@@ -57,6 +57,11 @@ Coverage and maturity tracking lives in `docs/lang/coverage.edn`; compatibility
 rules live in `docs/lang/versioning.md`; CI-facing commands live in
 `docs/lang/gates.md`.
 
+The machine-readable CLI command contract lives at `lang/cli.edn`. It defines
+the public `kotoba` command vocabulary for `run`, `check`, `db`, `git`, `rad`,
+and `deploy` so host implementations can adapt to CLJC/EDN data instead of
+owning the protocol surface.
+
 ## Maturity
 
 - `M0`: constants and docs.
