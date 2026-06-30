@@ -24,7 +24,7 @@ find orgs/kotoba-lang \
 | `aiueos` | 1 | 27 | primary migration | Move manifest, policy, broker, and safe checker semantics to Kotoba/CLJC. Native wasm execution may stay behind a host adapter while needed. |
 | `kami-engine` | 109 | 536 | domain-native backend | Keep native engine pieces as backend/adapters. Move public contracts and authoring DSLs to Kotoba/CLJC. |
 | `kami-engine-cfd` | 1 | 7 | domain-native backend | Keep as high-fidelity native CFD backend behind `aero`/CAE contracts. |
-| `kami-webgpu` | 0 | 1 | cleanup candidate | Single Rust file without Cargo. Inspect and either remove, archive, or convert to CLJC/WebGPU contract docs. |
+| `kami-webgpu` | 0 | 1 | generated fixture | Single generated Rust fixture without Cargo. Not a Rust dependency; keep generated from CLJC/EDN contracts. |
 | `kotoba-v2025` | 69 | 333 | legacy keep | Old design/reference. Keep as-is; do not spend migration effort unless a specific artifact is promoted. |
 
 ## Migration Policy
@@ -107,12 +107,13 @@ Target role:
 
 ### `kami-webgpu`
 
-Current role: one `.rs` file without a Cargo manifest.
+Current role: one generated `.rs` fixture without a Cargo manifest.
 
 Target role:
 
-- Inspect and delete if stale.
-- If still useful, convert to a documented host adapter or CLJC/WebGPU contract.
+- Keep as Rust-free CLJ/CLJS/CLJC repo.
+- Treat `fixtures/pipeline_specs.rs` as generated parity output, not source.
+- Do not add a Cargo manifest.
 
 ### `kotoba-v2025`
 
@@ -129,8 +130,7 @@ Target role:
 1. `kotoba`: classify crates and prevent new Rust protocol authority.
 2. `kototama`: replace wrapper semantics with Kotoba/CLJC package contracts.
 3. `aiueos`: move policy/broker/audit/safe-checker semantics to Kotoba/CLJC.
-4. `kami-webgpu`: clean up or reclassify the single Rust file.
+4. `kami-webgpu`: keep the single Rust file documented as generated fixture output.
 5. `kami-engine` and `kami-engine-cfd`: keep native backends, define CLJC public
    contracts around them.
 6. `kotoba-v2025`: leave untouched as legacy reference unless explicitly needed.
-
