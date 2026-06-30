@@ -61,6 +61,9 @@ Immediate actions:
   `migration-target`.
 - Prefer generated adapters from Kotoba/CLJC contracts over handwritten Rust
   semantics.
+- Treat `lang/cli.edn` as the initial data-first CLI command contract for
+  `run`, `check`, `db`, `git`, `rad`, and `deploy`; Rust CLI code should become
+  a host adapter over that contract rather than the source of protocol truth.
 
 ### `kototama`
 
