@@ -84,3 +84,38 @@ owning the protocol surface.
 The profile is kept in-repo for now. Split it into a separate repository only
 when an independent compiler, runtime, or external conformance suite needs to
 consume it outside this workspace.
+
+## Foundational stdlib roadmap
+
+The profile (source contract) is mature at `:m6`, and the **horizontal
+foundational stdlib** that the vertical `*-clj` libs (`langchain`, `langgraph`,
+`statechart`, `num`, …) assume is now complete: 12 foundational + 3 composite
+consumer libraries, all at **v0.1.0** and **M6**, all PUBLIC and CI-green under
+the `kotoba-lang` org, in the same zero-dep `.cljc` + host-injected pattern as
+`dsl-core` / `statechart` / `num`:
+
+- **Layer 1 — data**: `coll`, `spec`, `json` (P0)
+- **Layer 2 — cap/effect**: `wit` (WIT bindings + capability tokens), `async`
+  (CSP channels, bounded) (P0)
+- **Layer 3 — I/O**: `time`, `fs`, `http`, `io` (capability-tokenized,
+  host-injected) (P1)
+- **Layer 4 — tooling**: `test` (property), `fmt`, `lsp` (P2)
+- **Composite consumers**: `scheduler` (←async/time/coll), `store`
+  (←fs/io/wit/coll), `lint` (←fmt/lsp/fs/coll)
+
+Each lib is capability-parameterized (never direct-OS), plugs into the
+existing `effects.rs` / `policy.rs` deny-by-default boundary, and carries its
+own semver separate from `:kotoba.lang/profile-version` (the profile stays 1).
+Per-lib M0–M6 maturity and the full catalog are tracked in
+`docs/lang/coverage.edn` under `:stdlib` (track at `:m6`); the semver/compat
+policy is in `docs/lang/stdlib-versioning.md`; the gate set is in
+`docs/lang/stdlib-gates.md`; the decision and rationale (comparison vs Go /
+Python / Rust / Deno / TS) are in
+`docs/adr/ADR-kotoba-lang-foundational-stdlib.md`.
+
+**M5 consumer provenance**: every consumable leaf lib has a confirmed
+external consumer — `json` ← `http` and `langchain` (a real vertical), `spec`
+← `test`, `async`/`time`/`coll` ← `scheduler`, `fs`/`io`/`wit` ← `store`,
+`fmt`/`lsp` ← `lint`. `registry` is deferred to the `:packages` CID-lock
+track.
+
