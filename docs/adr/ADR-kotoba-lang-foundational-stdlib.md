@@ -1,37 +1,23 @@
 # ADR — kotoba-lang foundational horizontal stdlib layer
 
-- **Status**: Accepted (roadmap; per-lib maturity tracked in `docs/lang/coverage.edn` `:stdlib`)
-- **Date**: 2026-06-30
-- **Artifacts**: `docs/lang/coverage.edn` `:stdlib` track; planned repos
-  `kotoba-lang/{coll,spec,json,wit,async,fs,http,io,time,test,fmt,lsp,registry}`
+- **Status**: Accepted — **implemented**: 12 foundational + 3 composite libs shipped at v0.1.0 / M6
+- **Date**: 2026-06-30 (decision) · updated 2026-07-01 (completion + positioning)
+- **Artifacts**: `docs/lang/coverage.edn` `:stdlib` track; `docs/lang/stdlib-versioning.md` (M6 policy); `docs/lang/stdlib-gates.md` (M4 gate set); repos `kotoba-lang/{coll,spec,json,wit,async,time,fs,http,io,test,fmt,lsp,scheduler,store,lint}`
 - **Related**: `ADR-kotoba-lang-profile.md`, `ADR-safe-capability-language.md`
 
 ## Context
 
-`kotoba-lang` today ships a thick set of **vertical / domain DSL** libraries
-(`langchain`, `langgraph`, `statechart`, `states`, `policy`, `mcp`, `num`,
+`kotoba-lang` ships a thick set of **vertical / domain DSL** libraries
+(`langchain`, `langgraph`, `statechart`, `policy`, `mcp`, `num`,
 `multiformats`, `dag-cbor`, `ed25519`, `cacao`, `dsl-core`, `sigma`, `dmn`,
 `bpmn`, `cmmn`). They are all zero-dependency portable `.cljc`, designed to run
 on JVM / SCI / ClojureScript / GraalVM / kotoba-WASM, with I/O host-injected.
 
-What is **thin** is the **horizontal foundational stdlib** that those vertical
-libs implicitly assume. Each actor re-rolls collections, JSON parsing, time,
-byte streams, and async glue. Compared to the ecosystems kotoba competes with
-for untrusted / AI-generated code, the gap is concrete:
-
-| Axis | Go | Python | Rust | Deno/TS | kotoba (now) | Gap |
-|---|---|---|---|---|---|---|
-| Horizontal stdlib (coll/io/time/text/encode) | batteries | huge | std + core/alloc | deno.std | `dsl-core` problem maps only | **large** |
-| Async / concurrency | goroutines | asyncio | tokio | promises | none (WASM premise excludes threads/clock) | **large** |
-| Package / registry | go.mod | pypi | cargo | npm / deno.land | git-dep + west only | medium |
-| Capability / effect system | — | — | — | perms | `effects.rs` + WIT | **strength** |
-| Test / property | testing | pytest | proptest | deno.test | test-runner + conformance | medium (no property) |
-| Spec / schema | — | pydantic | serde | zod | `dsl-core.problem` only | **large** |
-| LSP / formatter / docs | gopls | ruff | rustfmt | dprint | clojure-side only | medium |
-
-The differentiator kotoba should press is the last strength column: the
+What was **thin** was the **horizontal foundational stdlib** those vertical
+libs implicitly assume. Each actor re-rolled collections, JSON parsing, time,
+byte streams, and async glue. The differentiator kotoba should press is the
 capability-confined, host-injected WASM premise from
-`ADR-safe-capability-language.md` means the horizontal stdlib can be
+`ADR-safe-capability-language.md`: the horizontal stdlib can be
 **capability-parameterized** rather than direct-OS — exactly the shape deno /
 rust / ts / python / go do *not* have natively.
 
@@ -43,102 +29,135 @@ using the same zero-dep `.cljc` + host-injected-ports pattern as `dsl-core` /
 the capability-safe story gets a first-class user API:
 
 ```
-Layer 4 — Tooling/UX : fmt · lsp · registry · test(property)
-Layer 3 — I/O        : fs · http · io  (capability-tokenized, host-injected)
+Layer 4 — Tooling/UX : fmt · lsp · test(property)
+Layer 3 — I/O        : fs · http · io · time  (capability-tokenized, host-injected)
 Layer 2 — Cap/effect : wit (WIT bindings + capability tokens) · async (CSP channels, bounded)
 Layer 1 — Data       : coll · spec · json   (pure, the foundation everything stands on)
+Composite consumers  : scheduler (←async/time/coll) · store (←fs/io/wit/coll) · lint (←fmt/lsp/fs/coll)
 ```
 
-Catalog (priority reflects what unblocks the most existing vertical libs first):
+### Catalog (shipped)
 
-| Repo (`kotoba-lang/`) | Layer | Compares to | Priority | Maturity |
-|---|---|---|---|---|
-| `coll`   | data | Go slices/maps · deno.std/collections · clojure core | P0 | M0 (planned) |
-| `spec`   | data | zod · pydantic · serde · clojure.spec/malli | P0 | M0 (planned) |
-| `json`   | data | encoding/json · serde_json · std/json | P0 | M0 (planned) |
-| `wit`    | cap/effect | wit-bindgen · Deno.* perms | P0 | M0 (planned) |
-| `async`  | cap/effect | tokio · asyncio · core.async | P0 | M0 (planned) |
-| `time`   | I/O | time · chrono · JS Temporal | P1 | M0 (planned) |
-| `fs`     | I/O | os/path · deno.std/fs | P1 | M0 (planned) |
-| `http`   | I/O | net/http · deno/http | P1 | M0 (planned) |
-| `io`     | I/O | io · std::io · deno/streams | P1 | M0 (planned) |
-| `test`   | tooling | proptest · deno.test · test.check | P2 | M0 (planned) |
-| `fmt`    | tooling | rustfmt · dprint | P2 | M0 (planned) |
-| `lsp`    | tooling | rust-analyzer · tsserver | P2 | M0 (planned) |
-| `registry` | tooling | crates.io · deno.land/x · go modules | P2 | M0 (planned) |
+| Repo (`kotoba-lang/`) | Layer | Compares to | Maturity |
+|---|---|---|---|
+| `coll`   | data | Go slices/maps · deno.std/collections · clojure core | M6 |
+| `spec`   | data | zod · pydantic · serde · clojure.spec/malli | M6 |
+| `json`   | data | encoding/json · serde_json · std/json | M6 |
+| `wit`    | cap/effect | wit-bindgen · Deno.* perms | M6 |
+| `async`  | cap/effect | tokio · asyncio · core.async | M6 |
+| `time`   | I/O | time · chrono · JS Temporal | M6 |
+| `fs`     | I/O | os/path · deno.std/fs | M6 |
+| `http`   | I/O | net/http · deno/http | M6 |
+| `io`     | I/O | io · std::io · deno/streams | M6 |
+| `test`   | tooling | proptest · deno.test · test.check | M6 |
+| `fmt`    | tooling | rustfmt · dprint | M6 |
+| `lsp`    | tooling | rust-analyzer · tsserver | M6 |
+| `scheduler` | composite | durable tick scheduler / actor outer loop | M6 |
+| `store`     | composite | capability-guarded KV store | M6 |
+| `lint`      | composite | EDN source linter/formatter | M6 |
 
-Design rules each lib must follow (so they stay kotoba-shaped):
+Design rules each lib follows:
 
 - **Zero third-party runtime deps; every namespace `.cljc`.** Same contract as
-  `dsl-core` / `num` core / `langchain`. Must run on JVM, SCI, ClojureScript,
+  `dsl-core` / `num` core / `langchain`. Runs on JVM, SCI, ClojureScript,
   GraalVM, and kotoba-WASM.
 - **Capability-parameterized, not direct-OS.** `fs` / `http` / `time` / `io`
-  take a host-injected capability handle (the same injection seam as
-  `kotobase.store/IStore` and `num.protocol/IBackend`). They never touch the OS
-  directly. `wit` is the typed binding generator that mints those handles.
+  take a host-injected capability handle (same seam as `kotobase.store/IStore`
+  and `num.protocol/IBackend`). They never touch the OS directly.
 - **Plugs into the existing effect/capability boundary.** `wit` and `async`
   surface `effects.rs` / `policy.rs` (deny-by-default, per-cid, interprocedural
   effect gate from `ADR-safe-capability-language.md`) as a *user* API, not a new
-  enforcement layer. No new gates invented here.
+  enforcement layer.
 - **stdlib versioning is separate from profile-version.** `:kotoba.lang/profile-version`
-  in `lang/profile.edn` is the *source contract* and is unchanged by this ADR
-  (stays 1). Each stdlib lib carries its own crate/repo semver, like the
-  existing `*-clj` siblings.
-- **Repos are plain-git children under `kotoba-lang` org**, registered via west
-  (`manifest/repos.edn` SSoT → `gen-west-manifest.bb`; never hand-written
-  `west.yml`). Per the standing authorization, each lib's
-  ADR → scaffold (`.cljc` + `deps.edn` + README + test) → `git init` + initial
-  commit → `gh repo create kotoba-lang/<name>` (private default) + push → west
-  registration → superproject `chore(manifest)+docs(adr)` commit is a single
-  follow-up flow, run per lib.
+  in `lang/profile.edn` is the *source contract* and is unchanged (stays 1). Each
+  stdlib lib carries its own semver, currently `0.1.0` (see `stdlib-versioning.md`).
+
+## Positioning: kotoba-lang vs Rust / Go / TS / Clojure
+
+kotoba-lang does **not** compete with Rust/Go/TS/Clojure on "general-purpose
+language stability / ecosystem breadth". It competes on an **orthogonal axis**:
+capability-safe × WASM-confinement × AI-agent-native × content-addressed
+substrate. The matrix:
+
+| Axis | Rust | Go | TS | Clojure | kotoba-lang |
+|---|---|---|---|---|---|
+| Compile target | native/wasm | native/wasm | JS/wasm | JVM/JS | **WASM Component Model** |
+| Capability/security model | ownership/borrow | — | — | — | **deny-by-default capability confinement + per-cid + effect gate** |
+| AI-agent-native (untrusted code) | — | — | — | — | **`:ai-generated` profile: ephemeral, net/secret/persist denied by default** |
+| WASM-isolated OS substrate | external(wasmtime) | — | — | — | **aiueos (capability Wasm OS, append-only audit)** |
+| Content-addressed data substrate | — | — | — | datomic(external) | **Datom[CID/T] + Datalog + CACAO + IPFS + kotobase PDS** |
+| Horizontal stdlib breadth | std small, eco huge | batteries | huge | medium(JVM) | 12 foundational + 3 composite (v0.1.0/M6) |
+| Property testing | proptest | — | — | test.check | **test (consumes spec generator)** |
+| Package registry | crates.io | go modules | npm/deno.land | clojars/maven | git-SHA dep + west manifest (`:packages` CID-lock track in progress) |
+| LSP wire | rust-analyzer | gopls | tsserver | clojure-lsp | lsp data layer ✅, JSON-RPC wire not integrated |
+| async runtime maturity | tokio(mature) | runtime(mature) | libuv(mature) | core.async | no runtime, pure state-machine (WASM premise, by design) |
+| 1.0 stability | ✅ | ✅ | ✅ | ✅ | 0.1.0 (API settling) |
+
+**Where kotoba leads (no peer):** capability-safe × WASM-confinement;
+AI-agent-native untrusted-code execution; aiueos capability OS;
+content-addressed data substrate; phonosemantic (kototama/kotodama).
+
+**Where kotoba trails (engineering, not design):** package registry; 1.0
+stability; async runtime maturity (intentionally host-driven); LSP wire
+integration.
 
 ## Consequences
 
-- **Vertical libs get a foundation.** `langchain` / `langgraph` / `statechart` /
-  `num` / `dag-cbor` stop re-rolling collections, JSON, byte streams, and async
-  glue. `langchain`'s current "host parses JSON for me" escape hatch becomes a
-  real `kotoba-lang/json` dep.
-- **`spec` + `test` close the property-testing gap.** `spec` generators feed
-  `test` property cases, giving kotoba the proptest/quickcheck surface the
-  comparison table shows missing — and it composes with the existing conformance
-  fixture runner (`lang/conformance/manifest.edn`).
-- **`wit` + `async` maximize the capability differentiator.** The deny-by-default
-  enforcement already exists in `effects.rs` / `policy.rs`; these libs turn it
-  into the documented user-facing API, which is the one column where kotoba
-  beats deno / rust / ts / python / go rather than trailing them.
-- **New packaging/UX surface.** `registry` / `fmt` / `lsp` become the
-  kotoba-native module resolution, formatting, and editing experience, reducing
-  reliance on clojure-side tooling for `.kotoba` source.
-- **Coverage/maturity scope expands, not the profile.** This ADR adds a
-  `:stdlib` track to `docs/lang/coverage.edn`; it does **not** bump
-  `:kotoba.lang/profile-version` or the core `:maturity :m6` of the profile
-  itself. The profile (source contract) is complete; the stdlib is a separate
-  roadmap tracked alongside it.
+- **Vertical libs gained a foundation.** `langchain` now depends on
+  `kotoba-lang/json` (the old "punt JSON to the host" escape hatch became an
+  in-language default) — a real vertical lib consuming a foundational-stdlib
+  lib. `langgraph` / `statechart` / `num` / `dag-cbor` stop re-rolling
+  collections, JSON, byte streams, and async glue.
+- **`spec` + `test` closed the property-testing gap.** `spec` generators feed
+  `test` property cases, and `test`'s PRNG/generators/quickcheck compose with
+  the existing conformance fixture runner.
+- **`wit` + `async` maximize the capability differentiator.** The
+  deny-by-default enforcement already existed in `effects.rs` / `policy.rs`;
+  these libs turn it into the documented user-facing API — the one column where
+  kotoba beats deno / rust / ts / python / go rather than trailing them.
+- **M5 consumer provenance is universal.** Every consumable leaf has a
+  confirmed external consumer: `json` ← http, langchain (real vertical); `spec`
+  ← test; `async`/`time`/`coll` ← scheduler; `fs`/`io`/`wit` ← store;
+  `fmt`/`lsp` ← lint.
+- **Coverage/maturity scope expanded, not the profile.** This ADR added a
+  `:stdlib` track to `docs/lang/coverage.edn` (now at `:m6`); it does **not**
+  bump `:kotoba.lang/profile-version` or the core `:maturity :m6` of the profile
+  itself.
 
-## Maturity
+## Maturity — reached
 
-Per-lib maturity reuses the same M0–M6 semantics as the core profile, tracked
-in `docs/lang/coverage.edn` under a new `:stdlib` key:
+All 15 shipped libs are at **M6 / v0.1.0**:
 
-- **M0**: ADR + catalog + repo plan (this ADR is the track-level M0 evidence).
-- **M1**: machine-readable contract for the lib (e.g. a `contract.edn` /
-  protocol seam).
+- **M0**: ADR + catalog + repo plan.
+- **M1**: machine-readable lib contract (protocol/`contract.edn` seam).
 - **M2**: positive fixtures / examples.
 - **M3**: negative fixtures (denied capability, malformed input).
-- **M4**: manifest-driven runner / CI gate.
-- **M5**: an external consumer (a vertical lib or `kotoba-cli`) depends on it.
-- **M6**: semver + compatibility policy for that lib.
+- **M4**: manifest-driven runner / CI gate (`stdlib-gates.md`; each lib's
+  GitHub Actions `clojure -M:test` on JDK 17+21 is green).
+- **M5**: external consumer — confirmed for every consumable leaf (see above).
+- **M6**: semver + compatibility policy (`stdlib-versioning.md`).
 
-Current state: **track at `:m0`, every lib `:planned` / `:m0`.** No lib is
-implemented yet; this ADR records the direction and the catalog so
-`coverage.edn` now *covers* the horizontal surface as a tracked roadmap. Track
-maturity rises as libs land; the first three (`coll`, `spec`, `json`) unblock
-the most existing vertical libs and are the recommended first follow-up.
+## Roadmap — engineering gaps to close (not design)
+
+These are the axes where the matrix above shows kotoba trailing; tracked here so
+they become follow-up work rather than drift:
+
+1. **Package registry** — currently git-SHA dep + west manifest. A first-party
+   registry/lockfile is the `:packages` CID-lock track
+   (`package-rules.md` / `ADR-kotoba-package-cid-lock`, owner WIP); the
+   `registry` stdlib lib is **deferred** there to avoid duplication.
+2. **LSP wire** — `lsp` lib owns the data contract (positions/ranges/diagnostics);
+   a JSON-RPC transport binding is the gap (currently host-supplied).
+3. **async runtime** — intentionally a pure state machine (WASM premise: no
+   threads, no wall-clock). The gap is durable-outer-loop reference drivers that
+   thread `async` + `time` + `scheduler` for long-running cells, not a tokio.
+4. **1.0** — all libs at `0.1.0`; cut `1.0` per lib once its surface is stable
+   under real use (per `stdlib-versioning.md`).
 
 ## Out of scope
 
 - Does **not** change `lang/profile.edn` or `:kotoba.lang/profile-version`.
-- Does **not** scaffold the 13 repos in this ADR; each is a separate follow-up
-  under the standing authorization (ADR → scaffold → repo → west).
 - Does **not** invent new enforcement gates; `wit` / `async` reuse the existing
   `effects.rs` / `policy.rs` boundary.
+- Does **not** build the `:packages` CID-lock track — that is owner-led; this
+  ADR only defers `registry` to it.
