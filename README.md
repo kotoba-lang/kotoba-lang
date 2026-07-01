@@ -25,22 +25,18 @@ repository as data:
   and capability vocabulary.
 - `src/kotoba/cli.cljc` validates the contract, shapes argv as EDN, and returns
   host-neutral command results.
-- Rust, Node, JVM, or native launchers are adapters. They should not define CLI
+- Node, JVM, native, or other launchers are adapters. They should not define CLI
   protocol semantics independently.
 
 ## Current Status
 
-`kotoba-git` and `kotoba-rad` still have Rust host implementations in
-`kotoba-lang/kotoba`, but the command shape is now CLJC/EDN owned here. The
+`kotoba-git` and `kotoba-rad` still have host implementation work outside this
+repository, but the command shape is now CLJC/EDN owned here. The
 remaining migration work is to replace those host implementations with
 Kotoba/CLJC adapters that consume `kotoba.cli/dispatch` results.
 
 ## Repository Layout
 
-- `crates/kotoba-lang/`: small Rust crate for the source-profile constants.
-- `crates/kotoba-lang/resources/kotoba/lang/profile.edn`: machine-readable
-  profile.
-- `crates/kotoba-lang/resources/kotoba/lang/conformance/`: profile fixtures.
 - `lang/cli.edn`: public CLI contract.
 - `lang/lab.edn`: `kotoba-lab` data contract.
 - `src/kotoba/cli.cljc`: CLJC CLI authority.
@@ -55,9 +51,7 @@ Kotoba/CLJC adapters that consume `kotoba.cli/dispatch` results.
 clojure -M:test
 bb scripts/check-cli-contract.bb lang/cli.edn
 node scripts/check-lab-site.mjs
-cargo test
 ```
 
-`clojure -M:test` is the primary CLI authority gate. The remaining Rust crate is
-a compatibility package for the source profile and should shrink as host
-adapters move to CLJC/Kotoba.
+`clojure -M:test` is the primary CLI authority gate. This repository should not
+contain `Cargo.toml`, `Cargo.lock`, `.rs`, or Rust toolchain files.
