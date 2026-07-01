@@ -1,5 +1,17 @@
 # Kotoba Language Gates
 
+The standalone artifact gate for this repository is:
+
+```sh
+test -f lang/package.edn
+test -f lang/package-conformance/manifest.edn
+test -f examples/package-manifest.edn
+test -f examples/kotoba.lock.edn
+test -f docs/adr/ADR-kotoba-transit-wire-protocol.md
+test -f docs/lang/package-rules.md
+bb scripts/check-package-contract.bb
+```
+
 These commands are the maturity gate for `kotoba-lang` profile version 1:
 
 ```sh
@@ -39,3 +51,11 @@ feature-shape compile drift in the compiler implementation crate.
 
 CI should run these commands as the minimum language-profile gate. Broader
 compiler-crate integration tests may run in a heavier implementation job.
+
+Package-safety maturity additionally requires `scripts/check-package-contract.bb`
+to accept positive package manifest/lock fixtures and reject version-only,
+unsigned, missing-CID, and over-capability negative fixtures from
+`lang/package-conformance/`. The same gate also pins package boundary metadata:
+known package kinds, adapter `:consumes` requirements, schema-contract
+`:provides` requirements, and `app.kotoba.*` / `wire.kotoba.*` contract
+surfaces in manifests and lockfiles.
