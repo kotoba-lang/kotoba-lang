@@ -50,6 +50,10 @@ alias.
 Those commands use the compiler implementation crate underneath, but keep the
 user-facing language surface under the `kotoba` command.
 
+Dynamic authority is modeled as explicit capability values, not as ambient host
+access or plain resource strings. The profile semantics are documented in
+[`capability-values.md`](capability-values.md).
+
 The machine-readable source contract lives at
 `crates/kotoba-lang/resources/kotoba/lang/profile.edn`. Compiler conformance
 fixtures live under `crates/kotoba-lang/resources/kotoba/lang/conformance/`.
@@ -118,4 +122,3 @@ external consumer — `json` ← `http` and `langchain` (a real vertical), `spec
 ← `test`, `async`/`time`/`coll` ← `scheduler`, `fs`/`io`/`wit` ← `store`,
 `fmt`/`lsp` ← `lint`. `registry` is deferred to the `:packages` CID-lock
 track.
-
