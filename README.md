@@ -14,25 +14,23 @@ implementation.
 - Conformance fixture manifest.
 - Safe capability language design notes.
 - Repository-language design for `kotoba-git` and `kotoba-rad`.
+- CLJC authority for the public `kotoba` CLI command contract.
 
-The implementation still lives in `kotoba-lang/kotoba`:
+The language and CLI authority lives here. Host implementations consume this
+repository as data:
 
-- `kotoba-cli` exposes `kotoba -e` and `kotoba wasm ...`.
-- `kotoba-clj` compiles the Kotoba/EDN subset to Wasm.
-- `kotoba-git` stores byte-exact Git objects as Kotoba CID blocks plus Datom
-  projections.
-- `kotoba-rad` provides the sovereign repository identity and ref-authorization
-  layer.
+- `lang/cli.edn` defines `run`, `check`, `db`, `git`, `rad`, and `deploy`.
+- `src/kotoba/cli.cljc` validates the contract, shapes argv as EDN, and returns
+  host-neutral command results.
+- Rust, Node, JVM, or native launchers are adapters. They should not define CLI
+  protocol semantics independently.
 
 ## Current Status
 
-`kotoba-git` and `kotoba-rad` exist as Rust crates in `kotoba-lang/kotoba`.
-The server also has Git smart-HTTP endpoints and rad delegate gating.
-
-The public `kotoba` CLI currently does not expose top-level `kotoba git ...` or
-`kotoba rad ...` subcommands. The expected CLI shape is documented in
-`docs/adr/ADR-kotoba-rad-git-sovereign-repo.md` and still needs to be wired into
-`kotoba-cli`.
+`kotoba-git` and `kotoba-rad` still have Rust host implementations in
+`kotoba-lang/kotoba`, but the command shape is now CLJC/EDN owned here. The
+remaining migration work is to replace those host implementations with
+Kotoba/CLJC adapters that consume `kotoba.cli/dispatch` results.
 
 ## Repository Layout
 
@@ -40,15 +38,20 @@ The public `kotoba` CLI currently does not expose top-level `kotoba git ...` or
 - `crates/kotoba-lang/resources/kotoba/lang/profile.edn`: machine-readable
   profile.
 - `crates/kotoba-lang/resources/kotoba/lang/conformance/`: profile fixtures.
+- `lang/cli.edn`: public CLI contract.
+- `src/kotoba/cli.cljc`: CLJC CLI authority.
+- `test/kotoba/cli_test.cljc`: CLI authority tests.
 - `docs/lang/`: profile maturity, gates, and versioning.
 - `docs/adr/`: extracted language and repository ADRs.
 
 ## Verify
 
 ```sh
+clojure -M:test
+bb scripts/check-cli-contract.bb lang/cli.edn
 cargo test
 ```
 
-The standalone crate checks stable source-profile constants and artifact
-presence. Full compiler, CLI, safe-mode, and mesh gates continue to run in
-`kotoba-lang/kotoba`.
+`clojure -M:test` is the primary CLI authority gate. The remaining Rust crate is
+a compatibility package for the source profile and should shrink as host
+adapters move to CLJC/Kotoba.
