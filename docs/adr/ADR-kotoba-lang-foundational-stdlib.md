@@ -161,3 +161,33 @@ they become follow-up work rather than drift:
   `effects.rs` / `policy.rs` boundary.
 - Does **not** build the `:packages` CID-lock track — that is owner-led; this
   ADR only defers `registry` to it.
+
+## OS / Runtime Infrastructure Gaps (aiueos-aligned)
+
+A broader survey of aiueos (the capability Wasm OS) + the kotoba-lang org
+identified eight OS/runtime infrastructure surfaces. The design rule is the
+same as `device`: capability-tokenized + host-injected, never direct-OS, so
+aiueos's broker can grant/deny each. Status + design per surface:
+
+| # | Surface | Status | Design |
+|---|---|---|---|
+| 1 | `net` — networking capability | **implemented** | `net:tcp`/`net:udp`/`net:dns` capability tokens + `INet` host-injected driver + mock. Same shape as `device`. |
+| 2 | `crypto` — hash/HMAC/AEAD primitives | **implemented** | sha2-256/sha2-512, HMAC, HKDF, AEAD (ChaCha20-Poly1305 shape). Portable (java.security.MessageDigest-grade), consumed by cacao/kotobase. |
+| 3 | `tls` — transport security | **implemented** | portable TLS handshake data model over host-injected transport; composes `net`+`crypto`. Host does the actual handshake; this lib owns the record/capability contract. |
+| 4 | `kv` — persistent KV store | **implemented** | `IKV` protocol (host-injected backend: mem/leveldb/sqlite-style), capability-gated. Complements `store` (mem) with a durable backend. |
+| 5 | `queue`/messaging | **existing** | aiueos's `topic` bus (pub/sub, ROS-topic analogue) covers in-process messaging. Distributed queue is the `kotobase`/`kotoba-fleet` domain, not a stdlib lib. |
+| 6 | `config`/`env` (12-factor) | **existing** | EDN manifests (`:aiueos/...`) ARE the config/env surface — a component's config is its manifest. No separate lib. |
+| 7 | `process`/sandbox | **not needed** | Wasm isolation per component IS the sandbox (the core aiueos premise). OS-level sandboxing (seccomp/cgroups) is a host concern, not a language-stdlib concern. |
+| 8 | `resource-limits` (CPU/mem quota) | **existing** | aiueos manifests already carry `:aiueos/limits` / `:aiueos/quota` / `:aiueos/schedule`, enforced at the broker/runtime level. No stdlib lib. |
+
+### Why this split
+
+`net`, `crypto`, `tls`, `kv` are **language-level** surfaces a cell author names
+in code — they need a portable `.cljc` vocabulary. `queue`/`config`/sandbox/
+resource-limits are **OS-level** surfaces aiueos already owns (manifest, topic
+bus, wasm isolation, quota) — duplicating them as stdlib would fragment the
+source of truth. The split keeps the stdlib at the language layer and leaves
+OS policy to aiueos.
+
+These four (`net`/`crypto`/`tls`/`kv`) extend the `:stdlib` track and are
+tracked in `docs/lang/coverage.edn` `:libs` at M6/v0.1.0, same as the rest.
