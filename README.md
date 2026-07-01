@@ -15,11 +15,14 @@ implementation.
 - Safe capability language design notes.
 - Repository-language design for `kotoba-git` and `kotoba-rad`.
 - CLJC authority for the public `kotoba` CLI command contract.
+- `kotoba-lab` research notebook contract and GitHub Pages prototype.
 
 The language and CLI authority lives here. Host implementations consume this
 repository as data:
 
 - `lang/cli.edn` defines `run`, `check`, `db`, `git`, `rad`, and `deploy`.
+- `lang/lab.edn` defines the `kotoba-lab` notebook, cell, artifact, evidence,
+  and capability vocabulary.
 - `src/kotoba/cli.cljc` validates the contract, shapes argv as EDN, and returns
   host-neutral command results.
 - Rust, Node, JVM, or native launchers are adapters. They should not define CLI
@@ -39,8 +42,10 @@ Kotoba/CLJC adapters that consume `kotoba.cli/dispatch` results.
   profile.
 - `crates/kotoba-lang/resources/kotoba/lang/conformance/`: profile fixtures.
 - `lang/cli.edn`: public CLI contract.
+- `lang/lab.edn`: `kotoba-lab` data contract.
 - `src/kotoba/cli.cljc`: CLJC CLI authority.
 - `test/kotoba/cli_test.cljc`: CLI authority tests.
+- `docs/site/`: GitHub Pages prototype rendered from `docs/site/lab.kotoba`.
 - `docs/lang/`: profile maturity, gates, and versioning.
 - `docs/adr/`: extracted language and repository ADRs.
 
@@ -49,6 +54,7 @@ Kotoba/CLJC adapters that consume `kotoba.cli/dispatch` results.
 ```sh
 clojure -M:test
 bb scripts/check-cli-contract.bb lang/cli.edn
+node scripts/check-lab-site.mjs
 cargo test
 ```
 
