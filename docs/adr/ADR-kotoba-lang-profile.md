@@ -1,8 +1,8 @@
-# ADR — kotoba-lang language profile crate
+# ADR — kotoba-lang language profile artifacts
 
 - **Status**: Accepted
 - **Date**: 2026-06-29
-- **Crate**: `crates/kotoba-lang`
+- **Artifacts**: `lang/profile.edn`, `lang/conformance/`
 - **Related**: `ADR-kotoba-wasm.md`, `ADR-safe-capability-language.md`
 
 ## Context
@@ -19,12 +19,13 @@ owner of both language semantics and compiler implementation.
 
 ## Decision
 
-Create `crates/kotoba-lang` as the in-repo language profile crate. It is a
-small, dependency-free contract crate, not a compiler or runtime.
+Create language-profile artifacts that are independent of the compiler
+implementation and independent of Rust packaging. The language contract is the
+EDN profile, conformance fixtures, and docs.
 
 `kotoba-lang` owns:
 
-- accepted source extensions: `.kotoba`, `.clj`, `.cljc`, `.cljs`
+- accepted source extensions: `.kotoba`, `.cljc`, `.clj`
 - reader targets: `kotoba`, `clj`, `cljs`
 - `.cljc` reader conditional branch order
 - namespace source resolution extension priority
@@ -37,7 +38,10 @@ Kotoba/EDN subset to WebAssembly and applies safe Kotoba admission checks.
 - `.kotoba` is the canonical Kotoba-only source extension.
 - `.cljc` remains the portable sharing format. Kotoba-specific behavior belongs
   in `#?(:kotoba ...)`.
+- Dedicated `.cljs` source files are retired from profile v2; ClojureScript
+  reader behavior remains available inside `.cljc` through `#?(:cljs ...)`.
 - Language profile constants are no longer duplicated inside `kotoba-clj`.
+- The canonical profile and conformance suite are not nested under a Rust crate.
 - The profile stays in the monorepo until an independent compiler, runtime, or
   external conformance suite needs to consume it outside this workspace.
 
