@@ -21,6 +21,8 @@ The language and CLI authority lives here. Host implementations consume this
 repository as data:
 
 - `lang/cli.edn` defines `run`, `check`, `db`, `git`, `rad`, and `deploy`.
+- `lang/adapters.edn` defines adapter-owned CLI launchers and keeps native
+  implementations outside the default language authority repo.
 - `lang/lab.edn` defines the `kotoba-lab` notebook, cell, artifact, evidence,
   and capability vocabulary.
 - `src/kotoba/cli.cljc` validates the contract, shapes argv as EDN, and returns
@@ -38,6 +40,7 @@ Kotoba/CLJC adapters that consume `kotoba.cli/dispatch` results.
 ## Repository Layout
 
 - `lang/cli.edn`: public CLI contract.
+- `lang/adapters.edn`: host adapter registry.
 - `lang/lab.edn`: `kotoba-lab` data contract.
 - `src/kotoba/cli.cljc`: CLJC CLI authority.
 - `test/kotoba/cli_test.cljc`: CLI authority tests.

@@ -12,6 +12,8 @@
 
 (def required-commands #{:run :check :db :git :rad :deploy})
 
+(def adapter-kinds #{:node :jvm :native :browser :edge})
+
 (defn read-contract
   "Read a CLI contract EDN file. CLJS callers should pass the parsed map to
   `validate-contract` and `command-result`."
@@ -75,6 +77,52 @@
                 :commands command-ids
                 :command-count (count commands)
                 :option-count (count (mapcat :options commands))}))))
+
+(defn validate-adapter-registry
+  "Validate the host adapter registry for CLI launchers."
+  [registry]
+  (let [adapters (:kotoba.adapter.registry/adapters registry)
+        errors (cond-> []
+                 (not= 1 (:kotoba.adapter.registry/version registry))
+                 (conj {:error :adapter-registry/version})
+
+                 (not (false? (get-in registry [:kotoba.adapter.registry/policy :rust-in-default-repo?])))
+                 (conj {:error :adapter-registry/rust-default})
+
+                 (not (vector? adapters))
+                 (conj {:error :adapter-registry/adapters})
+
+                 (and (vector? adapters) (empty? adapters))
+                 (conj {:error :adapter-registry/empty})
+
+                 (and (vector? adapters)
+                      (some #(not (keyword? (:id %))) adapters))
+                 (conj {:error :adapter/id})
+
+                 (and (vector? adapters)
+                      (some #(not (contains? adapter-kinds (:kind %))) adapters))
+                 (conj {:error :adapter/kind})
+
+                 (and (vector? adapters)
+                      (some #(not (string? (:repository %))) adapters))
+                 (conj {:error :adapter/repository})
+
+                 (and (vector? adapters)
+                      (some #(not (and (set? (:consumes %))
+                                       (seq (:consumes %))
+                                       (every? keyword? (:consumes %)))) adapters))
+                 (conj {:error :adapter/consumes})
+
+                 (and (vector? adapters)
+                      (some #(not (and (set? (:provides %))
+                                       (seq (:provides %))
+                                       (every? keyword? (:provides %)))) adapters))
+                 (conj {:error :adapter/provides}))]
+    (if (seq errors)
+      (failure :adapter-registry/invalid "adapter registry is invalid" {:errors errors})
+      (success :adapter-registry/valid
+               {:adapter-count (count adapters)
+                :adapters (mapv :id adapters)}))))
 
 (defn command-specs [contract]
   (into {}
