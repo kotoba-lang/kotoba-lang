@@ -20,7 +20,9 @@ implementation.
 The language and CLI authority lives here. Host implementations consume this
 repository as data:
 
-- `lang/cli.edn` defines `run`, `check`, `db`, `git`, `rad`, and `deploy`.
+- `lang/cli.edn` defines `run`, `check`, `db`, `git`, `rad`, `deploy`, and
+  `hinshitsu` (software-quality checks: evidence, gates, coverage, mokushi
+  visual regression — backed by `kotoba-lang/hinshitsu`).
 - `lang/adapters.edn` defines adapter-owned CLI launchers and keeps native
   implementations outside the default language authority repo.
 - `lang/lab.edn` defines the `kotoba-lab` notebook, cell, artifact, evidence,
