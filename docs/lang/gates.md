@@ -3,7 +3,9 @@
 The standalone artifact gate for this repository is:
 
 ```sh
+test -f lang/profile.edn
 test -f lang/package.edn
+test -f lang/conformance/manifest.edn
 test -f lang/package-conformance/manifest.edn
 test -f examples/package-manifest.edn
 test -f examples/kotoba.lock.edn
@@ -12,45 +14,33 @@ test -f docs/lang/package-rules.md
 bb scripts/check-package-contract.bb
 ```
 
-These commands are the maturity gate for `kotoba-lang` profile version 1:
+These commands are the maturity gate for `kotoba-lang` profile version 2, and
+they are CLJ/EDN-first — no Rust toolchain is required or allowed in this
+repository:
 
 ```sh
-cargo test -p kotoba-lang
-cargo test -p kotoba-clj --test lang_profile_conformance
-cargo run -p kotoba-cli -- -e '(+ 1 2)'
-cargo test -p kotoba-cli --test public_cli
-cargo test -p kotoba-cli wasm_cli_tests
-cargo test -p kotoba-cli mesh::tests
-cargo test -p kotoba-cli manifest_defaults_to_kotoba_extension_kind_with_clj_compat_host
-cargo test -p kotoba-lattice manifest::tests
-cargo run -p kotoba-cli -- wasm safe-policy examples/kotoba-shell-hello/src/policy.kotoba
-cargo check -p kotoba-clj
+clojure -M:test
+bb scripts/check-cli-contract.bb lang/cli.edn
+bb scripts/check-package-contract.bb
+node --check docs/site/app.js
+node scripts/check-lab-site.mjs
 ```
 
-The first command checks that the Rust profile constants, `profile.edn`, and
-`coverage.edn` agree. The second command runs the manifest-driven conformance
-suite from `crates/kotoba-lang/resources/kotoba/lang/conformance/` through the
-implementation compiler crate. That suite covers source-file `:run` cases,
-`:compile-expr` inline-expression cases, and declared negative/error cases. The
-third command pins the user-facing `kotoba -e` path. The fourth command runs
-public CLI integration tests for `kotoba -e`, `kotoba wasm build`,
-`kotoba wasm safe-policy`, `kotoba wasm selfhost-inspect`, and
-`kotoba wasm safe-build`, including checks that public output does not expose
-the legacy admission-gate name and that `-S` namespace resolution prefers
-canonical `.kotoba` sources over `.clj` compatibility files. The fifth command
-pins the `kotoba wasm` argument surface across build, safe-build, safe-policy,
-and selfhost-inspect, including default `reader-target=kotoba` and repeated
-`-S` / `--source-path` handling. The sixth through eighth commands pin the
-component and extension defaults: `kotoba component build` reports `.kotoba` as
-canonical while keeping `.clj` / `.cljc` / `.cljs` as compatibility inputs,
-extension artifacts default to `kotoba/library` with `clj/deps` as an explicit
-compatibility host, and app manifests default omitted `:lang` to `:kotoba` with
-legacy `:clojure` / `:clj` aliases preserved. The ninth command pins the
-user-facing `kotoba wasm` safe-language tooling path. The final command catches
-feature-shape compile drift in the compiler implementation crate.
+The first command runs the CLJC test suites: the CLI contract conformance
+tests (`test/kotoba/cli_test.cljc`) and the package contract tests
+(`test/kotoba/lang/package_contract_test.clj`). The second command validates
+the machine-readable CLI command contract. The third command runs the package
+manifest/lock conformance fixtures from `lang/package-conformance/`. The last
+two commands pin the lab site artifacts.
 
-CI should run these commands as the minimum language-profile gate. Broader
-compiler-crate integration tests may run in a heavier implementation job.
+Implementation conformance against the language profile is owned by the
+launcher and CLJC authority gates in `kotoba-lang/kotoba` (see its
+`docs/lang/gates.md`): a conforming implementation consumes
+`lang/conformance/manifest.edn`, runs all `:kind :run` source-file cases and
+`:kind :compile-expr` inline-expression cases for the declared target set, and
+produces the declared errors for all negative cases relevant to its admission
+mode. CI additionally enforces that no Rust source or Cargo build files
+reappear in this repository.
 
 Package-safety maturity additionally requires `scripts/check-package-contract.bb`
 to accept positive package manifest/lock fixtures and reject version-only,

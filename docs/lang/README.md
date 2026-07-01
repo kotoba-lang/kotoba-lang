@@ -32,15 +32,14 @@ compatibility examples are the conformance fixtures under `lang/conformance/`.
 
 ## Source Contract
 
-- Accepted extensions: `.kotoba`, `.clj`, `.cljc`, `.cljs`.
+- Accepted extensions: `.kotoba`, `.cljc`, `.clj`.
 - Default reader target: `kotoba`.
 - `:kotoba` branch fallback order: `:kotoba`, then `:clj`, then `:default`.
-- Namespace resolution priority for target `kotoba`: `.kotoba`, `.cljc`, `.clj`,
-  `.cljs`.
-- Namespace resolution priority for target `clj`: `.cljc`, `.clj`, `.kotoba`,
-  `.cljs`.
-- Namespace resolution priority for target `cljs`: `.cljc`, `.cljs`, `.clj`,
-  `.kotoba`.
+- Namespace resolution priority for target `kotoba`: `.kotoba`, `.cljc`, `.clj`.
+- Namespace resolution priority for target `clj`: `.cljc`, `.clj`, `.kotoba`.
+- Namespace resolution priority for target `cljs`: `.cljc`, `.clj`, `.kotoba`.
+- Retired legacy extension: `.cljs` source files; use `.cljc` with
+  `#?(:cljs ...)` for ClojureScript-targeted reader behavior.
 
 This is source compatibility, not JVM Clojure or ClojureScript runtime
 compatibility. Code still has to compile to the Kotoba compiler subset.
@@ -66,16 +65,16 @@ Namespace source roots are supplied with `-S` / `--source-path` or
 `KOTOBA_SOURCE_PATH`; `KOTOBA_CLJ_PATH` is retained only as a compatibility
 alias.
 
-Those commands use the compiler implementation crate underneath, but keep the
-user-facing language surface under the `kotoba` command.
+Those commands are implemented by the CLJC authority and the launcher in
+`kotoba-lang/kotoba`, but keep the user-facing language surface under the
+`kotoba` command.
 
 Dynamic authority is modeled as explicit capability values, not as ambient host
 access or plain resource strings. The profile semantics are documented in
 [`capability-values.md`](capability-values.md).
 
-The machine-readable source contract lives at
-`crates/kotoba-lang/resources/kotoba/lang/profile.edn`. Compiler conformance
-fixtures live under `crates/kotoba-lang/resources/kotoba/lang/conformance/`.
+The machine-readable source contract lives at `lang/profile.edn`. Compiler
+conformance fixtures live under `lang/conformance/`.
 Coverage and maturity tracking lives in `docs/lang/coverage.edn`; compatibility
 rules live in `docs/lang/versioning.md`; CI-facing commands live in
 `docs/lang/gates.md`.
