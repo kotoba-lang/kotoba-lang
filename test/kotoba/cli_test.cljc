@@ -1,8 +1,12 @@
 (ns kotoba.cli-test
-  (:require [clojure.test :refer [deftest is run-tests]]
+  (:require #?(:clj [clojure.edn :as edn])
+            [clojure.test :refer [deftest is run-tests]]
             [kotoba.cli :as cli]))
 
 (def contract (cli/read-contract))
+(def adapters
+  #?(:clj (edn/read-string (slurp "lang/adapters.edn"))
+     :cljs {}))
 
 (deftest contract-validates-in-cljc
   (let [result (cli/validate-contract contract)]
@@ -20,6 +24,13 @@
           :kotoba.cli/implemented-commands ["check" "db" "deploy" "git" "rad" "run"]
           :kotoba.cli/missing-commands []}
          (cli/conformance contract))))
+
+(deftest adapter-registry-is-cljc-authoritative
+  (let [result (cli/validate-adapter-registry adapters)]
+    (is (:kotoba.cli/ok? result))
+    (is (= {:adapter-count 3
+            :adapters [:adapter/node-cli :adapter/jvm-cli :adapter/native-cli]}
+           (:kotoba.cli/data result)))))
 
 (deftest argv-is-shaped-as-data
   (is (= {:positionals ["main.kotoba"]
