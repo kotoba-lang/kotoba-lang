@@ -152,6 +152,54 @@ Host-dispatch conformance fixtures (`:type :host-dispatch` in
 `test/kotoba/lang/capability_host_test.clj` and by
 `bb scripts/check-capability-values.bb`.
 
+## Capability-passing (S4b)
+
+The first capability-passing slice makes capability values flow as
+first-class arguments through guest code (including compiled wasm) as opaque
+integer handles, resolved back to concrete capabilities at host-call time.
+The host side lives in `kotoba-lang/kotoba` (`kotoba.cap-table`,
+`kotoba.host-providers/host-call-with`); this repository owns the semantic
+contract it implements:
+
+- **Acquire.** `(cap-acquire <kind-kw> <resource>)` runs the `guard-call`
+  intersection — requested ∩ CACAO grants ∩ local policy — exactly ONCE, at
+  acquisition. On grant the CONCRETE (post-intersection) capability is stored
+  in a per-run capability table under a small positive integer handle
+  (i64-safe; handle 0 is never issued) and the handle is returned. On denial
+  no handle is ever issued and the call fails closed with the
+  `intersect-grants` denial reason.
+- **Use.** A guarded host op accepts the handle as its leading argument
+  (`<op>-with` variants, e.g. `(host-i64-roundtrip-with cap code)`). The
+  handle is resolved back to the stored concrete capability — no
+  re-intersection happens, because the stored capability IS the intersected
+  one — but the resolution fails closed when the handle was never issued
+  (`:unknown-cap-handle`), the capability kind does not match the op
+  (`:cap-kind-mismatch`), or the stored expiry has passed at the use-time
+  clock (`:expired`). Expiry is therefore re-checked on EVERY use: a handle
+  acquired before expiry goes stale once `:now` advances past
+  `:cap/expires`.
+- **Receipts.** Acquisition and every use each leave a receipt in the same
+  append-only journal (`capability-host/journal`). `:receipt/call`
+  distinguishes them (`:cap/acquire` vs the `<op>-with` surface), and both
+  carry `:receipt/cap-handle` so the audit trail links every use back to the
+  acquisition that authorized it. Grant receipts embed the concrete
+  capability, never the broader requested one.
+- **Effect consistency.** When a function declares an `:effects` row, every
+  capability kind it acquires or uses through a handle must be covered by
+  the row (`effects-consistent?`); under-declaration is rejected at
+  check/emit time, per the Effect Consistency rule above.
+- **Compiled threading.** The wasm demonstration shape threads the handle as
+  a first-class i64 through a compiled module:
+  `kotoba.cap_acquire(kind_id: i32, res_ptr: i32, res_len: i32) -> i64` and
+  `kotoba.host_i64_roundtrip_with(cap: i64, code: i64) -> i64`.
+
+Remaining for S4b beyond this slice: dynamic verification of full CACAO
+delegation chains (signature-checked `leaf ⊆ root` at acquisition, kotoba-auth
+integration), typed capability parameters (`^GraphWriteCap` in the typed HIR),
+and compiled-code threading for the full host-op surface (only the
+ledger-append shape is emitted today; the other `<op>-with` variants are
+interpreter-only).
+
 ## Capability Value Contract
 
 The machine-checkable form of this document is
