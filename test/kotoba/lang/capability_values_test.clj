@@ -2,6 +2,7 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
+            [kotoba.lang.capability-cacao :as cacao]
             [kotoba.lang.capability-host :as host]
             [kotoba.lang.capability-values :as caps]))
 
@@ -166,7 +167,8 @@
     (is (= 1 (:kotoba.lang.capability.conformance/version manifest)))
     (doseq [tc (:cases manifest)
             :let [data (read-edn (str "lang/capability-conformance/" (:file tc)))
-                  result (if (= :host-dispatch (:type tc))
-                           (host/check-case tc data)
+                  result (case (:type tc)
+                           :host-dispatch (host/check-case tc data)
+                           :cacao-grants (cacao/check-case tc data)
                            (caps/check-case tc data))]]
       (is (:ok? result) (str (:id tc) " -> " (pr-str (:actual result)))))))

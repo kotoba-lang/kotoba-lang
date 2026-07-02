@@ -193,12 +193,61 @@ contract it implements:
   `kotoba.cap_acquire(kind_id: i32, res_ptr: i32, res_len: i32) -> i64` and
   `kotoba.host_i64_roundtrip_with(cap: i64, code: i64) -> i64`.
 
-Remaining for S4b beyond this slice: dynamic verification of full CACAO
-delegation chains (signature-checked `leaf ⊆ root` at acquisition, kotoba-auth
-integration), typed capability parameters (`^GraphWriteCap` in the typed HIR),
-and compiled-code threading for the full host-op surface (only the
+Remaining for S4b beyond this slice: kotoba-auth integration for chain
+issuance/rotation, typed capability parameters (`^GraphWriteCap` in the typed
+HIR), and compiled-code threading for the full host-op surface (only the
 ledger-append shape is emitted today; the other `<op>-with` variants are
-interpreter-only).
+interpreter-only). Dynamic verification of full CACAO delegation chains is
+delivered by the layering below.
+
+## CACAO chains
+
+Delegation-chain authorization is split across three strictly layered owners
+so this repository stays crypto-free:
+
+1. **Crypto** — `kotoba-lang/cacao` (`cacao.core/verify-chain`) verifies an
+   ordered vector of `cacao_b64` links (root first): every link's Ed25519
+   signature, `iss`/`aud` re-issuance linkage, resource attenuation
+   (`child ⊆ parent` under exact match or a parent trailing-`*` wildcard),
+   expiry ordering, and optional `:now` freshness. It returns only a result
+   map: `{:chain/valid? :chain/problems :chain/root-iss :chain/holder
+   :chain/resources :chain/expires :chain/depth}`.
+2. **Mapping (this repository)** —
+   `src/kotoba/lang/capability_cacao.cljc`
+   (`kotoba.lang.capability-cacao/grants-from-chain`) is a PURE mapping from
+   that VERIFIED result map (it never sees b64 or signatures) to the grant
+   shape consumed by `intersect-grants`.
+3. **Wiring** — the launcher (`kotoba-lang/kotoba`, `run --cacao <file>`)
+   calls both and feeds the grants into the existing guarded run.
+
+Resource URI convention (the `/`-to-slash keyword rule): a chain grants
+capabilities as
+
+```text
+kotoba://cap/<kind>/<resource>
+```
+
+where `<kind>` is the capability kind keyword printed without the colon — a
+bare kind maps to a bare keyword (`graph-read` → `:graph-read`) and a
+namespaced kind keeps its namespace as a path segment (`host/clipboard-read`
+→ `:host/clipboard-read`). `<resource>` is the resource string;
+`kotoba://cap/<kind>/*` grants the `:any` wildcard scope. Only kinds
+registered in `effect-for-kind` are granted; unknown kinds and non-cap URIs
+are SKIPPED with a note under `:skipped` — never silently granted.
+
+`grants-from-chain` returns `{:grants [..] :skipped [..]}` where each grant
+carries `:grant/expires` = `:chain/expires` (an ISO instant truncated to its
+date part — an unintelligible expiry fails closed rather than widening to
+never-expires) and a provenance-friendly `:grant/id` of
+`"cacao:<root-iss>:<index>"`, so every receipt's `:cap/provenance` traces
+back to the delegating root issuer. When `:chain/valid?` is not `true` the
+result is `{:grants [] :problems [..]}` — grants are NEVER derived from an
+unverified chain.
+
+Conformance fixtures of `:type :cacao-grants` live in
+`lang/capability-conformance/` and are exercised by
+`test/kotoba/lang/capability_cacao_test.clj` and by
+`bb scripts/check-capability-values.bb`.
 
 ## Capability Value Contract
 

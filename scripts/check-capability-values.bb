@@ -6,8 +6,10 @@
 ;; source directly so the gate cannot drift from the contract implementation.
 (load-file "src/kotoba/lang/capability_values.cljc")
 (load-file "src/kotoba/lang/capability_host.cljc")
+(load-file "src/kotoba/lang/capability_cacao.cljc")
 (alias 'caps 'kotoba.lang.capability-values)
 (alias 'host 'kotoba.lang.capability-host)
+(alias 'cacao 'kotoba.lang.capability-cacao)
 
 (def root (io/file "."))
 (def manifest-path "lang/capability-conformance/manifest.edn")
@@ -25,8 +27,9 @@
                  (for [tc (:cases manifest)]
                    (let [data (read-edn (str "lang/capability-conformance/"
                                              (:file tc)))
-                         result (if (= :host-dispatch (:type tc))
-                                  (host/check-case tc data)
+                         result (case (:type tc)
+                                  :host-dispatch (host/check-case tc data)
+                                  :cacao-grants (cacao/check-case tc data)
                                   (caps/check-case tc data))]
                      (if (:ok? result)
                        (do (println "ok" (:id tc)) true)
