@@ -108,10 +108,11 @@ repository as data:
 
 ## Current Status
 
-`kotoba-git` and `kotoba-rad` still have host implementation work outside this
-repository, but the command shape is now CLJC/EDN owned here. The
-remaining migration work is to replace those host implementations with
-Kotoba/CLJC adapters that consume `kotoba.cli/dispatch` results.
+`kotoba-git` and `kotoba-rad` are hosted by CLJC adapters in
+`kotoba-lang/kotoba` (`kotoba.git-adapter`, `kotoba.rad-adapter`) that consume
+`kotoba.cli/dispatch` planned results through injected host ports. No
+independent native host implementation of these commands remains; the command
+shape stays CLJC/EDN owned here.
 
 ## Maturity
 
