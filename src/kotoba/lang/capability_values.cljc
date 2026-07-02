@@ -28,7 +28,12 @@
    :host/keychain-read :host/keychain-read
    :host/keychain-write :host/keychain-write
    :host/notify :host/notify
-   :host/ledger-append :host/ledger-append})
+   :host/ledger-append :host/ledger-append
+   ;; kgraph-* (formerly kqe-*) EAVT graph-store host imports (kotoba.kgraph).
+   :host/graph-assert :host/graph-assert
+   :host/graph-retract :host/graph-retract
+   :host/graph-get-objects :host/graph-get-objects
+   :host/graph-query :host/graph-query})
 
 (defn non-empty-string?
   [x]
