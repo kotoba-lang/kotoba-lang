@@ -119,14 +119,14 @@
                    :cacao-grants [(grant :graph-write #{graph-a} nil "g1")]
                    :local-policy {:policy/allow {:graph-write #{graph-a graph-b}}}
                    :now now})
-        r (caps/receipt concrete now 'kqe-assert!)]
+        r (caps/receipt concrete now 'kgraph-assert!)]
     (is (:ok? (caps/validate-receipt r)))
     (is (= concrete (:receipt/cap r)))
     (is (= graph-a (get-in r [:receipt/cap :cap/resource])))
     (is (not= (:cap/resource requested)
               (get-in r [:receipt/cap :cap/resource])))
     (is (= now (:receipt/at r)))
-    (is (= 'kqe-assert! (:receipt/call r)))))
+    (is (= 'kgraph-assert! (:receipt/call r)))))
 
 (deftest malformed-cap-shapes-are-rejected
   (testing "a plain resource string is not a capability"
