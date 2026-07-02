@@ -135,7 +135,7 @@ are recorded in `docs/lang/versioning.md`; CI-facing commands are recorded in
 clojure -M:test
 bb scripts/check-cli-contract.bb lang/cli.edn
 bb scripts/check-package-contract.bb
-node scripts/check-lab-site.mjs
+bb scripts/check-legacy-runtime-absence.bb
 ```
 
 `clojure -M:test` is the primary CLI and package contract gate. This repository

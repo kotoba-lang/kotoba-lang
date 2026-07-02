@@ -22,8 +22,7 @@ repository:
 clojure -M:test
 bb scripts/check-cli-contract.bb lang/cli.edn
 bb scripts/check-package-contract.bb
-node --check docs/site/app.js
-node scripts/check-lab-site.mjs
+bb scripts/check-legacy-runtime-absence.bb
 ```
 
 The first command runs the CLJC test suites: the CLI contract conformance
