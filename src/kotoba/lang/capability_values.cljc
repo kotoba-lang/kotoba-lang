@@ -16,7 +16,19 @@
   (e.g. :egress, :secret-read) are added here to become supported."
   {:graph-read :graph-read
    :graph-write :graph-write
-   :infer :infer})
+   :infer :infer
+   ;; Host provider surfaces (issue #263): capability kinds for host-call
+   ;; dispatch through kotoba.lang.capability-host/guard-call. Each host kind
+   ;; is its own effect keyword, so a function accepting one must declare it.
+   :host/clipboard-read :host/clipboard-read
+   :host/clipboard-write :host/clipboard-write
+   :host/http :host/http
+   :host/fs-read :host/fs-read
+   :host/fs-write :host/fs-write
+   :host/keychain-read :host/keychain-read
+   :host/keychain-write :host/keychain-write
+   :host/notify :host/notify
+   :host/ledger-append :host/ledger-append})
 
 (defn non-empty-string?
   [x]
@@ -231,17 +243,38 @@
    :receipt/at now
    :receipt/call call})
 
+(defn denial-receipt?
+  "True when R records a denied host call (guard-call denial receipts carry
+  :receipt/denied with the fail-closed reason)."
+  [r]
+  (and (map? r) (contains? r :receipt/denied)))
+
 (defn validate-receipt
-  "Shape check for a receipt. Returns {:ok? bool :problems [...]}. The
-  embedded :receipt/cap must itself be a well-formed capability value (a
-  denial map or resource string is rejected)."
+  "Shape check for a receipt. Returns {:ok? bool :problems [...]}.
+
+  Grant/error receipts: the embedded :receipt/cap must itself be a well-formed
+  capability value (a denial map or resource string is rejected) — it is the
+  concrete, post-intersection capability. Denial receipts (:receipt/denied
+  present) carry the *requested* capability (which may itself be malformed —
+  that can be the reason for denial), so the cap check is relaxed and the
+  denial reason must be a keyword instead. Optional :receipt/outcome must be
+  one of :ok / :denied / :error when present."
   [r]
   (let [problems
         (if-not (map? r)
           [{:problem :receipt/not-a-map :value r}]
           (cond-> []
-            (not (capability? (:receipt/cap r)))
+            (and (not (denial-receipt? r))
+                 (not (capability? (:receipt/cap r))))
             (conj {:problem :receipt/cap-invalid :value (:receipt/cap r)})
+
+            (and (denial-receipt? r)
+                 (not (keyword? (:receipt/denied r))))
+            (conj {:problem :receipt/denied-invalid :value (:receipt/denied r)})
+
+            (and (contains? r :receipt/outcome)
+                 (not (contains? #{:ok :denied :error} (:receipt/outcome r))))
+            (conj {:problem :receipt/outcome-invalid :value (:receipt/outcome r)})
 
             (not (date-string? (:receipt/at r)))
             (conj {:problem :receipt/at-invalid :value (:receipt/at r)})
