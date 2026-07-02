@@ -193,12 +193,55 @@ contract it implements:
   `kotoba.cap_acquire(kind_id: i32, res_ptr: i32, res_len: i32) -> i64` and
   `kotoba.host_i64_roundtrip_with(cap: i64, code: i64) -> i64`.
 
+### Typed capability parameters
+
+Capability handles are typed at function boundaries. The canonical (and
+only) metadata form is a `:cap` entry in the parameter metadata map, whose
+value is a capability kind registered in `effect-for-kind`:
+
+```clojure
+(defn ^{:effects #{:host/ledger-append}} use-ledger
+  [^{:cap :host/ledger-append} c ^:i64 code]
+  (host-i64-roundtrip-with c code))
+```
+
+A `^:cap/<kind>` reader shorthand is not accepted: kinds are themselves
+namespaced keywords (`:host/ledger-append`), which a keyword shorthand
+cannot spell.
+
+Static guarantees (checked at check/emit time by the launcher's runtime
+slice, `kotoba-lang/kotoba` `kotoba.runtime/cap-typed-problems`; the kind
+vocabulary is this repository's `effect-for-kind`):
+
+- unknown param kinds are rejected (`:unknown-capability-kind`);
+- the leading argument of every `<op>-with` use must be **cap-typed** — the
+  direct result of `(cap-acquire ...)`, a cap-typed parameter, or a
+  let-bound alias — never an untyped/forgeable integer
+  (`:cap-arg-not-capability`);
+- kind consistency is enforced at every call site — a cap-typed value
+  presented to an op or a callee parameter of another kind is
+  `:cap-kind-mismatch` (always decidable in this slice: kinds are static);
+- a function's required effects include its cap-typed param kinds and,
+  through a fixpoint over direct calls, everything its callees require —
+  an under-covering declared `:effects` row is
+  `:cap-effect-under-declared` (Effect Consistency, interprocedurally).
+
+**i64 lowering.** In compiled wasm a cap-typed parameter lowers to an i64
+handle slot (the same machinery as `^:i64`), so handles flow through
+user-defined function calls end-to-end: the launcher's
+`demo_cap_threading` gate passes one handle through two levels of user
+functions down to the `host_i64_roundtrip_with` import. At run time the
+static gate is doubled dynamically: `resolve-use` re-checks kind and expiry
+on every host call, so a module produced by a checker-bypassing front end
+still fails closed at the host binding.
+
 Remaining for S4b beyond this slice: kotoba-auth integration for chain
-issuance/rotation, typed capability parameters (`^GraphWriteCap` in the typed
-HIR), and compiled-code threading for the full host-op surface (only the
-ledger-append shape is emitted today; the other `<op>-with` variants are
-interpreter-only). Dynamic verification of full CACAO delegation chains is
-delivered by the layering below.
+issuance/rotation, compiled-code threading for the full host-op ABI surface
+(cap-typed params thread through the i64 host ABI end-to-end; the
+pointer+length/buffer ABI `<op>-with` variants are interpreter-only), and
+ownership of the capability contract EDN by kotoba-core-contracts. Dynamic
+verification of full CACAO delegation chains is delivered by the layering
+below and is wired into the launcher (`run --cacao`).
 
 ## CACAO chains
 
