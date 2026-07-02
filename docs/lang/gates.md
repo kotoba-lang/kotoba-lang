@@ -22,15 +22,21 @@ repository:
 clojure -M:test
 bb scripts/check-cli-contract.bb lang/cli.edn
 bb scripts/check-package-contract.bb
+bb scripts/check-capability-values.bb
 bb scripts/check-legacy-runtime-absence.bb
 ```
 
 The first command runs the CLJC test suites: the CLI contract conformance
-tests (`test/kotoba/cli_test.cljc`) and the package contract tests
-(`test/kotoba/lang/package_contract_test.clj`). The second command validates
-the machine-readable CLI command contract. The third command runs the package
-manifest/lock conformance fixtures from `lang/package-conformance/`. The last
-two commands pin the lab site artifacts.
+tests (`test/kotoba/cli_test.cljc`), the package contract tests
+(`test/kotoba/lang/package_contract_test.clj`), and the capability value
+contract tests (`test/kotoba/lang/capability_values_test.clj`). The second
+command validates the machine-readable CLI command contract. The third command
+runs the package manifest/lock conformance fixtures from
+`lang/package-conformance/`. The fourth command runs the capability value
+conformance fixtures from `lang/capability-conformance/` through the same
+pure CLJC logic (`src/kotoba/lang/capability_values.cljc`): capability shape,
+effect-row consistency, CACAO grant / local policy intersection, and receipt
+cases. The last two commands pin the lab site artifacts.
 
 Implementation conformance against the language profile is owned by the
 launcher and CLJC authority gates in `kotoba-lang/kotoba` (see its
