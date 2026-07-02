@@ -118,3 +118,19 @@ The conformance suite should cover:
 - a dynamic graph/model call can avoid wildcard policy when capability-valued;
 - receipts include concrete capability information.
 
+## Capability Value Contract
+
+The machine-checkable form of this document is
+`src/kotoba/lang/capability_values.cljc` (`kotoba.lang.capability-values`):
+first-class `GraphReadCap` / `GraphWriteCap` / `InferCap` values
+(`graph-read-cap`, `graph-write-cap`, `infer-cap`, `capability?`,
+`validate-cap`), effect-row consistency (`effect-for-kind`,
+`effects-consistent?`), host-call-time CACAO grant / local policy
+intersection producing the concrete authorized capability or a fail-closed
+denial (`intersect-grants`), and receipts embedding the concrete — never the
+broader requested — capability (`receipt`, `validate-receipt`). Conformance
+fixtures live under `lang/capability-conformance/` (positive/negative cases
+listed in `lang/capability-conformance/manifest.edn`); they are exercised by
+`test/kotoba/lang/capability_values_test.clj` and by the gate
+`bb scripts/check-capability-values.bb`, which loads the same CLJC source.
+
