@@ -118,6 +118,40 @@ The conformance suite should cover:
 - a dynamic graph/model call can avoid wildcard policy when capability-valued;
 - receipts include concrete capability information.
 
+## Host-call dispatch
+
+`src/kotoba/lang/capability_host.cljc` (`kotoba.lang.capability-host`) is the
+pure CLJC dispatch kernel that hosts wire their provider invocation paths
+through. `guard-call` takes the host call name, the requested capability, the
+CACAO grants, the local policy, the current date, and the concrete provider
+`:handler`; it runs `intersect-grants` at call time and:
+
+- on denial, returns `{:kotoba.host/ok? false :kotoba.host/denied <reason>
+  :kotoba.host/receipt <denial receipt>}` WITHOUT invoking the handler
+  (fail closed);
+- on grant, invokes the handler with the CONCRETE (post-intersection)
+  capability — never the broader requested one — and returns
+  `{:kotoba.host/ok? true :kotoba.host/result .. :kotoba.host/receipt ..}`;
+- when the handler throws, records a receipt with `:receipt/outcome :error`
+  and rethrows.
+
+Every outcome builds its receipt via `kotoba.lang.capability-values/receipt`;
+denial receipts additionally carry `:receipt/denied <reason>` (and embed the
+requested capability, since no concrete capability exists), and
+`validate-receipt` accepts both shapes. `journal` returns an atom-backed
+append-only recorder (`{:record! fn :entries fn}`) so a host gets an ordered
+audit trail of receipts with zero extra dependencies.
+
+Host provider capability kinds (`:host/clipboard-read`,
+`:host/clipboard-write`, `:host/http`, `:host/fs-read`, `:host/fs-write`,
+`:host/keychain-read`, `:host/keychain-write`, `:host/notify`,
+`:host/ledger-append`) are registered in `effect-for-kind`, following the
+extensibility rule above: each host kind is its own required effect.
+Host-dispatch conformance fixtures (`:type :host-dispatch` in
+`lang/capability-conformance/manifest.edn`) are exercised by
+`test/kotoba/lang/capability_host_test.clj` and by
+`bb scripts/check-capability-values.bb`.
+
 ## Capability Value Contract
 
 The machine-checkable form of this document is
