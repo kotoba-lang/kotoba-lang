@@ -1,9 +1,17 @@
 # ADR - Kotoba Transit wire protocol
 
-- **Status**: Accepted
+- **Status**: Superseded by `ADR-kotoba-json-wire-protocol.md` (2026-07-03)
 - **Date**: 2026-07-01
 - **Artifacts**: `kotoba-lang/transit`, `docs/lang/package-rules.md`, `docs/lang/README.md`
 - **Related**: `ADR-kotoba-package-cid-lock.md`, `ADR-safe-capability-language.md`, `ADR-kotoba-rad-git-sovereign-repo.md`
+
+> **Superseded**: at M1 maturity (one call site, two days old), the
+> Transit-style `~:`/`~$`/`~#` tag scheme decided here was replaced by plain
+> `application/json` (optionally gzip-compressed) to stay aligned with
+> Kotoba's web-standard transport direction (QUIC/WebTransport in `net`,
+> `murakumo`, `rt`) and to keep wire messages debuggable with generic JSON
+> tooling. See `ADR-kotoba-json-wire-protocol.md` for the current rules. This
+> document is kept for history.
 
 ## Context
 

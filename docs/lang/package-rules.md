@@ -51,30 +51,36 @@ may use them in `:kotoba.package/provides`.
 
 ## Wire Protocol Rule
 
-Kotoba-owned application and resource APIs use Transit JSON as their default
-wire protocol. The canonical media type is `application/transit+json`, and the
-authoritative implementation is `kotoba-lang/transit`.
+Kotoba-owned application and resource APIs use plain JSON as their default
+wire protocol. The canonical media type is `application/json` (optionally
+`Content-Encoding: gzip` above `transit.core/default-gzip-threshold-bytes`),
+and the authoritative implementation is `kotoba-lang/transit`
+(`ADR-kotoba-json-wire-protocol.md`, superseding the earlier
+Transit-tagged-JSON `ADR-kotoba-transit-wire-protocol.md`).
 
 Rules:
 
 - in-memory and file authoring shape: EDN data models;
-- internal network/app wire: Transit JSON envelopes;
+- internal network/app wire: plain JSON envelopes (no `~:`/`~$`/`~#` tags);
 - package/storage integrity: CID, signed manifest, and lockfile;
-- external/provider interop: explicit adapters over the Transit/EDN model.
+- external/provider interop: explicit adapters over the EDN model.
 
 Packages that expose a network or host message surface should declare both the
-semantic app contract and, when relevant, the Transit wire contract. Example
+semantic app contract and, when relevant, the JSON wire contract. Example
 contract surfaces:
 
-- `:wire.kotoba.slides.deck.transit`
-- `:wire.kotoba.sheets.workbook.transit`
-- `:wire.kotoba.docs.document.transit`
-- `:wire.kotoba.datomic.request.transit`
+- `:wire.kotoba.slides.deck.json`
+- `:wire.kotoba.sheets.workbook.json`
+- `:wire.kotoba.docs.document.json`
+- `:wire.kotoba.datomic.request.json`
 
-Plain JSON, OpenAPI, GraphQL, ActivityStreams, XRPC, provider-specific REST, and
+OpenAPI, GraphQL, ActivityStreams, XRPC, provider-specific REST, and
 OpenAI-compatible request shapes are adapter surfaces. They are valid at
-boundaries, but must not become the source of truth for Kotoba-internal values
-such as keywords, symbols, sets, datoms, CIDs, operations, or patches.
+boundaries, but the wire projection is intentionally lossy at the JSON layer
+too: only the discriminant fields a reader already knows about (protocol
+family, resource kind, operation kind) are recovered as keywords by name —
+there is no generic, schema-free EDN reader for Kotoba-internal values such
+as keywords, symbols, sets, datoms, CIDs, operations, or patches.
 
 ## Capability Rule
 

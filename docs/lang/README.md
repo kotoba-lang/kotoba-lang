@@ -110,17 +110,18 @@ fixtures.
 
 ## Wire Protocol
 
-Kotoba-owned app/resource communication uses Transit JSON by default:
+Kotoba-owned app/resource communication uses plain JSON by default:
 
-- media type: `application/transit+json`
+- media type: `application/json`, optionally `Content-Encoding: gzip`
 - authoritative implementation: `kotoba-lang/transit`
 - in-memory and file authoring shape: EDN
 - package/storage integrity: CID, signed manifests, and lockfiles
-- external JSON/OpenAPI/GraphQL/XRPC/provider protocols: explicit adapters
+- external OpenAPI/GraphQL/XRPC/provider protocols: explicit adapters
 
-The decision is recorded in `docs/adr/ADR-kotoba-transit-wire-protocol.md`.
-Package rules require Transit wire contract surfaces for Kotoba-internal app APIs
-that cross a host or network boundary.
+The decision is recorded in `docs/adr/ADR-kotoba-json-wire-protocol.md`,
+superseding `docs/adr/ADR-kotoba-transit-wire-protocol.md`. Package rules
+require JSON wire contract surfaces for Kotoba-internal app APIs that cross a
+host or network boundary.
 
 ## Capability Values
 

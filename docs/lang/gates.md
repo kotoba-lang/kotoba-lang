@@ -10,6 +10,7 @@ test -f lang/package-conformance/manifest.edn
 test -f examples/package-manifest.edn
 test -f examples/kotoba.lock.edn
 test -f docs/adr/ADR-kotoba-transit-wire-protocol.md
+test -f docs/adr/ADR-kotoba-json-wire-protocol.md
 test -f docs/lang/package-rules.md
 bb scripts/check-package-contract.bb
 ```
