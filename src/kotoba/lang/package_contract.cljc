@@ -118,8 +118,8 @@
     (or
      (when-not (= 1 (:kotoba.lock/version m))
        (invalid "lock version 1 required" {:value (:kotoba.lock/version m)}))
-     (when-not (seq (:deps m))
-       (invalid "lock deps required" {}))
+     (when-not (vector? (:deps m))
+       (invalid "lock deps vector required" {:value (:deps m)}))
      (some (fn [dep]
              (or (missing-key dep lock-required "missing required lock field")
                  (when (and (:dep/kind dep)
