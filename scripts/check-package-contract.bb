@@ -107,8 +107,8 @@
 (defn check-lockfile! [m tc]
   (when-not (= 1 (:kotoba.lock/version m))
     (fail "lock version 1 required" {:value (:kotoba.lock/version m)}))
-  (when-not (seq (:deps m))
-    (fail "lock deps required" {}))
+  (when-not (vector? (:deps m))
+    (fail "lock deps vector required" {:value (:deps m)}))
   (let [declared (set (:declared-capabilities tc))]
     (doseq [dep (:deps m)]
       (require-keys dep lock-required "missing required lock field")
