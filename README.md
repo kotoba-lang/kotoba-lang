@@ -15,10 +15,21 @@ untrusted programs where the host decides which capabilities are available.
   compatibility source formats, while Kotoba-specific behavior is selected with
   the `:kotoba` reader target. ClojureScript-targeted reader behavior lives in
   `.cljc`, not dedicated `.cljs` source files.
+- **Implemented in Clojure ("Clojure on Clojure")**: the compiler, CLI, and
+  conformance tooling that process this Clojure-shaped language are themselves
+  written in Clojure/ClojureScript (`.cljc`). An earlier Rust implementation
+  was fully retired in favor of this CLJC authority (see
+  `docs/rust-migration-inventory.md`).
 - **Wasm-first execution**: the public compiler surface is `kotoba -e` and
   `kotoba wasm ...`.
 - **Capability-safe tooling**: safe-policy, safe-build, and selfhost-inspect are
-  part of the expected user-facing workflow.
+  part of the expected user-facing workflow. Safety is *benchmarked against*
+  Rust, not copied from it: Kotoba's capability-confinement model
+  (deny-by-default, explicit typed capabilities, signed audit receipts) is
+  ranked on an explicit safety ladder above ordinary Rust-style ownership/
+  borrow safety (see `docs/adr/ADR-safe-capability-language.md`). A
+  Rust-style borrow checker is on the roadmap as an additional layer, not yet
+  implemented.
 - **Conformance-oriented**: the profile is machine-readable and backed by
   fixtures so independent tools can agree on source behavior.
 
