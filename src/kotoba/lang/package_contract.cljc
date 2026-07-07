@@ -1,6 +1,7 @@
 (ns kotoba.lang.package-contract
   (:require [clojure.set :as set]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [multiformats.core :as mf]))
 
 (def manifest-required
   [:kotoba.package/name
@@ -27,9 +28,46 @@
   [x]
   (and (string? x) (not (str/blank? x))))
 
+(defn- read-varint
+  "Unsigned LEB128 varint at OFFSET in BS (any indexable byte sequence --
+  `nth`/`count` work uniformly on a JVM byte-array and a ClojureScript
+  vector, so this needs no platform-specific reader-conditional branch).
+  Returns [value next-offset]."
+  [bs offset]
+  (loop [offset offset value 0 shift 0]
+    (let [b (bit-and (nth bs offset) 0xff)]
+      (if (< b 0x80)
+        [(bit-or value (bit-shift-left b shift)) (inc offset)]
+        (recur (inc offset) (bit-or value (bit-shift-left (bit-and b 0x7f) shift)) (+ shift 7))))))
+
 (defn cid?
+  "A genuine CIDv1 structural check (`multiformats.core/cid->bytes` decode,
+  then parse [version-varint][codec-varint][multihash: fn-varint
+  len-varint digest]) -- not the previous `(str/starts-with? x \"bafy\")`
+  prefix sniff, which never actually decoded anything and happily accepted
+  strings containing characters (`0`/`1`/`8`/`9`, e.g. this repo's own
+  former test fixtures like \"bafyrepojson111...\") that fall OUTSIDE the
+  base32 'b'-multibase alphabet and could never have decoded as a real
+  CID. Requires version 1 (the only version `multiformats.core/cidv1`
+  emits) and the multihash's declared length to actually match the
+  decoded digest's byte count -- a truncated or padded string fails here
+  even if the multibase alphabet and varint framing otherwise parse."
   [x]
-  (and (non-empty-string? x) (str/starts-with? x "bafy")))
+  (and (non-empty-string? x)
+       (str/starts-with? x "b")
+       (try
+         (let [bs (mf/cid->bytes x)
+               [version off1] (read-varint bs 0)
+               [codec off2] (read-varint bs off1)
+               [hash-fn off3] (read-varint bs off2)
+               [hash-len off4] (read-varint bs off3)
+               digest-len (- (count bs) off4)]
+           (and (= 1 version)
+                (pos? codec)
+                (pos? hash-fn)
+                (pos? hash-len)
+                (= hash-len digest-len)))
+         (catch #?(:clj Exception :cljs :default) _ false))))
 
 (defn invalid
   [message data]
