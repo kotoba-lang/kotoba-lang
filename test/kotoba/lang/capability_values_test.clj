@@ -69,6 +69,29 @@
            :local-policy {:policy/allow {:teleport #{:any}}}
            :now now}))))
 
+(deftest aiueos-and-actor-host-kinds-are-registered-in-effect-for-kind
+  (testing "every aiueos kernel-capability kind and kototama actor-host kind kotoba.runtime/op->kind
+            declares is a member of effect-for-kind -- previously true only for the original
+            issue #263 provider kinds and kgraph-*; these 15 were added to op->kind (aiueos,
+            ADR-2607022700; actor-host, kotoba-core-contracts#3) without a matching entry here,
+            so guard-call denied every one of them at RUN time with :unsupported-kind the moment
+            a real caller supplied a policy and actually executed the guest, undetected because
+            only the static compile-time capability gate (which never consults effect-for-kind)
+            was ever exercised against them"
+    (doseq [kind [:host/log-write :host/clock-monotonic :host/random-bytes
+                  :host/topic-publish :host/topic-subscribe :host/pci-config
+                  :host/dma-map :host/irq-subscribe :host/mmio-map
+                  :host/identity-keypair :host/identity-sign :host/identity-verify
+                  :host/hash-sha256 :host/http-post :host/log-read]]
+      (is (contains? caps/effect-for-kind kind) kind)
+      (is (not= {:denied :unsupported-kind}
+                (caps/intersect-grants
+                 {:requested (caps/make-cap kind :any)
+                  :cacao-grants [(grant kind #{:any} nil "g1")]
+                  :local-policy {:policy/allow {kind #{:any}}}
+                  :now now}))
+          (str kind " must not be denied as unsupported now that it's registered")))))
+
 (deftest wildcard-result-requires-requested-grants-and-policy-all-any
   (testing "all three :any yields :any"
     (is (= :any
