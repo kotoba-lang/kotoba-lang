@@ -33,7 +33,37 @@
    :host/graph-assert :host/graph-assert
    :host/graph-retract :host/graph-retract
    :host/graph-get-objects :host/graph-get-objects
-   :host/graph-query :host/graph-query})
+   :host/graph-query :host/graph-query
+   ;; aiueos default kernel capabilities (aiueos.policy/default-kernel-caps,
+   ;; ADR-2607022700) -- registered in kotoba.runtime/op->kind (kotoba-lang/
+   ;; kotoba) since that ADR landed, but never added HERE. guard-call's
+   ;; unsupported-kind check (this namespace) means every one of these 9
+   ;; ops was denied at RUN time with :kotoba.host/denied :unsupported-kind
+   ;; the moment a real caller supplied a runtime policy and actually
+   ;; executed the guest -- kotoba's own `wasm emit`/`wasm run` test suite
+   ;; only ever exercised the static compile-time capability gate (which
+   ;; doesn't consult effect-for-kind at all) against these ops, so this
+   ;; went undetected until kotoba.wasm-exec's real (non-stub) provider
+   ;; implementations tried to actually guard-call them for the first time.
+   :host/log-write :host/log-write
+   :host/clock-monotonic :host/clock-monotonic
+   :host/random-bytes :host/random-bytes
+   :host/topic-publish :host/topic-publish
+   :host/topic-subscribe :host/topic-subscribe
+   :host/pci-config :host/pci-config
+   :host/dma-map :host/dma-map
+   :host/irq-subscribe :host/irq-subscribe
+   :host/mmio-map :host/mmio-map
+   ;; kotoba-lang/kototama's actor:host ABI (kototama.contract/
+   ;; kototama.tender, ADR-2607062330/2607062400) mirrored into kotoba's own
+   ;; real host-provider surface (kotoba.wasm-exec/real-op-effects) -- same
+   ;; gap as the aiueos kinds above, caught at the same time.
+   :host/identity-keypair :host/identity-keypair
+   :host/identity-sign :host/identity-sign
+   :host/identity-verify :host/identity-verify
+   :host/hash-sha256 :host/hash-sha256
+   :host/http-post :host/http-post
+   :host/log-read :host/log-read})
 
 (defn non-empty-string?
   [x]
