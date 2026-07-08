@@ -60,3 +60,38 @@ The profile is tracked to M6:
 The maturity evidence is recorded in `docs/lang/coverage.edn`; versioning rules
 are recorded in `docs/lang/versioning.md`; gate commands are recorded in
 `docs/lang/gates.md`.
+
+## Addendum (2026-07-08): profile v3 reinstates `.cljs`
+
+Profile v2 (2026-07-02, commit `a11b7eb9`) retired `.cljs` as a dedicated
+source extension on a thin equivalence argument alone (`.cljc` +
+`#?(:cljs ...)` already covers what a dedicated `.cljs` file would), with no
+documented analysis of the porting friction that imposes on people who
+already have `.cljs` code and want to try Kotoba without renaming files
+first. Profile v3 reverses that: `.kotoba`, `.cljc`, `.clj`, `.cljs` are all
+accepted source extensions again.
+
+This is a widening, not a return to the pre-v2 shape:
+
+- `.cljs` is added as a single-target compatibility extension with its own
+  `:reader-branches ["cljs" "default"]` — the same shape `.clj` already has
+  (`:reader-branches ["clj" "default"]`) — not the fully portable `.kotoba`
+  branch chain `.cljc` gets. A `.cljs` file cannot carry `#?(:kotoba ...)`
+  branches, mirroring how a `.clj` file cannot either.
+- `:cljs` was never removed as a reader *target*: `.cljc`'s
+  `:reader-targets`/`namespace-extension-priority` already listed `:cljs`
+  throughout v2 (a `.cljc` file was always readable under
+  `--reader-target cljs`). This addendum only widens which file *extension*
+  can carry that target directly, without going through `.cljc`.
+- `namespace-extension-priority` gains `"cljs"` in all three reader-target
+  entries: appended last for `:kotoba` and `:clj` (least relevant to those
+  targets), inserted second — right after `"cljc"` — for `:cljs`'s own list,
+  mirroring where `"clj"` sits in `:clj`'s own list.
+
+Downstream: `kotoba-lang/kotoba-core-contracts`
+(`resources/kotoba/lang/source_contract.edn`) gained a `:cljs` source-kind
+mirroring `:clj`'s shape, and `kotoba-lang/kotoba` bumped its
+`kotoba-core-contracts` pin and added `src/demo.cljs` as a genuine
+end-to-end positive fixture (a bare `.cljs` file, accepted directly,
+defaulting to the `:cljs` reader target with no `--reader-target` flag
+needed).
