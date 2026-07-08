@@ -27,9 +27,14 @@ untrusted programs where the host decides which capabilities are available.
   Rust, not copied from it: Kotoba's capability-confinement model
   (deny-by-default, explicit typed capabilities, signed audit receipts) is
   ranked on an explicit safety ladder above ordinary Rust-style ownership/
-  borrow safety (see `docs/adr/ADR-safe-capability-language.md`). A
-  Rust-style borrow checker is on the roadmap as an additional layer, not yet
-  implemented.
+  borrow safety (see `docs/adr/ADR-safe-capability-language.md`). A general
+  Rust-style borrow/lifetime system over every value was deliberately NOT
+  built — T1 Memory Safety is already achieved without one. What shipped
+  instead is a narrow slice scoped only to capability-typed values
+  (deterministic drop, no implicit clone: a capability handle may be
+  consumed at most once per execution path — `kotoba.runtime/cap-affine-
+  problems` in `kotoba-lang/kotoba`, `:cap-value-reused`), which is what the
+  ADR's own safety ladder actually calls for.
 - **Conformance-oriented**: the profile is machine-readable and backed by
   fixtures so independent tools can agree on source behavior.
 
