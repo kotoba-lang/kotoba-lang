@@ -52,7 +52,7 @@
 (deftest profile-and-package-contract-are-machine-readable
   (let [profile (read-edn "lang/profile.edn")
         package (read-edn "lang/package.edn")]
-    (is (= 2 (:kotoba.lang/profile-version profile)))
+    (is (= 3 (:kotoba.lang/profile-version profile)))
     (is (= :kotoba (:kotoba.lang/default-reader-target profile)))
     (is (= 1 (:kotoba.lang.package/version package)))
     (is (contains? (set (get-in package [:manifest :package-kinds :allow-kinds]))

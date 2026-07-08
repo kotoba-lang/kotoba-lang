@@ -11,10 +11,12 @@ untrusted programs where the host decides which capabilities are available.
 
 - **Small source surface**: Kotoba source is a Kotoba/EDN subset with `.kotoba`
   as the canonical extension.
-- **Clojure-family shape**: `.clj` and `.cljc` inputs are accepted as
-  compatibility source formats, while Kotoba-specific behavior is selected with
-  the `:kotoba` reader target. ClojureScript-targeted reader behavior lives in
-  `.cljc`, not dedicated `.cljs` source files.
+- **Clojure-family shape**: `.clj`, `.cljc`, and `.cljs` inputs are accepted
+  as compatibility source formats, while Kotoba-specific behavior is
+  selected with the `:kotoba` reader target — only reachable through
+  `.cljc`'s wider branch chain, since `.clj` and `.cljs` are single-target
+  compatibility extensions with their own reader-branch chain each (profile
+  v3, reinstating `.cljs`; see `docs/lang/versioning.md`).
 - **Implemented in Clojure ("Clojure on Clojure")**: the compiler, CLI, and
   conformance tooling that process this Clojure-shaped language are themselves
   written in Clojure/ClojureScript (`.cljc`). An earlier Rust implementation
@@ -69,15 +71,18 @@ conformance fixtures that the implementation consumes.
 
 ## Source Contract
 
-- Accepted extensions: `.kotoba`, `.cljc`, `.clj`.
+- Accepted extensions: `.kotoba`, `.cljc`, `.clj`, `.cljs`.
 - Canonical Kotoba-only extension: `.kotoba`.
 - Portable Clojure-family extension: `.cljc`.
-- Retired legacy extension: `.cljs` source files; use `.cljc` with
-  `#?(:cljs ...)` for ClojureScript-targeted behavior.
+- Compatibility extensions: `.clj` (JVM Clojure) and `.cljs` (ClojureScript),
+  each single-target with its own reader-branch chain (`["clj" "default"]`
+  and `["cljs" "default"]` respectively) — neither carries `#?(:kotoba ...)`
+  branches the way `.cljc` does.
 - Default reader target: `kotoba`.
 - `:kotoba` reader branch fallback order: `:kotoba`, then `:clj`, then
   `:default`.
-- Namespace resolution priority for target `kotoba`: `.kotoba`, `.cljc`, `.clj`.
+- Namespace resolution priority for target `kotoba`: `.kotoba`, `.cljc`,
+  `.clj`, `.cljs`.
 
 Example portable source:
 
@@ -90,7 +95,7 @@ Example portable source:
 New Kotoba-only code should use `.kotoba`. Shared Clojure-family source should
 use `.cljc` and place Kotoba-specific behavior behind `#?(:kotoba ...)`.
 
-The machine-readable source contract is `lang/profile.edn` (profile version 2);
+The machine-readable source contract is `lang/profile.edn` (profile version 3);
 conformance fixtures live under `lang/conformance/`.
 
 ## Repository Scope

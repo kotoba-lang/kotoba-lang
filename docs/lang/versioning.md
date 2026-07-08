@@ -30,6 +30,21 @@ Profile version 2 retires dedicated `.cljs` source files from the accepted
 source-extension set. ClojureScript-targeted behavior remains expressible in
 portable `.cljc` source through `#?(:cljs ...)` reader branches.
 
+Profile version 3 reinstates `.cljs` as an accepted compatibility source
+extension. The retirement in version 2 rested on a thin equivalence
+argument (`.cljc` + `#?(:cljs ...)` already covers what a dedicated `.cljs`
+file would) with no documented analysis of porting friction for people who
+already have `.cljs` code and want to try Kotoba without renaming files
+first; that friction is the reason for the reversal. `.cljs` is added as a
+single-target compatibility extension mirroring `.clj`'s shape (its own
+`:reader-branches ["cljs" "default"]`, not the fully portable `.kotoba`
+branch chain), not as a return to full ClojureScript compatibility — see
+`:kotoba.lang/authoring-surface` in `profile.edn` and
+`docs/adr/ADR-kotoba-lang-profile.md`'s addendum. `:cljs` was never removed
+as a reader *target* (`.cljc` could already be read under
+`--reader-target cljs`); this only widens which file extension can carry it
+directly.
+
 ## External Implementations
 
 An implementation conforms to profile version 1 when it can consume
