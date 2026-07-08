@@ -1,6 +1,6 @@
 # ADR - Kotoba package references, CID locks, and capability-safe dependencies
 
-- **Status**: Accepted (contract; implementation pending)
+- **Status**: Accepted — contract implemented through M4 (M5/M6 remain, see Maturity)
 - **Date**: 2026-06-30
 - **Artifacts**: `lang/package.edn`, `examples/package-manifest.edn`, `examples/kotoba.lock.edn`
 - **Related**: `ADR-kotoba-lang-foundational-stdlib.md`, `ADR-safe-capability-language.md`, `ADR-kotoba-rad-git-sovereign-repo.md`
@@ -176,11 +176,20 @@ the caller policy grant it.
 
 ## Maturity
 
-- `M0`: this ADR.
-- `M1`: `lang/package.edn` machine-readable contract.
-- `M2`: positive package manifest and lockfile examples.
-- `M3`: negative fixtures for missing CID, bad signature, bad repo RID, and
-  excessive capability grant.
-- `M4`: manifest-driven package contract runner.
-- `M5`: `kotoba-lang/registry` or `kotoba-cli` consumes the same suite.
-- `M6`: signing, revocation, and package compatibility policy.
+- `M0` ✅: this ADR.
+- `M1` ✅: `lang/package.edn` machine-readable contract.
+- `M2` ✅: positive package manifest and lockfile examples
+  (`lang/package-conformance/positive/`).
+- `M3` ✅: negative fixtures for missing CID, bad signature, bad repo RID, and
+  excessive capability grant (`lang/package-conformance/negative/`).
+- `M4` ✅: manifest-driven package contract runner
+  (`scripts/check-package-contract.bb`, confirmed passing against all
+  positive/negative fixtures).
+- `M5` ⬜: `kotoba-lang/registry` or `kotoba-cli` consumes the same suite —
+  `registry` is still `:status :planned` (deferred to the `:packages`
+  CID-lock track, see `docs/lang/coverage.edn` `:stdlib :engineering-gaps`).
+- `M6` ⬜: signing, revocation, and package compatibility policy — the
+  contract *validates* signature/revocation shape (rejects unsigned,
+  bad-alg, revoked, and expired-signer entries), but real key lifecycle,
+  revocation propagation, and a versioned compatibility policy for this
+  contract itself are not yet implemented.
