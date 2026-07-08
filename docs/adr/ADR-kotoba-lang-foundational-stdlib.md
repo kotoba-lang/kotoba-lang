@@ -89,7 +89,7 @@ substrate. The matrix:
 | Horizontal stdlib breadth | std small, eco huge | batteries | huge | medium(JVM) | 12 foundational + 3 composite (v0.1.0/M6) |
 | Property testing | proptest | — | — | test.check | **test (consumes spec generator)** |
 | Package registry | crates.io | go modules | npm/deno.land | clojars/maven | git-SHA dep + west manifest (`:packages` CID-lock track in progress) |
-| LSP wire | rust-analyzer | gopls | tsserver | clojure-lsp | lsp data layer ✅, JSON-RPC wire not integrated |
+| LSP wire | rust-analyzer | gopls | tsserver | clojure-lsp | lsp data layer ✅, JSON-RPC wire ✅ (`kotoba-lang/lsp-rpc`) |
 | async runtime maturity | tokio(mature) | runtime(mature) | libuv(mature) | core.async | no runtime, pure state-machine (WASM premise, by design) |
 | 1.0 stability | ✅ | ✅ | ✅ | ✅ | 0.1.0 (API settling) |
 
@@ -98,8 +98,7 @@ AI-agent-native untrusted-code execution; aiueos capability OS;
 content-addressed data substrate; phonosemantic (kototama/kotodama).
 
 **Where kotoba trails (engineering, not design):** package registry; 1.0
-stability; async runtime maturity (intentionally host-driven); LSP wire
-integration.
+stability; async runtime maturity (intentionally host-driven).
 
 ## Consequences
 
@@ -140,14 +139,17 @@ All 15 shipped libs are at **M6 / v0.1.0**:
 ## Roadmap — engineering gaps to close (not design)
 
 These are the axes where the matrix above shows kotoba trailing; tracked here so
-they become follow-up work rather than drift:
+they become follow-up work rather than drift. See `docs/lang/coverage.edn`
+`:stdlib :engineering-gaps` for the machine-readable status of each.
 
 1. **Package registry** — currently git-SHA dep + west manifest. A first-party
    registry/lockfile is the `:packages` CID-lock track
    (`package-rules.md` / `ADR-kotoba-package-cid-lock`, owner WIP); the
    `registry` stdlib lib is **deferred** there to avoid duplication.
-2. **LSP wire** — `lsp` lib owns the data contract (positions/ranges/diagnostics);
-   a JSON-RPC transport binding is the gap (currently host-supplied).
+2. **LSP wire — closed.** `lsp` lib owns the data contract
+   (positions/ranges/diagnostics); the JSON-RPC transport binding gap is
+   closed by `kotoba-lang/lsp-rpc` (JSON-RPC framing over a host-injected
+   transport).
 3. **async runtime** — intentionally a pure state machine (WASM premise: no
    threads, no wall-clock). The gap is durable-outer-loop reference drivers that
    thread `async` + `time` + `scheduler` for long-running cells, not a tokio.
