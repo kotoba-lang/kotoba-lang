@@ -63,7 +63,14 @@
    :host/identity-verify :host/identity-verify
    :host/hash-sha256 :host/hash-sha256
    :host/http-post :host/http-post
-   :host/log-read :host/log-read})
+   :host/log-read :host/log-read
+   ;; kami-* game-engine ECS surface (kotoba-core-contracts "kami/engine",
+   ;; capability id 233): one kind for the whole op family, mirroring the
+   ;; one shared capability. Registered HERE at the same time as the
+   ;; contract/provider registration -- omitting this entry is exactly the
+   ;; aiueos/actor:host :unsupported-kind runtime-denial gap documented
+   ;; above, so don't repeat it for new families.
+   :host/kami-engine :host/kami-engine})
 
 (defn non-empty-string?
   [x]
