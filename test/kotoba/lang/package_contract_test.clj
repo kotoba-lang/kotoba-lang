@@ -12,8 +12,44 @@
   [path]
   (edn/read-string (slurp (io/file path))))
 
+;; lang/package-conformance/manifest.edn, lang/package.edn, and
+;; lang/profile.edn are stored as Datomic/Datascript tx-data (see
+;; schema.edn / scripts/edn-datomize.bb `wrap-map-preserve-ns!`).
+;; `unblob` reverses the pr-str blob-ification of non-scalar values.
+(defn- unblob [v]
+  (if (string? v)
+    (try (let [parsed (edn/read-string v)] (if (coll? parsed) parsed v))
+         (catch Exception _ v))
+    v))
+
+;; manifest.edn: :kotoba.lang.package.conformance/version was already
+;; namespaced and kept as-is; the plain :cases key was prefixed to
+;; :kotoba.lang.package.conformance/cases and blob-stringified.
+(defn- reconstitute-package-conformance-manifest [tx-data]
+  (let [e (dissoc (first tx-data) :db/id)]
+    {:kotoba.lang.package.conformance/version
+     (:kotoba.lang.package.conformance/version e)
+     :cases (unblob (:kotoba.lang.package.conformance/cases e))}))
+
+;; profile.edn: every top-level key was already namespaced
+;; (:kotoba.lang/*), so no key was renamed -- just unblob every value.
+(defn- reconstitute-entity [tx-data]
+  (into {} (map (fn [[k v]] [k (unblob v)]))
+        (dissoc (first tx-data) :db/id)))
+
+;; package.edn: only :kotoba.lang.package/version was already namespaced
+;; (kept as-is); every other originally-plain key (:status :summary
+;; :identity :manifest :lock-entry :trust-rules :maturity) was prefixed to
+;; :kotoba.lang.package/* by the same ns, so it must be stripped back to
+;; plain explicitly (a blind namespace-strip would also strip :version).
+(defn- reconstitute-package-edn [tx-data]
+  (let [e (dissoc (first tx-data) :db/id)]
+    (into {:kotoba.lang.package/version (:kotoba.lang.package/version e)}
+          (map (fn [[k v]] [(keyword (name k)) (unblob v)]))
+          (dissoc e :kotoba.lang.package/version))))
+
 (deftest package-conformance-fixtures-match-contract
-  (let [manifest (read-edn manifest-path)]
+  (let [manifest (reconstitute-package-conformance-manifest (read-edn manifest-path))]
     (is (= 1 (:kotoba.lang.package.conformance/version manifest)))
     (doseq [tc (:cases manifest)
             :let [data (read-edn (str "lang/package-conformance/" (:file tc)))
@@ -50,8 +86,8 @@
       (is (false? (contract/cid? truncated))))))
 
 (deftest profile-and-package-contract-are-machine-readable
-  (let [profile (read-edn "lang/profile.edn")
-        package (read-edn "lang/package.edn")]
+  (let [profile (reconstitute-entity (read-edn "lang/profile.edn"))
+        package (reconstitute-package-edn (read-edn "lang/package.edn"))]
     (is (= 3 (:kotoba.lang/profile-version profile)))
     (is (= :kotoba (:kotoba.lang/default-reader-target profile)))
     (is (= 1 (:kotoba.lang.package/version package)))

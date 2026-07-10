@@ -4,8 +4,25 @@
             [kotoba.cli :as cli]))
 
 (def contract (cli/read-contract))
+
+;; lang/adapters.edn is stored as Datomic/Datascript tx-data (see
+;; schema.edn); every key was already namespaced (:kotoba.adapter.registry/*)
+;; so the transform did not rename anything -- reverse the blob-ification of
+;; non-scalar values the same way kotoba.cli/read-contract does for cli.edn.
+#?(:clj
+   (defn- unblob [v]
+     (if (string? v)
+       (try (let [parsed (edn/read-string v)] (if (coll? parsed) parsed v))
+            (catch Exception _ v))
+       v)))
+
+#?(:clj
+   (defn- reconstitute-entity [tx-data]
+     (into {} (map (fn [[k v]] [k (unblob v)]))
+           (dissoc (first tx-data) :db/id))))
+
 (def adapters
-  #?(:clj (edn/read-string (slurp "lang/adapters.edn"))
+  #?(:clj (reconstitute-entity (edn/read-string (slurp "lang/adapters.edn")))
      :cljs {}))
 
 (deftest contract-validates-in-cljc

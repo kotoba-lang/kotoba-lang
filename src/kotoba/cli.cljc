@@ -14,6 +14,27 @@
 
 (def adapter-kinds #{:node :jvm :native :browser :edge})
 
+;; lang/cli.edn is stored on disk as Datomic/Datascript tx-data
+;; (`[{:db/id -1 :kotoba.cli.contract/... ...}]`, see schema.edn and
+;; scripts/edn-datomize.bb `wrap-map-preserve-ns!`) rather than a bare
+;; map. Every top-level key in that file was already namespaced
+;; (:kotoba.cli.contract/*), so the transform did not rename any key -- only
+;; non-scalar values (nested maps/vectors-of-maps) were pr-str'd into blob
+;; strings. `reconstitute-entity` reverses exactly that: drop :db/id and
+;; edn/read-string any blob value back into real data, leaving every key
+;; identical to the original file shape so downstream lookups are unchanged.
+#?(:clj
+   (defn- unblob [v]
+     (if (string? v)
+       (try (let [parsed (edn/read-string v)] (if (coll? parsed) parsed v))
+            (catch Exception _ v))
+       v)))
+
+#?(:clj
+   (defn- reconstitute-entity [tx-data]
+     (into {} (map (fn [[k v]] [k (unblob v)]))
+           (dissoc (first tx-data) :db/id))))
+
 (defn read-contract
   "Read a CLI contract EDN file. CLJS callers should pass the parsed map to
   `validate-contract` and `command-result`."
@@ -21,7 +42,7 @@
          :cljs (throw (ex-info "read-contract requires an EDN map on CLJS" {}))))
   ([path]
    #?(:clj
-      (edn/read-string (slurp (io/file path)))
+      (reconstitute-entity (edn/read-string (slurp (io/file path))))
       :cljs
       (throw (ex-info "read-contract is not available on CLJS" {:path path})))))
 

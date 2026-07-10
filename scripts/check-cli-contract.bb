@@ -6,6 +6,20 @@
 
 (def required-commands #{:run :check :db :git :rad :deploy :hinshitsu})
 
+;; lang/cli.edn is stored as Datomic/Datascript tx-data (see schema.edn /
+;; scripts/edn-datomize.bb `wrap-map-preserve-ns!`); every key was
+;; already namespaced so the transform did not rename anything, it only
+;; pr-str'd non-scalar values into blob strings. Reverse exactly that.
+(defn- unblob [v]
+  (if (string? v)
+    (try (let [parsed (edn/read-string v)] (if (coll? parsed) parsed v))
+         (catch Exception _ v))
+    v))
+
+(defn- reconstitute-entity [tx-data]
+  (into {} (map (fn [[k v]] [k (unblob v)]))
+        (dissoc (first tx-data) :db/id)))
+
 (defn fail! [& parts]
   (binding [*out* *err*]
     (println (str/join " " parts)))
@@ -57,7 +71,7 @@
 
 (defn -main [& [path]]
   (let [path (or path "lang/cli.edn")
-        contract (edn/read-string (slurp path))
+        contract (reconstitute-entity (edn/read-string (slurp path)))
         version (:kotoba.cli.contract/version contract)
         tier-labels (:kotoba.cli.contract/tier-labels contract)
         option-types (:kotoba.cli.contract/option-types contract)
