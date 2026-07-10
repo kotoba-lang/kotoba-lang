@@ -12,6 +12,23 @@
   [path]
   (edn/read-string (slurp (io/file path))))
 
+;; lang/capability-conformance/manifest.edn is stored as Datomic/Datascript
+;; tx-data (see schema.edn). See scripts/check-capability-values.bb for the
+;; same reconstitution -- the manifest's plain :cases key was renamed to
+;; :kotoba.lang.capability.conformance/cases and blob-stringified, while the
+;; already-namespaced :version key was left untouched.
+(defn- unblob [v]
+  (if (string? v)
+    (try (let [parsed (edn/read-string v)] (if (coll? parsed) parsed v))
+         (catch Exception _ v))
+    v))
+
+(defn- reconstitute-capability-conformance-manifest [tx-data]
+  (let [e (dissoc (first tx-data) :db/id)]
+    {:kotoba.lang.capability.conformance/version
+     (:kotoba.lang.capability.conformance/version e)
+     :cases (unblob (:kotoba.lang.capability.conformance/cases e))}))
+
 (def graph-a "bafygrapha11111111111111111111111111111111111111111111111")
 (def graph-b "bafygraphb22222222222222222222222222222222222222222222222")
 (def graph-c "bafygraphc33333333333333333333333333333333333333333333333")
@@ -186,7 +203,7 @@
                                            :provenance ["g1"]})))))
 
 (deftest capability-conformance-fixtures-match-contract
-  (let [manifest (read-edn manifest-path)]
+  (let [manifest (reconstitute-capability-conformance-manifest (read-edn manifest-path))]
     (is (= 1 (:kotoba.lang.capability.conformance/version manifest)))
     (doseq [tc (:cases manifest)
             :let [data (read-edn (str "lang/capability-conformance/" (:file tc)))

@@ -17,10 +17,32 @@
 (defn read-edn [path]
   (edn/read-string (slurp (io/file root path))))
 
+;; lang/capability-conformance/manifest.edn is stored as Datomic/Datascript
+;; tx-data (see schema.edn / scripts/edn-datomize.bb
+;; `wrap-map-preserve-ns!`): :kotoba.lang.capability.conformance/version was
+;; already namespaced and kept as-is; the plain :cases key got prefixed to
+;; :kotoba.lang.capability.conformance/cases and, being a vector-of-maps,
+;; pr-str'd into a blob string. Reverse both back to the original
+;; {:kotoba.lang.capability.conformance/version _ :cases [...]} shape. The
+;; individual fixture files under lang/capability-conformance/{positive,
+;; negative}/*.edn are intentionally left untransformed (see repo notes),
+;; so `data` reads below stay plain read-edn.
+(defn- unblob [v]
+  (if (string? v)
+    (try (let [parsed (edn/read-string v)] (if (coll? parsed) parsed v))
+         (catch Exception _ v))
+    v))
+
+(defn- reconstitute-capability-conformance-manifest [tx-data]
+  (let [e (dissoc (first tx-data) :db/id)]
+    {:kotoba.lang.capability.conformance/version
+     (:kotoba.lang.capability.conformance/version e)
+     :cases (unblob (:kotoba.lang.capability.conformance/cases e))}))
+
 (defn fail [msg data]
   (throw (ex-info msg data)))
 
-(let [manifest (read-edn manifest-path)]
+(let [manifest (reconstitute-capability-conformance-manifest (read-edn manifest-path))]
   (when-not (= 1 (:kotoba.lang.capability.conformance/version manifest))
     (fail "capability conformance version 1 required" manifest))
   (let [results (doall
