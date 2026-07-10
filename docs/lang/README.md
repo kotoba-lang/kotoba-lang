@@ -19,10 +19,11 @@ Clojure execution. JVM is only the bootstrap host for today's language CLI.
 Canonical execute: `kototama` `run guest.wasm`.
 
 ```sh
-# Primary — AOT (package-lock mandatory)
+# Language — AOT (package-lock mandatory)
 kotoba wasm emit examples/hello.kotoba --package-lock kotoba.lock.edn -o hello.wasm
 kotoba wasm safe-build examples/policy-demo.kotoba --policy policy.edn --package-lock kotoba.lock.edn -o policy-demo.wasm
-kotoba wasm run examples/hello.kotoba --package-lock kotoba.lock.edn   # emit + host execute
+# Runtime (canonical): kototama  run  hello.wasm
+# Compat only:        kotoba wasm run hello.kotoba --package-lock …
 ```
 
 Historical Rust-era names (`kotoba -e`, `wasm safe-policy`, `wasm selfhost-inspect`)
