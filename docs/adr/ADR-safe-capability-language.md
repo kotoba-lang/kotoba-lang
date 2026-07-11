@@ -1,6 +1,6 @@
 # ADR — kotoba 言語の安全性設計まとめ直し: capability-confinement を一次原理にする
 
-Status: **Accepted・実装進行中** — gating 層は実装完了（capability/per-cid・subset 全 spec・effect interprocedural・S1b literal 型チェック・`:memory-pages` 強制・least-privilege tooling、実 cell で end-to-end 検証）。borrow checker（S2）は capability 値限定の narrow slice として実装済み（2026-07-08、`kotoba-lang/kotoba` `cap-affine-problems`、汎用 ownership システムではない）。残務は型システム本体（typed HIR）・capability 値渡し S4b・supply chain S5。詳細は §0「実装状況サマリ」と §9 ロードマップ。
+Status: **Accepted・実装進行中** — gating 層は実装完了（capability/per-cid・subset 全 spec・effect interprocedural・S1b literal 型チェック・`:memory-pages` 強制・least-privilege tooling、実 cell で end-to-end 検証）。borrow checker（S2）は capability 値限定の narrow slice として実装済み（2026-07-08、`kotoba-lang/kotoba` `cap-affine-problems`、汎用 ownership システムではない）。2026-07-11 に型・region・structured concurrency の CLJC 契約を採択し、M3 compiler admission adapter まで実装した（公開依存pin更新前の注釈付きsourceは fail-closed）。残務は typed HIR、region / task の lowering、capability 値渡し S4b の ABI 拡張、supply chain S5。詳細は §0「実装状況サマリ」と §9 ロードマップ、および `ADR-kotoba-type-region-structured-concurrency.md`。
 Date: 2026-06-25（設計）/ 実装更新: 2026-06-26
 Implemented: `crates/kotoba-clj`（`policy.rs` / `subset.rs` / `effects.rs` / `ty.rs` / `cli.rs`、safe-mode tests 約 170）
 Crate: `crates/kotoba-clj`（front-end 拡張）+ `kotoba-runtime` / `kotoba-lattice`（runtime 側 enforcement）

@@ -29,16 +29,16 @@
   (let [result (cli/validate-contract contract)]
     (is (:kotoba.cli/ok? result))
     (is (= {:version 1
-            :commands [:run :check :db :git :rad :deploy :hinshitsu]
-            :command-count 7
-            :option-count 40}
+            :commands [:run :check :db :git :rad :deploy :hinshitsu :wasm]
+            :command-count 8
+            :option-count 46}
            (:kotoba.cli/data result)))))
 
 (deftest cljc-authority-implements-contract-commands
   (is (= {:kotoba.cli/ok? true
           :kotoba.cli/source :cljc
-          :kotoba.cli/contract-commands ["check" "db" "deploy" "git" "hinshitsu" "rad" "run"]
-          :kotoba.cli/implemented-commands ["check" "db" "deploy" "git" "hinshitsu" "rad" "run"]
+          :kotoba.cli/contract-commands ["check" "db" "deploy" "git" "hinshitsu" "rad" "run" "wasm"]
+          :kotoba.cli/implemented-commands ["check" "db" "deploy" "git" "hinshitsu" "rad" "run" "wasm"]
           :kotoba.cli/missing-commands []}
          (cli/conformance contract))))
 
@@ -72,4 +72,5 @@
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'kotoba.cli-test)]
     (when (pos? (+ (or fail 0) (or error 0)))
-      #?(:clj (System/exit 1)))))
+      #?(:clj (System/exit 1)
+         :cljs nil))))
