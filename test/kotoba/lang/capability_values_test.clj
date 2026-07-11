@@ -135,6 +135,18 @@
               :local-policy {:policy/allow {:graph-read #{:any}}}
               :now now}))))))
 
+(deftest vrm-domain-capabilities-are-runtime-supported
+  (doseq [kind [:vrm/asset-read :vrm/compose :vrm/preview :vrm/export :vrm/publish]]
+    (is (= kind (get caps/effect-for-kind kind)))
+    (is (= graph-a
+           (:cap/resource
+            (caps/intersect-grants
+             {:requested (caps/make-cap kind :any)
+              :cacao-grants [(grant kind #{graph-a} nil "vrm-grant")]
+              :local-policy {:policy/allow {kind #{graph-a}}}
+              :now now})))
+        (str kind " must pass canonical grant/policy intersection"))))
+
 (deftest effect-row-must-cover-capability-parameters
   (testing "consistent row"
     (is (= {:ok? true :missing #{}}

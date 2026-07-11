@@ -70,7 +70,16 @@
    ;; contract/provider registration -- omitting this entry is exactly the
    ;; aiueos/actor:host :unsupported-kind runtime-denial gap documented
    ;; above, so don't repeat it for new families.
-   :host/kami-engine :host/kami-engine})
+   :host/kami-engine :host/kami-engine
+   ;; VRM composition domain capabilities. These authorize data-plane work
+   ;; performed by a CLJS host or Murakumo worker; they are not Wasm imports.
+   ;; Registration here is still mandatory because intersect-grants rejects
+   ;; every unknown kind fail-closed.
+   :vrm/asset-read :vrm/asset-read
+   :vrm/compose :vrm/compose
+   :vrm/preview :vrm/preview
+   :vrm/export :vrm/export
+   :vrm/publish :vrm/publish})
 
 (defn non-empty-string?
   [x]
