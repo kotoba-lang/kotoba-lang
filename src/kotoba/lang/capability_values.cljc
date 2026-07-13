@@ -71,6 +71,21 @@
    ;; aiueos/actor:host :unsupported-kind runtime-denial gap documented
    ;; above, so don't repeat it for new families.
    :host/kami-engine :host/kami-engine
+   ;; ADR-2607140600 Phase 3a device-capability bridge (iPhone sensing for
+   ;; the indoor floorplan-lab): 4 read-only, no-network-egress host
+   ;; imports registered in kotoba-core-contracts as motion/read (234),
+   ;; audio/io (235), ble/scan (236), wifi/info (237). audio-play and
+   ;; audio-record share the ONE audio/io capability (kind mirrors the
+   ;; capability id, same convention as :host/topic-subscribe grouping
+   ;; topic-poll/topic-take/topic-count), the other three are 1 kind per
+   ;; op. Registered HERE at capability-contract/op->kind registration
+   ;; time -- omitting this entry is exactly the aiueos/actor:host
+   ;; :unsupported-kind runtime-denial gap documented above (kami-engine's
+   ;; entry two lines up exists to not repeat it either).
+   :host/motion-read :host/motion-read
+   :host/audio-io :host/audio-io
+   :host/ble-scan :host/ble-scan
+   :host/wifi-info :host/wifi-info
    ;; VRM composition domain capabilities. These authorize data-plane work
    ;; performed by a CLJS host or Murakumo worker; they are not Wasm imports.
    ;; Registration here is still mandatory because intersect-grants rejects

@@ -147,6 +147,24 @@
               :now now})))
         (str kind " must pass canonical grant/policy intersection"))))
 
+(deftest sensing-device-capability-kinds-are-registered-in-effect-for-kind
+  (testing "ADR-2607140600 Phase 3a device-capability bridge (iPhone sensing for the indoor
+            floorplan-lab): :host/motion-read, :host/audio-io, :host/ble-scan, :host/wifi-info
+            must each be a member of effect-for-kind -- omitting one of these here is exactly
+            the aiueos/actor:host :unsupported-kind runtime-denial gap documented in
+            aiueos-and-actor-host-kinds-are-registered-in-effect-for-kind above (registered in
+            kotoba.runtime/op->kind but not HERE means every real call is denied at RUN time
+            even though the static compile-time capability gate never catches it)."
+    (doseq [kind [:host/motion-read :host/audio-io :host/ble-scan :host/wifi-info]]
+      (is (contains? caps/effect-for-kind kind) kind)
+      (is (not= {:denied :unsupported-kind}
+                (caps/intersect-grants
+                 {:requested (caps/make-cap kind :any)
+                  :cacao-grants [(grant kind #{:any} nil "g1")]
+                  :local-policy {:policy/allow {kind #{:any}}}
+                  :now now}))
+          (str kind " must not be denied as unsupported now that it's registered")))))
+
 (deftest effect-row-must-cover-capability-parameters
   (testing "consistent row"
     (is (= {:ok? true :missing #{}}
