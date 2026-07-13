@@ -219,7 +219,21 @@
   "2-arity OPTS may carry :tree-bytes -- see `tree-cid-error` -- to also
   recompute-and-compare :tree-cid against real content; omitted (the
   1-arity, every existing caller) keeps the original shape-only :tree-cid
-  behavior unchanged."
+  behavior unchanged.
+
+  IMPORTANT (see `signatures-error`'s docstring): this function alone binds
+  a valid signature to the manifest's self-declared :manifest-cid field,
+  NOT to the manifest's actual content -- a manifest whose other fields
+  (:kotoba.package/capabilities, :name, :version, ...) are mutated AFTER
+  signing, with :manifest-cid left untouched, still passes this function.
+  It only becomes a genuine content-binding guarantee when composed with a
+  SEPARATE check that recomputes :manifest-cid from the manifest's real
+  content and rejects a mismatch -- `kotoba.package-admission/verify-lock`
+  in the sibling kotoba-lang/kotoba repo does exactly that (calling both
+  this function AND `manifest-integrity-error`). A caller using THIS
+  function in isolation does not get that guarantee; see
+  `manifest-content-tampering-slips-through-manifest-error-alone` in this
+  namespace's tests for a concrete demonstration."
   ([m] (package-manifest-error m nil))
   ([m {:keys [tree-bytes]}]
    (let [source (:kotoba.package/source m)]

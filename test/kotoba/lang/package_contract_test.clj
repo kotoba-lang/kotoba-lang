@@ -196,6 +196,35 @@
       (is (false? (:valid? result)))
       (is (= "signature verification failed" (:message result))))))
 
+(deftest manifest-content-tampering-slips-through-manifest-error-alone
+  (testing "DOCUMENTED, NOT A REGRESSION (see package-manifest-error's docstring):
+            signatures-error binds a valid signature to the manifest's self-declared
+            :manifest-cid field, not to the manifest's actual content. A manifest whose
+            OTHER fields (here: :kotoba.package/capabilities) are mutated AFTER
+            signing, with :manifest-cid left untouched, still has a genuinely valid
+            signature over that (untouched) CID -- package-manifest-error ALONE has no
+            way to detect the mutation, since it never recomputes :manifest-cid from
+            real content. This test exists so that fact is asserted and visible, not
+            silently relied upon: full content-binding requires composing this with a
+            SEPARATE check that recomputes :manifest-cid (kotoba-lang/kotoba's
+            `kotoba.package-admission/manifest-integrity-error` does this, and its own
+            test suite proves a mismatched :manifest-cid IS rejected there)."
+    (let [seed (rand-seed)
+          did (ed/did-key-from-seed seed)
+          manifest-cid (mf/cidv1-dag-cbor (utf8 "manifest-content"))
+          sig (b64 (ed/sign seed (utf8 manifest-cid)))
+          legit (test-manifest {:repo-rid @stub-repo-rid
+                                :tree-cid @stub-tree-cid
+                                :manifest-cid manifest-cid
+                                :signatures [{:did did :alg :ed25519 :sig sig}]})
+          tampered (assoc legit :kotoba.package/capabilities ["kotoba://cap/host/fs-read"])]
+      (is (nil? (contract/package-manifest-error legit))
+          "the legitimately-signed, unmutated manifest passes, as a baseline")
+      (is (nil? (contract/package-manifest-error tampered))
+          "mutating :capabilities after signing, without touching :manifest-cid, still
+           passes package-manifest-error ALONE -- this is the documented gap, not an
+           assertion that it's safe in isolation"))))
+
 (deftest tree-cid-error-accepts-real-matching-content
   (let [content (utf8 "real source tree bytes")
         declared (mf/cidv1-raw content)]
