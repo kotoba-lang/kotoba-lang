@@ -79,6 +79,30 @@ Dynamic authority is modeled as explicit capability values, not as ambient host
 access or plain resource strings. The profile semantics are documented in
 [`capability-values.md`](capability-values.md).
 
+## Semantic Definition Identity
+
+The C1 content-addressed-code contract lives at `lang/semantic-code.edn`.
+Checked top-level definitions and canonical recursive groups may be lowered to canonical EDN IR
+with alpha-normalized local binders and resolved dependency CIDs, then encoded
+as canonical DAG-CBOR and identified by CIDv1. Human names, source paths,
+formatting, comments, aliases, and top-level source order do not participate in
+that semantic identity.
+
+Source, definition, and artifact identities remain distinct. Definition CID is
+content identity only: package admission, publisher signatures, CACAO,
+capability intersection, local policy, and Wasm confinement remain mandatory.
+The current launcher surface is:
+
+```bash
+kotoba check path/to/program.kotoba --kind semantic-code
+```
+
+The portable conformance inputs are under `lang/semantic-conformance/`. C1
+currently admits terms and recursive groups and fails closed on unresolved
+references or groups beyond its canonicalization bound. Namespace commits, Kotobase code-graph projection, and
+CID-addressed execution are later phases of
+`docs/adr/ADR-kotoba-content-addressed-codebase.md`.
+
 The machine-readable source contract lives at `lang/profile.edn`. Compiler
 conformance fixtures live under `lang/conformance/`.
 Coverage and maturity tracking lives in `docs/lang/coverage.edn`; compatibility
