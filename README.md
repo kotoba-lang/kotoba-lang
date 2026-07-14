@@ -127,6 +127,15 @@ repository as data:
 - Node, JVM, native, or other launchers are adapters. They should not define CLI
   protocol semantics independently.
 
+**Out of scope, by design**: this repository does not define the "safe
+Kotoba" compile-time admission grammar (subset/capability/effect gates —
+T1 Memory Safety / T2 Effect Soundness / T3 Capability Confinement). That is
+implemented in [`kotoba-lang/compiler`](https://github.com/kotoba-lang/compiler)
+(the CLJC-native successor of `kotoba-lang/kotoba`'s historical Rust
+`policy.rs`/`subset.rs`/`effects.rs`). `kotoba-lang/kotoba`'s README
+previously misattributed that successor to this repository; see
+`com-junkawasaki/root` ADR-2607141600.
+
 ## Current Status
 
 `kotoba-git` and `kotoba-rad` are hosted by CLJC adapters in
