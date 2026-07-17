@@ -26,7 +26,7 @@
   (:require [clojure.edn :as edn]
             [clojure.string :as str]))
 
-(def required-commands #{:run :check :db :git :rad :deploy :hinshitsu})
+(def required-commands #{:run :compile :check :db :git :rad :deploy :hinshitsu :wasm})
 
 ;; lang/cli.edn is stored as Datomic/Datascript tx-data (see schema.edn /
 ;; scripts/edn-datomize.cljs `wrap-map-preserve-ns!`); every key was
@@ -35,7 +35,7 @@
 (defn- unblob [v]
   (if (string? v)
     (try (let [parsed (edn/read-string v)] (if (coll? parsed) parsed v))
-         (catch Exception _ v))
+         (catch :default _ v))
     v))
 
 (defn- reconstitute-entity [tx-data]
@@ -93,7 +93,8 @@
 
 (defn -main [& [path]]
   (let [path (or path "lang/cli.edn")
-        contract (reconstitute-entity (edn/read-string (slurp path)))
+        contract (reconstitute-entity
+                  (edn/read-string (.readFileSync (js/require "node:fs") path "utf8")))
         version (:kotoba.cli.contract/version contract)
         tier-labels (:kotoba.cli.contract/tier-labels contract)
         option-types (:kotoba.cli.contract/option-types contract)

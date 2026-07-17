@@ -91,7 +91,7 @@
 (deftest profile-and-package-contract-are-machine-readable
   (let [profile (reconstitute-entity (read-edn "lang/profile.edn"))
         package (reconstitute-package-edn (read-edn "lang/package.edn"))]
-    (is (= 3 (:kotoba.lang/profile-version profile)))
+    (is (= 4 (:kotoba.lang/profile-version profile)))
     (is (= :kotoba (:kotoba.lang/default-reader-target profile)))
     (is (= :m2 (get-in profile [:kotoba.lang/type-system :maturity])))
     (is (= :pending (get-in profile [:kotoba.lang/type-system :compiler-admission])))

@@ -22,28 +22,31 @@
     {:exit (or (.-status r) 0) :out "" :err ""}))
 ;; -----------------------------------------------------------------------
 
-(require '         '[clojure.string :as str])
+(require '[clojure.string :as str])
 
 (def root (__path.resolve "."))
 
-(defn hidden-vcs-path? [^java.io.File file]
-  (some #{" .git" ".git"} (.split (str file) java.io.File/separator)))
+(defn files-under [dir]
+  (mapcat (fn [entry]
+            (let [path (.join __path dir (.-name entry))]
+              (cond
+                (= ".git" (.-name entry)) []
+                (.isDirectory entry) (files-under path)
+                (.isFile entry) [path]
+                :else [])))
+          (.readdirSync __fs dir #js {:withFileTypes true})))
 
-(defn legacy-runtime-file? [^java.io.File file]
-  (let [path (str file)
-        name (.getName file)]
+(defn legacy-runtime-file? [path]
+  (let [name (.basename __path path)]
     (or (= "Cargo.toml" name)
         (= "Cargo.lock" name)
         (str/starts-with? name "rust-toolchain")
         (str/ends-with? name ".rs")
-        (str/includes? path (str java.io.File/separator ".cargo" java.io.File/separator)))))
+        (str/includes? path (str (.-sep __path) ".cargo" (.-sep __path))))))
 
 (def offenders
-  (->> (file-seq root)
-       (remove hidden-vcs-path?)
-       (filter #(.isFile ^java.io.File %))
+  (->> (files-under root)
        (filter legacy-runtime-file?)
-       (map #(str ^java.io.File %))
        sort
        vec))
 

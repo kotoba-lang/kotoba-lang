@@ -10,7 +10,19 @@
 
 (def default-contract-path "lang/cli.edn")
 
-(def required-commands #{:run :check :db :git :rad :deploy :hinshitsu :wasm})
+(def required-commands #{:run :compile :check :db :git :rad :deploy :hinshitsu :wasm})
+
+(def compile-extensions #{".kotoba" ".cljk" ".cljc" ".cljs" ".clj"})
+
+(defn- source-extension [entry]
+  (some #(when (str/ends-with? entry %) %) compile-extensions))
+
+(defn- compile-backend [extension target]
+  (cond
+    (= extension ".cljs") :clojurescript
+    (= extension ".clj") :clojure
+    (= target "web") :kotoba-script
+    (= target "wasm") :kotoba-wasm))
 
 (def adapter-kinds #{:node :jvm :native :browser :edge})
 
@@ -214,6 +226,31 @@
                    {:command command-id
                     :kind kind
                     :input (first (:positionals request))
+                    :request request})))
+
+      (= command-id :compile)
+      (let [entry (first (:positionals request))
+            target (or (get-in request [:options :target]) "wasm")
+            extension (when (string? entry) (source-extension entry))]
+        (cond
+          (nil? entry)
+          (failure :compile/entry-required "compile requires a source entry" {})
+
+          (nil? extension)
+          (failure :compile/unsupported-extension "unsupported source extension"
+                   {:entry entry :allowed compile-extensions})
+
+          (not (#{"web" "wasm"} target))
+          (failure :compile/unsupported-target "unsupported compilation target"
+                   {:target target :allowed #{"web" "wasm"}})
+
+          :else
+          (success :compile/planned
+                   {:command command-id
+                    :entry entry
+                    :extension extension
+                    :target target
+                    :backend (compile-backend extension target)
                     :request request})))
 
       :else
