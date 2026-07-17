@@ -22,14 +22,14 @@
     {:exit (or (.-status r) 0) :out "" :err ""}))
 ;; -----------------------------------------------------------------------
 (require '[clojure.edn :as edn]
-         '         '[clojure.set :as set]
+         '[clojure.set :as set]
          '[clojure.string :as str])
 
 (def root (__path.resolve "."))
 (def manifest-path "lang/package-conformance/manifest.edn")
 
 (defn read-edn [path]
-  (edn/read-string (slurp (__path.resolve root path))))
+  (edn/read-string (.readFileSync __fs (__path.resolve root path) "utf8")))
 
 ;; lang/package-conformance/manifest.edn is stored as Datomic/Datascript
 ;; tx-data (see schema.edn / scripts/edn-datomize.cljs
@@ -44,7 +44,7 @@
 (defn- unblob [v]
   (if (string? v)
     (try (let [parsed (edn/read-string v)] (if (coll? parsed) parsed v))
-         (catch Exception _ v))
+         (catch :default _ v))
     v))
 
 (defn- reconstitute-package-conformance-manifest [tx-data]
@@ -192,8 +192,8 @@
       (try
         (check! data tc)
         (fail "expected error" tc)
-        (catch clojure.lang.ExceptionInfo e
-          (let [msg (.getMessage e)]
+        (catch :default e
+          (let [msg (ex-message e)]
             (when-not (str/includes? msg (:error-contains tc))
               (fail "unexpected error"
                     {:case (:id tc)

@@ -34,23 +34,24 @@ compatibility examples are the conformance fixtures under `lang/conformance/`.
 
 ## Source Contract
 
-- Accepted extensions: `.kotoba`, `.cljc`, `.clj`, `.cljs`.
+- Accepted extensions: `.kotoba`, `.cljc`, `.cljk`, `.clj`, `.cljs`.
+- `.cljk` means CLJ Kotoba and selects the `:kotoba` reader/compiler target.
+- `.cljc` is common source for `:clj`, `:cljs`, and `:kotoba`.
 - Default reader target: `kotoba`.
 - `:kotoba` branch fallback order: `:kotoba`, then `:clj`, then `:default`.
 - Namespace resolution priority for target `kotoba`: `.kotoba`, `.cljc`,
-  `.clj`, `.cljs`.
-- Namespace resolution priority for target `clj`: `.cljc`, `.clj`, `.kotoba`,
-  `.cljs`.
-- Namespace resolution priority for target `cljs`: `.cljc`, `.cljs`, `.clj`,
-  `.kotoba`.
+  `.cljk`, `.clj`, `.cljs`.
+- Namespace resolution priority for target `clj`: `.cljc`, `.clj`.
+- Namespace resolution priority for target `cljs`: `.cljc`, `.cljs`.
 - `.clj` and `.cljs` are single-target compatibility extensions (profile v3
   reinstates `.cljs`, previously retired in v2 — see
   `docs/lang/versioning.md`); each has its own reader-branch chain
   (`["clj" "default"]` / `["cljs" "default"]`) and neither carries
   `#?(:kotoba ...)` branches the way `.cljc` does.
 
-This is source compatibility, not JVM Clojure or ClojureScript runtime
-compatibility. Code still has to compile to the Kotoba compiler subset.
+`.clj` keeps Clojure semantics and `.cljs` keeps ClojureScript semantics.
+`.kotoba` and `.cljk` use the Kotoba compiler subset; `.cljc` is the only
+portable source surface shared by all three reader targets.
 
 Capability-safe language tooling is exposed through `kotoba wasm`:
 

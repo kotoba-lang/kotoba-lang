@@ -22,22 +22,18 @@
     {:exit (or (.-status r) 0) :out "" :err ""}))
 ;; -----------------------------------------------------------------------
 (require '[clojure.edn :as edn]
-         ')
+         '[kotoba.lang.capability-values :as caps]
+         '[kotoba.lang.capability-host :as host]
+         '[kotoba.lang.capability-cacao :as cacao])
 
-;; Run the exact same pure CLJC logic as the test suite: load the namespace
-;; source directly so the gate cannot drift from the contract implementation.
-(load-file "src/kotoba/lang/capability_values.cljc")
-(load-file "src/kotoba/lang/capability_host.cljc")
-(load-file "src/kotoba/lang/capability_cacao.cljc")
-(alias 'caps 'kotoba.lang.capability-values)
-(alias 'host 'kotoba.lang.capability-host)
-(alias 'cacao 'kotoba.lang.capability-cacao)
+;; Load the exact same pure CLJC namespaces as the test suite. The caller
+;; supplies `--classpath src`, so this gate cannot drift into copied logic.
 
 (def root (__path.resolve "."))
 (def manifest-path "lang/capability-conformance/manifest.edn")
 
 (defn read-edn [path]
-  (edn/read-string (slurp (__path.resolve root path))))
+  (edn/read-string (.readFileSync __fs (__path.resolve root path) "utf8")))
 
 ;; lang/capability-conformance/manifest.edn is stored as Datomic/Datascript
 ;; tx-data (see schema.edn / scripts/edn-datomize.cljs
@@ -52,7 +48,7 @@
 (defn- unblob [v]
   (if (string? v)
     (try (let [parsed (edn/read-string v)] (if (coll? parsed) parsed v))
-         (catch Exception _ v))
+         (catch :default _ v))
     v))
 
 (defn- reconstitute-capability-conformance-manifest [tx-data]

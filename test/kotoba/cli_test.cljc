@@ -29,16 +29,16 @@
   (let [result (cli/validate-contract contract)]
     (is (:kotoba.cli/ok? result))
     (is (= {:version 1
-            :commands [:run :check :db :git :rad :deploy :hinshitsu :wasm]
-            :command-count 8
-            :option-count 46}
+            :commands [:run :compile :check :db :git :rad :deploy :hinshitsu :wasm]
+            :command-count 9
+            :option-count 49}
            (:kotoba.cli/data result)))))
 
 (deftest cljc-authority-implements-contract-commands
   (is (= {:kotoba.cli/ok? true
           :kotoba.cli/source :cljc
-          :kotoba.cli/contract-commands ["check" "db" "deploy" "git" "hinshitsu" "rad" "run" "wasm"]
-          :kotoba.cli/implemented-commands ["check" "db" "deploy" "git" "hinshitsu" "rad" "run" "wasm"]
+          :kotoba.cli/contract-commands ["check" "compile" "db" "deploy" "git" "hinshitsu" "rad" "run" "wasm"]
+          :kotoba.cli/implemented-commands ["check" "compile" "db" "deploy" "git" "hinshitsu" "rad" "run" "wasm"]
           :kotoba.cli/missing-commands []}
          (cli/conformance contract))))
 
@@ -61,6 +61,19 @@
     (is (:kotoba.cli/ok? result))
     (is (= :check (:kotoba.cli/command result)))
     (is (= :contract/valid (:kotoba.cli/code result)))))
+
+(deftest compile-selects-language-owned-backends
+  (is (= :kotoba-script
+         (get-in (cli/dispatch contract ["compile" "main.kotoba" "--target" "web"])
+                 [:kotoba.cli/data :backend])))
+  (is (= :kotoba-script
+         (get-in (cli/dispatch contract ["compile" "main.cljc" "--target" "web"])
+                 [:kotoba.cli/data :backend])))
+  (is (= :clojurescript
+         (get-in (cli/dispatch contract ["compile" "main.cljs" "--target" "web"])
+                 [:kotoba.cli/data :backend])))
+  (is (= :compile/unsupported-extension
+         (:kotoba.cli/code (cli/dispatch contract ["compile" "main.js" "--target" "web"])))))
 
 (deftest side-effecting-commands-return-adapter-data
   (doseq [command ["run" "db" "git" "rad" "deploy" "hinshitsu"]]
