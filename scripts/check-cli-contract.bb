@@ -7,7 +7,7 @@
 (def required-commands #{:run :check :db :git :rad :deploy :hinshitsu})
 
 ;; lang/cli.edn is stored as Datomic/Datascript tx-data (see schema.edn /
-;; scripts/edn-datomize.bb `wrap-map-preserve-ns!`); every key was
+;; scripts/edn-datomize.cljs `wrap-map-preserve-ns!`); every key was
 ;; already namespaced so the transform did not rename anything, it only
 ;; pr-str'd non-scalar values into blob strings. Reverse exactly that.
 (defn- unblob [v]

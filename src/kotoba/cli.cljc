@@ -16,7 +16,7 @@
 
 ;; lang/cli.edn is stored on disk as Datomic/Datascript tx-data
 ;; (`[{:db/id -1 :kotoba.cli.contract/... ...}]`, see schema.edn and
-;; scripts/edn-datomize.bb `wrap-map-preserve-ns!`) rather than a bare
+;; scripts/edn-datomize.cljs `wrap-map-preserve-ns!`) rather than a bare
 ;; map. Every top-level key in that file was already namespaced
 ;; (:kotoba.cli.contract/*), so the transform did not rename any key -- only
 ;; non-scalar values (nested maps/vectors-of-maps) were pr-str'd into blob
