@@ -13,19 +13,21 @@ Kotoba-specific behavior is selected with reader conditionals:
 
 ## Getting Started
 
-For the public implementation CLI, start with the smallest compile-and-run path:
+**Product split:** **kotoba** = language (safe Kotoba → **WASM AOT emit**);
+**kototama** = `.kotoba` WASM **runtime** (run the emitted guest). Not JVM
+Clojure execution. JVM is only the bootstrap host for today's language CLI.
+Canonical execute: `kototama` `run guest.wasm`.
 
 ```sh
-kotoba -e '(+ 1 2)'
+# Language — AOT (package-lock mandatory)
+kotoba wasm emit examples/hello.kotoba --package-lock kotoba.lock.edn -o hello.wasm
+kotoba wasm safe-build examples/policy-demo.kotoba --policy policy.edn --package-lock kotoba.lock.edn -o policy-demo.wasm
+# Runtime (canonical): kototama  run  hello.wasm
+# Compat only:        kotoba wasm run hello.kotoba --package-lock …
 ```
 
-Then build a source file and inspect the safe-language policy surface:
-
-```sh
-kotoba wasm build examples/hello.kotoba -o hello.wasm
-kotoba wasm safe-policy examples/policy-demo.kotoba
-kotoba wasm safe-build examples/policy-demo.kotoba --policy policy.edn -o policy-demo.wasm
-```
+Historical Rust-era names (`kotoba -e`, `wasm safe-policy`, `wasm selfhost-inspect`)
+are not the live CLJ launcher surface. Use the commands above.
 
 The examples in `examples/` are intentionally small. The authoritative
 compatibility examples are the conformance fixtures under `lang/conformance/`.
@@ -50,21 +52,13 @@ compatibility examples are the conformance fixtures under `lang/conformance/`.
 This is source compatibility, not JVM Clojure or ClojureScript runtime
 compatibility. Code still has to compile to the Kotoba compiler subset.
 
-Inline expressions are also part of the compiler conformance vocabulary:
-`kotoba -e '(+ 1 2)'` wraps the expression as an exported `main`, compiles it
-through the same Kotoba -> core Wasm path, and runs `main`. This is
-compile-and-run sugar, not runtime `eval`; the lower-level implementation
-binary keeps a compatibility `-e` path only for crate-local testing and existing
-integrations.
-
 Capability-safe language tooling is exposed through `kotoba wasm`:
 
 ```sh
-kotoba wasm build cell.kotoba
-kotoba wasm build -S src cell.kotoba -o cell.wasm
-kotoba wasm safe-policy cell.kotoba
-kotoba wasm safe-build cell.kotoba --policy policy.edn -o cell.wasm
-kotoba wasm selfhost-inspect cell.kotoba --policy policy.edn --json
+kotoba wasm emit cell.kotoba --package-lock lock.edn -o cell.wasm
+kotoba wasm build cell.kotoba --package-lock lock.edn -o cell.wasm          # alias of emit
+kotoba wasm safe-build cell.kotoba --policy policy.edn --package-lock lock.edn -o cell.wasm
+kotoba wasm run cell.kotoba --package-lock lock.edn
 ```
 
 Namespace source roots are supplied with `-S` / `--source-path` or

@@ -93,6 +93,8 @@
         package (reconstitute-package-edn (read-edn "lang/package.edn"))]
     (is (= 3 (:kotoba.lang/profile-version profile)))
     (is (= :kotoba (:kotoba.lang/default-reader-target profile)))
+    (is (= :m2 (get-in profile [:kotoba.lang/type-system :maturity])))
+    (is (= :pending (get-in profile [:kotoba.lang/type-system :compiler-admission])))
     (is (= 1 (:kotoba.lang.package/version package)))
     (is (contains? (set (get-in package [:manifest :package-kinds :allow-kinds]))
                    :schema-contract))))
