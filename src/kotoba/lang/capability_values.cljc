@@ -63,7 +63,20 @@
    :host/identity-verify :host/identity-verify
    :host/hash-sha256 :host/hash-sha256
    :host/http-post :host/http-post
-   :host/log-read :host/log-read})
+   :host/log-read :host/log-read
+   ;; kami-* game-engine ECS surface (kotoba-core-contracts "kami/engine",
+   ;; capability id 233). Without this entry, guarded host calls for every
+   ;; kami-* op fail closed with :unsupported-kind even when policy grants
+   ;; :kami/engine — a silent T3 hole until the host is exercised with a
+   ;; real policy (security kaizen 2026-07-17).
+   :host/kami-engine :host/kami-engine
+   ;; kisekae/org-vrmc-vrm composition boundary. These must be canonical
+   ;; effects so a concrete post-policy grant survives worker re-authorization.
+   :vrm/asset-read :vrm/asset-read
+   :vrm/compose :vrm/compose
+   :vrm/preview :vrm/preview
+   :vrm/export :vrm/export
+   :vrm/publish :vrm/publish})
 
 (defn non-empty-string?
   [x]
@@ -214,11 +227,16 @@
   expiry is the earliest non-nil expiry among the requested capability and
   the contributing grants, provenance is the contributing grant ids. A
   wildcard (:any) result is only possible when requested, grants, and policy
-  are all :any. Fails closed with {:denied <reason>} when the requested kind
-  is unsupported (:unsupported-kind), every covering grant is expired at :now
-  (:expired), or the intersection is empty (:empty-intersection)."
+  are all :any — unless local-policy has :policy/forbid-wildcard true
+  (ADR-2607180900 P1 / S4b least-privilege), in which case :any is denied
+  as :wildcard-forbidden. Fails closed with {:denied <reason>} when the
+  requested kind is unsupported (:unsupported-kind), every covering grant
+  is expired at :now (:expired), or the intersection is empty
+  (:empty-intersection)."
   [{:keys [requested cacao-grants local-policy now]}]
-  (let [kind (:cap/kind requested)]
+  (let [kind (:cap/kind requested)
+        forbid-wildcard? (boolean (or (:policy/forbid-wildcard local-policy)
+                                      (:kotoba.policy/forbid-wildcard local-policy)))]
     (cond
       (not (capability? requested))
       {:denied :malformed-requested}
@@ -250,8 +268,14 @@
                 result-scope (-> requested-scope
                                  (scope-intersection grant-scope)
                                  (scope-intersection policy-scope))]
-            (if (and (not= :any result-scope) (empty? result-scope))
+            (cond
+              (and (not= :any result-scope) (empty? result-scope))
               {:denied :empty-intersection}
+
+              (and forbid-wildcard? (= :any result-scope))
+              {:denied :wildcard-forbidden}
+
+              :else
               (let [contributing (filter #(scope-overlaps?
                                            result-scope
                                            (->scope (:grant/resources %)))
