@@ -11,7 +11,7 @@
   (edn/read-string (slurp (io/file root path))))
 
 ;; lang/package-conformance/manifest.edn is stored as Datomic/Datascript
-;; tx-data (see schema.edn / scripts/edn-datomize.bb
+;; tx-data (see schema.edn / scripts/edn-datomize.cljs
 ;; `wrap-map-preserve-ns!`): :kotoba.lang.package.conformance/version was
 ;; already namespaced and kept as-is; the plain :cases key got prefixed to
 ;; :kotoba.lang.package.conformance/cases and pr-str'd into a blob string

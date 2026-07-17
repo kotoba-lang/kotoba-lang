@@ -17,7 +17,7 @@
 
 ;; lang/package-conformance/manifest.edn, lang/package.edn, and
 ;; lang/profile.edn are stored as Datomic/Datascript tx-data (see
-;; schema.edn / scripts/edn-datomize.bb `wrap-map-preserve-ns!`).
+;; schema.edn / scripts/edn-datomize.cljs `wrap-map-preserve-ns!`).
 ;; `unblob` reverses the pr-str blob-ification of non-scalar values.
 (defn- unblob [v]
   (if (string? v)
