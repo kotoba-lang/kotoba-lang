@@ -71,4 +71,4 @@
    :status (if (:ok? (score)) :meets-threshold :below-threshold)
    :score (score)
    :matrix (matrix)
-   :version (:kotoba.lang.host-parity/version (catalog) 0)}))
+   :version (:kotoba.lang.host-parity/version (catalog) 0)})

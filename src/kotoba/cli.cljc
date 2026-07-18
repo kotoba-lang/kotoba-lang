@@ -10,42 +10,9 @@
 
 (def default-contract-path "lang/cli.edn")
 
-(def required-commands #{:run :compile :check :db :git :rad :deploy :hinshitsu :wasm})
-
-(def compile-extensions #{".kotoba" ".cljk" ".cljc" ".cljs" ".clj"})
-
-(defn- source-extension [entry]
-  (some #(when (str/ends-with? entry %) %) compile-extensions))
-
-(defn- compile-backend [extension target]
-  (cond
-    (= extension ".cljs") :clojurescript
-    (= extension ".clj") :clojure
-    (= target "web") :kotoba-script
-    (= target "wasm") :kotoba-wasm))
+(def required-commands #{:run :compile :check :db :git :rad :deploy :hinshitsu})
 
 (def adapter-kinds #{:node :jvm :native :browser :edge})
-
-;; lang/cli.edn is stored on disk as Datomic/Datascript tx-data
-;; (`[{:db/id -1 :kotoba.cli.contract/... ...}]`, see schema.edn and
-;; scripts/edn-datomize.cljs `wrap-map-preserve-ns!`) rather than a bare
-;; map. Every top-level key in that file was already namespaced
-;; (:kotoba.cli.contract/*), so the transform did not rename any key -- only
-;; non-scalar values (nested maps/vectors-of-maps) were pr-str'd into blob
-;; strings. `reconstitute-entity` reverses exactly that: drop :db/id and
-;; edn/read-string any blob value back into real data, leaving every key
-;; identical to the original file shape so downstream lookups are unchanged.
-#?(:clj
-   (defn- unblob [v]
-     (if (string? v)
-       (try (let [parsed (edn/read-string v)] (if (coll? parsed) parsed v))
-            (catch Exception _ v))
-       v)))
-
-#?(:clj
-   (defn- reconstitute-entity [tx-data]
-     (into {} (map (fn [[k v]] [k (unblob v)]))
-           (dissoc (first tx-data) :db/id))))
 
 (defn read-contract
   "Read a CLI contract EDN file. CLJS callers should pass the parsed map to
@@ -54,7 +21,7 @@
          :cljs (throw (ex-info "read-contract requires an EDN map on CLJS" {}))))
   ([path]
    #?(:clj
-      (reconstitute-entity (edn/read-string (slurp (io/file path))))
+      (edn/read-string (slurp (io/file path)))
       :cljs
       (throw (ex-info "read-contract is not available on CLJS" {:path path})))))
 
@@ -226,31 +193,6 @@
                    {:command command-id
                     :kind kind
                     :input (first (:positionals request))
-                    :request request})))
-
-      (= command-id :compile)
-      (let [entry (first (:positionals request))
-            target (or (get-in request [:options :target]) "wasm")
-            extension (when (string? entry) (source-extension entry))]
-        (cond
-          (nil? entry)
-          (failure :compile/entry-required "compile requires a source entry" {})
-
-          (nil? extension)
-          (failure :compile/unsupported-extension "unsupported source extension"
-                   {:entry entry :allowed compile-extensions})
-
-          (not (#{"web" "wasm"} target))
-          (failure :compile/unsupported-target "unsupported compilation target"
-                   {:target target :allowed #{"web" "wasm"}})
-
-          :else
-          (success :compile/planned
-                   {:command command-id
-                    :entry entry
-                    :extension extension
-                    :target target
-                    :backend (compile-backend extension target)
                     :request request})))
 
       :else
