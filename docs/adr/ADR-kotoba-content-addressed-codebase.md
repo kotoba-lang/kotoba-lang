@@ -1,12 +1,14 @@
 # ADR — Kotoba content-addressed codebase over Kotobase/IPLD
 
-- **Status**: Accepted — C1–C5 reference implementation complete
+- **Status**: Accepted — C1–C5 portable reference implementation complete;
+  network security conformance is tracked separately by
+  `ADR-kotobase-security-access-control.md`
 - **Date**: 2026-07-14
 - **Deciders**: Jun Kawasaki
 - **Artifacts**: `lang/semantic-code.edn`, `lang/semantic-conformance/`,
   `kotoba/src/kotoba/semantic_code.cljc`, and
   `kotobase/src/kotobase/code_graph.cljc`
-- **Related**: `ADR-safe-capability-language.md`, `ADR-kotoba-package-cid-lock.md`, `ADR-kotoba-lang-profile.md`, `ADR-kotoba-rad-git-sovereign-repo.md`
+- **Related**: `ADR-kotobase-security-access-control.md`, `ADR-safe-capability-language.md`, `ADR-kotoba-package-cid-lock.md`, `ADR-kotoba-lang-profile.md`, `ADR-kotoba-rad-git-sovereign-repo.md`
 
 ## Context
 
@@ -209,6 +211,14 @@ Example questions include:
 
 ## Capability and Authority Boundary
 
+The normative authentication, authorization, row/write policy, verified-read,
+encryption, and audit boundary is defined by
+`ADR-kotobase-security-access-control.md`. This section describes the identity
+separation required by the code graph; it does not claim that every current
+deployment enforces the complete boundary. In particular, a signature-valid
+self-issued CACAO is authentication evidence, not proof that its resource
+strings were delegated as capabilities.
+
 Content identity is not authority:
 
 ```text
@@ -231,6 +241,10 @@ The architecture preserves separate responsibilities:
 The transitive effect closure of a code root must be computed from verified
 definition blocks and checked against the effective capability intersection
 before execution. A code CID cannot grant itself a capability.
+
+The query projection used for that closure must be derived from the verified
+semantic block. A boolean CID check followed by trust in caller-supplied
+dependency or effect fields is not a conforming admission boundary.
 
 ## Execution Receipt
 
@@ -279,7 +293,9 @@ backend-specific artifacts or environment-dependent tests.
 
 ## Privacy, Retention, and Garbage Collection
 
-IPLD content addressing does not provide confidentiality. Publicly retrievable
+IPLD content addressing does not provide confidentiality, and a storage lookup
+by CID does not by itself prove that the returned bytes match that CID. Blocks
+crossing a trust boundary must be rehashed before decode/use. Publicly retrievable
 blocks can disclose source, dependency topology, names, and small guessable
 values. Private code and data therefore use the existing tenant authorization
 and sealed/encrypted block-storage boundary. Plaintext CID, sealed-block CID,
@@ -306,8 +322,8 @@ auditability even if no current namespace names it.
 | C1 | semantic definition/type/recursive-group CID contract for the checked subset | Implemented and conformance-tested | files and current namespaces remain authoritative authoring input |
 | C2 | Kotobase code blocks, Datom projection, dependency/effect/type queries, persistent analysis cache | Implemented on portable `IStore` | additive read/query integration |
 | C3 | immutable namespace commits, hash-qualified names, import/export projection | Implemented | current source resolver remains supported |
-| C4 | capability-bound execution receipts linking code, artifact, data, grants, and policy | Implemented | existing admission and host gates remain mandatory |
-| C5 | missing-block code sync, artifact reuse, and distributed execution coordination by code-root CID | Reference implementation complete | uses verified C1+ blocks through local or XRPC-backed `IStore`; host execution remains injected |
+| C4 | capability-bound execution receipts linking code, artifact, data, grants, and policy | Storage/validation reference implemented; end-to-end authority enforcement is deployment work | strict verifier and effective-capability derivation from `ADR-kotobase-security-access-control.md` remain mandatory |
+| C5 | missing-block code sync, artifact reuse, and distributed execution coordination by code-root CID | Portable reference implementation complete | host execution, verified reads, disclosure authorization, and transport enforcement remain injected and must satisfy the security ADR |
 
 User-defined macros remain fail-closed in v1. Built-in checked forms are
 intrinsics of the semantic contract rather than arbitrary expansion code.
@@ -331,6 +347,11 @@ intersection, local policy, and the existing confined Wasm host.
   performs authorization-gated two-store missing-block sync, coordinates
   authorized execution, records cross-contract migration attestations, and
   computes auditable retention/GC plans over any `IStore` implementation.
+- The portable implementation's injected verifier/authorizer seams are not
+  themselves proof of secure deployment. Network-facing admission must derive
+  projections from verified blocks, and authorization must consume a normalized
+  effective-capability context as required by
+  `ADR-kotobase-security-access-control.md`.
 - Cross-repository integration tests admit compiler-produced type and definition
   blocks into Kotobase and round-trip namespace, closure, and execution-receipt
   links.
@@ -421,13 +442,21 @@ The v1 implementation resolves the original design questions as follows:
   metadata only after injected authorization. Unauthorized views contain only
   the definition identity, kind, visibility, and sealed-envelope CID.
 
+These are portable reference behaviors. Deployment conformance additionally
+requires strict credential/delegation verification, deny-by-default graph policy,
+verified block reads, production encryption for private data, and atomic head
+publication. Feature maturity (`C1`–`C5`) and security maturity (`S0`–`S5` in
+`ADR-kotobase-security-access-control.md`) are reported independently.
+
 User-defined deterministic macros, new algebraic/polymorphic type forms, an
 interactive namespace merge UI, particular encryption/KMS providers, and a
 particular HTTP/XRPC client are explicit future contract or host-adapter work,
 not incomplete behavior in semantic contract v1. The portable core exposes
 fail-closed macro/type admission, pure three-way merge conflicts, sealed-block
 authorization seams, and `IStore`; deployments select UI, crypto, transport,
-CACAO, retry, and scheduling policy without changing content identity.
+CACAO, retry, and scheduling policy without changing content identity. They may
+not claim secure network conformance until those selected adapters meet the
+mandatory gates in `ADR-kotobase-security-access-control.md`.
 
 ## Acceptance Gates for C1
 
