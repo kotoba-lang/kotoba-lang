@@ -35,7 +35,8 @@
             :name "read-config"
             :params [[:cap :host/fs-read "/app"] :string]
             :returns [:result :string :keyword]
-            :effects #{:host/fs-read :error}}
+            :effects #{:host/fs-read :error}
+            :schema :kotoba.typed-hir/v1}
            (types/typed-hir-entry form)))
     (is (= #{:host/fs-read}
            (:missing-effects
@@ -68,6 +69,47 @@
     (is (false? (:ok? result)))
     (is (= #{:spawn/effect-escapes :spawn/capability-move-unimplemented}
            (set (map :problem (:problems result)))))))
+
+(deftest l4-option-and-no-nil-return
+  (is (true? (types/type? [:option :string])))
+  (is (false? (types/type? [:option])))
+  (let [nil-ret (types/validate-signature
+                 {:params [:i64] :returns :nil :effects #{}})]
+    (is (false? (:ok? nil-ret)))
+    (is (some #(= :type/no-nil-return (:problem %)) (:problems nil-ret))))
+  (is (:ok? (types/validate-signature
+             {:params [[:option :string]]
+              :returns [:result :string :keyword]
+              :effects #{}}))))
+
+(deftest l4-host-import-arity-at-compile
+  (let [catalog {'log-write {:params [:i32 :i32] :result :i32}
+                 'clock-monotonic {:params [] :result :i64}}
+        bad (types/validate-host-import-calls
+             catalog '[(defn main [] (log-write 1))])
+        good (types/validate-host-import-calls
+              catalog '[(defn main [] (log-write 1 2) (clock-monotonic))])]
+    (is (false? (:ok? bad)))
+    (is (= :import/arity-mismatch (:problem (first (:problems bad)))))
+    (is (:ok? good))))
+
+(deftest l4-require-signatures
+  (let [forms (list (read-string "(defn main [] 0)")
+                    (read-string
+                     "(defn ^{:signature {:params [] :returns :i64 :effects #{}}} ready [] 1)"))]
+    (is (empty? (types/require-signatures-problems forms false)))
+    (let [ps (types/require-signatures-problems forms true)]
+      (is (= 1 (count ps)))
+      (is (= :signature/required (:problem (first ps))))
+      (is (= "main" (:function (first ps)))))))
+
+(deftest l4-typed-hir-module
+  (let [form (read-string
+              "(defn ^{:signature {:params [] :returns :i64 :effects #{}}} main [] 0)")
+        mod (types/typed-hir-module [form])]
+    (is (:ok? mod))
+    (is (= 1 (count (:entries mod))))
+    (is (= :typed-defn (:op (first (:entries mod)))))))
 
 (deftest type-system-conformance-fixtures-match-contract
   (let [manifest (read-edn conformance-manifest)]
