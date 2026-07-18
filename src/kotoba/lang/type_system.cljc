@@ -10,6 +10,10 @@
 (def primitive-types
   #{:nil :bool :i32 :i64 :f32 :string :bytes :keyword :value})
 
+(def non-nil-primitives
+  "S1b: public returns must not be bare :nil. Use [:option T] for absence."
+  (disj primitive-types :nil))
+
 (defn effect-row?
   [x]
   (and (set? x) (every? keyword? x)))
@@ -40,6 +44,10 @@
         :result (if (= 2 (count args))
                   (vec (mapcat type-problems args))
                   [{:problem :type/result-arity :type t}])
+        ;; L4 / S1b: explicit Option. Absence is typed — never bare :nil returns.
+        :option (if (= 1 (count args))
+                  (vec (type-problems (first args)))
+                  [{:problem :type/option-arity :type t}])
         :vector (if (= 1 (count args))
                   (vec (type-problems (first args)))
                   [{:problem :type/vector-arity :type t}])
@@ -72,6 +80,27 @@
                   (not (effect-row? effects))
                   (conj {:problem :type/task-effects :type t})))
         [{:problem :type/tag-unknown :type t}]))))
+
+(defn bare-nil-type?
+  "True when T is the bare :nil primitive (not [:option ...] / [:result ...])."
+  [t]
+  (= :nil t))
+
+(defn no-nil-return-problems
+  "S1b: public return types must not be bare :nil. Authors use [:option T]
+  for optional values and [:result Ok Err] for fallible results."
+  [returns]
+  (cond
+    (bare-nil-type? returns)
+    [{:problem :type/no-nil-return :type returns}]
+
+    (and (vector? returns) (= :result (first returns)))
+    (let [[_ ok err] returns]
+      (cond-> []
+        (bare-nil-type? ok) (conj {:problem :type/no-nil-return :type ok :position :result-ok})
+        (bare-nil-type? err) (conj {:problem :type/no-nil-return :type err :position :result-err})))
+
+    :else []))
 
 (defn contains-region?
   "Whether T contains a lexical region token or reference at any depth."
@@ -117,7 +146,9 @@
                    (some #(seq (type-problems %)) types)
                    (into (mapcat type-problems types))
                    (contains-region? returns)
-                   (conj {:problem :region/escape :type returns}))
+                   (conj {:problem :region/escape :type returns})
+                   true
+                   (into (no-nil-return-problems returns)))
         required (implied-effects (or params []))
         missing (if (effect-row? effects)
                   (set/difference required effects)
@@ -207,7 +238,96 @@
          :name (str name)
          :params (:params signature)
          :returns (:returns signature)
-         :effects (:effects signature)}))))
+         :effects (:effects signature)
+         :schema :kotoba.typed-hir/v1}))))
+
+(defn typed-hir-module
+  "Collect portable typed-HIR entries for every annotated public defn in FORMS.
+  Returns {:ok? bool :entries [...] :problems [...]}."
+  [forms]
+  (let [annotated (filter signature-from-defn forms)
+        results (mapv (fn [form]
+                        (let [v (validate-defn form)]
+                          {:form form
+                           :validated v
+                           :entry (when (:ok? v) (typed-hir-entry form))}))
+                      annotated)
+        problems (vec (mapcat #(get-in % [:validated :problems]) results))
+        entries (vec (keep :entry results))]
+    {:ok? (empty? problems)
+     :schema :kotoba.typed-hir-module/v1
+     :entries entries
+     :problems problems}))
+
+;; ---------------------------------------------------------------------------
+;; L4: host-import arity / result type at compile (catalog-driven)
+
+(defn- simple-call?
+  [form]
+  (and (seq? form) (symbol? (first form)) (nil? (namespace (first form)))))
+
+(defn check-host-import-call
+  "Given IMPORT-CATALOG {op-symbol -> {:params [type...] :result type}}
+  (or :param-types) and a call form `(op arg...)`, return problems when
+  arity or declared param count mismatches. Unknown ops produce no
+  problems here (strict-grammar / host-parity own unknown-import policy)."
+  [import-catalog form]
+  (when (simple-call? form)
+    (let [op (first form)
+          args (vec (rest form))
+          entry (get import-catalog op)]
+      (when entry
+        (let [expected (or (:params entry) (:param-types entry))
+              n-expected (when (vector? expected) (count expected))
+              n-actual (count args)]
+          (cond-> []
+            (and (some? n-expected) (not= n-expected n-actual))
+            (conj {:problem :import/arity-mismatch
+                   :op (str op)
+                   :expected n-expected
+                   :actual n-actual})
+
+            (and (contains? entry :result)
+                 (not (or (keyword? (:result entry))
+                          (vector? (:result entry)))))
+            (conj {:problem :import/result-type-invalid
+                   :op (str op)
+                   :result (:result entry)})))))))
+
+(defn walk-forms
+  "Depth-first walk of FORMS yielding every nested sequential form."
+  [forms]
+  (letfn [(walk [node]
+            (cond
+              (seq? node) (cons node (mapcat walk (rest node)))
+              (vector? node) (mapcat walk node)
+              (map? node) (mapcat walk (vals node))
+              :else []))]
+    (mapcat walk forms)))
+
+(defn validate-host-import-calls
+  "Walk FORMS and check every call against IMPORT-CATALOG (L4).
+  Returns {:ok? bool :problems [...]}."
+  [import-catalog forms]
+  (let [problems (vec (mapcat #(check-host-import-call import-catalog %)
+                              (walk-forms forms)))]
+    {:ok? (empty? problems) :problems problems}))
+
+(defn require-signatures-problems
+  "When require? is true, every public defn must carry :signature metadata.
+  Private `defn-` is exempt."
+  [forms require?]
+  (if-not require?
+    []
+    (vec
+     (keep (fn [form]
+             (when (and (seq? form)
+                        (= 'defn (first form))
+                        (symbol? (second form))
+                        (nil? (:signature (meta (second form)))))
+               {:problem :signature/required
+                :function (str (second form))}))
+           forms))))
 
 (defn validate-scope
   "Validate the static obligations of a proposed `scope` form.
