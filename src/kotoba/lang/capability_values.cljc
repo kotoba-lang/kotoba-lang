@@ -249,7 +249,9 @@
   is unsupported (:unsupported-kind), every covering grant is expired at :now
   (:expired), or the intersection is empty (:empty-intersection)."
   [{:keys [requested cacao-grants local-policy now]}]
-  (let [kind (:cap/kind requested)]
+  (let [kind (:cap/kind requested)
+        forbid-wildcard? (boolean (or (:policy/forbid-wildcard local-policy)
+                                      (:kotoba.policy/forbid-wildcard local-policy)))]
     (cond
       (not (capability? requested))
       {:denied :malformed-requested}
@@ -281,8 +283,14 @@
                 result-scope (-> requested-scope
                                  (scope-intersection grant-scope)
                                  (scope-intersection policy-scope))]
-            (if (and (not= :any result-scope) (empty? result-scope))
+            (cond
+              (and (not= :any result-scope) (empty? result-scope))
               {:denied :empty-intersection}
+
+              (and forbid-wildcard? (= :any result-scope))
+              {:denied :wildcard-forbidden}
+
+              :else
               (let [contributing (filter #(scope-overlaps?
                                            result-scope
                                            (->scope (:grant/resources %)))
