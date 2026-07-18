@@ -215,6 +215,57 @@
         (invalid "tree cid does not match tree content"
                  {:declared declared :computed computed})))))
 
+(defn component-cid-of
+  "Extract the component CID pin from a lock entry or package build map.
+  Accepts either top-level `:dep/component-cid` / `:kotoba.package/component-cid`
+  or nested `:dep/build` / `:kotoba.package/build` `:component-cid` (ADR
+  package-cid-lock optional field; required for :component kind on L3)."
+  [m]
+  (or (:dep/component-cid m)
+      (:kotoba.package/component-cid m)
+      (get-in m [:dep/build :component-cid])
+      (get-in m [:kotoba.package/build :component-cid])
+      (when (map? (:dep/build m))
+        (get (:dep/build m) :component-cid))
+      (when (map? (:kotoba.package/build m))
+        (get (:kotoba.package/build m) :component-cid))))
+
+(defn component-cid-error
+  "Shape (+ optional content) check for a component CID pin.
+  When COMPONENT-BYTES is supplied, recomputes CIDv1-raw and rejects
+  mismatch — same integrity pattern as tree-cid-error (L3 guest packages)."
+  ([declared] (component-cid-error declared nil))
+  ([declared component-bytes]
+   (cond
+     (not (cid? declared))
+     (invalid "component cid required" {:value declared})
+
+     (nil? component-bytes)
+     nil
+
+     :else
+     (let [computed (mf/cidv1-raw component-bytes)]
+       (when (not= declared computed)
+         (invalid "component cid does not match component content"
+                  {:declared declared :computed computed}))))))
+
+(defn- lock-dep-component-error
+  "For :component kind packages, a component-cid pin is mandatory (L3).
+  For any kind, a present component-cid must be a real CIDv1. Optional
+  content integrity when COMPONENT-BYTES is supplied."
+  [dep component-bytes]
+  (let [kind (:dep/kind dep)
+        declared (component-cid-of dep)]
+    (cond
+      (and (= :component kind) (nil? declared))
+      (invalid "component cid required"
+               {:dependency (:dep/name dep) :kind kind})
+
+      (some? declared)
+      (component-cid-error declared component-bytes)
+
+      :else nil)))
+
 (defn package-manifest-error
   "2-arity OPTS may carry :tree-bytes -- see `tree-cid-error` -- to also
   recompute-and-compare :tree-cid against real content; omitted (the
@@ -267,9 +318,12 @@
   "3-arity OPTS may carry :tree-bytes-by-dep -- {dep-name tree-bytes ...} --
   to also recompute-and-compare each dep's :dep/tree-cid against real
   content (see `tree-cid-error`); omitted (the 2-arity, every existing
-  caller) keeps the original shape-only :dep/tree-cid behavior unchanged."
+  caller) keeps the original shape-only :dep/tree-cid behavior unchanged.
+
+  OPTS may also carry :component-bytes-by-dep -- {dep-name component-bytes}
+  -- for L3 component-cid content integrity (CID guest packages)."
   ([m tc] (lockfile-error m tc nil))
-  ([m tc {:keys [tree-bytes-by-dep]}]
+  ([m tc {:keys [tree-bytes-by-dep component-bytes-by-dep]}]
    (let [declared (set (:declared-capabilities tc))
          blocked (set/union (set (:revoked-signers tc))
                             (set (:expired-signers tc))
@@ -291,6 +345,8 @@
                         [:dep/repo-rid :dep/tree-cid :dep/manifest-cid])
                   (when-let [tree-bytes (get tree-bytes-by-dep (:dep/name dep))]
                     (tree-cid-error (:dep/tree-cid dep) tree-bytes))
+                  (lock-dep-component-error
+                   dep (get component-bytes-by-dep (:dep/name dep)))
                   (when-not (seq (:dep/signers dep))
                     (invalid "signer required" {:dep dep}))
                   (when-let [bad (seq (set/intersection (set (:dep/signers dep)) blocked))]
