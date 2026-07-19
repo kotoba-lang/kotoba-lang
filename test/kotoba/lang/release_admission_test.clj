@@ -68,7 +68,46 @@
     :now-ms 1600 :max-age-ms 500
     :verify-signature-fn
     (fn [body signature]
-      (= signature [:valid (:receipt/artifact-digest body)]))}})
+      (= signature [:valid (:receipt/artifact-digest body)]))}
+   :crypto-policy
+   {:kotoba.security/crypto-policy-version 1 :mode :hybrid-required
+    :hybrid-epoch-floor 1}
+   :artifact-envelope
+   {:envelope/algorithms [:x25519 :ml-kem-768 :aes-256-gcm]
+    :envelope/provider {:provider/id :release-crypto
+                        :provider/fips-validated false}
+    :envelope/epoch 2 :envelope/kem? true :envelope/hybrid? true
+    :envelope/artifact-digest digest}
+   :abac-attributes
+   {:subject {:id :release-bot :role :publisher :clearance :restricted
+              :tenant "kotoba-lang"}
+    :resource {:tenant "kotoba-lang" :trust :release :classification :internal}
+    :environment {:surface :ci :network-zone :private
+                  :device-trusted? true :now "2026-07-20T00:00:00Z"}
+    :purpose :language-release}
+   :abac-policy
+   {:policy/id :kotoba-lang/release
+    :subject/ids #{:release-bot} :subject/roles #{:publisher}
+    :resource/ids #{"kotoba-lang/kotoba-lang"}
+    :resource/trust #{:release} :action/ids #{:release/publish}
+    :action/capabilities #{:artifact/publish}
+    :environment/surfaces #{:ci} :environment/network-zones #{:private}
+    :environment/require-device-trust? true
+    :purpose/allowed #{:language-release} :tenant/isolation? true}
+   :approvals
+   [{:approval/version 1 :approval/approver :alice :approval/role :security
+     :approval/request-digest digest :approval/not-before-ms 1000
+     :approval/expires-at-ms 2000 :approval/signature [:valid :alice digest]}
+    {:approval/version 1 :approval/approver :bob :approval/role :release
+     :approval/request-digest digest :approval/not-before-ms 1000
+     :approval/expires-at-ms 2000 :approval/signature [:valid :bob digest]}]
+   :approval-context
+   {:initiator :release-bot :required-roles #{:security :release}
+    :min-approvals 2 :now-ms 1500
+    :verify-signature-fn
+    (fn [body signature]
+      (= signature [:valid (:approval/approver body)
+                    (:approval/request-digest body)]))}})
 
 (deftest release-requires-all-three-independent-authorities
   (is (:release/allowed? (admission/evaluate base)))
@@ -86,7 +125,18 @@
                (assoc-in base [:restore-attestation :receipt/signature]
                          [:forged digest])
                (assoc-in base [:restore-attestation :receipt/artifact-digest]
-                         "sha256:other")]]
+                         "sha256:other")
+               (assoc-in base [:artifact-envelope :envelope/algorithms]
+                         [:x25519])
+               (assoc-in base [:artifact-envelope :envelope/hybrid?] false)
+               (assoc-in base [:artifact-envelope :envelope/artifact-digest]
+                         "sha256:other")
+               (assoc-in base [:abac-attributes :subject :id] :attacker)
+               (assoc-in base [:abac-attributes :environment :device-trusted?]
+                         false)
+               (assoc base :approvals [(first (:approvals base))])
+               (assoc-in base [:approvals 1 :approval/approver] :alice)
+               (assoc-in base [:approvals 0 :approval/signature] [:forged])]]
     (is (false? (:release/allowed? (admission/evaluate bad))))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo
                           #"secure release admission denied"

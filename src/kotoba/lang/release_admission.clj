@@ -1,6 +1,9 @@
 (ns kotoba.lang.release-admission
   "Fail-closed release publication admission for language/contracts artifacts."
-  (:require [kotoba.security.capability :as capability]
+  (:require [kotoba.security.abac :as abac]
+            [kotoba.security.approval :as approval]
+            [kotoba.security.capability :as capability]
+            [kotoba.security.crypto-policy :as crypto]
             [kotoba.security.hardware :as hardware]
             [kotoba.security.qualification :as qualification]
             [kotoba.security.resilience :as resilience]
@@ -10,7 +13,8 @@
   [{:keys [repository artifact-digest capability-token capability-context
            hardware-signing-evidence telemetry-receipt receipt-context
            transport-profile restore-receipt restore-attestation
-           restore-attestation-context]}]
+           restore-attestation-context artifact-envelope crypto-policy
+           abac-attributes abac-policy approvals approval-context]}]
   (let [capability-result
         (capability/evaluate
          capability-token
@@ -29,6 +33,23 @@
         restore-attestation-result
         (qualification/verify-signed-receipt
          restore-attestation restore-attestation-context)
+        crypto-result
+        (crypto/check-production-envelope crypto-policy artifact-envelope)
+        abac-result
+        (abac/evaluate
+         (-> abac-attributes
+             (assoc :resource
+                    (merge (:resource abac-attributes)
+                           {:id repository}))
+             (assoc :action
+                    (merge (:action abac-attributes)
+                           {:id :release/publish
+                            :capabilities #{:artifact/publish}})))
+         abac-policy)
+        approval-result
+        (approval/evaluate approvals
+                           (assoc approval-context
+                                  :request-digest artifact-digest))
         violations
         (cond-> []
           (not (:capability/allowed? capability-result))
@@ -47,7 +68,15 @@
           (conj :restore-attestation)
           (not= artifact-digest
                 (:qualification/artifact-digest restore-attestation-result))
-          (conj :restore-attestation-binding))]
+          (conj :restore-attestation-binding)
+          (not (:valid? crypto-result))
+          (conj :hybrid-artifact-envelope)
+          (not= artifact-digest (:envelope/artifact-digest artifact-envelope))
+          (conj :hybrid-artifact-binding)
+          (not (:abac/allowed? abac-result))
+          (conj :release-abac)
+          (not (:approval/allowed? approval-result))
+          (conj :independent-approval-quorum))]
     {:release/allowed? (empty? violations)
      :release/repository repository
      :release/artifact-digest artifact-digest
@@ -57,7 +86,10 @@
      :release/telemetry telemetry-result
      :release/transport transport-result
      :release/restore restore-result
-     :release/restore-attestation restore-attestation-result}))
+     :release/restore-attestation restore-attestation-result
+     :release/crypto crypto-result
+     :release/abac abac-result
+     :release/approval approval-result}))
 
 (defn admit! [request]
   (let [result (evaluate request)]
