@@ -22,7 +22,7 @@
     (is (contains? (:imports db) :secret/read-scoped))))
 
 (deftest native-trust-root-remains-explicit
-  (is (contains? (get-in model [:native-tcb :must-remain-outside-component-authority])
+  (is (contains? (set (get-in model [:native-tcb :must-remain-outside-component-authority]))
                  :raw-syscall-binding))
   (is (= :component-tender-and-linker (get-in model [:kototama :role])))
   (is (some #{:ci-soak} (get-in model [:migration :cutover-still-requires]))))

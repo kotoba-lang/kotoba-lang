@@ -12,10 +12,23 @@
   [path]
   (edn/read-string (slurp (io/file path))))
 
+(defn read-manifest
+  [path]
+  (let [value (read-edn path)]
+    (if (vector? value)
+      (let [entity (first value)]
+        (cond-> entity
+          (string? (:kotoba.lang.package.conformance/cases entity))
+          (assoc :cases
+                 (edn/read-string
+                  (:kotoba.lang.package.conformance/cases entity)))))
+      value)))
+
 (deftest package-conformance-fixtures-match-contract
-  (let [manifest (read-edn manifest-path)]
+  (let [manifest (read-manifest manifest-path)]
     (is (= 1 (:kotoba.lang.package.conformance/version manifest)))
-    (doseq [tc (:cases manifest)
+    (doseq [tc (or (:cases manifest)
+                   (:kotoba.lang.package.conformance/cases manifest))
             :let [data (read-edn (str "lang/package-conformance/" (:file tc)))
                   result (contract/validate-case tc data)]]
       (case (:kind tc)
