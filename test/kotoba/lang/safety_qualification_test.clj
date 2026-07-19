@@ -56,7 +56,7 @@
 (deftest component-source-does-not-encode-runtime-role
   (let [qualification (read-edn "lang/safety-qualification.edn")
         roles (read-edn "lang/component-role-model.edn")]
-    (is (= "adr-2607183900-kotoba-component-language-runtime-roles"
+    (is (= "adr-2607198100-kotoba-extension-verification"
            (:kotoba.lang.safety-qualification/adr qualification)))
     (is (true? (get-in qualification
                         [:capability-invariant

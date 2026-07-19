@@ -63,6 +63,26 @@ grant-verification roots.
 
 The normative role separation and provider examples are in
 [`lang/component-role-model.edn`](lang/component-role-model.edn).
+The first bounded lower-level slice is
+[`lang/transport-component-abi.edn`](lang/transport-component-abi.edn): opaque
+connect/TLS/channel handles with exact endpoint scope and finite limits.
+Compiler validation, reference Wasm import lowering, Kotoba HTTP/DB provider
+sources, and a fail-closed kototama link seam are implemented. An opt-in JVM
+socket/TLS HostFunction provider now implements the bounded ABI as a tested
+prototype. The JVM linker now bridges independent component memories, and a
+real Kotoba consumer reaches a status/header-validating Kotoba HTTP provider
+over verified TLS with finite read timeout. Browsers have an injected
+high-level `http-get` path using a COOP/COEP worker+SharedArrayBuffer bridge.
+Node additionally runs the compiled `.kotoba` HTTP provider over a bounded
+worker/SAB raw transport and links an independent consumer memory to it. Both
+paths are default-denied and finite-quota. Browser raw socket/TLS remains
+absent. Node now also supplies purpose-bound SCRAM credential use and pinned,
+one-shot PostgreSQL cancellation primitives, while the higher PostgreSQL
+consumer links and pool remain incomplete. Full browser parity is honestly below its
+global surface at 10 of 59 imports. The browser product profile classifies all
+59 imports: its ten required imports are 10/10 implemented, ten operations are
+intentional native/secret-custody boundaries, 38 provider-component operations
+remain deferred, and `llm-infer` remains an explicit deferred host injection.
 
 The normative terminology, end-to-end capability invariant, Deno/wasmCloud
 comparison boundaries, and the reverse-topological qualification plan that
@@ -96,9 +116,10 @@ requirements fail closed.
 Wave 1 preflight found 863 generated schema-DSL files using the bare
 `.kotoba` extension. They are not canonical Kotoba programs and are tracked in
 [`lang/q9-kotoba-extension-audit.edn`](lang/q9-kotoba-extension-audit.edn).
-Tranche 1 moved ten of them to `.kotoba-schema` and updated their manifest
-consumers, leaving 853 collisions. No CLJC consumer cutover is performed until
-a bounded component/native-TCB split is extracted and oracle-qualified.
+Consumer-aware schema tranches have moved 81 of them to `.kotoba-schema`,
+updated their manifests and documented references, and passed each repository's
+tests, leaving 782 collisions. No CLJC consumer cutover is performed until a
+bounded component/native-TCB split is extracted and oracle-qualified.
 
 All ten Tranche 1 repositories now extract the same bounded page-limit
 decision into a repository-local, zero-import `.kotoba` component. Each CLJC

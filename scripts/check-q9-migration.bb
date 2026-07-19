@@ -4,15 +4,24 @@
             [babashka.process :as process]
             [clojure.edn :as edn]
             [clojure.set :as set]
-            [clojure.string :as str]))
+            [clojure.string :as str])
+  (:import [java.nio.charset StandardCharsets]
+           [java.security MessageDigest]))
 
 (def contract (edn/read-string (slurp "lang/q9-migration.edn")))
 (def inventory (edn/read-string (slurp "lang/q9-inventory.edn")))
 (def extension-audit (edn/read-string (slurp "lang/q9-kotoba-extension-audit.edn")))
+(def candidate-verification
+  (edn/read-string (slurp "lang/q9-kotoba-candidate-verification.edn")))
 (def tranche (edn/read-string (slurp "lang/q9-wave1-tranche-1.edn")))
 (def soak-evidence (edn/read-string (slurp "lang/q9-wave1-tranche-1-soak.edn")))
 (def component-roles (edn/read-string (slurp "lang/component-role-model.edn")))
 (def workspace (-> "../../.." fs/canonicalize str))
+
+(defn sha256 [text]
+  (let [bytes (.digest (MessageDigest/getInstance "SHA-256")
+                       (.getBytes text StandardCharsets/UTF_8))]
+    (apply str (map #(format "%02x" (bit-and (int %) 0xff)) bytes))))
 
 (defn fail! [message data]
   (binding [*out* *err*]
@@ -62,15 +71,17 @@
       expected-totals (get-in contract [:live-inventory :totals])
       inventory-paths (mapcat :baseline-paths (:repositories inventory))
       extension-paths (map :path (:entries extension-audit))
+      proof-by-path (into {} (map (juxt :path identity)
+                                  (:entries candidate-verification)))
       live-extension-paths (live-kotoba-paths (keys expected))
       tranche-paths (mapcat :baseline-paths (:repositories tranche))
       tranche-repos (map :repository (:repositories tranche))
       inventory-path-set (set inventory-paths)
-      collision-repos (->> (:entries extension-audit)
-                            (filter #(= :legacy-schema-dsl-extension-collision
-                                        (:classification %)))
-                            (map #(str/join "/" (take 3 (str/split (:path %) #"/"))))
-                            set)
+      blocked-extension-repos
+      (->> (:entries extension-audit)
+           (remove #(= :canonical-verified (:classification %)))
+           (map #(str/join "/" (take 3 (str/split (:path %) #"/"))))
+           set)
       authorized (get-in contract [:current-decision :authorized-waves])]
   (when-not (= expected measured)
     (fail! "live inventory drift; refresh classification authority before migrating"
@@ -100,6 +111,24 @@
     (fail! "Kotoba extension audit drift; regenerate before migrating"
            {:added (set/difference live-extension-paths (set extension-paths))
             :removed (set/difference (set extension-paths) live-extension-paths)}))
+  (doseq [{:keys [path classification]} (:entries extension-audit)
+          :when (contains? #{:canonical-verified :canonical-fixture-verified
+                             :canonical-rejected} classification)]
+    (let [proof (get proof-by-path path)
+          expected-status (case classification
+                            :canonical-verified :canonical-verified
+                            :canonical-fixture-verified :canonical-fixture-verified
+                            :canonical-rejected :canonical-rejected)
+          current-sha (sha256 (slurp (str workspace "/" path)))]
+      (when-not (and (= expected-status (:status proof))
+                     (= current-sha (:sha256 proof)))
+        (fail! "Kotoba canonical classification lacks current hash-bound proof"
+               {:path path :classification classification
+                :proof-status (:status proof)
+                :proof-sha256 (:sha256 proof) :current-sha256 current-sha}))))
+  (when (some #(= :canonical-candidate-unverified (:classification %))
+              (:entries extension-audit))
+    (fail! "Kotoba extension audit contains unverified canonical candidates" {}))
   (when-not (= (get-in contract [:kotoba-extension-preflight :observed])
                (assoc (:counts extension-audit) :kotoba-paths (:path-count extension-audit)))
     (fail! "Kotoba extension classification drift"
@@ -114,9 +143,9 @@
   (when-not (set/subset? (set tranche-paths) inventory-path-set)
     (fail! "tranche names paths outside the frozen Q9 inventory"
            {:unknown (set/difference (set tranche-paths) inventory-path-set)}))
-  (when (some collision-repos tranche-repos)
-    (fail! "tranche still contains a bare .kotoba schema DSL collision"
-           {:repositories (filterv collision-repos tranche-repos)}))
+  (when (some blocked-extension-repos tranche-repos)
+    (fail! "tranche contains a .kotoba path without current canonical verification"
+           {:repositories (filterv blocked-extension-repos tranche-repos)}))
   (doseq [[old new] (:schema-path-mapping tranche)]
     (when (fs/exists? (str workspace "/" old))
       (fail! "legacy schema path still exists after remediation" {:path old}))
