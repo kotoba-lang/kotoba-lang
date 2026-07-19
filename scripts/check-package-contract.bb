@@ -173,8 +173,14 @@
             (println "ok" (:id tc) "->" msg))))
       (fail "unknown case kind" tc))))
 
-(let [manifest (read-edn manifest-path)]
+(let [raw (read-edn manifest-path)
+      manifest (if (vector? raw) (first raw) raw)
+      cases (or (:cases manifest)
+                (some-> (:kotoba.lang.package.conformance/cases manifest)
+                        edn/read-string))]
   (when-not (= 1 (:kotoba.lang.package.conformance/version manifest))
     (fail "package conformance version 1 required" manifest))
-  (doseq [tc (:cases manifest)]
+  (when-not (vector? cases)
+    (fail "package conformance cases vector required" {:value cases}))
+  (doseq [tc cases]
     (check-case! tc)))

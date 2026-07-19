@@ -4,6 +4,7 @@
   Loads lang/host-parity.edn. Pure data — no DOM, no Wasm execution.
   Missing host import is modeled as capability absence, never ambient success."
   (:require [clojure.edn :as edn]
+            [clojure.set :as set]
             #?(:clj [clojure.java.io :as io])))
 
 (def ^:private catalog*
@@ -37,15 +38,19 @@
 (defn matrix
   "Vector of {:import :jvm :browser :node :wasm-field :note}."
   []
-  (let [imports (:imports (catalog) {})]
-    (mapv (fn [[id row]]
+  (let [c (catalog)
+        imports (:imports c {})
+        required (or (:required-imports c) (set (keys imports)))
+        default-row (:unlisted-import-default c {})]
+    (mapv (fn [id]
+            (let [row (merge default-row (get imports id {}))]
             {:import id
              :jvm (:jvm row)
              :browser (:browser row)
              :node (:node row)
              :wasm-field (:wasm-field row)
-             :note (:note row)})
-          (sort-by (comp name key) imports))))
+             :note (:note row)}))
+          (sort-by name required))))
 
 (defn import-status
   "Raw matrix status for IMPORT on HOST (:jvm/:browser/:node), or nil."
@@ -84,21 +89,35 @@
         :else :capability-absent))))
 
 (defn score
-  "Browser linkability score vs acceptance thresholds."
+  "Browser linkability plus profile-required coverage. Intentional native
+  boundaries are not misreported as browser product gaps."
   []
   (let [c (catalog)
         statuses (get-in c [:acceptance :browser-linkable-statuses] #{:yes})
-        min-ratio (get-in c [:acceptance :min-browser-ratio] 0.0)
+        profile (:browser-profile c)
+        required (:required profile #{})
+        classified (apply set/union #{} (map #(get profile % #{})
+                                             [:required :intentional-native-boundary
+                                              :deferred-provider-components
+                                              :deferred-host-injection]))
         rows (matrix)
         n (count rows)
         yes (count (filter #(linkable? (:browser %) statuses) rows))
-        ratio (if (pos? n) (double (/ yes n)) 0.0)]
+        linkable-ids (set (map :import (filter #(linkable? (:browser %) statuses) rows)))
+        required-yes (count (set/intersection required linkable-ids))
+        required-ratio (if (seq required) (double (/ required-yes (count required))) 0.0)
+        minimum (get profile :minimum-required-coverage 1.0)
+        partition-ok? (= classified (set (map :import rows)))]
     {:total n
      :browser-yes yes
      :browser-no (- n yes)
-     :ratio ratio
-     :min-ratio min-ratio
-     :ok? (>= ratio min-ratio)
+     :ratio (if (pos? n) (double (/ yes n)) 0.0)
+     :required-total (count required)
+     :required-yes required-yes
+     :required-ratio required-ratio
+     :minimum-required-ratio minimum
+     :classification-complete? partition-ok?
+     :ok? (and partition-ok? (>= required-ratio minimum))
      :missing (mapv :import (remove #(linkable? (:browser %) statuses) rows))
      :gaps (get-in c [:acceptance :honest-gaps] [])}))
 

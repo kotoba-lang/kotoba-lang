@@ -23,6 +23,13 @@
    :host/clipboard-read :host/clipboard-read
    :host/clipboard-write :host/clipboard-write
    :host/http :host/http
+   :net/connect :net/connect
+   :crypto/tls :crypto/tls
+   :net/transport :net/transport
+   :component/http :component/http
+   :component/database :component/database
+   :secret/use-scram-sha256 :secret/use-scram-sha256
+   :secret/use-postgresql-cancel :secret/use-postgresql-cancel
    :host/fs-read :host/fs-read
    :host/fs-write :host/fs-write
    :host/keychain-read :host/keychain-read
