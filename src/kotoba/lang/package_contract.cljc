@@ -106,14 +106,35 @@
       (contract-vector-error (get m (keyword prefix "consumes"))
                              (keyword prefix "consumes"))))
 
-(defn- signed-bytes [^String s]
+(defn- signed-bytes
+  "UTF-8 bytes of S. Used to turn the canonical string a package signature
+  attests to (its manifest's own declared :manifest-cid -- see
+  `signatures-error`) into the byte message Ed25519 verify operates on.
+  Portable (same #?(:cljs (.encode (js/TextEncoder.) s)) construction
+  `multiformats.core/kotoba-cid` already uses in this dependency)."
+  [^String s]
   #?(:clj (.getBytes s "UTF-8")
      :cljs (.encode (js/TextEncoder.) s)))
 
 (defn- ed25519-signature-error
-  "Fail closed when SIG does not verify under DID for SIGNED bytes. The CLJS
-  contract has no approved verifier yet, so it rejects instead of accepting
-  shape-only signatures."
+  "Real Ed25519 verification of SIG (a base64-encoded signature, the same
+  encoding `cacao.core`/`kotoba-lang/org-chainagnostic-cacao` uses) against
+  SIGNED bytes, under the public key encoded in DID (a did:key:z... string,
+  `ed25519.core/did-key->pubkey`). nil when the signature verifies; a
+  package-contract-shaped error otherwise. Never throws: bad base64, a
+  malformed did:key, or a genuine signature mismatch are all reported as
+  the same closed rejection, not an uncaught exception.
+
+  :clj only. `ed25519.core` (kotoba-lang/ed25519) is a JVM
+  (java.security-based) Ed25519 implementation; no portable/:cljs Ed25519
+  verifier exists yet anywhere in this dependency graph, unlike
+  `multiformats.core` (fully .cljc). Rather than silently treat an
+  unverifiable signature as valid under :cljs, this fails CLOSED there --
+  every signature is rejected until a portable verifier exists. That is a
+  real, deliberate behavior change for any future :cljs consumer of this
+  namespace (there is none today -- see the file/ns docs), not an
+  oversight: accepting what cannot actually be verified would reintroduce
+  the exact vulnerability this function exists to close."
   [sig did signed]
   #?(:clj
      (try
@@ -121,13 +142,30 @@
          (when-not (ed25519/verify-did did signed sig-bytes)
            (invalid "signature verification failed" {:did did})))
        (catch Exception e
-         (invalid "signature verification failed"
-                  {:did did :error (.getMessage e)})))
+         (invalid "signature verification failed" {:did did :error (.getMessage e)})))
      :cljs
-     (invalid "signature verification not supported in this runtime"
-              {:did did})))
+     (invalid "signature verification not supported in this runtime" {:did did})))
 
 (defn signatures-error
+  "Validates SIGS (a package manifest's :kotoba.package/signatures vector)
+  for shape AND for real Ed25519 cryptographic authenticity: each
+  signature's :sig must actually verify, under the Ed25519 public key
+  encoded in its own :did, against MANIFEST-CID (the manifest's own
+  declared :kotoba.package/source :manifest-cid -- the content-identifier
+  every signer and verifier can derive from the manifest without agreeing
+  on a byte-for-byte re-encoding here; `kotoba.package-admission/
+  manifest-integrity-error` in the sibling kotoba-lang/kotoba repo
+  separately verifies that CID actually matches the manifest's real
+  content, so the two checks compose into signer-attests-to-CID +
+  CID-matches-content).
+
+  Before this fix, this function only checked shape (non-blank :did/:sig
+  strings, :alg = :ed25519) and never called any verification -- ANY :sig
+  string under ANY :did passed (docs/issues/
+  security-package-contract-conformance-gap.md, F-001). A forged or
+  malformed signature -- wrong key, tampered bytes, garbage :sig, a :did
+  that never actually signed this manifest -- now fails closed (rejected),
+  not silently accepted."
   [sigs manifest-cid]
   (cond
     (empty? sigs) (invalid "signature required" {})
@@ -140,71 +178,186 @@
                   (invalid "signature alg unsupported" {:signature sig}))
                 (when-not (non-empty-string? (:sig sig))
                   (invalid "signature bytes required" {:signature sig}))
-                (ed25519-signature-error
-                 (:sig sig) (:did sig) (signed-bytes manifest-cid))))
+                (ed25519-signature-error (:sig sig) (:did sig) (signed-bytes manifest-cid))))
           sigs)))
 
-(defn package-manifest-error
+(defn tree-cid-error
+  "Real content-integrity check for a source tree -- the :tree-cid analogue
+  of `kotoba.package-admission/manifest-integrity-error` (kotoba-lang/kotoba,
+  which recomputes and compares :manifest-cid from a manifest's own EDN
+  content). Computes `multiformats.core/cidv1-raw` of TREE-BYTES -- the
+  caller-supplied REAL byte content of the source tree DECLARED is supposed
+  to pin -- and compares. nil when they match; a package-contract-shaped
+  error otherwise (fails closed on mismatch).
+
+  This .cljc kernel is deliberately I/O-free (`package-manifest-error` /
+  `lockfile-error` validate only already-parsed EDN, never touch a
+  filesystem or a git object store). Unlike :manifest-cid, whose subject
+  (the manifest's own EDN data) IS already an in-memory argument to
+  `package-manifest-error`, :tree-cid's subject -- an actual source tree /
+  git working tree -- is NOT part of the manifest/lock data this kernel
+  receives at all. TREE-BYTES must therefore come from a caller that
+  genuinely has filesystem/git access (this mirrors why
+  manifest-integrity-error itself lives outside this kernel, in a separate
+  file-I/O-capable layer, one repo over). `package-manifest-error` /
+  `lockfile-error` accept optional tree content (`:tree-bytes` /
+  `:tree-bytes-by-dep`) and call this when it is supplied; when it is not
+  supplied (every existing caller and fixture, unchanged) they still only
+  run the shape-only `cid?` check they always ran -- this function never
+  silently no-ops a check by treating absent content as a pass."
+  [declared tree-bytes]
+  (cond
+    (not (cid? declared)) (invalid "tree cid required" {:value declared})
+    (nil? tree-bytes) (invalid "tree content required to verify tree cid" {:declared declared})
+    :else
+    (let [computed (mf/cidv1-raw tree-bytes)]
+      (when (not= declared computed)
+        (invalid "tree cid does not match tree content"
+                 {:declared declared :computed computed})))))
+
+(defn component-cid-of
+  "Extract the component CID pin from a lock entry or package build map.
+  Accepts either top-level `:dep/component-cid` / `:kotoba.package/component-cid`
+  or nested `:dep/build` / `:kotoba.package/build` `:component-cid` (ADR
+  package-cid-lock optional field; required for :component kind on L3)."
   [m]
-  (let [source (:kotoba.package/source m)]
-    (or
-     (missing-key m manifest-required "missing required package field")
-     (when (and (:kotoba.package/kind m)
-                (not (contains? allowed-package-kinds (:kotoba.package/kind m))))
-       (invalid "unknown package kind"
-                {:package (:kotoba.package/name m)
-                 :allowed allowed-package-kinds}))
-     (contract-surfaces-error m "kotoba.package")
-     (when (and (= :adapter (:kotoba.package/kind m))
-                (empty? (:kotoba.package/consumes m)))
-       (invalid "adapter consumes required" {:package (:kotoba.package/name m)}))
-     (when (and (= :schema-contract (:kotoba.package/kind m))
-                (empty? (:kotoba.package/provides m)))
-       (invalid "schema-contract provides required" {:package (:kotoba.package/name m)}))
-     (when-not (cid? (:kotoba.package/repo-rid m))
-       (invalid "repo-rid cid required" {:value (:kotoba.package/repo-rid m)}))
-     (missing-key source [:git-commit :tree-cid :manifest-cid] "missing required source field")
-     (when-not (cid? (:tree-cid source))
-       (invalid "tree cid required" {:source source}))
-     (when-not (cid? (:manifest-cid source))
-       (invalid "manifest cid required" {:source source}))
-     (when-not (vector? (:kotoba.package/capabilities m))
-       (invalid "capabilities vector required" {:value (:kotoba.package/capabilities m)}))
-     (signatures-error (:kotoba.package/signatures m)
-                       (:manifest-cid source)))))
+  (or (:dep/component-cid m)
+      (:kotoba.package/component-cid m)
+      (get-in m [:dep/build :component-cid])
+      (get-in m [:kotoba.package/build :component-cid])
+      (when (map? (:dep/build m))
+        (get (:dep/build m) :component-cid))
+      (when (map? (:kotoba.package/build m))
+        (get (:kotoba.package/build m) :component-cid))))
+
+(defn component-cid-error
+  "Shape (+ optional content) check for a component CID pin.
+  When COMPONENT-BYTES is supplied, recomputes CIDv1-raw and rejects
+  mismatch — same integrity pattern as tree-cid-error (L3 guest packages)."
+  ([declared] (component-cid-error declared nil))
+  ([declared component-bytes]
+   (cond
+     (not (cid? declared))
+     (invalid "component cid required" {:value declared})
+
+     (nil? component-bytes)
+     nil
+
+     :else
+     (let [computed (mf/cidv1-raw component-bytes)]
+       (when (not= declared computed)
+         (invalid "component cid does not match component content"
+                  {:declared declared :computed computed}))))))
+
+(defn- lock-dep-component-error
+  "For :component kind packages, a component-cid pin is mandatory (L3).
+  For any kind, a present component-cid must be a real CIDv1. Optional
+  content integrity when COMPONENT-BYTES is supplied."
+  [dep component-bytes]
+  (let [kind (:dep/kind dep)
+        declared (component-cid-of dep)]
+    (cond
+      (and (= :component kind) (nil? declared))
+      (invalid "component cid required"
+               {:dependency (:dep/name dep) :kind kind})
+
+      (some? declared)
+      (component-cid-error declared component-bytes)
+
+      :else nil)))
+
+(defn package-manifest-error
+  "2-arity OPTS may carry :tree-bytes -- see `tree-cid-error` -- to also
+  recompute-and-compare :tree-cid against real content; omitted (the
+  1-arity, every existing caller) keeps the original shape-only :tree-cid
+  behavior unchanged.
+
+  IMPORTANT (see `signatures-error`'s docstring): this function alone binds
+  a valid signature to the manifest's self-declared :manifest-cid field,
+  NOT to the manifest's actual content -- a manifest whose other fields
+  (:kotoba.package/capabilities, :name, :version, ...) are mutated AFTER
+  signing, with :manifest-cid left untouched, still passes this function.
+  It only becomes a genuine content-binding guarantee when composed with a
+  SEPARATE check that recomputes :manifest-cid from the manifest's real
+  content and rejects a mismatch -- `kotoba.package-admission/verify-lock`
+  in the sibling kotoba-lang/kotoba repo does exactly that (calling both
+  this function AND `manifest-integrity-error`). A caller using THIS
+  function in isolation does not get that guarantee; see
+  `manifest-content-tampering-slips-through-manifest-error-alone` in this
+  namespace's tests for a concrete demonstration."
+  ([m] (package-manifest-error m nil))
+  ([m {:keys [tree-bytes]}]
+   (let [source (:kotoba.package/source m)]
+     (or
+      (missing-key m manifest-required "missing required package field")
+      (when (and (:kotoba.package/kind m)
+                 (not (contains? allowed-package-kinds (:kotoba.package/kind m))))
+        (invalid "unknown package kind"
+                 {:package (:kotoba.package/name m)
+                  :allowed allowed-package-kinds}))
+      (contract-surfaces-error m "kotoba.package")
+      (when (and (= :adapter (:kotoba.package/kind m))
+                 (empty? (:kotoba.package/consumes m)))
+        (invalid "adapter consumes required" {:package (:kotoba.package/name m)}))
+      (when (and (= :schema-contract (:kotoba.package/kind m))
+                 (empty? (:kotoba.package/provides m)))
+        (invalid "schema-contract provides required" {:package (:kotoba.package/name m)}))
+      (when-not (cid? (:kotoba.package/repo-rid m))
+        (invalid "repo-rid cid required" {:value (:kotoba.package/repo-rid m)}))
+      (missing-key source [:git-commit :tree-cid :manifest-cid] "missing required source field")
+      (when-not (cid? (:tree-cid source))
+        (invalid "tree cid required" {:source source}))
+      (when tree-bytes (tree-cid-error (:tree-cid source) tree-bytes))
+      (when-not (cid? (:manifest-cid source))
+        (invalid "manifest cid required" {:source source}))
+      (when-not (vector? (:kotoba.package/capabilities m))
+        (invalid "capabilities vector required" {:value (:kotoba.package/capabilities m)}))
+      (signatures-error (:kotoba.package/signatures m) (:manifest-cid source))))))
 
 (defn lockfile-error
-  [m tc]
-  (let [declared (set (:declared-capabilities tc))
-        blocked (set/union (set (:revoked-signers tc))
-                           (set (:expired-signers tc))
-                           (set (:compromised-signers tc)))]
-    (or
-     (when-not (= 1 (:kotoba.lock/version m))
-       (invalid "lock version 1 required" {:value (:kotoba.lock/version m)}))
-     (when-not (vector? (:deps m))
-       (invalid "lock deps vector required" {:value (:deps m)}))
-     (some (fn [dep]
-             (or (missing-key dep lock-required "missing required lock field")
-                 (when (and (:dep/kind dep)
-                            (not (contains? allowed-package-kinds (:dep/kind dep))))
-                   (invalid "unknown package kind" {:dependency (:dep/name dep)}))
-                 (contract-surfaces-error dep "dep")
-                 (some (fn [k]
-                         (when-not (cid? (get dep k))
-                           (invalid "cid required" {:field k :value (get dep k)})))
-                       [:dep/repo-rid :dep/tree-cid :dep/manifest-cid])
-                 (when-not (seq (:dep/signers dep))
-                   (invalid "signer required" {:dep dep}))
-                 (when-let [bad (seq (set/intersection (set (:dep/signers dep)) blocked))]
-                   (invalid "signer not currently trusted"
-                            {:signers (vec bad)
-                             :dependency (:dep/name dep)}))
-                 (when-not (set/subset? (set (:dep/capabilities dep)) declared)
-                   (invalid "capability grant exceeds package declaration"
-                            {:grant (:dep/capabilities dep)
-                             :declared (:declared-capabilities tc)}))))
-           (:deps m)))))
+  "3-arity OPTS may carry :tree-bytes-by-dep -- {dep-name tree-bytes ...} --
+  to also recompute-and-compare each dep's :dep/tree-cid against real
+  content (see `tree-cid-error`); omitted (the 2-arity, every existing
+  caller) keeps the original shape-only :dep/tree-cid behavior unchanged.
+
+  OPTS may also carry :component-bytes-by-dep -- {dep-name component-bytes}
+  -- for L3 component-cid content integrity (CID guest packages)."
+  ([m tc] (lockfile-error m tc nil))
+  ([m tc {:keys [tree-bytes-by-dep component-bytes-by-dep]}]
+   (let [declared (set (:declared-capabilities tc))
+         blocked (set/union (set (:revoked-signers tc))
+                            (set (:expired-signers tc))
+                            (set (:compromised-signers tc)))]
+     (or
+      (when-not (= 1 (:kotoba.lock/version m))
+        (invalid "lock version 1 required" {:value (:kotoba.lock/version m)}))
+      (when-not (vector? (:deps m))
+        (invalid "lock deps vector required" {:value (:deps m)}))
+      (some (fn [dep]
+              (or (missing-key dep lock-required "missing required lock field")
+                  (when (and (:dep/kind dep)
+                             (not (contains? allowed-package-kinds (:dep/kind dep))))
+                    (invalid "unknown package kind" {:dependency (:dep/name dep)}))
+                  (contract-surfaces-error dep "dep")
+                  (some (fn [k]
+                          (when-not (cid? (get dep k))
+                            (invalid "cid required" {:field k :value (get dep k)})))
+                        [:dep/repo-rid :dep/tree-cid :dep/manifest-cid])
+                  (when-let [tree-bytes (get tree-bytes-by-dep (:dep/name dep))]
+                    (tree-cid-error (:dep/tree-cid dep) tree-bytes))
+                  (lock-dep-component-error
+                   dep (get component-bytes-by-dep (:dep/name dep)))
+                  (when-not (seq (:dep/signers dep))
+                    (invalid "signer required" {:dep dep}))
+                  (when-let [bad (seq (set/intersection (set (:dep/signers dep)) blocked))]
+                    (invalid "signer not currently trusted"
+                             {:signers (vec bad)
+                              :dependency (:dep/name dep)}))
+                  (when-not (set/subset? (set (:dep/capabilities dep)) declared)
+                    (invalid "capability grant exceeds package declaration"
+                             {:grant (:dep/capabilities dep)
+                              :declared (:declared-capabilities tc)}))))
+            (:deps m))))))
 
 (defn validate-case
   [tc data]

@@ -27,6 +27,29 @@
           (is (false? (:valid? result)) (:id tc))
           (is (str/includes? (:message result) (:error-contains tc)) (:id tc)))))))
 
+(deftest component-cid-required-for-component-kind
+  (testing "L3: :component packages must pin a real component-cid"
+    (let [lock (read-edn "lang/package-conformance/positive/component-lock.edn")
+          missing (read-edn "lang/package-conformance/negative/component_missing_cid_lock.edn")
+          bad (read-edn "lang/package-conformance/negative/component_bad_cid_lock.edn")
+          tc {:declared-capabilities []}]
+      (is (nil? (contract/lockfile-error lock tc)))
+      (is (= "component cid required"
+             (:message (contract/lockfile-error missing tc))))
+      (is (= "component cid required"
+             (:message (contract/lockfile-error bad tc))))))
+  (testing "content integrity when component bytes are supplied"
+    (let [lock (read-edn "lang/package-conformance/positive/component-lock.edn")
+          tc {:declared-capabilities []}
+          good (.getBytes "component-bytes-v1" "UTF-8")
+          other (.getBytes "other-component" "UTF-8")]
+      (is (nil? (contract/lockfile-error
+                 lock tc {:component-bytes-by-dep {"kotoba-lang/guest-hello" good}})))
+      (is (str/includes?
+           (:message (contract/lockfile-error
+                      lock tc {:component-bytes-by-dep {"kotoba-lang/guest-hello" other}}))
+           "component cid does not match")))))
+
 (deftest cid?-genuinely-decodes-and-structurally-validates-a-cidv1
   (testing "a real CIDv1 (multiformats.core/cidv1-dag-cbor, the same function this repo's
             conformance fixtures now use) passes"

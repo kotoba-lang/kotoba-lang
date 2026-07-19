@@ -17,7 +17,17 @@
   (and (string? x) (not (str/blank? x))))
 
 (defn cid? [x]
-  (and (non-empty-string? x) (str/starts-with? x "bafy")))
+  ;; Prefix-only check (matching this script's existing simplicity for
+  ;; every other CID field here -- not the genuine structural
+  ;; multiformats.core/cid->bytes decode kotoba.lang.package-contract/cid?
+  ;; does at runtime). "bafy" = CIDv1 dag-cbor+sha256 (repo-rid/tree-cid/
+  ;; manifest-cid); "bafk" = CIDv1 raw+sha256 (component-cid, since a
+  ;; component's admitted bytes are raw content, not a dag-cbor graph
+  ;; ref) -- both prefixes are genuinely present across this repo's own
+  ;; lang/package-conformance/*.edn fixtures (grep-verified), so a
+  ;; "bafy"-only check silently rejected every valid component-cid.
+  (and (non-empty-string? x)
+       (or (str/starts-with? x "bafy") (str/starts-with? x "bafk"))))
 
 (defn require-keys [m keys msg]
   (doseq [k keys]
@@ -117,6 +127,10 @@
       (doseq [k [:dep/repo-rid :dep/tree-cid :dep/manifest-cid]]
         (when-not (cid? (get dep k))
           (fail "cid required" {:field k :value (get dep k)})))
+      (when (= :component (:dep/kind dep))
+        (when-not (cid? (:dep/component-cid dep))
+          (fail "component cid required" {:dependency (:dep/name dep)
+                                           :value (:dep/component-cid dep)})))
       (when-not (seq (:dep/signers dep))
         (fail "signer required" {:dep dep}))
       (let [signers (set (:dep/signers dep))
