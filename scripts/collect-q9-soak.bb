@@ -26,11 +26,24 @@
   (let [raw (command! ["gh" "api" (str "repos/" github "/git/trees/" sha "?recursive=1")] ".")]
     (into {} (map (juxt :path :sha) (:tree (json/parse-string raw true))))))
 
+(defn authoritative-dirty-lines [status]
+  ;; Clojure CLI rewrites tracked .cpcache entries while resolving the exact
+  ;; committed deps used by qualification tests. They are build cache, not
+  ;; source or qualification authority. Keep rejecting every other dirty path;
+  ;; the required artifacts below are independently read from HEAD and matched
+  ;; byte-for-byte against each remote CI run's Git tree.
+  ;; command! trims the whole porcelain output, so the first line can lose
+  ;; its leading worktree-status space; accept one or two status columns.
+  (remove #(re-matches #".{1,2} \.cpcache/.*" %)
+          (remove str/blank? (str/split-lines status))))
+
 (defn collect-repository [{:keys [repository github dir] :as row}]
-  (let [local-dir (str "../../../" repository)]
-    (when-not (str/blank? (command! ["git" "status" "--porcelain"] local-dir))
+  (let [local-dir (str "../../../" repository)
+        dirty (authoritative-dirty-lines
+               (command! ["git" "status" "--porcelain"] local-dir))]
+    (when (seq dirty)
       (throw (ex-info "Q9 soak collection requires a clean committed repository"
-                      {:repository repository})))
+                      {:repository repository :dirty dirty})))
     (let [required (artifact-paths dir)
         local-head (command! ["git" "rev-parse" "HEAD"] local-dir)
         local-artifacts
