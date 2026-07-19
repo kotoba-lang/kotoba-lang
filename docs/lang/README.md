@@ -13,21 +13,19 @@ Kotoba-specific behavior is selected with reader conditionals:
 
 ## Getting Started
 
-**Product split:** **kotoba** = language (safe Kotoba → **WASM AOT emit**);
-**kototama** = `.kotoba` WASM **runtime** (run the emitted guest). Not JVM
-Clojure execution. JVM is only the bootstrap host for today's language CLI.
-Canonical execute: `kototama` `run guest.wasm`.
+For the public implementation CLI, start with the smallest compile-and-run path:
 
 ```sh
-# Language — AOT (package-lock mandatory)
-kotoba wasm emit examples/hello.kotoba --package-lock kotoba.lock.edn -o hello.wasm
-kotoba wasm safe-build examples/policy-demo.kotoba --policy policy.edn --package-lock kotoba.lock.edn -o policy-demo.wasm
-# Runtime (canonical): kototama  run  hello.wasm
-# Compat only:        kotoba wasm run hello.kotoba --package-lock …
+kotoba -e '(+ 1 2)'
 ```
 
-Historical Rust-era names (`kotoba -e`, `wasm safe-policy`, `wasm selfhost-inspect`)
-are not the live CLJ launcher surface. Use the commands above.
+Then build a source file and inspect the safe-language policy surface:
+
+```sh
+kotoba wasm build examples/hello.kotoba -o hello.wasm
+kotoba wasm safe-policy examples/policy-demo.kotoba
+kotoba wasm safe-build examples/policy-demo.kotoba --policy policy.edn -o policy-demo.wasm
+```
 
 The examples in `examples/` are intentionally small. The authoritative
 compatibility examples are the conformance fixtures under `lang/conformance/`.
@@ -53,13 +51,21 @@ compatibility examples are the conformance fixtures under `lang/conformance/`.
 `.kotoba` and `.cljk` use the Kotoba compiler subset; `.cljc` is the only
 portable source surface shared by all three reader targets.
 
+Inline expressions are also part of the compiler conformance vocabulary:
+`kotoba -e '(+ 1 2)'` wraps the expression as an exported `main`, compiles it
+through the same Kotoba -> core Wasm path, and runs `main`. This is
+compile-and-run sugar, not runtime `eval`; the lower-level implementation
+binary keeps a compatibility `-e` path only for crate-local testing and existing
+integrations.
+
 Capability-safe language tooling is exposed through `kotoba wasm`:
 
 ```sh
-kotoba wasm emit cell.kotoba --package-lock lock.edn -o cell.wasm
-kotoba wasm build cell.kotoba --package-lock lock.edn -o cell.wasm          # alias of emit
-kotoba wasm safe-build cell.kotoba --policy policy.edn --package-lock lock.edn -o cell.wasm
-kotoba wasm run cell.kotoba --package-lock lock.edn
+kotoba wasm build cell.kotoba
+kotoba wasm build -S src cell.kotoba -o cell.wasm
+kotoba wasm safe-policy cell.kotoba
+kotoba wasm safe-build cell.kotoba --policy policy.edn -o cell.wasm
+kotoba wasm selfhost-inspect cell.kotoba --policy policy.edn --json
 ```
 
 Namespace source roots are supplied with `-S` / `--source-path` or
@@ -74,31 +80,13 @@ Dynamic authority is modeled as explicit capability values, not as ambient host
 access or plain resource strings. The profile semantics are documented in
 [`capability-values.md`](capability-values.md).
 
-## Semantic Definition Identity
-
-The C1 content-addressed-code contract lives at `lang/semantic-code.edn`.
-Checked top-level definitions and canonical recursive groups may be lowered to canonical EDN IR
-with alpha-normalized local binders and resolved dependency CIDs, then encoded
-as canonical DAG-CBOR and identified by CIDv1. Human names, source paths,
-formatting, comments, aliases, and top-level source order do not participate in
-that semantic identity.
-
-Source, definition, and artifact identities remain distinct. Definition CID is
-content identity only: package admission, publisher signatures, CACAO,
-capability intersection, local policy, and Wasm confinement remain mandatory.
-The current launcher surface is:
-
-```bash
-kotoba check path/to/program.kotoba --kind semantic-code
-```
-
-The portable conformance inputs are under `lang/semantic-conformance/`. C1
-currently admits terms and recursive groups and fails closed on unresolved
-references or groups beyond its canonicalization bound. Namespace commits, Kotobase code-graph projection, and
-CID-addressed execution are later phases of
-`docs/adr/ADR-kotoba-content-addressed-codebase.md`.
-
-The machine-readable source contract lives at `lang/profile.edn`. Compiler
+The machine-readable source contract lives at `lang/profile.edn`. The current
+classification of intentional safety constraints, deliberate semantic
+simplifications, partial features, and ordinary implementation gaps lives at
+`lang/surface-status.edn`; its decision record is
+`docs/adr/ADR-kotoba-language-surface-status.md`. In particular, map and vector
+literals are partial compiler features, while set semantics and the
+higher-order `map` function are not yet portable guest features. Compiler
 conformance fixtures live under `lang/conformance/`.
 Coverage and maturity tracking lives in `docs/lang/coverage.edn`; compatibility
 rules live in `docs/lang/versioning.md`; CI-facing commands live in
