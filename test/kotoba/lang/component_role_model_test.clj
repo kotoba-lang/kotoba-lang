@@ -4,8 +4,6 @@
 
 (def model
   (edn/read-string (slurp "lang/component-role-model.edn")))
-(def transport
-  (edn/read-string (slurp "lang/transport-component-abi.edn")))
 
 (deftest source-extension-and-runtime-role-are-orthogonal
   (is (= ".kotoba" (get-in model [:source-language :canonical-extension])))
@@ -21,24 +19,10 @@
     (is (= #{:http/get :http/post} (:exports http)))
     (is (contains? (:imports http) :net/connect))
     (is (= #{:db/query :db/transaction} (:exports db)))
-    (is (contains? (:imports db) :secret/use-scram-sha256))
-    (is (contains? (:imports db) :secret/use-postgresql-cancel))))
+    (is (contains? (:imports db) :secret/read-scoped))))
 
 (deftest native-trust-root-remains-explicit
-  (is (some #{:raw-syscall-binding}
-            (get-in model [:native-tcb :must-remain-outside-component-authority])))
+  (is (contains? (set (get-in model [:native-tcb :must-remain-outside-component-authority]))
+                 :raw-syscall-binding))
   (is (= :component-tender-and-linker (get-in model [:kototama :role])))
   (is (some #{:ci-soak} (get-in model [:migration :cutover-still-requires]))))
-
-(deftest transport-provider-prototype-is-bounded-and-honest
-  (is (= #{'transport-connect 'tls-open 'tls-server-end-point 'transport-write
-           'transport-read 'transport-close}
-         (set (keys (:operations transport)))))
-  (is (true? (get-in transport [:limits :default-deny])))
-  (is (zero? (get-in transport [:limits :max-open-connections])))
-  (is (= :implemented-fail-closed
-         (get-in transport [:maturity :kototama-provider-link-seam])))
-  (is (= :implemented-jvm-prototype
-         (get-in transport [:maturity :kototama-native-transport-provider])))
-  (is (= :implemented (get-in transport [:maturity :tls-local-conformance])))
-  (is (false? (get-in transport [:maturity :production-qualified]))))

@@ -15,8 +15,6 @@
       semantics (read-edn "lang/capability-semantics.edn")
       plan (read-edn "lang/safety-qualification.edn")
       roles (read-edn "lang/component-role-model.edn")
-      transport (read-edn "lang/transport-component-abi.edn")
-      transport-bytes (slurp "lang/transport-component-abi.edn")
       required-claims #{:t1-memory :t2-effect :t3-confinement :t4-determinism
                         :t5-resource-bounds :t6-supply-chain :t7-backend-parity
                         :t8-host-resource-scope}
@@ -51,28 +49,11 @@
                                             :same-language-provider-does-not-bypass-imports]))
                       (= :component-tender-and-linker (get-in roles [:kototama :role])))
                  "component source and runtime role authority drift" {:roles roles})
-  (require-truth (and (= :bounded-prototype (:status transport))
-                      (= '#{transport-connect tls-open tls-server-end-point transport-write
-                            transport-read transport-close}
-                         (set (keys (:operations transport))))
-                      (true? (get-in transport [:limits :default-deny]))
-                      (zero? (get-in transport [:limits :max-open-connections]))
-                      (= :implemented-jvm-prototype
-                         (get-in transport [:maturity :kototama-native-transport-provider]))
-                      (= :implemented
-                         (get-in transport [:maturity :tls-local-conformance]))
-                      (false? (get-in transport [:maturity :production-qualified])))
-                 "bounded transport ABI authority drift" {:transport transport})
   (doseq [path ["../kotoba/resources/kotoba/lang/guest-grammar.edn"
                 "../compiler/resources/kotoba/lang/guest-grammar.edn"]]
     (require-truth (= grammar-bytes (slurp path))
                    "Q3 vendored guest grammar drift"
                    {:authority "lang/guest-grammar.edn" :consumer path}))
-  (require-truth (= transport-bytes
-                    (slurp "../compiler/resources/kotoba/lang/transport-component-abi.edn"))
-                 "transport ABI vendored compiler resource drift"
-                 {:authority "lang/transport-component-abi.edn"
-                  :consumer "../compiler/resources/kotoba/lang/transport-component-abi.edn"})
   (require-truth (.isFile (io/file "lang/qualification/q3-backend-parity.edn"))
                  "Q3 parity manifest missing" {})
   (println "Q1 PASS: T1-T8 claims have owner, TCB, negative evidence, and residual risk")

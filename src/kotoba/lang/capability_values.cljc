@@ -72,31 +72,13 @@
    :host/http-post :host/http-post
    :host/log-read :host/log-read
    ;; kami-* game-engine ECS surface (kotoba-core-contracts "kami/engine",
-   ;; capability id 233): one kind for the whole op family, mirroring the
-   ;; one shared capability. Registered HERE at the same time as the
-   ;; contract/provider registration -- omitting this entry is exactly the
-   ;; aiueos/actor:host :unsupported-kind runtime-denial gap documented
-   ;; above, so don't repeat it for new families.
+   ;; capability id 233). Without this entry, guarded host calls for every
+   ;; kami-* op fail closed with :unsupported-kind even when policy grants
+   ;; :kami/engine — a silent T3 hole until the host is exercised with a
+   ;; real policy (security kaizen 2026-07-17).
    :host/kami-engine :host/kami-engine
-   ;; ADR-2607140600 Phase 3a device-capability bridge (iPhone sensing for
-   ;; the indoor floorplan-lab): 4 read-only, no-network-egress host
-   ;; imports registered in kotoba-core-contracts as motion/read (234),
-   ;; audio/io (235), ble/scan (236), wifi/info (237). audio-play and
-   ;; audio-record share the ONE audio/io capability (kind mirrors the
-   ;; capability id, same convention as :host/topic-subscribe grouping
-   ;; topic-poll/topic-take/topic-count), the other three are 1 kind per
-   ;; op. Registered HERE at capability-contract/op->kind registration
-   ;; time -- omitting this entry is exactly the aiueos/actor:host
-   ;; :unsupported-kind runtime-denial gap documented above (kami-engine's
-   ;; entry two lines up exists to not repeat it either).
-   :host/motion-read :host/motion-read
-   :host/audio-io :host/audio-io
-   :host/ble-scan :host/ble-scan
-   :host/wifi-info :host/wifi-info
-   ;; VRM composition domain capabilities. These authorize data-plane work
-   ;; performed by a CLJS host or Murakumo worker; they are not Wasm imports.
-   ;; Registration here is still mandatory because intersect-grants rejects
-   ;; every unknown kind fail-closed.
+   ;; kisekae/org-vrmc-vrm composition boundary. These must be canonical
+   ;; effects so a concrete post-policy grant survives worker re-authorization.
    :vrm/asset-read :vrm/asset-read
    :vrm/compose :vrm/compose
    :vrm/preview :vrm/preview
@@ -252,9 +234,12 @@
   expiry is the earliest non-nil expiry among the requested capability and
   the contributing grants, provenance is the contributing grant ids. A
   wildcard (:any) result is only possible when requested, grants, and policy
-  are all :any. Fails closed with {:denied <reason>} when the requested kind
-  is unsupported (:unsupported-kind), every covering grant is expired at :now
-  (:expired), or the intersection is empty (:empty-intersection)."
+  are all :any — unless local-policy has :policy/forbid-wildcard true
+  (ADR-2607180900 P1 / S4b least-privilege), in which case :any is denied
+  as :wildcard-forbidden. Fails closed with {:denied <reason>} when the
+  requested kind is unsupported (:unsupported-kind), every covering grant
+  is expired at :now (:expired), or the intersection is empty
+  (:empty-intersection)."
   [{:keys [requested cacao-grants local-policy now]}]
   (let [kind (:cap/kind requested)
         forbid-wildcard? (boolean (or (:policy/forbid-wildcard local-policy)

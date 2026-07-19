@@ -4,41 +4,24 @@
             [kotoba.cli :as cli]))
 
 (def contract (cli/read-contract))
-
-;; lang/adapters.edn is stored as Datomic/Datascript tx-data (see
-;; schema.edn); every key was already namespaced (:kotoba.adapter.registry/*)
-;; so the transform did not rename anything -- reverse the blob-ification of
-;; non-scalar values the same way kotoba.cli/read-contract does for cli.edn.
-#?(:clj
-   (defn- unblob [v]
-     (if (string? v)
-       (try (let [parsed (edn/read-string v)] (if (coll? parsed) parsed v))
-            (catch Exception _ v))
-       v)))
-
-#?(:clj
-   (defn- reconstitute-entity [tx-data]
-     (into {} (map (fn [[k v]] [k (unblob v)]))
-           (dissoc (first tx-data) :db/id))))
-
 (def adapters
-  #?(:clj (reconstitute-entity (edn/read-string (slurp "lang/adapters.edn")))
+  #?(:clj (edn/read-string (slurp "lang/adapters.edn"))
      :cljs {}))
 
 (deftest contract-validates-in-cljc
   (let [result (cli/validate-contract contract)]
     (is (:kotoba.cli/ok? result))
     (is (= {:version 1
-            :commands [:run :compile :check :db :git :rad :deploy :hinshitsu :wasm]
-            :command-count 9
-            :option-count 49}
+            :commands [:run :compile :check :db :git :rad :deploy :hinshitsu]
+            :command-count 8
+            :option-count 44}
            (:kotoba.cli/data result)))))
 
 (deftest cljc-authority-implements-contract-commands
   (is (= {:kotoba.cli/ok? true
           :kotoba.cli/source :cljc
-          :kotoba.cli/contract-commands ["check" "compile" "db" "deploy" "git" "hinshitsu" "rad" "run" "wasm"]
-          :kotoba.cli/implemented-commands ["check" "compile" "db" "deploy" "git" "hinshitsu" "rad" "run" "wasm"]
+          :kotoba.cli/contract-commands ["check" "compile" "db" "deploy" "git" "hinshitsu" "rad" "run"]
+          :kotoba.cli/implemented-commands ["check" "compile" "db" "deploy" "git" "hinshitsu" "rad" "run"]
           :kotoba.cli/missing-commands []}
          (cli/conformance contract))))
 
@@ -62,19 +45,6 @@
     (is (= :check (:kotoba.cli/command result)))
     (is (= :contract/valid (:kotoba.cli/code result)))))
 
-(deftest compile-selects-language-owned-backends
-  (is (= :kotoba-script
-         (get-in (cli/dispatch contract ["compile" "main.kotoba" "--target" "web"])
-                 [:kotoba.cli/data :backend])))
-  (is (= :kotoba-script
-         (get-in (cli/dispatch contract ["compile" "main.cljc" "--target" "web"])
-                 [:kotoba.cli/data :backend])))
-  (is (= :clojurescript
-         (get-in (cli/dispatch contract ["compile" "main.cljs" "--target" "web"])
-                 [:kotoba.cli/data :backend])))
-  (is (= :compile/unsupported-extension
-         (:kotoba.cli/code (cli/dispatch contract ["compile" "main.js" "--target" "web"])))))
-
 (deftest side-effecting-commands-return-adapter-data
   (doseq [command ["run" "db" "git" "rad" "deploy" "hinshitsu"]]
     (let [result (cli/dispatch contract [command "--json"])]
@@ -85,5 +55,4 @@
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'kotoba.cli-test)]
     (when (pos? (+ (or fail 0) (or error 0)))
-      #?(:clj (System/exit 1)
-         :cljs nil))))
+      #?(:clj (System/exit 1)))))

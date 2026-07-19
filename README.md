@@ -3,20 +3,18 @@
 Kotoba is a small Clojure-shaped language profile for compiling safe,
 capability-checked programs to WebAssembly.
 
-It is designed for code that should be inspectable, portable, and constrained:
-AI-generated cells, sandboxed automation, repository policy, and other
-untrusted programs where the host decides which capabilities are available.
+It is designed for components that should be inspectable, portable, and
+constrained: AI-generated cells, sandboxed automation, repository policy,
+applications, orchestrators, and capability providers whose external effects
+are explicit and runtime-granted.
 
 ## Why Kotoba?
 
 - **Small source surface**: Kotoba source is a Kotoba/EDN subset with `.kotoba`
   as the canonical extension.
-- **Clojure-family shape**: `.clj`, `.cljc`, and `.cljs` inputs are accepted
-  as compatibility source formats, while Kotoba-specific behavior is
-  selected with the `:kotoba` reader target — only reachable through
-  `.cljc`'s wider branch chain, since `.clj` and `.cljs` are single-target
-  compatibility extensions with their own reader-branch chain each (profile
-  v3, reinstating `.cljs`; see `docs/lang/versioning.md`).
+- **Clojure-family shape**: `.clj` is Clojure, `.cljs` is ClojureScript,
+  `.cljk` is CLJ Kotoba, and `.cljc` is common source across all three reader
+  targets (`:clj`, `:cljs`, and `:kotoba`).
 - **Implemented in Clojure ("Clojure on Clojure")**: the compiler, CLI, and
   conformance tooling that process this Clojure-shaped language are themselves
   written in Clojure/ClojureScript (`.cljc`). An earlier Rust implementation
@@ -65,26 +63,6 @@ grant-verification roots.
 
 The normative role separation and provider examples are in
 [`lang/component-role-model.edn`](lang/component-role-model.edn).
-The first bounded lower-level slice is
-[`lang/transport-component-abi.edn`](lang/transport-component-abi.edn): opaque
-connect/TLS/channel handles with exact endpoint scope and finite limits.
-Compiler validation, reference Wasm import lowering, Kotoba HTTP/DB provider
-sources, and a fail-closed kototama link seam are implemented. An opt-in JVM
-socket/TLS HostFunction provider now implements the bounded ABI as a tested
-prototype. The JVM linker now bridges independent component memories, and a
-real Kotoba consumer reaches a status/header-validating Kotoba HTTP provider
-over verified TLS with finite read timeout. Browsers have an injected
-high-level `http-get` path using a COOP/COEP worker+SharedArrayBuffer bridge.
-Node additionally runs the compiled `.kotoba` HTTP provider over a bounded
-worker/SAB raw transport and links an independent consumer memory to it. Both
-paths are default-denied and finite-quota. Browser raw socket/TLS remains
-absent. Node now also supplies purpose-bound SCRAM credential use and pinned,
-one-shot PostgreSQL cancellation primitives, while the higher PostgreSQL
-consumer links and pool remain incomplete. Full browser parity is honestly below its
-global surface at 10 of 59 imports. The browser product profile classifies all
-59 imports: its ten required imports are 10/10 implemented, ten operations are
-intentional native/secret-custody boundaries, 38 provider-component operations
-remain deferred, and `llm-infer` remains an explicit deferred host injection.
 
 The normative terminology, end-to-end capability invariant, Deno/wasmCloud
 comparison boundaries, and the reverse-topological qualification plan that
@@ -118,10 +96,9 @@ requirements fail closed.
 Wave 1 preflight found 863 generated schema-DSL files using the bare
 `.kotoba` extension. They are not canonical Kotoba programs and are tracked in
 [`lang/q9-kotoba-extension-audit.edn`](lang/q9-kotoba-extension-audit.edn).
-Consumer-aware schema tranches have moved 81 of them to `.kotoba-schema`,
-updated their manifests and documented references, and passed each repository's
-tests, leaving 782 collisions. No CLJC consumer cutover is performed until a
-bounded component/native-TCB split is extracted and oracle-qualified.
+Tranche 1 moved ten of them to `.kotoba-schema` and updated their manifest
+consumers, leaving 853 collisions. No CLJC consumer cutover is performed until
+a bounded component/native-TCB split is extracted and oracle-qualified.
 
 All ten Tranche 1 repositories now extract the same bounded page-limit
 decision into a repository-local, zero-import `.kotoba` component. Each CLJC
@@ -170,10 +147,12 @@ conformance fixtures that the implementation consumes.
 
 ## Source Contract
 
-- Accepted extensions: `.kotoba`, `.cljc`, `.clj`, `.cljs`.
+- Accepted extensions: `.kotoba`, `.cljc`, `.cljk`, `.clj`, `.cljs`.
 - Canonical Kotoba-only extension: `.kotoba`.
 - Portable Clojure-family extension: `.cljc`.
-- Compatibility extensions: `.clj` (JVM Clojure) and `.cljs` (ClojureScript),
+- CLJ Kotoba extension: `.cljk`; it uses the Kotoba/Kototama compiler and is
+  not a JVM compilation target.
+- Standard extensions: `.clj` (Clojure) and `.cljs` (ClojureScript),
   each single-target with its own reader-branch chain (`["clj" "default"]`
   and `["cljs" "default"]` respectively) — neither carries `#?(:kotoba ...)`
   branches the way `.cljc` does.
@@ -181,7 +160,7 @@ conformance fixtures that the implementation consumes.
 - `:kotoba` reader branch fallback order: `:kotoba`, then `:clj`, then
   `:default`.
 - Namespace resolution priority for target `kotoba`: `.kotoba`, `.cljc`,
-  `.clj`, `.cljs`.
+  `.cljk`, `.clj`, `.cljs`.
 
 Example portable source:
 
@@ -194,7 +173,7 @@ Example portable source:
 New Kotoba-only code should use `.kotoba`. Shared Clojure-family source should
 use `.cljc` and place Kotoba-specific behavior behind `#?(:kotoba ...)`.
 
-The machine-readable source contract is `lang/profile.edn` (profile version 3);
+The machine-readable source contract is `lang/profile.edn` (profile version 4);
 conformance fixtures live under `lang/conformance/`.
 
 ## Repository Scope
@@ -225,15 +204,6 @@ repository as data:
 - `examples/`: small source examples for docs and CLI smoke tests.
 - Node, JVM, native, or other launchers are adapters. They should not define CLI
   protocol semantics independently.
-
-**Out of scope, by design**: this repository does not define the "safe
-Kotoba" compile-time admission grammar (subset/capability/effect gates —
-T1 Memory Safety / T2 Effect Soundness / T3 Capability Confinement). That is
-implemented in [`kotoba-lang/compiler`](https://github.com/kotoba-lang/compiler)
-(the CLJC-native successor of `kotoba-lang/kotoba`'s historical Rust
-`policy.rs`/`subset.rs`/`effects.rs`). `kotoba-lang/kotoba`'s README
-previously misattributed that successor to this repository; see
-`com-junkawasaki/root` ADR-2607141600.
 
 ## Current Status
 

@@ -12,23 +12,6 @@
   [path]
   (edn/read-string (slurp (io/file path))))
 
-;; lang/capability-conformance/manifest.edn is stored as Datomic/Datascript
-;; tx-data (see schema.edn). See scripts/check-capability-values.bb for the
-;; same reconstitution -- the manifest's plain :cases key was renamed to
-;; :kotoba.lang.capability.conformance/cases and blob-stringified, while the
-;; already-namespaced :version key was left untouched.
-(defn- unblob [v]
-  (if (string? v)
-    (try (let [parsed (edn/read-string v)] (if (coll? parsed) parsed v))
-         (catch Exception _ v))
-    v))
-
-(defn- reconstitute-capability-conformance-manifest [tx-data]
-  (let [e (dissoc (first tx-data) :db/id)]
-    {:kotoba.lang.capability.conformance/version
-     (:kotoba.lang.capability.conformance/version e)
-     :cases (unblob (:kotoba.lang.capability.conformance/cases e))}))
-
 (def graph-a "bafygrapha11111111111111111111111111111111111111111111111")
 (def graph-b "bafygraphb22222222222222222222222222222222222222222222222")
 (def graph-c "bafygraphc33333333333333333333333333333333333333333333333")
@@ -135,36 +118,6 @@
               :local-policy {:policy/allow {:graph-read #{:any}}}
               :now now}))))))
 
-(deftest vrm-domain-capabilities-are-runtime-supported
-  (doseq [kind [:vrm/asset-read :vrm/compose :vrm/preview :vrm/export :vrm/publish]]
-    (is (= kind (get caps/effect-for-kind kind)))
-    (is (= graph-a
-           (:cap/resource
-            (caps/intersect-grants
-             {:requested (caps/make-cap kind :any)
-              :cacao-grants [(grant kind #{graph-a} nil "vrm-grant")]
-              :local-policy {:policy/allow {kind #{graph-a}}}
-              :now now})))
-        (str kind " must pass canonical grant/policy intersection"))))
-
-(deftest sensing-device-capability-kinds-are-registered-in-effect-for-kind
-  (testing "ADR-2607140600 Phase 3a device-capability bridge (iPhone sensing for the indoor
-            floorplan-lab): :host/motion-read, :host/audio-io, :host/ble-scan, :host/wifi-info
-            must each be a member of effect-for-kind -- omitting one of these here is exactly
-            the aiueos/actor:host :unsupported-kind runtime-denial gap documented in
-            aiueos-and-actor-host-kinds-are-registered-in-effect-for-kind above (registered in
-            kotoba.runtime/op->kind but not HERE means every real call is denied at RUN time
-            even though the static compile-time capability gate never catches it)."
-    (doseq [kind [:host/motion-read :host/audio-io :host/ble-scan :host/wifi-info]]
-      (is (contains? caps/effect-for-kind kind) kind)
-      (is (not= {:denied :unsupported-kind}
-                (caps/intersect-grants
-                 {:requested (caps/make-cap kind :any)
-                  :cacao-grants [(grant kind #{:any} nil "g1")]
-                  :local-policy {:policy/allow {kind #{:any}}}
-                  :now now}))
-          (str kind " must not be denied as unsupported now that it's registered")))))
-
 (deftest effect-row-must-cover-capability-parameters
   (testing "consistent row"
     (is (= {:ok? true :missing #{}}
@@ -233,7 +186,7 @@
                                            :provenance ["g1"]})))))
 
 (deftest capability-conformance-fixtures-match-contract
-  (let [manifest (reconstitute-capability-conformance-manifest (read-edn manifest-path))]
+  (let [manifest (read-edn manifest-path)]
     (is (= 1 (:kotoba.lang.capability.conformance/version manifest)))
     (doseq [tc (:cases manifest)
             :let [data (read-edn (str "lang/capability-conformance/" (:file tc)))
@@ -242,3 +195,7 @@
                            :cacao-grants (cacao/check-case tc data)
                            (caps/check-case tc data))]]
       (is (:ok? result) (str (:id tc) " -> " (pr-str (:actual result)))))))
+
+(deftest vrm-composition-kinds-are-canonical-effects
+  (doseq [kind [:vrm/asset-read :vrm/compose :vrm/preview :vrm/export :vrm/publish]]
+    (is (= kind (get caps/effect-for-kind kind)))))
