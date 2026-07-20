@@ -13,7 +13,7 @@
 
 (deftest fleet-cannot-be-marked-complete-by-file-count
   (is (false? (get-in q9 [:current-decision :fleet-complete])))
-  (is (= :ten-pilots-extracted-awaiting-soak
+  (is (= :twenty-pilots-extracted-awaiting-soak
          (get-in q9 [:waves :wave-1 :next-tranche-status])))
   (is (true? (get-in q9 [:rollback-policy :oracle-retained-until-soak])))
   (is (true? (get-in q9 [:rollback-policy :production-deploy-requires-separate-authority]))))
