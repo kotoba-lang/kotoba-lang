@@ -5,6 +5,19 @@
 (def model
   (edn/read-string (slurp "lang/component-role-model.edn")))
 
+(def platform
+  (edn/read-string (slurp "lang/wasm-component-platform.edn")))
+
+(deftest wasi03-component-platform-is-closed-and-role-separated
+  (is (= "0.3.0" (get-in platform [:upstream :wasi :version])))
+  (is (= :declared-effects-only (get-in platform [:world :imports])))
+  (is (= :reject (get-in platform [:world :undeclared-imports])))
+  (is (false? (get-in platform [:world :ambient-wasi])))
+  (is (= :func (get-in platform [:function-modes :sync :wit])))
+  (is (= :async-func (get-in platform [:function-modes :async :wit])))
+  (is (= #{:language :compiler :kototama}
+         (set (keys (:ownership platform))))))
+
 (deftest source-extension-and-runtime-role-are-orthogonal
   (is (= ".kotoba" (get-in model [:source-language :canonical-extension])))
   (is (some #{:guest-only} (get-in model [:source-language :does-not-imply])))
