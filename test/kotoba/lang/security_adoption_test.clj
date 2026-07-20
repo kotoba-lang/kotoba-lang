@@ -4,7 +4,7 @@
             [kotoba.lang.release-admission]))
 
 (def required-security-sha
-  "9316629ed15437ef1cf0f93b7f98e7cb31ef91d2")
+  "23caaefa6ca35904f9d0c2dc0cbb3bec91ae8956")
 
 (deftest central-security-control-is-an-immutable-runtime-dependency
   (let [deps (edn/read-string (slurp "deps.edn"))
