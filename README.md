@@ -63,6 +63,11 @@ grant-verification roots.
 
 The normative role separation and provider examples are in
 [`lang/component-role-model.edn`](lang/component-role-model.edn).
+The portable platform ABI is WIT plus the WebAssembly Component Model with a
+WASI 0.3 baseline; see
+[`lang/wasm-component-platform.edn`](lang/wasm-component-platform.edn) and the
+corresponding platform ADR. Async functions, futures, and streams are explicit
+bounded effects, never ambient authority.
 
 The normative terminology, end-to-end capability invariant, Deno/wasmCloud
 comparison boundaries, and the reverse-topological qualification plan that
