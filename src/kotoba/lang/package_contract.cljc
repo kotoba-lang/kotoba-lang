@@ -273,7 +273,7 @@
      (when-let [resolved (or resolved-definitions (:resolved-definitions tc))]
        (let [result (identity/verify-locked-definitions m resolved)]
          (when-not (:ok? result)
-           (invalid "definition identity lock verification failed" result))))))))
+           (invalid "definition identity lock verification failed" result)))))))))
 
 (defn validate-case
   [tc data]
