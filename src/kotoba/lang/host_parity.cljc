@@ -83,6 +83,38 @@
      :missing (mapv :import (remove #(linkable? (:browser %) statuses) rows))
      :gaps (get-in c [:acceptance :honest-gaps] [])}))
 
+(defn availability
+  "Return the closed availability decision for one declared host import.
+  A missing row, explicit `:no`, or an unknown host is capability absence;
+  no caller receives ambient authority merely because a Component compiled."
+  [import host]
+  (let [status (get-in (catalog) [:imports import host])]
+    (if (contains? #{:yes :inject :coop-or-inject :component-link :native-provider} status)
+      :available
+      :capability-absent)))
+
+(defn guard-host-import
+  "Data-only host guard used before a provider is selected or linked."
+  [import host]
+  (let [status (availability import host)]
+    (if (= :available status)
+      {:kotoba.host/ok? true :status status :import import :host host}
+      {:kotoba.host/ok? false :kotoba.host/denied :host-absent
+       :status status :import import :host host})))
+
+(defn run-conformance
+  "Validate every declared matrix cell is a known, explicit availability
+  state. This is deliberately a contract conformance check, not a provider
+  invocation: providers remain separately qualified by their host runtimes."
+  []
+  (let [known #{:yes :no :inject :coop-or-inject :component-link :native-provider}
+        cases (vec (for [[import row] (:imports (catalog))
+                         host (:hosts (catalog))]
+                     {:import import :host host :status (get row host)}))
+        failed (vec (remove #(contains? known (:status %)) cases))]
+    {:ok? (empty? failed) :total (count cases)
+     :passed (- (count cases) (count failed)) :failed failed :results cases}))
+
 (defn report
   "Aggregate parity snapshot for CLI/doctor."
   []
