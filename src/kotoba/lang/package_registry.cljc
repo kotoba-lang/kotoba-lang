@@ -1,0 +1,84 @@
+(ns kotoba.lang.package-registry
+  "Compatibility registry kernel. Resolution is pure and always emits a
+  complete CID-pinned lock entry; name@version is never executable input."
+  (:require [clojure.string :as str]
+            [kotoba.lang.package-contract :as contract]))
+
+(def registry-version 1)
+(def required [:registry/name :registry/version :registry/repo-rid
+               :registry/commit :registry/tree-cid :registry/manifest-cid
+               :registry/signers :registry/capabilities])
+
+(defn- text? [x] (and (string? x) (not (str/blank? x))))
+(defn registry-key [name version] (str name "@" version))
+
+(defn normalize [registry]
+  (let [records (cond (vector? registry) registry
+                      (map? registry) (or (:records registry) (:kotoba.registry/records registry) [])
+                      :else [])
+        version (if (map? registry) (or (:kotoba.registry/version registry) (:version registry) registry-version)
+                    registry-version)]
+    {:kotoba.registry/version version :records (vec records)
+     :index (into {} (keep (fn [r] (when (and (map? r) (text? (:registry/name r))
+                                             (text? (:registry/version r)))
+                                    [(registry-key (:registry/name r) (:registry/version r)) r]))) records)}))
+
+(defn record-problems [record]
+  (cond
+    (not (map? record)) [{:problem :registry/record-not-a-map}]
+    :else
+    (cond-> []
+      (some #(not (contains? record %)) required)
+      (into (keep #(when-not (contains? record %) {:problem :registry/missing-field :field %}) required))
+      (and (contains? record :registry/repo-rid) (not (contract/cid? (:registry/repo-rid record))))
+      (conj {:problem :registry/cid-invalid :field :registry/repo-rid})
+      (and (contains? record :registry/tree-cid) (not (contract/cid? (:registry/tree-cid record))))
+      (conj {:problem :registry/cid-invalid :field :registry/tree-cid})
+      (and (contains? record :registry/manifest-cid) (not (contract/cid? (:registry/manifest-cid record))))
+      (conj {:problem :registry/cid-invalid :field :registry/manifest-cid})
+      (not (and (vector? (:registry/signers record)) (seq (:registry/signers record))
+                (every? text? (:registry/signers record))))
+      (conj {:problem :registry/signers-invalid})
+      (not (vector? (:registry/capabilities record)))
+      (conj {:problem :registry/capabilities-invalid}))))
+
+(defn validate [registry]
+  (let [r (normalize registry)
+        problems (vec (concat
+                       (when-not (= registry-version (:kotoba.registry/version r))
+                         [{:problem :registry/version-unsupported}])
+                       (mapcat record-problems (:records r))
+                       (when-not (= (count (:records r)) (count (:index r)))
+                         [{:problem :registry/duplicate-or-incomplete-keys}])))]
+    {:ok? (empty? problems) :problems problems :registry r}))
+
+(defn lookup [registry name version]
+  (get-in (normalize registry) [:index (registry-key name version)]))
+
+(defn resolve-record [registry name version]
+  (let [v (validate registry)]
+    (if-not (:ok? v) {:ok? false :problems (:problems v)}
+      (if-let [record (lookup (:registry v) name version)]
+        (let [problems (record-problems record)]
+          (if (seq problems) {:ok? false :problems problems} {:ok? true :record record}))
+        {:ok? false :problems [{:problem :registry/not-found :name name :version version}]}))))
+
+(defn record->lock-dep [record capability-grant]
+  (let [caps (vec (or capability-grant (:registry/capabilities record)))]
+    (cond-> {:dep/name (:registry/name record) :dep/version (:registry/version record)
+             :dep/repo-rid (:registry/repo-rid record) :dep/commit (:registry/commit record)
+             :dep/tree-cid (:registry/tree-cid record) :dep/manifest-cid (:registry/manifest-cid record)
+             :dep/signers (vec (:registry/signers record)) :dep/capabilities caps}
+      (:registry/kind record) (assoc :dep/kind (:registry/kind record))
+      (:registry/component-cid record) (assoc :dep/component-cid (:registry/component-cid record)))))
+
+(defn lock-from-requests [registry requests]
+  (let [results (mapv (fn [request]
+                        (let [resolved (resolve-record registry (or (:name request) (:dep/name request))
+                                                       (or (:version request) (:dep/version request)))]
+                          (if (:ok? resolved) (assoc resolved :dep (record->lock-dep (:record resolved)
+                                                                                      (or (:capabilities request) (:dep/capabilities request))))
+                              resolved))) requests)]
+    (if (every? :ok? results)
+      {:ok? true :lock {:kotoba.lock/version 1 :deps (mapv :dep results)} :deps (mapv :dep results)}
+      {:ok? false :problems (vec (mapcat :problems (remove :ok? results)))})))
