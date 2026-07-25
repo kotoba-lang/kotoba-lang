@@ -8,6 +8,29 @@ constrained: AI-generated cells, sandboxed automation, repository policy,
 applications, orchestrators, and capability providers whose external effects
 are explicit and runtime-granted.
 
+## Execution architecture
+
+Kotoba's ordinary execution artifact is a **Wasm Component**, not a direct
+native executable. The shared compiler pipeline checks the source subset,
+effects, declared capabilities, and resource bounds once, then lowers to the
+portable component. `kototama` verifies and links the component; `aiueos`
+decides scoped grants; the host enforces them.
+
+```text
+Kotoba component -> kototama linker/runtime -> verified host adapter
+                                      ^                 |
+aiueos control-plane component -------+----- scoped grant
+```
+
+WIT and WASI are interface vocabulary, not ambient authority. A component gets
+no filesystem, network, clock, random, environment, process, or secret access
+unless it imports a narrow interface and presents an aiueos grant that the host
+independently validates. Boot, hardware isolation, the Wasm engine, device
+drivers, and root-key use remain a deliberately small native TCB. Direct native
+AOT is reserved for that TCB and explicitly trusted low-level primitives, not
+for ordinary applications. The normative decision is
+[`ADR-2607252500`](https://github.com/com-junkawasaki/root/blob/main/90-docs/adr/2607252500-kotoba-wasm-component-first-execution-boundary.edn).
+
 ## Why Kotoba?
 
 - **Small source surface**: Kotoba source is a Kotoba/EDN subset with `.kotoba`
@@ -20,8 +43,9 @@ are explicit and runtime-granted.
   written in Clojure/ClojureScript (`.cljc`). An earlier Rust implementation
   was fully retired in favor of this CLJC authority (see
   `docs/rust-migration-inventory.md`).
-- **Wasm-first execution**: the public compiler surface is `kotoba -e` and
-  `kotoba wasm ...`.
+- **Wasm Component-first execution**: the public compiler surface is
+  `kotoba -e` and `kotoba wasm ...`; native AOT is not the default application
+  runtime.
 - **Capability-safe tooling**: safe-policy, safe-build, and selfhost-inspect are
   part of the expected user-facing workflow. Safety is *benchmarked against*
   Rust, not copied from it: Kotoba's capability-confinement model
