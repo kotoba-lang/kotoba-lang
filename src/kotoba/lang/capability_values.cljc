@@ -83,7 +83,15 @@
    :vrm/compose :vrm/compose
    :vrm/preview :vrm/preview
    :vrm/export :vrm/export
-   :vrm/publish :vrm/publish})
+   :vrm/publish :vrm/publish
+   ;; web-wide crawl (com-junkawasaki/root ADR-2607252400)。Common Crawl 経由の
+   ;; 商品コーパス収集を .kotoba guest に置くための kind。道具(shell-exec)ではなく
+   ;; *意図* を capability にしているので、cdx 照会・WARC 抽出・corpus 追記・publish が
+   ;; それぞれ独立した effect になり、guest 関数はどれを使うか effect row で宣言する。
+   :host/cc-cdx-query :host/cc-cdx-query
+   :host/cc-warc-extract :host/cc-warc-extract
+   :host/corpus-append :host/corpus-append
+   :host/corpus-publish :host/corpus-publish})
 
 (defn non-empty-string?
   [x]
