@@ -12,6 +12,15 @@
 (defn- text? [x] (and (string? x) (not (str/blank? x))))
 (defn registry-key [name version] (str name "@" version))
 
+(defn version-only-request?
+  "True for the deliberately non-admissible name+version request shape.
+  Resolution must turn this into a CID-pinned lock dependency before it can
+  cross the package admission boundary."
+  [request]
+  (and (map? request)
+       (= #{:dep/name :dep/version} (set (keys request)))
+       (text? (:dep/name request)) (text? (:dep/version request))))
+
 (defn normalize [registry]
   (let [records (cond (vector? registry) registry
                       (map? registry) (or (:records registry) (:kotoba.registry/records registry) [])
