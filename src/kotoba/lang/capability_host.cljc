@@ -67,6 +67,47 @@
              :kotoba.host/result (:value invoked)
              :kotoba.host/receipt receipt}))))))
 
+(defn guard-ability-call
+  "The typed-ability entry point for a host provider.
+
+  Unlike the legacy low-level `guard-call`, this requires the caller's declared
+  effect row.  The capability kind must be covered before policy intersection
+  or provider dispatch; a missing effect is a deny-before-effect result and
+  produces the same audit receipt shape as every other denied call.  Compiler
+  and component adapters should use this function when lowering an ability
+  parameter to a provider import."
+  [{:keys [call requested effect-row record! now] :as opts}]
+  (if-not (values/capability? requested)
+    (guard-call opts)
+    (let [effect-check (values/effects-consistent? effect-row [requested])]
+      (if (:ok? effect-check)
+        (guard-call opts)
+        (let [receipt (->receipt requested now call :denied
+                                 {:receipt/denied :effect-not-declared
+                                  :receipt/missing-effects (:missing effect-check)})]
+          (when record! (record! receipt))
+          {:kotoba.host/ok? false
+           :kotoba.host/denied :effect-not-declared
+           :kotoba.host/missing-effects (:missing effect-check)
+           :kotoba.host/receipt receipt})))))
+
+(defn guard-component-ability-call
+  "Strict Component-model provider entry point. It requires the full ability
+  binding (target, operation, positive byte/item/deadline limits, audit id)
+  before applying the typed effect gate and runtime grant intersection. This
+  prevents a legacy resource-only capability from becoming authority at a
+  component/WIT boundary."
+  [{:keys [call requested record! now] :as opts}]
+  (let [admission (values/component-admission opts)]
+    (if (:ok? admission)
+      (guard-ability-call opts)
+      (let [receipt (->receipt requested now call :denied
+                               {:receipt/denied (:denied admission)})]
+      (when record! (record! receipt))
+      {:kotoba.host/ok? false
+       :kotoba.host/denied (:denied admission)
+       :kotoba.host/receipt receipt}))))
+
 (defn journal
   "Atom-backed append-only receipt recorder. Returns
   {:record! <fn receipt -> receipt> :entries <fn -> [receipt ...]>} so a host

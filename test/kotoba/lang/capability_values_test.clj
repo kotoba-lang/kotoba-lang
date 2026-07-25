@@ -185,6 +185,17 @@
                                            :expires "2026-12-31"
                                            :provenance ["g1"]})))))
 
+(deftest component-abilities-bind-operation-limits-and-audit-identity
+  (let [cap (caps/make-component-cap
+             :host/http "https://api.example"
+             {:target :provider/http :operation :http/post
+              :limits {:max-bytes 4096 :max-items 1 :deadline-ms 1000}
+              :audit-id "request-42"})]
+    (is (caps/component-capability? cap))
+    (is (false? (caps/component-capability?
+                (assoc-in cap [:cap/limits :max-bytes] 0))))
+    (is (false? (caps/component-capability? (dissoc cap :cap/audit-id))))))
+
 (deftest capability-conformance-fixtures-match-contract
   (let [manifest (read-edn manifest-path)]
     (is (= 1 (:kotoba.lang.capability.conformance/version manifest)))

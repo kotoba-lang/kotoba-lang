@@ -164,6 +164,62 @@
     (is (= "clipboard:system"
            (get-in outcome [:kotoba.host/receipt :receipt/cap :cap/resource])))))
 
+(deftest typed-ability-call-requires-the-corresponding-effect-before-dispatch
+  (let [calls (atom 0)
+        denied (host/guard-ability-call
+                {:call :kotoba.host/graph-write
+                 :effect-row #{:graph-read}
+                 :requested (caps/graph-write-cap graph-a)
+                 :cacao-grants [(grant :graph-write #{graph-a} nil "g1")]
+                 :local-policy {:policy/allow {:graph-write #{graph-a}}}
+                 :now now
+                 :handler (fn [_] (swap! calls inc))})
+        granted (host/guard-ability-call
+                 {:call :kotoba.host/graph-write
+                  :effect-row #{:graph-write}
+                  :requested (caps/graph-write-cap graph-a)
+                  :cacao-grants [(grant :graph-write #{graph-a} nil "g1")]
+                  :local-policy {:policy/allow {:graph-write #{graph-a}}}
+                  :now now
+                  :handler (constantly :ok)})]
+    (is (= :effect-not-declared (:kotoba.host/denied denied)))
+    (is (= #{:graph-write} (:kotoba.host/missing-effects denied)))
+    (is (zero? @calls) "effect mismatch must deny before provider dispatch")
+    (is (= :ok (:kotoba.host/result granted)))
+    (is (= :ok (get-in granted [:kotoba.host/receipt :receipt/outcome])))))
+
+(deftest component-ability-call-rejects-legacy-resource-only-capabilities
+  (let [calls (atom 0)
+        common {:call :kotoba.host/http
+                :effect-row #{:host/http}
+                :cacao-grants [(assoc (grant :host/http #{"https://api.example"} nil "g1")
+                                  :grant/target :provider/http :grant/operations #{:http/post}
+                                  :grant/limits {:max-bytes 4096 :max-items 1 :deadline-ms 1000})]
+                :local-policy {:policy/allow {:host/http #{"https://api.example"}}
+                               :policy/component {:host/http {:targets #{:provider/http}
+                                                              :operations #{:http/post}
+                                                              :limits {:max-bytes 4096 :max-items 1 :deadline-ms 1000}}}}
+                :now now}
+        denied (host/guard-component-ability-call
+                (assoc common
+                       :requested (caps/make-cap :host/http "https://api.example")
+                       :handler (fn [_] (swap! calls inc))))
+        granted (host/guard-component-ability-call
+                 (assoc common
+                        :requested (caps/make-component-cap
+                                    :host/http "https://api.example"
+                                    {:target :provider/http :operation :http/post
+                                     :limits {:max-bytes 4096 :max-items 1 :deadline-ms 1000}
+                                     :audit-id "request-42"})
+                        :handler (constantly :ok)))]
+    (is (= :component-ability-invalid (:kotoba.host/denied denied)))
+    (is (zero? @calls))
+    (is (= :ok (:kotoba.host/result granted)))
+    (is (= :provider/http
+           (get-in granted [:kotoba.host/receipt :receipt/cap :cap/target])))
+    (is (= 4096
+           (get-in granted [:kotoba.host/receipt :receipt/cap :cap/limits :max-bytes])))))
+
 (deftest host-dispatch-conformance-fixtures-match-contract
   (let [manifest (read-edn manifest-path)
         host-cases (filter #(= :host-dispatch (:type %)) (:cases manifest))]

@@ -1,6 +1,7 @@
 (ns kotoba.lang.package-contract
   (:require [clojure.set :as set]
             [clojure.string :as str]
+            [kotoba.lang.code-identity :as identity]
             [multiformats.core :as mf]
             #?(:clj [ed25519.core :as ed25519]))
   #?(:clj (:import (java.util Base64))))
@@ -25,6 +26,13 @@
 
 (def allowed-package-kinds
   #{:library :adapter :schema-contract :tool :component})
+
+(def semver-pattern
+  #"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$")
+
+(defn semver? [value]
+  (boolean (and (string? value)
+                (re-matches semver-pattern value))))
 
 (defn non-empty-string?
   [x]
@@ -70,6 +78,41 @@
                 (pos? hash-len)
                 (= hash-len digest-len)))
          (catch #?(:clj Exception :cljs :default) _ false))))
+
+(declare invalid)
+
+(defn component-cid-of
+  "Extracts an optional component CID from either a lock entry or manifest.
+  A component package must carry this pin; other package kinds may carry it as
+  reproducible-build evidence."
+  [m]
+  (or (:dep/component-cid m)
+      (:kotoba.package/component-cid m)
+      (get-in m [:dep/build :component-cid])
+      (get-in m [:kotoba.package/build :component-cid])))
+
+(defn component-cid-error
+  "Validates a component CID and, when bytes are supplied by the admission
+  layer, recomputes the raw CID.  This keeps content verification at the
+  package/runtime boundary rather than trusting a declaration-shaped string."
+  ([declared] (component-cid-error declared nil))
+  ([declared component-bytes]
+   (cond
+     (not (cid? declared)) (invalid "component cid required" {:value declared})
+     (nil? component-bytes) nil
+     :else (let [computed (mf/cidv1-raw component-bytes)]
+             (when (not= declared computed)
+               (invalid "component cid does not match component content"
+                        {:declared declared :computed computed}))))))
+
+(defn- lock-dep-component-error [dep component-bytes]
+  (let [declared (component-cid-of dep)]
+    (cond
+      (and (= :component (:dep/kind dep)) (nil? declared))
+      (invalid "component cid required" {:dependency (:dep/name dep)})
+
+      (some? declared) (component-cid-error declared component-bytes)
+      :else nil)))
 
 (defn invalid
   [message data]
@@ -163,6 +206,9 @@
        (invalid "schema-contract provides required" {:package (:kotoba.package/name m)}))
      (when-not (cid? (:kotoba.package/repo-rid m))
        (invalid "repo-rid cid required" {:value (:kotoba.package/repo-rid m)}))
+     (when-not (semver? (:kotoba.package/version m))
+       (invalid "package semver required"
+                {:value (:kotoba.package/version m)}))
      (missing-key source [:git-commit :tree-cid :manifest-cid] "missing required source field")
      (when-not (cid? (:tree-cid source))
        (invalid "tree cid required" {:source source}))
@@ -174,7 +220,12 @@
                        (:manifest-cid source)))))
 
 (defn lockfile-error
-  [m tc]
+  "The optional third argument carries component bytes indexed by dependency
+  name and/or resolved definition records. It is the admission-layer bridge
+  used by `kotoba wasm safe-build`; the two-arity form remains pure EDN
+  validation for conformance tooling."
+  ([m tc] (lockfile-error m tc nil))
+  ([m tc {:keys [component-bytes-by-dep resolved-definitions]}]
   (let [declared (set (:declared-capabilities tc))
         blocked (set/union (set (:revoked-signers tc))
                            (set (:expired-signers tc))
@@ -190,10 +241,24 @@
                             (not (contains? allowed-package-kinds (:dep/kind dep))))
                    (invalid "unknown package kind" {:dependency (:dep/name dep)}))
                  (contract-surfaces-error dep "dep")
+                 (when-not (semver? (:dep/version dep))
+                   (invalid "dependency semver required"
+                            {:dependency (:dep/name dep)
+                             :value (:dep/version dep)}))
                  (some (fn [k]
                          (when-not (cid? (get dep k))
                            (invalid "cid required" {:field k :value (get dep k)})))
                        [:dep/repo-rid :dep/tree-cid :dep/manifest-cid])
+                 (when (and (contains? dep :dep/definition-cids)
+                            (or (not (vector? (:dep/definition-cids dep)))
+                                (not (every? identity/cid? (:dep/definition-cids dep)))
+                                (not (= (count (:dep/definition-cids dep))
+                                        (count (set (:dep/definition-cids dep)))))))
+                   (invalid "definition cids must be a unique CID vector"
+                            {:dependency (:dep/name dep)
+                             :value (:dep/definition-cids dep)}))
+                 (lock-dep-component-error
+                  dep (get component-bytes-by-dep (:dep/name dep)))
                  (when-not (seq (:dep/signers dep))
                    (invalid "signer required" {:dep dep}))
                  (when-let [bad (seq (set/intersection (set (:dep/signers dep)) blocked))]
@@ -203,8 +268,12 @@
                  (when-not (set/subset? (set (:dep/capabilities dep)) declared)
                    (invalid "capability grant exceeds package declaration"
                             {:grant (:dep/capabilities dep)
-                             :declared (:declared-capabilities tc)}))))
-           (:deps m)))))
+                             :declared (:declared-capabilities tc)})))
+           (:deps m))
+     (when-let [resolved (or resolved-definitions (:resolved-definitions tc))]
+       (let [result (identity/verify-locked-definitions m resolved)]
+         (when-not (:ok? result)
+           (invalid "definition identity lock verification failed" result))))))))
 
 (defn validate-case
   [tc data]

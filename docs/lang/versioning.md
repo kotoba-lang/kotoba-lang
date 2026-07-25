@@ -6,6 +6,10 @@
 - `:kotoba.lang.package/version` in `package.edn`
 - package/library semver in package manifests
 
+The executable policy is [`../../lang/version-policy.edn`](../../lang/version-policy.edn)
+and `kotoba.lang.version-policy`; this document explains that policy but does
+not override it.
+
 The profile version is the compatibility contract for source-processing tools.
 The package contract version is the compatibility contract for package
 manifests, lockfiles, registry records, and dependency safety checks. Package

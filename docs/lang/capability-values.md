@@ -96,6 +96,29 @@ effective capability =
 
 The host call must fail closed if the intersection is empty.
 
+## Typed Ability Dispatch
+
+`kotoba.lang.capability-host/guard-ability-call` is the provider-entry API for
+a capability parameter lowered from Kotoba source. It receives the caller's
+declared `:effect-row`, rejects an ability whose capability kind is absent from
+that row with `:effect-not-declared`, and only then performs the normal runtime
+grant intersection and provider dispatch. `guard-call` remains the lower-level
+compatibility primitive; new compiler and component adapters must use
+`guard-ability-call`.
+
+This dispatch shape is not an alternate native execution path. Per the
+Wasm-Component-first execution boundary (ADR-2607252500), normal Kotoba code
+executes as a component linked by `kototama`. The provider side is a narrow
+aiueos-owned WIT interface, with the native micro-TCB independently enforcing
+grant scope, target, quota, deadline, and revocation. Broad WASI authority is
+not an ability grant.
+
+At that boundary use a component ability, not a legacy resource-only capability.
+It carries `:cap/target`, `:cap/operation`, `:cap/limits` with positive
+`:max-bytes`, `:max-items`, and `:deadline-ms`, plus `:cap/audit-id`.
+`guard-component-ability-call` rejects a capability that omits any of these
+fields before provider dispatch.
+
 ## Receipt Requirement
 
 Every host call using a capability value must emit or link to a receipt
@@ -307,4 +330,3 @@ fixtures live under `lang/capability-conformance/` (positive/negative cases
 listed in `lang/capability-conformance/manifest.edn`); they are exercised by
 `test/kotoba/lang/capability_values_test.clj` and by the gate
 `bb scripts/check-capability-values.bb`, which loads the same CLJC source.
-

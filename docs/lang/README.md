@@ -80,6 +80,22 @@ Dynamic authority is modeled as explicit capability values, not as ambient host
 access or plain resource strings. The profile semantics are documented in
 [`capability-values.md`](capability-values.md).
 
+## Code Identity and Abilities
+
+Kotoba adopts two narrowly scoped, Unison-inspired ideas without adopting
+Unison syntax or runtime semantics: content-addressed **definition identity**
+and typed **abilities**. The design is proposed and recorded in
+[`ADR-kotoba-code-identity-and-abilities.md`](../adr/ADR-kotoba-code-identity-and-abilities.md);
+its machine-readable contract is [`lang/code-identity.edn`](../../lang/code-identity.edn).
+
+Source-tree CID, definition CID, component CID, and package-manifest CID have
+different jobs. A future definition CID identifies canonical typed KIR and its
+direct definition dependencies; it is not a source-text or package-name hash.
+Ability means an explicit, scoped capability value whose use requires the
+corresponding effect row and runtime policy intersection. Neither code identity
+nor an ability replaces Wasm isolation, package admission, or host/provider
+resource-scope checks.
+
 The machine-readable source contract lives at `lang/profile.edn`. The current
 classification of intentional safety constraints, deliberate semantic
 simplifications, partial features, and ordinary implementation gaps lives at
@@ -120,6 +136,10 @@ Executable package-contract fixtures live under `lang/package-conformance/`;
 `scripts/check-package-contract.bb` accepts the positive manifest/lock fixtures
 and rejects version-only, unsigned, missing-CID, and over-capability negative
 fixtures.
+
+Where a dependency exports closed pure definitions, its lock entry may also
+list `:dep/definition-cids`. Safe linking must recompute the canonical typed-KIR
+identity and reject a hash mismatch or a definition not listed by that lock.
 
 ## Wire Protocol
 

@@ -41,21 +41,56 @@
                             archived-language? (str/includes? path "/kotoba-v2025/_archive/")
                             proof (get verified-by-path path)
                             proof-current? (= (sha256 text) (:sha256 proof))]
-                        {:path path
-                         :classification
-                         (cond
-                           schema-dsl? :legacy-schema-dsl-extension-collision
-                           archived-language? :legacy-language-extension-collision
-                           (and proof-current? (= :canonical-verified (:status proof)))
-                           :canonical-verified
-                           (and proof-current? (= :canonical-fixture-verified (:status proof)))
-                           :canonical-fixture-verified
-                           (and proof-current? (= :canonical-rejected (:status proof)))
-                           :canonical-rejected
-                           :else :canonical-candidate-unverified)}))
+                        (let [classification
+                              (cond
+                                schema-dsl? :legacy-schema-dsl-extension-collision
+                                archived-language? :legacy-language-extension-collision
+                                (and proof-current? (= :canonical-verified (:status proof)))
+                                :canonical-verified
+                                (and proof-current? (= :canonical-fixture-verified (:status proof)))
+                                :canonical-fixture-verified
+                                (and proof-current? (= :canonical-rejected (:status proof)))
+                                :canonical-rejected
+                                :else :canonical-candidate-unverified)
+                              repository (str/join "/" (take 3 (str/split path #"/")))
+                              exception
+                              (case classification
+                                :legacy-schema-dsl-extension-collision
+                                {:exception/type :extension-collision
+                                 :artifact-kind :legacy-schema-dsl
+                                 :owner repository
+                                 :canonical-admission :deny
+                                 :replacement-extension ".kotoba-schema"
+                                 :migration-track :q9-schema-extension-remediation}
+                                :legacy-language-extension-collision
+                                {:exception/type :extension-collision
+                                 :artifact-kind :archived-legacy-language
+                                 :owner repository
+                                 :canonical-admission :deny
+                                 :replacement-extension ".cljc"
+                                 :migration-track :q9-archive-retirement}
+                                :canonical-candidate-unverified
+                                {:exception/type :verification-required
+                                 :artifact-kind :unverified-kotoba-source
+                                 :owner repository
+                                 :canonical-admission :deny
+                                 :replacement-extension ".kotoba.quarantine"
+                                 :migration-track :q9-candidate-verification}
+                                :canonical-rejected
+                                {:exception/type :verification-rejected
+                                 :artifact-kind :rejected-kotoba-source
+                                 :owner repository
+                                 :canonical-admission :deny
+                                 :replacement-extension ".kotoba.quarantine"
+                                 :migration-track :q9-candidate-remediation}
+                                nil)]
+                          (cond-> {:path path
+                                   :sha256 (sha256 text)
+                                   :classification classification}
+                            exception (assoc :typed-exception exception)))))
                     all)
       counts (frequencies (map :classification entries))
-      audit {:kotoba.lang.q9.extension-audit/version 2
+      audit {:kotoba.lang.q9.extension-audit/version 3
              :generated-at "2026-07-19"
              :generator "scripts/generate-q9-kotoba-extension-audit.bb"
              :verification "lang/q9-kotoba-candidate-verification.edn"

@@ -3,6 +3,7 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [kotoba.lang.code-identity :as identity]
             [kotoba.lang.package-contract :as contract]
             [multiformats.core :as mf]))
 
@@ -57,3 +58,94 @@
     (is (= 1 (:kotoba.lang.package/version package)))
     (is (contains? (set (get-in package [:manifest :package-kinds :allow-kinds]))
                    :schema-contract))))
+
+(deftest package-and-lock-versions-use-strict-semver
+  (doseq [valid ["0.1.0" "1.2.3" "2.0.0-rc.1" "2.0.0+build.9"]]
+    (is (contract/semver? valid)))
+  (doseq [invalid [nil "" "v1.2.3" "1" "1.2" "01.2.3" "latest"]]
+    (is (false? (contract/semver? invalid)))))
+
+(def pure-definition
+  {:definition/profile-version 1
+   :definition/kir {:op :fn
+                    :params [:x]
+                    :body [:+ :x 1]}
+   :definition/interface {:params [:i64] :result :i64 :effects #{}}
+   :definition/dependencies []})
+
+(defn real-cid [text]
+  (mf/cidv1-dag-cbor (.getBytes text "UTF-8")))
+
+(defn definition-lock [definition-cids]
+  {:kotoba.lock/version 1
+   :deps [{:dep/name "kotoba-lang/math"
+           :dep/version "0.1.0"
+           :dep/repo-rid (real-cid "repo")
+           :dep/commit "0123456789abcdef0123456789abcdef01234567"
+           :dep/tree-cid (real-cid "tree")
+           :dep/manifest-cid (real-cid "manifest")
+           :dep/signers ["did:key:z6Mkmath"]
+           :dep/capabilities []
+           :dep/definition-cids definition-cids}]})
+
+(deftest definition-cid-is-canonical-and-name-independent
+  (let [cid (identity/definition-cid pure-definition)
+        reordered (assoc pure-definition
+                         :definition/kir {:body [:+ :x 1]
+                                          :params [:x]
+                                          :op :fn})]
+    (is (= cid (identity/definition-cid reordered))
+        "map/source key order cannot change semantic identity")
+    (is (= cid (identity/definition-cid (assoc pure-definition :definition/name 'math/inc)))
+        "author-facing aliases cannot change semantic identity")
+    (is (not= cid (identity/definition-cid
+                   (assoc-in pure-definition [:definition/kir :body] [:+ :x 2])))
+        "typed KIR changes must change identity")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"dependencies vector required"
+                          (identity/definition-cid
+                           (assoc pure-definition :definition/dependencies #{}))))))
+
+(deftest definition-identity-must-match-and-be-listed-in-lock
+  (let [cid (identity/definition-cid pure-definition)
+        lock (definition-lock [cid])
+        resolved [{:dep/name "kotoba-lang/math"
+                   :definition pure-definition
+                   :definition-cid cid}]]
+    (is (= {:ok? true} (identity/verify-locked-definitions lock resolved)))
+    (is (= :definition/hash-mismatch
+           (:reason (identity/verify-locked-definitions
+                     lock
+                     [(assoc (first resolved) :definition-cid (real-cid "attacker"))]))))
+    (is (= :definition/not-locked
+           (:reason (identity/verify-locked-definitions
+                     (definition-lock []) resolved))))
+    (is (= :definition/unknown-dependency
+           (:reason (identity/verify-locked-definitions
+                     lock [(assoc (first resolved) :dep/name "attacker/math")]))))
+    (is (:valid?
+         (contract/validate-case
+          {:type :lockfile :declared-capabilities [] :resolved-definitions resolved}
+          lock))
+        "the package contract invokes identity verification when safe-build supplies resolutions")
+    (is (= "definition identity lock verification failed"
+           (:message
+            (contract/lockfile-error
+             lock
+             {:declared-capabilities []
+              :resolved-definitions [(assoc (first resolved) :definition-cid (real-cid "attacker"))]}))))))
+
+(deftest component-package-lock-binds-the-actual-component-bytes
+  (let [bytes (.getBytes "wasm-component" "UTF-8")
+        dep (assoc (first (:deps (definition-lock [])))
+                   :dep/kind :component
+                   :dep/component-cid (mf/cidv1-raw bytes))
+        lock {:kotoba.lock/version 1 :deps [dep]}
+        accepted (contract/lockfile-error
+                  lock {:declared-capabilities []}
+                  {:component-bytes-by-dep {(:dep/name dep) bytes}})
+        rejected (contract/lockfile-error
+                  lock {:declared-capabilities []}
+                  {:component-bytes-by-dep {(:dep/name dep) (.getBytes "tampered" "UTF-8")}})]
+    (is (nil? accepted))
+    (is (= "component cid does not match component content" (:message rejected)))))

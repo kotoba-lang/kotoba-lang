@@ -117,6 +117,13 @@
       (doseq [k [:dep/repo-rid :dep/tree-cid :dep/manifest-cid]]
         (when-not (cid? (get dep k))
           (fail "cid required" {:field k :value (get dep k)})))
+      (when (contains? dep :dep/definition-cids)
+        (let [definition-cids (:dep/definition-cids dep)]
+          (when (or (not (vector? definition-cids))
+                    (not (every? cid? definition-cids))
+                    (not (= (count definition-cids) (count (set definition-cids)))))
+            (fail "definition cids must be a unique CID vector"
+                  {:dependency (:dep/name dep) :value definition-cids}))))
       (when-not (seq (:dep/signers dep))
         (fail "signer required" {:dep dep}))
       (let [signers (set (:dep/signers dep))
