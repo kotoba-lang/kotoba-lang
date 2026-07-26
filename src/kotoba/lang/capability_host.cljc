@@ -67,6 +67,38 @@
              :kotoba.host/result (:value invoked)
              :kotoba.host/receipt receipt}))))))
 
+(defn guard-ability-call
+  "Require the caller's declared effect row before ordinary grant/policy
+  intersection and provider dispatch."
+  [{:keys [call requested effect-row record! now] :as opts}]
+  (if-not (values/capability? requested)
+    (guard-call opts)
+    (let [effect-check (values/effects-consistent? effect-row [requested])]
+      (if (:ok? effect-check)
+        (guard-call opts)
+        (let [receipt (->receipt requested now call :denied
+                                 {:receipt/denied :effect-not-declared
+                                  :receipt/missing-effects (:missing effect-check)})]
+          (when record! (record! receipt))
+          {:kotoba.host/ok? false
+           :kotoba.host/denied :effect-not-declared
+           :kotoba.host/missing-effects (:missing effect-check)
+           :kotoba.host/receipt receipt})))))
+
+(defn guard-component-ability-call
+  "Strict component-provider entry point: validate the complete binding,
+  component grant and local policy before applying the typed effect gate."
+  [{:keys [call requested record! now] :as opts}]
+  (let [admission (values/component-admission opts)]
+    (if (:ok? admission)
+      (guard-ability-call opts)
+      (let [receipt (->receipt requested now call :denied
+                               {:receipt/denied (:denied admission)})]
+        (when record! (record! receipt))
+        {:kotoba.host/ok? false
+         :kotoba.host/denied (:denied admission)
+         :kotoba.host/receipt receipt}))))
+
 (defn journal
   "Atom-backed append-only receipt recorder. Returns
   {:record! <fn receipt -> receipt> :entries <fn -> [receipt ...]>} so a host

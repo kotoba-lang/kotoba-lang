@@ -101,6 +101,10 @@
   [x]
   (and (string? x) (some? (re-matches #"\d{4}-\d{2}-\d{2}" x))))
 
+(defn- positive-int?
+  [x]
+  (and (int? x) (pos? x)))
+
 (defn resource-constraint?
   "A resource constraint is :any (the universe), a single cid string, or a
   non-empty set of cid strings (graph/model set)."
@@ -142,6 +146,22 @@
   [x]
   (true? (:ok? (validate-cap x))))
 
+(def component-bound-keys
+  [:cap/target :cap/operation :cap/limits :cap/audit-id])
+
+(defn component-capability?
+  "A capability value suitable for a narrow component provider boundary."
+  [cap]
+  (and (capability? cap)
+       (every? #(contains? cap %) component-bound-keys)
+       (or (keyword? (:cap/target cap)) (non-empty-string? (:cap/target cap)))
+       (or (keyword? (:cap/operation cap)) (non-empty-string? (:cap/operation cap)))
+       (non-empty-string? (:cap/audit-id cap))
+       (let [limits (:cap/limits cap)]
+         (and (map? limits)
+              (every? #(positive-int? (get limits %))
+                      [:max-bytes :max-items :deadline-ms])))))
+
 (defn make-cap
   "Generic capability constructor. OPTS: {:holder :expires :provenance}."
   ([kind resource] (make-cap kind resource nil))
@@ -151,6 +171,37 @@
             :cap/expires expires
             :cap/provenance (vec (or provenance []))}
      (some? holder) (assoc :cap/holder holder))))
+
+(defn make-component-cap
+  "Construct a component-bound ability with explicit provider and limits."
+  [kind resource {:keys [target operation limits audit-id holder expires provenance]}]
+  (assoc (make-cap kind resource {:holder holder :expires expires :provenance provenance})
+         :cap/target target
+         :cap/operation operation
+         :cap/limits limits
+         :cap/audit-id audit-id))
+
+(defn component-admission
+  "Require both delegation and local policy to authorize the requested
+  component target, operation, and upper-bounded limits."
+  [{:keys [requested cacao-grants local-policy]}]
+  (let [{kind :cap/kind target :cap/target operation :cap/operation
+         limits :cap/limits} requested
+        within? (fn [limit] (every? (fn [[k v]] (<= v (get limit k 0))) limits))
+        grant-ok? (some #(and (= kind (:grant/kind %))
+                              (= target (:grant/target %))
+                              (contains? (set (:grant/operations %)) operation)
+                              (within? (:grant/limits %)))
+                        cacao-grants)
+        policy (get-in local-policy [:policy/component kind])
+        policy-ok? (and (contains? (set (:targets policy)) target)
+                        (contains? (set (:operations policy)) operation)
+                        (within? (:limits policy)))]
+    (cond
+      (not (component-capability? requested)) {:denied :component-ability-invalid}
+      (not grant-ok?) {:denied :component-grant-denied}
+      (not policy-ok?) {:denied :component-policy-denied}
+      :else {:ok? true})))
 
 (defn graph-read-cap
   ([resource] (make-cap :graph-read resource))
@@ -298,10 +349,11 @@
                     expiry (earliest-expiry
                             (cons (:cap/expires requested)
                                   (map :grant/expires contributing)))]
-                (cond-> {:cap/kind kind
-                         :cap/resource (scope->resource result-scope)
-                         :cap/expires expiry
-                         :cap/provenance (into [] (map :grant/id) contributing)}
+                (cond-> (merge {:cap/kind kind
+                                :cap/resource (scope->resource result-scope)
+                                :cap/expires expiry
+                                :cap/provenance (into [] (map :grant/id) contributing)}
+                               (select-keys requested component-bound-keys))
                   (some? (:cap/holder requested))
                   (assoc :cap/holder (:cap/holder requested)))))))))))
 

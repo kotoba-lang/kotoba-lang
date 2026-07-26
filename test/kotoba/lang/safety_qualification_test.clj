@@ -15,6 +15,10 @@
 (def compiler-root
   (or (System/getenv "KOTOBA_COMPILER_QUALIFICATION_ROOT") "../compiler"))
 
+(def core-contracts-root
+  (or (System/getenv "KOTOBA_CORE_CONTRACTS_QUALIFICATION_ROOT")
+      "../kotoba-core-contracts"))
+
 (defn evidence-file [path]
   (cond
     (str/starts-with? path "../kotoba/")
@@ -22,6 +26,10 @@
 
     (str/starts-with? path "../compiler/")
     (io/file compiler-root (subs path (count "../compiler/")))
+
+    (str/starts-with? path "../kotoba-core-contracts/")
+    (io/file core-contracts-root
+             (subs path (count "../kotoba-core-contracts/")))
 
     :else (io/file path)))
 
