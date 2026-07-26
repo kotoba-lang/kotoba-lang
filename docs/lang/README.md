@@ -116,8 +116,8 @@ Safe Kotoba package references are content-pinned and authority-checked:
 
 The decision is recorded in `docs/adr/ADR-kotoba-package-cid-lock.md`.
 Human-facing authoring rules live in `docs/lang/package-rules.md`.
-Executable package-contract fixtures live under `lang/package-conformance/`;
-`scripts/check-package-contract.bb` accepts the positive manifest/lock fixtures
+Executable package-contract fixtures live in `kotoba-core-contracts/lang/package-conformance/`;
+`kotoba-core-contracts/scripts/check-package-contract.bb` accepts the positive manifest/lock fixtures
 and rejects version-only, unsigned, missing-CID, and over-capability negative
 fixtures.
 

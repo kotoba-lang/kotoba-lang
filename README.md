@@ -239,7 +239,7 @@ are recorded in `docs/lang/versioning.md`; CI-facing commands are recorded in
 ```sh
 clojure -M:test
 bb scripts/check-cli-contract.bb lang/cli.edn
-bb scripts/check-package-contract.bb
+bb ../kotoba-core-contracts/scripts/check-package-contract.bb
 bb scripts/check-capability-values.bb
 bb scripts/check-legacy-runtime-absence.bb
 ```
