@@ -304,6 +304,9 @@ Qualify vertical families in dependency order:
    **W5 deepen (2026-07-27, kotoba-component#57 + compiler#367 / ADR 0102):**
    log multi-step Wasmtime append sequence. **Multi-step Wasmtime driver
    evidence now present for clock + log.**
+   **W5 deepen (2026-07-27, kotoba-component#65 + compiler#377 / ADR 0111):**
+   dual-export compose-closed + log append→read (latest-sequence 1). **Log
+   multi-step now covers append-only and append+read ring walk.**
    **W5 family-3 product cutover (2026-07-27, compiler#368 + toshokan#8 /
    ADR 0103):** host-profile `ingress-methods` default split from egress
    allowlist; murakumo-toshokan `handleIncoming` + `max-request-bytes`.
@@ -334,8 +337,12 @@ Qualify vertical families in dependency order:
    multi-step Wasmtime http-ingress reply true-sum sequence (true-sum 2).
    **Family-3 ingress multi-step now covers both dual-export paths (accept +
    reply).**
+   **W5 deepen (2026-07-27, kotoba-component#65 + compiler#377 / ADR 0111):**
+   dual-export `compose-closed` subset matching + log append→read multi-step
+   (latest-sequence 1). Closes ADR 0102 deferred append+read walk. **State
+   multi-step remains covered by ADR 0060/0061 in compiler.**
    Next: get-stream dual-runtime / production cljs transports / more product
-   apps / state multi-step deepen if not already covered by ADR 0060.
+   apps.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
