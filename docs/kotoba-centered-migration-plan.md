@@ -350,6 +350,9 @@ Qualify vertical families in dependency order:
    **W5 deepen (2026-07-27, kotoba-component#69 + compiler#381 / ADR 0115):**
    log ring-overflow oldest-drop multi-step (oldest-sequence 2). **Log multi-step
    covers append-only, append+read, and ring-overflow oldest-drop.**
+   **W5 deepen (2026-07-27, kotoba-component#70 + compiler#383 / ADR 0116):**
+   log truncation-flag dual-read multi-step (trunc-sum 2). **Log multi-step suite
+   complete (append / append+read / oldest-drop / truncation).**
    **W5 deepen (2026-07-27, kotoba-component#66 + compiler#378 / ADR 0112):**
    object-write multi-function put+CAS multi-step (true-sum 2). **Write-path
    multi-step now covers put-only and put+CAS dual-export walks.**
@@ -366,8 +369,12 @@ Qualify vertical families in dependency order:
    log ring-overflow oldest-drop multi-step (capacity 2, 3 appends → oldest 2).
    Closes ADR 0111 deferred ring-buffer oldest-drop slice. **Log multi-step
    covers append-only, append+read, and ring-overflow oldest-drop.**
+   **W5 deepen (2026-07-27, kotoba-component#70 + compiler#383 / ADR 0116):**
+   log truncation-flag dual-read multi-step (after0 true + after1 false → 2).
+   Closes ADR 0111 deferred truncation multi-step slice. **Log multi-step
+   suite complete: append-only, append+read, oldest-drop, truncation flag.**
    Next: get-stream dual-runtime / production cljs transports / more product
-   apps / truncation-flag multi-step.
+   apps.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
