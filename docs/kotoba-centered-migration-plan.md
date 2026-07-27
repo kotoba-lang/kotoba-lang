@@ -249,6 +249,9 @@ Qualify vertical families in dependency order:
    Provider packaging + validate only — KIR asymmetric record+set application
    emit and Wasmtime multi-step driver deferred. `:wasm-aot` stays pending.
    **Family 1 (log+clock) wasm packaging evidence is now present for both kits.**
+   **W5 deepen (2026-07-27, kotoba-component#56 + compiler#366 / ADR 0101):**
+   multi-step Wasmtime clock sequence driver (wall→mono; obs delta 1).
+   **Family 1 multi-step execution evidence now present for clock.**
 2. HTTP egress;
    **W5 family-2 first slice (2026-07-27, provider#3 + compiler#351 / ADR 0086):**
    dual-runtime semantic vectors for `:http/post` on reference (`:clj`) and
@@ -283,8 +286,11 @@ Qualify vertical families in dependency order:
    workerd adapter `toIncoming`/`handleIncoming`/`fromReply` with
    `max-request-bytes`, method/path/header/body bounds, legacy `fetch`
    fallback. **Family 3 workerd ingress boundary intermediate evidence now
-   present.** Next: product route cutover, get-stream dual-runtime /
-   Wasmtime drivers / production cljs transports.
+   present.**
+   **W5 deepen (2026-07-27, kotoba-component#56 + compiler#366 / ADR 0101):**
+   clock multi-step Wasmtime sequence (wall→mono). **Multi-step Wasmtime
+   driver evidence now present for clock.** Next: product route cutover,
+   log multi-step driver, get-stream dual-runtime / production cljs transports.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
