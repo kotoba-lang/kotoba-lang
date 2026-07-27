@@ -290,6 +290,9 @@ Qualify vertical families in dependency order:
    **W5 deepen (2026-07-27, kotoba-component#64 + compiler#376 / ADR 0110):**
    multi-step Wasmtime reply true-sum (true-sum 2). **Family 3 multi-step
    now covers accept + reply.**
+   **W5 deepen (2026-07-27, kotoba-component#68 + compiler#380 / ADR 0114):**
+   accept+reply multi-function multi-step (none+true = 2). **Family 3
+   multi-function multi-step walk now present.**
    **W5 family-3 third slice (2026-07-27, provider#11 + compiler#364 /
    ADR 0099):** multi-inflight host queue (default depth 8, parametric
    [1,256]), FIFO accept, host may buffer while a request is pending reply.
@@ -337,6 +340,9 @@ Qualify vertical families in dependency order:
    multi-step Wasmtime http-ingress reply true-sum sequence (true-sum 2).
    **Family-3 ingress multi-step now covers both dual-export paths (accept +
    reply).**
+   **W5 deepen (2026-07-27, kotoba-component#68 + compiler#380 / ADR 0114):**
+   multi-function accept+reply multi-step (none+true = 2). **Family-3 multi-step
+   covers accept-only, reply-only, and accept+reply dual-export walks.**
    **W5 deepen (2026-07-27, kotoba-component#65 + compiler#377 / ADR 0111):**
    dual-export `compose-closed` subset matching + log append→read multi-step
    (latest-sequence 1). Closes ADR 0102 deferred append+read walk. **State
@@ -347,6 +353,12 @@ Qualify vertical families in dependency order:
    **W5 deepen (2026-07-27, kotoba-component#67 + compiler#379 / ADR 0113):**
    ui multi-function commit+next-event multi-step (rev+none = 2). **UI
    multi-step now covers commit-only and commit+next-event dual-export walks.**
+   **W5 deepen (2026-07-27, kotoba-component#68 + compiler#380 / ADR 0114):**
+   http-ingress multi-function accept+reply multi-step (none+true = 2).
+   Closes ADR 0110 deferred lifecycle coupling. **Family-3 multi-step now
+   covers accept-only, reply-only, and accept+reply dual-export walks.
+   All dual-export intermediate providers now have multi-function multi-step
+   evidence (log, ui, object-write, http-ingress).**
    Next: get-stream dual-runtime / production cljs transports / more product
    apps.
 4. state and storage;
