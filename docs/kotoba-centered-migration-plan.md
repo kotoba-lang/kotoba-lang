@@ -274,9 +274,13 @@ Qualify vertical families in dependency order:
    compiler#363 / ADR 0098):** synthetic dual-export
    `http-ingress-provider-wat` + `package-http-ingress-provider` (accept
    always-none; reply status bounds + true). **Family 3 dual-runtime + wasm
-   packaging intermediate evidence now present.** Next: multi-inflight /
-   workerd adapter, or get-stream dual-runtime / Wasmtime drivers /
-   production cljs transports.
+   packaging intermediate evidence now present.**
+   **W5 family-3 third slice (2026-07-27, provider#11 + compiler#364 /
+   ADR 0099):** multi-inflight host queue (default depth 8, parametric
+   [1,256]), FIFO accept, host may buffer while a request is pending reply.
+   **Family 3 multi-inflight dual-runtime evidence now present.** Next:
+   workerd adapter, get-stream dual-runtime / Wasmtime drivers / production
+   cljs transports.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
