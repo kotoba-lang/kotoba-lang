@@ -150,6 +150,15 @@ Exit gate: one logical UI/document value can be inspected as data, rendered to
 an HTML stream, reconciled to browser DOM, hashed deterministically, and
 rejected when its resource bounds are exceeded.
 
+**W4 first slice (2026-07-27, kotoba-lang/compiler `document-ui-render-test`):**
+a logical UI tree is a `:document` value (map of `:tag`/`:text`/`:children`),
+built and walked with existing `document-*` ops under depth/node/item budgets.
+Pure guest recursion renders it to an HTML string; KIR and restricted ESM agree;
+`document-equal?` distinguishes same vs different trees; over-budget trees fail
+closed at construction. Remaining for full exit: deterministic document digest
+as a first-class op, browser DOM reconciliation, Style vocabulary, and
+performance workloads.
+
 ### W5 — Host capability qualification
 
 Qualify vertical families in dependency order:
