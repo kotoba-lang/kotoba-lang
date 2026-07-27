@@ -184,9 +184,21 @@ kotoba-kir#10 + kotoba-script#71):** recursive logical values as sealed
 schema-checked trees. `[:ref R]` resolves to the nominal `:variant`/`:record`
 descriptor carried by the value; a productive `:app/node` (leaf i64 | branch
 of two refs) constructs and walks under ADT depth/node budgets (KIR +
-restricted ESM). Handles remain out of the application model. Remaining for
-full exit: dual renderer qualification and performance workloads (before
-HAMT/arena selection).
+restricted ESM). Handles remain out of the application model.
+
+**W4 sixth slice (2026-07-27, `document_dual_renderer_test` +
+`recursive_tree_update_test`, compiler#344):** dual-renderer qualification on
+one shared logical UI `:document` — pure guest HTML stream and host
+`reconcileUiDocument` (mock DOM serialize) agree byte-for-byte; after a
+persistent `document-assoc` leaf update both agree again; digests differ.
+Soft performance workload: 200× build+render of a 16-leaf tree under a 5s
+wall-clock budget (records the current path before HAMT/arena selection).
+Companion: sealed recursive tree persistent update via `hetero-vector-assoc`
++ pure guest structural `tree-eq` (KIR + restricted ESM). Design-system
+final cutover (Delivery 6) can now target the qualified dual renderers; W5
+still owns full `:ui/commit` kit qualification. Remaining for full Delivery-4
+exit: reader/printer round-trip of recursive logical values, and harder
+performance evidence before structure selection.
 
 ### W5 — Host capability qualification
 
