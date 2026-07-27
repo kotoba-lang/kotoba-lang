@@ -341,6 +341,9 @@ Qualify vertical families in dependency order:
    dual-export `compose-closed` subset matching + log append→read multi-step
    (latest-sequence 1). Closes ADR 0102 deferred append+read walk. **State
    multi-step remains covered by ADR 0060/0061 in compiler.**
+   **W5 deepen (2026-07-27, kotoba-component#66 + compiler#378 / ADR 0112):**
+   object-write multi-function put+CAS multi-step (true-sum 2). **Write-path
+   multi-step now covers put-only and put+CAS dual-export walks.**
    Next: get-stream dual-runtime / production cljs transports / more product
    apps.
 4. state and storage;
@@ -409,6 +412,9 @@ Qualify vertical families in dependency order:
    **W5 deepen (2026-07-27, kotoba-component#62 + compiler#374 / ADR 0108):**
    multi-step Wasmtime put-block sequence (true-sum 2). **Object-write multi-step
    execution evidence now present.**
+   **W5 deepen (2026-07-27, kotoba-component#66 + compiler#378 / ADR 0112):**
+   put+CAS multi-function multi-step (true-sum 2). **Object-write multi-step
+   covers put-only and put+CAS.**
    **See family 3 first+second slices (ADR 0097/0098) above.** Next:
    multi-inflight / workerd adapter, get-stream dual-runtime once reference
    `:bytes`/task values exist, or Wasmtime multi-step drivers / production
