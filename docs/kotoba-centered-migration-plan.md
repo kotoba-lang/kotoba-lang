@@ -309,8 +309,12 @@ Qualify vertical families in dependency order:
    multi-step Wasmtime http post sequence (two fixed-ok posts; status sum /
    200 = 2). **Multi-step Wasmtime driver evidence now present for clock +
    log + ui + http.**
+   **W5 deepen (2026-07-27, kotoba-component#60 + compiler#371 / ADR 0106):**
+   multi-step Wasmtime storage get→missing sequence (disc sum 2).
+   **Multi-step Wasmtime driver evidence now present for clock + log + ui +
+   http + storage.**
    Next: get-stream dual-runtime / production cljs transports / more product
-   apps / remaining multi-step drivers (storage, llm, object-write).
+   apps / remaining multi-step drivers (llm, object-write).
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
@@ -352,6 +356,9 @@ Qualify vertical families in dependency order:
    ADR 0093):** synthetic `storage-provider-wat` + `package-storage-provider`
    (always-missing, disc range-check). **Wasm packaging now also covers
    storage.**
+   **W5 deepen (2026-07-27, kotoba-component#60 + compiler#371 / ADR 0106):**
+   multi-step Wasmtime storage get→missing (disc sum 2). **Family 4 multi-step
+   execution evidence now present for storage.**
    **W5 remaining kit wasm (2026-07-27, kotoba-component#52 + compiler#359 /
    ADR 0094):** synthetic `llm-provider-wat` + `package-llm-provider`
    (budget/string bounds; fixed ok completion; no ambient credentials).
