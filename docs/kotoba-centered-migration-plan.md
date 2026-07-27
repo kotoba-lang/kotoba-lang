@@ -279,6 +279,13 @@ Qualify vertical families in dependency order:
  intermediate evidence now covers state + storage.** Next: UI dual-runtime
    (family 5), storage wasm packaging, or HTTP ingress kit (family 3).
 5. UI commit/event and DOM reconciliation;
+   **W5 family-5 first slice (2026-07-27, provider#6 + compiler#355 / ADR 0090):**
+   dual-runtime semantic vectors for `:ui/commit` + `:ui/next-event` on
+   reference (`:clj`) and nbb (`:cljs`). Revisions/node-count use canonical
+   i64 bigint on cljs. Declarative commit/events, stale revision fail-closed,
+   node/typed-set limit, missing-grant denial. No DOM objects cross the
+   boundary. Next: ui wasm packaging, LLM dual-runtime (family 6), or HTTP
+   ingress kit (family 3).
 6. LLM generate/stream/cancel/tool result;
 7. queues, timers, actors, and durable workflow;
 8. filesystem/process/git/cloud command capabilities for kbb.
