@@ -196,9 +196,18 @@ wall-clock budget (records the current path before HAMT/arena selection).
 Companion: sealed recursive tree persistent update via `hetero-vector-assoc`
 + pure guest structural `tree-eq` (KIR + restricted ESM). Design-system
 final cutover (Delivery 6) can now target the qualified dual renderers; W5
-still owns full `:ui/commit` kit qualification. Remaining for full Delivery-4
-exit: reader/printer round-trip of recursive logical values, and harder
-performance evidence before structure selection.
+still owns full `:ui/commit` kit qualification.
+
+**W4 seventh slice (2026-07-27, `document_roundtrip_test`, compiler#345 +
+kotoba-kir#11 + kotoba-script#72):** reader/printer round-trip for recursive
+logical documents. `document-print` emits the deterministic lowercase hex of
+`document-canonical-bytes` (same encoding as `document-sha256`);
+`document-read` is the inverse and re-applies depth/node/item/byte budgets.
+UI trees and scalar leaves round-trip equal with stable sha256; malformed
+print strings fail closed (KIR + restricted ESM). Wasm/browser-host import
+wiring for the two ops is a follow-up (document-sha256 multi-repo pattern).
+Remaining for full Delivery-4 exit: harder performance evidence before
+HAMT/arena selection, and wasm host parity for print/read.
 
 ### W5 — Host capability qualification
 
