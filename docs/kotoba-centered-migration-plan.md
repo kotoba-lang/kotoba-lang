@@ -255,9 +255,14 @@ Qualify vertical families in dependency order:
    nbb (`:cljs`) with a mock host transport. Timeout-ms and response status
    use canonical i64 bigint on cljs. Denial + origin/timeout fail-closed +
    typed transport error/redaction vectors. Production cljs HTTP transport
-   remains unimplemented (JVM transport ADR 0066 only). **Does not** flip
-   `:wasm-aot` or add an http component provider. Next within family 2:
-   wasm/component packaging or production cljs transport contract.
+   remains unimplemented (JVM transport ADR 0066 only).
+   **W5 family-2 second slice (2026-07-27, kotoba-component#49 + compiler#352 /
+   ADR 0087):** synthetic `http-provider-wat` + `package-http-provider` —
+   timeout/header/url/body bounds + `https://` prefix, fixed ok response,
+   no ambient network. Provider packaging + validate only. `:wasm-aot` stays
+   pending. **Family 2 dual-runtime + wasm packaging intermediate evidence
+   now present.** Next: production cljs HTTP transport contract, or family 3
+   HTTP ingress/lifecycle, or deepen family 2 with Wasmtime drivers.
 3. HTTP ingress and lifecycle;
 4. state and storage;
 5. UI commit/event and DOM reconciliation;
