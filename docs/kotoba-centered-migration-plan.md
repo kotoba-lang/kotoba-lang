@@ -94,6 +94,12 @@ Exit gate: representative existing `.cljc` pure and effectful functions compile
 without adding framework-specific special forms, and denial diagnostics name
 the original operation and source span.
 
+**W1 named-operation slice (2026-07-27):** compiler admits friendly namespaced
+heads such as `(clock/now seed)` (no user-facing numeric IDs), infers transitive
+effects, enforces optional `{:effects #{...}}` ceilings, and attaches
+`:source-operation` + source span to denial diagnostics. Fixtures:
+`examples/w1-*.kotoba` and `test/kotoba/compiler/w1_elaboration_test.clj`.
+
 ### W2 — One semantic catalog, multiple wire ABIs
 
 - Define each capability once by semantic name, request/result schema, effect,
