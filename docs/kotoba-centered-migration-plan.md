@@ -312,10 +312,15 @@ Qualify vertical families in dependency order:
    `:object/put-block` + `:object/compare-and-set-ref` (binding allowlist,
    bounded payload as host string, bool results, redaction, denial). Linear
    get-stream / bytes-task ownership stays on Component v0.3. **Reference
-   dual-runtime now also covers stream-object write ops.** Next: HTTP
-   ingress kit (family 3), get-stream dual-runtime once reference `:bytes`/
-   task values exist, or deepen existing kits with Wasmtime multi-step
-   drivers / production cljs transports.
+   dual-runtime now also covers stream-object write ops.**
+   **W5 stream-object write-path wasm (2026-07-27, kotoba-component#53 +
+   compiler#361 / ADR 0096):** synthetic dual-export
+   `object-write-provider-wat` + `package-object-write-provider` (bounds +
+   option disc; always-true; no ambient store). **Write-path dual-runtime +
+   wasm packaging intermediate evidence now present.** Next: HTTP ingress
+   kit (family 3), get-stream dual-runtime once reference `:bytes`/task
+   values exist, or deepen existing kits with Wasmtime multi-step drivers /
+   production cljs transports.
 7. queues, timers, actors, and durable workflow;
 8. filesystem/process/git/cloud command capabilities for kbb.
 
