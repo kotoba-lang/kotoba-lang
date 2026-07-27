@@ -251,7 +251,10 @@ Qualify vertical families in dependency order:
    **Family 1 (log+clock) wasm packaging evidence is now present for both kits.**
    **W5 deepen (2026-07-27, kotoba-component#56 + compiler#366 / ADR 0101):**
    multi-step Wasmtime clock sequence driver (wall→mono; obs delta 1).
-   **Family 1 multi-step execution evidence now present for clock.**
+   **Family 1 multi-step execution evidence now present for clock.
+   **W5 deepen (2026-07-27, kotoba-component#57 + compiler#367 / ADR 0102):**
+   multi-step Wasmtime log append sequence (two appends; seq delta 1).
+   **Family 1 multi-step execution evidence now present for log+clock.****
 2. HTTP egress;
    **W5 family-2 first slice (2026-07-27, provider#3 + compiler#351 / ADR 0086):**
    dual-runtime semantic vectors for `:http/post` on reference (`:clj`) and
@@ -288,9 +291,11 @@ Qualify vertical families in dependency order:
    fallback. **Family 3 workerd ingress boundary intermediate evidence now
    present.**
    **W5 deepen (2026-07-27, kotoba-component#56 + compiler#366 / ADR 0101):**
-   clock multi-step Wasmtime sequence (wall→mono). **Multi-step Wasmtime
-   driver evidence now present for clock.** Next: product route cutover,
-   log multi-step driver, get-stream dual-runtime / production cljs transports.
+   clock multi-step Wasmtime sequence (wall→mono).
+   **W5 deepen (2026-07-27, kotoba-component#57 + compiler#367 / ADR 0102):**
+   log multi-step Wasmtime append sequence. **Multi-step Wasmtime driver
+   evidence now present for clock + log.** Next: product route cutover,
+   get-stream dual-runtime / production cljs transports.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
