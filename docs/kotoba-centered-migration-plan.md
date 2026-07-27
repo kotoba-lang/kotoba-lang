@@ -155,9 +155,14 @@ a logical UI tree is a `:document` value (map of `:tag`/`:text`/`:children`),
 built and walked with existing `document-*` ops under depth/node/item budgets.
 Pure guest recursion renders it to an HTML string; KIR and restricted ESM agree;
 `document-equal?` distinguishes same vs different trees; over-budget trees fail
-closed at construction. Remaining for full exit: deterministic document digest
-as a first-class op, browser DOM reconciliation, Style vocabulary, and
-performance workloads.
+closed at construction.
+
+**W4 second slice (2026-07-27, `document-digest-style-test`):** content-sensitive
+structural i64 fingerprint of a `:document` (FNV-style over code points + sorted
+map walk) for deterministic identity without host objects; Style vocabulary as
+ordinary documents (`:selector` + `:decls` of `:prop`/`:value`) rendered to a CSS
+stream. Remaining for full exit: first-class `document-sha256` host op, browser
+DOM reconciliation, and performance workloads.
 
 ### W5 — Host capability qualification
 
