@@ -270,8 +270,11 @@ Qualify vertical families in dependency order:
    now present.**
    **W5 deepen (2026-07-27, kotoba-component#59 + compiler#370 / ADR 0105):**
    multi-step Wasmtime http post sequence (status sum / 200 = 2). **Family 2
-   multi-step execution evidence now present.** Next: production cljs HTTP
-   transport contract, or remaining multi-step drivers / product apps.
+   multi-step execution evidence now present.**
+   **W5 deepen (2026-07-27, provider#12 + compiler#384 / ADR 0117):**
+   production cljs/nbb HTTP transport (spawnSync hops). **Family 2 production
+   cljs transport intermediate evidence now present.** Next: production cljs
+   LLM/storage transports / product apps.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -373,8 +376,13 @@ Qualify vertical families in dependency order:
    log truncation-flag dual-read multi-step (after0 true + after1 false → 2).
    Closes ADR 0111 deferred truncation multi-step slice. **Log multi-step
    suite complete: append-only, append+read, oldest-drop, truncation flag.**
-   Next: get-stream dual-runtime / production cljs transports / more product
-   apps.
+   **W5 deepen (2026-07-27, provider#12 + compiler#384 / ADR 0117):**
+   production \`:cljs\`/nbb HTTP transport via spawnSync hops (allow-list,
+   redirect decline, destination-IP block, local echo POST). Closes ADR 0066
+   explicit cljs gap for \`:http/post\`. **Family 2 production cljs transport
+   intermediate evidence now present.**
+   Next: production cljs LLM/storage transports / get-stream dual-runtime /
+   more product apps.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
