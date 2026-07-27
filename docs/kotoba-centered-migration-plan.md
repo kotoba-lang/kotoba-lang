@@ -273,8 +273,11 @@ Qualify vertical families in dependency order:
    multi-step execution evidence now present.**
    **W5 deepen (2026-07-27, provider#12 + compiler#384 / ADR 0117):**
    production cljs/nbb HTTP transport (spawnSync hops). **Family 2 production
+   cljs transport intermediate evidence now present.**
+   **W5 deepen (2026-07-27, provider#13 + compiler#385 / ADR 0118):**
+   production cljs/nbb LLM transport (spawnSync hops). **Family 6 production
    cljs transport intermediate evidence now present.** Next: production cljs
-   LLM/storage transports / product apps.
+   storage transport / product apps.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -381,7 +384,12 @@ Qualify vertical families in dependency order:
    redirect decline, destination-IP block, local echo POST). Closes ADR 0066
    explicit cljs gap for \`:http/post\`. **Family 2 production cljs transport
    intermediate evidence now present.**
-   Next: production cljs LLM/storage transports / get-stream dual-runtime /
+   **W5 deepen (2026-07-27, provider#13 + compiler#385 / ADR 0118):**
+   production \`:cljs\`/nbb LLM transport via spawnSync hops (①→②→③ resolve,
+   Anthropic Messages wire, typed 429/401/500, bearer). Closes ADR 0064
+   explicit cljs gap for \`:llm/generate\`. **Family 6 production cljs transport
+   intermediate evidence now present.**
+   Next: production cljs storage transport / get-stream dual-runtime /
    more product apps.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
@@ -411,7 +419,7 @@ Qualify vertical families in dependency order:
    and nbb (`:cljs`) with mock host transport. Token budgets, temperature,
    and usage counts use canonical i64 bigint on cljs. Generation boundary,
    model/budget fail-closed, typed errors/redaction, missing-grant denial.
-   Production cljs LLM transport still unimplemented (JVM ADR 0064);
+   **W5 deepen ADR 0118:** production cljs/nbb LLM transport landed; was unimplemented (JVM ADR 0064);
    streaming/tool-calls out of v1 kit. **Reference dual-runtime now covers
    log, clock, http, state, storage, ui, llm.**
    **W5 remaining kit wasm (2026-07-27, kotoba-component#50 + compiler#357 /
