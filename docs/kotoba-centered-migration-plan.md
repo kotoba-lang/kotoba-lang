@@ -294,8 +294,12 @@ Qualify vertical families in dependency order:
    model/budget fail-closed, typed errors/redaction, missing-grant denial.
    Production cljs LLM transport still unimplemented (JVM ADR 0064);
    streaming/tool-calls out of v1 kit. **Reference dual-runtime now covers
-   log, clock, http, state, storage, ui, llm.** Next: remaining kit wasm
-   packaging, stream-object dual-runtime, or HTTP ingress kit (family 3).
+   log, clock, http, state, storage, ui, llm.**
+   **W5 remaining kit wasm (2026-07-27, kotoba-component#50 + compiler#357 /
+   ADR 0092):** synthetic `ui-provider-wat` + `package-ui-provider` dual-export
+   (revision counter, empty next-event, node-count bound). **Wasm packaging
+   now covers clock, log, http, state, ui.** Next: storage/llm wasm, or
+   stream-object dual-runtime, or HTTP ingress kit (family 3).
 7. queues, timers, actors, and durable workflow;
 8. filesystem/process/git/cloud command capabilities for kbb.
 
