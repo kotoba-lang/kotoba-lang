@@ -295,11 +295,15 @@ Qualify vertical families in dependency order:
    **W5 deepen (2026-07-27, kotoba-component#57 + compiler#367 / ADR 0102):**
    log multi-step Wasmtime append sequence. **Multi-step Wasmtime driver
    evidence now present for clock + log.**
-   **W5 family-3 product cutover (2026-07-27, compiler#368 + toshokan#? /
+   **W5 family-3 product cutover (2026-07-27, compiler#368 + toshokan#8 /
    ADR 0103):** host-profile `ingress-methods` default split from egress
    allowlist; murakumo-toshokan `handleIncoming` + `max-request-bytes`.
-   **First product workerd ingress cutover evidence now present.** Next:
-   get-stream dual-runtime / production cljs transports / more product apps.
+   **First product workerd ingress cutover evidence now present.**
+   **W5 deepen (2026-07-27, kotoba-component#58 + compiler#369 / ADR 0104):**
+   multi-step Wasmtime ui commit sequence (two empty commits; rev delta 1).
+   **Multi-step Wasmtime driver evidence now present for clock + log + ui.**
+   Next: get-stream dual-runtime / production cljs transports / more product
+   apps / remaining multi-step drivers (http, storage, llm, object-write).
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
@@ -334,6 +338,9 @@ Qualify vertical families in dependency order:
    **W5 remaining kit wasm (2026-07-27, kotoba-component#50 + compiler#357 /
    ADR 0092):** synthetic `ui-provider-wat` + `package-ui-provider` dual-export
    (revision counter, empty next-event, node-count bound). **Wasm packaging now covers clock, log, http, state, ui.**
+   **W5 deepen (2026-07-27, kotoba-component#58 + compiler#369 / ADR 0104):**
+   multi-step Wasmtime ui commit sequence (rev delta 1). **Family 5 multi-step
+   execution evidence now present for commit.**
    **W5 remaining kit wasm (2026-07-27, kotoba-component#51 + compiler#358 /
    ADR 0093):** synthetic `storage-provider-wat` + `package-storage-provider`
    (always-missing, disc range-check). **Wasm packaging now also covers
