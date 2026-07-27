@@ -177,9 +177,16 @@ host-side `reconcileUiDocument` maps the shallow UI `:document` shape
 objects; second reconcile updates text in place and reuses element instances;
 dangerous tags (`script`/`iframe`/…) fail closed. Mock DOM for Node tests;
 real `document.createElement` in browser. Does **not** replace the flat
-`:ui/commit` capability kit (W5). Remaining for full exit: recursive logical
-values (beyond bounded `:document`), dual renderer qualification, and
-performance workloads.
+`:ui/commit` capability kit (W5).
+
+**W4 fifth slice (2026-07-27, `recursive_tree_value_test`, compiler#343 +
+kotoba-kir#10 + kotoba-script#71):** recursive logical values as sealed
+schema-checked trees. `[:ref R]` resolves to the nominal `:variant`/`:record`
+descriptor carried by the value; a productive `:app/node` (leaf i64 | branch
+of two refs) constructs and walks under ADT depth/node budgets (KIR +
+restricted ESM). Handles remain out of the application model. Remaining for
+full exit: dual renderer qualification and performance workloads (before
+HAMT/arena selection).
 
 ### W5 — Host capability qualification
 
