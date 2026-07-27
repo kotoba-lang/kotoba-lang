@@ -227,6 +227,13 @@ host kits, then design-system logical-value cutover (css→html→…).
 Qualify vertical families in dependency order:
 
 1. log and clock;
+   **W5 first slice (2026-07-27, compiler + provider#2 / ADR 0079):** dual-runtime
+   semantic vectors for log+clock on reference (`:clj`) and nbb (`:cljs`).
+   Log sequence counters use canonical i64 bigint on cljs (clock-style).
+   Denial + invalid-tick vectors on clj; log append/read/limits/truncation/denial
+   on nbb. Restored nbb harness after provider extraction (`-M:test` classpath +
+   BigInt admission allow). **Does not** flip `:wasm-aot`/`:native-aot`/`:jit`
+   (still pending). Next within family 1: wasm/component providers for log+clock.
 2. HTTP egress;
 3. HTTP ingress and lifecycle;
 4. state and storage;
