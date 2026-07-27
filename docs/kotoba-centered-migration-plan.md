@@ -204,10 +204,15 @@ logical documents. `document-print` emits the deterministic lowercase hex of
 `document-canonical-bytes` (same encoding as `document-sha256`);
 `document-read` is the inverse and re-applies depth/node/item/byte budgets.
 UI trees and scalar leaves round-trip equal with stable sha256; malformed
-print strings fail closed (KIR + restricted ESM). Wasm/browser-host import
-wiring for the two ops is a follow-up (document-sha256 multi-repo pattern).
-Remaining for full Delivery-4 exit: harder performance evidence before
-HAMT/arena selection, and wasm host parity for print/read.
+print strings fail closed (KIR + restricted ESM).
+
+**W4 eighth slice (2026-07-27, compiler#346 + kotoba-wasm#32):** real wasm +
+browser-host import parity for `document-print` / `document-read` (same
+multi-repo pattern as document-sha256). `document_roundtrip_test` now covers
+KIR + restricted ESM + wasm/browser-host (15 assertions). Remaining for full
+Delivery-4 exit: harder performance evidence before HAMT/arena selection.
+Design-system final cutover (Delivery 6) remains unblocked on dual renderers
++ logical document identity/print.
 
 ### W5 — Host capability qualification
 
