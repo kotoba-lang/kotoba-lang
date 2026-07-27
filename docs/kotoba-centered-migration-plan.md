@@ -307,8 +307,15 @@ Qualify vertical families in dependency order:
    (budget/string bounds; fixed ok completion; no ambient credentials).
    **Wasm packaging now covers clock, log, http, state, storage, ui, llm
    (all 7 dual-runtime kits with intermediate packaging evidence).**
-   Next: stream-object dual-runtime, HTTP ingress kit (family 3), or deepen
-   existing kits with Wasmtime multi-step drivers / production cljs transports.
+   **W5 stream-object dual-runtime first slice (2026-07-27, provider#8/#9 +
+   compiler#360 / ADR 0095):** reference + nbb vectors for the write path —
+   `:object/put-block` + `:object/compare-and-set-ref` (binding allowlist,
+   bounded payload as host string, bool results, redaction, denial). Linear
+   get-stream / bytes-task ownership stays on Component v0.3. **Reference
+   dual-runtime now also covers stream-object write ops.** Next: HTTP
+   ingress kit (family 3), get-stream dual-runtime once reference `:bytes`/
+   task values exist, or deepen existing kits with Wasmtime multi-step
+   drivers / production cljs transports.
 7. queues, timers, actors, and durable workflow;
 8. filesystem/process/git/cloud command capabilities for kbb.
 
