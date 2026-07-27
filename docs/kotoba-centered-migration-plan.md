@@ -309,8 +309,18 @@ sha256 + print/read identity.
 **Delivery-6 fourth cutover (2026-07-27, liquid-glass-ui#10):** liquid-glass
 material tokens as `:document` → `--liquid-glass-*` stream in
 `tokens_document.kotoba` (light+dark roots, surface/motion nested).
-Byte-equality with form-A; print/read identity. Next: **kotoba-ui** theme
-composition.
+Byte-equality with form-A; print/read identity.
+
+**Delivery-6 fifth (final) cutover (2026-07-27, kotoba-ui#9):** kotoba-ui
+composition-layer theme as `:document` (`:accent` hex, optional
+`:appearance`) → cascade layer-order + accent CSS-var stream in
+`theme_document.kotoba`. Byte-equality with form-A `theme_core` helpers
+(hex→rgba, accent decls, layer, shell class/layout constants); sha256 +
+print/read identity. Full `theme-css` host join (shitsuke+glass+shell)
+remains `.cljc`. Form-A remains oracle; consumer APIs unchanged.
+**Design-system dependency-order document cutover is complete 5/5**
+(css → html → shitsuke → liquid-glass-ui → kotoba-ui). Remaining program
+work: W5 host kits (not a design-system file port).
 
 For Cloudflare, migrate route semantics only after HTTP ingress is qualified;
 until then the cljs entry remains a mechanism adapter. For Murakumo, migrate
