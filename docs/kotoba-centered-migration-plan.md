@@ -270,6 +270,13 @@ Qualify vertical families in dependency order:
    inflight queue, option incoming request, status [100,599], dual-runtime
    vectors on reference + nbb. No ambient listen; workerd cutover still
    pending. **Family 3 intermediate dual-runtime evidence now present.**
+   **W5 family-3 second slice (2026-07-27, kotoba-component#55 +
+   compiler#363 / ADR 0098):** synthetic dual-export
+   `http-ingress-provider-wat` + `package-http-ingress-provider` (accept
+   always-none; reply status bounds + true). **Family 3 dual-runtime + wasm
+   packaging intermediate evidence now present.** Next: multi-inflight /
+   workerd adapter, or get-stream dual-runtime / Wasmtime drivers /
+   production cljs transports.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
@@ -324,10 +331,10 @@ Qualify vertical families in dependency order:
    `object-write-provider-wat` + `package-object-write-provider` (bounds +
    option disc; always-true; no ambient store). **Write-path dual-runtime +
    wasm packaging intermediate evidence now present.**
-   **See family 3 first slice (ADR 0097) above.** Next: deepen family 3
-   (multi-inflight / workerd adapter), get-stream dual-runtime once
-   reference `:bytes`/task values exist, or Wasmtime multi-step drivers /
-   production cljs transports.
+   **See family 3 first+second slices (ADR 0097/0098) above.** Next:
+   multi-inflight / workerd adapter, get-stream dual-runtime once reference
+   `:bytes`/task values exist, or Wasmtime multi-step drivers / production
+   cljs transports.
 7. queues, timers, actors, and durable workflow;
 8. filesystem/process/git/cloud command capabilities for kbb.
 
