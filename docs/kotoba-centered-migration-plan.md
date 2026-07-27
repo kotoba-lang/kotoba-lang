@@ -287,6 +287,9 @@ Qualify vertical families in dependency order:
    **W5 deepen (2026-07-27, kotoba-component#63 + compiler#375 / ADR 0109):**
    multi-step Wasmtime accept→none (none-count 2). **Family 3 multi-step
    execution evidence now present for accept.**
+   **W5 deepen (2026-07-27, kotoba-component#64 + compiler#376 / ADR 0110):**
+   multi-step Wasmtime reply true-sum (true-sum 2). **Family 3 multi-step
+   now covers accept + reply.**
    **W5 family-3 third slice (2026-07-27, provider#11 + compiler#364 /
    ADR 0099):** multi-inflight host queue (default depth 8, parametric
    [1,256]), FIFO accept, host may buffer while a request is pending reply.
@@ -327,9 +330,12 @@ Qualify vertical families in dependency order:
    **W5 deepen (2026-07-27, kotoba-component#63 + compiler#375 / ADR 0109):**
    multi-step Wasmtime http-ingress accept→none sequence (none-count 2).
    **Family-3 ingress multi-step execution evidence now present (accept path).**
+   **W5 deepen (2026-07-27, kotoba-component#64 + compiler#376 / ADR 0110):**
+   multi-step Wasmtime http-ingress reply true-sum sequence (true-sum 2).
+   **Family-3 ingress multi-step now covers both dual-export paths (accept +
+   reply).**
    Next: get-stream dual-runtime / production cljs transports / more product
-   apps / state multi-step deepen if not already covered by ADR 0060 /
-   reply multi-step optional.
+   apps / state multi-step deepen if not already covered by ADR 0060.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
