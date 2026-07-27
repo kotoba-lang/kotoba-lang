@@ -301,8 +301,14 @@ Qualify vertical families in dependency order:
    **W5 remaining kit wasm (2026-07-27, kotoba-component#51 + compiler#358 /
    ADR 0093):** synthetic `storage-provider-wat` + `package-storage-provider`
    (always-missing, disc range-check). **Wasm packaging now also covers
-   storage.** Next: llm wasm, stream-object dual-runtime, or HTTP ingress
-   kit (family 3).
+   storage.**
+   **W5 remaining kit wasm (2026-07-27, kotoba-component#52 + compiler#359 /
+   ADR 0094):** synthetic `llm-provider-wat` + `package-llm-provider`
+   (budget/string bounds; fixed ok completion; no ambient credentials).
+   **Wasm packaging now covers clock, log, http, state, storage, ui, llm
+   (all 7 dual-runtime kits with intermediate packaging evidence).**
+   Next: stream-object dual-runtime, HTTP ingress kit (family 3), or deepen
+   existing kits with Wasmtime multi-step drivers / production cljs transports.
 7. queues, timers, actors, and durable workflow;
 8. filesystem/process/git/cloud command capabilities for kbb.
 
