@@ -276,8 +276,12 @@ Qualify vertical families in dependency order:
    cljs transport intermediate evidence now present.**
    **W5 deepen (2026-07-27, provider#13 + compiler#385 / ADR 0118):**
    production cljs/nbb LLM transport (spawnSync hops). **Family 6 production
-   cljs transport intermediate evidence now present.** Next: production cljs
-   storage transport / product apps.
+   cljs transport intermediate evidence now present.**
+   **W5 deepen (2026-07-27, provider#14 + compiler#386 / ADR 0119):**
+   production cljs/nbb storage transport (spawnSync hops). **Family 4
+   production cljs transport intermediate evidence now present. Production
+   cljs transports complete for HTTP + LLM + storage.** Next: get-stream
+   dual-runtime / product apps.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -389,8 +393,12 @@ Qualify vertical families in dependency order:
    Anthropic Messages wire, typed 429/401/500, bearer). Closes ADR 0064
    explicit cljs gap for \`:llm/generate\`. **Family 6 production cljs transport
    intermediate evidence now present.**
-   Next: production cljs storage transport / get-stream dual-runtime /
-   more product apps.
+   **W5 deepen (2026-07-27, provider#14 + compiler#386 / ADR 0119):**
+   production \`:cljs\`/nbb storage transport via spawnSync hops (required
+   host endpoint, put/get/delete/conflict, typed 429/500). Closes ADR 0071
+   explicit cljs gap for \`:storage/transact\`. **Production cljs transports
+   complete for HTTP + LLM + storage (ADR 0117–0119).**
+   Next: get-stream dual-runtime / more product apps.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
