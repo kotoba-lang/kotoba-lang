@@ -317,8 +317,12 @@ Qualify vertical families in dependency order:
    multi-step Wasmtime llm generate sequence (fixed text-length sum 4).
    **Multi-step Wasmtime driver evidence now present for clock + log + ui +
    http + storage + llm.**
+   **W5 deepen (2026-07-27, kotoba-component#62 + compiler#374 / ADR 0108):**
+   multi-step Wasmtime object put-block sequence (true-sum 2).
+   **Multi-step Wasmtime suite complete for intermediate-packaged kits:
+   clock + log + ui + http + storage + llm + object-write.**
    Next: get-stream dual-runtime / production cljs transports / more product
-   apps / remaining multi-step driver (object-write).
+   apps / state multi-step deepen if not already covered by ADR 0060.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
@@ -382,6 +386,9 @@ Qualify vertical families in dependency order:
    `object-write-provider-wat` + `package-object-write-provider` (bounds +
    option disc; always-true; no ambient store). **Write-path dual-runtime +
    wasm packaging intermediate evidence now present.**
+   **W5 deepen (2026-07-27, kotoba-component#62 + compiler#374 / ADR 0108):**
+   multi-step Wasmtime put-block sequence (true-sum 2). **Object-write multi-step
+   execution evidence now present.**
    **See family 3 first+second slices (ADR 0097/0098) above.** Next:
    multi-inflight / workerd adapter, get-stream dual-runtime once reference
    `:bytes`/task values exist, or Wasmtime multi-step drivers / production
