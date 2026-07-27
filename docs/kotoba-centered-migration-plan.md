@@ -264,6 +264,12 @@ Qualify vertical families in dependency order:
    now present.** Next: production cljs HTTP transport contract, or family 3
    HTTP ingress/lifecycle, or deepen family 2 with Wasmtime drivers.
 3. HTTP ingress and lifecycle;
+   **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
+   provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
+   lifecycle for `:http/accept` (id 17) + `:http/reply` (id 18). Single-
+   inflight queue, option incoming request, status [100,599], dual-runtime
+   vectors on reference + nbb. No ambient listen; workerd cutover still
+   pending. **Family 3 intermediate dual-runtime evidence now present.**
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
@@ -317,9 +323,10 @@ Qualify vertical families in dependency order:
    compiler#361 / ADR 0096):** synthetic dual-export
    `object-write-provider-wat` + `package-object-write-provider` (bounds +
    option disc; always-true; no ambient store). **Write-path dual-runtime +
-   wasm packaging intermediate evidence now present.** Next: HTTP ingress
-   kit (family 3), get-stream dual-runtime once reference `:bytes`/task
-   values exist, or deepen existing kits with Wasmtime multi-step drivers /
+   wasm packaging intermediate evidence now present.**
+   **See family 3 first slice (ADR 0097) above.** Next: deepen family 3
+   (multi-inflight / workerd adapter), get-stream dual-runtime once
+   reference `:bytes`/task values exist, or Wasmtime multi-step drivers /
    production cljs transports.
 7. queues, timers, actors, and durable workflow;
 8. filesystem/process/git/cloud command capabilities for kbb.
