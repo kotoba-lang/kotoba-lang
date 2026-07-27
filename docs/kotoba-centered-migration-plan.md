@@ -209,10 +209,18 @@ print strings fail closed (KIR + restricted ESM).
 **W4 eighth slice (2026-07-27, compiler#346 + kotoba-wasm#32):** real wasm +
 browser-host import parity for `document-print` / `document-read` (same
 multi-repo pattern as document-sha256). `document_roundtrip_test` now covers
-KIR + restricted ESM + wasm/browser-host (15 assertions). Remaining for full
-Delivery-4 exit: harder performance evidence before HAMT/arena selection.
-Design-system final cutover (Delivery 6) remains unblocked on dual renderers
-+ logical document identity/print.
+KIR + restricted ESM + wasm/browser-host (15 assertions).
+
+**W4 ninth slice (2026-07-27, `document_perf_workload_test`, compiler#347):**
+harder performance evidence before structure selection. Multi-section
+admitted tree through construct → print → read → equal? (KIR elevated fuel
+100× under 3s; ESM default fuel with fresh instantiate 50× under 4s) plus
+host-plane construct/print/read/sha256 100× under 2s. Shows tagged-vector
+documents are usable under admitted node budgets; HAMT/arena selection is
+not yet claimed. **Delivery-4 exit evidence for recursive logical documents
+is now complete enough to start Delivery-6 design-system cutover** (dual
+renderers + identity + print already green). Remaining program work: W5
+host kits, then design-system logical-value cutover (css→html→…).
 
 ### W5 — Host capability qualification
 
