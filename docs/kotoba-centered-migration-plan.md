@@ -291,8 +291,14 @@ style `:document` (`:selector` + `:decls` of `:prop`/`:value`) → CSS stream
 in `kotoba/css_document.kotoba`. Byte-equality with form-A `css_core.kotoba`
 and key-sorted `css.core` (rule corpus + breakout guard); `document-sha256`
 + print/read identity on style documents. Consumer `css.core` unchanged;
-form-A remains oracle. Next in dependency order: **html** logical hiccup
-document → HTML stream (parallel to W4 UI document path).
+form-A remains oracle.
+
+**Delivery-6 second cutover (2026-07-27, kotoba-lang/html#3):** html logical
+UI `:document` (W4 `:tag`/`:text`/`:attrs`/`:children`/`:void`) → HTML stream
+in `kotoba/html_document.kotoba`. Byte-equality with form-A `html_core.kotoba`
+for escape/void/closed/nested/html5; sorted attrs; sha256 + print/read
+identity. Compact emission (pretty-print stays host-side). Consumer
+`html.core` unchanged. Next: **shitsuke** tokens/hig on logical values.
 
 For Cloudflare, migrate route semantics only after HTTP ingress is qualified;
 until then the cljs entry remains a mechanism adapter. For Murakumo, migrate
