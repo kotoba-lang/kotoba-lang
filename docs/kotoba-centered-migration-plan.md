@@ -286,6 +286,14 @@ Delivery-6 exit. Do not make string-only SSR the final abstraction. Start
 cutover only when the shared logical value (Delivery 4 / W4) and both
 required renderers for that tranche are qualified.
 
+**Delivery-6 first cutover (2026-07-27, kotoba-lang/css#3):** css logical
+style `:document` (`:selector` + `:decls` of `:prop`/`:value`) → CSS stream
+in `kotoba/css_document.kotoba`. Byte-equality with form-A `css_core.kotoba`
+and key-sorted `css.core` (rule corpus + breakout guard); `document-sha256`
++ print/read identity on style documents. Consumer `css.core` unchanged;
+form-A remains oracle. Next in dependency order: **html** logical hiccup
+document → HTML stream (parallel to W4 UI document path).
+
 For Cloudflare, migrate route semantics only after HTTP ingress is qualified;
 until then the cljs entry remains a mechanism adapter. For Murakumo, migrate
 the state/LLM/governor/checkpoint vertical slice after the corresponding kits
