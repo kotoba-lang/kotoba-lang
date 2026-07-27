@@ -287,6 +287,15 @@ Qualify vertical families in dependency order:
    boundary. Next: ui wasm packaging, LLM dual-runtime (family 6), or HTTP
    ingress kit (family 3).
 6. LLM generate/stream/cancel/tool result;
+   **W5 family-6 first slice (2026-07-27, provider#7 + compiler#356 / ADR 0091):**
+   dual-runtime semantic vectors for `:llm/generate` on reference (`:clj`)
+   and nbb (`:cljs`) with mock host transport. Token budgets, temperature,
+   and usage counts use canonical i64 bigint on cljs. Generation boundary,
+   model/budget fail-closed, typed errors/redaction, missing-grant denial.
+   Production cljs LLM transport still unimplemented (JVM ADR 0064);
+   streaming/tool-calls out of v1 kit. **Reference dual-runtime now covers
+   log, clock, http, state, storage, ui, llm.** Next: remaining kit wasm
+   packaging, stream-object dual-runtime, or HTTP ingress kit (family 3).
 7. queues, timers, actors, and durable workflow;
 8. filesystem/process/git/cloud command capabilities for kbb.
 
