@@ -240,8 +240,17 @@ Qualify vertical families in dependency order:
    observation-sequence; closed application composition + `wasm-tools validate`.
    Production host time remains ADR 0073 CLJ/CLJS; WASI clocks on the
    component-model contract are not wired; `:wasm-aot` stays pending (same
-   honesty bar as state after ADR 0060). Next within family 1:
-   `log-provider-wat` (bounded append/read + set-of-records ABI).
+   honesty bar as state after ADR 0060).
+   **W5 third slice (2026-07-27, kotoba-wasm#33 + kotoba-component#48 +
+   compiler#350 / ADR 0085):** real dual-export `log-provider-wat` +
+   `package-log-provider` for log-v1 (append+read ring buffer, field sets,
+   oldest-drop, read limit/truncation). Requires Canonical `:set` layout
+   (pointer+length, typed-set bound 32). Default capacity 8 (parametric 256).
+   Provider packaging + validate only — KIR asymmetric record+set application
+   emit and Wasmtime multi-step driver deferred. `:wasm-aot` stays pending.
+   **Family 1 (log+clock) wasm packaging evidence is now present for both kits.**
+   Next: family 2 HTTP egress dual-runtime / component qualification, or
+   log/clock KIR app emit + Wasmtime drivers within family 1.
 2. HTTP egress;
 3. HTTP ingress and lifecycle;
 4. state and storage;
