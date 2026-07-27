@@ -298,7 +298,13 @@ UI `:document` (W4 `:tag`/`:text`/`:attrs`/`:children`/`:void`) → HTML stream
 in `kotoba/html_document.kotoba`. Byte-equality with form-A `html_core.kotoba`
 for escape/void/closed/nested/html5; sorted attrs; sha256 + print/read
 identity. Compact emission (pretty-print stays host-side). Consumer
-`html.core` unchanged. Next: **shitsuke** tokens/hig on logical values.
+`html.core` unchanged.
+
+**Delivery-6 third cutover (2026-07-27, kotoba-lang/shitsuke#9):** shitsuke
+token groups as `:document` (`:prefix`/`:group`/`:entries` or nested
+`:props`) → CSS custom-property stream in `tokens_document.kotoba` +
+`hig_document.kotoba`. Byte-equality with form-A tokens_core/hig_core;
+sha256 + print/read identity. Next: **liquid-glass-ui** material tokens.
 
 For Cloudflare, migrate route semantics only after HTTP ingress is qualified;
 until then the cljs entry remains a mechanism adapter. For Murakumo, migrate
