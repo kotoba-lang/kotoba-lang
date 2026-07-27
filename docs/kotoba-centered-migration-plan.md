@@ -278,9 +278,13 @@ Qualify vertical families in dependency order:
    **W5 family-3 third slice (2026-07-27, provider#11 + compiler#364 /
    ADR 0099):** multi-inflight host queue (default depth 8, parametric
    [1,256]), FIFO accept, host may buffer while a request is pending reply.
-   **Family 3 multi-inflight dual-runtime evidence now present.** Next:
-   workerd adapter, get-stream dual-runtime / Wasmtime drivers / production
-   cljs transports.
+   **Family 3 multi-inflight dual-runtime evidence now present.**
+   **W5 family-3 fourth slice (2026-07-27, compiler#365 / ADR 0100):**
+   workerd adapter `toIncoming`/`handleIncoming`/`fromReply` with
+   `max-request-bytes`, method/path/header/body bounds, legacy `fetch`
+   fallback. **Family 3 workerd ingress boundary intermediate evidence now
+   present.** Next: product route cutover, get-stream dual-runtime /
+   Wasmtime drivers / production cljs transports.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
