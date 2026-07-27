@@ -297,9 +297,12 @@ Qualify vertical families in dependency order:
    log, clock, http, state, storage, ui, llm.**
    **W5 remaining kit wasm (2026-07-27, kotoba-component#50 + compiler#357 /
    ADR 0092):** synthetic `ui-provider-wat` + `package-ui-provider` dual-export
-   (revision counter, empty next-event, node-count bound). **Wasm packaging
-   now covers clock, log, http, state, ui.** Next: storage/llm wasm, or
-   stream-object dual-runtime, or HTTP ingress kit (family 3).
+   (revision counter, empty next-event, node-count bound). **Wasm packaging now covers clock, log, http, state, ui.**
+   **W5 remaining kit wasm (2026-07-27, kotoba-component#51 + compiler#358 /
+   ADR 0093):** synthetic `storage-provider-wat` + `package-storage-provider`
+   (always-missing, disc range-check). **Wasm packaging now also covers
+   storage.** Next: llm wasm, stream-object dual-runtime, or HTTP ingress
+   kit (family 3).
 7. queues, timers, actors, and durable workflow;
 8. filesystem/process/git/cloud command capabilities for kbb.
 
