@@ -344,6 +344,9 @@ Qualify vertical families in dependency order:
    **W5 deepen (2026-07-27, kotoba-component#66 + compiler#378 / ADR 0112):**
    object-write multi-function put+CAS multi-step (true-sum 2). **Write-path
    multi-step now covers put-only and put+CAS dual-export walks.**
+   **W5 deepen (2026-07-27, kotoba-component#67 + compiler#379 / ADR 0113):**
+   ui multi-function commit+next-event multi-step (rev+none = 2). **UI
+   multi-step now covers commit-only and commit+next-event dual-export walks.**
    Next: get-stream dual-runtime / production cljs transports / more product
    apps.
 4. state and storage;
@@ -383,6 +386,9 @@ Qualify vertical families in dependency order:
    **W5 deepen (2026-07-27, kotoba-component#58 + compiler#369 / ADR 0104):**
    multi-step Wasmtime ui commit sequence (rev delta 1). **Family 5 multi-step
    execution evidence now present for commit.**
+   **W5 deepen (2026-07-27, kotoba-component#67 + compiler#379 / ADR 0113):**
+   commit+next-event multi-function multi-step (rev+none = 2). **Family 5
+   multi-step covers commit-only and commit+next-event.**
    **W5 remaining kit wasm (2026-07-27, kotoba-component#51 + compiler#358 /
    ADR 0093):** synthetic `storage-provider-wat` + `package-storage-provider`
    (always-missing, disc range-check). **Wasm packaging now also covers
