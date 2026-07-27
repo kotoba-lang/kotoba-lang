@@ -269,8 +269,15 @@ Qualify vertical families in dependency order:
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
    and nbb (`:cljs`). Entry versions use canonical i64 bigint on cljs.
    Round-trip, instance isolation, capacity typed error, missing-grant denial.
-   State wasm packaging already exists (ADR 0060/0061). Next within family 4:
-   storage dual-runtime (mock transport) and/or storage cljs i64 audit.
+   State wasm packaging already exists (ADR 0060/0061).
+   **W5 family-4 second slice (2026-07-27, provider#5 + compiler#354 / ADR 0089):**
+   dual-runtime semantic vectors for `:storage/transact` on reference (`:clj`)
+   and nbb (`:cljs`) with mock host transport. Versions (entry, expected,
+   conflict) use canonical i64 bigint on cljs. Put boundary, missing/conflict,
+   redaction, invalid-version fail-closed, denial. Production cljs storage
+   transport still unimplemented (JVM ADR 0071). **Family 4 dual-runtime
+ intermediate evidence now covers state + storage.** Next: UI dual-runtime
+   (family 5), storage wasm packaging, or HTTP ingress kit (family 3).
 5. UI commit/event and DOM reconciliation;
 6. LLM generate/stream/cancel/tool result;
 7. queues, timers, actors, and durable workflow;
