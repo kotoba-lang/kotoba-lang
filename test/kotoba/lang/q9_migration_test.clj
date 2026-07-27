@@ -1,7 +1,8 @@
 (ns kotoba.lang.q9-migration-test
   (:require [clojure.edn :as edn]
             [clojure.set :as set]
-            [clojure.test :refer [deftest is testing]]))
+            [clojure.test :refer [deftest is testing]]
+            [kotoba.lang.q9-migration :as migration]))
 
 (def q9 (edn/read-string (slurp "lang/q9-migration.edn")))
 (def soak (edn/read-string (slurp "lang/q9-wave1-tranche-1-soak.edn")))
@@ -31,3 +32,27 @@
   (is (every? empty? (map :runs (:repositories soak))))
   (is (false? (get-in soak [:gate :ready])))
   (is (false? (get-in soak [:gate :consumer-cutover-authorized]))))
+
+(deftest migration-state-machine-rejects-premature-grade-a-claims
+  (is (:valid? (migration/report q9)))
+  (let [premature (-> q9
+                      (assoc-in [:current-decision :fleet-complete] true)
+                      (assoc-in [:current-decision
+                                 :production-deploy-authorized] true))
+        codes (set (map :code (migration/validation-errors premature)))]
+    (is (contains? codes :q9/premature-fleet-completion))
+    (is (contains? codes :q9/premature-production-authorization))))
+
+(deftest qualified-waves-require-evidence-and-explicit-production-authority
+  (let [without-evidence
+        (assoc-in q9 [:waves :wave-2 :status] :qualified)]
+    (is (= :q9/qualified-without-evidence
+           (:code (first (migration/validation-errors without-evidence))))))
+  (let [all-qualified
+        (reduce (fn [program wave]
+                  (-> program
+                      (assoc-in [:waves wave :status] :qualified)
+                      (assoc-in [:waves wave :evidence] ["immutable-proof"])))
+                q9 migration/all-waves)]
+    (is (some #(= :q9/missing-explicit-production-authorization (:code %))
+              (migration/validation-errors all-qualified)))))
