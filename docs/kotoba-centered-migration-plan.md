@@ -265,6 +265,12 @@ Qualify vertical families in dependency order:
    HTTP ingress/lifecycle, or deepen family 2 with Wasmtime drivers.
 3. HTTP ingress and lifecycle;
 4. state and storage;
+   **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
+   dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
+   and nbb (`:cljs`). Entry versions use canonical i64 bigint on cljs.
+   Round-trip, instance isolation, capacity typed error, missing-grant denial.
+   State wasm packaging already exists (ADR 0060/0061). Next within family 4:
+   storage dual-runtime (mock transport) and/or storage cljs i64 audit.
 5. UI commit/event and DOM reconciliation;
 6. LLM generate/stream/cancel/tool result;
 7. queues, timers, actors, and durable workflow;
