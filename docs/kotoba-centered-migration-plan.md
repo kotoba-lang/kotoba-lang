@@ -267,8 +267,11 @@ Qualify vertical families in dependency order:
    timeout/header/url/body bounds + `https://` prefix, fixed ok response,
    no ambient network. Provider packaging + validate only. `:wasm-aot` stays
    pending. **Family 2 dual-runtime + wasm packaging intermediate evidence
-   now present.** Next: production cljs HTTP transport contract, or family 3
-   HTTP ingress/lifecycle, or deepen family 2 with Wasmtime drivers.
+   now present.**
+   **W5 deepen (2026-07-27, kotoba-component#59 + compiler#370 / ADR 0105):**
+   multi-step Wasmtime http post sequence (status sum / 200 = 2). **Family 2
+   multi-step execution evidence now present.** Next: production cljs HTTP
+   transport contract, or remaining multi-step drivers / product apps.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -302,8 +305,12 @@ Qualify vertical families in dependency order:
    **W5 deepen (2026-07-27, kotoba-component#58 + compiler#369 / ADR 0104):**
    multi-step Wasmtime ui commit sequence (two empty commits; rev delta 1).
    **Multi-step Wasmtime driver evidence now present for clock + log + ui.**
+   **W5 deepen (2026-07-27, kotoba-component#59 + compiler#370 / ADR 0105):**
+   multi-step Wasmtime http post sequence (two fixed-ok posts; status sum /
+   200 = 2). **Multi-step Wasmtime driver evidence now present for clock +
+   log + ui + http.**
    Next: get-stream dual-runtime / production cljs transports / more product
-   apps / remaining multi-step drivers (http, storage, llm, object-write).
+   apps / remaining multi-step drivers (storage, llm, object-write).
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
