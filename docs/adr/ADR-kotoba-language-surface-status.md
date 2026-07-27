@@ -47,6 +47,32 @@ one of these dispositions:
 The classification is about the **Kotoba guest surface**, not about Clojure or
 ClojureScript used to implement the compiler and host tooling.
 
+## Source preservation and safety elaboration
+
+The language grows by preserving the useful Clojure-shaped source surface and
+giving it safer semantics, not by replacing it with framework-specific
+application syntax. Ordinary operations remain functions over immutable
+values. The compiler may elaborate a named operation into inferred effects,
+hidden typed ability parameters, exact capability calls, WIT imports, and
+portable-effect envelopes, but those target mechanisms are not the source
+programming model.
+
+The default decision rule is:
+
+1. represent application descriptions and requests as ordinary
+   map/vector/set/record values;
+2. implement convenience syntax with bounded deterministic `defdesugar`;
+3. infer types and transitive effects rather than requiring low-level
+   annotations everywhere;
+4. expose explicit capability values only for attenuation and delegation;
+5. add a special form only when desugaring cannot preserve a named semantic or
+   safety invariant.
+
+Platform-specific `.cljc` branches should normally converge on one named
+Kotoba operation whose browser, workerd, Component, or native mechanisms are
+host providers. Portability is not achieved by moving raw JS/JVM interop into
+guest code.
+
 ## Collection decision
 
 ### Map literals
