@@ -204,9 +204,15 @@ For the design system, preserve dependency order:
 css → html → shitsuke → liquid-glass-ui → kotoba-ui
 ```
 
-Do not make string-only SSR the final abstraction. Start cutover when the
-shared logical value and both required renderers for that tranche are
-qualified.
+**Form-A oracle tranche (2026-07-27, ADR-2607270100 §10): complete 5/5.**
+Each repo has a `kotoba/*_core.kotoba` pure string pipeline behind a
+byte-equality KIR parity gate (css#2, html#2, shitsuke#7, liquid-glass-ui#8,
+kotoba-ui#7). Consumer `.cljc` APIs are unchanged; dual-render seams,
+component hiccup, full `theme-css` composition, and `spring-linear-easing`
+remain on the host. This is an intermediate oracle experiment — **not** the
+Delivery-6 exit. Do not make string-only SSR the final abstraction. Start
+cutover only when the shared logical value (Delivery 4 / W4) and both
+required renderers for that tranche are qualified.
 
 For Cloudflare, migrate route semantics only after HTTP ingress is qualified;
 until then the cljs entry remains a mechanism adapter. For Murakumo, migrate
