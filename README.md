@@ -41,6 +41,14 @@ are explicit and runtime-granted.
 Kotoba is not "any JVM Clojure or ClojureScript program runs." It is a
 Clojure-shaped profile with its own compatibility contract.
 
+The migration direction is **source preservation plus safety elaboration**:
+ordinary Clojure-shaped values and functions stay readable, while the compiler
+adds inferred effects, typed abilities, semantic definition identity, exact
+imports, and resource bounds. Numeric capability IDs, WIT details, provider
+callbacks, and host objects are not the application programming model. See
+[`docs/kotoba-centered-migration-plan.md`](docs/kotoba-centered-migration-plan.md).
+Root decision: `ADR-2607279200`.
+
 ## Component language, runtime roles, and safety qualification
 
 `.kotoba` means canonical capability-safe **component source**, not
@@ -81,6 +89,8 @@ Q1 safety claims and Q2 executable capability semantics are recorded in
 [`lang/safety-claims.edn`](lang/safety-claims.edn) and
 [`lang/capability-semantics.edn`](lang/capability-semantics.edn). Run
 `bb scripts/check-safety-qualification.bb` to reject missing evidence,
+and `clojure -M:grammar-authority` (or `nbb scripts/check-grammar-authority.cljs`)
+to reject guest-grammar / surface-status / vendor drift (W0),
 capability-catalog drift, or production wildcard authority.
 
 Q1-Q8 now pass for the bounded reference slice recorded in

@@ -59,3 +59,12 @@ but would not make its authority or sandbox portable.
 Definition or component identity never grants authority. A successful effect
 still requires host-side grant/policy intersection and last-boundary provider
 validation.
+
+## Relation to source preservation
+
+The portable-effect envelope is a **host/compiler boundary**, not the
+application programming model. Application source keeps ordinary named
+operations and immutable values; the compiler elaborates them into effect rows
+and ability parameters before any portable envelope is constructed. See
+`docs/kotoba-centered-migration-plan.md` and root ADR-2607279200.
+
