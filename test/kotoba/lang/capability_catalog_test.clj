@@ -3,9 +3,19 @@
             [kotoba.lang.capability-catalog :as catalog]))
 
 (deftest semantic-capability-authority-is-closed
+  ;; The count is a deliberate tripwire: adding a capability must be a reviewed
+  ;; act, not something that slips in. It went stale when 68e5fb5 ("record W5
+  ;; family-3 HTTP ingress dual-runtime") added :http/accept and :http/reply
+  ;; without updating it, and CI was red on main from 2026-07-27 09:57 until
+  ;; this commit. The wire-id assertion below is what makes the tripwire useful
+  ;; rather than merely annoying -- a bump to the count alone cannot hide a
+  ;; duplicated or skipped wire identity.
   (let [authority (catalog/validate! (catalog/read-authority))
-        entries (:capabilities authority)]
-    (is (= 16 (count entries)))
+        entries (:capabilities authority)
+        wire-ids (sort (map :compiler-wire-id (vals entries)))]
+    (is (= 18 (count entries)))
+    (is (= (range 1 (inc (count entries))) wire-ids)
+        "wire ids stay contiguous from 1 with no duplicates or gaps")
     (is (= [4 11 12]
            (mapv #(get-in entries [% :compiler-wire-id])
                  [:http/post :llm/generate :storage/transact])))
