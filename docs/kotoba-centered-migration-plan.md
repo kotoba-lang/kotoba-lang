@@ -169,9 +169,17 @@ stream.
 restricted ESM / real wasm+browser-host parity (kotoba-kir#9, kotoba-script#70,
 kotoba-wasm#31, compiler#341). Null-document golden
 `1b16b1df538ba12dc3f97edbb85caa7050d46c148134290feba80f8236c83db9`; content-
-sensitive and signed-zero identity. Remaining for full exit: recursive logical
-values (beyond bounded `:document`), browser DOM reconciliation, dual renderer
-qualification, and performance workloads.
+sensitive and signed-zero identity.
+
+**W4 fourth slice (2026-07-27, `document-dom-reconcile-test`, compiler#342):**
+host-side `reconcileUiDocument` maps the shallow UI `:document` shape
+(`:tag`/`:text`/`:children`) onto real DOM nodes. Guest never holds host
+objects; second reconcile updates text in place and reuses element instances;
+dangerous tags (`script`/`iframe`/…) fail closed. Mock DOM for Node tests;
+real `document.createElement` in browser. Does **not** replace the flat
+`:ui/commit` capability kit (W5). Remaining for full exit: recursive logical
+values (beyond bounded `:document`), dual renderer qualification, and
+performance workloads.
 
 ### W5 — Host capability qualification
 
