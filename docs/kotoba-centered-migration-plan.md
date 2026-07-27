@@ -304,7 +304,13 @@ identity. Compact emission (pretty-print stays host-side). Consumer
 token groups as `:document` (`:prefix`/`:group`/`:entries` or nested
 `:props`) → CSS custom-property stream in `tokens_document.kotoba` +
 `hig_document.kotoba`. Byte-equality with form-A tokens_core/hig_core;
-sha256 + print/read identity. Next: **liquid-glass-ui** material tokens.
+sha256 + print/read identity.
+
+**Delivery-6 fourth cutover (2026-07-27, liquid-glass-ui#10):** liquid-glass
+material tokens as `:document` → `--liquid-glass-*` stream in
+`tokens_document.kotoba` (light+dark roots, surface/motion nested).
+Byte-equality with form-A; print/read identity. Next: **kotoba-ui** theme
+composition.
 
 For Cloudflare, migrate route semantics only after HTTP ingress is qualified;
 until then the cljs entry remains a mechanism adapter. For Murakumo, migrate
