@@ -249,9 +249,15 @@ Qualify vertical families in dependency order:
    Provider packaging + validate only — KIR asymmetric record+set application
    emit and Wasmtime multi-step driver deferred. `:wasm-aot` stays pending.
    **Family 1 (log+clock) wasm packaging evidence is now present for both kits.**
-   Next: family 2 HTTP egress dual-runtime / component qualification, or
-   log/clock KIR app emit + Wasmtime drivers within family 1.
 2. HTTP egress;
+   **W5 family-2 first slice (2026-07-27, provider#3 + compiler#351 / ADR 0086):**
+   dual-runtime semantic vectors for `:http/post` on reference (`:clj`) and
+   nbb (`:cljs`) with a mock host transport. Timeout-ms and response status
+   use canonical i64 bigint on cljs. Denial + origin/timeout fail-closed +
+   typed transport error/redaction vectors. Production cljs HTTP transport
+   remains unimplemented (JVM transport ADR 0066 only). **Does not** flip
+   `:wasm-aot` or add an http component provider. Next within family 2:
+   wasm/component packaging or production cljs transport contract.
 3. HTTP ingress and lifecycle;
 4. state and storage;
 5. UI commit/event and DOM reconciliation;
