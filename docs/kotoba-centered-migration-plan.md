@@ -233,7 +233,15 @@ Qualify vertical families in dependency order:
    Denial + invalid-tick vectors on clj; log append/read/limits/truncation/denial
    on nbb. Restored nbb harness after provider extraction (`-M:test` classpath +
    BigInt admission allow). **Does not** flip `:wasm-aot`/`:native-aot`/`:jit`
-   (still pending). Next within family 1: wasm/component providers for log+clock.
+   (still pending).
+   **W5 second slice (2026-07-27, kotoba-component#47 + compiler#349 / ADR 0084):**
+   real (non-wiring-only) `clock-provider-wat` + `package-clock-provider` for
+   clock-v1's own literal shape. Synthetic self-contained wall/monotonic +
+   observation-sequence; closed application composition + `wasm-tools validate`.
+   Production host time remains ADR 0073 CLJ/CLJS; WASI clocks on the
+   component-model contract are not wired; `:wasm-aot` stays pending (same
+   honesty bar as state after ADR 0060). Next within family 1:
+   `log-provider-wat` (bounded append/read + set-of-records ABI).
 2. HTTP egress;
 3. HTTP ingress and lifecycle;
 4. state and storage;
