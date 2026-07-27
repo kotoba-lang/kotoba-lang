@@ -161,8 +161,17 @@ closed at construction.
 structural i64 fingerprint of a `:document` (FNV-style over code points + sorted
 map walk) for deterministic identity without host objects; Style vocabulary as
 ordinary documents (`:selector` + `:decls` of `:prop`/`:value`) rendered to a CSS
-stream. Remaining for full exit: first-class `document-sha256` host op, browser
-DOM reconciliation, and performance workloads.
+stream.
+
+**W4 third slice (2026-07-27, `document-sha256-test` + multi-repo):** first-class
+`document-sha256` host op. Shared deterministic UTF-8 canonical encoding
+(`n`/`b`/`i`/`f`/`s`/`k`/`v`/`m` + `K` for map keys) + SHA-256 hex, with KIR /
+restricted ESM / real wasm+browser-host parity (kotoba-kir#9, kotoba-script#70,
+kotoba-wasm#31, compiler#341). Null-document golden
+`1b16b1df538ba12dc3f97edbb85caa7050d46c148134290feba80f8236c83db9`; content-
+sensitive and signed-zero identity. Remaining for full exit: recursive logical
+values (beyond bounded `:document`), browser DOM reconciliation, dual renderer
+qualification, and performance workloads.
 
 ### W5 — Host capability qualification
 
