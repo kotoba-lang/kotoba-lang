@@ -294,8 +294,12 @@ Qualify vertical families in dependency order:
    clock multi-step Wasmtime sequence (wall→mono).
    **W5 deepen (2026-07-27, kotoba-component#57 + compiler#367 / ADR 0102):**
    log multi-step Wasmtime append sequence. **Multi-step Wasmtime driver
-   evidence now present for clock + log.** Next: product route cutover,
-   get-stream dual-runtime / production cljs transports.
+   evidence now present for clock + log.**
+   **W5 family-3 product cutover (2026-07-27, compiler#368 + toshokan#? /
+   ADR 0103):** host-profile `ingress-methods` default split from egress
+   allowlist; murakumo-toshokan `handleIncoming` + `max-request-bytes`.
+   **First product workerd ingress cutover evidence now present.** Next:
+   get-stream dual-runtime / production cljs transports / more product apps.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
