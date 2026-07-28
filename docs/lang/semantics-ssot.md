@@ -242,7 +242,7 @@ per case class (T1.2 landed). Dual-backend execution runner is T1.3.
 
 | Item | WBS |
 |---|---|
-| Full multi-backend required matrix | **T1.2 landed**; **T1.3 pilot landed** (compiler#412 dual KIR+wasm); T1.4–T1.5 native/golden |
+| Full multi-backend required matrix | **T1.2 landed**; **T1.3 pilot expanded** (compiler#412+#414, 7 dual-green); T1.4–T1.5 native/golden |
 | Fuel model detail | T7.2 |
 | True `loop`/`recur` tail | T7.1 |
 | Record args vs arity-5 packs | **T5.1 policy landed**; T5.2–T5.3 host bridge + pilot |
