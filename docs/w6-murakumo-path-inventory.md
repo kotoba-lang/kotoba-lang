@@ -134,11 +134,12 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#126:** **cljs dual-source secret pure + connect pure** — name/env constants + valid-env/path; default-class/node-class/serves-plane when ready. ADR `ADR-260728-w6-cljs-secret-connect-dual`.
 - **2026-07-28 murakumo#127:** **cljs dual-source config + persist pure** — path builders (`:config`) + authority/rkey/uri/url/write-ok? (`:persist`) when ready; try-oracle for persist i64-str. ADR `ADR-260728-w6-cljs-config-persist-dual`.
 - **2026-07-28 murakumo#128:** **cljs dual-source identity pure** — seed preimages, DID argv/trim, cid-b-prefix, JWT templates, graph-name; Node crypto/Buffer (no goog.crypt). ADR `ADR-260728-w6-cljs-identity-dual`.
-- **2026-07-28 murakumo (reconcile+cauth cljs dual-source):** `desired`/`deficit`/`action-name`/`watch-sleep-ms` (`:reconcile-plan`) + epoch/sequence/identifier/event-kind (`:component-authority`) when ready. ADR `ADR-260728-w6-cljs-reconcile-cauth-dual`.
+- **2026-07-28 murakumo#129:** **cljs dual-source reconcile.plan + component-authority** — `desired`/`deficit`/`action-name`/`watch-sleep-ms` + epoch/sequence/identifier/event-kind when ready. ADR `ADR-260728-w6-cljs-reconcile-cauth-dual`.
+- **2026-07-28 murakumo#130:** **cljs dual-source overlay keyring/peer/stream + infer.schedule** — rotation/epoch/preimages; choose-via; window/advance/ack; eligible?/score/queue-inc. ADR `ADR-260728-w6-cljs-overlay-schedule-dual`.
 
 ## Next
 
-1. murakumo pure+adapter path **#61–#128** + reconcile/cauth cljs dual-source. Remaining: Delivery 5–8 shells / residual PVA (schedule `eligible?` bit-pack intentional) / **incremental cljs rewire** (infer/overlay/deploy/report/…) / network·secret caps contract-only.
+1. murakumo pure+adapter path **#61–#130** — cljs dual-source through overlay+schedule. Remaining: Delivery 5–8 shells / residual PVA / **incremental cljs rewire** (infer plan/engine/gc/join/moe/rebalance/relay/credits, overlay runtime/driver, deploy) / network·secret caps contract-only.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#16 product-shell complete); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Deeper pure ports still dual-implemented where listed “Still host” (envelope maps, placement folds beyond wired subset, etc.); production compiler dependency remains avoided (resource path).
