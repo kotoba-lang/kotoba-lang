@@ -164,6 +164,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 
 - **2026-07-28 kotoba-lang T8.4 partial:** host-parity L5 critical conformance fixtures + resources sync. ADR-w6-t84-host-parity-critical-fixtures.
 
+
+- **2026-07-28 murakumo#145:** **kekkai.gate pure expand** — cli-argv fragments dual-source. ADR `ADR-260728-w6-kekkai-cli-pure-oracle`.
+
+- **2026-07-28 provider#40:** T8.3 **package-manifest** binds kit+wasm layers with production blockers (fixture always blocked). ADR 0158.
+
 ## Next
 
 1. **murakumo product-shell pure dual-source is complete** through **#144** (cljs #122–#135, residual `.clj` shells #135, pure expands #136–#144, ops config inject #137). Remaining murakumo work is thin: optional HOME/bin config leave; residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5); deeper “Still host” folds (envelope maps, placement sorts, SSH subprocess).
