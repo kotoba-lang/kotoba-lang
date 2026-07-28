@@ -152,6 +152,13 @@ fixture equality → shells remain on bb/nbb/JVM host.
 
 - **2026-07-28 provider#36–#37:** T8.3 signed **kit EDN** receipts (#36 / ADR 0154) + signed **Wasm provider receipt API** (#37 / ADR 0155, fixture digest only). Production AOT Component + readiness `:signed-wasm` still pending.
 
+
+- **2026-07-28 murakumo#141:** **persist pure oracle expand** — operation-create, write-ok-marker, auth-header, content-type, curl timeout/method, xrpc path. Envelope maps + graph-cid stay host. ADR `ADR-260728-w6-persist-envelope-pure-oracle`.
+
+- **2026-07-28 murakumo#143:** **task.plan pure oracle expand** — `unschedulable-detail` dual-source reject string. ADR `ADR-260728-w6-task-unsched-pure-oracle`.
+
+- **2026-07-28 provider#38:** T8.3 **identity.sign inject** adapter (`identity-signer`) + empty-module Wasm fixture resource (ADR 0156). Production AOT Component still open.
+
 ## Next
 
 1. murakumo pure+adapter path **#61–#139**
@@ -162,7 +169,7 @@ fixture equality → shells remain on bb/nbb/JVM host.
 
 ## Next
 
-1. murakumo pure+adapter path **#61–#142** — product-shell pure dual-source complete including residual report/provision/cloud/crypto `.cljc` (#135), dash/deploy/provision pure expands (#136–#139), and reconcile flags (#140). Remaining: residual ops CLI ambient sites beyond #137 (config leave for HOME/bins already inject-friendly); residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5). Network/secret kits + signed receipt APIs landed (provider#34–#37); **production AOT signed Wasm** still pending. com-cloudflare #17 + com-cloudflare-compat #5 cljs dual-source landed.
+1. murakumo pure+adapter path **#61–#143** — product-shell pure dual-source complete including residual report/provision/cloud/crypto `.cljc` (#135), dash/deploy/provision pure expands (#136–#139), and reconcile flags (#140). Remaining: residual ops CLI ambient sites beyond #137 (config leave for HOME/bins already inject-friendly); residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5). Network/secret kits + signed receipt APIs landed (provider#34–#37); **production AOT signed Wasm** still pending. com-cloudflare #17 + com-cloudflare-compat #5 cljs dual-source landed.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#16 product-shell complete); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Deeper pure ports still dual-implemented where listed “Still host” (envelope maps, placement folds beyond wired subset, etc.); production compiler dependency remains avoided (resource path).
