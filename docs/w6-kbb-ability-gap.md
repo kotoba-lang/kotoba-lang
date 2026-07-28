@@ -32,7 +32,7 @@ separates **ops shells** from the JS backend.
 | `git` | status/log (read subcommands) | **dual-runtime + tooling cutover** (provider#29+#31+#32; murakumo#55) | medium | remaining scripts |
 | `secret-custody` | named secret fetch (no dump) | **ops cutover complete** (#48–#53 + CF#3) | high | optional live kagi inject |
 | `cloud-deploy` | Workers/Pages deploy verbs | missing | low | scripted publish |
-| `clock-and-random` | clock + CSPRNG | partial | medium | compat actor ids |
+| `clock-and-random` | clock + CSPRNG | **landed** (clock id 7 + entropy id 23 provider#33) | medium | — |
 
 ## Consumers
 
@@ -65,13 +65,12 @@ separates **ops shells** from the JS backend.
 - **2026-07-28 provider#31 / ADR 0149:** `git-transport/os-run` JVM production transport.
 - **2026-07-28 provider#32 / ADR 0150:** git cljs/nbb os-run (spawnSync + cwd).
 - **2026-07-28 murakumo#55:** deploy pin absolute git bin (no PATH).
+- **2026-07-28 provider#33 / ADR 0151:** `provider.entropy` id 23 CSPRNG draw + dual-runtime os-draw.
 
 ## Next
 
-1. **cloud-deploy** stays low priority ops.  
-2. clock/entropy kit completion (medium).  
-3. Optional remaining bare-`git` script audit outside deploy pin.
-
+1. **cloud-deploy** (low) — pure request builders / ops verbs under grant.  
+2. Optional remaining bare-`git` script audit outside deploy pin.
 ## 2026-07-28 update
 
 - **git kit** contract first slice: `provider.git` id **22** (ADR 0148) — pure

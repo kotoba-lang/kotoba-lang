@@ -66,6 +66,7 @@ These are **authority hosts**, not W6 product file ports.
 8. **cljs OS transports** — **landed** (provider#28 ADR 0147 spawnSync + Node fs).
 9. **SSH** — **host-forever** (`docs/w6-ssh-host-forever.md`).
 10. **git kit** — **dual-runtime + deploy tooling cutover** (provider#29+#31+#32; murakumo#55).
+11. **entropy kit** — **landed** (provider#33 id 23 CSPRNG; clock+random gap closed).
 
 ## Migration process (unchanged)
 
