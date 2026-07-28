@@ -297,7 +297,8 @@ Qualify vertical families in dependency order:
    **W5 deepen (2026-07-28, compiler / ADR 0142):** one-arm linear `if` + conditional get product path (`put-then-count-if` / `put-cas-then-count-if`). **Conditional get product path landed.**
    **W6 inventory first slice (2026-07-28):** design-system complete cohort + platform host-mechanism + next product verticals (murakumo/cloudflare/kotoba-script) classified in `lang/w6-migration-inventory.edn`.
 **W6 murakumo path inventory (2026-07-28):** `lang/w6-murakumo-path-inventory.edn` — pure planners (infer/task/gate/dash/token) vs SSH/nbb shells.
-Next: W6 murakumo pure-planner oracle cutover / cloudflare route inventory / kbb ability gap.
+**W6 murakumo pure-planner oracle first cutover (2026-07-28, murakumo#37):** `kotoba/kekkai_gate_core.kotoba` string parity vs `murakumo.kekkai.gate` (ledger default / status parse / denial line / authorized?).
+Next: W6 remaining pure planners (infer/task/dash) oracle / cloudflare route inventory / kbb ability gap.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -490,7 +491,8 @@ Next: W6 murakumo pure-planner oracle cutover / cloudflare route inventory / kbb
    **W5 deepen (2026-07-28, compiler / ADR 0142):** conditional get product path (one-arm linear if).
    **W6 inventory first slice (2026-07-28):** `lang/w6-migration-inventory.edn` + docs.
    **W6 murakumo path inventory (2026-07-28):** pure planners vs host shells classified.
-   Next: W6 murakumo pure-planner oracle cutover / cloudflare route inventory / kbb ability gap.
+   **W6 murakumo gate oracle (2026-07-28, murakumo#37):** kekkai_gate_core.kotoba parity landed.
+   Next: W6 remaining pure planners oracle / cloudflare route inventory / kbb ability gap.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
