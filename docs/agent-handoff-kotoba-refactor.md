@@ -55,6 +55,7 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 | T8.3 real non-fixture Wasm package pilot (hash-sha256) | provider#41 / ADR 0159 |
 | Reliability T1.2 required-backends matrix (manifest v2) | kotoba-lang (this PR) / ADR-reliability-t12 |
 | Reliability T1.3 dual-backend runner pilot (5 fixtures) | compiler#412 / ADR 0161 |
+| Reliability T1.3 pilot expand (7 cases, string kit) | compiler#414 / ADR 0163 |
 | pure allowlist wasm set (8) + host-grant digest binding | provider#42 / ADR 0160 |
 | kekkai ledger/dir/HOME via murakumo.config | murakumo#146 |
 | overlay cert MURAKUMO_KAGI_DIR via murakumo.config | murakumo#147 |
@@ -79,11 +80,11 @@ Product dual-source remains separate (this handoff §2); do not invent language 
 
 **R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412 T1.3 dual-backend pilot.
 
-Next language work: expand T1.3 pilot; T1.4 native; T4.2 string-split optional; T5.2 remainder (native guest record wire; call-record projection landed murakumo#155); T5.3 pack rewrites; residual PVA intentional.
+Next language work: T1.3 further matrix (pilot 7 dual-green #414); T1.4 native; T4.2 string-split optional; T5.2 native record wire; T5.3 pack rewrites; T8.3 ops AOT; residual PVA intentional.
 
 ### Plan Next (priority order)
 
-1. **Delivery residual** — product-shell pure dual-source complete (#122–#155); residual ops config inject closed (#137+#146+#147); residual PVA (schedule `eligible?` bit-pack intentional)
+1. **Delivery residual** — product-shell pure dual-source complete (#122–#156); residual ops config inject closed (#137+#146+#147); residual PVA (schedule `eligible?` bit-pack intentional)
 2. **T8.3 production AOT** — receipt APIs + package-manifest (#36–#40) + pure allowlist **8 real wasm packages + host-grant binding** (#41–#42 / ADR 0159–0160) landed; remaining: ops/network AOT Components + flip readiness `:signed-wasm :ready` only when production-admissible (host-admissible pure grants OK for reference)
 3. **wasm-aot packaging claims** — pure allowlist `:wasm-aot :partial` (all 8); ops kits stay `:pending`; host-admissible ≠ production-admissible (ADR 0160)
 4. **Host parity L5** — T8.4 **partial**: critical-import conformance fixtures expanded (45 cases) + resources sync; remaining live host runners (kototama/wasm-webcomponent)
