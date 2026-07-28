@@ -781,5 +781,5 @@ First packages: capability-math-sin#1, capability-math-cos#1 (wasm + JVM Math).
 **capability-random-bytes#1 (2026-07-28):** wasm xorshift fill + JVM `SecureRandom`; ABI `random_bytes` `(ptr,len)→i32`.
 **capability-data-cbor#1 (2026-07-28):** flat pairs → definite CBOR map; ABI `cbor_encode`.
 **capability-data-json#1 (2026-07-28):** flat pairs → JSON object + bounded field extract; ABI `json_encode`/`json_extract_field`.
-**Allowlist pure reference-implemented set complete.** **murakumo#61–#69** rebalance + infer.plan pure path (partition-3 walk, plan-fits-3, moe pick). Next: n≠3 plan maps / Delivery 5–8; network/secret caps remain contract-only.
+**Allowlist pure reference-implemented set complete.** **murakumo#61–#70** rebalance + infer.plan pure path + engine mlx-moe/launch/tensor-split strings. Next: n≠3 plan maps / head-cmd walks / Delivery 5–8; network/secret caps remain contract-only.
 
