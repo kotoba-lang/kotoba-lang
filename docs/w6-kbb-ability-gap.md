@@ -29,8 +29,8 @@ separates **ops shells** from the JS backend.
 | `scoped-filesystem` | read/write under declared roots | **dual-runtime OS transport** (provider#25+#28) | high | browser mounts N/A |
 | `process` | spawn/await bounded process | **dual-runtime OS transport** (provider#25+#28) | high | — |
 | `ssh-or-remote-exec` | remote exec without ambient OpenSSH | **host-forever** | high | murakumo fleet stays on nbb/bb |
-| `git` | status/log (+ optional worktree) | missing | medium | repo tooling scripts |
-| `secret-custody` | named secret fetch (no dump) | **ops secrets cut over** (murakumo#48+#50 + CF#3) | high | QUIC PEM path-ref; optional kagi |
+| `git` | status/log (read subcommands) | **contract + JVM os-run** (provider#29+#31) | medium | cljs os-run; tooling cutover |
+| `secret-custody` | named secret fetch (no dump) | **ops cutover complete** (#48–#53 + CF#3) | high | optional live kagi inject |
 | `cloud-deploy` | Workers/Pages deploy verbs | missing | low | scripted publish |
 | `clock-and-random` | clock + CSPRNG | partial | medium | compat actor ids |
 
@@ -59,13 +59,16 @@ separates **ops shells** from the JS backend.
 - **2026-07-28 provider#28 / ADR 0147:** cljs/nbb `os-spawn` + `os-store` (spawnSync / Node fs sync).
 - **2026-07-28:** SSH host-forever decision; secret getenv audit first pass.
 - **2026-07-28 murakumo#50:** remaining high-priority secrets (service/metrics/overlay auth-key).
+- **2026-07-28 murakumo#52:** cert store scoped path-ref + `secret/kagi-fetch`.
+- **2026-07-28 murakumo#53:** quic_driver cert/key path refs (no PEM-in-env).
+- **2026-07-28 provider#29 / ADR 0148:** `provider.git` id 22 validate-run + echo-transport.
+- **2026-07-28 provider#31 / ADR 0149:** `git-transport/os-run` JVM production transport.
 
 ## Next
 
-1. QUIC cert/key path-refs under scoped-fs (medium) — see [`w6-secret-getenv-audit.md`](w6-secret-getenv-audit.md).  
-2. Optional live **kagi** `fn-fetch` wire.  
-3. **git** kit first slice (medium) when tooling needs it.  
-4. **cloud-deploy** stays low priority ops.
+1. git tooling cutover / cljs os-run (medium).  
+2. **cloud-deploy** stays low priority ops.  
+3. clock/entropy kit completion (medium).
 
 ## 2026-07-28 update
 
