@@ -327,7 +327,7 @@ Qualify vertical families in dependency order:
 **W6 entropy kit (2026-07-28, provider#33 / ADR 0151):** id 23 CSPRNG draw; clock-and-random gap closed.
 **W6 cloud-deploy (2026-07-28, com-cloudflare#5–#10):** pure plans + oracles + module multipart + Pages bulk + path oracle.
 **W6 bare-git audit (2026-07-28, murakumo#58):** absolute git-bin only.
-Next: product verticals / Delivery 5–8; W6 kbb gaps complete; pure capability reference-impl: sin/cos/sha256/clock/time/random landed — remaining allowlist `data/cbor` `data/json` (definition CID identity: agent-handoff + ADR-capability-repository-semantic-cid-v1).
+Next: product verticals / Delivery 5–8; crypto/host shells; production signed providers for network/secret; wasm-aot packaging claims. W6 kbb gaps complete; pure capability allowlist reference-impl complete (sin/cos/sha256/cbor/json/clock/random/now-days; definition CID identity: agent-handoff + ADR-capability-repository-semantic-cid-v1).
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -539,7 +539,7 @@ Next: product verticals / Delivery 5–8; W6 kbb gaps complete; pure capability 
    **W6 QUIC path-ref + kagi-fetch + git dual-runtime/tooling (2026-07-28, murakumo#52+#53+#55 + provider#29+#31+#32).**
    **W6 entropy kit (2026-07-28, provider#33 / ADR 0151):** CSPRNG id 23; clock-and-random landed.
    **W6 cloud-deploy complete + pages-bulk oracle + bare-git audit (2026-07-28, com-cloudflare#5–#10 + murakumo#58).**
-   Next: product verticals / Delivery 5–8 (W6 kbb gaps complete; clock/time/random reference-impl landed).
+   Next: product verticals / Delivery 5–8; crypto/host shells; production signed network/secret providers; wasm-aot packaging claims (W6 kbb gaps complete; pure capability allowlist reference-impl complete including cbor/json).
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
