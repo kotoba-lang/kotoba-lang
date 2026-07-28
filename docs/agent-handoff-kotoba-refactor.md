@@ -178,8 +178,11 @@ Contract only → **reference-implemented** (pure allowlist):
 | capability-math-sin | [#1](https://github.com/kotoba-lang/capability-math-sin/pull/1) | wasm core `sin` + JVM `Math/sin` |
 | capability-math-cos | [#1](https://github.com/kotoba-lang/capability-math-cos/pull/1) | wasm core `cos` + JVM `Math/cos` |
 | capability-hash-sha256 | [#1](https://github.com/kotoba-lang/capability-hash-sha256/pull/1) | wasm core `sha256_hex` + JVM `MessageDigest` |
+| capability-clock-monotonic | [#1](https://github.com/kotoba-lang/capability-clock-monotonic/pull/1) | wasm counter + JVM `System/nanoTime` |
+| capability-time-now-days | [#1](https://github.com/kotoba-lang/capability-time-now-days/pull/1) | wasm stub + JVM UTC day counter |
+| capability-random-bytes | [#1](https://github.com/kotoba-lang/capability-random-bytes/pull/1) | wasm xorshift + JVM `SecureRandom` |
 
-Next pure targets on the allowlist: `data/cbor`, `data/json`, `clock/monotonic`, `random/bytes`, `time/now-days`.  
+Next pure targets on the allowlist: `data/cbor`, `data/json` only.  
 Network/secret caps stay contract-only until signed production providers exist.
 
 ## 8. 2026-07-28 follow-through
@@ -189,3 +192,5 @@ Network/secret caps stay contract-only until signed production providers exist.
 | QUIC cert path-ref under scoped roots | murakumo#52 |
 | kagi-fetch wire | murakumo#52 |
 | git kit id 22 (ADR 0148) | provider#29 |
+| secret name/policy pure oracle | murakumo#60 |
+| clock/time/random reference-impl | capability-*-#1 |
