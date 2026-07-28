@@ -57,7 +57,7 @@ These are **authority hosts**, not W6 product file ports.
 ## Next actions
 
 1. **Path-level murakumo inventory** — **landed**: [`docs/w6-murakumo-path-inventory.md`](w6-murakumo-path-inventory.md) / `lang/w6-murakumo-path-inventory.edn`.
-2. **Murakumo pure-planner oracles** — landed gate#37 / infer-plan#38 / dash-state#39 / task-plan#40; remaining token/engine.
+2. **Murakumo pure-planner oracles** — landed gate#37 / infer-plan#38 / dash-state#39 / task-plan#40 / token#41; remaining infer/engine.
 3. **Cloudflare route inventory** — separate route product from mechanism adapters after ingress soak.
 4. **kbb ability gap list** — explicit blockers for kotoba-script ← nbb cutover.
 
