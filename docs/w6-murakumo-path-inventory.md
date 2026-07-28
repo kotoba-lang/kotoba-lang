@@ -76,9 +76,10 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#63:** `pool-demand-pack` + `seats-from-pool-pack` + `classify-run-flags` map-fold compose.
 - **2026-07-28 murakumo#64:** `demand-inc` class-pack reduce + `demand-to-pool-pack` (demand-from-runs fold).
 - **2026-07-28 murakumo#65:** placement pure layer — workers/seats-for-online/hysteresis/node-online?/move-needed/reason.
+- **2026-07-28 murakumo#66:** seat-order assignment — seat-order-pack/take-end/pipeline-note/reason-detail.
 
 ## Next
 
-1. murakumo rebalance pure path largely complete (#61–#65). Remaining: node-id assignment vectors / full moves-between maps / crypto/host shells.
+1. murakumo rebalance pure path complete through seat-order assignment (#61–#66). Remaining: concrete node-id vectors / moves-between maps / crypto/host shells.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
