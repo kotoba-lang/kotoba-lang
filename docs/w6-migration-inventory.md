@@ -43,7 +43,7 @@ These are **authority hosts**, not W6 product file ports.
 | murakumo | blocked-by-provider | state/LLM/governor/checkpoint product cutover |
 | murakumo-studio | blocked-by-provider | follows murakumo |
 | com-cloudflare | blocked-by-provider | path inventory landed; pure request/parse candidates; live token host |
-| com-cloudflare-compat | host-mechanism | adapter keep (pure routes optional later) |
+| com-cloudflare-compat | host-mechanism | adapter keep; coerce/path oracle landed (#2) |
 | kotoba-script | blocked-by-language | KIR→mjs backend; ops nbb until kbb gaps close |
 | kami-engine-script-runtime | host-mechanism | adapter |
 
@@ -69,6 +69,7 @@ These are **authority hosts**, not W6 product file ports.
 11. **entropy kit** — **landed** (provider#33 id 23 CSPRNG; clock+random gap closed).
 12. **cloud-deploy** — **complete** (com-cloudflare#5–#9 including Pages bulk Direct Upload).
 13. **bare-git audit** — **closed** (murakumo#58 absolute git-bin only).
+14. **cloudflare-compat oracle** — **coerce/path first slice** (com-cloudflare-compat#2).
 
 ## Migration process (unchanged)
 
