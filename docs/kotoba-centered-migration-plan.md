@@ -309,7 +309,8 @@ Qualify vertical families in dependency order:
 **W6 cloudflare analytics+paths oracle (2026-07-28, com-cloudflare#2):** `analytics_core` + `workers_path_core` GraphQL/REST string parity.
 **W6 process+scoped-fs contract (2026-07-28, provider#24 / ADR 0143):** capability ids 19/20; mem-store + echo-transport; pure path/spawn policy.
 **W6 process+scoped-fs OS transports (2026-07-28, provider#25 / ADR 0144):** os-spawn (:binaries) + os-store (:roots); no ambient PATH/FS.
-Next: W6 secret-custody ops wiring / cljs OS transports / optional medium murakumo pure planners.
+**W6 secret-custody contract (2026-07-28, provider#26 / ADR 0145):** id 21 get-only allowlist + env-fetch/map-fetch (no dump).
+Next: W6 ops CLI secret cutover / cljs OS transports / optional medium murakumo pure planners.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -514,7 +515,8 @@ Next: W6 secret-custody ops wiring / cljs OS transports / optional medium muraku
    **W6 cloudflare analytics+paths oracle (2026-07-28, com-cloudflare#2):** analytics/path string cores.
    **W6 process+scoped-fs contract (2026-07-28, provider#24 / ADR 0143):** ids 19/20 first slice.
    **W6 process+scoped-fs OS transports (2026-07-28, provider#25 / ADR 0144):** os-spawn + os-store.
-   Next: W6 secret-custody / cljs OS transports / optional medium pure planners.
+   **W6 secret-custody contract (2026-07-28, provider#26 / ADR 0145):** secret id 21 get-only.
+   Next: W6 ops CLI secret cutover / cljs OS transports / optional medium pure planners.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
