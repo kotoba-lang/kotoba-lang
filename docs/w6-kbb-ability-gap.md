@@ -26,11 +26,11 @@ separates **ops shells** from the JS backend.
 
 | id | ability | status | priority | blocks |
 |---|---|---|---|---|
-| `scoped-filesystem` | read/write under declared roots | **OS transport landed** (provider#25 os-store) | high | cljs mounts still open |
-| `process` | spawn/await bounded process | **OS transport landed** (provider#25 os-spawn) | high | cljs spawn / SSH still open |
-| `ssh-or-remote-exec` | remote exec without ambient OpenSSH | missing | high | murakumo fleet SSH (may stay host forever) |
+| `scoped-filesystem` | read/write under declared roots | **dual-runtime OS transport** (provider#25+#28) | high | browser mounts N/A |
+| `process` | spawn/await bounded process | **dual-runtime OS transport** (provider#25+#28) | high | — |
+| `ssh-or-remote-exec` | remote exec without ambient OpenSSH | **host-forever** | high | murakumo fleet stays on nbb/bb |
 | `git` | status/log (+ optional worktree) | missing | medium | repo tooling scripts |
-| `secret-custody` | named secret fetch (no dump) | **host transports + ops cutover** (provider#27 + murakumo#48 + com-cloudflare#3) | high | remaining ambient getenv call-sites; live kagi wire |
+| `secret-custody` | named secret fetch (no dump) | **host transports + ops cutover + audit** | high | remaining secret getenv sites |
 | `cloud-deploy` | Workers/Pages deploy verbs | missing | low | scripted publish |
 | `clock-and-random` | clock + CSPRNG | partial | medium | compat actor ids |
 
@@ -38,14 +38,13 @@ separates **ops shells** from the JS backend.
 
 | repo | surfaces | needs |
 |---|---|---|
-| **murakumo** | `ops.cljs`, `task/*`, `core.clj`, `ssh.clj` | process, ssh, scoped-fs, secrets |
+| **murakumo** | `ops.cljs`, `task/*`, `core.clj`, `ssh.clj` | process, ssh(host), scoped-fs, secrets |
 | **kotoba-script** | future kbb driver (not current mjs backend) | fs, process, git, secrets, deploy |
 | **kami-engine-script-runtime** | host adapter | process, scoped-fs |
 
 ## Policy
 
-1. **Do not** move murakumo SSH fleet shells into guest until process+ssh are
-   qualified — W6 murakumo inventory may keep them host-mechanism permanently.  
+1. **SSH fleet exec is host-forever** — see [`w6-ssh-host-forever.md`](w6-ssh-host-forever.md).  
 2. Guest product cutovers use **provider kits**, not kbb.  
 3. nbb/bb remain authorized ops hosts while gaps are open.  
 4. Close a gap only with conformance evidence + inventory status flip.
@@ -54,16 +53,15 @@ separates **ops shells** from the JS backend.
 
 - **2026-07-28 provider#24 / ADR 0143:** `provider.process` (id 20) + `provider.scoped-fs` (id 19) contract first slice (mem/echo transports, pure policy).
 - **2026-07-28 provider#25 / ADR 0144:** `process-transport/os-spawn` + `scoped-fs-transport/os-store` (host `:binaries` / `:roots`; no PATH/CWD defaults).
-
-## Progress (continued)
-
 - **2026-07-28 provider#26 / ADR 0145:** `provider.secret` (id 21) get-only allowlist + `env-fetch`/`map-fetch` (no dump).
 - **2026-07-28 provider#27 / ADR 0146:** `fn-fetch` (kagi/one-shot) + `keychain-fetch` (single-item `-w` only).
 - **2026-07-28 murakumo#48 + com-cloudflare#3:** ops CLI named-secret cutover for token HMAC + `CLOUDFLARE_API_TOKEN`.
+- **2026-07-28 provider#28 / ADR 0147:** cljs/nbb `os-spawn` + `os-store` (spawnSync / Node fs sync).
+- **2026-07-28:** SSH host-forever decision; secret getenv audit first pass.
 
 ## Next
 
-1. **cljs/nbb** OS spawn + root-mount transports (sync contract).  
-2. Decide **ssh forever-host** vs kit.  
-3. Audit remaining murakumo ambient getenv call-sites; optional live kagi `fn-fetch` wire.  
-4. Close secret-custody gap only after broader call-site evidence.
+1. Cut over remaining **secret** getenv sites (`MURAKUMO_SERVICE_TOKEN`, metrics token, overlay auth-key) — see [`w6-secret-getenv-audit.md`](w6-secret-getenv-audit.md).  
+2. Optional live **kagi** `fn-fetch` wire.  
+3. **git** kit first slice (medium) when tooling needs it.  
+4. **cloud-deploy** stays low priority ops.
