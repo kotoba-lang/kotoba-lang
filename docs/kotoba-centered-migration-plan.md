@@ -783,3 +783,4 @@ First packages: capability-math-sin#1, capability-math-cos#1 (wasm + JVM Math).
 **capability-data-json#1 (2026-07-28):** flat pairs → JSON object + bounded field extract; ABI `json_encode`/`json_extract_field`.
 **Allowlist pure reference-implemented set complete.** **murakumo#61–#122** pure+adapter path — **full product-shell KIR catalog (32 cores) + all portable pure hosts dual-source wired** (overlay-driver/runtime #113; Product Value ABI v1 #112–#121; cljs/nbb oracle load #122). Next: Delivery 5–8 remaining shells / residual PVA (schedule eligible? bit-pack intentional) / incremental cljs host rewire; network/secret caps remain contract-only.
 
+**Language reliability parity WBS (2026-07-28):** see [`docs/kotoba-reliability-parity-wbs.md`](./kotoba-reliability-parity-wbs.md) (T1–T10 / R1–R4 toward CLJ-class predictability without ambient Clojure).
