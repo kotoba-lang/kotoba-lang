@@ -281,9 +281,9 @@ Qualify vertical families in dependency order:
    production cljs/nbb storage transport (spawnSync hops). **Family 4
    production cljs transport intermediate evidence now present. Production
    cljs transports complete for HTTP + LLM + storage.**
-   **W5 deepen ADR 0120–0125:** :bytes leaf + object/http get-stream ready/pending/
-   joined multi-chunk + true chunk-queue multi-chunk on reference + nbb dual-runtime.
-   Next: guest poll/read ops / progressive live push / product apps.
+   **W5 deepen ADR 0120–0126:** :bytes leaf + object/http get-stream ready/pending/
+   joined multi-chunk + chunk-queue + progressive open-stream live push on
+   reference + nbb dual-runtime. Next: guest poll/read ops / product apps.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -425,7 +425,12 @@ Qualify vertical families in dependency order:
    producer chunk without pre-join (atomic chunk vs max-bytes). Reference + nbb
    dual-runtime (9+9). **True multi-chunk producer first slice landed
    (host-side; not guest poll/read, not progressive live push).**
-   Next: guest poll/read ops / progressive live push / product apps.
+   **W5 deepen (2026-07-28, kotoba-kir#16 + provider#20 + compiler#393 / ADR 0126):**
+   progressive live push via \`{:open-stream true}\` — host \`stream-enqueue!\` /
+   \`stream-close!\` while consumer polls empty+open as \`pending?\`. Reference +
+   nbb (10+10). **Progressive open-stream first slice landed (host-side;
+   not guest poll/read/enqueue language ops, not blocking wait).**
+   Next: guest poll/read ops / product apps.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
@@ -485,8 +490,8 @@ Qualify vertical families in dependency order:
    compiler#360 / ADR 0095):** reference + nbb vectors for the write path —
    `:object/put-block` + `:object/compare-and-set-ref` (binding allowlist,
    bounded payload as host string, bool results, redaction, denial). Linear
-   Component v0.3 keeps linear handle ABI; **ADR 0120–0125 :bytes + object/http
-   get-stream ready/pending/joined multi-chunk/chunk-queue on reference + nbb.** **Reference
+   Component v0.3 keeps linear handle ABI; **ADR 0120–0126 :bytes + object/http
+   get-stream ready/pending/joined multi-chunk/chunk-queue/open-stream on reference + nbb.** **Reference
    dual-runtime now also covers stream-object write ops.**
    **W5 stream-object write-path wasm (2026-07-27, kotoba-component#53 +
    compiler#361 / ADR 0096):** synthetic dual-export
