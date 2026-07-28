@@ -34,7 +34,7 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 | W5 product verticals (put/get/CAS/conditional) | **0140–0142** |
 | W6 inventories | murakumo / cloudflare / kbb gap |
 | W6 murakumo pure-planners **high** | **6/6** (#37–#42) |
-| W6 murakumo pure-planners **medium+** | **largely complete** (#61–#81: rebalance, plan partition n≠3/n>3, engine strings, report, schedule/task assign, credits, dash; ~31 `kotoba/*_core.kotoba`) |
+| W6 murakumo pure-planners **medium+** | **complete through #87** (#61–#87: pure cores + host-shell rows + token/overlay crypto packaging + live HMAC/AES adapters + kekkai product-shell KIR authority) |
 | W6 cloudflare pure-request / deploy oracles | client / stream / analytics / deploy / pages (com-cloudflare) |
 | W6 kbb ability gaps | **COMPLETE** (process / scoped-fs / secret / git / entropy / cloud-deploy; SSH host-forever) |
 | W6 process / scoped-fs / secret / git / entropy kits | provider ADR **0143–0151** (ids 19–23; cljs OS transports landed) |
@@ -43,10 +43,12 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 
 ### Plan Next (priority order)
 
-1. **Crypto / host shells** — HMAC and other host-bound crypto wiring where pure oracles already exist
-2. **Delivery 5–8 product shells** — wire pure oracles into real entrypoints (product vertical cutover, not new DSL)
+1. **Expand product-shell oracles** — more verticals beyond kekkai.gate (#86 pattern: precompiled KIR + host delegate)
+2. **Delivery 5–8 remaining shells** — continue wiring pure oracles into real entrypoints (not new DSL)
 3. **Production signed providers** for network / secret capabilities (leave pure allowlist alone; signed content-addressed Wasm)
 4. **wasm-aot packaging claims** — packaging / AOT path honesty vs remaining host shells
+
+**Landed 2026-07-28:** live HMAC/AES host adapters (#87); kekkai product-shell KIR authority (#86).
 
 ### Do not
 
@@ -197,5 +199,5 @@ Network/secret caps stay contract-only until signed production providers exist.
 | kagi-fetch wire | murakumo#52 |
 | git kit id 22 (ADR 0148) | provider#29 |
 | secret name/policy pure oracle | murakumo#60 |
-| rebalance + plan + engine + report pure path | murakumo#61–#85 |
+| rebalance + plan + engine + report pure path | murakumo#61–#87 |
 | clock/time/random reference-impl | capability-*-#1 |

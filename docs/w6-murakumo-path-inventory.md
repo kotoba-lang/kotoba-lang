@@ -95,9 +95,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#82:** host-shell pure — report `nodes-row`/`status-row`/`pad-to` + tunnel `parse-digits`/conn-opts strings.
 - **2026-07-28 murakumo#83:** token wire pure — `encode-claims-json` / `wire-token` / `constant-time-eq` (HMAC host remains).
 - **2026-07-28 murakumo#85:** identity JWT/op-token templates + `overlay_crypto_core` packaging (alg/nonce/tag/fields/b64 pad); AES-GCM seal/open host.
+- **2026-07-28 murakumo#86:** product-shell oracle authority — precompiled KIR for `kekkai.gate` + `murakumo.kotoba.oracle` loader (Delivery surface first vertical).
+- **2026-07-28 murakumo#87:** live HMAC + AES host adapters — token pure wire on `sign`/`verify`; overlay.crypto packaging gates on `open`.
 
 ## Next
 
-1. murakumo pure path #61–#85 complete (incl. identity templates + overlay crypto packaging). Remaining: Delivery 5–8 surface / live HMAC·AES host adapters / network·secret caps contract-only.
+1. murakumo pure+host-adapter path #61–#87 complete (incl. live HMAC/AES + kekkai product-shell authority). Remaining: expand product-shell oracles to more verticals / Delivery 5–8 remaining shells / network·secret caps contract-only.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
