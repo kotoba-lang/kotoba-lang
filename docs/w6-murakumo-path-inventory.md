@@ -90,9 +90,10 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#77:** `infer_plan_core` n≠3 plan maps — partition-1/2-ends + plan-fits-1/2 + asg-row-pack (host attaches node ids).
 - **2026-07-28 murakumo#78:** task expand `task-id`/assign-task-step-2 + credits multi-unit/share-floor pure.
 - **2026-07-28 murakumo#79:** schedule `assign-step-3` / `assign-pick-3` / `apply-pick-3` pure 3-node job batch step.
+- **2026-07-28 murakumo#80:** n>3 host-fold — `partition-step`/`partition-last`/`fits-and` + `pick-fold-step`/`queue-inc-if`.
 
 ## Next
 
-1. murakumo pure-planner path #61–#79 complete (incl. assign-step-3). Remaining: n>3 assign/partition reduce / crypto/host shells.
+1. murakumo pure-planner path #61–#80 complete (incl. n>3 host-fold reduce). Remaining: crypto/host shells / Delivery 5–8 surface.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
