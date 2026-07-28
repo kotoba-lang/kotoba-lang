@@ -62,7 +62,7 @@ These are **authority hosts**, not W6 product file ports.
 4. **kbb ability gap list** — **landed**: [`docs/w6-kbb-ability-gap.md`](w6-kbb-ability-gap.md) / `lang/w6-kbb-ability-gap.edn`.
 5. **Cloudflare pure-request oracle** — high-priority string cores **complete** (#1 stream, #2 analytics+paths).
 6. **Qualify process + scoped-fs kits** — **OS transports landed** (provider#24+#25); cljs remains.
-7. **Secret-custody** — **contract first slice** (provider#26 id 21); ops CLI cutover remains.
+7. **Secret-custody** — **host transports + first ops cutover** (provider#27 fn/keychain; murakumo#48 + com-cloudflare#3); remaining getenv audit open.
 
 ## Migration process (unchanged)
 
