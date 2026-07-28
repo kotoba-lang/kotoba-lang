@@ -69,9 +69,10 @@ EDN equality on request maps / parse fixtures → HTTP + token remain host.
 - **2026-07-28 com-cloudflare#6:** `kotoba/deploy_core.kotoba` validators / paths / plan constants / wrangler argv parity.
 - **2026-07-28 com-cloudflare#7:** Workers ES-module multipart put plan + live upload (ADR 0005).
 - **2026-07-28 com-cloudflare#8:** `deploy_core` module validate + multipart encode oracle (ADR 0006).
+- **2026-07-28 com-cloudflare-compat#2:** `kotoba/compat_core.kotoba` coerce/path/limit oracle (ADR 0001).
 
 ## Next
 
 1. Optional analytics parse tallies (map reduce) — guest `map-*` exists; still optional product work.  
-2. Optional Pages bulk asset deploy over REST (wrangler argv remains the ops path).  
-3. murakumo pure-planner scalar oracles complete (#37–#57); remaining cljc is map/vector/crypto/host shells.
+2. murakumo pure-planner scalar oracles complete (#37–#57); remaining cljc is map/vector/crypto/host shells.  
+3. compat handlers/store remain host; WASM L5 packaging still blocked.
