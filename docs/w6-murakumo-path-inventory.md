@@ -75,9 +75,10 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#61:** `infer_rebalance_core` 3-pool `largest-remainder-3` map-fold oracle (first beyond scalars).
 - **2026-07-28 murakumo#63:** `pool-demand-pack` + `seats-from-pool-pack` + `classify-run-flags` map-fold compose.
 - **2026-07-28 murakumo#64:** `demand-inc` class-pack reduce + `demand-to-pool-pack` (demand-from-runs fold).
+- **2026-07-28 murakumo#65:** placement pure layer — workers/seats-for-online/hysteresis/node-online?/move-needed/reason.
 
 ## Next
 
-1. murakumo map-folds: largest-remainder + pool-demand + classify + demand-from-runs landed (#61/#63/#64). Remaining: placement moves / capacity filter / crypto/host shells.
+1. murakumo rebalance pure path largely complete (#61–#65). Remaining: node-id assignment vectors / full moves-between maps / crypto/host shells.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.

@@ -781,5 +781,5 @@ First packages: capability-math-sin#1, capability-math-cos#1 (wasm + JVM Math).
 **capability-random-bytes#1 (2026-07-28):** wasm xorshift fill + JVM `SecureRandom`; ABI `random_bytes` `(ptr,len)→i32`.
 **capability-data-cbor#1 (2026-07-28):** flat pairs → definite CBOR map; ABI `cbor_encode`.
 **capability-data-json#1 (2026-07-28):** flat pairs → JSON object + bounded field extract; ABI `json_encode`/`json_extract_field`.
-**Allowlist pure reference-implemented set complete.** **murakumo#61/#63** map-fold verticals (`largest-remainder-3`, `pool-demand-pack`, `classify-run-flags`). Next: further map folds / Delivery 5–8; network/secret caps remain contract-only.
+**Allowlist pure reference-implemented set complete.** **murakumo#61–#65** rebalance product path (LR/pool/demand folds + placement pure layer). Next: further map folds / Delivery 5–8; network/secret caps remain contract-only.
 

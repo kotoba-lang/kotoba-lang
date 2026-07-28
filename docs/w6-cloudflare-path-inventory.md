@@ -76,6 +76,6 @@ EDN equality on request maps / parse fixtures → HTTP + token remain host.
 
 ## Next
 
-1. murakumo map-folds: largest-remainder (#61) + pool-demand/classify (#63).  
+1. murakumo rebalance pure path #61–#65 (LR/pool/demand/placement math).  
 2. compat handlers/store remain host; WASM L5 packaging still blocked.  
-3. Further product shells / full demand-from-runs reduce / placement moves still open.
+3. Node-id placement vectors / moves maps remain host; other product verticals open.
