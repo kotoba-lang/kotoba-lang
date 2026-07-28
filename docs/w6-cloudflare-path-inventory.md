@@ -76,6 +76,6 @@ EDN equality on request maps / parse fixtures → HTTP + token remain host.
 
 ## Next
 
-1. murakumo pure scalars through secret (#37–#60); first map-fold `largest-remainder-3` landed (murakumo#61).  
+1. murakumo map-folds: largest-remainder (#61) + pool-demand/classify (#63).  
 2. compat handlers/store remain host; WASM L5 packaging still blocked.  
-3. Further product shells / map folds (demand-from-runs, placement moves) still open.
+3. Further product shells / full demand-from-runs reduce / placement moves still open.
