@@ -143,9 +143,12 @@ fixture equality → shells remain on bb/nbb/JVM host.
 
 - **2026-07-28 murakumo#135:** **cljs dual-source residual JVM `.clj` pure shells** — `report` / `provision.plan` / `cloud.plan` / `overlay.crypto` → `.cljc` try-oracle dual-source; AES seal/open stays JVM. ADR `ADR-260728-w6-cljs-clj-residual-dual`.
 
+- **2026-07-28 murakumo#136:** **dash.state pure oracle expand** — probe parse (links/line key-value) + response constants (content-type/http-ok/health labels). `probe-command` stays host (SSH host-forever). ADR `ADR-260728-w6-dash-probe-pure-oracle`.
+- **2026-07-28 murakumo#137:** **residual ops config inject** — exact-name non-secret config centralized on `murakumo.config` (cloud/api/text/ckpt/bin/infer/git/driver); wired orchestrate/gateway/media/relay/core pin/transport. Secrets stay named fetch. ADR `ADR-260728-w6-ops-config-inject`.
+
 ## Next
 
-1. murakumo pure+adapter path **#61–#135** — product-shell pure dual-source complete including residual report/provision/cloud/crypto `.cljc` (#135). Remaining: Delivery 5–8 ops CLI shells / residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5). Network/secret **reference kit packages** landed (provider#34); signed Wasm packages still pending. com-cloudflare #17 + com-cloudflare-compat #5 cljs dual-source landed.
+1. murakumo pure+adapter path **#61–#135** — product-shell pure dual-source complete including residual report/provision/cloud/crypto `.cljc` (#135). Remaining: residual ops CLI ambient sites beyond #137 (config leave for HOME/bins already inject-friendly); residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5). Network/secret **reference kit packages** landed (provider#34); signed Wasm packages still pending. com-cloudflare #17 + com-cloudflare-compat #5 cljs dual-source landed.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#16 product-shell complete); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Deeper pure ports still dual-implemented where listed “Still host” (envelope maps, placement folds beyond wired subset, etc.); production compiler dependency remains avoided (resource path).
