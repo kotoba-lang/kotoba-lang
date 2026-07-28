@@ -133,8 +133,9 @@ exists.
 2. Fuel is **not replenishable** unless a profile explicitly says otherwise.  
 3. Deep recursion without true tail support may exhaust fuel or stack — authors must
    prefer bounded loops / iterative designs (see WBS T7).  
-4. Fuel charge rules (per op class) are detailed in `docs/lang/fuel-model.md` when T7.2
-   lands; until then treat fuel as “small pure functions succeed; adversarial depth fails closed.”
+4. Fuel charge rules are detailed in [`docs/lang/fuel-model.md`](./fuel-model.md) (T7.2):
+   **1 unit per function entry**, default budget **512**, non-replenishable, trap
+   `:fuel-exhausted`. Small pure functions succeed; adversarial depth fails closed.
 
 ---
 

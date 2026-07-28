@@ -81,7 +81,9 @@ Product dual-source remains separate (this handoff §2); do not invent language 
 
 **R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#415 T1.3 dual-backend pilot (**12** dual-green, string-ops surface complete).
 
-Next language work: T1.3 full matrix (collections still admission-blocked); T1.4 native; T4.2 string-split optional; T4.4/T5 record cookbook; T5.2 native record wire; T5.3 pack rewrites; T8.3 ops AOT; residual PVA intentional.
+Next language work: T1.3 full matrix (collections still admission-blocked); T1.4 native; T4.2 string-split optional; T4.4/T5 record cookbook; T5.2 native record wire; T5.3 pack rewrites; T7.1 true tail; T8.3 ops AOT; residual PVA intentional.
+
+**T7.2 fuel model:** [`docs/lang/fuel-model.md`](./lang/fuel-model.md) (1 unit/function entry, default 512).
 
 ### Plan Next (priority order)
 

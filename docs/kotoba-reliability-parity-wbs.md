@@ -136,7 +136,7 @@ compiler / KIR / wasm / native / legacy path skew.
 | ID | Task | Owner repo(s) | Deliverable | Depends | Estimate |
 |---|---|---|---|---|---|
 | T7.1 | `loop`/`recur` true tail on KIR + wasm (legacy runtime parity if still used) | **compiler**, **kotoba-kir**, **kotoba-wasm** | Spec + tests | roadmap | L |
-| T7.2 | Fuel model doc: charge rules, defaults, per-module budgets | **kotoba-lang**, **kotoba-kir** | `docs/lang/fuel-model.md` | T1.1 | S |
+| T7.2 | Fuel model doc: charge rules, defaults, per-module budgets — **landed** (`docs/lang/fuel-model.md`; 1 unit/function entry, default 512) | **kotoba-lang**, **kotoba-kir** | `docs/lang/fuel-model.md` | T1.1 | S |
 | T7.3 | `kotoba fuel-estimate` or compile-time crude cost attribute (optional) | **compiler** | Best-effort tool | T7.2 | M |
 | T7.4 | Conformance: tail recursion 10k iterations within fuel envelope | **compiler** | Regression | T7.1 | S |
 
