@@ -30,7 +30,7 @@ separates **ops shells** from the JS backend.
 | `process` | spawn/await bounded process | **dual-runtime OS transport** (provider#25+#28) | high | — |
 | `ssh-or-remote-exec` | remote exec without ambient OpenSSH | **host-forever** | high | murakumo fleet stays on nbb/bb |
 | `git` | status/log (read subcommands) | **dual-runtime + tooling cutover** (provider#29+#31+#32; murakumo#55) | medium | remaining scripts |
-| `secret-custody` | named secret fetch (no dump) | **ops cutover complete** (#48–#53 + CF#3) | high | optional live kagi inject |
+| `secret-custody` | named secret fetch (no dump) | **ops cutover + name oracle** (#48–#53 + #60 + CF#3) | high | optional live kagi inject |
 | `cloud-deploy` | Workers/Pages deploy verbs | **complete + oracle** (com-cloudflare#5–#10) | low | — |
 | `clock-and-random` | clock + CSPRNG | **landed** (clock id 7 + entropy id 23 provider#33) | medium | — |
 
@@ -61,6 +61,7 @@ separates **ops shells** from the JS backend.
 - **2026-07-28 murakumo#50:** remaining high-priority secrets (service/metrics/overlay auth-key).
 - **2026-07-28 murakumo#52:** cert store scoped path-ref + `secret/kagi-fetch`.
 - **2026-07-28 murakumo#53:** quic_driver cert/key path refs (no PEM-in-env).
+- **2026-07-28 murakumo#60 / ADR:** `secret_core.kotoba` name/env + path-ref policy oracle.
 - **2026-07-28 provider#29 / ADR 0148:** `provider.git` id 22 validate-run + echo-transport.
 - **2026-07-28 provider#31 / ADR 0149:** `git-transport/os-run` JVM production transport.
 - **2026-07-28 provider#32 / ADR 0150:** git cljs/nbb os-run (spawnSync + cwd).
