@@ -25,3 +25,16 @@ clojure -M:test -n kotoba.lang.version-policy-test \
 The report is stable-order data suitable for CI and tooling rather than
 human-only prose. The protected release workflow remains part of the global
 release hard gate; it does not weaken this compatibility contract.
+
+## Operational gates (T10.1–T10.3)
+
+| Gate | Command / artifact |
+|---|---|
+| Policy + current release | `clojure -M:compatibility` |
+| Explicit triple | `clojure -M:compatibility 4 1 0.4.0` |
+| CI | `.github/workflows/ci.yml` uploads `compatibility-report.edn` |
+| Tag content | binds include `:language-profile` (see `lang/version-policy.edn`) |
+| Release notes | mention `lang/surface-status.edn` / surface-matrix when surface changes |
+
+Current release binds **language-profile 4** (active) and package-contract **1**.
+

@@ -82,9 +82,9 @@ Authoritative work breakdown (repos, tasks, sequencing, agent guide):
 Tiers R1–R4: semantic conformance → stdlib/records → standalone run → toolchain/LTS.
 Product dual-source remains separate (this handoff §2); do not invent language features in product PRs.
 
-**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#416 T1.3 dual-backend pilot (**13** dual-green), **T1.5 golden digests** (compiler#418), T2.2 surface-matrix, T2.4 ambient corpus (compiler#417), T5.4 max-parameters=5, T6.3 tool-vs-runtime, T7.2 fuel model.
+**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#418 T1.3/T1.5 pilot+goldens (**13** dual-green), T2.2/T2.4, T5.4 max-parameters=5, T6.1 standalone (wasmtime primary), T6.3 tool-vs-runtime, T7.2 fuel, **T10.1–T10.3** release/compatibility gates.
 
-Next language work: T1.3 full matrix (collections still admission-blocked); T1.4 native; T4.2 string-split optional; T4.4 typed-map pilot; T5.2 native record wire; T5.3 pack rewrites; T6.1 standalone run; T7.1 true tail; T8.3 ops AOT; residual PVA intentional.
+Next language work: T1.3 full matrix (collections still admission-blocked); T1.4 native pilot; T4.2 string-split optional; T4.4 typed-map pilot; T5.2 native record wire; T5.3 pack rewrites; T7.1 true tail; T8.3 ops AOT; residual PVA intentional.
 
 **T7.2 fuel model:** [`docs/lang/fuel-model.md`](./lang/fuel-model.md) (1 unit/function entry, default 512).
 **T1.5 goldens:** compiler#418 / ADR 0167 — `clojure -M:conformance --check-golden`.
@@ -94,6 +94,8 @@ Next language work: T1.3 full matrix (collections still admission-blocked); T1.4
 **T4.5 collections costs:** [`docs/lang/collections-costs.md`](./lang/collections-costs.md).
 **T5.4 max-parameters:** keep **5** ([ADR-reliability-t54](./adr/ADR-reliability-t54-max-parameters.md)).
 **T6.3 tool vs runtime:** [ADR-reliability-t63](./adr/ADR-reliability-t63-tool-vs-runtime.md).
+**T6.1 standalone run:** [`docs/lang/standalone-run.md`](./lang/standalone-run.md) (wasmtime primary).
+**T10 compatibility:** `clojure -M:compatibility` (profile 4 / release 0.4.0).
 
 ### Plan Next (priority order)
 

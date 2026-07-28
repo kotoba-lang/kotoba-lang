@@ -225,3 +225,5 @@ external consumer — `json` ← `http` and `langchain` (a real vertical), `spec
 ← `test`, `async`/`time`/`coll` ← `scheduler`, `fs`/`io`/`wit` ← `store`,
 `fmt`/`lsp` ← `lint`. `registry` is deferred to the `:packages` CID-lock
 track.
+
+**Standalone run (T6.1):** [`standalone-run.md`](./standalone-run.md).
