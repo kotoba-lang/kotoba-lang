@@ -281,8 +281,8 @@ Qualify vertical families in dependency order:
    production cljs/nbb storage transport (spawnSync hops). **Family 4
    production cljs transport intermediate evidence now present. Production
    cljs transports complete for HTTP + LLM + storage.**
-   **W5 deepen ADR 0120:** runtime :bytes leaf type + object put-block field
-   type. Next: task/stream dual-runtime / product apps.
+   **W5 deepen ADR 0120/0121:** :bytes leaf + get-stream ready-task dual-runtime.
+   Next: http/get-stream / product apps.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -402,8 +402,12 @@ Qualify vertical families in dependency order:
    **W5 deepen (2026-07-27, kotoba-kir#12 + provider#15 + compiler#387 / ADR 0120):**
    runtime \`:bytes\` leaf type (JVM byte[] / cljs Uint8Array); object put-block
    field type is \`:bytes\` (closes ADR 0095 string workaround). **Reference-path
-   \`:bytes\` admitted; get-stream dual-runtime still needs task/stream values.**
-   Next: task/stream dual-runtime / more product apps.
+   \`:bytes\` admitted.**
+   **W5 deepen (2026-07-27, kotoba-kir#13 + provider#16 + compiler#388 / ADR 0121):**
+   host \`[:task [:stream :bytes]]\` / \`[:stream :bytes]\` + object get-stream
+   (id 14) dual-runtime ready-task → stream-read. **Reference dual-runtime
+   covers stream-object write + get-stream ready-task.**
+   Next: http/get-stream dual-runtime / pending→ready scheduling / product apps.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
@@ -463,7 +467,7 @@ Qualify vertical families in dependency order:
    compiler#360 / ADR 0095):** reference + nbb vectors for the write path —
    `:object/put-block` + `:object/compare-and-set-ref` (binding allowlist,
    bounded payload as host string, bool results, redaction, denial). Linear
-   get-stream / bytes-task ownership stays on Component v0.3; **ADR 0120 admits runtime :bytes leaf (put-block uses it).** **Reference
+   Component v0.3 keeps linear handle ABI; **ADR 0120 :bytes leaf + ADR 0121 get-stream ready-task dual-runtime on reference path.** **Reference
    dual-runtime now also covers stream-object write ops.**
    **W5 stream-object write-path wasm (2026-07-27, kotoba-component#53 +
    compiler#361 / ADR 0096):** synthetic dual-export
