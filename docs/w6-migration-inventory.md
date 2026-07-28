@@ -60,7 +60,7 @@ These are **authority hosts**, not W6 product file ports.
 2. **Murakumo pure-planner oracles** — high-priority complete (gate#37 … engine#42).
 3. **Cloudflare path inventory** — **landed**: [`docs/w6-cloudflare-path-inventory.md`](w6-cloudflare-path-inventory.md) / `lang/w6-cloudflare-path-inventory.edn`.
 4. **kbb ability gap list** — **landed**: [`docs/w6-kbb-ability-gap.md`](w6-kbb-ability-gap.md) / `lang/w6-kbb-ability-gap.edn`.
-5. **Cloudflare pure-request oracle** — stream validate/redact + analytics parse.
+5. **Cloudflare pure-request oracle** — stream **landed** (com-cloudflare#1); remaining analytics parse.
 6. **Qualify process + scoped-fs kits** — high-priority kbb gaps.
 
 ## Migration process (unchanged)
