@@ -781,6 +781,6 @@ First packages: capability-math-sin#1, capability-math-cos#1 (wasm + JVM Math).
 **capability-random-bytes#1 (2026-07-28):** wasm xorshift fill + JVM `SecureRandom`; ABI `random_bytes` `(ptr,len)→i32`.
 **capability-data-cbor#1 (2026-07-28):** flat pairs → definite CBOR map; ABI `cbor_encode`.
 **capability-data-json#1 (2026-07-28):** flat pairs → JSON object + bounded field extract; ABI `json_encode`/`json_extract_field`.
-**Allowlist pure reference-implemented set complete.** **murakumo#61–#133** pure+adapter path — **full product-shell KIR catalog (32 cores) + portable .cljc pure hosts dual-source complete** (cljs #122–#133 including residual infer plan/engine/rebalance/credits). Next: Delivery 5–8 remaining shells / residual PVA; network/secret caps remain contract-only.
+**Allowlist pure reference-implemented set complete.** **murakumo#61–#133** pure+adapter path — **full product-shell KIR catalog (32 cores) + portable .cljc pure hosts dual-source complete** (cljs #122–#133 including residual infer plan/engine/rebalance/credits). com-cloudflare cljs dual-source #17 landed. Next: Delivery 5–8 remaining shells / residual PVA; network/secret caps remain contract-only.
 
 **Language reliability parity WBS (2026-07-28):** see [`docs/kotoba-reliability-parity-wbs.md`](./kotoba-reliability-parity-wbs.md) (T1–T10 / R1–R4 toward CLJ-class predictability without ambient Clojure).
