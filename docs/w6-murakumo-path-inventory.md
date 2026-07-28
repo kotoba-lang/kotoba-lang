@@ -95,11 +95,12 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#82:** host-shell pure — report `nodes-row`/`status-row`/`pad-to` + tunnel `parse-digits`/conn-opts strings.
 - **2026-07-28 murakumo#83:** token wire pure — `encode-claims-json` / `wire-token` / `constant-time-eq` (HMAC host remains).
 - **2026-07-28 murakumo#85:** identity JWT/op-token templates + `overlay_crypto_core` packaging (alg/nonce/tag/fields/b64 pad); AES-GCM seal/open host.
-- **2026-07-28 murakumo#86:** product-shell oracle authority — precompiled KIR for `kekkai.gate` + `murakumo.kotoba.oracle` loader (Delivery surface first vertical).
-- **2026-07-28 murakumo#87:** live HMAC + AES host adapters — token pure wire on `sign`/`verify`; overlay.crypto packaging gates on `open`.
+- **2026-07-28 murakumo#86:** **product-shell oracle authority** (first dual-source cutover) — `murakumo.kekkai.gate` JVM public API delegates pure helpers to precompiled KIR (`resources/murakumo/oracle/kekkai_gate_core.kir.edn`) via `murakumo.kotoba.oracle` + `kotoba-kir`/`ir/execute`. Compiler stays test-only; CI drift gate regenerates with `murakumo.kotoba-oracle-gen`. ADR `ADR-260728-w6-product-shell-oracle-authority`.
+- **2026-07-28 murakumo#87:** live HMAC + AES host adapters — token pure wire (`encode-claims-json`/`signing-input`/`wire-token`/`constant-time=`) on live `sign`/`verify`; overlay.crypto packaging gates on `open` (AES-GCM Cipher stays host).
 
 ## Next
 
-1. murakumo pure+host-adapter path #61–#87 complete (incl. live HMAC/AES + kekkai product-shell authority). Remaining: expand product-shell oracles to more verticals / Delivery 5–8 remaining shells / network·secret caps contract-only.
+1. murakumo pure+adapter path **#61–#87** complete (kekkai product-shell KIR + live HMAC/AES adapters). Remaining: expand product-shell catalog (token claims, report pad) / Delivery 5–8 remaining shells / network·secret caps contract-only / cljs oracle load optional.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
+4. Full pure-planner cutover still dual-implemented until each core is wired like #86 (or bulk generate); blocked on production compiler (avoid) / kbb in-process load (future optional).
