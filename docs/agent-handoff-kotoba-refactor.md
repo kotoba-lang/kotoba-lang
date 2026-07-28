@@ -54,6 +54,7 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 | package-manifest + production blockers | provider#40 / ADR 0158 |
 | T8.3 real non-fixture Wasm package pilot (hash-sha256) | provider#41 / ADR 0159 |
 | Reliability T1.2 required-backends matrix (manifest v2) | kotoba-lang (this PR) / ADR-reliability-t12 |
+| Reliability T1.3 dual-backend runner pilot (5 fixtures) | compiler#412 / ADR 0161 |
 | pure allowlist wasm set (8) + host-grant digest binding | provider#42 / ADR 0160 |
 | kekkai ledger/dir/HOME via murakumo.config | murakumo#146 |
 | overlay cert MURAKUMO_KAGI_DIR via murakumo.config | murakumo#147 |
@@ -76,9 +77,9 @@ Authoritative work breakdown (repos, tasks, sequencing, agent guide):
 Tiers R1–R4: semantic conformance → stdlib/records → standalone run → toolchain/LTS.
 Product dual-source remains separate (this handoff §2); do not invent language features in product PRs.
 
-**R1 immediate trio landed** (#295 semantics-ssot, #411 pure-product + error codes).
+**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412 T1.3 dual-backend pilot.
 
-Next language work: T1.3 dual-backend runner (T1.2 matrix landed), T4 stdlib, T5 records (see WBS).
+Next language work: expand T1.3 pilot toward full pure-product matrix; T1.4 native; T4 stdlib; T5 records (see WBS).
 
 ### Plan Next (priority order)
 
