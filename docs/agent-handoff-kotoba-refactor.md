@@ -202,7 +202,7 @@ Network/secret caps stay contract-only until signed production providers exist.
 | git kit id 22 (ADR 0148–0150) | provider#29+#31+#32 |
 | entropy kit id 23 (ADR 0151) | provider#33 |
 | secret name/policy pure oracle | murakumo#60 |
-| rebalance + plan + engine + report pure path | murakumo#61–#84 |
+| rebalance + plan + engine + report pure path | murakumo#61–#91 |
 | identity JWT + overlay crypto packaging oracle | murakumo#85 |
 | product-shell oracle authority (kekkai.gate dual-source) | murakumo#86 |
 | live HMAC/AES host adapters | murakumo#87 |
