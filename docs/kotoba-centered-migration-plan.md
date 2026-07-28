@@ -281,8 +281,9 @@ Qualify vertical families in dependency order:
    production cljs/nbb storage transport (spawnSync hops). **Family 4
    production cljs transport intermediate evidence now present. Production
    cljs transports complete for HTTP + LLM + storage.**
-   **W5 deepen ADR 0120/0121:** :bytes leaf + get-stream ready-task dual-runtime.
-   Next: product apps / pending→ready scheduling.
+   **W5 deepen ADR 0120/0121/0122/0123:** :bytes leaf + object/http get-stream
+   ready-task + pending→ready (`task-fulfill!`) + multi-chunk join on reference
+   path. Next: guest poll/read ops / true async multi-chunk / product apps.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -410,7 +411,12 @@ Qualify vertical families in dependency order:
    **W5 deepen (2026-07-27, provider#17 + compiler#389 / ADR 0122):**
    \`:http/get-stream\` (id 13) dual-runtime ready-task (url+headers, exact-origin,
    stream-read). **Reference dual-runtime covers object + http get-stream.**
-   Next: pending→ready scheduling / multi-chunk / product apps.
+   **W5 deepen (2026-07-28, kotoba-kir#14 + provider#18 + compiler / ADR 0123):**
+   pending→ready via \`task-fulfill!\` + multi-chunk join (\`{:pending true}\` /
+   \`{:chunks [...]}\` transport replies) for object (id 14) and http (id 13)
+   get-stream on the reference path. **Pending scheduling + multi-chunk first
+   slice landed (host-side; not guest poll/read, not true async producers).**
+   Next: guest poll/read ops / true async multi-chunk / product apps.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
@@ -470,7 +476,8 @@ Qualify vertical families in dependency order:
    compiler#360 / ADR 0095):** reference + nbb vectors for the write path —
    `:object/put-block` + `:object/compare-and-set-ref` (binding allowlist,
    bounded payload as host string, bool results, redaction, denial). Linear
-   Component v0.3 keeps linear handle ABI; **ADR 0120 :bytes leaf + ADR 0121 get-stream ready-task dual-runtime on reference path.** **Reference
+   Component v0.3 keeps linear handle ABI; **ADR 0120–0123 :bytes + object/http
+   get-stream ready/pending/multi-chunk on reference path.** **Reference
    dual-runtime now also covers stream-object write ops.**
    **W5 stream-object write-path wasm (2026-07-27, kotoba-component#53 +
    compiler#361 / ADR 0096):** synthetic dual-export
