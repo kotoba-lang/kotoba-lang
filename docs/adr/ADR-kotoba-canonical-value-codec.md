@@ -1,6 +1,6 @@
 # ADR — Canonical value codec for EDN data identity
 
-- **Status**: Proposed — VC0–VC4 implemented, VC5 outstanding
+- **Status**: Accepted — VC0–VC5 implemented
 - **Date**: 2026-07-28
 - **Artifacts**: `lang/value-codec.edn`,
   `kotoba-lang/io-ipld:src/ipld/value.cljc`,
@@ -271,7 +271,7 @@ stage VC5 below adds no permission that stage VC0 did not already have.
 | VC2 | `io-ipld` `encode-value`/`decode-value` | existing node `encode`/`decode` callers unchanged | implemented |
 | VC3 | `arrangement` leaf values on the codec, `schema-version` 2, declared migration | a v1 snapshot either migrates or is rejected with a named reason; never reinterpreted | implemented |
 | VC4 | `semantic-code` delegates literals; float literals admitted; contract identity names the codec | v1 definition CIDs still verify under the v1 contract | implemented |
-| VC5 | `:data-host-arg` lowering and typed host decode for structured arguments | constants only; no runtime construction; capability rules unchanged | pending |
+| VC5 | `:data-host-arg` lowering and typed host decode for structured arguments | constants only; no runtime construction; capability rules unchanged | implemented |
 
 VC4 also fixed two defects it uncovered rather than working around them: a
 quoted form was not data (`'[a b]` recursed through `normalize-expr`, resolving
@@ -285,6 +285,18 @@ the reader preserves float-ness (JVM). On ClojureScript a source `1.0` and a
 source `1` are the same runtime value, so a non-integral literal is rejected
 rather than guessed — fail-closed, never two encodings for one source program.
 
-With VC5 outstanding, the design remains **proposed**: structured host
-arguments still cross the boundary as opaque strings under the 127-byte
-portable-string bound.
+VC5 lands the host-argument lowering on the existing `bytes-ptr`/`bytes-len`
+path: `memory-layout` runs after `lower-language-forms` and already lays out
+every all-integer vector literal as a data segment, so no new emit machinery
+was required.  The host distinguishes the two wire forms by first byte, and the
+discriminator is exact rather than heuristic — every value encodes as a CBOR
+2-element array whose head byte is `0x82`, and `0x82` is a UTF-8 *continuation*
+byte, so no valid UTF-8 text and therefore no valid EDN text can begin with it.
+An all-integer vector is deliberately excluded from the new lowering: it is
+already the raw-byte literal, and re-encoding it would change the bytes an
+existing guest hands its host.
+
+All six stages are implemented, so the design is **accepted**.  What remains is
+not part of this decision: `kotobase-peer`'s `cold-datoms` must decode
+version-2 leaves before it bumps its `arrangement` pin, and exact i64 still
+needs a BigInt-aware payload.
