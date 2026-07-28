@@ -281,14 +281,15 @@ Qualify vertical families in dependency order:
    production cljs/nbb storage transport (spawnSync hops). **Family 4
    production cljs transport intermediate evidence now present. Production
    cljs transports complete for HTTP + LLM + storage.**
-   **W5 deepen ADR 0120–0135:** :bytes leaf + object/http get-stream ready/pending/
+   **W5 deepen ADR 0120–0136:** :bytes leaf + object/http get-stream ready/pending/
    joined multi-chunk + chunk-queue + progressive open-stream + guest poll/read
    ops + production HTTP/object transports + object/http get-stream wasm packaging
    + put+get product vertical packaging + host linear resource table + intermediate
    CM packaging linear resource table (get→poll→read→drop) + full CM
-   `resource bytes-task` packaging (ADR 0135) on
+   `resource bytes-task` packaging (ADR 0135) + multi-step Wasmtime of CM resources
+   (get→poll-ready→body-len→drop; ADR 0136) on
    reference + nbb dual-runtime.
-   Next: fuller product apps / Wasmtime multi-step of CM resources / guest move typing.
+   Next: fuller product apps / guest move typing.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -468,11 +469,12 @@ Qualify vertical families in dependency order:
    multi-step Wasmtime sum 2 (not full CM `resource` types).
    **W5 deepen (2026-07-28, kotoba-component#76 + compiler#402 / ADR 0135):** full CM
    `resource bytes-task` packaging (own return + methods; wasm-tools validate + WIT
-   surface). Wasmtime multi-step of CM resources not claimed.
-      multi-step Wasmtime length 2. **Packaging table first slice landed
-   (free-function multi-step).**
-   **ADR 0135** adds full CM `resource` packaging validate evidence.
-   Next: fuller product apps / Wasmtime multi-step of CM resources / guest move typing.
+   surface).
+   **W5 deepen (2026-07-28, kotoba-component#77 + compiler / ADR 0136):** correct
+   cm32p2 export-resource ABI (`bytes-task_new` import + dtor) + multi-step
+   Wasmtime get→poll-ready→body-len→drop (body length 2). **CM resource
+   multi-step execution evidence now present.**
+   Next: fuller product apps / guest move typing.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
@@ -532,11 +534,11 @@ Qualify vertical families in dependency order:
    compiler#360 / ADR 0095):** reference + nbb vectors for the write path —
    `:object/put-block` + `:object/compare-and-set-ref` (binding allowlist,
    bounded payload as host string, bool results, redaction, denial). Linear
-   Component v0.3 keeps linear handle ABI; **ADR 0120–0135 :bytes + object/http
+   Component v0.3 keeps linear handle ABI; **ADR 0120–0136 :bytes + object/http
    get-stream ready/pending/joined multi-chunk/chunk-queue/open-stream + guest
    poll/read + production transports + packaging + put+get product vertical +
    host linear resource table + packaging linear resource table + full CM
-   resource packaging
+   resource packaging + multi-step Wasmtime of CM resources
    on reference + nbb.** **Reference dual-runtime now also covers stream-object write ops.**
 
 
