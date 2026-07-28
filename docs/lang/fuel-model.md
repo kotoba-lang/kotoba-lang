@@ -118,9 +118,7 @@ not be reintroduced on one backend only.
 
 | Item | WBS |
 |---|---|
-| True `loop`/`recur` tail on KIR + wasm | T7.1 |
-| Compile-time crude fuel estimate tool | T7.3 |
-| Conformance: 10k tail iterations within envelope | T7.4 |
+| Zero-charge `recur` / machine TCO (arbitrary fns) | T7.1 residual |
 | Per-op / weighted charging | not planned; would need ADR + dual-backend rewrite |
 
 ---
@@ -136,10 +134,15 @@ not be reintroduced on one backend only.
 | `compiler` `examples/fuel.kotoba` | fact / forever demo |
 | `lang/surface-status.edn` | transform helper fuel 128 |
 
-## loop / recur (T7.1)
+## loop / recur (T7.1 / T7.4)
 
-`loop`/`recur` desugar to a **named helper** that self-calls. Each iteration is a
-**function entry** and charges **1 fuel unit** (same as any call). Dual-backend
-pilot kits prove KIR + wasm agreement. Machine-level TCO (zero-charge recur /
-frame reuse) is **not** claimed yet.
+`loop`/`recur` desugar to a **named helper** (`__kotoba_loop_N`) that self-calls.
+Each iteration is a **function entry** and charges **1 fuel unit** (same as any
+call). Dual-backend pilot kits prove KIR + wasm agreement.
+
+**T7.4 (landed):** `:loop-deep-kit` runs **10_000** iterations with case
+`:fuel 12000` (compiler#424). KIR trampolines self-calls on the
+`__kotoba_loop_N` stack tip so host JVM stack does not grow (kotoba-kir#21+#22);
+wasm already handled deep self-calls under raised fuel. **Zero-charge recur /
+machine TCO** is still open.
 
