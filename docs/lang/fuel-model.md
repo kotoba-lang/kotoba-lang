@@ -140,9 +140,9 @@ not be reintroduced on one backend only.
 Each iteration is a **function entry** and charges **1 fuel unit** (same as any
 call). Dual-backend pilot kits prove KIR + wasm agreement.
 
-**T7.4 (landed):** `:loop-deep-kit` runs **10_000** iterations with case
-`:fuel 12000` (compiler#424). KIR trampolines self-calls on the
-`__kotoba_loop_N` stack tip so host JVM stack does not grow (kotoba-kir#21+#22);
-wasm already handled deep self-calls under raised fuel. **Zero-charge recur /
-machine TCO** is still open.
+**T7.4 + T7.1 (landed):** `:loop-deep-kit` runs **10_000** iterations with case
+`:fuel 16` (compiler#428). KIR trampolines + **zero-charges** self-tail re-entry
+of `__kotoba_loop_N`; wasm omits fuel prologue on those helpers. First helper
+entry still costs 1 unit. Arbitrary non-helper TCO still open; hosts must
+wall-clock-bound infinite loops.
 
