@@ -71,6 +71,7 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#57:** `overlay_peer_core` + `overlay_driver_core` pure oracles.
 - **2026-07-28 murakumo#59:** `component_authority_core.kotoba` identifier/epoch/sequence pure oracle.
 - **2026-07-28 murakumo#60:** `secret_core.kotoba` name/env constants + env/path-ref policy oracle.
+- **2026-07-28 murakumo#62:** `report_core` extended with remaining pure ops lines.
 - **2026-07-28 murakumo#61:** `infer_rebalance_core` 3-pool `largest-remainder-3` map-fold oracle (first beyond scalars).
 
 ## Next
