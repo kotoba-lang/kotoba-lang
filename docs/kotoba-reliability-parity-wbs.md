@@ -45,7 +45,7 @@ compiler / KIR / wasm / native / legacy path skew.
 |---|---|---|---|---|---|
 | T1.1 | Author `docs/lang/semantics-ssot.md` (values, evaluation, fuel, errors, capability call) | **kotoba-lang** | Accepted prose SSoT; points at executable suites | — | M |
 | T1.2 | Expand `lang/conformance/manifest.edn` to list **required** backends per case class — **landed** (v2 matrix + `conformance-matrix` + tests; ADR-reliability-t12) | **kotoba-lang** | Machine-readable matrix | T1.1 | S |
-| T1.3 | Implement/extend runner: each case runs on **KIR + wasm32-kotoba-v1** minimum — **pilot expanded** (compiler#412+#414 / ADR 0161+0163; **7** pure-product dual-green incl. string-join/from-i64; full matrix progressive) | **compiler**, **kotoba-kir**, **kotoba-wasm** | `clojure -M:conformance` green on both | T1.2 | L |
+| T1.3 | Implement/extend runner: each case runs on **KIR + wasm32-kotoba-v1** minimum — **pilot expanded** (compiler#412+#414+#415 / ADR 0161+0163+0164; **12** pure-product dual-green = control5 + full string-ops surface; full matrix progressive) | **compiler**, **kotoba-kir**, **kotoba-wasm** | `clojure -M:conformance` green on both | T1.2 | L |
 | T1.4 | Add native (x86_64/aarch64) cases for pure i64/string/option subset | **compiler**, **kotoba-native** | Profile `pure-native-v1` cases | T1.3 | L |
 | T1.5 | Golden digests for IR + selected artifact bytes (where policy allows) | **compiler**, **artifact** | CI fails on silent semantic drift | T1.3 | M |
 
