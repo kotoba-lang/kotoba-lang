@@ -95,9 +95,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#82:** host-shell pure — report `nodes-row`/`status-row`/`pad-to` + tunnel `parse-digits`/conn-opts strings.
 - **2026-07-28 murakumo#83:** token wire pure — `encode-claims-json` / `wire-token` / `constant-time-eq` (HMAC host remains).
 - **2026-07-28 murakumo#85:** identity JWT/op-token templates + `overlay_crypto_core` packaging (alg/nonce/tag/fields/b64 pad); AES-GCM seal/open host.
+- **2026-07-28 murakumo#86:** **product-shell oracle authority** (first dual-source cutover) — `murakumo.kekkai.gate` JVM public API delegates pure helpers to precompiled KIR (`resources/murakumo/oracle/kekkai_gate_core.kir.edn`) via `murakumo.kotoba.oracle` + `kotoba-kir`/`ir/execute`. Compiler stays test-only; CI drift gate regenerates with `murakumo.kotoba-oracle-gen`. ADR `ADR-260728-w6-product-shell-oracle-authority`.
 
 ## Next
 
-1. murakumo pure path #61–#85 complete (incl. identity templates + overlay crypto packaging). Remaining: Delivery 5–8 surface / live HMAC·AES host adapters / network·secret caps contract-only.
+1. murakumo pure path #61–#85 complete; **#86 opens product-shell authority wiring** (kekkai.gate vertical). Repeat catalog+wire for next high-traffic pure helpers (token claims/scope, report pad/header). Remaining: Delivery 5–8 surface / live HMAC·AES host adapters / network·secret caps / cljs oracle load.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
+4. Full pure-planner cutover still dual-implemented until each core is wired like #86 (or bulk generate); blocked on production compiler (avoid) / kbb in-process load (future optional).
