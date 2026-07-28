@@ -42,7 +42,7 @@ These are **authority hosts**, not W6 product file ports.
 |---|---|---|
 | murakumo | blocked-by-provider | state/LLM/governor/checkpoint product cutover |
 | murakumo-studio | blocked-by-provider | follows murakumo |
-| com-cloudflare | blocked-by-provider | path inventory landed; pure request/parse candidates; live token host |
+| com-cloudflare | blocked-by-provider | path inventory landed; pure request/query oracles through #13; live token host |
 | com-cloudflare-compat | host-mechanism | adapter keep; coerce/path oracle landed (#2) |
 | kotoba-script | blocked-by-language | KIR→mjs backend; ops nbb until kbb gaps close |
 | kami-engine-script-runtime | host-mechanism | adapter |
@@ -60,7 +60,7 @@ These are **authority hosts**, not W6 product file ports.
 2. **Murakumo pure-planner oracles** — high-priority complete (gate#37 … engine#42).
 3. **Cloudflare path inventory** — **landed**: [`docs/w6-cloudflare-path-inventory.md`](w6-cloudflare-path-inventory.md) / `lang/w6-cloudflare-path-inventory.edn`.
 4. **kbb ability gap list** — **landed**: [`docs/w6-kbb-ability-gap.md`](w6-kbb-ability-gap.md) / `lang/w6-kbb-ability-gap.edn`.
-5. **Cloudflare pure-request oracle** — string cores + parse tallies + client URL **complete** (#1–#2, #11–#12).
+5. **Cloudflare pure-request oracle** — string cores + parse tallies + client URL + zones query **complete** (#1–#2, #4, #11–#13).
 6. **Qualify process + scoped-fs kits** — **OS transports landed** (provider#24+#25); cljs remains.
 7. **Secret-custody** — **ops cutover complete** (murakumo#48+#50+#52+#53; com-cloudflare#3; kagi-fetch wire).
 8. **cljs OS transports** — **landed** (provider#28 ADR 0147 spawnSync + Node fs).
