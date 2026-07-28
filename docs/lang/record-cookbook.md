@@ -68,10 +68,13 @@ Evidence: compiler#416 / ADR 0165 — `clojure -M:conformance` includes this cas
 
 ## 3. Typed-map (limited)
 
-`[:map K V]` / typed-map helpers exist in broader surface tests but **literal
-typed-map construction is not the pure-product default path**. Prefer records
-for public pure exports until a dual-backend typed-map pilot lands in the T1.3
-runner.
+**Dual-backend pilot landed** (compiler#426 / ADR 0176, case `typed-map-kit`):
+bounded `[:map :i64 :i64]` with `typed-map-new` / `assoc` / `count` / `get` +
+`if-some` / `contains` / `equal`.
+
+Prefer **records** for public pure-product exports with named fields; use
+typed-map when a small homogeneous key→value table is the natural shape.
+Keyword keys and large/heterogeneous maps remain out of the pure-product default.
 
 ---
 
