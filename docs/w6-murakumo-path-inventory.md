@@ -148,35 +148,26 @@ fixture equality → shells remain on bb/nbb/JVM host.
 
 - **2026-07-28 murakumo#138:** **deploy.plan pure oracle expand** — execution-observed?/count-command, release-wit-path, stop-forward-command, absolute-unix-git-bin?. Windows drive absolute git stays host. ADR `ADR-260728-w6-deploy-probe-pure-oracle`.
 
-- **2026-07-28 murakumo#139:** **provision.plan pure oracle expand** — launch/peer/watchdog shell pure fragments. ADR provision shell pure.
+- **2026-07-28 murakumo#139:** **provision.plan pure oracle expand** — launch/peer/watchdog shell pure fragments. ADR `ADR-260728-w6-provision-shell-pure-oracle`.
 
-- **2026-07-28 provider#36–#37:** T8.3 signed **kit EDN** receipts (#36 / ADR 0154) + signed **Wasm provider receipt API** (#37 / ADR 0155, fixture digest only). Production AOT Component + readiness `:signed-wasm` still pending.
-
+- **2026-07-28 murakumo#140:** **reconcile.plan pure oracle expand** — missing-manifest?, action-is-satisfied?/place?, flag classifiers, watch-seconds, snapshot-value. parse-flags reduce fold stays host. ADR `ADR-260728-w6-reconcile-flags-pure-oracle`.
 
 - **2026-07-28 murakumo#141:** **persist pure oracle expand** — operation-create, write-ok-marker, auth-header, content-type, curl timeout/method, xrpc path. Envelope maps + graph-cid stay host. ADR `ADR-260728-w6-persist-envelope-pure-oracle`.
 
-- **2026-07-28 murakumo#143:** **task.plan pure oracle expand** — `unschedulable-detail` dual-source reject string. ADR `ADR-260728-w6-task-unsched-pure-oracle`.
-
-- **2026-07-28 provider#38:** T8.3 **identity.sign inject** adapter (`identity-signer`) + empty-module Wasm fixture resource (ADR 0156). Production AOT Component still open.
-
-
-- **2026-07-28 murakumo#144:** **tunnel + secret pure expand** — pick-exit/trim-err; secret kit-reply classify/error-code/message. ADR `ADR-260728-w6-tunnel-secret-result-pure-oracle`.
-
-- **2026-07-28 provider#39:** Ed25519 identity-signer inject **proven** (test-only org-ietf-ed25519). ADR 0157.
-
-- **2026-07-28 kotoba-lang T8.4 partial:** host-parity L5 critical conformance fixtures (45 expanded cases) + resources sync. ADR-w6-t84-host-parity-critical-fixtures.
-
-## Next
-
-1. murakumo pure+adapter path **#61–#139**
-- **2026-07-28 murakumo#140:** **reconcile.plan pure oracle expand** — missing-manifest?, action-is-satisfied?/place?, flag classifiers, watch-seconds, snapshot-value. parse-flags reduce fold stays host. ADR `ADR-260728-w6-reconcile-flags-pure-oracle`.
-
-
 - **2026-07-28 murakumo#142:** **cloud.plan pure oracle expand** — `webtransport-endpoint` + `transport-endpoint` dual-source. ADR `ADR-260728-w6-cloud-endpoint-pure-oracle`.
 
+- **2026-07-28 murakumo#143:** **task.plan pure oracle expand** — `unschedulable-detail` dual-source reject string. ADR `ADR-260728-w6-task-unsched-pure-oracle`.
+
+- **2026-07-28 murakumo#144:** **tunnel result + secret kit-reply pure** — `pick-exit`/`trim-err` for sh-result/scp-result; `secret-error-code`/`secret-error-message`/`reply-is-value?` wired into map-fetch/fn-fetch via classify-fetched. ADR `ADR-260728-w6-tunnel-secret-result-pure-oracle`.
+
+- **2026-07-28 provider#36–#39:** T8.3 signed **kit EDN** (#36 / ADR 0154) + signed **Wasm receipt API** (#37 / ADR 0155) + **identity.sign inject** (#38 / ADR 0156) + **Ed25519 inject proof** (#39 / ADR 0157). Production AOT Component + readiness `:signed-wasm` still pending.
+
+- **2026-07-28 kotoba-lang T8.4 partial:** host-parity L5 critical conformance fixtures + resources sync. ADR-w6-t84-host-parity-critical-fixtures.
+
 ## Next
 
-1. murakumo pure+adapter path **#61–#144** — product-shell pure dual-source complete including residual report/provision/cloud/crypto `.cljc` (#135), dash/deploy/provision pure expands (#136–#139), and reconcile flags (#140). Remaining: residual ops CLI ambient sites beyond #137 (config leave for HOME/bins already inject-friendly); residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5). Network/secret kits + signed receipt APIs landed (provider#34–#37); **production AOT signed Wasm** still pending. com-cloudflare #17 + com-cloudflare-compat #5 cljs dual-source landed.
-2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#16 product-shell complete); compat coerce/path oracle (#2).
-3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
-4. Deeper pure ports still dual-implemented where listed “Still host” (envelope maps, placement folds beyond wired subset, etc.); production compiler dependency remains avoided (resource path).
+1. **murakumo product-shell pure dual-source is complete** through **#144** (cljs #122–#135, residual `.clj` shells #135, pure expands #136–#144, ops config inject #137). Remaining murakumo work is thin: optional HOME/bin config leave; residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5); deeper “Still host” folds (envelope maps, placement sorts, SSH subprocess).
+2. **Production AOT signed Wasm** for network/secret (kits + signed receipt APIs landed provider#34–#39; readiness `:signed-wasm` still pending).
+3. Cloudflare pure-request + deploy + parse + client cores landed (#1–#16 product-shell complete); compat coerce/path oracle (#2); cljs dual-source #17 / compat #5 landed.
+4. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
+5. Production compiler dependency remains avoided (resource path / precompiled KIR). Language reliability parity T1.2+ (see WBS).
