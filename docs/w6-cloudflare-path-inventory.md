@@ -76,6 +76,6 @@ EDN equality on request maps / parse fixtures → HTTP + token remain host.
 
 ## Next
 
-1. murakumo rebalance pure path #61–#65 (LR/pool/demand/placement math).  
+1. murakumo rebalance #61–#66 + infer.plan partition #67.  
 2. compat handlers/store remain host; WASM L5 packaging still blocked.  
-3. Node-id placement vectors / moves maps remain host; other product verticals open.
+3. Full partition-layers walk / node-id plan maps remain host; other verticals open.
