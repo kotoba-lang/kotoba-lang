@@ -68,5 +68,5 @@ EDN equality on request maps / parse fixtures → HTTP + token remain host.
 ## Next
 
 1. Optional analytics parse tallies (map reduce) if guest maps land.  
-2. process + scoped-fs kit qualification (kbb high-priority gaps).  
+2. process + scoped-fs **contract first slice landed** (provider#24); OS transports remain.  
 3. Optional medium murakumo pure planners.
