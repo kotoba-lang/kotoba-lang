@@ -74,7 +74,7 @@ Next language work: T1.2 conformance matrix, T1.3 dual-backend runner, T4 stdlib
 ### Plan Next (priority order)
 
 1. **Delivery residual** — product-shell pure dual-source complete (#122–#144); optional HOME/bin config leave; residual PVA (schedule `eligible?` bit-pack intentional)
-2. **T8.3 production AOT** — signed kit EDN (#36) + signed Wasm **receipt API** (#37 / ADR 0155) landed; remaining: real content-addressed Component packages + readiness `:signed-wasm :ready` for HTTP/secret
+2. **T8.3 production AOT** — signed kit EDN (#36) + signed Wasm **receipt API** (#37) + identity inject (#38–#39) landed; remaining: real content-addressed Component packages + readiness `:signed-wasm :ready` for HTTP/secret
 3. **wasm-aot packaging claims** — still pending honesty (ADR 0152–0155); do not claim ready from fixture receipts
 4. **Host parity L5** — T8.4 **partial**: critical-import conformance fixtures expanded (45 cases) + resources sync; remaining live host runners (kototama/wasm-webcomponent)
 5. **Identity inject** — adapter (#38) + Ed25519 proof (#39 / ADR 0157); hosts wire kagi/CACAO for production keys; HMAC doubles stay tests-only
