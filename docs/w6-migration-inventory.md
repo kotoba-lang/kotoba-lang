@@ -56,7 +56,7 @@ These are **authority hosts**, not W6 product file ports.
 
 ## Next actions
 
-1. **Path-level murakumo inventory** — classify governor/checkpoint/state/llm entrypoints.
+1. **Path-level murakumo inventory** — **landed**: [`docs/w6-murakumo-path-inventory.md`](w6-murakumo-path-inventory.md) / `lang/w6-murakumo-path-inventory.edn`.
 2. **Cloudflare route inventory** — separate route product from mechanism adapters after ingress soak.
 3. **kbb ability gap list** — explicit blockers for kotoba-script ← nbb cutover.
 
