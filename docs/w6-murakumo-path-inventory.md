@@ -148,9 +148,13 @@ fixture equality → shells remain on bb/nbb/JVM host.
 
 - **2026-07-28 murakumo#138:** **deploy.plan pure oracle expand** — execution-observed?/count-command, release-wit-path, stop-forward-command, absolute-unix-git-bin?. Windows drive absolute git stays host. ADR `ADR-260728-w6-deploy-probe-pure-oracle`.
 
+- **2026-07-28 murakumo#139:** **provision.plan pure oracle expand** — launch/peer/watchdog shell pure fragments. ADR provision shell pure.
+
+- **2026-07-28 provider#36–#37:** T8.3 signed **kit EDN** receipts (#36 / ADR 0154) + signed **Wasm provider receipt API** (#37 / ADR 0155, fixture digest only). Production AOT Component + readiness `:signed-wasm` still pending.
+
 ## Next
 
-1. murakumo pure+adapter path **#61–#135** — product-shell pure dual-source complete including residual report/provision/cloud/crypto `.cljc` (#135). Remaining: residual ops CLI ambient sites beyond #137 (config leave for HOME/bins already inject-friendly); residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5). Network/secret **reference kit packages** landed (provider#34); signed Wasm packages still pending. com-cloudflare #17 + com-cloudflare-compat #5 cljs dual-source landed.
+1. murakumo pure+adapter path **#61–#139** — product-shell pure dual-source complete including residual report/provision/cloud/crypto `.cljc` (#135) and dash/deploy/provision pure expands (#136–#139). Remaining: residual ops CLI ambient sites beyond #137 (config leave for HOME/bins already inject-friendly); residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5). Network/secret kits + signed receipt APIs landed (provider#34–#37); **production AOT signed Wasm** still pending. com-cloudflare #17 + com-cloudflare-compat #5 cljs dual-source landed.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#16 product-shell complete); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Deeper pure ports still dual-implemented where listed “Still host” (envelope maps, placement folds beyond wired subset, etc.); production compiler dependency remains avoided (resource path).
