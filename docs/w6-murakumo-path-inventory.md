@@ -108,10 +108,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#99:** **bulk product-shell catalog** — all 32 `kotoba/*_core.kotoba` ship as `resources/murakumo/oracle/*.kir.edn`; auto-discover gen; host-wired secret + overlay.crypto packaging; remaining hosts wire incrementally.
 - **2026-07-28 murakumo#100:** **product-shell oracle authority (tunnel + config)** — JVM `murakumo.tunnel` pure conn-opts/wrap-cmd/parse-rc digits/scp-dest/forward/curl and `murakumo.config` path builders delegate to `tunnel_core.kir.edn` / `config_core.kir.edn`; SSH argv assembly, EDN I/O, env folds stay host. ADR `ADR-260728-w6-tunnel-config-oracle-authority`.
 - **2026-07-28 murakumo#101:** **product-shell oracle authority (reconcile.plan)** — JVM `desired` / `deficit` / `action-name` / `watch-sleep-ms` delegate to `reconcile_plan_core.kir.edn`; eligible/observed set algebra + variable pick-targets sort stay host. ADR `ADR-260728-w6-reconcile-oracle-authority`.
+- **2026-07-28 murakumo#102:** **product-shell oracle authority (fleet.inventory)** — JVM `node-port` / `health-url` / selector predicates / offline-line delegate to `fleet_inventory_core.kir.edn` via `:fleet-inventory`; enrich/named vector folds stay host. ADR `ADR-260728-w6-fleet-inventory-oracle-authority`.
 
 ## Next
 
-1. murakumo pure+adapter path **#61–#101** — **full KIR catalog shipped** (32 artifacts); tunnel/config/reconcile host-wired. Remaining: incremental host wiring of catalog-only cores (identity/credits/overlay/join/gc/… ) / Delivery 5–8 remaining shells / network·secret caps contract-only / cljs oracle load optional.
+1. murakumo pure+adapter path **#61–#102** — **full KIR catalog shipped** (32 artifacts); tunnel/config/reconcile/fleet-inventory host-wired. Remaining: incremental host wiring of catalog-only cores (identity/credits/overlay/join/gc/… ) / Delivery 5–8 remaining shells / network·secret caps contract-only / cljs oracle load optional.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Full pure-planner cutover still dual-implemented until each core is wired like #86–#98 (or bulk generate); blocked on production compiler (avoid) / kbb in-process load (future optional).
