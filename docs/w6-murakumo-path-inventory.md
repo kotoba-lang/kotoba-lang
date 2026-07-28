@@ -63,9 +63,10 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#44:** `kotoba/infer_schedule_core.kotoba` eligible?/score keys/compare parity (bit-packed flags).
 - **2026-07-28 murakumo#45:** `kotoba/infer_join_core.kotoba` + `kotoba/infer_gc_core.kotoba` tier/relay/can/resident + gc policy math parity.
 - **2026-07-28 murakumo#46:** `kotoba/config_core.kotoba` + `identity_core.kotoba` + `deploy_plan_core.kotoba` path/seed-preimage/argv parity.
+- **2026-07-28 murakumo#47:** `kotoba/infer_credits_core.kotoba` + `reconcile_plan_core.kotoba` integer settle/charge + action-name parity.
 
 ## Next
 
-1. Remaining medium pure planners (credits, reconcile/plan; rebalance/moe/relay).
+1. Optional low/medium leftovers: rebalance/moe/relay/persist pure cores.
 2. Cloudflare pure-request oracle string cores already landed (#1–#2); optional parse tallies.
 3. kbb process/scoped-fs OS transports after contract first slice (provider#24).
