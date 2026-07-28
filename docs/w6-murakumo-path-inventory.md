@@ -175,10 +175,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#148:** **config_core pure expand** — ops default URLs dual-source.
 - **2026-07-28 murakumo#149:** **deploy_plan pure expand** — argv fragments + gates dual-source.
 - **2026-07-28 murakumo#150:** **cloud_plan pure expand** — CLI presentation lines dual-source.
+- **2026-07-28 murakumo#151:** **cloud_plan pure expand** — summary address/policy lines dual-source.
 
 ## Next
 
-1. **murakumo product-shell pure dual-source is complete** through **#150** (cljs #122–#135, pure expands #136–#145, ops/config inject #137+#146+#147). Residual ops ambient getenv leave is closed for documented shells (remaining `System/getenv` are process 0-arity inject defaults or `murakumo.secret` named fetch). Residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5); deeper “Still host” folds (envelope maps, placement sorts, SSH subprocess).
+1. **murakumo product-shell pure dual-source is complete** through **#151** (cljs #122–#135, pure expands #136–#151, ops/config inject #137+#146+#147). Residual ops ambient getenv leave is closed for documented shells (remaining `System/getenv` are process 0-arity inject defaults or `murakumo.secret` named fetch). Residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5); deeper “Still host” folds (envelope maps, placement sorts, SSH subprocess).
 2. **Production AOT signed Wasm** for network/secret — pure allowlist 8 packages + grant-binding landed (provider#41–#42); ops kits still need AOT Components; readiness `:signed-wasm` still pending (host-admissible pure grants only).
 3. Cloudflare pure-request + deploy + parse + client cores landed (#1–#16 product-shell complete); compat coerce/path oracle (#2); cljs dual-source #17 / compat #5 landed.
 4. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
