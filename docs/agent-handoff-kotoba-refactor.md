@@ -56,6 +56,7 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 | Reliability T1.2 required-backends matrix (manifest v2) | kotoba-lang (this PR) / ADR-reliability-t12 |
 | Reliability T1.3 dual-backend runner pilot (5 fixtures) | compiler#412 / ADR 0161 |
 | Reliability T1.3 pilot expand (7 cases, string kit) | compiler#414 / ADR 0163 |
+| Reliability T1.3 string kit surface (12 cases dual-green) | compiler#415 / ADR 0164 |
 | pure allowlist wasm set (8) + host-grant digest binding | provider#42 / ADR 0160 |
 | kekkai ledger/dir/HOME via murakumo.config | murakumo#146 |
 | overlay cert MURAKUMO_KAGI_DIR via murakumo.config | murakumo#147 |
@@ -78,9 +79,9 @@ Authoritative work breakdown (repos, tasks, sequencing, agent guide):
 Tiers R1–R4: semantic conformance → stdlib/records → standalone run → toolchain/LTS.
 Product dual-source remains separate (this handoff §2); do not invent language features in product PRs.
 
-**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412 T1.3 dual-backend pilot.
+**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#415 T1.3 dual-backend pilot (**12** dual-green, string-ops surface complete).
 
-Next language work: T1.3 further matrix (pilot 7 dual-green #414); T1.4 native; T4.2 string-split optional; T5.2 native record wire; T5.3 pack rewrites; T8.3 ops AOT; residual PVA intentional.
+Next language work: T1.3 full matrix (collections still admission-blocked); T1.4 native; T4.2 string-split optional; T4.4/T5 record cookbook; T5.2 native record wire; T5.3 pack rewrites; T8.3 ops AOT; residual PVA intentional.
 
 ### Plan Next (priority order)
 
