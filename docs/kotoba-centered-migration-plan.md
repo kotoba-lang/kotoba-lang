@@ -300,7 +300,8 @@ Qualify vertical families in dependency order:
 **W6 murakumo pure-planner oracle first cutover (2026-07-28, murakumo#37):** `kotoba/kekkai_gate_core.kotoba` string parity vs `murakumo.kekkai.gate` (ledger default / status parse / denial line / authorized?).
 **W6 murakumo infer-plan oracle (2026-07-28, murakumo#38):** `kotoba/infer_plan_core.kotoba` parity for usable-bytes + choose-strategy.
 **W6 murakumo dash-state oracle (2026-07-28, murakumo#39):** `kotoba/dash_state_core.kotoba` short-hosted-cid / health-class / clamp-at / interval-sleep-ms.
-Next: W6 remaining pure planners (task/token/engine) oracle / cloudflare route inventory / kbb ability gap.
+**W6 murakumo task-plan oracle (2026-07-28, murakumo#40):** `kotoba/task_plan_core.kotoba` slots / failed? / can-retry? / defaults.
+Next: W6 remaining pure planners (token/engine) oracle / cloudflare route inventory / kbb ability gap.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -496,7 +497,8 @@ Next: W6 remaining pure planners (task/token/engine) oracle / cloudflare route i
    **W6 murakumo gate oracle (2026-07-28, murakumo#37):** kekkai_gate_core.kotoba parity landed.
    **W6 murakumo infer-plan oracle (2026-07-28, murakumo#38):** usable-bytes + strategy parity.
    **W6 murakumo dash-state oracle (2026-07-28, murakumo#39):** dash_state_core.kotoba display helpers.
-   Next: W6 remaining pure planners (task/token/engine) / cloudflare routes / kbb ability gap.
+   **W6 murakumo task-plan oracle (2026-07-28, murakumo#40):** task_plan_core.kotoba slots/failed?.
+   Next: W6 remaining pure planners (token/engine) / cloudflare routes / kbb ability gap.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
