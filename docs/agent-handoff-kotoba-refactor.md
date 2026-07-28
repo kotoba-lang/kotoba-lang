@@ -177,8 +177,9 @@ Contract only → **reference-implemented** (pure allowlist):
 | core-contracts status rules | [#22](https://github.com/kotoba-lang/kotoba-core-contracts/pull/22) | `:reference-implemented` allowlist + sha256/exports rules |
 | capability-math-sin | [#1](https://github.com/kotoba-lang/capability-math-sin/pull/1) | wasm core `sin` + JVM `Math/sin` |
 | capability-math-cos | [#1](https://github.com/kotoba-lang/capability-math-cos/pull/1) | wasm core `cos` + JVM `Math/cos` |
+| capability-hash-sha256 | [#1](https://github.com/kotoba-lang/capability-hash-sha256/pull/1) | wasm core `sha256_hex` + JVM `MessageDigest` |
 
-Next pure targets on the allowlist: `hash/sha256`, `data/cbor`, `data/json`, `clock/monotonic`, `random/bytes`, `time/now-days`.  
+Next pure targets on the allowlist: `data/cbor`, `data/json`, `clock/monotonic`, `random/bytes`, `time/now-days`.  
 Network/secret caps stay contract-only until signed production providers exist.
 
 ## 8. 2026-07-28 follow-through
