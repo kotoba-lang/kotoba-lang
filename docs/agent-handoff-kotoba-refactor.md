@@ -195,5 +195,5 @@ Network/secret caps stay contract-only until signed production providers exist.
 | kagi-fetch wire | murakumo#52 |
 | git kit id 22 (ADR 0148) | provider#29 |
 | secret name/policy pure oracle | murakumo#60 |
-| rebalance pure path + plan partition walk | murakumo#61–#68 |
+| rebalance pure path + plan partition walk | murakumo#61–#70 |
 | clock/time/random reference-impl | capability-*-#1 |
