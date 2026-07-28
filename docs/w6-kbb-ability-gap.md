@@ -29,7 +29,7 @@ separates **ops shells** from the JS backend.
 | `scoped-filesystem` | read/write under declared roots | **dual-runtime OS transport** (provider#25+#28) | high | browser mounts N/A |
 | `process` | spawn/await bounded process | **dual-runtime OS transport** (provider#25+#28) | high | — |
 | `ssh-or-remote-exec` | remote exec without ambient OpenSSH | **host-forever** | high | murakumo fleet stays on nbb/bb |
-| `git` | status/log (read subcommands) | **contract + JVM os-run** (provider#29+#31) | medium | cljs os-run; tooling cutover |
+| `git` | status/log (read subcommands) | **dual-runtime + tooling cutover** (provider#29+#31+#32; murakumo#55) | medium | remaining scripts |
 | `secret-custody` | named secret fetch (no dump) | **ops cutover complete** (#48–#53 + CF#3) | high | optional live kagi inject |
 | `cloud-deploy` | Workers/Pages deploy verbs | missing | low | scripted publish |
 | `clock-and-random` | clock + CSPRNG | partial | medium | compat actor ids |
@@ -63,12 +63,14 @@ separates **ops shells** from the JS backend.
 - **2026-07-28 murakumo#53:** quic_driver cert/key path refs (no PEM-in-env).
 - **2026-07-28 provider#29 / ADR 0148:** `provider.git` id 22 validate-run + echo-transport.
 - **2026-07-28 provider#31 / ADR 0149:** `git-transport/os-run` JVM production transport.
+- **2026-07-28 provider#32 / ADR 0150:** git cljs/nbb os-run (spawnSync + cwd).
+- **2026-07-28 murakumo#55:** deploy pin absolute git bin (no PATH).
 
 ## Next
 
-1. git tooling cutover / cljs os-run (medium).  
-2. **cloud-deploy** stays low priority ops.  
-3. clock/entropy kit completion (medium).
+1. **cloud-deploy** stays low priority ops.  
+2. clock/entropy kit completion (medium).  
+3. Optional remaining bare-`git` script audit outside deploy pin.
 
 ## 2026-07-28 update
 
