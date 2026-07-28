@@ -73,9 +73,10 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#60:** `secret_core.kotoba` name/env constants + env/path-ref policy oracle.
 - **2026-07-28 murakumo#62:** `report_core` extended with remaining pure ops lines.
 - **2026-07-28 murakumo#61:** `infer_rebalance_core` 3-pool `largest-remainder-3` map-fold oracle (first beyond scalars).
+- **2026-07-28 murakumo#63:** `pool-demand-pack` + `seats-from-pool-pack` + `classify-run-flags` map-fold compose.
 
 ## Next
 
-1. murakumo pure scalars complete; first map-fold (`largest-remainder-3`) landed (#61). Remaining: demand-from-runs / placement moves / crypto/host shells.
+1. murakumo map-folds: largest-remainder + pool-demand + classify landed (#61/#63). Remaining: full demand-from-runs reduce / placement moves / crypto/host shells.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
