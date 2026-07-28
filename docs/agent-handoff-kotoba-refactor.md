@@ -44,12 +44,12 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 ### Plan Next (priority order)
 
 1. **Delivery 5–8 remaining shells** — com-cloudflare product-shell started (#14); wire residual stream/deploy/analytics hosts + murakumo CLIs
-2. **Product Value ABI expand** — continue beyond token (#112) + ports (#114): schedule bit-flags, overlay sealed-fields, connect has-http, …
+2. **Product Value ABI expand** — continue beyond token (#112) + ports (#114) + sealed/reconcile (#115): schedule bit-flags, report has-health, connect plane flags, …
 3. **cljs oracle load optional** — resource load currently JVM/bb-only
 4. **Production signed providers** for network / secret capabilities (leave pure allowlist alone; signed content-addressed Wasm)
 5. **wasm-aot packaging claims** — packaging / AOT path honesty vs remaining host shells
 
-**Landed 2026-07-28:** full murakumo product-shell dual-source — bulk KIR catalog (#99) + host wire through overlay-driver/runtime (#113) + Product Value ABI v1 token (#112); live HMAC/AES (#87).
+**Landed 2026-07-28:** full murakumo product-shell dual-source — bulk KIR catalog (#99) + host wire through overlay-driver/runtime (#113) + Product Value ABI v1 token (#112) / ports (#114) / sealed+reconcile (#115); live HMAC/AES (#87).
 
 ### Do not
 
@@ -217,6 +217,7 @@ Network/secret caps stay contract-only until signed production providers exist.
 | Product Value ABI v1 token | murakumo#112 |
 | product-shell oracle authority (overlay driver + runtime) | murakumo#113 |
 | Product Value ABI v1 fleet + provision ports | murakumo#114 |
+| Product Value ABI v1 sealed fields + reconcile optionals | murakumo#115 |
 | product-shell oracle authority (fleet.inventory) | murakumo#102 |
 | product-shell oracle authority (infer.join + infer.gc) | murakumo#105 |
 | product-shell oracle authority (moe + rebalance + relay) | murakumo#107 |
