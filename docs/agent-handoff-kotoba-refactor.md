@@ -56,13 +56,9 @@ Authoritative work breakdown (repos, tasks, sequencing, agent guide):
 Tiers R1–R4: semantic conformance → stdlib/records → standalone run → toolchain/LTS.
 Product dual-source remains separate (this handoff §2); do not invent language features in product PRs.
 
-**R1 in flight (start here for language work):**
+**R1 immediate trio landed** (#295 semantics-ssot, #411 pure-product + error codes).
 
-| ID | Task | Repo |
-|---|---|---|
-| T1.1 | semantics-ssot.md | kotoba-lang (this doc set) |
-| T2.1 / T2.3 | pure-product admission + examples KIR | compiler |
-| T3.1 | error code + span contract | compiler |
+Next language work: T1.2 conformance matrix, T1.3 dual-backend runner, T4 stdlib, T5 records (see WBS).
 
 ### Plan Next (priority order)
 
