@@ -319,7 +319,9 @@ Qualify vertical families in dependency order:
 **W6 secret-custody contract (2026-07-28, provider#26 / ADR 0145):** id 21 get-only allowlist + env-fetch/map-fetch (no dump).
 **W6 secret host transports (2026-07-28, provider#27 / ADR 0146):** fn-fetch + keychain single-get (`-w` only).
 **W6 secret ops cutover (2026-07-28, murakumo#48 + com-cloudflare#3):** token HMAC + CF API token named fetch.
-Next: W6 cljs OS transports / remaining getenv audit / medium murakumo pure planners; capability Wasm implementations remain contract-only (definition CID identity landed — see agent-handoff + ADR-capability-repository-semantic-cid-v1).
+**W6 cljs OS transports (2026-07-28, provider#28 / ADR 0147):** nbb spawnSync + Node fs root mounts.
+**W6 SSH host-forever + secret getenv audit (2026-07-28):** fleet SSH stays host; audit lists remaining secret env sites.
+Next: W6 remaining secret getenv cutover / optional git kit / medium murakumo pure planners; capability Wasm implementations remain contract-only (definition CID identity landed — see agent-handoff + ADR-capability-repository-semantic-cid-v1).
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -526,7 +528,8 @@ Next: W6 cljs OS transports / remaining getenv audit / medium murakumo pure plan
    **W6 process+scoped-fs OS transports (2026-07-28, provider#25 / ADR 0144):** os-spawn + os-store.
    **W6 secret-custody contract (2026-07-28, provider#26 / ADR 0145):** secret id 21 get-only.
    **W6 secret host transports + ops cutover (2026-07-28, provider#27 + murakumo#48 + com-cloudflare#3).**
-   Next: W6 cljs OS transports / remaining getenv audit / optional medium pure planners.
+   **W6 cljs OS transports (2026-07-28, provider#28 / ADR 0147); SSH host-forever; secret getenv audit.**
+   Next: W6 remaining secret getenv cutover / optional git kit / optional medium pure planners.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
