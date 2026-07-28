@@ -322,7 +322,11 @@ Qualify vertical families in dependency order:
 **W6 cljs OS transports (2026-07-28, provider#28 / ADR 0147):** nbb spawnSync + Node fs root mounts.
 **W6 SSH host-forever + secret getenv audit (2026-07-28):** fleet SSH stays host; audit lists remaining secret env sites.
 **W6 secret remaining cutover (2026-07-28, murakumo#50):** service/metrics tokens + overlay auth-key named fetch.
-Next: W6 optional git kit / QUIC path-ref / medium murakumo pure planners; capability Wasm implementations remain contract-only (definition CID identity landed — see agent-handoff + ADR-capability-repository-semantic-cid-v1).
+**W6 QUIC cert path-ref + kagi-fetch + git kit (2026-07-28):**
+murakumo#52 path-ref under scoped roots + `secret/kagi-fetch`; provider#29 git kit id 22
+(ADR 0148). Next: production kagi getter inject / optional signed capability providers.
+
+Next: production kagi getter inject / signed capability providers / medium murakumo pure planners; capability Wasm implementations remain contract-only (definition CID identity landed — see agent-handoff + ADR-capability-repository-semantic-cid-v1).
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll

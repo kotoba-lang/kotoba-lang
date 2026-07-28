@@ -180,3 +180,11 @@ Contract only → **reference-implemented** (pure allowlist):
 
 Next pure targets on the allowlist: `hash/sha256`, `data/cbor`, `data/json`, `clock/monotonic`, `random/bytes`, `time/now-days`.  
 Network/secret caps stay contract-only until signed production providers exist.
+
+## 8. 2026-07-28 follow-through
+
+| Item | PR |
+|---|---|
+| QUIC cert path-ref under scoped roots | murakumo#52 |
+| kagi-fetch wire | murakumo#52 |
+| git kit id 22 (ADR 0148) | provider#29 |
