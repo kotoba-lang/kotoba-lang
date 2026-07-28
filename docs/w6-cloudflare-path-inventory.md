@@ -72,9 +72,10 @@ EDN equality on request maps / parse fixtures → HTTP + token remain host.
 - **2026-07-28 com-cloudflare-compat#2:** `kotoba/compat_core.kotoba` coerce/path/limit oracle (ADR 0001).
 - **2026-07-28 com-cloudflare#9–#10:** Pages bulk Direct Upload plan + path/hash oracle.
 - **2026-07-28 com-cloudflare#11:** `kotoba/analytics_parse_core.kotoba` tally/sum oracle (ADR 0009).
+- **2026-07-28 com-cloudflare#12:** `kotoba/client_core.kotoba` API base/URL/auth oracle (ADR 0010).
 
 ## Next
 
-1. murakumo pure-planner scalars through component-authority (#37–#59); remaining cljc is map/vector/crypto/host shells.  
+1. murakumo pure-planner scalars through secret (#37–#60); remaining cljc is map/vector/crypto/host shells.  
 2. compat handlers/store remain host; WASM L5 packaging still blocked.  
 3. Optional product shells / murakumo map folds beyond scalar oracles.
