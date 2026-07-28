@@ -136,10 +136,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#128:** **cljs dual-source identity pure** — seed preimages, DID argv/trim, cid-b-prefix, JWT templates, graph-name; Node crypto/Buffer (no goog.crypt). ADR `ADR-260728-w6-cljs-identity-dual`.
 - **2026-07-28 murakumo#129:** **cljs dual-source reconcile.plan + component-authority** — `desired`/`deficit`/`action-name`/`watch-sleep-ms` + epoch/sequence/identifier/event-kind when ready. ADR `ADR-260728-w6-cljs-reconcile-cauth-dual`.
 - **2026-07-28 murakumo#130:** **cljs dual-source overlay keyring/peer/stream + infer.schedule** — rotation/epoch/preimages; choose-via; window/advance/ack; eligible?/score/queue-inc. ADR `ADR-260728-w6-cljs-overlay-schedule-dual`.
+- **2026-07-28 murakumo#131:** **cljs dual-source infer gc/relay/moe/join** — defaults/need/free/target/rank; make-id/msg/lease; capacity/ratio/verdict/resident; max-resident/can?/needs-relay?/clamp/eligible. ADR `ADR-260728-w6-cljs-infer-gc-relay-moe-join`.
 
 ## Next
 
-1. murakumo pure+adapter path **#61–#130** — cljs dual-source through overlay+schedule. Remaining: Delivery 5–8 shells / residual PVA / **incremental cljs rewire** (infer plan/engine/gc/join/moe/rebalance/relay/credits, overlay runtime/driver, deploy) / network·secret caps contract-only.
+1. murakumo pure+adapter path **#61–#131** — cljs dual-source through infer gc/relay/moe/join. Remaining: Delivery 5–8 shells / residual PVA / **incremental cljs rewire** (infer plan/engine/rebalance/credits, overlay runtime/driver, deploy) / network·secret caps contract-only.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#16 product-shell complete); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Deeper pure ports still dual-implemented where listed “Still host” (envelope maps, placement folds beyond wired subset, etc.); production compiler dependency remains avoided (resource path).
