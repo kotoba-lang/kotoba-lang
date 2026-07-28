@@ -34,17 +34,19 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 | W5 product verticals (put/get/CAS/conditional) | **0140–0142** |
 | W6 inventories | murakumo / cloudflare / kbb gap |
 | W6 murakumo pure-planners **high** | **6/6** (#37–#42) |
-| W6 murakumo pure-planners **medium** | partial (fleet/schedule/join/gc/config/identity/deploy…) |
-| W6 cloudflare pure-request string cores | stream + analytics/paths |
-| W6 process / scoped-fs / secret kits | provider ADR **0143–0145** |
+| W6 murakumo pure-planners **medium+** | **largely complete** (#61–#81: rebalance, plan partition n≠3/n>3, engine strings, report, schedule/task assign, credits, dash; ~31 `kotoba/*_core.kotoba`) |
+| W6 cloudflare pure-request / deploy oracles | client / stream / analytics / deploy / pages (com-cloudflare) |
+| W6 kbb ability gaps | **COMPLETE** (process / scoped-fs / secret / git / entropy / cloud-deploy; SSH host-forever) |
+| W6 process / scoped-fs / secret / git / entropy kits | provider ADR **0143–0151** (ids 19–23; cljs OS transports landed) |
+| Pure capability allowlist reference-impl | **COMPLETE** (sin / cos / sha256 / cbor / json / clock / random / now-days) |
+| Network / secret capability packages | still **contract-only** (no production signed providers yet) |
 
 ### Plan Next (priority order)
 
-1. **Ops CLI secret cutover** — stop ambient `getenv`; use `provider.secret` (id 21)
-2. **cljs/nbb OS transports** for process spawn + scoped-fs roots
-3. **Remaining medium murakumo pure planners** — e.g. credits, reconcile/plan
-4. **kbb** high gaps still open beyond contract-first (ssh/git/cloud-deploy policy)
-5. **Capability Wasm implementations** — atomic repos are still `contract-only`
+1. **Crypto / host shells** — HMAC and other host-bound crypto wiring where pure oracles already exist
+2. **Delivery 5–8 product shells** — wire pure oracles into real entrypoints (product vertical cutover, not new DSL)
+3. **Production signed providers** for network / secret capabilities (leave pure allowlist alone; signed content-addressed Wasm)
+4. **wasm-aot packaging claims** — packaging / AOT path honesty vs remaining host shells
 
 ### Do not
 
