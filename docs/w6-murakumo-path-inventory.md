@@ -117,9 +117,12 @@ fixture equality → shells remain on bb/nbb/JVM host.
 
 - **2026-07-28 murakumo#111:** **product-shell oracle authority (overlay + cloud + provision)** — JVM overlay keyring/peer/stream pure helpers; cloud defaults/region/endpoints; provision constants/p2p/multiaddr/mesh cmds. ADR `ADR-260728-w6-overlay-cloud-provision-oracle-authority`.
 
+- **2026-07-28 murakumo#112:** **Product Value ABI v1 token oracle** — `token_core` rewritten with `[:option T]` / `if-some` / `string-from-i64` (no has-* sentinels); host option bridge; compiler+kir pin for product-value-abi-v1. ADR `ADR-260728-product-value-abi-v1-token`.
+- **2026-07-28 murakumo#113:** **product-shell oracle authority (overlay driver + runtime)** — JVM endpoint-kind/option-name/blank?/dial-ok-reason via `overlay_driver_core.kir.edn`; default ports/known-adapter?/adapter-kind/scheme-prefix-host via `overlay_runtime_core.kir.edn`. parse-argv loops + adapter registry maps stay host. ADR `ADR-260728-w6-overlay-driver-runtime-oracle-authority`.
+
 ## Next
 
-1. murakumo pure+adapter path **#61–#111** — **full KIR catalog shipped** (32 artifacts); deploy/connect/component-authority host-wired. Remaining catalog-only: overlay-driver / overlay-runtime (argv loops) / Delivery 5–8 shells / network·secret caps contract-only / cljs oracle load optional.
+1. murakumo pure+adapter path **#61–#113** — **full KIR catalog (32 artifacts) + all portable pure hosts dual-source wired** (incl. overlay-driver/runtime #113; Product Value ABI v1 token #112). Remaining: Delivery 5–8 remaining shells / network·secret caps contract-only / cljs oracle load optional / optional Product Value ABI roll-out beyond token.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Full pure-planner cutover still dual-implemented until each core is wired like #86–#98 (or bulk generate); blocked on production compiler (avoid) / kbb in-process load (future optional).
