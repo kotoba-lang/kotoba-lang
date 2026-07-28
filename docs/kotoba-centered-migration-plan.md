@@ -306,7 +306,8 @@ Qualify vertical families in dependency order:
 **W6 cloudflare path inventory (2026-07-28):** `lang/w6-cloudflare-path-inventory.edn` — API client pure request/parse vs HTTP host; routes = Workers/DNS/Pages.
 **W6 kbb ability gap (2026-07-28):** `lang/w6-kbb-ability-gap.edn` — process/scoped-fs/ssh/secrets gaps; ops stay on nbb.
 **W6 cloudflare stream oracle (2026-07-28, com-cloudflare#1):** `kotoba/stream_core.kotoba` validate/redact/path parity.
-Next: W6 analytics pure-request oracle / process+scoped-fs qualification / optional medium murakumo pure planners.
+**W6 cloudflare analytics+paths oracle (2026-07-28, com-cloudflare#2):** `analytics_core` + `workers_path_core` GraphQL/REST string parity.
+Next: W6 process+scoped-fs kit qualification / optional medium murakumo pure planners / optional analytics parse tallies.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -508,7 +509,8 @@ Next: W6 analytics pure-request oracle / process+scoped-fs qualification / optio
    **W6 cloudflare path inventory (2026-07-28):** pure request/parse candidates classified.
    **W6 kbb ability gap (2026-07-28):** process/scoped-fs/ssh/secrets gap list.
    **W6 cloudflare stream oracle (2026-07-28, com-cloudflare#1):** stream_core.kotoba validate/redact.
-   Next: W6 analytics pure-request oracle / process+scoped-fs kits / optional medium pure planners.
+   **W6 cloudflare analytics+paths oracle (2026-07-28, com-cloudflare#2):** analytics/path string cores.
+   Next: W6 process+scoped-fs kits / optional medium pure planners / optional parse tallies.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
