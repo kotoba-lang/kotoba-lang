@@ -43,7 +43,7 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 
 ### Plan Next (priority order)
 
-1. **Delivery 5–8 remaining shells** — wire pure oracles into real entrypoints / CLIs (not new DSL)
+1. **Delivery 5–8 remaining shells** — com-cloudflare product-shell started (#14); wire residual stream/deploy/analytics hosts + murakumo CLIs
 2. **Product Value ABI expand** — roll `[:option T]` / if-some pattern beyond token (#112) to other cores where has-* sentinels remain
 3. **cljs oracle load optional** — resource load currently JVM/bb-only
 4. **Production signed providers** for network / secret capabilities (leave pure allowlist alone; signed content-addressed Wasm)
