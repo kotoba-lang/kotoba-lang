@@ -168,11 +168,13 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#145:** **kekkai.gate pure expand** — cli-argv fragments dual-source. ADR `ADR-260728-w6-kekkai-cli-pure-oracle`.
 
 - **2026-07-28 provider#40:** T8.3 **package-manifest** binds kit+wasm layers with production blockers (fixture always blocked). ADR 0158.
+- **2026-07-28 murakumo#146:** **kekkai config inject** — ledger/dir/HOME via `murakumo.config`. ADR `ADR-260728-w6-kekkai-config-inject`.
+- **2026-07-28 provider#41:** T8.3 **real non-fixture Wasm package pilot** (hash-sha256 module bytes + registry; production claim still blocked by readiness `:signed-wasm`). ADR 0159.
 
 ## Next
 
-1. **murakumo product-shell pure dual-source is complete** through **#144** (cljs #122–#135, residual `.clj` shells #135, pure expands #136–#144, ops config inject #137). Remaining murakumo work is thin: optional HOME/bin config leave; residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5); deeper “Still host” folds (envelope maps, placement sorts, SSH subprocess).
-2. **Production AOT signed Wasm** for network/secret (kits + signed receipt APIs landed provider#34–#39; readiness `:signed-wasm` still pending).
+1. **murakumo product-shell pure dual-source is complete** through **#146** (cljs #122–#135, pure expands #136–#145, ops/config inject #137+#146). Remaining murakumo work is thin: optional HOME/bin leave elsewhere; residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5); deeper “Still host” folds (envelope maps, placement sorts, SSH subprocess).
+2. **Production AOT signed Wasm** for network/secret — pure allowlist real-bytes pilot landed (provider#41); ops kits still need AOT Components + readiness `:signed-wasm :ready`.
 3. Cloudflare pure-request + deploy + parse + client cores landed (#1–#16 product-shell complete); compat coerce/path oracle (#2); cljs dual-source #17 / compat #5 landed.
 4. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 5. Production compiler dependency remains avoided (resource path / precompiled KIR). Language reliability parity T1.2+ (see WBS).

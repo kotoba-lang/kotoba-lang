@@ -51,13 +51,15 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 | tunnel pick-exit/trim-err + secret kit-reply pure | murakumo#144 |
 | kekkai.gate pure expand (cli-argv fragments) | murakumo#145 |
 | package-manifest + production blockers | provider#40 / ADR 0158 |
+| T8.3 real non-fixture Wasm package pilot (hash-sha256) | provider#41 / ADR 0159 |
+| kekkai ledger/dir/HOME via murakumo.config | murakumo#146 |
 | Ed25519 identity-signer inject proven (test dep) | provider#39 / ADR 0157 |
 | identity.sign inject adapter + empty-module fixture | provider#38 / ADR 0156 |
 | T8.4 host-parity L5 critical conformance fixtures + resources sync | kotoba-lang (this PR) |
 | deploy.plan pure oracle expand (execution probe + pin paths) | murakumo#138 |
 | dash.state probe parse pure oracle expand | murakumo#136 |
 | Pure capability allowlist reference-impl | **COMPLETE** (sin / cos / sha256 / cbor / json / clock / random / now-days) |
-| Network / secret capability packages | kits + readiness + **signed kit EDN** + **signed Wasm receipt API** (provider#34–#37 / ADR 0152–0155); **identity inject adapter landed (#38)**; **production AOT signed Component still pending** (readiness `:signed-wasm` stays pending) |
+| Network / secret capability packages | kits + readiness + signed kit EDN + signed Wasm receipt API + identity inject + package-manifest (provider#34–#40); **real non-fixture wasm package pilot** (provider#41 / ADR 0159, hash-sha256); **ops/network production AOT + readiness `:signed-wasm :ready` still pending** |
 
 ### Language reliability parity (CLJ/CLJS-class trust)
 
@@ -76,8 +78,8 @@ Next language work: T1.2 conformance matrix, T1.3 dual-backend runner, T4 stdlib
 ### Plan Next (priority order)
 
 1. **Delivery residual** — product-shell pure dual-source complete (#122–#145); optional HOME/bin config leave; residual PVA (schedule `eligible?` bit-pack intentional)
-2. **T8.3 production AOT** — signed kit EDN (#36) + signed Wasm **receipt API** (#37) + identity inject (#38–#39) + package-manifest (#40 / ADR 0158) landed; remaining: real AOT Components + readiness `:signed-wasm :ready` (fixtures always blocked)
-3. **wasm-aot packaging claims** — still pending honesty (ADR 0152–0155); do not claim ready from fixture receipts
+2. **T8.3 production AOT** — receipt APIs + package-manifest (#36–#40) + **real non-fixture wasm package pilot** (#41 / ADR 0159 hash-sha256) landed; remaining: ops/network AOT Components + readiness `:signed-wasm :ready` (fixtures still blocked; real pilot clears fixture blocker only)
+3. **wasm-aot packaging claims** — partial for pure allowlist pilot (`:wasm-aot :partial` hash-sha256); ops kits stay `:pending`; do not claim ready from fixture receipts
 4. **Host parity L5** — T8.4 **partial**: critical-import conformance fixtures expanded (45 cases) + resources sync; remaining live host runners (kototama/wasm-webcomponent)
 5. **Identity inject** — adapter (#38) + Ed25519 proof (#39 / ADR 0157); hosts wire kagi/CACAO for production keys; HMAC doubles stay tests-only
 
