@@ -204,6 +204,7 @@ per case class (T1.2 landed). Dual-backend execution runner is T1.3.
 | `string-concat` | Bounded concatenation |
 | `string=?` | Equality (do not use `=` on strings) |
 | `string-from-i64` | Signed decimal text |
+| `string-join` | Separator + ≤8 parts → nested `string-concat` (T4.2) |
 | `string-contains?` / `string-fold-case` / `string-code-point-at` | As admitted |
 
 ---
