@@ -44,7 +44,7 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 ### Plan Next (priority order)
 
 1. **Delivery 5–8 remaining shells** — com-cloudflare product-shell started (#14); wire residual stream/deploy/analytics hosts + murakumo CLIs
-2. **Product Value ABI expand** — continue beyond token (#112) + ports (#114) + sealed/reconcile (#115): schedule bit-flags, report has-health, connect plane flags, …
+2. **Product Value ABI expand** — continue beyond token (#112) + ports (#114) + sealed/reconcile (#115) + connect/report (#116): schedule bit-flags, schedule bit-flags, overlay-peer choose-via, …
 3. **cljs oracle load optional** — resource load currently JVM/bb-only
 4. **Production signed providers** for network / secret capabilities (leave pure allowlist alone; signed content-addressed Wasm)
 5. **wasm-aot packaging claims** — packaging / AOT path honesty vs remaining host shells
