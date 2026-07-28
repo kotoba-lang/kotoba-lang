@@ -58,9 +58,10 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#39:** `kotoba/dash_state_core.kotoba` short-hosted-cid / health-class / clamp-at / interval-sleep-ms parity.
 - **2026-07-28 murakumo#40:** `kotoba/task_plan_core.kotoba` slots / failed? / can-retry? / defaults parity.
 - **2026-07-28 murakumo#41:** `kotoba/token_core.kotoba` claims/scope/expired/signing-input parity.
+- **2026-07-28 murakumo#42:** `kotoba/infer_engine_core.kotoba` rpc/embed cmd assembly + split-mode/endpoint parity.
 
 ## Next
 
-1. Remaining pure-planner oracle: `infer/engine` (cmd assembly).
+1. Medium-priority pure planners (schedule/credits/join/gc/fleet inventory/config) as needed.
 2. Cloudflare route inventory (sibling W6 next-action).
 3. kbb ability gap list for nbb shells (`ops`, `task/*`).
