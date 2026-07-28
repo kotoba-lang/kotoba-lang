@@ -282,7 +282,7 @@ Qualify vertical families in dependency order:
    production cljs transport intermediate evidence now present. Production
    cljs transports complete for HTTP + LLM + storage.**
    **W5 deepen ADR 0120/0121:** :bytes leaf + get-stream ready-task dual-runtime.
-   Next: http/get-stream / product apps.
+   Next: product apps / pending→ready scheduling.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -407,7 +407,10 @@ Qualify vertical families in dependency order:
    host \`[:task [:stream :bytes]]\` / \`[:stream :bytes]\` + object get-stream
    (id 14) dual-runtime ready-task → stream-read. **Reference dual-runtime
    covers stream-object write + get-stream ready-task.**
-   Next: http/get-stream dual-runtime / pending→ready scheduling / product apps.
+   **W5 deepen (2026-07-27, provider#17 + compiler#389 / ADR 0122):**
+   \`:http/get-stream\` (id 13) dual-runtime ready-task (url+headers, exact-origin,
+   stream-read). **Reference dual-runtime covers object + http get-stream.**
+   Next: pending→ready scheduling / multi-chunk / product apps.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
