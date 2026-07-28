@@ -73,9 +73,10 @@ EDN equality on request maps / parse fixtures → HTTP + token remain host.
 - **2026-07-28 com-cloudflare#9–#10:** Pages bulk Direct Upload plan + path/hash oracle.
 - **2026-07-28 com-cloudflare#11:** `kotoba/analytics_parse_core.kotoba` tally/sum oracle (ADR 0009).
 - **2026-07-28 com-cloudflare#12:** `kotoba/client_core.kotoba` API base/URL/auth oracle (ADR 0010).
+- **2026-07-28 com-cloudflare#13:** `kotoba/zones_path_core.kotoba` list-zones/DNS query + hostname-match oracle (ADR 0011). Workers base paths already in `workers_path_core` (#2).
 
 ## Next
 
-1. murakumo pure path #61–#75 (incl. reconcile pick-targets).  
+1. Zones/workers/pages pure path+query strings complete; result map folds stay host.  
 2. compat handlers/store remain host; WASM L5 packaging still blocked.  
-3. n≠3 / assign batches / eligible-nodes sets remain host; other verticals open.
+3. murakumo pure path / Delivery 5–8; other verticals open.
