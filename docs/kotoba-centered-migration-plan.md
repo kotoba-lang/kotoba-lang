@@ -281,10 +281,11 @@ Qualify vertical families in dependency order:
    production cljs/nbb storage transport (spawnSync hops). **Family 4
    production cljs transport intermediate evidence now present. Production
    cljs transports complete for HTTP + LLM + storage.**
-   **W5 deepen ADR 0120–0128:** :bytes leaf + object/http get-stream ready/pending/
+   **W5 deepen ADR 0120–0129:** :bytes leaf + object/http get-stream ready/pending/
    joined multi-chunk + chunk-queue + progressive open-stream + guest poll/read
-   ops + production HTTP get-stream transport on reference + nbb dual-runtime.
-   Next: object-store live transport / product apps / Component v0.3 packaging.
+   ops + production HTTP get-stream + production object-store transport on
+   reference + nbb dual-runtime.
+   Next: product apps / Component v0.3 packaging of get-stream poll/read.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -441,7 +442,11 @@ Qualify vertical families in dependency order:
    allow-list/redirect/SSRF floor as POST ADR 0066/0117; \`{:bytes ...}\` ready
    task). clj + cljs. **Live HTTP get-stream transport first slice landed
    (not object-store live, not status/headers surface).**
-   Next: object-store live transport / product apps / Component v0.3 packaging.
+   **W5 deepen (2026-07-28, provider#22 + compiler / ADR 0129):** production
+   \`object-transport/production-transport\` — host-configured endpoint, fixed-path
+   JSON for get-stream/put-block/CAS; no ambient object store. clj + cljs.
+   **Live object-store transport first slice landed (not Component v0.3 packaging).**
+   Next: product apps / Component v0.3 packaging of get-stream poll/read.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
@@ -501,9 +506,9 @@ Qualify vertical families in dependency order:
    compiler#360 / ADR 0095):** reference + nbb vectors for the write path —
    `:object/put-block` + `:object/compare-and-set-ref` (binding allowlist,
    bounded payload as host string, bool results, redaction, denial). Linear
-   Component v0.3 keeps linear handle ABI; **ADR 0120–0128 :bytes + object/http
+   Component v0.3 keeps linear handle ABI; **ADR 0120–0129 :bytes + object/http
    get-stream ready/pending/joined multi-chunk/chunk-queue/open-stream + guest
-   poll/read + production HTTP get-stream on reference + nbb.** **Reference dual-runtime now also covers stream-object write ops.**
+   poll/read + production HTTP get-stream + production object-store on reference + nbb.** **Reference dual-runtime now also covers stream-object write ops.**
 
    **W5 stream-object write-path wasm (2026-07-27, kotoba-component#53 +
    compiler#361 / ADR 0096):** synthetic dual-export
