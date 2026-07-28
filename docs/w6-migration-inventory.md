@@ -67,7 +67,7 @@ These are **authority hosts**, not W6 product file ports.
 9. **SSH** — **host-forever** (`docs/w6-ssh-host-forever.md`).
 10. **git kit** — **dual-runtime + deploy tooling cutover** (provider#29+#31+#32; murakumo#55).
 11. **entropy kit** — **landed** (provider#33 id 23 CSPRNG; clock+random gap closed).
-12. **cloud-deploy** — **complete** (com-cloudflare#5–#9 including Pages bulk Direct Upload).
+12. **cloud-deploy** — **complete + oracle** (com-cloudflare#5–#10 including Pages bulk + path oracle).
 13. **bare-git audit** — **closed** (murakumo#58 absolute git-bin only).
 14. **cloudflare-compat oracle** — **coerce/path first slice** (com-cloudflare-compat#2).
 

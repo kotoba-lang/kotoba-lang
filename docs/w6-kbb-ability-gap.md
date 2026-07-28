@@ -31,7 +31,7 @@ separates **ops shells** from the JS backend.
 | `ssh-or-remote-exec` | remote exec without ambient OpenSSH | **host-forever** | high | murakumo fleet stays on nbb/bb |
 | `git` | status/log (read subcommands) | **dual-runtime + tooling cutover** (provider#29+#31+#32; murakumo#55) | medium | remaining scripts |
 | `secret-custody` | named secret fetch (no dump) | **ops cutover complete** (#48–#53 + CF#3) | high | optional live kagi inject |
-| `cloud-deploy` | Workers/Pages deploy verbs | **complete** (com-cloudflare#5–#9) | low | — |
+| `cloud-deploy` | Workers/Pages deploy verbs | **complete + oracle** (com-cloudflare#5–#10) | low | — |
 | `clock-and-random` | clock + CSPRNG | **landed** (clock id 7 + entropy id 23 provider#33) | medium | — |
 
 ## Consumers
@@ -72,10 +72,11 @@ separates **ops shells** from the JS backend.
 - **2026-07-28 com-cloudflare#8 / ADR 0006:** module validate + multipart encode kotoba oracle.
 - **2026-07-28 murakumo#58:** bare-git audit closed (absolute git-bin only).
 - **2026-07-28 com-cloudflare#9 / ADR 0007:** Pages bulk Direct Upload pure multi-step plan.
+- **2026-07-28 com-cloudflare#10 / ADR 0008:** Pages bulk path/hash kotoba pure oracle.
 
 ## Next
 
-1. **W6 kbb ability gap list is complete** (high/medium + deploy polish).  
+1. **W6 kbb ability gap list is complete** (including Pages bulk + oracle).  
 2. Further work is product verticals / Delivery 5–8 — not kbb gap closure.
 ## 2026-07-28 update
 
