@@ -79,7 +79,7 @@ Product dual-source remains separate (this handoff §2); do not invent language 
 
 **R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412 T1.3 dual-backend pilot.
 
-Next language work: expand T1.3 pilot toward full pure-product matrix; T1.4 native; T4 stdlib; T5 records (see WBS).
+Next language work: expand T1.3 pilot toward full pure-product matrix; T1.4 native; T4.2 string kit (T4.1 frozen); T5 records (see WBS).
 
 ### Plan Next (priority order)
 
