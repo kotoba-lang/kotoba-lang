@@ -141,9 +141,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 
 - **2026-07-28 murakumo#133:** **cljs dual-source residual infer plan/engine/rebalance/credits** — usable-bytes/choose-strategy; rpc/head/mlx/moe/embed cmd fragments; largest-remainder seats; charge-allow?/memory-time. ADR `ADR-260728-w6-cljs-infer-residual-dual`.
 
+- **2026-07-28 murakumo#135:** **cljs dual-source residual JVM `.clj` pure shells** — `report` / `provision.plan` / `cloud.plan` / `overlay.crypto` → `.cljc` try-oracle dual-source; AES seal/open stays JVM. ADR `ADR-260728-w6-cljs-clj-residual-dual`.
+
 ## Next
 
-1. murakumo pure+adapter path **#61–#133** — cljs dual-source through overlay runtime/driver + deploy and infer gc/relay/moe/join. Remaining: Delivery 5–8 shells / residual PVA / network·secret caps contract-only (**portable .cljc pure cljs dual-source complete** through #133). com-cloudflare cljs dual-source #17 landed separately.
+1. murakumo pure+adapter path **#61–#135** — product-shell pure dual-source complete including residual report/provision/cloud/crypto `.cljc` (#135). Remaining: Delivery 5–8 ops CLI shells / residual PVA / network·secret caps contract-only. com-cloudflare #17 + com-cloudflare-compat #5 cljs dual-source landed.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#16 product-shell complete); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Deeper pure ports still dual-implemented where listed “Still host” (envelope maps, placement folds beyond wired subset, etc.); production compiler dependency remains avoided (resource path).
