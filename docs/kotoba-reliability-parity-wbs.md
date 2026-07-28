@@ -91,7 +91,7 @@ compiler / KIR / wasm / native / legacy path skew.
 |---|---|---|---|---|---|
 | T4.1 | Freeze `stdlib` module list in `lang/conformance/stdlib/` — **landed** (manifest.edn + core mirror + tests; ADR-reliability-t41) | **kotoba-lang** | Manifest of public names | PVA v1 | S |
 | T4.2 | Ship `string` kit: length, from-i64, join (bounded), split (bounded optional) | **compiler** (desugar/helpers), **kotoba-kir** | Documented ops + tests | T1.3 | M |
-| T4.3 | Ship `option`/`result` usage guide + helpers (if-some already fixed) | **kotoba-lang** docs, **compiler** examples | Guide + golden | T2.3 | S |
+| T4.3 | Ship `option`/`result` usage guide + helpers (if-some already fixed) — **landed** (option-result-guide.md + examples/option-result; ADR-reliability-t43) | **kotoba-lang** docs, **compiler** examples | Guide + golden | T2.3 | S |
 | T4.4 | Ship `record` + small typed-map cookbook for pure-product | **kotoba-lang**, **compiler** | Replace public base-N packs where possible | T5 | M |
 | T4.5 | Collections: document O-costs; add only **bounded** map/filter/reduce over hetero-vector/typed-map | **compiler**, **kotoba-lang** | No silent O(n²) without docs | T1.1 | M |
 

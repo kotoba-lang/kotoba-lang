@@ -79,11 +79,11 @@ Product dual-source remains separate (this handoff §2); do not invent language 
 
 **R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412 T1.3 dual-backend pilot.
 
-Next language work: expand T1.3 pilot toward full pure-product matrix; T1.4 native; T4.2 string kit (T4.1 frozen); T5 records (see WBS).
+Next language work: expand T1.3 pilot toward full pure-product matrix; T1.4 native; T4.2 string join/split (T4.1/T4.3 landed); T5 records (see WBS).
 
 ### Plan Next (priority order)
 
-1. **Delivery residual** — product-shell pure dual-source complete (#122–#147); residual ops config inject closed (#137+#146+#147); residual PVA (schedule `eligible?` bit-pack intentional)
+1. **Delivery residual** — product-shell pure dual-source complete (#122–#151); residual ops config inject closed (#137+#146+#147); residual PVA (schedule `eligible?` bit-pack intentional)
 2. **T8.3 production AOT** — receipt APIs + package-manifest (#36–#40) + pure allowlist **8 real wasm packages + host-grant binding** (#41–#42 / ADR 0159–0160) landed; remaining: ops/network AOT Components + flip readiness `:signed-wasm :ready` only when production-admissible (host-admissible pure grants OK for reference)
 3. **wasm-aot packaging claims** — pure allowlist `:wasm-aot :partial` (all 8); ops kits stay `:pending`; host-admissible ≠ production-admissible (ADR 0160)
 4. **Host parity L5** — T8.4 **partial**: critical-import conformance fixtures expanded (45 cases) + resources sync; remaining live host runners (kototama/wasm-webcomponent)
