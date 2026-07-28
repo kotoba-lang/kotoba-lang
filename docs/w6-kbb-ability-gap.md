@@ -30,7 +30,7 @@ separates **ops shells** from the JS backend.
 | `process` | spawn/await bounded process | **OS transport landed** (provider#25 os-spawn) | high | cljs spawn / SSH still open |
 | `ssh-or-remote-exec` | remote exec without ambient OpenSSH | missing | high | murakumo fleet SSH (may stay host forever) |
 | `git` | status/log (+ optional worktree) | missing | medium | repo tooling scripts |
-| `secret-custody` | named secret fetch (no dump) | **contract first slice** (provider#26 id 21) | high | kagi transport + ops CLI cutover |
+| `secret-custody` | named secret fetch (no dump) | **host transports + ops cutover** (provider#27 + murakumo#48 + com-cloudflare#3) | high | remaining ambient getenv call-sites; live kagi wire |
 | `cloud-deploy` | Workers/Pages deploy verbs | missing | low | scripted publish |
 | `clock-and-random` | clock + CSPRNG | partial | medium | compat actor ids |
 
@@ -58,10 +58,12 @@ separates **ops shells** from the JS backend.
 ## Progress (continued)
 
 - **2026-07-28 provider#26 / ADR 0145:** `provider.secret` (id 21) get-only allowlist + `env-fetch`/`map-fetch` (no dump).
+- **2026-07-28 provider#27 / ADR 0146:** `fn-fetch` (kagi/one-shot) + `keychain-fetch` (single-item `-w` only).
+- **2026-07-28 murakumo#48 + com-cloudflare#3:** ops CLI named-secret cutover for token HMAC + `CLOUDFLARE_API_TOKEN`.
 
 ## Next
 
-1. **Ops CLI cutover** — murakumo/cloudflare use secret kit instead of ambient getenv.  
-2. **cljs/nbb** OS spawn + root-mount transports (sync contract).  
-3. Decide **ssh forever-host** vs kit.  
-4. Optional **kagi** one-shot getter as `:fetch`.
+1. **cljs/nbb** OS spawn + root-mount transports (sync contract).  
+2. Decide **ssh forever-host** vs kit.  
+3. Audit remaining murakumo ambient getenv call-sites; optional live kagi `fn-fetch` wire.  
+4. Close secret-custody gap only after broader call-site evidence.
