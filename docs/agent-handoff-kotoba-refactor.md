@@ -45,6 +45,7 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 | T8.3 remainder first slice: signed Wasm provider receipts (fixture digest API) | provider#37 / ADR 0155 |
 | provision.plan pure oracle expand (launch/peer/watchdog) | murakumo#139 |
 | reconcile.plan pure oracle expand (CLI flags + action gates) | murakumo#140 |
+| cloud.plan pure oracle expand (webtransport + generic endpoints) | murakumo#142 |
 | deploy.plan pure oracle expand (execution probe + pin paths) | murakumo#138 |
 | dash.state probe parse pure oracle expand | murakumo#136 |
 | Pure capability allowlist reference-impl | **COMPLETE** (sin / cos / sha256 / cbor / json / clock / random / now-days) |
@@ -66,7 +67,7 @@ Next language work: T1.2 conformance matrix, T1.3 dual-backend runner, T4 stdlib
 
 ### Plan Next (priority order)
 
-1. **Delivery residual** — product-shell pure dual-source complete (#122–#140); optional HOME/bin config leave; residual PVA (schedule `eligible?` bit-pack intentional)
+1. **Delivery residual** — product-shell pure dual-source complete (#122–#142); optional HOME/bin config leave; residual PVA (schedule `eligible?` bit-pack intentional)
 2. **T8.3 production AOT** — signed kit EDN (#36) + signed Wasm **receipt API** (#37 / ADR 0155) landed; remaining: real content-addressed Component packages + readiness `:signed-wasm :ready` for HTTP/secret
 3. **wasm-aot packaging claims** — still pending honesty (ADR 0152–0155); do not claim ready from fixture receipts
 4. **Host parity L5** — T8.4 expand `lang/host-parity.edn` for critical imports
