@@ -45,7 +45,7 @@ compiler / KIR / wasm / native / legacy path skew.
 |---|---|---|---|---|---|
 | T1.1 | Author `docs/lang/semantics-ssot.md` (values, evaluation, fuel, errors, capability call) | **kotoba-lang** | Accepted prose SSoT; points at executable suites | — | M |
 | T1.2 | Expand `lang/conformance/manifest.edn` to list **required** backends per case class — **landed** (v2 matrix + `conformance-matrix` + tests; ADR-reliability-t12) | **kotoba-lang** | Machine-readable matrix | T1.1 | S |
-| T1.3 | Implement/extend runner: each case runs on **KIR + wasm32-kotoba-v1** minimum — **pilot expanded** (compiler#412–#423 / ADR 0161–0173; **22** pure-product dual-green incl. loop/recur; full matrix progressive) | **compiler**, **kotoba-kir**, **kotoba-wasm** | `clojure -M:conformance` green on both | T1.2 | L |
+| T1.3 | Implement/extend runner: each case runs on **KIR + wasm32-kotoba-v1** minimum — **pilot expanded** (compiler#412–#424 / ADR 0161–0174; **23** pure-product dual-green incl. T7.4 10k loop; full matrix progressive) | **compiler**, **kotoba-kir**, **kotoba-wasm** | `clojure -M:conformance` green on both | T1.2 | L |
 | T1.4 | Add native (x86_64/aarch64) cases for pure i64/string/option subset — **pilot landed** (compiler#419 / ADR 0168; 5 pure-native-v1 kexe cases on host ISA) | **compiler**, **kotoba-native** | Profile `pure-native-v1` cases | T1.3 | L |
 | T1.5 | Golden digests for IR + selected artifact bytes (where policy allows) — **landed** (compiler#418 / ADR 0167; pilot-golden.edn 13 cases; gensym-normalized KIR + wasm SHA-256) | **compiler**, **artifact** | CI fails on silent semantic drift | T1.3 | M |
 
@@ -138,7 +138,7 @@ compiler / KIR / wasm / native / legacy path skew.
 | T7.1 | `loop`/`recur` true tail on KIR + wasm — **partial landed**: helper desugar + dual-backend pilot (compiler#423); machine TCO / zero-charge recur still open | **compiler**, **kotoba-kir**, **kotoba-wasm** | Spec + tests | roadmap | L |
 | T7.2 | Fuel model doc: charge rules, defaults, per-module budgets — **landed** (`docs/lang/fuel-model.md`; 1 unit/function entry, default 512) | **kotoba-lang**, **kotoba-kir** | `docs/lang/fuel-model.md` | T1.1 | S |
 | T7.3 | `kotoba fuel-estimate` or compile-time crude cost attribute (optional) — **landed** (compiler#419 / ADR 0169; `clojure -M:fuel-estimate`) | **compiler** | Best-effort tool | T7.2 | M |
-| T7.4 | Conformance: tail recursion 10k iterations within fuel envelope | **compiler** | Regression | T7.1 | S |
+| T7.4 | Conformance: tail recursion 10k iterations within fuel envelope — **landed** (compiler#424 / ADR 0174 + kotoba-kir#21+#22 / ADR 0021; `:loop-deep-kit` fuel 12000; loop-helper trampoline; zero-charge still open) | **compiler**, **kotoba-kir** | Regression | T7.1 | S |
 
 **Exit:** Authors can predict stack/fuel for iterative pure code.
 
