@@ -21,3 +21,17 @@ clojure -M:test -n kotoba.lang.malicious-source-test
 L-07 remains `in-progress`: the production compiler, CLJS reader, and component
 admission lanes must each run this manifest directly, and coverage-guided
 mutation should expand it with minimized regressions from future findings.
+
+## Compiler frontend ambient gate (T2.4)
+
+The normative evaluator corpus above covers policy classes. The **compiler**
+additionally runs an always-on guest-source ambient reject suite:
+
+- Repo: `kotoba-lang/compiler`
+- Namespace: `kotoba.compiler.ambient-negative-corpus-test`
+- ADR: compiler `docs/adr/0166-reliability-t24-ambient-negative-corpus.md`
+- Codes: `:kotoba.error/ambient-forbidden`, `:max-parameters`, `:top-level-form`
+
+L-07 production-lane wiring for this *evaluator* manifest remains progressive;
+the frontend ambient suite is the landed T2.4 compiler half.
+
