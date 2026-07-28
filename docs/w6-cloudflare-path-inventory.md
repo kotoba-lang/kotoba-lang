@@ -79,8 +79,10 @@ EDN equality on request maps / parse fixtures → HTTP + token remain host.
 - **2026-07-28 com-cloudflare-compat#3:** **product-shell oracle authority** — `compat_core.kir.edn` + host-wire coerce/path/limit/status pure helpers (ADR 0002). Handlers/store stay host.
 - **2026-07-28 com-cloudflare#17:** **cljs/nbb product-shell oracle load + dual-source pure helpers** — `register-kir!` / `set-resource-loader!` / node-fs resources; try-oracle dual-source for client/path/stream/analytics/deploy pure surfaces. HTTP/JSON/multipart/SHA host remains. ADR 0014.
 
+- **2026-07-28 com-cloudflare-compat#5:** **cljs/nbb product-shell oracle load + dual-source pure helpers** — register-kir!/node-fs + try-oracle on constants/paths/coerce/status/health-actor. Handlers/store/WASM L5 stay host. ADR 0003.
+
 ## Next
 1. com-cloudflare product-shell dual-source complete through #17 (JVM host-wire #14+#16 + cljs #17). Remaining: live token host / workerd product cutover / Logpush destination fetch (blocked-by-provider).  
-2. compat product-shell dual-source landed (#3); handlers/store/WASM L5 packaging still host/blocked.  
+2. compat product-shell dual-source complete (#3 JVM + #5 cljs); handlers/store/WASM L5 packaging still host/blocked.  
 3. murakumo portable .cljc pure cljs dual-source complete (#122–#133); residual Delivery 5–8 shells / network·secret signed providers.
 
