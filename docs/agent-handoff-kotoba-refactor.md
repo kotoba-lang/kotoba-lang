@@ -82,15 +82,18 @@ Authoritative work breakdown (repos, tasks, sequencing, agent guide):
 Tiers R1–R4: semantic conformance → stdlib/records → standalone run → toolchain/LTS.
 Product dual-source remains separate (this handoff §2); do not invent language features in product PRs.
 
-**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#416 T1.3 dual-backend pilot (**13** dual-green), T2.2 surface-matrix, T2.4 ambient negative corpus (compiler#417), T5.4 keep max-parameters=5, T7.2 fuel model.
+**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#416 T1.3 dual-backend pilot (**13** dual-green), **T1.5 golden digests** (compiler#418), T2.2 surface-matrix, T2.4 ambient corpus (compiler#417), T5.4 max-parameters=5, T6.3 tool-vs-runtime, T7.2 fuel model.
 
-Next language work: T1.3 full matrix (collections still admission-blocked); T1.4 native; T4.2 string-split optional; T4.4 typed-map pilot; T5.2 native record wire; T5.3 pack rewrites; T7.1 true tail; T8.3 ops AOT; residual PVA intentional.
+Next language work: T1.3 full matrix (collections still admission-blocked); T1.4 native; T4.2 string-split optional; T4.4 typed-map pilot; T5.2 native record wire; T5.3 pack rewrites; T6.1 standalone run; T7.1 true tail; T8.3 ops AOT; residual PVA intentional.
 
 **T7.2 fuel model:** [`docs/lang/fuel-model.md`](./lang/fuel-model.md) (1 unit/function entry, default 512).
+**T1.5 goldens:** compiler#418 / ADR 0167 — `clojure -M:conformance --check-golden`.
 **T2.2 surface matrix:** [`docs/lang/surface-matrix.md`](./lang/surface-matrix.md) (`clojure -M -m kotoba.lang.surface-matrix --check`).
 **T2.4 ambient corpus:** compiler#417 / ADR 0166 + [`grade-a-malicious-source-corpus.md`](./grade-a-malicious-source-corpus.md).
 **T4.4 records:** [`docs/lang/record-cookbook.md`](./lang/record-cookbook.md) + compiler#416.
+**T4.5 collections costs:** [`docs/lang/collections-costs.md`](./lang/collections-costs.md).
 **T5.4 max-parameters:** keep **5** ([ADR-reliability-t54](./adr/ADR-reliability-t54-max-parameters.md)).
+**T6.3 tool vs runtime:** [ADR-reliability-t63](./adr/ADR-reliability-t63-tool-vs-runtime.md).
 
 ### Plan Next (priority order)
 

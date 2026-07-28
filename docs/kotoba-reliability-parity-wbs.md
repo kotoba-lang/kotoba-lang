@@ -47,7 +47,7 @@ compiler / KIR / wasm / native / legacy path skew.
 | T1.2 | Expand `lang/conformance/manifest.edn` to list **required** backends per case class — **landed** (v2 matrix + `conformance-matrix` + tests; ADR-reliability-t12) | **kotoba-lang** | Machine-readable matrix | T1.1 | S |
 | T1.3 | Implement/extend runner: each case runs on **KIR + wasm32-kotoba-v1** minimum — **pilot expanded** (compiler#412–#416 / ADR 0161–0165; **13** pure-product dual-green = control5 + string-ops + record-kit; full matrix progressive) | **compiler**, **kotoba-kir**, **kotoba-wasm** | `clojure -M:conformance` green on both | T1.2 | L |
 | T1.4 | Add native (x86_64/aarch64) cases for pure i64/string/option subset | **compiler**, **kotoba-native** | Profile `pure-native-v1` cases | T1.3 | L |
-| T1.5 | Golden digests for IR + selected artifact bytes (where policy allows) | **compiler**, **artifact** | CI fails on silent semantic drift | T1.3 | M |
+| T1.5 | Golden digests for IR + selected artifact bytes (where policy allows) — **landed** (compiler#418 / ADR 0167; pilot-golden.edn 13 cases; gensym-normalized KIR + wasm SHA-256) | **compiler**, **artifact** | CI fails on silent semantic drift | T1.3 | M |
 
 **Exit:** One failing backend fails the language gate; no “works on KIR only” silent pass for pure-product surface.
 
@@ -93,7 +93,7 @@ compiler / KIR / wasm / native / legacy path skew.
 | T4.2 | Ship `string` kit: length, from-i64, join (bounded), split (bounded optional) — **partial landed**: join via concat desugar (compiler#413 / ADR 0162); split deferred | **compiler** (desugar/helpers), **kotoba-kir** | Documented ops + tests | T1.3 | M |
 | T4.3 | Ship `option`/`result` usage guide + helpers (if-some already fixed) — **landed** (option-result-guide.md + examples/option-result; ADR-reliability-t43) | **kotoba-lang** docs, **compiler** examples | Guide + golden | T2.3 | S |
 | T4.4 | Ship `record` + small typed-map cookbook for pure-product — **partial landed**: record cookbook + dual-backend `:record-kit` (compiler#416 / ADR 0165); typed-map pure pilot deferred | **kotoba-lang**, **compiler** | Replace public base-N packs where possible | T5 | M |
-| T4.5 | Collections: document O-costs; add only **bounded** map/filter/reduce over hetero-vector/typed-map | **compiler**, **kotoba-lang** | No silent O(n²) without docs | T1.1 | M |
+| T4.5 | Collections: document O-costs; add only **bounded** map/filter/reduce over hetero-vector/typed-map — **docs landed** (`docs/lang/collections-costs.md`); new ops still dual-backend gated | **compiler**, **kotoba-lang** | No silent O(n²) without docs | T1.1 | M |
 
 **Exit:** New pure oracle rarely needs private `nat-str` / digit tables.
 
@@ -122,7 +122,7 @@ compiler / KIR / wasm / native / legacy path skew.
 |---|---|---|---|---|---|
 | T6.1 | Define **primary standalone run path** (wasmtime **or** kexe loader) | **kotoba**, **compiler**, **aiueos**/loader | Documented `kotoba run` without `clojure -M` for pure apps | T1.3 | L |
 | T6.2 | Precompiled KIR (or wasm) as default product artifact (already murakumo pattern) | product repos | Gen in CI; no compiler on prod classpath | — | M |
-| T6.3 | Bootstrap plan: compiler remains CLJ **tool**; language runtime is not | **kotoba-lang** ADR | Clear tool vs runtime split | T6.1 | S |
+| T6.3 | Bootstrap plan: compiler remains CLJ **tool**; language runtime is not — **landed** (ADR-reliability-t63) | **kotoba-lang** ADR | Clear tool vs runtime split | T6.1 | S |
 | T6.4 | cljs/browser: execute same pure artifacts (optional oracle load) | **kotoba-kir** cljs, **wasm-webcomponent** | Remove pure mirror where possible | T6.2 | L |
 
 **Exit:** Pure app demo runs in CI on wasmtime/kexe with zero Clojure at runtime.

@@ -10,6 +10,7 @@ fuel, errors, capabilities, multi-backend meaning (R1 / T1.1).
 **Records (T4.4):** [`record-cookbook.md`](./record-cookbook.md).  
 **Option/result (T4.3):** [`option-result-guide.md`](./option-result-guide.md).  
 **String kit (T4.2):** [`string-kit.md`](./string-kit.md).
+**Collections costs (T4.5):** [`collections-costs.md`](./collections-costs.md).
 
 Kotoba source is a Kotoba/EDN subset with a capability-safe profile for
 untrusted or AI-generated code. `.kotoba` is the canonical Kotoba-only source
