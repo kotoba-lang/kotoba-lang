@@ -45,7 +45,7 @@ compiler / KIR / wasm / native / legacy path skew.
 |---|---|---|---|---|---|
 | T1.1 | Author `docs/lang/semantics-ssot.md` (values, evaluation, fuel, errors, capability call) | **kotoba-lang** | Accepted prose SSoT; points at executable suites | — | M |
 | T1.2 | Expand `lang/conformance/manifest.edn` to list **required** backends per case class — **landed** (v2 matrix + `conformance-matrix` + tests; ADR-reliability-t12) | **kotoba-lang** | Machine-readable matrix | T1.1 | S |
-| T1.3 | Implement/extend runner: each case runs on **KIR + wasm32-kotoba-v1** minimum — **pilot expanded** (compiler#412–#426 / ADR 0161–0176; **29** pure-product dual-green incl. typed-map + if-some/control + T7.4 10k; full matrix progressive) | **compiler**, **kotoba-kir**, **kotoba-wasm** | `clojure -M:conformance` green on both | T1.2 | L |
+| T1.3 | Implement/extend runner: each case runs on **KIR + wasm32-kotoba-v1** minimum — **pilot expanded** (compiler#412–#427 / ADR 0161–0177; **30** pure-product dual-green incl. string-split-count + typed-map + T7.4 10k; full matrix progressive) | **compiler**, **kotoba-kir**, **kotoba-wasm** | `clojure -M:conformance` green on both | T1.2 | L |
 | T1.4 | Add native (x86_64/aarch64) cases for pure i64/string/option subset — **pilot landed** (compiler#419 / ADR 0168; 5 pure-native-v1 kexe cases on host ISA) | **compiler**, **kotoba-native** | Profile `pure-native-v1` cases | T1.3 | L |
 | T1.5 | Golden digests for IR + selected artifact bytes (where policy allows) — **landed** (compiler#418 / ADR 0167; pilot-golden.edn 13 cases; gensym-normalized KIR + wasm SHA-256) | **compiler**, **artifact** | CI fails on silent semantic drift | T1.3 | M |
 
@@ -90,7 +90,7 @@ compiler / KIR / wasm / native / legacy path skew.
 | ID | Task | Owner repo(s) | Deliverable | Depends | Estimate |
 |---|---|---|---|---|---|
 | T4.1 | Freeze `stdlib` module list in `lang/conformance/stdlib/` — **landed** (manifest.edn + core mirror + tests; ADR-reliability-t41) | **kotoba-lang** | Manifest of public names | PVA v1 | S |
-| T4.2 | Ship `string` kit: length, from-i64, join (bounded), split (bounded optional) — **partial landed**: join (compiler#413) + dual-backend string-byte-length (compiler#425); split deferred | **compiler** (desugar/helpers), **kotoba-kir** | Documented ops + tests | T1.3 | M |
+| T4.2 | Ship `string` kit: length, from-i64, join (bounded), split (bounded optional) — **landed for count**: join + byte-length + **string-split-count** (compiler#427 / kir#23 / wasm#34); full split-to-collection deferred | **compiler**, **kotoba-kir**, **kotoba-wasm** | Documented ops + tests | T1.3 | M |
 | T4.3 | Ship `option`/`result` usage guide + helpers (if-some already fixed) — **landed** (option-result-guide.md + examples/option-result; ADR-reliability-t43) | **kotoba-lang** docs, **compiler** examples | Guide + golden | T2.3 | S |
 | T4.4 | Ship `record` + small typed-map cookbook for pure-product — **landed**: record cookbook + `:record-kit` (compiler#416) + typed-map dual-backend pilot (compiler#426 / ADR 0176; `[:map :i64 :i64]`) | **kotoba-lang**, **compiler** | Replace public base-N packs where possible | T5 | M |
 | T4.5 | Collections: document O-costs; add only **bounded** map/filter/reduce over hetero-vector/typed-map — **docs landed** (`docs/lang/collections-costs.md`); new ops still dual-backend gated | **compiler**, **kotoba-lang** | No silent O(n²) without docs | T1.1 | M |
