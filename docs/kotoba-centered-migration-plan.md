@@ -1,5 +1,12 @@
 # Kotoba-centered migration plan
 
+> **Agent handoff (2026-07-28):** start at
+> [`docs/agent-handoff-kotoba-refactor.md`](./agent-handoff-kotoba-refactor.md)
+> and superproject `ADR-2607289500` (capability semantic CID + resume points).
+> Capability 1-repo / definition-CID contract: [`docs/adr/ADR-capability-repository-semantic-cid-v1.md`](./adr/ADR-capability-repository-semantic-cid-v1.md)
+> (core-contracts#21 @ `2e615d17…`, tamaki#10 @ `660e70bf…`, kototama#95 @ `74146a89…`).
+
+
 This plan turns the existing Clojure-shaped language contract, Unison-inspired
 definition identity, typed abilities, portable effects, and compiler admission
 gates into one migration path. It does not introduce a replacement application
@@ -310,7 +317,7 @@ Qualify vertical families in dependency order:
 **W6 process+scoped-fs contract (2026-07-28, provider#24 / ADR 0143):** capability ids 19/20; mem-store + echo-transport; pure path/spawn policy.
 **W6 process+scoped-fs OS transports (2026-07-28, provider#25 / ADR 0144):** os-spawn (:binaries) + os-store (:roots); no ambient PATH/FS.
 **W6 secret-custody contract (2026-07-28, provider#26 / ADR 0145):** id 21 get-only allowlist + env-fetch/map-fetch (no dump).
-Next: W6 ops CLI secret cutover / cljs OS transports / optional medium murakumo pure planners.
+Next: W6 ops CLI secret cutover / cljs OS transports / remaining medium murakumo pure planners; capability Wasm implementations remain contract-only (definition CID identity landed — see agent-handoff + ADR-capability-repository-semantic-cid-v1).
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -729,3 +736,21 @@ Kotoba is the center when:
 - capability removal reliably causes compile, instantiate, or provider
   admission failure.
 
+## Capability repository semantic CID (2026-07-28)
+
+Authority capabilities are published as **one public repository per capability**
+(`capability-*`), with import identity equal to **`:capability/definition-cid`**
+(CIDv1 over a canonical DAG-CBOR definition block). Repository names and Radicle
+RIDs are discovery aliases only. Tamaki emits both definition and hash-contract
+CIDs on the execution envelope; Kototama admits exact definition CIDs and rejects
+drift.
+
+| Repo | PR | Merge SHA |
+|---|---|---|
+| kotoba-core-contracts | [#21](https://github.com/kotoba-lang/kotoba-core-contracts/pull/21) | `2e615d17406ef4b6311401167294becceb5af2a1` |
+| tamaki | [#10](https://github.com/kotoba-lang/tamaki/pull/10) | `660e70bfbb08423d1f498616a68d4d01ae2a39e5` |
+| kototama | [#95](https://github.com/kotoba-lang/kototama/pull/95) | `74146a896dfae72b8eb407acf6f5717e0d2fd2e1` |
+
+Details: [`docs/adr/ADR-capability-repository-semantic-cid-v1.md`](./adr/ADR-capability-repository-semantic-cid-v1.md),
+[`docs/agent-handoff-kotoba-refactor.md`](./agent-handoff-kotoba-refactor.md).
+Generated packages remain `contract-only` until a signed Wasm component exists.
