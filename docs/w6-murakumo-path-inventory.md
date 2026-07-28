@@ -98,10 +98,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#86:** **product-shell oracle authority** (first dual-source cutover) — `murakumo.kekkai.gate` JVM public API delegates pure helpers to precompiled KIR (`resources/murakumo/oracle/kekkai_gate_core.kir.edn`) via `murakumo.kotoba.oracle` + `kotoba-kir`/`ir/execute`. Compiler stays test-only; CI drift gate regenerates with `murakumo.kotoba-oracle-gen`. ADR `ADR-260728-w6-product-shell-oracle-authority`.
 - **2026-07-28 murakumo#87:** live HMAC + AES host adapters — token pure wire (`encode-claims-json`/`signing-input`/`wire-token`/`constant-time=`) on live `sign`/`verify`; overlay.crypto packaging gates on `open` (AES-GCM Cipher stays host).
 - **2026-07-28 murakumo#88:** **product-shell oracle authority (token)** — `murakumo.token` JVM pure helpers delegate to `resources/murakumo/oracle/token_core.kir.edn` via `:token` catalog; HMAC/b64url host remains.
+- **2026-07-28 murakumo#89:** **product-shell oracle authority (report)** — `murakumo.report` JVM pure helpers (headers/pad/rows/`command-help`/reconcile pure builders/constants) delegate to `resources/murakumo/oracle/report_core.kir.edn` via `:report-core` catalog; host remains map projection + CSV joins + reconcile mapcat. ADR `ADR-260728-w6-report-oracle-authority`.
 
 ## Next
 
-1. murakumo pure+adapter path **#61–#88** complete (kekkai + token product-shell KIR + live HMAC/AES). Remaining: expand catalog (report/infer/…) / Delivery 5–8 remaining shells / network·secret caps contract-only / cljs oracle load optional.
+1. murakumo pure+adapter path **#61–#89** complete (kekkai + token + report product-shell KIR + live HMAC/AES). Remaining: expand catalog (infer/plan/…) / Delivery 5–8 remaining shells / network·secret caps contract-only / cljs oracle load optional.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
-4. Full pure-planner cutover still dual-implemented until each core is wired like #86/#88 (or bulk generate); blocked on production compiler (avoid) / kbb in-process load (future optional).
+4. Full pure-planner cutover still dual-implemented until each core is wired like #86/#88/#89 (or bulk generate); blocked on production compiler (avoid) / kbb in-process load (future optional).
