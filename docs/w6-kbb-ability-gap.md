@@ -66,3 +66,11 @@ separates **ops shells** from the JS backend.
 2. Optional live **kagi** `fn-fetch` wire.  
 3. **git** kit first slice (medium) when tooling needs it.  
 4. **cloud-deploy** stays low priority ops.
+
+## 2026-07-28 update
+
+- **git kit** contract first slice: `provider.git` id **22** (ADR 0148) — pure
+  subcommand allowlist + echo transport.
+- **QUIC cert path-ref**: murakumo overlay cert store accepts scoped-fs shaped
+  `:path-ref` + `:root-dirs` (murakumo#52).
+- **kagi-fetch**: `murakumo.secret/kagi-fetch` wires name→ref + one-shot getter.
