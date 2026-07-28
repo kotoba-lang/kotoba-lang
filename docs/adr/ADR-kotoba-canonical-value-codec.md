@@ -1,10 +1,11 @@
 # ADR — Canonical value codec for EDN data identity
 
-- **Status**: Proposed — VC0–VC3 implemented, VC4–VC5 outstanding
+- **Status**: Proposed — VC0–VC4 implemented, VC5 outstanding
 - **Date**: 2026-07-28
 - **Artifacts**: `lang/value-codec.edn`,
   `kotoba-lang/io-ipld:src/ipld/value.cljc`,
-  `kotoba-lang/arrangement:src/arrangement/core.cljc`
+  `kotoba-lang/arrangement:src/arrangement/core.cljc`,
+  `kotoba-lang/kotoba:src/kotoba/semantic_code.cljc`
 - **Related**: `ADR-kotoba-code-identity-and-abilities.md`,
   `ADR-kotoba-lang-profile.md`, `ADR-safe-capability-language.md`,
   `kotoba:docs/ADR-kotoba-content-addressed-codebase-gap.md` (G5)
@@ -269,9 +270,21 @@ stage VC5 below adds no permission that stage VC0 did not already have.
 | VC1 | Codec implementation plus JVM/cljs conformance vectors | byte-identical output on both runtimes; every rejected type has a negative vector | implemented |
 | VC2 | `io-ipld` `encode-value`/`decode-value` | existing node `encode`/`decode` callers unchanged | implemented |
 | VC3 | `arrangement` leaf values on the codec, `schema-version` 2, declared migration | a v1 snapshot either migrates or is rejected with a named reason; never reinterpreted | implemented |
-| VC4 | `semantic-code` delegates literals; float literals admitted under contract v2 | v1 definition CIDs still verify under the v1 contract | pending |
+| VC4 | `semantic-code` delegates literals; float literals admitted; contract identity names the codec | v1 definition CIDs still verify under the v1 contract | implemented |
 | VC5 | `:data-host-arg` lowering and typed host decode for structured arguments | constants only; no runtime construction; capability rules unchanged | pending |
 
-Until VC3 and VC4 land, the design must be described as **proposed**, and
-`arrangement`'s documented string-only persistence and `semantic-code`'s v1
-literal subset remain the operative contracts.
+VC4 also fixed two defects it uncovered rather than working around them: a
+quoted form was not data (`'[a b]` recursed through `normalize-expr`, resolving
+`a` and `b` as global **references**, while `'(a b)` had no branch at all), and
+set/map literal order was computed over **signed** JVM bytes, so the same
+literal hashed to two different definition CIDs depending on which runtime
+compiled it.
+
+One boundary is recorded rather than hidden: a float literal is admitted where
+the reader preserves float-ness (JVM). On ClojureScript a source `1.0` and a
+source `1` are the same runtime value, so a non-integral literal is rejected
+rather than guessed — fail-closed, never two encodings for one source program.
+
+With VC5 outstanding, the design remains **proposed**: structured host
+arguments still cross the boundary as opaque strings under the 127-byte
+portable-string bound.
