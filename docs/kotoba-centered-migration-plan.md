@@ -325,9 +325,9 @@ Qualify vertical families in dependency order:
 **W6 QUIC path-ref + kagi-fetch (2026-07-28, murakumo#52+#53):** cert store scoped roots + `kagi-fetch`; quic_driver path refs (no PEM-in-env).
 **W6 git kit (2026-07-28, provider#29+#31+#32 / ADR 0148–0150):** id 22 dual-runtime os-run + murakumo#55 deploy pin absolute git.
 **W6 entropy kit (2026-07-28, provider#33 / ADR 0151):** id 23 CSPRNG draw; clock-and-random gap closed.
-**W6 cloud-deploy (2026-07-28, com-cloudflare#5–#9):** pure plans + oracles + module multipart + Pages bulk Direct Upload.
+**W6 cloud-deploy (2026-07-28, com-cloudflare#5–#10):** pure plans + oracles + module multipart + Pages bulk + path oracle.
 **W6 bare-git audit (2026-07-28, murakumo#58):** absolute git-bin only.
-Next: medium pure planners / product verticals; W6 kbb gaps complete; capability Wasm implementations remain contract-only (definition CID identity landed — see agent-handoff + ADR-capability-repository-semantic-cid-v1).
+Next: product verticals / Delivery 5–8; W6 kbb gaps complete; capability Wasm implementations remain contract-only (definition CID identity landed — see agent-handoff + ADR-capability-repository-semantic-cid-v1).
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -538,8 +538,8 @@ Next: medium pure planners / product verticals; W6 kbb gaps complete; capability
    **W6 secret remaining cutover (2026-07-28, murakumo#50):** SERVICE/METRICS/overlay auth-key.
    **W6 QUIC path-ref + kagi-fetch + git dual-runtime/tooling (2026-07-28, murakumo#52+#53+#55 + provider#29+#31+#32).**
    **W6 entropy kit (2026-07-28, provider#33 / ADR 0151):** CSPRNG id 23; clock-and-random landed.
-   **W6 cloud-deploy complete + bare-git audit (2026-07-28, com-cloudflare#5–#9 + murakumo#58).**
-   Next: W6 medium pure planners / product verticals (kbb gaps complete).
+   **W6 cloud-deploy complete + pages-bulk oracle + bare-git audit (2026-07-28, com-cloudflare#5–#10 + murakumo#58).**
+   Next: product verticals / Delivery 5–8 (W6 kbb gaps complete).
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
