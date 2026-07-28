@@ -86,9 +86,10 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#73:** schedule pick pure — pick-idx-2-full / pick-idx-3-tournament / warm+score.
 - **2026-07-28 murakumo#74:** `report_core` command-help + reconcile-lines pure fragments (title/row/detail/reach/drift).
 - **2026-07-28 murakumo#75:** reconcile pick-targets pure — first-of-2/3 + pick-targets-2-pack (load×name).
+- **2026-07-28 murakumo#76:** schedule `assign-step-2` + task `task-eligible?` / fill-milli / wave-slot pure assign cores.
 
 ## Next
 
-1. murakumo pure-planner path #61–#75 complete (incl. reconcile pick-targets). Remaining: n≠3 node-id plan maps / assign job batches / eligible-nodes set algebra / crypto/host shells.
+1. murakumo pure-planner path #61–#76 complete (incl. assign-step + task eligible). Remaining: n≠3 node-id plan maps / full assign reduce over variable nodes / crypto/host shells.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
