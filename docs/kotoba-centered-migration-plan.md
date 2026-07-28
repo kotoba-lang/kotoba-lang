@@ -757,3 +757,10 @@ drift.
 Details: [`docs/adr/ADR-capability-repository-semantic-cid-v1.md`](./adr/ADR-capability-repository-semantic-cid-v1.md),
 [`docs/agent-handoff-kotoba-refactor.md`](./agent-handoff-kotoba-refactor.md).
 Generated packages remain `contract-only` until a signed Wasm component exists.
+
+## Capability package reference-implemented (2026-07-28)
+
+core-contracts#22 unlocks `:reference-implemented` for pure allowlist caps.
+First packages: capability-math-sin#1, capability-math-cos#1 (wasm + JVM Math).
+Next: hash/sha256 and other allowlisted pure caps.
+

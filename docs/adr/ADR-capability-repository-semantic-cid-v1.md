@@ -79,3 +79,10 @@ Kototama Tamaki-contract slice 5/8.
   `repository-refs-for-imports`)
 - `scripts/scaffold_capability_repos.clj`
 - Example package README: `kotoba-lang/capability-http-fetch`
+
+## Amendment: reference-implemented (2026-07-28)
+
+`kotoba-core-contracts#22` allows `:provider-status :reference-implemented` for an
+allowlist of pure capabilities when `artifacts/*.wasm` + sha256 + exports are
+published. Definition CIDs remain independent of digests. First landings:
+`capability-math-sin#1`, `capability-math-cos#1`.
