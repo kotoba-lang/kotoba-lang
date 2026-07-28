@@ -34,7 +34,7 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 | W5 product verticals (put/get/CAS/conditional) | **0140–0142** |
 | W6 inventories | murakumo / cloudflare / kbb gap |
 | W6 murakumo pure-planners **high** | **6/6** (#37–#42) |
-| W6 murakumo pure-planners **medium+** | **complete through #96** (#61–#96: product-shell KIR for kekkai/token/report/infer.plan/dash/schedule/task/engine + live HMAC/AES) |
+| W6 murakumo pure-planners **medium+** | **complete through #98** (#61–#98: product-shell KIR for kekkai/token/report/infer.plan/dash/schedule/task/engine/secret + live HMAC/AES) |
 | W6 cloudflare pure-request / deploy oracles | client / stream / analytics / deploy / pages (com-cloudflare) |
 | W6 kbb ability gaps | **COMPLETE** (process / scoped-fs / secret / git / entropy / cloud-deploy; SSH host-forever) |
 | W6 process / scoped-fs / secret / git / entropy kits | provider ADR **0143–0151** (ids 19–23; cljs OS transports landed) |
@@ -43,12 +43,12 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 
 ### Plan Next (priority order)
 
-1. **Expand product-shell oracles** — more verticals / bulk catalog gen beyond #86–#96 (precompiled KIR + host delegate)
+1. **Expand product-shell oracles** — bulk catalog gen beyond #86–#98 (precompiled KIR + host delegate for remaining cores)
 2. **Delivery 5–8 remaining shells** — continue wiring pure oracles into real entrypoints (not new DSL)
 3. **Production signed providers** for network / secret capabilities (leave pure allowlist alone; signed content-addressed Wasm)
 4. **wasm-aot packaging claims** — packaging / AOT path honesty vs remaining host shells
 
-**Landed 2026-07-28:** product-shell KIR authority for kekkai (#86), token (#88), report (#89), infer.plan (#91), dash.state (#93), schedule (#94), task.plan (#95), engine (#96); live HMAC/AES host adapters (#87).
+**Landed 2026-07-28:** product-shell KIR authority for kekkai (#86), token (#88), report (#89), infer.plan (#91), dash.state (#93), schedule (#94), task.plan (#95), engine (#96), secret (#98); live HMAC/AES host adapters (#87).
 
 ### Do not
 
@@ -213,5 +213,6 @@ Network/secret caps stay contract-only until signed production providers exist.
 | product-shell oracle authority (infer.schedule) | murakumo#94 |
 | product-shell oracle authority (task.plan) | murakumo#95 |
 | product-shell oracle authority (infer.engine) | murakumo#96 |
+| product-shell oracle authority (secret) | murakumo#98 |
 | zones query + hostname-match oracle | com-cloudflare#13 |
 | clock/time/random reference-impl | capability-*-#1 |
