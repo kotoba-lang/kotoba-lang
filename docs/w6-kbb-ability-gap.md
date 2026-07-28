@@ -31,7 +31,7 @@ separates **ops shells** from the JS backend.
 | `ssh-or-remote-exec` | remote exec without ambient OpenSSH | **host-forever** | high | murakumo fleet stays on nbb/bb |
 | `git` | status/log (read subcommands) | **dual-runtime + tooling cutover** (provider#29+#31+#32; murakumo#55) | medium | remaining scripts |
 | `secret-custody` | named secret fetch (no dump) | **ops cutover complete** (#48–#53 + CF#3) | high | optional live kagi inject |
-| `cloud-deploy` | Workers/Pages deploy verbs | missing | low | scripted publish |
+| `cloud-deploy` | Workers/Pages deploy verbs | **pure-plan first slice** (com-cloudflare#5) | low | module multipart; pages bulk |
 | `clock-and-random` | clock + CSPRNG | **landed** (clock id 7 + entropy id 23 provider#33) | medium | — |
 
 ## Consumers
@@ -66,11 +66,13 @@ separates **ops shells** from the JS backend.
 - **2026-07-28 provider#32 / ADR 0150:** git cljs/nbb os-run (spawnSync + cwd).
 - **2026-07-28 murakumo#55:** deploy pin absolute git bin (no PATH).
 - **2026-07-28 provider#33 / ADR 0151:** `provider.entropy` id 23 CSPRNG draw + dual-runtime os-draw.
+- **2026-07-28 com-cloudflare#5 / ADR 0003:** cloud-deploy pure Workers put/delete plans + live PUT.
 
 ## Next
 
-1. **cloud-deploy** (low) — pure request builders / ops verbs under grant.  
-2. Optional remaining bare-`git` script audit outside deploy pin.
+1. Optional Workers module multipart + Pages bulk deploy.  
+2. Optional remaining bare-`git` script audit outside deploy pin.  
+3. W6 high/medium kbb gaps are largely closed — further work is ops polish.
 ## 2026-07-28 update
 
 - **git kit** contract first slice: `provider.git` id **22** (ADR 0148) — pure
