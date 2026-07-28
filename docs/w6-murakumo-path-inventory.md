@@ -159,6 +159,13 @@ fixture equality → shells remain on bb/nbb/JVM host.
 
 - **2026-07-28 provider#38:** T8.3 **identity.sign inject** adapter (`identity-signer`) + empty-module Wasm fixture resource (ADR 0156). Production AOT Component still open.
 
+
+- **2026-07-28 murakumo#144:** **tunnel + secret pure expand** — pick-exit/trim-err; secret kit-reply classify/error-code/message. ADR `ADR-260728-w6-tunnel-secret-result-pure-oracle`.
+
+- **2026-07-28 provider#39:** Ed25519 identity-signer inject **proven** (test-only org-ietf-ed25519). ADR 0157.
+
+- **2026-07-28 kotoba-lang T8.4 partial:** host-parity L5 critical conformance fixtures (45 expanded cases) + resources sync. ADR-w6-t84-host-parity-critical-fixtures.
+
 ## Next
 
 1. murakumo pure+adapter path **#61–#139**
@@ -169,7 +176,7 @@ fixture equality → shells remain on bb/nbb/JVM host.
 
 ## Next
 
-1. murakumo pure+adapter path **#61–#143** — product-shell pure dual-source complete including residual report/provision/cloud/crypto `.cljc` (#135), dash/deploy/provision pure expands (#136–#139), and reconcile flags (#140). Remaining: residual ops CLI ambient sites beyond #137 (config leave for HOME/bins already inject-friendly); residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5). Network/secret kits + signed receipt APIs landed (provider#34–#37); **production AOT signed Wasm** still pending. com-cloudflare #17 + com-cloudflare-compat #5 cljs dual-source landed.
+1. murakumo pure+adapter path **#61–#144** — product-shell pure dual-source complete including residual report/provision/cloud/crypto `.cljc` (#135), dash/deploy/provision pure expands (#136–#139), and reconcile flags (#140). Remaining: residual ops CLI ambient sites beyond #137 (config leave for HOME/bins already inject-friendly); residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5). Network/secret kits + signed receipt APIs landed (provider#34–#37); **production AOT signed Wasm** still pending. com-cloudflare #17 + com-cloudflare-compat #5 cljs dual-source landed.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#16 product-shell complete); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Deeper pure ports still dual-implemented where listed “Still host” (envelope maps, placement folds beyond wired subset, etc.); production compiler dependency remains avoided (resource path).
