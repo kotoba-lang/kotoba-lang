@@ -39,7 +39,8 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 | W6 kbb ability gaps | **COMPLETE** (process / scoped-fs / secret / git / entropy / cloud-deploy; SSH host-forever) |
 | W6 process / scoped-fs / secret / git / entropy kits | provider ADR **0143–0151** (ids 19–23; cljs OS transports landed) |
 | W6 ops kit EDN packages + signing honesty | provider **#34** / ADR **0152** (wasm-aot/signed package pending) |
-| residual ops config inject (exact-name getenv) | murakumo#137 |
+| residual ops config inject (exact-name getenv) | murakumo#137+#146+#147 |
+
 | kit ready checklist T8.1/T8.2 + unsigned package fingerprint | provider#35 / ADR 0153 |
 | T8.3 first slice: signed kit EDN package receipts | provider#36 / ADR 0154 |
 | T8.3 remainder first slice: signed Wasm provider receipts (fixture digest API) | provider#37 / ADR 0155 |
@@ -53,6 +54,7 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 | package-manifest + production blockers | provider#40 / ADR 0158 |
 | T8.3 real non-fixture Wasm package pilot (hash-sha256) | provider#41 / ADR 0159 |
 | kekkai ledger/dir/HOME via murakumo.config | murakumo#146 |
+| overlay.cert MURAKUMO_KAGI_DIR via murakumo.config | murakumo#147 |
 | Ed25519 identity-signer inject proven (test dep) | provider#39 / ADR 0157 |
 | identity.sign inject adapter + empty-module fixture | provider#38 / ADR 0156 |
 | T8.4 host-parity L5 critical conformance fixtures + resources sync | kotoba-lang (this PR) |
@@ -77,7 +79,7 @@ Next language work: T1.2 conformance matrix, T1.3 dual-backend runner, T4 stdlib
 
 ### Plan Next (priority order)
 
-1. **Delivery residual** — product-shell pure dual-source complete (#122–#145); optional HOME/bin config leave; residual PVA (schedule `eligible?` bit-pack intentional)
+1. **Delivery residual** — product-shell pure dual-source complete (#122–#147); residual ops config inject closed (#137+#146+#147); residual PVA (schedule `eligible?` bit-pack intentional)
 2. **T8.3 production AOT** — receipt APIs + package-manifest (#36–#40) + **real non-fixture wasm package pilot** (#41 / ADR 0159 hash-sha256) landed; remaining: ops/network AOT Components + readiness `:signed-wasm :ready` (fixtures still blocked; real pilot clears fixture blocker only)
 3. **wasm-aot packaging claims** — partial for pure allowlist pilot (`:wasm-aot :partial` hash-sha256); ops kits stay `:pending`; do not claim ready from fixture receipts
 4. **Host parity L5** — T8.4 **partial**: critical-import conformance fixtures expanded (45 cases) + resources sync; remaining live host runners (kototama/wasm-webcomponent)
