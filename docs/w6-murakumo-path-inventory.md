@@ -106,10 +106,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#96:** **product-shell oracle authority (infer.engine)** — JVM `rpc-server-cmd` / `endpoint` / `head-cmd-*` / mlx/embed fragments delegate to `resources/murakumo/oracle/infer_engine_core.kir.edn` via `:infer-engine`; plan walks + CSV join stay host.
 - **2026-07-28 murakumo#98:** **product-shell oracle authority (secret)** — JVM name/env constants + `valid-env-var-name?` + POSIX `valid-path-ref?` delegate to `resources/murakumo/oracle/secret_core.kir.edn` via `:secret`; env/map/kagi fetch + System.getenv stay host.
 - **2026-07-28 murakumo#99:** **bulk product-shell catalog** — all 32 `kotoba/*_core.kotoba` ship as `resources/murakumo/oracle/*.kir.edn`; auto-discover gen; host-wired secret + overlay.crypto packaging; remaining hosts wire incrementally.
+- **2026-07-28 murakumo#100:** **product-shell oracle authority (tunnel + config)** — JVM `murakumo.tunnel` pure conn-opts/wrap-cmd/parse-rc digits/scp-dest/forward/curl and `murakumo.config` path builders delegate to `tunnel_core.kir.edn` / `config_core.kir.edn`; SSH argv assembly, EDN I/O, env folds stay host. ADR `ADR-260728-w6-tunnel-config-oracle-authority`.
 
 ## Next
 
-1. murakumo pure+adapter path **#61–#99** — **full KIR catalog shipped** (32 artifacts). Remaining: incremental host wiring of catalog-only cores / Delivery 5–8 remaining shells / network·secret caps contract-only / cljs oracle load optional.
+1. murakumo pure+adapter path **#61–#100** — **full KIR catalog shipped** (32 artifacts); tunnel + config host-wired. Remaining: incremental host wiring of catalog-only cores (reconcile/identity/credits/overlay/… ) / Delivery 5–8 remaining shells / network·secret caps contract-only / cljs oracle load optional.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Full pure-planner cutover still dual-implemented until each core is wired like #86–#98 (or bulk generate); blocked on production compiler (avoid) / kbb in-process load (future optional).
