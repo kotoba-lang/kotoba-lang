@@ -57,6 +57,9 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 | Reliability T1.3 dual-backend runner pilot (5 fixtures) | compiler#412 / ADR 0161 |
 | Reliability T1.3 pilot expand (7 cases, string kit) | compiler#414 / ADR 0163 |
 | Reliability T1.3 string kit surface (12 cases dual-green) | compiler#415 / ADR 0164 |
+| Reliability T1.3 record kit (13 cases) + T4.4 | compiler#416 / ADR 0165 |
+| Reliability T2.2 surface-matrix generator | kotoba-lang (this PR) / ADR-reliability-t22 |
+| Reliability T4.4 record cookbook | kotoba-lang (this PR) / ADR-reliability-t44 |
 | pure allowlist wasm set (8) + host-grant digest binding | provider#42 / ADR 0160 |
 | kekkai ledger/dir/HOME via murakumo.config | murakumo#146 |
 | overlay cert MURAKUMO_KAGI_DIR via murakumo.config | murakumo#147 |
@@ -79,11 +82,13 @@ Authoritative work breakdown (repos, tasks, sequencing, agent guide):
 Tiers R1–R4: semantic conformance → stdlib/records → standalone run → toolchain/LTS.
 Product dual-source remains separate (this handoff §2); do not invent language features in product PRs.
 
-**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#415 T1.3 dual-backend pilot (**12** dual-green, string-ops surface complete).
+**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#416 T1.3 dual-backend pilot (**13** dual-green, string-ops + record-kit), T2.2 surface-matrix generator, T7.2 fuel model.
 
-Next language work: T1.3 full matrix (collections still admission-blocked); T1.4 native; T4.2 string-split optional; T4.4/T5 record cookbook; T5.2 native record wire; T5.3 pack rewrites; T7.1 true tail; T8.3 ops AOT; residual PVA intentional.
+Next language work: T1.3 full matrix (collections still admission-blocked); T1.4 native; T4.2 string-split optional; T4.4 typed-map pilot; T5.2 native record wire; T5.3 pack rewrites; T7.1 true tail; T8.3 ops AOT; residual PVA intentional.
 
 **T7.2 fuel model:** [`docs/lang/fuel-model.md`](./lang/fuel-model.md) (1 unit/function entry, default 512).
+**T2.2 surface matrix:** [`docs/lang/surface-matrix.md`](./lang/surface-matrix.md) (`clojure -M -m kotoba.lang.surface-matrix --check`).
+**T4.4 records:** [`docs/lang/record-cookbook.md`](./lang/record-cookbook.md) + compiler#416.
 
 ### Plan Next (priority order)
 

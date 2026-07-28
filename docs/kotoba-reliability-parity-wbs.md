@@ -45,7 +45,7 @@ compiler / KIR / wasm / native / legacy path skew.
 |---|---|---|---|---|---|
 | T1.1 | Author `docs/lang/semantics-ssot.md` (values, evaluation, fuel, errors, capability call) | **kotoba-lang** | Accepted prose SSoT; points at executable suites | — | M |
 | T1.2 | Expand `lang/conformance/manifest.edn` to list **required** backends per case class — **landed** (v2 matrix + `conformance-matrix` + tests; ADR-reliability-t12) | **kotoba-lang** | Machine-readable matrix | T1.1 | S |
-| T1.3 | Implement/extend runner: each case runs on **KIR + wasm32-kotoba-v1** minimum — **pilot expanded** (compiler#412+#414+#415 / ADR 0161+0163+0164; **12** pure-product dual-green = control5 + full string-ops surface; full matrix progressive) | **compiler**, **kotoba-kir**, **kotoba-wasm** | `clojure -M:conformance` green on both | T1.2 | L |
+| T1.3 | Implement/extend runner: each case runs on **KIR + wasm32-kotoba-v1** minimum — **pilot expanded** (compiler#412–#416 / ADR 0161–0165; **13** pure-product dual-green = control5 + string-ops + record-kit; full matrix progressive) | **compiler**, **kotoba-kir**, **kotoba-wasm** | `clojure -M:conformance` green on both | T1.2 | L |
 | T1.4 | Add native (x86_64/aarch64) cases for pure i64/string/option subset | **compiler**, **kotoba-native** | Profile `pure-native-v1` cases | T1.3 | L |
 | T1.5 | Golden digests for IR + selected artifact bytes (where policy allows) | **compiler**, **artifact** | CI fails on silent semantic drift | T1.3 | M |
 
@@ -60,7 +60,7 @@ compiler / KIR / wasm / native / legacy path skew.
 | ID | Task | Owner repo(s) | Deliverable | Depends | Estimate |
 |---|---|---|---|---|---|
 | T2.1 | Promote `lang/pure-product-profile.edn` to **admission check** in frontend | **compiler**, **kotoba-lang** | Compile error if form outside profile when `--profile pure-product` | PVA v1 | M |
-| T2.2 | Generate `docs/lang/surface-matrix.md` from `surface-status.edn` in CI | **kotoba-lang** | Generated doc; `--check` mode | — | S |
+| T2.2 | Generate `docs/lang/surface-matrix.md` from `surface-status.edn` in CI — **landed** (`kotoba.lang.surface-matrix` + `--check`; ADR-reliability-t22) | **kotoba-lang** | Generated doc; `--check` mode | — | S |
 | T2.3 | CI job: every `pure-product` example under `examples/` compiles + KIR-executes | **kotoba-lang**, **compiler** | Examples as living contract | T2.1 | S |
 | T2.4 | Negative corpus: forbidden ambient forms still reject (link `grade-a-malicious-source-corpus.md`) | **compiler**, **kotoba-lang** | Always-on security regression | — | S |
 
@@ -92,7 +92,7 @@ compiler / KIR / wasm / native / legacy path skew.
 | T4.1 | Freeze `stdlib` module list in `lang/conformance/stdlib/` — **landed** (manifest.edn + core mirror + tests; ADR-reliability-t41) | **kotoba-lang** | Manifest of public names | PVA v1 | S |
 | T4.2 | Ship `string` kit: length, from-i64, join (bounded), split (bounded optional) — **partial landed**: join via concat desugar (compiler#413 / ADR 0162); split deferred | **compiler** (desugar/helpers), **kotoba-kir** | Documented ops + tests | T1.3 | M |
 | T4.3 | Ship `option`/`result` usage guide + helpers (if-some already fixed) — **landed** (option-result-guide.md + examples/option-result; ADR-reliability-t43) | **kotoba-lang** docs, **compiler** examples | Guide + golden | T2.3 | S |
-| T4.4 | Ship `record` + small typed-map cookbook for pure-product | **kotoba-lang**, **compiler** | Replace public base-N packs where possible | T5 | M |
+| T4.4 | Ship `record` + small typed-map cookbook for pure-product — **partial landed**: record cookbook + dual-backend `:record-kit` (compiler#416 / ADR 0165); typed-map pure pilot deferred | **kotoba-lang**, **compiler** | Replace public base-N packs where possible | T5 | M |
 | T4.5 | Collections: document O-costs; add only **bounded** map/filter/reduce over hetero-vector/typed-map | **compiler**, **kotoba-lang** | No silent O(n²) without docs | T1.1 | M |
 
 **Exit:** New pure oracle rarely needs private `nat-str` / digit tables.
