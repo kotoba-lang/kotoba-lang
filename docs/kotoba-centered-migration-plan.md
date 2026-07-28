@@ -295,7 +295,8 @@ Qualify vertical families in dependency order:
    **W5 deepen (2026-07-28, compiler / ADR 0140):** guest single-export object put→get product vertical (affine let put+get-stream+byte-count) on clj+nbb. **Fuller product app first slice landed.**
    **W5 deepen (2026-07-28, compiler / ADR 0141):** guest put→CAS→get product vertical (put-cas-then-count) on clj+nbb. **CAS-in-middle product path landed (not conditional get).**
    **W5 deepen (2026-07-28, compiler / ADR 0142):** one-arm linear `if` + conditional get product path (`put-then-count-if` / `put-cas-then-count-if`). **Conditional get product path landed.**
-Next: W6 inventory.
+   **W6 inventory first slice (2026-07-28):** design-system complete cohort + platform host-mechanism + next product verticals (murakumo/cloudflare/kotoba-script) classified in `lang/w6-migration-inventory.edn`.
+Next: W6 path-level murakumo inventory / cloudflare route inventory / kbb ability gap.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -486,7 +487,8 @@ Next: W6 inventory.
    **W5 deepen (2026-07-28, compiler / ADR 0140):** guest put→get product vertical dual-runtime.
    **W5 deepen (2026-07-28, compiler / ADR 0141):** guest put→CAS→get product vertical dual-runtime.
    **W5 deepen (2026-07-28, compiler / ADR 0142):** conditional get product path (one-arm linear if).
-   Next: W6 inventory.
+   **W6 inventory first slice (2026-07-28):** `lang/w6-migration-inventory.edn` + docs.
+   Next: W6 path-level murakumo / cloudflare routes / kbb ability gap.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
@@ -656,8 +658,11 @@ composition-layer theme as `:document` (`:accent` hex, optional
 print/read identity. Full `theme-css` host join (shitsuke+glass+shell)
 remains `.cljc`. Form-A remains oracle; consumer APIs unchanged.
 **Design-system dependency-order document cutover is complete 5/5**
-(css → html → shitsuke → liquid-glass-ui → kotoba-ui). Remaining program
-work: W5 host kits (not a design-system file port).
+(css → html → shitsuke → liquid-glass-ui → kotoba-ui).
+**W6 inventory v1 (2026-07-28):** see `docs/w6-migration-inventory.md` and
+`lang/w6-migration-inventory.edn`. W5 host-kit deepen is landed through
+compiler ADR 0142; remaining program work is path-level product inventory
+(murakumo / cloudflare routes / kbb←nbb) then per-slice cutover.
 
 For Cloudflare, migrate route semantics only after HTTP ingress is qualified;
 until then the cljs entry remains a mechanism adapter. For Murakumo, migrate
