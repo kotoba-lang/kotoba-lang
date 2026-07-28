@@ -34,7 +34,7 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 | W5 product verticals (put/get/CAS/conditional) | **0140–0142** |
 | W6 inventories | murakumo / cloudflare / kbb gap |
 | W6 murakumo pure-planners **high** | **6/6** (#37–#42) |
-| W6 murakumo pure-planners **medium+** | **complete through #93** (#61–#93: pure cores + host-shell rows + token/overlay crypto packaging + live HMAC/AES + product-shell KIR authority for kekkai/token/report/infer.plan/dash) |
+| W6 murakumo pure-planners **medium+** | **complete through #94** (#61–#94: product-shell KIR for kekkai/token/report/infer.plan/dash/schedule + live HMAC/AES) |
 | W6 cloudflare pure-request / deploy oracles | client / stream / analytics / deploy / pages (com-cloudflare) |
 | W6 kbb ability gaps | **COMPLETE** (process / scoped-fs / secret / git / entropy / cloud-deploy; SSH host-forever) |
 | W6 process / scoped-fs / secret / git / entropy kits | provider ADR **0143–0151** (ids 19–23; cljs OS transports landed) |
@@ -43,12 +43,12 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 
 ### Plan Next (priority order)
 
-1. **Expand product-shell oracles** — more verticals beyond kekkai/token/report/infer.plan/dash (#86/#88/#89/#91/#93 pattern: precompiled KIR + host delegate); next schedule/task/engine
+1. **Expand product-shell oracles** — more verticals beyond kekkai/token/report/infer.plan/dash/schedule (#86–#94 pattern: precompiled KIR + host delegate); next task/engine
 2. **Delivery 5–8 remaining shells** — continue wiring pure oracles into real entrypoints (not new DSL)
 3. **Production signed providers** for network / secret capabilities (leave pure allowlist alone; signed content-addressed Wasm)
 4. **wasm-aot packaging claims** — packaging / AOT path honesty vs remaining host shells
 
-**Landed 2026-07-28:** product-shell KIR authority for kekkai (#86), token (#88), report (#89), infer.plan (#91), dash.state (#93); live HMAC/AES host adapters (#87).
+**Landed 2026-07-28:** product-shell KIR authority for kekkai (#86), token (#88), report (#89), infer.plan (#91), dash.state (#93), schedule (#94); live HMAC/AES host adapters (#87).
 
 ### Do not
 
@@ -210,5 +210,6 @@ Network/secret caps stay contract-only until signed production providers exist.
 | product-shell oracle authority (report pad/header/help) | murakumo#89 |
 | product-shell oracle authority (infer.plan) | murakumo#91 |
 | product-shell oracle authority (dash.state) | murakumo#93 |
+| product-shell oracle authority (infer.schedule) | murakumo#94 |
 | zones query + hostname-match oracle | com-cloudflare#13 |
 | clock/time/random reference-impl | capability-*-#1 |

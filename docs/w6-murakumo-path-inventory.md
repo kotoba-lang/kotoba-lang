@@ -101,10 +101,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#89:** **product-shell oracle authority (report)** — `murakumo.report` JVM pure helpers (headers/pad/rows/`command-help`/reconcile pure builders/constants) delegate to `resources/murakumo/oracle/report_core.kir.edn` via `:report-core` catalog; host remains map projection + CSV joins + reconcile mapcat. ADR `ADR-260728-w6-report-oracle-authority`.
 - **2026-07-28 murakumo#91:** **product-shell oracle authority (infer.plan)** — JVM `GiB`/defaults/`usable-bytes`/`choose-strategy` name delegate to `resources/murakumo/oracle/infer_plan_core.kir.edn` via `:infer-plan`; partition walk stays cljc.
 - **2026-07-28 murakumo#93:** **product-shell oracle authority (dash.state)** — JVM `short-hosted-cid` / `health-class` / `interval-sleep-ms` / `clamp-at` / `append-capped` start / `recent-alerts` n delegate to `resources/murakumo/oracle/dash_state_core.kir.edn` via `:dash-state`; HTML join, probe parse, map folds stay cljc.
+- **2026-07-28 murakumo#94:** **product-shell oracle authority (infer.schedule)** — JVM `eligible?` / `score` / assign queue-inc delegate to `resources/murakumo/oracle/infer_schedule_core.kir.edn` via `:infer-schedule`; set projection + stable sort-by pick stay host.
 
 ## Next
 
-1. murakumo pure+adapter path **#61–#93** complete through dash.state product-shell KIR (kekkai + token + report + infer.plan + dash + live HMAC/AES). Remaining: expand catalog (schedule/task/engine/…) / Delivery 5–8 remaining shells / network·secret caps contract-only / cljs oracle load optional.
+1. murakumo pure+adapter path **#61–#94** complete through schedule product-shell KIR. Remaining: expand catalog (task/engine/…) / Delivery 5–8 remaining shells / network·secret caps contract-only / cljs oracle load optional.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Full pure-planner cutover still dual-implemented until each core is wired like #86/#88/#89/#91/#93 (or bulk generate); blocked on production compiler (avoid) / kbb in-process load (future optional).
