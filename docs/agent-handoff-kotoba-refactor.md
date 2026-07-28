@@ -181,8 +181,10 @@ Contract only → **reference-implemented** (pure allowlist):
 | capability-clock-monotonic | [#1](https://github.com/kotoba-lang/capability-clock-monotonic/pull/1) | wasm counter + JVM `System/nanoTime` |
 | capability-time-now-days | [#1](https://github.com/kotoba-lang/capability-time-now-days/pull/1) | wasm stub + JVM UTC day counter |
 | capability-random-bytes | [#1](https://github.com/kotoba-lang/capability-random-bytes/pull/1) | wasm xorshift + JVM `SecureRandom` |
+| capability-data-cbor | [#1](https://github.com/kotoba-lang/capability-data-cbor/pull/1) | wasm `cbor_encode` + JVM flat-pair encoder |
+| capability-data-json | [#1](https://github.com/kotoba-lang/capability-data-json/pull/1) | wasm `json_encode`/`json_extract_field` + JVM |
 
-Next pure targets on the allowlist: `data/cbor`, `data/json` only.  
+**Allowlist pure reference-implemented set is complete** (sin/cos/sha256/cbor/json/clock/random/now-days).  
 Network/secret caps stay contract-only until signed production providers exist.
 
 ## 8. 2026-07-28 follow-through
