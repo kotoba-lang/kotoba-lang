@@ -130,11 +130,12 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#122:** **optional cljs/nbb product-shell oracle load** — `register-kir!` / `set-resource-loader!` / node-fs `resources/` load; BigInt i64 bridge; task.plan `failed?` + fleet.inventory dual-source when ready; `nbb.edn` ships resources + kotoba-kir. ADR `ADR-260728-w6-cljs-oracle-load`.
 - **2026-07-28 murakumo#123:** **cljs dual-source dash.state** — pure display helpers (`short-hosted-cid` / `health-class` / sleep / clamp / recent / append-capped) when `oracle/ready? :dash-state` (ops.cljs path).
 - **2026-07-28 murakumo#124:** **cljs dual-source token pure + kekkai.gate** — claims/wire/CT-eq/scope + ledger/status/authorized/denial when ready; nbb Buffer b64; try-oracle string-op fallback. ADR `ADR-260728-w6-cljs-token-kekkai-dual`.
-- **2026-07-28 murakumo (tunnel cljs dual-source):** **task.exec transport path** — defaults / conn-opts fragments / wrap-cmd / parse-rc marker·digits / scp-dest / forward·curl shells when `oracle/ready? :tunnel` (try-oracle for cljs KIR substring/i64-str). Follow-on to #122–#124. ADR `ADR-260728-w6-cljs-tunnel-dual`.
+- **2026-07-28 murakumo#125:** **cljs dual-source tunnel pure** — defaults / conn-opts fragments / wrap-cmd / parse-rc marker·digits / scp-dest / forward·curl shells when `oracle/ready? :tunnel` (task.exec path; try-oracle for cljs KIR substring/i64-str). ADR `ADR-260728-w6-cljs-tunnel-dual`.
+- **2026-07-28 murakumo#126:** **cljs dual-source secret pure + connect pure** — name/env constants + valid-env/path; default-class/node-class/serves-plane when ready. ADR `ADR-260728-w6-cljs-secret-connect-dual`.
 
 ## Next
 
-1. murakumo pure+adapter path **#61–#124** + tunnel cljs dual-source — full dual-source + PVA + cljs load. Remaining: Delivery 5–8 shells / residual PVA (schedule `eligible?` bit-pack intentional) / **incremental cljs rewire** (config/report/persist/secret/connect/…) / network·secret caps contract-only.
+1. murakumo pure+adapter path **#61–#126** — full dual-source + PVA + cljs load + dash/token/kekkai/tunnel/secret/connect. Remaining: Delivery 5–8 shells / residual PVA (schedule `eligible?` bit-pack intentional) / **incremental cljs rewire** (config/persist/identity/infer/overlay/…) / network·secret caps contract-only.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#16 product-shell complete); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Deeper pure ports still dual-implemented where listed “Still host” (envelope maps, placement folds beyond wired subset, etc.); production compiler dependency remains avoided (resource path).
