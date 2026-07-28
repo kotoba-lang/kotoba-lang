@@ -781,5 +781,5 @@ First packages: capability-math-sin#1, capability-math-cos#1 (wasm + JVM Math).
 **capability-random-bytes#1 (2026-07-28):** wasm xorshift fill + JVM `SecureRandom`; ABI `random_bytes` `(ptr,len)→i32`.
 **capability-data-cbor#1 (2026-07-28):** flat pairs → definite CBOR map; ABI `cbor_encode`.
 **capability-data-json#1 (2026-07-28):** flat pairs → JSON object + bounded field extract; ABI `json_encode`/`json_extract_field`.
-**Allowlist pure reference-implemented set complete.** **murakumo#61–#99** pure+adapter path — **full product-shell KIR catalog (32 cores)** + secret/overlay-crypto wiring. Next: incremental host wiring of catalog-only cores / Delivery 5–8 remaining shells; network/secret caps remain contract-only.
+**Allowlist pure reference-implemented set complete.** **murakumo#61–#113** pure+adapter path — **full product-shell KIR catalog (32 cores) + all portable pure hosts dual-source wired** (overlay-driver/runtime #113; Product Value ABI v1 token #112). Next: Delivery 5–8 remaining shells / Product Value ABI expand / cljs oracle load optional; network/secret caps remain contract-only.
 
