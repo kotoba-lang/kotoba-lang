@@ -190,7 +190,8 @@ a case class:
 **Gate (R1 exit):** a pure-product case that fails any **required** backend fails the
 language gate — no silent “works on KIR only” for the pure-product surface (T1.3).
 
-Conformance ownership: `lang/conformance/manifest.edn` (matrix expansion is T1.2).
+Conformance ownership: `lang/conformance/manifest.edn` **v2** — required-backends matrix
+per case class (T1.2 landed). Dual-backend execution runner is T1.3.
 
 ---
 
@@ -240,7 +241,7 @@ Conformance ownership: `lang/conformance/manifest.edn` (matrix expansion is T1.2
 
 | Item | WBS |
 |---|---|
-| Full multi-backend required matrix | T1.2–T1.5 |
+| Full multi-backend required matrix | **T1.2 landed** (manifest v2); T1.3–T1.5 runners/native |
 | Fuel model detail | T7.2 |
 | True `loop`/`recur` tail | T7.1 |
 | Record args vs arity-5 packs | T5 |
