@@ -41,6 +41,15 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 | Pure capability allowlist reference-impl | **COMPLETE** (sin / cos / sha256 / cbor / json / clock / random / now-days) |
 | Network / secret capability packages | still **contract-only** (no production signed providers yet) |
 
+### Language reliability parity (CLJ/CLJS-class trust)
+
+Authoritative work breakdown (repos, tasks, sequencing, agent guide):
+
+- [`docs/kotoba-reliability-parity-wbs.md`](./kotoba-reliability-parity-wbs.md)
+
+Tiers R1–R4: semantic conformance → stdlib/records → standalone run → toolchain/LTS.
+Product dual-source remains separate (this handoff §2); do not invent language features in product PRs.
+
 ### Plan Next (priority order)
 
 1. **Delivery 5–8 remaining shells** — com-cloudflare product-shell complete (#14+#16); com-cloudflare-compat product-shell (#3); wire residual stream/deploy/analytics hosts + murakumo CLIs
