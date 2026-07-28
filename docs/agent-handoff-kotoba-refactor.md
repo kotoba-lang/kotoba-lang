@@ -44,7 +44,7 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 ### Plan Next (priority order)
 
 1. **Delivery 5–8 remaining shells** — com-cloudflare product-shell started (#14); wire residual stream/deploy/analytics hosts + murakumo CLIs
-2. **Product Value ABI expand** — roll `[:option T]` / if-some pattern beyond token (#112) to other cores where has-* sentinels remain
+2. **Product Value ABI expand** — continue beyond token (#112) + ports (#114): schedule bit-flags, overlay sealed-fields, connect has-http, …
 3. **cljs oracle load optional** — resource load currently JVM/bb-only
 4. **Production signed providers** for network / secret capabilities (leave pure allowlist alone; signed content-addressed Wasm)
 5. **wasm-aot packaging claims** — packaging / AOT path honesty vs remaining host shells
@@ -216,6 +216,7 @@ Network/secret caps stay contract-only until signed production providers exist.
 | product-shell oracle authority (infer.engine) | murakumo#96 |
 | Product Value ABI v1 token | murakumo#112 |
 | product-shell oracle authority (overlay driver + runtime) | murakumo#113 |
+| Product Value ABI v1 fleet + provision ports | murakumo#114 |
 | product-shell oracle authority (fleet.inventory) | murakumo#102 |
 | product-shell oracle authority (infer.join + infer.gc) | murakumo#105 |
 | product-shell oracle authority (moe + rebalance + relay) | murakumo#107 |
