@@ -55,9 +55,10 @@ fixture equality → shells remain on bb/nbb/JVM host.
 
 - **2026-07-28 murakumo#37:** `kotoba/kekkai_gate_core.kotoba` oracle parity for gate string core.
 - **2026-07-28 murakumo#38:** `kotoba/infer_plan_core.kotoba` usable-bytes + choose-strategy parity.
+- **2026-07-28 murakumo#39:** `kotoba/dash_state_core.kotoba` short-hosted-cid / health-class / clamp-at / interval-sleep-ms parity.
 
 ## Next
 
-1. Author oracle fixtures for `infer/plan` + `task/plan` (highest reuse).
+1. Remaining pure-planner oracles: `task/plan`, `token`, `infer/engine`.
 2. Cloudflare route inventory (sibling W6 next-action).
 3. kbb ability gap list for nbb shells (`ops`, `task/*`).
