@@ -281,7 +281,7 @@ Qualify vertical families in dependency order:
    production cljs/nbb storage transport (spawnSync hops). **Family 4
    production cljs transport intermediate evidence now present. Production
    cljs transports complete for HTTP + LLM + storage.**
-   **W5 deepen ADR 0120–0141:** :bytes leaf + object/http get-stream ready/pending/
+   **W5 deepen ADR 0120–0142:** :bytes leaf + object/http get-stream ready/pending/
    joined multi-chunk + chunk-queue + progressive open-stream + guest poll/read
    ops + production HTTP/object transports + object/http get-stream wasm packaging
    + put+get product vertical packaging + host linear resource table + intermediate
@@ -294,7 +294,8 @@ Qualify vertical families in dependency order:
    **W5 deepen (2026-07-28, compiler / ADR 0139):** multi-arm `case` / `cond` / `condp` affine exclusive-use via desugared nested if + dispatch lets. **Match multi-arm move typing (case/cond) landed (not match-variant).**
    **W5 deepen (2026-07-28, compiler / ADR 0140):** guest single-export object put→get product vertical (affine let put+get-stream+byte-count) on clj+nbb. **Fuller product app first slice landed.**
    **W5 deepen (2026-07-28, compiler / ADR 0141):** guest put→CAS→get product vertical (put-cas-then-count) on clj+nbb. **CAS-in-middle product path landed (not conditional get).**
-Next: W6 inventory / conditional get product path.
+   **W5 deepen (2026-07-28, compiler / ADR 0142):** one-arm linear `if` + conditional get product path (`put-then-count-if` / `put-cas-then-count-if`). **Conditional get product path landed.**
+Next: W6 inventory.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -484,7 +485,8 @@ Next: W6 inventory / conditional get product path.
    **W5 deepen (2026-07-28, compiler / ADR 0139):** case/cond/condp multi-arm exclusive-use.
    **W5 deepen (2026-07-28, compiler / ADR 0140):** guest put→get product vertical dual-runtime.
    **W5 deepen (2026-07-28, compiler / ADR 0141):** guest put→CAS→get product vertical dual-runtime.
-   Next: W6 inventory / conditional get product path.
+   **W5 deepen (2026-07-28, compiler / ADR 0142):** conditional get product path (one-arm linear if).
+   Next: W6 inventory.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
@@ -544,7 +546,7 @@ Next: W6 inventory / conditional get product path.
    compiler#360 / ADR 0095):** reference + nbb vectors for the write path —
    `:object/put-block` + `:object/compare-and-set-ref` (binding allowlist,
    bounded payload as host string, bool results, redaction, denial). Linear
-   Component v0.3 keeps linear handle ABI; **ADR 0120–0141 :bytes + object/http
+   Component v0.3 keeps linear handle ABI; **ADR 0120–0142 :bytes + object/http
    get-stream ready/pending/joined multi-chunk/chunk-queue/open-stream + guest
    poll/read + production transports + packaging + put+get product vertical + guest put→get/CAS product exports +
    host linear resource table + packaging linear resource table + full CM
