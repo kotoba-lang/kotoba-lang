@@ -146,6 +146,8 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#136:** **dash.state pure oracle expand** — probe parse (links/line key-value) + response constants (content-type/http-ok/health labels). `probe-command` stays host (SSH host-forever). ADR `ADR-260728-w6-dash-probe-pure-oracle`.
 - **2026-07-28 murakumo#137:** **residual ops config inject** — exact-name non-secret config centralized on `murakumo.config` (cloud/api/text/ckpt/bin/infer/git/driver); wired orchestrate/gateway/media/relay/core pin/transport. Secrets stay named fetch. ADR `ADR-260728-w6-ops-config-inject`.
 
+- **2026-07-28 murakumo#138:** **deploy.plan pure oracle expand** — execution-observed?/count-command, release-wit-path, stop-forward-command, absolute-unix-git-bin?. Windows drive absolute git stays host. ADR `ADR-260728-w6-deploy-probe-pure-oracle`.
+
 ## Next
 
 1. murakumo pure+adapter path **#61–#135** — product-shell pure dual-source complete including residual report/provision/cloud/crypto `.cljc` (#135). Remaining: residual ops CLI ambient sites beyond #137 (config leave for HOME/bins already inject-friendly); residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5). Network/secret **reference kit packages** landed (provider#34); signed Wasm packages still pending. com-cloudflare #17 + com-cloudflare-compat #5 cljs dual-source landed.

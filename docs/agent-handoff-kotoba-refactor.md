@@ -40,9 +40,11 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 | W6 process / scoped-fs / secret / git / entropy kits | provider ADR **0143–0151** (ids 19–23; cljs OS transports landed) |
 | W6 ops kit EDN packages + signing honesty | provider **#34** / ADR **0152** (wasm-aot/signed package pending) |
 | residual ops config inject (exact-name getenv) | murakumo#137 |
+| kit ready checklist T8.1/T8.2 + unsigned package fingerprint | provider#35 / ADR 0153 |
+| deploy.plan pure oracle expand (execution probe + pin paths) | murakumo#138 |
 | dash.state probe parse pure oracle expand | murakumo#136 |
 | Pure capability allowlist reference-impl | **COMPLETE** (sin / cos / sha256 / cbor / json / clock / random / now-days) |
-| Network / secret capability packages | **reference kit packages landed** (provider#34: secret/process/scoped-fs/git/entropy + existing http); **signed content-addressed Wasm still pending** |
+| Network / secret capability packages | reference kits + **T8.1/T8.2 readiness checklist** (provider#34+#35); unsigned kit EDN fingerprint; **signed Wasm still pending** (T8.3) |
 
 ### Language reliability parity (CLJ/CLJS-class trust)
 
@@ -58,8 +60,8 @@ Product dual-source remains separate (this handoff §2); do not invent language 
 1. **Delivery 5–8 remaining shells** — product-shell pure complete; murakumo ops config inject #137 (exact-name getenv centralize). Residual: optional HOME/bin config leave, WASM L5 packaging, signed content-addressed Wasm
 2. **Product Value ABI residual** — schedule `eligible?` bit-pack remains intentional packing (arity ≤5); most has-* sentinels cleared through #121
 3. **Incremental cljs host rewire** — landed murakumo #122–#135 + com-cloudflare#17 + com-cloudflare-compat#5; remaining residual PVA / network·secret signed providers / WASM packaging claims
-4. **Production signed providers** — reference kit packages landed (provider#34); remaining: content-addressed **signed** Wasm providers (not claimed)
-5. **wasm-aot packaging claims** — still pending per kit `:qualification`; honesty ADR 0152
+4. **Production signed providers** — kit packages + readiness checklist (provider#34+#35 / ADR 0152–0153); unsigned package fingerprint landed; remaining T8.3 **signed** Wasm
+5. **wasm-aot packaging claims** — still pending per kit scores; honesty ADR 0152–0153
 
 **Landed 2026-07-28:** full murakumo product-shell dual-source — bulk KIR catalog (#99) + host wire through overlay-driver/runtime (#113) + Product Value ABI v1 #112–#121 + cljs/nbb oracle load (#122); live HMAC/AES (#87).
 
