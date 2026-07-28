@@ -781,5 +781,5 @@ First packages: capability-math-sin#1, capability-math-cos#1 (wasm + JVM Math).
 **capability-random-bytes#1 (2026-07-28):** wasm xorshift fill + JVM `SecureRandom`; ABI `random_bytes` `(ptr,len)→i32`.
 **capability-data-cbor#1 (2026-07-28):** flat pairs → definite CBOR map; ABI `cbor_encode`.
 **capability-data-json#1 (2026-07-28):** flat pairs → JSON object + bounded field extract; ABI `json_encode`/`json_extract_field`.
-**Allowlist pure reference-implemented set complete.** **murakumo#61–#87** pure+adapter path (live HMAC/AES host adapters + kekkai product-shell KIR authority). Next: expand product-shell oracles / Delivery 5–8 remaining shells; network/secret caps remain contract-only.
+**Allowlist pure reference-implemented set complete.** **murakumo#61–#88** pure+adapter path (live HMAC/AES host adapters + kekkai/token product-shell KIR authority). Next: expand product-shell catalog / Delivery 5–8 remaining shells; network/secret caps remain contract-only.
 

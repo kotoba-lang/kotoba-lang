@@ -97,10 +97,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#85:** identity JWT/op-token templates + `overlay_crypto_core` packaging (alg/nonce/tag/fields/b64 pad); AES-GCM seal/open host.
 - **2026-07-28 murakumo#86:** **product-shell oracle authority** (first dual-source cutover) — `murakumo.kekkai.gate` JVM public API delegates pure helpers to precompiled KIR (`resources/murakumo/oracle/kekkai_gate_core.kir.edn`) via `murakumo.kotoba.oracle` + `kotoba-kir`/`ir/execute`. Compiler stays test-only; CI drift gate regenerates with `murakumo.kotoba-oracle-gen`. ADR `ADR-260728-w6-product-shell-oracle-authority`.
 - **2026-07-28 murakumo#87:** live HMAC + AES host adapters — token pure wire (`encode-claims-json`/`signing-input`/`wire-token`/`constant-time=`) on live `sign`/`verify`; overlay.crypto packaging gates on `open` (AES-GCM Cipher stays host).
+- **2026-07-28 murakumo#88:** **product-shell oracle authority (token)** — `murakumo.token` JVM pure helpers delegate to `resources/murakumo/oracle/token_core.kir.edn` via `:token` catalog; HMAC/b64url host remains.
 
 ## Next
 
-1. murakumo pure+adapter path **#61–#87** complete (kekkai product-shell KIR + live HMAC/AES adapters). Remaining: expand product-shell catalog (token claims, report pad) / Delivery 5–8 remaining shells / network·secret caps contract-only / cljs oracle load optional.
+1. murakumo pure+adapter path **#61–#88** complete (kekkai + token product-shell KIR + live HMAC/AES). Remaining: expand catalog (report/infer/…) / Delivery 5–8 remaining shells / network·secret caps contract-only / cljs oracle load optional.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
-4. Full pure-planner cutover still dual-implemented until each core is wired like #86 (or bulk generate); blocked on production compiler (avoid) / kbb in-process load (future optional).
+4. Full pure-planner cutover still dual-implemented until each core is wired like #86/#88 (or bulk generate); blocked on production compiler (avoid) / kbb in-process load (future optional).
