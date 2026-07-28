@@ -281,11 +281,12 @@ Qualify vertical families in dependency order:
    production cljs/nbb storage transport (spawnSync hops). **Family 4
    production cljs transport intermediate evidence now present. Production
    cljs transports complete for HTTP + LLM + storage.**
-   **W5 deepen ADR 0120–0132:** :bytes leaf + object/http get-stream ready/pending/
+   **W5 deepen ADR 0120–0133:** :bytes leaf + object/http get-stream ready/pending/
    joined multi-chunk + chunk-queue + progressive open-stream + guest poll/read
    ops + production HTTP/object transports + object/http get-stream wasm packaging
-   + put+get product vertical packaging on reference + nbb dual-runtime.
-   Next: linear task resource table / fuller product apps.
+   + put+get product vertical packaging + host linear resource table on
+   reference + nbb dual-runtime.
+   Next: Component Model resource ABI / fuller product apps.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -514,10 +515,10 @@ Qualify vertical families in dependency order:
    compiler#360 / ADR 0095):** reference + nbb vectors for the write path —
    `:object/put-block` + `:object/compare-and-set-ref` (binding allowlist,
    bounded payload as host string, bool results, redaction, denial). Linear
-   Component v0.3 keeps linear handle ABI; **ADR 0120–0132 :bytes + object/http
+   Component v0.3 keeps linear handle ABI; **ADR 0120–0133 :bytes + object/http
    get-stream ready/pending/joined multi-chunk/chunk-queue/open-stream + guest
-   poll/read + production transports + get-stream packaging + put+get product
-   vertical on reference + nbb.** **Reference dual-runtime now also covers stream-object write ops.**
+   poll/read + production transports + packaging + put+get product vertical +
+   host linear resource table on reference + nbb.** **Reference dual-runtime now also covers stream-object write ops.**
 
    **W5 stream-object write-path wasm (2026-07-27, kotoba-component#53 +
    compiler#361 / ADR 0096):** synthetic dual-export
