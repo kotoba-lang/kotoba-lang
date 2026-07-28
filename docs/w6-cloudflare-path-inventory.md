@@ -76,9 +76,10 @@ EDN equality on request maps / parse fixtures → HTTP + token remain host.
 - **2026-07-28 com-cloudflare#13:** `kotoba/zones_path_core.kotoba` list-zones/DNS query + hostname-match oracle (ADR 0011). Workers base paths already in `workers_path_core` (#2).
 - **2026-07-28 com-cloudflare#14:** **product-shell oracle authority** (first dual-source cutover) — all 9 `kotoba/*_core` ship as `resources/cloudflare/oracle/*.kir.edn`; JVM `cloudflare.client` + workers/zones/pages/logpush pure paths delegate via `cloudflare.kotoba.oracle` + kotoba-kir. Catalog-only residual: stream/deploy/pages-bulk/analytics(+parse). ADR `0012-w6-product-shell-oracle-authority`.
 - **2026-07-28 com-cloudflare#16:** **product-shell residual host-wire** — stream/deploy/pages-bulk/analytics pure surfaces dual-source; all 9 catalog hosts wired. ADR 0013.
+- **2026-07-28 com-cloudflare-compat#3:** **product-shell oracle authority** — `compat_core.kir.edn` + host-wire coerce/path/limit/status pure helpers (ADR 0002). Handlers/store stay host.
 
 ## Next
 1. product-shell dual-source started (#14): client + path hosts wired; remaining host wire for stream/deploy/pages-bulk/analytics pure cores.  
-2. compat handlers/store remain host; WASM L5 packaging still blocked.  
+2. compat product-shell dual-source landed (#3); handlers/store/WASM L5 packaging still host/blocked.  
 3. murakumo product-shell complete through #113; Product Value ABI expand / cljs oracle load optional.
 
