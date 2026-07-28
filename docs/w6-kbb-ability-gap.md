@@ -31,7 +31,7 @@ separates **ops shells** from the JS backend.
 | `ssh-or-remote-exec` | remote exec without ambient OpenSSH | **host-forever** | high | murakumo fleet stays on nbb/bb |
 | `git` | status/log (read subcommands) | **dual-runtime + tooling cutover** (provider#29+#31+#32; murakumo#55) | medium | remaining scripts |
 | `secret-custody` | named secret fetch (no dump) | **ops cutover complete** (#48–#53 + CF#3) | high | optional live kagi inject |
-| `cloud-deploy` | Workers/Pages deploy verbs | **module multipart + oracle** (com-cloudflare#5+#6+#7) | low | pages bulk REST only |
+| `cloud-deploy` | Workers/Pages deploy verbs | **module multipart + oracle** (com-cloudflare#5–#8) | low | pages bulk REST only |
 | `clock-and-random` | clock + CSPRNG | **landed** (clock id 7 + entropy id 23 provider#33) | medium | — |
 
 ## Consumers
@@ -69,6 +69,7 @@ separates **ops shells** from the JS backend.
 - **2026-07-28 com-cloudflare#5 / ADR 0003:** cloud-deploy pure Workers put/delete plans + live PUT.
 - **2026-07-28 com-cloudflare#6 / ADR 0004:** `kotoba/deploy_core.kotoba` validators / paths / wrangler argv oracle.
 - **2026-07-28 com-cloudflare#7 / ADR 0005:** Workers ES-module multipart put plan + live upload.
+- **2026-07-28 com-cloudflare#8 / ADR 0006:** module validate + multipart encode kotoba oracle.
 - **2026-07-28 murakumo#58:** bare-git audit closed (absolute git-bin only).
 
 ## Next
