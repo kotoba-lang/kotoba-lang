@@ -30,7 +30,7 @@ separates **ops shells** from the JS backend.
 | `process` | spawn/await bounded process | **dual-runtime OS transport** (provider#25+#28) | high | — |
 | `ssh-or-remote-exec` | remote exec without ambient OpenSSH | **host-forever** | high | murakumo fleet stays on nbb/bb |
 | `git` | status/log (+ optional worktree) | missing | medium | repo tooling scripts |
-| `secret-custody` | named secret fetch (no dump) | **host transports + ops cutover + audit** | high | remaining secret getenv sites |
+| `secret-custody` | named secret fetch (no dump) | **ops secrets cut over** (murakumo#48+#50 + CF#3) | high | QUIC PEM path-ref; optional kagi |
 | `cloud-deploy` | Workers/Pages deploy verbs | missing | low | scripted publish |
 | `clock-and-random` | clock + CSPRNG | partial | medium | compat actor ids |
 
@@ -58,10 +58,11 @@ separates **ops shells** from the JS backend.
 - **2026-07-28 murakumo#48 + com-cloudflare#3:** ops CLI named-secret cutover for token HMAC + `CLOUDFLARE_API_TOKEN`.
 - **2026-07-28 provider#28 / ADR 0147:** cljs/nbb `os-spawn` + `os-store` (spawnSync / Node fs sync).
 - **2026-07-28:** SSH host-forever decision; secret getenv audit first pass.
+- **2026-07-28 murakumo#50:** remaining high-priority secrets (service/metrics/overlay auth-key).
 
 ## Next
 
-1. Cut over remaining **secret** getenv sites (`MURAKUMO_SERVICE_TOKEN`, metrics token, overlay auth-key) — see [`w6-secret-getenv-audit.md`](w6-secret-getenv-audit.md).  
+1. QUIC cert/key path-refs under scoped-fs (medium) — see [`w6-secret-getenv-audit.md`](w6-secret-getenv-audit.md).  
 2. Optional live **kagi** `fn-fetch` wire.  
 3. **git** kit first slice (medium) when tooling needs it.  
 4. **cloud-deploy** stays low priority ops.
