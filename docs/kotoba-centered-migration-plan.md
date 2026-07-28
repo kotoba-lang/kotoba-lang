@@ -281,7 +281,7 @@ Qualify vertical families in dependency order:
    production cljs/nbb storage transport (spawnSync hops). **Family 4
    production cljs transport intermediate evidence now present. Production
    cljs transports complete for HTTP + LLM + storage.**
-   **W5 deepen ADR 0120–0137:** :bytes leaf + object/http get-stream ready/pending/
+   **W5 deepen ADR 0120–0138:** :bytes leaf + object/http get-stream ready/pending/
    joined multi-chunk + chunk-queue + progressive open-stream + guest poll/read
    ops + production HTTP/object transports + object/http get-stream wasm packaging
    + put+get product vertical packaging + host linear resource table + intermediate
@@ -290,7 +290,8 @@ Qualify vertical families in dependency order:
    (get→poll-ready→body-len→drop; ADR 0136) on
    reference + nbb dual-runtime.
       **W5 deepen (2026-07-28, compiler#404 / ADR 0137):** guest affine `let` move for linear task/stream — single binding move or one-shot consume (`bytes-task-byte-count` / `task-ready?`); double-use and multi-binding still rejected. Example: `examples/w5-linear-let-move.kotoba`.
-Next: fuller product apps / broader guest move typing (if/match) / W6 inventory.
+   **W5 deepen (2026-07-28, compiler / ADR 0138):** multi-binding non-linear companions + nested non-linear outer lets + balanced `if` arms (same move/consume kind). **Broader guest move typing first slice landed (not match multi-arm).**
+Next: fuller product apps / match multi-arm move typing / W6 inventory.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -475,7 +476,9 @@ Next: fuller product apps / broader guest move typing (if/match) / W6 inventory.
    cm32p2 export-resource ABI (`bytes-task_new` import + dtor) + multi-step
    Wasmtime get→poll-ready→body-len→drop (body length 2). **CM resource
    multi-step execution evidence now present.**
-   Next: fuller product apps / broader guest move typing (if/match) / W6 inventory.
+   **W5 deepen (2026-07-28, compiler / ADR 0138):** multi-binding companions + nested
+   non-linear outer lets + balanced `if` affine arms.
+   Next: fuller product apps / match multi-arm move typing / W6 inventory.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
@@ -535,11 +538,11 @@ Next: fuller product apps / broader guest move typing (if/match) / W6 inventory.
    compiler#360 / ADR 0095):** reference + nbb vectors for the write path —
    `:object/put-block` + `:object/compare-and-set-ref` (binding allowlist,
    bounded payload as host string, bool results, redaction, denial). Linear
-   Component v0.3 keeps linear handle ABI; **ADR 0120–0137 :bytes + object/http
+   Component v0.3 keeps linear handle ABI; **ADR 0120–0138 :bytes + object/http
    get-stream ready/pending/joined multi-chunk/chunk-queue/open-stream + guest
    poll/read + production transports + packaging + put+get product vertical +
    host linear resource table + packaging linear resource table + full CM
-   resource packaging + multi-step Wasmtime of CM resources
+   resource packaging + multi-step Wasmtime of CM resources + guest let/if move typing
    on reference + nbb.** **Reference dual-runtime now also covers stream-object write ops.**
 
 
