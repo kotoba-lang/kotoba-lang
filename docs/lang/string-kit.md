@@ -1,6 +1,6 @@
 # String kit (pure-product / T4.2)
 
-**Status:** length + from-i64 + concat + **bounded join** landed; T1.3 dual-backend pilot covers **full pure-product string-ops surface** (compiler#415 / ADR 0164, **12** cases)  
+**Status:** length + from-i64 + concat + **bounded join** landed; T1.3 dual-backend pilot covers pure-product string-ops including **string-byte-length** (compiler#425 / ADR 0175)  
 **Split:** deferred (optional)
 
 | Op | Arity | Meaning |
@@ -32,7 +32,8 @@ More than 8 parts after the separator is a compile-time reject.
 - compiler#413 / ADR 0162 (`string-join`)
 - compiler#414 / ADR 0163 (join + from-i64 pilot)
 - compiler#415 / ADR 0164 (contains / eq / substring / fold-case / code-point pilot)
-- `clojure -M:conformance` 12/12 dual-green
+- compiler#425 / ADR 0175 (`string-byte-length` dual-backend kit; pilot **28**)
+- `clojure -M:conformance` dual-green
 - `kotoba.compiler.string-operation-test` dual-backend checks
 
 ## Related
