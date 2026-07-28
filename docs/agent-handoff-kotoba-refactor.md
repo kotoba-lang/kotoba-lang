@@ -48,6 +48,7 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 | cloud.plan pure oracle expand (webtransport + generic endpoints) | murakumo#142 |
 | persist pure oracle expand (envelope operation + curl headers) | murakumo#141 |
 | task.plan pure oracle expand (unschedulable-detail) | murakumo#143 |
+| tunnel pick-exit/trim-err + secret kit-reply pure dual-source | murakumo#144 |
 | identity.sign inject adapter + empty-module fixture | provider#38 / ADR 0156 |
 | T8.4 host-parity L5 critical conformance fixtures + resources sync | kotoba-lang (this PR) |
 | deploy.plan pure oracle expand (execution probe + pin paths) | murakumo#138 |
@@ -71,13 +72,13 @@ Next language work: T1.2 conformance matrix, T1.3 dual-backend runner, T4 stdlib
 
 ### Plan Next (priority order)
 
-1. **Delivery residual** — product-shell pure dual-source complete (#122–#143); optional HOME/bin config leave; residual PVA (schedule `eligible?` bit-pack intentional)
-2. **T8.3 production AOT** — signed kit EDN (#36) + signed Wasm **receipt API** (#37 / ADR 0155) landed; remaining: real content-addressed Component packages + readiness `:signed-wasm :ready` for HTTP/secret
+1. **Delivery residual** — murakumo product-shell pure dual-source complete (#122–#144); optional HOME/bin config leave; residual PVA (schedule `eligible?` bit-pack intentional)
+2. **T8.3 production AOT** — signed kit EDN (#36) + signed Wasm **receipt API** (#37 / ADR 0155) + identity inject (#38) landed; remaining: real content-addressed Component packages + readiness `:signed-wasm :ready` for HTTP/secret
 3. **wasm-aot packaging claims** — still pending honesty (ADR 0152–0155); do not claim ready from fixture receipts
 4. **Host parity L5** — T8.4 **partial**: critical-import conformance fixtures expanded (45 cases) + resources sync; remaining live host runners (kototama/wasm-webcomponent)
 5. **Identity inject** — adapter landed (provider#38 / ADR 0156); hosts wire real Ed25519/CACAO/kagi; HMAC test doubles stay tests-only
 
-**Landed 2026-07-28:** full murakumo product-shell dual-source — bulk KIR catalog (#99) + host wire through overlay-driver/runtime (#113) + Product Value ABI v1 #112–#121 + cljs/nbb oracle load (#122); live HMAC/AES (#87).
+**Landed 2026-07-28:** full murakumo product-shell dual-source — bulk KIR catalog (#99) + host wire through overlay-driver/runtime (#113) + Product Value ABI v1 #112–#121 + cljs dual-source #122–#135 + pure expands #136–#144 + ops config inject #137; live HMAC/AES (#87).
 
 ### Do not
 
