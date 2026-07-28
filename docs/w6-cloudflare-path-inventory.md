@@ -75,6 +75,6 @@ EDN equality on request maps / parse fixtures → HTTP + token remain host.
 
 ## Next
 
-1. murakumo pure-planner scalar oracles complete (#37–#57); remaining cljc is map/vector/crypto/host shells.  
+1. murakumo pure-planner scalars through component-authority (#37–#59); remaining cljc is map/vector/crypto/host shells.  
 2. compat handlers/store remain host; WASM L5 packaging still blocked.  
 3. Optional product shells / murakumo map folds beyond scalar oracles.
