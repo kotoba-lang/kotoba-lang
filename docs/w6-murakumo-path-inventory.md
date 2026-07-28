@@ -139,9 +139,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#131:** **cljs dual-source infer.gc/relay/moe/join** — need/free/target/comfy; make-id/lease/msg kinds; capacity/ratio/verdict; tier/resident/can/relay flags. ADR `ADR-260728-w6-cljs-infer-gc-relay-moe-join`.
 - **2026-07-28 murakumo#132:** **cljs dual-source overlay.runtime/driver + deploy.plan** — default ports/adapter-kind/known-adapter?/scheme-host; option-name/blank?/endpoint-kind/dial-ok; constants/manifest-dir/paths/localhost-url/command-output. ADR `ADR-260728-w6-cljs-overlay-deploy-dual`.
 
+- **2026-07-28 murakumo#133:** **cljs dual-source residual infer plan/engine/rebalance/credits** — usable-bytes/choose-strategy; rpc/head/mlx/moe/embed cmd fragments; largest-remainder seats; charge-allow?/memory-time. ADR `ADR-260728-w6-cljs-infer-residual-dual`.
+
 ## Next
 
-1. murakumo pure+adapter path **#61–#132** — cljs dual-source through overlay runtime/driver + deploy and infer gc/relay/moe/join. Remaining: Delivery 5–8 shells / residual PVA / **incremental cljs rewire** (infer plan/engine/rebalance/credits) / network·secret caps contract-only.
+1. murakumo pure+adapter path **#61–#133** — cljs dual-source through overlay runtime/driver + deploy and infer gc/relay/moe/join. Remaining: Delivery 5–8 shells / residual PVA / network·secret caps contract-only (**portable .cljc pure cljs dual-source complete** through #133) / network·secret caps contract-only.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#16 product-shell complete); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Deeper pure ports still dual-implemented where listed “Still host” (envelope maps, placement folds beyond wired subset, etc.); production compiler dependency remains avoided (resource path).
