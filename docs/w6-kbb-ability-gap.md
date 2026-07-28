@@ -75,6 +75,8 @@ separates **ops shells** from the JS backend.
 - **2026-07-28 com-cloudflare#9 / ADR 0007:** Pages bulk Direct Upload pure multi-step plan.
 - **2026-07-28 com-cloudflare#10 / ADR 0008:** Pages bulk path/hash kotoba pure oracle.
 
+- **2026-07-28 provider#34 / ADR 0152:** ops capability-kit EDN packages (secret/process/scoped-fs/git/entropy) + honest `:signed-content-addressed-package :pending` / `:wasm-aot :pending`.
+
 ## Next
 
 1. **W6 kbb ability gap list is complete** (including Pages bulk + oracle).  

@@ -145,7 +145,7 @@ fixture equality → shells remain on bb/nbb/JVM host.
 
 ## Next
 
-1. murakumo pure+adapter path **#61–#135** — product-shell pure dual-source complete including residual report/provision/cloud/crypto `.cljc` (#135). Remaining: Delivery 5–8 ops CLI shells / residual PVA / network·secret caps contract-only. com-cloudflare #17 + com-cloudflare-compat #5 cljs dual-source landed.
+1. murakumo pure+adapter path **#61–#135** — product-shell pure dual-source complete including residual report/provision/cloud/crypto `.cljc` (#135). Remaining: Delivery 5–8 ops CLI shells / residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5). Network/secret **reference kit packages** landed (provider#34); signed Wasm packages still pending. com-cloudflare #17 + com-cloudflare-compat #5 cljs dual-source landed.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#16 product-shell complete); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Deeper pure ports still dual-implemented where listed “Still host” (envelope maps, placement folds beyond wired subset, etc.); production compiler dependency remains avoided (resource path).

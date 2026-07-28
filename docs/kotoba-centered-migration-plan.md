@@ -327,7 +327,7 @@ Qualify vertical families in dependency order:
 **W6 entropy kit (2026-07-28, provider#33 / ADR 0151):** id 23 CSPRNG draw; clock-and-random gap closed.
 **W6 cloud-deploy (2026-07-28, com-cloudflare#5–#10):** pure plans + oracles + module multipart + Pages bulk + path oracle.
 **W6 bare-git audit (2026-07-28, murakumo#58):** absolute git-bin only.
-Next: product verticals / Delivery 5–8; live HMAC·AES host adapters (crypto packaging pure landed #83–#85); production signed providers for network/secret; wasm-aot packaging claims. W6 kbb gaps complete; pure capability allowlist reference-impl complete (sin/cos/sha256/cbor/json/clock/random/now-days; definition CID identity: agent-handoff + ADR-capability-repository-semantic-cid-v1).
+Next: product verticals / Delivery 5–8 residual ops CLI shells; live HMAC·AES host adapters (crypto packaging pure landed #83–#85); network/secret **reference kit packages** landed (provider#34) — **signed** Wasm packages still pending (ADR 0152 honesty); wasm-aot still pending. W6 kbb gaps complete; pure capability allowlist reference-impl complete.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -539,7 +539,7 @@ Next: product verticals / Delivery 5–8; live HMAC·AES host adapters (crypto p
    **W6 QUIC path-ref + kagi-fetch + git dual-runtime/tooling (2026-07-28, murakumo#52+#53+#55 + provider#29+#31+#32).**
    **W6 entropy kit (2026-07-28, provider#33 / ADR 0151):** CSPRNG id 23; clock-and-random landed.
    **W6 cloud-deploy complete + pages-bulk oracle + bare-git audit (2026-07-28, com-cloudflare#5–#10 + murakumo#58).**
-   Next: product verticals / Delivery 5–8; live HMAC·AES host adapters (crypto packaging pure landed #83–#85); production signed network/secret providers; wasm-aot packaging claims (W6 kbb gaps complete; pure capability allowlist reference-impl complete including cbor/json).
+   Next: product verticals / Delivery 5–8; live HMAC·AES host adapters (crypto packaging pure landed #83–#85); network/secret reference kits landed (provider#34); signed Wasm + wasm-aot still pending (ADR 0152) (W6 kbb gaps complete; pure capability allowlist reference-impl complete including cbor/json).
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
@@ -781,6 +781,6 @@ First packages: capability-math-sin#1, capability-math-cos#1 (wasm + JVM Math).
 **capability-random-bytes#1 (2026-07-28):** wasm xorshift fill + JVM `SecureRandom`; ABI `random_bytes` `(ptr,len)→i32`.
 **capability-data-cbor#1 (2026-07-28):** flat pairs → definite CBOR map; ABI `cbor_encode`.
 **capability-data-json#1 (2026-07-28):** flat pairs → JSON object + bounded field extract; ABI `json_encode`/`json_extract_field`.
-**Allowlist pure reference-implemented set complete.** **murakumo#61–#133** pure+adapter path — **full product-shell KIR catalog (32 cores) + portable .cljc pure hosts dual-source complete** (cljs #122–#133 including residual infer plan/engine/rebalance/credits). com-cloudflare#17 + com-cloudflare-compat#5 + murakumo#135 cljs dual-source landed (product-shell pure complete). Next: Delivery 5–8 residual ops shells / residual PVA; network/secret caps remain contract-only.
+**Allowlist pure reference-implemented set complete.** **murakumo#61–#133** pure+adapter path — **full product-shell KIR catalog (32 cores) + portable .cljc pure hosts dual-source complete** (cljs #122–#133 including residual infer plan/engine/rebalance/credits). com-cloudflare#17 + com-cloudflare-compat#5 + murakumo#135 cljs dual-source landed (product-shell pure complete). Next: Delivery 5–8 residual ops shells / residual PVA (schedule eligible? bit-pack intentional); network/secret reference kits landed (provider#34); signed content-addressed Wasm still pending.
 
 **Language reliability parity WBS (2026-07-28):** see [`docs/kotoba-reliability-parity-wbs.md`](./kotoba-reliability-parity-wbs.md) (T1–T10 / R1–R4 toward CLJ-class predictability without ambient Clojure).
