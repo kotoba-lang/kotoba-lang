@@ -124,10 +124,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#115:** **Product Value ABI v1 sealed fields + reconcile optionals** — `sealed-fields-present?` uses `[:option :string]` ×3 (drop has-alg/nonce/ct); `desired` optional replicas; `action-name` optional cid (drop unused has-misplaced). ADR `ADR-260728-w6-pva-sealed-reconcile`.
 
 - **2026-07-28 murakumo#116:** **Product Value ABI v1 connect + report health** — `serves-plane?` optional http?/common? flags; `health-label`/`status-row` optional health? (drop has-http/has-common/has-health). ADR `ADR-260728-w6-pva-connect-report`.
+- **2026-07-28 murakumo#118:** **Product Value ABI v1 task failed? + peer choose-via** — `failed?` optional exit/error; `choose-via` optional direct/relay + health string (drop has-* / exit-present). ADR `ADR-260728-w6-pva-task-peer`.
 
 ## Next
 
-1. murakumo pure+adapter path **#61–#116** — full dual-source + PVA through connect/report health (#116 after sealed #115 / ports #114 / token #112). Remaining: Delivery 5–8 shells / PVA expand (schedule bit-flags, overlay-peer choose-via, …) / cljs oracle load optional / network·secret caps contract-only.
+1. murakumo pure+adapter path **#61–#118** — full dual-source + PVA through task/peer (#118 after connect/report #116). Remaining: Delivery 5–8 shells / PVA expand (schedule bit-flags, rebalance classify-run-flags, …) / cljs oracle load optional / network·secret caps contract-only.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Deeper pure ports still dual-implemented where listed “Still host” (envelope maps, placement folds beyond wired subset, etc.); production compiler dependency remains avoided (resource path).
