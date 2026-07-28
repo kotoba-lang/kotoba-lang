@@ -45,7 +45,7 @@ compiler / KIR / wasm / native / legacy path skew.
 |---|---|---|---|---|---|
 | T1.1 | Author `docs/lang/semantics-ssot.md` (values, evaluation, fuel, errors, capability call) | **kotoba-lang** | Accepted prose SSoT; points at executable suites | — | M |
 | T1.2 | Expand `lang/conformance/manifest.edn` to list **required** backends per case class — **landed** (v2 matrix + `conformance-matrix` + tests; ADR-reliability-t12) | **kotoba-lang** | Machine-readable matrix | T1.1 | S |
-| T1.3 | Implement/extend runner: each case runs on **KIR + wasm32-kotoba-v1** minimum — **pilot expanded** (compiler#412–#416 / ADR 0161–0165; **13** pure-product dual-green = control5 + string-ops + record-kit; full matrix progressive) | **compiler**, **kotoba-kir**, **kotoba-wasm** | `clojure -M:conformance` green on both | T1.2 | L |
+| T1.3 | Implement/extend runner: each case runs on **KIR + wasm32-kotoba-v1** minimum — **pilot expanded** (compiler#412–#421 / ADR 0161–0171; **20** pure-product dual-green; full matrix progressive) | **compiler**, **kotoba-kir**, **kotoba-wasm** | `clojure -M:conformance` green on both | T1.2 | L |
 | T1.4 | Add native (x86_64/aarch64) cases for pure i64/string/option subset — **pilot landed** (compiler#419 / ADR 0168; 5 pure-native-v1 kexe cases on host ISA) | **compiler**, **kotoba-native** | Profile `pure-native-v1` cases | T1.3 | L |
 | T1.5 | Golden digests for IR + selected artifact bytes (where policy allows) — **landed** (compiler#418 / ADR 0167; pilot-golden.edn 13 cases; gensym-normalized KIR + wasm SHA-256) | **compiler**, **artifact** | CI fails on silent semantic drift | T1.3 | M |
 
@@ -75,7 +75,7 @@ compiler / KIR / wasm / native / legacy path skew.
 | ID | Task | Owner repo(s) | Deliverable | Depends | Estimate |
 |---|---|---|---|---|---|
 | T3.1 | Error contract: every `reject!` carries source span + stable error code | **compiler** | `{:kotoba.error/code … :line … :column …}` | — | M |
-| T3.2 | Capability deny messages name **missing grant / effect / policy** | **compiler**, **provider**, **kototama** | Uniform deny envelope | T3.1 | M |
+| T3.2 | Capability deny messages name **missing grant / effect / policy** — **landed** (compiler#421 / ADR 0171; `:capability-missing-grant` + named missing) | **compiler**, **provider**, **kototama** | Uniform deny envelope | T3.1 | M |
 | T3.3 | KIR trap → source map (function + approximate form) | **kotoba-kir**, **compiler** | Runtime errors cite export name + hint | T3.1 | L |
 | T3.4 | CLI pretty-printer for errors (`kotoba check` human mode) — **landed** (compiler#420 / ADR 0170; `error: code at file:line:col`) | **kotoba** CLI / **compiler** cli | Readable default UX | T3.1, CLI | S |
 
@@ -167,7 +167,7 @@ compiler / KIR / wasm / native / legacy path skew.
 |---|---|---|---|---|---|
 | T9.1 | Map `lang/cli.edn` commands to implemented adapters; close M2 gaps | **kotoba**, **compiler** | `check` / `test` / `run` / `compile` | cli.edn | M |
 | T9.2 | `kotoba check` = frontend admit + pure-product profile — **landed** (compiler#420 / ADR 0170; `--profile pure-product`) | **compiler** CLI | Seconds-scale feedback | T2.1, T3.4 | M |
-| T9.3 | Official test harness for `.kotoba` modules (fixtures in-tree) | **kotoba-lang** or **compiler** | Documented `kotoba test` | T9.1 | M |
+| T9.3 | Official test harness for `.kotoba` modules (fixtures in-tree) — **landed** (compiler#421 docs/test-harness.md + smoke fixture + human CLI) | **kotoba-lang** or **compiler** | Documented `kotoba test` | T9.1 | M |
 | T9.4 | Minimal formatter (or strict style subset) | **kotoba-lang** | `kotoba fmt --check` optional | — | S |
 | T9.5 | LSP spike (diagnostics from T3) | new or **compiler** | Experimental but usable | T3.1 | L |
 
