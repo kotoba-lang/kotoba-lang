@@ -1,5 +1,8 @@
 # Kotoba Language Profile
 
+**Semantics SSoT:** [`semantics-ssot.md`](./semantics-ssot.md) — values, evaluation,
+fuel, errors, capabilities, multi-backend meaning (R1 / T1.1).
+
 Kotoba source is a Kotoba/EDN subset with a capability-safe profile for
 untrusted or AI-generated code. `.kotoba` is the canonical Kotoba-only source
 extension; portable `.cljc` is for shared Clojure-family source where
