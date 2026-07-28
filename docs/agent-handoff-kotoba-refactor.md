@@ -82,7 +82,7 @@ Authoritative work breakdown (repos, tasks, sequencing, agent guide):
 Tiers R1–R4: semantic conformance → stdlib/records → standalone run → toolchain/LTS.
 Product dual-source remains separate (this handoff §2); do not invent language features in product PRs.
 
-**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#424 T1.3×**23** (loop + T7.4 10k) + T1.4/T1.5 + T3.1–T3.4 + T7.1 partial + **T7.4** + T9.1–T9.3 + T2.2/T2.4 + T5.4 + T6.1/T6.3 + T7.2/T7.3 + **T10.1–T10.3**.
+**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#425 T1.3×**28** (if-some/control/bitops + loop + T7.4 10k) + T1.4/T1.5 + T3.1–T3.4 + T7.1 partial + **T7.4** + T9.1–T9.3 + T2.2/T2.4 + T5.4 + T6.1/T6.3 + T7.2/T7.3 + **T10.1–T10.3**.
 
 Next language work: T1.3 full matrix (collections still admission-blocked); T7.1 zero-charge/machine TCO; T4.2 string-split optional; T4.4 typed-map pilot; T5.2/T5.3 record wire/packs; T8.3 ops AOT; residual PVA; T9.1 remaining public adapters (db/git/…).
 
@@ -106,7 +106,8 @@ Next language work: T1.3 full matrix (collections still admission-blocked); T7.1
 **T9.1 CLI adapters:** `lang/cli-adapter-matrix.edn` + `clojure -M:cli-adapter-matrix` (check is M2).
 **T7.1 loop pilot:** compiler#423 — loop/recur dual-green (helper desugar; not machine TCO).
 **T3.3 fuel traps:** kotoba-kir#20 + compiler#423 pin — `:function` + `:call-stack` on fuel-exhausted.
-**T7.4 deep loop 10k:** compiler#424 / ADR 0174 + kotoba-kir#21+#22 — `:loop-deep-kit` (fuel 12000); loop-helper trampoline; pilot **23** dual-green; zero-charge still open.
+**T7.4 deep loop 10k:** compiler#424 / ADR 0174 + kotoba-kir#21+#22 — `:loop-deep-kit` (fuel 12000); loop-helper trampoline; zero-charge still open.
+**T1.3 pilot 28:** compiler#425 / ADR 0175 — if-some + string-byte-length + when/cond/if-let + case + bitops dual-green.
 
 ### Plan Next (priority order)
 
