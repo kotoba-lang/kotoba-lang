@@ -73,5 +73,5 @@ fixture equality → shells remain on bb/nbb/JVM host.
 ## Next
 
 1. murakumo pure-planner scalar oracles effectively complete (29 `.kotoba` cores). Remaining cljc is map/vector/crypto/host shells.
-2. Cloudflare pure-request + deploy module oracle landed (#1–#8); compat coerce/path oracle (#2); analytics tallies optional.
-3. kbb dual-runtime OS transports + git/entropy kits landed; remaining is optional Pages bulk REST.
+2. Cloudflare pure-request + deploy + parse tallies landed (#1–#11); compat coerce/path oracle (#2).
+3. kbb dual-runtime OS transports + git/entropy kits landed; W6 high/medium gaps effectively complete.
