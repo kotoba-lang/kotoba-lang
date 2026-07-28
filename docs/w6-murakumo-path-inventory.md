@@ -59,9 +59,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#40:** `kotoba/task_plan_core.kotoba` slots / failed? / can-retry? / defaults parity.
 - **2026-07-28 murakumo#41:** `kotoba/token_core.kotoba` claims/scope/expired/signing-input parity.
 - **2026-07-28 murakumo#42:** `kotoba/infer_engine_core.kotoba` rpc/embed cmd assembly + split-mode/endpoint parity.
+- **2026-07-28 murakumo#43:** `kotoba/fleet_inventory_core.kotoba` resolve-port / health-url / selector predicates / offline-line parity.
+- **2026-07-28 murakumo#44:** `kotoba/infer_schedule_core.kotoba` eligible?/score keys/compare parity (bit-packed flags).
 
 ## Next
 
-1. Medium-priority pure planners (schedule/credits/join/gc/fleet inventory/config) as needed.
-2. Cloudflare pure-request oracle (sibling inventory landed).
-3. kbb process/scoped-fs qualification for nbb shells (`ops`, `task/*`) — gap list landed.
+1. Remaining medium pure planners (gc/join/credits/config/deploy/reconcile/identity).
+2. Cloudflare pure-request oracle string cores already landed (#1–#2); optional parse tallies.
+3. kbb process/scoped-fs OS transports after contract first slice (provider#24).
