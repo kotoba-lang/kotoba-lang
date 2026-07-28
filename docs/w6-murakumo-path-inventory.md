@@ -103,10 +103,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#93:** **product-shell oracle authority (dash.state)** — JVM `short-hosted-cid` / `health-class` / `interval-sleep-ms` / `clamp-at` / `append-capped` start / `recent-alerts` n delegate to `resources/murakumo/oracle/dash_state_core.kir.edn` via `:dash-state`; HTML join, probe parse, map folds stay cljc.
 - **2026-07-28 murakumo#94:** **product-shell oracle authority (infer.schedule)** — JVM `eligible?` / `score` / assign queue-inc delegate to `resources/murakumo/oracle/infer_schedule_core.kir.edn` via `:infer-schedule`; set projection + stable sort-by pick stay host.
 - **2026-07-28 murakumo#95:** **product-shell oracle authority (task.plan)** — JVM `slots` / `failed?` / `eligible?` flags / `task-id` / retry bounds / wave·slot / percentile idx / summary retried·speedup delegate to `resources/murakumo/oracle/task_plan_core.kir.edn` via `:task-plan`; admit/prepare folds + sort-by stay cljc.
+- **2026-07-28 murakumo#96:** **product-shell oracle authority (infer.engine)** — JVM `rpc-server-cmd` / `endpoint` / `head-cmd-*` / mlx/embed fragments delegate to `resources/murakumo/oracle/infer_engine_core.kir.edn` via `:infer-engine`; plan walks + CSV join stay host.
 
 ## Next
 
-1. murakumo pure+adapter path **#61–#95** complete through task.plan product-shell KIR. Remaining: expand catalog (engine/…) / Delivery 5–8 remaining shells / network·secret caps contract-only / cljs oracle load optional.
+1. murakumo pure+adapter path **#61–#96** complete through engine product-shell KIR (kekkai/token/report/plan/dash/schedule/task/engine + live HMAC/AES). Remaining: bulk catalog gen for remaining cores / Delivery 5–8 remaining shells / network·secret caps contract-only / cljs oracle load optional.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Full pure-planner cutover still dual-implemented until each core is wired like #86–#95 (or bulk generate); blocked on production compiler (avoid) / kbb in-process load (future optional).
