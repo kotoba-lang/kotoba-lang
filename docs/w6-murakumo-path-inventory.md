@@ -111,10 +111,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#102:** **product-shell oracle authority (fleet.inventory)** — JVM `node-port` / `health-url` / selector predicates / offline-line delegate to `fleet_inventory_core.kir.edn` via `:fleet-inventory`; enrich/named vector folds stay host. ADR `ADR-260728-w6-fleet-inventory-oracle-authority`.
 - **2026-07-28 murakumo#103:** **product-shell oracle authority (identity + credits)** — JVM seed preimages/JWT templates/did helpers via `identity_core.kir.edn`; credits defaults/memory-time-weight/charge-allow? via `infer_credits_core.kir.edn`. SHA-256/b64url + float settle folds stay host. ADR `ADR-260728-w6-identity-credits-oracle-authority`.
 - **2026-07-28 murakumo#105:** **product-shell oracle authority (infer.join + infer.gc)** — JVM join tier max-resident/can?/needs-relay?/clamp/eligible via `infer_join_core.kir.edn`; gc GiB/defaults/need/free/target/comfy via `infer_gc_core.kir.edn`. Partition/plan folds stay host. ADR `ADR-260728-w6-join-gc-oracle-authority`.
+- **2026-07-28 murakumo#107:** **product-shell oracle authority (moe + rebalance + relay)** — JVM capacity-default/expert-ratio/verdict/resident via `infer_moe_core.kir.edn`; usable-gb + largest-remainder-3 via `infer_rebalance_core.kir.edn`; make-id/lease-expired?/msg kinds via `infer_relay_core.kir.edn`. Custom tiers + pool placement + queue maps stay host. ADR `ADR-260728-w6-moe-rebalance-relay-oracle-authority`.
 
 ## Next
 
-1. murakumo pure+adapter path **#61–#105** — **full KIR catalog shipped** (32 artifacts); join/gc host-wired. Remaining: incremental host wiring of catalog-only cores (moe/rebalance/relay/overlay/persist/deploy/… ) / Delivery 5–8 remaining shells / network·secret caps contract-only / cljs oracle load optional.
+1. murakumo pure+adapter path **#61–#107** — **full KIR catalog shipped** (32 artifacts); moe/rebalance/relay host-wired. Remaining: overlay/persist/deploy/connect/component-authority incremental host wiring / Delivery 5–8 remaining shells / network·secret caps contract-only / cljs oracle load optional.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Full pure-planner cutover still dual-implemented until each core is wired like #86–#98 (or bulk generate); blocked on production compiler (avoid) / kbb in-process load (future optional).
