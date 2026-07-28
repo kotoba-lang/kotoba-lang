@@ -42,9 +42,9 @@ These are **authority hosts**, not W6 product file ports.
 |---|---|---|
 | murakumo | blocked-by-provider | state/LLM/governor/checkpoint product cutover |
 | murakumo-studio | blocked-by-provider | follows murakumo |
-| com-cloudflare | blocked-by-provider | HTTP ingress workerd qualification; then route semantics |
-| com-cloudflare-compat | host-mechanism | adapter keep |
-| kotoba-script | blocked-by-language | kbb fs/process/git/secrets/cloud abilities (keep nbb) |
+| com-cloudflare | blocked-by-provider | path inventory landed; pure request/parse candidates; live token host |
+| com-cloudflare-compat | host-mechanism | adapter keep (pure routes optional later) |
+| kotoba-script | blocked-by-language | KIR→mjs backend; ops nbb until kbb gaps close |
 | kami-engine-script-runtime | host-mechanism | adapter |
 
 ## Guest product evidence already on `.kotoba`
@@ -56,10 +56,12 @@ These are **authority hosts**, not W6 product file ports.
 
 ## Next actions
 
-1. **Path-level murakumo inventory** — **landed**: [`docs/w6-murakumo-path-inventory.md`](w6-murakumo-path-inventory.md) / `lang/w6-murakumo-path-inventory.edn`.
-2. **Murakumo pure-planner oracles** — high-priority complete (gate#37 / infer-plan#38 / dash-state#39 / task-plan#40 / token#41 / engine#42).
-3. **Cloudflare route inventory** — separate route product from mechanism adapters after ingress soak.
-4. **kbb ability gap list** — explicit blockers for kotoba-script ← nbb cutover.
+1. **Path-level murakumo inventory** — **landed**: [`docs/w6-murakumo-path-inventory.md`](w6-murakumo-path-inventory.md).
+2. **Murakumo pure-planner oracles** — high-priority complete (gate#37 … engine#42).
+3. **Cloudflare path inventory** — **landed**: [`docs/w6-cloudflare-path-inventory.md`](w6-cloudflare-path-inventory.md) / `lang/w6-cloudflare-path-inventory.edn`.
+4. **kbb ability gap list** — **landed**: [`docs/w6-kbb-ability-gap.md`](w6-kbb-ability-gap.md) / `lang/w6-kbb-ability-gap.edn`.
+5. **Cloudflare pure-request oracle** — stream validate/redact + analytics parse.
+6. **Qualify process + scoped-fs kits** — high-priority kbb gaps.
 
 ## Migration process (unchanged)
 
