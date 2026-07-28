@@ -217,6 +217,7 @@ Network/secret caps stay contract-only until signed production providers exist.
 | product-shell oracle authority (infer.join + infer.gc) | murakumo#105 |
 | product-shell oracle authority (moe + rebalance + relay) | murakumo#107 |
 | product-shell oracle authority (deploy + connect + component-authority) | murakumo#110 |
+| product-shell oracle authority (overlay + cloud + provision) | murakumo#111 |
 | product-shell oracle authority (secret) | murakumo#98 |
 | bulk product-shell KIR catalog (32 cores) | murakumo#99 |
 | zones query + hostname-match oracle | com-cloudflare#13 |

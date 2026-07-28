@@ -115,9 +115,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#109:** **product-shell oracle authority (persist)** — JVM constants/rkeys/repo-uri/url/write-ok? via `persist_core.kir.edn`; envelope maps + graph-cid stay host. ADR `ADR-260728-w6-persist-oracle-authority`.
 - **2026-07-28 murakumo#110:** **product-shell oracle authority (deploy + connect + component-authority)** — JVM deploy defaults/paths/localhost-url via `deploy_plan_core.kir.edn`; connect class/plane via `connect_core.kir.edn`; component-authority epochs/identifier via `component_authority_core.kir.edn`. Regex/argv folds + ed25519 stay host. ADR `ADR-260728-w6-deploy-connect-authority-oracle`.
 
+- **2026-07-28 murakumo#111:** **product-shell oracle authority (overlay + cloud + provision)** — JVM overlay keyring/peer/stream pure helpers; cloud defaults/region/endpoints; provision constants/p2p/multiaddr/mesh cmds. ADR `ADR-260728-w6-overlay-cloud-provision-oracle-authority`.
+
 ## Next
 
-1. murakumo pure+adapter path **#61–#110** — **full KIR catalog shipped** (32 artifacts); deploy/connect/component-authority host-wired. Remaining catalog-only: overlay-* / cloud / provision / Delivery 5–8 remaining shells / network·secret caps contract-only / cljs oracle load optional.
+1. murakumo pure+adapter path **#61–#111** — **full KIR catalog shipped** (32 artifacts); deploy/connect/component-authority host-wired. Remaining catalog-only: overlay-driver / overlay-runtime (argv loops) / Delivery 5–8 shells / network·secret caps contract-only / cljs oracle load optional.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Full pure-planner cutover still dual-implemented until each core is wired like #86–#98 (or bulk generate); blocked on production compiler (avoid) / kbb in-process load (future optional).
