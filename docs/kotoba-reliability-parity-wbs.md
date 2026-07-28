@@ -135,10 +135,10 @@ compiler / KIR / wasm / native / legacy path skew.
 
 | ID | Task | Owner repo(s) | Deliverable | Depends | Estimate |
 |---|---|---|---|---|---|
-| T7.1 | `loop`/`recur` true tail on KIR + wasm — **partial landed**: helper desugar + dual-backend pilot (compiler#423); machine TCO / zero-charge recur still open | **compiler**, **kotoba-kir**, **kotoba-wasm** | Spec + tests | roadmap | L |
+| T7.1 | `loop`/`recur` true tail on KIR + wasm — **landed for desugared loop**: zero-charge helper re-entry (compiler#428 / kir#24 / wasm#35+#36); arbitrary mutual-recursion TCO still open | **compiler**, **kotoba-kir**, **kotoba-wasm** | Spec + tests | roadmap | L |
 | T7.2 | Fuel model doc: charge rules, defaults, per-module budgets — **landed** (`docs/lang/fuel-model.md`; 1 unit/function entry, default 512) | **kotoba-lang**, **kotoba-kir** | `docs/lang/fuel-model.md` | T1.1 | S |
 | T7.3 | `kotoba fuel-estimate` or compile-time crude cost attribute (optional) — **landed** (compiler#419 / ADR 0169; `clojure -M:fuel-estimate`) | **compiler** | Best-effort tool | T7.2 | M |
-| T7.4 | Conformance: tail recursion 10k iterations within fuel envelope — **landed** (compiler#424 / ADR 0174 + kotoba-kir#21+#22 / ADR 0021; `:loop-deep-kit` fuel 12000; loop-helper trampoline; zero-charge still open) | **compiler**, **kotoba-kir** | Regression | T7.1 | S |
+| T7.4 | Conformance: tail recursion 10k iterations within fuel envelope — **landed** (compiler#424+#428; `:loop-deep-kit` now fuel **16** under T7.1 zero-charge) | **compiler**, **kotoba-kir** | Regression | T7.1 | S |
 
 **Exit:** Authors can predict stack/fuel for iterative pure code.
 
