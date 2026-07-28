@@ -39,6 +39,8 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 | W6 kbb ability gaps | **COMPLETE** (process / scoped-fs / secret / git / entropy / cloud-deploy; SSH host-forever) |
 | W6 process / scoped-fs / secret / git / entropy kits | provider ADR **0143–0151** (ids 19–23; cljs OS transports landed) |
 | W6 ops kit EDN packages + signing honesty | provider **#34** / ADR **0152** (wasm-aot/signed package pending) |
+| residual ops config inject (exact-name getenv) | murakumo#137 |
+| dash.state probe parse pure oracle expand | murakumo#136 |
 | Pure capability allowlist reference-impl | **COMPLETE** (sin / cos / sha256 / cbor / json / clock / random / now-days) |
 | Network / secret capability packages | **reference kit packages landed** (provider#34: secret/process/scoped-fs/git/entropy + existing http); **signed content-addressed Wasm still pending** |
 
@@ -53,7 +55,7 @@ Product dual-source remains separate (this handoff §2); do not invent language 
 
 ### Plan Next (priority order)
 
-1. **Delivery 5–8 remaining shells** — com-cloudflare product-shell complete (#14+#16+#17); com-cloudflare-compat product-shell complete (#3+#5 cljs); murakumo product-shell pure dual-source complete through #135 (report/provision/cloud/crypto `.cljc`). Residual: ops CLI ambient shells / WASM L5 packaging
+1. **Delivery 5–8 remaining shells** — product-shell pure complete; murakumo ops config inject #137 (exact-name getenv centralize). Residual: optional HOME/bin config leave, WASM L5 packaging, signed content-addressed Wasm
 2. **Product Value ABI residual** — schedule `eligible?` bit-pack remains intentional packing (arity ≤5); most has-* sentinels cleared through #121
 3. **Incremental cljs host rewire** — landed murakumo #122–#135 + com-cloudflare#17 + com-cloudflare-compat#5; remaining residual PVA / network·secret signed providers / WASM packaging claims
 4. **Production signed providers** — reference kit packages landed (provider#34); remaining: content-addressed **signed** Wasm providers (not claimed)
