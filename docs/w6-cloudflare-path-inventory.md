@@ -76,6 +76,6 @@ EDN equality on request maps / parse fixtures → HTTP + token remain host.
 
 ## Next
 
-1. murakumo pure-planner scalars through secret (#37–#60); remaining cljc is map/vector/crypto/host shells.  
+1. murakumo pure scalars through secret (#37–#60); first map-fold `largest-remainder-3` landed (murakumo#61).  
 2. compat handlers/store remain host; WASM L5 packaging still blocked.  
-3. Optional product shells / murakumo map folds beyond scalar oracles.
+3. Further product shells / map folds (demand-from-runs, placement moves) still open.

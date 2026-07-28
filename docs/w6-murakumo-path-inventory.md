@@ -71,9 +71,10 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#57:** `overlay_peer_core` + `overlay_driver_core` pure oracles.
 - **2026-07-28 murakumo#59:** `component_authority_core.kotoba` identifier/epoch/sequence pure oracle.
 - **2026-07-28 murakumo#60:** `secret_core.kotoba` name/env constants + env/path-ref policy oracle.
+- **2026-07-28 murakumo#61:** `infer_rebalance_core` 3-pool `largest-remainder-3` map-fold oracle (first beyond scalars).
 
 ## Next
 
-1. murakumo pure-planner scalar oracles ~31 `.kotoba` cores. Remaining cljc is map/vector/crypto/host shells.
-2. Cloudflare pure-request + deploy + parse tallies landed (#1–#11); compat coerce/path oracle (#2).
-3. kbb dual-runtime OS transports + git/entropy kits landed; W6 high/medium gaps effectively complete.
+1. murakumo pure scalars complete; first map-fold (`largest-remainder-3`) landed (#61). Remaining: demand-from-runs / placement moves / crypto/host shells.
+2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
+3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
