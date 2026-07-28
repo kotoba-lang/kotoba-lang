@@ -82,9 +82,9 @@ Authoritative work breakdown (repos, tasks, sequencing, agent guide):
 Tiers R1–R4: semantic conformance → stdlib/records → standalone run → toolchain/LTS.
 Product dual-source remains separate (this handoff §2); do not invent language features in product PRs.
 
-**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#421 T1.3 pilot **20** dual-green + T1.4/T1.5 + T3.2/T3.4 + T9.2/T9.3, T2.2/T2.4, T5.4, T6.1/T6.3, T7.2/T7.3, **T10.1–T10.3**.
+**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#422 T1.3×20 + T1.4/T1.5 + **T3.1 complete** + T3.2/T3.4 + T9.1 matrix + T9.2/T9.3, T2.2/T2.4, T5.4, T6.1/T6.3, T7.2/T7.3, **T10.1–T10.3**.
 
-Next language work: T1.3 full matrix (collections still admission-blocked); expand T1.4 option surface; T4.2 string-split optional; T4.4 typed-map pilot; T5.2 native record wire; T5.3 pack rewrites; T7.1 true tail; T8.3 ops AOT; residual PVA intentional.
+Next language work: T1.3 full matrix (collections still admission-blocked); expand T1.4 option surface; T4.2 string-split optional; T4.4 typed-map pilot; T5.2 native record wire; T5.3 pack rewrites; T7.1 true tail; T8.3 ops AOT; residual PVA intentional; T9.1 remaining public adapters (db/git/…).
 
 **T7.2 fuel model:** [`docs/lang/fuel-model.md`](./lang/fuel-model.md) (1 unit/function entry, default 512).
 **T1.5 goldens:** compiler#418 / ADR 0167 — `clojure -M:conformance --check-golden`.
@@ -102,6 +102,8 @@ Next language work: T1.3 full matrix (collections still admission-blocked); expa
 **T1.3 pilot 20 dual-green:** compiler#421 / ADR 0171 — `clojure -M:conformance` / `--check-golden`.
 **T3.2 capability deny:** compiler#421 — missing grants named in message + error code.
 **T9.3 test harness:** compiler#421 — `clojure -M:run test <file.kotoba>` (export `test-*` → i64 1).
+**T3.1 error codes:** compiler#422 / ADR 0172 — every `reject!` has a code (default `:subset-reject`).
+**T9.1 CLI adapters:** `lang/cli-adapter-matrix.edn` + `clojure -M:cli-adapter-matrix` (check is M2).
 
 ### Plan Next (priority order)
 

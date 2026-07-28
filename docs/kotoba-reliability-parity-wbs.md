@@ -74,7 +74,7 @@ compiler / KIR / wasm / native / legacy path skew.
 
 | ID | Task | Owner repo(s) | Deliverable | Depends | Estimate |
 |---|---|---|---|---|---|
-| T3.1 | Error contract: every `reject!` carries source span + stable error code | **compiler** | `{:kotoba.error/code … :line … :column …}` | — | M |
+| T3.1 | Error contract: every `reject!` carries source span + stable error code — **landed** (compiler#422 / ADR 0172; default `:subset-reject` + specific codes) | **compiler** | `{:kotoba.error/code … :line … :column …}` | — | M |
 | T3.2 | Capability deny messages name **missing grant / effect / policy** — **landed** (compiler#421 / ADR 0171; `:capability-missing-grant` + named missing) | **compiler**, **provider**, **kototama** | Uniform deny envelope | T3.1 | M |
 | T3.3 | KIR trap → source map (function + approximate form) | **kotoba-kir**, **compiler** | Runtime errors cite export name + hint | T3.1 | L |
 | T3.4 | CLI pretty-printer for errors (`kotoba check` human mode) — **landed** (compiler#420 / ADR 0170; `error: code at file:line:col`) | **kotoba** CLI / **compiler** cli | Readable default UX | T3.1, CLI | S |
@@ -165,7 +165,7 @@ compiler / KIR / wasm / native / legacy path skew.
 
 | ID | Task | Owner repo(s) | Deliverable | Depends | Estimate |
 |---|---|---|---|---|---|
-| T9.1 | Map `lang/cli.edn` commands to implemented adapters; close M2 gaps | **kotoba**, **compiler** | `check` / `test` / `run` / `compile` | cli.edn | M |
+| T9.1 | Map `lang/cli.edn` commands to implemented adapters; close M2 gaps — **partial landed**: adapter matrix + check M2; db/git/rad/deploy/hinshitsu contract-only | **kotoba**, **compiler** | `check` / `test` / `run` / `compile` | cli.edn | M |
 | T9.2 | `kotoba check` = frontend admit + pure-product profile — **landed** (compiler#420 / ADR 0170; `--profile pure-product`) | **compiler** CLI | Seconds-scale feedback | T2.1, T3.4 | M |
 | T9.3 | Official test harness for `.kotoba` modules (fixtures in-tree) — **landed** (compiler#421 docs/test-harness.md + smoke fixture + human CLI) | **kotoba-lang** or **compiler** | Documented `kotoba test` | T9.1 | M |
 | T9.4 | Minimal formatter (or strict style subset) | **kotoba-lang** | `kotoba fmt --check` optional | — | S |
