@@ -62,9 +62,10 @@ EDN equality on request maps / parse fixtures → HTTP + token remain host.
 ## Progress
 
 - **2026-07-28:** path inventory accepted (this document).
+- **2026-07-28 com-cloudflare#1:** `kotoba/stream_core.kotoba` redact-key / validate-flags / destination-url / path builders parity.
 
 ## Next
 
-1. Author oracle fixtures for `stream/validate-output` + analytics parse (highest pure reuse).  
-2. kbb ability gap list (sibling W6 next-action).  
+1. Analytics parse + GraphQL request-builder oracle.  
+2. process + scoped-fs kit qualification (kbb high-priority gaps).  
 3. Optional medium murakumo pure planners.
