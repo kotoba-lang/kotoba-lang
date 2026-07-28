@@ -76,6 +76,6 @@ EDN equality on request maps / parse fixtures → HTTP + token remain host.
 
 ## Next
 
-1. murakumo pure path #61–#73 (plan/rebalance/engine/schedule pick).  
+1. murakumo pure path #61–#75 (incl. reconcile pick-targets).  
 2. compat handlers/store remain host; WASM L5 packaging still blocked.  
-3. n≠3 / assign batches / node-id maps remain host; other verticals open.
+3. n≠3 / assign batches / eligible-nodes sets remain host; other verticals open.
