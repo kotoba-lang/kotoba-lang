@@ -51,6 +51,10 @@ fixture equality → shells remain on bb/nbb/JVM host.
 | checkpoint-task-batch | state audit log + object result blobs |
 | fleet-control-plane | kbb process/ssh + optional HTTP ingress APIs |
 
+## Progress
+
+- **2026-07-28 murakumo#37:** `kotoba/kekkai_gate_core.kotoba` oracle parity for gate string core.
+
 ## Next
 
 1. Author oracle fixtures for `infer/plan` + `task/plan` (highest reuse).
