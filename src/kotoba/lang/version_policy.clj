@@ -36,9 +36,19 @@
            (conj {:code :deprecation/window-too-short})
            (not= :ed25519 (get-in policy [:release-tags :algorithm]))
            (conj {:code :release/unsupported-signature})
-           (not= #{:version :commit :tree :source-root :issued-at-ms}
+           (not= #{:version :commit :tree :source-root :issued-at-ms :language-profile}
                  (get-in policy [:release-tags :binds]))
-           (conj {:code :release/incomplete-binding}))
+           (conj {:code :release/incomplete-binding})
+           (let [lp (:release/language-profile policy)
+                 st (get-in policy [:supported :language-profile lp :status])]
+             (not= :active st))
+           (conj {:code :release/language-profile-not-active
+                  :language-profile (:release/language-profile policy)})
+           (let [pc (:release/package-contract policy)
+                 st (get-in policy [:supported :package-contract pc :status])]
+             (not= :active st))
+           (conj {:code :release/package-contract-not-active
+                  :package-contract (:release/package-contract policy)}))
          deprecation-errors
          (for [[axis versions] (:supported policy)
                [version entry] versions
@@ -118,15 +128,51 @@
     {:valid? (nil? code) :code code :tag tag :version version
      :signer signer}))
 
-(defn -main [& [profile package release]]
+
+(defn current-profile-ids
+  "Active language-profile and package-contract bound to :release/current (T10.1)."
+  ([] (current-profile-ids (read-policy)))
+  ([policy]
+   {:language-profile (:release/language-profile policy)
+    :package-contract (:release/package-contract policy)
+    :release-version (:release/current policy)}))
+
+(defn default-compatibility-request
+  "Request map for CI gate against the checked-in current release (T10.2)."
+  ([] (default-compatibility-request (read-policy)))
+  ([policy]
+   (merge (current-profile-ids policy)
+          {:on-date (LocalDate/now)})))
+
+(defn release-tag-envelope-template
+  "Unsigned envelope skeleton for a release tag (T10.1). Caller signs."
+  [policy {:keys [commit tree source-root issued-at-ms signer]}]
+  (let [version (:release/current policy)
+        prefix (get-in policy [:release-tags :prefix])]
+    {:tag (str prefix version)
+     :version version
+     :language-profile (:release/language-profile policy)
+     :commit commit
+     :tree tree
+     :source-root source-root
+     :issued-at-ms issued-at-ms
+     :signer signer}))
+
+(defn -main
+  "CLI (T10.2):
+   clojure -M:compatibility                 ; validate policy + current release report
+   clojure -M:compatibility 4 1 0.4.0       ; explicit profile package release"
+  [& [profile package release]]
   (let [policy (read-policy)
         policy-result (validate-policy policy)
-        report (when (and profile package release)
+        report (if (and profile package release)
                  (compatibility-report
                   policy {:language-profile (parse-long profile)
                           :package-contract (parse-long package)
-                          :release-version release}))]
-    (prn {:policy policy-result :compatibility report})
-    (when-not (and (:valid? policy-result)
-                   (or (nil? report) (:compatible? report)))
+                          :release-version release})
+                 (compatibility-report policy (default-compatibility-request policy)))]
+    (prn {:policy policy-result
+          :compatibility report
+          :current (current-profile-ids policy)})
+    (when-not (and (:valid? policy-result) (:compatible? report))
       (System/exit 1))))

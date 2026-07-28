@@ -35,7 +35,7 @@
 (defn signed-tag [seed overrides]
   (let [public-key (ed/pubkey-from-seed seed)
         signer (ed/did-key-from-pub public-key)
-        base {:tag "v0.4.0" :version "0.4.0"
+        base {:tag "v0.4.0" :version "0.4.0" :language-profile 4
               :commit "99a6da4159dca0f01f47ec81fab06f6aa4c74a0f"
               :tree "tree-sha256:abc" :source-root "sha256:def"
               :issued-at-ms 1784764800000 :signer signer}
@@ -62,3 +62,23 @@
            (:code (version/verify-release-tag
                    policy {(:signer envelope) {:status :revoked}}
                    envelope))))))
+
+(deftest default-compatibility-request-matches-current-release
+  (let [policy (version/read-policy)
+        ids (version/current-profile-ids policy)
+        report (version/compatibility-report
+                policy (version/default-compatibility-request policy))]
+    (is (= 4 (:language-profile ids)))
+    (is (= 1 (:package-contract ids)))
+    (is (= "0.4.0" (:release-version ids)))
+    (is (:compatible? report))
+    (is (:valid? (version/validate-policy policy)))))
+
+(deftest release-tag-template-binds-language-profile
+  (let [policy (version/read-policy)
+        env (version/release-tag-envelope-template
+             policy {:commit "c" :tree "t" :source-root "s"
+                     :issued-at-ms 1 :signer "did:key:test"})]
+    (is (= "v0.4.0" (:tag env)))
+    (is (= 4 (:language-profile env)))
+    (is (contains? (get-in policy [:release-tags :binds]) :language-profile))))

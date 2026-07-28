@@ -120,7 +120,7 @@ compiler / KIR / wasm / native / legacy path skew.
 
 | ID | Task | Owner repo(s) | Deliverable | Depends | Estimate |
 |---|---|---|---|---|---|
-| T6.1 | Define **primary standalone run path** (wasmtime **or** kexe loader) | **kotoba**, **compiler**, **aiueos**/loader | Documented `kotoba run` without `clojure -M` for pure apps | T1.3 | L |
+| T6.1 | Define **primary standalone run path** (wasmtime **or** kexe loader) — **landed: wasmtime primary**, kexe secondary (`docs/lang/standalone-run.md` / ADR-reliability-t61) | **kotoba**, **compiler**, **aiueos**/loader | Documented `kotoba run` without `clojure -M` for pure apps | T1.3 | L |
 | T6.2 | Precompiled KIR (or wasm) as default product artifact (already murakumo pattern) | product repos | Gen in CI; no compiler on prod classpath | — | M |
 | T6.3 | Bootstrap plan: compiler remains CLJ **tool**; language runtime is not — **landed** (ADR-reliability-t63) | **kotoba-lang** ADR | Clear tool vs runtime split | T6.1 | S |
 | T6.4 | cljs/browser: execute same pure artifacts (optional oracle load) | **kotoba-kir** cljs, **wasm-webcomponent** | Remove pure mirror where possible | T6.2 | L |
@@ -181,9 +181,9 @@ compiler / KIR / wasm / native / legacy path skew.
 
 | ID | Task | Owner repo(s) | Deliverable | Depends | Estimate |
 |---|---|---|---|---|---|
-| T10.1 | Publish **current language profile version** on every release tag | **kotoba-lang**, release workflow | Tag binds profile id | version-policy | S |
-| T10.2 | CI compatibility report artifact (`clojure -M:compatibility …`) required on release | **kotoba-lang** | Gate | version-policy | S |
-| T10.3 | Changelog discipline: surface-status diffs in release notes | **kotoba-lang** | Process | T2.2 | S |
+| T10.1 | Publish **current language profile version** on every release tag — **landed** (`:release/language-profile` + tag bind; ADR-reliability-t10) | **kotoba-lang**, release workflow | Tag binds profile id | version-policy | S |
+| T10.2 | CI compatibility report artifact (`clojure -M:compatibility …`) required on release — **landed** (`:compatibility` alias + ci.yml artifact) | **kotoba-lang** | Gate | version-policy | S |
+| T10.3 | Changelog discipline: surface-status diffs in release notes — **process landed** (`:release-notes` in version-policy + grade-a doc) | **kotoba-lang** | Process | T2.2 | S |
 | T10.4 | Deprecation window drills (one intentional soft deprecation of a sugar) | **compiler**, **kotoba-lang** | Proves policy works | T10.1 | M |
 
 **Exit:** Consumers can pin a language profile for ≥180 days without surprise breaks.
