@@ -43,13 +43,13 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 
 ### Plan Next (priority order)
 
-1. **Delivery 5–8 remaining shells** — com-cloudflare product-shell complete (#14+#16); com-cloudflare-compat product-shell (#3); wire residual stream/deploy/analytics hosts + murakumo CLIs
+1. **Delivery 5–8 remaining shells** — com-cloudflare product-shell complete (#14+#16); com-cloudflare-compat product-shell (#3); murakumo CLIs / residual product shells
 2. **Product Value ABI residual** — schedule `eligible?` bit-pack remains intentional packing (arity ≤5); most has-* sentinels cleared through #121
-3. **cljs oracle load optional** — resource load currently JVM/bb-only
+3. **Incremental cljs host rewire** — oracle load landed (#122); expand dual-source beyond task.failed? + fleet.inventory
 4. **Production signed providers** for network / secret capabilities (leave pure allowlist alone; signed content-addressed Wasm)
 5. **wasm-aot packaging claims** — packaging / AOT path honesty vs remaining host shells
 
-**Landed 2026-07-28:** full murakumo product-shell dual-source — bulk KIR catalog (#99) + host wire through overlay-driver/runtime (#113) + Product Value ABI v1 #112–#121 (token…rebalance/task-fold); live HMAC/AES (#87).
+**Landed 2026-07-28:** full murakumo product-shell dual-source — bulk KIR catalog (#99) + host wire through overlay-driver/runtime (#113) + Product Value ABI v1 #112–#121 + cljs/nbb oracle load (#122); live HMAC/AES (#87).
 
 ### Do not
 
@@ -222,6 +222,7 @@ Network/secret caps stay contract-only until signed production providers exist.
 | Product Value ABI v1 task failed? + peer choose-via | murakumo#118 |
 | Product Value ABI v1 schedule pick-fold | murakumo#120 |
 | Product Value ABI v1 rebalance classify + task pick-fold | murakumo#121 |
+| optional cljs/nbb product-shell oracle load | murakumo#122 |
 | product-shell oracle authority (fleet.inventory) | murakumo#102 |
 | product-shell oracle authority (infer.join + infer.gc) | murakumo#105 |
 | product-shell oracle authority (moe + rebalance + relay) | murakumo#107 |

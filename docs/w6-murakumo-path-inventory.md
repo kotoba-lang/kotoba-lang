@@ -127,10 +127,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#118:** **Product Value ABI v1 task failed? + peer choose-via** — `failed?` optional exit/error; `choose-via` optional direct/relay + health string (drop has-* / exit-present). ADR `ADR-260728-w6-pva-task-peer`.
 - **2026-07-28 murakumo#120:** **Product Value ABI v1 schedule pick-fold** — `pick-fold-step` optional champ (drop has-champ). ADR `ADR-260728-w6-pva-schedule-fold`.
 - **2026-07-28 murakumo#121:** **Product Value ABI v1 rebalance classify + task pick-fold** — `classify-run-flags` optional unit/kind tokens; `pick-task-fold-step` optional champ. ADR `ADR-260728-w6-pva-rebalance-task-fold`.
+- **2026-07-28 murakumo#122:** **optional cljs/nbb product-shell oracle load** — `register-kir!` / `set-resource-loader!` / node-fs `resources/` load; BigInt i64 bridge; task.plan `failed?` + fleet.inventory dual-source when ready; `nbb.edn` ships resources + kotoba-kir. ADR `ADR-260728-w6-cljs-oracle-load`.
 
 ## Next
 
-1. murakumo pure+adapter path **#61–#121** — full dual-source + PVA through rebalance/task-fold (#121 after schedule fold #120). Remaining: Delivery 5–8 shells / residual PVA (schedule `eligible?` bit-pack intentional) / cljs oracle load optional / network·secret caps contract-only.
-2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
+1. murakumo pure+adapter path **#61–#122** — full dual-source + PVA + cljs/nbb oracle load (#122). Remaining: Delivery 5–8 shells / residual PVA (schedule `eligible?` bit-pack intentional) / incremental cljs host rewire / network·secret caps contract-only.
+2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#16 product-shell complete); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Deeper pure ports still dual-implemented where listed “Still host” (envelope maps, placement folds beyond wired subset, etc.); production compiler dependency remains avoided (resource path).
