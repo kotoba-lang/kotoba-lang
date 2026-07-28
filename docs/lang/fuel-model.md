@@ -135,3 +135,11 @@ not be reintroduced on one backend only.
 | `compiler` `core.clj` | `:limits {:fuel 512 :replenishable? false}` |
 | `compiler` `examples/fuel.kotoba` | fact / forever demo |
 | `lang/surface-status.edn` | transform helper fuel 128 |
+
+## loop / recur (T7.1)
+
+`loop`/`recur` desugar to a **named helper** that self-calls. Each iteration is a
+**function entry** and charges **1 fuel unit** (same as any call). Dual-backend
+pilot kits prove KIR + wasm agreement. Machine-level TCO (zero-charge recur /
+frame reuse) is **not** claimed yet.
+
