@@ -81,9 +81,10 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#68:** `infer_plan_core` partition-layers integer walk — `partition-3-ends` / `advance-hi` / `layer-byte-at` (3-node ring).
 - **2026-07-28 murakumo#69:** `plan-fits-3` compose + `ok-mark` + moe `pick-max-idx-3` / `moe-capacity-ok`.
 - **2026-07-28 murakumo#70:** `infer_engine_core` mlx-moe/launch/tensor-split-3 string pure oracle.
+- **2026-07-28 murakumo#71:** `infer_engine_core` head-cmd-front/middle/tail + rpc-csv (llama-server head assembly).
 
 ## Next
 
-1. murakumo pure-planner path #61–#70 complete for fixed-3 plan/rebalance + engine string cores. Remaining: n≠3 node-id plan maps / report GiB rows / head-cmd plan walks / crypto/host shells.
+1. murakumo pure-planner path #61–#71 complete for fixed-3 plan/rebalance + engine string cores (incl. head-cmd). Remaining: n≠3 node-id plan maps / report GiB rows / crypto/host shells.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
