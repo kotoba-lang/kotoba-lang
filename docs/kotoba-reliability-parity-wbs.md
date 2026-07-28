@@ -153,7 +153,7 @@ compiler / KIR / wasm / native / legacy path skew.
 | T8.1 | Define **kit ready checklist** (**landed** provider#35 ADR 0153) (schema, dual-runtime, deny fixtures, quota, audit, 2-host parity) | **kotoba-lang**, **provider** | Checklist ADR | application-profile | S |
 | T8.2 | Apply checklist to HTTP / object / secret / process (**first pass** `kit-readiness-v1.edn` provider#35) (gap list) | **provider**, **kotoba-component** | Status table in `lang/` | T8.1 | L |
 | T8.3 | Network + secret **signed** reference providers (leave pure allowlist alone) — **partial**: kit EDN receipts provider#36 / ADR 0154; Wasm receipt API provider#37 / ADR 0155 (fixture only); identity inject provider#38 / ADR 0156; **production AOT Component still open** | **capability-***, **kotoba-core-contracts**, **tamaki**, **kototama**, **provider** | contract-only → signed | T8.1 | XL |
-| T8.4 | Expand `lang/host-parity.edn` L5 conformance cases for critical imports | **kotoba-lang**, **kototama**, **wasm-webcomponent** | Same guest expectations | T8.2 | M |
+| T8.4 | Expand `lang/host-parity.edn` L5 conformance cases for critical imports — **partial landed**: crypto/http/kagi/transport/llm fixtures + resources sync (45 expanded cases); remaining: live host runners in kototama/wasm-webcomponent | **kotoba-lang**, **kototama**, **wasm-webcomponent** | Same guest expectations | T8.2 | M |
 
 **Exit:** “Granted capability” has the same operational confidence as a well-tested CLJ client library.
 

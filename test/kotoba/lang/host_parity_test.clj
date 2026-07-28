@@ -28,9 +28,19 @@
 (deftest conformance-suite-passes
   (let [r (hp/run-conformance)]
     (is (pos? (:total r)))
+    (is (>= (:total r) 30)
+        "T8.4 expanded critical-import fixtures (multi-host cases expand)")
     (is (true? (:ok? r))
         (str "failed cases: " (pr-str (:failed r))))
     (is (= (:total r) (:passed r)))))
+
+(deftest t84-critical-import-fixtures-present
+  "T8.4: crypto/http/kagi/transport/llm honest-gap fixtures must remain."
+  (let [ids (set (map :id (hp/conformance-cases)))]
+    (doseq [id [:sign-all-available :verify-all-available
+                :kagi-sign-browser-absent :http-get-jvm-component-link-absent
+                :transport-connect-browser-absent :llm-infer-browser-absent]]
+      (is (contains? ids id) (str id)))))
 
 (deftest report-is-l5
   (let [r (hp/report)]
