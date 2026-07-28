@@ -30,7 +30,7 @@ separates **ops shells** from the JS backend.
 | `process` | spawn/await bounded process | **OS transport landed** (provider#25 os-spawn) | high | cljs spawn / SSH still open |
 | `ssh-or-remote-exec` | remote exec without ambient OpenSSH | missing | high | murakumo fleet SSH (may stay host forever) |
 | `git` | status/log (+ optional worktree) | missing | medium | repo tooling scripts |
-| `secret-custody` | named secret fetch (no dump-all) | partial | high | API tokens, murakumo HMAC secret |
+| `secret-custody` | named secret fetch (no dump) | **contract first slice** (provider#26 id 21) | high | kagi transport + ops CLI cutover |
 | `cloud-deploy` | Workers/Pages deploy verbs | missing | low | scripted publish |
 | `clock-and-random` | clock + CSPRNG | partial | medium | compat actor ids |
 
@@ -55,8 +55,13 @@ separates **ops shells** from the JS backend.
 - **2026-07-28 provider#24 / ADR 0143:** `provider.process` (id 20) + `provider.scoped-fs` (id 19) contract first slice (mem/echo transports, pure policy).
 - **2026-07-28 provider#25 / ADR 0144:** `process-transport/os-spawn` + `scoped-fs-transport/os-store` (host `:binaries` / `:roots`; no PATH/CWD defaults).
 
+## Progress (continued)
+
+- **2026-07-28 provider#26 / ADR 0145:** `provider.secret` (id 21) get-only allowlist + `env-fetch`/`map-fetch` (no dump).
+
 ## Next
 
-1. **cljs/nbb** OS spawn + root-mount transports (sync contract).  
-2. Decide **ssh forever-host** vs kit.  
-3. Wire **secret-custody** into ops CLIs that still use ambient env.
+1. **Ops CLI cutover** — murakumo/cloudflare use secret kit instead of ambient getenv.  
+2. **cljs/nbb** OS spawn + root-mount transports (sync contract).  
+3. Decide **ssh forever-host** vs kit.  
+4. Optional **kagi** one-shot getter as `:fetch`.
