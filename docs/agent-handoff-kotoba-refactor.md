@@ -54,7 +54,7 @@ Product dual-source remains separate (this handoff §2); do not invent language 
 
 1. **Delivery 5–8 remaining shells** — com-cloudflare product-shell complete (#14+#16); com-cloudflare-compat product-shell (#3); murakumo CLIs / residual product shells
 2. **Product Value ABI residual** — schedule `eligible?` bit-pack remains intentional packing (arity ≤5); most has-* sentinels cleared through #121
-3. **Incremental cljs host rewire** — landed #122–#132 (… + infer gc/relay/moe/join #131 + overlay runtime/driver + deploy #132); remaining infer plan/engine/rebalance/credits
+3. **Incremental cljs host rewire** — landed #122–#133 (portable .cljc pure dual-source complete); remaining Delivery 5–8 shells / residual PVA / network·secret
 4. **Production signed providers** for network / secret capabilities (leave pure allowlist alone; signed content-addressed Wasm)
 5. **wasm-aot packaging claims** — packaging / AOT path honesty vs remaining host shells
 
@@ -241,6 +241,7 @@ Network/secret caps stay contract-only until signed production providers exist.
 | cljs dual-source reconcile.plan + component-authority | murakumo#129 |
 | cljs dual-source overlay keyring/peer/stream + schedule | murakumo#130 |
 | cljs dual-source infer.gc/relay/moe/join | murakumo#131 |
+| cljs dual-source residual infer plan/engine/rebalance/credits | murakumo#133 |
 | cljs dual-source overlay.runtime/driver + deploy.plan | murakumo#132 |
 | product-shell oracle authority (fleet.inventory) | murakumo#102 |
 | product-shell oracle authority (infer.join + infer.gc) | murakumo#105 |
