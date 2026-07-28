@@ -26,8 +26,8 @@ separates **ops shells** from the JS backend.
 
 | id | ability | status | priority | blocks |
 |---|---|---|---|---|
-| `scoped-filesystem` | read/write under declared roots | **contract first slice** (provider#24 id 19) | high | OS mounts still open |
-| `process` | spawn/await bounded process | **contract first slice** (provider#24 id 20) | high | OS spawn still open |
+| `scoped-filesystem` | read/write under declared roots | **OS transport landed** (provider#25 os-store) | high | cljs mounts still open |
+| `process` | spawn/await bounded process | **OS transport landed** (provider#25 os-spawn) | high | cljs spawn / SSH still open |
 | `ssh-or-remote-exec` | remote exec without ambient OpenSSH | missing | high | murakumo fleet SSH (may stay host forever) |
 | `git` | status/log (+ optional worktree) | missing | medium | repo tooling scripts |
 | `secret-custody` | named secret fetch (no dump-all) | partial | high | API tokens, murakumo HMAC secret |
@@ -53,9 +53,10 @@ separates **ops shells** from the JS backend.
 ## Progress
 
 - **2026-07-28 provider#24 / ADR 0143:** `provider.process` (id 20) + `provider.scoped-fs` (id 19) contract first slice (mem/echo transports, pure policy).
+- **2026-07-28 provider#25 / ADR 0144:** `process-transport/os-spawn` + `scoped-fs-transport/os-store` (host `:binaries` / `:roots`; no PATH/CWD defaults).
 
 ## Next
 
-1. Production **OS spawn** + **root mount** transports (still no ambient authority).  
+1. **cljs/nbb** OS spawn + root-mount transports (sync contract).  
 2. Decide **ssh forever-host** vs kit.  
 3. Wire **secret-custody** into ops CLIs that still use ambient env.
