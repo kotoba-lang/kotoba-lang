@@ -78,9 +78,10 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#65:** placement pure layer — workers/seats-for-online/hysteresis/node-online?/move-needed/reason.
 - **2026-07-28 murakumo#66:** seat-order assignment — seat-order-pack/take-end/pipeline-note/reason-detail.
 - **2026-07-28 murakumo#67:** `infer_plan_core` plan-lr-3 + fits gates + layer-bytes (partition vertical).
+- **2026-07-28 murakumo#68:** `infer_plan_core` partition-layers integer walk — `partition-3-ends` / `advance-hi` / `layer-byte-at` (3-node ring).
 
 ## Next
 
-1. murakumo rebalance #61–#66 complete; infer.plan partition pure core #67 landed. Remaining: full partition-layers float walk / node-id plan maps / crypto/host shells.
+1. murakumo rebalance #61–#66 + infer.plan partition walk #67–#68 landed. Remaining: n≠3 node-id plan maps / report rows / crypto/host shells; engine mlx-moe cmd string core optional.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
