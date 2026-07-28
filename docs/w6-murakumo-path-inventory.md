@@ -54,6 +54,7 @@ fixture equality → shells remain on bb/nbb/JVM host.
 ## Progress
 
 - **2026-07-28 murakumo#37:** `kotoba/kekkai_gate_core.kotoba` oracle parity for gate string core.
+- **2026-07-28 murakumo#38:** `kotoba/infer_plan_core.kotoba` usable-bytes + choose-strategy parity.
 
 ## Next
 
