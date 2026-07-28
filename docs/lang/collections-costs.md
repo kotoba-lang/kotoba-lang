@@ -42,6 +42,11 @@ must not assume amortized O(1) assoc or log-time random access.
 - `docs/lang/fuel-model.md` — call fuel vs helper fuel  
 - `docs/lang/surface-matrix.md` — generated disposition table  
 
+## Dual-backend pilot (T4.5 partial)
+
+`vector-i64` constructor + `vector-count` / `vector-at` / `vector-conj` are dual-green
+(compiler#429 / wasm#37 / ADR 0179). Bounded map/filter/reduce transforms remain gated.
+
 ## Follow-ups
 
 - T4.5 code: only add new collection ops that are **explicitly bounded** and dual-backend tested  
