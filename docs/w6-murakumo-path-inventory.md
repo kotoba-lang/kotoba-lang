@@ -116,13 +116,13 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#110:** **product-shell oracle authority (deploy + connect + component-authority)** — JVM deploy defaults/paths/localhost-url via `deploy_plan_core.kir.edn`; connect class/plane via `connect_core.kir.edn`; component-authority epochs/identifier via `component_authority_core.kir.edn`. Regex/argv folds + ed25519 stay host. ADR `ADR-260728-w6-deploy-connect-authority-oracle`.
 
 - **2026-07-28 murakumo#111:** **product-shell oracle authority (overlay + cloud + provision)** — JVM overlay keyring/peer/stream pure helpers; cloud defaults/region/endpoints; provision constants/p2p/multiaddr/mesh cmds. ADR `ADR-260728-w6-overlay-cloud-provision-oracle-authority`.
-
+- **2026-07-28 murakumo#112:** Product Value ABI v1 token oracle — no has-* sentinels; pure token wire/claims on value-v1 ABI.
 - **2026-07-28 murakumo#112:** **Product Value ABI v1 token oracle** — `token_core` rewritten with `[:option T]` / `if-some` / `string-from-i64` (no has-* sentinels); host option bridge; compiler+kir pin for product-value-abi-v1. ADR `ADR-260728-product-value-abi-v1-token`.
-- **2026-07-28 murakumo#113:** **product-shell oracle authority (overlay driver + runtime)** — JVM endpoint-kind/option-name/blank?/dial-ok-reason via `overlay_driver_core.kir.edn`; default ports/known-adapter?/adapter-kind/scheme-prefix-host via `overlay_runtime_core.kir.edn`. parse-argv loops + adapter registry maps stay host. ADR `ADR-260728-w6-overlay-driver-runtime-oracle-authority`.
+- **2026-07-28 murakumo#113:** **product-shell oracle authority (overlay driver + runtime)** — residual catalog pure cores: driver `endpoint-kind`/`option-name`/`blank?`/`dial-ok-reason`/`command-is-dial?`; runtime default ports/`known-adapter?`/`adapter-kind`/`scheme-prefix-host`. parse-argv loops + adapter opens/status stay host. Completes dual-source host wiring for **all** 32 catalog ids. ADR `ADR-260728-w6-overlay-driver-runtime-oracle-authority`.
 
 ## Next
 
-1. murakumo pure+adapter path **#61–#113** — **full KIR catalog (32 artifacts) + all portable pure hosts dual-source wired** (incl. overlay-driver/runtime #113; Product Value ABI v1 token #112). Remaining: Delivery 5–8 remaining shells / network·secret caps contract-only / cljs oracle load optional / optional Product Value ABI roll-out beyond token.
+1. murakumo pure+adapter path **#61–#113** — **full KIR catalog (32 artifacts) + all portable pure hosts dual-source wired** (incl. overlay-driver/runtime #113; Product Value ABI v1 token #112). Residual host-only: parse-argv / map folds / crypto / SSH shells. Remaining: Delivery 5–8 shells / network·secret caps contract-only / cljs oracle load optional / optional Product Value ABI roll-out beyond token.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#12); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
-4. Full pure-planner cutover still dual-implemented until each core is wired like #86–#98 (or bulk generate); blocked on production compiler (avoid) / kbb in-process load (future optional).
+4. Deeper pure ports still dual-implemented where listed “Still host” (envelope maps, placement folds beyond wired subset, etc.); production compiler dependency remains avoided (resource path).
