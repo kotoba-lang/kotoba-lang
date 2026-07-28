@@ -157,9 +157,12 @@ fixture equality → shells remain on bb/nbb/JVM host.
 1. murakumo pure+adapter path **#61–#139**
 - **2026-07-28 murakumo#140:** **reconcile.plan pure oracle expand** — missing-manifest?, action-is-satisfied?/place?, flag classifiers, watch-seconds, snapshot-value. parse-flags reduce fold stays host. ADR `ADR-260728-w6-reconcile-flags-pure-oracle`.
 
+
+- **2026-07-28 murakumo#142:** **cloud.plan pure oracle expand** — `webtransport-endpoint` + `transport-endpoint` dual-source. ADR `ADR-260728-w6-cloud-endpoint-pure-oracle`.
+
 ## Next
 
-1. murakumo pure+adapter path **#61–#140** — product-shell pure dual-source complete including residual report/provision/cloud/crypto `.cljc` (#135), dash/deploy/provision pure expands (#136–#139), and reconcile flags (#140). Remaining: residual ops CLI ambient sites beyond #137 (config leave for HOME/bins already inject-friendly); residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5). Network/secret kits + signed receipt APIs landed (provider#34–#37); **production AOT signed Wasm** still pending. com-cloudflare #17 + com-cloudflare-compat #5 cljs dual-source landed.
+1. murakumo pure+adapter path **#61–#142** — product-shell pure dual-source complete including residual report/provision/cloud/crypto `.cljc` (#135), dash/deploy/provision pure expands (#136–#139), and reconcile flags (#140). Remaining: residual ops CLI ambient sites beyond #137 (config leave for HOME/bins already inject-friendly); residual PVA (schedule `eligible?` host bit-pack intentional, arity ≤5). Network/secret kits + signed receipt APIs landed (provider#34–#37); **production AOT signed Wasm** still pending. com-cloudflare #17 + com-cloudflare-compat #5 cljs dual-source landed.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#16 product-shell complete); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Deeper pure ports still dual-implemented where listed “Still host” (envelope maps, placement folds beyond wired subset, etc.); production compiler dependency remains avoided (resource path).
