@@ -43,7 +43,7 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 
 ### Plan Next (priority order)
 
-1. **Delivery 5–8 remaining shells** — com-cloudflare product-shell started (#14); wire residual stream/deploy/analytics hosts + murakumo CLIs
+1. **Delivery 5–8 remaining shells** — com-cloudflare product-shell complete (#14+#16); com-cloudflare-compat product-shell (#3); wire residual stream/deploy/analytics hosts + murakumo CLIs
 2. **Product Value ABI residual** — schedule `eligible?` bit-pack remains intentional packing (arity ≤5); most has-* sentinels cleared through #121
 3. **cljs oracle load optional** — resource load currently JVM/bb-only
 4. **Production signed providers** for network / secret capabilities (leave pure allowlist alone; signed content-addressed Wasm)
