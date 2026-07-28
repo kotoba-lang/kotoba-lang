@@ -82,9 +82,9 @@ Authoritative work breakdown (repos, tasks, sequencing, agent guide):
 Tiers R1–R4: semantic conformance → stdlib/records → standalone run → toolchain/LTS.
 Product dual-source remains separate (this handoff §2); do not invent language features in product PRs.
 
-**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#418 T1.3/T1.5 pilot+goldens (**13** dual-green), T2.2/T2.4, T5.4 max-parameters=5, T6.1 standalone (wasmtime primary), T6.3 tool-vs-runtime, T7.2 fuel, **T10.1–T10.3** release/compatibility gates.
+**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#419 T1.3/T1.4/T1.5 (wasm dual **13** + pure-native **5** + goldens), T2.2/T2.4, T5.4 max-parameters=5, T6.1/T6.3 standalone, T7.2/T7.3 fuel+estimate, **T10.1–T10.3** release/compatibility gates.
 
-Next language work: T1.3 full matrix (collections still admission-blocked); T1.4 native pilot; T4.2 string-split optional; T4.4 typed-map pilot; T5.2 native record wire; T5.3 pack rewrites; T7.1 true tail; T8.3 ops AOT; residual PVA intentional.
+Next language work: T1.3 full matrix (collections still admission-blocked); expand T1.4 option surface; T4.2 string-split optional; T4.4 typed-map pilot; T5.2 native record wire; T5.3 pack rewrites; T7.1 true tail; T8.3 ops AOT; residual PVA intentional.
 
 **T7.2 fuel model:** [`docs/lang/fuel-model.md`](./lang/fuel-model.md) (1 unit/function entry, default 512).
 **T1.5 goldens:** compiler#418 / ADR 0167 — `clojure -M:conformance --check-golden`.
@@ -96,6 +96,8 @@ Next language work: T1.3 full matrix (collections still admission-blocked); T1.4
 **T6.3 tool vs runtime:** [ADR-reliability-t63](./adr/ADR-reliability-t63-tool-vs-runtime.md).
 **T6.1 standalone run:** [`docs/lang/standalone-run.md`](./lang/standalone-run.md) (wasmtime primary).
 **T10 compatibility:** `clojure -M:compatibility` (profile 4 / release 0.4.0).
+**T1.4 pure-native pilot:** compiler#419 / ADR 0168 — `clojure -M:native-conformance`.
+**T7.3 fuel-estimate:** compiler#419 / ADR 0169 — `clojure -M:fuel-estimate <file>`.
 
 ### Plan Next (priority order)
 

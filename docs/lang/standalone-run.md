@@ -57,3 +57,6 @@ conformance subset; until then native is secondary for pure-product oracles.
 - T1.4 pure-native-v1 pilot cases in conformance runner  
 - T6.2 enforce precompiled artifacts in product CI templates  
 - Public `kotoba run` adapter alignment with `lang/cli.edn` (T9.1)
+
+
+**Update:** T1.4 pure-native pilot landed (compiler#419 / ADR 0168): `clojure -M:native-conformance`.
