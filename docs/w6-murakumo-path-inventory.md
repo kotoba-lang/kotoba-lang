@@ -63,5 +63,5 @@ fixture equality → shells remain on bb/nbb/JVM host.
 ## Next
 
 1. Medium-priority pure planners (schedule/credits/join/gc/fleet inventory/config) as needed.
-2. Cloudflare route inventory (sibling W6 next-action).
-3. kbb ability gap list for nbb shells (`ops`, `task/*`).
+2. Cloudflare pure-request oracle (sibling inventory landed).
+3. kbb process/scoped-fs qualification for nbb shells (`ops`, `task/*`) — gap list landed.

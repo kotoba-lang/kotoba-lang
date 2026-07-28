@@ -303,7 +303,9 @@ Qualify vertical families in dependency order:
 **W6 murakumo task-plan oracle (2026-07-28, murakumo#40):** `kotoba/task_plan_core.kotoba` slots / failed? / can-retry? / defaults.
 **W6 murakumo token oracle (2026-07-28, murakumo#41):** `kotoba/token_core.kotoba` claims/scope/expired/signing-input.
 **W6 murakumo infer-engine oracle (2026-07-28, murakumo#42):** `kotoba/infer_engine_core.kotoba` rpc/embed cmd assembly.
-Next: W6 medium pure planners (optional) / cloudflare route inventory / kbb ability gap.
+**W6 cloudflare path inventory (2026-07-28):** `lang/w6-cloudflare-path-inventory.edn` — API client pure request/parse vs HTTP host; routes = Workers/DNS/Pages.
+**W6 kbb ability gap (2026-07-28):** `lang/w6-kbb-ability-gap.edn` — process/scoped-fs/ssh/secrets gaps; ops stay on nbb.
+Next: W6 cloudflare pure-request oracle / process+scoped-fs qualification / optional medium murakumo pure planners.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -502,7 +504,9 @@ Next: W6 medium pure planners (optional) / cloudflare route inventory / kbb abil
    **W6 murakumo task-plan oracle (2026-07-28, murakumo#40):** task_plan_core.kotoba slots/failed?.
    **W6 murakumo token oracle (2026-07-28, murakumo#41):** token_core.kotoba claims/scope.
    **W6 murakumo infer-engine oracle (2026-07-28, murakumo#42):** infer_engine_core.kotoba cmd assembly.
-   Next: W6 medium pure planners (optional) / cloudflare routes / kbb ability gap.
+   **W6 cloudflare path inventory (2026-07-28):** pure request/parse candidates classified.
+   **W6 kbb ability gap (2026-07-28):** process/scoped-fs/ssh/secrets gap list.
+   Next: W6 cloudflare pure-request oracle / process+scoped-fs kits / optional medium pure planners.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
