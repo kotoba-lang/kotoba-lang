@@ -115,7 +115,7 @@ Kototama **rejects** definition-CID drift / substitution before HostCaps admissi
 |---|---|---|
 | A. Semantic definition CID | Meaning identity | `bafyrei…` on capability package |
 | B. actor:host wire numeric ids | Host import table in `capability_contract.edn` | 201+ |
-| C. Compiler/provider kit ids | Application capability kits | 1–21 (secret=21, process=20, scoped-fs=19) |
+| C. Compiler/provider kit ids | Application capability kits | 1–23 (scoped-fs=19, process=20, secret=21, git=22, entropy=23) |
 
 App source should use **named operations / semantic abilities**, not raw numbers.
 
@@ -133,11 +133,13 @@ App source should use **named operations / semantic abilities**, not raw numbers
 
 | Kit | id | Status |
 |---|---|---|
-| scoped-fs | 19 | pure resolve-path + mem-store + **os-store** (`:roots` required) |
-| process | 20 | pure validate-spawn + echo-transport + **os-spawn** (`:binaries` required) |
-| secret | 21 | get-only allowlist + map-fetch / env-fetch (no dump) |
+| scoped-fs | 19 | pure resolve-path + mem-store + **os-store** (`:roots` required); cljs/nbb OS transport landed (provider#28 / ADR 0147) |
+| process | 20 | pure validate-spawn + echo-transport + **os-spawn** (`:binaries` required); cljs/nbb OS transport landed (provider#28 / ADR 0147) |
+| secret | 21 | get-only allowlist + map-fetch / env-fetch (no dump); ops first-cutover (murakumo#48/#50) |
+| git | 22 | pure validate-run + echo-transport + **os-run** dual-runtime (ADR 0148–0150; provider#29+#31+#32); murakumo#55 deploy pin |
+| entropy | 23 | CSPRNG draw + dual-runtime **os-draw** (provider#33 / ADR 0151); clock-and-random gap closed |
 
-Still open: ops CLIs using these kits end-to-end; cljs parity for OS transports; ssh forever-host decision per gap list.
+cljs OS transports for process / scoped-fs / git are **done**. SSH is **host-forever** (no `provider.ssh` kit; decision recorded). Residual: remaining ops CLI ambient sites beyond first secret/git cutovers.
 
 ---
 
@@ -197,7 +199,12 @@ Network/secret caps stay contract-only until signed production providers exist.
 |---|---|
 | QUIC cert path-ref under scoped roots | murakumo#52 |
 | kagi-fetch wire | murakumo#52 |
-| git kit id 22 (ADR 0148) | provider#29 |
+| git kit id 22 (ADR 0148–0150) | provider#29+#31+#32 |
+| entropy kit id 23 (ADR 0151) | provider#33 |
 | secret name/policy pure oracle | murakumo#60 |
-| rebalance + plan + engine + report pure path | murakumo#61–#87 |
+| rebalance + plan + engine + report pure path | murakumo#61–#84 |
+| identity JWT + overlay crypto packaging oracle | murakumo#85 |
+| product-shell oracle authority (kekkai.gate dual-source) | murakumo#86 |
+| live HMAC/AES host adapters | murakumo#87 |
+| zones query + hostname-match oracle | com-cloudflare#13 |
 | clock/time/random reference-impl | capability-*-#1 |
