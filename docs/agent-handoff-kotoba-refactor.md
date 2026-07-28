@@ -165,3 +165,18 @@ Pick **one** Next item from the plan; finish with tests + inventory/plan update;
 | `docs/w6-*.md` + `lang/w6-*.edn` | Path-level inventories |
 | compiler `docs/adr/0120`–`0145` (approx.) | W5 deepen trail |
 | Superproject `ADR-2607289500` | Workspace-authoritative handoff |
+
+---
+
+## 7. Capability package implementation (2026-07-28)
+
+Contract only → **reference-implemented** (pure allowlist):
+
+| Package | PR | Status |
+|---|---|---|
+| core-contracts status rules | [#22](https://github.com/kotoba-lang/kotoba-core-contracts/pull/22) | `:reference-implemented` allowlist + sha256/exports rules |
+| capability-math-sin | [#1](https://github.com/kotoba-lang/capability-math-sin/pull/1) | wasm core `sin` + JVM `Math/sin` |
+| capability-math-cos | [#1](https://github.com/kotoba-lang/capability-math-cos/pull/1) | wasm core `cos` + JVM `Math/cos` |
+
+Next pure targets on the allowlist: `hash/sha256`, `data/cbor`, `data/json`, `clock/monotonic`, `random/bytes`, `time/now-days`.  
+Network/secret caps stay contract-only until signed production providers exist.
