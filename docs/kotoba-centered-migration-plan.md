@@ -281,9 +281,9 @@ Qualify vertical families in dependency order:
    production cljs/nbb storage transport (spawnSync hops). **Family 4
    production cljs transport intermediate evidence now present. Production
    cljs transports complete for HTTP + LLM + storage.**
-   **W5 deepen ADR 0120/0121/0122/0123:** :bytes leaf + object/http get-stream
-   ready-task + pending→ready (`task-fulfill!`) + multi-chunk join on reference
-   path. Next: guest poll/read ops / true async multi-chunk / product apps.
+   **W5 deepen ADR 0120–0124:** :bytes leaf + object/http get-stream ready/pending/
+   multi-chunk on reference + nbb dual-runtime. Next: guest poll/read ops /
+   true async multi-chunk / product apps.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -411,11 +411,15 @@ Qualify vertical families in dependency order:
    **W5 deepen (2026-07-27, provider#17 + compiler#389 / ADR 0122):**
    \`:http/get-stream\` (id 13) dual-runtime ready-task (url+headers, exact-origin,
    stream-read). **Reference dual-runtime covers object + http get-stream.**
-   **W5 deepen (2026-07-28, kotoba-kir#14 + provider#18 + compiler / ADR 0123):**
+   **W5 deepen (2026-07-28, kotoba-kir#14 + provider#18 + compiler#390 / ADR 0123):**
    pending→ready via \`task-fulfill!\` + multi-chunk join (\`{:pending true}\` /
    \`{:chunks [...]}\` transport replies) for object (id 14) and http (id 13)
    get-stream on the reference path. **Pending scheduling + multi-chunk first
    slice landed (host-side; not guest poll/read, not true async producers).**
+   **W5 deepen (2026-07-28, compiler / ADR 0124):** nbb (`:cljs`) dual-runtime
+   vectors for object + http get-stream ready / pending→fulfill / multi-chunk
+   (8+8 cases); kit `stream-object-v1` http request synced to url+headers record.
+   **Get-stream dual-runtime covers reference + nbb for ready/pending/multi-chunk.**
    Next: guest poll/read ops / true async multi-chunk / product apps.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
