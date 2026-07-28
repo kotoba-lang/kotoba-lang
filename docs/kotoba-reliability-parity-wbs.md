@@ -313,8 +313,10 @@ Do **not** parallelize “new sugar” with “conformance SSoT” on the same b
 
 ## Immediate next three PRs (start here)
 
-1. **kotoba-lang:** `docs/lang/semantics-ssot.md` skeleton + wire from handoff (T1.1)  
-2. **kotoba-lang + compiler:** pure-product profile admission flag + examples CI (T2.1 + T2.3)  
-3. **compiler:** error code + span contract on new rejects; migrate top 20 reject sites (T3.1)
+| # | Task | Status |
+|---|---|---|
+| 1 | **kotoba-lang:** `docs/lang/semantics-ssot.md` skeleton + handoff wire (T1.1) | **landed** (this tree) |
+| 2 | **compiler:** pure-product profile admission + examples KIR CI (T2.1 + T2.3) | companion PR |
+| 3 | **compiler:** error code + span contract; migrate top reject sites (T3.1) | companion PR |
 
 These three unlock parallel agent work on T4/T5 without reopening “what is the language.”

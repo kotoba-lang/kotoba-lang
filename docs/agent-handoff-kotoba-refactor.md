@@ -51,9 +51,18 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 Authoritative work breakdown (repos, tasks, sequencing, agent guide):
 
 - [`docs/kotoba-reliability-parity-wbs.md`](./kotoba-reliability-parity-wbs.md)
+- **Semantics SSoT (T1.1):** [`docs/lang/semantics-ssot.md`](./lang/semantics-ssot.md)
 
 Tiers R1–R4: semantic conformance → stdlib/records → standalone run → toolchain/LTS.
 Product dual-source remains separate (this handoff §2); do not invent language features in product PRs.
+
+**R1 in flight (start here for language work):**
+
+| ID | Task | Repo |
+|---|---|---|
+| T1.1 | semantics-ssot.md | kotoba-lang (this doc set) |
+| T2.1 / T2.3 | pure-product admission + examples KIR | compiler |
+| T3.1 | error code + span contract | compiler |
 
 ### Plan Next (priority order)
 
