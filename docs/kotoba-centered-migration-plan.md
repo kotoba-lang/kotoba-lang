@@ -302,7 +302,8 @@ Qualify vertical families in dependency order:
 **W6 murakumo dash-state oracle (2026-07-28, murakumo#39):** `kotoba/dash_state_core.kotoba` short-hosted-cid / health-class / clamp-at / interval-sleep-ms.
 **W6 murakumo task-plan oracle (2026-07-28, murakumo#40):** `kotoba/task_plan_core.kotoba` slots / failed? / can-retry? / defaults.
 **W6 murakumo token oracle (2026-07-28, murakumo#41):** `kotoba/token_core.kotoba` claims/scope/expired/signing-input.
-Next: W6 remaining pure planner (infer/engine) oracle / cloudflare route inventory / kbb ability gap.
+**W6 murakumo infer-engine oracle (2026-07-28, murakumo#42):** `kotoba/infer_engine_core.kotoba` rpc/embed cmd assembly.
+Next: W6 medium pure planners (optional) / cloudflare route inventory / kbb ability gap.
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -500,7 +501,8 @@ Next: W6 remaining pure planner (infer/engine) oracle / cloudflare route invento
    **W6 murakumo dash-state oracle (2026-07-28, murakumo#39):** dash_state_core.kotoba display helpers.
    **W6 murakumo task-plan oracle (2026-07-28, murakumo#40):** task_plan_core.kotoba slots/failed?.
    **W6 murakumo token oracle (2026-07-28, murakumo#41):** token_core.kotoba claims/scope.
-   Next: W6 remaining pure planner (infer/engine) / cloudflare routes / kbb ability gap.
+   **W6 murakumo infer-engine oracle (2026-07-28, murakumo#42):** infer_engine_core.kotoba cmd assembly.
+   Next: W6 medium pure planners (optional) / cloudflare routes / kbb ability gap.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)
