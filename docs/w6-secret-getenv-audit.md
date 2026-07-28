@@ -1,7 +1,7 @@
-# W6 secret getenv audit (murakumo first pass)
+# W6 secret getenv audit (murakumo)
 
-Status: audit first slice (2026-07-28)  
-Parent: secret-custody ops cutover (murakumo#48, com-cloudflare#3)
+Status: **high-priority secrets cut over** (2026-07-28, murakumo#50)  
+Parent: secret-custody ops (murakumo#48, #50; com-cloudflare#3)
 
 ## Policy
 
@@ -10,17 +10,17 @@ Parent: secret-custody ops cutover (murakumo#48, com-cloudflare#3)
 - **Config / paths / URLs / binary locations** may stay as exact getenv until
   a broader config kit lands; they are not secret-custody blockers.
 
-## murakumo call-sites (`origin/main` 2026-07-28)
+## murakumo call-sites
 
 | site | var(s) | class | action |
 |---|---|---|---|
-| `murakumo.secret` / `cmd-token` | `MURAKUMO_TOKEN_SECRET` | **secret** | **done** (named `murakumo-token`) |
-| `infer/relay_server.clj` | `MURAKUMO_SERVICE_TOKEN` | **secret** | next: named fetch |
-| `infer/media.clj` | `MURAKUMO_METRICS_TOKEN` | **secret** | next: named fetch |
-| `overlay/quic_driver.clj` | `MURAKUMO_QUIC_CERT`, `MURAKUMO_QUIC_KEY` | **secret material** | next: path refs or named fetch |
-| `cloud.clj` | `:overlay/auth-key-env` dynamic | **secret** | next: inject via secret kit |
-| `overlay/transport.clj` | dynamic env-name | **secret** | next: inject via secret kit |
-| `config.cljc` | operator seed env keys | **secret** | already inject-friendly `from-getenv` |
+| `murakumo.secret` / `cmd-token` | `MURAKUMO_TOKEN_SECRET` | **secret** | **done** `#48` (`murakumo-token`) |
+| `infer/relay_server.clj` | `MURAKUMO_SERVICE_TOKEN` | **secret** | **done** `#50` (`murakumo-service-token`) |
+| `infer/media.clj` | `MURAKUMO_METRICS_TOKEN` | **secret** | **done** `#50` (`murakumo-metrics-token`) |
+| `cloud.clj` | `:overlay/auth-key-env` dynamic | **secret** | **done** `#50` (`resolve-exact-env`) |
+| `config.cljc` | operator seed env keys | **secret** | inject-friendly `from-getenv` (leave) |
+| `overlay/quic_driver.clj` | `MURAKUMO_QUIC_CERT`, `MURAKUMO_QUIC_KEY` | **secret material** | next: path refs under scoped-fs |
+| `overlay/transport.clj` | `MURAKUMO_*_DRIVER` | **config** (binary path) | leave |
 | `kekkai.clj` / gate | ledger/dir/`HOME` | config path | leave |
 | `infer/gateway.clj` | image ckpt, text backend URL | config | leave |
 | `infer/orchestrate.clj` | `MURAKUMO_CLOUD` | config URL | leave |
@@ -33,8 +33,8 @@ Parent: secret-custody ops cutover (murakumo#48, com-cloudflare#3)
 |---|---|---|---|
 | `cloudflare.client/api-token` | `CLOUDFLARE_API_TOKEN` | **secret** | **done** (named `cloudflare-api-token`) |
 
-## Next cutover candidates (priority)
+## Next (medium)
 
-1. `MURAKUMO_SERVICE_TOKEN` / `MURAKUMO_METRICS_TOKEN` — same pattern as token secret  
-2. overlay auth-key env inject — wire through `murakumo.secret`  
-3. QUIC cert/key — prefer path refs under scoped-fs roots over raw getenv of PEM
+1. QUIC cert/key — prefer path refs under scoped-fs roots over PEM-in-env  
+2. Optional live kagi `fn-fetch` for operator seed / overlay keys  
+3. Operator seed remains inject-friendly; no ambient dump today
