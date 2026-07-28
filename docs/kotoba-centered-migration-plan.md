@@ -323,8 +323,8 @@ Qualify vertical families in dependency order:
 **W6 SSH host-forever + secret getenv audit (2026-07-28):** fleet SSH stays host; audit lists remaining secret env sites.
 **W6 secret remaining cutover (2026-07-28, murakumo#50):** service/metrics tokens + overlay auth-key named fetch.
 **W6 QUIC path-ref + kagi-fetch (2026-07-28, murakumo#52+#53):** cert store scoped roots + `kagi-fetch`; quic_driver path refs (no PEM-in-env).
-**W6 git kit (2026-07-28, provider#29+#31 / ADR 0148–0149):** id 22 validate-run + JVM os-run.
-Next: git tooling cutover / optional medium pure planners; capability Wasm implementations remain contract-only (definition CID identity landed — see agent-handoff + ADR-capability-repository-semantic-cid-v1).
+**W6 git kit (2026-07-28, provider#29+#31+#32 / ADR 0148–0150):** id 22 dual-runtime os-run + murakumo#55 deploy pin absolute git.
+Next: cloud-deploy (low) / clock-entropy / optional medium pure planners; capability Wasm implementations remain contract-only (definition CID identity landed — see agent-handoff + ADR-capability-repository-semantic-cid-v1).
 3. HTTP ingress and lifecycle;
    **W5 family-3 first slice (2026-07-27, abi#17 + kotoba-component#54 +
    provider#10 + compiler#362 / ADR 0097):** host-inject / guest-poll
@@ -533,8 +533,8 @@ Next: git tooling cutover / optional medium pure planners; capability Wasm imple
    **W6 secret host transports + ops cutover (2026-07-28, provider#27 + murakumo#48 + com-cloudflare#3).**
    **W6 cljs OS transports (2026-07-28, provider#28 / ADR 0147); SSH host-forever; secret getenv audit.**
    **W6 secret remaining cutover (2026-07-28, murakumo#50):** SERVICE/METRICS/overlay auth-key.
-   **W6 QUIC path-ref + kagi-fetch + git kit (2026-07-28, murakumo#52+#53 + provider#29+#31).**
-   Next: W6 git tooling cutover / optional medium pure planners.
+   **W6 QUIC path-ref + kagi-fetch + git dual-runtime/tooling (2026-07-28, murakumo#52+#53+#55 + provider#29+#31+#32).**
+   Next: W6 cloud-deploy (low) / clock-entropy / optional medium pure planners.
 4. state and storage;
    **W5 family-4 first slice (2026-07-27, provider#4 + compiler#353 / ADR 0088):**
    dual-runtime semantic vectors for `:state/transact` on reference (`:clj`)

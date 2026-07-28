@@ -65,7 +65,7 @@ These are **authority hosts**, not W6 product file ports.
 7. **Secret-custody** — **ops cutover complete** (murakumo#48+#50+#52+#53; com-cloudflare#3; kagi-fetch wire).
 8. **cljs OS transports** — **landed** (provider#28 ADR 0147 spawnSync + Node fs).
 9. **SSH** — **host-forever** (`docs/w6-ssh-host-forever.md`).
-10. **git kit** — **contract + JVM os-run** (provider#29+#31 / ADR 0148–0149).
+10. **git kit** — **dual-runtime + deploy tooling cutover** (provider#29+#31+#32; murakumo#55).
 
 ## Migration process (unchanged)
 
