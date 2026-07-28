@@ -1,7 +1,7 @@
 # String kit (pure-product / T4.2)
 
-**Status:** length + from-i64 + concat + **bounded join** landed; T1.3 dual-backend pilot covers pure-product string-ops including **string-byte-length** (compiler#425 / ADR 0175)  
-**Split:** deferred (optional)
+**Status:** length + from-i64 + concat + join + **string-split-count** landed dual-backend (compiler#427)  
+**Full split→collection:** deferred
 
 | Op | Arity | Meaning |
 |---|---|---|
@@ -9,7 +9,8 @@
 | `string-from-i64` | 1 | Signed decimal text (desugars to digit helpers) |
 | `string-concat` | 2 | Bounded concatenation (≤64KiB) |
 | `string-join` | 1+N (N≤8) | `(string-join sep a b …)` → nested concat with sep |
-| `string-split` | — | **Deferred** |
+| `string-split-count` | 2 | Segment count `(haystack sep)` — empty sep rejects |
+| `string-split` | — | **Deferred** (collection return) |
 | `string=?` | 2 | Equality → i64 1/0 |
 | `string-substring` | 3 | Byte-range slice (UTF-8 boundaries) |
 | `string-contains?` | 2 | Substring search → i64 1/0 |
@@ -32,7 +33,8 @@ More than 8 parts after the separator is a compile-time reject.
 - compiler#413 / ADR 0162 (`string-join`)
 - compiler#414 / ADR 0163 (join + from-i64 pilot)
 - compiler#415 / ADR 0164 (contains / eq / substring / fold-case / code-point pilot)
-- compiler#425 / ADR 0175 (`string-byte-length` dual-backend kit; pilot **28**)
+- compiler#425 / ADR 0175 (`string-byte-length` dual-backend kit)
+- compiler#427 / ADR 0177 (`string-split-count`; pilot **30**)
 - `clojure -M:conformance` dual-green
 - `kotoba.compiler.string-operation-test` dual-backend checks
 
