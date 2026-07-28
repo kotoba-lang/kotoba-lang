@@ -82,9 +82,9 @@ Authoritative work breakdown (repos, tasks, sequencing, agent guide):
 Tiers R1–R4: semantic conformance → stdlib/records → standalone run → toolchain/LTS.
 Product dual-source remains separate (this handoff §2); do not invent language features in product PRs.
 
-**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#427 T1.3×**30** (string-split-count + typed-map + if-some/control + loop + T7.4 10k) + T1.4/T1.5 + T3.1–T3.4 + T7.1 partial + **T7.4** + **T4.4** + T9.1–T9.3 + T2.2/T2.4 + T5.4 + T6.1/T6.3 + T7.2/T7.3 + **T10.1–T10.3**.
+**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#429 T1.3×**31** (vector-i64 + string-split-count + typed-map + if-some/control + loop + T7.4 10k) + T1.4/T1.5 + T3.1–T3.4 + **T7.1** zero-charge loop + **T7.4** + **T4.4** + **T4.5** partial + T9.1–T9.3 + T2.2/T2.4 + T5.4 + T6.1/T6.3 + T7.2/T7.3 + **T10.1–T10.3**.
 
-Next language work: T1.3 full matrix (collections still admission-blocked); T7.1 residual mutual-recursion TCO; T4.2 full string-split→collection optional; T5.2/T5.3 record wire/packs residual; T8.3 ops AOT; residual PVA; T9.1 remaining public adapters (db/git/…).
+Next language work: T1.3 full matrix (collection transforms still gated); T7.1 residual mutual-recursion TCO; T4.2 full string-split→collection optional; T4.5 map/filter/reduce dual-backend; T5.2/T5.3 residual; T8.3 ops AOT; residual PVA; T9.1 remaining public adapters (db/git/…).
 
 **T7.2 fuel model:** [`docs/lang/fuel-model.md`](./lang/fuel-model.md) (1 unit/function entry, default 512).
 **T1.5 goldens:** compiler#418 / ADR 0167 — `clojure -M:conformance --check-golden`.
@@ -111,6 +111,7 @@ Next language work: T1.3 full matrix (collections still admission-blocked); T7.1
 **T4.4 typed-map pilot 29:** compiler#426 / ADR 0176 — `[:map :i64 :i64]` new/count/get/contains/assoc/equal dual-green.
 **T4.2 string-split-count 30:** compiler#427 / ADR 0177 + kir#23 + wasm#34 — segment count dual-green; full split deferred.
 **T7.1 zero-charge loop:** compiler#428 / ADR 0178 + kir#24 + wasm#35+#36 — `__kotoba_loop_N` free after first entry; deep kit fuel 16.
+**T4.5 vector-i64 pilot 31:** compiler#429 / ADR 0179 + wasm#37 — count/at/conj dual-green.
 
 ### Plan Next (priority order)
 
