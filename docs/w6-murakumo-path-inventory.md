@@ -132,10 +132,11 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#124:** **cljs dual-source token pure + kekkai.gate** — claims/wire/CT-eq/scope + ledger/status/authorized/denial when ready; nbb Buffer b64; try-oracle string-op fallback. ADR `ADR-260728-w6-cljs-token-kekkai-dual`.
 - **2026-07-28 murakumo#125:** **cljs dual-source tunnel pure** — defaults / conn-opts fragments / wrap-cmd / parse-rc marker·digits / scp-dest / forward·curl shells when `oracle/ready? :tunnel` (task.exec path; try-oracle for cljs KIR substring/i64-str). ADR `ADR-260728-w6-cljs-tunnel-dual`.
 - **2026-07-28 murakumo#126:** **cljs dual-source secret pure + connect pure** — name/env constants + valid-env/path; default-class/node-class/serves-plane when ready. ADR `ADR-260728-w6-cljs-secret-connect-dual`.
+- **2026-07-28 murakumo (config+persist cljs dual-source):** path builders (`:config`) + authority/rkey/uri/url/write-ok? (`:persist`) when ready; try-oracle for persist i64-str. ADR `ADR-260728-w6-cljs-config-persist-dual`.
 
 ## Next
 
-1. murakumo pure+adapter path **#61–#126** — full dual-source + PVA + cljs load + dash/token/kekkai/tunnel/secret/connect. Remaining: Delivery 5–8 shells / residual PVA (schedule `eligible?` bit-pack intentional) / **incremental cljs rewire** (config/persist/identity/infer/overlay/…) / network·secret caps contract-only.
+1. murakumo pure+adapter path **#61–#126** + config/persist cljs dual-source. Remaining: Delivery 5–8 shells / residual PVA (schedule `eligible?` bit-pack intentional) / **incremental cljs rewire** (identity/infer/overlay/report/reconcile/…) / network·secret caps contract-only.
 2. Cloudflare pure-request + deploy + parse + client cores landed (#1–#16 product-shell complete); compat coerce/path oracle (#2).
 3. kbb dual-runtime OS transports + git/entropy kits landed; pure capability allowlist reference-impl complete.
 4. Deeper pure ports still dual-implemented where listed “Still host” (envelope maps, placement folds beyond wired subset, etc.); production compiler dependency remains avoided (resource path).
