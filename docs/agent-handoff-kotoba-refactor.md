@@ -53,6 +53,7 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 | kekkai.gate pure expand (cli-argv fragments) | murakumo#145 |
 | package-manifest + production blockers | provider#40 / ADR 0158 |
 | T8.3 real non-fixture Wasm package pilot (hash-sha256) | provider#41 / ADR 0159 |
+| Reliability T1.2 required-backends matrix (manifest v2) | kotoba-lang (this PR) / ADR-reliability-t12 |
 | pure allowlist wasm set (8) + host-grant digest binding | provider#42 / ADR 0160 |
 | kekkai ledger/dir/HOME via murakumo.config | murakumo#146 |
 | overlay cert MURAKUMO_KAGI_DIR via murakumo.config | murakumo#147 |
@@ -77,7 +78,7 @@ Product dual-source remains separate (this handoff §2); do not invent language 
 
 **R1 immediate trio landed** (#295 semantics-ssot, #411 pure-product + error codes).
 
-Next language work: T1.2 conformance matrix, T1.3 dual-backend runner, T4 stdlib, T5 records (see WBS).
+Next language work: T1.3 dual-backend runner (T1.2 matrix landed), T4 stdlib, T5 records (see WBS).
 
 ### Plan Next (priority order)
 
