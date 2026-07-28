@@ -65,9 +65,10 @@ fixture equality → shells remain on bb/nbb/JVM host.
 - **2026-07-28 murakumo#46:** `kotoba/config_core.kotoba` + `identity_core.kotoba` + `deploy_plan_core.kotoba` path/seed-preimage/argv parity.
 - **2026-07-28 murakumo#47:** `kotoba/infer_credits_core.kotoba` + `reconcile_plan_core.kotoba` integer settle/charge + action-name parity.
 - **2026-07-28 murakumo#49:** `persist_core` + `infer_moe_core` + `infer_rebalance_core` + `infer_relay_core` optional pure oracles.
+- **2026-07-28 murakumo#51:** `connect_core` + `cloud_plan_core` + `provision_plan_core` low-priority pure oracles.
 
 ## Next
 
-1. murakumo pure-planner scalar oracles largely complete (15 medium/high + 4 optional = 19 `.kotoba` cores). Remaining cljc is map/vector/crypto/host.
-2. Cloudflare pure-request oracle string cores already landed (#1–#2); optional parse tallies.
+1. murakumo pure-planner scalar oracles effectively complete (22 `.kotoba` cores). Remaining cljc is map/vector/crypto/host shells.
+2. Cloudflare pure-request string cores + logpush/summary landed (#1–#4); analytics parse tallies still map-bound.
 3. kbb process/scoped-fs OS transports after contract first slice (provider#24).
