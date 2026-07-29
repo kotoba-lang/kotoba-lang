@@ -51,9 +51,10 @@ must not assume amortized O(1) assoc or log-time random access.
 |---|---|
 | `(reduce + 0 v)` / `(reduce (fn [a x] …) 0 v)` / `(reduce named-binary 0 v)` | Folds; empty → init; named = arity-2 module `defn` |
 | `(map (fn [x] …) v)` / `(map inc v)` / `(map named-unary v)` | Builds new vector-i64; named = arity-1 module `defn` |
+| `(map (fn [x y] …) a b)` / `(map named-binary a b)` | 2-source; stops at **shortest** collection |
 | `(filter (fn [x] pred) v)` / `(filter named-pred v)` | pred used as `if` test |
 
-Still gated: multi-source `map`, first-class stored closures, pair-chain / typed-map transforms.
+Still gated: 3+ source `map`, first-class stored closures, typed-map transform sugar.
 `inc`/`dec` desugar to arithmetic.
 
 ## Follow-ups
