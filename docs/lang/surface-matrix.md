@@ -61,7 +61,8 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 | `nested-destructuring` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | Collection source expressions are temp-bound and evaluated exactly once. |
 | `portable-source-stdlib` | `implemented-partial` |  |  |
 | `portable-value-model` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | Primary Wasm preserves literal IDs while dynamic string results use allocation-checked descriptors with canonical content IDs; primary CLJS uses native immutable strings and symbols; compiler uses a distinct typed symbol value kind and checked dynamic construction, and its string operations share the UTF-8 byte-boundary contract. |
-| `protocol-and-record-dispatch` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
+| `protocol-and-record-dispatch` | `not-yet-implemented` |  |  |
+| `record-schema-values` | `implemented-partial` | compiler, kotoba-kir, kotoba-wasm |  |
 | `reduce-function` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `release-integration` | `implemented-partial` |  |  |
 
