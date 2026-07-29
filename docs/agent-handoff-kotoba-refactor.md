@@ -82,7 +82,7 @@ Authoritative work breakdown (repos, tasks, sequencing, agent guide):
 Tiers R1–R4: semantic conformance → stdlib/records → standalone run → toolchain/LTS.
 Product dual-source remains separate (this handoff §2); do not invent language features in product PRs.
 
-**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#431 T1.3×**38** (pred/when-ext/option-string/shift + vector/typed-map/string/loop kits) + T1.4/T1.5 + T3.1–T3.4 + **T7.1** zero-charge loop + **T7.4** + **T4.4** + **T4.5** partial + T9.1–T9.3 + T2.2/T2.4 + T5.4 + T6.1/T6.3 + T7.2/T7.3 + **T10.1–T10.3**.
+**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#432 T1.3×**41** (inc/dec + vector-sum loop + pred/when/vector/typed-map/string/loop kits) + T1.4/T1.5 + T3.1–T3.4 + **T7.1** zero-charge loop + **T7.4** + **T4.4** + **T4.5** partial + T9.1–T9.3 + T2.2/T2.4 + T5.4 + T6.1/T6.3 + T7.2/T7.3 + **T10.1–T10.3**.
 
 Next language work: T1.3 full matrix (collection transforms still gated); T7.1 residual mutual-recursion TCO; T4.2 full string-split→collection optional; T4.5 map/filter/reduce dual-backend; T5.2/T5.3 residual; T8.3 ops AOT; residual PVA; T9.1 remaining public adapters (db/git/…).
 
@@ -114,6 +114,7 @@ Next language work: T1.3 full matrix (collection transforms still gated); T7.1 r
 **T4.5 vector-i64 pilot 31:** compiler#429 / ADR 0179 + wasm#37 — count/at/conj dual-green.
 **T1.3 pilot 34:** compiler#430 / ADR 0180 — vector-assoc/drop/get + typed-map-dissoc + quot/bit-not dual-green.
 **T1.3 pilot 38:** compiler#431 / ADR 0181 — pred + when-ext + if-some-string + shift dual-green.
+**T1.3 pilot 41:** compiler#432 / ADR 0182 — inc/dec desugar + vector-sum loop + shift-right dual-green.
 
 ### Plan Next (priority order)
 

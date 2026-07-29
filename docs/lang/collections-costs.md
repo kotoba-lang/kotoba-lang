@@ -44,8 +44,9 @@ must not assume amortized O(1) assoc or log-time random access.
 
 ## Dual-backend pilot (T4.5 partial)
 
-`vector-i64` constructor + `vector-count` / `vector-at` / `vector-conj` are dual-green
-(compiler#429 / wasm#37 / ADR 0179). Bounded map/filter/reduce transforms remain gated.
+`vector-i64` constructor + mut ops + **loop reduce** (`vector-sum-kit`, compiler#432) are
+dual-green. Prefer explicit `loop`/`inc` over unadmitted `map`/`filter`/`reduce` sugar
+until those ops get dual-backend admission. `inc`/`dec` desugar to arithmetic.
 
 ## Follow-ups
 
