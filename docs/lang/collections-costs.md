@@ -50,10 +50,10 @@ must not assume amortized O(1) assoc or log-time random access.
 | Prefer | Notes |
 |---|---|
 | `(reduce + 0 v)` / `(reduce (fn [a x] …) 0 v)` | Folds; empty → init |
-| `(map (fn [x] …) v)` / `(map inc v)` | Builds new vector-i64 |
-| `(filter (fn [x] pred) v)` | pred used as `if` test |
+| `(map (fn [x] …) v)` / `(map inc v)` / `(map named-unary v)` | Builds new vector-i64; named = arity-1 module `defn` |
+| `(filter (fn [x] pred) v)` / `(filter named-pred v)` | pred used as `if` test |
 
-Still gated: multi-source `map`, named HOF refs, pair-chain / typed-map transforms.
+Still gated: multi-source `map`, first-class stored closures, pair-chain / typed-map transforms.
 `inc`/`dec` desugar to arithmetic.
 
 ## Follow-ups
