@@ -44,9 +44,9 @@ must not assume amortized O(1) assoc or log-time random access.
 
 ## Dual-backend pilot (T4.5 partial)
 
-`vector-i64` constructor + mut ops + **loop reduce** (`vector-sum-kit`, compiler#432) are
-dual-green. Prefer explicit `loop`/`inc` over unadmitted `map`/`filter`/`reduce` sugar
-until those ops get dual-backend admission. `inc`/`dec` desugar to arithmetic.
+`vector-i64` constructor + mut ops + **`reduce` over vector-i64** (compiler#433 / ADR 0183)
+are dual-green. Prefer `(reduce + 0 v)` or `(reduce (fn [a x] …) 0 v)` for folds.
+`map`/`filter` sugar remains admission-gated. `inc`/`dec` desugar to arithmetic.
 
 ## Follow-ups
 
