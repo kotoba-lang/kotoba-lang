@@ -82,9 +82,9 @@ Authoritative work breakdown (repos, tasks, sequencing, agent guide):
 Tiers R1–R4: semantic conformance → stdlib/records → standalone run → toolchain/LTS.
 Product dual-source remains separate (this handoff §2); do not invent language features in product PRs.
 
-**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#433 T1.3×**42** (reduce-vector + inc/dec + vector/typed-map/string/loop kits) + T1.4/T1.5 + T3.1–T3.4 + **T7.1** zero-charge loop + **T7.4** + **T4.4** + **T4.5** partial (reduce) + T9.1–T9.3 + T2.2/T2.4 + T5.4 + T6.1/T6.3 + T7.2/T7.3 + **T10.1–T10.3**.
+**R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#434 T1.3×**43** (map/filter/reduce-vector + inc/dec + vector/typed-map/string/loop kits) + T1.4/T1.5 + T3.1–T3.4 + **T7.1** zero-charge loop + **T7.4** + **T4.4** + **T4.5** vector-i64 map/filter/reduce + T9.1–T9.3 + T2.2/T2.4 + T5.4 + T6.1/T6.3 + T7.2/T7.3 + **T10.1–T10.3**.
 
-Next language work: T1.3 full matrix; T7.1 residual mutual-recursion TCO; T4.2 full string-split→collection optional; T4.5 map/filter sugar dual-backend; T5.2/T5.3 residual; T8.3 ops AOT; residual PVA; T9.1 remaining public adapters (db/git/…).
+Next language work: T1.3 full matrix; T7.1 residual mutual-recursion TCO; T4.2 full string-split→collection optional; T4.5 multi-source map / named HOF / pair-chain (residual); T5.2/T5.3 residual; T8.3 ops AOT; residual PVA; T9.1 remaining public adapters (db/git/…).
 
 **T7.2 fuel model:** [`docs/lang/fuel-model.md`](./lang/fuel-model.md) (1 unit/function entry, default 512).
 **T1.5 goldens:** compiler#418 / ADR 0167 — `clojure -M:conformance --check-golden`.
@@ -116,6 +116,7 @@ Next language work: T1.3 full matrix; T7.1 residual mutual-recursion TCO; T4.2 f
 **T1.3 pilot 38:** compiler#431 / ADR 0181 — pred + when-ext + if-some-string + shift dual-green.
 **T1.3 pilot 41:** compiler#432 / ADR 0182 — inc/dec desugar + vector-sum loop + shift-right dual-green.
 **T4.5 reduce-vector pilot 42:** compiler#433 / ADR 0183 — `(reduce + init v)` / `(reduce (fn [a x] e) init v)` dual-green.
+**T4.5 map/filter-vector pilot 43:** compiler#434 / ADR 0184 — `(map (fn [x] e) v)` / `(map inc|dec v)` / `(filter (fn [x] pred) v)` dual-green (loop helpers may return `:vector-i64`).
 
 ### Plan Next (priority order)
 

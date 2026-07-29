@@ -42,13 +42,21 @@ must not assume amortized O(1) assoc or log-time random access.
 - `docs/lang/fuel-model.md` — call fuel vs helper fuel  
 - `docs/lang/surface-matrix.md` — generated disposition table  
 
-## Dual-backend pilot (T4.5 partial)
+## Dual-backend pilot (T4.5 vector-i64)
 
-`vector-i64` constructor + mut ops + **`reduce` over vector-i64** (compiler#433 / ADR 0183)
-are dual-green. Prefer `(reduce + 0 v)` or `(reduce (fn [a x] …) 0 v)` for folds.
-`map`/`filter` sugar remains admission-gated. `inc`/`dec` desugar to arithmetic.
+`vector-i64` constructor + mut ops + **`reduce` / `map` / `filter` over vector-i64**
+(compiler#433–#434 / ADR 0183–0184) are dual-green.
+
+| Prefer | Notes |
+|---|---|
+| `(reduce + 0 v)` / `(reduce (fn [a x] …) 0 v)` | Folds; empty → init |
+| `(map (fn [x] …) v)` / `(map inc v)` | Builds new vector-i64 |
+| `(filter (fn [x] pred) v)` | pred used as `if` test |
+
+Still gated: multi-source `map`, named HOF refs, pair-chain / typed-map transforms.
+`inc`/`dec` desugar to arithmetic.
 
 ## Follow-ups
 
-- T4.5 code: only add new collection ops that are **explicitly bounded** and dual-backend tested  
+- T4.5 residual: multi-source map / named HOF / pair-chain only when dual-backend tested  
 - T1.3 full matrix still progressive for collection fixtures
