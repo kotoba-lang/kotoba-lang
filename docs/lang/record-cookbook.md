@@ -86,6 +86,10 @@ Keyword keys and large/heterogeneous maps remain out of the pure-product default
 | schedule `eligible?` flag bits | eligibility record | **landed** murakumo#195 (`:schedule/eligibility`) |
 | plan model / lr / residual packs | named records | **landed** murakumo#196–#198 |
 | schedule assign `pack3` queue folds | record export | **landed** murakumo#199 (`:schedule/assign2|3|triple|better*`) |
+| credits `share-pack-2` | `:credits/shares2` | **landed** murakumo#200 |
+| reconcile `pick-targets` pack | `:reconcile/targets` | **landed** murakumo#201/#202 |
+| task assign pack3 | `:task/pair|triple|assign2|3` | **landed** murakumo#203 |
+| rebalance demand / seat-order packs | `:rebalance/demand|order` (+ lanes) | **landed** murakumo#204 — **T5.3 packs complete** |
 | `has-name` + `name` twin | `[:option :string]` + `if-some` | ongoing (forbidden-pattern) |
 | bool-typed comparisons / bool export ABI | opt-in profile + wasm ABI | measured, **not landed** (ADR-reliability-record-access-and-bool-comparisons) |
 
@@ -109,6 +113,6 @@ Do **not** add new packs while rewriting.
 ## Related
 
 - compiler ADR 0165 / 0189 / 0190, T1.3 pilot suite  
-- T5.2 host bridge / T5.3 murakumo#193–#198  
+- T5.2 host bridge / T5.3 murakumo#193–#204  
 - `docs/adr/ADR-reliability-record-access-and-bool-comparisons.md`  
 - `docs/lang/surface-matrix.md` (T2.2 generated overview)
