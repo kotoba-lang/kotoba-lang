@@ -51,6 +51,7 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 |---|---|---|---|
 | `backend-parity` | `implemented-partial` |  |  |
 | `bounded-control-and-sugar` | `implemented-partial` |  |  |
+| `data-host-argument` | `implemented-partial` | kotoba-wasm |  |
 | `dynamic-arity-apply` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `filter-function` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `first-class-closure-values` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
