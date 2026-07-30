@@ -91,7 +91,7 @@ Keyword keys and large/heterogeneous maps remain out of the pure-product default
 | task assign pack3 | `:task/pair|triple|assign2|3` | **landed** murakumo#203 |
 | rebalance demand / seat-order packs | `:rebalance/demand|order` (+ lanes) | **landed** murakumo#204 — **T5.3 packs complete** |
 | `has-name` + `name` twin | `[:option :string]` + `if-some` | ongoing (forbidden-pattern) |
-| bool-typed comparisons / bool export ABI | opt-in profile + wasm ABI | measured, **not landed** (ADR-reliability-record-access-and-bool-comparisons) |
+| bool-typed comparisons / bool export ABI | language profile 5 (compiler ADR 0191) | design accepted; A/B/C remaining (typed-bool-value, export box, goldens) |
 
 Do **not** add new packs while rewriting.
 
@@ -113,6 +113,6 @@ Do **not** add new packs while rewriting.
 ## Related
 
 - compiler ADR 0165 / 0189 / 0190, T1.3 pilot suite  
-- T5.2 host bridge / T5.3 murakumo#193–#204  
+- T5.2 host bridge / T5.3 murakumo#193–#206  
 - `docs/adr/ADR-reliability-record-access-and-bool-comparisons.md`  
 - `docs/lang/surface-matrix.md` (T2.2 generated overview)

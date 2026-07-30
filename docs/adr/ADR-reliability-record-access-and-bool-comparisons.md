@@ -235,3 +235,9 @@ canonical path *does* admit, since that is what production code now uses.
 - compiler `docs/adr/0188-t23-enforce-pure-product-profile-in-conformance-runner.md`
 - murakumo `docs/adr/ADR-260729-w6-t53-rebalance-seats-record.md`
 - superproject `ADR-2607299400`
+
+## Follow-on (2026-07-30)
+
+Implementation design authority moved to compiler
+`docs/adr/0191-language-profile-5-bool-typed-predicates.md` (profile 4→5).
+Remaining work is A/B/C in that ADR, not a silent frontend one-liner.
