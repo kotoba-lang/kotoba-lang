@@ -157,7 +157,47 @@ is therefore **opt-in**: gate bool-typed comparisons behind a profile (the
 existing modules and the LTS promise are untouched, then migrate on a published
 window.
 
-#### A second, independent blocker: wasm32 cannot export `:bool`
+#### The decisive blocker: one `:bool` promotes the whole module's value profile
+
+Measured directly (2026-07-30), not inferred from test failures:
+
+| Module | value profile | wasm32 |
+|---|---|---|
+| i64 only — comparison inside an `if` | `:kotoba.value/i64-v1` | OK |
+| contains one `:bool`-returning function | **`:kotoba.value/typed-v1`** | OK |
+| pair operations, no bool | `:kotoba.value/i64-v1` | OK |
+| **pair operations + one `:bool` function** | — | **REJECT** `typed Wasm operation is not qualified: pair-first` |
+
+A single `:bool` anywhere in a module moves it from `i64-v1` to `typed-v1`, and
+`typed-v1`'s Wasm emitter has a **narrower operation set** — it does not qualify
+`pair-first` / `pair-second`. Pairs are how lists and collections are
+represented, so **a module cannot use a boolean and a list at the same time.**
+
+That is not a source-compatibility question and no deprecation window addresses
+it. It means the ordering assumed above is **wrong**: the value-profile /
+representation decision must come **before** the language-version decision, not
+after it. Until `:bool` is a plain scalar in `i64-v1` (or `typed-v1` qualifies
+the pair operations), bool-typed comparisons cannot coexist with collections at
+all.
+
+Failure taxonomy over the full compiler suite (749 tests, 4953 assertions;
+4 failures + 14 errors):
+
+| Cause | Count |
+|---|---|
+| `expression type mismatch: expected i64, got bool` — the i64-boolean idiom | 11 |
+| value-profile promotion (typed-v1 op set / target support) | 3 |
+| branch-type unification (`if`, `variant match`) | 2 |
+| a direct `(true? false)` assertion | 1 |
+
+Only the 11 are source migrations — and those migrate **toward** Clojure, e.g.
+`(+ (zero? x) (pos? x))` → `(+ (if (zero? x) 1 0) (if (pos? x) 1 0))`, which is
+what a Clojure programmer (or an LLM writing Clojure) writes. Two such
+migrations were done on the spike branch and the affected namespaces went from
+178 to 191 passing assertions. The remaining 7 are representation and
+target-matrix issues that no source edit fixes.
+
+#### A further blocker: wasm32 cannot export `:bool`
 
 `:bool` *intermediates* run on both backends — the 52/52 above proves it, since
 the runtime type of an intermediate is never validated at a function boundary.
