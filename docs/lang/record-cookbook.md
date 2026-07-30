@@ -80,11 +80,14 @@ Keyword keys and large/heterogeneous maps remain out of the pure-product default
 
 ## 4. Migration from packs
 
-| Old public pattern | Target |
-|---|---|
-| base-65536 seat packs | record export + host `call-record` (T5.3 pilot) |
-| `has-name` + `name` twin | `[:option :string]` + `if-some` |
-| schedule `eligible?` bit-pack | intentional residual until T5.3 rewrite |
+| Old public pattern | Target | Status (2026-07-30) |
+|---|---|---|
+| base-65536 seat packs | record export + host `call-record` | **landed** murakumo#193 (`:rebalance/lanes`) |
+| schedule `eligible?` flag bits | eligibility record | **landed** murakumo#195 (`:schedule/eligibility`) |
+| plan model / lr / residual packs | named records | **landed** murakumo#196–#198 |
+| schedule assign `pack3` queue folds | record export | **residual** (host still sort-by; pack helpers remain for tests) |
+| `has-name` + `name` twin | `[:option :string]` + `if-some` | ongoing (forbidden-pattern) |
+| bool-typed comparisons / bool export ABI | opt-in profile + wasm ABI | measured, **not landed** (ADR-reliability-record-access-and-bool-comparisons) |
 
 Do **not** add new packs while rewriting.
 
@@ -92,17 +95,20 @@ Do **not** add new packs while rewriting.
 
 ## 5. Pure-product profile alignment
 
-`lang/pure-product-profile.edn`:
+`lang/pure-product-profile.edn` (2026-07-30):
 
-- `:structural-args` preference includes `:record`  
+- `:value-types` includes **`:record`** (kind tag; concrete form
+  `[:record :ns/name [[:f T] …]]`) — closes ADR-2607299400 P1
+- `:record-ops` = `#{record-new record-get}` (2-arity + schema-ref evidence above)
+- `:structural-args` preference still lists `:record` first  
 - `:forbidden-patterns` bans new public base-N packs  
-- Value-types list is scalar/option-first; records are **construction/projection**
-  surface for multi-field APIs (this cookbook), not a free Clojure map
+- Still **not** free Clojure maps / `defrecord` / keyword field invoke
 
 ---
 
 ## Related
 
-- compiler ADR 0165, T1.3 pilot suite  
-- T5.2 host bridge / T5.3 rebalance pilot  
+- compiler ADR 0165 / 0189 / 0190, T1.3 pilot suite  
+- T5.2 host bridge / T5.3 murakumo#193–#198  
+- `docs/adr/ADR-reliability-record-access-and-bool-comparisons.md`  
 - `docs/lang/surface-matrix.md` (T2.2 generated overview)

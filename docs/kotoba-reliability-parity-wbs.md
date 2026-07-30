@@ -107,7 +107,7 @@ compiler / KIR / wasm / native / legacy path skew.
 |---|---|---|---|---|---|
 | T5.1 | ADR: structural args (`record` / typed-map) preferred over arity growth — **landed** (ADR-reliability-t51; pure-product-profile `:structural-args`) | **kotoba-lang** | Accepted ADR | — | S |
 | T5.2 | Product host bridge: map/record ↔ guest record for oracle/call — **partial landed**: murakumo `call-record`/`map->args` positional projection (murakumo#155); native guest record wire deferred | **murakumo**, **com-cloudflare** (pattern) | `oracle/call-record` or typed args | T5.1, PVA | M |
-| T5.3 | Pilot rewrite: rebalance seats pack → record export | **murakumo**, **compiler** | Delete public base-65536 from API | T5.2, T4.4 | L |
+| T5.3 | Pilot rewrite: rebalance seats pack → record export — **landed core** murakumo#193–#198 (seats / schedule eligibility / plan model+lr+residual); pure-product `:value-types` now includes `:record` + `:record-ops`; residual: schedule assign `pack3` queue folds + bool-typed predicate surface (see ADR-reliability-record-access-and-bool-comparisons) | **murakumo**, **compiler**, **kotoba-lang** | Delete public base-65536 from API | T5.2, T4.4 | L |
 | T5.4 | (Optional) raise max-parameters with security ADR **or** keep 5 + record-only — **landed: keep 5** (ADR-reliability-t54; records via T4.4) | **kotoba-lang**, **compiler** | Decision recorded | T5.1 | S |
 
 **Exit:** New public pure APIs do not introduce `has-*` or base-N packs.
