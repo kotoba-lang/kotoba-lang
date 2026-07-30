@@ -68,9 +68,9 @@
         ids (version/current-profile-ids policy)
         report (version/compatibility-report
                 policy (version/default-compatibility-request policy))]
-    (is (= 4 (:language-profile ids)))
+    (is (= 5 (:language-profile ids)))
     (is (= 1 (:package-contract ids)))
-    (is (= "0.4.0" (:release-version ids)))
+    (is (= "0.5.0" (:release-version ids)))
     (is (:compatible? report))
     (is (:valid? (version/validate-policy policy)))))
 
@@ -79,6 +79,6 @@
         env (version/release-tag-envelope-template
              policy {:commit "c" :tree "t" :source-root "s"
                      :issued-at-ms 1 :signer "did:key:test"})]
-    (is (= "v0.4.0" (:tag env)))
-    (is (= 4 (:language-profile env)))
+    (is (= "v0.5.0" (:tag env)))
+    (is (= 5 (:language-profile env)))
     (is (contains? (get-in policy [:release-tags :binds]) :language-profile))))

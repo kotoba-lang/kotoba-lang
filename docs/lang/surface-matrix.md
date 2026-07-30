@@ -7,8 +7,8 @@ Check: `clojure -M -m kotoba.lang.surface-matrix --check`
 | Field | Value |
 |---|---|
 | surface-status version | 1 |
-| profile version | 4 |
-| as-of | 2026-07-23 |
+| profile version | 5 |
+| as-of | 2026-07-30 |
 | authority ADR | `docs/adr/ADR-kotoba-language-surface-status.md` |
 
 WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source.
@@ -26,6 +26,7 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 
 | Surface | Disposition | Backends | Note / reason |
 |---|---|---|---|
+| `bool-is-a-type-not-a-number` | `intentional-semantic-simplification` |  | Comparisons and predicates are `:bool`. Profile 4 made them i64 so             `(+ (zero? x) (pos? x))` was admitted; that is a type error in             Clojure and it prevented `and`/`or`/`not` from composing into a             readable predicate. Migration is mechanical: `(if p 1 0)`. |
 | `bounded-admission` | `intentional-security-constraint` |  | Untrusted and generated programs must fail closed under finite admission and execution resources. |
 | `capability-only-affinity` | `intentional-semantic-simplification` |  | Affine consumption is scoped to capability values; a general ownership/borrow/lifetime system is intentionally absent. |
 | `explicit-errors` | `intentional-security-constraint` |  | Component/provider effects use explicit result/error values rather than hidden exception paths. |
