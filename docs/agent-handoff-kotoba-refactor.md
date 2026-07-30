@@ -84,8 +84,7 @@ Product dual-source remains separate (this handoff §2); do not invent language 
 
 **R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#437 T1.3×**52** (2-source map + list-rest + when-let/u64 + reduce-named/pair/string + named-hof/thread/option + …) + T1.4/T1.5 + T3.1–T3.4 + **T7.1** zero-charge loop + **T7.4** + **T4.4** + **T4.5** vector-i64 map/filter/reduce + named HOF + 2-source map + T9.1–T9.3 + T2.2/T2.4 + T5.4 + T6.1/T6.3 + T7.2/T7.3 + **T10.1–T10.3**.
 
-Next language work: T1.3 full matrix; T7.1 residual mutual-recursion TCO; T4.2 full string-split→collection optional; T4.5 3+ source map / stored closures / nested `do` wasm-typed; T5.2/T5.3 residual; T8.3 ops AOT; residual PVA; T9.1 remaining public adapters (db/git/…).
-
+Next language work: T1.3 full matrix; T7.1 residual mutual-recursion TCO; T4.2 full string-split→collection optional; T4.5 3+ source map / stored closures / nested `do` wasm-typed; T5.3 residual schedule assign `pack3` + bool-typed predicate surface (ADR-reliability-record-access-and-bool-comparisons); T5.2 native guest record wire; T8.3 ops AOT; T9.1 remaining public adapters (db/git/…).
 **T7.2 fuel model:** [`docs/lang/fuel-model.md`](./lang/fuel-model.md) (1 unit/function entry, default 512).
 **T1.5 goldens:** compiler#418 / ADR 0167 — `clojure -M:conformance --check-golden`.
 **T2.2 surface matrix:** [`docs/lang/surface-matrix.md`](./lang/surface-matrix.md) (`clojure -M -m kotoba.lang.surface-matrix --check`).
@@ -123,7 +122,7 @@ Next language work: T1.3 full matrix; T7.1 residual mutual-recursion TCO; T4.2 f
 
 ### Plan Next (priority order)
 
-1. **Delivery residual** — product-shell pure dual-source complete (#122–#156); residual ops config inject closed (#137+#146+#147); residual PVA (schedule `eligible?` bit-pack intentional)
+1. **T5.3 residual + bool surface** — core T5.3 packs→records landed murakumo#193–#198; pure-product `:value-types` includes `:record` + `:record-ops`; residual schedule assign `pack3` folds; bool-typed comparisons measured as **breaking / opt-in** (not a silent fix)
 2. **T8.3 production AOT** — receipt APIs + package-manifest (#36–#40) + pure allowlist **8 real wasm packages + host-grant binding** (#41–#42 / ADR 0159–0160) landed; remaining: ops/network AOT Components + flip readiness `:signed-wasm :ready` only when production-admissible (host-admissible pure grants OK for reference)
 3. **wasm-aot packaging claims** — pure allowlist `:wasm-aot :partial` (all 8); ops kits stay `:pending`; host-admissible ≠ production-admissible (ADR 0160)
 4. **Host parity L5** — T8.4 **partial**: critical-import conformance fixtures expanded (45 cases) + resources sync; remaining live host runners (kototama/wasm-webcomponent)
