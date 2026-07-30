@@ -84,7 +84,7 @@ Product dual-source remains separate (this handoff §2); do not invent language 
 
 **R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#437 T1.3×**52** (2-source map + list-rest + when-let/u64 + reduce-named/pair/string + named-hof/thread/option + …) + T1.4/T1.5 + T3.1–T3.4 + **T7.1** zero-charge loop + **T7.4** + **T4.4** + **T4.5** vector-i64 map/filter/reduce + named HOF + 2-source map + T9.1–T9.3 + T2.2/T2.4 + T5.4 + T6.1/T6.3 + T7.2/T7.3 + **T10.1–T10.3**.
 
-Next language work: T1.3 full matrix; T7.1 residual mutual-recursion TCO; T4.2 full string-split→collection optional; T4.5 3+ source map / stored closures / nested `do` wasm-typed; **bool-typed predicate surface** (measured breaking / opt-in — ADR-reliability-record-access-and-bool-comparisons; wasm32 cannot export `:bool` yet); T5.2 native guest record wire; T8.3 ops AOT; T9.1 remaining public adapters (db/git/…). **T5.3 pure-planner packs→records complete** murakumo#193–#204.
+Next language work: T1.3 full matrix; T7.1 residual mutual-recursion TCO; T4.2 full string-split→collection optional; T4.5 3+ source map / stored closures / nested `do` wasm-typed; **bool-typed predicate surface** (measured breaking / opt-in — ADR-reliability-record-access-and-bool-comparisons; wasm32 cannot export `:bool` yet); T5.2 native guest record wire; T8.3 ops AOT; T9.1 remaining public adapters (db/git/…). **T5.3 pure-planner packs→records + flag cutovers complete** murakumo#193–#206 (incl. task eligibility #205, reconcile name-order #206).
 **T7.2 fuel model:** [`docs/lang/fuel-model.md`](./lang/fuel-model.md) (1 unit/function entry, default 512).
 **T1.5 goldens:** compiler#418 / ADR 0167 — `clojure -M:conformance --check-golden`.
 **T2.2 surface matrix:** [`docs/lang/surface-matrix.md`](./lang/surface-matrix.md) (`clojure -M -m kotoba.lang.surface-matrix --check`).
@@ -122,13 +122,13 @@ Next language work: T1.3 full matrix; T7.1 residual mutual-recursion TCO; T4.2 f
 
 ### Plan Next (priority order)
 
-1. **bool-typed predicate surface (opt-in)** — measured as **breaking**, not a silent fix (ADR-reliability-record-access-and-bool-comparisons / kotoba-lang#344). Spike on `agent/bool-typed-comparisons` (compiler + kir) reaches 52/52 dual-backend but drops 19 core_test assertions where booleans are summed as i64; wasm32 cannot export `:bool` (externref). Land only behind `:language-profile` + dual-backend export path.
+1. **bool-typed predicate surface (language profile 5)** — design authority: compiler `docs/adr/0191-language-profile-5-bool-typed-predicates.md` (breaks profile 4 i64-as-bool arithmetic). **Not on main.** Remaining measured work: (A) aggregate `:bool` slots need `typed-bool-value` unbox intrinsic; (B) `:bool` export wrappers that box at the wasm boundary; (C) expectation/golden migration. kir#25 + wasm#38 already accept/emit 0/1 word for plain bool. Do **not** silent-land frontend-only spikes.
 2. **T8.3 production AOT** — receipt APIs + package-manifest (#36–#40) + pure allowlist **8 real wasm packages + host-grant binding** (#41–#42 / ADR 0159–0160) landed; remaining: ops/network AOT Components + flip readiness `:signed-wasm :ready` only when production-admissible
 3. **wasm-aot packaging claims** — pure allowlist `:wasm-aot :partial` (all 8); ops kits stay `:pending`; host-admissible ≠ production-admissible (ADR 0160)
 4. **Host parity L5** — T8.4 **partial**: critical-import conformance fixtures expanded (45 cases) + resources sync; remaining live host runners (kototama/wasm-webcomponent)
 5. **Identity inject** — adapter (#38) + Ed25519 proof (#39 / ADR 0157); hosts wire kagi/CACAO for production keys; HMAC doubles stay tests-only
 
-**Landed T5.3 packs→records (2026-07-29→30):** murakumo#193–#204 — seats, eligibility, plan, schedule-assign, credits shares, reconcile targets, task assign, rebalance demand/order. Pure-product `:value-types` includes `:record` + `:record-ops`. **No base-N packing remains in murakumo pure-planner oracles.**
+**Landed T5.3 packs→records + flag cutovers (2026-07-29→30):** murakumo#193–#206 — seats, schedule/task eligibility, plan, schedule-assign, credits shares, reconcile targets+name-order, task assign, rebalance demand/order. Pure-product `:value-types` includes `:record` + `:record-ops`. **No base-N packing and no residual name-bits/eligibility flag-words remain in murakumo pure-planner oracles.**
 
 **Landed 2026-07-28:** full murakumo product-shell dual-source — bulk KIR catalog (#99) + host wire through overlay-driver/runtime (#113) + Product Value ABI v1 #112–#121 + cljs/nbb oracle load (#122); live HMAC/AES (#87).
 
