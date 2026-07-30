@@ -11,7 +11,7 @@
   file, so its copy drifted unnoticed: it declared 49fc4ce while deps.edn had
   been on 65811c9. Two sources of truth for one fact, one of them unchecked and
   wrong. The test now binds all three together."
-  "65811c9d6878e881357e98f9f9fe6a60aeff7070")
+  "f409dbade106df076cefe640781b12db558f4135")
 
 (deftest central-security-control-is-an-immutable-runtime-dependency
   (let [deps (edn/read-string (slurp "deps.edn"))
