@@ -99,6 +99,86 @@ than either end state.
 the backends then reject, which is precisely the "admits ≠ runs" failure T2.3
 (compiler#438) just closed.
 
+#### Implemented as a spike and measured properly (2026-07-30)
+
+Branches, pushed and **not for merge**: `kotoba-kir` and `compiler`, both
+`agent/bool-typed-comparisons`.
+
+Four changes were needed, not one — the whole boolean layer was expressed as
+integer comparison against `0`:
+
+| Site | Was | Now |
+|---|---|---|
+| relational comparisons + `=` (`infer-call-type`) | `:i64` | `:bool` |
+| `not` / `not=` | `(= x 0)` | `(if x false true)` |
+| `if-not` / `when-not` | `(= test 0)` | swap the branches |
+| `desugar-comparison-chain` | folds to `1`/`0` | folds to `true`/`false` |
+| `kotoba-kir` comparison eval (JVM + cljs) | `1`/`0` | `true`/`false` |
+
+`kir`'s `if` already accepted a boolean *or* a legacy 0/1 integer test, so
+integer-conditioned programs keep working. `kir`'s own suite stays green
+(59 tests, 258 assertions).
+
+**The target predicate works**, executed end-to-end on KIR:
+
+```kotoba
+(ns p (:schemas {:s/e [:record :s/e [[:engine :bool] [:ckpt :bool]
+                                     [:holds :bool] [:fetch :bool]]]})
+      (:export [ok? main]))
+(defn ok? [e [:ref :s/e] free :i64 minf :i64] :bool
+  (and (record-get e :engine)
+       (or (not (record-get e :ckpt)) (record-get e :holds) (record-get e :fetch))
+       (>= free minf)))
+```
+
+`clojure -M:conformance` stays **52 / 52 dual-backend** (47 pure-product,
+5 portable), and legacy `(if (= x 0) 1 0)` still compiles and runs.
+
+#### Why it is nevertheless a breaking change, not a fix
+
+The broader compiler suite loses **19 assertions** (5 failures, 14 errors). They
+are **not** stale expectations. `core_test/safe-predicates-and-second-desugar-to-verified-core-operations`
+asserts this program:
+
+```kotoba
+(defn classify [x] (+ (zero? x) (pos? x) (neg? x) (not x) (not= x 4)))
+```
+
+**In this language, booleans *are* i64 arithmetic values, and summing predicate
+results is a supported idiom** exercised by the compiler's own tests. Typing
+comparisons as `:bool` invalidates it. Every failure carries the same message —
+`expression type mismatch: expected i64, got bool`.
+
+That makes this a **language-version decision**, governed by
+`lang/version-policy.edn` / `docs/grade-a-version-policy.md` and the T10
+deprecation window — not something to land as a bug fix. The recommended shape
+is therefore **opt-in**: gate bool-typed comparisons behind a profile (the
+`:language-profile` dial already exists) so new modules get real predicates while
+existing modules and the LTS promise are untouched, then migrate on a published
+window.
+
+#### A second, independent blocker: wasm32 cannot export `:bool`
+
+`:bool` *intermediates* run on both backends — the 52/52 above proves it, since
+the runtime type of an intermediate is never validated at a function boundary.
+But a function whose **declared result** is `:bool` fails to compile:
+
+```
+CompileError: Compiling function #42 failed:
+  call[1] expected type externref, found i64.extend_i32_u of type i64
+```
+
+`kotoba-wasm`'s `typed.cljc` states the design: *"Canonical Component adapters
+may additionally opt into bool=i32; ordinary KIR v4 deliberately keeps bool as a
+sealed externref."* A `:bool` in a signature therefore forces
+`requires-host-runtime?`, and the emitter has no bool result path there.
+
+So even with the spike, a bool-returning **export** would run on KIR but not on
+wasm32, violating the pure-product rule that admitted surface must execute on
+both. Making predicates a pure-product export surface needs a `kotoba-wasm` ABI
+decision (extend `native-bool?` to ordinary KIR v4, or box the result), which is
+a deliberate design point and not a side effect to take unilaterally.
+
 ### 2. Record field access needs a type-directed rewrite point
 
 `record-get` is 3-arity because lowering needs the schema. A 2-arity
