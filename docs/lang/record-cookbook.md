@@ -85,7 +85,7 @@ Keyword keys and large/heterogeneous maps remain out of the pure-product default
 | base-65536 seat packs | record export + host `call-record` | **landed** murakumo#193 (`:rebalance/lanes`) |
 | schedule `eligible?` flag bits | eligibility record | **landed** murakumo#195 (`:schedule/eligibility`) |
 | plan model / lr / residual packs | named records | **landed** murakumo#196–#198 |
-| schedule assign `pack3` queue folds | record export | **residual** (host still sort-by; pack helpers remain for tests) |
+| schedule assign `pack3` queue folds | record export | **landed** murakumo#199 (`:schedule/assign2|3|triple|better*`) |
 | `has-name` + `name` twin | `[:option :string]` + `if-some` | ongoing (forbidden-pattern) |
 | bool-typed comparisons / bool export ABI | opt-in profile + wasm ABI | measured, **not landed** (ADR-reliability-record-access-and-bool-comparisons) |
 
