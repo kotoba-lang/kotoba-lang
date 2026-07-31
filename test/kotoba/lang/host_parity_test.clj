@@ -15,6 +15,16 @@
   (is (= :available (hp/availability :llm-infer :jvm)))
   (is (= :available (hp/availability :llm-infer :node))
       "inject counts as available for linkability")
+  (is (= :available (hp/availability :kagi-sign :node))
+      "Node kagi-sign inject is real actor-host surface")
+  (is (= :capability-absent (hp/availability :scram-sha256 :node))
+      "Node actor-host has no scram-sha256 — honesty vs overclaimed inject")
+  (is (= :capability-absent (hp/availability :transport-connect :node))
+      "Node actor-host has no transport inject")
+  (is (= :capability-absent (hp/availability :pg-open :node))
+      "Node actor-host has no pg wire inject")
+  (is (= :available (hp/availability :scram-sha256 :jvm))
+      "JVM tender has purpose-bound scram-sha256")
   (is (= :unknown-import (hp/availability :not-a-real-import :jvm)))
   (is (= :unknown-host (hp/availability :sha256-hex :fleet))))
 
@@ -39,7 +49,9 @@
   (let [ids (set (map :id (hp/conformance-cases)))]
     (doseq [id [:sign-all-available :verify-all-available
                 :kagi-sign-browser-absent :http-get-jvm-component-link-absent
-                :transport-connect-browser-absent :llm-infer-browser-absent]]
+                :transport-connect-browser-absent :llm-infer-browser-absent
+                :scram-sha256-node-absent :transport-connect-node-absent
+                :pg-open-node-absent]]
       (is (contains? ids id) (str id)))))
 
 (deftest report-is-l5
