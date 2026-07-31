@@ -61,7 +61,7 @@ compiler / KIR / wasm / native / legacy path skew.
 |---|---|---|---|---|---|
 | T2.1 | Promote `lang/pure-product-profile.edn` to **admission check** in frontend — **landed** (compiler#411) | **compiler**, **kotoba-lang** | Compile error if form outside profile when `--profile pure-product` | PVA v1 | M |
 | T2.2 | Generate `docs/lang/surface-matrix.md` from `surface-status.edn` in CI — **landed** (`kotoba.lang.surface-matrix` + `--check`; ADR-reliability-t22) | **kotoba-lang** | Generated doc; `--check` mode | — | S |
-| T2.3 | CI job: every `pure-product` example under `examples/` compiles + KIR-executes | **kotoba-lang**, **compiler** | Examples as living contract | T2.1 | S |
+| T2.3 | CI job: every `pure-product` example under `examples/` compiles + KIR-executes — **landed** (`pure-product-examples` alias + CI job; ADR-reliability-t23) | **kotoba-lang**, **compiler** | Examples as living contract | T2.1 | S |
 | T2.4 | Negative corpus: forbidden ambient forms still reject (link `grade-a-malicious-source-corpus.md`) — **landed** (compiler#417 / ADR 0166 ambient suite + codes; grade-a cross-link) | **compiler**, **kotoba-lang** | Always-on security regression | — | S |
 
 **Exit:** “If it typechecks under pure-product, it runs on product KIR + wasm.”
@@ -316,7 +316,7 @@ Do **not** parallelize “new sugar” with “conformance SSoT” on the same b
 | # | Task | Status |
 |---|---|---|
 | 1 | **kotoba-lang:** `docs/lang/semantics-ssot.md` skeleton + handoff wire (T1.1) | **landed** #295 |
-| 2 | **compiler:** pure-product profile admission + examples KIR CI (T2.1 + T2.3) | **landed** #411 |
+| 2 | **compiler:** pure-product profile admission (T2.1 #411) + **kotoba-lang** examples KIR CI (T2.3 ADR-reliability-t23) | **landed** |
 | 3 | **compiler:** error code + span contract; migrate top reject sites (T3.1) | **landed** #411 |
 
 These three unlock parallel agent work on T4/T5 without reopening “what is the language.”
