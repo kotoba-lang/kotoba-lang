@@ -106,8 +106,8 @@ compiler / KIR / wasm / native / legacy path skew.
 | ID | Task | Owner repo(s) | Deliverable | Depends | Estimate |
 |---|---|---|---|---|---|
 | T5.1 | ADR: structural args (`record` / typed-map) preferred over arity growth — **landed** (ADR-reliability-t51; pure-product-profile `:structural-args`) | **kotoba-lang** | Accepted ADR | — | S |
-| T5.2 | Product host bridge: map/record ↔ guest record for oracle/call — **partial landed**: murakumo `call-record`/`map->args` positional projection (murakumo#155); native guest record wire deferred | **murakumo**, **com-cloudflare** (pattern) | `oracle/call-record` or typed args | T5.1, PVA | M |
-| T5.3 | Pilot rewrite: rebalance seats pack → record export — **landed complete** murakumo#193–#206 (seats / schedule+task eligibility / plan / schedule-assign / credits / reconcile targets+name-order / task assign / rebalance demand+order); pure-product `:value-types` includes `:record` + `:record-ops`; **no base-N packs remain**. Residual: bool-typed predicates = language profile 5 (compiler ADR 0191, A/B/C open) | **murakumo**, **compiler**, **kotoba-lang** | Delete public base-65536 from API | T5.2, T4.4 | L |
+| T5.2 | Product host bridge: map/record ↔ guest record for oracle/call — **positional call-record complete** murakumo#155+#261–#276 + com-cloudflare#18 + com-cloudflare-compat#6; **native guest record pilot** murakumo#277 (schedule/task eligibility single-arg record). Optional expansion of native-record fold-ins remains | **murakumo**, **com-cloudflare**, **com-cloudflare-compat** | `oracle/call-record` + `oracle/record` | T5.1, PVA | M |
+| T5.3 | Pilot rewrite: rebalance seats pack → record export — **landed complete** murakumo#193–#206 (seats / schedule+task eligibility / plan / schedule-assign / credits / reconcile targets+name-order / task assign / rebalance demand+order); pure-product `:value-types` includes `:record` + `:record-ops`; **no base-N packs remain**. Bool predicates = **profile 5 landed** (compiler ADR 0191 + #461) | **murakumo**, **compiler**, **kotoba-lang** | Delete public base-65536 from API | T5.2, T4.4 | L |
 | T5.4 | (Optional) raise max-parameters with security ADR **or** keep 5 + record-only — **landed: keep 5** (ADR-reliability-t54; records via T4.4) | **kotoba-lang**, **compiler** | Decision recorded | T5.1 | S |
 
 **Exit:** New public pure APIs do not introduce `has-*` or base-N packs.
@@ -123,7 +123,7 @@ compiler / KIR / wasm / native / legacy path skew.
 | T6.1 | Define **primary standalone run path** (wasmtime **or** kexe loader) — **landed: wasmtime primary**, kexe secondary (`docs/lang/standalone-run.md` / ADR-reliability-t61) | **kotoba**, **compiler**, **aiueos**/loader | Documented `kotoba run` without `clojure -M` for pure apps | T1.3 | L |
 | T6.2 | Precompiled KIR (or wasm) as default product artifact (already murakumo pattern) | product repos | Gen in CI; no compiler on prod classpath | — | M |
 | T6.3 | Bootstrap plan: compiler remains CLJ **tool**; language runtime is not — **landed** (ADR-reliability-t63) | **kotoba-lang** ADR | Clear tool vs runtime split | T6.1 | S |
-| T6.4 | cljs/browser: execute same pure artifacts (optional oracle load) | **kotoba-kir** cljs, **wasm-webcomponent** | Remove pure mirror where possible | T6.2 | L |
+| T6.4 | cljs/browser: execute same pure artifacts — **landed product-shell**: murakumo oracle-required trail + com-cloudflare#19 + com-cloudflare-compat#6 (`require-ready!`/`preload!`; pure mirrors deleted). Residual: broader wasm-webcomponent consumers | **murakumo**, **com-cloudflare***, **kotoba-kir** cljs | Remove pure mirror where possible | T6.2 | L |
 
 **Exit:** Pure app demo runs in CI on wasmtime/kexe with zero Clojure at runtime.
 
