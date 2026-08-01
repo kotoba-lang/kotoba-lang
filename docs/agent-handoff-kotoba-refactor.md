@@ -122,8 +122,8 @@ Next language work: T1.3 full matrix; T7.1 residual mutual-recursion TCO; T4.2 f
 
 ### Plan Next (priority order)
 
-1. **T8.3 production AOT residual** — typed-string Component surface complete (provider ADR 0199–0208); **nested EDN / multi-file kit body remains W4-gated**. Flip readiness `:signed-wasm :ready` only when production-admissible (ops/network). Do not re-propose packing walks already landed.
-2. **wasm-aot packaging claims** — pure allowlist `:wasm-aot :partial` (all 8); ops kits stay `:pending`; host-admissible ≠ production-admissible (ADR 0160)
+1. **T8.3 production AOT residual** — typed-string Component surface complete (provider ADR 0199–0208); W4 recursive EDN + guest host surfaces provider ADR 0246–0267 landed; **named catalog wire ids 19–23 landed** (this repo ADR-t83-ops-capability-catalog-wire-ids-19-23; compiler must vendor). Flip readiness `:signed-wasm :ready` / `:wasm-aot :implemented` only when production-admissible (host I/O still open by design). Do not re-propose packing walks already landed.
+2. **wasm-aot packaging claims** — pure allowlist `:wasm-aot :partial` (all 8); ops kits stay `:partial` (host authority); host-admissible ≠ production-admissible (ADR 0160)
 3. **Host parity L5 residual** — T8.4 **partial**: critical fixtures + Node inject honesty/live corpus (kototama#122–#125); remaining production qualification for SCRAM/TLS success paths + browser gaps
 4. **T5.2 native guest record wire expansion** — pilot landed murakumo#277 (schedule/task eligibility single record arg). Optional: fold other multi-scalar pure exports that are one conceptual record (not CLI token lines)
 5. **Identity inject** — adapter (#38) + Ed25519 proof (#39 / ADR 0157); hosts wire kagi/CACAO for production keys; HMAC doubles stay tests-only
