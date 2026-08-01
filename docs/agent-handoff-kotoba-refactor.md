@@ -20,7 +20,7 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 
 ---
 
-## 1. Where we are (2026-07-28)
+## 1. Where we are (2026-08-01)
 
 ### Done (high level)
 
@@ -70,6 +70,9 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 | deploy.plan pure oracle expand (execution probe + pin paths) | murakumo#138 |
 | dash.state probe parse pure oracle expand | murakumo#136 |
 | Pure capability allowlist reference-impl | **COMPLETE** (sin / cos / sha256 / cbor / json / clock / random / now-days) |
+| **T8.2 ops/object/storage checklist (2026-08-01)** | **COMPLETE** except object/storage `:signed-wasm :pending` (no production-signed wasm claim). Ops audit `:ready` (provider ADR 0269); object/storage audit+deny (0271–0273); inject parity (0270) |
+| **T8.3 ops guest host plane (2026-08-01)** | **COMPLETE**: W4 recursive EDN 0246–0255; codec AOT 0256–0259; guest host surfaces HTTP/secret/process/git/entropy/fs 0260–0268; inject parity 0270 |
+| **Ops wire ids 19–23 registration** | **COMPLETE**: catalog (kotoba-lang#358) + compiler vendoring (compiler#470 ADR 0198) + component-model inventory (component#120 ADR 0120) + compiler pin (compiler#471 ADR 0199) |
 | Network / secret capability packages | kits + readiness + signed receipts + package-manifest (provider#34–#40); pure allowlist **8 real wasm packages + grant-binding** (provider#41–#42 / ADR 0159–0160); **ops/network production AOT + readiness `:signed-wasm :ready` still pending** |
 
 ### Language reliability parity (CLJ/CLJS-class trust)
@@ -84,7 +87,7 @@ Product dual-source remains separate (this handoff §2); do not invent language 
 
 **R1 progress:** #295 semantics-ssot, #411 pure-product + error codes, #309 T1.2 matrix, compiler#412–#437 T1.3×**52** (2-source map + list-rest + when-let/u64 + reduce-named/pair/string + named-hof/thread/option + …) + T1.4/T1.5 + T3.1–T3.4 + **T7.1** zero-charge loop + **T7.4** + **T4.4** + **T4.5** vector-i64 map/filter/reduce + named HOF + 2-source map + T9.1–T9.3 + T2.2/T2.4 + T5.4 + T6.1/T6.3 + T7.2/T7.3 + **T10.1–T10.3**.
 
-Next language work: T1.3 full matrix; T7.1 residual mutual-recursion TCO; T4.2 full string-split→collection optional; T4.5 3+ source map / stored closures / nested `do` wasm-typed; T8.3 ops AOT residual; T9.1 remaining public adapters (db/git/…). **Profile 5 bool-typed predicates landed** (compiler ADR 0191 + composed-surface kit #461; release 0.5.0 authority). **T5.3 packs→records complete** murakumo#193–#206. **T5.2 product host bridge largely complete** (call-record close-out murakumo#261–#276 + com-cloudflare#18 + com-cloudflare-compat#6; native guest record pilot murakumo#277 schedule/task eligibility). **T6.4 oracle-required** murakumo fleet + com-cloudflare#19 + compat#6.
+Next language work: T1.3 full matrix; T7.1 residual mutual-recursion TCO; T4.2 full string-split→collection optional; T4.5 3+ source map / stored closures / nested `do` wasm-typed; T9.1 remaining public adapters (db/git/…). **T8.3 ops guest host + wire 19–23 registration landed 2026-08-01** (see Plan Next — host I/O wasm-aot remains partial by design). **Profile 5 bool-typed predicates landed** (compiler ADR 0191 + composed-surface kit #461; release 0.5.0 authority). **T5.3 packs→records complete** murakumo#193–#206. **T5.2 product host bridge largely complete** (call-record close-out murakumo#261–#276 + com-cloudflare#18 + com-cloudflare-compat#6; native guest record pilot murakumo#277 schedule/task eligibility). **T6.4 oracle-required** murakumo fleet + com-cloudflare#19 + compat#6.
 **T7.2 fuel model:** [`docs/lang/fuel-model.md`](./lang/fuel-model.md) (1 unit/function entry, default 512).
 **T1.5 goldens:** compiler#418 / ADR 0167 — `clojure -M:conformance --check-golden`.
 **T2.2 surface matrix:** [`docs/lang/surface-matrix.md`](./lang/surface-matrix.md) (`clojure -M -m kotoba.lang.surface-matrix --check`).
@@ -122,11 +125,12 @@ Next language work: T1.3 full matrix; T7.1 residual mutual-recursion TCO; T4.2 f
 
 ### Plan Next (priority order)
 
-1. **T8.3 production AOT residual** — typed-string Component surface complete (provider ADR 0199–0208); W4 recursive EDN + guest host surfaces provider ADR 0246–0267 landed; **named catalog wire ids 19–23 landed** (this repo ADR-t83-ops-capability-catalog-wire-ids-19-23; compiler must vendor). Flip readiness `:signed-wasm :ready` / `:wasm-aot :implemented` only when production-admissible (host I/O still open by design). Do not re-propose packing walks already landed.
-2. **wasm-aot packaging claims** — pure allowlist `:wasm-aot :partial` (all 8); ops kits stay `:partial` (host authority); host-admissible ≠ production-admissible (ADR 0160)
+1. **Host I/O wasm-aot honesty** — ops kits keep `:wasm-aot :partial` while host authority (network/spawn/store/git/CSPRNG) remains host-injected. **Do not** flip `:wasm-aot :implemented` or production `:signed-wasm` without production-admissible signed packages. Guest host surfaces + inject/deny/roundtrip plane is **landed** (provider 0260–0273). Prefer new product pure oracles over re-proposing packing walks / W4 / host inject already on main.
+2. **object/storage signed-wasm** — still `:pending` (no production-signed object/storage wasm). Optional future: fixed-depth pure EDN codecs for storage (like secret 0236) as codec-only packages — does **not** by itself justify production signed-wasm claims.
 3. **Host parity L5 residual** — T8.4 **partial**: critical fixtures + Node inject honesty/live corpus (kototama#122–#125); remaining production qualification for SCRAM/TLS success paths + browser gaps
-4. **T5.2 native guest record wire expansion** — pilot landed murakumo#277 (schedule/task eligibility single record arg). Optional: fold other multi-scalar pure exports that are one conceptual record (not CLI token lines)
+4. **T5.2 native guest record wire expansion** — pilot landed murakumo#277. Optional: fold other multi-scalar pure exports that are one conceptual record (not CLI token lines)
 5. **Identity inject** — adapter (#38) + Ed25519 proof (#39 / ADR 0157); hosts wire kagi/CACAO for production keys; HMAC doubles stay tests-only
+6. **Language reliability residual** — T1.3 full matrix progressive; T7.1 mutual-recursion TCO; T4.2 full string-split→collection optional; T4.5 3+ source map / stored closures; T9.1 remaining public adapters (db/git/…)
 
 **Landed profile 5 (2026-07-30→31):** compiler ADR 0191 A/B/C + composed-surface kit (compiler#461); kotoba-lang release 0.5.0 authority; pure-product includes `:bool` / `[:option :bool]`. Do **not** re-open frontend-only spikes.
 
@@ -137,6 +141,8 @@ Next language work: T1.3 full matrix; T7.1 residual mutual-recursion TCO; T4.2 f
 **Landed T5.3 packs→records + flag cutovers (2026-07-29→30):** murakumo#193–#206 — seats, schedule/task eligibility, plan, schedule-assign, credits shares, reconcile targets+name-order, task assign, rebalance demand/order. Pure-product `:value-types` includes `:record` + `:record-ops`. **No base-N packing remains in murakumo pure-planner oracles.**
 
 **Landed 2026-07-28:** full murakumo product-shell dual-source — bulk KIR catalog (#99) + host wire through overlay-driver/runtime (#113) + Product Value ABI v1 #112–#121 + cljs/nbb oracle load (#122); live HMAC/AES (#87).
+
+**Landed T8.2/T8.3 ops + readiness wave (2026-08-01):** provider W4/codecs/guest-host/inject 0246–0270; T8.2 audit/deny 0269–0273; catalog wire 19–23 (this repo#358); component-model 19–23 (component#120); compiler pin (compiler#470–#471). **Do not re-open** ops packing walks, W4 recursive EDN, or guest host inject as greenfield.
 
 ### Do not
 
