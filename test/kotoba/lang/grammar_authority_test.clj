@@ -69,3 +69,7 @@
                :semantic-cid :elaboration-pipeline :code-identity
                :portable-effect]]
       (is (integer? (get versions k)) k))))
+
+(deftest conformance-evidence-must-name-the-requested-case
+  (is (false? (auth/conformance-evidence-present?
+               {} :definitely-not-a-real-conformance-case))))

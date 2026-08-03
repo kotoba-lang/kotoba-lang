@@ -1,7 +1,8 @@
 (ns kotoba.lang.package-registry
   "Compatibility registry kernel. Resolution is pure and always emits a
   complete CID-pinned lock entry; name@version is never executable input."
-  (:require [clojure.string :as str]
+  (:require [clojure.set :as set]
+            [clojure.string :as str]
             [kotoba.lang.package-contract :as contract]))
 
 (def registry-version 1)
@@ -10,7 +11,7 @@
                :registry/signers :registry/capabilities])
 
 (defn- text? [x] (and (string? x) (not (str/blank? x))))
-(defn registry-key [name version] (str name "@" version))
+(defn registry-key [name version] [name version])
 
 (defn version-only-request?
   "True for the deliberately non-admissible name+version request shape.
@@ -68,12 +69,18 @@
   (let [v (validate registry)]
     (if-not (:ok? v) {:ok? false :problems (:problems v)}
       (if-let [record (lookup (:registry v) name version)]
-        (let [problems (record-problems record)]
+        (let [problems (cond-> (record-problems record)
+                         (or (not= name (:registry/name record))
+                             (not= version (:registry/version record)))
+                         (conj {:problem :registry/coordinate-mismatch
+                                :requested {:name name :version version}
+                                :resolved {:name (:registry/name record)
+                                           :version (:registry/version record)}}))]
           (if (seq problems) {:ok? false :problems problems} {:ok? true :record record}))
         {:ok? false :problems [{:problem :registry/not-found :name name :version version}]}))))
 
 (defn record->lock-dep [record capability-grant]
-  (let [caps (vec (or capability-grant (:registry/capabilities record)))]
+  (let [caps (vec (or capability-grant []))]
     (cond-> {:dep/name (:registry/name record) :dep/version (:registry/version record)
              :dep/repo-rid (:registry/repo-rid record) :dep/commit (:registry/commit record)
              :dep/tree-cid (:registry/tree-cid record) :dep/manifest-cid (:registry/manifest-cid record)
@@ -84,10 +91,24 @@
 (defn lock-from-requests [registry requests]
   (let [results (mapv (fn [request]
                         (let [resolved (resolve-record registry (or (:name request) (:dep/name request))
-                                                       (or (:version request) (:dep/version request)))]
-                          (if (:ok? resolved) (assoc resolved :dep (record->lock-dep (:record resolved)
-                                                                                      (or (:capabilities request) (:dep/capabilities request))))
-                              resolved))) requests)]
+                                                       (or (:version request) (:dep/version request)))
+                              requested-caps (or (:capabilities request)
+                                                 (:dep/capabilities request)
+                                                 [])]
+                          (cond
+                            (not (:ok? resolved)) resolved
+                            (not (vector? requested-caps))
+                            {:ok? false :problems [{:problem :registry/capability-grant-invalid}]}
+                            (not (set/subset? (set requested-caps)
+                                              (set (:registry/capabilities (:record resolved)))))
+                            {:ok? false
+                             :problems [{:problem :registry/capability-grant-not-subset
+                                         :requested requested-caps
+                                         :declared (:registry/capabilities (:record resolved))}]}
+                            :else
+                            (assoc resolved :dep (record->lock-dep (:record resolved)
+                                                                  requested-caps)))))
+                      requests)]
     (if (every? :ok? results)
       {:ok? true :lock {:kotoba.lock/version 1 :deps (mapv :dep results)} :deps (mapv :dep results)}
       {:ok? false :problems (vec (mapcat :problems (remove :ok? results)))})))

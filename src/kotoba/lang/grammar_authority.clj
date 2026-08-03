@@ -216,12 +216,11 @@
         (feature-catalog surface)))
 
 (defn conformance-evidence-present?
-  "True when a conformance keyword is backed by shared evidence listing or fixture dir."
+  "True when a conformance keyword is backed by shared evidence or its named fixture."
   [surface conformance-key]
   (or (nil? conformance-key)
       (contains? (set (get-in surface [:other-gaps :backend-parity :evidence :shared-cases] []))
                  conformance-key)
-      (.isDirectory (io/file "lang/conformance"))
       ;; Named fixture files used by the shared matrix.
       (.isFile (io/file (str "lang/conformance/" (name conformance-key) ".kotoba")))))
 
@@ -283,21 +282,18 @@
          (into []
                (keep (fn [[k meta]]
                        (let [conf (:conformance meta)
-                             missing (:missing meta)]
-                         (when (and (seq missing)
-                                    conf
-                                    (not (conformance-evidence-present? surface conf)))
+                             missing (:missing meta)
+                             evidenced? (conformance-evidence-present? surface conf)]
+                         (cond
+                           (and (seq missing) conf (not evidenced?))
                            {:feature k :conformance conf :missing missing
-                            :reason :portable-claim-missing-conformance-evidence})
-                         ;; If disposition claims implemented-partial with full
-                         ;; backends, missing non-empty means stay partial — OK.
-                         ;; Fail only when a feature claims empty missing + full
-                         ;; backends but has no conformance when one is required.
-                         (when (and (empty? missing)
-                                    conf
-                                    (not (conformance-evidence-present? surface conf)))
+                            :reason :portable-claim-missing-conformance-evidence}
+
+                           (and (empty? missing) conf (not evidenced?))
                            {:feature k :conformance conf
-                            :reason :conformance-key-not-in-shared-evidence}))))
+                            :reason :conformance-key-not-in-shared-evidence}
+
+                           :else nil))))
                feature-claims)
          vendor (vendor-drift authority-bytes)
          pipeline-errors

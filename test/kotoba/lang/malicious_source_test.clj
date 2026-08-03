@@ -37,3 +37,9 @@
   (is (= :reader/tag-escape
          (:code (malicious/safe-read-decision
                  "#evil/tag {:payload 1}" {})))))
+
+(deftest reader-discard-prefixes-cannot-bypass-the-nesting-budget
+  (let [source (str (apply str (repeat 5000 "#_ ")) "0")
+        result (malicious/safe-read-decision source {})]
+    (is (false? (:allowed? result)))
+    (is (= :reader/discard (:code result)))))

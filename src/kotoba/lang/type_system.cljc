@@ -56,6 +56,8 @@
                [{:problem :type/map-arity :type t}])
         :cap (let [[kind resource] args]
                (cond-> []
+                 (not= 2 (count args))
+                 (conj {:problem :type/cap-arity :type t})
                  (not (keyword? kind))
                  (conj {:problem :type/cap-kind :type t})
                  (not (capabilities/resource-constraint? resource))

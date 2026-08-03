@@ -28,28 +28,37 @@
 
 (defn safe-read-decision [source limits]
   (let [{:keys [max-source-bytes max-nesting-depth max-token-chars]}
-        (merge default-parser-limits limits)
-        metrics (structural-metrics source)
-        reader-escape? (boolean
-                        (re-find #"(#=|#[A-Za-z][A-Za-z0-9_.-]*/?[A-Za-z0-9_.-]*)"
-                                 source))
-        code (cond
-               (> (:bytes metrics) max-source-bytes) :parser/source-size
-               (> (:max-depth metrics) max-nesting-depth) :parser/nesting
-               (> (:max-token metrics) max-token-chars) :parser/token-size
-               reader-escape? :reader/tag-escape
-               :else nil)]
-    (if code
-      {:allowed? false :code code :metrics metrics}
-      (try
-        (edn/read-string {:readers {}
-                          :default (fn [tag _]
-                                     (throw (ex-info "reader tag denied"
-                                                     {:tag tag})))}
-                         source)
-        {:allowed? true :metrics metrics}
-        (catch Exception _
-          {:allowed? false :code :reader/malformed :metrics metrics})))))
+        (merge default-parser-limits limits)]
+    ;; A UTF-16 code-unit count is a cheap lower bound on UTF-8 bytes. Reject
+    ;; obvious oversized input before walking it or allocating a UTF-8 copy.
+    (if (> (.length ^String source) max-source-bytes)
+      {:allowed? false :code :parser/source-size
+       :metrics {:source-chars (.length ^String source)}}
+      (let [metrics (structural-metrics source)
+            discard? (boolean (re-find #"#_" source))
+            reader-escape? (boolean
+                            (re-find #"(#=|#[A-Za-z][A-Za-z0-9_.-]*/?[A-Za-z0-9_.-]*)"
+                                     source))
+            code (cond
+                   (> (:bytes metrics) max-source-bytes) :parser/source-size
+                   (> (:max-depth metrics) max-nesting-depth) :parser/nesting
+                   (> (:max-token metrics) max-token-chars) :parser/token-size
+                   discard? :reader/discard
+                   reader-escape? :reader/tag-escape
+                   :else nil)]
+        (if code
+          {:allowed? false :code code :metrics metrics}
+          (try
+            (edn/read-string {:readers {}
+                              :default (fn [tag _]
+                                         (throw (ex-info "reader tag denied"
+                                                         {:tag tag})))}
+                             source)
+            {:allowed? true :metrics metrics}
+            (catch StackOverflowError _
+              {:allowed? false :code :reader/nesting-overflow :metrics metrics})
+            (catch Exception _
+              {:allowed? false :code :reader/malformed :metrics metrics})))))))
 
 (defn evaluate-case
   [{:keys [attack-class source limits declared-effects observed-effects

@@ -29,7 +29,8 @@
   in kotoba.lang.capability-values/effect-for-kind are granted; every other
   resource URI is SKIPPED (reported under :skipped), never silently granted."
   (:require [clojure.string :as str]
-            [kotoba.lang.capability-values :as values]))
+            [kotoba.lang.capability-values :as values])
+  #?(:clj (:import [java.time Instant ZoneOffset])))
 
 (def cap-uri-prefix "kotoba://cap/")
 
@@ -70,15 +71,30 @@
 
 (defn- chain-expires->grant-expires
   "Chain expiry (an ISO-8601 instant such as \"2026-07-10T00:00:00Z\", or a
-  plain date) -> the grant-shape date string, by truncating to the date part.
-  Returns nil for nil and :invalid for a non-conforming value (fail closed:
-  an unintelligible expiry must not widen into \"never expires\")."
+  plain date) -> the grant-shape date string. Because grant dates remain valid
+  through that calendar date, an instant is conservatively mapped to the day
+  before its UTC date. This can shorten authority by less than 24 hours but can
+  never extend it past the signed instant. Returns nil for nil and :invalid for
+  a non-conforming value."
   [x]
   (cond
     (nil? x) nil
     (not (string? x)) :invalid
-    :else (let [date (first (str/split x #"T"))]
-            (if (values/date-string? date) date :invalid))))
+    (values/date-string? x) x
+    :else
+    #?(:clj
+       (try
+         (-> (Instant/parse x)
+             (.atZone ZoneOffset/UTC)
+             (.toLocalDate)
+             (.minusDays 1)
+             (str))
+         (catch Exception _ :invalid))
+       :cljs
+       (let [millis (js/Date.parse x)]
+         (if (js/isNaN millis)
+           :invalid
+           (subs (.toISOString (js/Date. (- millis 86400000))) 0 10))))))
 
 (defn grants-from-chain
   "Maps a VERIFIED chain result (the cacao.core/verify-chain shape — this
@@ -86,8 +102,8 @@
 
   On success returns {:grants [<grant> ..] :skipped [{:resource uri
   :note kw} ..]}: one grant per registered `kotoba://cap/<kind>/<resource>`
-  URI in :chain/resources (sorted for determinism), with
-  :grant/expires = :chain/expires (truncated to its date part) and
+  URI in :chain/resources (sorted for determinism), with a conservatively
+  attenuated date-shaped :grant/expires derived from :chain/expires and
   :grant/id = \"cacao:<root-iss>:<index>\" so every grant is traceable to the
   delegating root issuer. Unknown kinds and non-cap URIs are SKIPPED with a
   note — never granted.
