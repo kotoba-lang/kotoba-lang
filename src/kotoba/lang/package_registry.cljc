@@ -49,7 +49,18 @@
                 (every? text? (:registry/signers record))))
       (conj {:problem :registry/signers-invalid})
       (not (vector? (:registry/capabilities record)))
-      (conj {:problem :registry/capabilities-invalid}))))
+      (conj {:problem :registry/capabilities-invalid})
+      ;; CI2: a record MAY publish the definition identities it exports. It is
+      ;; optional because effectful code stays component-addressed until its
+      ;; capability interface is in the typed KIR, but when it is present it
+      ;; must be a vector of real CIDv1s -- an unparseable string here would
+      ;; otherwise become an unenforceable lock entry downstream.
+      (and (contains? record :registry/definition-cids)
+           (not (and (vector? (:registry/definition-cids record))
+                     (seq (:registry/definition-cids record))
+                     (every? contract/cid? (:registry/definition-cids record))
+                     (apply distinct? (:registry/definition-cids record)))))
+      (conj {:problem :registry/definition-cids-invalid}))))
 
 (defn validate [registry]
   (let [r (normalize registry)
@@ -79,7 +90,12 @@
              :dep/tree-cid (:registry/tree-cid record) :dep/manifest-cid (:registry/manifest-cid record)
              :dep/signers (vec (:registry/signers record)) :dep/capabilities caps}
       (:registry/kind record) (assoc :dep/kind (:registry/kind record))
-      (:registry/component-cid record) (assoc :dep/component-cid (:registry/component-cid record)))))
+      (:registry/component-cid record) (assoc :dep/component-cid (:registry/component-cid record))
+      ;; CI2: the alias resolves to the definition identities, so linking by
+      ;; name can never silently substitute different code. Sorted because
+      ;; dependency order is not semantic and the lock should be stable.
+      (:registry/definition-cids record)
+      (assoc :dep/definition-cids (vec (sort (:registry/definition-cids record)))))))
 
 (defn lock-from-requests [registry requests]
   (let [results (mapv (fn [request]
@@ -91,3 +107,20 @@
     (if (every? :ok? results)
       {:ok? true :lock {:kotoba.lock/version 1 :deps (mapv :dep results)} :deps (mapv :dep results)}
       {:ok? false :problems (vec (mapcat :problems (remove :ok? results)))})))
+
+(defn check-case
+  "Runs one `lang/code-identity-conformance` `:alias` case (CI2): a name@version
+  request must resolve, through the signed registry record, to exactly the
+  definition identities the manifest expects. This is the property that makes
+  `:dep/name` an alias rather than a substitution point."
+  [tc data]
+  (let [outcome (lock-from-requests (:registry data) [(:request data)])]
+    (if (= :accept (:kind tc))
+      (let [dep (first (:deps outcome))]
+        {:ok? (and (boolean (:ok? outcome))
+                   (= (:expected-definition-cids tc) (:dep/definition-cids dep)))
+         :actual (select-keys dep [:dep/name :dep/definition-cids])})
+      {:ok? (and (not (:ok? outcome))
+                 (contains? (set (map :problem (:problems outcome)))
+                            (:expected-problem tc)))
+       :actual (:problems outcome)})))
