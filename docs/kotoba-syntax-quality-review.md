@@ -146,9 +146,13 @@ generation: a result descriptor is admitted only when the compiler can build a
 typed fallback value for an unknown or wrong-family closure. Descriptors whose
 members have no such inhabitant yet (notably bytes, linear resources, and some
 list shapes) remain a maturity gap rather than silently weakening dispatch.
-Also, frontend result context propagates through a `do` tail, but the
-`kotoba-script` path still rejects a multi-expression `do` KIR operation. Until
-that backend gap closes, use `let` sequencing in portable authored code.
+
+Multi-expression `do` is now portable through the restricted ESM path as well
+as the reference and Wasm paths. Its non-tail expressions are evaluated in
+order and cannot be optimized away, while the final expression keeps its typed
+closure result context. The web representation also guards the compiler's
+reserved closure dispatcher handle as the physical pair it is, without
+weakening ordinary i64 parameter guards.
 
 ### P1 — vocabulary and module consistency
 
@@ -177,5 +181,6 @@ heads and explicit top-level function values still expose `invoke`/`fn-ref`;
 the former now accepts a complete descriptor so nominal and parameterized types
 remain honest at that boundary. The highest-value callable gap is no longer
 record/option/result dispatch itself, but extending typed trap fallbacks to the
-remaining descriptor families. The separate multi-expression `do` backend gap
-is now the clearest blemish in otherwise ordinary sequencing syntax.
+remaining descriptor families. With multi-expression `do` now portable, the
+remaining aesthetic friction is concentrated at genuinely computed callable
+boundaries rather than ordinary lexical calls or sequencing.
