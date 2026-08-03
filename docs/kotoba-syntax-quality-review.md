@@ -14,10 +14,11 @@ recognizable Clojure-shaped language without inheriting ambient Clojure/JVM
 authority.
 
 The syntax is not yet uniformly beautiful at representation boundaries.
-First-class function invocation still exposes lowering details that interrupt
-otherwise direct code. Document construction and generic option fallback now
-use contextual/type-directed elaboration into existing typed primitives rather
-than new runtime representations or punctuation-heavy syntax.
+Computed first-class function invocation still exposes lowering details, while
+lexical scalar, predicate, and vector-producing calls now stay direct in their
+known result contexts. Document construction and generic option fallback use
+contextual/type-directed elaboration into existing typed primitives rather than
+new runtime representations or punctuation-heavy syntax.
 
 ## Evidence-based scorecard
 
@@ -108,6 +109,13 @@ the explicit conversion of a known top-level function into a value. This keeps
 the common lexical path visually ordinary without pretending that every form
 in call-head position is dynamically callable.
 
+The same contextual rule now covers `:vector-i64`: vector operations and the
+collection inputs to `map`, `filter`, and `reduce` select the vector dispatcher
+for a lexical call. This admits library-shaped code such as
+`(defn call-singleton [f] (vector-at (f 7) 0))`, while a computed closure head
+uses `(invoke :vector-i64 closure 7)`. Wrong result families and unknown lambda
+ids still trap rather than coerce.
+
 ### P1 — vocabulary and module consistency
 
 - Document the four distinct sequence concepts where they first appear rather
@@ -132,6 +140,7 @@ lexically. Bounded documents are authored as inert data, option flow is
 idiomatic, lexical closures use ordinary application, and effects remain
 qualified and visible. The remaining callable-value debt is narrower:
 computed expression heads and explicit top-level function values still expose
-`invoke`/`fn-ref`, and closure result dispatch currently owns only `:i64` and
-`:bool`. Extending those result families is more valuable than adding new
-punctuation or weakening closed-world call resolution.
+`invoke`/`fn-ref`. Closure result dispatch now owns `:i64`, `:bool`, and
+`:vector-i64`; string, record, option/result, and other structured families
+remain explicit future work. Extending those families is more valuable than
+adding punctuation or weakening closed-world call resolution.

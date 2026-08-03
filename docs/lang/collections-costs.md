@@ -54,6 +54,7 @@ must not assume amortized O(1) assoc or log-time random access.
 | `(map (fn [x y] …) a b)` / `(map named-binary a b)` | 2-source; stops at **shortest** collection |
 | `(map (fn [a b c d e] …) a b c d e)` / named equivalent | Named/inline callbacks scale through 5 sources; 3–5 vector handles share one bounded typed state value; stops at **shortest** collection |
 | `(map stored-closure a …)` | Stored closure callbacks scale through 4 sources so callback + helper state remain inside the five-parameter ABI |
+| `(let [singleton (fn [x] [x])] (map inc (singleton 3)))` | A lexical closure in a known vector context selects the closed `:vector-i64` result dispatcher |
 | `(filter (fn [x] pred) v)` / `(filter named-pred v)` | pred used as `if` test |
 
 Still gated: five-source stored-closure `map` and typed-map transform sugar.
@@ -61,5 +62,5 @@ Still gated: five-source stored-closure `map` and typed-map transform sugar.
 
 ## Follow-ups
 
-- T4.5 residual: typed-map transform sugar and closure result families beyond i64/bool
+- T4.5 residual: typed-map transform sugar and closure result families beyond i64/bool/vector-i64
 - T1.3 full matrix still progressive for collection fixtures

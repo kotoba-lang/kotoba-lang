@@ -29,6 +29,7 @@
                                              (:file tc)))
                          result (case (:type tc)
                                   :host-dispatch (host/check-case tc data)
+                                  :component-binding (host/check-binding-case tc data)
                                   :cacao-grants (cacao/check-case tc data)
                                   (caps/check-case tc data))]
                      (if (:ok? result)
