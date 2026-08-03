@@ -89,34 +89,42 @@
 ;; sections
 
 (def intro-cards
-  [["Clojure-shaped, not Clojure"
-    "Source is an EDN/Lisp subset with its own contract."
-    (str ".kotoba is the canonical extension; .cljc is common source across "
-         "Clojure, ClojureScript and Kotoba. This is a source profile with its "
-         "own compatibility contract — not \"any JVM Clojure program runs\".")]
-   ["Nothing is ambient"
-    "Capability confinement is the first principle."
-    (str "A component reaches a resource only through a capability it was "
-         "explicitly handed. Effects are declared imports, the effective scope "
-         "is requested ∩ delegated ∩ local policy, and every attempt is "
-         "receipted. An ungranted capability is not merely refused — it is "
-         "absent and unbound.")]
-   ["WebAssembly components"
-    "The execution boundary is a component, not a process."
+  [["1 · Identity by content"
+    "A definition is named by what it means, not by what it was called."
+    (str "The identity is computed after desugar, type checking, effect "
+         "inference and ability elaboration — and it seals the effect row, so "
+         "a pure definition and one requiring network authority can never "
+         "share a name. Unison's idea; not Unison's syntax and not a global "
+         "codebase.")]
+   ["2 · Memory safety, as a consequence"
+    "The thesis is confinement. Memory safety falls out of it."
+    (str "Admitted components cannot address runtime or native memory, and "
+         "component memory operations are bounded or trap. That holds without "
+         "a general ownership/borrow system: affine consumption is scoped to "
+         "capability values alone, because what a program must not forge is "
+         "authority, not pointers.")]
+   ["3 · Component-first execution"
+    "The unit that runs is a Wasm component, not a process."
     (str "Each component gets its own WIT world built from its declared "
          "effects. Undeclared imports are rejected and there is no ambient "
-         "WASI. The tender links and instantiates; it binds only what was "
-         "granted.")]])
+         "WASI. The tender links and instantiates, binding only what policy "
+         "granted. Native AOT for ordinary applications is an explicit "
+         "non-goal — the boundary is the point.")]])
 
 (defn intro-section []
   (ui/section
-   {:title "What Kotoba is" :wide true}
+   {:title "Three things to know" :wide true}
    (ui/grid
     {:min "280px"}
     (for [[title lede body] intro-cards]
       (ui/panel [[:h3 {:class "hig-headline"} title]
                  [:p {:class "hig-callout kot-lede"} lede]
-                 [:p {:class "hig-subheadline"} body]])))))
+                 [:p {:class "hig-subheadline"} body]])))
+   (caption
+    (str "Kotoba source is an EDN/Lisp subset: .kotoba is the canonical "
+         "extension and .cljc is common source across Clojure, ClojureScript "
+         "and Kotoba. It is a source profile with its own compatibility "
+         "contract — not \"any JVM Clojure program runs\"."))))
 
 (def ladder
   [["S" "capability sandbox + deny-by-default + reproducible, verified build"
@@ -127,11 +135,14 @@
 
 (defn thesis-section []
   (ui/section
-   {:title "Why a linter is not a wall"}
+   {:title "Memory safety is a consequence, not the thesis"}
    [:p {:class "hig-body"}
-    "The safest program is not the one written in the strongest type system. "
-    "It is the one that, when it is fully compromised, can still do nothing. "
-    "So Kotoba ranks confinement above ownership:"]
+    "Most safe-language pitches begin and end with memory. Kotoba treats that "
+    "as necessary and insufficient: a program that cannot corrupt memory but "
+    "can still open a socket it was never given has not been contained. The "
+    "safest program is not the one written in the strongest type system — it "
+    "is the one that, when it is fully compromised, can still do nothing. So "
+    "confinement is ranked above ownership:"]
    (ui/list-view
     (for [[grade text note] ladder]
       (ui/list-row
@@ -141,12 +152,18 @@
     "Against a mythos-class adversarial agent, a linter's red underline is a "
     "polite signpost. When something comes through the wall, the only thing "
     "that works is to have kept nothing outside it."]
+   [:p {:class "hig-body"}
+    "This is why there is no borrow checker over every value. T1 — admitted "
+    "components cannot address runtime or native memory, and component memory "
+    "operations are bounded or trap — is met by the admitted grammar and the "
+    "runtime, not by an ownership system. Affine consumption exists, but only "
+    "where forging a duplicate would create authority: a capability value may "
+    "be consumed at most once per execution path."]
    (caption
-    (str "The ladder and this framing are the language's own accepted design "
-         "position (ADR — safe capability language). Memory safety is a "
-         "consequence here, not the thesis: T1 is met without a general "
-         "ownership/borrow system, and affine consumption is deliberately "
-         "scoped to capability values alone."))))
+    (str "The ladder is the language's own accepted design position (ADR — "
+         "safe capability language). What it does not claim: the Wasm runtime "
+         "engine stays inside the trusted computing base, and native loaders "
+         "still require a second OS isolation boundary."))))
 
 (def source-example
   "(ns example.greet)\n\n(defn greeting [name :string] :string\n  (string-concat \"hello, \" name))\n\n(defn main [] :string\n  (greeting \"kotoba\"))")
@@ -242,7 +259,7 @@
   (let [{:keys [component-model wasi]} (:upstream platform)
         world (:world platform)]
     (ui/section
-     {:title "The platform it targets" :wide true}
+     {:title "Component-first, and what that rules out" :wide true}
      (ui/grid
       {:min "280px"}
       (ui/panel
@@ -302,28 +319,59 @@
                                "resource scope, quota and deadline — not for "
                                "ordinary calls."))])))))
 
+(def stage-titles
+  {:ci0 "the contract"
+   :ci1 "canonical typed-KIR encoding and identity test vectors"
+   :ci2 "definition-addressed manifest fields and positive fixtures"
+   :ci3 "negative fixtures for every sealed input"
+   :ci4 "safe-build verifies identity against the package lock"
+   :ci5 "typed ability/effect checking and the narrow WIT ABI"
+   :ci6 "cross-implementation conformance"
+   :ci7 "friendly source operations elaborate identically"})
+
 (defn identity-section []
-  (ui/section
-   {:title "Identity by content, without the Unison surface"}
-   [:p {:class "hig-body"}
-    "Kotoba takes Unison's idea — a definition is named by what it is, not by "
-    "the label someone typed above it — and deliberately leaves the rest. "
-    "A definition identity is computed after desugar, type and effect checking, "
-    "and ability elaboration; source formatting, package name and git ref are "
-    "excluded from it."]
-   [:p {:class "hig-body"}
-    "What is explicitly " [:em "not"] " adopted, from "
-    (code "lang/code-identity.edn") ":"]
-   [:p {:class "kot-chips"}
-    (for [g (sort-by name (:non-goals identity-spec))]
-      (ui/chip (name g)))]
-   (caption
-    (str "Status is honest about staging: the semantic-identity slice "
-         "(canonical DAG-CBOR, CIDv1, de Bruijn binders, dependency links, "
-         "namespace commits) is implemented and tested in kotoba-lang/kotoba; "
-         "the typed definition-CID after elaboration is specified and largely "
-         "pending. Hash-native authoring, browse-by-hash and a deployed "
-         "codebase network are not claimed."))))
+  (let [{:keys [canonical-input]} (get-in identity-spec [:identities :definition-cid])
+        impl (:implementation identity-spec)]
+    (ui/section
+     {:title "Identity by content, without the Unison surface" :wide true}
+     [:p {:class "hig-body"}
+      "Kotoba takes Unison's idea — a definition is named by what it is, not "
+      "by the label someone typed above it — and deliberately leaves the rest. "
+      "The identity is computed "
+      [:em "after"]
+      " desugar, type checking, effect inference and ability elaboration, so "
+      "it names normalized semantics rather than text. Source formatting, "
+      "package name and git ref are excluded."]
+     [:p {:class "hig-body"} "What the identity seals:"]
+     [:p {:class "kot-chips"}
+      (for [k canonical-input] (ui/chip (name k)))]
+     [:p {:class "hig-body"}
+      "The effect row is in that list for a concrete reason. Without it, a "
+      "pure definition and one requiring "
+      (code ":host/http")
+      " with identical KIR hash to the same identity — so a lock pinning the "
+      "pure one would admit the effectful one. There is a negative fixture for "
+      "exactly that substitution."]
+     [:p {:class "hig-body"} "What is explicitly " [:em "not"] " adopted:"]
+     [:p {:class "kot-chips"}
+      (for [g (sort-by name (:non-goals identity-spec))]
+        (ui/chip (name g)))]
+     [:h3 {:class "hig-headline kot-stage-heading"} "Delivery stages"]
+     (ui/list-view
+      (for [[stage {:keys [status remaining note]}] (sort-by key impl)]
+        (ui/list-row
+         [:div
+          [:p {:class "hig-headline"}
+           (clojure.string/upper-case (name stage)) " — " (get stage-titles stage)]
+          [:p {:class "hig-footnote kot-muted"} (or note remaining)]]
+         {:trailing (ui/badge (name status))})))
+     (caption
+      (str "Read from lang/code-identity.edn at build time, so this table "
+           "cannot claim more than the repository does. The ADR's own rule is "
+           "that until CI4 and CI5 both land the design is described as "
+           "proposed — CI4 has landed and CI5 has not, so proposed is what it "
+           "is. Hash-native authoring, browse-by-hash and a deployed codebase "
+           "network are not claimed at all.")))))
 
 (defn status-section []
   (ui/section
@@ -389,6 +437,7 @@
        "color:var(--hig-color-secondary-label)}"
        ".kot-list li{margin-block:var(--hig-spacing-1)}"
        ".kot-chips{display:flex;flex-wrap:wrap;gap:var(--hig-spacing-2)}"
+       ".kot-stage-heading{margin-top:var(--hig-spacing-7)}"
        ".kot-link{color:var(--hig-color-tint)}"
        ".kot-cta{display:inline-flex;align-items:center;min-height:44px;"
        "padding:0 var(--hig-spacing-4);border-radius:var(--hig-radius-capsule);"
