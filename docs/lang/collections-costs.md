@@ -52,12 +52,14 @@ must not assume amortized O(1) assoc or log-time random access.
 | `(reduce + 0 v)` / `(reduce (fn [a x] …) 0 v)` / `(reduce named-binary 0 v)` | Folds; empty → init; named = arity-2 module `defn` |
 | `(map (fn [x] …) v)` / `(map inc v)` / `(map named-unary v)` | Builds new vector-i64; named = arity-1 module `defn` |
 | `(map (fn [x y] …) a b)` / `(map named-binary a b)` | 2-source; stops at **shortest** collection |
+| `(map (fn [a b c d e] …) a b c d e)` / named equivalent | Named/inline callbacks scale through 5 sources; 3–5 vector handles share one bounded typed state value; stops at **shortest** collection |
+| `(map stored-closure a …)` | Stored closure callbacks scale through 4 sources so callback + helper state remain inside the five-parameter ABI |
 | `(filter (fn [x] pred) v)` / `(filter named-pred v)` | pred used as `if` test |
 
-Still gated: 3+ source `map`, first-class stored closures, typed-map transform sugar.
+Still gated: five-source stored-closure `map` and typed-map transform sugar.
 `inc`/`dec` desugar to arithmetic.
 
 ## Follow-ups
 
-- T4.5 residual: multi-source map / named HOF / pair-chain only when dual-backend tested  
+- T4.5 residual: typed-map transform sugar and closure result families beyond i64/bool
 - T1.3 full matrix still progressive for collection fixtures
