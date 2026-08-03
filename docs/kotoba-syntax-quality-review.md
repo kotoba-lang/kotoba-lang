@@ -153,11 +153,19 @@ genuinely computed head, the full descriptor remains visible, for example
 `(invoke [:option :string] closure 42)`. That explicitness is useful honesty at
 the dynamic boundary, not syntax noise on the common path.
 
+Canonical typed lists follow the same rule. In ordinary source the constructor
+remains the familiar `(list ...)`; a surrounding `[:list T]` result context
+selects the canonical boundary representation without exposing the internal
+`typed-list-new` KIR operation. Only a genuinely computed call spells the
+boundary choice, for example `(invoke [:list :i64] closure 42)`. This is a good
+division of syntax: construction stays data-shaped, while representation is
+made explicit exactly where static call-head inference cannot recover it.
+
 The current descriptor profile is deliberately bounded by fail-closed trap
 generation: a result descriptor is admitted only when the compiler can build a
 typed fallback value for an unknown or wrong-family closure. Descriptors whose
-members have no such inhabitant yet (notably bytes, linear resources, and some
-list shapes) remain a maturity gap rather than silently weakening dispatch.
+members have no such inhabitant yet (notably bytes and linear resources) remain
+a maturity gap rather than silently weakening dispatch.
 
 Multi-expression `do` is now portable through the restricted ESM path as well
 as the reference and Wasm paths. Its non-tail expressions are evaluated in
@@ -231,9 +239,11 @@ result family that currently has a safe portable default, and effects remain
 qualified and visible. Computed expression heads and explicit top-level
 function values still expose `invoke`/`fn-ref`; the former accepts a complete
 descriptor so nominal and parameterized types remain honest at that boundary.
-The remaining result-family gap is confined to bytes, linear resources, and
-list shapes for which typed trap generation cannot yet construct a truthful
-portable fallback. Closure-valued parameters, captures, and results are now
+The remaining result-family gap is confined to bytes and linear resources, for
+which typed trap generation cannot yet construct a truthful portable fallback.
+Canonical typed lists retain ordinary `(list ...)` construction and expose
+`[:list T]` only at an explicit computed-call boundary. Closure-valued
+parameters, captures, and results are now
 inferred and checked across KIR, restricted ESM, and Wasm within a closed
 module. The remaining higher-order design gap is an explicit callable contract
 for unconstrained exported library functions. With multi-expression `do`
