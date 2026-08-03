@@ -62,5 +62,8 @@ Still gated: five-source stored-closure `map` and typed-map transform sugar.
 
 ## Follow-ups
 
-- T4.5 residual: typed-map transform sugar and closure result families beyond i64/bool/vector-i64
+- T4.5 residual: typed-map transform sugar; closure result families are closed
+  for heterogeneous vectors, typed sets/maps, records, variants, options, and
+  results, while bytes, linear resources, and unsupported list shapes remain
+  gated by typed trap fallback representation
 - T1.3 full matrix still progressive for collection fixtures
