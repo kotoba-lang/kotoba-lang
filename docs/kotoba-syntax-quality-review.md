@@ -15,9 +15,9 @@ authority.
 
 The syntax is not yet uniformly beautiful at representation boundaries.
 Computed first-class function invocation still exposes its result descriptor,
-while lexical scalar, predicate, vector, document, record, option, result,
-variant, heterogeneous-vector, typed-set, and typed-map producing calls stay
-direct in known result contexts. Document
+while lexical integer, f32/f64, predicate, vector-i64/vector-f64, document,
+record, option, result, variant, heterogeneous-vector, typed-set, and typed-map
+producing calls stay direct in known result contexts. Document
 construction and generic option fallback use contextual/type-directed
 elaboration into existing typed primitives rather than new runtime
 representations or punctuation-heavy syntax.
@@ -132,6 +132,13 @@ declared `:document` result carries through `let`, `if`, and `do` tails.
 Document-map keys deliberately remain explicit when their type is ambiguous
 between keyword and document; computed heads use `(invoke :document ...)`.
 
+The flat dispatcher profile also covers `:f32`, `:f64`, and `:vector-f64`.
+Numeric operations, comparisons, conversions, and vector-f64 consumers provide
+the expected result context, so ordinary lexical calls remain `(decode bits)`
+or `(samples bits)` rather than spelling a descriptor at each use. Explicit
+computed calls remain `(invoke :f64 closure bits)`, with a wrong numeric family
+trapping before any typed default can escape.
+
 The dispatcher is now keyed by the complete canonical result descriptor for
 nominal records and variants, `[:option T]`, `[:result T E]`, heterogeneous
 vectors, typed sets, and typed maps. Their constructors, projections,
@@ -157,7 +164,10 @@ as the reference and Wasm paths. Its non-tail expressions are evaluated in
 order and cannot be optimized away, while the final expression keeps its typed
 closure result context. The web representation also guards the compiler's
 reserved closure dispatcher handle as the physical pair it is, without
-weakening ordinary i64 parameter guards.
+weakening ordinary i64 parameter guards. A closure value captured by another
+closure still reaches a restricted-ESM helper through the legacy i64 capture
+guard; KIR and Wasm execute it, but ESM rejects the physical pair. That gap must
+be fixed with explicit checked KIR capture typing, not a permissive JS guard.
 
 ### P1 — vocabulary and module consistency
 
@@ -185,8 +195,9 @@ result family that currently has a safe portable default, and effects remain
 qualified and visible. Computed expression heads and explicit top-level
 function values still expose `invoke`/`fn-ref`; the former accepts a complete
 descriptor so nominal and parameterized types remain honest at that boundary.
-The remaining callable gap is confined to bytes, linear resources, and list
-shapes for which typed trap generation cannot yet construct a truthful portable
-fallback. With multi-expression `do` portable, the remaining aesthetic friction
-is concentrated at genuinely computed callable boundaries rather than ordinary
-lexical calls or sequencing.
+The remaining result-family gap is confined to bytes, linear resources, and
+list shapes for which typed trap generation cannot yet construct a truthful
+portable fallback. Restricted ESM also still needs explicit KIR typing for a
+closure value captured by another closure. With multi-expression `do` portable,
+the remaining aesthetic friction is concentrated at genuinely computed
+callable boundaries rather than ordinary lexical calls or sequencing.
