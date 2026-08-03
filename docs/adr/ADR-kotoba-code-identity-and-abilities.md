@@ -190,9 +190,11 @@ that file, not this paragraph, is the current state.  Accepted describes the
 delivery stages, not a claim that nothing remains — three risks are worth
 naming here because they bound what the design now guarantees:
 
-- **Provenance does not survive project linking.**  Modules are analyzed before
-  linking, so a diagnostic raised during a project build cannot point back at
-  the friendly operation the author wrote.
+- **Source spans still refer to the linked intermediate.**  The friendly
+  operation name now survives linking, so a project-build diagnostic can name
+  the operation — but the span points into the linked source, not the module
+  the author wrote.  Closing that needs a source map from linked positions back
+  to module positions.
 - **The `typed-capability-v3` WIT profile is JVM-only** and is therefore the one
   part of the WIT layer with no cross-implementation evidence.
 - **Receipts are compared field-wise, not hashed**, so receipt bytes are not yet
