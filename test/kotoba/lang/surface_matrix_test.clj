@@ -19,6 +19,20 @@
     (is (str/includes? md "`no-ambient-authority`"))
     (is (str/includes? md "WBS: **T2.2**"))))
 
+(deftest computed-invoke-keeps-dynamic-heads-visible-without-redundant-types
+  (let [surface (sm/load-surface-status)
+        closure (get-in surface [:other-gaps :first-class-closure-values])]
+    (is (= "(invoke closure zero-to-four-args) in a closed typed result context"
+           (get-in closure [:syntax :contextual-typed-computed-call])))
+    (is (= :i64
+           (get-in closure [:computed-invoke-result-context
+                            :fallback-without-context])))
+    (is (= :accepted-when-ambiguous
+           (get-in closure [:computed-invoke-result-context
+                            :explicit-descriptor])))
+    (is (some #{:contextual-computed-invoke-result-inference}
+              (:supports closure)))))
+
 (deftest on-disk-matrix-matches-regenerated
   (let [r (sm/check-matrix!)]
     (is (true? (:ok? r))
