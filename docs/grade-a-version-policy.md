@@ -13,8 +13,11 @@
 Release-tag signatures bind version, commit, tree, source-root digest, and
 issuance time. Verification requires an active signer from an external trust
 store and Ed25519 proof; changed tags, versions, commits, trees, roots,
-signatures, or revoked signers fail closed. Package manifests and dependency
-lock entries use the same strict SemVer syntax.
+signatures, or revoked signers fail closed. The verifier and release admission
+gate are owned by [`kotoba-lang/release`](https://github.com/kotoba-lang/release),
+which consumes this repository's policy rather than defining language
+semantics. Package manifests and dependency lock entries use the same strict
+SemVer syntax.
 
 ```sh
 clojure -M:compatibility 4 1 0.4.0
@@ -37,4 +40,3 @@ release hard gate; it does not weaken this compatibility contract.
 | Release notes | mention `lang/surface-status.edn` / surface-matrix when surface changes |
 
 Current release binds **language-profile 4** (active) and package-contract **1**.
-

@@ -1,11 +1,8 @@
 (ns kotoba.lang.version-policy
-  "Machine-enforced release, support, deprecation, and signed-tag policy."
-  (:require [clojure.edn :as edn]
-            [clojure.string :as str]
-            [ed25519.core :as ed])
+  "Machine-enforced language support, deprecation, and compatibility policy."
+  (:require [clojure.edn :as edn])
   (:import [java.time LocalDate]
-           [java.time.temporal ChronoUnit]
-           [java.util Base64]))
+           [java.time.temporal ChronoUnit]))
 
 (def policy-path "lang/version-policy.edn")
 
@@ -94,40 +91,6 @@
     {:format-version (get-in policy [:compatibility-report :format-version])
      :compatible? (every? :allowed? checks)
      :checks (vec (sort-by (comp str :axis) checks))}))
-
-(defn canonical-tag-body [envelope]
-  (pr-str (into (sorted-map) (dissoc envelope :signature))))
-
-(defn verify-release-tag
-  "Verify tag shape, v<semver>, complete content binding, signer trust/status,
-   and Ed25519 signature. TRUST maps DID to {:status :active}."
-  [policy trust envelope]
-  (let [version (:version envelope)
-        signer (:signer envelope)
-        tag (:tag envelope)
-        required (get-in policy [:release-tags :binds])
-        body (canonical-tag-body envelope)
-        signature (try (.decode (Base64/getDecoder)
-                                ^String (:signature envelope))
-                       (catch Exception _ nil))
-        missing (remove #(contains? envelope %) required)
-        code (cond
-               (nil? (parse-semver version)) :tag/invalid-version
-               (not= tag (str (get-in policy [:release-tags :prefix])
-                              version)) :tag/name-mismatch
-               (seq missing) :tag/incomplete-binding
-               (not= :active (get-in trust [signer :status]))
-               :tag/signer-untrusted
-               (nil? signature) :tag/invalid-signature
-               (not (try
-                      (ed/verify-did signer (.getBytes body "UTF-8")
-                                     signature)
-                      (catch Exception _ false)))
-               :tag/invalid-signature
-               :else nil)]
-    {:valid? (nil? code) :code code :tag tag :version version
-     :signer signer}))
-
 
 (defn current-profile-ids
   "Active language-profile and package-contract bound to :release/current (T10.1)."
