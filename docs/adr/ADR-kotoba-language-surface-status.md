@@ -185,9 +185,16 @@ arity zero through four. An explicit form is used instead of silently treating
 value-position symbols as functions, because lexical bindings may shadow a
 top-level name. Computed calls remain explicit `(invoke f ...)`; this is an
 intentional inspectability simplification rather than an absent call mechanism.
-An exported higher-order function with no constraining use inside its compiled
-module remains an open boundary: the current public signature surface has no
-closure type with which to declare its parameter and result contract.
+An exported callable parameter or result uses the public descriptor
+`[:fn [parameter-types result-type] ...]`: one to five unique clauses, arity
+zero through four. The initial ABI-neutral profile admits only `:i64`
+parameters; results may use any non-linear type supported by the closed
+dispatcher profile. The descriptor remains source/interface data and lowers to
+physical i64 plus checked closure refinements. Project linking assigns disjoint
+module lambda-ID ranges and emits one bounded router per arity/result family,
+so cross-module calls require neither synthetic handles nor ambient dynamic
+dispatch. Callable and linear-resource results remain rejected until they have
+a truthful ownership-aware representation.
 
 ## Intentional constraints
 

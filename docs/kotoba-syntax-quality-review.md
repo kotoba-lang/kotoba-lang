@@ -32,7 +32,7 @@ representations or punctuation-heavy syntax.
 | Collection vocabulary | Mostly coherent | literal/vector/list/set operations are familiar, but source list, pair-chain list, typed `[:list T]`, and document list need careful documentation |
 | Document values | Strong | arbitrary bounded EDN map keys, canonical bytes, sets/lists/symbols, contextual `(document {...})` authoring, and KIR/ESM/Wasm/NBB parity are complete |
 | Binary values | Coherent bounded foundation | `(bytes)` is the canonical empty value; `:bytes` crosses checked KIR/ESM/Wasm closure boundaries; nonempty payloads remain explicit typed host/provider inputs |
-| Higher-order calls | Strong inside a closed module; explicit at computed and open-module boundaries | a lexical closure uses ordinary `(f ...)`; fixed-point inference checks ordinary closure parameters/captures/results; `invoke` remains for computed heads and public closure signatures remain undesigned |
+| Higher-order calls | Strong across closed and project-module boundaries; explicit for computed heads | a lexical closure uses ordinary `(f ...)`; `[:fn [params result] ...]` is the bounded public contract; `invoke` remains for computed heads |
 | Failure/effect semantics | Strong | unsupported syntax, undeclared effects, oversized expansion, and host authority fail closed |
 
 ## Preserve
@@ -202,20 +202,31 @@ fail-closed: candidate-specific dispatcher arguments are not globally promoted,
 malformed closure values trap, and the nullable zero sentinel used by lazy
 sequences is preserved only on the proven nonzero branch.
 
-### P1 — open-module callable signatures
+### Completed — open-module callable signatures
 
-The next syntax decision is not how to make ordinary calls shorter; that path
-is already direct. It is how an exported library function such as
-`(defn identity [f] f)` declares its contract when no use in the same module
-constrains `f`. Closed-module inference cannot truthfully choose closure versus
-scalar at that boundary, and Kotoba currently has no public closure type.
+An unconstrained exported higher-order function now declares the same
+data-shaped contract used by the rest of Kotoba's value types:
 
-Prefer extending the existing signature data model with one canonical bounded
-callable descriptor over adding call punctuation or implicit dynamic dispatch.
-The descriptor must include admitted arities and result descriptors, remain
-inert data, and lower to the same checked KIR metadata. Until that contract is
-designed and verified across packages, unconstrained open-module higher-order
-exports remain an explicit maturity gap rather than being guessed as closures.
+```clojure
+(defn apply-one [f [:fn [[:i64] :i64]] x :i64] :i64 (f x))
+(defn make-renderer [] [:fn [[:i64] :string]]
+  (fn [x] (string-from-i64 x)))
+```
+
+Each `[:fn ...]` contains one to five unique arity clauses; a clause is
+`[parameter-types result-type]`, and callable arity remains zero through four.
+The first profile admits only i64 parameters, matching the real closure ABI,
+while every non-linear result family with a safe dispatcher is available.
+Callable and linear-resource results are rejected rather than represented by a
+synthetic handle.
+
+The descriptor is inert public contract data. It lowers to physical i64 plus
+the existing checked closure refinements; KIR and Wasm gain no second function
+representation. Project interfaces preserve the descriptor. The linker assigns
+disjoint lambda-ID ranges to modules and emits one bounded router for each
+arity/result family, so a library closure genuinely executes across the module
+boundary. Wrong arity, result family, malformed handles, and dishonest literal
+`fn` implementations fail closed.
 
 ### P1 — vocabulary and module consistency
 
@@ -247,10 +258,11 @@ The remaining result-family gap is confined to linear resources, for which
 typed trap generation cannot construct a truthful portable fallback.
 Canonical typed lists retain ordinary `(list ...)` construction and expose
 `[:list T]` only at an explicit computed-call boundary. Closure-valued
-parameters, captures, and results are now
-inferred and checked across KIR, restricted ESM, and Wasm within a closed
-module. The remaining higher-order design gap is an explicit callable contract
-for unconstrained exported library functions. With multi-expression `do`
-portable, the aesthetic friction is concentrated at genuinely computed or
-open-module callable boundaries rather than ordinary lexical calls or
-sequencing.
+parameters, captures, and results are inferred inside a closed module and
+explicitly contracted at an open-module boundary across KIR, restricted ESM,
+and Wasm. The `[:fn ...]` spelling is consistent with `[:option T]` and
+`[:result T E]`, while ordinary calls remain `(f x)` and the physical ABI stays
+hidden. With multi-expression `do` portable, the remaining aesthetic friction
+is concentrated at genuinely computed calls (`invoke`) and explicit top-level
+function conversion (`fn-ref`), not ordinary lexical calls, module composition,
+or sequencing.

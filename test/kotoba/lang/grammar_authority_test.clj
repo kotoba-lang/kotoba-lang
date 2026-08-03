@@ -69,3 +69,14 @@
                :semantic-cid :elaboration-pipeline :code-identity
                :portable-effect]]
       (is (integer? (get versions k)) k))))
+
+(deftest public-callable-contract-is-bounded-and-abi-neutral
+  (let [grammar (auth/read-edn auth/grammar-path)
+        callable (:callable-type grammar)]
+    (is (= 6 (:kotoba.lang.guest-grammar/profile-version grammar)))
+    (is (= "[:fn [parameter-types result-type] ...]" (:syntax callable)))
+    (is (= {:min 1 :max 5 :unique-by :arity} (:clauses callable)))
+    (is (= {:min 0 :max 4} (:arity callable)))
+    (is (= #{:i64} (:parameter-types callable)))
+    (is (= :i64 (:physical-abi callable)))
+    (is (= :project-interface-preserved (:module-boundary callable)))))
