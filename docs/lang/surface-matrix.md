@@ -8,7 +8,7 @@ Check: `clojure -M -m kotoba.lang.surface-matrix --check`
 |---|---|
 | surface-status version | 1 |
 | profile version | 5 |
-| as-of | 2026-07-30 |
+| as-of | 2026-08-03 |
 | authority ADR | `docs/adr/ADR-kotoba-language-surface-status.md` |
 
 WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source.
@@ -40,6 +40,7 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 
 | Surface | Disposition | Backends | Note / reason |
 |---|---|---|---|
+| `contextual-document-literal` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `map-function` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | Do not diagnose this as lack of map literals; the implemented slice is eager and fuel-bounded. |
 | `map-literal` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | :intentional-persistent-pair-chain-not-hamt |
 | `persistent-collection-semantics` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
