@@ -190,7 +190,12 @@
             component never declared."
     (let [receipt {:format :kotoba.wit-package/v1
                    :target :wasm-component-kotoba-v1
-                   :imports [:component/http]}
+                   :imports [:component/http]
+                   ;; Emitted by kotoba.component.wit/emit; the binder reads
+                   ;; this rather than assuming which guard is required.
+                   :host-binding {:contract host/host-binding-contract
+                                  :required-guard host/required-guard
+                                  :imports {:component/http host/required-guard}}}
           bound (host/bind-component-imports receipt {:component/http identity})]
       (is (true? (:ok? bound)))
       (is (= #{:component/http} (set (keys (:dispatch bound)))))
