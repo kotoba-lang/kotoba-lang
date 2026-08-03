@@ -123,6 +123,13 @@ ordinary lexical call, including through a declared library boundary. A
 computed closure head remains explicit as `(invoke :string closure 42)`, and a
 wrong-family closure still traps closed.
 
+The same closed rule now covers `:document`. Document consumers and
+unambiguous document constructor positions select the document dispatcher, so
+`(document-count (build 42))` remains ordinary lexical application and a
+declared `:document` result carries through `let`, `if`, and `do` tails.
+Document-map keys deliberately remain explicit when their type is ambiguous
+between keyword and document; computed heads use `(invoke :document ...)`.
+
 ### P1 — vocabulary and module consistency
 
 - Document the four distinct sequence concepts where they first appear rather
@@ -148,6 +155,7 @@ idiomatic, lexical closures use ordinary application, and effects remain
 qualified and visible. The remaining callable-value debt is narrower:
 computed expression heads and explicit top-level function values still expose
 `invoke`/`fn-ref`. Closure result dispatch now owns `:i64`, `:bool`, `:string`,
-and `:vector-i64`; record, option/result, document, and other structured
-families remain explicit future work. Extending those families is more
-valuable than adding punctuation or weakening closed-world call resolution.
+`:vector-i64`, and `:document`. The remaining structured callable-value work
+is descriptor-keyed: nominal records and parameterized option/result values
+cannot honestly share one untyped dispatcher family. Adding that descriptor
+layer is more valuable than punctuation or weaker closed-world resolution.
