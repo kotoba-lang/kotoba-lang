@@ -111,6 +111,7 @@
         from-lazy-ops (map as-sym (or (:operations entry) #{}))
         named (case (as-kw feature-key)
                 :map-literal '[get assoc]
+                :contextual-document-literal '[document]
                 :vector-literal '[]
                 :set-literal '[contains? conj disj]
                 :map-function '[map]
