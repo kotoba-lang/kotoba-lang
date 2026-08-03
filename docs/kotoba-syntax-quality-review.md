@@ -14,11 +14,12 @@ recognizable Clojure-shaped language without inheriting ambient Clojure/JVM
 authority.
 
 The syntax is not yet uniformly beautiful at representation boundaries.
-Computed first-class function invocation still exposes lowering details, while
-lexical scalar, predicate, and vector-producing calls now stay direct in their
-known result contexts. Document construction and generic option fallback use
-contextual/type-directed elaboration into existing typed primitives rather than
-new runtime representations or punctuation-heavy syntax.
+Computed first-class function invocation still exposes its result descriptor,
+while lexical scalar, predicate, vector, document, record, option, and
+result-producing calls stay direct in known result contexts. Document
+construction and generic option fallback use contextual/type-directed
+elaboration into existing typed primitives rather than new runtime
+representations or punctuation-heavy syntax.
 
 ## Evidence-based scorecard
 
@@ -130,6 +131,25 @@ declared `:document` result carries through `let`, `if`, and `do` tails.
 Document-map keys deliberately remain explicit when their type is ambiguous
 between keyword and document; computed heads use `(invoke :document ...)`.
 
+The dispatcher is now keyed by the complete canonical result descriptor for
+nominal records, `[:option T]`, and `[:result T E]`. A record constructor,
+projection, update, equality check, option/result constructor or match arm gives
+a lexical call enough context to remain `(f ...)`; declared result boundaries
+and result-typed `fn-ref` values carry the same context. Different nominal
+records and differently parameterized option/result values never share a
+dispatcher. At a genuinely computed head, the full descriptor remains visible,
+for example `(invoke [:option :string] closure 42)`. That explicitness is a
+useful honesty at the dynamic boundary, not syntax noise on the common path.
+
+The current descriptor profile is deliberately bounded by fail-closed trap
+generation: a result descriptor is admitted only when the compiler can build a
+typed fallback value for an unknown or wrong-family closure. Descriptors whose
+members have no such inhabitant yet (notably bytes, linear resources, and some
+list shapes) remain a maturity gap rather than silently weakening dispatch.
+Also, frontend result context propagates through a `do` tail, but the
+`kotoba-script` path still rejects a multi-expression `do` KIR operation. Until
+that backend gap closes, use `let` sequencing in portable authored code.
+
 ### P1 — vocabulary and module consistency
 
 - Document the four distinct sequence concepts where they first appear rather
@@ -151,11 +171,11 @@ between keyword and document; computed heads use `(invoke :document ...)`.
 
 The language has a coherent aesthetic rather than merely resembling Clojure
 lexically. Bounded documents are authored as inert data, option flow is
-idiomatic, lexical closures use ordinary application, and effects remain
-qualified and visible. The remaining callable-value debt is narrower:
-computed expression heads and explicit top-level function values still expose
-`invoke`/`fn-ref`. Closure result dispatch now owns `:i64`, `:bool`, `:string`,
-`:vector-i64`, and `:document`. The remaining structured callable-value work
-is descriptor-keyed: nominal records and parameterized option/result values
-cannot honestly share one untyped dispatcher family. Adding that descriptor
-layer is more valuable than punctuation or weaker closed-world resolution.
+idiomatic, lexical closures use ordinary application across flat and structured
+result types, and effects remain qualified and visible. Computed expression
+heads and explicit top-level function values still expose `invoke`/`fn-ref`;
+the former now accepts a complete descriptor so nominal and parameterized types
+remain honest at that boundary. The highest-value callable gap is no longer
+record/option/result dispatch itself, but extending typed trap fallbacks to the
+remaining descriptor families. The separate multi-expression `do` backend gap
+is now the clearest blemish in otherwise ordinary sequencing syntax.
