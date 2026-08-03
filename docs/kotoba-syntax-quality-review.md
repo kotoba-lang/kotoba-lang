@@ -27,7 +27,7 @@ new runtime representations or punctuation-heavy syntax.
 | Effect visibility | Strong | qualified catalog operations elaborate to declared abilities; ambient interop remains forbidden |
 | Type readability | Strong with one rough edge | signatures read left-to-right; raw descriptors such as `[:option :document]` leak into extraction helpers |
 | Collection vocabulary | Mostly coherent | literal/vector/list/set operations are familiar, but source list, pair-chain list, typed `[:list T]`, and document list need careful documentation |
-| Document authoring | Weak | every scalar currently needs `document-string`, `document-i64`, etc.; nesting multiplies ceremony |
+| Document values | Runtime model strong; authoring weak | arbitrary bounded EDN map keys, canonical bytes, sets/lists/symbols, and KIR/ESM/Wasm/NBB parity are complete; every authored scalar still needs `document-string`, `document-i64`, etc. |
 | Higher-order calls | Adequate, visibly lowered | `fn` is clear; `(invoke f ...)` and `(fn-ref add)` expose static-dispatch machinery |
 | Failure/effect semantics | Strong | unsupported syntax, undeclared effects, oversized expansion, and host authority fail closed |
 
@@ -41,6 +41,20 @@ new runtime representations or punctuation-heavy syntax.
    by admitting host macros, reflection, reader eval, or ambient imports.
 
 ## Improve in priority order
+
+### Completed foundation — one general document map
+
+The remaining bounded-EDN representation gap is closed. A document map now
+uses document nodes for both keys and values; keyword source keys are shorthand
+for keyword document nodes. General keys round-trip canonically across the
+reference evaluator, restricted ESM, JVM Wasm compiler, public NBB fast path,
+and browser host. Existing keyword-map canonical bytes, digests, and budgets
+remain compatible.
+
+This strengthens the contextual-literal recommendation below: `(document
+{...})` can elaborate into the one existing `document-map` representation. It
+does not need a JSON object escape hatch, a second map tag, or backend-specific
+semantics.
 
 ### P0 — contextual document literals
 
@@ -104,9 +118,10 @@ top-level function used in value position.
 ## Current maturity conclusion
 
 The language already has a coherent aesthetic, rather than merely resembling
-Clojure lexically. Its remaining aesthetic debt is concentrated and fixable:
-make safe typed elaboration absorb representation ceremony while retaining
-visible effects and fail-closed bounds. The contextual document literal is the
-highest-leverage next syntax slice because it improves real migrated libraries
-and desugars entirely to primitives that already have KIR, ESM, and Wasm
-conformance.
+Clojure lexically. Its document runtime model is now complete for the bounded
+EDN profile; the remaining debt is source ceremony, not representation or
+backend parity. Make safe typed elaboration absorb that ceremony while
+retaining visible effects and fail-closed bounds. The contextual document
+literal is the highest-leverage next syntax slice because it improves real
+migrated libraries and desugars entirely to primitives that already have KIR,
+ESM, Wasm, and NBB conformance.
