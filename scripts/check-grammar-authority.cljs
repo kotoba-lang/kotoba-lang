@@ -66,6 +66,7 @@
 
 (defn feature-form-hints [feature-key entry]
   (let [named (case (as-kw feature-key)
+                :contextual-document-literal '[document]
                 :map-literal '[get assoc]
                 :vector-literal '[]
                 :set-literal '[contains? conj disj]

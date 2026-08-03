@@ -28,7 +28,7 @@ than new runtime representations or punctuation-heavy syntax.
 | Type readability | Strong | signatures read left-to-right; idiomatic option fallback infers `[:option T]`, while descriptors remain only in low-level ABI forms |
 | Collection vocabulary | Mostly coherent | literal/vector/list/set operations are familiar, but source list, pair-chain list, typed `[:list T]`, and document list need careful documentation |
 | Document values | Strong | arbitrary bounded EDN map keys, canonical bytes, sets/lists/symbols, contextual `(document {...})` authoring, and KIR/ESM/Wasm/NBB parity are complete |
-| Higher-order calls | Adequate, visibly lowered | `fn` is clear; `(invoke f ...)` and `(fn-ref add)` expose static-dispatch machinery |
+| Higher-order calls | Strong for lexical code; explicit at value boundaries | a lexical closure uses ordinary `(f ...)`; `invoke` remains for computed expression heads/result-family selection and `fn-ref` for explicit top-level function values |
 | Failure/effect semantics | Strong | unsupported syntax, undeclared effects, oversized expansion, and host authority fail closed |
 
 ## Preserve
@@ -93,13 +93,20 @@ extraction primitive seen after elaboration, not idiomatic authored source.
 Existing libraries are being migrated incrementally; completion here describes
 the admitted language surface, not zero remaining low-level call sites.
 
-### P1 — statically known callable values
+### Completed — statically known callable values
 
-Investigate type-directed `(f x)` only when `f` is proven to be a bounded
-closure value and cannot be confused with a global operation. Until that proof
-and its diagnostics exist, explicit `(invoke f x)` is safer than introducing
-ambiguous call syntax. `fn-ref` can then become compiler elaboration for a
-top-level function used in value position.
+A symbol proven lexical by function parameters, sequential `let`, `loop`, or
+destructuring now uses ordinary application: `(f x)`. The frontend lowers it
+to the arity-specific static closure dispatcher; boolean positions select the
+boolean result family and a wrong-family closure traps. True special heads
+(`let`, `if`, `do`, `fn`, `loop`, `recur`) remain non-shadowable, while an
+unknown global call head still fails closed instead of becoming a host lookup.
+
+`invoke` remains intentional for a computed/non-symbol closure expression or
+when authored code must select a result family explicitly. `fn-ref` remains
+the explicit conversion of a known top-level function into a value. This keeps
+the common lexical path visually ordinary without pretending that every form
+in call-head position is dynamically callable.
 
 ### P1 — vocabulary and module consistency
 
@@ -120,9 +127,11 @@ top-level function used in value position.
 
 ## Current maturity conclusion
 
-The language already has a coherent aesthetic, rather than merely resembling
-Clojure lexically. Its bounded document model and closed authoring syntax are
-now complete without representation or backend forks. The highest remaining
-syntax debt is statically known callable values: `(invoke f x)` and `(fn-ref
-add)` still expose dispatch machinery. Any further sugar must retain static
-bounded dispatch, visible effects, and unambiguous global operation resolution.
+The language has a coherent aesthetic rather than merely resembling Clojure
+lexically. Bounded documents are authored as inert data, option flow is
+idiomatic, lexical closures use ordinary application, and effects remain
+qualified and visible. The remaining callable-value debt is narrower:
+computed expression heads and explicit top-level function values still expose
+`invoke`/`fn-ref`, and closure result dispatch currently owns only `:i64` and
+`:bool`. Extending those result families is more valuable than adding new
+punctuation or weakening closed-world call resolution.
