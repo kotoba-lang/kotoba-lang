@@ -1,6 +1,6 @@
 # ADR — Unison-inspired code identity and typed abilities
 
-- **Status**: Proposed
+- **Status**: Accepted — CI1–CI7 implemented (2026-08-03); see lang/code-identity.edn for per-stage evidence and residual risks
 - **Date**: 2026-07-25
 - **Artifacts**: `lang/code-identity.edn`, `docs/lang/capability-values.md`,
   `lang/package.edn`
@@ -182,3 +182,18 @@ provider revalidation remain mandatory TCB elements.
 Until CI4 and CI5 land, the design must be described as **proposed**.  Existing
 manifest/tree/component CIDs and current capability gates remain the operative
 security mechanisms.
+
+**2026-08-03 — all of CI1–CI7 are implemented**, so the condition above is met
+and this ADR moves from Proposed to Accepted.  Per-stage evidence and the
+residual risks each stage carries are recorded in `lang/code-identity.edn`;
+that file, not this paragraph, is the current state.  Accepted describes the
+delivery stages, not a claim that nothing remains — three risks are worth
+naming here because they bound what the design now guarantees:
+
+- **Provenance does not survive project linking.**  Modules are analyzed before
+  linking, so a diagnostic raised during a project build cannot point back at
+  the friendly operation the author wrote.
+- **The `typed-capability-v3` WIT profile is JVM-only** and is therefore the one
+  part of the WIT layer with no cross-implementation evidence.
+- **Receipts are compared field-wise, not hashed**, so receipt bytes are not yet
+  a cross-implementation contract.
