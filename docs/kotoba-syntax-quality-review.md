@@ -31,7 +31,7 @@ representations or punctuation-heavy syntax.
 | Type readability | Strong | signatures read left-to-right; idiomatic option fallback infers `[:option T]`, while descriptors remain only in low-level ABI forms |
 | Collection vocabulary | Mostly coherent | literal/vector/list/set operations are familiar, but source list, pair-chain list, typed `[:list T]`, and document list need careful documentation |
 | Document values | Strong | arbitrary bounded EDN map keys, canonical bytes, sets/lists/symbols, contextual `(document {...})` authoring, and KIR/ESM/Wasm/NBB parity are complete |
-| Higher-order calls | Strong for lexical code; explicit at value boundaries | a lexical closure uses ordinary `(f ...)`; `invoke` remains for computed expression heads/result-family selection and `fn-ref` for explicit top-level function values |
+| Higher-order calls | Strong inside a closed module; explicit at computed and open-module boundaries | a lexical closure uses ordinary `(f ...)`; fixed-point inference checks ordinary closure parameters/captures/results; `invoke` remains for computed heads and public closure signatures remain undesigned |
 | Failure/effect semantics | Strong | unsupported syntax, undeclared effects, oversized expansion, and host authority fail closed |
 
 ## Preserve
@@ -164,10 +164,46 @@ as the reference and Wasm paths. Its non-tail expressions are evaluated in
 order and cannot be optimized away, while the final expression keeps its typed
 closure result context. The web representation also guards the compiler's
 reserved closure dispatcher handle as the physical pair it is, without
-weakening ordinary i64 parameter guards. A closure value captured by another
-closure still reaches a restricted-ESM helper through the legacy i64 capture
-guard; KIR and Wasm execute it, but ESM rejects the physical pair. That gap must
-be fixed with explicit checked KIR capture typing, not a permissive JS guard.
+weakening ordinary i64 parameter guards.
+
+Closure boundaries now use the same checked representation. A module-local
+fixed-point pass follows closure values backward and forward through static
+calls, sequential aliases, ordinary parameters, captures, and function
+results. It records canonical closure parameter/result metadata in typed KIR;
+restricted ESM consequently uses `assertClosure` at those boundaries while
+ordinary scalar parameters retain `assertI64`. This keeps higher-order source
+ordinary:
+
+```clojure
+(defn apply-one [f x] (f x))
+(defn identity [f] f)
+(defn wrap [f] (fn [x] (f x)))
+```
+
+Likewise, `(apply f x (list y z))` keeps the familiar source list spelling;
+the compiler records its lowered tail as a bounded i64 pair-chain instead of
+leaking that representation into source syntax or weakening scalar guards.
+
+No `invoke`, ABI tuple destructuring, or closure annotation is needed merely
+because a closure crosses a boundary inside the module. The inference remains
+fail-closed: candidate-specific dispatcher arguments are not globally promoted,
+malformed closure values trap, and the nullable zero sentinel used by lazy
+sequences is preserved only on the proven nonzero branch.
+
+### P1 — open-module callable signatures
+
+The next syntax decision is not how to make ordinary calls shorter; that path
+is already direct. It is how an exported library function such as
+`(defn identity [f] f)` declares its contract when no use in the same module
+constrains `f`. Closed-module inference cannot truthfully choose closure versus
+scalar at that boundary, and Kotoba currently has no public closure type.
+
+Prefer extending the existing signature data model with one canonical bounded
+callable descriptor over adding call punctuation or implicit dynamic dispatch.
+The descriptor must include admitted arities and result descriptors, remain
+inert data, and lower to the same checked KIR metadata. Until that contract is
+designed and verified across packages, unconstrained open-module higher-order
+exports remain an explicit maturity gap rather than being guessed as closures.
 
 ### P1 — vocabulary and module consistency
 
@@ -197,7 +233,10 @@ function values still expose `invoke`/`fn-ref`; the former accepts a complete
 descriptor so nominal and parameterized types remain honest at that boundary.
 The remaining result-family gap is confined to bytes, linear resources, and
 list shapes for which typed trap generation cannot yet construct a truthful
-portable fallback. Restricted ESM also still needs explicit KIR typing for a
-closure value captured by another closure. With multi-expression `do` portable,
-the remaining aesthetic friction is concentrated at genuinely computed
-callable boundaries rather than ordinary lexical calls or sequencing.
+portable fallback. Closure-valued parameters, captures, and results are now
+inferred and checked across KIR, restricted ESM, and Wasm within a closed
+module. The remaining higher-order design gap is an explicit callable contract
+for unconstrained exported library functions. With multi-expression `do`
+portable, the aesthetic friction is concentrated at genuinely computed or
+open-module callable boundaries rather than ordinary lexical calls or
+sequencing.
