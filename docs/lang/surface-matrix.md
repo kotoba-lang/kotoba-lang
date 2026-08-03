@@ -7,7 +7,7 @@ Check: `clojure -M -m kotoba.lang.surface-matrix --check`
 | Field | Value |
 |---|---|
 | surface-status version | 1 |
-| profile version | 5 |
+| profile version | 6 |
 | as-of | 2026-08-04 |
 | authority ADR | `docs/adr/ADR-kotoba-language-surface-status.md` |
 
@@ -56,7 +56,7 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 | `data-host-argument` | `implemented-partial` | kotoba-wasm |  |
 | `dynamic-arity-apply` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `filter-function` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
-| `first-class-closure-values` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
+| `first-class-closure-values` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | Public [:fn [parameter-types result-type] ...] contracts cross project-module boundaries; parameters are intentionally i64-only in the first ABI-neutral profile, and computed heads remain explicit. |
 | `inline-fn-callbacks` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `lazy-sequences` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `multi-collection-map` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
