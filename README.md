@@ -215,6 +215,8 @@ repository as data:
 - `src/kotoba/lang/package_contract.cljc` validates package manifests and
   lockfiles against `lang/package.edn`.
 - `docs/lang/`: profile maturity, gates, and versioning.
+- `docs/kotoba-syntax-quality-review.md`: evidence-based syntax review and the
+  prioritized path for improving ergonomics without weakening static safety.
 - `docs/adr/`: extracted language and repository ADRs.
 - `examples/`: small source examples for docs and CLI smoke tests.
 - Node, JVM, native, or other launchers are adapters. They should not define CLI
