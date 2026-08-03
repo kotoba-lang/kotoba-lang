@@ -99,6 +99,96 @@
          :kotoba.host/denied (:denied admission)
          :kotoba.host/receipt receipt}))))
 
+;; ---------------------------------------------------------------------------
+;; CI5 — component import binding
+;;
+;; The three guards above form a ladder, and the weaker rungs stay public
+;; because non-component hosts legitimately use them. That is exactly the
+;; problem this section solves: nothing stopped a host from binding a
+;; *component's* effectful import with `guard-call` or `guard-ability-call`
+;; and silently skipping component admission (target identity, operation, and
+;; resource limits). `guard-ability-call` degrades further still — for a
+;; request that is not a capability value it falls through to `guard-call`,
+;; bypassing the effect gate — whereas `guard-component-ability-call` denies
+;; that case as :component-ability-invalid.
+;;
+;; So binding is made a checked operation rather than a convention: a host
+;; hands over the compiler's WIT receipt and its handlers, and gets back a
+;; dispatch table in which every entry routes through the strict guard. There
+;; is no argument by which a caller can select a weaker one.
+
+(def component-target
+  "The only target whose imports this binder will bind."
+  :wasm-component-kotoba-v1)
+
+(defn bind-component-imports
+  "CI5: the admissible way to bind a compiled component's effectful imports.
+
+  RECEIPT is the compiler's WIT package receipt — `{:format
+  :kotoba.wit-package/v1 :target :wasm-component-kotoba-v1 :imports [<name>
+  ...]}`. HANDLERS maps each declared import name to `(fn [concrete-cap] ...)`.
+
+  Returns `{:ok? true :dispatch {<name> (fn [opts] ...)}}`, or a fail-closed
+  diagnostic. The declared imports and the supplied handlers must correspond
+  exactly:
+
+  - a handler for an import the component never declared would be authority
+    the WIT world does not describe, and
+  - a declared import with no handler would leave a hole whose behaviour is
+    decided at call time by whatever the host happens to do next.
+
+  Both are refused here, where the mismatch is visible, rather than at the
+  first call."
+  [receipt handlers]
+  (let [imports (:imports receipt)
+        handlers (or handlers {})
+        declared (set imports)
+        supplied (set (keys handlers))]
+    (cond
+      (not (map? receipt))
+      {:ok? false :denied :binding/receipt-invalid}
+
+      (not= :kotoba.wit-package/v1 (:format receipt))
+      {:ok? false :denied :binding/receipt-format-unsupported
+       :format (:format receipt)}
+
+      (not= component-target (:target receipt))
+      {:ok? false :denied :binding/target-not-component :target (:target receipt)}
+
+      (not (and (sequential? imports) (= (count imports) (count declared))))
+      {:ok? false :denied :binding/imports-invalid :imports imports}
+
+      (seq (remove declared supplied))
+      {:ok? false :denied :binding/undeclared-import
+       :undeclared (vec (sort (remove declared supplied)))}
+
+      (seq (remove supplied declared))
+      {:ok? false :denied :binding/unbound-import
+       :unbound (vec (sort (remove supplied declared)))}
+
+      :else
+      {:ok? true
+       :dispatch
+       (into {}
+             (map (fn [name]
+                    [name (fn bound-call [opts]
+                            ;; :call and :handler are supplied here, not by the
+                            ;; caller: the binding decides which handler an
+                            ;; import reaches, and the receipt names the call.
+                            (guard-component-ability-call
+                             (assoc opts :call name :handler (get handlers name))))]))
+             imports)})))
+
+(defn dispatch-call
+  "Invoke a bound import by name. An import absent from the table is denied
+  rather than treated as unguarded: a dispatch table is a closed world, so a
+  name it does not contain is not an unbound call, it is an ungranted one."
+  [{:keys [dispatch]} name opts]
+  (if-let [bound (get dispatch name)]
+    (bound opts)
+    {:kotoba.host/ok? false :kotoba.host/denied :binding/unknown-call
+     :kotoba.host/call name}))
+
 (defn journal
   "Atom-backed append-only receipt recorder. Returns
   {:record! <fn receipt -> receipt> :entries <fn -> [receipt ...]>} so a host
@@ -157,3 +247,46 @@
 
           false)]
     {:ok? ok? :case (:id tc) :actual outcome}))
+
+(defn check-binding-case
+  "Runs one `:component-binding` conformance case (CI5). DATA is
+  `{:receipt <wit receipt> :handler-imports [<name> ...] :call <name>
+    :opts <guard opts>}`; the runner supplies real handler fns for
+  :handler-imports so a fixture never has to carry code."
+  [tc data]
+  (let [calls (atom [])
+        handlers (into {} (map (fn [name]
+                                 [name (fn [concrete]
+                                         (swap! calls conj concrete)
+                                         concrete)]))
+                       (:handler-imports data))
+        bound (bind-component-imports (:receipt data) handlers)]
+    (case (:kind tc)
+      :reject-binding
+      {:ok? (and (false? (:ok? bound)) (= (:denied tc) (:denied bound)))
+       :actual bound}
+
+      ;; The binding succeeds and the call is dispatched; what the case asserts
+      ;; is which guard the bound entry actually applied.
+      (let [{:keys [record! entries]} (journal)
+            outcome (if (:ok? bound)
+                      (dispatch-call bound (:call data)
+                                     (assoc (:opts data) :record! record!))
+                      bound)]
+        (case (:kind tc)
+          :accept
+          {:ok? (and (true? (:ok? bound))
+                     (true? (:kotoba.host/ok? outcome))
+                     (= 1 (count @calls))
+                     (= 1 (count (entries))))
+           :actual outcome}
+
+          :expect-denied
+          {:ok? (and (true? (:ok? bound))
+                     (false? (:kotoba.host/ok? outcome))
+                     (= (:denied tc) (:kotoba.host/denied outcome))
+                     (empty? @calls))
+           :actual outcome}
+
+          {:ok? false :actual {:problem :conformance/unknown-case-kind
+                               :kind (:kind tc)}})))))

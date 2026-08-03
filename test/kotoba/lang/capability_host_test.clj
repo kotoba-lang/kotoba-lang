@@ -172,3 +172,28 @@
             :let [data (read-edn (str "lang/capability-conformance/" (:file tc)))
                   result (host/check-case tc data)]]
       (is (:ok? result) (str (:id tc) " -> " (pr-str (:actual result)))))))
+
+(deftest component-binding-conformance-fixtures-match-contract
+  (let [manifest (read-edn manifest-path)
+        cases (filter #(= :component-binding (:type %)) (:cases manifest))]
+    (is (seq cases) "CI5 component-binding cases must exist")
+    (doseq [tc cases
+            :let [data (read-edn (str "lang/capability-conformance/" (:file tc)))
+                  result (host/check-binding-case tc data)]]
+      (is (:ok? result) (str (:id tc) " -> " (pr-str (:actual result)))))))
+
+(deftest the-binder-is-the-only-route-to-a-component-import
+  (testing "the weaker guards stay public for non-component hosts, so what
+            makes the strict path exclusive is that binding is a checked
+            operation: a bound entry supplies :call and :handler itself, and a
+            caller cannot substitute a weaker guard or reach an import the
+            component never declared."
+    (let [receipt {:format :kotoba.wit-package/v1
+                   :target :wasm-component-kotoba-v1
+                   :imports [:component/http]}
+          bound (host/bind-component-imports receipt {:component/http identity})]
+      (is (true? (:ok? bound)))
+      (is (= #{:component/http} (set (keys (:dispatch bound)))))
+      (testing "a name outside the table is ungranted, not unguarded"
+        (is (= :binding/unknown-call
+               (:kotoba.host/denied (host/dispatch-call bound :component/database {}))))))))
