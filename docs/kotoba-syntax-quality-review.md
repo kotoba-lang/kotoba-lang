@@ -31,6 +31,7 @@ representations or punctuation-heavy syntax.
 | Type readability | Strong | signatures read left-to-right; idiomatic option fallback infers `[:option T]`, while descriptors remain only in low-level ABI forms |
 | Collection vocabulary | Mostly coherent | literal/vector/list/set operations are familiar, but source list, pair-chain list, typed `[:list T]`, and document list need careful documentation |
 | Document values | Strong | arbitrary bounded EDN map keys, canonical bytes, sets/lists/symbols, contextual `(document {...})` authoring, and KIR/ESM/Wasm/NBB parity are complete |
+| Binary values | Coherent bounded foundation | `(bytes)` is the canonical empty value; `:bytes` crosses checked KIR/ESM/Wasm closure boundaries; nonempty payloads remain explicit typed host/provider inputs |
 | Higher-order calls | Strong inside a closed module; explicit at computed and open-module boundaries | a lexical closure uses ordinary `(f ...)`; fixed-point inference checks ordinary closure parameters/captures/results; `invoke` remains for computed heads and public closure signatures remain undesigned |
 | Failure/effect semantics | Strong | unsupported syntax, undeclared effects, oversized expansion, and host authority fail closed |
 
@@ -163,9 +164,12 @@ made explicit exactly where static call-head inference cannot recover it.
 
 The current descriptor profile is deliberately bounded by fail-closed trap
 generation: a result descriptor is admitted only when the compiler can build a
-typed fallback value for an unknown or wrong-family closure. Descriptors whose
-members have no such inhabitant yet (notably bytes and linear resources) remain
-a maturity gap rather than silently weakening dispatch.
+typed fallback value for an unknown or wrong-family closure. Bytes now have the
+canonical zero-argument `(bytes)` spelling and an internal empty fallback, so
+`:bytes` crosses closure and function boundaries without exposing
+`bytes-empty`. Nonempty binary payloads still enter through typed host/provider
+boundaries. Linear resources remain excluded because inventing a fallback
+handle would violate affinity rather than improve syntax.
 
 Multi-expression `do` is now portable through the restricted ESM path as well
 as the reference and Wasm paths. Its non-tail expressions are evaluated in
@@ -239,8 +243,8 @@ result family that currently has a safe portable default, and effects remain
 qualified and visible. Computed expression heads and explicit top-level
 function values still expose `invoke`/`fn-ref`; the former accepts a complete
 descriptor so nominal and parameterized types remain honest at that boundary.
-The remaining result-family gap is confined to bytes and linear resources, for
-which typed trap generation cannot yet construct a truthful portable fallback.
+The remaining result-family gap is confined to linear resources, for which
+typed trap generation cannot construct a truthful portable fallback.
 Canonical typed lists retain ordinary `(list ...)` construction and expose
 `[:list T]` only at an explicit computed-call boundary. Closure-valued
 parameters, captures, and results are now
