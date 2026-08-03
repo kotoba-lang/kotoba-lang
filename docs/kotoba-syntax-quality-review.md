@@ -116,6 +116,13 @@ for a lexical call. This admits library-shaped code such as
 uses `(invoke :vector-i64 closure 7)`. Wrong result families and unknown lambda
 ids still trap rather than coerce.
 
+String-consuming operations now provide the corresponding `:string` context,
+and declared `:string` function results carry it through the value-producing
+tails of `let`, `if`, and `do`. Thus `(string-length (render 42))` stays an
+ordinary lexical call, including through a declared library boundary. A
+computed closure head remains explicit as `(invoke :string closure 42)`, and a
+wrong-family closure still traps closed.
+
 ### P1 — vocabulary and module consistency
 
 - Document the four distinct sequence concepts where they first appear rather
@@ -140,7 +147,7 @@ lexically. Bounded documents are authored as inert data, option flow is
 idiomatic, lexical closures use ordinary application, and effects remain
 qualified and visible. The remaining callable-value debt is narrower:
 computed expression heads and explicit top-level function values still expose
-`invoke`/`fn-ref`. Closure result dispatch now owns `:i64`, `:bool`, and
-`:vector-i64`; string, record, option/result, and other structured families
-remain explicit future work. Extending those families is more valuable than
-adding punctuation or weakening closed-world call resolution.
+`invoke`/`fn-ref`. Closure result dispatch now owns `:i64`, `:bool`, `:string`,
+and `:vector-i64`; record, option/result, document, and other structured
+families remain explicit future work. Extending those families is more
+valuable than adding punctuation or weakening closed-world call resolution.
