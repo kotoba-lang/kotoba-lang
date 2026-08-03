@@ -170,7 +170,14 @@ argument counts zero through four through the same static dispatchers and
 returns zero when the runtime tail exceeds that bound. Variadic closure
 clauses are statically specialized through arity four and bind rest arguments
 as a pair-chain. The shared `first-class-closures-invoke-and-apply` case verifies
-returned closures, `fn-ref`, `invoke`, and bounded `apply` on the primary path.
+returned closures, closure-valued ordinary parameters and captures, ordinary
+lexical application, `fn-ref`, `invoke`, and bounded `apply` on the primary
+path. The compiler infers those closure boundaries to a fixed point within a
+closed module and emits checked KIR parameter/result metadata. Restricted ESM
+validates the same physical closure pair rather than treating it as a scalar
+i64 capture. The `apply` tail remains an ordinary `(list ...)` at the source
+surface; its internal KIR boundary is separately typed and checked as a bounded
+i64 pair-chain of at most four arguments.
 
 Top-level functions can explicitly become first-class values through
 `(fn-ref name)`, which creates deterministic arity wrappers for every declared
@@ -178,6 +185,9 @@ arity zero through four. An explicit form is used instead of silently treating
 value-position symbols as functions, because lexical bindings may shadow a
 top-level name. Computed calls remain explicit `(invoke f ...)`; this is an
 intentional inspectability simplification rather than an absent call mechanism.
+An exported higher-order function with no constraining use inside its compiled
+module remains an open boundary: the current public signature surface has no
+closure type with which to declare its parameter and result contract.
 
 ## Intentional constraints
 
