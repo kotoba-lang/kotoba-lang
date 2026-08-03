@@ -14,10 +14,10 @@ recognizable Clojure-shaped language without inheriting ambient Clojure/JVM
 authority.
 
 The syntax is not yet uniformly beautiful at representation boundaries.
-Document construction, generic option extraction, and first-class function
-invocation expose lowering details that interrupt otherwise direct code. The
-right direction is contextual elaboration into existing typed primitives, not
-new runtime representations or punctuation-heavy syntax.
+First-class function invocation still exposes lowering details that interrupt
+otherwise direct code. Document construction and generic option fallback now
+use contextual/type-directed elaboration into existing typed primitives rather
+than new runtime representations or punctuation-heavy syntax.
 
 ## Evidence-based scorecard
 
@@ -25,7 +25,7 @@ new runtime representations or punctuation-heavy syntax.
 | --- | --- | --- |
 | Data and control | Strong | literals, nested destructuring, `let`, `if`, `cond`, `case`, threading, bounded HOFs |
 | Effect visibility | Strong | qualified catalog operations elaborate to declared abilities; ambient interop remains forbidden |
-| Type readability | Strong with one rough edge | signatures read left-to-right; raw descriptors such as `[:option :document]` leak into extraction helpers |
+| Type readability | Strong | signatures read left-to-right; idiomatic option fallback infers `[:option T]`, while descriptors remain only in low-level ABI forms |
 | Collection vocabulary | Mostly coherent | literal/vector/list/set operations are familiar, but source list, pair-chain list, typed `[:list T]`, and document list need careful documentation |
 | Document values | Strong | arbitrary bounded EDN map keys, canonical bytes, sets/lists/symbols, contextual `(document {...})` authoring, and KIR/ESM/Wasm/NBB parity are complete |
 | Higher-order calls | Adequate, visibly lowered | `fn` is clear; `(invoke f ...)` and `(fn-ref add)` expose static-dispatch machinery |
@@ -83,12 +83,15 @@ Landed acceptance evidence:
 - no capability or host import added;
 - source spans in diagnostics point to the literal member that failed.
 
-### P0 — option flow over extraction plumbing
+### Completed surface — option flow over extraction plumbing
 
-Prefer `if-some`, `when-some`, `some->`, and `some->>` in documentation and
-libraries. Keep `option-value-of` as a low-level total extraction primitive,
-but stop presenting nested descriptor-bearing extraction as idiomatic source.
-Add typed bindings only where inference cannot establish the payload.
+Use `option-or` when the intent is “payload or fallback”; its payload descriptor
+is inferred from typed locals, constructors, record fields, let bindings, or
+function results. Prefer `if-some`, `when-some`, `some->`, and `some->>` when
+the intent is control flow. `option-value-of` remains the low-level total
+extraction primitive seen after elaboration, not idiomatic authored source.
+Existing libraries are being migrated incrementally; completion here describes
+the admitted language surface, not zero remaining low-level call sites.
 
 ### P1 — statically known callable values
 
@@ -120,6 +123,6 @@ top-level function used in value position.
 The language already has a coherent aesthetic, rather than merely resembling
 Clojure lexically. Its bounded document model and closed authoring syntax are
 now complete without representation or backend forks. The highest remaining
-syntax debt is option extraction ceremony: make idiomatic `if-some`,
-`when-some`, `some->`, and `some->>` absorb common control flow while retaining
-visible effects and fail-closed bounds.
+syntax debt is statically known callable values: `(invoke f x)` and `(fn-ref
+add)` still expose dispatch machinery. Any further sugar must retain static
+bounded dispatch, visible effects, and unambiguous global operation resolution.

@@ -16,10 +16,11 @@ or `ttl = -1` packs.
 
 | Layer | What | When to use |
 |---|---|---|
-| **Language option** `[:option T]` | Typed optional value; sugar `if-some` / `when-some` / `match-option` | Product pure oracles, PVA v1 hosts |
+| **Language option** `[:option T]` | Typed optional value; `option-or` for a value default, `if-some` / `when-some` for control flow | Product pure oracles, PVA v1 hosts |
 | **Stdlib prelude records** `Some`/`None`/`Ok`/`Err` | Explicit prelude helpers (`option-value`, `unwrap-ok`, …) from `lang/stdlib/core.kotoba` | Programs compiled **with** `--prelude` / conformance `:prelude` |
 
-Pure-product **product oracles** should use **`[:option T]` + `if-some`** first.
+Pure-product **product oracles** should use `[:option T]` with `option-or` for a
+fallback value, or `if-some` when the payload controls a branch.
 Prelude helpers are for portable library / stdlib conformance, not a second ABI.
 
 ---
@@ -41,16 +42,17 @@ Prelude helpers are for portable library / stdlib conformance, not a second ABI.
     "anonymous"))
 
 (defn claim-exp [now :i64 ttl [:option :i64]] :i64
-  (+ now (if-some [x ttl] x 2592000)))
+  (+ now (option-or ttl 2592000)))
 ```
 
 Rules:
 
-1. `if-some` binds the **payload** when some; else runs the else branch.  
-2. Do **not** hardcode `if-some` to `[:option :i64]` only — any `[:option T]`.  
-3. Prefer option over `has-name` / `ttl -1` sentinels (forbidden patterns in pure-product profile).  
-4. `when-some` is if-some without else (body only when some).  
-5. `match-option` is the explicit typed form when sugar desugaring needs a fixed type.
+1. `option-or` returns the payload when present and the fallback otherwise; `T` is inferred.
+2. `if-some` binds the **payload** when some; else runs the else branch.
+3. Do **not** hardcode these forms to `[:option :i64]` — any `[:option T]`.
+4. Prefer option over `has-name` / `ttl -1` sentinels (forbidden patterns in pure-product profile).
+5. `when-some` is if-some without else; `some->` chains Option-returning steps.
+6. `match-option` is the explicit typed branch form; `option-value-of` is lowering-level ABI, not cookbook syntax.
 
 ### Golden
 

@@ -112,6 +112,7 @@
         named (case (as-kw feature-key)
                 :map-literal '[get assoc]
                 :contextual-document-literal '[document]
+                :option-flow '[option-or if-some when-some some-> some->> match-option]
                 :vector-literal '[]
                 :set-literal '[contains? conj disj]
                 :map-function '[map]
