@@ -1,7 +1,7 @@
 # Kotoba syntax quality review
 
 Status: active design review  
-Date: 2026-08-03  
+Date: 2026-08-04
 Authority inspected: `lang/guest-grammar.edn`, `lang/surface-status.edn`, the
 conformance corpus, compiler examples, and the bounded document migration.
 
@@ -15,8 +15,9 @@ authority.
 
 The syntax is not yet uniformly beautiful at representation boundaries.
 Computed first-class function invocation still exposes its result descriptor,
-while lexical scalar, predicate, vector, document, record, option, and
-result-producing calls stay direct in known result contexts. Document
+while lexical scalar, predicate, vector, document, record, option, result,
+variant, heterogeneous-vector, typed-set, and typed-map producing calls stay
+direct in known result contexts. Document
 construction and generic option fallback use contextual/type-directed
 elaboration into existing typed primitives rather than new runtime
 representations or punctuation-heavy syntax.
@@ -132,14 +133,18 @@ Document-map keys deliberately remain explicit when their type is ambiguous
 between keyword and document; computed heads use `(invoke :document ...)`.
 
 The dispatcher is now keyed by the complete canonical result descriptor for
-nominal records, `[:option T]`, and `[:result T E]`. A record constructor,
-projection, update, equality check, option/result constructor or match arm gives
-a lexical call enough context to remain `(f ...)`; declared result boundaries
-and result-typed `fn-ref` values carry the same context. Different nominal
-records and differently parameterized option/result values never share a
-dispatcher. At a genuinely computed head, the full descriptor remains visible,
-for example `(invoke [:option :string] closure 42)`. That explicitness is a
-useful honesty at the dynamic boundary, not syntax noise on the common path.
+nominal records and variants, `[:option T]`, `[:result T E]`, heterogeneous
+vectors, typed sets, and typed maps. Their constructors, projections,
+consumers, updates, equality checks, and match arms give a lexical call enough
+context to remain `(f ...)`; declared result boundaries and typed `fn-ref`
+values carry the same context. Nested typed closures also seed one another's
+requested dispatcher signatures, so an outer closure can call an inner typed
+closure without falling back to provisional `:i64` inference. Schema references
+are resolved before variant construction, matching, rewriting, and dispatch.
+Different nominal or parameterized values never share a dispatcher. At a
+genuinely computed head, the full descriptor remains visible, for example
+`(invoke [:option :string] closure 42)`. That explicitness is useful honesty at
+the dynamic boundary, not syntax noise on the common path.
 
 The current descriptor profile is deliberately bounded by fail-closed trap
 generation: a result descriptor is admitted only when the compiler can build a
@@ -175,12 +180,13 @@ weakening ordinary i64 parameter guards.
 
 The language has a coherent aesthetic rather than merely resembling Clojure
 lexically. Bounded documents are authored as inert data, option flow is
-idiomatic, lexical closures use ordinary application across flat and structured
-result types, and effects remain qualified and visible. Computed expression
-heads and explicit top-level function values still expose `invoke`/`fn-ref`;
-the former now accepts a complete descriptor so nominal and parameterized types
-remain honest at that boundary. The highest-value callable gap is no longer
-record/option/result dispatch itself, but extending typed trap fallbacks to the
-remaining descriptor families. With multi-expression `do` now portable, the
-remaining aesthetic friction is concentrated at genuinely computed callable
-boundaries rather than ordinary lexical calls or sequencing.
+idiomatic, lexical closures use ordinary application across every structured
+result family that currently has a safe portable default, and effects remain
+qualified and visible. Computed expression heads and explicit top-level
+function values still expose `invoke`/`fn-ref`; the former accepts a complete
+descriptor so nominal and parameterized types remain honest at that boundary.
+The remaining callable gap is confined to bytes, linear resources, and list
+shapes for which typed trap generation cannot yet construct a truthful portable
+fallback. With multi-expression `do` portable, the remaining aesthetic friction
+is concentrated at genuinely computed callable boundaries rather than ordinary
+lexical calls or sequencing.
