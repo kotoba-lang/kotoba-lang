@@ -121,6 +121,49 @@
   "The only target whose imports this binder will bind."
   :wasm-component-kotoba-v1)
 
+(def host-binding-contract
+  "The `:host-binding` shape emitted by kotoba-lang/kotoba-component's
+  `kotoba.component.wit/emit`."
+  :kotoba.component.host-binding/v1)
+
+(def required-guard
+  "The host entry point a component's effectful import must be bound through."
+  :guard-component-ability-call)
+
+(defn- host-binding-problem
+  "CI5: check the receipt's declaration instead of assuming it.
+
+  This binder always routed through the strict guard, but that was its own
+  private decision — the receipt said nothing, so there was nothing to
+  disagree with. Reading the declaration turns a silent assumption into a
+  checkable agreement: a receipt that omits it, names a different guard, or
+  leaves an import uncovered is refused rather than bound on trust."
+  [receipt]
+  (let [declaration (:host-binding receipt)
+        declared-contract (:contract declaration)
+        declared-guard (:required-guard declaration)
+        declared-imports (:imports declaration)
+        emitted (set (:imports receipt))]
+    (cond
+      (nil? declaration)
+      {:denied :binding/host-binding-undeclared}
+
+      (not= host-binding-contract declared-contract)
+      {:denied :binding/host-binding-contract-unsupported :contract declared-contract}
+
+      (not= required-guard declared-guard)
+      {:denied :binding/host-binding-guard-mismatch :required-guard declared-guard}
+
+      (not (map? declared-imports))
+      {:denied :binding/host-binding-invalid}
+
+      (not= emitted (set (keys declared-imports)))
+      {:denied :binding/host-binding-incomplete
+       :uncovered (vec (sort (remove (set (keys declared-imports)) emitted)))}
+
+      (seq (remove #(= required-guard %) (vals declared-imports)))
+      {:denied :binding/host-binding-guard-mismatch :imports declared-imports})))
+
 (defn bind-component-imports
   "CI5: the admissible way to bind a compiled component's effectful imports.
 
@@ -157,6 +200,11 @@
 
       (not (and (sequential? imports) (= (count imports) (count declared))))
       {:ok? false :denied :binding/imports-invalid :imports imports}
+
+      ;; The receipt must state which guard it requires before anything is
+      ;; bound, so agreement is checked rather than assumed.
+      (host-binding-problem receipt)
+      (assoc (host-binding-problem receipt) :ok? false)
 
       (seq (remove declared supplied))
       {:ok? false :denied :binding/undeclared-import
