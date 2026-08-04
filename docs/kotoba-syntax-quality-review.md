@@ -326,19 +326,22 @@ completed slice on KIR and `wasm32-kotoba-v1` with result `26`.
 - Decide a bounded specialization rule for `extend-protocol` defaults and
   remove the legacy zero-sentinel dispatch path.
 
-After compiler#525 and provider#172–#175 (ADR 0276–0279), an organization-wide
-source scan on 2026-08-04 found 110 remaining explicit low-level operations
-(`record-get` 46, `record-new` 32, `hetero-vector-at` 32) across 19 `.kotoba`
-files. Seven migrated HTTP packages removed 164 such sites and now use nominal
-records without changing their exports or `main` oracles. The
-remaining sites are concentrated in `kotoba-lang/provider` Wasm-package
+After compiler#525 and provider#172–#176 (ADR 0276–0280), an organization-wide
+source scan on 2026-08-04 found 68 remaining explicit low-level operations
+(`record-get` 24, `record-new` 12, `hetero-vector-at` 32) across 16 `.kotoba`
+files. Ten migrated provider packages removed 206 such sites and now use
+domain-named nominal records without changing their exports or `main` oracles.
+The remaining sites are concentrated in `kotoba-lang/provider` Wasm-package
 sources rather than ordinary application code, so the next high-leverage work
-is to repeat this schema-driven migration package by package; adding more
-general syntax sugar would optimize the wrong layer.
+is to migrate the shared recursive EDN key/value record pattern across its 12
+packages; adding more general syntax sugar would optimize the wrong layer.
 
-The residual now splits evenly between 78 raw record operations and 32
-heterogeneous-vector projections. The latter need descriptor-aware access
-migration rather than being counted as unfinished nominal-record syntax.
+The residual splits into 36 raw record operations and 32 heterogeneous-vector
+projections. The latter need descriptor-aware access migration rather than
+being counted as unfinished nominal-record syntax. The latest process and git
+records intentionally have separate nominal identities despite sharing a
+physical shape; this is a useful example of the language surface expressing
+domain meaning instead of ABI layout.
 
 ### P1 — vocabulary and module consistency
 
