@@ -5,6 +5,7 @@
 - **Artifacts**: `lang/value-codec.edn`,
   `kotoba-lang/io-ipld:src/kotoba/value/codec.cljc`,
   `kotoba-lang/io-ipld:src/ipld/value.cljc`,
+  `kotoba-lang/provider:src/provider/value_codec.cljc`,
   `kotoba-lang/arrangement:src/arrangement/core.cljc`,
   `kotoba-lang/kotoba:src/kotoba/semantic_code.cljc`
 - **Related**: `ADR-kotoba-code-identity-and-abilities.md`,

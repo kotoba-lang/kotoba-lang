@@ -369,6 +369,14 @@ semantic operation.
 This does not close the canonical compiler `data-host-arg` gap below. It proves
 the target layering and removes one production boundary that violated it.
 
+The provider ops kits now confirm the same rule across HTTP, secret, process,
+git, entropy, and scoped-fs audit paths. Their public operations did not acquire
+an `encode`, `parse`, tag, or buffer argument: adapters emit bounded
+`:provider.ops-audit/v1` request/reply bytes, while the old W4 EDN is retained
+only as compatibility evidence. Real JVM, ClojureScript/Node, and compiler
+consumer conformance all exercise that boundary. Provider ABI work still listed
+below concerns native record/option/result buffers, not authored wire syntax.
+
 ### P0 — remove remaining compiler-shaped source plumbing
 
 - Finish canonical compiler data-host arguments so `bytes-ptr`/`bytes-len` and
@@ -435,9 +443,9 @@ and Wasm. The `[:fn ...]` spelling is consistent with `[:option T]` and
 hidden. With multi-expression `do` and recursive typed patterns portable, the
 remaining aesthetic friction is concentrated in the intentionally visible
 computed-call operator (`invoke`), explicit top-level function conversion
-(`fn-ref`), and compiler/provider ABI preparation. Actor Delta wire no longer
-contributes to that friction: canonical bytes, float tagging, and limits are
-hidden behind semantic operations.
+(`fn-ref`), and compiler/provider ABI preparation. Actor Delta and provider
+ops audit wire no longer contribute to that friction: canonical bytes, float
+tagging, and limits are hidden behind semantic operations.
 Record/protocol code is no longer part of that friction: ordinary declarations,
 constructors, field access, and statically resolved calls now form one readable
 source story.
