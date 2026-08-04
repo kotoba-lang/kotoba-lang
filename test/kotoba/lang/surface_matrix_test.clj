@@ -53,12 +53,19 @@
     (is (= :qualified-typed-ability (:source-boundary replacement)))
     (is (= :forbidden (:physical-source-forms replacement)))
     (is (= "kotoba.value.v1" (get-in replacement [:wire :codec])))
-    (is (= #{:i64 :f64 :string :keyword :symbol :bool :document}
+    (is (= :kotoba.ability-wire-adapter/v2
+           (get-in replacement [:wire :format])))
+    (is (= #{:i64 :f32 :f64 :string :bytes :keyword :symbol :bool :document
+             :map :option-i64 :result-i64 :vector-i64 :vector-f64
+             :record :variant :option :result :vector :list :set :ref}
            (:types replacement)))
+    (is (= {:authority :typed-ability-descriptor
+            :physical-wire :wit-canonical-abi
+            :byte-tunneling false}
+           (:component-parity replacement)))
     (is (= #{:kotoba-wasm}
            (get-in boundary [:legacy-surface :backends])))
-    (is (some #{:schema-directed-aggregate-wire-shapes}
-              (:missing boundary)))))
+    (is (= [:async-provider-contract] (:missing boundary)))))
 
 (deftest on-disk-matrix-matches-regenerated
   (let [r (sm/check-matrix!)]
