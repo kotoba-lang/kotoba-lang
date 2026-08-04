@@ -106,8 +106,10 @@ The canonical compiler does not install a runtime fallback. It specializes the
 `default` body to each otherwise-unimplemented record in the sealed module;
 named sections and record-local implementations take precedence. Every
 receiver remains statically nominal, every method is checked against its
-record descriptor, and an unknown receiver is a compile error. Use
-`extend-type` when the record is the clearer unit of organization.
+record descriptor, and an unknown receiver is a compile error. Primary Wasm
+and restricted CLJS emit the same sealed cases and trap a forged unknown tag
+instead of returning a sentinel. Use `extend-type` when the record is the
+clearer unit of organization.
 
 ## 4. Typed-map (limited)
 

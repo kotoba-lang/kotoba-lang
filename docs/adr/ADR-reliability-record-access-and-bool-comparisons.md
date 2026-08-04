@@ -260,6 +260,7 @@ Compiler ADR 0205/compiler#521 then closes the typed-field follow-up without a
 new record representation: unannotated fields still default to `:i64`, while
 `[name :string active :bool]` reuses the existing typed-parameter spelling and
 lowers to the complete nominal descriptor already handled by KIR and Wasm.
-`map->Type` remains exact-literal-only. `extend-protocol` defaults, dynamic map
-construction, and the legacy primary zero-sentinel path remain explicit gaps;
-keyword-as-function field access is already type-directed and admitted.
+`map->Type` remains exact-literal-only. Compiler#535 adds sealed
+`extend-protocol/default` specialization, and kotoba#453 removes the primary
+zero-sentinel path. Arbitrary dynamic map construction remains intentionally
+excluded; keyword-as-function field access is already type-directed and admitted.

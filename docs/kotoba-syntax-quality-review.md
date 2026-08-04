@@ -343,12 +343,13 @@ without reflection or an invented result for unknown receivers. Arbitrary
 dynamic-map to record conversion is deliberately not hidden inside
 `map->Type`; if needed it requires a separately named checked operation and a
 real dynamic-map value contract.
-Legacy primary tag dispatch still returns a zero sentinel for an unknown tag;
-that behavior should converge to fail-closed semantics rather than become part
-of the language aesthetic.
+Primary Kotoba now elaborates the same sealed record cases and traps an unknown
+tag on both Wasm and restricted CLJS. The internal tagged-map representation
+therefore no longer leaks open-world or zero-sentinel semantics into the
+language contract.
 
 Acceptance evidence is compiler ADR 0204/0205/0208/0209/0210/0214/0217,
-compiler#520/#521/#525/#526/#527/#532/#535, and the
+compiler#520/#521/#525/#526/#527/#532/#535, kotoba#453, and the
 `:record-protocol-static-dispatch` plus `:typed-defrecord-fields` cases
 executing on KIR and `wasm32-kotoba-v1` with results `16` and `13`, plus
 `:wide-nominal-records` executing with result `8`. The computed constructor
@@ -437,9 +438,10 @@ a plausible value.
 
 - Extend contextual callable results to linear resources only when a truthful
   affine trap/result model exists; never invent a fallback handle for elegance.
-- Remove the legacy primary zero-sentinel dispatch path; the canonical
-  compiler already rejects unknown receivers and specializes
-  `extend-protocol/default` over the sealed record set.
+
+Kotoba#453 closes the former primary protocol-dispatch item: complete sections,
+module-local record targets, sealed `default` specialization, and an unknown-tag
+trap now agree with the canonical compiler without adding source syntax.
 
 Compiler#532 closes the former non-literal `map->Type` item with exact map
 leaves under total bounded control. It does not relabel arbitrary runtime maps
