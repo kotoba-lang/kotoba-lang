@@ -26,7 +26,8 @@ representations or punctuation-heavy syntax.
 
 | Area | Assessment | Evidence |
 | --- | --- | --- |
-| Data and control | Strong | literals, nested destructuring, `let`, `if`, `cond`, `case`, threading, bounded HOFs |
+| Data and control | Strong core, one typed edge | literals, flat destructuring, `let`, `if`, `cond`, `case`, threading, bounded HOFs; typed nested patterns still expose an accessor-selection gap |
+| Records and protocols | Strong bounded profile | `defrecord`, `defprotocol`, `definterface`, complete `extend-type`, `->Type`, and literal `map->Type` lower to nominal records and static calls |
 | Effect visibility | Strong | qualified catalog operations elaborate to declared abilities; ambient interop remains forbidden |
 | Type readability | Strong | signatures read left-to-right; idiomatic option fallback infers `[:option T]`, while descriptors remain only in low-level ABI forms |
 | Collection vocabulary | Mostly coherent | literal/vector/list/set operations are familiar, but source list, pair-chain list, typed `[:list T]`, and document list need careful documentation |
@@ -248,6 +249,57 @@ closed dispatcher families used for lexical calls. With no such context,
 This removes redundant annotation without hiding the computed call itself or
 adding runtime type inspection.
 
+### Completed — bounded records and closed protocols
+
+The canonical compiler now accepts the Clojure-shaped surface directly:
+
+```clojure
+(defprotocol Value
+  (value [this]))
+
+(defrecord Box [x]
+  Value
+  (value [this] (get this :x)))
+
+(defn main []
+  (value (->Box 7)))
+```
+
+This is a material aesthetic improvement over repeating a complete
+`[:record ...]` descriptor at every construction, projection, parameter, and
+result site. The frontend lowers declarations to nominal record operations and
+private static functions; protocol call syntax stays ordinary without adding
+reflection or runtime type guessing. One `extend-type` may contain multiple
+protocol sections, and every section implements every declared method exactly
+once.
+
+The visible bounds are coherent rather than accidental. Unannotated fields
+default to `:i64`; typed fields reuse the function signature spelling,
+`[name :string active :bool]`. `map->Type` accepts an exact literal map, and an
+unknown or unimplemented receiver is a compile error. Both
+`(get record :field)` and the idiomatic `(:field record)` are type-directed.
+`extend-protocol` defaults and dynamic map construction remain explicit gaps.
+Legacy primary tag dispatch still returns a zero sentinel for an unknown tag;
+that behavior should converge to fail-closed semantics rather than become part
+of the language aesthetic.
+
+Acceptance evidence is compiler ADR 0204/0205, compiler#520/#521, and the
+`:record-protocol-static-dispatch` plus `:typed-defrecord-fields` cases
+executing on KIR and `wasm32-kotoba-v1` with results `16` and `13`.
+
+### P0 — remove remaining compiler-shaped source plumbing
+
+- Make nested heterogeneous vector/map projection type-directed so authored
+  `get`, `nth`, and destructuring patterns do not choose `typed-*` accessors.
+- Finish canonical compiler data-host arguments so `bytes-ptr`/`bytes-len` and
+  similar physical ABI preparation stays in providers and generated adapters.
+- Extend contextual callable results to linear resources only when a truthful
+  affine trap/result model exists; never invent a fallback handle for elegance.
+- Add non-literal `map->Type` without weakening nominal identity or bounded
+  heterogeneous construction.
+- Decide a bounded specialization rule for `extend-protocol` defaults and
+  remove the legacy zero-sentinel dispatch path.
+
 ### P1 — vocabulary and module consistency
 
 - Document the four distinct sequence concepts where they first appear rather
@@ -275,8 +327,8 @@ qualified and visible. Computed expression heads and explicit top-level
 function values still expose `invoke`/`fn-ref`; `invoke` inherits a closed
 result context and accepts a complete descriptor only when the type is otherwise
 ambiguous, so nominal and parameterized types remain honest at that boundary.
-The remaining result-family gap is confined to linear resources, for which
-typed trap generation cannot construct a truthful portable fallback.
+The remaining callable result-family gap is confined to linear resources, for
+which typed trap generation cannot construct a truthful portable fallback.
 Canonical typed lists retain ordinary `(list ...)` construction and expose
 `[:list T]` only at an ambiguous computed-call boundary. Closure-valued
 parameters, captures, and results are inferred inside a closed module and
@@ -285,5 +337,7 @@ and Wasm. The `[:fn ...]` spelling is consistent with `[:option T]` and
 `[:result T E]`, while ordinary calls remain `(f x)` and the physical ABI stays
 hidden. With multi-expression `do` portable, the remaining aesthetic friction
 is concentrated in the intentionally visible computed-call operator (`invoke`)
-and explicit top-level function conversion (`fn-ref`), not repeated result
-descriptors, ordinary lexical calls, module composition, or sequencing.
+and explicit top-level function conversion (`fn-ref`), plus typed nested
+collection access and provider ABI preparation. Record/protocol code is no
+longer part of that friction: ordinary declarations, constructors, field
+access, and statically resolved calls now form one readable source story.

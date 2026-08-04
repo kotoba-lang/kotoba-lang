@@ -241,3 +241,25 @@ canonical path *does* admit, since that is what production code now uses.
 Implementation design authority moved to compiler
 `docs/adr/0191-language-profile-5-bool-typed-predicates.md` (profile 4→5).
 Remaining work is A/B/C in that ADR, not a silent frontend one-liner.
+
+## Follow-on (2026-08-04): record/protocol gap closed in the canonical compiler
+
+Compiler ADR 0204 and compiler#520 replace the historical finding in section 3
+with a bounded, closed-world implementation. `defrecord`, `defprotocol`,
+`definterface`, record-local implementations, and multi-protocol `extend-type`
+now lower before ordinary analysis to nominal record operations and private
+static functions. The shared `:record-protocol-static-dispatch` fixture is also
+present in the compiler pilot manifest and executes on KIR and
+`wasm32-kotoba-v1` with result `16`.
+
+This is intentionally not full Clojure protocol semantics. Every protocol
+section must implement every declared method exactly once, and an unknown
+receiver is a compile error rather than the old zero sentinel.
+
+Compiler ADR 0205/compiler#521 then closes the typed-field follow-up without a
+new record representation: unannotated fields still default to `:i64`, while
+`[name :string active :bool]` reuses the existing typed-parameter spelling and
+lowers to the complete nominal descriptor already handled by KIR and Wasm.
+`map->Type` remains exact-literal-only. `extend-protocol` defaults, dynamic map
+construction, and the legacy primary zero-sentinel path remain explicit gaps;
+keyword-as-function field access is already type-directed and admitted.
