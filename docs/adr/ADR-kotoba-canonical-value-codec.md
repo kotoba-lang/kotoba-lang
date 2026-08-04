@@ -304,3 +304,11 @@ All codec, persistence, semantic-code, host-argument, bounded-consumer, and
 exact-i64 stages are implemented, so the design is **accepted**. Compiler
 typed data-host lowering and native provider record/option/result buffers are
 separate ABI work; they do not reopen this value-wire decision.
+
+Compiler#533 / compiler ADR 0215 later adopted this wire in an exact generated
+host adapter for scalar and `:document` typed abilities. It translates the
+compiler's tagged document runtime value to an ordinary canonical value before
+encoding, and rejects unstandardized aggregate descriptors rather than leaking
+compiler constructor vectors onto the wire. Schema-directed aggregate shapes,
+Wasm component integration, and an asynchronous provider contract remain
+separate ABI work.

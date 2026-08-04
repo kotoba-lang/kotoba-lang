@@ -46,6 +46,20 @@
     (is (not-any? #{:dynamic-map-constructor}
                   (:missing records)))))
 
+(deftest canonical-data-host-boundary-does-not-revive-physical-source-syntax
+  (let [surface (sm/load-surface-status)
+        boundary (get-in surface [:other-gaps :data-host-argument])
+        replacement (:canonical-replacement boundary)]
+    (is (= :qualified-typed-ability (:source-boundary replacement)))
+    (is (= :forbidden (:physical-source-forms replacement)))
+    (is (= "kotoba.value.v1" (get-in replacement [:wire :codec])))
+    (is (= #{:i64 :f64 :string :keyword :symbol :bool :document}
+           (:types replacement)))
+    (is (= #{:kotoba-wasm}
+           (get-in boundary [:legacy-surface :backends])))
+    (is (some #{:schema-directed-aggregate-wire-shapes}
+              (:missing boundary)))))
+
 (deftest on-disk-matrix-matches-regenerated
   (let [r (sm/check-matrix!)]
     (is (true? (:ok? r))
