@@ -55,7 +55,9 @@
     (is (false? (:dynamic-fallback extension)))
     (is (contains? (get-in records [:extensions :implemented])
                    'extend-protocol))
-    (is (= [:legacy-zero-sentinel-removal] (:missing records)))))
+    (is (= :portable-trap
+           (get-in records [:protocols :unknown-or-unimplemented-receiver :primary])))
+    (is (empty? (:missing records)))))
 
 (deftest canonical-data-host-boundary-does-not-revive-physical-source-syntax
   (let [surface (sm/load-surface-status)

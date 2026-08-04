@@ -271,12 +271,12 @@ record identity under `:kotoba.record/type`. Field lookup and persistent update
 reuse ordinary map operations. `defprotocol` declarations and record-local
 method implementations compile to bounded static dispatch. Methods may take
 one to five parameters. The canonical compiler rejects unknown or unimplemented
-receivers; the legacy primary tag dispatcher still returns an explicit zero,
-which remains a recorded parity gap rather than language semantics. `extend-type` and
+receivers; primary Wasm and restricted CLJS emit sealed record cases and trap
+an unknown tag. `extend-type` and
 record-local implementations add methods to the same static dispatcher and
 reject duplicate type/method implementations. `extend-protocol`, including its
-`default` section, remains outside the canonical compiler until a bounded
-closed-world specialization rule exists. `definterface` is supported as the
+`default` section, specializes otherwise-unimplemented records declared in the
+sealed module and never becomes a runtime fallback. `definterface` is supported as the
 same safe static method contract—never as ambient JVM/JS interop. The shared
 `record-protocol-static-dispatch` conformance case covers constructors,
 record-local implementation, and `extend-type`; successful known-receiver
