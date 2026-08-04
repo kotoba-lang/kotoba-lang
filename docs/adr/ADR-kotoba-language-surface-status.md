@@ -290,6 +290,11 @@ Provider#174 / ADR 0278 migrates the earlier request skeleton and result EDN
 packages, removing another 44 operations while preserving both `-9002` oracles.
 Provider#175 / ADR 0279 migrates three header-state packages, removing another
 52 operations while preserving three independent `-9002` oracles.
+Provider#176 / ADR 0280 migrates the process request, git request, and HTTP
+header EDN accumulator packages, removing another 42 operations while
+preserving the independent `-2309`, `-2311`, and `-9002` oracles. Process and
+git deliberately retain separate nominal identities despite their common
+three-field physical shape.
 
 All three backends now provide the explicit lazy-sequence slice. A non-empty
 sequence is a resolver closure that yields either zero (empty) or a pair of
