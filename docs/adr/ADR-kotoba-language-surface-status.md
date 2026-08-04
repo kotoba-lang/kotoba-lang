@@ -353,7 +353,11 @@ Wasm/CLJS lowerers. Vector positional/`&` and map `:keys`/`:or`/`:as` plus
 explicit keyword-to-pattern entries expand into sequential temp bindings, so
 the source expression is evaluated once. Function-parameter destructuring
 now normalizes to generated plain parameters plus the same body-leading `let`,
-so it shares the portable semantics and conformance fixture.
+so it shares the portable semantics. Compiler ADR 0211 adds an exact bounded
+descriptor slice for heterogeneous `& rest`; closed mixed/nested vector
+literals infer that descriptor without authored type plumbing. The shared
+`:nested-let-destructuring` fixture now executes with result `29` on compiler
+KIR and `wasm32-kotoba-v1` instead of remaining an orphaned declaration.
 
 ## Release and expressiveness priority
 

@@ -44,14 +44,11 @@
         "no surface-status entry links a conformance case, so this gate is inert")))
 
 (deftest a-measured-compiler-rejection-must-carry-the-orphan-note
-  ;; The gap this gate closes: :nested-let-destructuring is :pure-product-run,
-  ;; so it declares #{:kir :wasm32-kotoba-v1} required, while surface-status
-  ;; measured the compiler rejecting the shape. Neither file was wrong alone.
   (let [m (cm/load-manifest)
         ss (cm/load-surface-status)
-        stripped (update-in ss [:other-gaps :nested-destructuring]
-                            dissoc :orphaned-conformance)
-        v (cm/validate-claims m stripped)]
+        contradictory (assoc-in ss [:other-gaps :nested-destructuring :measurement]
+                                {:result :rejected})
+        v (cm/validate-claims m contradictory)]
     (is (false? (:ok? v)))
     (is (= :measured-rejection-without-orphan-note
            (-> v :problems first :type)))))
@@ -59,8 +56,9 @@
 (deftest an-orphan-note-without-a-measurement-is-stale
   (let [m (cm/load-manifest)
         ss (cm/load-surface-status)
-        stripped (update-in ss [:other-gaps :nested-destructuring] dissoc :measurement)
-        v (cm/validate-claims m stripped)]
+        stale (assoc-in ss [:other-gaps :nested-destructuring :orphaned-conformance]
+                        {:case :nested-let-destructuring :executed-by :none})
+        v (cm/validate-claims m stale)]
     (is (false? (:ok? v)))
     (is (some #(= :orphan-note-without-measured-rejection (:type %)) (:problems v))
         "a note claiming the compiler rejects the surface outlives the
