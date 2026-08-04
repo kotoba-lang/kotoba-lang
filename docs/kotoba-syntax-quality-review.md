@@ -32,6 +32,16 @@ undeclared references still fail closed. Ordinary construction, record access,
 heterogeneous projection, and recursive record declarations no longer expose
 raw compiler plumbing in provider source.
 
+Compiler@63bed2b extends that same source/representation separation to the
+native host, and compiler@d0af5f0 (compiler#529) records and strengthens its
+source-level conformance. Ordinary homogeneous vectors remain `[1 2 3]`, `nth`, and
+ordinary destructuring in authored Kotoba; the POSIX and Windows loaders
+implement a bounded immutable handle ABI underneath them. The explicit
+`vector-*` names remain available at typed or representation boundaries, so
+native execution adds backend coverage without adding source punctuation or a
+second collection syntax. Sixteen signed-kexe cases now exercise scalar and
+composed i64/f64 vector paths on the host ISA.
+
 ## Evidence-based scorecard
 
 | Area | Assessment | Evidence |
@@ -40,7 +50,7 @@ raw compiler plumbing in provider source.
 | Records and protocols | Strong bounded profile; recursive declaration seam closed | `defrecord`, `defprotocol`, `definterface`, complete `extend-type`, `->Type`, and literal `map->Type` lower to nominal records and static calls; a bounded declaration prepass preserves closed recursive schemas without descriptor repetition |
 | Effect visibility | Strong | qualified catalog operations elaborate to declared abilities; ambient interop remains forbidden |
 | Type readability | Strong | signatures read left-to-right; idiomatic option fallback infers `[:option T]`, while descriptors remain only in low-level ABI forms |
-| Collection vocabulary | Mostly coherent | literal/vector/list/set operations are familiar, but source list, pair-chain list, typed `[:list T]`, and document list need careful documentation |
+| Collection vocabulary | Mostly coherent; native homogeneous path preserves the source aesthetic | literal/vector/list/set operations are familiar, and native vectors keep `[1 2 3]`/`nth` over a bounded host ABI; source list, pair-chain list, typed `[:list T]`, and document list still need careful documentation |
 | Document values | Strong | arbitrary bounded EDN map keys, canonical bytes, sets/lists/symbols, contextual `(document {...})` authoring, and KIR/ESM/Wasm/NBB parity are complete |
 | Binary values | Coherent bounded foundation | `(bytes)` is the canonical empty value; `:bytes` crosses checked KIR/ESM/Wasm closure boundaries; nonempty payloads remain explicit typed host/provider inputs |
 | Higher-order calls | Strong across closed and project-module boundaries | a lexical closure uses ordinary `(f ...)`; a computed head uses visible `invoke` but inherits any closed result context; `[:fn [params result] ...]` is the bounded public contract |
