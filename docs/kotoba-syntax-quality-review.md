@@ -25,17 +25,19 @@ representations or punctuation-heavy syntax.
 Provider#178 demonstrates that the existing type-directed surface is sufficient
 for production recursive data: ordinary `(nth p 0)` retains the exact child
 descriptor inferred from the variant arm and lowers to byte-identical Wasm.
-The remaining visual debt is now one declaration seam rather than expression
-noise throughout programs: recursive record schemas repeat one exact forward
-descriptor. Ordinary construction, record access, and heterogeneous projection
-no longer expose raw compiler operations in provider source.
+Compiler#527 and provider#179 close the final record-specific declaration seam:
+a recursive schema may refer to a later same-module `defrecord` without
+repeating its generated descriptor, while incompatible collisions and
+undeclared references still fail closed. Ordinary construction, record access,
+heterogeneous projection, and recursive record declarations no longer expose
+raw compiler plumbing in provider source.
 
 ## Evidence-based scorecard
 
 | Area | Assessment | Evidence |
 | --- | --- | --- |
 | Data and control | Strong core, one bounded edge | literals, recursive typed destructuring, `let`, `if`, `cond`, `case`, threading, bounded HOFs; heterogeneous `& rest` still needs a sliced descriptor |
-| Records and protocols | Strong bounded profile; one recursive declaration seam | `defrecord`, `defprotocol`, `definterface`, complete `extend-type`, `->Type`, and literal `map->Type` lower to nominal records and static calls; exact forward declarations preserve closed recursive schemas |
+| Records and protocols | Strong bounded profile; recursive declaration seam closed | `defrecord`, `defprotocol`, `definterface`, complete `extend-type`, `->Type`, and literal `map->Type` lower to nominal records and static calls; a bounded declaration prepass preserves closed recursive schemas without descriptor repetition |
 | Effect visibility | Strong | qualified catalog operations elaborate to declared abilities; ambient interop remains forbidden |
 | Type readability | Strong | signatures read left-to-right; idiomatic option fallback infers `[:option T]`, while descriptors remain only in low-level ABI forms |
 | Collection vocabulary | Mostly coherent | literal/vector/list/set operations are familiar, but source list, pair-chain list, typed `[:list T]`, and document list need careful documentation |
@@ -291,22 +293,24 @@ be a first-class function outside the truthful five-parameter callable ABI.
 receiver is a compile error. Both
 `(get record :field)` and the idiomatic `(:field record)` are type-directed.
 When an `ns` schema recursively refers to a later `defrecord`, compiler ADR
-0209 permits an exact qualified forward descriptor and rejects every
-incompatible collision. This is safe and explicit, but repeating the generated
-descriptor once is still less elegant than a declaration prepass that could
-establish the same nominal identity automatically.
+0210 predeclares the bounded same-module record descriptor before validating
+the closed graph. Exact explicit declarations remain compatible under ADR
+0209; incompatible collisions and undeclared names are rejected. The authored
+schema therefore states only the recursive edge, while `defrecord` owns the
+shape exactly once.
 `extend-protocol` defaults and dynamic map construction remain explicit gaps.
 Legacy primary tag dispatch still returns a zero sentinel for an unknown tag;
 that behavior should converge to fail-closed semantics rather than become part
 of the language aesthetic.
 
-Acceptance evidence is compiler ADR 0204/0205/0208/0209,
-compiler#520/#521/#525/#526, and the
+Acceptance evidence is compiler ADR 0204/0205/0208/0209/0210,
+compiler#520/#521/#525/#526/#527, and the
 `:record-protocol-static-dispatch` plus `:typed-defrecord-fields` cases
 executing on KIR and `wasm32-kotoba-v1` with results `16` and `13`, plus
-`:wide-nominal-records` executing with result `8`. Provider#177 / provider ADR
-0281 additionally proves twelve recursive production packages against their
-independent KIR oracles.
+`:wide-nominal-records` executing with result `8`. Provider#177/#179 and
+provider ADR 0281/0283 additionally prove twelve recursive production packages
+against their independent KIR oracles, with byte-identical Wasm after removing
+the explicit schema descriptors.
 
 ### Completed — type-directed access and nested patterns
 
@@ -342,7 +346,7 @@ completed slice on KIR and `wasm32-kotoba-v1` with result `26`.
 - Decide a bounded specialization rule for `extend-protocol` defaults and
   remove the legacy zero-sentinel dispatch path.
 
-After compiler#526 and provider#172–#178 (ADR 0276–0282), the canonical source
+After compiler#527 and provider#172–#179 (ADR 0276–0283), the canonical source
 scan on 2026-08-04 found zero authored `record-new`, `record-get`, or
 `hetero-vector-at` operations in provider `.kotoba` files. Twenty-six distinct
 provider packages removed all 274 sites without changing their exports,
@@ -353,18 +357,14 @@ More record or projection sugar is therefore not justified by current
 production evidence. The latest process and git records intentionally have
 separate nominal identities despite sharing a physical shape; the twelve
 recursive packages likewise use namespace-local `EdnKeyValue` identities.
-This is useful domain meaning rather than ABI-layout coincidence. The exact
-forward descriptor currently required at each recursive namespace boundary is
-truthful but visually repetitive; a future declaration prepass may remove that
-repetition only if it preserves the same exact-collision and closed-schema
-checks. Heterogeneous `& rest` remains a separate descriptor-slice problem and
-must not be inferred from the completed literal-index evidence.
+This is useful domain meaning rather than ABI-layout coincidence. The
+declaration prepass removes only repeated shape text and preserves
+exact-collision and closed-schema checks. Heterogeneous `& rest` remains a
+separate descriptor-slice problem and must not be inferred from the completed
+literal-index evidence.
 
 ### P1 — vocabulary and module consistency
 
-- Evaluate a declaration prepass for recursive `defrecord` references so an
-  `ns` schema can retain exact nominal identity without repeating the generated
-  descriptor; keep incompatible collisions fail-closed.
 - Document the four distinct sequence concepts where they first appear rather
   than relying on name prefixes alone.
 - Prefer an `ns` form in authored modules and conformance examples; keep
