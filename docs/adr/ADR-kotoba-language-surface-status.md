@@ -307,6 +307,13 @@ the recursive schema closed and auditable, although its one-time descriptor
 repetition remains a visible declaration-order seam rather than an ideal
 surface.
 
+Provider#178 / provider ADR 0282 then replaces the final 32 explicit
+`hetero-vector-at` projections in sixteen recursive EDN packages with ordinary
+literal `nth`. Compiler ADR 0206 already carries the exact pair descriptor from
+the variant arm, so this required no new syntax and produced byte-identical
+Wasm artifacts. The canonical provider source scan now finds zero authored
+`record-new`, `record-get`, or `hetero-vector-at` calls.
+
 All three backends now provide the explicit lazy-sequence slice. A non-empty
 sequence is a resolver closure that yields either zero (empty) or a pair of
 zero-arity closures, one for the head and one for the tail. `lazy-first` and

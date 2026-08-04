@@ -22,11 +22,13 @@ construction and generic option fallback likewise use contextual/type-directed
 elaboration into existing typed primitives rather than new runtime
 representations or punctuation-heavy syntax.
 
-The remaining visual debt is sharply bounded rather than spread through the
-language: recursive record schemas repeat one exact forward descriptor, and 32
-provider projections still spell `hetero-vector-at` with a complete vector
-descriptor. Ordinary record construction and access no longer expose raw
-compiler operations.
+Provider#178 demonstrates that the existing type-directed surface is sufficient
+for production recursive data: ordinary `(nth p 0)` retains the exact child
+descriptor inferred from the variant arm and lowers to byte-identical Wasm.
+The remaining visual debt is now one declaration seam rather than expression
+noise throughout programs: recursive record schemas repeat one exact forward
+descriptor. Ordinary construction, record access, and heterogeneous projection
+no longer expose raw compiler operations in provider source.
 
 ## Evidence-based scorecard
 
@@ -340,22 +342,23 @@ completed slice on KIR and `wasm32-kotoba-v1` with result `26`.
 - Decide a bounded specialization rule for `extend-protocol` defaults and
   remove the legacy zero-sentinel dispatch path.
 
-After compiler#526 and provider#172–#177 (ADR 0276–0281), an organization-wide
-source scan on 2026-08-04 found 32 remaining explicit low-level operations, all
-`hetero-vector-at`, across 16 `.kotoba` files. Twenty-two migrated provider
-packages removed 242 sites from the original 274 and now contain no authored
-`record-new` or `record-get`, without changing their exports, capability wires,
-or `main` oracles.
+After compiler#526 and provider#172–#178 (ADR 0276–0282), the canonical source
+scan on 2026-08-04 found zero authored `record-new`, `record-get`, or
+`hetero-vector-at` operations in provider `.kotoba` files. Twenty-six distinct
+provider packages removed all 274 sites without changing their exports,
+capability wires, `main` oracles, or, for the final `nth` migration, even their
+Wasm bytes.
 
-The residual therefore needs descriptor-aware heterogeneous access rather than
-more nominal-record sugar. The latest process and git records intentionally
-have separate nominal identities despite sharing a physical shape; the twelve
+More record or projection sugar is therefore not justified by current
+production evidence. The latest process and git records intentionally have
+separate nominal identities despite sharing a physical shape; the twelve
 recursive packages likewise use namespace-local `EdnKeyValue` identities.
 This is useful domain meaning rather than ABI-layout coincidence. The exact
 forward descriptor currently required at each recursive namespace boundary is
 truthful but visually repetitive; a future declaration prepass may remove that
 repetition only if it preserves the same exact-collision and closed-schema
-checks.
+checks. Heterogeneous `& rest` remains a separate descriptor-slice problem and
+must not be inferred from the completed literal-index evidence.
 
 ### P1 — vocabulary and module consistency
 
