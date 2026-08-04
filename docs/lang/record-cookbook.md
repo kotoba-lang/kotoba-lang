@@ -38,10 +38,23 @@ Prefer the nominal declaration and ordinary access surface:
 ```
 
 Unannotated fields default to `:i64`. Records admit up to 32 unique fields.
-Direct `->Type` and exact-literal `map->Type` construction work for wide
-records; only first-class constructor values remain bounded by the truthful
-five-parameter callable ABI. `record-new` and `record-get` are low-level
-representation operations, not the default authored style.
+Direct `->Type` and exact-map `map->Type` construction work for wide records.
+The nominal context may cross total bounded control while each result leaf
+keeps the exact declared fields:
+
+```kotoba
+(map->Point
+  (if enabled
+    {:x 3 :y 4}
+    {:y fallback :x 0}))
+```
+
+This covers `if`/`if-not`/`if-let`/`if-some`, `cond` with `:else`,
+`case`/`condp` with a default, and final `let`/`do` results. An arbitrary map
+variable is not coerced to a record. Only first-class constructor values remain
+bounded by the truthful five-parameter callable ABI. `record-new` and
+`record-get` are low-level representation operations, not the default authored
+style.
 
 Recursive schemas state the edge once and let `defrecord` own the shape:
 
@@ -110,16 +123,16 @@ Do **not** add new packs while rewriting.
 - `:record-ops` = `#{record-new record-get}` after frontend elaboration
 - `:structural-args` preference still lists `:record` first  
 - `:forbidden-patterns` bans new public base-N packs  
-- Authored nominal source uses `defrecord`, `->Type`, exact-literal
-  `map->Type`, `(get record :field)`, or `(:field record)`; free ambient host
-  maps and reflection remain excluded
+- Authored nominal source uses `defrecord`, `->Type`, exact-map `map->Type`
+  (including total bounded control), `(get record :field)`, or
+  `(:field record)`; free ambient host maps and reflection remain excluded
 
 ---
 
 ## Related
 
-- compiler ADR 0165 / 0189 / 0190 / 0204 / 0208 / 0210
-- compiler#520/#525/#527 and provider#172–#179
+- compiler ADR 0165 / 0189 / 0190 / 0204 / 0208 / 0210 / 0214
+- compiler#520/#525/#527/#532 and provider#172–#179
 - T5.2 host bridge / T5.3 murakumo#193–#206  
 - `docs/adr/ADR-reliability-record-access-and-bool-comparisons.md`  
 - `docs/lang/surface-matrix.md` (T2.2 generated overview)

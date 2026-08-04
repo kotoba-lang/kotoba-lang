@@ -33,6 +33,19 @@
     (is (some #{:contextual-computed-invoke-result-inference}
               (:supports closure)))))
 
+(deftest computed-record-maps-stay-nominal-exact-and-total
+  (let [surface (sm/load-surface-status)
+        records (get-in surface [:other-gaps :protocol-and-record-dispatch])
+        constructor (get-in records [:record-data :map-constructor :compiler])]
+    (is (= :exact-literal-map (:leaf constructor)))
+    (is (= :declared-nominal-record (:context constructor)))
+    (is (= '#{if if-not if-let if-some cond case condp let do}
+           (:computed-through constructor)))
+    (is (= :all-result-paths-required (:totality constructor)))
+    (is (= :rejected (:runtime-map-guessing constructor)))
+    (is (not-any? #{:dynamic-map-constructor}
+                  (:missing records)))))
+
 (deftest on-disk-matrix-matches-regenerated
   (let [r (sm/check-matrix!)]
     (is (true? (:ok? r))

@@ -24,6 +24,12 @@ representations or punctuation-heavy syntax. A declared `:document` result or
 typed request now admits the closed literal directly, so the type and the data
 shape are each written once.
 
+Nominal record construction follows the same rule. `map->Type` writes the
+identity once and propagates it only through total bounded control result
+positions; every reachable leaf remains an exact declared-field map. This
+removes repeated branch constructors without introducing dynamic record
+coercion or runtime shape guessing.
+
 Provider#178 demonstrates that the existing type-directed surface is sufficient
 for production recursive data: ordinary `(nth p 0)` retains the exact child
 descriptor inferred from the variant arm and lowers to byte-identical Wasm.
@@ -49,7 +55,7 @@ composed i64/f64 vector paths on the host ISA.
 | Area | Assessment | Evidence |
 | --- | --- | --- |
 | Data and control | Strong bounded profile | closed mixed/nested literals, recursive typed destructuring including heterogeneous `& rest`, `let`, `if`, `cond`, `case`, threading, and bounded HOFs |
-| Records and protocols | Strong bounded profile; recursive declaration seam closed | `defrecord`, `defprotocol`, `definterface`, complete `extend-type`, `->Type`, and literal `map->Type` lower to nominal records and static calls; a bounded declaration prepass preserves closed recursive schemas without descriptor repetition |
+| Records and protocols | Strong bounded profile; recursive declaration and computed-construction seams closed | `defrecord`, `defprotocol`, `definterface`, complete `extend-type`, `->Type`, and exact-map `map->Type` through total bounded control lower to nominal records and static calls; a bounded declaration prepass preserves closed recursive schemas without descriptor repetition |
 | Effect visibility | Strong | qualified catalog operations elaborate to declared abilities; ambient interop remains forbidden |
 | Type readability | Strong | signatures read left-to-right; idiomatic option fallback infers `[:option T]`, while descriptors remain only in low-level ABI forms |
 | Collection vocabulary | Mostly coherent; native homogeneous path preserves the source aesthetic | literal/vector/list/set operations are familiar, and native vectors keep `[1 2 3]`/`nth` over a bounded host ABI; source list, pair-chain list, typed `[:list T]`, and document list still need careful documentation |
@@ -317,8 +323,11 @@ default to `:i64`; typed fields reuse the function signature spelling,
 For records wider than five fields, direct `->Type` and exact-literal
 `map->Type` construction remain available, while `->Type` does not pretend to
 be a first-class function outside the truthful five-parameter callable ABI.
-`map->Type` accepts an exact literal map, and an unknown or unimplemented
-receiver is a compile error. Both
+`map->Type` also carries that nominal context through the result positions of
+total `if`/`if-not`/`if-let`/`if-some`, `cond` with `:else`, `case`/`condp`
+with defaults, and the final expression of `let`/`do`. Every reachable leaf
+must still be an exact literal map. Missing paths, wrong key sets, and arbitrary
+map variables are compile errors rather than runtime coercions. Both
 `(get record :field)` and the idiomatic `(:field record)` are type-directed.
 When an `ns` schema recursively refers to a later `defrecord`, compiler ADR
 0210 predeclares the bounded same-module record descriptor before validating
@@ -326,16 +335,21 @@ the closed graph. Exact explicit declarations remain compatible under ADR
 0209; incompatible collisions and undeclared names are rejected. The authored
 schema therefore states only the recursive edge, while `defrecord` owns the
 shape exactly once.
-`extend-protocol` defaults and dynamic map construction remain explicit gaps.
+`extend-protocol` defaults remain an explicit gap. Arbitrary dynamic-map to
+record conversion is deliberately not hidden inside `map->Type`; if needed it
+requires a separately named checked operation and a real dynamic-map value
+contract.
 Legacy primary tag dispatch still returns a zero sentinel for an unknown tag;
 that behavior should converge to fail-closed semantics rather than become part
 of the language aesthetic.
 
-Acceptance evidence is compiler ADR 0204/0205/0208/0209/0210,
-compiler#520/#521/#525/#526/#527, and the
+Acceptance evidence is compiler ADR 0204/0205/0208/0209/0210/0214,
+compiler#520/#521/#525/#526/#527/#532, and the
 `:record-protocol-static-dispatch` plus `:typed-defrecord-fields` cases
 executing on KIR and `wasm32-kotoba-v1` with results `16` and `13`, plus
-`:wide-nominal-records` executing with result `8`. Provider#177/#179 and
+`:wide-nominal-records` executing with result `8`. The computed constructor
+suite also executes on KIR, restricted ESM, and browser Wasm, while its
+JVM-free NBB Wasm fixture fixes the portable compiler path. Provider#177/#179 and
 provider ADR 0281/0283 additionally prove twelve recursive production packages
 against their independent KIR oracles, with byte-identical Wasm after removing
 the explicit schema descriptors.
@@ -409,10 +423,13 @@ a plausible value.
   similar physical ABI preparation stays in providers and generated adapters.
 - Extend contextual callable results to linear resources only when a truthful
   affine trap/result model exists; never invent a fallback handle for elegance.
-- Add non-literal `map->Type` without weakening nominal identity or bounded
-  heterogeneous construction.
 - Decide a bounded specialization rule for `extend-protocol` defaults and
   remove the legacy zero-sentinel dispatch path.
+
+Compiler#532 closes the former non-literal `map->Type` item with exact map
+leaves under total bounded control. It does not relabel arbitrary runtime maps
+as records, so nominal identity and heterogeneous field descriptors remain
+closed.
 
 After compiler#527 and provider#172–#179 (ADR 0276–0283), the canonical source
 scan on 2026-08-04 found zero authored `record-new`, `record-get`, or
@@ -475,5 +492,5 @@ computed-call operator (`invoke`), explicit top-level function conversion
 ops audit wire no longer contribute to that friction: canonical bytes, float
 tagging, and limits are hidden behind semantic operations.
 Record/protocol code is no longer part of that friction: ordinary declarations,
-constructors, field access, and statically resolved calls now form one readable
-source story.
+constructors including computed total-control `map->Type`, field access, and
+statically resolved calls now form one readable source story.
