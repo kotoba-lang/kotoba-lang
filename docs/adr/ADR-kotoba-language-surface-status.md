@@ -262,7 +262,10 @@ vector/list runtime class identity is intentionally outside this bounded,
 shape-directed profile.
 
 `defrecord` is now implemented across the compiler and primary Kotoba Wasm/CLJS
-lowerers. It expands to deterministic
+lowerers. The canonical compiler admits up to 32 fields independently of the
+five-parameter callable ABI. Wider records keep direct `->Type` and exact-map
+`map->Type` construction, but do not manufacture a dishonest first-class
+constructor function. It expands to deterministic
 `->Type` and `map->Type` constructors over persistent maps and stores the
 record identity under `:kotoba.record/type`. Field lookup and persistent update
 reuse ordinary map operations. `defprotocol` declarations and record-local
@@ -276,6 +279,11 @@ safe static method contract—never as ambient JVM/JS interop. The shared
 `record-protocol-static-dispatch` conformance case covers constructors,
 record-local implementation, and `extend-type`; this bounded static-dispatch
 slice now has portable backend parity.
+
+Compiler ADR 0208 / compiler#525 proves the wide nominal profile on KIR and
+`wasm32-kotoba-v1`. Provider#172 / provider ADR 0276 is the first production
+source migration: its six-field HTTP request removed 44 raw record operations
+while preserving the exported ABI and `main = -9242`.
 
 All three backends now provide the explicit lazy-sequence slice. A non-empty
 sequence is a resolver closure that yields either zero (empty) or a pair of
