@@ -326,12 +326,11 @@ completed slice on KIR and `wasm32-kotoba-v1` with result `26`.
 - Decide a bounded specialization rule for `extend-protocol` defaults and
   remove the legacy zero-sentinel dispatch path.
 
-After compiler#525 and the first two provider migrations in provider#172/#173
-(ADR 0276/0277), an organization-wide source scan on 2026-08-04 found 206
-remaining explicit low-level record operations (`record-get` 95, `record-new`
-79, `hetero-vector-at` 32) across 24 `.kotoba` files. The migrated combined and
-request-only HTTP packages removed 68 such sites and now use nominal records
-without changing their exports or `main = -9242` / `main = -9002`. The
+After compiler#525 and provider#172–#174 (ADR 0276–0278), an organization-wide
+source scan on 2026-08-04 found 162 remaining explicit low-level record
+operations (`record-get` 69, `record-new` 61, `hetero-vector-at` 32) across 22
+`.kotoba` files. Four migrated HTTP packages removed 112 such sites and now use
+nominal records without changing their exports or `main` oracles. The
 remaining sites are concentrated in `kotoba-lang/provider` Wasm-package
 sources rather than ordinary application code, so the next high-leverage work
 is to repeat this schema-driven migration package by package; adding more
