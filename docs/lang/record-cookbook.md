@@ -1,7 +1,7 @@
 # Record & typed structural args cookbook (pure-product / T4.4)
 
 **WBS:** T4.4  
-**Status:** accepted (guide + dual-backend pilot evidence)  
+**Status:** accepted (portable compiler + production provider evidence)
 **Related:** [T5.1 structural args](../adr/ADR-reliability-t51-structural-args.md),
 [option/result guide](./option-result-guide.md), Product Value ABI v1
 
@@ -14,7 +14,7 @@ base-N packs, `has-*` sentinels, or arity growth past `max-parameters` 5.
 
 | Situation | Prefer |
 |---|---|
-| 2+ named fields (config, seats, claim body) | `[:record …]` |
+| 2+ named fields (config, seats, claim body) | nominal `defrecord` |
 | Presence / absence of one value | `[:option T]` (T4.3) |
 | Short ordered bag of same-role values | hetero-vector (when admitted) |
 | Truly positional ≤5 stable args | flat arity |
@@ -24,44 +24,48 @@ base-N packs, `has-*` sentinels, or arity growth past `max-parameters` 5.
 
 ## 2. Sealed record surface (guest)
 
-Schema shape:
-
-```text
-[:record :ns/name [[:field-a :i64] [:field-b :string] …]]
-```
-
-Ops (compiler / KIR / wasm32):
-
-| Op | Meaning |
-|---|---|
-| `(record-new SCHEMA v1 v2 …)` | Construct; arity = field count |
-| `(record-get SCHEMA rec :field)` | Project field |
-
-### Golden dual-backend pilot
-
-`compiler` T1.3 case `:record-kit` (`values/record_kit.kotoba`):
+Prefer the nominal declaration and ordinary access surface:
 
 ```kotoba
-(ns kotoba.lang.conformance.record-kit)
+(ns demo.point)
+
+(defrecord Point [x :i64 y :i64])
 
 (defn main []
-  (+ (record-get [:record :demo/point [[:x :i64] [:y :i64]]]
-                 (record-new [:record :demo/point [[:x :i64] [:y :i64]]] 3 4)
-                 :x)
-     (record-get [:record :demo/point [[:x :i64] [:y :i64]]]
-                 (record-new [:record :demo/point [[:x :i64] [:y :i64]]] 3 4)
-                 :y)))
+  (+ (:x (->Point 3 4))
+     (get (map->Point {:x 3 :y 4}) :y)))
 ;; expect 7 on KIR + wasm32-kotoba-v1
 ```
 
-Evidence: compiler#416 / ADR 0165 — `clojure -M:conformance` includes this case.
+Unannotated fields default to `:i64`. Records admit up to 32 unique fields.
+Direct `->Type` and exact-literal `map->Type` construction work for wide
+records; only first-class constructor values remain bounded by the truthful
+five-parameter callable ABI. `record-new` and `record-get` are low-level
+representation operations, not the default authored style.
+
+Recursive schemas state the edge once and let `defrecord` own the shape:
+
+```kotoba
+(ns demo.tree
+  (:schemas {:tree/node
+             [:variant :tree/node
+              [[:entry [:ref :demo.tree/Entry]]]]}))
+
+(defrecord Entry [k :string v :string])
+```
+
+Compiler ADR 0210 predeclares eligible same-module records before validating
+the closed schema graph. Exact explicit descriptors remain compatible, while
+undeclared references and incompatible same-name descriptors fail closed.
 
 ### Rules of thumb
 
-1. **Nominal schema** — field list + `:ns/name` identity; wrong nominal fails closed.  
-2. **Field types** — pure-product hosts still prefer scalar + option + string; nested recursive records remain a later W4 concern.  
+1. **Nominal schema** — namespace plus record name owns identity; equal physical fields do not make records interchangeable.
+2. **Field types** — use canonical admitted value descriptors; recursive W4 records are production-proven.
 3. **Do not** invent parallel `has-x` i64 fields when an option field works.  
-4. **Host bridge** — product CLJ/CLJS hosts call via positional args or murakumo `call-record` (T5.2 partial); native guest record wire still deferred.  
+4. **Host bridge** — product CLJ/CLJS `call-record` cutovers are landed; W4
+   guest modules encode nominal records while live host I/O remains explicitly
+   injected.
 5. **max-parameters 5** stays (T5.4); records are the multi-field escape hatch.
 
 ---
@@ -91,7 +95,7 @@ Keyword keys and large/heterogeneous maps remain out of the pure-product default
 | task assign pack3 | `:task/pair|triple|assign2|3` | **landed** murakumo#203 |
 | rebalance demand / seat-order packs | `:rebalance/demand|order` (+ lanes) | **landed** murakumo#204 — **T5.3 packs complete** |
 | `has-name` + `name` twin | `[:option :string]` + `if-some` | ongoing (forbidden-pattern) |
-| bool-typed comparisons / bool export ABI | language profile 5 (compiler ADR 0191) | design accepted; A/B/C remaining (typed-bool-value, export box, goldens) |
+| bool-typed comparisons / bool export ABI | language profile 5 (compiler ADR 0191) | typed predicates landed; external Wasm exports retain the recorded Canonical ABI boundary |
 
 Do **not** add new packs while rewriting.
 
@@ -99,20 +103,23 @@ Do **not** add new packs while rewriting.
 
 ## 5. Pure-product profile alignment
 
-`lang/pure-product-profile.edn` (2026-07-30):
+`lang/pure-product-profile.edn` keeps the low-level representation contract:
 
 - `:value-types` includes **`:record`** (kind tag; concrete form
   `[:record :ns/name [[:f T] …]]`) — closes ADR-2607299400 P1
-- `:record-ops` = `#{record-new record-get}` (2-arity + schema-ref evidence above)
+- `:record-ops` = `#{record-new record-get}` after frontend elaboration
 - `:structural-args` preference still lists `:record` first  
 - `:forbidden-patterns` bans new public base-N packs  
-- Still **not** free Clojure maps / `defrecord` / keyword field invoke
+- Authored nominal source uses `defrecord`, `->Type`, exact-literal
+  `map->Type`, `(get record :field)`, or `(:field record)`; free ambient host
+  maps and reflection remain excluded
 
 ---
 
 ## Related
 
-- compiler ADR 0165 / 0189 / 0190, T1.3 pilot suite  
+- compiler ADR 0165 / 0189 / 0190 / 0204 / 0208 / 0210
+- compiler#520/#525/#527 and provider#172–#179
 - T5.2 host bridge / T5.3 murakumo#193–#206  
 - `docs/adr/ADR-reliability-record-access-and-bool-comparisons.md`  
 - `docs/lang/surface-matrix.md` (T2.2 generated overview)
