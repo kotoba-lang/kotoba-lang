@@ -58,11 +58,34 @@ composed i64/f64 vector paths on the host ISA.
 | Records and protocols | Strong bounded profile; recursive declaration and computed-construction seams closed | `defrecord`, `defprotocol`, `definterface`, complete `extend-type`, `->Type`, and exact-map `map->Type` through total bounded control lower to nominal records and static calls; a bounded declaration prepass preserves closed recursive schemas without descriptor repetition |
 | Effect visibility | Strong | qualified catalog operations elaborate to declared abilities; ambient interop remains forbidden |
 | Type readability | Strong | signatures read left-to-right; idiomatic option fallback infers `[:option T]`, while descriptors remain only in low-level ABI forms |
-| Collection vocabulary | Mostly coherent; native homogeneous path preserves the source aesthetic | literal/vector/list/set operations are familiar, and native vectors keep `[1 2 3]`/`nth` over a bounded host ABI; source list, pair-chain list, typed `[:list T]`, and document list still need careful documentation |
+| Collection vocabulary | Strong bounded vocabulary | literal/vector/list/set operations remain familiar; four distinct sequence concepts are named below, while native vectors keep `[1 2 3]`/`nth` over a bounded host ABI |
 | Document values | Strong | arbitrary bounded EDN map keys, canonical bytes, sets/lists/symbols, explicit `(document {...})` plus type-directed bare literals, and KIR/ESM/Wasm/NBB parity are complete |
 | Binary values | Coherent bounded foundation | `(bytes)` is the canonical empty value; `:bytes` crosses checked KIR/ESM/Wasm closure boundaries; nonempty payloads remain explicit typed host/provider inputs |
 | Higher-order calls | Strong across closed and project-module boundaries | a lexical closure uses ordinary `(f ...)`; a computed head uses visible `invoke` but inherits any closed result context; `[:fn [params result] ...]` is the bounded public contract |
 | Failure/effect semantics | Strong | unsupported syntax, undeclared effects, oversized expansion, and host authority fail closed |
+
+## Sequence vocabulary
+
+Kotoba deliberately has four sequence-shaped concepts. They share familiar
+operations where their semantics agree, but they are not interchangeable:
+
+1. A source collection literal (`[...]`, `(list ...)`, or `#{...}`) is an
+   immutable, eager, fuel-bounded value. Its portable lowering is a persistent
+   pair-chain; native homogeneous vectors may use a checked host handle without
+   changing source syntax.
+2. A typed list (`[:list T]`) is the open-boundary descriptor for a homogeneous
+   eager list. Authors normally construct it with `(list ...)`; the descriptor
+   appears only where inference cannot recover `T`.
+3. A lazy sequence is a pure call-by-name resolver used by `lazy-map`,
+   `lazy-filter`, `take`, and `drop`. It is not memoized, and effectful thunks
+   are rejected.
+4. A stream (`[:stream :bytes]`, normally inside `[:task ...]`) is an affine
+   capability resource. Reading or dropping it consumes authority; it is not a
+   persistent collection and cannot be copied or serialized as an ordinary
+   value.
+
+This naming keeps representation details out of normal code while making the
+important persistence, evaluation, and ownership differences explicit.
 
 ## Preserve
 
@@ -467,12 +490,17 @@ guessing from incomplete runtime evidence.
 
 ### P1 — vocabulary and module consistency
 
-- Document the four distinct sequence concepts where they first appear rather
-  than relying on name prefixes alone.
-- Prefer an `ns` form in authored modules and conformance examples; keep
-  namespace-free files only as explicit minimal-script fixtures.
-- Use predicates with `?`, effecting operations with `!`, and qualified names
-  for capability operations consistently in the language-owned catalog.
+The four sequence concepts are now named explicitly above. A 2026-08-05
+workspace scan found `ns` in 138 of 141 `.kotoba` files. The three exceptions
+are intentional: one minimal browser qualification, one concatenated Wasm ABI
+fragment whose owning source contains `ns`, and one separate generated schema
+DSL that merely uses the file extension. Low-level option projection and
+branching are also absent from authored `.kotoba`: `option-value-of` and
+`option-match` have zero call sites; ordinary code uses `option-or`, `if-some`,
+`when-some`, threading, or `match-option`.
+
+The remaining P1 convention is ongoing catalog hygiene: predicates use `?`,
+effecting operations use `!`, and capability operations stay qualified.
 
 ## Explicit non-goals
 
