@@ -20,7 +20,9 @@ Ambiguous computed calls still spell the descriptor, because hiding a real
 choice there would be runtime guessing rather than elegance. Document
 construction and generic option fallback likewise use contextual/type-directed
 elaboration into existing typed primitives rather than new runtime
-representations or punctuation-heavy syntax.
+representations or punctuation-heavy syntax. A declared `:document` result or
+typed request now admits the closed literal directly, so the type and the data
+shape are each written once.
 
 Provider#178 demonstrates that the existing type-directed surface is sufficient
 for production recursive data: ordinary `(nth p 0)` retains the exact child
@@ -51,7 +53,7 @@ composed i64/f64 vector paths on the host ISA.
 | Effect visibility | Strong | qualified catalog operations elaborate to declared abilities; ambient interop remains forbidden |
 | Type readability | Strong | signatures read left-to-right; idiomatic option fallback infers `[:option T]`, while descriptors remain only in low-level ABI forms |
 | Collection vocabulary | Mostly coherent; native homogeneous path preserves the source aesthetic | literal/vector/list/set operations are familiar, and native vectors keep `[1 2 3]`/`nth` over a bounded host ABI; source list, pair-chain list, typed `[:list T]`, and document list still need careful documentation |
-| Document values | Strong | arbitrary bounded EDN map keys, canonical bytes, sets/lists/symbols, contextual `(document {...})` authoring, and KIR/ESM/Wasm/NBB parity are complete |
+| Document values | Strong | arbitrary bounded EDN map keys, canonical bytes, sets/lists/symbols, explicit `(document {...})` plus type-directed bare literals, and KIR/ESM/Wasm/NBB parity are complete |
 | Binary values | Coherent bounded foundation | `(bytes)` is the canonical empty value; `:bytes` crosses checked KIR/ESM/Wasm closure boundaries; nonempty payloads remain explicit typed host/provider inputs |
 | Higher-order calls | Strong across closed and project-module boundaries | a lexical closure uses ordinary `(f ...)`; a computed head uses visible `invoke` but inherits any closed result context; `[:fn [params result] ...]` is the bounded public contract |
 | Failure/effect semantics | Strong | unsupported syntax, undeclared effects, oversized expansion, and host authority fail closed |
@@ -99,6 +101,22 @@ inside the form is inert closed data; a nested list becomes a document list and
 is never invoked. Dynamic expressions outside the closed form stay explicitly
 boxed. This removes representation noise without adding a second value model,
 codec, or backend path.
+
+Compiler#531 removes the wrapper where the enclosing type already makes the
+choice exact:
+
+```clojure
+(defn request [] :document
+  {:goal "migrate"
+   :attempt 3
+   :actors #{actor/run}})
+```
+
+The automatic form is deliberately narrower than explicit `(document ...)`:
+simple symbols and lists remain variable/call expressions, while namespaced
+symbols and recursively closed scalar/map/vector/set data elaborate directly.
+This is the attractive boundary: ordinary data remains ordinary data, but the
+compiler does not guess whether ambiguous syntax is code or data.
 
 Landed acceptance evidence:
 
@@ -448,7 +466,9 @@ parameters, captures, and results are inferred inside a closed module and
 explicitly contracted at an open-module boundary across KIR, restricted ESM,
 and Wasm. The `[:fn ...]` spelling is consistent with `[:option T]` and
 `[:result T E]`, while ordinary calls remain `(f x)` and the physical ABI stays
-hidden. With multi-expression `do` and recursive typed patterns portable, the
+hidden. Type-directed bare document literals improve this without closing or
+renaming the distinct physical compiler data-host ABI gap. With
+multi-expression `do` and recursive typed patterns portable, the
 remaining aesthetic friction is concentrated in the intentionally visible
 computed-call operator (`invoke`), explicit top-level function conversion
 (`fn-ref`), and compiler/provider ABI preparation. Actor Delta and provider
