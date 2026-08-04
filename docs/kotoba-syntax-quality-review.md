@@ -398,8 +398,11 @@ path. This is architectural evidence for the syntax rule: physical wire
 preparation belongs in generated/provider adapters, while public code names the
 semantic operation.
 
-This does not close the canonical compiler `data-host-arg` gap below. It proves
-the target layering and removes one production boundary that violated it.
+Compiler#533 now applies this layering to canonical compiler hosts for scalar
+and `:document` abilities. Authored code keeps the qualified semantic call;
+the generated adapter alone translates ordinary canonical values to bounded
+`kotoba.value.v1` bytes. The legacy `data-host-arg` spelling remains
+kotoba-wasm-only and is not the portable language direction.
 
 The provider ops kits now confirm the same rule across HTTP, secret, process,
 git, entropy, and scoped-fs audit paths. Their public operations did not acquire
@@ -419,8 +422,10 @@ a plausible value.
 
 ### P0 — remove remaining compiler-shaped source plumbing
 
-- Finish canonical compiler data-host arguments so `bytes-ptr`/`bytes-len` and
-  similar physical ABI preparation stays in providers and generated adapters.
+- Standardize schema-directed record/variant/option/result ability wire shapes
+  and the Wasm component host binding. Compiler#533 already keeps
+  `bytes-ptr`/`bytes-len` and codec selection inside generated adapters for
+  scalar and `:document` JVM/CLJS hosts.
 - Extend contextual callable results to linear resources only when a truthful
   affine trap/result model exists; never invent a fallback handle for elegance.
 - Decide a bounded specialization rule for `extend-protocol` defaults and
