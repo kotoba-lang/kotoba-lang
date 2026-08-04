@@ -13,12 +13,12 @@ forms, destructuring, threading, records, and collection literals compose in a
 recognizable Clojure-shaped language without inheriting ambient Clojure/JVM
 authority.
 
-The syntax is not yet uniformly beautiful at representation boundaries.
-Computed first-class function invocation still exposes its result descriptor,
-while lexical integer, f32/f64, predicate, vector-i64/vector-f64, document,
-record, option, result, variant, heterogeneous-vector, typed-set, and typed-map
-producing calls stay direct in known result contexts. Document
-construction and generic option fallback use contextual/type-directed
+The syntax is now consistently clean at statically recoverable representation
+boundaries. Lexical and computed first-class function calls both reuse a closed
+consumer or return context instead of repeating their result descriptor.
+Ambiguous computed calls still spell the descriptor, because hiding a real
+choice there would be runtime guessing rather than elegance. Document
+construction and generic option fallback likewise use contextual/type-directed
 elaboration into existing typed primitives rather than new runtime
 representations or punctuation-heavy syntax.
 
@@ -32,7 +32,7 @@ representations or punctuation-heavy syntax.
 | Collection vocabulary | Mostly coherent | literal/vector/list/set operations are familiar, but source list, pair-chain list, typed `[:list T]`, and document list need careful documentation |
 | Document values | Strong | arbitrary bounded EDN map keys, canonical bytes, sets/lists/symbols, contextual `(document {...})` authoring, and KIR/ESM/Wasm/NBB parity are complete |
 | Binary values | Coherent bounded foundation | `(bytes)` is the canonical empty value; `:bytes` crosses checked KIR/ESM/Wasm closure boundaries; nonempty payloads remain explicit typed host/provider inputs |
-| Higher-order calls | Strong across closed and project-module boundaries; explicit for computed heads | a lexical closure uses ordinary `(f ...)`; `[:fn [params result] ...]` is the bounded public contract; `invoke` remains for computed heads |
+| Higher-order calls | Strong across closed and project-module boundaries | a lexical closure uses ordinary `(f ...)`; a computed head uses visible `invoke` but inherits any closed result context; `[:fn [params result] ...]` is the bounded public contract |
 | Failure/effect semantics | Strong | unsupported syntax, undeclared effects, oversized expansion, and host authority fail closed |
 
 ## Preserve
@@ -106,8 +106,10 @@ boolean result family and a wrong-family closure traps. True special heads
 (`let`, `if`, `do`, `fn`, `loop`, `recur`) remain non-shadowable, while an
 unknown global call head still fails closed instead of becoming a host lookup.
 
-`invoke` remains intentional for a computed/non-symbol closure expression or
-when authored code must select a result family explicitly. `fn-ref` remains
+`invoke` remains intentional for a computed/non-symbol closure expression.
+Its result descriptor is omitted when a closed consumer or return annotation
+already determines it, and remains explicit only when authored code must make
+an otherwise ambiguous result-family choice. `fn-ref` remains
 the explicit conversion of a known top-level function into a value. This keeps
 the common lexical path visually ordinary without pretending that every form
 in call-head position is dynamically callable.
@@ -116,14 +118,14 @@ The same contextual rule now covers `:vector-i64`: vector operations and the
 collection inputs to `map`, `filter`, and `reduce` select the vector dispatcher
 for a lexical call. This admits library-shaped code such as
 `(defn call-singleton [f] (vector-at (f 7) 0))`, while a computed closure head
-uses `(invoke :vector-i64 closure 7)`. Wrong result families and unknown lambda
+uses `(invoke closure 7)` in that same context. Wrong result families and unknown lambda
 ids still trap rather than coerce.
 
 String-consuming operations now provide the corresponding `:string` context,
 and declared `:string` function results carry it through the value-producing
 tails of `let`, `if`, and `do`. Thus `(string-length (render 42))` stays an
 ordinary lexical call, including through a declared library boundary. A
-computed closure head remains explicit as `(invoke :string closure 42)`, and a
+computed closure head remains visible as `(invoke closure 42)`, and a
 wrong-family closure still traps closed.
 
 The same closed rule now covers `:document`. Document consumers and
@@ -131,13 +133,13 @@ unambiguous document constructor positions select the document dispatcher, so
 `(document-count (build 42))` remains ordinary lexical application and a
 declared `:document` result carries through `let`, `if`, and `do` tails.
 Document-map keys deliberately remain explicit when their type is ambiguous
-between keyword and document; computed heads use `(invoke :document ...)`.
+between keyword and document; contextual computed heads use `(invoke ...)`.
 
 The flat dispatcher profile also covers `:f32`, `:f64`, and `:vector-f64`.
 Numeric operations, comparisons, conversions, and vector-f64 consumers provide
 the expected result context, so ordinary lexical calls remain `(decode bits)`
 or `(samples bits)` rather than spelling a descriptor at each use. Explicit
-computed calls remain `(invoke :f64 closure bits)`, with a wrong numeric family
+computed calls remain `(invoke closure bits)` in a numeric context, with a wrong numeric family
 trapping before any typed default can escape.
 
 The dispatcher is now keyed by the complete canonical result descriptor for
@@ -150,17 +152,18 @@ requested dispatcher signatures, so an outer closure can call an inner typed
 closure without falling back to provisional `:i64` inference. Schema references
 are resolved before variant construction, matching, rewriting, and dispatch.
 Different nominal or parameterized values never share a dispatcher. At a
-genuinely computed head, the full descriptor remains visible, for example
+computed head the operator stays visible, but the full descriptor is written
+only when no surrounding form determines it, for example
 `(invoke [:option :string] closure 42)`. That explicitness is useful honesty at
-the dynamic boundary, not syntax noise on the common path.
+an ambiguous type boundary, not syntax noise on every dynamic call.
 
 Canonical typed lists follow the same rule. In ordinary source the constructor
 remains the familiar `(list ...)`; a surrounding `[:list T]` result context
 selects the canonical boundary representation without exposing the internal
-`typed-list-new` KIR operation. Only a genuinely computed call spells the
-boundary choice, for example `(invoke [:list :i64] closure 42)`. This is a good
-division of syntax: construction stays data-shaped, while representation is
-made explicit exactly where static call-head inference cannot recover it.
+`typed-list-new` KIR operation. A computed call in the same context is simply
+`(invoke closure 42)`; only an uncontextualized call spells
+`(invoke [:list :i64] closure 42)`. This keeps construction data-shaped and
+makes representation explicit exactly where static inference cannot recover it.
 
 The current descriptor profile is deliberately bounded by fail-closed trap
 generation: a result descriptor is admitted only when the compiler can build a
@@ -228,6 +231,23 @@ arity/result family, so a library closure genuinely executes across the module
 boundary. Wrong arity, result family, malformed handles, and dishonest literal
 `fn` implementations fail closed.
 
+### Completed — contextual computed calls
+
+A computed head remains visibly dynamic but no longer repeats a result type
+already fixed by its surroundings:
+
+```clojure
+(string-length (invoke renderer 42))
+(record-get Person (invoke factory 42) :name)
+```
+
+Consumers, typed constructors, and declared function results select the same
+closed dispatcher families used for lexical calls. With no such context,
+`invoke` keeps the i64 default or accepts an explicit descriptor such as
+`(invoke [:option :string] factory 42)`. Wrong-family closures still trap.
+This removes redundant annotation without hiding the computed call itself or
+adding runtime type inspection.
+
 ### P1 — vocabulary and module consistency
 
 - Document the four distinct sequence concepts where they first appear rather
@@ -252,17 +272,18 @@ lexically. Bounded documents are authored as inert data, option flow is
 idiomatic, lexical closures use ordinary application across every structured
 result family that currently has a safe portable default, and effects remain
 qualified and visible. Computed expression heads and explicit top-level
-function values still expose `invoke`/`fn-ref`; the former accepts a complete
-descriptor so nominal and parameterized types remain honest at that boundary.
+function values still expose `invoke`/`fn-ref`; `invoke` inherits a closed
+result context and accepts a complete descriptor only when the type is otherwise
+ambiguous, so nominal and parameterized types remain honest at that boundary.
 The remaining result-family gap is confined to linear resources, for which
 typed trap generation cannot construct a truthful portable fallback.
 Canonical typed lists retain ordinary `(list ...)` construction and expose
-`[:list T]` only at an explicit computed-call boundary. Closure-valued
+`[:list T]` only at an ambiguous computed-call boundary. Closure-valued
 parameters, captures, and results are inferred inside a closed module and
 explicitly contracted at an open-module boundary across KIR, restricted ESM,
 and Wasm. The `[:fn ...]` spelling is consistent with `[:option T]` and
 `[:result T E]`, while ordinary calls remain `(f x)` and the physical ABI stays
 hidden. With multi-expression `do` portable, the remaining aesthetic friction
-is concentrated at genuinely computed calls (`invoke`) and explicit top-level
-function conversion (`fn-ref`), not ordinary lexical calls, module composition,
-or sequencing.
+is concentrated in the intentionally visible computed-call operator (`invoke`)
+and explicit top-level function conversion (`fn-ref`), not repeated result
+descriptors, ordinary lexical calls, module composition, or sequencing.

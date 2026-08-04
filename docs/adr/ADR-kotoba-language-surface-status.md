@@ -185,6 +185,11 @@ arity zero through four. An explicit form is used instead of silently treating
 value-position symbols as functions, because lexical bindings may shadow a
 top-level name. Computed calls remain explicit `(invoke f ...)`; this is an
 intentional inspectability simplification rather than an absent call mechanism.
+When a consumer or function return annotation supplies a closed result type,
+`invoke` reuses that context instead of repeating a descriptor. An explicit
+descriptor remains accepted and is required only when the result family is
+otherwise ambiguous. This is frontend elaboration into the same typed static
+dispatcher; it adds no runtime type guessing or ABI representation.
 An exported callable parameter or result uses the public descriptor
 `[:fn [parameter-types result-type] ...]`: one to five unique clauses, arity
 zero through four. The initial ABI-neutral profile admits only `:i64`
