@@ -43,6 +43,7 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 | `contextual-document-literal` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `map-function` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | Do not diagnose this as lack of map literals; the implemented slice is eager and fuel-bounded. |
 | `map-literal` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | :intentional-persistent-pair-chain-not-hamt |
+| `native-homogeneous-vectors` | `implemented-partial` | compiler-native-host | This records the homogeneous native value path. It does not claim native parity for the separate source vector literal entry, whose portable pair-chain representation remains unchanged. |
 | `persistent-collection-semantics` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `set-literal` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | Runtime-equal duplicates are removed; this remains an untagged linear set representation. |
 | `vector-literal` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | :intentional-persistent-pair-chain-not-vector-trie |
