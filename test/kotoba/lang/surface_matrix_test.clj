@@ -78,7 +78,17 @@
            (:component-parity replacement)))
     (is (= #{:kotoba-wasm}
            (get-in boundary [:legacy-surface :backends])))
-    (is (= [:async-provider-contract] (:missing boundary)))))
+    (is (= {:adapter :kotoba.compiler.value-codec/async-ability-provider
+            :result-type [:task [:stream :bytes]]
+            :completion :one-shot-callback
+            :start-status #{:pending :completed}
+            :status-state-match :fail-closed
+            :task-authority :org-owned-linear-resource-table
+            :same-id-observability true
+            :handle-on-wire false
+            :response-validation :bounded-descriptor-directed-canonical-reencode}
+           (:async-provider replacement)))
+    (is (empty? (:missing boundary)))))
 
 (deftest on-disk-matrix-matches-regenerated
   (let [r (sm/check-matrix!)]
