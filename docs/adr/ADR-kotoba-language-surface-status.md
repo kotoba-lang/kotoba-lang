@@ -284,6 +284,8 @@ Compiler ADR 0208 / compiler#525 proves the wide nominal profile on KIR and
 `wasm32-kotoba-v1`. Provider#172 / provider ADR 0276 is the first production
 source migration: its six-field HTTP request removed 44 raw record operations
 while preserving the exported ABI and `main = -9242`.
+Provider#173 / ADR 0277 applies the same profile to the request-only package,
+removing another 24 operations while preserving `main = -9002`.
 
 All three backends now provide the explicit lazy-sequence slice. A non-empty
 sequence is a resolver closure that yields either zero (empty) or a pair of
