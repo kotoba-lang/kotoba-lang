@@ -36,7 +36,7 @@ raw compiler plumbing in provider source.
 
 | Area | Assessment | Evidence |
 | --- | --- | --- |
-| Data and control | Strong core, one bounded edge | literals, recursive typed destructuring, `let`, `if`, `cond`, `case`, threading, bounded HOFs; heterogeneous `& rest` still needs a sliced descriptor |
+| Data and control | Strong bounded profile | closed mixed/nested literals, recursive typed destructuring including heterogeneous `& rest`, `let`, `if`, `cond`, `case`, threading, and bounded HOFs |
 | Records and protocols | Strong bounded profile; recursive declaration seam closed | `defrecord`, `defprotocol`, `definterface`, complete `extend-type`, `->Type`, and literal `map->Type` lower to nominal records and static calls; a bounded declaration prepass preserves closed recursive schemas without descriptor repetition |
 | Effect visibility | Strong | qualified catalog operations elaborate to declared abilities; ambient interop remains forbidden |
 | Type readability | Strong | signatures read left-to-right; idiomatic option fallback infers `[:option T]`, while descriptors remain only in low-level ABI forms |
@@ -327,16 +327,17 @@ are expanded, so source stays data-shaped:
 The source and every intermediate value are evaluated once. Required record
 fields and heterogeneous positions fail closed; typed-map bindings require an
 explicit `:or` value because lookup may miss. Homogeneous vector rest keeps its
-bounded `vector-drop` behavior. Heterogeneous `& rest` remains explicit because
-it needs a new descriptor for the suffix rather than a guessed payload type.
+bounded `vector-drop` behavior. Heterogeneous `& rest` slices its exact suffix
+descriptor at compile time and rebuilds the bounded suffix without exposing
+that descriptor in source. Closed mixed and nested vector literals infer the
+same exact descriptor, so `[1 [2 3] 4 5]` remains ordinary data-shaped syntax.
 
-Compiler ADR 0206/0207 and the `:nested-typed-destructuring` case exercise the
-completed slice on KIR and `wasm32-kotoba-v1` with result `26`.
+Compiler ADR 0206/0207/0211 and the `:nested-typed-destructuring` and
+`:nested-let-destructuring` cases exercise the completed slice on KIR and
+`wasm32-kotoba-v1` with results `26` and `29`.
 
 ### P0 — remove remaining compiler-shaped source plumbing
 
-- Add a bounded heterogeneous-vector descriptor-slice operation, then execute
-  the authority `:nested-let-destructuring` case containing nested `& rest`.
 - Finish canonical compiler data-host arguments so `bytes-ptr`/`bytes-len` and
   similar physical ABI preparation stays in providers and generated adapters.
 - Extend contextual callable results to linear resources only when a truthful
@@ -359,9 +360,9 @@ separate nominal identities despite sharing a physical shape; the twelve
 recursive packages likewise use namespace-local `EdnKeyValue` identities.
 This is useful domain meaning rather than ABI-layout coincidence. The
 declaration prepass removes only repeated shape text and preserves
-exact-collision and closed-schema checks. Heterogeneous `& rest` remains a
-separate descriptor-slice problem and must not be inferred from the completed
-literal-index evidence.
+exact-collision and closed-schema checks. Compiler#528 closes the separate
+heterogeneous-rest seam with an exact bounded descriptor slice rather than
+guessing from incomplete runtime evidence.
 
 ### P1 — vocabulary and module consistency
 
@@ -401,7 +402,7 @@ and Wasm. The `[:fn ...]` spelling is consistent with `[:option T]` and
 hidden. With multi-expression `do` and recursive typed patterns portable, the
 remaining aesthetic friction is concentrated in the intentionally visible
 computed-call operator (`invoke`), explicit top-level function conversion
-(`fn-ref`), one bounded heterogeneous-rest edge, and provider ABI preparation.
+(`fn-ref`), and provider ABI preparation.
 Record/protocol code is no longer part of that friction: ordinary declarations,
 constructors, field access, and statically resolved calls now form one readable
 source story.
