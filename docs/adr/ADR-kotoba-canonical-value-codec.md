@@ -93,6 +93,7 @@ call the codec for each value position.
 | symbol | 6 | CBOR text | `"ns/name"` or `"name"` |
 | bytes | 7 | CBOR byte string | |
 | link | 8 | CBOR tag 42 | `ipld.link/Link`; `ipld.core/link` remains compatible |
+| exact i64 | 9 | CBOR byte string, 8 bytes | big-endian signed two's-complement; explicit `int64` wrapper |
 | vector | 16 | CBOR array of encoded values | order preserved |
 | list | 17 | CBOR array of encoded values | order preserved, distinct from vector |
 | set | 18 | CBOR array of encoded values | sorted by encoded element bytes, unsigned |
@@ -125,13 +126,14 @@ the org already pins.  Since the codec has its own tag envelope, it does not
 need CBOR-native float typing, and controlling the eight bytes directly also
 removes any per-runtime float-encoding divergence.
 
-**Integers are admitted only in the safe-integer range** (±(2^53−1)).
+**Bare integers are admitted only in the safe-integer range** (±(2^53−1)).
 `cbor.core`'s `byte-at` documents that its ClojureScript path is exact only to
 2^53, because JS bitwise operators truncate to Int32 first and it divides
 instead.  Admitting a wider integer would silently produce different bytes on
-the two runtimes.  Exact i64 needs a BigInt-aware payload and is deferred to a
-named follow-up rather than faked — a real limitation, since Kotoba has `:i64`
-as a first-class type.
+the two runtimes. Exact signed i64 therefore uses append-only code 9, an
+explicit wrapper, and an 8-byte big-endian two's-complement payload. JVM
+integers and JavaScript BigInts produce the same bytes; unsafe JS Numbers and
+values outside the signed 64-bit range are rejected rather than coerced.
 
 ### 4. Determinism is a cross-runtime obligation
 
@@ -298,7 +300,7 @@ An all-integer vector is deliberately excluded from the new lowering: it is
 already the raw-byte literal, and re-encoding it would change the bytes an
 existing guest hands its host.
 
-All six stages are implemented, so the design is **accepted**.  What remains is
-not part of this decision: `kotobase-peer`'s `cold-datoms` must decode
-version-2 leaves before it bumps its `arrangement` pin, and exact i64 still
-needs a BigInt-aware payload.
+All codec, persistence, semantic-code, host-argument, bounded-consumer, and
+exact-i64 stages are implemented, so the design is **accepted**. Compiler
+typed data-host lowering and native provider record/option/result buffers are
+separate ABI work; they do not reopen this value-wire decision.

@@ -377,6 +377,14 @@ only as compatibility evidence. Real JVM, ClojureScript/Node, and compiler
 consumer conformance all exercise that boundary. Provider ABI work still listed
 below concerns native record/option/result buffers, not authored wire syntax.
 
+Exact signed i64 follows the same layering. The shared wire now has append-only
+code 9 and an explicit adapter wrapper over 8-byte two's-complement data, with
+byte-identical JVM and real ClojureScript vectors through both limits. Kotoba's
+authored `:i64` type does not gain a suffix or conversion form; compiler/provider
+adapters remain responsible for selecting the wrapper when they lower a typed
+boundary. Unsafe JavaScript Numbers are rejected instead of being rounded into
+a plausible value.
+
 ### P0 — remove remaining compiler-shaped source plumbing
 
 - Finish canonical compiler data-host arguments so `bytes-ptr`/`bytes-len` and
