@@ -190,11 +190,10 @@ that file, not this paragraph, is the current state.  Accepted describes the
 delivery stages, not a claim that nothing remains — three risks are worth
 naming here because they bound what the design now guarantees:
 
-- **Source spans still refer to the linked intermediate.**  The friendly
-  operation name now survives linking, so a project-build diagnostic can name
-  the operation — but the span points into the linked source, not the module
-  the author wrote.  Closing that needs a source map from linked positions back
-  to module positions.
+- **The source map exists but nothing consumes it yet.**  `link-source` returns
+  a map from linked line to authoring module, so a project-build diagnostic
+  *can* be translated back to the file the author wrote — but diagnostics still
+  carry linked-source spans until whatever renders them does the translation.
 - **The `typed-capability-v3` WIT profile is JVM-only** and is therefore the one
   part of the WIT layer with no cross-implementation evidence.
 - **Receipts are compared field-wise, not hashed**, so receipt bytes are not yet
