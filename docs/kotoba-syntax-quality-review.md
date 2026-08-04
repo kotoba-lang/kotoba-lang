@@ -275,17 +275,22 @@ once.
 
 The visible bounds are coherent rather than accidental. Unannotated fields
 default to `:i64`; typed fields reuse the function signature spelling,
-`[name :string active :bool]`. `map->Type` accepts an exact literal map, and an
-unknown or unimplemented receiver is a compile error. Both
+`[name :string active :bool]`. A nominal record may contain up to 32 fields.
+For records wider than five fields, direct `->Type` and exact-literal
+`map->Type` construction remain available, while `->Type` does not pretend to
+be a first-class function outside the truthful five-parameter callable ABI.
+`map->Type` accepts an exact literal map, and an unknown or unimplemented
+receiver is a compile error. Both
 `(get record :field)` and the idiomatic `(:field record)` are type-directed.
 `extend-protocol` defaults and dynamic map construction remain explicit gaps.
 Legacy primary tag dispatch still returns a zero sentinel for an unknown tag;
 that behavior should converge to fail-closed semantics rather than become part
 of the language aesthetic.
 
-Acceptance evidence is compiler ADR 0204/0205, compiler#520/#521, and the
+Acceptance evidence is compiler ADR 0204/0205/0208, compiler#520/#521/#525, and the
 `:record-protocol-static-dispatch` plus `:typed-defrecord-fields` cases
-executing on KIR and `wasm32-kotoba-v1` with results `16` and `13`.
+executing on KIR and `wasm32-kotoba-v1` with results `16` and `13`, plus
+`:wide-nominal-records` executing with result `8`.
 
 ### Completed — type-directed access and nested patterns
 
@@ -321,13 +326,16 @@ completed slice on KIR and `wasm32-kotoba-v1` with result `26`.
 - Decide a bounded specialization rule for `extend-protocol` defaults and
   remove the legacy zero-sentinel dispatch path.
 
-An organization-wide source scan on 2026-08-04 found 274 remaining explicit
-low-level record operations (`record-get` 136, `record-new` 106,
-`hetero-vector-at` 32) across 26 `.kotoba` files. They are all concentrated in
-`kotoba-lang/provider` Wasm-package sources rather than ordinary application
-code. The next high-leverage migration is therefore schema-driven provider
-record construction/projection, after the shared nominal record library is
-available; adding more general syntax sugar would optimize the wrong layer.
+After compiler#525 and the first provider migration in provider#172 / ADR 0276,
+an organization-wide source scan on 2026-08-04 found 230 remaining explicit
+low-level record operations (`record-get` 110, `record-new` 88,
+`hetero-vector-at` 32) across 25 `.kotoba` files. The migrated HTTP package
+removed 44 such sites and now uses `Header`, `HttpRequest`, and `HttpResponse`
+nominal records without changing its twelve exports or `main = -9242`. The
+remaining sites are concentrated in `kotoba-lang/provider` Wasm-package
+sources rather than ordinary application code, so the next high-leverage work
+is to repeat this schema-driven migration package by package; adding more
+general syntax sugar would optimize the wrong layer.
 
 ### P1 — vocabulary and module consistency
 
