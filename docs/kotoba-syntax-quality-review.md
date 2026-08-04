@@ -534,10 +534,13 @@ form. With
 multi-expression `do` and recursive typed patterns portable, the
 remaining aesthetic friction is concentrated in the intentionally visible
 computed-call operator (`invoke`), explicit top-level function conversion
-(`fn-ref`), asynchronous host contracts, and affine linear-resource results.
-Actor Delta and provider
-ops audit wire no longer contribute to that friction: canonical bytes, float
-tagging, and limits are hidden behind semantic operations.
+(`fn-ref`), and affine linear-resource results. Asynchronous host completion no
+longer adds source or wire syntax: the generated adapter exchanges bounded
+canonical request/response bytes through a one-shot callback while the task and
+stream stay local affine handles. Declared pending/completed status must match
+the observable task state. Actor Delta and provider ops audit wire likewise no
+longer contribute to that friction: canonical bytes, float tagging, and limits
+are hidden behind semantic operations.
 Record/protocol code is no longer part of that friction: ordinary declarations,
 constructors including computed total-control `map->Type`, field access, and
 statically resolved calls now form one readable source story.
