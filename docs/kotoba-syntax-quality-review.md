@@ -346,6 +346,29 @@ Compiler ADR 0206/0207/0211 and the `:nested-typed-destructuring` and
 `:nested-let-destructuring` cases exercise the completed slice on KIR and
 `wasm32-kotoba-v1` with results `26` and `29`.
 
+### Completed — canonical bytes stay below the authored surface
+
+The first real actor adoption confirms the desired boundary shape without
+adding source punctuation or representation functions. Actor domain code still
+calls ordinary named operations:
+
+```clojure
+(delta-to-bytes delta)
+(delta-from-bytes bytes)
+```
+
+The adapter, not authored Kotoba, owns `:actor-ipc.delta/v1`, explicit Float64
+wire tags, canonical map ordering, and the ability's 16 MiB envelope limit.
+Legacy `pr-str`/`read-string` text masquerading as bytes is rejected. The same
+JVM and real CLJS tests observe actual byte arrays, and the consumer needs only
+kotoba-lang org runtime libraries; CID hashing is not loaded on this value-only
+path. This is architectural evidence for the syntax rule: physical wire
+preparation belongs in generated/provider adapters, while public code names the
+semantic operation.
+
+This does not close the canonical compiler `data-host-arg` gap below. It proves
+the target layering and removes one production boundary that violated it.
+
 ### P0 — remove remaining compiler-shaped source plumbing
 
 - Finish canonical compiler data-host arguments so `bytes-ptr`/`bytes-len` and
@@ -412,7 +435,9 @@ and Wasm. The `[:fn ...]` spelling is consistent with `[:option T]` and
 hidden. With multi-expression `do` and recursive typed patterns portable, the
 remaining aesthetic friction is concentrated in the intentionally visible
 computed-call operator (`invoke`), explicit top-level function conversion
-(`fn-ref`), and provider ABI preparation.
+(`fn-ref`), and compiler/provider ABI preparation. Actor Delta wire no longer
+contributes to that friction: canonical bytes, float tagging, and limits are
+hidden behind semantic operations.
 Record/protocol code is no longer part of that friction: ordinary declarations,
 constructors, field access, and statically resolved calls now form one readable
 source story.

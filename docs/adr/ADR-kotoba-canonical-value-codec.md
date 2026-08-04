@@ -3,6 +3,7 @@
 - **Status**: Accepted — VC0–VC5 implemented
 - **Date**: 2026-07-28
 - **Artifacts**: `lang/value-codec.edn`,
+  `kotoba-lang/io-ipld:src/kotoba/value/codec.cljc`,
   `kotoba-lang/io-ipld:src/ipld/value.cljc`,
   `kotoba-lang/arrangement:src/arrangement/core.cljc`,
   `kotoba-lang/kotoba:src/kotoba/semantic_code.cljc`
@@ -90,7 +91,7 @@ call the codec for each value position.
 | keyword | 5 | CBOR text | `"ns/name"` or `"name"` |
 | symbol | 6 | CBOR text | `"ns/name"` or `"name"` |
 | bytes | 7 | CBOR byte string | |
-| link | 8 | CBOR tag 42 | `ipld.core/Link` |
+| link | 8 | CBOR tag 42 | `ipld.link/Link`; `ipld.core/link` remains compatible |
 | vector | 16 | CBOR array of encoded values | order preserved |
 | list | 17 | CBOR array of encoded values | order preserved, distinct from vector |
 | set | 18 | CBOR array of encoded values | sorted by encoded element bytes, unsigned |
