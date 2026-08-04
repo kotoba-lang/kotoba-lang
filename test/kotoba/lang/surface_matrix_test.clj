@@ -46,6 +46,17 @@
     (is (not-any? #{:dynamic-map-constructor}
                   (:missing records)))))
 
+(deftest extend-protocol-default-is-static-and-closed
+  (let [records (get-in (sm/load-surface-status)
+                        [:other-gaps :protocol-and-record-dispatch])
+        extension (get-in records [:extensions :extend-protocol])]
+    (is (= :sealed-module-record-specialization (:default extension)))
+    (is (true? (:explicit-precedence extension)))
+    (is (false? (:dynamic-fallback extension)))
+    (is (contains? (get-in records [:extensions :implemented])
+                   'extend-protocol))
+    (is (= [:legacy-zero-sentinel-removal] (:missing records)))))
+
 (deftest canonical-data-host-boundary-does-not-revive-physical-source-syntax
   (let [surface (sm/load-surface-status)
         boundary (get-in surface [:other-gaps :data-host-argument])

@@ -335,16 +335,20 @@ the closed graph. Exact explicit declarations remain compatible under ADR
 0209; incompatible collisions and undeclared names are rejected. The authored
 schema therefore states only the recursive edge, while `defrecord` owns the
 shape exactly once.
-`extend-protocol` defaults remain an explicit gap. Arbitrary dynamic-map to
-record conversion is deliberately not hidden inside `map->Type`; if needed it
-requires a separately named checked operation and a real dynamic-map value
-contract.
+`extend-protocol` now groups named record implementations through the same
+static path, and its `default` is specialized only to otherwise-unimplemented
+records declared in the sealed module. It is never a dynamic fallback. This is
+the bounded rule the Clojure-shaped spelling needed: convenient grouping
+without reflection or an invented result for unknown receivers. Arbitrary
+dynamic-map to record conversion is deliberately not hidden inside
+`map->Type`; if needed it requires a separately named checked operation and a
+real dynamic-map value contract.
 Legacy primary tag dispatch still returns a zero sentinel for an unknown tag;
 that behavior should converge to fail-closed semantics rather than become part
 of the language aesthetic.
 
-Acceptance evidence is compiler ADR 0204/0205/0208/0209/0210/0214,
-compiler#520/#521/#525/#526/#527/#532, and the
+Acceptance evidence is compiler ADR 0204/0205/0208/0209/0210/0214/0217,
+compiler#520/#521/#525/#526/#527/#532/#535, and the
 `:record-protocol-static-dispatch` plus `:typed-defrecord-fields` cases
 executing on KIR and `wasm32-kotoba-v1` with results `16` and `13`, plus
 `:wide-nominal-records` executing with result `8`. The computed constructor
@@ -433,8 +437,9 @@ a plausible value.
 
 - Extend contextual callable results to linear resources only when a truthful
   affine trap/result model exists; never invent a fallback handle for elegance.
-- Decide a bounded specialization rule for `extend-protocol` defaults and
-  remove the legacy zero-sentinel dispatch path.
+- Remove the legacy primary zero-sentinel dispatch path; the canonical
+  compiler already rejects unknown receivers and specializes
+  `extend-protocol/default` over the sealed record set.
 
 Compiler#532 closes the former non-literal `map->Type` item with exact map
 leaves under total bounded control. It does not relabel arbitrary runtime maps

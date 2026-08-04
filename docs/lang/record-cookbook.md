@@ -83,7 +83,33 @@ undeclared references and incompatible same-name descriptors fail closed.
 
 ---
 
-## 3. Typed-map (limited)
+## 3. Group implementations by protocol
+
+Use `extend-protocol` when one protocol is the natural unit of organization:
+
+```kotoba
+(defprotocol Value
+  (value [this]))
+
+(defrecord Special [x])
+(defrecord Ordinary [x])
+
+(extend-protocol Value
+  Special
+  (value [this] (+ 100 (:x this)))
+
+  default
+  (value [this] (:x this)))
+```
+
+The canonical compiler does not install a runtime fallback. It specializes the
+`default` body to each otherwise-unimplemented record in the sealed module;
+named sections and record-local implementations take precedence. Every
+receiver remains statically nominal, every method is checked against its
+record descriptor, and an unknown receiver is a compile error. Use
+`extend-type` when the record is the clearer unit of organization.
+
+## 4. Typed-map (limited)
 
 **Dual-backend pilot landed** (compiler#426 / ADR 0176, case `typed-map-kit`):
 bounded `[:map :i64 :i64]` with `typed-map-new` / `assoc` / `count` / `get` +
@@ -95,7 +121,7 @@ Keyword keys and large/heterogeneous maps remain out of the pure-product default
 
 ---
 
-## 4. Migration from packs
+## 5. Migration from packs
 
 | Old public pattern | Target | Status (2026-07-30) |
 |---|---|---|
@@ -114,7 +140,7 @@ Do **not** add new packs while rewriting.
 
 ---
 
-## 5. Pure-product profile alignment
+## 6. Pure-product profile alignment
 
 `lang/pure-product-profile.edn` keeps the low-level representation contract:
 
@@ -131,8 +157,8 @@ Do **not** add new packs while rewriting.
 
 ## Related
 
-- compiler ADR 0165 / 0189 / 0190 / 0204 / 0208 / 0210 / 0214
-- compiler#520/#525/#527/#532 and provider#172–#179
+- compiler ADR 0165 / 0189 / 0190 / 0204 / 0208 / 0210 / 0214 / 0217
+- compiler#520/#525/#527/#532/#535 and provider#172–#179
 - T5.2 host bridge / T5.3 murakumo#193–#206  
 - `docs/adr/ADR-reliability-record-access-and-bool-comparisons.md`  
 - `docs/lang/surface-matrix.md` (T2.2 generated overview)
