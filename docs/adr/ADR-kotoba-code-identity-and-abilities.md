@@ -194,7 +194,9 @@ naming here because they bound what the design now guarantees:
   a map from linked line to authoring module, so a project-build diagnostic
   *can* be translated back to the file the author wrote — but diagnostics still
   carry linked-source spans until whatever renders them does the translation.
-- **The `typed-capability-v3` WIT profile is JVM-only** and is therefore the one
-  part of the WIT layer with no cross-implementation evidence.
+- ~~The `typed-capability-v3` WIT profile is JVM-only.~~  Closed: the WIT is
+  embedded rather than read off the classpath, and the world is byte-identical
+  under both implementations.  The whole WIT layer now has
+  cross-implementation evidence.
 - **Receipts are compared field-wise, not hashed**, so receipt bytes are not yet
   a cross-implementation contract.
