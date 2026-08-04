@@ -398,11 +398,20 @@ path. This is architectural evidence for the syntax rule: physical wire
 preparation belongs in generated/provider adapters, while public code names the
 semantic operation.
 
-Compiler#533 now applies this layering to canonical compiler hosts for scalar
-and `:document` abilities. Authored code keeps the qualified semantic call;
-the generated adapter alone translates ordinary canonical values to bounded
-`kotoba.value.v1` bytes. The legacy `data-host-arg` spelling remains
+Compiler#533 and #534 now apply this layering to the compiler's JVM/CLJS host
+adapter for scalars, documents, nominal records and variants, structural
+options and results, and typed collections. Authored code keeps the qualified
+semantic call; the adapter alone translates descriptor-directed values to
+bounded `kotoba.value.v1` bytes. Nominal IDs remain explicit on the wire, exact
+i64 wrappers prevent JavaScript rounding, and full KIR constructor descriptors
+are not transmitted. The legacy `data-host-arg` spelling remains
 kotoba-wasm-only and is not the portable language direction.
+
+Components preserve the same authored call and typed descriptor authority but
+lower aggregates through native WIT Canonical ABI values. Adding a second byte
+tunnel inside WIT would expose more physical mechanism without adding semantic
+coverage, so Component parity explicitly means equivalent types and authority,
+not identical transport bytes.
 
 The provider ops kits now confirm the same rule across HTTP, secret, process,
 git, entropy, and scoped-fs audit paths. Their public operations did not acquire
@@ -422,10 +431,6 @@ a plausible value.
 
 ### P0 — remove remaining compiler-shaped source plumbing
 
-- Standardize schema-directed record/variant/option/result ability wire shapes
-  and the Wasm component host binding. Compiler#533 already keeps
-  `bytes-ptr`/`bytes-len` and codec selection inside generated adapters for
-  scalar and `:document` JVM/CLJS hosts.
 - Extend contextual callable results to linear resources only when a truthful
   affine trap/result model exists; never invent a fallback handle for elegance.
 - Decide a bounded specialization rule for `extend-protocol` defaults and
@@ -488,12 +493,14 @@ parameters, captures, and results are inferred inside a closed module and
 explicitly contracted at an open-module boundary across KIR, restricted ESM,
 and Wasm. The `[:fn ...]` spelling is consistent with `[:option T]` and
 `[:result T E]`, while ordinary calls remain `(f x)` and the physical ABI stays
-hidden. Type-directed bare document literals improve this without closing or
-renaming the distinct physical compiler data-host ABI gap. With
+hidden. Type-directed bare document literals and schema-directed ability
+adapters improve this without reviving the legacy physical data-host source
+form. With
 multi-expression `do` and recursive typed patterns portable, the
 remaining aesthetic friction is concentrated in the intentionally visible
 computed-call operator (`invoke`), explicit top-level function conversion
-(`fn-ref`), and compiler/provider ABI preparation. Actor Delta and provider
+(`fn-ref`), asynchronous host contracts, and affine linear-resource results.
+Actor Delta and provider
 ops audit wire no longer contribute to that friction: canonical bytes, float
 tagging, and limits are hidden behind semantic operations.
 Record/protocol code is no longer part of that friction: ordinary declarations,

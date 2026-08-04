@@ -8,7 +8,7 @@ Check: `clojure -M -m kotoba.lang.surface-matrix --check`
 |---|---|
 | surface-status version | 1 |
 | profile version | 6 |
-| as-of | 2026-08-04 |
+| as-of | 2026-08-05 |
 | authority ADR | `docs/adr/ADR-kotoba-language-surface-status.md` |
 
 WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source.

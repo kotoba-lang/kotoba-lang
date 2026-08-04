@@ -301,14 +301,19 @@ already the raw-byte literal, and re-encoding it would change the bytes an
 existing guest hands its host.
 
 All codec, persistence, semantic-code, host-argument, bounded-consumer, and
-exact-i64 stages are implemented, so the design is **accepted**. Compiler
-typed data-host lowering and native provider record/option/result buffers are
-separate ABI work; they do not reopen this value-wire decision.
+exact-i64 stages are implemented, so the design is **accepted**. The legacy
+physical data-host lowering remains backend-local; it does not reopen this
+value-wire decision or define the portable authored surface.
 
-Compiler#533 / compiler ADR 0215 later adopted this wire in an exact generated
-host adapter for scalar and `:document` typed abilities. It translates the
-compiler's tagged document runtime value to an ordinary canonical value before
-encoding, and rejects unstandardized aggregate descriptors rather than leaking
-compiler constructor vectors onto the wire. Schema-directed aggregate shapes,
-Wasm component integration, and an asynchronous provider contract remain
-separate ABI work.
+Compiler#533 / compiler ADR 0215 later adopted this wire in an exact JVM/CLJS
+host adapter for scalar and `:document` typed abilities. Compiler#534 / ADR
+0216 extends it recursively to nominal records and variants, structural options
+and results, heterogeneous vectors, bounded lists, sets, maps, and schema
+references. Exact envelopes retain nominal identity without transmitting KIR
+constructor vectors, while the org codec's explicit wrappers preserve every
+signed i64 and float across JVM and JavaScript.
+
+Wasm Components use the same typed ability descriptor as schema authority but
+keep their native WIT Canonical ABI representation; they do not tunnel
+`kotoba.value.v1` bytes through WIT. The remaining separate ABI decision is an
+asynchronous provider contract.
