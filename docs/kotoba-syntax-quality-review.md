@@ -22,12 +22,18 @@ construction and generic option fallback likewise use contextual/type-directed
 elaboration into existing typed primitives rather than new runtime
 representations or punctuation-heavy syntax.
 
+The remaining visual debt is sharply bounded rather than spread through the
+language: recursive record schemas repeat one exact forward descriptor, and 32
+provider projections still spell `hetero-vector-at` with a complete vector
+descriptor. Ordinary record construction and access no longer expose raw
+compiler operations.
+
 ## Evidence-based scorecard
 
 | Area | Assessment | Evidence |
 | --- | --- | --- |
 | Data and control | Strong core, one bounded edge | literals, recursive typed destructuring, `let`, `if`, `cond`, `case`, threading, bounded HOFs; heterogeneous `& rest` still needs a sliced descriptor |
-| Records and protocols | Strong bounded profile | `defrecord`, `defprotocol`, `definterface`, complete `extend-type`, `->Type`, and literal `map->Type` lower to nominal records and static calls |
+| Records and protocols | Strong bounded profile; one recursive declaration seam | `defrecord`, `defprotocol`, `definterface`, complete `extend-type`, `->Type`, and literal `map->Type` lower to nominal records and static calls; exact forward declarations preserve closed recursive schemas |
 | Effect visibility | Strong | qualified catalog operations elaborate to declared abilities; ambient interop remains forbidden |
 | Type readability | Strong | signatures read left-to-right; idiomatic option fallback infers `[:option T]`, while descriptors remain only in low-level ABI forms |
 | Collection vocabulary | Mostly coherent | literal/vector/list/set operations are familiar, but source list, pair-chain list, typed `[:list T]`, and document list need careful documentation |
@@ -282,15 +288,23 @@ be a first-class function outside the truthful five-parameter callable ABI.
 `map->Type` accepts an exact literal map, and an unknown or unimplemented
 receiver is a compile error. Both
 `(get record :field)` and the idiomatic `(:field record)` are type-directed.
+When an `ns` schema recursively refers to a later `defrecord`, compiler ADR
+0209 permits an exact qualified forward descriptor and rejects every
+incompatible collision. This is safe and explicit, but repeating the generated
+descriptor once is still less elegant than a declaration prepass that could
+establish the same nominal identity automatically.
 `extend-protocol` defaults and dynamic map construction remain explicit gaps.
 Legacy primary tag dispatch still returns a zero sentinel for an unknown tag;
 that behavior should converge to fail-closed semantics rather than become part
 of the language aesthetic.
 
-Acceptance evidence is compiler ADR 0204/0205/0208, compiler#520/#521/#525, and the
+Acceptance evidence is compiler ADR 0204/0205/0208/0209,
+compiler#520/#521/#525/#526, and the
 `:record-protocol-static-dispatch` plus `:typed-defrecord-fields` cases
 executing on KIR and `wasm32-kotoba-v1` with results `16` and `13`, plus
-`:wide-nominal-records` executing with result `8`.
+`:wide-nominal-records` executing with result `8`. Provider#177 / provider ADR
+0281 additionally proves twelve recursive production packages against their
+independent KIR oracles.
 
 ### Completed — type-directed access and nested patterns
 
@@ -326,25 +340,28 @@ completed slice on KIR and `wasm32-kotoba-v1` with result `26`.
 - Decide a bounded specialization rule for `extend-protocol` defaults and
   remove the legacy zero-sentinel dispatch path.
 
-After compiler#525 and provider#172–#176 (ADR 0276–0280), an organization-wide
-source scan on 2026-08-04 found 68 remaining explicit low-level operations
-(`record-get` 24, `record-new` 12, `hetero-vector-at` 32) across 16 `.kotoba`
-files. Ten migrated provider packages removed 206 such sites and now use
-domain-named nominal records without changing their exports or `main` oracles.
-The remaining sites are concentrated in `kotoba-lang/provider` Wasm-package
-sources rather than ordinary application code, so the next high-leverage work
-is to migrate the shared recursive EDN key/value record pattern across its 12
-packages; adding more general syntax sugar would optimize the wrong layer.
+After compiler#526 and provider#172–#177 (ADR 0276–0281), an organization-wide
+source scan on 2026-08-04 found 32 remaining explicit low-level operations, all
+`hetero-vector-at`, across 16 `.kotoba` files. Twenty-two migrated provider
+packages removed 242 sites from the original 274 and now contain no authored
+`record-new` or `record-get`, without changing their exports, capability wires,
+or `main` oracles.
 
-The residual splits into 36 raw record operations and 32 heterogeneous-vector
-projections. The latter need descriptor-aware access migration rather than
-being counted as unfinished nominal-record syntax. The latest process and git
-records intentionally have separate nominal identities despite sharing a
-physical shape; this is a useful example of the language surface expressing
-domain meaning instead of ABI layout.
+The residual therefore needs descriptor-aware heterogeneous access rather than
+more nominal-record sugar. The latest process and git records intentionally
+have separate nominal identities despite sharing a physical shape; the twelve
+recursive packages likewise use namespace-local `EdnKeyValue` identities.
+This is useful domain meaning rather than ABI-layout coincidence. The exact
+forward descriptor currently required at each recursive namespace boundary is
+truthful but visually repetitive; a future declaration prepass may remove that
+repetition only if it preserves the same exact-collision and closed-schema
+checks.
 
 ### P1 — vocabulary and module consistency
 
+- Evaluate a declaration prepass for recursive `defrecord` references so an
+  `ns` schema can retain exact nominal identity without repeating the generated
+  descriptor; keep incompatible collisions fail-closed.
 - Document the four distinct sequence concepts where they first appear rather
   than relying on name prefixes alone.
 - Prefer an `ns` form in authored modules and conformance examples; keep
