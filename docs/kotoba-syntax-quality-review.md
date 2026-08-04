@@ -26,7 +26,7 @@ representations or punctuation-heavy syntax.
 
 | Area | Assessment | Evidence |
 | --- | --- | --- |
-| Data and control | Strong core, one typed edge | literals, flat destructuring, `let`, `if`, `cond`, `case`, threading, bounded HOFs; typed nested patterns still expose an accessor-selection gap |
+| Data and control | Strong core, one bounded edge | literals, recursive typed destructuring, `let`, `if`, `cond`, `case`, threading, bounded HOFs; heterogeneous `& rest` still needs a sliced descriptor |
 | Records and protocols | Strong bounded profile | `defrecord`, `defprotocol`, `definterface`, complete `extend-type`, `->Type`, and literal `map->Type` lower to nominal records and static calls |
 | Effect visibility | Strong | qualified catalog operations elaborate to declared abilities; ambient interop remains forbidden |
 | Type readability | Strong | signatures read left-to-right; idiomatic option fallback infers `[:option T]`, while descriptors remain only in low-level ABI forms |
@@ -287,10 +287,31 @@ Acceptance evidence is compiler ADR 0204/0205, compiler#520/#521, and the
 `:record-protocol-static-dispatch` plus `:typed-defrecord-fields` cases
 executing on KIR and `wasm32-kotoba-v1` with results `16` and `13`.
 
+### Completed — type-directed access and nested patterns
+
+Ordinary `get`, keyword lookup, and `nth` now select record, typed-map,
+homogeneous-vector, floating-vector, or heterogeneous-vector access from the
+inferred receiver. The same decision happens after recursive binding patterns
+are expanded, so source stays data-shaped:
+
+```clojure
+(let [[id [name active]] row] ...)
+(let [{{:keys [name]} :profile} user] ...)
+```
+
+The source and every intermediate value are evaluated once. Required record
+fields and heterogeneous positions fail closed; typed-map bindings require an
+explicit `:or` value because lookup may miss. Homogeneous vector rest keeps its
+bounded `vector-drop` behavior. Heterogeneous `& rest` remains explicit because
+it needs a new descriptor for the suffix rather than a guessed payload type.
+
+Compiler ADR 0206/0207 and the `:nested-typed-destructuring` case exercise the
+completed slice on KIR and `wasm32-kotoba-v1` with result `26`.
+
 ### P0 — remove remaining compiler-shaped source plumbing
 
-- Make nested heterogeneous vector/map projection type-directed so authored
-  `get`, `nth`, and destructuring patterns do not choose `typed-*` accessors.
+- Add a bounded heterogeneous-vector descriptor-slice operation, then execute
+  the authority `:nested-let-destructuring` case containing nested `& rest`.
 - Finish canonical compiler data-host arguments so `bytes-ptr`/`bytes-len` and
   similar physical ABI preparation stays in providers and generated adapters.
 - Extend contextual callable results to linear resources only when a truthful
@@ -299,6 +320,14 @@ executing on KIR and `wasm32-kotoba-v1` with results `16` and `13`.
   heterogeneous construction.
 - Decide a bounded specialization rule for `extend-protocol` defaults and
   remove the legacy zero-sentinel dispatch path.
+
+An organization-wide source scan on 2026-08-04 found 274 remaining explicit
+low-level record operations (`record-get` 136, `record-new` 106,
+`hetero-vector-at` 32) across 26 `.kotoba` files. They are all concentrated in
+`kotoba-lang/provider` Wasm-package sources rather than ordinary application
+code. The next high-leverage migration is therefore schema-driven provider
+record construction/projection, after the shared nominal record library is
+available; adding more general syntax sugar would optimize the wrong layer.
 
 ### P1 — vocabulary and module consistency
 
@@ -335,9 +364,10 @@ parameters, captures, and results are inferred inside a closed module and
 explicitly contracted at an open-module boundary across KIR, restricted ESM,
 and Wasm. The `[:fn ...]` spelling is consistent with `[:option T]` and
 `[:result T E]`, while ordinary calls remain `(f x)` and the physical ABI stays
-hidden. With multi-expression `do` portable, the remaining aesthetic friction
-is concentrated in the intentionally visible computed-call operator (`invoke`)
-and explicit top-level function conversion (`fn-ref`), plus typed nested
-collection access and provider ABI preparation. Record/protocol code is no
-longer part of that friction: ordinary declarations, constructors, field
-access, and statically resolved calls now form one readable source story.
+hidden. With multi-expression `do` and recursive typed patterns portable, the
+remaining aesthetic friction is concentrated in the intentionally visible
+computed-call operator (`invoke`), explicit top-level function conversion
+(`fn-ref`), one bounded heterogeneous-rest edge, and provider ABI preparation.
+Record/protocol code is no longer part of that friction: ordinary declarations,
+constructors, field access, and statically resolved calls now form one readable
+source story.
