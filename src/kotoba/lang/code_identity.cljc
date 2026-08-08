@@ -36,23 +36,26 @@
   rule (\"byte-for-byte deterministic identity\") and CI6's cross-implementation
   conformance both forbid.
 
-  Version 2 normalizes to a closed, injective, tagged form and encodes it with
+  Version 2 normalized to a closed, injective, tagged form and encoded it with
   a deterministic CBOR encoder.  Every value carries its type tag, so a
   keyword can never collide with the string of the same name.  Numbers are
   carried as exact decimal/hex *text* rather than CBOR integers because a
   64-bit KIR literal exceeds the JavaScript exact-integer range: text keeps
   `:clj` and `:cljs` on the same bytes.
 
-  Identity payloads are versioned, and version 2 CIDs are deliberately not
-  version 1 CIDs."
+  Version 3 preserves that semantic form but promotes dependency CIDs from
+  tagged strings to real IPLD Links (DAG-CBOR tag 42). Generic DAG traversal
+  can now discover the definition closure without knowing Kotoba's schema.
+
+  Identity payloads are versioned; v3 CIDs are deliberately not v1/v2 CIDs."
   (:require [clojure.string :as str]
-            [cbor.core :as cbor]
+            [ipld.core :as ipld]
             [multiformats.core :as mf]))
 
 (def payload-version
   "Bumped whenever the sealed inputs or the canonical encoding change. Old
   identities are not claimed to be equal to new ones — that is the point."
-  2)
+  3)
 
 (def definition-required
   [:definition/profile-version
@@ -289,13 +292,25 @@
    ;; compiled frontends converge on an identical closure.
    :dependencies (vec (sort (:definition/dependencies definition)))})
 
+(defn identity-node
+  "Closed DAG-CBOR node addressed by DefCID v3.
+
+  The semantic payload remains the injective tagged Kotoba value. Dependency
+  identities are outside that value as native IPLD Links so they are graph
+  edges rather than strings."
+  [definition]
+  (let [payload (identity-payload definition)]
+    {"format" "kotoba.definition-identity.v3"
+     "semantic" (normalize (dissoc payload :dependencies))
+     "dependencies" (mapv ipld/link (:dependencies payload))}))
+
 (defn canonical-bytes
   "The canonical DAG-CBOR block for DEFINITION. These bytes — not any printed
   representation of them — are the thing the CID addresses."
   [definition]
   (if-let [error (definition-error definition)]
     (throw (ex-info (:message error) error))
-    (cbor/encode (normalize (identity-payload definition)))))
+    (ipld/encode (identity-node definition))))
 
 (defn canonical-hex
   "Hex of `canonical-bytes`, for fixtures and cross-implementation diffing."

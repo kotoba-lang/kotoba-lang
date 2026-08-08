@@ -11,7 +11,7 @@
 ;;
 ;; Run (from the repository root, with the sibling libraries on the classpath):
 ;;
-;;   nbb --classpath "src:../io-multiformats/src:../dag-cbor/src" \
+;;   nbb --classpath "src:../io-ipld/src:../io-multiformats/src:../org-ietf-cbor/src" \
 ;;       scripts/verify_code_identity_cljs.cljs
 
 (require '[kotoba.lang.code-identity :as ci]

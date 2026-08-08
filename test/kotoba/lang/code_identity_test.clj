@@ -13,7 +13,7 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
-            [cbor.core :as cbor]
+            [ipld.core :as ipld]
             [kotoba.lang.code-identity :as identity]
             [kotoba.lang.package-registry :as registry]))
 
@@ -89,8 +89,18 @@
             bytes must actually decode as CBOR, or the codec claim is a lie an
             IPLD consumer discovers at read time."
     (let [bytes (identity/canonical-bytes definition)]
-      (is (= (cbor/decode bytes)
-             (identity/normalize (identity/identity-payload definition)))))))
+      (is (= (ipld/decode bytes) (identity/identity-node definition)))
+      (is (= [] (ipld/links (ipld/decode bytes)))))))
+
+(deftest dependencies-are-native-ipld-links
+  (let [dependency (identity/definition-cid
+                    (assoc definition :definition/kir {:op :const :value 9}))
+        node (-> definition
+                 (assoc :definition/dependencies [dependency])
+                 identity/canonical-bytes
+                 ipld/decode)]
+    (is (= [dependency] (ipld/links node)))
+    (is (ipld/link? (get-in node ["dependencies" 0])))))
 
 ;; ---------------------------------------------------------------------------
 ;; CI2 / CI3 — conformance fixtures
