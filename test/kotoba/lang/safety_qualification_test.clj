@@ -15,6 +15,9 @@
 (def compiler-root
   (or (System/getenv "KOTOBA_COMPILER_QUALIFICATION_ROOT") "../compiler"))
 
+(def sema-root
+  (or (System/getenv "KOTOBA_SEMA_QUALIFICATION_ROOT") "../kotoba-sema"))
+
 (def core-contracts-root
   (or (System/getenv "KOTOBA_CORE_CONTRACTS_QUALIFICATION_ROOT")
       "../kotoba-core-contracts"))
@@ -77,7 +80,10 @@
   (let [authority (slurp "lang/guest-grammar.edn")]
     (is (= authority (slurp (io/file kotoba-root
                                      "resources/kotoba/lang/guest-grammar.edn"))))
-    (is (= authority (slurp (io/file compiler-root
+    ;; Source grammar ownership moved with semantic analysis. The compiler is
+    ;; orchestration and consumes this resource from kotoba-sema; requiring a
+    ;; duplicate compiler copy would undo the extracted boundary.
+    (is (= authority (slurp (io/file sema-root
                                      "resources/kotoba/lang/guest-grammar.edn"))))))
 
 (deftest component-source-does-not-encode-runtime-role
