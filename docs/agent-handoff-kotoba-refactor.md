@@ -42,6 +42,53 @@ rather than a rewrite.
 
 ---
 
+## 0b. What is left in the toolchain repos is not backlog (2026-08-10)
+
+"Move the remaining `.cljc` to `.kotoba`" is a reasonable-sounding task that,
+across `kotoba`, `aiueos`, `kotoba-native` and `amu`, is mostly already answered
+— in accepted decisions rather than in the file counts. Measured on `main`:
+
+| repo | `.kotoba` | `.clj`+`.cljc`+`.cljs` | what the non-Kotoba mass is |
+|---|---|---|---|
+| `aiueos` | 5,093 L / 65 | 15,903 L | 59 kernel objects **are** the Kotoba; the rest is the host plane |
+| `kotoba` | 4,060 L / 103 | 24,748 L | `runtime.clj` 5,820 + `launcher.clj` 1,918 + `wasm_exec.clj` 862 — host mechanism |
+| `amu` | 1,053 L / 121 | 35,103 L | conformance fixtures and examples; **no product `.kotoba`** |
+| `kotoba-native` | **0** | 7,042 L | the x86-64/AArch64 backend itself |
+
+The two that look worst are settled:
+
+- **`amu` stays CLJ.** `ADR-reliability-t63-tool-vs-runtime` decision 3 —
+  *"Compiler remains CLJ as the build/analysis tool — no requirement to
+  self-host the compiler before R3."* Its 121 `.kotoba` files are
+  `resources/kotoba/lang-conformance/*`, `test/nbb/fixtures` and `examples`;
+  that is what a compiler's `.kotoba` is supposed to be.
+- **`kotoba-native` has no `.kotoba` by construction.** It is the machine-code
+  backend, and `ADR-2607072000` puts what would otherwise be Rust into `.cljc`.
+
+`aiueos` and `kotoba` are host planes, which this plan's own completion criteria
+keep: *"cljs/cljc remain only as bounded compatibility or implementation
+layers"*, and the per-slice checklist ends at *"Host mechanism contains no
+product policy."*
+
+**So the open question is not how much moves. It is whether the boundary is
+honest** — whether any decision is sitting in host mechanism. Two findings that
+say it is worth asking:
+
+- `aiueos/src/broker.cljc` names itself "the capability broker's decision
+  logic", and `decide.cljc` exists so that a native host adapter *"shells out
+  to"* it rather than deciding itself. The decision is real and it is in a
+  CLJ subprocess. It does **not** move as it stands: the native gate
+  (`only-native-word-typed-features?`) rejects escaping records, maps,
+  variants, typed sets and heterogeneous vectors, and `verify-system` folds
+  vectors of violation maps. Only its scalar core (`trust-rank`,
+  `below-verified?`, the signature ladder) is native-shaped, and extracting
+  that alone does not remove the subprocess — so do not sell it as removing a
+  JVM dependency.
+- Nothing here has been audited for the checklist's last line. That audit, not
+  a file-count reduction, is the next real slice.
+
+---
+
 ## 1. Where we are (2026-08-01)
 
 ### Done (high level)
