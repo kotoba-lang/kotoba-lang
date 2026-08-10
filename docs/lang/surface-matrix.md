@@ -70,6 +70,7 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 | `record-schema-values` | `implemented-partial` | compiler, kotoba-kir, kotoba-wasm |  |
 | `reduce-function` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `release-integration` | `implemented-partial` |  |  |
+| `string-predicate-typing` | `not-yet-implemented` |  | Profile 5 (compiler ADR 0191) moved comparisons and predicates to `:bool`     so `and`/`or`/`not` compose into a readable predicate. It carried     `= < > <= >= not not= zero? pos? neg? empty? some?`; it did not carry the     two string predicates. `kotoba-sema` frontend.cljc returns `:i64` for     `string=?` and `string-contains?`, while the later `string-index-contains`     returns `:bool`. So the same file now types two spellings of the same     question differently. |
 
 ## Classification rule
 
