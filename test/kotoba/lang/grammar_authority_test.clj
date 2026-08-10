@@ -146,3 +146,16 @@
     (is (= #{:i64} (:parameter-types callable)))
     (is (= :i64 (:physical-abi callable)))
     (is (= :project-interface-preserved (:module-boundary callable)))))
+
+(deftest every-identity-says-whether-it-exists
+  ;; Two entries — source-tree-cid and package-manifest-cid — described what
+  ;; they prove and omitted :status, while definition-cid said :implemented and
+  ;; component-admission said :planned. A description with no status reads as a
+  ;; deployment, and both of those appear nowhere but the file declaring them
+  ;; (surveyed 2026-08-10).
+  (let [identities (:identities (auth/read-edn "lang/code-identity.edn"))
+        statuses #{:implemented :planned :not-implemented}]
+    (is (seq identities))
+    (doseq [[k m] identities]
+      (is (contains? statuses (:status m))
+          (str k " must say whether it exists: " (pr-str (:status m)))))))
