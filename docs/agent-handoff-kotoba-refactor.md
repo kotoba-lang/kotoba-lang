@@ -10,6 +10,28 @@ This file is the **runbook** so a fresh agent can continue without chat history.
 
 ---
 
+## 0a. The compiler repo is named `amu` (2026-08-10)
+
+`kotoba-lang/compiler` was **renamed to `kotoba-lang/amu`**. Everything below that
+says "compiler" means that same repository:
+
+- west path is **`orgs/kotoba-lang/amu`** (not `orgs/kotoba-lang/compiler`), CLI is
+  **`bin/amu`**; `bin/kotoba-compiler` and the `kotoba.compiler.*` namespaces remain
+  as compatibility APIs.
+- `compiler#412`, `compiler ADR 0191`, … still resolve — GitHub keeps PR and issue
+  numbers across a rename, so those references were **not** rewritten here.
+- The old name still redirects on GitHub, which is exactly why this bites: a stale
+  clone at `orgs/kotoba-lang/compiler` keeps fetching fine while the **west-managed
+  path is empty**, so `bin/amu` looks missing. Materialise it with
+  `west update --fetch smart amu` before concluding the toolchain is absent.
+  (Same failure mode as `kotoba-fleet-vcs` → `kagi`; see superproject CLAUDE.md.)
+
+The 2026-08-10 `chore: migrate Amu paths across language tooling` sweep updated the
+plan, the ADRs and `lang/*.edn`, but **skipped this runbook** — hence this section
+rather than a rewrite.
+
+---
+
 ## 0. Read order (do not skip)
 
 1. Superproject `ADR-2607279200` — source stays Clojure-shaped; no new app DSL
