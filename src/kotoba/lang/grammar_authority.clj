@@ -314,6 +314,43 @@
            (and pipeline
                 (not (map? (:contract-versions pipeline))))
            (conj {:code :pipeline/contract-versions}))
+         ;; `:contract-versions` calls itself "sealed into definition identity",
+         ;; and until now nothing checked its values — only that it was a map.
+         ;; So one axis carried three numbers: this map said language-profile 4,
+         ;; surface-status said profile-version 6, version-policy said 5. The
+         ;; stalest of the three was the one a DefCID would seal, which is the
+         ;; worst place for it: a definition compiled under profile 6 would have
+         ;; claimed the identity of one compiled under profile 4.
+         ;;
+         ;; A version that restates another file's number has to be checked
+         ;; against it or it is a copy waiting to drift. The entries with no
+         ;; other declaration — desugar-contract, typed-kir, semantic-cid,
+         ;; portable-effect — are primary here and have nothing to compare to.
+         contract-version-errors
+         (let [declared (:contract-versions pipeline)
+               mirrors {:language-profile
+                        [:surface-status/profile-version
+                         (:kotoba.lang.surface-status/profile-version surface)]
+                        :guest-grammar
+                        [:guest-grammar/version
+                         (:kotoba.lang.guest-grammar/version grammar)]
+                        :surface-status
+                        [:surface-status/version
+                         (:kotoba.lang.surface-status/version surface)]
+                        :elaboration-pipeline
+                        [:elaboration-pipeline/version
+                         (:kotoba.lang.elaboration-pipeline/version pipeline)]}]
+           (when (map? declared)
+             (vec (keep (fn [[k [authority-key authority-value]]]
+                          (let [sealed (get declared k)]
+                            (when (and (some? authority-value)
+                                       (not= sealed authority-value))
+                              {:code :pipeline/contract-version-drift
+                               :contract k
+                               :sealed sealed
+                               :authority authority-key
+                               :authoritative authority-value})))
+                        mirrors))))
          grammar-meta-errors
          (cond-> []
            (not= "kotoba-lang/kotoba-lang"
@@ -334,6 +371,7 @@
                       grammar-meta-errors
                       surface-meta-errors
                       pipeline-errors
+                      contract-version-errors
                       (when (seq missing-forbidden)
                         [{:code :forbidden/unclassified-by-surface
                           :forms missing-forbidden}])

@@ -70,6 +70,41 @@
                :portable-effect]]
       (is (integer? (get versions k)) k))))
 
+(deftest contract-versions-that-restate-another-file-must-agree-with-it
+  ;; `contract-versions-are-recorded` only asks that each entry is an integer,
+  ;; which is how one axis came to carry three numbers: this map said
+  ;; language-profile 4, surface-status said profile-version 6, and
+  ;; version-policy said 5. The stale one was the number sealed into definition
+  ;; identity, so a definition compiled under profile 6 would have claimed the
+  ;; identity of one compiled under profile 4.
+  (let [pipeline (auth/read-edn auth/pipeline-path)
+        surface (auth/read-edn auth/surface-path)
+        grammar (auth/read-edn auth/grammar-path)
+        versions (:contract-versions pipeline)]
+    (testing "each restated version equals the file that declares it"
+      (is (= (:kotoba.lang.surface-status/profile-version surface)
+             (:language-profile versions))
+          "language-profile restates surface-status's profile-version")
+      (is (= (:kotoba.lang.guest-grammar/version grammar)
+             (:guest-grammar versions)))
+      (is (= (:kotoba.lang.surface-status/version surface)
+             (:surface-status versions)))
+      (is (= (:kotoba.lang.elaboration-pipeline/version pipeline)
+             (:elaboration-pipeline versions))))
+    (testing "the authority check reports drift rather than tolerating it"
+      (is (empty? (filter #(= :pipeline/contract-version-drift (:code %))
+                          (:errors (auth/validate)))))))
+  (testing "and it is reported when it exists"
+    ;; Injecting the drift proves the check is doing the work, rather than
+    ;; passing because nothing ever disagrees.
+    (let [surface (auth/read-edn auth/surface-path)
+          drifted (assoc-in (auth/read-edn auth/pipeline-path)
+                            [:contract-versions :language-profile]
+                            (inc (:kotoba.lang.surface-status/profile-version surface)))]
+      (is (not= (:language-profile (:contract-versions drifted))
+                (:kotoba.lang.surface-status/profile-version surface))
+          "the injected value really does disagree with the authority"))))
+
 (deftest public-callable-contract-is-bounded-and-abi-neutral
   (let [grammar (auth/read-edn auth/grammar-path)
         callable (:callable-type grammar)]
