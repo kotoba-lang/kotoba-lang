@@ -13,7 +13,7 @@
   (or (System/getenv "KOTOBA_QUALIFICATION_ROOT") "../kotoba"))
 
 (def compiler-root
-  (or (System/getenv "KOTOBA_COMPILER_QUALIFICATION_ROOT") "../compiler"))
+  (or (System/getenv "KOTOBA_COMPILER_QUALIFICATION_ROOT") "../amu"))
 
 (def sema-root
   (or (System/getenv "KOTOBA_SEMA_QUALIFICATION_ROOT") "../kotoba-sema"))
@@ -27,8 +27,8 @@
     (str/starts-with? path "../kotoba/")
     (io/file kotoba-root (subs path (count "../kotoba/")))
 
-    (str/starts-with? path "../compiler/")
-    (io/file compiler-root (subs path (count "../compiler/")))
+    (str/starts-with? path "../amu/")
+    (io/file compiler-root (subs path (count "../amu/")))
 
     (str/starts-with? path "../kotoba-core-contracts/")
     (io/file core-contracts-root

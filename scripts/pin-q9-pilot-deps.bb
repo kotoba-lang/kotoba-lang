@@ -12,8 +12,8 @@
 (def local-block
   (str "io.github.kotoba-lang/kotoba\n"
        "                      {:local/root \"../kotoba\"}\n"
-       "                      io.github.kotoba-lang/compiler\n"
-       "                      {:local/root \"../compiler\"}\n"
+       "                      io.github.kotoba-lang/amu\n"
+       "                      {:local/root \"../amu\"}\n"
        "                      io.github.kotoba-lang/kotoba-lang\n"
        "                      {:local/root \"../kotoba-lang\"}"))
 
@@ -21,8 +21,8 @@
   (str "io.github.kotoba-lang/kotoba\n"
        "                      {:git/url \"https://github.com/kotoba-lang/kotoba.git\"\n"
        "                       :git/sha \"47a83883ce0ca91d6cda978c8fd03f38192c3887\"}\n"
-       "                      io.github.kotoba-lang/compiler\n"
-       "                      {:git/url \"https://github.com/kotoba-lang/compiler.git\"\n"
+       "                      io.github.kotoba-lang/amu\n"
+       "                      {:git/url \"https://github.com/kotoba-lang/amu.git\"\n"
        "                       :git/sha \"269846bbd9921517ec9451fbf575e047d61c7e19\"}\n"
        "                      io.github.kotoba-lang/kotoba-lang\n"
        "                      {:git/url \"https://github.com/kotoba-lang/kotoba-lang.git\"\n"

@@ -9,7 +9,7 @@
 `kotoba-lang/murakumo` T5.3 replaced the rebalance base-65536 seat pack with
 `[:record :rebalance/lanes …]`. That landed and is byte-parity green, but the
 resulting source is not yet what the migration plan's target DX promises. Two
-specific frictions, both measured against `kotoba-lang/compiler@653084f` through
+specific frictions, both measured against `kotoba-lang/amu@653084f` through
 `kotoba.compiler.core/compile-source`:
 
 ```kotoba
@@ -86,7 +86,7 @@ Measured consequences of exactly that line:
   structurally polymorphic — `(and boolA boolB)` already returns `:bool` today.
   They need no change.
 - After the frontend accepts it, a `value-type-mismatch` surfaces from a
-  **different repo**: that error string is not in `kotoba-lang/compiler`; it
+  **different repo**: that error string is not in `kotoba-lang/amu`; it
   comes from the `kotoba-kir` / `kotoba-wasm` git deps.
 
 So the slice is: **compiler** (comparison typing + a bool-aware `not`) +
@@ -188,7 +188,7 @@ type-directed rewrite pass** (`annotate-doseq-collection-kinds` runs *before*
 `analyze`). Adding either sugar means adding that pass, or resolving the schema
 inside `infer-call-type` and rewriting the node there.
 
-This is contained to `kotoba-lang/compiler` — unlike (1) it needs no other repo.
+This is contained to `kotoba-lang/amu` — unlike (1) it needs no other repo.
 It is the cheaper of the two and should go first.
 
 Interim, available today with no compiler change: name the schema with `def`

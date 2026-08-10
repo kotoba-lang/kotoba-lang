@@ -35,7 +35,7 @@ rejected as unregistered. Provider ADR 0265/0267 explicitly deferred
    `:wasm-aot :implemented`.
 4. Compiler must vendor the same catalog + update the CLJS fallback map in
    `frontend.cljc` so JVM resource load and CLJS agree (separate PR on
-   `kotoba-lang/compiler`).
+   `kotoba-lang/amu`).
 
 ## Non-goals
 

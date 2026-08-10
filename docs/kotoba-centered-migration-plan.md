@@ -53,7 +53,7 @@ closed reader
 | Concern | Authority |
 | --- | --- |
 | Source profile, guest grammar, desugar contract, semantic capability names | `kotoba-lang/kotoba-lang` |
-| Typed admission, HIR/KIR, target lowering, verifier | `kotoba-lang/compiler` |
+| Typed admission, HIR/KIR, target lowering, verifier | `kotoba-lang/amu` |
 | Semantic definition/codebase implementation and launcher integration | `kotoba-lang/kotoba` |
 | Component linking, WIT admission, runtime resource enforcement | `kotoba-lang/kototama` |
 | Grant policy and native enforcement boundary | `kotoba-lang/aiueos` and the selected host |
@@ -157,7 +157,7 @@ Exit gate: one logical UI/document value can be inspected as data, rendered to
 an HTML stream, reconciled to browser DOM, hashed deterministically, and
 rejected when its resource bounds are exceeded.
 
-**W4 first slice (2026-07-27, kotoba-lang/compiler `document-ui-render-test`):**
+**W4 first slice (2026-07-27, kotoba-lang/amu `document-ui-render-test`):**
 a logical UI tree is a `:document` value (map of `:tag`/`:text`/`:children`),
 built and walked with existing `document-*` ops under depth/node/item budgets.
 Pure guest recursion renders it to an HTML string; KIR and restricted ESM agree;

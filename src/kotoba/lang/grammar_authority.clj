@@ -18,7 +18,7 @@
 (def local-vendor-path "resources/kotoba/lang/guest-grammar.edn")
 
 (def sibling-vendor-paths
-  ["../compiler/resources/kotoba/lang/guest-grammar.edn"
+  ["../amu/resources/kotoba/lang/guest-grammar.edn"
    "../kotoba/resources/kotoba/lang/guest-grammar.edn"
    "../grammar/resources/kotoba/lang/guest-grammar.edn"])
 

@@ -77,7 +77,7 @@ guest code.
 
 ### Map literals
 
-Map literals are implemented in `kotoba-lang/compiler`. They lower
+Map literals are implemented in `kotoba-lang/amu`. They lower
 deterministically to a pair-list of key/value pairs. `get` performs a linear
 scan; `assoc` constructs a replacement association list. This reuses existing
 bounded pair primitives instead of introducing a new GC-managed hash-map
@@ -89,7 +89,7 @@ backend parity is incomplete.
 
 ### Vector literals
 
-Vector literals are implemented as data in `kotoba-lang/compiler`, using the
+Vector literals are implemented as data in `kotoba-lang/amu`, using the
 same pair-chain representation as lists. The runtime intentionally has no tag
 that distinguishes such a vector value from a list value. This is a useful
 implemented slice plus an intentional semantic simplification, not full
@@ -100,7 +100,7 @@ they are not confused with vector-as-data during lowering.
 
 ### Set literals
 
-The bounded reader recognizes `#{...}` and both `kotoba-lang/compiler` and the
+The bounded reader recognizes `#{...}` and both `kotoba-lang/amu` and the
 primary `kotoba` Wasm/CLJS lowering paths lower sets to a bounded unique
 pair-chain. Source forms are sorted before lowering,
 runtime-equal duplicates are removed, and `contains?`, `conj`, and `disj` use

@@ -38,8 +38,8 @@
   (str old-test-dep
        "\n                      io.github.kotoba-lang/kotoba\n"
        "                      {:local/root \"../kotoba\"}\n"
-       "                      io.github.kotoba-lang/compiler\n"
-       "                      {:local/root \"../compiler\"}\n"
+       "                      io.github.kotoba-lang/amu\n"
+       "                      {:local/root \"../amu\"}\n"
        "                      io.github.kotoba-lang/kotoba-lang\n"
        "                      {:local/root \"../kotoba-lang\"}"))
 
