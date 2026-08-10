@@ -19,8 +19,35 @@
 
 (def sibling-vendor-paths
   ["../amu/resources/kotoba/lang/guest-grammar.edn"
+   "../compiler/resources/kotoba/lang/guest-grammar.edn"
    "../kotoba/resources/kotoba/lang/guest-grammar.edn"
-   "../grammar/resources/kotoba/lang/guest-grammar.edn"])
+   "../grammar/resources/kotoba/lang/guest-grammar.edn"
+   "../kotoba-sema/resources/kotoba/lang/guest-grammar.edn"])
+
+(def vendored-authorities
+  "Every file this repository is the authority for that another repository
+  carries a byte copy of.
+
+  Only guest-grammar was checked. Surveyed 2026-08-10, three other copies were
+  not: kotoba-sema's guest-grammar — and sema is now the frontend owner —
+  capability-catalog in three places, and host-parity in kotoba. A copy nothing
+  compares is a copy waiting to drift, which is the same defect this file's
+  contract-version check was added for.
+
+  `../amu` and `../compiler` are both listed because that repository was renamed
+  and a checkout may still be under either name. A path that is absent reports
+  `:missing`, which callers tolerate — a sibling need not be checked out — while
+  a path that is present and different is drift."
+  {"lang/guest-grammar.edn"
+   (cons local-vendor-path sibling-vendor-paths)
+   "lang/capability-catalog.edn"
+   ["resources/kotoba/lang/capability-catalog.edn"
+    "../amu/resources/kotoba/lang/capability-catalog.edn"
+    "../compiler/resources/kotoba/lang/capability-catalog.edn"
+    "../kotoba-sema/resources/kotoba/lang/capability-catalog.edn"]
+   "lang/host-parity.edn"
+   ["resources/kotoba/lang/host-parity.edn"
+    "../kotoba/resources/kotoba/lang/host-parity.edn"]})
 
 (def portable-backends #{:compiler :kotoba-wasm :kotoba-cljs})
 
@@ -243,6 +270,19 @@
                      :else nil))))
          paths)))
 
+(defn authority-vendor-drift
+  "Drift across every entry of `vendored-authorities`, tagged with the file each
+  copy is supposed to be a copy OF. Reports the same `:missing` / `:byte-mismatch`
+  shape as `vendor-drift`, so a caller decides which of those is an error."
+  ([] (authority-vendor-drift vendored-authorities))
+  ([registry]
+   (into []
+         (mapcat (fn [[authority paths]]
+                   (when-let [bytes (file-bytes authority)]
+                     (map #(assoc % :authority authority)
+                          (vendor-drift bytes paths)))))
+         registry)))
+
 (defn validate
   "Run all W0 grammar-authority checks. Returns a result map with :valid?."
   ([]
@@ -392,7 +432,15 @@
                               ;; fail closed only on local missing or any present mismatch.
                               bad (vec (concat local-missing mismatches))]
                           (when (seq bad)
-                            [{:code :vendor/drift :paths bad}]))))
+                            [{:code :vendor/drift :paths bad}]))
+                      ;; Every other authority this repository publishes a copy
+                      ;; of. Same tolerance: a sibling may be absent, but a
+                      ;; sibling that is present and different is drift.
+                      (let [others (remove #(= "lang/guest-grammar.edn" (:authority %))
+                                           (authority-vendor-drift))
+                            mismatches (vec (filter #(= :byte-mismatch (:error %)) others))]
+                        (when (seq mismatches)
+                          [{:code :vendor/authority-drift :paths mismatches}]))))
          valid? (empty? errors)]
      {:valid? valid?
       :errors errors

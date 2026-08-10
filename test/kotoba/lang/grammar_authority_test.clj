@@ -1,6 +1,7 @@
 (ns kotoba.lang.grammar-authority-test
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.set :as set]
+            [clojure.string :as str]
             [clojure.java.io :as io]
             [kotoba.lang.grammar-authority :as auth]))
 
@@ -60,6 +61,36 @@
           paths (mapcat :paths vendor-errors)
           mismatches (filter #(= :byte-mismatch (:error %)) paths)]
       (is (empty? mismatches) (pr-str mismatches)))))
+
+(deftest every-authority-this-repo-publishes-a-copy-of-is-checked
+  ;; Only guest-grammar was. Surveyed 2026-08-10, three other copies were not:
+  ;; kotoba-sema's guest-grammar — and sema is now the frontend owner —
+  ;; capability-catalog in three places, and host-parity in kotoba.
+  ;;
+  ;; The gap had already bitten. kotoba-lang/compiler was renamed to
+  ;; kotoba-lang/amu, the authority says so, and the vendored copies still said
+  ;; "kotoba-lang/compiler" — unnoticed because the path list named only the new
+  ;; location, so the copies under the old name were never opened.
+  (testing "the registry names a real authority file for every entry"
+    (doseq [[authority paths] auth/vendored-authorities]
+      (is (.isFile (io/file authority)) authority)
+      (is (seq paths) authority)
+      (doseq [p paths]
+        (is (str/ends-with? p (subs authority (inc (str/last-index-of authority "/"))))
+            (str p " should be a copy of " authority)))))
+  (testing "guest-grammar's own paths are covered by the registry"
+    (is (= (set (cons auth/local-vendor-path auth/sibling-vendor-paths))
+           (set (get auth/vendored-authorities "lang/guest-grammar.edn")))))
+  (testing "a copy that is present and different is reported"
+    (let [mismatches (filter #(= :byte-mismatch (:error %))
+                             (auth/authority-vendor-drift))]
+      (is (empty? mismatches) (pr-str mismatches))))
+  (testing "an absent sibling is reported as missing, not as drift"
+    (let [drift (auth/authority-vendor-drift
+                 {"lang/guest-grammar.edn" ["../definitely-not-a-repo/x.edn"]})]
+      (is (= [:missing] (mapv :error drift)))
+      (is (= ["lang/guest-grammar.edn"] (mapv :authority drift))
+          "each entry says which file it was supposed to be a copy of"))))
 
 (deftest contract-versions-are-recorded
   (let [pipeline (auth/read-edn auth/pipeline-path)
