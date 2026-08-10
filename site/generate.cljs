@@ -395,9 +395,9 @@
     (ui/panel [[:h3 {:class "hig-headline"} "kotoba-lang/kotoba-lang"]
                [:p {:class "hig-footnote"} "The language authority: profile, grammar, capability semantics, safety claims, conformance fixtures."]
                [:p [:a {:class "kot-link" :href "https://github.com/kotoba-lang/kotoba-lang"} "github.com/kotoba-lang/kotoba-lang"]]])
-    (ui/panel [[:h3 {:class "hig-headline"} "kotoba-lang/compiler"]
+    (ui/panel [[:h3 {:class "hig-headline"} "kotoba-lang/amu"]
                [:p {:class "hig-footnote"} "Frontend admission, effect inference, KIR, and the emit backends."]
-               [:p [:a {:class "kot-link" :href "https://github.com/kotoba-lang/compiler"} "github.com/kotoba-lang/compiler"]]])
+               [:p [:a {:class "kot-link" :href "https://github.com/kotoba-lang/amu"} "github.com/kotoba-lang/amu"]]])
     (ui/panel [[:h3 {:class "hig-headline"} "kotoba-lang/kotoba"]
                [:p {:class "hig-footnote"} "Language and library substrate, host implementations, semantic-code identity, integration tests."]
                [:p [:a {:class "kot-link" :href "https://github.com/kotoba-lang/kotoba"} "github.com/kotoba-lang/kotoba"]]])

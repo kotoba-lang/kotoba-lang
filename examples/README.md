@@ -5,7 +5,7 @@
 Manifest: [`pure-product-examples.edn`](./pure-product-examples.edn)
 
 ```bash
-# requires sibling ../compiler checkout
+# requires sibling ../amu checkout
 clojure -M:pure-product-examples
 ```
 

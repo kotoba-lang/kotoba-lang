@@ -27,7 +27,7 @@ mutation should expand it with minimized regressions from future findings.
 The normative evaluator corpus above covers policy classes. The **compiler**
 additionally runs an always-on guest-source ambient reject suite:
 
-- Repo: `kotoba-lang/compiler`
+- Repo: `kotoba-lang/amu`
 - Namespace: `kotoba.compiler.ambient-negative-corpus-test`
 - ADR: compiler `docs/adr/0166-reliability-t24-ambient-negative-corpus.md`
 - Codes: `:kotoba.error/ambient-forbidden`, `:max-parameters`, `:top-level-form`

@@ -19,7 +19,7 @@ enforced on labelled T1.3 cases). The remaining half is a CI job that treats
    `compile-source` + `{:language-profile :pure-product}`, then
    `kotoba.kir/execute` for each case.
 3. **Alias** `clojure -M:pure-product-examples` (requires sibling
-   `../compiler` checkout).
+   `../amu` checkout).
 4. **CI** job `pure-product-examples` on ubuntu-24.04 clones compiler tip and
    runs the alias (fail closed).
 

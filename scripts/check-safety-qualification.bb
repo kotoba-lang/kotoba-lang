@@ -50,7 +50,7 @@
                       (= :component-tender-and-linker (get-in roles [:kototama :role])))
                  "component source and runtime role authority drift" {:roles roles})
   (doseq [path ["../kotoba/resources/kotoba/lang/guest-grammar.edn"
-                "../compiler/resources/kotoba/lang/guest-grammar.edn"]]
+                "../amu/resources/kotoba/lang/guest-grammar.edn"]]
     (require-truth (= grammar-bytes (slurp path))
                    "Q3 vendored guest grammar drift"
                    {:authority "lang/guest-grammar.edn" :consumer path}))

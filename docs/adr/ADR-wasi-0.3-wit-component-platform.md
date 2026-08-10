@@ -32,7 +32,7 @@ canonical set/map, and resource limits remain language semantics enforced on
 both sides of a provider boundary. General recursive value schemas are rejected
 until WIT and the Kotoba validator can preserve their identity and bounds.
 
-`kotoba-lang/compiler` owns deterministic WIT/world generation, core Wasm,
+`kotoba-lang/amu` owns deterministic WIT/world generation, core Wasm,
 Canonical ABI adapters, and component encoding. `kototama` owns admission,
 linking, provider composition, WASI 0.3 async polling/cancellation, and runtime
 budgets. Neither layer may silently extend the language surface.

@@ -9,7 +9,7 @@
   The ids resolve against TWO corpora, and the field does not say which:
 
     7 of 8   this repo's own lang/**/manifest.edn (81 cases across 6 manifests)
-    1 of 8   :record-kit, in kotoba-lang/compiler's pilot-manifest.edn
+    1 of 8   :record-kit, in kotoba-lang/amu's pilot-manifest.edn
 
   That ambiguity is not hypothetical -- checking only the compiler's manifest
   reports 6 of 8 missing, and checking only this repo's reports 1 of 8 missing.
@@ -55,5 +55,5 @@
     (when (seq sibling)
       (is (empty? dangling)
           (str "surface-status.edn cites conformance cases that exist in neither "
-               "this repo's lang/**/manifest.edn nor ../compiler/"
+               "this repo's lang/**/manifest.edn nor ../amu/"
                compiler-manifest ": " (pr-str dangling))))))

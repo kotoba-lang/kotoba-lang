@@ -174,7 +174,7 @@
              {:repository repository :path path})))
   (let [expected-pins (get-in tranche [:pilot-contract :standalone-ci :pins])
         dep->pin {'io.github.kotoba-lang/kotoba (:kotoba expected-pins)
-                  'io.github.kotoba-lang/compiler (:compiler expected-pins)
+                  'io.github.kotoba-lang/amu (:compiler expected-pins)
                   'io.github.kotoba-lang/kotoba-lang (:kotoba-lang expected-pins)}]
     (doseq [{:keys [repository]} (:pilots tranche)]
       (let [deps (edn/read-string (slurp (str workspace "/" repository "/deps.edn")))
