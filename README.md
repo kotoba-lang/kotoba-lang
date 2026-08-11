@@ -1,12 +1,56 @@
 # Kotoba
 
-Kotoba is a small Clojure-shaped language profile for compiling safe,
-capability-checked programs to WebAssembly.
+Kotoba is a small, safety-first Clojure-shaped language profile for compiling
+capability-checked programs through checked KIR to WebAssembly, native x86-64/
+AArch64 machine code, and restricted JavaScript.
 
 It is designed for components that should be inspectable, portable, and
 constrained: AI-generated cells, sandboxed automation, repository policy,
 applications, orchestrators, and capability providers whose external effects
 are explicit and runtime-granted.
+
+## Purpose and philosophy
+
+Kotoba is designed first for software written, changed, tested, and operated by
+AI agents and by people directing them. It supports autonomous coding and
+vibe-coding workflows without treating generated code, tool requests, or
+observed content as authority. Every program must cross explicit, deterministic
+capability, effect, resource, package, and target-admission boundaries.
+
+Safety takes priority over ambient convenience: unsupported behavior fails
+closed, and a module can use only the authority it was explicitly granted. The
+development loop is meant to stay fast and reproducible through machine-readable
+contracts, checked KIR shared across qualified targets, bounded workers,
+deterministic caches, target-aware tests, and signed build/execution receipts.
+Performance claims are evidence for a named workload and host, never a universal
+language ranking.
+
+Cryptographic safety also has a precise scope. CID-pinned inputs, signatures,
+trust/revocation policy, artifact seals, and receipts protect integrity and
+provenance. Encryption, decryption, key use, and secret access require explicit,
+purpose-bound capabilities and qualified providers; the language does not claim
+that all source or runtime data is automatically encrypted.
+
+Kotoba follows a **white-hat philosophy**: its intended uses are authorized
+construction, defense, verification, repair, and auditable automation—not
+bypassing controls or acquiring hidden authority. Intent alone is not a security
+boundary; the compiler/runtime capability model remains the enforcement layer.
+
+### Design influences
+
+The influences are aspect-specific, not compatibility claims:
+
+- **Lisp/Clojure**: data-oriented programs, immutable values, a small composable
+  language, and interactive development.
+- **Rust**: compile-time safety discipline and affine authority handling; Kotoba
+  is benchmarked against Rust rather than copying its general ownership system.
+- **Deno**: secure-by-default execution with explicit permissions.
+- **Unison**: semantic, content-addressed definition identity.
+- **Ethereum/CACAO**: signed identity, attenuated delegation, and verifiable
+  authorization/receipt boundaries, without implying EVM compatibility.
+- **IPFS**: CID-addressed, byte-verified discovery and distribution.
+- **Nix**: pinned inputs, declarative environments, reproducible artifacts, and
+  deploying the same admitted closure that was tested.
 
 ## Why Kotoba?
 
@@ -20,8 +64,11 @@ are explicit and runtime-granted.
   written in Clojure/ClojureScript (`.cljc`). An earlier Rust implementation
   was fully retired in favor of this CLJC authority (see
   `docs/rust-migration-inventory.md`).
-- **Wasm-first execution**: the public compiler surface is `kotoba -e` and
-  `kotoba wasm ...`.
+- **Multi-target execution**: [`kotoba-lang/amu`](https://github.com/kotoba-lang/amu)
+  admits source once into checked KIR and emits Wasm/Wasm Components, restricted
+  JavaScript, or sealed KEXE native artifacts for x86-64 and AArch64. Wasm
+  Component remains the primary portable application profile; direct native AOT
+  is a supported, explicitly selected backend.
 - **Capability-safe tooling**: safe-policy, safe-build, and selfhost-inspect are
   part of the expected user-facing workflow. Safety is *benchmarked against*
   Rust, not copied from it: Kotoba's capability-confinement model
@@ -35,6 +82,13 @@ are explicit and runtime-granted.
   consumed at most once per execution path — `kotoba.runtime/cap-affine-
   problems` in `kotoba-lang/kotoba`, `:cap-value-reused`), which is what the
   ADR's own safety ladder actually calls for.
+- **Verified native execution without a Wasm dependency**: Amu emits machine
+  instructions directly without an assembler, LLVM, JVM JIT, or Wasm runtime.
+  Its independent verifier regenerates and compares the sealed code;
+  [`tender-native`](https://github.com/kotoba-lang/tender-native) verifies signed
+  KEXE trust/policy, maps code W^X, executes it in a supervised loader process,
+  and produces a signed receipt. The supported native language/ABI slice is
+  bounded and fails closed outside its qualified coverage.
 - **Conformance-oriented**: the profile is machine-readable and backed by
   fixtures so independent tools can agree on source behavior.
 
