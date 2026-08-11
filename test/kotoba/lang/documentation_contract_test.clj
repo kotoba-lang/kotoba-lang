@@ -63,20 +63,37 @@
     (is (= [:docs/link-missing] (mapv :code found)))
     (is (= "missing.md" (:target (first found))))))
 
-(deftest release-binding-fails-closed-on-the-observed-gap
+(deftest release-binding-names-the-verified-profile-6-artifact
   (let [binding (read-edn (File. ".") "lang/docs-release.edn")
         policy (read-edn (File. ".") "lang/version-policy.edn")
-        surface (read-edn (File. ".") "lang/surface-status.edn")]
+        surface (read-edn (File. ".") "lang/surface-status.edn")
+        trust (read-edn (File. ".") "lang/release-trust.edn")
+        implementation (:implementation-release binding)
+        envelope (:signed-envelope implementation)]
     (is (= (:kotoba.lang.surface-status/profile-version surface)
            (get-in binding [:contract :language-profile])))
     (is (= (:release/language-profile policy)
            (get-in binding [:language-release :language-profile])))
     (is (= 6 (get-in binding [:language-release :language-profile])))
     (is (= "0.7.0" (get-in binding [:language-release :version])))
-    (is (= :absent
+    (is (= :verified
            (get-in binding [:implementation-release :language-profile-binding])))
-    (is (= :blocked (get-in binding [:public-default :status])))
-    (is (= :docs/no-release-bound-profile
+    (is (= 6 (get-in binding [:implementation-release :language-profile])))
+    (is (= 1 (get-in binding [:implementation-release :package-contract])))
+    (is (= #{:darwin-arm64}
+           (get-in binding [:implementation-release :platforms])))
+    (is (= "6d2ad543f48391b91bec63b50a7fdb7ba8fe8828"
+           (get-in binding [:implementation-release :commit])))
+    (is (= :verified
+           (get-in binding [:implementation-release :signed-envelope
+                            :signature-status])))
+    (is (= "sha256:e9d8186c4e54aa95e53e56877a794dcd890c6b296a6e5bd2bfd9cccc8ce0638c"
+           (get-in implementation [:artifact-digests :darwin-arm64])))
+    (is (= "66f6368dabfea6b6a842fb6fa10d261e4e3545a3667ec227740c26a0433b4f2e"
+           (:sha256 envelope)))
+    (is (= :active (get-in trust [:signers (:signer envelope) :status])))
+    (is (= :released (get-in binding [:public-default :status])))
+    (is (= :docs/release-bound-profile
            (get-in binding [:public-default :code])))))
 
 (deftest diagnostic-registry-is-stable-and-source-backed
@@ -114,7 +131,7 @@
     (is (str/includes? html "id=\"kot-doc-search\""))
     (is (str/includes? html "aria-label=\"Search Kotoba documentation reference\""))
     (is (str/includes? html "No query leaves the browser."))
-    (is (str/includes? html "docs/no-release-bound-profile"))
-    (is (str/includes? html "profile binding: absent"))
+    (is (str/includes? html "docs/release-bound-profile"))
+    (is (str/includes? html "profile binding: verified"))
     (is (= 47 (count (re-seq #"class=\"kot-search-item\"" html))))
     (is (str/includes? html "input.addEventListener('input',apply)"))))

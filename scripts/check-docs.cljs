@@ -64,16 +64,51 @@
 (defn release-errors []
   (let [binding-path (local-path "lang/docs-release.edn")
         policy-path (local-path "lang/version-policy.edn")
-        surface-path (local-path "lang/surface-status.edn")]
-    (if-not (every? exists? [binding-path policy-path surface-path])
+        surface-path (local-path "lang/surface-status.edn")
+        trust-path (local-path "lang/release-trust.edn")]
+    (if-not (every? exists? [binding-path policy-path surface-path trust-path])
       []
       (let [binding (read-edn binding-path)
             policy (read-edn policy-path)
             surface (read-edn surface-path)
+            trust (read-edn trust-path)
             contract-profile (get-in binding [:contract :language-profile])
             release-profile (get-in binding [:language-release :language-profile])
-            impl-binding (get-in binding [:implementation-release :language-profile-binding])
-            public-status (get-in binding [:public-default :status])]
+            language-version (get-in binding [:language-release :version])
+            implementation (:implementation-release binding)
+            impl-binding (:language-profile-binding implementation)
+            public-status (get-in binding [:public-default :status])
+            envelope (:signed-envelope implementation)
+            signer (get-in trust [:signers (:signer envelope)])
+            conformance (:conformance-result implementation)
+            required-binds #{:binary-sha256 :runtime :source-extensions
+                             :structured-rejection :commit :tree :platform
+                             :language-profile :package-contract
+                             :artifact-digests :conformance-result}
+            released-valid?
+            (and (= :verified impl-binding)
+                 (= contract-profile (:language-profile implementation))
+                 (= (:release/package-contract policy)
+                    (:package-contract implementation))
+                 (= (str "v" language-version) (:tag implementation))
+                 (re-matches #"[0-9a-f]{40}" (:commit implementation))
+                 (re-matches #"[0-9a-f]{40}" (:tree implementation))
+                 (= (:platforms implementation)
+                    (set (keys (:artifact-digests implementation))))
+                 (seq (:platforms implementation))
+                 (every? #(re-matches #"sha256:[0-9a-f]{64}" %)
+                         (vals (:artifact-digests implementation)))
+                 (re-matches #"[0-9a-f]{64}" (:binary-sha256 implementation))
+                 (= :passed (:status conformance))
+                 (pos? (:tests conformance))
+                 (pos? (:assertions conformance))
+                 (zero? (:failures conformance))
+                 (zero? (:errors conformance))
+                 (every? (:evidence-binds implementation) required-binds)
+                 (= :verified (:signature-status envelope))
+                 (re-matches #"[0-9a-f]{64}" (:sha256 envelope))
+                 (= :active (:status signer))
+                 (contains? (:purpose signer) :implementation-release))]
         (cond-> []
           (not= contract-profile (:kotoba.lang.surface-status/profile-version surface))
           (conj {:code :docs/release-contract-drift})
@@ -85,7 +120,10 @@
           (conj {:code :docs/release-overclaim
                  :contract-profile contract-profile
                  :release-profile release-profile
-                 :implementation-binding impl-binding}))))))
+                 :implementation-binding impl-binding})
+          (and (= :released public-status) (not released-valid?))
+          (conj {:code :docs/released-binding-incomplete
+                 :implementation-release implementation}))))))
 
 (defn diagnostic-errors []
   (let [p (local-path "lang/diagnostics.edn")]
