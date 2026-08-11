@@ -26,9 +26,13 @@
 
 (deftest actual-ci-and-soak-evidence-is-fail-closed
   (is (false? (get-in q9 [:soak-evidence :local-preflight-is-ci-evidence])))
-  (is (= 3 (get-in soak [:requirements :distinct-runs-per-repository])))
+  (is (= 2 (:kotoba.lang.q9.soak/version soak)))
+  (is (= "fleet-ci/tip-verify/v1" (get-in soak [:requirements :policy])))
+  (is (= "fleet-ci/*" (get-in soak [:requirements :signer-grant])))
+  (is (= 3 (get-in soak [:requirements :distinct-receipts-per-repository])))
   (is (= 604800 (get-in soak [:requirements :minimum-soak-seconds])))
   (is (true? (get-in soak [:requirements :same-qualification-artifacts])))
+  (is (re-matches #"[0-9a-f]{40}" (get-in soak [:gate :root-evidence-sha])))
   (is (every? empty? (map :runs (:repositories soak))))
   (is (false? (get-in soak [:gate :ready])))
   (is (false? (get-in soak [:gate :consumer-cutover-authorized]))))
