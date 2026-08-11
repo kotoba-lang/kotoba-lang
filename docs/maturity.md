@@ -16,12 +16,12 @@ Comparison baselines: [Rust documentation bookshelf](https://doc.rust-lang.org/s
 | first-run learning path | install, tutorial/tour, runnable examples | [getting started](getting-started.md) and checked examples | implemented, narrow |
 | language reference | comprehensive syntax and semantic reference | reader map plus semantics SSoT, grammar, surface matrix | implemented, partial |
 | executable specification | conformance suites and implementation tests | machine grammar plus positive, negative, type, capability, identity, and adversarial fixtures | strong bounded slice |
-| standard-library reference | searchable per-symbol API pages | machine inventory and repository READMEs | gap |
-| command reference | generated, per-command CLI documentation | `lang/cli.edn` plus a workflow-oriented reference | partial |
-| diagnostics | stable codes with searchable explanations | phase model; stable-code coverage incomplete | gap |
-| versions and releases | docs bound to shipped versions | profile/package/release axes exist; profile 6 is not yet bound by the current release policy | blocked release gate |
+| standard-library reference | searchable per-symbol API pages | generated bounded-core symbol reference | implemented, bounded |
+| command reference | generated, per-command CLI documentation | generated from `lang/cli.edn` | implemented |
+| diagnostics | stable codes with searchable explanations | generated bounded contract registry; compiler/host coverage remains incomplete | implemented, bounded |
+| versions and releases | docs bound to shipped versions | machine release binding blocks the public default because no implementation evidence binds profile 6 | correctly blocked |
 | editor experience | installable LSP/editor guides | LSP substrate exists; end-user setup guide is absent | gap |
-| discoverability | searchable, link-checked public site | generated landing page links the docs; full-text search is absent | partial |
+| discoverability | searchable, link-checked public site | generated landing page embeds a local reference search index | implemented, bounded corpus |
 
 ## Maturity axes
 
@@ -50,18 +50,20 @@ or Deno.”
 | D2 reference | getting started, language, tooling, package, and stdlib routes exist | complete for bounded surface |
 | D3 executable integrity | checked documents resolve links and authority/profile drift fails a gate | complete |
 | D4 public portal | generated public page exposes the routes without restating the spec | implemented; deployment is a separate operational check |
-| D5 release-bound docs | every public page names a shipped implementation/profile pair; CLI/API/diagnostics are generated and searchable | not complete |
-| D6 external validation | task-based user tests, localization, accessibility and search telemetry drive revisions | not complete |
+| D5 release-bound docs | every public page names a shipped implementation/profile pair; CLI/API/diagnostics are generated and searchable | reference generation/search complete; release pair correctly blocked |
+| D6 external validation | task-based user tests, localization, accessibility and search telemetry drive revisions | protocol and automation complete; external observations pending |
 
 ## Next maturity gates
 
 1. Bind language profile 6 to a signed implementation release through
    `kotoba-lang/release`; do not change `lang/version-policy.edn` as prose-only
    bookkeeping.
-2. Generate CLI pages from `lang/cli.edn` and symbol pages from stdlib manifests.
-3. Publish a stable diagnostic-code registry with examples and explanations.
-4. Add full-text search over the generated static documentation artifact.
-5. Run external first-install, first-build, capability-policy, and error-recovery
-   tasks; feed measured failures back into this roadmap.
+2. Extend the bounded diagnostic registry as compiler and host codes become
+   stable; never infer exhaustive coverage from the initial registry.
+3. Run the four tasks in [`user-validation.edn`](user-validation.edn) with at
+   least three external users; automated and agent-proxy results cannot close D6.
+4. Add localization and privacy-preserving search/task telemetry only after its
+   collection and retention policy is explicit.
 
-Run `nbb scripts/check-docs.cljs` to verify the D3 contract.
+Run `nbb scripts/generate-docs-reference.cljs --check` and
+`nbb scripts/check-docs.cljs` to verify the generated-reference contract.

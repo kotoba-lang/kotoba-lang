@@ -2,6 +2,7 @@
 (ns check-docs
   (:require [cljs.reader :as reader]
             [clojure.string :as str]
+            ["child_process" :as child]
             ["fs" :as fs]
             ["path" :as path]))
 
@@ -49,6 +50,84 @@
         (when-not (apply = (vals versions))
           [{:code :docs/profile-version-drift :versions versions}])))))
 
+(defn generated-errors []
+  (let [generator (local-path "scripts/generate-docs-reference.cljs")]
+    (if-not (exists? generator)
+      []
+      (let [result (child/spawnSync "nbb"
+                                    #js ["scripts/generate-docs-reference.cljs" "--check"]
+                                    #js {:cwd root :encoding "utf8"})]
+        (when-not (zero? (.-status result))
+          [{:code :docs/generated-drift
+            :detail (str/trim (str (.-stdout result) (.-stderr result)))}])))))
+
+(defn release-errors []
+  (let [binding-path (local-path "lang/docs-release.edn")
+        policy-path (local-path "lang/version-policy.edn")
+        surface-path (local-path "lang/surface-status.edn")]
+    (if-not (every? exists? [binding-path policy-path surface-path])
+      []
+      (let [binding (read-edn binding-path)
+            policy (read-edn policy-path)
+            surface (read-edn surface-path)
+            contract-profile (get-in binding [:contract :language-profile])
+            release-profile (get-in binding [:language-release :language-profile])
+            impl-binding (get-in binding [:implementation-release :language-profile-binding])
+            public-status (get-in binding [:public-default :status])]
+        (cond-> []
+          (not= contract-profile (:kotoba.lang.surface-status/profile-version surface))
+          (conj {:code :docs/release-contract-drift})
+          (not= release-profile (:release/language-profile policy))
+          (conj {:code :docs/release-policy-drift})
+          (and (or (not= contract-profile release-profile)
+                   (= :absent impl-binding))
+               (not= :blocked public-status))
+          (conj {:code :docs/release-overclaim
+                 :contract-profile contract-profile
+                 :release-profile release-profile
+                 :implementation-binding impl-binding}))))))
+
+(defn diagnostic-errors []
+  (let [p (local-path "lang/diagnostics.edn")]
+    (if-not (exists? p)
+      []
+      (let [registry (read-edn p)
+            entries (:diagnostics registry)
+            codes (map :code entries)]
+        (cond-> []
+          (not= (count codes) (count (set codes)))
+          (conj {:code :docs/diagnostic-code-duplicate})
+          (some #(or (not (keyword? (:code %)))
+                     (not (keyword? (:phase %)))
+                     (str/blank? (:summary %))
+                     (str/blank? (:action %))
+                     (not (exists? (local-path (:source %))))) entries)
+          (conj {:code :docs/diagnostic-entry-invalid}))))))
+
+(defn validation-errors []
+  (let [p (local-path "docs/user-validation.edn")]
+    (if-not (exists? p)
+      []
+      (let [doc (read-edn p)
+            observations (:observations doc)
+            invalid (filter #(or (nil? (:participant/class %))
+                                 (nil? (:task %))
+                                 (nil? (:outcome %))
+                                 (str/blank? (:evidence %))
+                                 (str/blank? (:observed-at %))) observations)
+            gate (get-in doc [:external-gate :status])
+            external (filter #(= :external-user (:participant/class %)) observations)
+            required (get-in doc [:protocol :external-completion-requires :required-tasks])
+            covered (set (map :task (filter #(= :pass (:outcome %)) external)))
+            minimum (get-in doc [:protocol :external-completion-requires :minimum-participants])]
+        (cond-> []
+          (seq invalid)
+          (conj {:code :docs/validation-result-invalid :count (count invalid)})
+          (and (= :complete gate)
+               (or (< (count (set (map :participant/id external))) minimum)
+                   (not (every? covered required))))
+          (conj {:code :docs/external-validation-overclaim}))))))
+
 (defn main []
   (let [missing-map (when-not (exists? map-path)
                       [{:code :docs/authority-map-missing
@@ -80,7 +159,9 @@
                         (nil? kind))]
           {:code :docs/authority-invalid :axis axis})
         errors (vec (concat missing-map missing-docs broken-links route-errors
-                            authority-errors (profile-errors)))]
+                            authority-errors (profile-errors) (generated-errors)
+                            (release-errors) (diagnostic-errors)
+                            (validation-errors)))]
     (if (seq errors)
       (do (println "DOCS FAIL" (pr-str errors)) (js/process.exit 1))
       (do (println "DOCS PASS"

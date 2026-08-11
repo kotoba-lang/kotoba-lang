@@ -37,8 +37,9 @@ persistent pair-chain representations with linear bounded operations.
 - Hidden exception paths are excluded from safe components; fallible work uses
   explicit option/result values.
 - Execution is fuel-bounded. See the [fuel model](../lang/fuel-model.md).
-- Diagnostics are phase-tagged. Stable error-code coverage is still an active
-  maturity item and must not be presented as complete.
+- Diagnostics are phase-tagged. The bounded stable registry is in the
+  [generated diagnostic-code reference](../generated/diagnostics.md); compiler
+  and host-specific codes outside it must not be presented as covered.
 
 ## Effects and capabilities
 
@@ -65,5 +66,5 @@ additional type, capability, identity, and malicious-source suites beside it.
 
 Language profile, package contract, implementation release, and individual
 stdlib semver are separate axes. Read [language versioning](../lang/versioning.md)
-and [stdlib versioning](../lang/stdlib-versioning.md) before making a
-compatibility claim.
+and [stdlib versioning](../lang/stdlib-versioning.md), then check the generated
+[release binding](../generated/release.md) before making a compatibility claim.

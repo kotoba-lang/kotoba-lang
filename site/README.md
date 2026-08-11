@@ -1,7 +1,8 @@
 # site — kotoba-lang.org
 
-The language's public page. One static, self-contained document: no build step
-and no runtime JavaScript for anyone visiting it.
+The language's public page. One static, self-contained document with no network
+runtime dependency. A small inline script filters the generated reference
+index; queries stay in the browser and no telemetry is emitted.
 
 ## What makes this page different from a README
 
@@ -16,6 +17,9 @@ lang/safety-claims.edn          lang/wasm-component-platform.edn
 lang/surface-status.edn         lang/code-identity.edn
 lang/capability-semantics.edn   lang/safety-qualification.edn
 lang/elaboration-pipeline.edn
+lang/docs-release.edn           lang/diagnostics.edn
+lang/cli.edn                    lang/conformance/stdlib/manifest.edn
+docs/user-validation.edn        docs/search-index.edn
 ```
 
 Change the spec and the page changes with it. The page cannot drift into
@@ -26,6 +30,8 @@ The page also exposes the four checked documentation routes—learn, use,
 implement, and evaluate—from `docs/authority-map.edn`. The prose documents are
 linked rather than copied into the landing page. Run `nbb scripts/check-docs.cljs`
 before regenerating so moved authorities and broken reader paths fail closed.
+Run `nbb scripts/generate-docs-reference.cljs --check` first so the embedded
+search corpus and generated Markdown cannot lag those authorities.
 
 ## Regenerate
 

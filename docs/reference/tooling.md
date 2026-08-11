@@ -3,6 +3,8 @@
 The installed `kotoba` executable and its release artifacts are owned by
 [`kotoba-lang/kotoba`](https://github.com/kotoba-lang/kotoba). The host-neutral
 command vocabulary is machine-readable in [`lang/cli.edn`](../../lang/cli.edn).
+Use the [generated CLI reference](../generated/cli.md) for the complete command
+and option inventory.
 
 ## Common workflows
 
@@ -39,13 +41,15 @@ semver. Their inventory and exact pinned evidence are recorded in
 - I/O contracts: `time`, `fs`, `http`, `io`
 - tooling: `test`, `fmt`, `lsp`, `lsp-rpc`, `lint`, `lint-kotoba`
 
-Repository-level `M6` means the declared conformance/versioning stages exist;
+The bounded core names are generated in the
+[standard-library reference](../generated/stdlib.md). Repository-level `M6`
+means the declared conformance/versioning stages exist;
 it does not mean 1.0 API stability, broad adoption, or production SLO evidence.
 
 ## Editors and diagnostics
 
 `lsp` and `lsp-rpc` provide the protocol substrate, while `fmt` and `lint`
-provide portable tooling libraries. End-user editor installation, searchable
-per-symbol API pages, and a stable diagnostic-code index remain documentation
-product gaps. Track them in [maturity](../maturity.md) rather than inferring
-completion from repository existence.
+provide portable tooling libraries. The
+[diagnostic-code reference](../generated/diagnostics.md) is stable for the
+bounded contract surface, but is explicitly not an exhaustive compiler/host
+catalog. End-user editor installation remains a documentation-product gap.
