@@ -1,5 +1,7 @@
 (ns kotoba.lang.version-policy-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
+            [clojure.test :refer [deftest is]]
             [kotoba.lang.version-policy :as version])
   (:import [java.time LocalDate]))
 
@@ -35,9 +37,9 @@
         ids (version/current-profile-ids policy)
         report (version/compatibility-report
                 policy (version/default-compatibility-request policy))]
-    (is (= 5 (:language-profile ids)))
+    (is (= 6 (:language-profile ids)))
     (is (= 1 (:package-contract ids)))
-    (is (= "0.5.0" (:release-version ids)))
+    (is (= "0.7.0" (:release-version ids)))
     (is (:compatible? report))
     (is (:valid? (version/validate-policy policy)))))
 
@@ -45,7 +47,20 @@
   (let [policy (version/read-policy)
         env (version/release-tag-envelope-template
              policy {:commit "c" :tree "t" :source-root "s"
-                     :issued-at-ms 1 :signer "did:key:test"})]
-    (is (= "v0.5.0" (:tag env)))
-    (is (= 5 (:language-profile env)))
-    (is (contains? (get-in policy [:release-tags :binds]) :language-profile))))
+                     :issued-at-ms 1 :signer "did:key:test"
+                     :artifact-digests {:darwin-arm64 "sha256:a"}
+                     :conformance-result {:status :passed}})]
+    (is (= "v0.7.0" (:tag env)))
+    (is (= 6 (:language-profile env)))
+    (is (= #{:version :commit :tree :source-root :issued-at-ms
+             :language-profile :package-contract :artifact-digests
+             :conformance-result}
+           (get-in policy [:release-tags :binds])))))
+
+(deftest release-trust-is-external-and-active
+  (let [trust (edn/read-string (slurp "lang/release-trust.edn"))
+        signers (:signers trust)]
+    (is (= 1 (:kotoba.lang.release-trust/version trust)))
+    (is (= 1 (count signers)))
+    (is (every? #(= :active (:status %)) (vals signers)))
+    (is (every? #(str/starts-with? % "did:key:") (keys signers)))))
