@@ -33,7 +33,15 @@
   (is (= 604800 (get-in soak [:requirements :minimum-soak-seconds])))
   (is (true? (get-in soak [:requirements :same-qualification-artifacts])))
   (is (re-matches #"[0-9a-f]{40}" (get-in soak [:gate :root-evidence-sha])))
-  (is (every? empty? (map :runs (:repositories soak))))
+  (let [runs (map :runs (:repositories soak))
+        minimum (apply min (map count runs))]
+    (is (= minimum (get-in soak [:gate :actual-green-fleet-receipts-per-repository])))
+    (is (every? #(every? (fn [run]
+                           (and (:signer-enrolled run)
+                                (:signature-verified run)
+                                (= :pass (:outcome run))))
+                         %)
+                runs)))
   (is (false? (get-in soak [:gate :ready])))
   (is (false? (get-in soak [:gate :consumer-cutover-authorized]))))
 
