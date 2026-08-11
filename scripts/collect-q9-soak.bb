@@ -27,7 +27,17 @@
   (json/parse-string (command! ["gh" "api" endpoint]) true))
 
 (defn github-file [repository revision file]
-  (let [response (gh-json (str "repos/" repository "/contents/" file "?ref=" revision))]
+  (let [contents (gh-json (str "repos/" repository "/contents/" file "?ref=" revision))
+        ;; Contents API omits :content once a file exceeds 1 MiB. The immutable
+        ;; blob named by that response is the same bytes and remains available
+        ;; through Git Data up to GitHub's blob limit.
+        response (if (seq (:content contents))
+                   contents
+                   (gh-json (str "repos/" repository "/git/blobs/" (:sha contents))))]
+    (when-not (and (= "base64" (:encoding response)) (seq (:content response)))
+      (throw (ex-info "GitHub did not return decodable file content"
+                      {:repository repository :revision revision :file file
+                       :size (:size contents) :blob-sha (:sha contents)})))
     (String. (.decode (Base64/getMimeDecoder) ^String (:content response)) "UTF-8")))
 
 (defn edn-lines [s]
