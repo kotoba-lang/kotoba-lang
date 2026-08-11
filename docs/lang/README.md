@@ -182,17 +182,25 @@ Current evidence, by kind:
 | Slice | Where | What it decides |
 |---|---|---|
 | Op classification | `kotoba-selfhost-contracts:kotoba/safe_analyzer_core.kotoba` | non-executable form / numeric result / effect op / user-call excluded — pure, `effects=#{}`, green on `:jvm-kir`, `:js`, `:wasm` |
+| Effect algebra, minimal policy, policy check, admission | `kotoba-selfhost-contracts:kotoba/capability_admission_core.kotoba` | effect union / declaration check / unused-grant lint / minimal policy / effective scope / attenuation / deny ladder — pure, `effects=#{}`, green on `:jvm-kir`, `:js`, `:wasm` |
+| Effect **inference** (the AST walk) | host | folding a call graph into a mask is a traversal over a collection. Mechanism, and host until the native gate takes collections |
 | Seed shape | `kotoba.selfhost.contracts` (CLJ) | that a seed is well-formed. **Not** self-hosting evidence |
 
-The classification slice keeps the authority split that makes the claim
-checkable: the EDN owns *which* ops are in a class, the `.kotoba` owns *what it
-means* to be in one, and an authority test refuses to let either move alone.
-Cite a slice here only once something equivalent binds it.
+Both Kotoba slices keep the authority split that makes the claim checkable: the
+EDN owns *which* ops are in a class, the `.kotoba` owns *what it means* to be in
+one, and an authority test refuses to let either move alone. In the admission
+slice that binding extends to the bit ORDER — `effect-bit` assigns bit *i* to
+index *i* of `:effect-ops`, so reordering that vector is a wire change and not a
+formatting change. Cite a slice here only once something equivalent binds it.
+
+Note the row that is deliberately not a Kotoba row. Splitting "effect inference"
+into an algebra that moved and a traversal that did not is the honest reading;
+recording the slice as done because the algebra landed would be exactly the
+error this section was corrected for.
 
 This repository tracks the path under `docs/lang/coverage.edn` `:selfhost`.
-Remaining work is explicit: effect inference, minimal-policy, policy-check and
-admission-check as executing Kotoba (these are the slices the removed analyzer
-covered and the ones this table is still missing), package lock enforcement in
+Remaining work is explicit: the effect-inference traversal (blocked on the
+native gate taking collections, not on a decision), package lock enforcement in
 safe-build, registry signature verification, repo RID validation through
 kotoba-rad, capability values in the host ABI, and broader compiler semantics
 self-hosting.
