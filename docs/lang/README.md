@@ -92,8 +92,10 @@ Dynamic authority is modeled as explicit capability values, not as ambient host
 access or plain resource strings. The profile semantics are documented in
 [`capability-values.md`](capability-values.md).
 
-The machine-readable source contract lives at `lang/profile.edn`. The current
-classification of intentional safety constraints, deliberate semantic
+Source-file classification lives in
+[`kotoba-core-contracts/lang/profile.edn`](https://github.com/kotoba-lang/kotoba-core-contracts/blob/main/lang/profile.edn).
+The admitted language surface is owned here by `lang/guest-grammar.edn`. The
+current classification of intentional safety constraints, deliberate semantic
 simplifications, partial features, and ordinary implementation gaps lives at
 `lang/surface-status.edn`; its decision record is
 `docs/adr/ADR-kotoba-language-surface-status.md`. In particular, map and vector
@@ -111,9 +113,10 @@ owning the protocol surface.
 
 ## Package References
 
-Package and registry work is tracked separately from the source profile. The
-machine-readable package contract lives at `lang/package.edn`; example package
-manifest and lockfile shapes live in `examples/package-manifest.edn` and
+Package and registry work is tracked separately from the language surface. The
+machine-readable package contract lives in
+[`kotoba-core-contracts/lang/package.edn`](https://github.com/kotoba-lang/kotoba-core-contracts/blob/main/lang/package.edn);
+example authoring shapes remain in `examples/package-manifest.edn` and
 `examples/kotoba.lock.edn`.
 
 Safe Kotoba package references are content-pinned and authority-checked:
@@ -194,7 +197,7 @@ safe-build, registry signature verification, repo RID validation through
 kotoba-rad, capability values in the host ABI, and broader compiler semantics
 self-hosting.
 
-## Maturity
+## Contract maturity
 
 - `M0`: constants and docs.
 - `M1`: machine-readable profile.
@@ -204,9 +207,15 @@ self-hosting.
 - `M5`: external implementation can consume the same suite.
 - `M6`: profile-version compatibility policy.
 
+This scale measures the bounded conformance contract. It does not measure the
+documentation product, implementation release, operational reliability,
+ecosystem adoption, or production SLOs. See
+[`docs/maturity.md`](../maturity.md) for the separated assessment.
+
 ## Layering
 
-- `kotoba-lang`: language profile, source contract, conformance vocabulary.
+- `kotoba-lang`: language semantics, admitted grammar, and conformance vocabulary.
+- `kotoba-core-contracts`: source classification, package, and runtime-boundary contracts.
 - `kotoba-cli`: public compiler surface: `kotoba -e` and `kotoba wasm ...`.
 - `kotoba-clj`: compiler implementation crate and compatibility binary for the
   profile.

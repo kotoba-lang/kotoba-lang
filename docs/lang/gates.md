@@ -1,61 +1,65 @@
-# Kotoba Language Gates
+# Kotoba language gates
 
-The standalone artifact gate for this repository is:
+The language repository owns semantics, grammar, conformance, documentation,
+and the host-neutral CLI vocabulary. Source classification and package
+contracts were intentionally moved to `kotoba-lang/kotoba-core-contracts`;
+release admission is owned by `kotoba-lang/release`.
+
+## Standalone repository gates
 
 ```sh
-test -f lang/profile.edn
-test -f lang/package.edn
+test -f lang/guest-grammar.edn
+test -f lang/surface-status.edn
+test -f lang/elaboration-pipeline.edn
 test -f lang/conformance/manifest.edn
-test -f lang/package-conformance/manifest.edn
-test -f examples/package-manifest.edn
-test -f examples/kotoba.lock.edn
-test -f docs/adr/ADR-kotoba-transit-wire-protocol.md
-test -f docs/adr/ADR-kotoba-json-wire-protocol.md
-test -f docs/lang/package-rules.md
-bb scripts/check-package-contract.bb
-```
-
-These commands are the maturity gate for `kotoba-lang` profile version 2, and
-they are CLJ/EDN-first — no Rust toolchain is required or allowed in this
-repository:
-
-```sh
-clojure -M:test
+test -f lang/capability-conformance/manifest.edn
+test -f lang/type-conformance/manifest.edn
+test -f docs/authority-map.edn
+nbb scripts/check-docs.cljs
+nbb scripts/check-grammar-authority.cljs
 bb scripts/check-cli-contract.bb lang/cli.edn
-bb scripts/check-package-contract.bb
 bb scripts/check-capability-values.bb
 bb scripts/check-legacy-runtime-absence.bb
+clojure -M:compatibility
+clojure -M:test
 ```
 
-The first command runs the CLJC test suites: the CLI contract conformance
-tests (`test/kotoba/cli_test.cljc`), the package contract tests
-(`test/kotoba/lang/package_contract_test.clj`), and the capability value
-contract tests (`test/kotoba/lang/capability_values_test.clj` and
-`test/kotoba/lang/capability_host_test.clj`). The second
-command validates the machine-readable CLI command contract. The third command
-runs the package manifest/lock conformance fixtures from
-`lang/package-conformance/`. The fourth command runs the capability value
-conformance fixtures from `lang/capability-conformance/` through the same
-pure CLJC logic (`src/kotoba/lang/capability_values.cljc` plus the host-call
-dispatch kernel `src/kotoba/lang/capability_host.cljc`): capability shape,
-effect-row consistency, CACAO grant / local policy intersection, receipt
-cases, and host-dispatch cases (a granted call reaches the handler with the
-concrete capability, a denied call never does, and both leave receipts).
-The last two commands pin the lab site artifacts.
+`check-docs.cljs` rejects missing reader routes, broken relative links in the
+checked set, invalid authority records, and profile-version disagreement among
+grammar, surface, and elaboration authorities. `check-grammar-authority.cljs`
+checks admitted/forbidden surface classification and any available vendored
+grammar copies.
 
-Implementation conformance against the language profile is owned by the
-launcher and CLJC authority gates in `kotoba-lang/kotoba` (see its
-`docs/lang/gates.md`): a conforming implementation consumes
-`lang/conformance/manifest.edn`, runs all `:kind :run` source-file cases and
-`:kind :compile-expr` inline-expression cases for the declared target set, and
-produces the declared errors for all negative cases relevant to its admission
-mode. CI additionally enforces that no Rust source or Cargo build files
-reappear in this repository.
+The full Clojure suite includes sibling-owned evidence checks and therefore
+needs the west sibling layout. In a standalone clone, run the self-contained
+gates above and report missing sibling evidence separately rather than calling
+the whole suite green.
 
-Package-safety maturity additionally requires `scripts/check-package-contract.bb`
-to accept positive package manifest/lock fixtures and reject version-only,
-unsigned, missing-CID, and over-capability negative fixtures from
-`lang/package-conformance/`. The same gate also pins package boundary metadata:
-known package kinds, adapter `:consumes` requirements, schema-contract
-`:provides` requirements, and `app.kotoba.*` / `wire.kotoba.*` contract
-surfaces in manifests and lockfiles.
+## Negative documentation proof
+
+The documentation gate has a committed broken fixture:
+
+```sh
+nbb scripts/check-docs.cljs --root test/fixtures/docs-negative
+```
+
+It must exit non-zero with `:docs/link-missing`. A gate that cannot demonstrate
+its failure path is not landed.
+
+## Cross-repository gates
+
+Package admission is verified by:
+
+```sh
+bb ../kotoba-core-contracts/scripts/check-package-contract.bb
+```
+
+Implementation conformance is owned by `kotoba-lang/kotoba` and the compiler
+backends. A conforming implementation consumes `lang/conformance/manifest.edn`,
+runs every declared case for its supported targets, produces the declared
+negative results, and reports unsupported targets explicitly. Silent fallback
+to another backend or reader target is non-conforming.
+
+Signed release tags and trust-store verification are owned by
+`kotoba-lang/release`. Updating `lang/version-policy.edn` alone does not prove a
+profile has been released.

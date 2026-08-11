@@ -331,7 +331,14 @@
 
 (defn identity-section []
   (let [{:keys [canonical-input]} (get-in identity-spec [:identities :definition-cid])
-        impl (:implementation identity-spec)]
+        impl (:implementation identity-spec)
+        foundation-statuses (select-keys impl [:ci4 :ci5])
+        foundation-landed? (every? #(= :implemented (:status %))
+                                    (vals foundation-statuses))
+        pending-identities
+        (for [[identity {:keys [status]}] (:identities identity-spec)
+              :when (not= :implemented status)]
+          (str (name identity) "=" (name status)))]
     (ui/section
      {:title "Identity by content, without the Unison surface" :wide true}
      [:p {:class "hig-body"}
@@ -367,11 +374,10 @@
          {:trailing (ui/badge (name status))})))
      (caption
       (str "Read from lang/code-identity.edn at build time, so this table "
-           "cannot claim more than the repository does. The ADR's own rule is "
-           "that until CI4 and CI5 both land the design is described as "
-           "proposed — CI4 has landed and CI5 has not, so proposed is what it "
-           "is. Hash-native authoring, browse-by-hash and a deployed codebase "
-           "network are not claimed at all.")))))
+           "cannot claim more than the repository does. CI4 and CI5 are "
+           (if foundation-landed? "both implemented. " "not both implemented. ")
+           "That does not promote the other identity layers: "
+           (clojure.string/join ", " pending-identities) ".")))))
 
 (defn status-section []
   (ui/section
@@ -387,14 +393,43 @@
      "Key custody and revocation distribution remain operational, not linguistic, guarantees."])
    (caption "If a claim is not on this page, assume it is not being made.")))
 
+(defn documentation-section []
+  (ui/section
+   {:title "Documentation" :wide true}
+   [:p {:class "hig-body"}
+    "Choose a route by what you need to accomplish. Each route points back to "
+    "the machine-readable authority instead of creating another copy of the spec."]
+   (ui/grid
+    {:min "240px"}
+    (ui/panel [[:h3 {:class "hig-headline"} "Learn"]
+               [:p {:class "hig-footnote"} "Install the CLI, run an expression, build a module, and understand the compatibility boundary."]
+               [:p [:a {:class "kot-link" :href "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/getting-started.md"}
+                    "Getting started"]]])
+    (ui/panel [[:h3 {:class "hig-headline"} "Use"]
+               [:p {:class "hig-footnote"} "Look up values, effects, errors, packages, standard libraries, and common tool workflows."]
+               [:p [:a {:class "kot-link" :href "https://github.com/kotoba-lang/kotoba-lang/tree/main/docs/reference"}
+                    "Language and tooling reference"]]])
+    (ui/panel [[:h3 {:class "hig-headline"} "Implement"]
+               [:p {:class "hig-footnote"} "Consume the semantics SSoT, admitted grammar, surface classification, and conformance fixtures."]
+               [:p [:a {:class "kot-link" :href "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/lang/semantics-ssot.md"}
+                    "Implementation contract"]]])
+    (ui/panel [[:h3 {:class "hig-headline"} "Evaluate"]
+               [:p {:class "hig-footnote"} "Separate contract, documentation, release, operational, and ecosystem maturity before making a claim."]
+               [:p [:a {:class "kot-link" :href "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/maturity.md"}
+                    "Maturity and comparison"]]]))
+   (caption "The complete routing and ownership map is checked by scripts/check-docs.cljs.")))
+
 (defn footer []
   (ui/section
    {:title "Read the source" :wide true}
    (ui/grid
     {:min "240px"}
     (ui/panel [[:h3 {:class "hig-headline"} "kotoba-lang/kotoba-lang"]
-               [:p {:class "hig-footnote"} "The language authority: profile, grammar, capability semantics, safety claims, conformance fixtures."]
+               [:p {:class "hig-footnote"} "The language authority: semantics, admitted grammar, capability semantics, safety claims, conformance fixtures."]
                [:p [:a {:class "kot-link" :href "https://github.com/kotoba-lang/kotoba-lang"} "github.com/kotoba-lang/kotoba-lang"]]])
+    (ui/panel [[:h3 {:class "hig-headline"} "kotoba-lang/kotoba-core-contracts"]
+               [:p {:class "hig-footnote"} "Source classification, package admission, and runtime-boundary contracts consumed by launchers."]
+               [:p [:a {:class "kot-link" :href "https://github.com/kotoba-lang/kotoba-core-contracts"} "github.com/kotoba-lang/kotoba-core-contracts"]]])
     (ui/panel [[:h3 {:class "hig-headline"} "kotoba-lang/amu"]
                [:p {:class "hig-footnote"} "Frontend admission, effect inference, KIR, and the emit backends."]
                [:p [:a {:class "kot-link" :href "https://github.com/kotoba-lang/amu"} "github.com/kotoba-lang/amu"]]])
@@ -471,6 +506,7 @@
    (platform-section)
    (identity-section)
    (status-section)
+   (documentation-section)
    (footer)))
 
 (def html
