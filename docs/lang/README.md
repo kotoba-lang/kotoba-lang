@@ -183,7 +183,7 @@ Current evidence, by kind:
 |---|---|---|
 | Op classification | `kotoba-selfhost-contracts:kotoba/safe_analyzer_core.kotoba` | non-executable form / numeric result / effect op / user-call excluded — pure, `effects=#{}`, green on `:jvm-kir`, `:js`, `:wasm` |
 | Effect algebra, minimal policy, policy check, admission | `kotoba-selfhost-contracts:kotoba/capability_admission_core.kotoba` | effect union / declaration check / unused-grant lint / minimal policy / effective scope / attenuation / deny ladder — pure, `effects=#{}`, green on `:jvm-kir`, `:js`, `:wasm` |
-| Effect **inference** (the AST walk) | host | folding a call graph into a mask is a traversal over a collection. Mechanism, and host until the native gate takes collections |
+| Effect **inference** (the AST walk) | host — `kotoba.selfhost.analyzer/infer-effects` | folding a call graph into a mask is a traversal over a collection. Mechanism, and host until the native gate takes collections |
 | Seed shape | `kotoba.selfhost.contracts` (CLJ) | that a seed is well-formed. **Not** self-hosting evidence |
 
 Both Kotoba slices keep the authority split that makes the claim checkable: the
@@ -198,7 +198,16 @@ into an algebra that moved and a traversal that did not is the honest reading;
 recording the slice as done because the algebra landed would be exactly the
 error this section was corrected for.
 
-This repository tracks the path under `docs/lang/coverage.edn` `:selfhost`.
+Both slices ship as compiled KIR that production loads without the compiler on
+its classpath, and `kotoba.selfhost.analyzer` is the host traversal that calls
+them — a decision nobody calls is the same nothing as a fact table nobody reads.
+A fleet-ci gate runs the drift check so that stops depending on memory.
+
+This repository tracks the path under `docs/lang/coverage.edn` `:selfhost`,
+which now exists — it did not when this section first pointed at it. Maturity is
+`:m4`, and the entry says what would downgrade it: a registered gate that has
+not produced a green receipt is the same nothing as no gate. `:m5` is **not**
+claimed — the only consumer is in the same repository.
 Remaining work is explicit: the effect-inference traversal (blocked on the
 native gate taking collections, not on a decision), package lock enforcement in
 safe-build, registry signature verification, repo RID validation through
