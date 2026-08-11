@@ -39,4 +39,7 @@ release hard gate; it does not weaken this compatibility contract.
 | Tag content | binds include `:language-profile` (see `lang/version-policy.edn`) |
 | Release notes | mention `lang/surface-status.edn` / surface-matrix when surface changes |
 
-Current release binds **language-profile 4** (active) and package-contract **1**.
+Current language release 0.7.0 binds **language-profile 6** (active) and
+package-contract **1**. Profile 5 remains supported under its deprecation
+window. An implementation is not the public default until its separately
+signed release envelope verifies against `lang/release-trust.edn`.

@@ -33,7 +33,9 @@
            (conj {:code :deprecation/window-too-short})
            (not= :ed25519 (get-in policy [:release-tags :algorithm]))
            (conj {:code :release/unsupported-signature})
-           (not= #{:version :commit :tree :source-root :issued-at-ms :language-profile}
+           (not= #{:version :commit :tree :source-root :issued-at-ms
+                   :language-profile :package-contract :artifact-digests
+                   :conformance-result}
                  (get-in policy [:release-tags :binds]))
            (conj {:code :release/incomplete-binding})
            (let [lp (:release/language-profile policy)
@@ -109,15 +111,19 @@
 
 (defn release-tag-envelope-template
   "Unsigned envelope skeleton for a release tag (T10.1). Caller signs."
-  [policy {:keys [commit tree source-root issued-at-ms signer]}]
+  [policy {:keys [commit tree source-root issued-at-ms signer
+                  artifact-digests conformance-result]}]
   (let [version (:release/current policy)
         prefix (get-in policy [:release-tags :prefix])]
     {:tag (str prefix version)
      :version version
      :language-profile (:release/language-profile policy)
+     :package-contract (:release/package-contract policy)
      :commit commit
      :tree tree
      :source-root source-root
+     :artifact-digests artifact-digests
+     :conformance-result conformance-result
      :issued-at-ms issued-at-ms
      :signer signer}))
 

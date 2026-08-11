@@ -71,6 +71,8 @@
            (get-in binding [:contract :language-profile])))
     (is (= (:release/language-profile policy)
            (get-in binding [:language-release :language-profile])))
+    (is (= 6 (get-in binding [:language-release :language-profile])))
+    (is (= "0.7.0" (get-in binding [:language-release :version])))
     (is (= :absent
            (get-in binding [:implementation-release :language-profile-binding])))
     (is (= :blocked (get-in binding [:public-default :status])))
