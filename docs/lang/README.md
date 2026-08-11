@@ -205,9 +205,15 @@ A fleet-ci gate runs the drift check so that stops depending on memory.
 
 This repository tracks the path under `docs/lang/coverage.edn` `:selfhost`,
 which now exists — it did not when this section first pointed at it. Maturity is
-`:m4`, and the entry says what would downgrade it: a registered gate that has
-not produced a green receipt is the same nothing as no gate. `:m5` is **not**
-claimed — the only consumer is in the same repository.
+`:m4` with measured evidence: the gate ran green on fleet node `judah` at
+`4f8e3af` (33 tests / 284,726 assertions), which is the only thing separating it
+from *"it passes on the machine that wrote it"*. The entry records what would
+downgrade it — a registered gate that stops producing receipts is the same
+nothing as no gate.
+
+`:m5` is claimed: `kotoba selfhost analyze` in `kotoba-lang/kotoba` executes
+these decisions. It restates no rule — not the effect set, not the bit
+assignment, not the deny order.
 Remaining work is explicit: the effect-inference traversal (blocked on the
 native gate taking collections, not on a decision), package lock enforcement in
 safe-build, registry signature verification, repo RID validation through
