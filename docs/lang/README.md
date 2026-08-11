@@ -210,11 +210,18 @@ A fleet-ci gate runs the drift check so that stops depending on memory.
 
 This repository tracks the path under `docs/lang/coverage.edn` `:selfhost`,
 which now exists — it did not when this section first pointed at it. Maturity is
-`:m4` with measured evidence: the gate ran green on fleet node `judah` at
-`4f8e3af` (33 tests / 284,726 assertions), which is the only thing separating it
-from *"it passes on the machine that wrote it"*. The entry records what would
-downgrade it — a registered gate that stops producing receipts is the same
-nothing as no gate.
+**`:m3`, not `:m4`.** The gate ran green twice on fleet nodes other than the
+machine that wrote the code — `judah` at `4f8e3af` (33 tests) and `joseph` at
+`5e46bdc` (34 tests / 284,730 assertions) — which is what separates a gate from
+*"it passes for me"*. But both runs were `--dry-run`, so neither landed a row in
+`manifest/fleet-ci.edn`, and the rule this track states is that a gate producing
+no receipt is the same nothing as no gate.
+
+The first real attempt was blocked for a reason worth keeping: the scheduled
+tick died on an unrelated repo's `:min-files` floor and took the whole matrix
+with it, so everything after it got no receipt — indistinguishable from *"not
+scheduled yet"*. Fixed in `com-junkawasaki/root`#1959 (ADR-2608110300). Raise
+this to `:m4` once a row actually appears.
 
 `:m5` is claimed: `kotoba selfhost analyze` in `kotoba-lang/kotoba` executes
 these decisions. It restates no rule — not the effect set, not the bit
