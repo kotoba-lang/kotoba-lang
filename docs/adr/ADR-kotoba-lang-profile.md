@@ -2,7 +2,8 @@
 
 - **Status**: Accepted
 - **Date**: 2026-06-29
-- **Artifacts**: `lang/profile.edn`, `lang/conformance/`
+- **Artifacts**: `lang/profile.edn`, `lang/conformance/`,
+  `lang/version-policy.edn`, `lang/docs-release.edn`
 - **Related**: `ADR-kotoba-wasm.md`, `ADR-safe-capability-language.md`
 
 ## Context
@@ -95,3 +96,55 @@ mirroring `:clj`'s shape, and `kotoba-lang/kotoba` bumped its
 end-to-end positive fixture (a bare `.cljs` file, accepted directly,
 defaulting to the `:cljs` reader target with no `--reader-target` flag
 needed).
+
+## Addendum (2026-08-11): profile 6 is release-bound in v0.7.0
+
+Profile maturity (M0–M6) and documentation maturity (D0–D6) are separate
+axes. M6 means that a machine-readable profile has compatibility policy and
+executable gates. It does not by itself mean that public documentation names a
+shipped implementation and independently verifiable artifact. The latter is
+D5, and requires an exact release binding.
+
+Profile 6 is the first Kotoba profile accepted under that D5 release contract.
+`lang/version-policy.edn` fixes profile 6 and package contract 1 as the public
+callable contract. `lang/docs-release.edn` records the promoted platform and
+binds the documentation to all of the following evidence:
+
+- release `v0.7.0` and implementation commit
+  `6d2ad543f48391b91bec63b50a7fdb7ba8fe8828`;
+- implementation tree
+  `d78ec08ff0e7d16f8b774b9aa7f2c8ff6a7c431e`;
+- darwin-arm64 native binary SHA-256
+  `7f294d0c63695d921643cf87435b12c9f8b9cc329a3084605c2ef6432c0368da`;
+- archive SHA-256
+  `e9d8186c4e54aa95e53e56877a794dcd890c6b296a6e5bd2bfd9cccc8ce0638c`;
+- evidence JSON SHA-256
+  `71ee59b5c6ab2704cc9e26632dc5350b285f4a992e63fc7cb34bf47da30b7079`;
+- signed envelope SHA-256
+  `66f6368dabfea6b6a842fb6fa10d261e4e3545a3667ec227740c26a0433b4f2e`;
+- release signer
+  `did:key:z6MkgtjFR4xwQtb4ZqGg5N8NCpT8fNd4HfjznLamf9oZhmRs`;
+- a green release result of 536 tests, 8,580 assertions, zero failures, and
+  zero errors.
+
+The release was downloaded again from the public release, its checksum and
+signature were verified, the executable was confirmed as Mach-O arm64, the
+self-host suite passed 17/17, and the smoke program returned 42. Public docs
+were generated from the binding and deployed with content SHA-256
+`bf85d618782d411c4d91801bbffa6f4a374fca357b0bfd5a0301046092e04c64`.
+The superproject pins for `kotoba`, `kotoba-lang`, and `release` were verified
+as default-branch-reachable fast-forwards and reconciled into fleet-db; the
+resulting projection is clean at root merge commit
+`16fc5bf2b4665be824a158949f505c900bf3d893`.
+
+This closes D5 only for profile 6 / package contract 1 / darwin-arm64. Linux,
+Windows, and darwin-amd64 remain unbound and must not inherit the released
+claim. D6 also remains open until at least three external users complete the
+documented tasks and their failures and completion evidence are recorded.
+Kotoba therefore has a release-grade evidence path, but does not yet claim the
+ecosystem breadth, multi-platform release coverage, independent-user history,
+or long-term compatibility record of Rust, Go, or Deno.
+
+Implementation and publication landed through `kotoba-lang/kotoba-lang` PRs
+#414 and #418, `kotoba-lang/kotoba` PRs #459, #461, #463, and #464,
+`kotoba-lang/release` PR #1, and `com-junkawasaki/root` PR #1974.
