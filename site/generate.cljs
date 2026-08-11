@@ -415,7 +415,7 @@
      {:title "Release binding" :wide true}
      [:p {:class "hig-body"}
       "Documentation does not silently equate a language profile with the latest binary tag. "
-      "The machine binding currently keeps the public default blocked:"]
+      "The machine binding records the independently verified public-default status:"]
      (ui/grid
       {:min "240px"}
       (ui/panel [[:p {:class "hig-caption2 kot-eyebrow"} "current contract"]
@@ -437,7 +437,7 @@
      [:p [:a {:class "kot-link"
               :href "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/generated/release.md"}
           "Read the generated release binding"]]
-     (caption "A signed envelope that binds the implementation commit, artifact digests, profile, package contract and conformance result is required to unblock this section."))))
+     (caption "Promotion requires a signed envelope that binds the implementation commit, artifact digests, profile, package contract and conformance result; unverified platforms remain excluded."))))
 
 (defn search-url [path]
   (str "https://github.com/kotoba-lang/kotoba-lang/blob/main/" path))

@@ -19,7 +19,7 @@ Comparison baselines: [Rust documentation bookshelf](https://doc.rust-lang.org/s
 | standard-library reference | searchable per-symbol API pages | generated bounded-core symbol reference | implemented, bounded |
 | command reference | generated, per-command CLI documentation | generated from `lang/cli.edn` | implemented |
 | diagnostics | stable codes with searchable explanations | generated bounded contract registry; compiler/host coverage remains incomplete | implemented, bounded |
-| versions and releases | docs bound to shipped versions | machine release binding blocks the public default because no implementation evidence binds profile 6 | correctly blocked |
+| versions and releases | docs bound to shipped versions | signed v0.7.0 darwin-arm64 evidence binds implementation commit, artifact, profile 6, package contract 1, and conformance result | implemented for promoted platform |
 | editor experience | installable LSP/editor guides | LSP substrate exists; end-user setup guide is absent | gap |
 | discoverability | searchable, link-checked public site | generated landing page embeds a local reference search index | implemented, bounded corpus |
 
@@ -50,14 +50,13 @@ or Deno.”
 | D2 reference | getting started, language, tooling, package, and stdlib routes exist | complete for bounded surface |
 | D3 executable integrity | checked documents resolve links and authority/profile drift fails a gate | complete |
 | D4 public portal | generated public page exposes the routes without restating the spec | implemented; deployment is a separate operational check |
-| D5 release-bound docs | every public page names a shipped implementation/profile pair; CLI/API/diagnostics are generated and searchable | reference generation/search complete; release pair correctly blocked |
+| D5 release-bound docs | every public page names a shipped implementation/profile pair; CLI/API/diagnostics are generated and searchable | complete for v0.7.0 / profile 6 on darwin-arm64; other platforms remain unbound |
 | D6 external validation | task-based user tests, localization, accessibility and search telemetry drive revisions | protocol and automation complete; external observations pending |
 
 ## Next maturity gates
 
-1. Bind language profile 6 to a signed implementation release through
-   `kotoba-lang/release`; do not change `lang/version-policy.edn` as prose-only
-   bookkeeping.
+1. Build and independently verify profile-6 artifacts for additional platforms;
+   do not infer cross-platform release maturity from darwin-arm64 evidence.
 2. Extend the bounded diagnostic registry as compiler and host codes become
    stable; never infer exhaustive coverage from the initial registry.
 3. Run the four tasks in [`user-validation.edn`](user-validation.edn) with at

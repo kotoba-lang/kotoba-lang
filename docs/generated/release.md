@@ -2,15 +2,15 @@
 
 > Generated from [`lang/docs-release.edn`](../../lang/docs-release.edn). Do not edit by hand.
 
-Public default: **BLOCKED** (`:docs/no-release-bound-profile`).
+Public default: **RELEASED** (`:docs/release-bound-profile`).
 
-Language release 0.7.0 binds profile 6, but no published implementation evidence binds that profile. Do not present an implementation as the profile-6 public default until its signed envelope verifies.
+Kotoba v0.7.0 for darwin-arm64 is the public implementation bound to language profile 6 and package contract 1. Its signed envelope verifies the source tree, artifact digest, and 536-test / 8,580-assertion conformance result. Other platforms remain unbound.
 
 | Axis | Recorded value |
 |---|---|
 | Current contract | language profile 6, package contract 1 |
 | Language release | 0.7.0, language profile 6 |
-| Implementation release | `v0.6.22` at `1c025d81e417` |
-| Implementation profile binding | `absent` |
+| Implementation release | `v0.7.0` at `6d2ad543f483` |
+| Implementation profile binding | `verified` |
 
 Promotion requires: `artifact-digests`, `conformance-result`, `implementation-commit`, `language-profile`, `package-contract`, `published-at`, `signed-release-envelope`.
