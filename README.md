@@ -175,18 +175,19 @@ function remains the oracle; clock/UUID/atom-backed CRUD remains in the
 temporary native/compatibility adapter for this tranche. Future tranches may
 move HTTP, database and other provider logic to `.kotoba` by declaring their
 lower-level imports. Reference Wasm, compiler KIR, and each oracle agree with
-no effects. Consumer cutover is still false until three green CI runs and
-seven days of soak are recorded.
-Actual GitHub evidence is stored in
+no effects. Consumer cutover is still false until three signed green murakumo
+receipts and seven days of soak are recorded for every repository.
+Published murakumo fleet evidence is stored in
 [`lang/q9-wave1-tranche-1-soak.edn`](lang/q9-wave1-tranche-1-soak.edn).
 After the pilot revisions are committed and published, run
 `bb scripts/collect-q9-soak.bb`; then use `bb scripts/check-q9-soak.bb` as the
 fail-closed cutover gate. It requires three distinct successful `main` push
-runs per repository, unchanged qualification Git blobs, and 604800 elapsed
-seconds. Local preflight never counts as CI evidence.
+runs per repository, enrolled fleet signers, unchanged qualification Git
+blobs, and 604800 elapsed seconds. Local preflight never counts as CI evidence.
 Qualification dependencies use published immutable Git SHAs, not sibling
-`local/root` paths, so each existing GitHub Actions workflow can reproduce the
-test from a standalone checkout.
+`local/root` paths, so every murakumo fleet gate can reproduce the test from a
+standalone checkout. GitHub is only the immutable Git transport for the tested
+tree and receipt ledger; GitHub Actions is not an evidence authority.
 
 ## Documentation
 

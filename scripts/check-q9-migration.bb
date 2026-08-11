@@ -12,7 +12,8 @@
 (def tranche (edn/read-string (slurp "lang/q9-wave1-tranche-1.edn")))
 (def soak-evidence (edn/read-string (slurp "lang/q9-wave1-tranche-1-soak.edn")))
 (def component-roles (edn/read-string (slurp "lang/component-role-model.edn")))
-(def workspace (-> "../../.." fs/canonicalize str))
+(def workspace (or (System/getenv "Q9_WORKSPACE_ROOT")
+                   (-> "../../.." fs/canonicalize str)))
 
 (defn fail! [message data]
   (binding [*out* *err*]
@@ -130,7 +131,7 @@
                {:repository repository :path path})))
     (when-not (false? consumer-cutover)
       (fail! "pilot consumer cutover is forbidden before soak" {}))
-    (when-not (and (< (:green-ci-runs soak) (:required-ci-runs soak))
+    (when-not (and (< (:green-fleet-receipts soak) (:required-fleet-receipts soak))
                    (< (:calendar-days soak) (:required-calendar-days soak)))
       (fail! "pilot soak status must be explicit and incomplete before cutover" {:soak soak})))
   (when-not (= (set tranche-repos) (set (map :repository (:pilots tranche))))
@@ -141,7 +142,10 @@
     (fail! "soak evidence must cover exactly the tranche repositories"
            {:tranche tranche-repos
             :soak (mapv :repository (:repositories soak-evidence))}))
-  (when-not (and (= 3 (get-in soak-evidence [:requirements :distinct-runs-per-repository]))
+  (when-not (and (= 2 (:kotoba.lang.q9.soak/version soak-evidence))
+                 (= "fleet-ci/tip-verify/v1" (get-in soak-evidence [:requirements :policy]))
+                 (= "fleet-ci/*" (get-in soak-evidence [:requirements :signer-grant]))
+                 (= 3 (get-in soak-evidence [:requirements :distinct-receipts-per-repository]))
                  (= 604800 (get-in soak-evidence [:requirements :minimum-soak-seconds]))
                  (true? (get-in soak-evidence [:requirements :same-qualification-artifacts])))
     (fail! "soak evidence weakens the fleet rollback policy"
