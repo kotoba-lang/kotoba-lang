@@ -1,9 +1,11 @@
 # Kotoba Language Profile Versioning
 
-`kotoba-lang` uses three related version numbers:
+Kotoba uses three related version numbers across two authority repositories:
 
-- `:kotoba.lang/profile-version` in `profile.edn`
-- `:kotoba.lang.package/version` in `package.edn`
+- `:kotoba.lang.guest-grammar/profile-version` in `lang/guest-grammar.edn`
+  (mirrored and checked against `lang/surface-status.edn` and the elaboration pipeline)
+- `:kotoba.lang.package/version` in
+  `kotoba-core-contracts/lang/package.edn`
 - package/library semver in package manifests
 
 The profile version is the compatibility contract for source-processing tools.
@@ -39,7 +41,8 @@ first; that friction is the reason for the reversal. `.cljs` is added as a
 single-target compatibility extension mirroring `.clj`'s shape (its own
 `:reader-branches ["cljs" "default"]`, not the fully portable `.kotoba`
 branch chain), not as a return to full ClojureScript compatibility — see
-`:kotoba.lang/authoring-surface` in `profile.edn` and
+the source-classification contract in
+`kotoba-core-contracts/lang/profile.edn` and
 `docs/adr/ADR-kotoba-lang-profile.md`'s addendum. `:cljs` was never removed
 as a reader *target* (`.cljc` could already be read under
 `--reader-target cljs`); this only widens which file extension can carry it
@@ -59,7 +62,7 @@ targets explicitly. Silent fallback to another target is non-conforming.
 ## Package Contract
 
 A package tool conforms to package contract version 1 when it can consume
-`lang/package.edn`, accept lock entries with repo RID, manifest CID, tree CID,
+`kotoba-core-contracts/lang/package.edn`, accept lock entries with repo RID, manifest CID, tree CID,
 signers, and capability grants, and reject version-only dependencies for safe
 execution.
 

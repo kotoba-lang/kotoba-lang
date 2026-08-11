@@ -5,7 +5,7 @@ and no runtime JavaScript for anyone visiting it.
 
 ## What makes this page different from a README
 
-`generate.cljs` **derives the page from this repository's own authority files**
+`generate.cljs` **derives the language claims from this repository's own authority files**
 rather than restating them in prose. The eight safety claims and their residual
 risks, the deliberately-absent surface, the elaboration pipeline, the deny
 rules, the Component Model / WASI pins and the identity non-goals are all read
@@ -21,6 +21,11 @@ lang/elaboration-pipeline.edn
 Change the spec and the page changes with it. The page cannot drift into
 claiming more than the spec claims, which is the property a safety-oriented
 language's marketing page most needs to have.
+
+The page also exposes the four checked documentation routes—learn, use,
+implement, and evaluate—from `docs/authority-map.edn`. The prose documents are
+linked rather than copied into the landing page. Run `nbb scripts/check-docs.cljs`
+before regenerating so moved authorities and broken reader paths fail closed.
 
 ## Regenerate
 

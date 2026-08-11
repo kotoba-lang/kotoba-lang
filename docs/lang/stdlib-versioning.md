@@ -10,10 +10,12 @@ capstone that makes a library safe to depend on.
 
 ## Two version axes (do not confuse them)
 
-- **`:kotoba.lang/profile-version`** (in `lang/profile.edn`) — the *source*
-  contract (extensions, reader targets, namespace priority). This is the
-  *language*, and its versioning rules live in `docs/lang/versioning.md`. The
-  stdlib does **not** bump the profile version.
+- **language profile version** — declared by `lang/guest-grammar.edn` and
+  checked against `lang/surface-status.edn` and the elaboration pipeline.
+  Source-file classification is separately owned by
+  `kotoba-core-contracts/lang/profile.edn`. These are language contracts, and
+  their versioning rules live in `docs/lang/versioning.md`. The stdlib does
+  **not** bump the language profile version.
 - **Per-library semver** — each stdlib repo's own `:version` in `deps.edn` and
   a `CHANGELOG.md`. This is the *library* contract. A consumer depends on a
   library by git SHA today; the version tags releases.
