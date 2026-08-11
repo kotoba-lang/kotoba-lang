@@ -183,7 +183,8 @@ Current evidence, by kind:
 |---|---|---|
 | Op classification | `kotoba-selfhost-contracts:kotoba/safe_analyzer_core.kotoba` | non-executable form / numeric result / effect op / user-call excluded — pure, `effects=#{}`, green on `:jvm-kir`, `:js`, `:wasm` |
 | Effect algebra, minimal policy, policy check, admission | `kotoba-selfhost-contracts:kotoba/capability_admission_core.kotoba` | effect union / declaration check / unused-grant lint / minimal policy / effective scope / attenuation / deny ladder — pure, `effects=#{}`, green on `:jvm-kir`, `:js`, `:wasm` |
-| Effect **inference** (the AST walk) | host — `kotoba.selfhost.analyzer/infer-effects` | folding a call graph into a mask is a traversal over a collection. Mechanism, and host until the native gate takes collections |
+| Effect **inference** — the transition | `kotoba-selfhost-contracts:kotoba/capability_admission_core.kotoba` (`infer-step`) | `state + event -> state`; word-typed, so it qualifies on native ISA like the rest |
+| Effect inference — the loop | host — a `reduce` over that step | cannot mis-classify, mis-assign or mis-union, because it does none of those |
 | Seed shape | `kotoba.selfhost.contracts` (CLJ) | that a seed is well-formed. **Not** self-hosting evidence |
 
 Both Kotoba slices keep the authority split that makes the claim checkable: the
@@ -193,10 +194,14 @@ slice that binding extends to the bit ORDER — `effect-bit` assigns bit *i* to
 index *i* of `:effect-ops`, so reordering that vector is a wire change and not a
 formatting change. Cite a slice here only once something equivalent binds it.
 
-Note the row that is deliberately not a Kotoba row. Splitting "effect inference"
-into an algebra that moved and a traversal that did not is the honest reading;
-recording the slice as done because the algebra landed would be exactly the
-error this section was corrected for.
+Note that "effect inference" is split across two rows rather than being one
+host row. An earlier version said the traversal stayed host *until the native
+gate takes collections*; that reason was measured and is wrong (ADR-2608110200).
+Native has bounded vectors and a string index — what it refuses is a
+caller-supplied handle crossing a kexe export, which is a safety property, and
+no backend has a sequence parameter type anyway. None of it applies, because a
+fold's decision content is its transition and the transition is now Kotoba.
+What remains host is a `reduce`.
 
 Both slices ship as compiled KIR that production loads without the compiler on
 its classpath, and `kotoba.selfhost.analyzer` is the host traversal that calls
