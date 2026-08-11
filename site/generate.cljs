@@ -21,6 +21,7 @@
 
 (require '[kotoba-ui.core :as ui]
          '[cljs.reader :as reader]
+         '[clojure.string :as str]
          '["fs" :as fs]
          '["path" :as path])
 
@@ -36,7 +37,13 @@
    "lang/elaboration-pipeline.edn"
    "lang/wasm-component-platform.edn"
    "lang/code-identity.edn"
-   "lang/safety-qualification.edn"])
+   "lang/safety-qualification.edn"
+   "lang/docs-release.edn"
+   "lang/diagnostics.edn"
+   "lang/cli.edn"
+   "lang/conformance/stdlib/manifest.edn"
+   "docs/user-validation.edn"
+   "docs/search-index.edn"])
 
 (def authority
   (into {} (for [f authority-files]
@@ -49,6 +56,12 @@
 (def identity-spec  (authority "lang/code-identity.edn"))
 (def qualification  (authority "lang/safety-qualification.edn"))
 (def elaboration    (authority "lang/elaboration-pipeline.edn"))
+(def docs-release   (authority "lang/docs-release.edn"))
+(def diagnostics    (authority "lang/diagnostics.edn"))
+(def cli-contract   (authority "lang/cli.edn"))
+(def stdlib         (authority "lang/conformance/stdlib/manifest.edn"))
+(def user-validation (authority "docs/user-validation.edn"))
+(def search-index   (authority "docs/search-index.edn"))
 
 ;; ---------------------------------------------------------------------------
 ;; theme — the one place in app code a hex color is legitimate (rule 5)
@@ -393,6 +406,79 @@
      "Key custody and revocation distribution remain operational, not linguistic, guarantees."])
    (caption "If a claim is not on this page, assume it is not being made.")))
 
+(defn release-section []
+  (let [contract (:contract docs-release)
+        language (:language-release docs-release)
+        implementation (:implementation-release docs-release)
+        public (:public-default docs-release)]
+    (ui/section
+     {:title "Release binding" :wide true}
+     [:p {:class "hig-body"}
+      "Documentation does not silently equate a language profile with the latest binary tag. "
+      "The machine binding currently keeps the public default blocked:"]
+     (ui/grid
+      {:min "240px"}
+      (ui/panel [[:p {:class "hig-caption2 kot-eyebrow"} "current contract"]
+                 [:p {:class "hig-headline"}
+                  "language profile " (:language-profile contract)]
+                 (caption (str "package contract " (:package-contract contract)))])
+      (ui/panel [[:p {:class "hig-caption2 kot-eyebrow"} "language release"]
+                 [:p {:class "hig-headline"} (:version language)]
+                 (caption (str "binds profile " (:language-profile language)))])
+      (ui/panel [[:p {:class "hig-caption2 kot-eyebrow"} "implementation"]
+                 [:p {:class "hig-headline"} (:tag implementation)]
+                 (caption (str "profile binding: "
+                               (name (:language-profile-binding implementation))))])
+      (ui/panel [[:p {:class "hig-caption2 kot-eyebrow"} "public default"]
+                 [:p {:class "hig-headline"}
+                  (str/upper-case (name (:status public)))]
+                 (caption (str (:code public))) ]))
+     [:p {:class "hig-callout"} (:reason public)]
+     [:p [:a {:class "kot-link"
+              :href "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/generated/release.md"}
+          "Read the generated release binding"]]
+     (caption "A signed envelope that binds the implementation commit, artifact digests, profile, package contract and conformance result is required to unblock this section."))))
+
+(defn search-url [path]
+  (str "https://github.com/kotoba-lang/kotoba-lang/blob/main/" path))
+
+(defn search-section []
+  (ui/section
+   {:title "Search the checked reference" :wide true}
+   [:p {:class "hig-body"}
+    "Search commands, options, bounded standard-library names, stable diagnostic codes, and release status. The index is generated from machine authorities and runs locally in this page."]
+   (ui/text-field {:id "kot-doc-search"
+                   :type "search"
+                   :placeholder "Try: compile, option-some, docs/link-missing"
+                   :aria-label "Search Kotoba documentation reference"})
+   [:p {:id "kot-doc-search-count" :class "hig-caption1 kot-muted"
+        :aria-live "polite"}]
+   [:div {:id "kot-doc-search-results"}
+    (ui/list-view
+     (for [{:keys [kind title body url keywords]} search-index
+           :let [haystack (str/lower-case
+                           (str title " " body " "
+                                (str/join " " keywords)))]]
+       [:div {:class "kot-search-item" :data-search haystack}
+        (ui/list-row
+         [:div
+          [:p {:class "hig-headline"}
+           [:a {:class "kot-link" :href (search-url url)} title]]
+          [:p {:class "hig-footnote kot-muted"} body]]
+         {:trailing (ui/badge (name kind))})]))]
+   (caption (str (count search-index) " generated entries. No query leaves the browser."))))
+
+(def search-js
+  (str "document.addEventListener('DOMContentLoaded',function(){"
+       "var input=document.getElementById('kot-doc-search');"
+       "var count=document.getElementById('kot-doc-search-count');"
+       "var items=Array.from(document.querySelectorAll('.kot-search-item'));"
+       "function apply(){var q=input.value.trim().toLowerCase();var shown=0;"
+       "items.forEach(function(item,i){var match=q?item.dataset.search.includes(q):i<8;"
+       "item.hidden=!match;if(match){shown+=1;}});"
+       "count.textContent=shown+' result'+(shown===1?'':'s');}"
+       "input.addEventListener('input',apply);apply();});"))
+
 (defn documentation-section []
   (ui/section
    {:title "Documentation" :wide true}
@@ -474,6 +560,7 @@
        ".kot-chips{display:flex;flex-wrap:wrap;gap:var(--hig-spacing-2)}"
        ".kot-stage-heading{margin-top:var(--hig-spacing-7)}"
        ".kot-link{color:var(--hig-color-tint)}"
+       ".kot-search-item[hidden]{display:none}"
        ".kot-cta{display:inline-flex;align-items:center;min-height:44px;"
        "padding:0 var(--hig-spacing-4);border-radius:var(--hig-radius-capsule);"
        "color:var(--hig-color-tint);text-decoration:none;"
@@ -506,8 +593,11 @@
    (platform-section)
    (identity-section)
    (status-section)
+   (release-section)
+   (search-section)
    (documentation-section)
-   (footer)))
+   (footer)
+   [:script [:hiccup/raw search-js]]))
 
 (def html
   (ui/->page

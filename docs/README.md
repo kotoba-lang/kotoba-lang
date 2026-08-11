@@ -13,6 +13,13 @@ the repository root README remains the project overview.
 | implement a compiler or runtime | [Semantics SSoT](lang/semantics-ssot.md) | [grammar](../lang/guest-grammar.edn), [surface status](../lang/surface-status.edn), [conformance](../lang/conformance/manifest.edn) |
 | evaluate readiness honestly | [Maturity and comparison](maturity.md) | [coverage evidence](lang/coverage.edn), [engineering model](system-dynamics/kotoba-lang-maturity.md) |
 
+Generated lookup surfaces: [CLI](generated/cli.md),
+[standard library](generated/stdlib.md),
+[diagnostics](generated/diagnostics.md), and
+[release binding](generated/release.md). The generated references and
+[`search-index.edn`](search-index.edn) come from machine authorities; run
+`nbb scripts/generate-docs-reference.cljs --check` to detect drift.
+
 ## What is normative?
 
 Kotoba deliberately separates language meaning from implementation and
@@ -44,6 +51,8 @@ Documentation changes must keep all of these true:
 5. Maturity claims name their axis. Contract maturity, documentation maturity,
    operational reliability, ecosystem adoption, and production SLOs are not
    interchangeable.
+6. Generated references match their authorities, and a missing release/profile
+   binding blocks the public default instead of selecting a convenient version.
 
 Run the executable documentation gate:
 
