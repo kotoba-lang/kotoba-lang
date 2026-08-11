@@ -158,16 +158,41 @@ are documented in `docs/lang/capability-values.md`.
 ## Self-Hosting Track
 
 The target is for Kotoba's language and admission semantics to move into Kotoba
-itself. Current self-hosting evidence lives in the implementation workspace:
-`kotoba-lang/kotoba:crates/kotoba-clj/selfhost/safe_analyzer.kotoba` implements
-covered effect, minimal-policy, policy-check, and admission-check slices as a
-safe Kotoba component. Public CLI gates exercise `selfhost-inspect`,
-`safe-policy`, and `safe-build` on the covered slices.
+itself. The measure is the one `ADR-safe-capability-language` §0.1 sets — not
+fewer host lines, but more slices whose **safety decision** is authored in
+Kotoba.
 
-This repository tracks that path under `docs/lang/coverage.edn` `:selfhost`.
-Remaining work is explicit: package lock enforcement in safe-build, registry
-signature verification, repo RID validation through kotoba-rad, capability
-values in the host ABI, and broader compiler semantics self-hosting.
+**Read the state below before citing this section (corrected 2026-08-11).** It
+previously described `kotoba-lang/kotoba:crates/kotoba-clj/selfhost/safe_analyzer.kotoba`
+as implementing covered effect, minimal-policy, policy-check and admission-check
+slices. That file went with the Rust crates and **no longer exists**; what
+survived the removal is its classification tables, as
+`kotoba-selfhost-contracts:resources/kotoba/selfhost/safe_analyzer_facts.edn`.
+For a period they had no reader at all: `kotoba.selfhost.contracts` validates
+seed *shape* and never classifies an op, so the CLI gates named here
+(`selfhost-inspect`, `safe-policy`, `safe-build`) were checking that seeds are
+well-formed, not that a Kotoba analyzer agrees with them. A fact list is not a
+decision, and this section read as though it were.
+
+Current evidence, by kind:
+
+| Slice | Where | What it decides |
+|---|---|---|
+| Op classification | `kotoba-selfhost-contracts:kotoba/safe_analyzer_core.kotoba` | non-executable form / numeric result / effect op / user-call excluded — pure, `effects=#{}`, green on `:jvm-kir`, `:js`, `:wasm` |
+| Seed shape | `kotoba.selfhost.contracts` (CLJ) | that a seed is well-formed. **Not** self-hosting evidence |
+
+The classification slice keeps the authority split that makes the claim
+checkable: the EDN owns *which* ops are in a class, the `.kotoba` owns *what it
+means* to be in one, and an authority test refuses to let either move alone.
+Cite a slice here only once something equivalent binds it.
+
+This repository tracks the path under `docs/lang/coverage.edn` `:selfhost`.
+Remaining work is explicit: effect inference, minimal-policy, policy-check and
+admission-check as executing Kotoba (these are the slices the removed analyzer
+covered and the ones this table is still missing), package lock enforcement in
+safe-build, registry signature verification, repo RID validation through
+kotoba-rad, capability values in the host ABI, and broader compiler semantics
+self-hosting.
 
 ## Maturity
 
