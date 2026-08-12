@@ -347,6 +347,26 @@
                   k)))
         claims))
 
+;; `:implementation` was free text. `surface-matrix/backends-of` renders whatever
+;; set it finds, `feature-portable-claims` only tests subset-of-portable-backends,
+;; and nothing else reads the key -- so a typo, or a token invented for one
+;; entry, was indistinguishable from a supported backend. Measured 2026-08-12:
+;; ten tokens in use, none of them a member of either real backend vocabulary
+;; (`kir/target.cljc` compatibility-targets, `lang/conformance/manifest.edn`
+;; :backends).
+;;
+;; This does not decide which vocabulary is right -- see
+;; `:implementation-vocabulary :open-decision`. It freezes the ten so the
+;; namespace cannot grow while that decision is outstanding.
+(defn implementation-tokens [surface]
+  (into #{}
+        (comp (filter (fn [[_ v]] (map? v)))
+              (mapcat (fn [[_ v]] (mapcat (fn [[_ e]] (when (map? e) (:implementation e))) v))))
+        surface))
+
+(defn declared-implementation-vocabulary [surface]
+  (set (get-in surface [:classification-rule :implementation-vocabulary :tokens] #{})))
+
 (defn conformance-link-debt-register [surface]
   (set (get-in surface [:classification-rule :conformance-link-debt :entries] #{})))
 
@@ -491,6 +511,8 @@
                              {:feature k :conformance conf
                               :reason :conformance-key-not-in-shared-evidence})))))
                feature-claims)
+         unknown-impl-tokens (set/difference (implementation-tokens surface)
+                                             (declared-implementation-vocabulary surface))
          unlinked-claims (portable-claims-without-conformance surface feature-claims)
          debt-register (conformance-link-debt-register surface)
          unregistered-claims (set/difference unlinked-claims debt-register)
@@ -586,6 +608,9 @@
                       (when (seq incomplete-portable)
                         [{:code :portable/sugar-unclassified
                           :entries incomplete-portable}])
+                      (when (seq unknown-impl-tokens)
+                        [{:code :portable/unknown-implementation-token
+                          :tokens unknown-impl-tokens}])
                       (when (seq unregistered-claims)
                         [{:code :portable/claim-without-conformance
                           :entries unregistered-claims}])
