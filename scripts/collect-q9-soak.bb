@@ -175,7 +175,14 @@
                           :gate (clojure.core/name (:name gate))}))))
              (sort-by :completed-at)
              (reduce (fn [runs run]
-                       (if (some #(= (:receipt-cid %) (:receipt-cid run)) runs)
+                       ;; Q9 qualifies distinct repository main tips, not
+                       ;; repeated executions of the same tree. A retry may
+                       ;; legitimately produce a new signed receipt CID for
+                       ;; the same head; retain only its first observation so
+                       ;; the published count cannot overstate progress.
+                       (if (some #(or (= (:receipt-cid %) (:receipt-cid run))
+                                      (= (:head-sha %) (:head-sha run)))
+                                 runs)
                          runs
                          (conj runs run))) []))
         runs
