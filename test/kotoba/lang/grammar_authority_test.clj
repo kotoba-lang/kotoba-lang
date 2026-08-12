@@ -52,6 +52,24 @@
     (is (set/subset? security forbidden)
         (pr-str {:named-but-not-forbidden (set/difference security forbidden)}))))
 
+;; The third leg of `:security-constraint-requires`. The other two were
+;; checkable and checked; this one was stated and never enforced, and measured
+;; 2026-08-12 all seven security constraints were missing it while both
+;; semantic-simplification entries -- which the rule does not ask -- carried a
+;; reference.
+(deftest security-constraints-carry-an-adr
+  (let [surface (auth/read-edn auth/surface-path)
+        missing (auth/security-constraints-missing-adr surface)]
+    (is (empty? missing) (pr-str {:missing-adr missing}))))
+
+;; And the reference has to point at something. A repo-relative path must
+;; resolve; an ADR id (no slash) names a superproject document this repo cannot
+;; see and is accepted by convention, not by resolution.
+(deftest security-constraint-adr-paths-resolve
+  (let [surface (auth/read-edn auth/surface-path)
+        unresolved (auth/security-constraint-adr-paths-unresolved surface)]
+    (is (empty? unresolved) (pr-str {:unresolved unresolved}))))
+
 (deftest admitted-forms-are-classified
   (let [grammar (auth/read-edn auth/grammar-path)
         surface (auth/read-edn auth/surface-path)
