@@ -9,7 +9,7 @@
   (:import [java.math BigInteger]
            [java.security KeyFactory MessageDigest Signature]
            [java.security.spec X509EncodedKeySpec]
-           [java.time Instant]
+           [java.time Duration Instant]
            [java.util Arrays Base64]))
 
 (def path "lang/q9-wave1-tranche-1-soak.edn")
@@ -141,6 +141,13 @@
   (let [comparison (gh-json (str "repos/" github "/compare/" sha "...main"))]
     (contains? #{"ahead" "identical"} (:status comparison))))
 
+(defn soak-seconds [^Instant observed-at runs]
+  (if-let [oldest (when (seq runs)
+                    (apply min-key #(.toEpochMilli ^Instant %)
+                           (map (comp #(Instant/parse %) :completed-at) runs)))]
+    (.getSeconds (Duration/between oldest observed-at))
+    0))
+
 (defn collect-repository [root-sha receipts allowed-signers
                           {:keys [github dir] :as row}]
   (let [repo (last (str/split github #"/"))
@@ -198,15 +205,17 @@
       _ (when (empty? allowed-signers)
           (throw (ex-info "no enrolled murakumo signer has the required grant"
                           {:grant grant :root-evidence-sha root-sha})))
+      observed-at (Instant/now)
       repositories (mapv #(collect-repository root-sha receipts allowed-signers %)
                          (:repositories evidence))
       min-runs (apply min (map (comp count :runs) repositories))
+      min-soak (apply min (map #(soak-seconds observed-at (:runs %)) repositories))
       updated (-> evidence
-                  (assoc :as-of (str (Instant/now)))
+                  (assoc :as-of (str observed-at))
                   (assoc :repositories repositories)
                   (assoc :gate {:root-evidence-sha root-sha
                                 :actual-green-fleet-receipts-per-repository min-runs
-                                :soak-seconds 0
+                                :soak-seconds min-soak
                                 :ready false
                                 :consumer-cutover-authorized false}))]
   (spit path (with-out-str (pprint/pprint updated)))
