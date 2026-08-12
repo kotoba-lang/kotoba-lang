@@ -110,6 +110,49 @@
 ;; with "dynamic loading, interop, mutation, and metaprogramming are
 ;; forbidden". Two forms of one named invariant, two different mechanisms, one
 ;; of them incidental.
+;; `:classification-rule :security-constraint-requires` asks for three things:
+;; a named invariant, fail-closed enforcement, and an ADR. The first two are
+;; checkable -- the entry key names the invariant, and
+;; `security-constraint-surfaces` below proves the grammar forbids what it
+;; names. The third was not checked at all, and measured 2026-08-12 not one of
+;; the seven security constraints carried an ADR reference, while BOTH
+;; `:intentional-semantic-simplification` entries did -- the disposition the
+;; rule does not ask it of. The requirement was being met by the entries that
+;; did not owe it.
+;;
+;; Two reference forms are admitted, because both are already in use in this
+;; repo. A repo-relative path (`docs/adr/ADR-safe-capability-language.md`) must
+;; resolve on disk; an ADR id (`adr-2608650000-...`, the form
+;; `:kotoba.lang.guest-grammar/adr` itself uses) names a document in the
+;; superproject and is accepted without filesystem resolution -- this repo
+;; cannot see that tree, and a check that cannot fail honestly is worse than a
+;; convention stated plainly.
+(defn- adr-references [v]
+  (let [a (:adr v)]
+    (cond (string? a) [a]
+          (sequential? a) (vec a)
+          :else [])))
+
+(defn security-constraints-missing-adr [surface]
+  (into #{}
+        (keep (fn [[entry v]]
+                (when (and (= :intentional-security-constraint (:disposition v))
+                           (empty? (adr-references v)))
+                  entry)))
+        (:invariants surface {})))
+
+(defn security-constraint-adr-paths-unresolved
+  "Repo-relative ADR references that do not resolve on disk. ADR ids (no `/`)
+  are superproject references and are not resolved here."
+  [surface]
+  (into #{}
+        (comp (filter (fn [[_ v]]
+                        (= :intentional-security-constraint (:disposition v))))
+              (mapcat (fn [[_ v]] (adr-references v)))
+              (filter #(str/includes? % "/"))
+              (remove #(.isFile (io/file %))))
+        (:invariants surface {})))
+
 (defn security-constraint-surfaces [surface]
   (into #{}
         (comp (filter (fn [[_entry v]]
@@ -339,6 +382,8 @@
          security-not-forbidden (set/difference
                                  (security-constraint-surfaces surface)
                                  forbidden)
+         missing-adr (security-constraints-missing-adr surface)
+         unresolved-adr (security-constraint-adr-paths-unresolved surface)
          admitted (admitted-source-forms grammar)
          classified (classified-forms surface)
          ;; Builtins and pure host helpers are grammar-classified by catalog
@@ -459,6 +504,12 @@
                       (when (seq security-not-forbidden)
                         [{:code :forbidden/security-surface-not-forbidden
                           :forms security-not-forbidden}])
+                      (when (seq missing-adr)
+                        [{:code :security/constraint-missing-adr
+                          :entries missing-adr}])
+                      (when (seq unresolved-adr)
+                        [{:code :security/adr-path-unresolved
+                          :paths unresolved-adr}])
                       (when (seq unclassified)
                         [{:code :admitted/unclassified-by-surface
                           :forms unclassified}])
