@@ -83,6 +83,40 @@
                   (map as-sym (:surface v #{}))))
         (:invariants surface {})))
 
+;; Only the surfaces an `:intentional-security-constraint` names -- which is
+;; strictly narrower than `invariant-surfaces`, and the distinction is what
+;; makes the reverse direction checkable at all.
+;;
+;; `invariant-surfaces` unions EVERY invariant's `:surface`, including
+;; `:intentional-semantic-simplification` entries. For those, `:surface` means
+;; "these operations are governed by this rule", not "these operations are
+;; banned": `:bool-is-a-type-not-a-number` lists `= < > <= >= not not= zero?
+;; pos? neg? empty? some?`, all of which are admitted and must stay admitted.
+;; So `invariant-surfaces` minus `forbidden-heads` is legitimately non-empty
+;; and cannot be an error -- which is why `validate` computed that difference
+;; and then dropped it on the floor.
+;;
+;; A `:intentional-security-constraint` makes the opposite claim. Per
+;; `:classification-rule :security-constraint-requires`, it asserts a named
+;; invariant with FAIL-CLOSED ENFORCEMENT. A form it names that is absent from
+;; `:forbidden-heads` has no such enforcement behind it -- it is refused only
+;; for as long as nothing gives it a lowering, and it opens silently the day
+;; something does.
+;;
+;; Measured 2026-08-12 against amu ca28ece, which is what added this:
+;; `:no-ambient-mutation` named `reset!` and `swap!`, neither was in
+;; `:forbidden-heads`, and the compiler refused them with "operation has no
+;; admitted lowering" while refusing `atom` and `set!` from the same invariant
+;; with "dynamic loading, interop, mutation, and metaprogramming are
+;; forbidden". Two forms of one named invariant, two different mechanisms, one
+;; of them incidental.
+(defn security-constraint-surfaces [surface]
+  (into #{}
+        (comp (filter (fn [[_entry v]]
+                        (= :intentional-security-constraint (:disposition v))))
+              (mapcat (fn [[_entry v]] (map as-sym (:surface v #{})))))
+        (:invariants surface {})))
+
 (defn sugar-entries [grammar]
   (into {}
         (map (fn [[k v]] [(as-kw k) v]))
@@ -298,6 +332,13 @@
          inv-surface (invariant-surfaces surface)
          missing-forbidden (set/difference forbidden inv-surface)
          extra-invariant (set/difference inv-surface forbidden)
+         ;; The reverse of `missing-forbidden`, scoped to the only disposition
+         ;; that claims fail-closed enforcement. See
+         ;; `security-constraint-surfaces` for why `extra-invariant` itself
+         ;; cannot carry this check.
+         security-not-forbidden (set/difference
+                                 (security-constraint-surfaces surface)
+                                 forbidden)
          admitted (admitted-source-forms grammar)
          classified (classified-forms surface)
          ;; Builtins and pure host helpers are grammar-classified by catalog
@@ -415,6 +456,9 @@
                       (when (seq missing-forbidden)
                         [{:code :forbidden/unclassified-by-surface
                           :forms missing-forbidden}])
+                      (when (seq security-not-forbidden)
+                        [{:code :forbidden/security-surface-not-forbidden
+                          :forms security-not-forbidden}])
                       (when (seq unclassified)
                         [{:code :admitted/unclassified-by-surface
                           :forms unclassified}])

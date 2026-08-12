@@ -27,6 +27,31 @@
     (is (set/subset? forbidden inv)
         (pr-str {:missing (set/difference forbidden inv)}))))
 
+;; The other direction, and it is NOT the mirror image of the test above.
+;;
+;; That one asks "is every forbidden head classified?" -- against ALL invariant
+;; surfaces, which is right for it. This one asks "is every form a SECURITY
+;; constraint names actually forbidden?", and it must exclude
+;; `:intentional-semantic-simplification` surfaces: those name admitted
+;; operations (`:bool-is-a-type-not-a-number` names `= < > <= >=` and friends),
+;; so running this over `invariant-surfaces` would demand the grammar forbid
+;; comparison.
+;;
+;; Measured 2026-08-12: `:no-ambient-mutation` named `reset!` and `swap!` while
+;; `:forbidden-heads` did not carry them. The compiler refused both anyway --
+;; but with "operation has no admitted lowering", not the forbidden-head
+;; rejection its siblings `atom` and `set!` got. A named invariant that holds
+;; only because nothing happens to lower those symbols is not the fail-closed
+;; enforcement `:classification-rule :security-constraint-requires` asks for.
+(deftest security-constraint-surfaces-are-forbidden-heads
+  (let [grammar (auth/read-edn auth/grammar-path)
+        surface (auth/read-edn auth/surface-path)
+        forbidden (auth/forbidden-heads grammar)
+        security (auth/security-constraint-surfaces surface)]
+    (is (seq security) "no :intentional-security-constraint surfaces were read")
+    (is (set/subset? security forbidden)
+        (pr-str {:named-but-not-forbidden (set/difference security forbidden)}))))
+
 (deftest admitted-forms-are-classified
   (let [grammar (auth/read-edn auth/grammar-path)
         surface (auth/read-edn auth/surface-path)
