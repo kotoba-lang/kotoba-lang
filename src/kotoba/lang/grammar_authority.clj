@@ -14,6 +14,7 @@
 (def grammar-path "lang/guest-grammar.edn")
 (def surface-path "lang/surface-status.edn")
 (def pipeline-path "lang/elaboration-pipeline.edn")
+(def conformance-manifest-path "lang/conformance/manifest.edn")
 
 (def local-vendor-path "resources/kotoba/lang/guest-grammar.edn")
 
@@ -319,15 +320,74 @@
                         :disposition (:disposition v)}]))))
         (feature-catalog surface)))
 
+;; A portable claim with NO conformance link at all is checked by nothing, and
+;; that is the larger hole the two dead-code bugs were hiding.
+;; `portable-without-evidence` requires a non-nil `:conformance` before it looks
+;; at anything, and `conformance-matrix/validate-claims` only validates links
+;; that exist -- so an entry claiming all three backends and naming no case is
+;; strictly less checked than one that names a case badly.
+;;
+;; Measured 2026-08-12: 18 entries qualify as portable claims, 8 carry a link,
+;; 10 carry none.
+;;
+;; Filling ten conformance cases is not something this check can do, so it is a
+;; ratchet rather than a wall: the ten are registered by name and date in
+;; `:classification-rule :conformance-link-debt`, and anything outside that
+;; register fails. The debt cannot grow silently, and it is visible in the
+;; authority rather than in a commit message. `:portable/conformance-debt-stale`
+;; is the other direction -- an entry that has since gained a link must leave
+;; the register, so it shrinks as work lands instead of ossifying.
+(defn portable-claims-without-conformance
+  "Portable claims naming no conformance case, by either link form."
+  [surface claims]
+  (into #{}
+        (keep (fn [[k meta]]
+                (when-not (or (:conformance meta)
+                              (get-in meta [:orphaned-conformance :case]))
+                  k)))
+        claims))
+
+(defn conformance-link-debt-register [surface]
+  (set (get-in surface [:classification-rule :conformance-link-debt :entries] #{})))
+
+(defn declared-conformance-case-ids
+  "Case ids declared by lang/conformance/manifest.edn, or #{} when it is absent."
+  []
+  (let [f (io/file conformance-manifest-path)]
+    (if (.isFile f)
+      (into #{} (keep :id) (:cases (edn/read-string (slurp f))))
+      #{})))
+
 (defn conformance-evidence-present?
-  "True when a conformance keyword is backed by shared evidence listing or fixture dir."
+  "True when a conformance keyword resolves to real evidence.
+
+  This used to read:
+
+      (or (nil? conformance-key)
+          (contains? shared-cases conformance-key)
+          (.isDirectory (io/file \"lang/conformance\"))   ; <-- always true
+          (.isFile (io/file (str \"lang/conformance/\" (name conformance-key) \".kotoba\"))))
+
+  The third clause tests that a DIRECTORY exists, which has nothing to do with
+  the key, and it is true in every checkout -- so the predicate was constant
+  `true` and the two clauses after it were unreachable. Measured 2026-08-12:
+  `(conformance-evidence-present? surface :totally-made-up-key)` returned true.
+
+  The fourth clause could not have worked either. `:conformance` values are
+  case IDS declared in `lang/conformance/manifest.edn`, not filenames; the
+  fixtures live in subdirectories (`collections/`, `control/`, `functions/`,
+  ...) and are not named after the keys. No `lang/conformance/<key>.kotoba`
+  exists for any key in use.
+
+  So resolution now goes to the manifest, which is where `conformance-matrix`
+  already resolves the same ids. Cross-repo ids (declared in the compiler's own
+  pilot-manifest) are handled by the caller the way `validate-claims` handles
+  them -- via the entry's `:conformance-manifest`, which this arity cannot see."
   [surface conformance-key]
   (or (nil? conformance-key)
       (contains? (set (get-in surface [:other-gaps :backend-parity :evidence :shared-cases] []))
                  conformance-key)
-      (.isDirectory (io/file "lang/conformance"))
-      ;; Named fixture files used by the shared matrix.
-      (.isFile (io/file (str "lang/conformance/" (name conformance-key) ".kotoba")))))
+      (contains? (declared-conformance-case-ids) conformance-key)))
 
 (defn file-bytes [path]
   (when (.isFile (io/file path))
@@ -407,24 +467,34 @@
          feature-claims (feature-portable-claims surface)
          portable-without-evidence
          (into []
+               ;; These were two sequential `when` forms. A fn returns its LAST
+               ;; expression, so the first map was built and dropped on every
+               ;; iteration and `:portable-claim-missing-conformance-evidence`
+               ;; could not be emitted by any input. The one entry that would
+               ;; have produced it -- `:first-class-closure-values`, whose
+               ;; `:missing` is non-empty and whose `:conformance` is not in
+               ;; `:shared-cases` -- was routed into exactly the discarded
+               ;; branch, while the surviving branch requires `(empty? missing)`.
+               ;; Measured 2026-08-12.
+               ;;
+               ;; The two cases differ only in what they mean, so they are one
+               ;; `cond` now: a claim whose conformance key has no evidence is
+               ;; reported either way, and `:missing` only picks the reason.
                (keep (fn [[k meta]]
                        (let [conf (:conformance meta)
                              missing (:missing meta)]
-                         (when (and (seq missing)
-                                    conf
+                         (when (and conf
                                     (not (conformance-evidence-present? surface conf)))
-                           {:feature k :conformance conf :missing missing
-                            :reason :portable-claim-missing-conformance-evidence})
-                         ;; If disposition claims implemented-partial with full
-                         ;; backends, missing non-empty means stay partial — OK.
-                         ;; Fail only when a feature claims empty missing + full
-                         ;; backends but has no conformance when one is required.
-                         (when (and (empty? missing)
-                                    conf
-                                    (not (conformance-evidence-present? surface conf)))
-                           {:feature k :conformance conf
-                            :reason :conformance-key-not-in-shared-evidence}))))
+                           (if (seq missing)
+                             {:feature k :conformance conf :missing missing
+                              :reason :portable-claim-missing-conformance-evidence}
+                             {:feature k :conformance conf
+                              :reason :conformance-key-not-in-shared-evidence})))))
                feature-claims)
+         unlinked-claims (portable-claims-without-conformance surface feature-claims)
+         debt-register (conformance-link-debt-register surface)
+         unregistered-claims (set/difference unlinked-claims debt-register)
+         stale-debt (set/difference debt-register unlinked-claims)
          vendor (vendor-drift authority-bytes)
          pipeline-errors
          (cond-> []
@@ -516,6 +586,12 @@
                       (when (seq incomplete-portable)
                         [{:code :portable/sugar-unclassified
                           :entries incomplete-portable}])
+                      (when (seq unregistered-claims)
+                        [{:code :portable/claim-without-conformance
+                          :entries unregistered-claims}])
+                      (when (seq stale-debt)
+                        [{:code :portable/conformance-debt-stale
+                          :entries stale-debt}])
                       (when (seq portable-without-evidence)
                         [{:code :portable/missing-evidence
                           :entries portable-without-evidence}])

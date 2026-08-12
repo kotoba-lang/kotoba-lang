@@ -70,6 +70,38 @@
         unresolved (auth/security-constraint-adr-paths-unresolved surface)]
     (is (empty? unresolved) (pr-str {:unresolved unresolved}))))
 
+;; `conformance-evidence-present?` used to contain
+;; `(.isDirectory (io/file "lang/conformance"))` inside its `or`, which is true
+;; in every checkout and killed every clause after it. The predicate answered
+;; `true` for any input, so `:portable/missing-evidence` could not fire.
+;; Measured 2026-08-12. A made-up key is the whole test.
+(deftest conformance-evidence-is-not-vacuously-present
+  (let [surface (auth/read-edn auth/surface-path)]
+    (is (not (#'auth/conformance-evidence-present? surface :totally-made-up-key)))
+    (is (#'auth/conformance-evidence-present? surface :nested-let-destructuring)
+        "a case id declared in lang/conformance/manifest.edn must resolve")))
+
+;; The debt register is a ratchet in both directions: a portable claim naming no
+;; conformance case must be registered, and a registered entry that has since
+;; gained a link must be removed. Neither direction can be satisfied by adding
+;; rows -- one fails on unregistered claims, the other on stale rows.
+(deftest conformance-link-debt-register-matches-reality
+  (let [grammar (auth/read-edn auth/grammar-path)
+        surface (auth/read-edn auth/surface-path)
+        claims (auth/feature-portable-claims surface)
+        unlinked (auth/portable-claims-without-conformance surface claims)
+        register (auth/conformance-link-debt-register surface)]
+    (is (seq claims) "no portable claims were read")
+    (is (empty? (set/difference unlinked register))
+        (pr-str {:unregistered (set/difference unlinked register)}))
+    (is (empty? (set/difference register unlinked))
+        (pr-str {:stale-register-rows (set/difference register unlinked)}))
+    ;; 3-arity: the 2-arity overload does not read the pipeline and reports
+    ;; :pipeline/missing, which is not what this test is about.
+    (let [errors (:errors (auth/validate grammar surface
+                                         (auth/read-edn auth/pipeline-path)))]
+      (is (empty? errors) (pr-str errors)))))
+
 (deftest admitted-forms-are-classified
   (let [grammar (auth/read-edn auth/grammar-path)
         surface (auth/read-edn auth/surface-path)
