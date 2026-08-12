@@ -102,6 +102,21 @@
                                          (auth/read-edn auth/pipeline-path)))]
       (is (empty? errors) (pr-str errors)))))
 
+;; `:implementation` was free text: rendered into the surface matrix, tested
+;; only for subset-of-portable-backends, read by nothing else. A typo or a
+;; token coined for one entry was indistinguishable from a supported backend.
+;; The declared set does not decide which vocabulary is correct — it stops the
+;; namespace growing while that decision is open.
+(deftest implementation-tokens-are-declared
+  (let [surface (auth/read-edn auth/surface-path)
+        used (auth/implementation-tokens surface)
+        declared (auth/declared-implementation-vocabulary surface)]
+    (is (seq used) "no :implementation tokens were read")
+    (is (empty? (set/difference used declared))
+        (pr-str {:undeclared (set/difference used declared)}))
+    (is (empty? (set/difference declared used))
+        (pr-str {:declared-but-unused (set/difference declared used)}))))
+
 (deftest admitted-forms-are-classified
   (let [grammar (auth/read-edn auth/grammar-path)
         surface (auth/read-edn auth/surface-path)
