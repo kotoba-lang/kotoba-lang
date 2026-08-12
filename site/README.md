@@ -39,12 +39,29 @@ Run from the **repository root**, with the design-system repos checked out as
 west siblings (`orgs/kotoba-lang/*`):
 
 ```sh
-nbb --classpath "../shitsuke/src:../css/src:../html/src:../liquid-glass-ui/src:../kotoba-ui/src:../byoubu/src:../byoubu-ui/src" \
+nbb --classpath "../shitsuke/src:../css/src:../html/src:../liquid-glass-ui/src:../kotoba-ui/src:../byoubu/src:../byoubu-ui/src:../kotoba-kir/src:../kotoba-hir/src" \
     site/generate.cljs
 ```
 
+`kotoba-kir` and `kotoba-hir` are on that classpath because shitsuke moved its
+raw-text safety check into a compiled `.kotoba` decision core, so
+`shitsuke.hiccup` now loads `kotoba.kir`, which loads `kotoba.hir`. They are
+required to *load* the design system, not merely to call it. The generator also
+registers the shipped KIR itself — on ClojureScript there is no classpath to
+read the artifact from, and `->html` refuses rather than silently skipping the
+check on the `[:script ...]` and `[:style ...]` this page emits. It reads that
+artifact from `../shitsuke/resources` by default; set `SHITSUKE_RESOURCES` for a
+checkout that is not laid out as a west sibling.
+
 Output: `site/dist/index.html` (committed, so a clean checkout can deploy
 without running the generator).
+
+**The committed artifact is a deploy input, not a build by-product**: `wrangler
+deploy` here has no build step, so whatever is in `dist/` at deploy time is what
+the live zone serves. Regenerate and check `git diff` before shipping. An
+*absent* `dist/` fails loudly, but an *empty* one does not — wrangler reports
+"Read 0 files" and uploads them, which on a custom domain replaces the live page
+with nothing. Measured 2026-08-13 with wrangler 4.103.0.
 
 ## Score it
 

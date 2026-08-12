@@ -13,17 +13,55 @@
 ;;
 ;; Run from the repository root (west layout: siblings under orgs/kotoba-lang):
 ;;
-;;   nbb --classpath "../shitsuke/src:../css/src:../html/src:../liquid-glass-ui/src:../kotoba-ui/src:../byoubu/src:../byoubu-ui/src" \
+;;   nbb --classpath "../shitsuke/src:../css/src:../html/src:../liquid-glass-ui/src:../kotoba-ui/src:../byoubu/src:../byoubu-ui/src:../kotoba-kir/src:../kotoba-hir/src" \
 ;;       site/generate.cljs
+;;
+;; `kotoba-kir` and `kotoba-hir` are on that classpath because shitsuke moved
+;; its raw-text safety check into a compiled `.kotoba` decision core:
+;; `shitsuke.hiccup` -> `shitsuke.kotoba-oracle` -> `kotoba.kir` -> `kotoba.hir`.
+;; They are load-bearing for LOADING the design system, not only for calling it.
 ;;
 ;; Output: site/dist/index.html (a single self-contained static document —
 ;; no build step, no runtime JS, for anyone visiting the page).
 
 (require '[kotoba-ui.core :as ui]
+         '[shitsuke.kotoba-oracle :as oracle]
          '[cljs.reader :as reader]
          '[clojure.string :as str]
          '["fs" :as fs]
          '["path" :as path])
+
+;; ---------------------------------------------------------------------------
+;; the raw-text decision core
+;;
+;; This page renders `[:script [:hiccup/raw ...]]` and `[:style [:hiccup/raw ...]]`,
+;; and shitsuke routes exactly those raw-text elements through a compiled
+;; `.kotoba` core. On ClojureScript there is no classpath to read the shipped
+;; artifact from, so `->html` THROWS unless the KIR is registered first — a
+;; deliberate refusal, because a silent fallback around a missing security core
+;; is how an unchecked payload reaches a page (shitsuke README, "ClojureScript
+;; consumers: what changed").
+;;
+;; The ids and the artifact path are read from the library rather than spelled
+;; out here, so an upstream rename cannot leave this generator registering a
+;; core that no longer exists while still appearing to work.
+
+(def shitsuke-resources
+  "Where shitsuke's shipped decision cores live.
+
+  Defaults to the same west sibling layout the classpath above already assumes;
+  `SHITSUKE_RESOURCES` overrides it for checkouts that are not laid out that
+  way (a CI worktree, a one-off clone)."
+  (or (some-> js/process.env.SHITSUKE_RESOURCES not-empty)
+      (path/join ".." "shitsuke" "resources")))
+
+(doseq [id (keys oracle/cores)]
+  (let [artifact (path/join shitsuke-resources (oracle/resource-path id))]
+    (when-not (fs/existsSync artifact)
+      (println "site/generate.cljs: shitsuke decision core not found:" artifact)
+      (println "  set SHITSUKE_RESOURCES to the shitsuke checkout's resources/ directory")
+      (js/process.exit 1))
+    (oracle/register-kir! id (reader/read-string (fs/readFileSync artifact "utf8")))))
 
 ;; ---------------------------------------------------------------------------
 ;; authority inputs
