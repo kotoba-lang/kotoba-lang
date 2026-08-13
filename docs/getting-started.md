@@ -54,8 +54,15 @@ and selects Kotoba-specific behavior with a `#?(:kotoba …)` reader branch.
 
 Kotoba source has no ambient filesystem, network, secret, clock, or process
 authority. A component declares imports; policy grants a bounded subset; the
-runtime links only the granted providers. Start with
-[capability values](lang/capability-values.md) before writing effectful code.
+runtime links only the granted providers. An empty policy denies every host
+effect, including `:host/http`. That is the product for untrusted code:
+ungranted authority does not run.
+
+Hosted billed deploy of those grants is not a public product yet. Do not treat
+`kotoba deploy` as a Deno Deploy analog you can buy today.
+
+Start with [capability values](lang/capability-values.md) before writing
+effectful code.
 
 ## 5. Know the compatibility boundary
 

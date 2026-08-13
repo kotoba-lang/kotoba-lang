@@ -1,8 +1,9 @@
 # Kotoba documentation
 
-Kotoba is a small Clojure-shaped language profile for capability-checked
-WebAssembly components. This page is the stable entrance to its documentation;
-the repository root README remains the project overview.
+Kotoba is a capability-safe language for untrusted AI-written code.
+Deny-by-default: a program can only touch what it was granted. This page is
+the stable entrance to its documentation; the repository root README remains
+the project overview. Hosted billed deploy is not live.
 
 ## Choose a path
 

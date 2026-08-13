@@ -155,12 +155,40 @@
          "capability values alone, because what a program must not forge is "
          "authority, not pointers.")]
    ["3 · Component-first execution"
-    "The unit that runs is a Wasm component, not a process."
-    (str "Each component gets its own WIT world built from its declared "
-         "effects. Undeclared imports are rejected and there is no ambient "
-         "WASI. The tender links and instantiates, binding only what policy "
-         "granted. Native AOT for ordinary applications is an explicit "
-         "non-goal — the boundary is the point.")]])
+    "The unit that runs is an admitted component, not an ambient process."
+    (str "Each component gets its own WIT world from declared effects. "
+         "Undeclared imports are rejected and there is no ambient WASI. "
+         "The tender binds only what policy granted. Wasm Component is the "
+         "primary portable profile. Bounded native AOT (sealed KEXE on "
+         "x86-64/AArch64) is a supported, explicitly selected backend. "
+         "Ordinary-application native — an ambient OS process with syscalls "
+         "— remains a non-goal.")]])
+
+(defn sixty-second-section []
+  (ui/section
+   {:title "Sixty seconds" :wide true}
+   [:p {:class "hig-body"}
+    "Kotoba is for untrusted AI-written code. Compile a program with no "
+    "effects, then see what an empty policy denies. Hosted billed deploy of "
+    "those grants is not a public product yet."]
+   (ui/grid
+    {:min "280px"}
+    (ui/panel
+     [[:h3 {:class "hig-headline"} "Compile"]
+      (code-block (str "brew tap kotoba-lang/kotoba\n"
+                       "brew install kotoba\n"
+                       "kotoba -e '(+ 1 2)'\n"
+                       "kotoba compile examples/hello.kotoba --target wasm --output hello.wasm --json"))
+      (caption "Installation is owned by kotoba-lang/kotoba. -e is compile-and-run sugar, not runtime eval.")])
+    (ui/panel
+     [[:h3 {:class "hig-headline"} "Deny"]
+      [:p {:class "hig-subheadline"}
+       "No ambient filesystem, network, secrets, clock, or process. An empty "
+       "policy denies every host effect, including " (code ":host/http")
+       ". An ungranted capability is unbound."]
+      (caption (str "That is the product. Selling HTTP, storage, or LLM effects "
+                    "waits until those kits are qualified on a shipped backend. "
+                    "Getting started: docs/getting-started.md."))]))))
 
 (defn intro-section []
   (ui/section
@@ -246,7 +274,9 @@
                (caption (str "Scope may only attenuate, never widen, and the handler "
                              "receives a concrete post-intersection capability. "
                              "Production policy must forbid wildcard scope; every "
-                             "attempt is receipted whether or not it succeeds."))]))))
+                             "attempt is receipted whether or not it succeeds. "
+                             "This is the admission shape. HTTP, storage, and LLM "
+                             "kits are not qualified for sale on a shipped backend."))]))))
 
 (defn claims-section []
   (ui/section
@@ -331,7 +361,12 @@
                                                                    (:pipeline elaboration)))))]
                       (code t)))
          " — under the same rules: exact imports, deny-by-default admission."]
-        (caption "Ordinary-application native AOT is an explicit non-goal: the execution boundary is the component.")])
+        (caption (str "These two are the portable component-lowering targets. "
+                      "Bounded native AOT (sealed KEXE on x86-64/AArch64) is a "
+                      "separately selected backend. Ordinary-application native "
+                      "— an ambient OS process with syscalls — remains a "
+                      "non-goal: the execution boundary is still the granted "
+                      "component."))])
       (ui/panel
        [[:h3 {:class "hig-headline"} "Who does what"]
         (bullets
@@ -440,6 +475,7 @@
    (bullets
     ["Q1–Q8 pass for the bounded reference slice, including a CLJC-shadowed pure port, a denied/allowed capability port, and guarded native OS-isolation conformance."
      "Q9 fleet migration is authorized only for bounded Wave 1 tranches. Later waves and production deployment are not authorized, and the ClojureScript oracle is retained."
+     "Hosted billed deploy is not live. kotoba deploy is a package-manifest CLI (maturity m1, dry-run by default), not a public Deno Deploy analog."
      "Runtime-engine vulnerabilities remain inside the trusted computing base; native loaders still require a second OS isolation boundary."
      "Key custody and revocation distribution remain operational, not linguistic, guarantees."])
    (caption "If a claim is not on this page, assume it is not being made.")))
@@ -613,15 +649,15 @@
                      {:trailing [(ui/badge "capability-safe")]})}
    (ui/hero
     {:title "Kotoba"
-     :tagline (str "A Clojure-shaped language that compiles to WebAssembly "
-                   "components — where a program can only touch what it was "
-                   "explicitly handed.")
+     :tagline (str "A capability-safe language for untrusted AI-written code. "
+                   "A program can only touch what it was granted.")
      :actions [[:a {:class "kot-cta hig-headline"
-                    :href "https://github.com/kotoba-lang/kotoba-lang"}
-                "The language authority"]
+                    :href "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/getting-started.md"}
+                "Getting started"]
                [:a {:class "kot-cta hig-headline"
-                    :href "https://github.com/kotoba-lang/kotoba-lang/blob/main/lang/guest-grammar.edn"}
-                "The admitted grammar"]]})
+                    :href "https://github.com/kotoba-lang/kotoba-lang"}
+                "Language authority"]]})
+   (sixty-second-section)
    (intro-section)
    (thesis-section)
    (source-section)
@@ -639,11 +675,12 @@
 
 (def html
   (ui/->page
-   {:title "Kotoba — a capability-safe language for WebAssembly components"
-    :description (str "Kotoba is a Clojure-shaped, capability-confined language "
-                      "that compiles to WebAssembly components. Deny-by-default "
-                      "authority, declared effects, bounded admission, "
-                      "reproducible artifacts.")
+   {:title "Kotoba — a capability-safe language for untrusted AI-written code"
+    :description (str "Kotoba is a capability-confined language for untrusted "
+                      "AI-written code. Deny-by-default authority, declared "
+                      "effects, bounded admission. Compiles to WebAssembly "
+                      "components and a bounded native backend. Hosted billed "
+                      "deploy is not live.")
     :theme theme
     :head [:style [:hiccup/raw app-css]]}
    (view)))
