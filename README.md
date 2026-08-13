@@ -1,13 +1,24 @@
 # Kotoba
 
-Kotoba is a small, safety-first Clojure-shaped language profile for compiling
-capability-checked programs through checked KIR to WebAssembly, native x86-64/
-AArch64 machine code, and restricted JavaScript.
+Capability-safe language for untrusted AI-written code.
 
-It is designed for components that should be inspectable, portable, and
-constrained: AI-generated cells, sandboxed automation, repository policy,
-applications, orchestrators, and capability providers whose external effects
-are explicit and runtime-granted.
+A compiled program can use only the authority it was granted. Deny-by-default.
+[kotoba-lang.org](https://kotoba-lang.org) · CLI/implementation:
+[`kotoba-lang/kotoba`](https://github.com/kotoba-lang/kotoba)
+
+```sh
+brew tap kotoba-lang/kotoba && brew install kotoba
+kotoba -e '(+ 1 2)'
+kotoba compile examples/hello.kotoba --target wasm --output hello.wasm --json
+```
+
+An empty policy denies every host effect, including `:host/http`. Hosted billed
+deploy of those grants is not live. Wasm Component is the primary portable
+profile. Bounded native AOT (x86-64/AArch64) is a supported, explicitly selected
+backend; ordinary-application native (ambient OS process) is a non-goal.
+
+The rest of this file is the language contract. Start with
+[docs/getting-started.md](docs/getting-started.md) if you want to run something.
 
 ## Purpose and philosophy
 
