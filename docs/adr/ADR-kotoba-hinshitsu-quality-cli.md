@@ -35,7 +35,7 @@ future adapters) would otherwise re-invent its own ad-hoc flags.
 ## Decision
 
 Add `:hinshitsu` as a seventh `:m1` command to `lang/cli.edn`, following the
-exact shape of `:db`/`:git`/`:rad`/`:deploy` (a `:subcommands` vector mirrored
+exact shape of `:graph`/`:git`/`:rad`/`:deploy` (a `:subcommands` vector mirrored
 by an `--op` enum option, for adapters without nested-command support):
 
 - **Subcommands**: `:evidence` (record/inspect a single evidence entry),
@@ -48,7 +48,7 @@ by an `--op` enum option, for adapters without nested-command support):
   `:required-checks`), `--json` (matches every other command).
 
 `src/kotoba/cli.cljc`'s `required-commands` gains `:hinshitsu`; like `:run`,
-`:db`, `:git`, `:rad`, `:deploy`, its `command-result` falls through to the
+`:graph`, `:git`, `:rad`, `:deploy`, its `command-result` falls through to the
 generic `:command/planned` / `:adapter-required` branch — the CLJC authority
 owns the contract and argv shaping, not the actual check execution (that
 stays a host-adapter concern, e.g. kotoba-shell calling into

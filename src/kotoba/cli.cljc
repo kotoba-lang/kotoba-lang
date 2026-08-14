@@ -10,7 +10,7 @@
 
 (def default-contract-path "lang/cli.edn")
 
-(def required-commands #{:run :compile :check :db :git :rad :deploy :hinshitsu})
+(def required-commands #{:run :compile :check :graph :git :rad :deploy :hinshitsu})
 
 (def adapter-kinds #{:node :jvm :native :browser :edge})
 
@@ -177,7 +177,7 @@
 
 (defn command-result
   "Return the CLJC authoritative result shape for a command. Side effects such as
-  deploy, db transact, or git commit are represented as data for host adapters."
+  deploy, graph transact, or git commit are represented as data for host adapters."
   [contract command-id request]
   (let [spec (get (command-specs contract) command-id)]
     (cond
