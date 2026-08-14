@@ -109,7 +109,7 @@ Options:
 
 ## `kotoba deploy`
 
-Plan and apply deployment operations from Kotoba package data.
+Plan and apply package desired-state to a local receipt or a murakumo fleet reside target.
 
 Maturity tier: `m1`.
 
@@ -119,7 +119,7 @@ Options:
 
 - **`--manifest`** — Package or deployment manifest. Type: `path`; default: `package-manifest.edn`.
 - **`--op`** — Deployment operation. Mirrors subcommands for simple host adapters. Type: `enum`; values: `plan`, `apply`, `status`, `rollback`.
-- **`--target`** — Deployment target name or URI. Type: `string`; required.
+- **`--target`** — Local name (dev), file: URI, absolute path, or murakumo:<node> / fleet:<node>. Compute reside is the murakumo Mac mini fleet; Deno Deploy and Cloudflare are not targets of this command. Type: `string`; required.
 - **`--dry-run`** — Plan without applying host-side changes. Type: `boolean`; default: `true`.
 - **`--revision`** — Revision to deploy or roll back to. Type: `string`.
 - **`--json`** — Emit machine-readable deployment status. Type: `boolean`.
