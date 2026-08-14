@@ -58,9 +58,9 @@ Options:
 - **`--safe`** — Apply the capability-safe Kotoba profile. Type: `boolean`; default: `true`.
 - **`--json`** — Emit machine-readable diagnostics. Type: `boolean`.
 
-## `kotoba db`
+## `kotoba graph`
 
-Interact with the Kotoba data substrate through explicit data operations.
+Query and transact the language graph store (kgraph) with Datomic-shaped operations.
 
 Maturity tier: `m1`.
 
@@ -68,7 +68,7 @@ Subcommands: `connect`, `query`, `transact`, `pull`, `status`.
 
 Options:
 
-- **`--db`** — Database alias, URI, or environment-selected handle. Type: `string`; required.
+- **`--graph`, `--db`** — Graph handle: mem:<alias>, file:<path>, or a filesystem path. --db remains a compatibility alias. Type: `string`; required.
 - **`--op`** — Data operation. Mirrors the supported subcommands for adapters without nested command support. Type: `enum`; values: `connect`, `query`, `transact`, `pull`, `status`.
 - **`-f`, `--file`** — EDN query, transaction, or pull request file. Type: `path`.
 - **`--param`** — EDN parameter binding for query-like operations. Type: `edn`; repeatable.

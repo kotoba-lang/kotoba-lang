@@ -285,7 +285,7 @@ consume this repository and the lower-level core-contract repository as data:
 - `lang/conformance/`: conformance fixtures for source behavior.
 - `kotoba-core-contracts/lang/profile.edn`: source-file classification.
 - `kotoba-core-contracts/lang/package.edn`: package reference and lock contract.
-- `lang/cli.edn` defines `run`, `check`, `db`, `git`, `rad`, `deploy`, and
+- `lang/cli.edn` defines `run`, `check`, `graph`, `git`, `rad`, `deploy`, and
   `hinshitsu` (software-quality checks: evidence, gates, coverage, mokushi
   visual regression — backed by `kotoba-lang/hinshitsu`).
 - `lang/adapters.edn` defines adapter-owned CLI launchers and keeps native

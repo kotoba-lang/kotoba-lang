@@ -12,7 +12,7 @@
   (let [result (cli/validate-contract contract)]
     (is (:kotoba.cli/ok? result))
     (is (= {:version 1
-            :commands [:run :compile :check :db :git :rad :deploy :hinshitsu]
+            :commands [:run :compile :check :graph :git :rad :deploy :hinshitsu]
             :command-count 8
             :option-count 44}
            (:kotoba.cli/data result)))))
@@ -20,8 +20,8 @@
 (deftest cljc-authority-implements-contract-commands
   (is (= {:kotoba.cli/ok? true
           :kotoba.cli/source :cljc
-          :kotoba.cli/contract-commands ["check" "compile" "db" "deploy" "git" "hinshitsu" "rad" "run"]
-          :kotoba.cli/implemented-commands ["check" "compile" "db" "deploy" "git" "hinshitsu" "rad" "run"]
+          :kotoba.cli/contract-commands ["check" "compile" "deploy" "git" "graph" "hinshitsu" "rad" "run"]
+          :kotoba.cli/implemented-commands ["check" "compile" "deploy" "git" "graph" "hinshitsu" "rad" "run"]
           :kotoba.cli/missing-commands []}
          (cli/conformance contract))))
 
@@ -46,7 +46,7 @@
     (is (= :contract/valid (:kotoba.cli/code result)))))
 
 (deftest side-effecting-commands-return-adapter-data
-  (doseq [command ["run" "db" "git" "rad" "deploy" "hinshitsu"]]
+  (doseq [command ["run" "graph" "git" "rad" "deploy" "hinshitsu"]]
     (let [result (cli/dispatch contract [command "--json"])]
       (is (:kotoba.cli/ok? result))
       (is (= :command/planned (:kotoba.cli/code result)))
