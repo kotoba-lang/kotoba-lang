@@ -10,7 +10,8 @@
   (:require [clojure.string :as str]
             [kotoba.lang.capability-values :as capabilities]
             [kotoba.lang.code-identity :as identity]
-            [kotoba.lang.incidence :as incidence]))
+            [kotoba.lang.incidence :as incidence])
+  #?(:clj (:import [java.time Instant])))
 
 (defn- did? [x]
   (and (string? x) (boolean (re-matches #"did:[a-z0-9]+:[^\s]+" x))))
@@ -169,6 +170,17 @@
   #{:ucan/valid? :ucan/problems :ucan/root-iss :ucan/audience
     :ucan/resources :ucan/expires :ucan/depth :ucan/attenuated?})
 
+(defn- ucan-expiry->instant [expiry]
+  (cond
+    (nil? expiry) nil
+    (and (integer? expiry)
+         (<= -9007199254740991 expiry 9007199254740991))
+    #?(:clj (str (Instant/ofEpochSecond expiry))
+       :cljs (let [instant (js/Date. (* expiry 1000))]
+               (when-not (js/isNaN (.getTime instant))
+                 (.toISOString instant))))
+    :else nil))
+
 (defn ucan-delegation-verifier
   "Build a verifier accepted by trusted/verify-delegation!.
 
@@ -204,10 +216,14 @@
                      (<= 0 (:ucan/depth result) max-depth))
         (throw (ex-info "UCAN delegation was rejected"
                         {:problem :interop/ucan-delegation-invalid})))
-      {:chain/valid? true
-       :chain/problems []
-       :chain/root-iss (:ucan/root-iss result)
-       :chain/holder holder
-       :chain/resources (:ucan/resources result)
-       :chain/expires (:ucan/expires result)
-       :chain/depth (:ucan/depth result)})))
+      (let [expires (ucan-expiry->instant (:ucan/expires result))]
+        (when (and (some? (:ucan/expires result)) (nil? expires))
+          (throw (ex-info "UCAN expiry could not be normalized"
+                          {:problem :interop/ucan-expiry-invalid})))
+        {:chain/valid? true
+         :chain/problems []
+         :chain/root-iss (:ucan/root-iss result)
+         :chain/holder holder
+         :chain/resources (:ucan/resources result)
+         :chain/expires expires
+         :chain/depth (:ucan/depth result)}))))
