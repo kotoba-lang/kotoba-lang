@@ -253,9 +253,11 @@ plus the canonical [Syrup draft](https://github.com/ocapn/syrup/blob/master/draf
 Measured cross-runtime evidence is recorded in
 `docs/lang/ocapn-interop-2026-08-15.edn`: ten shared Syrup values match
 `@endo/ocapn` 1.1.1 byte-for-byte, and the bounded CapTP frame round-trips on
-both the JVM and nbb/Node. It explicitly does not claim a live
-Endo-to-Kotoba session, start-session signature interop, handoff interop,
-float64 support, or Set byte compatibility.
+both the JVM and nbb/Node. The same receipt now includes a live framed TCP
+session with bidirectional Ed25519 start-session verification and shared
+session-id derivation, plus byte-identical, cross-verified third-party handoff
+signatures and deposit-after-withdraw settlement. It still explicitly does
+not claim float64 or JavaScript Set byte compatibility.
 
 Identity terminology follows W3C [DID Core](https://www.w3.org/TR/did-core/)
 and [Verifiable Credentials Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/).

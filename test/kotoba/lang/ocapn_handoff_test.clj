@@ -58,7 +58,7 @@
       (is (handoff/admitted-gift? gift))
       (is (identical? target (handoff/gift-target gift)))
       (is (= 0 (:handoff/count (handoff/gift-description gift)))))
-    (is (= :handoff/gift-unavailable
+    (is (= :handoff/count-replay
            (:problem
             (ex-data
              (try
@@ -96,3 +96,107 @@
                    store verify gifter-key
                    {:session-id (fixed-bytes 32 0) :gifter-side side} give (Object.))
                   (catch clojure.lang.ExceptionInfo e e))))))))
+
+(deftest deferred-withdrawal-settles-after-deposit-and-keeps-tombstones
+  (let [gifter-key (fixed-bytes 32 21)
+        receiver-key (fixed-bytes 32 22)
+        gifter-session (fixed-bytes 32 23)
+        gifter-side (fixed-bytes 32 24)
+        receiver-session (fixed-bytes 32 25)
+        receiver-side (fixed-bytes 32 26)
+        ;; Endo's randomGiftId is 16 bytes; OCapN does not require 32.
+        gift-id (fixed-bytes 16 27)
+        give (handoff/handoff-give!
+              (signer gifter-key)
+              {:receiver-key receiver-key
+               :exporter-location
+               (captp/syrup-record 'ocapn-peer ['tcp-testing-only
+                                                 "exporter" {}])
+               :session-id gifter-session
+               :gifter-side gifter-side
+               :gift-id gift-id})
+        receive (handoff/handoff-receive!
+                 (signer receiver-key)
+                 {:receiving-session receiver-session
+                  :receiving-side receiver-side
+                  :handoff-count 3
+                  :signed-give give})
+        store (handoff/gift-store)
+        target :authority/target
+        delivered (atom nil)
+        future (handoff/withdraw-gift-deferred!
+                store verify (fn [_ _] gifter-key)
+                {:receiving-session receiver-session
+                 :receiving-side receiver-side}
+                receive)]
+    (is (handoff/future-gift? future))
+    (is (= {:handoff/status :pending}
+           (handoff/future-gift-settlement future)))
+    (handoff/listen-future-gift! future #(reset! delivered %))
+    (is (:handoff/delivered-to-waiter?
+         (handoff/deposit-gift!
+          store verify gifter-key
+          {:session-id gifter-session :gifter-side gifter-side}
+          give target)))
+    (is (handoff/admitted-gift? @delivered))
+    (is (= target (handoff/gift-target @delivered)))
+    (is (= :fulfilled
+           (:handoff/status (handoff/future-gift-settlement future))))
+    (is (= :handoff/count-replay
+           (:problem
+            (ex-data
+             (try
+               (handoff/withdraw-gift-deferred!
+                store verify (fn [_ _] gifter-key)
+                {:receiving-session receiver-session
+                 :receiving-side receiver-side}
+                receive)
+               (catch clojure.lang.ExceptionInfo e e))))))
+    (is (= :handoff/gift-replay
+           (:problem
+            (ex-data
+             (try
+               (handoff/deposit-gift!
+                store verify gifter-key
+                {:session-id gifter-session :gifter-side gifter-side}
+                give target)
+               (catch clojure.lang.ExceptionInfo e e))))))))
+
+(deftest pending-gift-allows-one-waiter-only
+  (let [gifter-key (fixed-bytes 32 31)
+        receiver-key (fixed-bytes 32 32)
+        gifter-session (fixed-bytes 32 33)
+        gifter-side (fixed-bytes 32 34)
+        receiver-session (fixed-bytes 32 35)
+        receiver-side (fixed-bytes 32 36)
+        gift-id (fixed-bytes 16 37)
+        give (handoff/handoff-give!
+              (signer gifter-key)
+              {:receiver-key receiver-key
+               :exporter-location
+               (captp/syrup-record 'ocapn-peer ['tcp-testing-only "x" {}])
+               :session-id gifter-session :gifter-side gifter-side
+               :gift-id gift-id})
+        receive! (fn [count]
+                   (handoff/handoff-receive!
+                    (signer receiver-key)
+                    {:receiving-session receiver-session
+                     :receiving-side receiver-side
+                     :handoff-count count
+                     :signed-give give}))
+        store (handoff/gift-store)]
+    (is (handoff/future-gift?
+         (handoff/withdraw-gift-deferred!
+          store verify (fn [_ _] gifter-key)
+          {:receiving-session receiver-session :receiving-side receiver-side}
+          (receive! 0))))
+    (is (= :handoff/gift-reserved
+           (:problem
+            (ex-data
+             (try
+               (handoff/withdraw-gift-deferred!
+                store verify (fn [_ _] gifter-key)
+                {:receiving-session receiver-session
+                 :receiving-side receiver-side}
+                (receive! 1))
+               (catch clojure.lang.ExceptionInfo e e))))))))
