@@ -1,0 +1,110 @@
+# Content-addressed incidence
+
+Kotoba models durable social and distributed state as immutable, typed
+relations. An incidence is an n-ary relation whose participants occur under
+explicit roles. Its canonical DAG-CBOR block has a CIDv1 identity.
+
+```clojure
+{:incidence/kind :organization/member-added
+ :incidence/roles
+ {:organization #{{:ref/type :cid :ref/value "bafy..."}}
+  :member #{{:ref/type :did :ref/value "did:key:z6Mk..."}}}
+ :incidence/facts {:membership/roles #{:maintainer}}
+ :incidence/parents #{"bafy..."}
+ :incidence/evidence #{"bafy..."}
+ :incidence/policies #{"bafy..."}}
+```
+
+The data and coordination model is Syndicate-like incidence-first, rather than
+actor-first or object-first:
+
+- a person, software agent, conventional organization, and system-of-systems
+  are constituted through the same `:organization/constitution` relation;
+- an organization identity is the CID of that constitution, not its mutable
+  name, DID document, or current membership;
+- membership changes append incidences; they do not mutate the constitution;
+- a removal names the exact member-added CIDs it observed, giving deterministic
+  observed-remove-set projection under concurrent histories;
+- current state is a verified projection of an immutable incidence DAG.
+
+An addressed incidence is an assertion. A `:dataspace/retracted` incidence
+names exact assertion CIDs and acts as an append-only tombstone. Observation is
+an inert EDN selector over the verified active projection. Publishing,
+callbacks, facet lifecycle, and transport remain runtime concerns; the pure
+language layer does not pretend that constructing an EDN map has performed an
+effect.
+
+Human names and discovery aliases may change without changing an already
+published incidence. A new semantic fact produces a new block and CID.
+
+## References
+
+A participant is always an explicitly typed reference:
+
+| Type | Meaning |
+|---|---|
+| `:cid` | immutable internal Kotoba/IPLD identity |
+| `:did` | interoperable principal identifier |
+| `:uri` | external resource identifier |
+
+This avoids treating an arbitrary string as a principal or resource. A DID can
+point external clients toward an organization, while internal state remains a
+CID-addressed history.
+
+## Protocol mappings
+
+- Holochain action/source-chain links map to incidence blocks and parents.
+- ValueFlows economic-event roles map directly to incidence roles.
+- Syndicate assertions map to blocks; withdrawals target existing CIDs.
+- UCAN and ZCAP grantor, grantee, resource, action, constraint, and proof
+  relationships map to delegation incidences.
+- W3C VC issuer, subject, holder, claim, and evidence relationships map to
+  credential incidences. DID values remain typed external references.
+
+These mappings preserve the external vocabularies at adapters. They do not put
+mutable DID documents or protocol-specific wire envelopes into internal
+semantic identity.
+
+## Security boundary
+
+A valid incidence CID proves only that canonical content has not changed. It
+does not prove who authored the block, that a VC or UCAN signature is valid, or
+that the holder may invoke an effect.
+
+Effectful execution still follows the capability pipeline:
+
+1. verify the signature and delegation/evidence chain;
+2. intersect the verified delegation with local policy;
+3. mint a concrete scoped capability value;
+4. guard the host effect and emit a receipt.
+
+Consequently a delegation or credential incidence received from an untrusted
+store is data-only until its protocol adapter verifies it. Merely knowing its
+CID never grants authority.
+
+## EDN data and object capabilities
+
+EDN is the semantic data model, not the authority model. Canonical DAG-CBOR is
+the binary identity encoding, and a protocol adapter may choose a different
+wire envelope. These are distinct layers.
+
+```text
+EDN-like immutable value -> canonical DAG-CBOR -> CID
+runtime capability       -> host-admitted lexical/affine value, not EDN
+```
+
+There is deliberately no `#cap` tagged literal and `:ref/type` does not admit a
+capability variant. A `{:capability ...}` map, delegation incidence, UCAN, or
+ZCAP document is inert description/evidence. Only the capability admission
+pipeline can mint the concrete runtime value accepted by a host effect.
+
+Kotoba syntax being Clojure-shaped does not imply Clojure/JVM authority.
+Ambient `slurp`, JVM interop, environment access, reader evaluation, and guest
+macros remain outside the safe language. Runtime authority arrives through
+arguments and captured lexical bindings and is further bounded by affine use,
+effect rows, verified delegation, and local policy.
+
+Future surface sugar may spell pure constructors and runtime effects as
+`assert`, `observe`, and `facet`, but it must elaborate to this closed data and
+capability kernel. Macro expansion is not allowed to become an ambient-authority
+escape hatch.
