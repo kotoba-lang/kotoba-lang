@@ -11,10 +11,15 @@
 
 (def captp-version "1.0")
 (def draft-profile "ocapn-captp-1.0-draft-2026-08-15")
+(def durable-receipt-version incidence/append-durable-version)
+(def durable-receipt-kind incidence/append-durable-kind)
 
 (def ^:private reference-fields
   #{:session/id :session/version :session/authenticated?
     :remote/target :send!})
+
+(def ^:private request-reference-fields
+  (conj reference-fields :request!))
 
 (def ^:private target-fields
   #{:ocapn/descriptor :ocapn/position})
@@ -23,10 +28,20 @@
   (-reference-info [reference])
   (-deliver! [reference message]))
 
+(defprotocol ^:private RemoteRequestReference
+  (-request! [reference call]))
+
 (deftype ^:private LiveReference [info send!]
   RemoteReference
   (-reference-info [_] info)
   (-deliver! [_ message] (send! message)))
+
+(deftype ^:private LiveRequestReference [info send! request!]
+  RemoteReference
+  (-reference-info [_] info)
+  (-deliver! [_ message] (send! message))
+  RemoteRequestReference
+  (-request! [_ call] (request! call)))
 
 (defn- non-negative-int?
   [x]
@@ -46,7 +61,8 @@
     (not (map? opts))
     {:problem :ocapn/connection-not-a-map}
 
-    (not= reference-fields (set (keys opts)))
+    (not (contains? #{reference-fields request-reference-fields}
+                    (set (keys opts))))
     {:problem :ocapn/connection-fields}
 
     (not (capabilities/non-empty-string? (:session/id opts)))
@@ -64,7 +80,11 @@
     {:problem :ocapn/target-invalid}
 
     (not (fn? (:send! opts)))
-    {:problem :ocapn/send-port-invalid}))
+    {:problem :ocapn/send-port-invalid}
+
+    (and (contains? opts :request!)
+         (not (fn? (:request! opts))))
+    {:problem :ocapn/request-port-invalid}))
 
 (defn connected-reference
   "Construct an opaque live reference from an already authenticated CapTP
@@ -72,16 +92,21 @@
   [opts]
   (if-let [error (connection-error opts)]
     (throw (ex-info "invalid OCapN live reference" error))
-    (LiveReference.
-     {:ocapn/profile draft-profile
-      :session/id (:session/id opts)
-      :session/version (:session/version opts)
-      :remote/target (:remote/target opts)}
-     (:send! opts))))
+    (let [info {:ocapn/profile draft-profile
+                :session/id (:session/id opts)
+                :session/version (:session/version opts)
+                :remote/target (:remote/target opts)}]
+      (if (contains? opts :request!)
+        (LiveRequestReference. info (:send! opts) (:request! opts))
+        (LiveReference. info (:send! opts))))))
 
 (defn live-reference?
   [x]
   (satisfies? RemoteReference x))
+
+(defn request-capable-reference?
+  [x]
+  (satisfies? RemoteRequestReference x))
 
 (defn reference-description
   "Return inert audit metadata. The live send authority is never exposed."
@@ -117,6 +142,51 @@
       (not= dataspace (:cap/resource cap))
       {:problem :ocapn/capability-resource})))
 
+(defn durable-receipt
+  "Construct the deterministic content-addressed remote durability claim for
+  ENTRY in DATASPACE. This is inert evidence, not authority or independent
+  proof that storage occurred."
+  [dataspace entry]
+  (incidence/append-durable-receipt dataspace entry))
+
+(defn durable-receipt-error
+  "Return a fail-closed diagnostic unless RECEIPT is the exact deterministic
+  receipt for REQUEST's verified CID and dataspace."
+  [request receipt]
+  (let [verified (when (map? receipt) (incidence/verify-addressed receipt))
+        expected (when (and (map? request)
+                            (map? (:entry request))
+                            (capabilities/non-empty-string? (:dataspace request)))
+                   (try
+                     (durable-receipt (:dataspace request) (:entry request))
+                     (catch #?(:clj Exception :cljs :default) _ nil)))]
+    (cond
+      (not (map? receipt))
+      {:problem :ocapn/durable-receipt-not-a-map}
+
+      (not= #{:incidence/cid :incidence/block} (set (keys receipt)))
+      {:problem :ocapn/durable-receipt-fields}
+
+      (not (:ok? verified))
+      {:problem :ocapn/durable-receipt-address-invalid
+       :verification verified}
+
+      (nil? expected)
+      {:problem :ocapn/durable-receipt-request-invalid}
+
+      (not= expected receipt)
+      {:problem :ocapn/durable-receipt-mismatch
+       :expected-cid (:incidence/cid expected)
+       :actual-cid (:incidence/cid receipt)})))
+
+(defn- append-args
+  [request]
+  (let [entry (:entry request)]
+    ['append-incidence
+     (:dataspace request)
+     (:incidence/cid entry)
+     (incidence/canonical-bytes (:incidence/block entry))]))
+
 (defn deliver-message
   "Build the abstract current-draft CapTP delivery for one incidence.
 
@@ -129,17 +199,29 @@
                     {:problem :ocapn/not-live-reference})))
   (if-let [error (append-request-error request)]
     (throw (ex-info "invalid OCapN incidence append" error))
-    (let [entry (:entry request)
-          block (:incidence/block entry)]
-      {:ocapn/profile draft-profile
-       :ocapn/op :op/deliver
-       :ocapn/to (:remote/target (-reference-info reference))
-       :ocapn/args ['append-incidence
-                    (:dataspace request)
-                    (:incidence/cid entry)
-                    (incidence/canonical-bytes block)]
-       :ocapn/answer-position false
-       :ocapn/resolve-me false})))
+    {:ocapn/profile draft-profile
+     :ocapn/op :op/deliver
+     :ocapn/to (:remote/target (-reference-info reference))
+     :ocapn/args (append-args request)
+     :ocapn/answer-position false
+     :ocapn/resolve-me false}))
+
+(defn request-call
+  "Build a settled-result request for an authenticated session driver.
+
+  The driver, not the language kernel, allocates a resolver descriptor and any
+  answer position, sends op:deliver, waits for settlement, and releases CapTP
+  answer/import state."
+  [reference request]
+  (when-not (request-capable-reference? reference)
+    (throw (ex-info "OCapN reference cannot request a result"
+                    {:problem :ocapn/request-not-supported})))
+  (if-let [error (append-request-error request)]
+    (throw (ex-info "invalid OCapN incidence append" error))
+    {:ocapn/profile draft-profile
+     :ocapn/to (:remote/target (-reference-info reference))
+     :ocapn/args (append-args request)
+     :ocapn/result :settled}))
 
 (defn append-provider
   "Adapt a live OCapN reference to incidence-port's lexical append provider.
@@ -163,3 +245,39 @@
        :ocapn/message-id (:ocapn/message-id result)
        :ocapn/session-id (:session/id (-reference-info reference))
        :incidence/cid (get-in request [:entry :incidence/cid])})))
+
+(defn durable-append-provider
+  "Adapt a request-capable live reference to a remote durability-claiming
+  incidence provider.
+
+  Success requires a fulfilled CapTP result whose value is the exact
+  content-addressed receipt for the requested dataspace and incidence CID.
+  The claim is authenticated only to the extent of the injected live session;
+  it is not an independent proof of physical persistence."
+  [reference]
+  (when-not (request-capable-reference? reference)
+    (throw (ex-info "OCapN reference cannot request a result"
+                    {:problem :ocapn/request-not-supported})))
+  (fn append-over-ocapn-with-receipt! [request]
+    (let [call (request-call reference request)
+          settlement (-request! reference call)]
+      (cond
+        (and (map? settlement)
+             (= :broken (:ocapn/status settlement)))
+        (throw (ex-info "OCapN remote request broke"
+                        {:problem :ocapn/remote-broken}))
+
+        (not (and (map? settlement)
+                  (= #{:ocapn/status :ocapn/value} (set (keys settlement)))
+                  (= :fulfilled (:ocapn/status settlement))))
+        (throw (ex-info "invalid OCapN settlement"
+                        {:problem :ocapn/settlement-invalid}))
+
+        :else
+        (let [receipt (:ocapn/value settlement)]
+          (if-let [error (durable-receipt-error request receipt)]
+            (throw (ex-info "invalid OCapN durable receipt" error))
+            {:ocapn/remote-durable? true
+             :ocapn/session-id (:session/id (-reference-info reference))
+             :incidence/cid (get-in request [:entry :incidence/cid])
+             :receipt/cid (:incidence/cid receipt)}))))))

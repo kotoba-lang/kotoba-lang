@@ -11,6 +11,8 @@
             [multiformats.core :as mf]))
 
 (def payload-version 1)
+(def append-durable-version 1)
+(def append-durable-kind :dataspace/append-durable)
 
 (def required-fields
   #{:incidence/kind
@@ -85,6 +87,25 @@
                        (every? identity/cid? retracts)
                        (every? (:incidence/parents block) retracts))
           {:problem :dataspace/retracted}))
+
+      :dataspace/append-durable
+      (let [subjects (:receipt/subject roles)
+            subject (first subjects)
+            subject-cid (:ref/value subject)]
+        (when-not (and (= #{:receipt/subject} (set (keys roles)))
+                       (= 1 (count subjects))
+                       (= :cid (:ref/type subject))
+                       (= #{:receipt/version :receipt/status
+                            :receipt/dataspace}
+                          (set (keys facts)))
+                       (= append-durable-version (:receipt/version facts))
+                       (= :durable (:receipt/status facts))
+                       (string? (:receipt/dataspace facts))
+                       (boolean (re-find #"\S" (:receipt/dataspace facts)))
+                       (= #{subject-cid} (:incidence/parents block))
+                       (empty? (:incidence/evidence block))
+                       (empty? (:incidence/policies block)))
+          {:problem :dataspace/append-durable}))
 
       nil)))
 
@@ -247,6 +268,33 @@
    :incidence/parents parents
    :incidence/evidence evidence
    :incidence/policies policies})
+
+(defn append-durable-receipt
+  "Construct deterministic inert evidence that a provider claims durable
+  storage of ENTRY in DATASPACE. The resulting CID proves integrity and
+  binding of the claim, not physical persistence or authority."
+  [dataspace entry]
+  (let [verified (when (map? entry) (verify-addressed entry))]
+    (cond
+      (not (and (string? dataspace) (boolean (re-find #"\S" dataspace))))
+      (throw (ex-info "invalid durable receipt dataspace"
+                      {:problem :dataspace/resource-invalid}))
+
+      (not (:ok? verified))
+      (throw (ex-info "invalid durable receipt subject"
+                      {:problem :dataspace/emission-invalid
+                       :verification verified}))
+
+      :else
+      (let [subject (:cid verified)]
+        (addressed
+         (incidence
+          append-durable-kind
+          {:receipt/subject #{(typed-ref :cid subject)}}
+          {:parents #{subject}
+           :facts {:receipt/version append-durable-version
+                   :receipt/status :durable
+                   :receipt/dataspace dataspace}}))))))
 
 (defn assertion
   "Pure Syndicate-style assertion constructor: address an inert incidence

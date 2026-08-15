@@ -88,10 +88,27 @@ netlayer, session keys, bootstrap/sturdyref resolution, handoffs, promise
 pipelining, and distributed reference GC. Kotoba does not claim to implement
 those protocol layers in this adapter.
 
-An accepted send means only that the local authenticated session driver
+An accepted one-way send means only that the local authenticated session driver
 accepted the frame. It is not evidence that the remote peer durably stored the
-incidence. A future request/ack protocol can add that stronger receipt without
-changing the lexical publication boundary.
+incidence.
+
+For callers that require a remote durability claim, a second adapter requires a
+distinct live `request!` authority. It passes the same target and arguments to
+the authenticated session driver and requests a settled result. The driver
+owns the concrete `resolve-me-desc`, optional answer position, promise
+settlement, and answer/import garbage collection required by CapTP.
+
+The fulfilled value is accepted only when it is the exact deterministic
+content-addressed `:dataspace/append-durable` incidence for the requested
+dataspace and incidence CID. The appended CID is both its parent and typed
+subject. A receipt for another dataspace or CID, a substituted block, a broken
+promise, or a malformed settlement fails closed and produces an error attempt
+receipt at the existing host guard.
+
+This receipt is an authenticated remote durability *claim* because it arrived
+through the injected authenticated session. Its CID proves the integrity and
+binding of the claim; it does not independently prove physical persistence or
+make the receipt data into authority.
 
 OCapN remains a changing draft. This adapter pins its interpreted profile as
 ocapn-captp-1.0-draft-2026-08-15 rather than claiming timeless wire
