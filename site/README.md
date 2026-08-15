@@ -14,44 +14,35 @@ at build time from:
 
 ```
 lang/safety-claims.edn          lang/wasm-component-platform.edn
-lang/surface-status.edn         lang/code-identity.edn
-lang/capability-semantics.edn   lang/safety-qualification.edn
-lang/elaboration-pipeline.edn
-lang/docs-release.edn           lang/diagnostics.edn
-lang/cli.edn                    lang/conformance/stdlib/manifest.edn
-docs/user-validation.edn        docs/search-index.edn
+lang/surface-status.edn         lang/elaboration-pipeline.edn
+lang/docs-release.edn           docs/search-index.edn
 ```
 
 Change the spec and the page changes with it. The page cannot drift into
 claiming more than the spec claims, which is the property a safety-oriented
 language's marketing page most needs to have.
 
-The page also exposes the four checked documentation routes—learn, use,
-implement, and evaluate—from `docs/authority-map.edn`. The prose documents are
-linked rather than copied into the landing page. Run `nbb scripts/check-docs.cljs`
-before regenerating so moved authorities and broken reader paths fail closed.
-Run `nbb scripts/generate-docs-reference.cljs --check` first so the embedded
-search corpus and generated Markdown cannot lag those authorities.
+The market-timing cards cite primary public sources (Stack Overflow and
+Anthropic). They are explicitly labelled as market evidence, not language
+qualification evidence. Product and safety claims remain derived from the
+repository authorities above. The page also retains the generated local
+documentation search: its 47-entry index is embedded at build time, and no
+query leaves the browser.
 
 ## Regenerate
 
-Run from the **repository root**, with the design-system repos checked out as
-west siblings (`orgs/kotoba-lang/*`):
+Run from the **repository root**, with `jp-go-digital-design-system`, `css`, and
+`html` checked out as west siblings (`orgs/kotoba-lang/*`):
 
 ```sh
-nbb --classpath "../shitsuke/src:../css/src:../html/src:../liquid-glass-ui/src:../kotoba-ui/src:../byoubu/src:../byoubu-ui/src:../kotoba-kir/src:../kotoba-hir/src" \
-    site/generate.cljs
+JP_GO_DDS_ROOT=../jp-go-digital-design-system \
+nbb --classpath "../jp-go-digital-design-system/src:../css/src:../html/src" site/generate.cljs
 ```
 
-`kotoba-kir` and `kotoba-hir` are on that classpath because shitsuke moved its
-raw-text safety check into a compiled `.kotoba` decision core, so
-`shitsuke.hiccup` now loads `kotoba.kir`, which loads `kotoba.hir`. They are
-required to *load* the design system, not merely to call it. The generator also
-registers the shipped KIR itself — on ClojureScript there is no classpath to
-read the artifact from, and `->html` refuses rather than silently skipping the
-check on the `[:script ...]` and `[:style ...]` this page emits. It reads that
-artifact from `../shitsuke/resources` by default; set `SHITSUKE_RESOURCES` for a
-checkout that is not laid out as a west sibling.
+The generator reads the vendored DADS stylesheet from
+`JP_GO_DDS_ROOT/resources/jp_go_dds/dds.css` and inlines it. The resulting page
+has no external font, script, analytics, or design-system request at runtime;
+the small documentation-filter script is inline.
 
 Output: `site/dist/index.html` (committed, so a clean checkout can deploy
 without running the generator).
@@ -86,6 +77,6 @@ npx wrangler deploy
 Static assets only — `wrangler.jsonc` declares no Worker script. The zone is in
 the `ai-gftd-cloud` Cloudflare account, served on the apex and `www`.
 
-The page is built with the kotoba-lang design system (`kotoba-ui.core` only:
-HIG tokens, liquid-glass material, shell layout). The single theme map at the
-top of `generate.cljs` is the only place a color literal is allowed.
+The page is built with `jp-go-dds` (the Digital Agency Design System mirror).
+Application CSS uses the shared `--hig-*` token contract through
+`jp-go-dds.tokens/skin-css`; it does not define a separate palette.
