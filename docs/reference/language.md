@@ -48,6 +48,29 @@ name is not authority. The host must receive a scoped capability value, narrow
 it through grant and policy intersection, and leave an auditable receipt. See
 [capability values](../lang/capability-values.md).
 
+## Dataspace coordination
+
+Kotoba admits Syndicate-shaped coordination forms over the typed
+`:dataspace/transact` capability:
+
+```clojure
+(ns room.sensor
+  (:capabilities #{:dataspace/transact}))
+
+(defn publish [facet :i64]
+  (assert! "[:temperature :room/a 21]" facet))
+
+(defn subscribe [facet :i64]
+  (observe! "[:temperature :room/a ?t]" facet))
+```
+
+`assert!`, `retract!`, and `observe!` default to facet `0` when the facet
+argument is omitted. `facet-enter!` returns a host-owned facet identifier;
+`facet-leave!` retracts that facet's assertions and observations. These forms
+desugar before HIR to the closed typed capability request, so inferred effects,
+KIR, and backends do not gain a bypass. Assertion and pattern strings are inert
+EDN data; possessing or copying them never grants dataspace authority.
+
 ## Deliberately absent
 
 The safe component surface excludes ambient code loading, host interop,
