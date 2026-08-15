@@ -292,6 +292,63 @@
     (is (= :captp/syrup-noncanonical (:problem (ex-data thrown))))
     (is (= :aborted (:captp/phase (captp/runtime-description runtime))))))
 
+(deftest deferred-answers-pipeline-derive-listen-and-settle
+  (let [{:keys [runtime written]} (open-runtime)
+        factory (captp/deferred-request!
+                 runtime
+                 {:ocapn/to {:ocapn/descriptor :desc/export
+                             :ocapn/position 5}
+                  :ocapn/args ['make-car-factory]})
+        car (captp/pipeline-request! factory ['make-car])
+        field (captp/get-answer! car "engine")
+        indexed (captp/index-answer! field 0)
+        untagged (captp/untag-answer! indexed "horsepower")]
+    (is (every? captp/deferred-answer? [factory car field indexed untagged]))
+    (is (= ['op:start-session 'op:deliver 'op:deliver 'op:get 'op:index
+            'op:untag]
+           (mapv :syrup/record @written)))
+    (is (= (captp/descriptor 'desc:answer 1)
+           (first (:syrup/fields (nth @written 2)))))
+    (is (= :captp/answer-unresolved
+           (:problem (ex-data
+                      (try (captp/settlement! car)
+                           (catch clojure.lang.ExceptionInfo e e))))))
+    (captp/listen! car)
+    (let [listen (last @written)
+          [_ listener] (:syrup/fields listen)
+          [resolver] (:syrup/fields listener)]
+      (is (= 'op:listen (:syrup/record listen)))
+      (captp/receive!
+       runtime
+       (captp/syrup-encode
+        (captp/syrup-record
+         'op:deliver
+         [(captp/descriptor 'desc:export resolver)
+          ['fulfill "car-ready"] false false])))
+      (is (= {:ocapn/status :fulfilled :ocapn/value "car-ready"}
+             (captp/settlement! car)))
+      (is (= 'op:gc-answers (:syrup/record (last @written)))))))
+
+(deftest deferred-answer-listener-and-shape-violations-fail-closed
+  (let [{:keys [runtime]} (open-runtime)
+        pending (captp/deferred-request!
+                 runtime {:ocapn/to {:ocapn/descriptor :desc/export
+                                     :ocapn/position 1}
+                          :ocapn/args ['query]})]
+    (captp/listen! pending)
+    (is (= :captp/listener-already-attached
+           (:problem (ex-data
+                      (try (captp/listen! pending)
+                           (catch clojure.lang.ExceptionInfo e e))))))
+    (is (= :captp/index-invalid
+           (:problem (ex-data
+                      (try (captp/index-answer! pending -1)
+                           (catch clojure.lang.ExceptionInfo e e))))))
+    (is (= :captp/deferred-request-invalid
+           (:problem (ex-data
+                      (try (captp/deferred-request! runtime {:ocapn/args []})
+                           (catch clojure.lang.ExceptionInfo e e))))))))
+
 (deftest locators-remain-inert-until-a-live-resolver-admits-a-target
   (let [locator (captp/parse-locator
                  "ocapn://alice.example.tcp/s/calendar?port=443&host=a")
