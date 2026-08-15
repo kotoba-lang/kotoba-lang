@@ -27,6 +27,21 @@ actor-first or object-first:
   observed-remove-set projection under concurrent histories;
 - current state is a verified projection of an immutable incidence DAG.
 
+A DID can be one constituent of that root, but it is not substituted for the
+constitution CID. An injected verifier resolves the DID and verifies its proof
+material, revocation/current-method policy, and trust policy. Kotoba then
+independently checks that the result names the exact constitution CID and kind,
+that the DID is a constituent, and that the admitted verification method is an
+`assertionMethod` of that DID. Success mints an opaque organization binding
+containing the authorized authenticated-session peers. A DID document, VC,
+boolean, or caller-built binding map remains inert data.
+
+This follows the W3C distinction between an identifier, a verification method,
+and a purpose-specific verification relationship. DID Core assigns
+`authentication` to challenge-response authentication and `assertionMethod` to
+claims expressed by a DID subject; resolving a DID alone therefore does not
+authorize an append or prove an organization constitution.
+
 An addressed incidence is an assertion. A `:dataspace/retracted` incidence
 names exact assertion CIDs and acts as an append-only tombstone. Observation is
 an inert EDN selector over the verified active projection.
@@ -122,6 +137,32 @@ through the injected authenticated session. Its CID proves the integrity and
 binding of the claim; it does not independently prove physical persistence or
 make the receipt data into authority.
 
+The stronger `signed-readback-append-provider` adds an organization-bound,
+fresh readback mode. Before delivery it obtains a one-shot challenge from an
+injected capability and binds that challenge to the exact dataspace and
+incidence CID. The remote response contains a content-addressed
+`:dataspace/signed-readback` statement plus an adapter-specific proof. The
+statement binds:
+
+- the appended and read-back incidence CID (which must be identical);
+- the dataspace and organization constitution CID;
+- the issuer DID and its admitted `assertionMethod`;
+- the authenticated session peer and transcript CID;
+- the one-shot challenge, issue time, and expiry.
+
+The lexical verifier consumes the challenge before parsing or cryptographic
+verification, enforces its maximum-age policy with an injected clock, and asks
+an injected signature verifier to verify the statement's canonical DAG-CBOR
+bytes. Only then does it mint an opaque verified-readback value. A replay,
+expired statement, substituted CID, mismatched constitution/peer/session,
+wrong proof purpose, invalid signature, or serialized lookalike fails closed.
+Transport failure and remote break also discard the pending challenge.
+
+This proves a fresh, organization-signed claim that the exact CID was read
+back. It still does not independently demonstrate the physical medium,
+replication factor, retention period, or Byzantine quorum; those belong to the
+next distributed dataspace layer.
+
 OCapN remains a changing draft. This adapter pins its interpreted profile as
 ocapn-captp-1.0-draft-2026-08-15 rather than claiming timeless wire
 compatibility.
@@ -130,6 +171,12 @@ Draft sources used by this profile are the OCapN
 [CapTP specification](https://github.com/ocapn/ocapn/blob/main/draft-specifications/CapTP%20Specification.md)
 and [locator specification](https://github.com/ocapn/ocapn/blob/main/draft-specifications/Locators.md),
 plus the canonical [Syrup draft](https://github.com/ocapn/syrup/blob/master/draft-specification.md).
+
+Identity terminology follows W3C [DID Core](https://www.w3.org/TR/did-core/)
+and [Verifiable Credentials Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/).
+Kotoba does not require a VC wrapper for its native readback statement; a VC is
+an external adapter form whose issuer/subject/proof must resolve to the same
+admitted binding and statement CID.
 
 Locator parsing is inert. A sturdyref becomes a session-bound target only when
 a live host resolver capability returns both an opaque authenticated session
