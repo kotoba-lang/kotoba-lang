@@ -24,6 +24,9 @@
                    :ocapn/position 7}
    :send! send!})
 
+(defn request-connection [request!]
+  (assoc (connection identity) :request! request!))
+
 (defn publish-opts [append! record!]
   {:dataspace dataspace
    :emissions [(incidence/assertion presence)]
@@ -93,6 +96,8 @@
                                    :ocapn/position 1})]
            [:ocapn/send-port-invalid
             (assoc (connection identity) :send! :serialized-function)]
+           [:ocapn/request-port-invalid
+            (assoc (connection identity) :request! :serialized-function)]
            [:ocapn/connection-fields
             (assoc (connection identity) :sturdyref "ocapn://example")]]]
     (is (= expected
@@ -107,6 +112,7 @@
     (is (= ocapn/draft-profile (:ocapn/profile description)))
     (is (= "captp-session-a" (:session/id description)))
     (is (not (contains? description :send!)))
+    (is (not (contains? description :request!)))
     (is (nil? (ocapn/reference-description {:pretend :reference})))))
 
 (deftest bootstrap-export-zero-is-a-valid-live-target
@@ -151,3 +157,106 @@
     (is (= 1 (count (entries))))
     (is (= :error (:receipt/outcome (first (entries)))))
     (is (true? (:ok? (capabilities/validate-receipt (first (entries))))))))
+
+(deftest durable-receipt-is-deterministic-and-bound-to-the-incidence
+  (let [entry (incidence/assertion presence)
+        receipt-a (ocapn/durable-receipt dataspace entry)
+        receipt-b (ocapn/durable-receipt dataspace entry)
+        block (:incidence/block receipt-a)]
+    (is (= receipt-a receipt-b))
+    (is (:ok? (incidence/verify-addressed receipt-a)))
+    (is (= ocapn/durable-receipt-kind (:incidence/kind block)))
+    (is (= #{(:incidence/cid entry)} (:incidence/parents block)))
+    (is (= #{(incidence/typed-ref :cid (:incidence/cid entry))}
+           (get-in block [:incidence/roles :receipt/subject])))
+    (is (= {:receipt/version ocapn/durable-receipt-version
+            :receipt/status :durable
+            :receipt/dataspace dataspace}
+           (:incidence/facts block)))))
+
+(deftest durable-receipt-shape-is-part-of-incidence-semantics
+  (let [entry (incidence/assertion presence)
+        valid-block (:incidence/block
+                     (incidence/append-durable-receipt dataspace entry))
+        invalid-block (assoc-in valid-block
+                                [:incidence/facts :receipt/status]
+                                :queued)
+        thrown (try
+                 (incidence/incidence-cid invalid-block)
+                 nil
+                 (catch clojure.lang.ExceptionInfo e e))]
+    (is (= :dataspace/append-durable (:problem (ex-data thrown))))))
+
+(deftest request-capable-reference-returns-a-bound-durable-receipt
+  (let [calls (atom [])
+        entry (incidence/assertion presence)
+        remote-receipt (ocapn/durable-receipt dataspace entry)
+        reference (ocapn/connected-reference
+                   (request-connection
+                    (fn [call]
+                      (swap! calls conj call)
+                      {:ocapn/status :fulfilled
+                       :ocapn/value remote-receipt})))
+        {:keys [record! entries]} (host/journal)
+        result (port/publish-emissions!
+                (publish-opts (ocapn/durable-append-provider reference)
+                              record!))
+        call (first @calls)]
+    (is (ocapn/request-capable-reference? reference))
+    (is (:ok? result))
+    (is (= 1 (count @calls)))
+    (is (= :settled (:ocapn/result call)))
+    (is (= {:ocapn/descriptor :desc/export :ocapn/position 7}
+           (:ocapn/to call)))
+    (is (= 'append-incidence (first (:ocapn/args call))))
+    (is (= (:incidence/cid entry) (nth (:ocapn/args call) 2)))
+    (is (true? (get-in result [:results 0 :ocapn/remote-durable?])))
+    (is (= (:incidence/cid remote-receipt)
+           (get-in result [:results 0 :receipt/cid])))
+    (is (= :ok (:receipt/outcome (first (entries)))))))
+
+(deftest one-way-reference-cannot-claim-remote-durability
+  (let [reference (ocapn/connected-reference (connection identity))
+        thrown (try
+                 (ocapn/durable-append-provider reference)
+                 nil
+                 (catch clojure.lang.ExceptionInfo e e))]
+    (is (false? (ocapn/request-capable-reference? reference)))
+    (is (= :ocapn/request-not-supported (:problem (ex-data thrown))))))
+
+(deftest mismatched-or-tampered-durable-receipt-is-rejected
+  (let [entry (incidence/assertion presence)
+        wrong-space (ocapn/durable-receipt "dataspace:rooms/b" entry)
+        tampered (assoc (ocapn/durable-receipt dataspace entry)
+                        :incidence/cid "bafytampered")]
+    (doseq [[expected receipt]
+            [[:ocapn/durable-receipt-mismatch wrong-space]
+             [:ocapn/durable-receipt-address-invalid tampered]]]
+      (let [reference (ocapn/connected-reference
+                       (request-connection
+                        (constantly {:ocapn/status :fulfilled
+                                     :ocapn/value receipt})))
+            {:keys [record! entries]} (host/journal)
+            thrown (try
+                     (port/publish-emissions!
+                      (publish-opts (ocapn/durable-append-provider reference)
+                                    record!))
+                     nil
+                     (catch clojure.lang.ExceptionInfo e e))]
+        (is (= expected (:problem (ex-data thrown))))
+        (is (= :error (:receipt/outcome (first (entries)))))))))
+
+(deftest broken-remote-settlement-does-not-leak-remote-debug-data
+  (let [reference (ocapn/connected-reference
+                   (request-connection
+                    (constantly {:ocapn/status :broken
+                                 :ocapn/reason "remote stack and secret"})))
+        {:keys [record!]} (host/journal)
+        thrown (try
+                 (port/publish-emissions!
+                  (publish-opts (ocapn/durable-append-provider reference)
+                                record!))
+                 nil
+                 (catch clojure.lang.ExceptionInfo e e))]
+    (is (= {:problem :ocapn/remote-broken} (ex-data thrown)))
+    (is (not (re-find #"secret" (str (ex-data thrown)))))))
