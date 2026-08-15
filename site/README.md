@@ -22,6 +22,11 @@ Change the spec and the page changes with it. The page cannot drift into
 claiming more than the spec claims, which is the property a safety-oriented
 language's marketing page most needs to have.
 
+The layout is mobile-first: narrow screens are the base CSS, while wider header
+and action layouts are added with `min-width` queries. Public navigation points
+to the language docs, the normative protocol and spec repositories, Kotobase,
+Murakumo, and the distinct language-authority and implementation repositories.
+
 The market-timing cards cite primary public sources (Stack Overflow and
 Anthropic). They are explicitly labelled as market evidence, not language
 qualification evidence. Product and safety claims remain derived from the

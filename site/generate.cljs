@@ -59,19 +59,19 @@
    "transform:translateY(-150%);padding:var(--hig-spacing-2) var(--hig-spacing-3);"
    "background:var(--hig-color-system-background);color:var(--hig-color-label);z-index:3}"
    ".kot-skip:focus{transform:translateY(var(--hig-spacing-2))}"
-   ".kot-header{position:sticky;top:0;z-index:2;background:var(--hig-color-system-background);"
+   ".kot-header{position:relative;z-index:2;background:var(--hig-color-system-background);"
    "border-bottom:var(--hig-hairline) solid var(--hig-color-separator)}"
-   ".kot-header__inner{display:flex;align-items:center;justify-content:space-between;"
+   ".kot-header__inner{display:flex;align-items:flex-start;flex-direction:column;"
    "gap:var(--hig-spacing-3);padding-block:var(--hig-spacing-3)}"
    ".kot-wordmark{color:var(--hig-color-label);font-weight:700;text-decoration:none}"
-   ".kot-nav{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;"
-   "gap:var(--hig-spacing-2)}"
-   ".kot-hero{padding-block:var(--hig-spacing-10) var(--hig-spacing-9)}"
+   ".kot-nav{display:flex;align-items:center;justify-content:flex-start;flex-wrap:wrap;"
+   "gap:var(--hig-spacing-2);width:100%}"
+   ".kot-hero{padding-block:var(--hig-spacing-8)}"
    ".kot-eyebrow{margin:0 0 var(--hig-spacing-3);color:var(--hig-color-tint);"
    "font-weight:700;letter-spacing:.06em;text-transform:uppercase}"
    ".kot-hero h1{max-width:18ch;margin:0 0 var(--hig-spacing-4)}"
    ".kot-lead{max-width:48rem;margin:0;color:var(--hig-color-secondary-label)}"
-   ".kot-actions{display:flex;flex-wrap:wrap;gap:var(--hig-spacing-3);"
+   ".kot-actions{display:grid;grid-template-columns:minmax(0,1fr);gap:var(--hig-spacing-3);"
    "margin-top:var(--hig-spacing-6)}"
    ".kot-proof{margin-top:var(--hig-spacing-8)}"
    ".kot-card-title{margin-top:0}"
@@ -92,10 +92,18 @@
    ".kot-list li+li{margin-top:var(--hig-spacing-2)}"
    ".kot-quote{margin:var(--hig-spacing-5) 0 0;padding-inline-start:var(--hig-spacing-4);"
    "border-inline-start:var(--hig-hairline) solid var(--hig-color-tint)}"
+   ".kot-table-scroll{max-width:100%;overflow-x:auto}"
    ".kot-footer{padding-block:var(--hig-spacing-7);"
    "border-top:var(--hig-hairline) solid var(--hig-color-separator)}"
-   "@media(max-width:48rem){.kot-header__inner{align-items:flex-start;flex-direction:column}"
-   ".kot-nav{justify-content:flex-start}.kot-hero{padding-block:var(--hig-spacing-8)}}"))
+   "@media(min-width:36rem){.kot-actions{display:flex;flex-wrap:wrap}}"
+   "@media(min-width:48rem){.kot-header{position:sticky;top:0}"
+   ".kot-header__inner{align-items:center;flex-direction:row;justify-content:space-between}"
+   ".kot-nav{justify-content:flex-end;width:auto}.kot-hero{padding-block:var(--hig-spacing-10) var(--hig-spacing-9)}}"))
+
+(def primary-links
+  [{:label "Docs" :href "https://github.com/kotoba-lang/kotoba-lang/tree/main/docs"}
+   {:label "Protocol" :href "https://github.com/kotoba-lang/kotoba-protocol"}
+   {:label "Spec" :href "https://github.com/kotoba-lang/spec"}])
 
 (def market-signals
   [{:metric "46% vs 33%"
@@ -120,8 +128,8 @@
     [:div {:class "kot-header__inner"}
      [:a {:class "kot-wordmark" :href "#top"} "Kotoba"]
      [:nav {:class "kot-nav" :aria-label "Primary"}
-      (dds/button "Why Kotoba" {:type :text :size "sm" :href "#why"})
-      (dds/button "How it works" {:type :text :size "sm" :href "#how"})
+      (for [{:keys [label href]} primary-links]
+        (dds/button label {:type :text :size "sm" :href href}))
       (dds/button "GitHub" {:type :outline :size "sm"
                              :href "https://github.com/kotoba-lang/kotoba-lang"})]])])
 
@@ -129,7 +137,7 @@
   [:section {:id "top" :class "kot-hero"}
    (dds/container
     [:p {:class "kot-eyebrow"} "The language for AI agents and vibe coding"]
-    (dds/heading 1 "Let AI write the code. Never hand it the keys." {:size "64"})
+    (dds/heading 1 "Let AI write the code. Never hand it the keys." {:size "48"})
     [:p {:class "kot-lead"}
      "Kotoba is an AI-native, capability-safe language. Generated programs can touch only explicitly granted resources—even when a Mythos-class agent is looking for a way out."]
     [:div {:class "kot-actions"}
@@ -147,6 +155,50 @@
       (card (dds/chip-label "PORTABLE + NATIVE")
             (dds/heading 3 "One checked IR" {:size "20"})
             [:p "WebAssembly Components first; sealed, bounded native AOT when selected."]))])])
+
+(def stack-links
+  [{:name "Documentation"
+    :role "Learn the language, use the toolchain, implement a backend, or inspect maturity evidence."
+    :href "https://github.com/kotoba-lang/kotoba-lang/tree/main/docs"
+    :cta "Open docs"}
+   {:name "Protocol"
+    :role "Normative layer, vocabulary, datom, IPLD, IPNS, IPFS, and application-model contracts."
+    :href "https://github.com/kotoba-lang/kotoba-protocol"
+    :cta "Open protocol"}
+   {:name "Spec"
+    :role "The data layer of the foundational standard library: small, reusable data specifications."
+    :href "https://github.com/kotoba-lang/spec"
+    :cta "Open spec"}
+   {:name "Kotobase"
+    :role "Persistent Datalog and content-addressed database for durable application state."
+    :href "https://github.com/kotoba-lang/kotobase"
+    :cta "Open Kotobase"}
+   {:name "Murakumo"
+    :role "Hosting, placement, deployment, and fleet control plane for the Kotoba component mesh."
+    :href "https://github.com/kotoba-lang/murakumo"
+    :cta "Open Murakumo"}])
+
+(defn stack-section []
+  (dds/section
+   {:id "explore" :title "From language contract to running system"}
+   [:p {:class "kot-lead"}
+    "The language authority, implementation, data plane, and fleet are separate on purpose. Open the layer you need without guessing which repository owns it."]
+   (dds/grid
+    {:min "17rem"}
+    (card (dds/chip-label "LANGUAGE AUTHORITY")
+          (dds/heading 3 "kotoba-lang/kotoba-lang" {:size "20"})
+          [:p "Normative language specification, grammar, machine-readable contracts, public CLI contract, and conformance."]
+          (external-link "https://github.com/kotoba-lang/kotoba-lang" "Open language authority"))
+    (card (dds/chip-label "IMPLEMENTATION")
+          (dds/heading 3 "kotoba-lang/kotoba" {:size "20"})
+          [:p "Installable CLI, runtime and host implementations, providers, integration tests, and qualification evidence that consume the language authority."]
+          (external-link "https://github.com/kotoba-lang/kotoba" "Open implementation")))
+   (dds/grid
+    {:min "16rem"}
+    (for [{:keys [name role href cta]} stack-links]
+      (card (dds/heading 3 name {:size "20"})
+            [:p role]
+            (external-link href cta))))))
 
 (defn why-section []
   (apply dds/section
@@ -227,14 +279,15 @@
   (let [invariants (:invariants surface-status)]
     (dds/section
      {:title "What AI-written Kotoba cannot ask for"}
-     (dds/table
-      {:caption "Deliberately absent language surface"
-       :headers ["Boundary" "Why it is absent"]
-       :row-header? true
-       :rows (for [k [:no-ambient-authority :no-interop :no-ambient-mutation
-                      :no-unbounded-concurrency :no-guest-macros :explicit-errors]
-                   :let [{:keys [surface reason]} (get invariants k)]]
-               [(str/join ", " (sort (map name surface))) reason])})
+     [:div {:class "kot-table-scroll"}
+      (dds/table
+       {:caption "Deliberately absent language surface"
+        :headers ["Boundary" "Why it is absent"]
+        :row-header? true
+        :rows (for [k [:no-ambient-authority :no-interop :no-ambient-mutation
+                       :no-unbounded-concurrency :no-guest-macros :explicit-errors]
+                    :let [{:keys [surface reason]} (get invariants k)]]
+                [(str/join ", " (sort (map name surface))) reason])})]
      (caption "These are named security constraints in lang/surface-status.edn, not features missing from a roadmap."))))
 
 (defn release-section []
@@ -308,6 +361,10 @@
     :href "https://github.com/kotoba-lang/kototama"}
    {:name "kotoba-lang/kotoba-core-contracts" :role "Package admission and runtime-boundary contracts"
     :href "https://github.com/kotoba-lang/kotoba-core-contracts"}
+   {:name "kotoba-lang/kotobase" :role "Persistent Datalog and content-addressed application state"
+    :href "https://github.com/kotoba-lang/kotobase"}
+   {:name "kotoba-lang/murakumo" :role "Hosting, placement, deployment, and fleet control plane"
+    :href "https://github.com/kotoba-lang/murakumo"}
    {:name "kotoba-lang" :role "All repositories in the language ecosystem"
     :href "https://github.com/kotoba-lang"}])
 
@@ -345,6 +402,7 @@
    [:main {:id "main"}
     (hero)
     (dds/container
+     (stack-section)
      (why-section)
      (how-section)
      (start-section)
