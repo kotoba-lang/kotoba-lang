@@ -84,20 +84,31 @@ For each append it creates the current draft CapTP 1.0 abstract delivery:
       answer-position=false
       resolve-me=false
 
-The injected session driver owns Syrup encoding, the reliable in-order
-netlayer, session keys, bootstrap/sturdyref resolution, handoffs, promise
-pipelining, and distributed reference GC. Kotoba does not claim to implement
-those protocol layers in this adapter.
+The bounded Kotoba CapTP runtime now owns canonical Syrup encoding/decoding for
+the passable values used here, `op:start-session` admission, the
+`starting -> active -> aborted` lifecycle, one active session per peer,
+one-way client `op:deliver`, answer/resolver allocation and settlement,
+outbound `op:gc-answers`, wire-counted import/export `op:gc-exports`, and
+`op:abort`. Malformed or
+non-canonical inbound frames abort the session. Netlayer exceptions are reduced
+to stable diagnostics rather than exposing remote or host debugging data.
+
+The reliable in-order encrypted channel, ephemeral session-key generation, and
+cryptographic verification of `op:start-session` remain injected host
+capabilities. `op:listen`, promise pipelining, `op:get`, tagging, and third-party
+handoffs are not claimed by this bounded profile.
 
 An accepted one-way send means only that the local authenticated session driver
 accepted the frame. It is not evidence that the remote peer durably stored the
 incidence.
 
 For callers that require a remote durability claim, a second adapter requires a
-distinct live `request!` authority. It passes the same target and arguments to
-the authenticated session driver and requests a settled result. The driver
-owns the concrete `resolve-me-desc`, optional answer position, promise
-settlement, and answer/import garbage collection required by CapTP.
+distinct request-capable runtime. It passes the same target and arguments to
+the authenticated session and requests a settled result. The runtime allocates
+the concrete `resolve-me-desc` and answer position, accepts only a single
+`fulfill` or `break`, releases the answer, and retains exported resolvers until
+the peer's wire-count GC releases them. A remote `break` becomes only the
+stable `:broken` status; its error payload is not exposed across the boundary.
 
 The fulfilled value is accepted only when it is the exact deterministic
 content-addressed `:dataspace/append-durable` incidence for the requested
@@ -117,7 +128,13 @@ compatibility.
 
 Draft sources used by this profile are the OCapN
 [CapTP specification](https://github.com/ocapn/ocapn/blob/main/draft-specifications/CapTP%20Specification.md)
-and [locator specification](https://github.com/ocapn/ocapn/blob/main/draft-specifications/Locators.md).
+and [locator specification](https://github.com/ocapn/ocapn/blob/main/draft-specifications/Locators.md),
+plus the canonical [Syrup draft](https://github.com/ocapn/syrup/blob/master/draft-specification.md).
+
+Locator parsing is inert. A sturdyref becomes a session-bound target only when
+a live host resolver capability returns both an opaque authenticated session
+and a valid remote export descriptor. Possessing the URI alone remains
+insufficient to mint authority.
 
 Human names and discovery aliases may change without changing an already
 published incidence. A new semantic fact produces a new block and CID.
