@@ -320,6 +320,121 @@
                              roles))))
              (:active-blocks projection))})))
 
+(def facet-fields
+  "Closed shape for the pure facet lifecycle state. A facet value is inert
+  state, not a publishing capability."
+  #{:facet/status :facet/owner :facet/assertions :facet/withdrawal})
+
+(defn facet-error
+  "Return a fail-closed facet-state diagnostic, or nil. Runtime code may keep
+  this value in a lexical binding, but possessing or reconstructing the EDN
+  map does not grant authority to publish its emissions."
+  [facet]
+  (or
+   (when-not (map? facet)
+     {:problem :facet/not-a-map})
+   (when (map? facet)
+     (let [actual (set (keys facet))]
+       (when (not= facet-fields actual)
+         {:problem :facet/fields
+          :missing (set/difference facet-fields actual)
+          :unknown (set/difference actual facet-fields)})))
+   (when-not (contains? #{:open :stopped} (:facet/status facet))
+     {:problem :facet/status})
+   (when-not (ref? (:facet/owner facet))
+     {:problem :facet/owner})
+   (let [assertions (:facet/assertions facet)]
+     (when-not (and (map? assertions)
+                    (every? (fn [[cid entry]]
+                              (and (identity/cid? cid)
+                                   (= cid (:incidence/cid entry))
+                                   (:ok? (verify-addressed entry))
+                                   (not= :dataspace/retracted
+                                         (get-in entry [:incidence/block
+                                                        :incidence/kind]))))
+                            assertions))
+       {:problem :facet/assertions}))
+   (let [withdrawal (:facet/withdrawal facet)]
+     (case (:facet/status facet)
+       :open (when-not (nil? withdrawal)
+               {:problem :facet/open-with-withdrawal})
+       :stopped
+       (when-not
+        (or (and (empty? (:facet/assertions facet)) (nil? withdrawal))
+            (and (map? withdrawal)
+                 (:ok? (verify-addressed withdrawal))
+                 (= :dataspace/retracted
+                    (get-in withdrawal [:incidence/block :incidence/kind]))
+                 (= #{(:facet/owner facet)}
+                    (get-in withdrawal [:incidence/block :incidence/roles
+                                        :dataspace/retractor]))
+                 (= (set (keys (:facet/assertions facet)))
+                    (get-in withdrawal [:incidence/block :incidence/facts
+                                        :dataspace/retracts]))))
+        {:problem :facet/withdrawal})
+       nil))))
+
+(defn facet
+  "Open an inert Syndicate-style facet owned by OWNER. OWNER identifies the
+  retractor in durable history; it is not itself a publishing capability."
+  [owner]
+  (let [state {:facet/status :open
+               :facet/owner owner
+               :facet/assertions {}
+               :facet/withdrawal nil}]
+    (if-let [error (facet-error state)]
+      (throw (ex-info "invalid facet owner" error))
+      state)))
+
+(defn facet-assert
+  "Purely plan assertion of BLOCK from an open facet.
+
+  Returns `{:ok? true :facet next-state :emit [addressed-incidence]}`. An
+  assertion already owned by the facet is idempotent and emits nothing.
+  Publishing the returned entry remains a capability-guarded runtime effect."
+  [state block]
+  (if-let [error (facet-error state)]
+    {:ok? false :reason :facet/state-invalid :error error}
+    (cond
+      (not= :open (:facet/status state))
+      {:ok? false :reason :facet/stopped}
+
+      (= :dataspace/retracted (:incidence/kind block))
+      {:ok? false :reason :facet/retraction-not-owned}
+
+      :else
+      (try
+        (let [entry (assertion block)
+              cid (:incidence/cid entry)]
+          (if (contains? (:facet/assertions state) cid)
+            {:ok? true :facet state :emit []}
+            {:ok? true
+             :facet (assoc-in state [:facet/assertions cid] entry)
+             :emit [entry]}))
+        (catch #?(:clj Exception :cljs :default) e
+          {:ok? false :reason :facet/assertion-invalid :error (ex-data e)})))))
+
+(defn facet-stop
+  "Stop a facet and deterministically plan withdrawal of every assertion it
+  owns. The first stop emits one append-only retraction (or nothing for an
+  empty facet); repeated stop is idempotent and emits nothing."
+  ([state] (facet-stop state {}))
+  ([state opts]
+   (if-let [error (facet-error state)]
+     {:ok? false :reason :facet/state-invalid :error error}
+     (if (= :stopped (:facet/status state))
+       {:ok? true :facet state :emit []}
+       (let [targets (set (keys (:facet/assertions state)))
+             withdrawal (when (seq targets)
+                          (assertion
+                           (retract (:facet/owner state) targets opts)))
+             stopped (assoc state
+                            :facet/status :stopped
+                            :facet/withdrawal withdrawal)]
+         {:ok? true
+          :facet stopped
+          :emit (cond-> [] withdrawal (conj withdrawal))})))))
+
 (defn constitute
   "Constitute a person, agent, organization, or system through the same root
   relation. The returned block's CID is the organization's internal identity."
