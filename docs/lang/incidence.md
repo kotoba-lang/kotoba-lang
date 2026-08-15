@@ -69,6 +69,38 @@ The provider may append to Holochain, a local content-addressed DAG, or an
 OCapN remote object. Those are adapters behind the same port, not alternate
 language authority models.
 
+### OCapN adapter
+
+The OCapN adapter accepts only an opaque live reference created by a trusted
+runtime after CapTP session authentication. A locator URI, sturdyref record, or
+other EDN value cannot be converted into a live reference by the language
+kernel.
+
+For each append it creates the current draft CapTP 1.0 abstract delivery:
+
+    op:deliver remote-export
+      [append-incidence dataspace incidence-cid canonical-dag-cbor-bytes]
+      answer-position=false
+      resolve-me=false
+
+The injected session driver owns Syrup encoding, the reliable in-order
+netlayer, session keys, bootstrap/sturdyref resolution, handoffs, promise
+pipelining, and distributed reference GC. Kotoba does not claim to implement
+those protocol layers in this adapter.
+
+An accepted send means only that the local authenticated session driver
+accepted the frame. It is not evidence that the remote peer durably stored the
+incidence. A future request/ack protocol can add that stronger receipt without
+changing the lexical publication boundary.
+
+OCapN remains a changing draft. This adapter pins its interpreted profile as
+ocapn-captp-1.0-draft-2026-08-15 rather than claiming timeless wire
+compatibility.
+
+Draft sources used by this profile are the OCapN
+[CapTP specification](https://github.com/ocapn/ocapn/blob/main/draft-specifications/CapTP%20Specification.md)
+and [locator specification](https://github.com/ocapn/ocapn/blob/main/draft-specifications/Locators.md).
+
 Human names and discovery aliases may change without changing an already
 published incidence. A new semantic fact produces a new block and CID.
 
