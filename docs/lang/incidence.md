@@ -50,6 +50,25 @@ publish authority. Callbacks, transport, and publication remain runtime
 concerns; the pure language layer does not pretend that constructing a map has
 performed an effect.
 
+## Capability-guarded publication
+
+The incidence port is the narrow boundary between pure facet emissions and a
+host dataspace. Its append provider is injected through lexical scope; EDN
+cannot name or reconstruct that function.
+
+Before the provider is called, the port:
+
+1. verifies every addressed incidence and rejects duplicate CIDs;
+2. requires an exact dataspace resource, never a wildcard request;
+3. checks the caller's :host/ledger-append effect declaration;
+4. intersects verified delegation with local policy;
+5. passes only the concrete post-intersection capability to the provider;
+6. records a receipt for every attempted append.
+
+The provider may append to Holochain, a local content-addressed DAG, or an
+OCapN remote object. Those are adapters behind the same port, not alternate
+language authority models.
+
 Human names and discovery aliases may change without changing an already
 published incidence. A new semantic fact produces a new block and CID.
 
