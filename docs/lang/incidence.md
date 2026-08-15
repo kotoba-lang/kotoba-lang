@@ -235,6 +235,26 @@ Kotoba does not require a VC wrapper for its native readback statement; a VC is
 an external adapter form whose issuer/subject/proof must resolve to the same
 admitted binding and statement CID.
 
+`did-vc-organization-binding-verifier` is the fail-closed adapter for that
+boundary. The injected resolver and verifier own DID method resolution,
+credential-status policy, JSON-LD processing, canonicalization, and suite
+cryptography. Kotoba independently requires an admitted `assertionMethod`, its
+controller and key material, an allowlisted Data Integrity cryptosuite,
+`proofPurpose` `assertionMethod`, and a credential subject containing the exact
+constitution CID. Verification methods, assertion relationships, credential
+subjects, and authorized peers are all bounded by lexical adapter policy. The
+external verifier must return the exact secured document
+it verified; success is converted only into the existing opaque organization
+binding.
+
+`ucan-delegation-verifier` similarly adapts a host UCAN verifier into the
+existing opaque delegation. Envelope decoding, signatures, proof lookup, and
+expiry validation stay with that injected verifier. Kotoba accepts only a
+closed normalized result with the exact holder audience, a non-empty set of
+`kotoba://cap/` resources, explicit attenuation, and a lexically bounded proof
+depth and resource count. A token string, DID, VC, or normalized result map is
+still inert data and cannot be used as authority directly.
+
 Locator parsing is inert. A sturdyref becomes a session-bound target only when
 a live host resolver capability returns both an opaque authenticated session
 and a valid remote export descriptor. Possessing the URI alone remains
