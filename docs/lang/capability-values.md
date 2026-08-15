@@ -123,7 +123,7 @@ The conformance suite should cover:
 `src/kotoba/lang/capability_host.cljc` (`kotoba.lang.capability-host`) is the
 pure CLJC dispatch kernel that hosts wire their provider invocation paths
 through. `guard-call` takes the host call name, the requested capability, the
-CACAO grants, the local policy, the current date, and the concrete provider
+CACAO grants, the local policy, the mandatory trusted current date, and the concrete provider
 `:handler`; it runs `intersect-grants` at call time and:
 
 - on denial, returns `{:kotoba.host/ok? false :kotoba.host/denied <reason>
@@ -252,7 +252,7 @@ so this repository stays crypto-free:
    ordered vector of `cacao_b64` links (root first): every link's Ed25519
    signature, `iss`/`aud` re-issuance linkage, resource attenuation
    (`child ⊆ parent` under exact match or a parent trailing-`*` wildcard),
-   expiry ordering, and optional `:now` freshness. It returns only a result
+   expiry ordering and freshness against a trusted `:now`. It returns only a result
    map: `{:chain/valid? :chain/problems :chain/root-iss :chain/holder
    :chain/resources :chain/expires :chain/depth}`.
 2. **Mapping (this repository)** —
@@ -279,9 +279,12 @@ registered in `effect-for-kind` are granted; unknown kinds and non-cap URIs
 are SKIPPED with a note under `:skipped` — never silently granted.
 
 `grants-from-chain` returns `{:grants [..] :skipped [..]}` where each grant
-carries `:grant/expires` = `:chain/expires` (an ISO instant truncated to its
-date part — an unintelligible expiry fails closed rather than widening to
-never-expires) and a provenance-friendly `:grant/id` of
+carries a date-shaped `:grant/expires`. A plain chain date is preserved. An ISO
+instant is conservatively mapped to the day before its UTC date because grant
+dates remain live through that date; this may shorten authority by less than a
+day but never extends it beyond the signed instant. An unintelligible expiry
+fails closed rather than widening to never-expires. Grants carry a
+provenance-friendly `:grant/id` of
 `"cacao:<root-iss>:<index>"`, so every receipt's `:cap/provenance` traces
 back to the delegating root issuer. When `:chain/valid?` is not `true` the
 result is `{:grants [] :problems [..]}` — grants are NEVER derived from an
@@ -307,4 +310,3 @@ fixtures live under `lang/capability-conformance/` (positive/negative cases
 listed in `lang/capability-conformance/manifest.edn`); they are exercised by
 `test/kotoba/lang/capability_values_test.clj` and by the gate
 `bb scripts/check-capability-values.bb`, which loads the same CLJC source.
-

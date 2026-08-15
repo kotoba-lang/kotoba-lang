@@ -185,23 +185,29 @@
   "Require both delegation and local policy to authorize the requested
   component target, operation, and upper-bounded limits."
   [{:keys [requested cacao-grants local-policy]}]
-  (let [{kind :cap/kind target :cap/target operation :cap/operation
-         limits :cap/limits} requested
-        within? (fn [limit] (every? (fn [[k v]] (<= v (get limit k 0))) limits))
-        grant-ok? (some #(and (= kind (:grant/kind %))
-                              (= target (:grant/target %))
-                              (contains? (set (:grant/operations %)) operation)
-                              (within? (:grant/limits %)))
-                        cacao-grants)
-        policy (get-in local-policy [:policy/component kind])
-        policy-ok? (and (contains? (set (:targets policy)) target)
-                        (contains? (set (:operations policy)) operation)
-                        (within? (:limits policy)))]
-    (cond
-      (not (component-capability? requested)) {:denied :component-ability-invalid}
-      (not grant-ok?) {:denied :component-grant-denied}
-      (not policy-ok?) {:denied :component-policy-denied}
-      :else {:ok? true})))
+  (if-not (component-capability? requested)
+    {:denied :component-ability-invalid}
+    (let [{kind :cap/kind target :cap/target operation :cap/operation
+           limits :cap/limits} requested
+          within? (fn [limit]
+                    (and (map? limit)
+                         (every? (fn [[k v]]
+                                   (let [upper (get limit k)]
+                                     (and (positive-int? upper) (<= v upper))))
+                                 limits)))
+          grant-ok? (some #(and (= kind (:grant/kind %))
+                                (= target (:grant/target %))
+                                (contains? (set (:grant/operations %)) operation)
+                                (within? (:grant/limits %)))
+                          cacao-grants)
+          policy (get-in local-policy [:policy/component kind])
+          policy-ok? (and (contains? (set (:targets policy)) target)
+                          (contains? (set (:operations policy)) operation)
+                          (within? (:limits policy)))]
+      (cond
+        (not grant-ok?) {:denied :component-grant-denied}
+        (not policy-ok?) {:denied :component-policy-denied}
+        :else {:ok? true}))))
 
 (defn graph-read-cap
   ([resource] (make-cap :graph-read resource))
@@ -296,9 +302,11 @@
   are all :any — unless local-policy has :policy/forbid-wildcard true
   (ADR-2607180900 P1 / S4b least-privilege), in which case :any is denied
   as :wildcard-forbidden. Fails closed with {:denied <reason>} when the
-  requested kind is unsupported (:unsupported-kind), every covering grant
-  is expired at :now (:expired), or the intersection is empty
-  (:empty-intersection)."
+  requested kind is unsupported (:unsupported-kind), trusted current time is
+  absent or malformed (:current-time-required / :current-time-invalid), the
+  requested capability is expired (:requested-expired), every covering grant
+  has malformed expiry (:grant-expiry-invalid) or is expired at :now
+  (:expired), or the intersection is empty (:empty-intersection)."
   [{:keys [requested cacao-grants local-policy now]}]
   (let [kind (:cap/kind requested)
         forbid-wildcard? (boolean (or (:policy/forbid-wildcard local-policy)
@@ -310,6 +318,15 @@
       (not (contains? effect-for-kind kind))
       {:denied :unsupported-kind}
 
+      (nil? now)
+      {:denied :current-time-required}
+
+      (not (date-string? now))
+      {:denied :current-time-invalid}
+
+      (expired-at? (:cap/expires requested) now)
+      {:denied :requested-expired}
+
       :else
       (let [requested-scope (->scope (:cap/resource requested))
             policy-scope (->scope (get-in local-policy [:policy/allow kind]))
@@ -319,9 +336,13 @@
                                      requested-scope
                                      (->scope (:grant/resources g)))))
                              cacao-grants)
-            live (remove #(expired-at? (:grant/expires %) now) covering)]
+            valid-expiry (filter #(or (nil? (:grant/expires %))
+                                      (date-string? (:grant/expires %)))
+                                 covering)
+            live (remove #(expired-at? (:grant/expires %) now) valid-expiry)]
         (cond
           (empty? covering) {:denied :empty-intersection}
+          (empty? valid-expiry) {:denied :grant-expiry-invalid}
           (empty? live) {:denied :expired}
           :else
           (let [grant-scope (reduce (fn [acc g]
