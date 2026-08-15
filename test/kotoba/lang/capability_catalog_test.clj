@@ -13,7 +13,7 @@
   (let [authority (catalog/validate! (catalog/read-authority))
         entries (:capabilities authority)
         wire-ids (sort (map :compiler-wire-id (vals entries)))]
-    (is (= 23 (count entries)))
+    (is (= 24 (count entries)))
     (is (= (range 1 (inc (count entries))) wire-ids)
         "wire ids stay contiguous from 1 with no duplicates or gaps")
     (is (= [4 11 12]
@@ -23,12 +23,15 @@
            (mapv #(get-in entries [% :source-operation])
                  [:http/post :llm/generate :storage/transact])))
     ;; T8.3 ops kits — wire ids match provider kit :capability :id (ADR-t83-ops-catalog-19-23)
-    (is (= [19 20 21 22 23]
+    (is (= [19 20 21 22 23 24]
            (mapv #(get-in entries [% :compiler-wire-id])
-                 [:fs/transact :process/spawn :secret/get :git/run :entropy/draw])))
-    (is (= ['fs/transact 'process/spawn 'secret/get 'git/run 'entropy/draw]
+                 [:fs/transact :process/spawn :secret/get :git/run :entropy/draw
+                  :dataspace/transact])))
+    (is (= ['fs/transact 'process/spawn 'secret/get 'git/run 'entropy/draw
+            'dataspace/transact]
            (mapv #(get-in entries [% :source-operation])
-                 [:fs/transact :process/spawn :secret/get :git/run :entropy/draw])))))
+                 [:fs/transact :process/spawn :secret/get :git/run :entropy/draw
+                  :dataspace/transact])))))
 
 (deftest duplicate-wire-id-fails-closed
   (let [authority (catalog/read-authority)]

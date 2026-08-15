@@ -91,7 +91,11 @@
    :host/cc-cdx-query :host/cc-cdx-query
    :host/cc-warc-extract :host/cc-warc-extract
    :host/corpus-append :host/corpus-append
-   :host/corpus-publish :host/corpus-publish})
+   :host/corpus-publish :host/corpus-publish
+   ;; Syndicate-style EDN dataspace kit (root ADR-2608154100). A well-formed
+   ;; cap map is still not a runtime grant; resolve requires cap-acquire /
+   ;; host table intersection.
+   :dataspace/transact :dataspace/transact})
 
 (defn non-empty-string?
   [x]
