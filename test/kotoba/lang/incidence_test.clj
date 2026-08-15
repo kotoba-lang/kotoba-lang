@@ -26,7 +26,12 @@
     (is (= incidence/signed-readback-kind
            (get-in contract [:coordination :publication :transport :ocapn
                              :delivery-modes :signed-readback
-                             :statement-kind])))))
+                             :statement-kind])))
+    (is (= :verified-cid-set-union
+           (get-in contract [:coordination :replication :model])))
+    (is (= :explicit-branch-conflict
+           (get-in contract [:organization :governance :concurrency
+                             :same-conflict-key])))))
 
 (deftest frozen-canonical-vector-holds
   (let [vectors (edn/read-string (slurp "lang/incidence-vectors.edn"))]

@@ -65,6 +65,63 @@ publish authority. Callbacks, transport, and publication remain runtime
 concerns; the pure language layer does not pretend that constructing a map has
 performed an effect.
 
+## Distributed replication
+
+The bounded replica is an anti-entropy state machine over verified addressed
+incidences. It atomically hash-checks each bounded input batch and monotonically
+unions entries by CID. Arrival order has no semantic meaning. A valid child may
+arrive before its parent; it is retained as an orphan and its missing parent CID
+is prioritized in the next pull request. Stable bounded CID inventory pages and
+exact requested export batches provide the transport-neutral synchronization
+surface.
+
+Partial replication is never promoted into complete state. Projection remains
+blocked until every referenced parent is locally present and the incidence DAG
+passes the normal verification rules. Thus an orphan is useful replication
+progress, not an assertion that incomplete history is authoritative.
+
+Replication and consensus are deliberately separate. CID set union converges
+when peers eventually exchange all blocks, but says nothing about a unique
+winner for mutually exclusive organization decisions. Applications needing a
+Byzantine total order attach an external consensus adapter such as Inga; the
+dataspace kernel does not disguise wall-clock arrival as consensus.
+
+For availability evidence, distinct authenticated peers can each return the
+opaque signed-readback admission described below. Claims for the same
+dataspace, incidence CID, constitution CID, and issuer DID can satisfy a
+caller-supplied lexical threshold and mint an opaque replication certificate.
+The same peer never counts twice, and serialized receipt maps never count at
+all. The threshold remains explicit policy: the certificate proves only that
+that many admitted peers made fresh signed readback claims, not physical
+medium, retention duration, or Byzantine agreement.
+
+## Organization governance
+
+Governance uses the same immutable incidence model:
+
+1. `:organization/governance-policy` binds the constitution CID to a governor
+   set, distinct-governor threshold, and allowed action kinds.
+2. `:organization/proposal` binds that exact policy CID to an action, payload
+   CID, proposer, and application-defined conflict key.
+3. `:organization/approval` binds a governor and approve/reject decision to the
+   exact proposal and names one external proof CID.
+4. `:organization/enacted` names the proposal and the exact approval CIDs that
+   met policy.
+
+All four records are inert content-addressed data. An injected verifier must
+verify each approval proof and mint an opaque approval bound to its approval
+CID, proposal CID, constitution CID, governor, and evidence CID. Enactment
+requires distinct opaque approvals from the policy's governor set; a repeated
+governor, rejected vote, invalid/misbound proof, below-threshold set, or
+serialized lookalike fails closed. Success returns an opaque enacted decision
+plus its inert addressed incidence for capability-guarded publication.
+
+Several valid certificates for the same proposal collapse without changing
+the decision. Different enacted proposals with the same organization and
+conflict key remain an explicit branch conflict. The projector does not choose
+the latest timestamp or lexical winner. Resolution requires another governed
+proposal or a configured total-order consensus adapter.
+
 ## Capability-guarded publication
 
 The incidence port is the narrow boundary between pure facet emissions and a
