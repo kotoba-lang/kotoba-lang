@@ -11,6 +11,8 @@ fuel, errors, capabilities, multi-backend meaning (R1 / T1.1).
 **Option/result (T4.3):** [`option-result-guide.md`](./option-result-guide.md).  
 **String kit (T4.2):** [`string-kit.md`](./string-kit.md).
 **Collections costs (T4.5):** [`collections-costs.md`](./collections-costs.md).
+**Content-addressed incidence:** [`incidence.md`](./incidence.md) — immutable
+role relations, organization projection, and DID/VC/UCAN/ZCAP adapter boundary.
 
 Kotoba source is a Kotoba/EDN subset with a capability-safe profile for
 untrusted or AI-generated code. `.kotoba` is the canonical Kotoba-only source

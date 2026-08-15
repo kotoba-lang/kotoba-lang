@@ -22,6 +22,7 @@ in the same change. Do not invent a second informal dialect in product PRs.
 | Fuel | Finite fuel; non-replenishable default budgets |
 | Errors | Fail-closed admission; stable `:kotoba.error/code` + source span |
 | Capability call | Named `cap-call` only when declared + granted |
+| Incidence | Immutable role relation; CID integrity is not authority |
 
 ### Out of scope (intentional non-Clojure)
 
@@ -126,7 +127,26 @@ exists.
 
 ---
 
-## 6. Fuel and termination
+## 6. Content-addressed incidence
+
+Durable distributed and organizational state is expressed as immutable,
+role-labelled n-ary relations. The canonical contract is
+`lang/incidence.edn`; the reference semantics are documented in
+[`incidence.md`](./incidence.md).
+
+1. An incidence CID identifies canonical relation content, never authority.
+2. Person, agent, organization, and system use the same constitution shape.
+3. Assertions and CID-targeted retractions append parent-linked incidences;
+   current state and observations are verified projections rather than
+   mutation of an identity object.
+4. DID, VC, UCAN, and ZCAP terms belong at explicit interoperability adapters.
+5. An external delegation remains data-only until verification, local-policy
+   intersection, and concrete capability minting succeed.
+6. EDN and tagged literals never mint capabilities. Authority is a runtime
+   lexical/affine value; Clojure-shaped syntax does not expose ambient JVM
+   authority or effectful macro expansion.
+
+## 7. Fuel and termination
 
 1. Default compile artifacts carry a **finite fuel** budget (commonly 512 units;
    target-specific).  
@@ -139,9 +159,9 @@ exists.
 
 ---
 
-## 7. Errors and diagnostics
+## 8. Errors and diagnostics
 
-### 7.1 Phases
+### 8.1 Phases
 
 Compiler `ex-info` data includes `:phase` among:
 
@@ -154,7 +174,7 @@ Compiler `ex-info` data includes `:phase` among:
 | `:ir` / lowering | Internal lowering failure |
 | others | see `kotoba.compiler.diagnostic/phase-codes` |
 
-### 7.2 Stable codes (T3.1+)
+### 8.2 Stable codes (T3.1+)
 
 Prefer machine-readable:
 
@@ -169,14 +189,14 @@ Prefer machine-readable:
 `:kotoba.error/code` when present. New `reject!` sites must supply a specific code;
 legacy sites may still use the coarse phase code until burned down.
 
-### 7.3 Contributor bar
+### 8.3 Contributor bar
 
 A new contributor should fix a type/cap error **without reading compiler source**,
 using message + span + code only (WBS T3 exit).
 
 ---
 
-## 8. Multi-backend meaning
+## 9. Multi-backend meaning
 
 “Same program” reliability means **shared HIR/KIR meaning** across backends that claim
 a case class:
@@ -196,7 +216,7 @@ per case class (T1.2 landed). Dual-backend execution runner is T1.3.
 
 ---
 
-## 9. String operations (product surface)
+## 10. String operations (product surface)
 
 | Op | Meaning |
 |---|---|
@@ -210,7 +230,7 @@ per case class (T1.2 landed). Dual-backend execution runner is T1.3.
 
 ---
 
-## 10. Equality
+## 11. Equality
 
 - `=` is for admitted scalar/identity types in the safe profile.  
 - Strings → `string=?`  
