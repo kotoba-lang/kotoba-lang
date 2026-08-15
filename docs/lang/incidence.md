@@ -71,10 +71,11 @@ language authority models.
 
 ### OCapN adapter
 
-The OCapN adapter accepts only an opaque live reference created by a trusted
-runtime after CapTP session authentication. A locator URI, sturdyref record, or
-other EDN value cannot be converted into a live reference by the language
-kernel.
+The OCapN adapter accepts only an opaque authenticated-session value minted by
+a trusted host verifier and binds the remote target to that session. It no
+longer accepts an `authenticated=true` boolean, caller-provided session map, or
+serialized transport function. A locator URI, sturdyref record, or other EDN
+value cannot be converted into a live reference by the language kernel.
 
 For each append it creates the current draft CapTP 1.0 abstract delivery:
 
@@ -158,13 +159,21 @@ that the holder may invoke an effect.
 Effectful execution still follows the capability pipeline:
 
 1. verify the signature and delegation/evidence chain;
-2. intersect the verified delegation with local policy;
-3. mint a concrete scoped capability value;
-4. guard the host effect and emit a receipt.
+2. mint an opaque verified-delegation runtime value;
+3. intersect that verified delegation with local policy;
+4. mint a concrete scoped capability value;
+5. guard the host effect and emit a receipt.
 
 Consequently a delegation or credential incidence received from an untrusted
 store is data-only until its protocol adapter verifies it. Merely knowing its
 CID never grants authority.
+
+The incidence publication port accepts the opaque verified-delegation value,
+not a vector of caller-constructed grant maps. Likewise, OCapN connection setup
+accepts an opaque authenticated-session value containing sanitized peer and
+transcript-CID metadata; transport functions and verifier capabilities are not
+exposed by its audit description. These values are ordinary runtime objects to
+trusted host code but are not EDN and cannot be reconstructed by a guest.
 
 ## EDN data and object capabilities
 

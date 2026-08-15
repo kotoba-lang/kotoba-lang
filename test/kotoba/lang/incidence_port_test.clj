@@ -3,7 +3,8 @@
             [kotoba.lang.capability-host :as host]
             [kotoba.lang.capability-values :as capabilities]
             [kotoba.lang.incidence :as incidence]
-            [kotoba.lang.incidence-port :as port]))
+            [kotoba.lang.incidence-port :as port]
+            [kotoba.lang.trusted-admission :as trusted]))
 
 (def alice (incidence/typed-ref :did "did:key:z6Mkalice"))
 (def room (incidence/typed-ref :uri "https://example.test/rooms/a"))
@@ -23,18 +24,27 @@
 (defn requested-cap []
   (capabilities/make-cap port/append-kind dataspace))
 
-(defn grant []
-  {:grant/kind port/append-kind
-   :grant/resources #{dataspace}
-   :grant/expires nil
-   :grant/id "ucan:rooms/a"})
+(defn verified-delegation
+  [resources]
+  (trusted/verify-delegation!
+   (constantly
+    {:chain/valid? true
+     :chain/problems []
+     :chain/root-iss "did:key:z6Mkroot"
+     :chain/holder "did:key:z6Mkholder"
+     :chain/resources resources
+     :chain/expires nil
+     :chain/depth 1})
+   :test-evidence))
 
 (defn publish-opts [emissions append!]
   {:dataspace dataspace
    :emissions emissions
    :requested (requested-cap)
    :effect-row #{port/append-effect}
-   :cacao-grants [(grant)]
+   :verified-delegation
+   (verified-delegation
+    #{(str "kotoba://cap/host/ledger-append/" dataspace)})
    :local-policy {:policy/allow {port/append-kind #{dataspace}}}
    :now now
    :append! append!})
@@ -59,7 +69,7 @@
     (is (= (:receipts result) (entries)))
     (is (every? #(= dataspace (:dataspace %)) @calls))
     (is (every? #(= dataspace (get-in % [:capability :cap/resource])) @calls))
-    (is (every? #(= ["ucan:rooms/a"]
+    (is (every? #(= ["cacao:did:key:z6Mkroot:0"]
                     (get-in % [:capability :cap/provenance]))
                 @calls))
     (is (every? #(true? (:ok? (capabilities/validate-receipt %)))
@@ -68,7 +78,8 @@
 (deftest missing-effect-or-delegation-never-reaches-provider
   (doseq [[expected changes]
           [[:effect-not-declared {:effect-row #{}}]
-           [:empty-intersection {:cacao-grants []}]
+           [:empty-intersection
+            {:verified-delegation (verified-delegation #{})}]
            [:empty-intersection
             {:local-policy {:policy/allow {port/append-kind
                                             #{"dataspace:somewhere-else"}}}}]]]
@@ -85,6 +96,22 @@
       (is (zero? @calls))
       (is (= 1 (count (entries))))
       (is (= :denied (:receipt/outcome (first (entries))))))))
+
+(deftest serialized-grants-cannot-cross-the-publication-boundary
+  (let [calls (atom 0)
+        {:keys [record! entries]} (host/journal)
+        result (port/publish-emissions!
+                (assoc
+                 (publish-opts [(incidence/assertion presence)]
+                               (fn [_] (swap! calls inc)))
+                 :verified-delegation
+                 [{:grant/kind port/append-kind
+                   :grant/resources #{dataspace}}]
+                 :record! record!))]
+    (is (false? (:ok? result)))
+    (is (= :dataspace/delegation-not-verified (:reason result)))
+    (is (zero? @calls))
+    (is (empty? (entries)))))
 
 (deftest malformed-or-substituted-emissions-fail-before-any-effect
   (let [entry (incidence/assertion presence)
@@ -111,6 +138,8 @@
              [:dataspace/capability-resource
              {:requested (capabilities/make-cap port/append-kind :any)}]
              [:dataspace/provider-invalid {:append! :pretend-authority}]
+             [:dataspace/delegation-not-verified
+              {:verified-delegation {:pretend :verified}}]
              [:dataspace/receipt-date-invalid {:now "today"}]
              [:dataspace/recorder-invalid {:record! :pretend-recorder}]]]
       (let [result (port/publish-emissions!
