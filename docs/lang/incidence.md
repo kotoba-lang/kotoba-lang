@@ -86,6 +86,15 @@ winner for mutually exclusive organization decisions. Applications needing a
 Byzantine total order attach an external consensus adapter such as Inga; the
 dataspace kernel does not disguise wall-clock arrival as consensus.
 
+`kotoba.lang.consensus-order` is that narrow adapter boundary. An injected
+consensus verifier must return a closed binding for the exact dataspace,
+height, parent commit, commit ID, and ordered incidence CIDs. A truthy answer,
+serialized lookalike, skipped height, wrong parent, fork, reordered entry, or
+hash-invalid block fails closed. Successful admission is opaque. Applying it
+hash-checks and ingests the exact certified entries while returning their total
+order beside the replica; it does not relabel set-union replication as
+consensus. Inga QC verification remains owned by Inga and is injected here.
+
 For availability evidence, distinct authenticated peers can each return the
 opaque signed-readback admission described below. Claims for the same
 dataspace, incidence CID, constitution CID, and issuer DID can satisfy a
@@ -160,15 +169,27 @@ The bounded Kotoba CapTP runtime now owns canonical Syrup encoding/decoding for
 the passable values used here, `op:start-session` admission, the
 `starting -> active -> aborted` lifecycle, one active session per peer,
 one-way client `op:deliver`, answer/resolver allocation and settlement,
+opaque deferred answers, `desc:answer` promise pipelining, one-shot
+`op:listen`, and the answer-derivation operations `op:get`, `op:index`, and
+`op:untag`,
 outbound `op:gc-answers`, wire-counted import/export `op:gc-exports`, and
 `op:abort`. Malformed or
 non-canonical inbound frames abort the session. Netlayer exceptions are reduced
 to stable diagnostics rather than exposing remote or host debugging data.
 
-The reliable in-order encrypted channel, ephemeral session-key generation, and
+The reliable in-order secure channel, ephemeral session-key generation, and
 cryptographic verification of `op:start-session` remain injected host
-capabilities. `op:listen`, promise pipelining, `op:get`, tagging, and third-party
-handoffs are not claimed by this bounded profile.
+capabilities. `provider-transport` supplies a real bounded TLS netlayer, but
+transport certificate identity is not silently promoted to a CapTP principal.
+
+`kotoba.lang.ocapn-handoff` implements the certificate and authority boundary
+for third-party handoffs: canonical signed `desc:handoff-give` and
+`desc:handoff-receive` records, Gifter and Receiver session binding, both
+signature checks through injected capabilities, unique gift IDs, per-session
+handoff-count replay rejection, and a single-use opaque admitted gift. The
+bounded store currently requires deposit before withdrawal; waiting promises
+for a future deposit and a network-facing bootstrap dispatcher remain provider
+concerns rather than hidden kernel threads.
 
 An accepted one-way send means only that the local authenticated session driver
 accepted the frame. It is not evidence that the remote peer durably stored the
@@ -228,6 +249,13 @@ Draft sources used by this profile are the OCapN
 [CapTP specification](https://github.com/ocapn/ocapn/blob/main/draft-specifications/CapTP%20Specification.md)
 and [locator specification](https://github.com/ocapn/ocapn/blob/main/draft-specifications/Locators.md),
 plus the canonical [Syrup draft](https://github.com/ocapn/syrup/blob/master/draft-specification.md).
+
+Measured cross-runtime evidence is recorded in
+`docs/lang/ocapn-interop-2026-08-15.edn`: ten shared Syrup values match
+`@endo/ocapn` 1.1.1 byte-for-byte, and the bounded CapTP frame round-trips on
+both the JVM and nbb/Node. It explicitly does not claim a live
+Endo-to-Kotoba session, start-session signature interop, handoff interop,
+float64 support, or Set byte compatibility.
 
 Identity terminology follows W3C [DID Core](https://www.w3.org/TR/did-core/)
 and [Verifiable Credentials Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/).

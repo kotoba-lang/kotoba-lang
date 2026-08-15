@@ -43,6 +43,10 @@
   [xs]
   (mapv #(bit-and 0xff %) xs))
 
+(defn- byte-count [xs]
+  #?(:clj (alength ^bytes xs)
+     :cljs (.-length xs)))
+
 (defn- ->bytes
   [xs]
   #?(:clj (byte-array (map unchecked-byte xs))
@@ -91,20 +95,20 @@
              (str value "+")))
 
     (byte-array-value? value)
-    (concat-bytes (ascii (str (count value) ":")) value)
+    (concat-bytes (ascii (str (byte-count value) ":")) value)
 
     (string? value)
     (let [payload (utf8-bytes value)]
-      (concat-bytes (ascii (str (count payload) "\"")) payload))
+      (concat-bytes (ascii (str (byte-count payload) "\"")) payload))
 
     (keyword? value)
     (let [payload (utf8-bytes (str value))]
-      (concat-bytes (ascii (str (count payload) "'")) payload))
+      (concat-bytes (ascii (str (byte-count payload) "'")) payload))
 
     (symbol? value)
     (let [text (str value)
           payload (utf8-bytes text)]
-      (concat-bytes (ascii (str (count payload) "'")) payload))
+      (concat-bytes (ascii (str (byte-count payload) "'")) payload))
 
     (syrup-record? value)
     (apply concat-bytes
@@ -176,26 +180,26 @@
                     {:problem :captp/syrup-truncated})))
   (let [tag (nth data start)]
     (cond
-      (= tag (int \t)) [true (inc start)]
-      (= tag (int \f)) [false (inc start)]
+      (= tag 116) [true (inc start)]
+      (= tag 102) [false (inc start)]
 
-      (= tag (int \[))
-      (let [[values end] (parse-many data (inc start) (int \]))]
+      (= tag 91)
+      (let [[values end] (parse-many data (inc start) 93)]
         [(vec values) end])
 
-      (= tag (int \{))
-      (let [[values end] (parse-many data (inc start) (int \}))]
+      (= tag 123)
+      (let [[values end] (parse-many data (inc start) 125)]
         (when (odd? (count values))
           (throw (ex-info "Syrup dictionary has an unmatched key"
                           {:problem :captp/syrup-dictionary-arity})))
         [(into {} (map vec (partition 2 values))) end])
 
-      (= tag (int \#))
-      (let [[values end] (parse-many data (inc start) (int \$))]
+      (= tag 35)
+      (let [[values end] (parse-many data (inc start) 36)]
         [(set values) end])
 
-      (= tag (int \<))
-      (let [[values end] (parse-many data (inc start) (int \>))
+      (= tag 60)
+      (let [[values end] (parse-many data (inc start) 62)
             label (first values)]
         (when-not (and (symbol? label) (seq values))
           (throw (ex-info "Syrup record label is not a symbol"
@@ -295,6 +299,18 @@
 (defn abort-frame [reason]
   (syrup-record 'op:abort [(str reason)]))
 
+(defn listen-frame [target listener]
+  (syrup-record 'op:listen [(target->descriptor target) listener]))
+
+(defn get-frame [target field-name answer-position]
+  (syrup-record 'op:get [(target->descriptor target) field-name answer-position]))
+
+(defn index-frame [target index answer-position]
+  (syrup-record 'op:index [(target->descriptor target) index answer-position]))
+
+(defn untag-frame [target tag answer-position]
+  (syrup-record 'op:untag [(target->descriptor target) tag answer-position]))
+
 (defprotocol ^:private RuntimeValue
   (-runtime-state [runtime])
   (-runtime-session [runtime])
@@ -307,6 +323,18 @@
 (defprotocol ^:private SessionRegistryValue
   (-claim! [registry peer-key session-id])
   (-release! [registry peer-key session-id]))
+
+(defprotocol ^:private DeferredAnswerValue
+  (-answer-runtime [answer])
+  (-answer-position [answer]))
+
+(deftype ^:private DeferredAnswer [runtime position]
+  DeferredAnswerValue
+  (-answer-runtime [_] runtime)
+  (-answer-position [_] position))
+
+(defn deferred-answer? [x]
+  (satisfies? DeferredAnswerValue x))
 
 (deftype ^:private SessionRegistry [state]
   SessionRegistryValue
@@ -409,6 +437,39 @@
                           :next-export (inc resolver))
                    (assoc-in [:answers answer] {:status :pending
                                                 :resolver resolver})
+                   (assoc-in [:exports resolver] {:wire-count 1
+                                                  :kind :resolver
+                                                  :answer answer})))))
+    @allocated))
+
+(defn- allocate-answer!
+  [runtime]
+  (let [allocated (atom nil)]
+    (swap! (-runtime-state runtime)
+           (fn [state]
+             (let [answer (:next-answer state)]
+               (reset! allocated answer)
+               (-> state
+                   (assoc :next-answer (inc answer))
+                   (assoc-in [:answers answer] {:status :pending})))))
+    @allocated))
+
+(defn- attach-listener!
+  [runtime answer]
+  (let [allocated (atom nil)]
+    (swap! (-runtime-state runtime)
+           (fn [state]
+             (when-not (= :pending (get-in state [:answers answer :status]))
+               (throw (ex-info "only a pending answer can be listened to"
+                               {:problem :captp/listen-not-pending})))
+             (when (get-in state [:answers answer :resolver])
+               (throw (ex-info "answer already has a listener"
+                               {:problem :captp/listener-already-attached})))
+             (let [resolver (:next-export state)]
+               (reset! allocated resolver)
+               (-> state
+                   (assoc :next-export (inc resolver))
+                   (assoc-in [:answers answer :resolver] resolver)
                    (assoc-in [:exports resolver] {:wire-count 1
                                                   :kind :resolver
                                                   :answer answer})))))
@@ -575,6 +636,113 @@
           (throw error)
           (throw (ex-info "invalid inbound CapTP exchange"
                           {:problem :captp/inbound-exchange-invalid})))))))
+
+(defn deferred-request!
+  "Send a request whose answer can be pipelined before it settles.
+
+  Resolution is driven by receive!. Merely printing or serializing the returned
+  opaque value cannot forge an answer slot."
+  [runtime {:keys [ocapn/to ocapn/args] :as call}]
+  (active! runtime)
+  (when-not (and (map? call)
+                 (= #{:ocapn/to :ocapn/args} (set (keys call)))
+                 (map? to) (vector? args))
+    (throw (ex-info "invalid deferred CapTP request"
+                    {:problem :captp/deferred-request-invalid})))
+  (let [answer (allocate-answer! runtime)]
+    (write-wire! runtime (deliver-frame to args answer false))
+    (DeferredAnswer. runtime answer)))
+
+(defn pipeline-request!
+  "Pipeline a request to an unresolved remote answer, returning a new answer."
+  [pending args]
+  (when-not (and (deferred-answer? pending) (vector? args))
+    (throw (ex-info "deferred answer and argument vector required"
+                    {:problem :captp/pipeline-request-invalid})))
+  (let [runtime (-answer-runtime pending)
+        answer (allocate-answer! runtime)]
+    (active! runtime)
+    (write-wire! runtime
+                 (deliver-frame {:ocapn/descriptor :desc/answer
+                                 :ocapn/position (-answer-position pending)}
+                                args answer false))
+    (DeferredAnswer. runtime answer)))
+
+(defn pipeline-send!
+  "Pipeline a one-way message to an unresolved remote answer."
+  [pending args]
+  (when-not (and (deferred-answer? pending) (vector? args))
+    (throw (ex-info "deferred answer and argument vector required"
+                    {:problem :captp/pipeline-send-invalid})))
+  (let [runtime (-answer-runtime pending)]
+    (active! runtime)
+    (write-wire! runtime
+                 (deliver-frame {:ocapn/descriptor :desc/answer
+                                 :ocapn/position (-answer-position pending)}
+                                args false false))))
+
+(defn listen!
+  "Attach exactly one local resolver to a deferred answer."
+  [pending]
+  (when-not (deferred-answer? pending)
+    (throw (ex-info "deferred answer required"
+                    {:problem :captp/deferred-answer-required})))
+  (let [runtime (-answer-runtime pending)
+        answer (-answer-position pending)
+        resolver (attach-listener! runtime answer)]
+    (write-wire! runtime
+                 (listen-frame {:ocapn/descriptor :desc/answer
+                                :ocapn/position answer}
+                               (descriptor 'desc:import-object resolver)))))
+
+(defn- derive-answer!
+  [pending value frame-fn problem]
+  (when-not (deferred-answer? pending)
+    (throw (ex-info "deferred answer required" {:problem problem})))
+  (let [runtime (-answer-runtime pending)
+        answer (allocate-answer! runtime)]
+    (active! runtime)
+    (write-wire! runtime
+                 (frame-fn {:ocapn/descriptor :desc/answer
+                            :ocapn/position (-answer-position pending)}
+                           value answer))
+    (DeferredAnswer. runtime answer)))
+
+(defn get-answer! [pending field-name]
+  (when-not (capabilities/non-empty-string? field-name)
+    (throw (ex-info "CapTP field name required" {:problem :captp/get-field-invalid})))
+  (derive-answer! pending field-name get-frame :captp/get-invalid))
+
+(defn index-answer! [pending index]
+  (when-not (and (int? index) (not (neg? index)))
+    (throw (ex-info "CapTP index must be non-negative" {:problem :captp/index-invalid})))
+  (derive-answer! pending index index-frame :captp/index-invalid))
+
+(defn untag-answer! [pending tag]
+  (when-not (capabilities/non-empty-string? tag)
+    (throw (ex-info "CapTP tag required" {:problem :captp/untag-tag-invalid})))
+  (derive-answer! pending tag untag-frame :captp/untag-invalid))
+
+(defn settlement!
+  "Consume a settled deferred answer and release its remote answer position."
+  [pending]
+  (when-not (deferred-answer? pending)
+    (throw (ex-info "deferred answer required"
+                    {:problem :captp/deferred-answer-required})))
+  (let [runtime (-answer-runtime pending)
+        answer (-answer-position pending)
+        {:keys [status value]} (get-in @(-runtime-state runtime) [:answers answer])]
+    (case status
+      :pending (throw (ex-info "CapTP answer remains unresolved"
+                               {:problem :captp/answer-unresolved}))
+      :fulfilled (do (write-wire! runtime (gc-answers-frame [answer]))
+                     (swap! (-runtime-state runtime) update :answers dissoc answer)
+                     {:ocapn/status :fulfilled :ocapn/value value})
+      :broken (do (write-wire! runtime (gc-answers-frame [answer]))
+                  (swap! (-runtime-state runtime) update :answers dissoc answer)
+                  {:ocapn/status :broken})
+      (throw (ex-info "CapTP deferred answer is unknown or consumed"
+                      {:problem :captp/answer-unknown})))))
 
 (defn open-session!
   "Verify both start-session records and open a bounded CapTP runtime.
