@@ -49,8 +49,17 @@ The generator reads the vendored DADS stylesheet from
 has no external font, script, analytics, or design-system request at runtime;
 the small documentation-filter script is inline.
 
-Output: `site/dist/index.html` (committed, so a clean checkout can deploy
-without running the generator).
+The header uses the same six-circle `K O T O B A` artwork as the implementation
+repository README. Its authoritative source is
+`kotoba-lang/kotoba@cfdc08b71c4053f80d42a24d7bb418204a84b369:docs/assets/header.png`
+(SHA-256 `76040326b828217845181068d3cf14ab856f671c5525bf8eb1182c40c4116a35`).
+`site/assets/kotoba-wordmark.png` is a 480 x 68 mobile-sized derivative
+(SHA-256 `0126a8791d4181d102892215e50379014af6bc7e36bbee7c5aa5002a6f25778a`).
+The generator copies that local asset into `dist/`, so the deployed page makes
+no external image request.
+
+Output: `site/dist/index.html` and `site/dist/kotoba-wordmark.png` (committed, so
+a clean checkout can deploy without running the generator).
 
 **The committed artifact is a deploy input, not a build by-product**: `wrangler
 deploy` here has no build step, so whatever is in `dist/` at deploy time is what

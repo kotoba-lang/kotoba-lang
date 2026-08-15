@@ -38,9 +38,16 @@
 (def dds-css-path
   (path/join dds-root "resources" "jp_go_dds" "dds.css"))
 
+(def logo-source-path
+  (path/join "site" "assets" "kotoba-wordmark.png"))
+
 (when-not (fs/existsSync dds-css-path)
   (println "site/generate.cljs: jp-go-dds CSS not found:" dds-css-path)
   (println "  set JP_GO_DDS_ROOT to the jp-go-digital-design-system checkout")
+  (js/process.exit 1))
+
+(when-not (fs/existsSync logo-source-path)
+  (println "site/generate.cljs: Kotoba wordmark not found:" logo-source-path)
   (js/process.exit 1))
 
 (def dds-css (fs/readFileSync dds-css-path "utf8"))
@@ -63,7 +70,8 @@
    "border-bottom:var(--hig-hairline) solid var(--hig-color-separator)}"
    ".kot-header__inner{display:flex;align-items:flex-start;flex-direction:column;"
    "gap:var(--hig-spacing-3);padding-block:var(--hig-spacing-3)}"
-   ".kot-wordmark{color:var(--hig-color-label);font-weight:700;text-decoration:none}"
+   ".kot-wordmark{display:inline-flex;align-items:center;text-decoration:none}"
+   ".kot-logo{display:block;height:var(--hig-spacing-7);width:auto}"
    ".kot-nav{display:flex;align-items:center;justify-content:flex-start;flex-wrap:wrap;"
    "gap:var(--hig-spacing-2);width:100%}"
    ".kot-hero{padding-block:var(--hig-spacing-8)}"
@@ -126,7 +134,9 @@
   [:header {:class "kot-header"}
    (dds/container
     [:div {:class "kot-header__inner"}
-     [:a {:class "kot-wordmark" :href "#top"} "Kotoba"]
+     [:a {:class "kot-wordmark" :href "#top" :aria-label "Kotoba home"}
+      [:img {:class "kot-logo" :src "./kotoba-wordmark.png"
+             :width 480 :height 68 :alt "Kotoba"}]]
      [:nav {:class "kot-nav" :aria-label "Primary"}
       (for [{:keys [label href]} primary-links]
         (dds/button label {:type :text :size "sm" :href href}))
@@ -428,5 +438,6 @@
 (let [out (path/join "site" "dist")]
   (fs/mkdirSync out #js {:recursive true})
   (fs/writeFileSync (path/join out "index.html") html)
+  (fs/copyFileSync logo-source-path (path/join out "kotoba-wordmark.png"))
   (println "wrote" (path/join out "index.html")
            (str "(" (.-length html) " bytes)")))
