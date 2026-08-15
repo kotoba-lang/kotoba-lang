@@ -147,6 +147,79 @@
     (is (= :dataspace/query-invalid
            (:reason (incidence/observe live {:roles {:room "a name"}}))))))
 
+(deftest facet-stop-automatically-retracts-every-owned-assertion
+  (let [presence (incidence/incidence
+                  :presence/online
+                  {:room #{service} :participant #{alice}}
+                  {})
+        status (incidence/incidence
+                :presence/status
+                {:participant #{alice}}
+                {:facts {:status :available}})
+        opened (incidence/facet alice)
+        first-assert (incidence/facet-assert opened presence)
+        second-assert (incidence/facet-assert (:facet first-assert) status)
+        duplicate (incidence/facet-assert (:facet second-assert) presence)
+        stopped (incidence/facet-stop (:facet duplicate))
+        assertion-entries (into [] (concat (:emit first-assert)
+                                           (:emit second-assert)))
+        all-entries (into assertion-entries (:emit stopped))
+        projection (incidence/active-projection all-entries)
+        targets (set (map :incidence/cid assertion-entries))]
+    (is (:ok? first-assert))
+    (is (:ok? second-assert))
+    (is (empty? (:emit duplicate)))
+    (is (= :stopped (get-in stopped [:facet :facet/status])))
+    (is (= targets
+           (get-in stopped [:facet :facet/withdrawal :incidence/block
+                            :incidence/facts :dataspace/retracts])))
+    (is (= targets (:retracted projection)))
+    (is (= #{:dataspace/retracted}
+           (set (map :incidence/kind (vals (:active-blocks projection))))))
+    (is (empty? (:matches
+                 (incidence/observe projection {:kind :presence/online}))))
+    (is (empty? (:emit (incidence/facet-stop (:facet stopped)))))
+    (is (= :facet/stopped
+           (:reason (incidence/facet-assert (:facet stopped) presence))))))
+
+(deftest facet-stop-is-canonical-across-assertion-order
+  (let [a (incidence/incidence :fact/a {:subject #{alice}} {})
+        b (incidence/incidence :fact/b {:subject #{bob}} {})
+        build (fn [blocks]
+                (reduce (fn [state block]
+                          (:facet (incidence/facet-assert state block)))
+                        (incidence/facet alice)
+                        blocks))
+        stopped-a (incidence/facet-stop (build [a b]))
+        stopped-b (incidence/facet-stop (build [b a]))]
+    (is (= (get-in stopped-a [:emit 0 :incidence/cid])
+           (get-in stopped-b [:emit 0 :incidence/cid])))
+    (is (nil? (incidence/facet-error (:facet stopped-a))))))
+
+(deftest facet-state-is-inert-and-fails-closed
+  (let [empty-stop (incidence/facet-stop (incidence/facet alice))
+        asserted (incidence/facet-assert
+                  (incidence/facet alice)
+                  (incidence/incidence :fact/a {:subject #{alice}} {}))
+        stopped (:facet (incidence/facet-stop (:facet asserted)))]
+    (is (:ok? empty-stop))
+    (is (empty? (:emit empty-stop)))
+    (is (nil? (get-in empty-stop [:facet :facet/withdrawal])))
+    (is (nil? (:capability empty-stop)))
+    (is (= :facet/withdrawal
+           (:problem (incidence/facet-error (assoc stopped :facet/owner bob)))))
+    (is (= :facet/state-invalid
+           (:reason
+            (incidence/facet-assert
+             (assoc (incidence/facet alice) :facet/publish-authority true)
+             (incidence/incidence :fact/a {:subject #{alice}} {})))))
+    (is (= :facet/retraction-not-owned
+           (:reason
+            (incidence/facet-assert
+             (incidence/facet alice)
+             (incidence/retract alice #{(incidence/incidence-cid constitution)}
+                                {})))))))
+
 (deftest cid-and-delegation-shaped-data-never-mint-authority
   (let [delegation (incidence/incidence
                     :capability/delegation

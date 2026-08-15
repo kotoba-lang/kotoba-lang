@@ -29,10 +29,26 @@ actor-first or object-first:
 
 An addressed incidence is an assertion. A `:dataspace/retracted` incidence
 names exact assertion CIDs and acts as an append-only tombstone. Observation is
-an inert EDN selector over the verified active projection. Publishing,
-callbacks, facet lifecycle, and transport remain runtime concerns; the pure
-language layer does not pretend that constructing an EDN map has performed an
-effect.
+an inert EDN selector over the verified active projection.
+
+Facet lifecycle is a pure state machine. `facet-assert` returns the next facet
+state plus an addressed incidence to emit. `facet-stop` returns the stopped
+state plus one retraction targeting every CID owned by that facet. Duplicate
+assert and duplicate stop are idempotent. An empty facet stops without emitting
+a meaningless empty retraction.
+
+```clojure
+(let [opened (incidence/facet me)
+      asserted (incidence/facet-assert opened presence)
+      stopped (incidence/facet-stop (:facet asserted))]
+  {:publish-now (:emit asserted)
+   :publish-on-stop (:emit stopped)})
+```
+
+Facet state and emissions are inert EDN. Reconstructing either does not grant
+publish authority. Callbacks, transport, and publication remain runtime
+concerns; the pure language layer does not pretend that constructing a map has
+performed an effect.
 
 Human names and discovery aliases may change without changing an already
 published incidence. A new semantic fact produces a new block and CID.
