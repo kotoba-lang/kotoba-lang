@@ -23,6 +23,12 @@
            (get-in contract [:organization :kinds])))
     (is (= :opaque-verified-organization-binding
            (get-in contract [:organization :external-identity :admission])))
+    (is (= :kotoba.lang.interop-verifiers/did-vc-organization-binding-verifier
+           (get-in contract [:adapters :w3c-did :adapter])))
+    (is (= :kotoba.lang.interop-verifiers/ucan-delegation-verifier
+           (get-in contract [:adapters :ucan :adapter])))
+    (is (= :assertionMethod
+           (get-in contract [:adapters :w3c-vc :proof-purpose])))
     (is (= incidence/signed-readback-kind
            (get-in contract [:coordination :publication :transport :ocapn
                              :delivery-modes :signed-readback

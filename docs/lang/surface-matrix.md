@@ -8,7 +8,7 @@ Check: `clojure -M -m kotoba.lang.surface-matrix --check`
 |---|---|
 | surface-status version | 1 |
 | profile version | 6 |
-| as-of | 2026-08-05 |
+| as-of | 2026-08-15 |
 | authority ADR | `docs/adr/ADR-kotoba-language-surface-status.md` |
 
 WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source.
@@ -55,6 +55,7 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 | `backend-parity` | `implemented-partial` |  |  |
 | `bounded-control-and-sugar` | `implemented-partial` |  |  |
 | `data-host-argument` | `implemented-partial` | compiler-host-cljs, compiler-host-jvm, kotoba-wasm |  |
+| `dataspace` | `implemented-partial` | compiler | Source forms make coordination native without making assertion data authoritative. Explicit facet enter/leave is the safe current lifecycle surface. |
 | `dynamic-arity-apply` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `filter-function` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `first-class-closure-values` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | Public [:fn [parameter-types result-type] ...] contracts cross project-module boundaries; parameters are intentionally i64-only in the first ABI-neutral profile. Computed heads remain explicit, while their result descriptor is inferred from a closed consumer or return context and stays explicit only when ambiguous. |
