@@ -49,11 +49,11 @@
     (testing "one grant per registered cap URI, deterministic sorted order"
       (is (= [{:grant/kind :graph-read
                :grant/resources #{:any}
-               :grant/expires "2027-01-01"
+               :grant/expires "2026-12-31"
                :grant/id "cacao:did:key:z6Mkroota:0"}
               {:grant/kind :host/ledger-append
                :grant/resources #{"ledger:main"}
-               :grant/expires "2027-01-01"
+               :grant/expires "2026-12-31"
                :grant/id "cacao:did:key:z6Mkroota:1"}]
              grants)))
     (testing "unknown kinds are skipped with a note, never granted"
@@ -68,7 +68,7 @@
                        :now "2026-07-02"})]
         (is (not (caps/denied? concrete)))
         (is (= "ledger:main" (:cap/resource concrete)))
-        (is (= "2027-01-01" (:cap/expires concrete)))
+        (is (= "2026-12-31" (:cap/expires concrete)))
         (is (= ["cacao:did:key:z6Mkroota:1"] (:cap/provenance concrete)))))))
 
 (deftest unverified-chain-never-yields-grants
@@ -90,11 +90,17 @@
         (is (seq (:problems result)) (pr-str bad))))))
 
 (deftest chain-expires-maps-to-grant-expires
-  (testing "instant is truncated to its date part"
-    (is (= "2026-07-10"
+  (testing "instant is conservatively bounded before its UTC date"
+    (is (= "2026-07-09"
            (-> (cacao/grants-from-chain
                 (chain-result ["kotoba://cap/graph-read/g1"]
                               {:expires "2026-07-10T12:34:56Z"}))
+               :grants first :grant/expires))))
+  (testing "an instant exactly at UTC midnight does not gain that calendar day"
+    (is (= "2026-07-09"
+           (-> (cacao/grants-from-chain
+                (chain-result ["kotoba://cap/graph-read/g1"]
+                              {:expires "2026-07-10T00:00:00Z"}))
                :grants first :grant/expires))))
   (testing "nil expiry stays nil (chain freshness already checked by verify-chain)"
     (is (nil? (-> (cacao/grants-from-chain

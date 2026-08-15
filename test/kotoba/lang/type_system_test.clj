@@ -56,6 +56,8 @@
   (testing "unknown type tags and malformed capability scopes do not become :value"
     (is (false? (types/type? [:future :i32])))
     (is (false? (types/type? [:cap :host/fs-read 42])))
+    (is (false? (types/type? [:cap :graph-read "/public"
+                              [:cap :host/fs-write :any]])))
     (is (false? (types/type? [:region-ref 'r])))))
 
 (deftest structured-children-are-effect-contained-and-cannot-share-caps-yet

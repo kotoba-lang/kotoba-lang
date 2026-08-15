@@ -1,6 +1,6 @@
 # ADR — Canonical value codec for EDN data identity
 
-- **Status**: Accepted — VC0–VC5 implemented
+- **Status**: Accepted — VC0–VC6 implemented
 - **Date**: 2026-07-28
 - **Artifacts**: `lang/value-codec.edn`,
   `kotoba-lang/io-ipld:src/kotoba/value/codec.cljc`,
@@ -10,6 +10,7 @@
   `kotoba-lang/kotoba:src/kotoba/semantic_code.cljc`
 - **Related**: `ADR-kotoba-code-identity-and-abilities.md`,
   `ADR-kotoba-lang-profile.md`, `ADR-safe-capability-language.md`,
+  `ADR-kotoba-cid-handle-cap-runtime.md`,
   `kotoba:docs/ADR-kotoba-content-addressed-codebase-gap.md` (G5)
 - **Execution-boundary authority**:
   `90-docs/adr/2607252500-kotoba-wasm-component-first-execution-boundary.edn`
@@ -276,6 +277,7 @@ stage VC5 below adds no permission that stage VC0 did not already have.
 | VC3 | `arrangement` leaf values on the codec, `schema-version` 2, declared migration | a v1 snapshot either migrates or is rejected with a named reason; never reinterpreted | implemented |
 | VC4 | `semantic-code` delegates literals; float literals admitted; contract identity names the codec | v1 definition CIDs still verify under the v1 contract | implemented |
 | VC5 | `:data-host-arg` lowering and typed host decode for structured arguments | constants only; no runtime construction; capability rules unchanged | implemented |
+| VC6 | ValueCID plus bounded run-local CID↔Handle reference kernel | CID is logical identity, Handle is local location, neither grants authority | implemented |
 
 VC4 also fixed two defects it uncovered rather than working around them: a
 quoted form was not data (`'[a b]` recursed through `normalize-expr`, resolving
@@ -299,6 +301,35 @@ byte, so no valid UTF-8 text and therefore no valid EDN text can begin with it.
 An all-integer vector is deliberately excluded from the new lowering: it is
 already the raw-byte literal, and re-encoding it would change the bytes an
 existing guest hands its host.
+
+VC6 gives the canonical bytes their explicit logical address:
+`CIDv1(dag-cbor, sha2-256(encode-value(v)))`. The stable facade exposes
+`value-cid` and `verify-value-cid`; `kotoba-lang/codebase` supplies the bounded
+run-local table that interns or hydrates the CID to a machine-word handle.
+The table stores canonical bytes, returns defensive decoded values, rejects
+forged handles, and never reuses a released slot. Runtime close/release does
+not delete CAS blocks. Capability/resource handles remain a separate affine
+authority plane. Wasm/native callback adoption is staged in
+`ADR-kotoba-cid-handle-cap-runtime.md`; VC6 does not claim that every backend
+already routes every value through the table.
+
+The backend-neutral `:kotoba.value-runtime/v1` dispatcher is also landed in
+`kotoba-lang/codebase`. It fixes the canonical-bytes/CID-text/scalar-handle
+boundary before Wasm and native transports are added, so those transports
+cannot silently create a second value identity algorithm.
+
+KIR now exposes the five operations through a separate `:value-call` callback,
+and typed core Wasm lowers them to `kotoba:value-runtime` imports using
+`externref` canonical bytes/CID text plus an `i64` Handle. This import namespace
+is authority-free and Component packaging rejects it until a public WIT
+interface is defined.
+
+The native side is no longer pending: `lang/value-runtime-native.edn` landed
+after this VC6 record was written and is the authority for its own status. The
+handle arena, normalized dispatch, sealed provider transport and CAS digest
+verifier are implemented against a C-free bare-metal surface, while admission
+stays `:deny-until-qualified` and `:aiueos-cpl3-provider` is still pending. VC6
+points at that file rather than restating a status that would drift from it.
 
 All codec, persistence, semantic-code, host-argument, bounded-consumer, and
 exact-i64 stages are implemented, so the design is **accepted**. The legacy

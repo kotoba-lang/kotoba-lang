@@ -61,6 +61,34 @@
            :local-policy {:policy/allow {:graph-write #{graph-a}}}
            :now now}))))
 
+(deftest intersection-requires-trusted-current-time-and-checks-request-expiry
+  (testing "current time is mandatory and must use the contract date shape"
+    (is (= {:denied :current-time-required}
+           (caps/intersect-grants
+            {:requested (caps/graph-read-cap graph-a)
+             :cacao-grants [(grant :graph-read #{graph-a} nil "g1")]
+             :local-policy {:policy/allow {:graph-read #{graph-a}}}})))
+    (is (= {:denied :current-time-invalid}
+           (caps/intersect-grants
+            {:requested (caps/graph-read-cap graph-a)
+             :cacao-grants [(grant :graph-read #{graph-a} nil "g1")]
+             :local-policy {:policy/allow {:graph-read #{graph-a}}}
+             :now "not-a-date"}))))
+  (testing "an expired requested capability cannot reach a live grant"
+    (is (= {:denied :requested-expired}
+           (caps/intersect-grants
+            {:requested (caps/graph-read-cap graph-a {:expires "2020-01-01"})
+             :cacao-grants [(grant :graph-read #{graph-a} "2027-01-01" "g1")]
+             :local-policy {:policy/allow {:graph-read #{graph-a}}}
+             :now now}))))
+  (testing "malformed grant expiry fails closed"
+    (is (= {:denied :grant-expiry-invalid}
+           (caps/intersect-grants
+            {:requested (caps/graph-read-cap graph-a)
+             :cacao-grants [(grant :graph-read #{graph-a} "later" "g1")]
+             :local-policy {:policy/allow {:graph-read #{graph-a}}}
+             :now now})))))
+
 (deftest intersection-denies-unsupported-kind
   (is (= {:denied :unsupported-kind}
          (caps/intersect-grants
@@ -184,6 +212,30 @@
                                           {:holder "did:key:z6Mkh"
                                            :expires "2026-12-31"
                                            :provenance ["g1"]})))))
+
+(deftest malformed-component-limits-deny-before-numeric-comparison
+  (let [requested (caps/make-component-cap
+                   :component/http graph-a
+                   {:target :service :operation :get
+                    :limits {:max-bytes "not-a-number"
+                             :max-items 1 :deadline-ms 1}
+                    :audit-id "audit-1"})
+        result (caps/component-admission
+                {:requested requested
+                 :cacao-grants [{:grant/kind :component/http
+                                 :grant/target :service
+                                 :grant/operations [:get]
+                                 :grant/limits {:max-bytes 10
+                                                :max-items 10
+                                                :deadline-ms 10}}]
+                 :local-policy {:policy/component
+                                {:component/http
+                                 {:targets [:service]
+                                  :operations [:get]
+                                  :limits {:max-bytes 10
+                                           :max-items 10
+                                           :deadline-ms 10}}}}})]
+    (is (= {:denied :component-ability-invalid} result))))
 
 (deftest capability-conformance-fixtures-match-contract
   (let [manifest (read-edn manifest-path)]

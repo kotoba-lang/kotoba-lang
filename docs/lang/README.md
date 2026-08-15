@@ -27,19 +27,29 @@ Kotoba-specific behavior is selected with reader conditionals:
 
 ## Getting Started
 
-For the public implementation CLI, start with the smallest compile-and-run path:
+**Product split.** **kotoba** is the *language*: it compiles safe Kotoba source
+ahead of time to a Wasm artifact. **kototama** is the *runtime* that admits and
+runs that artifact. Compiling is not executing, and neither of them is JVM
+Clojure execution — the JVM is only the bootstrap host for today's language CLI.
+
+Start with the smallest compile-and-run path:
 
 ```sh
-kotoba -e '(+ 1 2)'
+kotoba run -e '(+ 1 2)'
 ```
 
-Then build a source file and inspect the safe-language policy surface:
+Then compile a source file to an artifact, and validate one under the
+capability-safe profile without running it:
 
 ```sh
-kotoba wasm build examples/hello.kotoba -o hello.wasm
-kotoba wasm safe-policy examples/policy-demo.kotoba
-kotoba wasm safe-build examples/policy-demo.kotoba --policy policy.edn -o policy-demo.wasm
+kotoba compile --target wasm examples/hello.kotoba -o hello.wasm
+kotoba check --safe examples/policy-demo.kotoba
 ```
+
+The command surface is declared in [`lang/cli.edn`](../../lang/cli.edn) and
+enforced against the implementation by `kotoba.cli/conformance`; that contract
+is the authority when this document disagrees with it. Commands are `run`,
+`compile`, `check`, `graph`, `git`, `rad`, `deploy` and `hinshitsu`.
 
 The examples in `examples/` are intentionally small. The authoritative
 compatibility examples are the conformance fixtures under `lang/conformance/`.
@@ -66,21 +76,25 @@ compatibility examples are the conformance fixtures under `lang/conformance/`.
 portable source surface shared by all three reader targets.
 
 Inline expressions are also part of the compiler conformance vocabulary:
-`kotoba -e '(+ 1 2)'` wraps the expression as an exported `main`, compiles it
-through the same Kotoba -> core Wasm path, and runs `main`. This is
+`kotoba run -e '(+ 1 2)'` wraps the expression as an exported `main`, compiles
+it through the same Kotoba -> core Wasm path, and runs `main`. This is
 compile-and-run sugar, not runtime `eval`; the lower-level implementation
 binary keeps a compatibility `-e` path only for crate-local testing and existing
 integrations.
 
-Capability-safe language tooling is exposed through `kotoba wasm`:
+Ahead-of-time emit and capability-safe validation are separate commands:
 
 ```sh
-kotoba wasm build cell.kotoba
-kotoba wasm build -S src cell.kotoba -o cell.wasm
-kotoba wasm safe-policy cell.kotoba
-kotoba wasm safe-build cell.kotoba --policy policy.edn -o cell.wasm
-kotoba wasm selfhost-inspect cell.kotoba --policy policy.edn --json
+kotoba compile --target wasm cell.kotoba -o cell.wasm
+kotoba compile --target web cell.kotoba -o cell.js   # restricted kotoba-script backend
+kotoba check --safe -S src cell.kotoba
+kotoba check --safe --json cell.kotoba
 ```
+
+There is no `kotoba wasm` command group. `wasm` is a `--target` of `compile`,
+and the capability-safe profile is `--safe` on `check` — the former `wasm
+build` / `safe-policy` / `safe-build` / `selfhost-inspect` spellings are
+Rust-era names with no entry in `lang/cli.edn`.
 
 Namespace source roots are supplied with `-S` / `--source-path` or
 `KOTOBA_SOURCE_PATH`; `KOTOBA_CLJ_PATH` is retained only as a compatibility
@@ -253,7 +267,8 @@ ecosystem adoption, or production SLOs. See
 
 - `kotoba-lang`: language semantics, admitted grammar, and conformance vocabulary.
 - `kotoba-core-contracts`: source classification, package, and runtime-boundary contracts.
-- `kotoba-cli`: public compiler surface: `kotoba -e` and `kotoba wasm ...`.
+- `kotoba-cli`: public compiler surface, declared in `lang/cli.edn`
+  (`run`, `compile`, `check`, `graph`, `git`, `rad`, `deploy`, `hinshitsu`).
 - `kotoba-clj`: compiler implementation crate and compatibility binary for the
   profile.
 - `kotoba-runtime`: host/runtime for compiled components.
