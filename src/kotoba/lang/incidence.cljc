@@ -15,6 +15,7 @@
 (def append-durable-kind :dataspace/append-durable)
 (def signed-readback-version 1)
 (def signed-readback-kind :dataspace/signed-readback)
+(def governance-version 1)
 
 (def required-fields
   #{:incidence/kind
@@ -79,6 +80,97 @@
                        (every? identity/cid? removes)
                        (every? (:incidence/parents block) removes))
           {:problem :organization/member-removed}))
+
+      :organization/governance-policy
+      (let [organization (first (:governance/organization roles))
+            governors (:governance/governor roles)
+            threshold (:governance/threshold facts)]
+        (when-not
+         (and (= #{:governance/organization :governance/governor}
+                 (set (keys roles)))
+              (singleton-role? roles :governance/organization)
+              (= :cid (:ref/type organization))
+              (= governance-version (:governance/version facts))
+              (= #{:governance/version :governance/threshold
+                   :governance/actions}
+                 (set (keys facts)))
+              (integer? threshold) (pos? threshold)
+              (<= threshold (count governors))
+              (set? (:governance/actions facts))
+              (seq (:governance/actions facts))
+              (every? keyword? (:governance/actions facts))
+              (= #{(:ref/value organization)} (:incidence/parents block))
+              (empty? (:incidence/evidence block))
+              (empty? (:incidence/policies block)))
+          {:problem :organization/governance-policy}))
+
+      :organization/proposal
+      (let [organization (first (:governance/organization roles))
+            policy-cid (:governance/policy-cid facts)
+            payload-cid (:governance/payload-cid facts)]
+        (when-not
+         (and (= #{:governance/organization :governance/proposer}
+                 (set (keys roles)))
+              (every? #(singleton-role? roles %)
+                      [:governance/organization :governance/proposer])
+              (= :cid (:ref/type organization))
+              (= #{:governance/version :governance/policy-cid
+                   :governance/action :governance/payload-cid
+                   :governance/conflict-key}
+                 (set (keys facts)))
+              (= governance-version (:governance/version facts))
+              (identity/cid? policy-cid)
+              (keyword? (:governance/action facts))
+              (identity/cid? payload-cid)
+              (string? (:governance/conflict-key facts))
+              (boolean (re-find #"\S" (:governance/conflict-key facts)))
+              (= (set [policy-cid payload-cid]) (:incidence/parents block))
+              (= #{policy-cid} (:incidence/policies block))
+              (empty? (:incidence/evidence block)))
+          {:problem :organization/proposal}))
+
+      :organization/approval
+      (let [proposal-cid (:governance/proposal-cid facts)
+            policy-cid (first (:incidence/policies block))]
+        (when-not
+         (and (= #{:governance/organization :governance/governor}
+                 (set (keys roles)))
+              (every? #(singleton-role? roles %)
+                      [:governance/organization :governance/governor])
+              (= :cid (:ref/type (first (:governance/organization roles))))
+              (= #{:governance/version :governance/proposal-cid
+                   :governance/decision}
+                 (set (keys facts)))
+              (= governance-version (:governance/version facts))
+              (identity/cid? proposal-cid)
+              (contains? #{:approve :reject} (:governance/decision facts))
+              (= #{proposal-cid} (:incidence/parents block))
+              (= 1 (count (:incidence/policies block)))
+              (identity/cid? policy-cid)
+              (= 1 (count (:incidence/evidence block))))
+          {:problem :organization/approval}))
+
+      :organization/enacted
+      (let [proposal-cid (:governance/proposal-cid facts)
+            approval-cids (:governance/approval-cids facts)
+            policy-cid (first (:incidence/policies block))]
+        (when-not
+         (and (= #{:governance/organization} (set (keys roles)))
+              (singleton-role? roles :governance/organization)
+              (= :cid (:ref/type (first (:governance/organization roles))))
+              (= #{:governance/version :governance/proposal-cid
+                   :governance/approval-cids}
+                 (set (keys facts)))
+              (= governance-version (:governance/version facts))
+              (identity/cid? proposal-cid)
+              (set? approval-cids) (seq approval-cids)
+              (every? identity/cid? approval-cids)
+              (= (conj approval-cids proposal-cid)
+                 (:incidence/parents block))
+              (= 1 (count (:incidence/policies block)))
+              (identity/cid? policy-cid)
+              (seq (:incidence/evidence block)))
+          {:problem :organization/enacted}))
 
       :dataspace/retracted
       (let [retracts (:dataspace/retracts facts)]
