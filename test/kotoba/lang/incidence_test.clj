@@ -20,7 +20,13 @@
     (is (= incidence/required-fields (get-in contract [:block :required])))
     (is (true? (get-in contract [:identity :integrity-is-not-authority])))
     (is (= incidence/organization-kinds
-           (get-in contract [:organization :kinds])))))
+           (get-in contract [:organization :kinds])))
+    (is (= :opaque-verified-organization-binding
+           (get-in contract [:organization :external-identity :admission])))
+    (is (= incidence/signed-readback-kind
+           (get-in contract [:coordination :publication :transport :ocapn
+                             :delivery-modes :signed-readback
+                             :statement-kind])))))
 
 (deftest frozen-canonical-vector-holds
   (let [vectors (edn/read-string (slurp "lang/incidence-vectors.edn"))]

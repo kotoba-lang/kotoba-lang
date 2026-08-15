@@ -5,7 +5,8 @@
   possess a verifier function, successfully verify the evidence, and mint one
   of the private runtime types in this namespace. Consumers accept those types
   rather than booleans or caller-constructed grant maps."
-  (:require [kotoba.lang.capability-cacao :as cacao]
+  (:require [clojure.string :as str]
+            [kotoba.lang.capability-cacao :as cacao]
             [kotoba.lang.capability-values :as capabilities]
             [kotoba.lang.code-identity :as identity]
             [kotoba.lang.incidence :as incidence]))
@@ -20,6 +21,11 @@
   #{:session/valid? :session/id :session/version :session/peer
     :session/transcript-cid})
 
+(def ^:private organization-binding-result-fields
+  #{:binding/valid? :binding/constitution-cid :binding/kind :binding/did
+    :binding/authorized-peers :binding/verification-relationship
+    :binding/verification-method :binding/evidence-cid})
+
 (def ^:private send-transport-fields #{:send!})
 (def ^:private request-transport-fields #{:send! :request!})
 
@@ -33,6 +39,9 @@
 
 (defprotocol ^:private RequestSessionValue
   (-session-request! [value call]))
+
+(defprotocol ^:private VerifiedOrganizationBindingValue
+  (-organization-binding-info [value]))
 
 (deftype ^:private VerifiedDelegation [info grants]
   VerifiedDelegationValue
@@ -50,6 +59,10 @@
   (-session-send! [_ message] (send! message))
   RequestSessionValue
   (-session-request! [_ call] (request! call)))
+
+(deftype ^:private VerifiedOrganizationBinding [info]
+  VerifiedOrganizationBindingValue
+  (-organization-binding-info [_] info))
 
 (defn- did?
   [x]
@@ -114,6 +127,101 @@
          (select-keys result [:chain/root-iss :chain/holder :chain/resources
                               :chain/expires :chain/depth])
          (:grants mapped))))))
+
+(defn- addressed-constitution-error
+  [entry]
+  (let [verified (when (map? entry) (incidence/verify-addressed entry))
+        block (:incidence/block entry)]
+    (cond
+      (not (:ok? verified))
+      {:problem :trusted/constitution-address-invalid
+       :verification verified}
+
+      (not= :organization/constitution (:incidence/kind block))
+      {:problem :trusted/constitution-kind-invalid})))
+
+(defn organization-binding-result-error
+  "Return a closed diagnostic for a DID/constitution verifier result."
+  [constitution result]
+  (let [constitution-cid (:incidence/cid constitution)
+        constitution-block (:incidence/block constitution)
+        constitution-kind (get-in constitution-block
+                                  [:incidence/facts :organization/kind])
+        constituents (get-in constitution-block
+                             [:incidence/roles :organization/constituent])
+        did-ref (when (did? (:binding/did result))
+                  (incidence/typed-ref :did (:binding/did result)))]
+    (cond
+      (not (map? result))
+      {:problem :trusted/organization-binding-result-not-a-map}
+
+      (not= organization-binding-result-fields (set (keys result)))
+      {:problem :trusted/organization-binding-result-fields}
+
+      (not (true? (:binding/valid? result)))
+      {:problem :trusted/organization-binding-not-verified}
+
+      (not= constitution-cid (:binding/constitution-cid result))
+      {:problem :trusted/organization-binding-constitution-mismatch}
+
+      (not= constitution-kind (:binding/kind result))
+      {:problem :trusted/organization-binding-kind-mismatch}
+
+      (not (did? (:binding/did result)))
+      {:problem :trusted/organization-binding-did-invalid}
+
+      (not (contains? constituents did-ref))
+      {:problem :trusted/organization-binding-did-not-constituent}
+
+      (not (and (set? (:binding/authorized-peers result))
+                (seq (:binding/authorized-peers result))
+                (every? incidence/ref? (:binding/authorized-peers result))))
+      {:problem :trusted/organization-binding-peers-invalid}
+
+      (not= :assertionMethod (:binding/verification-relationship result))
+      {:problem :trusted/organization-binding-relationship-invalid}
+
+      (not (and (capabilities/non-empty-string?
+                 (:binding/verification-method result))
+                (str/starts-with? (:binding/verification-method result)
+                                  (str (:binding/did result) "#"))))
+      {:problem :trusted/organization-binding-method-invalid}
+
+      (not (identity/cid? (:binding/evidence-cid result)))
+      {:problem :trusted/organization-binding-evidence-invalid})))
+
+(defn verify-organization-binding!
+  "Verify an external DID binding for one addressed constitution and mint an
+  opaque admitted value. DID documents, VCs, and proof objects remain inert;
+  VERIFY! owns resolution, method-specific cryptography, revocation, and trust
+  policy. The kernel independently binds the admitted result to the exact
+  constitution CID and one of its DID constituents."
+  [verify! constitution evidence]
+  (when-not (fn? verify!)
+    (throw (ex-info "organization binding verifier is not live"
+                    {:problem :trusted/organization-binding-verifier-invalid})))
+  (if-let [error (addressed-constitution-error constitution)]
+    (throw (ex-info "organization constitution was not admitted" error))
+    (let [result (try
+                   (verify! {:constitution constitution :evidence evidence})
+                   (catch #?(:clj Exception :cljs :default) _
+                     ::verification-failed))]
+      (when (= ::verification-failed result)
+        (throw (ex-info "organization binding verification failed"
+                        {:problem :trusted/organization-binding-verification-failed})))
+      (if-let [error (organization-binding-result-error constitution result)]
+        (throw (ex-info "organization binding was not admitted" error))
+        (VerifiedOrganizationBinding. (dissoc result :binding/valid?))))))
+
+(defn verified-organization-binding?
+  [x]
+  (satisfies? VerifiedOrganizationBindingValue x))
+
+(defn organization-binding-description
+  "Return inert admitted binding metadata, never the resolver/verifier."
+  [binding]
+  (when (verified-organization-binding? binding)
+    (-organization-binding-info binding)))
 
 (defn verified-delegation?
   [x]

@@ -13,6 +13,8 @@
 (def payload-version 1)
 (def append-durable-version 1)
 (def append-durable-kind :dataspace/append-durable)
+(def signed-readback-version 1)
+(def signed-readback-kind :dataspace/signed-readback)
 
 (def required-fields
   #{:incidence/kind
@@ -106,6 +108,49 @@
                        (empty? (:incidence/evidence block))
                        (empty? (:incidence/policies block)))
           {:problem :dataspace/append-durable}))
+
+      :dataspace/signed-readback
+      (let [subject (first (:receipt/subject roles))
+            organization (first (:receipt/organization roles))
+            issuer (first (:receipt/issuer roles))
+            peer (first (:receipt/peer roles))
+            subject-cid (:ref/value subject)
+            organization-cid (:ref/value organization)]
+        (when-not
+         (and (= #{:receipt/subject :receipt/organization
+                   :receipt/issuer :receipt/peer}
+                 (set (keys roles)))
+              (every? #(singleton-role? roles %)
+                      [:receipt/subject :receipt/organization
+                       :receipt/issuer :receipt/peer])
+              (= :cid (:ref/type subject))
+              (= :cid (:ref/type organization))
+              (= :did (:ref/type issuer))
+              (= #{:receipt/version :receipt/status :receipt/dataspace
+                   :receipt/readback-cid :receipt/challenge
+                   :receipt/issued-at-ms :receipt/expires-at-ms
+                   :receipt/session-transcript-cid
+                   :receipt/verification-method}
+                 (set (keys facts)))
+              (= signed-readback-version (:receipt/version facts))
+              (= :durable (:receipt/status facts))
+              (string? (:receipt/dataspace facts))
+              (boolean (re-find #"\S" (:receipt/dataspace facts)))
+              (= subject-cid (:receipt/readback-cid facts))
+              (string? (:receipt/challenge facts))
+              (boolean (re-find #"\S" (:receipt/challenge facts)))
+              (integer? (:receipt/issued-at-ms facts))
+              (integer? (:receipt/expires-at-ms facts))
+              (< (:receipt/issued-at-ms facts) (:receipt/expires-at-ms facts))
+              (identity/cid? (:receipt/session-transcript-cid facts))
+              (string? (:receipt/verification-method facts))
+              (boolean (re-find #"\S" (:receipt/verification-method facts)))
+              (= (set [subject-cid organization-cid])
+                 (:incidence/parents block))
+              (= 1 (count (:incidence/evidence block)))
+              (empty? (:incidence/policies block))
+              (ref? peer))
+          {:problem :dataspace/signed-readback}))
 
       nil)))
 
@@ -295,6 +340,32 @@
            :facts {:receipt/version append-durable-version
                    :receipt/status :durable
                    :receipt/dataspace dataspace}}))))))
+
+(defn signed-readback-statement
+  "Construct the content-addressed statement covered by a remote signature.
+  SIGNATURE bytes are deliberately outside this block, avoiding circular
+  identity and keeping cryptographic suite representation adapter-specific."
+  [{:keys [dataspace subject-cid readback-cid constitution-cid issuer peer
+           challenge issued-at-ms expires-at-ms session-transcript-cid
+           verification-method binding-evidence-cid]}]
+  (addressed
+   (incidence
+    signed-readback-kind
+    {:receipt/subject #{(typed-ref :cid subject-cid)}
+     :receipt/organization #{(typed-ref :cid constitution-cid)}
+     :receipt/issuer #{(typed-ref :did issuer)}
+     :receipt/peer #{peer}}
+    {:parents (set [subject-cid constitution-cid])
+     :evidence #{binding-evidence-cid}
+     :facts {:receipt/version signed-readback-version
+             :receipt/status :durable
+             :receipt/dataspace dataspace
+             :receipt/readback-cid readback-cid
+             :receipt/challenge challenge
+             :receipt/issued-at-ms issued-at-ms
+             :receipt/expires-at-ms expires-at-ms
+             :receipt/session-transcript-cid session-transcript-cid
+             :receipt/verification-method verification-method}})))
 
 (defn assertion
   "Pure Syndicate-style assertion constructor: address an inert incidence

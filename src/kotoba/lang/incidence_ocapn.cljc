@@ -8,6 +8,7 @@
   (:require [kotoba.lang.capability-values :as capabilities]
             [kotoba.lang.incidence :as incidence]
             [kotoba.lang.incidence-port :as port]
+            [kotoba.lang.signed-readback :as readback]
             [kotoba.lang.trusted-admission :as trusted]))
 
 (def captp-version trusted/captp-version)
@@ -262,3 +263,82 @@
              :ocapn/session-id (:session/id (-reference-info reference))
              :incidence/cid (get-in request [:entry :incidence/cid])
              :receipt/cid (:incidence/cid receipt)}))))))
+
+(defn signed-readback-call
+  "Build the stronger organization-bound append/readback request. The
+  challenge is one-shot state owned by the lexical readback verifier."
+  [reference verifier request challenge]
+  (when-not (request-capable-reference? reference)
+    (throw (ex-info "OCapN reference cannot request a result"
+                    {:problem :ocapn/request-not-supported})))
+  (when-not (readback/verifier? verifier)
+    (throw (ex-info "signed readback verifier required"
+                    {:problem :ocapn/readback-verifier-required})))
+  (if-let [error (append-request-error request)]
+    (throw (ex-info "invalid OCapN incidence append" error))
+    (let [info (readback/verifier-description verifier)
+          entry (:entry request)]
+      {:ocapn/profile draft-profile
+       :ocapn/to (:remote/target (-reference-info reference))
+       :ocapn/args ['append-incidence-readback
+                    (:dataspace request)
+                    (:incidence/cid entry)
+                    (incidence/canonical-bytes (:incidence/block entry))
+                    challenge
+                    (:binding/constitution-cid info)]
+       :ocapn/result :settled})))
+
+(defn signed-readback-append-provider
+  "Adapt a request-capable reference to the strongest bounded receipt mode.
+
+  Success returns an opaque VerifiedReadback admission. The remote statement
+  must bind the exact incidence read back, organization constitution, DID
+  assertion method, authenticated peer/transcript, one-shot challenge, and
+  freshness window; an injected host verifier must then validate its proof."
+  [reference verifier]
+  (when-not (request-capable-reference? reference)
+    (throw (ex-info "OCapN reference cannot request a result"
+                    {:problem :ocapn/request-not-supported})))
+  (when-not (readback/verifier? verifier)
+    (throw (ex-info "signed readback verifier required"
+                    {:problem :ocapn/readback-verifier-required})))
+  (fn append-over-ocapn-with-signed-readback! [request]
+    (when-let [error (append-request-error request)]
+      (throw (ex-info "invalid OCapN incidence append" error)))
+    (let [challenge (readback/issue-challenge! verifier request)
+          call (signed-readback-call reference verifier request challenge)
+          settlement (try
+                       (-request! reference call)
+                       (catch #?(:clj Exception :cljs :default) _
+                         ::request-failed))]
+      (cond
+        (= ::request-failed settlement)
+        (do
+          (readback/discard-challenge! verifier challenge)
+          (throw (ex-info "OCapN readback request failed"
+                          {:problem :ocapn/readback-request-failed})))
+
+        (and (map? settlement)
+             (= :broken (:ocapn/status settlement)))
+        (do
+          (readback/discard-challenge! verifier challenge)
+          (throw (ex-info "OCapN remote readback request broke"
+                          {:problem :ocapn/remote-broken})))
+
+        (not (and (map? settlement)
+                  (= #{:ocapn/status :ocapn/value} (set (keys settlement)))
+                  (= :fulfilled (:ocapn/status settlement))))
+        (do
+          (readback/discard-challenge! verifier challenge)
+          (throw (ex-info "invalid OCapN readback settlement"
+                          {:problem :ocapn/settlement-invalid})))
+
+        :else
+        (let [admission (readback/verify-envelope!
+                         verifier request challenge (:ocapn/value settlement))
+              info (readback/verified-readback-description admission)]
+          {:ocapn/remote-readback-verified? true
+           :ocapn/session-id (:session/id (-reference-info reference))
+           :incidence/cid (get-in request [:entry :incidence/cid])
+           :receipt/cid (:receipt/statement-cid info)
+           :readback/admission admission})))))
