@@ -4,7 +4,8 @@
             [kotoba.lang.capability-values :as capabilities]
             [kotoba.lang.incidence :as incidence]
             [kotoba.lang.incidence-ocapn :as ocapn]
-            [kotoba.lang.incidence-port :as port]))
+            [kotoba.lang.incidence-port :as port]
+            [kotoba.lang.trusted-admission :as trusted]))
 
 (def alice (incidence/typed-ref :did "did:key:z6Mkalice"))
 (def room (incidence/typed-ref :uri "https://example.test/rooms/a"))
@@ -16,26 +17,46 @@
                        {:room #{room} :participant #{alice}}
                        {}))
 
+(defn authenticated-session [transport]
+  (trusted/authenticate-session!
+   (constantly
+    {:session/valid? true
+     :session/id "captp-session-a"
+     :session/version ocapn/captp-version
+     :session/peer alice
+     :session/transcript-cid (incidence/incidence-cid presence)})
+   :test-handshake
+   transport))
+
 (defn connection [send!]
-  {:session/id "captp-session-a"
-   :session/version ocapn/captp-version
-   :session/authenticated? true
+  {:session (authenticated-session {:send! send!})
    :remote/target {:ocapn/descriptor :desc/export
-                   :ocapn/position 7}
-   :send! send!})
+                   :ocapn/position 7}})
 
 (defn request-connection [request!]
-  (assoc (connection identity) :request! request!))
+  {:session (authenticated-session {:send! identity :request! request!})
+   :remote/target {:ocapn/descriptor :desc/export
+                   :ocapn/position 7}})
+
+(defn verified-delegation []
+  (trusted/verify-delegation!
+   (constantly
+    {:chain/valid? true
+     :chain/problems []
+     :chain/root-iss "did:key:z6Mkroot"
+     :chain/holder "did:key:z6Mkholder"
+     :chain/resources
+     #{(str "kotoba://cap/host/ledger-append/" dataspace)}
+     :chain/expires nil
+     :chain/depth 1})
+   :test-cacao))
 
 (defn publish-opts [append! record!]
   {:dataspace dataspace
    :emissions [(incidence/assertion presence)]
    :requested (capabilities/make-cap port/append-kind dataspace)
    :effect-row #{port/append-effect}
-   :cacao-grants [{:grant/kind port/append-kind
-                   :grant/resources #{dataspace}
-                   :grant/expires nil
-                   :grant/id "ucan:rooms/a"}]
+   :verified-delegation (verified-delegation)
    :local-policy {:policy/allow {port/append-kind #{dataspace}}}
    :now now
    :record! record!
@@ -86,18 +107,13 @@
 
 (deftest connection-setup-is-closed-and-requires-authenticated-session
   (doseq [[expected opts]
-          [[:ocapn/version-unsupported
-            (assoc (connection identity) :session/version "future")]
-           [:ocapn/session-not-authenticated
-            (assoc (connection identity) :session/authenticated? false)]
+          [[:ocapn/session-not-authenticated
+            (assoc (connection identity) :session
+                   {:session/valid? true})]
            [:ocapn/target-invalid
             (assoc (connection identity)
                    :remote/target {:ocapn/descriptor :desc/answer
                                    :ocapn/position 1})]
-           [:ocapn/send-port-invalid
-            (assoc (connection identity) :send! :serialized-function)]
-           [:ocapn/request-port-invalid
-            (assoc (connection identity) :request! :serialized-function)]
            [:ocapn/connection-fields
             (assoc (connection identity) :sturdyref "ocapn://example")]]]
     (is (= expected

@@ -7,19 +7,16 @@
   op:deliver abstraction without making locator or sturdyref data executable."
   (:require [kotoba.lang.capability-values :as capabilities]
             [kotoba.lang.incidence :as incidence]
-            [kotoba.lang.incidence-port :as port]))
+            [kotoba.lang.incidence-port :as port]
+            [kotoba.lang.trusted-admission :as trusted]))
 
-(def captp-version "1.0")
+(def captp-version trusted/captp-version)
 (def draft-profile "ocapn-captp-1.0-draft-2026-08-15")
 (def durable-receipt-version incidence/append-durable-version)
 (def durable-receipt-kind incidence/append-durable-kind)
 
 (def ^:private reference-fields
-  #{:session/id :session/version :session/authenticated?
-    :remote/target :send!})
-
-(def ^:private request-reference-fields
-  (conj reference-fields :request!))
+  #{:session :remote/target})
 
 (def ^:private target-fields
   #{:ocapn/descriptor :ocapn/position})
@@ -31,17 +28,17 @@
 (defprotocol ^:private RemoteRequestReference
   (-request! [reference call]))
 
-(deftype ^:private LiveReference [info send!]
+(deftype ^:private LiveReference [info session]
   RemoteReference
   (-reference-info [_] info)
-  (-deliver! [_ message] (send! message)))
+  (-deliver! [_ message] (trusted/session-send! session message)))
 
-(deftype ^:private LiveRequestReference [info send! request!]
+(deftype ^:private LiveRequestReference [info session]
   RemoteReference
   (-reference-info [_] info)
-  (-deliver! [_ message] (send! message))
+  (-deliver! [_ message] (trusted/session-send! session message))
   RemoteRequestReference
-  (-request! [_ call] (request! call)))
+  (-request! [_ call] (trusted/session-request! session call)))
 
 (defn- non-negative-int?
   [x]
@@ -61,30 +58,14 @@
     (not (map? opts))
     {:problem :ocapn/connection-not-a-map}
 
-    (not (contains? #{reference-fields request-reference-fields}
-                    (set (keys opts))))
+    (not= reference-fields (set (keys opts)))
     {:problem :ocapn/connection-fields}
 
-    (not (capabilities/non-empty-string? (:session/id opts)))
-    {:problem :ocapn/session-id-invalid}
-
-    (not= captp-version (:session/version opts))
-    {:problem :ocapn/version-unsupported
-     :expected captp-version
-     :actual (:session/version opts)}
-
-    (not (true? (:session/authenticated? opts)))
+    (not (trusted/authenticated-session? (:session opts)))
     {:problem :ocapn/session-not-authenticated}
 
     (not (target? (:remote/target opts)))
-    {:problem :ocapn/target-invalid}
-
-    (not (fn? (:send! opts)))
-    {:problem :ocapn/send-port-invalid}
-
-    (and (contains? opts :request!)
-         (not (fn? (:request! opts))))
-    {:problem :ocapn/request-port-invalid}))
+    {:problem :ocapn/target-invalid}))
 
 (defn connected-reference
   "Construct an opaque live reference from an already authenticated CapTP
@@ -92,13 +73,13 @@
   [opts]
   (if-let [error (connection-error opts)]
     (throw (ex-info "invalid OCapN live reference" error))
-    (let [info {:ocapn/profile draft-profile
-                :session/id (:session/id opts)
-                :session/version (:session/version opts)
-                :remote/target (:remote/target opts)}]
-      (if (contains? opts :request!)
-        (LiveRequestReference. info (:send! opts) (:request! opts))
-        (LiveReference. info (:send! opts))))))
+    (let [session (:session opts)
+          info (assoc (trusted/session-description session)
+                      :ocapn/profile draft-profile
+                      :remote/target (:remote/target opts))]
+      (if (trusted/request-capable-session? session)
+        (LiveRequestReference. info session)
+        (LiveReference. info session)))))
 
 (defn live-reference?
   [x]

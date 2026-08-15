@@ -7,7 +7,8 @@
   declared effect row agree. No transport is selected here."
   (:require [kotoba.lang.capability-host :as host]
             [kotoba.lang.capability-values :as capabilities]
-            [kotoba.lang.incidence :as incidence]))
+            [kotoba.lang.incidence :as incidence]
+            [kotoba.lang.trusted-admission :as trusted]))
 
 (def append-kind :host/ledger-append)
 (def append-effect :host/ledger-append)
@@ -37,7 +38,7 @@
         :else nil))))
 
 (defn- request-error
-  [dataspace requested now record! append!]
+  [dataspace requested verified-delegation now record! append!]
   (cond
     (not (capabilities/non-empty-string? dataspace))
     {:problem :dataspace/resource-invalid}
@@ -50,6 +51,9 @@
 
     (and (some? record!) (not (fn? record!)))
     {:problem :dataspace/recorder-invalid}
+
+    (not (trusted/verified-delegation? verified-delegation))
+    {:problem :dataspace/delegation-not-verified}
 
     (not (capabilities/capability? requested))
     {:problem :dataspace/capability-invalid}
@@ -67,17 +71,19 @@
 (defn publish-emissions!
   "Publish verified facet EMISSIONS through an injected append provider.
 
-  OPTS contains exact dataspace and capability inputs plus an injected
-  append function accepting a map with :dataspace, :entry, and :capability.
+  OPTS contains exact dataspace and capability inputs, an opaque verified
+  delegation value, plus an injected append function accepting a map with
+  :dataspace, :entry, and :capability.
 
   Every entry is hash-verified before the first effect. Each append then passes
   through guard-ability-call, so the provider sees only the concrete
   post-intersection capability. Processing stops on the first denial. Provider
   exceptions are receipted by the host guard and rethrown; already appended
   content remains append-only."
-  [{:keys [dataspace emissions requested effect-row cacao-grants local-policy
-           now record! append!]}]
-  (if-let [error (or (request-error dataspace requested now record! append!)
+  [{:keys [dataspace emissions requested effect-row verified-delegation
+           local-policy now record! append!]}]
+  (if-let [error (or (request-error dataspace requested verified-delegation
+                                    now record! append!)
                      (emissions-error emissions))]
     {:ok? false :reason (:problem error) :error error}
     (loop [remaining emissions
@@ -89,7 +95,7 @@
                {:call append-call
                 :requested requested
                 :effect-row effect-row
-                :cacao-grants cacao-grants
+                :cacao-grants (trusted/delegation-grants verified-delegation)
                 :local-policy local-policy
                 :now now
                 :record! record!
