@@ -149,7 +149,8 @@
     [:p {:class "kot-eyebrow"} "The language for AI agents and vibe coding"]
     (dds/heading 1 "Let AI write the code. Never hand it the keys." {:size "48"})
     [:p {:class "kot-lead"}
-     "Kotoba is an AI-native, capability-safe language. Generated programs can touch only explicitly granted resources—even when a Mythos-class agent is looking for a way out."]
+     [:strong "If it compiles, it's contained."]
+     " Kotoba is an AI-native, capability-safe language: an effect you were not granted cannot be written, so the compiler refuses to emit the artifact at all—even when a Mythos-class agent is looking for a way out."]
     [:div {:class "kot-actions"}
      (dds/button "Start in 60 seconds" {:href "#start" :size "lg"})
      (dds/button "View the language authority" {:href "https://github.com/kotoba-lang/kotoba-lang"
