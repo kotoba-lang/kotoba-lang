@@ -10,8 +10,13 @@ On macOS or Linux with Homebrew:
 
 ```sh
 brew tap kotoba-lang/kotoba
+brew trust kotoba-lang/kotoba
 brew install kotoba
 ```
+
+Homebrew 6 refuses to load a formula from a tap it has not been told to trust,
+so without the middle line `brew install` stops with `Refusing to load formula
+… from untrusted tap`.
 
 Alternatively, use the checksum-verifying installer published by the
 implementation repository:
