@@ -323,6 +323,97 @@
   {:incidence/cid (incidence-cid block)
    :incidence/block block})
 
+
+;; ── projection onto the datom plane ──────────────────────────────────────────
+;;
+;; An incidence block and a set of `{:s :p :o}` triples are the same value here,
+;; and `datoms` / `from-datoms` are asserted to round-trip rather than described
+;; as roughly equivalent.
+;;
+;; That is a fact about THIS incidence model and not about incidence in general.
+;; `com-junkawasaki/inc` and the EAF ontology carry `Endpoint = {incidence, role,
+;; sign, mult}` with `:signs [-1 0 1]`; those two fields have no counterpart in a
+;; block, because `:incidence/roles` maps a role to a SET of participants. A set
+;; carries no multiplicity and no orientation, so there is nothing for the triple
+;; form to lose:
+;;
+;;   role -> non-empty set of participants   ==   one triple per participant
+;;   set semantics (no order, no repeats)    ==   set-of-triples semantics
+;;
+;; This is why the arity-3 query engine is adequate for the labelled plane as it
+;; stands, and why a wider Atom is not what the labelled plane is waiting for.
+;; If `sign` or `mult` ever enter this model, this projection becomes lossy and
+;; must be revisited -- the round-trip test is what will say so.
+
+(def reserved-predicates
+  "Predicates the projection uses for a block's own structure.
+
+  A ROLE whose key is one of these would produce a triple indistinguishable from
+  a structural one, and the projection refuses such a block instead of emitting
+  a set that cannot be read back. Fail closed: a lossy projection that looked
+  like a lossless one is exactly the failure this round-trip exists to prevent."
+  #{:incidence/kind :incidence/parents :incidence/evidence :incidence/policies})
+
+(defn- fact-predicate [k] [:incidence/fact k])
+
+(defn- fact-predicate? [p]
+  (and (vector? p) (= 2 (count p)) (= :incidence/fact (first p))))
+
+(defn projectable?
+  "True when `block` has no role key that would collide with a structural
+  predicate. `datoms` refuses the rest."
+  [block]
+  (empty? (filter #(or (contains? reserved-predicates %) (vector? %))
+                  (keys (:incidence/roles block)))))
+
+(defn datoms
+  "`block` addressed by `cid` as a set of `{:s :p :o}` triples, or nil when the
+  block is not `projectable?`.
+
+  Roles keep their own keyword as the predicate, because a role is an EDGE and
+  the edge form is the one a query joins on: `[?i :organization/constituent ?p]`
+  reads as what it is. Facts are attributes of the incidence rather than edges,
+  so they are qualified as `[:incidence/fact k]` -- which also means a fact key
+  can never collide with a structural predicate or with a role."
+  [cid block]
+  (when (projectable? block)
+    (set
+     (concat
+      [{:s cid :p :incidence/kind :o (:incidence/kind block)}]
+      (for [[role participants] (:incidence/roles block)
+            participant participants]
+        {:s cid :p role :o participant})
+      (for [[k v] (:incidence/facts block)]
+        {:s cid :p (fact-predicate k) :o v})
+      (for [field [:incidence/parents :incidence/evidence :incidence/policies]
+            ref (get block field)]
+        {:s cid :p field :o ref})))))
+
+(defn from-datoms
+  "Inverse of `datoms` for the triples whose `:s` is `cid`, or nil.
+
+  nil when the projection is not well formed -- no kind, or more than one. The
+  three set-valued structural fields are rebuilt as empty sets when absent,
+  which is what the block form requires and what `datoms` emitted nothing for."
+  [cid triples]
+  (let [mine (filter #(= cid (:s %)) triples)
+        kinds (distinct (map :o (filter #(= :incidence/kind (:p %)) mine)))]
+    (when (= 1 (count kinds))
+      (let [structural (into {} (for [f [:incidence/parents :incidence/evidence
+                                         :incidence/policies]]
+                                  [f (set (map :o (filter #(= f (:p %)) mine)))]))]
+        (merge
+         {:incidence/kind (first kinds)
+          :incidence/roles
+          (reduce (fn [acc {:keys [p o]}] (update acc p (fnil conj #{}) o))
+                  {}
+                  (remove #(or (contains? reserved-predicates (:p %))
+                               (fact-predicate? (:p %)))
+                          mine))
+          :incidence/facts
+          (into {} (for [{:keys [p o]} mine :when (fact-predicate? p)]
+                     [(second p) o]))}
+         structural)))))
 (defn verify-addressed
   "Verify an addressed envelope before projection."
   [entry]
