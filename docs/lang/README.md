@@ -96,6 +96,23 @@ corresponding effect row and runtime policy intersection. Neither code identity
 nor an ability replaces Wasm isolation, package admission, or host/provider
 resource-scope checks.
 
+## Canonical Value Codec
+
+Definition identity covers code; it does not cover the *values* code and data
+share. Three unrelated canonical forms coexist today, and none of them
+round-trips a keyword or orders a set deterministically. The single value codec
+that closes this is proposed in
+[`ADR-kotoba-canonical-value-codec.md`](../adr/ADR-kotoba-canonical-value-codec.md);
+its machine-readable contract is [`lang/value-codec.edn`](../../lang/value-codec.edn).
+
+`kotoba.value.v1` is normative wherever a Kotoba EDN value acquires an identity
+or crosses a content-addressed boundary: the semantic literal IR, an IPLD value
+position, and a persisted datom leaf. It is proposed, not implemented — until
+its `arrangement` and `semantic-code` stages land, string-only persistence and
+the v1 literal subset remain the operative contracts. A value CID is an
+identity, never an authority; the codec relaxes no capability rule and makes no
+query effect-free.
+
 The machine-readable source contract lives at `lang/profile.edn`. The current
 classification of intentional safety constraints, deliberate semantic
 simplifications, partial features, and ordinary implementation gaps lives at

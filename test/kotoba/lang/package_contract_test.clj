@@ -63,7 +63,18 @@
   (doseq [valid ["0.1.0" "1.2.3" "2.0.0-rc.1" "2.0.0+build.9"]]
     (is (contract/semver? valid)))
   (doseq [invalid [nil "" "v1.2.3" "1" "1.2" "01.2.3" "latest"]]
-    (is (false? (contract/semver? invalid)))))
+    (is (false? (contract/semver? invalid))))
+  (let [manifest (read-edn "lang/package-conformance/positive/package-manifest.edn")
+        lock (read-edn "lang/package-conformance/positive/kotoba.lock.edn")]
+    (is (= "package version must be SemVer"
+           (:message
+            (contract/package-manifest-error
+             (assoc manifest :kotoba.package/version "latest")))))
+    (is (= "dependency version must be SemVer"
+           (:message
+            (contract/lockfile-error
+             (assoc-in lock [:deps 0 :dep/version] "v1.2.3")
+             {:declared-capabilities []}))))))
 
 (def pure-definition
   {:definition/profile-version 1

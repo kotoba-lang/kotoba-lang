@@ -1,6 +1,7 @@
 (ns kotoba.lang.package-contract
   (:require [clojure.set :as set]
             [clojure.string :as str]
+            [kotoba.lang.code-identity :as identity]
             [multiformats.core :as mf]
             #?(:clj [ed25519.core :as ed25519]))
   #?(:clj (:import (java.util Base64))))
@@ -25,6 +26,19 @@
 
 (def allowed-package-kinds
   #{:library :adapter :schema-contract :tool :component})
+
+(def ^:private semver-pattern
+  ;; SemVer 2.0.0, including the no-leading-zero rule for the three numeric
+  ;; core identifiers and for numeric pre-release identifiers.
+  #"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$")
+
+(defn semver?
+  "True when X is a complete SemVer 2.0.0 string.
+
+  Package and dependency versions are authority inputs, so conveniences such
+  as `v1.2.3`, partial versions, ranges, and mutable labels fail closed."
+  [x]
+  (boolean (and (string? x) (re-matches semver-pattern x))))
 
 (defn non-empty-string?
   [x]
@@ -295,6 +309,9 @@
         (invalid "unknown package kind"
                  {:package (:kotoba.package/name m)
                   :allowed allowed-package-kinds}))
+      (when-not (semver? (:kotoba.package/version m))
+        (invalid "package version must be SemVer"
+                 {:value (:kotoba.package/version m)}))
       (contract-surfaces-error m "kotoba.package")
       (when (and (= :adapter (:kotoba.package/kind m))
                  (empty? (:kotoba.package/consumes m)))
@@ -335,9 +352,21 @@
         (invalid "lock deps vector required" {:value (:deps m)}))
       (some (fn [dep]
               (or (missing-key dep lock-required "missing required lock field")
+                  (when-not (semver? (:dep/version dep))
+                    (invalid "dependency version must be SemVer"
+                             {:dependency (:dep/name dep)
+                              :value (:dep/version dep)}))
                   (when (and (:dep/kind dep)
                              (not (contains? allowed-package-kinds (:dep/kind dep))))
                     (invalid "unknown package kind" {:dependency (:dep/name dep)}))
+                  (when-let [definition-cids (:dep/definition-cids dep)]
+                    (when-not (and (vector? definition-cids)
+                                   (= (count definition-cids)
+                                      (count (set definition-cids)))
+                                   (every? identity/cid? definition-cids))
+                      (invalid "definition cids must be a unique CID vector"
+                               {:dependency (:dep/name dep)
+                                :value definition-cids})))
                   (contract-surfaces-error dep "dep")
                   (some (fn [k]
                           (when-not (cid? (get dep k))
@@ -357,7 +386,12 @@
                     (invalid "capability grant exceeds package declaration"
                              {:grant (:dep/capabilities dep)
                               :declared (:declared-capabilities tc)}))))
-            (:deps m))))))
+            (:deps m))
+      (when-let [resolved (:resolved-definitions tc)]
+        (let [result (identity/verify-locked-definitions m resolved)]
+          (when-not (:ok? result)
+            (invalid "definition identity lock verification failed"
+                     result))))))))
 
 (defn validate-case
   [tc data]

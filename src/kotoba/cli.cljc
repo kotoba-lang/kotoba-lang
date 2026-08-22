@@ -10,7 +10,8 @@
 
 (def default-contract-path "lang/cli.edn")
 
-(def required-commands #{:run :compile :check :db :git :rad :deploy :hinshitsu})
+(def required-commands
+  #{:run :compile :check :codebase :db :git :rad :deploy :hinshitsu})
 
 (def adapter-kinds #{:node :jvm :native :browser :edge})
 

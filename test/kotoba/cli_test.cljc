@@ -11,17 +11,17 @@
 (deftest contract-validates-in-cljc
   (let [result (cli/validate-contract contract)]
     (is (:kotoba.cli/ok? result))
-    (is (= {:version 1
-            :commands [:run :compile :check :db :git :rad :deploy :hinshitsu]
-            :command-count 8
-            :option-count 44}
+    (is (= {:version 2
+            :commands [:run :compile :codebase :check :db :git :rad :deploy :hinshitsu]
+            :command-count 9
+            :option-count 73}
            (:kotoba.cli/data result)))))
 
 (deftest cljc-authority-implements-contract-commands
   (is (= {:kotoba.cli/ok? true
           :kotoba.cli/source :cljc
-          :kotoba.cli/contract-commands ["check" "compile" "db" "deploy" "git" "hinshitsu" "rad" "run"]
-          :kotoba.cli/implemented-commands ["check" "compile" "db" "deploy" "git" "hinshitsu" "rad" "run"]
+          :kotoba.cli/contract-commands ["check" "codebase" "compile" "db" "deploy" "git" "hinshitsu" "rad" "run"]
+          :kotoba.cli/implemented-commands ["check" "codebase" "compile" "db" "deploy" "git" "hinshitsu" "rad" "run"]
           :kotoba.cli/missing-commands []}
          (cli/conformance contract))))
 
@@ -44,6 +44,23 @@
     (is (:kotoba.cli/ok? result))
     (is (= :check (:kotoba.cli/command result)))
     (is (= :contract/valid (:kotoba.cli/code result)))))
+
+(deftest semantic-code-and-codebase-are-public-contract-surfaces
+  (let [specs (cli/command-specs contract)]
+    (is (some #{:semantic-code}
+              (->> specs :check :options
+                   (filter #(= :kind (:id %))) first :values)))
+    (is (some #{:semantic-test}
+              (->> specs :check :options
+                   (filter #(= :kind (:id %))) first :values)))
+    (is (= :m2 (get-in specs [:codebase :tier])))
+    (is (some #{:build-cache}
+              (map :id (get-in specs [:compile :options]))))
+    (is (some #{:run} (get-in specs [:codebase :subcommands])))
+    (is (some #{:network-replicate}
+              (get-in specs [:codebase :subcommands])))
+    (is (every? (set (get-in specs [:codebase :subcommands]))
+                [:cache-publish :cache-fetch :provider-discover]))))
 
 (deftest side-effecting-commands-return-adapter-data
   (doseq [command ["run" "db" "git" "rad" "deploy" "hinshitsu"]]

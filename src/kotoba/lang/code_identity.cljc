@@ -77,7 +77,7 @@
      {:valid? false :message "definition dependency CID required"})
    (when-not (= (count (:definition/dependencies definition))
                 (count (set (:definition/dependencies definition))))
-     {:valid? false :message "definition dependencies must be unique"}))
+     {:valid? false :message "definition dependencies must be unique"})))
 
 (defn identity-payload
   "The exact, versioned payload addressed by `definition-cid`."
@@ -141,6 +141,6 @@
                     :expected expected-cid :actual actual :entry entry}
 
                    (not (contains? (get allowed name #{}) expected-cid))
-                   {:ok? false :reason :definition/not-locked :entry entry})))))
+                   {:ok? false :reason :definition/not-locked :entry entry}))))
            resolved)
      {:ok? true})))

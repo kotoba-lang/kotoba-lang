@@ -3,6 +3,7 @@
             [clojure.java.io :as io]
             [clojure.set :as set]
             [clojure.test :refer [deftest is testing]]
+            [kotoba.lang.capability-catalog :as capability-catalog]
             [kotoba.lang.capability-values :as caps]))
 
 (defn read-edn [path]
@@ -35,6 +36,29 @@
     (is (= :forbidden
            (get-in semantics [:rules :production-effective-wildcard])))
     (is (true? (get-in semantics [:revocation :fail-closed])))))
+
+(deftest q2-semantic-catalog-generates-compiler-and-provider-inventories
+  (let [semantics (read-edn "lang/capability-semantics.edn")
+        validation (capability-catalog/validate semantics)
+        operations (:compiler-operations semantics)
+        projections (:projections validation)
+        registry (read-edn "../compiler/resources/kotoba/compiler/capability-registry.edn")
+        component (read-edn "../compiler/resources/kotoba/lang/component-model-v1.edn")
+        provider (read-edn "../compiler/resources/kotoba/lang/provider-conformance-v1.edn")
+        provider-operations (->> (:kits provider)
+                                 (mapcat :capabilities)
+                                 (sort-by :id)
+                                 vec)]
+    (is (:valid? validation) (pr-str (:problems validation)))
+    (is (= (:registry projections) registry))
+    (is (= (:component-capabilities projections) (:capabilities component)))
+    (is (= (:provider-capabilities projections) provider-operations))
+    (is (every? #(.isFile
+                  (io/file "../compiler/resources" %))
+                (vals (:contract-resources projections))))
+    (is (= (count operations) (count (set (map :name operations)))))
+    (is (= (count operations) (count (set (map :id operations)))))
+    (is (every? #(<= 1 (:id %) 255) operations))))
 
 (deftest q2-production-policy-cannot-yield-wildcard-authority
   (let [requested (caps/make-cap :graph-read :any)
