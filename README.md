@@ -1,345 +1,331 @@
 # Kotoba
 
-Capability-safe language for untrusted AI-written code.
+> **AI writes freely. Kotoba draws the boundary.**
 
-A compiled program can use only the authority it was granted. Deny-by-default.
-[kotoba-lang.org](https://kotoba-lang.org) · CLI/implementation:
-[`kotoba-lang/kotoba`](https://github.com/kotoba-lang/kotoba)
+Kotoba is an intuitive, declarative, security-first language and computing
+stack for AI agents—and for humans who vibe-code with them.
+
+**Existing software adds security around the program. Kotoba makes security a
+property of the whole computation.**
+
+[kotoba-lang.org](https://kotoba-lang.org) · implementation and CLI:
+[`kotoba-lang/kotoba`](https://github.com/kotoba-lang/kotoba) ·
+[getting started](docs/getting-started.md)
 
 ```sh
-brew tap kotoba-lang/kotoba && brew install kotoba
+brew tap kotoba-lang/kotoba
+brew install kotoba
 kotoba -e '(+ 1 2)'
-kotoba compile examples/hello.kotoba --target wasm --output hello.wasm --json
 ```
 
-An empty policy denies every host effect, including `:host/http`. Hosted billed
-deploy of those grants is not live. Wasm Component is the primary portable
-profile. Bounded native AOT (x86-64/AArch64) is a supported, explicitly selected
-backend; ordinary-application native (ambient OS process) is a non-goal.
+That expression follows the same admitted compilation path as a file. It is
+compile-and-run convenience, not unrestricted runtime `eval`.
 
-The rest of this file is the language contract. Start with
-[docs/getting-started.md](docs/getting-started.md) if you want to run something.
+## Why Kotoba
 
-## Purpose and philosophy
+AI can produce useful software faster than a human can review every line. The
+problem is no longer only whether generated code is correct. It is whether the
+code can reach files, networks, secrets, processes, models, or money that the
+request never intended to expose.
 
-Kotoba is designed first for software written, changed, tested, and operated by
-AI agents and by people directing them. It supports autonomous coding and
-vibe-coding workflows without treating generated code, tool requests, or
-observed content as authority. Every program must cross explicit, deterministic
-capability, effect, resource, package, and target-admission boundaries.
+Most systems begin with a general-purpose program and add sandboxing, IAM,
+containers, policy engines, signing, and deployment controls around it. Those
+layers still matter, but they are asked to reconstruct intent after the program
+already has broad semantics.
 
-Safety takes priority over ambient convenience: unsupported behavior fails
-closed, and a module can use only the authority it was explicitly granted. The
-development loop is meant to stay fast and reproducible through machine-readable
-contracts, checked KIR shared across qualified targets, bounded workers,
-deterministic caches, target-aware tests, and signed build/execution receipts.
-Performance claims are evidence for a named workload and host, never a universal
-language ranking.
+Kotoba starts from the opposite direction:
 
-Cryptographic safety also has a precise scope. CID-pinned inputs, signatures,
-trust/revocation policy, artifact seals, and receipts protect integrity and
-provenance. Encryption, decryption, key use, and secret access require explicit,
-purpose-bound capabilities and qualified providers; the language does not claim
-that all source or runtime data is automatically encrypted.
+- authority is explicit and deny-by-default;
+- effects are inferred and checked before an artifact is emitted;
+- code and dependencies have content-derived identities;
+- the host binds only the capabilities that survived admission; and
+- successful and denied actions can produce receipts.
 
-Kotoba follows a **white-hat philosophy**: its intended uses are authorized
-construction, defense, verification, repair, and auditable automation—not
-bypassing controls or acquiring hidden authority. Intent alone is not a security
-boundary; the compiler/runtime capability model remains the enforcement layer.
+The goal is not to decide that AI-written code is trustworthy. The goal is to
+make the boundary deterministic even when the author is an agent.
 
-### Design influences
+## What Kotoba feels like
 
-The influences are aspect-specific, not compatibility claims:
+**Where Lisp's mind meets Rust's discipline.**
 
-- **Lisp/Clojure**: data-oriented programs, immutable values, a small composable
-  language, and interactive development.
-- **Rust**: compile-time safety discipline and affine authority handling; Kotoba
-  is benchmarked against Rust rather than copying its general ownership system.
-- **Deno**: secure-by-default execution with explicit permissions.
-- **Unison**: semantic, content-addressed definition identity.
-- **Ethereum/CACAO**: signed identity, attenuated delegation, and verifiable
-  authorization/receipt boundaries, without implying EVM compatibility.
-- **IPFS**: CID-addressed, byte-verified discovery and distribution.
-- **Nix**: pinned inputs, declarative environments, reproducible artifacts, and
-  deploying the same admitted closure that was tested.
+Kotoba keeps a small, data-oriented, Clojure-shaped language: immutable values,
+ordinary functions, explicit data, and a composable syntax that is easy for
+humans and models to generate. It adds static discipline around authority,
+effects, resources, packages, and artifact identity.
 
-## Why Kotoba?
+It is deliberately narrower than Clojure. Ambient interop, runtime code
+loading, unrestricted mutation, guest-defined macros, and unbounded concurrency
+are outside the admitted component surface. The restriction is the product:
+programs remain readable while the dangerous degrees of freedom stay visible
+at the boundary.
 
-- **Small source surface**: Kotoba source is a Kotoba/EDN subset with `.kotoba`
-  as the canonical extension.
-- **Clojure-family shape**: `.clj` is Clojure, `.cljs` is ClojureScript,
-  `.cljk` is CLJ Kotoba, and `.cljc` is common source across all three reader
-  targets (`:clj`, `:cljs`, and `:kotoba`).
-- **Implemented in Clojure ("Clojure on Clojure")**: the compiler, CLI, and
-  conformance tooling that process this Clojure-shaped language are themselves
-  written in Clojure/ClojureScript (`.cljc`). An earlier Rust implementation
-  was fully retired in favor of this CLJC authority (see
-  `docs/rust-migration-inventory.md`).
-- **Multi-target execution**: [`kotoba-lang/amu`](https://github.com/kotoba-lang/amu)
-  admits source once into checked KIR and emits Wasm/Wasm Components, restricted
-  JavaScript, or sealed KEXE native artifacts for x86-64 and AArch64. Wasm
-  Component remains the primary portable application profile; direct native AOT
-  is a supported, explicitly selected backend.
-- **Capability-safe tooling**: safe-policy, safe-build, and selfhost-inspect are
-  part of the expected user-facing workflow. Safety is *benchmarked against*
-  Rust, not copied from it: Kotoba's capability-confinement model
-  (deny-by-default, explicit typed capabilities, signed audit receipts) is
-  ranked on an explicit safety ladder above ordinary Rust-style ownership/
-  borrow safety (see `docs/adr/ADR-safe-capability-language.md`). A general
-  Rust-style borrow/lifetime system over every value was deliberately NOT
-  built — T1 Memory Safety is already achieved without one. What shipped
-  instead is a narrow slice scoped only to capability-typed values
-  (deterministic drop, no implicit clone: a capability handle may be
-  consumed at most once per execution path — `kotoba.runtime/cap-affine-
-  problems` in `kotoba-lang/kotoba`, `:cap-value-reused`), which is what the
-  ADR's own safety ladder actually calls for.
-- **Verified native execution without a Wasm dependency**: Amu emits machine
-  instructions directly without an assembler, LLVM, JVM JIT, or Wasm runtime.
-  Its independent verifier regenerates and compares the sealed code;
-  [`tender-native`](https://github.com/kotoba-lang/tender-native) verifies signed
-  KEXE trust/policy, maps code W^X, executes it in a supervised loader process,
-  and produces a signed receipt. The supported native language/ABI slice is
-  bounded and fails closed outside its qualified coverage.
-- **Conformance-oriented**: the profile is machine-readable and backed by
-  fixtures so independent tools can agree on source behavior.
+**A language AI agents can use, not abuse.** This is an engineering direction,
+not a claim that software can never be exploited.
 
-Kotoba is not "any JVM Clojure or ClojureScript program runs." It is a
-Clojure-shaped profile with its own compatibility contract.
+## Hello, world
 
-The migration direction is **source preservation plus safety elaboration**:
-ordinary Clojure-shaped values and functions stay readable, while the compiler
-adds inferred effects, typed abilities, semantic definition identity, exact
-imports, and resource bounds. Numeric capability IDs, WIT details, provider
-callbacks, and host objects are not the application programming model. See
-[`docs/kotoba-centered-migration-plan.md`](docs/kotoba-centered-migration-plan.md).
-Root decision: `ADR-2607279200`.
+Create `hello.kotoba`:
 
-## Component language, runtime roles, and safety qualification
+```clojure
+(ns hello (:export [main]))
 
-`.kotoba` means canonical capability-safe **component source**, not
-"guest-only" or "pure-only" source. A Kotoba component may implement domain
-logic, orchestration, policy, an HTTP client, or a database provider, provided
-all transitive effects are declared imports and no ambient authority is
-introduced.
+(defn main [] :i64
+  (+ 40 2))
+```
 
-**Guest** and **host** are relative runtime roles. A component is a guest of
-the runtime or provider supplying its imports; the same component is a host to
-a downstream component whose imports it implements. For example, an HTTP
-provider written in `.kotoba` can import scoped socket/TLS/clock capabilities
-and export `http/get`. It does not gain network access from its extension.
+Compile it to the primary portable target:
 
-`aiueos` decides scoped grants. `kototama` is the component tender/linker: it
-admits already-emitted Wasm components, links declared imports and exports,
-binds granted capabilities, and enforces resource limits. A minimal native TCB
-still owns the Wasm engine, raw syscall bindings, root secret custody, and
-grant-verification roots.
+```sh
+kotoba compile hello.kotoba --target wasm --output hello.wasm --json
+```
 
-The normative role separation and provider examples are in
-[`lang/component-role-model.edn`](lang/component-role-model.edn).
-The portable platform ABI is WIT plus the WebAssembly Component Model with a
-WASI 0.3 baseline; see
-[`lang/wasm-component-platform.edn`](lang/wasm-component-platform.edn) and the
-corresponding platform ADR. Async functions, futures, and streams are explicit
-bounded effects, never ambient authority.
+Or compile a restricted web artifact:
 
-The normative terminology, end-to-end capability invariant, Deno/wasmCloud
-comparison boundaries, and the reverse-topological qualification plan that
-must precede fleet-wide CLJC migration live in
-[`lang/safety-qualification.edn`](lang/safety-qualification.edn). In
-particular, `kototama` is the runtime/tender analogue, not the whole wasmCloud
-control plane; the accepted wasmCloud/wadm control-plane analogue is the
-`murakumo` family.
+```sh
+kotoba compile hello.kotoba --target web --output hello.mjs --json
+```
 
-Q1 safety claims and Q2 executable capability semantics are recorded in
-[`lang/safety-claims.edn`](lang/safety-claims.edn) and
-[`lang/capability-semantics.edn`](lang/capability-semantics.edn). Run
-`bb scripts/check-safety-qualification.bb` to reject missing evidence,
-and `clojure -M:grammar-authority` (or `nbb scripts/check-grammar-authority.cljs`)
-to reject guest-grammar / surface-status / vendor drift (W0),
-capability-catalog drift, or production wildcard authority.
+An empty policy grants no host effects:
 
-Q1-Q8 now pass for the bounded reference slice recorded in
-`../kotoba/qualification/q8-report.edn`, including a CLJC-shadowed pure port,
-a denied/allowed capability port, and guarded native OS-isolation conformance.
-This is not fleet production maturity: fleet-wide migration remains
-unauthorized and the CLJC oracle is retained.
+```clojure
+{:policy/allow #{}
+ :policy/forbid-wildcard true}
+```
 
-Q9 is now authorized only for bounded Wave 1 tranches; Waves 2-5 and production
-deployment remain unauthorized. The live 5-org path inventory, dependency
-waves, per-repository gate, soak/rollback policy, and current status are in
-[`lang/q9-migration.edn`](lang/q9-migration.edn) and
-[`lang/q9-inventory.edn`](lang/q9-inventory.edn). Run
-`bb scripts/check-q9-migration.bb` before changing a tranche. Inventory drift,
-missing paths, duplicate paths, dependency-open waves, or weakened rollback
-requirements fail closed.
+Network, storage, model access, secrets, and other external actions require a
+resource-scoped capability and a host/provider qualified to enforce it.
 
-Wave 1 preflight found 863 generated schema-DSL files using the bare
-`.kotoba` extension. They are not canonical Kotoba programs and are tracked in
-[`lang/q9-kotoba-extension-audit.edn`](lang/q9-kotoba-extension-audit.edn).
-Tranche 1 moved ten of them to `.kotoba-schema` and updated their manifest
-consumers, leaving 853 collisions. No CLJC consumer cutover is performed until
-a bounded component/native-TCB split is extracted and oracle-qualified.
+## The technical model
 
-All ten Tranche 1 repositories now extract the same bounded page-limit
-decision into a repository-local, zero-import `.kotoba` component. Each CLJC
-function remains the oracle; clock/UUID/atom-backed CRUD remains in the
-temporary native/compatibility adapter for this tranche. Future tranches may
-move HTTP, database and other provider logic to `.kotoba` by declaring their
-lower-level imports. Reference Wasm, compiler KIR, and each oracle agree with
-no effects. Consumer cutover is still false until three signed green murakumo
-receipts and seven days of soak are recorded for every repository.
-Published murakumo fleet evidence is stored in
-[`lang/q9-wave1-tranche-1-soak.edn`](lang/q9-wave1-tranche-1-soak.edn).
-After the pilot revisions are committed and published, run
-`bb scripts/collect-q9-soak.bb`; then use `bb scripts/check-q9-soak.bb` as the
-fail-closed cutover gate. It requires three distinct successful `main` push
-runs per repository, enrolled fleet signers, unchanged qualification Git
-blobs, and 604800 elapsed seconds. Local preflight never counts as CI evidence.
-Qualification dependencies use published immutable Git SHAs, not sibling
-`local/root` paths, so every murakumo fleet gate can reproduce the test from a
-standalone checkout. GitHub is only the immutable Git transport for the tested
-tree and receipt ledger; GitHub Actions is not an evidence authority.
+```text
+intent + source
+      ↓
+parse, elaborate, and type-check
+      ↓
+checked KIR
+      ↓
+capability / effect / resource admission
+      ↓
+content-addressed, target-specific artifact
+      ↓
+host verifies, binds, and enforces the admitted grant
+      ↓
+result + execution receipt
+```
+
+### 1. Checked KIR
+
+Kotoba source is lowered into a typed, effect-aware intermediate
+representation: checked KIR. Backends consume that checked representation
+rather than each inventing their own interpretation of source authority.
+Unsupported types, effects, resources, or target surfaces fail closed.
+
+Checked KIR is also a trust boundary. Artifact verification treats embedded IR
+as hostile input and rechecks the properties required by the selected backend.
+
+### 2. Capability and effect admission
+
+A program does not receive ambient access to the host. Its transitive effects
+must be representable, inferred, and admitted. Requested authority, delegated
+authority, local policy, and target support intersect; none of those steps can
+silently widen the grant.
+
+```text
+requested ∩ delegated ∩ local policy ∩ target support = effective grant
+```
+
+An ungranted capability is absent or unbound. Providers must independently
+validate concrete resource scope at the moment of use.
+
+### 3. Content-addressed artifacts
+
+Source definitions, dependency closures, policies, locks, compiler contracts,
+and target ABIs can participate in artifact identity. The build therefore says
+which admitted computation it represents, not merely which mutable filename
+was compiled.
+
+Content addressing proves byte identity, not authorization. Signatures,
+trusted-signer policy, validity, revocation, and host admission remain separate
+checks.
+
+### 4. Host enforcement
+
+The runtime or tender verifies the artifact and binds only the admitted imports.
+The provider or native handler rechecks the resource scope before performing an
+effect. Fuel, memory, time, output, and other budgets remain finite. Decisions
+and actions can be recorded in signed receipts.
+
+WebAssembly Components are the primary portable application profile. Bounded
+native AOT for x86-64 and AArch64 is an explicitly selected backend with a
+separate verifier and OS-isolation requirement. Ambient native processes are
+not the ordinary application model.
+
+## Security model
+
+Kotoba's claim is confinement through explicit authority, not perfection.
+
+What the bounded, qualified model is designed to establish:
+
+- every transitive component effect is declared and admitted before emission;
+- ungranted capability imports do not reach a provider or native handler;
+- inputs and execution have explicit finite bounds;
+- artifact identity and release evidence can be bound to trusted signers; and
+- concrete host effects are re-authorized at the resource boundary and
+  receipted.
+
+What Kotoba does **not** claim:
+
+- that the stack is unhackable;
+- a general Rust ownership, borrowing, or lifetime system for every value;
+- that every source file or runtime value is automatically encrypted;
+- that native code needs no OS isolation;
+- that every backend has feature parity; or
+- universal performance superiority over LLVM, Rust, Wasm, or another runtime.
+
+The trusted computing base still includes the compiler admission path, artifact
+verifier, runtime engine or native loader, policy roots, provider
+implementations, key custody, and operating-system isolation. The current
+machine-readable claims and their residual risks live in
+[`lang/safety-claims.edn`](lang/safety-claims.edn).
+
+## Architecture
+
+The repositories are separated so that a language claim can be reviewed
+independently from the code that implements or operates it.
+
+| Layer | Responsibility | Authority |
+|---|---|---|
+| Language | Grammar, semantics, effects, CLI contract, conformance, safety claims | this repository, `kotoba-lang/kotoba-lang` |
+| Compiler | Elaboration, type/effect checking, checked KIR, qualified target emission | [`kotoba-lang/amu`](https://github.com/kotoba-lang/amu) |
+| Implementation | Installable CLI, host integrations, providers, and integration evidence | [`kotoba-lang/kotoba`](https://github.com/kotoba-lang/kotoba) |
+| Tender | Artifact admission, capability binding, runtime limits, and receipts | [`kotoba-lang/kototama`](https://github.com/kotoba-lang/kototama) |
+| Native path | Machine-code backends, KEXE verification, supervised loading | [`kotoba-lang/kotoba-native`](https://github.com/kotoba-lang/kotoba-native) and `tender-native` |
+| Data plane | Persistent Datalog and content-addressed application state | [`kotoba-lang/kotobase`](https://github.com/kotoba-lang/kotobase) |
+| Fleet | Hosting, placement, deployment, and operational control | [`kotoba-lang/murakumo`](https://github.com/kotoba-lang/murakumo) |
+
+These names describe ownership boundaries, not a requirement that an
+application developer understand every repository before writing Kotoba.
+
+## Proof, with the boundary attached
+
+- The language grammar, surface status, capability catalog, safety claims, CLI,
+  and conformance suite are machine-readable in this repository.
+- Positive and negative fixtures exercise both what the profile accepts and
+  what it must reject.
+- Checked KIR is shared by qualified portable and native target paths; backend
+  coverage is reported per target rather than assumed.
+- The wider Kotoba stack currently runs **33 inference cores for internal
+  production dogfooding**. This is evidence that the team operates its own
+  stack; it is **not customer traction, paid adoption, or revenue**.
+
+See [`docs/maturity.md`](docs/maturity.md) for maturity by axis and
+[`docs/README.md`](docs/README.md) for the documentation routes. Contract-stage
+labels do not imply ecosystem, adoption, release, or production-SLO maturity.
+
+## Install
+
+### Homebrew (macOS and Linux)
+
+```sh
+brew tap kotoba-lang/kotoba
+brew install kotoba
+```
+
+Homebrew 6 users may need to trust the tap once:
+
+```sh
+brew trust kotoba-lang/kotoba
+```
+
+### Verified shell installer
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kotoba-lang/kotoba/main/install.sh | sh
+```
+
+The installer verifies the published archive checksum. Native release
+availability is platform-specific; use the source launcher when no qualified
+archive exists for the current platform.
+
+### From source
+
+```sh
+git clone https://github.com/kotoba-lang/kotoba.git
+cd kotoba
+bin/kotoba-clj check --kind cli-contract --json
+```
+
+## Source contract
+
+- `.kotoba` is canonical Kotoba component source.
+- `.cljc` is portable Clojure-family source and may use a `:kotoba` reader
+  branch.
+- `.cljk` is CLJ Kotoba source; it is not a JVM target.
+- `.clj` and `.cljs` keep their normal single-target meaning.
+
+Kotoba is not a promise that arbitrary JVM Clojure or ClojureScript programs
+will run. The admitted grammar is
+[`lang/guest-grammar.edn`](lang/guest-grammar.edn), current implementation and
+intentional exclusions are in
+[`lang/surface-status.edn`](lang/surface-status.edn), and fixtures live under
+[`lang/conformance/`](lang/conformance/).
+
+## Roadmap
+
+The direction is intentionally incremental and fail-closed.
+
+**Now**
+
+- keep grammar, effect inference, checked KIR, target adapters, and public docs
+  on one versioned contract;
+- preserve deny-by-default host behavior and concrete resource scope;
+- publish target-specific qualification rather than collapsing it into one
+  maturity number; and
+- improve the first-run path without widening the language surface.
+
+**Next**
+
+- close typed request/result and provider-conformance gaps for HTTP, storage,
+  model, secret, and database capabilities;
+- expand differential and adversarial conformance across qualified backends;
+- strengthen signed artifact, revocation, receipt, and reproducible-release
+  operations; and
+- continue bounded native coverage only where the verifier and loader fail
+  closed outside the supported slice.
+
+**Later**
+
+- widen production deployment only after independent provider, host-isolation,
+  rollback, and soak evidence exists;
+- grow the ecosystem through small declarative libraries whose effects remain
+  inspectable; and
+- keep unsupported ambient authority a non-goal rather than treating it as a
+  compatibility backlog.
+
+Roadmap items are not promises of shipped capability. Current status remains
+authoritative in machine-readable contracts and qualification evidence.
 
 ## Documentation
 
-Start at [`docs/README.md`](docs/README.md). It provides separate routes for
-learning the language, using the toolchain, implementing a backend, and
-evaluating maturity. [`docs/authority-map.edn`](docs/authority-map.edn) records
-which repository owns each normative contract; `nbb scripts/check-docs.cljs`
-rejects broken checked links, missing routes, and profile-version drift.
+- [Getting started](docs/getting-started.md)
+- [Documentation map](docs/README.md)
+- [Language surface status](lang/surface-status.edn)
+- [Safety claims and residual risks](lang/safety-claims.edn)
+- [Capability semantics](lang/capability-semantics.edn)
+- [Component role model](lang/component-role-model.edn)
+- [Maturity by axis](docs/maturity.md)
+- [Architecture decisions](docs/adr/)
 
-## 30-Second Tour
-
-Inline expressions compile through the same Kotoba-to-Wasm path:
-
-```sh
-kotoba -e '(+ 1 2)'
-```
-
-Build a Kotoba source file:
-
-```sh
-kotoba wasm build examples/hello.kotoba -o hello.wasm
-```
-
-Inspect and enforce a capability policy:
-
-```sh
-kotoba wasm safe-policy examples/policy-demo.kotoba
-kotoba wasm safe-build examples/policy-demo.kotoba --policy policy.edn -o policy-demo.wasm
-kotoba wasm selfhost-inspect examples/policy-demo.kotoba --policy policy.edn --json
-```
-
-The implementation launcher currently lives in `kotoba-lang/kotoba`. This
-repository owns the admitted grammar, language semantics, CLI contract, and
-conformance fixtures. `kotoba-lang/kotoba-core-contracts` owns source-file
-classification and package/runtime boundary contracts.
-
-## Source Contract
-
-- Accepted extensions: `.kotoba`, `.cljc`, `.cljk`, `.clj`, `.cljs`.
-- Canonical Kotoba-only extension: `.kotoba`.
-- Portable Clojure-family extension: `.cljc`.
-- CLJ Kotoba extension: `.cljk`; it uses the Kotoba/Kototama compiler and is
-  not a JVM compilation target.
-- Standard extensions: `.clj` (Clojure) and `.cljs` (ClojureScript),
-  each single-target with its own reader-branch chain (`["clj" "default"]`
-  and `["cljs" "default"]` respectively) — neither carries `#?(:kotoba ...)`
-  branches the way `.cljc` does.
-- Default reader target: `kotoba`.
-- `:kotoba` reader branch fallback order: `:kotoba`, then `:clj`, then
-  `:default`.
-- Namespace resolution priority for target `kotoba`: `.kotoba`, `.cljc`,
-  `.cljk`, `.clj`, `.cljs`.
-
-Example portable source:
-
-```clojure
-#?(:kotoba (defn main [x] (+ x 10))
-   :clj    (defn main [x] (+ x 1))
-   :cljs   (defn main [x] (+ x 2)))
-```
-
-New Kotoba-only code should use `.kotoba`. Shared Clojure-family source should
-use `.cljc` and place Kotoba-specific behavior behind `#?(:kotoba ...)`.
-
-The machine-readable source-file contract is
-[`kotoba-core-contracts/lang/profile.edn`](https://github.com/kotoba-lang/kotoba-core-contracts/blob/main/lang/profile.edn).
-The broader admitted grammar and current surface live in
-[`lang/guest-grammar.edn`](lang/guest-grammar.edn) and
-[`lang/surface-status.edn`](lang/surface-status.edn); conformance fixtures live
-under `lang/conformance/`.
-
-## Repository Scope
-
-This repository is split from `kotoba-lang/kotoba` so the language surface can
-be reviewed independently from the current compiler, runtime, server, and mesh
-implementation.
-
-The language semantics and CLI authority live here. Host implementations
-consume this repository and the lower-level core-contract repository as data:
-
-- `lang/guest-grammar.edn`: machine-readable admitted language grammar.
-- `lang/surface-status.edn`: implemented, partial, and deliberately excluded
-  surface.
-- `lang/conformance/`: conformance fixtures for source behavior.
-- `kotoba-core-contracts/lang/profile.edn`: source-file classification.
-- `kotoba-core-contracts/lang/package.edn`: package reference and lock contract.
-- `lang/cli.edn` defines `run`, `check`, `graph`, `git`, `rad`, `deploy`, and
-  `hinshitsu` (software-quality checks: evidence, gates, coverage, mokushi
-  visual regression — backed by `kotoba-lang/hinshitsu`).
-- `lang/adapters.edn` defines adapter-owned CLI launchers and keeps native
-  implementations outside the default language authority repo.
-- `lang/lab.edn` defines the `kotoba-lab` notebook, cell, artifact, evidence,
-  and capability vocabulary.
-- `src/kotoba/cli.cljc` validates the contract, shapes argv as EDN, and returns
-  host-neutral command results.
-- `kotoba-core-contracts/src/kotoba/lang/package_contract.cljc` validates
-  package manifests and lockfiles.
-- `docs/`: audience routes, reference, maturity, language gates, and ADRs.
-- `docs/kotoba-syntax-quality-review.md`: evidence-based syntax review and the
-  prioritized path for improving ergonomics without weakening static safety.
-- `docs/adr/`: extracted language and repository ADRs.
-- `examples/`: small source examples for docs and CLI smoke tests.
-- Node, JVM, native, or other launchers are adapters. They should not define CLI
-  protocol semantics independently.
-
-## Current Status
-
-`kotoba-git` and `kotoba-rad` are hosted by CLJC adapters in
-`kotoba-lang/kotoba` (`kotoba.git-adapter`, `kotoba.rad-adapter`) that consume
-`kotoba.cli/dispatch` planned results through injected host ports. No
-independent native host implementation of these commands remains; the command
-shape stays CLJC/EDN owned here.
-
-## Maturity
-
-The bounded contract track is tracked to M6:
-
-- `M0`: constants and docs.
-- `M1`: machine-readable profile.
-- `M2`: positive conformance fixtures.
-- `M3`: negative conformance fixtures.
-- `M4`: manifest-driven conformance runner.
-- `M5`: external implementations can consume the same suite.
-- `M6`: profile-version compatibility policy.
-
-Maturity evidence is recorded in `docs/lang/coverage.edn`; compatibility rules
-are recorded in `docs/lang/versioning.md`; CI-facing commands are recorded in
-`docs/lang/gates.md`. This contract-stage label is not a claim of Rust/Go/Deno
-documentation, ecosystem, adoption, release, or production-SLO maturity; those
-axes are separated in [`docs/maturity.md`](docs/maturity.md).
-
-## Verify
+## Verify this repository
 
 ```sh
 clojure -M:test
 nbb scripts/check-docs.cljs
 bb scripts/check-cli-contract.bb lang/cli.edn
-bb ../kotoba-core-contracts/scripts/check-package-contract.bb
 bb scripts/check-capability-values.bb
 bb scripts/check-legacy-runtime-absence.bb
 ```
 
-`clojure -M:test` is the primary CLI and package contract gate. This repository
-should not contain `Cargo.toml`, `Cargo.lock`, `.rs`, or Rust toolchain files.
+This repository is the CLJC/EDN language authority. Native, JVM, Node, or other
+launchers are adapters and must not define independent language or CLI
+semantics.

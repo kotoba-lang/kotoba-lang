@@ -109,26 +109,21 @@
    ".kot-nav{justify-content:flex-end;width:auto}.kot-hero{padding-block:var(--hig-spacing-10) var(--hig-spacing-9)}}"))
 
 (def primary-links
-  [{:label "Docs" :href "https://github.com/kotoba-lang/kotoba-lang/tree/main/docs"}
-   {:label "Protocol" :href "https://github.com/kotoba-lang/kotoba-protocol"}
-   {:label "Spec" :href "https://github.com/kotoba-lang/spec"}])
+  [{:label "Why" :href "#why"}
+   {:label "What" :href "#what"}
+   {:label "Proof" :href "#proof"}
+   {:label "Architecture" :href "#architecture"}])
 
-(def market-signals
-  [{:metric "46% vs 33%"
-    :title "AI use grew faster than trust"
-    :body "More developers distrust AI output accuracy than trust it. The winning language cannot ask users to believe generated code; it must make authority inspectable and enforceable."
-    :href "https://survey.stackoverflow.co/2025/ai"
-    :source "Stack Overflow Developer Survey 2025"}
-   {:metric "81%"
-    :title "Agent security is already a mainstream concern"
-    :body "Developers report concern about the security and privacy of AI agents. Permission prompts are a workflow; least authority has to survive compilation and execution."
-    :href "https://survey.stackoverflow.co/2025/ai"
-    :source "Stack Overflow Developer Survey 2025"}
-   {:metric "10,000+"
-    :title "Mythos-class systems changed the threat ceiling"
-    :body "Anthropic reports that Project Glasswing partners found more than ten thousand high- or critical-severity flaws. Kotoba does not claim an unhackable runtime; it limits what admitted code can reach after compromise."
-    :href "https://www.anthropic.com/news/expanding-project-glasswing"
-    :source "Anthropic, Project Glasswing"}])
+(def proof-signals
+  [{:metric "33 cores"
+    :title "Internal production dogfooding"
+    :body "The wider Kotoba stack runs 33 inference cores internally. This proves the team operates its own stack; it is not customer traction, paid adoption, or revenue."}
+   {:metric "8 claims"
+    :title "Boundaries are machine-readable"
+    :body "Safety claims name their trusted computing base, negative evidence, and residual risk instead of collapsing into an 'unhackable' slogan."}
+   {:metric "deny by default"
+    :title "No grant, no host effect"
+    :body "An empty policy grants no filesystem, network, process, clock, model, or secret authority. Providers must also validate concrete resource scope."}])
 
 (defn header []
   [:header {:class "kot-header"}
@@ -146,104 +141,101 @@
 (defn hero []
   [:section {:id "top" :class "kot-hero"}
    (dds/container
-    [:p {:class "kot-eyebrow"} "The language for AI agents and vibe coding"]
-    (dds/heading 1 "Let AI write the code. Never hand it the keys." {:size "48"})
+    [:p {:class "kot-eyebrow"} "A language AI agents can use, not abuse"]
+    (dds/heading 1 "AI writes freely. Kotoba draws the boundary." {:size "48"})
     [:p {:class "kot-lead"}
-     [:strong "If it compiles, it's contained."]
-     " Kotoba is an AI-native, capability-safe language: an effect you were not granted cannot be written, so the compiler refuses to emit the artifact at all—even when a Mythos-class agent is looking for a way out."]
+     "Kotoba is an intuitive, declarative, security-first language and computing stack for AI agents—and for humans who vibe-code with them."]
+    [:blockquote {:class "kot-quote"}
+     [:strong "Existing software adds security around the program. Kotoba makes security a property of the whole computation."]]
     [:div {:class "kot-actions"}
-     (dds/button "Start in 60 seconds" {:href "#start" :size "lg"})
-     (dds/button "View the language authority" {:href "https://github.com/kotoba-lang/kotoba-lang"
-                                                  :type :outline :size "lg"})]
+     (dds/button "See how it works" {:href "#architecture" :size "lg"})
+     (dds/button "Start with Kotoba" {:href "#start" :type :outline :size "lg"})]
     [:div {:class "kot-proof"}
      (dds/grid {:min "14rem"}
       (card (dds/chip-label "DENY BY DEFAULT")
             (dds/heading 3 "No ambient authority" {:size "20"})
-            [:p "No implicit filesystem, network, process, clock, or secrets."])
-      (card (dds/chip-label "CHECK BEFORE RUN")
-            (dds/heading 3 "Effects are admitted" {:size "20"})
-            [:p "Transitive effects become exact component imports before emission."])
-      (card (dds/chip-label "PORTABLE + NATIVE")
-            (dds/heading 3 "One checked IR" {:size "20"})
-            [:p "WebAssembly Components first; sealed, bounded native AOT when selected."]))])])
+            [:p "No implicit filesystem, network, process, clock, model, or secrets."])
+      (card (dds/chip-label "CHECKED KIR")
+            (dds/heading 3 "Authority survives compilation" {:size "20"})
+            [:p "Types, effects, resources, and target support are admitted before emission."])
+      (card (dds/chip-label "HOST ENFORCED")
+            (dds/heading 3 "Only the grant is bound" {:size "20"})
+            [:p "The host and provider enforce concrete scope and record the decision."]))])])
 
-(def stack-links
-  [{:name "Documentation"
-    :role "Learn the language, use the toolchain, implement a backend, or inspect maturity evidence."
-    :href "https://github.com/kotoba-lang/kotoba-lang/tree/main/docs"
-    :cta "Open docs"}
-   {:name "Protocol"
-    :role "Normative layer, vocabulary, datom, IPLD, IPNS, IPFS, and application-model contracts."
-    :href "https://github.com/kotoba-lang/kotoba-protocol"
-    :cta "Open protocol"}
-   {:name "Spec"
-    :role "The data layer of the foundational standard library: small, reusable data specifications."
-    :href "https://github.com/kotoba-lang/spec"
-    :cta "Open spec"}
-   {:name "Kotobase"
-    :role "Persistent Datalog and content-addressed database for durable application state."
-    :href "https://github.com/kotoba-lang/kotobase"
-    :cta "Open Kotobase"}
-   {:name "Murakumo"
-    :role "Hosting, placement, deployment, and fleet control plane for the Kotoba component mesh."
-    :href "https://github.com/kotoba-lang/murakumo"
-    :cta "Open Murakumo"}])
-
-(defn stack-section []
+(defn architecture-section []
   (dds/section
-   {:id "explore" :title "From language contract to running system"}
+   {:id "architecture" :title "Security across the whole computation"}
    [:p {:class "kot-lead"}
-    "The language authority, implementation, data plane, and fleet are separate on purpose. Open the layer you need without guessing which repository owns it."]
+    "The boundary is carried from intent to execution. Each stage narrows or verifies authority; no later stage is allowed to invent a grant."]
    (dds/grid
-    {:min "17rem"}
-    (card (dds/chip-label "LANGUAGE AUTHORITY")
-          (dds/heading 3 "kotoba-lang/kotoba-lang" {:size "20"})
-          [:p "Normative language specification, grammar, machine-readable contracts, public CLI contract, and conformance."]
-          (external-link "https://github.com/kotoba-lang/kotoba-lang" "Open language authority"))
-    (card (dds/chip-label "IMPLEMENTATION")
-          (dds/heading 3 "kotoba-lang/kotoba" {:size "20"})
-          [:p "Installable CLI, runtime and host implementations, providers, integration tests, and qualification evidence that consume the language authority."]
-          (external-link "https://github.com/kotoba-lang/kotoba" "Open implementation")))
-   (dds/grid
-    {:min "16rem"}
-    (for [{:keys [name role href cta]} stack-links]
-      (card (dds/heading 3 name {:size "20"})
-            [:p role]
-            (external-link href cta))))))
+    {:min "13rem"}
+    (card (dds/chip-label "1 · SOURCE")
+          (dds/heading 3 "Declarative intent" {:size "20"})
+          [:p "A small, Clojure-shaped surface keeps programs readable and excludes ambient escape hatches."])
+    (card (dds/chip-label "2 · CHECK")
+          (dds/heading 3 "Checked KIR" {:size "20"})
+          [:p "Types and transitive effects become a target-independent, inspectable representation."])
+    (card (dds/chip-label "3 · ADMIT")
+          (dds/heading 3 "Intersect authority" {:size "20"})
+          [:p "Requested, delegated, local-policy, resource, and target grants can only narrow."])
+    (card (dds/chip-label "4 · IDENTIFY")
+          (dds/heading 3 "Address the artifact" {:size "20"})
+          [:p "Code, dependencies, policy, compiler contract, and target ABI bind the computation's identity."])
+    (card (dds/chip-label "5 · ENFORCE")
+          (dds/heading 3 "Bind at the host" {:size "20"})
+          [:p "The runtime and provider bind only admitted capabilities, enforce finite budgets, and emit receipts."]))
+   [:blockquote {:class "kot-quote"}
+    [:strong "Content identity is not authority."]
+    [:p "CID verification, signatures, revocation, host policy, resource checks, and OS isolation remain separate boundaries."]]))
 
 (defn why-section []
-  (apply dds/section
-         {:id "why" :title "The market moved from autocomplete to agents"}
-         [:p {:class "kot-lead"}
-          "Vibe coding is not a temporary syntax trend. It moves code production to models while leaving humans accountable for effects. Kotoba is positioned at that missing boundary: let the model produce more, while the language grants less."]
-         (dds/grid {:min "17rem"}
-          (for [{:keys [metric title body href source]} market-signals]
-            (card [:p {:class "kot-metric"} metric]
-                  (dds/heading 3 title {:size "24"})
-                  [:p body]
-                  (external-link href source))))
-         [[:p {:class "kot-caption kot-muted"}
-           "External market evidence explains timing; it is not language qualification evidence."]]))
-
-(defn how-section []
   (dds/section
-   {:id "how" :title "Vibe coding, with a hard boundary"}
+   {:id "why" :title "AI can write faster than humans can review"}
    [:p {:class "kot-lead"}
-    "Do not decide whether generated code is trustworthy. Decide exactly what it may do, then make everything else structurally unavailable."]
+    "Generated code may be useful and still reach a file, network, secret, process, model, or payment surface the request never intended to expose."]
    (dds/grid
     {:min "18rem"}
-    (card (dds/chip-label "1 · WRITE")
-          (dds/heading 3 "Prompt the program" {:size "24"})
-          [:p "AI writes a small, Clojure-shaped source profile. Macros, eval, ambient interop, and unbounded concurrency are absent from the admitted grammar."])
-    (card (dds/chip-label "2 · ADMIT")
-          (dds/heading 3 "Compile the authority" {:size "24"})
-          [:p "Type checking and transitive effect inference produce exact imports. Requested, delegated, and local policy intersect; authority can only narrow."])
-    (card (dds/chip-label "3 · RUN")
-          (dds/heading 3 "Bind only the grant" {:size "24"})
-          [:p "The tender binds only admitted capabilities. Ungranted effects are absent or unbound, and attempts are receipted whether they succeed or fail."]))
+    (card (dds/chip-label "THE OLD DEFAULT")
+          (dds/heading 3 "Build broadly, constrain later" {:size "24"})
+          [:p "A general-purpose program starts with ambient semantics. Sandboxes, IAM, containers, policy, and signing are added around it to recover the intended boundary."])
+    (card (dds/chip-label "THE KOTOBA DEFAULT")
+          (dds/heading 3 "Grant narrowly, then compile" {:size "24"})
+          [:p "Effects and capabilities are part of the admitted computation. If the target cannot prove and bind the grant, it does not emit or run the artifact."]))
+   [:p {:class "kot-caption kot-muted"}
+    "Kotoba complements runtime and OS isolation; it does not make those layers unnecessary."]))
+
+(defn what-section []
+  (dds/section
+   {:id "what" :title "Where Lisp's mind meets Rust's discipline"}
+   [:p {:class "kot-lead"}
+    "Kotoba is a small, data-oriented, Clojure-shaped language with static discipline around authority, effects, resources, packages, and artifact identity."]
+   (dds/grid
+    {:min "18rem"}
+    (card (dds/chip-label "INTUITIVE")
+          (dds/heading 3 "Code as readable data" {:size "24"})
+          [:p "Immutable values, ordinary functions, explicit data, and a composable syntax are easy for humans and models to produce and inspect."])
+    (card (dds/chip-label "DECLARATIVE")
+          (dds/heading 3 "Say what may happen" {:size "24"})
+          [:p "Effects, capabilities, resources, dependencies, and targets are visible inputs to admission—not surprises discovered after deployment."])
+    (card (dds/chip-label "SECURITY-FIRST")
+          (dds/heading 3 "Less language, harder boundary" {:size "24"})
+          [:p "No ambient interop, runtime code loading, unrestricted mutation, guest-defined macros, or unbounded concurrency in the admitted component surface."]))
    [:blockquote {:class "kot-quote"}
-    [:strong "Mythos can search for a weakness. It still cannot mint a capability."]
-    [:p "This is a confinement claim, not an 'unhackable' claim: the Wasm engine, providers, policy, key custody, and native OS isolation remain in the trusted computing base."]]))
+    [:strong "A language AI agents can use, not abuse."]
+    [:p "This is a confinement direction, not an 'unhackable' claim. The compiler, verifier, runtime, providers, policy roots, key custody, and OS isolation remain in the trusted computing base."]]))
+
+(defn proof-section []
+  (apply dds/section
+         {:id "proof" :title "Proof, with the boundary attached"}
+         [:p {:class "kot-lead"}
+          "Kotoba separates implementation evidence from market traction and keeps residual risk next to every safety claim."]
+         (dds/grid {:min "17rem"}
+          (for [{:keys [metric title body]} proof-signals]
+            (card [:p {:class "kot-metric"} metric]
+                  (dds/heading 3 title {:size "24"})
+                  [:p body])))
+         [[:p {:class "kot-caption kot-muted"}
+           "Internal production use is dogfooding evidence only. It does not imply external customers, paid pilots, or revenue."]]))
 
 (defn start-section []
   (dds/section
@@ -361,33 +353,23 @@
        "count.textContent=shown+' result'+(shown===1?'':'s');}"
        "input.addEventListener('input',apply);apply();});"))
 
-(def github-projects
-  [{:name "kotoba-lang/kotoba-lang" :role "Language authority, semantics, grammar, claims, and conformance"
-    :href "https://github.com/kotoba-lang/kotoba-lang"}
-   {:name "kotoba-lang/amu" :role "Compiler frontend, effect inference, checked KIR, Wasm and native emitters"
-    :href "https://github.com/kotoba-lang/amu"}
-   {:name "kotoba-lang/kotoba" :role "Language and library substrate, hosts, identities, and integration tests"
-    :href "https://github.com/kotoba-lang/kotoba"}
-   {:name "kotoba-lang/kototama" :role "Tender that admits components and binds granted capabilities"
-    :href "https://github.com/kotoba-lang/kototama"}
-   {:name "kotoba-lang/kotoba-core-contracts" :role "Package admission and runtime-boundary contracts"
-    :href "https://github.com/kotoba-lang/kotoba-core-contracts"}
-   {:name "kotoba-lang/kotobase" :role "Persistent Datalog and content-addressed application state"
-    :href "https://github.com/kotoba-lang/kotobase"}
-   {:name "kotoba-lang/murakumo" :role "Hosting, placement, deployment, and fleet control plane"
-    :href "https://github.com/kotoba-lang/murakumo"}
-   {:name "kotoba-lang" :role "All repositories in the language ecosystem"
-    :href "https://github.com/kotoba-lang"}])
-
 (defn source-section []
   (dds/section
-   {:id "source" :title "Open source, from language to runtime"}
+   {:id "source" :title "Read the contract or run the implementation"}
    (dds/grid
     {:min "18rem"}
-    (for [{:keys [name role href]} github-projects]
-      (card (dds/heading 3 name {:size "20"})
-            [:p role]
-            (external-link href "Open on GitHub"))))
+    (card (dds/chip-label "LANGUAGE AUTHORITY")
+          (dds/heading 3 "kotoba-lang/kotoba-lang" {:size "20"})
+          [:p "Grammar, semantics, capability contracts, safety claims, CLI contract, documentation, and conformance fixtures."]
+          (external-link "https://github.com/kotoba-lang/kotoba-lang" "Read the language authority"))
+    (card (dds/chip-label "INSTALLABLE IMPLEMENTATION")
+          (dds/heading 3 "kotoba-lang/kotoba" {:size "20"})
+          [:p "CLI, host integrations, providers, runtime adapters, integration tests, and target-specific qualification evidence."]
+          (external-link "https://github.com/kotoba-lang/kotoba" "Open the implementation"))
+    (card (dds/chip-label "DOCUMENTATION")
+          (dds/heading 3 "Learn, build, or evaluate" {:size "20"})
+          [:p "Separate paths for first use, language reference, backend implementation, security boundaries, and maturity evidence."]
+          (external-link "https://github.com/kotoba-lang/kotoba-lang/tree/main/docs" "Choose a documentation path")))
    [:p {:class "kot-caption kot-muted"}
     "Language profile " (get-in docs-release [:contract :language-profile])
     "; public-default release status: "
@@ -400,7 +382,7 @@
 (defn footer []
   [:footer {:class "kot-footer"}
    (dds/container
-    [:p [:strong "Kotoba"] " — let AI write more; grant the program less."]
+    [:p [:strong "Kotoba"] " — AI writes freely. Kotoba draws the boundary."]
     [:p {:class "kot-caption kot-muted"}
      "Generated by " (code "site/generate.cljs") " from "
      (str/join ", " authority-files) ". No telemetry. No runtime dependency."]
@@ -413,9 +395,10 @@
    [:main {:id "main"}
     (hero)
     (dds/container
-     (stack-section)
      (why-section)
-     (how-section)
+     (what-section)
+     (proof-section)
+     (architecture-section)
      (start-section)
      (claims-section)
      (deliberate-section)
@@ -427,10 +410,10 @@
 
 (def html
   (page/->page
-   {:title "Kotoba — the capability-safe language for AI agents and vibe coding"
-    :description (str "Let AI write the code without handing it the keys. Kotoba is an "
-                      "AI-native language with deny-by-default capabilities, checked effects, "
-                      "bounded admission, WebAssembly Components, and bounded native AOT.")
+   {:title "Kotoba — security-first computing for AI agents and vibe coding"
+    :description (str "AI writes freely. Kotoba draws the boundary. An intuitive, declarative, "
+                      "security-first language and computing stack with checked KIR, explicit "
+                      "capability and effect admission, content-addressed artifacts, and host enforcement.")
     :lang "en"
     :css dds-css
     :app-css (str tokens/skin-css "\n" app-css)}

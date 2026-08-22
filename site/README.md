@@ -27,12 +27,17 @@ and action layouts are added with `min-width` queries. Public navigation points
 to the language docs, the normative protocol and spec repositories, Kotobase,
 Murakumo, and the distinct language-authority and implementation repositories.
 
-The market-timing cards cite primary public sources (Stack Overflow and
-Anthropic). They are explicitly labelled as market evidence, not language
-qualification evidence. Product and safety claims remain derived from the
-repository authorities above. The page also retains the generated local
-documentation search: its 47-entry index is embedded at build time, and no
-query leaves the browser.
+The first screen is deliberately a 30-second narrative: **Why → What → Proof →
+Architecture**. It states the product thesis, shows the language feel, separates
+internal production dogfooding from customer traction, and then carries the
+boundary through checked KIR, capability/effect admission, content-addressed
+artifacts, and host enforcement. The 33-core figure is an explicitly bounded
+internal-operations statement, not a language qualification claim, customer
+count, paid-adoption metric, or revenue claim. Product safety claims remain
+derived from the repository authorities above.
+
+The page also retains the generated local documentation search: its embedded
+index is built from the repository authority and no query leaves the browser.
 
 ## Regenerate
 
