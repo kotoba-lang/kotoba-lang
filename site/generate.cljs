@@ -423,5 +423,13 @@
   (fs/mkdirSync out #js {:recursive true})
   (fs/writeFileSync (path/join out "index.html") html)
   (fs/copyFileSync logo-source-path (path/join out "kotoba-wordmark.png"))
+  ;; RFC 9116. Copied rather than generated so the published contact is a file
+  ;; someone can read and edit in `site/assets/`, not a string buried in here —
+  ;; and so a regeneration cannot silently drop it (a security.txt that
+  ;; disappears looks exactly like one that was never published).
+  (let [wk (path/join out ".well-known")]
+    (fs/mkdirSync wk #js {:recursive true})
+    (fs/copyFileSync (path/join "site" "assets" "security.txt")
+                     (path/join wk "security.txt")))
   (println "wrote" (path/join out "index.html")
            (str "(" (.-length html) " bytes)")))
