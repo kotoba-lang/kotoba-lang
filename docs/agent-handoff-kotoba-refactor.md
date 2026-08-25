@@ -241,6 +241,14 @@ Examples already landed:
 
 - murakumo: `kotoba/kekkai_gate_core.kotoba`, `infer_plan_core`, `dash_state_core`, …
 - com-cloudflare: `kotoba/stream_core.kotoba`, `analytics_core`, `workers_path_core`
+- kagami (2026-08-25, merge `38a088d`): `src/kagami/pin_core.kotoba` — the pin
+  admission gate (`admit` reason/verdict fold + trailing-* grant `covers?`),
+  step-1 parity-bound (`kagami.pin-kotoba-parity-test`, amu + kotoba-kir
+  test-only). The authority move is deliberately deferred: kagami's production
+  entry is nbb `--classpath src`, an operator contract the superproject
+  runbooks depend on — the core's header records this and the removal
+  conditions. The fleet gate for kagami is `:nbb-test`, so the parity gate
+  runs on the JVM `clojure -M:test` path, not on the nodes.
 
 ---
 
