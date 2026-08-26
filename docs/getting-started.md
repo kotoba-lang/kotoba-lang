@@ -32,10 +32,10 @@ The release page is the authority for available platforms and artifacts:
 
 ```sh
 kotoba selfhost check --json
-kotoba -e '(+ 1 2)'
 ```
 
-`-e` is compile-and-run sugar. It does not enable runtime `eval`.
+Accept only a `valid` response with an empty problem list. Installation alone
+does not prove that a source compiled or ran.
 
 ## 3. Build a source file
 
@@ -51,6 +51,12 @@ Compile it for WebAssembly:
 ```sh
 kotoba compile hello.kotoba --target wasm --output hello.wasm --json
 ```
+
+Accept only an `emitted` response. For a host-independent execution check,
+follow the published [AI-agent quickstart](https://kotoba-lang.org/agent-quickstart.md),
+which loads the module, rejects unexpected imports, and calls exported `main`.
+An adapter-owned CLI command may return `planned` / `adapter-required`; that is
+a plan, not execution evidence.
 
 New Kotoba-only code uses `.kotoba`. Shared Clojure-family source uses `.cljc`
 and selects Kotoba-specific behavior with a `#?(:kotoba …)` reader branch.
