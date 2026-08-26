@@ -41,6 +41,13 @@
 (def logo-source-path
   (path/join "site" "assets" "kotoba-wordmark.png"))
 
+(def benchmark-source-path
+  (path/join "bench" "public-compile-comparison" "latest.json"))
+
+(def benchmark
+  (js->clj (js/JSON.parse (fs/readFileSync benchmark-source-path "utf8"))
+           :keywordize-keys true))
+
 (when-not (fs/existsSync dds-css-path)
   (println "site/generate.cljs: jp-go-dds CSS not found:" dds-css-path)
   (println "  set JP_GO_DDS_ROOT to the jp-go-digital-design-system checkout")
@@ -112,6 +119,8 @@
   [{:label "Why" :href "#why"}
    {:label "What" :href "#what"}
    {:label "Proof" :href "#proof"}
+   {:label "Benchmark" :href "#benchmark"}
+   {:label "Agents" :href "./llms.txt"}
    {:label "Architecture" :href "#architecture"}])
 
 (def proof-signals
@@ -149,7 +158,8 @@
      [:strong "Existing software adds security around the program. Kotoba makes security a property of the whole computation."]]
     [:div {:class "kot-actions"}
      (dds/button "See how it works" {:href "#architecture" :size "lg"})
-     (dds/button "Start with Kotoba" {:href "#start" :type :outline :size "lg"})]
+     (dds/button "Start with Kotoba" {:href "#start" :type :outline :size "lg"})
+     (dds/button "AI agent setup" {:href "./agent-quickstart.md" :type :text :size "lg"})]
     [:div {:class "kot-proof"}
      (dds/grid {:min "14rem"}
       (card (dds/chip-label "DENY BY DEFAULT")
@@ -242,21 +252,59 @@
    {:id "start" :title "Start in sixty seconds"}
    (dds/grid
     {:min "20rem"}
-    (card (dds/heading 3 "Run Kotoba" {:size "24"})
+    (card (dds/heading 3 "Install and self-check" {:size "24"})
           [:pre {:class "kot-pre"}
-           [:code "brew tap kotoba-lang/kotoba\nbrew install kotoba\nkotoba -e '(+ 1 2)'\nkotoba compile examples/hello.kotoba --target wasm --output hello.wasm --json"]]
-          (caption "The -e command is compile-and-run sugar, not runtime eval."))
+           [:code "brew tap kotoba-lang/kotoba\nbrew trust kotoba-lang/kotoba\nbrew install kotoba\nkotoba selfhost check --json"]]
+          (caption "Accept a valid response with an empty problem list."))
     (card (dds/heading 3 "Start with no authority" {:size "24"})
           [:p "An empty policy denies every host effect. Add only the resource-scoped capability the program needs."]
           [:pre {:class "kot-pre"}
            [:code "{:policy/allow #{}\n :policy/forbid-wildcard true}"]]
           (caption "HTTP, storage, and LLM hosted kits are not yet qualified for sale on a shipped backend.")))
    [:div {:class "kot-actions"}
+    (dds/button "AI agent: executable quickstart"
+                {:href "./agent-quickstart.md"})
     (dds/button "Open the getting-started guide"
-                {:href "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/getting-started.md"})
+                {:href "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/getting-started.md"
+                 :type :outline})
     (dds/button "Read CLI reference"
                 {:href "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/generated/cli.md"
                  :type :outline})]))
+
+(defn benchmark-section []
+  (let [kotoba (get-in benchmark [:results :kotoba])
+        rust (get-in benchmark [:results :rust])
+        ratio (get-in benchmark [:results :medianRatioKotobaToRust])
+        runs (get-in benchmark [:method :runs])
+        chip (get-in benchmark [:environment :chip])
+        measured-date (subs (:generatedAt benchmark) 0 10)
+        kotoba-version (str/upper-case (get-in benchmark [:environment :kotoba]))
+        rust-version (str/join " " (take 2 (str/split (get-in benchmark [:environment :rustc]) #" ")))]
+    (dds/section
+     {:id "benchmark" :title "Measured against Rust, with the boundary attached"}
+     [:p {:class "kot-lead"}
+      "A process-cold comparison of two tiny programs that export " (code "main")
+      ", return i64 42, emit WebAssembly, require zero imports, and are executed after every compile."]
+     (dds/grid
+      {:min "16rem"}
+      (card (dds/chip-label kotoba-version)
+            (dds/heading 3 (str (:medianMilliseconds kotoba) " ms median") {:size "24"})
+            (caption (str (:p95Milliseconds kotoba) " ms p95 · " runs " samples")))
+      (card (dds/chip-label (str/upper-case rust-version))
+            (dds/heading 3 (str (:medianMilliseconds rust) " ms median") {:size "24"})
+            (caption (str (:p95Milliseconds rust) " ms p95 · " runs " samples")))
+      (card (dds/chip-label "THIS RUN")
+            (dds/heading 3 (str ratio "× Rust elapsed") {:size "24"})
+            (caption (str measured-date " · " chip " · alternating order"))))
+     [:p
+      "This measures tiny-workload toolchain startup on one machine, not general compile speed. "
+      "The modules have different ABIs and runtime contracts, so their byte sizes are not ranked."]
+     [:div {:class "kot-actions"}
+      (dds/button "Inspect every sample"
+                  {:href "./benchmarks/compile-wasm-latest.json"})
+      (dds/button "Re-run the harness"
+                  {:href "https://github.com/kotoba-lang/kotoba-lang/tree/main/bench/public-compile-comparison"
+                   :type :outline})])))
 
 (defn claims-section []
   (dds/section
@@ -400,6 +448,7 @@
      (proof-section)
      (architecture-section)
      (start-section)
+     (benchmark-section)
      (claims-section)
      (deliberate-section)
      (release-section)
@@ -423,6 +472,13 @@
   (fs/mkdirSync out #js {:recursive true})
   (fs/writeFileSync (path/join out "index.html") html)
   (fs/copyFileSync logo-source-path (path/join out "kotoba-wordmark.png"))
+  (doseq [[source target]
+          [[benchmark-source-path (path/join out "benchmarks" "compile-wasm-latest.json")]
+           [(path/join "site" "assets" "llms.txt") (path/join out "llms.txt")]
+           [(path/join "site" "assets" "llms-full.txt") (path/join out "llms-full.txt")]
+           [(path/join "site" "assets" "agent-quickstart.md") (path/join out "agent-quickstart.md")]]]
+    (fs/mkdirSync (path/dirname target) #js {:recursive true})
+    (fs/copyFileSync source target))
   ;; RFC 9116. Copied rather than generated so the published contact is a file
   ;; someone can read and edit in `site/assets/`, not a string buried in here —
   ;; and so a regeneration cannot silently drop it (a security.txt that

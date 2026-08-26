@@ -38,6 +38,9 @@ derived from the repository authorities above.
 
 The page also retains the generated local documentation search: its embedded
 index is built from the repository authority and no query leaves the browser.
+The public benchmark section reads the checked-in raw report at
+`bench/public-compile-comparison/latest.json`; the generator copies that report
+alongside `llms.txt`, `llms-full.txt`, and the executable agent quickstart.
 
 ## Regenerate
 
@@ -63,8 +66,9 @@ repository README. Its authoritative source is
 The generator copies that local asset into `dist/`, so the deployed page makes
 no external image request.
 
-Output: `site/dist/index.html` and `site/dist/kotoba-wordmark.png` (committed, so
-a clean checkout can deploy without running the generator).
+Output: `site/dist/index.html`, the wordmark, AI-agent text surfaces, and the
+raw benchmark JSON (committed, so a clean checkout can deploy without running
+the generator).
 
 **The committed artifact is a deploy input, not a build by-product**: `wrangler
 deploy` here has no build step, so whatever is in `dist/` at deploy time is what
