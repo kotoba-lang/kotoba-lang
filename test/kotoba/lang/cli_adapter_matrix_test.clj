@@ -5,5 +5,5 @@
 (deftest matrix-matches-public-contract
   (let [r (m/validate)]
     (is (true? (:ok? r)) (pr-str (:problems r)))
-    (is (= 8 (:command-count r)))
+    (is (= 9 (:command-count r)))
     (is (true? (:implemented-check? r)))))

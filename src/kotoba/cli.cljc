@@ -10,7 +10,7 @@
 
 (def default-contract-path "lang/cli.edn")
 
-(def required-commands #{:run :compile :check :graph :git :rad :deploy :hinshitsu})
+(def required-commands #{:id :run :compile :check :graph :git :rad :deploy :hinshitsu})
 
 (def adapter-kinds #{:node :jvm :native :browser :edge})
 
@@ -38,6 +38,30 @@
   {:kotoba.cli/ok? true
    :kotoba.cli/code code
    :kotoba.cli/data data})
+
+(def ^:private ethereum-address-re #"^0x[0-9A-Fa-f]{40}$")
+
+(defn wallet-did
+  "Derive the chain-bound DID for an Ethereum account.
+
+  This deliberately consumes a public wallet address, not private key material.
+  Proof of control belongs to SIWE at the relying party; creating a DID must not
+  turn the language CLI into a seed exporter."
+  [address chain-id]
+  (when (and (string? address)
+             (re-matches ethereum-address-re address)
+             (pos-int? chain-id))
+    (str "did:pkh:eip155:" chain-id ":" (str/lower-case address))))
+
+(defn- parse-chain-id [value]
+  (try
+    (let [n #?(:clj (Long/parseLong (str value))
+               :cljs (js/Number (str value)))]
+      (when (and #?(:clj (pos? n)
+                    :cljs (and (js/Number.isSafeInteger n) (pos? n)))
+                 (<= n 9007199254740991))
+        n))
+    (catch #?(:clj Exception :cljs :default) _ nil)))
 
 (defn validate-contract
   "Return a structured validation result for the CLI contract."
@@ -194,6 +218,30 @@
                     :kind kind
                     :input (first (:positionals request))
                     :request request})))
+
+      (= command-id :id)
+      (let [address (or (get-in request [:options :address])
+                        (first (:positionals request)))
+            chain-id (parse-chain-id (or (get-in request [:options :chain-id]) "8453"))]
+        (cond
+          (not (and (string? address) (re-matches ethereum-address-re address)))
+          (failure :id/address-invalid
+                   "id requires a public 0x Ethereum wallet address"
+                   {:address address})
+
+          (nil? chain-id)
+          (failure :id/chain-invalid
+                   "chain-id must be a positive EIP-155 integer"
+                   {:chain-id (get-in request [:options :chain-id])})
+
+          :else
+          (success :id/generated
+                   {:method :did:pkh
+                    :network :eip155
+                    :chain-id chain-id
+                    :address (str/lower-case address)
+                    :did (wallet-did address chain-id)
+                    :proof :siwe-required})))
 
       :else
       (success :command/planned
