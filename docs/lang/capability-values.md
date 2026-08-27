@@ -142,6 +142,17 @@ requested capability, since no concrete capability exists), and
 append-only recorder (`{:record! fn :entries fn}`) so a host gets an ordered
 audit trail of receipts with zero extra dependencies.
 
+For protected identity- or trust-dependent effects,
+`capability-host/guard-causal-call` adds a stricter entry point. Before a
+provider can run it requires a `grant.causal-trust` allow decision bound to an
+immutable decision CID, operational identity epoch, intent CID, scoped
+evaluator claim CIDs, policy CID, and basis CID. The requested capability must
+name the same principal, action, and resource. The ordinary CACAO delegation
+and local-policy intersection still runs afterward; evaluator claims never
+mint capabilities or bypass those gates. Success, local denial, and provider
+error receipts are wrapped in a secret-free causal execution receipt. An
+invalid causal envelope is denied and receipted before the handler runs.
+
 Host provider capability kinds (`:host/clipboard-read`,
 `:host/clipboard-write`, `:host/http`, `:host/fs-read`, `:host/fs-write`,
 `:host/keychain-read`, `:host/keychain-write`, `:host/notify`,
