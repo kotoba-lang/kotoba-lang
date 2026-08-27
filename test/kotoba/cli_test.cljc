@@ -14,7 +14,7 @@
     (is (= {:version 1
             :commands [:id :run :compile :check :graph :git :rad :deploy :hinshitsu]
             :command-count 9
-            :option-count 47}
+            :option-count 50}
            (:kotoba.cli/data result)))))
 
 (deftest cljc-authority-implements-contract-commands
@@ -45,22 +45,62 @@
     (is (= :check (:kotoba.cli/command result)))
     (is (= :contract/valid (:kotoba.cli/code result)))))
 
-(deftest id-is-wallet-first-and-base-bound-by-default
-  (let [address "0xA00366234D29d4F882088048c0B2fa0dB7302D4E"
-        result (cli/dispatch contract ["id" "--address" address])]
+(deftest id-is-passkey-first-and-chain-neutral
+  (let [result (cli/dispatch contract ["id" "new" "--rp-id" "itonami.cloud"])]
     (is (:kotoba.cli/ok? result))
-    (is (= :id/generated (:kotoba.cli/code result)))
-    (is (= "did:pkh:eip155:8453:0xa00366234d29d4f882088048c0b2fa0db7302d4e"
-           (get-in result [:kotoba.cli/data :did])))
-    (is (= :siwe-required (get-in result [:kotoba.cli/data :proof])))
+    (is (= :id/enrollment-requested (:kotoba.cli/code result)))
+    (is (= :passkey-smart-account (get-in result [:kotoba.cli/data :method])))
+    (is (= :webauthn-p256
+           (get-in result [:kotoba.cli/data :controller :signature-suite])))
+    (is (= :secure-random-principal-id
+           (get-in result [:kotoba.cli/data :host-action])))
+    (is (nil? (get-in result [:kotoba.cli/data :chain-default])))
     (is (nil? (get-in result [:kotoba.cli/data :private-key])))))
 
-(deftest id-rejects-non-wallet-input-and-invalid-chain
-  (is (= :id/address-invalid
-         (:kotoba.cli/code (cli/dispatch contract ["id" "--address" "did:key:zLegacy"]))))
+(deftest id-plans-explicit-smart-account-links-without-a-base-default
+  (let [principal "urn:kotoba:principal:018f4d6c-29bf-7f80-9a21-111111111111"
+        base "eip155:8453:0xa00366234d29d4f882088048c0b2fa0db7302d4e"
+        ethereum "eip155:1:0xa00366234d29d4f882088048c0b2fa0db7302d4e"
+        result (cli/dispatch contract ["id" "new" "--rp-id" "itonami.cloud"
+                                       "--principal" principal
+                                       "--account" base
+                                       "--account" ethereum])]
+    (is (:kotoba.cli/ok? result))
+    (is (= :id/enrollment-planned (:kotoba.cli/code result)))
+    (is (= principal (get-in result [:kotoba.cli/data :principal])))
+    (is (= [base ethereum]
+           (mapv :identity.account/id (get-in result [:kotoba.cli/data :accounts]))))
+    (is (every? #(= :erc4337 (:identity.account/protocol %))
+                (get-in result [:kotoba.cli/data :accounts])))
+    (is (every? #(= #{:erc1271 :erc6492}
+                     (:identity.account/signature-verifiers %))
+                (get-in result [:kotoba.cli/data :accounts])))
+    (is (nil? (get-in result [:kotoba.cli/data :chain-default])))))
+
+(deftest legacy-evm-address-is-only-an-explicit-account-link
+  (let [address "0xA00366234D29d4F882088048c0B2fa0dB7302D4E"
+        no-chain (cli/dispatch contract ["id" "account" "--address" address])
+        result (cli/dispatch contract ["id" "account" "--address" address
+                                       "--chain-id" "10"])]
+    (is (= :id/chain-required (:kotoba.cli/code no-chain)))
+    (is (:kotoba.cli/ok? result))
+    (is (= :id/account-described (:kotoba.cli/code result)))
+    (is (false? (get-in result [:kotoba.cli/data :principal?])))
+    (is (= "eip155:10:0xa00366234d29d4f882088048c0b2fa0db7302d4e"
+           (get-in result [:kotoba.cli/data :account-id])))
+    (is (= "did:pkh:eip155:10:0xa00366234d29d4f882088048c0b2fa0db7302d4e"
+           (get-in result [:kotoba.cli/data :account-did])))))
+
+(deftest id-rejects-incomplete-or-invalid-input
+  (is (= :id/rp-id-invalid
+         (:kotoba.cli/code (cli/dispatch contract ["id" "new"]))))
+  (is (= :id/account-invalid
+         (:kotoba.cli/code
+          (cli/dispatch contract ["id" "new" "--rp-id" "itonami.cloud"
+                                  "--account" "base:0xnot-caip10"]))))
   (is (= :id/chain-invalid
          (:kotoba.cli/code
-          (cli/dispatch contract ["id" "--address"
+          (cli/dispatch contract ["id" "account" "--address"
                                   "0xA00366234D29d4F882088048c0B2fa0dB7302D4E"
                                   "--chain-id" "0"])))))
 

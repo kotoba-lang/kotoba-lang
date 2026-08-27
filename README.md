@@ -257,18 +257,24 @@ bin/kotoba-clj check --kind cli-contract --json
 
 ### Web3-first identity
 
-The public identity command derives a chain-bound DID from a wallet's public
-address. Base mainnet is the default because it is the settlement network used
-by Murakumo's x402 surface. The CLI never asks for or prints a private key;
-control is proven separately with SIWE at the service being entered.
+The public identity command starts with a chain-neutral Kotoba principal and a
+Passkey/WebAuthn controller. An EVM smart account is an explicit CAIP-10 link,
+verified with ERC-1271 or ERC-6492 when counterfactual; it is not the principal.
+The CLI never asks for or prints a private key, and a verified login still needs
+an explicitly scoped capability before an agent can act.
 
 ```sh
-kotoba id --address 0xA00366234D29d4F882088048c0B2fa0dB7302D4E
-# did:pkh:eip155:8453:0xa00366234d29d4f882088048c0b2fa0db7302d4e
+kotoba id new --rp-id itonami.cloud
+# urn:kotoba:principal:<random id> + Passkey registration plan
 
-kotoba id --address 0xA00366234D29d4F882088048c0B2fa0dB7302D4E --chain-id 1
-# did:pkh:eip155:1:0xa00366234d29d4f882088048c0b2fa0db7302d4e
+kotoba id new --rp-id itonami.cloud \
+  --account eip155:8453:0xA00366234D29d4F882088048c0B2fa0dB7302D4E \
+  --account eip155:1:0xA00366234D29d4F882088048c0B2fa0dB7302D4E
 ```
+
+Base is useful for Murakumo settlement, but is never selected implicitly. A
+legacy EVM address can still be described as a linked account by supplying its
+chain explicitly: `kotoba id account --address 0x… --chain-id 8453`.
 
 ## Source contract
 
