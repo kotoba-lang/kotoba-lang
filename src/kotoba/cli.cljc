@@ -5,8 +5,10 @@
   argument shaping, and command result model without depending on Rust."
   #?(:clj (:require [clojure.edn :as edn]
                     [clojure.java.io :as io]
-                    [clojure.string :as str])) ; cljs consumers pass parsed EDN.
-  #?(:cljs (:require [clojure.string :as str])))
+                    [clojure.string :as str]
+                    [identity.principal :as principal])) ; cljs consumers pass parsed EDN.
+  #?(:cljs (:require [clojure.string :as str]
+                     [identity.principal :as principal])))
 
 (def default-contract-path "lang/cli.edn")
 
@@ -41,12 +43,11 @@
 
 (def ^:private ethereum-address-re #"^0x[0-9A-Fa-f]{40}$")
 
-(defn wallet-did
-  "Derive the chain-bound DID for an Ethereum account.
+(defn account-did
+  "Derive a chain-bound DID alias for one explicitly selected EVM account.
 
-  This deliberately consumes a public wallet address, not private key material.
-  Proof of control belongs to SIWE at the relying party; creating a DID must not
-  turn the language CLI into a seed exporter."
+  This is a linked account identifier, not the Kotoba principal. No chain is
+  defaulted here and proof of account control remains a relying-party concern."
   [address chain-id]
   (when (and (string? address)
              (re-matches ethereum-address-re address)
@@ -62,6 +63,104 @@
                  (<= n 9007199254740991))
         n))
     (catch #?(:clj Exception :cljs :default) _ nil)))
+
+(defn- rp-id? [x]
+  (and (string? x)
+       (not (str/blank? x))
+       (<= (count x) 253)
+       (boolean (re-matches #"^[A-Za-z0-9.-]+$" x))
+       (not (str/starts-with? x "."))
+       (not (str/ends-with? x "."))))
+
+(defn- many [x]
+  (cond
+    (nil? x) []
+    (vector? x) x
+    :else [x]))
+
+(defn- account-plan [account-id]
+  (if (= "eip155" (principal/account-namespace account-id))
+    {:identity.account/id account-id
+     :identity.account/kind :smart-account
+     :identity.account/protocol :erc4337
+     :identity.account/status :proof-required
+     :identity.account/signature-verifiers #{:erc1271 :erc6492}}
+    {:identity.account/id account-id
+     :identity.account/kind :linked-account
+     :identity.account/protocol :chain-native
+     :identity.account/status :proof-required}))
+
+(defn- passkey-enrollment-result [request]
+  (let [principal-id (get-in request [:options :principal])
+        rp-id (get-in request [:options :rp-id])
+        account-ids (many (get-in request [:options :account]))
+        invalid-account (first (remove principal/account-id? account-ids))]
+    (cond
+      (not (rp-id? rp-id))
+      (failure :id/rp-id-invalid
+               "id new requires a WebAuthn relying-party id"
+               {:rp-id rp-id})
+
+      (and principal-id (not (principal/principal-id? principal-id)))
+      (failure :id/principal-invalid
+               "principal must be a DID or urn:kotoba:principal:* identifier"
+               {:principal principal-id})
+
+      invalid-account
+      (failure :id/account-invalid
+               "account must be a CAIP-10 account id"
+               {:account invalid-account})
+
+      :else
+      (success (if principal-id :id/enrollment-planned :id/enrollment-requested)
+               (cond->
+                {:method :passkey-smart-account
+                 :principal principal-id
+                 :controller {:kind :passkey
+                              :signature-suite :webauthn-p256
+                              :rp-id rp-id
+                              :status :registration-required}
+                 :accounts (mapv account-plan account-ids)
+                 :chain-default nil
+                 :custody :passkey-provider
+                 :proof :webauthn-registration-required
+                 :authority :capability-required}
+                 (nil? principal-id)
+                 (assoc :host-action :secure-random-principal-id))))))
+
+(defn- evm-account-result [request]
+  (let [address (or (get-in request [:options :address])
+                    (first (remove #{"account"} (:positionals request))))
+        raw-chain-id (get-in request [:options :chain-id])
+        chain-id (when (some? raw-chain-id) (parse-chain-id raw-chain-id))]
+    (cond
+      (not (and (string? address) (re-matches ethereum-address-re address)))
+      (failure :id/address-invalid
+               "id account requires a public 0x Ethereum account address"
+               {:address address})
+
+      (nil? raw-chain-id)
+      (failure :id/chain-required
+               "chain-id is required; Kotoba has no implicit Base or EVM chain"
+               {})
+
+      (nil? chain-id)
+      (failure :id/chain-invalid
+               "chain-id must be a positive EIP-155 integer"
+               {:chain-id raw-chain-id})
+
+      :else
+      (let [address (str/lower-case address)
+            account-id (str "eip155:" chain-id ":" address)]
+        (success :id/account-described
+                 {:method :linked-chain-account
+                  :principal? false
+                  :account-id account-id
+                  :account-did (account-did address chain-id)
+                  :network :eip155
+                  :chain-id chain-id
+                  :address address
+                  :proof :account-control-proof-required})))))
 
 (defn validate-contract
   "Return a structured validation result for the CLI contract."
@@ -220,28 +319,17 @@
                     :request request})))
 
       (= command-id :id)
-      (let [address (or (get-in request [:options :address])
-                        (first (:positionals request)))
-            chain-id (parse-chain-id (or (get-in request [:options :chain-id]) "8453"))]
+      (let [action (first (:positionals request))
+            account-mode? (or (= "account" action)
+                              (some? (get-in request [:options :address]))
+                              (and (string? action)
+                                   (re-matches ethereum-address-re action)))]
         (cond
-          (not (and (string? address) (re-matches ethereum-address-re address)))
-          (failure :id/address-invalid
-                   "id requires a public 0x Ethereum wallet address"
-                   {:address address})
-
-          (nil? chain-id)
-          (failure :id/chain-invalid
-                   "chain-id must be a positive EIP-155 integer"
-                   {:chain-id (get-in request [:options :chain-id])})
-
-          :else
-          (success :id/generated
-                   {:method :did:pkh
-                    :network :eip155
-                    :chain-id chain-id
-                    :address (str/lower-case address)
-                    :did (wallet-did address chain-id)
-                    :proof :siwe-required})))
+          account-mode? (evm-account-result request)
+          (or (nil? action) (= "new" action)) (passkey-enrollment-result request)
+          :else (failure :id/action-unknown
+                         "id action must be new or account"
+                         {:action action})))
 
       :else
       (success :command/planned

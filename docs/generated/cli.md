@@ -4,6 +4,25 @@
 
 Contract version: `1`. Host executables are adapters; unsupported commands must fail explicitly.
 
+## `kotoba id`
+
+Create a chain-neutral Kotoba principal enrollment plan controlled by a passkey. Smart accounts are explicit CAIP-10 links; no chain or provider is the identity root.
+
+Maturity tier: `m2`.
+
+Positionals:
+
+- **`action`** — new (default) for Passkey enrollment, or account to describe a compatibility EVM account link. Type: `string`.
+
+Options:
+
+- **`--principal`** — Existing DID or urn:kotoba:principal:* to enroll. When omitted, the host creates a random chain-neutral principal id. Type: `string`.
+- **`--rp-id`** — WebAuthn relying-party id that will perform the real, single-use Passkey registration ceremony. Type: `string`.
+- **`--account`** — Optional CAIP-10 account to link after proof. EVM links use ERC-4337/1271/6492; Base is explicit eip155:8453, never a default. Type: `string`; repeatable.
+- **`--address`** — Compatibility public 0x EVM account address. Produces a linked account descriptor, not a principal. Type: `string`.
+- **`--chain-id`** — Required with --address. No EIP-155 chain is selected implicitly. Type: `int`.
+- **`--json`** — Emit the identity result as JSON. Type: `boolean`.
+
 ## `kotoba run`
 
 Compile and run a Kotoba entry point.

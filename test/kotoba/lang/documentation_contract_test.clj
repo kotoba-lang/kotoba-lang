@@ -121,7 +121,7 @@
 (deftest generated-search-index-covers-each-reference-kind
   (let [entries (read-edn (File. ".") "docs/search-index.edn")]
     (is (= #{:release :cli :stdlib :diagnostic} (set (map :kind entries))))
-    (is (= 47 (count entries)))
+    (is (= 48 (count entries)))
     (is (every? #(and (string? (:title %))
                       (string? (:body %))
                       (string? (:url %))) entries))))
