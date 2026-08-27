@@ -8,7 +8,8 @@
   and handler errors — leave a receipt, so an audit trail exists for every
   attempted host call. `journal` provides a zero-dependency append-only
   recorder for those receipts."
-  (:require [kotoba.lang.capability-values :as values]))
+  (:require [kotoba.lang.capability-values :as values]
+            [kotoba.lang.causal-receipt :as causal]))
 
 (defn- ->receipt
   [cap now call outcome extra]
@@ -66,6 +67,40 @@
             {:kotoba.host/ok? true
              :kotoba.host/result (:value invoked)
              :kotoba.host/receipt receipt}))))))
+
+(defn guard-causal-call
+  "Guard a host call with causal authority and the ordinary capability gates.
+
+  `:causal-authority` names an allow decision, its CID, epoch, intent, policy,
+  immutable basis, and the evaluator claims used. It is validated before the
+  handler can run. CACAO grants and local policy are still intersected by
+  `guard-call`; an LLM-issued claim cannot bypass either one. Valid attempts
+  return and record a causal execution receipt containing the ordinary host
+  receipt. Invalid causal authority is denied and receipted without invoking
+  the handler."
+  [{:keys [call requested now record! causal-authority] :as opts}]
+  (let [invalid (try
+                  (causal/preflight! causal-authority requested now)
+                  nil
+                  (catch #?(:clj Exception :cljs :default) error error))]
+    (if invalid
+      (let [receipt (->receipt requested now call :denied
+                               {:receipt/denied :causal-authority-invalid})]
+        (when record! (record! receipt))
+        {:kotoba.host/ok? false
+         :kotoba.host/denied :causal-authority-invalid
+         :kotoba.host/receipt receipt})
+      (let [bound-receipt (atom nil)
+            bind-and-record! (fn [host-receipt]
+                               (let [bound (causal/bind-receipt
+                                            causal-authority host-receipt)]
+                                 (reset! bound-receipt bound)
+                                 (when record! (record! bound))
+                                 bound))
+            result (guard-call (-> opts
+                                   (dissoc :causal-authority)
+                                   (assoc :record! bind-and-record!)))]
+        (assoc result :kotoba.host/receipt @bound-receipt)))))
 
 (defn guard-ability-call
   "Require the caller's declared effect row before ordinary grant/policy

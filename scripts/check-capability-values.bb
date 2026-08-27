@@ -1,10 +1,20 @@
 #!/usr/bin/env bb
 (require '[clojure.edn :as edn]
-         '[clojure.java.io :as io])
+         '[clojure.java.io :as io]
+         '[babashka.deps :as deps])
+
+;; capability-host's strict causal path validates the shared grant contract.
+;; Resolve exactly that declared dependency (and its transitive contracts),
+;; while keeping this script on the same source implementation as the tests.
+(let [declared (edn/read-string (slurp "deps.edn"))
+      coordinate 'io.github.kotoba-lang/grant]
+  (deps/add-deps {:paths ["src"]
+                  :deps {coordinate (get-in declared [:deps coordinate])}}))
 
 ;; Run the exact same pure CLJC logic as the test suite: load the namespace
 ;; source directly so the gate cannot drift from the contract implementation.
 (load-file "src/kotoba/lang/capability_values.cljc")
+(load-file "src/kotoba/lang/causal_receipt.cljc")
 (load-file "src/kotoba/lang/capability_host.cljc")
 (load-file "src/kotoba/lang/capability_cacao.cljc")
 (alias 'caps 'kotoba.lang.capability-values)
