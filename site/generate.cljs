@@ -44,8 +44,15 @@
 (def benchmark-source-path
   (path/join "bench" "public-compile-comparison" "latest.json"))
 
+(def runtime-benchmark-source-path
+  (path/join "bench" "public-runtime-comparison" "latest.json"))
+
 (def benchmark
   (js->clj (js/JSON.parse (fs/readFileSync benchmark-source-path "utf8"))
+           :keywordize-keys true))
+
+(def runtime-benchmark
+  (js->clj (js/JSON.parse (fs/readFileSync runtime-benchmark-source-path "utf8"))
            :keywordize-keys true))
 
 (when-not (fs/existsSync dds-css-path)
@@ -279,30 +286,78 @@
         chip (get-in benchmark [:environment :chip])
         measured-date (subs (:generatedAt benchmark) 0 10)
         kotoba-version (str/upper-case (get-in benchmark [:environment :kotoba]))
-        rust-version (str/join " " (take 2 (str/split (get-in benchmark [:environment :rustc]) #" ")))]
+        rust-version (str/join " " (take 2 (str/split (get-in benchmark [:environment :rustc]) #" ")))
+        comparators (:comparators runtime-benchmark)
+        domains (:domains runtime-benchmark)
+        coverage (:semanticCoverage runtime-benchmark)
+        speed (:speedQualification runtime-benchmark)
+        runtime-date (subs (:generatedAt runtime-benchmark) 0 10)
+        comparator-labels (str/join ", " (map :label comparators))]
     (dds/section
-     {:id "benchmark" :title "Measured against Rust, with the boundary attached"}
+     {:id "benchmark" :title "Two benchmarks. Two different questions."}
      [:p {:class "kot-lead"}
-      "A process-cold comparison of two tiny programs that export " (code "main")
-      ", return i64 42, emit WebAssembly, require zero imports, and are executed after every compile."]
+      "Compile time asks how quickly a tiny program becomes executable. Runtime asks how fast already-built native code runs. The results below keep those questions—and their evidence status—separate."]
      (dds/grid
       {:min "16rem"}
-      (card (dds/chip-label kotoba-version)
-            (dds/heading 3 (str (:medianMilliseconds kotoba) " ms median") {:size "24"})
-            (caption (str (:p95Milliseconds kotoba) " ms p95 · " runs " samples")))
-      (card (dds/chip-label (str/upper-case rust-version))
-            (dds/heading 3 (str (:medianMilliseconds rust) " ms median") {:size "24"})
-            (caption (str (:p95Milliseconds rust) " ms p95 · " runs " samples")))
-      (card (dds/chip-label "THIS RUN")
-            (dds/heading 3 (str ratio "× Rust elapsed") {:size "24"})
-            (caption (str measured-date " · " chip " · alternating order"))))
+      (card (dds/chip-label "COMPILE · MEASURED")
+            (dds/heading 3 (str (:medianMilliseconds kotoba) " ms vs "
+                                (:medianMilliseconds rust) " ms") {:size "24"})
+            [:p (str kotoba-version " used " ratio "× the elapsed time of "
+                     (str/upper-case rust-version) " in this exact run.")]
+            (caption (str runs " alternating process-cold samples · " measured-date
+                          " · " chip)))
+      (card (dds/chip-label "RUNTIME · COVERAGE COMPLETE")
+            (dds/heading 3 (str (count domains) " workloads × "
+                                (count comparators) " comparators") {:size "24"})
+            [:p (str "Amu native is exercised against " comparator-labels
+                     " through one common native call boundary.")]
+            (caption (str (:completeComparatorDomainPairs coverage) "/"
+                          (:requiredComparatorDomainPairs coverage)
+                          " comparator/workload pairs · exact answers verified")))
+      (card (dds/chip-label "RUNTIME SPEED · PENDING" {:color "gray"})
+            (dds/heading 3 "Not qualified" {:size "24"})
+            [:p "The comparison ran, but the host never became quiet enough to support a speed ranking."]
+            (caption (str "load1 " (.toFixed (:observedLoad1First speed) 2) " → "
+                          (.toFixed (:observedLoad1Last speed) 3) " · required ≤ "
+                          (.toFixed (:quietLoad1Limit speed) 1) " · " runtime-date))))
+     [:div {:class "kot-table-scroll"}
+      (dds/table
+       {:caption "What each public benchmark does—and does not—establish"
+        :headers ["Question" "Compared implementations" "Current conclusion"]
+        :row-header? true
+        :rows [["Tiny Wasm compile + execute"
+                (str kotoba-version " vs " (str/upper-case rust-version))
+                (str (:medianMilliseconds kotoba) " ms vs "
+                     (:medianMilliseconds rust) " ms median; " ratio
+                     "× Rust elapsed on this recorded M4 run only")]
+               ["Native steady-state execution"
+                (str "Amu native vs " comparator-labels)
+                "All 30 semantic comparison cells are complete; speed ranking withheld because the quiet-host gate failed"]]})]
+     (dds/heading 3 "What the native suite covers" {:size "24"})
      [:p
-      "This measures tiny-workload toolchain startup on one machine, not general compile speed. "
-      "The modules have different ABIs and runtime contracts, so their byte sizes are not ranked."]
+      "Each implementation returns an independently checked known answer. The suite rotates every engine pair in ABBA/BAAB order and measures after loading, mapping, and symbol lookup."]
+     [:div {:class "kot-table-scroll"}
+      (dds/table
+       {:caption "Six required native runtime workloads"
+        :headers ["Workload" "What it stresses" "Evidence status"]
+        :row-header? true
+        :rows (for [{:keys [label stress exactResultVerified]} domains]
+                [label stress (if exactResultVerified
+                                "Exact result verified; timing unqualified"
+                                "Incomplete")])})]
+     [:p
+      [:strong "Bottom line: "]
+      "The compile result is a real, narrow measurement. The runtime comparison universe is complete and reproducible, but this run does not establish that Amu is fastest. A quiet-host rerun must pass every comparator in every workload before that sentence becomes valid."]
      [:div {:class "kot-actions"}
-      (dds/button "Inspect every sample"
+      (dds/button "Inspect compile samples"
                   {:href "./benchmarks/compile-wasm-latest.json"})
-      (dds/button "Re-run the harness"
+      (dds/button "Inspect runtime evidence"
+                  {:href "./benchmarks/runtime-native-latest.json"
+                   :type :outline})
+      (dds/button "Review the runtime method"
+                  {:href (get-in runtime-benchmark [:sources :method])
+                   :type :outline})
+      (dds/button "Re-run compile harness"
                   {:href "https://github.com/kotoba-lang/kotoba-lang/tree/main/bench/public-compile-comparison"
                    :type :outline})])))
 
@@ -474,6 +529,7 @@
   (fs/copyFileSync logo-source-path (path/join out "kotoba-wordmark.png"))
   (doseq [[source target]
           [[benchmark-source-path (path/join out "benchmarks" "compile-wasm-latest.json")]
+           [runtime-benchmark-source-path (path/join out "benchmarks" "runtime-native-latest.json")]
            [(path/join "site" "assets" "llms.txt") (path/join out "llms.txt")]
            [(path/join "site" "assets" "llms-full.txt") (path/join out "llms-full.txt")]
            [(path/join "site" "assets" "agent-quickstart.md") (path/join out "agent-quickstart.md")]]]

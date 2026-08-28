@@ -38,9 +38,13 @@ derived from the repository authorities above.
 
 The page also retains the generated local documentation search: its embedded
 index is built from the repository authority and no query leaves the browser.
-The public benchmark section reads the checked-in raw report at
-`bench/public-compile-comparison/latest.json`; the generator copies that report
-alongside `llms.txt`, `llms-full.txt`, and the executable agent quickstart.
+The public benchmark section reads the checked-in compile report at
+`bench/public-compile-comparison/latest.json` and the bounded native comparison
+summary at `bench/public-runtime-comparison/latest.json`. The generator copies
+both reports alongside `llms.txt`, `llms-full.txt`, and the executable agent
+quickstart. Compile-startup evidence and steady-state runtime evidence remain
+visibly separate, and an unqualified host-load result cannot become a fastest
+claim through presentation.
 
 ## Regenerate
 
