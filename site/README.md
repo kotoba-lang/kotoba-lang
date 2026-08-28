@@ -1,8 +1,9 @@
 # site — kotoba-lang.org
 
-The language's public page. One static, self-contained document with no network
-runtime dependency. A small inline script filters the generated reference
-index; queries stay in the browser and no telemetry is emitted.
+The language's public static site. It has no third-party runtime dependency.
+Small inline scripts filter the generated reference index and run the Play
+surface; Play fetches only the same-origin, digest-bound Wasm artifact. Queries
+stay in the browser and no telemetry is emitted.
 
 ## What makes this page different from a README
 
@@ -38,6 +39,12 @@ derived from the repository authorities above.
 
 The page also retains the generated local documentation search: its embedded
 index is built from the repository authority and no query leaves the browser.
+The developer journey connects documentation, the exact checked source sample,
+a digest-bound browser Play artifact, libraries, roadmap, public community
+channels, the generated engineering blog, and related cloud products.
+`site/assets/play/` contains the source, Wasm, provenance, and publication
+manifest copied to `site/dist/play/`; the UI explicitly labels this as a
+precompiled example rather than an arbitrary in-browser compiler.
 The public benchmark section reads the checked-in compile report at
 `bench/public-compile-comparison/latest.json` and the bounded native comparison
 summary at `bench/public-runtime-comparison/latest.json`. The generator copies
@@ -60,7 +67,7 @@ nbb --classpath "../jp-go-digital-design-system/src:../css/src:../html/src" site
 The generator reads the vendored DADS stylesheet from
 `JP_GO_DDS_ROOT/resources/jp_go_dds/dds.css` and inlines it. The resulting page
 has no external font, script, analytics, or design-system request at runtime;
-the small documentation-filter script is inline.
+the small documentation-filter and Play scripts are inline.
 
 The header uses the same six-circle `K O T O B A` artwork as the implementation
 repository README. Its authoritative source is
@@ -71,9 +78,9 @@ repository README. Its authoritative source is
 The generator copies that local asset into `dist/`, so the deployed page makes
 no external image request.
 
-Output: `site/dist/index.html`, the wordmark, AI-agent text surfaces, and the
-raw benchmark JSON (committed, so a clean checkout can deploy without running
-the generator).
+Output: `site/dist/index.html`, `site/dist/blog/index.html`, the Play artifact
+and evidence, the wordmark, AI-agent text surfaces, and the raw benchmark JSON
+(committed, so a clean checkout can deploy without running the generator).
 
 The generator also publishes identity's canonical external-trust artifacts at
 `/schemas/trust-profile/v1`,
