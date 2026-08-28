@@ -127,7 +127,9 @@
                       (string? (:url %))) entries))))
 
 (deftest generated-site-embeds-private-local-search-and-release-block
-  (let [html (slurp "site/dist/index.html")]
+  (let [html (slurp "site/dist/index.html")
+        search-items (count (re-seq #"class=\"kot-search-item\"" html))
+        index-entries (count (read-edn (File. ".") "docs/search-index.edn"))]
     (is (str/includes? html "id=\"kot-doc-search\""))
     (is (str/includes? html "aria-label=\"Search Kotoba documentation reference\""))
     (is (str/includes? html "No query leaves the browser."))
@@ -140,5 +142,7 @@
     (is (.isFile (file-at (File. ".") "site/dist/llms-full.txt")))
     (is (.isFile (file-at (File. ".") "site/dist/agent-quickstart.md")))
     (is (.isFile (file-at (File. ".") "site/dist/benchmarks/compile-wasm-latest.json")))
-    (is (= 47 (count (re-seq #"class=\"kot-search-item\"" html))))
+    (is (= 48 search-items))
+    (is (= index-entries search-items))
+    (is (str/includes? html ">kotoba id<"))
     (is (str/includes? html "input.addEventListener('input',apply)"))))
