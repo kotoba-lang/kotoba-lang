@@ -502,7 +502,11 @@
                 [(path/join identity-root "resources" "public" "policies"
                             "trust" "eas" "kotobase-v1.json")
                  (path/join out "policies" "trust" "eas"
-                            "kotobase-v1.json")]]]
+                            "kotobase-v1.json")]
+                [(path/join identity-root "resources" "public" "policies"
+                            "trust" "erc8004" "murakumo-v1.json")
+                 (path/join out "policies" "trust" "erc8004"
+                            "murakumo-v1.json")]]]
     (doseq [[source target] copies]
       (when-not (fs/existsSync source)
         (throw (js/Error. (str "required identity trust contract missing: " source))))
