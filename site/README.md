@@ -45,6 +45,11 @@ channels, the generated engineering blog, and related cloud products.
 `site/assets/play/` contains the source, Wasm, provenance, and publication
 manifest copied to `site/dist/play/`; the UI explicitly labels this as a
 precompiled example rather than an arbitrary in-browser compiler.
+The displayed Kotoba source is tokenized at build time into comments, special
+forms, definition names, keywords, values, delimiters, and operators. The
+generator fails if concatenating those highlighted tokens does not reproduce
+the exact `.kotoba` source, and the deployed page needs no client-side syntax
+highlighter or third-party runtime dependency.
 The public benchmark section reads the checked-in compile report at
 `bench/public-compile-comparison/latest.json` and the bounded native comparison
 summary at `bench/public-runtime-comparison/latest.json`. The generator copies
