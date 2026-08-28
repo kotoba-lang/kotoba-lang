@@ -10,6 +10,7 @@
          '[jp-go-dds.tokens :as tokens]
          '[cljs.reader :as reader]
          '[clojure.string :as str]
+         '["crypto" :as crypto]
          '["fs" :as fs]
          '["path" :as path])
 
@@ -36,8 +37,17 @@
   (or (some-> js/process.env.JP_GO_DDS_ROOT not-empty)
       (path/join ".." "jp-go-digital-design-system")))
 
+(def grammar-root
+  (or (some-> js/process.env.KOTOBA_GRAMMAR_ROOT not-empty)
+      (path/join ".." "grammar")))
+
 (def dds-css-path
   (path/join dds-root "resources" "jp_go_dds" "dds.css"))
+
+(def syntax-grammar-path
+  (path/join grammar-root "syntaxes" "kotoba.tmLanguage.json"))
+
+(def dependency-manifest-path (path/join "site" "dependencies.edn"))
 
 (def logo-source-path
   (path/join "site" "assets" "kotoba-wordmark.png"))
@@ -64,6 +74,9 @@
 (def play-source (fs/readFileSync play-source-path "utf8"))
 (def play-provenance (reader/read-string (fs/readFileSync play-provenance-path "utf8")))
 (def play-sha256 (get-in play-provenance [:outputs :primary :sha256]))
+(def dependencies (reader/read-string (fs/readFileSync dependency-manifest-path "utf8")))
+(def syntax-dependency
+  (first (filter #(= :syntax-highlighting (:id %)) (:build-time dependencies))))
 
 (when-not (fs/existsSync dds-css-path)
   (println "site/generate.cljs: jp-go-dds CSS not found:" dds-css-path)
@@ -74,7 +87,27 @@
   (println "site/generate.cljs: Kotoba wordmark not found:" logo-source-path)
   (js/process.exit 1))
 
+(when-not (fs/existsSync syntax-grammar-path)
+  (println "site/generate.cljs: Kotoba TextMate grammar not found:" syntax-grammar-path)
+  (println "  set KOTOBA_GRAMMAR_ROOT to the kotoba-lang/grammar checkout")
+  (js/process.exit 1))
+
 (def dds-css (fs/readFileSync dds-css-path "utf8"))
+(def syntax-grammar-json (fs/readFileSync syntax-grammar-path "utf8"))
+(def syntax-grammar
+  (js->clj (js/JSON.parse syntax-grammar-json) :keywordize-keys true))
+(def syntax-grammar-sha256
+  (.digest (.update (crypto/createHash "sha256") syntax-grammar-json) "hex"))
+
+(when-not (= (:artifact-sha256 syntax-dependency) syntax-grammar-sha256)
+  (throw (js/Error.
+          (str "Kotoba syntax grammar digest does not match site/dependencies.edn: "
+               syntax-grammar-sha256))))
+
+(when-not (= (:scope syntax-dependency) (:scopeName syntax-grammar))
+  (throw (js/Error.
+          (str "Kotoba syntax scope does not match site/dependencies.edn: "
+               (:scopeName syntax-grammar)))))
 
 (defn code [s] [:code {:class "kot-code"} s])
 (defn caption [& children] (into [:p {:class "kot-muted kot-caption"}] children))
@@ -84,41 +117,56 @@
   (into [:ul {:class "kot-list"}] (for [item items] [:li item])))
 (defn card [& children] (apply dds/card children))
 
-(def kotoba-special-forms
-  #{"def" "defn" "do" "fn" "if" "let" "loop" "match" "match-type"
-    "ns" "recur"})
+(defn scope-kind [scope]
+  (cond
+    (str/starts-with? scope "comment.") :comment
+    (str/starts-with? scope "string.") :string
+    (str/starts-with? scope "constant.numeric.") :number
+    (str/starts-with? scope "constant.language.") :literal
+    (str/starts-with? scope "constant.other.keyword.") :keyword
+    (str/starts-with? scope "invalid.") :forbidden
+    (str/starts-with? scope "keyword.") :form
+    (str/starts-with? scope "support.function.") :function
+    (str/starts-with? scope "entity.name.") :definition
+    (str/starts-with? scope "punctuation.") :delimiter
+    :else :symbol))
 
-(def kotoba-operators
-  #{"+" "-" "*" "/" "=" "<" "<=" ">" ">=" "and" "or" "not"})
+(defn compound-pattern [{:keys [begin end patterns]}]
+  (let [children (keep :match patterns)
+        child (if (seq children)
+                (str "(?:" (str/join "|" children) ")")
+                "(?!)")]
+    (str "(?:" begin ")(?:(?:" child ")|(?!(?:" end "))[\\s\\S])*(?:" end "|$)")))
 
-(def kotoba-token-pattern
-  #"(;;[^\n]*|\"(?:\\.|[^\"\\])*\"|:[A-Za-z0-9_?!+*./<>=-]+|-?[0-9]+(?:\.[0-9]+)?|[()\[\]{}]|[^\s()\[\]{}\"]+|\s+)")
+(def syntax-patterns
+  (mapv (fn [{:keys [name match begin] :as pattern}]
+          {:scope name
+           :kind (scope-kind name)
+           :regex (js/RegExp. (or match (when begin (compound-pattern pattern))) "my")})
+        (:patterns syntax-grammar)))
+
+(defn token-at [source index]
+  (some (fn [{:keys [regex] :as pattern}]
+          (set! (.-lastIndex regex) index)
+          (when-let [match (.exec regex source)]
+            (let [text (aget match 0)]
+              (when (seq text)
+                (assoc pattern :text text)))))
+        syntax-patterns))
+
+(defn append-token [tokens token]
+  (if (and (= :plain (:kind token)) (= :plain (:kind (peek tokens))))
+    (conj (pop tokens) (update (peek tokens) :text str (:text token)))
+    (conj tokens token)))
 
 (defn kotoba-tokens [source]
-  (loop [parts (re-seq kotoba-token-pattern source)
-         expects-name? false
-         tokens []]
-    (if-let [part (some-> parts first first)]
-      (let [whitespace? (boolean (re-matches #"\s+" part))
-            kind (cond
-                   whitespace? :plain
-                   (str/starts-with? part ";;") :comment
-                   (str/starts-with? part "\"") :string
-                   expects-name? :definition
-                   (kotoba-special-forms part) :form
-                   (str/starts-with? part ":") :keyword
-                   (re-matches #"-?[0-9]+(?:\.[0-9]+)?" part) :number
-                   (re-matches #"[()\[\]{}]" part) :delimiter
-                   (kotoba-operators part) :operator
-                   :else :plain)
-            next-expects-name? (cond
-                                 whitespace? expects-name?
-                                 expects-name? false
-                                 (#{"ns" "def" "defn"} part) true
-                                 :else false)]
-        (recur (next parts)
-               next-expects-name?
-               (conj tokens {:kind kind :text part})))
+  (loop [index 0 tokens []]
+    (if (< index (count source))
+      (if-let [{:keys [text] :as token} (token-at source index)]
+        (recur (+ index (count text)) (append-token tokens (dissoc token :regex)))
+        (recur (inc index)
+               (append-token tokens {:kind :plain :scope nil
+                                     :text (subs source index (inc index))})))
       tokens)))
 
 (defn highlighted-kotoba [source]
@@ -176,11 +224,14 @@
    "border-radius:var(--hig-radius-md)}"
    ".kot-source{display:block;white-space:pre;tab-size:2}"
    ".kot-syntax-comment{color:var(--hig-color-tertiary-label);font-style:italic}"
-   ".kot-syntax-form,.kot-syntax-keyword,.kot-syntax-operator{color:var(--hig-color-tint);font-weight:700}"
+   ".kot-syntax-form,.kot-syntax-keyword,.kot-syntax-function{color:var(--hig-color-tint);font-weight:700}"
    ".kot-syntax-definition{color:var(--hig-color-label);font-weight:700;text-decoration:underline;"
    "text-decoration-color:var(--hig-color-tint);text-underline-offset:.18em}"
-   ".kot-syntax-number,.kot-syntax-string{color:var(--hig-color-label);font-weight:700}"
+   ".kot-syntax-number,.kot-syntax-string,.kot-syntax-literal{color:var(--hig-color-label);font-weight:700}"
    ".kot-syntax-delimiter{color:var(--hig-color-secondary-label)}"
+   ".kot-syntax-symbol{color:var(--hig-color-label)}"
+   ".kot-syntax-forbidden{color:var(--hig-color-label);font-weight:700;text-decoration:underline wavy;"
+   "text-decoration-color:var(--hig-color-tint);text-underline-offset:.18em}"
    ".kot-list{padding-inline-start:var(--hig-spacing-5)}"
    ".kot-list li+li{margin-top:var(--hig-spacing-2)}"
    ".kot-quote{margin:var(--hig-spacing-5) 0 0;padding-inline-start:var(--hig-spacing-4);"
@@ -391,6 +442,11 @@
     {:min "21rem"}
     (card (dds/chip-label "KOTOBA SOURCE")
           [:pre {:class "kot-pre"} (highlighted-kotoba play-source)]
+          (caption "Highlighting authority: "
+                   (external-link "https://github.com/kotoba-lang/grammar" "kotoba-lang/grammar")
+                   " → " (code "source.kotoba") " TextMate projection → build-time HTML. "
+                   "Browser highlighter dependency: none. "
+                   [:a {:class "kot-link" :href "./dependencies.edn"} "Inspect dependencies"])
           (caption "Compile locally: kotoba compile double-21.kotoba --target wasm32-browser --output double-21.wasm"))
     (card [:div {:id "play" :class "kot-play"}
            (dds/chip-label "PLAY · WEBASSEMBLY")
@@ -797,6 +853,7 @@
   (fs/mkdirSync (path/join out "blog") #js {:recursive true})
   (fs/writeFileSync (path/join out "blog" "index.html") blog-html)
   (fs/copyFileSync logo-source-path (path/join out "kotoba-wordmark.png"))
+  (fs/copyFileSync dependency-manifest-path (path/join out "dependencies.edn"))
   (doseq [[source target]
           [[benchmark-source-path (path/join out "benchmarks" "compile-wasm-latest.json")]
            [runtime-benchmark-source-path (path/join out "benchmarks" "runtime-native-latest.json")]
