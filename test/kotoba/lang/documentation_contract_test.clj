@@ -145,4 +145,4 @@
     (is (= 48 search-items))
     (is (= index-entries search-items))
     (is (str/includes? html ">kotoba id<"))
-    (is (str/includes? html "input.addEventListener('input',apply)")))))
+    (is (str/includes? html "input.addEventListener('input',apply)"))))
