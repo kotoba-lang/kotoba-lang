@@ -135,7 +135,7 @@
     (is (str/includes? html "No query leaves the browser."))
     (is (str/includes? html "docs/release-bound-profile"))
     (is (str/includes? html "profile binding: verified"))
-    (is (str/includes? html "Measured against Rust, with the boundary attached"))
+    (is (str/includes? html "Proof, with the boundary attached"))
     (is (str/includes? html "./benchmarks/compile-wasm-latest.json"))
     (is (str/includes? html "./agent-quickstart.md"))
     (is (.isFile (file-at (File. ".") "site/dist/llms.txt")))
@@ -146,3 +146,22 @@
     (is (= index-entries search-items))
     (is (str/includes? html ">kotoba id<"))
     (is (str/includes? html "input.addEventListener('input',apply)"))))
+
+(deftest generated-site-uses-the-pinned-portable-highlight-library
+  (let [manifest (read-edn (File. ".") "site/dependencies.edn")
+        published (read-edn (File. ".") "site/dist/dependencies.edn")
+        syntax (first (filter #(= :syntax-highlighting (:id %))
+                              (:build-time manifest)))
+        html (slurp "site/dist/index.html")]
+    (is (= manifest published) "the public dependency manifest must be exact")
+    (is (= "kotoba-lang/grammar" (:repository syntax)))
+    (is (= "de393f6087daf931ae924e5dd0ec75dea7a87bd2" (:revision syntax)))
+    (is (= "kotoba.grammar.highlight/tokenize" (:api syntax)))
+    (is (= "site/generate.cljs/highlighted-kotoba" (:consumer syntax)))
+    (is (false? (:runtime-dependency syntax)))
+    (is (str/includes? html "kotoba.grammar.highlight/tokenize"))
+    (doseq [class ["kot-syntax-comment" "kot-syntax-form"
+                   "kot-syntax-definition" "kot-syntax-function"
+                   "kot-syntax-number" "kot-syntax-delimiter"
+                   "kot-syntax-symbol"]]
+      (is (str/includes? html class) (str class " must remain rendered")))))

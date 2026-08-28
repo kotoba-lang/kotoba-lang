@@ -8,6 +8,7 @@
 (require '[jp-go-dds.core :as dds]
          '[jp-go-dds.page :as page]
          '[jp-go-dds.tokens :as tokens]
+         '[kotoba.grammar.highlight :as grammar-highlight]
          '[cljs.reader :as reader]
          '[clojure.string :as str]
          '["crypto" :as crypto]
@@ -119,6 +120,7 @@
 
 (defn scope-kind [scope]
   (cond
+    (nil? scope) :plain
     (str/starts-with? scope "comment.") :comment
     (str/starts-with? scope "string.") :string
     (str/starts-with? scope "constant.numeric.") :number
@@ -131,46 +133,9 @@
     (str/starts-with? scope "punctuation.") :delimiter
     :else :symbol))
 
-(defn compound-pattern [{:keys [begin end patterns]}]
-  (let [children (keep :match patterns)
-        child (if (seq children)
-                (str "(?:" (str/join "|" children) ")")
-                "(?!)")]
-    (str "(?:" begin ")(?:(?:" child ")|(?!(?:" end "))[\\s\\S])*(?:" end "|$)")))
-
-(def syntax-patterns
-  (mapv (fn [{:keys [name match begin] :as pattern}]
-          {:scope name
-           :kind (scope-kind name)
-           :regex (js/RegExp. (or match (when begin (compound-pattern pattern))) "my")})
-        (:patterns syntax-grammar)))
-
-(defn token-at [source index]
-  (some (fn [{:keys [regex] :as pattern}]
-          (set! (.-lastIndex regex) index)
-          (when-let [match (.exec regex source)]
-            (let [text (aget match 0)]
-              (when (seq text)
-                (assoc pattern :text text)))))
-        syntax-patterns))
-
-(defn append-token [tokens token]
-  (if (and (= :plain (:kind token)) (= :plain (:kind (peek tokens))))
-    (conj (pop tokens) (update (peek tokens) :text str (:text token)))
-    (conj tokens token)))
-
-(defn kotoba-tokens [source]
-  (loop [index 0 tokens []]
-    (if (< index (count source))
-      (if-let [{:keys [text] :as token} (token-at source index)]
-        (recur (+ index (count text)) (append-token tokens (dissoc token :regex)))
-        (recur (inc index)
-               (append-token tokens {:kind :plain :scope nil
-                                     :text (subs source index (inc index))})))
-      tokens)))
-
 (defn highlighted-kotoba [source]
-  (let [tokens (kotoba-tokens source)
+  (let [tokens (mapv #(assoc % :kind (scope-kind (:scope %)))
+                     (grammar-highlight/tokenize source))
         reconstructed (apply str (map :text tokens))]
     (when-not (= source reconstructed)
       (throw (js/Error. "Kotoba syntax highlighting changed the displayed source")))
@@ -444,7 +409,8 @@
           [:pre {:class "kot-pre"} (highlighted-kotoba play-source)]
           (caption "Highlighting authority: "
                    (external-link "https://github.com/kotoba-lang/grammar" "kotoba-lang/grammar")
-                   " → " (code "source.kotoba") " TextMate projection → build-time HTML. "
+                   " → " (code "kotoba.grammar.highlight/tokenize") " → build-time HTML. "
+                   "Editor scope contract: " (code "source.kotoba") ". "
                    "Browser highlighter dependency: none. "
                    [:a {:class "kot-link" :href "./dependencies.edn"} "Inspect dependencies"])
           (caption "Compile locally: kotoba compile double-21.kotoba --target wasm32-browser --output double-21.wasm"))

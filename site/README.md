@@ -45,12 +45,14 @@ channels, the generated engineering blog, and related cloud products.
 `site/assets/play/` contains the source, Wasm, provenance, and publication
 manifest copied to `site/dist/play/`; the UI explicitly labels this as a
 precompiled example rather than an arbitrary in-browser compiler.
-The displayed Kotoba source is tokenized at build time from
-`kotoba-lang/grammar`'s generated `syntaxes/kotoba.tmLanguage.json`; the site
-does not maintain a second keyword or forbidden-form list. TextMate scopes are
-adapted to presentation classes, and the generator fails if concatenating the
-highlighted tokens does not reproduce the exact `.kotoba` source. The deployed
-page needs no client-side syntax highlighter or third-party runtime dependency.
+The displayed Kotoba source is tokenized at build time by
+`kotoba-lang/grammar`'s portable `kotoba.grammar.highlight/tokenize` API; the
+site does not maintain a tokenizer, keyword list, or forbidden-form list.
+Stable TextMate-compatible scopes are adapted to presentation classes, and the
+generator fails if concatenating the highlighted tokens does not reproduce the
+exact `.kotoba` source. The generated TextMate artifact remains digest-checked
+as the editor scope contract. The deployed page needs no client-side syntax
+highlighter or third-party runtime dependency.
 `site/dependencies.edn` records the grammar revision, artifact digest, scope,
 other build-time repositories, and the intentionally small browser runtime
 dependency surface. The generator verifies the grammar digest and scope before
@@ -72,7 +74,7 @@ Run from the **repository root**, with `jp-go-digital-design-system`, `grammar`,
 JP_GO_DDS_ROOT=../jp-go-digital-design-system \
 KOTOBA_GRAMMAR_ROOT=../grammar \
 KOTOBA_IDENTITY_ROOT=../identity \
-nbb --classpath "../jp-go-digital-design-system/src:../css/src:../html/src" site/generate.cljs
+nbb --classpath "../grammar/src:../jp-go-digital-design-system/src:../css/src:../html/src" site/generate.cljs
 ```
 
 The generator reads the vendored DADS stylesheet from
