@@ -487,5 +487,22 @@
     (fs/mkdirSync wk #js {:recursive true})
     (fs/copyFileSync (path/join "site" "assets" "security.txt")
                      (path/join wk "security.txt")))
+  ;; Public machine contract for the external-trust discovery documents served
+  ;; by Kotobase, Murakumo and Itonami. identity owns the schema and policy;
+  ;; this authority site is only their deterministic HTTPS projection.
+  (let [identity-root (or (.-KOTOBA_IDENTITY_ROOT js/process.env)
+                          (path/join ".." "identity"))
+        copies [[(path/join identity-root "resources" "public" "schemas"
+                            "trust-profile" "v1.json")
+                 (path/join out "schemas" "trust-profile" "v1")]
+                [(path/join identity-root "resources" "public" "policies"
+                            "trust" "human-passport" "itonami-v1.json")
+                 (path/join out "policies" "trust" "human-passport"
+                            "itonami-v1.json")]]]
+    (doseq [[source target] copies]
+      (when-not (fs/existsSync source)
+        (throw (js/Error. (str "required identity trust contract missing: " source))))
+      (fs/mkdirSync (path/dirname target) #js {:recursive true})
+      (fs/copyFileSync source target)))
   (println "wrote" (path/join out "index.html")
            (str "(" (.-length html) " bytes)")))
