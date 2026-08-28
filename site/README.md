@@ -49,6 +49,7 @@ Run from the **repository root**, with `jp-go-digital-design-system`, `css`, and
 
 ```sh
 JP_GO_DDS_ROOT=../jp-go-digital-design-system \
+KOTOBA_IDENTITY_ROOT=../identity \
 nbb --classpath "../jp-go-digital-design-system/src:../css/src:../html/src" site/generate.cljs
 ```
 
@@ -69,6 +70,12 @@ no external image request.
 Output: `site/dist/index.html`, the wordmark, AI-agent text surfaces, and the
 raw benchmark JSON (committed, so a clean checkout can deploy without running
 the generator).
+
+The generator also publishes identity's canonical external-trust artifacts at
+`/schemas/trust-profile/v1` and
+`/policies/trust/human-passport/itonami-v1.json`. The source remains
+`kotoba-lang/identity`; regeneration fails if that west sibling is absent, so a
+stale handwritten site copy cannot silently deploy.
 
 **The committed artifact is a deploy input, not a build by-product**: `wrangler
 deploy` here has no build step, so whatever is in `dist/` at deploy time is what
