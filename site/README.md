@@ -75,7 +75,8 @@ The generator also publishes identity's canonical external-trust artifacts at
 `/schemas/trust-profile/v1`,
 `/policies/trust/human-passport/itonami-v1.json`, and
 `/policies/trust/eas/kotobase-v1.json`, and
-`/policies/trust/erc8004/murakumo-v1.json`. The source remains
+`/policies/trust/erc8004/murakumo-v1.json` plus its detached
+`.signature.json` quorum envelope. The source remains
 `kotoba-lang/identity`; regeneration fails if that west sibling is absent, so a
 stale handwritten site copy cannot silently deploy.
 
