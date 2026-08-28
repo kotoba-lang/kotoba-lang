@@ -45,11 +45,16 @@ channels, the generated engineering blog, and related cloud products.
 `site/assets/play/` contains the source, Wasm, provenance, and publication
 manifest copied to `site/dist/play/`; the UI explicitly labels this as a
 precompiled example rather than an arbitrary in-browser compiler.
-The displayed Kotoba source is tokenized at build time into comments, special
-forms, definition names, keywords, values, delimiters, and operators. The
-generator fails if concatenating those highlighted tokens does not reproduce
-the exact `.kotoba` source, and the deployed page needs no client-side syntax
-highlighter or third-party runtime dependency.
+The displayed Kotoba source is tokenized at build time from
+`kotoba-lang/grammar`'s generated `syntaxes/kotoba.tmLanguage.json`; the site
+does not maintain a second keyword or forbidden-form list. TextMate scopes are
+adapted to presentation classes, and the generator fails if concatenating the
+highlighted tokens does not reproduce the exact `.kotoba` source. The deployed
+page needs no client-side syntax highlighter or third-party runtime dependency.
+`site/dependencies.edn` records the grammar revision, artifact digest, scope,
+other build-time repositories, and the intentionally small browser runtime
+dependency surface. The generator verifies the grammar digest and scope before
+rendering and publishes the manifest at `/dependencies.edn`.
 The public benchmark section reads the checked-in compile report at
 `bench/public-compile-comparison/latest.json` and the bounded native comparison
 summary at `bench/public-runtime-comparison/latest.json`. The generator copies
@@ -60,11 +65,12 @@ claim through presentation.
 
 ## Regenerate
 
-Run from the **repository root**, with `jp-go-digital-design-system`, `css`, and
-`html` checked out as west siblings (`orgs/kotoba-lang/*`):
+Run from the **repository root**, with `jp-go-digital-design-system`, `grammar`,
+`css`, and `html` checked out as west siblings (`orgs/kotoba-lang/*`):
 
 ```sh
 JP_GO_DDS_ROOT=../jp-go-digital-design-system \
+KOTOBA_GRAMMAR_ROOT=../grammar \
 KOTOBA_IDENTITY_ROOT=../identity \
 nbb --classpath "../jp-go-digital-design-system/src:../css/src:../html/src" site/generate.cljs
 ```
