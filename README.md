@@ -12,6 +12,15 @@ property of the whole computation.**
 [`kotoba-lang/kotoba`](https://github.com/kotoba-lang/kotoba) ·
 [getting started](docs/getting-started.md)
 
+The domains name different product responsibilities. `kotoba-lang.org` is this
+language's specification and documentation surface. The operational entrance
+is [`kotoba.cloud`](https://kotoba.cloud): Passkey identity and CLI deploy
+discovery. Durable storage remains
+[`kotobase.net`](https://kotobase.net), CPU/GPU execution remains
+[`murakumo.cloud`](https://murakumo.cloud), and agent work remains
+[`itonami.cloud`](https://itonami.cloud). The separation is an authority
+boundary, not merely navigation or branding.
+
 ```sh
 brew tap kotoba-lang/kotoba
 brew install kotoba
