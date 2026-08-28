@@ -84,6 +84,55 @@
   (into [:ul {:class "kot-list"}] (for [item items] [:li item])))
 (defn card [& children] (apply dds/card children))
 
+(def kotoba-special-forms
+  #{"def" "defn" "do" "fn" "if" "let" "loop" "match" "match-type"
+    "ns" "recur"})
+
+(def kotoba-operators
+  #{"+" "-" "*" "/" "=" "<" "<=" ">" ">=" "and" "or" "not"})
+
+(def kotoba-token-pattern
+  #"(;;[^\n]*|\"(?:\\.|[^\"\\])*\"|:[A-Za-z0-9_?!+*./<>=-]+|-?[0-9]+(?:\.[0-9]+)?|[()\[\]{}]|[^\s()\[\]{}\"]+|\s+)")
+
+(defn kotoba-tokens [source]
+  (loop [parts (re-seq kotoba-token-pattern source)
+         expects-name? false
+         tokens []]
+    (if-let [part (some-> parts first first)]
+      (let [whitespace? (boolean (re-matches #"\s+" part))
+            kind (cond
+                   whitespace? :plain
+                   (str/starts-with? part ";;") :comment
+                   (str/starts-with? part "\"") :string
+                   expects-name? :definition
+                   (kotoba-special-forms part) :form
+                   (str/starts-with? part ":") :keyword
+                   (re-matches #"-?[0-9]+(?:\.[0-9]+)?" part) :number
+                   (re-matches #"[()\[\]{}]" part) :delimiter
+                   (kotoba-operators part) :operator
+                   :else :plain)
+            next-expects-name? (cond
+                                 whitespace? expects-name?
+                                 expects-name? false
+                                 (#{"ns" "def" "defn"} part) true
+                                 :else false)]
+        (recur (next parts)
+               next-expects-name?
+               (conj tokens {:kind kind :text part})))
+      tokens)))
+
+(defn highlighted-kotoba [source]
+  (let [tokens (kotoba-tokens source)
+        reconstructed (apply str (map :text tokens))]
+    (when-not (= source reconstructed)
+      (throw (js/Error. "Kotoba syntax highlighting changed the displayed source")))
+    (into [:code {:class "kot-source" :aria-label "Kotoba source code"}]
+          (map (fn [{:keys [kind text]}]
+                 (if (= :plain kind)
+                   text
+                   [:span {:class (str "kot-syntax-" (name kind))} text])))
+          tokens)))
+
 (def app-css
   (str
    ".kot-skip{position:absolute;inset-inline-start:var(--hig-spacing-2);"
@@ -125,6 +174,13 @@
    "line-height:var(--hig-text-footnote-line-height);margin:0;overflow-x:auto;"
    "padding:var(--hig-spacing-4);background:var(--hig-color-quaternary-system-fill);"
    "border-radius:var(--hig-radius-md)}"
+   ".kot-source{display:block;white-space:pre;tab-size:2}"
+   ".kot-syntax-comment{color:var(--hig-color-tertiary-label);font-style:italic}"
+   ".kot-syntax-form,.kot-syntax-keyword,.kot-syntax-operator{color:var(--hig-color-tint);font-weight:700}"
+   ".kot-syntax-definition{color:var(--hig-color-label);font-weight:700;text-decoration:underline;"
+   "text-decoration-color:var(--hig-color-tint);text-underline-offset:.18em}"
+   ".kot-syntax-number,.kot-syntax-string{color:var(--hig-color-label);font-weight:700}"
+   ".kot-syntax-delimiter{color:var(--hig-color-secondary-label)}"
    ".kot-list{padding-inline-start:var(--hig-spacing-5)}"
    ".kot-list li+li{margin-top:var(--hig-spacing-2)}"
    ".kot-quote{margin:var(--hig-spacing-5) 0 0;padding-inline-start:var(--hig-spacing-4);"
@@ -334,7 +390,7 @@
    (dds/grid
     {:min "21rem"}
     (card (dds/chip-label "KOTOBA SOURCE")
-          [:pre {:class "kot-pre"} [:code play-source]]
+          [:pre {:class "kot-pre"} (highlighted-kotoba play-source)]
           (caption "Compile locally: kotoba compile double-21.kotoba --target wasm32-browser --output double-21.wasm"))
     (card [:div {:id "play" :class "kot-play"}
            (dds/chip-label "PLAY · WEBASSEMBLY")
