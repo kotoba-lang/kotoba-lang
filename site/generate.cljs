@@ -2,7 +2,8 @@
 ;;
 ;; The page is rendered with jp-go-dds (Digital Agency Design System), while
 ;; its product claims are derived from this repository's machine authorities.
-;; No runtime network dependency or telemetry is added.
+;; No third-party runtime dependency or telemetry is added. Play fetches one
+;; same-origin, digest-bound Wasm artifact generated from the checked source.
 
 (require '[jp-go-dds.core :as dds]
          '[jp-go-dds.page :as page]
@@ -47,6 +48,11 @@
 (def runtime-benchmark-source-path
   (path/join "bench" "public-runtime-comparison" "latest.json"))
 
+(def play-source-path (path/join "site" "assets" "play" "double-21.kotoba"))
+(def play-wasm-path (path/join "site" "assets" "play" "double-21.wasm"))
+(def play-provenance-path
+  (path/join "site" "assets" "play" "double-21.wasm.provenance.edn"))
+
 (def benchmark
   (js->clj (js/JSON.parse (fs/readFileSync benchmark-source-path "utf8"))
            :keywordize-keys true))
@@ -54,6 +60,10 @@
 (def runtime-benchmark
   (js->clj (js/JSON.parse (fs/readFileSync runtime-benchmark-source-path "utf8"))
            :keywordize-keys true))
+
+(def play-source (fs/readFileSync play-source-path "utf8"))
+(def play-provenance (reader/read-string (fs/readFileSync play-provenance-path "utf8")))
+(def play-sha256 (get-in play-provenance [:outputs :primary :sha256]))
 
 (when-not (fs/existsSync dds-css-path)
   (println "site/generate.cljs: jp-go-dds CSS not found:" dds-css-path)
@@ -103,6 +113,11 @@
    "line-height:var(--hig-text-footnote-line-height)}"
    ".kot-link{color:var(--hig-color-tint);text-underline-offset:.18em}"
    ".kot-search-item[hidden]{display:none}"
+   ".kot-play{display:grid;gap:var(--hig-spacing-4)}"
+   ".kot-play-status{min-height:1.5em;margin:0;font-family:var(--hig-font-mono)}"
+   ".kot-explore{margin-top:var(--hig-spacing-5)}"
+   ".kot-blog-entry+ .kot-blog-entry{margin-top:var(--hig-spacing-7);padding-top:var(--hig-spacing-7);"
+   "border-top:var(--hig-hairline) solid var(--hig-color-separator)}"
    ".kot-code{font-family:var(--hig-font-mono);font-size:var(--hig-text-footnote-font-size);"
    "background:var(--hig-color-quaternary-system-fill);padding:0 var(--hig-spacing-1);"
    "border-radius:var(--hig-radius-xs);overflow-wrap:anywhere}"
@@ -123,12 +138,13 @@
    ".kot-nav{justify-content:flex-end;width:auto}.kot-hero{padding-block:var(--hig-spacing-10) var(--hig-spacing-9)}}"))
 
 (def primary-links
-  [{:label "Why" :href "#why"}
-   {:label "What" :href "#what"}
-   {:label "Proof" :href "#proof"}
-   {:label "Benchmark" :href "#benchmark"}
-   {:label "Agents" :href "./llms.txt"}
-   {:label "Architecture" :href "#architecture"}])
+  [{:label "Docs" :href "#docs"}
+   {:label "Play" :href "#play"}
+   {:label "Libraries" :href "#libraries"}
+   {:label "Roadmap" :href "#roadmap"}
+   {:label "Community" :href "#community"}
+   {:label "Blog" :href "./blog/"}
+   {:label "Cloud" :href "#cloud"}])
 
 (def proof-signals
   [{:metric "33 cores"
@@ -141,18 +157,26 @@
     :title "No grant, no host effect"
     :body "An empty policy grants no filesystem, network, process, clock, model, or secret authority. Providers must also validate concrete resource scope."}])
 
-(defn header []
-  [:header {:class "kot-header"}
-   (dds/container
-    [:div {:class "kot-header__inner"}
-     [:a {:class "kot-wordmark" :href "#top" :aria-label "Kotoba home"}
-      [:img {:class "kot-logo" :src "./kotoba-wordmark.png"
-             :width 480 :height 68 :alt "Kotoba"}]]
-     [:nav {:class "kot-nav" :aria-label "Primary"}
-      (for [{:keys [label href]} primary-links]
-        (dds/button label {:type :text :size "sm" :href href}))
-      (dds/button "GitHub" {:type :outline :size "sm"
-                             :href "https://github.com/kotoba-lang/kotoba-lang"})]])])
+(defn header
+  ([] (header ""))
+  ([root]
+   (let [local-href (fn [href]
+                      (cond
+                        (str/blank? root) href
+                        (str/starts-with? href "#") (str root href)
+                        (str/starts-with? href "./") (str root (subs href 2))
+                        :else href))]
+     [:header {:class "kot-header"}
+      (dds/container
+       [:div {:class "kot-header__inner"}
+        [:a {:class "kot-wordmark" :href (str root "#top") :aria-label "Kotoba home"}
+         [:img {:class "kot-logo" :src (str root "kotoba-wordmark.png")
+                :width 480 :height 68 :alt "Kotoba"}]]
+        [:nav {:class "kot-nav" :aria-label "Primary"}
+         (for [{:keys [label href]} primary-links]
+           (dds/button label {:type :text :size "sm" :href (local-href href)}))
+         (dds/button "GitHub" {:type :outline :size "sm"
+                                :href "https://github.com/kotoba-lang/kotoba-lang"})]])])))
 
 (defn hero []
   [:section {:id "top" :class "kot-hero"}
@@ -277,6 +301,133 @@
     (dds/button "Read CLI reference"
                 {:href "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/generated/cli.md"
                  :type :outline})]))
+
+(defn developer-section []
+  (dds/section
+   {:id "docs" :title "Learn, try, then go deeper"}
+   [:p {:class "kot-lead"}
+    "A connected path from first program to language contracts, libraries, evidence, and deployment surfaces."]
+   (dds/grid
+    {:min "16rem"}
+    (card (dds/chip-label "LEARN")
+          (dds/heading 3 "Docs by intent" {:size "24"})
+          [:p "Start with installation, learn the admitted language, or inspect the normative semantics and conformance data."]
+          (external-link "https://github.com/kotoba-lang/kotoba-lang/tree/main/docs" "Open documentation map"))
+    (card (dds/chip-label "READ CODE")
+          (dds/heading 3 "One source, one answer" {:size "24"})
+          [:p "The example below is the exact source compiled into the browser demo—not a JavaScript reimplementation."]
+          [:a {:class "kot-link" :href "#code"} "Read the sample"])
+    (card (dds/chip-label "RUN")
+          (dds/heading 3 "Execute in this page" {:size "24"})
+          [:p "Load a same-origin, digest-bound WebAssembly artifact and call its exported Kotoba main function."]
+          [:a {:class "kot-link" :href "#play"} "Open Play"])
+    (card (dds/chip-label "BUILD")
+          (dds/heading 3 "Libraries and contracts" {:size "24"})
+          [:p "Browse bounded core names, foundational libraries, package rules, and their current maturity boundary."]
+          [:a {:class "kot-link" :href "#libraries"} "Browse libraries"]))))
+
+(defn code-play-section []
+  (dds/section
+   {:id "code" :title "A small Kotoba program, running for real"}
+   [:p {:class "kot-lead"}
+    "Amu compiles this pure Kotoba source to the wasm32-browser profile. The checked-in artifact has no imports and returns 42."]
+   (dds/grid
+    {:min "21rem"}
+    (card (dds/chip-label "KOTOBA SOURCE")
+          [:pre {:class "kot-pre"} [:code play-source]]
+          (caption "Compile locally: kotoba compile double-21.kotoba --target wasm32-browser --output double-21.wasm"))
+    (card [:div {:id "play" :class "kot-play"}
+           (dds/chip-label "PLAY · WEBASSEMBLY")
+           (dds/heading 3 "Run the verified artifact" {:size "24"})
+           [:p "The browser fetches 344 bytes, verifies SHA-256, rejects every import, instantiates the module, and calls main()."]
+           [:p [:strong "Expected result: "] (code "42")]
+           (dds/button "Run Kotoba" {:id "kot-play-run" :size "lg"})
+           [:p {:id "kot-play-status" :class "kot-play-status kot-muted"
+                :role "status" :aria-live "polite"}
+            "Ready. No code has run yet."]
+           (caption "This executes a precompiled, immutable example. Editing arbitrary source in the browser is not yet a shipped compiler surface.")]))))
+
+(defn libraries-section []
+  (dds/section
+   {:id "libraries" :title "Libraries, without hiding the package boundary"}
+   [:p {:class "kot-lead"}
+    "Kotoba's foundational libraries are independent repositories with their own versions and evidence. Dependencies are pinned by Git SHA today; the first-party network registry remains planned."]
+   (dds/grid
+    {:min "18rem"}
+    (card (dds/chip-label "BOUNDED CORE")
+          (dds/heading 3 "Generated symbol reference" {:size "24"})
+          [:p "Search the names admitted by the current bounded standard-library contract."]
+          (external-link "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/generated/stdlib.md" "Browse core symbols"))
+    (card (dds/chip-label "FOUNDATIONAL")
+          (dds/heading 3 "Data, effects, I/O, tooling" {:size "24"})
+          [:p "Start with coll, spec, json, text, wit, async, time, fs, http, test, fmt, lint, and LSP contracts."]
+          (external-link "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/reference/tooling.md#standard-library" "Browse the library map"))
+    (card (dds/chip-label "PACKAGE CONTRACT")
+          (dds/heading 3 "Content-addressed dependencies" {:size "24"})
+          [:p "Package manifests distinguish pure libraries, explicit adapters, schemas, applications, and providers."]
+          (external-link "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/lang/package-rules.md" "Read package rules")))
+   (caption "Repository maturity labels do not imply 1.0 API stability, broad adoption, or production SLOs.")))
+
+(defn roadmap-section []
+  (dds/section
+   {:id "roadmap" :title "Roadmap: widen only after the boundary holds"}
+   (dds/grid
+    {:min "18rem"}
+    (card (dds/chip-label "NOW")
+          (dds/heading 3 "One versioned contract" {:size "24"})
+          [:p "Keep grammar, effects, checked KIR, target adapters, qualification, and first-run documentation aligned."])
+    (card (dds/chip-label "NEXT")
+          (dds/heading 3 "Close provider gaps" {:size "24"})
+          [:p "Expand typed request/result conformance, adversarial testing, receipts, revocation, and reproducible release operations."])
+    (card (dds/chip-label "LATER")
+          (dds/heading 3 "Earn wider deployment" {:size "24"})
+          [:p "Widen production use after provider, host-isolation, rollback, and soak evidence—and grow inspectable declarative libraries."]))
+   [:p (external-link "https://github.com/kotoba-lang/kotoba-lang#roadmap" "Read the maintained roadmap and non-goals")]
+   (caption "Roadmap items are direction, not promises of shipped capability or delivery dates.")))
+
+(defn community-section []
+  (dds/section
+   {:id "community" :title "Build the community in public"}
+   [:p {:class "kot-lead"}
+    "Kotoba does not yet claim a large community. Today the honest public meeting points are the source repositories, issue trackers, release history, and security channel."]
+   (dds/grid
+    {:min "18rem"}
+    (card (dds/chip-label "DISCUSS & REPORT")
+          (dds/heading 3 "Language issues" {:size "24"})
+          [:p "Ask a design question, propose a documentation improvement, or report a reproducible language-contract problem."]
+          (external-link "https://github.com/kotoba-lang/kotoba-lang/issues" "Open language issues"))
+    (card (dds/chip-label "IMPLEMENT")
+          (dds/heading 3 "Compiler and CLI issues" {:size "24"})
+          [:p "Follow implementation work, releases, target support, and runtime integration in the installable implementation."]
+          (external-link "https://github.com/kotoba-lang/kotoba/issues" "Open implementation issues"))
+    (card (dds/chip-label "SECURITY")
+          (dds/heading 3 "Report privately" {:size "24"})
+          [:p "Use the published security policy for vulnerabilities; do not disclose exploitable details in a public issue."]
+          (external-link "https://github.com/kotoba-lang/kotoba-lang/security/policy" "Read security policy")))
+   [:p (external-link "https://github.com/orgs/kotoba-lang/repositories" "Explore all public Kotoba repositories")]))
+
+(defn blog-cloud-section []
+  (dds/section
+   {:id "cloud" :title "Engineering notes and the wider cloud stack"}
+   (dds/grid
+    {:min "18rem"}
+    (card (dds/chip-label "BLOG")
+          (dds/heading 3 "Evidence before slogans" {:size "24"})
+          [:p "Read short engineering notes that connect product claims to measurements, authority files, and remaining gates."]
+          [:a {:class "kot-link" :href "./blog/"} "Read the Kotoba blog"])
+    (card (dds/chip-label "KOTOBASE")
+          (dds/heading 3 "Data and protocol plane" {:size "24"})
+          [:p "Content-addressed data, identity-bound access, and federation surfaces for the wider stack."]
+          (external-link "https://kotobase.net/" "Open Kotobase"))
+    (card (dds/chip-label "MURAKUMO")
+          (dds/heading 3 "Compute and inference plane" {:size "24"})
+          [:p "Fleet compute and model-serving infrastructure. Availability and route qualification remain service-specific."]
+          (external-link "https://murakumo.cloud/" "Open Murakumo"))
+    (card (dds/chip-label "ITONAMI")
+          (dds/heading 3 "Agent workspace" {:size "24"})
+          [:p "A workspace where people and agents coordinate goals, evidence, tools, and governed effects."]
+          (external-link "https://itonami.cloud/" "Open Itonami")))
+   (caption "These are related products, not proof that every Kotoba capability is available as a generally sold hosted service.")))
 
 (defn benchmark-section []
   (let [kotoba (get-in benchmark [:results :kotoba])
@@ -456,6 +607,26 @@
        "count.textContent=shown+' result'+(shown===1?'':'s');}"
        "input.addEventListener('input',apply);apply();});"))
 
+(def play-js
+  (str "document.addEventListener('DOMContentLoaded',function(){"
+       "var button=document.getElementById('kot-play-run');"
+       "var status=document.getElementById('kot-play-status');"
+       "var expected='" play-sha256 "';"
+       "function hex(bytes){return Array.from(bytes,function(b){return b.toString(16).padStart(2,'0');}).join('');}"
+       "button.addEventListener('click',async function(){button.disabled=true;status.textContent='Verifying artifact…';"
+       "try{var response=await fetch('./play/double-21.wasm',{cache:'no-store'});"
+       "if(!response.ok)throw new Error('artifact fetch failed: HTTP '+response.status);"
+       "var bytes=new Uint8Array(await response.arrayBuffer());"
+       "var digest=hex(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)));"
+       "if(digest!==expected)throw new Error('artifact digest mismatch');"
+       "var module=await WebAssembly.compile(bytes);"
+       "if(WebAssembly.Module.imports(module).length!==0)throw new Error('demo artifact requested a host import');"
+       "var instance=await WebAssembly.instantiate(module,{});"
+       "var result=instance.exports.main();"
+       "if(result!==42n)throw new Error('unexpected result');"
+       "status.textContent='✓ Kotoba returned '+result.toString()+' · SHA-256 verified · 0 imports';"
+       "}catch(error){status.textContent='Could not run: '+error.message;}finally{button.disabled=false;}});});"))
+
 (defn source-section []
   (dds/section
    {:id "source" :title "Read the contract or run the implementation"}
@@ -488,7 +659,7 @@
     [:p [:strong "Kotoba"] " — AI writes freely. Kotoba draws the boundary."]
     [:p {:class "kot-caption kot-muted"}
      "Generated by " (code "site/generate.cljs") " from "
-     (str/join ", " authority-files) ". No telemetry. No runtime dependency."]
+     (str/join ", " authority-files) ". No telemetry. No third-party runtime dependency."]
     [:p (external-link "https://github.com/kotoba-lang/kotoba-lang" "Source and license")])])
 
 (defn view []
@@ -500,6 +671,12 @@
     (dds/container
      (why-section)
      (what-section)
+     (developer-section)
+     (code-play-section)
+     (libraries-section)
+     (roadmap-section)
+     (community-section)
+     (blog-cloud-section)
      (proof-section)
      (architecture-section)
      (start-section)
@@ -510,7 +687,33 @@
      (search-section)
      (source-section))]
    (footer)
-   [:script search-js]])
+   [:script search-js]
+   [:script play-js]])
+
+(defn blog-view []
+  [:div
+   [:a {:class "kot-skip" :href "#main"} "Skip to content"]
+   (header "../")
+   [:main {:id "main"}
+    (dds/container
+     [:section {:id "top" :class "kot-hero"}
+      [:p {:class "kot-eyebrow"} "Kotoba engineering notes"]
+      (dds/heading 1 "Evidence before slogans" {:size "48"})
+      [:p {:class "kot-lead"}
+       "Short notes about language design, measurements, shipped boundaries, and what still remains unqualified."]]
+     [:article {:class "kot-blog-entry"}
+      [:p {:class "kot-eyebrow"} "28 August 2026 · Benchmarks"]
+      (dds/heading 2 "Two benchmarks answer two different questions" {:size "32"})
+      [:p "Compile time measures a tiny source-to-executable path. Native runtime measures already-built programs. Kotoba publishes them separately so a fast compile cannot be mistaken for a fast runtime—or the reverse."]
+      [:p "The native comparison currently covers every required implementation/workload pair and verifies exact results, but its speed ranking remains withheld because the recorded host-load gate failed."]
+      [:p [:a {:class "kot-link" :href "../#benchmark"} "Read the benchmark and inspect its evidence"]]]
+     [:article {:class "kot-blog-entry"}
+      [:p {:class "kot-eyebrow"} "28 August 2026 · Language design"]
+      (dds/heading 2 "No ambient authority is a language boundary" {:size "32"})
+      [:p "Kotoba programs do not begin with implicit filesystem, network, process, clock, model, or secret access. Source declares effects, admission intersects grants and policy, and the host binds only the resulting capabilities."]
+      [:p "That design complements operating-system isolation; it does not replace the compiler, verifier, runtime, provider, key custody, or host policy in the trusted computing base."]
+      [:p [:a {:class "kot-link" :href "../#architecture"} "See the computation boundary"]]])]
+   (footer)])
 
 (def html
   (page/->page
@@ -523,9 +726,20 @@
     :app-css (str tokens/skin-css "\n" app-css)}
    (view)))
 
+(def blog-html
+  (page/->page
+   {:title "Kotoba Blog — engineering notes and evidence"
+    :description "Kotoba engineering notes about language design, benchmarks, evidence, and remaining qualification gates."
+    :lang "en"
+    :css dds-css
+    :app-css (str tokens/skin-css "\n" app-css)}
+   (blog-view)))
+
 (let [out (path/join "site" "dist")]
   (fs/mkdirSync out #js {:recursive true})
   (fs/writeFileSync (path/join out "index.html") html)
+  (fs/mkdirSync (path/join out "blog") #js {:recursive true})
+  (fs/writeFileSync (path/join out "blog" "index.html") blog-html)
   (fs/copyFileSync logo-source-path (path/join out "kotoba-wordmark.png"))
   (doseq [[source target]
           [[benchmark-source-path (path/join out "benchmarks" "compile-wasm-latest.json")]
@@ -535,6 +749,12 @@
            [(path/join "site" "assets" "agent-quickstart.md") (path/join out "agent-quickstart.md")]]]
     (fs/mkdirSync (path/dirname target) #js {:recursive true})
     (fs/copyFileSync source target))
+  (doseq [name ["double-21.kotoba" "double-21.wasm"
+                "double-21.wasm.provenance.edn" "double-21.wasm.publication.edn"]]
+    (let [source (path/join "site" "assets" "play" name)
+          target (path/join out "play" name)]
+      (fs/mkdirSync (path/dirname target) #js {:recursive true})
+      (fs/copyFileSync source target)))
   ;; RFC 9116. Copied rather than generated so the published contact is a file
   ;; someone can read and edit in `site/assets/`, not a string buried in here —
   ;; and so a regeneration cannot silently drop it (a security.txt that
