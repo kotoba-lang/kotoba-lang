@@ -143,6 +143,8 @@
     (is (str/includes? html "11 toolchain paths"))
     (is (str/includes? html "DEVELOPER LOOP · RANK UNQUALIFIED"))
     (is (str/includes? html "WORKLOAD DOMAINS · RANK UNQUALIFIED"))
+    (is (str/includes? html "Amortized in-process batch medians"))
+    (is (str/includes? html "map chains are fused into reduce"))
     (is (str/includes? html "BUILD STARTUP · RANK UNQUALIFIED"))
     (is (str/includes? html "C / Clang"))
     (is (str/includes? html "JVM / javac"))

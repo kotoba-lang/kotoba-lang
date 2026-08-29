@@ -9,6 +9,8 @@ import { performance } from "node:perf_hooks";
 
 const root = resolve(import.meta.dirname, "..");
 const output = resolve(root, option("--output", "bench/public-domain-comparison/latest.json"));
+const kotobaCliOption = option("--kotoba-cli", "kotoba");
+const kotobaCli = kotobaCliOption.includes("/") ? resolve(kotobaCliOption) : kotobaCliOption;
 const runs = Number(option("--runs", "7"));
 if (!Number.isInteger(runs) || runs < 7 || runs > 31 || runs % 2 === 0) {
   throw new Error("--runs must be an odd integer from 7 through 31");
@@ -49,6 +51,9 @@ function measured(values) {
     samplesMilliseconds: values.map(rounded),
   };
 }
+function normalizedMeasured(values, divisor) {
+  return measured(values.map(value => value / divisor));
+}
 function na(reason) { return { status: "not-applicable", reason }; }
 function load1() {
   const result = spawnSync("sysctl", ["-n", "vm.loadavg"], { encoding: "utf8" });
@@ -80,36 +85,42 @@ const workloads = {
   string: {
     label: "String",
     iterations: 400,
+    amortizedMultiplier: 100,
     expected: 6400,
     contract: "For each iteration, concatenate 'kotoba-' and 'language', then add its character count and one when it contains 'lang'.",
   },
   collection: {
     label: "Collection",
     iterations: 8,
+    amortizedMultiplier: 1000,
     expected: 1216,
     contract: "Reuse a 16-element collection, map increment over it, and reduce by addition; one iteration returns 152.",
   },
   allocation: {
     label: "Allocation",
     iterations: 5,
+    amortizedMultiplier: 500,
     expected: 760,
     contract: "For each iteration, allocate a 16-element collection and two mapped collections, then reduce; one iteration returns 152.",
   },
   io: {
     label: "I/O",
     iterations: 12,
+    amortizedMultiplier: 3,
     expected: 1604321280,
     contract: "Read the same deterministic 1 MiB file 12 times and sum every unsigned byte.",
   },
   concurrency: {
     label: "Concurrency",
     iterations: 1000000,
+    amortizedMultiplier: 8,
     expected: 4985653002,
     contract: "Run four workers, each performing 1,000,000 wrapping 32-bit LCG steps from seeds 1..4, and sum the final unsigned states.",
   },
   realApp: {
     label: "Real application",
     iterations: 8,
+    amortizedMultiplier: 1000,
     expected: 64,
     contract: "Evaluate a fixed 16-request risk batch against an admission threshold and count admitted requests; one batch returns 8.",
   },
@@ -133,6 +144,7 @@ const [path, workload, iterationsText] = process.argv.slice(2);
 const bytes = await readFile(path);
 const literals = workload === "string" ? ["kotoba-", "kotoba-language", "lang", "language"] : [];
 const imports = new Proxy({
+  scratch: new WebAssembly.Memory({ initial: 2, maximum: 2 }),
   literal: (index) => literals[index],
   new: (tag) => ({ tag, items: [] }),
   "push-i64": (value, item) => { value.items.push(item); return value; },
@@ -141,6 +153,14 @@ const imports = new Proxy({
   count: (_descriptor, value) => BigInt(value.length ?? value.items.length),
   "vector-at-i64": (_descriptor, value, index) => value.items[Number(index)],
   "vector-conj-i64": (_descriptor, value, item) => ({ tag: value.tag, items: [...value.items, item] }),
+  "vector-from-memory-i64": (descriptor, offset, count) => {
+    const view = new DataView(imports.scratch.buffer);
+    const items = [];
+    for (let index = 0; index < count; index += 1) {
+      items.push(view.getBigInt64(offset + index * 8, true));
+    }
+    return Object.freeze({ tag: descriptor, items: Object.freeze(items) });
+  },
   "string-concat": (_descriptor, left, right) => left + right,
   "string-contains": (_descriptor, value, part) => value.includes(part) ? 1 : 0,
 }, { get(target, property) { return target[property] ?? (() => { throw new Error("unexpected typed import: " + String(property)); }); } });
@@ -237,23 +257,37 @@ const kotobaArtifacts = {};
 for (const id of ["string", "collection", "allocation", "realApp"]) {
   const source = join(root, "bench", "public-domain-comparison", "probes", `${id}.kotoba`);
   const artifact = join(directory, `${id}.wasm`);
-  compile("kotoba", ["compile", source, "--target", "wasm", "-o", artifact, "--json"]);
+  compile(kotobaCli, ["compile", source, "--target", "wasm", "--fuel", "1048576", "-o", artifact]);
   kotobaArtifacts[id] = { source, artifact };
 }
 
+function lcg(seed, iterations) {
+  let value = seed >>> 0;
+  for (let index = 0; index < iterations; index += 1) {
+    value = (Math.imul(value, 1664525) + 1013904223) >>> 0;
+  }
+  return value;
+}
+function expectedFor(id, multiplier = 1) {
+  if (id === "concurrency") {
+    const iterations = workloads[id].iterations * multiplier;
+    return [1, 2, 3, 4].map(seed => lcg(seed, iterations)).reduce((sum, value) => sum + value, 0);
+  }
+  return workloads[id].expected * multiplier;
+}
 const tools = [
-  { id:"kotoba", label:"Kotoba / Wasm + typed JS host", target:"WebAssembly in Node.js", version:command("brew",["list","--versions","kotoba"]), artifact:kotobaArtifacts,
-    run:(id,w)=>runTimed(process.execPath,[kotobaRunner,w.artifact,id,String(workloads[id].iterations)],workloads[id].expected) },
+  { id:"kotoba", label:"Kotoba / Wasm + typed JS host", target:"WebAssembly in Node.js", version:option("--kotoba-version",optionalVersion(kotobaCli,["--version"])), artifact:kotobaArtifacts,
+    run:(id,w,multiplier=1)=>runTimed(process.execPath,[kotobaRunner,w.artifact,id,String(workloads[id].iterations * multiplier)],expectedFor(id,multiplier)) },
   { id:"rust", label:"Rust", target:"arm64 macOS native", version:optionalVersion("rustc",["--version"]), artifact:rustArtifact,
-    run:(id)=>runTimed(rustArtifact,[id,String(workloads[id].iterations),ioPath],workloads[id].expected) },
+    run:(id,_w,multiplier=1)=>runTimed(rustArtifact,[id,String(workloads[id].iterations * multiplier),ioPath],expectedFor(id,multiplier)) },
   { id:"c", label:"C / Clang", target:"arm64 macOS native", version:optionalVersion("clang",["--version"]), artifact:cArtifact,
-    run:(id)=>runTimed(cArtifact,[id,String(workloads[id].iterations),ioPath],workloads[id].expected) },
+    run:(id,_w,multiplier=1)=>runTimed(cArtifact,[id,String(workloads[id].iterations * multiplier),ioPath],expectedFor(id,multiplier)) },
   { id:"go", label:"Go", target:"arm64 macOS native", version:optionalVersion("go",["version"]), artifact:goArtifact,
-    run:(id)=>runTimed(goArtifact,[id,String(workloads[id].iterations),ioPath],workloads[id].expected) },
+    run:(id,_w,multiplier=1)=>runTimed(goArtifact,[id,String(workloads[id].iterations * multiplier),ioPath],expectedFor(id,multiplier)) },
   { id:"jvm", label:"JVM / Java", target:"JVM", version:optionalVersion("java",["-version"]), artifact:join(javaClasses,"Domain.class"),
-    run:(id)=>runTimed("java",["-cp",javaClasses,"Domain",id,String(workloads[id].iterations),ioPath],workloads[id].expected) },
+    run:(id,_w,multiplier=1)=>runTimed("java",["-cp",javaClasses,"Domain",id,String(workloads[id].iterations * multiplier),ioPath],expectedFor(id,multiplier)) },
   { id:"javascript", label:"JavaScript / Node.js", target:"Node.js", version:optionalVersion("node",["--version"]), artifact:nodeSource,
-    run:(id)=>runTimed(process.execPath,[nodeSource,id,String(workloads[id].iterations),ioPath],workloads[id].expected) },
+    run:(id,_w,multiplier=1)=>runTimed(process.execPath,[nodeSource,id,String(workloads[id].iterations * multiplier),ioPath],expectedFor(id,multiplier)) },
 ];
 
 const unsupported = {
@@ -263,17 +297,25 @@ const unsupported = {
   },
 };
 const samples = Object.fromEntries(tools.map(t=>[t.id,{}]));
+const amortizedSamples = Object.fromEntries(tools.map(t=>[t.id,{}]));
 const loadBefore = load1();
 
 // Correctness warm-up, then rotate tool order on every sample to reduce drift bias.
 for (const tool of tools) for (const id of Object.keys(workloads)) {
-  if (!unsupported[tool.id]?.[id]) tool.run(id, kotobaArtifacts[id]);
+  if (!unsupported[tool.id]?.[id]) {
+    tool.run(id, kotobaArtifacts[id]);
+    tool.run(id, kotobaArtifacts[id], workloads[id].amortizedMultiplier);
+  }
 }
 for (let sample = 0; sample < runs; sample += 1) {
   for (const id of Object.keys(workloads)) {
     const rotated = [...tools.slice(sample % tools.length), ...tools.slice(0, sample % tools.length)];
     for (const tool of rotated) {
       if (!unsupported[tool.id]?.[id]) (samples[tool.id][id] ??= []).push(tool.run(id, kotobaArtifacts[id]));
+      if (!unsupported[tool.id]?.[id]) {
+        const multiplier = workloads[id].amortizedMultiplier;
+        (amortizedSamples[tool.id][id] ??= []).push(tool.run(id, kotobaArtifacts[id], multiplier));
+      }
     }
   }
 }
@@ -283,14 +325,15 @@ const logicalCpu = Number(command("sysctl",["-n","hw.logicalcpu"]));
 const qualified = maxLoad <= logicalCpu * 0.75;
 
 const report = {
-  schema:"kotoba.public-domain-comparison.v1",
+  schema:"kotoba.public-domain-comparison.v2",
   generatedAt:new Date().toISOString(),
   repository:{commit:command("git",["rev-parse","HEAD"],{cwd:root}),dirty:command("git",["status","--porcelain"],{cwd:root})!==""},
   machine:{os:optionalVersion("sw_vers",["-productVersion"]),architecture:process.arch,cpu:command("sysctl",["-n","machdep.cpu.brand_string"]),logicalCpu,load1Before:loadBefore,load1After:loadAfter},
   qualification:{qualified,rule:"max(load1 before, load1 after) <= 0.75 * logical CPU count",note:qualified?"Medians may be compared only within each workload and target/runtime contract.":"Host load exceeded the publication gate; values are observations, not qualified rankings."},
-  method:{runs,warmups:1,processBoundary:"Every sample starts a fresh process; concurrency workers are created inside that process.",measurement:"Wall-clock process-cold startup plus workload execution; compilation is excluded.",correctness:"Every sample must print the reference checksum exactly.",scope:"Representative six-runtime comparison; targets, allocation models, JIT/AOT, and host contracts differ."},
+  method:{runs,warmups:1,processBoundary:"Every sample starts a fresh process; concurrency workers are created inside that process.",measurement:"processCold is wall-clock process startup plus workload execution. amortizedExecution runs a larger in-process batch and divides elapsed time by its workload-specific multiplier; it amortizes but does not fully remove process, VM, or module startup, and is not claimed as a perfectly warmed steady-state value. Compilation is excluded.",correctness:"Every process-cold and amortized sample must print its independently scaled reference checksum exactly.",scope:"Representative six-runtime comparison; targets, allocation models, JIT/AOT, and host contracts differ.",kotobaFuel:1048576},
+  kotobaOptimization:{scope:"Pure unary inc/dec map chains consumed by a pure primitive reduce",semantics:"Input collection is evaluated once; callbacks outside the proven subset retain eager materialization.",structuralEvidence:"Fused HIR contains no vector-conj; the fallback regression retains vector-conj.",revisions:{sema:"8676e3d60a8372667b3b427b01d214f7684d443f",amu:"1e9b99617871f19fc28fa1bba80fc17544571b64",cli:"b94228d5e3d60d35fe1e642b7f52706a3426645e"}},
   workloads,
-  tools:tools.map(tool=>({id:tool.id,label:tool.label,target:tool.target,version:tool.version,artifactSha256:tool.id==="kotoba"?Object.fromEntries(Object.entries(kotobaArtifacts).map(([id,x])=>[id,sha256(x.artifact)])):sha256(tool.artifact),results:Object.fromEntries(Object.keys(workloads).map(id=>[id,unsupported[tool.id]?.[id]?na(unsupported[tool.id][id]):measured(samples[tool.id][id])]))})),
+  tools:tools.map(tool=>({id:tool.id,label:tool.label,target:tool.target,version:tool.version,artifactSha256:tool.id==="kotoba"?Object.fromEntries(Object.entries(kotobaArtifacts).map(([id,x])=>[id,sha256(x.artifact)])):sha256(tool.artifact),results:Object.fromEntries(Object.keys(workloads).map(id=>[id,unsupported[tool.id]?.[id]?na(unsupported[tool.id][id]):measured(samples[tool.id][id])])),amortizedResults:Object.fromEntries(Object.keys(workloads).map(id=>[id,unsupported[tool.id]?.[id]?na(unsupported[tool.id][id]):normalizedMeasured(amortizedSamples[tool.id][id],workloads[id].amortizedMultiplier)]))})),
  };
 write(output,`${JSON.stringify(report,null,2)}\n`);
 rmSync(directory,{recursive:true,force:true});

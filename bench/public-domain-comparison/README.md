@@ -4,7 +4,7 @@ This benchmark compares six representative runtime paths across six workload
 domains: strings, collections, allocation, file I/O, concurrency, and a small
 request-admission policy application kernel.
 
-The benchmark has three non-negotiable rules:
+The benchmark has four non-negotiable rules:
 
 - every measured sample starts a fresh process and must return the exact
   reference checksum;
@@ -13,6 +13,9 @@ The benchmark has three non-negotiable rules:
 - results may be compared only inside one workload. They are not a universal
   language ranking because the targets, JIT/AOT modes, collectors, and host
   contracts differ.
+- the process-cold lane and the larger amortized in-process lane stay separate.
+  The latter divides a batch by its declared multiplier; it reduces startup's
+  influence but is not described as a perfectly warmed steady-state value.
 
 Kotoba's string, collection, and allocation cases compile sovereign `.kotoba`
 sources with the public `kotoba compile` command. They execute the emitted Wasm
@@ -26,6 +29,7 @@ Run from the repository root with the named toolchains on `PATH`:
 
 ```sh
 node scripts/benchmark-public-domains.mjs --runs 7 \
+  --kotoba-cli /path/to/kotoba --kotoba-version kotoba-cli@COMMIT \
   --output bench/public-domain-comparison/latest.json
 ```
 
