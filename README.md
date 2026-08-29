@@ -23,6 +23,16 @@ enforcement. Durable storage remains
 [`itonami.cloud`](https://itonami.cloud). The separation is an authority
 boundary, not merely navigation or branding.
 
+Library discovery belongs here at
+[`kotoba-lang.org/libraries/`](https://kotoba-lang.org/libraries/): GitHub
+provenance, exact CID dependency graphs, compatibility evidence, and bounded
+comparisons are language/ecosystem facts. Publication starts in Kotoba CLI.
+`kotoba library inspect` resolves names or `#hash` abbreviations to immutable
+definition CIDs; `kotoba library publish` plans by default and explicitly
+reuses the existing locally signed namespace-head/IPNS path when applied.
+Kotoba Cloud remains the publication-control entrance, Kotobase remains block
+and receipt storage, and Passkey-hosted publication is not yet live.
+
 ```sh
 brew tap kotoba-lang/kotoba
 brew install kotoba
@@ -345,6 +355,8 @@ authoritative in machine-readable contracts and qualification evidence.
 - [Safety claims and residual risks](lang/safety-claims.edn)
 - [Capability semantics](lang/capability-semantics.edn)
 - [Component role model](lang/component-role-model.edn)
+- [Library publication authority](lang/library-publication.edn)
+- [Public library catalog](https://kotoba-lang.org/libraries/)
 - [Maturity by axis](docs/maturity.md)
 - [Architecture decisions](docs/adr/)
 

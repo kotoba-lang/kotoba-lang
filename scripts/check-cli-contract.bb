@@ -4,7 +4,7 @@
   (:require [clojure.edn :as edn]
             [clojure.string :as str]))
 
-(def required-commands #{:id :run :compile :check :graph :git :rad :deploy :hinshitsu})
+(def required-commands #{:id :run :compile :check :graph :git :rad :deploy :library :hinshitsu})
 
 (defn fail! [& parts]
   (binding [*out* *err*]
