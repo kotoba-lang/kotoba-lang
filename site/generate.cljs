@@ -562,7 +562,13 @@
 (defn benchmark-section []
   (let [kotoba (get-in benchmark [:results :kotoba])
         rust (get-in benchmark [:results :rust])
-        ratio (get-in benchmark [:results :medianRatioKotobaToRust])
+        c (get-in benchmark [:results :c])
+        jvm (get-in benchmark [:results :jvm])
+        compile-speed (:speedQualification benchmark)
+        compile-results [{:label "Kotoba" :target "WebAssembly" :result kotoba}
+                         {:label "Rust / rustc" :target "WebAssembly" :result rust}
+                         {:label "C / Clang" :target "WebAssembly" :result c}
+                         {:label "JVM / javac" :target "JVM class" :result jvm}]
         runs (get-in benchmark [:method :runs])
         chip (get-in benchmark [:environment :chip])
         measured-date (subs (:generatedAt benchmark) 0 10)
@@ -580,12 +586,16 @@
       "Compile time asks how quickly a tiny program becomes executable. Runtime asks how fast already-built native code runs. The results below keep those questions—and their evidence status—separate."]
      (dds/grid
       {:min "16rem"}
-      (card (dds/chip-label "COMPILE · MEASURED")
-            (dds/heading 3 (str (:medianMilliseconds kotoba) " ms vs "
-                                (:medianMilliseconds rust) " ms") {:size "24"})
-            [:p (str kotoba-version " used " ratio "× the elapsed time of "
-                     (str/upper-case rust-version) " in this exact run.")]
-            (caption (str runs " alternating process-cold samples · " measured-date
+      (card (dds/chip-label "BUILD STARTUP · RANK UNQUALIFIED" {:color "gray"})
+            (dds/heading 3 "4 toolchains, 21 runs each" {:size "24"})
+            [:p (str "Kotoba " (:medianMilliseconds kotoba) " ms · Rust "
+                     (:medianMilliseconds rust) " ms · C "
+                     (:medianMilliseconds c) " ms · JVM "
+                     (:medianMilliseconds jvm) " ms median.")]
+            (caption (str runs " rotating process-cold samples · load1 "
+                          (:observedLoad1First compile-speed) " → "
+                          (:observedLoad1Last compile-speed) " · required ≤ "
+                          (:quietLoad1Limit compile-speed) " · " measured-date
                           " · " chip)))
       (card (dds/chip-label "RUNTIME · COVERAGE COMPLETE")
             (dds/heading 3 (str (count domains) " workloads × "
@@ -603,14 +613,30 @@
                           (.toFixed (:quietLoad1Limit speed) 1) " · " runtime-date))))
      [:div {:class "kot-table-scroll"}
       (dds/table
+       {:caption "Tiny source-to-artifact process-cold build measurement"
+        :headers ["Toolchain" "Output" "Median" "p95" "Relative elapsed time"]
+        :row-header? true
+        :rows (for [{:keys [label target result]} compile-results]
+                [label
+                 target
+                 (str (:medianMilliseconds result) " ms")
+                 (str (:p95Milliseconds result) " ms")
+                 (str (:medianRatioToKotoba result) "× Kotoba")])})]
+     (caption
+      (str kotoba-version " · " (str/upper-case rust-version) " · "
+           (get-in benchmark [:environment :clang]) " · "
+           (get-in benchmark [:environment :javac])
+           ". Kotoba, Rust, and C emit Wasm; javac emits a class file. "
+           "Different targets and compiler work make this a startup observation, not a universal ranking. "
+           "The recorded host-load gate failed, so the table is not a qualified speed rank."))
+     [:div {:class "kot-table-scroll"}
+      (dds/table
        {:caption "What each public benchmark does—and does not—establish"
         :headers ["Question" "Compared implementations" "Current conclusion"]
         :row-header? true
         :rows [["Tiny Wasm compile + execute"
-                (str kotoba-version " vs " (str/upper-case rust-version))
-                (str (:medianMilliseconds kotoba) " ms vs "
-                     (:medianMilliseconds rust) " ms median; " ratio
-                     "× Rust elapsed on this recorded M4 run only")]
+                "Kotoba, Rust, C, and JVM toolchains"
+                (str "Four process-cold medians published above; only Kotoba/Rust/C share the Wasm target, and no general build-speed rank is claimed")]
                ["Native steady-state execution"
                 (str "Amu native vs " comparator-labels)
                 "All 30 semantic comparison cells are complete; speed ranking withheld because the quiet-host gate failed"]]})]
@@ -628,7 +654,7 @@
                                 "Incomplete")])})]
      [:p
       [:strong "Bottom line: "]
-      "The compile result is a real, narrow measurement. The runtime comparison universe is complete and reproducible, but this run does not establish that Amu is fastest. A quiet-host rerun must pass every comparator in every workload before that sentence becomes valid."]
+      "The build and runtime artifacts, exact results, and samples are real. Neither run qualifies a speed ranking because its quiet-host gate failed. A quiet-host rerun must pass the relevant gate before any fastest claim becomes valid."]
      [:div {:class "kot-actions"}
       (dds/button "Inspect compile samples"
                   {:href "./benchmarks/compile-wasm-latest.json"})
