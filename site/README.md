@@ -61,12 +61,15 @@ The public benchmark section reads the checked-in compile report at
 `bench/public-compile-comparison/latest.json` and the bounded native comparison
 summary at `bench/public-runtime-comparison/latest.json`. The generator copies
 these reports plus the stage-separated developer-loop report at
-`bench/public-end-to-end-comparison/latest.json` alongside `llms.txt`,
+`bench/public-end-to-end-comparison/latest.json` and the string, collection,
+allocation, I/O, concurrency, and real-application report at
+`bench/public-domain-comparison/latest.json` alongside `llms.txt`,
 `llms-full.txt`, and the executable agent
 quickstart. Compile-startup evidence and steady-state runtime evidence remain
 visibly separate from dependency resolution, checking, clean/no-change builds,
-and first-result latency. An unqualified host-load result cannot become a
-fastest claim through presentation.
+first-result latency, and workload-domain behavior. Unsupported capabilities
+remain reasoned N/A rather than zero. An unqualified host-load result cannot
+become a fastest claim through presentation.
 
 ## Regenerate
 
