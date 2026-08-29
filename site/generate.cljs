@@ -51,6 +51,8 @@
   (path/join grammar-root "syntaxes" "kotoba.tmLanguage.json"))
 
 (def dependency-manifest-path (path/join "site" "dependencies.edn"))
+(def package-registry-path (path/join "lang" "package-registry.edn"))
+(def package-ipfs-path (path/join "site" "assets" "ipfs"))
 
 (def logo-source-path
   (path/join "site" "assets" "kotoba-wordmark.png"))
@@ -78,6 +80,9 @@
 (def play-provenance (reader/read-string (fs/readFileSync play-provenance-path "utf8")))
 (def play-sha256 (get-in play-provenance [:outputs :primary :sha256]))
 (def dependencies (reader/read-string (fs/readFileSync dependency-manifest-path "utf8")))
+(def public-package-registry
+  (reader/read-string (fs/readFileSync package-registry-path "utf8")))
+(def reference-package (first (:records public-package-registry)))
 (def syntax-dependency
   (first (filter #(= :syntax-highlighting (:id %)) (:build-time dependencies))))
 
@@ -111,6 +116,14 @@
   (throw (js/Error.
           (str "Kotoba syntax scope does not match site/dependencies.edn: "
                (:scopeName syntax-grammar)))))
+
+(when-not (and (= 1 (:kotoba.registry/version public-package-registry))
+               (= 1 (count (:records public-package-registry)))
+               (= "kotoba-lang/reference-math" (:registry/name reference-package))
+               (string? (:registry/release-cid reference-package))
+               (= 2 (count (:registry/providers reference-package))))
+  (throw (js/Error.
+          "public reference package registry is incomplete")))
 
 (defn code [s] [:code {:class "kot-code"} s])
 (defn caption [& children] (into [:p {:class "kot-muted kot-caption"}] children))
@@ -817,6 +830,9 @@
          (dds/button "日本語" {:href "../ja/libraries/" :type :outline :size "lg"})
          (dds/button "Machine-readable contract"
                      {:href "../.well-known/kotoba-libraries.json"
+                      :type :outline :size "lg"})
+         (dds/button "Package registry (EDN)"
+                     {:href "../.well-known/kotoba-package-registry.edn"
                       :type :outline :size "lg"})]]
 
        (dds/section
@@ -838,6 +854,8 @@
 
        (dds/section
         {:id "publish" :title "Inspect, sign, publish, discover"}
+        [:pre {:class "kot-pre"}
+         [:code "# install the live reference release; execution is then local and CID-locked\nkotoba package add kotoba-lang/reference-math@0.1.0\nkotoba package run kotoba-lang/reference-math  # 42"]]
         [:pre {:class "kot-pre"}
          [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# dry-run is the default\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted\n\n# replicate the exact release closure to two storage origins\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted --dry-run false \\\n  --provider east=https://east.example --provider-token-file <east-token> \\\n  --provider west=https://west.example --provider-token-file <west-token>\n\n# verify every byte and two routed peer IDs, then run by release CID\nkotoba library verify ipfs://<release-cid> --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example\nkotoba library run ipfs://<release-cid> --entry answer \\\n  --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example"]]
         (dds/grid
@@ -861,7 +879,8 @@
          {:min "18rem"}
          (card (dds/chip-label "LIVE")
                (dds/heading 3 "Executable release closure" {:size "20"})
-               [:p "The CLI builds and transfers one CID closure containing definitions, raw Wasm, compile receipts, compiler contract, policy, and package-lock evidence."])
+               [:p "The CLI builds and transfers one CID closure containing definitions, raw Wasm, compile receipts, compiler contract, policy, and package-lock evidence."]
+               [:p (code (:registry/release-cid reference-package))])
          (card (dds/chip-label "LIVE")
                (dds/heading 3 "Passkey-hosted publish" {:size "20"})
                [:p "The CLI replicates the immutable closure and returns a fragment-only approval URL. kotoba.cloud binds explicit approval to Stable Principal and active DID without receiving the signing seed or storage tokens."])
@@ -906,6 +925,9 @@
          (dds/button "English" {:href "../../libraries/" :type :outline :size "lg"})
          (dds/button "機械可読 contract"
                      {:href "../../.well-known/kotoba-libraries.json"
+                      :type :outline :size "lg"})
+         (dds/button "Package registry (EDN)"
+                     {:href "../../.well-known/kotoba-package-registry.edn"
                       :type :outline :size "lg"})]]
 
        (dds/section
@@ -927,6 +949,8 @@
 
        (dds/section
         {:id "publish" :title "inspect、署名、publish、discover"}
+        [:pre {:class "kot-pre"}
+         [:code "# live の参照 release を導入。以後の実行は local の CID lock だけを使う\nkotoba package add kotoba-lang/reference-math@0.1.0\nkotoba package run kotoba-lang/reference-math  # 42"]]
         [:pre {:class "kot-pre"}
          [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# 既定は dry-run\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted\n\n# exact release closure を 2 storage origin へ複製\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted --dry-run false \\\n  --provider east=https://east.example --provider-token-file <east-token> \\\n  --provider west=https://west.example --provider-token-file <west-token>\n\n# 全 byte と 2 routed peer ID を検証し、release CID から実行\nkotoba library verify ipfs://<release-cid> --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example\nkotoba library run ipfs://<release-cid> --entry answer \\\n  --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example"]]
         (dds/grid
@@ -950,7 +974,8 @@
          {:min "18rem"}
          (card (dds/chip-label "LIVE")
                (dds/heading 3 "実行可能 release closure" {:size "20"})
-               [:p "CLI は definition、raw Wasm、compile receipt、compiler contract、policy、package-lock evidence を一つの CID closure として構築・転送します。"])
+               [:p "CLI は definition、raw Wasm、compile receipt、compiler contract、policy、package-lock evidence を一つの CID closure として構築・転送します。"]
+               [:p (code (:registry/release-cid reference-package))])
          (card (dds/chip-label "LIVE")
                (dds/heading 3 "Passkey-hosted publish" {:size "20"})
                [:p "CLI は immutable closure を複製して fragment-only の承認 URL を返します。kotoba.cloud は signing seed と storage token を受け取らず、明示承認を Stable Principal / active DID に結びます。"])
@@ -1050,7 +1075,12 @@
                      (path/join wk "security.txt"))
     (fs/writeFileSync
      (path/join wk "kotoba-libraries.json")
-     (js/JSON.stringify (clj->js library-publication) nil 2)))
+     (js/JSON.stringify (clj->js library-publication) nil 2))
+    (fs/copyFileSync package-registry-path
+                     (path/join wk "kotoba-package-registry.edn")))
+  ;; Static raw-IPFS surface. The CLI re-hashes every response and compares
+  ;; both origins; this directory is transport, not naming authority.
+  (fs/cpSync package-ipfs-path (path/join out "ipfs") #js {:recursive true})
   ;; Public machine contract for the external-trust discovery documents served
   ;; by Kotobase, Murakumo and Itonami. identity owns the schema and policy;
   ;; this authority site is only their deterministic HTTPS projection.
