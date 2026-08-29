@@ -885,6 +885,8 @@
          [:code (str "# install the live dual-signed release; execution is then local and CID-locked\n"
                      "kotoba package add kotoba-lang/reference-math@0.1.0 --catalog-cid " package-registry-cid "\n"
                      "kotoba package run kotoba-lang/reference-math  # 42")]]
+        [:p {:class "kot-lead"}
+         "This reference package is verified with Ed25519 and FIPS 204 ML-DSA-65 before installation and again before safe execution. This is a post-quantum package-signing boundary—not a claim that Passkeys, IPNS, transport, or every Kotoba encryption path is post-quantum."]
         [:pre {:class "kot-pre"}
          [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# dry-run is the default\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted\n\n# replicate the exact release closure to two storage origins\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted --dry-run false \\\n  --provider east=https://east.example --provider-token-file <east-token> \\\n  --provider west=https://west.example --provider-token-file <west-token>\n\n# verify every byte and two routed peer IDs, then run by release CID\nkotoba library verify ipfs://<release-cid> --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example\nkotoba library run ipfs://<release-cid> --entry answer \\\n  --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example"]]
         (dds/grid
@@ -982,6 +984,8 @@
          [:code (str "# live の二重署名 release を導入。以後は local の CID lock を使う\n"
                      "kotoba package add kotoba-lang/reference-math@0.1.0 --catalog-cid " package-registry-cid "\n"
                      "kotoba package run kotoba-lang/reference-math  # 42")]]
+        [:p {:class "kot-lead"}
+         "この reference package は install 前と safe execution 前に Ed25519 と FIPS 204 ML-DSA-65 の両方を検証します。耐量子化したのは package signing の境界であり、Passkey・IPNS・transport・Kotoba の全暗号経路が耐量子という主張ではありません。"]
         [:pre {:class "kot-pre"}
          [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# 既定は dry-run\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted\n\n# exact release closure を 2 storage origin へ複製\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted --dry-run false \\\n  --provider east=https://east.example --provider-token-file <east-token> \\\n  --provider west=https://west.example --provider-token-file <west-token>\n\n# 全 byte と 2 routed peer ID を検証し、release CID から実行\nkotoba library verify ipfs://<release-cid> --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example\nkotoba library run ipfs://<release-cid> --entry answer \\\n  --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example"]]
         (dds/grid
