@@ -25,6 +25,18 @@ set, or a sandbox escape from the Wasm host.
 A defect here is more serious than the same defect in an ordinary language,
 because the containment is the product.
 
+## Post-quantum-by-default policy
+
+Every newly admitted Kotoba cryptographic boundary must include a named
+post-quantum construction and reject downgrade. Confidentiality uses a hybrid
+classical + ML-KEM suite; signatures and publication admission retain a
+classical proof only alongside ML-DSA. Post-quantum protection is therefore a
+design prerequisite, not a feature applications may silently omit.
+
+Development-only legacy paths do not define this floor and are not a migration
+requirement. External TLS and authenticator-native WebAuthn algorithms remain
+outside the claim unless separately qualified.
+
 ## What is not claimed
 
 This repository carries **no third-party security certification**. There is no

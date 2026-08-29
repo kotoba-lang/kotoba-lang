@@ -298,7 +298,7 @@
     [:p {:class "kot-eyebrow"} "A language AI agents can use, not abuse"]
     (dds/heading 1 "AI writes freely. Kotoba draws the boundary." {:size "48"})
     [:p {:class "kot-lead"}
-     "Kotoba is an intuitive, declarative, security-first language and computing stack for AI agents—and for humans who vibe-code with them."]
+     "Kotoba is an intuitive, declarative, security-first language and computing stack for AI agents—and for humans who vibe-code with them. Post-quantum cryptography is the admission floor for every new cryptographic boundary, not an optional mode."]
     [:blockquote {:class "kot-quote"}
      [:strong "Existing software adds security around the program. Kotoba makes security a property of the whole computation."]]
     [:div {:class "kot-actions"}
@@ -315,7 +315,10 @@
             [:p "Types, effects, resources, and target support are admitted before emission."])
       (card (dds/chip-label "HOST ENFORCED")
             (dds/heading 3 "Only the grant is bound" {:size "20"})
-            [:p "The host and provider enforce concrete scope and record the decision."]))])])
+            [:p "The host and provider enforce concrete scope and record the decision."])
+      (card (dds/chip-label "POST-QUANTUM FLOOR")
+            (dds/heading 3 "No classical-only downgrade" {:size "20"})
+            [:p "New encryption and publication boundaries require ML-KEM or ML-DSA evidence and reject stripped PQ material."]))])])
 
 (defn architecture-section []
   (dds/section
@@ -886,7 +889,7 @@
                      "kotoba package add kotoba-lang/reference-math@0.1.0 --catalog-cid " package-registry-cid "\n"
                      "kotoba package run kotoba-lang/reference-math  # 42")]]
         [:p {:class "kot-lead"}
-         "This reference package is verified with Ed25519 and FIPS 204 ML-DSA-65 before installation and again before safe execution. This is a post-quantum package-signing boundary—not a claim that Passkeys, IPNS, transport, or every Kotoba encryption path is post-quantum."]
+         "Post-quantum cryptography is the Kotoba admission floor, not an optional mode. This reference package is verified with Ed25519 and FIPS 204 ML-DSA-65 before installation and again before safe execution. External Passkeys and transport remain separately qualified boundaries."]
         [:pre {:class "kot-pre"}
          [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# dry-run is the default\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted\n\n# replicate the exact release closure to two storage origins\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted --dry-run false \\\n  --pqc-seed-file <ml-dsa-seed> \\\n  --provider east=https://east.example --provider-token-file <east-token> \\\n  --provider west=https://west.example --provider-token-file <west-token>\n\n# verify every byte and two routed peer IDs, then run by release CID\nkotoba library verify ipfs://<release-cid> --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example\nkotoba library run ipfs://<release-cid> --entry answer \\\n  --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example"]]
         (dds/grid
@@ -985,7 +988,7 @@
                      "kotoba package add kotoba-lang/reference-math@0.1.0 --catalog-cid " package-registry-cid "\n"
                      "kotoba package run kotoba-lang/reference-math  # 42")]]
         [:p {:class "kot-lead"}
-         "この reference package は install 前と safe execution 前に Ed25519 と FIPS 204 ML-DSA-65 の両方を検証します。耐量子化したのは package signing の境界であり、Passkey・IPNS・transport・Kotoba の全暗号経路が耐量子という主張ではありません。"]
+         "耐量子暗号は Kotoba の admission floor であり、任意の mode ではありません。この reference package は install 前と safe execution 前に Ed25519 と FIPS 204 ML-DSA-65 の両方を検証します。外部 Passkey と transport は別に検証する境界です。"]
         [:pre {:class "kot-pre"}
          [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# 既定は dry-run\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted\n\n# exact release closure を 2 storage origin へ複製\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted --dry-run false \\\n  --pqc-seed-file <ml-dsa-seed> \\\n  --provider east=https://east.example --provider-token-file <east-token> \\\n  --provider west=https://west.example --provider-token-file <west-token>\n\n# 全 byte と 2 routed peer ID を検証し、release CID から実行\nkotoba library verify ipfs://<release-cid> --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example\nkotoba library run ipfs://<release-cid> --entry answer \\\n  --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example"]]
         (dds/grid
@@ -1039,9 +1042,9 @@
 
 (def html
   (page/->page
-   {:title "Kotoba — security-first computing for AI agents and vibe coding"
+   {:title "Kotoba — post-quantum-by-default computing for AI agents"
     :description (str "AI writes freely. Kotoba draws the boundary. An intuitive, declarative, "
-                      "security-first language and computing stack with checked KIR, explicit "
+                      "security-first, post-quantum-by-default language and computing stack with checked KIR, explicit "
                       "capability and effect admission, content-addressed artifacts, and host enforcement.")
     :lang "en"
     :css dds-css

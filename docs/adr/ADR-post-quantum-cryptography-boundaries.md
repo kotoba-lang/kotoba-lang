@@ -10,6 +10,14 @@ protocols. Migrating one does not migrate the others.
 
 ## Decision
 
+Post-quantum cryptography is the admission floor for every new Kotoba
+cryptographic boundary. It is not an opt-in profile and classical-only
+downgrade is not a compatibility mode. A classical primitive may remain as one
+half of a hybrid construction, but cannot satisfy a new boundary by itself.
+
+Development-only legacy paths are not migration targets. They may remain
+inspectable while being excluded from admission, publication, or execution.
+
 Post-quantum claims name the protected operation and exact suite.
 
 - New CLI-encrypted objects use
@@ -34,15 +42,17 @@ replace the pinned ML-DSA key.
 
 ## Non-claims
 
-These slices do not establish that WebAuthn authenticators, TLS connections,
-legacy IPNS records, every stored object, every identity controller, or every
-deployment is post-quantum. A future authenticator-native ML-DSA Passkey
+The Kotoba default governs boundaries Kotoba admits; it does not reclassify
+external WebAuthn authenticators, TLS connections, or protocols outside that
+admission boundary. A future authenticator-native ML-DSA Passkey
 requires interoperable WebAuthn/COSE support in authenticators, browsers, and
 the relying party and will be qualified as a separate migration.
 
 ## Consequences
 
-Receipts and machine profiles expose the exact suite and scope. Documentation
-must say “hybrid-encrypted CLI object,” “hybrid package attestation,” or
-“Passkey plus Principal-pinned ML-DSA publication approval,” rather than the
-unbounded phrase “post-quantum Passkey” or “Kotoba is post-quantum.”
+Receipts and machine profiles expose the exact suite and scope. “Kotoba is
+post-quantum by default” means new Kotoba cryptographic boundaries are refused
+without PQ material and downgrade rejection. More specific claims continue to
+name “hybrid-encrypted CLI object,” “hybrid package attestation,” or “Passkey
+plus Principal-pinned ML-DSA publication approval”; the phrase does not turn an
+external platform Passkey into a post-quantum authenticator.
