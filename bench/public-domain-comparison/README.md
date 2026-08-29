@@ -2,7 +2,7 @@
 
 This benchmark compares six representative runtime paths across six workload
 domains: strings, collections, allocation, file I/O, concurrency, and a small
-file-backed access-log application.
+request-admission policy application kernel.
 
 The benchmark has three non-negotiable rules:
 
@@ -16,10 +16,11 @@ The benchmark has three non-negotiable rules:
 
 Kotoba's string, collection, and allocation cases compile sovereign `.kotoba`
 sources with the public `kotoba compile` command. They execute the emitted Wasm
-through the declared `kotoba:typed` ABI. The standalone target deliberately has
-no ambient filesystem or thread access, so file I/O, concurrency, and the
-file-backed application remain N/A until an admitted common capability-host
-contract is benchmarked.
+through the declared `kotoba:typed` ABI. Its real-application case evaluates a
+fixed batch of request risk scores through an admission policy. The standalone
+target deliberately has no ambient filesystem or thread access, so file I/O
+and concurrency remain N/A until an admitted common capability-host contract
+is benchmarked.
 
 Run from the repository root with the named toolchains on `PATH`:
 
