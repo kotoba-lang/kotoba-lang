@@ -31,6 +31,12 @@ The Cloud page must not imply that discovery delegates authority, that
 artifact verification, provider qualification, host enforcement, key custody,
 or operating-system isolation.
 
+For hosted library publication, `kotoba.cloud` additionally enforces a
+Principal-pinned ML-DSA-65 co-signature beside the Passkey session. The scope
+must remain explicit: it protects that publication approval path and does not
+make the authenticator's WebAuthn credential, TLS, IPNS, or every Kotoba
+operation post-quantum.
+
 The public entrance is localized from one structural view. Japanese is
 canonical at `/`; English is canonical at `/en/`; reciprocal `hreflang`
 links and a locale registry make additional languages explicit extensions.

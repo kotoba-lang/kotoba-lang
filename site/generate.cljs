@@ -888,7 +888,7 @@
         [:p {:class "kot-lead"}
          "This reference package is verified with Ed25519 and FIPS 204 ML-DSA-65 before installation and again before safe execution. This is a post-quantum package-signing boundary—not a claim that Passkeys, IPNS, transport, or every Kotoba encryption path is post-quantum."]
         [:pre {:class "kot-pre"}
-         [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# dry-run is the default\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted\n\n# replicate the exact release closure to two storage origins\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted --dry-run false \\\n  --provider east=https://east.example --provider-token-file <east-token> \\\n  --provider west=https://west.example --provider-token-file <west-token>\n\n# verify every byte and two routed peer IDs, then run by release CID\nkotoba library verify ipfs://<release-cid> --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example\nkotoba library run ipfs://<release-cid> --entry answer \\\n  --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example"]]
+         [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# dry-run is the default\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted\n\n# replicate the exact release closure to two storage origins\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted --dry-run false \\\n  --pqc-seed-file <ml-dsa-seed> \\\n  --provider east=https://east.example --provider-token-file <east-token> \\\n  --provider west=https://west.example --provider-token-file <west-token>\n\n# verify every byte and two routed peer IDs, then run by release CID\nkotoba library verify ipfs://<release-cid> --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example\nkotoba library run ipfs://<release-cid> --entry answer \\\n  --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example"]]
         (dds/grid
          {:min "16rem"}
          (card (dds/chip-label "1 · INSPECT")
@@ -896,13 +896,13 @@
                [:p "Resolve the namespace head, definition CIDs, dependency CIDs, identity layer, and optional GitHub provenance before creating a release."])
          (card (dds/chip-label "2 · AUTHORIZE")
                (dds/heading 3 "Sign the namespace head" {:size "20"})
-               [:p "The local operator key signs publication. Passkey later approves relay of that same signed value; neither gate replaces the other."])
+               [:p "The local operator key signs publication. Passkey confirms the Stable Principal, while ML-DSA-65 signs every publication field and is pinned to that Principal; none of the three gates replaces another."])
          (card (dds/chip-label "3 · REPLICATE + VERIFY")
                (dds/heading 3 "Two stores, two peers, every byte" {:size "20"})
                [:p "The CLI re-fetches the full DAG and raw artifacts from each storage origin, then counts distinct libp2p peer IDs observed through delegated routing."])
          (card (dds/chip-label "4 · NAME + RUN")
                (dds/heading 3 "Approve a name; execute a hash" {:size "20"})
-               [:p "Passkey controls the mutable IPNS relay. Wasm execution addresses the immutable release CID and export, so the catalog is not a runtime dependency."])))
+               [:p "Passkey plus the pinned ML-DSA-65 key controls the mutable IPNS relay. This application-layer co-approval does not make the authenticator's Passkey post-quantum. Wasm execution addresses the immutable release CID and export."])))
 
        (dds/section
         {:id "status" :title "Current boundary"}
@@ -914,7 +914,7 @@
                [:p (code (:registry/release-cid reference-package))])
          (card (dds/chip-label "LIVE")
                (dds/heading 3 "Passkey-hosted publish" {:size "20"})
-               [:p "The CLI replicates the immutable closure and returns a fragment-only approval URL. kotoba.cloud binds explicit approval to Stable Principal and active DID without receiving the signing seed or storage tokens."])
+               [:p "The CLI replicates the immutable closure and returns a fragment-only approval URL containing an ML-DSA-65 signature. kotoba.cloud requires the Passkey session and atomically pins the first valid ML-DSA key to the Stable Principal without receiving either signing seed or storage tokens."])
          (card (dds/chip-label "STATUS")
                (dds/heading 3 (str/replace (name status) #"-" " ") {:size "20"})
                [:p "A release remains pending until two byte-complete storage origins and two distinct routed peer IDs produce an availability-proof CID. One gateway never qualifies."])
@@ -987,7 +987,7 @@
         [:p {:class "kot-lead"}
          "この reference package は install 前と safe execution 前に Ed25519 と FIPS 204 ML-DSA-65 の両方を検証します。耐量子化したのは package signing の境界であり、Passkey・IPNS・transport・Kotoba の全暗号経路が耐量子という主張ではありません。"]
         [:pre {:class "kot-pre"}
-         [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# 既定は dry-run\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted\n\n# exact release closure を 2 storage origin へ複製\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted --dry-run false \\\n  --provider east=https://east.example --provider-token-file <east-token> \\\n  --provider west=https://west.example --provider-token-file <west-token>\n\n# 全 byte と 2 routed peer ID を検証し、release CID から実行\nkotoba library verify ipfs://<release-cid> --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example\nkotoba library run ipfs://<release-cid> --entry answer \\\n  --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example"]]
+         [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# 既定は dry-run\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted\n\n# exact release closure を 2 storage origin へ複製\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted --dry-run false \\\n  --pqc-seed-file <ml-dsa-seed> \\\n  --provider east=https://east.example --provider-token-file <east-token> \\\n  --provider west=https://west.example --provider-token-file <west-token>\n\n# 全 byte と 2 routed peer ID を検証し、release CID から実行\nkotoba library verify ipfs://<release-cid> --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example\nkotoba library run ipfs://<release-cid> --entry answer \\\n  --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example"]]
         (dds/grid
          {:min "16rem"}
          (card (dds/chip-label "1 · INSPECT")
@@ -995,13 +995,13 @@
                [:p "release 作成前に namespace head、definition CID、dependency CID、identity layer、任意の GitHub provenance を確認します。"])
          (card (dds/chip-label "2 · AUTHORIZE")
                (dds/heading 3 "namespace head に署名" {:size "20"})
-               [:p "local operator key が署名し、Passkey は同じ署名値の relay を承認します。どちらの gate も他方を置き換えません。"])
+               [:p "local operator key が署名し、Passkey が Stable Principal を確認し、ML-DSA-65 が公開対象の全 field に署名してその Principal へ固定されます。3つの gate は互いを置き換えません。"])
          (card (dds/chip-label "3 · REPLICATE + VERIFY")
                (dds/heading 3 "2 storage、2 peer、全 byte" {:size "20"})
                [:p "CLI は各 storage origin から DAG と raw artifact を再取得して検証し、delegated routing が返す distinct libp2p peer ID を数えます。"])
          (card (dds/chip-label "4 · NAME + RUN")
                (dds/heading 3 "名前を承認し、hash を実行" {:size "20"})
-               [:p "Passkey は mutable IPNS relay を制御します。Wasm 実行は immutable release CID と export を指定し、catalog に runtime 依存しません。"])))
+               [:p "Passkey と固定済み ML-DSA-65 key が mutable IPNS relay を制御します。この application-layer co-approval は authenticator の Passkey 自体を耐量子化しません。Wasm 実行は immutable release CID と export を指定します。"])))
 
        (dds/section
         {:id "status" :title "現在の境界"}
@@ -1013,7 +1013,7 @@
                [:p (code (:registry/release-cid reference-package))])
          (card (dds/chip-label "LIVE")
                (dds/heading 3 "Passkey-hosted publish" {:size "20"})
-               [:p "CLI は immutable closure を複製して fragment-only の承認 URL を返します。kotoba.cloud は signing seed と storage token を受け取らず、明示承認を Stable Principal / active DID に結びます。"])
+               [:p "CLI は immutable closure を複製し、ML-DSA-65 署名を含む fragment-only の承認 URL を返します。kotoba.cloud は Passkey session を要求し、最初の有効な ML-DSA key を Stable Principal へ原子的に固定します。どちらの signing seed も storage token も受け取りません。"])
          (card (dds/chip-label "STATUS")
                (dds/heading 3 (str/replace (name status) #"-" " ") {:size "20"})
                [:p "2 つの byte-complete storage origin と 2 distinct routed peer ID が availability-proof CID を作るまで pending です。1 gateway だけでは分散認定しません。"])

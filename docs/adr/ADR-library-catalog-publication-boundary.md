@@ -32,14 +32,23 @@ definitions; a library-release CID identifies the executable release graph;
 SourceCID, BuildCID and ArtifactCID remain distinct when present. A valid CID
 does not grant publication, installation, capability use, or execution.
 
-Passkey-hosted publication is available as a two-authority relay. The CLI signs
+Passkey-hosted publication is available as a three-gate relay. The CLI signs
 the namespace head and release link locally, uploads the same complete immutable
 closure to at least two distinct digest-verifying storage origins, and places only a bounded signed request in
-the approval URL fragment. After an explicit click, kotoba.cloud verifies the
-Passkey session and relays the signed mutable record. Kotobase independently
+the approval URL fragment. It also signs every security-relevant request field
+with ML-DSA-65. After an explicit click, kotoba.cloud verifies the Passkey
+session, verifies the ML-DSA signature, atomically binds the first valid ML-DSA
+key to the Stable Principal, and relays the signed mutable record. A later
+Passkey session may not replace that pinned key. Kotobase independently
 checks that the key named by the `k51...` name signed the record and enforces
-monotonic sequence CAS. The private signing seed, storage token, and Passkey
-cookie never cross those boundaries.
+monotonic sequence CAS. The Ed25519 seed, ML-DSA seed, storage token, and
+Passkey cookie never cross those boundaries.
+
+This makes hosted publication depend on a post-quantum application signature;
+it does not change the COSE algorithm implemented by the platform
+authenticator. First-use ML-DSA enrollment inherits the classical security of
+the Passkey ceremony. After binding, compromising only that classical Passkey
+cannot replace the post-quantum approval key.
 
 Publication and distributed qualification are separate states. A successful
 upload or Passkey approval remains `pending-availability`. `kotoba library
