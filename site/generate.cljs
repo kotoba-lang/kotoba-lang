@@ -827,8 +827,8 @@
                (dds/heading 3 "Meaning or checked KIR" {:size "20"})
                [:p "A name, full CID, and unambiguous #hash abbreviation resolve to the same definition."])
          (card (dds/chip-label "RELEASE CID")
-               (dds/heading 3 "Signed namespace head" {:size "20"})
-               [:p "The release graph selects exact definition CIDs and links its predecessor, making rollback detectable."])
+               (dds/heading 3 "Executable release root" {:size "20"})
+               [:p "One immutable IPLD root binds the namespace head, exact definitions, raw Wasm artifacts, compile receipts, and reproducibility evidence."])
          (card (dds/chip-label "SOURCE · BUILD · ARTIFACT")
                (dds/heading 3 "Keep provenance layers separate" {:size "20"})
                [:p "Source bytes, declared build inputs, and emitted bytes have different identities. None grants execution authority."])
@@ -839,35 +839,35 @@
        (dds/section
         {:id "publish" :title "Inspect, sign, publish, discover"}
         [:pre {:class "kot-pre"}
-         [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# dry-run is the default\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted\n\n# store verified blocks, then open the returned Passkey approval URL\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted \\\n  --dry-run false --write-token-file <path>"]]
+         [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# dry-run is the default\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted\n\n# replicate the exact release closure to two storage origins\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted --dry-run false \\\n  --provider east=https://east.example --provider-token-file <east-token> \\\n  --provider west=https://west.example --provider-token-file <west-token>\n\n# verify every byte and two routed peer IDs, then run by release CID\nkotoba library verify ipfs://<release-cid> --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example\nkotoba library run ipfs://<release-cid> --entry answer \\\n  --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example"]]
         (dds/grid
          {:min "16rem"}
          (card (dds/chip-label "1 · INSPECT")
                (dds/heading 3 "Resolve the exact graph" {:size "20"})
-               [:p "Return the release CID, definition CIDs, dependency CIDs, identity layer, and optional GitHub provenance."])
+               [:p "Resolve the namespace head, definition CIDs, dependency CIDs, identity layer, and optional GitHub provenance before creating a release."])
          (card (dds/chip-label "2 · AUTHORIZE")
                (dds/heading 3 "Sign the namespace head" {:size "20"})
                [:p "The local operator key signs publication. Passkey later approves relay of that same signed value; neither gate replaces the other."])
-         (card (dds/chip-label "3 · STORE + NAME")
-               (dds/heading 3 "Store, then approve the signed head" {:size "20"})
-               [:p "Kotobase verifies every block digest. kotoba.cloud verifies the Passkey session, then Kotobase verifies the k51 signer and sequence."])
-         (card (dds/chip-label "4 · DISCOVER")
-               (dds/heading 3 "Project into the public catalog" {:size "20"})
-               [:p "kotoba-lang.org explains the graph. kotoba.cloud owns publication control and deploy readiness without becoming storage."])))
+         (card (dds/chip-label "3 · REPLICATE + VERIFY")
+               (dds/heading 3 "Two stores, two peers, every byte" {:size "20"})
+               [:p "The CLI re-fetches the full DAG and raw artifacts from each storage origin, then counts distinct libp2p peer IDs observed through delegated routing."])
+         (card (dds/chip-label "4 · NAME + RUN")
+               (dds/heading 3 "Approve a name; execute a hash" {:size "20"})
+               [:p "Passkey controls the mutable IPNS relay. Wasm execution addresses the immutable release CID and export, so the catalog is not a runtime dependency."])))
 
        (dds/section
         {:id "status" :title "Current boundary"}
         (dds/grid
          {:min "18rem"}
          (card (dds/chip-label "LIVE")
-               (dds/heading 3 "Local-signed IPNS publication" {:size "20"})
-               [:p "The CLI inspect and dry-run path is implemented over the existing content-addressed codebase. Explicit apply reuses signed-head and IPNS publication."])
+               (dds/heading 3 "Executable release closure" {:size "20"})
+               [:p "The CLI builds and transfers one CID closure containing definitions, raw Wasm, compile receipts, compiler contract, policy, and package-lock evidence."])
          (card (dds/chip-label "LIVE")
                (dds/heading 3 "Passkey-hosted publish" {:size "20"})
-               [:p "The CLI stores the immutable closure and returns a fragment-only approval URL. kotoba.cloud binds explicit approval to Stable Principal and active DID without receiving the signing seed or storage token."])
+               [:p "The CLI replicates the immutable closure and returns a fragment-only approval URL. kotoba.cloud binds explicit approval to Stable Principal and active DID without receiving the signing seed or storage tokens."])
          (card (dds/chip-label "STATUS")
                (dds/heading 3 (str/replace (name status) #"-" " ") {:size "20"})
-               [:p "The machine contract exposes this evidence state so clients do not infer hosted capability from a public webpage."])
+               [:p "A release remains pending until two byte-complete storage origins and two distinct routed peer IDs produce an availability-proof CID. One gateway never qualifies."])
          (card (dds/chip-label "SOURCE")
                (dds/heading 3 "Review the implementation" {:size "20"})
                [:p (external-link "https://github.com/kotoba-lang/kotoba" "Kotoba CLI")]
@@ -916,8 +916,8 @@
                (dds/heading 3 "意味、または checked KIR" {:size "20"})
                [:p "名前・完全 CID・曖昧でない #hash 短縮形は、同じ definition を解決します。"])
          (card (dds/chip-label "RELEASE CID")
-               (dds/heading 3 "署名された namespace head" {:size "20"})
-               [:p "release graph は exact definition CID を選び、直前の head を link して rollback を検出可能にします。"])
+               (dds/heading 3 "実行可能な release root" {:size "20"})
+               [:p "一つの不変 IPLD root が namespace head、exact definition、raw Wasm、compile receipt、再現性 evidence を結びます。"])
          (card (dds/chip-label "SOURCE · BUILD · ARTIFACT")
                (dds/heading 3 "provenance の層を混ぜない" {:size "20"})
                [:p "source bytes、宣言された build inputs、生成物 bytes は別の identity です。いずれも execution authority ではありません。"])
@@ -928,35 +928,35 @@
        (dds/section
         {:id "publish" :title "inspect、署名、publish、discover"}
         [:pre {:class "kot-pre"}
-         [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# 既定は dry-run\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted\n\n# verified block 保存後、返された Passkey 承認 URL を開く\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted \\\n  --dry-run false --write-token-file <path>"]]
+         [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# 既定は dry-run\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted\n\n# exact release closure を 2 storage origin へ複製\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted --dry-run false \\\n  --provider east=https://east.example --provider-token-file <east-token> \\\n  --provider west=https://west.example --provider-token-file <west-token>\n\n# 全 byte と 2 routed peer ID を検証し、release CID から実行\nkotoba library verify ipfs://<release-cid> --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example\nkotoba library run ipfs://<release-cid> --entry answer \\\n  --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example"]]
         (dds/grid
          {:min "16rem"}
          (card (dds/chip-label "1 · INSPECT")
                (dds/heading 3 "exact graph を解決" {:size "20"})
-               [:p "release CID、definition CID、dependency CID、identity layer、任意の GitHub provenance を返します。"])
+               [:p "release 作成前に namespace head、definition CID、dependency CID、identity layer、任意の GitHub provenance を確認します。"])
          (card (dds/chip-label "2 · AUTHORIZE")
                (dds/heading 3 "namespace head に署名" {:size "20"})
                [:p "local operator key が署名し、Passkey は同じ署名値の relay を承認します。どちらの gate も他方を置き換えません。"])
-         (card (dds/chip-label "3 · STORE + NAME")
-               (dds/heading 3 "保存してから signed head を承認" {:size "20"})
-               [:p "Kotobase が各 block digest を検査し、kotoba.cloud が Passkey session を確認し、Kotobase が k51 signer と sequence を再検証します。"])
-         (card (dds/chip-label "4 · DISCOVER")
-               (dds/heading 3 "public catalog に投影" {:size "20"})
-               [:p "kotoba-lang.org は graph を説明し、kotoba.cloud は publication control を担い、kotobase.net は storage を担います。"])))
+         (card (dds/chip-label "3 · REPLICATE + VERIFY")
+               (dds/heading 3 "2 storage、2 peer、全 byte" {:size "20"})
+               [:p "CLI は各 storage origin から DAG と raw artifact を再取得して検証し、delegated routing が返す distinct libp2p peer ID を数えます。"])
+         (card (dds/chip-label "4 · NAME + RUN")
+               (dds/heading 3 "名前を承認し、hash を実行" {:size "20"})
+               [:p "Passkey は mutable IPNS relay を制御します。Wasm 実行は immutable release CID と export を指定し、catalog に runtime 依存しません。"])))
 
        (dds/section
         {:id "status" :title "現在の境界"}
         (dds/grid
          {:min "18rem"}
          (card (dds/chip-label "LIVE")
-               (dds/heading 3 "local-signed IPNS publication" {:size "20"})
-               [:p "CLI の inspect と dry-run は content-addressed codebase 上で実装済みです。明示 apply は既存の signed-head / IPNS 経路を使います。"])
+               (dds/heading 3 "実行可能 release closure" {:size "20"})
+               [:p "CLI は definition、raw Wasm、compile receipt、compiler contract、policy、package-lock evidence を一つの CID closure として構築・転送します。"])
          (card (dds/chip-label "LIVE")
                (dds/heading 3 "Passkey-hosted publish" {:size "20"})
-               [:p "CLI は immutable closure を保存して fragment-only の承認 URL を返します。kotoba.cloud は signing seed と storage token を受け取らず、明示承認を Stable Principal / active DID に結びます。"])
+               [:p "CLI は immutable closure を複製して fragment-only の承認 URL を返します。kotoba.cloud は signing seed と storage token を受け取らず、明示承認を Stable Principal / active DID に結びます。"])
          (card (dds/chip-label "STATUS")
                (dds/heading 3 (str/replace (name status) #"-" " ") {:size "20"})
-               [:p "client が webpage の存在から hosted capability を推測しないよう、machine contract に evidence state を公開します。"])
+               [:p "2 つの byte-complete storage origin と 2 distinct routed peer ID が availability-proof CID を作るまで pending です。1 gateway だけでは分散認定しません。"])
          (card (dds/chip-label "SOURCE")
                (dds/heading 3 "実装を review" {:size "20"})
                [:p (external-link "https://github.com/kotoba-lang/kotoba" "Kotoba CLI")]
