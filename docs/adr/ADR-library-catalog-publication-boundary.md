@@ -13,8 +13,9 @@ Its machine projection is `/.well-known/kotoba-libraries.json`, generated from
 Publication begins in Kotoba CLI. `kotoba library inspect` and
 `kotoba library publish` are a human-facing projection over the existing
 hash-native codebase, signed namespace heads, verified block ingress, and IPNS
-publication. The first applied mode is local-operator signed IPNS. Publish is
-dry-run by default.
+publication. Publish is dry-run by default. Applied publication builds a
+separate immutable release root binding the exact namespace head to each
+definition, raw Wasm artifact, compile receipt, and reproducibility input.
 
 Domain responsibilities remain separate:
 
@@ -27,20 +28,31 @@ Domain responsibilities remain separate:
   authority.
 
 Names, versions and `latest`-style refs are discovery. Definition CIDs identify
-definitions; a signed namespace-head CID identifies a selected release graph;
+definitions; a library-release CID identifies the executable release graph;
 SourceCID, BuildCID and ArtifactCID remain distinct when present. A valid CID
 does not grant publication, installation, capability use, or execution.
 
 Passkey-hosted publication is available as a two-authority relay. The CLI signs
-the namespace head locally, uploads the complete immutable closure to
-Kotobase's digest-verifying ingress, and places only a bounded signed request in
+the namespace head and release link locally, uploads the same complete immutable
+closure to at least two distinct digest-verifying storage origins, and places only a bounded signed request in
 the approval URL fragment. After an explicit click, kotoba.cloud verifies the
 Passkey session and relays the signed mutable record. Kotobase independently
 checks that the key named by the `k51...` name signed the record and enforces
 monotonic sequence CAS. The private signing seed, storage token, and Passkey
 cookie never cross those boundaries.
 
-This first hosted slice returns an immediate publication receipt. Catalog
+Publication and distributed qualification are separate states. A successful
+upload or Passkey approval remains `pending-availability`. `kotoba library
+verify ipfs://<release-cid>` re-fetches every DAG-CBOR block and raw artifact
+from every named storage origin, verifies each CID and exact byte sequence, and
+asks delegated routing for distinct libp2p peer IDs. Only at least two
+byte-complete storage origins and two distinct routed peer IDs produce a
+`kotoba.library-availability.v1` proof CID. Gateway URLs are not counted as
+peers; IPNI/DHT discovery is not treated as storage. `kotoba library run`
+requires the same verification before executing a hash-addressed Wasm export.
+
+This hosted slice returns an immediate publication receipt, not a distributed
+availability claim. Catalog
 ingestion, revocation UI, publication history, and storage-token replacement by
 a short-lived Passkey-scoped grant remain separate follow-ups and must not be
 claimed as live.
