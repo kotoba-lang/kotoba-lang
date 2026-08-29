@@ -486,26 +486,30 @@
 
 (defn blog-cloud-section []
   (dds/section
-   {:id "cloud" :title "Engineering notes and the wider cloud stack"}
+   {:id "cloud" :title "From language boundary to separately governed services"}
    (dds/grid
     {:min "18rem"}
     (card (dds/chip-label "BLOG")
           (dds/heading 3 "Evidence before slogans" {:size "24"})
           [:p "Read short engineering notes that connect product claims to measurements, authority files, and remaining gates."]
           [:a {:class "kot-link" :href "./blog/"} "Read the Kotoba blog"])
+    (card (dds/chip-label "KOTOBA CLOUD")
+          (dds/heading 3 "Identity and deploy control" {:size "24"})
+          [:p "The operational entrance for Passkey identity and CLI topology discovery. It carries admitted boundaries forward without replacing compiler or host enforcement."]
+          (external-link "https://kotoba.cloud/" "Open Kotoba Cloud"))
     (card (dds/chip-label "KOTOBASE")
-          (dds/heading 3 "Data and protocol plane" {:size "24"})
-          [:p "Content-addressed data, identity-bound access, and federation surfaces for the wider stack."]
+          (dds/heading 3 "Storage and receipt plane" {:size "24"})
+          [:p "Content-addressed artifacts, durable state, execution receipts, identity-bound access, and federation surfaces."]
           (external-link "https://kotobase.net/" "Open Kotobase"))
     (card (dds/chip-label "MURAKUMO")
           (dds/heading 3 "Compute and inference plane" {:size "24"})
           [:p "Fleet compute and model-serving infrastructure. Availability and route qualification remain service-specific."]
           (external-link "https://murakumo.cloud/" "Open Murakumo"))
     (card (dds/chip-label "ITONAMI")
-          (dds/heading 3 "Agent workspace" {:size "24"})
-          [:p "A workspace where people and agents coordinate goals, evidence, tools, and governed effects."]
+          (dds/heading 3 "Agent work plane" {:size "24"})
+          [:p "Continuing agent work across workspaces, goals, evidence, tools, approvals, and governed effects."]
           (external-link "https://itonami.cloud/" "Open Itonami")))
-   (caption "These are related products, not proof that every Kotoba capability is available as a generally sold hosted service.")))
+   (caption "These services retain separate authority, availability, and qualification boundaries. Their connection is not proof that every Kotoba capability is available as a generally sold hosted service.")))
 
 (defn benchmark-section []
   (let [kotoba (get-in benchmark [:results :kotoba])

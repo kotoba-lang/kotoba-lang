@@ -15,7 +15,9 @@ property of the whole computation.**
 The domains name different product responsibilities. `kotoba-lang.org` is this
 language's specification and documentation surface. The operational entrance
 is [`kotoba.cloud`](https://kotoba.cloud): Passkey identity and CLI deploy
-discovery. Durable storage remains
+discovery. It carries Kotoba's admitted-computation boundary into operation;
+it does not replace language admission, artifact verification, or host
+enforcement. Durable storage remains
 [`kotobase.net`](https://kotobase.net), CPU/GPU execution remains
 [`murakumo.cloud`](https://murakumo.cloud), and agent work remains
 [`itonami.cloud`](https://itonami.cloud). The separation is an authority
