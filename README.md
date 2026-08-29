@@ -13,6 +13,16 @@ publication authority requires ML-DSA-65 alongside the current classical
 proof. Missing PQ material and classical-only downgrade are rejection cases.
 Development-only legacy paths are not compatibility requirements.
 
+The machine-readable coverage authority is
+[`security/cryptographic-boundaries.edn`](security/cryptographic-boundaries.edn).
+The deployed projection is
+[`/.well-known/kotoba-cryptographic-boundaries.edn`](https://kotoba-lang.org/.well-known/kotoba-cryptographic-boundaries.edn);
+the repository file remains the authority.
+An admitted boundary must name its PQ suite, downgrade behavior,
+implementation, and negative-test evidence. Incomplete storage, compute, or
+key-recovery boundaries remain explicitly blocked instead of inheriting the
+repository-wide claim.
+
 **Existing software adds security around the program. Kotoba makes security a
 property of the whole computation.**
 

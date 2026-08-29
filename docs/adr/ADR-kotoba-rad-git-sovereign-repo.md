@@ -31,7 +31,7 @@ layer that fills the same role with CID, Datom, DID, Source Chain, Warrant, and 
 | Repository identity | `kotoba-rad` design layer | repo id, delegate set, visibility, policies, epoch keys | signed identity journal |
 | Authority / auth | `kotoba-auth` | DID key parsing, CACAO grants, signature verification | signer authority |
 | Source chain / warrants | `kotoba-dht` | append-only per-DID journal, warrants for invalid updates | peer accountability |
-| Object encryption | `kotoba-crypto` | envelope encryption, HPKE now, hybrid PQ later | confidentiality |
+| Object encryption | `kotoba-crypto` | hybrid X25519 + ML-KEM-768 envelope; Rad grant wiring pending | confidentiality |
 | Distribution | `kotoba-net` / read plane | CID-over-HTTP, gossipsub, bitswap-style replication | transport untrusted |
 
 ### Repository ID
@@ -139,8 +139,10 @@ For private repos:
 - Revocation is epoch rotation; already distributed ciphertext is assumed unrecoverable only if
   the revoked party never received the epoch DEK.
 
-Current implementation can use X25519 HPKE-like wrapping from `kotoba-crypto`. The data model must
-carry algorithm tags so it can migrate to hybrid classical + post-quantum wrapping:
+The Kotoba admission floor requires hybrid X25519 + ML-KEM-768 wrapping for
+every new confidentiality boundary. The shared CLI envelope implements that
+suite; Rad object/grant wiring remains blocked until it uses the same explicit
+suite and rejects missing PQ material:
 
 ```edn
 {:grant/epoch 3
@@ -210,7 +212,8 @@ kotoba rad verify --rid bafy...
   repository event type.
 - Whether fast-forward validation should materialize commit ancestry through `kotoba-git::log` or
   maintain a cached reachability index.
-- Which PQ implementation becomes the first production dependency for ML-KEM / ML-DSA.
+- How Rad grant rotation and recovery expose the shared ML-KEM/ML-DSA suite
+  without introducing a second key-lifecycle authority.
 
 ## References
 

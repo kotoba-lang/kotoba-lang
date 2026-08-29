@@ -29,9 +29,11 @@ Post-quantum claims name the protected operation and exact suite.
   `ed25519+ml-dsa-65` publication attestation already pinned by catalog CID.
 - Hosted library publication requires three gates: the namespace's Ed25519
   signature, a live Passkey session for the Stable Principal, and an
-  ML-DSA-65 signature over every security-relevant publication field. The
-  first valid ML-DSA key is atomically pinned to that Principal and cannot be
-  replaced by a later Passkey session.
+  ML-DSA-65 signature over every security-relevant publication field. Each
+  approval also carries a single-use request ID, a short expiry, and the
+  Principal's monotonic PQ key epoch. The first valid ML-DSA key is atomically
+  pinned to that Principal; a replay, expired request, old epoch, mismatched
+  key, or revoked state fails closed.
 
 The last item is application-layer co-approval. A platform Passkey continues
 to use the COSE algorithm implemented by its authenticator. Kotoba Cloud
@@ -56,3 +58,12 @@ without PQ material and downgrade rejection. More specific claims continue to
 name “hybrid-encrypted CLI object,” “hybrid package attestation,” or “Passkey
 plus Principal-pinned ML-DSA publication approval”; the phrase does not turn an
 external platform Passkey into a post-quantum authenticator.
+
+The machine-readable authority for the current classifications, evidence, and
+named gaps is `security/cryptographic-boundaries.edn`. Its validator and the
+Murakumo fleet gate reject an admitted managed boundary that lacks PQ material,
+implementation evidence, negative tests, or downgrade rejection. The Cloud PQ
+key lifecycle remains `blocked`: its rotation and revocation state transitions
+are specified and tested, but authenticated public transition endpoints,
+independent recovery quorum, a scheduled drill, and a public transparency
+witness are not yet operational.

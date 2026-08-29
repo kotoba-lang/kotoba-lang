@@ -37,9 +37,11 @@ the namespace head and release link locally, uploads the same complete immutable
 closure to at least two distinct digest-verifying storage origins, and places only a bounded signed request in
 the approval URL fragment. It also signs every security-relevant request field
 with ML-DSA-65. After an explicit click, kotoba.cloud verifies the Passkey
-session, verifies the ML-DSA signature, atomically binds the first valid ML-DSA
-key to the Stable Principal, and relays the signed mutable record. A later
-Passkey session may not replace that pinned key. Kotobase independently
+session, verifies the ML-DSA signature, consumes a signed single-use request ID
+within its short validity window, and atomically binds the first valid ML-DSA
+key and monotonic key epoch to the Stable Principal. A replay, expired request,
+old epoch, mismatched key, or revoked state fails closed. A later Passkey
+session may not replace that pinned key. Kotobase independently
 checks that the key named by the `k51...` name signed the record and enforces
 monotonic sequence CAS. The Ed25519 seed, ML-DSA seed, storage token, and
 Passkey cookie never cross those boundaries.
@@ -61,10 +63,12 @@ peers; IPNI/DHT discovery is not treated as storage. `kotoba library run`
 requires the same verification before executing a hash-addressed Wasm export.
 
 This hosted slice returns an immediate publication receipt, not a distributed
-availability claim. Catalog
-ingestion, revocation UI, publication history, and storage-token replacement by
-a short-lived Passkey-scoped grant remain separate follow-ups and must not be
-claimed as live.
+availability claim. Catalog ingestion, authenticated rotation/revocation
+endpoints and UI, independent recovery, public transparency, and storage-token
+replacement by a short-lived Passkey-scoped grant remain separate follow-ups
+and must not be claimed as live. The lifecycle state machine and bounded
+transition history are implemented and tested; that does not make those public
+operations available.
 
 Library comparisons must name the exact CID/ref, workload, target, host,
 toolchain, samples, measurement time, result verification, receipt, and

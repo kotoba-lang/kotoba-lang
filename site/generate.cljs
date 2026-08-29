@@ -22,6 +22,7 @@
    "lang/wasm-component-platform.edn"
    "lang/library-publication.edn"
    "lang/docs-release.edn"
+   "security/cryptographic-boundaries.edn"
    "docs/search-index.edn"])
 
 (def authority
@@ -52,6 +53,8 @@
 
 (def dependency-manifest-path (path/join "site" "dependencies.edn"))
 (def package-registry-path (path/join "lang" "package-registry.edn"))
+(def cryptographic-boundaries-path
+  (path/join "security" "cryptographic-boundaries.edn"))
 (def package-ipfs-path (path/join "site" "assets" "ipfs"))
 
 (def logo-source-path
@@ -1115,7 +1118,9 @@
      (path/join wk "kotoba-libraries.json")
      (js/JSON.stringify (clj->js library-publication) nil 2))
     (fs/copyFileSync package-registry-path
-                     (path/join wk "kotoba-package-registry.edn")))
+                     (path/join wk "kotoba-package-registry.edn"))
+    (fs/copyFileSync cryptographic-boundaries-path
+                     (path/join wk "kotoba-cryptographic-boundaries.edn")))
   ;; Static raw-IPFS surface. The CLI re-hashes every response and compares
   ;; both origins; this directory is transport, not naming authority.
   (let [ipfs-out (path/join out "ipfs")]
