@@ -121,7 +121,7 @@
 (deftest generated-search-index-covers-each-reference-kind
   (let [entries (read-edn (File. ".") "docs/search-index.edn")]
     (is (= #{:release :cli :stdlib :diagnostic} (set (map :kind entries))))
-    (is (= 48 (count entries)))
+    (is (= 49 (count entries)))
     (is (every? #(and (string? (:title %))
                       (string? (:body %))
                       (string? (:url %))) entries))))
@@ -142,7 +142,7 @@
     (is (.isFile (file-at (File. ".") "site/dist/llms-full.txt")))
     (is (.isFile (file-at (File. ".") "site/dist/agent-quickstart.md")))
     (is (.isFile (file-at (File. ".") "site/dist/benchmarks/compile-wasm-latest.json")))
-    (is (= 48 search-items))
+    (is (= 49 search-items))
     (is (= index-entries search-items))
     (is (str/includes? html ">kotoba id<"))
     (is (str/includes? html "input.addEventListener('input',apply)"))))

@@ -20,6 +20,7 @@
    "lang/surface-status.edn"
    "lang/elaboration-pipeline.edn"
    "lang/wasm-component-platform.edn"
+   "lang/library-publication.edn"
    "lang/docs-release.edn"
    "docs/search-index.edn"])
 
@@ -31,6 +32,7 @@
 (def surface-status (authority "lang/surface-status.edn"))
 (def platform       (authority "lang/wasm-component-platform.edn"))
 (def elaboration    (authority "lang/elaboration-pipeline.edn"))
+(def library-publication (authority "lang/library-publication.edn"))
 (def docs-release   (authority "lang/docs-release.edn"))
 (def search-index   (authority "docs/search-index.edn"))
 
@@ -429,7 +431,7 @@
   (dds/section
    {:id "libraries" :title "Libraries, without hiding the package boundary"}
    [:p {:class "kot-lead"}
-    "Kotoba's foundational libraries are independent repositories with their own versions and evidence. Dependencies are pinned by Git SHA today; the first-party network registry remains planned."]
+    "Kotoba libraries are content-addressed graphs. Names and GitHub repositories help people discover them; definition and signed release CIDs say exactly what they are."]
    (dds/grid
     {:min "18rem"}
     (card (dds/chip-label "BOUNDED CORE")
@@ -442,8 +444,8 @@
           (external-link "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/reference/tooling.md#standard-library" "Browse the library map"))
     (card (dds/chip-label "PACKAGE CONTRACT")
           (dds/heading 3 "Content-addressed dependencies" {:size "24"})
-          [:p "Package manifests distinguish pure libraries, explicit adapters, schemas, applications, and providers."]
-          (external-link "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/lang/package-rules.md" "Read package rules")))
+          [:p "Inspect exact dependency CIDs, identity layers, GitHub provenance, and the current publication boundary."]
+          [:a {:class "kot-link" :href "./libraries/"} "Open the library catalog and publish flow"]))
    (caption "Repository maturity labels do not imply 1.0 API stability, broad adoption, or production SLOs.")))
 
 (defn roadmap-section []
@@ -797,6 +799,94 @@
       [:p [:a {:class "kot-link" :href "../#architecture"} "See the computation boundary"]]])]
    (footer)])
 
+(defn libraries-view []
+  (let [surfaces (:kotoba.library-publication/surfaces library-publication)
+        status (:kotoba.library-publication/status library-publication)]
+    [:div
+     [:a {:class "kot-skip" :href "#main"} "Skip to content"]
+     (header "../")
+     [:main {:id "main"}
+      (dds/container
+       [:section {:id "top" :class "kot-hero"}
+        [:p {:class "kot-eyebrow"} "CONTENT-ADDRESSED LIBRARIES"]
+        (dds/heading 1 "Names help you find code. Hashes say what it is." {:size "48"})
+        [:p {:class "kot-lead"}
+         "Kotoba CLI inspects and publishes the same CID graph it compiles. GitHub is provenance, a namespace is discovery, and immutable CIDs identify definitions, releases, builds, and artifacts."]
+        [:div {:class "kot-actions"}
+         (dds/button "Inspect with Kotoba CLI" {:href "#publish" :size "lg"})
+         (dds/button "Machine-readable contract"
+                     {:href "../.well-known/kotoba-libraries.json"
+                      :type :outline :size "lg"})]]
+
+       (dds/section
+        {:id "identity" :title "One library, several identities"}
+        (dds/grid
+         {:min "17rem"}
+         (card (dds/chip-label "DEFINITION CID")
+               (dds/heading 3 "Meaning or checked KIR" {:size "20"})
+               [:p "A name, full CID, and unambiguous #hash abbreviation resolve to the same definition."])
+         (card (dds/chip-label "RELEASE CID")
+               (dds/heading 3 "Signed namespace head" {:size "20"})
+               [:p "The release graph selects exact definition CIDs and links its predecessor, making rollback detectable."])
+         (card (dds/chip-label "SOURCE · BUILD · ARTIFACT")
+               (dds/heading 3 "Keep provenance layers separate" {:size "20"})
+               [:p "Source bytes, declared build inputs, and emitted bytes have different identities. None grants execution authority."])
+         (card (dds/chip-label "GITHUB")
+               (dds/heading 3 "Provenance, not identity" {:size "20"})
+               [:p "Repository and commit links help review origin. They cannot replace CIDs or authorize a namespace update."])))
+
+       (dds/section
+        {:id "publish" :title "Inspect, sign, publish, discover"}
+        [:pre {:class "kot-pre"}
+         [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# dry-run is the default\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo\n\n# explicit network effect: signed head + IPNS\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --dry-run false"]]
+        (dds/grid
+         {:min "16rem"}
+         (card (dds/chip-label "1 · INSPECT")
+               (dds/heading 3 "Resolve the exact graph" {:size "20"})
+               [:p "Return the release CID, definition CIDs, dependency CIDs, identity layer, and optional GitHub provenance."])
+         (card (dds/chip-label "2 · AUTHORIZE")
+               (dds/heading 3 "Sign the namespace head" {:size "20"})
+               [:p "The existing local operator identity signs publication. A valid CID alone never proves who may publish it."])
+         (card (dds/chip-label "3 · STORE + NAME")
+               (dds/heading 3 "Reuse codebase and IPNS" {:size "20"})
+               [:p "Missing blocks go to a verified endpoint when configured; IPNS names the signed head. No second package registry is invented."])
+         (card (dds/chip-label "4 · DISCOVER")
+               (dds/heading 3 "Project into the public catalog" {:size "20"})
+               [:p "kotoba-lang.org explains the graph. kotoba.cloud owns publication control and deploy readiness without becoming storage."])))
+
+       (dds/section
+        {:id "status" :title "Current boundary"}
+        (dds/grid
+         {:min "18rem"}
+         (card (dds/chip-label "LIVE")
+               (dds/heading 3 "Local-signed IPNS publication" {:size "20"})
+               [:p "The CLI inspect and dry-run path is implemented over the existing content-addressed codebase. Explicit apply reuses signed-head and IPNS publication."])
+         (card (dds/chip-label "NOT LIVE")
+               (dds/heading 3 "Passkey-hosted publish" {:size "20"})
+               [:p "kotoba.cloud does not yet accept a hosted library apply. Passkey authorization, namespace governance, abuse controls, and catalog ingestion remain separate qualification work."])
+         (card (dds/chip-label "STATUS")
+               (dds/heading 3 (str/replace (name status) #"-" " ") {:size "20"})
+               [:p "The machine contract exposes this evidence state so clients do not infer hosted capability from a public webpage."])
+         (card (dds/chip-label "SOURCE")
+               (dds/heading 3 "Review the implementation" {:size "20"})
+               [:p (external-link "https://github.com/kotoba-lang/kotoba" "Kotoba CLI")]
+               [:p (external-link "https://github.com/kotoba-lang/kotoba-lang" "Language and catalog authority")]
+               [:p (external-link "https://github.com/kotoba-lang/codebase" "Content-addressed codebase")]))
+        (caption "Hosted Passkey publication: "
+                 (if (get-in surfaces [:hosted-passkey-publish :implemented])
+                   "implemented" "not implemented")
+                 ". Content identity is never execution authority."))
+
+       (dds/section
+        {:id "compare" :title "Compare libraries with the boundary attached"}
+        [:p {:class "kot-lead"}
+         "A comparison is evidence only when it names the exact library CID, workload, target, host, toolchain, sample count, measurement time, verified result, receipt, and residual limit."]
+        (bullets ["Do not compare mutable latest aliases as if they were immutable releases."
+                  "Separate API coverage, target compatibility, compile performance, runtime performance, and operational qualification."
+                  "A faster isolated kernel is not a general production-performance claim."
+                  "Unsupported or unmeasured cells stay explicit; they are not silently scored as zero."])))]
+     (footer)]))
+
 (def html
   (page/->page
    {:title "Kotoba — security-first computing for AI agents and vibe coding"
@@ -817,11 +907,22 @@
     :app-css (str tokens/skin-css "\n" app-css)}
    (blog-view)))
 
+(def libraries-html
+  (page/->page
+   {:title "Kotoba Libraries — content-addressed publication and comparison"
+    :description "Inspect, publish, discover, and compare Kotoba libraries by immutable definition and release CIDs, with GitHub provenance kept separate."
+    :lang "en"
+    :css dds-css
+    :app-css (str tokens/skin-css "\n" app-css)}
+   (libraries-view)))
+
 (let [out (path/join "site" "dist")]
   (fs/mkdirSync out #js {:recursive true})
   (fs/writeFileSync (path/join out "index.html") html)
   (fs/mkdirSync (path/join out "blog") #js {:recursive true})
   (fs/writeFileSync (path/join out "blog" "index.html") blog-html)
+  (fs/mkdirSync (path/join out "libraries") #js {:recursive true})
+  (fs/writeFileSync (path/join out "libraries" "index.html") libraries-html)
   (fs/copyFileSync logo-source-path (path/join out "kotoba-wordmark.png"))
   (fs/copyFileSync dependency-manifest-path (path/join out "dependencies.edn"))
   (doseq [[source target]
@@ -845,7 +946,10 @@
   (let [wk (path/join out ".well-known")]
     (fs/mkdirSync wk #js {:recursive true})
     (fs/copyFileSync (path/join "site" "assets" "security.txt")
-                     (path/join wk "security.txt")))
+                     (path/join wk "security.txt"))
+    (fs/writeFileSync
+     (path/join wk "kotoba-libraries.json")
+     (js/JSON.stringify (clj->js library-publication) nil 2)))
   ;; Public machine contract for the external-trust discovery documents served
   ;; by Kotobase, Murakumo and Itonami. identity owns the schema and policy;
   ;; this authority site is only their deterministic HTTPS projection.

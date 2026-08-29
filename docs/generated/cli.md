@@ -143,6 +143,29 @@ Options:
 - **`--revision`** — Revision to deploy or roll back to. Type: `string`.
 - **`--json`** — Emit machine-readable deployment status. Type: `boolean`.
 
+## `kotoba library`
+
+Inspect and publish a content-addressed library namespace through the existing Kotoba codebase and IPNS publication path.
+
+Maturity tier: `m1`.
+
+Subcommands: `inspect`, `publish`.
+
+Positionals:
+
+- **`definition`** — For inspect: a selected name, full definition CID, or #hash abbreviation. Omit to inspect the whole namespace. Type: `string`.
+
+Options:
+
+- **`--store`** — Local content-addressed codebase store. Type: `path`; required.
+- **`--namespace`** — Human discovery namespace. The signed namespace head and definition CIDs remain the content identities. Type: `string`; required.
+- **`--github`** — Optional GitHub provenance URL. It is not content identity or publication authority. Type: `string`.
+- **`--endpoint`** — Optional HTTPS codebase node receiving verified blocks and the signed namespace head. Type: `string`.
+- **`--write-token-file`** — Credential file for an explicitly configured publication endpoint; never printed by the CLI. Type: `path`.
+- **`--router`** — Delegated IPFS router used for IPNS publication and resolution. Type: `string`; repeatable.
+- **`--dry-run`** — Inspect the exact release graph without publishing. Set false for the existing local-signed IPNS operation. Type: `boolean`; default: `true`.
+- **`--json`** — Emit the descriptor or publication receipt as JSON. Type: `boolean`.
+
 ## `kotoba hinshitsu`
 
 Run software-quality checks (evidence, gates, coverage, visual regression) as data.
