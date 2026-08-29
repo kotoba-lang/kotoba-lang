@@ -646,7 +646,7 @@
             (dds/heading 3 "6 domains × 6 runtime paths" {:size "24"})
             [:p "Strings, collections, allocation, file I/O, four-worker concurrency, and a request-admission policy application kernel are correctness checked."]
             (caption (str (get-in domain-benchmark [:method :runs])
-                          " process-cold samples · load1 "
+                          " samples in both process-cold and amortized lanes · load1 "
                           (get-in domain-benchmark [:machine :load1Before]) " → "
                           (get-in domain-benchmark [:machine :load1After])
                           (if domain-qualified " · qualified" " · rank withheld")))))
@@ -700,6 +700,21 @@
       "Every sample returned the exact reference checksum. Kotoba uses its emitted Wasm and declared typed ABI; its standalone target has no ambient filesystem or thread contract, so those cells are reasoned N/A. The recorded host-load gate failed, so medians are observations, not a ranking.")
      [:div {:class "kot-table-scroll"}
       (dds/table
+       {:caption "Amortized in-process batch medians per base workload; N/A keeps the same capability boundary"
+        :headers ["Runtime path" "String" "Collection" "Allocation" "File I/O" "Concurrency" "Real app"]
+        :row-header? true
+        :rows (for [result domain-results]
+                [(:label result)
+                 (stage-ms (get-in result [:amortizedResults :string]))
+                 (stage-ms (get-in result [:amortizedResults :collection]))
+                 (stage-ms (get-in result [:amortizedResults :allocation]))
+                 (stage-ms (get-in result [:amortizedResults :io]))
+                 (stage-ms (get-in result [:amortizedResults :concurrency]))
+                 (stage-ms (get-in result [:amortizedResults :realApp]))])})]
+     (caption
+      "Each larger in-process batch is divided by its declared workload multiplier. This amortizes startup but does not fully remove process, VM, or Wasm instantiation cost, so it is not labeled a perfectly warmed steady-state result. Kotoba's pure inc/dec map chains are fused into reduce without intermediate vectors; callbacks outside that proven subset keep eager materialization.")
+     [:div {:class "kot-table-scroll"}
+      (dds/table
        {:caption "What each public benchmark does—and does not—establish"
         :headers ["Question" "Compared implementations" "Current conclusion"]
         :row-header? true
@@ -714,7 +729,7 @@
                 "All 30 semantic comparison cells are complete; speed ranking withheld because the quiet-host gate failed"]
                ["Strings, collections, allocation, I/O, concurrency, and real app"
                 "Kotoba, Rust, C, Go, JVM, and JavaScript runtime paths"
-                "Exact checksums and all applicable samples are published; standalone Kotoba I/O and threads are N/A, while its pure request-admission application is measured; the failed load gate withholds ranking"]]})]
+                "Exact checksums and process-cold plus amortized samples are published; standalone Kotoba I/O and threads are N/A, while its pure request-admission application is measured; the failed load gate withholds ranking"]]})]
      (dds/heading 3 "What the native suite covers" {:size "24"})
      [:p
       "Each implementation returns an independently checked known answer. The suite rotates every engine pair in ABBA/BAAB order and measures after loading, mapping, and symbol lookup."]
