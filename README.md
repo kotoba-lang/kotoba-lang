@@ -5,6 +5,14 @@
 Kotoba is an intuitive, declarative, security-first language and computing
 stack for AI agents—and for humans who vibe-code with them.
 
+> **Post-quantum cryptography is the default admission floor for every new
+> Kotoba cryptographic boundary—not an optional compatibility mode.**
+
+New encrypted objects require hybrid X25519 + ML-KEM-768. New package and
+publication authority requires ML-DSA-65 alongside the current classical
+proof. Missing PQ material and classical-only downgrade are rejection cases.
+Development-only legacy paths are not compatibility requirements.
+
 **Existing software adds security around the program. Kotoba makes security a
 property of the whole computation.**
 
