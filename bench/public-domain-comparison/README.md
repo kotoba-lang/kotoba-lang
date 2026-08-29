@@ -1,0 +1,32 @@
+# Public workload-domain comparison
+
+This benchmark compares six representative runtime paths across six workload
+domains: strings, collections, allocation, file I/O, concurrency, and a small
+file-backed access-log application.
+
+The benchmark has three non-negotiable rules:
+
+- every measured sample starts a fresh process and must return the exact
+  reference checksum;
+- unsupported target contracts are `not-applicable` with a reason, never zero
+  and never an implementation in a different language;
+- results may be compared only inside one workload. They are not a universal
+  language ranking because the targets, JIT/AOT modes, collectors, and host
+  contracts differ.
+
+Kotoba's string, collection, and allocation cases compile sovereign `.kotoba`
+sources with the public `kotoba compile` command. They execute the emitted Wasm
+through the declared `kotoba:typed` ABI. The standalone target deliberately has
+no ambient filesystem or thread access, so file I/O, concurrency, and the
+file-backed application remain N/A until an admitted common capability-host
+contract is benchmarked.
+
+Run from the repository root with the named toolchains on `PATH`:
+
+```sh
+node scripts/benchmark-public-domains.mjs --runs 7 \
+  --output bench/public-domain-comparison/latest.json
+```
+
+The JSON report records complete samples, workload contracts, tool versions,
+artifact digests, machine load, and a qualification gate.

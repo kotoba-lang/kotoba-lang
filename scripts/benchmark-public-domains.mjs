@@ -1,0 +1,313 @@
+#!/usr/bin/env node
+
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
+
+const root = resolve(import.meta.dirname, "..");
+const output = resolve(root, option("--output", "bench/public-domain-comparison/latest.json"));
+const runs = Number(option("--runs", "7"));
+if (!Number.isInteger(runs) || runs < 7 || runs > 31 || runs % 2 === 0) {
+  throw new Error("--runs must be an odd integer from 7 through 31");
+}
+
+function option(name, fallback) {
+  const index = process.argv.indexOf(name);
+  return index === -1 ? fallback : process.argv[index + 1];
+}
+function command(command, args = [], options = {}) {
+  return execFileSync(command, args, { encoding: "utf8", ...options }).trim();
+}
+function optionalVersion(commandName, args = []) {
+  const result = spawnSync(commandName, args, { encoding: "utf8" });
+  return result.status === 0
+    ? `${result.stdout || ""}${result.stderr || ""}`.trim().split("\n")[0]
+    : "unavailable";
+}
+function write(path, contents) {
+  mkdirSync(resolve(path, ".."), { recursive: true });
+  writeFileSync(path, contents);
+}
+function sha256(path) {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+function rounded(value) { return Number(value.toFixed(3)); }
+function percentile(values, fraction) {
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)];
+}
+function measured(values) {
+  return {
+    status: "measured",
+    medianMilliseconds: rounded(percentile(values, 0.5)),
+    p95Milliseconds: rounded(percentile(values, 0.95)),
+    minimumMilliseconds: rounded(Math.min(...values)),
+    maximumMilliseconds: rounded(Math.max(...values)),
+    samplesMilliseconds: values.map(rounded),
+  };
+}
+function na(reason) { return { status: "not-applicable", reason }; }
+function load1() {
+  const result = spawnSync("sysctl", ["-n", "vm.loadavg"], { encoding: "utf8" });
+  const match = result.stdout?.match(/\{\s*([0-9.]+)/);
+  return match ? rounded(Number(match[1])) : null;
+}
+function runTimed(commandName, args, expected, options = {}) {
+  const started = performance.now();
+  const result = spawnSync(commandName, args, {
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...options,
+  });
+  const elapsed = performance.now() - started;
+  if (result.status !== 0) {
+    throw new Error(`${commandName} ${args.join(" ")} failed (${result.status}): ${result.stderr || result.stdout}`);
+  }
+  if (result.stdout.trim() !== String(expected)) {
+    throw new Error(`${commandName} ${args.join(" ")} returned ${JSON.stringify(result.stdout.trim())}, expected ${expected}`);
+  }
+  return elapsed;
+}
+function compile(commandName, args, options = {}) {
+  const result = spawnSync(commandName, args, { encoding: "utf8", ...options });
+  if (result.status !== 0) {
+    throw new Error(`${commandName} ${args.join(" ")} failed (${result.status}): ${result.stderr || result.stdout}`);
+  }
+}
+
+const workloads = {
+  string: {
+    label: "String",
+    iterations: 400,
+    expected: 6400,
+    contract: "For each iteration, concatenate 'kotoba-' and 'language', then add its character count and one when it contains 'lang'.",
+  },
+  collection: {
+    label: "Collection",
+    iterations: 8,
+    expected: 1216,
+    contract: "Reuse a 16-element collection, map increment over it, and reduce by addition; one iteration returns 152.",
+  },
+  allocation: {
+    label: "Allocation",
+    iterations: 5,
+    expected: 760,
+    contract: "For each iteration, allocate a 16-element collection and two mapped collections, then reduce; one iteration returns 152.",
+  },
+  io: {
+    label: "I/O",
+    iterations: 12,
+    expected: 1604321280,
+    contract: "Read the same deterministic 1 MiB file 12 times and sum every unsigned byte.",
+  },
+  concurrency: {
+    label: "Concurrency",
+    iterations: 1000000,
+    expected: 4985653002,
+    contract: "Run four workers, each performing 1,000,000 wrapping 32-bit LCG steps from seeds 1..4, and sum the final unsigned states.",
+  },
+  realApp: {
+    label: "Real application",
+    iterations: 8,
+    expected: 20720800000,
+    contract: "Read and aggregate a deterministic 50,000-line TSV access log eight times: sum response bytes and add 1,000,000 for every 5xx row.",
+  },
+};
+
+const directory = mkdtempSync(join(tmpdir(), "kotoba-public-domains-"));
+const ioPath = join(directory, "payload.bin");
+const ioBytes = Buffer.alloc(1024 * 1024);
+let ioSum = 0;
+for (let i = 0; i < ioBytes.length; i += 1) {
+  ioBytes[i] = (i * 17 + 23) & 255;
+  ioSum += ioBytes[i];
+}
+writeFileSync(ioPath, ioBytes);
+workloads.io.expected = ioSum * workloads.io.iterations;
+
+const logPath = join(directory, "access.tsv");
+let logText = "";
+let appOnce = 0;
+for (let i = 0; i < 50000; i += 1) {
+  const status = i % 20 === 0 ? 503 : 200;
+  const bytes = (i * 31) % 65536;
+  logText += `${status}\t${bytes}\t/item/${i % 97}\n`;
+  appOnce += bytes + (status >= 500 ? 1000000 : 0);
+}
+writeFileSync(logPath, logText);
+workloads.realApp.expected = appOnce * workloads.realApp.iterations;
+
+const kotobaRunner = join(directory, "run-kotoba.mjs");
+write(kotobaRunner, String.raw`
+import { readFile } from "node:fs/promises";
+const [path, workload, iterationsText] = process.argv.slice(2);
+const bytes = await readFile(path);
+const literals = workload === "string" ? ["kotoba-", "kotoba-language", "lang", "language"] : [];
+const imports = new Proxy({
+  literal: (index) => literals[index],
+  new: (tag) => ({ tag, items: [] }),
+  "push-i64": (value, item) => { value.items.push(item); return value; },
+  seal: (_descriptor, value) => value,
+  "assert-ref": (_descriptor, value) => value,
+  count: (_descriptor, value) => BigInt(value.length ?? value.items.length),
+  "vector-at-i64": (_descriptor, value, index) => value.items[Number(index)],
+  "vector-conj-i64": (_descriptor, value, item) => ({ tag: value.tag, items: [...value.items, item] }),
+  "string-concat": (_descriptor, left, right) => left + right,
+  "string-contains": (_descriptor, value, part) => value.includes(part) ? 1 : 0,
+}, { get(target, property) { return target[property] ?? (() => { throw new Error("unexpected typed import: " + String(property)); }); } });
+const { instance } = await WebAssembly.instantiate(bytes, { "kotoba:typed": imports });
+let answer = 0n;
+for (let i = 0; i < Number(iterationsText); i += 1) answer += instance.exports.main();
+console.log(answer.toString());
+`);
+
+const cSource = join(directory, "domain.c");
+const cArtifact = join(directory, "domain-c");
+write(cSource, String.raw`
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+typedef struct { uint32_t seed; uint64_t n; uint32_t out; } job;
+static void *volatile allocation_sink;
+static void *lcg(void *p) { job *j=p; uint32_t x=j->seed; for(uint64_t i=0;i<j->n;i++) x=x*1664525u+1013904223u; j->out=x; return 0; }
+static uint64_t file_sum(const char *path) { FILE *f=fopen(path,"rb"); if(!f) exit(2); uint64_t s=0; unsigned char b[65536]; size_t n; while((n=fread(b,1,sizeof b,f))) for(size_t i=0;i<n;i++) s+=b[i]; fclose(f); return s; }
+static uint64_t app(const char *path) { FILE *f=fopen(path,"r"); if(!f) exit(2); uint64_t s=0, bytes; unsigned status; char rest[128]; while(fscanf(f,"%u\t%llu\t%127s",&status,(unsigned long long*)&bytes,rest)==3) s+=bytes+(status>=500?1000000:0); fclose(f); return s; }
+int main(int argc,char **argv){ const char *w=argv[1]; uint64_t n=strtoull(argv[2],0,10),s=0;
+ if(!strcmp(w,"string")){for(uint64_t i=0;i<n;i++){char x[32]; strcpy(x,"kotoba-"); strcat(x,"language"); s+=strlen(x)+(strstr(x,"lang")!=0);}}
+ else if(!strcmp(w,"collection")){int a[16]; for(int i=0;i<16;i++)a[i]=i+1; for(uint64_t k=0;k<n;k++)for(int i=0;i<16;i++)s+=a[i]+1;}
+ else if(!strcmp(w,"allocation")){for(uint64_t k=0;k<n;k++){int *a=malloc(16*sizeof(int)),*b=malloc(16*sizeof(int)),*c=malloc(16*sizeof(int)); for(int i=0;i<16;i++){a[i]=i;b[i]=a[i]+1;c[i]=b[i]+1;s+=c[i];} allocation_sink=c; free(a);free(b);free(c);}}
+ else if(!strcmp(w,"io")){for(uint64_t i=0;i<n;i++)s+=file_sum(argv[3]);}
+ else if(!strcmp(w,"concurrency")){pthread_t t[4];job j[4];for(int i=0;i<4;i++){j[i]=(job){i+1,n,0};pthread_create(&t[i],0,lcg,&j[i]);}for(int i=0;i<4;i++){pthread_join(t[i],0);s+=j[i].out;}}
+ else if(!strcmp(w,"realApp")){for(uint64_t i=0;i<n;i++)s+=app(argv[3]);} printf("%llu\n",(unsigned long long)s); }
+`);
+
+const rustSource = join(directory, "domain.rs");
+const rustArtifact = join(directory, "domain-rust");
+write(rustSource, String.raw`
+use std::{env,fs,thread};
+fn lcg(seed:u32,n:u64)->u32{let mut x=seed;for _ in 0..n{x=x.wrapping_mul(1664525).wrapping_add(1013904223);}x}
+fn main(){let a:Vec<String>=env::args().collect();let w=&a[1];let n:u64=a[2].parse().unwrap();let mut s=0u64;
+match w.as_str(){
+"string"=>for _ in 0..n{let x=["kotoba-","language"].concat();s+=x.chars().count() as u64+x.contains("lang") as u64},
+"collection"=>{let a:Vec<u64>=(1..=16).collect();for _ in 0..n{s+=a.iter().map(|x|x+1).sum::<u64>()}},
+"allocation"=>for _ in 0..n{let a:Vec<u64>=(0..16).collect();let b:Vec<u64>=a.iter().map(|x|x+1).collect();let c:Vec<u64>=b.iter().map(|x|x+1).collect();s+=std::hint::black_box(&c).iter().sum::<u64>()},
+"io"=>for _ in 0..n{s+=fs::read(&a[3]).unwrap().iter().map(|x|*x as u64).sum::<u64>()},
+"concurrency"=>{let mut hs=Vec::new();for seed in 1..=4{hs.push(thread::spawn(move||lcg(seed,n)));}for h in hs{s+=h.join().unwrap() as u64}},
+"realApp"=>for _ in 0..n{for line in fs::read_to_string(&a[3]).unwrap().lines(){let mut p=line.split('\t');let status:u32=p.next().unwrap().parse().unwrap();let bytes:u64=p.next().unwrap().parse().unwrap();s+=bytes+if status>=500{1000000}else{0};}},_=>panic!()};println!("{}",s)}
+`);
+
+const goSource = join(directory, "domain.go");
+const goArtifact = join(directory, "domain-go");
+write(goSource, String.raw`
+package main
+import("bufio";"fmt";"os";"strconv";"strings")
+var allocationSink any
+func lcg(seed uint32,n uint64)uint32{x:=seed;for i:=uint64(0);i<n;i++{x=x*1664525+1013904223};return x}
+func fileSum(path string)uint64{b,e:=os.ReadFile(path);if e!=nil{panic(e)};s:=uint64(0);for _,x:=range b{s+=uint64(x)};return s}
+func app(path string)uint64{f,e:=os.Open(path);if e!=nil{panic(e)};defer f.Close();s:=uint64(0);q:=bufio.NewScanner(f);for q.Scan(){p:=strings.Split(q.Text(),"\t");st,_:=strconv.Atoi(p[0]);b,_:=strconv.ParseUint(p[1],10,64);s+=b;if st>=500{s+=1000000}};return s}
+func main(){w:=os.Args[1];n,_:=strconv.ParseUint(os.Args[2],10,64);s:=uint64(0);switch w{case"string":for i:=uint64(0);i<n;i++{x:="kotoba-"+"language";s+=uint64(len([]rune(x)));if strings.Contains(x,"lang"){s++}};case"collection":a:=[]uint64{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};for k:=uint64(0);k<n;k++{b:=make([]uint64,len(a));for i,x:=range a{b[i]=x+1};for _,x:=range b{s+=x}};case"allocation":for k:=uint64(0);k<n;k++{a:=make([]uint64,16);b:=make([]uint64,16);c:=make([]uint64,16);for i:=range a{a[i]=uint64(i);b[i]=a[i]+1;c[i]=b[i]+1;s+=c[i]};allocationSink=c};case"io":for i:=uint64(0);i<n;i++{s+=fileSum(os.Args[3])};case"concurrency":ch:=make(chan uint32,4);for seed:=uint32(1);seed<=4;seed++{go func(x uint32){ch<-lcg(x,n)}(seed)};for i:=0;i<4;i++{s+=uint64(<-ch)};case"realApp":for i:=uint64(0);i<n;i++{s+=app(os.Args[3])}};fmt.Println(s)}
+`);
+
+const javaSource = join(directory, "Domain.java");
+const javaClasses = join(directory, "java-classes");
+write(javaSource, String.raw`
+import java.nio.file.*;import java.util.*;import java.util.concurrent.*;
+public final class Domain{
+ static long lcg(int seed,long n){int x=seed;for(long i=0;i<n;i++)x=x*1664525+1013904223;return Integer.toUnsignedLong(x);}
+ static long fileSum(String p)throws Exception{long s=0;for(byte x:Files.readAllBytes(Path.of(p)))s+=Byte.toUnsignedInt(x);return s;}
+ static long app(String p)throws Exception{long s=0;for(String line:Files.readAllLines(Path.of(p))){String[]x=line.split("\\t",3);int st=Integer.parseInt(x[0]);s+=Long.parseLong(x[1])+(st>=500?1000000:0);}return s;}
+ public static void main(String[]a)throws Exception{String w=a[0];long n=Long.parseLong(a[1]),s=0;switch(w){
+ case"string"->{for(long i=0;i<n;i++){String x="kotoba-"+"language";s+=x.codePointCount(0,x.length())+(x.contains("lang")?1:0);}}
+ case"collection"->{List<Long>x=new ArrayList<>();for(long i=1;i<=16;i++)x.add(i);for(long k=0;k<n;k++)s+=x.stream().mapToLong(v->v+1).sum();}
+ case"allocation"->{for(long k=0;k<n;k++){List<Long>x=new ArrayList<>(),y=new ArrayList<>(),z=new ArrayList<>();for(long i=0;i<16;i++)x.add(i);for(long v:x)y.add(v+1);for(long v:y)z.add(v+1);for(long v:z)s+=v;}}
+ case"io"->{for(long i=0;i<n;i++)s+=fileSum(a[2]);}
+ case"concurrency"->{ExecutorService e=Executors.newFixedThreadPool(4);List<Future<Long>>f=new ArrayList<>();for(int seed=1;seed<=4;seed++){int q=seed;f.add(e.submit(()->lcg(q,n)));}for(Future<Long>q:f)s+=q.get();e.shutdown();}
+ case"realApp"->{for(long i=0;i<n;i++)s+=app(a[2]);}}
+ System.out.println(s);}}
+`);
+
+const nodeSource = join(directory, "domain-node.mjs");
+write(nodeSource, String.raw`
+import{readFileSync}from"node:fs";import{Worker,isMainThread,parentPort,workerData}from"node:worker_threads";
+function lcg(seed,n){let x=seed>>>0;for(let i=0;i<n;i++)x=(Math.imul(x,1664525)+1013904223)>>>0;return x}
+if(!isMainThread){parentPort.postMessage(lcg(workerData.seed,workerData.n));}else{const[w,nt,path]=process.argv.slice(2),n=Number(nt);let s=0;
+if(w==="string")for(let i=0;i<n;i++){const x="kotoba-"+"language";s+=[...x].length+(x.includes("lang")?1:0)}
+else if(w==="collection"){const a=Array.from({length:16},(_,i)=>i+1);for(let k=0;k<n;k++)s+=a.map(x=>x+1).reduce((x,y)=>x+y,0)}
+else if(w==="allocation")for(let k=0;k<n;k++)s+=Array.from({length:16},(_,i)=>i).map(x=>x+1).map(x=>x+1).reduce((x,y)=>x+y,0)
+else if(w==="io")for(let i=0;i<n;i++)for(const x of readFileSync(path))s+=x;
+else if(w==="concurrency"){s=await Promise.all([1,2,3,4].map(seed=>new Promise((ok,no)=>{const w=new Worker(new URL(import.meta.url),{workerData:{seed,n}});w.once("message",ok);w.once("error",no)}))).then(x=>x.reduce((a,b)=>a+b,0))}
+else if(w==="realApp")for(let i=0;i<n;i++)for(const line of readFileSync(path,"utf8").trimEnd().split("\n")){const[st,b]=line.split("\t");s+=Number(b)+(Number(st)>=500?1000000:0)}console.log(s)}
+`);
+
+compile("clang", ["-O2", "-pthread", "-o", cArtifact, cSource]);
+compile("rustc", ["-C", "opt-level=2", "-o", rustArtifact, rustSource]);
+compile("go", ["build", "-trimpath", "-o", goArtifact, goSource]);
+mkdirSync(javaClasses);
+compile("javac", ["-d", javaClasses, javaSource]);
+
+const kotobaArtifacts = {};
+for (const id of ["string", "collection", "allocation"]) {
+  const source = join(root, "bench", "public-domain-comparison", "probes", `${id}.kotoba`);
+  const artifact = join(directory, `${id}.wasm`);
+  compile("kotoba", ["compile", source, "--target", "wasm", "-o", artifact, "--json"]);
+  kotobaArtifacts[id] = { source, artifact };
+}
+
+const tools = [
+  { id:"kotoba", label:"Kotoba / Wasm + typed JS host", target:"WebAssembly in Node.js", version:command("brew",["list","--versions","kotoba"]), artifact:kotobaArtifacts,
+    run:(id,w)=>runTimed(process.execPath,[kotobaRunner,w.artifact,id,String(workloads[id].iterations)],workloads[id].expected) },
+  { id:"rust", label:"Rust", target:"arm64 macOS native", version:optionalVersion("rustc",["--version"]), artifact:rustArtifact,
+    run:(id)=>runTimed(rustArtifact,[id,String(workloads[id].iterations),id==="io"?ioPath:logPath],workloads[id].expected) },
+  { id:"c", label:"C / Clang", target:"arm64 macOS native", version:optionalVersion("clang",["--version"]), artifact:cArtifact,
+    run:(id)=>runTimed(cArtifact,[id,String(workloads[id].iterations),id==="io"?ioPath:logPath],workloads[id].expected) },
+  { id:"go", label:"Go", target:"arm64 macOS native", version:optionalVersion("go",["version"]), artifact:goArtifact,
+    run:(id)=>runTimed(goArtifact,[id,String(workloads[id].iterations),id==="io"?ioPath:logPath],workloads[id].expected) },
+  { id:"jvm", label:"JVM / Java", target:"JVM", version:optionalVersion("java",["-version"]), artifact:join(javaClasses,"Domain.class"),
+    run:(id)=>runTimed("java",["-cp",javaClasses,"Domain",id,String(workloads[id].iterations),id==="io"?ioPath:logPath],workloads[id].expected) },
+  { id:"javascript", label:"JavaScript / Node.js", target:"Node.js", version:optionalVersion("node",["--version"]), artifact:nodeSource,
+    run:(id)=>runTimed(process.execPath,[nodeSource,id,String(workloads[id].iterations),id==="io"?ioPath:logPath],workloads[id].expected) },
+];
+
+const unsupported = {
+  kotoba: {
+    io: "The standalone Kotoba Wasm artifact has no ambient filesystem import; an admitted filesystem capability host is outside this comparison.",
+    concurrency: "The current standalone Kotoba Wasm target exposes no shared-memory/thread contract.",
+    realApp: "This file-backed application requires the filesystem capability excluded by the standalone target contract.",
+  },
+};
+const samples = Object.fromEntries(tools.map(t=>[t.id,{}]));
+const loadBefore = load1();
+
+// Correctness warm-up, then rotate tool order on every sample to reduce drift bias.
+for (const tool of tools) for (const id of Object.keys(workloads)) {
+  if (!unsupported[tool.id]?.[id]) tool.run(id, kotobaArtifacts[id]);
+}
+for (let sample = 0; sample < runs; sample += 1) {
+  for (const id of Object.keys(workloads)) {
+    const rotated = [...tools.slice(sample % tools.length), ...tools.slice(0, sample % tools.length)];
+    for (const tool of rotated) {
+      if (!unsupported[tool.id]?.[id]) (samples[tool.id][id] ??= []).push(tool.run(id, kotobaArtifacts[id]));
+    }
+  }
+}
+const loadAfter = load1();
+const maxLoad = Math.max(loadBefore ?? 0, loadAfter ?? 0);
+const logicalCpu = Number(command("sysctl",["-n","hw.logicalcpu"]));
+const qualified = maxLoad <= logicalCpu * 0.75;
+
+const report = {
+  schema:"kotoba.public-domain-comparison.v1",
+  generatedAt:new Date().toISOString(),
+  repository:{commit:command("git",["rev-parse","HEAD"],{cwd:root}),dirty:command("git",["status","--porcelain"],{cwd:root})!==""},
+  machine:{os:optionalVersion("sw_vers",["-productVersion"]),architecture:process.arch,cpu:command("sysctl",["-n","machdep.cpu.brand_string"]),logicalCpu,load1Before:loadBefore,load1After:loadAfter},
+  qualification:{qualified,rule:"max(load1 before, load1 after) <= 0.75 * logical CPU count",note:qualified?"Medians may be compared only within each workload and target/runtime contract.":"Host load exceeded the publication gate; values are observations, not qualified rankings."},
+  method:{runs,warmups:1,processBoundary:"Every sample starts a fresh process; concurrency workers are created inside that process.",measurement:"Wall-clock process-cold startup plus workload execution; compilation is excluded.",correctness:"Every sample must print the reference checksum exactly.",scope:"Representative six-runtime comparison; targets, allocation models, JIT/AOT, and host contracts differ."},
+  workloads,
+  tools:tools.map(tool=>({id:tool.id,label:tool.label,target:tool.target,version:tool.version,artifactSha256:tool.id==="kotoba"?Object.fromEntries(Object.entries(kotobaArtifacts).map(([id,x])=>[id,sha256(x.artifact)])):sha256(tool.artifact),results:Object.fromEntries(Object.keys(workloads).map(id=>[id,unsupported[tool.id]?.[id]?na(unsupported[tool.id][id]):measured(samples[tool.id][id])]))})),
+ };
+write(output,`${JSON.stringify(report,null,2)}\n`);
+rmSync(directory,{recursive:true,force:true});
+console.log(output);
