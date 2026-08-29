@@ -60,10 +60,13 @@ rendering and publishes the manifest at `/dependencies.edn`.
 The public benchmark section reads the checked-in compile report at
 `bench/public-compile-comparison/latest.json` and the bounded native comparison
 summary at `bench/public-runtime-comparison/latest.json`. The generator copies
-both reports alongside `llms.txt`, `llms-full.txt`, and the executable agent
+these reports plus the stage-separated developer-loop report at
+`bench/public-end-to-end-comparison/latest.json` alongside `llms.txt`,
+`llms-full.txt`, and the executable agent
 quickstart. Compile-startup evidence and steady-state runtime evidence remain
-visibly separate, and an unqualified host-load result cannot become a fastest
-claim through presentation.
+visibly separate from dependency resolution, checking, clean/no-change builds,
+and first-result latency. An unqualified host-load result cannot become a
+fastest claim through presentation.
 
 ## Regenerate
 
