@@ -54,6 +54,11 @@ and an ML-DSA-65 signature over the exact request; the ML-DSA key is pinned to
 the Stable Principal on first valid use. This is an application-layer
 post-quantum co-approval, not a claim that the authenticator's WebAuthn
 credential itself is post-quantum.
+The pinned ML-DSA key can be rotated through
+`https://kotoba.cloud/v1/pq-keys/rotate` only with signatures from both the
+current and next keys plus Passkey confirmation; revocation similarly requires
+the current key plus Passkey. Independent recovery without the current key and
+external transparency witnessing remain blocked boundaries.
 
 ```sh
 brew tap kotoba-lang/kotoba

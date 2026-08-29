@@ -34,6 +34,11 @@ Post-quantum claims name the protected operation and exact suite.
   Principal's monotonic PQ key epoch. The first valid ML-DSA key is atomically
   pinned to that Principal; a replay, expired request, old epoch, mismatched
   key, or revoked state fails closed.
+- Normal ML-DSA key rotation and revocation are public, authenticated
+  operations. Rotation requires the current and next keys to sign identical
+  transition bytes plus a live Passkey session; revocation requires the
+  current key plus Passkey. The Principal-scoped Durable Object changes state
+  atomically and rejects exact transition-ID replay.
 
 The last item is application-layer co-approval. A platform Passkey continues
 to use the COSE algorithm implemented by its authenticator. Kotoba Cloud
@@ -62,8 +67,10 @@ external platform Passkey into a post-quantum authenticator.
 The machine-readable authority for the current classifications, evidence, and
 named gaps is `security/cryptographic-boundaries.edn`. Its validator and the
 Murakumo fleet gate reject an admitted managed boundary that lacks PQ material,
-implementation evidence, negative tests, or downgrade rejection. The Cloud PQ
-key lifecycle remains `blocked`: its rotation and revocation state transitions
-are specified and tested, but authenticated public transition endpoints,
-independent recovery quorum, a scheduled drill, and a public transparency
-witness are not yet operational.
+implementation evidence, negative tests, or downgrade rejection. The normal
+Cloud PQ key lifecycle is admitted: authenticated rotation and revocation
+endpoints, CLI approval flow, atomic state transition, and no-store receipt are
+live. Recovery without the current key remains blocked until an independent
+quorum exists. A scheduled recovery/rotation drill and a public transparency
+witness are also not yet operational; the immediate HTTPS receipt is not
+represented as independently witnessed evidence.
