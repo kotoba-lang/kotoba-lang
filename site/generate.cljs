@@ -642,7 +642,7 @@
                           (:observedLoad1First end-speed) " → "
                           (:observedLoad1Last end-speed) " · required ≤ "
                           (:quietLoad1Limit end-speed))))
-      (card (dds/chip-label "WORKLOAD DOMAINS · RANK UNQUALIFIED" {:color "gray"})
+     (card (dds/chip-label "WORKLOAD DOMAINS · RANK UNQUALIFIED" {:color "gray"})
             (dds/heading 3 "6 domains × 6 runtime paths" {:size "24"})
             [:p "Strings, collections, allocation, file I/O, four-worker concurrency, and a request-admission policy application kernel are correctness checked."]
             (caption (str (get-in domain-benchmark [:method :runs])
@@ -650,6 +650,29 @@
                           (get-in domain-benchmark [:machine :load1Before]) " → "
                           (get-in domain-benchmark [:machine :load1After])
                           (if domain-qualified " · qualified" " · rank withheld")))))
+     (dds/heading 3 "Optimization delivery after the published run" {:size "24"})
+     [:p
+      "The dated benchmark above remains immutable. New implementation slices are listed separately until the same-artifact suite reruns and passes its qualification gates."]
+     [:div {:class "kot-table-scroll"}
+      (dds/table
+       {:caption "Implemented surfaces that are not yet new speed claims"
+        :headers ["Surface" "Delivered" "Evidence boundary"]
+        :row-header? true
+        :rows [["Native vectors / allocation"
+                "Bounded non-escaping vector literals are escape-proved and scalar-replaced on x86-64 and AArch64."
+                "211 backend tests / 2,442 assertions; escaping vectors retain the checked host ABI. No new ranked timing yet."]
+               ["String SIMD"
+                "POSIX checked equality uses explicit 16-byte NEON or SSE2 comparison after handle and canonical UTF-8 validation."
+                "Optimized assembly and both native ISA semantic vectors verified. Windows remains separately pinned; latency rank pending."]
+               ["Async I/O capability"
+                "Root-confined eventual read/write/list/exists/delete use CompletableFuture on JVM and fs.promises on Node."
+                "JVM and Node real-filesystem tests pass. The public standalone Wasm benchmark still has no admitted host binding, so its I/O cell remains N/A."]
+               ["Structured concurrency"
+                "A bounded 32-child fail-fast scope joins, cancels siblings, and prevents child lifetime escape as canonical Kotoba state."
+                "996 parity assertions across .kotoba authority and CLJC load path. This is structured lifetime semantics, not an OS-thread throughput result."]
+               ["Kotoba CLI"
+                "kotoba test/build consume the new compiler pin; kotoba compile emits sealed x86-64 and AArch64 KEXE directly."
+                "Public CLI lifecycle and AArch64 vector artifact verified. Native --run stays refused until a measured loader receipt is wired."]]})]
      [:div {:class "kot-table-scroll"}
       (dds/table
        {:caption "Tiny source-to-artifact process-cold build measurement"
