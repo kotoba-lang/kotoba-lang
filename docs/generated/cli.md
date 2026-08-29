@@ -126,6 +126,31 @@ Options:
 - **`-o`, `--output`** — Output path for build/export artifacts. Type: `path`.
 - **`--json`** — Emit machine-readable workflow result. Type: `boolean`.
 
+## `kotoba build`
+
+Build a Kotoba project into its checked target artifact. This is the direct project lifecycle command; rad build remains a compatibility spelling.
+
+Maturity tier: `m2`.
+
+Options:
+
+- **`--project`** — Project root. Type: `path`; default: `.`.
+- **`--profile`** — Build profile. Type: `enum`; values: `dev`, `test`, `release`; default: `release`.
+- **`-o`, `--output`** — Optional output artifact path. Type: `path`.
+- **`--json`** — Emit machine-readable build results. Type: `boolean`.
+
+## `kotoba test`
+
+Check and run the admitted tests for a Kotoba project. This is the direct project lifecycle command; rad test remains a compatibility spelling.
+
+Maturity tier: `m2`.
+
+Options:
+
+- **`--project`** — Project root. Type: `path`; default: `.`.
+- **`--profile`** — Test profile. Type: `enum`; values: `test`; default: `test`.
+- **`--json`** — Emit machine-readable test results. Type: `boolean`.
+
 ## `kotoba deploy`
 
 Plan and apply package desired-state to a local receipt or a murakumo fleet reside target.
@@ -163,7 +188,8 @@ Options:
 - **`--endpoint`** — Optional HTTPS codebase node receiving verified blocks and the signed namespace head. Type: `string`.
 - **`--write-token-file`** — Credential file for an explicitly configured publication endpoint; never printed by the CLI. Type: `path`.
 - **`--router`** — Delegated IPFS router used for IPNS publication and resolution. Type: `string`; repeatable.
-- **`--dry-run`** — Inspect the exact release graph without publishing. Set false for the existing local-signed IPNS operation. Type: `boolean`; default: `true`.
+- **`--hosted`** — Store the immutable graph, then emit a kotoba.cloud URL for explicit Passkey approval of the locally signed namespace head. Type: `boolean`.
+- **`--dry-run`** — Inspect the exact release graph without publishing. Set false for local-signed IPNS, or combine with --hosted for Passkey approval. Type: `boolean`; default: `true`.
 - **`--json`** — Emit the descriptor or publication receipt as JSON. Type: `boolean`.
 
 ## `kotoba hinshitsu`
