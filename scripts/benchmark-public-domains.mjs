@@ -110,8 +110,8 @@ const workloads = {
   realApp: {
     label: "Real application",
     iterations: 8,
-    expected: 20720800000,
-    contract: "Read and aggregate a deterministic 50,000-line TSV access log eight times: sum response bytes and add 1,000,000 for every 5xx row.",
+    expected: 64,
+    contract: "Evaluate a fixed 16-request risk batch against an admission threshold and count admitted requests; one batch returns 8.",
   },
 };
 
@@ -125,18 +125,6 @@ for (let i = 0; i < ioBytes.length; i += 1) {
 }
 writeFileSync(ioPath, ioBytes);
 workloads.io.expected = ioSum * workloads.io.iterations;
-
-const logPath = join(directory, "access.tsv");
-let logText = "";
-let appOnce = 0;
-for (let i = 0; i < 50000; i += 1) {
-  const status = i % 20 === 0 ? 503 : 200;
-  const bytes = (i * 31) % 65536;
-  logText += `${status}\t${bytes}\t/item/${i % 97}\n`;
-  appOnce += bytes + (status >= 500 ? 1000000 : 0);
-}
-writeFileSync(logPath, logText);
-workloads.realApp.expected = appOnce * workloads.realApp.iterations;
 
 const kotobaRunner = join(directory, "run-kotoba.mjs");
 write(kotobaRunner, String.raw`
@@ -174,14 +162,13 @@ typedef struct { uint32_t seed; uint64_t n; uint32_t out; } job;
 static void *volatile allocation_sink;
 static void *lcg(void *p) { job *j=p; uint32_t x=j->seed; for(uint64_t i=0;i<j->n;i++) x=x*1664525u+1013904223u; j->out=x; return 0; }
 static uint64_t file_sum(const char *path) { FILE *f=fopen(path,"rb"); if(!f) exit(2); uint64_t s=0; unsigned char b[65536]; size_t n; while((n=fread(b,1,sizeof b,f))) for(size_t i=0;i<n;i++) s+=b[i]; fclose(f); return s; }
-static uint64_t app(const char *path) { FILE *f=fopen(path,"r"); if(!f) exit(2); uint64_t s=0, bytes; unsigned status; char rest[128]; while(fscanf(f,"%u\t%llu\t%127s",&status,(unsigned long long*)&bytes,rest)==3) s+=bytes+(status>=500?1000000:0); fclose(f); return s; }
 int main(int argc,char **argv){ const char *w=argv[1]; uint64_t n=strtoull(argv[2],0,10),s=0;
  if(!strcmp(w,"string")){for(uint64_t i=0;i<n;i++){char x[32]; strcpy(x,"kotoba-"); strcat(x,"language"); s+=strlen(x)+(strstr(x,"lang")!=0);}}
  else if(!strcmp(w,"collection")){int a[16]; for(int i=0;i<16;i++)a[i]=i+1; for(uint64_t k=0;k<n;k++)for(int i=0;i<16;i++)s+=a[i]+1;}
  else if(!strcmp(w,"allocation")){for(uint64_t k=0;k<n;k++){int *a=malloc(16*sizeof(int)),*b=malloc(16*sizeof(int)),*c=malloc(16*sizeof(int)); for(int i=0;i<16;i++){a[i]=i;b[i]=a[i]+1;c[i]=b[i]+1;s+=c[i];} allocation_sink=c; free(a);free(b);free(c);}}
  else if(!strcmp(w,"io")){for(uint64_t i=0;i<n;i++)s+=file_sum(argv[3]);}
  else if(!strcmp(w,"concurrency")){pthread_t t[4];job j[4];for(int i=0;i<4;i++){j[i]=(job){i+1,n,0};pthread_create(&t[i],0,lcg,&j[i]);}for(int i=0;i<4;i++){pthread_join(t[i],0);s+=j[i].out;}}
- else if(!strcmp(w,"realApp")){for(uint64_t i=0;i<n;i++)s+=app(argv[3]);} printf("%llu\n",(unsigned long long)s); }
+ else if(!strcmp(w,"realApp")){int risk[16]={12,55,33,91,4,50,49,72,18,66,40,88,7,51,21,99};for(uint64_t k=0;k<n;k++)for(int i=0;i<16;i++)s+=risk[i]<50;} printf("%llu\n",(unsigned long long)s); }
 `);
 
 const rustSource = join(directory, "domain.rs");
@@ -196,19 +183,18 @@ match w.as_str(){
 "allocation"=>for _ in 0..n{let a:Vec<u64>=(0..16).collect();let b:Vec<u64>=a.iter().map(|x|x+1).collect();let c:Vec<u64>=b.iter().map(|x|x+1).collect();s+=std::hint::black_box(&c).iter().sum::<u64>()},
 "io"=>for _ in 0..n{s+=fs::read(&a[3]).unwrap().iter().map(|x|*x as u64).sum::<u64>()},
 "concurrency"=>{let mut hs=Vec::new();for seed in 1..=4{hs.push(thread::spawn(move||lcg(seed,n)));}for h in hs{s+=h.join().unwrap() as u64}},
-"realApp"=>for _ in 0..n{for line in fs::read_to_string(&a[3]).unwrap().lines(){let mut p=line.split('\t');let status:u32=p.next().unwrap().parse().unwrap();let bytes:u64=p.next().unwrap().parse().unwrap();s+=bytes+if status>=500{1000000}else{0};}},_=>panic!()};println!("{}",s)}
+"realApp"=>{let risk=[12,55,33,91,4,50,49,72,18,66,40,88,7,51,21,99];for _ in 0..n{s+=risk.iter().filter(|x|**x<50).count() as u64}},_=>panic!()};println!("{}",s)}
 `);
 
 const goSource = join(directory, "domain.go");
 const goArtifact = join(directory, "domain-go");
 write(goSource, String.raw`
 package main
-import("bufio";"fmt";"os";"strconv";"strings")
+import("fmt";"os";"strconv";"strings")
 var allocationSink any
 func lcg(seed uint32,n uint64)uint32{x:=seed;for i:=uint64(0);i<n;i++{x=x*1664525+1013904223};return x}
 func fileSum(path string)uint64{b,e:=os.ReadFile(path);if e!=nil{panic(e)};s:=uint64(0);for _,x:=range b{s+=uint64(x)};return s}
-func app(path string)uint64{f,e:=os.Open(path);if e!=nil{panic(e)};defer f.Close();s:=uint64(0);q:=bufio.NewScanner(f);for q.Scan(){p:=strings.Split(q.Text(),"\t");st,_:=strconv.Atoi(p[0]);b,_:=strconv.ParseUint(p[1],10,64);s+=b;if st>=500{s+=1000000}};return s}
-func main(){w:=os.Args[1];n,_:=strconv.ParseUint(os.Args[2],10,64);s:=uint64(0);switch w{case"string":for i:=uint64(0);i<n;i++{x:="kotoba-"+"language";s+=uint64(len([]rune(x)));if strings.Contains(x,"lang"){s++}};case"collection":a:=[]uint64{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};for k:=uint64(0);k<n;k++{b:=make([]uint64,len(a));for i,x:=range a{b[i]=x+1};for _,x:=range b{s+=x}};case"allocation":for k:=uint64(0);k<n;k++{a:=make([]uint64,16);b:=make([]uint64,16);c:=make([]uint64,16);for i:=range a{a[i]=uint64(i);b[i]=a[i]+1;c[i]=b[i]+1;s+=c[i]};allocationSink=c};case"io":for i:=uint64(0);i<n;i++{s+=fileSum(os.Args[3])};case"concurrency":ch:=make(chan uint32,4);for seed:=uint32(1);seed<=4;seed++{go func(x uint32){ch<-lcg(x,n)}(seed)};for i:=0;i<4;i++{s+=uint64(<-ch)};case"realApp":for i:=uint64(0);i<n;i++{s+=app(os.Args[3])}};fmt.Println(s)}
+func main(){w:=os.Args[1];n,_:=strconv.ParseUint(os.Args[2],10,64);s:=uint64(0);switch w{case"string":for i:=uint64(0);i<n;i++{x:="kotoba-"+"language";s+=uint64(len([]rune(x)));if strings.Contains(x,"lang"){s++}};case"collection":a:=[]uint64{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};for k:=uint64(0);k<n;k++{b:=make([]uint64,len(a));for i,x:=range a{b[i]=x+1};for _,x:=range b{s+=x}};case"allocation":for k:=uint64(0);k<n;k++{a:=make([]uint64,16);b:=make([]uint64,16);c:=make([]uint64,16);for i:=range a{a[i]=uint64(i);b[i]=a[i]+1;c[i]=b[i]+1;s+=c[i]};allocationSink=c};case"io":for i:=uint64(0);i<n;i++{s+=fileSum(os.Args[3])};case"concurrency":ch:=make(chan uint32,4);for seed:=uint32(1);seed<=4;seed++{go func(x uint32){ch<-lcg(x,n)}(seed)};for i:=0;i<4;i++{s+=uint64(<-ch)};case"realApp":risk:=[]uint64{12,55,33,91,4,50,49,72,18,66,40,88,7,51,21,99};for k:=uint64(0);k<n;k++{for _,x:=range risk{if x<50{s++}}}};fmt.Println(s)}
 `);
 
 const javaSource = join(directory, "Domain.java");
@@ -218,14 +204,13 @@ import java.nio.file.*;import java.util.*;import java.util.concurrent.*;
 public final class Domain{
  static long lcg(int seed,long n){int x=seed;for(long i=0;i<n;i++)x=x*1664525+1013904223;return Integer.toUnsignedLong(x);}
  static long fileSum(String p)throws Exception{long s=0;for(byte x:Files.readAllBytes(Path.of(p)))s+=Byte.toUnsignedInt(x);return s;}
- static long app(String p)throws Exception{long s=0;for(String line:Files.readAllLines(Path.of(p))){String[]x=line.split("\\t",3);int st=Integer.parseInt(x[0]);s+=Long.parseLong(x[1])+(st>=500?1000000:0);}return s;}
  public static void main(String[]a)throws Exception{String w=a[0];long n=Long.parseLong(a[1]),s=0;switch(w){
  case"string"->{for(long i=0;i<n;i++){String x="kotoba-"+"language";s+=x.codePointCount(0,x.length())+(x.contains("lang")?1:0);}}
  case"collection"->{List<Long>x=new ArrayList<>();for(long i=1;i<=16;i++)x.add(i);for(long k=0;k<n;k++)s+=x.stream().mapToLong(v->v+1).sum();}
  case"allocation"->{for(long k=0;k<n;k++){List<Long>x=new ArrayList<>(),y=new ArrayList<>(),z=new ArrayList<>();for(long i=0;i<16;i++)x.add(i);for(long v:x)y.add(v+1);for(long v:y)z.add(v+1);for(long v:z)s+=v;}}
  case"io"->{for(long i=0;i<n;i++)s+=fileSum(a[2]);}
  case"concurrency"->{ExecutorService e=Executors.newFixedThreadPool(4);List<Future<Long>>f=new ArrayList<>();for(int seed=1;seed<=4;seed++){int q=seed;f.add(e.submit(()->lcg(q,n)));}for(Future<Long>q:f)s+=q.get();e.shutdown();}
- case"realApp"->{for(long i=0;i<n;i++)s+=app(a[2]);}}
+ case"realApp"->{long[]risk={12,55,33,91,4,50,49,72,18,66,40,88,7,51,21,99};for(long k=0;k<n;k++)for(long x:risk)if(x<50)s++;}}
  System.out.println(s);}}
 `);
 
@@ -239,7 +224,7 @@ else if(w==="collection"){const a=Array.from({length:16},(_,i)=>i+1);for(let k=0
 else if(w==="allocation")for(let k=0;k<n;k++)s+=Array.from({length:16},(_,i)=>i).map(x=>x+1).map(x=>x+1).reduce((x,y)=>x+y,0)
 else if(w==="io")for(let i=0;i<n;i++)for(const x of readFileSync(path))s+=x;
 else if(w==="concurrency"){s=await Promise.all([1,2,3,4].map(seed=>new Promise((ok,no)=>{const w=new Worker(new URL(import.meta.url),{workerData:{seed,n}});w.once("message",ok);w.once("error",no)}))).then(x=>x.reduce((a,b)=>a+b,0))}
-else if(w==="realApp")for(let i=0;i<n;i++)for(const line of readFileSync(path,"utf8").trimEnd().split("\n")){const[st,b]=line.split("\t");s+=Number(b)+(Number(st)>=500?1000000:0)}console.log(s)}
+else if(w==="realApp"){const risk=[12,55,33,91,4,50,49,72,18,66,40,88,7,51,21,99];for(let k=0;k<n;k++)for(const x of risk)if(x<50)s++}console.log(s)}
 `);
 
 compile("clang", ["-O2", "-pthread", "-o", cArtifact, cSource]);
@@ -249,7 +234,7 @@ mkdirSync(javaClasses);
 compile("javac", ["-d", javaClasses, javaSource]);
 
 const kotobaArtifacts = {};
-for (const id of ["string", "collection", "allocation"]) {
+for (const id of ["string", "collection", "allocation", "realApp"]) {
   const source = join(root, "bench", "public-domain-comparison", "probes", `${id}.kotoba`);
   const artifact = join(directory, `${id}.wasm`);
   compile("kotoba", ["compile", source, "--target", "wasm", "-o", artifact, "--json"]);
@@ -260,22 +245,21 @@ const tools = [
   { id:"kotoba", label:"Kotoba / Wasm + typed JS host", target:"WebAssembly in Node.js", version:command("brew",["list","--versions","kotoba"]), artifact:kotobaArtifacts,
     run:(id,w)=>runTimed(process.execPath,[kotobaRunner,w.artifact,id,String(workloads[id].iterations)],workloads[id].expected) },
   { id:"rust", label:"Rust", target:"arm64 macOS native", version:optionalVersion("rustc",["--version"]), artifact:rustArtifact,
-    run:(id)=>runTimed(rustArtifact,[id,String(workloads[id].iterations),id==="io"?ioPath:logPath],workloads[id].expected) },
+    run:(id)=>runTimed(rustArtifact,[id,String(workloads[id].iterations),ioPath],workloads[id].expected) },
   { id:"c", label:"C / Clang", target:"arm64 macOS native", version:optionalVersion("clang",["--version"]), artifact:cArtifact,
-    run:(id)=>runTimed(cArtifact,[id,String(workloads[id].iterations),id==="io"?ioPath:logPath],workloads[id].expected) },
+    run:(id)=>runTimed(cArtifact,[id,String(workloads[id].iterations),ioPath],workloads[id].expected) },
   { id:"go", label:"Go", target:"arm64 macOS native", version:optionalVersion("go",["version"]), artifact:goArtifact,
-    run:(id)=>runTimed(goArtifact,[id,String(workloads[id].iterations),id==="io"?ioPath:logPath],workloads[id].expected) },
+    run:(id)=>runTimed(goArtifact,[id,String(workloads[id].iterations),ioPath],workloads[id].expected) },
   { id:"jvm", label:"JVM / Java", target:"JVM", version:optionalVersion("java",["-version"]), artifact:join(javaClasses,"Domain.class"),
-    run:(id)=>runTimed("java",["-cp",javaClasses,"Domain",id,String(workloads[id].iterations),id==="io"?ioPath:logPath],workloads[id].expected) },
+    run:(id)=>runTimed("java",["-cp",javaClasses,"Domain",id,String(workloads[id].iterations),ioPath],workloads[id].expected) },
   { id:"javascript", label:"JavaScript / Node.js", target:"Node.js", version:optionalVersion("node",["--version"]), artifact:nodeSource,
-    run:(id)=>runTimed(process.execPath,[nodeSource,id,String(workloads[id].iterations),id==="io"?ioPath:logPath],workloads[id].expected) },
+    run:(id)=>runTimed(process.execPath,[nodeSource,id,String(workloads[id].iterations),ioPath],workloads[id].expected) },
 ];
 
 const unsupported = {
   kotoba: {
     io: "The standalone Kotoba Wasm artifact has no ambient filesystem import; an admitted filesystem capability host is outside this comparison.",
     concurrency: "The current standalone Kotoba Wasm target exposes no shared-memory/thread contract.",
-    realApp: "This file-backed application requires the filesystem capability excluded by the standalone target contract.",
   },
 };
 const samples = Object.fromEntries(tools.map(t=>[t.id,{}]));

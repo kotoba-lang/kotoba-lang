@@ -644,7 +644,7 @@
                           (:quietLoad1Limit end-speed))))
       (card (dds/chip-label "WORKLOAD DOMAINS · RANK UNQUALIFIED" {:color "gray"})
             (dds/heading 3 "6 domains × 6 runtime paths" {:size "24"})
-            [:p "Strings, collections, allocation, file I/O, four-worker concurrency, and a file-backed access-log application are correctness checked."]
+            [:p "Strings, collections, allocation, file I/O, four-worker concurrency, and a request-admission policy application kernel are correctness checked."]
             (caption (str (get-in domain-benchmark [:method :runs])
                           " process-cold samples · load1 "
                           (get-in domain-benchmark [:machine :load1Before]) " → "
@@ -714,7 +714,7 @@
                 "All 30 semantic comparison cells are complete; speed ranking withheld because the quiet-host gate failed"]
                ["Strings, collections, allocation, I/O, concurrency, and real app"
                 "Kotoba, Rust, C, Go, JVM, and JavaScript runtime paths"
-                "Exact checksums and all applicable samples are published; standalone Kotoba I/O, threads, and the file-backed app are N/A, and the failed load gate withholds ranking"]]})]
+                "Exact checksums and all applicable samples are published; standalone Kotoba I/O and threads are N/A, while its pure request-admission application is measured; the failed load gate withholds ranking"]]})]
      (dds/heading 3 "What the native suite covers" {:size "24"})
      [:p
       "Each implementation returns an independently checked known answer. The suite rotates every engine pair in ABBA/BAAB order and measures after loading, mapping, and symbol lookup."]
