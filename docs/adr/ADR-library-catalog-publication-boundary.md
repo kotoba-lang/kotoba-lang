@@ -63,12 +63,12 @@ peers; IPNI/DHT discovery is not treated as storage. `kotoba library run`
 requires the same verification before executing a hash-addressed Wasm export.
 
 This hosted slice returns an immediate publication receipt, not a distributed
-availability claim. Catalog ingestion, authenticated rotation/revocation
-endpoints and UI, independent recovery, public transparency, and storage-token
-replacement by a short-lived Passkey-scoped grant remain separate follow-ups
-and must not be claimed as live. The lifecycle state machine and bounded
-transition history are implemented and tested; that does not make those public
-operations available.
+availability claim. Authenticated rotation/revocation endpoints and their CLI
+approval UI are live: rotation requires byte-identical signatures from current
+and next ML-DSA keys plus Passkey; revocation requires the current key plus
+Passkey. Independent recovery, public transparency, catalog ingestion, and
+storage-token replacement by a short-lived Passkey-scoped grant remain
+separate follow-ups and must not be claimed as live.
 
 Library comparisons must name the exact CID/ref, workload, target, host,
 toolchain, samples, measurement time, result verification, receipt, and
