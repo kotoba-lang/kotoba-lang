@@ -147,6 +147,15 @@
     (is (str/includes? html ">kotoba id<"))
     (is (str/includes? html "input.addEventListener('input',apply)"))))
 
+(deftest generated-library-catalog-has-mutually-linked-english-and-japanese-pages
+  (let [english (slurp "site/dist/libraries/index.html")
+        japanese (slurp "site/dist/ja/libraries/index.html")]
+    (is (str/includes? english "href=\"../ja/libraries/\">日本語</a>"))
+    (is (str/includes? japanese "lang=\"ja\""))
+    (is (str/includes? japanese "名前はコードを見つける。Hash は、それが何かを示す。"))
+    (is (str/includes? japanese "href=\"../../libraries/\">English</a>"))
+    (is (str/includes? japanese "kotoba.cloud は hosted apply をまだ受け付けません"))))
+
 (deftest generated-site-uses-the-pinned-portable-highlight-library
   (let [manifest (read-edn (File. ".") "site/dependencies.edn")
         published (read-edn (File. ".") "site/dist/dependencies.edn")

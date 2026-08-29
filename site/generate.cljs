@@ -814,6 +814,7 @@
          "Kotoba CLI inspects and publishes the same CID graph it compiles. GitHub is provenance, a namespace is discovery, and immutable CIDs identify definitions, releases, builds, and artifacts."]
         [:div {:class "kot-actions"}
          (dds/button "Inspect with Kotoba CLI" {:href "#publish" :size "lg"})
+         (dds/button "日本語" {:href "../ja/libraries/" :type :outline :size "lg"})
          (dds/button "Machine-readable contract"
                      {:href "../.well-known/kotoba-libraries.json"
                       :type :outline :size "lg"})]]
@@ -887,6 +888,95 @@
                   "Unsupported or unmeasured cells stay explicit; they are not silently scored as zero."])))]
      (footer)]))
 
+(defn libraries-ja-view []
+  (let [surfaces (:kotoba.library-publication/surfaces library-publication)
+        status (:kotoba.library-publication/status library-publication)]
+    [:div
+     [:a {:class "kot-skip" :href "#main"} "本文へ移動"]
+     (header "../../")
+     [:main {:id "main"}
+      (dds/container
+       [:section {:id "top" :class "kot-hero"}
+        [:p {:class "kot-eyebrow"} "CONTENT-ADDRESSED LIBRARIES"]
+        (dds/heading 1 "名前はコードを見つける。Hash は、それが何かを示す。" {:size "48"})
+        [:p {:class "kot-lead"}
+         "Kotoba CLI は、compile するものと同じ CID graph を inspect・publish します。GitHub は provenance、namespace は discovery、不変 CID は definition・release・build・artifact の identity です。"]
+        [:div {:class "kot-actions"}
+         (dds/button "Kotoba CLI で確認" {:href "#publish" :size "lg"})
+         (dds/button "English" {:href "../../libraries/" :type :outline :size "lg"})
+         (dds/button "機械可読 contract"
+                     {:href "../../.well-known/kotoba-libraries.json"
+                      :type :outline :size "lg"})]]
+
+       (dds/section
+        {:id "identity" :title "1 つの library、複数の identity"}
+        (dds/grid
+         {:min "17rem"}
+         (card (dds/chip-label "DEFINITION CID")
+               (dds/heading 3 "意味、または checked KIR" {:size "20"})
+               [:p "名前・完全 CID・曖昧でない #hash 短縮形は、同じ definition を解決します。"])
+         (card (dds/chip-label "RELEASE CID")
+               (dds/heading 3 "署名された namespace head" {:size "20"})
+               [:p "release graph は exact definition CID を選び、直前の head を link して rollback を検出可能にします。"])
+         (card (dds/chip-label "SOURCE · BUILD · ARTIFACT")
+               (dds/heading 3 "provenance の層を混ぜない" {:size "20"})
+               [:p "source bytes、宣言された build inputs、生成物 bytes は別の identity です。いずれも execution authority ではありません。"])
+         (card (dds/chip-label "GITHUB")
+               (dds/heading 3 "provenance であって identity ではない" {:size "20"})
+               [:p "repository と commit は出所の review に使いますが、CID を置き換えず、namespace 更新権限も与えません。"])))
+
+       (dds/section
+        {:id "publish" :title "inspect、署名、publish、discover"}
+        [:pre {:class "kot-pre"}
+         [:code "kotoba library inspect quadruple \\\n+  --store .kotoba/codebase --namespace demo \\\n+  --github https://github.com/kotoba-lang/demo\n\n# 既定は dry-run\nkotoba library publish \\\n+  --store .kotoba/codebase --namespace demo\n\n# 明示的な network effect: signed head + IPNS\nkotoba library publish \\\n+  --store .kotoba/codebase --namespace demo --dry-run false"]]
+        (dds/grid
+         {:min "16rem"}
+         (card (dds/chip-label "1 · INSPECT")
+               (dds/heading 3 "exact graph を解決" {:size "20"})
+               [:p "release CID、definition CID、dependency CID、identity layer、任意の GitHub provenance を返します。"])
+         (card (dds/chip-label "2 · AUTHORIZE")
+               (dds/heading 3 "namespace head に署名" {:size "20"})
+               [:p "現在は local operator identity が署名します。正しい CID だけでは publish 権限を証明しません。"])
+         (card (dds/chip-label "3 · STORE + NAME")
+               (dds/heading 3 "codebase と IPNS を再利用" {:size "20"})
+               [:p "block は検証済み endpoint に保存し、IPNS が signed head を名指します。第 2 の package registry は作りません。"])
+         (card (dds/chip-label "4 · DISCOVER")
+               (dds/heading 3 "public catalog に投影" {:size "20"})
+               [:p "kotoba-lang.org は graph を説明し、kotoba.cloud は publication control を担い、kotobase.net は storage を担います。"])))
+
+       (dds/section
+        {:id "status" :title "現在の境界"}
+        (dds/grid
+         {:min "18rem"}
+         (card (dds/chip-label "LIVE")
+               (dds/heading 3 "local-signed IPNS publication" {:size "20"})
+               [:p "CLI の inspect と dry-run は content-addressed codebase 上で実装済みです。明示 apply は既存の signed-head / IPNS 経路を使います。"])
+         (card (dds/chip-label "NOT LIVE")
+               (dds/heading 3 "Passkey-hosted publish" {:size "20"})
+               [:p "kotoba.cloud は hosted apply をまだ受け付けません。Passkey authorization、namespace governance、abuse control、catalog ingestion は未 qualification です。"])
+         (card (dds/chip-label "STATUS")
+               (dds/heading 3 (str/replace (name status) #"-" " ") {:size "20"})
+               [:p "client が webpage の存在から hosted capability を推測しないよう、machine contract に evidence state を公開します。"])
+         (card (dds/chip-label "SOURCE")
+               (dds/heading 3 "実装を review" {:size "20"})
+               [:p (external-link "https://github.com/kotoba-lang/kotoba" "Kotoba CLI")]
+               [:p (external-link "https://github.com/kotoba-lang/kotoba-lang" "Language / catalog authority")]
+               [:p (external-link "https://github.com/kotoba-lang/codebase" "Content-addressed codebase")]))
+        (caption "Hosted Passkey publication: "
+                 (if (get-in surfaces [:hosted-passkey-publish :implemented])
+                   "implemented" "not implemented")
+                 "。content identity は execution authority ではありません。"))
+
+       (dds/section
+        {:id "compare" :title "境界を付けて library を比較する"}
+        [:p {:class "kot-lead"}
+         "比較には exact library CID、workload、target、host、toolchain、sample count、測定時刻、verified result、receipt、残る制約を含めます。"]
+        (bullets ["mutable な latest alias を、不変 release として比較しない。"
+                  "API coverage、target compatibility、compile performance、runtime performance、operational qualification を分ける。"
+                  "isolated kernel の速度を production 全体の性能 claim にしない。"
+                  "unsupported / unmeasured は明示し、0 点として隠さない。"])))]
+     (footer)]))
+
 (def html
   (page/->page
    {:title "Kotoba — security-first computing for AI agents and vibe coding"
@@ -916,6 +1006,15 @@
     :app-css (str tokens/skin-css "\n" app-css)}
    (libraries-view)))
 
+(def libraries-ja-html
+  (page/->page
+   {:title "Kotoba Libraries — content-addressed publication と比較"
+    :description "不変な definition CID と release CID を使って Kotoba library を inspect、publish、discover、compare し、GitHub provenance を identity と分けます。"
+    :lang "ja"
+    :css dds-css
+    :app-css (str tokens/skin-css "\n" app-css)}
+   (libraries-ja-view)))
+
 (let [out (path/join "site" "dist")]
   (fs/mkdirSync out #js {:recursive true})
   (fs/writeFileSync (path/join out "index.html") html)
@@ -923,6 +1022,8 @@
   (fs/writeFileSync (path/join out "blog" "index.html") blog-html)
   (fs/mkdirSync (path/join out "libraries") #js {:recursive true})
   (fs/writeFileSync (path/join out "libraries" "index.html") libraries-html)
+  (fs/mkdirSync (path/join out "ja" "libraries") #js {:recursive true})
+  (fs/writeFileSync (path/join out "ja" "libraries" "index.html") libraries-ja-html)
   (fs/copyFileSync logo-source-path (path/join out "kotoba-wordmark.png"))
   (fs/copyFileSync dependency-manifest-path (path/join out "dependencies.edn"))
   (doseq [[source target]
