@@ -80,9 +80,33 @@
 (def play-provenance (reader/read-string (fs/readFileSync play-provenance-path "utf8")))
 (def play-sha256 (get-in play-provenance [:outputs :primary :sha256]))
 (def dependencies (reader/read-string (fs/readFileSync dependency-manifest-path "utf8")))
+(def package-registry-bytes (fs/readFileSync package-registry-path))
 (def public-package-registry
-  (reader/read-string (fs/readFileSync package-registry-path "utf8")))
+  (reader/read-string (.toString package-registry-bytes "utf8")))
 (def reference-package (first (:records public-package-registry)))
+
+(defn- base32-lower [bytes]
+  (loop [xs (seq bytes) acc 0 bits 0 out ""]
+    (cond
+      (>= bits 5)
+      (let [remaining (- bits 5)
+            digit (bit-and 31 (unsigned-bit-shift-right acc remaining))
+            mask (if (zero? remaining) 0 (dec (bit-shift-left 1 remaining)))]
+        (recur xs (bit-and acc mask) remaining
+               (str out (.charAt "abcdefghijklmnopqrstuvwxyz234567" digit))))
+
+      xs
+      (recur (next xs) (bit-or (bit-shift-left acc 8) (first xs)) (+ bits 8) out)
+
+      (pos? bits)
+      (let [digit (bit-and 31 (bit-shift-left acc (- 5 bits)))]
+        (str out (.charAt "abcdefghijklmnopqrstuvwxyz234567" digit)))
+
+      :else out)))
+
+(def package-registry-cid
+  (let [digest (.digest (.update (crypto/createHash "sha256") package-registry-bytes))]
+    (str "b" (base32-lower (concat [1 85 18 32] digest)))))
 (def syntax-dependency
   (first (filter #(= :syntax-highlighting (:id %)) (:build-time dependencies))))
 
@@ -121,6 +145,9 @@
                (= 1 (count (:records public-package-registry)))
                (= "kotoba-lang/reference-math" (:registry/name reference-package))
                (string? (:registry/release-cid reference-package))
+               (= "ed25519+ml-dsa-65" (:registry/pqc-suite reference-package))
+               (string? (:registry/pqc-attestation-cid reference-package))
+               (str/starts-with? (:registry/pqc-key-id reference-package) "sha256:")
                (= 2 (count (:registry/providers reference-package))))
   (throw (js/Error.
           "public reference package registry is incomplete")))
@@ -855,7 +882,9 @@
        (dds/section
         {:id "publish" :title "Inspect, sign, publish, discover"}
         [:pre {:class "kot-pre"}
-         [:code "# install the live reference release; execution is then local and CID-locked\nkotoba package add kotoba-lang/reference-math@0.1.0\nkotoba package run kotoba-lang/reference-math  # 42"]]
+         [:code (str "# install the live dual-signed release; execution is then local and CID-locked\n"
+                     "kotoba package add kotoba-lang/reference-math@0.1.0 --catalog-cid " package-registry-cid "\n"
+                     "kotoba package run kotoba-lang/reference-math  # 42")]]
         [:pre {:class "kot-pre"}
          [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# dry-run is the default\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted\n\n# replicate the exact release closure to two storage origins\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted --dry-run false \\\n  --provider east=https://east.example --provider-token-file <east-token> \\\n  --provider west=https://west.example --provider-token-file <west-token>\n\n# verify every byte and two routed peer IDs, then run by release CID\nkotoba library verify ipfs://<release-cid> --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example\nkotoba library run ipfs://<release-cid> --entry answer \\\n  --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example"]]
         (dds/grid
@@ -950,7 +979,9 @@
        (dds/section
         {:id "publish" :title "inspect、署名、publish、discover"}
         [:pre {:class "kot-pre"}
-         [:code "# live の参照 release を導入。以後の実行は local の CID lock だけを使う\nkotoba package add kotoba-lang/reference-math@0.1.0\nkotoba package run kotoba-lang/reference-math  # 42"]]
+         [:code (str "# live の二重署名 release を導入。以後は local の CID lock を使う\n"
+                     "kotoba package add kotoba-lang/reference-math@0.1.0 --catalog-cid " package-registry-cid "\n"
+                     "kotoba package run kotoba-lang/reference-math  # 42")]]
         [:pre {:class "kot-pre"}
          [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# 既定は dry-run\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted\n\n# exact release closure を 2 storage origin へ複製\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted --dry-run false \\\n  --provider east=https://east.example --provider-token-file <east-token> \\\n  --provider west=https://west.example --provider-token-file <west-token>\n\n# 全 byte と 2 routed peer ID を検証し、release CID から実行\nkotoba library verify ipfs://<release-cid> --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example\nkotoba library run ipfs://<release-cid> --entry answer \\\n  --store .kotoba/codebase \\\n  --provider east=https://east.example --provider west=https://west.example"]]
         (dds/grid
@@ -1080,7 +1111,12 @@
                      (path/join wk "kotoba-package-registry.edn")))
   ;; Static raw-IPFS surface. The CLI re-hashes every response and compares
   ;; both origins; this directory is transport, not naming authority.
-  (fs/cpSync package-ipfs-path (path/join out "ipfs") #js {:recursive true})
+  (let [ipfs-out (path/join out "ipfs")]
+    ;; Keep the generated gateway projection exact. A recursive copy alone
+    ;; preserves blocks removed from the source and can keep an obsolete
+    ;; publication address reachable after a registry rotation.
+    (fs/rmSync ipfs-out #js {:recursive true :force true})
+    (fs/cpSync package-ipfs-path ipfs-out #js {:recursive true}))
   ;; Public machine contract for the external-trust discovery documents served
   ;; by Kotobase, Murakumo and Itonami. identity owns the schema and policy;
   ;; this authority site is only their deterministic HTTPS projection.
