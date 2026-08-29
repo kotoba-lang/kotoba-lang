@@ -14,7 +14,7 @@
     (is (= {:version 1
             :commands [:id :run :compile :check :graph :git :rad :deploy :library :hinshitsu]
             :command-count 10
-            :option-count 58}
+            :option-count 59}
            (:kotoba.cli/data result)))))
 
 (deftest cljc-authority-implements-contract-commands

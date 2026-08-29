@@ -31,10 +31,19 @@ definitions; a signed namespace-head CID identifies a selected release graph;
 SourceCID, BuildCID and ArtifactCID remain distinct when present. A valid CID
 does not grant publication, installation, capability use, or execution.
 
-Passkey-hosted publication remains false until the hosted control plane binds a
-verified Principal to namespace authorization, rate/quota policy, storage
-admission, durable receipt, revocation, and catalog ingestion. Public copy and
-machine profiles must retain that negative claim.
+Passkey-hosted publication is available as a two-authority relay. The CLI signs
+the namespace head locally, uploads the complete immutable closure to
+Kotobase's digest-verifying ingress, and places only a bounded signed request in
+the approval URL fragment. After an explicit click, kotoba.cloud verifies the
+Passkey session and relays the signed mutable record. Kotobase independently
+checks that the key named by the `k51...` name signed the record and enforces
+monotonic sequence CAS. The private signing seed, storage token, and Passkey
+cookie never cross those boundaries.
+
+This first hosted slice returns an immediate publication receipt. Catalog
+ingestion, revocation UI, publication history, and storage-token replacement by
+a short-lived Passkey-scoped grant remain separate follow-ups and must not be
+claimed as live.
 
 Library comparisons must name the exact CID/ref, workload, target, host,
 toolchain, samples, measurement time, result verification, receipt, and
