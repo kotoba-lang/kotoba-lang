@@ -66,6 +66,9 @@
 (def runtime-benchmark-source-path
   (path/join "bench" "public-runtime-comparison" "latest.json"))
 
+(def end-to-end-benchmark-source-path
+  (path/join "bench" "public-end-to-end-comparison" "latest.json"))
+
 (def play-source-path (path/join "site" "assets" "play" "double-21.kotoba"))
 (def play-wasm-path (path/join "site" "assets" "play" "double-21.wasm"))
 (def play-provenance-path
@@ -77,6 +80,10 @@
 
 (def runtime-benchmark
   (js->clj (js/JSON.parse (fs/readFileSync runtime-benchmark-source-path "utf8"))
+           :keywordize-keys true))
+
+(def end-to-end-benchmark
+  (js->clj (js/JSON.parse (fs/readFileSync end-to-end-benchmark-source-path "utf8"))
            :keywordize-keys true))
 
 (def play-source (fs/readFileSync play-source-path "utf8"))
@@ -579,11 +586,18 @@
         coverage (:semanticCoverage runtime-benchmark)
         speed (:speedQualification runtime-benchmark)
         runtime-date (subs (:generatedAt runtime-benchmark) 0 10)
-        comparator-labels (str/join ", " (map :label comparators))]
+        comparator-labels (str/join ", " (map :label comparators))
+        end-speed (:speedQualification end-to-end-benchmark)
+        end-results (map #(get-in end-to-end-benchmark [:results (keyword %)])
+                         (get-in end-to-end-benchmark [:coverage :measuredToolchains]))
+        stage-ms (fn [stage]
+                   (if (= "measured" (:status stage))
+                     (str (:medianMilliseconds stage) " ms")
+                     "N/A"))]
     (dds/section
-     {:id "benchmark" :title "Two benchmarks. Two different questions."}
+     {:id "benchmark" :title "Three benchmarks. Three different questions."}
      [:p {:class "kot-lead"}
-      "Compile time asks how quickly a tiny program becomes executable. Runtime asks how fast already-built native code runs. The results below keep those questions—and their evidence status—separate."]
+      "Compiler startup asks how quickly one tiny source becomes an artifact. The developer loop separates resolution, checking, builds, and first result. Runtime asks how fast already-built native code runs. The results below keep all three questions—and their evidence status—separate."]
      (dds/grid
       {:min "16rem"}
       (card (dds/chip-label "BUILD STARTUP · RANK UNQUALIFIED" {:color "gray"})
@@ -610,7 +624,15 @@
             [:p "The comparison ran, but the host never became quiet enough to support a speed ranking."]
             (caption (str "load1 " (.toFixed (:observedLoad1First speed) 2) " → "
                           (.toFixed (:observedLoad1Last speed) 3) " · required ≤ "
-                          (.toFixed (:quietLoad1Limit speed) 1) " · " runtime-date))))
+                          (.toFixed (:quietLoad1Limit speed) 1) " · " runtime-date)))
+      (card (dds/chip-label "DEVELOPER LOOP · RANK UNQUALIFIED" {:color "gray"})
+            (dds/heading 3 (str (count end-results) " toolchain paths") {:size "24"})
+            [:p "Dependency resolution, checking, clean and no-change builds, and process-cold first result are recorded separately."]
+            (caption (str (get-in end-to-end-benchmark [:method :runs])
+                          " samples per measured stage · load1 "
+                          (:observedLoad1First end-speed) " → "
+                          (:observedLoad1Last end-speed) " · required ≤ "
+                          (:quietLoad1Limit end-speed)))))
      [:div {:class "kot-table-scroll"}
       (dds/table
        {:caption "Tiny source-to-artifact process-cold build measurement"
@@ -631,12 +653,30 @@
            "The recorded host-load gate failed, so the table is not a qualified speed rank."))
      [:div {:class "kot-table-scroll"}
       (dds/table
+       {:caption "Dependency-free tiny-project developer-loop medians; N/A means no separate phase was measured"
+        :headers ["Toolchain / target" "Resolve" "Check" "Clean build" "No-change build" "Start + execute" "Clean build + first result"]
+        :row-header? true
+        :rows (for [result end-results]
+                [(str (:label result) " · " (:target result))
+                 (stage-ms (get-in result [:stages :dependencyResolution]))
+                 (stage-ms (get-in result [:stages :checkOrAdmission]))
+                 (stage-ms (get-in result [:stages :cleanBuild]))
+                 (stage-ms (get-in result [:stages :noChangeBuild]))
+                 (stage-ms (get-in result [:stages :processColdStartupAndExecution]))
+                 (stage-ms (get-in result [:loops :cleanBuildAndFirstRun]))])})]
+     (caption
+      "Every emitted artifact produced 42 in a fresh process. Targets and runtime contracts differ; N/A is never zero. The host-load gate failed, so these are reproducible observations rather than a cross-language speed ranking.")
+     [:div {:class "kot-table-scroll"}
+      (dds/table
        {:caption "What each public benchmark does—and does not—establish"
         :headers ["Question" "Compared implementations" "Current conclusion"]
         :row-header? true
         :rows [["Tiny Wasm compile + execute"
                 "Kotoba, Rust, C, and JVM toolchains"
                 (str "Four process-cold medians published above; only Kotoba/Rust/C share the Wasm target, and no general build-speed rank is claimed")]
+               ["Tiny-project developer loop"
+                "Kotoba, Rust, C, Zig, TinyGo, Go, Swift, JVM, AssemblyScript, .NET IL, and .NET Native AOT"
+                "Seven samples per available stage are published; target differences and a failed host-load gate prohibit a universal ranking"]
                ["Native steady-state execution"
                 (str "Amu native vs " comparator-labels)
                 "All 30 semantic comparison cells are complete; speed ranking withheld because the quiet-host gate failed"]]})]
@@ -654,12 +694,15 @@
                                 "Incomplete")])})]
      [:p
       [:strong "Bottom line: "]
-      "The build and runtime artifacts, exact results, and samples are real. Neither run qualifies a speed ranking because its quiet-host gate failed. A quiet-host rerun must pass the relevant gate before any fastest claim becomes valid."]
+      "The compiler-startup, developer-loop, and runtime artifacts, exact results, and samples are real. None of the current runs qualifies a speed ranking because its quiet-host gate failed. A quiet-host rerun must pass the relevant gate before any fastest claim becomes valid."]
      [:div {:class "kot-actions"}
       (dds/button "Inspect compile samples"
                   {:href "./benchmarks/compile-wasm-latest.json"})
       (dds/button "Inspect runtime evidence"
                   {:href "./benchmarks/runtime-native-latest.json"
+                   :type :outline})
+      (dds/button "Inspect developer-loop samples"
+                  {:href "./benchmarks/end-to-end-latest.json"
                    :type :outline})
       (dds/button "Review the runtime method"
                   {:href (get-in runtime-benchmark [:sources :method])
@@ -858,10 +901,10 @@
       [:p {:class "kot-lead"}
        "Short notes about language design, measurements, shipped boundaries, and what still remains unqualified."]]
      [:article {:class "kot-blog-entry"}
-      [:p {:class "kot-eyebrow"} "28 August 2026 · Benchmarks"]
-      (dds/heading 2 "Two benchmarks answer two different questions" {:size "32"})
-      [:p "Compile time measures a tiny source-to-executable path. Native runtime measures already-built programs. Kotoba publishes them separately so a fast compile cannot be mistaken for a fast runtime—or the reverse."]
-      [:p "The native comparison currently covers every required implementation/workload pair and verifies exact results, but its speed ranking remains withheld because the recorded host-load gate failed."]
+      [:p {:class "kot-eyebrow"} "29 August 2026 · Benchmarks"]
+      (dds/heading 2 "Three benchmarks answer three different questions" {:size "32"})
+      [:p "Compiler startup measures one tiny source-to-artifact path. The developer-loop suite separates resolution, checking, clean and no-change builds, and first result across eleven toolchain paths. Native runtime measures already-built programs. Kotoba publishes them separately so one fast phase cannot be mistaken for universal speed."]
+      [:p "Every emitted result is checked, but all speed rankings remain withheld because the recorded host-load gates failed."]
       [:p [:a {:class "kot-link" :href "../#benchmark"} "Read the benchmark and inspect its evidence"]]]
      [:article {:class "kot-blog-entry"}
       [:p {:class "kot-eyebrow"} "28 August 2026 · Language design"]
@@ -1121,6 +1164,7 @@
   (doseq [[source target]
           [[benchmark-source-path (path/join out "benchmarks" "compile-wasm-latest.json")]
            [runtime-benchmark-source-path (path/join out "benchmarks" "runtime-native-latest.json")]
+           [end-to-end-benchmark-source-path (path/join out "benchmarks" "end-to-end-latest.json")]
            [(path/join "site" "assets" "llms.txt") (path/join out "llms.txt")]
            [(path/join "site" "assets" "llms-full.txt") (path/join out "llms-full.txt")]
            [(path/join "site" "assets" "agent-quickstart.md") (path/join out "agent-quickstart.md")]]]
