@@ -39,7 +39,7 @@
                 policy (version/default-compatibility-request policy))]
     (is (= 6 (:language-profile ids)))
     (is (= 1 (:package-contract ids)))
-    (is (= "0.7.0" (:release-version ids)))
+    (is (= "0.7.3" (:release-version ids)))
     (is (:compatible? report))
     (is (:valid? (version/validate-policy policy)))))
 
@@ -50,7 +50,7 @@
                      :issued-at-ms 1 :signer "did:key:test"
                      :artifact-digests {:darwin-arm64 "sha256:a"}
                      :conformance-result {:status :passed}})]
-    (is (= "v0.7.0" (:tag env)))
+    (is (= "v0.7.3" (:tag env)))
     (is (= 6 (:language-profile env)))
     (is (= #{:version :commit :tree :source-root :issued-at-ms
              :language-profile :package-contract :artifact-digests
