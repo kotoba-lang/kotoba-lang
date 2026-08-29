@@ -839,7 +839,7 @@
        (dds/section
         {:id "publish" :title "Inspect, sign, publish, discover"}
         [:pre {:class "kot-pre"}
-         [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# dry-run is the default\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo\n\n# explicit network effect: signed head + IPNS\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --dry-run false"]]
+         [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# dry-run is the default\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted\n\n# store verified blocks, then open the returned Passkey approval URL\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted \\\n  --dry-run false --write-token-file <path>"]]
         (dds/grid
          {:min "16rem"}
          (card (dds/chip-label "1 · INSPECT")
@@ -847,10 +847,10 @@
                [:p "Return the release CID, definition CIDs, dependency CIDs, identity layer, and optional GitHub provenance."])
          (card (dds/chip-label "2 · AUTHORIZE")
                (dds/heading 3 "Sign the namespace head" {:size "20"})
-               [:p "The existing local operator identity signs publication. A valid CID alone never proves who may publish it."])
+               [:p "The local operator key signs publication. Passkey later approves relay of that same signed value; neither gate replaces the other."])
          (card (dds/chip-label "3 · STORE + NAME")
-               (dds/heading 3 "Reuse codebase and IPNS" {:size "20"})
-               [:p "Missing blocks go to a verified endpoint when configured; IPNS names the signed head. No second package registry is invented."])
+               (dds/heading 3 "Store, then approve the signed head" {:size "20"})
+               [:p "Kotobase verifies every block digest. kotoba.cloud verifies the Passkey session, then Kotobase verifies the k51 signer and sequence."])
          (card (dds/chip-label "4 · DISCOVER")
                (dds/heading 3 "Project into the public catalog" {:size "20"})
                [:p "kotoba-lang.org explains the graph. kotoba.cloud owns publication control and deploy readiness without becoming storage."])))
@@ -862,9 +862,9 @@
          (card (dds/chip-label "LIVE")
                (dds/heading 3 "Local-signed IPNS publication" {:size "20"})
                [:p "The CLI inspect and dry-run path is implemented over the existing content-addressed codebase. Explicit apply reuses signed-head and IPNS publication."])
-         (card (dds/chip-label "NOT LIVE")
+         (card (dds/chip-label "LIVE")
                (dds/heading 3 "Passkey-hosted publish" {:size "20"})
-               [:p "kotoba.cloud does not yet accept a hosted library apply. Passkey authorization, namespace governance, abuse controls, and catalog ingestion remain separate qualification work."])
+               [:p "The CLI stores the immutable closure and returns a fragment-only approval URL. kotoba.cloud binds explicit approval to Stable Principal and active DID without receiving the signing seed or storage token."])
          (card (dds/chip-label "STATUS")
                (dds/heading 3 (str/replace (name status) #"-" " ") {:size "20"})
                [:p "The machine contract exposes this evidence state so clients do not infer hosted capability from a public webpage."])
@@ -928,7 +928,7 @@
        (dds/section
         {:id "publish" :title "inspect、署名、publish、discover"}
         [:pre {:class "kot-pre"}
-         [:code "kotoba library inspect quadruple \\\n+  --store .kotoba/codebase --namespace demo \\\n+  --github https://github.com/kotoba-lang/demo\n\n# 既定は dry-run\nkotoba library publish \\\n+  --store .kotoba/codebase --namespace demo\n\n# 明示的な network effect: signed head + IPNS\nkotoba library publish \\\n+  --store .kotoba/codebase --namespace demo --dry-run false"]]
+         [:code "kotoba library inspect quadruple \\\n  --store .kotoba/codebase --namespace demo \\\n  --github https://github.com/kotoba-lang/demo\n\n# 既定は dry-run\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted\n\n# verified block 保存後、返された Passkey 承認 URL を開く\nkotoba library publish \\\n  --store .kotoba/codebase --namespace demo --hosted \\\n  --dry-run false --write-token-file <path>"]]
         (dds/grid
          {:min "16rem"}
          (card (dds/chip-label "1 · INSPECT")
@@ -936,10 +936,10 @@
                [:p "release CID、definition CID、dependency CID、identity layer、任意の GitHub provenance を返します。"])
          (card (dds/chip-label "2 · AUTHORIZE")
                (dds/heading 3 "namespace head に署名" {:size "20"})
-               [:p "現在は local operator identity が署名します。正しい CID だけでは publish 権限を証明しません。"])
+               [:p "local operator key が署名し、Passkey は同じ署名値の relay を承認します。どちらの gate も他方を置き換えません。"])
          (card (dds/chip-label "3 · STORE + NAME")
-               (dds/heading 3 "codebase と IPNS を再利用" {:size "20"})
-               [:p "block は検証済み endpoint に保存し、IPNS が signed head を名指します。第 2 の package registry は作りません。"])
+               (dds/heading 3 "保存してから signed head を承認" {:size "20"})
+               [:p "Kotobase が各 block digest を検査し、kotoba.cloud が Passkey session を確認し、Kotobase が k51 signer と sequence を再検証します。"])
          (card (dds/chip-label "4 · DISCOVER")
                (dds/heading 3 "public catalog に投影" {:size "20"})
                [:p "kotoba-lang.org は graph を説明し、kotoba.cloud は publication control を担い、kotobase.net は storage を担います。"])))
@@ -951,9 +951,9 @@
          (card (dds/chip-label "LIVE")
                (dds/heading 3 "local-signed IPNS publication" {:size "20"})
                [:p "CLI の inspect と dry-run は content-addressed codebase 上で実装済みです。明示 apply は既存の signed-head / IPNS 経路を使います。"])
-         (card (dds/chip-label "NOT LIVE")
+         (card (dds/chip-label "LIVE")
                (dds/heading 3 "Passkey-hosted publish" {:size "20"})
-               [:p "kotoba.cloud は hosted apply をまだ受け付けません。Passkey authorization、namespace governance、abuse control、catalog ingestion は未 qualification です。"])
+               [:p "CLI は immutable closure を保存して fragment-only の承認 URL を返します。kotoba.cloud は signing seed と storage token を受け取らず、明示承認を Stable Principal / active DID に結びます。"])
          (card (dds/chip-label "STATUS")
                (dds/heading 3 (str/replace (name status) #"-" " ") {:size "20"})
                [:p "client が webpage の存在から hosted capability を推測しないよう、machine contract に evidence state を公開します。"])
