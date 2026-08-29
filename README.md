@@ -31,7 +31,11 @@ comparisons are language/ecosystem facts. Publication starts in Kotoba CLI.
 definition CIDs; `kotoba library publish` plans by default and explicitly
 reuses the existing locally signed namespace-head/IPNS path when applied.
 Kotoba Cloud remains the publication-control entrance, Kotobase remains block
-and receipt storage, and Passkey-hosted publication is not yet live.
+and receipt storage. Hosted publication requires both a live Passkey session
+and an ML-DSA-65 signature over the exact request; the ML-DSA key is pinned to
+the Stable Principal on first valid use. This is an application-layer
+post-quantum co-approval, not a claim that the authenticator's WebAuthn
+credential itself is post-quantum.
 
 ```sh
 brew tap kotoba-lang/kotoba
