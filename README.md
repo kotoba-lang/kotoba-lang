@@ -138,10 +138,13 @@ defaults, bounded-ready paths, partial implementations, and directions:
 - **Arrow-shaped data; explicit CPU SIMD and device-native GPU kernels.** On
   Apple M4, a bounded float32 path executes an explicit Wasm `v128`/`f32x4`
   kernel over Arrow values in the same linear-memory backing, with zero
-  Arrow-to-SIMD copies and a scalar tail. The GPU path retains one
-  `ArrayBuffer`, then performs one measured WebGPU upload to Num on Metal.
-  Nullable data, other dtypes, broader kernels, unified-memory upload removal,
-  and other hosts remain separately qualified.
+  Arrow-to-SIMD copies and a scalar tail. Across three qualified runs of the
+  same 262,147-element scale workload and artifact, it completed 3.66–3.72×
+  faster than scalar Wasm. This is a kernel-and-host result, not a general
+  runtime claim. The GPU path retains one `ArrayBuffer`, then performs one
+  measured WebGPU upload to Num on Metal. Nullable data, other dtypes, broader
+  kernels, unified-memory upload removal, and other hosts remain separately
+  qualified.
 - **AI first; AGI-ready boundaries, not an AGI claim.** Stronger models still
   operate inside explicit effects, finite resources, receipts, and host checks.
 
