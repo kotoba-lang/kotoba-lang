@@ -123,6 +123,16 @@ effects, enforces optional `{:effects #{...}}` ceilings, and attaches
 Exit gate: adding a capability requires one semantic declaration and fails CI
 unless all target mappings and positive/denial fixtures are present.
 
+**W2 logic-authority slice (2026-08-30):** capability semantics v2 separates
+effect, intent, grant, concrete capability, and receipt. Amu emits a
+content-bound `:kotoba.logic-manifest/v1` and bounded `amu:` facts from checked
+KIR. `org-biscuitsec` joins those facts with one VM intent, an attenuated
+Biscuit `grant:`, host-owned `policy:`, and current `runtime:` availability.
+Token facts are excluded from trusted policy saturation, so a bearer cannot
+impersonate compiler, policy, or runtime provenance. The older three-term guard
+fails closed when handed semantics v2. IPLD carries identities and evidence;
+CARv2 remains indexed transport and never contains a public raw bearer token.
+
 ### W3 — Semantic identity after elaboration
 
 - Converge `kotoba.semantic-code` and compiler definition identity on canonical

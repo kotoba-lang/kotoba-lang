@@ -62,6 +62,15 @@
              (set/difference contract-kinds source-kinds)))
     (is (= :forbidden
            (get-in semantics [:rules :production-effective-wildcard])))
+    (is (= :statically-possible-intersect-requested-intersect-delegated-intersect-local-policy-intersect-runtime-available
+           (get-in semantics [:rules :effective-scope])))
+    (is (= :delegated-grant-only
+           (get-in semantics [:rules :biscuit-role])))
+    (is (true? (get-in semantics [:rules :only-local-authorizer-may-allow])))
+    (is (= :forbidden (get-in semantics [:rules :raw-bearer-in-public-car])))
+    (is (= :bounded-nary-tuples (get-in semantics [:logic :wire-facts])))
+    (is (= :verified-compiler-manifest
+           (get-in semantics [:logic :predicate-origins "amu:"])))
     (is (true? (get-in semantics [:revocation :fail-closed])))))
 
 (deftest q2-production-policy-cannot-yield-wildcard-authority

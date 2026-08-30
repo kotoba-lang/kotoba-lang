@@ -46,7 +46,9 @@ persistent pair-chain representations with linear bounded operations.
 Effects are inferred and checked against declared capabilities. A resource
 name is not authority. The host must receive a scoped capability value, narrow
 it through grant and policy intersection, and leave an auditable receipt. See
-[capability values](../lang/capability-values.md).
+[capability values](../lang/capability-values.md). The complete compiler,
+Biscuit, VM, IPLD, and runtime trust split is specified by
+[effect, delegation, and runtime authority](../lang/logic-authority.md).
 
 ## Dataspace coordination
 
