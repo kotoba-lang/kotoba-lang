@@ -135,11 +135,13 @@ defaults, bounded-ready paths, partial implementations, and directions:
   Borrowed Arrow buffers now retain CPU backing through the authorized
   Kotobase lake path. Network ingress, decompression, GPU upload, and immutable
   persistent updates remain explicit copy boundaries.
-- **Arrow-shaped CPU data; device-native GPU kernels.** A bounded float32 path
-  retains one `ArrayBuffer` through Arrow and its CPU typed view, then performs
-  one measured WebGPU upload to Num on Apple M4/Metal. Nullable data, other
-  dtypes, SIMD codegen, unified-memory upload removal, and other accelerators
-  remain separately qualified.
+- **Arrow-shaped data; explicit CPU SIMD and device-native GPU kernels.** On
+  Apple M4, a bounded float32 path executes an explicit Wasm `v128`/`f32x4`
+  kernel over Arrow values in the same linear-memory backing, with zero
+  Arrow-to-SIMD copies and a scalar tail. The GPU path retains one
+  `ArrayBuffer`, then performs one measured WebGPU upload to Num on Metal.
+  Nullable data, other dtypes, broader kernels, unified-memory upload removal,
+  and other hosts remain separately qualified.
 - **AI first; AGI-ready boundaries, not an AGI claim.** Stronger models still
   operate inside explicit effects, finite resources, receipts, and host checks.
 
