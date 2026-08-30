@@ -110,6 +110,34 @@ at the boundary.
 **A language AI agents can use, not abuse.** This is an engineering direction,
 not a claim that software can never be exploited.
 
+## Product defaults and engineering directions
+
+The machine-readable authority is
+[`lang/product-defaults.edn`](lang/product-defaults.edn). It separates active
+defaults, bounded-ready paths, partial implementations, and directions:
+
+- **Build faster. Run faster. Keep the boundary.** Four benchmark families
+  publish exact-result evidence; universal speed ranks remain withheld until
+  their qualification gates pass.
+- **Storage without a language ceiling.** Kotobase supplies content identity,
+  range reads, immutable history, and provider-neutral storage. Physical
+  capacity, tenancy, retention, replication, cost, and budgets stay explicit.
+- **Post-quantum cryptography by default.** New cryptographic boundaries reject
+  classical-only downgrade; Passkeys, transport, implementations, and custody
+  remain separately qualified.
+- **Authentication present; authority denied by default.** Identity never
+  silently grants a host effect.
+- **Flexible delegation that can only narrow.** Requested, delegated, local,
+  resource, and target scopes intersect.
+- **Web3 ready, chain-neutral at the root.** Wallets are linked accounts, not
+  the principal or an ambient execution grant.
+- **Zero-copy where ownership permits; one copy where a boundary requires it.**
+  Borrowed Arrow buffers now retain CPU backing through the authorized
+  Kotobase lake path. Network ingress, decompression, GPU upload, and immutable
+  persistent updates remain explicit copy boundaries.
+- **AI first; AGI-ready boundaries, not an AGI claim.** Stronger models still
+  operate inside explicit effects, finite resources, receipts, and host checks.
+
 ## Hello, world
 
 Create `hello.kotoba`:
