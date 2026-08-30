@@ -25,10 +25,11 @@
       (is (seq (:requires rule))))))
 
 (deftest migration-unit-is-a-whole-component-built-by-both-public-paths
-  (is (= 2 (:kotoba.lang.q9/version q9)))
+  (is (= 3 (:kotoba.lang.q9/version q9)))
   (is (= :whole-component (get-in q9 [:scope :migration-unit])))
   (is (true? (get-in q9 [:scope :decision-only-extraction-forbidden])))
   (is (true? (get-in q9 [:scope :whole-component-build-required])))
+  (is (true? (get-in q9 [:scope :jvm-dependency-forbidden])))
   (doseq [disposition migration/compiled-dispositions]
     (testing (name disposition)
       (let [required (set (get-in q9 [:dispositions disposition :requires]))]
@@ -39,8 +40,23 @@
   (is (= "kotoba rad build --project <repository> --profile release"
          (get-in q9 [:whole-component-build-contract
                      :public-cli :package-build])))
-  (is (= "amu compile <entry.kotoba|entry.cljk> --target <target> --output <artifact>"
+  (is (= :verified-native-executable
+         (get-in q9 [:whole-component-build-contract
+                     :public-cli :distribution])))
+  (is (= "amu compile <entry.kotoba|entry.cljk> --target <target> --jvm-free --output <artifact>"
          (get-in q9 [:whole-component-build-contract :amu :compile])))
+  (is (= :fail-closed
+         (get-in q9 [:whole-component-build-contract :amu :jvm-fallback])))
+  (is (false? (get-in q9 [:whole-component-build-contract
+                           :oracle-parity :jvm-required])))
+  (is (= #{"java" "javac" "clojure" "clj"}
+         (set (get-in q9 [:whole-component-build-contract
+                          :acceptance-environment :forbidden-processes]))))
+  (is (= :babashka-native
+         (get-in q9 [:whole-component-build-contract
+                     :policy-gate :runtime])))
+  (is (false? (get-in q9 [:whole-component-build-contract
+                           :policy-gate :jvm-required])))
   (is (some #{:decision-core-only-shadow}
             (get-in q9 [:whole-component-build-contract :forbidden])))
   (is (false? (get-in q9 [:component-migration-model
@@ -57,7 +73,14 @@
         errors (migration/validation-errors weakened)]
     (is (some #(and (= :q9/missing-whole-component-build-gate (:code %))
                     (= :clj-kotoba (:disposition %)))
-              errors))))
+              errors)))
+  (let [weakened (-> q9
+                     (assoc-in [:scope :jvm-dependency-forbidden] false)
+                     (assoc-in [:whole-component-build-contract
+                                :amu :jvm-fallback] :allowed))
+        codes (set (map :code (migration/validation-errors weakened)))]
+    (is (contains? codes :q9/decision-slice-migration-enabled))
+    (is (contains? codes :q9/build-contract-weakened))))
 
 (deftest actual-ci-and-soak-evidence-is-fail-closed
   (is (false? (get-in q9 [:soak-evidence :local-preflight-is-ci-evidence])))

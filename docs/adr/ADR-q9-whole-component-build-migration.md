@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-08-30
 - Supersedes: Q9 decision-core and function-shadow extraction as a migration unit
-- Machine authority: `lang/q9-migration.edn` version 2
+- Machine authority: `lang/q9-migration.edn` version 3
 
 ## Context
 
@@ -67,8 +67,8 @@ kotoba rad build --project <repository> --profile release
 Amu directly:
 
 ```sh
-amu check <entry.kotoba|entry.cljk>
-amu compile <entry.kotoba|entry.cljk> --target <target> --output <artifact>
+amu check <entry.kotoba|entry.cljk> --jvm-free
+amu compile <entry.kotoba|entry.cljk> --target <target> --jvm-free --output <artifact>
 ```
 
 “Kotoba CLI build” means the public `kotoba compile` source path plus
@@ -79,7 +79,28 @@ For the same target and locked inputs, both routes must bind the same payload
 CID, definition CIDs, exports, imports, inferred effects and resource bounds.
 CLI wrapper provenance may differ; executable meaning may not.
 
-### 4. Verification covers the complete public surface
+### 4. Migration acceptance has no JVM dependency
+
+The `kotoba` command is the verified native distribution, not a Java, Clojure
+CLI or development launcher. Amu runs its nbb/Node compiler entry with
+`--jvm-free`. That switch makes missing dependency locks, unsupported targets
+and unsupported project/linker operations fail closed; it never falls back to
+the Clojure/JVM compatibility path.
+
+Acceptance runs with `JAVA_HOME` unset or invalid and with `java`, `javac`,
+`clojure` and `clj` denied and traced. A target without both JVM-free paths is
+blocked; installing a JDK is not a remedy and cannot turn the gate green.
+
+The retained `.cljc` oracle runs through CLJS/nbb when portable. Otherwise its
+observations are sealed as content-addressed golden vectors and checked from
+native, Wasm or nbb. A new JVM oracle run is historical/diagnostic evidence,
+not a migration dependency.
+
+The canonical fleet/policy gate runs as
+`bb scripts/check-q9-migration.bb`; Babashka is a native executable and the
+gate does not require a JVM.
+
+### 5. Verification covers the complete public surface
 
 The retained Clojure source is a rollback oracle for the whole component.
 Parity covers every public export and externally visible refusal, effect,
@@ -91,7 +112,7 @@ shadow or canary path before soak begins. Source deletion remains forbidden
 until the existing receipt/time soak completes and a separate decision
 authorizes oracle retirement.
 
-### 5. Earlier decision cores are historical evidence only
+### 6. Earlier decision cores are historical evidence only
 
 Existing decision-core pilots remain useful compiler conformance fixtures.
 They may not gain new production consumers or expand as the Q9 pattern. Each
@@ -106,6 +127,8 @@ must be absorbed into a complete component build before consumer cutover.
   oracle plus Kotoba shadow.
 - Build success is stronger: it proves the public CLI, Amu, component closure
   and manifest agree.
+- Migration builders and acceptance tests require no JDK, Java process or
+  Clojure CLI installation.
 - A repository may remain unmigrated longer; it may not claim progress by
   counting extracted predicates.
 
@@ -116,9 +139,9 @@ Each repository records:
 1. the complete source/API baseline;
 2. the target component entry and transitive source closure;
 3. declared imports, exports, effects and resource bounds;
-4. Kotoba CLI and Amu commands for every target;
+4. JVM-free Kotoba CLI and Amu commands for every target;
 5. artifact/manifest equivalence evidence;
-6. whole-surface oracle parity;
+6. a no-JVM process trace and whole-surface portable/golden oracle parity;
 7. consumer shadow/canary selection;
 8. rollback, soak and residual risk.
 

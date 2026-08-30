@@ -170,21 +170,41 @@
   (let [build-contract (:whole-component-build-contract contract)
         compiled-dispositions #{:kotoba-only :clj-kotoba :common :split}
         required-builds #{:kotoba-cli-build :amu-compile}]
-    (when-not (and (= 2 (:kotoba.lang.q9/version contract))
+    (when-not (and (= 3 (:kotoba.lang.q9/version contract))
                    (= :whole-component (get-in contract [:scope :migration-unit]))
                    (true? (get-in contract
                                   [:scope :decision-only-extraction-forbidden]))
                    (true? (get-in contract
                                   [:scope :whole-component-build-required]))
+                   (true? (get-in contract
+                                  [:scope :jvm-dependency-forbidden]))
                    (= "kotoba compile <entry.kotoba|entry.cljk> --target <target> --output <artifact>"
                       (get-in build-contract [:public-cli :source-build]))
                    (= "kotoba rad build --project <repository> --profile release"
                       (get-in build-contract [:public-cli :package-build]))
-                   (= "amu compile <entry.kotoba|entry.cljk> --target <target> --output <artifact>"
+                   (= :verified-native-executable
+                      (get-in build-contract [:public-cli :distribution]))
+                   (true? (get-in build-contract
+                                  [:public-cli :jvm-launcher-forbidden]))
+                   (= "amu check <entry.kotoba|entry.cljk> --jvm-free"
+                      (get-in build-contract [:amu :source-check]))
+                   (= "amu compile <entry.kotoba|entry.cljk> --target <target> --jvm-free --output <artifact>"
                       (get-in build-contract [:amu :compile]))
+                   (= :fail-closed (get-in build-contract [:amu :jvm-fallback]))
+                   (= :migration-blocked
+                      (get-in build-contract [:amu :unsupported-target]))
+                   (false? (get-in build-contract [:oracle-parity :jvm-required]))
+                   (= #{"java" "javac" "clojure" "clj"}
+                      (set (get-in build-contract
+                                   [:acceptance-environment :forbidden-processes])))
+                   (= :babashka-native
+                      (get-in build-contract [:policy-gate :runtime]))
+                   (false? (get-in build-contract [:policy-gate :jvm-required]))
                    (true? (get-in build-contract
                                   [:public-cli :internal-namespace-entry-forbidden]))
                    (some #{:decision-core-only-shadow} (:forbidden build-contract))
+                   (some #{:jvm-build-or-test-dependency} (:forbidden build-contract))
+                   (some #{:implicit-jvm-fallback} (:forbidden build-contract))
                    (every? (fn [disposition]
                              (set/subset?
                               required-builds

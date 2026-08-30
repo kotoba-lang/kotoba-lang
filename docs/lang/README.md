@@ -30,7 +30,8 @@ Kotoba-specific behavior is selected with reader conditionals:
 **Product split.** **kotoba** is the *language*: it compiles safe Kotoba source
 ahead of time to a Wasm artifact. **kototama** is the *runtime* that admits and
 runs that artifact. Compiling is not executing, and neither of them is JVM
-Clojure execution — the JVM is only the bootstrap host for today's language CLI.
+Clojure execution. The distributed Kotoba CLI is a native executable; the JVM
+launcher is a development/compatibility path and is not admitted by Q9.
 
 Start with the smallest compile-and-run path:
 
@@ -82,6 +83,8 @@ the public `kotoba check` / `kotoba compile` path, the package-level
 `kotoba rad build` path, and direct `amu check` / `amu compile` for every
 declared target. The rule and rollback boundary are defined in
 [`ADR-q9-whole-component-build-migration.md`](../adr/ADR-q9-whole-component-build-migration.md).
+These gates are JVM-free: `kotoba` is the verified native executable and Amu
+runs with `--jvm-free`, which rejects rather than falls back to `clojure`.
 
 Inline expressions are also part of the compiler conformance vocabulary:
 `kotoba run -e '(+ 1 2)'` wraps the expression as an exported `main`, compiles

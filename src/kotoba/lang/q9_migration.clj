@@ -29,7 +29,8 @@
         [{:code :q9/wave-inventory-drift}])
       (when-not (and (= :whole-component (:migration-unit scope))
                      (true? (:decision-only-extraction-forbidden scope))
-                     (true? (:whole-component-build-required scope)))
+                     (true? (:whole-component-build-required scope))
+                     (true? (:jvm-dependency-forbidden scope)))
         [{:code :q9/decision-slice-migration-enabled}])
       (for [disposition compiled-dispositions
             :let [required (set (get-in q9 [:dispositions disposition :requires]))]
@@ -41,11 +42,32 @@
                         (get-in build-contract [:public-cli :source-build]))
                      (= "kotoba rad build --project <repository> --profile release"
                         (get-in build-contract [:public-cli :package-build]))
-                     (= "amu compile <entry.kotoba|entry.cljk> --target <target> --output <artifact>"
+                     (= :verified-native-executable
+                        (get-in build-contract [:public-cli :distribution]))
+                     (true? (get-in build-contract
+                                    [:public-cli :jvm-launcher-forbidden]))
+                     (= "amu check <entry.kotoba|entry.cljk> --jvm-free"
+                        (get-in build-contract [:amu :source-check]))
+                     (= "amu compile <entry.kotoba|entry.cljk> --target <target> --jvm-free --output <artifact>"
                         (get-in build-contract [:amu :compile]))
+                     (= :fail-closed
+                        (get-in build-contract [:amu :jvm-fallback]))
+                     (= :migration-blocked
+                        (get-in build-contract [:amu :unsupported-target]))
+                     (false? (get-in build-contract [:oracle-parity :jvm-required]))
+                     (= #{"java" "javac" "clojure" "clj"}
+                        (set (get-in build-contract
+                                     [:acceptance-environment :forbidden-processes])))
+                     (= :babashka-native
+                        (get-in build-contract [:policy-gate :runtime]))
+                     (false? (get-in build-contract
+                                     [:policy-gate :jvm-required]))
                      (true? (get-in build-contract
                                     [:public-cli :internal-namespace-entry-forbidden]))
-                     (some #{:decision-core-only-shadow} (:forbidden build-contract)))
+                     (every? (set (:forbidden build-contract))
+                             [:decision-core-only-shadow
+                              :jvm-build-or-test-dependency
+                              :implicit-jvm-fallback]))
         [{:code :q9/build-contract-weakened}])
       (for [wave authorized
             :when (not (set/subset? (get dependencies wave #{}) authorized))]
