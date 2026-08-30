@@ -75,6 +75,14 @@ compatibility examples are the conformance fixtures under `lang/conformance/`.
 `.kotoba` and `.cljk` use the Kotoba compiler subset; `.cljc` is the only
 portable source surface shared by all three reader targets.
 
+Q9 source migration is whole-component only. Extracting a predicate or
+decision core while the Clojure namespace remains the executable component is
+compiler evidence, not migration progress. Every migrated component must pass
+the public `kotoba check` / `kotoba compile` path, the package-level
+`kotoba rad build` path, and direct `amu check` / `amu compile` for every
+declared target. The rule and rollback boundary are defined in
+[`ADR-q9-whole-component-build-migration.md`](../adr/ADR-q9-whole-component-build-migration.md).
+
 Inline expressions are also part of the compiler conformance vocabulary:
 `kotoba run -e '(+ 1 2)'` wraps the expression as an exported `main`, compiles
 it through the same Kotoba -> core Wasm path, and runs `main`. This is

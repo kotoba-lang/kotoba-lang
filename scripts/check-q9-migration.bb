@@ -152,6 +152,10 @@
            {:requirements (:requirements soak-evidence)}))
   (when-not (and (= "lang/component-role-model.edn"
                     (get-in contract [:component-migration-model :authority]))
+                 (= :whole-component
+                    (get-in contract [:component-migration-model :migration-unit]))
+                 (false? (get-in contract [:component-migration-model
+                                            :decision-only-slices-allowed]))
                  (true? (get-in contract [:component-migration-model
                                           :kotoba-provider-components-allowed]))
                  (true? (get-in component-roles [:runtime-roles :relational]))
@@ -163,6 +167,35 @@
     (fail! "component-role migration authority drift"
            {:contract (:component-migration-model contract)
             :model "lang/component-role-model.edn"}))
+  (let [build-contract (:whole-component-build-contract contract)
+        compiled-dispositions #{:kotoba-only :clj-kotoba :common :split}
+        required-builds #{:kotoba-cli-build :amu-compile}]
+    (when-not (and (= 2 (:kotoba.lang.q9/version contract))
+                   (= :whole-component (get-in contract [:scope :migration-unit]))
+                   (true? (get-in contract
+                                  [:scope :decision-only-extraction-forbidden]))
+                   (true? (get-in contract
+                                  [:scope :whole-component-build-required]))
+                   (= "kotoba compile <entry.kotoba|entry.cljk> --target <target> --output <artifact>"
+                      (get-in build-contract [:public-cli :source-build]))
+                   (= "kotoba rad build --project <repository> --profile release"
+                      (get-in build-contract [:public-cli :package-build]))
+                   (= "amu compile <entry.kotoba|entry.cljk> --target <target> --output <artifact>"
+                      (get-in build-contract [:amu :compile]))
+                   (true? (get-in build-contract
+                                  [:public-cli :internal-namespace-entry-forbidden]))
+                   (some #{:decision-core-only-shadow} (:forbidden build-contract))
+                   (every? (fn [disposition]
+                             (set/subset?
+                              required-builds
+                              (set (get-in contract
+                                           [:dispositions disposition :requires]))))
+                           compiled-dispositions))
+      (fail! "Q9 whole-component dual-build contract is weakened"
+             {:scope (:scope contract)
+              :build-contract build-contract
+              :dispositions (select-keys (:dispositions contract)
+                                         compiled-dispositions)})))
   (when-not (and (false? (get-in soak-evidence [:gate :ready]))
                  (false? (get-in soak-evidence [:gate :consumer-cutover-authorized])))
     (fail! "soak authority must remain closed until a superseding accepted decision"

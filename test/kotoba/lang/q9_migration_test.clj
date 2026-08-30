@@ -24,6 +24,41 @@
     (testing (name disposition)
       (is (seq (:requires rule))))))
 
+(deftest migration-unit-is-a-whole-component-built-by-both-public-paths
+  (is (= 2 (:kotoba.lang.q9/version q9)))
+  (is (= :whole-component (get-in q9 [:scope :migration-unit])))
+  (is (true? (get-in q9 [:scope :decision-only-extraction-forbidden])))
+  (is (true? (get-in q9 [:scope :whole-component-build-required])))
+  (doseq [disposition migration/compiled-dispositions]
+    (testing (name disposition)
+      (let [required (set (get-in q9 [:dispositions disposition :requires]))]
+        (is (set/subset? migration/required-build-evidence required)))))
+  (is (= "kotoba compile <entry.kotoba|entry.cljk> --target <target> --output <artifact>"
+         (get-in q9 [:whole-component-build-contract
+                     :public-cli :source-build])))
+  (is (= "kotoba rad build --project <repository> --profile release"
+         (get-in q9 [:whole-component-build-contract
+                     :public-cli :package-build])))
+  (is (= "amu compile <entry.kotoba|entry.cljk> --target <target> --output <artifact>"
+         (get-in q9 [:whole-component-build-contract :amu :compile])))
+  (is (some #{:decision-core-only-shadow}
+            (get-in q9 [:whole-component-build-contract :forbidden])))
+  (is (false? (get-in q9 [:component-migration-model
+                           :decision-only-slices-allowed]))))
+
+(deftest migration-state-machine-rejects-the-old-decision-core-model
+  (let [weakened (-> q9
+                     (assoc-in [:scope :migration-unit] :decision)
+                     (assoc-in [:scope :decision-only-extraction-forbidden] false))
+        codes (set (map :code (migration/validation-errors weakened)))]
+    (is (contains? codes :q9/decision-slice-migration-enabled)))
+  (let [weakened (update-in q9 [:dispositions :clj-kotoba :requires]
+                            #(vec (remove #{:amu-compile} %)))
+        errors (migration/validation-errors weakened)]
+    (is (some #(and (= :q9/missing-whole-component-build-gate (:code %))
+                    (= :clj-kotoba (:disposition %)))
+              errors))))
+
 (deftest actual-ci-and-soak-evidence-is-fail-closed
   (is (false? (get-in q9 [:soak-evidence :local-preflight-is-ci-evidence])))
   (is (= 2 (:kotoba.lang.q9.soak/version soak)))
