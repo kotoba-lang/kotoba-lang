@@ -22,6 +22,7 @@
    "lang/wasm-component-platform.edn"
    "lang/library-publication.edn"
    "lang/docs-release.edn"
+   "lang/product-defaults.edn"
    "security/cryptographic-boundaries.edn"
    "docs/search-index.edn"])
 
@@ -35,6 +36,7 @@
 (def elaboration    (authority "lang/elaboration-pipeline.edn"))
 (def library-publication (authority "lang/library-publication.edn"))
 (def docs-release   (authority "lang/docs-release.edn"))
+(def product-defaults (authority "lang/product-defaults.edn"))
 (def search-index   (authority "docs/search-index.edn"))
 
 (def dds-root
@@ -398,6 +400,24 @@
    [:blockquote {:class "kot-quote"}
     [:strong "A language AI agents can use, not abuse."]
     [:p "This is a confinement direction, not an 'unhackable' claim. The compiler, verifier, runtime, providers, policy roots, key custody, and OS isolation remain in the trusted computing base."]]))
+
+(defn defaults-section []
+  (apply dds/section
+         {:id "defaults" :title "Defaults for an AI-first computing stack"}
+         [:p {:class "kot-lead"}
+          "These are engineering claims with their qualification attached. Default, bounded-ready, partial, and direction are different states; none is silently promoted to universal."]
+         (dds/grid
+          {:min "18rem"}
+          (for [{:keys [status headline body]} (:claims product-defaults)]
+            (card (dds/chip-label (-> status name str/upper-case
+                                      (str/replace "-" " "))
+                                  {:color (if (contains? #{:default :ready-bounded} status)
+                                            "blue" "gray")})
+                  (dds/heading 3 headline {:size "24"})
+                  [:p body])))
+         [[:p {:class "kot-caption kot-muted"}
+           "Machine authority: " (code "lang/product-defaults.edn")
+           ". Unlimited physical storage, zero copies everywhere, universal speed rank, AGI achieved, and unhackable remain forbidden absolute claims."]]))
 
 (defn proof-section []
   (apply dds/section
@@ -946,6 +966,7 @@
     (dds/container
      (why-section)
      (what-section)
+     (defaults-section)
      (developer-section)
      (code-play-section)
      (libraries-section)

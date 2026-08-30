@@ -16,7 +16,8 @@ at build time from:
 ```
 lang/safety-claims.edn          lang/wasm-component-platform.edn
 lang/surface-status.edn         lang/elaboration-pipeline.edn
-lang/docs-release.edn           docs/search-index.edn
+lang/docs-release.edn           lang/product-defaults.edn
+docs/search-index.edn
 ```
 
 Change the spec and the page changes with it. The page cannot drift into
