@@ -38,11 +38,11 @@
 
 (defn measure [org]
   (let [root (str "orgs/" org)
-        cljc (lines "rg" "--files" root "-g" "*.cljc")
+        cljc (lines-allow-empty "rg" "--files" root "-g" "*.cljc")
         repos (into #{} (keep #(some->> (str/split % #"/")
                                         (take 3) seq (str/join "/"))) cljc)
         records (filter #(re-find plan-pattern %)
-                        (lines "rg" "--files" root))]
+                        (lines-allow-empty "rg" "--files" root))]
     {:files (count cljc)
      :repositories (count repos)
      :migration-records (count records)}))
