@@ -8,7 +8,7 @@ Check: `clojure -M -m kotoba.lang.surface-matrix --check`
 |---|---|
 | surface-status version | 1 |
 | profile version | 6 |
-| as-of | 2026-08-15 |
+| as-of | 2026-08-30 |
 | authority ADR | `docs/adr/ADR-kotoba-language-surface-status.md` |
 
 WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source.
@@ -29,12 +29,12 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 | `bool-is-a-type-not-a-number` | `intentional-semantic-simplification` |  | Comparisons and predicates are `:bool`. Profile 4 made them i64 so             `(+ (zero? x) (pos? x))` was admitted; that is a type error in             Clojure and it prevented `and`/`or`/`not` from composing into a             readable predicate. Migration is mechanical: `(if p 1 0)`. |
 | `bounded-admission` | `intentional-security-constraint` |  | Untrusted and generated programs must fail closed under finite admission and execution resources. |
 | `capability-only-affinity` | `intentional-semantic-simplification` |  | Affine consumption is scoped to capability values; a general ownership/borrow/lifetime system is intentionally absent. |
-| `explicit-errors` | `intentional-security-constraint` |  | Component/provider effects use explicit result/error values rather than hidden exception paths. |
-| `no-ambient-authority` | `intentional-security-constraint` |  | Components cannot manufacture code or authority from ambient process state. |
-| `no-ambient-mutation` | `intentional-security-constraint` |  | External mutable state is provider-owned and capability/policy mediated; component-local state must use an explicitly bounded model. |
-| `no-guest-macros` | `intentional-security-constraint` |  | The safe component surface must be statically inspectable before execution. |
-| `no-interop` | `intentional-security-constraint` |  | Arbitrary JVM/JS object and method access bypasses capability admission. |
-| `no-unbounded-concurrency` | `intentional-security-constraint` |  | Component scheduling and resources must remain tender-controlled and bounded. |
+| `explicit-errors` | `intentional-security-constraint` |  | Ambient throw/try/catch is untracked non-local control flow: it exits             scopes the inferred effect row never mentions and skips unwind             obligations (dataspace facet retraction has no checked unwind yet).             The ban is on the ambient form; a typed abort/exception ability whose             effect appears in the inferred row, Unison Exception-style, is             admissible once the preconditions land. |
+| `no-ambient-authority` | `intentional-security-constraint` |  | Components cannot manufacture code or authority from ambient process state.             Unrelaxable by grant dispatch (the biscuit axis): evaluated or loaded             code was never effect-inferred and is not part of the definition CID,             so admitting it severs code identity from behavior. The Unison-adopted             identity property makes this ban more necessary, not less. |
+| `no-ambient-mutation` | `intentional-security-constraint` |  | External mutable state is provider-owned and capability/policy mediated; component-local state must use an explicitly bounded model.             The invariant is AMBIENT, not mutation itself: the :state capability             kit is the admitted non-ambient model, and the :widening-path heads may             later desugar to it (effect row shows :state, a grant is required at             instantiation, and capability handles are rejected as stored values so             affine provenance tracking survives). Until that desugar and its             conformance vectors land, every head here stays rejected fail-closed.             binding / var / alter-var-root / set! have no ability model decided             and carry no widening path. |
+| `no-guest-macros` | `intentional-security-constraint` |  | The safe component surface must be statically inspectable before execution.             Unrelaxable: expansion executes code inside the compiler (build time),             and the definition CID hashes post-desugar typed KIR, so unbounded             macros both run early and make source identity unreviewable.             defdesugar (bounded pure desugar) remains the admitted alternative. |
+| `no-interop` | `intentional-security-constraint` |  | Arbitrary JVM/JS object and method access bypasses capability admission.             Unrelaxable by grant dispatch: interop never reaches             guard-component-ability-call, so grant intersection, receipts and             revocation cannot see the call. Vacuous on the wasm32 ABI (no such             path exists); load-bearing at portable/trusted, where the subset gate             is the only boundary (no separate VM sandbox is claimed there). |
+| `no-unbounded-concurrency` | `intentional-security-constraint` |  | Component scheduling and resources must remain tender-controlled and bounded.             Neither definition CIDs nor delegated grants meter CPU or scheduling;             fuel is per-instance and ambient threads would escape it. A             structured-spawn ability with sub-budgeted fuel is designable but             undecided; no widening path yet. |
 
 ## Collections
 
