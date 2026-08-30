@@ -98,9 +98,10 @@ repository README. Its authoritative source is
 The generator copies that local asset into `dist/`, so the deployed page makes
 no external image request.
 
-Output: `site/dist/index.html`, `site/dist/blog/index.html`, the Play artifact
-and evidence, the wordmark, AI-agent text surfaces, and the raw benchmark JSON
-(committed, so a clean checkout can deploy without running the generator).
+Output: `site/dist/index.html`, `site/dist/blog/index.html`,
+`site/dist/legal/index.html`, the Play artifact and evidence, the wordmark,
+AI-agent text surfaces, and the raw benchmark JSON (committed, so a clean
+checkout can deploy without running the generator).
 
 The generator also publishes identity's canonical external-trust artifacts at
 `/schemas/trust-profile/v1`,
@@ -138,8 +139,15 @@ cd site
 npx wrangler deploy
 ```
 
-Static assets only — `wrangler.jsonc` declares no Worker script. The zone is in
-the `ai-gftd-cloud` Cloudflare account, served on the apex and `www`.
+Static assets only — `wrangler.jsonc` declares no Worker script. The zone is
+served on the apex and `www`. The Cloudflare account that currently holds the
+zone is an infrastructure label, not the published operator.
+
+The published operator on this zone is **Kotoba Labs Inc.** Public contact
+is `support@kotoba-lang.org`. Sales contact is Ryo Awai. The footer, `/legal/`,
+and `security.txt` name only those facts. Do not publish a Specified
+Commercial Transactions Act table, Delaware file number, address, phone, or
+any other mailbox from this generator.
 
 The page is built with `jp-go-dds` (the Digital Agency Design System mirror).
 Application CSS uses the shared `--hig-*` token contract through
