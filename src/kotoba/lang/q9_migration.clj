@@ -6,6 +6,8 @@
 (def q9-path "lang/q9-migration.edn")
 (def all-waves #{:wave-0 :wave-1 :wave-2 :wave-3 :wave-4 :wave-5})
 (def complete-statuses #{:qualified})
+(def compiled-dispositions #{:kotoba-only :clj-kotoba :common :split})
+(def required-build-evidence #{:kotoba-cli-build :amu-compile})
 
 (defn read-program []
   (edn/read-string (slurp q9-path)))
@@ -15,6 +17,8 @@
         dependencies (:wave-dependencies q9)
         decision (:current-decision q9)
         authorized (:authorized-waves decision)
+        scope (:scope q9)
+        build-contract (:whole-component-build-contract q9)
         completed (into #{} (keep (fn [[wave v]]
                                     (when (complete-statuses (:status v)) wave)))
                         waves)
@@ -23,6 +27,48 @@
      (concat
       (when-not (= all-waves (set (keys waves)) (set (keys dependencies)))
         [{:code :q9/wave-inventory-drift}])
+      (when-not (and (= :whole-component (:migration-unit scope))
+                     (true? (:decision-only-extraction-forbidden scope))
+                     (true? (:whole-component-build-required scope))
+                     (true? (:jvm-dependency-forbidden scope)))
+        [{:code :q9/decision-slice-migration-enabled}])
+      (for [disposition compiled-dispositions
+            :let [required (set (get-in q9 [:dispositions disposition :requires]))]
+            :when (not (set/subset? required-build-evidence required))]
+        {:code :q9/missing-whole-component-build-gate
+         :disposition disposition
+         :missing (set/difference required-build-evidence required)})
+      (when-not (and (= "kotoba compile <entry.kotoba|entry.cljk> --target <target> --output <artifact>"
+                        (get-in build-contract [:public-cli :source-build]))
+                     (= "kotoba rad build --project <repository> --profile release"
+                        (get-in build-contract [:public-cli :package-build]))
+                     (= :verified-native-executable
+                        (get-in build-contract [:public-cli :distribution]))
+                     (true? (get-in build-contract
+                                    [:public-cli :jvm-launcher-forbidden]))
+                     (= "amu check <entry.kotoba|entry.cljk> --jvm-free"
+                        (get-in build-contract [:amu :source-check]))
+                     (= "amu compile <entry.kotoba|entry.cljk> --target <target> --jvm-free --output <artifact>"
+                        (get-in build-contract [:amu :compile]))
+                     (= :fail-closed
+                        (get-in build-contract [:amu :jvm-fallback]))
+                     (= :migration-blocked
+                        (get-in build-contract [:amu :unsupported-target]))
+                     (false? (get-in build-contract [:oracle-parity :jvm-required]))
+                     (= #{"java" "javac" "clojure" "clj"}
+                        (set (get-in build-contract
+                                     [:acceptance-environment :forbidden-processes])))
+                     (= :babashka-native
+                        (get-in build-contract [:policy-gate :runtime]))
+                     (false? (get-in build-contract
+                                     [:policy-gate :jvm-required]))
+                     (true? (get-in build-contract
+                                    [:public-cli :internal-namespace-entry-forbidden]))
+                     (every? (set (:forbidden build-contract))
+                             [:decision-core-only-shadow
+                              :jvm-build-or-test-dependency
+                              :implicit-jvm-fallback]))
+        [{:code :q9/build-contract-weakened}])
       (for [wave authorized
             :when (not (set/subset? (get dependencies wave #{}) authorized))]
         {:code :q9/dependency-not-authorized :wave wave})
