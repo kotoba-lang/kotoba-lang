@@ -2,9 +2,24 @@
 
 Status: **Accepted・実装進行中** — gating 層は実装完了（capability/per-cid・subset 全 spec・effect interprocedural・S1b literal 型チェック・`:memory-pages` 強制・least-privilege tooling、実 cell で end-to-end 検証）。borrow checker（S2）は capability 値限定の narrow slice として実装済み（2026-07-08、`kotoba-lang/kotoba` `cap-affine-problems`、汎用 ownership システムではない）。残務は型システム本体（typed HIR）・capability 値渡し S4b・supply chain S5。詳細は §0「実装状況サマリ」と §9 ロードマップ。
 Date: 2026-06-25（設計）/ 実装更新: 2026-06-26
-Implemented: `crates/kotoba-clj`（`policy.rs` / `subset.rs` / `effects.rs` / `ty.rs` / `cli.rs`、safe-mode tests 約 170）
+Implemented（歴史的）: `crates/kotoba-clj` は kotoba#259 `604896171` の Rust workspace 撤去で削除済み。本文中の `*.rs` 証拠パス（`policy.rs` / `subset.rs` / `effects.rs` / `ty.rs` / `cli.rs`、safe-mode tests 約 200 を含む全件）は**当時の実測の歴史的記録**であり、現行 tree には存在しない
 Crate: `crates/kotoba-clj`（front-end 拡張）+ `kotoba-runtime` / `kotoba-lattice`（runtime 側 enforcement）
 関連: `docs/ADR-kotoba-wasm.md`, `docs/ADR-kotoba-word.md`, `docs/ADR-kotoba-mesh-wasm-hosting.md`, `docs/SECURITY-ARCHITECTURE.md`, `docs/ADR-sealed-cold-tier.md`
+
+> **証拠の現在地（2026-08-30 追記）**: Rust workspace（`crates/kotoba-clj`）は
+> kotoba#259 で撤去済み。実行可能 threat-model（`tests/safe_confinement_matrix.rs`
+> の層順 assert: subset→型→effect→capability、最初の一致が勝つ）は現行 tree に
+> port が無く、その合成保証の主張は **UNVERIFIED**（撤去当時までの実測記録）。
+> 現行の enforcement は次の 4 つ:
+> ① amu の elaboration pipeline admission（deny-by-default、`:minimal-policy` 推論、
+> fail-closed）② 本 repo の `src/kotoba/lang/grammar_authority.clj` +
+> `scripts/check-grammar-authority.cljs`（forbidden-heads ⊇ security surfaces を
+> fail-closed 検査）③ `lang/capability-conformance/`（positive / negative fixtures）
+> ④ kotoba-lang/kotoba の `test/kotoba/cap_{affine,typed,table,passing}_test.clj`。
+> 禁止の分類（shielding axis: code-identity / dispatch-bypass / authority /
+> control-effect-tracking / resource-bounds、authority 軸の widening path）は
+> `lang/surface-status.edn` と superproject
+> adr-2608301500-guest-syntax-restrictions-classified-by-shielding-mechanism が正本。
 
 ## 0. 一行で
 
@@ -47,7 +62,7 @@ Crate: `crates/kotoba-clj`（front-end 拡張）+ `kotoba-runtime` / `kotoba-lat
 | **`bytes-alloc` 負容量ガード（静的 + 実行時）（T1）**: 負 cap は header に巨大 unsigned `cap` として格納され byte-append! の overflow ガードを無効化（かつ `cap+8` が wrap して微小確保）。①負 literal は ty.rs で静的拒否、②実行時は codegen が `cap < 0` で trap。byte-append! 防御を回避する経路を封鎖（回帰テストで「負 cap → append 前に trap」を固定） | ✅ | **T1** | `ty.rs` / `codegen.rs` |
 | **borrow checker（S2、narrow slice、2026-07-08、provenance追跡2026-07-08）**: 汎用の Rust 級 ownership/borrow/lifetime システムは意図的に作らない — T1 はそれ無しで別経路（free-less allocator + 境界チェック + 並行 primitive deny）で既に達成済み。残したスコープは **capability 値限定**の affine typing のみ: `^{:cap <kind>}` param・`(cap-acquire ...)` 直結果・let alias のいずれも、関数本体の単一実行パス上で **高々一度**しか消費（`<op>-with` 先頭引数 / callee の cap-typed param 引数）できない（deterministic drop = 未使用は許可、no implicit clone = 再消費は `:cap-value-reused` で拒否）。`if` 分岐は相互排他だが両分岐を同じ起点から独立に検査し union で合流（どちらが実行されたか静的に分からないため）。追跡は**値の provenance（origin id）単位**——`(cap-acquire ...)` の各出現ごとにカウンタで新しい origin を採番し、let-bound alias はエイリアス元と同じ origin を共有する——ため、`(let [alias c] ...)` で別名にリネームして `alias` と `c` を1回ずつ使うケース(多段エイリアスチェーン含む)も同一 origin の二重消費として正しく検出する（当初の実装では束縛名単位の追跡で見逃していたが、2026-07-08 に origin 単位に直して解消） | ✅(narrow slice) | **T1 は S2 無しで別経路により達成済み。この narrow slice は capability 値渡し(S4b)の ownership 表現が目的** | kotoba-lang/kotoba `src/kotoba/runtime.clj`（`cap-affine-problems` / `cap-affine-step` / `affine-use` / `cap-expr-info`）/ `test/kotoba/cap_affine_test.clj` |
 | **reproducible build 検証（S5 部分）**: `compile_safe_kotoba[_with_prelude]`（legacy alias: `compile_safe_clj[_with_prelude]`）がバイト決定的（同一ソース→同一 wasm→安定 CID）であることを test でロック。teeth: Rust の `HashMap` は `new()` ごとに別シードのため、codegen が emission で map を反復していれば同一プロセス内の再コンパイルで発散する → 反復しない不変条件（全 emission は source 順 Vec、map は lookup のみ）を回帰から保護。判別テスト込み。**さらに self-hosting が実際に配布する component build（`compile_component_str_with_prelude`、core module + wit-component ラップ）も決定的であることをロック**＝ confined アナライザの component CID 安定（供給網健全性）。なお safe mode は `require`/`use` を subset で deny 済 ＝ deps allowlist は deny-all で充足 | ✅ | **S5 部分** | `tests/safe_reproducible.rs` |
-| **敵対的 confinement マトリクス**（実行可能な threat model）: 全防御層（subset/型/effect/capability/runtime trap）を貫き、各 escape-hatch クラスが**どの層・どの `CljError`** で拒否されるかを assert。層順（subset→型→effect→capability、最初の一致が勝つ）+ 実行時 memory-safety trap を合成保証としてロック。非自明性のため clean cell も検証 | ✅ | — | `tests/safe_confinement_matrix.rs` |
+| **敵対的 confinement マトリクス**（実行可能な threat model）: 全防御層（subset/型/effect/capability/runtime trap）を貫き、各 escape-hatch クラスが**どの層・どの `CljError`** で拒否されるかを assert。層順（subset→型→effect→capability、最初の一致が勝つ）+ 実行時 memory-safety trap を合成保証としてロック。非自明性のため clean cell も検証 | ⚠ **UNVERIFIED**（#259 で削除、現行 port 無し） | — | (歴史的: `tests/safe_confinement_matrix.rs`) |
 | **高階関数はゲートを迂回できない（T2/T3 をクロージャ越しに保証）**: capability collector（`used_host_imports`）と effect collector（`effects::collect`）はともに `fn` 本体を再帰的に walk するため、クロージャ内に隠した host call も **import が policy で gate され、効果は定義位置に lexically 帰属**する。`(fn [] (kqe-assert! …))` は未許諾なら Policy 拒否、`:effects #{}` 宣言下なら Effect 拒否。さらに **per-cid（instance 級）束縛もクロージャを貫く**（graphA 許諾下でクロージャが graphB に書けば Policy 拒否、graphB 許諾なら compile）。lexical scope による confinement 回避は class 級・instance 級とも不能（テストでロック） | ✅ | **T2/T3** | `codegen.rs` / `effects.rs` / `policy.rs` / `tests/safe_confinement_matrix.rs` |
 | **capability の値渡し（S4b 第一スライス）✅**: capability 値が first-class 引数（opaque i64 handle）として compiled wasm を流れ、host-call 時に concrete capability へ解決される。`cap-acquire` が policy ∩ CACAO grants ∩ requested の交差を**取得時に一度だけ**実行し per-run cap table に concrete cap を格納（denial は handle を発行しない）、`<op>-with` が handle を先頭引数に取り使用時に expiry 再検査・kind 照合・偽造 handle 拒否（fail closed）。取得と各使用の両方に receipt（`:receipt/cap-handle` で連結）。effect row 宣言時は取得/使用 kind ⊆ row を check 時に強制。wasm は `cap_acquire(i32,i32,i32)->i64` + `host_i64_roundtrip_with(i64,i64)->i64` の実証 shape を emit・node 実行。実装: kotoba-lang/kotoba `kotoba.cap-table`/`kotoba.host-providers`/`kotoba.runtime`（CLJ runtime slice、2026-07-02） | ✅(slice) | **T3** | kotoba-lang/kotoba `src/kotoba/cap_table.clj` ほか |
 | **typed capability params ✅（S4b 第二スライス、2026-07-02）**: param metadata `^{:cap <kind>}`（正準形はこの一形式のみ — kind keyword が既に namespaced のため `^:cap/<kind>` shorthand は不採用）を check/emit 時に静的検査。`<op>-with` の先頭引数は cap-typed（`cap-acquire` 直結果 / cap-typed param / その let alias）以外を静的拒否（`:cap-arg-not-capability` — 偽造整数はコンパイル不能）、kind 照合は op と user-fn callee param の全 call site（`:cap-kind-mismatch`、kind は静的なので常に決定可能）、effect row は cap param kind ＋ direct call graph の fixpoint で interprocedural に強制（`:cap-effect-under-declared`）。実行時の `resolve-use`（kind/expiry 再検査）は defense in depth として維持 | ✅ | **T3** | kotoba-lang/kotoba `src/kotoba/runtime.clj`（`cap-typed-problems` / `fn-required-cap-kinds`）/ `test/kotoba/cap_typed_test.clj` |
@@ -56,7 +71,7 @@ Crate: `crates/kotoba-clj`（front-end 拡張）+ `kotoba-runtime` / `kotoba-lat
 | capability 値渡しの残り（pointer+length/buffer ABI `<op>-with` の compiled threading — i64 shape 以外は interpreter-only）・signed module（S5 残） | ⬜ | — | — |
 
 達成: **T2 Effect Soundness ✅ / T3 Capability Confinement ✅（instance 粒度、バイト列検証済み）**。
-**T1 Memory Safety は大部分達成**: ①raw メモリ primitive（`alloc`/`load*`/`store*`）を user code で deny（モジュール内任意 read/write 封鎖）、②`byte-at` は静的（literal OOB）+ 実行時（`index >=u len` で trap、負 index 含む）に bounds-respecting、③`byte-append!` は実行時容量 trap（`len >=u cap`）で buffer overflow 封鎖、④bump allocator は free 不実施で use-after-free/double-free 構造的に不在、⑤並行 primitive deny で data race 不在。**S2 は narrow slice(capability 値限定 affine typing)として実装済み**（上表参照、`kotoba-lang/kotoba` `cap-affine-problems`）。テスト: safe-mode 約 200（`crates/kotoba-clj/tests/safe_*.rs` + `confinement_property.rs` + `safe_confinement_matrix.rs` + `safe_reproducible.rs`）+ 実行時 trap（`compile_run.rs`）+ ast meta-guard + **実在の agent cell end-to-end**（`safe_integration.rs`）、full suite green（41 groups）、clippy clean（default + cli）。
+**T1 Memory Safety は大部分達成**: ①raw メモリ primitive（`alloc`/`load*`/`store*`）を user code で deny（モジュール内任意 read/write 封鎖）、②`byte-at` は静的（literal OOB）+ 実行時（`index >=u len` で trap、負 index 含む）に bounds-respecting、③`byte-append!` は実行時容量 trap（`len >=u cap`）で buffer overflow 封鎖、④bump allocator は free 不実施で use-after-free/double-free 構造的に不在、⑤並行 primitive deny で data race 不在。**S2 は narrow slice(capability 値限定 affine typing)として実装済み**（上表参照、`kotoba-lang/kotoba` `cap-affine-problems`）。テスト: safe-mode 約 200（`crates/kotoba-clj/tests/safe_*.rs` + `confinement_property.rs` + `safe_confinement_matrix.rs` + `safe_reproducible.rs`）+ 実行時 trap（`compile_run.rs`）+ ast meta-guard + **実在の agent cell end-to-end**（`safe_integration.rs`）、full suite green（41 groups）、clippy clean（default + cli）。**（この段落のテスト群は Rust 撤去 #259 で削除済み — 撤去時点までの歴史的実測。現行 enforcement は冒頭「証拠の現在地」）**
 
 ### 0.1 語彙整理と self-hosting 境界（2026-06-29）
 
