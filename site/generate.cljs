@@ -11,6 +11,8 @@
          '[kotoba.grammar.highlight :as grammar-highlight]
          '[cljs.reader :as reader]
          '[clojure.string :as str]
+         '[kotoba.site.hero :as hero]
+         '[html.core :as html]
          '["crypto" :as crypto]
          '["fs" :as fs]
          '["path" :as path])
@@ -226,10 +228,14 @@
    ".kot-logo{display:block;height:var(--hig-spacing-7);width:auto}"
    ".kot-nav{display:flex;align-items:center;justify-content:flex-start;flex-wrap:wrap;"
    "gap:var(--hig-spacing-2);width:100%}"
-   ".kot-hero{padding-block:var(--hig-spacing-8)}"
+   ".kot-hero{position:relative;overflow:clip;padding-block:var(--hig-spacing-8)}"
+   ".kot-hero-canvas{position:absolute;inset:0;z-index:0;pointer-events:none}"
+   ".kot-hero-canvas>canvas,.kot-hero-canvas>svg{position:absolute;inset:0;width:100%;height:100%;display:block}"
+   ".kot-hero-canvas>svg{fill:var(--hig-color-tint);opacity:.55}"
+   ".kot-hero>.dds-ext-container{position:relative;z-index:1}"
    ".kot-eyebrow{margin:0 0 var(--hig-spacing-3);color:var(--hig-color-tint);"
    "font-weight:700;letter-spacing:.06em;text-transform:uppercase}"
-   ".kot-hero h1{max-width:18ch;margin:0 0 var(--hig-spacing-4)}"
+   ".kot-hero h1{max-width:24ch;margin:0 0 var(--hig-spacing-4);text-wrap:balance}"
    ".kot-lead{max-width:48rem;margin:0;color:var(--hig-color-secondary-label)}"
    ".kot-actions{display:grid;grid-template-columns:minmax(0,1fr);gap:var(--hig-spacing-3);"
    "margin-top:var(--hig-spacing-6)}"
@@ -270,7 +276,8 @@
    ".kot-table-scroll{max-width:100%;overflow-x:auto}"
    ".kot-footer{padding-block:var(--hig-spacing-7);"
    "border-top:var(--hig-hairline) solid var(--hig-color-separator)}"
-   "@media(min-width:36rem){.kot-actions{display:flex;flex-wrap:wrap}}"
+   "@media(min-width:36rem){.kot-actions{display:flex;flex-wrap:wrap}"
+   ".kot-hero h1{font-size:2.75rem;line-height:1.15}}"
    "@media(min-width:48rem){.kot-header{position:sticky;top:0}"
    ".kot-header__inner{align-items:center;flex-direction:row;justify-content:space-between}"
    ".kot-nav{justify-content:flex-end;width:auto}.kot-hero{padding-block:var(--hig-spacing-10) var(--hig-spacing-9)}}"))
@@ -316,8 +323,150 @@
          (dds/button "GitHub" {:type :outline :size "sm"
                                 :href "https://github.com/kotoba-lang/kotoba-lang"})]])])))
 
+(def fallback-svg
+  (let [pts (hero/stroke-samples 36)
+        circles (map (fn [{:keys [x y r density]}]
+                       [:circle {:cx (-> x (* 200) (.toFixed 2))
+                                 :cy (-> y (* 200) (.toFixed 2))
+                                 :r (-> (* 14 r) (.toFixed 2))
+                                 :opacity (-> (+ 0.35 (* 0.65 density)) (.toFixed 2))}])
+                     pts)]
+    (str "<svg viewBox=\"0 0 200 200\" preserveAspectRatio=\"xMidYMid slice\" "
+         "aria-hidden=\"true\" focusable=\"false\" id=\"kot-hero-fallback\">"
+         (html/->html circles)
+         "</svg>")))
+
+(def FXN (str hero/drift-freq-x))
+(def FYN (str hero/drift-freq-y))
+(def AMAXV (str hero/alpha-max))
+
+(def hero-js
+  (let [points-js (str "var P=new Uint8Array([" (str/join "," (vec (hero/quantized-bytes))) "]),"
+                       "N=" hero/point-count ",FP=" hero/hero-fps ",DUR=" hero/hero-duration-seconds ","
+                       "AX=" hero/drift-amplitude-x ",AY=" hero/drift-amplitude-y ","
+                       "FX=" hero/drift-freq-x ",FY=" hero/drift-freq-y ","
+                       "AMAX=" hero/alpha-max ";")]
+    (str points-js
+         "document.addEventListener('DOMContentLoaded',function(){"
+         "var wrap=document.getElementById('kot-hero-canvas');"
+         "if(!wrap||matchMedia('(prefers-reduced-motion: reduce)').matches)return;"
+         "var canvas=document.createElement('canvas');"
+         "var drawn=false;"
+         "function svgOnly(){if(drawn)return;drawn=true;"
+         "var s=document.getElementById('kot-hero-fallback');"
+         "if(s)wrap.appendChild(s);}"
+         "function useEngine(c){try{wrap.replaceChild(c,document.getElementById('kot-hero-fallback'));}catch(e){wrap.appendChild(c);}}"
+         "async function webgpu(){var gpu=navigator.gpu;if(!gpu)return false;"
+         "var adapter=null;try{adapter=await gpu.requestAdapter();}catch(e){adapter=null;}"
+         "if(!adapter)return false;var device=null;"
+         "try{device=await adapter.requestDevice();}catch(e){device=null;}"
+         "if(!device)return false;var ctx=null;"
+         "try{ctx=canvas.getContext('webgpu');}catch(e){ctx=null;}"
+         "if(!ctx)return false;var format=navigator.gpu.getPreferredCanvasFormat();"
+         "try{ctx.configure({device:device,format:format,alphaMode:'premultiplied'});}catch(e){return false;}"
+         "var wgsl='struct U{t:f32,ph:f32,ux:f32,uy:f32,ax:f32,ay:f32,w:f32,h:f32};"
+         "@group(0)@binding(0)var<uniform>u:U;"
+         "struct VOut{@builtin(position)pos:vec4f,@location(0)den:f32,@location(1)rad:f32,@location(2)cen:vec2f};"
+         "@vertex fn vs(@builtin(vertex_index)vi:u32,@builtin(instance_index)ii:u32,@location(0)p:vec2f,@location(1)m:vec2f)->VOut{"
+         "let corners=array<vec2f,6>(vec2f(-1.0,-1.0),vec2f(1.0,-1.0),vec2f(-1.0,1.0),vec2f(-1.0,1.0),vec2f(1.0,-1.0),vec2f(1.0,1.0));"
+         "let ang=6.2831853*u.t*(0.3+0.7*fract(f32(ii)*0.61803399));"
+         "let c=vec2f(u.ux,u.uy)+vec2f(u.ax*cos(ang*" FXN "+f32(ii)*0.37),u.ay*sin(ang*" FYN "+f32(ii)*0.61));"
+         "let ndc=vec2f(c.x*2.0-1.0,1.0-c.y*2.0);"
+         "let rad=m.x*2.0*min(u.w,u.h);"
+         "let off=corners[vi]*vec2f(rad/u.w,rad/u.h);"
+         "var o:VOut;"
+         "o.pos=vec4f(ndc+off,0.0,1.0);"
+         "o.den=m.y;o.rad=rad;o.cen=vec2f((ndc.x*0.5+0.5)*u.w,(ndc.y*0.5+0.5)*u.h);"
+         "return o;}"
+         "@fragment fn fs(f:VOut)->@location(0)vec4f{"
+         "let d=length(f.pos.xy-f.cen)/max(f.rad,1.0);"
+         "if(d>1.0){discard;}"
+         "let a=" AMAXV "*(1.0-d*d)*u.ph*f.den;"
+         "return vec4f(0.0,0.09,0.757,a);}';"
+         "var module=null;"
+         "try{module=device.createShaderModule({code:wgsl});}catch(e){return false;}"
+         "var pipeline=null;"
+         "try{pipeline=device.createRenderPipeline({layout:'auto',"
+         "vertex:{module:module,entryPoint:'vs',buffers:[{arrayStride:4,attributes:[{shaderLocation:0,offset:0,format:'unorm8x2'},{shaderLocation:1,offset:2,format:'unorm8x2'}]}]},"
+         "fragment:{module:module,entryPoint:'fs',targets:[{format:format,blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},"
+         "primitive:{topology:'triangle-list'}});}catch(e){return false;}"
+         "var vbuf=device.createBuffer({size:P.byteLength,usage:GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});"
+         "device.queue.writeBuffer(vbuf,0,P);"
+         "var ubuf=device.createBuffer({size:32,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});"
+         "var bind=device.createBindGroup({layout:pipeline.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:ubuf}}]});"
+         "useEngine(canvas);"
+         "function size(){var dpr=Math.min(window.devicePixelRatio||1,2);"
+         "var r=wrap.getBoundingClientRect();canvas.width=Math.max(1,Math.round(r.width*dpr));"
+         "canvas.height=Math.max(1,Math.round(r.height*dpr));}"
+         "size();window.addEventListener('resize',size);"
+         "var t0=null,last=0;"
+         "function frame(ms){requestAnimationFrame(frame);"
+         "if(ms-last<1000/FP-1)return;last=ms;"
+         "if(t0===null)t0=ms;var t=(ms-t0)/1000;"
+         "if(t>DUR){t0=ms;t=0;}"
+         "var ph=0.55+0.45*Math.sin(t*0.35);"
+         "var ang2=6.2831853*t/DUR;"
+         "var ux=0.5+AX*Math.cos(ang2*FX),uy=0.5+AY*Math.sin(ang2*FY);"
+         "var ax=AX*0.6*Math.sin(t*0.23),ay=AY*0.6*Math.sin(t*0.31+1.7);"
+         "device.queue.writeBuffer(ubuf,0,new Float32Array([t,ph,ux,uy,ax,ay,canvas.width,canvas.height]));"
+         "var enc=device.createCommandEncoder();"
+         "var pass=enc.beginRenderPass({colorAttachments:[{view:ctx.getCurrentTexture().createView(),clearValue:{r:1,g:1,b:1,a:1},loadOp:'clear',storeOp:'store'}]});"
+         "pass.setPipeline(pipeline);pass.setVertexBuffer(0,vbuf);pass.setBindGroup(0,bind);"
+         "pass.draw(6,N);pass.end();"
+         "device.queue.submit([enc.finish()]);}"
+         "requestAnimationFrame(frame);return true;}"
+         "function webgl2(){var gl=null;try{gl=canvas.getContext('webgl2',{antialias:true,alpha:true});}catch(e){gl=null;}"
+         "if(!gl)return false;var vs='#version 300 es\\nin vec2 a;in vec2 m;uniform vec2 u;"
+         "uniform float t,minWH,ax,ay,FX,FY;out float vden;void main(){"
+         "float ang=6.2831853*t*(0.3+0.7*fract(float(gl_VertexID)*0.61803399));"
+         "vec2 c=u+vec2(ax*cos(ang*FX+float(gl_VertexID)*0.37),ay*sin(ang*FY+float(gl_VertexID)*0.61));"
+         "vden=m.y;gl_Position=vec4((c*2.0-1.0)*vec2(1.0,-1.0),0.0,1.0);"
+         "gl_PointSize=max(1.0,m.x*2.0*minWH);}';"
+         "var fs='#version 300 es\\nprecision mediump float;in float vden;uniform float amax,ph;out vec4 oc;void main(){"
+         "vec2 d=gl_PointCoord-vec2(0.5);float r=length(d)*2.0;if(r>1.0)discard;"
+         "float a=amax*(1.0-r*r)*ph*vden;oc=vec4(0.0,0.09,0.757,a);}';"
+         "function sh(t,s){var o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);"
+         "if(!gl.getShaderParameter(o,gl.COMPILE_STATUS)){throw new Error(gl.getShaderInfoLog(o));}return o;}"
+         "var prog=gl.createProgram();gl.attachShader(prog,sh(gl.VERTEX_SHADER,vs));"
+         "gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,fs));gl.linkProgram(prog);"
+         "if(!gl.getProgramParameter(prog,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(prog));"
+         "gl.useProgram(prog);var buf=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buf);"
+         "gl.bufferData(gl.ARRAY_BUFFER,P,gl.STATIC_DRAW);"
+         "var loc=gl.getAttribLocation(prog,'a');gl.enableVertexAttribArray(loc);"
+         "gl.vertexAttribPointer(loc,2,gl.UNSIGNED_BYTE,true,4,0);"
+         "var locM=gl.getAttribLocation(prog,'m');gl.enableVertexAttribArray(locM);"
+         "gl.vertexAttribPointer(locM,2,gl.UNSIGNED_BYTE,true,4,2);"
+         "var U={};['u','t','minWH','ax','ay','FX','FY','amax','ph'].forEach(function(n){U[n]=gl.getUniformLocation(prog,n);});"
+         "gl.uniform1f(U.FX,FX);gl.uniform1f(U.FY,FY);gl.uniform1f(U.amax,AMAX);"
+         "useEngine(canvas);"
+         "function size(){var dpr=Math.min(window.devicePixelRatio||1,2);"
+         "var r=wrap.getBoundingClientRect();canvas.width=Math.max(1,Math.round(r.width*dpr));"
+         "canvas.height=Math.max(1,Math.round(r.height*dpr));gl.viewport(0,0,canvas.width,canvas.height);"
+         "gl.uniform1f(U.minWH,Math.min(canvas.width,canvas.height));}"
+         "size();window.addEventListener('resize',size);"
+         "var t0=null,last=0;function frame(ms){requestAnimationFrame(frame);"
+         "if(ms-last<1000/FP-1)return;last=ms;"
+         "if(t0===null)t0=ms;var t=(ms-t0)/1000;"
+         "if(t>DUR){t0=ms;t=0;}"
+         "gl.uniform1f(U.t,t);gl.uniform1f(U.ph,0.55+0.45*Math.sin(t*0.35));"
+         "var ang=6.2831853*t/DUR;"
+         "gl.uniform2f(U.u,0.5+AX*Math.cos(ang*FX),0.5+AY*Math.sin(ang*FY));"
+         "gl.uniform1f(U.ax,AX*0.6*Math.sin(t*0.23));"
+         "gl.uniform1f(U.ay,AY*0.6*Math.sin(t*0.31+1.7));"
+         "gl.clearColor(1.0,1.0,1.0,1.0);gl.clear(gl.COLOR_BUFFER_BIT);"
+         "gl.drawArrays(gl.POINTS,0,N);requestAnimationFrame(frame);}"
+         "requestAnimationFrame(frame);return true;}"
+         "webgpu().then(function(ok){if(ok)return;"
+         "try{if(webgl2())return;}catch(e){}"
+         "svgOnly();});});")))
+
+(defn hero-canvas []
+  [:div {:class "kot-hero-canvas" :id "kot-hero-canvas" :aria-hidden "true"}
+   (html/raw fallback-svg)])
+
 (defn hero []
   [:section {:id "top" :class "kot-hero"}
+   (hero-canvas)
    (dds/container
     [:p {:class "kot-eyebrow"} "A language AI agents can use, not abuse"]
     (dds/heading 1 "AI writes freely. Kotoba draws the boundary." {:size "48"})
@@ -510,7 +659,18 @@
            [:p {:id "kot-play-status" :class "kot-play-status kot-muted"
                 :role "status" :aria-live "polite"}
             "Ready. No code has run yet."]
-           (caption "This executes a precompiled, immutable example. Editing arbitrary source in the browser is not yet a shipped compiler surface.")]))))
+           (caption "This executes a precompiled, immutable example. Editing arbitrary source in the browser is not yet a shipped compiler surface.")
+           [:p {:class "kot-caption kot-muted"}
+            "Interactive demos: "
+            (external-link "https://kotoba-lang.github.io/wasm-webcomponent/examples/solar-helix/"
+                           "solar-helix (guest-driven WebGPU render)")
+            " · "
+            (external-link "https://kotoba-lang.github.io/wasm-webcomponent/examples/kami-survivors/"
+                           "kami-survivors (a .kotoba game)")
+            " · "
+            (external-link "https://kotoba-lang.github.io/wasm-webcomponent/examples/gpu-clear/"
+                           "gpu-clear (WebGPU smoke)")
+            ". Hosted on the wasm-webcomponent GitHub Pages surface; availability is per-browser WebGPU/WebAssembly support."]]))))
 
 (defn libraries-section []
   (dds/section
@@ -1006,7 +1166,8 @@
      (source-section))]
    (footer)
    [:script search-js]
-   [:script play-js]])
+   [:script play-js]
+   [:script hero-js]])
 
 (defn blog-view []
   [:div
@@ -1343,6 +1504,8 @@
   (fs/mkdirSync (path/join out "ja" "legal") #js {:recursive true})
   (fs/writeFileSync (path/join out "ja" "legal" "index.html") legal-ja-html)
   (fs/copyFileSync logo-source-path (path/join out "kotoba-wordmark.png"))
+  ;; Cloudflare Workers static assets: _headers lives at the dist root.
+  (fs/copyFileSync (path/join "site" "_headers") (path/join out "_headers"))
   (fs/copyFileSync dependency-manifest-path (path/join out "dependencies.edn"))
   (doseq [[source target]
           [[benchmark-source-path (path/join out "benchmarks" "compile-wasm-latest.json")]
