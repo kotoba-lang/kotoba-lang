@@ -740,10 +740,16 @@
         :row-header? true
         :rows [[(str "The released kotoba CLI emits a module that will not compile above "
                      cli-top " functions")
-                (str "A defect, and the reason to validate inside a harness. "
-                     (inc cli-top) " is where a LEB128 function index stops fitting in one byte. "
-                     "The current compiler does not have it"
-                     (if cli-broken (str ": Amu builds K=" cli-broken " correctly.") "."))]
+                (str "A defect, and the reason to validate inside a harness. At K="
+                     (inc cli-top) " a call has to carry function index " cli-top
+                     ", the first value that needs two LEB128 bytes, and the emitter writes "
+                     "one. The bytes say it is not a missing encoder but an unused one: "
+                     "local.set 128 is written 80 01, and call 128 one instruction later is "
+                     "written 80. The count of truncated operands is exactly K minus " cli-top
+                     ". The current compiler does not have it"
+                     (if cli-broken (str " — Amu builds K=" cli-broken " correctly, and the "
+                                         "fix has been on its emitter's default branch since "
+                                         "before this release was tagged.") "."))]
                ["Every Kotoba lane traps at K=512 when built with default settings"
                 (str "Not a defect. A Kotoba module carries a declared call-fuel budget and "
                      "the compiler default is 512 calls, which this workload crosses at K=512 "
@@ -803,7 +809,9 @@
       (dds/button "Inspect build-scaling samples"
                   {:href "./benchmarks/build-scaling-latest.json"})
       (external-link "https://github.com/kotoba-lang/buildbench"
-                     "Re-run it on your machine")])))
+                     "Re-run it on your machine")
+      (external-link "https://github.com/kotoba-lang/kotoba/issues/526"
+                     "The defect, with its bytes")])))
 
 (defn benchmark-section []
   (let [kotoba (get-in benchmark [:results :kotoba])
