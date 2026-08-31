@@ -81,7 +81,7 @@ Run from the **repository root**, with `jp-go-digital-design-system`, `grammar`,
 JP_GO_DDS_ROOT=../jp-go-digital-design-system \
 KOTOBA_GRAMMAR_ROOT=../grammar \
 KOTOBA_IDENTITY_ROOT=../identity \
-nbb --classpath "../grammar/src:../jp-go-digital-design-system/src:../css/src:../html/src" site/generate.cljs
+nbb --classpath "site/src:../grammar/src:../jp-go-digital-design-system/src:../css/src:../html/src" site/generate.cljs
 ```
 
 The generator reads the vendored DADS stylesheet from
