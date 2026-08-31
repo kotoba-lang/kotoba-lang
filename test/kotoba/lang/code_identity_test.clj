@@ -124,8 +124,12 @@
 
 (deftest canonical-order-is-not-source-order
   (testing "map entry order"
-    (is (= (identity/definition-cid (assoc definition :definition/kir {:x 1 :y 2}))
-           (identity/definition-cid (assoc definition :definition/kir (array-map :y 2 :x 1))))))
+    ;; A real IR node, because kotoba-kir now refuses a :definition/kir that is
+    ;; not one ("definition typed KIR must be an IR node with :op"). The claim
+    ;; is unchanged -- entry order must not reach the CID -- and the block below
+    ;; was already written this way.
+    (is (= (identity/definition-cid (assoc definition :definition/kir {:op :const :value 1}))
+           (identity/definition-cid (assoc definition :definition/kir (array-map :value 1 :op :const))))))
   (testing "dependency order"
     (let [a (identity/definition-cid (assoc definition :definition/kir {:op :const :value 10}))
           b (identity/definition-cid (assoc definition :definition/kir {:op :const :value 20}))]

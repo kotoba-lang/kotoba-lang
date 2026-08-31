@@ -76,6 +76,9 @@
 (def domain-benchmark-source-path
   (path/join "bench" "public-domain-comparison" "latest.json"))
 
+(def build-scaling-source-path
+  (path/join "bench" "public-build-scaling" "latest.json"))
+
 (def play-source-path (path/join "site" "assets" "play" "double-21.kotoba"))
 (def play-wasm-path (path/join "site" "assets" "play" "double-21.wasm"))
 (def play-provenance-path
@@ -95,6 +98,10 @@
 
 (def domain-benchmark
   (js->clj (js/JSON.parse (fs/readFileSync domain-benchmark-source-path "utf8"))
+           :keywordize-keys true))
+
+(def build-scaling
+  (js->clj (js/JSON.parse (fs/readFileSync build-scaling-source-path "utf8"))
            :keywordize-keys true))
 
 (def play-source (fs/readFileSync play-source-path "utf8"))
@@ -758,6 +765,214 @@
           (external-link "https://itonami.cloud/" "Open Itonami")))
    (caption "These services retain separate authority, availability, and qualification boundaries. Their connection is not proof that every Kotoba capability is available as a generally sold hosted service.")))
 
+(def build-scaling-lane-order
+  [:kotoba-wasm-cli :amu-wasm :amu-native
+   :rustc-wasm :rustc-native :clang-wasm :clang-native :javac])
+
+(defn- scaling-cell
+  "One cell of the scaling table.
+
+  A lane that did not build is never rendered as a blank or a dash. The
+  fastest way to emit an artifact is to emit a broken one, so a build that
+  produced something which is not the program has to read differently from a
+  build that was quick."
+  [result]
+  (case (:status result)
+    "measured" (str (get-in result [:summary :median]) " ms")
+    "invalid" "invalid artifact"
+    "failed" "build failed"
+    "unavailable" "no toolchain"
+    "not-run" "budget spent"
+    (or (:status result) "—")))
+
+(defn- thousands [n]
+  (str/replace (str n) #"\B(?=(\d{3})+$)" ","))
+
+(defn build-scaling-section []
+  (let [scales (:scales build-scaling)
+        lanes (:lanes build-scaling)
+        present (filter #(contains? lanes %) build-scaling-lane-order)
+        absolute (:absoluteTimes build-scaling)
+        measured-date (subs (:generatedAt build-scaling) 0 10)
+        host (get-in build-scaling [:environment :cpu])
+        hostname (get-in build-scaling [:environment :hostname])
+        at (fn [k lane] (get-in (first (filter #(= k (:k %)) scales)) [:lanes lane]))
+        median (fn [k lane] (get-in (at k lane) [:summary :median]))
+        largest-measured (fn [lane]
+                           (last (for [s scales
+                                       :when (= "measured" (get-in s [:lanes lane :status]))]
+                                   (:k s))))
+        cli-top (largest-measured :kotoba-wasm-cli)
+        amu-top (largest-measured :amu-wasm)
+        cli-broken (first (for [s scales
+                                :when (= "invalid" (get-in s [:lanes :kotoba-wasm-cli :status]))]
+                            (:k s)))
+        biggest (:k (last scales))
+        ordering-at (fn [k] (get-in (first (filter #(= k (:k %)) scales))
+                                    [:ordering :kotoba-wasm-cli] {}))
+        ;; every size where the released CLI still emits a valid module — the
+        ;; crossover is the result, so showing only the ends would hide it
+        ordering-scales (for [sc scales
+                              :when (= "measured" (get-in sc [:lanes :kotoba-wasm-cli :status]))]
+                          (:k sc))
+        smallest-ordering (ordering-at (:k (first scales)))
+        cli-fastest-when-small (and (seq smallest-ordering)
+                                    (every? :qualifiedFaster (vals smallest-ordering)))]
+    (list
+     (dds/heading 3 "Build time as the source gets larger" {:size "24"})
+     [:p
+      "The benchmarks above build a program small enough to fit on one screen, "
+      "which measures how quickly a toolchain starts. It says little about the "
+      "number a developer actually waits on, which is the slope. This fifth "
+      "benchmark generates the same program at increasing sizes — "
+      (code "K") " independent four-operation functions and one entry point that "
+      "calls all of them — and builds it through every toolchain on the host, in "
+      "rotating order."]
+     [:p
+      "It then runs what each toolchain produced, after the clock has stopped. "
+      "That check is not decoration. The fastest way to emit an artifact is to "
+      "emit a broken one, so a lane that stopped working would otherwise post "
+      "its best numbers exactly where it stopped working."]
+     [:div {:class "kot-table-scroll"}
+      (dds/table
+       {:caption "Process-cold build wall time by source size; medians, one host, lanes interleaved"
+        :headers (into ["Toolchain / target"]
+                       (for [s scales] (str "K=" (:k s))))
+        :row-header? true
+        :rows (for [id present]
+                (into [(str (get-in lanes [id :label]) " · "
+                            (get-in lanes [id :target]))]
+                      (for [s scales] (scaling-cell (get-in s [:lanes id])))))})]
+     (caption
+      (str "Measured " measured-date " on " hostname " (" host "). "
+           "K is the number of generated functions; the Kotoba source runs from "
+           (get-in (first scales) [:sourceLines :kotoba]) " to "
+           (get-in (last scales) [:sourceLines :kotoba]) " lines. "
+           "Targets, ABIs, optimisation levels and runtime contracts differ across "
+           "lanes, so this asks about developer feedback latency, not equivalent work. "
+           (if (:qualified absolute)
+             "The host stayed under the quiet-load gate, so these milliseconds are absolute figures for this machine."
+             (str "The host-load gate failed (load1 "
+                  (str/join "–" (map str (take 2 (:observedLoad1 absolute))))
+                  ", required ≤ " (:quietLoad1Limit absolute)
+                  "), so these are observations of this run rather than portable figures. "
+                  "Because the lanes are interleaved, the ordering is qualified separately."))))
+     (dds/heading 3 "Which orderings survive the noise test" {:size "24"})
+     [:p
+      "A ratio is not a ranking. "
+      (external-link "https://github.com/kotoba-lang/perfgate" "perfgate")
+      " refuses any ordering whose gap falls inside the two arms' own spread, "
+      "however large the ratio looks, and refuses an arm with too few samples or "
+      "too much noise. It runs here at its own default policy, unrelaxed — a "
+      "threshold loosened to let this run through would be a benchmark measuring "
+      "its own thresholds. Because the lanes are interleaved on one host, a gap "
+      "that survives this test survives the host being busy."]
+     [:div {:class "kot-table-scroll"}
+      (dds/table
+       {:caption "Released Kotoba CLI against each comparator, at every size where it still emits a valid module"
+        :headers ["Size" "Compared against" "Kotoba faster?" "Gap vs combined spread" "Why not, if not"]
+        :row-header? true
+        :rows (for [k ordering-scales
+                    [id v] (sort-by key (ordering-at k))]
+                (let [sep (:separation v)
+                      reasons (distinct (map :reason (:reasons v)))]
+                  [(str "K=" k)
+                   (str (get-in lanes [id :label]) " · " (get-in lanes [id :target]))
+                   (if (:qualifiedFaster v) "yes, qualified" "no")
+                   (str (some-> (:gap sep) (.toFixed 1)) " ms vs "
+                        (some-> (:summed-stdev sep) (.toFixed 1)) " ms")
+                   (if (:qualifiedFaster v) "—" (str/join ", " reasons))]))})]
+     (caption
+      (str "improvement-below-threshold means the Kotoba lane was not faster at that size at all. "
+           "The advantage is real and qualified at cold start, and it is gone against C by K=32 "
+           "and against Rust by K=" cli-top ". That crossover is the result, so it is shown rather "
+           "than summarised away."))
+     (dds/heading 3 "Two failures that are not the same failure" {:size "24"})
+     [:p
+      "Three Kotoba lanes stopped working in this run, and publishing them as one "
+      "row would have been wrong. One is a defect. The other two are declared "
+      "bounds being enforced exactly as specified, and reporting those as defects "
+      "would mean measuring the bounds instead of the compiler."]
+     [:div {:class "kot-table-scroll"}
+      (dds/table
+       {:caption "What stopped, and what it means"
+        :headers ["Observation" "Reading"]
+        :row-header? true
+        :rows [[(str "The released kotoba CLI emits a module that will not compile above "
+                     cli-top " functions")
+                (str "A defect, and the reason to validate inside a harness. At K="
+                     (inc cli-top) " a call has to carry function index " cli-top
+                     ", the first value that needs two LEB128 bytes, and the emitter writes "
+                     "one. The bytes say it is not a missing encoder but an unused one: "
+                     "local.set 128 is written 80 01, and call 128 one instruction later is "
+                     "written 80. The count of truncated operands is exactly K minus " cli-top
+                     ". The current compiler does not have it"
+                     (if cli-broken (str " — Amu builds K=" cli-broken " correctly, and the "
+                                         "fix has been on its emitter's default branch since "
+                                         "before this release was tagged.") "."))]
+               ["Every Kotoba lane traps at K=512 when built with default settings"
+                (str "Not a defect. A Kotoba module carries a declared call-fuel budget and "
+                     "the compiler default is 512 calls, which this workload crosses at K=512 "
+                     "where the entry point calls 512 leaves. The harness declares "
+                     (thousands (get-in build-scaling [:method :declaredKotobaFuel]))
+                     " units explicitly and records that it did. C, Rust and Java have no "
+                     "equivalent bound to raise.")]
+               ["Amu refuses the module outright once it would hold more than 1,024 functions"
+                (str "Also not a defect, and the opposite of the first row. max-functions is a "
+                     "declared admission limit, so the compiler stops with "
+                     "kotoba.error/subset-reject and names what it refused, rather than emitting "
+                     "something that will not load. A loud ceiling and a silent one are very "
+                     "different results, and only a harness that executes the artifact tells "
+                     "them apart. The limit is per module: a larger program is a multi-module "
+                     "project, which this single-file benchmark deliberately does not exercise.")]]})]
+     (dds/heading 3 "What this establishes" {:size "24"})
+     [:div {:class "kot-table-scroll"}
+      (dds/table
+       {:caption "The fifth benchmark's answers, including the ones that are unfavourable"
+        :headers ["Question" "Answer from this run"]
+        :row-header? true
+        :rows [["How fast is a cold Kotoba build of a small module?"
+                (str "The released CLI builds K=1 in " (median 1 :kotoba-wasm-cli)
+                     " ms process-cold, artifact executed and answer checked — the "
+                     "fastest first result of any lane measured here.")]
+               ["How large a module can the released binary build?"
+                (str "Up to " cli-top " functions. Beyond that it is not slower, it is wrong, "
+                     "and this harness reports that as a failed lane rather than a fast one.")]
+               ["Does build time stay competitive as the source grows?"
+                (str "Through K=" cli-top " the released CLI is measured against Rust and C "
+                     "in the table above. Past that point the only Kotoba compiler that "
+                     "still emits a correct module is Amu, which runs on nbb rather than as "
+                     "a released binary, and is roughly an order of magnitude slower at every "
+                     "size measured — so at large sizes build speed is not currently a Kotoba "
+                     "strength, and this page is not going to claim otherwise.")]
+               ["How large a source has been built end to end?"
+                (str "K=" (or amu-top biggest) " through Amu — "
+                     (get-in (first (filter #(= amu-top (:k %)) scales)) [:sourceLines :kotoba])
+                     " lines of Kotoba, artifact executed and the answer checked. That is one "
+                     "function short of the declared 1,024 ceiling, and the next size up is "
+                     "refused rather than mis-built.")]
+               ["Is the emitted code fast?"
+                "Out of scope here — this measures building, not running. The native runtime suite above asks that question."]]})]
+     [:p
+      [:strong "Bottom line: "]
+      (if cli-fastest-when-small
+        (str "At the smallest size the released binary is faster than every comparator here by "
+             "a margin that survives the noise test, and it has a hard correctness ceiling at "
+             cli-top " functions. ")
+        (str "The released binary has the lowest cold-start median on this host, though not by "
+             "a margin the noise test will qualify against every comparator, and it has a hard "
+             "correctness ceiling at " cli-top " functions. "))
+      "The compiler without that ceiling is roughly an order of magnitude slower at every size "
+      "measured. Both facts come from the same run, and the harness that found them is public, "
+      "so the run can be disagreed with."]
+     [:div {:class "kot-actions"}
+      (dds/button "Inspect build-scaling samples"
+                  {:href "./benchmarks/build-scaling-latest.json"})
+      (external-link "https://github.com/kotoba-lang/buildbench"
+                     "Re-run it on your machine")
+      (external-link "https://github.com/kotoba-lang/kotoba/issues/526"
+                     "The defect, with its bytes")])))
+
 (defn benchmark-section []
   (let [kotoba (get-in benchmark [:results :kotoba])
         rust (get-in benchmark [:results :rust])
@@ -789,9 +1004,9 @@
                      (str (:medianMilliseconds stage) " ms")
                      "N/A"))]
     (dds/section
-     {:id "benchmark" :title "Four benchmarks. Four different questions."}
+     {:id "benchmark" :title "Five benchmarks. Five different questions."}
      [:p {:class "kot-lead"}
-      "Compiler startup asks how quickly one tiny source becomes an artifact. The developer loop separates resolution, checking, builds, and first result. Native runtime asks how fast already-built code runs. The workload-domain suite asks how strings, collections, allocation, I/O, concurrency, and a small real application behave. The results keep all four questions—and their evidence status—separate."]
+      "Compiler startup asks how quickly one tiny source becomes an artifact. Build scaling asks what happens to that number when the source stops being tiny—and whether the artifact still answers. The developer loop separates resolution, checking, builds, and first result. Native runtime asks how fast already-built code runs. The workload-domain suite asks how strings, collections, allocation, I/O, concurrency, and a small real application behave. The results keep all five questions—and their evidence status—separate."]
      (dds/grid
       {:min "16rem"}
       (card (dds/chip-label "BUILD STARTUP · RANK UNQUALIFIED" {:color "gray"})
@@ -827,6 +1042,17 @@
                           (:observedLoad1First end-speed) " → "
                           (:observedLoad1Last end-speed) " · required ≤ "
                           (:quietLoad1Limit end-speed))))
+     (card (dds/chip-label "BUILD SCALING · CEILING FOUND" {:color "gray"})
+            (dds/heading 3 (str (count (:scales build-scaling)) " source sizes") {:size "24"})
+            [:p "The same program from one function to "
+             (:k (last (:scales build-scaling)))
+             ", built by every toolchain on the host and then executed. "
+             "The released binary has the lowest cold-start cost here and a correctness "
+             "ceiling above 128 functions."]
+            (caption (str "artifacts checked after the clock stops · load1 "
+                          (str/join " → " (map str (take 2 (get-in build-scaling [:absoluteTimes :observedLoad1]))))
+                          " · required ≤ " (get-in build-scaling [:absoluteTimes :quietLoad1Limit])
+                          " · " (subs (:generatedAt build-scaling) 0 10))))
      (card (dds/chip-label "WORKLOAD DOMAINS · RANK UNQUALIFIED" {:color "gray"})
             (dds/heading 3 "6 domains × 6 runtime paths" {:size "24"})
             [:p "Strings, collections, allocation, file I/O, four-worker concurrency, and a request-admission policy application kernel are correctness checked."]
@@ -835,6 +1061,7 @@
                           (get-in domain-benchmark [:machine :load1Before]) " → "
                           (get-in domain-benchmark [:machine :load1After])
                           (if domain-qualified " · qualified" " · rank withheld")))))
+     (build-scaling-section)
      (dds/heading 3 "Optimization delivery after the published run" {:size "24"})
      [:p
       "The dated benchmark above remains immutable. New implementation slices are listed separately until the same-artifact suite reruns and passes its qualification gates."]
@@ -1181,6 +1408,13 @@
       [:p {:class "kot-lead"}
        "Short notes about language design, measurements, shipped boundaries, and what still remains unqualified."]]
      [:article {:class "kot-blog-entry"}
+      [:p {:class "kot-eyebrow"} "31 August 2026 · Benchmarks"]
+      (dds/heading 2 "A fifth benchmark, and the claim it would not support" {:size "32"})
+      [:p "The four benchmarks all built a program small enough to fit on one screen, which measures how quickly a toolchain starts rather than the number a developer waits on. The new build-scaling suite generates the same program at eight sizes, builds it through every toolchain on the host, and then executes what each one produced."]
+      [:p "Executing the artifact is what makes it a benchmark rather than a stopwatch. The released Kotoba CLI emits an invalid WebAssembly module above 128 functions and exits successfully, so an unvalidated harness would have recorded its best numbers exactly where it had stopped working. Two further Kotoba lanes stop at declared bounds — a call-fuel budget and a function-count admission limit — which are the opposite result and had to be reported as such."]
+      [:p "The suite was added to show build speed as a strength. It shows the released binary with the lowest cold-start build cost of any lane measured, and it shows that at large sizes build speed is not currently a Kotoba strength. Both halves are in the same table."]
+      [:p [:a {:class "kot-link" :href "../#benchmark"} "Read the build-scaling results"]]]
+     [:article {:class "kot-blog-entry"}
       [:p {:class "kot-eyebrow"} "29 August 2026 · Benchmarks"]
       (dds/heading 2 "Four benchmarks answer four different questions" {:size "32"})
       [:p "Compiler startup measures one tiny source-to-artifact path. The developer-loop suite separates resolution, checking, clean and no-change builds, and first result across eleven toolchain paths. Native runtime measures already-built programs. A fourth suite compares strings, collections, allocation, I/O, concurrency, and a small real application across six representative runtime paths. Kotoba publishes them separately so one fast phase cannot be mistaken for universal speed."]
@@ -1512,6 +1746,7 @@
            [runtime-benchmark-source-path (path/join out "benchmarks" "runtime-native-latest.json")]
            [end-to-end-benchmark-source-path (path/join out "benchmarks" "end-to-end-latest.json")]
            [domain-benchmark-source-path (path/join out "benchmarks" "domains-latest.json")]
+           [build-scaling-source-path (path/join out "benchmarks" "build-scaling-latest.json")]
            [(path/join "site" "assets" "llms.txt") (path/join out "llms.txt")]
            [(path/join "site" "assets" "llms-full.txt") (path/join out "llms-full.txt")]
            [(path/join "site" "assets" "agent-quickstart.md") (path/join out "agent-quickstart.md")]]]
