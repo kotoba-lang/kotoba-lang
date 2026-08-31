@@ -98,6 +98,18 @@ repository README. Its authoritative source is
 The generator copies that local asset into `dist/`, so the deployed page makes
 no external image request.
 
+`site/assets/kotoba-og-card.png` (1200x630, SHA-256
+`6e4b107fc8dd8623df36a31f15e7889d3672f9e932dcc9ddd8d74745b8959fc9`) and
+`site/assets/kotoba-favicon.png` (64x64, SHA-256
+`1d654a287062943236f9ce8eea3c1818c7b5a06e25975ccae4363e7ee967e7e2`) are
+deterministic derivatives of the sources in `site/assets/meta-src/`: render
+each with headless Chrome at its nominal size
+(`--window-size=1200,630` / `--window-size=64,64
+--default-background-color=00000000`), screenshot, and copy over the checked-in
+PNG. The OG card reuses the hero ring geometry (stroke arc sampled at 360
+points) so the share card matches the live hero. The generator refuses to run
+when either asset is missing.
+
 Output: `site/dist/index.html`, `site/dist/blog/index.html`,
 `site/dist/legal/index.html`, the Play artifact and evidence, the wordmark,
 AI-agent text surfaces, and the raw benchmark JSON (committed, so a clean
