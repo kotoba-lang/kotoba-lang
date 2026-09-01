@@ -21,6 +21,7 @@
   ["lang/safety-claims.edn"
    "lang/surface-status.edn"
    "lang/elaboration-pipeline.edn"
+   "lang/typed-eval.edn"
    "lang/wasm-component-platform.edn"
    "lang/library-publication.edn"
    "lang/docs-release.edn"
@@ -36,6 +37,7 @@
 (def surface-status (authority "lang/surface-status.edn"))
 (def platform       (authority "lang/wasm-component-platform.edn"))
 (def elaboration    (authority "lang/elaboration-pipeline.edn"))
+(def typed-eval     (authority "lang/typed-eval.edn"))
 (def library-publication (authority "lang/library-publication.edn"))
 (def docs-release   (authority "lang/docs-release.edn"))
 (def product-defaults (authority "lang/product-defaults.edn"))
@@ -539,6 +541,32 @@
    [:blockquote {:class "kot-quote"}
     [:strong "Content identity is not authority."]
     [:p "CID verification, signatures, revocation, host policy, resource checks, and OS isolation remain separate boundaries."]]))
+
+(defn typed-eval-section []
+  (dds/section
+   {:id "typed-eval" :title "Lisp eval, without ambient host eval"}
+   [:p {:class "kot-lead"}
+    "Kotoba evaluates checked code as content-addressed data. The familiar "
+    (code "(eval request)")
+    " surface lowers to the typed " (code ":code/eval")
+    " ability; it never receives source text, a reader form, a namespace, or a host object."]
+   (dds/grid
+    {:min "16rem"}
+    (card (dds/chip-label "DEFINITION CID")
+          (dds/heading 3 "What code?" {:size "20"})
+          [:p "The CID selects a hash-verified checked-KIR definition and its CID-only dependency closure."])
+    (card (dds/chip-label "ADMISSION CID")
+          (dds/heading 3 "May it run here?" {:size "20"})
+          [:p "The exact interface, complete effect row, current allowance, fuel, and decreasing eval depth are bound before execution."])
+    (card (dds/chip-label "VALUE CID")
+          (dds/heading 3 "What came back?" {:size "20"})
+          [:p "The typed result is persisted as content-addressed evidence. Its hash cannot retroactively authorize an effect."]))
+   [:blockquote {:class "kot-quote"}
+    [:strong "Identity, authority, and result evidence are three different facts."]]
+   (caption "Machine contract: "
+            (code "lang/typed-eval.edn") ". Compiler wire capability: "
+            (code (str (:compiler-wire-id typed-eval))) ". "
+            "Bounded apply remains ordinary closed-module closure application.")))
 
 (defn why-section []
   (dds/section
@@ -1398,6 +1426,7 @@
      (blog-cloud-section)
      (proof-section)
      (architecture-section)
+     (typed-eval-section)
      (start-section)
      (benchmark-section)
      (claims-section)

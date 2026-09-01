@@ -189,7 +189,7 @@
         html (slurp "site/dist/index.html")]
     (is (= manifest published) "the public dependency manifest must be exact")
     (is (= "kotoba-lang/grammar" (:repository syntax)))
-    (is (= "de393f6087daf931ae924e5dd0ec75dea7a87bd2" (:revision syntax)))
+    (is (= "383882d622845dd699dd3c595fee0c13f7aa5398" (:revision syntax)))
     (is (= "kotoba.grammar.highlight/tokenize" (:api syntax)))
     (is (= "site/generate.cljs/highlighted-kotoba" (:consumer syntax)))
     (is (false? (:runtime-dependency syntax)))
@@ -199,3 +199,11 @@
                    "kot-syntax-number" "kot-syntax-delimiter"
                    "kot-syntax-symbol"]]
       (is (str/includes? html class) (str class " must remain rendered")))))
+
+(deftest generated-site-explains-typed-eval-without-authority-overclaim
+  (let [html (slurp "site/dist/index.html")]
+    (is (str/includes? html "id=\"typed-eval\""))
+    (is (str/includes? html "DEFINITION CID"))
+    (is (str/includes? html "ADMISSION CID"))
+    (is (str/includes? html "VALUE CID"))
+    (is (str/includes? html "Its hash cannot retroactively authorize an effect"))))

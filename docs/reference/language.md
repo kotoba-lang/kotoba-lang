@@ -34,6 +34,14 @@ persistent pair-chain representations with linear bounded operations.
 ## Evaluation and errors
 
 - Evaluation order is deterministic and defined by the semantics SSoT.
+- `apply` performs bounded application of an already checked closure.
+- `(eval request)` invokes the typed `:code/eval` ability. Its bounded
+  `:document` names a checked-KIR definition CID and canonical arguments; the
+  surrounding typed context fixes the result. DefCID, AdmissionCID, and
+  ValueCID remain separate. See the machine contract in
+  [`lang/typed-eval.edn`](../../lang/typed-eval.edn).
+- Host `eval`, source-string loading, reader evaluation, and ambient namespace
+  resolution remain forbidden.
 - Hidden exception paths are excluded from safe components; fallible work uses
   explicit option/result values.
 - Execution is fuel-bounded. See the [fuel model](../lang/fuel-model.md).

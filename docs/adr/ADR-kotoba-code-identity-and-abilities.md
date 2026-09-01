@@ -149,8 +149,9 @@ required authority; it never replaces host-side policy enforcement.
 - Treating source or component hashes as proof that code is pure or safe.
 - Adopting a global Unison-style codebase namespace before definition identity
   is implemented and independently reproducible.
-- Adding general effect handlers, runtime `eval`, dynamic loading, or ambient
-  I/O.
+- Adding general effect handlers, ambient host `eval`, source-text dynamic
+  loading, or ambient I/O. CID-addressed checked-KIR typed eval is governed by
+  `ADR-kotoba-typed-eval.md` and does not relax this boundary.
 - Creating a direct native AOT/OS-syscall route for ordinary Kotoba code.
 - Treating a host-language provider callback as the primary execution model;
   normal execution composes admitted Wasm Components through `kototama`.

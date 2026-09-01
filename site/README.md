@@ -16,6 +16,7 @@ at build time from:
 ```
 lang/safety-claims.edn          lang/wasm-component-platform.edn
 lang/surface-status.edn         lang/elaboration-pipeline.edn
+lang/typed-eval.edn
 lang/docs-release.edn           lang/product-defaults.edn
 docs/search-index.edn
 ```
