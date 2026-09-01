@@ -17,11 +17,16 @@ or `ttl = -1` packs.
 | Layer | What | When to use |
 |---|---|---|
 | **Language option** `[:option T]` | Typed optional value; `option-or` for a value default, `if-some` / `when-some` for control flow | Product pure oracles, PVA v1 hosts |
-| **Stdlib prelude records** `Some`/`None`/`Ok`/`Err` | Explicit prelude helpers (`option-value`, `unwrap-ok`, …) from `lang/stdlib/core.kotoba` | Programs compiled **with** `--prelude` / conformance `:prelude` |
+| **Language option/result builtins** `option-some` / `option-none` / `option-some?` / `option-value` / `result-ok` / `result-err` / `result-ok?` / `result-value` / `result-error` | Named operations the frontend owns; the same names, as values rather than sugar | Library code building or inspecting an option/result explicitly |
 
 Pure-product **product oracles** should use `[:option T]` with `option-or` for a
 fallback value, or `if-some` when the payload controls a branch.
-Prelude helpers are for portable library / stdlib conformance, not a second ABI.
+
+There is no third layer. The bounded stdlib used to carry its own `Some`/`None`/
+`Ok`/`Err` records and helpers named `option-value`, `unwrap-ok` and so on; the
+language has since taken those names (they are RESERVED, so no module can
+define them), and version 2 of the stdlib freeze withdrew the records. See
+`lang/conformance/stdlib/manifest.edn` `:withdrawn`.
 
 ---
 
@@ -66,35 +71,42 @@ Compiler evidence: `kotoba.compiler.pure-product-profile-test`,
 
 ---
 
-## 3. Stdlib prelude option/result (explicit records)
+## 3. Option/result as named operations
 
-When the program is compiled **with** `lang/stdlib/core.kotoba` as prelude:
+These are language builtins, not library functions. They are RESERVED names: a
+module that defines one is refused with `reserved function name`.
 
 | Name | Role |
 |---|---|
-| `option-some` / `option-none` | Construct record options |
-| `option-some?` / `option-none?` | Predicates |
+| `option-some` / `option-none` | Construct an option |
+| `option-some?` | Predicate |
 | `option-value` | Payload or default |
-| `ok` / `err` | Result records |
-| `ok?` / `err?` | Predicates |
-| `unwrap-ok` / `unwrap-err` | Payload or default |
+| `result-ok` / `result-err` | Construct a result |
+| `result-ok?` | Predicate |
+| `result-value` / `result-error` | Payload or default |
 
-Conformance sketch (`lang/conformance/stdlib/basic.kotoba`):
+The parametric family (`option-some-of`, `option-match`, `result-match-of`, …)
+carries an explicit type and is lowering-level ABI, not cookbook syntax.
 
 ```kotoba
 (defn main []
   (+ (option-value (option-some 4) 0)
-     (unwrap-ok (ok 5) 0)))
+     (result-value (result-ok 5) 0)))
 ```
 
-Public name freeze: T4.1 `lang/conformance/stdlib/manifest.edn`.
+The stdlib no longer defines any of this. Its own conformance entry
+(`lang/conformance/stdlib/basic.kotoba`) is now a two-module project that
+requires `stdlib.core` and calls `first-match` and `reverse`; the option/result
+names it used to call are the builtins above.
+
+Public name freeze: T4.1 `lang/conformance/stdlib/manifest.edn` (version 2).
 
 ---
 
 ## 4. Decision checklist
 
 1. Writing a **murakumo / product pure oracle**? → `[:option T]` + `if-some`.  
-2. Need **library-style** option/result without host ABI? → prelude + T4.1 names.  
+2. Need to build or inspect an option/result explicitly? → the language builtins in §3.  
 3. Tempted to add `has-foo :i64`? → stop; use option.  
 4. Need multi-field optional config? → prefer small record / hetero-vector (T5), not base-N packs.
 
@@ -110,4 +122,5 @@ Public name freeze: T4.1 `lang/conformance/stdlib/manifest.edn`.
 
 ---
 
-*T4.3 deliverable: guide + golden pointers; helpers already landed (if-some / prelude).*
+*T4.3 deliverable: guide + golden pointers; helpers already landed (if-some /
+language option-result builtins).*
