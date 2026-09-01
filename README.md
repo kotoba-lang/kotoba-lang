@@ -234,7 +234,32 @@ Content addressing proves byte identity, not authorization. Signatures,
 trusted-signer policy, validity, revocation, and host admission remain separate
 checks.
 
-### 4. Host enforcement
+### 4. Typed `eval`, bounded `apply`
+
+Kotoba keeps Lisp's two central dynamic operations without reopening ambient
+host evaluation. `apply` invokes an already checked closure with at most four
+arguments. `(eval request)` is a typed `:code/eval` ability: its bounded
+document names a checked-KIR definition by CID and carries canonical argument
+documents; its result type comes from the surrounding function contract.
+
+```clojure
+(ns app (:capabilities #{:code/eval}))
+
+(defn run [request :document] :i64
+  (eval request))
+```
+
+Before execution, the host binds the DefCID, exact interface and effect row,
+current effect allowance, fuel, and decreasing nested-eval depth into an
+AdmissionCID. The typed output is persisted as a ValueCID. The three identities
+are deliberately distinct: a definition hash proves what code was selected,
+not that it may run, and a result hash is evidence after execution rather than
+authority for an effect. Host `eval`, source strings, reader evaluation, and
+ambient namespace lookup remain forbidden. See
+[`lang/typed-eval.edn`](lang/typed-eval.edn) and the
+[`typed eval ADR`](docs/adr/ADR-kotoba-typed-eval.md).
+
+### 5. Host enforcement
 
 The runtime or tender verifies the artifact and binds only the admitted imports.
 The provider or native handler rechecks the resource scope before performing an

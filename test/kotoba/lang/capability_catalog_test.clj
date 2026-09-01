@@ -13,7 +13,7 @@
   (let [authority (catalog/validate! (catalog/read-authority))
         entries (:capabilities authority)
         wire-ids (sort (map :compiler-wire-id (vals entries)))]
-    (is (= 26 (count entries)))
+    (is (= 30 (count entries)))
     (is (= (range 1 (inc (count entries))) wire-ids)
         "wire ids stay contiguous from 1 with no duplicates or gaps")
     (is (= [4 11 12]
@@ -34,7 +34,12 @@
                   :dataspace/transact])))
     (is (= [25 26]
            (mapv #(get-in entries [% :compiler-wire-id])
-                 [:stream/accept :stream/send])))))
+                 [:stream/accept :stream/send])))
+    (is (= [27 28 29 30]
+           (mapv #(get-in entries [% :compiler-wire-id])
+                 [:net/datagram :link/frame :can/frame :code/eval])))
+    (is (= 'code/eval (get-in entries [:code/eval :source-operation])))
+    (is (= 'eval (get-in entries [:code/eval :source-alias])))))
 
 (deftest duplicate-wire-id-fails-closed
   (let [authority (catalog/read-authority)]

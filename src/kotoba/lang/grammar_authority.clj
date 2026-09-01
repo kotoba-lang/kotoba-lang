@@ -228,6 +228,7 @@
                 :lazy-sequences '[lazy-cons lazy-first lazy-rest lazy-empty?
                                   lazy-map lazy-filter take drop]
                 :dynamic-arity-apply '[apply]
+                :typed-eval '[eval]
                 :bounded-control-and-sugar '[loop recur match defdesugar]
                 :nested-destructuring '[]
                 :protocol-and-record-dispatch '[defrecord defprotocol definterface

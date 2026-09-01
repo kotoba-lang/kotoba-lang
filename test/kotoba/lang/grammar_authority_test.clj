@@ -188,7 +188,7 @@
     (doseq [k [:language-profile :guest-grammar :surface-status
                :desugar-contract :typed-kir :capability-catalog
                :semantic-cid :elaboration-pipeline :code-identity
-               :portable-effect]]
+               :typed-eval :portable-effect]]
       (is (integer? (get versions k)) k))))
 
 (deftest contract-versions-that-restate-another-file-must-agree-with-it
