@@ -1714,23 +1714,30 @@
 (defn- favicon-link []
   [:link {:rel "icon" :type "image/png" :href "/kotoba-favicon.png"}])
 
+(defn- apple-touch-icon-link []
+  [:link {:rel "apple-touch-icon" :href "/kotoba-favicon.png"}])
+
 (defn- og-head
   "Open Graph / Twitter card / canonical head tags. og:image uses the full
   absolute URL social scrapers require; canonical is this page's own URL.
   The description meta itself comes from page/->page's :description option —
-  this must not emit a second one."
-  [path]
-  (list
-   [:link {:rel "canonical" :href (str site-origin path)}]
-   [:meta {:property "og:site_name" :content "Kotoba"}]
-   [:meta {:property "og:type" :content "website"}]
-   [:meta {:property "og:url" :content (str site-origin path)}]
-   [:meta {:property "og:image" :content (str site-origin "/kotoba-og-card.png")}]
-   [:meta {:property "og:image:width" :content "1200"}]
-   [:meta {:property "og:image:height" :content "630"}]
-   [:meta {:property "og:image:alt" :content "AI writes freely. Kotoba draws the boundary."}]
-   [:meta {:name "twitter:card" :content "summary_large_image"}]
-   [:meta {:name "twitter:image" :content (str site-origin "/kotoba-og-card.png")}]))
+  this must not emit a second one. og:title and og:description are emitted
+  explicitly because some scrapers do not fall back to <title>/<meta
+  description> when og: properties are present but these two are missing."
+  ([path title description]
+   (list
+    [:link {:rel "canonical" :href (str site-origin path)}]
+    [:meta {:property "og:site_name" :content "Kotoba"}]
+    [:meta {:property "og:type" :content "website"}]
+    [:meta {:property "og:url" :content (str site-origin path)}]
+    [:meta {:property "og:title" :content title}]
+    [:meta {:property "og:description" :content description}]
+    [:meta {:property "og:image" :content (str site-origin "/kotoba-og-card.png")}]
+    [:meta {:property "og:image:width" :content "1200"}]
+    [:meta {:property "og:image:height" :content "630"}]
+    [:meta {:property "og:image:alt" :content "AI writes freely. Kotoba draws the boundary."}]
+    [:meta {:name "twitter:card" :content "summary_large_image"}]
+    [:meta {:name "twitter:image" :content (str site-origin "/kotoba-og-card.png")}])))
 
 (def html
   (page/->page
@@ -1741,7 +1748,12 @@
     :lang "en"
     :css dds-css
     :app-css (str tokens/skin-css "\n" app-css)
-    :head (list (favicon-link) (og-head "/"))}
+    :head (list (favicon-link)
+                (apple-touch-icon-link)
+                (og-head "/" "Kotoba — post-quantum-by-default computing for AI agents"
+                         (str "AI writes freely. Kotoba draws the boundary. An intuitive, declarative, "
+                              "security-first, post-quantum-by-default language and computing stack with checked KIR, explicit "
+                              "capability and effect admission, content-addressed artifacts, and host enforcement.")))}
    (view)))
 
 (def blog-html
@@ -1751,7 +1763,10 @@
     :lang "en"
     :css dds-css
     :app-css (str tokens/skin-css "\n" app-css)
-    :head (list (favicon-link) (og-head "/blog/"))}
+    :head (list (favicon-link)
+                (apple-touch-icon-link)
+                (og-head "/blog/" "Kotoba Blog — engineering notes and evidence"
+                         "Kotoba engineering notes about language design, benchmarks, evidence, and remaining qualification gates."))}
    (blog-view)))
 
 (def libraries-html
@@ -1761,7 +1776,10 @@
     :lang "en"
     :css dds-css
     :app-css (str tokens/skin-css "\n" app-css)
-    :head (list (favicon-link) (og-head "/libraries/"))}
+    :head (list (favicon-link)
+                (apple-touch-icon-link)
+                (og-head "/libraries/" "Kotoba Libraries — content-addressed publication and comparison"
+                         "Inspect, publish, discover, and compare Kotoba libraries by immutable definition and release CIDs, with GitHub provenance kept separate."))}
    (libraries-view)))
 
 (def libraries-ja-html
@@ -1771,7 +1789,10 @@
     :lang "ja"
     :css dds-css
     :app-css (str tokens/skin-css "\n" app-css)
-    :head (list (favicon-link) (og-head "/ja/libraries/"))}
+    :head (list (favicon-link)
+                (apple-touch-icon-link)
+                (og-head "/ja/libraries/" "Kotoba Libraries — content-addressed publication と比較"
+                         "不変な definition CID と release CID を使って Kotoba library を inspect、publish、discover、compare し、GitHub provenance を identity と分けます。"))}
    (libraries-ja-view)))
 
 (def legal-html
@@ -1781,7 +1802,10 @@
     :lang "en"
     :css dds-css
     :app-css (str tokens/skin-css "\n" app-css)
-    :head (list (favicon-link) (og-head "/legal/"))}
+    :head (list (favicon-link)
+                (apple-touch-icon-link)
+                (og-head "/legal/" "Kotoba Labs Inc. — public operator"
+                         "kotoba-lang.org is operated by Kotoba Labs Inc. Public contact: support@kotoba-lang.org."))}
    (legal-view)))
 
 (def legal-ja-html
@@ -1791,7 +1815,10 @@
     :lang "ja"
     :css dds-css
     :app-css (str tokens/skin-css "\n" app-css)
-    :head (list (favicon-link) (og-head "/ja/legal/"))}
+    :head (list (favicon-link)
+                (apple-touch-icon-link)
+                (og-head "/ja/legal/" "Kotoba Labs Inc. — 公開運営者"
+                         "kotoba-lang.org の公開運営者は Kotoba Labs Inc. です。公開連絡先: support@kotoba-lang.org。"))}
    (legal-ja-view)))
 
 (let [out (path/join "site" "dist")]
