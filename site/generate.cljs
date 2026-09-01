@@ -72,6 +72,9 @@
 (def favicon-source-path
   (path/join "site" "assets" "kotoba-favicon.png"))
 
+(def favicon-ico-source-path
+  (path/join "site" "assets" "kotoba-favicon.ico"))
+
 (def site-origin "https://kotoba-lang.org")
 
 (def benchmark-source-path
@@ -158,9 +161,11 @@
   (js/process.exit 1))
 
 (when-not (and (fs/existsSync og-card-source-path)
-               (fs/existsSync favicon-source-path))
+               (fs/existsSync favicon-source-path)
+               (fs/existsSync favicon-ico-source-path))
   (println "site/generate.cljs: OG card / favicon assets not found under site/assets/")
   (println "  regenerate them from site/assets/meta-src/ with headless Chrome screenshots")
+  (println "  favicon.ico comes from png_to_ico conversion of the checked-in 64x64 PNG")
   (js/process.exit 1))
 
 (when-not (fs/existsSync syntax-grammar-path)
@@ -1742,18 +1747,14 @@
 (def html
   (page/->page
    {:title "Kotoba — post-quantum-by-default computing for AI agents"
-    :description (str "AI writes freely. Kotoba draws the boundary. An intuitive, declarative, "
-                      "security-first, post-quantum-by-default language and computing stack with checked KIR, explicit "
-                      "capability and effect admission, content-addressed artifacts, and host enforcement.")
+    :description "AI writes freely. Kotoba draws the boundary — a security-first, post-quantum-by-default language and computing stack."
     :lang "en"
     :css dds-css
     :app-css (str tokens/skin-css "\n" app-css)
     :head (list (favicon-link)
                 (apple-touch-icon-link)
                 (og-head "/" "Kotoba — post-quantum-by-default computing for AI agents"
-                         (str "AI writes freely. Kotoba draws the boundary. An intuitive, declarative, "
-                              "security-first, post-quantum-by-default language and computing stack with checked KIR, explicit "
-                              "capability and effect admission, content-addressed artifacts, and host enforcement.")))}
+                         "AI writes freely. Kotoba draws the boundary — a security-first, post-quantum-by-default language and computing stack."))}
    (view)))
 
 (def blog-html
@@ -1766,7 +1767,7 @@
     :head (list (favicon-link)
                 (apple-touch-icon-link)
                 (og-head "/blog/" "Kotoba Blog — engineering notes and evidence"
-                         "Kotoba engineering notes about language design, benchmarks, evidence, and remaining qualification gates."))}
+                         "Engineering notes on language design, benchmarks, evidence, and qualification gates."))}
    (blog-view)))
 
 (def libraries-html
@@ -1779,7 +1780,7 @@
     :head (list (favicon-link)
                 (apple-touch-icon-link)
                 (og-head "/libraries/" "Kotoba Libraries — content-addressed publication and comparison"
-                         "Inspect, publish, discover, and compare Kotoba libraries by immutable definition and release CIDs, with GitHub provenance kept separate."))}
+                         "Inspect, publish, discover, and compare libraries by immutable definition and release CIDs."))}
    (libraries-view)))
 
 (def libraries-ja-html
@@ -1792,7 +1793,7 @@
     :head (list (favicon-link)
                 (apple-touch-icon-link)
                 (og-head "/ja/libraries/" "Kotoba Libraries — content-addressed publication と比較"
-                         "不変な definition CID と release CID を使って Kotoba library を inspect、publish、discover、compare し、GitHub provenance を identity と分けます。"))}
+                         "不変な definition CID と release CID で Kotoba library を inspect、publish、discover、compare します。"))}
    (libraries-ja-view)))
 
 (def legal-html
@@ -1818,7 +1819,7 @@
     :head (list (favicon-link)
                 (apple-touch-icon-link)
                 (og-head "/ja/legal/" "Kotoba Labs Inc. — 公開運営者"
-                         "kotoba-lang.org の公開運営者は Kotoba Labs Inc. です。公開連絡先: support@kotoba-lang.org。"))}
+                         "公開運営者は Kotoba Labs Inc.。連絡先: support@kotoba-lang.org。"))}
    (legal-ja-view)))
 
 (let [out (path/join "site" "dist")]
@@ -1837,6 +1838,8 @@
   (fs/copyFileSync logo-source-path (path/join out "kotoba-wordmark.png"))
   (fs/copyFileSync og-card-source-path (path/join out "kotoba-og-card.png"))
   (fs/copyFileSync favicon-source-path (path/join out "kotoba-favicon.png"))
+  ;; /favicon.ico for legacy agents that request it without an explicit <link>.
+  (fs/copyFileSync favicon-ico-source-path (path/join out "favicon.ico"))
   ;; Cloudflare Workers static assets: _headers lives at the dist root.
   (fs/copyFileSync (path/join "site" "_headers") (path/join out "_headers"))
   (fs/copyFileSync dependency-manifest-path (path/join out "dependencies.edn"))
