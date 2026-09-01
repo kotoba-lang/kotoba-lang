@@ -58,3 +58,35 @@
     (is (= 1 (:kotoba.stdlib/version pkg)))
     (is (= :core (:id (first (:kotoba.stdlib/artifacts pkg)))))
     (is (= (:sha256 core) (:sha256 (first (:kotoba.stdlib/artifacts pkg)))))))
+
+;; The import policy used to name `compile --prelude`, which no route
+;; implements: the nbb/native routes refuse it outright and the JVM route
+;; drops it unread. A contract that names a dead route is worse than one that
+;; names none, because a caller reading it believes the standard library was
+;; linked. This holds the correction in place -- both halves of it, since
+;; naming the working route while the artifact still cannot travel it would be
+;; the same defect one level down.
+(deftest import-policy-names-a-route-that-carries-source
+  (let [policy (:kotoba.stdlib/import-policy (edn/read-string (slurp "lang/stdlib.edn")))]
+    (testing "the mode and CLI name the project route"
+      (is (= :explicit-source-path (:mode policy)))
+      (is (= ["compile" "--source-path"] (:cli policy)))
+      (is (true? (:jvm-free policy)))
+      (is (str/includes? (:example policy) "--source-path")))
+    (testing "ambient loading is still refused -- the invariant did not change"
+      (is (false? (:ambient-default policy))))
+    (testing "--prelude is recorded as superseded, not as a working route"
+      (let [superseded (:superseded-cli policy)]
+        (is (= "--prelude" (:flag superseded)))
+        (is (= :not-implemented-anywhere (:status superseded)))
+        (is (string? (get-in superseded [:measured :cljs-backend])))))
+    (testing "and the artifact's own reachability is stated rather than implied"
+      (let [reach (:artifact-reachability policy)]
+        (is (= :unreachable (:status reach)))
+        (is (= 2 (count (:blockers reach))))
+        (is (every? #(and (keyword? (:id %)) (string? (:evidence %)))
+                    (:blockers reach)))))
+    (testing "the other places carrying the old claim are listed, not left unnamed"
+      (is (seq (:also-claimed-in policy)))
+      (is (every? #(and (string? (:path %)) (string? (:status %)))
+                  (:also-claimed-in policy))))))
