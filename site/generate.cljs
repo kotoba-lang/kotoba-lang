@@ -64,6 +64,14 @@
 (def logo-source-path
   (path/join "site" "assets" "kotoba-wordmark.png"))
 
+(def og-card-source-path
+  (path/join "site" "assets" "kotoba-og-card.png"))
+
+(def favicon-source-path
+  (path/join "site" "assets" "kotoba-favicon.png"))
+
+(def site-origin "https://kotoba-lang.org")
+
 (def benchmark-source-path
   (path/join "bench" "public-compile-comparison" "latest.json"))
 
@@ -145,6 +153,12 @@
 
 (when-not (fs/existsSync logo-source-path)
   (println "site/generate.cljs: Kotoba wordmark not found:" logo-source-path)
+  (js/process.exit 1))
+
+(when-not (and (fs/existsSync og-card-source-path)
+               (fs/existsSync favicon-source-path))
+  (println "site/generate.cljs: OG card / favicon assets not found under site/assets/")
+  (println "  regenerate them from site/assets/meta-src/ with headless Chrome screenshots")
   (js/process.exit 1))
 
 (when-not (fs/existsSync syntax-grammar-path)
@@ -1668,6 +1682,27 @@
        "脆弱性報告は GitHub の private vulnerability reporting を使います。所在地、電話番号、登記番号は掲載していません。"]])]
    (footer :ja "./")])
 
+(defn- favicon-link []
+  [:link {:rel "icon" :type "image/png" :href "/kotoba-favicon.png"}])
+
+(defn- og-head
+  "Open Graph / Twitter card / canonical head tags. og:image uses the full
+  absolute URL social scrapers require; canonical is this page's own URL.
+  The description meta itself comes from page/->page's :description option —
+  this must not emit a second one."
+  [path]
+  (list
+   [:link {:rel "canonical" :href (str site-origin path)}]
+   [:meta {:property "og:site_name" :content "Kotoba"}]
+   [:meta {:property "og:type" :content "website"}]
+   [:meta {:property "og:url" :content (str site-origin path)}]
+   [:meta {:property "og:image" :content (str site-origin "/kotoba-og-card.png")}]
+   [:meta {:property "og:image:width" :content "1200"}]
+   [:meta {:property "og:image:height" :content "630"}]
+   [:meta {:property "og:image:alt" :content "AI writes freely. Kotoba draws the boundary."}]
+   [:meta {:name "twitter:card" :content "summary_large_image"}]
+   [:meta {:name "twitter:image" :content (str site-origin "/kotoba-og-card.png")}]))
+
 (def html
   (page/->page
    {:title "Kotoba — post-quantum-by-default computing for AI agents"
@@ -1676,7 +1711,8 @@
                       "capability and effect admission, content-addressed artifacts, and host enforcement.")
     :lang "en"
     :css dds-css
-    :app-css (str tokens/skin-css "\n" app-css)}
+    :app-css (str tokens/skin-css "\n" app-css)
+    :head (list (favicon-link) (og-head "/"))}
    (view)))
 
 (def blog-html
@@ -1685,7 +1721,8 @@
     :description "Kotoba engineering notes about language design, benchmarks, evidence, and remaining qualification gates."
     :lang "en"
     :css dds-css
-    :app-css (str tokens/skin-css "\n" app-css)}
+    :app-css (str tokens/skin-css "\n" app-css)
+    :head (list (favicon-link) (og-head "/blog/"))}
    (blog-view)))
 
 (def libraries-html
@@ -1694,7 +1731,8 @@
     :description "Inspect, publish, discover, and compare Kotoba libraries by immutable definition and release CIDs, with GitHub provenance kept separate."
     :lang "en"
     :css dds-css
-    :app-css (str tokens/skin-css "\n" app-css)}
+    :app-css (str tokens/skin-css "\n" app-css)
+    :head (list (favicon-link) (og-head "/libraries/"))}
    (libraries-view)))
 
 (def libraries-ja-html
@@ -1703,7 +1741,8 @@
     :description "不変な definition CID と release CID を使って Kotoba library を inspect、publish、discover、compare し、GitHub provenance を identity と分けます。"
     :lang "ja"
     :css dds-css
-    :app-css (str tokens/skin-css "\n" app-css)}
+    :app-css (str tokens/skin-css "\n" app-css)
+    :head (list (favicon-link) (og-head "/ja/libraries/"))}
    (libraries-ja-view)))
 
 (def legal-html
@@ -1712,7 +1751,8 @@
     :description "kotoba-lang.org is operated by Kotoba Labs Inc. Public contact: support@kotoba-lang.org."
     :lang "en"
     :css dds-css
-    :app-css (str tokens/skin-css "\n" app-css)}
+    :app-css (str tokens/skin-css "\n" app-css)
+    :head (list (favicon-link) (og-head "/legal/"))}
    (legal-view)))
 
 (def legal-ja-html
@@ -1721,7 +1761,8 @@
     :description "kotoba-lang.org の公開運営者は Kotoba Labs Inc. です。公開連絡先: support@kotoba-lang.org。"
     :lang "ja"
     :css dds-css
-    :app-css (str tokens/skin-css "\n" app-css)}
+    :app-css (str tokens/skin-css "\n" app-css)
+    :head (list (favicon-link) (og-head "/ja/legal/"))}
    (legal-ja-view)))
 
 (let [out (path/join "site" "dist")]
@@ -1738,6 +1779,8 @@
   (fs/mkdirSync (path/join out "ja" "legal") #js {:recursive true})
   (fs/writeFileSync (path/join out "ja" "legal" "index.html") legal-ja-html)
   (fs/copyFileSync logo-source-path (path/join out "kotoba-wordmark.png"))
+  (fs/copyFileSync og-card-source-path (path/join out "kotoba-og-card.png"))
+  (fs/copyFileSync favicon-source-path (path/join out "kotoba-favicon.png"))
   ;; Cloudflare Workers static assets: _headers lives at the dist root.
   (fs/copyFileSync (path/join "site" "_headers") (path/join out "_headers"))
   (fs/copyFileSync dependency-manifest-path (path/join out "dependencies.edn"))
