@@ -18,6 +18,7 @@ lang/safety-claims.edn          lang/wasm-component-platform.edn
 lang/surface-status.edn         lang/elaboration-pipeline.edn
 lang/typed-eval.edn
 lang/docs-release.edn           lang/product-defaults.edn
+site/sponsorship.edn
 docs/search-index.edn
 ```
 
@@ -116,7 +117,9 @@ sampled at 360 points) so the share card matches the live hero. The
 generator refuses to run when any asset is missing.
 
 Output: `site/dist/index.html`, `site/dist/blog/index.html`,
-`site/dist/legal/index.html`, the Play artifact and evidence, the wordmark,
+`site/dist/legal/index.html`, `site/dist/sponsor/index.html`,
+`site/dist/ja/sponsor/index.html`, `site/dist/sponsorship.edn`, the Play artifact
+and evidence, the wordmark,
 AI-agent text surfaces, and the raw benchmark JSON (committed, so a clean
 checkout can deploy without running the generator).
 
@@ -165,6 +168,19 @@ is `support@kotoba-lang.org`. Sales contact is Ryo Awai. The footer, `/legal/`,
 and `security.txt` name only those facts. Do not publish a Specified
 Commercial Transactions Act table, Delaware file number, address, phone, or
 any other mailbox from this generator.
+
+## GitHub Sponsors activation
+
+`site/sponsorship.edn` is the public status authority. Keep it at
+`:status :preparing` until GitHub has approved the `kotoba-lang` sponsored
+organization profile and `https://github.com/sponsors/kotoba-lang` resolves to
+that live profile. In this state, the generated pages explain the flow but do
+not show a payment action.
+
+After approval, change the status to `:live`, update `:checked-at`, regenerate
+the committed `site/dist/` artifacts, and change `.github/FUNDING.yml` from the
+status-aware custom project page to `github: kotoba-lang`. Verify the homepage,
+`/sponsor/`, `/ja/sponsor/`, and the repository Sponsor button before deploy.
 
 The page is built with `jp-go-dds` (the Digital Agency Design System mirror).
 Application CSS uses the shared `--hig-*` token contract through
