@@ -63,12 +63,23 @@
     (is (= :removed-in-version-2 (get-in m [:records :status])))
     (is (= 2 (count (get-in m [:records :two-independent-reasons]))))))
 
-(deftest the-arity-limit-is-recorded-with-its-reproduction
+(deftest the-arity-limit-is-recorded-as-fixed-with-its-reproduction
+  ;; The entry outlived the limit it named (amu #738, merge c085efe,
+  ;; 2026-09-01). It is kept rather than deleted, because the reproduction is
+  ;; the cheapest way to notice a regression -- so what this pins moves from
+  ;; the refusal to the fix. An entry left saying :not-fixed-here would tell
+  ;; the next reader to route around something that works.
   (let [m (load-manifest)]
+    (is (= :fixed (get-in m [:arity-limit :status])))
+    (is (nil? (get-in m [:arity-limit :not-fixed-here]))
+        "the limit is gone; the entry must not still claim it is not fixed")
     (is (= "export does not name a declared function"
-           (get-in m [:arity-limit :message])))
+           (get-in m [:arity-limit :was :message]))
+        "the message it used to refuse with stays readable, under :was")
     (is (str/includes? (get-in m [:arity-limit :reproduction]) "--source-path"))
-    (is (true? (get-in m [:arity-limit :not-fixed-here])))))
+    (is (str/includes? (get-in m [:arity-limit :now]) "twice$arity$2")
+        "what it does now is recorded by the export names it actually gives")
+    (is (= 738 (get-in m [:arity-limit :fixed-in :pr])))))
 
 (deftest core-source-matches-public-names-and-sha
   (let [m (load-manifest)
