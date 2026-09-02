@@ -1,6 +1,6 @@
 # ADR — Unison-inspired code identity and typed abilities
 
-- **Status**: Accepted — CI1–CI7 implemented (2026-08-03); see lang/code-identity.edn for per-stage evidence and residual risks
+- **Status**: Accepted — CI1–CI7 implemented (2026-08-03); see lang/code-identity.edn for per-stage evidence and residual risks. 2026-09-02: definition identity covers every checked definition, effectful included — the effect row is a sealed input and `:definition-cid :scope` is `:closed-deterministic-checked-definition`; compiler-inferred `[:cap/call id]` rows are not yet hashable (`:effect-row-vocabulary`, not-yet-bridged).
 - **Date**: 2026-07-25
 - **Artifacts**: `lang/code-identity.edn`, `docs/lang/capability-values.md`,
   `lang/package.edn`
@@ -94,10 +94,13 @@ locked package entry.  Names remain author-facing aliases only; safe linking
 resolves an alias to a signed manifest and then to an expected definition CID.
 Name resolution cannot silently change the definition that is linked.
 
-Definition-addressing is initially restricted to closed, deterministic,
-pure-definition interfaces.  Effectful code remains component-addressed until
-its capability interface and effect closure are represented in the typed KIR
-**and** its WIT world is admitted by `kototama`. A definition CID is never an
+Definition-addressing covers every closed, deterministic, *checked*
+definition, effectful or not: the effect row is one of the sealed inputs, so
+an effectful definition has its own CID (widened from pure-only on
+2026-09-02 — the payload had sealed the row since version 2 and only the
+prose said otherwise).  Instantiating or evaluating effectful code still
+requires its WIT world to be admitted by `kototama` and, per
+`lang/typed-eval.edn`, a capability receipt. A definition CID is never an
 authorization to instantiate code or bind an import.
 
 ### 3. Capability values are Kotoba abilities

@@ -94,12 +94,14 @@ make the boundary deterministic even when the author is an agent.
 
 ## What Kotoba feels like
 
-**Where Lisp's mind meets Rust's discipline.**
+**Where Lisp's mind and GP 2's graph rewriting meet Rust's discipline.**
 
-Kotoba keeps a small, data-oriented, Clojure-shaped language: immutable values,
-ordinary functions, explicit data, and a composable syntax that is easy for
-humans and models to generate. It adds static discipline around authority,
-effects, resources, packages, and artifact identity.
+Kotoba keeps a small, data-oriented, Clojure-shaped language. Its design draws
+on Lisp's code-as-data tradition and
+[GP 2's rule-based graph rewriting](https://uoycs-plasma.github.io/GP2/):
+immutable values, ordinary functions, explicit data, and a composable syntax
+that is easy for humans and models to generate. It adds static discipline around
+authority, effects, resources, packages, and artifact identity.
 
 It is deliberately narrower than Clojure. Ambient interop, runtime code
 loading, unrestricted mutation, guest-defined macros, and unbounded concurrency

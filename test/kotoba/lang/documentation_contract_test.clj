@@ -136,6 +136,8 @@
     (is (str/includes? html "docs/release-bound-profile"))
     (is (str/includes? html "profile binding: verified"))
     (is (str/includes? html "Proof, with the boundary attached"))
+    (is (str/includes? html "Where Lisp's mind and GP 2's graph rewriting meet Rust's discipline"))
+    (is (str/includes? html "href=\"https://uoycs-plasma.github.io/GP2/\""))
     (is (str/includes? html "./benchmarks/compile-wasm-latest.json"))
     (is (str/includes? html "./benchmarks/end-to-end-latest.json"))
     (is (str/includes? html "./benchmarks/domains-latest.json"))

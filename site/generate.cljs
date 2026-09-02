@@ -591,9 +591,11 @@
 
 (defn what-section []
   (dds/section
-   {:id "what" :title "Where Lisp's mind meets Rust's discipline"}
+   {:id "what" :title "Where Lisp's mind and GP 2's graph rewriting meet Rust's discipline"}
    [:p {:class "kot-lead"}
-    "Kotoba is a small, data-oriented, Clojure-shaped language with static discipline around authority, effects, resources, packages, and artifact identity."]
+    "Kotoba is a small, data-oriented, Clojure-shaped language. Its design draws on Lisp's code-as-data tradition and "
+    [:a {:href "https://uoycs-plasma.github.io/GP2/"} "GP 2's rule-based graph rewriting"]
+    ", with static discipline around authority, effects, resources, packages, and artifact identity."]
    (dds/grid
     {:min "18rem"}
     (card (dds/chip-label "INTUITIVE")
