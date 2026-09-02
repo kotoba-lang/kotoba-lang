@@ -9,6 +9,9 @@
   `kotoba/src/kotoba/semantic_code.cljc`, and
   `kotobase/src/kotobase/code_graph.cljc`
 - **Related**: `ADR-kotobase-security-access-control.md`, `ADR-safe-capability-language.md`, `ADR-kotoba-package-cid-lock.md`, `ADR-kotoba-lang-profile.md`, `ADR-kotoba-rad-git-sovereign-repo.md`
+- **Extended by**: `ADR-kotoba-definition-patch-share.md` (definition interchange
+  is a `:definition-cid` patch, not source-file copy; `lang/semantic-code.edn`
+  remains 404 in this repository)
 
 ## Context
 
