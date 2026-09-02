@@ -357,3 +357,25 @@
       (is (seq (:remaining direction))
           "what layer 2 still cannot do is written down, not left to be
            discovered by the next caller"))))
+
+(deftest every-declared-stage-has-an-implementation-entry-with-a-status
+  (testing "a stage named in :stages with no :implementation entry is a plan
+            that reads like a deployment -- the same shape :identities was
+            fixed for on 2026-08-10. Nothing compared the two maps until
+            :ci8 was added on 2026-09-02, so a stage could be declared and
+            never say whether anything implements it."
+    (let [contract (read-edn contract-file)
+          stages (set (keys (:stages contract)))
+          impls (:implementation contract)]
+      (is (seq stages) "the contract must declare stages")
+      (is (= stages (set (keys impls)))
+          "every declared stage has an implementation entry, and no implementation
+           entry names a stage the contract does not declare")
+      (doseq [[stage entry] impls]
+        (is (contains? entry :status)
+            (str stage " must say whether it is implemented"))
+        (is (contains? #{:implemented :partial :planned :not-implemented} (:status entry))
+            (str stage " has an unrecognised :status " (pr-str (:status entry))))
+        (when (= :implemented (:status entry))
+          (is (seq (:evidence entry))
+              (str stage " claims :implemented and must name its evidence")))))))
