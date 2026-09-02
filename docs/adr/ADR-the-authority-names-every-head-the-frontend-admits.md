@@ -112,8 +112,9 @@ stop being reported as `:unknown-form` by the grammar pre-check. They are
 still refused wherever they have no lowering, by the compiler, which is the
 component that knows.
 
-**4. All four vendored copies are resynced in one wave**, and each vendoring
-repository gains a test that fails when they drift.
+**4. Three of the four vendored copies are resynced in one wave**, and every
+vendoring repository gains a test that fails when they drift. **kotoba is
+deliberately not resynced**; see below.
 
 ## The drift check, and why it is placed where it is
 
@@ -121,19 +122,45 @@ The replacement check compares copies **on a classpath**, where a copy cannot
 be absent:
 
 - **amu** sees its own `resources/` copy and kotoba-sema's, across the
-  `deps.edn` pin. Two copies, always.
-- **kotoba** sees its own, `vendor/grammar`'s (a `:local/root`) and amu's,
-  across its amu pin. Three copies.
+  `deps.edn` pin. Two copies, always, and comparing them is what found amu's
+  own copy one change behind.
 - **kotoba-sema** sees one. Its dependencies carry no copy, so its check is
-  the pinned-digest half only, and it says so rather than implying a
-  comparison it cannot make.
+  the pinned-digest half plus the comparison only it can make — its copy
+  against the frontend tables, which live there.
+- **kotoba** sees five, and already had the strongest of the three checks:
+  `every-guest-grammar-on-the-classpath-is-the-same-bytes` requires all five
+  to be byte-identical with no exemption.
 
-Every one of them also asserts the sha256 of the copy it holds equals the
-authority digest of this wave,
-`3e3f9748e245386fc2c89bbadabddfebb4bf02190e137494feacec6a12b4500a`. That
-literal appears in four repositories, which is the point: the next authority
-edit is a four-repository wave by construction, and a copy that is edited
-alone goes red even where there is nothing to compare it to.
+### kotoba is not resynced, and that is the finding
+
+Its five copies all agree — at the *previous* authority. Resyncing the two it
+ships would make them disagree with the three arriving from its pinned amu,
+kotoba-lang and kotoba-sema, which is exactly what its own check refuses, and
+refuses rightly: `io/resource` answers with whichever comes first, so
+admission would be decided by classpath order. Moving the dependency copies
+means advancing its amu pin, **106 commits behind** — a compiler migration,
+not a grammar resync.
+
+A first draft of that repository's change did resync both copies and added an
+allowlist keyed on the stale dependency pins. Its own suite caught it: a
+weaker check landing beside a stronger one that already existed. What landed
+instead is a **baseline naming both digests** — the one its copies are at and
+the one they owe — with the head count asserted through
+`kotoba.grammar/admitted-heads`, which is the one reader of
+`:admitted-builtins` anywhere. So the gap is a number in a test rather than a
+sentence in a document.
+
+Each of the other checks asserts the sha256 of the copy it holds equals the
+authority digest of its wave. That literal appears in four repositories, which
+is the point: the next authority edit is a four-repository wave by
+construction, and a copy that is edited alone goes red even where there is
+nothing to compare it to.
+
+**It worked within the hour.** A parallel stream edited this file the same day
+(`904ad31`, the map surface is not keyword-only) and updated the pinned digest
+here as part of it — which is the tripwire doing its job. Its three vendored
+copies are then owed the same bytes, and that is now a visible, dated
+obligation rather than a silent divergence.
 
 Each check prints `COMPARED\t<n>` and refuses `n = 0`, and each names the
 differing heads — the symmetric difference of `:admitted-builtins` and of

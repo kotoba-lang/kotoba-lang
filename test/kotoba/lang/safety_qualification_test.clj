@@ -86,12 +86,28 @@
     (is (= {:denied :wildcard-forbidden} result))))
 
 (deftest q3-consumers-embed-the-canonical-grammar-without-drift
-  (let [authority (slurp "lang/guest-grammar.edn")]
-    (is (= authority (slurp (io/file kotoba-root
-                                     "resources/kotoba/lang/guest-grammar.edn"))))
+  ;; Deferrals are read from `kotoba.lang.grammar-authority-test`, which is
+  ;; where the decision to defer a copy is recorded with its reason and its
+  ;; closing condition. Two tests in this repository compare the same sibling
+  ;; copies; a copy deferred in one and required in the other would make the
+  ;; deferral a matter of which test ran.
+  (let [authority (slurp "lang/guest-grammar.edn")
+        deferred @(requiring-resolve 'kotoba.lang.grammar-authority-test/deferred-vendor-copies)
+        kotoba-copy "../kotoba/resources/kotoba/lang/guest-grammar.edn"]
+    (if (contains? deferred kotoba-copy)
+      (do (println (format "DEFERRED\t1\t%s (see grammar-authority-test/deferred-vendor-copies)"
+                           kotoba-copy))
+          (is (not= authority (slurp (io/file kotoba-root
+                                              "resources/kotoba/lang/guest-grammar.edn")))
+              (str kotoba-copy " is recorded as deferred but now matches this"
+                   " authority; delete the entry in"
+                   " grammar-authority-test/deferred-vendor-copies")))
+      (is (= authority (slurp (io/file kotoba-root
+                                       "resources/kotoba/lang/guest-grammar.edn")))))
     ;; Source grammar ownership moved with semantic analysis. The compiler is
     ;; orchestration and consumes this resource from kotoba-sema; requiring a
-    ;; duplicate compiler copy would undo the extracted boundary.
+    ;; duplicate compiler copy would undo the extracted boundary. kotoba-sema is
+    ;; never deferred: it is resynced in the same wave as this authority.
     (is (= authority (slurp (io/file sema-root
                                      "resources/kotoba/lang/guest-grammar.edn"))))))
 
