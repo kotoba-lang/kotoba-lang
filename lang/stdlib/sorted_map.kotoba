@@ -1,0 +1,287 @@
+;; A persistent ordered map, written in Kotoba.
+;;
+;; Unison writes `Map` in Unison; this is the same placement. Nothing here is
+;; a builtin, a host call or a compiler change: the whole structure is an AVL
+;; tree built out of `pair`, walked by fuel-bounded recursion, and it compiles
+;; to wasm32 by the ordinary project route.
+;;
+;; A LIBRARY MODULE, reached the way `stdlib.core` is reached: a guest writes
+;; `(:require [stdlib.sorted-map :as sm])` and puts this file's grandparent
+;; directory on `--source-path`.
+;;
+;;
+;; WHY A TREE OF PAIRS AND NOT OF RECORDS
+;;
+;; Records were the first choice and are refused twice over. Measured
+;; 2026-09-02 against amu ca869d79e, JVM-free:
+;;
+;;   (defrecord Node [k :i64 v :i64
+;;                    l [:record :probe.rec/Node]
+;;                    r [:record :probe.rec/Node]])
+;;
+;; exits 65 with :kotoba.error/value-type-outside-profile, "value type is
+;; outside the safe profile" -- a record field cannot name its own record. And
+;; even spelled some other way there is no empty node to return: an empty
+;; record is refused (:kotoba.error/record-fields) and two nominal types on
+;; the two arms of an `if` are refused with "if branches must have the same
+;; value type", both already on record in
+;; `lang/conformance/stdlib/manifest.edn` :records. There is no `variant` head
+;; in `lang/guest-grammar.edn` to reach for either.
+;;
+;; So a node is four `pair` cells and the empty map is 0 -- the same carrier
+;; and the same nil that `stdlib.core` already uses for its chains:
+;;
+;;   node = (pair key (pair value (pair height (pair left right))))
+;;
+;;   key    (pair-first node)
+;;   value  (pair-first (pair-second node))
+;;   height (pair-first (pair-second (pair-second node)))
+;;   left   (pair-first  (pair-second (pair-second (pair-second node))))
+;;   right  (pair-second (pair-second (pair-second (pair-second node))))
+;;
+;;
+;; WHY AVL AND NOT A LEFT-LEANING RED-BLACK TREE
+;;
+;; Depth, because depth is what recursion costs here. An AVL tree of n keys is
+;; at most 1.44*log2(n+2) - 0.33 deep; a 2-3 left-leaning red-black tree is at
+;; most 2*log2(n+1). At 63 keys that is 8 against 12, and every level of it is
+;; paid twice -- once going down and once rebalancing on the way back up -- out
+;; of a budget of 512 calls. The measured heights are in the manifest's
+;; :costs; they are the AVL bound, not the LLRB one.
+;;
+;;
+;; WHAT `sm-get` RETURNS, AND WHY IT IS NOT AN OPTION
+;;
+;; `(sm-get map key not-found)` -- the caller supplies the sentinel, which is
+;; exactly `clojure.core/get`'s three-argument arity. `[:option :i64]` was the
+;; first choice and wasm32 still refuses it. Measured 2026-09-02, amu
+;; ca869d79e, in a single file:
+;;
+;;   (defn f [x :i64] :option-i64 (if (> x 3) (option-some x) (option-none)))
+;;
+;;   amu check   ... --jvm-free                      exit 0
+;;   amu compile ... --target wasm32 --jvm-free      exit 70
+;;   {:error :wasm-typed-lowering,
+;;    :diagnostic {:code :kotoba/internal-error},
+;;    :message "unsupported typed Wasm expression"}
+;;
+;; and the refusal is the whole project's, not the function's: a module that
+;; contains such a function does not compile even when nothing reaches it
+;; (`lang/compat.edn` :measured :option-return-on-wasm32). This package claims
+;; :kotoba-wasm, so it carries what that claim covers. `sm-contains?` answers
+;; the question the option would have answered.
+;;
+;;
+;; TRUTH IS 1 AND 0, as it is for `every?` in `stdlib.core`. `:bool` exists;
+;; the sibling module in this package does not use it and neither does this
+;; one, so a caller reading both reads one convention.
+;;
+;; ONE AMBIGUITY, PINNED RATHER THAN HIDDEN: `sm-min-key` and `sm-max-key`
+;; answer 0 for the empty map, and 0 is also a perfectly good key. `sm-count`
+;; is the discriminator. The oracle test asserts the collision rather than
+;; choosing keys that avoid it.
+;;
+;; BACKEND GAP, not a language rule: recursive logical values landed (W4) on
+;; #{:compiler :kotoba-wasm :kotoba-cljs} and NOT on native. That is why the
+;; note above says wasm32 refuses an option -- a measured backend gap -- and
+;; not that Kotoba has no options. It has them; this backend cannot lower one
+;; here yet, and when it can, `sm-get` gains an option-valued sibling.
+
+(ns stdlib.sorted-map
+  (:export [sm-empty sm-get sm-contains? sm-assoc sm-dissoc sm-count
+            sm-keys sm-vals sm-reduce sm-min-key sm-max-key]))
+
+;; 0 for the empty tree, so a caller never writes the representation down.
+(defn sm-empty []
+  0)
+
+;; The empty tree has height 0; a leaf has height 1. Called four times per
+;; level of an insert (twice here, twice inside `mk`), which is most of what
+;; an insert costs.
+(defn- node-height [node]
+  (if (= node 0)
+    0
+    (pair-first (pair-second (pair-second node)))))
+
+;; The only place a node is built. Height is derived from the children, so it
+;; cannot drift out of step with them.
+(defn- mk [k v l r]
+  (let [hl (node-height l)
+        hr (node-height r)]
+    (pair k (pair v (pair (+ 1 (if (> hl hr) hl hr)) (pair l r))))))
+
+(defn- rotate-right [node]
+  (let [l (pair-first (pair-second (pair-second (pair-second node))))
+        lkids (pair-second (pair-second (pair-second l)))]
+    (mk (pair-first l)
+        (pair-first (pair-second l))
+        (pair-first lkids)
+        (mk (pair-first node)
+            (pair-first (pair-second node))
+            (pair-second lkids)
+            (pair-second (pair-second (pair-second (pair-second node))))))))
+
+(defn- rotate-left [node]
+  (let [r (pair-second (pair-second (pair-second (pair-second node))))
+        rkids (pair-second (pair-second (pair-second r)))]
+    (mk (pair-first r)
+        (pair-first (pair-second r))
+        (mk (pair-first node)
+            (pair-first (pair-second node))
+            (pair-first (pair-second (pair-second (pair-second node))))
+            (pair-first rkids))
+        (pair-second rkids))))
+
+;; One node from its pieces, rotated if the two subtrees differ in height by
+;; more than one -- which, after a single insert or removal, is the most they
+;; can differ by. The doubled cases (left-right, right-left) rotate the child
+;; first, which is the textbook AVL repair and the reason a rotation is
+;; expressed over a whole node rather than over four loose arguments.
+(defn- balance [k v l r]
+  (let [hl (node-height l)
+        hr (node-height r)]
+    (if (> hl (+ hr 1))
+      (let [lkids (pair-second (pair-second (pair-second l)))]
+        (if (< (node-height (pair-first lkids)) (node-height (pair-second lkids)))
+          (rotate-right (mk k v (rotate-left l) r))
+          (rotate-right (mk k v l r))))
+      (if (> hr (+ hl 1))
+        (let [rkids (pair-second (pair-second (pair-second r)))]
+          (if (< (node-height (pair-second rkids)) (node-height (pair-first rkids)))
+            (rotate-left (mk k v l (rotate-right r)))
+            (rotate-left (mk k v l r))))
+        (mk k v l r)))))
+
+;; An existing key keeps its place and takes the new value, as clojure.core's
+;; assoc does. The tree that comes back is a new one; the old one is still
+;; valid, and shares every node the insert did not walk through.
+(defn sm-assoc [tree k v]
+  (if (= tree 0)
+    (mk k v 0 0)
+    (let [tk (pair-first tree)
+          kids (pair-second (pair-second (pair-second tree)))]
+      (if (< k tk)
+        (balance tk (pair-first (pair-second tree)) (sm-assoc (pair-first kids) k v) (pair-second kids))
+        (if (> k tk)
+          (balance tk (pair-first (pair-second tree)) (pair-first kids) (sm-assoc (pair-second kids) k v))
+          (mk k v (pair-first kids) (pair-second kids)))))))
+
+(defn- min-node [tree]
+  (let [l (pair-first (pair-second (pair-second (pair-second tree))))]
+    (if (= l 0)
+      tree
+      (min-node l))))
+
+;; A key that is not there is not an error and changes nothing, as
+;; clojure.core's dissoc. A node with two children is replaced by its
+;; in-order successor, which is then removed from the right subtree.
+(defn sm-dissoc [tree k]
+  (if (= tree 0)
+    0
+    (let [tk (pair-first tree)
+          kids (pair-second (pair-second (pair-second tree)))]
+      (if (< k tk)
+        (balance tk (pair-first (pair-second tree)) (sm-dissoc (pair-first kids) k) (pair-second kids))
+        (if (> k tk)
+          (balance tk (pair-first (pair-second tree)) (pair-first kids) (sm-dissoc (pair-second kids) k))
+          (if (= (pair-first kids) 0)
+            (pair-second kids)
+            (if (= (pair-second kids) 0)
+              (pair-first kids)
+              (let [successor (min-node (pair-second kids))]
+                (balance (pair-first successor)
+                         (pair-first (pair-second successor))
+                         (pair-first kids)
+                         (sm-dissoc (pair-second kids) (pair-first successor)))))))))))
+
+;; One call per level, and the level count is the AVL bound -- which is the
+;; whole point of keeping the tree balanced.
+(defn sm-get [tree k not-found]
+  (if (= tree 0)
+    not-found
+    (let [tk (pair-first tree)
+          kids (pair-second (pair-second (pair-second tree)))]
+      (if (< k tk)
+        (sm-get (pair-first kids) k not-found)
+        (if (> k tk)
+          (sm-get (pair-second kids) k not-found)
+          (pair-first (pair-second tree)))))))
+
+(defn sm-contains? [tree k]
+  (if (= tree 0)
+    0
+    (let [tk (pair-first tree)
+          kids (pair-second (pair-second (pair-second tree)))]
+      (if (< k tk)
+        (sm-contains? (pair-first kids) k)
+        (if (> k tk)
+          (sm-contains? (pair-second kids) k)
+          1)))))
+
+;; O(n): the size is not stored in the node. Storing it would cost a fifth
+;; pair cell on every node to save a walk that only `sm-count` takes, and the
+;; walk is what the fuel measurement in the manifest budgets for.
+(defn sm-count [tree]
+  (if (= tree 0)
+    0
+    (let [kids (pair-second (pair-second (pair-second tree)))]
+      (+ 1 (+ (sm-count (pair-first kids)) (sm-count (pair-second kids)))))))
+
+;; Ascending, because the right subtree's keys are pushed onto the tail before
+;; this node's key goes in front of them. A pair chain ending in 0, which is
+;; what every `stdlib.core` function takes.
+(defn- keys-into [tree out]
+  (if (= tree 0)
+    out
+    (let [kids (pair-second (pair-second (pair-second tree)))]
+      (keys-into (pair-first kids)
+                 (pair (pair-first tree) (keys-into (pair-second kids) out))))))
+
+(defn sm-keys [tree]
+  (keys-into tree 0))
+
+(defn- vals-into [tree out]
+  (if (= tree 0)
+    out
+    (let [kids (pair-second (pair-second (pair-second tree)))]
+      (vals-into (pair-first kids)
+                 (pair (pair-first (pair-second tree)) (vals-into (pair-second kids) out))))))
+
+;; In key order, so (sm-vals m) lines up item for item with (sm-keys m).
+(defn sm-vals [tree]
+  (vals-into tree 0))
+
+;; `f` receives the accumulator and an ENTRY -- `(pair key value)` -- because
+;; the closure dispatcher this package anchors is binary. A ternary
+;; `(invoke f acc k v)` would need a three-argument closure, which
+;; `stdlib.core` does not anchor and nothing in this package has measured.
+(defn- reduce-into [f acc tree]
+  (if (= tree 0)
+    acc
+    (let [kids (pair-second (pair-second (pair-second tree)))
+          after-left (reduce-into f acc (pair-first kids))]
+      (reduce-into f
+                   (invoke f after-left (pair (pair-first tree) (pair-first (pair-second tree))))
+                   (pair-second kids)))))
+
+;; Ascending key order, as clojure.core/reduce over a sorted-map is.
+(defn sm-reduce [f init tree]
+  (reduce-into f init tree))
+
+;; 0 for the empty map -- and 0 is also a key. See the note at the top; use
+;; sm-count to tell them apart.
+(defn sm-min-key [tree]
+  (if (= tree 0)
+    0
+    (pair-first (min-node tree))))
+
+(defn- max-node [tree]
+  (let [r (pair-second (pair-second (pair-second (pair-second tree))))]
+    (if (= r 0)
+      tree
+      (max-node r))))
+
+(defn sm-max-key [tree]
+  (if (= tree 0)
+    0
+    (pair-first (max-node tree))))

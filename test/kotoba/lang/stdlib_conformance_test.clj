@@ -28,7 +28,8 @@
 (def ^:private module-path "lang/stdlib/core.kotoba")
 (def ^:private stdlib-manifest-path "lang/conformance/stdlib/manifest.edn")
 
-(def ^:private case-ids [:portable-source-stdlib :portable-source-stdlib-extended])
+(def ^:private case-ids [:portable-source-stdlib :portable-source-stdlib-extended
+                         :portable-source-stdlib-ordered])
 
 (defn- conformance-cases []
   (let [cases (:cases (edn/read-string (slurp (str conformance-root "/manifest.edn"))))]
@@ -37,8 +38,14 @@
 (defn- conformance-case []
   (first (conformance-cases)))
 
-(defn- stdlib-module []
-  (first (:modules (edn/read-string (slurp stdlib-manifest-path)))))
+(defn- stdlib-modules []
+  (:modules (edn/read-string (slurp stdlib-manifest-path))))
+
+;; Namespace to file, from the manifest rather than by convention -- the
+;; conformance entries name which module they require, and version 4 added a
+;; second one.
+(defn- module-path-for [namespace-symbol]
+  (:path (first (filter #(= namespace-symbol (:namespace %)) (stdlib-modules)))))
 
 (defn- ns-form [forms]
   (first (filter #(and (seq? %) (= 'ns (first %))) forms)))
@@ -61,9 +68,9 @@
    forms))
 
 (defn- join-case [{:keys [entry]}]
-  (let [module (sema/read-forms (slurp module-path))
-        entry-forms (sema/read-forms (slurp (str conformance-root "/" entry)))
-        [_ _ alias] (second (ns-clause entry-forms :require))
+  (let [entry-forms (sema/read-forms (slurp (str conformance-root "/" entry)))
+        [required _ alias] (second (ns-clause entry-forms :require))
+        module (sema/read-forms (slurp (module-path-for required)))
         source (->> (concat (body-forms module)
                             (unalias alias (body-forms entry-forms)))
                     (map pr-str)
@@ -84,39 +91,51 @@
 
 (deftest the-case-names-the-project-route-and-not-a-prelude
   (doseq [[case- entry] (map vector (conformance-cases)
-                             ["stdlib/basic.kotoba" "stdlib/extended.kotoba"])]
+                             ["stdlib/basic.kotoba" "stdlib/extended.kotoba"
+                              "stdlib/ordered.kotoba"])]
     (is (nil? (:prelude case-))
         "`:prelude` names a route no implementation has; see lang/stdlib.edn")
     (is (= ["."] (:source-paths case-)))
     (is (= entry (:entry case-)))))
 
 (deftest the-entry-requires-the-module-rather-than-being-prepended-to-it
-  (doseq [case- (conformance-cases)]
-    (let [entry-forms (sema/read-forms (slurp (str conformance-root "/" (:entry case-))))
-          require- (ns-clause entry-forms :require)]
-      (is (some? require-) "the entry must be a project module")
-      (is (= 'stdlib.core (first (second require-))))
-      (is (= :as (second (second require-)))))))
+  (let [namespaces (set (map :namespace (stdlib-modules)))]
+    (doseq [case- (conformance-cases)]
+      (let [entry-forms (sema/read-forms (slurp (str conformance-root "/" (:entry case-))))
+            require- (ns-clause entry-forms :require)]
+        (is (some? require-) "the entry must be a project module")
+        (is (contains? namespaces (first (second require-)))
+            (str (:id case-) " must require a module the manifest declares"))
+        (is (= :as (second (second require-))))))))
 
-(deftest the-module-exports-exactly-the-frozen-public-names
-  (let [forms (sema/read-forms (slurp module-path))
-        exported (set (second (ns-clause forms :export)))
-        frozen (:public-names (stdlib-module))]
-    (is (= 'stdlib.core (second (ns-form forms))))
-    (is (= frozen exported)
-        (str "extra=" (pr-str (set/difference exported frozen))
-             " missing=" (pr-str (set/difference frozen exported))))))
+(deftest the-modules-export-exactly-the-frozen-public-names
+  (doseq [{:keys [path namespace public-names]} (stdlib-modules)]
+    (testing (str namespace)
+      (let [forms (sema/read-forms (slurp path))
+            exported (set (second (ns-clause forms :export)))]
+        (is (= namespace (second (ns-form forms))))
+        (is (= public-names exported)
+            (str "extra=" (pr-str (set/difference exported public-names))
+                 " missing=" (pr-str (set/difference public-names exported))))))))
+
+(deftest each-module-is-mirrored-byte-for-byte-under-the-conformance-root
+  ;; The conformance case can be compiled with either root on --source-path;
+  ;; if the two copies drifted, one of the two roots would be compiling
+  ;; something else and only one of them would be tested.
+  (doseq [{:keys [path conformance-path namespace]} (stdlib-modules)]
+    (is (= (slurp path) (slurp conformance-path))
+        (str namespace ": conformance mirror must match the package SSoT"))))
 
 (deftest no-frozen-public-name-is-a-reserved-name
   ;; Five of version 1's twenty-seven names had become reserved while the file
   ;; sat uncompiled. A module that defines one is refused outright, so this is
   ;; the check that the frozen list stays callable as the language grows.
-  (let [frozen (:public-names (stdlib-module))
-        collisions (filter frontend/reserved-function-names frozen)]
-    (is (empty? collisions)
-        (str "reserved, so stdlib.core cannot define them: " (pr-str (sort collisions))))))
+  (doseq [{:keys [namespace public-names]} (stdlib-modules)]
+    (let [collisions (filter frontend/reserved-function-names public-names)]
+      (is (empty? collisions)
+          (str "reserved, so " namespace " cannot define them: " (pr-str (sort collisions)))))))
 
-(deftest every-export-is-single-arity
+(deftest every-core-export-is-single-arity
   ;; A multi-arity function CANNOT be exported: the module is analyzed before
   ;; it is linked, so `(defn f ([x] ...) ([x y] ...))` is already `f$arity$1`
   ;; when `(:export [f])` is resolved, and the linker answers
