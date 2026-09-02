@@ -250,3 +250,38 @@
         (is (= :definition/hash-mismatch
                (:reason (identity/verify-locked-definitions
                          lock [(assoc entry :definition effectful)]))))))))
+
+;; ---------------------------------------------------------------------------
+;; scope: checked definitions, effectful included (2026-09-02)
+;; ---------------------------------------------------------------------------
+
+(def ^:private contract-file "lang/code-identity.edn")
+
+(deftest the-contract-and-the-fixtures-agree-that-effectful-definitions-are-in-scope
+  (let [contract (get-in (read-edn contract-file) [:identities :definition-cid])
+        manifest (read-edn (str conformance-root "manifest.edn"))
+        cases (into {} (map (juxt :id identity)) (:cases manifest))]
+    (testing "the contract no longer says pure-only"
+      (is (= :closed-deterministic-checked-definition (:scope contract)))
+      (is (= :sealed-by-effect-row (get-in contract [:effectful :status]))))
+    (testing "a positive identity fixture carries a non-empty effect row and its
+              expected CID is the frozen :effect-row-http vector"
+      (let [tc (get cases :positive-identity-effectful-http)
+            data (read-edn (str conformance-root (:file tc)))
+            frozen (first (filter #(= :effect-row-http (:id %)) (:vectors vectors)))]
+        (is (some? tc) "fixture must be in the manifest")
+        (is (seq (:definition/effect-row data)))
+        (is (= (:definition-cid frozen) (:expected-cid tc)))))
+    (testing "a locked effectful definition is admitted, not merely identified"
+      (let [tc (get cases :positive-locked-effectful-definition-admitted)
+            data (read-edn (str conformance-root (:file tc)))]
+        (is (some? tc) "fixture must be in the manifest")
+        (is (seq (get-in data [:resolved 0 :definition :definition/effect-row])))
+        (is (= :accept (:kind tc)))))
+    (testing "the vocabulary gap is recorded, not papered over: the compiler's
+              [:cap/call id] rows are refused today and the contract says so"
+      (is (= :not-yet-bridged (get-in contract [:effect-row-vocabulary :status])))
+      (is (= (get-in contract [:effect-row-vocabulary :refusal])
+             (:message (identity/definition-error
+                        (assoc definition :definition/effect-row #{[:cap/call 8]}))))
+          "the recorded refusal literal must be the one the mechanism emits"))))
