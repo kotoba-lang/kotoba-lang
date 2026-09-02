@@ -60,7 +60,7 @@ See `lang/surface-status.edn` and Grade-A malicious corpus for the deny list.
 | `:bool` | Boolean; may wire as i64 0/1 at some boundaries |
 | `:string` | UTF-8 bytes; length ops use **byte** length unless a named code-point op is used |
 | `:keyword` | Admitted keyword values |
-| `:f32` / `:f64` | IEEE-754; target-restricted (see floating-point policy) |
+| `:f32` / `:f64` | IEEE-754; target-restricted (see [3.4 Floating-point policy](#34-floating-point-policy)) |
 
 ### 3.2 Structured (typed / parametric)
 
@@ -91,6 +91,66 @@ Authoritative table: `docs/adr/ADR-product-value-abi-v1.md`.
 **Forbidden product patterns** (when option/string work): `has-*` i64 sentinels for
 optional strings; `ttl -1` for missing i64; public base-N packs when a record export
 exists.
+
+### 3.4 Floating-point policy
+
+Decided by [ADR-kotoba-floating-point-on-native](../adr/ADR-kotoba-floating-point-on-native.md).
+Machine form: `lang/guest-grammar.edn` `:floating-point`; classification:
+`lang/surface-status.edn` `:native-binary32-arithmetic`.
+
+**Widths.** `:f32` is IEEE-754 binary32, `:f64` is binary64. There is no
+implicit conversion between them, and none between either and `:i64`. Every
+conversion is a named operation.
+
+**Rounding is round-to-nearest, ties-to-even**, for arithmetic and for every
+conversion. Emitted code assumes the host's default rounding state (x86 MXCSR,
+AArch64 FPCR); no admitted operation lets a guest change it.
+
+**No contraction, no fast-math.** A backend may not fuse a multiply and an add
+into an FMA — that changes the result. No reassociation, no reciprocal
+substitution for division, no flush-to-zero, no denormals-are-zero. Subnormals
+are computed.
+
+**NaN, ±Infinity and −0.0 are ordinary values in computation.** They are
+produced, carried, compared and distinguished; `f32-unordered` / `f64-unordered`
+is the operation that observes NaN, and `f32-neg` of `+0.0` is `−0.0`, a
+different bit pattern. This is *not* the same boundary as the wire:
+`lang/value-codec.edn` still rejects all four as transportable values, and
+`:f32` remains a binder-level annotation rather than a wire type. A value a
+program may compute is not thereby a value the codec may carry.
+
+**NaN payloads are unspecified.** A program may observe *that* a value is NaN;
+the language does not promise which quiet-NaN payload an operation produces, and
+two backends may differ there and both conform.
+
+**Spelling.** The operations are named heads — `f32-add`, `f64-sqrt`,
+`f32-lt` — never `+` or `<`. The `f32+` family in `:admitted-builtins` is the
+legacy wasm emitter's builtin vocabulary (its neighbours are `"i64+"`,
+`"alloc"`, `"str-ptr"`), not a second name for these; the canonical spelling of
+*integer* addition in the same file is plain `+`.
+
+**Literals are exact or refused.** A decimal literal reaches the compiler as a
+host binary64, so decimal → binary32 cannot be rounded in one step, and
+decimal → binary64 → binary32 is not always the same value. A literal is
+admitted in an `:f32` context only when its binary64 round-trips exactly through
+binary32. `1.5` and `2.0` are admitted; `0.1` is refused, because the value the
+reader hands over is not the float the author wrote. Write the narrowing
+explicitly — `(f64-to-f32-rounded 0.1)` — or the pattern —
+`(f32-from-bits 0x3DCCCCCD)`.
+
+**Target restriction** (this is what "target-restricted" in §3.1 means):
+
+| Target | f64 | f32 |
+|---|---|---|
+| KIR oracle (`kotoba.kir/execute`) | full | full |
+| `wasm32-kotoba-v1`, `js-kotoba-v1` | full | full |
+| native x86_64 / aarch64 | arithmetic, comparison, bits | arithmetic, comparison, bits, and four conversions |
+
+On native, `min`/`max`, the `-checked` conversions and the truncating
+float → int conversions are refused, each for a stated reason — see the ADR.
+Neither `:f32` nor `:f64` is a native function-boundary type at either width;
+floats cross a native module boundary as their bit pattern, and
+`f32-from-bits` / `f32-to-bits` cost nothing.
 
 ---
 
@@ -234,7 +294,10 @@ per case class (T1.2 landed). Dual-backend execution runner is T1.3.
 
 - `=` is for admitted scalar/identity types in the safe profile.  
 - Strings → `string=?`  
-- f64 → `f64-eq` or bit conversion — rejection messages must name the alternative.
+- Floats → the width's own head, `f32-eq` / `f64-eq`, or bit conversion — rejection
+  messages must name the alternative. `=` between floats is not admitted: NaN and
+  −0.0 do not behave under integer equality on a word the way IEEE-754 says they
+  must. See §3.4.
 
 ---
 

@@ -63,6 +63,7 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 | `lazy-sequences` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `multi-collection-map` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `named-multi-arity-functions` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
+| `native-binary32-arithmetic` | `implemented-partial` | compiler, kotoba-kir |  |
 | `nested-destructuring` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | Source and intermediate collection expressions are each evaluated exactly once. |
 | `option-flow` | `implemented-partial` | compiler, kir, kotoba-cljs, restricted-esm, wasm32 |  |
 | `portable-source-stdlib` | `implemented-partial` |  |  |
