@@ -164,12 +164,25 @@
 ;; vectors, so demanding the head in `:forbidden-heads` would demand the
 ;; opposite of what the entry says. Those entries are still classified (they
 ;; still count in `invariant-surfaces`); they are only excused from this set.
+;;
+;; And one finer distinction, added 2026-09-02 with local-state slice 1.
+;; `:enforcement :tracked-elaboration` excuses a WHOLE entry, which is right
+;; for `:explicit-errors` (every head it names is elaborated). It is wrong for
+;; `:no-ambient-mutation`, where three of ten heads became admitted-via-
+;; elaboration and the other seven -- `set!`, `ref`, `dosync`, `volatile!`,
+;; `binding`, `var`, `alter-var-root` -- must still be refused by the head.
+;; Excusing the entry would have stopped asking about those seven, so
+;; `:admitted-via-elaboration` names the excused SUBSET and the remainder is
+;; still required to appear in `:forbidden-heads`.
 (defn security-constraint-surfaces [surface]
   (into #{}
         (comp (filter (fn [[_entry v]]
                         (and (= :intentional-security-constraint (:disposition v))
                              (not= :tracked-elaboration (:enforcement v)))))
-              (mapcat (fn [[_entry v]] (map as-sym (:surface v #{})))))
+              (mapcat (fn [[_entry v]]
+                        (let [elaborated (into #{} (map as-sym)
+                                               (:admitted-via-elaboration v #{}))]
+                          (remove elaborated (map as-sym (:surface v #{})))))))
         (:invariants surface {})))
 
 (defn sugar-entries [grammar]
