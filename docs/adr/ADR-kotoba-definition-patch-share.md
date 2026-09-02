@@ -16,9 +16,9 @@
 
 ## Investigation
 
-The language ports pin is `94f03a58` (CI run
-https://github.com/kotoba-lang/kotoba-lang/actions/runs/33647273774).
-`45795b6c`, `61e5e79c`, `245493fc`, and `48d7d3cb` are historical only, not the live pin.
+The language ports pin is `447dca4c` (CI run
+https://github.com/kotoba-lang/kotoba-lang/actions/runs/33655194943).
+`94f03a58`, `45795b6c`, `61e5e79c`, `245493fc`, and `48d7d3cb` are historical only, not the live pin.
 The hasher pin is unchanged: `lang/code-identity.edn` names
 `:definition-cid` `:implemented` (payload-version 2, DAG-CBOR / sha2-256,
 scope `:closed-deterministic-checked-definition`). This repository only
