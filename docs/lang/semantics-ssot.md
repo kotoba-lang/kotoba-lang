@@ -163,10 +163,12 @@ floats cross a native module boundary as their bit pattern, and
    order, and the value is the last one. The core `let` takes exactly ONE body
    expression, so a multi-form source body is collapsed into a `do` during
    desugaring — never into nested `let`s, which would make each non-final form
-   an unused binding that a later pass is entitled to drop. `when`, `when-not`,
-   `when-let`, `when-some`, `doseq` and `dotimes` reach the same rule through
-   their own desugaring. `defn`, `fn` and `loop` take one body expression and
-   refuse more.  
+   an unused binding that a later pass is entitled to drop. `when`, `when-not`
+   and `when-let` reach the same rule through their own desugaring (measured).
+   `defn`, `fn` and `loop` take one body expression and refuse more.
+   `when-some`, `doseq` and `dotimes` are listed as **unmeasured** in
+   `lang/guest-grammar.edn` `:implicit-body-forms` — do not read them as
+   either.  
 5. Core `if` is exactly ternary — test, then, else. Any other arity is refused.  
 6. `if` / `if-some` / `cond` / `case` evaluate only the taken branch.  
 7. `if-some` binds the **payload** of `[:option T]` when some; else else-branch.  
