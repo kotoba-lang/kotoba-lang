@@ -16,7 +16,10 @@
 
 ## Investigation
 
-The identity hasher is already the pin. `lang/code-identity.edn` names
+The language ports pin is `245493fc` (CI run
+https://github.com/kotoba-lang/kotoba-lang/actions/runs/33620750254).
+`48d7d3cb` is historical last-green before keeper #518, not the live pin.
+The hasher pin is unchanged: `lang/code-identity.edn` names
 `:definition-cid` `:implemented` (payload-version 2, DAG-CBOR / sha2-256,
 scope `:closed-deterministic-checked-definition`). This repository only
 delegates: `kotoba.lang.code-identity` is a facade. The algorithm lives in
