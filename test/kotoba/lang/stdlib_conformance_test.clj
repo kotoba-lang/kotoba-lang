@@ -28,10 +28,14 @@
 (def ^:private module-path "lang/stdlib/core.kotoba")
 (def ^:private stdlib-manifest-path "lang/conformance/stdlib/manifest.edn")
 
+(def ^:private case-ids [:portable-source-stdlib :portable-source-stdlib-extended])
+
+(defn- conformance-cases []
+  (let [cases (:cases (edn/read-string (slurp (str conformance-root "/manifest.edn"))))]
+    (mapv (fn [id] (first (filter #(= id (:id %)) cases))) case-ids)))
+
 (defn- conformance-case []
-  (->> (:cases (edn/read-string (slurp (str conformance-root "/manifest.edn"))))
-       (filter #(= :portable-source-stdlib (:id %)))
-       first))
+  (first (conformance-cases)))
 
 (defn- stdlib-module []
   (first (:modules (edn/read-string (slurp stdlib-manifest-path)))))
@@ -56,38 +60,43 @@
        node))
    forms))
 
-(def ^:private joined
-  (delay
-    (let [{:keys [entry]} (conformance-case)
-          module (sema/read-forms (slurp module-path))
-          entry-forms (sema/read-forms (slurp (str conformance-root "/" entry)))
-          [_ _ alias] (second (ns-clause entry-forms :require))
-          source (->> (concat (body-forms module)
-                              (unalias alias (body-forms entry-forms)))
-                      (map pr-str)
-                      (str/join "\n"))]
-      (kir/lower (sema/analyze source)))))
+(defn- join-case [{:keys [entry]}]
+  (let [module (sema/read-forms (slurp module-path))
+        entry-forms (sema/read-forms (slurp (str conformance-root "/" entry)))
+        [_ _ alias] (second (ns-clause entry-forms :require))
+        source (->> (concat (body-forms module)
+                            (unalias alias (body-forms entry-forms)))
+                    (map pr-str)
+                    (str/join "\n"))]
+    (kir/lower (sema/analyze source))))
 
 (deftest portable-source-stdlib-computes-its-expected-value
-  (let [{:keys [function args expect]} (conformance-case)]
-    (is (= (:kotoba expect)
-           (long (kir/execute @joined (symbol (or function "main")) (vec args))))
-        "the case's :expect {:kotoba n} is what the two modules compute")))
+  ;; Both cases: the version-2 list and the version-3 additions. A case that
+  ;; is declared and not found is a failure, not a skip.
+  (doseq [case- (conformance-cases)]
+    (is (some? case-) (str "declared case missing from lang/conformance/manifest.edn: " (pr-str case-ids)))
+    (when case-
+      (let [{:keys [id function args expect]} case-]
+        (testing (name id)
+          (is (= (:kotoba expect)
+                 (long (kir/execute (join-case case-) (symbol (or function "main")) (vec args))))
+              "the case's :expect {:kotoba n} is what the two modules compute"))))))
 
 (deftest the-case-names-the-project-route-and-not-a-prelude
-  (let [case- (conformance-case)]
+  (doseq [[case- entry] (map vector (conformance-cases)
+                             ["stdlib/basic.kotoba" "stdlib/extended.kotoba"])]
     (is (nil? (:prelude case-))
         "`:prelude` names a route no implementation has; see lang/stdlib.edn")
     (is (= ["."] (:source-paths case-)))
-    (is (= "stdlib/basic.kotoba" (:entry case-)))))
+    (is (= entry (:entry case-)))))
 
 (deftest the-entry-requires-the-module-rather-than-being-prepended-to-it
-  (let [entry-forms (sema/read-forms (slurp (str conformance-root "/"
-                                                 (:entry (conformance-case)))))
-        require- (ns-clause entry-forms :require)]
-    (is (some? require-) "the entry must be a project module")
-    (is (= 'stdlib.core (first (second require-))))
-    (is (= :as (second (second require-))))))
+  (doseq [case- (conformance-cases)]
+    (let [entry-forms (sema/read-forms (slurp (str conformance-root "/" (:entry case-))))
+          require- (ns-clause entry-forms :require)]
+      (is (some? require-) "the entry must be a project module")
+      (is (= 'stdlib.core (first (second require-))))
+      (is (= :as (second (second require-)))))))
 
 (deftest the-module-exports-exactly-the-frozen-public-names
   (let [forms (sema/read-forms (slurp module-path))

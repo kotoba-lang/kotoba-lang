@@ -29,6 +29,8 @@
 ;; has to reach them or the caller learns nothing.
 (def ^:private harness
   "(defn bio [s :string needle :string] :i64 (byte-index-of s needle))
+   (defn uio [s :string needle :string] :i64 (utf16-index-of s needle))
+   (defn ulio [s :string needle :string] :i64 (utf16-last-index-of s needle))
    (defn main [] :i64 0)")
 
 (def ^:private lowered
@@ -116,17 +118,67 @@
         module-entry (get-in contract [:modules :kotoba.string])]
     (testing "lang/compat.edn carries the module"
       (is (= "lang/compat/kotoba/string.kotoba" (:path module-entry)))
-      (is (= #{'byte-index-of} (:provides module-entry))))
+      (is (= #{'byte-index-of 'utf16-index-of 'utf16-last-index-of} (:provides module-entry))))
     (testing "and the source's public names are exactly that"
       (let [public (set (map (comp symbol second)
                              (re-seq #"(?m)^\(defn\s+([^\s\[]+)" module)))]
         (is (= (:provides module-entry) public))))
-    (testing "clojure.string/index-of stays absent, and points here"
+    (testing "clojure.string/index-of stays absent, and points here -- at both halves"
       (let [absent (get-in contract [:modules :clojure.string :absent 'index-of])]
         (is (string? (:reason absent)))
-        (is (= 'kotoba.string/byte-index-of (:instead absent)))))
+        (is (= #{'kotoba.string/byte-index-of 'kotoba.string/utf16-index-of} (:instead absent)))
+        (is (str/includes? (:reason absent) "option")
+            "the reason on record is the nil half, not the index half, which is answered")))
+    (testing "and last-index-of points at its utf16 counterpart"
+      (is (= 'kotoba.string/utf16-last-index-of
+             (get-in contract [:modules :clojure.string :absent 'last-index-of :instead]))))
     (testing "nothing named index-of is exported from the clojure.string module"
       (let [clojure-module (slurp "lang/compat/clojure/string.kotoba")]
         (is (empty? (filter #{"index-of"}
                             (map second (re-seq #"(?m)^\(defn\s+([^\s\[]+)"
                                                 clojure-module)))))))))
+
+;; ---------------------------------------------------------------------------
+;; 2026-09-02: utf16-index-of / utf16-last-index-of. Here the oracle IS
+;; clojure.string, because the number is the same number -- a UTF-16 code-unit
+;; index -- and only nil is spelled -1.
+
+(defn- utf16-index-of [s needle]
+  (long (kir/execute @lowered 'uio [s needle])))
+
+(defn- utf16-last-index-of [s needle]
+  (long (kir/execute @lowered 'ulio [s needle])))
+
+(def ^:private utf16-cases
+  (concat cases
+          [["😀a😀a" "a"] ["😀a😀a" "😀a"] ["a😀b😀b" "b"] ["😀" ""] ["😀" "😀"]
+           ["xx" "xxx"] ["🇯🇵x" "x"] ["aあaあ" "あ"] ["ab" "ab"]]))
+
+(deftest utf16-index-of-matches-clojure-string
+  (let [bad (for [[s needle] utf16-cases
+                  :let [want (long (or (str/index-of s needle) -1))
+                        got (utf16-index-of s needle)]
+                  :when (not= want got)]
+              {:input [s needle] :clojure want :kotoba got})]
+    (is (empty? bad) (pr-str (vec bad)))))
+
+(deftest utf16-last-index-of-matches-clojure-string
+  (let [bad (for [[s needle] utf16-cases
+                  :let [want (long (or (str/last-index-of s needle) -1))
+                        got (utf16-last-index-of s needle)]
+                  :when (not= want got)]
+              {:input [s needle] :clojure want :kotoba got})]
+    (is (empty? bad) (pr-str (vec bad))))
+  (testing "the empty needle answers the UTF-16 length, as String.lastIndexOf does"
+    (is (= 3 (str/last-index-of "a😀" "")))
+    (is (= 3 (utf16-last-index-of "a😀" "")))))
+
+(deftest the-two-indexes-really-differ
+  ;; The whole reason there are two names. Astral code points make the UTF-16
+  ;; index differ from the code-point count as well, which is why the emoji
+  ;; cases are here and not only the kana ones.
+  (doseq [[s needle] [["aあb" "b"] ["a😀b" "b"] ["日本語" "語"] ["😀a😀a" "a"]]]
+    (is (not= (utf16-index-of s needle) (byte-index-of s needle))
+        (pr-str [s needle])))
+  (is (= 3 (utf16-index-of "a😀b" "b")) "one unit for a, two for the pair")
+  (is (= 5 (byte-index-of "a😀b" "b")) "one byte for a, four for the emoji"))
