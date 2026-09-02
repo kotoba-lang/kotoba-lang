@@ -154,10 +154,21 @@
               (remove #(.isFile (io/file %))))
         (:invariants surface {})))
 
+;;
+;; One more distinction, added 2026-09-02 with the abort ability (slice 1).
+;; An `:intentional-security-constraint` whose `:enforcement` is
+;; `:tracked-elaboration` names forms the compiler ADMITS -- by lowering them
+;; into a tracked effect (`throw`/`try` -> `:abort` on the row, `[:result T E]`
+;; as the interface) rather than by refusing the head. Its fail-closed
+;; enforcement is the elaboration and the refusals it pins in conformance
+;; vectors, so demanding the head in `:forbidden-heads` would demand the
+;; opposite of what the entry says. Those entries are still classified (they
+;; still count in `invariant-surfaces`); they are only excused from this set.
 (defn security-constraint-surfaces [surface]
   (into #{}
         (comp (filter (fn [[_entry v]]
-                        (= :intentional-security-constraint (:disposition v))))
+                        (and (= :intentional-security-constraint (:disposition v))
+                             (not= :tracked-elaboration (:enforcement v)))))
               (mapcat (fn [[_entry v]] (map as-sym (:surface v #{})))))
         (:invariants surface {})))
 
