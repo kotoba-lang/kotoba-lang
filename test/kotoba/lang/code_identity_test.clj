@@ -379,3 +379,67 @@
         (when (= :implemented (:status entry))
           (is (seq (:evidence entry))
               (str stage " claims :implemented and must name its evidence")))))))
+
+;; ---------------------------------------------------------------------------
+;; The sealed contract versions have authorities, and are read from them
+
+(def ^:private pipeline-file "lang/elaboration-pipeline.edn")
+(def ^:private grammar-file "lang/guest-grammar.edn")
+
+(deftest both-sealed-contract-versions-have-a-named-authority
+  (testing ":profile-version always had one. :desugar-contract-version was
+  recorded as having none -- and the record was wrong: lang/elaboration-pipeline
+  had declared it since 2026-09-01 and nothing read it, which is worse than
+  unowned, because the compiler was sealing a STALE value. This asserts that
+  the contract names both read sites and that both resolve."
+    (let [named (get-in (read-edn contract-file)
+                        [:identities :definition-cid :sealed-version-authorities])]
+      (is (map? named) "the contract must name where each sealed version lives")
+      (is (= #{:profile-version :desugar-contract-version} (set (keys named))))
+      (is (pos-int? (:kotoba.lang.guest-grammar/profile-version (read-edn grammar-file)))
+          "the :profile-version read site resolves")
+      (is (pos-int? (get-in (read-edn pipeline-file) [:contract-versions :desugar-contract]))
+          "the :desugar-contract-version read site resolves"))))
+
+(deftest the-frozen-vectors-are-not-the-desugar-contract-authority
+  (testing "amu pinned 1 `because the frozen vectors use 1`. They do not
+  declare a current value: a vector carries :desugar-contract-version as an
+  INPUT and pins the CID it produces, and two of them carry different inputs on
+  purpose. Both stay true whatever the authority says, which is why raising the
+  authority does not move a single frozen CID."
+    (let [inputs (into #{} (map (comp :definition/desugar-contract-version :definition))
+                       (:vectors vectors))]
+      (is (< 1 (count inputs))
+          "more than one desugar contract version appears among the vectors, so
+           no single one of them can be read as the current value")
+      (is (contains? inputs 1))
+      (is (contains? inputs 2)))))
+
+(deftest alpha-normalization-has-one-authority-and-it-is-kotoba-kir
+  (testing "recorded as a residual risk of :ci8 on 2026-09-02: the walk was
+  implemented twice and neither copy was the authority. The entry has to say
+  where it landed, what the two copies disagreed about, and whether
+  normalization is internal to definition-cid or an explicit caller step --
+  a convergence with no answer to the last is a convergence that moved the
+  question rather than settling it."
+    (let [entry (get-in (read-edn contract-file)
+                        [:identity-implementations :alpha-normalization])]
+      (is (= :authority (:status entry)))
+      (is (= "kotoba.kir.alpha-normalization" (:namespace entry)))
+      (is (= [:params :let :result-match-of :variant-match :option-match]
+             (:binding-forms entry))
+          "five binding forms, named, so a sixth is a review event")
+      (is (string? (:walks-agreed entry)))
+      (is (string? (:normalization-is-an-explicit-step entry)))
+      (is (string? (:frozen-vectors entry))))))
+
+(deftest the-ci8-desugar-gap-says-what-closed-it
+  (testing "a gap sentence that is deleted when the gap closes leaves no record
+  that it was ever open, and no way to tell a closed gap from one nobody
+  wrote down"
+    (let [gap (get-in (read-edn contract-file) [:implementation :ci8 :gap])]
+      (is (string? gap))
+      (is (.startsWith ^String gap "CLOSED")
+          "state the closure rather than removing the sentence")
+      (is (.contains ^String gap "elaboration-pipeline")
+          "and name the authority that closed it"))))

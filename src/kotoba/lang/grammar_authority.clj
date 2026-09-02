@@ -48,7 +48,16 @@
     "../kotoba-sema/resources/kotoba/lang/capability-catalog.edn"]
    "lang/host-parity.edn"
    ["resources/kotoba/lang/host-parity.edn"
-    "../kotoba/resources/kotoba/lang/host-parity.edn"]})
+    "../kotoba/resources/kotoba/lang/host-parity.edn"]
+   ;; Added 2026-09-02. :contract-versions :desugar-contract is the authority
+   ;; for the number sealed as :definition/desugar-contract-version, and the
+   ;; compiler now reads it rather than pinning a guess — which means it is a
+   ;; vendored copy, which means it is a copy waiting to drift unless it is
+   ;; compared.
+   "lang/elaboration-pipeline.edn"
+   ["resources/kotoba/lang/elaboration-pipeline.edn"
+    "../amu/resources/kotoba/lang/elaboration-pipeline.edn"
+    "../compiler/resources/kotoba/lang/elaboration-pipeline.edn"]})
 
 (def portable-backends #{:compiler :kotoba-wasm :kotoba-cljs})
 
