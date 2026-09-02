@@ -156,13 +156,22 @@ floats cross a native module boundary as their bit pattern, and
 
 ## 4. Evaluation order
 
-1. Forms are **desugared** into a core expression language (let/if/call/literals…).  
+1. Forms are **desugared** into a core expression language (let/if/do/call/literals…).  
 2. Evaluation is **left-to-right, call-by-value**.  
 3. `let` bindings are sequential.  
-4. `if` / `if-some` / `cond` / `case` evaluate only the taken branch.  
-5. `if-some` binds the **payload** of `[:option T]` when some; else else-branch.  
+4. A `let` **body is an implicit `do`**: every form is evaluated, in source
+   order, and the value is the last one. The core `let` takes exactly ONE body
+   expression, so a multi-form source body is collapsed into a `do` during
+   desugaring — never into nested `let`s, which would make each non-final form
+   an unused binding that a later pass is entitled to drop. `when`, `when-not`,
+   `when-let`, `when-some`, `doseq` and `dotimes` reach the same rule through
+   their own desugaring. `defn`, `fn` and `loop` take one body expression and
+   refuse more.  
+5. Core `if` is exactly ternary — test, then, else. Any other arity is refused.  
+6. `if` / `if-some` / `cond` / `case` evaluate only the taken branch.  
+7. `if-some` binds the **payload** of `[:option T]` when some; else else-branch.  
    Binding type is the option’s **T**, not hardcoded `:i64` (Product Value ABI fix).  
-6. There is **no ambient mutable heap** in pure guest code. Host state is capability I/O.
+8. There is **no ambient mutable heap** in pure guest code. Host state is capability I/O.
 
 ---
 
