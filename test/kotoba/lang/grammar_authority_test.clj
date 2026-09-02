@@ -249,3 +249,116 @@
     (doseq [[k m] identities]
       (is (contains? statuses (:status m))
           (str k " must say whether it exists: " (pr-str (:status m)))))))
+
+;; ---------------------------------------------------------------------------
+;; ADR-the-authority-names-every-head-the-frontend-admits.
+;;
+;; `local-and-sibling-vendors-match-authority` above compares this file against
+;; `../amu`, `../kotoba`, `../kotoba-sema` and `../grammar`. Those paths exist
+;; only inside the west monorepo layout, the test guards each with
+;; `(when (.isFile ...))`, and `authority-vendor-drift` reports an absent path
+;; as `:missing`, which it tolerates. So in a single-repository clone it
+;; compares exactly one copy -- this repository's own -- and reports green.
+;;
+;; Measured 2026-09-03 on main, before this wave: THREE of the four sibling
+;; copies had drifted (amu one change behind at 580 lines, kotoba's two copies
+;; at 401 against the authority's 601) and that test said nothing. A check that
+;; could not run returned the value of a check that ran and found nothing
+;; wrong -- ADR-2608136000's shape.
+;;
+;; Two additions, neither of which can be satisfied by absence.
+
+(def ^:private authority-grammar-sha256
+  "The sha256 of `lang/guest-grammar.edn` as of the 2026-09-03 resync wave.
+  The same literal is pinned in amu, kotoba-sema and kotoba, so an authority
+  edit that is not carried to all four goes red in the three that were left
+  behind -- including in a clone where there is no sibling to compare against.
+
+  Updating it is the wave: change this file, recompute, and carry the new
+  digest to the other three in the same wave. A digest updated here alone is
+  the defect this pin exists to make loud."
+  "3e3f9748e245386fc2c89bbadabddfebb4bf02190e137494feacec6a12b4500a")
+
+(defn- sha256-hex [^bytes bs]
+  (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") bs)]
+    (apply str (map #(format "%02x" %) d))))
+
+(deftest the-authority-digest-is-pinned-so-a-resync-wave-cannot-be-half-done
+  (let [bytes (java.nio.file.Files/readAllBytes
+               (.toPath (io/file auth/grammar-path)))
+        actual (sha256-hex bytes)]
+    (is (= authority-grammar-sha256 actual)
+        (str "lang/guest-grammar.edn changed without the resync wave.\n"
+             "  expected " authority-grammar-sha256 "\n"
+             "  actual   " actual "\n"
+             "Carry the new bytes to amu, kotoba-sema and kotoba (two copies),"
+             " and update the pinned digest in all four repositories."))))
+
+(deftest the-vendor-comparison-reports-how-many-copies-it-compared
+  ;; The evidence floor. `authority-vendor-drift` returns only the copies it
+  ;; had something to SAY about; a run that opened nothing and a run that
+  ;; opened five identical files both return `[]`. So count the openable ones
+  ;; and print the count, and refuse a run that compared none.
+  (let [registry auth/vendored-authorities
+        listed (mapcat val registry)
+        present (filter #(.isFile (io/file %)) listed)
+        drift (auth/authority-vendor-drift)
+        mismatches (filter #(= :byte-mismatch (:error %)) drift)]
+    (println (format "COMPARED\t%d/%d\tguest-grammar and its sibling authorities"
+                     (count present) (count listed)))
+    (is (pos? (count present))
+        "not one vendored copy was openable; this run measured nothing")
+    (is (some #(= auth/local-vendor-path %) present)
+        "the local vendor copy is always present, so its absence means the
+         registry stopped naming this repository's own copy")
+    (is (empty? mismatches)
+        (str "vendored copies differ from their authority: "
+             (pr-str (mapv (juxt :authority :path) mismatches))))
+    (testing "a sibling that is absent is reported as missing, never as compared"
+      (is (not-any? #(= :missing (:error %))
+                    (filter #(= auth/local-vendor-path (:path %)) drift))))))
+
+(deftest admitted-builtins-names-the-kernel-families
+  ;; It named three kernel heads while kotoba-sema's frontend admitted 114.
+  ;;
+  ;; The set has exactly one reader anywhere: `kotoba.grammar/admitted-heads`
+  ;; in kotoba-lang/kotoba's vendored grammar loader, where a head missing
+  ;; from it is reported as `:unknown-form`. Nothing here, in kotoba-sema or
+  ;; in amu reads it, and nothing anywhere reads it to decide what the
+  ;; COMPILER admits. So the understatement's consequence was one repository
+  ;; calling 111 admitted heads unknown, and nothing failing.
+  ;;
+  ;; This test cannot read the frontend (kotoba-sema is not a dependency of
+  ;; this repository), so it pins the SHAPE and the COUNT that were measured
+  ;; against kotoba-sema 1afff23 on 2026-09-03. The equality itself is checked
+  ;; where the frontend is on the classpath: kotoba-sema's own
+  ;; `guest-grammar-vendor-test`.
+  (let [grammar (auth/read-edn auth/grammar-path)
+        builtins (into #{} (map name) (:admitted-builtins grammar))
+        kernel (into #{} (filter #(or (str/starts-with? % "kernel-")
+                                      (str/starts-with? % "slice-")))
+                     builtins)
+        ;; `kernel-load-` alone also matches `kernel-load-ptr`,
+        ;; `kernel-load-idt` and `kernel-load-gdt-tss`, which are privileged
+        ;; operations rather than window transfers -- the first draft of this
+        ;; test counted 35 for that reason. The width suffix is what makes a
+        ;; head a window transfer.
+        windows (filter #(re-matches #"kernel-(load|store)-u(8|16|32|64)(-(4k|16k|64k))?" %)
+                        kernel)
+        carried (filter #(or (str/starts-with? % "slice-of-")
+                             (contains? #{"slice-length" "slice-get"
+                                          "slice-set!" "slice-sub"} %))
+                        kernel)]
+    (println (format "SCANNED\t%d\tadmitted-builtins (%d kernel heads)"
+                     (count builtins) (count kernel)))
+    (is (= 114 (count kernel))
+        "the three kernel tables in kotoba-sema's frontend held 114 heads on
+         2026-09-03; if that moved, this file and the four vendored copies
+         move with it")
+    (is (= 32 (count windows)) "four transfer widths by four window tiers")
+    (is (= 8 (count carried)) "the carried slice family")
+    (doseq [head ["kernel-load-u64-64k" "kernel-cmpxchg-u64" "kernel-dot-f32"
+                  "kernel-dequant-dot-q6-k" "slice-sub" "kernel-xsetbv"
+                  "kernel-uefi-call6" "kernel-swapgs"]]
+      (is (contains? kernel head)
+          (str head " is admitted by the frontend and must be named here")))))
