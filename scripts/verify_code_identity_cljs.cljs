@@ -37,6 +37,30 @@
    []
    (:vectors table)))
 
+;; The effect-row bridge under ClojureScript: nbb carries capability ids as
+;; BigInt, and a BigInt is not `=` to the plain number a catalog keys on. The
+;; bridge normalises, so the same compiler report bridges to the same keyword
+;; row -- and therefore the same CID -- on both implementations.
+(def bridge-failures
+  (let [catalog {5 :clock/now 8 :state/transact}
+        expected #{:state/transact :clock/now}
+        row (try (ci/effect-row-from-hir {:effects #{[:cap/call (js/BigInt 8)] [:cap/call (js/BigInt 5)]}
+                                          :named-operations #{:state/transact :clock/now}}
+                                         {:id->name catalog})
+                 (catch :default e {:error (.-message e)}))
+        refused (try (ci/effect-row-from-hir {:effects #{[:cap/call (js/BigInt 200)]}}
+                                             {:id->name catalog})
+                     nil
+                     (catch :default e (.-message e)))]
+    (cond-> []
+      (not= expected row)
+      (conj {:id :bridge-bigint-row :field :effect-row :expected expected :actual row})
+      (not= "effect row wire id has no catalog name: [:cap/call 200]" refused)
+      (conj {:id :bridge-unnamed-id :field :refusal
+             :expected "effect row wire id has no catalog name: [:cap/call 200]" :actual refused}))))
+
+(def failures (into failures bridge-failures))
+
 (doseq [f failures]
   (println "FAIL" (:id f) (:field f))
   (println "  clojure   :" (:expected f))
@@ -47,4 +71,5 @@
                (count (:vectors table)) "vectors")
       (js/process.exit 1))
   (println "ok:" (count (:vectors table))
-           "vectors produce identical canonical bytes and CIDs under ClojureScript"))
+           "vectors produce identical canonical bytes and CIDs under ClojureScript;"
+           "effect-row bridge agrees on BigInt ids and on the unnamed-id refusal"))
