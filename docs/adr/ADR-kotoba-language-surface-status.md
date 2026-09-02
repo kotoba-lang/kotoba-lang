@@ -100,21 +100,62 @@ they are not confused with vector-as-data during lowering.
 
 ### Set literals
 
-The bounded reader recognizes `#{...}` and both `kotoba-lang/amu` and the
-primary `kotoba` Wasm/CLJS lowering paths lower sets to a bounded unique
-pair-chain. Source forms are sorted before lowering,
-runtime-equal duplicates are removed, and `contains?`, `conj`, and `disj` use
-compiler-synthesized recursive helpers. Set literals are therefore
-`:implemented-partial`, with a 16-item admission limit chosen so worst-case
-duplicate-removal walks remain inside the existing execution-fuel budget.
+The bounded reader recognizes `#{...}` and lowers it to `(typed-set-new [:set
+:keyword] ...)` with the source forms sorted first, so raw set iteration order
+is never observable. A `#{...}` literal is **keyword-only**: a literal of any
+other item type, and one mixing item types, are both outside the bounded
+profile, and `(typed-set-new [:set item-type] item ...)` builds the others.
+The admission limit is **32 items**.
 
-This is not yet a persistent hash set. A shared positive conformance fixture
-(`:bounded-set-literal-and-operations`) now covers literal construction,
-runtime-equal duplicate removal, membership, addition, and removal. The
-remaining gaps are tagged collection identity and a persistent-set performance
-contract. Reader acceptance alone
-would not have been language support; the classification changed only after
-lowering, operations, bounds, and executable frontend tests existed.
+`conj` and `disj` desugar to `typed-set-conj` and `typed-set-disj`, folded left
+over the items, taking the item type from the receiver — so a set built by
+`typed-set-new` answers them at any admitted item type. `contains?` does **not**
+take a set: it is the canonical typed-map presence primitive, and a set receiver
+is refused with `:kotoba.error/map-presence-receiver` naming `typed-set-contains`
+as what to write instead.
+
+This is not a persistent hash set.
+
+### What this section said before 2026-09-03, and why that matters
+
+Everything above is a correction, and the corrections are the point:
+
+* it said the operations "use compiler-synthesized recursive helpers". Measured
+  2026-09-03 against sema `1587f57` and amu `6c245f69`, `conj` and `disj` had
+  **no lowering at all** — `(conj #{:a} :b)` was refused `operation has no
+  admitted lowering`, the message for a head nothing rewrote, on every
+  receiver, while `typed-set-conj` and `typed-set-disj` sat next to them fully
+  lowered. They were implemented that day (sema `24a59c74`);
+* it said `contains?` was one of the three. It is not, and
+  `lang/guest-grammar.edn` `:contains?` records the same refusal — two
+  authorities in one repository contradicting each other;
+* it said the admission limit was 16, "chosen so worst-case duplicate-removal
+  walks remain inside the existing execution-fuel budget". Measured: 32 admitted,
+  33 refused `typed set constructor exceeds item limit`. The 16 had no
+  measurement behind it and the rationale described a lowering that is not the
+  one in use;
+* it said "the classification changed only after lowering, operations, bounds,
+  and executable frontend tests existed", and named
+  `:bounded-set-literal-and-operations` as the fixture covering "membership,
+  addition, and removal". That fixture —
+  `lang/conformance/collections/set.kotoba` — could not be admitted on either
+  backend it declares, for two independent reasons: its set literal was
+  heterogeneous (`#{:a (+ 1 1)}`), and it called `contains?` on a set. Nothing
+  ran it. Nothing had ever run it: amu's dual-backend runner reads only its own
+  pilot manifest, and `kotoba`'s runner reads this manifest but drives
+  `kotoba.runtime/wasm-binary`, a backend `:backends` does not name.
+
+The last one is the shape ADR-2608136000 describes: a case declared on two
+backends, exercised on a third that was not declared, with nothing anywhere to
+compare the two facts. It is fixed by making the fixture admissible, by running
+it here on `:kir` (`kotoba.lang.collections-conformance-test`), and by recording
+in the manifest, per required backend, **where that backend is driven** —
+`:executed-by` and `:unexecuted-backends`, checked against `:required-backends`
+by `kotoba.lang.conformance-matrix/validate-execution`, with the runner
+asserting in the other direction that the case it just ran names it.
+
+`:wasm32-kotoba-v1` is still not driven over this manifest anywhere. That is now
+written down with a date and a closing condition instead of being invisible.
 
 ### The `map` function
 

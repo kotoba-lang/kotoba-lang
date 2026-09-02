@@ -4,6 +4,7 @@
   Pure loaders + queries. Dual-backend *execution* is T1.3 (compiler /
   kotoba-kir / kotoba-wasm runners)."
   (:require [clojure.edn :as edn]
+            [clojure.set :as set]
             #?(:clj [clojure.java.io :as io])))
 
 (def manifest-path "lang/conformance/manifest.edn")
@@ -105,6 +106,94 @@
       {:ok? (empty? ps) :problems ps
        :case-count (count (cases manifest))
        :pure-product-count (count (pure-product-cases manifest))})))
+
+
+;; --- required backends <-> the runners that actually drive them ------------
+;;
+;; `:required-backends` says which backends a case MUST pass. It does not say
+;; where any of them is driven, and until 2026-09-03 nothing did. Measured that
+;; day, `:bounded-set-literal-and-operations` declared `#{:kir
+;; :wasm32-kotoba-v1}` and was executed on neither: amu's dual-backend runner
+;; reads its own pilot manifest and never this one, and `kotoba`'s runner does
+;; read this one but drives `kotoba.runtime/wasm-binary`, which `:backends`
+;; does not name at all. A case can therefore be declared on two backends,
+;; exercised on a third that is not declared, and look green from every angle.
+;;
+;; A case that records `:executed-by` opts into the check: for it, the required
+;; backends must be EXACTLY the ones named there plus the ones recorded in
+;; `:unexecuted-backends` with a date, a reason and a closing condition. A
+;; backend cannot be in both -- an excuse that outlives what it excuses is the
+;; same defect in the other direction -- and the count of cases carrying the
+;; record is a floor, so the annotation can only grow.
+;;
+;; The other half of this cannot live here: a runner must assert that the case
+;; it just executed names it. `kotoba.lang.collections-conformance-test` does
+;; that, so `:executed-by` cannot claim a runner that does not run.
+
+(def min-cases-with-execution-record
+  "Floor on how many cases record where their required backends are driven.
+  A ratchet: raise it when a case is annotated, never lower it. Without a
+  floor, deleting every `:executed-by` would make this check pass by having
+  nothing to check -- which is not the same as finding nothing wrong."
+  2)
+
+(def ^:private deferral-keys #{:as-of :reason :closes-when})
+
+(defn cases-with-execution-record [manifest]
+  (filterv :executed-by (cases manifest)))
+
+(defn validate-execution
+  "Cross-check `:executed-by`/`:unexecuted-backends` against
+  `:required-backends`. Returns `{:ok? bool :problems [...] :recorded n}`."
+  [manifest]
+  (let [backend-ids (set (keys (backends manifest)))
+        recorded (cases-with-execution-record manifest)
+        problems (transient [])]
+    (doseq [c recorded
+            :let [id (:id c)
+                  required (required-backends-for manifest c)
+                  executed (set (keys (:executed-by c)))
+                  deferred (set (keys (:unexecuted-backends c)))]]
+      (doseq [b (into executed deferred)]
+        (when-not (contains? backend-ids b)
+          (conj! problems {:type :execution-unknown-backend :id id :backend b})))
+      (doseq [b (set/intersection executed deferred)]
+        (conj! problems
+               {:type :backend-both-executed-and-deferred :id id :backend b
+                :why "an entry in :unexecuted-backends naming a backend that
+                      :executed-by also names is an excuse that outlived what
+                      it excused; move it or drop it"}))
+      (doseq [b (set/difference required (into executed deferred))]
+        (conj! problems
+               {:type :required-backend-not-accounted-for :id id :backend b
+                :why "the case requires this backend and records neither a
+                      runner for it nor a dated reason there is none"}))
+      (doseq [b (set/difference (into executed deferred) required)]
+        (conj! problems
+               {:type :backend-recorded-but-not-required :id id :backend b
+                :why "the record names a backend the case does not require;
+                      either the requirement was dropped and the record was
+                      not, or the record is about the wrong case"}))
+      (doseq [[b entry] (:unexecuted-backends c)]
+        (let [missing (remove #(contains? entry %) deferral-keys)]
+          (when (seq missing)
+            (conj! problems
+                   {:type :deferral-missing-keys :id id :backend b
+                    :missing (vec (sort missing))}))))
+      (doseq [[b runner] (:executed-by c)]
+        (when-not (and (string? runner) (seq runner))
+          (conj! problems
+                 {:type :runner-not-named :id id :backend b
+                  :why ":executed-by must name the repository and namespace
+                        that drives the backend, so a reader can go and look"}))))
+    (let [ps (persistent! problems)
+          n (count recorded)]
+      {:ok? (and (empty? ps) (>= n min-cases-with-execution-record))
+       :problems (cond-> ps
+                   (< n min-cases-with-execution-record)
+                   (conj {:type :execution-record-floor
+                          :got n :need min-cases-with-execution-record}))
+       :recorded n})))
 
 ;; --- surface-status <-> manifest agreement --------------------------------
 ;;
