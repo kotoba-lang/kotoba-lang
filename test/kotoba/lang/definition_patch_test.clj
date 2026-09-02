@@ -127,7 +127,11 @@
                  {:ops [{:op :add :name "math/double"
                          :definition-cid authority-cid}]})))))
   (testing "the spike never requires the parallel tree"
-    (is (nil? (requiring-resolve 'kotoba.codebase.typed-code/definition-cid)))))
+    (is (not (re-find #"\[kotoba\.codebase"
+                      (slurp (io/file "src/kotoba/lang/definition_patch.cljc"))))
+        "the keyword :kotoba.codebase/typed-code is the refuse name, not a require")
+    (is (thrown? java.io.FileNotFoundException
+                 (requiring-resolve 'kotoba.codebase.typed-code/definition-cid)))))
 
 (deftest source-tree-bytes-are-not-the-unit
   (is (= :patch/source-tree-unit

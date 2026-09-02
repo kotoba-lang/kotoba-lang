@@ -57,18 +57,18 @@
       (cond
         forbidden (fail forbidden)
         (not (text? nm)) (fail :patch/name-invalid)
-        (not (#{:add :replace :remove} op-name)) (fail :patch/op-unknown :op op-name)
+        (not (#{:add :replace :remove} op-name)) (fail :patch/op-unknown {:op op-name})
         (= :replace op-name)
         (let [from-p (cid-problem (:from op))
               to-p (cid-problem (:to op))]
           (cond
-            from-p (fail from-p :field :from)
-            to-p (fail to-p :field :to)
+            from-p (fail from-p {:field :from})
+            to-p (fail to-p {:field :to})
             :else {:ok? true}))
         :else
         (let [p (cid-problem (:definition-cid op))]
           (if p
-            (fail p :field :definition-cid)
+            (fail p {:field :definition-cid})
             {:ok? true}))))))
 
 (defn validate-patch
@@ -102,21 +102,21 @@
     (case (:op op)
       :add
       (if (contains? bindings nm)
-        (fail :patch/name-exists :name nm)
+        (fail :patch/name-exists {:name nm})
         {:ok? true :bindings (assoc bindings nm (:definition-cid op))})
       :replace
       (cond
-        (not (contains? bindings nm)) (fail :patch/name-missing :name nm)
+        (not (contains? bindings nm)) (fail :patch/name-missing {:name nm})
         (not= (get bindings nm) (:from op))
-        (fail :patch/replace-from-mismatch :name nm
-              :expected (:from op) :actual (get bindings nm))
+        (fail :patch/replace-from-mismatch
+              {:name nm :expected (:from op) :actual (get bindings nm)})
         :else {:ok? true :bindings (assoc bindings nm (:to op))})
       :remove
       (cond
-        (not (contains? bindings nm)) (fail :patch/name-missing :name nm)
+        (not (contains? bindings nm)) (fail :patch/name-missing {:name nm})
         (not= (get bindings nm) (:definition-cid op))
-        (fail :patch/remove-mismatch :name nm
-              :expected (:definition-cid op) :actual (get bindings nm))
+        (fail :patch/remove-mismatch
+              {:name nm :expected (:definition-cid op) :actual (get bindings nm)})
         :else {:ok? true :bindings (dissoc bindings nm)}))))
 
 (defn apply-patch
@@ -136,18 +136,19 @@
 (defn- verify-definition-payload [cid definition]
   (let [p (cid-problem cid)]
     (cond
-      p (fail p :field :definitions)
-      (not (map? definition)) (fail :patch/share-definition-not-a-map :cid cid)
+      p (fail p {:field :definitions})
+      (not (map? definition)) (fail :patch/share-definition-not-a-map {:cid cid})
       :else
       (try
         (let [actual (identity/definition-cid definition)]
           (if (= cid actual)
             {:ok? true}
-            (fail :patch/share-hash-mismatch :expected cid :actual actual)))
+            (fail :patch/share-hash-mismatch {:expected cid :actual actual})))
         (catch #?(:clj Throwable :cljs :default) e
           (fail :patch/share-definition-refused
-                :cid cid
-                :problem (or (:problem (ex-data e)) :definition/uncanonical-value)))))))
+                {:cid cid
+                 :problem (or (:problem (ex-data e))
+                              :definition/uncanonical-value)}))))))
 
 (defn validate-share
   "A share is a patch plus optional definition payloads. Each payload is
