@@ -95,13 +95,18 @@
         deferred @(requiring-resolve 'kotoba.lang.grammar-authority-test/deferred-vendor-copies)
         kotoba-copy "../kotoba/resources/kotoba/lang/guest-grammar.edn"]
     (if (contains? deferred kotoba-copy)
-      (do (println (format "DEFERRED\t1\t%s (see grammar-authority-test/deferred-vendor-copies)"
-                           kotoba-copy))
-          (is (not= authority (slurp (io/file kotoba-root
-                                              "resources/kotoba/lang/guest-grammar.edn")))
-              (str kotoba-copy " is recorded as deferred but now matches this"
-                   " authority; delete the entry in"
-                   " grammar-authority-test/deferred-vendor-copies")))
+      ;; Reported, not asserted, for the reason
+      ;; `grammar-authority-test/local-and-sibling-vendors-match-authority`
+      ;; gives: "behind and not recorded" is a drift and fails there; "recorded
+      ;; but no longer behind" is a stale record, and this repository's CI pins
+      ;; a kotoba revision a parallel stream is resyncing, so the same entry is
+      ;; live in a monorepo checkout and stale in CI at once.
+      (println (format "DEFERRED\t1\t%s\t%s"
+                       kotoba-copy
+                       (if (= authority (slurp (io/file kotoba-root
+                                                        "resources/kotoba/lang/guest-grammar.edn")))
+                         "STALE-DEFERRAL: no longer behind; delete the entry"
+                         "behind this authority, as recorded")))
       (is (= authority (slurp (io/file kotoba-root
                                        "resources/kotoba/lang/guest-grammar.edn")))))
     ;; Source grammar ownership moved with semantic analysis. The compiler is
