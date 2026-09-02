@@ -44,6 +44,19 @@
    (defn t-distinct [code] (encode (distinct (decode code))))
    (defn t-interpose [sep code] (encode (interpose sep (decode code))))
    (defn t-juxt2 [x] (encode (invoke (juxt2 (fn [x] (+ x 1)) (fn [x] (quot x 2))) x)))
+   (defn t-frequencies-count [code] (typed-map-count [:map :i64 :i64] (frequencies (decode code))))
+   (defn t-frequencies-of [code item] (get (frequencies (decode code)) item 0))
+   (defn t-frequencies-has [code item] (if (contains? (frequencies (decode code)) item) 1 0))
+   (defn t-frequencies-dissoc [code item]
+     (typed-map-count [:map :i64 :i64] (dissoc (frequencies (decode code)) item)))
+   (defn nested-two-level [] [:map :i64 [:map :i64 :i64]]
+     (typed-map-assoc [:map :i64 [:map :i64 :i64]]
+       (typed-map-assoc [:map :i64 [:map :i64 :i64]]
+         (typed-map-new [:map :i64 [:map :i64 :i64]])
+         2 (typed-map-new [:map :i64 :i64] 5 7 6 8))
+       3 (typed-map-new [:map :i64 :i64] 5 9)))
+   (defn t-get-in2 [outer inner] (get-in2 (nested-two-level) (pair outer (pair inner 0)) 99))
+   (defn t-get-in2-short [outer] (get-in2 (nested-two-level) (pair outer 0) 99))
    (defn main [] 0)")
 
 (def ^:private lowered
@@ -121,6 +134,45 @@
 (deftest juxt2-matches-clojure-core
   (doseq [x (range 0 9)]
     (is (= (encode ((juxt inc #(quot % 2)) x)) (run 't-juxt2 x)))))
+
+(deftest frequencies-matches-clojure-core
+  ;; The whole map, not one lookup: count, then the tally for every digit that
+  ;; could be a key, including the ones that are not in the input and must
+  ;; answer the default. `lists` holds at most 12 distinct digits, well inside
+  ;; the 31-entry bound of a typed map.
+  (doseq [items lists]
+    (let [want (frequencies items)]
+      (testing (pr-str items)
+        (is (= (count want) (run 't-frequencies-count (encode items)))
+            "distinct-key count")
+        (doseq [digit (range 0 10)]
+          (is (= (get want digit 0) (run 't-frequencies-of (encode items) digit))
+              (str "tally for " digit))
+          (is (= (if (contains? want digit) 1 0)
+                 (run 't-frequencies-has (encode items) digit))
+              (str "contains? " digit))
+          (is (= (count (dissoc want digit))
+                 (run 't-frequencies-dissoc (encode items) digit))
+              (str "count after dissoc " digit)))))))
+
+(deftest get-in2-matches-clojure-core-on-two-key-paths
+  ;; The oracle is clojure.core/get-in itself, over the same two-level map the
+  ;; harness builds.
+  (let [oracle {2 {5 7, 6 8}, 3 {5 9}}]
+    (doseq [outer (range 0 5)
+            inner (range 0 8)]
+      (is (= (get-in oracle [outer inner] 99)
+             (run 't-get-in2 outer inner))
+          (str "path [" outer " " inner "]")))))
+
+(deftest get-in2-differs-from-clojure-on-a-short-path
+  ;; The divergence the name carries, pinned rather than avoided: clojure.core
+  ;; answers the INNER MAP for a one-key path, and a monomorphic function
+  ;; returning :i64 cannot. It answers not-found.
+  (let [oracle {2 {5 7, 6 8}, 3 {5 9}}]
+    (is (= {5 7, 6 8} (get-in oracle [2] 99))
+        "the oracle really does answer the inner map, so the divergence is real")
+    (is (= 99 (run 't-get-in2-short 2)))))
 
 (deftest keep-differs-from-clojure-on-zero
   ;; The one divergence, pinned: 0 is nil in this module, and clojure.core

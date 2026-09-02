@@ -131,24 +131,34 @@
          clojure.lang.ExceptionInfo #"document-map-required"
          (run "(defn main [] :i64 (string-length (ex-message (document-i64 3))))")))))
 
-(deftest the-absent-arities-are-not-symmetric
-  ;; MEASURED 2026-09-02, and it is not what the obvious sentence would have
-  ;; said. Under-arity is refused. OVER-arity is not: the frontend admits a
-  ;; three-argument call to a two-parameter function and DROPS the third,
-  ;; without a word -- `(two 1 2 3)` on `(defn- two [a b] (+ a b))` answers 3.
-  ;; That is a general hole in this frontend, not something about this module,
-  ;; and it is pinned here because `lang/compat.edn` would otherwise claim a
-  ;; caller "gets an arity refusal, never a different answer" and be wrong in
-  ;; one of the two directions.
+(deftest the-arities-are-refused-in-both-directions
+  ;; This test was `the-absent-arities-are-not-symmetric` when it was written
+  ;; on 2026-09-02, and what it MEASURED that day was a hole: under-arity was
+  ;; refused, over-arity was not, and the frontend admitted a three-argument
+  ;; call to a two-parameter function and dropped the third without a word --
+  ;; `(two 1 2 3)` on `(defn- two [a b] (+ a b))` answered 3. It was pinned
+  ;; here because `lang/compat.edn` would otherwise have claimed a caller
+  ;; "gets an arity refusal, never a different answer" and been wrong in one
+  ;; of the two directions.
+  ;;
+  ;; kotoba-sema closed it the same week (its ADR 0011, "a wrong argument
+  ;; count is refused in both directions"), and the message gained the counts.
+  ;; What this test pins therefore moves from the hole to its absence: a test
+  ;; still asserting that the over-arity call is admitted would tell the next
+  ;; reader to route around something that works.
   (testing "(ex-info msg) -- too few -- is refused at check time"
-    (is (= "function call arity mismatch"
+    (is (= "function call arity mismatch: ex-info takes 2 arguments; got 1"
            (refusal "(defn main [] :i64 (document-count (ex-info \"m\")))"))))
-  (testing "(ex-info msg data cause) -- too many -- is ADMITTED, and the cause
-            is discarded silently"
-    (is (nil? (refusal "(defn main [] :i64 (document-count (ex-info \"m\" (document-null) (document-null))))")))
+  (testing "(ex-info msg data cause) -- too many -- is refused too, and says so"
+    (is (= "function call arity mismatch: ex-info takes 2 arguments; got 3"
+           (refusal "(defn main [] :i64 (document-count (ex-info \"m\" (document-null) (document-null))))"))))
+  (testing "and the general case, so the rule is not read as one about ex-info"
+    (is (= "function call arity mismatch: two takes 2 arguments; got 3"
+           (refusal "(defn- two [a :i64 b :i64] :i64 (+ a b))
+                     (defn main [] :i64 (two 1 2 3))")))
     (is (= 3 (run "(defn- two [a :i64 b :i64] :i64 (+ a b))
-                   (defn main [] :i64 (two 1 2 3))"))
-        "the general case, so the hole is not read as one about ex-info")))
+                   (defn main [] :i64 (two 1 2))"))
+        "the right count still answers")))
 
 (deftest the-data-argument-must-be-a-document
   ;; This lives here rather than in lang/conformance/abort/ on purpose: it is

@@ -35,7 +35,7 @@
 (deftest stdlib-manifest-frozen-shape
   (let [m (load-manifest)
         core (first (:modules m))]
-    (is (= 4 (:kotoba.lang.stdlib.manifest/version m)))
+    (is (= 5 (:kotoba.lang.stdlib.manifest/version m)))
     (is (= :frozen (:kotoba.lang.stdlib.manifest/status m)))
     (is (= "T4.1" (:kotoba.lang.stdlib.manifest/wbs m)))
     (is (= :core (:id core)))
@@ -120,16 +120,19 @@
         "every added name is frozen")
     (is (not-any? #(contains? (:withdrawn m) %) added)
         "and none of them is also withdrawn")
-    (doseq [name '[frequencies get-in some juxt keep]]
+    (doseq [name '[get-in some juxt keep]]
       (is (contains? (:absent m) name) (str name " must be accounted for under :absent"))
       (is (keyword? (:reason (get-in m [:absent name]))) (str name " needs a keyword reason")))
-    (doseq [name '[frequencies get-in]]
+    (testing "the refusal version 3 recorded for both names stays readable under :was"
+      ;; `frequencies` left `:absent` in version 5 and `get-in` is refused for
+      ;; a different reason now, so the message that refused them in version 3
+      ;; is only reachable through the entry that remains.
       (is (= "expression type mismatch: expected keyword, got i64"
-             (get-in m [:absent name :message]))
-          (str name " is refused by the keyword-keyed map, and the message is on record")))
+             (get-in m [:absent 'get-in :was :message]))))
     (is (= 'juxt2 (get-in m [:absent 'juxt :replaced-by])))
     (is (= 'first-match (get-in m [:absent 'some :replaced-by])))
-    (is (not (contains? (:public-names core) 'frequencies)))
+    (is (not (contains? (:absent m) 'frequencies))
+        "frequencies is a public name as of version 5 and must not also be absent")
     (is (not (contains? (:public-names core) 'get-in)))
     (testing "the private helpers are not public names"
       (let [helpers (set (mapcat val (:private-helpers core)))]
@@ -152,6 +155,8 @@
   ;; frozen list. A version bump that quietly moved names between modules
   ;; would pass every other test in this file.
   (let [m (load-manifest)
+        ;; Read before the local shadows the function of the same name.
+        added-in-five (:added (revision m 5))
         revision (revision m 4)
         core (first (filter #(= :core (:id %)) (:modules m)))
         sorted (first (filter #(= :sorted-map (:id %)) (:modules m)))
@@ -170,13 +175,21 @@
     (is (= (:added revision) (:public-names sorted)))
     (is (empty? (clojure.set/intersection (:public-names core) (:public-names sorted)))
         "the two modules must not both claim a name")
-    (is (= '#{every? first-match concat reverse-into reverse
-              range-step range zipmap merge
-              comp2 stdlib-binary-closure-anchor partial1
-              keep remove mapv take-while drop-while
-              sort sort-by partition distinct interpose juxt2}
+    ;; `(is (nil? (:added-names revision)))` was here and said nothing: no
+    ;; revision has ever carried that key, so it passed without measuring
+    ;; anything. What version 4 not touching :core actually looks like is the
+    ;; assertion below.
+    (is (= (into '#{every? first-match concat reverse-into reverse
+                    range-step range zipmap merge
+                    comp2 stdlib-binary-closure-anchor partial1
+                    keep remove mapv take-while drop-while
+                    sort sort-by partition distinct interpose juxt2}
+                 added-in-five)
            (:public-names core))
-        "version 4 is an added module; :core's frozen list does not move")
+        (str ":core's frozen list is version 3's plus exactly what version 5 "
+             "added -- version 4 moved nothing, and a bump that quietly "
+             "dropped or renamed an older name would pass every other test "
+             "in this file"))
     (testing "the private helpers account for every defn- in the source"
       (let [private (set (map (comp symbol second)
                               (re-seq #"(?m)^\s*\(defn-\s+([^\s\[]+)" src)))]
@@ -206,12 +219,46 @@
       (is (= "lang/conformance/stdlib/ordered.kotoba" (get-in m [:conformance :ordered-entry])))
       (is (.exists (io/file (get-in m [:conformance :ordered-entry])))))))
 
+(deftest version-five-added-the-two-the-keyword-keyed-map-refused
+  ;; The names versions 3 and 4 recorded as unwritable, now written -- and the
+  ;; entry that still cannot be written, with its reason REPLACED rather than
+  ;; left standing. An `:absent` entry whose reason has been fixed elsewhere
+  ;; tells the next reader to route around something that works.
+  (let [m (load-manifest)
+        core (first (filter #(= :core (:id %)) (:modules m)))
+        revision (revision m 5)]
+    (is (= 5 (:version revision)))
+    (is (= :expansion (:kind revision)))
+    (is (= '#{frequencies get-in2} (:added revision)))
+    (is (every? #(contains? (:public-names core) %) (:added revision))
+        "every added name is frozen")
+    (is (not-any? #(contains? (:withdrawn m) %) (:added revision)))
+    (is (not-any? #(contains? (:absent m) %) (:added revision))
+        "a name cannot be both frozen and absent")
+    (testing "frequencies brings a private helper with it"
+      (is (= '#{tally-into} (get-in core [:private-helpers 'frequencies]))))
+    (testing "get-in is still absent, for a DIFFERENT reason than before"
+      (is (contains? (:absent m) 'get-in))
+      (is (= :the-path-length-is-part-of-the-type
+             (get-in m [:absent 'get-in :reason])))
+      (is (not= "expression type mismatch: expected keyword, got i64"
+                (get-in m [:absent 'get-in :message]))
+          "the closed refusal must not still be presented as the current one")
+      (is (= "expression type mismatch: expected keyword, got i64"
+             (get-in m [:absent 'get-in :was :message]))
+          "and the refusal it USED to have stays readable under :was")
+      (is (= 'get-in2 (get-in m [:absent 'get-in :replaced-by]))))
+    (testing "and the keyed conformance case is declared on both sides"
+      (is (contains? (get-in m [:conformance :cases]) :portable-source-stdlib-keyed))
+      (is (= "lang/conformance/stdlib/keyed.kotoba" (get-in m [:conformance :keyed-entry])))
+      (is (.exists (io/file (get-in m [:conformance :keyed-entry])))))))
+
 (deftest package-contract-lists-core-module
   (let [pkg (edn/read-string (slurp "lang/stdlib.edn"))
         m (load-manifest)
         core (first (:modules m))]
-    (is (= 4 (:kotoba.stdlib/version pkg)))
-    (is (= "0.4.0" (:kotoba.stdlib/release pkg)))
+    (is (= 5 (:kotoba.stdlib/version pkg)))
+    (is (= "0.5.0" (:kotoba.stdlib/release pkg)))
     (is (string? (:kotoba.stdlib/absent pkg)) "the package points at the manifest's :absent")
     (is (= :core (:id (first (:kotoba.stdlib/artifacts pkg)))))
     (is (= 'stdlib.core (:namespace (first (:kotoba.stdlib/artifacts pkg)))))
