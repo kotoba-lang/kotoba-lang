@@ -321,3 +321,39 @@
       (is (not= (get-in impls [:kotoba.kir/definition-identity :status])
                 (get-in impls [:kotoba.codebase/typed-code :status]))
           "one is the authority and the other is the one being migrated"))))
+
+(deftest the-contract-says-where-the-second-answer-is-persisted
+  (testing "this entry was UNVERIFIED, and an unmeasured store reads exactly
+            like an empty one. Measured 2026-09-02 store by store, and one
+            layer-1 definition CID turned out to be published, signed and
+            live -- in THIS repository, which the first survey did not grep."
+    (let [persistence (get-in (read-edn contract-file)
+                              [:identity-implementations :measured-difference :persistence])]
+      (is (map? persistence)
+          "a prose sentence ending in UNVERIFIED is not a measurement")
+      (is (= :persisted-and-published (:verdict persistence)))
+      (is (seq (:stores persistence)))
+      (is (every? #(contains? % :found) (:stores persistence))
+          "every enumerated store answers, so a store nobody looked at cannot
+           be mistaken for one that came back empty")
+      (is (some #(and (true? (:found %)) (pos? (:count %)) (seq (:cids %)))
+                (:stores persistence))
+          "and the store that found something says how many and which")
+      (testing "`could not check` is a distinct answer from `not found`"
+        (let [unchecked (filter #(= :could-not-check (:found %)) (:stores persistence))]
+          (is (seq unchecked))
+          (is (every? :reason unchecked)
+              "with the reason it could not be checked, never a bare absence"))))))
+
+(deftest the-migration-landed-as-an-opt-in-layer
+  (testing "and the contract records the flag, its default, and what layer 2
+            refuses rather than approximating"
+    (let [direction (get-in (read-edn contract-file)
+                            [:identity-implementations :direction])]
+      (is (= :landed-as-opt-in-layer-2 (:status direction)))
+      (is (re-find #"default-identity-version is 1" (:flag direction))
+          "the default is layer 1 because a layer-1 CID is live")
+      (is (seq (:refused-rather-than-approximated direction)))
+      (is (seq (:remaining direction))
+          "what layer 2 still cannot do is written down, not left to be
+           discovered by the next caller"))))
