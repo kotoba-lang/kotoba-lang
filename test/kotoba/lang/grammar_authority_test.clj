@@ -354,7 +354,7 @@
   Updating it is the wave: change this file, recompute, and carry the new
   digest to the other three in the same wave. A digest updated here alone is
   the defect this pin exists to make loud."
-  "67561e57ad2b135d848eac75b46ab430d4404a463159f43775e01134e569988f")
+  "6e1202fd23bc5a2ed6ef432114585c1813f5143d643eb4c8ee9a00b6e798b922")
 
 (defn- sha256-hex [^bytes bs]
   (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") bs)]
@@ -433,14 +433,15 @@
                         kernel)]
     (println (format "SCANNED\t%d\tadmitted-builtins (%d kernel heads)"
                      (count builtins) (count kernel)))
-    (is (= 114 (count kernel))
+    (is (= 115 (count kernel))
         "the three kernel tables in kotoba-sema's frontend held 114 heads on
-         2026-09-03; if that moved, this file and the four vendored copies
-         move with it")
+         2026-09-03, and 115 since fwstore's `kernel-uefi-alloc-region`; if
+         that moves, this file and the four vendored copies move with it")
     (is (= 32 (count windows)) "four transfer widths by four window tiers")
     (is (= 8 (count carried)) "the carried slice family")
     (doseq [head ["kernel-load-u64-64k" "kernel-cmpxchg-u64" "kernel-dot-f32"
                   "kernel-dequant-dot-q6-k" "slice-sub" "kernel-xsetbv"
-                  "kernel-uefi-call6" "kernel-swapgs"]]
+                  "kernel-uefi-call6" "kernel-swapgs"
+                  "kernel-uefi-alloc-region"]]
       (is (contains? kernel head)
           (str head " is admitted by the frontend and must be named here")))))
