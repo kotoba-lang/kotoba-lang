@@ -79,10 +79,45 @@
       (is (= :tracked-elaboration (:enforcement (entry :explicit-errors))))))
   (testing "and the facet unwind the abort path waits on is the one the dataspace entry declares missing"
     (is (contains? (set (:missing (entry :dataspace))) :checked-lexical-facet-unwind)))
-  (testing "the state widening has not landed: every covered head is still forbidden"
+  (testing "the STATE KIT widening has not landed: the heads only it covers are still forbidden"
+    ;; This asked about all six heads of :state-kit-desugar :covers until
+    ;; 2026-09-02, when the second widening path on the same entry --
+    ;; :local-atom-elaboration, lang/local-state.edn -- landed and admitted
+    ;; three of them BY ELABORATION. The state kit itself has not moved: its
+    ;; four preconditions are unchanged above, and the three heads below have
+    ;; no host, no grant and no desugar. So the question this splits into two.
     (let [grammar (edn/read-string (slurp "lang/guest-grammar.edn"))
           forbidden (set (:forbidden-heads grammar))]
-      (is (every? forbidden '#{atom swap! reset! volatile! ref dosync}))))
+      (is (every? forbidden '#{volatile! ref dosync}))))
+  (testing "the LOCAL ATOM widening has (slice 1): its heads left forbidden-heads and are sugar"
+    (let [grammar (edn/read-string (slurp "lang/guest-grammar.edn"))
+          forbidden (set (:forbidden-heads grammar))
+          path (:local-atom-elaboration (entry :no-ambient-mutation))]
+      (is (not-any? forbidden '#{atom swap! reset! deref}))
+      (is (= '[atom swap! reset! deref] (get-in grammar [:sugar :atom-local :forms])))
+      (is (= :slice-1-implemented (:status path)))
+      (is (= '#{atom swap! reset! deref} (:covers path)))
+      (is (= '#{atom swap! reset! deref}
+             (:admitted-via-elaboration (entry :no-ambient-mutation))))
+      (is (= :met (get-in path [:precondition-status :non-escaping-cell-enforced :status])))))
+  (testing "and it did NOT advance the state kit's vacuous precondition"
+    ;; A cell is not a value either, so nothing on this slice gives a
+    ;; capability handle a type. `capability-handles-are-not-values` above is
+    ;; the measurement; this is the record that the path knows it.
+    (is (= :local-atom-elaboration
+           (get-in (entry :no-ambient-mutation) [:widening-path :unchanged-by])))
+    (is (= :vacuous
+           (get-in (entry :no-ambient-mutation)
+                   [:widening-path :precondition-status
+                    :capability-handle-storage-rejected-by-schema :status]))))
+  (testing "a non-escaping local atom is admitted, and an escaping one is not"
+    ;; The two directions, measured rather than declared. A slice that only
+    ;; admitted would not be a widening of :no-ambient-mutation at all.
+    (is (nil? (rejection-of "(defn main [] :i64 (let [a (atom 0)] (swap! a + 42) @a))")))
+    (is (= (str "atom `a` escapes its let scope (atom slice 1 admits "
+                "swap!/reset!/deref in straight-line code of the binding "
+                "function only)")
+           (rejection-of "(defn main [] :i64 (let [a (atom 0)] a))"))))
   (testing "the abort widening has (slice 1): the heads left forbidden-heads and are sugar"
     (let [grammar (edn/read-string (slurp "lang/guest-grammar.edn"))
           forbidden (set (:forbidden-heads grammar))]
