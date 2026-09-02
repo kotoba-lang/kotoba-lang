@@ -86,12 +86,33 @@
     (is (= {:denied :wildcard-forbidden} result))))
 
 (deftest q3-consumers-embed-the-canonical-grammar-without-drift
-  (let [authority (slurp "lang/guest-grammar.edn")]
-    (is (= authority (slurp (io/file kotoba-root
-                                     "resources/kotoba/lang/guest-grammar.edn"))))
+  ;; Deferrals are read from `kotoba.lang.grammar-authority-test`, which is
+  ;; where the decision to defer a copy is recorded with its reason and its
+  ;; closing condition. Two tests in this repository compare the same sibling
+  ;; copies; a copy deferred in one and required in the other would make the
+  ;; deferral a matter of which test ran.
+  (let [authority (slurp "lang/guest-grammar.edn")
+        deferred @(requiring-resolve 'kotoba.lang.grammar-authority-test/deferred-vendor-copies)
+        kotoba-copy "../kotoba/resources/kotoba/lang/guest-grammar.edn"]
+    (if (contains? deferred kotoba-copy)
+      ;; Reported, not asserted, for the reason
+      ;; `grammar-authority-test/local-and-sibling-vendors-match-authority`
+      ;; gives: "behind and not recorded" is a drift and fails there; "recorded
+      ;; but no longer behind" is a stale record, and this repository's CI pins
+      ;; a kotoba revision a parallel stream is resyncing, so the same entry is
+      ;; live in a monorepo checkout and stale in CI at once.
+      (println (format "DEFERRED\t1\t%s\t%s"
+                       kotoba-copy
+                       (if (= authority (slurp (io/file kotoba-root
+                                                        "resources/kotoba/lang/guest-grammar.edn")))
+                         "STALE-DEFERRAL: no longer behind; delete the entry"
+                         "behind this authority, as recorded")))
+      (is (= authority (slurp (io/file kotoba-root
+                                       "resources/kotoba/lang/guest-grammar.edn")))))
     ;; Source grammar ownership moved with semantic analysis. The compiler is
     ;; orchestration and consumes this resource from kotoba-sema; requiring a
-    ;; duplicate compiler copy would undo the extracted boundary.
+    ;; duplicate compiler copy would undo the extracted boundary. kotoba-sema is
+    ;; never deferred: it is resynced in the same wave as this authority.
     (is (= authority (slurp (io/file sema-root
                                      "resources/kotoba/lang/guest-grammar.edn"))))))
 
