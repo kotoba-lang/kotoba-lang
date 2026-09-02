@@ -22,6 +22,13 @@
   ["../amu/resources/kotoba/lang/guest-grammar.edn"
    "../compiler/resources/kotoba/lang/guest-grammar.edn"
    "../kotoba/resources/kotoba/lang/guest-grammar.edn"
+   ;; kotoba's SECOND copy. `kotoba/vendor/grammar` is a committed vendored
+   ;; checkout of the grammar repository, consumed as `{:local/root
+   ;; "vendor/grammar"}`, so the file below is on kotoba's classpath as
+   ;; `kotoba/lang/guest-grammar.edn` exactly like the one above. The digest
+   ;; pin's message has said "kotoba (two copies)" since 2026-09-03 while this
+   ;; list named one; added 2026-09-03, measured drifted at the time it was.
+   "../kotoba/vendor/grammar/resources/kotoba/lang/guest-grammar.edn"
    "../grammar/resources/kotoba/lang/guest-grammar.edn"
    "../kotoba-sema/resources/kotoba/lang/guest-grammar.edn"])
 

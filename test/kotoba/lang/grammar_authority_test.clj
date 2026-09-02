@@ -277,7 +277,7 @@
   Updating it is the wave: change this file, recompute, and carry the new
   digest to the other three in the same wave. A digest updated here alone is
   the defect this pin exists to make loud."
-  "3e3f9748e245386fc2c89bbadabddfebb4bf02190e137494feacec6a12b4500a")
+  "67561e57ad2b135d848eac75b46ab430d4404a463159f43775e01134e569988f")
 
 (defn- sha256-hex [^bytes bs]
   (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") bs)]
