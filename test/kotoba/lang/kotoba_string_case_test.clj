@@ -1,18 +1,29 @@
 (ns kotoba.lang.kotoba-string-case-test
-  "`lang/compat/kotoba/string/case.kotoba` and the table it reads, checked
-  against java.lang.Character and java.lang.String themselves.
+  "`lang/compat/kotoba/string/case.kotoba` and the table it reads.
 
-  The tables in `case_tables.kotoba` were GENERATED from those same JVM
-  functions by `scripts/gen_case_tables.clj`, which would make this test
-  circular if it compared the table to its own source. It does not: it runs
-  the Kotoba code -- the block arithmetic, the UTF-8 widths, the string
-  slicing, the walk -- and compares the ANSWER to a fresh call of the JVM
-  function. A generator that emitted the right characters at the wrong
-  offsets, or a block whose width was wrong, or a walk that lost a code
-  point, all fail here.
+  THE CONTRACT is the Unicode SIMPLE case mapping (UnicodeData.txt fields
+  12/13, one code point to one code point, no locale, no context).
+  `Character.toLowerCase(int)` / `toUpperCase(int)` implement that mapping
+  for the Unicode version the host JDK carries -- they are a convenient
+  oracle, not the authority. CI and this repository's test host are
+  Temurin 21 / Unicode 15.0. Unicode 16.0 published simple mappings that
+  a Unicode-15 Character answers as identity (U+019B, U+0264, U+1C89,
+  U+1C8A in the U+0000..U+3100 sweep, plus their new partners and the
+  Garay case pairs). Kotoba follows the published mapping. The JVM is
+  the thing that can be behind; that skew is asserted, not treated as
+  the expected answer.
 
-  THE SWEEP is every code point below U+3100 plus every code point the JVM
-  reports a case mapping for anywhere in Unicode, which is where the four-byte
+  The tables in `case_tables.kotoba` were GENERATED from a JDK that
+  already carried Unicode 16, then checked here by running the Kotoba
+  code -- the block arithmetic, the UTF-8 widths, the string slicing,
+  the walk -- against the Unicode oracle (JVM Character, overlaid with
+  the Unicode 16.0 mappings a Unicode-15 JDK lacks). A generator that
+  emitted the right characters at the wrong offsets, or a block whose
+  width was wrong, or a walk that lost a code point, all fail here.
+
+  THE SWEEP is every code point below U+3100 plus every code point the
+  JVM reports a case mapping for anywhere in Unicode plus the Unicode
+  16.0 mappings the host JDK may not know, which is where the four-byte
   blocks and the SpecialCasing expansions live. The counts are printed.
 
   WHY THESE NAMES AND NOT clojure.string's. `clojure.string/lower-case` calls
@@ -76,6 +87,102 @@
   [^String s]
   (vec (.toArray (.codePoints s))))
 
+;; Unicode 16.0 Simple_Uppercase_Mapping / Simple_Lowercase_Mapping for
+;; code points that are identity in Unicode 15.0 (JDK 21 Character).
+;; Source: https://www.unicode.org/Public/16.0.0/ucd/UnicodeData.txt
+;; fields 12 and 13. Each row is [code-point simple-upper simple-lower].
+;;
+;; The four that sit inside the U+0000..U+3100 sweep -- U+019B, U+0264,
+;; U+1C89, U+1C8A -- are why a Unicode-15 JVM oracle goes red. The rest
+;; are their new partners and the Garay case pairs; a Unicode-15 JVM
+;; never puts them in `jvm-mapped`, so they have to be named here or
+;; they drop out of the sweep.
+(def ^:private unicode-16-over-15-rows
+  [[0x019B 0xA7DC 0x019B]
+   [0x0264 0xA7CB 0x0264]
+   [0x1C89 0x1C89 0x1C8A]
+   [0x1C8A 0x1C89 0x1C8A]
+   [0xA7CB 0xA7CB 0x0264]
+   [0xA7CC 0xA7CC 0xA7CD]
+   [0xA7CD 0xA7CC 0xA7CD]
+   [0xA7DA 0xA7DA 0xA7DB]
+   [0xA7DB 0xA7DA 0xA7DB]
+   [0xA7DC 0xA7DC 0x019B]
+   [0x10D50 0x10D50 0x10D70]
+   [0x10D51 0x10D51 0x10D71]
+   [0x10D52 0x10D52 0x10D72]
+   [0x10D53 0x10D53 0x10D73]
+   [0x10D54 0x10D54 0x10D74]
+   [0x10D55 0x10D55 0x10D75]
+   [0x10D56 0x10D56 0x10D76]
+   [0x10D57 0x10D57 0x10D77]
+   [0x10D58 0x10D58 0x10D78]
+   [0x10D59 0x10D59 0x10D79]
+   [0x10D5A 0x10D5A 0x10D7A]
+   [0x10D5B 0x10D5B 0x10D7B]
+   [0x10D5C 0x10D5C 0x10D7C]
+   [0x10D5D 0x10D5D 0x10D7D]
+   [0x10D5E 0x10D5E 0x10D7E]
+   [0x10D5F 0x10D5F 0x10D7F]
+   [0x10D60 0x10D60 0x10D80]
+   [0x10D61 0x10D61 0x10D81]
+   [0x10D62 0x10D62 0x10D82]
+   [0x10D63 0x10D63 0x10D83]
+   [0x10D64 0x10D64 0x10D84]
+   [0x10D65 0x10D65 0x10D85]
+   [0x10D70 0x10D50 0x10D70]
+   [0x10D71 0x10D51 0x10D71]
+   [0x10D72 0x10D52 0x10D72]
+   [0x10D73 0x10D53 0x10D73]
+   [0x10D74 0x10D54 0x10D74]
+   [0x10D75 0x10D55 0x10D75]
+   [0x10D76 0x10D56 0x10D76]
+   [0x10D77 0x10D57 0x10D77]
+   [0x10D78 0x10D58 0x10D78]
+   [0x10D79 0x10D59 0x10D79]
+   [0x10D7A 0x10D5A 0x10D7A]
+   [0x10D7B 0x10D5B 0x10D7B]
+   [0x10D7C 0x10D5C 0x10D7C]
+   [0x10D7D 0x10D5D 0x10D7D]
+   [0x10D7E 0x10D5E 0x10D7E]
+   [0x10D7F 0x10D5F 0x10D7F]
+   [0x10D80 0x10D60 0x10D80]
+   [0x10D81 0x10D61 0x10D81]
+   [0x10D82 0x10D62 0x10D82]
+   [0x10D83 0x10D63 0x10D83]
+   [0x10D84 0x10D64 0x10D84]
+   [0x10D85 0x10D65 0x10D85]])
+
+(def ^:private unicode-16-over-15
+  (into {} (map (fn [[cp upper lower]] [cp {:upper upper :lower lower}])
+                unicode-16-over-15-rows)))
+
+(defn- simple-lower-cp [cp]
+  (if-let [m (unicode-16-over-15 cp)]
+    (:lower m)
+    (int (Character/toLowerCase (int cp)))))
+
+(defn- simple-upper-cp [cp]
+  (if-let [m (unicode-16-over-15 cp)]
+    (:upper m)
+    (int (Character/toUpperCase (int cp)))))
+
+(defn- simple-lower-str [cp] (one (simple-lower-cp cp)))
+(defn- simple-upper-str [cp] (one (simple-upper-cp cp)))
+
+(defn- upper-root-str
+  "String.toUpperCase(Locale.ROOT), except where the host JDK's Unicode
+  is behind the published simple mapping -- then the Unicode SIMPLE
+  uppercase. None of the Unicode 16.0 additions have a SpecialCasing
+  expansion, so the two coincide once the JDK catches up."
+  [^String s]
+  (apply str
+         (map (fn [cp]
+                (if (contains? unicode-16-over-15 cp)
+                  (one (get-in unicode-16-over-15 [cp :upper]))
+                  (.toUpperCase ^String (one cp) Locale/ROOT)))
+              (code-points s))))
+
 ;; Every code point the JVM maps at all -- found by asking the JVM, not by
 ;; reading the table back, so a mapping the generator MISSED is in the sweep.
 (def ^:private jvm-mapped
@@ -90,36 +197,63 @@
 (def ^:private sweep
   (delay (concat (remove #(<= 0xD800 % 0xDFFF) (range 0 0x3100))
                  (sort @jvm-mapped)
+                 (sort (keys unicode-16-over-15))
                  [0x3100 0xD7FF 0xE000 0xFEFF 0x1F600 0x10FFFF])))
 
-(deftest simple-case-mappings-are-the-jvm-s
-  ;; Character.toLowerCase(int) / toUpperCase(int) -- the Unicode SIMPLE
-  ;; mappings, one code point to one code point, no locale and no context.
+(deftest simple-case-mappings-are-unicode-simple
+  ;; Unicode SIMPLE mappings, one code point to one code point, no locale
+  ;; and no context. Character.toLowerCase(int) / toUpperCase(int) are
+  ;; the oracle where the host JDK's Unicode version has the mapping;
+  ;; unicode-16-over-15 is the oracle where it does not.
   (let [points (vec @sweep)
         bad (for [cp points
                   :let [s (one cp)
                         got-lower (call 'lower s)
-                        want-lower (one (Character/toLowerCase (int cp)))
+                        want-lower (simple-lower-str cp)
                         got-upper (call 'upper s)
-                        want-upper (one (Character/toUpperCase (int cp)))]
+                        want-upper (simple-upper-str cp)]
                   :when (or (not= got-lower want-lower) (not= got-upper want-upper))]
               {:code-point (format "U+%04X" cp)
-               :kotoba [got-lower got-upper] :jvm [want-lower want-upper]})]
+               :kotoba [got-lower got-upper] :unicode [want-lower want-upper]
+               :jvm [(one (Character/toLowerCase (int cp)))
+                     (one (Character/toUpperCase (int cp)))]})]
     (println (str "SCANNED\t" (count points) "\tcode points; the JVM maps "
-                  (count @jvm-mapped) " of them"))
+                  (count @jvm-mapped) " of them; Unicode 16 adds "
+                  (count unicode-16-over-15) " the host JDK may lack"))
     (is (pos? (count @jvm-mapped)) "an empty JVM mapping set would make this sweep vacuous")
     (is (> (count points) 12000) "the sweep must actually cover U+0000..U+3100 and the mapped tail")
     (is (empty? bad) (pr-str (vec (take 8 bad))))))
 
+(deftest unicode-16-simple-mappings-are-not-the-host-jdk
+  ;; The four sweep-visible points, plus their published partners. Kotoba
+  ;; must match Unicode even when Character answers identity.
+  (doseq [[cp upper lower] unicode-16-over-15-rows]
+    (let [s (one cp)
+          label (format "U+%04X" cp)]
+      (is (= (one lower) (call 'lower s)) (str label " simple-lower"))
+      (is (= (one upper) (call 'upper s)) (str label " simple-upper"))
+      (is (= (one upper) (call 'upper-root s)) (str label " upper-root"))))
+  (testing "a Unicode-15 JVM answers identity; Kotoba must not follow it off Unicode"
+    (doseq [cp [0x019B 0x0264 0x1C89 0x1C8A]]
+      (let [jvm-upper (one (Character/toUpperCase (int cp)))
+            uni-upper (simple-upper-str cp)
+            kotoba-upper (call 'upper (one cp))]
+        (is (= uni-upper kotoba-upper) (format "U+%04X follows Unicode" cp))
+        (when (not= jvm-upper uni-upper)
+          (is (not= jvm-upper kotoba-upper)
+              (format "U+%04X must not copy a lagging Character.toUpperCase" cp)))))))
+
 (deftest upper-case-root-is-string-touppercase-root
   ;; The stronger claim: String.toUpperCase(Locale.ROOT), which is NOT the
-  ;; simple mapping -- 102 code points expand to more than one character.
+  ;; simple mapping -- 102 code points expand to more than one character --
+  ;; except where the host JDK's simple mapping is behind Unicode 16.0.
   (let [bad (for [cp @sweep
                   :let [s (one cp)
                         got (call 'upper-root s)
-                        want (.toUpperCase s Locale/ROOT)]
+                        want (upper-root-str s)]
                   :when (not= got want)]
-              {:code-point (format "U+%04X" cp) :kotoba got :jvm want})]
+              {:code-point (format "U+%04X" cp) :kotoba got :unicode want
+               :jvm (.toUpperCase ^String s Locale/ROOT)})]
     (is (empty? bad) (pr-str (vec (take 8 bad)))))
   (testing "the expansions are really there and really are not the simple mapping"
     (is (= "SS" (call 'upper-root "ß")))
@@ -149,15 +283,15 @@
 (deftest whole-strings-agree-too
   (doseq [[label function oracle]
           [["simple-lower-case" 'lower
-            (fn [s] (apply str (map #(one (Character/toLowerCase (int %))) (code-points s))))]
+            (fn [s] (apply str (map simple-lower-str (code-points s))))]
            ["simple-upper-case" 'upper
-            (fn [s] (apply str (map #(one (Character/toUpperCase (int %))) (code-points s))))]
-           ["upper-case-root" 'upper-root (fn [s] (.toUpperCase ^String s Locale/ROOT))]]]
+            (fn [s] (apply str (map simple-upper-str (code-points s))))]
+           ["upper-case-root" 'upper-root upper-root-str]]]
     (testing label
       (let [bad (for [s strings
                       :let [got (call function s) want (oracle s)]
                       :when (not= got want)]
-                  {:input s :kotoba got :jvm want})]
+                  {:input s :kotoba got :unicode want})]
         (is (empty? bad) (pr-str (vec (take 5 bad))))))))
 
 (deftest simple-capitalize-uppercases-the-first-code-point
@@ -166,9 +300,8 @@
                    s
                    (let [first- (.codePointAt ^String s 0)
                          rest- (subs s (Character/charCount first-))]
-                     (str (one (Character/toUpperCase (int first-)))
-                          (apply str (map #(one (Character/toLowerCase (int %)))
-                                          (code-points rest-)))))))
+                     (str (simple-upper-str first-)
+                          (apply str (map simple-lower-str (code-points rest-)))))))
         bad (for [s strings
                   :let [got (call 'cap s) want (oracle s)]
                   :when (not= got want)]

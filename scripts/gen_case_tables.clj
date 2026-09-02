@@ -1,6 +1,7 @@
 (ns gen-case-tables
-  "Writes `lang/compat/kotoba/string/case_tables.kotoba` from the JVM's own
-  Character and String APIs.
+  "Writes `lang/compat/kotoba/string/case_tables.kotoba` from the Unicode
+  SIMPLE case mapping, read off the JVM and overlaid with the Unicode 16.0
+  mappings a Unicode-15 JDK (Temurin 21 / CI) answers as identity.
 
     clojure -M scripts/gen_case_tables.clj
 
@@ -9,8 +10,9 @@
   hand. Case mapping is 1,488 lowercase and 1,505 uppercase code points, plus
   102 that `String.toUpperCase` expands to more than one character. A hand
   table of that size is a table of what someone believed Unicode says; this
-  one is derived from the JVM the oracle then checks it against, and the
-  generator is checked in so the derivation can be repeated when a JDK moves.
+  one is derived from Unicode (via Character on a current JDK, plus the
+  published 16.0 rows a Unicode-15 Character lacks) and the generator is
+  checked in so the derivation can be repeated when a JDK moves.
 
   WHY THE OUTPUT IS STRING LITERALS AND NOT ARITHMETIC. Kotoba has no
   code-point-to-string constructor -- `string-from-i64` writes a NUMBER in
@@ -38,21 +40,94 @@
 
 (defn- one [cp] (String/valueOf (Character/toChars cp)))
 
+;; Unicode 16.0 Simple_Uppercase_Mapping / Simple_Lowercase_Mapping for
+;; code points that are identity in Unicode 15.0 (JDK 21 Character).
+;; Same rows as test/kotoba/lang/kotoba_string_case_test.clj. Applied
+;; AFTER the JVM read so regenerating on CI's Temurin 21 does not drop
+;; the published mappings. Source: UnicodeData.txt 16.0.0 fields 12/13.
+(def ^:private unicode-16-over-15
+  (into {}
+        (map (fn [[cp upper lower]] [cp {:upper upper :lower lower}])
+             [[0x019B 0xA7DC 0x019B]
+              [0x0264 0xA7CB 0x0264]
+              [0x1C89 0x1C89 0x1C8A]
+              [0x1C8A 0x1C89 0x1C8A]
+              [0xA7CB 0xA7CB 0x0264]
+              [0xA7CC 0xA7CC 0xA7CD]
+              [0xA7CD 0xA7CC 0xA7CD]
+              [0xA7DA 0xA7DA 0xA7DB]
+              [0xA7DB 0xA7DA 0xA7DB]
+              [0xA7DC 0xA7DC 0x019B]
+              [0x10D50 0x10D50 0x10D70]
+              [0x10D51 0x10D51 0x10D71]
+              [0x10D52 0x10D52 0x10D72]
+              [0x10D53 0x10D53 0x10D73]
+              [0x10D54 0x10D54 0x10D74]
+              [0x10D55 0x10D55 0x10D75]
+              [0x10D56 0x10D56 0x10D76]
+              [0x10D57 0x10D57 0x10D77]
+              [0x10D58 0x10D58 0x10D78]
+              [0x10D59 0x10D59 0x10D79]
+              [0x10D5A 0x10D5A 0x10D7A]
+              [0x10D5B 0x10D5B 0x10D7B]
+              [0x10D5C 0x10D5C 0x10D7C]
+              [0x10D5D 0x10D5D 0x10D7D]
+              [0x10D5E 0x10D5E 0x10D7E]
+              [0x10D5F 0x10D5F 0x10D7F]
+              [0x10D60 0x10D60 0x10D80]
+              [0x10D61 0x10D61 0x10D81]
+              [0x10D62 0x10D62 0x10D82]
+              [0x10D63 0x10D63 0x10D83]
+              [0x10D64 0x10D64 0x10D84]
+              [0x10D65 0x10D65 0x10D85]
+              [0x10D70 0x10D50 0x10D70]
+              [0x10D71 0x10D51 0x10D71]
+              [0x10D72 0x10D52 0x10D72]
+              [0x10D73 0x10D53 0x10D73]
+              [0x10D74 0x10D54 0x10D74]
+              [0x10D75 0x10D55 0x10D75]
+              [0x10D76 0x10D56 0x10D76]
+              [0x10D77 0x10D57 0x10D77]
+              [0x10D78 0x10D58 0x10D78]
+              [0x10D79 0x10D59 0x10D79]
+              [0x10D7A 0x10D5A 0x10D7A]
+              [0x10D7B 0x10D5B 0x10D7B]
+              [0x10D7C 0x10D5C 0x10D7C]
+              [0x10D7D 0x10D5D 0x10D7D]
+              [0x10D7E 0x10D5E 0x10D7E]
+              [0x10D7F 0x10D5F 0x10D7F]
+              [0x10D80 0x10D60 0x10D80]
+              [0x10D81 0x10D61 0x10D81]
+              [0x10D82 0x10D62 0x10D82]
+              [0x10D83 0x10D63 0x10D83]
+              [0x10D84 0x10D64 0x10D84]
+              [0x10D85 0x10D65 0x10D85]])))
+
+(defn- simple-lower ^long [cp]
+  (if-let [m (unicode-16-over-15 cp)]
+    (long (:lower m))
+    (long (Character/toLowerCase (int cp)))))
+
+(defn- simple-upper ^long [cp]
+  (if-let [m (unicode-16-over-15 cp)]
+    (long (:upper m))
+    (long (Character/toUpperCase (int cp)))))
+
 (defn- blocks
   "Contiguous ranges of code points whose targets under `f` all have the same
   UTF-8 width, cut at a gap wider than `max-gap`. Surrogates are never spanned:
   they are not scalar values and could not be written into a literal."
   [f]
-  (let [changed (vec (remove surrogates (filter #(not= % (f (int %))) code-points)))]
+  (let [changed (vec (remove surrogates (filter #(not= % (f %)) code-points)))]
     (loop [cs changed out []]
       (if (empty? cs)
         out
         (let [lo (first cs)
-              width (utf8-width (f (int lo)))
+              width (utf8-width (f lo))
               extendable? (fn [prev c]
                             (and (<= (- c prev) max-gap)
                                  (not-any? #(or (surrogates %)
-                                                (not= width (utf8-width (f (int %)))))
+                                                (not= width (utf8-width (f %))))
                                            (range (inc prev) (inc c)))))
               hi (loop [prev lo remaining (next cs)]
                    (let [c (first remaining)]
@@ -61,7 +136,7 @@
                        prev)))]
           (recur (drop-while #(<= % hi) cs)
                  (conj out {:lo lo :hi hi :width width
-                            :literal (apply str (map #(one (f (int %))) (range lo (inc hi))))})))))))
+                            :literal (apply str (map #(one (f %)) (range lo (inc hi))))})))))))
 
 (defn- special-uppercase
   "The code points where `String.toUpperCase(Locale.ROOT)` is not the
@@ -91,16 +166,17 @@
        "      :else (string-substring s index (+ index width)))))\n"))
 
 (defn -main [& _]
-  (let [lower (blocks #(Character/toLowerCase ^int %))
-        upper (blocks #(Character/toUpperCase ^int %))
+  (let [lower (blocks simple-lower)
+        upper (blocks simple-upper)
         special (special-uppercase)
         source
         (str
 ";; GENERATED by scripts/gen_case_tables.clj. Do not edit.
 ;;
-;; The Unicode case mappings the JVM has, as Kotoba data. Read off
-;; java.lang.Character and java.lang.String at generation time and checked
-;; against those same functions, code point by code point, in
+;; The Unicode SIMPLE case mappings, as Kotoba data. Read off
+;; java.lang.Character and java.lang.String at generation time, then
+;; overlaid with the Unicode 16.0 mappings a Unicode-15 JDK answers as
+;; identity, and checked against that same Unicode oracle in
 ;; test/kotoba/lang/kotoba_string_case_test.clj.
 ;;
 ;; A mapped character cannot be COMPUTED here: Kotoba has no
@@ -119,22 +195,23 @@
 ;; `(if (>= point lo) (<= point hi) false)`: an unannotated `and` is i64 and
 ;; a cond test position wants a bool.
 ;;
-;; Read off JDK " (System/getProperty "java.version") " on 2026-09-02. The Unicode
-;; version is whatever that JDK carries; it is not asserted here, because a
-;; version string proves nothing about a table. What IS checked is the mapping:
-;; the oracle sweeps code points against these same JVM functions, so a JDK
-;; that moves them turns the sweep red and this file is regenerated.
+;; Read off JDK " (System/getProperty "java.version") " on 2026-09-02, then
+;; overlaid with Unicode 16.0 Simple_Uppercase_Mapping /
+;; Simple_Lowercase_Mapping for the rows Unicode 15.0 / JDK 21 Character
+;; lacks (U+019B, U+0264, U+1C89, U+1C8A and their partners; Garay). The
+;; contract is the published Unicode SIMPLE mapping, not whatever Character
+;; the host JDK happens to carry. The oracle sweeps against that mapping.
 
 (ns kotoba.string.case-tables
   (:export [lower-slice upper-slice upper-root-slice]))
 
 "
          (slice-fn "lower-slice"
-                   "java.lang.Character.toLowerCase(int) -- the Unicode SIMPLE lowercase mapping, one code point to one code point."
+                   "Unicode SIMPLE lowercase mapping, one code point to one code point (Character.toLowerCase(int), plus Unicode 16.0 rows a Unicode-15 JDK lacks)."
                    lower)
          "\n"
          (slice-fn "upper-slice"
-                   "java.lang.Character.toUpperCase(int) -- the Unicode SIMPLE uppercase mapping, one code point to one code point."
+                   "Unicode SIMPLE uppercase mapping, one code point to one code point (Character.toUpperCase(int), plus Unicode 16.0 rows a Unicode-15 JDK lacks)."
                    upper)
          "\n"
 ";; java.lang.String.toUpperCase(Locale.ROOT) differs from the simple mapping
