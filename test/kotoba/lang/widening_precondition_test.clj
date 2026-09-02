@@ -71,13 +71,37 @@
       (is (= :met (get-in status [:effect-row-shows-state :status])))
       (is (= :not-met (get-in status [:conformance-vectors-positive-and-negative :status])))
       (is (= :partial (get-in status [:state-kit-backend-qualification :status])))))
-  (testing "abort"
+  (testing "abort (slice 1 landed 2026-09-02; lang/abort-ability.edn)"
     (let [status (get-in (entry :explicit-errors) [:widening-path :precondition-status])]
-      (is (= :not-met (get-in status [:checked-lexical-facet-unwind :status])))))
+      (is (= :not-met (get-in status [:checked-lexical-facet-unwind :status])))
+      (is (= :met (get-in status [:effect-row-integration :status])))
+      (is (= :met (get-in status [:conformance-vectors-positive-and-negative :status])))
+      (is (= :tracked-elaboration (:enforcement (entry :explicit-errors))))))
   (testing "and the facet unwind the abort path waits on is the one the dataspace entry declares missing"
     (is (contains? (set (:missing (entry :dataspace))) :checked-lexical-facet-unwind)))
-  (testing "no widening has landed: every covered head is still forbidden"
+  (testing "the state widening has not landed: every covered head is still forbidden"
     (let [grammar (edn/read-string (slurp "lang/guest-grammar.edn"))
           forbidden (set (:forbidden-heads grammar))]
-      (is (every? forbidden '#{atom swap! reset! volatile! ref dosync}))
-      (is (every? forbidden '#{throw try catch})))))
+      (is (every? forbidden '#{atom swap! reset! volatile! ref dosync}))))
+  (testing "the abort widening has (slice 1): the heads left forbidden-heads and are sugar"
+    (let [grammar (edn/read-string (slurp "lang/guest-grammar.edn"))
+          forbidden (set (:forbidden-heads grammar))]
+      (is (not-any? forbidden '#{throw try catch}))
+      (is (= '[throw] (get-in grammar [:sugar :throw :forms])))
+      (is (= '[try catch] (get-in grammar [:sugar :try :forms]))))))
+
+(deftest the-abort-effect-reaches-the-row-and-try-removes-it
+  ;; The precondition recorded as :met above, measured rather than stated:
+  ;; the throwing callee's row carries :abort and its interface is
+  ;; [:result T E]; the caller that catches carries nothing.
+  (let [hir (sema/analyze "(ns w (:export [main]))
+                           (defn- safe-div [a :i64 b :i64] :i64
+                             (if (= b 0) (throw \"division by zero\") (quot a b)))
+                           (defn main [] :i64 (try (safe-div 10 0) (catch e (string-length e))))")
+        by-name (into {} (map (juxt :name identity)) (:functions hir))]
+    (is (= #{:abort} (:effects (by-name 'safe-div))))
+    (is (= [:result :i64 :string] (:result (by-name 'safe-div))))
+    (is (= #{} (:effects (by-name 'main))))
+    (is (not-any? #(and (seq? %) (contains? '#{throw try catch} (first %)))
+                  (tree-seq coll? seq (mapv :body (:functions hir))))
+        "the ambient forms never exist post-elaboration")))
