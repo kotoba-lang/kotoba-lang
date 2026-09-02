@@ -25,6 +25,12 @@
   "(defn sw [s :string p :string] :i64 (if (starts-with? s p) 1 0))
    (defn ew [s :string p :string] :i64 (if (ends-with? s p) 1 0))
    (defn inc? [s :string p :string] :i64 (if (includes? s p) 1 0))
+   (defn bl [s :string] :i64 (if (blank? s) 1 0))
+   (defn tr [s :string] :string (trim s))
+   (defn trl [s :string] :string (triml s))
+   (defn trr [s :string] :string (trimr s))
+   (defn rv [s :string] :string (reverse s))
+   (defn ws [point :i64] :i64 (if (whitespace? point) 1 0))
    (defn main [] :i64 0)")
 
 ;; The module's own reader drops its `ns` form, rather than a regex over the
@@ -87,3 +93,72 @@
       (is (empty? (filter (set (keys absent))
                           (map (comp symbol second)
                                (re-seq #"(?m)^\(defn\s+([^\s\[]+)" module))))))))
+
+;; ---------------------------------------------------------------------------
+;; 2026-09-02: blank? / trim / triml / trimr / reverse.
+
+(defn- call1 [function s]
+  (kir/execute @lowered function [s]))
+
+;; Every kind of whitespace Java has an opinion about, on both sides of
+;; something, plus the ones it says are NOT whitespace: U+00A0, U+2007 and
+;; U+202F (non-breaking) and U+0085 (NEL). U+3000 is the one an ASCII-only
+;; answer gets wrong.
+(def ^:private whitespace-cases
+  ["" " " "\t" "\n" "a" " a " "\t\ta\n" "\u3000a\u3000" "\u00a0a\u00a0" "\u2007a"
+   "\u202fa\u202f" "\u0085a\u0085" "\u2028a\u2029" "\u1680a\u205f" " あ " "あ\u3000い"
+   "😀 " " 😀" "\u3000\u3000" "\u00a0" "\u0085" "  " "\u000b\u000c" "\u001c\u001f a"
+   "x\u2007" "\u2000\u2001\u2006 a \u2008\u200a" "日本語　" "\r\n"])
+
+(deftest blank-and-the-trims-match-clojure-string
+  (doseq [[label function oracle] [["blank?" 'bl #(if (str/blank? %) 1 0)]
+                                   ["trim" 'tr str/trim]
+                                   ["triml" 'trl str/triml]
+                                   ["trimr" 'trr str/trimr]]]
+    (testing label
+      (let [bad (for [s whitespace-cases
+                      :let [got (call1 function s) want (oracle s)]
+                      :when (not= got want)]
+                  {:input s :kotoba got :clojure want})]
+        (is (empty? bad) (str label " disagrees with clojure.string on " (pr-str (vec bad))))))))
+
+(def ^:private reverse-cases
+  ["" "a" "ab" "あいう" "aあb" "a😀b" "😀😀" "日本語" "😀" "a\u0301" "🇯🇵" "\u2028x" "hello" "aあ😀"])
+
+(deftest reverse-matches-clojure-string
+  ;; StringBuilder.reverse keeps a surrogate pair together, which is why this
+  ;; can be exact on astral input at all; the emoji cases are the assertion.
+  (let [bad (for [s reverse-cases
+                  :let [got (call1 'rv s) want (str/reverse s)]
+                  :when (not= got want)]
+              {:input s :kotoba got :clojure want})]
+    (is (empty? bad) (pr-str (vec bad))))
+  (is (= "😀あa" (call1 'rv "aあ😀")))
+  (is (= "😀あa" (str/reverse "aあ😀"))
+      "if the JVM ever reversed by UTF-16 unit this would be a corrupt pair, and reverse could not be exact"))
+
+;; The predicate underneath all four, held to java.lang.Character/isWhitespace
+;; -- the int overload, i.e. over code points -- for every code point below
+;; U+3100 (which contains every range in the table and its neighbours) and,
+;; separately, for EVERY code point the JVM says is whitespace, found by
+;; asking the JVM, not by reading the table back.
+(deftest the-whitespace-predicate-is-the-jvm-s
+  (let [jvm-whitespace (set (filter #(Character/isWhitespace (int %)) (range 0 0x110000)))
+        sweep (concat (range 0 0x3100) jvm-whitespace
+                      [0x3100 0xD7FF 0xE000 0xFEFF 0x1F600 0x10FFFF])
+        bad (for [point sweep
+                  :let [want (Character/isWhitespace (int point))
+                        got (= 1 (long (kir/execute @lowered 'ws [point])))]
+                  :when (not= want got)]
+              {:code-point (format "U+%04X" point) :jvm want :kotoba got})]
+    (println (str "SCANNED\t" (count sweep) "\tcode points; JVM whitespace set has " (count jvm-whitespace)))
+    (is (pos? (count jvm-whitespace)) "an empty JVM set would make this sweep vacuous")
+    (is (empty? bad) (pr-str (vec bad)))
+    (testing "the four Java excludes, and NEL, are not whitespace on either side"
+      (doseq [point [0x00A0 0x2007 0x202F 0x0085]]
+        (is (false? (Character/isWhitespace (int point))))
+        (is (= 0 (long (kir/execute @lowered 'ws [point])))
+            (format "U+%04X must not be whitespace" point))))
+    (testing "and U+3000 is"
+      (is (true? (Character/isWhitespace (int 0x3000))))
+      (is (= 1 (long (kir/execute @lowered 'ws [0x3000])))))))

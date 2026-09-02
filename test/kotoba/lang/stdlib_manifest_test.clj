@@ -26,7 +26,7 @@
 (deftest stdlib-manifest-frozen-shape
   (let [m (load-manifest)
         core (first (:modules m))]
-    (is (= 2 (:kotoba.lang.stdlib.manifest/version m)))
+    (is (= 3 (:kotoba.lang.stdlib.manifest/version m)))
     (is (= :frozen (:kotoba.lang.stdlib.manifest/status m)))
     (is (= "T4.1" (:kotoba.lang.stdlib.manifest/wbs m)))
     (is (= :core (:id core)))
@@ -46,9 +46,11 @@
   ;; being dropped silently.
   (let [m (load-manifest)
         core (first (:modules m))
-        withdrawn (:withdrawn m)]
-    (is (= 2 (get-in m [:kotoba.lang.stdlib.manifest/revision :version])))
-    (is (= :contraction (get-in m [:kotoba.lang.stdlib.manifest/revision :kind])))
+        withdrawn (:withdrawn m)
+        version-2 (first (:previous-revisions m))]
+    (is (= 2 (:version version-2))
+        "the contraction stays on record under :previous-revisions once version 3 is current")
+    (is (= :contraction (:kind version-2)))
     (doseq [name '[some option-some option-none option-some? option-value
                    option-none? ok err ok? err? unwrap-ok unwrap-err
                    find select-keys group-by update]]
@@ -94,11 +96,54 @@
         (str "extra=" (pr-str (clojure.set/difference names expected))
              " missing=" (pr-str (clojure.set/difference expected names))))))
 
+(deftest version-three-added-eleven-names-and-accounted-for-the-rest
+  ;; An expansion of a frozen list is a version bump with a record of what
+  ;; was added and, as loudly, what was asked for and refused.
+  (let [m (load-manifest)
+        core (first (:modules m))
+        revision (:kotoba.lang.stdlib.manifest/revision m)
+        added (:added revision)]
+    (is (= 3 (:version revision)))
+    (is (= :expansion (:kind revision)))
+    (is (= '#{keep remove mapv take-while drop-while sort sort-by partition distinct interpose juxt2}
+           added))
+    (is (every? #(contains? (:public-names core) %) added)
+        "every added name is frozen")
+    (is (not-any? #(contains? (:withdrawn m) %) added)
+        "and none of them is also withdrawn")
+    (doseq [name '[frequencies get-in some juxt keep]]
+      (is (contains? (:absent m) name) (str name " must be accounted for under :absent"))
+      (is (keyword? (:reason (get-in m [:absent name]))) (str name " needs a keyword reason")))
+    (doseq [name '[frequencies get-in]]
+      (is (= "expression type mismatch: expected keyword, got i64"
+             (get-in m [:absent name :message]))
+          (str name " is refused by the keyword-keyed map, and the message is on record")))
+    (is (= 'juxt2 (get-in m [:absent 'juxt :replaced-by])))
+    (is (= 'first-match (get-in m [:absent 'some :replaced-by])))
+    (is (not (contains? (:public-names core) 'frequencies)))
+    (is (not (contains? (:public-names core) 'get-in)))
+    (testing "the private helpers are not public names"
+      (let [helpers (set (mapcat val (:private-helpers core)))]
+        (is (seq helpers))
+        (is (empty? (filter (:public-names core) helpers)))
+        (let [src (slurp core-path)
+              private-names (set (map (comp symbol second)
+                                      (re-seq #"(?m)^\s*\(defn-\s+([^\s\[]+)" src)))]
+          (is (= helpers private-names)
+              (str "extra=" (pr-str (clojure.set/difference private-names helpers))
+                   " missing=" (pr-str (clojure.set/difference helpers private-names)))))))
+    (testing "and the extended conformance case is declared on both sides"
+      (is (contains? (get-in m [:conformance :cases]) :portable-source-stdlib-extended))
+      (is (= "lang/conformance/stdlib/extended.kotoba" (get-in m [:conformance :extended-entry])))
+      (is (.exists (io/file (get-in m [:conformance :extended-entry])))))))
+
 (deftest package-contract-lists-core-module
   (let [pkg (edn/read-string (slurp "lang/stdlib.edn"))
         m (load-manifest)
         core (first (:modules m))]
-    (is (= 2 (:kotoba.stdlib/version pkg)))
+    (is (= 3 (:kotoba.stdlib/version pkg)))
+    (is (= "0.3.0" (:kotoba.stdlib/release pkg)))
+    (is (string? (:kotoba.stdlib/absent pkg)) "the package points at the manifest's :absent")
     (is (= :core (:id (first (:kotoba.stdlib/artifacts pkg)))))
     (is (= 'stdlib.core (:namespace (first (:kotoba.stdlib/artifacts pkg)))))
     (is (= (:sha256 core) (:sha256 (first (:kotoba.stdlib/artifacts pkg)))))))
