@@ -21,6 +21,7 @@ It prevents unbounded recursion / loops from hanging a host. Fuel is
 | Replenishable? | **No** (default profile) |
 | Exhaustion trap | `:fuel-exhausted` (fail closed) |
 | Max declared budget (wasm) | \(2^{62}-1\) (`kotoba.wasm/max-fuel`) |
+| Max declared budget (native) | \(2^{53}-1\) (`kotoba.kir/max-fuel`) — see §8 |
 
 ---
 
@@ -146,3 +147,57 @@ of `__kotoba_loop_N`; wasm omits fuel prologue on those helpers. First helper
 entry still costs 1 unit. Arbitrary non-helper TCO still open; hosts must
 wall-clock-bound infinite loops.
 
+
+---
+
+## 8. Ceilings (fuel64, 2026-09-03)
+
+**The invariant: a fuel budget is exactly counted by every runtime that counts
+it.** Two ceilings, because the two counters have different exact ranges.
+
+| surface | ceiling | decided in | why |
+|---|---|---|---|
+| native | **2^53−1** = 9,007,199,254,740,991 | `kotoba.kir/max-fuel` | `charge!` is `(vswap! fuel dec)` on a plain host number: a `Long` on the JVM, a **double** on Node |
+| wasm32 | 2^62−1 | `kotoba.wasm/max-fuel` | an i64 global throughout — `global.get` / `i64.eqz` / `i64.sub`, no double in the path |
+
+Measured on Node, 2026-09-03: `x - 1 === x` is already true at
+`9007199254740996` (2^53+4), and true of every value from 2^54 up. A budget
+above 2^53−1 is one the reference interpreter never sees reach zero — it would
+report `:ok` for a program that does not terminate.
+
+**Do not average them.** A 2^62 budget handed to the KIR interpreter stalls on
+its first charge; a 2^53 ceiling on wasm would refuse budgets its counter
+carries exactly. `lang/surface-status.edn` records the wasm ceiling as a
+**string**, because the ClojureScript EDN reader returns
+`4611686018427388000` for `4611686018427387903` — the same fact one layer up.
+
+### What used to act as the ceiling
+
+**2,147,483,647, and it was an immediate width.** `kotoba.native.elf64` wrote a
+kernel object's per-call budget with `mov qword [r9+8], imm32`, sign-extended.
+The context field is a `uint64_t` and the charge is `dec qword [r9+8]`; the
+image routes always wrote eight data bytes. Two aiueos ADRs reasoned from the
+number as though it were the ABI. It is now two forms — the same 8-byte
+instruction at or below 2^31−1, and `movabs r10, imm64; mov [r9+8], r10` above
+it — so no existing object's bytes moved.
+
+Separately, `kotoba.verifier` and amu's JVM-free driver admitted at most 2^20,
+which bound the **image** route only; the object route does not read the sealed
+budget, and shipped tiers of 250,000,000 past it.
+
+### The ceiling is not a recommendation
+
+At 58,367,824 charges/second (measured, QEMU TCG on an Apple M4; aiueos ADR
+0195), 2^53−1 is about 4.9 years, and about 104 days at 1e9 charges/second.
+That is a bound — finite and exactly counted — and it is not a budget anyone
+should give an object a kernel calls with interrupts disabled. Per-object tiers
+stay measured by execution with a stated margin.
+
+Refusals, each by a reason literal: `:fuel-outside-admitted-range`
+(`kotoba.kir/execute`), `native fuel budget is not admitted`
+(`kotoba.verifier`, `kotoba.compiler.nbb.cli`),
+`:object-fuel-tier-outside-admitted-range` (`kotoba.native.elf64`), and
+`:isr-entry-fuel-exceeds-imm32` — the interrupt entry deliberately stays imm32,
+because its frame size is load-bearing, and refuses rather than truncating.
+
+ADR: `docs/adr/ADR-kotoba-fuel-budget-is-sixty-four-bits.md`.
