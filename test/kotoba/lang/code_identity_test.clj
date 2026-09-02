@@ -278,10 +278,46 @@
         (is (some? tc) "fixture must be in the manifest")
         (is (seq (get-in data [:resolved 0 :definition :definition/effect-row])))
         (is (= :accept (:kind tc)))))
-    (testing "the vocabulary gap is recorded, not papered over: the compiler's
-              [:cap/call id] rows are refused today and the contract says so"
-      (is (= :not-yet-bridged (get-in contract [:effect-row-vocabulary :status])))
+    (testing "the vocabulary is bridged, and the contract names the bridge:
+              the compiler's [:cap/call id] rows are still refused by the
+              identity itself, and effect-row-from-hir is the one route from
+              them to the named-operation row the identity seals"
+      (is (= :bridged (get-in contract [:effect-row-vocabulary :status])))
+      (is (= "kotoba.kir.definition-identity/effect-row-from-hir"
+             (get-in contract [:effect-row-vocabulary :adapter])))
       (is (= (get-in contract [:effect-row-vocabulary :refusal])
              (:message (identity/definition-error
                         (assoc definition :definition/effect-row #{[:cap/call 8]}))))
-          "the recorded refusal literal must be the one the mechanism emits"))))
+          "the recorded refusal literal must be the one the mechanism emits")
+      (let [row (identity/effect-row-from-hir {:effects #{[:cap/call 8]}
+                                               :named-operations #{:state/transact}}
+                                              {:id->name {8 :state/transact}})]
+        (is (= #{:state/transact} row))
+        (is (nil? (identity/definition-error (assoc definition :definition/effect-row row)))))
+      (is (= (get-in contract [:effect-row-vocabulary :unnamed-wire-id-refusal])
+             (try (identity/effect-row-from-hir {:effects #{[:cap/call 200]}}
+                                                {:id->name {8 :state/transact}})
+                  nil
+                  (catch clojure.lang.ExceptionInfo e (.getMessage e))))
+          "the recorded unnamed-id refusal literal must be the one the bridge emits"))
+    (testing "a positive identity fixture carries a row produced by the bridge"
+      (let [tc (get cases :positive-identity-named-operation-row)
+            data (read-edn (str conformance-root (:file tc)))]
+        (is (some? tc) "fixture must be in the manifest")
+        (is (= #{:state/transact :clock/now} (:definition/effect-row data)))
+        (is (= (:expected-cid tc) (identity/definition-cid data)))))))
+
+(deftest the-contract-lists-both-identity-implementations-and-a-direction
+  (testing "two algorithms answer `what is this definition` today; the contract
+            says so, names which one is the authority, and says which way the
+            other one moves. Silence here is how the second answer stayed
+            invisible for a month."
+    (let [impls (:identity-implementations (read-edn contract-file))]
+      (is (map? impls))
+      (is (contains? impls :kotoba.kir/definition-identity))
+      (is (contains? impls :kotoba.codebase/typed-code))
+      (is (= :kotoba.kir/definition-identity (:authority impls)))
+      (is (= :typed-code-adopts-definition-identity (get-in impls [:direction :decision])))
+      (is (not= (get-in impls [:kotoba.kir/definition-identity :status])
+                (get-in impls [:kotoba.codebase/typed-code :status]))
+          "one is the authority and the other is the one being migrated"))))

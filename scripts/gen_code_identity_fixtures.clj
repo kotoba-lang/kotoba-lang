@@ -135,6 +135,27 @@
 (assert (not= pure-cid effectful-cid)
         "the effect row is sealed: pure and effectful must not share a CID")
 
+;; Bridged 2026-09-02: the compiler's wire row is translated to the named
+;; operations the identity seals by kotoba.kir.definition-identity/
+;; effect-row-from-hir. This fixture's row is produced BY the bridge from a
+;; compiler-shaped report, so the fixture proves the route, not just the
+;; destination. The catalog is fixture-local (kotoba-sema owns the real one
+;; and is not on this classpath); the ids are the ones that catalog assigns
+;; to these operations as of kotoba-sema c14ca39 (resources/kotoba/lang/
+;; capability-catalog.edn), but the identity does not depend on them: a
+;; renumbered catalog produces the same row and the same CID.
+(def fixture-catalog {5 :clock/now 8 :state/transact})
+(def named-operation-row
+  (ci/effect-row-from-hir {:effects #{[:cap/call 8] [:cap/call 5]}
+                           :named-operations #{:state/transact :clock/now}}
+                          {:id->name fixture-catalog}))
+(assert (= #{:state/transact :clock/now} named-operation-row))
+(def named-operation (assoc base :definition/effect-row named-operation-row))
+(def named-operation-cid (cid named-operation))
+(assert (= named-operation-cid
+           (cid (assoc base :definition/effect-row #{:clock/now :state/transact})))
+        "a bridged row hashes exactly as a hand-resolved row: the bridge adds no encoding")
+
 (def fixtures
   (concat
    ;; ---- CI2 positive ----
@@ -147,6 +168,11 @@
      :case {:id :positive-identity-effectful-http :kind :accept :type :identity
             :expected-cid effectful-cid}
      :data effectful}
+
+    {:file "positive/identity_named_operation_row.edn"
+     :case {:id :positive-identity-named-operation-row :kind :accept :type :identity
+            :expected-cid named-operation-cid}
+     :data named-operation}
 
     {:file "positive/locked_effectful_definition_admitted.edn"
      :case {:id :positive-locked-effectful-definition-admitted :kind :accept :type :admission}

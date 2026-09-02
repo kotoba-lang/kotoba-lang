@@ -15,6 +15,7 @@
 (def i64 identity/i64)
 (def normalize identity/normalize)
 (def definition-error identity/definition-error)
+(def effect-row-from-hir identity/effect-row-from-hir)
 (def identity-payload identity/identity-payload)
 (def canonical-bytes identity/canonical-bytes)
 (def canonical-hex identity/canonical-hex)
