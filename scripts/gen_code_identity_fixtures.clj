@@ -124,6 +124,17 @@
    :desugar      (assoc base :definition/desugar-contract-version 2)
    :body         (assoc base :definition/kir {:op :const :value 99})})
 
+;; Scope is :closed-deterministic-checked-definition (2026-09-02): an
+;; effectful definition has an identity of its own. The row is spelled with
+;; registry keywords because that is the vocabulary the identity admits today
+;; -- see :effect-row-vocabulary in lang/code-identity.edn for the gap between
+;; this and the [:cap/call id] rows the compiler infers.
+(def effectful (assoc base :definition/effect-row #{:host/http}))
+(def effectful-cid (cid effectful))
+
+(assert (not= pure-cid effectful-cid)
+        "the effect row is sealed: pure and effectful must not share a CID")
+
 (def fixtures
   (concat
    ;; ---- CI2 positive ----
@@ -131,6 +142,16 @@
      :case {:id :positive-identity-pure-const :kind :accept :type :identity
             :expected-cid pure-cid}
      :data base}
+
+    {:file "positive/identity_effectful_http.edn"
+     :case {:id :positive-identity-effectful-http :kind :accept :type :identity
+            :expected-cid effectful-cid}
+     :data effectful}
+
+    {:file "positive/locked_effectful_definition_admitted.edn"
+     :case {:id :positive-locked-effectful-definition-admitted :kind :accept :type :admission}
+     :data {:lock (lock-with [effectful-cid])
+            :resolved [(entry effectful effectful-cid)]}}
 
     {:file "positive/alias_resolves_to_definition_cids.edn"
      :case {:id :positive-alias-resolves :kind :accept :type :alias
