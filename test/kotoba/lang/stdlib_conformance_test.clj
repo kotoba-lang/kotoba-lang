@@ -29,7 +29,8 @@
 (def ^:private stdlib-manifest-path "lang/conformance/stdlib/manifest.edn")
 
 (def ^:private case-ids [:portable-source-stdlib :portable-source-stdlib-extended
-                         :portable-source-stdlib-ordered])
+                         :portable-source-stdlib-ordered
+                         :portable-source-stdlib-keyed])
 
 (defn- conformance-cases []
   (let [cases (:cases (edn/read-string (slurp (str conformance-root "/manifest.edn"))))]
@@ -92,7 +93,7 @@
 (deftest the-case-names-the-project-route-and-not-a-prelude
   (doseq [[case- entry] (map vector (conformance-cases)
                              ["stdlib/basic.kotoba" "stdlib/extended.kotoba"
-                              "stdlib/ordered.kotoba"])]
+                              "stdlib/ordered.kotoba" "stdlib/keyed.kotoba"])]
     (is (nil? (:prelude case-))
         "`:prelude` names a route no implementation has; see lang/stdlib.edn")
     (is (= ["."] (:source-paths case-)))
