@@ -44,7 +44,7 @@
    {:as-of "2026-09-03"
     :reason
     (str "behind by the map-literal VALUE type, which landed in kotoba-sema "
-         "bfb19d71 (recorded there as ADR 0032) and in this authority in the "
+         "bfb19d71 (recorded there as ADR 0033) and in this authority in the "
          "same wave. amu is not red on "
          "its own main: its pinned digest still matches its own copy, and its "
          "kotoba-sema pin (df383ba0) predates the change. It goes red the "
@@ -54,7 +54,7 @@
          "of the two classpath copies comes first.")
     :recorded-there
     "amu deps.edn (the grammar-sha256 line beside the kotoba-sema pin) and test/kotoba/compiler/guest_grammar_vendor_test.clj"
-    :closes-when "amu advances its kotoba-sema pin to 5fd767b5 or later and resyncs its copy and both digests in the same commit"}})
+    :closes-when "amu advances its kotoba-sema pin to 0a5dcc2b or later and resyncs its copy and both digests in the same commit"}})
 
 (defn- deferred-vendor-drift?
   "A `:vendor/drift` error every one of whose mismatching paths is recorded in
@@ -370,7 +370,7 @@
   digest to the other three in the same wave. A digest updated here alone is
   the defect this pin exists to make loud.
 
-  Advanced 2026-09-03 from `6e1202fd` together with kotoba-sema `5fd767b5`,
+  Advanced 2026-09-03 from `6e1202fd` together with kotoba-sema `0a5dcc2b`,
   which carries the same bytes. The change is the map literal's VALUE type:
   this authority said it was `always :i64` and gave the reason with it --
   \"a literal has no annotation and inference runs after desugaring, so the
