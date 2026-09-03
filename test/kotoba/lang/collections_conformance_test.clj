@@ -54,16 +54,18 @@
             [kotoba.sema :as sema]))
 
 (def ^:private conformance-root "lang/conformance")
-(def ^:private entry-prefix
+(def ^:private entry-prefixes
   "The whole of `collections/`.
 
-  It was `collections/set` until 2026-09-03, because the other three fixtures
-  could not run: measured against sema `24a59c74`, `(count [7 8 9])` was
-  refused `operation has no admitted lowering`, exactly as `(conj #{:a} :b)`
-  had been. Measured again against sema `7e277da6`, which dispatched `count`
-  and the pair accessors onto the primitives that were already there:
+  It was `[\"collections/map_\" \"collections/set\"]` until 2026-09-03, and the
+  reason given for not widening it to `collections/` was that doing so would
+  silently pull in three fixtures that could not run: measured against sema
+  `24a59c74`, `(count [7 8 9])` was refused `operation has no admitted
+  lowering`, exactly as `(conj #{:a} :b)` had been. Measured again against
+  sema `7e277da6`, which dispatched `count` and the pair accessors onto the
+  primitives each collection already had:
 
-    destructuring.kotoba   RAN, and had run all along -- the old comment
+    destructuring.kotoba   RAN, and had run all along -- the note above
                            grouped it with the other two and was wrong about
                            it; it uses `nth` with a default and typed-map
                            `:keys` destructuring, neither of which ever needed
@@ -76,10 +78,18 @@
                            but the LAST item -- cannot be built from
                            `vector-drop`, which drops from the front.
 
-  So this file now matches all five, and the third case below asserts that the
-  one recorded as unexecutable STILL IS. A `:unexecuted-backends` entry that
-  nothing checks is a parking space."
-  "collections/")
+  So nothing is pulled in silently any more: all five are matched, each one
+  records whether a runner drives it, and the third case below asserts that
+  the one recorded as unexecutable STILL IS. A `:unexecuted-backends` entry
+  that nothing checks is a parking space.
+
+  Still a VECTOR rather than a single string, because the shape is the
+  runner's contract with `owned-entry?` and a future slice may need a prefix
+  of its own again."
+  ["collections/"])
+
+(defn- owned-entry? [entry]
+  (boolean (some #(str/starts-with? (str entry) %) entry-prefixes)))
 
 (def ^:private this-runner
   "kotoba-lang/kotoba-lang kotoba.lang.collections-conformance-test")
@@ -88,7 +98,7 @@
   (edn/read-string (slurp (str conformance-root "/manifest.edn"))))
 
 (defn- collections-cases [m]
-  (filter #(some-> (:entry %) (str/starts-with? entry-prefix)) (:cases m)))
+  (filter #(owned-entry? (:entry %)) (:cases m)))
 
 (defn- source-of [case]
   (slurp (str conformance-root "/" (:entry case))))
@@ -103,7 +113,7 @@
   every case into `:unexecuted-backends` would leave this file green while
   executing nothing -- and `(= declared executed)` alone cannot see that,
   because it would compare two empty sets."
-  3)
+  4)
 
 (deftest every-collections-case-that-requires-kir-executes-to-its-expected-value
   (let [cases (collections-cases (manifest))
@@ -130,7 +140,8 @@
           (is (= (get-in case [:expect :kotoba]) (long value)))
           (swap! executed conj (:id case)))))
     (println (format "EXECUTED\t%d\t%s :run cases on :kir (%d deferred)"
-                     (count @executed) entry-prefix (count deferred)))
+                     (count @executed) (str/join ", " entry-prefixes)
+                     (count deferred)))
     (is (pos? (count @executed))
         "no collections case executed; a run that measured nothing is not a run
          that found nothing wrong")
@@ -143,7 +154,7 @@
 
 (deftest a-case-recorded-as-unexecutable-on-kir-still-is
   ;; `:unexecuted-backends` must not become a parking space. A case parked
-  ;; there is asserted to be REFUSED, and refused for the reason recorded --
+  ;; there is asserted to be REFUSED, and refused with the message recorded --
   ;; not merely refused, since a fixture failing for some other cause would
   ;; otherwise count as evidence for the recorded one (ADR-2608136000
   ;; question 6). If it starts working, this goes red and the entry moves.
@@ -151,7 +162,7 @@
                                (contains? (:unexecuted-backends %) :kir))
                          (collections-cases (manifest)))]
     (println (format "DEFERRED\t%d\t%s :run cases parked on :kir"
-                     (count deferred) entry-prefix))
+                     (count deferred) (str/join ", " entry-prefixes)))
     (doseq [case deferred]
       (testing (str (:id case))
         (let [refusal (refusal-of (source-of case))]
@@ -195,7 +206,7 @@
   (let [on-disk (->> (file-seq (java.io.File. (str conformance-root "/collections")))
                      (filter #(.isFile ^java.io.File %))
                      (map #(subs (.getPath ^java.io.File %) (inc (count conformance-root))))
-                     (filter #(str/starts-with? % entry-prefix))
+                     (filter owned-entry?)
                      set)
         declared (into #{} (map :entry) (collections-cases (manifest)))]
     (is (pos? (count on-disk)) "the fixture directory was not read")

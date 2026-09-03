@@ -136,9 +136,9 @@
   floor, deleting every `:executed-by` would make this check pass by having
   nothing to check -- which is not the same as finding nothing wrong.
 
-  Raised from 2 to 5 on 2026-09-03, when the three `collections/` cases that
-  had no record at all gained one."
-  5)
+  Raised from 2 to 6 on 2026-09-03: the three `collections/` cases that had no
+  record at all gained one, and the map-literal-values case landed with one."
+  6)
 
 (def ^:private deferral-keys #{:as-of :reason :closes-when})
 
