@@ -48,17 +48,25 @@
             [kotoba.sema :as sema]))
 
 (def ^:private conformance-root "lang/conformance")
-(def ^:private entry-prefix
-  "The set slice of `collections/`. The other three fixtures in that directory
-  -- vector.kotoba, higher_order.kotoba, destructuring.kotoba -- are NOT run
-  here, and not because they were forgotten: measured 2026-09-03 against sema
-  `24a59c74`, `(count [7 8 9])` is refused `operation has no admitted
-  lowering`, exactly as `(conj #{:a} :b)` was. They are the same defect on
-  different heads and they are somebody's next change, not this one's. What
-  this file must not do is include them, go red, and be quietly narrowed
-  later; the manifest records which cases have a runner, and those three do
-  not claim one."
-  "collections/set")
+(def ^:private entry-prefixes
+  "The slices of `collections/` this runner owns. The other three fixtures in
+  that directory -- vector.kotoba, higher_order.kotoba, destructuring.kotoba
+  -- are NOT run here, and not because they were forgotten: measured
+  2026-09-03 against sema `24a59c74`, `(count [7 8 9])` is refused `operation
+  has no admitted lowering`, exactly as `(conj #{:a} :b)` was. They are the
+  same defect on different heads and they are somebody's next change, not this
+  one's. What this file must not do is include them, go red, and be quietly
+  narrowed later; the manifest records which cases have a runner, and those
+  three do not claim one.
+
+  A VECTOR and not a single string since 2026-09-03: `collections/map_` is the
+  map literal's value types, which needs a prefix of its own because
+  `collections/set` cannot match it and widening the prefix to `collections/`
+  would silently pull in the three fixtures above."
+  ["collections/map_" "collections/set"])
+
+(defn- owned-entry? [entry]
+  (boolean (some #(str/starts-with? (str entry) %) entry-prefixes)))
 
 (def ^:private this-runner
   "kotoba-lang/kotoba-lang kotoba.lang.collections-conformance-test")
@@ -67,7 +75,7 @@
   (edn/read-string (slurp (str conformance-root "/manifest.edn"))))
 
 (defn- collections-cases [m]
-  (filter #(some-> (:entry %) (str/starts-with? entry-prefix)) (:cases m)))
+  (filter #(owned-entry? (:entry %)) (:cases m)))
 
 (defn- source-of [case]
   (slurp (str conformance-root "/" (:entry case))))
@@ -98,7 +106,8 @@
                                  (vec (:args case)))]
           (is (= (get-in case [:expect :kotoba]) (long value)))
           (swap! executed conj (:id case)))))
-    (println (format "EXECUTED\t%d\t%s cases on :kir" (count @executed) entry-prefix))
+    (println (format "EXECUTED\t%d\t%s cases on :kir"
+                     (count @executed) (str/join ", " entry-prefixes)))
     (is (pos? (count @executed))
         "no collections case executed; a run that measured nothing is not a run
          that found nothing wrong")
@@ -128,7 +137,7 @@
   (let [on-disk (->> (file-seq (java.io.File. (str conformance-root "/collections")))
                      (filter #(.isFile ^java.io.File %))
                      (map #(subs (.getPath ^java.io.File %) (inc (count conformance-root))))
-                     (filter #(str/starts-with? % entry-prefix))
+                     (filter owned-entry?)
                      set)
         declared (into #{} (map :entry) (collections-cases (manifest)))]
     (is (pos? (count on-disk)) "the fixture directory was not read")

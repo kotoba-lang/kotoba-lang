@@ -39,7 +39,22 @@
    "../kotoba/vendor/grammar/resources/kotoba/lang/guest-grammar.edn"
    {:as-of "2026-09-03"
     :reason "the second of kotoba's two shipped copies; see the entry above"
-    :closes-when "kotoba advances its amu pin and resyncs both copies"}})
+    :closes-when "kotoba advances its amu pin and resyncs both copies"}
+   "../amu/resources/kotoba/lang/guest-grammar.edn"
+   {:as-of "2026-09-03"
+    :reason
+    (str "behind by the map-literal VALUE type, which landed in kotoba-sema "
+         "bfb19d71 (recorded there as ADR 0032) and in this authority in the "
+         "same wave. amu is not red on "
+         "its own main: its pinned digest still matches its own copy, and its "
+         "kotoba-sema pin (df383ba0) predates the change. It goes red the "
+         "moment it advances that pin without resyncing the copy, which is "
+         "exactly amu ADR 0330's postscript -- the pin and the vendored "
+         "grammar move together, because io/resource answers with whichever "
+         "of the two classpath copies comes first.")
+    :recorded-there
+    "amu deps.edn (the grammar-sha256 line beside the kotoba-sema pin) and test/kotoba/compiler/guest_grammar_vendor_test.clj"
+    :closes-when "amu advances its kotoba-sema pin to 5fd767b5 or later and resyncs its copy and both digests in the same commit"}})
 
 (defn- deferred-vendor-drift?
   "A `:vendor/drift` error every one of whose mismatching paths is recorded in
@@ -353,8 +368,17 @@
 
   Updating it is the wave: change this file, recompute, and carry the new
   digest to the other three in the same wave. A digest updated here alone is
-  the defect this pin exists to make loud."
-  "6e1202fd23bc5a2ed6ef432114585c1813f5143d643eb4c8ee9a00b6e798b922")
+  the defect this pin exists to make loud.
+
+  Advanced 2026-09-03 from `6e1202fd` together with kotoba-sema `5fd767b5`,
+  which carries the same bytes. The change is the map literal's VALUE type:
+  this authority said it was `always :i64` and gave the reason with it --
+  \"a literal has no annotation and inference runs after desugaring, so the
+  value half cannot be read off the source\" -- and kotoba-sema's
+  `desugar-map` now reads it off the literal's own values, so the sentence
+  would have been false the moment the frontend landed. amu and kotoba are
+  behind; see `deferred-vendor-copies`."
+  "871f3873ae30a33ba7461c8664094b42396c0c4d79612668d11b0b29a2c0172f")
 
 (defn- sha256-hex [^bytes bs]
   (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") bs)]
