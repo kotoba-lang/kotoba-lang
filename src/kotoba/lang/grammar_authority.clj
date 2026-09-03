@@ -18,53 +18,83 @@
 
 (def local-vendor-path "resources/kotoba/lang/guest-grammar.edn")
 
+(def registry-path
+  "THE registry of copies. One file, read by this namespace, by
+  `scripts/check-grammar-authority.cljs` and by
+  `scripts/check-vendored-copies-fleet.cljs`.
+
+  Until 2026-09-03 the list lived in four places -- here, in that .cljs script,
+  in `lang/elaboration-pipeline.edn`'s `:vendored-consumers`, and in the
+  deferral map in `test/kotoba/lang/grammar_authority_test.clj` -- and they
+  disagreed. The EDN one named seven paths and knew nothing about kotoba-sema,
+  kotoba's second copy or amu's elaboration-pipeline copy; the .cljs one named
+  three. A registry of copies that is itself copied is the defect it exists to
+  find, so the vars below are DERIVED from the file rather than restated."
+  "lang/vendored-copies.edn")
+
+(defn- read-registry []
+  (let [f (io/file registry-path)]
+    (when-not (.isFile f)
+      (throw (ex-info (str registry-path " is missing. Every vendored-copy check"
+                           " reads it, and a run without it would compare"
+                           " nothing while reporting nothing wrong.")
+                      {:path registry-path})))
+    (edn/read-string (slurp f))))
+
+(def registry (read-registry))
+
 (def sibling-vendor-paths
-  ["../amu/resources/kotoba/lang/guest-grammar.edn"
-   "../compiler/resources/kotoba/lang/guest-grammar.edn"
-   "../kotoba/resources/kotoba/lang/guest-grammar.edn"
-   ;; kotoba's SECOND copy. `kotoba/vendor/grammar` is a committed vendored
-   ;; checkout of the grammar repository, consumed as `{:local/root
-   ;; "vendor/grammar"}`, so the file below is on kotoba's classpath as
-   ;; `kotoba/lang/guest-grammar.edn` exactly like the one above. The digest
-   ;; pin's message has said "kotoba (two copies)" since 2026-09-03 while this
-   ;; list named one; added 2026-09-03, measured drifted at the time it was.
-   "../kotoba/vendor/grammar/resources/kotoba/lang/guest-grammar.edn"
-   "../grammar/resources/kotoba/lang/guest-grammar.edn"
-   "../kotoba-sema/resources/kotoba/lang/guest-grammar.edn"])
+  "Checkout paths of every guest-grammar copy OUTSIDE this repository, derived
+  from the registry.
+
+  `../compiler` appears among `:retired` rather than here: that repository was
+  renamed to `../amu` and a stale checkout may still answer under the old name.
+  `../amu`'s guest-grammar copy is retired too -- it shadowed kotoba-sema's on
+  amu's own classpath while kotoba-sema owns the frontend that reads it, so it
+  was deleted 2026-09-03 and the grammar now travels in amu's kotoba-sema pin.
+
+  A path that is absent reports `:missing`, which callers tolerate -- a sibling
+  need not be checked out -- while a path that is present and different is
+  drift. That tolerance is also why this direction cannot answer the
+  cross-repository question at all; `scripts/check-vendored-copies-fleet.cljs`
+  asks GitHub instead."
+  (vec (for [c (:copies registry)
+             :when (and (= "lang/guest-grammar.edn" (:authority c))
+                        (not= local-vendor-path (:checkout-path c)))]
+         (:checkout-path c))))
 
 (def vendored-authorities
   "Every file this repository is the authority for that another repository
-  carries a byte copy of.
+  carries a byte copy of, as authority -> checkout paths. Derived from
+  `registry-path`."
+  (reduce (fn [m c]
+            (update m (:authority c) (fnil conj []) (:checkout-path c)))
+          {}
+          (:copies registry)))
 
-  Only guest-grammar was checked. Surveyed 2026-08-10, three other copies were
-  not: kotoba-sema's guest-grammar — and sema is now the frontend owner —
-  capability-catalog in three places, and host-parity in kotoba. A copy nothing
-  compares is a copy waiting to drift, which is the same defect this file's
-  contract-version check was added for.
+(def retired-checkout-paths
+  "Checkout paths that must NOT resolve: a repository renamed out from under
+  them, or a copy deleted for a structural reason that a resync script still
+  knows the path of. Named so a return is a NAMED failure rather than a silent
+  restoration."
+  (into {} (map (juxt :checkout-path identity)) (:retired registry)))
 
-  `../amu` and `../compiler` are both listed because that repository was renamed
-  and a checkout may still be under either name. A path that is absent reports
-  `:missing`, which callers tolerate — a sibling need not be checked out — while
-  a path that is present and different is drift."
-  {"lang/guest-grammar.edn"
-   (cons local-vendor-path sibling-vendor-paths)
-   "lang/capability-catalog.edn"
-   ["resources/kotoba/lang/capability-catalog.edn"
-    "../amu/resources/kotoba/lang/capability-catalog.edn"
-    "../compiler/resources/kotoba/lang/capability-catalog.edn"
-    "../kotoba-sema/resources/kotoba/lang/capability-catalog.edn"]
-   "lang/host-parity.edn"
-   ["resources/kotoba/lang/host-parity.edn"
-    "../kotoba/resources/kotoba/lang/host-parity.edn"]
-   ;; Added 2026-09-02. :contract-versions :desugar-contract is the authority
-   ;; for the number sealed as :definition/desugar-contract-version, and the
-   ;; compiler now reads it rather than pinning a guess — which means it is a
-   ;; vendored copy, which means it is a copy waiting to drift unless it is
-   ;; compared.
-   "lang/elaboration-pipeline.edn"
-   ["resources/kotoba/lang/elaboration-pipeline.edn"
-    "../amu/resources/kotoba/lang/elaboration-pipeline.edn"
-    "../compiler/resources/kotoba/lang/elaboration-pipeline.edn"]})
+(def deferrals
+  "Copies knowingly behind, keyed `\"<repo> <path>\"`, each with `:as-of`,
+  `:reason` and `:closes-when`. The CONVERSE -- an entry whose copy is no
+  longer behind -- is asserted by the fleet script, not here: locally a
+  sibling's state depends on which revision happens to be checked out, so the
+  same assertion would be a coin flip. Over there the question is asked of the
+  consumer's default branch and the answer is the same everywhere."
+  (or (:deferrals registry) {}))
+
+(defn deferral-for
+  "The deferral covering a CHECKOUT path, if any."
+  [checkout-path]
+  (some (fn [c]
+          (when (= checkout-path (:checkout-path c))
+            (get deferrals (str (:repo c) " " (:path c)))))
+        (:copies registry)))
 
 (def portable-backends #{:compiler :kotoba-wasm :kotoba-cljs})
 
@@ -689,7 +719,16 @@
               :sugar-entries (count portability)
               :portable-sugar (count (filter (comp :portable-claim? val) portability))
               :feature-portable-claims (count feature-claims)
-              :vendor-checked (inc (count sibling-vendor-paths))
+              ;; HOW MANY FILES WERE ACTUALLY OPENED, not how many paths are
+              ;; listed. `:vendor-checked` used to be `(inc (count
+              ;; sibling-vendor-paths))` -- a constant. It reported 7 in a
+              ;; single-repository clone that had compared exactly one file,
+              ;; which is the number a reader uses to decide whether the run
+              ;; means anything.
+              :vendor-compared (count (filter #(.isFile (io/file %))
+                                              (cons local-vendor-path
+                                                    sibling-vendor-paths)))
+              :vendor-registered (inc (count sibling-vendor-paths))
               :extra-invariant-surface (count extra-invariant)}
       :extra-invariant-surface extra-invariant
       :unclassified unclassified
