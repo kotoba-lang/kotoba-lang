@@ -73,15 +73,25 @@
     higher_order.kotoba    now runs; it was refused `expected i64, got
                            vector-i64` because it spells `pair-first` over a
                            `filter` result, which is a bounded vector.
-    vector.kotoba          still cannot run: `peek` and `pop` have no lowering
-                           on any receiver, and Clojure's vector `pop` -- all
-                           but the LAST item -- cannot be built from
-                           `vector-drop`, which drops from the front.
+    vector.kotoba          could not run YET: `peek` and `pop` had no
+                           lowering on any receiver, and Clojure's vector
+                           `pop` -- all but the LAST item -- could not be
+                           built from `vector-drop`, which drops from the
+                           front.
 
-  So nothing is pulled in silently any more: all five are matched, each one
-  records whether a runner drives it, and the third case below asserts that
-  the one recorded as unexecutable STILL IS. A `:unexecuted-backends` entry
-  that nothing checks is a parking space.
+  That last one now runs too. Later on 2026-09-03 kotoba-kir `b021a0d1`
+  gained `vector-take` -- `vector-drop`'s mirror, keeping the HEAD where drop
+  keeps the tail -- and kotoba-sema `cb5cf553` gained the heads, so the
+  fixture executes to its 20 and its `:kir` entry moved from
+  `:unexecuted-backends` to `:executed-by`. `min-executed-run-cases` rose
+  from 4 to 5 in the same change: a case that starts running raises the
+  ratchet, or the floor would keep passing if it stopped again.
+
+  So nothing is pulled in silently any more: all five are matched, all five
+  are driven, and each one records the runner that drives it. The third case
+  below still asserts that anything recorded as unexecutable STILL IS -- a
+  `:unexecuted-backends` entry that nothing checks is a parking space -- and
+  now says out loud when it has nothing to assert about.
 
   Still a VECTOR rather than a single string, because the shape is the
   runner's contract with `owned-entry?` and a future slice may need a prefix
@@ -112,8 +122,12 @@
   raise it when a case starts running, never lower it. Without it, moving
   every case into `:unexecuted-backends` would leave this file green while
   executing nothing -- and `(= declared executed)` alone cannot see that,
-  because it would compare two empty sets."
-  4)
+  because it would compare two empty sets.
+
+  Raised from 4 to 5 on 2026-09-03 when `vector.kotoba` started running, which
+  is the ratchet doing its job: the case that moved out of
+  `:unexecuted-backends` is now one the floor requires."
+  5)
 
 (deftest every-collections-case-that-requires-kir-executes-to-its-expected-value
   (let [cases (collections-cases (manifest))
@@ -158,11 +172,25 @@
   ;; not merely refused, since a fixture failing for some other cause would
   ;; otherwise count as evidence for the recorded one (ADR-2608136000
   ;; question 6). If it starts working, this goes red and the entry moves.
+  ;;
+  ;; As of 2026-09-03 NOTHING is parked on `:kir`: `vector.kotoba` was the
+  ;; last one and it runs. So this body iterates an empty sequence, and a test
+  ;; that iterates an empty sequence and reports success is the exact shape
+  ;; ADR-2608136000 exists to stop -- the check that measured nothing
+  ;; answering like the check that measured and found nothing wrong. It is
+  ;; kept, because it is what will catch the NEXT case someone parks, and the
+  ;; printed line SAYS which of the two states produced the green. There is
+  ;; deliberately no floor on the parked count: zero parked is the goal, and a
+  ;; floor would forbid reaching it. The evidence floor lives in the test
+  ;; above, over the cases that do run, and it went up when this one emptied.
   (let [deferred (filter #(and (= :run (:kind %))
                                (contains? (:unexecuted-backends %) :kir))
                          (collections-cases (manifest)))]
-    (println (format "DEFERRED\t%d\t%s :run cases parked on :kir"
-                     (count deferred) (str/join ", " entry-prefixes)))
+    (println (format "DEFERRED\t%d\t%s :run cases parked on :kir%s"
+                     (count deferred) (str/join ", " entry-prefixes)
+                     (if (zero? (count deferred))
+                       " (NOTHING PARKED -- this deftest asserted nothing)"
+                       "")))
     (doseq [case deferred]
       (testing (str (:id case))
         (let [refusal (refusal-of (source-of case))]

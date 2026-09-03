@@ -276,36 +276,6 @@
      depends on the split happening: until it does, the other 141 heads in the
      key are checked normally."}
 
-   {:heads #{"keys" "vals" "peek" "pop"}
-    :as-of "2026-09-03"
-    :claimed-by [:guest-grammar :sugar
-                 :surface-status :collections :persistent-collection-semantics]
-    :reason
-    "`:sugar` claims each of these on `#{:compiler :kotoba-cljs :kotoba-wasm}`
-     and `:persistent-collection-semantics :operations` names them.
-     Measured 2026-09-03 against the `:test` pin, every one is refused
-     `operation has no admitted lowering` at every arity and every receiver
-     shape -- there is no arm, while `vector-count` beside them compiles. Two
-     of the four defects of 2026-09-03 were this, on `conj` and `disj`; these
-     are the same defect not yet fixed.
-
-     `count` WAS in this set, and was in it for the length of one merge. It
-     went in against kotoba-sema 24a59c74, where `(count [7 8 9])` had no arm;
-     the pin advanced to 5fd767b5 the same afternoon, and
-     `a-recorded-exception-must-still-be-a-gap` went red naming `count` and
-     `{:verdict :admitted :arity 1 :shape \"[7 8 9]\"}`. The line was deleted
-     because the red said to. That is the whole mechanism, exercised in
-     production on the day it landed, and it is written down here because a
-     converse assertion nobody has watched fire is a claim like any other.
-
-     ALSO NOTE: `:diagnostic-hints` names `count`, `keys` and `vals`, which is
-     a hint table for REFUSED heads. It has not been updated for `count`, so
-     the two keys of one file now disagree in the other direction."
-    :closes-when
-    "the frontend lowers them, or the authority stops claiming them. Whichever
-     lands first, `a-recorded-exception-must-still-be-a-gap` names the head
-     and the fix is to delete it from this set -- as it already was once."}
-
    {:heads #{"keyword?" "string?" "symbol?" "string="}
     :as-of "2026-09-03"
     :claimed-by [:guest-grammar :predicates
