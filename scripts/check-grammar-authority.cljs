@@ -13,10 +13,22 @@
 (def surface-path "lang/surface-status.edn")
 (def pipeline-path "lang/elaboration-pipeline.edn")
 (def local-vendor-path "resources/kotoba/lang/guest-grammar.edn")
+
+;; DERIVED from the registry, not restated here. This list used to be three
+;; hard-coded paths while `src/kotoba/lang/grammar_authority.clj` named six and
+;; `lang/elaboration-pipeline.edn` named seven -- three lists of the same thing,
+;; all wrong in different ways. `grammar-authority-test/the-registry-is-the-only-
+;; list-of-copies` refuses a hard-coded sibling path in this file.
+(def registry-path "lang/vendored-copies.edn")
+
+(def registry
+  (edn/read-string (fs/readFileSync registry-path "utf8")))
+
 (def sibling-vendor-paths
-  ["../amu/resources/kotoba/lang/guest-grammar.edn"
-   "../kotoba/resources/kotoba/lang/guest-grammar.edn"
-   "../grammar/resources/kotoba/lang/guest-grammar.edn"])
+  (vec (for [c (:copies registry)
+             :when (and (= "lang/guest-grammar.edn" (:authority c))
+                        (not= local-vendor-path (:checkout-path c)))]
+         (:checkout-path c))))
 (def portable-backends #{:compiler :kotoba-wasm :kotoba-cljs})
 
 (defn read-edn [p]
