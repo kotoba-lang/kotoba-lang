@@ -57,9 +57,10 @@
   (delay
     (let [body (->> (sema/read-forms module)
                     (remove #(and (seq? %) (= 'ns (first %))))
-                    ;; the module carries its own golden `main` (wasm32
-                    ;; self-check); this unit's entry is the harness's, so
-                    ;; the module's is stripped rather than renamed
+                    ;; defensive: if the module ever grows a `main`, this
+                    ;; unit's entry is the harness's, so the module's is
+                    ;; stripped rather than renamed (sorted-map's harness
+                    ;; needs the same guard the day it grows one)
                     (remove #(and (seq? %) (= 'defn (first %))
                                   (= 'main (second %))))
                     (map pr-str)
