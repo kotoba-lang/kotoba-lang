@@ -35,7 +35,7 @@
 (deftest stdlib-manifest-frozen-shape
   (let [m (load-manifest)
         core (first (:modules m))]
-    (is (= 5 (:kotoba.lang.stdlib.manifest/version m)))
+    (is (= 6 (:kotoba.lang.stdlib.manifest/version m)))
     (is (= :frozen (:kotoba.lang.stdlib.manifest/status m)))
     (is (= "T4.1" (:kotoba.lang.stdlib.manifest/wbs m)))
     (is (= :core (:id core)))
@@ -257,8 +257,8 @@
   (let [pkg (edn/read-string (slurp "lang/stdlib.edn"))
         m (load-manifest)
         core (first (:modules m))]
-    (is (= 5 (:kotoba.stdlib/version pkg)))
-    (is (= "0.5.0" (:kotoba.stdlib/release pkg)))
+    (is (= 6 (:kotoba.stdlib/version pkg)))
+    (is (= "0.6.0" (:kotoba.stdlib/release pkg)))
     (is (string? (:kotoba.stdlib/absent pkg)) "the package points at the manifest's :absent")
     (is (= :core (:id (first (:kotoba.stdlib/artifacts pkg)))))
     (is (= 'stdlib.core (:namespace (first (:kotoba.stdlib/artifacts pkg)))))
