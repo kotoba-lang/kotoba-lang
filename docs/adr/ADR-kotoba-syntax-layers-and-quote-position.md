@@ -7,7 +7,8 @@
 - **Related**: `ADR-safe-capability-language.md`,
   `ADR-kotoba-typed-eval.md`, `ADR-kotoba-code-identity-and-abilities.md`,
   `ADR-kotoba-contextual-document-literals.md`,
-  `ADR-kotoba-language-surface-status.md`
+  `ADR-kotoba-language-surface-status.md`,
+  `ADR-kotoba-pure-s-expression-core-and-cljk-surface.md`
 
 ## Context
 
@@ -80,11 +81,13 @@ Two authority-surface gaps surround this:
 
 ## Decision
 
-1. **The surface stays Clojure-shaped.** A pure S-expression reader is not
-   adopted. The AI-first benefit the comparison sought is taken at the
-   canonical layer, where it already exists: a definition CID hashes
-   normalized, checked semantics — not source spelling — and source that
-   never becomes a definition is never executed at all.
+1. **The surface stays Clojure-shaped on `.cljk`, while `.kotoba` targets the pure S-expression core.**
+   (Amended/specialized by `ADR-kotoba-pure-s-expression-core-and-cljk-surface.md`).
+   The friendly Clojure surface with rich desugaring is preserved on `.cljk` to
+   exploit existing corpus prior. The canonical `.kotoba` format strips syntax
+   variance down to orthogonal pure S-expressions for maximum determinism in
+   autonomous agent compiler/verifier loops. Both compile to the identical
+   canonical IR and Definition CID.
 2. **Identity is the existing definition CID.** No new identity layer. The
    proposal's `CID = H(Canonical(Resolve(Elaborate(source))))` is literally
    the sealed payload: typed KIR + profile version + desugar-contract version
@@ -130,13 +133,12 @@ Two authority-surface gaps surround this:
    none of them as new language.
 
 ## Explicit non-goals
-
-- A pure S-expression reader or a second canonical syntax.
-- Lisp-2 namespaces, or a function/value split.
-- Giving `quote` value semantics as part of this ADR.
-- Relaxing eval, apply, or macro policy beyond the recorded contracts.
-- Introducing a polyglot consistency runtime or consensus ladder into the
-  language contract.
+ 
+ - Lisp-2 namespaces, or a function/value split.
+ - Giving `quote` value semantics as part of this ADR.
+ - Relaxing eval, apply, or macro policy beyond the recorded contracts.
+ - Introducing a polyglot consistency runtime or consensus ladder into the
+   language contract.
 
 ## Evidence
 
