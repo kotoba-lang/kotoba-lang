@@ -14,7 +14,7 @@ Public names: `comp2`, `concat`, `err`, `err?`, `every?`, `find`, `group-by`, `m
 
 ## Language built-ins
 
-String operations: `string-byte-length`, `string-code-point-at`, `string-concat`, `string-contains?`, `string-fold-case`, `string-from-i64`, `string-join`, `string-length`, `string-substring`, `string=?`.
+String operations: `string-byte-length`, `string-code-point-at`, `string-concat`, `string-contains?`, `string-fold-case`, `string-from-i64`, `string-join`, `string-length`, `string-substring`, `string-upper`, `string=?`.
 
 Option sugar: `if-some`, `match-option`, `when-some`.
 

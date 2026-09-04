@@ -1,6 +1,6 @@
 # String kit (pure-product / T4.2)
 
-**Status:** length + from-i64 + concat + join + **string-split-count** landed dual-backend (compiler#427)  
+**Status:** length + from-i64 + concat + join + **string-split-count** landed dual-backend (compiler#427); **string-upper** landed as the fold-case mirror (2026-09-04)  
 **Full split→collection:** deferred
 
 | Op | Arity | Meaning |
@@ -15,6 +15,7 @@
 | `string-substring` | 3 | Byte-range slice (UTF-8 boundaries) |
 | `string-contains?` | 2 | Substring search → i64 1/0 |
 | `string-fold-case` | 1 | Unicode case-fold |
+| `string-upper` | 1 | Unicode upper-case (the mirror of fold-case) |
 | `string-code-point-at` | 2 | Code point at UTF-8 byte offset |
 
 ## `string-join` examples
