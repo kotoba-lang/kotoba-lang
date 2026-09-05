@@ -102,7 +102,12 @@
    :host/env-read :host/env-read
    ;; fs/browse (capability id 253) — directory listing narrowed to the
    ;; granted directory TREE (kbb slice 2).
-   :host/fs-browse :host/fs-browse})
+   :host/fs-browse :host/fs-browse
+   ;; proc/exec (capability id 259, kotoba-core-contracts a6463d4) — run
+   ;; ONE allowlisted invocation; the guest names a grant INDEX into the
+   ;; policy's fixed invocation table, argv/cwd are policy-side literals
+   ;; (kbb slice 2, ADR-2607181900).
+   :host/proc-exec :host/proc-exec})
 
 (defn non-empty-string?
   [x]

@@ -252,3 +252,8 @@
 (deftest vrm-composition-kinds-are-canonical-effects
   (doseq [kind [:vrm/asset-read :vrm/compose :vrm/preview :vrm/export :vrm/publish]]
     (is (= kind (get caps/effect-for-kind kind)))))
+
+(deftest proc-exec-effect-row-test
+  (testing "proc/exec (capability id 259) has a real effect row (kbb slice 2)"
+    (is (contains? caps/effect-for-kind :host/proc-exec))
+    (is (= :host/proc-exec (get caps/effect-for-kind :host/proc-exec)))))
