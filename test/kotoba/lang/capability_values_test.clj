@@ -262,3 +262,8 @@
   (testing "data/json (capability id 246) has a real effect row"
     (is (contains? caps/effect-for-kind :host/data-json))
     (is (= :host/data-json (get caps/effect-for-kind :host/data-json)))))
+
+(deftest data-edn-effect-row-test
+  (testing "data/edn (capability id 260) has a real effect row (kbb gate item ④)"
+    (is (contains? caps/effect-for-kind :host/data-edn))
+    (is (= :host/data-edn (get caps/effect-for-kind :host/data-edn)))))
