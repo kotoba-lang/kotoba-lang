@@ -257,3 +257,8 @@
   (testing "proc/exec (capability id 259) has a real effect row (kbb slice 2)"
     (is (contains? caps/effect-for-kind :host/proc-exec))
     (is (= :host/proc-exec (get caps/effect-for-kind :host/proc-exec)))))
+
+(deftest data-json-effect-row-test
+  (testing "data/json (capability id 246) has a real effect row"
+    (is (contains? caps/effect-for-kind :host/data-json))
+    (is (= :host/data-json (get caps/effect-for-kind :host/data-json)))))

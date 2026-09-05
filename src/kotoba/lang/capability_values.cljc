@@ -107,7 +107,13 @@
    ;; ONE allowlisted invocation; the guest names a grant INDEX into the
    ;; policy's fixed invocation table, argv/cwd are policy-side literals
    ;; (kbb slice 2, ADR-2607181900).
-   :host/proc-exec :host/proc-exec})
+   :host/proc-exec :host/proc-exec
+   ;; data/json (capability id 246, kotoba-core-contracts) — JSON wire-format
+   ;; ops (json-encode / json-extract-field). One kind for the family, the
+   ;; same convention as topic-* sharing :host/topic-subscribe. Resource
+   ;; scope is enforced per-call in the host provider (kotoba repo), not
+   ;; here.
+   :host/data-json :host/data-json})
 
 (defn non-empty-string?
   [x]
