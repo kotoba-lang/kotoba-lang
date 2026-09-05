@@ -6,6 +6,8 @@
   `lang/package.edn`
 - **Related**: `ADR-safe-capability-language.md`,
   `ADR-kotoba-package-cid-lock.md`, `ADR-kotoba-language-surface-status.md`
+- **Extended by**: `ADR-kotoba-definition-patch-share.md` (patch/share is the
+  definition interchange unit; this ADR remains the hasher pin)
 - **Execution-boundary authority**:
   `90-docs/adr/2607252500-kotoba-wasm-component-first-execution-boundary.edn`
 
