@@ -118,7 +118,15 @@
    ;; same convention as topic-* sharing :host/topic-subscribe. Resource
    ;; scope is enforced per-call in the host provider (kotoba repo), not
    ;; here.
-   :host/data-json :host/data-json})
+   :host/data-json :host/data-json
+   ;; data/edn (capability id 260, kotoba-core-contracts bceabfa) — EDN
+   ;; wire read for the kbb ops-script surface (facade/tasks.edn checks,
+   ;; deps.edn pin audits). edn-read takes the EDN text as a plain string
+   ;; and returns the parsed value; one kind for the family, same
+   ;; convention as :host/data-json. No external resource — the bytes
+   ;; come entirely from the guest's own argument, so the kind-level
+   ;; grant is the whole boundary.
+   :host/data-edn :host/data-edn})
 
 (defn non-empty-string?
   [x]
