@@ -345,9 +345,9 @@
   digest to the other three in the same wave. A digest updated here alone is
   the defect this pin exists to make loud.
 
-  Advanced 2026-09-05 from `871f3873` for :host/env-read (merge `7cca78dc`).
-  Sibling pins follow (kotoba#553, kotoba-sema#48). See `deferred-vendor-copies`."
-  "811e3d5ee4ca3e9d052b59435d4baeeb6095a0df5fb7756cedc2cb598ce58e99")
+  Advanced 2026-09-05 from `811e3d5e` for :host/fs-browse (merge `0b320850`).
+  Sibling pins follow (kotoba main dd8cf587, kotoba-sema#49 86565528). See `deferred-vendor-copies`."
+  "9d701ea9a803a4b3d7dc4245274a9a901ab4ac506ebd401282b2acdf7747dd9c")
 
 (defn- sha256-hex [^bytes bs]
   (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") bs)]
