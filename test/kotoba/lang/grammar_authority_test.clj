@@ -552,3 +552,23 @@
         "not one copy opened; this run measured nothing")
     (is (<= (:vendor-compared stats) (:vendor-registered stats))
         "more copies were compared than are registered")))
+
+(deftest pure-s-expression-core-heads-are-not-yet-admitted
+  ;; ADR-544 (pure S-expression core + cljk surface) step 1 admits the pure
+  ;; head set (lam app rel query perform handle ref) as desugaring source
+  ;; forms. Measured today (q9-migration.edn :pure-heads-admitted false),
+  ;; NONE are admitted by the grammar authority -- writing pure-`.kotoba`
+  ;; source is not possible, and the running `.kotoba` files are clojure-
+  ;; shaped by authority, not by oversight.
+  ;;
+  ;; This test is the machine-checkable RED for step 1: it must FAIL (flip
+  ;; to asserting admitted) the moment lam/app/rel/query/perform/handle/ref
+  ;; become admitted source heads. Do NOT delete it when starting step 1 --
+  ;; edit the assertion to GREEN as part of landing the grammar change.
+  (let [grammar (auth/read-edn auth/grammar-path)
+        admitted (:all (auth/admitted-source-forms grammar))
+        pure-heads '[lam app rel query perform handle ref]]
+    (doseq [h pure-heads]
+      (is (not (contains? admitted h))
+          (str h " should NOT be admitted yet -- ADR-544 step 1 must flip "
+               "this to a contains? assertion when the pure head lands")))))
