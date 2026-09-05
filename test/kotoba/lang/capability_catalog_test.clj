@@ -13,7 +13,7 @@
   (let [authority (catalog/validate! (catalog/read-authority))
         entries (:capabilities authority)
         wire-ids (sort (map :compiler-wire-id (vals entries)))]
-    (is (= 34 (count entries)))
+    (is (= 35 (count entries)))
     (is (= (range 1 (inc (count entries))) wire-ids)
         "wire ids stay contiguous from 1 with no duplicates or gaps")
     (is (= [4 11 12]
@@ -56,7 +56,11 @@
                  [:env/read :fs/browse])))
     (is (= ['env/read 'fs/browse]
            (mapv #(get-in entries [% :source-operation])
-                 [:env/read :fs/browse])))))
+                 [:env/read :fs/browse])))
+    ;; ADR-2609051100 slice 4: fs/app-data (runtime id 202) gets compiler
+    ;; wire id 35 so native guests can lower fs-read/fs-write.
+    (is (= 35 (get-in entries [:fs/app-data :compiler-wire-id])))
+    (is (= 'fs/app-data (get-in entries [:fs/app-data :source-operation])))))
 
 (deftest duplicate-wire-id-fails-closed
   (let [authority (catalog/read-authority)]
