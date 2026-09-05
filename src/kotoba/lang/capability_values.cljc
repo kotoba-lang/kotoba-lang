@@ -108,6 +108,11 @@
    ;; policy's fixed invocation table, argv/cwd are policy-side literals
    ;; (kbb slice 2, ADR-2607181900).
    :host/proc-exec :host/proc-exec
+   ;; fs/app-data (runtime id 202, kotoba-core-contracts) — sandboxed
+   ;; fs read/write narrowed to the granted path scope; compiler wire id
+   ;; 35 so native (amu KEXE) guests can lower fs-read/fs-write against
+   ;; the loader provider table (ADR-2609051100 slice 4 task 1).
+   :host/fs-app-data :host/fs-app-data
    ;; data/json (capability id 246, kotoba-core-contracts) — JSON wire-format
    ;; ops (json-encode / json-extract-field). One kind for the family, the
    ;; same convention as topic-* sharing :host/topic-subscribe. Resource
@@ -513,3 +518,4 @@
 
           false)]
     {:ok? ok? :case (:id tc) :actual actual}))
+
