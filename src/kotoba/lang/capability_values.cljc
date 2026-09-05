@@ -99,7 +99,10 @@
    ;; kbb ops-script surface (ADR-2607181900 readiness gate): env/read
    ;; (capability id 258, kotoba-core-contracts) — named process-environment
    ;; variable lookup, resource scope = the granted env var NAMES.
-   :host/env-read :host/env-read})
+   :host/env-read :host/env-read
+   ;; fs/browse (capability id 253) — directory listing narrowed to the
+   ;; granted directory TREE (kbb slice 2).
+   :host/fs-browse :host/fs-browse})
 
 (defn non-empty-string?
   [x]
