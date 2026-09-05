@@ -134,13 +134,27 @@
   "Floor on how many cases record where their required backends are driven.
   A ratchet: raise it when a case is annotated, never lower it. Without a
   floor, deleting every `:executed-by` would make this check pass by having
-  nothing to check -- which is not the same as finding nothing wrong."
-  2)
+  nothing to check -- which is not the same as finding nothing wrong.
+
+  Raised from 2 to 6 on 2026-09-03: the three `collections/` cases that had no
+  record at all gained one, and the map-literal-values case landed with one."
+  6)
 
 (def ^:private deferral-keys #{:as-of :reason :closes-when})
 
-(defn cases-with-execution-record [manifest]
-  (filterv :executed-by (cases manifest)))
+(defn cases-with-execution-record
+  "Cases that record where their required backends are driven.
+
+  `:unexecuted-backends` counts, not only `:executed-by`. This filtered on
+  `:executed-by` alone until 2026-09-03, so a case that records ONLY
+  deferrals -- one that no backend runs, which is exactly the case whose
+  record most needs checking -- was invisible to `validate-execution`: its
+  deferral entries were never checked for `:as-of`/`:reason`/`:closes-when`,
+  and it never counted toward the floor. Measured on
+  `:bounded-vector-literal-and-operations`, whose two required backends are
+  both deferred."
+  [manifest]
+  (filterv #(or (:executed-by %) (:unexecuted-backends %)) (cases manifest)))
 
 (defn validate-execution
   "Cross-check `:executed-by`/`:unexecuted-backends` against

@@ -95,7 +95,19 @@
    ;; Syndicate-style EDN dataspace kit (root ADR-2608154100). A well-formed
    ;; cap map is still not a runtime grant; resolve requires cap-acquire /
    ;; host table intersection.
-   :dataspace/transact :dataspace/transact})
+   :dataspace/transact :dataspace/transact
+   ;; kbb ops-script surface (ADR-2607181900 readiness gate): env/read
+   ;; (capability id 258, kotoba-core-contracts) — named process-environment
+   ;; variable lookup, resource scope = the granted env var NAMES.
+   :host/env-read :host/env-read
+   ;; fs/browse (capability id 253) — directory listing narrowed to the
+   ;; granted directory TREE (kbb slice 2).
+   :host/fs-browse :host/fs-browse
+   ;; proc/exec (capability id 259, kotoba-core-contracts a6463d4) — run
+   ;; ONE allowlisted invocation; the guest names a grant INDEX into the
+   ;; policy's fixed invocation table, argv/cwd are policy-side literals
+   ;; (kbb slice 2, ADR-2607181900).
+   :host/proc-exec :host/proc-exec})
 
 (defn non-empty-string?
   [x]

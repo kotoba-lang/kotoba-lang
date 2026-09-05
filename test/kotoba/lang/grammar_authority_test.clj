@@ -6,40 +6,30 @@
             [kotoba.lang.grammar-authority :as auth]))
 
 (def deferred-vendor-copies
-  "Sibling copies that are KNOWN to be behind this authority, each with the
-  reason it has not been resynced and the condition that closes it.
+  "Sibling copies KNOWN to be behind this authority, keyed by CHECKOUT path.
 
-  A copy that is behind and is NOT listed here fails. Listing one is a
-  decision with a date on it, not a way of not noticing -- and an entry whose
-  copy is no longer behind ALSO fails, so the map cannot outlive what it
-  excuses.
+  DERIVED from `lang/vendored-copies.edn` since 2026-09-03. It used to be a
+  literal map here, which made it the fourth place the registry of copies
+  lived -- and the four disagreed, which is how kotoba-sema's copy of
+  `capability-catalog.edn` went unmeasured entirely.
 
-  This map exists because `local-and-sibling-vendors-match-authority` measures
-  a different thing depending on where it runs. Its sibling paths exist only
-  in the west monorepo layout, so in a single-repository clone it compares one
-  file -- this repository's own copy of itself -- and reports green. Measured
-  2026-09-03 before the resync wave, three of the four sibling copies had
-  drifted and it said nothing. Recording the deferral makes the state the same
-  in both places: what is behind is behind on the record."
-  {"../kotoba/resources/kotoba/lang/guest-grammar.edn"
-   {:as-of "2026-09-03"
-    :reason
-    (str "kotoba's five classpath copies all agree WITH EACH OTHER at the "
-         "pre-wave authority, and its own check "
-         "(`every-guest-grammar-on-the-classpath-is-the-same-bytes`) is "
-         "stricter than this one -- every copy byte-identical, no exemption. "
-         "Resyncing the two it ships alone would break it, rightly, because "
-         "`io/resource` answers with whichever copy comes first. Moving the "
-         "three that arrive from its pinned amu, kotoba-lang and kotoba-sema "
-         "means advancing an amu pin 106 commits behind main: a compiler "
-         "migration, not a grammar resync.")
-    :recorded-there
-    "kotoba docs/ADR-the-vendored-grammar-is-compared-where-it-is-read.md and test/kotoba/guest_grammar_vendor_test.clj, which pins BOTH digests -- the one its copies are at and the one they owe"
-    :closes-when "kotoba advances its amu pin and resyncs both copies"}
-   "../kotoba/vendor/grammar/resources/kotoba/lang/guest-grammar.edn"
-   {:as-of "2026-09-03"
-    :reason "the second of kotoba's two shipped copies; see the entry above"
-    :closes-when "kotoba advances its amu pin and resyncs both copies"}})
+  A copy that is behind and is NOT recorded fails. Recording one is a decision
+  with a date on it, not a way of not noticing: every entry carries `:as-of`,
+  `:reason` and `:closes-when`, and `deferrals-are-not-a-bare-skip-list` below
+  refuses one that does not.
+
+  THE CONVERSE -- an entry whose copy is no longer behind -- is asserted by
+  `scripts/check-vendored-copies-fleet.cljs`, not here. Its sibling paths exist
+  only in the west monorepo layout, so what this file can see depends on which
+  revision happens to be checked out beside it; the same assertion here would
+  be a coin flip, and was for that reason only ever a printed note. The fleet
+  script asks GitHub about the consumer's DEFAULT BRANCH, an answer that is the
+  same everywhere, so over there it is a failure."
+  (into {}
+        (keep (fn [c]
+                (when-let [d (auth/deferral-for (:checkout-path c))]
+                  [(:checkout-path c) d])))
+        (:copies auth/registry)))
 
 (defn- deferred-vendor-drift?
   "A `:vendor/drift` error every one of whose mismatching paths is recorded in
@@ -346,15 +336,18 @@
 ;; Two additions, neither of which can be satisfied by absence.
 
 (def ^:private authority-grammar-sha256
-  "The sha256 of `lang/guest-grammar.edn` as of the 2026-09-03 resync wave.
+  "The sha256 of `lang/guest-grammar.edn` as of the 2026-09-05 resync wave.
   The same literal is pinned in amu, kotoba-sema and kotoba, so an authority
   edit that is not carried to all four goes red in the three that were left
   behind -- including in a clone where there is no sibling to compare against.
 
   Updating it is the wave: change this file, recompute, and carry the new
   digest to the other three in the same wave. A digest updated here alone is
-  the defect this pin exists to make loud."
-  "6e1202fd23bc5a2ed6ef432114585c1813f5143d643eb4c8ee9a00b6e798b922")
+  the defect this pin exists to make loud.
+
+  Advanced 2026-09-05 from `811e3d5e` for :host/fs-browse (merge `0b320850`).
+  Sibling pins follow (kotoba main dd8cf587, kotoba-sema#49 86565528). See `deferred-vendor-copies`."
+  "9d701ea9a803a4b3d7dc4245274a9a901ab4ac506ebd401282b2acdf7747dd9c")
 
 (defn- sha256-hex [^bytes bs]
   (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") bs)]
@@ -445,3 +438,113 @@
                   "kernel-uefi-alloc-region"]]
       (is (contains? kernel head)
           (str head " is admitted by the frontend and must be named here")))))
+
+;; ---------------------------------------------------------------------------
+;; The registry of copies, and the discipline it has to keep
+;; ---------------------------------------------------------------------------
+;;
+;; Added 2026-09-03 with `lang/vendored-copies.edn`. Before it, the list of
+;; copies lived in four places that disagreed, and the deferral map was a
+;; literal in this file with nothing checking its shape.
+
+(deftest the-registry-answers-why-every-copy-exists
+  ;; The load-bearing measurement. A copy whose reason is not recorded is a
+  ;; copy the next resync wave will carry without knowing whether it should
+  ;; exist at all -- which is how five of these outlived their reason.
+  (let [copies (:copies auth/registry)]
+    (println (format "SCANNED\t%d\tregistered copies of %d authorities"
+                     (count copies) (count auth/vendored-authorities)))
+    (is (seq copies)
+        "the registry names no copies; this run measured nothing, which is not
+         the same as finding nothing wrong")
+    (doseq [c copies]
+      (is (every? #(contains? c %) [:authority :repo :path :checkout-path
+                                    :exists-because :read-by :dependant?])
+          (str "a registered copy does not say why it exists: " (pr-str c)))
+      (is (.isFile (io/file (:authority c)))
+          (str "a registered copy names an authority file that is not in this "
+               "repository: " (:authority c))))
+    (testing "the local copy of each authority is registered, since it is the
+              one file that is never allowed to be behind"
+      (doseq [[authority paths] auth/vendored-authorities]
+        (is (some #(not (str/starts-with? % "..")) paths)
+            (str authority " has no copy inside this repository registered"))))))
+
+(deftest deferrals-are-not-a-bare-skip-list
+  ;; A skip list with no date, no reason and no closing condition is a way of
+  ;; not noticing. Every entry owes all three.
+  (let [ds auth/deferrals]
+    (println (format "DEFERRED\t%d\tcopies recorded as knowingly behind" (count ds)))
+    (doseq [[k v] ds]
+      (is (map? v) (str "deferral " k " is not a map"))
+      (doseq [field [:as-of :reason :closes-when]]
+        (is (contains? v field)
+            (str "deferral " (pr-str k) " has no " field
+                 "; a deferral without one is a skip list entry")))
+      (is (re-matches #"\d{4}-\d{2}-\d{2}" (str (:as-of v)))
+          (str "deferral " (pr-str k) " has no dated :as-of")))))
+
+(deftest every-deferral-names-a-registered-copy
+  ;; Half of the converse. A deferral for a path nothing compares excuses
+  ;; nothing, and reads as coverage. The OTHER half -- a deferral naming a copy
+  ;; that is actually in sync -- needs the consumer's default branch and is
+  ;; asserted in `scripts/check-vendored-copies-fleet.cljs`.
+  (let [known (into #{} (map (fn [c] (str (:repo c) " " (:path c))))
+                    (:copies auth/registry))]
+    (is (seq known) "no registered copies; nothing to check deferrals against")
+    (doseq [k (keys auth/deferrals)]
+      (is (contains? known k)
+          (str "deferral " (pr-str k) " names no registered copy. Registered: "
+               (pr-str (sort known)))))))
+
+(deftest retired-copies-do-not-come-back
+  ;; A path deleted for a structural reason comes back the moment someone runs
+  ;; a resync that still knows it. Named here so the return is a NAMED failure.
+  ;; Only checkable for siblings that are present; the fleet script asks GitHub
+  ;; and so can check them all.
+  (let [retired auth/retired-checkout-paths
+        present (filter #(.isFile (io/file %)) (keys retired))]
+    (println (format "RETIRED\t%d\tpaths registered, %d resolvable here"
+                     (count retired) (count present)))
+    (is (seq retired) "no retired paths registered; the registry lost them")
+    (doseq [p present]
+      (is false
+          (str "a retired copy came back: " p "\n  retired "
+               (:retired (get retired p)) "\n  " (:reason (get retired p)))))
+    (testing "every retired entry says when and why"
+      (doseq [[p v] retired]
+        (is (contains? v :retired) (str p " has no :retired date"))
+        (is (contains? v :reason) (str p " has no :reason"))))))
+
+(deftest the-registry-is-the-only-list-of-copies
+  ;; Both scripts and this namespace read `lang/vendored-copies.edn`. A
+  ;; hard-coded sibling path anywhere else is the fifth list, and the fifth
+  ;; list is how the first four came to disagree.
+  (let [script "scripts/check-grammar-authority.cljs"]
+    (is (.isFile (io/file script))
+        (str script " is missing, so this check could not run; refusing to
+             report a pass"))
+    (let [text (slurp script)]
+      (is (str/includes? text auth/registry-path)
+          (str script " does not read " auth/registry-path
+               "; it is keeping its own list of copies"))
+      (is (not (re-find #"\"\.\./(amu|kotoba|grammar|kotoba-sema|compiler)/resources/" text))
+          (str script " hard-codes a sibling copy path. Derive it from "
+               auth/registry-path " instead.")))))
+
+(deftest the-vendor-count-is-files-opened-not-paths-listed
+  ;; `:vendor-checked` was `(inc (count sibling-vendor-paths))` -- a constant.
+  ;; It reported 7 in a clone that had compared one file. The two numbers are
+  ;; now separate, and the one a reader trusts is the one that counts opens.
+  (let [stats (:stats (auth/validate))
+        openable (count (filter #(.isFile (io/file %))
+                                (cons auth/local-vendor-path
+                                      auth/sibling-vendor-paths)))]
+    (println (format "COMPARED\t%d/%d\tguest-grammar copies openable here"
+                     (:vendor-compared stats) (:vendor-registered stats)))
+    (is (= openable (:vendor-compared stats))
+        "the reported compared-count is not the number of files that opened")
+    (is (pos? (:vendor-compared stats))
+        "not one copy opened; this run measured nothing")
+    (is (<= (:vendor-compared stats) (:vendor-registered stats))
+        "more copies were compared than are registered")))

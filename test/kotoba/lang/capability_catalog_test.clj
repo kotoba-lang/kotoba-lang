@@ -13,7 +13,7 @@
   (let [authority (catalog/validate! (catalog/read-authority))
         entries (:capabilities authority)
         wire-ids (sort (map :compiler-wire-id (vals entries)))]
-    (is (= 30 (count entries)))
+    (is (= 34 (count entries)))
     (is (= (range 1 (inc (count entries))) wire-ids)
         "wire ids stay contiguous from 1 with no duplicates or gaps")
     (is (= [4 11 12]
@@ -39,7 +39,24 @@
            (mapv #(get-in entries [% :compiler-wire-id])
                  [:net/datagram :link/frame :can/frame :code/eval])))
     (is (= 'code/eval (get-in entries [:code/eval :source-operation])))
-    (is (= 'eval (get-in entries [:code/eval :source-alias])))))
+    (is (= 'eval (get-in entries [:code/eval :source-alias])))
+    ;; ADR-2609031100. Promoted from kotoba-sema's vendored copy, where a
+    ;; language-surface change had been made in a consumer repository; the ids
+    ;; are named here so a resync cannot quietly drop or renumber them.
+    (is (= [31 32]
+           (mapv #(get-in entries [% :compiler-wire-id])
+                 [:screen/observe :screen/act])))
+    (is (= ['screen/observe 'screen/act]
+           (mapv #(get-in entries [% :source-operation])
+                 [:screen/observe :screen/act])))
+    ;; kbb ADR-2607181900 slice 3 (merge 8d5a7b1d): compiler wire ids 33/34
+    ;; for env/read and fs/browse. Named so a resync cannot drop them.
+    (is (= [33 34]
+           (mapv #(get-in entries [% :compiler-wire-id])
+                 [:env/read :fs/browse])))
+    (is (= ['env/read 'fs/browse]
+           (mapv #(get-in entries [% :source-operation])
+                 [:env/read :fs/browse])))))
 
 (deftest duplicate-wire-id-fails-closed
   (let [authority (catalog/read-authority)]

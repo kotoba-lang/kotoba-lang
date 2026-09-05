@@ -35,7 +35,7 @@
 (deftest stdlib-manifest-frozen-shape
   (let [m (load-manifest)
         core (first (:modules m))]
-    (is (= 5 (:kotoba.lang.stdlib.manifest/version m)))
+    (is (= 6 (:kotoba.lang.stdlib.manifest/version m)))
     (is (= :frozen (:kotoba.lang.stdlib.manifest/status m)))
     (is (= "T4.1" (:kotoba.lang.stdlib.manifest/wbs m)))
     (is (= :core (:id core)))
@@ -257,8 +257,8 @@
   (let [pkg (edn/read-string (slurp "lang/stdlib.edn"))
         m (load-manifest)
         core (first (:modules m))]
-    (is (= 5 (:kotoba.stdlib/version pkg)))
-    (is (= "0.5.0" (:kotoba.stdlib/release pkg)))
+    (is (= 6 (:kotoba.stdlib/version pkg)))
+    (is (= "0.6.0" (:kotoba.stdlib/release pkg)))
     (is (string? (:kotoba.stdlib/absent pkg)) "the package points at the manifest's :absent")
     (is (= :core (:id (first (:kotoba.stdlib/artifacts pkg)))))
     (is (= 'stdlib.core (:namespace (first (:kotoba.stdlib/artifacts pkg)))))
@@ -317,3 +317,40 @@
       (is (seq (:also-claimed-in policy)))
       (is (every? #(and (string? (:path %)) (string? (:status %)))
                   (:also-claimed-in policy))))))
+
+(deftest every-recorded-reason-has-been-re-read
+  "A reason for absence is a claim about the compiler, and the compiler moves
+  under it. `:reasons-re-read` records a verdict for every `:absent` and
+  `:withdrawn` name as of a named date and toolchain, so `still true` and
+  `nobody looked` stop being the same silence.
+
+  Measured 2026-09-03, which is why this exists: re-reading all of them found
+  `update`'s reason stale -- the entry says the `map-assoc` isolate exits 70
+  on wasm32, and it compiles with exit 0 and the recorded body answers 5
+  through amu's browser host. Nothing had re-read it since version 2.
+
+  The floor is both directions. Every recorded name needs a verdict, and a
+  verdict may not name something that is not recorded -- otherwise the map
+  outlives the entries it speaks for."
+  (let [m (load-manifest)
+        re-read (:reasons-re-read m)
+        verdicts (:verdicts re-read)
+        recorded (into (set (keys (:absent m))) (keys (:withdrawn m)))]
+    (is (string? (:as-of re-read)))
+    (is (string? (:toolchain re-read)))
+    (is (pos? (count recorded)) "no names were read; a run that measured
+                                 nothing is not a run that found nothing wrong")
+    (println (format "SCANNED\t%d\trecorded reasons (%d absent, %d withdrawn)"
+                     (count recorded) (count (:absent m)) (count (:withdrawn m))))
+    (is (empty? (remove verdicts recorded))
+        (str "no verdict for: " (pr-str (sort (remove verdicts recorded)))))
+    (is (empty? (remove recorded (keys verdicts)))
+        (str "verdict for a name that is neither absent nor withdrawn: "
+             (pr-str (sort (remove recorded (keys verdicts))))))
+    (is (every? #{:unchanged :stale} (vals verdicts))
+        (str "a verdict must be :unchanged or :stale; got "
+             (pr-str (sort (distinct (vals verdicts))))))
+    (testing "every verdict that is not :unchanged says what was measured"
+      (doseq [[name verdict] verdicts :when (not= :unchanged verdict)]
+        (is (string? (get-in re-read [:measured name]))
+            (str name " is " verdict " with no measurement"))))))
