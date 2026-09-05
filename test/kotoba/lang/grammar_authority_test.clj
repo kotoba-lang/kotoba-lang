@@ -346,8 +346,12 @@
   the defect this pin exists to make loud.
 
   Advanced 2026-09-05 from `811e3d5e` for :host/fs-browse (merge `0b320850`).
-  Sibling pins follow (kotoba main dd8cf587, kotoba-sema#49 86565528). See `deferred-vendor-copies`."
-  "9d701ea9a803a4b3d7dc4245274a9a901ab4ac506ebd401282b2acdf7747dd9c")
+  Sibling pins follow (kotoba main dd8cf587, kotoba-sema#49 86565528). See `deferred-vendor-copies`.
+  Advanced again 2026-09-05 for the string-search surface slice:
+  :predicates gains string-index-of, string-contains? and string-split-count
+  (kbb scripts-port wave 2; the compiler and KIR already implemented the
+  latter two, and kotoba.runtime gains the CLJ interpreter bindings)."
+  "3e41eb84a57a1fcc84dc0ec0b6a5ec1fd535c39e2cf6cfc14418fc1ec4567483")
 
 (defn- sha256-hex [^bytes bs]
   (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") bs)]
