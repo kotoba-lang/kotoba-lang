@@ -336,7 +336,7 @@
 ;; Two additions, neither of which can be satisfied by absence.
 
 (def ^:private authority-grammar-sha256
-  "The sha256 of `lang/guest-grammar.edn` as of the 2026-09-03 resync wave.
+  "The sha256 of `lang/guest-grammar.edn` as of the 2026-09-05 resync wave.
   The same literal is pinned in amu, kotoba-sema and kotoba, so an authority
   edit that is not carried to all four goes red in the three that were left
   behind -- including in a clone where there is no sibling to compare against.
@@ -345,15 +345,9 @@
   digest to the other three in the same wave. A digest updated here alone is
   the defect this pin exists to make loud.
 
-  Advanced 2026-09-03 from `6e1202fd` together with kotoba-sema `0a5dcc2b`,
-  which carries the same bytes. The change is the map literal's VALUE type:
-  this authority said it was `always :i64` and gave the reason with it --
-  \"a literal has no annotation and inference runs after desugaring, so the
-  value half cannot be read off the source\" -- and kotoba-sema's
-  `desugar-map` now reads it off the literal's own values, so the sentence
-  would have been false the moment the frontend landed. amu and kotoba are
-  behind; see `deferred-vendor-copies`."
-  "871f3873ae30a33ba7461c8664094b42396c0c4d79612668d11b0b29a2c0172f")
+  Advanced 2026-09-05 from `871f3873` for :host/env-read (merge `7cca78dc`).
+  Sibling pins follow (kotoba#553, kotoba-sema#48). See `deferred-vendor-copies`."
+  "811e3d5ee4ca3e9d052b59435d4baeeb6095a0df5fb7756cedc2cb598ce58e99")
 
 (defn- sha256-hex [^bytes bs]
   (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") bs)]
