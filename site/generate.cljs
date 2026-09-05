@@ -26,6 +26,7 @@
    "lang/library-publication.edn"
    "lang/docs-release.edn"
    "lang/product-defaults.edn"
+   "site/sponsorship.edn"
    "security/cryptographic-boundaries.edn"
    "docs/search-index.edn"])
 
@@ -41,7 +42,11 @@
 (def library-publication (authority "lang/library-publication.edn"))
 (def docs-release   (authority "lang/docs-release.edn"))
 (def product-defaults (authority "lang/product-defaults.edn"))
+(def sponsorship    (authority "site/sponsorship.edn"))
 (def search-index   (authority "docs/search-index.edn"))
+
+(def sponsorship-live? (= :live (:status sponsorship)))
+(def sponsor-profile-url (get-in sponsorship [:platform :profile-url]))
 
 (def dds-root
   (or (some-> js/process.env.JP_GO_DDS_ROOT not-empty)
@@ -316,6 +321,7 @@
    {:label "Libraries" :href "#libraries"}
    {:label "Roadmap" :href "#roadmap"}
    {:label "Community" :href "#community"}
+   {:label "Sponsor" :href "./sponsor/"}
    {:label "Blog" :href "./blog/"}
    {:label "Cloud" :href "#cloud"}])
 
@@ -786,6 +792,27 @@
           [:p "Use the published security policy for vulnerabilities; do not disclose exploitable details in a public issue."]
           (external-link "https://github.com/kotoba-lang/kotoba-lang/security/policy" "Read security policy")))
    [:p (external-link "https://github.com/orgs/kotoba-lang/repositories" "Explore all public Kotoba repositories")]))
+
+(defn sponsor-section []
+  (dds/section
+   {:id "sponsor" :title "Fund the public boundary, without buying authority"}
+   [:p {:class "kot-lead"}
+    (if sponsorship-live?
+      "GitHub Sponsors is open for people and organizations that want to sustain Kotoba's public language, tooling, qualification, and evidence."
+      "The Kotoba GitHub Sponsors profile is being prepared. The project page is ready now and will expose a payment action only after GitHub approves the organization profile.")]
+   (dds/grid
+    {:min "18rem"}
+    (card (dds/chip-label (if sponsorship-live? "OPEN" "PREPARING"))
+          (dds/heading 3 "GitHub Sponsors" {:size "24"})
+          [:p (if sponsorship-live?
+                "Choose a one-time or monthly tier on GitHub. GitHub handles the payment and sponsorship management."
+                "No sponsorship payment can be made through kotoba-lang.org while the GitHub profile is not live.")]
+          [:p [:a {:class "kot-link" :href "./sponsor/"} "See sponsorship status and principles"]])
+    (card (dds/chip-label "NO PURCHASE")
+          (dds/heading 3 "Support is not authority" {:size "24"})
+          [:p "Sponsorship does not buy a feature, roadmap priority, support SLA, private access, or a security exception."]))
+   (caption "Sponsorship status: " (str/upper-case (name (:status sponsorship)))
+            ". Checked " (:checked-at sponsorship) ".")))
 
 (defn blog-cloud-section []
   (dds/section
@@ -1430,6 +1457,7 @@
      (libraries-section)
      (roadmap-section)
      (community-section)
+     (sponsor-section)
      (blog-cloud-section)
      (proof-section)
      (architecture-section)
@@ -1718,6 +1746,88 @@
        "脆弱性報告は GitHub の private vulnerability reporting を使います。所在地、電話番号、登記番号は掲載していません。"]])]
    (footer :ja "./")])
 
+(defn sponsor-view [locale]
+  (let [ja? (= locale :ja)
+        root (if ja? "../../" "../")
+        uses (:use-of-funds sponsorship)
+        non-exchange (:non-exchange sponsorship)]
+    [:div
+     [:a {:class "kot-skip" :href "#main"} (if ja? "本文へ移動" "Skip to content")]
+     (header root)
+     [:main {:id "main"}
+      (dds/container
+       [:section {:id "top" :class "kot-hero"}
+        [:p {:class "kot-eyebrow"}
+         (if sponsorship-live? "GITHUB SPONSORS" "GITHUB SPONSORS · PREPARING")]
+        (dds/heading 1
+                     (if ja? "Kotoba の公開基盤を支える" "Sustain Kotoba's public foundation")
+                     {:size "48"})
+        [:p {:class "kot-lead"}
+         (if ja?
+           (if sponsorship-live?
+             "GitHub Sponsors で、Kotoba の言語仕様、ツール、検証、公開 evidence を継続的に支援できます。"
+             "Kotoba organization の GitHub Sponsors profile は準備中です。GitHub の承認前に、このサイトが支払いを受け付けることはありません。")
+           (if sponsorship-live?
+             "Use GitHub Sponsors to sustain Kotoba's language contract, tooling, qualification, and public evidence."
+             "The Kotoba organization profile is being prepared. This site will not present a payment action before GitHub approves it."))]
+        [:div {:class "kot-actions"}
+         (if sponsorship-live?
+           (dds/button (if ja? "GitHub Sponsors で支援" "Sponsor on GitHub")
+                       {:href sponsor-profile-url :size "lg"})
+           (dds/button (if ja? "GitHub で準備状況を見る" "Follow the launch on GitHub")
+                       {:href "https://github.com/kotoba-lang/kotoba-lang" :size "lg"}))
+         (dds/button (if ja? "English" "日本語")
+                     {:href (if ja? "../../sponsor/" "../ja/sponsor/")
+                      :type :outline :size "lg"})
+         (dds/button (if ja? "機械可読 status" "Machine-readable status")
+                     {:href (str root "sponsorship.edn")
+                      :type :outline :size "lg"})]]
+
+       (dds/section
+        {:id "flow" :title (if ja? "支援の流れ" "How sponsorship works")}
+        (dds/grid
+         {:min "16rem"}
+         (card (dds/chip-label "1")
+               (dds/heading 3 (if ja? "使途と原則を確認" "Review the purpose") {:size "20"})
+               [:p (if ja?
+                     "支援対象と、支援によって購入できないものをこのページで確認します。"
+                     "Read what funding sustains and what sponsorship cannot purchase.")])
+         (card (dds/chip-label "2")
+               (dds/heading 3 (if ja? "GitHub で tier を選択" "Choose a tier on GitHub") {:size "20"})
+               [:p (if ja?
+                     "profile 公開後、GitHub で単発または月次の tier を選択します。"
+                     "After the profile is live, choose a one-time or monthly tier on GitHub.")])
+         (card (dds/chip-label "3")
+               (dds/heading 3 (if ja? "GitHub で管理" "Manage it on GitHub") {:size "20"})
+               [:p (if ja?
+                     "支払い、領収、変更、停止は GitHub の sponsorship 画面で管理します。"
+                     "GitHub handles payment, receipts, changes, and cancellation.")]))
+        (caption (if ja?
+                   (str "現在の状態: " (str/upper-case (name (:status sponsorship))) "。確認日: " (:checked-at sponsorship) "。")
+                   (str "Current status: " (str/upper-case (name (:status sponsorship))) ". Checked " (:checked-at sponsorship) "."))))
+
+       (dds/section
+        {:id "funds" :title (if ja? "支援で継続するもの" "What funding sustains")}
+        (bullets (if ja?
+                   ["言語 contract、documentation、conformance fixture"
+                    "compiler、CLI、provider qualification"
+                    "再現可能 release、security review、公開 evidence"]
+                   uses)))
+
+       (dds/section
+        {:id "boundary" :title (if ja? "支援と購入を分ける" "Sponsorship is not a purchase")}
+        (bullets (if ja?
+                   ["支援は feature、roadmap priority、support SLA、security exception を購入するものではありません。"
+                    "公開 roadmap は方向性であり、納期や提供を約束するものではありません。"]
+                   non-exchange))
+        [:p (if ja?
+              "支払いを伴わない参加は、issue、documentation、code contribution から始められます。"
+              "Participation without payment starts with issues, documentation, and code contributions.")]
+        [:p (external-link "https://github.com/orgs/kotoba-lang/repositories"
+                           (if ja? "公開 repository を見る" "Explore public repositories"))])
+       )]
+     (footer locale "../legal/")]))
+
 (defn- favicon-link []
   [:link {:rel "icon" :type "image/png" :href "/kotoba-favicon.png"}])
 
@@ -1824,6 +1934,32 @@
                          "公開運営者は Kotoba Labs Inc.。連絡先: support@kotoba-lang.org。"))}
    (legal-ja-view)))
 
+(def sponsor-html
+  (page/->page
+   {:title "Sponsor Kotoba — GitHub Sponsors"
+    :description "Sustain Kotoba's public language contracts, tooling, qualification, and evidence through GitHub Sponsors."
+    :lang "en"
+    :css dds-css
+    :app-css (str tokens/skin-css "\n" app-css)
+    :head (list (favicon-link)
+                (apple-touch-icon-link)
+                (og-head "/sponsor/" "Sponsor Kotoba — GitHub Sponsors"
+                         "Sustain Kotoba's public language contracts, tooling, qualification, and evidence."))}
+   (sponsor-view :en)))
+
+(def sponsor-ja-html
+  (page/->page
+   {:title "Kotoba を支援 — GitHub Sponsors"
+    :description "GitHub Sponsors で Kotoba の公開言語仕様、ツール、検証、evidence を継続的に支援します。"
+    :lang "ja"
+    :css dds-css
+    :app-css (str tokens/skin-css "\n" app-css)
+    :head (list (favicon-link)
+                (apple-touch-icon-link)
+                (og-head "/ja/sponsor/" "Kotoba を支援 — GitHub Sponsors"
+                         "Kotoba の公開言語仕様、ツール、検証、evidence を継続的に支援します。"))}
+   (sponsor-view :ja)))
+
 (let [out (path/join "site" "dist")]
   (fs/mkdirSync out #js {:recursive true})
   (fs/writeFileSync (path/join out "index.html") html)
@@ -1837,6 +1973,12 @@
   (fs/writeFileSync (path/join out "legal" "index.html") legal-html)
   (fs/mkdirSync (path/join out "ja" "legal") #js {:recursive true})
   (fs/writeFileSync (path/join out "ja" "legal" "index.html") legal-ja-html)
+  (fs/mkdirSync (path/join out "sponsor") #js {:recursive true})
+  (fs/writeFileSync (path/join out "sponsor" "index.html") sponsor-html)
+  (fs/mkdirSync (path/join out "ja" "sponsor") #js {:recursive true})
+  (fs/writeFileSync (path/join out "ja" "sponsor" "index.html") sponsor-ja-html)
+  (fs/copyFileSync (path/join "site" "sponsorship.edn")
+                   (path/join out "sponsorship.edn"))
   (fs/copyFileSync logo-source-path (path/join out "kotoba-wordmark.png"))
   (fs/copyFileSync og-card-source-path (path/join out "kotoba-og-card.png"))
   (fs/copyFileSync favicon-source-path (path/join out "kotoba-favicon.png"))
