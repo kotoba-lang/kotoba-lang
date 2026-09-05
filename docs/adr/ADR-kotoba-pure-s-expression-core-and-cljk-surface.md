@@ -114,3 +114,51 @@ Kotoba adopts a **two-tier syntax and source specialization model**:
 - The language documentation, specification files, and grammar authorities
   distinguish `.cljk` (Clojure-friendly desugared surface) from `.kotoba`
   (canonical pure S-expression core).
+
+
+## Addendum — measured grammar state (2026-09-05)
+
+This addendum records where the pure S-expression core actually stands,
+measured, so the decision above is not read as an implementation claim.
+
+**What is measured (guest-grammar.edn, the source-surface authority):**
+
+- The admitted `:core-special-forms` for `.kotoba` today are
+  `ns def defn defprotocol definterface defrecord extend-type extend-protocol
+  let if do main` — the clojure-shaped core. `defn` is a core special form,
+  not a desugar.
+- `lam`, `app`, `rel`, `query`, `perform`, `handle` appear in **no** admitted
+  head set of the grammar authority. The pure core form set of this ADR is
+  decided but **not implemented** in the source surface.
+- `:sugar` (`->`, `and`, `when`, `loop/recur`, …) is admitted in source and
+  must desugar before emit — this is the bounded-sugar part of the surface,
+  and it is enforced.
+
+**What `:canonical? true` means today:** in
+`kotoba/lang/source_contract.edn` the `.kotoba` kind carries
+`:canonical? true` and `:reader-target :kotoba`. This makes `.kotoba` the
+canonical *text format* (EDN, one admitted reader target). It does **not**
+mean the pure form set of this ADR is the admitted grammar. Everything that
+runs today — `kbb`, the compiler, `amu` — consumes clojure-shaped `.kotoba`.
+
+**Every kbb ops script written under ADR-2607181900's readiness gate** (for
+example `src/demo_kbb_proc_exec.kotoba` in kotoba-lang/kotoba) uses
+`(ns …) (defn main [] (let …))` and is admitted exactly because the
+clojure-shaped core is what the grammar authority admits.
+
+**Path to the pure core** (unchanged decision, honest sequence):
+
+1. Extend the grammar authority with the pure head set as *additional
+   admitted source forms* that desugar to the existing primitives — same
+   discipline as every sugar entry (`:desugars-to`, bounded error lattice,
+   measured per backend).
+2. Land the elaboration so `.cljk` and pure `.kotoba` mint identical
+   Definition CIDs for equivalent normalized semantics (this ADR §3).
+3. Only then flip `q9-migration.edn :kotoba-only` from an aspirational
+   profile (requires `:q1-q8-profile`, not yet satisfied) to the enforced
+   admission profile. The `:dispositions` table already records these
+   requirements; nothing else needs to change when the gate is met.
+
+Until step 3, writing pure-`.kotoba` code is not possible and the
+`.kotoba` files in the fleet are clojure-shaped by authority, not by
+oversight.
