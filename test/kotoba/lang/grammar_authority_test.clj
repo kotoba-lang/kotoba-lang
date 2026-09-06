@@ -589,6 +589,89 @@
           (str h " has no primitive to desugar onto and must not be admitted "
                "by the authority ahead of one")))))
 
+(deftest the-pure-ref-spelling-collision-is-recorded-on-both-sides
+  ;; `ref` is ADR-544's definition reference AND Clojure's STM constructor,
+  ;; which `:no-ambient-mutation` forbids. The pure-head rewrite runs before
+  ;; `:forbidden-heads` is consulted, so for two kotoba-sema commits the
+  ;; security refusal was silently gone (`(let [r (ref n)] n)` was admitted).
+  ;;
+  ;; A reader arrives at this collision from either side: from the invariant,
+  ;; asking "is `ref` refused?", or from the pure core, asking "what does
+  ;; `(ref x)` do?". Both must say the same thing, so this holds the two
+  ;; records to each other rather than trusting a comment on one of them.
+  (let [surface (auth/read-edn auth/surface-path)
+        grammar (auth/read-edn auth/grammar-path)
+        invariant (get-in surface [:invariants :no-ambient-mutation])
+        collision (:spelling-collision invariant)
+        pure (get-in surface [:other-gaps :pure-s-expression-core])
+        forbidden (into #{} (map symbol) (map name (:forbidden-heads grammar #{})))]
+    (is (some? collision)
+        "the invariant must record that `ref` has a second reading -- without
+         it, `:surface` and `:forbidden-heads` read as `(ref x)` is never
+         admitted, which stopped being true at kotoba-sema a2f86f87")
+    (is (= 'ref (:head collision)))
+    (is (contains? (set (:surface invariant)) 'ref)
+        "the STM reading is still forbidden and `ref` must stay in :surface")
+    (is (contains? forbidden 'ref)
+        "and in :forbidden-heads -- the narrowing admits a different head that
+         shares a spelling, it does not widen this constraint")
+    (is (not (contains? (set (:admitted-via-elaboration invariant)) 'ref))
+        "`ref` is NOT admitted via the local-state elaboration; putting it in
+         that set would subtract it from the required-forbidden set and say
+         the STM reading had been let in")
+    (is (contains? (set (:operations pure)) 'ref)
+        "and the pure core must claim it, or the collision record describes
+         an admission nothing makes")
+    ;; The fail-closed half. These five are what make the collision
+    ;; containable: the spelling is admitted for definitions, and nothing can
+    ;; be DONE with an STM-shaped ref.
+    (is (= '#{deref dosync alter commute ref-set}
+           (set (get-in collision [:fail-closed :refused])))
+        (pr-str (get-in collision [:fail-closed :refused])))
+    (is (string? (:pinned-by collision))
+        "a fail-closed claim with no test named is a sentence, not a gate")))
+
+(deftest no-pure-head-collides-with-a-security-surface-unrecorded
+  ;; The generalisation of the `ref` bug. A pure head that shares a spelling
+  ;; with a forbidden one takes that refusal away silently, because the
+  ;; pure-head rewrite runs BEFORE `:forbidden-heads` is consulted -- the
+  ;; frontend never sees the head at all. Nothing would have said so; `ref`
+  ;; was found by reading, not by a check.
+  ;;
+  ;; So: every pure head that also appears in a security surface must carry a
+  ;; `:spelling-collision` record. Measured 2026-09-06, `ref` is the only one
+  ;; -- but "only one today" is exactly the claim that goes stale, and the
+  ;; cost of the next one is a security constraint that stops firing.
+  (let [surface (auth/read-edn auth/surface-path)
+        grammar (auth/read-edn auth/grammar-path)
+        pure-heads '#{lam app ref perform handle rel query}
+        forbidden (into #{} (map symbol) (map name (:forbidden-heads grammar #{})))
+        security-surfaces
+        (into {}
+              (keep (fn [[k v]]
+                      (when (= :intentional-security-constraint (:disposition v))
+                        (let [hit (set (filter pure-heads
+                                               (map (comp symbol name) (:surface v #{}))))]
+                          (when (seq hit) [k hit])))))
+              (:invariants surface {}))
+        recorded (into #{}
+                       (keep (fn [[_ v]] (get-in v [:spelling-collision :head])))
+                       (:invariants surface {}))
+        colliding (into (set (mapcat val security-surfaces))
+                        (filter pure-heads forbidden))]
+    (is (pos? (count pure-heads)) "the head set is empty; this measured nothing")
+    (is (empty? (set/difference colliding recorded))
+        (str "pure head(s) share a spelling with a forbidden or security-"
+             "constrained head and no invariant records the collision: "
+             (pr-str (set/difference colliding recorded))
+             ". The pure-head rewrite runs before :forbidden-heads, so this "
+             "is a refusal that has silently stopped firing -- add a "
+             ":spelling-collision record naming the admitted shape, what "
+             "everything else refuses with, and the fail-closed evidence."))
+    (is (empty? (set/difference recorded colliding))
+        (str "a :spelling-collision is recorded for a head that no longer "
+             "collides -- delete it: " (pr-str (set/difference recorded colliding))))))
+
 (deftest the-surface-status-record-of-the-pure-core-matches-this-authority
   ;; The frontend/authority drift above is recorded in surface-status so a
   ;; reader finds it without running the compiler. This test keeps the two
