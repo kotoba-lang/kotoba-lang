@@ -86,9 +86,30 @@
     ;; three of them BY ELABORATION. The state kit itself has not moved: its
     ;; four preconditions are unchanged above, and the three heads below have
     ;; no host, no grant and no desugar. So the question this splits into two.
+    ;; `ref` was in this list until 2026-09-06 and is deliberately not any
+    ;; more. It left `:forbidden-heads` because ADR-544's pure definition
+    ;; reference shares its spelling and a head cannot be both admitted and
+    ;; forbidden -- NOT because the state kit moved. Using its membership as
+    ;; evidence for a claim about the state kit was a proxy, and the proxy
+    ;; broke for an unrelated reason; `volatile!` and `dosync` are state-kit
+    ;; heads with no second reading, so they carry the claim on their own.
+    ;;
+    ;; The second assertion is what stops this from being a weaker test: a
+    ;; state-kit head may leave `:forbidden-heads` ONLY through a recorded
+    ;; excusal, so removing `dosync` tomorrow still goes red.
     (let [grammar (edn/read-string (slurp "lang/guest-grammar.edn"))
-          forbidden (set (:forbidden-heads grammar))]
-      (is (every? forbidden '#{volatile! ref dosync}))))
+          forbidden (set (:forbidden-heads grammar))
+          e (entry :no-ambient-mutation)
+          excused (into (set (:admitted-via-elaboration e))
+                        (set (:admitted-via-pure-core-elaboration e)))]
+      (is (every? forbidden '#{volatile! dosync}))
+      (is (not-any? excused '#{volatile! dosync})
+          "a state-kit head is recorded as admitted via elaboration -- that is
+           the state-kit widening landing, and this test says it has not")
+      (is (contains? excused 'ref)
+          "`ref` is out of :forbidden-heads and must be accounted for by an
+           excusal; if it is not, a security head has gone missing rather
+           than moved")))
   (testing "the LOCAL ATOM widening has (slice 1): its heads left forbidden-heads and are sugar"
     (let [grammar (edn/read-string (slurp "lang/guest-grammar.edn"))
           forbidden (set (:forbidden-heads grammar))

@@ -1,9 +1,16 @@
 # ADR - Kotoba package references, CID locks, and capability-safe dependencies
 
-- **Status**: Accepted — contract implemented through M4 (M5/M6 remain, see Maturity)
+- **Status**: Accepted — contract implemented through M5 (M6 remains, see Maturity)
 - **Date**: 2026-06-30
-- **Artifacts**: `lang/package.edn`, `examples/package-manifest.edn`, `examples/kotoba.lock.edn`
+- **Artifacts**: `lang/package-conformance/`, `examples/package-manifest.edn`,
+  `examples/kotoba.lock.edn`, and — since M5 — `kotoba.compiler.nbb.package-lock`
+  / `kotoba.compiler.nbb.package-authoring` in `kotoba-lang/amu`
 - **Related**: `ADR-kotoba-lang-foundational-stdlib.md`, `ADR-safe-capability-language.md`, `ADR-kotoba-rad-git-sovereign-repo.md`
+- **Not a mirror**: `kotoba-lang/kotoba` carries a file of the same name
+  under `docs/`. It is a DIVERGENT older document (308 diff lines as of
+  2026-09-06), not a copy of this one, and its status line makes a
+  different claim. This file is the contract; that one has not been
+  reconciled.
 
 ## Context
 
@@ -177,17 +184,60 @@ the caller policy grant it.
 ## Maturity
 
 - `M0` ✅: this ADR.
-- `M1` ✅: `lang/package.edn` machine-readable contract.
+- `M1` ✅: machine-readable contract. NOTE: this line named `lang/package.edn`
+  until 2026-09-06 and that file does not exist. The contract is
+  `kotoba.lang.package-contract` in `kotoba-lang/kotoba-core-contracts`, with
+  the case manifest at `lang/package-conformance/manifest.edn`.
 - `M2` ✅: positive package manifest and lockfile examples
   (`lang/package-conformance/positive/`).
 - `M3` ✅: negative fixtures for missing CID, bad signature, bad repo RID, and
   excessive capability grant (`lang/package-conformance/negative/`).
-- `M4` ✅: manifest-driven package contract runner
-  (`scripts/check-package-contract.bb`, confirmed passing against all
-  positive/negative fixtures).
-- `M5` ⬜: `kotoba-lang/registry` or `kotoba-cli` consumes the same suite —
-  `registry` is still `:status :planned` (deferred to the `:packages`
-  CID-lock track, see `docs/lang/coverage.edn` `:stdlib :engineering-gaps`).
+- `M4` ✅: manifest-driven package contract runner. NOTE: this line named
+  `scripts/check-package-contract.bb` until 2026-09-06. That file was a
+  hand-maintained SECOND implementation of the validator, on a script host
+  ADR-2607173000 had retired, and it had already drifted -- the
+  invalid-definition-cid rule landed and the copy kept accepting the case. It
+  was removed; `test/run_portable.cljs` runs the corpus through the real
+  validator, on Node, and `clojure -M:test` runs it on the JVM.
+- `M5` ✅ (2026-09-06): `kotoba-lang/amu` produces and consumes a lock.
+
+      amu package-fetch   --deps kotoba.deps.edn --packages <dir>
+      amu package-manifest <root> --name … --version … --url … --key key.edn
+      amu package-lock    --deps kotoba.deps.edn --packages <dir>
+      amu check|compile|module-lock <entry> --source-path … \
+          --package-lock kotoba.lock.edn --packages <dir> [--trust trust.edn]
+
+  A package lock resolves to source roots; the module lock (`module_lock.cljs`)
+  then pins every module by CID. They compose rather than compete:
+  `kotoba.lock.edn` answers WHO and WHAT MAY IT DO, `kotoba.modules.edn`
+  answers WHICH BYTES. `--package-lock` and `--module-lock` are mutually
+  exclusive.
+
+  Five checks bind a materialised tree to its lock entry — commit, tree CID,
+  manifest signature, manifest integrity, and definition CIDs — and each was
+  broken on its own to see it refuse with its own message. `:dep/definition-cids`
+  is optional in the contract and REQUIRED by amu: without it nothing checks the
+  tree against the lock.
+
+  Two things had to move first, both stale implementation state rather than
+  design. `signatures-error` verified only under `:clj` (its docstring's reason
+  — no portable Ed25519 verifier in the dependency graph — was true when
+  written and false by 2026-09-06), and `manifest-integrity-error` lived in
+  `kotoba.security.package-admission`, which is `.clj`. Both are portable now;
+  `package-admission` delegates. Neither was a hole — valid signatures were
+  rejected — but together they made a lock unconsumable off the JVM.
+
+  Whole flow measured with `clojure` and `java` on PATH replaced by scripts
+  that announce themselves and exit 99: fetch → manifest → lock → check →
+  compile, zero invocations, and the pinned build byte-identical to the
+  unpinned one.
+
+  `kotoba-lang/registry` remains `:status :planned`. M5 asked for `registry`
+  OR a CLI; the CLI is what landed. Nothing consumes a lock in production yet:
+  M5 is the consumer existing, and adoption is separate.
+
+  Detail and the defects this turned up: `com-junkawasaki/root`
+  `90-docs/adr/2609062200-kotoba-package-lock-m5-consumer.edn`.
 - `M6` ⬜: signing, revocation, and package compatibility policy — the
   contract *validates* signature/revocation shape (rejects unsigned,
   bad-alg, revoked, and expired-signer entries), but real key lifecycle,

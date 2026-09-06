@@ -165,15 +165,19 @@ because the synthetic binder introduced for the beta-redex is not the author's
 `g`. Identical CIDs need alpha-normalisation, which is step 2 below. **Do not
 read the matching wasm bytes as evidence for the CID claim.**
 
-**`rel`, `query` and `handle` are not "unfinished", they are unspecified.**
-Step 1's discipline is "admit as additional source forms that desugar to the
-existing primitives". These three have no existing primitive to desugar onto:
-`rel`/`query` need a relational value model this compiler does not have
-(`kgraph-get` is not `query`, and calling it that would decide a semantics no
-ADR has decided), and `handle` needs an effect handler — the abort ability's
-`try`/`catch` (`lang/abort-ability.edn`) lowers one `[:result T E]` and does
-not resume. A head with no primitive cannot be desugared to existing
-primitives, so it waits for a decision rather than for an implementation.
+**`rel`, `query` and `handle` are not "unfinished", they are unspecified —
+and they are unspecified in three different ways.** Measured 2026-09-06
+against kotoba-sema `e90dd5ea`:
+
+| head | blocker | what exists |
+|---|---|---|
+| `rel` | **undecided semantics**, not a missing primitive | `kgraph-assert!` (arity 3, all-integer EAVT store) is admitted with an **empty effect row**, and `(do (kgraph-assert! 1 2 42) (kgraph-get 1 2))` answers 42. A `rel` head could desugar onto it today. What nobody has decided is whether ADR-544's `rel` *is* the kgraph — binding a pure-core head to one specific store is a language commitment, not a lowering. The `!` in the primitive's own name also says its authors thought it wrote something the effect row does not show. |
+| `query` | **missing primitive** | `kgraph-get` is a point lookup: one value, and `i64 MIN` for an absent key. A relational `query` needs pattern variables and more than one result, and nothing produces either. `kgraph-count` + `kgraph-entity-at` let a guest *iterate*, so a pattern query is something one could **write** — which is the open question, primitive or stdlib. The sentinel return is also the first thing `pure-product-profile.edn` `:forbidden-patterns` names. |
+| `handle` | **undecided authority**, not a missing primitive | `handle` is the other half of `perform`, and `perform` lowers to `cap-call`, whose answer comes from the **host**. A guest `handle` would let a guest intercept its own capability calls — it changes *who answers an effect*, which is a security decision. `try`/`catch` is not it: that lowers one `[:result T E]` and does not resume. |
+
+An earlier revision of this addendum gave one reason for all three ("no
+existing primitive to desugar onto"). For `rel` that was measurably too
+strong.
 
 **What `:canonical? true` means today:** in
 `kotoba/lang/source_contract.edn` the `.kotoba` kind carries
