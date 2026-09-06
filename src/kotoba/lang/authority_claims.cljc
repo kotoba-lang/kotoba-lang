@@ -296,7 +296,8 @@
 
    {:heads #{"lam" "app" "perform"}
     :as-of "2026-09-06"
-    :claimed-by [:surface-status :other-gaps :pure-s-expression-core :operations]
+    :claimed-by [:surface-status :other-gaps :pure-s-expression-core :operations
+                 :guest-grammar :sugar :pure-s-expression-core :forms]
     :reason
     "The other direction this file's docstring names: an arm this pin cannot
      see. ADR-544 step 1 lowers `lam` and `app` (kotoba-sema 9a23bbc) and
@@ -310,6 +311,11 @@
      compile and run:
      `(app (ref inc1) n)` produces the same :hir-sha256, :kir-sha256 and
      wasm32 bytes as `(inc1 n)`.
+
+     Both authorities claim them since the 2026-09-06 grammar wave; before
+     it only surface-status did. Which one claims a head does not change what
+     this probe measures -- it runs the frontend -- so the group is the same
+     three either way.
 
      `ref` is deliberately NOT in this group, and the reason is worth
      recording. Under the pinned frontend `(ref x)` is refused
