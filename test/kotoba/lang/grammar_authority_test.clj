@@ -351,7 +351,7 @@
   :predicates gains string-index-of, string-contains? and string-split-count
   (kbb scripts-port wave 2; the compiler and KIR already implemented the
   latter two, and kotoba.runtime gains the CLJ interpreter bindings)."
-  "3e41eb84a57a1fcc84dc0ec0b6a5ec1fd535c39e2cf6cfc14418fc1ec4567483")
+  "f0a1de925e5b6a616691f2bd1d62ebf41fb92e4cc8c5569f75e729f9f54762f7")
 
 (defn- sha256-hex [^bytes bs]
   (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") bs)]
@@ -555,20 +555,18 @@
 
 (deftest pure-s-expression-core-heads-are-not-yet-admitted
   ;; ADR-544 (pure S-expression core + cljk surface) step 1 admits the pure
-  ;; head set (lam app rel query perform handle ref) as desugaring source
-  ;; forms. Measured today (q9-migration.edn :pure-heads-admitted false),
-  ;; NONE are admitted by the grammar authority -- writing pure-`.kotoba`
-  ;; source is not possible, and the running `.kotoba` files are clojure-
-  ;; shaped by authority, not by oversight.
-  ;;
-  ;; This test is the machine-checkable RED for step 1: it must FAIL (flip
-  ;; to asserting admitted) the moment lam/app/rel/query/perform/handle/ref
-  ;; become admitted source heads. Do NOT delete it when starting step 1 --
-  ;; edit the assertion to GREEN as part of landing the grammar change.
+  ;; head set as desugaring source forms. Slice 1 (kotoba-sema #54 + this
+  ;; grammar entry) admits `lam` and `app`; `rel query perform handle` still
+  ;; have no lowering and `ref` stays forbidden. This test pins the CURRENT
+  ;; boundary: the two landed heads are admitted, the rest are not. As each
+  ;; later slice lands a remaining head, move it from `not-yet` to `landed`.
   (let [grammar (auth/read-edn auth/grammar-path)
         admitted (:all (auth/admitted-source-forms grammar))
-        pure-heads '[lam app rel query perform handle ref]]
-    (doseq [h pure-heads]
+        landed '[lam app]
+        not-yet '[rel query perform handle ref]]
+    (doseq [h landed]
+      (is (contains? admitted h)
+          (str h " should be admitted -- pure-head slice 1 landed lam/app")))
+    (doseq [h not-yet]
       (is (not (contains? admitted h))
-          (str h " should NOT be admitted yet -- ADR-544 step 1 must flip "
-               "this to a contains? assertion when the pure head lands")))))
+          (str h " should NOT be admitted yet -- later pure-head slice must flip")))))
