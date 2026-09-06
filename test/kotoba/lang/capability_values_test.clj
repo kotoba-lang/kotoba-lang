@@ -267,3 +267,20 @@
   (testing "data/edn (capability id 260) has a real effect row (kbb gate item ④)"
     (is (contains? caps/effect-for-kind :host/data-edn))
     (is (= :host/data-edn (get caps/effect-for-kind :host/data-edn)))))
+
+(deftest llm-infer-effect-row-test
+  (testing "llm/infer (capability id 225) has a real effect row"
+    (is (contains? caps/effect-for-kind :host/llm-infer))
+    (is (= :host/llm-infer (get caps/effect-for-kind :host/llm-infer))))
+  (testing "a granted :host/llm-infer request is NOT denied as :unsupported-kind --
+            the whole point of registering the kind. kotoba.runtime/op->kind maps
+            the `llm-infer` host import to it, and kotoba.wasm-exec's real provider
+            guard-calls it; without this entry every such call failed closed at RUN
+            time with :kotoba.host/denied :unsupported-kind while every compile-time
+            capability test stayed green (the gate never consults effect-for-kind)."
+    (is (not= {:denied :unsupported-kind}
+              (caps/intersect-grants
+               {:requested (caps/make-cap :host/llm-infer :any)
+                :cacao-grants [(grant :host/llm-infer #{:any} nil "g-llm")]
+                :local-policy {:policy/allow {:host/llm-infer #{:any}}}
+                :now now})))))
