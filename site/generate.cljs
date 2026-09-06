@@ -1090,6 +1090,21 @@
                      " comparator/workload pairs by at least 5%, separated from the arms' "
                      "own spread. The bounded fastest claim needs every pair, so it stays "
                      "unqualified — the count is the informative half.")]
+            ;; The score is a measurement, not a constant. Four runs of one
+            ;; commit scored 19, 19, 15, 19 (2026-09-06), because a single
+            ;; outlier sample in one arm can trip perfgate's noise rule for
+            ;; several pairs at once. Publishing the bare median would repeat
+            ;; the overstatement this card used to make.
+            (when-let [runs (:runs runtime-score)]
+              (when (> runs 1)
+                [:p (str "Median of " runs " host-qualified runs; the score ranged "
+                         (first (:observedRange runtime-score)) "–"
+                         (last (:observedRange runtime-score))
+                         " and " (:stableQualifiedPairs runtime-score) " of the "
+                         (:totalPairs runtime-score)
+                         " pairs qualified in every one. A single noisy sample can "
+                         "disqualify several pairs at once, so a one-run score is "
+                         "not precise to one pair.")]))
             (caption (str "busy-CPU " (str/join " → " (map #(.toFixed (:busyCpuFraction %) 3)
                                                            (:quietGateSamples speed)))
                           " · required ≤ 0.10 · " runtime-date)))
@@ -1144,7 +1159,14 @@
                           (str (when (pos? pct) "+") (.toFixed pct 1) "%"
                                (when (:qualified pair) " ✓"))))))})]
      (caption (str (:qualifiedPairs runtime-score) " of " (:totalPairs runtime-score)
-                   " pairs qualified · candidate "
+                   " pairs qualified"
+                   (if-let [runs (:runs runtime-score)]
+                     (if (> runs 1)
+                       (str " (median of " runs "; " (:stableQualifiedPairs runtime-score)
+                            " in every run)")
+                       " (one run)")
+                     "")
+                   " · candidate "
                    (subs (:compilerCommit runtime-benchmark) 0 12)
                    " · " (:host runtime-benchmark)))
      (dds/heading 3 "Optimization delivery after the published run" {:size "24"})
