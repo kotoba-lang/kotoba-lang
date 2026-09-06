@@ -292,7 +292,37 @@
     :closes-when
     "`string=` is corrected to `string=?` in both `:predicates` and
      `:portable-value-model :operations`, and the three predicates are either
-     lowered or moved to a `:not-yet-implemented` disposition."}])
+     lowered or moved to a `:not-yet-implemented` disposition."}
+
+   {:heads #{"lam" "app" "perform"}
+    :as-of "2026-09-06"
+    :claimed-by [:surface-status :other-gaps :pure-s-expression-core :operations]
+    :reason
+    "The other direction this file's docstring names: an arm this pin cannot
+     see. ADR-544 step 1 lowers `lam` and `app` (kotoba-sema 9a23bbc) and
+     `ref` and `perform` (kotoba-sema fcd4e35, merged to sema main as
+     a2f86f87); the `:test` alias pins 7e277da6, older than
+     both, so the probe measures a frontend where the heads genuinely are
+     absent and is right to say so. Advancing that pin carries 30-odd
+     unrelated sema commits into a suite that already has 772 standing
+     errors, so it is its own change with its own measurement and not this
+     one. Measured 2026-09-06 against kotoba-sema fcd4e35 directly, all four
+     compile and run:
+     `(app (ref inc1) n)` produces the same :hir-sha256, :kir-sha256 and
+     wasm32 bytes as `(inc1 n)`.
+
+     `ref` is deliberately NOT in this group, and the reason is worth
+     recording. Under the pinned frontend `(ref x)` is refused
+     `dynamic loading, interop, mutation, and metaprogramming are forbidden`
+     -- a different answer from the negative control's, so this probe already
+     counts it as an arm. It is a false negative of the probe (a head refused
+     as ambient is not a head with a lowering), and it converges to the right
+     answer once the pin moves, so listing it here would record a gap that
+     does not exist."
+    :closes-when
+    "the `:test` alias pins a kotoba-sema at or after a2f86f87. Then
+     `a-recorded-exception-must-still-be-a-gap` goes red naming these three,
+     and the fix for that red is to delete this group."}])
 
 (defn exceptions-by-head []
   (into {} (for [g stale-claim-exceptions, h (:heads g)] [h (dissoc g :heads)])))

@@ -116,49 +116,98 @@ Kotoba adopts a **two-tier syntax and source specialization model**:
   (canonical pure S-expression core).
 
 
-## Addendum — measured grammar state (2026-09-05)
+## Addendum — measured state (2026-09-06, supersedes the 2026-09-05 addendum)
 
 This addendum records where the pure S-expression core actually stands,
 measured, so the decision above is not read as an implementation claim.
+It replaces the 2026-09-05 addendum, which said the pure core was decided but
+not implemented anywhere; part of it is now implemented.
 
-**What is measured (guest-grammar.edn, the source-surface authority):**
+**Two authorities answer "is a pure head admitted", and they do not agree.**
 
-- The admitted `:core-special-forms` for `.kotoba` today are
-  `ns def defn defprotocol definterface defrecord extend-type extend-protocol
-  let if do main` — the clojure-shaped core. `defn` is a core special form,
-  not a desugar.
-- `lam`, `app`, `rel`, `query`, `perform`, `handle` appear in **no** admitted
-  head set of the grammar authority. The pure core form set of this ADR is
-  decided but **not implemented** in the source surface.
-- `:sugar` (`->`, `and`, `when`, `loop/recur`, …) is admitted in source and
-  must desugar before emit — this is the bounded-sugar part of the surface,
-  and it is enforced.
+| head | frontend (kotoba-sema) | grammar authority (`lang/guest-grammar.edn`) |
+|---|---|---|
+| `lam` | admitted — `(lam [params] body)` → `(fn [params] body)` | not admitted |
+| `app` | admitted — `(app f a…)` → `(f a…)` | not admitted |
+| `ref` | admitted — `(ref name)` → `name` | not admitted |
+| `perform` | admitted — `(perform :kind/op v…)` → `(cap-call :kind/op v…)` | not admitted |
+| `rel` | refused, no lowering | not admitted |
+| `query` | refused, no lowering | not admitted |
+| `handle` | refused, no lowering | not admitted |
+
+Measured 2026-09-06 against kotoba-sema `fcd4e35` (slice 2, on `9a23bbc`
+slice 1), with `kotoba.sema/analyze` + `kotoba.kir/execute` for the KIR
+reading and `amu compile --target wasm32 --jvm-free` — this frontend shadowing
+amu `origin/main` `1e5b7b8f`'s pin — for the wasm32 reading, the artifact
+executed under `runtime/browser-host.mjs`.
+
+**What the four admitted heads cost the backends: nothing.**
+
+```
+(defn run [n :i64] :i64 (app (ref inc1) n))
+(defn run [n :i64] :i64 (inc1 n))
+   -> identical :hir-sha256, identical :kir-sha256, identical wasm32 bytes
+```
+
+**What they do not yet buy: identical Definition CIDs.** §3 of this ADR says
+both surfaces mint the same Definition CID for equivalent normalized
+semantics. Step 1 does not deliver that:
+
+```
+pure  (app (ref inc1) (app (lam [x] (+ x 1)) n))
+twin  (inc1 (let [g (fn [x] (+ x 1))] (g n)))
+   -> same wasm32 sha256 (fda4cc37…), both answer run(1) = 3
+   -> DIFFERENT :hir-sha256 and :kir-sha256
+```
+
+The artifact matches because wasm carries no local names. The KIR differs
+because the synthetic binder introduced for the beta-redex is not the author's
+`g`. Identical CIDs need alpha-normalisation, which is step 2 below. **Do not
+read the matching wasm bytes as evidence for the CID claim.**
+
+**`rel`, `query` and `handle` are not "unfinished", they are unspecified.**
+Step 1's discipline is "admit as additional source forms that desugar to the
+existing primitives". These three have no existing primitive to desugar onto:
+`rel`/`query` need a relational value model this compiler does not have
+(`kgraph-get` is not `query`, and calling it that would decide a semantics no
+ADR has decided), and `handle` needs an effect handler — the abort ability's
+`try`/`catch` (`lang/abort-ability.edn`) lowers one `[:result T E]` and does
+not resume. A head with no primitive cannot be desugared to existing
+primitives, so it waits for a decision rather than for an implementation.
 
 **What `:canonical? true` means today:** in
 `kotoba/lang/source_contract.edn` the `.kotoba` kind carries
 `:canonical? true` and `:reader-target :kotoba`. This makes `.kotoba` the
 canonical *text format* (EDN, one admitted reader target). It does **not**
-mean the pure form set of this ADR is the admitted grammar. Everything that
-runs today — `kbb`, the compiler, `amu` — consumes clojure-shaped `.kotoba`.
-
-**Every kbb ops script written under ADR-2607181900's readiness gate** (for
-example `src/demo_kbb_proc_exec.kotoba` in kotoba-lang/kotoba) uses
-`(ns …) (defn main [] (let …))` and is admitted exactly because the
-clojure-shaped core is what the grammar authority admits.
+mean the pure form set of this ADR is the admitted grammar. The clojure-shaped
+core (`ns def defn defprotocol definterface defrecord extend-type
+extend-protocol let if do main`) is still what every consumer builds its
+admitted head set from, and every kbb ops script written under
+ADR-2607181900's readiness gate is clojure-shaped for that reason.
 
 **Path to the pure core** (unchanged decision, honest sequence):
 
 1. Extend the grammar authority with the pure head set as *additional
-   admitted source forms* that desugar to the existing primitives — same
-   discipline as every sugar entry (`:desugars-to`, bounded error lattice,
-   measured per backend).
+   admitted source forms* that desugar to the existing primitives.
+   **Half done.** The frontend lowers four of them; `lang/guest-grammar.edn`
+   admits none. Closing the gap is a resync wave, not an edit:
+   `lang/vendored-copies.edn` registers five copies of `guest-grammar.edn`
+   across four repositories, and until they move together a consumer reading
+   the authority rejects source the compiler accepts. The current state is
+   recorded in `lang/surface-status.edn` `:other-gaps
+   :pure-s-expression-core` and gated by
+   `grammar_authority_test/pure-s-expression-core-heads-are-not-yet-admitted`.
 2. Land the elaboration so `.cljk` and pure `.kotoba` mint identical
-   Definition CIDs for equivalent normalized semantics (this ADR §3).
+   Definition CIDs for equivalent normalized semantics (this ADR §3). The
+   beta-redex measurement above is the concrete first gap.
 3. Only then flip `q9-migration.edn :kotoba-only` from an aspirational
    profile (requires `:q1-q8-profile`, not yet satisfied) to the enforced
-   admission profile. The `:dispositions` table already records these
-   requirements; nothing else needs to change when the gate is met.
+   admission profile.
 
-Until step 3, writing pure-`.kotoba` code is not possible and the
-`.kotoba` files in the fleet are clojure-shaped by authority, not by
-oversight.
+Until step 3, a `.kotoba` file may use `lam`/`app`/`ref`/`perform` but cannot
+be written in the pure core alone, and the `.kotoba` files in the fleet are
+clojure-shaped by authority, not by oversight.
+
+**Admitting the heads broke nothing.** Across the 3,336 `.kotoba`/`.cljk`
+files in this workspace, none of the seven heads appears in operator position
+or as a `defn` name (measured 2026-09-06).

@@ -556,19 +556,63 @@
 (deftest pure-s-expression-core-heads-are-not-yet-admitted
   ;; ADR-544 (pure S-expression core + cljk surface) step 1 admits the pure
   ;; head set (lam app rel query perform handle ref) as desugaring source
-  ;; forms. Measured today (q9-migration.edn :pure-heads-admitted false),
-  ;; NONE are admitted by the grammar authority -- writing pure-`.kotoba`
-  ;; source is not possible, and the running `.kotoba` files are clojure-
-  ;; shaped by authority, not by oversight.
+  ;; forms. Step 1 has landed IN THE FRONTEND and not here: measured
+  ;; 2026-09-06 against kotoba-sema fcd4e35, `lam` `app` `ref` `perform`
+  ;; compile and run (`(app (ref inc1) n)` produces the same HIR, KIR and
+  ;; wasm32 bytes as `(inc1 n)`), while this authority admits none of the
+  ;; seven.
   ;;
-  ;; This test is the machine-checkable RED for step 1: it must FAIL (flip
-  ;; to asserting admitted) the moment lam/app/rel/query/perform/handle/ref
-  ;; become admitted source heads. Do NOT delete it when starting step 1 --
-  ;; edit the assertion to GREEN as part of landing the grammar change.
+  ;; That drift is the point of this test. `lang/guest-grammar.edn` has five
+  ;; vendored copies across four repositories (`lang/vendored-copies.edn`), so
+  ;; admitting the heads here is a resync wave rather than an edit -- and
+  ;; until it lands, a consumer that builds its admitted head set from this
+  ;; authority rejects source the compiler accepts.
+  ;;
+  ;; Do NOT delete this when the wave lands. Move the four into the admitted
+  ;; group below; the split is the assertion.
   (let [grammar (auth/read-edn auth/grammar-path)
         admitted (:all (auth/admitted-source-forms grammar))
-        pure-heads '[lam app rel query perform handle ref]]
-    (doseq [h pure-heads]
+        ;; Lowered by the frontend today; not yet in this authority.
+        frontend-admitted '[lam app ref perform]
+        ;; No existing primitive to desugar onto, so not admitted anywhere:
+        ;; `rel`/`query` need a relational value model, `handle` needs an
+        ;; effect handler (the abort ability's try/catch lowers a
+        ;; `[:result T E]`; it does not resume).
+        no-lowering-anywhere '[rel query handle]]
+    (doseq [h frontend-admitted]
       (is (not (contains? admitted h))
-          (str h " should NOT be admitted yet -- ADR-544 step 1 must flip "
-               "this to a contains? assertion when the pure head lands")))))
+          (str h " is admitted by the FRONTEND but not by this authority. If "
+               "this now fails, the guest-grammar resync wave landed -- move "
+               h " into the admitted group instead of deleting the test")))
+    (doseq [h no-lowering-anywhere]
+      (is (not (contains? admitted h))
+          (str h " has no primitive to desugar onto and must not be admitted "
+               "by the authority ahead of one")))))
+
+(deftest the-surface-status-record-of-the-pure-core-matches-this-authority
+  ;; The frontend/authority drift above is recorded in surface-status so a
+  ;; reader finds it without running the compiler. This test keeps the two
+  ;; records from disagreeing: every head surface-status lists as admitted by
+  ;; the frontend must still be absent from the authority, and every head it
+  ;; lists as having no lowering must be absent too. When the resync wave
+  ;; lands, both files move together or this goes red.
+  (let [grammar (auth/read-edn auth/grammar-path)
+        surface (auth/read-edn auth/surface-path)
+        admitted (:all (auth/admitted-source-forms grammar))
+        entry (get-in surface [:other-gaps :pure-s-expression-core])
+        operations (set (:operations entry))
+        not-admitted (set (map (comp symbol name) (keys (:not-admitted entry))))]
+    (is (some? entry)
+        "surface-status must carry :pure-s-expression-core -- it is the only
+         place the frontend/authority split is written down")
+    (is (= '#{lam app ref perform} operations)
+        (pr-str operations))
+    (is (= '#{rel query handle} not-admitted)
+        (pr-str not-admitted))
+    (is (empty? (set/intersection operations not-admitted))
+        "a head cannot be both lowered and unlowerable")
+    (is (empty? (set/intersection admitted (set/union operations not-admitted)))
+        (str "surface-status says these heads are not in the authority, but the "
+             "authority admits: "
+             (pr-str (set/intersection
+                      admitted (set/union operations not-admitted)))))))
