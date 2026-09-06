@@ -1041,6 +1041,9 @@
         domains (:domains runtime-benchmark)
         coverage (:semanticCoverage runtime-benchmark)
         speed (:speedQualification runtime-benchmark)
+        runtime-score (:score runtime-benchmark)
+        runtime-pairs (:pairs runtime-benchmark)
+        pair-index (into {} (map (juxt (juxt :domain :comparator) identity)) runtime-pairs)
         runtime-date (subs (:generatedAt runtime-benchmark) 0 10)
         comparator-labels (str/join ", " (map :label comparators))
         end-speed (:speedQualification end-to-end-benchmark)
@@ -1077,12 +1080,19 @@
             (caption (str (:completeComparatorDomainPairs coverage) "/"
                           (:requiredComparatorDomainPairs coverage)
                           " comparator/workload pairs · exact answers verified")))
-      (card (dds/chip-label "RUNTIME SPEED · PENDING" {:color "gray"})
-            (dds/heading 3 "Not qualified" {:size "24"})
-            [:p "The comparison ran, but the host never became quiet enough to support a speed ranking."]
-            (caption (str "load1 " (.toFixed (:observedLoad1First speed) 2) " → "
-                          (.toFixed (:observedLoad1Last speed) 3) " · required ≤ "
-                          (.toFixed (:quietLoad1Limit speed) 1) " · " runtime-date)))
+      (card (dds/chip-label (str "RUNTIME SPEED · " (:qualifiedPairs runtime-score)
+                                 "/" (:totalPairs runtime-score) " QUALIFIED")
+                            (when-not (:fastestClaimQualified speed) {:color "gray"}))
+            (dds/heading 3 (str (:qualifiedPairs runtime-score) " of "
+                                (:totalPairs runtime-score) " pairs") {:size "24"})
+            [:p (str "Amu native wins " (:qualifiedPairs runtime-score) " of the "
+                     (:totalPairs runtime-score)
+                     " comparator/workload pairs by at least 5%, separated from the arms' "
+                     "own spread. The bounded fastest claim needs every pair, so it stays "
+                     "unqualified — the count is the informative half.")]
+            (caption (str "busy-CPU " (str/join " → " (map #(.toFixed (:busyCpuFraction %) 3)
+                                                           (:quietGateSamples speed)))
+                          " · required ≤ 0.10 · " runtime-date)))
       (card (dds/chip-label "DEVELOPER LOOP · RANK UNQUALIFIED" {:color "gray"})
             (dds/heading 3 (str (count end-results) " toolchain paths") {:size "24"})
             [:p "Dependency resolution, checking, clean and no-change builds, and process-cold first result are recorded separately."]
@@ -1111,6 +1121,32 @@
                           (get-in domain-benchmark [:machine :load1After])
                           (if domain-qualified " · qualified" " · rank withheld")))))
      (build-scaling-section)
+     (dds/heading 3 "Every runtime pair, win or loss" {:size "24"})
+     [:p
+      "The bounded claim is all-or-nothing, so a single unqualified pair makes it false. "
+      "Publishing only that verdict would hide which pairs are contested, so the whole "
+      "grid is here. A cell is the mean improvement of Amu native over that comparator "
+      "on that workload; positive means Amu is faster, and a check marks the pairs that "
+      "clear perfgate — at least 5% and separated from the arms' own spread."]
+     [:div {:class "kot-table-scroll"}
+      (dds/table
+       {:caption (str "Amu native vs each comparator, " runtime-date
+                      ", host-qualified; ✓ = passes perfgate")
+        :headers (into ["Workload"] (map :label comparators))
+        :row-header? true
+        :rows (for [d domains]
+                (into [(:label d)]
+                      (for [c comparators
+                            :let [pair (pair-index [(:id d) (:id c)])
+                                  pct (some-> (:improvement pair) (* 100))]]
+                        (if (nil? pair)
+                          "—"
+                          (str (when (pos? pct) "+") (.toFixed pct 1) "%"
+                               (when (:qualified pair) " ✓"))))))})]
+     (caption (str (:qualifiedPairs runtime-score) " of " (:totalPairs runtime-score)
+                   " pairs qualified · candidate "
+                   (subs (:compilerCommit runtime-benchmark) 0 12)
+                   " · " (:host runtime-benchmark)))
      (dds/heading 3 "Optimization delivery after the published run" {:size "24"})
      [:p
       "The dated benchmark above remains immutable. New implementation slices are listed separately until the same-artifact suite reruns and passes its qualification gates."]
