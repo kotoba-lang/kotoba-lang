@@ -131,7 +131,39 @@ function load1() {
   return match ? rounded(Number(match[1])) : null;
 }
 
+// Aggregate busy-CPU fraction over a one-second window.
+//
+// This replaces `load1 <= 1.0` as the gate criterion. That criterion was not
+// strict, it was unsatisfiable: measured 2026-09-06, the load1 FLOOR on all
+// seven reachable ten-core fleet nodes was 1.34-2.08 while the same machines
+// were 4-7% busy. No host could ever have produced a qualifying sample, so
+// every run this benchmark has ever recorded carries
+// `buildSpeedRankingQualified: false` -- including the committed
+// bench/public-compile-comparison/latest.json, whose own explanation says
+// "do not use this run to rank the toolchains".
+//
+// amu hit this exact wall and resolved it the same way: its ADR 0281 proved
+// the load1 gate unsatisfiable across the fleet, and ADR 0282 replaced the
+// proxy with the quantity actually meant -- the busy-CPU fraction, read
+// directly at the same strictness.
+//
+// load1 is kept in the report as a diagnostic. It is no longer the criterion.
+function busyCpuFraction() {
+  // `iostat -c2 -w1` prints two rows; the first is a since-boot average and
+  // the second is the one-second window. Columns: KB/t tps MB/s us sy id 1m 5m 15m.
+  const raw = optionalText("iostat", ["-c2", "-w1"]);
+  const rows = raw.split("\n").map((r) => r.trim())
+    .filter((r) => /^[\d.]+(\s+[\d.]+){8}$/.test(r));
+  if (rows.length < 2) return null;
+  const cols = rows[rows.length - 1].split(/\s+/).map(Number);
+  // Index 5 is idle. It is NOT one of the last three -- those are the load
+  // averages, and reading them as CPU state yields a plausible wrong number.
+  const idle = cols[5];
+  return Number.isFinite(idle) ? rounded((100 - idle) / 100) : null;
+}
+
 const observedLoad1First = load1();
+const observedBusyFirst = busyCpuFraction();
 const directory = mkdtempSync(join(tmpdir(), "kotoba-public-compile-"));
 try {
   const rustSource = join(directory, "main.rs");
@@ -173,9 +205,13 @@ try {
   };
   const summaries = Object.fromEntries(tools.map((tool) => [tool, summary(samples[tool])]));
   const observedLoad1Last = load1();
-  const quietLoad1Limit = 1.0;
-  const speedQualified = observedLoad1First !== null && observedLoad1Last !== null
-    && observedLoad1First <= quietLoad1Limit && observedLoad1Last <= quietLoad1Limit;
+  const observedBusyLast = busyCpuFraction();
+  const quietBusyCpuLimit = 0.10;
+  // A run whose busy fraction could not be READ is unqualified, not qualified:
+  // "could not measure the host" must never produce the same verdict as
+  // "measured the host and it was quiet".
+  const speedQualified = observedBusyFirst !== null && observedBusyLast !== null
+    && observedBusyFirst <= quietBusyCpuLimit && observedBusyLast <= quietBusyCpuLimit;
   const report = {
     format: "kotoba.public-compile-comparison/v2",
     generatedAt: new Date().toISOString(),
@@ -185,12 +221,16 @@ try {
     speedQualification: {
       verdict: speedQualified ? "qualified-host-load" : "unqualified-host-load",
       buildSpeedRankingQualified: speedQualified,
-      quietLoad1Limit,
-      observedLoad1First,
-      observedLoad1Last,
+      criterion: "aggregate busy-CPU fraction before and after the run, both <= quietBusyCpuLimit",
+      quietBusyCpuLimit,
+      observedBusyFirst,
+      observedBusyLast,
+      load1Diagnostic: { observedLoad1First, observedLoad1Last, note: "diagnostic only; not the criterion (see busyCpuFraction)" },
       explanation: speedQualified
         ? "The host-load gate passed; the ranking remains limited to this exact startup workload."
-        : "The artifacts and samples are valid observations, but the host-load gate failed; do not use this run to rank the toolchains.",
+        : (observedBusyFirst === null || observedBusyLast === null
+          ? "The busy-CPU fraction could not be read, so the host was not measured; this run cannot rank the toolchains."
+          : "The artifacts and samples are valid observations, but the host-load gate failed; do not use this run to rank the toolchains."),
     },
     environment: {
       os: optionalText("uname", ["-srv"]),
