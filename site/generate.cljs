@@ -1090,6 +1090,15 @@
                      " comparator/workload pairs by at least 5%, separated from the arms' "
                      "own spread. The bounded fastest claim needs every pair, so it stays "
                      "unqualified — the count is the informative half.")]
+            ;; "unqualified" reads as "not yet". For at least two pairs it is
+            ;; "never": the three compilers emit the same instructions.
+            (when-let [unwinnable (seq (:pairs (:provenUnwinnablePairs runtime-benchmark)))]
+              [:p (str "At least " (count unwinnable) " of those pairs cannot be won at all. "
+                       "On narrow-arithmetic, amu, Apple clang -O3 and rustc -O3 compile the "
+                       "kernel to the same 61-instruction sequence — clang and rustc "
+                       "byte-identical, amu differing only in register numbers. A 5% margin "
+                       "over identical code does not exist, so the bounded claim is "
+                       "unattainable rather than merely unmet.")])
             ;; The score is a measurement, not a constant. Four runs of one
             ;; commit scored 19, 19, 15, 19 (2026-09-06), because a single
             ;; outlier sample in one arm can trip perfgate's noise rule for

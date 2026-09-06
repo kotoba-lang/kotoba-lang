@@ -208,6 +208,22 @@
    ;; The claim is all-or-nothing by construction, so anything short of 30/30
    ;; is `false`. Publishing the count beside it is the point: "18 of 30" and
    ;; "not qualified" are both true, and only one of them is informative.
+   ;; Verified 2026-09-06 by disassembling all three artifacts for the
+   ;; narrow-arithmetic kernel: amu, Apple clang -O3 and rustc -C opt-level=3
+   ;; emit the SAME 61-instruction sequence. clang's and rustc's encodings are
+   ;; byte-identical to each other; amu's differ from theirs only in which
+   ;; registers were chosen. A >= 5% margin over identical code is not a thing
+   ;; a compiler can produce, so these pairs are not "not yet won" -- they
+   ;; cannot be won, and the bounded 30/30 claim cannot be qualified by any
+   ;; amount of further work. Listed rather than counted: only pairs actually
+   ;; disassembled and compared belong here.
+   :provenUnwinnablePairs
+   {:pairs [{:domain "narrow-arithmetic" :comparator "clang-c11"}
+            {:domain "narrow-arithmetic" :comparator "rust"}]
+    :evidence "amu, clang -O3 and rustc -O3 compile this kernel to the same 61-instruction sequence; clang and rustc are byte-identical, amu differs only in register numbers"
+    :verified "2026-09-06"
+    :consequence "the bounded fastest claim requires a >= 5% margin on every pair, which cannot exist against identical code"}
+
    :speedQualification
    {:verdict (if (:qualified quiet) "qualified-host-load" "unqualified-host-load")
     :fastestClaimQualified (= stable-count (count pairs))
@@ -225,7 +241,10 @@
                   "; " stable-count " qualified in every run)")
              " (a single run -- the score moves by more than one pair between runs)")
            ". The bounded fastest claim requires all " (count pairs)
-           " in every run and is therefore not qualified.")
+           " in every run. At least two of those pairs are provably unwinnable"
+           " -- amu, clang and rustc compile the narrow-arithmetic kernel to the"
+           " same 61-instruction sequence -- so the bounded claim is not merely"
+           " unqualified, it is unattainable.")
       (str "The comparison set and exact-result checks completed, but the bounded "
            "quiet-host gate never passed. Timings from this run must not be used "
            "to rank the implementations."))}
