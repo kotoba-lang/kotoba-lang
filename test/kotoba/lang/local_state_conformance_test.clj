@@ -14,6 +14,7 @@
   stopped exercising its route would still be refused, just not for its
   reason. Each also has to carry a `:kotoba.error/local-state-*` code."
   (:require [clojure.edn :as edn]
+            [clojure.set :as set]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.kir :as kir]
@@ -93,6 +94,28 @@
       (is (= (:surface contract) (:admitted-via-elaboration entry)))
       (is (= (:surface contract) (get-in entry [:local-atom-elaboration :covers]))))
     (testing "the heads that stay refused are still forbidden by the grammar"
-      (let [forbidden (set (:forbidden-heads grammar))]
-        (is (every? forbidden '#{set! alter-var-root ref dosync volatile! binding var}))
-        (is (not-any? forbidden '#{atom swap! reset! deref}))))))
+      ;; `ref` is NOT in this list, and its absence is asserted rather than
+      ;; assumed. It left `:forbidden-heads` on 2026-09-06 for a reason that
+      ;; has nothing to do with local state: ADR-544's pure definition
+      ;; reference shares its spelling, and a head cannot be in both the
+      ;; admitted head set and the forbidden one. Dropping it from this list
+      ;; without checking WHY would turn a security assertion into a shorter
+      ;; security assertion, so the check below is that every head missing
+      ;; from `:forbidden-heads` is missing for a recorded reason.
+      (let [forbidden (set (:forbidden-heads grammar))
+            still-refused '#{set! alter-var-root dosync volatile! binding var}
+            excused (into (set (:admitted-via-elaboration entry))
+                          (set (:admitted-via-pure-core-elaboration entry)))]
+        (is (every? forbidden still-refused))
+        (is (not-any? forbidden '#{atom swap! reset! deref}))
+        (is (contains? excused 'ref)
+            "`ref` is out of :forbidden-heads, so some excusal must account
+             for it -- otherwise a security head has simply gone missing")
+        (is (empty? (set/difference
+                     (set (:surface entry))
+                     (set/union forbidden excused)))
+            (str "a head named by :no-ambient-mutation is neither forbidden "
+                 "nor excused: "
+                 (pr-str (set/difference
+                          (set (:surface entry))
+                          (set/union forbidden excused)))))))))

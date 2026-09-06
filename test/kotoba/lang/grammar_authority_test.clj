@@ -351,7 +351,7 @@
   :predicates gains string-index-of, string-contains? and string-split-count
   (kbb scripts-port wave 2; the compiler and KIR already implemented the
   latter two, and kotoba.runtime gains the CLJ interpreter bindings)."
-  "3e41eb84a57a1fcc84dc0ec0b6a5ec1fd535c39e2cf6cfc14418fc1ec4567483")
+  "91726497cb66cb94b9407005312a2a3a6e4bfd5b67293e282d99a9c96a57636c")
 
 (defn- sha256-hex [^bytes bs]
   (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") bs)]
@@ -553,41 +553,37 @@
     (is (<= (:vendor-compared stats) (:vendor-registered stats))
         "more copies were compared than are registered")))
 
-(deftest pure-s-expression-core-heads-are-not-yet-admitted
-  ;; ADR-544 (pure S-expression core + cljk surface) step 1 admits the pure
-  ;; head set (lam app rel query perform handle ref) as desugaring source
-  ;; forms. Step 1 has landed IN THE FRONTEND and not here: measured
-  ;; 2026-09-06 against kotoba-sema fcd4e35, `lam` `app` `ref` `perform`
-  ;; compile and run (`(app (ref inc1) n)` produces the same HIR, KIR and
-  ;; wasm32 bytes as `(inc1 n)`), while this authority admits none of the
-  ;; seven.
+(deftest the-pure-s-expression-core-heads-this-authority-admits
+  ;; ADR-544 step 1: the pure head set is admitted as DESUGARING source forms.
+  ;; This test was the RED gate for that -- it asserted all seven were absent,
+  ;; and said in its own failure message to MOVE heads into an admitted group
+  ;; rather than delete it when the wave landed. This is that move.
   ;;
-  ;; That drift is the point of this test. `lang/guest-grammar.edn` has five
-  ;; vendored copies across four repositories (`lang/vendored-copies.edn`), so
-  ;; admitting the heads here is a resync wave rather than an edit -- and
-  ;; until it lands, a consumer that builds its admitted head set from this
-  ;; authority rejects source the compiler accepts.
+  ;; Four are admitted here and lowered by the frontend. Three are not, and
+  ;; the reason is not that nobody got to them: they have no existing
+  ;; primitive to desugar onto, and step 1's discipline is "desugar to the
+  ;; existing primitives". `rel`/`query` need a relational value model this
+  ;; compiler does not have; `handle` needs an effect handler, which is a
+  ;; different thing from the abort ability's try/catch -- that lowers one
+  ;; `[:result T E]` and does not resume.
   ;;
-  ;; Do NOT delete this when the wave lands. Move the four into the admitted
-  ;; group below; the split is the assertion.
+  ;; Both directions are asserted. A head that quietly LOSES its admission is
+  ;; as much a defect as one that quietly gains it, and a one-sided test would
+  ;; only ever catch the second.
   (let [grammar (auth/read-edn auth/grammar-path)
         admitted (:all (auth/admitted-source-forms grammar))
-        ;; Lowered by the frontend today; not yet in this authority.
-        frontend-admitted '[lam app ref perform]
-        ;; No existing primitive to desugar onto, so not admitted anywhere:
-        ;; `rel`/`query` need a relational value model, `handle` needs an
-        ;; effect handler (the abort ability's try/catch lowers a
-        ;; `[:result T E]`; it does not resume).
+        lowered '[lam app ref perform]
         no-lowering-anywhere '[rel query handle]]
-    (doseq [h frontend-admitted]
-      (is (not (contains? admitted h))
-          (str h " is admitted by the FRONTEND but not by this authority. If "
-               "this now fails, the guest-grammar resync wave landed -- move "
-               h " into the admitted group instead of deleting the test")))
+    (doseq [h lowered]
+      (is (contains? admitted h)
+          (str h " is lowered by the frontend and must be admitted by this "
+               "authority -- if this is red, a consumer building its head set "
+               "from the authority now rejects source the compiler accepts")))
     (doseq [h no-lowering-anywhere]
       (is (not (contains? admitted h))
           (str h " has no primitive to desugar onto and must not be admitted "
-               "by the authority ahead of one")))))
+               "ahead of one. Admitting it here would make the authority "
+               "promise a lowering that does not exist")))))
 
 (deftest the-pure-ref-spelling-collision-is-recorded-on-both-sides
   ;; `ref` is ADR-544's definition reference AND Clojure's STM constructor,
@@ -612,13 +608,25 @@
     (is (= 'ref (:head collision)))
     (is (contains? (set (:surface invariant)) 'ref)
         "the STM reading is still forbidden and `ref` must stay in :surface")
-    (is (contains? forbidden 'ref)
-        "and in :forbidden-heads -- the narrowing admits a different head that
-         shares a spelling, it does not widen this constraint")
+    (is (not (contains? forbidden 'ref))
+        "`ref` must NOT be in :forbidden-heads. It is in the admitted head set
+         (`:sugar :pure-s-expression-core`), and a head in both makes the
+         document contradict itself -- kotoba-lang/grammar's
+         `the-admission-set-holds-real-heads-and-not-feature-names` refuses
+         exactly that, and refused this wave's first attempt")
+    (is (contains? (set (:admitted-via-pure-core-elaboration invariant)) 'ref)
+        "`ref` is excused from :forbidden-heads through its OWN key, not the
+         local-state slice's `:admitted-via-elaboration`. That set is asserted
+         elsewhere to equal lang/local-state.edn's `:surface` exactly, so a
+         head admitted by a different elaboration cannot be added to it")
     (is (not (contains? (set (:admitted-via-elaboration invariant)) 'ref))
-        "`ref` is NOT admitted via the local-state elaboration; putting it in
-         that set would subtract it from the required-forbidden set and say
-         the STM reading had been let in")
+        "and it must NOT be in the local-state set -- putting it there says the
+         state-kit widening covers it, which it does not")
+    (is (= :elaboration (:refusal-lives-in collision))
+        "the record must say WHERE the STM refusal lives. It moved out of the
+         catalog into the rewrite, and that was measured independently: with
+         `ref` already removed from :forbidden-heads, all seven STM spellings
+         are still refused :kotoba.error/ambient-forbidden")
     (is (contains? (set (:operations pure)) 'ref)
         "and the pure core must claim it, or the collision record describes
          an admission nothing makes")
@@ -630,7 +638,6 @@
         (pr-str (get-in collision [:fail-closed :refused])))
     (is (string? (:pinned-by collision))
         "a fail-closed claim with no test named is a sentence, not a gate")))
-
 (deftest no-pure-head-collides-with-a-security-surface-unrecorded
   ;; The generalisation of the `ref` bug. A pure head that shares a spelling
   ;; with a forbidden one takes that refusal away silently, because the
@@ -673,12 +680,15 @@
              "collides -- delete it: " (pr-str (set/difference recorded colliding))))))
 
 (deftest the-surface-status-record-of-the-pure-core-matches-this-authority
-  ;; The frontend/authority drift above is recorded in surface-status so a
-  ;; reader finds it without running the compiler. This test keeps the two
-  ;; records from disagreeing: every head surface-status lists as admitted by
-  ;; the frontend must still be absent from the authority, and every head it
-  ;; lists as having no lowering must be absent too. When the resync wave
-  ;; lands, both files move together or this goes red.
+  ;; Two files answer "which pure heads are admitted" and a reader may open
+  ;; either. This holds them to each other in BOTH directions, so neither can
+  ;; move alone: what surface-status lists under `:operations` is exactly what
+  ;; the grammar admits, and what it lists under `:not-admitted` is exactly
+  ;; what the grammar refuses.
+  ;;
+  ;; Until 2026-09-06 these two disagreed -- the frontend lowered four heads
+  ;; the authority did not admit -- and nothing said so. That is what this
+  ;; pair of assertions exists to prevent recurring, in either direction.
   (let [grammar (auth/read-edn auth/grammar-path)
         surface (auth/read-edn auth/surface-path)
         admitted (:all (auth/admitted-source-forms grammar))
@@ -686,16 +696,20 @@
         operations (set (:operations entry))
         not-admitted (set (map (comp symbol name) (keys (:not-admitted entry))))]
     (is (some? entry)
-        "surface-status must carry :pure-s-expression-core -- it is the only
-         place the frontend/authority split is written down")
+        "surface-status must carry :pure-s-expression-core")
     (is (= '#{lam app ref perform} operations)
         (pr-str operations))
     (is (= '#{rel query handle} not-admitted)
         (pr-str not-admitted))
     (is (empty? (set/intersection operations not-admitted))
         "a head cannot be both lowered and unlowerable")
-    (is (empty? (set/intersection admitted (set/union operations not-admitted)))
-        (str "surface-status says these heads are not in the authority, but the "
-             "authority admits: "
-             (pr-str (set/intersection
-                      admitted (set/union operations not-admitted)))))))
+    (is (empty? (set/difference operations admitted))
+        (str "surface-status records these as lowered, but the grammar "
+             "authority does not admit them: "
+             (pr-str (set/difference operations admitted))
+             " -- the two records have drifted apart"))
+    (is (empty? (set/intersection admitted not-admitted))
+        (str "surface-status records these as having NO lowering, but the "
+             "grammar authority admits them: "
+             (pr-str (set/intersection admitted not-admitted))
+             " -- the authority is promising a lowering that does not exist"))))

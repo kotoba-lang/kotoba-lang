@@ -226,8 +226,19 @@
                         (and (= :intentional-security-constraint (:disposition v))
                              (not= :tracked-elaboration (:enforcement v)))))
               (mapcat (fn [[_entry v]]
+                        ;; TWO excusal sets, not one. `:admitted-via-elaboration`
+                        ;; is the local-state slice's and is asserted to equal
+                        ;; `lang/local-state.edn`'s `:surface` by
+                        ;; `local_state_conformance_test`; a head admitted by a
+                        ;; DIFFERENT elaboration cannot be added to it without
+                        ;; making that assertion false. `ref` is the first such
+                        ;; head (ADR-544's pure definition reference, admitted
+                        ;; in one shape by the pure-core rewrite), and it is
+                        ;; excused here through its own key so that neither
+                        ;; slice has to describe the other.
                         (let [elaborated (into #{} (map as-sym)
-                                               (:admitted-via-elaboration v #{}))]
+                                               (into (:admitted-via-elaboration v #{})
+                                                     (:admitted-via-pure-core-elaboration v #{})))]
                           (remove elaborated (map as-sym (:surface v #{})))))))
         (:invariants surface {})))
 
@@ -330,7 +341,7 @@
         sugar-defaults '#{-> ->> as-> and or when if-not when-not
                           cond condp cond->> case if-let when-let if-some when-some
                           some-> some->> not= do get assoc contains? conj disj
-                          map filter reduce fn invoke fn-ref apply
+                          map filter reduce fn lam app ref perform invoke fn-ref apply
                           lazy-cons lazy-first lazy-rest lazy-empty? lazy-map
                           lazy-filter take drop count nth peek pop keys vals dissoc
                           match defdesugar loop recur assert doseq dotimes
