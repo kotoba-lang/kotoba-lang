@@ -126,7 +126,28 @@
    ;; convention as :host/data-json. No external resource — the bytes
    ;; come entirely from the guest's own argument, so the kind-level
    ;; grant is the whole boundary.
-   :host/data-edn :host/data-edn})
+   :host/data-edn :host/data-edn
+   ;; llm/infer (capability id 225, kotoba-core-contracts) -- the
+   ;; `llm-infer` host import (module "kotoba", field "llm_infer",
+   ;; (prompt-ptr prompt-len out-ptr out-cap) -> bytes-written|-1).
+   ;; Declared in kotoba-core-contracts since ADR-2607062330's llm-infer
+   ;; addendum and implemented by kototama.tender, but never registered
+   ;; HERE -- so the moment kotoba's own JVM/Chicory host provider
+   ;; (kotoba.wasm-exec/real-op-effects) guard-called it under a real
+   ;; policy, it was denied at RUN time with :kotoba.host/denied
+   ;; :unsupported-kind, invisible to the compile-time capability gate
+   ;; (which never consults this map). Exactly the aiueos/actor-host gap
+   ;; above, one more time.
+   ;;
+   ;; Resource scope is enforced per-call in the host provider (kotoba
+   ;; repo), not here -- same convention as :host/data-json. For this
+   ;; kind that provider deliberately performs NO per-call resource
+   ;; check: the guest supplies only a prompt, and the destination
+   ;; endpoint and model are host-chosen constants a guest cannot
+   ;; influence (the argument kototama.tender's `anthropic-infer`
+   ;; docstring makes for its own fixed Anthropic URL). The kind-level
+   ;; grant is the whole boundary.
+   :host/llm-infer :host/llm-infer})
 
 (defn non-empty-string?
   [x]
