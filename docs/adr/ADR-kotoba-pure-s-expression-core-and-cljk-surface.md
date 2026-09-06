@@ -165,19 +165,42 @@ because the synthetic binder introduced for the beta-redex is not the author's
 `g`. Identical CIDs need alpha-normalisation, which is step 2 below. **Do not
 read the matching wasm bytes as evidence for the CID claim.**
 
-**`rel`, `query` and `handle` are not "unfinished", they are unspecified —
-and they are unspecified in three different ways.** Measured 2026-09-06
-against kotoba-sema `e90dd5ea`:
+**All seven heads are admitted as of 2026-09-06.** The last three were held
+back by three claims — written in this addendum — that turned out, on
+measurement, to be about the claims rather than about the language:
 
-| head | blocker | what exists |
+| head | the claim | what measuring showed |
 |---|---|---|
-| `rel` | **undecided semantics**, not a missing primitive | `kgraph-assert!` (arity 3, all-integer EAVT store) is admitted with an **empty effect row**, and `(do (kgraph-assert! 1 2 42) (kgraph-get 1 2))` answers 42. A `rel` head could desugar onto it today. What nobody has decided is whether ADR-544's `rel` *is* the kgraph — binding a pure-core head to one specific store is a language commitment, not a lowering. The `!` in the primitive's own name also says its authors thought it wrote something the effect row does not show. |
-| `query` | **missing primitive** | `kgraph-get` is a point lookup: one value, and `i64 MIN` for an absent key. A relational `query` needs pattern variables and more than one result, and nothing produces either. `kgraph-count` + `kgraph-entity-at` let a guest *iterate*, so a pattern query is something one could **write** — which is the open question, primitive or stdlib. The sentinel return is also the first thing `pure-product-profile.edn` `:forbidden-patterns` names. |
-| `handle` | **undecided authority**, not a missing primitive | `handle` is the other half of `perform`, and `perform` lowers to `cap-call`, whose answer comes from the **host**. A guest `handle` would let a guest intercept its own capability calls — it changes *who answers an effect*, which is a security decision. `try`/`catch` is not it: that lowers one `[:result T E]` and does not resume. |
+| `handle` | *"a guest `handle` would let a guest intercept its own capability calls — a security decision, not a lowering"* | **False for this desugar.** `(try (cap-call :clock/now 0) (catch e 7))` is refused *"try body cannot abort; there is nothing to catch"*: a capability call contributes no `:abort` to the effect row, so `try` — and therefore `handle` — structurally cannot wrap one. The protection is enforced by the row, not by withholding the head. |
+| `rel` | *"binding a pure-core head to one specific store is a language commitment"* | `kgraph-assert!` is **already admitted under `:pure-product`**, so the head adds no authority to any profile. And the kgraph is the language's *only* relational plane, so there was no second candidate to commit to. |
+| `query` | *"a relational `query` needs pattern variables and more than one result"* | That was about a `query` nobody had specified. `(query e a)` **is** the point read — the eliminator for what `rel` introduces — and the head says so in its own arity refusal. A pattern query remains unbuilt, and is now a future head rather than this one's blocker. |
 
-An earlier revision of this addendum gave one reason for all three ("no
-existing primitive to desugar onto"). For `rel` that was measurably too
-strong.
+`handle` and `perform` are deliberately **not** a matched pair, and the
+asymmetry is recorded rather than hidden: `perform` introduces a capability
+effect that only the host answers; `handle` eliminates the abort ability,
+which is the one a guest can handle.
+
+`query` keeps its primitive's sentinel — `kgraph-get` answers `i64 MIN` for an
+absent `(e,a)` and is **not** wrapped in an `[:option T]`. A datom whose value
+*is* `i64 MIN` is indistinguishable from an absent one, so an option would
+promise a totality the store does not have.
+
+**Backends differ per head, so they are recorded per head.** `lam` `app` `ref`
+`perform` `handle` reach wasm32; `rel` and `query` are KIR-only, because
+`(kgraph-get 1 2)` *alone* fails `:wasm-local-encoding` on wasm32 while a
+plain program compiles (measured against amu `9bb5ea68`). That gap is
+inherited from the primitives, not introduced here — but a single `:backends`
+set for the entry would have been an overclaim for two heads or an underclaim
+for five, which is the mistake this entry already made once with
+`:kotoba-wasm`.
+
+**Identity, measured:**
+
+```
+handle / try                 identical :kir-sha256 AND identical wasm32 bytes
+perform / cap-call           identical wasm32 bytes
+(app (ref f) n) / (f n)      identical :hir-sha256, :kir-sha256, wasm32 bytes
+```
 
 **What `:canonical? true` means today:** in
 `kotoba/lang/source_contract.edn` the `.kotoba` kind carries
@@ -193,14 +216,15 @@ ADR-2607181900's readiness gate is clojure-shaped for that reason.
 
 1. Extend the grammar authority with the pure head set as *additional
    admitted source forms* that desugar to the existing primitives.
-   **Half done.** The frontend lowers four of them; `lang/guest-grammar.edn`
-   admits none. Closing the gap is a resync wave, not an edit:
-   `lang/vendored-copies.edn` registers five copies of `guest-grammar.edn`
-   across four repositories, and until they move together a consumer reading
-   the authority rejects source the compiler accepts. The current state is
-   recorded in `lang/surface-status.edn` `:other-gaps
-   :pure-s-expression-core` and gated by
-   `grammar_authority_test/pure-s-expression-core-heads-are-not-yet-admitted`.
+   **Done, 2026-09-06.** All seven heads are lowered by the frontend and
+   admitted by `lang/guest-grammar.edn` `:sugar :pure-s-expression-core`,
+   carried to the five copies `lang/vendored-copies.edn` registers across four
+   repositories with the pinned digest advanced in three of them together.
+   Gated by `grammar_authority_test/the-pure-s-expression-core-heads-this-authority-admits`
+   (both directions) and `/the-pure-heads-backends-are-recorded-per-head-because-they-differ`,
+   and measured against a running compiler by
+   `authority-claim-lowering-test`, whose `:test` pin now names a frontend
+   that has them.
 2. Land the elaboration so `.cljk` and pure `.kotoba` mint identical
    Definition CIDs for equivalent normalized semantics (this ADR §3). The
    beta-redex measurement above is the concrete first gap.
@@ -208,9 +232,9 @@ ADR-2607181900's readiness gate is clojure-shaped for that reason.
    profile (requires `:q1-q8-profile`, not yet satisfied) to the enforced
    admission profile.
 
-Until step 3, a `.kotoba` file may use `lam`/`app`/`ref`/`perform` but cannot
-be written in the pure core alone, and the `.kotoba` files in the fleet are
-clojure-shaped by authority, not by oversight.
+Until step 3, a `.kotoba` file may use the whole pure head set but is not
+*required* to, and the `.kotoba` files in the fleet are clojure-shaped by
+authority, not by oversight.
 
 **Admitting the heads broke nothing.** Across the 3,336 `.kotoba`/`.cljk`
 files in this workspace, none of the seven heads appears in operator position

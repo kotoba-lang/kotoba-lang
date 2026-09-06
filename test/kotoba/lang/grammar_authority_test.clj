@@ -351,7 +351,7 @@
   :predicates gains string-index-of, string-contains? and string-split-count
   (kbb scripts-port wave 2; the compiler and KIR already implemented the
   latter two, and kotoba.runtime gains the CLJ interpreter bindings)."
-  "c02fcc5a8cb09a6d9d6fa9633ff0fb5a272e393040ef0d5a089f3c7355791d71")
+  "a1b444230a3ec6b835545b422f79a9c6fc581dc2588d035ae739bc0eb89d08bb")
 
 (defn- sha256-hex [^bytes bs]
   (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") bs)]
@@ -554,36 +554,48 @@
         "more copies were compared than are registered")))
 
 (deftest the-pure-s-expression-core-heads-this-authority-admits
-  ;; ADR-544 step 1: the pure head set is admitted as DESUGARING source forms.
-  ;; This test was the RED gate for that -- it asserted all seven were absent,
-  ;; and said in its own failure message to MOVE heads into an admitted group
-  ;; rather than delete it when the wave landed. This is that move.
+  ;; ADR-544 step 1 is complete: all SEVEN pure heads are admitted as
+  ;; desugaring source forms. This test has been through three shapes -- "none
+  ;; are admitted" (the RED gate), "four are and three are not", and now this
+  ;; -- and each move was made by editing the assertion, never by deleting it.
   ;;
-  ;; Four are admitted here and lowered by the frontend. Three are not, and
-  ;; the reason is not that nobody got to them: they have no existing
-  ;; primitive to desugar onto, and step 1's discipline is "desugar to the
-  ;; existing primitives". `rel`/`query` need a relational value model this
-  ;; compiler does not have; `handle` needs an effect handler, which is a
-  ;; different thing from the abort ability's try/catch -- that lowers one
-  ;; `[:result T E]` and does not resume.
-  ;;
-  ;; Both directions are asserted. A head that quietly LOSES its admission is
-  ;; as much a defect as one that quietly gains it, and a one-sided test would
-  ;; only ever catch the second.
+  ;; Both directions are asserted. A head that quietly LOSES admission is as
+  ;; much a defect as one that quietly gains it, and the first two shapes of
+  ;; this test would only ever have caught the second.
   (let [grammar (auth/read-edn auth/grammar-path)
         admitted (:all (auth/admitted-source-forms grammar))
-        lowered '[lam app ref perform]
-        no-lowering-anywhere '[rel query handle]]
-    (doseq [h lowered]
+        pure-heads '[lam app ref perform rel query handle]]
+    (is (= 7 (count pure-heads)) "the ADR's head set is seven; this measured nothing if not")
+    (doseq [h pure-heads]
       (is (contains? admitted h)
-          (str h " is lowered by the frontend and must be admitted by this "
-               "authority -- if this is red, a consumer building its head set "
-               "from the authority now rejects source the compiler accepts")))
-    (doseq [h no-lowering-anywhere]
-      (is (not (contains? admitted h))
-          (str h " has no primitive to desugar onto and must not be admitted "
-               "ahead of one. Admitting it here would make the authority "
-               "promise a lowering that does not exist")))))
+          (str h " must be admitted by this authority -- if this is red, a "
+               "consumer building its head set from the authority now rejects "
+               "source the compiler accepts")))))
+
+(deftest the-pure-heads-backends-are-recorded-per-head-because-they-differ
+  ;; Five reach wasm32; `rel` and `query` are KIR-only, because the kgraph
+  ;; primitives they spell do not lower to wasm32 (measured 2026-09-06:
+  ;; `(kgraph-get 1 2)` alone fails :wasm-local-encoding while a plain program
+  ;; compiles). A single `:backends` set for the entry would be an overclaim
+  ;; for two heads or an underclaim for five -- which is the same mistake this
+  ;; entry already made once, with :kotoba-wasm.
+  (let [grammar (auth/read-edn auth/grammar-path)
+        surface (auth/read-edn auth/surface-path)
+        entry (get-in grammar [:sugar :pure-s-expression-core])
+        per-head (:backends-per-head entry)
+        gap (get-in surface [:other-gaps :pure-s-expression-core :backend-gap])]
+    (is (= (set (:forms entry)) (set (keys per-head)))
+        (str "every admitted head needs a backend record and no others: "
+             (pr-str {:forms (set (:forms entry)) :recorded (set (keys per-head))})))
+    (is (= '#{rel query} (:heads gap))
+        "surface-status must name the same two heads as the backend gap")
+    (is (= (:heads gap)
+           (set (keep (fn [[h b]] (when (contains? b :compiler-kir-only) h)) per-head)))
+        (str "the heads marked :compiler-kir-only in the grammar and the heads "
+             "surface-status records as not reaching wasm32 must be the same "
+             "set, or one of the two records is stale: "
+             (pr-str {:grammar (set (keep (fn [[h b]] (when (contains? b :compiler-kir-only) h)) per-head))
+                      :surface-status (:heads gap)})))))
 
 (deftest the-pure-ref-spelling-collision-is-recorded-on-both-sides
   ;; `ref` is ADR-544's definition reference AND Clojure's STM constructor,
@@ -697,10 +709,12 @@
         not-admitted (set (map (comp symbol name) (keys (:not-admitted entry))))]
     (is (some? entry)
         "surface-status must carry :pure-s-expression-core")
-    (is (= '#{lam app ref perform} operations)
+    (is (= '#{lam app ref perform rel query handle} operations)
         (pr-str operations))
-    (is (= '#{rel query handle} not-admitted)
-        (pr-str not-admitted))
+    (is (empty? not-admitted)
+        (str "all seven heads are admitted as of 2026-09-06; :not-admitted "
+             "must be empty. Anything here is a head the authority refuses, "
+             "and it needs a reason next to it: " (pr-str not-admitted)))
     (is (empty? (set/intersection operations not-admitted))
         "a head cannot be both lowered and unlowerable")
     (is (empty? (set/difference operations admitted))
