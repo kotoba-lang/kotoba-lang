@@ -191,7 +191,7 @@
         html (slurp "site/dist/index.html")]
     (is (= manifest published) "the public dependency manifest must be exact")
     (is (= "kotoba-lang/grammar" (:repository syntax)))
-    (is (= "4457d76212e52e277b15a0427ea66b5dd50e657e" (:revision syntax)))
+    (is (= "efaec1df470500c70db89a6c0c988530796f3e1b" (:revision syntax)))
     (is (= "kotoba.grammar.highlight/tokenize" (:api syntax)))
     (is (= "site/generate.cljs/highlighted-kotoba" (:consumer syntax)))
     (is (false? (:runtime-dependency syntax)))

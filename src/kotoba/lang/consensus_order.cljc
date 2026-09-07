@@ -70,23 +70,27 @@
       (throw (ex-info "consensus verifier did not bind the commit"
                       {:problem :consensus/verification-invalid})))
     (let [dataspace (:consensus/dataspace envelope)
-          claimed? (atom false)]
-      (swap! (-commit-state registry)
-             (fn [state]
-               (let [{previous-height :height previous-id :commit-id}
-                     (get state dataspace)
-                     expected-height (inc (or previous-height 0))
-                     expected-parent previous-id]
-                 (if (and (= expected-height (:consensus/height envelope))
-                          (= expected-parent (:consensus/parent-id envelope)))
-                   (do (reset! claimed? true)
-                       (assoc state dataspace
-                              {:height (:consensus/height envelope)
-                               :commit-id (:consensus/commit-id envelope)}))
-                   state))))
-      (when-not @claimed?
+          prev (get @(-commit-state registry) dataspace)
+          expected-height (inc (or (:height prev) 0))
+          expected-parent (:commit-id prev)
+          claimed? (and (= expected-height (:consensus/height envelope))
+                        (= expected-parent (:consensus/parent-id envelope)))]
+      (when claimed?
+        (swap! (-commit-state registry)
+               (fn [state]
+                 (assoc state dataspace
+                        {:height (:consensus/height envelope)
+                         :commit-id (:consensus/commit-id envelope)}))))
+      (when-not claimed?
         (throw (ex-info "consensus commit is forked or out of order"
-                        {:problem :consensus/order-invalid})))
+                        {:problem :consensus/order-invalid
+                         :consensus/dataspace dataspace
+                         :consensus/candidate
+                         {:height (:consensus/height envelope)
+                          :parent-id (:consensus/parent-id envelope)
+                          :commit-id (:consensus/commit-id envelope)}
+                         :consensus/observed-height expected-height
+                         :consensus/expected-parent expected-parent})))
       (OrderedCommit. expected))))
 
 (defn apply-commit
