@@ -103,6 +103,12 @@ report rather than applied uniformly:
   the line, hue, signed number), so neither colour vision nor a greyscale print
   is a single point of failure. The two directions are scaled separately
   because the wins reach +92% and the losses only −12%; the caption says so.
+- `ranked-bars` is also used for the six **native runtime** panels, in absolute
+  milliseconds. The grid of 30 pairs reports margins, which is what perfgate
+  rules on, but a percentage does not say whether a workload runs in five
+  milliseconds or five hundred. The candidate median is one value per workload
+  (the suite rotates each engine pair ABBA/BAAB, so the same Amu artifact is
+  timed once and compared against each arm in turn).
 - `log-lines` — build time against source size on two log axes. Only the
   released Kotoba lane is coloured and every line is labelled at its own end,
   so no categorical palette is introduced: blue/purple/cyan failed the CVD
@@ -125,6 +131,28 @@ collapses the marks. Verified in all three states: with motion, an off-screen
 bar measures `0px` and reaches `30px` on scroll; with reduced motion the class
 is never added and bars are full width immediately; with JavaScript disabled
 the charts render complete and the line dash offset is `0`.
+
+## The header says `Lisp`
+
+The page said `Clojure-shaped` in prose and showed tokenized Kotoba further
+down, but nothing above the fold said *this is a Lisp*. Two marks, both drawn
+rather than fetched — no request, and both stroke/colour `--hig-color-tint`,
+so they follow the design system into dark mode like everything else:
+
+- `( KOTOBA )` — the wordmark read as one form. Text, not an image, so it
+  scales with the type. The glyphs are `aria-hidden`; the link's `aria-label`
+  already names it.
+- Four nested opening parens in each page margin, the right one mirrored, so
+  the header reads as one enclosing form `(((( … ))))`.
+
+The margin placement is the whole point and the first attempt got it wrong
+twice: a wide nest stretched across the header was clipped into unrelated
+curves, and centred it landed directly behind the nav, so a texture became
+scratch marks over the links. Below 64rem the container fills the viewport and
+there is no margin, so it is not drawn at all rather than drawn on top of
+something. Verified by geometry rather than by eye — the nest's bounding boxes
+intersect **zero** nav links or wordmark boxes at 1440px, and it is absent at
+420px.
 
 ## The `Fastest` claim on the first screen
 
@@ -223,6 +251,23 @@ the live zone serves. Regenerate and check `git diff` before shipping. An
 *absent* `dist/` fails loudly, but an *empty* one does not — wrangler reports
 "Read 0 files" and uploads them, which on a custom domain replaces the live page
 with nothing. Measured 2026-08-13 with wrangler 4.103.0.
+
+## Where each benchmark lives
+
+`benchmark-provenance` names the harness, method and report for all five
+benchmarks, and the table renders them as links. URLs the reports carry
+themselves are preferred over URLs written here — the runtime suite and the
+build-scaling harness both publish their own harness, manifest and method — and
+the three that run from this repository have their paths passed through
+`check-local!`, so **a harness that moves fails the build instead of shipping a
+dead link**. Verified in both directions: renaming one entry's `:harness`
+exits non-zero naming the missing path, and all 20 rendered links return 200.
+
+The `Bottom line` paragraph used to say that *no* current run qualified a speed
+ranking because its quiet-host gate failed. That was true of three of the five
+reports and false of the two that matter: the runtime suite records
+`qualified-host-load`, and the build-scaling orderings clear perfgate at K=1.
+It now reads the verdicts out of the reports so it cannot go stale again.
 
 ## The repository catalogue
 

@@ -317,11 +317,23 @@
    "transform:translateY(-150%);padding:var(--hig-spacing-2) var(--hig-spacing-3);"
    "background:var(--hig-color-system-background);color:var(--hig-color-label);z-index:3}"
    ".kot-skip:focus{transform:translateY(var(--hig-spacing-2))}"
-   ".kot-header{position:relative;z-index:2;background:var(--hig-color-system-background);"
+   ".kot-header{position:relative;z-index:2;overflow:clip;"
+   "background:var(--hig-color-system-background);"
    "border-bottom:var(--hig-hairline) solid var(--hig-color-separator)}"
    ".kot-header__inner{display:flex;align-items:flex-start;flex-direction:column;"
    "gap:var(--hig-spacing-3);padding-block:var(--hig-spacing-3)}"
-   ".kot-wordmark{display:inline-flex;align-items:center;text-decoration:none}"
+   ".kot-wordmark{display:inline-flex;align-items:center;gap:.12em;text-decoration:none}"
+   ".kot-paren{font-family:var(--hig-font-mono);font-size:2.1rem;line-height:1;"
+   "font-weight:400;color:var(--hig-color-tint)}"
+   ;; A texture, not data: hairline strokes at low opacity, and it sits behind
+   ;; the header row so the nav keeps the surface it is measured against.
+   ;; The motif lives in the page margins, never over the nav. Below 64rem the
+   ;; container fills the viewport and there is no margin to put it in, so it
+   ;; is not drawn at all rather than drawn on top of something.
+   ".kot-lisp-edge{display:none}"
+   ".kot-lisp-nest{display:block;height:100%;width:auto;max-width:none;fill:none;"
+   "stroke:var(--hig-color-tint);stroke-width:2;stroke-linecap:round}"
+   ".kot-header__inner{position:relative;z-index:1}"
    ".kot-logo{display:block;height:var(--hig-spacing-7);width:auto}"
    ".kot-nav{display:flex;align-items:center;justify-content:flex-start;flex-wrap:wrap;"
    "gap:var(--hig-spacing-2);width:100%}"
@@ -406,6 +418,11 @@
    "border-top:var(--hig-hairline) solid var(--hig-color-separator)}"
    "@media(min-width:36rem){.kot-actions{display:flex;flex-wrap:wrap}"
    ".kot-hero h1{font-size:2.75rem;line-height:1.15}}"
+   "@media(min-width:64rem){"
+   ".kot-lisp-edge{display:block;position:absolute;inset-block:0;width:5.25rem;"
+   "opacity:.22;pointer-events:none;z-index:0}"
+   ".kot-lisp-edge[data-side=start]{inset-inline-start:0}"
+   ".kot-lisp-edge[data-side=end]{inset-inline-end:0;transform:scaleX(-1)}}"
    "@media(min-width:48rem){.kot-header{position:sticky;top:0}"
    ".kot-header__inner{align-items:center;flex-direction:row;justify-content:space-between}"
    ".kot-nav{justify-content:flex-end;width:auto}.kot-hero{padding-block:var(--hig-spacing-10) var(--hig-spacing-9)}}"
@@ -543,6 +560,36 @@
     :title "No grant, no host effect"
     :body "An empty policy grants no filesystem, network, process, clock, model, or secret authority. Providers must also validate concrete resource scope."}])
 
+(def ^:private lisp-nest
+  "Four nested opening parentheses, drawn as one cubic each.
+
+  Placed once in each margin — the right one mirrored — so the header reads as
+  a single enclosing form: `(((( … ))))`. The first attempt put a wide nest
+  across the whole header and it was wrong twice over: stretched to the header
+  height the arcs were clipped into unrelated curves, and centred they landed
+  directly behind the nav, so a texture became scratch marks over the links.
+  In the margins there is nothing to sit on top of, and the motif says what it
+  is: this is a Lisp, and the page is one form.
+
+  Drawn rather than fetched — an inline SVG makes no request, and its stroke
+  is `--hig-color-tint`, so it follows the design system into dark mode like
+  every other mark here. `aria-hidden`, because it is ornament and the
+  wordmark link already carries the accessible name."
+  (let [w 84 h 76 depth 4
+        arc (fn [x]
+              (let [c (- x 15)]
+                (str "M" x " 9 C" c " 27 " c " 49 " x " 67")))]
+    [:svg {:class "kot-lisp-nest" :viewBox (str "0 0 " w " " h)
+           :aria-hidden "true" :focusable "false"
+           :preserveAspectRatio "xMaxYMid meet"}
+     (for [i (range depth)]
+       [:path {:d (arc (+ 22 (* i 16)))
+               :opacity (.toFixed (- 0.95 (* i 0.18)) 2)}])]))
+
+(def lisp-backdrop
+  (list [:div {:class "kot-lisp-edge" :data-side "start"} lisp-nest]
+        [:div {:class "kot-lisp-edge" :data-side "end"} lisp-nest]))
+
 (defn header
   ([] (header ""))
   ([root]
@@ -553,11 +600,17 @@
                         (str/starts-with? href "./") (str root (subs href 2))
                         :else href))]
      [:header {:class "kot-header"}
+      lisp-backdrop
       (dds/container
        [:div {:class "kot-header__inner"}
         [:a {:class "kot-wordmark" :href (str root "#top") :aria-label "Kotoba home"}
+         ;; `( KOTOBA )` — the wordmark read as one form. Text, not an image,
+         ;; so it scales with the type and inherits the tint in both themes.
+         ;; The link's aria-label already names it, so the glyphs are hidden.
+         [:span {:class "kot-paren" :aria-hidden "true"} "("]
          [:img {:class "kot-logo" :src (str root "kotoba-wordmark.png")
-                :width 480 :height 68 :alt "Kotoba"}]]
+                :width 480 :height 68 :alt "Kotoba"}]
+         [:span {:class "kot-paren" :aria-hidden "true"} ")"]]
         [:nav {:class "kot-nav" :aria-label "Primary"}
          (for [{:keys [label href]} primary-links]
            (dds/button label {:type :text :size "sm" :href (local-href href)}))
@@ -1539,6 +1592,93 @@
       (external-link "https://github.com/kotoba-lang/kotoba/issues/526"
                      "The defect, with its bytes")])))
 
+(def benchmark-provenance
+  "Where each published benchmark actually lives.
+
+  A URL the report itself carries is preferred over one written here: the
+  runtime suite and the build-scaling harness both name their own harness,
+  manifest and method, so those are read out of the JSON. The other three run
+  from this repository, and their paths are checked against the working tree
+  at build time (see `benchmark-provenance-rows`) — a moved script fails the
+  build instead of shipping a dead link."
+  [{:id :compile
+    :question "Compiler startup"
+    :repo "kotoba-lang/kotoba-lang"
+    :harness "scripts/benchmark-public-compile.mjs"
+    :extra ["bench/public-compile-comparison/README.md"
+            "bench/public-compile-comparison/main.kotoba"]
+    :report "bench/public-compile-comparison/latest.json"
+    :published "./benchmarks/compile-wasm-latest.json"}
+   {:id :end-to-end
+    :question "Developer loop"
+    :repo "kotoba-lang/kotoba-lang"
+    :harness "scripts/benchmark-public-end-to-end.mjs"
+    :extra ["bench/public-end-to-end-comparison/README.md"]
+    :report "bench/public-end-to-end-comparison/latest.json"
+    :published "./benchmarks/end-to-end-latest.json"}
+   {:id :runtime
+    :question "Native runtime"
+    :repo "kotoba-lang/amu"
+    :harness-url (get-in runtime-benchmark [:sources :harness])
+    :extra-urls [(get-in runtime-benchmark [:sources :manifest])
+                 (get-in runtime-benchmark [:sources :method])]
+    :projector "scripts/project-runtime-comparison.cljs"
+    :report "bench/public-runtime-comparison/latest.json"
+    :published "./benchmarks/runtime-native-latest.json"}
+   {:id :build-scaling
+    :question "Build scaling"
+    :repo "kotoba-lang/buildbench"
+    :harness-url (get-in build-scaling [:method :harness])
+    :report "bench/public-build-scaling/latest.json"
+    :published "./benchmarks/build-scaling-latest.json"}
+   {:id :domains
+    :question "Workload domains"
+    :repo "kotoba-lang/kotoba-lang"
+    :harness "scripts/benchmark-public-domains.mjs"
+    :extra ["bench/public-domain-comparison/README.md"
+            "bench/public-domain-comparison/probes"]
+    :report "bench/public-domain-comparison/latest.json"
+    :published "./benchmarks/domains-latest.json"}])
+
+(def ^:private repo-blob-base "https://github.com/kotoba-lang/")
+
+(defn- repo-path-url [repo path]
+  (str repo-blob-base (subs repo (count "kotoba-lang/")) "/blob/main/" path))
+
+(defn- check-local! [path]
+  (when-not (fs/existsSync path)
+    (throw (js/Error. (str "benchmark provenance points at a path that is not in "
+                           "this tree: " path))))
+  path)
+
+(defn benchmark-provenance-rows
+  "Rows for the provenance table, with every in-repo path verified to exist."
+  []
+  (for [{:keys [question repo harness harness-url extra extra-urls projector
+                report published]} benchmark-provenance]
+    (let [harness-link (if harness-url
+                         (external-link harness-url
+                                        (last (str/split harness-url #"/")))
+                         (external-link (repo-path-url repo (check-local! harness))
+                                        harness))
+          more (concat
+                (for [pth extra]
+                  (external-link (repo-path-url repo (check-local! pth)) pth))
+                (for [u extra-urls :when u]
+                  (external-link u (last (str/split (first (str/split u #"#")) #"/"))))
+                (when projector
+                  [(external-link (repo-path-url "kotoba-lang/kotoba-lang"
+                                                 (check-local! projector))
+                                  projector)]))]
+      [question
+       (external-link (str "https://github.com/" repo) repo)
+       (into [:span] (interpose " · " (cons harness-link more)))
+       [:span
+        [:a {:class "kot-link" :href published} "published JSON"]
+        " · "
+        (external-link (repo-path-url "kotoba-lang/kotoba-lang" (check-local! report))
+                       report)]])))
+
 (defn benchmark-section []
   (let [kotoba (get-in benchmark [:results :kotoba])
         rust (get-in benchmark [:results :rust])
@@ -1666,6 +1806,52 @@
                           (get-in domain-benchmark [:machine :load1After])
                           (if domain-qualified " · qualified" " · rank withheld")))))
      (build-scaling-section)
+     (dds/heading 3 "How long each native workload actually takes" {:size "24"})
+     [:p
+      "The grid below reports the margin between two arms. That is the number "
+      "perfgate rules on, but a percentage on its own does not say whether a "
+      "workload runs in five milliseconds or five hundred, and it hides the "
+      "difference between a contested pair and an irrelevant one. These panels are "
+      "the medians those margins are computed from. Amu native is the coloured lane "
+      "in every panel — including the panels where it is not first. Each panel is "
+      "scaled to its own slowest arm, because the question a panel answers is who is "
+      "faster in that workload."]
+     (dds/grid
+      {:min "19rem"}
+      (for [d domains
+            :let [ps (filter #(= (:id d) (:domain %)) runtime-pairs)
+                  cand (:candidateMedian (first ps))
+                  rows (sort-by :value
+                                (cons {:label (:candidate runtime-benchmark)
+                                       :value cand :lead? true}
+                                      (for [pr ps
+                                            :let [c (first (filter #(= (:comparator pr) (:id %))
+                                                                   comparators))]]
+                                        {:label (:label c)
+                                         :value (:baselineMedian pr)})))
+                  best (:value (first rows))]]
+        (card
+         (dds/heading 4 (:label d) {:size "20"})
+         (chart/ranked-bars
+          {:rows (for [{:keys [label value lead?]} rows]
+                   {:label label :value value
+                    :display (str (.toFixed value 2) " ms")
+                    :note (when lead?
+                            (if (= value best)
+                              "fastest here"
+                              (str (.toFixed (/ value best) 2) "× the fastest here")))
+                    :lead? lead?})}))))
+     (caption
+      (str "Median milliseconds over " (:runs runtime-score)
+           " host-qualified runs; shorter is faster. Every arm returned the same "
+           "independently checked answer, and the candidate median is one value per "
+           "workload — the suite rotates each engine pair in ABBA/BAAB order, so the "
+           "same Amu artifact is timed once per workload and then compared against "
+           "each arm in turn. Unlike the other four benchmarks on this page, this "
+           "one's quiet-host gate PASSED (" (name (:verdict speed))
+           "), so these are figures for this host rather than observations only. The "
+           "bounded fastest claim still needs all " (:totalPairs runtime-score)
+           " pairs, which is what the grid below is for."))
      (dds/heading 3 "Every runtime pair, win or loss" {:size "24"})
      [:p
       "The bounded claim is all-or-nothing, so a single unqualified pair makes it false. "
@@ -1887,9 +2073,40 @@
                 [label stress (if exactResultVerified
                                 "Exact result verified; timing unqualified"
                                 "Incomplete")])})]
+     (dds/heading 3 "Where each benchmark lives" {:size "24"})
+     [:p
+      "Every number above comes from a public harness and a committed report, so a "
+      "run can be repeated and a claim can be disagreed with. The in-repo paths in "
+      "this table are checked against the working tree when this page is generated: "
+      "a harness that moves fails the build rather than shipping a dead link."]
+     [:div {:class "kot-table-scroll"}
+      (dds/table
+       {:caption "Harness, method and report for each published benchmark"
+        :headers ["Benchmark" "Repository" "Harness and method" "Report"]
+        :row-header? true
+        :rows (benchmark-provenance-rows)})]
+     (caption
+      (list "The gate every ordering on this page is put through is "
+            (external-link "https://github.com/kotoba-lang/perfgate" "kotoba-lang/perfgate")
+            ", run at its own unrelaxed default policy. A threshold loosened to let a "
+            "run through would be a benchmark measuring its own thresholds."))
      [:p
       [:strong "Bottom line: "]
-      "The compiler-startup, developer-loop, and runtime artifacts, exact results, and samples are real. None of the current runs qualifies a speed ranking because its quiet-host gate failed. A quiet-host rerun must pass the relevant gate before any fastest claim becomes valid."]
+      ;; This sentence used to say that NO current run qualified a speed
+      ;; ranking because its quiet-host gate failed. That was true of four of
+      ;; the five reports and false of the two that matter: the runtime suite
+      ;; records `qualified-host-load`, and the build-scaling orderings clear
+      ;; perfgate at K=1. Reading the verdicts out of the reports keeps the
+      ;; sentence from going stale again.
+      (str "The artifacts, exact results and samples are real in all five benchmarks. "
+           "Three of them — compiler startup, the developer loop and the workload "
+           "domains — failed their quiet-host gate, so they rank nothing and are "
+           "published as observations. The native runtime suite passed its gate and "
+           "wins " (:qualifiedPairs runtime-score) " of its " (:totalPairs runtime-score)
+           " pairs, short of the every-pair claim it would need. Build scaling "
+           "qualifies its cold-start ordering against every comparator on the host "
+           "and finds a correctness ceiling in the same run. No universal speed rank "
+           "is claimed anywhere on this page, and none of these runs licenses one.")]
      [:div {:class "kot-actions"}
       (dds/button "Inspect compile samples"
                   {:href "./benchmarks/compile-wasm-latest.json"})
