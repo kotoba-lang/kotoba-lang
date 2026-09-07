@@ -59,6 +59,91 @@ highlighter or third-party runtime dependency.
 other build-time repositories, and the intentionally small browser runtime
 dependency surface. The generator verifies the grammar digest and scope before
 rendering and publishes the manifest at `/dependencies.edn`.
+## Dark mode
+
+Both themes come from one knob: `jp-go-dds.page` is called with `:dark? true`,
+which inserts `jp-go-dds.dark`'s inversion layer and writes `color-scheme` and
+`theme-color` for both modes. Application CSS defines no palette — every mark,
+including the charts, reads a `--hig-*` token — so the whole page follows the
+mirrored DADS ramps without a second set of colours.
+
+Two things had to be fixed for it, and both were invisible in light mode:
+
+- The hero canvas cleared to **opaque white** and painted its dots in a baked
+  `#0017c1`. On a dark page that is a white slab with invisible dots. It now
+  clears to `(0,0,0,0)` — the WebGPU output is then already premultiplied and
+  the WebGL canvas composites over the page — and reads its dot colour from
+  `getComputedStyle(wrap).color`, which `.kot-hero-canvas` sets to
+  `var(--hig-color-tint)`. The SVG fallback already followed the token.
+- DADS's blue text chip resolves to a step whose dark mirror measures
+  **4.42:1** against the dark surface, below WCAG AA for its own 16px normal
+  weight. One rule points it at `--hig-color-tint` instead (11.10:1 light,
+  8.76:1 dark). That is an upstream `jp-go-dds.dark` gap, not a local
+  preference, and it also stops the page carrying two different blues.
+
+Measured contrast, both themes, every chart mark and every piece of chart text:
+marks ≥ 3:1, text ≥ 4.5:1.
+
+## Charts
+
+`site/src/kotoba/site/chart.cljc` holds three pure hiccup forms, chosen per
+report rather than applied uniformly:
+
+- `ranked-bars` — magnitude across named toolchains. Bars carry **time**, so
+  the fastest lane is the *shortest* bar and every chart says so in its axis
+  note. Plotting a speed ratio would put the winner on the longest bar and
+  would also quietly replace the measured quantity with a derived one.
+  Row layout answers to the width of the **chart**, not the window
+  (`container-type: inline-size`): the same component is 60rem wide in the hero
+  and 17rem wide in a small-multiple card, and a viewport media query squeezed
+  the narrow card's bars to a sliver.
+- `diverging-cell` — one signed comparison grown from a centre baseline, used
+  for all 30 runtime pairs. Sign is carried by three channels at once (side of
+  the line, hue, signed number), so neither colour vision nor a greyscale print
+  is a single point of failure. The two directions are scaled separately
+  because the wins reach +92% and the losses only −12%; the caption says so.
+- `log-lines` — build time against source size on two log axes. Only the
+  released Kotoba lane is coloured and every line is labelled at its own end,
+  so no categorical palette is introduced: blue/purple/cyan failed the CVD
+  separation check (ΔE 4.8 protan) against this palette's own ramps. Labels are
+  spread apart and connected by dotted hairline leaders — four of the seven
+  lanes finish within 9 vertical units of each other.
+
+A lane that did not build, or a capability a target does not have, renders as
+text in the track. It never becomes a zero-length bar: the fastest way to emit
+an artifact is to emit a broken one.
+
+Three end marks, because they are three different events: a dot where the run
+ended, a cross where the lane emitted an artifact that is not the program, a
+bar where the toolchain refused to build.
+
+The reveal is an enhancement and never a precondition. The final state is what
+the CSS declares; a `<head>` script adds `.kot-anim` only when it is about to
+observe and `prefers-reduced-motion` is not set, and that class is what
+collapses the marks. Verified in all three states: with motion, an off-screen
+bar measures `0px` and reaches `30px` on scroll; with reduced motion the class
+is never added and bars are full width immediately; with JavaScript disabled
+the charts render complete and the line dash offset is `0`.
+
+## The `Fastest` claim on the first screen
+
+`cold-start` in `generate.cljs` derives it once, from
+`bench/public-build-scaling/latest.json`. Four of the five public reports
+record a **failed** quiet-host gate and therefore may not rank anything, and
+the page says so next to each of them. The build-scaling report is the
+exception for a structural reason: its lanes are interleaved on one host and
+every ordering goes through perfgate at its own unrelaxed default policy, which
+refuses any gap falling inside the two arms' combined spread — so a gap that
+survives survives the host being busy.
+
+At K=1 the released CLI passes that test against all four comparators the host
+could build (2.5x Clang, 3.3x rustc to Wasm, 4.8x rustc to native, 14.6x
+javac). Bounded to that host, that size and that run, it is the only thing this
+page calls fastest. `:qualified?` is read out of the report, not asserted: if a
+rerun loses one ordering, the chip, the heading and the sentence step down
+together. `lang/product-defaults.edn` still forbids
+`:universal-speed-rank`, and nothing here claims one.
+
 The public benchmark section reads the checked-in compile report at
 `bench/public-compile-comparison/latest.json` and the bounded native comparison
 summary at `bench/public-runtime-comparison/latest.json`. The generator copies
@@ -135,6 +220,70 @@ the live zone serves. Regenerate and check `git diff` before shipping. An
 *absent* `dist/` fails loudly, but an *empty* one does not — wrangler reports
 "Read 0 files" and uploads them, which on a custom domain replaces the live page
 with nothing. Measured 2026-08-13 with wrangler 4.103.0.
+
+## The repository catalogue
+
+`/libraries/#catalog` lists every public repository in the `kotoba-lang`
+organisation and filters it in the browser. Two committed inputs:
+
+- `site/library-catalog.edn` — the snapshot (name, description, existing
+  GitHub topics, primary language, archived flag, last push). Committed so the
+  generator is deterministic and needs no network. Refresh it with the
+  documented `gh api graphql` pagination in this section rather than a script:
+  new operations tooling is kbb-first (owner instruction 2026-09-07) and that
+  migration is out of scope for this page.
+- `site/library-taxonomy.edn` — the tag vocabulary. Each tag names the GitHub
+  repository **topic** it corresponds to, so the site filter and the org's
+  topics are one vocabulary instead of two that drift.
+
+`site/src/kotoba/site/catalog.cljc` applies it, and keeps two strengths of fact
+apart. A **plane** tag is read off the repository name using the workspace's
+own naming rule (ADR-2608040100) and is as reliable as the name. A **domain**
+tag is matched against the name and description with word-boundary patterns —
+substring matching turns `os` into a hit on `kotobase`, `protocols` and
+`compose` alike, 203 false hits measured. That is evidence, and it runs out:
+1,160 of these repositories carry no description at all, and some names are
+deliberate metaphors (`kuro`, `kobo`, `byoubu`) that say nothing about the
+function.
+
+So the page publishes the number it could not tag. A classifier that assigns
+every repository a nearest-guess tag returns the same shape as one that is
+right, and the reader cannot tell which they are looking at.
+
+The list is server-rendered, not built from an embedded JSON blob: with
+JavaScript off the complete catalogue is still the page, and the controls —
+the part that needs a script — are the part hidden until one runs. Text
+narrows, tags widen (a repository matching *any* selected tag is shown): with
+24 domain tags an AND of two of them is almost always empty, which reads as a
+broken filter rather than a precise one.
+
+`.kot-lib[hidden]{display:none}` is not cosmetic. A `display` declaration beats
+the `hidden` attribute's UA `display:none`, so without it every filtered-out
+row stayed laid out: `el.hidden` read `true`, the counter said 31, and the
+reader still saw all 2,215. Filtering is therefore verified by **rendered
+geometry**, not by the property — unfiltered 2,215 rows / 166,120px tall,
+`#tag=simulation` 31 rows / 8,100px.
+
+A repository is discovery, not a package. Exactly one library is published
+through the content-addressed registry; the catalogue caption says so.
+
+### Refresh the snapshot
+
+```sh
+# 23 pages of 100; write name/description/topics/language/archived/pushed
+gh api graphql -f query='
+{ organization(login:"kotoba-lang") {
+    repositories(first:100, privacy:PUBLIC, after:CURSOR, orderBy:{field:NAME,direction:ASC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes { name description isArchived isFork stargazerCount pushedAt
+              primaryLanguage { name }
+              repositoryTopics(first:20){ nodes { topic { name } } } } } } }'
+```
+
+Forks and `.github` are excluded. Then push the derived tags back as GitHub
+topics so the correspondence holds in both directions; the topics endpoint
+**replaces** the whole set, so send the union of derived and existing topics
+and never send an empty list.
 
 ## Score it
 

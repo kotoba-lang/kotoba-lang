@@ -1,0 +1,229 @@
+(ns kotoba.site.chart
+  "Chart primitives for kotoba-lang.org.
+
+  Pure hiccup. No third-party charting runtime, no colour literal, no `px`
+  type size — every mark reads a `--hig-*` token, so the charts follow the
+  design system into dark mode without a second palette (`jp-go-dds.dark`
+  mirrors the DADS ramps; anything written against the token contract
+  follows unmodified).
+
+  ## Why these forms
+
+  Three of the four benchmark reports were published as wide tables of
+  milliseconds. A table answers *what was the number*; none of them answered
+  *who is faster, and by how much* without the reader doing arithmetic across
+  a scroll container. Each form here is chosen for the question its report
+  asks:
+
+  - `ranked-bars` — magnitude across named toolchains. Bars carry **time**,
+    so the fastest lane is the *shortest* bar; the axis note says so. Plotting
+    a speed ratio would make the winner longest and read better, and would
+    also silently change the measured quantity into a derived one.
+  - `diverging-cell` — one signed comparison, drawn from a centre baseline.
+    Sign is carried by three channels at once (side of the baseline, hue, and
+    a signed number), so neither colour-vision nor a greyscale print is a
+    single point of failure.
+  - `log-lines` — build time against source size. Both axes span three orders
+    of magnitude, so both are log; the caption says so, because a log axis
+    that does not announce itself is a misread waiting to happen.
+
+  ## Not-measured is never zero
+
+  A lane that did not build, or a capability a target does not have, renders
+  as text in the track. It never becomes a zero-length bar: the fastest way
+  to emit an artifact is to emit a broken one, and a chart that draws
+  \"absent\" and \"instant\" the same way rewards exactly that.
+
+  ## The animation is an enhancement, never a precondition
+
+  The final state is what the CSS declares. `site/generate.cljs` adds a class
+  to the root element *only* when it is about to observe the charts and the
+  reader has not asked for reduced motion; that class is what collapses the
+  marks so the reveal has somewhere to travel from. With no JavaScript, a
+  failed observer, or `prefers-reduced-motion: reduce`, the charts render
+  complete rather than empty."
+  (:require [clojure.string :as str]))
+
+(defn- fmt
+  "Fixed-point without trailing-zero noise, as a string."
+  [x digits]
+  #?(:cljs (.toFixed (double x) digits)
+     :clj (format (str "%." digits "f") (double x))))
+
+(defn- pct [x] (str (fmt x 3) "%"))
+
+;; ── ranked bars ─────────────────────────────────────────────────────────────
+
+(defn ranked-bars
+  "Horizontal ranked bars.
+
+  opts:
+    :rows   [{:label :sub :value :display :note :lead? :absent}]
+            `:value` absent (or `:absent` set) renders the reason as text.
+    :axis   one-line note under the chart (say which direction is better)
+    :max    optional shared maximum, for small multiples that must share a
+            scale. Defaults to the largest value present.
+
+  The lead row is the only coloured mark; every other bar is one recessive
+  grey. That is deliberate — a categorical palette here would have to survive
+  a colour-vision check for hues that carry no information, since the label
+  column already gives every row its identity."
+  [{:keys [rows axis max]}]
+  (let [values (keep :value rows)
+        top (or max (when (seq values) (apply clojure.core/max values)) 1)
+        top (if (pos? top) top 1)]
+    [:div {:class "kot-chart"}
+     (into [:ol {:class "kot-bars"}]
+           (for [{:keys [label sub value display note lead? absent]} rows]
+             [:li {:class "kot-bar" :data-lead (when lead? "1")}
+              [:span {:class "kot-bar-label"}
+               label
+               (when sub [:span {:class "kot-bar-sub"} sub])]
+              (if (or absent (nil? value))
+                [:span {:class "kot-bar-track kot-bar-track--absent"}
+                 [:span {:class "kot-bar-absent"} (or absent "not measured")]]
+                [:span {:class "kot-bar-track"}
+                 [:span {:class "kot-bar-fill"
+                         :style (str "--w:" (pct (* 100 (/ (double value) top))))}]])
+              [:span {:class "kot-bar-value"}
+               (or display "—")
+               (when note [:span {:class "kot-bar-note"} note])]]))
+     (when axis [:p {:class "kot-chart-axis"} axis])]))
+
+;; ── diverging cell ──────────────────────────────────────────────────────────
+
+(defn diverging-cell
+  "One signed comparison as a bar grown from a centre baseline.
+
+  opts: :value signed percentage · :display text · :neg-max :pos-max the two
+  arms of the shared scale · :qualified? whether the ordering passed its gate
+  · :title the hover/`title` text carrying why, if not.
+
+  The two arms are scaled independently and the caption must say so: this
+  data runs from about -12% to +92%, and a symmetric scale would flatten
+  every small positive gap into the same invisible sliver as the losses."
+  [{:keys [value display qualified? title neg-max pos-max]}]
+  (let [v (double value)
+        span (if (neg? v) (clojure.core/max 1e-9 (double neg-max))
+                          (clojure.core/max 1e-9 (double pos-max)))
+        w (clojure.core/min 100.0 (* 100 (/ (if (neg? v) (- v) v) span)))]
+    [:span (cond-> {:class "kot-dv" :data-sign (if (neg? v) "neg" "pos")
+                    :data-qualified (when qualified? "1")}
+             title (assoc :title title))
+     [:span {:class "kot-dv-track"}
+      [:span {:class "kot-dv-fill" :style (str "--w:" (pct w))}]]
+     [:span {:class "kot-dv-value"} display
+      (when qualified? [:span {:class "kot-dv-tick" :aria-hidden "true"} "✓"])]]))
+
+;; ── log/log line chart ──────────────────────────────────────────────────────
+
+(defn- log10 [x] #?(:cljs (js/Math.log10 x) :clj (Math/log10 x)))
+
+(defn- spread
+  "Push a sorted list of label anchors apart so none of them overlaps.
+
+  Four of the seven lanes finish within 9 vertical units of each other on a
+  log axis, so end labels stacked at their own y would overprint. Nudging a
+  label away from its line detaches it, which is why every displaced label
+  gets a leader line back to its own end marker (see `log-lines`)."
+  [ys gap lo hi]
+  (let [placed (reduce (fn [acc y]
+                         (conj acc (clojure.core/max y (+ gap (or (peek acc) (- lo gap))))))
+                       [] (sort ys))
+        overflow (- (or (peek placed) hi) hi)]
+    (if (pos? overflow)
+      (mapv #(clojure.core/max lo (- % overflow)) placed)
+      placed)))
+
+(def ^:private end-marks
+  "How a line is allowed to stop.
+
+  A lane that emitted a broken artifact and a lane that refused to build are
+  not the same event, and drawing both as \"the line ends here\" would report
+  a defect and a declared, enforced limit as one thing."
+  {:ok :circle :broke :cross :refused :bar})
+
+(defn log-lines
+  "Multi-series line chart on two log axes, as inline SVG.
+
+  opts:
+    :series [{:id :label :accent? :points [[x y]…] :end-kind}]
+            `:end-kind` is `:ok`, `:broke` (emitted an artifact that is not
+            the program) or `:refused` (declined to build).
+    :x-ticks / :y-ticks  [[value label]…]
+    :x-title :y-title :width :height
+
+  The SVG renders at its natural size inside a scroll container rather than
+  scaling to the column, because scaling an SVG scales its type: a chart
+  legible at 760 units wide has 6px axis labels on a 360px phone. Scrolling a
+  chart is a known interaction; unreadable axis labels are not.
+
+  Only the accented series is coloured, and every line is labelled at its own
+  end — identity never depends on matching a hue to a legend swatch, which is
+  also why no categorical palette is introduced here."
+  [{:keys [series x-ticks y-ticks x-title y-title width height]
+    :or {width 760 height 360}}]
+  (let [pad-l 72 pad-r 152 pad-t 18 pad-b 48
+        x0 pad-l x1 (- width pad-r)
+        y0 pad-t y1 (- height pad-b)
+        drawn (filter #(seq (:points %)) series)
+        xs (mapcat #(map first (:points %)) drawn)
+        ys (mapcat #(map second (:points %)) drawn)
+        lxmin (log10 (apply min xs)) lxmax (log10 (apply max xs))
+        lymin (log10 (apply min ys)) lymax (log10 (apply max ys))
+        sx (fn [x] (+ x0 (* (- x1 x0) (/ (- (log10 x) lxmin)
+                                         (clojure.core/max 1e-9 (- lxmax lxmin))))))
+        sy (fn [y] (- y1 (* (- y1 y0) (/ (- (log10 y) lymin)
+                                         (clojure.core/max 1e-9 (- lymax lymin))))))
+        ends (map (fn [srs] (let [[x y] (last (:points srs))]
+                              (assoc srs :ex (sx x) :ey (sy y))))
+                  drawn)
+        ordered (sort-by :ey ends)
+        label-ys (spread (map :ey ordered) 15 (+ y0 6) y1)
+        anchored (map #(assoc %1 :ly %2) ordered label-ys)]
+    [:div {:class "kot-chart kot-chart-scroll"}
+     (into
+      [:svg {:class "kot-lines" :viewBox (str "0 0 " width " " height)
+             :width width :height height :role "img"
+             :aria-label (str y-title " against " x-title " for "
+                             (count drawn) " toolchain lanes")}]
+      (concat
+       (for [[y _] y-ticks]
+         [:line {:class "kot-grid" :x1 x0 :x2 x1
+                 :y1 (fmt (sy y) 1) :y2 (fmt (sy y) 1)}])
+       (for [[y lab] y-ticks]
+         [:text {:class "kot-tick kot-tick-y" :x (- x0 8) :y (fmt (+ 4 (sy y)) 1)} lab])
+       (for [[x lab] x-ticks]
+         [:text {:class "kot-tick kot-tick-x" :x (fmt (sx x) 1) :y (+ y1 20)} lab])
+       [[:text {:class "kot-axis-title" :x (/ (+ x0 x1) 2) :y (+ y1 40)} x-title]
+        [:text {:class "kot-axis-title kot-axis-title-y"
+                :transform (str "rotate(-90 13 " (/ (+ y0 y1) 2) ")")
+                :x 13 :y (/ (+ y0 y1) 2)} y-title]]
+       (for [{:keys [id points accent?]} drawn
+             :let [d (str/join " " (map-indexed
+                                    (fn [i [x y]]
+                                      (str (if (zero? i) "M" "L")
+                                           (fmt (sx x) 1) " " (fmt (sy y) 1)))
+                                    points))]]
+         [:path {:class "kot-line" :d d :data-accent (when accent? "1")
+                 :pathLength 1000 :data-series (name id)}])
+       ;; Every label gets a leader back to its own end marker. A label at
+       ;; the right margin whose line stopped in the middle of the chart is
+       ;; the case that most needs one, and that is also the case where the
+       ;; vertical displacement can be zero.
+       (for [{:keys [ex ey ly]} anchored]
+         [:path {:class "kot-leader"
+                 :d (str "M" (fmt (+ ex 6) 1) " " (fmt ey 1)
+                         "L" (fmt (+ x1 14) 1) " " (fmt ly 1))}])
+       (for [{:keys [ex ey accent? end-kind]} anchored]
+         (case (end-marks (or end-kind :ok))
+           :cross [:g {:class "kot-end kot-end-broke" :data-accent (when accent? "1")}
+                   [:path {:d (str "M" (fmt (- ex 4.5) 1) " " (fmt (- ey 4.5) 1) "l9 9"
+                                   "M" (fmt (+ ex 4.5) 1) " " (fmt (- ey 4.5) 1) "l-9 9")}]]
+           :bar [:g {:class "kot-end kot-end-refused" :data-accent (when accent? "1")}
+                 [:path {:d (str "M" (fmt ex 1) " " (fmt (- ey 5.5) 1) "v11")}]]
+           [:circle {:class "kot-end" :data-accent (when accent? "1")
+                     :cx (fmt ex 1) :cy (fmt ey 1) :r 4}]))
+       (for [{:keys [ly accent? label]} anchored]
+         [:text {:class "kot-line-label" :data-accent (when accent? "1")
+                 :x (+ x1 18) :y (fmt (+ 4 ly) 1)} label])))]))
