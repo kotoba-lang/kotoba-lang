@@ -12,6 +12,8 @@
          '[cljs.reader :as reader]
          '[clojure.string :as str]
          '[kotoba.site.hero :as hero]
+         '[kotoba.site.chart :as chart]
+         '[kotoba.site.catalog :as catalog]
          '[html.core :as html]
          '["crypto" :as crypto]
          '["fs" :as fs]
@@ -122,6 +124,65 @@
   (js->clj (js/JSON.parse (fs/readFileSync build-scaling-source-path "utf8"))
            :keywordize-keys true))
 
+(def cold-start
+  "The one speed ordering on this page that its own gate qualifies.
+
+  Four of the five public reports record a FAILED quiet-host gate, so none of
+  them may rank anything, and this page says so next to each of them. The
+  build-scaling report is the exception and the reason is structural rather
+  than lucky: its lanes are interleaved on one host and every ordering is put
+  through perfgate at its own unrelaxed default policy, which refuses any gap
+  that falls inside the two arms' combined spread. A gap that survives that
+  test survives the host being busy.
+
+  At the smallest source size the released Kotoba CLI passes it against every
+  comparator the host could build. That — bounded to this host, this size and
+  this run — is the only thing the page is allowed to call fastest, and
+  `:qualified?` is read from the report rather than asserted here: if a rerun
+  loses one of those orderings, the hero panel demotes itself."
+  (let [scale (first (:scales build-scaling))
+        lanes (:lanes build-scaling)
+        lead :kotoba-wasm-cli
+        ordering (get-in scale [:ordering lead])
+        base (get-in scale [:lanes lead :summary :median])
+        row (fn [id]
+              (let [r (get-in scale [:lanes id])
+                    m (get-in r [:summary :median])]
+                (cond-> {:id id
+                         :label (get-in lanes [id :label])
+                         :target (get-in lanes [id :target])
+                         :status (:status r)
+                         :lead? (= id lead)}
+                  (= "measured" (:status r))
+                  (assoc :median m :ratio (/ m base)))))]
+    {:lead lead
+     :k (:k scale)
+     :median base
+     :samples (get-in scale [:lanes lead :n])
+     :rows (map row [lead :clang-native :rustc-wasm :rustc-native :javac])
+     :beaten (count ordering)
+     :qualified? (boolean (and (seq ordering)
+                               (every? :qualifiedFaster (vals ordering))))
+     :date (subs (:generatedAt build-scaling) 0 10)
+     :host (get-in build-scaling [:environment :cpu])}))
+
+(def library-catalog
+  (reader/read-string (fs/readFileSync (path/join "site" "library-catalog.edn") "utf8")))
+
+(def library-taxonomy
+  (reader/read-string (fs/readFileSync (path/join "site" "library-taxonomy.edn") "utf8")))
+
+(def tagged-catalog
+  "Every public repository in the org, tagged.
+
+  `:untagged` is published on the page rather than swallowed. 1,160 of these
+  repositories carry no GitHub description, so the only evidence a domain tag
+  could come from is the name — and for some of them the name is a metaphor
+  (`kuro`, `kobo`, `byoubu`) that says nothing about the function on purpose.
+  Assigning those a nearest-guess tag would make the catalogue look complete
+  while making it wrong, and a reader could not tell the two apart."
+  (catalog/tag-all library-taxonomy library-catalog))
+
 (def play-source (fs/readFileSync play-source-path "utf8"))
 (def play-provenance (reader/read-string (fs/readFileSync play-provenance-path "utf8")))
 (def play-sha256 (get-in play-provenance [:outputs :primary :sha256]))
@@ -208,6 +269,9 @@
 
 (def public-contact-email "support@kotoba-lang.org")
 
+(defn- thousands [n]
+  (str/replace (str n) #"\B(?=(\d{3})+$)" ","))
+
 (defn code [s] [:code {:class "kot-code"} s])
 (defn caption [& children] (into [:p {:class "kot-muted kot-caption"}] children))
 (defn external-link [href label]
@@ -247,22 +311,186 @@
                    [:span {:class (str "kot-syntax-" (name kind))} text])))
           tokens)))
 
+(defn highlighted-kotoba-chars
+  "`highlighted-kotoba`, with every visible character in its own span.
+
+  The morph turns each character into a hex digit and back, so each one has to
+  be addressable. The grammar's round-trip assertion still runs on the tokens
+  before this splits them, and the text content is unchanged, so what is
+  displayed is still exactly the file's bytes.
+
+  Emitted as one pre-rendered string rather than nested hiccup, and that is
+  not a micro-optimisation. `html.core` indents an element whose children are
+  ALL elements — true of a token like `examples.w1-pure` once every character
+  is a span — and inside `white-space: pre` each of those indents is a real
+  line break. Measured: the hero rendered one character per line. `<pre>` is
+  on the renderer's preserve-whitespace list but `<code>` is not, so the
+  safety net does not reach this element.
+
+  Whitespace stays as plain text: wrapping it would multiply the markup for
+  characters that never change, and it is what keeps the source's own newlines
+  and indentation intact."
+  [source]
+  (let [tokens (mapv #(assoc % :kind (scope-kind (:scope %)))
+                     (grammar-highlight/tokenize source))
+        reconstructed (apply str (map :text tokens))
+        counter (volatile! -1)]
+    (when-not (= source reconstructed)
+      (throw (js/Error. "Kotoba syntax highlighting changed the displayed source")))
+    [:code {:class "kot-source kot-morph-src" :aria-label "Kotoba source code"}
+     (html/raw
+      (apply str
+             (for [{:keys [kind text]} tokens
+                   :let [inner (apply str
+                                      (for [c (seq text)]
+                                        (if (str/blank? c)
+                                          (html/esc c)
+                                          (str "<span class=\"kot-ch\" style=\"--i:"
+                                               (vswap! counter inc) "\">"
+                                               (html/esc c) "</span>"))))]]
+               (if (= :plain kind)
+                 inner
+                 (str "<span class=\"kot-syntax-" (name kind) "\">" inner "</span>")))))]))
+
+(def identity-layers
+  "The identities this one program has, read out of its provenance receipt.
+
+  They are deliberately different hashes of different things, which is the
+  point the animation is making: source bytes, the checked intermediate
+  representation, and the artifact identity that binds code, policy, compiler
+  contract and target ABI are three facts, not one. None of them is authority
+  to run anything — that is the architecture section's job to say, and it does."
+  [{:key :source :label "source bytes"
+    :sha (:source-sha256 play-provenance)
+    :note "sha-256 of the exact file shown here"}
+   {:key :kir :label "checked KIR"
+    :sha (:kir-sha256 play-provenance)
+    :note "the typed, effect-checked representation the compiler admitted"}
+   {:key :artifact :label "artifact identity"
+    :sha (:sha256 play-provenance)
+    :note "binds source, policy, compiler contract and target ABI"}])
+
+(defn hero-code
+  "The first screen's Kotoba program, and the hashes it turns into.
+
+  Same file as the Play section further down — the one whose Wasm is checked
+  in with this provenance — so the digests on screen are the recorded digests
+  of the thing you can actually run, not a decorative hex string.
+
+  The list of identities is real text in the page. The animation is an overlay
+  on top of it: with no JavaScript, or with reduced motion, the code and all
+  three hashes are simply there."
+  []
+  [:div {:class "kot-morph" :id "kot-morph"
+         :data-layers (str/join "|" (for [{:keys [label sha]} identity-layers]
+                                      (str label " " sha)))}
+   [:div {:class "kot-morph-stage"}
+    [:pre {:class "kot-pre kot-morph-code"} (highlighted-kotoba-chars play-source)]
+    [:div {:class "kot-morph-out" :aria-hidden "true"}
+     [:span {:class "kot-morph-label"}]
+     [:span {:class "kot-morph-hex"}]]]
+   [:ul {:class "kot-morph-ids"}
+    (for [{:keys [label sha note]} identity-layers]
+      [:li [:span {:class "kot-morph-id-label"} label]
+       [:code {:class "kot-code kot-morph-id-sha"} (subs sha 0 16) "…"]
+       [:span {:class "kot-morph-id-note"} note]])]])
+
 (def app-css
   (str
    ".kot-skip{position:absolute;inset-inline-start:var(--hig-spacing-2);"
    "transform:translateY(-150%);padding:var(--hig-spacing-2) var(--hig-spacing-3);"
    "background:var(--hig-color-system-background);color:var(--hig-color-label);z-index:3}"
    ".kot-skip:focus{transform:translateY(var(--hig-spacing-2))}"
-   ".kot-header{position:relative;z-index:2;background:var(--hig-color-system-background);"
+   ".kot-header{position:relative;z-index:2;"
+   "background:var(--hig-color-system-background);"
    "border-bottom:var(--hig-hairline) solid var(--hig-color-separator)}"
-   ".kot-header__inner{display:flex;align-items:flex-start;flex-direction:column;"
+   ".kot-header__inner{position:relative;display:flex;align-items:center;flex-direction:row;"
+   "justify-content:space-between;gap:var(--hig-spacing-2);"
    "gap:var(--hig-spacing-3);padding-block:var(--hig-spacing-3)}"
-   ".kot-wordmark{display:inline-flex;align-items:center;text-decoration:none}"
-   ".kot-logo{display:block;height:var(--hig-spacing-7);width:auto}"
-   ".kot-nav{display:flex;align-items:center;justify-content:flex-start;flex-wrap:wrap;"
-   "gap:var(--hig-spacing-2);width:100%}"
+   ".kot-wordmark{display:inline-flex;align-items:center;gap:.12em;min-width:0;"
+   "text-decoration:none}"
+   ".kot-paren{font-family:var(--hig-font-mono);font-size:1rem;line-height:1;"
+   "font-weight:400;color:var(--hig-color-tint)}"
+   ;; A texture, not data: hairline strokes at low opacity, and it sits behind
+   ;; the header row so the nav keeps the surface it is measured against.
+   ;; The motif lives in the page margins, never over the nav. Below 64rem the
+   ;; container fills the viewport and there is no margin to put it in, so it
+   ;; is not drawn at all rather than drawn on top of something.
+   ".kot-lisp-edge{display:none;overflow:clip}"
+   ".kot-lisp-nest{display:block;height:100%;width:auto;max-width:none;fill:none;"
+   "stroke:var(--hig-color-tint);stroke-width:2;stroke-linecap:round}"
+   ".kot-header__inner{position:relative;z-index:1}"
+   ".kot-logo{display:block;height:var(--hig-spacing-4);width:auto;max-width:100%}"
+   ;; ── the menu ─────────────────────────────────────────────────────────────
+   ".kot-nav-inline{display:none}"
+   ".kot-menu{position:static}"
+   ".kot-menu-label{display:none}"
+   "#kot-gh{padding-inline:var(--hig-spacing-2)}"
+   ".kot-menu-summary{display:inline-flex;align-items:center;justify-content:center;"
+   "gap:var(--hig-spacing-1);min-width:calc(44 / 16 * 1rem);"
+   "min-height:calc(44 / 16 * 1rem);padding-inline:var(--hig-spacing-2);"
+   "border-radius:var(--hig-radius-xs);color:var(--hig-color-tint);"
+   "font-weight:700;cursor:pointer;list-style:none}"
+   ".kot-menu-summary::-webkit-details-marker{display:none}"
+   ".kot-menu-caret{display:none;transition:transform .2s ease}"
+   ".kot-menu[open] .kot-menu-caret{transform:rotate(180deg)}"
+   ".kot-menu-burger{display:block}"
+   ".kot-menu[open] .kot-menu-burger{opacity:.55}"
+   ".kot-menu-panel{position:absolute;z-index:3;inset-inline:0;"
+   "top:calc(100% + var(--hig-spacing-3));display:grid;gap:var(--hig-spacing-4);"
+   "max-height:calc(100dvh - 7rem);overflow:auto;padding:var(--hig-spacing-4);"
+   "border:1px solid var(--hig-color-separator);border-radius:var(--hig-radius-sm);"
+   "background:var(--hig-color-system-background);box-shadow:0 8px 28px rgb(0 0 0 / 18%)}"
+   ".kot-menu-group-label{margin:0 0 var(--hig-spacing-2);"
+   "color:var(--hig-color-secondary-label);font-size:var(--hig-text-caption1-font-size);"
+   "letter-spacing:.08em;text-transform:uppercase}"
+   ".kot-menu-list{list-style:none;margin:0;padding:0;display:grid}"
+   ".kot-menu-link{display:flex;align-items:center;gap:var(--hig-spacing-2);"
+   "min-height:calc(44 / 16 * 1rem);color:var(--hig-color-label);text-decoration:none}"
+   ".kot-menu-link:hover,.kot-menu-link:focus-visible{color:var(--hig-color-tint);"
+   "text-decoration:underline;text-underline-offset:.18em}"
+   ".kot-menu-n{color:var(--hig-color-tint);font-family:var(--hig-font-mono);"
+   "font-size:var(--hig-text-caption1-font-size)}"
+   ;; ── the contents strip ───────────────────────────────────────────────────
+   ".kot-contents{margin-block:var(--hig-spacing-9) var(--hig-spacing-8)}"
+   ".kot-contents-label{margin:0 0 var(--hig-spacing-3);"
+   "color:var(--hig-color-secondary-label);font-size:var(--hig-text-caption1-font-size);"
+   "letter-spacing:.08em;text-transform:uppercase}"
+   ".kot-contents-list{list-style:none;margin:0;padding:0;display:grid;"
+   "gap:var(--hig-spacing-1)}"
+   ".kot-contents-link{display:grid;grid-template-columns:2.5rem 1fr;"
+   "align-items:baseline;gap:var(--hig-spacing-1) var(--hig-spacing-2);"
+   "padding-block:var(--hig-spacing-3);"
+   "border-top:1px solid var(--hig-color-separator);"
+   "color:var(--hig-color-label);text-decoration:none}"
+   ".kot-contents-list li:last-child .kot-contents-link{"
+   "border-bottom:1px solid var(--hig-color-separator)}"
+   ".kot-contents-n{color:var(--hig-color-tint);font-family:var(--hig-font-mono);"
+   "font-size:var(--hig-text-footnote-font-size)}"
+   ".kot-contents-t{font-weight:700}"
+   ".kot-contents-b{grid-column:2;color:var(--hig-color-secondary-label);"
+   "font-size:var(--hig-text-footnote-font-size);"
+   "line-height:var(--hig-text-footnote-line-height)}"
+   ".kot-contents-link:hover .kot-contents-t,"
+   ".kot-contents-link:focus-visible .kot-contents-t{color:var(--hig-color-tint);"
+   "text-decoration:underline;text-underline-offset:.18em}"
+   ;; ── chapter rules ────────────────────────────────────────────────────────
+   ".kot-chapter{display:flex;align-items:baseline;gap:var(--hig-spacing-3);"
+   "margin-block:var(--hig-spacing-9) var(--hig-spacing-6);"
+   "padding-top:var(--hig-spacing-4);"
+   "border-top:2px solid var(--hig-color-tint)}"
+   ".kot-chapter-n{color:var(--hig-color-tint);font-family:var(--hig-font-mono);"
+   "font-weight:700}"
+   ".kot-chapter-t{color:var(--hig-color-secondary-label);font-weight:700;"
+   "letter-spacing:.08em;text-transform:uppercase;"
+   "font-size:var(--hig-text-footnote-font-size)}"
+   ".kot-chapter-block>.dds-ext-section:first-of-type{padding-top:0;border-top:none}"
+   ".kot-chapter-block>.dds-ext-section:last-of-type{padding-bottom:0}"
+   ".kot-nav{display:flex;align-items:center;justify-content:flex-end;flex-wrap:nowrap;"
+   "gap:var(--hig-spacing-2);flex:0 0 auto}"
    ".kot-hero{position:relative;overflow:clip;padding-block:var(--hig-spacing-8)}"
-   ".kot-hero-canvas{position:absolute;inset:0;z-index:0;pointer-events:none}"
+   ".kot-hero-canvas{position:absolute;inset:0;z-index:0;pointer-events:none;"
+   "color:var(--hig-color-tint)}"
    ".kot-hero-canvas>canvas,.kot-hero-canvas>svg{position:absolute;inset:0;width:100%;height:100%;display:block}"
    ".kot-hero-canvas>svg{fill:var(--hig-color-tint);opacity:.55}"
    ".kot-hero>.dds-ext-container{position:relative;z-index:1}"
@@ -279,6 +507,13 @@
    ".kot-caption{font-size:var(--hig-text-footnote-font-size);"
    "line-height:var(--hig-text-footnote-line-height)}"
    ".kot-link{color:var(--hig-color-tint);text-underline-offset:.18em}"
+   ;; DADS's blue text chip resolves to a step whose dark mirror measures
+   ;; 4.42:1 against the dark surface — below WCAG AA for its own 16px normal
+   ;; weight (measured 2026-09-07). Point it at the accent this page already
+   ;; uses everywhere else rather than inventing a colour: 11.10:1 light,
+   ;; 8.76:1 dark, and chips now match the eyebrow instead of being a second
+   ;; blue. This is an upstream jp-go-dds.dark gap, not a local preference.
+   ".dads-chip-label[data-style=\"text\"][data-color=\"blue\"]{color:var(--hig-color-tint)}"
    ".kot-search-item[hidden]{display:none}"
    ".kot-play{display:grid;gap:var(--hig-spacing-4)}"
    ".kot-play-status{min-height:1.5em;margin:0;font-family:var(--hig-font-mono)}"
@@ -293,6 +528,50 @@
    "padding:var(--hig-spacing-4);background:var(--hig-color-quaternary-system-fill);"
    "border-radius:var(--hig-radius-md)}"
    ".kot-source{display:block;white-space:pre;tab-size:2}"
+   ;; ── the theme switch: the Lisp mark is the control ───────────────────────
+   "#kot-theme{min-width:calc(44 / 16 * 1rem);min-height:calc(44 / 16 * 1rem);"
+   "padding-inline:var(--hig-spacing-2);color:var(--hig-color-tint)}"
+   ".kot-yy{display:inline-flex}"
+   ".kot-yy-ring{fill:none;stroke:currentColor;stroke-width:1;opacity:.5}"
+   ".kot-yy-yin{fill:currentColor}"
+   ".kot-lam{fill:none;stroke-width:2.4;stroke-linecap:round}"
+   ;; The lambda sitting on the inked half is knocked out in the page surface;
+   ;; the other is inked in the tint. Swap them and each one vanishes into its
+   ;; own background.
+   ".kot-lam-cut{stroke:var(--hig-color-system-background)}"
+   ".kot-lam-ink{stroke:currentColor}"
+   ".kot-yy-fig{transform-origin:12px 12px;transition:transform .55s cubic-bezier(.68,-0.3,.32,1.3)}"
+   "#kot-theme[aria-checked=\"true\"] .kot-yy-fig{transform:rotate(180deg)}"
+   "@media(prefers-reduced-motion:reduce){.kot-yy-fig{transition:none}}"
+   ;; ── the hero program, and the hashes it turns into ───────────────────────
+   ".kot-morph{margin:0 0 var(--hig-spacing-7);max-width:44rem}"
+   ".kot-morph-stage{display:grid;align-items:center;"
+   "background:var(--hig-color-secondary-system-background);"
+   "border:1px solid var(--hig-color-separator);"
+   "border-radius:var(--hig-radius-sm);padding:var(--hig-spacing-4);"
+   "overflow-x:auto}"
+   ".kot-morph-stage>*{grid-area:1/1}"
+   ".kot-morph .kot-pre{background:none;border:0;margin:0;padding:0}"
+   ".kot-morph-code{margin:0;transition:opacity .35s ease}"
+   ".kot-morph .kot-ch{transition:color .3s ease;transition-delay:calc(var(--i) * 4ms)}"
+   ".kot-morph.is-scatter .kot-ch{color:var(--hig-color-tertiary-label)}"
+   ".kot-morph.is-hash .kot-morph-code{opacity:0}"
+   ".kot-morph-out{display:grid;gap:var(--hig-spacing-2);justify-items:start;"
+   "align-content:center;opacity:0;transform:scale(.97);"
+   "pointer-events:none;transition:opacity .35s ease,transform .35s ease}"
+   ".kot-morph.is-hash .kot-morph-out{opacity:1;transform:none}"
+   ".kot-morph-label{color:var(--hig-color-tint);font-weight:700;"
+   "font-size:var(--hig-text-footnote-font-size);letter-spacing:.06em;"
+   "text-transform:uppercase}"
+   ".kot-morph-hex{font-family:var(--hig-font-mono);"
+   "font-size:var(--hig-text-footnote-font-size);line-height:1.5;"
+   "overflow-wrap:anywhere;color:var(--hig-color-label)}"
+   ".kot-morph-ids{list-style:none;margin:var(--hig-spacing-3) 0 0;padding:0;"
+   "display:grid;gap:var(--hig-spacing-2)}"
+   ".kot-morph-ids li{display:flex;flex-wrap:wrap;align-items:baseline;"
+   "gap:var(--hig-spacing-2);font-size:var(--hig-text-footnote-font-size)}"
+   ".kot-morph-id-label{min-width:9rem;color:var(--hig-color-label);font-weight:700}"
+   ".kot-morph-id-note{color:var(--hig-color-secondary-label)}"
    ".kot-syntax-comment{color:var(--hig-color-tertiary-label);font-style:italic}"
    ".kot-syntax-form,.kot-syntax-keyword,.kot-syntax-function{color:var(--hig-color-tint);font-weight:700}"
    ".kot-syntax-definition{color:var(--hig-color-label);font-weight:700;text-decoration:underline;"
@@ -307,23 +586,226 @@
    ".kot-quote{margin:var(--hig-spacing-5) 0 0;padding-inline-start:var(--hig-spacing-4);"
    "border-inline-start:var(--hig-hairline) solid var(--hig-color-tint)}"
    ".kot-table-scroll{max-width:100%;overflow-x:auto}"
+   ;; ── repository catalogue ─────────────────────────────────────────────────
+   ".kot-cat-controls{margin-block:var(--hig-spacing-4)}"
+   ".kot-cat-controls .dads-input-text{display:block}"
+   ".kot-cat-controls .dads-input-text__input{width:100%;max-width:28rem}"
+   ".kot-cat-tags{display:flex;flex-wrap:wrap;gap:var(--hig-spacing-2);"
+   "margin-block:var(--hig-spacing-3)}"
+   ".kot-cat-tags .dads-button[aria-pressed=\"true\"]{background:var(--hig-color-tint);"
+   "color:var(--hig-color-system-background);border-color:var(--hig-color-tint)}"
+   ".kot-cat-list{list-style:none;margin:var(--hig-spacing-4) 0 0;padding:0}"
+   ".kot-lib{display:grid;gap:var(--hig-spacing-1);padding-block:var(--hig-spacing-3);"
+   "border-top:1px solid var(--hig-color-separator)}"
+   ".kot-lib[hidden]{display:none}"
+   ".kot-lib-name{font-family:var(--hig-font-mono);font-weight:700;"
+   "color:var(--hig-color-tint);text-underline-offset:.18em;justify-self:start}"
+   ".kot-lib-flag{justify-self:start;font-size:var(--hig-text-caption1-font-size);"
+   "color:var(--hig-color-secondary-label);text-transform:uppercase;letter-spacing:.04em}"
+   ".kot-lib-desc{color:var(--hig-color-secondary-label);"
+   "font-size:var(--hig-text-footnote-font-size);"
+   "line-height:var(--hig-text-footnote-line-height)}"
+   ".kot-lib-tags{display:flex;flex-wrap:wrap;gap:var(--hig-spacing-1)}"
+   ".kot-lib-tag{padding:.1em .5em;border-radius:var(--hig-radius-capsule);"
+   "background:var(--hig-color-tertiary-system-fill);color:var(--hig-color-label);"
+   "font-family:var(--hig-font-mono);font-size:var(--hig-text-caption1-font-size)}"
    ".kot-footer{padding-block:var(--hig-spacing-7);"
    "border-top:var(--hig-hairline) solid var(--hig-color-separator)}"
+   "@media(min-width:48rem){.kot-nav-inline{display:flex;align-items:center;"
+   "gap:var(--hig-spacing-1)}"
+   ".kot-logo{height:var(--hig-spacing-7)}.kot-paren{font-size:2.1rem}"
+   ".kot-menu-panel{inset-inline:auto 0;width:auto;min-width:19rem;"
+   "max-height:min(70dvh,34rem)}"
+   ".kot-contents-link{grid-template-columns:3rem 14rem 1fr}"
+   ".kot-contents-b{grid-column:auto}}"
+   ;; 320px is the one width that cannot hold a fourth control beside the
+   ;; wordmark; from 23rem it can, so GitHub appears there.
+   "#kot-gh{display:none}"
+   "@media(min-width:23rem){#kot-gh{display:inline-flex}"
+   ".kot-logo{height:calc(15 / 16 * 1rem)}.kot-paren{font-size:1rem}}"
+   "@media(min-width:26rem){.kot-logo{height:calc(17 / 16 * 1rem)}"
+   ".kot-paren{font-size:1.15rem}}"
+   "@media(min-width:34rem){.kot-menu-label{display:inline}"
+   ".kot-menu-caret{display:block}.kot-menu-burger{display:none}"
+   ".kot-menu-summary{padding-inline:var(--hig-spacing-3)}"
+   "#kot-gh{padding-inline:var(--hig-spacing-3)}"
+   ".kot-logo{height:calc(20 / 16 * 1rem)}.kot-paren{font-size:1.35rem}}"
+   "@media(min-width:42rem){.kot-logo{height:var(--hig-spacing-6)}"
+   ".kot-paren{font-size:1.7rem}}"
    "@media(min-width:36rem){.kot-actions{display:flex;flex-wrap:wrap}"
    ".kot-hero h1{font-size:2.75rem;line-height:1.15}}"
+   "@media(min-width:64rem){"
+   ".kot-lisp-edge{display:block;position:absolute;inset-block:0;width:5.25rem;"
+   "opacity:.22;pointer-events:none;z-index:0}"
+   ".kot-lisp-edge[data-side=start]{inset-inline-start:0}"
+   ".kot-lisp-edge[data-side=end]{inset-inline-end:0;transform:scaleX(-1)}}"
    "@media(min-width:48rem){.kot-header{position:sticky;top:0}"
-   ".kot-header__inner{align-items:center;flex-direction:row;justify-content:space-between}"
-   ".kot-nav{justify-content:flex-end;width:auto}.kot-hero{padding-block:var(--hig-spacing-10) var(--hig-spacing-9)}}"))
+   ".kot-hero{padding-block:var(--hig-spacing-10) var(--hig-spacing-9)}}"
+   ;; ── charts ───────────────────────────────────────────────────────────────
+   ;; Every mark reads a --hig-* token, so jp-go-dds.dark carries the whole
+   ;; chart layer into dark mode without a second palette. Bar length is TIME,
+   ;; so the fastest lane is the shortest bar and each chart says so.
+   ;; The row layout has to answer to the width of the CHART, not the window:
+   ;; the same component is 60rem wide in the hero and 17rem wide inside a
+   ;; small-multiple card. A viewport media query gives the narrow card the
+   ;; wide layout and squeezes its bars to a sliver (measured).
+   ".kot-chart{margin-block:var(--hig-spacing-5) var(--hig-spacing-3);"
+   "container-type:inline-size}"
+   ".kot-chart-scroll{max-width:100%;overflow-x:auto}"
+   ".kot-chart-axis{margin:var(--hig-spacing-2) 0 0;color:var(--hig-color-secondary-label);"
+   "font-size:var(--hig-text-footnote-font-size);line-height:var(--hig-text-footnote-line-height)}"
+   ".kot-bars{list-style:none;margin:0;padding:0;display:grid;gap:var(--hig-spacing-3)}"
+   ".kot-bar{display:grid;grid-template-columns:minmax(0,1fr) auto;"
+   "column-gap:var(--hig-spacing-3);row-gap:var(--hig-spacing-1);align-items:center}"
+   ;; Rows are explicit: auto-placement puts the value BELOW a track that
+   ;; spans both columns, which detaches it from the label it belongs to.
+   ".kot-bar-label{grid-row:1;grid-column:1;font-weight:700;line-height:1.3}"
+   ".kot-bar-value{grid-row:1;grid-column:2}"
+   ".kot-bar-track{grid-row:2;grid-column:1/-1}"
+   ".kot-bar-sub{display:block;font-weight:400;color:var(--hig-color-secondary-label);"
+   "font-size:var(--hig-text-footnote-font-size)}"
+   ".kot-bar-track{position:relative;display:block;height:var(--hig-spacing-3);"
+   "border-radius:2px;background:var(--hig-color-tertiary-system-fill)}"
+   ".kot-bar-track--absent{background:none;height:auto}"
+   ".kot-bar-fill{position:absolute;inset-block:0;inset-inline-start:0;width:var(--w);"
+   "min-width:2px;background:var(--hig-color-tertiary-label);"
+   "border-start-end-radius:var(--hig-spacing-1);border-end-end-radius:var(--hig-spacing-1)}"
+   ".kot-bar[data-lead] .kot-bar-fill{background:var(--hig-color-tint)}"
+   ".kot-bar-absent{display:block;overflow-wrap:anywhere;color:var(--hig-color-secondary-label);"
+   "font-size:var(--hig-text-footnote-font-size);line-height:var(--hig-text-footnote-line-height)}"
+   ".kot-bar-value{font-family:var(--hig-font-mono);font-variant-numeric:tabular-nums;"
+   "text-align:end;white-space:nowrap;line-height:1.3}"
+   ".kot-bar-note{display:block;font-family:var(--hig-font-text);font-variant-numeric:normal;"
+   "font-size:var(--hig-text-footnote-font-size);color:var(--hig-color-secondary-label)}"
+   ".kot-bar[data-lead] .kot-bar-note{color:var(--hig-color-label);font-weight:700}"
+   ;; Narrow charts are the base: label and value on one line, the track on
+   ;; its own line under them. From 30rem of CHART width the row becomes
+   ;; label / track / value, which is where a ranked bar chart actually reads.
+   "@container (min-width:30rem){"
+   ".kot-bar{grid-template-columns:minmax(8rem,13rem) minmax(0,1fr) minmax(5.5rem,auto)}"
+   ".kot-bar-label,.kot-bar-track,.kot-bar-value{grid-row:auto;grid-column:auto}}"
+   ".kot-dv{display:grid;grid-template-columns:minmax(3.5rem,1fr) auto;align-items:center;"
+   "gap:var(--hig-spacing-2);min-width:9rem}"
+   ".kot-dv-track{position:relative;display:block;height:var(--hig-spacing-3);"
+   "border-radius:2px;background:var(--hig-color-tertiary-system-fill)}"
+   ".kot-dv-track::before{content:\"\";position:absolute;inset-block:0;"
+   "inset-inline-start:calc(50% - 1px);width:2px;background:var(--hig-color-separator)}"
+   ".kot-dv-fill{position:absolute;inset-block:0;width:calc(var(--w)/2);min-width:2px}"
+   ".kot-dv[data-sign=pos] .kot-dv-fill{inset-inline-start:50%;background:var(--hig-color-tint);"
+   "border-start-end-radius:var(--hig-spacing-1);border-end-end-radius:var(--hig-spacing-1)}"
+   ".kot-dv[data-sign=neg] .kot-dv-fill{inset-inline-end:50%;background:var(--hig-palette-orange);"
+   "border-start-start-radius:var(--hig-spacing-1);border-end-start-radius:var(--hig-spacing-1)}"
+   ".kot-dv:not([data-qualified]) .kot-dv-fill{opacity:.5}"
+   ".kot-dv-value{font-family:var(--hig-font-mono);font-variant-numeric:tabular-nums;"
+   "white-space:nowrap;font-size:var(--hig-text-footnote-font-size)}"
+   ".kot-dv-tick{margin-inline-start:.3em;color:var(--hig-color-tint);font-weight:700}"
+   ".kot-lines{display:block;min-width:46rem}"
+   ".kot-grid{stroke:var(--hig-color-separator)}"
+   ".kot-tick,.kot-axis-title,.kot-line-label{font-family:var(--hig-font-text);"
+   "font-size:var(--hig-text-caption2-font-size);fill:var(--hig-color-secondary-label)}"
+   ".kot-tick-y{text-anchor:end}"
+   ".kot-tick-x,.kot-axis-title{text-anchor:middle}"
+   ".kot-line{fill:none;stroke:var(--hig-color-tertiary-label);stroke-width:2;"
+   "stroke-linecap:round;stroke-linejoin:round}"
+   ".kot-line[data-accent]{stroke:var(--hig-color-tint);stroke-width:3}"
+   ".kot-end{fill:var(--hig-color-tertiary-label);stroke:var(--hig-color-system-background);stroke-width:2}"
+   ".kot-end[data-accent]{fill:var(--hig-color-tint)}"
+   ".kot-end-broke path,.kot-end-refused path{fill:none;"
+   "stroke:var(--hig-color-tertiary-label);stroke-width:2;stroke-linecap:round}"
+   ".kot-end-broke[data-accent] path,.kot-end-refused[data-accent] path{stroke:var(--hig-color-tint)}"
+   ".kot-leader{fill:none;stroke:var(--hig-color-separator);stroke-width:1;"
+   "stroke-dasharray:2 3}"
+   ".kot-line-label[data-accent]{fill:var(--hig-color-label);font-weight:700}"
+   ;; ── the speed panel on the first screen ──────────────────────────────────
+   ".kot-speed{margin:var(--hig-spacing-7) 0 0;padding:var(--hig-spacing-5);"
+   "border:1px solid var(--hig-color-separator);border-radius:var(--hig-radius-md);"
+   "background:var(--hig-color-system-background)}"
+   ".kot-speed h2{margin:var(--hig-spacing-3) 0 0;text-wrap:balance}"
+   ".kot-speed-figure{display:flex;align-items:flex-end;flex-wrap:wrap;"
+   "column-gap:var(--hig-spacing-4);row-gap:var(--hig-spacing-2);"
+   "margin-block:var(--hig-spacing-4) var(--hig-spacing-2)}"
+   ".kot-speed-figure p{margin:0}"
+   ".kot-speed-value{font-weight:700;line-height:1;letter-spacing:-.01em;"
+   "font-size:clamp(calc(44 / 16 * 1rem),11vw,calc(64 / 16 * 1rem))}"
+   ".kot-speed-unit{margin-inline-start:.1em;font-size:.4em;color:var(--hig-color-secondary-label)}"
+   ".kot-speed-sub{max-width:28rem;padding-block-end:.35rem;color:var(--hig-color-secondary-label);"
+   "font-size:var(--hig-text-footnote-font-size);line-height:var(--hig-text-footnote-line-height)}"
+   ;; ── reveal ───────────────────────────────────────────────────────────────
+   ;; The final state is what the CSS declares; `kot-anim` is added by a head
+   ;; script only when it is about to observe and motion is not reduced. With
+   ;; no JavaScript the charts render complete rather than empty.
+   ".kot-anim .kot-chart .kot-bar-fill,.kot-anim .kot-chart .kot-dv-fill{"
+   "transition:width .85s cubic-bezier(.22,.61,.36,1)}"
+   ".kot-anim .kot-chart:not(.is-in) .kot-bar-fill,"
+   ".kot-anim .kot-chart:not(.is-in) .kot-dv-fill{width:0;min-width:0}"
+   ".kot-anim .kot-chart .kot-line{stroke-dasharray:1000;transition:stroke-dashoffset 1.4s ease-out}"
+   ".kot-anim .kot-chart:not(.is-in) .kot-line{stroke-dashoffset:1000}"
+   ".kot-anim .kot-chart .kot-end,.kot-anim .kot-chart .kot-leader,"
+   ".kot-anim .kot-chart .kot-line-label{transition:opacity .5s ease-out .8s}"
+   ".kot-anim .kot-chart:not(.is-in) .kot-end,"
+   ".kot-anim .kot-chart:not(.is-in) .kot-leader,"
+   ".kot-anim .kot-chart:not(.is-in) .kot-line-label{opacity:0}"
+   "@media(prefers-reduced-motion:reduce){"
+   ".kot-anim .kot-chart *{transition:none!important}"
+   ".kot-anim .kot-chart:not(.is-in) .kot-bar-fill,"
+   ".kot-anim .kot-chart:not(.is-in) .kot-dv-fill{width:var(--w);min-width:2px}"
+   ".kot-anim .kot-chart:not(.is-in) .kot-line{stroke-dashoffset:0}"
+   ".kot-anim .kot-chart:not(.is-in) .kot-end,"
+   ".kot-anim .kot-chart:not(.is-in) .kot-leader,"
+   ".kot-anim .kot-chart:not(.is-in) .kot-line-label{opacity:1}}"))
 
-(def primary-links
+(def chapters
+  "The page as five chapters, in the order the argument runs.
+
+  The sections themselves are unchanged — this is the order they are placed in
+  and the contents strip that names them. Before this the body ran why → what →
+  defaults → docs → code → libraries → roadmap → community → sponsor → cloud →
+  proof → architecture, so the mechanism and the evidence arrived after the
+  sponsorship page, and the reader met the ecosystem before the argument. The
+  anchor of each chapter is its first section's existing id; no new ids, no
+  moved content, no changed words."
+  [{:n "01" :title "The problem" :href "#why"
+    :blurb "What generated code can reach, and what a language can do about it."}
+   {:n "02" :title "How the boundary works" :href "#architecture"
+    :blurb "Source, checked KIR, admission, artifact identity, host enforcement."}
+   {:n "03" :title "The evidence" :href "#proof"
+    :blurb "Five benchmarks, eight claims, and the qualification each one carries."}
+   {:n "04" :title "Start using it" :href "#start"
+    :blurb "Install, read, run a real program, browse the libraries."}
+   {:n "05" :title "Around the language" :href "#roadmap"
+    :blurb "Roadmap, community, sponsorship, cloud services, source."}])
+
+(def nav-menu
+  "Every destination, grouped, in one disclosure.
+
+  The header used to carry ten controls in a flat row: three rows and 202px of
+  header on a 390px screen, and nothing to tell the reader which of the ten
+  mattered. Grouping is the content of this change — the links are the same
+  links."
+  [{:group "Learn"
+    :items [{:label "Docs" :href "#docs"}
+            {:label "Play" :href "#play"}
+            {:label "Libraries" :href "#libraries"}]}
+   {:group "Project"
+    :items [{:label "Roadmap" :href "#roadmap"}
+            {:label "Community" :href "#community"}
+            {:label "Sponsor" :href "./sponsor/"}]}
+   {:group "Elsewhere"
+    :items [{:label "Blog" :href "./blog/"}
+            {:label "Cloud" :href "#cloud"}
+            ;; GitHub is in the header bar from 23rem up, and stays listed here
+            ;; so the 320px class — the one width where the bar cannot hold a
+            ;; fourth control — can still reach it.
+            {:label "GitHub" :href "https://github.com/kotoba-lang/kotoba-lang"}]}])
+
+(def nav-inline
+  "The two destinations kept in the header bar at 48rem and up.
+
+  They are also in the menu. A duplicated navigation link is ordinary — the
+  wordmark already duplicates `#top` — and it is what lets one DOM copy of the
+  menu serve every width without leaving anything unreachable on a phone."
   [{:label "Docs" :href "#docs"}
-   {:label "Play" :href "#play"}
-   {:label "Libraries" :href "#libraries"}
-   {:label "Roadmap" :href "#roadmap"}
-   {:label "Community" :href "#community"}
-   {:label "Sponsor" :href "./sponsor/"}
-   {:label "Blog" :href "./blog/"}
-   {:label "Cloud" :href "#cloud"}])
+   {:label "Play" :href "#play"}])
 
 (def proof-signals
   [{:metric "33 cores"
@@ -336,6 +818,75 @@
     :title "No grant, no host effect"
     :body "An empty policy grants no filesystem, network, process, clock, model, or secret authority. Providers must also validate concrete resource scope."}])
 
+(def ^:private lisp-nest
+  "Four nested opening parentheses, drawn as one cubic each.
+
+  Placed once in each margin — the right one mirrored — so the header reads as
+  a single enclosing form: `(((( … ))))`. The first attempt put a wide nest
+  across the whole header and it was wrong twice over: stretched to the header
+  height the arcs were clipped into unrelated curves, and centred they landed
+  directly behind the nav, so a texture became scratch marks over the links.
+  In the margins there is nothing to sit on top of, and the motif says what it
+  is: this is a Lisp, and the page is one form.
+
+  Drawn rather than fetched — an inline SVG makes no request, and its stroke
+  is `--hig-color-tint`, so it follows the design system into dark mode like
+  every other mark here. `aria-hidden`, because it is ornament and the
+  wordmark link already carries the accessible name."
+  (let [w 84 h 76 depth 4
+        arc (fn [x]
+              (let [c (- x 15)]
+                (str "M" x " 9 C" c " 27 " c " 49 " x " 67")))]
+    [:svg {:class "kot-lisp-nest" :viewBox (str "0 0 " w " " h)
+           :aria-hidden "true" :focusable "false"
+           :preserveAspectRatio "xMaxYMid meet"}
+     (for [i (range depth)]
+       [:path {:d (arc (+ 22 (* i 16)))
+               :opacity (.toFixed (- 0.95 (* i 0.18)) 2)}])]))
+
+(def lisp-backdrop
+  (list [:div {:class "kot-lisp-edge" :data-side "start"} lisp-nest]
+        [:div {:class "kot-lisp-edge" :data-side "end"} lisp-nest]))
+
+(def theme-toggle
+  "Light/dark toggle, drawn as a λ yin-yang.
+
+  The Lisp logo is a circle split by an S-curve with a lambda in each half —
+  one knocked out of the dark side, one inked on the light side. That figure
+  is already a light/dark duality, so it does not need a sun and a moon bolted
+  onto it: **the control is the mark, and toggling rotates it 180°**, which
+  carries the coloured mass from one side to the other. This is our own
+  geometry in the same family, not a copy of the logo file.
+
+  The two λ positions are the roomiest point in each half — the point furthest
+  from the dividing curve and from the rim — found by sampling the filled path
+  rather than eyeballed, and the scale is the largest that keeps both strokes,
+  stroke width included, inside their own half. A λ that crosses the boundary
+  is invisible where it lands on its own colour.
+
+  `role=switch` + `aria-checked` is the honest shape for a two-state control
+  (a button with a label that changes says the opposite thing half the time).
+  It ships `hidden`: without JavaScript there is nothing for it to do, and a
+  dead control is worse than no control — the page still answers to
+  `prefers-color-scheme` on its own."
+  (let [yin "M12 1.4A10.6 10.6 0 0 1 12 22.6A5.3 5.3 0 0 1 12 12A5.3 5.3 0 0 0 12 1.4Z"
+        lam (fn [x y rot cls]
+              [:g {:transform (str "translate(" x " " y ") rotate(" rot ") scale(0.78)")}
+               [:path {:class (str "kot-lam " cls) :d "M-2.2 -4 L2.4 4"}]
+               [:path {:class (str "kot-lam " cls) :d "M-0.6 -1.2 L-2.8 4"}]])]
+    (dds/button
+     [:span {:class "kot-yy"}
+      [:svg {:viewBox "0 0 24 24" :width 26 :height 26
+             :aria-hidden "true" :focusable "false"}
+       [:g {:class "kot-yy-fig"}
+        [:circle {:class "kot-yy-ring" :cx 12 :cy 12 :r 10.6}]
+        [:path {:class "kot-yy-yin" :d yin}]
+        (lam 12.05 17.30 0 "kot-lam-cut")
+        (lam 11.95 6.70 180 "kot-lam-ink")]]]
+     {:type :text :size "sm"
+      :attrs {:id "kot-theme" :role "switch"
+              :aria-checked "false" :aria-label "Dark mode" :hidden true}})))
+
 (defn header
   ([] (header ""))
   ([root]
@@ -346,16 +897,62 @@
                         (str/starts-with? href "./") (str root (subs href 2))
                         :else href))]
      [:header {:class "kot-header"}
+      lisp-backdrop
       (dds/container
        [:div {:class "kot-header__inner"}
         [:a {:class "kot-wordmark" :href (str root "#top") :aria-label "Kotoba home"}
+         ;; `( KOTOBA )` — the wordmark read as one form. Text, not an image,
+         ;; so it scales with the type and inherits the tint in both themes.
+         ;; The link's aria-label already names it, so the glyphs are hidden.
+         [:span {:class "kot-paren" :aria-hidden "true"} "("]
          [:img {:class "kot-logo" :src (str root "kotoba-wordmark.png")
-                :width 480 :height 68 :alt "Kotoba"}]]
+                :width 480 :height 68 :alt "Kotoba"}]
+         [:span {:class "kot-paren" :aria-hidden "true"} ")"]]
         [:nav {:class "kot-nav" :aria-label "Primary"}
-         (for [{:keys [label href]} primary-links]
-           (dds/button label {:type :text :size "sm" :href (local-href href)}))
-         (dds/button "GitHub" {:type :outline :size "sm"
-                                :href "https://github.com/kotoba-lang/kotoba-lang"})]])])))
+         ;; Two quick links from 48rem up; below that the row is wordmark,
+         ;; menu, switch — one line on a 390px screen instead of three.
+         [:span {:class "kot-nav-inline"}
+          (for [{:keys [label href]} nav-inline]
+            (dds/button label {:type :text :size "sm" :href (local-href href)}))]
+         ;; The repository is where the claims can be checked, so it is a bar
+         ;; control rather than a menu row. Outline, not text: it leaves the
+         ;; site, and the one control that does should not look like the ones
+         ;; that do not.
+         (dds/button "GitHub"
+                     {:type :outline :size "sm"
+                      :href "https://github.com/kotoba-lang/kotoba-lang"
+                      :attrs {:id "kot-gh"}})
+         ;; A native <details>: no script decides whether it opens, so it works
+         ;; before and without JavaScript. One script only closes it again
+         ;; after a link inside it is followed.
+         [:details {:class "kot-menu" :id "kot-menu"}
+          [:summary {:class "kot-menu-summary" :aria-label "Menu"}
+           [:span {:class "kot-menu-label"} "Menu"]
+           ;; Two glyphs, one shown at a time. A bare caret with no label reads
+           ;; as "something expands", not as "this is the menu"; the three
+           ;; lines are what people look for when there is no room for a word.
+           [:svg {:class "kot-menu-burger" :viewBox "0 0 24 24" :width 20 :height 20
+                  :aria-hidden "true" :focusable "false"}
+            [:path {:d "M4 7h16M4 12h16M4 17h16" :fill "none" :stroke "currentcolor"
+                    :stroke-width 2 :stroke-linecap "round"}]]
+           [:svg {:class "kot-menu-caret" :viewBox "0 0 24 24" :width 18 :height 18
+                  :aria-hidden "true" :focusable "false"}
+            [:path {:d "M4 8.5 12 16l8-7.5" :fill "none" :stroke "currentcolor"
+                    :stroke-width 2 :stroke-linecap "round" :stroke-linejoin "round"}]]]
+          [:div {:class "kot-menu-panel"}
+           [:div {:class "kot-menu-group"}
+            [:p {:class "kot-menu-group-label"} "On this page"]
+            [:ul {:class "kot-menu-list"}
+             (for [{:keys [n title href]} chapters]
+               [:li [:a {:class "kot-menu-link" :href (local-href href)}
+                     [:span {:class "kot-menu-n"} n] title]])]]
+           (for [{:keys [group items]} nav-menu]
+             [:div {:class "kot-menu-group"}
+              [:p {:class "kot-menu-group-label"} group]
+              [:ul {:class "kot-menu-list"}
+               (for [{:keys [label href]} items]
+                 [:li [:a {:class "kot-menu-link" :href (local-href href)} label]])]])]]
+         theme-toggle]])])))
 
 (def fallback-svg
   (let [pts (hero/stroke-samples 36)
@@ -374,6 +971,152 @@
 (def FYN (str hero/drift-freq-y))
 (def AMAXV (str hero/alpha-max))
 
+(def morph-js
+  "Turns the hero's program into one of its hashes, and back.
+
+  The effect is the argument, not decoration: a Kotoba definition is addressed
+  by what it is, so watching the source resolve into a digest and back is the
+  claim the rest of the page spends paragraphs on. It cycles through the three
+  identities in `identity-layers`, which is why it does not simply fade — the
+  label changes each time, and they are different hashes of different things.
+
+  Everything it needs is already in the DOM: the digests come from a data
+  attribute the generator wrote from the provenance receipt, and the original
+  characters are read back off the page at start-up rather than duplicated
+  into another attribute.
+
+  It runs on hover, on focus, and on a slow timer while the block is actually
+  on screen — the timer is cleared the moment it leaves, so a page scrolled
+  past does no work. `prefers-reduced-motion` returns before any of that is
+  wired up; the code and all three hashes are in the page as ordinary text, so
+  nothing is lost by never running it."
+  (str "(function(){"
+       "var R=document.getElementById('kot-morph');if(!R)return;"
+       "if(window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)').matches)return;"
+       "var C=[].slice.call(R.querySelectorAll('.kot-ch'));if(!C.length)return;"
+       "var O=C.map(function(e){return e.textContent;});"
+       "var L=(R.getAttribute('data-layers')||'').split('|').map(function(t){"
+       "var i=t.lastIndexOf(' ');return{l:t.slice(0,i),h:t.slice(i+1)};});"
+       "if(!L.length||!L[0].h)return;"
+       "var out=R.querySelector('.kot-morph-out'),"
+       "lab=R.querySelector('.kot-morph-label'),hex=R.querySelector('.kot-morph-hex');"
+       "var H='0123456789abcdef',busy=false,turn=0,T=[];"
+       "function at(f,m){T.push(setTimeout(f,m));}"
+       "function stop(){T.forEach(clearTimeout);T=[];}"
+       "function scramble(){for(var i=0;i<C.length;i++)"
+       "C[i].textContent=H.charAt((Math.random()*16)|0);}"
+       "function restore(){for(var i=0;i<C.length;i++)C[i].textContent=O[i];}"
+       "function run(){if(busy)return;busy=true;stop();"
+       "var x=L[turn%L.length];turn++;"
+       "lab.textContent=x.l;hex.textContent=x.h;"
+       "R.classList.add('is-scatter');"
+       "at(scramble,60);at(scramble,180);at(scramble,300);"
+       "at(function(){R.classList.add('is-hash');},420);"
+       "at(function(){R.classList.remove('is-hash');},2400);"
+       "at(scramble,2460);at(scramble,2580);"
+       "at(function(){restore();R.classList.remove('is-scatter');busy=false;},2700);}"
+       "R.addEventListener('mouseenter',run);R.addEventListener('focusin',run);"
+       "var tick=null;"
+       "function idle(on){if(on){if(!tick)tick=setInterval(function(){"
+       "if(!document.hidden)run();},9000);}"
+       "else if(tick){clearInterval(tick);tick=null;}}"
+       "if('IntersectionObserver' in window){"
+       "new IntersectionObserver(function(es){es.forEach(function(e){"
+       "idle(e.isIntersecting);if(e.isIntersecting)at(run,900);});},"
+       "{threshold:0.35}).observe(R);}else{at(run,900);idle(true);}"
+       "})();"))
+
+(def menu-js
+  "Closes the header menu after a link inside it is followed.
+
+  The disclosure itself is native, so it opens and closes without this; all
+  this does is stop an open panel from covering the section the reader just
+  jumped to. Delegated from `document` for the same reason the theme script
+  is: one head script, every page, no dependency on the element existing yet."
+  (str "(function(){"
+       "document.addEventListener('click',function(e){"
+       "var t=e.target;while(t&&t!==document){"
+       "if(t.tagName==='A'&&t.className&&t.className.indexOf&&"
+       "t.className.indexOf('kot-menu-link')>-1){"
+       "var d=document.getElementById('kot-menu');if(d)d.open=false;return;}"
+       "t=t.parentNode;}});"
+       "})();"))
+
+(def theme-js
+  "Theme choice, in one script that runs in <head> on every page.
+
+  It has to be in the head and before paint: applying a stored `dark` after
+  first paint is a white flash on every navigation. It has to be on every page
+  or the choice does not survive a link.
+
+  The click handler is delegated from `document`, so the same head script
+  works even though the button does not exist yet when it runs — that is why
+  there is one script instead of a head script plus a body script per page.
+
+  With no stored choice the page follows `prefers-color-scheme`, which is what
+  `jp-go-dds.dark` already does on its own; the toggle only ever writes an
+  explicit override, and `:root[data-theme]` beats the media query in both
+  directions."
+  (str "(function(){"
+       "var K='kotoba-theme',R=document.documentElement;"
+       "function stored(){try{var v=localStorage.getItem(K);"
+       "return v==='dark'||v==='light'?v:null;}catch(e){return null;}}"
+       "var s=stored();if(s)R.setAttribute('data-theme',s);"
+       "function sysDark(){return !!(window.matchMedia&&"
+       "matchMedia('(prefers-color-scheme: dark)').matches);}"
+       "function current(){var a=R.getAttribute('data-theme');"
+       "return a==='dark'||a==='light'?a:(sysDark()?'dark':'light');}"
+       "function paint(){var b=document.getElementById('kot-theme');if(!b)return;"
+       "var d=current()==='dark';"
+       "b.setAttribute('aria-checked',d?'true':'false');"
+       "b.setAttribute('aria-label',d?'Dark mode, on':'Dark mode, off');}"
+       "document.addEventListener('click',function(e){"
+       "var t=e.target,b=null;"
+       "while(t&&t!==document){if(t.id==='kot-theme'){b=t;break;}t=t.parentNode;}"
+       "if(!b)return;"
+       "var n=current()==='dark'?'light':'dark';"
+       "R.setAttribute('data-theme',n);"
+       "try{localStorage.setItem(K,n);}catch(e2){}"
+       "paint();});"
+       "function ready(){var b=document.getElementById('kot-theme');"
+       "if(b){b.hidden=false;paint();}}"
+       "if(document.readyState==='loading')"
+       "document.addEventListener('DOMContentLoaded',ready);else ready();"
+       ;; While no explicit choice is stored the page still follows the system,
+       ;; so the switch has to follow it too or it will show the wrong state.
+       "if(window.matchMedia){var mq=matchMedia('(prefers-color-scheme: dark)');"
+       "var f=function(){if(!stored())paint();};"
+       "if(mq.addEventListener)mq.addEventListener('change',f);}"
+       "})();"))
+
+(def chart-anim-head-js
+  "Runs in <head>, before first paint, so the charts never render complete and
+  then collapse. It only arms the reveal — the collapsed state lives behind
+  `.kot-anim`, so with no JavaScript, no IntersectionObserver, or reduced
+  motion the charts render finished instead of empty."
+  (str "(function(){try{"
+       "if(!('IntersectionObserver' in window))return;"
+       "if(window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)').matches)return;"
+       "document.documentElement.classList.add('kot-anim');"
+       "}catch(e){}})();"))
+
+(def chart-anim-js
+  (str "(function(){"
+       "var r=document.documentElement;"
+       "if(!r.classList.contains('kot-anim'))return;"
+       "function go(){"
+       "var cs=[].slice.call(document.querySelectorAll('.kot-chart'));"
+       "function all(){cs.forEach(function(c){c.classList.add('is-in');});}"
+       "try{var io=new IntersectionObserver(function(es){"
+       "es.forEach(function(e){if(e.isIntersecting){e.target.classList.add('is-in');io.unobserve(e.target);}});"
+       "},{threshold:0.12,rootMargin:'0px 0px -6% 0px'});"
+       ;; A chart that is never observed, or whose observer never fires, must
+       ;; not stay empty: the fallback reveals everything unconditionally.
+       "cs.forEach(function(c){io.observe(c);});setTimeout(all,2500);}catch(e){all();}}"
+       "if(document.readyState==='loading')"
+       "document.addEventListener('DOMContentLoaded',go);else go();"
+       "})();"))
+
 (def hero-js
   (let [points-js (str "var P=new Uint8Array([" (str/join "," (vec (hero/quantized-bytes))) "]),"
                        "N=" hero/point-count ",FP=" hero/hero-fps ",DUR=" hero/hero-duration-seconds ","
@@ -384,6 +1127,14 @@
          "document.addEventListener('DOMContentLoaded',function(){"
          "var wrap=document.getElementById('kot-hero-canvas');"
          "if(!wrap||matchMedia('(prefers-reduced-motion: reduce)').matches)return;"
+         ;; The dot colour is not baked: `.kot-hero-canvas` carries
+         ;; `color:var(--hig-color-tint)`, so the resolved value follows
+         ;; jp-go-dds.dark's mirrored ramp. The shader writes sRGB directly
+         ;; (the canvas format is a plain unorm), so the channels are used as
+         ;; read — linearising here would shift the hue.
+         "var TC='0.0,0.09,0.757';"
+         "try{var _m=getComputedStyle(wrap).color.match(/[0-9.]+/g);"
+         "if(_m&&_m.length>=3){TC=(_m[0]/255).toFixed(4)+','+(_m[1]/255).toFixed(4)+','+(_m[2]/255).toFixed(4);}}catch(e){}"
          "var canvas=document.createElement('canvas');"
          "var drawn=false;"
          "function svgOnly(){if(drawn)return;drawn=true;"
@@ -416,7 +1167,7 @@
          "let d=length(f.pos.xy-f.cen)/max(f.rad,1.0);"
          "if(d>1.0){discard;}"
          "let a=" AMAXV "*(1.0-d*d)*u.ph*f.den;"
-         "return vec4f(0.0,0.09,0.757,a);}';"
+         "return vec4f('+TC+',a);}';"
          "var module=null;"
          "try{module=device.createShaderModule({code:wgsl});}catch(e){return false;}"
          "var pipeline=null;"
@@ -444,7 +1195,7 @@
          "var ax=AX*0.6*Math.sin(t*0.23),ay=AY*0.6*Math.sin(t*0.31+1.7);"
          "device.queue.writeBuffer(ubuf,0,new Float32Array([t,ph,ux,uy,ax,ay,canvas.width,canvas.height]));"
          "var enc=device.createCommandEncoder();"
-         "var pass=enc.beginRenderPass({colorAttachments:[{view:ctx.getCurrentTexture().createView(),clearValue:{r:1,g:1,b:1,a:1},loadOp:'clear',storeOp:'store'}]});"
+         "var pass=enc.beginRenderPass({colorAttachments:[{view:ctx.getCurrentTexture().createView(),clearValue:{r:0,g:0,b:0,a:0},loadOp:'clear',storeOp:'store'}]});"
          "pass.setPipeline(pipeline);pass.setVertexBuffer(0,vbuf);pass.setBindGroup(0,bind);"
          "pass.draw(6,N);pass.end();"
          "device.queue.submit([enc.finish()]);}"
@@ -458,7 +1209,7 @@
          "gl_PointSize=max(1.0,m.x*2.0*minWH);}';"
          "var fs='#version 300 es\\nprecision mediump float;in float vden;uniform float amax,ph;out vec4 oc;void main(){"
          "vec2 d=gl_PointCoord-vec2(0.5);float r=length(d)*2.0;if(r>1.0)discard;"
-         "float a=amax*(1.0-r*r)*ph*vden;oc=vec4(0.0,0.09,0.757,a);}';"
+         "float a=amax*(1.0-r*r)*ph*vden;oc=vec4('+TC+',a);}';"
          "function sh(t,s){var o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);"
          "if(!gl.getShaderParameter(o,gl.COMPILE_STATUS)){throw new Error(gl.getShaderInfoLog(o));}return o;}"
          "var prog=gl.createProgram();gl.attachShader(prog,sh(gl.VERTEX_SHADER,vs));"
@@ -487,7 +1238,7 @@
          "gl.uniform2f(U.u,0.5+AX*Math.cos(ang*FX),0.5+AY*Math.sin(ang*FY));"
          "gl.uniform1f(U.ax,AX*0.6*Math.sin(t*0.23));"
          "gl.uniform1f(U.ay,AY*0.6*Math.sin(t*0.31+1.7));"
-         "gl.clearColor(1.0,1.0,1.0,1.0);gl.clear(gl.COLOR_BUFFER_BIT);"
+         "gl.clearColor(0.0,0.0,0.0,0.0);gl.clear(gl.COLOR_BUFFER_BIT);"
          "gl.drawArrays(gl.POINTS,0,N);requestAnimationFrame(frame);}"
          "requestAnimationFrame(frame);return true;}"
          "webgpu().then(function(ok){if(ok)return;"
@@ -498,14 +1249,82 @@
   [:div {:class "kot-hero-canvas" :id "kot-hero-canvas" :aria-hidden "true"}
    (html/raw fallback-svg)])
 
+(defn- ms [x] (str (.toFixed x 2) " ms"))
+
+(def lane-status-text
+  "Why a lane produced no number. Never rendered as a zero-length bar: the
+  fastest way to emit an artifact is to emit a broken one, and a chart that
+  draws \"absent\" and \"instant\" alike rewards exactly that."
+  {"invalid" "invalid artifact" "failed" "build failed"
+   "unavailable" "no toolchain" "not-run" "budget spent"})
+
+(defn speed-panel
+  "The speed claim on the first screen.
+
+  The word `fastest` appears here only while `cold-start` reports that every
+  ordering behind it passed perfgate; if a rerun loses one, the chip, the
+  heading and the sentence step down together rather than one of them being
+  left behind."
+  []
+  (let [{:keys [median rows qualified? beaten date host k samples]} cold-start]
+    [:div {:class "kot-speed"}
+     (dds/chip-label (if qualified?
+                       (str "FASTEST COLD BUILD · " beaten " OF " beaten
+                            " ORDERINGS QUALIFIED")
+                       "COLD BUILD · ORDERING UNQUALIFIED")
+                     (if qualified? {} {:color "gray"}))
+     (dds/heading 2
+                  (if qualified?
+                    "Fastest cold build of any toolchain on this host."
+                    "Lowest cold-build median on this host; ordering unqualified.")
+                  {:size "32"})
+     [:div {:class "kot-speed-figure"}
+      [:p {:class "kot-speed-value"} (.toFixed median 2)
+       [:span {:class "kot-speed-unit"} "ms"]]
+      [:p {:class "kot-speed-sub"}
+       "Kotoba source to a WebAssembly artifact, process-cold — then executed, "
+       "and the answer checked after the clock stopped."]]
+     (chart/ranked-bars
+      {:axis (str "Process-cold build wall time in milliseconds; shorter is faster. "
+                  "K=" k " source, lanes interleaved on one host, "
+                  samples " samples each.")
+       :rows (for [{:keys [label target median ratio status lead?]} rows]
+               (if (= "measured" status)
+                 {:label label :sub target :value median
+                  :display (ms median)
+                  :note (if lead? "fastest here" (str (.toFixed ratio 1) "× Kotoba"))
+                  :lead? lead?}
+                 {:label label :sub target
+                  :absent (get lane-status-text status status)}))})
+     [:p {:class "kot-caption kot-muted"}
+      (if qualified?
+        (list (str "All " beaten " orderings pass ")
+              (external-link "https://github.com/kotoba-lang/perfgate" "perfgate")
+              " at its unrelaxed default policy — at least 5% and separated from the "
+              "arms' own spread — so the ordering holds even though the host was busy. ")
+        "The ordering did not pass its gate on this run. ")
+      "Bounded to this host, this source size and this run: build time is not "
+      "execution speed, the advantage narrows as the source grows, and the released "
+      "binary has a hard correctness ceiling. All five benchmarks, including the ones "
+      "that go against Kotoba, are below. Measured "
+      date " on " host "."]
+     [:div {:class "kot-actions"}
+      (dds/button "See the five benchmarks" {:href "#benchmark"})
+      (dds/button "Inspect the samples"
+                  {:href "./benchmarks/build-scaling-latest.json" :type :text})]]))
+
 (defn hero []
   [:section {:id "top" :class "kot-hero"}
    (hero-canvas)
    (dds/container
+    ;; The program comes first. Before any claim about the language, the page
+    ;; shows one and lets it resolve into its own hashes — which is the claim.
+    (hero-code)
     [:p {:class "kot-eyebrow"} "A language AI agents can use, not abuse"]
     (dds/heading 1 "AI writes freely. Kotoba draws the boundary." {:size "48"})
     [:p {:class "kot-lead"}
      "Kotoba is an intuitive, declarative, security-first language and computing stack for AI agents—and for humans who vibe-code with them. Post-quantum cryptography is the admission floor for every new cryptographic boundary, not an optional mode."]
+    (speed-panel)
     [:blockquote {:class "kot-quote"}
      [:strong "Existing software adds security around the program. Kotoba makes security a property of the whole computation."]]
     [:div {:class "kot-actions"}
@@ -734,6 +1553,25 @@
                            "gpu-clear (WebGPU smoke)")
             ". Hosted on the wasm-webcomponent GitHub Pages surface; availability is per-browser WebGPU/WebAssembly support."]]))))
 
+(def catalog-tag-order
+  "Plane tags first, then domains, each in taxonomy order. The taxonomy file
+  decides the order so the chip row and the tag vocabulary cannot drift."
+  (concat (map :id (:planes library-taxonomy))
+          (map :id (:domains library-taxonomy))))
+
+(defn- catalog-chip
+  "One filter control. On the catalogue page it is a toggle button; on the
+  landing page it is a link into the catalogue, so the landing page's chips
+  keep working with JavaScript off."
+  [tag n {:keys [href]}]
+  (let [label (str (catalog/label-of library-taxonomy tag) " · " (thousands n))]
+    (if href
+      (dds/button label {:type :outline :size "sm"
+                         :href (str href "#tag=" (catalog/topic-of library-taxonomy tag))})
+      (dds/button label {:type :outline :size "sm"
+                         :attrs {:data-cat-tag (catalog/topic-of library-taxonomy tag)
+                                 :aria-pressed "false"}}))))
+
 (defn libraries-section []
   (dds/section
    {:id "libraries" :title "Libraries, without hiding the package boundary"}
@@ -753,7 +1591,133 @@
           (dds/heading 3 "Content-addressed dependencies" {:size "24"})
           [:p "Inspect exact dependency CIDs, identity layers, GitHub provenance, and the current publication boundary."]
           [:a {:class "kot-link" :href "./libraries/"} "Open the library catalog and publish flow"]))
-   (caption "Repository maturity labels do not imply 1.0 API stability, broad adoption, or production SLOs.")))
+   (dds/heading 3 "Browse the whole organisation by tag" {:size "24"})
+   [:p
+    "There are " (thousands (:total tagged-catalog)) " public repositories in the "
+    (code "kotoba-lang") " organisation. Every tag below is the GitHub topic of "
+    "the same name, so the site filter and the org's topics are one vocabulary "
+    "rather than two that drift. Pick one to open the catalogue already filtered."]
+   [:div {:class "kot-cat-tags"}
+    (for [tag catalog-tag-order
+          :let [n (get (:counts tagged-catalog) tag 0)]
+          :when (pos? n)]
+      (catalog-chip tag n {:href "./libraries/"}))]
+   [:p [:a {:class "kot-link" :href "./libraries/#catalog"}
+        (str "Browse and filter all " (thousands (:total tagged-catalog)) " repositories")]]
+   (caption
+    (str "A repository is not a published package. Exactly "
+         (count (:records public-package-registry))
+         " library is published through the content-addressed registry; the rest of "
+         "this list is discovery. Repository maturity labels do not imply 1.0 API "
+         "stability, broad adoption, or production SLOs, and "
+         (thousands (:untagged tagged-catalog))
+         " repositories match no domain rule and are shown untagged rather than "
+         "given the nearest label."))))
+
+(defn catalog-section
+  "The whole public repository list, rendered into the page and filtered in
+  the browser.
+
+  The list is server-rendered rather than built from an embedded JSON blob:
+  with JavaScript off, or before the script runs, the complete catalogue is
+  still the page. The controls are the part that needs a script, so they are
+  the part that is hidden until one runs."
+  []
+  (let [{:keys [repos counts untagged described total]} tagged-catalog]
+    (dds/section
+     {:id "catalog" :title "Every public repository, filterable"}
+     [:p {:class "kot-lead"}
+      "The " (thousands total) " public repositories in the "
+      (code "kotoba-lang") " organisation, with the tag vocabulary the "
+      "organisation's GitHub topics use. Filter by name, by description, or by "
+      "any combination of tags."]
+     [:div {:class "kot-cat-controls" :id "kot-cat-controls" :hidden true}
+      (dds/form-field
+       {:label "Filter repositories" :for "kot-cat-q"
+        :support "Try: os, driver, sim, wasm, ipld. Text narrows; tags widen — a repository matching any selected tag is shown."
+        :support-id "kot-cat-q-support"}
+       (dds/input-text {:id "kot-cat-q" :type "search"
+                        :aria-label "Filter Kotoba repositories"
+                        :aria-describedby "kot-cat-q-support"}))
+      [:div {:class "kot-cat-tags"}
+       (for [tag catalog-tag-order
+             :let [n (get counts tag 0)]
+             :when (pos? n)]
+         (catalog-chip tag n {}))
+       (dds/button "Clear" {:type :text :size "sm"
+                            :attrs {:id "kot-cat-clear"}})]]
+     [:p {:id "kot-cat-count" :class "kot-caption kot-muted" :aria-live "polite"}
+      (str "Showing " (thousands total) " of " (thousands total) " repositories")]
+     [:ol {:class "kot-cat-list" :id "kot-cat-list"}
+      (for [{:keys [name description tags topics archived?]} repos]
+        [:li {:class "kot-lib"
+              :data-t (str/join " " (map #(catalog/topic-of library-taxonomy %) tags))}
+         [:a {:class "kot-lib-name"
+              :href (str "https://github.com/kotoba-lang/" name) :rel "noreferrer"}
+          name]
+         (when archived? [:span {:class "kot-lib-flag"} "archived"])
+         (when description [:span {:class "kot-lib-desc"} description])
+         (when (or (seq tags) (seq topics))
+           [:span {:class "kot-lib-tags"}
+            (for [t (distinct (concat (map #(catalog/topic-of library-taxonomy %) tags)
+                                      topics))]
+              [:span {:class "kot-lib-tag"} t])])])]
+     (caption
+      (str "Filtering runs in the browser and no query leaves it; with JavaScript "
+           "off the complete list is still rendered above. "
+           (thousands described) " of these repositories carry a GitHub description, "
+           "so a domain tag has that much evidence to work from — "
+           (thousands untagged) " match no domain rule and are shown untagged rather "
+           "than assigned the nearest label. A repository list is discovery. It is not "
+           "the package registry: exactly one library is published through the "
+           "content-addressed registry described above, and a repository here is "
+           "neither a released package nor an API-stability claim."))
+     (caption "Tag vocabulary: " (code "site/library-taxonomy.edn")
+              ". Repository snapshot: " (code "site/library-catalog.edn")
+              ", fetched " (:fetched-at library-catalog) "."))))
+
+(def catalog-js
+  (str "(function(){"
+       "var list=document.getElementById('kot-cat-list');if(!list)return;"
+       "var items=[].slice.call(list.children);"
+       ;; The haystack is built once from the rendered text. Repeating it in a
+       ;; data-* attribute would put every description in the document twice
+       ;; (measured: +250 KB) to save work this loop does in one pass at load.
+       "var hay=items.map(function(e){return e.textContent.toLowerCase();});"
+       "var tg=items.map(function(e){return ' '+(e.getAttribute('data-t')||'')+' ';});"
+       "var q=document.getElementById('kot-cat-q');"
+       "var count=document.getElementById('kot-cat-count');"
+       "var chips=[].slice.call(document.querySelectorAll('[data-cat-tag]'));"
+       "var on={};"
+       "function n(x){return x.toLocaleString('en-US');}"
+       "function apply(){var s=(q.value||'').trim().toLowerCase();"
+       "var keys=Object.keys(on).filter(function(k){return on[k];});var shown=0;"
+       "for(var i=0;i<items.length;i++){"
+       "var ok=!s||hay[i].indexOf(s)>-1;"
+       "if(ok&&keys.length){ok=false;"
+       "for(var j=0;j<keys.length;j++){if(tg[i].indexOf(' '+keys[j]+' ')>-1){ok=true;break;}}}"
+       "items[i].hidden=!ok;if(ok){shown++;}}"
+       "count.textContent='Showing '+n(shown)+' of '+n(items.length)+' repositories';}"
+       "function set(t,v){on[t]=v;chips.forEach(function(c){"
+       "if(c.getAttribute('data-cat-tag')===t)c.setAttribute('aria-pressed',v?'true':'false');});}"
+       "chips.forEach(function(c){c.addEventListener('click',function(){"
+       "var t=c.getAttribute('data-cat-tag');set(t,!on[t]);apply();});});"
+       "q.addEventListener('input',apply);"
+       "var clear=document.getElementById('kot-cat-clear');"
+       "if(clear)clear.addEventListener('click',function(){"
+       "Object.keys(on).forEach(function(t){set(t,false);});q.value='';apply();});"
+       ;; Deep link from the landing page's chips: /libraries/#tag=<topic>
+       "function fromHash(){"
+       "var m=/[#&]tag=([a-z0-9-]+)/.exec(location.hash);"
+       "if(m&&chips.some(function(c){return c.getAttribute('data-cat-tag')===m[1];})){"
+       "set(m[1],true);apply();}}"
+       ;; A chip link followed from THIS page changes only the fragment, which
+       ;; is a same-document navigation: without this listener the filter would
+       ;; work from the landing page and do nothing from inside the catalogue.
+       "window.addEventListener('hashchange',fromHash);"
+       "fromHash();apply();"
+       "var ctl=document.getElementById('kot-cat-controls');if(ctl)ctl.hidden=false;"
+       "})();"))
 
 (defn roadmap-section []
   (dds/section
@@ -861,9 +1825,6 @@
     "not-run" "budget spent"
     (or (:status result) "—")))
 
-(defn- thousands [n]
-  (str/replace (str n) #"\B(?=(\d{3})+$)" ","))
-
 (defn build-scaling-section []
   (let [scales (:scales build-scaling)
         lanes (:lanes build-scaling)
@@ -893,7 +1854,35 @@
                           (:k sc))
         smallest-ordering (ordering-at (:k (first scales)))
         cli-fastest-when-small (and (seq smallest-ordering)
-                                    (every? :qualifiedFaster (vals smallest-ordering)))]
+                                    (every? :qualifiedFaster (vals smallest-ordering)))
+        ;; Short lane names for the line ends. `Amu` appears twice in the
+        ;; report's own labels, once per target, so the target has to be in
+        ;; the name or two different lines get the same label.
+        lane-short {:kotoba-wasm-cli "Kotoba CLI" :amu-wasm "Amu → Wasm"
+                    :amu-native "Amu → native" :rustc-wasm "rustc → Wasm"
+                    :rustc-native "rustc → native" :clang-native "clang → native"
+                    :javac "javac"}
+        scaling-series
+        (for [id present
+              :let [sts (map #(get-in % [:lanes id :status]) scales)
+                    last-m (last (keep-indexed (fn [i st] (when (= "measured" st) i)) sts))
+                    ;; What happened AFTER the last measured size, not the
+                    ;; first gap anywhere: a lane that emitted a broken
+                    ;; artifact and a lane that refused to build are two
+                    ;; different results and get two different end marks.
+                    after (when last-m (first (drop (inc last-m) sts)))
+                    pts (vec (for [sc scales
+                                   :when (= "measured" (get-in sc [:lanes id :status]))]
+                               [(:k sc) (get-in sc [:lanes id :summary :median])]))]
+              :when (seq pts)]
+          {:id id
+           :accent? (= id :kotoba-wasm-cli)
+           :label (lane-short id (get-in lanes [id :label]))
+           :points pts
+           :end-kind (case after
+                       "invalid" :broke
+                       ("failed" "unavailable" "not-run") :refused
+                       :ok)})]
     (list
      (dds/heading 3 "Build time as the source gets larger" {:size "24"})
      [:p
@@ -909,6 +1898,18 @@
       "That check is not decoration. The fastest way to emit an artifact is to "
       "emit a broken one, so a lane that stopped working would otherwise post "
       "its best numbers exactly where it stopped working."]
+     (chart/log-lines
+      {:series scaling-series
+       :x-ticks [[1 "K=1"] [32 "32"] [128 "128"] [512 "512"] [2048 "2048"]]
+       :y-ticks [[20 "20 ms"] [100 "100 ms"] [1000 "1 s"] [10000 "10 s"]]
+       :x-title "Generated functions (log scale)"
+       :y-title "Build wall time (log scale)"})
+     (caption
+      (str "Both axes are logarithmic: the sources span three orders of magnitude "
+           "and so do the times. A line ends in a dot where the run ended, in a "
+           "cross where that lane emitted an artifact that is not the program, and "
+           "in a bar where the toolchain refused to build. Those three are not the "
+           "same event and the two failures below are not the same failure."))
      [:div {:class "kot-table-scroll"}
       (dds/table
        {:caption "Process-cold build wall time by source size; medians, one host, lanes interleaved"
@@ -999,8 +2000,10 @@
                      "kotoba.error/subset-reject and names what it refused, rather than emitting "
                      "something that will not load. A loud ceiling and a silent one are very "
                      "different results, and only a harness that executes the artifact tells "
-                     "them apart. The limit is per module: a larger program is a multi-module "
-                     "project, which this single-file benchmark deliberately does not exercise.")]]})]
+                     "them apart. Measured 2026-09-07: this is the whole program's ceiling, "
+                     "not one module's — max-project-functions is also 1,024 and is checked "
+                     "against the linked project, so no arrangement of modules compiles a "
+                     "2,048-function program today.")]]})]
      (dds/heading 3 "What this establishes" {:size "24"})
      [:div {:class "kot-table-scroll"}
       (dds/table
@@ -1049,6 +2052,93 @@
       (external-link "https://github.com/kotoba-lang/kotoba/issues/526"
                      "The defect, with its bytes")])))
 
+(def benchmark-provenance
+  "Where each published benchmark actually lives.
+
+  A URL the report itself carries is preferred over one written here: the
+  runtime suite and the build-scaling harness both name their own harness,
+  manifest and method, so those are read out of the JSON. The other three run
+  from this repository, and their paths are checked against the working tree
+  at build time (see `benchmark-provenance-rows`) — a moved script fails the
+  build instead of shipping a dead link."
+  [{:id :compile
+    :question "Compiler startup"
+    :repo "kotoba-lang/kotoba-lang"
+    :harness "scripts/benchmark-public-compile.mjs"
+    :extra ["bench/public-compile-comparison/README.md"
+            "bench/public-compile-comparison/main.kotoba"]
+    :report "bench/public-compile-comparison/latest.json"
+    :published "./benchmarks/compile-wasm-latest.json"}
+   {:id :end-to-end
+    :question "Developer loop"
+    :repo "kotoba-lang/kotoba-lang"
+    :harness "scripts/benchmark-public-end-to-end.mjs"
+    :extra ["bench/public-end-to-end-comparison/README.md"]
+    :report "bench/public-end-to-end-comparison/latest.json"
+    :published "./benchmarks/end-to-end-latest.json"}
+   {:id :runtime
+    :question "Native runtime"
+    :repo "kotoba-lang/amu"
+    :harness-url (get-in runtime-benchmark [:sources :harness])
+    :extra-urls [(get-in runtime-benchmark [:sources :manifest])
+                 (get-in runtime-benchmark [:sources :method])]
+    :projector "scripts/project-runtime-comparison.cljs"
+    :report "bench/public-runtime-comparison/latest.json"
+    :published "./benchmarks/runtime-native-latest.json"}
+   {:id :build-scaling
+    :question "Build scaling"
+    :repo "kotoba-lang/buildbench"
+    :harness-url (get-in build-scaling [:method :harness])
+    :report "bench/public-build-scaling/latest.json"
+    :published "./benchmarks/build-scaling-latest.json"}
+   {:id :domains
+    :question "Workload domains"
+    :repo "kotoba-lang/kotoba-lang"
+    :harness "scripts/benchmark-public-domains.mjs"
+    :extra ["bench/public-domain-comparison/README.md"
+            "bench/public-domain-comparison/probes"]
+    :report "bench/public-domain-comparison/latest.json"
+    :published "./benchmarks/domains-latest.json"}])
+
+(def ^:private repo-blob-base "https://github.com/kotoba-lang/")
+
+(defn- repo-path-url [repo path]
+  (str repo-blob-base (subs repo (count "kotoba-lang/")) "/blob/main/" path))
+
+(defn- check-local! [path]
+  (when-not (fs/existsSync path)
+    (throw (js/Error. (str "benchmark provenance points at a path that is not in "
+                           "this tree: " path))))
+  path)
+
+(defn benchmark-provenance-rows
+  "Rows for the provenance table, with every in-repo path verified to exist."
+  []
+  (for [{:keys [question repo harness harness-url extra extra-urls projector
+                report published]} benchmark-provenance]
+    (let [harness-link (if harness-url
+                         (external-link harness-url
+                                        (last (str/split harness-url #"/")))
+                         (external-link (repo-path-url repo (check-local! harness))
+                                        harness))
+          more (concat
+                (for [pth extra]
+                  (external-link (repo-path-url repo (check-local! pth)) pth))
+                (for [u extra-urls :when u]
+                  (external-link u (last (str/split (first (str/split u #"#")) #"/"))))
+                (when projector
+                  [(external-link (repo-path-url "kotoba-lang/kotoba-lang"
+                                                 (check-local! projector))
+                                  projector)]))]
+      [question
+       (external-link (str "https://github.com/" repo) repo)
+       (into [:span] (interpose " · " (cons harness-link more)))
+       [:span
+        [:a {:class "kot-link" :href published} "published JSON"]
+        " · "
+        (external-link (repo-path-url "kotoba-lang/kotoba-lang" (check-local! report))
+                       report)]])))
+
 (defn benchmark-section []
   (let [kotoba (get-in benchmark [:results :kotoba])
         rust (get-in benchmark [:results :rust])
@@ -1072,12 +2162,16 @@
         runtime-pairs (:pairs runtime-benchmark)
         pair-index (into {} (map (juxt (juxt :domain :comparator) identity)) runtime-pairs)
         runtime-date (subs (:generatedAt runtime-benchmark) 0 10)
+        improvements (keep #(some-> (:improvement %) (* 100)) runtime-pairs)
+        improvement-gain (apply max 1 (filter pos? improvements))
+        improvement-loss (apply max 1 (map - (filter neg? improvements)))
         comparator-labels (str/join ", " (map :label comparators))
         end-speed (:speedQualification end-to-end-benchmark)
         end-results (map #(get-in end-to-end-benchmark [:results (keyword %)])
                          (get-in end-to-end-benchmark [:coverage :measuredToolchains]))
         domain-results (:tools domain-benchmark)
         domain-qualified (get-in domain-benchmark [:qualification :qualified])
+        domain-workload-order [:string :collection :allocation :io :concurrency :realApp]
         stage-ms (fn [stage]
                    (if (= "measured" (:status stage))
                      (str (:medianMilliseconds stage) " ms")
@@ -1172,6 +2266,52 @@
                           (get-in domain-benchmark [:machine :load1After])
                           (if domain-qualified " · qualified" " · rank withheld")))))
      (build-scaling-section)
+     (dds/heading 3 "How long each native workload actually takes" {:size "24"})
+     [:p
+      "The grid below reports the margin between two arms. That is the number "
+      "perfgate rules on, but a percentage on its own does not say whether a "
+      "workload runs in five milliseconds or five hundred, and it hides the "
+      "difference between a contested pair and an irrelevant one. These panels are "
+      "the medians those margins are computed from. Amu native is the coloured lane "
+      "in every panel — including the panels where it is not first. Each panel is "
+      "scaled to its own slowest arm, because the question a panel answers is who is "
+      "faster in that workload."]
+     (dds/grid
+      {:min "19rem"}
+      (for [d domains
+            :let [ps (filter #(= (:id d) (:domain %)) runtime-pairs)
+                  cand (:candidateMedian (first ps))
+                  rows (sort-by :value
+                                (cons {:label (:candidate runtime-benchmark)
+                                       :value cand :lead? true}
+                                      (for [pr ps
+                                            :let [c (first (filter #(= (:comparator pr) (:id %))
+                                                                   comparators))]]
+                                        {:label (:label c)
+                                         :value (:baselineMedian pr)})))
+                  best (:value (first rows))]]
+        (card
+         (dds/heading 4 (:label d) {:size "20"})
+         (chart/ranked-bars
+          {:rows (for [{:keys [label value lead?]} rows]
+                   {:label label :value value
+                    :display (str (.toFixed value 2) " ms")
+                    :note (when lead?
+                            (if (= value best)
+                              "fastest here"
+                              (str (.toFixed (/ value best) 2) "× the fastest here")))
+                    :lead? lead?})}))))
+     (caption
+      (str "Median milliseconds over " (:runs runtime-score)
+           " host-qualified runs; shorter is faster. Every arm returned the same "
+           "independently checked answer, and the candidate median is one value per "
+           "workload — the suite rotates each engine pair in ABBA/BAAB order, so the "
+           "same Amu artifact is timed once per workload and then compared against "
+           "each arm in turn. Unlike the other four benchmarks on this page, this "
+           "one's quiet-host gate PASSED (" (name (:verdict speed))
+           "), so these are figures for this host rather than observations only. The "
+           "bounded fastest claim still needs all " (:totalPairs runtime-score)
+           " pairs, which is what the grid below is for."))
      (dds/heading 3 "Every runtime pair, win or loss" {:size "24"})
      [:p
       "The bounded claim is all-or-nothing, so a single unqualified pair makes it false. "
@@ -1179,7 +2319,7 @@
       "grid is here. A cell is the mean improvement of Amu native over that comparator "
       "on that workload; positive means Amu is faster, and a check marks the pairs that "
       "clear perfgate — at least 5% and separated from the arms' own spread."]
-     [:div {:class "kot-table-scroll"}
+     [:div {:class "kot-table-scroll kot-chart"}
       (dds/table
        {:caption (str "Amu native vs each comparator, " runtime-date
                       ", host-qualified; ✓ = passes perfgate")
@@ -1192,8 +2332,25 @@
                                   pct (some-> (:improvement pair) (* 100))]]
                         (if (nil? pair)
                           "—"
-                          (str (when (pos? pct) "+") (.toFixed pct 1) "%"
-                               (when (:qualified pair) " ✓"))))))})]
+                          (chart/diverging-cell
+                           {:value pct
+                            :display (str (when (pos? pct) "+") (.toFixed pct 1) "%")
+                            :qualified? (:qualified pair)
+                            :neg-max improvement-loss :pos-max improvement-gain
+                            :title (if (:qualified pair)
+                                     (str "Passes perfgate; qualified in "
+                                          (:qualifiedRuns pair) " of "
+                                          (:runs pair) " runs")
+                                     (str "Not qualified: "
+                                          (str/join ", " (:reasons pair))))})))))})]
+     (caption
+      (str "Each cell is a bar grown from a centre line: right of it Amu native is "
+           "faster, left of it slower. The two directions are scaled separately — "
+           "the wins run to +" (.toFixed improvement-gain 0) "% and the losses only to −"
+           (.toFixed improvement-loss 0)
+           "%, so one shared scale would flatten every contested pair into the same "
+           "invisible sliver. Sign is also carried by the side of the line and by the "
+           "signed number, so no reading of this grid depends on telling two colours apart."))
      (caption (str (:qualifiedPairs runtime-score) " of " (:totalPairs runtime-score)
                    " pairs qualified"
                    (if-let [runs (:runs runtime-score)]
@@ -1228,6 +2385,20 @@
                ["Kotoba CLI"
                 "kotoba test/build consume the new compiler pin; kotoba compile emits sealed x86-64 and AArch64 KEXE directly."
                 "Public CLI lifecycle and AArch64 vector artifact verified. Native --run stays refused until a measured loader receipt is wired."]]})]
+     (dds/heading 3 "Compiler startup, four toolchains" {:size "24"})
+     (chart/ranked-bars
+      {:axis (str "Process-cold wall time for one tiny source, in milliseconds; "
+                  "shorter is faster. " runs " rotating samples per toolchain on "
+                  chip ". The host-load gate FAILED on this run, so these are "
+                  "observations of one machine, not a ranking.")
+       :rows (for [{:keys [label target result]} compile-results]
+               {:label label :sub target
+                :value (:medianMilliseconds result)
+                :display (str (:medianMilliseconds result) " ms")
+                :note (if (= 1 (:medianRatioToKotoba result))
+                        "the baseline"
+                        (str (:medianRatioToKotoba result) "× Kotoba"))
+                :lead? (= "Kotoba" label)})})
      [:div {:class "kot-table-scroll"}
       (dds/table
        {:caption "Tiny source-to-artifact process-cold build measurement"
@@ -1261,6 +2432,48 @@
                  (stage-ms (get-in result [:loops :cleanBuildAndFirstRun]))])})]
      (caption
       "Every emitted artifact produced 42 in a fresh process. Targets and runtime contracts differ; N/A is never zero. The host-load gate failed, so these are reproducible observations rather than a cross-language speed ranking.")
+     (dds/heading 3 "Six domains, side by side" {:size "24"})
+     [:p
+      "Each panel is scaled to its own slowest lane, because the question a panel "
+      "answers is who is faster in that domain, not how the domains compare to each "
+      "other. Kotoba's lane is the coloured one in every panel — including the "
+      "panels where it is last. Its standalone Wasm artifact runs through a Node "
+      "host and pays that startup on every process-cold sample, while Rust, C and Go "
+      "run as native binaries; where the target has no ambient filesystem or thread "
+      "contract at all, the lane is absent rather than zero."]
+     (dds/grid
+      {:min "19rem"}
+      (for [[wid {:keys [label]}] (map (juxt identity #(get-in domain-benchmark [:workloads %]))
+                                       domain-workload-order)
+            :let [measured (->> domain-results
+                                (keep (fn [t] (let [r (get-in t [:results wid])]
+                                                (when (= "measured" (:status r))
+                                                  {:label (:label t)
+                                                   :value (:medianMilliseconds r)}))))
+                                (sort-by :value))
+                  best (:value (first measured))
+                  absent (->> domain-results
+                              (keep (fn [t] (when-not (= "measured" (get-in t [:results wid :status]))
+                                              {:label (:label t)
+                                               :absent "N/A — not in this target's contract"}))))]]
+        (card
+         (dds/heading 4 label {:size "20"})
+         (chart/ranked-bars
+          {:rows (concat
+                  (for [{:keys [label value]} measured]
+                    (let [kotoba? (str/starts-with? label "Kotoba")]
+                      {:label label :value value
+                       :display (str value " ms")
+                       :note (when kotoba?
+                               (if (= value best)
+                                 "fastest here"
+                                 (str (.toFixed (/ value best) 1) "× the fastest here")))
+                       :lead? kotoba?}))
+                  absent)}))))
+     (caption
+      "Process-cold medians in milliseconds; shorter is faster. The host-load gate "
+      "failed on this run, so these panels are observations rather than a ranking, "
+      "and the amortized lane below tells a different story again.")
      [:div {:class "kot-table-scroll"}
       (dds/table
        {:caption "Process-cold workload-domain medians; N/A means the target contract does not provide that capability"
@@ -1320,9 +2533,40 @@
                 [label stress (if exactResultVerified
                                 "Exact result verified; timing unqualified"
                                 "Incomplete")])})]
+     (dds/heading 3 "Where each benchmark lives" {:size "24"})
+     [:p
+      "Every number above comes from a public harness and a committed report, so a "
+      "run can be repeated and a claim can be disagreed with. The in-repo paths in "
+      "this table are checked against the working tree when this page is generated: "
+      "a harness that moves fails the build rather than shipping a dead link."]
+     [:div {:class "kot-table-scroll"}
+      (dds/table
+       {:caption "Harness, method and report for each published benchmark"
+        :headers ["Benchmark" "Repository" "Harness and method" "Report"]
+        :row-header? true
+        :rows (benchmark-provenance-rows)})]
+     (caption
+      (list "The gate every ordering on this page is put through is "
+            (external-link "https://github.com/kotoba-lang/perfgate" "kotoba-lang/perfgate")
+            ", run at its own unrelaxed default policy. A threshold loosened to let a "
+            "run through would be a benchmark measuring its own thresholds."))
      [:p
       [:strong "Bottom line: "]
-      "The compiler-startup, developer-loop, and runtime artifacts, exact results, and samples are real. None of the current runs qualifies a speed ranking because its quiet-host gate failed. A quiet-host rerun must pass the relevant gate before any fastest claim becomes valid."]
+      ;; This sentence used to say that NO current run qualified a speed
+      ;; ranking because its quiet-host gate failed. That was true of four of
+      ;; the five reports and false of the two that matter: the runtime suite
+      ;; records `qualified-host-load`, and the build-scaling orderings clear
+      ;; perfgate at K=1. Reading the verdicts out of the reports keeps the
+      ;; sentence from going stale again.
+      (str "The artifacts, exact results and samples are real in all five benchmarks. "
+           "Three of them — compiler startup, the developer loop and the workload "
+           "domains — failed their quiet-host gate, so they rank nothing and are "
+           "published as observations. The native runtime suite passed its gate and "
+           "wins " (:qualifiedPairs runtime-score) " of its " (:totalPairs runtime-score)
+           " pairs, short of the every-pair claim it would need. Build scaling "
+           "qualifies its cold-start ordering against every comparator on the host "
+           "and finds a correctness ceiling in the same run. No universal speed rank "
+           "is claimed anywhere on this page, and none of these runs licenses one.")]
      [:div {:class "kot-actions"}
       (dds/button "Inspect compile samples"
                   {:href "./benchmarks/compile-wasm-latest.json"})
@@ -1509,6 +2753,40 @@
         " · "
         (external-link "https://github.com/kotoba-lang/kotoba-lang" "Source and license")])])))
 
+(defn contents-strip
+  "What the rest of the page is, in five lines, before the reader commits to
+  forty screens of it.
+
+  A document this long needs a contents list more than it needs ten links in
+  the header, and this one is generated from `chapters`, so the strip and the
+  order the sections are placed in cannot disagree."
+  []
+  [:nav {:class "kot-contents" :aria-label "Contents"}
+   [:p {:class "kot-contents-label"} "What follows"]
+   [:ol {:class "kot-contents-list"}
+    (for [{:keys [n title href blurb]} chapters]
+      [:li [:a {:class "kot-contents-link" :href href}
+            [:span {:class "kot-contents-n"} n]
+            [:span {:class "kot-contents-t"} title]
+            [:span {:class "kot-contents-b"} blurb]]])]])
+
+(defn chapter-rule
+  "The divider that opens a chapter.
+
+  Not a heading: the 21 sections already own the `h2` level and re-levelling
+  every one of them to make room would change the document outline, which is
+  more than a layout change. This is a labelled rule that tells the eye where
+  a chapter starts."
+  [n title]
+  [:div {:class "kot-chapter"}
+   [:span {:class "kot-chapter-n"} n]
+   [:span {:class "kot-chapter-t"} title]])
+
+(defn chapter
+  "One chapter: its rule, then its sections, in order."
+  [{:keys [n title]} & sections]
+  (into [:div {:class "kot-chapter-block"} (chapter-rule n title)] sections))
+
 (defn view []
   [:div
    [:a {:class "kot-skip" :href "#main"} "Skip to content"]
@@ -1516,30 +2794,39 @@
    [:main {:id "main"}
     (hero)
     (dds/container
-     (why-section)
-     (what-section)
-     (defaults-section)
-     (developer-section)
-     (code-play-section)
-     (libraries-section)
-     (roadmap-section)
-     (community-section)
-     (sponsor-section)
-     (blog-cloud-section)
-     (proof-section)
-     (architecture-section)
-     (typed-eval-section)
-     (start-section)
-     (benchmark-section)
-     (claims-section)
-     (deliberate-section)
-     (release-section)
-     (search-section)
-     (source-section))]
+     (contents-strip)
+     ;; The same twenty sections, in the order the argument actually runs.
+     (chapter (nth chapters 0)
+              (why-section)
+              (what-section))
+     (chapter (nth chapters 1)
+              (architecture-section)
+              (typed-eval-section)
+              (defaults-section)
+              (deliberate-section))
+     (chapter (nth chapters 2)
+              (proof-section)
+              (benchmark-section)
+              (claims-section)
+              (release-section))
+     (chapter (nth chapters 3)
+              (start-section)
+              (developer-section)
+              (code-play-section)
+              (libraries-section)
+              (search-section))
+     (chapter (nth chapters 4)
+              (roadmap-section)
+              (community-section)
+              (sponsor-section)
+              (blog-cloud-section)
+              (source-section)))]
    (footer)
    [:script search-js]
    [:script play-js]
-   [:script hero-js]])
+   [:script hero-js]
+   [:script chart-anim-js]
+   [:script morph-js]])
 
 (defn blog-view []
   [:div
@@ -1638,6 +2925,8 @@
                (dds/heading 3 "Approve a name; execute a hash" {:size "20"})
                [:p "Passkey plus the pinned ML-DSA-65 key controls the mutable IPNS relay. This application-layer co-approval does not make the authenticator's Passkey post-quantum. Wasm execution addresses the immutable release CID and export."])))
 
+       (catalog-section)
+
        (dds/section
         {:id "status" :title "Current boundary"}
         (dds/grid
@@ -1670,7 +2959,8 @@
                   "Separate API coverage, target compatibility, compile performance, runtime performance, and operational qualification."
                   "A faster isolated kernel is not a general production-performance claim."
                   "Unsupported or unmeasured cells stay explicit; they are not silently scored as zero."])))]
-     (footer :en "../legal/")]))
+     (footer :en "../legal/")
+     [:script catalog-js]]))
 
 (defn libraries-ja-view []
   (let [surfaces (:kotoba.library-publication/surfaces library-publication)
@@ -1929,9 +3219,13 @@
     :description "AI writes freely. Kotoba draws the boundary — a security-first, post-quantum-by-default language and computing stack."
     :lang "en"
     :css dds-css
+    :dark? true
     :app-css (str tokens/skin-css "\n" app-css)
     :head (list (favicon-link)
                 (apple-touch-icon-link)
+                [:script theme-js]
+                [:script menu-js]
+                [:script chart-anim-head-js]
                 (og-head "/" "Kotoba — post-quantum-by-default computing for AI agents"
                          "AI writes freely. Kotoba draws the boundary — a security-first, post-quantum-by-default language and computing stack."))}
    (view)))
@@ -1942,9 +3236,12 @@
     :description "Kotoba engineering notes about language design, benchmarks, evidence, and remaining qualification gates."
     :lang "en"
     :css dds-css
+    :dark? true
     :app-css (str tokens/skin-css "\n" app-css)
     :head (list (favicon-link)
                 (apple-touch-icon-link)
+                [:script theme-js]
+                [:script menu-js]
                 (og-head "/blog/" "Kotoba Blog — engineering notes and evidence"
                          "Engineering notes on language design, benchmarks, evidence, and qualification gates."))}
    (blog-view)))
@@ -1955,9 +3252,12 @@
     :description "Inspect, publish, discover, and compare Kotoba libraries by immutable definition and release CIDs, with GitHub provenance kept separate."
     :lang "en"
     :css dds-css
+    :dark? true
     :app-css (str tokens/skin-css "\n" app-css)
     :head (list (favicon-link)
                 (apple-touch-icon-link)
+                [:script theme-js]
+                [:script menu-js]
                 (og-head "/libraries/" "Kotoba Libraries — content-addressed publication and comparison"
                          "Inspect, publish, discover, and compare libraries by immutable definition and release CIDs."))}
    (libraries-view)))
@@ -1968,9 +3268,12 @@
     :description "不変な definition CID と release CID を使って Kotoba library を inspect、publish、discover、compare し、GitHub provenance を identity と分けます。"
     :lang "ja"
     :css dds-css
+    :dark? true
     :app-css (str tokens/skin-css "\n" app-css)
     :head (list (favicon-link)
                 (apple-touch-icon-link)
+                [:script theme-js]
+                [:script menu-js]
                 (og-head "/ja/libraries/" "Kotoba Libraries — content-addressed publication と比較"
                          "不変な definition CID と release CID で Kotoba library を inspect、publish、discover、compare します。"))}
    (libraries-ja-view)))
@@ -1981,9 +3284,12 @@
     :description "kotoba-lang.org is operated by Kotoba Labs Inc. Public contact: support@kotoba-lang.org."
     :lang "en"
     :css dds-css
+    :dark? true
     :app-css (str tokens/skin-css "\n" app-css)
     :head (list (favicon-link)
                 (apple-touch-icon-link)
+                [:script theme-js]
+                [:script menu-js]
                 (og-head "/legal/" "Kotoba Labs Inc. — public operator"
                          "kotoba-lang.org is operated by Kotoba Labs Inc. Public contact: support@kotoba-lang.org."))}
    (legal-view)))
@@ -1994,9 +3300,12 @@
     :description "kotoba-lang.org の公開運営者は Kotoba Labs Inc. です。公開連絡先: support@kotoba-lang.org。"
     :lang "ja"
     :css dds-css
+    :dark? true
     :app-css (str tokens/skin-css "\n" app-css)
     :head (list (favicon-link)
                 (apple-touch-icon-link)
+                [:script theme-js]
+                [:script menu-js]
                 (og-head "/ja/legal/" "Kotoba Labs Inc. — 公開運営者"
                          "公開運営者は Kotoba Labs Inc.。連絡先: support@kotoba-lang.org。"))}
    (legal-ja-view)))
@@ -2007,9 +3316,12 @@
     :description "Sustain Kotoba's public language contracts, tooling, qualification, and evidence through GitHub Sponsors."
     :lang "en"
     :css dds-css
+    :dark? true
     :app-css (str tokens/skin-css "\n" app-css)
     :head (list (favicon-link)
                 (apple-touch-icon-link)
+                [:script theme-js]
+                [:script menu-js]
                 (og-head "/sponsor/" "Sponsor Kotoba — GitHub Sponsors"
                          "Sustain Kotoba's public language contracts, tooling, qualification, and evidence."))}
    (sponsor-view :en)))
@@ -2020,9 +3332,12 @@
     :description "GitHub Sponsors で Kotoba の公開言語仕様、ツール、検証、evidence を継続的に支援します。"
     :lang "ja"
     :css dds-css
+    :dark? true
     :app-css (str tokens/skin-css "\n" app-css)
     :head (list (favicon-link)
                 (apple-touch-icon-link)
+                [:script theme-js]
+                [:script menu-js]
                 (og-head "/ja/sponsor/" "Kotoba を支援 — GitHub Sponsors"
                          "Kotoba の公開言語仕様、ツール、検証、evidence を継続的に支援します。"))}
    (sponsor-view :ja)))

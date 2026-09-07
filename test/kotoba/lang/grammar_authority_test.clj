@@ -350,8 +350,15 @@
   Advanced again 2026-09-05 for the string-search surface slice:
   :predicates gains string-index-of, string-contains? and string-split-count
   (kbb scripts-port wave 2; the compiler and KIR already implemented the
-  latter two, and kotoba.runtime gains the CLJ interpreter bindings)."
-  "a1b444230a3ec6b835545b422f79a9c6fc581dc2588d035ae739bc0eb89d08bb")
+  latter two, and kotoba.runtime gains the CLJ interpreter bindings).
+  Advanced 2026-09-07 to `e333abac` for amu-h7: `:admitted-builtins` gains
+  `kernel-undefined-opcode-handler-address` (kotoba-sema#PR moves its copy and
+  pin in lockstep; amu and kotoba resync after).
+  Advanced 2026-09-07 to `ee7ea37c` for the fs-browse-dir grammar head /
+  find-lib slice (capability id 261). Sibling mains already MATCH
+  (kotoba cb70c446, kotoba-sema af8cc780); this pin plus the CI.yml
+  checkouts close the wave."
+  "ee7ea37c7ea88c52ee8869af4d485e91a0b11bb153682ad717c86c055270b6b5")
 
 (defn- sha256-hex [^bytes bs]
   (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") bs)]
@@ -430,16 +437,18 @@
                         kernel)]
     (println (format "SCANNED\t%d\tadmitted-builtins (%d kernel heads)"
                      (count builtins) (count kernel)))
-    (is (= 115 (count kernel))
+    (is (= 116 (count kernel))
         "the three kernel tables in kotoba-sema's frontend held 114 heads on
-         2026-09-03, and 115 since fwstore's `kernel-uefi-alloc-region`; if
-         that moves, this file and the four vendored copies move with it")
+         2026-09-03, 115 since fwstore's `kernel-uefi-alloc-region` and 116
+         since amu-h7's `kernel-undefined-opcode-handler-address`; if that
+         moves, this file and the four vendored copies move with it")
     (is (= 32 (count windows)) "four transfer widths by four window tiers")
     (is (= 8 (count carried)) "the carried slice family")
     (doseq [head ["kernel-load-u64-64k" "kernel-cmpxchg-u64" "kernel-dot-f32"
                   "kernel-dequant-dot-q6-k" "slice-sub" "kernel-xsetbv"
                   "kernel-uefi-call6" "kernel-swapgs"
-                  "kernel-uefi-alloc-region"]]
+                  "kernel-uefi-alloc-region"
+                  "kernel-undefined-opcode-handler-address"]]
       (is (contains? kernel head)
           (str head " is admitted by the frontend and must be named here")))))
 
