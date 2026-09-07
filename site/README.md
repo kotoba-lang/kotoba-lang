@@ -154,6 +154,70 @@ something. Verified by geometry rather than by eye — the nest's bounding boxes
 intersect **zero** nav links or wordmark boxes at 1440px, and it is absent at
 420px.
 
+## The theme switch is the Lisp mark
+
+The Lisp logo is a circle split by an S-curve with a lambda in each half — one
+knocked out of the dark side, one inked on the light side. That figure is
+already a light/dark duality, so the toggle does not bolt a sun and a moon
+onto it: **the control is the mark, and pressing it rotates the figure 180°**,
+carrying the coloured mass from one side to the other. The geometry is ours,
+in the same family, not a copy of the logo file.
+
+Both λ positions are the roomiest point in each half — furthest from the
+dividing curve and from the rim — found by sampling the filled path rather
+than placed by eye, and the scale is the largest that keeps both strokes,
+stroke width included, inside their own half. A λ that crosses the boundary is
+invisible where it lands on its own colour; the first attempt did exactly that
+at scale 0.85 and the check caught it.
+
+`role="switch"` with `aria-checked` is the honest shape for two states (a
+button whose label changes says the opposite thing half the time). The script
+is one head script on every page: in the head because applying a stored `dark`
+after first paint is a white flash on every navigation, on every page because
+otherwise the choice does not survive a link, and delegated from `document` so
+one script can serve a button that does not exist yet when it runs. With no
+stored choice the page follows `prefers-color-scheme`, and the switch follows
+it too. The button ships `hidden` and JavaScript reveals it — without a script
+there is nothing for it to do, and a dead control is worse than none.
+
+Measured both ways: from a light system, one click gives `data-theme="dark"`,
+body `rgb(26,26,26)`, `aria-checked="true"`, the figure at `rotate(180deg)`,
+`kotoba-theme=dark` stored, and it survives a navigation to `/libraries/`;
+from a dark system it starts checked and one click gives light. With
+JavaScript off the button is hidden and the page still honours the system.
+
+## The hero program, and the hashes it turns into
+
+The first screen carries a real Kotoba program — the same
+`site/assets/play/double-21.kotoba` the Play section runs — tokenized at build
+time by the grammar. Hovering it, or simply leaving it on screen, dissolves
+every character into hex and reassembles it as one of the program's identities,
+then puts the code back. It cycles through three, because they are three
+different hashes of three different things, all read out of the checked-in
+provenance receipt:
+
+| | |
+|---|---|
+| `source bytes` | sha-256 of the exact file shown |
+| `checked KIR` | the typed, effect-checked representation the compiler admitted |
+| `artifact identity` | binds source, policy, compiler contract and target ABI |
+
+The effect is the argument rather than decoration: a Kotoba definition is
+addressed by what it is, and none of these hashes is authority to run
+anything. The three digests are ordinary text in the page, so with JavaScript
+off or `prefers-reduced-motion` set nothing is lost — the animation is an
+overlay on content that is already there.
+
+**One rendering trap, measured.** Wrapping each character in its own span makes
+a token's children *all* elements, and `html.core` indents an element whose
+children are all elements. Inside `white-space: pre` each of those indents is a
+real line break, so the hero rendered one character per line. `<pre>` is on the
+renderer's preserve-whitespace list; `<code>` is not, so the safety net does
+not reach the element that needed it. `highlighted-kotoba-chars` therefore
+emits one pre-rendered, escaped string. The grammar's round-trip assertion
+still runs on the tokens before they are split, so the displayed bytes are
+still exactly the file's bytes.
+
 ## The `Fastest` claim on the first screen
 
 `cold-start` in `generate.cljs` derives it once, from

@@ -311,6 +311,90 @@
                    [:span {:class (str "kot-syntax-" (name kind))} text])))
           tokens)))
 
+(defn highlighted-kotoba-chars
+  "`highlighted-kotoba`, with every visible character in its own span.
+
+  The morph turns each character into a hex digit and back, so each one has to
+  be addressable. The grammar's round-trip assertion still runs on the tokens
+  before this splits them, and the text content is unchanged, so what is
+  displayed is still exactly the file's bytes.
+
+  Emitted as one pre-rendered string rather than nested hiccup, and that is
+  not a micro-optimisation. `html.core` indents an element whose children are
+  ALL elements — true of a token like `examples.w1-pure` once every character
+  is a span — and inside `white-space: pre` each of those indents is a real
+  line break. Measured: the hero rendered one character per line. `<pre>` is
+  on the renderer's preserve-whitespace list but `<code>` is not, so the
+  safety net does not reach this element.
+
+  Whitespace stays as plain text: wrapping it would multiply the markup for
+  characters that never change, and it is what keeps the source's own newlines
+  and indentation intact."
+  [source]
+  (let [tokens (mapv #(assoc % :kind (scope-kind (:scope %)))
+                     (grammar-highlight/tokenize source))
+        reconstructed (apply str (map :text tokens))
+        counter (volatile! -1)]
+    (when-not (= source reconstructed)
+      (throw (js/Error. "Kotoba syntax highlighting changed the displayed source")))
+    [:code {:class "kot-source kot-morph-src" :aria-label "Kotoba source code"}
+     (html/raw
+      (apply str
+             (for [{:keys [kind text]} tokens
+                   :let [inner (apply str
+                                      (for [c (seq text)]
+                                        (if (str/blank? c)
+                                          (html/esc c)
+                                          (str "<span class=\"kot-ch\" style=\"--i:"
+                                               (vswap! counter inc) "\">"
+                                               (html/esc c) "</span>"))))]]
+               (if (= :plain kind)
+                 inner
+                 (str "<span class=\"kot-syntax-" (name kind) "\">" inner "</span>")))))]))
+
+(def identity-layers
+  "The identities this one program has, read out of its provenance receipt.
+
+  They are deliberately different hashes of different things, which is the
+  point the animation is making: source bytes, the checked intermediate
+  representation, and the artifact identity that binds code, policy, compiler
+  contract and target ABI are three facts, not one. None of them is authority
+  to run anything — that is the architecture section's job to say, and it does."
+  [{:key :source :label "source bytes"
+    :sha (:source-sha256 play-provenance)
+    :note "sha-256 of the exact file shown here"}
+   {:key :kir :label "checked KIR"
+    :sha (:kir-sha256 play-provenance)
+    :note "the typed, effect-checked representation the compiler admitted"}
+   {:key :artifact :label "artifact identity"
+    :sha (:sha256 play-provenance)
+    :note "binds source, policy, compiler contract and target ABI"}])
+
+(defn hero-code
+  "The first screen's Kotoba program, and the hashes it turns into.
+
+  Same file as the Play section further down — the one whose Wasm is checked
+  in with this provenance — so the digests on screen are the recorded digests
+  of the thing you can actually run, not a decorative hex string.
+
+  The list of identities is real text in the page. The animation is an overlay
+  on top of it: with no JavaScript, or with reduced motion, the code and all
+  three hashes are simply there."
+  []
+  [:div {:class "kot-morph" :id "kot-morph"
+         :data-layers (str/join "|" (for [{:keys [label sha]} identity-layers]
+                                      (str label " " sha)))}
+   [:div {:class "kot-morph-stage"}
+    [:pre {:class "kot-pre kot-morph-code"} (highlighted-kotoba-chars play-source)]
+    [:div {:class "kot-morph-out" :aria-hidden "true"}
+     [:span {:class "kot-morph-label"}]
+     [:span {:class "kot-morph-hex"}]]]
+   [:ul {:class "kot-morph-ids"}
+    (for [{:keys [label sha note]} identity-layers]
+      [:li [:span {:class "kot-morph-id-label"} label]
+       [:code {:class "kot-code kot-morph-id-sha"} (subs sha 0 16) "…"]
+       [:span {:class "kot-morph-id-note"} note]])]])
+
 (def app-css
   (str
    ".kot-skip{position:absolute;inset-inline-start:var(--hig-spacing-2);"
@@ -377,6 +461,50 @@
    "padding:var(--hig-spacing-4);background:var(--hig-color-quaternary-system-fill);"
    "border-radius:var(--hig-radius-md)}"
    ".kot-source{display:block;white-space:pre;tab-size:2}"
+   ;; ── the theme switch: the Lisp mark is the control ───────────────────────
+   "#kot-theme{min-width:calc(44 / 16 * 1rem);min-height:calc(44 / 16 * 1rem);"
+   "padding-inline:var(--hig-spacing-2);color:var(--hig-color-tint)}"
+   ".kot-yy{display:inline-flex}"
+   ".kot-yy-ring{fill:none;stroke:currentColor;stroke-width:1;opacity:.5}"
+   ".kot-yy-yin{fill:currentColor}"
+   ".kot-lam{fill:none;stroke-width:2.4;stroke-linecap:round}"
+   ;; The lambda sitting on the inked half is knocked out in the page surface;
+   ;; the other is inked in the tint. Swap them and each one vanishes into its
+   ;; own background.
+   ".kot-lam-cut{stroke:var(--hig-color-system-background)}"
+   ".kot-lam-ink{stroke:currentColor}"
+   ".kot-yy-fig{transform-origin:12px 12px;transition:transform .55s cubic-bezier(.68,-0.3,.32,1.3)}"
+   "#kot-theme[aria-checked=\"true\"] .kot-yy-fig{transform:rotate(180deg)}"
+   "@media(prefers-reduced-motion:reduce){.kot-yy-fig{transition:none}}"
+   ;; ── the hero program, and the hashes it turns into ───────────────────────
+   ".kot-morph{margin-block:var(--hig-spacing-6);max-width:44rem}"
+   ".kot-morph-stage{display:grid;align-items:center;"
+   "background:var(--hig-color-secondary-system-background);"
+   "border:1px solid var(--hig-color-separator);"
+   "border-radius:var(--hig-radius-sm);padding:var(--hig-spacing-4);"
+   "overflow-x:auto}"
+   ".kot-morph-stage>*{grid-area:1/1}"
+   ".kot-morph .kot-pre{background:none;border:0;margin:0;padding:0}"
+   ".kot-morph-code{margin:0;transition:opacity .35s ease}"
+   ".kot-morph .kot-ch{transition:color .3s ease;transition-delay:calc(var(--i) * 4ms)}"
+   ".kot-morph.is-scatter .kot-ch{color:var(--hig-color-tertiary-label)}"
+   ".kot-morph.is-hash .kot-morph-code{opacity:0}"
+   ".kot-morph-out{display:grid;gap:var(--hig-spacing-2);justify-items:start;"
+   "align-content:center;opacity:0;transform:scale(.97);"
+   "pointer-events:none;transition:opacity .35s ease,transform .35s ease}"
+   ".kot-morph.is-hash .kot-morph-out{opacity:1;transform:none}"
+   ".kot-morph-label{color:var(--hig-color-tint);font-weight:700;"
+   "font-size:var(--hig-text-footnote-font-size);letter-spacing:.06em;"
+   "text-transform:uppercase}"
+   ".kot-morph-hex{font-family:var(--hig-font-mono);"
+   "font-size:var(--hig-text-footnote-font-size);line-height:1.5;"
+   "overflow-wrap:anywhere;color:var(--hig-color-label)}"
+   ".kot-morph-ids{list-style:none;margin:var(--hig-spacing-3) 0 0;padding:0;"
+   "display:grid;gap:var(--hig-spacing-2)}"
+   ".kot-morph-ids li{display:flex;flex-wrap:wrap;align-items:baseline;"
+   "gap:var(--hig-spacing-2);font-size:var(--hig-text-footnote-font-size)}"
+   ".kot-morph-id-label{min-width:9rem;color:var(--hig-color-label);font-weight:700}"
+   ".kot-morph-id-note{color:var(--hig-color-secondary-label)}"
    ".kot-syntax-comment{color:var(--hig-color-tertiary-label);font-style:italic}"
    ".kot-syntax-form,.kot-syntax-keyword,.kot-syntax-function{color:var(--hig-color-tint);font-weight:700}"
    ".kot-syntax-definition{color:var(--hig-color-label);font-weight:700;text-decoration:underline;"
@@ -590,6 +718,45 @@
   (list [:div {:class "kot-lisp-edge" :data-side "start"} lisp-nest]
         [:div {:class "kot-lisp-edge" :data-side "end"} lisp-nest]))
 
+(def theme-toggle
+  "Light/dark toggle, drawn as a λ yin-yang.
+
+  The Lisp logo is a circle split by an S-curve with a lambda in each half —
+  one knocked out of the dark side, one inked on the light side. That figure
+  is already a light/dark duality, so it does not need a sun and a moon bolted
+  onto it: **the control is the mark, and toggling rotates it 180°**, which
+  carries the coloured mass from one side to the other. This is our own
+  geometry in the same family, not a copy of the logo file.
+
+  The two λ positions are the roomiest point in each half — the point furthest
+  from the dividing curve and from the rim — found by sampling the filled path
+  rather than eyeballed, and the scale is the largest that keeps both strokes,
+  stroke width included, inside their own half. A λ that crosses the boundary
+  is invisible where it lands on its own colour.
+
+  `role=switch` + `aria-checked` is the honest shape for a two-state control
+  (a button with a label that changes says the opposite thing half the time).
+  It ships `hidden`: without JavaScript there is nothing for it to do, and a
+  dead control is worse than no control — the page still answers to
+  `prefers-color-scheme` on its own."
+  (let [yin "M12 1.4A10.6 10.6 0 0 1 12 22.6A5.3 5.3 0 0 1 12 12A5.3 5.3 0 0 0 12 1.4Z"
+        lam (fn [x y rot cls]
+              [:g {:transform (str "translate(" x " " y ") rotate(" rot ") scale(0.78)")}
+               [:path {:class (str "kot-lam " cls) :d "M-2.2 -4 L2.4 4"}]
+               [:path {:class (str "kot-lam " cls) :d "M-0.6 -1.2 L-2.8 4"}]])]
+    (dds/button
+     [:span {:class "kot-yy"}
+      [:svg {:viewBox "0 0 24 24" :width 26 :height 26
+             :aria-hidden "true" :focusable "false"}
+       [:g {:class "kot-yy-fig"}
+        [:circle {:class "kot-yy-ring" :cx 12 :cy 12 :r 10.6}]
+        [:path {:class "kot-yy-yin" :d yin}]
+        (lam 12.05 17.30 0 "kot-lam-cut")
+        (lam 11.95 6.70 180 "kot-lam-ink")]]]
+     {:type :text :size "sm"
+      :attrs {:id "kot-theme" :role "switch"
+              :aria-checked "false" :aria-label "Dark mode" :hidden true}})))
+
 (defn header
   ([] (header ""))
   ([root]
@@ -615,7 +782,8 @@
          (for [{:keys [label href]} primary-links]
            (dds/button label {:type :text :size "sm" :href (local-href href)}))
          (dds/button "GitHub" {:type :outline :size "sm"
-                                :href "https://github.com/kotoba-lang/kotoba-lang"})]])])))
+                                :href "https://github.com/kotoba-lang/kotoba-lang"})
+         theme-toggle]])])))
 
 (def fallback-svg
   (let [pts (hero/stroke-samples 36)
@@ -633,6 +801,108 @@
 (def FXN (str hero/drift-freq-x))
 (def FYN (str hero/drift-freq-y))
 (def AMAXV (str hero/alpha-max))
+
+(def morph-js
+  "Turns the hero's program into one of its hashes, and back.
+
+  The effect is the argument, not decoration: a Kotoba definition is addressed
+  by what it is, so watching the source resolve into a digest and back is the
+  claim the rest of the page spends paragraphs on. It cycles through the three
+  identities in `identity-layers`, which is why it does not simply fade — the
+  label changes each time, and they are different hashes of different things.
+
+  Everything it needs is already in the DOM: the digests come from a data
+  attribute the generator wrote from the provenance receipt, and the original
+  characters are read back off the page at start-up rather than duplicated
+  into another attribute.
+
+  It runs on hover, on focus, and on a slow timer while the block is actually
+  on screen — the timer is cleared the moment it leaves, so a page scrolled
+  past does no work. `prefers-reduced-motion` returns before any of that is
+  wired up; the code and all three hashes are in the page as ordinary text, so
+  nothing is lost by never running it."
+  (str "(function(){"
+       "var R=document.getElementById('kot-morph');if(!R)return;"
+       "if(window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)').matches)return;"
+       "var C=[].slice.call(R.querySelectorAll('.kot-ch'));if(!C.length)return;"
+       "var O=C.map(function(e){return e.textContent;});"
+       "var L=(R.getAttribute('data-layers')||'').split('|').map(function(t){"
+       "var i=t.lastIndexOf(' ');return{l:t.slice(0,i),h:t.slice(i+1)};});"
+       "if(!L.length||!L[0].h)return;"
+       "var out=R.querySelector('.kot-morph-out'),"
+       "lab=R.querySelector('.kot-morph-label'),hex=R.querySelector('.kot-morph-hex');"
+       "var H='0123456789abcdef',busy=false,turn=0,T=[];"
+       "function at(f,m){T.push(setTimeout(f,m));}"
+       "function stop(){T.forEach(clearTimeout);T=[];}"
+       "function scramble(){for(var i=0;i<C.length;i++)"
+       "C[i].textContent=H.charAt((Math.random()*16)|0);}"
+       "function restore(){for(var i=0;i<C.length;i++)C[i].textContent=O[i];}"
+       "function run(){if(busy)return;busy=true;stop();"
+       "var x=L[turn%L.length];turn++;"
+       "lab.textContent=x.l;hex.textContent=x.h;"
+       "R.classList.add('is-scatter');"
+       "at(scramble,60);at(scramble,180);at(scramble,300);"
+       "at(function(){R.classList.add('is-hash');},420);"
+       "at(function(){R.classList.remove('is-hash');},2400);"
+       "at(scramble,2460);at(scramble,2580);"
+       "at(function(){restore();R.classList.remove('is-scatter');busy=false;},2700);}"
+       "R.addEventListener('mouseenter',run);R.addEventListener('focusin',run);"
+       "var tick=null;"
+       "function idle(on){if(on){if(!tick)tick=setInterval(function(){"
+       "if(!document.hidden)run();},9000);}"
+       "else if(tick){clearInterval(tick);tick=null;}}"
+       "if('IntersectionObserver' in window){"
+       "new IntersectionObserver(function(es){es.forEach(function(e){"
+       "idle(e.isIntersecting);if(e.isIntersecting)at(run,900);});},"
+       "{threshold:0.35}).observe(R);}else{at(run,900);idle(true);}"
+       "})();"))
+
+(def theme-js
+  "Theme choice, in one script that runs in <head> on every page.
+
+  It has to be in the head and before paint: applying a stored `dark` after
+  first paint is a white flash on every navigation. It has to be on every page
+  or the choice does not survive a link.
+
+  The click handler is delegated from `document`, so the same head script
+  works even though the button does not exist yet when it runs — that is why
+  there is one script instead of a head script plus a body script per page.
+
+  With no stored choice the page follows `prefers-color-scheme`, which is what
+  `jp-go-dds.dark` already does on its own; the toggle only ever writes an
+  explicit override, and `:root[data-theme]` beats the media query in both
+  directions."
+  (str "(function(){"
+       "var K='kotoba-theme',R=document.documentElement;"
+       "function stored(){try{var v=localStorage.getItem(K);"
+       "return v==='dark'||v==='light'?v:null;}catch(e){return null;}}"
+       "var s=stored();if(s)R.setAttribute('data-theme',s);"
+       "function sysDark(){return !!(window.matchMedia&&"
+       "matchMedia('(prefers-color-scheme: dark)').matches);}"
+       "function current(){var a=R.getAttribute('data-theme');"
+       "return a==='dark'||a==='light'?a:(sysDark()?'dark':'light');}"
+       "function paint(){var b=document.getElementById('kot-theme');if(!b)return;"
+       "var d=current()==='dark';"
+       "b.setAttribute('aria-checked',d?'true':'false');"
+       "b.setAttribute('aria-label',d?'Dark mode, on':'Dark mode, off');}"
+       "document.addEventListener('click',function(e){"
+       "var t=e.target,b=null;"
+       "while(t&&t!==document){if(t.id==='kot-theme'){b=t;break;}t=t.parentNode;}"
+       "if(!b)return;"
+       "var n=current()==='dark'?'light':'dark';"
+       "R.setAttribute('data-theme',n);"
+       "try{localStorage.setItem(K,n);}catch(e2){}"
+       "paint();});"
+       "function ready(){var b=document.getElementById('kot-theme');"
+       "if(b){b.hidden=false;paint();}}"
+       "if(document.readyState==='loading')"
+       "document.addEventListener('DOMContentLoaded',ready);else ready();"
+       ;; While no explicit choice is stored the page still follows the system,
+       ;; so the switch has to follow it too or it will show the wrong state.
+       "if(window.matchMedia){var mq=matchMedia('(prefers-color-scheme: dark)');"
+       "var f=function(){if(!stored())paint();};"
+       "if(mq.addEventListener)mq.addEventListener('change',f);}"
+       "})();"))
 
 (def chart-anim-head-js
   "Runs in <head>, before first paint, so the charts never render complete and
@@ -866,6 +1136,7 @@
     (dds/heading 1 "AI writes freely. Kotoba draws the boundary." {:size "48"})
     [:p {:class "kot-lead"}
      "Kotoba is an intuitive, declarative, security-first language and computing stack for AI agents—and for humans who vibe-code with them. Post-quantum cryptography is the admission floor for every new cryptographic boundary, not an optional mode."]
+    (hero-code)
     (speed-panel)
     [:blockquote {:class "kot-quote"}
      [:strong "Existing software adds security around the program. Kotoba makes security a property of the whole computation."]]
@@ -2324,7 +2595,8 @@
    [:script search-js]
    [:script play-js]
    [:script hero-js]
-   [:script chart-anim-js]])
+   [:script chart-anim-js]
+   [:script morph-js]])
 
 (defn blog-view []
   [:div
@@ -2721,6 +2993,7 @@
     :app-css (str tokens/skin-css "\n" app-css)
     :head (list (favicon-link)
                 (apple-touch-icon-link)
+                [:script theme-js]
                 [:script chart-anim-head-js]
                 (og-head "/" "Kotoba — post-quantum-by-default computing for AI agents"
                          "AI writes freely. Kotoba draws the boundary — a security-first, post-quantum-by-default language and computing stack."))}
@@ -2736,6 +3009,7 @@
     :app-css (str tokens/skin-css "\n" app-css)
     :head (list (favicon-link)
                 (apple-touch-icon-link)
+                [:script theme-js]
                 (og-head "/blog/" "Kotoba Blog — engineering notes and evidence"
                          "Engineering notes on language design, benchmarks, evidence, and qualification gates."))}
    (blog-view)))
@@ -2750,6 +3024,7 @@
     :app-css (str tokens/skin-css "\n" app-css)
     :head (list (favicon-link)
                 (apple-touch-icon-link)
+                [:script theme-js]
                 (og-head "/libraries/" "Kotoba Libraries — content-addressed publication and comparison"
                          "Inspect, publish, discover, and compare libraries by immutable definition and release CIDs."))}
    (libraries-view)))
@@ -2764,6 +3039,7 @@
     :app-css (str tokens/skin-css "\n" app-css)
     :head (list (favicon-link)
                 (apple-touch-icon-link)
+                [:script theme-js]
                 (og-head "/ja/libraries/" "Kotoba Libraries — content-addressed publication と比較"
                          "不変な definition CID と release CID で Kotoba library を inspect、publish、discover、compare します。"))}
    (libraries-ja-view)))
@@ -2778,6 +3054,7 @@
     :app-css (str tokens/skin-css "\n" app-css)
     :head (list (favicon-link)
                 (apple-touch-icon-link)
+                [:script theme-js]
                 (og-head "/legal/" "Kotoba Labs Inc. — public operator"
                          "kotoba-lang.org is operated by Kotoba Labs Inc. Public contact: support@kotoba-lang.org."))}
    (legal-view)))
@@ -2792,6 +3069,7 @@
     :app-css (str tokens/skin-css "\n" app-css)
     :head (list (favicon-link)
                 (apple-touch-icon-link)
+                [:script theme-js]
                 (og-head "/ja/legal/" "Kotoba Labs Inc. — 公開運営者"
                          "公開運営者は Kotoba Labs Inc.。連絡先: support@kotoba-lang.org。"))}
    (legal-ja-view)))
@@ -2806,6 +3084,7 @@
     :app-css (str tokens/skin-css "\n" app-css)
     :head (list (favicon-link)
                 (apple-touch-icon-link)
+                [:script theme-js]
                 (og-head "/sponsor/" "Sponsor Kotoba — GitHub Sponsors"
                          "Sustain Kotoba's public language contracts, tooling, qualification, and evidence."))}
    (sponsor-view :en)))
@@ -2820,6 +3099,7 @@
     :app-css (str tokens/skin-css "\n" app-css)
     :head (list (favicon-link)
                 (apple-touch-icon-link)
+                [:script theme-js]
                 (og-head "/ja/sponsor/" "Kotoba を支援 — GitHub Sponsors"
                          "Kotoba の公開言語仕様、ツール、検証、evidence を継続的に支援します。"))}
    (sponsor-view :ja)))
