@@ -401,24 +401,83 @@
    "transform:translateY(-150%);padding:var(--hig-spacing-2) var(--hig-spacing-3);"
    "background:var(--hig-color-system-background);color:var(--hig-color-label);z-index:3}"
    ".kot-skip:focus{transform:translateY(var(--hig-spacing-2))}"
-   ".kot-header{position:relative;z-index:2;overflow:clip;"
+   ".kot-header{position:relative;z-index:2;"
    "background:var(--hig-color-system-background);"
    "border-bottom:var(--hig-hairline) solid var(--hig-color-separator)}"
-   ".kot-header__inner{display:flex;align-items:flex-start;flex-direction:column;"
+   ".kot-header__inner{display:flex;align-items:center;flex-direction:row;"
+   "justify-content:space-between;"
    "gap:var(--hig-spacing-3);padding-block:var(--hig-spacing-3)}"
    ".kot-wordmark{display:inline-flex;align-items:center;gap:.12em;text-decoration:none}"
-   ".kot-paren{font-family:var(--hig-font-mono);font-size:2.1rem;line-height:1;"
+   ".kot-paren{font-family:var(--hig-font-mono);font-size:1.7rem;line-height:1;"
    "font-weight:400;color:var(--hig-color-tint)}"
    ;; A texture, not data: hairline strokes at low opacity, and it sits behind
    ;; the header row so the nav keeps the surface it is measured against.
    ;; The motif lives in the page margins, never over the nav. Below 64rem the
    ;; container fills the viewport and there is no margin to put it in, so it
    ;; is not drawn at all rather than drawn on top of something.
-   ".kot-lisp-edge{display:none}"
+   ".kot-lisp-edge{display:none;overflow:clip}"
    ".kot-lisp-nest{display:block;height:100%;width:auto;max-width:none;fill:none;"
    "stroke:var(--hig-color-tint);stroke-width:2;stroke-linecap:round}"
    ".kot-header__inner{position:relative;z-index:1}"
-   ".kot-logo{display:block;height:var(--hig-spacing-7);width:auto}"
+   ".kot-logo{display:block;height:var(--hig-spacing-6);width:auto}"
+   ;; ── the menu ─────────────────────────────────────────────────────────────
+   ".kot-nav-inline{display:none}"
+   ".kot-menu{position:relative}"
+   ".kot-menu-summary{display:inline-flex;align-items:center;gap:var(--hig-spacing-1);"
+   "min-height:calc(44 / 16 * 1rem);padding-inline:var(--hig-spacing-3);"
+   "border-radius:var(--hig-radius-xs);color:var(--hig-color-tint);"
+   "font-weight:700;cursor:pointer;list-style:none}"
+   ".kot-menu-summary::-webkit-details-marker{display:none}"
+   ".kot-menu-caret{transition:transform .2s ease}"
+   ".kot-menu[open] .kot-menu-caret{transform:rotate(180deg)}"
+   ".kot-menu-panel{display:grid;gap:var(--hig-spacing-4);width:100%;"
+   "margin-top:var(--hig-spacing-3);padding:var(--hig-spacing-4) 0 0;"
+   "border-top:1px solid var(--hig-color-separator)}"
+   ".kot-menu-group-label{margin:0 0 var(--hig-spacing-2);"
+   "color:var(--hig-color-secondary-label);font-size:var(--hig-text-caption1-font-size);"
+   "letter-spacing:.08em;text-transform:uppercase}"
+   ".kot-menu-list{list-style:none;margin:0;padding:0;display:grid}"
+   ".kot-menu-link{display:flex;align-items:center;gap:var(--hig-spacing-2);"
+   "min-height:calc(44 / 16 * 1rem);color:var(--hig-color-label);text-decoration:none}"
+   ".kot-menu-link:hover,.kot-menu-link:focus-visible{color:var(--hig-color-tint);"
+   "text-decoration:underline;text-underline-offset:.18em}"
+   ".kot-menu-n{color:var(--hig-color-tint);font-family:var(--hig-font-mono);"
+   "font-size:var(--hig-text-caption1-font-size)}"
+   ;; ── the contents strip ───────────────────────────────────────────────────
+   ".kot-contents{margin-block:var(--hig-spacing-9) var(--hig-spacing-8)}"
+   ".kot-contents-label{margin:0 0 var(--hig-spacing-3);"
+   "color:var(--hig-color-secondary-label);font-size:var(--hig-text-caption1-font-size);"
+   "letter-spacing:.08em;text-transform:uppercase}"
+   ".kot-contents-list{list-style:none;margin:0;padding:0;display:grid;"
+   "gap:var(--hig-spacing-1)}"
+   ".kot-contents-link{display:grid;grid-template-columns:2.5rem 1fr;"
+   "align-items:baseline;gap:var(--hig-spacing-1) var(--hig-spacing-2);"
+   "padding-block:var(--hig-spacing-3);"
+   "border-top:1px solid var(--hig-color-separator);"
+   "color:var(--hig-color-label);text-decoration:none}"
+   ".kot-contents-list li:last-child .kot-contents-link{"
+   "border-bottom:1px solid var(--hig-color-separator)}"
+   ".kot-contents-n{color:var(--hig-color-tint);font-family:var(--hig-font-mono);"
+   "font-size:var(--hig-text-footnote-font-size)}"
+   ".kot-contents-t{font-weight:700}"
+   ".kot-contents-b{grid-column:2;color:var(--hig-color-secondary-label);"
+   "font-size:var(--hig-text-footnote-font-size);"
+   "line-height:var(--hig-text-footnote-line-height)}"
+   ".kot-contents-link:hover .kot-contents-t,"
+   ".kot-contents-link:focus-visible .kot-contents-t{color:var(--hig-color-tint);"
+   "text-decoration:underline;text-underline-offset:.18em}"
+   ;; ── chapter rules ────────────────────────────────────────────────────────
+   ".kot-chapter{display:flex;align-items:baseline;gap:var(--hig-spacing-3);"
+   "margin-block:var(--hig-spacing-9) var(--hig-spacing-6);"
+   "padding-top:var(--hig-spacing-4);"
+   "border-top:2px solid var(--hig-color-tint)}"
+   ".kot-chapter-n{color:var(--hig-color-tint);font-family:var(--hig-font-mono);"
+   "font-weight:700}"
+   ".kot-chapter-t{color:var(--hig-color-secondary-label);font-weight:700;"
+   "letter-spacing:.08em;text-transform:uppercase;"
+   "font-size:var(--hig-text-footnote-font-size)}"
+   ".kot-chapter-block>.dds-ext-section:first-of-type{padding-top:0;border-top:none}"
+   ".kot-chapter-block>.dds-ext-section:last-of-type{padding-bottom:0}"
    ".kot-nav{display:flex;align-items:center;justify-content:flex-start;flex-wrap:wrap;"
    "gap:var(--hig-spacing-2);width:100%}"
    ".kot-hero{position:relative;overflow:clip;padding-block:var(--hig-spacing-8)}"
@@ -544,6 +603,17 @@
    "font-family:var(--hig-font-mono);font-size:var(--hig-text-caption1-font-size)}"
    ".kot-footer{padding-block:var(--hig-spacing-7);"
    "border-top:var(--hig-hairline) solid var(--hig-color-separator)}"
+   "@media(min-width:48rem){.kot-nav-inline{display:flex;align-items:center;"
+   "gap:var(--hig-spacing-1)}"
+   ".kot-logo{height:var(--hig-spacing-7)}.kot-paren{font-size:2.1rem}"
+   ".kot-menu-panel{position:absolute;z-index:3;inset-inline-end:0;"
+   "top:calc(100% + var(--hig-spacing-2));width:auto;min-width:17rem;"
+   "max-height:min(70vh,34rem);overflow:auto;margin-top:0;"
+   "padding:var(--hig-spacing-4);border:1px solid var(--hig-color-separator);"
+   "border-radius:var(--hig-radius-sm);background:var(--hig-color-system-background);"
+   "box-shadow:0 8px 28px rgb(0 0 0 / 18%)}"
+   ".kot-contents-link{grid-template-columns:3rem 14rem 1fr}"
+   ".kot-contents-b{grid-column:auto}}"
    "@media(min-width:36rem){.kot-actions{display:flex;flex-wrap:wrap}"
    ".kot-hero h1{font-size:2.75rem;line-height:1.15}}"
    "@media(min-width:64rem){"
@@ -552,7 +622,6 @@
    ".kot-lisp-edge[data-side=start]{inset-inline-start:0}"
    ".kot-lisp-edge[data-side=end]{inset-inline-end:0;transform:scaleX(-1)}}"
    "@media(min-width:48rem){.kot-header{position:sticky;top:0}"
-   ".kot-header__inner{align-items:center;flex-direction:row;justify-content:space-between}"
    ".kot-nav{justify-content:flex-end;width:auto}.kot-hero{padding-block:var(--hig-spacing-10) var(--hig-spacing-9)}}"
    ;; ── charts ───────────────────────────────────────────────────────────────
    ;; Every mark reads a --hig-* token, so jp-go-dds.dark carries the whole
@@ -667,15 +736,55 @@
    ".kot-anim .kot-chart:not(.is-in) .kot-leader,"
    ".kot-anim .kot-chart:not(.is-in) .kot-line-label{opacity:1}}"))
 
-(def primary-links
+(def chapters
+  "The page as five chapters, in the order the argument runs.
+
+  The sections themselves are unchanged — this is the order they are placed in
+  and the contents strip that names them. Before this the body ran why → what →
+  defaults → docs → code → libraries → roadmap → community → sponsor → cloud →
+  proof → architecture, so the mechanism and the evidence arrived after the
+  sponsorship page, and the reader met the ecosystem before the argument. The
+  anchor of each chapter is its first section's existing id; no new ids, no
+  moved content, no changed words."
+  [{:n "01" :title "The problem" :href "#why"
+    :blurb "What generated code can reach, and what a language can do about it."}
+   {:n "02" :title "How the boundary works" :href "#architecture"
+    :blurb "Source, checked KIR, admission, artifact identity, host enforcement."}
+   {:n "03" :title "The evidence" :href "#proof"
+    :blurb "Five benchmarks, eight claims, and the qualification each one carries."}
+   {:n "04" :title "Start using it" :href "#start"
+    :blurb "Install, read, run a real program, browse the libraries."}
+   {:n "05" :title "Around the language" :href "#roadmap"
+    :blurb "Roadmap, community, sponsorship, cloud services, source."}])
+
+(def nav-menu
+  "Every destination, grouped, in one disclosure.
+
+  The header used to carry ten controls in a flat row: three rows and 202px of
+  header on a 390px screen, and nothing to tell the reader which of the ten
+  mattered. Grouping is the content of this change — the links are the same
+  links."
+  [{:group "Learn"
+    :items [{:label "Docs" :href "#docs"}
+            {:label "Play" :href "#play"}
+            {:label "Libraries" :href "#libraries"}]}
+   {:group "Project"
+    :items [{:label "Roadmap" :href "#roadmap"}
+            {:label "Community" :href "#community"}
+            {:label "Sponsor" :href "./sponsor/"}]}
+   {:group "Elsewhere"
+    :items [{:label "Blog" :href "./blog/"}
+            {:label "Cloud" :href "#cloud"}
+            {:label "GitHub" :href "https://github.com/kotoba-lang/kotoba-lang"}]}])
+
+(def nav-inline
+  "The two destinations kept in the header bar at 48rem and up.
+
+  They are also in the menu. A duplicated navigation link is ordinary — the
+  wordmark already duplicates `#top` — and it is what lets one DOM copy of the
+  menu serve every width without leaving anything unreachable on a phone."
   [{:label "Docs" :href "#docs"}
-   {:label "Play" :href "#play"}
-   {:label "Libraries" :href "#libraries"}
-   {:label "Roadmap" :href "#roadmap"}
-   {:label "Community" :href "#community"}
-   {:label "Sponsor" :href "./sponsor/"}
-   {:label "Blog" :href "./blog/"}
-   {:label "Cloud" :href "#cloud"}])
+   {:label "Play" :href "#play"}])
 
 (def proof-signals
   [{:metric "33 cores"
@@ -779,10 +888,34 @@
                 :width 480 :height 68 :alt "Kotoba"}]
          [:span {:class "kot-paren" :aria-hidden "true"} ")"]]
         [:nav {:class "kot-nav" :aria-label "Primary"}
-         (for [{:keys [label href]} primary-links]
-           (dds/button label {:type :text :size "sm" :href (local-href href)}))
-         (dds/button "GitHub" {:type :outline :size "sm"
-                                :href "https://github.com/kotoba-lang/kotoba-lang"})
+         ;; Two quick links from 48rem up; below that the row is wordmark,
+         ;; menu, switch — one line on a 390px screen instead of three.
+         [:span {:class "kot-nav-inline"}
+          (for [{:keys [label href]} nav-inline]
+            (dds/button label {:type :text :size "sm" :href (local-href href)}))]
+         ;; A native <details>: no script decides whether it opens, so it works
+         ;; before and without JavaScript. One script only closes it again
+         ;; after a link inside it is followed.
+         [:details {:class "kot-menu" :id "kot-menu"}
+          [:summary {:class "kot-menu-summary"}
+           [:span {:class "kot-menu-label"} "Menu"]
+           [:svg {:class "kot-menu-caret" :viewBox "0 0 24 24" :width 18 :height 18
+                  :aria-hidden "true" :focusable "false"}
+            [:path {:d "M4 8.5 12 16l8-7.5" :fill "none" :stroke "currentcolor"
+                    :stroke-width 2 :stroke-linecap "round" :stroke-linejoin "round"}]]]
+          [:div {:class "kot-menu-panel"}
+           [:div {:class "kot-menu-group"}
+            [:p {:class "kot-menu-group-label"} "On this page"]
+            [:ul {:class "kot-menu-list"}
+             (for [{:keys [n title href]} chapters]
+               [:li [:a {:class "kot-menu-link" :href (local-href href)}
+                     [:span {:class "kot-menu-n"} n] title]])]]
+           (for [{:keys [group items]} nav-menu]
+             [:div {:class "kot-menu-group"}
+              [:p {:class "kot-menu-group-label"} group]
+              [:ul {:class "kot-menu-list"}
+               (for [{:keys [label href]} items]
+                 [:li [:a {:class "kot-menu-link" :href (local-href href)} label]])]])]]
          theme-toggle]])])))
 
 (def fallback-svg
@@ -855,6 +988,22 @@
        "new IntersectionObserver(function(es){es.forEach(function(e){"
        "idle(e.isIntersecting);if(e.isIntersecting)at(run,900);});},"
        "{threshold:0.35}).observe(R);}else{at(run,900);idle(true);}"
+       "})();"))
+
+(def menu-js
+  "Closes the header menu after a link inside it is followed.
+
+  The disclosure itself is native, so it opens and closes without this; all
+  this does is stop an open panel from covering the section the reader just
+  jumped to. Delegated from `document` for the same reason the theme script
+  is: one head script, every page, no dependency on the element existing yet."
+  (str "(function(){"
+       "document.addEventListener('click',function(e){"
+       "var t=e.target;while(t&&t!==document){"
+       "if(t.tagName==='A'&&t.className&&t.className.indexOf&&"
+       "t.className.indexOf('kot-menu-link')>-1){"
+       "var d=document.getElementById('kot-menu');if(d)d.open=false;return;}"
+       "t=t.parentNode;}});"
        "})();"))
 
 (def theme-js
@@ -2564,6 +2713,40 @@
         " · "
         (external-link "https://github.com/kotoba-lang/kotoba-lang" "Source and license")])])))
 
+(defn contents-strip
+  "What the rest of the page is, in five lines, before the reader commits to
+  forty screens of it.
+
+  A document this long needs a contents list more than it needs ten links in
+  the header, and this one is generated from `chapters`, so the strip and the
+  order the sections are placed in cannot disagree."
+  []
+  [:nav {:class "kot-contents" :aria-label "Contents"}
+   [:p {:class "kot-contents-label"} "What follows"]
+   [:ol {:class "kot-contents-list"}
+    (for [{:keys [n title href blurb]} chapters]
+      [:li [:a {:class "kot-contents-link" :href href}
+            [:span {:class "kot-contents-n"} n]
+            [:span {:class "kot-contents-t"} title]
+            [:span {:class "kot-contents-b"} blurb]]])]])
+
+(defn chapter-rule
+  "The divider that opens a chapter.
+
+  Not a heading: the 21 sections already own the `h2` level and re-levelling
+  every one of them to make room would change the document outline, which is
+  more than a layout change. This is a labelled rule that tells the eye where
+  a chapter starts."
+  [n title]
+  [:div {:class "kot-chapter"}
+   [:span {:class "kot-chapter-n"} n]
+   [:span {:class "kot-chapter-t"} title]])
+
+(defn chapter
+  "One chapter: its rule, then its sections, in order."
+  [{:keys [n title]} & sections]
+  (into [:div {:class "kot-chapter-block"} (chapter-rule n title)] sections))
+
 (defn view []
   [:div
    [:a {:class "kot-skip" :href "#main"} "Skip to content"]
@@ -2571,26 +2754,33 @@
    [:main {:id "main"}
     (hero)
     (dds/container
-     (why-section)
-     (what-section)
-     (defaults-section)
-     (developer-section)
-     (code-play-section)
-     (libraries-section)
-     (roadmap-section)
-     (community-section)
-     (sponsor-section)
-     (blog-cloud-section)
-     (proof-section)
-     (architecture-section)
-     (typed-eval-section)
-     (start-section)
-     (benchmark-section)
-     (claims-section)
-     (deliberate-section)
-     (release-section)
-     (search-section)
-     (source-section))]
+     (contents-strip)
+     ;; The same twenty sections, in the order the argument actually runs.
+     (chapter (nth chapters 0)
+              (why-section)
+              (what-section))
+     (chapter (nth chapters 1)
+              (architecture-section)
+              (typed-eval-section)
+              (defaults-section)
+              (deliberate-section))
+     (chapter (nth chapters 2)
+              (proof-section)
+              (benchmark-section)
+              (claims-section)
+              (release-section))
+     (chapter (nth chapters 3)
+              (start-section)
+              (developer-section)
+              (code-play-section)
+              (libraries-section)
+              (search-section))
+     (chapter (nth chapters 4)
+              (roadmap-section)
+              (community-section)
+              (sponsor-section)
+              (blog-cloud-section)
+              (source-section)))]
    (footer)
    [:script search-js]
    [:script play-js]
@@ -2994,6 +3184,7 @@
     :head (list (favicon-link)
                 (apple-touch-icon-link)
                 [:script theme-js]
+                [:script menu-js]
                 [:script chart-anim-head-js]
                 (og-head "/" "Kotoba — post-quantum-by-default computing for AI agents"
                          "AI writes freely. Kotoba draws the boundary — a security-first, post-quantum-by-default language and computing stack."))}
@@ -3010,6 +3201,7 @@
     :head (list (favicon-link)
                 (apple-touch-icon-link)
                 [:script theme-js]
+                [:script menu-js]
                 (og-head "/blog/" "Kotoba Blog — engineering notes and evidence"
                          "Engineering notes on language design, benchmarks, evidence, and qualification gates."))}
    (blog-view)))
@@ -3025,6 +3217,7 @@
     :head (list (favicon-link)
                 (apple-touch-icon-link)
                 [:script theme-js]
+                [:script menu-js]
                 (og-head "/libraries/" "Kotoba Libraries — content-addressed publication and comparison"
                          "Inspect, publish, discover, and compare libraries by immutable definition and release CIDs."))}
    (libraries-view)))
@@ -3040,6 +3233,7 @@
     :head (list (favicon-link)
                 (apple-touch-icon-link)
                 [:script theme-js]
+                [:script menu-js]
                 (og-head "/ja/libraries/" "Kotoba Libraries — content-addressed publication と比較"
                          "不変な definition CID と release CID で Kotoba library を inspect、publish、discover、compare します。"))}
    (libraries-ja-view)))
@@ -3055,6 +3249,7 @@
     :head (list (favicon-link)
                 (apple-touch-icon-link)
                 [:script theme-js]
+                [:script menu-js]
                 (og-head "/legal/" "Kotoba Labs Inc. — public operator"
                          "kotoba-lang.org is operated by Kotoba Labs Inc. Public contact: support@kotoba-lang.org."))}
    (legal-view)))
@@ -3070,6 +3265,7 @@
     :head (list (favicon-link)
                 (apple-touch-icon-link)
                 [:script theme-js]
+                [:script menu-js]
                 (og-head "/ja/legal/" "Kotoba Labs Inc. — 公開運営者"
                          "公開運営者は Kotoba Labs Inc.。連絡先: support@kotoba-lang.org。"))}
    (legal-ja-view)))
@@ -3085,6 +3281,7 @@
     :head (list (favicon-link)
                 (apple-touch-icon-link)
                 [:script theme-js]
+                [:script menu-js]
                 (og-head "/sponsor/" "Sponsor Kotoba — GitHub Sponsors"
                          "Sustain Kotoba's public language contracts, tooling, qualification, and evidence."))}
    (sponsor-view :en)))
@@ -3100,6 +3297,7 @@
     :head (list (favicon-link)
                 (apple-touch-icon-link)
                 [:script theme-js]
+                [:script menu-js]
                 (og-head "/ja/sponsor/" "Kotoba を支援 — GitHub Sponsors"
                          "Kotoba の公開言語仕様、ツール、検証、evidence を継続的に支援します。"))}
    (sponsor-view :ja)))
