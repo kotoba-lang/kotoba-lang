@@ -404,11 +404,12 @@
    ".kot-header{position:relative;z-index:2;"
    "background:var(--hig-color-system-background);"
    "border-bottom:var(--hig-hairline) solid var(--hig-color-separator)}"
-   ".kot-header__inner{display:flex;align-items:center;flex-direction:row;"
-   "justify-content:space-between;"
+   ".kot-header__inner{position:relative;display:flex;align-items:center;flex-direction:row;"
+   "justify-content:space-between;gap:var(--hig-spacing-2);"
    "gap:var(--hig-spacing-3);padding-block:var(--hig-spacing-3)}"
-   ".kot-wordmark{display:inline-flex;align-items:center;gap:.12em;text-decoration:none}"
-   ".kot-paren{font-family:var(--hig-font-mono);font-size:1.7rem;line-height:1;"
+   ".kot-wordmark{display:inline-flex;align-items:center;gap:.12em;min-width:0;"
+   "text-decoration:none}"
+   ".kot-paren{font-family:var(--hig-font-mono);font-size:1.4rem;line-height:1;"
    "font-weight:400;color:var(--hig-color-tint)}"
    ;; A texture, not data: hairline strokes at low opacity, and it sits behind
    ;; the header row so the nav keeps the surface it is measured against.
@@ -419,10 +420,10 @@
    ".kot-lisp-nest{display:block;height:100%;width:auto;max-width:none;fill:none;"
    "stroke:var(--hig-color-tint);stroke-width:2;stroke-linecap:round}"
    ".kot-header__inner{position:relative;z-index:1}"
-   ".kot-logo{display:block;height:var(--hig-spacing-6);width:auto}"
+   ".kot-logo{display:block;height:var(--hig-spacing-5);width:auto;max-width:100%}"
    ;; ── the menu ─────────────────────────────────────────────────────────────
    ".kot-nav-inline{display:none}"
-   ".kot-menu{position:relative}"
+   ".kot-menu{position:static}"
    ".kot-menu-summary{display:inline-flex;align-items:center;gap:var(--hig-spacing-1);"
    "min-height:calc(44 / 16 * 1rem);padding-inline:var(--hig-spacing-3);"
    "border-radius:var(--hig-radius-xs);color:var(--hig-color-tint);"
@@ -430,9 +431,11 @@
    ".kot-menu-summary::-webkit-details-marker{display:none}"
    ".kot-menu-caret{transition:transform .2s ease}"
    ".kot-menu[open] .kot-menu-caret{transform:rotate(180deg)}"
-   ".kot-menu-panel{display:grid;gap:var(--hig-spacing-4);width:100%;"
-   "margin-top:var(--hig-spacing-3);padding:var(--hig-spacing-4) 0 0;"
-   "border-top:1px solid var(--hig-color-separator)}"
+   ".kot-menu-panel{position:absolute;z-index:3;inset-inline:0;"
+   "top:calc(100% + var(--hig-spacing-3));display:grid;gap:var(--hig-spacing-4);"
+   "max-height:calc(100dvh - 7rem);overflow:auto;padding:var(--hig-spacing-4);"
+   "border:1px solid var(--hig-color-separator);border-radius:var(--hig-radius-sm);"
+   "background:var(--hig-color-system-background);box-shadow:0 8px 28px rgb(0 0 0 / 18%)}"
    ".kot-menu-group-label{margin:0 0 var(--hig-spacing-2);"
    "color:var(--hig-color-secondary-label);font-size:var(--hig-text-caption1-font-size);"
    "letter-spacing:.08em;text-transform:uppercase}"
@@ -536,7 +539,7 @@
    "#kot-theme[aria-checked=\"true\"] .kot-yy-fig{transform:rotate(180deg)}"
    "@media(prefers-reduced-motion:reduce){.kot-yy-fig{transition:none}}"
    ;; ── the hero program, and the hashes it turns into ───────────────────────
-   ".kot-morph{margin-block:var(--hig-spacing-6);max-width:44rem}"
+   ".kot-morph{margin:0 0 var(--hig-spacing-7);max-width:44rem}"
    ".kot-morph-stage{display:grid;align-items:center;"
    "background:var(--hig-color-secondary-system-background);"
    "border:1px solid var(--hig-color-separator);"
@@ -606,14 +609,12 @@
    "@media(min-width:48rem){.kot-nav-inline{display:flex;align-items:center;"
    "gap:var(--hig-spacing-1)}"
    ".kot-logo{height:var(--hig-spacing-7)}.kot-paren{font-size:2.1rem}"
-   ".kot-menu-panel{position:absolute;z-index:3;inset-inline-end:0;"
-   "top:calc(100% + var(--hig-spacing-2));width:auto;min-width:17rem;"
-   "max-height:min(70vh,34rem);overflow:auto;margin-top:0;"
-   "padding:var(--hig-spacing-4);border:1px solid var(--hig-color-separator);"
-   "border-radius:var(--hig-radius-sm);background:var(--hig-color-system-background);"
-   "box-shadow:0 8px 28px rgb(0 0 0 / 18%)}"
+   ".kot-menu-panel{inset-inline:auto 0;width:auto;min-width:19rem;"
+   "max-height:min(70dvh,34rem)}"
    ".kot-contents-link{grid-template-columns:3rem 14rem 1fr}"
    ".kot-contents-b{grid-column:auto}}"
+   "@media(min-width:26rem){.kot-logo{height:var(--hig-spacing-6)}"
+   ".kot-paren{font-size:1.7rem}}"
    "@media(min-width:36rem){.kot-actions{display:flex;flex-wrap:wrap}"
    ".kot-hero h1{font-size:2.75rem;line-height:1.15}}"
    "@media(min-width:64rem){"
@@ -1281,11 +1282,13 @@
   [:section {:id "top" :class "kot-hero"}
    (hero-canvas)
    (dds/container
+    ;; The program comes first. Before any claim about the language, the page
+    ;; shows one and lets it resolve into its own hashes — which is the claim.
+    (hero-code)
     [:p {:class "kot-eyebrow"} "A language AI agents can use, not abuse"]
     (dds/heading 1 "AI writes freely. Kotoba draws the boundary." {:size "48"})
     [:p {:class "kot-lead"}
      "Kotoba is an intuitive, declarative, security-first language and computing stack for AI agents—and for humans who vibe-code with them. Post-quantum cryptography is the admission floor for every new cryptographic boundary, not an optional mode."]
-    (hero-code)
     (speed-panel)
     [:blockquote {:class "kot-quote"}
      [:strong "Existing software adds security around the program. Kotoba makes security a property of the whole computation."]]
