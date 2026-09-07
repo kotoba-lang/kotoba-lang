@@ -1967,8 +1967,10 @@
                      "kotoba.error/subset-reject and names what it refused, rather than emitting "
                      "something that will not load. A loud ceiling and a silent one are very "
                      "different results, and only a harness that executes the artifact tells "
-                     "them apart. The limit is per module: a larger program is a multi-module "
-                     "project, which this single-file benchmark deliberately does not exercise.")]]})]
+                     "them apart. Measured 2026-09-07: this is the whole program's ceiling, "
+                     "not one module's — max-project-functions is also 1,024 and is checked "
+                     "against the linked project, so no arrangement of modules compiles a "
+                     "2,048-function program today.")]]})]
      (dds/heading 3 "What this establishes" {:size "24"})
      [:div {:class "kot-table-scroll"}
       (dds/table
