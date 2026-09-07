@@ -70,6 +70,8 @@
 (def quiet (:quietGate qual))
 (when (nil? (:qualified quiet))
   (die! 2 "REFUSED: the report carries no quiet-gate verdict; its timings cannot be published as a ranking"))
+(when (false? (:hostLoadQualified qual))
+  (die! 2 "REFUSED: the report tripped the harness's mid-run host-load gate; its timings are another tenant's"))
 
 (def pg (get qual :perfgate))
 (def ec (get pg (keyword "external-comparators")))
@@ -127,6 +129,16 @@
       (die! 2 (str "REFUSED: " path " carries no quiet-gate verdict")))
     (when-not (get-in r [:qualification :quietGate :qualified])
       (die! 2 (str "REFUSED: " path " did not pass its quiet-gate; it cannot vote on a ranking")))
+    ;; The quiet gate is measured BEFORE the run. The harness also watches the
+    ;; host DURING the run and records `hostLoadQualified`; a report where that
+    ;; is false had another tenant (a fleet gate, a scan) on the host mid-run,
+    ;; and its medians are that tenant's, not the kernels'. Measured 2026-09-07
+    ;; on judah: 4 of 12 A/B runs in one hour passed the quiet gate and then
+    ;; tripped this one, with amu medians up to +12% and whole domains
+    ;; `too-noisy`. Such a run is not a vote against the candidate; it is not a
+    ;; vote at all.
+    (when (false? (get-in r [:qualification :hostLoadQualified]))
+      (die! 2 (str "REFUSED: " path " tripped the harness's mid-run host-load gate; it cannot vote on a ranking")))
     r))
 
 (defn pairs-of [r]
