@@ -198,6 +198,15 @@ mid-row instead of spanning the header. Both are the same mistake: the
 containing block was the control rather than the row it belongs to. Measured
 after: the panel's edges match the header's content box at 390, 768 and 1440.
 
+**Which way the controls sit.** `.kot-nav` is `justify-content: flex-end` and
+`flex-wrap: nowrap` at every width. The nav box already reached the right edge;
+only its *content* was left-aligned, so the menu sat against the wordmark with
+78px of empty rail after the theme switch. `nowrap` matters too: with the nav
+allowed to wrap, a 320px header became 120px because the controls dropped below
+the wordmark instead of sharing the row. Measured: the theme switch's right edge
+is flush with the header's content box at 320, 360, 390, 430, 500, 768 and
+1440, header 68px throughout.
+
 **The wordmark.** It is an image at a fixed height, so it does not shrink on
 its own, and once the header became a single row it overlapped the menu at
 390px. It now steps down twice on the way to a 320px screen. Measured: zero

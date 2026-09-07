@@ -409,7 +409,7 @@
    "gap:var(--hig-spacing-3);padding-block:var(--hig-spacing-3)}"
    ".kot-wordmark{display:inline-flex;align-items:center;gap:.12em;min-width:0;"
    "text-decoration:none}"
-   ".kot-paren{font-family:var(--hig-font-mono);font-size:1.4rem;line-height:1;"
+   ".kot-paren{font-family:var(--hig-font-mono);font-size:1rem;line-height:1;"
    "font-weight:400;color:var(--hig-color-tint)}"
    ;; A texture, not data: hairline strokes at low opacity, and it sits behind
    ;; the header row so the nav keeps the surface it is measured against.
@@ -420,7 +420,7 @@
    ".kot-lisp-nest{display:block;height:100%;width:auto;max-width:none;fill:none;"
    "stroke:var(--hig-color-tint);stroke-width:2;stroke-linecap:round}"
    ".kot-header__inner{position:relative;z-index:1}"
-   ".kot-logo{display:block;height:var(--hig-spacing-5);width:auto;max-width:100%}"
+   ".kot-logo{display:block;height:var(--hig-spacing-4);width:auto;max-width:100%}"
    ;; ── the menu ─────────────────────────────────────────────────────────────
    ".kot-nav-inline{display:none}"
    ".kot-menu{position:static}"
@@ -481,8 +481,8 @@
    "font-size:var(--hig-text-footnote-font-size)}"
    ".kot-chapter-block>.dds-ext-section:first-of-type{padding-top:0;border-top:none}"
    ".kot-chapter-block>.dds-ext-section:last-of-type{padding-bottom:0}"
-   ".kot-nav{display:flex;align-items:center;justify-content:flex-start;flex-wrap:wrap;"
-   "gap:var(--hig-spacing-2);width:100%}"
+   ".kot-nav{display:flex;align-items:center;justify-content:flex-end;flex-wrap:nowrap;"
+   "gap:var(--hig-spacing-2);flex:0 0 auto}"
    ".kot-hero{position:relative;overflow:clip;padding-block:var(--hig-spacing-8)}"
    ".kot-hero-canvas{position:absolute;inset:0;z-index:0;pointer-events:none;"
    "color:var(--hig-color-tint)}"
@@ -613,7 +613,9 @@
    "max-height:min(70dvh,34rem)}"
    ".kot-contents-link{grid-template-columns:3rem 14rem 1fr}"
    ".kot-contents-b{grid-column:auto}}"
-   "@media(min-width:26rem){.kot-logo{height:var(--hig-spacing-6)}"
+   "@media(min-width:23rem){.kot-logo{height:calc(20 / 16 * 1rem)}"
+   ".kot-paren{font-size:1.35rem}}"
+   "@media(min-width:28rem){.kot-logo{height:var(--hig-spacing-6)}"
    ".kot-paren{font-size:1.7rem}}"
    "@media(min-width:36rem){.kot-actions{display:flex;flex-wrap:wrap}"
    ".kot-hero h1{font-size:2.75rem;line-height:1.15}}"
@@ -623,7 +625,7 @@
    ".kot-lisp-edge[data-side=start]{inset-inline-start:0}"
    ".kot-lisp-edge[data-side=end]{inset-inline-end:0;transform:scaleX(-1)}}"
    "@media(min-width:48rem){.kot-header{position:sticky;top:0}"
-   ".kot-nav{justify-content:flex-end;width:auto}.kot-hero{padding-block:var(--hig-spacing-10) var(--hig-spacing-9)}}"
+   ".kot-hero{padding-block:var(--hig-spacing-10) var(--hig-spacing-9)}}"
    ;; ── charts ───────────────────────────────────────────────────────────────
    ;; Every mark reads a --hig-* token, so jp-go-dds.dark carries the whole
    ;; chart layer into dark mode without a second palette. Bar length is TIME,
