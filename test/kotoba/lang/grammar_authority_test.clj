@@ -353,8 +353,12 @@
   latter two, and kotoba.runtime gains the CLJ interpreter bindings).
   Advanced 2026-09-07 to `e333abac` for amu-h7: `:admitted-builtins` gains
   `kernel-undefined-opcode-handler-address` (kotoba-sema#PR moves its copy and
-  pin in lockstep; amu and kotoba resync after)."
-  "e333abac09386fc059331fd81fe4cce685e757a6bd4507edfc28cee67b3afc97")
+  pin in lockstep; amu and kotoba resync after).
+  Advanced 2026-09-07 to `ee7ea37c` for the fs-browse-dir grammar head /
+  find-lib slice (capability id 261). Sibling mains already MATCH
+  (kotoba cb70c446, kotoba-sema af8cc780); this pin plus the CI.yml
+  checkouts close the wave."
+  "ee7ea37c7ea88c52ee8869af4d485e91a0b11bb153682ad717c86c055270b6b5")
 
 (defn- sha256-hex [^bytes bs]
   (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") bs)]
