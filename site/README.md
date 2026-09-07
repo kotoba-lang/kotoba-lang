@@ -173,6 +173,10 @@ links broke.
 it needs ten links in a header. It is generated from `chapters`, so the strip
 and the order of the sections cannot disagree.
 
+**Where the program sits.** The hero opens with the program, above the eyebrow
+and the headline: before any claim about the language, the page shows one and
+lets it resolve into its own hashes, which is the claim.
+
 **The menu.** The header carried ten controls in a flat row — three rows and
 **202px** of header on a 390px screen, with nothing to say which of the ten
 mattered. They are now one native `<details>`, grouped: the five chapters
@@ -185,6 +189,28 @@ Measured, closed: **390px → 3 visible controls in a 68px header** (was 10 in
 it opens with JavaScript off; the only script closes it again after a link
 inside it is followed, so an open panel does not cover the section just jumped
 to.
+
+**Where the panel is anchored.** To `.kot-header__inner`, which is exactly the
+container's content box, and not to the disclosure. Anchored to the disclosure
+it ended 52px short of the header's right edge at 1440px, and at 390px — where
+the panel was in flow inside a flex item — it came out 210px wide, floating
+mid-row instead of spanning the header. Both are the same mistake: the
+containing block was the control rather than the row it belongs to. Measured
+after: the panel's edges match the header's content box at 390, 768 and 1440.
+
+**The wordmark.** It is an image at a fixed height, so it does not shrink on
+its own, and once the header became a single row it overlapped the menu at
+390px. It now steps down twice on the way to a 320px screen. Measured: zero
+overlap between the wordmark and the nav at 320, 360, 390, 430, 768 and 1440.
+
+**One upstream fix came out of this.** `.dds-ext-grid` used
+`minmax(var(--dds-ext-grid-min,16rem),1fr)`, and a track that cannot go
+narrower than its declared minimum makes the whole page scroll sideways on a
+screen narrower than that. At 320px this page had 32px of horizontal scroll and
+every offender was a grid whose consumer passed `:min "19rem"` or `"21rem"`.
+Fixed in `jp-go-digital-design-system` with `min(<declared>, 100%)` rather than
+re-derived in this app's CSS, because that is the layer that owns the rule.
+Measured after: zero horizontal scroll at 320, 360, 390, 430, 768 and 1440.
 
 Two things the measurement corrected. The page does **not** overflow
 horizontally on a phone: `scrollWidth - clientWidth` is 0 at 360, 390 and
