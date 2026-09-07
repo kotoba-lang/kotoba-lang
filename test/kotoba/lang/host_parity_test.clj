@@ -17,12 +17,12 @@
       "inject counts as available for linkability")
   (is (= :available (hp/availability :kagi-sign :node))
       "Node kagi-sign inject is real actor-host surface")
-  (is (= :capability-absent (hp/availability :scram-sha256 :node))
-      "Node actor-host has no scram-sha256 — honesty vs overclaimed inject")
-  (is (= :capability-absent (hp/availability :transport-connect :node))
-      "Node actor-host has no transport inject")
-  (is (= :capability-absent (hp/availability :pg-open :node))
-      "Node actor-host has no pg wire inject")
+  (is (= :available (hp/availability :scram-sha256 :node))
+      "Node actor-host scramCredentials fail-closed inject seam")
+  (is (= :available (hp/availability :transport-connect :node))
+      "Node actor-host transportProvider fail-closed inject seam")
+  (is (= :available (hp/availability :pg-open :node))
+      "Node actor-host pgWireProvider fail-closed inject seam")
   (is (= :available (hp/availability :scram-sha256 :jvm))
       "JVM tender has purpose-bound scram-sha256")
   (is (= :unknown-import (hp/availability :not-a-real-import :jvm)))
@@ -50,8 +50,8 @@
     (doseq [id [:sign-all-available :verify-all-available
                 :kagi-sign-browser-absent :http-get-jvm-component-link-absent
                 :transport-connect-browser-absent :llm-infer-browser-absent
-                :scram-sha256-node-absent :transport-connect-node-absent
-                :pg-open-node-absent]]
+                :scram-sha256-node-available :transport-connect-node-available
+                :pg-open-node-available]]
       (is (contains? ids id) (str id)))))
 
 (deftest report-is-l5
