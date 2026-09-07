@@ -103,6 +103,12 @@
    ;; fs/browse (capability id 253) — directory listing narrowed to the
    ;; granted directory TREE (kbb slice 2).
    :host/fs-browse :host/fs-browse
+   ;; fs/browse-dir (capability id 261, kotoba-core-contracts 2ff3f736) —
+   ;; directory listing WITH is-dir per entry, for the kotoba-lang/find
+   ;; recursive tree-walk. Same narrowing as fs/browse (granted directory
+   ;; TREE, prefix boundary on a path separator); the guest walks the tree
+   ;; itself, every descent inside the capability guard.
+   :host/fs-browse-dir :host/fs-browse-dir
    ;; proc/exec (capability id 259, kotoba-core-contracts a6463d4) — run
    ;; ONE allowlisted invocation; the guest names a grant INDEX into the
    ;; policy's fixed invocation table, argv/cwd are policy-side literals
