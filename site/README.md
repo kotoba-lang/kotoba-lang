@@ -198,6 +198,26 @@ mid-row instead of spanning the header. Both are the same mistake: the
 containing block was the control rather than the row it belongs to. Measured
 after: the panel's edges match the header's content box at 390, 768 and 1440.
 
+**GitHub is a bar control, not a menu row.** The repository is where the claims
+on this page can be checked, so it sits in the header rather than two taps
+away. Outline rather than text, because it is the one control that leaves the
+site and it should not look like the ones that do not.
+
+It appears from **23rem** up. 320px is the single width where the bar cannot
+hold a fourth control beside the wordmark without clipping it, and there it
+stays listed under *Elsewhere* in the menu — reachable, just not in the bar.
+From 34rem the menu gets its word back and the wordmark steps up again; from
+48rem `Docs` and `Play` rejoin it.
+
+The menu's glyph follows the same logic: three lines while the label is
+hidden, a caret once the word `Menu` is beside it. A bare caret reads as
+"something expands", not as "this is the menu".
+
+Measured at 320, 360, 375, 390, 414, 430, 480, 600, 768, 1024 and 1440: header
+68px at every width, the switch flush with the header's content box, the
+wordmark never clipped, and no horizontal page scroll. GitHub is in the bar
+from 375 up and in the menu at 320 and 360.
+
 **Which way the controls sit.** `.kot-nav` is `justify-content: flex-end` and
 `flex-wrap: nowrap` at every width. The nav box already reached the right edge;
 only its *content* was left-aligned, so the menu sat against the wordmark with

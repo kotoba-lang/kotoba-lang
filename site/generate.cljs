@@ -424,13 +424,18 @@
    ;; ── the menu ─────────────────────────────────────────────────────────────
    ".kot-nav-inline{display:none}"
    ".kot-menu{position:static}"
-   ".kot-menu-summary{display:inline-flex;align-items:center;gap:var(--hig-spacing-1);"
-   "min-height:calc(44 / 16 * 1rem);padding-inline:var(--hig-spacing-3);"
+   ".kot-menu-label{display:none}"
+   "#kot-gh{padding-inline:var(--hig-spacing-2)}"
+   ".kot-menu-summary{display:inline-flex;align-items:center;justify-content:center;"
+   "gap:var(--hig-spacing-1);min-width:calc(44 / 16 * 1rem);"
+   "min-height:calc(44 / 16 * 1rem);padding-inline:var(--hig-spacing-2);"
    "border-radius:var(--hig-radius-xs);color:var(--hig-color-tint);"
    "font-weight:700;cursor:pointer;list-style:none}"
    ".kot-menu-summary::-webkit-details-marker{display:none}"
-   ".kot-menu-caret{transition:transform .2s ease}"
+   ".kot-menu-caret{display:none;transition:transform .2s ease}"
    ".kot-menu[open] .kot-menu-caret{transform:rotate(180deg)}"
+   ".kot-menu-burger{display:block}"
+   ".kot-menu[open] .kot-menu-burger{opacity:.55}"
    ".kot-menu-panel{position:absolute;z-index:3;inset-inline:0;"
    "top:calc(100% + var(--hig-spacing-3));display:grid;gap:var(--hig-spacing-4);"
    "max-height:calc(100dvh - 7rem);overflow:auto;padding:var(--hig-spacing-4);"
@@ -613,9 +618,19 @@
    "max-height:min(70dvh,34rem)}"
    ".kot-contents-link{grid-template-columns:3rem 14rem 1fr}"
    ".kot-contents-b{grid-column:auto}}"
-   "@media(min-width:23rem){.kot-logo{height:calc(20 / 16 * 1rem)}"
-   ".kot-paren{font-size:1.35rem}}"
-   "@media(min-width:28rem){.kot-logo{height:var(--hig-spacing-6)}"
+   ;; 320px is the one width that cannot hold a fourth control beside the
+   ;; wordmark; from 23rem it can, so GitHub appears there.
+   "#kot-gh{display:none}"
+   "@media(min-width:23rem){#kot-gh{display:inline-flex}"
+   ".kot-logo{height:calc(15 / 16 * 1rem)}.kot-paren{font-size:1rem}}"
+   "@media(min-width:26rem){.kot-logo{height:calc(17 / 16 * 1rem)}"
+   ".kot-paren{font-size:1.15rem}}"
+   "@media(min-width:34rem){.kot-menu-label{display:inline}"
+   ".kot-menu-caret{display:block}.kot-menu-burger{display:none}"
+   ".kot-menu-summary{padding-inline:var(--hig-spacing-3)}"
+   "#kot-gh{padding-inline:var(--hig-spacing-3)}"
+   ".kot-logo{height:calc(20 / 16 * 1rem)}.kot-paren{font-size:1.35rem}}"
+   "@media(min-width:42rem){.kot-logo{height:var(--hig-spacing-6)}"
    ".kot-paren{font-size:1.7rem}}"
    "@media(min-width:36rem){.kot-actions{display:flex;flex-wrap:wrap}"
    ".kot-hero h1{font-size:2.75rem;line-height:1.15}}"
@@ -778,6 +793,9 @@
    {:group "Elsewhere"
     :items [{:label "Blog" :href "./blog/"}
             {:label "Cloud" :href "#cloud"}
+            ;; GitHub is in the header bar from 23rem up, and stays listed here
+            ;; so the 320px class — the one width where the bar cannot hold a
+            ;; fourth control — can still reach it.
             {:label "GitHub" :href "https://github.com/kotoba-lang/kotoba-lang"}]}])
 
 (def nav-inline
@@ -896,12 +914,27 @@
          [:span {:class "kot-nav-inline"}
           (for [{:keys [label href]} nav-inline]
             (dds/button label {:type :text :size "sm" :href (local-href href)}))]
+         ;; The repository is where the claims can be checked, so it is a bar
+         ;; control rather than a menu row. Outline, not text: it leaves the
+         ;; site, and the one control that does should not look like the ones
+         ;; that do not.
+         (dds/button "GitHub"
+                     {:type :outline :size "sm"
+                      :href "https://github.com/kotoba-lang/kotoba-lang"
+                      :attrs {:id "kot-gh"}})
          ;; A native <details>: no script decides whether it opens, so it works
          ;; before and without JavaScript. One script only closes it again
          ;; after a link inside it is followed.
          [:details {:class "kot-menu" :id "kot-menu"}
-          [:summary {:class "kot-menu-summary"}
+          [:summary {:class "kot-menu-summary" :aria-label "Menu"}
            [:span {:class "kot-menu-label"} "Menu"]
+           ;; Two glyphs, one shown at a time. A bare caret with no label reads
+           ;; as "something expands", not as "this is the menu"; the three
+           ;; lines are what people look for when there is no room for a word.
+           [:svg {:class "kot-menu-burger" :viewBox "0 0 24 24" :width 20 :height 20
+                  :aria-hidden "true" :focusable "false"}
+            [:path {:d "M4 7h16M4 12h16M4 17h16" :fill "none" :stroke "currentcolor"
+                    :stroke-width 2 :stroke-linecap "round"}]]
            [:svg {:class "kot-menu-caret" :viewBox "0 0 24 24" :width 18 :height 18
                   :aria-hidden "true" :focusable "false"}
             [:path {:d "M4 8.5 12 16l8-7.5" :fill "none" :stroke "currentcolor"
