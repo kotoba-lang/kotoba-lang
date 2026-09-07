@@ -154,6 +154,47 @@ something. Verified by geometry rather than by eye — the nest's bounding boxes
 intersect **zero** nav links or wordmark boxes at 1440px, and it is absent at
 420px.
 
+## The page as five chapters, and one menu
+
+The information did not change: the same twenty sections, the same words, the
+same links. What changed is the order they are placed in and how you get at
+them.
+
+**The order.** The body used to run why → what → defaults → docs → code →
+libraries → roadmap → community → sponsor → cloud → proof → architecture, so
+the mechanism and the evidence arrived *after* the sponsorship page and the
+reader met the ecosystem before the argument. `chapters` now states the
+narrative once, and the body is placed in that order: the problem → how the
+boundary works → the evidence → start using it → around the language. Each
+chapter's anchor is its first section's existing id, so no ids moved and no
+links broke.
+
+**The contents strip.** A forty-screen document needs a contents list more than
+it needs ten links in a header. It is generated from `chapters`, so the strip
+and the order of the sections cannot disagree.
+
+**The menu.** The header carried ten controls in a flat row — three rows and
+**202px** of header on a 390px screen, with nothing to say which of the ten
+mattered. They are now one native `<details>`, grouped: the five chapters
+under *On this page*, then Learn / Project / Elsewhere. `Docs` and `Play` stay
+in the bar from 48rem up; they also appear in the menu, which is what lets one
+DOM copy serve every width without leaving anything unreachable on a phone.
+
+Measured, closed: **390px → 3 visible controls in a 68px header** (was 10 in
+202px); **1440px → 5 in 68px** (was 10 in 112px). It is a native disclosure, so
+it opens with JavaScript off; the only script closes it again after a link
+inside it is followed, so an open panel does not cover the section just jumped
+to.
+
+Two things the measurement corrected. The page does **not** overflow
+horizontally on a phone: `scrollWidth - clientWidth` is 0 at 360, 390 and
+430px, and every element wider than the viewport sits inside a scroll
+container that is supposed to hold it — an element-by-element check reports
+643px of "overflow" and is measuring the wrong thing. And `overflow: clip` on
+the header, added for the paren nest, also clipped the menu panel: it rendered
+behind the hero and could not be clicked. The clip belongs on the nest boxes,
+which are the only things that spill.
+
 ## The theme switch is the Lisp mark
 
 The Lisp logo is a circle split by an S-curve with a lambda in each half — one
