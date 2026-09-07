@@ -70,11 +70,16 @@
     (doseq [bad [(envelope 1 nil "inga:fork" [child])
                  (envelope 3 "inga:block:1" "inga:skip" [child])
                  (envelope 2 "inga:wrong-parent" "inga:fork2" [child])]]
-      (is (= :consensus/order-invalid
-             (:problem
-              (ex-data
-               (try (order/admit-commit! registry verifier bad)
-                    (catch clojure.lang.ExceptionInfo e e)))))))))
+      (let [err (ex-data
+                  (try (order/admit-commit! registry verifier bad)
+                       (catch clojure.lang.ExceptionInfo e e)))]
+        (is (= :consensus/order-invalid (:problem err)))
+        ;; fork evidence must be recoverable at the detection seam so a
+        ;; later warrant (path b / ADR-2809060410) can sign it
+        (is (= (:consensus/height bad) (get-in err [:consensus/candidate :height])))
+        (is (= (:consensus/parent-id bad) (get-in err [:consensus/candidate :parent-id])))
+        (is (= 2 (:consensus/observed-height err)))
+        (is (= "inga:block:1" (:consensus/expected-parent err)))))))
 
 (defn- sha256-hex [text]
   (let [digest (.digest (MessageDigest/getInstance "SHA-256")
