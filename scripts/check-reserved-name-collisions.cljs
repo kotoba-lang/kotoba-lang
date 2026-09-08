@@ -1,0 +1,147 @@
+#!/usr/bin/env nbb
+;; scripts/check-reserved-name-collisions.cljs
+;;
+;; Does a component's PUBLIC surface carry a name the pure S-expression core
+;; has reserved? Answer it before the migration is written, not after it fails
+;; to compile.
+;;
+;; This exists because of a measured miss. ADR-544's 2026-09-06 sweep reported
+;; that across 3,336 .kotoba/.cljk files no reserved head appears in operator
+;; position. A wave-1 pilot added 2026-09-03 -- inside that corpus -- calls
+;; `(query store entity)` four times and is refused by amu with
+;; :kotoba.error/pure-query-arity. The collision was there for five days before
+;; a compiler run surfaced it, and the cause was not a typo: the oracle
+;; src/aadhaar/main.cljc defines its OWN public `query`, arity 2 and 3, over a
+;; mutable store. `query` is an ordinary name for a data-access function, so
+;; this will recur.
+;;
+;; ## What it checks, and what it deliberately does not
+;;
+;; CHECKS  a public def/defn in a .cljc/.clj oracle whose NAME is a reserved
+;;         head -- the migration hazard, visible before any .kotoba is written.
+;; CHECKS  a reserved head appearing in operator position in .kotoba/.cljk,
+;;         reported for review.
+;;
+;; DOES NOT validate arity or semantics. amu owns that and says so precisely
+;; (`query reads one datom`); a second opinion here could disagree with the
+;; compiler, and a checker that contradicts the thing it is checking is worse
+;; than none.
+;;
+;; ## The head set is READ, never hardcoded
+;;
+;; From lang/guest-grammar.edn :sugar :pure-s-expression-core :forms. Hardcoding
+;; it is how the last sweep went stale: the set grew from four heads to seven on
+;; 2026-09-06 and any copy of the old four would still have reported clean.
+;; If the authority cannot be read this REFUSES (exit 2) rather than checking
+;; against an assumed set.
+;;
+;;   nbb scripts/check-reserved-name-collisions.cljs <dir> [<dir> ...]
+;;                                                  [--grammar <path>]
+;;
+;; exit 0  scanned, no collisions
+;; exit 1  collisions found
+;; exit 2  REFUSED -- could not establish the head set or found nothing to scan
+
+(ns check-reserved-name-collisions
+  (:require [clojure.string :as str]
+            [clojure.edn :as edn]
+            ["fs" :as fs]
+            ["path" :as path]))
+
+;; nbb leaves the script path in argv after the interpreter args, so it is
+;; dropped explicitly. Taking it as a directory is how the first run of this
+;; file refused itself.
+(def argv (vec (remove #(str/ends-with? % ".cljs") (drop 2 (js->clj js/process.argv)))))
+(defn opt [f] (let [i (.indexOf argv f)] (when (pos? i) (nth argv (inc i) nil))))
+(def dirs (vec (remove #(or (str/starts-with? % "--")
+                            (= % (opt "--grammar")))
+                       argv)))
+
+(defn refuse! [msg data]
+  (println "REFUSED" msg (pr-str data))
+  (js/process.exit 2))
+
+;; --- the head set, read from the authority ---------------------------------
+(def grammar-path
+  (or (opt "--grammar")
+      (first (filter fs/existsSync
+                     ["lang/guest-grammar.edn"
+                      "resources/kotoba/lang/guest-grammar.edn"]))))
+
+(def reserved
+  (do
+    (when-not (and grammar-path (fs/existsSync grammar-path))
+      (refuse! "cannot read the grammar authority; refusing to check against an assumed head set"
+               {:looked-for ["lang/guest-grammar.edn" "resources/kotoba/lang/guest-grammar.edn"]}))
+    (let [forms (get-in (edn/read-string (fs/readFileSync grammar-path "utf8"))
+                        [:sugar :pure-s-expression-core :forms])]
+      (when (empty? forms)
+        (refuse! "grammar authority declares no pure-s-expression-core forms"
+                 {:grammar grammar-path}))
+      (into #{} (map str) forms))))
+
+;; --- file walk --------------------------------------------------------------
+(def skip #{"node_modules" ".git" "target" "dist" "build" ".shadow-cljs"})
+
+(defn walk [dir]
+  (if-not (fs/existsSync dir)
+    nil
+    (let [ents (try (fs/readdirSync dir #js {:withFileTypes true}) (catch :default _ nil))]
+      (when (nil? ents) (refuse! "cannot read directory" {:dir dir}))
+      (mapcat (fn [e]
+                (let [n (.-name e) p (path/join dir n)]
+                  (cond
+                    (skip n) nil
+                    (.isDirectory e) (walk p)
+                    :else [p])))
+              (array-seq ents)))))
+
+;; --- oracle public names ----------------------------------------------------
+;; `(defn name`, `(def name` -- excluding defn- / def- and ^:private. Deliberately
+;; textual: this runs before a component is migrated, on source that may not
+;; compile, so it cannot depend on a reader that would reject the file.
+(def public-def-re #"(?m)^\s*\((?:defn|def)\s+(?!\^:private)([^\s\^\[\)]+)")
+
+(defn public-names [text]
+  (->> (re-seq public-def-re text)
+       (map second)
+       (remove nil?)
+       (remove #(str/ends-with? % "-"))
+       set))
+
+(def operator-re #"\(\s*([a-z][a-z0-9-]*)[\s\)]")
+
+(defn operator-heads [text]
+  (->> (re-seq operator-re text) (map second) set))
+
+(let [_ (when (empty? dirs) (refuse! "no directory given" {:usage "check-reserved-name-collisions.cljs <dir> ..."}))
+      files (vec (mapcat walk dirs))
+      _ (when (empty? files) (refuse! "nothing to scan under the given directories" {:dirs dirs}))
+      oracle (filter #(or (str/ends-with? % ".cljc") (str/ends-with? % ".clj")) files)
+      guest  (filter #(or (str/ends-with? % ".kotoba") (str/ends-with? % ".cljk")) files)
+      read-safe (fn [p] (try (fs/readFileSync p "utf8") (catch :default _ nil)))
+      unreadable (atom 0)
+      surface-hits
+      (vec (for [p oracle
+                 :let [t (read-safe p)]
+                 :when (or t (do (swap! unreadable inc) false))
+                 n (sort (filter reserved (public-names t)))]
+             {:kind :public-surface :file p :name n}))
+      operator-hits
+      (vec (for [p guest
+                 :let [t (read-safe p)]
+                 :when (or t (do (swap! unreadable inc) false))
+                 h (sort (filter reserved (operator-heads t)))]
+             {:kind :operator-position :file p :name h}))
+      hits (concat surface-hits operator-hits)]
+  (println (str "RESERVED\t" (str/join "," (sort reserved)) "\t(read from " grammar-path ")"))
+  (println (str "SCANNED\t" (count oracle) "\toracle .cljc/.clj"))
+  (println (str "SCANNED\t" (count guest) "\tguest .kotoba/.cljk"))
+  (when (pos? @unreadable)
+    (println (str "UNREADABLE\t" @unreadable "\tfiles could not be read -- NOT counted as clean")))
+  (doseq [{:keys [kind file name]} hits]
+    (println (str (if (= kind :public-surface) "COLLISION" "OPERATOR ") "\t" name "\t" file)))
+  (println (str "COLLISIONS\t" (count surface-hits) "\tpublic oracle names that are reserved heads"))
+  (println (str "OPERATOR\t" (count operator-hits) "\treserved heads in operator position (amu decides arity)"))
+  (when (pos? @unreadable) (js/process.exit 2))
+  (js/process.exit (if (seq hits) 1 0)))
