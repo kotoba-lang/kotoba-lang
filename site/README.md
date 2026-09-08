@@ -539,3 +539,17 @@ status-aware custom project page to `github: kotoba-lang`. Verify the homepage,
 The page is built with `jp-go-dds` (the Digital Agency Design System mirror).
 Application CSS uses the shared `--hig-*` token contract through
 `jp-go-dds.tokens/skin-css`; it does not define a separate palette.
+
+## Hero source on IPFS
+
+The visible `hello.kotoba` filename links to the exact `double-21.kotoba` source
+bytes using a CIDv1 raw/sha2-256 identifier derived by the generator. A matching
+HTTP block mirror is generated under `/ipfs/<CID>`. On 2026-09-08 the source was
+pinned on the local online Kubo node and announced through routing; both
+`ipfs.io/ipfs/<CID>` and `ipfs.kotobase.net/ipfs/<CID>` returned byte-identical
+source. This is observed retrieval, not a permanent availability guarantee.
+
+Source CID: `bafkreiaeohkv2zuo2x4yq745euqm5wijrub5xpkxbbw5gre6tdp3sxzonm`.
+If the sample changes, publish/pin the new generated CID and verify external
+retrieval before deploying its link. Renaming the visible filename does not
+change the file bytes or its CID.
