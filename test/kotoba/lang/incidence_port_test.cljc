@@ -172,7 +172,7 @@
                             (throw (ex-info "append failed" {:provider true}))))
                          :record! record!))
                  nil
-                 (catch clojure.lang.ExceptionInfo e e))]
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
     (is (= "append failed" (ex-message thrown)))
     (is (= 1 (count (entries))))
     (is (= :error (:receipt/outcome (first (entries)))))

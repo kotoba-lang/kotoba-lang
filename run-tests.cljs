@@ -1,9 +1,9 @@
 ;; nbb --classpath "src:test:$(clojure -Spath -M:test)" run-tests.cljs
 ;;
 ;; The ClojureScript half of this repository's suite. It had none until
-;; 2026-09-08, while carrying 28 `.cljc` sources and 56 `.clj` tests -- so
-;; every one of those 28 was a claim of portability that no run had ever
-;; checked, in the repository that defines the language.
+;; 2026-09-08, when it started at 2 `.cljc` sources and 56 `.clj` tests -- so
+;; every one of the 28 `.cljc` sources under `src/` was a claim of portability
+;; that no run had checked, in the repository that defines the language.
 ;;
 ;; That is not hypothetical here. `kotoba.lang.captp-runtime`'s `parse-natural`
 ;; used `parse-long`, which returns nil above 2^53 on this host, and wrapped
@@ -25,15 +25,91 @@
 ;; assertion ran. It was `.cljc`, which claims otherwise. The extension now
 ;; matches the fact.
 ;;
-;; The 56 `.clj` tests are NOT here and are not all JVM-only: most are portable
-;; in principle, and converting the highest-value ones (starting with
-;; `captp_runtime_test.clj`, which exercises the wire codec this host already
-;; got wrong once) is the follow-on work. Until then, treat this runner's green
-;; as covering three namespaces, not the suite.
+;; 2026-09-08, second pass: 15 more of the 56 `.clj` tests ported to `.cljc`
+;; and registered below, prioritised by risk (wire codec, identity/CID,
+;; capability, signing, byte encoding over formatting/diagnostics). The
+;; remaining `.clj` tests fall into distinct categories -- say which applies,
+;; do not just drop a test:
+;;
+;;   - `authority_claim_lowering_test.clj`, `code_identity_test.clj`,
+;;     `conformance_matrix_test.clj`, `cli_adapter_matrix_test.clj`,
+;;     `capability_values_test.clj`, `definition_patch_test.clj`,
+;;     `incidence_test.clj`, `incidence_datoms_test.clj`,
+;;     `surface_matrix_test.clj`, `type_system_test.clj`: CANNOT run here.
+;;     Each reaches a `load-*` function (`authority-claims/load-guest-grammar`,
+;;     `conformance-matrix/load-manifest`, `cli-adapter-matrix/load-edn`, or a
+;;     local `read-edn` built on `clojure.java.io`/`slurp`) whose `:cljs`
+;;     branch is a deliberate throw, or that requires `clojure.java.io`/
+;;     `slurp` directly -- reading a file off disk has no ClojureScript
+;;     implementation in this codebase, the same fact that put
+;;     `kotoba.cli-test` in this list originally.
+;;   - `host_parity_test.clj`: CANNOT run here for a quieter version of the
+;;     same reason. `kotoba.lang.host-parity`'s `catalog*` does not throw on
+;;     cljs; its `:cljs` branch silently returns a STUB catalog (`{:imports {}
+;;     :conformance {:cases []}}`) instead of reading `lang/host-parity.edn`,
+;;     because reading that file has no ClojureScript implementation either.
+;;     Measured 2026-09-08: registering the ported test made 20 of its 24
+;;     assertions fail, every one comparing real catalog data (case counts,
+;;     specific import ids, `:status`) against the empty stub -- that is the
+;;     stub behaving exactly as designed, not a codec or logic defect, so the
+;;     test was reverted to `.clj` rather than forced green.
+;;   - Nothing in the remaining `.clj` set was left out because it "cannot run
+;;     here" for a reason other than the file-read one above; anything not
+;;     listed there and not below is unconverted, not unconvertible.
+;;
+;; Two of the newly-portable tests needed a real substitution, not just a
+;; reader-conditional wrapper, because they built their fixtures on JVM
+;; crypto interop the SOURCE under test never touches:
+;;   - `consensus_order_test.cljc` and `ocapn_handoff_test.cljc` used
+;;     `java.security.MessageDigest` for a local SHA-256 test helper.
+;;     `sha2.core` (a portable `.cljc` FIPS 180-4 implementation already
+;;     reachable on this classpath) replaces it identically on both hosts --
+;;     verified here against the standard SHA-256("abc") test vector before
+;;     use, and the digest is the SAME implementation on both hosts, not
+;;     merely an equivalent one.
+;;
+;; One portability quirk was found and is NOT a defect in any source under
+;; test: `(seq (js/Uint8Array. ...))` produces a value that fails
+;; `sequential?` under nbb 1.4.208, so `(= (seq a) (seq b))` for two
+;; content-identical typed arrays returns false even though the bytes match.
+;; `(vec ...)` does not have this problem on either host. Ported tests that
+;; compared byte arrays use `vec`, not `seq`, for exactly this reason
+;; (`captp_runtime_test.cljc`, `incidence_ocapn_test.cljc`,
+;; `ocapn_handoff_test.cljc`).
+;;
+;; One genuine SOURCE defect was found and fixed, not routed around: this run
+;; is what found it. `kotoba.lang.incidence-replication/state-error` and
+;; `ingest` called plain `(count (incidence/canonical-bytes ...))` --
+;; `canonical-bytes` returns a `js/Uint8Array` on this host, and
+;; `clojure.core/count` throws `No protocol method ICounted.-count defined`
+;; for a typed array here (it is not a `js/Array`). Any replica holding even
+;; one existing block made `state-error` throw instead of validating, which
+;; made `ingest` and `consensus-order/apply-commit` (which calls it) throw
+;; too. The fix is the same `byte-count` helper `kotoba.lang.captp-runtime`
+;; and `kotoba.lang.ocapn-handoff` already carry for exactly this
+;; (`#?(:clj (alength ...) :cljs (.-length ...))`), applied at both call
+;; sites in `incidence_replication.cljc`.
+;;
+;; The remaining `.clj` tests are NOT here and are not all unconvertible: any
+;; not named above as file-read-bound is simply not yet converted.
 (ns run-tests
   (:require [cljs.test :as t]
             [kotoba.lang.causal-receipt-test]
-            [kotoba.lang.captp-runtime-natural-ceiling-test]))
+            [kotoba.lang.captp-runtime-natural-ceiling-test]
+            [kotoba.lang.captp-runtime-test]
+            [kotoba.lang.capability-cacao-test]
+            [kotoba.lang.consensus-order-test]
+            [kotoba.lang.incidence-ocapn-test]
+            [kotoba.lang.incidence-port-test]
+            [kotoba.lang.incidence-replication-test]
+            [kotoba.lang.interop-profiles-test]
+            [kotoba.lang.interop-verifiers-test]
+            [kotoba.lang.ocapn-handoff-test]
+            [kotoba.lang.organization-governance-test]
+            [kotoba.lang.package-registry-test]
+            [kotoba.lang.portable-effect-test]
+            [kotoba.lang.signed-readback-test]
+            [kotoba.lang.trusted-admission-test]))
 
 (defmethod t/report [:cljs.test/default :end-run-tests] [m]
   (println (str "\nnbb: " (:test m) " tests, " (:pass m) " passed, "
@@ -42,4 +118,18 @@
     (set! (.-exitCode js/process) 1)))
 
 (t/run-tests 'kotoba.lang.causal-receipt-test
-             'kotoba.lang.captp-runtime-natural-ceiling-test)
+             'kotoba.lang.captp-runtime-natural-ceiling-test
+             'kotoba.lang.captp-runtime-test
+             'kotoba.lang.capability-cacao-test
+             'kotoba.lang.consensus-order-test
+             'kotoba.lang.incidence-ocapn-test
+             'kotoba.lang.incidence-port-test
+             'kotoba.lang.incidence-replication-test
+             'kotoba.lang.interop-profiles-test
+             'kotoba.lang.interop-verifiers-test
+             'kotoba.lang.ocapn-handoff-test
+             'kotoba.lang.organization-governance-test
+             'kotoba.lang.package-registry-test
+             'kotoba.lang.portable-effect-test
+             'kotoba.lang.signed-readback-test
+             'kotoba.lang.trusted-admission-test)

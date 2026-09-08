@@ -14,6 +14,17 @@
 (def default-max-batch 256)
 (def default-max-block-bytes (* 1024 1024))
 
+(defn- byte-count
+  "`(count ...)` throws for `incidence/canonical-bytes`'s result on this host
+  -- it is a `js/Uint8Array` on cljs, which does not satisfy `ICounted` (the
+  same convention `kotoba.lang.captp-runtime` and `kotoba.lang.ocapn-handoff`
+  already branch on for their own `byte-count` helpers). Measured 2026-09-08:
+  a replica with even one existing block made `state-error` throw on nbb
+  instead of validating, because `count` reached this path unconditionally."
+  [bytes]
+  #?(:clj (alength ^bytes bytes)
+     :cljs (.-length bytes)))
+
 (defprotocol ^:private ReplicationCertificateValue
   (-certificate-info [value]))
 
@@ -75,8 +86,8 @@
                         (let [verified (incidence/verify-addressed entry)]
                           (and (:ok? verified)
                                (= cid (:cid verified))
-                               (<= (count (incidence/canonical-bytes
-                                           (:incidence/block entry)))
+                               (<= (byte-count (incidence/canonical-bytes
+                                               (:incidence/block entry)))
                                    (:replica/max-block-bytes state)))))
                       (:replica/blocks state))))
     {:problem :replication/blocks-invalid}
@@ -127,8 +138,8 @@
                         {:problem :replication/entry-invalid
                          :verification verified}
 
-                        (> (count (incidence/canonical-bytes
-                                   (:incidence/block entry)))
+                        (> (byte-count (incidence/canonical-bytes
+                                       (:incidence/block entry)))
                            (:replica/max-block-bytes state))
                         {:problem :replication/block-too-large
                          :cid (:cid verified)}
