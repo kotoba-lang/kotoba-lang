@@ -114,6 +114,57 @@
 (defn operator-heads [text]
   (->> (re-seq operator-re text) (map second) set))
 
+;; --- --findings mode: the orgs-detector protocol ----------------------------
+;;
+;; manifest/orgs-detectors.edn requires FINDING<TAB>sev<TAB>key<TAB>detail lines
+;; and a non-zero SCANNED evidence line. This mode scans every oracle under
+;; orgs/ in one ripgrep pass instead of walking ~1,300 checkouts in node.
+;;
+;; The pattern requires the name to END at the head. Two weaker patterns were
+;; measured first and both were wrong, each caught by cross-checking a single
+;; repository the directory-walk mode had already answered:
+;;
+;;   (?:query)[\s\)]   MISSES `(defn query` followed by a newline -- ripgrep is
+;;                     line-based and there is no character after the name on
+;;                     that line. Undercounted `query` fleet-wide 1030 -> 5.
+;;   (?:query)\b       MATCHES inside `handle-create`, because `-` is a
+;;                     non-word character to a regex but part of the name in
+;;                     Clojure. Overcounted `handle` 79 -> 5387.
+(defn- findings-mode [root]
+  (let [heads (str/join "|" (sort reserved))
+        pat (str "^\\s*\\((?:defn|def)\\s+(?:" heads ")(?:\\s|\\)|$)")
+        args ["--no-ignore" "--no-heading" "--line-number"
+              "-g" "*.cljc" "-g" "*.clj"
+              "-g" "!**/node_modules/**" "-g" "!**/.git/**" "-g" "!**/target/**"
+              "-g" "!**/dist/**" "-g" "!**/build/**"
+              pat "orgs"]
+        cp (js/require "child_process")
+        out (try (.toString (.execFileSync cp "rg" (clj->js args)
+                                           #js {:cwd root :encoding "utf8"
+                                                :maxBuffer 512000000}))
+                 (catch :default e (if (= 1 (.-status e)) "" ::failed)))]
+    (when (= out ::failed)
+      (refuse! "ripgrep failed; refusing to report a clean scan" {:root root}))
+    (let [lines (vec (remove str/blank? (str/split-lines out)))
+          name-re (re-pattern "\\((?:defn|def)\\s+([^\\s\\)]+)")
+          rows (keep (fn [l]
+                       (let [p (first (str/split l #":"))
+                             nm (second (re-find name-re l))]
+                         (when (and p nm (reserved nm))
+                           {:repo (str/join "/" (take 3 (str/split p #"/")))
+                            :file p :name nm})))
+                     lines)]
+      (println (str "SCANNED\t" (count lines) "\toracle lines matching a reserved head"))
+      (doseq [{:keys [repo file name]} (sort-by (juxt :repo :name) rows)]
+        (println (str "FINDING\twarn\t" repo "::" name
+                      "\tpublic `" name "` in " file
+                      " is a reserved pure-core head; it collides when this component migrates")))
+      (js/process.exit 0))))
+
+;; Dispatch: --findings is the orgs-detector protocol; otherwise directory mode.
+(when (some #{"--findings"} (vec (drop 2 (js->clj js/process.argv))))
+  (findings-mode (or (opt "--root") ".")))
+
 (let [_ (when (empty? dirs) (refuse! "no directory given" {:usage "check-reserved-name-collisions.cljs <dir> ..."}))
       files (vec (mapcat walk dirs))
       _ (when (empty? files) (refuse! "nothing to scan under the given directories" {:dirs dirs}))
