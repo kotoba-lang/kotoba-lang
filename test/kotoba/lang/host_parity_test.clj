@@ -59,3 +59,33 @@
     (is (= :l5 (:level r)))
     (is (= :meets-threshold (:status r)))
     (is (true? (get-in r [:conformance :ok?])))))
+
+;; --- 2026-09-08: an unavailable catalog must not read as a measured one ----
+
+(deftest a-loaded-catalog-says-it-was-loaded
+  ;; The positive direction. Without this, the assertion below passes just as
+  ;; well against a `catalog-available?` that returns false unconditionally.
+  (is (true? (hp/catalog-available?))
+      "the JVM suite reads lang/host-parity.edn, so this must be true here")
+  (is (= :resource (:kotoba.lang.host-parity/source (hp/catalog)))))
+
+(deftest a-loaded-catalog-reports-a-status-that-is-not-catalog-unavailable
+  ;; The other half: `:catalog-unavailable` must be reachable ONLY when the
+  ;; catalog really is unavailable, or the new status is just noise.
+  (is (not= :catalog-unavailable (:status (hp/report))))
+  (is (true? (:catalog-available? (hp/report))))
+  (is (true? (:catalog-available? (hp/score)))))
+
+(deftest the-empty-catalog-was-indistinguishable-and-is-not-anymore
+  ;; What this pins is the DISTINCTION, not the numbers. Before this change the
+  ;; unavailable catalog produced `{:total 0 :ratio 0.0 :ok? false}` and
+  ;; `:below-threshold` -- byte-identical to a real measurement of a workspace
+  ;; with no host imports. `guard-host-import` still denied (it always did;
+  ;; availability answers :unknown-import for everything), so this was never a
+  ;; safety hole -- it was an unreadable one.
+  (let [real (hp/catalog)]
+    (is (contains? real :kotoba.lang.host-parity/source)
+        "every catalog carries its provenance, loaded or not")
+    (is (seq (:imports real))
+        "SCANNED: the JVM catalog is non-empty, so the assertions above are
+         about a real catalog and not about the stub")))

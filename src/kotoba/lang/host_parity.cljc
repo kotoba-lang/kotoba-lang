@@ -7,6 +7,32 @@
             [kotoba.lang.coll :as coll]
             #?(:clj [clojure.java.io :as io])))
 
+(def ^:private unavailable-catalog
+  "The catalog when `lang/host-parity.edn` could not be read.
+
+  It is empty AND it says so. Before 2026-09-08 it was only empty: the `:cljs`
+  branch returned this shape unconditionally and the `:clj` branch returned it
+  whenever the resource was missing, and nothing downstream could tell that
+  from a real catalog which happens to list no imports.
+
+  The consequences were never UNSAFE -- `availability` answers
+  `:unknown-import` for everything, so `guard-host-import` denies and the L5
+  gate fails closed, which is the documented intent. They were MISLEADING.
+  `score` reports `:total 0 :ratio 0.0 :ok? false` and `report` reports
+  `:below-threshold`, and both read as a measurement of a workspace with no
+  host imports rather than as a failure to measure. Measured 2026-09-08:
+  porting `host_parity_test` to `.cljc` failed 20 of its 24 assertions on nbb,
+  every one comparing real catalog data against this stub, and the only clue in
+  the output was a version of 0.
+
+  `::source` is the difference. Nothing else about the fallback changes."
+  {:kotoba.lang.host-parity/version 0
+   :kotoba.lang.host-parity/source :unavailable
+   :imports {}
+   :acceptance {:browser-linkable-statuses #{:yes}
+                :min-browser-ratio 0.0}
+   :conformance {:cases []}})
+
 (def ^:private catalog*
   (delay
     #?(:clj
@@ -16,20 +42,26 @@
                      (when (.isFile f) f)))]
          (if c
            (with-open [r (io/reader c)]
-             (edn/read-string (slurp r)))
-           {:kotoba.lang.host-parity/version 0
-            :imports {}
-            :acceptance {:browser-linkable-statuses #{:yes}
-                         :min-browser-ratio 0.0}
-            :conformance {:cases []}}))
-       :cljs
-       {:kotoba.lang.host-parity/version 0
-        :imports {}
-        :acceptance {:browser-linkable-statuses #{:yes}
-                     :min-browser-ratio 0.0}
-        :conformance {:cases []}})))
+             (assoc (edn/read-string (slurp r))
+                    :kotoba.lang.host-parity/source :resource))
+           unavailable-catalog))
+       ;; ClojureScript has no ambient file read here, and this namespace runs
+       ;; in the browser as well as under nbb, so reaching for `fs` would be
+       ;; wrong rather than merely unimplemented. Supplying the catalog by
+       ;; injection is a design decision this namespace does not get to make on
+       ;; its own; until it is made, the honest answer is that the catalog is
+       ;; UNAVAILABLE on this host, said out loud.
+       :cljs unavailable-catalog)))
 
 (defn catalog [] @catalog*)
+
+(defn catalog-available?
+  "Whether `lang/host-parity.edn` was actually read.
+
+  False means every parity number below is the shape of an answer, not an
+  answer. Check this before quoting `score` or `report`."
+  []
+  (= :resource (:kotoba.lang.host-parity/source (catalog))))
 
 (defn- linkable?
   [status statuses]
@@ -117,6 +149,10 @@
      :required-ratio required-ratio
      :minimum-required-ratio minimum
      :classification-complete? partition-ok?
+     ;; Carried so a caller can tell `measured zero` from `could not measure`.
+     ;; `:ok?` is unchanged: it was already false in the unavailable case, and
+     ;; making the distinction visible must not quietly change a verdict.
+     :catalog-available? (catalog-available?)
      :ok? (and partition-ok? (>= required-ratio minimum))
      :missing (mapv :import (remove #(linkable? (:browser %) statuses) rows))
      :gaps (get-in c [:acceptance :honest-gaps] [])}))
@@ -195,7 +231,13 @@
   (let [s (score)
         conf (run-conformance)]
     {:level :l5
-     :status (if (and (:ok? s) (:ok? conf)) :meets-threshold :below-threshold)
+     ;; `:below-threshold` and `:catalog-unavailable` were the same word before.
+     ;; A reader cannot act on the first without knowing it is not the second.
+     :status (cond
+               (not (catalog-available?)) :catalog-unavailable
+               (and (:ok? s) (:ok? conf)) :meets-threshold
+               :else :below-threshold)
+     :catalog-available? (catalog-available?)
      :score s
      :conformance conf
      :matrix (matrix)
