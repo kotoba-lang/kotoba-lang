@@ -1,6 +1,6 @@
 (ns kotoba.lang.q9-migration
   "Fail-closed authorization checks for the Q9 dependency-ordered migration."
-  (:require [clojure.edn :as edn]
+  (:require [kotoba.lang.edn :as edn]
             [kotoba.lang.coll :as coll]))
 
 (def q9-path "lang/q9-migration.edn")

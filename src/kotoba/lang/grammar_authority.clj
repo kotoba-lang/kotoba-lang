@@ -6,7 +6,7 @@
   Authority: lang/guest-grammar.edn + lang/surface-status.edn +
   lang/elaboration-pipeline.edn (ADR-2607279200 / migration plan W0)."
   (:gen-class)
-  (:require [clojure.edn :as edn]
+  (:require [kotoba.lang.edn :as edn]
             [clojure.java.io :as io]
             [kotoba.lang.coll :as coll]
             [kotoba.lang.text :as str]))

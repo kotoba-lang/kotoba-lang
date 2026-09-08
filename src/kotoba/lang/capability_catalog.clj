@@ -1,5 +1,5 @@
 (ns kotoba.lang.capability-catalog
-  (:require [clojure.edn :as edn]
+  (:require [kotoba.lang.edn :as edn]
             [clojure.java.io :as io]))
 
 (defn read-authority

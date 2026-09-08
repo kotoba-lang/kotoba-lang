@@ -1,6 +1,6 @@
 (ns kotoba.lang.cli-adapter-matrix
   "T9.1: validate lang/cli-adapter-matrix.edn against lang/cli.edn command ids."
-  (:require [clojure.edn :as edn]
+  (:require [kotoba.lang.edn :as edn]
             [kotoba.lang.coll :as coll]
             #?(:clj [clojure.java.io :as io])))
 

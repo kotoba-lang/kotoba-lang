@@ -4,7 +4,7 @@
   Manifest: examples/pure-product-examples.edn
   Run: clojure -M:pure-product-examples
   Requires sibling checkout of kotoba-lang/amu (or override COMPILER_ROOT)."
-  (:require [clojure.edn :as edn]
+  (:require [kotoba.lang.edn :as edn]
             [clojure.java.io :as io]
             [kotoba.lang.text :as str]
             [kotoba.compiler.core :as compiler]

@@ -2,7 +2,7 @@
   "Loader for lang/guest-grammar.edn — the shared .kotoba guest form catalog
   (ADR-2607180900). Portable .cljc: reads EDN from the classpath resource
   path used when this library is on the deps path, or from an explicit file."
-  (:require [clojure.edn :as edn]
+  (:require [kotoba.lang.edn :as edn]
             #?(:clj [clojure.java.io :as io])))
 
 (def ^:private resource-path "guest-grammar.edn")
@@ -19,7 +19,7 @@
                      (when c
                        (try
                          (with-open [r (io/reader c)]
-                           (edn/read (java.io.PushbackReader. r)))
+                           (edn/read-string (slurp r)))
                          (catch Exception _ nil))))
                    candidates)
              {:kotoba.lang.guest-grammar/version 0

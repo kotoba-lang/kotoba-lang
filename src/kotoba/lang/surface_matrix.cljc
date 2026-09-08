@@ -2,7 +2,7 @@
   "T2.2: generate docs/lang/surface-matrix.md from lang/surface-status.edn.
 
   Pure loaders + markdown render + --check (byte-identical regenerated body)."
-  (:require [clojure.edn :as edn]
+  (:require [kotoba.lang.edn :as edn]
             [kotoba.lang.text :as str]
             #?(:clj [clojure.java.io :as io])))
 
