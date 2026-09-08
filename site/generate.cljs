@@ -373,13 +373,17 @@
   representation, and the artifact identity that binds code, policy, compiler
   contract and target ABI are three facts, not one. None of them is authority
   to run anything — that is the architecture section's job to say, and it does."
-  [{:key :source :label "source bytes"
+  [{:key :source-cid :label "source CID"
+    :sha play-source-cid
+    :href play-source-url
+    :note "IPFS CIDv1 · raw · sha2-256 of hello.kotoba"}
+   {:key :source :label "source SHA-256"
     :sha (:source-sha256 play-provenance)
     :note "sha-256 of the exact file shown here"}
-   {:key :kir :label "checked KIR"
+   {:key :kir :label "checked KIR SHA-256"
     :sha (:kir-sha256 play-provenance)
     :note "the typed, effect-checked representation the compiler admitted"}
-   {:key :artifact :label "artifact identity"
+   {:key :artifact :label "artifact identity SHA-256"
     :sha (:sha256 play-provenance)
     :note "binds source, policy, compiler contract and target ABI"}])
 
@@ -392,7 +396,7 @@
 
   The list of identities is real text in the page. The animation is an overlay
   on top of it: with no JavaScript, or with reduced motion, the code and all
-  three hashes are simply there."
+  four identities are simply there."
   []
   [:div {:class "kot-morph" :id "kot-morph"
          :data-layers (str/join "|" (for [{:keys [label sha]} identity-layers]
@@ -407,10 +411,14 @@
      [:span {:class "kot-morph-label"}]
      [:span {:class "kot-morph-hex"}]]]
    [:ul {:class "kot-morph-ids"}
-    (for [{:keys [label sha note]} identity-layers]
+    (for [{:keys [label sha note href]} identity-layers]
       [:li [:span {:class "kot-morph-id-label"} label]
-       [:code {:class "kot-code kot-morph-id-sha"} (subs sha 0 16) "…"]
-       [:span {:class "kot-morph-id-note"} note]])]])
+       (let [value [:code {:class "kot-code kot-morph-id-sha" :title sha}
+                    (subs sha 0 16) "…"]]
+         (if href [:a {:href href :aria-label (str label " " sha)} value] value))
+       [:span {:class "kot-morph-id-note"} note]])]
+   [:p {:class "kot-caption kot-muted"}
+    "The source CID opens hello.kotoba. The SHA-256 digests identify source bytes, checked KIR, and artifact identity; they are not IPFS addresses."]])
 
 (def app-css
   (str
@@ -942,7 +950,7 @@
 
   The effect is the argument, not decoration: a Kotoba definition is addressed
   by what it is, so watching the source resolve into a digest and back is the
-  claim the rest of the page spends paragraphs on. It cycles through the three
+  claim the rest of the page spends paragraphs on. It cycles through the four
   identities in `identity-layers`, which is why it does not simply fade — the
   label changes each time, and they are different hashes of different things.
 
@@ -954,7 +962,7 @@
   It runs on hover, on focus, and on a slow timer while the block is actually
   on screen — the timer is cleared the moment it leaves, so a page scrolled
   past does no work. `prefers-reduced-motion` returns before any of that is
-  wired up; the code and all three hashes are in the page as ordinary text, so
+  wired up; the code and all four identities are in the page as ordinary text, so
   nothing is lost by never running it."
   (str "(function(){"
        "var R=document.getElementById('kot-morph');if(!R)return;"
