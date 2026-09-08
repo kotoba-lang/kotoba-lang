@@ -143,13 +143,30 @@
   [n]
   (<= 48 n 57))
 
+(def ^:private max-portable-syrup-natural
+  "js/Number.MAX_SAFE_INTEGER (2^53 - 1), held as an explicit constant
+  shared by both hosts rather than derived from each host's own integer
+  range.
+
+  `parse-long` silently returns nil for a digit string above this bound
+  on ClojureScript -- float64 cannot address it -- while the same digit
+  string keeps parsing correctly on the JVM (a 64-bit long) all the way to
+  ~9.2e18. Without a shared ceiling the exact same wire bytes decode on
+  one host and corrupt or refuse on the other, which is exactly the kind
+  of host double this file exists to avoid (see the module docstring).
+  Measured 2026-09-08: `(parse-long \"9007199254740992\")` => nil under
+  nbb, => 9007199254740992 under the JVM."
+  9007199254740991)
+
 (defn- parse-natural
   [data start]
   (loop [i start]
     (if (and (< i (count data)) (digit? (nth data i)))
       (recur (inc i))
       (when (> i start)
-        [(parse-long (apply str (map char (subvec data start i)))) i]))))
+        (when-some [n (parse-long (apply str (map char (subvec data start i))))]
+          (when (<= n max-portable-syrup-natural)
+            [n i]))))))
 
 (declare parse-value)
 
