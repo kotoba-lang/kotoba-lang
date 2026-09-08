@@ -3106,8 +3106,14 @@
   ([path title description]
    (list
     [:link {:rel "canonical" :href (str site-origin path)}]
+    (when (contains? #{"/libraries/" "/legal/" "/sponsor/" "/ja/libraries/" "/ja/legal/" "/ja/sponsor/"} path)
+      (let [en-path (str/replace path #"^/ja/" "/")]
+        (list [:link {:rel "alternate" :hreflang "en" :href (str site-origin en-path)}]
+              [:link {:rel "alternate" :hreflang "ja" :href (str site-origin "/ja" en-path)}]
+              [:link {:rel "alternate" :hreflang "x-default" :href (str site-origin en-path)}])))
     [:meta {:property "og:site_name" :content "Kotoba"}]
-    [:meta {:property "og:type" :content "website"}]
+    [:script {:type "application/ld+json"} "{\"@context\":\"https://schema.org\",\"@type\":\"WebSite\",\"@id\":\"https://kotoba-lang.org/#website\",\"url\":\"https://kotoba-lang.org/\",\"name\":\"Kotoba\",\"publisher\":{\"@type\":\"Organization\",\"name\":\"Kotoba Labs Inc.\"},\"inLanguage\":[\"en\",\"ja\"]}"]
+        [:meta {:property "og:type" :content "website"}]
     [:meta {:property "og:url" :content (str site-origin path)}]
     [:meta {:property "og:title" :content title}]
     [:meta {:property "og:description" :content description}]
@@ -3115,6 +3121,11 @@
     [:meta {:property "og:image:width" :content "1200"}]
     [:meta {:property "og:image:height" :content "630"}]
     [:meta {:property "og:image:alt" :content "Safe code. Built for machine speed."}]
+    [:link {:rel "alternate" :type "text/markdown" :href (str site-origin "/agent-quickstart.md") :title "AI agent quickstart"}]
+    [:link {:rel "alternate" :type "text/plain" :href (str site-origin "/llms.txt") :title "LLM documentation index"}]
+    [:meta {:name "twitter:title" :content title}]
+    [:meta {:name "twitter:description" :content description}]
+    [:meta {:property "og:locale" :content (if (str/starts-with? path "/ja/") "ja_JP" "en_US")}]
     [:meta {:name "twitter:card" :content "summary_large_image"}]
     [:meta {:name "twitter:image" :content (str site-origin "/kotoba-og-card.png")}])))
 
@@ -3345,3 +3356,19 @@
       (fs/copyFileSync source target)))
   (println "wrote" (path/join out "index.html")
            (str "(" (.-length html) " bytes)")))
+
+(let [root "site/dist"
+      walk (fn walk [dir]
+             (mapcat (fn [name]
+                       (let [p (path/join dir name)]
+                         (if (.isDirectory (fs/statSync p)) (walk p) [p])))
+                     (js->clj (fs/readdirSync dir))))
+      urls (->> (walk root)
+                (filter #(str/ends-with? % ".html"))
+                (keep #(second (re-find #"rel=\"canonical\" href=\"([^\"]+)\"" (fs/readFileSync % "utf8"))))
+                distinct sort)]
+  (when (empty? urls) (throw (js/Error. "No canonical URLs for sitemap")))
+  (fs/writeFileSync (path/join root "robots.txt") "User-agent: *\nAllow: /\n\nSitemap: https://kotoba-lang.org/sitemap.xml\n")
+  (fs/writeFileSync (path/join root "sitemap.xml")
+    (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
+         (str/join "\n" (map #(str "<url><loc>" % "</loc></url>") urls)) "\n</urlset>\n")))
