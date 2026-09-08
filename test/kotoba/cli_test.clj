@@ -1,12 +1,26 @@
 (ns kotoba.cli-test
-  (:require #?(:clj [clojure.edn :as edn])
+  "`.clj`, not `.cljc`, as of 2026-09-08.
+
+  This file was `.cljc` and could not load on ClojureScript at all: it calls
+  `(cli/read-contract)` at TOP LEVEL, and `cli.cljc`'s `:cljs` branch of that
+  function is a deliberate `(throw (ex-info \"read-contract requires an EDN map
+  on CLJS\" {}))` -- reading a file off disk has no ClojureScript
+  implementation here. So requiring this namespace under nbb threw before a
+  single assertion ran.
+
+  A `.cljc` extension is a claim that the file runs on both hosts. This one
+  could not, by the deliberate design of the code it tests, and nothing said so
+  because no ClojureScript runner existed in this repository until today.
+  The extension now matches the fact.
+
+  If `read-contract` ever gains a ClojureScript implementation, move this back
+  and add it to `run-tests.cljs` -- in BOTH lists."
+  (:require [clojure.edn :as edn]
             [clojure.test :refer [deftest is run-tests]]
             [kotoba.cli :as cli]))
 
 (def contract (cli/read-contract))
-(def adapters
-  #?(:clj (edn/read-string (slurp "lang/adapters.edn"))
-     :cljs {}))
+(def adapters (edn/read-string (slurp "lang/adapters.edn")))
 
 (deftest contract-validates-in-cljc
   (let [result (cli/validate-contract contract)]
@@ -114,4 +128,4 @@
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'kotoba.cli-test)]
     (when (pos? (+ (or fail 0) (or error 0)))
-      #?(:clj (System/exit 1)))))
+      (System/exit 1))))

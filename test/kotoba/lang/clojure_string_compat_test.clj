@@ -43,6 +43,19 @@
    (defn trr [s :string] :string (trimr s))
    (defn rv [s :string] :string (reverse s))
    (defn ws [point :i64] :i64 (if (whitespace? point) 1 0))
+   ;; `join` takes a [:list :string], and a list can only be CONSTRUCTED with
+   ;; a statically known item count -- `typed-list-new` is a constructor over
+   ;; literal items and kotoba-sema's `canonical-list-operations` is exactly
+   ;; #{typed-list-new typed-list-nth}, with no conj, cons or append (measured
+   ;; 2026-09-08). So the harness carries one entry per arity rather than
+   ;; passing a list in from the host.
+   (defn j0 [sep :string] :string (join sep (typed-list-new [:list :string])))
+   (defn j1 [sep :string a :string] :string
+     (join sep (typed-list-new [:list :string] a)))
+   (defn j2 [sep :string a :string b :string] :string
+     (join sep (typed-list-new [:list :string] a b)))
+   (defn j3 [sep :string a :string b :string c :string] :string
+     (join sep (typed-list-new [:list :string] a b c)))
    (defn main [] :i64 0)")
 
 ;; The module's own reader drops its `ns` form, rather than a regex over the
@@ -216,3 +229,72 @@
     (testing "and U+3000 is"
       (is (true? (Character/isWhitespace (int 0x3000))))
       (is (= 1 (long (kir/execute @lowered 'ws [0x3000])))))))
+
+;; ---------------------------------------------------------------------------
+;; 2026-09-08: join, and the accessor that made it writable.
+;;
+;; `lang/compat.edn` recorded join as absent because it "consumes a sequence of
+;; strings: the same [:list :string] with no accessor". The accessor landed on
+;; both backends on 2026-09-08 (kotoba-script `typedListNth`, kotoba-wasm
+;; `list-nth-i64` / `list-nth-ref`); the KIR reference interpreter this test
+;; runs on already had it, which is why this test can be the oracle for the
+;; SEMANTICS while the compiled artifacts are the evidence for the LOWERING.
+
+(def ^:private join-cases
+  ;; [separator items]. The three shapes Clojure's join is defined by -- empty,
+  ;; single, many -- plus separators and items that are themselves empty or
+  ;; multi-byte, because `string-concat` here is over UTF-8 bytes.
+  [["," []] ["," ["a"]] ["," ["a" "b"]] ["," ["a" "b" "c"]]
+   ["" ["a" "b"]] ["" []] ["" ["a"]]
+   ["、" ["あ" "い" "う"]] ["," ["" ""]] ["," ["" "a" ""]]
+   ["--" ["x" "y"]] ["," ["😀" "b"]] ["😀" ["a" "b"]]
+   [" " ["日本語" "です"]] ["," ["aあb"]] ["\n" ["a" "b"]]])
+
+(deftest join-matches-clojure-string
+  (let [entry {0 'j0 1 'j1 2 'j2 3 'j3}
+        results (for [[separator items] join-cases]
+                  (let [got (kir/execute @lowered (entry (count items))
+                                         (cons separator items))
+                        want (str/join separator items)]
+                    {:separator separator :items items :kotoba got :clojure want
+                     :agrees? (= got want)}))
+        bad (remove :agrees? results)]
+    ;; A COUNT, not a boolean: `failures * 1000 + checks`, so a run that
+    ;; checked nothing (0) is distinguishable from a clean run (16) and from a
+    ;; single regression (1016). A boolean cannot tell those apart.
+    (println (str "JOIN-CHECKED\t" (+ (* 1000 (count bad)) (count results))
+                  "\t(failures*1000 + cases)"))
+    (is (= (count join-cases) (count results)))
+    (is (pos? (count results)) "an empty case set would make this vacuous")
+    (is (empty? bad) (str "join disagrees with clojure.string on " (pr-str (vec bad))))))
+
+(deftest the-list-accessor-reads-and-traps
+  ;; The gap `lang/compat.edn` recorded was that a [:list :string] could be
+  ;; built and counted and never read. This is the read, and the two ends of
+  ;; the range, asserted rather than described.
+  (let [source (str "(defn at [i :i64] :string "
+                    "(nth (typed-list-new [:list :string] \"a\" \"bb\" \"ccc\") i))\n"
+                    "(defn n [] :i64 "
+                    "(vector-count (typed-list-new [:list :string] \"a\" \"bb\" \"ccc\")))\n"
+                    "(defn main [] :i64 0)")
+        program (kir/lower (sema/analyze source))]
+    (is (= 3 (long (kir/execute program 'n []))))
+    (is (= "a" (kir/execute program 'at [0])))
+    (is (= "bb" (kir/execute program 'at [1])))
+    (is (= "ccc" (kir/execute program 'at [2])))
+    (doseq [out-of-range [3 -1]]
+      (is (thrown? Throwable (kir/execute program 'at [out-of-range]))
+          (str "index " out-of-range " must trap, as vector nth without a default does")))))
+
+(deftest join-s-one-argument-arity-is-refused-not-answered
+  ;; clojure.string/join also has a one-argument arity, (join coll), which
+  ;; concatenates with no separator. There is no multi-arity here, so the
+  ;; caller gets an arity refusal at check time -- never a different answer.
+  ;; Asserted, because "it would be refused" is exactly the kind of claim that
+  ;; quietly stops being true.
+  (let [body (->> (sema/read-forms module)
+                  (remove #(and (seq? %) (= 'ns (first %))))
+                  (map pr-str)
+                  (str/join "\n"))
+        one-arg (str body "\n(defn main [] :string (join (typed-list-new [:list :string] \"a\")))")]
+    (is (thrown? Throwable (kir/lower (sema/analyze one-arg))))))
