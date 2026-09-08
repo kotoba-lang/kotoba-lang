@@ -218,7 +218,8 @@
 (def play-source-cid
   (let [digest (.digest (.update (crypto/createHash "sha256") (fs/readFileSync play-source-path)))]
     (str "b" (base32-lower (concat [1 85 18 32] digest)))))
-(def play-source-ipfs-url (str "https://ipfs.kotobase.net/ipfs/" play-source-cid))
+(def play-source-url (str "/ipfs/" play-source-cid))
+(def play-source-ipfs-url (str "ipfs://" play-source-cid))
 
 (def syntax-dependency
   (first (filter #(= :syntax-highlighting (:id %)) (:build-time dependencies))))
@@ -391,8 +392,9 @@
          :data-layers (str/join "|" (for [{:keys [label sha]} identity-layers]
                                       (str label " " sha)))}
    [:p {:class "kot-caption kot-muted" :id "kot-hero-filename"}
-    [:a {:href play-source-ipfs-url :title "View source on IPFS"}
-     [:code {:class "kot-code"} "hello.kotoba"]] " / IPFS"]
+    [:a {:href play-source-url :title "View the exact source by CID"}
+     [:code {:class "kot-code"} "hello.kotoba"]] " / "
+    [:a {:href play-source-ipfs-url :title "Open in an IPFS client"} "IPFS"]]
    [:div {:class "kot-morph-stage"}
     [:pre {:class "kot-pre kot-morph-code" :aria-labelledby "kot-hero-filename"} (highlighted-kotoba-chars play-source)]
     [:div {:class "kot-morph-out" :aria-hidden "true"}
@@ -3292,6 +3294,9 @@
   (fs/copyFileSync favicon-ico-source-path (path/join out "favicon.ico"))
   ;; Cloudflare Workers static assets: _headers lives at the dist root.
   (fs/copyFileSync (path/join "site" "_headers") (path/join out "_headers"))
+  ;; Only this source block is text. Other /ipfs blocks can be CBOR or Wasm.
+  (fs/appendFileSync (path/join out "_headers")
+    (str "\n" play-source-url "\n  Content-Type: text/plain; charset=utf-8\n  Content-Disposition: inline; filename=hello.kotoba\n"))
   (fs/copyFileSync dependency-manifest-path (path/join out "dependencies.edn"))
   (doseq [[source target]
           [[benchmark-source-path (path/join out "benchmarks" "compile-wasm-latest.json")]
