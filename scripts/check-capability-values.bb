@@ -4,12 +4,22 @@
          '[babashka.deps :as deps])
 
 ;; capability-host's strict causal path validates the shared grant contract.
-;; Resolve exactly that declared dependency (and its transitive contracts),
-;; while keeping this script on the same source implementation as the tests.
+;; Resolve exactly those declared dependencies (and their transitive
+;; contracts), while keeping this script on the same source implementation
+;; as the tests. After 832a44b, capability_values.cljc / capability_cacao.cljc
+;; require kotoba.lang.coll and kotoba.lang.text instead of clojure.set /
+;; clojure.string; grant alone no longer puts those namespaces on the bb
+;; classpath (CI: FileNotFoundException on kotoba.lang.coll).
 (let [declared (edn/read-string (slurp "deps.edn"))
-      coordinate 'io.github.kotoba-lang/grant]
+      coordinates '[io.github.kotoba-lang/grant
+                    io.github.kotoba-lang/coll
+                    io.github.kotoba-lang/text]]
   (deps/add-deps {:paths ["src"]
-                  :deps {coordinate (get-in declared [:deps coordinate])}}))
+                  :deps (into {}
+                              (keep (fn [c]
+                                      (when-let [coord (get-in declared [:deps c])]
+                                        [c coord])))
+                              coordinates)}))
 
 ;; Run the exact same pure CLJC logic as the test suite: load the namespace
 ;; source directly so the gate cannot drift from the contract implementation.
