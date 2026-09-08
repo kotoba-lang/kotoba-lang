@@ -3,7 +3,7 @@
 
   Host binaries are adapters. This namespace owns the data contract loading,
   argument shaping, and command result model without depending on Rust."
-  #?(:clj (:require [clojure.edn :as edn]
+  #?(:clj (:require [kotoba.lang.edn :as edn]
                     [clojure.java.io :as io]
                     [kotoba.lang.text :as str]
                     [identity.principal :as principal])) ; cljs consumers pass parsed EDN.

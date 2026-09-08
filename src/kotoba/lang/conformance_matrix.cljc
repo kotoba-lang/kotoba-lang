@@ -3,7 +3,7 @@
 
   Pure loaders + queries. Dual-backend *execution* is T1.3 (compiler /
   kotoba-kir / kotoba-wasm runners)."
-  (:require [clojure.edn :as edn]
+  (:require [kotoba.lang.edn :as edn]
             [kotoba.lang.coll :as coll]
             #?(:clj [clojure.java.io :as io])))
 

@@ -1,6 +1,6 @@
 (ns kotoba.lang.version-policy
   "Machine-enforced language support, deprecation, and compatibility policy."
-  (:require [clojure.edn :as edn])
+  (:require [kotoba.lang.edn :as edn])
   (:import [java.time LocalDate]
            [java.time.temporal ChronoUnit]))
 

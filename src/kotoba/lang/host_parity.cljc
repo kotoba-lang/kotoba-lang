@@ -3,7 +3,7 @@
 
   Loads lang/host-parity.edn. Pure data — no DOM, no Wasm execution.
   Missing host import is modeled as capability absence, never ambient success."
-  (:require [clojure.edn :as edn]
+  (:require [kotoba.lang.edn :as edn]
             [kotoba.lang.coll :as coll]
             #?(:clj [clojure.java.io :as io])))
 
@@ -16,7 +16,7 @@
                      (when (.isFile f) f)))]
          (if c
            (with-open [r (io/reader c)]
-             (edn/read (java.io.PushbackReader. r)))
+             (edn/read-string (slurp r)))
            {:kotoba.lang.host-parity/version 0
             :imports {}
             :acceptance {:browser-linkable-statuses #{:yes}

@@ -38,7 +38,7 @@
   defect it is looking for: quietly, and green."
   (:require [kotoba.lang.text :as str]
             [kotoba.lang.conformance-matrix :as cm]
-            #?(:clj [clojure.edn :as edn])
+            #?(:clj [kotoba.lang.edn :as edn])
             #?(:clj [clojure.java.io :as io])))
 
 ;; --- what counts as a claim ------------------------------------------------
