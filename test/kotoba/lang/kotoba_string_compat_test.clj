@@ -1,7 +1,7 @@
 (ns kotoba.lang.kotoba-string-compat-test
   "`lang/compat/kotoba/string.kotoba`, checked against byte arithmetic.
 
-  There is no Clojure oracle for `byte-index-of`: `clojure.string/index-of`
+  There is no Clojure oracle for `byte-index-of`: `str/index-of`
   answers a CHARACTER index, and the whole reason this function has a
   different name is that the two numbers are different. Calling it as the
   oracle would assert the defect.
@@ -14,11 +14,11 @@
   a valid needle can only begin on a code-point boundary, which is the only
   place the Kotoba scan looks.
 
-  `clojure.string/index-of` is still called, in `the-name-is-the-point`, but
+  `str/index-of` is still called, in `the-name-is-the-point`, but
   as the CONTRAST: the cases recorded there are the ones where believing the
   Clojure name would slice a string in half."
   (:require [clojure.edn :as edn]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.kir :as kir]
             [kotoba.sema :as sema]))
@@ -132,7 +132,7 @@
       (let [public (set (map (comp symbol second)
                              (re-seq #"(?m)^\(defn\s+([^\s\[]+)" module)))]
         (is (= (:provides module-entry) public))))
-    ;; UNTIL 2026-09-08 this asserted the opposite: that clojure.string/index-of
+    ;; UNTIL 2026-09-08 this asserted the opposite: that str/index-of
     ;; stayed ABSENT and pointed here, and that nothing named index-of was
     ;; exported. The reason it was absent was never about strings -- it was
     ;; that an option-valued return refused to lower to wasm32 for the whole

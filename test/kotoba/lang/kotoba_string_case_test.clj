@@ -26,14 +26,14 @@
   16.0 mappings the host JDK may not know, which is where the four-byte
   blocks and the SpecialCasing expansions live. The counts are printed.
 
-  WHY THESE NAMES AND NOT clojure.string's. `clojure.string/lower-case` calls
+  WHY THESE NAMES AND NOT clojure.string's. `str/lower` calls
   `String.toLowerCase()` with no locale, so its answer depends on
   `Locale.getDefault()`; `locale-is-not-a-detail` asserts that divergence
   against the JVM rather than describing it. The Clojure names stay absent in
   `lang/compat.edn` for that reason and two more, each measured below."
   (:require [clojure.edn :as edn]
             [clojure.set :as set]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [clojure.walk :as walk]
             [kotoba.kir :as kir]
@@ -317,7 +317,7 @@
 ;; stop being true.
 
 (deftest locale-is-not-a-detail
-  ;; clojure.string/lower-case is (.. s toString toLowerCase) -- no locale
+  ;; str/lower is (.. s toString toLowerCase) -- no locale
   ;; argument, so Locale.getDefault(). A Kotoba guest has no locale to read.
   (let [turkish (Locale/forLanguageTag "tr")]
     (is (= "i" (.toLowerCase "I" Locale/ROOT)))
@@ -360,7 +360,7 @@
     (is (= "𐐀bc" (call 'cap astral))
         "the code-point-wise answer uppercases the astral letter")
     (is (= "𐐨bc" (str/capitalize astral))
-        "clojure.string/capitalize leaves it alone: (subs s 0 1) is half a pair, and .toUpperCase of a lone surrogate is itself")
+        "str/capitalize leaves it alone: (subs s 0 1) is half a pair, and .toUpperCase of a lone surrogate is itself")
     (is (not= (str/capitalize astral) (call 'cap astral)))))
 
 ;; ---------------------------------------------------------------------------

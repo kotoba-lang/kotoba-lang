@@ -1,9 +1,9 @@
 (ns captp-cljs-smoke
   (:require [clojure.java.io :as io]
-            [clojure.string :as str]))
+            [kotoba.lang.text :as str]))
 
 (defn- executable []
-  (if (str/starts-with? (str/lower-case (System/getProperty "os.name")) "windows")
+  (if (str/starts-with? (str/lower (System/getProperty "os.name")) "windows")
     "npx.cmd"
     "npx"))
 

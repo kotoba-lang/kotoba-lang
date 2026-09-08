@@ -10,7 +10,7 @@
   kotoba-lang/kotoba (typed_eval.clj). Do not duplicate it here."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.kir :as kir]
             [kotoba.sema :as sema]))

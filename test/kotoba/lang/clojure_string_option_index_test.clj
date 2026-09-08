@@ -1,5 +1,5 @@
 (ns kotoba.lang.clojure-string-option-index-test
-  "`clojure.string/index-of` and `last-index-of` in `lang/compat/clojure/string.kotoba`,
+  "`str/index-of` and `last-index-of` in `lang/compat/clojure/string.kotoba`,
   checked against clojure.string itself -- INCLUDING the nil.
 
   These two were absent from that module until 2026-09-08, and the reason on
@@ -17,7 +17,7 @@
   web alike. So the absent case is spelled as the option it always was.
 
   WHAT THIS FILE ASSERTS, and the distinction is the point: the ORACLE is
-  `clojure.string/index-of` itself, called, with `nil` as the absent case.
+  `str/index-of` itself, called, with `nil` as the absent case.
   A table of expected numbers would record what someone believed Clojure
   does. Two of the cases below -- the astral one, and `last-index-of` with an
   empty needle -- are exactly where a believed table gets written wrong.
@@ -26,7 +26,7 @@
   lowers to wasm32 and produces the right number is asserted in amu's own
   conformance pilot (`:option-return-kit`), which RUNS the artifact on both
   the KIR and wasm32 backends. This file asserts the string semantics."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.kir :as kir]
             [kotoba.sema :as sema]))
@@ -87,13 +87,13 @@
   (doseq [[s value] cases]
     (testing (pr-str [s value])
       (is (= (str/index-of s value) (kotoba-index-of s value))
-          "index-of must agree with clojure.string/index-of, nil included"))))
+          "index-of must agree with str/index-of, nil included"))))
 
 (deftest last-index-of-agrees-with-clojure-string-including-the-nil
   (doseq [[s value] cases]
     (testing (pr-str [s value])
       (is (= (str/last-index-of s value) (kotoba-last-index-of s value))
-          "last-index-of must agree with clojure.string/last-index-of, nil included"))))
+          "last-index-of must agree with str/last-index-of, nil included"))))
 
 (deftest absence-is-nil-and-not-minus-one
   (testing "the whole reason these are option-valued"

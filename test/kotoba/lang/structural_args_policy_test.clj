@@ -2,7 +2,7 @@
 (ns kotoba.lang.structural-args-policy-test
   "T5.1: structural-args policy present and forbids new packs."
   (:require [clojure.edn :as edn]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is]]))
 
 (deftest pure-product-structural-args-policy

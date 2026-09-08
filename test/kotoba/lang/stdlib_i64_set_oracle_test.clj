@@ -25,7 +25,7 @@
   duplicates) is asserted on every produced set -- a merge that returns
   the right MEMBERS in the wrong ORDER would otherwise pass."
   (:require [clojure.set :as cset]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.kir :as kir]
             [kotoba.sema :as sema]))

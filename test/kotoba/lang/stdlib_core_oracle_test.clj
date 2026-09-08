@@ -15,7 +15,7 @@
   that is the module's stated convention (first-match returns 0 for nothing)
   -- and then, in `keep-differs-from-clojure-on-zero`, the divergence that
   convention creates is asserted rather than avoided."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.kir :as kir]
             [kotoba.sema :as sema]))
