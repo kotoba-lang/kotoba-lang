@@ -553,3 +553,12 @@ Source CID: `bafkreiaeohkv2zuo2x4yq745euqm5wijrub5xpkxbbw5gre6tdp3sxzonm`.
 If the sample changes, publish/pin the new generated CID and verify external
 retrieval before deploying its link. Renaming the visible filename does not
 change the file bytes or its CID.
+
+### Browser link availability correction (2026-09-08)
+
+Subsequent requests to the archive gateway returned 502 `archive gateway unavailable`,
+and ipfs.io returned 429. Earlier byte-equality probes do not establish sustained
+availability. The filename now opens the same-origin, exact-CID HTTP mirror,
+explicitly served as inline UTF-8 plain text. The adjacent IPFS link uses
+`ipfs://<CID>` for native IPFS clients. No automatic cross-origin gateway fallback
+is required to read the sample in a browser. Network pin and source CID are unchanged.
