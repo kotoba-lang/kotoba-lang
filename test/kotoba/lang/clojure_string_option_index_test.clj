@@ -28,7 +28,6 @@
   the KIR and wasm32 backends. This file asserts the string semantics."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
-            [clojure.walk :as walk]
             [kotoba.kir :as kir]
             [kotoba.sema :as sema]))
 
@@ -50,58 +49,20 @@
 (defn- body-forms [source]
   (remove #(and (seq? %) (= 'ns (first %))) (sema/read-forms source)))
 
-(defn- unalias
-  "What the project linker does to a qualified call, and only that:
-  `ks/utf16-index-of` -> `utf16-index-of`. The real consumer route needs no
-  such thing -- `amu compile --source-path <repo>/lang/compat` resolves the
-  `(:require [kotoba.string :as ks])` for real, measured 2026-09-08 -- but
-  this repository has no linker to call, so the two modules join one
-  compilation unit here."
-  [alias forms]
-  (walk/postwalk
-   (fn [node]
-     (if (and (symbol? node) (= (str alias) (namespace node)))
-       (symbol (name node))
-       node))
-   forms))
-
-(defn- defined-name [form]
-  (when (and (seq? form) (contains? #{'defn 'defn-} (first form)))
-    (second form)))
-
-(defn- drop-shared-definitions
-  "One compilation unit cannot define a name twice, and both modules define
-  the private `code-point-width` -- the same three comparisons, because the
-  UTF-8 width of a code point is a property of the code point and neither
-  module can import the other's privates.
-
-  Dropping the duplicate silently would hide a real divergence, so this
-  RETURNS the dropped forms alongside and the test below asserts they were
-  identical to the ones kept. If someone edits one copy, that assertion goes
-  red rather than this link quietly choosing a winner."
-  [kept-forms later-forms]
-  (let [kept (into {} (keep (fn [f] (when-let [n (defined-name f)] [n f])) kept-forms))]
-    (reduce (fn [acc f]
-              (let [n (defined-name f)]
-                (if (and n (contains? kept n))
-                  (update acc :dropped conj [(get kept n) f])
-                  (update acc :forms conj f))))
-            {:forms [] :dropped []}
-            later-forms)))
-
-(def ^:private linked
-  (delay
-    (let [ks (vec (body-forms (slurp kotoba-string-path)))
-          cs (unalias 'ks (body-forms (slurp clojure-string-path)))]
-      (drop-shared-definitions ks cs))))
-
+;; ONE module since the 2026-09-08 move. #653 linked two -- `index-of` was in
+;; `clojure.string` and wrapped `kotoba.string/utf16-index-of` across a
+;; `(:require ... :as ks)`, so this file joined both units, unaliased the `ks/`
+;; prefix the way a linker would, and dropped the `code-point-width` that both
+;; modules defined. The owner's decision the same day made `kotoba.string` the
+;; canonical library, so the wrapper and the scan are now in the SAME file:
+;; there is no prefix to unalias and no duplicate to drop. `clojure.string`
+;; forwards, and that forwarding is asserted in clojure_string_compat_test.
 (def ^:private lowered
   (delay
-    (let [{:keys [forms]} @linked
-          source (->> (concat (body-forms (slurp kotoba-string-path)) forms)
-                      (map pr-str)
-                      (str/join "\n"))]
-      (kir/lower (sema/analyze (str source "\n" harness))))))
+    (kir/lower
+     (sema/analyze (str (->> (body-forms (slurp kotoba-string-path))
+                             (map pr-str) (str/join "\n"))
+                        "\n" harness)))))
 
 (defn- call [function s value]
   (long (kir/execute @lowered function [s value] {:fuel 100000000})))
@@ -158,13 +119,20 @@
     (is (= 3 (str/last-index-of "a😀" "")))
     (is (= 3 (kotoba-last-index-of "a😀" "")))))
 
-(deftest the-duplicate-private-is-identical-in-both-modules
-  (testing "linking the two modules dropped only definitions that were the same"
-    (let [{:keys [dropped]} @linked]
-      (is (seq dropped) "code-point-width is defined in both modules")
-      (is (= #{'code-point-width} (set (map (comp second first) dropped)))
-          "only code-point-width may be shared; a new collision has to be looked at")
-      (doseq [[kept later] dropped]
-        (is (= kept later)
-            (str "the two modules' copies of " (second kept)
-                 " have diverged; this link would silently pick one"))))))
+(deftest the-duplicate-private-is-gone-rather-than-dropped-at-link-time
+  (testing "the merge removed the copy this test used to have to reconcile"
+    ;; #653 linked two modules that both defined `code-point-width`, dropped
+    ;; the later copy, and asserted the two were identical -- because a link
+    ;; that silently picks a winner is the defect. The 2026-09-08 move made
+    ;; that unnecessary rather than safe: there is one definition now, in the
+    ;; canonical module, and the shim defines no privates at all. Asserted,
+    ;; because "there is only one" is exactly the claim that quietly stops
+    ;; being true when someone adds a helper to the shim.
+    (let [defs (fn [path] (frequencies (map second (re-seq #"(?m)^\(defn-?\s+([^\s\[]+)"
+                                                          (slurp path)))))]
+      (is (= 1 (get (defs kotoba-string-path) "code-point-width"))
+          "the canonical module defines it exactly once")
+      (is (nil? (get (defs clojure-string-path) "code-point-width"))
+          "the shim must not grow a private copy of it"))
+    (is (empty? (re-seq #"(?m)^\(defn-\s" (slurp clojure-string-path)))
+        "the shim must hold forwarders only -- a private in there is an implementation, and there is supposed to be exactly one")))

@@ -18,16 +18,25 @@
             [kotoba.kir :as kir]
             [kotoba.sema :as sema]))
 
-(def ^:private module (slurp "lang/compat/clojure/string.kotoba"))
+;; The definitions moved to `kotoba.string` on 2026-09-08, when the owner made
+;; it the canonical guest string library. `clojure.string` is now a forwarding
+;; shim over it and `kotoba.text` an alias over it, so the BEHAVIOUR tests below
+;; run the canonical module and a separate test holds the two forwarders to it.
+(def ^:private module (slurp "lang/compat/kotoba/string.kotoba"))
+(def ^:private shim (slurp "lang/compat/clojure/string.kotoba"))
+(def ^:private alias-module (slurp "lang/compat/kotoba/text.kotoba"))
+;; `join` is in its own namespace because it needs a newer amu than the rest --
+;; see that file's header. It is source-concatenated here because the KIR
+;; reference interpreter this test runs on has no project linker.
+(def ^:private join-module (slurp "lang/compat/kotoba/string/join.kotoba"))
 
-;; Since 2026-09-08 this module carries `(:require [kotoba.string :as ks])`,
-;; because `index-of` wraps `kotoba.string/utf16-index-of` rather than
-;; repeating its scan. `amu compile --source-path <repo>/lang/compat` resolves
-;; that for real; this repository has no linker to call, so the two modules
-;; join one compilation unit here, exactly as kotoba_string_case_test does
-;; with its tables. `index-of` itself is asserted against clojure.string in
-;; clojure_string_option_index_test; what is asserted here is only that the
-;; module still LOWERS and that the eight older names still answer.
+;; #653 landed `index-of` / `last-index-of` in `clojure.string` on the same day,
+;; wrapping `kotoba.string/utf16-index-of` across a `(:require ... :as ks)`.
+;; The move brought them here, into the module that already held the scan, so
+;; the `ks/` prefix is gone and there is no second unit to join. `index-of`
+;; itself is asserted against clojure.string in clojure_string_option_index_test;
+;; what is asserted here is that the module still LOWERS and that the eight
+;; older names still answer.
 (def ^:private required-module (slurp "lang/compat/kotoba/string.kotoba"))
 
 ;; The module is a library: no `main`, so it is admitted through its exports.
@@ -61,38 +70,17 @@
 ;; The module's own reader drops its `ns` form, rather than a regex over the
 ;; text: a unit admits one namespace form, and the harness has to join the same
 ;; unit because this repository has no project linker to call.
-(defn- body-forms [source]
-  (remove #(and (seq? %) (= 'ns (first %))) (sema/read-forms source)))
-
-(defn- unalias
-  "What the project linker does to a qualified call, and only that:
-  `ks/utf16-index-of` -> `utf16-index-of`."
-  [alias forms]
-  (walk/postwalk
-   (fn [node]
-     (if (and (symbol? node) (= (str alias) (namespace node)))
-       (symbol (name node))
-       node))
-   forms))
-
-;; Both modules define the private `code-point-width` -- the same three
-;; comparisons, because the UTF-8 width of a code point is a property of the
-;; code point and neither module can import the other's privates. One unit
-;; cannot define a name twice, so the later copy is dropped; that the two are
-;; identical is asserted in clojure_string_option_index_test rather than
-;; assumed here.
-(defn- defined-name [form]
-  (when (and (seq? form) (contains? #{'defn 'defn-} (first form)))
-    (second form)))
+(defn- forms-of [source]
+  (->> (sema/read-forms source)
+       (remove #(and (seq? %) (= 'ns (first %))))
+       (map pr-str)
+       (str/join "\n")))
 
 (def ^:private lowered
   (delay
-    (let [required (vec (body-forms required-module))
-          taken (set (keep defined-name required))
-          own (remove #(contains? taken (defined-name %))
-                      (unalias 'ks (body-forms module)))
-          body (->> (concat required own) (map pr-str) (str/join "\n"))]
-      (kir/lower (sema/analyze (str body "\n" harness))))))
+    (kir/lower (sema/analyze (str (forms-of module) "\n"
+                                  (forms-of join-module) "\n"
+                                  harness)))))
 
 (defn- call [function s argument]
   (= 1 (long (kir/execute @lowered function [s argument]))))
@@ -128,38 +116,76 @@
     (is (true? (call 'inc? "hello" "")))
     (is (true? (str/includes? "hello" "")))))
 
-(deftest the-module-provides-exactly-what-it-claims
-  (testing "the contract and the source agree on the public names"
-    (let [contract (edn/read-string (slurp "lang/compat.edn"))
-          declared (get-in contract [:modules :clojure.string :provides])
-          public (set (map (comp symbol second)
-                           (re-seq #"(?m)^\(defn\s+([^\s\[]+)" module)))]
-      (is (= (set declared) public))))
-  (testing "and the absent ones are absent, with a reason each"
-    (let [contract (edn/read-string (slurp "lang/compat.edn"))
-          absent (get-in contract [:modules :clojure.string :absent])]
-      (is (seq absent))
-      (is (every? #(string? (:reason (val %))) absent))
-      (is (empty? (filter (set (keys absent))
-                          (map (comp symbol second)
-                               (re-seq #"(?m)^\(defn\s+([^\s\[]+)" module)))))))
-  (testing "and a name that LANDED is provided, not still listed absent"
-    ;; index-of and last-index-of moved out of :absent on 2026-09-08. A name
-    ;; can be in exactly one of the two, and the one it is in has to match the
-    ;; source -- otherwise the authority records a reason for an absence that
-    ;; is not an absence, which is the failure mode this whole file exists for.
-    (let [contract (edn/read-string (slurp "lang/compat.edn"))
-          cs (get-in contract [:modules :clojure.string])
-          landed (:landed cs)
-          public (set (map (comp symbol second)
-                           (re-seq #"(?m)^\(defn\s+([^\s\[]+)" module)))]
-      (is (seq landed))
-      (is (every? #(string? (:measured (val %))) landed)
-          "a landed name carries the date and the oracle it was measured against")
-      (is (empty? (clojure.set/intersection (set (keys landed)) (set (keys (:absent cs)))))
-          "a name cannot be both landed and absent")
-      (is (every? public (keys landed))
-          "every landed name has to actually be in the source"))))
+(defn- public-names [source]
+  (set (map (comp symbol second) (re-seq #"(?m)^\(defn\s+([^\s\[]+)" source))))
+
+(deftest the-modules-provide-exactly-what-they-claim
+  (let [contract (edn/read-string (slurp "lang/compat.edn"))]
+    (testing "kotoba.string is the canonical module and its source matches"
+      (is (= (get-in contract [:modules :kotoba.string :provides])
+             (public-names module))))
+    (testing "kotoba.string.join is its own module"
+      (is (= #{'join} (public-names join-module)))
+      (is (= #{'join} (get-in contract [:modules :kotoba.string.join :provides]))))
+    (testing "clojure.string is a shim, and its surface is what the contract records"
+      (is (= (get-in contract [:modules :clojure.string :provides])
+             (public-names shim))))
+    (testing "kotoba.text is an alias, and its surface is what the contract records"
+      (is (= (get-in contract [:modules :kotoba.text :provides])
+             (public-names alias-module))))
+    (testing "and a name that LANDED is provided, not still listed absent"
+      ;; index-of and last-index-of moved out of :absent on 2026-09-08 (#653).
+      ;; A name is in exactly one of the two, and the one it is in has to match
+      ;; the source -- otherwise the authority records a reason for an absence
+      ;; that is not an absence. The entry lives on the CANONICAL module since
+      ;; the same-day move.
+      (let [ks (get-in contract [:modules :kotoba.string])
+            landed (:landed ks)]
+        (is (seq landed))
+        (is (every? #(string? (:measured (val %))) landed)
+            "a landed name carries the date and the oracle it was measured against")
+        (is (empty? (clojure.set/intersection (set (keys landed)) (set (keys (:absent ks)))))
+            "a name cannot be both landed and absent")
+        (is (every? (public-names module) (keys landed))
+            "every landed name has to actually be in the source")
+        (is (every? (public-names shim) (keys landed))
+            "and the shim has to forward it, or callers of clojure.string lose it")))
+    (testing "and the absent ones are absent, with a reason each"
+      (let [absent (get-in contract [:modules :kotoba.string :absent])]
+        (is (seq absent))
+        (is (every? #(string? (:reason (val %))) absent))
+        (is (empty? (filter (set (keys absent)) (public-names module))))))))
+
+;; The point of a shim is that there is ONE implementation. A shim that had
+;; drifted -- a forwarder that computed something itself, or forwarded to the
+;; wrong name -- would still compile and would still pass every behaviour test
+;; above, because those run the canonical module. So this reads the forwarders
+;; and asserts each is a single call to the same name in `kotoba.string`.
+(defn- forwarder-targets [source]
+  (into {} (map (fn [[_ name target]] [(symbol name) (symbol target)])
+                (re-seq #"(?m)^\(defn\s+([^\s\[]+)[^\n]*\n?[^(]*\(ks/([^\s)]+)" source))))
+
+(deftest the-shim-and-the-alias-forward-and-do-not-reimplement
+  (testing "clojure.string forwards every name it exports to the same name"
+    (let [targets (forwarder-targets shim)]
+      (is (= (public-names shim) (set (keys targets)))
+          "every public name must be a forwarder, not an implementation")
+      (is (every? (fn [[name target]] (= name target)) targets)
+          (str "a forwarder points somewhere else: " (pr-str targets)))))
+  (testing "kotoba.text forwards every name it exports to the same name"
+    (let [targets (forwarder-targets alias-module)]
+      (is (= (public-names alias-module) (set (keys targets))))
+      (is (every? (fn [[name target]] (= name target)) targets)
+          (str "a forwarder points somewhere else: " (pr-str targets)))))
+  (testing "the alias is the canonical surface, and the shim is a subset of it"
+    (is (= (public-names module) (public-names alias-module))
+        "kotoba.text and kotoba.string must have the SAME surface -- they are aliases")
+    (is (every? (public-names module) (public-names shim))
+        "every clojure.string name must exist in kotoba.string"))
+  (testing "and neither carries join, which lives apart because it needs a newer amu"
+    (is (not (contains? (public-names shim) 'join)))
+    (is (not (contains? (public-names alias-module) 'join)))
+    (is (not (contains? (public-names module) 'join)))))
 
 ;; ---------------------------------------------------------------------------
 ;; 2026-09-02: blank? / trim / triml / trimr / reverse.
@@ -292,9 +318,6 @@
   ;; caller gets an arity refusal at check time -- never a different answer.
   ;; Asserted, because "it would be refused" is exactly the kind of claim that
   ;; quietly stops being true.
-  (let [body (->> (sema/read-forms module)
-                  (remove #(and (seq? %) (= 'ns (first %))))
-                  (map pr-str)
-                  (str/join "\n"))
-        one-arg (str body "\n(defn main [] :string (join (typed-list-new [:list :string] \"a\")))")]
+  (let [one-arg (str (forms-of join-module)
+                     "\n(defn main [] :string (join (typed-list-new [:list :string] \"a\")))")]
     (is (thrown? Throwable (kir/lower (sema/analyze one-arg))))))

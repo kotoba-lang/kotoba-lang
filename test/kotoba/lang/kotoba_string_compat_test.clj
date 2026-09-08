@@ -118,39 +118,54 @@
         module-entry (get-in contract [:modules :kotoba.string])]
     (testing "lang/compat.edn carries the module"
       (is (= "lang/compat/kotoba/string.kotoba" (:path module-entry)))
-      (is (= #{'byte-index-of 'utf16-index-of 'utf16-last-index-of} (:provides module-entry))))
+      ;; Thirteen since 2026-09-08, when the owner made this the canonical guest
+      ;; string library and the eight clojure.string functions moved here. The
+      ;; three index functions are the ones this file measures; the other eight
+      ;; are measured in clojure_string_compat_test.clj against clojure.string
+      ;; itself, which is still their oracle.
+      (is (= #{'byte-index-of 'utf16-index-of 'utf16-last-index-of
+               'starts-with? 'ends-with? 'includes?
+               'blank? 'trim 'triml 'trimr 'reverse
+               'index-of 'last-index-of}
+             (:provides module-entry))))
     (testing "and the source's public names are exactly that"
       (let [public (set (map (comp symbol second)
                              (re-seq #"(?m)^\(defn\s+([^\s\[]+)" module)))]
         (is (= (:provides module-entry) public))))
     ;; UNTIL 2026-09-08 this asserted the opposite: that clojure.string/index-of
     ;; stayed ABSENT and pointed here, and that nothing named index-of was
-    ;; exported from the clojure.string module. The reason it was absent was
-    ;; never about strings -- it was that an option-valued return refused to
-    ;; lower to wasm32 for the whole project (:measured :option-return-on-wasm32)
-    ;; -- and re-measuring that at amu 9092ee34 found it false. So the names
-    ;; landed, and what is asserted here is the relationship that survives:
-    ;; these three still exist under their own names, and the Clojure names are
-    ;; built on them rather than beside them.
-    (testing "clojure.string/index-of landed, and is built on this module"
-      (let [cs (get-in contract [:modules :clojure.string])]
-        (is (nil? (get-in cs [:absent 'index-of]))
-            "index-of is no longer absent")
-        (is (contains? (:provides cs) 'index-of))
-        (is (contains? (:provides cs) 'last-index-of))
-        (is (contains? (:requires cs) 'kotoba.string)
-            "the Clojure names wrap this module's scan rather than repeating it")
-        (is (string? (get-in cs [:landed 'index-of :measured])))
-        (is (string? (get-in cs [:landed 'last-index-of :measured])))))
+    ;; exported. The reason it was absent was never about strings -- it was
+    ;; that an option-valued return refused to lower to wasm32 for the whole
+    ;; project (:measured :option-return-on-wasm32) -- and re-measuring that at
+    ;; amu 9092ee34 found it false (#653). The same day, the owner made this
+    ;; the canonical guest string library, so the two names live HERE and
+    ;; clojure.string forwards them.
+    (testing "index-of landed, on this module, and the shim forwards it"
+      (let [ks (get-in contract [:modules :kotoba.string])
+            cs (get-in contract [:modules :clojure.string])]
+        (is (nil? (get-in ks [:absent 'index-of])) "index-of is no longer absent")
+        (is (contains? (:provides ks) 'index-of))
+        (is (contains? (:provides ks) 'last-index-of))
+        (is (string? (get-in ks [:landed 'index-of :measured])))
+        (is (string? (get-in ks [:landed 'last-index-of :measured])))
+        (is (contains? (:provides cs) 'index-of)
+            "a caller of clojure.string must not lose it to the move")
+        (is (= 'kotoba.string (:forwards-to cs)))))
     (testing "and the -1 spelling stays, under a name that says so"
       ;; byte-index-of and utf16-index-of are NOT superseded: they answer a
       ;; number a caller can compose with, and byte-index-of answers the other
       ;; index entirely. What changed is that a caller who wants Clojure's nil
       ;; no longer has to read -1 and remember what it means.
-      (is (= #{'byte-index-of 'utf16-index-of 'utf16-last-index-of}
-             (:provides module-entry)))
+      (is (every? (:provides module-entry)
+                  '[byte-index-of utf16-index-of utf16-last-index-of]))
       (is (str/includes? (get-in contract [:modules :kotoba.string :hazards :minus-one-is-not-nil])
-                         "-1")))))
+                         "-1")))
+    (testing "and the shim's :absent map points at the canonical one rather than restating it"
+      (doseq [name '[lower-case upper-case capitalize
+                     split split-lines replace replace-first]]
+        (is (str/includes? (get-in contract [:modules :clojure.string :absent name :reason])
+                           ":modules :kotoba.string :absent")
+            (str name " must point at the canonical reason, not carry a second copy of it"))))))
 
 ;; ---------------------------------------------------------------------------
 ;; 2026-09-02: utf16-index-of / utf16-last-index-of. Here the oracle IS
