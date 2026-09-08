@@ -385,8 +385,10 @@
   [:div {:class "kot-morph" :id "kot-morph"
          :data-layers (str/join "|" (for [{:keys [label sha]} identity-layers]
                                       (str label " " sha)))}
+   [:p {:class "kot-caption kot-muted" :id "kot-hero-filename"}
+    [:code {:class "kot-code"} "hello.kotoba"]]
    [:div {:class "kot-morph-stage"}
-    [:pre {:class "kot-pre kot-morph-code"} (highlighted-kotoba-chars play-source)]
+    [:pre {:class "kot-pre kot-morph-code" :aria-labelledby "kot-hero-filename"} (highlighted-kotoba-chars play-source)]
     [:div {:class "kot-morph-out" :aria-hidden "true"}
      [:span {:class "kot-morph-label"}]
      [:span {:class "kot-morph-hex"}]]]
