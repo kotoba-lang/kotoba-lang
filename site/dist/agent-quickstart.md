@@ -76,3 +76,12 @@ The current public language/implementation binding is recorded separately at
 https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/generated/release.md.
 Do not assume that an installed formula version is bound to the current
 language profile without checking that release record.
+
+## Next: trusted state and service discovery
+
+- Kotobase graph CLI, authentication and MCP: https://kotobase.net/agent-quickstart.md
+- Kotoba Cloud capabilities and signed packages: https://kotoba.cloud/agent-quickstart.md
+- Machine documentation index: https://kotoba-lang.org/llms.txt
+
+Cloud hosted apply is not offered today. Follow each service's capability and
+authorization profile; compiling a local program grants no service access.
