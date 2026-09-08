@@ -1,7 +1,7 @@
 (ns kotoba.lang.q9-migration
   "Fail-closed authorization checks for the Q9 dependency-ordered migration."
   (:require [clojure.edn :as edn]
-            [clojure.set :as set]))
+            [kotoba.lang.coll :as coll]))
 
 (def q9-path "lang/q9-migration.edn")
 (def all-waves #{:wave-0 :wave-1 :wave-2 :wave-3 :wave-4 :wave-5})
@@ -34,10 +34,10 @@
         [{:code :q9/decision-slice-migration-enabled}])
       (for [disposition compiled-dispositions
             :let [required (set (get-in q9 [:dispositions disposition :requires]))]
-            :when (not (set/subset? required-build-evidence required))]
+            :when (not (coll/subset? required-build-evidence required))]
         {:code :q9/missing-whole-component-build-gate
          :disposition disposition
-         :missing (set/difference required-build-evidence required)})
+         :missing (coll/set-difference required-build-evidence required)})
       (when-not (and (= "kotoba compile <entry.kotoba|entry.cljk> --target <target> --output <artifact>"
                         (get-in build-contract [:public-cli :source-build]))
                      (= "kotoba rad build --project <repository> --profile release"
@@ -70,17 +70,17 @@
                               :implicit-jvm-fallback]))
         [{:code :q9/build-contract-weakened}])
       (for [wave authorized
-            :when (not (set/subset? (get dependencies wave #{}) authorized))]
+            :when (not (coll/subset? (get dependencies wave #{}) authorized))]
         {:code :q9/dependency-not-authorized :wave wave})
       (for [[wave {:keys [status evidence]}] waves
             :when (and (= :qualified status) (empty? evidence))]
         {:code :q9/qualified-without-evidence :wave wave})
       (when (and production-authorized? (not= all-waves completed))
         [{:code :q9/premature-production-authorization
-          :incomplete (set/difference all-waves completed)}])
+          :incomplete (coll/set-difference all-waves completed)}])
       (when (and (:fleet-complete decision) (not= all-waves completed))
         [{:code :q9/premature-fleet-completion
-          :incomplete (set/difference all-waves completed)}])
+          :incomplete (coll/set-difference all-waves completed)}])
       (when (and (= all-waves completed) (not production-authorized?))
         [{:code :q9/missing-explicit-production-authorization}])))))
 

@@ -1,8 +1,8 @@
 (ns kotoba.lang.package-registry
   "Compatibility registry kernel. Resolution is pure and always emits a
   complete CID-pinned lock entry; name@version is never executable input."
-  (:require [clojure.set :as set]
-            [clojure.string :as str]
+  (:require [kotoba.lang.coll :as coll]
+            [kotoba.lang.text :as str]
             [kotoba.lang.package-contract :as contract]))
 
 (def registry-version 1)
@@ -115,7 +115,7 @@
                             (not (:ok? resolved)) resolved
                             (not (vector? requested-caps))
                             {:ok? false :problems [{:problem :registry/capability-grant-invalid}]}
-                            (not (set/subset? (set requested-caps)
+                            (not (coll/subset? (set requested-caps)
                                               (set (:registry/capabilities (:record resolved)))))
                             {:ok? false
                              :problems [{:problem :registry/capability-grant-not-subset

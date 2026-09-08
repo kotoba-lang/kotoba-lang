@@ -4,7 +4,7 @@
   This namespace does not hash definitions. It consumes
   `kotoba.lang.code-identity`, which delegates to
   `kotoba.kir.definition-identity`. A CID here is identity, never authority."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotoba.lang.code-identity :as identity]))
 
 (def patch-version 1)

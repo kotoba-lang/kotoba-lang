@@ -8,8 +8,8 @@
   (:gen-class)
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.set :as set]
-            [clojure.string :as str]))
+            [kotoba.lang.coll :as coll]
+            [kotoba.lang.text :as str]))
 
 (def grammar-path "lang/guest-grammar.edn")
 (def surface-path "lang/surface-status.edn")
@@ -346,7 +346,7 @@
                           lazy-filter take drop count nth peek pop keys vals dissoc
                           match defdesugar loop recur assert doseq dotimes
                           defmulti defmethod}]
-    (set/union invariants feature-forms core-defaults arith-defaults
+    (coll/set-union invariants feature-forms core-defaults arith-defaults
                cmp-defaults pred-defaults sugar-defaults)))
 
 (defn admitted-source-forms
@@ -370,7 +370,7 @@
      :predicates pred
      :sugar sugar-forms
      :builtins builtins
-     :all (set/union core arith cmp pred sugar-forms)}))
+     :all (coll/set-union core arith cmp pred sugar-forms)}))
 
 (defn sugar-portability
   "For each sugar entry, whether it claims full portable backend coverage."
@@ -394,7 +394,7 @@
                                     (:primary-implementation v)
                                     #{}))
                       ;; compiler-implementation alone is not a portable claim
-                      full? (set/subset? portable-backends impl)]
+                      full? (coll/subset? portable-backends impl)]
                   (when (and full? (= :implemented-partial (:disposition v)))
                     [k {:implementation impl
                         :conformance (:conformance v)
@@ -535,13 +535,13 @@
    (let [authority-bytes (slurp (io/file grammar-path))
          forbidden (forbidden-heads grammar)
          inv-surface (invariant-surfaces surface)
-         missing-forbidden (set/difference forbidden inv-surface)
-         extra-invariant (set/difference inv-surface forbidden)
+         missing-forbidden (coll/set-difference forbidden inv-surface)
+         extra-invariant (coll/set-difference inv-surface forbidden)
          ;; The reverse of `missing-forbidden`, scoped to the only disposition
          ;; that claims fail-closed enforcement. See
          ;; `security-constraint-surfaces` for why `extra-invariant` itself
          ;; cannot carry this check.
-         security-not-forbidden (set/difference
+         security-not-forbidden (coll/set-difference
                                  (security-constraint-surfaces surface)
                                  forbidden)
          missing-adr (security-constraints-missing-adr surface)
@@ -551,7 +551,7 @@
          ;; Builtins and pure host helpers are grammar-classified by catalog
          ;; membership; they do not need surface-status feature rows.
          needs-surface (:all admitted)
-         unclassified (set/difference needs-surface classified)
+         unclassified (coll/set-difference needs-surface classified)
          portability (sugar-portability grammar)
          incomplete-portable
          (into []
@@ -562,7 +562,7 @@
                                       (contains? (conceptual-sugar-keys) k)))
                          (let [forms (or (seq (:forms meta)) #{})
                                form-ok? (or (empty? forms)
-                                            (set/subset? (set forms) classified))]
+                                            (coll/subset? (set forms) classified))]
                            (when-not form-ok?
                              {:sugar k :forms forms :reason :portable-forms-unclassified})))))
                portability)
@@ -593,12 +593,12 @@
                              {:feature k :conformance conf
                               :reason :conformance-key-not-in-shared-evidence})))))
                feature-claims)
-         unknown-impl-tokens (set/difference (implementation-tokens surface)
+         unknown-impl-tokens (coll/set-difference (implementation-tokens surface)
                                              (declared-implementation-vocabulary surface))
          unlinked-claims (portable-claims-without-conformance surface feature-claims)
          debt-register (conformance-link-debt-register surface)
-         unregistered-claims (set/difference unlinked-claims debt-register)
-         stale-debt (set/difference debt-register unlinked-claims)
+         unregistered-claims (coll/set-difference unlinked-claims debt-register)
+         stale-debt (coll/set-difference debt-register unlinked-claims)
          vendor (vendor-drift authority-bytes)
          pipeline-errors
          (cond-> []

@@ -4,7 +4,7 @@
   Replication is monotonic set union, not consensus. Hash-verified orphan
   blocks may be retained while parents are fetched; projection is available
   only after the local parent closure is complete."
-  (:require [clojure.set :as set]
+  (:require [kotoba.lang.coll :as coll]
             [kotoba.lang.capability-values :as capabilities]
             [kotoba.lang.code-identity :as identity]
             [kotoba.lang.incidence :as incidence]
@@ -108,8 +108,8 @@
         parents (into #{} (mapcat #(get-in % [:incidence/block
                                                :incidence/parents]))
                       (vals blocks))]
-    {:frontier (set/difference known parents)
-     :missing (set/difference parents known)}))
+    {:frontier (coll/set-difference known parents)
+     :missing (coll/set-difference parents known)}))
 
 (defn ingest
   "Atomically hash-check and union one bounded batch. Unknown parents are
@@ -161,8 +161,8 @@
                                  (assoc blocks cid entry))
                                before checked)
                 {:keys [frontier missing]} (indexes merged)
-                added (set/difference (set cids) (set (keys before)))
-                duplicate (set/intersection (set cids) (set (keys before)))]
+                added (coll/set-difference (set cids) (set (keys before)))
+                duplicate (coll/set-intersection (set cids) (set (keys before)))]
             {:ok? true
              :replica (assoc state :replica/blocks merged
                              :replica/frontier frontier
@@ -197,10 +197,10 @@
                  (positive-int? limit) (<= limit (:replica/max-batch state)))
     (throw (ex-info "remote inventory is invalid"
                     {:problem :replication/remote-inventory-invalid})))
-  (let [unknown (set/difference remote-cids
+  (let [unknown (coll/set-difference remote-cids
                                 (set (keys (:replica/blocks state))))
-        parents (sort (set/intersection unknown (:replica/missing state)))
-        others (sort (set/difference unknown (set parents)))]
+        parents (sort (coll/set-intersection unknown (:replica/missing state)))
+        others (sort (coll/set-difference unknown (set parents)))]
     (vec (take limit (concat parents others)))))
 
 (defn export-batch

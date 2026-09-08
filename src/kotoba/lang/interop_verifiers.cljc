@@ -7,7 +7,7 @@
   semantic checks that are easy to lose between libraries: DID verification
   relationship, proof purpose, cryptosuite allowlist, exact constitution
   binding, UCAN audience, attenuation, and normalized capability resources."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotoba.lang.capability-values :as capabilities]
             [kotoba.lang.code-identity :as identity]
             [kotoba.lang.incidence :as incidence])

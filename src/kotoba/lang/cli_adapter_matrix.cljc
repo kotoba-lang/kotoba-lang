@@ -1,7 +1,7 @@
 (ns kotoba.lang.cli-adapter-matrix
   "T9.1: validate lang/cli-adapter-matrix.edn against lang/cli.edn command ids."
   (:require [clojure.edn :as edn]
-            [clojure.set :as set]
+            [kotoba.lang.coll :as coll]
             #?(:clj [clojure.java.io :as io])))
 
 (def contract-path "lang/cli.edn")
@@ -25,8 +25,8 @@
        (conj! problems {:type :matrix-version}))
      (when-not (= cmd-ids matrix-ids)
        (conj! problems {:type :command-id-mismatch
-                        :only-contract (set/difference cmd-ids matrix-ids)
-                        :only-matrix (set/difference matrix-ids cmd-ids)}))
+                        :only-contract (coll/set-difference cmd-ids matrix-ids)
+                        :only-matrix (coll/set-difference matrix-ids cmd-ids)}))
      (doseq [[id entry] (:commands matrix)]
        (when-not (seq (:adapters entry))
          (conj! problems {:type :no-adapters :id id}))

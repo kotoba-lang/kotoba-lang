@@ -4,8 +4,8 @@
   resource set; a resource string is never authority by itself. The semantic
   contract is docs/lang/capability-values.md; conformance fixtures live under
   lang/capability-conformance/."
-  (:require [clojure.set :as set]
-            [clojure.string :as str]))
+  (:require [kotoba.lang.coll :as coll]
+            [kotoba.lang.text :as str]))
 
 ;; ---------------------------------------------------------------------------
 ;; Capability value shape
@@ -298,7 +298,7 @@
                        (map (fn [c]
                               (get effect-for-kind (:cap/kind c) (:cap/kind c))))
                        caps)
-        missing (set/difference required row)]
+        missing (coll/set-difference required row)]
     {:ok? (empty? missing) :missing missing}))
 
 ;; ---------------------------------------------------------------------------
@@ -325,14 +325,14 @@
   (cond
     (= :any a) b
     (= :any b) a
-    :else (set/intersection a b)))
+    :else (coll/set-intersection a b)))
 
 (defn- scope-overlaps?
   [a b]
   (cond
     (= :any a) (or (= :any b) (boolean (seq b)))
     (= :any b) (boolean (seq a))
-    :else (boolean (seq (set/intersection a b)))))
+    :else (boolean (seq (coll/set-intersection a b)))))
 
 (defn- scope->resource
   [scope]
@@ -411,7 +411,7 @@
                                       (let [s (->scope (:grant/resources g))]
                                         (if (or (= :any acc) (= :any s))
                                           :any
-                                          (set/union acc s))))
+                                          (coll/set-union acc s))))
                                     #{}
                                     live)
                 result-scope (-> requested-scope

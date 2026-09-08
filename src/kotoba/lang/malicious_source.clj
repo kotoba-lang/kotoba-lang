@@ -2,8 +2,8 @@
   "Normative malicious-source corpus evaluator. All limits are checked before
    EDN parsing so hostile input cannot allocate unbounded reader structures."
   (:require [clojure.edn :as edn]
-            [clojure.set :as set]
-            [clojure.string :as str]))
+            [kotoba.lang.coll :as coll]
+            [kotoba.lang.text :as str]))
 
 (def default-parser-limits
   {:max-source-bytes 65536 :max-nesting-depth 128 :max-token-chars 4096})
@@ -72,10 +72,10 @@
     (safe-read-decision source limits)
 
     :effect-laundering
-    (if (set/subset? (set observed-effects) (set declared-effects))
+    (if (coll/subset? (set observed-effects) (set declared-effects))
       {:allowed? true}
       {:allowed? false :code :effects/laundered
-       :undeclared (set/difference (set observed-effects)
+       :undeclared (coll/set-difference (set observed-effects)
                                    (set declared-effects))})
 
     :confused-deputy
@@ -112,6 +112,6 @@
                                           (:code result)))}))
                     (:cases manifest))
         covered (set (map :attack-class cases))]
-    {:valid? (and (set/subset? required covered)
+    {:valid? (and (coll/subset? required covered)
                   (every? :passed? cases))
      :required required :covered covered :cases cases}))

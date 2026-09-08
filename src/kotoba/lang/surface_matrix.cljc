@@ -3,7 +3,7 @@
 
   Pure loaders + markdown render + --check (byte-identical regenerated body)."
   (:require [clojure.edn :as edn]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             #?(:clj [clojure.java.io :as io])))
 
 (def surface-status-path "lang/surface-status.edn")

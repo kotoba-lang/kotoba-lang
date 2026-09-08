@@ -4,7 +4,7 @@
 
   These functions verify inert evidence. Only the existing trusted-admission
   layer may turn a successful result into an opaque runtime authority value."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [data-integrity.core :as di]
             [data-integrity.eddsa :as eddsa]
             [data-integrity.eddsa-rdfc :as rdfc]
