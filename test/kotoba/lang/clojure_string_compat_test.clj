@@ -11,12 +11,24 @@
   and until this file every one of them was checked by regex and sha256 -- that
   a name is present, not that it computes the right answer."
   (:require [clojure.edn :as edn]
+            [clojure.set]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
             [kotoba.kir :as kir]
             [kotoba.sema :as sema]))
 
 (def ^:private module (slurp "lang/compat/clojure/string.kotoba"))
+
+;; Since 2026-09-08 this module carries `(:require [kotoba.string :as ks])`,
+;; because `index-of` wraps `kotoba.string/utf16-index-of` rather than
+;; repeating its scan. `amu compile --source-path <repo>/lang/compat` resolves
+;; that for real; this repository has no linker to call, so the two modules
+;; join one compilation unit here, exactly as kotoba_string_case_test does
+;; with its tables. `index-of` itself is asserted against clojure.string in
+;; clojure_string_option_index_test; what is asserted here is only that the
+;; module still LOWERS and that the eight older names still answer.
+(def ^:private required-module (slurp "lang/compat/kotoba/string.kotoba"))
 
 ;; The module is a library: no `main`, so it is admitted through its exports.
 ;; Calling it needs an entry, and the entry has to reach every export or the
@@ -36,12 +48,37 @@
 ;; The module's own reader drops its `ns` form, rather than a regex over the
 ;; text: a unit admits one namespace form, and the harness has to join the same
 ;; unit because this repository has no project linker to call.
+(defn- body-forms [source]
+  (remove #(and (seq? %) (= 'ns (first %))) (sema/read-forms source)))
+
+(defn- unalias
+  "What the project linker does to a qualified call, and only that:
+  `ks/utf16-index-of` -> `utf16-index-of`."
+  [alias forms]
+  (walk/postwalk
+   (fn [node]
+     (if (and (symbol? node) (= (str alias) (namespace node)))
+       (symbol (name node))
+       node))
+   forms))
+
+;; Both modules define the private `code-point-width` -- the same three
+;; comparisons, because the UTF-8 width of a code point is a property of the
+;; code point and neither module can import the other's privates. One unit
+;; cannot define a name twice, so the later copy is dropped; that the two are
+;; identical is asserted in clojure_string_option_index_test rather than
+;; assumed here.
+(defn- defined-name [form]
+  (when (and (seq? form) (contains? #{'defn 'defn-} (first form)))
+    (second form)))
+
 (def ^:private lowered
   (delay
-    (let [body (->> (sema/read-forms module)
-                    (remove #(and (seq? %) (= 'ns (first %))))
-                    (map pr-str)
-                    (str/join "\n"))]
+    (let [required (vec (body-forms required-module))
+          taken (set (keep defined-name required))
+          own (remove #(contains? taken (defined-name %))
+                      (unalias 'ks (body-forms module)))
+          body (->> (concat required own) (map pr-str) (str/join "\n"))]
       (kir/lower (sema/analyze (str body "\n" harness))))))
 
 (defn- call [function s argument]
@@ -92,7 +129,24 @@
       (is (every? #(string? (:reason (val %))) absent))
       (is (empty? (filter (set (keys absent))
                           (map (comp symbol second)
-                               (re-seq #"(?m)^\(defn\s+([^\s\[]+)" module))))))))
+                               (re-seq #"(?m)^\(defn\s+([^\s\[]+)" module)))))))
+  (testing "and a name that LANDED is provided, not still listed absent"
+    ;; index-of and last-index-of moved out of :absent on 2026-09-08. A name
+    ;; can be in exactly one of the two, and the one it is in has to match the
+    ;; source -- otherwise the authority records a reason for an absence that
+    ;; is not an absence, which is the failure mode this whole file exists for.
+    (let [contract (edn/read-string (slurp "lang/compat.edn"))
+          cs (get-in contract [:modules :clojure.string])
+          landed (:landed cs)
+          public (set (map (comp symbol second)
+                           (re-seq #"(?m)^\(defn\s+([^\s\[]+)" module)))]
+      (is (seq landed))
+      (is (every? #(string? (:measured (val %))) landed)
+          "a landed name carries the date and the oracle it was measured against")
+      (is (empty? (clojure.set/intersection (set (keys landed)) (set (keys (:absent cs)))))
+          "a name cannot be both landed and absent")
+      (is (every? public (keys landed))
+          "every landed name has to actually be in the source"))))
 
 ;; ---------------------------------------------------------------------------
 ;; 2026-09-02: blank? / trim / triml / trimr / reverse.

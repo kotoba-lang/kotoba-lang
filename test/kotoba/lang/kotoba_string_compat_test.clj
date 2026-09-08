@@ -123,20 +123,34 @@
       (let [public (set (map (comp symbol second)
                              (re-seq #"(?m)^\(defn\s+([^\s\[]+)" module)))]
         (is (= (:provides module-entry) public))))
-    (testing "clojure.string/index-of stays absent, and points here -- at both halves"
-      (let [absent (get-in contract [:modules :clojure.string :absent 'index-of])]
-        (is (string? (:reason absent)))
-        (is (= #{'kotoba.string/byte-index-of 'kotoba.string/utf16-index-of} (:instead absent)))
-        (is (str/includes? (:reason absent) "option")
-            "the reason on record is the nil half, not the index half, which is answered")))
-    (testing "and last-index-of points at its utf16 counterpart"
-      (is (= 'kotoba.string/utf16-last-index-of
-             (get-in contract [:modules :clojure.string :absent 'last-index-of :instead]))))
-    (testing "nothing named index-of is exported from the clojure.string module"
-      (let [clojure-module (slurp "lang/compat/clojure/string.kotoba")]
-        (is (empty? (filter #{"index-of"}
-                            (map second (re-seq #"(?m)^\(defn\s+([^\s\[]+)"
-                                                clojure-module)))))))))
+    ;; UNTIL 2026-09-08 this asserted the opposite: that clojure.string/index-of
+    ;; stayed ABSENT and pointed here, and that nothing named index-of was
+    ;; exported from the clojure.string module. The reason it was absent was
+    ;; never about strings -- it was that an option-valued return refused to
+    ;; lower to wasm32 for the whole project (:measured :option-return-on-wasm32)
+    ;; -- and re-measuring that at amu 9092ee34 found it false. So the names
+    ;; landed, and what is asserted here is the relationship that survives:
+    ;; these three still exist under their own names, and the Clojure names are
+    ;; built on them rather than beside them.
+    (testing "clojure.string/index-of landed, and is built on this module"
+      (let [cs (get-in contract [:modules :clojure.string])]
+        (is (nil? (get-in cs [:absent 'index-of]))
+            "index-of is no longer absent")
+        (is (contains? (:provides cs) 'index-of))
+        (is (contains? (:provides cs) 'last-index-of))
+        (is (contains? (:requires cs) 'kotoba.string)
+            "the Clojure names wrap this module's scan rather than repeating it")
+        (is (string? (get-in cs [:landed 'index-of :measured])))
+        (is (string? (get-in cs [:landed 'last-index-of :measured])))))
+    (testing "and the -1 spelling stays, under a name that says so"
+      ;; byte-index-of and utf16-index-of are NOT superseded: they answer a
+      ;; number a caller can compose with, and byte-index-of answers the other
+      ;; index entirely. What changed is that a caller who wants Clojure's nil
+      ;; no longer has to read -1 and remember what it means.
+      (is (= #{'byte-index-of 'utf16-index-of 'utf16-last-index-of}
+             (:provides module-entry)))
+      (is (str/includes? (get-in contract [:modules :kotoba.string :hazards :minus-one-is-not-nil])
+                         "-1")))))
 
 ;; ---------------------------------------------------------------------------
 ;; 2026-09-02: utf16-index-of / utf16-last-index-of. Here the oracle IS
