@@ -197,3 +197,127 @@ gates it hits are mechanical — an `:export` clause, a folded constant, dropped
   `amu package-ios` / `extract-native` are where that thread starts.
 - **The 137 files are one day's classpath**, at the pins recorded in
   `lang/selfhost-distance.edn`. Not a stable denominator.
+
+## The trust half of the native flow is not JVM-free
+
+Measured 2026-09-08 by putting refusing stubs for `java`, `javac`, `clojure`
+and `clj` first on `PATH` with `JAVA_HOME=/nonexistent`, and running each step
+of the documented native flow:
+
+| step | JVM-free |
+|---|---|
+| `amu module-lock` (source → CID blocks) | **yes** |
+| `amu compile --module-lock --blocks --target aarch64-macos` | **yes** |
+| `amu extract-native` | **yes** |
+| `amu keygen` | no — `REFUSED: clojure was invoked` |
+| `amu sign` | no |
+| `amu verify` | no |
+| `amu measure-runtime` (builds the `kotoba-loader` Mach-O) | no |
+| `amu run` (verify signature, trust, runtime, then execute) | no |
+
+So a native artifact can be **produced** without a JVM and cannot be
+**signed, verified, measured or run** without one. The JVM-free story stops
+exactly where the artifact becomes trustworthy.
+
+The only JVM-free way to execute one today is `amu extract-native` plus
+invoking `kexe_loader` by hand with the symbol's offset — which is how the
+`42` above was obtained, and which **bypasses the signature, the trust set and
+the runtime measurement entirely**. That is a demonstration, not a way to run
+software.
+
+### There are two signing surfaces, and one of them is already portable
+
+`bin/amu` routes `sign-output-set` and `verify-output-set` to nbb, and
+`src/kotoba/compiler/nbb/output_attestation.cljs` signs with `node:crypto`
+Ed25519 — no JVM anywhere. The kexe flow instead goes through
+`kotoba-verifier/src/kotoba/verifier/signing.clj`, 171 lines of
+`java.security` `KeyFactory`/`Signature` and `java.util.Base64`, which is
+`.clj` and therefore JVM-only.
+
+Same algorithm, same purpose, two implementations, one portable. That is the
+shape `lang/definition-patch.edn` already names for the hasher
+(`:parallel-hasher {:status :second-implementation-to-be-migrated}`), and it
+is worth naming here for the signer too.
+
+### The next rung, and what would make it real
+
+Port `kotoba.verifier.signing` to `.cljc` — `java.security` under `:clj`,
+`node:crypto` under `:cljs` — and add the four kexe trust commands to
+`bin/amu`'s nbb-eligible list.
+
+The check that would make it landable is a **cross-host parity test**, not a
+green suite: a key generated on one host verifies on the other, in both
+directions, and a signature made on one host is accepted by the other. Signing
+code that has only ever been run one way is signing code whose portability
+nobody has measured — and this document's own ladder exists because the
+JVM-free claim had never been run against a `PATH` with no `java` on it.
+
+## The order the hosts can leave in
+
+Knowing that the trust half needs a JVM is not a work order. A namespace
+cannot be ported before the namespaces it requires are, so "what first" is a
+topological sort over the require graph, restricted to the host-bound nodes.
+`scripts/measure-host-port-order.cljs` computes it; `lang/host-port-order.edn`
+is the result.
+
+**Two hosts leave, not one.** `node:crypto` is not a smaller problem than
+`java.security` — it is the same problem with a different owner, and
+Kotoba-only means neither. Four escape kinds are read off the source:
+`:clj-only` (a `.clj` with no `.cljc`/`.cljs` twin), `:java-interop`,
+`:node-require`, `:js-interop`.
+
+From the three roots of the native trust flow — `kotoba.verifier.signing`,
+`kotoba.compiler.cli`, `kotoba.compiler.nbb.output-attestation` — measured
+2026-09-08: **100 namespaces reachable, 52 host-bound, 8 waves and one cycle.**
+
+| wave | namespaces |
+|---:|---|
+| 0 | `cbor.core`, `json.core`, `compiler.atomic-output`, `bounded-edn`, `coverage`, `ipld-adl-source`, `kotoba-reader`, `project-files`, `component.admission`, `component.wit`, `gmir`, `hir`, `kir.cljs-i64`, `kir.descriptor`, `native.interrupt-abi`, `script`, `wasm.tools` |
+| 1 | `artifact.core`, `capability-names`, `kir.value`, `mir`, `wasm.typed` |
+| 2 | `backend.evm`, `nbb.output-attestation`, `kir.decimal`, `kir.xml`, `native.elf64`, `native.machine-ir`, `wasm.core` |
+| 3 | `component.core`, `kir`, `native.aarch64`, `native.x86-64` |
+| 4 | `compiler.frontend`, `reference-runtime`, `component.artifact`, `verifier` |
+| 5 | `backend.cljs`, `ios-aot`, `verifier.signing` |
+| 6 | `coverage-evidence`, `receipt`, `release` |
+| **cycle** | `cli`, `core`, `cache`, `definition-identity`, `module-lock`, `provenance`, `test-profile`, `kir.definition-identity`, `multiformats.core` |
+
+Two things to read from it.
+
+**Wave 0 is the only face that can be started.** Everything after it waits on
+what it requires. It is what can begin, not what is easy.
+
+**The tail is a cycle, and nine namespaces sit in it.** `cli`, `core`,
+`cache`, `definition-identity`, `module-lock`, `provenance`, `test-profile`,
+`kir.definition-identity` and `multiformats.core` require each other, so no
+one of them comes out alone. Whether to break the cycle or move all nine at
+once is a design decision; it is not an ordering question, and the sort
+cannot answer it.
+
+`kotoba.artifact.core` carries `:java-interop`, `:node-require` **and**
+`:js-interop` at once — the case where removing the JVM leaves Node behind,
+and which only counts as one item of work once the target is Kotoba-only.
+
+## The `.kotoba` files in this closure are not Kotoba
+
+The compiler's own classpath carries **82 `.kotoba` files**. Measured
+2026-09-08:
+
+| | count |
+|---|---:|
+| carry a **double extension** — `X.cljc.kotoba`, `X.clj.kotoba`, `X.cljs.kotoba` | **71** |
+| plain `.kotoba` | 11 |
+| of those 11, read by the Kotoba reader | 5 |
+| **admitted by `amu check`, out of all 82** | **0** |
+
+The double extension is the finding, and it needs no interpretation: the file
+is the Clojure source with `.kotoba` appended. `ed25519/core.cljc.kotoba`
+opens `;; ed25519.core — pure-Clojure Ed25519 …` and the reader refuses it.
+
+`lang/q9-migration.edn` sets `:bulk-extension-rename-forbidden true`. These
+71 files are what that rule exists to prevent, and they are inside the
+compiler's own dependency closure.
+
+The consequence for measurement is the point: **any progress metric that
+counts `.kotoba` files would score these 71 as done.** The only honest counter
+is one that compiles them, which is why both files in this directory report a
+gate that executes rather than a file that exists.
