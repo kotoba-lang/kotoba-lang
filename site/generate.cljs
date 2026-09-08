@@ -1320,13 +1320,13 @@
     ;; The program comes first. Before any claim about the language, the page
     ;; shows one and lets it resolve into its own hashes — which is the claim.
     (hero-code)
-    [:p {:class "kot-eyebrow"} "A language AI agents can use, not abuse"]
-    (dds/heading 1 "AI writes freely. Kotoba draws the boundary." {:size "48"})
+    [:p {:class "kot-eyebrow"} "SAFE + FAST · BUILT FOR AI-GENERATED SOFTWARE"]
+    (dds/heading 1 "Safe code. Built for machine speed." {:size "48"})
     [:p {:class "kot-lead"}
-     "Kotoba is an intuitive, declarative, security-first language and computing stack for AI agents—and for humans who vibe-code with them. Post-quantum cryptography is the admission floor for every new cryptographic boundary, not an optional mode."]
+     "Kotoba is a Lisp-shaped language designed for safe, ultra-fast AI-generated software. Inspectable programs, explicit capabilities, and content-addressed artifacts connect compiler checks to controlled execution."]
     (speed-panel)
     [:blockquote {:class "kot-quote"}
-     [:strong "Existing software adds security around the program. Kotoba makes security a property of the whole computation."]]
+     [:strong "When AI generates, builds, tests, and regenerates code continuously, build latency becomes infrastructure throughput."]]
     [:div {:class "kot-actions"}
      (dds/button "See how it works" {:href "#architecture" :size "lg"})
      (dds/button "Start with Kotoba" {:href "#start" :type :outline :size "lg"})
@@ -1433,7 +1433,7 @@
           (dds/heading 3 "Less language, harder boundary" {:size "24"})
           [:p "No ambient interop, runtime code loading, unrestricted mutation, guest-defined macros, or unbounded concurrency in the admitted component surface."]))
    [:blockquote {:class "kot-quote"}
-    [:strong "A language AI agents can use, not abuse."]
+    [:strong "SAFE + FAST · BUILT FOR AI-GENERATED SOFTWARE."]
     [:p "This is a confinement direction, not an 'unhackable' claim. The compiler, verifier, runtime, providers, policy roots, key custody, and OS isolation remain in the trusted computing base."]]))
 
 (defn defaults-section []
@@ -1780,7 +1780,7 @@
 
 (defn blog-cloud-section []
   (dds/section
-   {:id "cloud" :title "From language boundary to separately governed services"}
+   {:id "cloud" :title "Safe code. Trusted state. Controlled execution."}
    (dds/grid
     {:min "18rem"}
     (card (dds/chip-label "BLOG")
@@ -1788,12 +1788,12 @@
           [:p "Read short engineering notes that connect product claims to measurements, authority files, and remaining gates."]
           [:a {:class "kot-link" :href "./blog/"} "Read the Kotoba blog"])
     (card (dds/chip-label "KOTOBA CLOUD")
-          (dds/heading 3 "Identity and deploy control" {:size "24"})
-          [:p "The operational entrance for Passkey identity and CLI topology discovery. It carries admitted boundaries forward without replacing compiler or host enforcement."]
+          (dds/heading 3 "Controlled execution" {:size "24"})
+          [:p "Kotoba Cloud connects identity and deploy control to the execution environment. Discovery is live; hosted apply is not yet offered. Compute remains provided by separately governed services."]
           (external-link "https://kotoba.cloud/" "Open Kotoba Cloud"))
     (card (dds/chip-label "KOTOBASE")
-          (dds/heading 3 "Storage and receipt plane" {:size "24"})
-          [:p "Content-addressed artifacts, durable state, execution receipts, identity-bound access, and federation surfaces."]
+          (dds/heading 3 "Trusted graph state" {:size "24"})
+          [:p "Kotobase is the content-addressed graph database for AI state and knowledge: explicit relationships, identifiable history, and scoped access."]
           (external-link "https://kotobase.net/" "Open Kotobase"))
     (card (dds/chip-label "MURAKUMO")
           (dds/heading 3 "Compute and inference plane" {:size "24"})
@@ -2742,7 +2742,7 @@
          legal-label (if ja? "運営情報" "Operator")]
      [:footer {:class "kot-footer"}
       (dds/container
-       [:p [:strong "Kotoba"] " — AI writes freely. Kotoba draws the boundary."]
+       [:p [:strong "Kotoba"] " — Safe code. Built for machine speed."]
        [:p {:class "kot-caption kot-muted"}
         operator " " contact-label (mail-link) ". " sales]
        [:p {:class "kot-caption kot-muted"}
@@ -3209,14 +3209,14 @@
     [:meta {:property "og:image" :content (str site-origin "/kotoba-og-card.png")}]
     [:meta {:property "og:image:width" :content "1200"}]
     [:meta {:property "og:image:height" :content "630"}]
-    [:meta {:property "og:image:alt" :content "AI writes freely. Kotoba draws the boundary."}]
+    [:meta {:property "og:image:alt" :content "Safe code. Built for machine speed."}]
     [:meta {:name "twitter:card" :content "summary_large_image"}]
     [:meta {:name "twitter:image" :content (str site-origin "/kotoba-og-card.png")}])))
 
 (def html
   (page/->page
-   {:title "Kotoba — post-quantum-by-default computing for AI agents"
-    :description "AI writes freely. Kotoba draws the boundary — a security-first, post-quantum-by-default language and computing stack."
+   {:title "Kotoba — safe, fast language for AI-generated software"
+    :description "Kotoba is designed for safe, ultra-fast AI-generated software. Explore the language, reproducible benchmarks, and the Kotobase and Kotoba Cloud stack."
     :lang "en"
     :css dds-css
     :dark? true
@@ -3226,8 +3226,8 @@
                 [:script theme-js]
                 [:script menu-js]
                 [:script chart-anim-head-js]
-                (og-head "/" "Kotoba — post-quantum-by-default computing for AI agents"
-                         "AI writes freely. Kotoba draws the boundary — a security-first, post-quantum-by-default language and computing stack."))}
+                (og-head "/" "Kotoba — safe, fast language for AI-generated software"
+                         "Kotoba is designed for safe, ultra-fast AI-generated software. Explore the language, reproducible benchmarks, and the Kotobase and Kotoba Cloud stack."))}
    (view)))
 
 (def blog-html
