@@ -81,7 +81,7 @@
     (let [thrown (try
                    (verifier {:constitution constitution :evidence evidence})
                    nil
-                   (catch clojure.lang.ExceptionInfo e e))]
+                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
       (is (= expected (:problem (ex-data thrown)))))))
 
 (deftest trusted-boundary-sanitizes-did-vc-adapter-failures
@@ -91,7 +91,7 @@
                  (trusted/verify-organization-binding!
                   verifier constitution binding-evidence)
                  nil
-                 (catch clojure.lang.ExceptionInfo e e))]
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
     (is (= :trusted/organization-binding-verification-failed
            (:problem (ex-data thrown))))))
 
@@ -130,6 +130,6 @@
           thrown (try
                    (trusted/verify-delegation! verifier :evidence)
                    nil
-                   (catch clojure.lang.ExceptionInfo e e))]
+                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
       (is (= :trusted/delegation-verification-failed
              (:problem (ex-data thrown)))))))

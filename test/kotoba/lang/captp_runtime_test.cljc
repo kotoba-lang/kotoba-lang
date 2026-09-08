@@ -6,6 +6,43 @@
             [kotoba.lang.incidence-ocapn :as ocapn]
             [kotoba.lang.trusted-admission :as trusted]))
 
+;; Ported from captp_runtime_test.clj 2026-09-08: this namespace exercises the
+;; CapTP/Syrup WIRE codec -- the exact seam where `parse-natural`'s nil/2^53
+;; defect (PR #650) hid clean on the JVM. `kotoba.lang.captp-runtime` already
+;; carries dual-host bytes (`byte-array-value?` branches on `[B` vs
+;; `js/Uint8Array`), so the only work here is giving the TEST fixtures the
+;; same dual-host bytes instead of raw JVM interop.
+;;
+;; One genuine host difference surfaced while porting, unrelated to any bug in
+;; the source: `(seq (js/Uint8Array. ...))` produces a value that fails
+;; `sequential?` under nbb 1.4.208, so `(= (seq a) (seq b))` for two
+;; content-identical typed arrays returns false even though the arrays match
+;; byte-for-byte. `(vec ...)` does not have this problem on either host (a
+;; JVM `byte[]` and a `js/Uint8Array` both `vec` into an ordinary persistent
+;; vector), so byte-array equality below is asserted with `vec`, not `seq`.
+;; This is a `seq`-on-typed-array quirk of the host, not a codec defect --
+;; `captp/syrup-decode` itself already round-trips correctly on both hosts.
+
+(defn- bytes-of
+  [ints]
+  #?(:clj (byte-array ints)
+     :cljs (js/Uint8Array. (clj->js ints))))
+
+(defn- bytes-like?
+  [x]
+  #?(:clj (bytes? x)
+     :cljs (instance? js/Uint8Array x)))
+
+(defn- bytes->str
+  [bs]
+  #?(:clj (String. ^bytes bs "UTF-8")
+     :cljs (.decode (js/TextDecoder.) bs)))
+
+(defn- str->bytes
+  [s]
+  #?(:clj (.getBytes ^String s "UTF-8")
+     :cljs (.encode (js/TextEncoder.) s)))
+
 (def peer (incidence/typed-ref :did "did:key:z6Mkcaptppeer"))
 (def transcript
   (incidence/incidence :session/transcript {:session/peer #{peer}} {}))
@@ -13,15 +50,15 @@
 
 (def local-start
   (captp/start-session-frame
-   (byte-array [1 2 3])
+   (bytes-of [1 2 3])
    (captp/syrup-record 'ocapn-peer ['tcp "local.example" false])
-   (byte-array [4 5 6])))
+   (bytes-of [4 5 6])))
 
 (def remote-start
   (captp/start-session-frame
-   (byte-array [7 8 9])
+   (bytes-of [7 8 9])
    (captp/syrup-record 'ocapn-peer ['tcp "remote.example" false])
-   (byte-array [10 11 12])))
+   (bytes-of [10 11 12])))
 
 (def verified-session
   {:session/valid? true
@@ -69,21 +106,22 @@
                  #{3 1 2}
                  {"name" "Alice" "age" 30}
                  (captp/syrup-record 'desc:export [7])
-                 (byte-array [0 127 -1])]]
+                 (bytes-of [0 127 -1])]]
     (let [encoded (captp/syrup-encode value)
           decoded (captp/syrup-decode encoded)]
-      (if (bytes? value)
-        (is (= (seq value) (seq decoded)))
+      (if (bytes-like? value)
+        (is (= (vec value) (vec decoded)))
         (is (= value decoded)))
-      (is (= (seq encoded) (seq (captp/syrup-encode decoded))))))
+      (is (= (vec encoded) (vec (captp/syrup-encode decoded))))))
   (is (= "<11'desc:export7+>"
-         (String. (captp/syrup-encode
-                   (captp/syrup-record 'desc:export [7])) "UTF-8")))
+         (bytes->str (captp/syrup-encode
+                      (captp/syrup-record 'desc:export [7])))))
   (is (= :captp/syrup-noncanonical
          (:problem
           (ex-data
-           (try (captp/syrup-decode (.getBytes "01+" "UTF-8"))
-                (catch clojure.lang.ExceptionInfo e e)))))))
+           (try (captp/syrup-decode (str->bytes "01+"))
+                (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                       e e)))))))
 
 (deftest session-opens-only-after-start-session-verification
   (let [{:keys [runtime written]} (open-runtime)
@@ -105,7 +143,8 @@
                    :registry (captp/session-registry)
                    :write-frame! (fn [_] (swap! called inc))})
                  nil
-                 (catch clojure.lang.ExceptionInfo e e))]
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                        e e))]
     (is (= :captp/start-session-invalid (:problem (ex-data thrown))))
     (is (zero? @called))))
 
@@ -115,7 +154,8 @@
         thrown (try
                  (open-runtime nil registry)
                  nil
-                 (catch clojure.lang.ExceptionInfo e e))]
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                        e e))]
     (is (= :captp/duplicate-peer-session (:problem (ex-data thrown))))
     (captp/abort! first-runtime "replace session")
     (is (captp/runtime? (:runtime (open-runtime nil registry))))))
@@ -200,7 +240,8 @@
                    :ocapn/answer-position false
                    :ocapn/resolve-me false})
                  nil
-                 (catch clojure.lang.ExceptionInfo e e))]
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                        e e))]
     (is (:ocapn/accepted? result))
     (is (= 'op:abort (:syrup/record (last @written))))
     (is (= :aborted (:captp/phase (captp/runtime-description runtime))))
@@ -252,7 +293,8 @@
                    :ocapn/args ['query]
                    :ocapn/result :settled})
                  nil
-                 (catch clojure.lang.ExceptionInfo e e))]
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                        e e))]
     (is (= {:problem :captp/exchange-failed} (ex-data thrown)))
     (is (not (re-find #"secret|token" (str (ex-data thrown)))))
     (is (= :aborted (:captp/phase (captp/runtime-description runtime))))
@@ -286,9 +328,10 @@
 (deftest malformed-inbound-frame-aborts-the-session
   (let [{:keys [runtime]} (open-runtime)
         thrown (try
-                 (captp/receive! runtime (.getBytes "01+" "UTF-8"))
+                 (captp/receive! runtime (str->bytes "01+"))
                  nil
-                 (catch clojure.lang.ExceptionInfo e e))]
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                        e e))]
     (is (= :captp/syrup-noncanonical (:problem (ex-data thrown))))
     (is (= :aborted (:captp/phase (captp/runtime-description runtime))))))
 
@@ -312,7 +355,9 @@
     (is (= :captp/answer-unresolved
            (:problem (ex-data
                       (try (captp/settlement! car)
-                           (catch clojure.lang.ExceptionInfo e e))))))
+                           (catch #?(:clj clojure.lang.ExceptionInfo
+                                     :cljs ExceptionInfo)
+                                  e e))))))
     (captp/listen! car)
     (let [listen (last @written)
           [_ listener] (:syrup/fields listen)
@@ -339,15 +384,21 @@
     (is (= :captp/listener-already-attached
            (:problem (ex-data
                       (try (captp/listen! pending)
-                           (catch clojure.lang.ExceptionInfo e e))))))
+                           (catch #?(:clj clojure.lang.ExceptionInfo
+                                     :cljs ExceptionInfo)
+                                  e e))))))
     (is (= :captp/index-invalid
            (:problem (ex-data
                       (try (captp/index-answer! pending -1)
-                           (catch clojure.lang.ExceptionInfo e e))))))
+                           (catch #?(:clj clojure.lang.ExceptionInfo
+                                     :cljs ExceptionInfo)
+                                  e e))))))
     (is (= :captp/deferred-request-invalid
            (:problem (ex-data
                       (try (captp/deferred-request! runtime {:ocapn/args []})
-                           (catch clojure.lang.ExceptionInfo e e))))))))
+                           (catch #?(:clj clojure.lang.ExceptionInfo
+                                     :cljs ExceptionInfo)
+                                  e e))))))))
 
 (deftest locators-remain-inert-until-a-live-resolver-admits-a-target
   (let [locator (captp/parse-locator
@@ -370,9 +421,11 @@
             (ex-data
              (try (captp/resolve-sturdyref! nil
                                             "ocapn://alice.tcp/s/calendar")
-                  (catch clojure.lang.ExceptionInfo e e))))))
+                  (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                         e e))))))
     (is (= :captp/locator-component-invalid
            (:problem
             (ex-data
              (try (captp/parse-locator "ocapn://alice.tcp/s/bad%XX")
-                  (catch clojure.lang.ExceptionInfo e e))))))))
+                  (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                         e e))))))))

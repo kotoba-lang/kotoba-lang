@@ -84,7 +84,7 @@
     (is (= 'append-incidence (first (:ocapn/args message))))
     (is (= dataspace sent-dataspace))
     (is (= (incidence/incidence-cid presence) sent-cid))
-    (is (= (seq (incidence/canonical-bytes presence)) (seq sent-bytes)))
+    (is (= (vec (incidence/canonical-bytes presence)) (vec sent-bytes)))
     (is (false? (:ocapn/answer-position message)))
     (is (false? (:ocapn/resolve-me message)))
     (is (= "message-1" (get-in result [:results 0 :ocapn/message-id])))
@@ -103,7 +103,7 @@
            (:problem
             (ex-data
              (try (ocapn/append-provider data)
-                  (catch clojure.lang.ExceptionInfo e e))))))))
+                  (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))))))))
 
 (deftest connection-setup-is-closed-and-requires-authenticated-session
   (doseq [[expected opts]
@@ -120,7 +120,7 @@
            (:problem
             (ex-data
              (try (ocapn/connected-reference opts)
-                  (catch clojure.lang.ExceptionInfo e e))))))))
+                  (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))))))))
 
 (deftest reference-description-does-not-expose-send-authority
   (let [reference (ocapn/connected-reference (connection identity))
@@ -156,7 +156,7 @@
                            :capability (capabilities/make-cap port/append-kind
                                                               dataspace)})
                  nil
-                 (catch clojure.lang.ExceptionInfo e e))]
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
     (is (= :ocapn/incidence-invalid (:problem (ex-data thrown))))
     (is (empty? @messages))))
 
@@ -168,7 +168,7 @@
                  (port/publish-emissions!
                   (publish-opts (ocapn/append-provider reference) record!))
                  nil
-                 (catch clojure.lang.ExceptionInfo e e))]
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
     (is (= :ocapn/send-unconfirmed (:problem (ex-data thrown))))
     (is (= 1 (count (entries))))
     (is (= :error (:receipt/outcome (first (entries)))))
@@ -200,7 +200,7 @@
         thrown (try
                  (incidence/incidence-cid invalid-block)
                  nil
-                 (catch clojure.lang.ExceptionInfo e e))]
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
     (is (= :dataspace/append-durable (:problem (ex-data thrown))))))
 
 (deftest request-capable-reference-returns-a-bound-durable-receipt
@@ -236,7 +236,7 @@
         thrown (try
                  (ocapn/durable-append-provider reference)
                  nil
-                 (catch clojure.lang.ExceptionInfo e e))]
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
     (is (false? (ocapn/request-capable-reference? reference)))
     (is (= :ocapn/request-not-supported (:problem (ex-data thrown))))))
 
@@ -258,7 +258,7 @@
                       (publish-opts (ocapn/durable-append-provider reference)
                                     record!))
                      nil
-                     (catch clojure.lang.ExceptionInfo e e))]
+                     (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
         (is (= expected (:problem (ex-data thrown))))
         (is (= :error (:receipt/outcome (first (entries)))))))))
 
@@ -273,6 +273,6 @@
                   (publish-opts (ocapn/durable-append-provider reference)
                                 record!))
                  nil
-                 (catch clojure.lang.ExceptionInfo e e))]
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
     (is (= {:problem :ocapn/remote-broken} (ex-data thrown)))
     (is (not (re-find #"secret" (str (ex-data thrown)))))))

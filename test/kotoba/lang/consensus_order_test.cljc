@@ -5,9 +5,27 @@
             [inga.kotoba-order :as inga-order]
             [kotoba.lang.consensus-order :as order]
             [kotoba.lang.incidence :as incidence]
-            [kotoba.lang.incidence-replication :as replication])
-  (:import [java.nio.charset StandardCharsets]
-           [java.security MessageDigest]))
+            [kotoba.lang.incidence-replication :as replication]
+            [sha2.core :as sha2]))
+
+;; Ported from consensus_order_test.clj 2026-09-08. The only JVM-specific
+;; piece was a local `sha256-hex` test helper built on `java.security.
+;; MessageDigest` -- not on `kotoba.lang.consensus-order` itself, which never
+;; imports Java and was already dual-host. `sha2.core` (a portable `.cljc`
+;; FIPS 180-4 implementation already reachable on this classpath, verified
+;; here against the standard SHA-256("abc") test vector) replaces it on BOTH
+;; hosts, so the hash function used to sign and verify votes is now identical
+;; on JVM and nbb rather than merely equivalent -- no reader-conditional
+;; branch is needed for the digest itself, only for turning a string into the
+;; unsigned-byte vector `sha2.core/sha256` expects.
+
+(defn- utf8-byte-vec
+  [s]
+  #?(:clj (vec (map #(bit-and % 0xff) (.getBytes ^String s "UTF-8")))
+     :cljs (vec (js/Array.from (.encode (js/TextEncoder.) s)))))
+
+(defn- sha256-hex [text]
+  (sha2/sha256-hex (utf8-byte-vec text)))
 
 (def dataspace "dataspace:consensus/example")
 (def org-ref (incidence/typed-ref :did "did:key:z6Mkconsensusorg"))
@@ -51,7 +69,8 @@
             (ex-data
              (try (order/apply-commit
                    (replication/replica dataspace) commit [child root])
-                  (catch clojure.lang.ExceptionInfo e e))))))
+                  (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                         e e))))))
     (is (= 2 (:consensus/height
               (order/commit-description
                (order/admit-commit!
@@ -65,14 +84,17 @@
            (:problem
             (ex-data
              (try (order/admit-commit! registry (constantly true) first-envelope)
-                  (catch clojure.lang.ExceptionInfo e e))))))
+                  (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                         e e))))))
     (order/admit-commit! registry verifier first-envelope)
     (doseq [bad [(envelope 1 nil "inga:fork" [child])
                  (envelope 3 "inga:block:1" "inga:skip" [child])
                  (envelope 2 "inga:wrong-parent" "inga:fork2" [child])]]
       (let [err (ex-data
                   (try (order/admit-commit! registry verifier bad)
-                       (catch clojure.lang.ExceptionInfo e e)))]
+                       (catch #?(:clj clojure.lang.ExceptionInfo
+                                 :cljs ExceptionInfo)
+                              e e)))]
         (is (= :consensus/order-invalid (:problem err)))
         ;; fork evidence must be recoverable at the detection seam so a
         ;; later warrant (path b / ADR-2809060410) can sign it
@@ -80,11 +102,6 @@
         (is (= (:consensus/parent-id bad) (get-in err [:consensus/candidate :parent-id])))
         (is (= 2 (:consensus/observed-height err)))
         (is (= "inga:block:1" (:consensus/expected-parent err)))))))
-
-(defn- sha256-hex [text]
-  (let [digest (.digest (MessageDigest/getInstance "SHA-256")
-                        (.getBytes text StandardCharsets/UTF_8))]
-    (apply str (map #(format "%02x" (bit-and 0xff %)) digest))))
 
 (deftest admitted-inga-qc-is-a-live-consensus-verifier
   (let [witnesses #{"validator-a" "validator-b" "validator-c" "validator-d"}
@@ -127,4 +144,5 @@
                (order/admit-commit!
                 (order/commit-registry) verify!
                 (assoc envelope :consensus/dataspace "dataspace:evil"))
-               (catch clojure.lang.ExceptionInfo e e))))))))
+               (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                      e e))))))))

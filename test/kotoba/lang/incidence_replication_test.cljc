@@ -119,11 +119,11 @@
              (:problem
               (ex-data
                (try (replication/certify-readback-quorum [info info] 2)
-                    (catch clojure.lang.ExceptionInfo e e))))))
+                    (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))))))
       (let [same-peer [(admitted-readback (first peers) "d1")
                        (admitted-readback (first peers) "d2")]]
         (is (= :replication/duplicate-peer
                (:problem
                 (ex-data
                  (try (replication/certify-readback-quorum same-peer 2)
-                      (catch clojure.lang.ExceptionInfo e e))))))))))
+                      (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))))))))))

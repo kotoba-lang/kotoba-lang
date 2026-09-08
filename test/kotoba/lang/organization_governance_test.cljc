@@ -83,7 +83,7 @@
              (:problem
               (ex-data
                (try (governance/enact policy p [a1] [admitted])
-                    (catch clojure.lang.ExceptionInfo e e)))))))
+                    (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e)))))))
     (testing "serialized admission lookalike"
       (is (= :governance/approval-not-verified
              (:problem
@@ -92,7 +92,7 @@
                      policy p [a1 a1]
                      [(governance/approval-description admitted)
                       (governance/approval-description admitted)])
-                    (catch clojure.lang.ExceptionInfo e e)))))))
+                    (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e)))))))
     (testing "verifier result cannot substitute a governor"
       (let [bad (try
                   (governance/verify-approval!
@@ -102,7 +102,7 @@
                             :approval/governor (last governors)))
                    policy p a1 :proof)
                   nil
-                  (catch clojure.lang.ExceptionInfo e e))]
+                  (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
         (is (= :governance/governor-mismatch
                (:problem (ex-data bad))))))))
 
@@ -144,5 +144,5 @@
                  (governance/verify-approval!
                   (constantly {}) policy malicious a :proof)
                  nil
-                 (catch clojure.lang.ExceptionInfo e e))]
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
     (is (= :governance/action-not-allowed (:problem (ex-data thrown))))))

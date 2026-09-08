@@ -9,8 +9,13 @@
             [status-list.core :as status-list]
             [ucan.core :as ucan]))
 
+(defn- bytes-of
+  [ints]
+  #?(:clj (byte-array (map unchecked-byte ints))
+     :cljs (js/Uint8Array. (clj->js ints))))
+
 (defn seed [offset]
-  (byte-array (map unchecked-byte (range offset (+ offset 32)))))
+  (bytes-of (range offset (+ offset 32))))
 
 (def org-seed (seed 0))
 (def peer-seed (seed 32))
@@ -55,7 +60,8 @@
 
 (defn problem [f]
   (try (f) nil
-       (catch clojure.lang.ExceptionInfo e (:problem (ex-data e)))))
+       (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+              e (:problem (ex-data e)))))
 
 (deftest real-data-integrity-proof-mints-only-an-opaque-binding
   (let [secured (issue org-seed org-did (org-credential))
@@ -96,7 +102,7 @@
 (defn delegation-payload [iss aud command nonce]
   {"iss" iss "aud" aud "sub" org-did "cmd" command
    "pol" [["==" ".resource" resource]]
-   "nonce" (byte-array (repeat 12 (unchecked-byte nonce)))
+   "nonce" (bytes-of (repeat 12 nonce))
    "exp" 2000})
 
 (deftest real-ucan-chain-mints-only-attenuated-kotoba-grants

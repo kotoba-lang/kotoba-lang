@@ -116,7 +116,7 @@
                      (trusted/verify-organization-binding!
                       (constantly changed) constitution :evidence)
                      nil
-                     (catch clojure.lang.ExceptionInfo e e))]
+                     (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
         (is (= problem (:problem (ex-data thrown))))))))
 
 (deftest readback-verifier-requires-an-authorized-authenticated-peer
@@ -130,7 +130,7 @@
                    :verify! proof-result
                    :max-age-ms 500})
                  nil
-                 (catch clojure.lang.ExceptionInfo e e))]
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
     (is (= :readback/peer-not-authorized (:problem (ex-data thrown))))))
 
 (deftest signed-readback-is-one-shot-fresh-and-opaque
@@ -150,7 +150,7 @@
                    (readback/verify-envelope!
                     v (request) challenge (envelope v challenge 900 1100))
                    nil
-                   (catch clojure.lang.ExceptionInfo e e))]
+                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
       (is (= :readback/challenge-not-pending
              (:problem (ex-data replay)))))))
 
@@ -162,7 +162,7 @@
                    (readback/verify-envelope!
                     v (request) challenge (envelope v challenge 400 800))
                    nil
-                   (catch clojure.lang.ExceptionInfo e e))]
+                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
       (is (= :readback/not-fresh (:problem (ex-data thrown))))))
   (testing "wrong challenge"
     (let [v (verifier)
@@ -171,7 +171,7 @@
                    (readback/verify-envelope!
                     v (request) challenge (envelope v "other" 900 1100))
                    nil
-                   (catch clojure.lang.ExceptionInfo e e))]
+                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
       (is (= :readback/challenge-mismatch (:problem (ex-data thrown))))))
   (testing "wrong readback CID"
     (let [v (verifier)
@@ -183,7 +183,7 @@
           thrown (try
                    (readback/verify-envelope! v (request) challenge tampered)
                    nil
-                   (catch clojure.lang.ExceptionInfo e e))]
+                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
       (is (= :readback/statement-address-invalid
              (:problem (ex-data thrown))))))
   (doseq [[label problem overrides]
@@ -203,7 +203,7 @@
                       {:receipt/statement statement
                        :receipt/proof {:proofValue "signature"}})
                      nil
-                     (catch clojure.lang.ExceptionInfo e e))]
+                     (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
         (is (= problem (:problem (ex-data thrown)))))))
   (testing "invalid host-verified signature"
     (let [v (verifier (constantly "signature-challenge")
@@ -213,7 +213,7 @@
                    (readback/verify-envelope!
                     v (request) challenge (envelope v challenge 900 1100))
                    nil
-                   (catch clojure.lang.ExceptionInfo e e))]
+                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
       (is (= :readback/signature-invalid (:problem (ex-data thrown)))))))
 
 (deftest duplicate-challenges-are-rejected-before-network-use
@@ -222,7 +222,7 @@
     (let [thrown (try
                    (readback/issue-challenge! v (request))
                    nil
-                   (catch clojure.lang.ExceptionInfo e e))]
+                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
       (is (= :readback/challenge-duplicate (:problem (ex-data thrown)))))))
 
 (deftest ocapn-provider-returns-an-opaque-verified-readback

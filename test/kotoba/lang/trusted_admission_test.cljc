@@ -38,7 +38,7 @@
     (is (try
           (edn/read-string (pr-str value))
           false
-          (catch Exception _ true)))))
+          (catch #?(:clj Exception :cljs :default) _ true)))))
 
 (deftest delegation-verification-fails-closed-and-sanitizes-errors
   (doseq [[expected verify!]
@@ -49,7 +49,7 @@
     (let [thrown (try
                    (trusted/verify-delegation! verify! :evidence)
                    nil
-                   (catch clojure.lang.ExceptionInfo e e))]
+                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
       (is (= expected (:problem (ex-data thrown))))
       (is (not (re-find #"secret" (str (ex-data thrown))))))))
 
@@ -95,7 +95,7 @@
     (let [thrown (try
                    (trusted/authenticate-session! verify! :evidence transport)
                    nil
-                   (catch clojure.lang.ExceptionInfo e e))]
+                   (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
       (is (= expected (:problem (ex-data thrown))))
       (is (not (re-find #"secret" (str (ex-data thrown))))))))
 
@@ -105,7 +105,7 @@
         thrown (try
                  (trusted/session-request! session :call)
                  nil
-                 (catch clojure.lang.ExceptionInfo e e))]
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e e))]
     (is (trusted/authenticated-session? session))
     (is (false? (trusted/request-capable-session? session)))
     (is (= :trusted/session-request-not-supported
