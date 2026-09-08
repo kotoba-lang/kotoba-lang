@@ -32,11 +32,13 @@
         (:copies auth/registry)))
 
 (defn- deferred-vendor-drift?
-  "A `:vendor/drift` error every one of whose mismatching paths is recorded in
-  `deferred-vendor-copies`. Any other error, and any drift naming a path that
-  is not recorded, is still an error."
+  "A vendor-copy error every one of whose mismatching paths is recorded in
+  `deferred-vendor-copies`. Guest-grammar drift is `:vendor/drift`; other
+  authorities (catalog, host-parity, pipeline) are `:vendor/authority-drift`.
+  Any other error, and any drift naming a path that is not recorded, is
+  still an error."
   [e]
-  (and (= :vendor/drift (:code e))
+  (and (contains? #{:vendor/drift :vendor/authority-drift} (:code e))
        (every? #(or (not= :byte-mismatch (:error %))
                     (contains? deferred-vendor-copies (:path %)))
                (:paths e))))
@@ -189,7 +191,8 @@
       (when (and (.isFile (io/file path))
                  (not (contains? deferred-vendor-copies path)))
         (is (= authority (slurp path)) path)))
-    (let [vendor-errors (filter #(= :vendor/drift (:code %)) (:errors result))
+    (let [vendor-errors (filter #(contains? #{:vendor/drift :vendor/authority-drift} (:code %))
+                                (:errors result))
           paths (mapcat :paths vendor-errors)
           mismatches (filter #(= :byte-mismatch (:error %)) paths)
           unexplained (remove #(contains? deferred-vendor-copies (:path %)) mismatches)
