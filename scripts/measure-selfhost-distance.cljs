@@ -1,0 +1,142 @@
+;; measure-selfhost-distance.cljs — how far is the Kotoba compiler from being
+;; built by Kotoba?
+;;
+;; `lang/q9-inventory.edn` counts `.cljc` paths: 25,919 of them, every one
+;; `:classification-status :unclassified`. Counting paths is not measuring
+;; distance. Nothing in this repository has ever asked the compiler whether it
+;; can read, link and admit its own source, and "we plan to migrate" and "we
+;; are N files away" are different claims.
+;;
+;; This asks. It walks the compiler's own classpath, runs the two gates that
+;; come before any semantics — the reader, then `amu check` — and writes a
+;; histogram of what each file was refused for.
+;;
+;;   nbb measure-selfhost-distance.cljs --amu <amu checkout> --output <file.edn>
+;;
+;; The result is a scoreboard, not a verdict: a file that reads is not a file
+;; that compiles, and a file that `check` admits is not a file whose semantics
+;; survive. The gates are reported separately for that reason.
+;;
+;; nbb rather than kbb: this drives `amu` as a subprocess and walks a
+;; filesystem, and the fs/process capability kits are not qualified on any
+;; backend yet (`amu/resources/kotoba/lang/capability-kits/`). It is a
+;; migration candidate under the kbb-first rule, not an exception to it.
+
+(ns measure-selfhost-distance
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            ["node:child_process" :as cp]
+            [clojure.string :as str]
+            [cljs.pprint]
+            [kotoba.compiler.kotoba-reader :as kr]))
+
+(def ^:private argv (vec (js->clj js/process.argv)))
+
+(defn- opt [flag]
+  (let [i (.indexOf (into-array argv) flag)]
+    (when (nat-int? i) (nth argv (inc i) nil))))
+
+(def ^:private amu-root (or (opt "--amu") (throw (js/Error. "--amu <checkout> is required"))))
+(def ^:private output (or (opt "--output") (throw (js/Error. "--output <file.edn> is required"))))
+(def ^:private nbb-cli (path/join amu-root "node_modules" "nbb" "cli.js"))
+(def ^:private entry (path/join amu-root "src" "kotoba" "compiler" "nbb" "wasm_cli.cljs"))
+
+(defn- classpath []
+  (let [r (cp/spawnSync js/process.execPath
+                        (clj->js [nbb-cli "--classpath" (path/join amu-root "src")
+                                  (path/join amu-root "scripts" "print-classpath.cljs") amu-root])
+                        #js {:encoding "utf8" :cwd amu-root :maxBuffer (* 16 1024 1024)})]
+    (when-not (zero? (.-status r))
+      (throw (js/Error. (str "classpath resolution failed: " (.-stderr r)))))
+    (->> (str/split (.-stdout r) #"\r?\n") (remove str/blank?) vec)))
+
+(defn- cljc-under [dir]
+  (if (fs/existsSync dir)
+    (mapcat (fn [e]
+              (let [p (path/join dir e)]
+                (cond (.isDirectory (fs/statSync p)) (cljc-under p)
+                      (str/ends-with? e ".cljc") [p]
+                      :else [])))
+            (fs/readdirSync dir))
+    []))
+
+(def ^:private dispatch-forms
+  {:set #"#\{" :reader-conditional #"#\?\(" :splicing-reader-conditional #"#\?@"
+   :regex "#\"" :discard #"#_" :js-literal #"#js" :var-quote #"#'"})
+
+(defn- read-gate [source]
+  (try (kr/read-forms source) {:gate :read :ok true}
+       (catch :default e {:gate :read :ok false :reason (str (.-message e))})))
+
+(defn- check-gate [cp-str file]
+  (let [r (cp/spawnSync js/process.execPath
+                        (clj->js ["--stack-size=4096" nbb-cli "--classpath" cp-str entry "check" file])
+                        #js {:encoding "utf8" :maxBuffer (* 32 1024 1024)})
+        out (str (.-stdout r) (.-stderr r))]
+    (if (zero? (.-status r))
+      {:gate :check :ok true}
+      {:gate :check :ok false
+       :reason (or (second (re-find #":code (:[^,}\s]+)" out))
+                   (second (re-find #":error (:[^,}\s]+)" out))
+                   :unclassified)
+       :message (second (re-find #":message \"([^\"]{0,120})" out))})))
+
+(defn- histogram [rows k]
+  (->> rows (remove :ok) (map k) frequencies (sort-by val >) (into [])))
+
+(let [cp-entries (classpath)
+      cp-str (str/join ":" (conj cp-entries (path/join amu-root "src")))
+      sources (->> (conj (filterv #(str/ends-with? % "/src") cp-entries)
+                         (path/join amu-root "src"))
+                   (mapcat cljc-under) sort vec)
+      _ (println "sources:" (count sources))
+      reads (mapv (fn [f] (assoc (read-gate (fs/readFileSync f "utf8")) :file f)) sources)
+      checks (mapv (fn [f] (assoc (check-gate cp-str f) :file f)) sources)
+      census (reduce (fn [acc [k re]]
+                       (assoc acc k (count (filterv (fn [f] (re-find (re-pattern re) (fs/readFileSync f "utf8")))
+                                                    sources))))
+                     {} dispatch-forms)
+      result {:kotoba.lang.selfhost/version 1
+              :measured-at (subs (.toISOString (js/Date.)) 0 10)
+              :plane :authored-input
+              :question "Can the Kotoba compiler read, link and admit its own SOURCE TEXT?"
+              :identity-authority "kotoba-lang/kotoba-lang lang/code-identity.edn"
+              :does-not-measure
+              ["Distance to self-hosting. Identity in this language is the
+                definition CID -- typed KIR, effect row, interface and direct
+                dependency CIDs -- and `:source-tree-cid` is `:not-implemented`
+                and proves `:authored-input` only. This file measures that
+                authored-input surface."
+               "The interchange unit. `lang/definition-patch.edn` sets it to
+                `:definition-cid-ops-and-name-mappings`, explicitly `:not`
+                `:source-file-copy` / `:source-tree-bytes` / `:source-tree-cid`."
+               "Whether a native binary can be produced without a source tree.
+                It already can: `amu module-lock` then `amu compile
+                --module-lock --blocks --target aarch64-macos --jvm-free`
+                builds from content-addressed blocks alone (measured
+                2026-09-08, artifact executed, answered 42)."]
+              :amu-commit (let [r (cp/spawnSync "git" (clj->js ["-C" amu-root "rev-parse" "HEAD"])
+                                                #js {:encoding "utf8"})]
+                            (str/trim (str (.-stdout r))))
+              :pins (into (sorted-map)
+                          (keep (fn [e]
+                                  (when-let [m (re-find #"/io\.github\.kotoba-lang/([^/]+)/([0-9a-f]{40})/" e)]
+                                    [(nth m 1) (nth m 2)]))
+                                cp-entries))
+              :source-count (count sources)
+              :line-count (reduce + (map (fn [f] (count (str/split (fs/readFileSync f "utf8") #"\n"))) sources))
+              :read-gate {:passed (count (filter :ok reads))
+                          :refused (count (remove :ok reads))
+                          :by-reason (histogram reads :reason)}
+              :check-gate {:passed (count (filter :ok checks))
+                           :refused (count (remove :ok checks))
+                           :by-reason (histogram checks :reason)}
+              :dispatch-census census
+              :not-established
+              ["A file that reads is not a file that compiles."
+               "A file that `check` admits is not a file whose semantics survive lowering."
+               "`check` is run per file. A file that declares (:require ...) is refused as needing a project; that refusal is this harness's single-file mode, not a language gap."]}]
+  (fs/writeFileSync output (with-out-str (cljs.pprint/pprint result)))
+  (println "read gate  :" (:passed (:read-gate result)) "/" (count sources))
+  (println "check gate :" (:passed (:check-gate result)) "/" (count sources))
+  (println "wrote" output))
