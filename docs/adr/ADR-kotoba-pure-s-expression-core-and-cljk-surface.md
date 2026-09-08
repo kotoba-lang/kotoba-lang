@@ -116,7 +116,7 @@ Kotoba adopts a **two-tier syntax and source specialization model**:
   (canonical pure S-expression core).
 
 
-## Addendum — measured state (2026-09-06, supersedes the 2026-09-05 addendum)
+## Addendum — measured state (2026-09-06, with the §3 result corrected 2026-09-08; supersedes the 2026-09-05 addendum)
 
 This addendum records where the pure S-expression core actually stands,
 measured, so the decision above is not read as an implementation claim.
@@ -149,21 +149,52 @@ executed under `runtime/browser-host.mjs`.
    -> identical :hir-sha256, identical :kir-sha256, identical wasm32 bytes
 ```
 
-**What they do not yet buy: identical Definition CIDs.** §3 of this ADR says
-both surfaces mint the same Definition CID for equivalent normalized
-semantics. Step 1 does not deliver that:
+**What they do buy: identical Definition CIDs. Measured 2026-09-08.** §3 of
+this ADR says both surfaces mint the same Definition CID for equivalent
+normalized semantics. They do. The 2026-09-06 reading of this pair did not
+measure that:
 
 ```
 pure  (app (ref inc1) (app (lam [x] (+ x 1)) n))
 twin  (inc1 (let [g (fn [x] (+ x 1))] (g n)))
    -> same wasm32 sha256 (fda4cc37…), both answer run(1) = 3
    -> DIFFERENT :hir-sha256 and :kir-sha256
+   -> IDENTICAL Definition CIDs, on all four definitions in the module
+      run  bafyreifbyisa5fsmdmzif276hbwvh4o7pepkqcewnhcv3brwuwtylz52yy
 ```
 
-The artifact matches because wasm carries no local names. The KIR differs
-because the synthetic binder introduced for the beta-redex is not the author's
-`g`. Identical CIDs need alpha-normalisation, which is step 2 below. **Do not
-read the matching wasm bytes as evidence for the CID claim.**
+`:hir-sha256` and `:kir-sha256` are not the Definition CID. They hash
+intermediate text, in which the synthetic binder introduced for the beta-redex
+is genuinely not the author's `g`; the identity renames binders to de Bruijn
+positions before hashing, which is exactly why it does not care. **The claim
+was about DefCIDs and the evidence was about two other hashes** — the failure
+mode this workspace names as reporting something other than the thing that was
+broken.
+
+Two more surface pairs agree, so pair A is not a coincidence of one shape:
+
+```
+(-> n inc1 inc1)          ≡ (app (ref inc1) (app (ref inc1) n))
+                            bafyreicjnack62w6ougceqtz5lqupmdvstchsxo7dkf2mxgkst5cva2rj4
+(cond (< n 0) 0 :else n)  ≡ (if (< n 0) 0 n)
+                            bafyreic5fnjazknv27xhovmzgwuaoaba7w32yidcvktqk2ypcnbkfyfwvu
+```
+
+The negative control moves: `(+ x 2)` in place of `(+ x 1)` gives
+`bafyreicn3hzig6…`, so agreement here is discriminating rather than a
+comparison that never ran.
+
+Measured on `amu` `origin/main` `473e84ab` through
+`bin/amu definition-cids --jvm-free`. **Not** on the shared checkout, which is
+156 commits behind and pins a `kotoba-sema` older than the heads — run there,
+the pure spelling returns `:subset-reject`, which reads exactly like the
+language refusing the form. **Do not read the matching wasm bytes as evidence
+for the CID claim** either; the wasm agrees for a weaker reason (it carries no
+local names at all).
+
+Three pairs are not a corpus. Destructuring, protocol dispatch, `match` and
+the `document` forms are unmeasured, and §3 is retired as *the recorded gap*,
+not proven in general.
 
 **All seven heads are admitted as of 2026-09-06.** The last three were held
 back by three claims — written in this addendum — that turned out, on
@@ -226,8 +257,12 @@ ADR-2607181900's readiness gate is clojure-shaped for that reason.
    `authority-claim-lowering-test`, whose `:test` pin now names a frontend
    that has them.
 2. Land the elaboration so `.cljk` and pure `.kotoba` mint identical
-   Definition CIDs for equivalent normalized semantics (this ADR §3). The
-   beta-redex measurement above is the concrete first gap.
+   Definition CIDs for equivalent normalized semantics (this ADR §3).
+   **The recorded gap is retired, 2026-09-08** — the beta-redex pair and two
+   others mint identical DefCIDs; see the measurement above. What remains is
+   a conformance corpus rather than a fix: pair each surface construct with
+   its canonical-core spelling, assert equal DefCIDs, and keep a negative
+   control in it.
 3. Only then flip `q9-migration.edn :kotoba-only` from an aspirational
    profile (requires `:q1-q8-profile`, not yet satisfied) to the enforced
    admission profile.
