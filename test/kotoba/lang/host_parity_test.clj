@@ -11,7 +11,8 @@
 (deftest availability-maps-no-to-capability-absent
   (is (= :available (hp/availability :sha256-hex :jvm)))
   (is (= :available (hp/availability :sha256-hex :browser)))
-  (is (= :capability-absent (hp/availability :llm-infer :browser)))
+  (is (= :available (hp/availability :llm-infer :browser))
+      "coop-or-inject counts as available for linkability")
   (is (= :available (hp/availability :llm-infer :jvm)))
   (is (= :available (hp/availability :llm-infer :node))
       "inject counts as available for linkability")
@@ -29,7 +30,7 @@
   (is (= :unknown-host (hp/availability :sha256-hex :fleet))))
 
 (deftest guard-host-import-denies-absent
-  (let [denied (hp/guard-host-import :llm-infer :browser)
+  (let [denied (hp/guard-host-import :kagi-sign :browser)
         ok (hp/guard-host-import :sha256-hex :browser)]
     (is (false? (:kotoba.host/ok? denied)))
     (is (= :host-absent (:kotoba.host/denied denied)))
@@ -49,7 +50,7 @@
   (let [ids (set (map :id (hp/conformance-cases)))]
     (doseq [id [:sign-all-available :verify-all-available
                 :kagi-sign-browser-absent :http-get-jvm-component-link-absent
-                :transport-connect-browser-absent :llm-infer-browser-absent
+                :transport-connect-browser-absent :llm-infer-browser-linkable
                 :scram-sha256-node-available :transport-connect-node-available
                 :pg-open-node-available]]
       (is (contains? ids id) (str id)))))
