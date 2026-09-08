@@ -2,7 +2,7 @@
   "T4.1: frozen stdlib public module list."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]])
   (:import (java.security MessageDigest)))
 

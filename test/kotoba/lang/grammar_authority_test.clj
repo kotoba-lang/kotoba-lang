@@ -1,7 +1,7 @@
 (ns kotoba.lang.grammar-authority-test
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.set :as set]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.java.io :as io]
             [kotoba.lang.grammar-authority :as auth]))
 

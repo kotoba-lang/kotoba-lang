@@ -15,7 +15,7 @@
   reason. Each also has to carry a `:kotoba.error/local-state-*` code."
   (:require [clojure.edn :as edn]
             [clojure.set :as set]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.kir :as kir]
             [kotoba.sema :as sema]))

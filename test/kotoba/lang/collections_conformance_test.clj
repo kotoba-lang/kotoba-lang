@@ -48,7 +48,7 @@
   manifest's `:runners`/`:deferred-runners` and checked by
   `kotoba.lang.conformance-matrix-test`, not papered over here."
   (:require [clojure.edn :as edn]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.kir :as kir]
             [kotoba.sema :as sema]))

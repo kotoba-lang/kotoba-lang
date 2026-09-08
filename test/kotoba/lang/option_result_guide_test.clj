@@ -1,6 +1,6 @@
 (ns kotoba.lang.option-result-guide-test
   "T4.3: option/result guide + golden structural checks."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [clojure.java.io :as io]))
 

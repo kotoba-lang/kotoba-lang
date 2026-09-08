@@ -1,6 +1,6 @@
 (ns kotoba.lang.version-policy-test
   (:require [clojure.edn :as edn]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is]]
             [kotoba.lang.version-policy :as version])
   (:import [java.time LocalDate]))

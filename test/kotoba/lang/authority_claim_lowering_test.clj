@@ -67,7 +67,7 @@
   frontend is right. Only the fallback -- the same answer the control gets --
   is absence. Conflating the two is how a sweep produces a green that means
   nothing."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.lang.authority-claims :as ac]
             [kotoba.sema :as sema]))

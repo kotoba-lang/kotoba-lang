@@ -25,7 +25,7 @@
   `avl-height-bound-holds` is the test that a broken `balance` fails."
   (:require [clojure.edn :as edn]
             [clojure.set :as set]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.kir :as kir]
             [kotoba.sema :as sema]))

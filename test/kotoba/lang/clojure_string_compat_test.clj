@@ -12,7 +12,7 @@
   a name is present, not that it computes the right answer."
   (:require [clojure.edn :as edn]
             [clojure.set]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [clojure.walk :as walk]
             [kotoba.kir :as kir]
@@ -313,7 +313,7 @@
           (str "index " out-of-range " must trap, as vector nth without a default does")))))
 
 (deftest join-s-one-argument-arity-is-refused-not-answered
-  ;; clojure.string/join also has a one-argument arity, (join coll), which
+  ;; str/join also has a one-argument arity, (join coll), which
   ;; concatenates with no separator. There is no multi-arity here, so the
   ;; caller gets an arity refusal at check time -- never a different answer.
   ;; Asserted, because "it would be refused" is exactly the kind of claim that

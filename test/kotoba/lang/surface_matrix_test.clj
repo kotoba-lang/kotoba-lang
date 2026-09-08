@@ -3,7 +3,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [kotoba.lang.surface-matrix :as sm]
             [clojure.java.io :as io]
-            [clojure.string :as str]))
+            [kotoba.lang.text :as str]))
 
 (deftest surface-status-valid
   (let [s (sm/load-surface-status)

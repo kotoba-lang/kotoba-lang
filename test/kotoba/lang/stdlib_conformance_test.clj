@@ -17,7 +17,7 @@
   and exit codes, in `lang/stdlib.edn` `:artifact-reachability`."
   (:require [clojure.edn :as edn]
             [clojure.set :as set]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [clojure.walk :as walk]
             [kotoba.compiler.frontend :as frontend]

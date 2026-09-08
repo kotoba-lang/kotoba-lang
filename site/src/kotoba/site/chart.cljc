@@ -42,7 +42,7 @@
   marks so the reveal has somewhere to travel from. With no JavaScript, a
   failed observer, or `prefers-reduced-motion: reduce`, the charts render
   complete rather than empty."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (defn- fmt
   "Fixed-point without trailing-zero noise, as a string."

@@ -14,7 +14,7 @@
   nearest-guess tag returns the same shape as one that is actually right, and
   the reader has no way to tell which they are looking at. Untagged has to be
   a visible outcome, not a silent fallback to the closest label."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (defn- compiled-domains [taxonomy]
   (for [d (:domains taxonomy)]
@@ -41,7 +41,7 @@
   word-boundary patterns — substring matching turns `os` into a hit on
   `kotobase`, `protocols` and `compose` alike (measured: 203 false hits)."
   [domains repo]
-  (let [hay (str/lower-case (str (:name repo) " " (:description repo)))]
+  (let [hay (str/lower (str (:name repo) " " (:description repo)))]
     (into [] (keep (fn [{:keys [id re]}]
                      (when (some #(re-find % hay) re) id))
                    domains))))

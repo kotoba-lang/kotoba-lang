@@ -3,7 +3,7 @@
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [clojure.pprint :as pprint]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba.compiler.core :as compiler]
             [kotoba.compiler.frontend :as frontend]
             [kotoba.runtime :as runtime]
