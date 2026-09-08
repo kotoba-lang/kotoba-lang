@@ -215,6 +215,11 @@
 (def package-registry-cid
   (let [digest (.digest (.update (crypto/createHash "sha256") package-registry-bytes))]
     (str "b" (base32-lower (concat [1 85 18 32] digest)))))
+(def play-source-cid
+  (let [digest (.digest (.update (crypto/createHash "sha256") (fs/readFileSync play-source-path)))]
+    (str "b" (base32-lower (concat [1 85 18 32] digest)))))
+(def play-source-ipfs-url (str "https://ipfs.kotobase.net/ipfs/" play-source-cid))
+
 (def syntax-dependency
   (first (filter #(= :syntax-highlighting (:id %)) (:build-time dependencies))))
 
@@ -386,7 +391,8 @@
          :data-layers (str/join "|" (for [{:keys [label sha]} identity-layers]
                                       (str label " " sha)))}
    [:p {:class "kot-caption kot-muted" :id "kot-hero-filename"}
-    [:code {:class "kot-code"} "hello.kotoba"]]
+    [:a {:href play-source-ipfs-url :title "View source on IPFS"}
+     [:code {:class "kot-code"} "hello.kotoba"]] " / IPFS"]
    [:div {:class "kot-morph-stage"}
     [:pre {:class "kot-pre kot-morph-code" :aria-labelledby "kot-hero-filename"} (highlighted-kotoba-chars play-source)]
     [:div {:class "kot-morph-out" :aria-hidden "true"}
@@ -3326,7 +3332,9 @@
     ;; preserves blocks removed from the source and can keep an obsolete
     ;; publication address reachable after a registry rotation.
     (fs/rmSync ipfs-out #js {:recursive true :force true})
-    (fs/cpSync package-ipfs-path ipfs-out #js {:recursive true}))
+    (fs/cpSync package-ipfs-path ipfs-out #js {:recursive true})
+    ;; Same raw CID as the publicly pinned IPFS source; no gateway trust needed.
+    (fs/writeFileSync (path/join ipfs-out play-source-cid) (fs/readFileSync play-source-path)))
   ;; Public machine contract for the external-trust discovery documents served
   ;; by Kotobase, Murakumo and Itonami. identity owns the schema and policy;
   ;; this authority site is only their deterministic HTTPS projection.
