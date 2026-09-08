@@ -11,8 +11,10 @@
   and until this file every one of them was checked by regex and sha256 -- that
   a name is present, not that it computes the right answer."
   (:require [clojure.edn :as edn]
+            [clojure.set]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
             [kotoba.kir :as kir]
             [kotoba.sema :as sema]))
 
@@ -27,6 +29,15 @@
 ;; see that file's header. It is source-concatenated here because the KIR
 ;; reference interpreter this test runs on has no project linker.
 (def ^:private join-module (slurp "lang/compat/kotoba/string/join.kotoba"))
+
+;; #653 landed `index-of` / `last-index-of` in `clojure.string` on the same day,
+;; wrapping `kotoba.string/utf16-index-of` across a `(:require ... :as ks)`.
+;; The move brought them here, into the module that already held the scan, so
+;; the `ks/` prefix is gone and there is no second unit to join. `index-of`
+;; itself is asserted against clojure.string in clojure_string_option_index_test;
+;; what is asserted here is that the module still LOWERS and that the eight
+;; older names still answer.
+(def ^:private required-module (slurp "lang/compat/kotoba/string.kotoba"))
 
 ;; The module is a library: no `main`, so it is admitted through its exports.
 ;; Calling it needs an entry, and the entry has to reach every export or the
@@ -122,6 +133,23 @@
     (testing "kotoba.text is an alias, and its surface is what the contract records"
       (is (= (get-in contract [:modules :kotoba.text :provides])
              (public-names alias-module))))
+    (testing "and a name that LANDED is provided, not still listed absent"
+      ;; index-of and last-index-of moved out of :absent on 2026-09-08 (#653).
+      ;; A name is in exactly one of the two, and the one it is in has to match
+      ;; the source -- otherwise the authority records a reason for an absence
+      ;; that is not an absence. The entry lives on the CANONICAL module since
+      ;; the same-day move.
+      (let [ks (get-in contract [:modules :kotoba.string])
+            landed (:landed ks)]
+        (is (seq landed))
+        (is (every? #(string? (:measured (val %))) landed)
+            "a landed name carries the date and the oracle it was measured against")
+        (is (empty? (clojure.set/intersection (set (keys landed)) (set (keys (:absent ks)))))
+            "a name cannot be both landed and absent")
+        (is (every? (public-names module) (keys landed))
+            "every landed name has to actually be in the source")
+        (is (every? (public-names shim) (keys landed))
+            "and the shim has to forward it, or callers of clojure.string lose it")))
     (testing "and the absent ones are absent, with a reason each"
       (let [absent (get-in contract [:modules :kotoba.string :absent])]
         (is (seq absent))
