@@ -118,21 +118,38 @@
         module-entry (get-in contract [:modules :kotoba.string])]
     (testing "lang/compat.edn carries the module"
       (is (= "lang/compat/kotoba/string.kotoba" (:path module-entry)))
-      (is (= #{'byte-index-of 'utf16-index-of 'utf16-last-index-of} (:provides module-entry))))
+      ;; Eleven since 2026-09-08, when the owner made this the canonical guest
+      ;; string library and the eight clojure.string functions moved here. The
+      ;; three index functions are the ones this file measures; the other eight
+      ;; are measured in clojure_string_compat_test.clj against clojure.string
+      ;; itself, which is still their oracle.
+      (is (= #{'byte-index-of 'utf16-index-of 'utf16-last-index-of
+               'starts-with? 'ends-with? 'includes?
+               'blank? 'trim 'triml 'trimr 'reverse}
+             (:provides module-entry))))
     (testing "and the source's public names are exactly that"
       (let [public (set (map (comp symbol second)
                              (re-seq #"(?m)^\(defn\s+([^\s\[]+)" module)))]
         (is (= (:provides module-entry) public))))
-    (testing "clojure.string/index-of stays absent, and points here -- at both halves"
-      (let [absent (get-in contract [:modules :clojure.string :absent 'index-of])]
+    (testing "index-of stays absent, and points here -- at both halves"
+      ;; The reason lives on the CANONICAL module since 2026-09-08. The
+      ;; clojure.string entry is a shim and its :absent map holds pointers, so
+      ;; reading the reason there would read a pointer and pass on nothing.
+      (let [absent (get-in contract [:modules :kotoba.string :absent 'index-of])]
         (is (string? (:reason absent)))
         (is (= #{'kotoba.string/byte-index-of 'kotoba.string/utf16-index-of} (:instead absent)))
         (is (str/includes? (:reason absent) "option")
             "the reason on record is the nil half, not the index half, which is answered")))
     (testing "and last-index-of points at its utf16 counterpart"
       (is (= 'kotoba.string/utf16-last-index-of
-             (get-in contract [:modules :clojure.string :absent 'last-index-of :instead]))))
-    (testing "nothing named index-of is exported from the clojure.string module"
+             (get-in contract [:modules :kotoba.string :absent 'last-index-of :instead]))))
+    (testing "and the shim's :absent map points at the canonical one rather than restating it"
+      (doseq [name '[index-of last-index-of lower-case upper-case capitalize
+                     split split-lines replace replace-first]]
+        (is (str/includes? (get-in contract [:modules :clojure.string :absent name :reason])
+                           ":modules :kotoba.string :absent")
+            (str name " must point at the canonical reason, not carry a second copy of it"))))
+    (testing "nothing named index-of is exported from the clojure.string shim either"
       (let [clojure-module (slurp "lang/compat/clojure/string.kotoba")]
         (is (empty? (filter #{"index-of"}
                             (map second (re-seq #"(?m)^\(defn\s+([^\s\[]+)"
