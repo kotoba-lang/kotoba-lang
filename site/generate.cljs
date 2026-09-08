@@ -122,8 +122,14 @@
            :keywordize-keys true))
 
 (def build-scaling
-  (js->clj (js/JSON.parse (fs/readFileSync build-scaling-source-path "utf8"))
-           :keywordize-keys true))
+  ;; Presentation names only; the published measurement report retains its
+  ;; original lane identities, commands, and results.
+  (-> (js->clj (js/JSON.parse (fs/readFileSync build-scaling-source-path "utf8"))
+               :keywordize-keys true)
+      (assoc-in [:lanes :kotoba-wasm-cli :label] "Kotoba")
+      (assoc-in [:lanes :kotoba-wasm-cli :target] "Released CLI · WebAssembly")
+      (assoc-in [:lanes :amu-wasm :label] "Kotoba / Amu")
+      (assoc-in [:lanes :amu-native :label] "Kotoba / Amu")))
 
 (def cold-start
   "The one speed ordering on this page that its own gate qualifies.
@@ -1773,8 +1779,8 @@
         ;; Short lane names for the line ends. `Amu` appears twice in the
         ;; report's own labels, once per target, so the target has to be in
         ;; the name or two different lines get the same label.
-        lane-short {:kotoba-wasm-cli "Kotoba CLI" :amu-wasm "Amu → Wasm"
-                    :amu-native "Amu → native" :rustc-wasm "rustc → Wasm"
+        lane-short {:kotoba-wasm-cli "Kotoba · released CLI" :amu-wasm "Kotoba / Amu → Wasm"
+                    :amu-native "Kotoba / Amu → native" :rustc-wasm "rustc → Wasm"
                     :rustc-native "rustc → native" :clang-native "clang → native"
                     :javac "javac"}
         scaling-series
