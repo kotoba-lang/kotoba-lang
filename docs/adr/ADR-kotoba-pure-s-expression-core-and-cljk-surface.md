@@ -216,14 +216,49 @@ absent `(e,a)` and is **not** wrapped in an `[:option T]`. A datom whose value
 *is* `i64 MIN` is indistinguishable from an absent one, so an option would
 promise a totality the store does not have.
 
-**Backends differ per head, so they are recorded per head.** `lam` `app` `ref`
-`perform` `handle` reach wasm32; `rel` and `query` are KIR-only, because
-`(kgraph-get 1 2)` *alone* fails `:wasm-local-encoding` on wasm32 while a
-plain program compiles (measured against amu `9bb5ea68`). That gap is
+**Backends differ per head, so they are recorded per head.** Measured
+2026-09-06 against amu `9bb5ea68`: `lam` `app` `ref` `perform` `handle` reach
+wasm32; `rel` and `query` do not, because `(kgraph-get 1 2)` *alone* fails
+`:wasm-local-encoding` on wasm32 while a plain program compiles. That gap is
 inherited from the primitives, not introduced here — but a single `:backends`
 set for the entry would have been an overclaim for two heads or an underclaim
 for five, which is the mistake this entry already made once with
 `:kotoba-wasm`.
+
+⚠ **This paragraph called `rel` and `query` KIR-only until 2026-09-08, and
+that was false.** Re-measured against amu `origin/main` `a169d7bf`, every
+command `--jvm-free`, with each native artifact *executed* through
+`tools/kexe_loader.c` rather than merely built:
+
+| head | wasm32 | aarch64-macos | native answer |
+|---|---|---|---|
+| `lam` `app` `ref` | compiles | compiles | `1` |
+| `rel` | `:wasm-local-encoding` | compiles | `1` |
+| `query` | `:wasm-local-encoding` | compiles | `7` |
+| `handle` | compiles | **refused** `:verify` | — |
+| `perform` | compiles | compiles | loader traps |
+
+**Five of the seven answer natively.** A wasm32 ceiling had been read as a KIR
+ceiling, and `lang/guest-grammar.edn` carried it as the marker
+`:compiler-kir-only`, now removed. Per-target reach lives in
+`:amu-targets-per-head`, because the `:backends` vocabulary cannot express it:
+`:compiler` is amu as a whole and `:kotoba-wasm` names the legacy
+`kotoba.runtime/wasm-binary` emitter, which rejects these heads.
+
+Two controls, because agreement that cannot disagree is not evidence:
+
+- `query` **reads the store** rather than returning a constant — storing 41
+  answers `41` where storing 7 answers `7`.
+- `handle`'s native refusal is **inherited, not introduced**. The same program
+  written with plain `(try .. (catch ..))` and no `handle` at all is refused
+  with the identical message, `native artifact contains an unsupported
+  effect`, so what native lacks is the `:abort` ability. Recorded as
+  `:native-gap` in `lang/surface-status.edn`.
+
+`perform` compiling natively while the bare loader traps is not a language
+gap: `kotoba-native`'s README states the backend is not an effect provider, and
+this is what that reads like from the guest side. Compiling to a target and
+running on that host face are two claims, and only the first holds here.
 
 **Identity, measured:**
 
