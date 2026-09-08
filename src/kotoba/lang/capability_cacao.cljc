@@ -28,7 +28,7 @@
   resource string, or `*` for the :any wildcard scope. Only kinds registered
   in kotoba.lang.capability-values/effect-for-kind are granted; every other
   resource URI is SKIPPED (reported under :skipped), never silently granted."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotoba.lang.capability-values :as values])
   #?(:clj (:import [java.time Instant ZoneOffset])))
 

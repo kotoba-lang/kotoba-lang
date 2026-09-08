@@ -36,7 +36,7 @@
   `keys-not-read` below. Both are data rather than prose because an
   enumeration that silently misses a key fails in the same direction as the
   defect it is looking for: quietly, and green."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotoba.lang.conformance-matrix :as cm]
             #?(:clj [clojure.edn :as edn])
             #?(:clj [clojure.java.io :as io])))

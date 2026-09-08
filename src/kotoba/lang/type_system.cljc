@@ -4,7 +4,7 @@
   This namespace deliberately validates *language contract data*, not JVM
   Clojure classes.  Host compilers consume the same data before lowering it to
   their own typed IR.  See docs/lang/type-system.md."
-  (:require [clojure.set :as set]
+  (:require [kotoba.lang.coll :as coll]
             [kotoba.lang.capability-values :as capabilities]))
 
 (def primitive-types
@@ -153,7 +153,7 @@
                    (into (no-nil-return-problems returns)))
         required (implied-effects (or params []))
         missing (if (effect-row? effects)
-                  (set/difference required effects)
+                  (coll/set-difference required effects)
                   required)
         missing-problems (when (seq missing)
                            [{:problem :signature/missing-effect
@@ -357,7 +357,7 @@
                      (when-not (vector? captures)
                        [{:problem :spawn/captures}])
                      (when (and (effect-row? effects) (effect-row? child-effects))
-                       (for [effect (set/difference child-effects effects)]
+                       (for [effect (coll/set-difference child-effects effects)]
                          {:problem :spawn/effect-escapes :effect effect}))
                      (mapcat type-problems capture-types)
                      (for [kind (mapcat capability-kinds capture-types)]

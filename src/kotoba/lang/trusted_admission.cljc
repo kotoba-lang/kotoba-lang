@@ -5,7 +5,7 @@
   possess a verifier function, successfully verify the evidence, and mint one
   of the private runtime types in this namespace. Consumers accept those types
   rather than booleans or caller-constructed grant maps."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotoba.lang.capability-cacao :as cacao]
             [kotoba.lang.capability-values :as capabilities]
             [kotoba.lang.code-identity :as identity]

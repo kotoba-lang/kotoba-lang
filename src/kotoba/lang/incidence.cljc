@@ -5,7 +5,7 @@
   roles. It is data and evidence, never authority by possession: admission to
   an effect still requires verified delegation, local policy, and a concrete
   capability value. The normative shape is `lang/incidence.edn`."
-  (:require [clojure.set :as set]
+  (:require [kotoba.lang.coll :as coll]
             [cbor.core :as cbor]
             [kotoba.lang.code-identity :as identity]
             [multiformats.core :as mf]))
@@ -258,8 +258,8 @@
      (let [actual (set (keys block))]
        (when (not= required-fields actual)
          {:problem :incidence/fields
-          :missing (set/difference required-fields actual)
-          :unknown (set/difference actual required-fields)})))
+          :missing (coll/set-difference required-fields actual)
+          :unknown (coll/set-difference actual required-fields)})))
    (when-not (keyword? (:incidence/kind block))
      {:problem :incidence/kind})
    (let [roles (:incidence/roles block)]
@@ -639,8 +639,8 @@
      (let [actual (set (keys facet))]
        (when (not= facet-fields actual)
          {:problem :facet/fields
-          :missing (set/difference facet-fields actual)
-          :unknown (set/difference actual facet-fields)})))
+          :missing (coll/set-difference facet-fields actual)
+          :unknown (coll/set-difference actual facet-fields)})))
    (when-not (contains? #{:open :stopped} (:facet/status facet))
      {:problem :facet/status})
    (when-not (ref? (:facet/owner facet))

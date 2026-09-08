@@ -4,7 +4,7 @@
   Pure loaders + queries. Dual-backend *execution* is T1.3 (compiler /
   kotoba-kir / kotoba-wasm runners)."
   (:require [clojure.edn :as edn]
-            [clojure.set :as set]
+            [kotoba.lang.coll :as coll]
             #?(:clj [clojure.java.io :as io])))
 
 (def manifest-path "lang/conformance/manifest.edn")
@@ -171,18 +171,18 @@
       (doseq [b (into executed deferred)]
         (when-not (contains? backend-ids b)
           (conj! problems {:type :execution-unknown-backend :id id :backend b})))
-      (doseq [b (set/intersection executed deferred)]
+      (doseq [b (coll/set-intersection executed deferred)]
         (conj! problems
                {:type :backend-both-executed-and-deferred :id id :backend b
                 :why "an entry in :unexecuted-backends naming a backend that
                       :executed-by also names is an excuse that outlived what
                       it excused; move it or drop it"}))
-      (doseq [b (set/difference required (into executed deferred))]
+      (doseq [b (coll/set-difference required (into executed deferred))]
         (conj! problems
                {:type :required-backend-not-accounted-for :id id :backend b
                 :why "the case requires this backend and records neither a
                       runner for it nor a dated reason there is none"}))
-      (doseq [b (set/difference (into executed deferred) required)]
+      (doseq [b (coll/set-difference (into executed deferred) required)]
         (conj! problems
                {:type :backend-recorded-but-not-required :id id :backend b
                 :why "the record names a backend the case does not require;

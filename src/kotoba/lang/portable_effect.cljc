@@ -6,7 +6,7 @@
   always host-owned and goes through `guard-component-ability-call`, so the
   same effect row, grant, local policy, target, operation, limits, and receipt
   contract applies on every host."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotoba.lang.capability-host :as capability-host]
             [kotoba.lang.capability-values :as capability-values]))
 

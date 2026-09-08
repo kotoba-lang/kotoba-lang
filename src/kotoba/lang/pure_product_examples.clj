@@ -6,7 +6,7 @@
   Requires sibling checkout of kotoba-lang/amu (or override COMPILER_ROOT)."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba.compiler.core :as compiler]
             [kotoba.kir :as kir]))
 

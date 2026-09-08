@@ -5,9 +5,9 @@
   argument shaping, and command result model without depending on Rust."
   #?(:clj (:require [clojure.edn :as edn]
                     [clojure.java.io :as io]
-                    [clojure.string :as str]
+                    [kotoba.lang.text :as str]
                     [identity.principal :as principal])) ; cljs consumers pass parsed EDN.
-  #?(:cljs (:require [clojure.string :as str]
+  #?(:cljs (:require [kotoba.lang.text :as str]
                      [identity.principal :as principal])))
 
 (def default-contract-path "lang/cli.edn")
@@ -53,7 +53,7 @@
   (when (and (string? address)
              (re-matches ethereum-address-re address)
              (pos-int? chain-id))
-    (str "did:pkh:eip155:" chain-id ":" (str/lower-case address))))
+    (str "did:pkh:eip155:" chain-id ":" (str/lower address))))
 
 (defn- parse-chain-id [value]
   (try
@@ -151,7 +151,7 @@
                {:chain-id raw-chain-id})
 
       :else
-      (let [address (str/lower-case address)
+      (let [address (str/lower address)
             account-id (str "eip155:" chain-id ":" address)]
         (success :id/account-described
                  {:method :linked-chain-account

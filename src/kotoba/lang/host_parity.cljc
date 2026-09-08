@@ -4,7 +4,7 @@
   Loads lang/host-parity.edn. Pure data — no DOM, no Wasm execution.
   Missing host import is modeled as capability absence, never ambient success."
   (:require [clojure.edn :as edn]
-            [clojure.set :as set]
+            [kotoba.lang.coll :as coll]
             #?(:clj [clojure.java.io :as io])))
 
 (def ^:private catalog*
@@ -96,7 +96,7 @@
         statuses (get-in c [:acceptance :browser-linkable-statuses] #{:yes})
         profile (:browser-profile c)
         required (:required profile #{})
-        classified (apply set/union #{} (map #(get profile % #{})
+        classified (apply coll/set-union #{} (map #(get profile % #{})
                                              [:required :intentional-native-boundary
                                               :deferred-provider-components
                                               :deferred-host-injection]))
@@ -104,7 +104,7 @@
         n (count rows)
         yes (count (filter #(linkable? (:browser %) statuses) rows))
         linkable-ids (set (map :import (filter #(linkable? (:browser %) statuses) rows)))
-        required-yes (count (set/intersection required linkable-ids))
+        required-yes (count (coll/set-intersection required linkable-ids))
         required-ratio (if (seq required) (double (/ required-yes (count required))) 0.0)
         minimum (get profile :minimum-required-coverage 1.0)
         partition-ok? (= classified (set (map :import rows)))]

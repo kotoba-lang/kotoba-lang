@@ -5,7 +5,7 @@
   answer and resolver positions, and distributed reference bookkeeping.  It
   deliberately does not turn locator data into authority: resolving a
   sturdyref still requires a live resolver capability supplied by the host."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotoba.lang.capability-values :as capabilities]
             [kotoba.lang.trusted-admission :as trusted])
   #?(:clj (:import [java.io ByteArrayOutputStream]
