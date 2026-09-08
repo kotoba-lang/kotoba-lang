@@ -360,8 +360,16 @@
   Advanced 2026-09-07 to `ee7ea37c` for the fs-browse-dir grammar head /
   find-lib slice (capability id 261). Sibling mains already MATCH
   (kotoba cb70c446, kotoba-sema af8cc780); this pin plus the CI.yml
-  checkouts close the wave."
-  "ee7ea37c7ea88c52ee8869af4d485e91a0b11bb153682ad717c86c055270b6b5")
+  checkouts close the wave.
+  Advanced 2026-09-08 to `515bbc7d` for the pure-core backend record.
+  `:compiler-kir-only` is removed from `:backends-per-head` -- measured false:
+  rel and query both lower to aarch64-macos and the artifact RUNS. A new
+  `:amu-targets-per-head` records per-TARGET reach, which the `:backends`
+  vocabulary cannot express (`:compiler` is amu as a whole and `:kotoba-wasm`
+  names the legacy emitter). No head is admitted or withdrawn: :admitted stays
+  119 and :unclassified 0. Carry to kotoba-sema, kotoba (two copies) and
+  grammar; amu pins the digest without shipping a grammar copy."
+  "515bbc7de84a3340ef3b250e4ee411739d3acebf32ba31450540f146768bb841")
 
 (defn- sha256-hex [^bytes bs]
   (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") bs)]
@@ -585,29 +593,61 @@
                "source the compiler accepts")))))
 
 (deftest the-pure-heads-backends-are-recorded-per-head-because-they-differ
-  ;; Five reach wasm32; `rel` and `query` are KIR-only, because the kgraph
-  ;; primitives they spell do not lower to wasm32 (measured 2026-09-06:
+  ;; Five heads reach wasm32; `rel` and `query` do not, because the kgraph
+  ;; primitives they spell do not lower there (measured 2026-09-06:
   ;; `(kgraph-get 1 2)` alone fails :wasm-local-encoding while a plain program
   ;; compiles). A single `:backends` set for the entry would be an overclaim
   ;; for two heads or an underclaim for five -- which is the same mistake this
   ;; entry already made once, with :kotoba-wasm.
+  ;;
+  ;; They are NOT KIR-only, which this comment said until 2026-09-08. Both
+  ;; lower to aarch64-macos and the artifact runs. The direction that IS
+  ;; missing is the other one: `handle` reaches wasm32 and not native, because
+  ;; the :abort ability has no native lowering. Two gaps, opposite directions,
+  ;; each inherited from a primitive rather than introduced by a head, and
+  ;; each held to surface-status below.
   (let [grammar (auth/read-edn auth/grammar-path)
         surface (auth/read-edn auth/surface-path)
         entry (get-in grammar [:sugar :pure-s-expression-core])
         per-head (:backends-per-head entry)
-        gap (get-in surface [:other-gaps :pure-s-expression-core :backend-gap])]
+        targets (:amu-targets-per-head entry)
+        gap (get-in surface [:other-gaps :pure-s-expression-core :backend-gap])
+        native-gap (get-in surface [:other-gaps :pure-s-expression-core :native-gap])]
     (is (= (set (:forms entry)) (set (keys per-head)))
         (str "every admitted head needs a backend record and no others: "
              (pr-str {:forms (set (:forms entry)) :recorded (set (keys per-head))})))
     (is (= '#{rel query} (:heads gap))
         "surface-status must name the same two heads as the backend gap")
+    ;; Was keyed on the marker :compiler-kir-only, which 2026-09-08 measured
+    ;; false -- rel and query lower to aarch64-macos and the artifact runs.
+    ;; Per-target reach now lives in :amu-targets-per-head, because the
+    ;; :backends vocabulary has no token for an amu target (`:compiler` is amu
+    ;; as a whole; `:kotoba-wasm` is the legacy emitter, which rejects these
+    ;; heads). Keying the gate on that field keeps it gating the thing the two
+    ;; records actually have to agree about.
+    (is (= (set (:forms entry)) (set (keys targets)))
+        "every admitted head needs a per-target record and no others")
     (is (= (:heads gap)
-           (set (keep (fn [[h b]] (when (contains? b :compiler-kir-only) h)) per-head)))
-        (str "the heads marked :compiler-kir-only in the grammar and the heads "
-             "surface-status records as not reaching wasm32 must be the same "
-             "set, or one of the two records is stale: "
-             (pr-str {:grammar (set (keep (fn [[h b]] (when (contains? b :compiler-kir-only) h)) per-head))
-                      :surface-status (:heads gap)})))))
+           (set (keep (fn [[h m]] (when (= :refused (:wasm32 m)) h)) targets)))
+        (str "the heads refused by --target wasm32 and the heads surface-status "
+             "records as not reaching wasm32 must be the same set, or one of "
+             "the two records is stale: "
+             (pr-str {:grammar (set (keep (fn [[h m]] (when (= :refused (:wasm32 m)) h)) targets))
+                      :surface-status (:heads gap)})))
+    (is (= (:heads native-gap)
+           (set (keep (fn [[h m]] (when (= :refused (:aarch64-macos m)) h)) targets)))
+        (str "same, for the native direction. handle is refused by "
+             ":verify because the :abort ability has no native lowering: "
+             (pr-str {:grammar (set (keep (fn [[h m]] (when (= :refused (:aarch64-macos m)) h)) targets))
+                      :surface-status (:heads native-gap)})))
+    ;; :compiles and :executes must stay distinct, or the record silently
+    ;; becomes a build check again.
+    (is (every? #{:compiles :executes :compiles-only :refused}
+                (mapcat vals (vals targets)))
+        "per-target values come from a closed set")
+    (is (contains? (set (map :aarch64-macos (vals targets))) :executes)
+        "at least one head must be recorded as having actually RUN natively,
+         otherwise nothing here distinguishes building from running")))
 
 (deftest the-pure-ref-spelling-collision-is-recorded-on-both-sides
   ;; `ref` is ADR-544's definition reference AND Clojure's STM constructor,
