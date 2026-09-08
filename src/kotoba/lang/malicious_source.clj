@@ -1,7 +1,7 @@
 (ns kotoba.lang.malicious-source
   "Normative malicious-source corpus evaluator. All limits are checked before
    EDN parsing so hostile input cannot allocate unbounded reader structures."
-  (:require [clojure.edn :as edn]
+  (:require [kotoba.lang.edn :as edn]
             [kotoba.lang.coll :as coll]
             [kotoba.lang.text :as str]))
 
