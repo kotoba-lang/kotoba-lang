@@ -266,9 +266,42 @@ Kotoba-only means neither. Four escape kinds are read off the source:
 `:clj-only` (a `.clj` with no `.cljc`/`.cljs` twin), `:java-interop`,
 `:node-require`, `:js-interop`.
 
-From the three roots of the native trust flow — `kotoba.verifier.signing`,
-`kotoba.compiler.cli`, `kotoba.compiler.nbb.output-attestation` — measured
-2026-09-08: **100 namespaces reachable, 52 host-bound, 8 waves and one cycle.**
+⚠ **The first version of this section asked one question where there are
+two, and got the answer wrong.** It counted any host escape as a JVM blocker,
+which put `kotoba.hir`, `kotoba.gmir` and five others in the first wave —
+namespaces that are `.cljc`, that the JVM-free nbb route lowers through
+today, and that block the JVM not at all. Their `js/` sits in a `:cljs`
+branch, which is what portable code looks like. Two predicates, two orders:
+
+| question | blocker | reachable | blockers | waves |
+|---|---|---:|---:|---|
+| **stop depending on the JVM** | `:clj-only` — a `.clj` with no `.cljc`/`.cljs` twin, so it runs on no other host | 100 | **18** | **6, no cycle** |
+| **be Kotoba only** | any host escape, including a `:cljs` branch naming `js/` | 100 | **52** | 8 + a cycle of 9 |
+
+### To stop depending on the JVM
+
+```
+wave 0  compiler.atomic-output, bounded-edn, coverage, ipld-adl-source,
+        project-files, component.admission, verifier.signing, wasm.tools
+wave 1  compiler.cache, coverage-evidence, module-lock, receipt, release,
+        component.core
+wave 2  component.artifact
+wave 3  compiler.core
+wave 4  compiler.test-profile
+wave 5  compiler.cli
+```
+
+**`kotoba.verifier.signing` is in wave 0.** Everything it requires is already
+`.cljc`; the only thing binding it to the JVM is that it is a `.clj` file.
+The trust gap measured above is therefore not blocked behind four waves of
+other work, which is what the conflated ordering implied — it can be started
+now.
+
+### To be Kotoba only
+
+From the same three roots — `kotoba.verifier.signing`,
+`kotoba.compiler.cli`, `kotoba.compiler.nbb.output-attestation`: **52
+host-bound namespaces, 8 waves and one cycle.**
 
 | wave | namespaces |
 |---:|---|

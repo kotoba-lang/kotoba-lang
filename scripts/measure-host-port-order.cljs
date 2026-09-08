@@ -6,17 +6,10 @@
 ;; question "what first" is a topological sort over the require graph
 ;; restricted to the JVM-bound nodes.
 ;;
-;; Two hosts have to leave, not one: the JVM (`.clj`-only, `java.` interop) and
-;; Node (`["node:…"]` requires, `js/` interop). `node:crypto` is not a smaller
-;; problem than `java.security` -- it is the same problem with a different
-;; owner, and Kotoba-only means neither.
+;; JVM-bound here means: this namespace exists as `.clj` and has no `.cljc` or
+;; `.cljs` twin on the classpath. That is a property of the tree, not a guess.
 ;;
-;; Host-bound here is a property of the tree, not a guess: the four escape
-;; kinds are read off the source. A namespace with no escape is portable
-;; BETWEEN the two hosts; it is still not written in Kotoba.
-;;
-;;   nbb --classpath <cp> scripts/measure-host-port-order.cljs \
-;;     --dirs <src:src:...> --roots ns,ns --output order.edn
+;;   nbb --classpath <cp> jvm-port-order.cljs --roots ns,ns --output order.edn
 
 (ns jvm-port-order
   (:require ["node:fs" :as fs]
@@ -79,7 +72,14 @@
                     (any #"\[\"node:") (conj :node-require)
                     (any #"js/[A-Za-z]") (conj :js-interop))))
       escape-map (into {} (map (fn [n] [n (escapes n)]) (keys by-ns)))
-      jvm-bound? (fn [n] (seq (get escape-map n)))
+      ;; TWO questions, two predicates. A .cljc file with `js/` inside its
+      ;; :cljs branch is portable BETWEEN the hosts -- kotoba.hir and
+      ;; kotoba.gmir are exactly that, and the JVM-free nbb route lowers
+      ;; through both today. Counting them as JVM blockers, which an earlier
+      ;; version of this script did, put seven namespaces in the first wave
+      ;; that do not block the JVM at all.
+      jvm-blocker? (fn [n] (contains? (get escape-map n) :clj-only))
+      kotoba-blocker? (fn [n] (seq (get escape-map n)))
       deps (into {} (map (fn [[n es]] [n (reduce into #{} (map :requires es))]) by-ns))
       ;; reachable JVM-bound closure from the roots
       reach (loop [seen #{} queue (vec roots)]
@@ -88,19 +88,22 @@
                   (recur seen (vec (rest queue)))
                   (recur (conj seen n) (into (vec (rest queue)) (get deps n #{}))))
                 seen))
-      nodes (set (filter jvm-bound? reach))
-      edges (into {} (map (fn [n] [n (set (filter nodes (get deps n #{})))]) nodes))
-      ;; Kahn: a node is ready when every JVM-bound namespace it requires is done
-      order (loop [remaining nodes done [] wave 0 waves []]
-              (if (empty? remaining)
-                waves
-                (let [ready (set (filter (fn [n] (empty? (remove (set done) (get edges n)))) remaining))]
-                  (if (empty? ready)
-                    (conj waves {:wave :cycle :namespaces (vec (sort remaining))})
-                    (recur (remove ready remaining) (into done ready) (inc wave)
-                           (conj waves {:wave wave
-                                        :namespaces (vec (sort ready))
-                                        :files (vec (sort (map :file (mapcat by-ns ready))))}))))))
+      sort-waves
+      (fn [nodes]
+        (let [edges (into {} (map (fn [n] [n (set (filter nodes (get deps n #{})))]) nodes))]
+          (loop [remaining nodes done [] wave 0 waves []]
+            (if (empty? remaining)
+              waves
+              (let [ready (set (filter (fn [n] (empty? (remove (set done) (get edges n)))) remaining))]
+                (if (empty? ready)
+                  (conj waves {:wave :cycle :namespaces (vec (sort remaining))})
+                  (recur (remove ready remaining) (into done ready) (inc wave)
+                         (conj waves {:wave wave :namespaces (vec (sort ready))}))))))))
+      jvm-nodes (set (filter jvm-blocker? reach))
+      kotoba-nodes (set (filter kotoba-blocker? reach))
+      nodes kotoba-nodes
+      order (sort-waves kotoba-nodes)
+      jvm-order (sort-waves jvm-nodes)
       result {:kotoba.lang.host-port-order/version 1
               :measured-at (subs (.toISOString (js/Date.)) 0 10)
               :question "In what order can the JVM and Node dependencies be removed from the native flow?"
@@ -114,7 +117,13 @@
                                   (sort nodes)))
               :roots (vec (sort roots))
               :reachable-namespaces (count reach)
-              :host-bound-count (count nodes)
+              :jvm-removal {:blocker-rule ":clj-only -- a .clj with no .cljc/.cljs twin, so it runs on no other host"
+                            :count (count jvm-nodes)
+                            :waves jvm-order}
+              :kotoba-only {:blocker-rule "any host escape at all, including a :cljs branch that names js/"
+                            :count (count kotoba-nodes)
+                            :waves order}
+              :host-bound-count (count kotoba-nodes)
               :waves order
               :not-established
               ["Kotoba-only is the target, and neither .cljc nor a portable host shim is
@@ -125,6 +134,10 @@
                 inside a .cljc file, which this does not see."
                "Wave 1 is what can be started, not what is easy."]}]
   (fs/writeFileSync output (with-out-str (cljs.pprint/pprint result)))
-  (println "reachable:" (count reach) " host-bound:" (count nodes) " waves:" (count order))
+  (println "reachable:" (count reach))
+  (println "-- to stop depending on the JVM --  blockers:" (count jvm-nodes) " waves:" (count jvm-order))
+  (doseq [w jvm-order]
+    (println (str "  wave " (:wave w) ": " (str/join ", " (map str (:namespaces w))))))
+  (println "-- to be Kotoba only --  blockers:" (count kotoba-nodes) " waves:" (count order))
   (doseq [w order]
     (println (str "  wave " (:wave w) ": " (str/join ", " (map str (:namespaces w)))))))
