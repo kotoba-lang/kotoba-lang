@@ -306,6 +306,39 @@ Until step 3, a `.kotoba` file may use the whole pure head set but is not
 *required* to, and the `.kotoba` files in the fleet are clojure-shaped by
 authority, not by oversight.
 
-**Admitting the heads broke nothing.** Across the 3,336 `.kotoba`/`.cljk`
-files in this workspace, none of the seven heads appears in operator position
-or as a `defn` name (measured 2026-09-06).
+**Admitting the heads broke one file, not none.** The 2026-09-06 sweep reported
+that across the 3,336 `.kotoba`/`.cljk` files in this workspace none of the
+seven heads appears in operator position or as a `defn` name. Re-measured
+2026-09-08, that is false, and the counterexample predates the sweep:
+
+```
+orgs/kotoba-lang/com-aadhaar/src/aadhaar/whole-component.kotoba   added 2026-09-03
+  line 140   (query store entity)       2 args
+  line 145   (query store entity id)    3 args
+  line 149   (query store entity id)    3 args
+  line 159   (query store entity id)    3 args
+```
+
+`amu check --jvm-free` refuses it with `:kotoba.error/pure-query-arity` — *query
+reads one datom: (query entity attribute). It is a point read, not a pattern
+query*. The file is a wave-1 Q9 pilot, so the sweep's own corpus contained it.
+
+**It is a semantic collision, not a spelling accident.** The oracle this pilot
+reproduces, `src/aadhaar/main.cljc`, defines a PUBLIC `query` of its own — a
+store read over a mutable atom, arity 2 and 3. Any component whose public
+surface already contains a name in the reserved set collides on migration, and
+`query` is an ordinary name for a data-access function to carry.
+
+**The blast radius is exactly one file, measured rather than assumed.** Across
+every `.kotoba`/`.cljk` in the workspace, ignores off:
+
+| head | files with the head in operator position |
+|---|---|
+| `lam` `app` `ref` | 1 — `cloud-itonami-app/.../pure_head_probe.kotoba`, a deliberate probe using them correctly |
+| `query` | 1 — the com-aadhaar pilot above |
+| `perform` `rel` `handle` | 0 |
+
+So the decision stands and no wave of repair is owed. What was wrong is the
+word *nothing*, and the sweep that produced it: a corpus scan that reported a
+clean result while a file in its own corpus refused to compile for exactly the
+reason being scanned for.
