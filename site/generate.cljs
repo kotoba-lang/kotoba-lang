@@ -1257,8 +1257,8 @@
     [:blockquote {:class "kot-quote"}
      [:strong "When AI generates, builds, tests, and regenerates code continuously, build latency becomes infrastructure throughput."]]
     [:div {:class "kot-actions"}
-     (dds/button "See how it works" {:href "#architecture" :size "lg"})
-     (dds/button "Start with Kotoba" {:href "#start" :type :outline :size "lg"})
+     (dds/button "Install and run" {:href "#start" :size "lg"})
+     (dds/button "See how it works" {:href "#architecture" :type :outline :size "lg"})
      (dds/button "AI agent setup" {:href "./agent-quickstart.md" :type :text :size "lg"})]
     [:div {:class "kot-proof"}
      (dds/grid {:min "14rem"}
@@ -1405,11 +1405,10 @@
           [:pre {:class "kot-pre"}
            [:code "brew tap kotoba-lang/kotoba\nbrew trust kotoba-lang/kotoba\nbrew install kotoba\nkotoba selfhost check --json"]]
           (caption "Accept a valid response with an empty problem list."))
-    (card (dds/heading 3 "Start with no authority" {:size "24"})
-          [:p "An empty policy denies every host effect. Add only the resource-scoped capability the program needs."]
+    (card (dds/heading 3 "A first program" {:size "24"})
           [:pre {:class "kot-pre"}
-           [:code "{:policy/allow #{}\n :policy/forbid-wildcard true}"]]
-          (caption "HTTP, storage, and LLM hosted kits are not yet qualified for sale on a shipped backend.")))
+           [:code "(defn main []\n  (+ 40 2))"]]
+          [:p "This program requests no host imports; the emitted module has no imports."]))
    [:div {:class "kot-actions"}
     (dds/button "AI agent: executable quickstart"
                 {:href "./agent-quickstart.md"})
