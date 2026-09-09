@@ -2888,6 +2888,40 @@
    [:script chart-anim-js]
    [:script morph-js]])
 
+(def security-graph-css ".kot-attack-graph{margin-inline:0}.kot-attack-graph ol,.kot-attack-graph ul{list-style:none;padding:0}.kot-attack-graph li{border:var(--hig-hairline) solid var(--hig-color-separator);border-radius:var(--hig-radius-md);padding:var(--hig-spacing-4);margin-block:var(--hig-spacing-4);background:var(--hig-color-secondary-system-background)}.kot-attack-graph ol li+li:before{content:'\u2193';display:block;color:var(--hig-color-secondary-label)}.kot-attack-graph ul{border-inline-start:var(--hig-hairline) solid var(--hig-color-tint);padding-inline-start:var(--hig-spacing-6)}")
+
+(def security-copy (reader/read-string (fs/readFileSync "site/security-article.edn" "utf8")))
+
+(defn security-view []
+  [:div
+   [:a {:class "kot-skip" :href "#main"} "Skip to content"]
+   (header "/" "/blog/csf2-attack-graphs/")
+   [:main {:id "main"}
+    (dds/container
+     [:article {:class "kot-blog-entry"}
+      [:p {:class "kot-eyebrow"} "Security engineering"]
+      (dds/heading 1 (:title security-copy) {:size "48"})
+      [:p {:class "kot-lead"} (:intro security-copy)]
+      [:p (:notice security-copy)]
+      (for [{:keys [title paragraphs rows graph after stories]} (:sections security-copy)]
+        [:section
+         (dds/heading 2 title {:size "32"})
+         (for [p paragraphs] [:p p])
+         (when rows
+           [:dl (for [[name contribution] rows]
+                  [:div [:dt [:strong name]] [:dd contribution]])])
+         (when graph
+           [:figure {:class "kot-attack-graph"}
+            [:ol (for [step (take 4 graph)] [:li [:strong step]])]
+            [:ul (for [outcome (drop 4 graph)] [:li outcome])]
+            [:figcaption after]])
+         (for [{:keys [title text]} stories]
+           [:section (dds/heading 3 title {:size "24"}) [:p text]])])
+      (dds/heading 2 (:source-title security-copy) {:size "32"})
+      [:ul (for [{:keys [label url]} (:links security-copy)]
+             [:li [:a {:href url :class "kot-link"} label]])]])]
+   (footer :en "/legal/")])
+
 (defn blog-view []
   [:div
    [:a {:class "kot-skip" :href "#main"} "Skip to content"]
@@ -2899,6 +2933,11 @@
       (dds/heading 1 "Evidence before slogans" {:size "48"})
       [:p {:class "kot-lead"}
        "Short notes about language design, measurements, shipped boundaries, and what still remains unqualified."]]
+     [:article {:class "kot-blog-entry"}
+      [:p {:class "kot-eyebrow"} "Security engineering"]
+      (dds/heading 2 (:title security-copy) {:size "32"})
+      [:p (:description security-copy)]
+      [:a {:class "kot-link" :href "/blog/csf2-attack-graphs/"} "Read the assessment and attack scenarios"]]
      [:article {:class "kot-blog-entry"}
       [:p {:class "kot-eyebrow"} "31 August 2026 · Benchmarks"]
       (dds/heading 2 "A fifth benchmark, and the claim it would not support" {:size "32"})
@@ -3267,7 +3306,7 @@
           base-path (if (tags first-segment)
                       (str "/" (str/join "/" (drop 2 segments))
                            (when (> (count segments) 2) "/")) path)]
-      (when (contains? #{"/" "/blog/" "/libraries/" "/legal/" "/sponsor/"} base-path)
+      (when (contains? #{"/" "/blog/" "/blog/csf2-attack-graphs/" "/libraries/" "/legal/" "/sponsor/"} base-path)
         (concat
          (for [{:keys [tag]} locales/required]
            [:link {:rel "alternate" :hreflang tag
@@ -3469,6 +3508,8 @@
   [{:path "/" :view (view)
     :title "Kotoba — safe, fast language for AI-generated software"
     :description "Kotoba is designed for safe, ultra-fast AI-generated software. Explore the language, reproducible benchmarks, and the Kotobase and Kotoba Cloud stack."}
+   {:path "/blog/csf2-attack-graphs/" :view (security-view) :title (:title security-copy)
+    :description (:description security-copy)}
    {:path "/blog/" :view (blog-view) :title "Kotoba Blog — engineering notes and evidence"
     :description "Kotoba engineering notes about language design, benchmarks, evidence, and remaining qualification gates."}
    {:path "/libraries/" :view (libraries-view) :title "Kotoba Libraries — content-addressed publication and comparison"
@@ -3512,7 +3553,7 @@
         tree (-> view (locales/map-text tr) (locales/rebase-links resolve-link) (locales/mark-language tag))
         rendered (page/->page
                   {:title (tr title) :description (tr description) :lang tag :css dds-css :dark? true
-                   :app-css (str tokens/skin-css "\n" app-css "\npre,code,kbd,samp{direction:ltr;unicode-bidi:isolate}pre{text-align:left}")
+                   :app-css (str tokens/skin-css "\n" app-css "\n" (when (= path "/blog/csf2-attack-graphs/") security-graph-css) "\npre,code,kbd,samp{direction:ltr;unicode-bidi:isolate}pre{text-align:left}")
                    :head (list (favicon-link) (apple-touch-icon-link)
                                [:script theme-js] [:script menu-js] [:script chart-anim-head-js]
                                (og-head page-path (tr title) (tr description)))} tree)]
@@ -3649,6 +3690,17 @@
       (let [target (str "site/dist/" (:tag locale) (:path p) "index.html")]
         (fs/mkdirSync (path/dirname target) #js {:recursive true})
         (fs/writeFileSync target (translated-page locale p catalog))))))
+
+(let [p (first (filter #(= "/blog/csf2-attack-graphs/" (:path %)) localized-pages))
+      rendered (page/->page
+                 {:title (:title p) :description (:description p) :lang "en" :css dds-css :dark? true
+                  :app-css (str tokens/skin-css "\n" app-css "\n" security-graph-css)
+                  :head (list (favicon-link) (apple-touch-icon-link) [:script theme-js] [:script menu-js]
+                              (og-head (:path p) (:title p) (:description p)))} (:view p))]
+  (fs/mkdirSync "site/dist/blog/csf2-attack-graphs" #js {:recursive true})
+  (fs/writeFileSync "site/dist/blog/csf2-attack-graphs/index.html" rendered)
+  (fs/mkdirSync "site/dist/security" #js {:recursive true})
+  (fs/copyFileSync "docs/security/csf2-threat-model.md" "site/dist/security/csf2-threat-model.md"))
 
 (fs/writeFileSync "site/dist/_redirects" "/zh /zh-Hans/ 301\n/zh/* /zh-Hans/:splat 301\n")
 
