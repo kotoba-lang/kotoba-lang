@@ -12,6 +12,7 @@
          '[kotoba.grammar.highlight :as grammar-highlight]
          '[cljs.reader :as reader]
          '[clojure.string :as str]
+         '[kotoba.site.locales :as locales]
          '[kotoba.site.hero :as hero]
          '[kotoba.site.chart :as chart]
          '[kotoba.site.catalog :as catalog]
@@ -863,7 +864,8 @@
 
 (defn header
   ([] (header ""))
-  ([root]
+  ([root] (header root "/"))
+  ([root page-path]
    (let [local-href (fn [href]
                       (cond
                         (str/blank? root) href
@@ -914,6 +916,13 @@
             [:path {:d "M4 8.5 12 16l8-7.5" :fill "none" :stroke "currentcolor"
                     :stroke-width 2 :stroke-linecap "round" :stroke-linejoin "round"}]]]
           [:div {:class "kot-menu-panel"}
+           [:div {:class "kot-menu-group" :translate "no" :lang "en" :dir "ltr"}
+            [:p {:class "kot-menu-group-label"} "Languages"]
+            [:ul {:class "kot-menu-list"}
+             (for [{:keys [tag label]} locales/required]
+               [:li [:a {:class "kot-menu-link" :href (str (when (not= tag "en") (str "/" tag)) page-path)
+                          :lang tag :hreflang tag :data-site-language tag
+                          :aria-current (when (= tag "en") "page")} label]])]]
            [:div {:class "kot-menu-group"}
             [:p {:class "kot-menu-group-label"} "On this page"]
             [:ul {:class "kot-menu-list"}
@@ -1016,7 +1025,11 @@
        "t=t.parentNode;}});"
        "})();"))
 
-(def theme-js theme/script)
+(def theme-js
+  ;; aria-checked already announces the state; retain the translated name.
+  (str/replace theme/script
+    "b.setAttribute('aria-label',ja?(d?'ダークモード、オン':'ダークモード、オフ'):(d?'Dark mode, on':'Dark mode, off'));"
+    ""))
 
 (def chart-anim-head-js
   "Runs in <head>, before first paint, so the charts never render complete and
@@ -1498,19 +1511,15 @@
     :cli "Lire la référence CLI"}])
 
 (def start-languages
-  (into [{:path "start" :lang "en" :label "English"}]
-        (map (fn [copy]
-               (assoc (select-keys copy [:path :lang]) :label
-                      (get {"ja" "日本語" "hi" "हिन्दी" "ta" "தமிழ்"
-                            "zh-Hans" "简体中文" "ar" "العربية" "uk" "Українська"
-                            "es" "Español" "fr" "Français"} (:lang copy)))))
-        start-card-locales))
+  (concat (map #(assoc % :path (if (= (:tag %) "en") "" (:tag %)) :lang (:tag %)) locales/required)
+          [{:path "ta" :lang "ta" :label "தமிழ்"}
+           {:path "uk" :lang "uk" :label "Українська"}]))
 
 (defn start-language-nav [lang]
-  [:nav {:aria-label "Quickstart languages" :lang "en" :dir "ltr"}
+  [:nav {:aria-label "Languages" :lang "en" :dir "ltr" :translate "no"}
    [:div {:class "kot-actions" :style "display:flex;flex-wrap:wrap"}
     (for [{:keys [path label] target-lang :lang} start-languages]
-      [:a (cond-> {:class "kot-link" :href (str "/" path "/")
+      [:a (cond-> {:class "kot-link" :href (if (str/blank? path) "/" (str "/" path "/"))
                    :lang target-lang :hreflang target-lang}
             (= lang target-lang) (assoc :aria-current "page"))
        [:bdi label]])]])
@@ -1584,7 +1593,10 @@
            [:p [:strong "Expected result: "] (code "42")]
            (dds/button "Run Kotoba" {:id "kot-play-run" :size "lg"})
            [:p {:id "kot-play-status" :class "kot-play-status kot-muted"
-                :role "status" :aria-live "polite"}
+                :role "status" :aria-live "polite"
+                :data-verifying "Verifying artifact…"
+                :data-success "✓ Kotoba returned {result} · SHA-256 verified · 0 imports"
+                :data-error "Could not run: "}
             "Ready. No code has run yet."]
            (caption "This executes a precompiled, immutable example. Editing arbitrary source in the browser is not yet a shipped compiler surface.")
            [:p {:class "kot-caption kot-muted"}
@@ -1692,9 +1704,10 @@
          (catalog-chip tag n {}))
        (dds/button "Clear" {:type :text :size "sm"
                             :attrs {:id "kot-cat-clear"}})]]
-     [:p {:id "kot-cat-count" :class "kot-caption kot-muted" :aria-live "polite"}
+     [:p {:id "kot-cat-count" :class "kot-caption kot-muted" :aria-live "polite"
+          :data-count-template "Showing {shown} of {total} repositories"}
       (str "Showing " (thousands total) " of " (thousands total) " repositories")]
-     [:ol {:class "kot-cat-list" :id "kot-cat-list"}
+     [:ol {:class "kot-cat-list" :id "kot-cat-list" :lang "en" :translate "no"}
       (for [{:keys [name description tags topics archived?]} repos]
         [:li {:class "kot-lib"
               :data-t (str/join " " (map #(catalog/topic-of library-taxonomy %) tags))}
@@ -1709,7 +1722,7 @@
                                       topics))]
               [:span {:class "kot-lib-tag"} t])])])]
      (caption
-      (str "Filtering runs in the browser and no query leaves it; with JavaScript "
+      (str "Repository names and descriptions are upstream source records in English. Filtering runs in the browser and no query leaves it; with JavaScript "
            "off the complete list is still rendered above. "
            (thousands described) " of these repositories carry a GitHub description, "
            "so a domain tag has that much evidence to work from — "
@@ -1743,7 +1756,7 @@
        "if(ok&&keys.length){ok=false;"
        "for(var j=0;j<keys.length;j++){if(tg[i].indexOf(' '+keys[j]+' ')>-1){ok=true;break;}}}"
        "items[i].hidden=!ok;if(ok){shown++;}}"
-       "count.textContent='Showing '+n(shown)+' of '+n(items.length)+' repositories';}"
+       "count.textContent=count.dataset.countTemplate.replace('{shown}',n(shown)).replace('{total}',n(items.length));}"
        "function set(t,v){on[t]=v;chips.forEach(function(c){"
        "if(c.getAttribute('data-cat-tag')===t)c.setAttribute('aria-pressed',v?'true':'false');});}"
        "chips.forEach(function(c){c.addEventListener('click',function(){"
@@ -2664,7 +2677,7 @@
         :rows (for [k [:no-ambient-authority :no-interop :no-ambient-mutation
                        :no-unbounded-concurrency :no-guest-macros :explicit-errors]
                     :let [{:keys [surface reason]} (get invariants k)]]
-                [(str/join ", " (sort (map name surface))) reason])})]
+                [[:code (str/join ", " (sort (map name surface)))] reason])})]
      (caption "These are named security constraints in lang/surface-status.edn, not features missing from a roadmap."))))
 
 (defn release-section []
@@ -2705,13 +2718,14 @@
     (dds/input-text {:id "kot-doc-search" :type "search"
                      :aria-label "Search Kotoba documentation reference"
                      :aria-describedby "kot-doc-search-support"}))
-   [:p {:id "kot-doc-search-count" :class "kot-caption kot-muted" :aria-live "polite"}]
+   [:p {:id "kot-doc-search-count" :class "kot-caption kot-muted" :aria-live "polite"
+        :data-count-template "Results: {shown}"}]
    [:div {:id "kot-doc-search-results"}
     (for [{:keys [kind title body url keywords]} search-index
           :let [haystack (str/lower-case (str title " " body " " (str/join " " keywords)))]]
       [:div {:class "kot-search-item" :data-search haystack}
        (card (dds/chip-label (name kind))
-             (dds/heading 3 title {:size "20"})
+             (dds/heading 3 (if (= kind :cli) [:code title] title) {:size "20"})
              [:p body]
              (external-link (search-url url) "Open reference"))])]
    (caption "No query leaves the browser.")))
@@ -2724,7 +2738,7 @@
        "function apply(){var q=input.value.trim().toLowerCase();var shown=0;"
        "items.forEach(function(item,i){var match=q?item.dataset.search.includes(q):i<8;"
        "item.hidden=!match;if(match){shown+=1;}});"
-       "count.textContent=shown+' result'+(shown===1?'':'s');}"
+       "count.textContent=count.dataset.countTemplate.replace('{shown}',String(shown));}"
        "input.addEventListener('input',apply);apply();});"))
 
 (def play-js
@@ -2733,8 +2747,8 @@
        "var status=document.getElementById('kot-play-status');"
        "var expected='" play-sha256 "';"
        "function hex(bytes){return Array.from(bytes,function(b){return b.toString(16).padStart(2,'0');}).join('');}"
-       "button.addEventListener('click',async function(){button.disabled=true;status.textContent='Verifying artifact…';"
-       "try{var response=await fetch('./play/double-21.wasm',{cache:'no-store'});"
+       "button.addEventListener('click',async function(){button.disabled=true;status.textContent=status.dataset.verifying;"
+       "try{var response=await fetch('/play/double-21.wasm',{cache:'no-store'});"
        "if(!response.ok)throw new Error('artifact fetch failed: HTTP '+response.status);"
        "var bytes=new Uint8Array(await response.arrayBuffer());"
        "var digest=hex(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)));"
@@ -2744,8 +2758,8 @@
        "var instance=await WebAssembly.instantiate(module,{});"
        "var result=instance.exports.main();"
        "if(result!==42n)throw new Error('unexpected result');"
-       "status.textContent='✓ Kotoba returned '+result.toString()+' · SHA-256 verified · 0 imports';"
-       "}catch(error){status.textContent='Could not run: '+error.message;}finally{button.disabled=false;}});});"))
+       "status.textContent=status.dataset.success.replace('{result}',result.toString());"
+       "}catch(error){status.textContent=status.dataset.error+error.message;}finally{button.disabled=false;}});});"))
 
 (defn source-section []
   (dds/section
@@ -2877,7 +2891,7 @@
 (defn blog-view []
   [:div
    [:a {:class "kot-skip" :href "#main"} "Skip to content"]
-   (header "../")
+   (header "../" "/blog/")
    [:main {:id "main"}
     (dds/container
      [:section {:id "top" :class "kot-hero"}
@@ -2911,7 +2925,7 @@
         status (:kotoba.library-publication/status library-publication)]
     [:div
      [:a {:class "kot-skip" :href "#main"} "Skip to content"]
-     (header "../")
+     (header "../" "/libraries/")
      [:main {:id "main"}
       (dds/container
        [:section {:id "top" :class "kot-hero"}
@@ -3110,7 +3124,7 @@
 (defn legal-view []
   [:div
    [:a {:class "kot-skip" :href "#main"} "Skip to content"]
-   (header "../")
+   (header "../" "/legal/")
    [:main {:id "main"}
     (dds/container
      [:section {:id "top" :class "kot-hero"}
@@ -3156,7 +3170,7 @@
         non-exchange (:non-exchange sponsorship)]
     [:div
      [:a {:class "kot-skip" :href "#main"} (if ja? "本文へ移動" "Skip to content")]
-     (header root)
+     (header root "/sponsor/")
      [:main {:id "main"}
       (dds/container
        [:section {:id "top" :class "kot-hero"}
@@ -3247,18 +3261,20 @@
   ([path title description]
    (list
     [:link {:rel "canonical" :href (str site-origin path)}]
-    (when (contains? #{"/libraries/" "/legal/" "/sponsor/" "/ja/libraries/" "/ja/legal/" "/ja/sponsor/"} path)
-      (let [en-path (str/replace path #"^/ja/" "/")]
-        (list [:link {:rel "alternate" :hreflang "en" :href (str site-origin en-path)}]
-              [:link {:rel "alternate" :hreflang "ja" :href (str site-origin "/ja" en-path)}]
-              [:link {:rel "alternate" :hreflang "x-default" :href (str site-origin en-path)}])))
-    (when (some #(= path (str "/" (:path %) "/")) start-languages)
-      (concat
-       (for [{:keys [path lang]} start-languages]
-         [:link {:rel "alternate" :hreflang lang :href (str site-origin "/" path "/")}])
-       [[:link {:rel "alternate" :hreflang "x-default" :href (str site-origin "/start/") }]]))
+    (let [tags (set (map :tag locales/required))
+          segments (str/split path #"/")
+          first-segment (second segments)
+          base-path (if (tags first-segment)
+                      (str "/" (str/join "/" (drop 2 segments))
+                           (when (> (count segments) 2) "/")) path)]
+      (when (contains? #{"/" "/blog/" "/libraries/" "/legal/" "/sponsor/"} base-path)
+        (concat
+         (for [{:keys [tag]} locales/required]
+           [:link {:rel "alternate" :hreflang tag
+                   :href (str site-origin (if (= tag "en") "" (str "/" tag)) base-path)}])
+         [[:link {:rel "alternate" :hreflang "x-default" :href (str site-origin base-path)}]])))
     [:meta {:property "og:site_name" :content "Kotoba"}]
-    [:script {:type "application/ld+json"} "{\"@context\":\"https://schema.org\",\"@type\":\"WebSite\",\"@id\":\"https://kotoba-lang.org/#website\",\"url\":\"https://kotoba-lang.org/\",\"name\":\"Kotoba\",\"publisher\":{\"@type\":\"Organization\",\"name\":\"Kotoba Labs Inc.\"},\"inLanguage\":[\"en\",\"ja\",\"hi\",\"ta\",\"zh-Hans\",\"ar\",\"uk\",\"es\",\"fr\"]}"]
+    [:script {:type "application/ld+json"} "{\"@context\":\"https://schema.org\",\"@type\":\"WebSite\",\"@id\":\"https://kotoba-lang.org/#website\",\"url\":\"https://kotoba-lang.org/\",\"name\":\"Kotoba\",\"publisher\":{\"@type\":\"Organization\",\"name\":\"Kotoba Labs Inc.\"},\"inLanguage\":[\"en\",\"zh-Hans\",\"hi\",\"es\",\"ar\",\"fr\",\"bn\",\"pt\",\"id\",\"ur\",\"ru\",\"de\",\"ja\",\"ko\",\"pcm\",\"arz\",\"mr\",\"ta\",\"uk\"]}"]
         [:meta {:property "og:type" :content "website"}]
     [:meta {:property "og:url" :content (str site-origin path)}]
     [:meta {:property "og:title" :content title}]
@@ -3449,6 +3465,61 @@
                          "Kotoba の公開言語仕様、ツール、検証、evidence を継続的に支援します。"))}
    (sponsor-view :ja)))
 
+(def localized-pages
+  [{:path "/" :view (view)
+    :title "Kotoba — safe, fast language for AI-generated software"
+    :description "Kotoba is designed for safe, ultra-fast AI-generated software. Explore the language, reproducible benchmarks, and the Kotobase and Kotoba Cloud stack."}
+   {:path "/blog/" :view (blog-view) :title "Kotoba Blog — engineering notes and evidence"
+    :description "Kotoba engineering notes about language design, benchmarks, evidence, and remaining qualification gates."}
+   {:path "/libraries/" :view (libraries-view) :title "Kotoba Libraries — content-addressed publication and comparison"
+    :description "Inspect, publish, discover, and compare Kotoba libraries by immutable definition and release CIDs, with GitHub provenance kept separate."}
+   {:path "/legal/" :view (legal-view) :title "Kotoba Labs Inc. — public operator"
+    :description "kotoba-lang.org is operated by Kotoba Labs Inc. Public contact: support@kotoba-lang.org."}
+   {:path "/sponsor/" :view (sponsor-view :en) :title "Sponsor Kotoba — GitHub Sponsors"
+    :description "Sustain Kotoba's public language contracts, tooling, qualification, and evidence through GitHub Sponsors."}])
+
+(defn message-id [s]
+  (.digest (.update (crypto/createHash "sha256") (str/trim s)) "hex"))
+
+(def source-messages
+  (let [messages (atom {})
+        collect (fn [s] (swap! messages assoc (message-id s) (str/trim s)) s)]
+    (doseq [{:keys [view title description]} localized-pages]
+      (locales/map-text view collect) (collect title) (collect description))
+    @messages))
+
+(fs/mkdirSync "site/i18n" #js {:recursive true})
+(fs/writeFileSync "site/i18n/en.json" (str (js/JSON.stringify (clj->js source-messages) nil 2) "\n"))
+(when (= "1" (.-KOTOBA_I18N_EXPORT_ONLY js/process.env))
+  (println "exported" (count source-messages) "English messages")
+  (js/process.exit 0))
+
+(defn translated-page [{:keys [tag dir]} {:keys [path view title description]} catalog]
+  (let [tr (fn [s]
+             (let [v (get catalog (message-id s))]
+               (when (or (not (string? v)) (str/blank? v))
+                 (throw (js/Error. (str "Missing translation " tag " " (message-id s)))))
+               (str (or (re-find #"^\s+" s) "") v (or (re-find #"\s+$" s) ""))))
+        page-path (str "/" tag path)
+        translated-paths (set (map :path localized-pages))
+        resolve-link (fn [href]
+                       (if (or (str/starts-with? href "#")
+                               (re-find #"^(?:[a-z]+:|//)" href)) href
+                           (let [url (js/URL. href (str site-origin path))
+                                 p (.-pathname url)]
+                             (str (if (translated-paths p) (str "/" tag p) p)
+                                  (.-search url) (.-hash url)))))
+        tree (-> view (locales/map-text tr) (locales/rebase-links resolve-link) (locales/mark-language tag))
+        rendered (page/->page
+                  {:title (tr title) :description (tr description) :lang tag :css dds-css :dark? true
+                   :app-css (str tokens/skin-css "\n" app-css "\npre,code,kbd,samp{direction:ltr;unicode-bidi:isolate}pre{text-align:left}")
+                   :head (list (favicon-link) (apple-touch-icon-link)
+                               [:script theme-js] [:script menu-js] [:script chart-anim-head-js]
+                               (og-head page-path (tr title) (tr description)))} tree)]
+    (if (= dir "rtl")
+      (str/replace rendered (str "<html lang=\"" tag "\">")
+                   (str "<html lang=\"" tag "\" dir=\"rtl\">")) rendered)))
+
 (let [out (path/join "site" "dist")]
   (fs/mkdirSync out #js {:recursive true})
   (fs/writeFileSync (path/join out "index.html") html)
@@ -3467,7 +3538,8 @@
   (fs/mkdirSync (path/join out "ja" "sponsor") #js {:recursive true})
   (fs/writeFileSync (path/join out "ja" "sponsor" "index.html") sponsor-ja-html)
   (doseq [copy (cons (assoc start-card-en :path "start" :lang "en"
-                            :agent-href "../agent-quickstart.md") start-card-locales)]
+                            :agent-href "../agent-quickstart.md")
+                       (filter #(contains? #{"ta" "uk"} (:lang %)) start-card-locales))]
     (let [dir (path/join out (:path copy))
           html (start-card-locale-html copy)]
       (fs/mkdirSync dir #js {:recursive true})
@@ -3570,6 +3642,15 @@
       (fs/copyFileSync source target)))
   (println "wrote" (path/join out "index.html")
            (str "(" (.-length html) " bytes)")))
+
+(doseq [locale (rest locales/required)]
+  (let [catalog (js->clj (js/JSON.parse (fs/readFileSync (str "site/i18n/" (:tag locale) ".json") "utf8")))]
+    (doseq [p localized-pages]
+      (let [target (str "site/dist/" (:tag locale) (:path p) "index.html")]
+        (fs/mkdirSync (path/dirname target) #js {:recursive true})
+        (fs/writeFileSync target (translated-page locale p catalog))))))
+
+(fs/writeFileSync "site/dist/_redirects" "/zh /zh-Hans/ 301\n/zh/* /zh-Hans/:splat 301\n")
 
 (let [root "site/dist"
       walk (fn walk [dir]

@@ -579,3 +579,32 @@ visible language links and reciprocal `hreflang` metadata. English and
 Every page has its own canonical URL and is included in the sitemap. Arabic
 uses RTL prose with explicitly LTR code blocks and shared English navigation.
 Install commands and program bytes are identical across locales.
+
+## Shared public languages
+
+ADR-2609091700 defines the common 17-language baseline across the six public
+sites. This generator publishes equivalent home, blog, library introduction,
+operator/legal and sponsorship pages in all 17 languages. Tamil and Ukrainian
+starter pages remain available. `/zh/` redirects to `/zh-Hans/`.
+
+`site/i18n/en.json` is the generated English message inventory. Other JSON
+catalogs are keyed by SHA-256 of each trimmed English source string: changed
+source text cannot silently reuse a stale translation. Export the inventory
+with `KOTOBA_I18N_EXPORT_ONLY=1` and the usual generator command. The normal
+build rejects missing or blank messages. Provenance files record machine
+translation and explicitly leave native-speaker review unverified.
+
+The translation walk preserves executable examples, scripts, URLs, identifiers,
+and upstream repository records. The library catalog's original English data
+is marked `lang="en" translate="no"`; its localized introduction states that
+boundary. Linked external specifications and source reference records retain
+their source language. The language menu preserves the equivalent public page;
+RTL languages isolate executable examples in left-to-right direction.
+
+After generating, verify catalogs, runtime placeholders, all 85 canonical
+pages, reciprocal alternates and unchanged executable examples:
+
+```sh
+nbb --classpath site/src site/test/locales_test.cljs
+nbb --classpath site/src site/test/public_locales_test.cljs
+```
