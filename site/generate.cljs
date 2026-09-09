@@ -1508,7 +1508,7 @@
 
 (defn start-language-nav [lang]
   [:nav {:aria-label "Quickstart languages" :lang "en" :dir "ltr"}
-   [:div {:class "kot-actions"}
+   [:div {:class "kot-actions" :style "display:flex;flex-wrap:wrap"}
     (for [{:keys [path label] target-lang :lang} start-languages]
       [:a (cond-> {:class "kot-link" :href (str "/" path "/")
                    :lang target-lang :hreflang target-lang}
