@@ -1,5 +1,5 @@
 (ns kotoba.site.locales
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.walk :as walk]))
 
 ;; ADR-2609091700, manifest/public-site-locales.edn in the superproject.
