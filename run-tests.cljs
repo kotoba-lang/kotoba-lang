@@ -92,6 +92,57 @@
 ;;
 ;; The remaining `.clj` tests are NOT here and are not all unconvertible: any
 ;; not named above as file-read-bound is simply not yet converted.
+;;
+;; 2026-09-09, third pass: re-measured the nine `.cljc` SOURCES the second
+;; pass's list above named as reached only by `.clj` tests
+;; (`scripts/verify-portable-source-tested-on-one-host.cljs` in the
+;; superproject, not the list itself, is the instrument -- the list had
+;; already drifted: `capability_values_test.clj`, `incidence_test.clj` and
+;; `incidence_datoms_test.clj` had separately become reached by a portable
+;; test each in the interim, and `cli_adapter_matrix_test.clj` had joined it).
+;; All nine turned out to be SPLITTABLE, not blocked: in every case the
+;; validation/identity/probe LOGIC under test takes its input as an explicit
+;; argument, and only a `load-*`/`slurp` wrapper or a top-level `(read-...)`
+;; touches a file. Each gained a `*-portable-test.cljc` sibling (the pattern
+;; `kotoba-lang/kotoba` already uses) that exercises the same logic against
+;; synthetic or locally-computed data instead of the real repository files;
+;; the real-file assertions (and, for `host_parity_test.clj`, the ones that
+;; compare against real catalog data the cljs stub cannot supply) stay in
+;; the original `.clj` files. Two needed a genuine substitution beyond a
+;; reader-conditional:
+;;
+;;   - `kotoba.lang.code-identity-portable-test`: `identity/i64` does
+;;     `(str n)`, so calling it with a raw integer literal above 2^53-1 is
+;;     exactly the failure this file's own `normalize` exists to catch -- the
+;;     reader has already rounded the literal before `i64` sees it. Passing
+;;     the digits as a STRING literal instead makes `(i64 "9007199254740993")`
+;;     carry the exact value on both hosts, which is what the JVM test relies
+;;     on to keep two large i64 neighbours distinct.
+;;   - `kotoba.lang.type-system-portable-test`: two assertions parse a `defn`
+;;     form carrying `^{...}` metadata with plain `read-string`, which is
+;;     `clojure.core/read-string` (the full reader) on the JVM and does not
+;;     resolve on this host at all; `cljs.reader/read-string` reads the same
+;;     forms and is aliased to the same name here.
+;;
+;; `kotoba.lang.host-parity-portable-test` is not a substitution but a mirror:
+;; rather than force the JVM test's real-catalog assertions to pass against
+;; the cljs stub (rejected on 2026-09-08 for exactly that reason, see above),
+;; it asserts the STUB's own contract -- `catalog-available?` false,
+;; `:source :unavailable`, empty matrix/imports, `:status :catalog-unavailable`
+;; -- which is real, honest, and true only on this host.
+;;
+;; `kotoba.lang.authority-claim-lowering-portable-test` looked like the
+;; hardest of the nine (it drives `kotoba.sema`, the compiler frontend, across
+;; a whole probe grid) and turned out to need no substitution at all:
+;; `kotoba.sema` is already a portable `.cljc` and loads and runs on nbb
+;; unmodified (verified directly). The real blocker for most of that file's
+;; assertions is `kotoba.lang.authority-claims/load-guest-grammar` and
+;; `.../load-surface-status`; those three assertions stay in the `.clj` file.
+;; But `feature-keys-that-are-not-heads` is a literal data map in the SOURCE,
+;; not file-loaded, so `the-not-a-head-table-does-not-hide-a-head` needed only
+;; the probe infrastructure -- which ports over `format` (unresolved on this
+;; host; `kotoba.lang.text/format`, already aliased `str` in that file, is the
+;; portable equivalent the test already had a name for).
 (ns run-tests
   (:require [cljs.test :as t]
             [kotoba.lang.causal-receipt-test]
@@ -109,7 +160,16 @@
             [kotoba.lang.package-registry-test]
             [kotoba.lang.portable-effect-test]
             [kotoba.lang.signed-readback-test]
-            [kotoba.lang.trusted-admission-test]))
+            [kotoba.lang.trusted-admission-test]
+            [kotoba.cli-portable-test]
+            [kotoba.lang.code-identity-portable-test]
+            [kotoba.lang.definition-patch-portable-test]
+            [kotoba.lang.cli-adapter-matrix-portable-test]
+            [kotoba.lang.type-system-portable-test]
+            [kotoba.lang.conformance-matrix-portable-test]
+            [kotoba.lang.surface-matrix-portable-test]
+            [kotoba.lang.host-parity-portable-test]
+            [kotoba.lang.authority-claim-lowering-portable-test]))
 
 (defmethod t/report [:cljs.test/default :end-run-tests] [m]
   (println (str "\nnbb: " (:test m) " tests, " (:pass m) " passed, "
@@ -132,4 +192,13 @@
              'kotoba.lang.package-registry-test
              'kotoba.lang.portable-effect-test
              'kotoba.lang.signed-readback-test
-             'kotoba.lang.trusted-admission-test)
+             'kotoba.lang.trusted-admission-test
+             'kotoba.cli-portable-test
+             'kotoba.lang.code-identity-portable-test
+             'kotoba.lang.definition-patch-portable-test
+             'kotoba.lang.cli-adapter-matrix-portable-test
+             'kotoba.lang.type-system-portable-test
+             'kotoba.lang.conformance-matrix-portable-test
+             'kotoba.lang.surface-matrix-portable-test
+             'kotoba.lang.host-parity-portable-test
+             'kotoba.lang.authority-claim-lowering-portable-test)

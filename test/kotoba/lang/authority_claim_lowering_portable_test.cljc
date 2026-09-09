@@ -1,0 +1,104 @@
+(ns kotoba.lang.authority-claim-lowering-portable-test
+  "The genuinely portable slice of kotoba.lang.authority-claim-lowering-test.
+
+  `kotoba.sema` (the compiler frontend this file measures) is a `.cljc` and
+  loads and runs fine under nbb -- verified directly before writing this file.
+  The blocker for MOST of the JVM test's assertions is not the frontend, it is
+  `kotoba.lang.authority-claims/load-guest-grammar` and
+  `.../load-surface-status`, whose `:cljs` branches deliberately throw
+  (reading `lang/guest-grammar.edn` / `lang/surface-status.edn` off disk has
+  no ClojureScript implementation in this namespace). Those stay in
+  kotoba.lang.authority-claim-lowering-test (.clj):
+  `every-claimed-head-has-a-lowering`, `a-recorded-exception-must-still-be-a-
+  gap`, and `every-key-of-both-authorities-is-read-or-recorded` all call
+  `ac/load-guest-grammar` / `ac/load-surface-status`.
+
+  `kotoba.lang.authority-claims/feature-keys-that-are-not-heads` is a literal
+  data map in the source, not file-loaded -- so
+  `the-not-a-head-table-does-not-hide-a-head` needs only the probe
+  infrastructure below, and it is this file's one assertion that actually
+  reaches `kotoba.lang.authority-claims` (the finding this file resolves).
+  `the-negative-control-is-refused-everywhere` validates that same probe
+  infrastructure and is included alongside it, though on its own it does not
+  touch `kotoba.lang.authority-claims`.
+
+  One conversion needed: bare `format` does not resolve on this host (nbb has
+  no `java.util.Formatter`); `kotoba.lang.text/format` is the portable
+  equivalent and the source test file already aliases that namespace as
+  `str`, so this file uses `str/format` in its place."
+  (:require #?(:clj [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.lang.text :as str]
+            [kotoba.lang.authority-claims :as ac]
+            [kotoba.sema :as sema]))
+
+(def ^:private control-head
+  "A head no authority claims and no frontend admits."
+  "zzz-no-such-head-9r3k")
+
+(def ^:private argument-shapes
+  ["0" ":a" "\"s\"" "[7 8 9]" "{:a 1}" "#{:a}" "true"])
+
+(def ^:private positions
+  {:call (fn [call] (str/format "(defn main [] %s)" call))
+   :top-level (fn [call] (str/format "%s (defn main [] 0)" call))
+   :loop-body (fn [call]
+                (str/format "(defn main [] (loop [i 0] (if (< i 1) %s i)))" call))})
+
+(def ^:private cells
+  (vec (concat (for [n (range 0 5) p (keys positions)] [p n :i64 (str/join (repeat n " 0"))])
+               (for [n (range 1 5) s argument-shapes p (keys positions)]
+                 [p n s (str/join (repeat n (str " " s)))]))))
+
+(defn- analyze-outcome
+  [source]
+  (try (do (sema/analyze source) ::admitted)
+       (catch #?(:clj Throwable :cljs :default) e (first (str/split-lines (str (ex-message e)))))))
+
+(defn- source-for [head [position _ _ args]]
+  ((positions position) (str/format "(%s%s)" head args)))
+
+(def ^:private baseline
+  (delay (into {} (for [c cells] [(subvec c 0 3) (analyze-outcome (source-for control-head c))]))))
+
+(defn- measure
+  [head]
+  (loop [[c & more] cells, refused nil]
+    (if (nil? c)
+      (or refused {:verdict :absent :msg (@baseline [:call 1 :i64])})
+      (let [outcome (analyze-outcome (source-for head c))
+            [position arity shape] c]
+        (cond
+          (= ::admitted outcome)
+          {:verdict :admitted :position position :arity arity :shape shape}
+
+          (= outcome (@baseline (subvec c 0 3)))
+          (recur more refused)
+
+          :else
+          (recur more (or refused {:verdict :refused-for-argument :msg outcome
+                                   :position position :arity arity :shape shape})))))))
+
+(deftest the-negative-control-is-refused-everywhere
+  (let [answers (vals @baseline)]
+    (is (= (count cells) (count answers)))
+    (is (not-any? #(= ::admitted %) answers)
+        (str "the control head was ADMITTED somewhere; every 'this head exists'
+              verdict in this file is then unfalsifiable. cells: "
+             (pr-str (keep (fn [[c a]] (when (= ::admitted a) c)) @baseline))))
+    (is (contains? (set answers) "operation has no admitted lowering")
+        "the control never produced the frontend's own absence refusal, so the
+         probe is not reaching the dispatch this file claims to measure")))
+
+(deftest the-not-a-head-table-does-not-hide-a-head
+  (let [entries (filter (comp nil? :head val) ac/feature-keys-that-are-not-heads)]
+    (is (pos? (count entries)) "the table is empty; this assertion measured nothing")
+    (doseq [[k _] entries]
+      (testing (str k)
+        (let [m (measure (name k))]
+          (is (= :absent (:verdict m))
+              (str (name k) " is excluded from the claim enumeration as `not a
+                    call head`, but the frontend has an arm for it: "
+                   (pr-str m)
+                   ". Either give the entry a :head, or remove it from
+                    feature-keys-that-are-not-heads.")))))))
