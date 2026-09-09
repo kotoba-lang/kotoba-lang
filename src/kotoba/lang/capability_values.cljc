@@ -119,6 +119,11 @@
    ;; 35 so native (amu KEXE) guests can lower fs-read/fs-write against
    ;; the loader provider table (ADR-2609051100 slice 4 task 1).
    :host/fs-app-data :host/fs-app-data
+   ;; io/write (compiler wire id 37) — the bytes a COMMAND writes to its
+   ;; standard output. Deliberately its own effect and NOT :host/log-append:
+   ;; a command's stdout is its answer, an audit record is a different thing,
+   ;; and a grant for one must not carry the other.
+   :host/io-write :host/io-write
    ;; data/json (capability id 246, kotoba-core-contracts) — JSON wire-format
    ;; ops (json-encode / json-extract-field). One kind for the family, the
    ;; same convention as topic-* sharing :host/topic-subscribe. Resource
