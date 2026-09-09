@@ -26,11 +26,18 @@
 (def text-attributes #{:title :alt :aria-label :placeholder :data-count-template :data-verifying :data-success :data-error})
 
 (defn mark-language [node tag]
-  (walk/postwalk
-   (fn [x]
-     (if (and (map? x) (:hreflang x))
-       (cond-> (dissoc x :aria-current)
-         (= tag (:hreflang x)) (assoc :aria-current "page")) x)) node))
+  (let [label (or (:label (first (filter #(= tag (:tag %)) required))) tag)]
+    (walk/postwalk
+     (fn [x]
+       (cond
+         (and (vector? x) (map? (second x)) (:data-language-selector-current (second x)))
+         [(first x) (second x) label]
+         (and (map? x) (:data-language-selector-opener x))
+         (assoc x :aria-label (str "Language: " label))
+         (and (map? x) (:hreflang x))
+         (cond-> (dissoc x :aria-current :data-current)
+           (= tag (:hreflang x)) (assoc :aria-current "page" :data-current true))
+         :else x)) node)))
 
 (defn translatable? [s]
   (and (string? s) (re-find #"[A-Za-z]" s)

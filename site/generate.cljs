@@ -7,6 +7,7 @@
 
 (require '[jp-go-dds.core :as dds]
          '[jp-go-dds.theme-toggle :as theme]
+         '[jp-go-dds.behavior :as behavior]
          '[jp-go-dds.page :as page]
          '[jp-go-dds.tokens :as tokens]
          '[kotoba.grammar.highlight :as grammar-highlight]
@@ -253,7 +254,10 @@
   (println "  set KOTOBA_GRAMMAR_ROOT to the kotoba-lang/grammar checkout")
   (js/process.exit 1))
 
-(def dds-css (fs/readFileSync dds-css-path "utf8"))
+(def dds-css (str (fs/readFileSync dds-css-path "utf8")
+                  (str/join "\n" (for [component ["language-selector" "menu-list-box" "menu-list"]]
+                                     (fs/readFileSync (path/join dds-root "resources/jp_go_dds/components" (str component ".css")) "utf8")))
+                  behavior/language-selector-css))
 (def syntax-grammar-json (fs/readFileSync syntax-grammar-path "utf8"))
 (def syntax-grammar
   (js->clj (js/JSON.parse syntax-grammar-json) :keywordize-keys true))
@@ -633,7 +637,9 @@
    ;; 320px is the one width that cannot hold a fourth control beside the
    ;; wordmark; from 23rem it can, so GitHub appears there.
    "#kot-gh{display:none}"
-   "@media(min-width:23rem){#kot-gh{display:inline-flex}"
+   "@media(min-width:48rem){#kot-gh{display:inline-flex}}"
+   "@media(max-width:47.99rem){.kot-header__inner{flex-wrap:wrap}.kot-nav{margin-inline-start:auto;flex-wrap:wrap}.kot-header__inner [data-language-selector-current]{max-inline-size:6rem}}"
+   "@media(min-width:23rem){"
    ".kot-logo{height:calc(15 / 16 * 1rem)}.kot-paren{font-size:1rem}}"
    "@media(min-width:26rem){.kot-logo{height:calc(17 / 16 * 1rem)}"
    ".kot-paren{font-size:1.15rem}}"
@@ -916,13 +922,6 @@
             [:path {:d "M4 8.5 12 16l8-7.5" :fill "none" :stroke "currentcolor"
                     :stroke-width 2 :stroke-linecap "round" :stroke-linejoin "round"}]]]
           [:div {:class "kot-menu-panel"}
-           [:div {:class "kot-menu-group" :translate "no" :lang "en" :dir "ltr"}
-            [:p {:class "kot-menu-group-label"} "Languages"]
-            [:ul {:class "kot-menu-list"}
-             (for [{:keys [tag label]} locales/required]
-               [:li [:a {:class "kot-menu-link" :href (str (when (not= tag "en") (str "/" tag)) page-path)
-                          :lang tag :hreflang tag :data-site-language tag
-                          :aria-current (when (= tag "en") "page")} label]])]]
            [:div {:class "kot-menu-group"}
             [:p {:class "kot-menu-group-label"} "On this page"]
             [:ul {:class "kot-menu-list"}
@@ -935,6 +934,12 @@
               [:ul {:class "kot-menu-list"}
                (for [{:keys [label href]} items]
                  [:li [:a {:class "kot-menu-link" :href (local-href href)} label]])]])]]
+         (dds/language-selector
+          {:id-prefix "kot-header-language" :current "en"
+           :attrs {:translate "no" :lang "en" :dir "ltr"}
+           :languages (mapv (fn [{:keys [tag label name]}]
+                              {:code tag :label label :aliases name
+                               :href (str (when (not= tag "en") (str "/" tag)) page-path)}) locales/required)})
          theme-toggle]])])))
 
 (def fallback-svg
@@ -1016,7 +1021,7 @@
   this does is stop an open panel from covering the section the reader just
   jumped to. Delegated from `document` for the same reason the theme script
   is: one head script, every page, no dependency on the element existing yet."
-  (str "(function(){"
+  (str behavior/language-selector-script "(function(){"
        "document.addEventListener('click',function(e){"
        "var t=e.target;while(t&&t!==document){"
        "if(t.tagName==='A'&&t.className&&t.className.indexOf&&"
@@ -1516,13 +1521,12 @@
            {:path "uk" :lang "uk" :label "Українська"}]))
 
 (defn start-language-nav [lang]
-  [:nav {:aria-label "Languages" :lang "en" :dir "ltr" :translate "no"}
-   [:div {:class "kot-actions" :style "display:flex;flex-wrap:wrap"}
-    (for [{:keys [path label] target-lang :lang} start-languages]
-      [:a (cond-> {:class "kot-link" :href (if (str/blank? path) "/" (str "/" path "/"))
-                   :lang target-lang :hreflang target-lang}
-            (= lang target-lang) (assoc :aria-current "page"))
-       [:bdi label]])]])
+  (dds/language-selector
+   {:id-prefix "kot-start-language" :current lang
+    :attrs {:translate "no" :lang "en" :dir "ltr"}
+    :languages (mapv (fn [{:keys [path label name] target-lang :lang}]
+                       {:code target-lang :label label :aliases name
+                        :href (if (str/blank? path) "/#start" (str "/" path "/#start"))}) start-languages)}))
 
 (defn start-section
   ([] (start-section start-card-en))
