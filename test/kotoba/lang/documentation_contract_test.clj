@@ -178,7 +178,7 @@
     (is (str/includes? english "href=\"../ja/libraries/\">日本語</a>"))
     (is (str/includes? japanese "lang=\"ja\""))
     (is (str/includes? japanese "名前はコードを見つける。Hash は、それが何かを示す。"))
-    (is (str/includes? japanese "href=\"../../libraries/\">English</a>"))
+    (is (str/includes? japanese "href=\"/libraries/\" lang=\"en\" hreflang=\"en\""))
     (is (str/includes? japanese "Passkey-hosted publish"))
     (is (str/includes? japanese "fragment-only の承認 URL"))
     (is (str/includes? japanese "--hosted"))))
