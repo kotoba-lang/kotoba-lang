@@ -13,7 +13,7 @@
   (let [authority (catalog/validate! (catalog/read-authority))
         entries (:capabilities authority)
         wire-ids (sort (map :compiler-wire-id (vals entries)))]
-    (is (= 37 (count entries)))
+    (is (= 38 (count entries)))
     (is (= (range 1 (inc (count entries))) wire-ids)
         "wire ids stay contiguous from 1 with no duplicates or gaps")
     (is (= [4 11 12]
@@ -77,7 +77,16 @@
     ;; and one grant must not carry both.
     (is (= 37 (get-in entries [:io/write :compiler-wire-id])))
     (is (= 'io/write (get-in entries [:io/write :source-operation])))
-    (is (= :host/io-write (get-in entries [:io/write :effect])))))
+    (is (= :host/io-write (get-in entries [:io/write :effect])))
+    ;; cli/args gets compiler wire 38: the arguments a command was invoked
+    ;; with. With :io/write it completes the pair a command cannot be built
+    ;; without -- one to see what it was asked, one to answer.
+    ;;
+    ;; Its own effect, not shared with :host/io-write: seeing how a process
+    ;; was invoked and producing output are different authorities.
+    (is (= 38 (get-in entries [:cli/args :compiler-wire-id])))
+    (is (= 'cli/args (get-in entries [:cli/args :source-operation])))
+    (is (= :host/cli-args (get-in entries [:cli/args :effect])))))
 
 (deftest duplicate-wire-id-fails-closed
   (let [authority (catalog/read-authority)]
