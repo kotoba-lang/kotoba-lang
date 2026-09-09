@@ -178,7 +178,11 @@
     (is (str/includes? english "href=\"../ja/libraries/\">日本語</a>"))
     (is (str/includes? japanese "lang=\"ja\""))
     (is (str/includes? japanese "名前はコードを見つける。Hash は、それが何かを示す。"))
-    (is (str/includes? japanese "href=\"/libraries/\" lang=\"en\" hreflang=\"en\""))
+    (is (some (fn [anchor]
+                (every? #(str/includes? anchor %)
+                        ["href=\"/libraries/\"" "lang=\"en\"" "hreflang=\"en\""]))
+              (re-seq #"<a\s[^>]*>" japanese))
+        "an English library link must preserve its destination and locale, independent of attribute order")
     (is (str/includes? japanese "Passkey-hosted publish"))
     (is (str/includes? japanese "fragment-only の承認 URL"))
     (is (str/includes? japanese "--hosted"))))
