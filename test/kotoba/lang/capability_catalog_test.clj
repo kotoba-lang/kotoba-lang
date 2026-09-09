@@ -13,7 +13,7 @@
   (let [authority (catalog/validate! (catalog/read-authority))
         entries (:capabilities authority)
         wire-ids (sort (map :compiler-wire-id (vals entries)))]
-    (is (= 38 (count entries)))
+    (is (= 39 (count entries)))
     (is (= (range 1 (inc (count entries))) wire-ids)
         "wire ids stay contiguous from 1 with no duplicates or gaps")
     (is (= [4 11 12]
@@ -86,7 +86,16 @@
     ;; was invoked and producing output are different authorities.
     (is (= 38 (get-in entries [:cli/args :compiler-wire-id])))
     (is (= 'cli/args (get-in entries [:cli/args :source-operation])))
-    (is (= :host/cli-args (get-in entries [:cli/args :effect])))))
+    (is (= :host/cli-args (get-in entries [:cli/args :effect])))
+    ;; io/write-error gets compiler wire 39: a command's DIAGNOSTIC output.
+    ;; Its own effect, asserted here, because sharing :host/io-write would let
+    ;; a grant meant for complaining put bytes into the answer.
+    (is (= 39 (get-in entries [:io/write-error :compiler-wire-id])))
+    (is (= 'io/write-error (get-in entries [:io/write-error :source-operation])))
+    (is (= :host/io-write-error (get-in entries [:io/write-error :effect])))
+    (is (not= (get-in entries [:io/write :effect])
+              (get-in entries [:io/write-error :effect]))
+        "stdout and stderr must not share an effect")))
 
 (deftest duplicate-wire-id-fails-closed
   (let [authority (catalog/read-authority)]

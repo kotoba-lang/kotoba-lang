@@ -129,6 +129,10 @@
    ;; authority as producing output, and a grant for one must not carry the
    ;; other.
    :host/cli-args :host/cli-args
+   ;; io/write-error (compiler wire id 39) — a command's DIAGNOSTIC output.
+   ;; Its own effect and not :host/io-write: stdout is the answer, stderr is
+   ;; not, and one grant must not carry both.
+   :host/io-write-error :host/io-write-error
    ;; data/json (capability id 246, kotoba-core-contracts) — JSON wire-format
    ;; ops (json-encode / json-extract-field). One kind for the family, the
    ;; same convention as topic-* sharing :host/topic-subscribe. Resource
