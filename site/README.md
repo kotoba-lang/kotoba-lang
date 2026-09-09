@@ -391,7 +391,8 @@ generator refuses to run when any asset is missing.
 
 Output: `site/dist/index.html`, `site/dist/blog/index.html`,
 `site/dist/legal/index.html`, `site/dist/sponsor/index.html`,
-`site/dist/ja/sponsor/index.html`, `site/dist/sponsorship.edn`, the Play artifact
+`site/dist/ja/sponsor/index.html`, start-card-only locale pages at
+`site/dist/{hi,ta,zh-Hans,ar,uk,es,fr}/index.html`, `site/dist/sponsorship.edn`, the Play artifact
 and evidence, the wordmark,
 AI-agent text surfaces, and the raw benchmark JSON (committed, so a clean
 checkout can deploy without running the generator).
