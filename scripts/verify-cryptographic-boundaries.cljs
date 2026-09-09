@@ -3,7 +3,7 @@
   (:require ["node:fs" :as fs]
             ["node:path" :as path]
             [cljs.reader :as reader]
-            [clojure.string :as str]))
+            [kotoba.lang.text :as str]))
 
 (def required-keys
   [:boundary/id :boundary/owner :boundary/kind :boundary/classification
@@ -11,7 +11,7 @@
 
 (defn- pq-suite? [suite]
   (and suite
-       (let [text (str/lower-case (name suite))]
+       (let [text (str/lower (name suite))]
          (or (str/includes? text "ml-kem")
              (str/includes? text "ml-dsa")))))
 
@@ -72,7 +72,7 @@
                        (or (not= :external (:boundary/admission boundary))
                            (not (false? (:boundary/pq-required boundary)))))
               [{:problem :boundary/external-classification-invalid :boundary id}])
-            (when (str/includes? (str/lower-case (str (:boundary/suite boundary)))
+            (when (str/includes? (str/lower (str (:boundary/suite boundary)))
                                  "classical-only")
               [{:problem :boundary/classical-only-suite :boundary id}]))))
        boundaries)))))

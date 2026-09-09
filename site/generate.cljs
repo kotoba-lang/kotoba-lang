@@ -12,7 +12,7 @@
          '[jp-go-dds.tokens :as tokens]
          '[kotoba.grammar.highlight :as grammar-highlight]
          '[cljs.reader :as reader]
-         '[clojure.string :as str]
+         '[kotoba.lang.text :as str]
          '[kotoba.site.locales :as locales]
          '[kotoba.site.hero :as hero]
          '[kotoba.site.chart :as chart]
@@ -1391,7 +1391,7 @@
          (dds/grid
           {:min "18rem"}
           (for [{:keys [status headline body]} (:claims product-defaults)]
-            (card (dds/chip-label (-> status name str/upper-case
+            (card (dds/chip-label (-> status name str/upper
                                       (str/replace "-" " "))
                                   {:color (if (contains? #{:default :ready-bounded} status)
                                             "blue" "gray")})
@@ -1838,7 +1838,7 @@
     (card (dds/chip-label "NO PURCHASE")
           (dds/heading 3 "Support is not authority" {:size "24"})
           [:p "Sponsorship does not buy a feature, roadmap priority, support SLA, private access, or a security exception."]))
-   (caption "Sponsorship status: " (str/upper-case (name (:status sponsorship)))
+   (caption "Sponsorship status: " (str/upper (name (:status sponsorship)))
             ". Checked " (:checked-at sponsorship) ".")))
 
 (defn blog-cloud-section []
@@ -2215,7 +2215,7 @@
         runs (get-in benchmark [:method :runs])
         chip (get-in benchmark [:environment :chip])
         measured-date (subs (:generatedAt benchmark) 0 10)
-        kotoba-version (str/upper-case (get-in benchmark [:environment :kotoba]))
+        kotoba-version (str/upper (get-in benchmark [:environment :kotoba]))
         rust-version (str/join " " (take 2 (str/split (get-in benchmark [:environment :rustc]) #" ")))
         comparators (:comparators runtime-benchmark)
         domains (:domains runtime-benchmark)
@@ -2474,7 +2474,7 @@
                  (str (:p95Milliseconds result) " ms")
                  (str (:medianRatioToKotoba result) "× Kotoba")])})]
      (caption
-      (str kotoba-version " · " (str/upper-case rust-version) " · "
+      (str kotoba-version " · " (str/upper rust-version) " · "
            (get-in benchmark [:environment :clang]) " · "
            (get-in benchmark [:environment :javac])
            ". Kotoba, Rust, and C emit Wasm; javac emits a class file. "
@@ -2658,7 +2658,7 @@
     {:min "19rem"}
     (for [{:keys [id claim tcb residual-risk]} (:claims safety-claims)]
       (card
-       (dds/chip-label (str/upper-case (name id)))
+       (dds/chip-label (str/upper (name id)))
        [:p claim]
        (dds/divider)
        [:p [:strong "Trusted computing base"]]
@@ -2666,7 +2666,7 @@
        [:p [:strong "Residual risk"]]
        (bullets residual-risk))))
    (caption "Qualification "
-            (str/upper-case (name (:kotoba.lang.safety-claims/qualification safety-claims)))
+            (str/upper (name (:kotoba.lang.safety-claims/qualification safety-claims)))
             ", as of " (:kotoba.lang.safety-claims/as-of safety-claims) ".")))
 
 (defn deliberate-section []
@@ -2701,7 +2701,7 @@
             (dds/heading 3 (:tag implementation) {:size "24"})
             (caption "profile binding: " (name (:language-profile-binding implementation))))
       (card (dds/chip-label "PUBLIC DEFAULT")
-            (dds/heading 3 (str/upper-case (name (:status public))) {:size "24"})
+            (dds/heading 3 (str/upper (name (:status public))) {:size "24"})
             (caption (str (:code public)))))
      [:p (:reason public)]
      (external-link "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/generated/release.md"
@@ -2726,7 +2726,7 @@
         :data-count-template "Results: {shown}"}]
    [:div {:id "kot-doc-search-results"}
     (for [{:keys [kind title body url keywords]} search-index
-          :let [haystack (str/lower-case (str title " " body " " (str/join " " keywords)))]]
+          :let [haystack (str/lower (str title " " body " " (str/join " " keywords)))]]
       [:div {:class "kot-search-item" :data-search haystack}
        (card (dds/chip-label (name kind))
              (dds/heading 3 (if (= kind :cli) [:code title] title) {:size "20"})
@@ -2785,7 +2785,7 @@
    [:p {:class "kot-caption kot-muted"}
     "Language profile " (get-in docs-release [:contract :language-profile])
     "; public-default release status: "
-    (str/upper-case (name (get-in docs-release [:public-default :status]))) ". "]
+    (str/upper (name (get-in docs-release [:public-default :status]))) ". "]
    [:p {:class "kot-caption kot-muted"}
     "The primary portable platform is WebAssembly Components with WASI "
     (get-in platform [:upstream :wasi :version]) ". The elaboration pipeline has "
@@ -3263,8 +3263,8 @@
                      "支払い、領収、変更、停止は GitHub の sponsorship 画面で管理します。"
                      "GitHub handles payment, receipts, changes, and cancellation.")]))
         (caption (if ja?
-                   (str "現在の状態: " (str/upper-case (name (:status sponsorship))) "。確認日: " (:checked-at sponsorship) "。")
-                   (str "Current status: " (str/upper-case (name (:status sponsorship))) ". Checked " (:checked-at sponsorship) "."))))
+                   (str "現在の状態: " (str/upper (name (:status sponsorship))) "。確認日: " (:checked-at sponsorship) "。")
+                   (str "Current status: " (str/upper (name (:status sponsorship))) ". Checked " (:checked-at sponsorship) "."))))
 
        (dds/section
         {:id "funds" :title (if ja? "支援で継続するもの" "What funding sustains")}

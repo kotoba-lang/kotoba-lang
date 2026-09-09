@@ -45,7 +45,7 @@
 ;; exit 2 REFUSED — could not measure; nothing written
 
 (ns generate-q9-inventory
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.edn :as edn]
             ["fs" :as fs]
             ["path" :as path]

@@ -1,6 +1,6 @@
 (ns public-locales-test
   (:require [cljs.test :refer [deftest is run-tests]]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba.site.locales :as locales]
             ["node:fs" :as fs]))
 

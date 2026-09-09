@@ -14,7 +14,7 @@
 (ns jvm-port-order
   (:require ["node:fs" :as fs]
             ["node:path" :as path]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [cljs.pprint]))
 
 (def ^:private argv (vec (js->clj js/process.argv)))

@@ -1,7 +1,7 @@
 #!/usr/bin/env nbb
 (ns generate-docs-reference
   (:require [cljs.reader :as reader]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             ["fs" :as fs]
             ["path" :as path]))
 
@@ -84,7 +84,7 @@
         public (:public-default release-binding)]
     (str (heading "Generated Kotoba release binding")
          "> Generated from [`lang/docs-release.edn`](../../lang/docs-release.edn). Do not edit by hand.\n\n"
-         "Public default: **" (str/upper-case (name (:status public))) "** (`" (:code public) "`).\n\n"
+         "Public default: **" (str/upper (name (:status public))) "** (`" (:code public) "`).\n\n"
          (:reason public) "\n\n"
          "| Axis | Recorded value |\n|---|---|\n"
          "| Current contract | language profile " (:language-profile contract)

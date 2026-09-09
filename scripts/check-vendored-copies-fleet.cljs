@@ -38,7 +38,7 @@
             ["node:crypto" :as crypto]
             ["node:fs" :as fs]
             [clojure.edn :as edn]
-            [clojure.string :as str]))
+            [kotoba.lang.text :as str]))
 
 (def argv (vec (drop 2 (js->clj (.-argv js/process)))))
 

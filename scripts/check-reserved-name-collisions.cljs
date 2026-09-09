@@ -43,7 +43,7 @@
 ;; exit 2  REFUSED -- could not establish the head set or found nothing to scan
 
 (ns check-reserved-name-collisions
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.edn :as edn]
             ["fs" :as fs]
             ["path" :as path]))
