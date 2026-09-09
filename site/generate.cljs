@@ -1257,8 +1257,8 @@
     [:blockquote {:class "kot-quote"}
      [:strong "When AI generates, builds, tests, and regenerates code continuously, build latency becomes infrastructure throughput."]]
     [:div {:class "kot-actions"}
-     (dds/button "See how it works" {:href "#architecture" :size "lg"})
-     (dds/button "Start with Kotoba" {:href "#start" :type :outline :size "lg"})
+     (dds/button "Install and run" {:href "#start" :size "lg"})
+     (dds/button "See how it works" {:href "#architecture" :type :outline :size "lg"})
      (dds/button "AI agent setup" {:href "./agent-quickstart.md" :type :text :size "lg"})]
     [:div {:class "kot-proof"}
      (dds/grid {:min "14rem"}
