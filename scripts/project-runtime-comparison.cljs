@@ -29,7 +29,7 @@
 ;;          must not become a published ranking; that is the whole reason the
 ;;          previous artifact withheld its timings.
 
-(require '[clojure.string :as str])
+(require '[kotoba.lang.text :as str])
 (def fs (js/require "node:fs"))
 (def crypto (js/require "node:crypto"))
 

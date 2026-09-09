@@ -1,7 +1,7 @@
 #!/usr/bin/env nbb
 (ns check-docs
   (:require [cljs.reader :as reader]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             ["child_process" :as child]
             ["fs" :as fs]
             ["path" :as path]))

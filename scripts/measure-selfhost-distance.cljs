@@ -26,7 +26,7 @@
   (:require ["node:fs" :as fs]
             ["node:path" :as path]
             ["node:child_process" :as cp]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [cljs.pprint]
             [kotoba.compiler.kotoba-reader :as kr]))
 
