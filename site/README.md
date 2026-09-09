@@ -601,10 +601,16 @@ boundary. Linked external specifications and source reference records retain
 their source language. The language menu preserves the equivalent public page;
 RTL languages isolate executable examples in left-to-right direction.
 
-After generating, verify catalogs, runtime placeholders, all 85 canonical
+After generating, verify catalogs, runtime placeholders, all 102 canonical
 pages, reciprocal alternates and unchanged executable examples:
 
 ```sh
 nbb --classpath site/src site/test/locales_test.cljs
 nbb --classpath site/src site/test/public_locales_test.cljs
 ```
+
+## CSF assessment article
+
+`site/security-article.edn` holds the dated public article; `docs/security/csf2-threat-model.md` carries the English source-backed model, control boundaries and selected CSF mapping. The article is generated at `/blog/csf2-attack-graphs/` and all 16 translated equivalents, linked from each localized blog. New source strings use the shared root `scripts/model-eval/bench.cljs translate` policy with explicit public input. Translation receipts and provenance remain separate from native-language quality certification.
+
+The article does not claim a completed enterprise hosted-apply service, NIST certification, comprehensive compliance or live attack-test coverage. Keep its measurement date, source identities and distinctions between design, local implementation tests and operating evidence.
