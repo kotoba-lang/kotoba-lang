@@ -124,6 +124,11 @@
    ;; a command's stdout is its answer, an audit record is a different thing,
    ;; and a grant for one must not carry the other.
    :host/io-write :host/io-write
+   ;; cli/args (compiler wire id 38) — the arguments a COMMAND was invoked
+   ;; with. Its own effect: seeing how a process was invoked is not the same
+   ;; authority as producing output, and a grant for one must not carry the
+   ;; other.
+   :host/cli-args :host/cli-args
    ;; data/json (capability id 246, kotoba-core-contracts) — JSON wire-format
    ;; ops (json-encode / json-extract-field). One kind for the family, the
    ;; same convention as topic-* sharing :host/topic-subscribe. Resource
