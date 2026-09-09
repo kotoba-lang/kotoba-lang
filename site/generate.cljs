@@ -1396,28 +1396,118 @@
          [[:p {:class "kot-caption kot-muted"}
            "Internal production use is dogfooding evidence only. It does not imply external customers, paid pilots, or revenue."]]))
 
-(defn start-section []
-  (dds/section
-   {:id "start" :title "Start in sixty seconds"}
-   (dds/grid
-    {:min "20rem"}
-    (card (dds/heading 3 "Install and self-check" {:size "24"})
-          [:pre {:class "kot-pre"}
-           [:code "brew tap kotoba-lang/kotoba\nbrew trust kotoba-lang/kotoba\nbrew install kotoba\nkotoba selfhost check --json"]]
-          (caption "Accept a valid response with an empty problem list."))
-    (card (dds/heading 3 "A first program" {:size "24"})
-          [:pre {:class "kot-pre"}
-           [:code "(defn main []\n  (+ 40 2))"]]
-          [:p "This program requests no host imports; the emitted module has no imports."]))
-   [:div {:class "kot-actions"}
-    (dds/button "AI agent: executable quickstart"
-                {:href "./agent-quickstart.md"})
-    (dds/button "Open the getting-started guide"
-                {:href "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/getting-started.md"
-                 :type :outline})
-    (dds/button "Read CLI reference"
-                {:href "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/generated/cli.md"
-                 :type :outline})]))
+(def start-install-code
+  "brew tap kotoba-lang/kotoba\nbrew trust kotoba-lang/kotoba\nbrew install kotoba\nkotoba selfhost check --json")
+
+(def start-program-code
+  "(defn main []\n  (+ 40 2))")
+
+(def start-getting-started-href
+  "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/getting-started.md")
+
+(def start-cli-reference-href
+  "https://github.com/kotoba-lang/kotoba-lang/blob/main/docs/generated/cli.md")
+
+(def start-card-en
+  "English start-card copy frozen from main 109f829 / merged #664.
+  Locale pages translate only these prose keys; the two code blocks stay
+  byte-for-byte."
+  {:title "Start in sixty seconds"
+   :install "Install and self-check"
+   :check-caption "Accept a valid response with an empty problem list."
+   :program "A first program"
+   :program-sentence "This program requests no host imports; the emitted module has no imports."
+   :agent "AI agent: executable quickstart"
+   :guide "Open the getting-started guide"
+   :cli "Read CLI reference"
+   :agent-href "./agent-quickstart.md"})
+
+(def start-card-locales
+  "Start-card-only locale pages. Not a homepage translation."
+  [{:path "hi" :lang "hi"
+    :title "साठ सेकंड में शुरू करें"
+    :install "इंस्टॉल और सेल्फ-चेक"
+    :check-caption "खाली problem list वाला valid response स्वीकार करें।"
+    :program "पहला प्रोग्राम"
+    :program-sentence "यह प्रोग्राम कोई host import नहीं मांगता; emit हुआ module में कोई import नहीं है।"
+    :agent "AI agent: चलाने योग्य quickstart"
+    :guide "getting-started guide खोलें"
+    :cli "CLI reference पढ़ें"}
+   {:path "ta" :lang "ta"
+    :title "அறுபது வினாடியில் தொடங்குங்கள்"
+    :install "நிறுவல் மற்றும் self-check"
+    :check-caption "காலி problem list உள்ள valid response-ஐ ஏற்கவும்."
+    :program "முதல் நிறல்"
+    :program-sentence "இந்த நிறல் host import எதையும் கோரவில்லை; emit ஆன module-இல் import இல்லை."
+    :agent "AI agent: இயக்கக்கூடிய quickstart"
+    :guide "getting-started guide-ஐத் திறக்கவும்"
+    :cli "CLI reference-ஐப் படிக்கவும்"}
+   {:path "zh-Hans" :lang "zh-Hans"
+    :title "六十秒内开始"
+    :install "安装并自检"
+    :check-caption "接受 problem list 为空的有效响应。"
+    :program "第一个程序"
+    :program-sentence "这个程序不请求任何 host import；生成的模块没有 import。"
+    :agent "AI agent：可执行的 quickstart"
+    :guide "打开 getting-started 指南"
+    :cli "阅读 CLI 参考"}
+   {:path "ar" :lang "ar" :dir "rtl"
+    :title "ابدأ خلال ستين ثانية"
+    :install "التثبيت والفحص الذاتي"
+    :check-caption "اقبل استجابة صالحة تكون قائمة المشكلات فيها فارغة."
+    :program "برنامج أول"
+    :program-sentence "هذا البرنامج لا يطلب أي host imports； الوحدة المُخرَجة بلا imports."
+    :agent "وكيل الذكاء الاصطناعي: quickstart قابل للتنفيذ"
+    :guide "افتح دليل getting-started"
+    :cli "اقرأ مرجع CLI"}
+   {:path "uk" :lang "uk"
+    :title "Почніть за шістдесят секунд"
+    :install "Встановлення і самоперевірка"
+    :check-caption "Прийміть дійсну відповідь з порожнім списком проблем."
+    :program "Перша програма"
+    :program-sentence "Ця програма не запитує host imports; згенерований модуль не має imports."
+    :agent "AI-агент: виконуваний quickstart"
+    :guide "Відкрити посібник getting-started"
+    :cli "Читати довідку CLI"}
+   {:path "es" :lang "es"
+    :title "Empieza en sesenta segundos"
+    :install "Instalar y autocomprobar"
+    :check-caption "Acepta una respuesta válida con la lista de problemas vacía."
+    :program "Un primer programa"
+    :program-sentence "Este programa no pide host imports; el módulo emitido no tiene imports."
+    :agent "Agente de IA: quickstart ejecutable"
+    :guide "Abrir la guía getting-started"
+    :cli "Leer la referencia CLI"}
+   {:path "fr" :lang "fr"
+    :title "Commencer en soixante secondes"
+    :install "Installer et auto-vérifier"
+    :check-caption "Accepter une réponse valide dont la liste de problèmes est vide."
+    :program "Un premier programme"
+    :program-sentence "Ce programme ne demande aucun host import ; le module émis n’en a aucun."
+    :agent "Agent IA : quickstart exécutable"
+    :guide "Ouvrir le guide getting-started"
+    :cli "Lire la référence CLI"}])
+
+(defn start-section
+  ([] (start-section start-card-en))
+  ([{:keys [title install check-caption program program-sentence agent guide cli agent-href]
+     :or {agent-href "../agent-quickstart.md"}}]
+   (dds/section
+    {:id "start" :title title}
+    (dds/grid
+     {:min "20rem"}
+     (card (dds/heading 3 install {:size "24"})
+           [:pre {:class "kot-pre"}
+            [:code start-install-code]]
+           (caption check-caption))
+     (card (dds/heading 3 program {:size "24"})
+           [:pre {:class "kot-pre"}
+            [:code start-program-code]]
+           [:p program-sentence]))
+    [:div {:class "kot-actions"}
+     (dds/button agent {:href agent-href})
+     (dds/button guide {:href start-getting-started-href :type :outline})
+     (dds/button cli {:href start-cli-reference-href :type :outline})])))
 
 (defn developer-section []
   (dds/section
@@ -3134,6 +3224,16 @@
         (list [:link {:rel "alternate" :hreflang "en" :href (str site-origin en-path)}]
               [:link {:rel "alternate" :hreflang "ja" :href (str site-origin "/ja" en-path)}]
               [:link {:rel "alternate" :hreflang "x-default" :href (str site-origin en-path)}])))
+    (when (contains? #{"/hi/" "/ta/" "/zh-Hans/" "/ar/" "/uk/" "/es/" "/fr/"} path)
+      (list [:link {:rel "alternate" :hreflang "en" :href (str site-origin "/")}]
+            [:link {:rel "alternate" :hreflang "hi" :href (str site-origin "/hi/")}]
+            [:link {:rel "alternate" :hreflang "ta" :href (str site-origin "/ta/")}]
+            [:link {:rel "alternate" :hreflang "zh-Hans" :href (str site-origin "/zh-Hans/")}]
+            [:link {:rel "alternate" :hreflang "ar" :href (str site-origin "/ar/")}]
+            [:link {:rel "alternate" :hreflang "uk" :href (str site-origin "/uk/")}]
+            [:link {:rel "alternate" :hreflang "es" :href (str site-origin "/es/")}]
+            [:link {:rel "alternate" :hreflang "fr" :href (str site-origin "/fr/")}]
+            [:link {:rel "alternate" :hreflang "x-default" :href (str site-origin "/")}]))
     [:meta {:property "og:site_name" :content "Kotoba"}]
     [:script {:type "application/ld+json"} "{\"@context\":\"https://schema.org\",\"@type\":\"WebSite\",\"@id\":\"https://kotoba-lang.org/#website\",\"url\":\"https://kotoba-lang.org/\",\"name\":\"Kotoba\",\"publisher\":{\"@type\":\"Organization\",\"name\":\"Kotoba Labs Inc.\"},\"inLanguage\":[\"en\",\"ja\"]}"]
         [:meta {:property "og:type" :content "website"}]
@@ -3148,7 +3248,16 @@
     [:link {:rel "alternate" :type "text/plain" :href (str site-origin "/llms.txt") :title "LLM documentation index"}]
     [:meta {:name "twitter:title" :content title}]
     [:meta {:name "twitter:description" :content description}]
-    [:meta {:property "og:locale" :content (if (str/starts-with? path "/ja/") "ja_JP" "en_US")}]
+    [:meta {:property "og:locale" :content (cond
+                                             (str/starts-with? path "/ja/") "ja_JP"
+                                             (str/starts-with? path "/hi/") "hi_IN"
+                                             (str/starts-with? path "/ta/") "ta_IN"
+                                             (str/starts-with? path "/zh-Hans/") "zh_CN"
+                                             (str/starts-with? path "/ar/") "ar"
+                                             (str/starts-with? path "/uk/") "uk_UA"
+                                             (str/starts-with? path "/es/") "es"
+                                             (str/starts-with? path "/fr/") "fr"
+                                             :else "en_US")}]
     [:meta {:name "twitter:card" :content "summary_large_image"}]
     [:meta {:name "twitter:image" :content (str site-origin "/kotoba-og-card.png")}])))
 
@@ -3265,6 +3374,40 @@
                          "Sustain Kotoba's public language contracts, tooling, qualification, and evidence."))}
    (sponsor-view :en)))
 
+(defn start-card-view
+  "One start card, header, and footer. Not a translated homepage."
+  [copy]
+  [:div
+   [:a {:class "kot-skip" :href "#main"} "Skip to content"]
+   (header "../")
+   [:main {:id "main"}
+    (dds/container
+     (start-section copy))]
+   (footer :en "../legal/")])
+
+(defn start-card-locale-html
+  "Start-card-only page. page/->page has no :dir option; Arabic gets dir=rtl
+  on the html element after the existing helper emits lang=\"ar\"."
+  [{:keys [path lang dir title program-sentence] :as copy}]
+  (let [page-title (str "Kotoba — " title)
+        page-path (str "/" path "/")
+        html (page/->page
+              {:title page-title
+               :description program-sentence
+               :lang lang
+               :css dds-css
+               :dark? true
+               :app-css (str tokens/skin-css "\n" app-css)
+               :head (list (favicon-link)
+                           (apple-touch-icon-link)
+                           [:script theme-js]
+                           [:script menu-js]
+                           (og-head page-path page-title program-sentence))}
+              (start-card-view copy))]
+    (if (= dir "rtl")
+      (str/replace html "<html lang=\"ar\">" "<html lang=\"ar\" dir=\"rtl\">")
+      html)))
+
 (def sponsor-ja-html
   (page/->page
    {:title "Kotoba を支援 — GitHub Sponsors"
@@ -3298,6 +3441,22 @@
   (fs/writeFileSync (path/join out "sponsor" "index.html") sponsor-html)
   (fs/mkdirSync (path/join out "ja" "sponsor") #js {:recursive true})
   (fs/writeFileSync (path/join out "ja" "sponsor" "index.html") sponsor-ja-html)
+  (doseq [copy start-card-locales]
+    (let [dir (path/join out (:path copy))
+          html (start-card-locale-html copy)]
+      (fs/mkdirSync dir #js {:recursive true})
+      (fs/writeFileSync (path/join dir "index.html") html)
+      (when-not (str/includes? html start-install-code)
+        (throw (js/Error. (str "start-card locale " (:path copy) " lost the Homebrew block"))))
+      (when-not (str/includes? html start-program-code)
+        (throw (js/Error. (str "start-card locale " (:path copy) " lost the first program"))))
+      (when-not (str/includes? html (:title copy))
+        (throw (js/Error. (str "start-card locale " (:path copy) " lost its title"))))
+      (when (str/includes? html "Start in sixty seconds")
+        (throw (js/Error. (str "start-card locale " (:path copy) " leaked the English title"))))
+      (when (and (= (:dir copy) "rtl")
+                 (not (str/includes? html "<html lang=\"ar\" dir=\"rtl\">")))
+        (throw (js/Error. "Arabic start-card page is missing html dir=rtl")))))
   (fs/copyFileSync (path/join "site" "sponsorship.edn")
                    (path/join out "sponsorship.edn"))
   (fs/copyFileSync logo-source-path (path/join out "kotoba-wordmark.png"))
