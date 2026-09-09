@@ -1437,8 +1437,8 @@
     :title "அறுபது வினாடியில் தொடங்குங்கள்"
     :install "நிறுவல் மற்றும் self-check"
     :check-caption "காலி problem list உள்ள valid response-ஐ ஏற்கவும்."
-    :program "முதல் நிறல்"
-    :program-sentence "இந்த நிறல் host import எதையும் கோரவில்லை; emit ஆன module-இல் import இல்லை."
+    :program "முதல் நிரல்"
+    :program-sentence "இந்த நிரல் host import எதையும் கோரவில்லை; emit ஆன module-இல் import இல்லை."
     :agent "AI agent: இயக்கக்கூடிய quickstart"
     :guide "getting-started guide-ஐத் திறக்கவும்"
     :cli "CLI reference-ஐப் படிக்கவும்"}
