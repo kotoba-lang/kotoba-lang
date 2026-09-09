@@ -13,7 +13,7 @@
   (let [authority (catalog/validate! (catalog/read-authority))
         entries (:capabilities authority)
         wire-ids (sort (map :compiler-wire-id (vals entries)))]
-    (is (= 36 (count entries)))
+    (is (= 37 (count entries)))
     (is (= (range 1 (inc (count entries))) wire-ids)
         "wire ids stay contiguous from 1 with no duplicates or gaps")
     (is (= [4 11 12]
@@ -65,7 +65,19 @@
     ;; 36. 85fcca93 wrote 261 here; validate! refuses ids outside 1..255
     ;; and the tripwire requires contiguous wires 1..n.
     (is (= 36 (get-in entries [:fs/browse-dir :compiler-wire-id])))
-    (is (= 'fs/browse-dir (get-in entries [:fs/browse-dir :source-operation])))))
+    (is (= 'fs/browse-dir (get-in entries [:fs/browse-dir :source-operation])))
+    ;; io/write gets compiler wire 37: the bytes a COMMAND writes to its
+    ;; standard output. It is the capability that makes a Kotoba guest a
+    ;; command rather than a function -- before it there was no entry in this
+    ;; catalog for stdout or for argv, so a guest could compute an answer and
+    ;; had no way to say one.
+    ;;
+    ;; The effect is deliberately its OWN and not :host/log-append. A
+    ;; command's stdout is its answer; an audit record is a different thing,
+    ;; and one grant must not carry both.
+    (is (= 37 (get-in entries [:io/write :compiler-wire-id])))
+    (is (= 'io/write (get-in entries [:io/write :source-operation])))
+    (is (= :host/io-write (get-in entries [:io/write :effect])))))
 
 (deftest duplicate-wire-id-fails-closed
   (let [authority (catalog/read-authority)]
