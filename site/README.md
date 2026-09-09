@@ -563,3 +563,19 @@ availability. The filename now opens the same-origin, exact-CID HTTP mirror,
 explicitly served as inline UTF-8 plain text. The adjacent IPFS link uses
 `ipfs://<CID>` for native IPFS clients. No automatic cross-origin gateway fallback
 is required to read the sample in a browser. Network pin and source CID are unchanged.
+
+## Localized quickstart pages
+
+The homepage start card links to nine equivalent quickstart pages: English
+(`/start/`), Japanese (`/ja/`), Hindi (`/hi/`), Tamil (`/ta/`), Simplified Chinese
+(`/zh-Hans/`), Arabic (`/ar/`), Ukrainian (`/uk/`), Spanish (`/es/`), and French
+(`/fr/`). These translate the start card, not the full homepage or linked
+English documentation. Existing Japanese libraries, legal, and sponsor pages
+remain separate.
+
+`start-card-locales` owns localized copy. `start-languages` supplies both the
+visible language links and reciprocal `hreflang` metadata. English and
+`x-default` point to the equivalent `/start/` page, not the full homepage.
+Every page has its own canonical URL and is included in the sitemap. Arabic
+uses RTL prose with explicitly LTR code blocks and shared English navigation.
+Install commands and program bytes are identical across locales.

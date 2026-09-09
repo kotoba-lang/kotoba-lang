@@ -1424,7 +1424,16 @@
 
 (def start-card-locales
   "Start-card-only locale pages. Not a homepage translation."
-  [{:path "hi" :lang "hi"
+  [{:path "ja" :lang "ja"
+    :title "60秒で始める"
+    :install "インストールと動作確認"
+    :check-caption "問題リストが空の、有効な応答を確認してください。"
+    :program "最初のプログラム"
+    :program-sentence "このプログラムはホストの機能を要求しません。生成されるモジュールにもインポートはありません。"
+    :agent "AIエージェント向け：実行可能なクイックスタート（英語）"
+    :guide "入門ガイドを開く（英語）"
+    :cli "CLIリファレンスを読む（英語）"}
+   {:path "hi" :lang "hi"
     :title "साठ सेकंड में शुरू करें"
     :install "इंस्टॉल और सेल्फ-चेक"
     :check-caption "खाली problem list वाला valid response स्वीकार करें।"
@@ -1488,20 +1497,39 @@
     :guide "Ouvrir le guide getting-started"
     :cli "Lire la référence CLI"}])
 
+(def start-languages
+  (into [{:path "start" :lang "en" :label "English"}]
+        (map (fn [copy]
+               (assoc (select-keys copy [:path :lang]) :label
+                      (get {"ja" "日本語" "hi" "हिन्दी" "ta" "தமிழ்"
+                            "zh-Hans" "简体中文" "ar" "العربية" "uk" "Українська"
+                            "es" "Español" "fr" "Français"} (:lang copy)))))
+        start-card-locales))
+
+(defn start-language-nav [lang]
+  [:nav {:aria-label "Quickstart languages" :lang "en" :dir "ltr"}
+   [:div {:class "kot-actions" :style "display:flex;flex-wrap:wrap"}
+    (for [{:keys [path label] target-lang :lang} start-languages]
+      [:a (cond-> {:class "kot-link" :href (str "/" path "/")
+                   :lang target-lang :hreflang target-lang}
+            (= lang target-lang) (assoc :aria-current "page"))
+       [:bdi label]])]])
+
 (defn start-section
   ([] (start-section start-card-en))
-  ([{:keys [title install check-caption program program-sentence agent guide cli agent-href]
-     :or {agent-href "../agent-quickstart.md"}}]
+  ([{:keys [title install check-caption program program-sentence agent guide cli agent-href lang]
+     :or {lang "en" agent-href "../agent-quickstart.md"}}]
    (dds/section
     {:id "start" :title title}
+    (start-language-nav lang)
     (dds/grid
      {:min "20rem"}
      (card (dds/heading 3 install {:size "24"})
-           [:pre {:class "kot-pre"}
+           [:pre {:class "kot-pre" :dir "ltr" :style "text-align: left"}
             [:code start-install-code]]
            (caption check-caption))
      (card (dds/heading 3 program {:size "24"})
-           [:pre {:class "kot-pre"}
+           [:pre {:class "kot-pre" :dir "ltr" :style "text-align: left"}
             [:code start-program-code]]
            [:p program-sentence]))
     [:div {:class "kot-actions"}
@@ -3224,18 +3252,13 @@
         (list [:link {:rel "alternate" :hreflang "en" :href (str site-origin en-path)}]
               [:link {:rel "alternate" :hreflang "ja" :href (str site-origin "/ja" en-path)}]
               [:link {:rel "alternate" :hreflang "x-default" :href (str site-origin en-path)}])))
-    (when (contains? #{"/hi/" "/ta/" "/zh-Hans/" "/ar/" "/uk/" "/es/" "/fr/"} path)
-      (list [:link {:rel "alternate" :hreflang "en" :href (str site-origin "/")}]
-            [:link {:rel "alternate" :hreflang "hi" :href (str site-origin "/hi/")}]
-            [:link {:rel "alternate" :hreflang "ta" :href (str site-origin "/ta/")}]
-            [:link {:rel "alternate" :hreflang "zh-Hans" :href (str site-origin "/zh-Hans/")}]
-            [:link {:rel "alternate" :hreflang "ar" :href (str site-origin "/ar/")}]
-            [:link {:rel "alternate" :hreflang "uk" :href (str site-origin "/uk/")}]
-            [:link {:rel "alternate" :hreflang "es" :href (str site-origin "/es/")}]
-            [:link {:rel "alternate" :hreflang "fr" :href (str site-origin "/fr/")}]
-            [:link {:rel "alternate" :hreflang "x-default" :href (str site-origin "/")}]))
+    (when (some #(= path (str "/" (:path %) "/")) start-languages)
+      (concat
+       (for [{:keys [path lang]} start-languages]
+         [:link {:rel "alternate" :hreflang lang :href (str site-origin "/" path "/")}])
+       [[:link {:rel "alternate" :hreflang "x-default" :href (str site-origin "/start/") }]]))
     [:meta {:property "og:site_name" :content "Kotoba"}]
-    [:script {:type "application/ld+json"} "{\"@context\":\"https://schema.org\",\"@type\":\"WebSite\",\"@id\":\"https://kotoba-lang.org/#website\",\"url\":\"https://kotoba-lang.org/\",\"name\":\"Kotoba\",\"publisher\":{\"@type\":\"Organization\",\"name\":\"Kotoba Labs Inc.\"},\"inLanguage\":[\"en\",\"ja\"]}"]
+    [:script {:type "application/ld+json"} "{\"@context\":\"https://schema.org\",\"@type\":\"WebSite\",\"@id\":\"https://kotoba-lang.org/#website\",\"url\":\"https://kotoba-lang.org/\",\"name\":\"Kotoba\",\"publisher\":{\"@type\":\"Organization\",\"name\":\"Kotoba Labs Inc.\"},\"inLanguage\":[\"en\",\"ja\",\"hi\",\"ta\",\"zh-Hans\",\"ar\",\"uk\",\"es\",\"fr\"]}"]
         [:meta {:property "og:type" :content "website"}]
     [:meta {:property "og:url" :content (str site-origin path)}]
     [:meta {:property "og:title" :content title}]
@@ -3378,12 +3401,14 @@
   "One start card, header, and footer. Not a translated homepage."
   [copy]
   [:div
-   [:a {:class "kot-skip" :href "#main"} "Skip to content"]
-   (header "../")
+   [:a {:class "kot-skip" :href "#main" :lang "en"} "Skip to content"]
+   [:div {:lang "en" :dir "ltr"} (header "../")]
    [:main {:id "main"}
     (dds/container
      (start-section copy))]
-   (footer :en "../legal/")])
+   [:div {:lang (if (= (:lang copy) "ja") "ja" "en") :dir "ltr"}
+    (footer (if (= (:lang copy) "ja") :ja :en)
+            (if (= (:lang copy) "ja") "legal/" "../legal/"))]])
 
 (defn start-card-locale-html
   "Start-card-only page. page/->page has no :dir option; Arabic gets dir=rtl
@@ -3441,7 +3466,8 @@
   (fs/writeFileSync (path/join out "sponsor" "index.html") sponsor-html)
   (fs/mkdirSync (path/join out "ja" "sponsor") #js {:recursive true})
   (fs/writeFileSync (path/join out "ja" "sponsor" "index.html") sponsor-ja-html)
-  (doseq [copy start-card-locales]
+  (doseq [copy (cons (assoc start-card-en :path "start" :lang "en"
+                            :agent-href "../agent-quickstart.md") start-card-locales)]
     (let [dir (path/join out (:path copy))
           html (start-card-locale-html copy)]
       (fs/mkdirSync dir #js {:recursive true})
@@ -3452,7 +3478,8 @@
         (throw (js/Error. (str "start-card locale " (:path copy) " lost the first program"))))
       (when-not (str/includes? html (:title copy))
         (throw (js/Error. (str "start-card locale " (:path copy) " lost its title"))))
-      (when (str/includes? html "Start in sixty seconds")
+      (when (and (not= (:lang copy) "en")
+                 (str/includes? html "Start in sixty seconds"))
         (throw (js/Error. (str "start-card locale " (:path copy) " leaked the English title"))))
       (when (and (= (:dir copy) "rtl")
                  (not (str/includes? html "<html lang=\"ar\" dir=\"rtl\">")))
