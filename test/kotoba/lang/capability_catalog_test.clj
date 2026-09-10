@@ -13,7 +13,7 @@
   (let [authority (catalog/validate! (catalog/read-authority))
         entries (:capabilities authority)
         wire-ids (sort (map :compiler-wire-id (vals entries)))]
-    (is (= 39 (count entries)))
+    (is (= 40 (count entries)))
     (is (= (range 1 (inc (count entries))) wire-ids)
         "wire ids stay contiguous from 1 with no duplicates or gaps")
     (is (= [4 11 12]
@@ -95,7 +95,21 @@
     (is (= :host/io-write-error (get-in entries [:io/write-error :effect])))
     (is (not= (get-in entries [:io/write :effect])
               (get-in entries [:io/write-error :effect]))
-        "stdout and stderr must not share an effect")))
+        "stdout and stderr must not share an effect")
+    ;; sys/cwd gets compiler wire 40: where the process was started.
+    ;;
+    ;; Its own effect, asserted here for the same reason stderr has one.
+    ;; `pwd` is often described as reading $PWD, but /bin/pwd -L VALIDATES
+    ;; $PWD against the real directory and prints the physical path when they
+    ;; disagree -- measured 2026-09-10, PWD=/tmp still printed the physical
+    ;; path. The environment variable is a hint that gets checked, not the
+    ;; answer, so a grant to read environment variables must not supply it.
+    (is (= 40 (get-in entries [:sys/cwd :compiler-wire-id])))
+    (is (= 'sys/cwd (get-in entries [:sys/cwd :source-operation])))
+    (is (= :host/sys-cwd (get-in entries [:sys/cwd :effect])))
+    (is (not= (get-in entries [:env/read :effect])
+              (get-in entries [:sys/cwd :effect]))
+        "reading the environment must not carry the working directory")))
 
 (deftest duplicate-wire-id-fails-closed
   (let [authority (catalog/read-authority)]

@@ -133,6 +133,11 @@
    ;; Its own effect and not :host/io-write: stdout is the answer, stderr is
    ;; not, and one grant must not carry both.
    :host/io-write-error :host/io-write-error
+   ;; sys/cwd (compiler wire id 40) — where the process was started. Its own
+   ;; effect and not :host/env-read: pwd validates $PWD against the real
+   ;; directory rather than trusting it, so reading the environment cannot
+   ;; answer this.
+   :host/sys-cwd :host/sys-cwd
    ;; data/json (capability id 246, kotoba-core-contracts) — JSON wire-format
    ;; ops (json-encode / json-extract-field). One kind for the family, the
    ;; same convention as topic-* sharing :host/topic-subscribe. Resource
