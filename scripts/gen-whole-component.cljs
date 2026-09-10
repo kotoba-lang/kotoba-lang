@@ -209,6 +209,61 @@
          (str/join "\n" (concat arms idx))
          "\n      :else (arr-count (apply-filters rows \"{\\\"notAField\\\":\\\"x\\\"}\" fields)))))")))
 
+
+;; --- the handlers oracle, from the root spec's OWN fields -------------------
+;;
+;; Same carried-name class as the filters oracle, and it damaged two selectors
+;; instead of a whole layer. Selector 6 is the update-SUCCESS arm -- selector 7
+;; is already its 404 arm and selector 13 hashes a field the update is supposed
+;; to have written -- but the template updates with {"jurisdiction":"US"}, and
+;; no entity in this cohort except com-aadhaar's declares `jurisdiction`. An
+;; unknown field is rejected, so selector 6 measured 400 and the 200 path was
+;; never exercised. Selector 13 then hashed a field the rejected response does
+;; not carry: measured 2026-09-11, it returned 7 in com-agones AND in
+;; com-airtable, while selector 14 differed between them. A hash that does not
+;; vary with the repository is hashing a constant.
+;;
+;; Nothing is lost by making 6 succeed. `reject-unknown` is one function and
+;; `handle-create` calls it with the same `(fields-of entity)`; selector 2
+;; already feeds it an unknown key. The rejection arm stays covered, and the
+;; success arm stops being missing.
+
+(defn handlers-oracle [{:keys [root]}]
+  (let [ent (:entity root)
+        pre (:id-prefix root)
+        req1 (name (first (:required root)))
+        upd (str "{\\\"" req1 "\\\":\\\"updated\\\"}")]
+    (str ";; Selector 6 is the update SUCCESS arm and must be 200; 7 is its 404.\n"
+         ";; Selector 13 hashes the field selector 6 wrote, so it is meaningful\n"
+         ";; only while 6 succeeds -- if 6 ever returns 400 again, 13 is hashing\n"
+         ";; an absent field and will read the same in every repository.\n"
+         "(defn oracle-handlers [sel :i64] :i64\n"
+         "  (let [store (seeded-store 2)]\n    (cond\n"
+         "      (= sel 0) (as-int (field (handle-create store \"" ent "\" (fixture-data 0) 1) \"status\"))\n"
+         "      (= sel 1) (as-int (field (handle-create store \"" ent "\" (fixture-data 1) 1) \"status\"))\n"
+         "      (= sel 2) (as-int (field (handle-create store \"" ent "\" (fixture-data 2) 1) \"status\"))\n"
+         "      (= sel 3) (as-int (field (handle-list store \"" ent "\" \"{}\") \"status\"))\n"
+         "      (= sel 4) (as-int (field (handle-get store \"" ent "\" \"" pre "_0\" \"{}\") \"status\"))\n"
+         "      (= sel 5) (as-int (field (handle-get store \"" ent "\" \"nope\" \"{}\") \"status\"))\n"
+         "      (= sel 6) (as-int (field (handle-update store \"" ent "\" \"" pre "_0\"\n"
+         "                                              \"" upd "\" 1) \"status\"))\n"
+         "      (= sel 7) (as-int (field (handle-update store \"" ent "\" \"nope\" \"{}\" 1) \"status\"))\n"
+         "      (= sel 8) (as-int (field (handle-delete store \"" ent "\" \"" pre "_0\") \"status\"))\n"
+         "      (= sel 9) (as-int (field (handle-delete store \"" ent "\" \"nope\") \"status\"))\n"
+         "      (= sel 10) (arr-count (store-rows (raw-field (handle-delete store \"" ent "\" \"" pre "_0\")\n"
+         "                                                   \"store\")\n"
+         "                                        \"" ent "\"))\n"
+         "      (= sel 11) (arr-count (store-rows (raw-field (handle-create store \"" ent "\"\n"
+         "                                                                 (fixture-data 0) 1)\n"
+         "                                                   \"store\")\n"
+         "                                        \"" ent "\"))\n"
+         "      (= sel 12) (as-int (field (raw-field (handle-list store \"" ent "\" \"{}\") \"body\") \"total\"))\n"
+         "      (= sel 13) (str-hash (field (raw-field (handle-update store \"" ent "\" \"" pre "_0\"\n"
+         "                                                            \"" upd "\" 1)\n"
+         "                                             \"body\")\n"
+         "                                  \"" req1 "\"))\n"
+         "      :else (str-hash (raw-field (handle-get store \"" ent "\" \"" pre "_1\" \"{}\") \"body\")))))")))
+
 ;; --- the ref row and the expand oracle, by ref ARITY ------------------------
 ;;
 ;; These two were the last blocks still reached only by the token pass, and that
@@ -374,6 +429,7 @@
           ;; The ref row and the expand oracle, regenerated whole rather than
           ;; reached by the token pass. See the note above `ref-row`.
           body (block body "oracle-filters" (str (filters-oracle p f) "\n\n"))
+          body (block body "oracle-handlers" (str (handlers-oracle p) "\n\n"))
           body (block body "cred-row" (str (ref-row specs p f) "\n\n"))
           body (block body "oracle-expand"
                       (str (str/replace (expand-oracle p f) "REF_ENT" (:entity (:ref-ent p)))
