@@ -113,7 +113,21 @@
   [{:keys [root ref-ent float-ent]}]
   (let [rreq (map name (:required root))
         rfields (map name (:fields root))
-        freq (map name (:required float-ent))
+        ;; The coercion fixture must CONTAIN the coerced field. Built from
+        ;; `:required` alone it does not, whenever the coerced field is optional
+        ;; -- and measured 2026-09-10 across the wave-1 sample, that is the
+        ;; common case, not the rare one: com-aave, com-abb-robotics, com-adobe
+        ;; and com-acquia all declare a coercion on a field they do not require.
+        ;; com-abb-robotics is the sharp instance: Robot coerces `payloadKg` to
+        ;; :float and requires only [model status], so a fixture from `:required`
+        ;; omits the one field the arm exists to exercise, and the hand-written
+        ;; component it replaced carried "payloadKg":"150.5" precisely because a
+        ;; person noticed.
+        fcoerce (map (fn [[k v]] [(name k) (case (if (keyword? v) (name v) (str v))
+                                             "int" "7" "float" "1.5" "bool" "true" "v")])
+                     (:coerce float-ent))
+        freq (concat (map (fn [f] [f "v"]) (map name (:required float-ent)))
+                     (remove (fn [[k _]] (some #{k} (map name (:required float-ent)))) fcoerce))
         extra (first (remove (set rreq) rfields))
         ref-fields (map name (keys (:refs ref-ent)))
         ref-targets (map (fn [[_ v]] v) (:refs ref-ent))
@@ -123,7 +137,7 @@
           "    (= sel 0) \"" (jobj (map (fn [f] [f "v"]) rreq)) "\"\n"
           "    (= sel 1) \"" (jobj (map (fn [f] [f "v"]) (take 1 rreq))) "\"\n"
           "    (= sel 2) \"" (jobj (concat (map (fn [f] [f "v"]) rreq) [["bogus" "x"]])) "\"\n"
-          "    (= sel 3) \"" (jobj (map (fn [f] [f "v"]) freq)) "\"\n"
+          "    (= sel 3) \"" (jobj freq) "\"\n"
           "    (= sel 4) \"" (jobj (map (fn [f] [f "v"]) (map name (:required ref-ent)))) "\"\n"
           "    :else \"{}\"))")
      :degenerate-fixture-1? (<= (count rreq) 1)
