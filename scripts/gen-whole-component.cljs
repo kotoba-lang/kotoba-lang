@@ -168,7 +168,13 @@
         third (if (> (count rf) 1) (kv 1)
                   (str "(jkv \"" (or (first filler) "note") "\" \"v\")"))
         fourth (str "(jkv \"" (or (if (> (count rf) 1) (first filler) (second filler)) "note2") "\" \"v\")")]
-    (str "(defn cred-row [i :i64] :string\n"
+    (str ";; A " (:entity ref-ent) " row pointing at the row its "
+         (if (> (count rf) 1) "TWO ref fields name" "one ref field names")
+         ".\n"
+         (if (> (count rf) 1)
+           ";; Two refs make `expand`'s fold run twice over one row, which is the\n;; case `oracle-expand` selector 4 is about.\n"
+           ";; One ref means the fold runs over a single pair, and a fold over one\n;; is not a fold -- which is why no selector 4 is generated below.\n")
+         "(defn cred-row [i :i64] :string\n"
          "  (jobj (jsep (jsep (jkv \"id\" (string-concat \"" (:id-prefix ref-ent) "_\" (string-from-i64 i)))\n"
          "                    " (kv 0) ")\n"
          "              (jsep " third " " fourth "))))")))
@@ -212,9 +218,23 @@
   lost one REFUSES rather than writing a component with a stale fixture."
   [src name replacement]
   (let [head (str "(defn " name " ")
-        i (str/index-of src head)]
-    (when-not i (refuse! "template lost an anchor" {:defn name}))
-    (let [rest-from (+ i (count head))
+        i0 (str/index-of src head)
+        _ (when-not i0 (refuse! "template lost an anchor" {:defn name}))
+        ;; Walk BACK over the comment lines immediately above the form and
+        ;; replace those too. Measured 2026-09-10: regenerating cred-row for a
+        ;; one-ref repository left the template's comment in place, so the file
+        ;; said the row points at its target "through BOTH of its ref fields"
+        ;; and named a `:childProjectId` that the substitution had invented --
+        ;; directly above a generated body with one ref and no such field. A
+        ;; comment reached only by token substitution carries exactly the
+        ;; staleness the generated body was written to avoid, and it is worse
+        ;; than a stale name because it reads as an explanation.
+        i (loop [k i0]
+            (let [prev-start (inc (or (str/last-index-of src "\n" (- k 2)) -1))]
+              (if (and (> k 0) (str/starts-with? (subs src prev-start (min (count src) (+ prev-start 2))) ";;"))
+                (recur prev-start)
+                k)))]
+    (let [rest-from (+ i0 (count head))
           j (or (first (sort (remove nil? [(str/index-of src "\n(defn " rest-from)
                                            (str/index-of src "\n;; ---" rest-from)])))
                 (count src))]
