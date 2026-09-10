@@ -1,0 +1,44 @@
+;; Reproducible, JVM-free site build for CI and operators.
+(require '["node:fs" :as fs]
+         '["node:path" :as path]
+         '["node:child_process" :as cp])
+
+(defn run! [command args options]
+  (let [result (cp/spawnSync command (clj->js args)
+                            (clj->js (merge {:stdio "inherit"
+                                            :timeout 600000} options)))]
+    (when-not (= 0 (.-status result))
+      (throw (js/Error. (str command " failed (exit " (.-status result) ")"))))))
+
+(def root (.cwd js/process))
+(def deps-root (path/join root ".site-deps"))
+(def lock (js->clj (js/JSON.parse (fs/readFileSync "site/build-dependencies.json" "utf8"))
+                  :keywordize-keys true))
+(fs/mkdirSync deps-root #js {:recursive true})
+(doseq [[name sha] (:repositories lock)]
+  (let [name (cljs.core/name name)
+        dir (path/join deps-root name)]
+    (when-not (re-matches #"[0-9a-f]{40}" sha)
+      (throw (js/Error. (str "Invalid dependency revision: " name))))
+    (if (fs/existsSync dir)
+      (run! "git" ["fetch" "origin"] {:cwd dir})
+      (run! "git" ["clone" "--no-checkout"
+                  (str "https://github.com/kotoba-lang/" name ".git") dir] {}))
+    ;; Only this build's ignored dependency checkout is changed.
+    (run! "git" ["checkout" "--detach" sha] {:cwd dir})))
+
+(def classpath
+  (.join (clj->js (cons "site/src"
+                        (for [name ["grammar" "text" "jp-go-digital-design-system" "css" "html"]]
+                          (path/join deps-root name "src")))) ":"))
+(def env (js/Object.assign #js {} js/process.env
+                #js {"JP_GO_DDS_ROOT" (path/join deps-root "jp-go-digital-design-system")
+                     "KOTOBA_GRAMMAR_ROOT" (path/join deps-root "grammar")
+                     "KOTOBA_IDENTITY_ROOT" (path/join deps-root "identity")}))
+(def nbb (path/join root "node_modules" ".bin" "nbb"))
+;; A failed generation must never leave old pages looking like new output.
+(fs/rmSync "site/dist" #js {:recursive true :force true})
+(doseq [script ["site/generate.cljs" "site/test/locales_test.cljs"
+                "site/test/public_locales_test.cljs"]]
+  (run! nbb ["--classpath" classpath script] {:env env}))
+(println "Site generation and locale checks passed.")

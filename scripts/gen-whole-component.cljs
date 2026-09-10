@@ -113,7 +113,21 @@
   [{:keys [root ref-ent float-ent]}]
   (let [rreq (map name (:required root))
         rfields (map name (:fields root))
-        freq (map name (:required float-ent))
+        ;; The coercion fixture must CONTAIN the coerced field. Built from
+        ;; `:required` alone it does not, whenever the coerced field is optional
+        ;; -- and measured 2026-09-10 across the wave-1 sample, that is the
+        ;; common case, not the rare one: com-aave, com-abb-robotics, com-adobe
+        ;; and com-acquia all declare a coercion on a field they do not require.
+        ;; com-abb-robotics is the sharp instance: Robot coerces `payloadKg` to
+        ;; :float and requires only [model status], so a fixture from `:required`
+        ;; omits the one field the arm exists to exercise, and the hand-written
+        ;; component it replaced carried "payloadKg":"150.5" precisely because a
+        ;; person noticed.
+        fcoerce (map (fn [[k v]] [(name k) (case (if (keyword? v) (name v) (str v))
+                                             "int" "7" "float" "1.5" "bool" "true" "v")])
+                     (:coerce float-ent))
+        freq (concat (map (fn [f] [f "v"]) (map name (:required float-ent)))
+                     (remove (fn [[k _]] (some #{k} (map name (:required float-ent)))) fcoerce))
         extra (first (remove (set rreq) rfields))
         ref-fields (map name (keys (:refs ref-ent)))
         ref-targets (map (fn [[_ v]] v) (:refs ref-ent))
@@ -123,7 +137,7 @@
           "    (= sel 0) \"" (jobj (map (fn [f] [f "v"]) rreq)) "\"\n"
           "    (= sel 1) \"" (jobj (map (fn [f] [f "v"]) (take 1 rreq))) "\"\n"
           "    (= sel 2) \"" (jobj (concat (map (fn [f] [f "v"]) rreq) [["bogus" "x"]])) "\"\n"
-          "    (= sel 3) \"" (jobj (map (fn [f] [f "v"]) freq)) "\"\n"
+          "    (= sel 3) \"" (jobj freq) "\"\n"
           "    (= sel 4) \"" (jobj (map (fn [f] [f "v"]) (map name (:required ref-ent)))) "\"\n"
           "    :else \"{}\"))")
      :degenerate-fixture-1? (<= (count rreq) 1)
@@ -137,7 +151,66 @@
           (if (< (count rreq) 2) " (jkv \"_\" \"\")" "") "))))")
      :ref-fields ref-fields
      :ref-targets ref-targets
-     :ref-other ref-other}))
+     :ref-other ref-other
+     :ref-arity (count ref-fields)}))
+
+;; --- the ref row and the expand oracle, by ref ARITY ------------------------
+;;
+;; These two were the last blocks still reached only by the token pass, and that
+;; is where a measured defect lived. `ref-field-2` fell back to `ref-field-1`
+;; when the target entity had ONE ref, so a one-ref repository got
+;; `childPartId -> projectId` on top of `parentPartId -> projectId`. Measured
+;; 2026-09-10 on the shipped com-accela component: `cred-row` emitted
+;; "projectId" TWICE -- a duplicate JSON key -- and `oracle-expand` selector 4,
+;; the "expand BOTH refs" case, asked for "projectId,projectId" and returned
+;; EXACTLY selector 0's value, 303754089. A selector that cannot tell a fold
+;; that ran twice from one that ran once measures nothing, and it went green.
+;;
+;; Neither is caught by `amu check`: both objects are built with `jkv` calls, so
+;; the compiler has no schema for them and answers :ok true either way.
+;;
+;; So they are generated, and the BOTH selector exists only when there is a
+;; second ref for it to be about.
+
+(defn ref-row [specs {:keys [ref-ent]} f]
+  (let [prefix-of (into {} (map (juxt :entity :id-prefix) specs))
+        rf (vec (:ref-fields f))
+        rt (vec (:ref-targets f))
+        filler (remove (set rf) (map name (:required ref-ent)))
+        kv (fn [i] (str "(jkv \"" (nth rf i) "\" (string-concat \""
+                        (get prefix-of (let [t (nth rt i)] (if (keyword? t) (name t) t)) "row") "_\" (string-from-i64 i)))"))
+        third (if (> (count rf) 1) (kv 1)
+                  (str "(jkv \"" (or (first filler) "note") "\" \"v\")"))
+        fourth (str "(jkv \"" (or (if (> (count rf) 1) (first filler) (second filler)) "note2") "\" \"v\")")]
+    (str ";; A " (:entity ref-ent) " row pointing at the row its "
+         (if (> (count rf) 1) "TWO ref fields name" "one ref field names")
+         ".\n"
+         (if (> (count rf) 1)
+           ";; Two refs make `expand`'s fold run twice over one row, which is the\n;; case `oracle-expand` selector 4 is about.\n"
+           ";; One ref means the fold runs over a single pair, and a fold over one\n;; is not a fold -- which is why no selector 4 is generated below.\n")
+         "(defn cred-row [i :i64] :string\n"
+         "  (jobj (jsep (jsep (jkv \"id\" (string-concat \"" (:id-prefix ref-ent) "_\" (string-from-i64 i)))\n"
+         "                    " (kv 0) ")\n"
+         "              (jsep " third " " fourth "))))")))
+
+(defn expand-oracle [{:keys [root]} f]
+  (let [rf (vec (:ref-fields f))
+        f1 (first rf)
+        arms [(str "      ;; the ref resolves\n      (= sel 0) (str-hash (expand store rec \"{\\\"expand\\\":\\\"" f1 "\\\"}\"\n                                  (refs-of \"REF_ENT\")))")
+              (str "      ;; a field `expand` is not asked for\n      (= sel 1) (str-hash (expand store rec \"{\\\"expand\\\":\\\"other\\\"}\"\n                                  (refs-of \"REF_ENT\")))")
+              (str "      ;; the ref names a row the store does not hold\n      (= sel 2) (str-hash (expand store (cred-row 9) \"{\\\"expand\\\":\\\"" f1 "\\\"}\"\n                                  (refs-of \"REF_ENT\")))")
+              (str "      ;; a spec with NO refs -- the fold runs over nothing\n      (= sel 3) (str-hash (expand store rec \"{\\\"expand\\\":\\\"" f1 "\\\"}\"\n                                  (refs-of \"" (:entity root) "\")))")]
+        both (when (> (count rf) 1)
+               (str "      ;; BOTH refs -- the fold runs twice over one row\n      (= sel 4) (str-hash (expand store rec \"{\\\"expand\\\":\\\"" (str/join "," rf) "\\\"}\"\n                                  (refs-of \"REF_ENT\")))"))]
+    (str ";; Selectors 1 and 3 must collapse to the unexpanded record and 2 must\n"
+         ";; differ from both; without that floor a green 0 cannot be told from a\n"
+         ";; fold over nothing."
+         (if both "\n;; Selector 4 exists because this entity declares two refs.\n"
+             "\n;; There is NO selector 4: this entity declares one ref, so a `BOTH`\n;; case would duplicate selector 0 and measure nothing.\n")
+         "(defn oracle-expand [sel :i64] :i64\n"
+         "  (let [store (seeded-both 3)\n        rec (cred-row 1)]\n    (cond\n"
+         (str/join "\n" (remove nil? (conj arms both)))
+         "\n      :else (str-hash rec))))")))
 
 ;; --- splice ---------------------------------------------------------------
 ;;
@@ -159,9 +232,23 @@
   lost one REFUSES rather than writing a component with a stale fixture."
   [src name replacement]
   (let [head (str "(defn " name " ")
-        i (str/index-of src head)]
-    (when-not i (refuse! "template lost an anchor" {:defn name}))
-    (let [rest-from (+ i (count head))
+        i0 (str/index-of src head)
+        _ (when-not i0 (refuse! "template lost an anchor" {:defn name}))
+        ;; Walk BACK over the comment lines immediately above the form and
+        ;; replace those too. Measured 2026-09-10: regenerating cred-row for a
+        ;; one-ref repository left the template's comment in place, so the file
+        ;; said the row points at its target "through BOTH of its ref fields"
+        ;; and named a `:childProjectId` that the substitution had invented --
+        ;; directly above a generated body with one ref and no such field. A
+        ;; comment reached only by token substitution carries exactly the
+        ;; staleness the generated body was written to avoid, and it is worse
+        ;; than a stale name because it reads as an explanation.
+        i (loop [k i0]
+            (let [prev-start (inc (or (str/last-index-of src "\n" (- k 2)) -1))]
+              (if (and (> k 0) (str/starts-with? (subs src prev-start (min (count src) (+ prev-start 2))) ";;"))
+                (recur prev-start)
+                k)))]
+    (let [rest-from (+ i0 (count head))
           j (or (first (sort (remove nil? [(str/index-of src "\n(defn " rest-from)
                                            (str/index-of src "\n;; ---" rest-from)])))
                 (count src))]
@@ -192,6 +279,26 @@
           p (plan specs)
           f (fixtures p)
           _ (guard! specs p)
+          ;; A repository where NO spec declares a ref cannot get a derived
+          ;; expand oracle. Measured 2026-09-10 on com-aave, whose four specs
+          ;; are all `:refs {}`: `ref-row` indexed the empty ref-field vector and
+          ;; the run died with "No item 0 in vector of length 0" -- an index
+          ;; error, not a refusal, so it named nothing and wrote nothing.
+          ;;
+          ;; Refusing rather than inventing. The hand-written com-aave component
+          ;; solves this by passing `expand` a SYNTHETIC ref table --
+          ;; "liquidityIndex:ReserveData" -- so the fold runs even though the
+          ;; real table yields nothing, with selector 0 left on the real table to
+          ;; document that emptiness. That is a good design and a person chose
+          ;; it. A generator that invented such a pair on its own would be
+          ;; manufacturing the test input whose absence it exists to detect, and
+          ;; the resulting arms would go green over a fold the production path
+          ;; never performs.
+          _ (when-not (:refs-exercised? p)
+              (refuse! "no spec declares a ref, so no expand oracle can be derived"
+                       {:specs (mapv :entity specs)
+                        :hint (str "every spec is :refs {} -- see com-aave, which passes a synthetic "
+                                   "ref table by hand and keeps selector 0 on the real one")}))
           tmpl (fs/readFileSync tmpl-path "utf8")
           ;; 1. the tables, regenerated whole.
           ;;
@@ -209,9 +316,21 @@
           ;; 2. the fixtures, regenerated whole
           body (block body "fixture-data" (str (:fixture-data f) "\n\n"))
           body (block body "seeded-row" (str (:seeded-row f) "\n\n"))
+          ;; The ref row and the expand oracle, regenerated whole rather than
+          ;; reached by the token pass. See the note above `ref-row`.
+          body (block body "cred-row" (str (ref-row specs p f) "\n\n"))
+          body (block body "oracle-expand"
+                      (str (str/replace (expand-oracle p f) "REF_ENT" (:entity (:ref-ent p)))
+                           "\n\n"))
           ;; 3. every remaining canon token, by role
           subs [[(:ref-field-1 canon) (or (first (:ref-fields f)) (:ref-field-1 canon))]
-                [(:ref-field-2 canon) (or (second (:ref-fields f)) (first (:ref-fields f)) (:ref-field-2 canon))]
+                ;; NO fallback to ref-field-1. That fallback is what produced a
+                ;; duplicate JSON key and a selector that duplicated another
+                ;; selector's value. With cred-row and oracle-expand now
+                ;; generated, a surviving `childPartId` means some OTHER block
+                ;; still carries it, and the evidence floor below will say so
+                ;; rather than papering over it with an alias.
+                [(:ref-field-2 canon) (or (second (:ref-fields f)) (:ref-field-2 canon))]
                 [(:root-prefix canon) (:id-prefix (:root p))]
                 [(:ref-prefix canon) (:id-prefix (:ref-ent p))]
                 [(:root canon) (:entity (:root p))]
@@ -233,7 +352,13 @@
       ;; `abbrobot_pro` -- id prefixes of template entities the canon map never
       ;; names. A check written from the substitution table can only see what
       ;; the substitution table already handles.
-      (let [stems (if (= src-name (:src canon)) [] ["abbrobot" "abb_robotics" "abb-robotics"])
+      (let [stems (if (= src-name (:src canon)) []
+                      (concat ["abbrobot" "abb_robotics" "abb-robotics"]
+                              ;; A template ref-field that survives means a block
+                              ;; carrying it was not regenerated. Previously the
+                              ;; alias hid this by rewriting it to a real name.
+                              (remove (set (:ref-fields f))
+                                      [(:ref-field-1 canon) (:ref-field-2 canon)])))
             survivors (filter #(str/includes? body %) stems)]
         (when (seq survivors)
           (refuse! "template tokens survived the substitution"
