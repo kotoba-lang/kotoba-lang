@@ -1,0 +1,251 @@
+#!/usr/bin/env nbb
+;; gen-whole-component.cljs -- the whole-component port, generated from the
+;; oracle's own entity-specs table.
+;;
+;; The wave-1 cohort's twenty oracles are one generated actor template. Measured
+;; 2026-09-10: diffing src/aave/main.cljc against src/abb_robotics/main.cljc with
+;; the repository name normalised away leaves the docstring and the entity-specs
+;; table, and nothing else. So the whole-component port is mechanical -- and the
+;; parts that must NOT be mechanical are exactly where the first hand port went
+;; wrong.
+;;
+;; That miss is the reason this exists. Porting com-abb-robotics by hand carried
+;; com-aadhaar's `{"expand":"identityId"}` into the expand oracle. BOM has no
+;; identityId, so every selector would have named a field that does not exist,
+;; `expand` would have folded over nothing, and four arms would have gone green
+;; measuring an empty fold -- in the one port whose novelty was that the fold now
+;; runs twice. Here every field name, prefix and entity name is DERIVED from the
+;; spec table, so that class cannot be carried.
+;;
+;; WRITTEN IN nbb, NOT kbb. CLAUDE.md puts new operational tooling on kbb first.
+;; Measured 2026-09-10 on this machine: `which kbb` finds nothing. Recorded here
+;; rather than silently choosing the old host; the kbb port is owed.
+;;
+;;   nbb gen-whole-component.cljs <template.kotoba> <repo-dir> <src-dir-name>
+;;
+;; exit 0  wrote the component
+;; exit 2  REFUSED -- could not parse the oracle, or the template lost an anchor
+
+(ns gen-whole-component
+  (:require [clojure.string :as str]
+            [clojure.edn :as edn]
+            ["fs" :as fs]
+            ["path" :as path]))
+
+(def argv (vec (remove #(str/ends-with? % ".cljs") (drop 2 (js->clj js/process.argv)))))
+
+(defn refuse! [msg data]
+  (println (str "REFUSED\t" msg "\t" (pr-str data)))
+  (.exit js/process 2))
+
+;; --- the oracle's table ----------------------------------------------------
+
+(defn read-specs
+  "The `entity-specs` vector out of a .cljc oracle, as data.
+
+  Read with the EDN reader rather than pattern-matched: the table is ordinary
+  data and a regex over it would be a second, weaker parser for something that
+  already has one."
+  [cljc]
+  (let [i (str/index-of cljc "(def entity-specs")]
+    (when-not i (refuse! "no entity-specs in the oracle" {}))
+    (let [open (str/index-of cljc "[" i)
+          ;; balance brackets from the opening one
+          end (loop [j open depth 0]
+                (cond
+                  (>= j (count cljc)) (refuse! "unbalanced entity-specs vector" {})
+                  (= \[ (nth cljc j)) (recur (inc j) (inc depth))
+                  (= \] (nth cljc j)) (if (= 1 depth) j (recur (inc j) (dec depth)))
+                  :else (recur (inc j) depth)))
+          specs (edn/read-string (subs cljc open (inc end)))]
+      (when-not (and (vector? specs) (seq specs) (every? map? specs))
+        (refuse! "entity-specs did not read as a non-empty vector of maps" {:got (type specs)}))
+      specs)))
+
+;; --- derived names ---------------------------------------------------------
+
+(defn- names [ks] (str/join "," (map name ks)))
+(defn- pairs [m] (str/join "," (map (fn [[k v]] (str (name k) ":" (if (keyword? v) (name v) v))) m)))
+
+(defn plan
+  "Which entity plays which role in the fixtures, derived rather than chosen.
+
+  root      the first spec with no refs -- the thing other rows point AT
+  ref-ent   the first spec that HAS refs, so the expand fold has something to do
+  float-ent the first spec with a :float coercion, which is the blocked arm"
+  [specs]
+  (let [root (or (first (filter #(empty? (:refs %)) specs)) (first specs))
+        ref-ent (first (filter #(seq (:refs %)) specs))
+        float-ent (first (filter #(some #{:float} (vals (:coerce %))) specs))]
+    {:root root
+     :ref-ent ref-ent
+     :float-ent (or float-ent (second specs) root)
+     :refs-exercised? (boolean ref-ent)
+     :float-reached? (boolean float-ent)}))
+
+;; --- the eight tables ------------------------------------------------------
+
+(defn tables [specs]
+  (let [arm (fn [f] (str/join "\n" (map (fn [s] (str "    (string=? entity \"" (:entity s) "\") \"" (f s) "\"")) specs)))]
+    (str
+     "(defn entity-count [] :i64 " (count specs) ")\n\n"
+     "(defn entity-at [i :i64] :string\n  (cond\n"
+     (str/join "\n" (map-indexed (fn [i s] (str "    (= i " i ") \"" (:entity s) "\"")) specs))
+     "\n    :else \"\"))\n\n"
+     "(defn plural-of [entity :string] :string\n  (cond\n" (arm :plural) "\n    :else \"\"))\n\n"
+     "(defn id-prefix-of [entity :string] :string\n  (cond\n" (arm :id-prefix) "\n    :else \"\"))\n\n"
+     "(defn fields-of [entity :string] :string\n  (cond\n" (arm #(names (:fields %))) "\n    :else \"\"))\n\n"
+     "(defn required-of [entity :string] :string\n  (cond\n" (arm #(names (:required %))) "\n    :else \"\"))\n\n"
+     ";; `:coerce` as `field:kind` pairs. A spec that declares `{}` answers \"\".\n"
+     ";; A `float` arm is the one the aarch64 backend refuses -- see `coerce-field`.\n"
+     "(defn coerce-table-of [entity :string] :string\n  (cond\n" (arm #(pairs (:coerce %))) "\n    :else \"\"))\n\n"
+     ";; `:refs` as `field:entity` pairs, comma-separated. A spec with two refs\n"
+     ";; makes `expand`'s fold run twice over one row.\n"
+     "(defn refs-of [entity :string] :string\n  (cond\n" (arm #(pairs (:refs %))) "\n    :else \"\"))")))
+
+;; --- the fixtures ----------------------------------------------------------
+
+(defn- jobj [kvs] (str "{" (str/join "," (map (fn [[k v]] (str "\\\"" k "\\\":\\\"" v "\\\"")) kvs)) "}"))
+
+(defn fixtures
+  "fixture-data, seeded-row and the ref row, with every field name taken from
+  the spec table. This is the block the hand port got wrong."
+  [{:keys [root ref-ent float-ent]}]
+  (let [rreq (map name (:required root))
+        rfields (map name (:fields root))
+        freq (map name (:required float-ent))
+        extra (first (remove (set rreq) rfields))
+        ref-fields (map name (keys (:refs ref-ent)))
+        ref-targets (map (fn [[_ v]] v) (:refs ref-ent))
+        ref-other (first (remove (set ref-fields) (map name (:fields ref-ent))))]
+    {:fixture-data
+     (str "(defn fixture-data [sel :i64] :string\n  (cond\n"
+          "    (= sel 0) \"" (jobj (map (fn [f] [f "v"]) rreq)) "\"\n"
+          "    (= sel 1) \"" (jobj (map (fn [f] [f "v"]) (take 1 rreq))) "\"\n"
+          "    (= sel 2) \"" (jobj (concat (map (fn [f] [f "v"]) rreq) [["bogus" "x"]])) "\"\n"
+          "    (= sel 3) \"" (jobj (map (fn [f] [f "v"]) freq)) "\"\n"
+          "    (= sel 4) \"" (jobj (map (fn [f] [f "v"]) (map name (:required ref-ent)))) "\"\n"
+          "    :else \"{}\"))")
+     :degenerate-fixture-1? (<= (count rreq) 1)
+     :seeded-row
+     (str "(defn seeded-row [i :i64] :string\n"
+          "  (jobj (jsep (jsep (jkv \"id\" (string-concat \"" (:id-prefix root) "_\" (string-from-i64 i)))\n"
+          "                    " (if extra
+                                   (str "(jkv-raw \"" extra "\" (string-from-i64 i)))")
+                                   (str "(jkv \"" (first rreq) "\" \"v\"))"))
+          "\n              (jsep " (str/join " " (map (fn [f] (str "(jkv \"" f "\" \"v\")")) (take 2 rreq)))
+          (if (< (count rreq) 2) " (jkv \"_\" \"\")" "") "))))")
+     :ref-fields ref-fields
+     :ref-targets ref-targets
+     :ref-other ref-other}))
+
+;; --- splice ---------------------------------------------------------------
+;;
+;; The template's own names are the canon. Every one of them is replaced by the
+;; role the target's spec table gives it, and a guard refuses when a target
+;; entity happens to carry a canon name in a DIFFERENT role -- a silent
+;; mis-mapping there would produce a component that compiles and addresses the
+;; wrong rows.
+
+(def canon
+  {:root "Part" :ref-ent "BOM" :float-ent "Robot"
+   :root-prefix "abbrobot_par" :ref-prefix "abbrobot_bom"
+   :ref-field-1 "parentPartId" :ref-field-2 "childPartId"
+   :ns "abb-robotics" :ns-prefix "abb_robotics" :src "abb_robotics"})
+
+(defn- block
+  "Replace the whole `(defn NAME ...)` form, found by its header and ended by
+  the next top-level `(defn ` or `;; ---`. Anchors are checked: a template that
+  lost one REFUSES rather than writing a component with a stale fixture."
+  [src name replacement]
+  (let [head (str "(defn " name " ")
+        i (str/index-of src head)]
+    (when-not i (refuse! "template lost an anchor" {:defn name}))
+    (let [rest-from (+ i (count head))
+          j (or (first (sort (remove nil? [(str/index-of src "\n(defn " rest-from)
+                                           (str/index-of src "\n;; ---" rest-from)])))
+                (count src))]
+      (str (subs src 0 i) replacement (subs src j)))))
+
+(defn- guard! [specs p]
+  (let [by-name (into {} (map (juxt :entity identity) specs))
+        ;; Built by reduce, not as a literal: when a repository has no float
+        ;; coercion the float role falls back to an entity that may already
+        ;; hold another role, and a map literal with a duplicate key throws.
+        ;; First role assigned wins, which matches the substitution order.
+        role (reduce (fn [m [k e]] (if (contains? m e) m (assoc m e k)))
+                     {}
+                     [[:root (:entity (:root p))]
+                      [:ref-ent (:entity (:ref-ent p))]
+                      [:float-ent (:entity (:float-ent p))]])]
+    (doseq [[k v] (select-keys canon [:root :ref-ent :float-ent])]
+      (when (and (contains? by-name v) (not= k (get role v)))
+        (refuse! "a target entity carries a template name in another role"
+                 {:entity v :template-role k :target-role (get role v)})))))
+
+(let [[tmpl-path repo-dir src-name] argv]
+  (when-not (and tmpl-path repo-dir src-name)
+    (refuse! "usage: <template.kotoba> <repo-dir> <src-dir-name>" {:argv argv}))
+  (let [cljc-path (path/join repo-dir "src" src-name "main.cljc")]
+    (when-not (fs/existsSync cljc-path) (refuse! "no oracle" {:path cljc-path}))
+    (let [specs (read-specs (fs/readFileSync cljc-path "utf8"))
+          p (plan specs)
+          f (fixtures p)
+          _ (guard! specs p)
+          tmpl (fs/readFileSync tmpl-path "utf8")
+          ;; 1. the tables, regenerated whole.
+          ;;
+          ;; ORDER MATTERS and it cost a wrong component to find out. Inserting
+          ;; the generated block first and then deleting the seven originals by
+          ;; name deletes the GENERATED ones -- `block` finds the first match,
+          ;; and after the insert that is the new text. The originals survive,
+          ;; the token pass rewrites their entity names, and the result compiles
+          ;; while `id-prefix-of` still answers the template's prefixes. Delete
+          ;; first, insert second.
+          body (reduce (fn [acc n] (block acc n "")) tmpl
+                       ["entity-at" "plural-of" "id-prefix-of" "fields-of"
+                        "required-of" "coerce-table-of" "refs-of"])
+          body (block body "entity-count" (str (tables specs) "\n\n"))
+          ;; 2. the fixtures, regenerated whole
+          body (block body "fixture-data" (str (:fixture-data f) "\n\n"))
+          body (block body "seeded-row" (str (:seeded-row f) "\n\n"))
+          ;; 3. every remaining canon token, by role
+          subs [[(:ref-field-1 canon) (or (first (:ref-fields f)) (:ref-field-1 canon))]
+                [(:ref-field-2 canon) (or (second (:ref-fields f)) (first (:ref-fields f)) (:ref-field-2 canon))]
+                [(:root-prefix canon) (:id-prefix (:root p))]
+                [(:ref-prefix canon) (:id-prefix (:ref-ent p))]
+                [(:root canon) (:entity (:root p))]
+                [(:ref-ent canon) (:entity (:ref-ent p))]
+                [(:float-ent canon) (:entity (:float-ent p))]
+                [(:ns canon) (str/replace src-name "_" "-")]
+                [(:ns-prefix canon) src-name]
+                [(str "src/" (:src canon) "/") (str "src/" src-name "/")]]
+          body (reduce (fn [acc [a b]] (if (= a b) acc (str/replace acc a b))) body subs)
+          out (path/join repo-dir "src" src-name "whole_component.kotoba")]
+      ;; Evidence floor. `amu check` passes on a component whose tables still
+      ;; answer the TEMPLATE's prefixes -- measured, that is exactly what the
+      ;; first run of this generator produced -- so the check that matters is
+      ;; that no canon token survived. A generator that cannot say this REFUSES
+      ;; rather than writing.
+      ;; The stems, not the canon values. Measured: the first version of this
+      ;; check looked only at `canon`, and the four tokens that actually
+      ;; survived were `abbrobot_cha`, `abbrobot_wor`, `abbrobot_rob` and
+      ;; `abbrobot_pro` -- id prefixes of template entities the canon map never
+      ;; names. A check written from the substitution table can only see what
+      ;; the substitution table already handles.
+      (let [stems (if (= src-name (:src canon)) [] ["abbrobot" "abb_robotics" "abb-robotics"])
+            survivors (filter #(str/includes? body %) stems)]
+        (when (seq survivors)
+          (refuse! "template tokens survived the substitution"
+                   {:tokens (vec survivors)
+                    :hint "a table or fixture block was not regenerated; see the ORDER MATTERS note"})))
+      (fs/writeFileSync out body)
+      (println (str "SPECS\t" (count specs) "\t" (str/join "," (map :entity specs))))
+      (println (str "ROOT\t" (:entity (:root p))))
+      (println (str "REFS\t" (if (:refs-exercised? p)
+                               (str (:entity (:ref-ent p)) " " (pairs (:refs (:ref-ent p))))
+                               "none -- expand folds over nothing in this repository")))
+      (println (str "FLOAT\t" (if (:float-reached? p) (:entity (:float-ent p)) "not reached")))
+      (when (:degenerate-fixture-1? f)
+        (println "WARN\tthe root entity requires one field, so fixture 1 cannot be a partial record"))
+      (println (str "WROTE\t" out "\t" (count (str/split-lines body)) " lines")))))
