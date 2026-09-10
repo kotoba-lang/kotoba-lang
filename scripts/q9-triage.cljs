@@ -1,0 +1,120 @@
+#!/usr/bin/env nbb
+;; q9-triage.cljs -- rename every .cljc/.clj/.cljs to .kotoba, ask the compiler,
+;; and let the answer be the classification.
+;;
+;; ADR-2607279200 decision 5 requires a four-way classification PER PATH before
+;; a migration, and `lang/q9-migration.edn` carries
+;; `:classification-required-per-path true`. Until now that reading was done by
+;; a person opening files, which is the slow half of every port.
+;;
+;; The owner's proposal was to rename first and let `kotoba compile` / `kotoba
+;; test` say whether it works. Measured 2026-09-10 on twelve real .cljc files
+;; across text, io-multiformats, css, i64, com-agora and com-adyen:
+;;
+;;   0 of 12   compiled
+;;   7 of 12   :kotoba/source-read-failed -- and SIX of those seven carry NO
+;;             span, so the answer is one line with no location
+;;   4 of 12   :kotoba.error/namespace-export-clause, with a span
+;;   1 of 12   :kotoba.error/namespace-require-needs-project
+;;
+;; and every one of the seven read failures contains `#?(`, `#(` or `^:`.
+;;
+;; So the rename does NOT verify a port -- but the ERROR CODE is a classifier,
+;; and a cheap one. That is what this script is: the owner's procedure, run for
+;; what it actually answers.
+;;
+;; TWO THINGS IT DOES NOT DO, because measuring showed it cannot:
+;;
+;;   It never renames in place. The copy goes to a scratch directory. A bulk
+;;   in-tree rename is forbidden by `lang/q9-migration.edn`
+;;   (`:bulk-extension-rename-forbidden true`), and that rule has a measured
+;;   reason in this cohort: `schema/*.kotoba` was a generated schema DSL wearing
+;;   the extension, and the tranche had to rename twenty of them to
+;;   `.kotoba-schema` to undo it.
+;;
+;;   It does not treat a `#?(` file as a rename candidate at all. A reader
+;;   conditional means the file is TWO programs, and choosing a branch is a
+;;   semantic decision, not a rename. The closed reader refuses reader macros by
+;;   design, not by omission.
+;;
+;;   nbb q9-triage.cljs <amu-bin> <scratch-dir> <dir> [<dir> ...]
+;;
+;; exit 0  scanned and classified
+;; exit 2  REFUSED -- amu not runnable, or nothing to scan
+
+(ns q9-triage
+  (:require [clojure.string :as str]
+            ["fs" :as fs]
+            ["path" :as path]
+            ["child_process" :as cp]))
+
+(def argv (vec (remove #(str/ends-with? % ".cljs") (drop 2 (js->clj js/process.argv)))))
+
+(defn refuse! [msg data]
+  (println (str "REFUSED\t" msg "\t" (pr-str data)))
+  (.exit js/process 2))
+
+(defn- walk [dir out]
+  (when (fs/existsSync dir)
+    (doseq [e (fs/readdirSync dir #js {:withFileTypes true})]
+      (let [p (path/join dir (.-name e))]
+        (cond
+          (and (.isDirectory e)
+               (not (contains? #{"node_modules" ".git" "target" "dist" "build" ".shadow-cljs"} (.-name e))))
+          (walk p out)
+          (and (.isFile e) (re-find #"\.(cljc|clj|cljs)$" (.-name e)))
+          (swap! out conj p)
+          :else nil)))))
+
+(def reader-features
+  "Syntax the closed reader does not admit. `#?(` is the one that matters: it
+  means the file is two programs and no rename can say which."
+  [["#?(" :reader-conditional]
+   ["#(" :fn-literal]
+   ["^" :metadata]
+   ["#'" :var-quote]])
+
+(defn- features [src]
+  (vec (keep (fn [[lit k]] (when (str/includes? src lit) k)) reader-features)))
+
+(defn- classify [amu scratch p]
+  (let [src (fs/readFileSync p "utf8")
+        feats (features src)
+        dest (path/join scratch (str (str/replace (str/replace p "/" "_") #"\.(cljc|clj|cljs)$" "") ".kotoba"))]
+    (fs/writeFileSync dest src)
+    (let [r (.spawnSync cp "node" (clj->js [amu "check" dest "--jvm-free"])
+                        #js {:encoding "utf8" :timeout 240000})
+          out (str (.-stdout r) (.-stderr r))
+          code (or (second (re-find #":code (:[a-zA-Z0-9./-]+)" out)) "none")
+          ok? (str/includes? out ":ok true")]
+      {:path p
+       :verdict (cond ok? :compiles
+                      (seq (filter #{:reader-conditional} feats)) :two-programs
+                      (= code ":kotoba/source-read-failed") :reader-refused
+                      :else :admitted-but-rejected)
+       :code (if ok? "-" code)
+       :span? (str/includes? out ":span")
+       :features feats})))
+
+(let [[amu scratch & dirs] argv]
+  (when-not (and amu scratch (seq dirs))
+    (refuse! "usage: <amu-bin> <scratch-dir> <dir> [<dir> ...]" {:argv argv}))
+  (when-not (fs/existsSync amu) (refuse! "amu not found" {:amu amu}))
+  (fs/mkdirSync scratch #js {:recursive true})
+  (let [files (atom [])]
+    (doseq [d dirs] (walk d files))
+    (when (empty? @files) (refuse! "nothing to scan" {:dirs (vec dirs)}))
+    (let [rows (mapv #(classify amu scratch %) @files)
+          by (frequencies (map :verdict rows))
+          spanless (count (filter #(and (not (:span? %)) (not= :compiles (:verdict %))) rows))]
+      (doseq [r rows]
+        (println (str (name (:verdict r)) "\t" (:code r) "\t"
+                      (if (:span? r) "span" "no-span") "\t"
+                      (str/join "," (map name (:features r))) "\t" (:path r))))
+      (println (str "SCANNED\t" (count rows)))
+      (doseq [[k v] (sort-by (comp - val) by)] (println (str "VERDICT\t" (name k) "\t" v)))
+      ;; The number that decides whether this procedure is cheap: a failure with
+      ;; no span costs a read anyway, so it is not classification, it is a
+      ;; pointer at a whole file.
+      (println (str "NO-SPAN\t" spanless "\tof " (- (count rows) (get by :compiles 0))
+                    " failures carry no location")))))
