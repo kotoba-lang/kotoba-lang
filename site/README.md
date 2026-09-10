@@ -349,6 +349,50 @@ become a fastest claim through presentation.
 
 ## Regenerate
 
+For an isolated checkout or CI, run from the repository root:
+
+```sh
+npm ci
+npm run site:build
+```
+
+This fetches full Git checkouts into ignored `.site-deps/`, selects the
+immutable revisions in `site/build-dependencies.json`, regenerates `site/dist/`,
+and runs both locale suites. The grammar pin matches the digest contract in
+`site/dependencies.edn`. The text pin includes the one-argument `join` needed
+by the HTML renderer; the older operator checkout produced empty documents.
+The other pins preserve the dependencies used by the existing site. Advance
+these deliberately with a successful regeneration and locale verification.
+
+### Merge-triggered Cloudflare deployment
+
+The site-specific production build configuration is recorded in
+`site/cloudflare-build.json`. Configure Workers Builds on the existing
+`kotoba-lang-org` Worker with repository `kotoba-lang/kotoba-lang`:
+
+- Production branch: `main`; preview deployments disabled.
+- Root directory: `/`.
+- Build command: `npm ci && npm run site:build`.
+- Deploy command: `npx --no-install wrangler deploy --config site/wrangler.jsonc`.
+- Build variable: `NODE_VERSION=22`.
+- Watch all repository paths: language authorities and evidence outside
+  `site/` are also build inputs.
+
+Merge source changes into main; the build regenerates the pages before
+deploying. Edit `site/generate.cljs` or the source assets, not generated
+`site/dist/` HTML. A failed build or locale test must prevent deployment.
+`npm run site:deploy` provides the same build-before-deploy order for operators.
+
+**Activation is separate from these committed commands.** Cloudflare must
+first be authorized to access this GitHub repository and have a Workers build
+token. As of 2026-09-10, the repository-connection API returns code 8000008
+(Git account disconnected), and no build token is registered. These files
+alone do not enable the trigger. After connection, verify the first main
+push build succeeds and that the live homepage matches its generated output.
+
+Official setup reference:
+[Workers Builds API](https://developers.cloudflare.com/workers/ci-cd/builds/api-reference/).
+
 Run from the **repository root**, with `jp-go-digital-design-system`, `grammar`,
 `text`, `css`, and `html` checked out as west siblings (`orgs/kotoba-lang/*`):
 
