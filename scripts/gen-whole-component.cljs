@@ -339,7 +339,29 @@
                 [(:ns canon) (str/replace src-name "_" "-")]
                 [(:ns-prefix canon) src-name]
                 [(str "src/" (:src canon) "/") (str "src/" src-name "/")]]
-          body (reduce (fn [acc [a b]] (if (= a b) acc (str/replace acc a b))) body subs)
+          ;; ENTITY NAMES are replaced on a word boundary; everything else is a
+          ;; plain substring. Measured 2026-09-11 on com-agora: the template's
+          ;; root entity is `Part`, agora's is `Channel`, and an unanchored
+          ;; replacement rewrote the FIELD `maxParticipants` into
+          ;; `maxChannelicipants` -- inside coerce-table-of and fields-of, both
+          ;; of which are strings, so `amu check` returned :ok true and the
+          ;; evidence floor (which scans for surviving `abbrobot` stems) saw
+          ;; nothing wrong with a corrupted TARGET word.
+          ;;
+          ;; This is the same shape as the `.clj` / `.cljc` prefix aliasing this
+          ;; workspace hit earlier: a substring replacement firing inside a
+          ;; longer word. Prefixes and namespace tokens keep the plain form --
+          ;; `abbrobot_par` cannot occur inside another identifier here, and
+          ;; anchoring them would break `src/abb_robotics/`.
+          entity-names (set (map (fn [[a _]] a)
+                                 [[(:root canon)] [(:ref-ent canon)] [(:float-ent canon)]]))
+          body (reduce (fn [acc [a b]]
+                         (cond
+                           (= a b) acc
+                           (contains? entity-names a)
+                           (str/replace acc (re-pattern (str "\\b" a "\\b")) b)
+                           :else (str/replace acc a b)))
+                       body subs)
           out (path/join repo-dir "src" src-name "whole_component.kotoba")]
       ;; Evidence floor. `amu check` passes on a component whose tables still
       ;; answer the TEMPLATE's prefixes -- measured, that is exactly what the
