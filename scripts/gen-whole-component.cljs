@@ -279,6 +279,26 @@
           p (plan specs)
           f (fixtures p)
           _ (guard! specs p)
+          ;; A repository where NO spec declares a ref cannot get a derived
+          ;; expand oracle. Measured 2026-09-10 on com-aave, whose four specs
+          ;; are all `:refs {}`: `ref-row` indexed the empty ref-field vector and
+          ;; the run died with "No item 0 in vector of length 0" -- an index
+          ;; error, not a refusal, so it named nothing and wrote nothing.
+          ;;
+          ;; Refusing rather than inventing. The hand-written com-aave component
+          ;; solves this by passing `expand` a SYNTHETIC ref table --
+          ;; "liquidityIndex:ReserveData" -- so the fold runs even though the
+          ;; real table yields nothing, with selector 0 left on the real table to
+          ;; document that emptiness. That is a good design and a person chose
+          ;; it. A generator that invented such a pair on its own would be
+          ;; manufacturing the test input whose absence it exists to detect, and
+          ;; the resulting arms would go green over a fold the production path
+          ;; never performs.
+          _ (when-not (:refs-exercised? p)
+              (refuse! "no spec declares a ref, so no expand oracle can be derived"
+                       {:specs (mapv :entity specs)
+                        :hint (str "every spec is :refs {} -- see com-aave, which passes a synthetic "
+                                   "ref table by hand and keeps selector 0 on the real one")}))
           tmpl (fs/readFileSync tmpl-path "utf8")
           ;; 1. the tables, regenerated whole.
           ;;
