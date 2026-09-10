@@ -404,11 +404,27 @@
           ;; manufacturing the test input whose absence it exists to detect, and
           ;; the resulting arms would go green over a fold the production path
           ;; never performs.
-          _ (when-not (:refs-exercised? p)
-              (refuse! "no spec declares a ref, so no expand oracle can be derived"
-                       {:specs (mapv :entity specs)
-                        :hint (str "every spec is :refs {} -- see com-aave, which passes a synthetic "
-                                   "ref table by hand and keeps selector 0 on the real one")}))
+          ;; SCOPED TO THE TWO BLOCKS THAT NEED A REF, not to the whole run.
+          ;;
+          ;; This was a `refuse!`, and refusing the run froze three repositories
+          ;; out of every later fix. com-aftership, com-adyen and com-airtable
+          ;; declare :refs {} on every spec, so each generator improvement since
+          ;; -- the entity table, the fixtures, oracle-filters, oracle-handlers,
+          ;; none of which touch a ref -- stopped at this line and left them
+          ;; behind. Measured 2026-09-11: all three still answer 5,5,5,5,5,5 for
+          ;; oracle-filters and 400/7 for oracle-handlers selectors 6 and 13,
+          ;; the two defects already fixed everywhere else.
+          ;;
+          ;; The original reasoning is kept and still holds: a generator that
+          ;; invented a ref pair would manufacture the input whose absence it
+          ;; exists to detect. So cred-row and oracle-expand are still NOT
+          ;; derived here. They are left exactly as they stand, which for these
+          ;; repositories is a fold over nothing -- recorded as
+          ;; :expand-fold :not-exercised in each migration record, so the
+          ;; vacuity is on the record rather than hidden.
+          ;;
+          ;; What changes is only which blocks the absence stops.
+          refs? (:refs-exercised? p)
           tmpl (fs/readFileSync tmpl-path "utf8")
           ;; 1. the tables, regenerated whole.
           ;;
@@ -430,10 +446,37 @@
           ;; reached by the token pass. See the note above `ref-row`.
           body (block body "oracle-filters" (str (filters-oracle p f) "\n\n"))
           body (block body "oracle-handlers" (str (handlers-oracle p) "\n\n"))
-          body (block body "cred-row" (str (ref-row specs p f) "\n\n"))
-          body (block body "oracle-expand"
-                      (str (str/replace (expand-oracle p f) "REF_ENT" (:entity (:ref-ent p)))
-                           "\n\n"))
+          body (if refs? (block body "cred-row" (str (ref-row specs p f) "\n\n")) body)
+          body (if refs?
+                 (block body "oracle-expand"
+                        (str (str/replace (expand-oracle p f) "REF_ENT" (:entity (:ref-ent p)))
+                             "\n\n"))
+                 body)
+          ;; With no ref anywhere, the three ref blocks are DELETED rather than
+          ;; carried. Leaving them was tried first and the evidence floor caught
+          ;; it: the generator builds from the TEMPLATE, so an un-regenerated
+          ;; cred-row keeps `parentPartId`, `childPartId` and the `BOM` entity,
+          ;; and the output would name a relationship this repository does not
+          ;; have. `cred-row`, `seeded-both` and `oracle-expand` form a closed
+          ;; cluster -- cred-row feeds seeded-both, both feed oracle-expand, and
+          ;; the only tie outside it is the oracle-expand export -- so the three
+          ;; come out together or not at all.
+          ;;
+          ;; This is a public-surface change and it is the deliberate kind:
+          ;; ADR-q9 allows dropping an export by an explicit API decision, and
+          ;; a fold over nothing is exactly what should be absent rather than
+          ;; present and vacuous.
+          body (if refs? body
+                   (reduce (fn [acc n] (block acc n ""))
+                           body ["cred-row" "seeded-both" "oracle-expand"]))
+          body (if refs? body
+                   (let [before "oracle-facts oracle-expand oracle-clock"
+                         after  "oracle-facts oracle-clock"]
+                     (when-not (str/includes? body before)
+                       (refuse! "cannot drop the oracle-expand export"
+                                {:expected before
+                                 :hint "the export vector moved; deleting the defn without the export would not compile"}))
+                     (str/replace body before after)))
           ;; 3. every remaining canon token, by role
           subs [[(:ref-field-1 canon) (or (first (:ref-fields f)) (:ref-field-1 canon))]
                 ;; NO fallback to ref-field-1. That fallback is what produced a
@@ -467,8 +510,24 @@
           ;; anchoring them would break `src/abb_robotics/`.
           entity-names (set (map (fn [[a _]] a)
                                  [[(:root canon)] [(:ref-ent canon)] [(:float-ent canon)]]))
+          ;; A pair whose REPLACEMENT is nil is dropped, and said out loud.
+          ;;
+          ;; `ref-prefix` and `ref-ent` resolve through `(:ref-ent p)`, which is
+          ;; nil when no spec declares a ref. While this ran only behind the
+          ;; whole-run refusal that could not happen; with the refusal scoped to
+          ;; the two ref blocks it can, and `str/replace` with a nil replacement
+          ;; throws "Cannot read properties of null" from inside clojure.string
+          ;; -- an error that names the reducer, not the token. Substituting a
+          ;; token for nothing is never right, so this guard belongs here
+          ;; whatever the caller.
+          droppable (remove (fn [[_ b]] (string? b)) subs)
+          _ (when (seq droppable)
+              (println (str "SKIPPED-TOKENS\t"
+                            (str/join "," (map first droppable))
+                            "\tno target in this repository's spec table; left as they stand")))
           body (reduce (fn [acc [a b]]
                          (cond
+                           (not (string? b)) acc
                            (= a b) acc
                            (contains? entity-names a)
                            (str/replace acc (re-pattern (str "\\b" a "\\b")) b)
@@ -507,4 +566,8 @@
       (println (str "FLOAT\t" (if (:float-reached? p) (:entity (:float-ent p)) "not reached")))
       (when (:degenerate-fixture-1? f)
         (println "WARN\tthe root entity requires one field, so fixture 1 cannot be a partial record"))
+      (when-not refs?
+        (println (str "DROPPED-BLOCKS\tcred-row,seeded-both,oracle-expand\t"
+                      "no spec declares a ref, so this component has no expand "
+                      "oracle; the oracle-expand export is dropped with them")))
       (println (str "WROTE\t" out "\t" (count (str/split-lines body)) " lines")))))
