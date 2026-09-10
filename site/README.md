@@ -383,12 +383,14 @@ deploying. Edit `site/generate.cljs` or the source assets, not generated
 `site/dist/` HTML. A failed build or locale test must prevent deployment.
 `npm run site:deploy` provides the same build-before-deploy order for operators.
 
-**Activation is separate from these committed commands.** Cloudflare must
-first be authorized to access this GitHub repository and have a Workers build
-token. As of 2026-09-10, the repository-connection API returns code 8000008
-(Git account disconnected), and no build token is registered. These files
-alone do not enable the trigger. After connection, verify the first main
-push build succeeds and that the live homepage matches its generated output.
+**Activation is separate from these committed commands.** On 2026-09-10 the
+owner authorized the Cloudflare GitHub App for this repository. The production
+trigger and build token were created, and the main-only commands, cache and
+Node 22 variable above were saved and read back from Cloudflare. Trigger ID:
+`29b54d36-8f9b-45c4-967c-23d4d786ecf8`. No preview trigger is enabled.
+After changing this configuration, verify a main push build succeeds and the
+live homepage matches its generated output. A configured trigger alone is
+not proof of a successful deployment.
 
 Official setup reference:
 [Workers Builds API](https://developers.cloudflare.com/workers/ci-cd/builds/api-reference/).
