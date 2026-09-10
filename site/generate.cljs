@@ -2895,36 +2895,63 @@
 (def security-graph-css ".kot-attack-graph{margin-inline:0}.kot-attack-graph ol,.kot-attack-graph ul{list-style:none;padding:0}.kot-attack-graph li{border:var(--hig-hairline) solid var(--hig-color-separator);border-radius:var(--hig-radius-md);padding:var(--hig-spacing-4);margin-block:var(--hig-spacing-4);background:var(--hig-color-secondary-system-background)}.kot-attack-graph ol li+li:before{content:'\u2193';display:block;color:var(--hig-color-secondary-label)}.kot-attack-graph ul{border-inline-start:var(--hig-hairline) solid var(--hig-color-tint);padding-inline-start:var(--hig-spacing-6)}")
 
 (def security-copy (reader/read-string (fs/readFileSync "site/security-article.edn" "utf8")))
+(def infra-cost-copy (reader/read-string (fs/readFileSync "site/infra-cost-article.edn" "utf8")))
 
-(defn security-view []
+(defn- article-section
+  [{:keys [title paragraphs rows table table-2 steps after paragraphs-after stories graph]}]
+  [:section
+   (dds/heading 2 title {:size "32"})
+   (for [p paragraphs] [:p p])
+   (when table
+     [:div {:class "kot-table-scroll"}
+      (dds/table table)])
+   (when rows
+     [:dl (for [[name contribution] rows]
+            [:div [:dt [:strong name]] [:dd contribution]])])
+   (when (and after (not graph)) [:p after])
+   (when table-2
+     [:div {:class "kot-table-scroll"}
+      (dds/table table-2)])
+   (when steps
+     [:ol {:class "kot-list"}
+      (for [s steps] [:li s])])
+   (for [p paragraphs-after] [:p p])
+   (when graph
+     [:figure {:class "kot-attack-graph"}
+      [:ol (for [step (take 4 graph)] [:li [:strong step]])]
+      [:ul (for [outcome (drop 4 graph)] [:li outcome])]
+      [:figcaption after]])
+   (for [{:keys [title text]} stories]
+     [:section (dds/heading 3 title {:size "24"}) [:p text]])])
+
+(defn- blog-article-view
+  [{:keys [copy path eyebrow]}]
   [:div
    [:a {:class "kot-skip" :href "#main"} "Skip to content"]
-   (header "/" "/blog/csf2-attack-graphs/")
+   (header "/" path)
    [:main {:id "main"}
     (dds/container
      [:article {:class "kot-blog-entry"}
-      [:p {:class "kot-eyebrow"} "Security engineering"]
-      (dds/heading 1 (:title security-copy) {:size "48"})
-      [:p {:class "kot-lead"} (:intro security-copy)]
-      [:p (:notice security-copy)]
-      (for [{:keys [title paragraphs rows graph after stories]} (:sections security-copy)]
-        [:section
-         (dds/heading 2 title {:size "32"})
-         (for [p paragraphs] [:p p])
-         (when rows
-           [:dl (for [[name contribution] rows]
-                  [:div [:dt [:strong name]] [:dd contribution]])])
-         (when graph
-           [:figure {:class "kot-attack-graph"}
-            [:ol (for [step (take 4 graph)] [:li [:strong step]])]
-            [:ul (for [outcome (drop 4 graph)] [:li outcome])]
-            [:figcaption after]])
-         (for [{:keys [title text]} stories]
-           [:section (dds/heading 3 title {:size "24"}) [:p text]])])
-      (dds/heading 2 (:source-title security-copy) {:size "32"})
-      [:ul (for [{:keys [label url]} (:links security-copy)]
+      [:p {:class "kot-eyebrow"} eyebrow]
+      (dds/heading 1 (:title copy) {:size "48"})
+      [:p {:class "kot-lead"} (:intro copy)]
+      [:p (:notice copy)]
+      (for [section (:sections copy)]
+        (article-section section))
+      (dds/heading 2 (:source-title copy) {:size "32"})
+      [:ul (for [{:keys [label url]} (:links copy)]
              [:li [:a {:href url :class "kot-link"} label]])]])]
    (footer :en "/legal/")])
+
+(defn security-view []
+  (blog-article-view {:copy security-copy
+                      :path "/blog/csf2-attack-graphs/"
+                      :eyebrow "Security engineering"}))
+
+(defn infra-cost-view []
+  (blog-article-view {:copy infra-cost-copy
+                      :path "/blog/infra-cost-measured-path/"
+                      :eyebrow "Draft · 10 September 2026 · Infrastructure"}))
 
 (defn blog-view []
   [:div
@@ -2937,6 +2964,11 @@
       (dds/heading 1 "Evidence before slogans" {:size "48"})
       [:p {:class "kot-lead"}
        "Short notes about language design, measurements, shipped boundaries, and what still remains unqualified."]]
+     [:article {:class "kot-blog-entry"}
+      [:p {:class "kot-eyebrow"} "10 September 2026 · Infrastructure"]
+      (dds/heading 2 (:title infra-cost-copy) {:size "32"})
+      [:p (:description infra-cost-copy)]
+      [:a {:class "kot-link" :href "/blog/infra-cost-measured-path/"} "Read the measured path"]]
      [:article {:class "kot-blog-entry"}
       [:p {:class "kot-eyebrow"} "Security engineering"]
       (dds/heading 2 (:title security-copy) {:size "32"})
@@ -3310,7 +3342,7 @@
           base-path (if (tags first-segment)
                       (str "/" (str/join "/" (drop 2 segments))
                            (when (> (count segments) 2) "/")) path)]
-      (when (contains? #{"/" "/blog/" "/blog/csf2-attack-graphs/" "/libraries/" "/legal/" "/sponsor/"} base-path)
+      (when (contains? #{"/" "/blog/" "/blog/csf2-attack-graphs/" "/blog/infra-cost-measured-path/" "/libraries/" "/legal/" "/sponsor/"} base-path)
         (concat
          (for [{:keys [tag]} locales/required]
            [:link {:rel "alternate" :hreflang tag
@@ -3512,6 +3544,8 @@
   [{:path "/" :view (view)
     :title "Kotoba — safe, fast language for AI-generated software"
     :description "Kotoba is designed for safe, ultra-fast AI-generated software. Explore the language, reproducible benchmarks, and the Kotobase and Kotoba Cloud stack."}
+   {:path "/blog/infra-cost-measured-path/" :view (infra-cost-view) :title (:title infra-cost-copy)
+    :description (:description infra-cost-copy)}
    {:path "/blog/csf2-attack-graphs/" :view (security-view) :title (:title security-copy)
     :description (:description security-copy)}
    {:path "/blog/" :view (blog-view) :title "Kotoba Blog — engineering notes and evidence"
@@ -3695,16 +3729,19 @@
         (fs/mkdirSync (path/dirname target) #js {:recursive true})
         (fs/writeFileSync target (translated-page locale p catalog))))))
 
-(let [p (first (filter #(= "/blog/csf2-attack-graphs/" (:path %)) localized-pages))
-      rendered (page/->page
-                 {:title (:title p) :description (:description p) :lang "en" :css dds-css :dark? true
-                  :app-css (str tokens/skin-css "\n" app-css "\n" security-graph-css)
-                  :head (list (favicon-link) (apple-touch-icon-link) [:script theme-js] [:script menu-js]
-                              (og-head (:path p) (:title p) (:description p)))} (:view p))]
-  (fs/mkdirSync "site/dist/blog/csf2-attack-graphs" #js {:recursive true})
-  (fs/writeFileSync "site/dist/blog/csf2-attack-graphs/index.html" rendered)
-  (fs/mkdirSync "site/dist/security" #js {:recursive true})
-  (fs/copyFileSync "docs/security/csf2-threat-model.md" "site/dist/security/csf2-threat-model.md"))
+(doseq [article-path ["/blog/csf2-attack-graphs/" "/blog/infra-cost-measured-path/"]]
+  (let [p (first (filter #(= article-path (:path %)) localized-pages))
+        extra-css (when (= article-path "/blog/csf2-attack-graphs/") security-graph-css)
+        rendered (page/->page
+                  {:title (:title p) :description (:description p) :lang "en" :css dds-css :dark? true
+                   :app-css (str tokens/skin-css "\n" app-css (when extra-css (str "\n" extra-css)))
+                   :head (list (favicon-link) (apple-touch-icon-link) [:script theme-js] [:script menu-js]
+                               (og-head (:path p) (:title p) (:description p)))} (:view p))
+        dir (str "site/dist" (subs article-path 0 (dec (count article-path))))]
+    (fs/mkdirSync dir #js {:recursive true})
+    (fs/writeFileSync (path/join dir "index.html") rendered)))
+(fs/mkdirSync "site/dist/security" #js {:recursive true})
+(fs/copyFileSync "docs/security/csf2-threat-model.md" "site/dist/security/csf2-threat-model.md")
 
 (fs/writeFileSync "site/dist/_redirects" "/zh /zh-Hans/ 301\n/zh/* /zh-Hans/:splat 301\n")
 

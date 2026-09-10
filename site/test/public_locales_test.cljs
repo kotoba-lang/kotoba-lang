@@ -6,7 +6,7 @@
 
 (defn read-json [p] (js->clj (js/JSON.parse (fs/readFileSync p "utf8"))))
 (def source (read-json "site/i18n/en.json"))
-(def paths ["/" "/blog/csf2-attack-graphs/" "/blog/" "/libraries/" "/legal/" "/sponsor/"])
+(def paths ["/" "/blog/infra-cost-measured-path/" "/blog/csf2-attack-graphs/" "/blog/" "/libraries/" "/legal/" "/sponsor/"])
 (defn placeholders [s] (frequencies (re-seq #"\{[A-Za-z_]+\}" s)))
 (defn code-blocks [s] (map second (re-seq #"(?s)<pre[^>]*>(.*?)</pre>" s)))
 

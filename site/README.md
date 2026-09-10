@@ -614,3 +614,7 @@ nbb --classpath site/src site/test/public_locales_test.cljs
 `site/security-article.edn` holds the dated public article; `docs/security/csf2-threat-model.md` carries the English source-backed model, control boundaries and selected CSF mapping. The article is generated at `/blog/csf2-attack-graphs/` and all 16 translated equivalents, linked from each localized blog. New source strings use the shared root `scripts/model-eval/bench.cljs translate` policy with explicit public input. Translation receipts and provenance remain separate from native-language quality certification.
 
 The article does not claim a completed enterprise hosted-apply service, NIST certification, comprehensive compliance or live attack-test coverage. Keep its measurement date, source identities and distinctions between design, local implementation tests and operating evidence.
+
+## Infrastructure-cost measured-path article
+
+`site/infra-cost-article.edn` is the English source for `/blog/infra-cost-measured-path/` and its localized equivalents. It ships mechanisms and named numbers only: no $/month savings, no language Release URL, no Kotoba-beats-Rust-or-C on GPU. Gate caveats stay next to measured numbers (host-load failed on the cited build-scaling run; native 19/30 is not “fastest everywhere”; admit-path walls include process overhead; exit 65 / exit 78 remain HOLD). English is the source of record; locale catalog shells may reuse English until a reviewed translation exists.
