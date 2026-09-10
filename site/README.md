@@ -630,4 +630,8 @@ card. Cloudflare deploy stays with Jun.
 Keep measured vs mechanism-only vs HOLD labels next to claims. Do not
 republish the withdrawn Amu 1.349× vs Rust ratio (ADR 0281). CUDA C emit is
 not NVIDIA product qualification. No Cerebras, no HIP, no Kotoba>Rust/C on
-GPU, no invented speedups, percentages, FLOPS, or GMV.
+GPU, no invented speedups, percentages, FLOPS, or GMV. ADR 0284's 21.1×
+vector-at figure is Kotoba slower than C on that host — not a shame metric
+to hide. Cite kotoba-lang/amu `docs/adr/`, `docs/performance.md`,
+`test/kotoba/compiler/accelerator_test.clj`, and the published
+compile-evidence pack. Do not cite coordinator box paths or RESEARCH.md.
