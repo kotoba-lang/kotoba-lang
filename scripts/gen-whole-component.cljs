@@ -144,15 +144,70 @@
      :seeded-row
      (str "(defn seeded-row [i :i64] :string\n"
           "  (jobj (jsep (jsep (jkv \"id\" (string-concat \"" (:id-prefix root) "_\" (string-from-i64 i)))\n"
+          ;; NO fallback to (first rreq). When every field is required there is
+          ;; no non-required field to carry the row index, and repeating the
+          ;; first required one emits it TWICE -- a duplicate JSON key, the same
+          ;; defect the ref-field-2 fallback below was removed for. Measured
+          ;; 2026-09-11 on the shipped com-airtable component, whose Base
+          ;; declares :fields and :required identical, so `seeded-row` wrote
+          ;; "name" twice. Pad with the same `_` slot the <2-required case uses.
           "                    " (if extra
                                    (str "(jkv-raw \"" extra "\" (string-from-i64 i)))")
-                                   (str "(jkv \"" (first rreq) "\" \"v\"))"))
+                                   (str "(jkv \"_\" \"\"))"))
           "\n              (jsep " (str/join " " (map (fn [f] (str "(jkv \"" f "\" \"v\")")) (take 2 rreq)))
           (if (< (count rreq) 2) " (jkv \"_\" \"\")" "") "))))")
+     :seed-extra extra
      :ref-fields ref-fields
      :ref-targets ref-targets
      :ref-other ref-other
      :ref-arity (count ref-fields)}))
+
+
+;; --- the filters oracle, from the root spec's OWN fields --------------------
+;;
+;; This block was reached only by the token pass, and the token pass substitutes
+;; ENTITY names and REF-FIELD names -- not ordinary field names. So the template
+;; repository's field names came through unchanged. Measured 2026-09-11 across
+;; the wave-1 cohort: seventeen of twenty components filter on `jurisdiction`
+;; and `externalId`, which are com-aadhaar's fields. Where they are foreign the
+;; component ignores the unknown key and returns every row, so all six selectors
+;; answer the SAME NUMBER -- com-agones and com-adyen both measured 5,5,5,5,5,5,
+;; against com-aadhaar's 5,3,5,1,0,5 and com-aave's identical 5,3,5,1,0,5 where
+;; the names were adapted. Six selectors and one value is a layer that cannot
+;; tell a working filter from a broken one, which is the exact class this
+;; generator's header claims cannot be carried.
+;;
+;; The floor: selector 1 must match every row and selector 2 none, on the SAME
+;; field. That pair is what makes the rest mean anything -- a filter that
+;; matched everything and a filter that matched nothing are the two ends, and
+;; a component that ignores the key silently collapses them.
+
+(defn filters-oracle [{:keys [root]} f]
+  (let [rreq (map name (:required root))
+        req1 (first rreq)
+        extra (:seed-extra f)
+        arms [(str "      ;; no filter at all -- the row count itself\n"
+                   "      (= sel 0) (arr-count (apply-filters rows \"{}\" fields))")
+              (str "      ;; a required field, the value every seeded row carries\n"
+                   "      (= sel 1) (arr-count (apply-filters rows \"{\\\"" req1 "\\\":\\\"v\\\"}\" fields))")
+              (str "      ;; the SAME field, a value no seeded row carries\n"
+                   "      (= sel 2) (arr-count (apply-filters rows \"{\\\"" req1 "\\\":\\\"zzz\\\"}\" fields))")]
+        idx (when extra
+              [(str "      ;; the row index, which is unique -- exactly one row\n"
+                    "      (= sel 3) (arr-count (apply-filters rows \"{\\\"" extra "\\\":\\\"1\\\"}\" fields))")
+               (str "      ;; the row index, out of range -- no row\n"
+                    "      (= sel 4) (arr-count (apply-filters rows \"{\\\"" extra "\\\":\\\"99\\\"}\" fields))")])]
+    (str ";; Selector 1 must return every row and selector 2 none, on the same\n"
+         ";; field; without that pair a green run cannot be told from a filter\n"
+         ";; whose key this repository does not have.\n"
+         (if idx
+           ";; Selectors 3 and 4 index a non-required field that carries the row\n;; number, so they reach the one-row and the no-row cases.\n"
+           ";; There are NO selectors 3 and 4: every field of this entity is\n;; required, so no field carries the row index and a uniqueness case\n;; cannot be derived. Recorded rather than faked with a repeated field.\n")
+         "(defn oracle-filters [sel :i64] :i64\n"
+         "  (let [rows (store-rows (seeded-store 5) \"" (:entity root) "\")\n"
+         "        fields (fields-of \"" (:entity root) "\")]\n    (cond\n"
+         (str/join "\n" (concat arms idx))
+         "\n      :else (arr-count (apply-filters rows \"{\\\"notAField\\\":\\\"x\\\"}\" fields)))))")))
 
 ;; --- the ref row and the expand oracle, by ref ARITY ------------------------
 ;;
@@ -318,6 +373,7 @@
           body (block body "seeded-row" (str (:seeded-row f) "\n\n"))
           ;; The ref row and the expand oracle, regenerated whole rather than
           ;; reached by the token pass. See the note above `ref-row`.
+          body (block body "oracle-filters" (str (filters-oracle p f) "\n\n"))
           body (block body "cred-row" (str (ref-row specs p f) "\n\n"))
           body (block body "oracle-expand"
                       (str (str/replace (expand-oracle p f) "REF_ENT" (:entity (:ref-ent p)))
