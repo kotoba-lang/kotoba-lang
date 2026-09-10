@@ -2,6 +2,30 @@
   (:require [clojure.test :refer [deftest is testing]]
             [kotoba.lang.capability-catalog :as catalog]))
 
+(deftest an-entry-with-no-classification-is-refused-by-the-authority
+  ;; Root ADR-2607280100 D5. The count assertions in the test below say the
+  ;; catalog IS complete today; this says `validate!` is what would notice if
+  ;; it stopped being -- a check that has only ever seen a passing input has
+  ;; not been shown to discriminate.
+  (let [authority (catalog/read-authority)
+        entry (get-in authority [:capabilities :hash/sha256])]
+    (is (keyword? (:kotoba.security/classification entry)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (catalog/validate!
+                  (update-in authority [:capabilities :hash/sha256]
+                             dissoc :kotoba.security/classification)))
+        "a capability with no declaration must not leave the authority")
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (catalog/validate!
+                  (assoc-in authority
+                            [:capabilities :hash/sha256
+                             :kotoba.security/classification]
+                            "public")))
+        "a declaration that is a string reading like a keyword is not one")
+    (is (map? (catalog/validate! authority))
+        "and the unmodified authority still passes, so the two refusals above
+         are the classification and not the fixture")))
+
 (deftest semantic-capability-authority-is-closed
   ;; The count is a deliberate tripwire: adding a capability must be a reviewed
   ;; act, not something that slips in. It went stale when 68e5fb5 ("record W5
@@ -14,6 +38,17 @@
         entries (:capabilities authority)
         wire-ids (sort (map :compiler-wire-id (vals entries)))]
     (is (= 40 (count entries)))
+    ;; Root ADR-2607280100 D5. Counts, not a boolean: `false` alone cannot
+    ;; tell one capability added without a classification from a catalog that
+    ;; failed to load. WHICH labels are legal is not asserted here -- that is
+    ;; `kotoba.security.information-flow/ranks`, one lattice, and amu's
+    ;; `kotoba.compiler.effect-classification` is what ranks a declaration.
+    (is (= 0 (count (remove :kotoba.security/classification (vals entries))))
+        "every capability declares :kotoba.security/classification")
+    (is (= (count entries)
+           (count (filter (comp keyword? :kotoba.security/classification)
+                          (vals entries))))
+        "a declaration is a keyword, not a string that reads like one")
     (is (= (range 1 (inc (count entries))) wire-ids)
         "wire ids stay contiguous from 1 with no duplicates or gaps")
     (is (= [4 11 12]
