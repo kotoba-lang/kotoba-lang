@@ -48,7 +48,7 @@
   "Every var the emitted harness calls. Checked before writing, because a
   harness that cannot load is worse than no harness: it fails at the point of
   use, long after the run that produced it looked successful."
-  ["routes" "as-int" "as-bool" "page-limit"])
+  ["routes" "as-int" "as-bool" "page-limit" "entity-specs"])
 
 (defn harness [ns-name]
   (str
@@ -74,11 +74,30 @@
    "   demonstrated that it can detect a mismatch, and is not a pass. A run on a\n"
    "   JVM would legitimately agree on that row; say which runtime produced any\n"
    "   result.\"\n"
-   "  (:require [" ns-name " :as m]))\n\n"
+   "  (:require [" ns-name " :as m]\n            [clojure.string :as str]))\n\n"
    ";; Byte-identical in every hand-written harness in this cohort.\n"
    "(def fixture-text\n"
    "  {0 \"12\" 1 \" 42 \" 2 \"-7\" 3 \"12abc\" 4 \"\" 5 \"true\" 6 \"TRUE\" 7 \"Yes\" 8 \"on\"\n"
    "   9 \"1\" 10 \"0\" 11 \"false\" 12 \"null\" 13 \"nope\"})\n\n"
+   ";; The same rolling hash the .kotoba computes: acc*131 + code point, mod\n"
+   ";; 1000000007, seeded 7. Every intermediate stays under 2^53, so a JS double\n"
+   ";; holds it exactly.\n"
+   "(defn str-hash [x]\n"
+   "  (reduce (fn [acc ch] (mod (+ (* acc 131) (.charCodeAt ch 0)) 1000000007)) 7 (seq (str x))))\n\n"
+   ";; The entity table, rendered the way `oracle-table` renders it. Unlike the\n"
+   ";; layers above, this one is DERIVED FROM THIS REPOSITORY'S OWN SPEC TABLE on\n"
+   ";; both sides, so it is the first row here that carries a per-repository\n"
+   ";; signal rather than a cohort-wide constant. It is also a runtime check for\n"
+   ";; the defect the component generator's evidence floor exists to catch: a\n"
+   ";; component whose tables still answer the TEMPLATE's prefixes passes\n"
+   ";; `amu check`, and fails here.\n"
+   "(defn coerce-csv [spec]\n"
+   "  (str/join \",\" (map (fn [[k v]] (str (name k) \":\" (name v))) (:coerce spec))))\n\n"
+   "(defn table-line [spec]\n"
+   "  (str/join \"|\" [(:entity spec) (:plural spec) (:id-prefix spec)\n"
+   "                 (str/join \",\" (map name (:fields spec)))\n"
+   "                 (str/join \",\" (map name (:required spec)))\n"
+   "                 (coerce-csv spec)]))\n\n"
    "(defn row [label v] (println (str label \"\\t\" v)))\n\n"
    "(println \"; oracle = " ns-name " under nbb\")\n"
    "(row \"main(route-count)\" (count m/routes))\n\n"
@@ -88,7 +107,10 @@
    "(doseq [i [5 6 7 8 9 10 11 4 13]]\n"
    "  (row (str \"as-bool \" i) (if (m/as-bool (fixture-text i)) 1 0)))\n\n"
    "(println \"; page-limit\")\n"
-   "(doseq [r [-5 0 1 20 99 100 101 250]] (row (str \"page-limit \" r) (m/page-limit r)))\n"))
+   "(doseq [r [-5 0 1 20 99 100 101 250]] (row (str \"page-limit \" r) (m/page-limit r)))\n\n"
+   "(println \"; table\")\n"
+   "(doseq [i (range (count m/entity-specs))]\n"
+   "  (row (str \"table \" i) (str-hash (table-line (nth m/entity-specs i)))))\n"))
 
 (let [[repo-dir src-name] argv]
   (when-not (and repo-dir src-name)
