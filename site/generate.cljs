@@ -2906,12 +2906,15 @@
 
 (def security-copy (reader/read-string (fs/readFileSync "site/security-article.edn" "utf8")))
 (def infra-cost-copy (reader/read-string (fs/readFileSync "site/infra-cost-article.edn" "utf8")))
+(def amu-isa-copy (reader/read-string (fs/readFileSync "site/amu-isa-article.edn" "utf8")))
 
 (defn- article-section
-  [{:keys [title paragraphs rows table table-2 steps after paragraphs-after stories graph]}]
+  [{:keys [title paragraphs items rows table table-2 steps after paragraphs-after stories graph]}]
   [:section
    (dds/heading 2 title {:size "32"})
    (for [p paragraphs] [:p p])
+   (when items
+     [:ul {:class "kot-list"} (for [item items] [:li item])])
    (when table
      [:div {:class "kot-table-scroll"}
       (dds/table table)])
@@ -2963,6 +2966,26 @@
                       :path "/blog/infra-cost-measured-path/"
                       :eyebrow "Draft · 10 September 2026 · Infrastructure"}))
 
+(defn amu-isa-view []
+  [:div
+   [:a {:class "kot-skip" :href "#main"} "Skip to content"]
+   ;; English-primary article: language switch lands on the localized blog
+   ;; index rather than invented translated bodies.
+   (header "/" "/blog/")
+   [:main {:id "main"}
+    (dds/container
+     [:article {:class "kot-blog-entry" :lang "en" :translate "no"}
+      [:p {:class "kot-eyebrow"} (:eyebrow amu-isa-copy)]
+      (dds/heading 1 (:title amu-isa-copy) {:size "48"})
+      [:p {:class "kot-lead"} (:intro amu-isa-copy)]
+      [:p (:notice amu-isa-copy)]
+      (for [section (:sections amu-isa-copy)]
+        (article-section section))
+      (dds/heading 2 (:source-title amu-isa-copy) {:size "32"})
+      [:ul (for [{:keys [label url]} (:links amu-isa-copy)]
+             [:li [:a {:href url :class "kot-link"} label]])]])]
+   (footer :en "/legal/")])
+
 (defn blog-view []
   [:div
    [:a {:class "kot-skip" :href "#main"} "Skip to content"]
@@ -2974,6 +2997,12 @@
       (dds/heading 1 "Evidence before slogans" {:size "48"})
       [:p {:class "kot-lead"}
        "Short notes about language design, measurements, shipped boundaries, and what still remains unqualified."]]
+     [:article {:class "kot-blog-entry" :lang "en" :translate "no"}
+      [:p {:class "kot-eyebrow"} (:eyebrow amu-isa-copy)]
+      (dds/heading 2 (:title amu-isa-copy) {:size "32"})
+      [:p (:description amu-isa-copy)]
+      [:a {:class "kot-link" :href "/blog/amu-isa-hardware-optimization/"}
+       "Read what amu emits and tunes today"]]
      [:article {:class "kot-blog-entry"}
       [:p {:class "kot-eyebrow"} "10 September 2026 · Infrastructure"]
       (dds/heading 2 (:title infra-cost-copy) {:size "32"})
@@ -3559,6 +3588,8 @@
     :description (:description infra-cost-copy)}
    {:path "/blog/csf2-attack-graphs/" :view (security-view) :title (:title security-copy)
     :description (:description security-copy)}
+   ;; /blog/amu-isa-hardware-optimization/ is English-primary and written
+   ;; below; it is not in this list so translated bodies are not invented.
    {:path "/blog/" :view (blog-view) :title "Kotoba Blog — engineering notes and evidence"
     :description "Kotoba engineering notes about language design, benchmarks, evidence, and remaining qualification gates."}
    {:path "/libraries/" :view (libraries-view) :title "Kotoba Libraries — content-addressed publication and comparison"
@@ -3753,6 +3784,17 @@
     (fs/writeFileSync (path/join dir "index.html") rendered)))
 (fs/mkdirSync "site/dist/security" #js {:recursive true})
 (fs/copyFileSync "docs/security/csf2-threat-model.md" "site/dist/security/csf2-threat-model.md")
+
+(let [rendered (page/->page
+                 {:title (:title amu-isa-copy) :description (:description amu-isa-copy) :lang "en" :css dds-css :dark? true
+                  :app-css (str tokens/skin-css "\n" app-css)
+                  :head (list (favicon-link) (apple-touch-icon-link) [:script theme-js] [:script menu-js]
+                              (og-head "/blog/amu-isa-hardware-optimization/"
+                                       (:title amu-isa-copy)
+                                       (:description amu-isa-copy)))}
+                 (amu-isa-view))]
+  (fs/mkdirSync "site/dist/blog/amu-isa-hardware-optimization" #js {:recursive true})
+  (fs/writeFileSync "site/dist/blog/amu-isa-hardware-optimization/index.html" rendered))
 
 (fs/writeFileSync "site/dist/_redirects" "/zh /zh-Hans/ 301\n/zh/* /zh-Hans/:splat 301\n")
 
