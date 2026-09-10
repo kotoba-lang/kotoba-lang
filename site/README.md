@@ -618,3 +618,16 @@ The article does not claim a completed enterprise hosted-apply service, NIST cer
 ## Infrastructure-cost measured-path article
 
 `site/infra-cost-article.edn` is the English source for `/blog/infra-cost-measured-path/` and its localized equivalents. It ships mechanisms and named numbers only: no $/month savings, no language Release URL, no Kotoba-beats-Rust-or-C on GPU. Gate caveats stay next to measured numbers (host-load failed on the cited build-scaling run; native 19/30 is not “fastest everywhere”; admit-path walls include process overhead; exit 65 / exit 78 remain HOLD). English is the source of record; locale catalog shells may reuse English until a reviewed translation exists.
+
+## amu ISA / hardware-unit article
+
+`site/amu-isa-article.edn` is the English-primary engineering note at
+`/blog/amu-isa-hardware-optimization/`. The generator wires the view, the
+English dist HTML, and a `translate=no` card at the top of `blog-view`.
+Translated bodies were not invented; locale blog indexes keep the English
+card. Cloudflare deploy stays with Jun.
+
+Keep measured vs mechanism-only vs HOLD labels next to claims. Do not
+republish the withdrawn Amu 1.349× vs Rust ratio (ADR 0281). CUDA C emit is
+not NVIDIA product qualification. No Cerebras, no HIP, no Kotoba>Rust/C on
+GPU, no invented speedups, percentages, FLOPS, or GMV.
