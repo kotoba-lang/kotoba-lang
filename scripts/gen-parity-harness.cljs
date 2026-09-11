@@ -48,7 +48,8 @@
   "Every var the emitted harness calls. Checked before writing, because a
   harness that cannot load is worse than no harness: it fails at the point of
   use, long after the run that produced it looked successful."
-  ["routes" "as-int" "as-bool" "page-limit" "entity-specs" "fresh-store" "persist!" "query" "retract!"])
+  ["routes" "as-int" "as-bool" "page-limit" "entity-specs" "fresh-store" "persist!" "query" "retract!"
+   "handle-create" "handle-list" "handle-get" "handle-update" "handle-delete"])
 
 (defn harness [ns-name]
   (str
@@ -62,12 +63,14 @@
    "   input, and absent when reproducing it would mean rebuilding this\n"
    "   repository's own rendering convention on the Clojure side. So the\n"
    "   route count, as-int / as-bool / page-limit over the shared fixture\n"
-   "   table, the entity table, and the five COUNT-valued selectors of\n"
-   "   oracle-store are here.\n\n"
-   "   Not here: the three hash-valued selectors of oracle-store, and the\n"
-   "   filter, pagination, handler and expand layers, which have not been\n"
-   "   read selector by selector yet. An arm that runs without asserting\n"
-   "   anything about this repository is worse than an absent one.\n\n"
+   "   table, the entity table, the five COUNT-valued selectors of\n"
+   "   oracle-store, and the thirteen status- and count-valued selectors of\n"
+   "   oracle-handlers are here.\n\n"
+   "   Not here: the three hash-valued selectors of oracle-store, the two\n"
+   "   hash-valued selectors of oracle-handlers, and the filter, pagination\n"
+   "   and expand layers, which have not been read selector by selector\n"
+   "   yet. An arm that runs without asserting anything about this\n"
+   "   repository is worse than an absent one.\n\n"
    "   ## The control\n\n"
    "   `as-int` of \\\"12abc\\\" MUST differ between this harness and the artifact.\n"
    "   The oracle's as-int is a reader conditional whose branches disagree: the\n"
@@ -155,6 +158,44 @@
    "  (row \"store 5\" (let [st (seeded-store 3)] (m/persist! st e (seeded-row 1))\n"
    "                    (count (m/query st e))))\n"
    "  (row \"store 7\" (count (m/query (seeded-store 3) (:entity other-spec)))))\n\n"
+   ;; The handler layer, selector by selector. The component's oracle-handlers
+   ;; has fifteen selectors: 0-9 are HTTP status codes, 10-12 are counts, 13
+   ;; and the else arm are str-hash of a rendered body. The first thirteen are
+   ;; derivable -- a status code and a count have no rendering -- and the last
+   ;; two are refused for the reason the store layer refuses its hashes.
+   ;;
+   ;; The fixtures are derived from root-spec the way the component derives
+   ;; its own: 0 is every required field, 1 is the first required field alone,
+   ;; 2 is every required field plus an unknown one. Where an entity requires
+   ;; exactly one field, 1 equals 0 and both create -- the component has the
+   ;; same degeneracy and the two agree on it rather than one of them faking a
+   ;; partial record.
+   ;;
+   ;; Only STATUS and COUNT are compared. The CLJC oracle mints ids with
+   ;; randomness and stamps clock values, so bodies cannot be compared and are
+   ;; not; `second` of every handler result is the status, and that is all
+   ;; that is read from it.
+   "(println \"; handlers  (status codes and counts)\")\n"
+   "(let [e (:entity root-spec) p (:id-prefix root-spec)\n"
+   "      req (map name (:required root-spec))\n"
+   "      fx0 (into {} (map (fn [f] [(keyword f) \"v\"]) req))\n"
+   "      fx1 (into {} (map (fn [f] [(keyword f) \"v\"]) (take 1 req)))\n"
+   "      fx2 (assoc fx0 :bogus \"x\")\n"
+   "      req1 (keyword (first req))\n"
+   "      status second]\n"
+   "  (row \"handlers 0\" (status (m/handle-create (seeded-store 2) e fx0)))\n"
+   "  (row \"handlers 1\" (status (m/handle-create (seeded-store 2) e fx1)))\n"
+   "  (row \"handlers 2\" (status (m/handle-create (seeded-store 2) e fx2)))\n"
+   "  (row \"handlers 3\" (status (m/handle-list (seeded-store 2) e {})))\n"
+   "  (row \"handlers 4\" (status (m/handle-get (seeded-store 2) e (str p \"_0\") {})))\n"
+   "  (row \"handlers 5\" (status (m/handle-get (seeded-store 2) e \"nope\" {})))\n"
+   "  (row \"handlers 6\" (status (m/handle-update (seeded-store 2) e (str p \"_0\") {req1 \"updated\"})))\n"
+   "  (row \"handlers 7\" (status (m/handle-update (seeded-store 2) e \"nope\" {})))\n"
+   "  (row \"handlers 8\" (status (m/handle-delete (seeded-store 2) e (str p \"_0\"))))\n"
+   "  (row \"handlers 9\" (status (m/handle-delete (seeded-store 2) e \"nope\")))\n"
+   "  (row \"handlers 10\" (let [st (seeded-store 2)] (m/handle-delete st e (str p \"_0\")) (count (m/query st e))))\n"
+   "  (row \"handlers 11\" (let [st (seeded-store 2)] (m/handle-create st e fx0) (count (m/query st e))))\n"
+   "  (row \"handlers 12\" (:total (first (m/handle-list (seeded-store 2) e {})))))\n\n"
    "(println \"; table\")\n"
    "(doseq [i (range (count m/entity-specs))]\n"
    "  (row (str \"table \" i) (str-hash (table-line (nth m/entity-specs i)))))\n"))
