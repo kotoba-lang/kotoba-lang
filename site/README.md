@@ -364,6 +364,18 @@ by the HTML renderer; the older operator checkout produced empty documents.
 The other pins preserve the dependencies used by the existing site. Advance
 these deliberately with a successful regeneration and locale verification.
 
+The site build temporarily uses the lockfile-pinned nbb host: Cloudflare's
+Node image does not include kbb, and nbb does not resolve `.cljk` namespaces.
+`site/build.cljk` copies the four canonical site namespaces byte-for-byte to
+ignored `.site-deps/site-src/` with `.cljs` extensions before loading them.
+This is a build-host adapter, not a Q9 migration or acceptance claim. Remove
+it when the provisioned build host can load the canonical `.cljk` sources.
+
+Production belongs to the dedicated `cloud-kotoba` account
+(`62e1fda53188460698f8c66d3aef59c6`), explicitly selected in
+`site/wrangler.jsonc`. The `Kotoba Developers` group grants Workers Platform
+Admin only within that account; it does not grant access to `network-awai`.
+
 ### Merge-triggered Cloudflare deployment
 
 The site-specific production build configuration is recorded in
