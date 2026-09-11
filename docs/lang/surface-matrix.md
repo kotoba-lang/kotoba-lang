@@ -58,6 +58,7 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 | `bounded-control-and-sugar` | `implemented-partial` |  |  |
 | `data-host-argument` | `implemented-partial` | compiler-host-cljs, compiler-host-jvm, kotoba-wasm |  |
 | `dataspace` | `implemented-partial` | compiler | Source forms make coordination native without making assertion data authoritative. Explicit facet enter/leave is the safe current lifecycle surface. |
+| `declaration-metadata` | `not-yet-implemented` |  |  |
 | `dynamic-arity-apply` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `element-type-polymorphism` | `not-yet-implemented` |  |  |
 | `filter-function` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
