@@ -71,6 +71,7 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 | `named-multi-arity-functions` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `native-binary32-arithmetic` | `implemented-partial` | compiler, kotoba-kir |  |
 | `nested-destructuring` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | Source and intermediate collection expressions are each evaluated exactly once. |
+| `ns-attr-map-declarations` | `implemented-partial` | compiler |  |
 | `option-flow` | `implemented-partial` | compiler, kir, kotoba-cljs, restricted-esm, wasm32 |  |
 | `portable-source-stdlib` | `implemented-partial` |  |  |
 | `portable-value-model` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | Primary Wasm preserves literal IDs while dynamic string results use allocation-checked descriptors with canonical content IDs; primary CLJS uses native immutable strings and symbols; compiler uses a distinct typed symbol value kind and checked dynamic construction, and its string operations share the UTF-8 byte-boundary contract. |
