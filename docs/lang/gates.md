@@ -15,8 +15,8 @@ test -f lang/conformance/manifest.edn
 test -f lang/capability-conformance/manifest.edn
 test -f lang/type-conformance/manifest.edn
 test -f docs/authority-map.edn
-nbb scripts/check-docs.cljs
-nbb scripts/check-grammar-authority.cljs
+nbb scripts/check-docs.cljk
+nbb scripts/check-grammar-authority.cljk
 bb scripts/check-cli-contract.bb lang/cli.edn
 bb scripts/check-capability-values.bb
 bb scripts/check-legacy-runtime-absence.bb
@@ -40,7 +40,7 @@ the whole suite green.
 The documentation gate has a committed broken fixture:
 
 ```sh
-nbb scripts/check-docs.cljs --root test/fixtures/docs-negative
+nbb scripts/check-docs.cljk --root test/fixtures/docs-negative
 ```
 
 It must exit non-zero with `:docs/link-missing`. A gate that cannot demonstrate

@@ -10,7 +10,7 @@ The inspected immutable source identities are:
 
 | Component | Revision | Source anchor |
 |---|---|---|
-| Language/host kernel | eb492e251b2e1d7d070bb7f1b3cca9bcc9914d6b | [capability_host.cljc](https://github.com/kotoba-lang/kotoba-lang/blob/eb492e251b2e1d7d070bb7f1b3cca9bcc9914d6b/src/kotoba/lang/capability_host.cljc#L19) |
+| Language/host kernel | eb492e251b2e1d7d070bb7f1b3cca9bcc9914d6b | [capability_host.cljc](https://github.com/kotoba-lang/kotoba-lang/blob/eb492e251b2e1d7d070bb7f1b3cca9bcc9914d6b/src/kotoba/lang/capability_host.cljk#L19) |
 | Cloud client/Worker | 7677a1084cf3bcdf776306075aef67281251e112 | [profile.cljc:100](https://github.com/kotoba-lang/app-kotoba-cloud/blob/7677a1084cf3bcdf776306075aef67281251e112/src/app_kotoba_cloud/profile.cljc#L100) |
 | Identity/gateway/graph services | 380934ee43e1babfac055f20680802c978a047f5 | [auth.cljs:252](https://github.com/net-kotobase/control-plane/blob/380934ee43e1babfac055f20680802c978a047f5/kotobase-graph-database/src/kotobase/graph_database/auth.cljs#L252) |
 | Assurance register | dd8c782bf0901c6065fdd1e45345a06641b4d316 | [remaining-operational-gaps.edn](https://github.com/kotoba-lang/security/blob/dd8c782bf0901c6065fdd1e45345a06641b4d316/registers/remaining-operational-gaps.edn) |
@@ -19,8 +19,8 @@ These identify inspected source, not verified deployed versions. Fresh main was 
 
 | Workflow | Resource and configuration | Recipients | Enforcing control / evidence |
 |---|---|---|---|
-| Language host invocation | Requested resource intersected with supplied grants and local policy at supplied time | Concrete provider handler | `src/kotoba/lang/capability_host.cljc:40-69`; denial avoids handler; the trusted host supplies verified facts and correct time |
-| Component import binding | Compiler binding receipt, required guard and concrete import set | Bound component dispatcher | `src/kotoba/lang/capability_host.cljc:168-273`; unknown imports are denied; weaker generic host helpers are not interchangeable with this component binder |
+| Language host invocation | Requested resource intersected with supplied grants and local policy at supplied time | Concrete provider handler | `src/kotoba/lang/capability_host.cljk:40-69`; denial avoids handler; the trusted host supplies verified facts and correct time |
+| Component import binding | Compiler binding receipt, required guard and concrete import set | Bound component dispatcher | `src/kotoba/lang/capability_host.cljk:168-273`; unknown imports are denied; weaker generic host helpers are not interchangeable with this component binder |
 | Cloud session lookup | Fixed identity service, selected session cookie | Identity Worker | Cloud `session.cljc:6-7,28-41,70-83`, `worker.cljs:52-68`; a valid viewer is an identity projection, not operation approval |
 | Cloud publication / key transitions | Per-principal Durable Object lifecycle and exact ML-DSA approved payload | Fixed publication upstream or key registry | Cloud `worker.cljs:215-266,287-332`, `pq_key_registry.cljs:57-79`; payload match, key epoch and replay state precede the operation |
 | Public bootstrap | Fixed loader CID in public object binding | Anonymous readers | Cloud `worker.cljs:369-392`; existence/size checks and digest headers do not by themselves demonstrate client byte verification |
@@ -87,7 +87,7 @@ These are defensive acceptance scenarios, not asserted vulnerabilities. Tests sh
 
 NIST does not certify CSF products or implementations: [official FAQ](https://www.nist.gov/cyberframework/faqs). The existing SOC/ISO register is separate: the checker run at 254bf4da3b792d4068abab5a4752d8a0e5e03fda reports design/implementation evidence and zero operating evidence for its encoded controls; it is not a CSF completion metric. The evidence index, crosswalk policy and operational-gap register were byte-identical in freshly fetched main dd8c782bf0901c6065fdd1e45345a06641b4d316.
 
-Local verification at the language revision: `scripts/verify_capability_conformance_cljs.cljs` passed 24 expected verdicts (9 component-binding, 2 host-dispatch). Its `.cljc` kernels ran under nbb with the coll, text, grant, identity and authority source dependencies. This verifies allow/deny fixture behavior, not a compiled-artifact attack test, production host wiring, or cross-runtime byte equality. Initial attempts without the dependency classpath could not run and were not counted as passes.
+Local verification at the language revision: `scripts/verify_capability_conformance_cljs.cljk` passed 24 expected verdicts (9 component-binding, 2 host-dispatch). Its `.cljc` kernels ran under nbb with the coll, text, grant, identity and authority source dependencies. This verifies allow/deny fixture behavior, not a compiled-artifact attack test, production host wiring, or cross-runtime byte equality. Initial attempts without the dependency classpath could not run and were not counted as passes.
 
 ## Severity calibration
 

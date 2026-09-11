@@ -3,7 +3,7 @@
 - **Status**: Accepted, portable envelope and CLJ/CLJS kernel implemented
 - **Date**: 2026-07-25
 - **Implementation**:
-  `src/kotoba/lang/portable_effect.cljc`
+  `src/kotoba/lang/portable_effect.cljk`
 - **First consumer**:
   `kotoba-lang/toshokan`
 

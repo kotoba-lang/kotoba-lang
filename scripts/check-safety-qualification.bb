@@ -3,7 +3,7 @@
          '[clojure.java.io :as io]
          '[clojure.set :as set])
 
-(load-file "src/kotoba/lang/capability_values.cljc")
+(load-file "src/kotoba/lang/capability_values.cljk")
 (alias 'caps 'kotoba.lang.capability-values)
 
 (defn read-edn [path] (edn/read-string (slurp path)))

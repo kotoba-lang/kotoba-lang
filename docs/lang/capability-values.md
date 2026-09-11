@@ -120,7 +120,7 @@ The conformance suite should cover:
 
 ## Host-call dispatch
 
-`src/kotoba/lang/capability_host.cljc` (`kotoba.lang.capability-host`) is the
+`src/kotoba/lang/capability_host.cljk` (`kotoba.lang.capability-host`) is the
 pure CLJC dispatch kernel that hosts wire their provider invocation paths
 through. `guard-call` takes the host call name, the requested capability, the
 CACAO grants, the local policy, the mandatory trusted current date, and the concrete provider
@@ -160,7 +160,7 @@ Host provider capability kinds (`:host/clipboard-read`,
 extensibility rule above: each host kind is its own required effect.
 Host-dispatch conformance fixtures (`:type :host-dispatch` in
 `lang/capability-conformance/manifest.edn`) are exercised by
-`test/kotoba/lang/capability_host_test.clj` and by
+`test/kotoba/lang/capability_host_test.cljk` and by
 `bb scripts/check-capability-values.bb`.
 
 ## Capability-passing (S4b)
@@ -267,7 +267,7 @@ so this repository stays crypto-free:
    map: `{:chain/valid? :chain/problems :chain/root-iss :chain/holder
    :chain/resources :chain/expires :chain/depth}`.
 2. **Mapping (this repository)** —
-   `src/kotoba/lang/capability_cacao.cljc`
+   `src/kotoba/lang/capability_cacao.cljk`
    (`kotoba.lang.capability-cacao/grants-from-chain`) is a PURE mapping from
    that VERIFIED result map (it never sees b64 or signatures) to the grant
    shape consumed by `intersect-grants`.
@@ -309,7 +309,7 @@ Conformance fixtures of `:type :cacao-grants` live in
 ## Capability Value Contract
 
 The machine-checkable form of this document is
-`src/kotoba/lang/capability_values.cljc` (`kotoba.lang.capability-values`):
+`src/kotoba/lang/capability_values.cljk` (`kotoba.lang.capability-values`):
 first-class `GraphReadCap` / `GraphWriteCap` / `InferCap` values
 (`graph-read-cap`, `graph-write-cap`, `infer-cap`, `capability?`,
 `validate-cap`), effect-row consistency (`effect-for-kind`,
@@ -319,5 +319,5 @@ denial (`intersect-grants`), and receipts embedding the concrete — never the
 broader requested — capability (`receipt`, `validate-receipt`). Conformance
 fixtures live under `lang/capability-conformance/` (positive/negative cases
 listed in `lang/capability-conformance/manifest.edn`); they are exercised by
-`test/kotoba/lang/capability_values_test.clj` and by the gate
+`test/kotoba/lang/capability_values_test.cljk` and by the gate
 `bb scripts/check-capability-values.bb`, which loads the same CLJC source.

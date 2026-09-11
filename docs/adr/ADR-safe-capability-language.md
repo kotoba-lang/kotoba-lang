@@ -12,8 +12,8 @@ Crate: `crates/kotoba-clj`（front-end 拡張）+ `kotoba-runtime` / `kotoba-lat
 > port が無く、その合成保証の主張は **UNVERIFIED**（撤去当時までの実測記録）。
 > 現行の enforcement は次の 4 つ:
 > ① amu の elaboration pipeline admission（deny-by-default、`:minimal-policy` 推論、
-> fail-closed）② 本 repo の `src/kotoba/lang/grammar_authority.clj` +
-> `scripts/check-grammar-authority.cljs`（forbidden-heads ⊇ security surfaces を
+> fail-closed）② 本 repo の `src/kotoba/lang/grammar_authority.cljk` +
+> `scripts/check-grammar-authority.cljk`（forbidden-heads ⊇ security surfaces を
 > fail-closed 検査）③ `lang/capability-conformance/`（positive / negative fixtures）
 > ④ kotoba-lang/kotoba の `test/kotoba/cap_{affine,typed,table,passing}_test.clj`。
 > 禁止の分類（shielding axis: code-identity / dispatch-bypass / authority /

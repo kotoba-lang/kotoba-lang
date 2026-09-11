@@ -12,7 +12,7 @@ The requested command is not in the public CLI contract.
 
 **Recovery:** Use a command generated from lang/cli.edn.
 
-Authority: [`src/kotoba/cli.cljc`](../../src/kotoba/cli.cljc).
+Authority: [`src/kotoba/cli.cljk`](../../src/kotoba/cli.cljk).
 
 ## `:contract/invalid`
 
@@ -22,7 +22,7 @@ The CLI contract failed structural validation.
 
 **Recovery:** Inspect the structured :errors collection; do not dispatch the command.
 
-Authority: [`src/kotoba/cli.cljc`](../../src/kotoba/cli.cljc).
+Authority: [`src/kotoba/cli.cljk`](../../src/kotoba/cli.cljk).
 
 ## `:version/unsupported`
 
@@ -32,7 +32,7 @@ The requested language or package contract version is unknown.
 
 **Recovery:** Select a version listed under :supported in lang/version-policy.edn.
 
-Authority: [`src/kotoba/lang/version_policy.clj`](../../src/kotoba/lang/version_policy.clj).
+Authority: [`src/kotoba/lang/version_policy.cljk`](../../src/kotoba/lang/version_policy.cljk).
 
 ## `:version/removed`
 
@@ -42,7 +42,7 @@ The requested contract version has been removed.
 
 **Recovery:** Migrate to the active version before compiling or running.
 
-Authority: [`src/kotoba/lang/version_policy.clj`](../../src/kotoba/lang/version_policy.clj).
+Authority: [`src/kotoba/lang/version_policy.cljk`](../../src/kotoba/lang/version_policy.cljk).
 
 ## `:version/deprecation-expired`
 
@@ -52,7 +52,7 @@ The compatibility window for a deprecated version has expired.
 
 **Recovery:** Apply the migration named by the version policy.
 
-Authority: [`src/kotoba/lang/version_policy.clj`](../../src/kotoba/lang/version_policy.clj).
+Authority: [`src/kotoba/lang/version_policy.cljk`](../../src/kotoba/lang/version_policy.cljk).
 
 ## `:release/invalid-semver`
 
@@ -62,7 +62,7 @@ A release identifier is not strict SemVer.
 
 **Recovery:** Use MAJOR.MINOR.PATCH with an optional valid pre-release or build suffix.
 
-Authority: [`src/kotoba/lang/version_policy.clj`](../../src/kotoba/lang/version_policy.clj).
+Authority: [`src/kotoba/lang/version_policy.cljk`](../../src/kotoba/lang/version_policy.cljk).
 
 ## `:docs/no-release-bound-profile`
 
@@ -82,7 +82,7 @@ A checked document points to a missing local target.
 
 **Recovery:** Restore the target or update the authority map and regenerate the reference.
 
-Authority: [`scripts/check-docs.cljs`](../../scripts/check-docs.cljs).
+Authority: [`scripts/check-docs.cljk`](../../scripts/check-docs.cljk).
 
 ## `:docs/profile-version-drift`
 
@@ -92,7 +92,7 @@ Grammar, surface, and elaboration authorities disagree on the language profile.
 
 **Recovery:** Reconcile the authorities before publishing documentation.
 
-Authority: [`scripts/check-docs.cljs`](../../scripts/check-docs.cljs).
+Authority: [`scripts/check-docs.cljk`](../../scripts/check-docs.cljk).
 
 ## `:docs/generated-drift`
 
@@ -100,9 +100,9 @@ Phase: `documentation`.
 
 A committed generated reference does not match its machine authority.
 
-**Recovery:** Run nbb scripts/generate-docs-reference.cljs and commit the result.
+**Recovery:** Run nbb scripts/generate-docs-reference.cljk and commit the result.
 
-Authority: [`scripts/check-docs.cljs`](../../scripts/check-docs.cljs).
+Authority: [`scripts/check-docs.cljk`](../../scripts/check-docs.cljk).
 
 ## `:docs/validation-result-invalid`
 
@@ -112,5 +112,5 @@ A user-validation observation is incomplete or overclaims an external result.
 
 **Recovery:** Record participant class, task, outcome, evidence, and observed time.
 
-Authority: [`scripts/check-docs.cljs`](../../scripts/check-docs.cljs).
+Authority: [`scripts/check-docs.cljk`](../../scripts/check-docs.cljk).
 

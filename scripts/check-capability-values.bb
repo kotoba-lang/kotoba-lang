@@ -23,10 +23,10 @@
 
 ;; Run the exact same pure CLJC logic as the test suite: load the namespace
 ;; source directly so the gate cannot drift from the contract implementation.
-(load-file "src/kotoba/lang/capability_values.cljc")
-(load-file "src/kotoba/lang/causal_receipt.cljc")
-(load-file "src/kotoba/lang/capability_host.cljc")
-(load-file "src/kotoba/lang/capability_cacao.cljc")
+(load-file "src/kotoba/lang/capability_values.cljk")
+(load-file "src/kotoba/lang/causal_receipt.cljk")
+(load-file "src/kotoba/lang/capability_host.cljk")
+(load-file "src/kotoba/lang/capability_cacao.cljk")
 (alias 'caps 'kotoba.lang.capability-values)
 (alias 'host 'kotoba.lang.capability-host)
 (alias 'cacao 'kotoba.lang.capability-cacao)
