@@ -1,0 +1,87 @@
+#!/usr/bin/env nbb
+;; verify-template-fixed-point.cljs -- is the generator's template still what
+;; the generator would write?
+;;
+;; `gen-whole-component.cljs` reads ONE component as its template and rewrites
+;; every other repository's from it. That template is itself a generated
+;; component, so it has to satisfy the generator too -- and nothing checked
+;; that it did.
+;;
+;; Measured 2026-09-11: it did not. Two fixes had landed in the generator --
+;; oracle-filters derived from the root spec, oracle-handlers updating a field
+;; the entity declares -- and every repository received them EXCEPT the
+;; template, which is where the defective text had come from. It answered
+;; 5,5,5,5,5,5 for oracle-filters and 400/7 for handler selectors 6 and 13,
+;; the two defects already repaired everywhere else.
+;;
+;; The generator is idempotent -- gen(gen(x)) = gen(x), measured -- so this is
+;; not a structural instability. It is staleness, and staleness is silent: the
+;; template compiles, its self-checks pass, and it goes on seeding the cohort.
+;; This check is what makes the next occurrence loud.
+;;
+;;   nbb scripts/verify-template-fixed-point.cljs <com-abb-robotics checkout>
+;;
+;; exit 0  the template is what the generator would write
+;; exit 1  it is stale -- regenerate it
+;; exit 2  REFUSED, could not measure
+
+(ns verify-template-fixed-point
+  (:require [clojure.string :as str]
+            [nbb.core :as nbb]
+            ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as path]
+            ["child_process" :as cp]))
+
+(def argv (vec (remove #(str/ends-with? % ".cljs") (drop 2 (js->clj js/process.argv)))))
+
+(defn refuse! [msg data]
+  (println (str "REFUSED\t" msg "\t" (pr-str data)))
+  (.exit js/process 2))
+
+;; The template's identity is the generator's own canon, not a guess. If the
+;; canon moves, this check must move with it rather than keep checking a file
+;; that is no longer the template.
+(def src-name "abb_robotics")
+
+(let [[repo] argv]
+  (when-not repo (refuse! "usage: <com-abb-robotics checkout>" {:argv argv}))
+  (let [gen  (path/join (path/dirname nbb/*file*) "gen-whole-component.cljs")
+        comp (path/join repo "src" src-name "whole_component.kotoba")]
+    (when-not (fs/existsSync gen)  (refuse! "no generator beside this script" {:path gen}))
+    (when-not (fs/existsSync comp) (refuse! "no template component" {:path comp}))
+    (let [committed (fs/readFileSync comp "utf8")
+          ;; Regenerate into a COPY. Running the generator over the checkout
+          ;; would edit the thing being measured, and a check that mutates its
+          ;; subject cannot be run twice.
+          tmp  (fs/mkdtempSync (path/join (os/tmpdir) "tmplfx-"))
+          dest (path/join tmp "src" src-name)
+          _    (fs/mkdirSync dest #js {:recursive true})
+          _    (fs/copyFileSync comp (path/join dest "whole_component.kotoba"))
+          main (path/join repo "src" src-name "main.cljc")
+          _    (when-not (fs/existsSync main) (refuse! "no oracle beside the template" {:path main}))
+          _    (fs/copyFileSync main (path/join dest "main.cljc"))
+          ;; the template is the COMMITTED file, and the target is the copy
+          r (cp/spawnSync "nbb" #js [gen comp tmp src-name] #js {:encoding "utf8"})]
+      (when-not (zero? (.-status r))
+        (refuse! "the generator refused the template" {:stdout (.-stdout r) :stderr (.-stderr r)}))
+      (let [regenerated (fs/readFileSync (path/join dest "whole_component.kotoba") "utf8")]
+        (if (= committed regenerated)
+          (do (println (str "FIXED-POINT\t" src-name "\tthe template is what the generator would write"))
+              (.exit js/process 0))
+          (let [a (str/split-lines committed)
+                b (str/split-lines regenerated)
+                ;; The FIRST differing line and the two lengths. Not a count of
+                ;; positionally-unequal lines: one inserted line shifts every
+                ;; line after it, so that count reads as a magnitude and is an
+                ;; artefact of the comparison. Measured here at 89 for a diff
+                ;; that was 23 added and 7 removed.
+                first-diff (->> (map vector (range) a b)
+                                (some (fn [[i x y]] (when (not= x y) (inc i)))))]
+            (println (str "STALE\t" src-name
+                          "\tfirst differing line " (or first-diff (inc (min (count a) (count b))))
+                          "; committed " (count a)
+                          " lines, regenerated " (count b)))
+            (println (str "  regenerate it: nbb scripts/gen-whole-component.cljs "
+                          comp " " repo " " src-name))
+            (.exit js/process 1)))))))
