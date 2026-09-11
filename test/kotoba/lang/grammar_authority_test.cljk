@@ -368,8 +368,15 @@
   vocabulary cannot express (`:compiler` is amu as a whole and `:kotoba-wasm`
   names the legacy emitter). No head is admitted or withdrawn: :admitted stays
   119 and :unclassified 0. Carry to kotoba-sema, kotoba (two copies) and
-  grammar; amu pins the digest without shipping a grammar copy."
-  "515bbc7de84a3340ef3b250e4ee411739d3acebf32ba31450540f146768bb841")
+  grammar; amu pins the digest without shipping a grammar copy.
+  Advanced 2026-09-11 to `10ff0062` for module type parameters:
+  `:core-form-shapes` gains `:ns` (with the new `(:params [sym ...])` clause)
+  and `:require-spec` (with `:with {param type}`), and `:admission-limits`
+  gains `:max-template-parameters 8`. No head is admitted or withdrawn --
+  this is a module-form shape, instantiated by amu's project linker, and the
+  frontend never sees a parameter symbol. Carry to kotoba-sema, kotoba (two
+  copies) and grammar; amu pins the digest across its kotoba-sema pin."
+  "10ff0062271d3a557deab865510c948125a84aba7d760298bcaf345cd0370a6b")
 
 (defn- sha256-hex [^bytes bs]
   (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") bs)]
