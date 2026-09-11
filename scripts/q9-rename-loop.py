@@ -47,7 +47,7 @@ WRITTEN IN PYTHON, which is a deviation. CLAUDE.md puts new operational tooling
 on kbb first and this workspace does not write .sh or .mjs; `which kbb` finds
 nothing on this machine (measured 2026-09-10) and this began as a throwaway
 driver that turned out to be worth keeping. Recorded rather than hidden; the
-nbb or kbb port is owed, and `scripts/q9-triage.cljs` next door is the nbb one.
+nbb or kbb port is owed, and `scripts/q9-triage.cljk` next door is the nbb one.
 
 Usage: q9-rename-loop.py <amu-bin> <src-dir> <entry-relative-path> [rounds]
 Env:   ORGS_ROOT (default /Users/junkawasaki/github/com-junkawasaki/orgs/kotoba-lang)

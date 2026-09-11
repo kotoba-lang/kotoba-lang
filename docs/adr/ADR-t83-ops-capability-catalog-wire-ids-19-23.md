@@ -45,7 +45,7 @@ rejected as unregistered. Provider ADR 0265/0267 explicitly deferred
 
 ## Evidence
 
-- `test/kotoba/lang/capability_catalog_test.clj` — count 23, contiguous
+- `test/kotoba/lang/capability_catalog_test.cljk` — count 23, contiguous
   ids, ops name→id + source-operation assertions
 - `catalog/validate!` uniqueness + shape checks
 

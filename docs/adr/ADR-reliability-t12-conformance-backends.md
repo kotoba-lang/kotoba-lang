@@ -49,7 +49,7 @@ across backends remains **T1.3**.
 ## Evidence
 
 - `lang/conformance/manifest.edn` v2
-- `test/kotoba/lang/conformance_matrix_test.clj`
+- `test/kotoba/lang/conformance_matrix_test.cljk`
 
 ## Related
 

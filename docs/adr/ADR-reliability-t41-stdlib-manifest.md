@@ -29,7 +29,7 @@ machine-readable module list under `lang/conformance/stdlib/`.
 ## Evidence
 
 - `lang/conformance/stdlib/manifest.edn`
-- `test/kotoba/lang/stdlib_manifest_test.clj`
+- `test/kotoba/lang/stdlib_manifest_test.cljk`
 
 ## Related
 
