@@ -86,7 +86,7 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 | `release-integration` | `implemented-partial` |  |  |
 | `require-refer` | `implemented-partial` | compiler |  |
 | `string-predicate-typing` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | `string=?` and `string-contains?` infer `:bool`, like every other predicate, so     they compose under `and`/`or`/`not` and can be returned from a `:bool` function.     A string predicate no longer sits in an `:i64` position -- convert explicitly. |
-| `typed-closure-parameters` | `not-yet-implemented` |  |  |
+| `typed-closure-parameters` | `implemented-partial` | compiler, kir, wasm32 |  |
 | `typed-eval` | `implemented` | compiler, kir |  |
 
 ## Classification rule
