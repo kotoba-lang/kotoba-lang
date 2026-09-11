@@ -78,6 +78,10 @@
         ref-ent (first (filter #(seq (:refs %)) specs))
         float-ent (first (filter #(some #{:float} (vals (:coerce %))) specs))]
     {:root root
+     ;; The first spec that is not the root -- the same rule the harness uses
+     ;; for `other-spec`, so the two ask about the SAME entity rather than two
+     ;; entities that merely both happen to be empty.
+     :other-ent (first (remove #(= (:entity %) (:entity root)) specs))
      :ref-ent ref-ent
      :float-ent (or float-ent (second specs) root)
      :refs-exercised? (boolean ref-ent)
@@ -487,9 +491,18 @@
                 ;; rather than papering over it with an alias.
                 [(:ref-field-2 canon) (or (second (:ref-fields f)) (:ref-field-2 canon))]
                 [(:root-prefix canon) (:id-prefix (:root p))]
-                [(:ref-prefix canon) (:id-prefix (:ref-ent p))]
+                ;; Falls back to the other entity when no spec declares a ref.
+                ;; These two tokens also appear in `oracle-store`, whose last
+                ;; selector asks "a DIFFERENT entity holds none of these rows".
+                ;; Dropping them left the template's `BOM` standing, so in a
+                ;; ref-less repository that selector queried an entity the spec
+                ;; table does not contain. It still answered 0 and still agreed
+                ;; with the harness, which answers 0 because a real other entity
+                ;; holds no rows -- agreement for two different reasons, and the
+                ;; weaker of the two is not the one the selector claims.
+                [(:ref-prefix canon) (or (:id-prefix (:ref-ent p)) (:id-prefix (:other-ent p)))]
                 [(:root canon) (:entity (:root p))]
-                [(:ref-ent canon) (:entity (:ref-ent p))]
+                [(:ref-ent canon) (or (:entity (:ref-ent p)) (:entity (:other-ent p)))]
                 [(:float-ent canon) (:entity (:float-ent p))]
                 [(:ns canon) (str/replace src-name "_" "-")]
                 [(:ns-prefix canon) src-name]
@@ -556,7 +569,35 @@
         (when (seq survivors)
           (refuse! "template tokens survived the substitution"
                    {:tokens (vec survivors)
-                    :hint "a table or fixture block was not regenerated; see the ORDER MATTERS note"})))
+                    :hint "a table or fixture block was not regenerated; see the ORDER MATTERS note"}))
+        ;; Second floor: no TEMPLATE entity name may survive into a
+        ;; repository that does not declare it.
+        ;;
+        ;; The stem check above cannot see this. It looks for `abbrobot` and
+        ;; the two ref fields; a template ENTITY that survives is none of
+        ;; those -- `BOM` is not `abbrobot`. Measured 2026-09-11: three
+        ;; ref-less repositories shipped an oracle-store whose last selector
+        ;; queried `BOM`, and every check in this file passed them.
+        ;;
+        ;; The candidate set is the CANON entities, and that is a known limit.
+        ;;
+        ;; Taking every capitalised quoted string out of the template was tried
+        ;; and is too broad: it flags "GET", "POST", "DELETE", "TRUE" and "Yes",
+        ;; which are HTTP methods and parse fixtures, not entities. The canon
+        ;; names three of the template's six, so a fourth template entity
+        ;; surviving would still pass here -- the same limit the stem comment
+        ;; above describes, recorded rather than papered over. It does catch
+        ;; the measured case, because BOM is the canon ref entity.
+        (let [declared (set (map :entity specs))
+              canon-entities (set (vals (select-keys canon [:root :ref-ent :float-ent])))
+              survivors2 (sort (filter #(and (str/includes? body (str "\"" % "\""))
+                                             (not (contains? declared %)))
+                                       canon-entities))]
+          (when (seq survivors2)
+            (refuse! "a template entity survived into a repository that does not declare it"
+                     {:entities (vec survivors2)
+                      :declared (vec (sort declared))
+                      :hint "some block still carries a template entity; the substitution did not reach it"}))))
       (fs/writeFileSync out body)
       (println (str "SPECS\t" (count specs) "\t" (str/join "," (map :entity specs))))
       (println (str "ROOT\t" (:entity (:root p))))
