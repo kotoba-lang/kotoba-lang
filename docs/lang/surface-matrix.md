@@ -58,11 +58,14 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 | `bounded-control-and-sugar` | `implemented-partial` |  |  |
 | `data-host-argument` | `implemented-partial` | compiler-host-cljs, compiler-host-jvm, kotoba-wasm |  |
 | `dataspace` | `implemented-partial` | compiler | Source forms make coordination native without making assertion data authoritative. Explicit facet enter/leave is the safe current lifecycle surface. |
+| `declaration-metadata` | `not-yet-implemented` |  |  |
 | `dynamic-arity-apply` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
+| `element-type-polymorphism` | `not-yet-implemented` |  |  |
 | `filter-function` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `first-class-closure-values` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | Public [:fn [parameter-types result-type] ...] contracts cross project-module boundaries; parameters are intentionally i64-only in the first ABI-neutral profile. Computed heads remain explicit, while their result descriptor is inferred from a closed consumer or return context and stays explicit only when ambiguous. |
 | `inline-fn-callbacks` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `lazy-sequences` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
+| `merge-with-head` | `not-yet-implemented` |  |  |
 | `multi-collection-map` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `named-multi-arity-functions` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `native-binary32-arithmetic` | `implemented-partial` | compiler, kotoba-kir |  |
@@ -74,8 +77,10 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 | `pure-s-expression-core` | `implemented-partial` | compiler | ADR-544 step 1 pure heads, admitted by the frontend as desugars onto primitives it already had, so nothing new reaches a backend. They carry no authority of their own: perform resolves through the same capability registry as cap-call, contributes the same effect row, and is refused by the same :pure-product head set; ref takes one simple symbol and evaluates to it, which is naming a definition and not dereferencing a content address. The grammar authority admits the same four (`:sugar :pure-s-expression-core`), carried to all five copies in the 2026-09-06 wave. |
 | `record-schema-values` | `implemented-partial` | compiler, kotoba-kir, kotoba-wasm |  |
 | `reduce-function` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
+| `reduce-over-typed-set` | `not-yet-implemented` |  |  |
 | `release-integration` | `implemented-partial` |  |  |
 | `string-predicate-typing` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | `string=?` and `string-contains?` infer `:bool`, like every other predicate, so     they compose under `and`/`or`/`not` and can be returned from a `:bool` function.     A string predicate no longer sits in an `:i64` position -- convert explicitly. |
+| `typed-closure-parameters` | `not-yet-implemented` |  |  |
 | `typed-eval` | `implemented` | compiler, kir |  |
 
 ## Classification rule
