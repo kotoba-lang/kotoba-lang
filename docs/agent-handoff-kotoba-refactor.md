@@ -159,7 +159,7 @@ Product dual-source remains separate (this handoff §2); do not invent language 
 Next language work: T1.3 full matrix; T7.1 residual mutual-recursion TCO; T4.2 full string-split→collection optional; T4.5 3+ source map / stored closures / nested `do` wasm-typed; T9.1 remaining public adapters (db/git/…). **T8.3 ops guest host + wire 19–23 registration landed 2026-08-01** (see Plan Next — host I/O wasm-aot remains partial by design). **Profile 5 bool-typed predicates landed** (compiler ADR 0191 + composed-surface kit #461; release 0.5.0 authority). **T5.3 packs→records complete** murakumo#193–#206. **T5.2 product host bridge largely complete** (call-record close-out murakumo#261–#276 + com-cloudflare#18 + com-cloudflare-compat#6; native guest record pilot murakumo#277 schedule/task eligibility). **T6.4 oracle-required** murakumo fleet + com-cloudflare#19 + compat#6.
 **T7.2 fuel model:** [`docs/lang/fuel-model.md`](./lang/fuel-model.md) (1 unit/function entry, default 512).
 **T1.5 goldens:** compiler#418 / ADR 0167 — `clojure -M:conformance --check-golden`.
-**T2.2 surface matrix:** [`docs/lang/surface-matrix.md`](./lang/surface-matrix.md) (`clojure -M -m kotoba.lang.surface-matrix --check`).
+**T2.2 surface matrix:** [`docs/lang/surface-matrix.md`](./lang/surface-matrix.md) (`clojure -M:surface-matrix --check`).
 **T2.4 ambient corpus:** compiler#417 / ADR 0166 + [`grade-a-malicious-source-corpus.md`](./grade-a-malicious-source-corpus.md).
 **T4.4 records:** [`docs/lang/record-cookbook.md`](./lang/record-cookbook.md) + compiler#416.
 **T4.5 collections costs:** [`docs/lang/collections-costs.md`](./lang/collections-costs.md).
