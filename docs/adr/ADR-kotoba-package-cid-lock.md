@@ -198,7 +198,7 @@ the caller policy grant it.
   ADR-2607173000 had retired, and it had already drifted -- the
   invalid-definition-cid rule landed and the copy kept accepting the case. It
   was removed; `test/run_portable.cljs` runs the corpus through the real
-  validator, on Node, and `clojure -M:test` runs it on the JVM.
+  validator, on Node, and `kbb -M:test` runs it on the JVM.
 - `M5` ✅ (2026-09-06): `kotoba-lang/amu` produces and consumes a lock.
 
       amu package-fetch   --deps kotoba.deps.edn --packages <dir>

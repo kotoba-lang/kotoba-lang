@@ -1,4 +1,4 @@
-#!/usr/bin/env bb
+#!/usr/bin/env kbb
 (require '[clojure.edn :as edn]
          '[clojure.java.io :as io]
          '[clojure.set :as set])

@@ -45,7 +45,7 @@ compiler / KIR / wasm / native / legacy path skew.
 |---|---|---|---|---|---|
 | T1.1 | Author `docs/lang/semantics-ssot.md` (values, evaluation, fuel, errors, capability call) | **kotoba-lang** | Accepted prose SSoT; points at executable suites | — | M |
 | T1.2 | Expand `lang/conformance/manifest.edn` to list **required** backends per case class — **landed** (v2 matrix + `conformance-matrix` + tests; ADR-reliability-t12) | **kotoba-lang** | Machine-readable matrix | T1.1 | S |
-| T1.3 | Implement/extend runner: each case runs on **KIR + wasm32-kotoba-v1** minimum — **pilot expanded** (compiler#412–#437 / ADR 0161–0187; **52** pure-product dual-green incl. multi-map/list-rest/when-let; full matrix progressive) | **compiler**, **kotoba-kir**, **kotoba-wasm** | `clojure -M:conformance` green on both | T1.2 | L |
+| T1.3 | Implement/extend runner: each case runs on **KIR + wasm32-kotoba-v1** minimum — **pilot expanded** (compiler#412–#437 / ADR 0161–0187; **52** pure-product dual-green incl. multi-map/list-rest/when-let; full matrix progressive) | **compiler**, **kotoba-kir**, **kotoba-wasm** | `kbb -M:conformance` green on both | T1.2 | L |
 | T1.4 | Add native (x86_64/aarch64) cases for pure i64/string/option subset — **pilot landed** (compiler#419 / ADR 0168; 5 pure-native-v1 kexe cases on host ISA) | **compiler**, **kotoba-native** | Profile `pure-native-v1` cases | T1.3 | L |
 | T1.5 | Golden digests for IR + selected artifact bytes (where policy allows) — **landed** (compiler#418 / ADR 0167; pilot-golden.edn 13 cases; gensym-normalized KIR + wasm SHA-256) | **compiler**, **artifact** | CI fails on silent semantic drift | T1.3 | M |
 
@@ -120,7 +120,7 @@ compiler / KIR / wasm / native / legacy path skew.
 
 | ID | Task | Owner repo(s) | Deliverable | Depends | Estimate |
 |---|---|---|---|---|---|
-| T6.1 | Define **primary standalone run path** (wasmtime **or** kexe loader) — **landed: wasmtime primary**, kexe secondary (`docs/lang/standalone-run.md` / ADR-reliability-t61) | **kotoba**, **compiler**, **aiueos**/loader | Documented `kotoba run` without `clojure -M` for pure apps | T1.3 | L |
+| T6.1 | Define **primary standalone run path** (wasmtime **or** kexe loader) — **landed: wasmtime primary**, kexe secondary (`docs/lang/standalone-run.md` / ADR-reliability-t61) | **kotoba**, **compiler**, **aiueos**/loader | Documented `kotoba run` without `kbb -M` for pure apps | T1.3 | L |
 | T6.2 | Precompiled KIR (or wasm) as default product artifact (already murakumo pattern) | product repos | Gen in CI; no compiler on prod classpath | — | M |
 | T6.3 | Bootstrap plan: compiler remains CLJ **tool**; language runtime is not — **landed** (ADR-reliability-t63) | **kotoba-lang** ADR | Clear tool vs runtime split | T6.1 | S |
 | T6.4 | cljs/browser: execute same pure artifacts — **landed product-shell**: murakumo oracle-required trail + com-cloudflare#19 + com-cloudflare-compat#6 (`require-ready!`/`preload!`; pure mirrors deleted). Residual: broader wasm-webcomponent consumers | **murakumo**, **com-cloudflare***, **kotoba-kir** cljs | Remove pure mirror where possible | T6.2 | L |
@@ -137,7 +137,7 @@ compiler / KIR / wasm / native / legacy path skew.
 |---|---|---|---|---|---|
 | T7.1 | `loop`/`recur` true tail on KIR + wasm — **landed for desugared loop**: zero-charge helper re-entry (compiler#428 / kir#24 / wasm#35+#36); arbitrary mutual-recursion TCO still open | **compiler**, **kotoba-kir**, **kotoba-wasm** | Spec + tests | roadmap | L |
 | T7.2 | Fuel model doc: charge rules, defaults, per-module budgets — **landed** (`docs/lang/fuel-model.md`; 1 unit/function entry, default 512) | **kotoba-lang**, **kotoba-kir** | `docs/lang/fuel-model.md` | T1.1 | S |
-| T7.3 | `kotoba fuel-estimate` or compile-time crude cost attribute (optional) — **landed** (compiler#419 / ADR 0169; `clojure -M:fuel-estimate`) | **compiler** | Best-effort tool | T7.2 | M |
+| T7.3 | `kotoba fuel-estimate` or compile-time crude cost attribute (optional) — **landed** (compiler#419 / ADR 0169; `kbb -M:fuel-estimate`) | **compiler** | Best-effort tool | T7.2 | M |
 | T7.4 | Conformance: tail recursion 10k iterations within fuel envelope — **landed** (compiler#424+#428; `:loop-deep-kit` now fuel **16** under T7.1 zero-charge) | **compiler**, **kotoba-kir** | Regression | T7.1 | S |
 
 **Exit:** Authors can predict stack/fuel for iterative pure code.
@@ -171,7 +171,7 @@ compiler / KIR / wasm / native / legacy path skew.
 | T9.4 | Minimal formatter (or strict style subset) | **kotoba-lang** | `kotoba fmt --check` optional | — | S |
 | T9.5 | LSP spike (diagnostics from T3) | new or **compiler** | Experimental but usable | T3.1 | L |
 
-**Exit:** New hire runs check/test/run without memorizing `clojure -M:…` classpaths.
+**Exit:** New hire runs check/test/run without memorizing `kbb -M:…` classpaths.
 
 ---
 
@@ -182,7 +182,7 @@ compiler / KIR / wasm / native / legacy path skew.
 | ID | Task | Owner repo(s) | Deliverable | Depends | Estimate |
 |---|---|---|---|---|---|
 | T10.1 | Publish **current language profile version** on every release tag — **landed** (`:release/language-profile` + tag bind; ADR-reliability-t10) | **kotoba-lang**, release workflow | Tag binds profile id | version-policy | S |
-| T10.2 | CI compatibility report artifact (`clojure -M:compatibility …`) required on release — **landed** (`:compatibility` alias + ci.yml artifact) | **kotoba-lang** | Gate | version-policy | S |
+| T10.2 | CI compatibility report artifact (`kbb -M:compatibility …`) required on release — **landed** (`:compatibility` alias + ci.yml artifact) | **kotoba-lang** | Gate | version-policy | S |
 | T10.3 | Changelog discipline: surface-status diffs in release notes — **process landed** (`:release-notes` in version-policy + grade-a doc) | **kotoba-lang** | Process | T2.2 | S |
 | T10.4 | Deprecation window drills (one intentional soft deprecation of a sugar) | **compiler**, **kotoba-lang** | Proves policy works | T10.1 | M |
 

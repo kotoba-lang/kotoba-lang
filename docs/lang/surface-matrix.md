@@ -1,8 +1,8 @@
 # Kotoba language surface matrix
 
 **Generated** from `lang/surface-status.edn` — do not hand-edit.
-Regenerate: `clojure -M:surface-matrix`
-Check: `clojure -M:surface-matrix --check`
+Regenerate: `kbb -M:surface-matrix`
+Check: `kbb -M:surface-matrix --check`
 
 | Field | Value |
 |---|---|

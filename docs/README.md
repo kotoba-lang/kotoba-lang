@@ -31,7 +31,7 @@ Generated lookup surfaces: [CLI](generated/cli.md),
 [diagnostics](generated/diagnostics.md), and
 [release binding](generated/release.md). The generated references and
 [`search-index.edn`](search-index.edn) come from machine authorities; run
-`nbb scripts/generate-docs-reference.cljk --check` to detect drift.
+`kbb --backend sci scripts/generate-docs-reference.cljk --check` to detect drift.
 
 ## What is normative?
 
@@ -70,5 +70,5 @@ Documentation changes must keep all of these true:
 Run the executable documentation gate:
 
 ```sh
-nbb scripts/check-docs.cljk
+kbb --backend sci scripts/check-docs.cljk
 ```

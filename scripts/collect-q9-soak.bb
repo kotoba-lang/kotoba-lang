@@ -1,4 +1,4 @@
-#!/usr/bin/env bb
+#!/usr/bin/env kbb
 (ns collect-q9-soak
   (:require [babashka.process :as process]
             [cheshire.core :as json]

@@ -132,7 +132,7 @@ All 15 shipped libs are at **M6 / v0.1.0**:
 - **M2**: positive fixtures / examples.
 - **M3**: negative fixtures (denied capability, malformed input).
 - **M4**: manifest-driven runner / CI gate (`stdlib-gates.md`; each lib's
-  GitHub Actions `clojure -M:test` on JDK 17+21 is green).
+  GitHub Actions `kbb -M:test` on JDK 17+21 is green).
 - **M5**: external consumer — confirmed for every consumable leaf (see above).
 - **M6**: semver + compatibility policy (`stdlib-versioning.md`).
 

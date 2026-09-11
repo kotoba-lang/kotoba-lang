@@ -1,4 +1,4 @@
-#!/usr/bin/env bb
+#!/usr/bin/env kbb
 (ns check-q9-migration
   (:require [babashka.fs :as fs]
             [babashka.process :as process]

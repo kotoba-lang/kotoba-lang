@@ -1,4 +1,4 @@
-#!/usr/bin/env bb
+#!/usr/bin/env kbb
 (ns pin-q9-pilot-deps
   (:require [babashka.fs :as fs]
             [clojure.string :as str]))

@@ -402,7 +402,7 @@ Run from the **repository root**, with `jp-go-digital-design-system`, `grammar`,
 JP_GO_DDS_ROOT=../jp-go-digital-design-system \
 KOTOBA_GRAMMAR_ROOT=../grammar \
 KOTOBA_IDENTITY_ROOT=../identity \
-nbb --classpath "site/src:../grammar/src:../text/src:../jp-go-digital-design-system/src:../css/src:../html/src" site/generate.cljk
+kbb --backend sci --classpath "site/src:../grammar/src:../text/src:../jp-go-digital-design-system/src:../css/src:../html/src" site/generate.cljk
 ```
 
 The generator reads the vendored DADS stylesheet from
@@ -547,7 +547,7 @@ rendered HTML against a deterministic HIG/WCAG rubric — no LLM, no browser:
 
 ```sh
 cd ../design-quality
-nbb --classpath src -m design-quality.cli score ../kotoba-lang/site/dist/index.html --min 100
+kbb --backend sci --classpath src -m design-quality.cli score ../kotoba-lang/site/dist/index.html --min 100
 ```
 
 Current score: **100.00** (converged, no findings). Do not lower the floor to
@@ -651,8 +651,8 @@ After generating, verify catalogs, runtime placeholders, all 102 canonical
 pages, reciprocal alternates and unchanged executable examples:
 
 ```sh
-nbb --classpath site/src site/test/locales_test.cljk
-nbb --classpath site/src site/test/public_locales_test.cljk
+kbb --backend sci --classpath site/src site/test/locales_test.cljk
+kbb --backend sci --classpath site/src site/test/public_locales_test.cljk
 ```
 
 ## CSF assessment article

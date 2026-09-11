@@ -1,4 +1,4 @@
-#!/usr/bin/env bb
+#!/usr/bin/env kbb
 (ns apply-q9-page-limit-pilots
   (:require [babashka.fs :as fs]
             [clojure.string :as str]))

@@ -77,7 +77,7 @@ All probes: `compile-source … :wasm32-kotoba-v1`, executed on KIR.
 
 Measured consequences of exactly that line:
 
-- `clojure -M:conformance` → **51 / 52** (was 52 / 52). The single regression is
+- `kbb -M:conformance` → **51 / 52** (was 52 / 52). The single regression is
   `:when-ext-kit`, `(when-not (< 2 1) 6)`, failing with *equality operands must
   have the same value type*. Root cause: `not` (and `empty?`, `zero?`, `not=`)
   desugar to `(= x 0)`, so the whole boolean layer is expressed as integer
@@ -131,7 +131,7 @@ integer-conditioned programs keep working. `kir`'s own suite stays green
        (>= free minf)))
 ```
 
-`clojure -M:conformance` stays **52 / 52 dual-backend** (47 pure-product,
+`kbb -M:conformance` stays **52 / 52 dual-backend** (47 pure-product,
 5 portable), and legacy `(if (= x 0) 1 0)` still compiles and runs.
 
 #### Why it is nevertheless a breaking change, not a fix

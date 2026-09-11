@@ -20,8 +20,8 @@ semantics. Package manifests and dependency lock entries use the same strict
 SemVer syntax.
 
 ```sh
-clojure -M:compatibility 4 1 0.4.0
-clojure -M:test -n kotoba.lang.version-policy-test \
+kbb -M:compatibility 4 1 0.4.0
+kbb -M:test -n kotoba.lang.version-policy-test \
   -n kotoba.lang.package-contract-test
 ```
 
@@ -33,8 +33,8 @@ release hard gate; it does not weaken this compatibility contract.
 
 | Gate | Command / artifact |
 |---|---|
-| Policy + current release | `clojure -M:compatibility` |
-| Explicit triple | `clojure -M:compatibility 4 1 0.4.0` |
+| Policy + current release | `kbb -M:compatibility` |
+| Explicit triple | `kbb -M:compatibility 4 1 0.4.0` |
 | CI | `.github/workflows/ci.yml` uploads `compatibility-report.edn` |
 | Tag content | binds include `:language-profile` (see `lang/version-policy.edn`) |
 | Release notes | mention `lang/surface-status.edn` / surface-matrix when surface changes |

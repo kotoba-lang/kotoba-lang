@@ -1,4 +1,4 @@
-#!/usr/bin/env bb
+#!/usr/bin/env kbb
 
 (ns check-cli-contract
   (:require [clojure.edn :as edn]

@@ -264,7 +264,7 @@ These are responsibility moves, not changes to Kotoba source semantics.
 
 The assessment is based on:
 
-- `deps.edn` and `clojure -Stree` from this repository on 2026-08-03;
+- `deps.edn` and `kbb -Stree` from this repository on 2026-08-03;
 - production namespace references under `src/`;
 - `resources/repository-rules.edn`;
 - the workspace exception
