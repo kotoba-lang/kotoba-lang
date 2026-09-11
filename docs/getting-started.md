@@ -1,5 +1,28 @@
 # Getting started with Kotoba
 
+**Other languages:**
+[Bahasa Indonesia](i18n/id/getting-started.md) ·
+[Basa Jawa](i18n/jv/getting-started.md) ·
+[Basa Sunda](i18n/su/getting-started.md) ·
+[Español](i18n/es/getting-started.md) ·
+[עברית](i18n/he/getting-started.md) ·
+[한국어](i18n/ko/getting-started.md) ·
+[Italiano](i18n/it/getting-started.md) ·
+[العربية](i18n/ar/getting-started.md) ·
+[الدارجة المغربية](i18n/ar-MA/getting-started.md) ·
+[المصرية](i18n/arz/getting-started.md) ·
+[Deutsch](i18n/de/getting-started.md) ·
+[index](i18n/README.md)
+
+Site start cards already published (unchanged):
+[हिन्दी](https://kotoba-lang.org/hi/) ·
+[தமிழ்](https://kotoba-lang.org/ta/) ·
+[简体中文](https://kotoba-lang.org/zh-Hans/) ·
+[العربية](https://kotoba-lang.org/ar/) ·
+[Українська](https://kotoba-lang.org/uk/) ·
+[Español](https://kotoba-lang.org/es/) ·
+[Français](https://kotoba-lang.org/fr/).
+
 This path gets from an empty machine to a checked program. Installation and
 binary releases are owned by [`kotoba-lang/kotoba`](https://github.com/kotoba-lang/kotoba),
 not by this language-contract repository.
