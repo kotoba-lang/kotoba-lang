@@ -5,6 +5,18 @@ Deny-by-default: a program can only touch what it was granted. This page is
 the stable entrance to its documentation; the repository root README remains
 the project overview. Hosted billed deploy is not live.
 
+Localized GitHub start paths (one job: install and compile) live under
+[docs/i18n](i18n/README.md). Those pages are machine translations;
+English remains the source of record. Published site start cards for
+[हिन्दी](https://kotoba-lang.org/hi/),
+[தமிழ்](https://kotoba-lang.org/ta/),
+[简体中文](https://kotoba-lang.org/zh-Hans/),
+[العربية](https://kotoba-lang.org/ar/),
+[Українська](https://kotoba-lang.org/uk/),
+[Español](https://kotoba-lang.org/es/), and
+[Français](https://kotoba-lang.org/fr/)
+are unchanged.
+
 ## Choose a path
 
 | I want to… | Start here | Then read |

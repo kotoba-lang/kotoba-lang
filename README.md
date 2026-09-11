@@ -1,5 +1,28 @@
 # Kotoba
 
+**Start this job in another language:**
+[Bahasa Indonesia](docs/i18n/id/getting-started.md) ·
+[Basa Jawa](docs/i18n/jv/getting-started.md) ·
+[Basa Sunda](docs/i18n/su/getting-started.md) ·
+[Español](docs/i18n/es/getting-started.md) ·
+[עברית](docs/i18n/he/getting-started.md) ·
+[한국어](docs/i18n/ko/getting-started.md) ·
+[Italiano](docs/i18n/it/getting-started.md) ·
+[العربية](docs/i18n/ar/getting-started.md) ·
+[الدارجة المغربية](docs/i18n/ar-MA/getting-started.md) ·
+[المصرية](docs/i18n/arz/getting-started.md) ·
+[Deutsch](docs/i18n/de/getting-started.md) ·
+[all start paths](docs/i18n/README.md)
+
+Site start cards already published (unchanged):
+[हिन्दी](https://kotoba-lang.org/hi/) ·
+[தமிழ்](https://kotoba-lang.org/ta/) ·
+[简体中文](https://kotoba-lang.org/zh-Hans/) ·
+[العربية](https://kotoba-lang.org/ar/) ·
+[Українська](https://kotoba-lang.org/uk/) ·
+[Español](https://kotoba-lang.org/es/) ·
+[Français](https://kotoba-lang.org/fr/).
+
 > **AI writes freely. Kotoba draws the boundary.**
 
 Kotoba is an intuitive, declarative, security-first language and computing
@@ -442,6 +465,7 @@ authoritative in machine-readable contracts and qualification evidence.
 ## Documentation
 
 - [Getting started](docs/getting-started.md)
+- [Localized GitHub start paths](docs/i18n/README.md)
 - [Documentation map](docs/README.md)
 - [Language surface status](lang/surface-status.edn)
 - [Safety claims and residual risks](lang/safety-claims.edn)
