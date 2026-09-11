@@ -1,4 +1,4 @@
-#!/usr/bin/env bb
+#!/usr/bin/env kbb
 (ns generate-q9-kotoba-extension-audit
   (:require [babashka.fs :as fs]
             [babashka.process :as process]

@@ -9,7 +9,7 @@ Each library is a plain-git child repo under `kotoba-lang/<name>` with the same
 `deps.edn :test` alias, so the per-lib gate is uniform:
 
 ```sh
-clojure -M:test
+kbb -M:test
 ```
 
 ## The gate set
@@ -18,7 +18,7 @@ Foundational (Layer 1–4) libs — 12:
 
 ```sh
 for n in coll spec json wit async time fs http io test fmt lsp; do
-  (cd orgs/kotoba-lang/$n && clojure -M:test)
+  (cd orgs/kotoba-lang/$n && kbb -M:test)
 done
 ```
 
@@ -26,14 +26,14 @@ Composite consumer libs — 3:
 
 ```sh
 for n in scheduler store lint; do
-  (cd orgs/kotoba-lang/$n && clojure -M:test)
+  (cd orgs/kotoba-lang/$n && kbb -M:test)
 done
 ```
 
 ## CI contract
 
 - Each library's own GitHub Actions workflow (`.github/workflows/ci.yml`) runs
-  `clojure -M:test` on JDK 17 and 21. A green run there *is* that lib's M4
+  `kbb -M:test` on JDK 17 and 21. A green run there *is* that lib's M4
   evidence.
 - The `:stdlib` track is M4 when every shipped lib's latest CI run is
   `success`. Track maturity in `docs/lang/coverage.edn` `:stdlib :maturity`

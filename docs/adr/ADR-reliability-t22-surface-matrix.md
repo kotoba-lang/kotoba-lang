@@ -7,7 +7,7 @@
 ## Decision
 
 Generate `docs/lang/surface-matrix.md` from `lang/surface-status.edn` via
-`kotoba.lang.surface-matrix` (`clojure -M:surface-matrix`).
+`kotoba.lang.surface-matrix` (`kbb -M:surface-matrix`).
 `--check` fails CI-style when the markdown is stale.
 
 ## Related

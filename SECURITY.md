@@ -49,7 +49,7 @@ which have implementation evidence, and which have no operating evidence at all
 Read the current figures there with
 
 ```sh
-nbb --classpath src scripts/check-crosswalk.cljs
+kbb --backend sci --classpath src scripts/check-crosswalk.cljs
 ```
 
 rather than quoting a number from this file, which would be stale the moment it

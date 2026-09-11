@@ -20,7 +20,7 @@ Authority capabilities were catalogued centrally but needed a Unison-like
 
 - Repository name: `capability-<id-with-dashes>` (example: `capability-http-fetch`).
 - Composition capabilities stay in Tamaki and never receive HostCaps directly.
-- Scaffold: `clojure -M -m scaffold-capability-repos /abs/out [--update]`
+- Scaffold: `kbb -M -m scaffold-capability-repos /abs/out [--update]`
   in `kotoba-core-contracts`.
 
 ### 2. Import identity is `:capability/definition-cid`

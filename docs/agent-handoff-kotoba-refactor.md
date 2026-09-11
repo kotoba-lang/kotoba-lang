@@ -158,23 +158,23 @@ Product dual-source remains separate (this handoff §2); do not invent language 
 
 Next language work: T1.3 full matrix; T7.1 residual mutual-recursion TCO; T4.2 full string-split→collection optional; T4.5 3+ source map / stored closures / nested `do` wasm-typed; T9.1 remaining public adapters (db/git/…). **T8.3 ops guest host + wire 19–23 registration landed 2026-08-01** (see Plan Next — host I/O wasm-aot remains partial by design). **Profile 5 bool-typed predicates landed** (compiler ADR 0191 + composed-surface kit #461; release 0.5.0 authority). **T5.3 packs→records complete** murakumo#193–#206. **T5.2 product host bridge largely complete** (call-record close-out murakumo#261–#276 + com-cloudflare#18 + com-cloudflare-compat#6; native guest record pilot murakumo#277 schedule/task eligibility). **T6.4 oracle-required** murakumo fleet + com-cloudflare#19 + compat#6.
 **T7.2 fuel model:** [`docs/lang/fuel-model.md`](./lang/fuel-model.md) (1 unit/function entry, default 512).
-**T1.5 goldens:** compiler#418 / ADR 0167 — `clojure -M:conformance --check-golden`.
-**T2.2 surface matrix:** [`docs/lang/surface-matrix.md`](./lang/surface-matrix.md) (`clojure -M:surface-matrix --check`).
+**T1.5 goldens:** compiler#418 / ADR 0167 — `kbb -M:conformance --check-golden`.
+**T2.2 surface matrix:** [`docs/lang/surface-matrix.md`](./lang/surface-matrix.md) (`kbb -M:surface-matrix --check`).
 **T2.4 ambient corpus:** compiler#417 / ADR 0166 + [`grade-a-malicious-source-corpus.md`](./grade-a-malicious-source-corpus.md).
 **T4.4 records:** [`docs/lang/record-cookbook.md`](./lang/record-cookbook.md) + compiler#416.
 **T4.5 collections costs:** [`docs/lang/collections-costs.md`](./lang/collections-costs.md).
 **T5.4 max-parameters:** keep **5** ([ADR-reliability-t54](./adr/ADR-reliability-t54-max-parameters.md)).
 **T6.3 tool vs runtime:** [ADR-reliability-t63](./adr/ADR-reliability-t63-tool-vs-runtime.md).
 **T6.1 standalone run:** [`docs/lang/standalone-run.md`](./lang/standalone-run.md) (wasmtime primary).
-**T10 compatibility:** `clojure -M:compatibility` (profile 4 / release 0.4.0).
-**T1.4 pure-native pilot:** compiler#419 / ADR 0168 — `clojure -M:native-conformance`.
-**T7.3 fuel-estimate:** compiler#419 / ADR 0169 — `clojure -M:fuel-estimate <file>`.
-**T9.2/T3.4 check CLI:** compiler#420 / ADR 0170 — `clojure -M:run check <file> --profile pure-product`.
-**T1.3 pilot 20 dual-green:** compiler#421 / ADR 0171 — `clojure -M:conformance` / `--check-golden`.
+**T10 compatibility:** `kbb -M:compatibility` (profile 4 / release 0.4.0).
+**T1.4 pure-native pilot:** compiler#419 / ADR 0168 — `kbb -M:native-conformance`.
+**T7.3 fuel-estimate:** compiler#419 / ADR 0169 — `kbb -M:fuel-estimate <file>`.
+**T9.2/T3.4 check CLI:** compiler#420 / ADR 0170 — `kbb -M:run check <file> --profile pure-product`.
+**T1.3 pilot 20 dual-green:** compiler#421 / ADR 0171 — `kbb -M:conformance` / `--check-golden`.
 **T3.2 capability deny:** compiler#421 — missing grants named in message + error code.
-**T9.3 test harness:** compiler#421 — `clojure -M:run test <file.kotoba>` (export `test-*` → i64 1).
+**T9.3 test harness:** compiler#421 — `kbb -M:run test <file.kotoba>` (export `test-*` → i64 1).
 **T3.1 error codes:** compiler#422 / ADR 0172 — every `reject!` has a code (default `:subset-reject`).
-**T9.1 CLI adapters:** `lang/cli-adapter-matrix.edn` + `clojure -M:cli-adapter-matrix` (check is M2).
+**T9.1 CLI adapters:** `lang/cli-adapter-matrix.edn` + `kbb -M:cli-adapter-matrix` (check is M2).
 **T7.1 loop pilot:** compiler#423 — loop/recur dual-green (helper desugar; not machine TCO).
 **T3.3 fuel traps:** kotoba-kir#20 + compiler#423 pin — `:function` + `:call-stack` on fuel-exhausted.
 **T7.4 deep loop 10k:** compiler#424 / ADR 0174 + kotoba-kir#21+#22 — `:loop-deep-kit` (fuel 12000); loop-helper trampoline; zero-charge still open.
@@ -248,7 +248,7 @@ Examples already landed:
   entry is nbb `--classpath src`, an operator contract the superproject
   runbooks depend on — the core's header records this and the removal
   conditions. The fleet gate for kagami is `:nbb-test`, so the parity gate
-  runs on the JVM `clojure -M:test` path, not on the nodes.
+  runs on the JVM `kbb -M:test` path, not on the nodes.
 
 ---
 
@@ -271,7 +271,7 @@ Examples already landed:
 | Discovery only | GitHub name + Radicle RID are **aliases** |
 | Hash rules pinned | `:capability/hash-contract-cid` |
 | No ambient authority | Knowing a CID ≠ grant; Tamaki request + Kototama admit + policy |
-| Scaffold | `clojure -M -m scaffold-capability-repos /abs/out [--update]` from core-contracts |
+| Scaffold | `kbb -M -m scaffold-capability-repos /abs/out [--update]` from core-contracts |
 | Generated status | `contract-only` until signed content-addressed Wasm component exists |
 
 Definition block **includes:** schema, version, ABI ns/version, sorted imports/effects, defaultPolicy, artifactFormat, hashContract link.  

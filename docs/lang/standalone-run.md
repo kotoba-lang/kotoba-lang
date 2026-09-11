@@ -4,7 +4,7 @@
 **Related:** [T6.3 tool vs runtime](../adr/ADR-reliability-t63-tool-vs-runtime.md),
 fuel-model, T1.3 dual-backend pilot
 
-Goal: run a **pure** Kotoba program **without** `clojure -M` on the production
+Goal: run a **pure** Kotoba program **without** `kbb -M` on the production
 host. The compiler remains a build-time CLJ tool (T6.3).
 
 ## Primary path (pure apps): **wasm32-kotoba-v1 + wasmtime**
@@ -41,7 +41,7 @@ conformance subset; until then native is secondary for pure-product oracles.
 
 | Path | Role |
 |---|---|
-| `kotoba -e '…'` / `clojure -M -m …` | Dev / tool only |
+| `kotoba -e '…'` / `kbb -M -m …` | Dev / tool only |
 | KIR `kotoba.kir/execute` on JVM/cljs | Product **oracle** embed (murakumo); still a library host, not “standalone OS process without host lang” |
 | Restricted ESM (`js-kotoba-v1`) | Browser/worker; needs JS engine |
 
@@ -59,4 +59,4 @@ conformance subset; until then native is secondary for pure-product oracles.
 - Public `kotoba run` adapter alignment with `lang/cli.edn` (T9.1)
 
 
-**Update:** T1.4 pure-native pilot landed (compiler#419 / ADR 0168): `clojure -M:native-conformance`.
+**Update:** T1.4 pure-native pilot landed (compiler#419 / ADR 0168): `kbb -M:native-conformance`.

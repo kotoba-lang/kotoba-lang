@@ -64,7 +64,7 @@ stays a host-adapter concern, e.g. kotoba-shell calling into
 - `test/kotoba/cli_test.cljc`'s hard-coded expectations move from 6 to 7
   commands and 33 to 40 options (`:hinshitsu` contributes 7: `input`,
   `operation`, `baseline`, `candidate`, `threshold`, `required-check`,
-  `json`) — verified passing (`clojure -M:test`, 6 tests / 27 assertions).
+  `json`) — verified passing (`kbb -M:test`, 6 tests / 27 assertions).
 - kotoba-shell's existing Rust check structs are not migrated by this ADR
   alone; that migration (replacing `SdkCheckStatus`/`EvidenceCheckReport`
   with `hinshitsu.core`/`hinshitsu.mokushi` calls, and wiring

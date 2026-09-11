@@ -36,7 +36,7 @@ More than 8 parts after the separator is a compile-time reject.
 - compiler#415 / ADR 0164 (contains / eq / substring / fold-case / code-point pilot)
 - compiler#425 / ADR 0175 (`string-byte-length` dual-backend kit)
 - compiler#427 / ADR 0177 (`string-split-count`; pilot **30**)
-- `clojure -M:conformance` dual-green
+- `kbb -M:conformance` dual-green
 - `kotoba.compiler.string-operation-test` dual-backend checks
 
 ## Related

@@ -18,7 +18,7 @@ enforced on labelled T1.3 cases). The remaining half is a CI job that treats
 2. **Runner** `kotoba.lang.pure-product-examples` compiles each source with
    `compile-source` + `{:language-profile :pure-product}`, then
    `kotoba.kir/execute` for each case.
-3. **Alias** `clojure -M:pure-product-examples` (requires sibling
+3. **Alias** `kbb -M:pure-product-examples` (requires sibling
    `../amu` checkout).
 4. **CI** job `pure-product-examples` on ubuntu-24.04 clones compiler tip and
    runs the alias (fail closed).
@@ -26,7 +26,7 @@ enforced on labelled T1.3 cases). The remaining half is a CI job that treats
 ## Evidence
 
 ```
-KOTOBA_LANG_ROOT=. clojure -M:pure-product-examples
+KOTOBA_LANG_ROOT=. kbb -M:pure-product-examples
 # T2.3 pure-product examples: 4 / 4 passed
 ```
 

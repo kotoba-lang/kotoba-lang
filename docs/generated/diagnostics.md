@@ -100,7 +100,7 @@ Phase: `documentation`.
 
 A committed generated reference does not match its machine authority.
 
-**Recovery:** Run nbb scripts/generate-docs-reference.cljk and commit the result.
+**Recovery:** Run kbb --backend sci scripts/generate-docs-reference.cljk and commit the result.
 
 Authority: [`scripts/check-docs.cljk`](../../scripts/check-docs.cljk).
 

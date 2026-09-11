@@ -4,7 +4,7 @@
 fuel, errors, capabilities, multi-backend meaning (R1 / T1.1).
 
 **Surface matrix (T2.2):** [`surface-matrix.md`](./surface-matrix.md) — generated from
-`lang/surface-status.edn` (`clojure -M:surface-matrix --check`).
+`lang/surface-status.edn` (`kbb -M:surface-matrix --check`).
 
 **Fuel model (T7.2):** [`fuel-model.md`](./fuel-model.md).  
 **Records (T4.4):** [`record-cookbook.md`](./record-cookbook.md).  

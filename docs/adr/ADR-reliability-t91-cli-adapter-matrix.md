@@ -8,7 +8,7 @@
 
 1. Keep `lang/cli.edn` as the public 8-command contract.  
 2. Record host adapter readiness in `lang/cli-adapter-matrix.edn`.  
-3. Validate with `clojure -M:cli-adapter-matrix` / unit tests.  
+3. Validate with `kbb -M:cli-adapter-matrix` / unit tests.  
 4. Promote `:check` contract tier to **M2** (compiler adapter + pure-product
    fixtures landed). Other commands remain M1/contract-only until adapters exist.  
 5. Compiler extras (`test`, `fuel-estimate`, sign/receipt…) stay outside the

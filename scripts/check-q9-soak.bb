@@ -1,4 +1,4 @@
-#!/usr/bin/env bb
+#!/usr/bin/env kbb
 (ns check-q9-soak
   (:require [clojure.edn :as edn]
             [clojure.set :as set]

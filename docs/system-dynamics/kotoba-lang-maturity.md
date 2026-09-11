@@ -4,8 +4,8 @@ This calculation uses the OASIS XMILE stock/flow engine maintained in
 `kotoba-lang/org-oasis-open-xmile`. Run it with:
 
 ```sh
-clojure -M:maturity
-clojure -M:maturity --check
+kbb -M:maturity
+kbb -M:maturity --check
 ```
 
 The evidence snapshot is

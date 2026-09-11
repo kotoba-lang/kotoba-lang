@@ -15,7 +15,7 @@ is data-driven so compiler/runtime implementations can consume the same files
 without copying the reference evaluator.
 
 ```sh
-clojure -M:test -n kotoba.lang.malicious-source-test
+kbb -M:test -n kotoba.lang.malicious-source-test
 ```
 
 L-07 remains `in-progress`: the production compiler, CLJS reader, and component

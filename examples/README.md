@@ -6,7 +6,7 @@ Manifest: [`pure-product-examples.edn`](./pure-product-examples.edn)
 
 ```bash
 # requires sibling ../amu checkout
-clojure -M:pure-product-examples
+kbb -M:pure-product-examples
 ```
 
 CI job `pure-product-examples` runs the same command. See

@@ -5,7 +5,7 @@ that Kotoba produced.
 
 ```sh
 # scripts/build-native.sh, in kotoba-lang/kotoba
-clojure -T:build uber                                       # Clojure -> uberjar
+kbb -T:build uber                                       # Clojure -> uberjar
 native-image -jar target/kotoba-standalone.jar target/native/kotoba
 ```
 

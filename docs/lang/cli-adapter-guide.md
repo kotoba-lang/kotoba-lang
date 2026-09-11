@@ -7,7 +7,7 @@
 # structural contract (8 commands)
 bb scripts/check-cli-contract.bb lang/cli.edn
 # adapter matrix vs contract
-clojure -M:cli-adapter-matrix
+kbb -M:cli-adapter-matrix
 ```
 
 ## Public commands
@@ -27,9 +27,9 @@ clojure -M:cli-adapter-matrix
 
 | Command | Invoke |
 |---|---|
-| test | `clojure -M:run test file.kotoba` |
-| fuel-estimate | `clojure -M:fuel-estimate file.kotoba` |
-| sign / verify / receipt / … | `clojure -M:run <cmd>` |
+| test | `kbb -M:run test file.kotoba` |
+| fuel-estimate | `kbb -M:fuel-estimate file.kotoba` |
+| sign / verify / receipt / … | `kbb -M:run <cmd>` |
 
 ## Closing M1→M2 for a command
 
