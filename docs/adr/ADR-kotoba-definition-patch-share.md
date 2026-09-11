@@ -4,12 +4,12 @@
   implemented. Transport, persistence, and concurrent merge are unmeasured.
 - **Date**: 2026-09-02
 - **Artifacts**: `lang/definition-patch.edn`,
-  `src/kotoba/lang/definition_patch.cljc`,
-  `test/kotoba/lang/definition_patch_test.clj`
+  `src/kotoba/lang/definition_patch.cljk`,
+  `test/kotoba/lang/definition_patch_test.cljk`
 - **Extends**: `ADR-kotoba-content-addressed-codebase.md`,
   `ADR-kotoba-code-identity-and-abilities.md`
 - **Consumes**: `lang/code-identity.edn` (`:definition-cid`, payload-version 2);
-  facade `src/kotoba/lang/code_identity.cljc`; authority
+  facade `src/kotoba/lang/code_identity.cljk`; authority
   `kotoba.kir.definition-identity`
 - **Does not own**: typed eval (`ADR-kotoba-typed-eval.md`,
   `lang/typed-eval.edn`); guest grammar; the kotoba-kir hasher

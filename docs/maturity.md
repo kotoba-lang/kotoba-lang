@@ -64,5 +64,5 @@ or Deno.”
 4. Add localization and privacy-preserving search/task telemetry only after its
    collection and retention policy is explicit.
 
-Run `nbb scripts/generate-docs-reference.cljs --check` and
-`nbb scripts/check-docs.cljs` to verify the generated-reference contract.
+Run `nbb scripts/generate-docs-reference.cljk --check` and
+`nbb scripts/check-docs.cljk` to verify the generated-reference contract.

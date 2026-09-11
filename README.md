@@ -456,7 +456,7 @@ authoritative in machine-readable contracts and qualification evidence.
 
 ```sh
 clojure -M:test
-nbb scripts/check-docs.cljs
+nbb scripts/check-docs.cljk
 bb scripts/check-cli-contract.bb lang/cli.edn
 bb scripts/check-capability-values.bb
 bb scripts/check-legacy-runtime-absence.bb

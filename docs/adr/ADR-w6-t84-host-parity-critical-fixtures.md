@@ -28,7 +28,7 @@ imports / browser-profile / most import rows).
 ## Evidence
 
 - `lang/host-parity.edn` + `resources/kotoba/lang/host-parity.edn`
-- `test/kotoba/lang/host_parity_test.clj` (45 expanded cases green)
+- `test/kotoba/lang/host_parity_test.cljk` (45 expanded cases green)
 
 ## Related
 

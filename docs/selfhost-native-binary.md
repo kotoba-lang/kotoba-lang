@@ -84,7 +84,7 @@ KIR, interface, effect row, dependencies by CID — in that plane?*
 
 ## The measurement in `lang/selfhost-distance.edn`, and what it is not
 
-`scripts/measure-selfhost-distance.cljs` walks the 137 `.cljc` files on the
+`scripts/measure-selfhost-distance.cljk` walks the 137 `.cljc` files on the
 compiler's own classpath (85,106 lines) and runs the two gates that the
 **authored-input** surface has:
 
@@ -257,7 +257,7 @@ JVM-free claim had never been run against a `PATH` with no `java` on it.
 Knowing that the trust half needs a JVM is not a work order. A namespace
 cannot be ported before the namespaces it requires are, so "what first" is a
 topological sort over the require graph, restricted to the host-bound nodes.
-`scripts/measure-host-port-order.cljs` computes it; `lang/host-port-order.edn`
+`scripts/measure-host-port-order.cljk` computes it; `lang/host-port-order.edn`
 is the result.
 
 **Two hosts leave, not one.** `node:crypto` is not a smaller problem than

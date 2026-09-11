@@ -87,7 +87,7 @@ marks ≥ 3:1, text ≥ 4.5:1.
 
 ## Charts
 
-`site/src/kotoba/site/chart.cljc` holds three pure hiccup forms, chosen per
+`site/src/kotoba/site/chart.cljk` holds three pure hiccup forms, chosen per
 report rather than applied uniformly:
 
 - `ranked-bars` — magnitude across named toolchains. Bars carry **time**, so
@@ -379,7 +379,7 @@ The site-specific production build configuration is recorded in
   `site/` are also build inputs.
 
 Merge source changes into main; the build regenerates the pages before
-deploying. Edit `site/generate.cljs` or the source assets, not generated
+deploying. Edit `site/generate.cljk` or the source assets, not generated
 `site/dist/` HTML. A failed build or locale test must prevent deployment.
 `npm run site:deploy` provides the same build-before-deploy order for operators.
 
@@ -402,7 +402,7 @@ Run from the **repository root**, with `jp-go-digital-design-system`, `grammar`,
 JP_GO_DDS_ROOT=../jp-go-digital-design-system \
 KOTOBA_GRAMMAR_ROOT=../grammar \
 KOTOBA_IDENTITY_ROOT=../identity \
-nbb --classpath "site/src:../grammar/src:../text/src:../jp-go-digital-design-system/src:../css/src:../html/src" site/generate.cljs
+nbb --classpath "site/src:../grammar/src:../text/src:../jp-go-digital-design-system/src:../css/src:../html/src" site/generate.cljk
 ```
 
 The generator reads the vendored DADS stylesheet from
@@ -491,7 +491,7 @@ organisation and filters it in the browser. Two committed inputs:
   repository **topic** it corresponds to, so the site filter and the org's
   topics are one vocabulary instead of two that drift.
 
-`site/src/kotoba/site/catalog.cljc` applies it, and keeps two strengths of fact
+`site/src/kotoba/site/catalog.cljk` applies it, and keeps two strengths of fact
 apart. A **plane** tag is read off the repository name using the workspace's
 own naming rule (ADR-2608040100) and is as reliable as the name. A **domain**
 tag is matched against the name and description with word-boundary patterns —
@@ -651,8 +651,8 @@ After generating, verify catalogs, runtime placeholders, all 102 canonical
 pages, reciprocal alternates and unchanged executable examples:
 
 ```sh
-nbb --classpath site/src site/test/locales_test.cljs
-nbb --classpath site/src site/test/public_locales_test.cljs
+nbb --classpath site/src site/test/locales_test.cljk
+nbb --classpath site/src site/test/public_locales_test.cljk
 ```
 
 ## CSF assessment article

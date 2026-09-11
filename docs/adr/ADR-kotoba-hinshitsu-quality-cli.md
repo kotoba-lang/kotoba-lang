@@ -25,7 +25,7 @@ correctly distinguishing an identical frame (distortion 0.0, pass) from a
 genuine UI state change (distortion 0.056, correctly fails a 0.02 threshold).
 
 The public `kotoba` CLI (`lang/cli.edn`) is the data-first command contract
-host adapters implement; `src/kotoba/cli.cljc`'s `required-commands` is a
+host adapters implement; `src/kotoba/cli.cljk`'s `required-commands` is a
 closed set validated 1:1 against the contract (`validate-contract` fails if
 the contract's command set and the CLJC authority's implemented set diverge —
 see `test/kotoba/cli_test.cljc`). Quality/evidence/visual checks have no
@@ -47,7 +47,7 @@ by an `--op` enum option, for adapters without nested-command support):
   comparison), `--required-check` (repeatable, feeds `gate`'s
   `:required-checks`), `--json` (matches every other command).
 
-`src/kotoba/cli.cljc`'s `required-commands` gains `:hinshitsu`; like `:run`,
+`src/kotoba/cli.cljk`'s `required-commands` gains `:hinshitsu`; like `:run`,
 `:graph`, `:git`, `:rad`, `:deploy`, its `command-result` falls through to the
 generic `:command/planned` / `:adapter-required` branch — the CLJC authority
 owns the contract and argv shaping, not the actual check execution (that
@@ -75,7 +75,7 @@ stays a host-adapter concern, e.g. kotoba-shell calling into
 
 - `kotoba-lang/hinshitsu`: `src/hinshitsu/core.cljc`, `src/hinshitsu/mokushi.cljc`.
 - `lang/cli.edn`: the `:hinshitsu` command entry.
-- `src/kotoba/cli.cljc`: `required-commands`, `command-result`.
+- `src/kotoba/cli.cljk`: `required-commands`, `command-result`.
 - `docs/ADR-kotoba-shell-aiueos-safe-kotoba.md` (kotoba-lang/kotoba): the
   Rust check structs this generalizes (`SdkCheckStatus`, `CoverageAssessment`,
   `EvidenceCheckReport`, `EvidenceEntry`).
