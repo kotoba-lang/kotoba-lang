@@ -364,6 +364,17 @@ by the HTML renderer; the older operator checkout produced empty documents.
 The other pins preserve the dependencies used by the existing site. Advance
 these deliberately with a successful regeneration and locale verification.
 
+The site build uses `site/kbb --backend sci` with the lockfile-pinned,
+`.cljk`-aware engine. Cloudflare's Node image needs no host-installed kbb.
+The build loads the canonical site namespaces directly; the temporary
+`.cljs` projections are no longer needed. This remains a SCI build-host
+adapter, not a Q9 migration or acceptance claim.
+
+Production belongs to the dedicated `cloud-kotoba` account
+(`62e1fda53188460698f8c66d3aef59c6`), explicitly selected in
+`site/wrangler.jsonc`. The `Kotoba Developers` group grants Workers Platform
+Admin only within that account; it does not grant access to `network-awai`.
+
 ### Merge-triggered Cloudflare deployment
 
 The site-specific production build configuration is recorded in

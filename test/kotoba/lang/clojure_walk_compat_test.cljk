@@ -1,0 +1,357 @@
+(ns kotoba.lang.clojure-walk-compat-test
+  "`lang/compat/clojure/walk.kotoba`, checked against clojure.walk itself.
+
+  The oracle is the real function: a table of EDN forms -- scalars, empty
+  containers, nested maps / vectors / lists / sets, string and keyword keys,
+  containers as keys, the document depth limit -- crossed with a table of
+  replacement maps, handed to the Kotoba `prewalk-replace`,
+  `postwalk-replace`, `keywordize-keys` and `stringify-keys` on the KIR
+  interpreter and to clojure.walk on the host on the same EDN, and the two
+  answers compared as VALUES (read back from the interpreter's EDN text, so
+  map and set order never enter into it) and as SHAPES (a list is not a
+  vector, even though `=` says so).
+
+  Documents cross the interpreter boundary as EDN TEXT: the harness reads
+  the inputs with `document-edn-read` and prints the answer with
+  `document-edn-print`, so the interpreter is only ever handed strings.
+
+  Where the twin deliberately diverges it is asserted, not described: an
+  entry replaced by something that is not an entry TRAPS where the host
+  throws; a string that is not keyword source TRAPS where the host mints an
+  unreadable keyword; a replacement map that is not a map TRAPS where the
+  host answers; and on a key collision the host's answer depends on the
+  literal's entry order while this answers in document key order.
+
+  HOW THE INTERPRETER IS RUN. The walk is recursive, and the KIR reference
+  interpreter, run by SCI on Node with Node's default stack, has room for a
+  few levels of guest recursion only -- measured 2026-09-12: a trivial
+  self-recursive `defn` answers depth 11 and traps `fuel-exhausted
+  :host-stack-exhausted` at 12; this module's walk answers a vector nested 3
+  deep and traps at 4, and prewalk-replace over a map holding a map traps at
+  depth 2; with `node --stack-size=4000` the same walk answers every depth
+  the document limit (8) allows. That is a property of the
+  harness, not of the language: the same text lowers and runs on the web
+  and wasm backends where recursion depth 8 x 2 frames is nothing. So the
+  SHALLOW table runs in this process, and the FULL table runs in a child
+  Node started with a larger stack (`-main` below is that child), whose
+  results come back as an EDN file. On the JVM both tables run in-process.
+
+  Portable: runs on nbb (run-tests.cljk) and, where the `.cljk` sources can
+  be loaded, on the JVM."
+  (:require #?(:clj [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            #?(:clj [clojure.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            #?(:cljs ["node:fs" :as fs])
+            #?(:cljs ["node:child_process" :as child-process])
+            #?(:cljs ["node:os" :as os])
+            #?(:cljs ["node:path" :as path])
+            [clojure.set :as set]
+            [clojure.walk :as walk]
+            [kotoba.lang.text :as str]
+            [kotoba.kir :as kir]
+            [kotoba.sema :as sema]))
+
+(defn- slurp-repo-file [path]
+  #?(:clj (slurp path)
+     :cljs (.readFileSync fs path "utf8")))
+
+(def ^:private module-path "lang/compat/clojure/walk.kotoba")
+(def ^:private module (delay (slurp-repo-file module-path)))
+
+;; The reader answers integer literals as BigInt on this host, and `pr-str`
+;; renders a BigInt as `#object[BigInt 0]`, which the reader then refuses on
+;; the way back in. Printed as plain numbers.
+(defn- readable-integers [forms]
+  #?(:clj forms
+     :cljs (walk/postwalk (fn [x] (if (and (some? x) (= js/BigInt (.-constructor x))) (js/Number x) x)) forms)))
+
+(defn- body-of [source]
+  (->> (sema/read-forms source)
+       (remove #(and (seq? %) (= 'ns (first %))))
+       readable-integers
+       (map pr-str)
+       (str/join "\n")))
+
+;; Every export reached through an entry that takes and answers EDN text.
+(def ^:private harness
+  "(defn pre [smap :string form :string] :string
+     (document-edn-print (prewalk-replace (document-edn-read smap) (document-edn-read form))))
+   (defn post [smap :string form :string] :string
+     (document-edn-print (postwalk-replace (document-edn-read smap) (document-edn-read form))))
+   (defn kw [form :string] :string (document-edn-print (keywordize-keys (document-edn-read form))))
+   (defn sk [form :string] :string (document-edn-print (stringify-keys (document-edn-read form))))
+   (defn main [] :i64 0)")
+
+(def ^:private lowered
+  (delay (kir/lower (sema/analyze (str (body-of @module) "\n" harness)))))
+
+;; ---------------------------------------------------------------------------
+;; running the interpreter: in this process, and in a child with a stack
+
+;; One call: `{:value "<edn>"}` or `{:trap :name}`.
+(defn- call-here [[function args]]
+  (try {:value (kir/execute @lowered function args {:fuel 100000000})}
+       (catch #?(:clj Throwable :cljs :default) e
+         {:trap (or (:trap (ex-data e)) (ex-message e))})))
+
+(defn- run-here [calls]
+  (mapv call-here calls))
+
+#?(:cljs
+   (defn- argv-classpath []
+     (let [argv (vec (js->clj (.-argv js/process)))
+           index (first (keep-indexed (fn [i a] (when (contains? #{"--classpath" "-cp"} a) i)) argv))]
+       (when index (nth argv (inc index) nil)))))
+
+;; The child role. `node --stack-size=<kb> <engine> --classpath <cp> -m
+;; kotoba.lang.clojure-walk-compat-test <calls.edn> <results.edn>`: reads
+;; the calls, runs them on the interpreter, writes the results.
+#?(:cljs
+   (defn -main [calls-file results-file]
+     (let [calls (edn/read-string (.readFileSync fs calls-file "utf8"))]
+       (.writeFileSync fs results-file (pr-str (run-here calls)) "utf8"))))
+
+(def ^:private child-stack-kb 4000)
+
+#?(:cljs
+   (defn- run-in-child
+     "The calls run in a fresh Node with `--stack-size` raised, the engine and
+     classpath copied from this process's own argv. A child that does not
+     produce a result file is an ERROR with its stderr, never an empty
+     result -- an empty result would compare equal to nothing and pass."
+     [calls]
+     (let [engine (second (js->clj (.-argv js/process)))
+           classpath (argv-classpath)
+           dir (.mkdtempSync fs (.join path (.tmpdir os) "clojure-walk-compat-"))
+           calls-file (.join path dir "calls.edn")
+           results-file (.join path dir "results.edn")]
+       (when-not classpath
+         (throw (ex-info "cannot start the child: no --classpath in this process's argv" {:argv (js->clj (.-argv js/process))})))
+       (.writeFileSync fs calls-file (pr-str calls) "utf8")
+       (let [result (.spawnSync child-process (.-execPath js/process)
+                                (clj->js [(str "--stack-size=" child-stack-kb) engine
+                                          "--classpath" classpath
+                                          "-m" "kotoba.lang.clojure-walk-compat-test"
+                                          calls-file results-file])
+                                #js {:encoding "utf8"})]
+         (when-not (.existsSync fs results-file)
+           (throw (ex-info (str "the child produced no results: status " (.-status result)
+                                " signal " (.-signal result) "\n" (.-stderr result))
+                           {:status (.-status result) :signal (.-signal result)})))
+         (let [results (edn/read-string (.readFileSync fs results-file "utf8"))]
+           (.rmSync fs dir #js {:recursive true :force true})
+           (when-not (= (count calls) (count results))
+             (throw (ex-info (str "the child answered " (count results) " of " (count calls) " calls")
+                             {:calls (count calls) :results (count results)})))
+           results)))))
+
+(defn- run-full [calls]
+  #?(:clj (run-here calls)
+     :cljs (run-in-child calls)))
+
+;; ---------------------------------------------------------------------------
+;; the tables
+
+;; Forms of depth 0 and 1: what the in-process interpreter answers on every
+;; host (see the namespace docstring for why depth is the harness's limit).
+(def ^:private shallow-forms
+  ["1" "\"s\"" ":k" "nil" "true" "false" "1.5" "sym" ":ns/k"
+   "[]" "{}" "()" "#{}"
+   "[1 :a \"s\" nil]"
+   "{:a 1 \"b\" 2}"
+   "(:a :b :a)"
+   "#{:a 1 \"s\" 2}"
+   "{:a/b 1 \"c/d\" 2}"
+   "{\"ab\" \"a\\\"b\\nあ\" :c \"\"}"])
+
+;; Forms that need the child's stack: two levels and deeper, up to the
+;; document depth limit.
+(def ^:private deep-forms
+  ["#{:a 1 \"s\" [1 2]}"
+   "[[1 2] [1 2] :a]"
+   "{[1 2] :v {:k 1} :m}"
+   "{:a/b 1 :c {:d/e 2}}"
+   "{\"ab\" \"a\\\"b\\nあ\" \"c/d\" [\"e\"]}"
+   "{:a 1 :b :a :c [:a {:a :a}]}"
+   "{\"a\" {\"b\" [{\"c\" 1}]}}"
+   "{:a [#{(1 2) {:b [3]}}]}"
+   "#{[1 2] [3 4] #{{:a 1}}}"
+   "(:a (:b (:c (1))))"
+   "[[[[[[[[2]]]]]]]]"
+   "{:b {:b {:b {:b {:b {:b {:b {:b 2}}}}}}}}"
+   "#{#{#{#{#{#{#{#{2}}}}}}}}"
+   "((((((((:b))))))))"
+   "{\"a\" {\"a\" {\"a\" {\"a\" {\"a\" {\"a\" {\"a\" {\"a\" 2}}}}}}}}"
+   "{:a {:b {:c {:d {:e {:f {:g {:h 2}}}}}}}}"
+   "[{:a [{\"b\" (1 #{:c})}]} {:d nil}]"])
+
+;; The forms at the document depth limit (8) hold `2` / `:b` at the bottom,
+;; which no smap below replaces with a CONTAINER: a container there would be
+;; a document deeper than the limit, which is a trap this language has and
+;; the host does not (asserted below, by name). No key is a string the
+;; reader could not read back as a keyword, for the same reason.
+
+;; Replacement maps for the two `-replace` functions: nothing; keywords; one
+;; of every scalar kind; a vector key (which also matches map ENTRIES equal
+;; to it); a map key; and a replacement that is itself a container.
+(def ^:private smaps
+  ["{}"
+   "{:a :x}"
+   "{1 :one \"s\" :str nil :nil true 0 :k \"kw\" sym :sym}"
+   "{[1 2] :pair}"
+   "{{:k 1} :m [3] {:x 1}}"
+   "{:a [1 2] 1 #{:z}}"])
+
+(defn- read-edn [s] (edn/read-string s))
+
+;; The value with its container KINDS made explicit, because `(= [1] '(1))`
+;; is true and a list answered as a vector must not pass.
+(defn- shape [v]
+  (cond
+    (map? v) [:map (set (map (fn [[k x]] [(shape k) (shape x)]) v))]
+    (vector? v) [:vector (mapv shape v)]
+    (set? v) [:set (set (map shape v))]
+    (seq? v) [:list (mapv shape v)]
+    :else v))
+
+(defn- oracle [[function args]]
+  (case function
+    pre (walk/prewalk-replace (read-edn (first args)) (read-edn (second args)))
+    post (walk/postwalk-replace (read-edn (first args)) (read-edn (second args)))
+    kw (walk/keywordize-keys (read-edn (first args)))
+    sk (walk/stringify-keys (read-edn (first args)))))
+
+(defn- calls-over [forms]
+  (vec (concat (for [f '[pre post] smap smaps form forms] [f [smap form]])
+               (for [f '[kw sk] form forms] [f [form]]))))
+
+(defn- disagreements
+  "Every call whose interpreter answer is not the host's, with both answers."
+  [calls results]
+  (vec (keep (fn [[call result]]
+               (let [expected (shape (oracle call))
+                     got (if (contains? result :value)
+                           (shape (read-edn (:value result)))
+                           result)]
+                 (when-not (= expected got)
+                   {:call call :host expected :kotoba got})))
+             (map vector calls results))))
+
+(deftest matches-clojure-walk-on-the-shallow-table-in-this-process
+  (let [calls (calls-over shallow-forms)
+        results (run-here calls)
+        bad (disagreements calls results)]
+    (is (= (* (+ (* 2 (count smaps)) 2) (count shallow-forms)) (count calls)))
+    (is (empty? bad) (str (count bad) " of " (count calls) " disagree with clojure.walk; first: " (pr-str (first bad))))))
+
+(deftest matches-clojure-walk-on-the-full-table
+  (let [calls (calls-over (into shallow-forms deep-forms))
+        results (run-full calls)
+        bad (disagreements calls results)]
+    (is (= (* (+ (* 2 (count smaps)) 2) (+ (count shallow-forms) (count deep-forms))) (count calls)))
+    (is (empty? bad) (str (count bad) " of " (count calls) " disagree with clojure.walk; first: " (pr-str (first bad))))))
+
+(deftest the-named-boundaries-answer-what-clojure-walk-answers
+  ;; Named, so a reader sees them without decoding the table.
+  (let [answer (fn [call] (shape (read-edn (:value (call-here call)))))]
+    (testing "postwalk replaces a container AFTER its children, prewalk BEFORE, and the difference is visible"
+      ;; post: [:a] -> [:x] (children first) then [:x] is not in smap.
+      ;; pre: [:a] IS in smap -> :y, and :y has no children.
+      (is (= (shape [:x]) (answer '[post ["{:a :x [:a] :y}" "[:a]"]])))
+      (is (= :y (answer '[pre ["{:a :x [:a] :y}" "[:a]"]]))))
+    (testing "a set is rebuilt as a set: two members replaced by one value collapse"
+      (is (= (shape #{0 3}) (answer '[post ["{1 0 2 0}" "#{1 2 3}"]]))))
+    (testing "an entry [k v] is itself a candidate, and a two-vector replacement is an entry"
+      (is (= (shape {:b 2}) (answer '[post ["{[:a 1] [:b 2]}" "{:a 1}"]])))
+      (is (= (shape (walk/postwalk-replace {[:a 1] [:b 2]} {:a 1})) (answer '[post ["{[:a 1] [:b 2]}" "{:a 1}"]]))))
+    (testing "a map replacement for an entry contributes its entries"
+      (is (= (shape (walk/postwalk-replace {[1 2] {:x 1 :y 2}} {1 2}))
+             (answer '[post ["{[1 2] {:x 1 :y 2}}" "{1 2}"]]))))
+    (testing "stringify-keys drops the namespace, as `name` does"
+      (is (= (shape (walk/stringify-keys {:a/b 1})) (answer '[sk ["{:a/b 1}"]])))
+      (is (= (shape {"b" 1}) (answer '[sk ["{:a/b 1}"]]))))
+    (testing "keywordize-keys keeps a slash as a namespace, as `keyword` does"
+      (is (= (shape (walk/keywordize-keys {"a/b" 1})) (answer '[kw ["{\"a/b\" 1}"]])))
+      (is (= (shape {:a/b 1}) (answer '[kw ["{\"a/b\" 1}"]]))))
+    (testing "the document depth limit is the only depth this answers, and it answers all of it"
+      (is (= (shape [[[[[[[[:x]]]]]]]])
+             (shape (read-edn (:value (first (run-full '[[post ["{1 :x}" "[[[[[[[[1]]]]]]]]"]]]))))))))))
+
+;; ---------------------------------------------------------------------------
+;; the divergences, asserted
+
+(defn- host-throws? [thunk]
+  (try (do (thunk) false)
+       (catch #?(:clj Throwable :cljs :default) _ true)))
+
+(deftest where-the-host-throws-this-traps
+  (testing "an entry replaced by a scalar: `into {}` has no meaning for it"
+    (is (host-throws? #(walk/postwalk-replace {[1 2] :pair} {1 2})))
+    (is (= {:trap :division-by-zero} (call-here '[post ["{[1 2] :pair}" "{1 2}"]]))
+        "the assert's trap -- the portable trap ABI has no message channel"))
+  (testing "an entry replaced by a one-vector: the hosts disagree with each other (the JVM throws, ClojureScript reads past the end), so this refuses"
+    (is (= {:trap :division-by-zero} (call-here '[post ["{[1 2] [3]}" "{1 2}"]])))))
+
+(deftest where-the-host-answers-something-unreadable-this-traps
+  (testing "clojure.core/keyword mints a keyword from any string; keyword-from-string refuses the ones the reader could not read back"
+    (is (= (keyword "a b") (first (keys (walk/keywordize-keys {"a b" 1})))))
+    (is (= {:trap :invalid-keyword-source} (call-here '[kw ["{\"a b\" 1}"]])))
+    (is (= {:trap :invalid-keyword-source} (call-here '[kw ["{\"\" 1}"]])))
+    (is (= {:trap :invalid-keyword-source} (call-here '[kw ["{\":a\" 1}"]])))))
+
+(deftest a-replacement-deeper-than-the-document-limit-traps
+  (testing "a container put at depth 8 makes a document of depth 9, which no document can be; the host has no such limit"
+    (is (= [[[[[[[[#{:z}]]]]]]]] (walk/prewalk-replace {1 #{:z}} [[[[[[[[1]]]]]]]])))
+    (is (= {:trap "document exceeds depth limit"}
+           (first (run-full '[[pre ["{1 #{:z}}" "[[[[[[[[1]]]]]]]]"]]]))))))
+
+(deftest a-replacement-map-that-is-not-a-map-traps
+  (testing "(contains? nil x) is false on the host, so a nil smap is the identity there; here smap is a document map or a trap"
+    (is (= {:a 1} (walk/postwalk-replace nil {:a 1})))
+    (is (= {:trap :document-map-required} (call-here '[post ["nil" "{:a 1}"]])))
+    (is (= {:trap :document-map-required} (call-here '[pre ["[1]" "{:a 1}"]])))))
+
+(deftest on-a-key-collision-the-host-depends-on-entry-order-and-this-does-not
+  ;; Two spellings of ONE map value answer differently on the host, because
+  ;; `into {}` takes the entries in the literal's order and the later wins.
+  ;; A document map has one order (its keys sorted), so this answers one
+  ;; thing for the value -- which agrees with one of the host's two answers
+  ;; and not the other. Not an approximation: the host function is not a
+  ;; function of the value here.
+  (testing "keywordize-keys"
+    (is (= {"a" 1 :a 2} {:a 2 "a" 1}))
+    (is (= {:a 2} (walk/keywordize-keys {"a" 1 :a 2})))
+    (is (= {:a 1} (walk/keywordize-keys {:a 2 "a" 1})))
+    (is (= (shape {:a 1}) (shape (read-edn (:value (call-here '[kw ["{\"a\" 1 :a 2}"]])))))))
+  (testing "postwalk-replace"
+    (is (= {:b 2} (walk/postwalk-replace {:a :b} {:a 1 :b 2})))
+    (is (= {:b 1} (walk/postwalk-replace {:a :b} {:b 2 :a 1})))
+    (is (= (shape {:b 2}) (shape (read-edn (:value (call-here '[post ["{:a :b}" "{:a 1 :b 2}"]]))))))))
+
+;; ---------------------------------------------------------------------------
+;; the contract
+
+(defn- public-names [source]
+  (set (map (comp symbol second) (re-seq #"(?m)^\(defn\s+([^\s\[]+)" source))))
+
+(deftest the-module-provides-exactly-what-the-contract-records
+  (let [contract (edn/read-string (slurp-repo-file "lang/compat.edn"))
+        entry (get-in contract [:modules :clojure.walk])]
+    (testing "the provided names are the public defns, and nothing absent is provided"
+      (is (= (:provides entry) (public-names @module)))
+      (is (empty? (set/intersection (:provides entry) (set (keys (:absent entry)))))))
+    (testing "every clojure.walk public name is either provided or absent with a reason"
+      (let [clojure-walk-names '#{walk prewalk postwalk prewalk-demo postwalk-demo
+                                  prewalk-replace postwalk-replace
+                                  keywordize-keys stringify-keys macroexpand-all}
+            recorded (set/union (:provides entry) (set (keys (:absent entry))))]
+        (is (= clojure-walk-names recorded)
+            (str "unrecorded: " (pr-str (set/difference clojure-walk-names recorded))
+                 " extra: " (pr-str (set/difference recorded clojure-walk-names))))
+        (is (every? (fn [[_ v]] (string? (:reason v))) (:absent entry)))))
+    (testing "the three function-taking names are absent for the refusal the callable ABI gives"
+      (doseq [name '[walk prewalk postwalk]]
+        (is (str/includes? (get-in entry [:absent name :reason])
+                           "callable parameter types currently require the i64 closure ABI")
+            (str name))))))
