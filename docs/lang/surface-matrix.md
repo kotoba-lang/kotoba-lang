@@ -44,6 +44,7 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 |---|---|---|---|
 | `contextual-document-literal` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `map-function` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | Do not diagnose this as lack of map literals; the implemented slice is eager and fuel-bounded. |
+| `map-indexed-function` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | Do not diagnose this as lack of index tracking; the callback receives the index as its first parameter, reusing map's admission exactly. |
 | `map-literal` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | :intentional-persistent-pair-chain-not-hamt |
 | `native-homogeneous-vectors` | `implemented-partial` | compiler-native-host | This records the homogeneous native value path. It does not claim native parity for the separate source vector literal entry, whose portable pair-chain representation remains unchanged. |
 | `persistent-collection-semantics` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
@@ -85,7 +86,7 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 | `release-integration` | `implemented-partial` |  |  |
 | `require-refer` | `implemented-partial` | compiler |  |
 | `string-predicate-typing` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | `string=?` and `string-contains?` infer `:bool`, like every other predicate, so     they compose under `and`/`or`/`not` and can be returned from a `:bool` function.     A string predicate no longer sits in an `:i64` position -- convert explicitly. |
-| `typed-closure-parameters` | `not-yet-implemented` |  |  |
+| `typed-closure-parameters` | `implemented-partial` | compiler, kir, wasm32 |  |
 | `typed-eval` | `implemented` | compiler, kir |  |
 
 ## Classification rule
