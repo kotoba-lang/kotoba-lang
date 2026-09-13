@@ -370,10 +370,14 @@ The build loads the canonical site namespaces directly; the temporary
 `.cljs` projections are no longer needed. This remains a SCI build-host
 adapter, not a Q9 migration or acceptance claim.
 
-Production belongs to the dedicated `cloud-kotoba` account
-(`62e1fda53188460698f8c66d3aef59c6`), explicitly selected in
-`site/wrangler.jsonc`. The `Kotoba Developers` group grants Workers Platform
-Admin only within that account; it does not grant access to `network-awai`.
+Production belongs to the `network-awai` account
+(`4da88288dc30d9ee257f319d3c33ecf0`), explicitly selected in
+`site/wrangler.jsonc`. The owner restored this assignment on 2026-09-13.
+The attempted `cloud-kotoba` zone migration never became active: public DNS
+continued to use `everton.ns.cloudflare.com` and `vivienne.ns.cloudflare.com`.
+Keep the `kotoba-lang-org` Worker, apex/www custom domains and Workers Builds
+in `network-awai`; an upload into another account does not update this site.
+Account group permissions are separate from the domain assignment.
 
 ### Merge-triggered Cloudflare deployment
 
