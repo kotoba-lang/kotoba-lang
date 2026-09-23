@@ -5,9 +5,12 @@
 - WBS: T5.4
 - Supersedes: `ADR-reliability-t54-max-parameters.md` (decision 1, and decision 4's
   pinned arity)
-- Implementation (merged): kotoba-gmir `cf39f7c`, kotoba-sema `bf42c45`,
+- Implementation (all on default branches, 2026-09-23): kotoba-gmir `cf39f7c`,
+  kotoba-sema `bf42c45` (frontend) + `8571681` (vendored grammar resync),
   kotoba-codegen `9a54c24`, kotoba-mir `6d92aea`, kotoba-native `85a068a`,
-  kotoba-verifier `1a3abd1`; amu pins and tests follow in its own PR
+  kotoba-verifier `1a3abd1`, kotoba-lang `f9c659e` (#704), amu `4af8c67`
+  (#1051, pins + parameter pins 6 -> 65) and `a6f1d90` (#1053, digest
+  history). Superproject west pins advanced for all nine.
 
 ## Context
 
@@ -100,6 +103,29 @@ the only thing that differed was the source roots.
      `unknown-encoding`.
    - amu h10 and corpus pins: the old 6-argument pins fail on the new code,
      because 6 arguments now compile.
+
+## Residual gaps (resume here)
+
+In priority order. None blocks the bound itself.
+
+1. **The next wall for the torihiki book is the native item budget, not
+   arity.** Seven fields of 16,384 need `KEXE_VECTOR_ITEMS=131072`; the
+   loader default is 65,536 (`tools/kexe_loader.c`
+   `KEXE_VECTOR_ITEM_CAPACITY`). Deciding that number is the next ADR, with
+   `lang/surface-status.edn` `:binds-first` as its evidence.
+2. **`tools/kexe_loader.c` still takes at most 5 entry arguments** on its
+   command line. A loader CLI limit, not the language's; raise it when a
+   host needs a wide entry.
+3. **Suites the kbb engine cannot load.** kotoba-mir `mir_test` and amu
+   `project_test` use `clojure.lang.ExceptionInfo` / `bytes?`; since the JVM
+   route was removed they are run by nothing. This change ran them on
+   scratch copies with `ExceptionInfo`; porting them is its own change.
+4. **Measurement traps, recorded so they are not re-diagnosed:** the loader
+   starts with 512 fuel (`KEXE_FUEL`; `amu compile --fuel` does not reach
+   it), and a zero-argument `main` is evaluated at compile time on a small
+   budget (a bit-or accumulator there is refused as `oracle evaluation
+   rejected` on the pre-change amu too).
+5. **wasm32-browser has no tail-call elimination** (pre-existing, unchanged).
 
 ## Related
 
