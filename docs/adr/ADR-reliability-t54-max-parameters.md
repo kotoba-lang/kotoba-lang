@@ -1,6 +1,7 @@
 # ADR: Reliability T5.4 — keep max-parameters = 5 (records for multi-field)
 
-- Status: Accepted
+- Status: Superseded by `ADR-reliability-t54b-max-parameters-64.md` (2026-09-23:
+  the bound is 64; native calls pass arguments past the fifth on the stack)
 - Date: 2026-07-28
 - WBS: T5.4
 
