@@ -19,6 +19,35 @@ Homebrew 6 requires the explicit `brew trust` step. Release artifacts and the
 checksum-verifying alternative installer are maintained at
 https://github.com/kotoba-lang/kotoba/releases.
 
+### 1b. Worktree-local install (no Homebrew, no package manager)
+
+For a sandboxed or unattended agent run that may write only inside its own
+worktree and may not install packages: the release archive is one static
+executable (`kotoba`) plus `LICENSE` and `README.md`, with no runtime
+dependency. Download it next to your program, verify the digest, and call it
+by path.
+
+```sh
+mkdir -p .kotoba-toolchain
+ASSET=kotoba-darwin-arm64       # or kotoba-darwin-amd64, kotoba-linux-amd64
+curl -fsSL -o .kotoba-toolchain/$ASSET.tar.gz \
+  https://github.com/kotoba-lang/kotoba/releases/latest/download/$ASSET.tar.gz
+curl -fsSL -o .kotoba-toolchain/$ASSET.tar.gz.sha256 \
+  https://github.com/kotoba-lang/kotoba/releases/latest/download/$ASSET.tar.gz.sha256
+(cd .kotoba-toolchain && shasum -a 256 -c $ASSET.tar.gz.sha256)
+tar -xzf .kotoba-toolchain/$ASSET.tar.gz -C .kotoba-toolchain
+.kotoba-toolchain/kotoba selfhost check --json
+```
+
+The `.sha256` file is `<hex digest>  <file name>` (two spaces), the shape
+`shasum -c` / `sha256sum -c` read. Add `.kotoba-toolchain/` to `.gitignore`;
+the archive is about 42 MB and is not source. Use `.kotoba-toolchain/kotoba`
+wherever the steps below say `kotoba`. Measured 2026-09-17 on macOS arm64 with
+v0.7.3 and an environment reduced to `PATH`, `LANG`, a private `HOME` and
+`TMPDIR`: steps 2–5 below all passed. If your environment has no network from
+the shell (some sandboxes), this download is the step that fails; do not
+report the later steps as passed.
+
 ## 2. Check the compiler seed
 
 ```sh
@@ -79,7 +108,7 @@ language profile without checking that release record.
 
 ## Next: trusted state and service discovery
 
-- Kotobase graph CLI, authentication and MCP: https://kotobase.net/agent-quickstart.md
+- Graph & Ontology database (workspace → agent token → Biscuit → transact → query): https://graph.kotoba.cloud/agent-quickstart.md
 - Kotoba Cloud capabilities and signed packages: https://kotoba.cloud/agent-quickstart.md
 - Machine documentation index: https://kotoba-lang.org/llms.txt
 
