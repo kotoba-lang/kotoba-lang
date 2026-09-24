@@ -119,12 +119,85 @@
        ;; not the compiler refusing; keep status, signal and the head of what
        ;; came back so a whole-run nil (measured 2026-09-11: 181/181 nil while
        ;; the entry path was wrong) cannot pass as a histogram.
+       ;; The module the refusal came from: the project route reports the
+       ;; first module in the link closure that fails, so the same wall is
+       ;; counted once per importer; :by-source folds it back to its origin.
+       :source (second (re-find #":source \"([^\"]+)\"" out))
        :message (or (second (re-find #":message \"([^\"]{0,120})" out))
                     (str "UNCLASSIFIED status=" (.-status r) " signal=" (.-signal r) " "
                          (subs (str/replace out #"\s+" " ") 0 (min 400 (count out)))))})))
 
 (defn- histogram [rows k]
   (->> rows (remove :ok) (map k) frequencies (sort-by val >) (into [])))
+
+;; ---------------------------------------------------------------------------
+;; Reachability: which sources the compiler's own entry points pull in.
+;;
+;; adr-2609242330 §4: the selfhost target is the closure of amu's
+;; `kotoba.compiler.nbb.*_cli` entry points, not the whole classpath (security's
+;; JVM tools, kotoba-component's composition/doctor and amu's ipld_adl are on
+;; the classpath but are not the compiler). The scoreboard is therefore split
+;; into :reachable and :unreachable; the classpath-wide totals stay as they
+;; were so history is comparable.
+;;
+;; LIMITATION (stated in the output as well): the walk follows only the
+;; `(:require ...)` entries the Kotoba reader sees -- feature `:kotoba`, else
+;; `:default`. A require that lives only inside `#?(:clj ...)` / `#?(:cljs ...)`,
+;; a string require (`["node:fs" ...]`), and a module started as a separate
+;; script (e.g. `nbb/classpath.cljk` spawned by the CLI) are NOT followed, so
+;; the closure is a lower bound of what the compiler runs.
+;;
+;; Deterministic: entries are the sorted list of `src/kotoba/compiler/nbb/*_cli.cljk`
+;; under the amu checkout; a namespace defined by several source files (`.cljc`
+;; and `.cljk` twins, `.clj.cljk` halves) reaches all of them; the result is sorted.
+
+(def ^:private entry-glob "<amu>/src/kotoba/compiler/nbb/*_cli.cljk")
+
+(defn- entry-files []
+  (let [dir (path/join amu-root "src/kotoba/compiler/nbb")]
+    (->> (fs/readdirSync dir) (map str)
+         (filter #(str/ends-with? % "_cli.cljk"))
+         sort
+         (mapv #(path/join dir %)))))
+
+(defn- ns-and-requires
+  "[ns-symbol #{required ns symbols}] of SOURCE as the Kotoba reader sees it,
+  or nil when the file does not read or has no ns form."
+  [source]
+  (try
+    (let [forms (kr/read-forms source)
+          nsf (first (filter #(and (seq? %) (= 'ns (first %))) forms))]
+      (when nsf
+        [(second nsf)
+         (->> (rest nsf)
+              (filter seq?)
+              (filter #(= :require (first %)))
+              (mapcat rest)
+              (keep (fn [spec] (let [n (if (vector? spec) (first spec) spec)]
+                                 (when (symbol? n) n))))
+              set)]))
+    (catch :default _ nil)))
+
+(defn- reachable-set
+  "Set of source files reachable from ENTRIES through Kotoba-visible requires."
+  [sources entries]
+  (let [info (into {} (map (fn [f] [f (ns-and-requires (fs/readFileSync f "utf8"))]) sources))
+        by-ns (reduce (fn [m [f [n _]]] (if n (update m n (fnil conj []) f) m)) {} info)]
+    (loop [seen #{} todo (vec (sort entries))]
+      (if (empty? todo)
+        seen
+        (let [f (peek todo) todo (pop todo)]
+          (if (seen f)
+            (recur seen todo)
+            (recur (conj seen f)
+                   (into todo (sort (mapcat by-ns (second (get info f))))))))))))
+
+(defn- gate-summary [rows]
+  {:passed (count (filter :ok rows))
+   :refused (count (remove :ok rows))
+   :by-reason (histogram rows :reason)
+   :by-message (->> rows (remove :ok) (map :message) frequencies (sort-by val >) (take 25) (into []))
+   :by-source (->> rows (remove :ok) (keep :source) frequencies (sort-by val >) (take 25) (into []))})
 
 (let [cp-entries (classpath)
       cp-str (str/join ":" (conj cp-entries (path/join amu-root "src")))
@@ -138,11 +211,19 @@
                        (conj (path/join amu-root "src"))
                        (conj compat-root))
       project-checks (mapv (fn [f] (assoc (check-gate cp-str f source-roots) :file f)) sources)
+      entries (entry-files)
+      reach (reachable-set sources entries)
+      _ (println "reachable from" (count entries) "entries:" (count reach) "/" (count sources))
+      amu-rel #(str/replace % (path/resolve amu-root) "<amu>")
       census (reduce (fn [acc [k re]]
                        (assoc acc k (count (filterv (fn [f] (re-find (re-pattern re) (fs/readFileSync f "utf8")))
                                                     sources))))
                      {} dispatch-forms)
-      result {:kotoba.lang.selfhost/version 1
+      result {:kotoba.lang.selfhost/version 2
+              ;; v2 (2026-09-24, adr-2609242330 S0): adds :reachability,
+              ;; :reachable and :unreachable (the project-check gate split by the
+              ;; entry closure) and :source per refusal. Every v1 key is kept with
+              ;; its v1 meaning, so the classpath-wide totals stay comparable.
               :measured-at (subs (.toISOString (js/Date.)) 0 10)
               :plane :authored-input
               :question "Can the Kotoba compiler read, link and admit its own SOURCE TEXT?"
@@ -182,7 +263,25 @@
                                    :refused (count (remove :ok project-checks))
                                    :by-reason (histogram project-checks :reason)
                                    :by-message (->> project-checks (remove :ok) (map :message) frequencies (sort-by val >) (take 25) (into []))
-                                   :passed-files (->> project-checks (filter :ok) (map #(str/replace (:file %) amu-root "<amu>")) sort vec)}
+                                   :passed-files (->> project-checks (filter :ok) (map (comp amu-rel :file)) sort vec)}
+              :reachability {:entries-glob entry-glob
+                             :entries (mapv amu-rel entries)
+                             :follows "(:require ...) symbols the Kotoba reader sees (feature :kotoba, else :default)"
+                             :limitation ["Requires only inside #?(:clj ...) or #?(:cljs ...) are not followed."
+                                          "String requires (host modules) are not followed."
+                                          "Modules started as separate scripts (e.g. nbb/classpath.cljk spawned by the CLI) are not followed."
+                                          "The closure is therefore a lower bound of what the compiler runs."]
+                             :reachable-count (count reach)
+                             :unreachable-count (- (count sources) (count reach))}
+              :reachable (let [rows (filterv #(reach (:file %)) project-checks)]
+                           (assoc (gate-summary rows)
+                                  :route :project-check-gate
+                                  :source-count (count rows)
+                                  :files (->> rows (map (comp amu-rel :file)) sort vec)))
+              :unreachable (let [rows (filterv #(not (reach (:file %))) project-checks)]
+                             (assoc (gate-summary rows)
+                                    :route :project-check-gate
+                                    :source-count (count rows)))
               :dispatch-census census
               :not-established
               ["A file that reads is not a file that compiles."
@@ -191,4 +290,7 @@
   (fs/writeFileSync output (with-out-str (cljs.pprint/pprint result)))
   (println "read gate  :" (:passed (:read-gate result)) "/" (count sources))
   (println "check gate :" (:passed (:check-gate result)) "/" (count sources))
+  (println "project    :" (:passed (:project-check-gate result)) "/" (count sources)
+           " reachable" (:passed (:reachable result)) "/" (:source-count (:reachable result))
+           " unreachable" (:passed (:unreachable result)) "/" (:source-count (:unreachable result)))
   (println "wrote" output))
