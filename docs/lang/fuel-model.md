@@ -17,9 +17,9 @@ It prevents unbounded recursion / loops from hanging a host. Fuel is
 
 | Property | Value |
 |---|---|
-| Default initial budget | **512** units |
+| Default initial budget | **512** units (reference, ESM, cljs, Wasm); **not metered** by default on the native kexe profile since P4 of adr-2609242100 — see `lang/limits.edn` `:profile/native` |
 | Replenishable? | **No** (default profile) |
-| Exhaustion trap | `:fuel-exhausted` (fail closed) |
+| Exhaustion trap | `:budget/fuel` (fail closed; was `:fuel-exhausted` before P4 of adr-2609242100). Fuel is one of four profile budgets — fuel, cells, bytes, frames — whose units, traps and per-profile defaults live in `lang/limits.edn` |
 | Max declared budget (wasm) | \(2^{62}-1\) (`kotoba.wasm/max-fuel`) |
 | Max declared budget (native) | \(2^{53}-1\) (`kotoba.kir/max-fuel`) — see §8 |
 
@@ -33,7 +33,7 @@ It prevents unbounded recursion / loops from hanging a host. Fuel is
 |---|---|---|
 | **KIR** (`kotoba.kir`) | `charge!` in `invoke-function` decrements a volatile counter | 512 |
 | **wasm32-kotoba-v1** | Module-private `mut i64` global; prologue `global.get` / `eqz` → `unreachable` / `sub` | 512 baked into global init |
-| **js-kotoba-v1** | `kotoba$fuel` atom; charge helper throws `fuel-exhausted` | 512 |
+| **js-kotoba-v1** | `kotoba$fuel` atom; charge helper throws `budget/fuel` | 512 |
 
 Evidence comments in tree:
 
