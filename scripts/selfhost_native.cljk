@@ -1,0 +1,472 @@
+;; selfhost_native.cljk -- stages 2 and 3 of the selfhost distance
+;; (superproject adr-2609242330 / adr-2609251400).
+;;
+;; `measure-selfhost-distance.cljk` measures stage 1: does `amu check` admit a
+;; module on the project route. That count can rise while nothing it admits
+;; has ever run as native code, so this namespace adds the two stages after it,
+;; for every module that passed stage 1:
+;;
+;;   stage 2  :native-compile       the module compiles as a native LIBRARY
+;;            (`bin/amu compile <file> --source-path ... --unpinned --policy
+;;            <grant> --target aarch64|x86_64`), and `bin/amu extract-native
+;;            <kexe> --symbol <export>` -- which runs the kotoba-verifier over
+;;            the artifact -- answers for every export. A refusal is recorded
+;;            with the code and message amu printed.
+;;   stage 3  :native-differential  for every export of a stage-2 module, inputs
+;;            generated from the declared Kotoba parameter types (boundary
+;;            values plus seeded random ones) run through the native code
+;;            (`tools/kexe_loader.c`) and through the same function on the host
+;;            (nbb, the module's `#?(:cljs ...)` reading), and the answers are
+;;            compared. A function whose types the loader cannot carry is
+;;            `:not-drivable` with the type named; that is not a pass.
+;;
+;; Every per-module row carries a :status that is one of :ok / :refused /
+;; :could-not-run / :not-drivable / :mismatch / :skipped -- the harness failing
+;; to run and the compiler refusing are different answers, and neither is a
+;; pass (AGENTS.md, the 8 questions: 2 and 4).
+;;
+;; Host: nbb (node:fs / node:child_process), for the same reason the stage-1
+;; script is -- it drives amu and cc as subprocesses, and the fs / process
+;; capability kits are not qualified on a native backend yet.
+
+(ns selfhost-native
+  (:require ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            ["node:child_process" :as cp]
+            [cljs.reader :as reader]
+            [kotoba.lang.text :as str]))
+
+(def isas [:aarch64 :x86_64])
+
+;; ---------------------------------------------------------------------------
+;; subprocess
+
+(defn- run [cmd args & [opts]]
+  (let [r (cp/spawnSync cmd (clj->js args)
+                        (clj->js (merge {:encoding "utf8" :maxBuffer (* 64 1024 1024)} opts)))]
+    {:status (.-status r)
+     :signal (.-signal r)
+     :error (when (.-error r) (str (.-message (.-error r))))
+     :out (str (.-stdout r))
+     :err (str (.-stderr r))}))
+
+(defn- head [s n] (let [s (str/replace (str s) #"\s+" " ")] (subs s 0 (min n (count s)))))
+
+(defn- diagnostic
+  "The code and message amu printed for a refusal, or nil when the output
+  carries none (then the harness could not read an answer)."
+  [text]
+  (let [code (or (second (re-find #":code (:[^,}\s]+)" text))
+                 (second (re-find #":error (:[^,}\s]+)" text)))
+        message (second (re-find #":message \"((?:[^\"\\\\]|\\\\.){0,600})" text))]
+    (when code {:code code :message (or message "")})))
+
+;; ---------------------------------------------------------------------------
+;; stage 2 -- native compile + verifier
+
+(defn- read-edn-file [p] (reader/read-string (fs/readFileSync p "utf8")))
+
+(defn- kexe-exports
+  "[{:name sym :param-types [...] :result t :offset n :arity n}] for every
+  export of the artifact, types from the artifact's own :program."
+  [kexe]
+  (let [m (read-edn-file kexe)
+        fns (into {} (map (fn [f] [(:name f) f]) (:functions (:program m))))]
+    (->> (:exports m)
+         (map (fn [[sym e]]
+                (let [f (get fns sym)]
+                  {:name (str sym)
+                   :param-types (vec (:param-types f))
+                   :result (:result f)
+                   :arity (:arity e)})))
+         (sort-by :name)
+         vec)))
+
+;; A symbol name as a file-name segment (`bigint?` -> `bigint_q`).
+(defn- file-safe [s]
+  (-> s (str/replace "?" "_q") (str/replace "!" "_b") (str/replace #"[^A-Za-z0-9_.-]" "_")))
+
+(defn compile-native
+  "Stage 2 for one module on one ISA."
+  [{:keys [amu-root source-roots grant work]} file isa tag]
+  (let [kexe (path/join work (str tag "-" (name isa) ".kexe"))
+        amu (path/join amu-root "bin" "amu")
+        r (run js/process.execPath
+               (concat [amu "compile" file]
+                       (mapcat (fn [d] ["--source-path" d]) source-roots)
+                       ["--unpinned" "--policy" grant "--target" (name isa) "--output" kexe])
+               {:cwd amu-root})
+        text (str (:out r) (:err r))]
+    (cond
+      (and (zero? (:status r)) (fs/existsSync kexe))
+      (let [exports (kexe-exports kexe)
+            verify (mapv (fn [{ename :name}]
+                           (let [bin (path/join work (str tag "-" (file-safe ename) "-" (name isa) ".bin"))
+                                 v (run js/process.execPath
+                                        [amu "extract-native" kexe "--symbol" ename "--output" bin]
+                                        {:cwd amu-root})
+                                 vt (str (:out v) (:err v))]
+                             (if (and (zero? (:status v)) (fs/existsSync bin))
+                               (let [offset (second (re-find #":offset (\d+)" (:out v)))]
+                                 {:export ename :status :ok :bin bin :offset offset})
+                               (if-let [d (diagnostic vt)]
+                                 (assoc d :export ename :status :refused :phase :extract-native)
+                                 {:export ename :status :could-not-run :phase :extract-native
+                                  :detail (str "status=" (:status v) " " (head vt 300))}))))
+                         exports)
+            bad (remove #(= :ok (:status %)) verify)]
+        {:isa isa
+         :status (cond (empty? exports) :refused
+                       (some #(= :could-not-run (:status %)) bad) :could-not-run
+                       (seq bad) :refused
+                       :else :ok)
+         :code (when (empty? exports) ":harness/no-exports")
+         :message (when (empty? exports) "the artifact exports nothing; a library with no export has no function stage 3 can drive")
+         :kexe kexe
+         :exports exports
+         :verify verify})
+
+      (diagnostic text)
+      (merge {:isa isa :status :refused :phase :compile} (diagnostic text))
+
+      :else
+      {:isa isa :status :could-not-run :phase :compile
+       :detail (str "status=" (:status r) " signal=" (:signal r) " " (:error r) " " (head text 400))})))
+
+;; ---------------------------------------------------------------------------
+;; stage 3 -- input generation
+
+;; Deterministic xorshift32 over Numbers; the seed is recorded in the output.
+(defn- next-u32 [x]
+  (let [x (bit-xor x (bit-shift-left x 13))
+        x (bit-xor x (unsigned-bit-shift-right x 17))
+        x (bit-xor x (bit-shift-left x 5))]
+    (unsigned-bit-shift-right x 0)))
+
+(defn- rng-seq [seed] (rest (iterate next-u32 (unsigned-bit-shift-right seed 0))))
+
+(def i64-boundary
+  ["0" "1" "-1" "2" "255" "256" "-256" "4294967296" "9007199254740991"
+   "-9007199254740991" "9007199254740992" "9223372036854775807" "-9223372036854775808"])
+
+(def string-boundary
+  ["" "0" "12" "-7" "+7" " 12 " "1e3" "abc" "007" "9007199254740993"
+   "-9223372036854775808" "a/b/../c" "/" "é" "日本語" "\n"])
+
+(defn- random-i64 [a b small?]
+  (if small?
+    (str (- (mod a 2001) 1000))
+    (str (js/BigInt.asIntN 64 (+ (* (js/BigInt a) (js/BigInt 4294967296)) (js/BigInt b))))))
+
+(def ^:private alphabets
+  ["0123456789" "abcdefghijklmnopqrstuvwxyz0123456789-_./ " "0123456789-+ ."])
+
+(defn- random-string [ws]
+  (let [[a b & more] ws
+        n (mod a 12)
+        kind (mod b 4)]
+    (apply str
+           (map (fn [w]
+                  (if (= kind 3)
+                    ;; a BMP code point outside the surrogate block
+                    (let [cp (+ 32 (mod w 55000))] (js/String.fromCodePoint cp))
+                    (let [alpha (nth alphabets kind)] (nth alpha (mod w (count alpha))))))
+                (take n more)))))
+
+(def supported-param #{:i64 :string :bool [:option :i64]})
+(def supported-result #{:i64 :string :bool [:option :i64]})
+
+(defn- generator
+  "fn of (index, words) -> a typed value, or nil when TYPE cannot be generated
+  and carried by the loader."
+  [t]
+  (case t
+    :i64 (fn [i [a b c]] (if (< i (count i64-boundary))
+                          [:i64 (nth i64-boundary i)]
+                          [:i64 (random-i64 a b (even? c))]))
+    :string (fn [i ws] (if (< i (count string-boundary))
+                         [:string (nth string-boundary i)]
+                         [:string (random-string ws)]))
+    :bool (fn [i [a]] [:bool (if (< i 2) (zero? i) (odd? a))])
+    (if (= t [:option :i64])
+      (fn [i [a b c]] (if (or (zero? i) (zero? (mod a 3)))
+                        [:option nil]
+                        [:option (if (< i (count i64-boundary)) (nth i64-boundary i) (random-i64 a b (even? c)))]))
+      nil)))
+
+(defn drivability
+  "nil when the export can be driven through the loader, else the reason."
+  [{:keys [param-types result arity]}]
+  (let [bad-params (vec (remove supported-param param-types))]
+    (cond
+      (> arity 5) (str "arity " arity " exceeds the loader's 5 i64 argument slots")
+      (seq bad-params) (str "parameter type(s) " (pr-str bad-params)
+                            " have no kexe_loader argument encoding (it carries i64, s:<utf8 hex>, o:none/o:some:<i64>, e:ok/err:<i64>, r:<i64,...>, v:... and g: regions)")
+      (not (supported-result result)) (str "result type " (pr-str result)
+                                           " has no KEXE_RESULT_TYPE decoding the harness can compare (loader decodes i64, string, option-i64, result-i64, record:<n> of i64 words, variant)")
+      :else nil)))
+
+(defn cases
+  "Deterministic argument vectors for an export: first one per boundary index
+  (parameter k walks the boundary lists at phase 5k), then N-RANDOM seeded
+  random ones."
+  [{:keys [param-types]} seed n-random]
+  (let [n-boundary (max (count i64-boundary) (count string-boundary))
+        words (partition 16 (rng-seq (+ seed (count param-types))))]
+    (vec (for [i (range (+ n-boundary n-random))
+               :let [ws (nth words i)]]
+           (vec (map-indexed (fn [k t]
+                               ((generator t)
+                                (if (< i n-boundary) (mod (+ i (* 5 k)) n-boundary) (+ 1000 i))
+                                (drop (* 4 k) ws)))
+                             param-types))))))
+
+;; ---------------------------------------------------------------------------
+;; stage 3 -- native side
+
+(defn- utf8-hex [s] (.toString (js/Buffer.from s "utf8") "hex"))
+
+(defn- loader-arg [[kind v]]
+  (case kind
+    :i64 v
+    :string (str "s:" (utf8-hex v))
+    :bool (if v "1" "0")
+    :option (if (nil? v) "o:none" (str "o:some:" v))))
+
+(defn- result-type-env [t]
+  (cond (= t :string) "string" (= t [:option :i64]) "option-i64" :else "i64"))
+
+(defn build-loader
+  "Compile tools/kexe_loader.c for ISA into WORK. x86_64 on an arm64 host is
+  built with -arch x86_64 and runs under Rosetta 2."
+  [amu-root work isa]
+  (let [out (path/join work (str "kexe-loader-" (name isa)))
+        arch-flag (case isa :aarch64 ["-arch" "arm64"] :x86_64 ["-arch" "x86_64"])
+        r (run "cc" (concat ["-std=c11" "-O2"] arch-flag
+                            [(path/join amu-root "tools" "kexe_loader.c") "-o" out]))]
+    (if (and (zero? (:status r)) (fs/existsSync out))
+      {:ok true :path out}
+      {:ok false :detail (head (str (:err r) (:error r)) 400)})))
+
+(defn- native-outcome [loader bin offset isa result-t args]
+  (let [r (run loader (concat [bin offset (str (count args)) (name isa) "-"] (map loader-arg args))
+               ;; process.env is not a plain object: js->clj leaves it as is.
+               {:env (js/Object.assign #js {} js/process.env
+                                       #js {"KEXE_STRUCTURED_REPORT" "1"
+                                            "KEXE_RESULT_TYPE" (result-type-env result-t)})})
+        line (last (filter #(str/starts-with? % "{:status") (str/split-lines (:out r))))
+        ;; The i64 words are taken as TEXT: an EDN reader answers a Number
+        ;; and rounds anything past 2^53 (measured here 2026-09-26: the first
+        ;; run reported 9223372036854775807 as ...776000, a mismatch the
+        ;; native code never made).
+        word (fn [k] (when line (second (re-find (re-pattern (str k " (-?\\d+)")) line))))
+        status (when line (second (re-find #":status (:[a-z-]+)" line)))]
+    (cond
+      (nil? status) {:could-not-run (str "loader status=" (:status r) " " (head (str (:out r) (:err r)) 200))}
+      (= ":trap" status) {:refused (str "trap " (head (:err r) 160))}
+      (= result-t :string) {:ok [:string (second (re-find #":result-utf8-hex \"([0-9a-f]*)\"" line))]}
+      (= result-t :bool) {:ok [:bool (not= "0" (word ":result"))]}
+      (= result-t [:option :i64]) {:ok (if (re-find #":result-tag true" line) [:int (word ":result-word")] [:nil])}
+      :else {:ok [:int (word ":result")]})))
+
+;; ---------------------------------------------------------------------------
+;; stage 3 -- host side (one nbb process per module)
+
+(defn- host-literal [[kind v]]
+  (case kind
+    :i64 (let [n (js/BigInt v)]
+           ;; An i64 on the host is what host_integer/narrow-below-max-safe
+           ;; answers: a Number when it is a safe integer, else a BigInt.
+           (if (and (<= n (js/BigInt 9007199254740991)) (>= n (js/BigInt -9007199254740991)))
+             v
+             (str "(js/BigInt " (pr-str v) ")")))
+    :string (pr-str v)
+    :bool (str v)
+    :option (if (nil? v) "nil" (host-literal [:i64 v]))))
+
+(def ^:private driver-prelude
+  "(defn- norm* [v]
+  (cond (nil? v) [:nil]
+        (boolean? v) [:bool v]
+        (string? v) [:string (.toString (js/Buffer.from v \"utf8\") \"hex\")]
+        (and (some? v) (identical? (type v) js/BigInt)) [:int (str v)]
+        (and (number? v) (js/Number.isInteger v)) [:int (str v)]
+        :else [:other (subs (pr-str v) 0 (min 200 (count (pr-str v))))]))
+(defn- run* [f args]
+  (try {:ok (norm* (apply f args))}
+       (catch :default e {:threw (subs (str (.-message e)) 0 (min 160 (count (str (.-message e)))))})))
+")
+
+(defn host-outcomes
+  "{export-name [outcome ...]} computed by the host reading of NS, or
+  {:could-not-run detail}."
+  [{:keys [amu-root cp-str work]} ns-sym tag calls]
+  (let [driver (path/join work (str tag "-host-driver.cljs"))
+        src (str "(ns selfhost-native-host-driver (:require [" ns-sym " :as m]))\n"
+                 driver-prelude
+                 "(println \"HOST-OUTCOMES\")\n(prn {"
+                 (str/join "\n "
+                           (map (fn [[fname arg-vecs]]
+                                  (str (pr-str fname) " ["
+                                       (str/join " " (map (fn [args] (str "(run* m/" fname " [" (str/join " " (map host-literal args)) "])"))
+                                                          arg-vecs))
+                                       "]"))
+                                calls))
+                 "})\n")
+        _ (fs/writeFileSync driver src)
+        r (run js/process.execPath
+               ["--stack-size=4096" (path/join amu-root "node_modules" "nbb" "cli.js")
+                "--classpath" cp-str driver]
+               {:cwd amu-root})
+        lines (str/split-lines (:out r))
+        idx (.indexOf (into-array lines) "HOST-OUTCOMES")]
+    (if (and (zero? (:status r)) (>= idx 0) (< (inc idx) (count lines)))
+      (try (reader/read-string (nth lines (inc idx)))
+           (catch :default e {:could-not-run (str "host outcome unreadable: " (.-message e))}))
+      {:could-not-run (str "host driver status=" (:status r) " " (head (str (:err r) (:out r)) 400))})))
+
+;; ---------------------------------------------------------------------------
+;; stage 3 -- comparison
+
+(defn- agree? [native host]
+  (cond
+    (:could-not-run native) :could-not-run
+    (and (:refused native) (:threw host)) :both-refused
+    (or (:refused native) (:threw host)) :mismatch
+    (= (:ok native) (:ok host)) :agree
+    :else :mismatch))
+
+(defn- verdict-counts [verdicts]
+  (merge {:agree 0 :both-refused 0 :mismatch 0 :could-not-run 0} (frequencies verdicts)))
+
+(defn- display [args] (mapv (fn [[k v]] (if (= k :string) (pr-str v) (str v))) args))
+
+(defn differential
+  "Stage 3 for one module whose stage 2 passed on ISAS-OK."
+  [ctx file ns-sym tag stage2 {:keys [seed n-random loaders]}]
+  (let [exports (:exports (first (filter #(= :ok (:status %)) stage2)))
+        drivable (for [e exports :let [why (drivability e)]] (assoc e :not-drivable why))
+        driven (remove :not-drivable drivable)
+        case-map (into {} (map (fn [e] [(:name e) (cases e seed n-random)]) driven))
+        host (if (seq driven) (host-outcomes ctx ns-sym tag case-map) {})
+        per-isa
+        (vec
+         (for [row stage2 :when (= :ok (:status row))
+               :let [isa (:isa row)
+                     loader (get loaders isa)]]
+           {:isa isa
+            :execution (if (and (= isa :x86_64) (= "arm64" js/process.arch)) :rosetta-2 :native)
+            :functions
+            (vec
+             (for [e drivable
+                   :let [nm (:name e)]]
+               (cond
+                 (:not-drivable e) {:export nm :status :not-drivable :reason (:not-drivable e)
+                                    :param-types (:param-types e) :result (:result e)}
+                 (not (:ok loader)) {:export nm :status :could-not-run :reason (str "loader build failed: " (:detail loader))}
+                 (:could-not-run host) {:export nm :status :could-not-run :reason (:could-not-run host)}
+                 :else
+                 (let [v (first (filter #(= nm (:export %)) (:verify row)))
+                       args-list (get case-map nm)
+                       host-rs (get host nm)
+                       native-rs (mapv #(native-outcome (:path loader) (:bin v) (:offset v) isa (:result e) %) args-list)
+                       verdicts (mapv agree? native-rs host-rs)
+                       counts (verdict-counts verdicts)
+                       first-bad (first (keep-indexed (fn [i vd] (when (#{:mismatch :could-not-run} vd)
+                                                                   {:args (display (nth args-list i))
+                                                                    :native (nth native-rs i)
+                                                                    :host (nth host-rs i)}))
+                                                      verdicts))]
+                   {:export nm
+                    :param-types (:param-types e) :result (:result e)
+                    :cases (count verdicts)
+                    :counts counts
+                    :status (cond (not= (count host-rs) (count args-list)) :could-not-run
+                                  (pos? (:could-not-run counts)) :could-not-run
+                                  (pos? (:mismatch counts)) :mismatch
+                                  (zero? (count verdicts)) :could-not-run
+                                  :else :ok)
+                    :first-counterexample first-bad}))))}))]
+    per-isa))
+
+(defn- module-status [statuses]
+  (cond (empty? statuses) :skipped
+        (every? #{:ok} statuses) :ok
+        (some #{:could-not-run} statuses) :could-not-run
+        (some #{:mismatch} statuses) :mismatch
+        (some #{:refused} statuses) :refused
+        :else :not-drivable))
+
+(defn ns-of-file [file]
+  (let [src (fs/readFileSync file "utf8")]
+    (second (re-find #"\(ns\s+([^\s()]+)" src))))
+
+(defn measure
+  "Stages 2 and 3 for FILES (stage-1 passes). REACHABLE? says which are in the
+  entry closure; LABEL maps a file to its printed label. Returns
+  {:native-compile .. :native-differential .. :top-line ..}."
+  [{:keys [amu-root work label reachable? substitute seed n-random] :as ctx} files]
+  (fs/mkdirSync work #js {:recursive true})
+  (let [loaders (into {} (map (fn [isa] [isa (build-loader amu-root work isa)]) isas))
+        rows
+        (vec
+         (map-indexed
+          (fn [i file]
+            (let [compiled-from (get substitute file file)
+                  tag (str "m" i)
+                  ns-sym (ns-of-file file)
+                  s2 (mapv #(compile-native ctx compiled-from % tag) isas)
+                  s2-status (module-status (map :status s2))
+                  s3 (when (= :ok s2-status)
+                       (differential ctx file ns-sym tag s2 {:seed seed :n-random n-random :loaders loaders}))
+                  fn-statuses (mapcat #(map :status (:functions %)) s3)
+                  s3-status (if (= :ok s2-status) (module-status fn-statuses) :skipped)]
+              (println "  stage2" (name s2-status) "stage3" (name s3-status) (label file))
+              {:file (label file)
+               :compiled-from (when (not= compiled-from file) compiled-from)
+               :ns ns-sym
+               :reachable (boolean (reachable? file))
+               :stage2 {:status s2-status
+                        :per-isa (mapv (fn [r] (-> r
+                                                   (dissoc :kexe :exports)
+                                                   (assoc :export-count (count (:exports r)))
+                                                   (update :verify (fn [vs] (mapv #(dissoc % :bin) vs)))))
+                                       s2)}
+               :stage3 {:status s3-status
+                        :skipped-because (when (= :skipped s3-status) "stage 2 did not pass on both ISAs")
+                        :per-isa s3}}))
+          files))
+        count-by (fn [k st rs] (count (filter #(= st (get-in % [k :status])) rs)))
+        summary (fn [rs]
+                  {:modules (count rs)
+                   :stage2 (into {} (map (fn [st] [st (count-by :stage2 st rs)]) [:ok :refused :could-not-run]))
+                   :stage3 (into {} (map (fn [st] [st (count-by :stage3 st rs)]) [:ok :mismatch :not-drivable :could-not-run :skipped]))
+                   :stage2-by-code (->> rs (mapcat #(get-in % [:stage2 :per-isa]))
+                                        (remove #(= :ok (:status %)))
+                                        (map #(or (:code %) (name (:status %)))) frequencies (sort-by val >) vec)})
+        reach (filterv :reachable rows)
+        unreach (filterv (complement :reachable) rows)]
+    {:native-compile
+     {:route "bin/amu compile <file> --source-path <every src root> --source-path lang/compat --unpinned --policy <grant> --target <isa>; then bin/amu extract-native <kexe> --symbol <export> (runs the kotoba-verifier)"
+      :isas isas
+      :pass-rule "compile answers exit 0 on BOTH isas, the artifact exports at least one function, and extract-native (verifier) answers for every export"
+      :loaders (into {} (map (fn [[k v]] [k (if (:ok v) :built (:detail v))]) loaders))
+      :modules (mapv #(select-keys % [:file :compiled-from :ns :reachable :stage2]) rows)
+      :reachable (summary reach)
+      :unreachable (summary unreach)}
+     :native-differential
+     {:route "tools/kexe_loader.c (cc -std=c11 -O2 -arch <isa>) with KEXE_STRUCTURED_REPORT=1 KEXE_RESULT_TYPE=<t> vs. the module's host (nbb) reading called with the same inputs"
+      :seed seed
+      :cases-per-function (+ (max (count i64-boundary) (count string-boundary)) n-random)
+      :generated-types (vec supported-param)
+      :host-i64-representation "a Number when |x| <= 2^53-1, else a BigInt (what host_integer/narrow-below-max-safe answers)"
+      :agreement "equal normalised values, or both sides refusing (native trap / host throw); anything else is a mismatch"
+      :pass-rule "every export drivable, and on every stage-2 isa every case agrees"
+      :x86_64-execution (if (= "arm64" js/process.arch) :rosetta-2 :native)
+      :modules (mapv #(select-keys % [:file :ns :reachable :stage3]) rows)
+      :reachable (summary reach)
+      :unreachable (summary unreach)}
+     :scanned (count rows)}))
+
+(defn tmp-work [] (fs/mkdtempSync (path/join (os/tmpdir) "selfhost-native-")))
