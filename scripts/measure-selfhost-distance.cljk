@@ -64,6 +64,34 @@
                              " -- pass --compat <kotoba-lang>/lang/compat"))))
     root))
 
+;; The capability grant the compiler holds when it runs (adr-2609242330 S5):
+;; a module that names an ability -- `(env/read ...)`, `(io/write ...)` -- is
+;; checked with the authority the compiler actually has, so its refusal on
+;; the scoreboard is a language wall and not "the measurement granted
+;; nothing". Default: lang/selfhost-compiler-grant.edn beside the compat root.
+(def ^:private grant-path
+  (let [p (path/resolve (or (opt "--grant") (path/join compat-root ".." "selfhost-compiler-grant.edn")))]
+    (when-not (fs/existsSync p)
+      (throw (js/Error. (str "grant policy is not a file: " p
+                             " -- pass --grant <kotoba-lang>/lang/selfhost-compiler-grant.edn"))))
+    p))
+
+;; NAMED EXCEPTION, not a silent skip (adr-2609242330 S5, section 1 (c)).
+;; amu's nbb mechanism layer -- the Node handlers of the compiler's
+;; abilities, and loading / event loop / exit -- is the one place a host
+;; module is required by string, and by design it is never Kotoba source:
+;; compiler modules require it only under #?(:cljs ...), and under Kotoba the
+;; same calls elaborate to typed-cap-call whose handler the target profile
+;; supplies. Its files are listed in the output under :excluded with this
+;; reason and are not counted as passed or refused.
+(def ^:private mechanism-layer
+  {:dir "src/kotoba/compiler/nbb/host"
+   :reason "nbb/Node handlers of the compiler's abilities and the entry mechanism (adr-2609242330 S5, section 1 (c)); required only under #?(:cljs ...), never compiled as Kotoba"})
+
+(defn- mechanism-layer? [file]
+  (str/starts-with? (path/resolve file)
+                    (str (path/resolve (path/join amu-root (:dir mechanism-layer))) "/")))
+
 (defn- classpath []
   (let [r (cp/spawnSync js/process.execPath
                         (clj->js [nbb-cli "--classpath" (path/join amu-root "src")
@@ -105,7 +133,8 @@
   project route is what turns it into the real next refusal."
   [cp-str file & [source-roots]]
   (let [r (cp/spawnSync js/process.execPath
-                        (clj->js (concat ["--stack-size=4096" nbb-cli "--classpath" cp-str entry "check" file]
+                        (clj->js (concat ["--stack-size=4096" nbb-cli "--classpath" cp-str entry "check" file
+                                          "--policy" grant-path]
                                          (mapcat (fn [d] ["--source-path" d]) source-roots)))
                         #js {:encoding "utf8" :maxBuffer (* 32 1024 1024)})
         out (str (.-stdout r) (.-stderr r))]
@@ -119,6 +148,13 @@
        ;; not the compiler refusing; keep status, signal and the head of what
        ;; came back so a whole-run nil (measured 2026-09-11: 181/181 nil while
        ;; the entry path was wrong) cannot pass as a histogram.
+       ;; The module the refusal came from: the project route reports the
+       ;; first module in the link closure that fails, so the same wall is
+       ;; counted once per importer; :by-source folds it back to its origin.
+       ;; That fold holds only where amu attributes the refusal; for a
+       ;; module-header refusal it did not until 2026-09-25 (see
+       ;; :by-refusing-module).
+       :source (second (re-find #":source \"([^\"]+)\"" out))
        :message (or (second (re-find #":message \"([^\"]{0,120})" out))
                     (str "UNCLASSIFIED status=" (.-status r) " signal=" (.-signal r) " "
                          (subs (str/replace out #"\s+" " ") 0 (min 400 (count out)))))})))
@@ -126,23 +162,129 @@
 (defn- histogram [rows k]
   (->> rows (remove :ok) (map k) frequencies (sort-by val >) (into [])))
 
+;; ---------------------------------------------------------------------------
+;; Reachability: which sources the compiler's own entry points pull in.
+;;
+;; adr-2609242330 §4: the selfhost target is the closure of amu's
+;; `kotoba.compiler.nbb.*_cli` entry points, not the whole classpath (security's
+;; JVM tools, kotoba-component's composition/doctor and amu's ipld_adl are on
+;; the classpath but are not the compiler). The scoreboard is therefore split
+;; into :reachable and :unreachable; the classpath-wide totals stay as they
+;; were so history is comparable.
+;;
+;; LIMITATION (stated in the output as well): the walk follows only the
+;; `(:require ...)` entries the Kotoba reader sees -- feature `:kotoba`, else
+;; `:default`. A require that lives only inside `#?(:clj ...)` / `#?(:cljs ...)`,
+;; a string require (`["node:fs" ...]`), and a module started as a separate
+;; script (e.g. `nbb/classpath.cljk` spawned by the CLI) are NOT followed, so
+;; the closure is a lower bound of what the compiler runs.
+;;
+;; Deterministic: entries are the sorted list of `src/kotoba/compiler/nbb/*_cli.cljk`
+;; under the amu checkout; a namespace defined by several source files (`.cljc`
+;; and `.cljk` twins, `.clj.cljk` halves) reaches all of them; the result is sorted.
+
+(def ^:private entry-glob "<amu>/src/kotoba/compiler/nbb/*_cli.cljk")
+
+(defn- entry-files []
+  (let [dir (path/join amu-root "src/kotoba/compiler/nbb")]
+    (->> (fs/readdirSync dir) (map str)
+         (filter #(str/ends-with? % "_cli.cljk"))
+         sort
+         (mapv #(path/join dir %)))))
+
+(defn- ns-and-requires
+  "[ns-symbol #{required ns symbols}] of SOURCE as the Kotoba reader sees it,
+  or nil when the file does not read or has no ns form."
+  [source]
+  (try
+    (let [forms (kr/read-forms source)
+          nsf (first (filter #(and (seq? %) (= 'ns (first %))) forms))]
+      (when nsf
+        [(second nsf)
+         (->> (rest nsf)
+              (filter seq?)
+              (filter #(= :require (first %)))
+              (mapcat rest)
+              (keep (fn [spec] (let [n (if (vector? spec) (first spec) spec)]
+                                 (when (symbol? n) n))))
+              set)]))
+    (catch :default _ nil)))
+
+(defn- reachable-set
+  "Set of source files reachable from ENTRIES through Kotoba-visible requires."
+  [sources entries]
+  (let [info (into {} (map (fn [f] [f (ns-and-requires (fs/readFileSync f "utf8"))]) sources))
+        by-ns (reduce (fn [m [f [n _]]] (if n (update m n (fnil conj []) f) m)) {} info)]
+    (loop [seen #{} todo (vec (sort entries))]
+      (if (empty? todo)
+        seen
+        (let [f (peek todo) todo (pop todo)]
+          (if (seen f)
+            (recur seen todo)
+            (recur (conj seen f)
+                   (into todo (sort (mapcat by-ns (second (get info f))))))))))))
+
+(defn- gate-summary [rows]
+  {:passed (count (filter :ok rows))
+   :refused (count (remove :ok rows))
+   :by-reason (histogram rows :reason)
+   :by-message (->> rows (remove :ok) (map :message) frequencies (sort-by val >) (take 25) (into []))
+   :by-source (->> rows (remove :ok) (keep :source) frequencies (sort-by val >) (take 25) (into []))
+   ;; Two views of one wall (adr-2609242330 S5, 2026-09-25). :rows is the
+   ;; per-importer count -- every checked file whose closure hits the wall,
+   ;; the number :by-message has always carried, so history stays comparable.
+   ;; :modules is the per-refusing-module view: the distinct `:source` labels
+   ;; (file basenames) amu attributed the refusal to. Before amu attributed a
+   ;; module HEADER refusal (a string host import, a malformed :require) to
+   ;; that module, `:source` named the ROOT file, so :modules equalled the
+   ;; importers; from the amu commit that attributes it, :modules names the
+   ;; module that actually refused. A basename can name two files (io.cljk);
+   ;; the label is what the CLI prints.
+   :by-refusing-module (->> rows (remove :ok) (group-by :message)
+                            (map (fn [[m rs]] [m {:rows (count rs)
+                                                  :modules (->> rs (keep :source) distinct sort vec)}]))
+                            (sort-by (fn [[_ v]] (- (:rows v))))
+                            ;; Every wall, not the top 25: a wall that falls
+                            ;; to one or two rows must stay visible.
+                            (into []))
+   :passed-files (->> rows (filter :ok) (map :file) sort vec)})
+
 (let [cp-entries (classpath)
       cp-str (str/join ":" (conj cp-entries (path/join amu-root "src")))
-      sources (->> (conj (filterv #(str/ends-with? % "/src") cp-entries)
-                         (path/join amu-root "src"))
-                   (mapcat cljc-under) sort vec)
-      _ (println "sources:" (count sources))
+      all-sources (->> (conj (filterv #(str/ends-with? % "/src") cp-entries)
+                             (path/join amu-root "src"))
+                       (mapcat cljc-under) sort vec)
+      excluded (filterv mechanism-layer? all-sources)
+      sources (filterv (complement mechanism-layer?) all-sources)
+      _ (println "sources:" (count sources) "excluded (mechanism layer):" (count excluded))
       reads (mapv (fn [f] (assoc (read-gate (fs/readFileSync f "utf8")) :file f)) sources)
       checks (mapv (fn [f] (assoc (check-gate cp-str f) :file f)) sources)
       source-roots (-> (filterv #(str/ends-with? % "/src") cp-entries)
                        (conj (path/join amu-root "src"))
                        (conj compat-root))
       project-checks (mapv (fn [f] (assoc (check-gate cp-str f source-roots) :file f)) sources)
+      entries (entry-files)
+      reach (reachable-set sources entries)
+      _ (println "reachable from" (count entries) "entries:" (count reach) "/" (count sources))
+      amu-rel #(str/replace % (path/resolve amu-root) "<amu>")
       census (reduce (fn [acc [k re]]
                        (assoc acc k (count (filterv (fn [f] (re-find (re-pattern re) (fs/readFileSync f "utf8")))
                                                     sources))))
                      {} dispatch-forms)
-      result {:kotoba.lang.selfhost/version 1
+      result {:kotoba.lang.selfhost/version 2
+              ;; v2 additions (2026-09-25, adr-2609242330 S5): :grant (the
+              ;; policy both check routes pass) and :excluded (the named
+              ;; mechanism-layer exception); :reachable / :unreachable carry
+              ;; :passed-files.
+              :grant {:path (str/replace grant-path (path/resolve compat-root ".." "..") "<kotoba-lang>")
+                      :text (fs/readFileSync grant-path "utf8")}
+              :excluded {:mechanism-layer (assoc mechanism-layer
+                                                 :files (mapv amu-rel excluded)
+                                                 :count (count excluded))}
+              ;; v2 (2026-09-24, adr-2609242330 S0): adds :reachability,
+              ;; :reachable and :unreachable (the project-check gate split by the
+              ;; entry closure) and :source per refusal. Every v1 key is kept with
+              ;; its v1 meaning, so the classpath-wide totals stay comparable.
               :measured-at (subs (.toISOString (js/Date.)) 0 10)
               :plane :authored-input
               :question "Can the Kotoba compiler read, link and admit its own SOURCE TEXT?"
@@ -182,7 +324,25 @@
                                    :refused (count (remove :ok project-checks))
                                    :by-reason (histogram project-checks :reason)
                                    :by-message (->> project-checks (remove :ok) (map :message) frequencies (sort-by val >) (take 25) (into []))
-                                   :passed-files (->> project-checks (filter :ok) (map #(str/replace (:file %) amu-root "<amu>")) sort vec)}
+                                   :passed-files (->> project-checks (filter :ok) (map (comp amu-rel :file)) sort vec)}
+              :reachability {:entries-glob entry-glob
+                             :entries (mapv amu-rel entries)
+                             :follows "(:require ...) symbols the Kotoba reader sees (feature :kotoba, else :default)"
+                             :limitation ["Requires only inside #?(:clj ...) or #?(:cljs ...) are not followed."
+                                          "String requires (host modules) are not followed."
+                                          "Modules started as separate scripts (e.g. nbb/classpath.cljk spawned by the CLI) are not followed."
+                                          "The closure is therefore a lower bound of what the compiler runs."]
+                             :reachable-count (count reach)
+                             :unreachable-count (- (count sources) (count reach))}
+              :reachable (let [rows (filterv #(reach (:file %)) project-checks)]
+                           (assoc (update (gate-summary rows) :passed-files #(mapv amu-rel %))
+                                  :route :project-check-gate
+                                  :source-count (count rows)
+                                  :files (->> rows (map (comp amu-rel :file)) sort vec)))
+              :unreachable (let [rows (filterv #(not (reach (:file %))) project-checks)]
+                             (assoc (update (gate-summary rows) :passed-files #(mapv amu-rel %))
+                                    :route :project-check-gate
+                                    :source-count (count rows)))
               :dispatch-census census
               :not-established
               ["A file that reads is not a file that compiles."
@@ -191,4 +351,7 @@
   (fs/writeFileSync output (with-out-str (cljs.pprint/pprint result)))
   (println "read gate  :" (:passed (:read-gate result)) "/" (count sources))
   (println "check gate :" (:passed (:check-gate result)) "/" (count sources))
+  (println "project    :" (:passed (:project-check-gate result)) "/" (count sources)
+           " reachable" (:passed (:reachable result)) "/" (:source-count (:reachable result))
+           " unreachable" (:passed (:unreachable result)) "/" (:source-count (:unreachable result)))
   (println "wrote" output))

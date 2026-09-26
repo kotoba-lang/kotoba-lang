@@ -72,6 +72,7 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 | `multi-collection-map` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `named-multi-arity-functions` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `native-binary32-arithmetic` | `implemented-partial` | compiler, kotoba-kir |  |
+| `native-host-text-operations` | `implemented-partial` | compiler-native-host | Native-only. A backend without the context-ABI host slot refuses the head by name; no portable lowering is claimed. |
 | `nested-destructuring` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | Source and intermediate collection expressions are each evaluated exactly once. |
 | `ns-attr-map-declarations` | `implemented-partial` | compiler |  |
 | `option-flow` | `implemented-partial` | compiler, kir, kotoba-cljs, restricted-esm, wasm32 |  |
