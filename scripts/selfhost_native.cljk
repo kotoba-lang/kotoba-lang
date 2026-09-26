@@ -174,8 +174,23 @@
                     (let [alpha (nth alphabets kind)] (nth alpha (mod w (count alpha))))))
                 (take n more)))))
 
-(def supported-param #{:i64 :string :bool [:option :i64]})
-(def supported-result #{:i64 :string :bool [:option :i64]})
+(def vector-boundary
+  [[] ["0"] ["1" "-1"] ["255" "256" "-256"] ["9007199254740991" "-9007199254740991"]
+   ["9223372036854775807" "-9223372036854775808" "0"] ["4294967296"]])
+
+(def bytes-boundary
+  [[] [0] [255] [0 255 128] [97 98 99] [227 129 130] [10] [1 2 3 4 5 6 7 8]])
+
+;; Since 2026-09-26 the loader's export boundary codec builds :vector-i64,
+;; :bytes and [:option :string] arguments from typed wire tokens and decodes
+;; those results (amu tools/kexe_loader_boundary.kotoba, superproject
+;; adr-2609242330); every call declares its parameter kinds (KEXE_ARG_TYPES).
+(def supported-param #{:i64 :string :bool [:option :i64] :vector-i64 :bytes [:option :string]})
+(def supported-result #{:i64 :string :bool [:option :i64] :vector-i64 :bytes [:option :string]})
+
+(def ^:private kind-names
+  {:i64 "i64" :string "string" :bool "bool" [:option :i64] "option-i64"
+   :vector-i64 "vector-i64" :bytes "bytes" [:option :string] "option-string"})
 
 (defn- generator
   "fn of (index, words) -> a typed value, or nil when TYPE cannot be generated
@@ -189,11 +204,27 @@
                          [:string (nth string-boundary i)]
                          [:string (random-string ws)]))
     :bool (fn [i [a]] [:bool (if (< i 2) (zero? i) (odd? a))])
-    (if (= t [:option :i64])
+    :vector-i64 (fn [i [a b & more]]
+                  (if (< i (count vector-boundary))
+                    [:vector (nth vector-boundary i)]
+                    [:vector (vec (map-indexed (fn [k w] (random-i64 w (+ w k) (not= 0 (mod b 5))))
+                                               (take (mod a 9) more)))]))
+    :bytes (fn [i [a & more]]
+             (if (< i (count bytes-boundary))
+               [:bytes (nth bytes-boundary i)]
+               [:bytes (vec (map #(mod % 256) (take (mod a 17) more)))]))
+    (cond
+      (= t [:option :i64])
       (fn [i [a b c]] (if (or (zero? i) (zero? (mod a 3)))
                         [:option nil]
                         [:option (if (< i (count i64-boundary)) (nth i64-boundary i) (random-i64 a b (even? c)))]))
-      nil)))
+      (= t [:option :string])
+      (fn [i [a & ws]] (if (or (zero? i) (zero? (mod a 3)))
+                         [:option-string nil]
+                         [:option-string (if (< i (count string-boundary))
+                                           (nth string-boundary i)
+                                           (random-string ws))]))
+      :else nil)))
 
 (defn drivability
   "nil when the export can be driven through the loader, else the reason."
@@ -202,9 +233,9 @@
     (cond
       (> arity 5) (str "arity " arity " exceeds the loader's 5 i64 argument slots")
       (seq bad-params) (str "parameter type(s) " (pr-str bad-params)
-                            " have no kexe_loader argument encoding (it carries i64, s:<utf8 hex>, o:none/o:some:<i64>, e:ok/err:<i64>, r:<i64,...>, v:... and g: regions)")
+                            " have no kexe_loader argument encoding the harness generates (it carries i64, bool, s:<utf8 hex>, o:none/o:some:<i64>, o:some:s:<utf8 hex>, vi:<i64,...>, b:<hex>, e:ok/err:<i64>, r:<i64,...>, v:... and g: regions)")
       (not (supported-result result)) (str "result type " (pr-str result)
-                                           " has no KEXE_RESULT_TYPE decoding the harness can compare (loader decodes i64, string, option-i64, result-i64, record:<n> of i64 words, variant)")
+                                           " has no KEXE_RESULT_TYPE decoding the harness can compare (loader decodes i64, string, option-i64, option-string, vector-i64, bytes, result-i64, record:<n> of i64 words, variant)")
       :else nil)))
 
 (defn cases
@@ -227,15 +258,24 @@
 
 (defn- utf8-hex [s] (.toString (js/Buffer.from s "utf8") "hex"))
 
+(defn- bytes-hex [items] (apply str (map #(.padStart (.toString % 16) 2 "0") items)))
+
 (defn- loader-arg [[kind v]]
   (case kind
     :i64 v
     :string (str "s:" (utf8-hex v))
     :bool (if v "1" "0")
-    :option (if (nil? v) "o:none" (str "o:some:" v))))
+    :option (if (nil? v) "o:none" (str "o:some:" v))
+    :option-string (if (nil? v) "o:none" (str "o:some:s:" (utf8-hex v)))
+    :vector (str "vi:" (str/join "," v))
+    :bytes (str "b:" (bytes-hex v))))
 
 (defn- result-type-env [t]
-  (cond (= t :string) "string" (= t [:option :i64]) "option-i64" :else "i64"))
+  (cond (= t :string) "string" (= t [:option :i64]) "option-i64"
+        (= t [:option :string]) "option-string" (= t :vector-i64) "vector-i64"
+        (= t :bytes) "bytes" :else "i64"))
+
+(defn- arg-types-env [param-types] (str/join "," (map kind-names param-types)))
 
 (defn build-loader
   "Compile tools/kexe_loader.c for ISA into WORK. x86_64 on an arm64 host is
@@ -249,11 +289,12 @@
       {:ok true :path out}
       {:ok false :detail (head (str (:err r) (:error r)) 400)})))
 
-(defn- native-outcome [loader bin offset isa result-t args]
+(defn- native-outcome [loader bin offset isa param-types result-t args]
   (let [r (run loader (concat [bin offset (str (count args)) (name isa) "-"] (map loader-arg args))
                ;; process.env is not a plain object: js->clj leaves it as is.
                {:env (js/Object.assign #js {} js/process.env
                                        #js {"KEXE_STRUCTURED_REPORT" "1"
+                                            "KEXE_ARG_TYPES" (arg-types-env param-types)
                                             "KEXE_RESULT_TYPE" (result-type-env result-t)})})
         line (last (filter #(str/starts-with? % "{:status") (str/split-lines (:out r))))
         ;; The i64 words are taken as TEXT: an EDN reader answers a Number
@@ -265,7 +306,17 @@
     (cond
       (nil? status) {:could-not-run (str "loader status=" (:status r) " " (head (str (:out r) (:err r)) 200))}
       (= ":trap" status) {:refused (str "trap " (head (:err r) 160))}
+      ;; A boundary refusal is the harness's input being refused, not the
+      ;; module's answer: it is reported, never counted as agreement.
+      (= ":refused" status) {:could-not-run (str "boundary refused the input: " (head line 160))}
       (= result-t :string) {:ok [:string (second (re-find #":result-utf8-hex \"([0-9a-f]*)\"" line))]}
+      (= result-t [:option :string]) {:ok (if (re-find #":result-tag true" line)
+                                            [:string (second (re-find #":result-utf8-hex \"([0-9a-f]*)\"" line))]
+                                            [:nil])}
+      ;; Items as TEXT, for the same 2^53 reason as the words above.
+      (= result-t :vector-i64) {:ok [:vector (let [inner (second (re-find #":result-items \[([-0-9 ]*)\]" line))]
+                                               (if (str/blank? inner) [] (str/split inner #" ")))]}
+      (= result-t :bytes) {:ok [:bytes (second (re-find #":result-hex \"([0-9a-f]*)\"" line))]}
       (= result-t :bool) {:ok [:bool (not= "0" (word ":result"))]}
       (= result-t [:option :i64]) {:ok (if (re-find #":result-tag true" line) [:int (word ":result-word")] [:nil])}
       :else {:ok [:int (word ":result")]})))
@@ -283,7 +334,11 @@
              (str "(js/BigInt " (pr-str v) ")")))
     :string (pr-str v)
     :bool (str v)
-    :option (if (nil? v) "nil" (host-literal [:i64 v]))))
+    :option (if (nil? v) "nil" (host-literal [:i64 v]))
+    :option-string (if (nil? v) "nil" (pr-str v))
+    :vector (str "[" (str/join " " (map #(host-literal [:i64 %]) v)) "]")
+    ;; A host :bytes is a Buffer (text_bytes' :cljs reading builds one).
+    :bytes (str "(js/Buffer.from (clj->js [" (str/join " " v) "]))")))
 
 (def ^:private driver-prelude
   "(defn- norm* [v]
@@ -292,6 +347,9 @@
         (string? v) [:string (.toString (js/Buffer.from v \"utf8\") \"hex\")]
         (and (some? v) (identical? (type v) js/BigInt)) [:int (str v)]
         (and (number? v) (js/Number.isInteger v)) [:int (str v)]
+        (instance? js/Uint8Array v) [:bytes (.toString (js/Buffer.from v) \"hex\")]
+        (and (sequential? v) (every? #(or (and (number? %) (js/Number.isInteger %)) (identical? (type %) js/BigInt)) v))
+        [:vector (mapv str v)]
         :else [:other (subs (pr-str v) 0 (min 200 (count (pr-str v))))]))
 (defn- run* [f args]
   (try {:ok (norm* (apply f args))}
@@ -340,7 +398,7 @@
 (defn- verdict-counts [verdicts]
   (merge {:agree 0 :both-refused 0 :mismatch 0 :could-not-run 0} (frequencies verdicts)))
 
-(defn- display [args] (mapv (fn [[k v]] (if (= k :string) (pr-str v) (str v))) args))
+(defn- display [args] (mapv (fn [[k v]] (if (#{:i64 :bool :option} k) (str v) (pr-str v))) args))
 
 (defn differential
   "Stage 3 for one module whose stage 2 passed on ISAS-OK."
@@ -370,7 +428,7 @@
                  (let [v (first (filter #(= nm (:export %)) (:verify row)))
                        args-list (get case-map nm)
                        host-rs (get host nm)
-                       native-rs (mapv #(native-outcome (:path loader) (:bin v) (:offset v) isa (:result e) %) args-list)
+                       native-rs (mapv #(native-outcome (:path loader) (:bin v) (:offset v) isa (:param-types e) (:result e) %) args-list)
                        verdicts (mapv agree? native-rs host-rs)
                        counts (verdict-counts verdicts)
                        first-bad (first (keep-indexed (fn [i vd] (when (#{:mismatch :could-not-run} vd)
