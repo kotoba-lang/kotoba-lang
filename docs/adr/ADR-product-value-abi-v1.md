@@ -30,7 +30,7 @@ Admitted and proven for product path:
 - `if-some` / `when-some` with **typed option locals** (any `[:option T]`)
 - `match-option` with explicit type
 - `string-length` (= UTF-8 byte length; same unit as `string-substring`)
-- `string-from-i64` (signed decimal; desugars to wasm-safe helpers)
+- `string-from-i64` (signed decimal; desugars to existing helpers (reuse, not a wasm32 requirement))
 - `string-concat` / `string=?` / dynamic `string-substring`
 - `string-byte-length` (canonical name; `string-length` is alias)
 

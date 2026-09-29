@@ -278,7 +278,7 @@ Do **not** parallelize “new sugar” with “conformance SSoT” on the same b
 |---|---|---|
 | Conformance case + both backends | Yes | pure-product profile; no ambient; PR tests |
 | Error code plumbing | Yes | stable error code table |
-| Stdlib op | Yes | desugar to existing wasm-safe ops preferred |
+| Stdlib op | Yes | reuse existing ops where that is simpler; wasm32 is not a condition (ADR-language-semantics-are-target-independent) |
 | Record pilot (rebalance) | Yes with design note | T5.1 ADR; no new pack public API |
 | Standalone wasmtime path | Senior / multi-repo | T6.1 scope lock |
 | Signed network/secret | Senior + security | T8.1 checklist; no fake reference-impl |

@@ -1,5 +1,16 @@
 # Agent rules
 
+## Language semantics are target-independent
+
+- wasm32 is one build target of the Amu native compiler, not the definition of
+  Kotoba. Do not cap, narrow or defer a language or stdlib feature because
+  wasm32 cannot lower it yet: specify the semantics against the KIR
+  interpreter, and let each target lower the feature or refuse it by name
+  (exit 65, recorded in `lang/surface-status.edn`).
+- Keep a limit only if it bounds a resource or protects an invariant.
+- Never relaxes the safety pipeline, fail-closed behaviour or the no-JVM rules.
+  Decision: `docs/adr/ADR-language-semantics-are-target-independent.md`.
+
 ## Q9 source migration is whole-component and JVM-free
 
 The machine authority is `lang/q9-migration.edn`; the accepted decision is
