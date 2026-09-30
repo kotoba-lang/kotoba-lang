@@ -1,0 +1,889 @@
+;; kotoba.compiler.kotoba-reader -- the GUEST-ROUTE twin of kotoba-sema's
+;; `kotoba/compiler/kotoba_reader.cljk`, the purpose-built reader for the
+;; admission-gated `.kotoba` grammar.
+;;
+;; WHY A TWIN AND NOT #?(:kotoba ...) BRANCHES. The host reader is written in
+;; host values: it returns Clojure lists, vectors, maps, symbols, keywords and
+;; JS BigInt/Long, attaches source spans as metadata (`with-meta`), raises with
+;; `ex-info`, sorts map keys with `sorted-map-by` over `pr-str`, and classifies
+;; tokens with nine regexes. None of that has a Kotoba spelling, and the result
+;; type itself is the wall: a Kotoba function cannot return "a Clojure form".
+;; So the guest route gets a module of the SAME NAME with a different, typed
+;; contract, exactly as `kotoba.lang.text` and `kotoba.edn` do.
+;;
+;; THE CONTRACT
+;;   (read-forms source)                       -> :kotoba.reader/out
+;;   (read-forms-bounded source max-depth max-token-bytes)
+;;                                             -> :kotoba.reader/out
+;; `:kotoba.reader/out` is [forms [:list :form/r]] [err :string] [at :i64].
+;; ERR is "" on success; otherwise it is the reader's message and AT the byte
+;; offset it stopped at (the host raises `ex-info` with `{:phase :read}`; a
+;; Kotoba function has no raise that a caller can see, and a trap has no
+;; message channel). A max of 0 means unlimited, as nil does on the host.
+;; Forms are the recursive `:form/r` record of kotoba.form (tags: 0 nil, 1
+;; bool, 2 int, 3 string, 4 keyword, 5 symbol, 6 list, 7 vector, 8 set, 9 map;
+;; a map's kids are k v k v ...). Nothing is regex-driven: tokens are
+;; classified by one code-point scan each.
+;;
+;; WHERE THIS DIFFERS FROM THE HOST READER, ON PURPOSE
+;;   * No source spans. `:form/r` has no metadata slot, so no line, column or
+;;     end-offset travels with a form. Positions are byte offsets, not UTF-16
+;;     units (they agree on ASCII).
+;;   * `^meta form` reads as the list `(kotoba.reader/meta META FORM)` with
+;;     META normalized as the host normalizes it ({:kw true}, {:tag sym},
+;;     the map itself). Metadata that silently vanished would make
+;;     `^:private` compile as public; a tagged wrapper is refused by name if a
+;;     consumer does not understand it. The same rule as `#"..."`, `#js` and
+;;     `\c`, which read as `(kotoba.reader/regex "..")` / `(.../js form)` /
+;;     `(.../char "c")`.
+;;   * A decimal literal reads as `(f64-from-bits N)` as on the host, but the
+;;     `:kotoba.reader/f64-literal` marker is metadata and cannot be carried.
+;;     The value comes from the `decimal-f64-parse` builtin, so it is refused
+;;     (`f64 literal outside the sealed decimal subset`) where that builtin
+;;     answers none: more than 3 exponent digits, more than 64 bytes, or a
+;;     non-finite result. The host reads 1e999 as Infinity.
+;;   * An integer outside i64 reads as `(kotoba.reader/bigint "digits")`, the
+;;     tagged form the host already uses for `123N`. Hex past 64 bits is
+;;     refused (the host promotes to BigInt).
+;;   * Map literals keep source order (the host sorts entries by `pr-str`).
+;;     Sets keep source order and are never refused for size.
+;;   * `\uXXXX` in a string is one BMP code point; a surrogate escape
+;;     (D800-DFFF) is refused, the host keeps a lone UTF-16 unit.
+;;   * The 10000-top-level-form and 8 MiB source limits belong to the
+;;     frontend's `read-forms` wrapper, not this module.
+;;
+;; The host behaviour of the .cljk is untouched: nbb and the JVM never see
+;; this file (extension priority across source roots picks the `.kotoba` twin
+;; only on the project route).
+
+(ns kotoba.compiler.kotoba-reader
+  (:export [read-forms read-forms-bounded])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                       [:kids [:list [:ref :form/r]]]]]
+             :kotoba.reader/rd [:record :kotoba.reader/rd
+                                [[:form [:ref :form/r]]
+                                 [:forms [:list [:ref :form/r]]]
+                                 [:pos :i64]
+                                 [:kind :i64]
+                                 [:err :string]]]
+             :kotoba.reader/c [:record :kotoba.reader/c
+                               [[:s :string] [:n :i64] [:md :i64] [:mt :i64]]]
+             :kotoba.reader/out [:record :kotoba.reader/out
+                                 [[:forms [:list [:ref :form/r]]]
+                                  [:err :string]
+                                  [:at :i64]]]}))
+
+;; ---------------------------------------------------------------------------
+;; forms (kotoba.form's constructors, restated: a module that needs three of
+;; them should not need the whole library on its source path)
+
+(defn- no-forms [] [:list [:ref :form/r]]
+  (typed-list-new [:list [:ref :form/r]]))
+
+(defn- one-form [a [:ref :form/r]] [:list [:ref :form/r]]
+  (typed-list-new [:list [:ref :form/r]] a))
+
+(defn- two-forms [a [:ref :form/r] b [:ref :form/r]] [:list [:ref :form/r]]
+  (typed-list-new [:list [:ref :form/r]] a b))
+
+(defn- three-forms [a [:ref :form/r] b [:ref :form/r] c [:ref :form/r]] [:list [:ref :form/r]]
+  (typed-list-new [:list [:ref :form/r]] a b c))
+
+(defn- conj-form [xs [:list [:ref :form/r]] x [:ref :form/r]] [:list [:ref :form/r]]
+  (typed-list-conj [:list [:ref :form/r]] xs x))
+
+(defn- mk [t :i64 s :string n :i64 k :keyword kids [:list [:ref :form/r]]] [:ref :form/r]
+  (record-new [:ref :form/r] t s n k kids))
+
+(defn- nil-form [] [:ref :form/r] (mk 0 "" 0 :none (no-forms)))
+(defn- bool-form [b :bool] [:ref :form/r] (mk 1 "" (if b 1 0) :none (no-forms)))
+(defn- int-form [n :i64] [:ref :form/r] (mk 2 "" n :none (no-forms)))
+(defn- string-form [s :string] [:ref :form/r] (mk 3 s 0 :none (no-forms)))
+(defn- keyword-form [k :keyword tok :string] [:ref :form/r] (mk 4 tok 0 k (no-forms)))
+(defn- symbol-form [s :string] [:ref :form/r] (mk 5 s 0 :none (no-forms)))
+(defn- seq-form [kids [:list [:ref :form/r]]] [:ref :form/r] (mk 6 "" 0 :none kids))
+(defn- vec-form [kids [:list [:ref :form/r]]] [:ref :form/r] (mk 7 "" 0 :none kids))
+(defn- set-form [kids [:list [:ref :form/r]]] [:ref :form/r] (mk 8 "" 0 :none kids))
+(defn- map-form [kids [:list [:ref :form/r]]] [:ref :form/r] (mk 9 "" 0 :none kids))
+
+(defn- tag-of [f [:ref :form/r]] :i64 (record-get [:ref :form/r] f :tag))
+(defn- kids-of [f [:ref :form/r]] [:list [:ref :form/r]] (record-get [:ref :form/r] f :kids))
+(defn- sym-of [f [:ref :form/r]] :string (record-get [:ref :form/r] f :s))
+(defn- kw-of [f [:ref :form/r]] :keyword (record-get [:ref :form/r] f :k))
+
+(defn- kid [xs [:list [:ref :form/r]] i :i64] [:ref :form/r]
+  (typed-list-nth [:list [:ref :form/r]] xs i))
+
+(defn- append-all [acc [:list [:ref :form/r]] xs [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (let [n (vector-count xs)]
+    (loop [i 0 out acc]
+      (if (>= i n)
+        out
+        (recur (+ i 1) (conj-form out (kid xs i)))))))
+
+;; (NAME arg) with NAME a symbol: the tagged shape host-only literals read as.
+(defn- tagged [name :string arg [:ref :form/r]] [:ref :form/r]
+  (seq-form (two-forms (symbol-form name) arg)))
+
+;; ---------------------------------------------------------------------------
+;; source context and read results
+
+(defn- cs [c [:ref :kotoba.reader/c]] :string (record-get [:ref :kotoba.reader/c] c :s))
+(defn- cn [c [:ref :kotoba.reader/c]] :i64 (record-get [:ref :kotoba.reader/c] c :n))
+(defn- cmd [c [:ref :kotoba.reader/c]] :i64 (record-get [:ref :kotoba.reader/c] c :md))
+(defn- cmt [c [:ref :kotoba.reader/c]] :i64 (record-get [:ref :kotoba.reader/c] c :mt))
+
+;; kind: 0 a form, 1 nothing (a discarded or unmatched form), 2 a splice of
+;; `forms`, 3 an error `err`.
+(defn- rd [form [:ref :form/r] forms [:list [:ref :form/r]] pos :i64 kind :i64 err :string]
+  [:ref :kotoba.reader/rd]
+  (record-new [:ref :kotoba.reader/rd] form forms pos kind err))
+
+(defn- rd-form [r [:ref :kotoba.reader/rd]] [:ref :form/r] (record-get [:ref :kotoba.reader/rd] r :form))
+(defn- rd-forms [r [:ref :kotoba.reader/rd]] [:list [:ref :form/r]] (record-get [:ref :kotoba.reader/rd] r :forms))
+(defn- rd-pos [r [:ref :kotoba.reader/rd]] :i64 (record-get [:ref :kotoba.reader/rd] r :pos))
+(defn- rd-kind [r [:ref :kotoba.reader/rd]] :i64 (record-get [:ref :kotoba.reader/rd] r :kind))
+(defn- rd-err [r [:ref :kotoba.reader/rd]] :string (record-get [:ref :kotoba.reader/rd] r :err))
+
+(defn- ok [form [:ref :form/r] pos :i64] [:ref :kotoba.reader/rd]
+  (rd form (no-forms) pos 0 ""))
+
+(defn- skipped [pos :i64] [:ref :kotoba.reader/rd]
+  (rd (nil-form) (no-forms) pos 1 ""))
+
+(defn- spliced [forms [:list [:ref :form/r]] pos :i64] [:ref :kotoba.reader/rd]
+  (rd (nil-form) forms pos 2 ""))
+
+(defn- items [forms [:list [:ref :form/r]] pos :i64] [:ref :kotoba.reader/rd]
+  (rd (nil-form) forms pos 0 ""))
+
+(defn- fail [msg :string pos :i64] [:ref :kotoba.reader/rd]
+  (rd (nil-form) (no-forms) pos 3 msg))
+
+(defn- failed? [r [:ref :kotoba.reader/rd]] :bool (= 3 (rd-kind r)))
+
+;; ---------------------------------------------------------------------------
+;; bytes and code points (offsets stay on code-point boundaries:
+;; `string-code-point-at` REFUSES an interior byte)
+
+(defn- code-point-width [point :i64] :i64
+  (if (< point 128)
+    1
+    (if (< point 2048)
+      2
+      (if (< point 65536) 3 4))))
+
+(defn- point-at [s :string i :i64 n :i64] :i64
+  (if (< i n) (string-code-point-at s i) -1))
+
+(defn- digit? [p :i64] :bool (and (>= p 48) (<= p 57)))
+(defn- sign? [p :i64] :bool (or (= p 43) (= p 45)))
+
+(defn- hex-digit-value [p :i64] :i64
+  (cond
+    (and (>= p 48) (<= p 57)) (- p 48)
+    (and (>= p 97) (<= p 102)) (+ 10 (- p 97))
+    (and (>= p 65) (<= p 70)) (+ 10 (- p 65))
+    :else -1))
+
+(defn- alnum? [p :i64] :bool
+  (or (digit? p) (and (>= p 97) (<= p 122)) (and (>= p 65) (<= p 90))))
+
+;; `,` is whitespace, as in EDN.
+(defn- whitespace? [p :i64] :bool
+  (or (= p 32) (= p 9) (= p 10) (= p 13) (= p 44)))
+
+;; ( ) [ ] { } " ; -- and the end of input.
+(defn- delimiter? [p :i64] :bool
+  (or (< p 0) (= p 40) (= p 41) (= p 91) (= p 93) (= p 123) (= p 125) (= p 34) (= p 59)))
+
+(defn- token-char? [p :i64] :bool
+  (not (or (whitespace? p) (delimiter? p))))
+
+;; The string of one code point.
+(defn- code-point-string [c :i64] :string
+  (if (< c 128)
+    (string-from-utf8 (bytes-from-vector-i64 (vector-assoc! (vector-alloc 1) 0 c)))
+    (if (< c 2048)
+      (string-from-utf8
+       (bytes-from-vector-i64
+        (vector-assoc! (vector-assoc! (vector-alloc 2) 0 (+ 192 (quot c 64)))
+                       1 (+ 128 (bit-and c 63)))))
+      (string-from-utf8
+       (bytes-from-vector-i64
+        (vector-assoc! (vector-assoc! (vector-assoc! (vector-alloc 3) 0 (+ 224 (quot c 4096)))
+                                      1 (+ 128 (bit-and (quot c 64) 63)))
+                       2 (+ 128 (bit-and c 63))))))))
+
+;; ---------------------------------------------------------------------------
+;; scanning
+
+(defn- skip-line [s :string n :i64 i :i64] :i64
+  (loop [j i]
+    (if (< j n)
+      (if (= 10 (string-code-point-at s j))
+        j
+        (recur (+ j (code-point-width (string-code-point-at s j)))))
+      j)))
+
+(defn- skip-ws [s :string n :i64 i :i64] :i64
+  (loop [j i]
+    (if (< j n)
+      (let [p (string-code-point-at s j)]
+        (cond
+          (whitespace? p) (recur (+ j 1))
+          (= p 59) (recur (skip-line s n (+ j 1)))
+          :else j))
+      j)))
+
+(defn- token-end [s :string n :i64 i :i64] :i64
+  (loop [j i]
+    (if (< j n)
+      (let [p (string-code-point-at s j)]
+        (if (token-char? p) (recur (+ j (code-point-width p))) j))
+      j)))
+
+(defn- digits-end [s :string i :i64 n :i64] :i64
+  (loop [j i]
+    (if (digit? (point-at s j n)) (recur (+ j 1)) j)))
+
+(defn- hex-end [s :string i :i64 n :i64] :i64
+  (loop [j i]
+    (if (>= (hex-digit-value (point-at s j n)) 0) (recur (+ j 1)) j)))
+
+(defn- octal-end [s :string i :i64 n :i64] :i64
+  (loop [j i]
+    (let [p (point-at s j n)]
+      (if (and (>= p 48) (<= p 55)) (recur (+ j 1)) j))))
+
+;; The run of [0-9a-zA-Z_.] from `i`.
+(defn- word-end [s :string i :i64 n :i64] :i64
+  (loop [j i]
+    (let [p (point-at s j n)]
+      (if (or (alnum? p) (= p 95) (= p 46)) (recur (+ j 1)) j))))
+
+;; ---------------------------------------------------------------------------
+;; numbers
+
+;; Value of the hex digits in [i, end) as an i64, negated when NEG.
+(defn- hex-value [s :string i :i64 end :i64 neg :bool] :i64
+  (let [v (loop [j i acc 0]
+            (if (>= j end)
+              acc
+              (recur (+ j 1) (+ (* acc 16) (hex-digit-value (string-code-point-at s j))))))]
+    (if neg (- 0 v) v)))
+
+(defn- int-token [tok :string e :i64] [:ref :kotoba.reader/rd]
+  (let [parsed (parse-long tok)]
+    (if (option-some?-of [:option :i64] parsed)
+      (ok (int-form (option-value-of [:option :i64] parsed 0)) e)
+      (ok (tagged "kotoba.reader/bigint" (string-form tok)) e))))
+
+;; `[+-]?(?:(?:[0-9]+\.[0-9]*|[0-9]*\.[0-9]+)(?:[eE][+-]?[0-9]+)?|[0-9]+[eE][+-]?[0-9]+)`
+;; and, with `plain` true, the same without the leading sign shape check --
+;; i.e. whether the token from `i0` is a decimal f64 shape ending exactly at n.
+(defn- f64-shape? [s :string i0 :i64 n :i64] :bool
+  (let [d1 (digits-end s i0 n)
+        dot? (= 46 (point-at s d1 n))
+        d2s (if dot? (+ d1 1) d1)
+        d2 (if dot? (digits-end s d2s n) d1)
+        em (point-at s d2 n)
+        exp? (or (= em 101) (= em 69))
+        ks (if exp? (if (sign? (point-at s (+ d2 1) n)) (+ d2 2) (+ d2 1)) d2)
+        ke (if exp? (digits-end s ks n) d2)
+        exp-ok? (or (not exp?) (> ke ks))
+        body-ok? (if dot?
+                   (or (> d1 i0) (> d2 d2s))
+                   (and exp? (> d1 i0)))]
+    (and exp-ok? body-ok? (= ke n))))
+
+(defn- f64-bits-form [bits :i64] [:ref :form/r]
+  (seq-form (two-forms (symbol-form "f64-from-bits") (int-form bits))))
+
+(defn- f64-token [tok :string e :i64] [:ref :kotoba.reader/rd]
+  (let [parsed (decimal-f64-parse tok)]
+    (if (option-some?-of [:option :f64] parsed)
+      (ok (f64-bits-form (f64-to-bits (option-value-of [:option :f64] parsed 0.0))) e)
+      (fail (str "f64 literal outside the sealed decimal subset: " tok) e))))
+
+;; `[+-]?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?` -- what `1.5M` may carry.
+(defn- bigdec-body? [s :string i0 :i64 n :i64] :bool
+  (let [d1 (digits-end s i0 n)
+        dot? (= 46 (point-at s d1 n))
+        d2s (if dot? (+ d1 1) d1)
+        d2 (if dot? (digits-end s d2s n) d1)
+        em (point-at s d2 n)
+        exp? (or (= em 101) (= em 69))
+        ks (if exp? (if (sign? (point-at s (+ d2 1) n)) (+ d2 2) (+ d2 1)) d2)
+        ke (if exp? (digits-end s ks n) d2)]
+    (and (> d1 i0)
+         (or (not dot?) (> d2 d2s))
+         (or (not exp?) (> ke ks))
+         (= ke n))))
+
+(defn- number-or-symbol [tok :string e :i64] [:ref :kotoba.reader/rd]
+  (let [n (string-byte-length tok)
+        i0 (if (sign? (point-at tok 0 n)) 1 0)
+        neg? (= 45 (point-at tok 0 n))
+        i1 (digits-end tok i0 n)
+        p0 (point-at tok i0 n)
+        p1 (point-at tok (+ i0 1) n)
+        last (point-at tok (- n 1) n)]
+    (cond
+      ;; A leading zero on a multi-digit token: octal on one host, decimal on
+      ;; the other, so refused rather than picked.
+      (and (= p0 48) (= i1 n) (> (- i1 i0) 1))
+      (fail (str "a leading zero is not an octal prefix in Kotoba: " tok
+                 " -- write it in decimal, or 0x hex") e)
+
+      (and (> i1 i0) (= i1 n))
+      (int-token tok e)
+
+      ;; 0x hex.
+      (and (= p0 48) (or (= p1 120) (= p1 88)) (> (hex-end tok (+ i0 2) n) (+ i0 2))
+           (= (hex-end tok (+ i0 2) n) n))
+      (let [ds (+ i0 2)
+            nd (- n ds)
+            top (hex-digit-value (string-code-point-at tok ds))]
+        (if (or (> nd 16) (and (= nd 16) (> top 7)))
+          (fail (str "hex literal outside i64: " tok) e)
+          (ok (int-form (hex-value tok ds n neg?)) e)))
+
+      (and (or (digit? p0) (= p0 46)) (f64-shape? tok i0 n))
+      (f64-token tok e)
+
+      ;; 123N -- a host bigint, kept as a tagged form.
+      (and (= last 78) (> i1 i0) (= i1 (- n 1)))
+      (ok (tagged "kotoba.reader/bigint" (string-form (string-substring tok 0 (- n 1)))) e)
+
+      ;; 1.5M -- a host bigdec.
+      (and (= last 77) (digit? p0) (bigdec-body? tok i0 (- n 1)))
+      (ok (tagged "kotoba.reader/bigdec" (string-form (string-substring tok 0 (- n 1)))) e)
+
+      ;; Begins like a number, is none: refused, never a symbol.
+      (and (digit? p0) (= (word-end tok i0 n) n))
+      (fail (str "unsupported numeric literal: " tok
+                 " -- decimal, 0x hex and decimal f64 are the forms this reader accepts") e)
+
+      :else
+      (ok (symbol-form tok) e))))
+
+(defn- token-form [tok :string e :i64] [:ref :kotoba.reader/rd]
+  (cond
+    (string=? tok "nil") (ok (nil-form) e)
+    (string=? tok "true") (ok (bool-form true) e)
+    (string=? tok "false") (ok (bool-form false) e)
+    :else (number-or-symbol tok e)))
+
+;; The token at `i`: [end] or an error result. The caller passes the position.
+(defn- token-check [c [:ref :kotoba.reader/c] i :i64 e :i64] [:ref :kotoba.reader/rd]
+  (cond
+    (= e i) (fail "expected a form" i)
+    (and (> (cmt c) 0) (> (- e i) (cmt c))) (fail "EDN token exceeds limit" i)
+    :else (ok (nil-form) e)))
+
+;; ---------------------------------------------------------------------------
+;; strings
+
+;; The end offset (of the closing quote) of the string body starting at `i`,
+;; -1 if unterminated.
+(defn- string-close [s :string n :i64 i :i64] :i64
+  (loop [j i]
+    (if (>= j n)
+      -1
+      (let [p (string-code-point-at s j)]
+        (cond
+          (= p 34) j
+          (and (= p 92) (< (+ j 1) n)) (recur (+ (+ j 1) (code-point-width (string-code-point-at s (+ j 1)))))
+          :else (recur (+ j (code-point-width p))))))))
+
+;; The text an escape stands for, "" with an error when unsupported. `w` is
+;; the number of bytes consumed after the backslash's own byte position.
+(defn- escape-text [raw :string j :i64 n :i64] [:ref :kotoba.reader/rd]
+  (let [nxt (string-code-point-at raw (+ j 1))]
+    (cond
+      (= nxt 110) (ok (string-form "\n") (+ j 2))
+      (= nxt 116) (ok (string-form "\t") (+ j 2))
+      (= nxt 114) (ok (string-form "\r") (+ j 2))
+      (= nxt 92) (ok (string-form "\\") (+ j 2))
+      (= nxt 34) (ok (string-form "\"") (+ j 2))
+      (= nxt 48) (ok (string-form (code-point-string 0)) (+ j 2))
+      (= nxt 98) (ok (string-form (code-point-string 8)) (+ j 2))
+      (= nxt 102) (ok (string-form (code-point-string 12)) (+ j 2))
+      (= nxt 117)
+      (let [hs (+ j 2)]
+        (if (and (= (hex-end raw hs n) (+ hs 4)) (<= (+ hs 4) n))
+          (let [v (hex-value raw hs (+ hs 4) false)]
+            (if (and (>= v 55296) (<= v 57343))
+              (fail "unsupported string escape: surrogate" j)
+              (ok (string-form (code-point-string v)) (+ j 6))))
+          (fail "unsupported string escape" j)))
+      :else (fail "unsupported string escape" j))))
+
+(defn- unescape [raw :string] [:ref :kotoba.reader/rd]
+  (let [n (string-byte-length raw)]
+    (loop [j 0 seg 0 acc ""]
+      (if (>= j n)
+        (ok (string-form (string-concat acc (string-substring raw seg n))) n)
+        (let [p (string-code-point-at raw j)]
+          (if (and (= p 92) (< (+ j 1) n))
+            (let [e (escape-text raw j n)]
+              (if (failed? e)
+                e
+                (recur (rd-pos e) (rd-pos e)
+                       (string-concat (string-concat acc (string-substring raw seg j))
+                                      (sym-of (rd-form e))))))
+            (recur (+ j (code-point-width p)) seg acc)))))))
+
+(defn- read-string-literal [c [:ref :kotoba.reader/c] i :i64] [:ref :kotoba.reader/rd]
+  (let [s (cs c)
+        n (cn c)
+        close (string-close s n (+ i 1))]
+    (if (< close 0)
+      (fail "unterminated string literal" i)
+      (let [r (unescape (string-substring s (+ i 1) close))]
+        (if (failed? r)
+          (fail (rd-err r) i)
+          (ok (rd-form r) (+ close 1)))))))
+
+;; The body of `#"..."`, raw: only `\"` is an escape, and it stands for `"`.
+(defn- read-regex-body [c [:ref :kotoba.reader/c] i :i64] [:ref :kotoba.reader/rd]
+  (let [s (cs c)
+        n (cn c)]
+    (loop [j i seg i acc ""]
+      (if (>= j n)
+        (fail "unterminated regex literal" i)
+        (let [p (string-code-point-at s j)]
+          (cond
+            (= p 34) (ok (string-form (string-concat acc (string-substring s seg j))) (+ j 1))
+            (and (= p 92) (= 34 (point-at s (+ j 1) n)))
+            (recur (+ j 2) (+ j 2)
+                   (string-concat (string-concat acc (string-substring s seg j)) "\""))
+            (and (= p 92) (< (+ j 1) n))
+            (recur (+ (+ j 1) (code-point-width (string-code-point-at s (+ j 1)))) seg acc)
+            :else (recur (+ j (code-point-width p)) seg acc)))))))
+
+;; ---------------------------------------------------------------------------
+;; #() shorthand
+
+;; -1 when X is not `%` / `%N`; the argument number otherwise (0 for `%0`).
+(defn- arg-num [x [:ref :form/r]] :i64
+  (if (= 5 (tag-of x))
+    (let [nm (sym-of x)
+          n (string-byte-length nm)]
+      (cond
+        (string=? nm "%") 1
+        (and (> n 1) (= 37 (string-code-point-at nm 0)) (= (digits-end nm 1 n) n))
+        (option-value-of [:option :i64] (parse-long (string-substring nm 1 n)) 0)
+        :else -1))
+    -1))
+
+(defn- rest-arg? [x [:ref :form/r]] :bool
+  (and (= 5 (tag-of x)) (string=? (sym-of x) "%&")))
+
+(defn- max-i64 [a :i64 b :i64] :i64 (if (> a b) a b))
+
+;; Highest `%N` anywhere under X (sets included), -1 if none; -2 if a `%&`.
+(defn- max-arg-in [xs [:list [:ref :form/r]] i :i64 best :i64] :i64
+  (if (>= i (vector-count xs))
+    best
+    (let [m (max-arg xs i)]
+      (if (= m -2)
+        -2
+        (max-arg-in xs (+ i 1) (max-i64 best m))))))
+
+(defn- max-arg [xs [:list [:ref :form/r]] i :i64] :i64
+  (let [x (kid xs i)]
+    (if (rest-arg? x)
+      -2
+      (max-i64 (arg-num x) (max-arg-in (kids-of x) 0 -1)))))
+
+(defn- rewrite-kids [xs [:list [:ref :form/r]] i :i64 out [:list [:ref :form/r]]]
+  [:list [:ref :form/r]]
+  (if (>= i (vector-count xs))
+    out
+    (rewrite-kids xs (+ i 1) (conj-form out (rewrite (kid xs i))))))
+
+;; `%`/`%N` become the symbol `pN`; only lists, vectors and maps are walked
+;; (the host walks seq?, vector? and map? -- not sets).
+(defn- rewrite [x [:ref :form/r]] [:ref :form/r]
+  (let [t (tag-of x)
+        a (arg-num x)]
+    (cond
+      (> a 0) (symbol-form (string-concat "p" (string-from-i64 a)))
+      (= t 6) (seq-form (rewrite-kids (kids-of x) 0 (no-forms)))
+      (= t 7) (vec-form (rewrite-kids (kids-of x) 0 (no-forms)))
+      (= t 9) (map-form (rewrite-kids (kids-of x) 0 (no-forms)))
+      :else x)))
+
+(defn- shorthand-params [n :i64 k :i64 out [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (> k n)
+    out
+    (shorthand-params n (+ k 1) (conj-form out (symbol-form (string-concat "p" (string-from-i64 k)))))))
+
+(defn- fn-shorthand [forms [:list [:ref :form/r]] pos :i64] [:ref :kotoba.reader/rd]
+  (if (= 0 (vector-count forms))
+    (fail "#() shorthand requires a body" pos)
+    (let [m (max-arg-in forms 0 -1)]
+      (cond
+        (= m -2) (fail "%& rest args are not admitted in #() shorthand" pos)
+        (= m 0) (fail "fn shorthand arg must be %1 or higher" pos)
+        :else
+        (ok (seq-form
+             (three-forms (symbol-form "fn")
+                          (vec-form (shorthand-params (max-i64 m 0) 1 (no-forms)))
+                          (seq-form (rewrite-kids forms 0 (no-forms)))))
+            pos)))))
+
+;; ---------------------------------------------------------------------------
+;; reader conditionals
+
+(defn- feature-selected? [f [:ref :form/r]] :bool
+  (and (= 4 (tag-of f))
+       (or (= (kw-of f) :kotoba) (= (kw-of f) :default))))
+
+;; The form of the first clause whose feature is :kotoba or :default, or the
+;; index -1 in the second result slot of the record when none matches.
+(defn- select-clause [clauses [:list [:ref :form/r]] j :i64] :i64
+  (if (>= (+ j 1) (vector-count clauses))
+    -1
+    (if (feature-selected? (kid clauses j))
+      (+ j 1)
+      (select-clause clauses (+ j 2)))))
+
+;; ---------------------------------------------------------------------------
+;; character literals
+
+(defn- char-name-value [text :string] :string
+  (cond
+    (string=? text "newline") "\n"
+    (string=? text "space") " "
+    (string=? text "tab") "\t"
+    (string=? text "formfeed") (code-point-string 12)
+    (string=? text "backspace") (code-point-string 8)
+    (string=? text "return") "\r"
+    :else ""))
+
+(defn- char-name? [text :string] :bool
+  (or (string=? text "newline") (string=? text "space") (string=? text "tab")
+      (string=? text "formfeed") (string=? text "backspace") (string=? text "return")))
+
+;; TEXT is the token after the backslash; the string it stands for, or an
+;; error result.
+(defn- char-value [text :string at :i64] [:ref :kotoba.reader/rd]
+  (let [n (string-byte-length text)
+        p0 (point-at text 0 n)]
+    (cond
+      (char-name? text) (ok (string-form (char-name-value text)) at)
+      (= n (code-point-width p0)) (ok (string-form text) at)
+      (and (= p0 117) (= n 5) (= (hex-end text 1 n) 5))
+      (let [v (hex-value text 1 5 false)]
+        (if (and (>= v 55296) (<= v 57343))
+          (fail "unsupported character literal: surrogate" at)
+          (ok (string-form (code-point-string v)) at)))
+      (and (= p0 111) (> n 1) (< n 5) (= (octal-end text 1 n) n))
+      (ok (string-form (code-point-string
+                        (loop [j 1 acc 0]
+                          (if (>= j n)
+                            acc
+                            (recur (+ j 1) (+ (* acc 8) (- (string-code-point-at text j) 48)))))))
+          at)
+      :else (fail (str "unsupported character literal: \\" text) at))))
+
+;; ---------------------------------------------------------------------------
+;; the reader proper
+
+;; The keyword named by TOKEN, or an error result when `keyword-from-string`
+;; would trap on it (it traps on the empty string and on a leading colon,
+;; whitespace or a delimiter/quote character).
+(defn- keyword-token-ok? [tok :string] :bool
+  (let [n (string-byte-length tok)]
+    (and (> n 0)
+         (loop [j 0]
+           (if (>= j n)
+             true
+             (let [p (string-code-point-at tok j)]
+               (if (or (and (= j 0) (= p 58))
+                       (whitespace? p)
+                       (= p 39) (= p 96) (= p 126) (= p 94) (= p 92)
+                       (delimiter? p))
+                 false
+                 (recur (+ j (code-point-width p))))))))))
+
+(defn- read-keyword [c [:ref :kotoba.reader/c] i :i64] [:ref :kotoba.reader/rd]
+  (let [s (cs c)
+        n (cn c)
+        e (token-end s n (+ i 1))
+        chk (token-check c (+ i 1) e)]
+    (if (failed? chk)
+      chk
+      (let [tok (string-substring s (+ i 1) e)]
+        (if (keyword-token-ok? tok)
+          (ok (keyword-form (keyword-from-string tok) tok) e)
+          (fail (str "invalid keyword: :" tok) i))))))
+
+;; Elements up to CLOSE. DEPTH is the depth of the container we are in; the
+;; elements are read at DEPTH + 1.
+(defn- read-delimited [c [:ref :kotoba.reader/c] i :i64 close :i64 depth :i64] [:ref :kotoba.reader/rd]
+  (let [d (+ depth 1)
+        s (cs c)
+        n (cn c)]
+    (if (and (> (cmd c) 0) (> d (cmd c)))
+      (fail "EDN nesting exceeds limit" i)
+      (loop [j i acc (no-forms)]
+        (let [k (skip-ws s n j)]
+          (if (>= k n)
+            (fail "unterminated collection" k)
+            (if (= close (string-code-point-at s k))
+              (items acc (+ k 1))
+              (let [r (read-form c k d)]
+                (cond
+                  (failed? r) r
+                  (= 1 (rd-kind r)) (recur (rd-pos r) acc)
+                  (= 2 (rd-kind r)) (recur (rd-pos r) (append-all acc (rd-forms r)))
+                  :else (recur (rd-pos r) (conj-form acc (rd-form r))))))))))))
+
+;; `open` is the constructor tag of the collection: 6 list, 7 vector, 8 set,
+;; 9 map.
+(defn- read-collection [c [:ref :kotoba.reader/c] i :i64 skip :i64 close :i64 tag :i64 depth :i64]
+  [:ref :kotoba.reader/rd]
+  (let [r (read-delimited c (+ i skip) close depth)]
+    (cond
+      (failed? r) r
+      (and (= tag 9) (= 1 (rem (vector-count (rd-forms r)) 2)))
+      (fail "map literal must contain an even number of forms" i)
+      :else (ok (mk tag "" 0 :none (rd-forms r)) (rd-pos r)))))
+
+;; Read one form after a prefix (`@`, `'`): the wrapped list, or an error.
+(defn- read-wrapped [c [:ref :kotoba.reader/c] i :i64 skip :i64 head :string depth :i64 what :string]
+  [:ref :kotoba.reader/rd]
+  (let [r (read-form c (+ i skip) depth)]
+    (cond
+      (failed? r) r
+      (not (= 0 (rd-kind r))) (fail what i)
+      :else (ok (tagged head (rd-form r)) (rd-pos r)))))
+
+;; The normalized metadata map of `^META`.
+(defn- meta-map [m [:ref :form/r]] [:ref :form/r]
+  (let [t (tag-of m)]
+    (cond
+      (= t 4) (map-form (two-forms m (bool-form true)))
+      (= t 5) (map-form (two-forms (keyword-form :tag "tag") m))
+      (= t 3) (map-form (two-forms (keyword-form :tag "tag") m))
+      :else m)))
+
+(defn- meta-ok? [m [:ref :form/r]] :bool
+  (let [t (tag-of m)]
+    (or (= t 4) (= t 5) (= t 3) (= t 9))))
+
+(defn- read-meta [c [:ref :kotoba.reader/c] i :i64 depth :i64] [:ref :kotoba.reader/rd]
+  (let [m (read-form c (+ i 1) depth)]
+    (cond
+      (failed? m) m
+      (not (= 0 (rd-kind m))) (fail "metadata must be a keyword, symbol, string, or map" i)
+      (not (meta-ok? (rd-form m))) (fail "metadata must be a keyword, symbol, string, or map" i)
+      :else
+      (let [f (read-form c (rd-pos m) depth)]
+        (cond
+          (failed? f) f
+          (not (= 0 (rd-kind f))) (fail "metadata must precede a form" i)
+          ;; A decimal literal is the list (f64-from-bits N) here as on the
+          ;; host; the host refuses metadata on it through a marker this
+          ;; record cannot carry, so it is refused by shape.
+          (not (or (= 5 (tag-of (rd-form f)))
+                   (= 6 (tag-of (rd-form f)))
+                   (= 7 (tag-of (rd-form f)))
+                   (= 8 (tag-of (rd-form f)))
+                   (= 9 (tag-of (rd-form f)))))
+          (fail "metadata may only precede a symbol or a collection" i)
+          :else
+          (ok (seq-form (three-forms (symbol-form "kotoba.reader/meta")
+                                     (meta-map (rd-form m))
+                                     (rd-form f)))
+              (rd-pos f)))))))
+
+(defn- qualify-key [k [:ref :form/r] ns-token :string] [:ref :form/r]
+  (if (= 4 (tag-of k))
+    (let [tok (sym-of k)]
+      (cond
+        (string-starts-with-underscore-slash? tok)
+        (let [bare (string-substring tok 2 (string-byte-length tok))]
+          (keyword-form (keyword-from-string bare) bare))
+        (>= (string-index-of tok "/") 0) k
+        :else (let [q (str ns-token "/" tok)]
+                (keyword-form (keyword-from-string q) q))))
+    k))
+
+(defn- string-starts-with-underscore-slash? [tok :string] :bool
+  (and (>= (string-byte-length tok) 2)
+       (= 95 (string-code-point-at tok 0))
+       (= 47 (string-code-point-at tok 1))))
+
+(defn- qualify-entries [xs [:list [:ref :form/r]] i :i64 ns-token :string out [:list [:ref :form/r]]]
+  [:list [:ref :form/r]]
+  (if (>= i (vector-count xs))
+    out
+    (qualify-entries xs (+ i 1) ns-token
+                     (conj-form out (if (= 0 (rem i 2)) (qualify-key (kid xs i) ns-token) (kid xs i))))))
+
+;; `#:ns{...}`. The host qualifies bare keyword keys with NS, leaves
+;; qualified ones alone and turns `_/k` into `k`. `keyword-name` drops the
+;; namespace, so a keyword form keeps the token it was read from in :s.
+(defn- read-namespaced-map [c [:ref :kotoba.reader/c] i :i64 depth :i64] [:ref :kotoba.reader/rd]
+  (let [s (cs c)
+        n (cn c)
+        e (token-end s n (+ i 2))
+        ns-token (string-substring s (+ i 2) e)
+        j (skip-ws s n e)]
+    (if (or (= e (+ i 2)) (not (= 123 (point-at s j n))))
+      (fail "expected `{` after `#:ns`" i)
+      (let [r (read-delimited c (+ j 1) 125 depth)]
+        (cond
+          (failed? r) r
+          (= 1 (rem (vector-count (rd-forms r)) 2))
+          (fail "map literal must contain an even number of forms" i)
+          (not (keyword-token-ok? ns-token)) (fail "expected `{` after `#:ns`" i)
+          :else (ok (map-form (qualify-entries (rd-forms r) 0 ns-token (no-forms))) (rd-pos r)))))))
+
+(defn- read-conditional [c [:ref :kotoba.reader/c] i :i64 depth :i64] [:ref :kotoba.reader/rd]
+  (let [s (cs c)
+        n (cn c)
+        splicing? (= 64 (point-at s (+ i 2) n))
+        j (skip-ws s n (if splicing? (+ i 3) (+ i 2)))]
+    (if (not (= 40 (point-at s j n)))
+      (fail (if splicing? "expected `(` after `#?@`" "expected `(` after `#?`") i)
+      (let [r (read-delimited c (+ j 1) 41 depth)]
+        (if (failed? r)
+          r
+          (let [at (select-clause (rd-forms r) 0)]
+            (cond
+              (< at 0) (skipped (rd-pos r))
+              splicing?
+              (let [f (kid (rd-forms r) at)]
+                (cond
+                  (not (or (= 6 (tag-of f)) (= 7 (tag-of f))))
+                  (fail "`#?@` branch must be a sequential collection" i)
+                  (= 0 depth) (fail "`#?@` is not admitted at top level" i)
+                  :else (spliced (kids-of f) (rd-pos r))))
+              :else (ok (kid (rd-forms r) at) (rd-pos r)))))))))
+
+(defn- read-dispatch [c [:ref :kotoba.reader/c] i :i64 depth :i64] [:ref :kotoba.reader/rd]
+  (let [s (cs c)
+        n (cn c)
+        p2 (point-at s (+ i 1) n)]
+    (cond
+      (= p2 40)
+      (let [r (read-delimited c (+ i 2) 41 depth)]
+        (if (failed? r) r (let [f (fn-shorthand (rd-forms r) i)]
+                            (if (failed? f) f (ok (rd-form f) (rd-pos r))))))
+
+      (= p2 123) (read-collection c i 2 125 8 depth)
+
+      (= p2 95)
+      (let [r (read-form c (+ i 2) depth)]
+        (if (failed? r) r (skipped (rd-pos r))))
+
+      (= p2 63) (read-conditional c i depth)
+
+      (= p2 58) (read-namespaced-map c i depth)
+
+      (= p2 35)
+      (let [e (token-end s n (+ i 2))
+            tok (string-substring s (+ i 2) e)]
+        (cond
+          (string=? tok "NaN") (ok (f64-bits-form 9221120237041090560) e)
+          (string=? tok "Inf") (ok (f64-bits-form 9218868437227405312) e)
+          (string=? tok "-Inf") (ok (f64-bits-form -4503599627370496) e)
+          :else (fail "unsupported symbolic f64 literal" i)))
+
+      (= p2 34)
+      (let [r (read-regex-body c (+ i 2))]
+        (if (failed? r) r (ok (tagged "kotoba.reader/regex" (rd-form r)) (rd-pos r))))
+
+      (= p2 106)
+      (let [e (token-end s n (+ i 1))]
+        (if (string=? (string-substring s (+ i 1) e) "js")
+          (let [r (read-form c e depth)]
+            (cond
+              (failed? r) r
+              (not (= 0 (rd-kind r))) (fail "`#js` must precede a form" i)
+              :else (ok (tagged "kotoba.reader/js" (rd-form r)) (rd-pos r))))
+          (fail "unsupported reader dispatch" i)))
+
+      (= p2 61) (fail "reader evaluation is forbidden" i)
+
+      :else (fail "unsupported reader dispatch" i))))
+
+(defn- read-char-literal [c [:ref :kotoba.reader/c] i :i64] [:ref :kotoba.reader/rd]
+  (let [s (cs c)
+        n (cn c)
+        p (point-at s (+ i 1) n)]
+    (if (< p 0)
+      (fail "unexpected end of input after `\\`" i)
+      (let [single? (or (delimiter? p) (whitespace? p) (= p 92) (= p 34) (= p 59))
+            e (if single? (+ (+ i 1) (code-point-width p)) (token-end s n (+ i 1)))
+            chk (if single? (ok (nil-form) e) (token-check c (+ i 1) e))]
+        (if (failed? chk)
+          chk
+          (let [v (char-value (string-substring s (+ i 1) e) i)]
+            (if (failed? v)
+              v
+              (ok (tagged "kotoba.reader/char" (rd-form v)) e))))))))
+
+(defn- read-symbol-or-number [c [:ref :kotoba.reader/c] i :i64] [:ref :kotoba.reader/rd]
+  (let [s (cs c)
+        e (token-end s (cn c) i)
+        chk (token-check c i e)]
+    (if (failed? chk)
+      chk
+      (let [r (token-form (string-substring s i e) e)]
+        (if (failed? r) (fail (rd-err r) i) r)))))
+
+;; One form at or after `i0`. DEPTH is the depth of the enclosing container.
+(defn- read-form [c [:ref :kotoba.reader/c] i0 :i64 depth :i64] [:ref :kotoba.reader/rd]
+  (let [s (cs c)
+        n (cn c)
+        i (skip-ws s n i0)
+        p (point-at s i n)]
+    (cond
+      (< p 0) (fail "unexpected end of input" i)
+      (= p 40) (read-collection c i 1 41 6 depth)
+      (= p 91) (read-collection c i 1 93 7 depth)
+      (= p 123) (read-collection c i 1 125 9 depth)
+      (= p 34) (read-string-literal c i)
+      (= p 64) (read-wrapped c i 1 "deref" depth "deref must precede a form")
+      (= p 39) (read-wrapped c i 1 "quote" depth "quote must precede a form")
+      (= p 94) (read-meta c i depth)
+      (= p 58) (read-keyword c i)
+      (= p 35) (read-dispatch c i depth)
+      (= p 92) (read-char-literal c i)
+      (= p 41) (fail "unmatched `)`" i)
+      (= p 93) (fail "unmatched `]`" i)
+      (= p 125) (fail "unmatched `}`" i)
+      :else (read-symbol-or-number c i))))
+
+;; ---------------------------------------------------------------------------
+;; the exports
+
+(defn- out [forms [:list [:ref :form/r]] err :string at :i64] [:ref :kotoba.reader/out]
+  (record-new [:ref :kotoba.reader/out] forms err at))
+
+(defn- read-all [c [:ref :kotoba.reader/c]] [:ref :kotoba.reader/out]
+  (let [s (cs c)
+        n (cn c)]
+    (loop [i 0 acc (no-forms)]
+      (let [j (skip-ws s n i)]
+        (if (>= j n)
+          (out acc "" j)
+          (let [r (read-form c j 0)]
+            (cond
+              (failed? r) (out acc (rd-err r) (rd-pos r))
+              (= 0 (rd-kind r)) (recur (rd-pos r) (conj-form acc (rd-form r)))
+              :else (recur (rd-pos r) acc))))))))
+
+(defn read-forms-bounded [source :string max-depth :i64 max-token :i64]
+  [:ref :kotoba.reader/out]
+  (read-all (record-new [:ref :kotoba.reader/c] source (string-byte-length source) max-depth max-token)))
+
+(defn read-forms [source :string] [:ref :kotoba.reader/out]
+  (read-forms-bounded source 0 0))
