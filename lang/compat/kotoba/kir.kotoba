@@ -27,8 +27,8 @@
 ;;   max-fuel, default-frames, max-frames
 ;;                          REAL, as zero-argument functions (an exported
 ;;                          constant must be a function): call as (max-fuel).
-;;   lower                  PARTLY REAL (kotoba.kir.lowering, over Form). Its two
-;;                          halves are (1) validation + assembly and (2)
+;;   lower                  PARTLY REAL (kotoba.kir.lowering + kotoba.kir.interp).
+;;                          Its two halves are (1) validation + assembly and (2)
 ;;                          sealing `:oracle-value` by RUNNING the interpreter.
 ;;                          (1) is ported: the HIR envelope (kotoba.hir), the
 ;;                          core-form shape rejectors (let / if / do), the
@@ -41,16 +41,28 @@
 ;;                          Modules host `lower` does not oracle (no entry, a
 ;;                          result other than i64/bool, an effect other than
 ;;                          :state/:abort, kernel-native) lower for real.
-;;                          NAMED REFUSAL that remains: a pure i64/bool entry
-;;                          is sealed by running the interpreter (2), so it
-;;                          answers ok=false, trap
-;;                          "kotoba.kir/oracle-unavailable" rather than a
-;;                          module without the oracle.
-;;   execute, eval-expr     REFUSAL. The interpreter (typed values, records,
-;;                          variants, heap handles, kgraph, bytes, decimal,
-;;                          fuel/cell/byte/frame budgets, ~1800 lines in
-;;                          eval-expr alone) has no native port yet. Both answer
-;;                          ok=false, trap "kotoba.kir/interpreter-unavailable".
+;;                          (2) is ported for the first interpreter families
+;;                          (kotoba.kir.interp: pure :i64/:bool functions, integer
+;;                          arithmetic and comparison, bit/shift/i32 operations,
+;;                          let/if/do, calls, __kotoba_loop_N loops): the entry is
+;;                          run under the host's oracle budgets (fuel 100000,
+;;                          frames 32) and a value seals :oracle-value and
+;;                          :blocks; a :budget/* trap records
+;;                          :oracle-inconclusive; any other trap is ok=false,
+;;                          trap "kotoba.kir/oracle-trap:<name>" (host: lower
+;;                          aborts). NAMED REFUSAL that remains: a module whose
+;;                          pure entry uses any other family (strings, bytes,
+;;                          collections, records, variants, floats, pairs,
+;;                          documents, closures, ...) answers ok=false, trap
+;;                          "kotoba.kir/oracle-unavailable".
+;;   execute, eval-expr     REAL for the same subset (kotoba.kir.interp); the
+;;                          result is the value as a Form or ok=false with the
+;;                          host's trap name ("budget/fuel", "division-by-zero",
+;;                          ...) as trap and message. A module (or form) outside
+;;                          the subset answers ok=false, trap
+;;                          "kotoba.kir/interpreter-unavailable" -- the remaining
+;;                          hollow spot; see amu-measure
+;;                          docs/selfhost-kir-interpreter-design.md.
 ;;
 ;; The refusals are VALUES, not exceptions (a Kotoba function has no raise a
 ;; caller can see): every consumer must test `ok` before reading `value`. A
@@ -69,10 +81,18 @@
 
 (ns kotoba.kir
   (:require [kotoba.string :as ks]
-            [kotoba.kir.lowering :as lw])
+            [kotoba.form :as form]
+            [kotoba.kir.lowering :as lw]
+            [kotoba.kir.kvalue :as kv]
+            [kotoba.kir.interp :as ip]
+            [kotoba.verifier.kirx :as kx])
   (:export [host-stack-exhausted? lower execute eval-expr max-fuel default-frames max-frames uses-f32? uses-f64? budget-trap? trap-inconclusive? run-ok? run-value run-trap run-message])
   (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
                                        [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
+             :kir/v [:record :kir/v [[:tag :i64] [:n :i64] [:s :string] [:k :keyword]
+                                     [:b :bytes] [:kids [:list [:ref :kir/v]]]]]
+             :kir.interp/res [:record :kir.interp/res
+                              [[:kind :i64] [:v [:ref :kir/v]] [:fuel :i64] [:trap :string]]]
              :kir.lower/problem [:record :kir.lower/problem
                                  [[:problem :keyword] [:function [:ref :form/r]] [:message :string]]]
              :kotoba.kir/run [:record :kotoba.kir/run
@@ -104,6 +124,50 @@
   (record-new [:ref :kotoba.kir/run] false (lw/problem-form p)
               "kotoba.kir/lower-rejected" (lw/problem-message p)))
 
+(defn- kwf [k :keyword] [:ref :form/r] (form/keyword-form k))
+
+;; The resource traps: a run that stopped on a budget has not answered. Host
+;; `lower` records them as `:oracle-inconclusive <trap>` (P4, adr-2609242100).
+(defn- trap-keyword [trap :string] :keyword
+  (cond
+    (string=? trap "budget/fuel") :budget/fuel
+    (string=? trap "budget/cells") :budget/cells
+    (string=? trap "budget/bytes") :budget/bytes
+    (string=? trap "budget/frames") :budget/frames
+    :else :host/stack-exhausted))
+
+;; The module with its oracle sealed: `:oracle-value` the boxed value and
+;; `:blocks` the one-block program `[:const.i64 v] [:return]` (a boolean is the
+;; word 1 / 0 inside a module, the boxed boolean at the boundary).
+(defn- sealed-module [base [:ref :form/r] v [:ref :kir/v]] [:ref :form/r]
+  (let [n (kv/n-of v)
+        value (if (kv/is-bool? v) (form/bool-form (= n 1)) (form/int-form n))
+        insts (form/form-vec
+               (form/two-forms (form/form-vec (form/two-forms (kwf :const.i64) (form/int-form n)))
+                               (form/form-vec (form/one-form (kwf :return)))))
+        block (form/form-map
+               (form/append-form
+                (form/append-form (form/two-forms (kwf :id) (form/int-form 0)) (kwf :instructions))
+                insts))
+        blocks (form/form-vec (form/one-form block))]
+    (form/assoc-form (form/assoc-form base (kwf :oracle-value) value) (kwf :blocks) blocks)))
+
+(defn- default-oracle-fuel [] :i64 100000)
+
+;; A pure i64/bool entry inside the ported subset (kotoba.kir.interp): seal its
+;; value by running the interpreter under the host's default oracle budgets.
+;; A budget trap is `:oracle-inconclusive`; every other trap aborts `lower` on
+;; the host, and is a refusal carrying the trap's name here.
+(defn- seal [hir [:ref :form/r]] [:ref :kotoba.kir/run]
+  (let [base (lw/lower-base hir)
+        entry (form/symbol-value (form/form-get hir (kwf :entry)))
+        r (ip/run base entry (kv/no-values) (default-oracle-fuel) (default-frames))]
+    (cond
+      (ip/res-ok? r) (ok-run (sealed-module base (ip/res-value r)))
+      (kx/trap-inconclusive? (ip/res-trap r))
+      (ok-run (form/assoc-form base (kwf :oracle-inconclusive) (kwf (trap-keyword (ip/res-trap r)))))
+      :else (refused (string-concat "kotoba.kir/oracle-trap:" (ip/res-trap r)) (ip/res-trap r)))))
+
 (defn lower [hir [:ref :form/r]] [:ref :kotoba.kir/run]
   (let [p (lw/lower-problem hir)]
     (if (not (= :ok (lw/problem-of p)))
@@ -113,24 +177,65 @@
       ;; is the host's message.
       (rejected-run p)
       (if (lw/oracle-wanted? hir)
-        ;; NAMED REFUSAL: a pure i64/bool entry is sealed by RUNNING the
-        ;; interpreter, which has no native port. Answering the structural
-        ;; module without the oracle would be a different artifact under the
-        ;; same name.
-        (refused "kotoba.kir/oracle-unavailable"
-                 "this module's pure entry is sealed by running the KIR interpreter, which has no native port yet")
+        (let [base (lw/lower-base hir)]
+          (if (ip/ported? base)
+            ;; REAL for the ported subset: the oracle is sealed by running
+            ;; kotoba.kir.interp over the module (integer/boolean arithmetic,
+            ;; let/if/do, calls, loop helpers).
+            (seal hir)
+            ;; NAMED REFUSAL: this pure entry uses an operation family the
+            ;; interpreter has not ported (strings, bytes, collections,
+            ;; records, variants, floats, pairs, documents, ...). Answering the
+            ;; structural module without the oracle would be a different
+            ;; artifact under the same name.
+            (refused "kotoba.kir/oracle-unavailable"
+                     "this module's pure entry is sealed by running the KIR interpreter, and it uses an operation family that has no native port yet")))
         ;; REAL: no oracle is sealed for this module (no entry, a non-i64/bool
         ;; result, a non-pure effect row, or kernel-native): the module is the
         ;; structural assembly, :oracle-value nil, :blocks [].
         (ok-run (lw/lower-base hir))))))
 
+;; ---- execute / eval-expr over the ported subset ----
+
+(defn- opt-int [opts [:ref :form/r] k :keyword dflt :i64] :i64
+  (let [x (form/form-get opts (kwf k))]
+    (if (form/is-int? x) (form/int-value x) dflt)))
+
+(defn- exported? [kir [:ref :form/r] name :string] :bool
+  (let [ex (form/form-get kir (kwf :exports))]
+    (if (form/form-has? kir (kwf :exports))
+      (loop [i 0]
+        (if (>= i (form/count-of ex)) false
+          (if (string=? (form/symbol-value (form/nth-of ex i)) name) true (recur (inc i)))))
+      true)))
+
+(defn- args-values [args [:list [:ref :form/r]]] [:list [:ref :kir/v]]
+  (loop [i 0 acc (kv/no-values)]
+    (if (>= i (vector-count args)) acc
+      (recur (inc i) (kv/append-value acc (kv/from-form (typed-list-nth [:list [:ref :form/r]] args i)))))))
+
+(defn- run-of [r [:ref :kir.interp/res]] [:ref :kotoba.kir/run]
+  (if (ip/res-ok? r)
+    (ok-run (kv/to-form (ip/res-value r)))
+    (refused (ip/res-trap r) (ip/res-trap r))))
+
 (defn execute [kir [:ref :form/r] function-name :string args [:list [:ref :form/r]] opts [:ref :form/r]] [:ref :kotoba.kir/run]
-  (refused "kotoba.kir/interpreter-unavailable"
-           "the KIR reference interpreter has no native port yet"))
+  (if (not (ip/ported? kir))
+    (refused "kotoba.kir/interpreter-unavailable"
+             "this module uses an operation family the KIR reference interpreter has no native port for yet")
+    (let [fuel (opt-int opts :fuel 512)
+          frames (opt-int opts :frames (default-frames))]
+      (cond
+        (not (exported? kir function-name)) (refused "kotoba.kir/execute-rejected" "function is not exported")
+        (or (<= fuel 0) (> fuel (max-fuel))) (refused "kotoba.kir/execute-rejected" "fuel must be a positive integer within the admitted ceiling")
+        (or (<= frames 0) (> frames (max-frames))) (refused "kotoba.kir/execute-rejected" "frames must be a positive integer within the admitted ceiling")
+        :else (run-of (ip/run kir function-name (args-values args) fuel frames))))))
 
 (defn eval-expr [form [:ref :form/r]] [:ref :kotoba.kir/run]
-  (refused "kotoba.kir/interpreter-unavailable"
-           "the KIR reference interpreter has no native port yet"))
+  (if (ip/form-ported? form)
+    (run-of (ip/eval-form form 512 (default-frames)))
+    (refused "kotoba.kir/interpreter-unavailable"
+             "this form uses an operation family the KIR reference interpreter has no native port for yet")))
 
 ;; ---------------------------------------------------------------------------
 ;; uses-f64? / uses-f32? / budget-trap? / trap-inconclusive? -- REAL bodies, in
