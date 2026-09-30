@@ -1,0 +1,459 @@
+;; kotoba.verifier.signing -- Ed25519 signing for sealed artifacts, over the
+;; recursive `:form/r` record. The GUEST-ROUTE twin of kotoba-verifier's
+;; `kotoba/verifier/signing.cljk`; the project route takes this file instead of
+;; the .cljk (extension priority across source roots), and the host behaviour of
+;; the .cljk is untouched.
+;;
+;; WHY A TWIN. The host module reaches the platform's signer (java.security,
+;; node:crypto) for the DER key envelopes and for Ed25519 itself; neither exists
+;; in Kotoba. Here Ed25519 is the pure `ed25519.sign` (RFC 8032), the key
+;; envelopes are the same DER -- X.509 SubjectPublicKeyInfo and PKCS#8, base64'd
+;; -- built and parsed by hand (12 and 16 fixed prefix bytes over the 32 raw
+;; bytes), and the signed value is the canonical text of `kotoba.verifier.seal`,
+;; the same text `kotoba.artifact.core/canonical-bytes` gives on the hosts.
+;; Ed25519 is deterministic, so the same key over the same value produces the
+;; same signature byte for byte on every route.
+;;
+;; THE CONTRACT
+;;   Values are Forms (a key, a trust policy, an envelope are maps). A host
+;;   `throw` (ex-info) is a TRAP here (`assert`): an export cannot abort with a
+;;   value a caller sees, as kotoba.verifier/verify-artifact! does not.
+;;   `now` and the validity bounds of `sign` are read as i64 Form leaves.
+;;   generate-keypair draws its 32-byte seed from the `entropy/draw` capability.
+
+(ns kotoba.verifier.signing
+  (:require [kotoba.form :as form]
+            [kotoba.bytes :as kbytes]
+            [kotoba.verifier.seal :as seal]
+            [kotoba.verifier :as verifier]
+            [ed25519.sign :as ed])
+  (:export [generate-keypair sign sign-value signer-id trusted-signer-id! valid-key?
+            valid-verification-key? validate-trust! verification-key verify verify-value])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                       [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]}))
+
+;; ---- traps ---------------------------------------------------------------------------------
+
+(defn- trap-form [] [:ref :form/r]
+  (let [refused (assert (= 1 0))] (form/nil-form)))
+
+(defn- trap-string [] :string
+  (let [refused (assert (= 1 0))] ""))
+
+;; ---- Form plumbing ---------------------------------------------------------------------------
+
+(defn- kwf [k :keyword] [:ref :form/r] (form/keyword-form k))
+
+(defn- fget [m [:ref :form/r] k :keyword] [:ref :form/r]
+  (form/form-get m (form/keyword-form k)))
+
+(defn- has? [m [:ref :form/r] k :keyword] :bool
+  (form/form-has? m (form/keyword-form k)))
+
+(defn- kw? [f [:ref :form/r] k :keyword] :bool
+  (if (form/is-keyword? f) (= k (form/keyword-value f)) false))
+
+(defn- empty-map [] [:ref :form/r] (form/form-map (form/no-forms)))
+
+(defn- put [m [:ref :form/r] k :keyword v [:ref :form/r]] [:ref :form/r]
+  (form/assoc-form m (form/keyword-form k) v))
+
+;; the member test of a set or vector form
+(defn- member-from [xs [:list [:ref :form/r]] x [:ref :form/r] i :i64] :bool
+  (if (>= i (vector-count xs))
+    false
+    (if (form/eq (typed-list-nth [:list [:ref :form/r]] xs i) x)
+      true
+      (member-from xs x (+ i 1)))))
+
+(defn- member? [s [:ref :form/r] x [:ref :form/r]] :bool
+  (member-from (form/kids-of s) x 0))
+
+;; ---- sha256 strings -------------------------------------------------------------------------
+
+(defn- lower-hex? [c :i64] :bool
+  (if (>= c 48) (if (<= c 57) true (if (>= c 97) (<= c 102) false)) false))
+
+(defn- hex64-from [s :string i :i64] :bool
+  (if (>= i 64)
+    true
+    (if (lower-hex? (string-code-point-at s i)) (hex64-from s (+ i 1)) false)))
+
+(defn- sha256? [f [:ref :form/r]] :bool
+  (if (form/is-string? f)
+    (if (= 64 (string-byte-length (form/string-value f)))
+      (hex64-from (form/string-value f) 0)
+      false)
+    false))
+
+(defn- all-sha256-from [xs [:list [:ref :form/r]] i :i64] :bool
+  (if (>= i (vector-count xs))
+    true
+    (if (sha256? (typed-list-nth [:list [:ref :form/r]] xs i)) (all-sha256-from xs (+ i 1)) false)))
+
+(defn- sha-set? [f [:ref :form/r]] :bool
+  (if (form/is-set? f) (all-sha256-from (form/kids-of f) 0) false))
+
+;; ---- trust policy -----------------------------------------------------------------------------
+
+(defn- allowed-trust-key? [k [:ref :form/r]] :bool
+  (if (form/is-keyword? k)
+    (let [name (form/keyword-value k)]
+      (or (= name :format) (= name :trusted-signers) (= name :revoked-signers)
+          (= name :revoked-artifacts) (= name :trusted-runtime-sha256)
+          (= name :revoked-runtime-sha256)))
+    false))
+
+(defn- allowed-trust-keys-from [kids [:list [:ref :form/r]] j :i64] :bool
+  (if (>= j (vector-count kids))
+    true
+    (if (allowed-trust-key? (typed-list-nth [:list [:ref :form/r]] kids j))
+      (allowed-trust-keys-from kids (+ j 2))
+      false)))
+
+(defn- optional-sha-set? [trust [:ref :form/r] k :keyword] :bool
+  (if (has? trust k) (sha-set? (fget trust k)) true))
+
+(defn- trust-valid? [trust [:ref :form/r]] :bool
+  (if (form/is-map? trust)
+    (if (allowed-trust-keys-from (form/kids-of trust) 0)
+      (if (has? trust :format)
+        (if (has? trust :trusted-signers)
+          (if (has? trust :revoked-signers)
+            (if (has? trust :revoked-artifacts)
+              (if (kw? (fget trust :format) :kotoba.trust/v1)
+                (if (sha-set? (fget trust :trusted-signers))
+                  (if (sha-set? (fget trust :revoked-signers))
+                    (if (sha-set? (fget trust :revoked-artifacts))
+                      (if (optional-sha-set? trust :trusted-runtime-sha256)
+                        (optional-sha-set? trust :revoked-runtime-sha256)
+                        false)
+                      false)
+                    false)
+                  false)
+                false)
+              false)
+            false)
+          false)
+        false)
+      false)
+    false))
+
+(defn validate-trust! [trust [:ref :form/r]] [:ref :form/r]
+  (if (trust-valid? trust) trust (trap-form)))
+
+;; ---- bytes and the DER envelopes ------------------------------------------------------------
+
+(defn- unhex-bytes [s :string] :vector-i64
+  (option-value-of [:option :vector-i64] (kbytes/unhex s) (vector-i64)))
+
+;; X.509 SubjectPublicKeyInfo of an Ed25519 key: SEQUENCE { SEQUENCE { OID 1.3.101.112 }, BIT STRING }
+(defn- spki-prefix [] :vector-i64 (unhex-bytes "302a300506032b6570032100"))
+
+;; PKCS#8 PrivateKeyInfo of an Ed25519 key: SEQUENCE { INTEGER 0, SEQUENCE { OID }, OCTET STRING { OCTET STRING seed } }
+(defn- pkcs8-prefix [] :vector-i64 (unhex-bytes "302e020100300506032b657004220420"))
+
+(defn- append-from [out :vector-i64 b :vector-i64 i :i64] :vector-i64
+  (if (>= i (vector-count b))
+    out
+    (append-from (vector-conj out (vector-at b i)) b (+ i 1))))
+
+(defn- append-bytes [a :vector-i64 b :vector-i64] :vector-i64
+  (append-from a b 0))
+
+(defn- slice-from [v :vector-i64 from :i64 to :i64 out :vector-i64] :vector-i64
+  (if (>= from to)
+    out
+    (slice-from v (+ from 1) to (vector-conj out (vector-at v from)))))
+
+(defn- slice [v :vector-i64 from :i64 to :i64] :vector-i64
+  (slice-from v from to (vector-i64)))
+
+(defn- prefix-from? [v :vector-i64 p :vector-i64 i :i64] :bool
+  (if (>= i (vector-count p))
+    true
+    (if (= (vector-at v i) (vector-at p i)) (prefix-from? v p (+ i 1)) false)))
+
+(defn- b64 [bytes :vector-i64] :string (kbytes/base64-encode bytes))
+
+(defn- none-bytes [] [:option :vector-i64] (option-none-of [:option :vector-i64]))
+
+;; the 32 raw bytes under a fixed DER PREFIX, or none
+(defn- der-raw [encoded :string prefix :vector-i64] [:option :vector-i64]
+  (match-option (kbytes/base64-decode encoded) [:option :vector-i64]
+    (none (none-bytes))
+    (some v (if (= (vector-count v) (+ (vector-count prefix) 32))
+              (if (prefix-from? v prefix 0)
+                (option-some-of [:option :vector-i64] (slice v (vector-count prefix) (vector-count v)))
+                (none-bytes))
+              (none-bytes)))))
+
+(defn- decode-public [encoded :string] [:option :vector-i64]
+  (der-raw encoded (spki-prefix)))
+
+(defn- decode-private [encoded :string] [:option :vector-i64]
+  (der-raw encoded (pkcs8-prefix)))
+
+(defn- canonical-bytes [value [:ref :form/r]] :vector-i64
+  (vector-i64-from-bytes (string-to-utf8 (seal/canonical-text value))))
+
+;; ---- Ed25519 over the pure implementation ------------------------------------------------------
+
+(defn- doc-at [d :document i :i64] :document
+  (option-value-of [:option :document] (document-vector-at d i) (document-null)))
+
+(defn- doc-bytes-from [d :document i :i64 out :vector-i64] :vector-i64
+  (if (>= i (document-count d))
+    out
+    (doc-bytes-from d (+ i 1)
+                    (vector-conj out (option-value-of [:option :i64] (document-i64-value (doc-at d i)) 0)))))
+
+(defn- public-of-seed [seed :vector-i64] :vector-i64
+  (let [sk (ed/secret-key seed)]
+    (doc-bytes-from (option-value-of [:option :document] (document-get sk (document-keyword :public)) (document-null))
+                    0 (vector-i64))))
+
+(defn- raw-sign [seed :vector-i64 message :vector-i64] :vector-i64
+  (ed/sign (ed/secret-key seed) message))
+
+(defn- same-bytes-from? [a :vector-i64 b :vector-i64 i :i64] :bool
+  (if (>= i (vector-count a))
+    true
+    (if (= (vector-at a i) (vector-at b i)) (same-bytes-from? a b (+ i 1)) false)))
+
+(defn- same-bytes? [a :vector-i64 b :vector-i64] :bool
+  (if (= (vector-count a) (vector-count b)) (same-bytes-from? a b 0) false))
+
+;; ---- signer identity and keys ---------------------------------------------------------------------
+
+(defn signer-id [public-key :string] :string
+  (seal/sha256-form (put (put (empty-map) :algorithm (kwf :ed25519))
+                         :public-key (form/string-form public-key))))
+
+;; the public key derives from the private one
+(defn- keypair-matches? [public-key :string private-key :string] :bool
+  (match-option (decode-public public-key) [:option :vector-i64]
+    (none false)
+    (some pub (match-option (decode-private private-key) [:option :vector-i64]
+                (none false)
+                (some seed (same-bytes? pub (public-of-seed seed)))))))
+
+(defn- signer-matches? [key [:ref :form/r]] :bool
+  (form/eq (fget key :signer) (form/string-form (signer-id (form/string-value (fget key :public-key))))))
+
+(defn valid-key? [key [:ref :form/r]] :bool
+  (if (form/is-map? key)
+    (if (= 10 (form/count-of key))
+      (if (has? key :format)
+        (if (has? key :algorithm)
+          (if (has? key :signer)
+            (if (has? key :public-key)
+              (if (has? key :private-key)
+                (if (kw? (fget key :format) :kotoba.signing-key/v1)
+                  (if (kw? (fget key :algorithm) :ed25519)
+                    (if (form/is-string? (fget key :public-key))
+                      (if (form/is-string? (fget key :private-key))
+                        (if (signer-matches? key)
+                          (keypair-matches? (form/string-value (fget key :public-key))
+                                            (form/string-value (fget key :private-key)))
+                          false)
+                        false)
+                      false)
+                    false)
+                  false)
+                false)
+              false)
+            false)
+          false)
+        false)
+      false)
+    false))
+
+(defn- public-decodes? [encoded :string] :bool
+  (match-option (decode-public encoded) [:option :vector-i64]
+    (none false)
+    (some pub true)))
+
+(defn valid-verification-key? [key [:ref :form/r]] :bool
+  (if (form/is-map? key)
+    (if (= 8 (form/count-of key))
+      (if (has? key :format)
+        (if (has? key :algorithm)
+          (if (has? key :signer)
+            (if (has? key :public-key)
+              (if (kw? (fget key :format) :kotoba.verification-key/v1)
+                (if (kw? (fget key :algorithm) :ed25519)
+                  (if (form/is-string? (fget key :public-key))
+                    (if (signer-matches? key)
+                      (public-decodes? (form/string-value (fget key :public-key)))
+                      false)
+                    false)
+                  false)
+                false)
+              false)
+            false)
+          false)
+        false)
+      false)
+    false))
+
+(defn verification-key [signing-key [:ref :form/r]] [:ref :form/r]
+  (if (valid-key? signing-key)
+    (put (put (put (put (empty-map) :format (kwf :kotoba.verification-key/v1))
+                   :algorithm (kwf :ed25519))
+              :signer (fget signing-key :signer))
+         :public-key (fget signing-key :public-key))
+    (trap-form)))
+
+(defn trusted-signer-id! [key [:ref :form/r]] [:ref :form/r]
+  (if (valid-verification-key? key)
+    (fget key :signer)
+    (if (valid-key? key)
+      (fget key :signer)
+      (trap-form))))
+
+;; ---- signing and verifying a value --------------------------------------------------------------------
+
+(defn sign-value [key [:ref :form/r] value [:ref :form/r]] :string
+  (if (valid-key? key)
+    (match-option (decode-private (form/string-value (fget key :private-key))) [:option :vector-i64]
+      (none (trap-string))
+      (some seed (b64 (raw-sign seed (canonical-bytes value)))))
+    (trap-string)))
+
+(defn verify-value [public-key :string value [:ref :form/r] signature :string] :bool
+  (match-option (decode-public public-key) [:option :vector-i64]
+    (none false)
+    (some pub (match-option (kbytes/base64-decode signature) [:option :vector-i64]
+                (none false)
+                (some sig (ed/verify pub (canonical-bytes value) sig))))))
+
+(defn generate-keypair [] [:ref :form/r]
+  (let [seed (unhex-bytes (entropy/draw "32"))
+        public (b64 (append-bytes (spki-prefix) (public-of-seed seed)))
+        private (b64 (append-bytes (pkcs8-prefix) seed))]
+    (put (put (put (put (put (empty-map) :format (kwf :kotoba.signing-key/v1))
+                        :algorithm (kwf :ed25519))
+                   :signer (form/string-form (signer-id public)))
+              :public-key (form/string-form public))
+         :private-key (form/string-form private))))
+
+;; ---- signing an artifact ------------------------------------------------------------------------------
+
+(defn- statement-of [artifact [:ref :form/r] key [:ref :form/r] not-before [:ref :form/r] expires [:ref :form/r]]
+  [:ref :form/r]
+  (put (put (put (put (put (put (empty-map) :format (kwf :kotoba.signature-statement/v1))
+                          :artifact-sha256 (fget artifact :sha256))
+                     :signer (fget key :signer))
+                :public-key (fget key :public-key))
+           :not-before not-before)
+       :expires expires))
+
+(defn- interval-ok? [not-before [:ref :form/r] expires [:ref :form/r]] :bool
+  (if (verifier/guest-integer? not-before)
+    (if (verifier/guest-integer? expires)
+      (< (form/int-value not-before) (form/int-value expires))
+      false)
+    false))
+
+(defn- signed-envelope [kexe [:ref :form/r] key [:ref :form/r] not-before [:ref :form/r] expires [:ref :form/r]]
+  [:ref :form/r]
+  (let [statement (statement-of kexe key not-before expires)]
+    (put (put (put (put (empty-map) :format (kwf :kotoba.signed-kexe/v1))
+                   :artifact kexe)
+              :statement statement)
+         :signature (form/string-form (sign-value key statement)))))
+
+(defn sign [kexe [:ref :form/r] key [:ref :form/r] opts [:ref :form/r]] [:ref :form/r]
+  (let [verified (verifier/verify-artifact! kexe)]
+    (if (valid-key? key)
+      (if (interval-ok? (fget opts :not-before) (fget opts :expires))
+        (signed-envelope kexe key (fget opts :not-before) (fget opts :expires))
+        (trap-form))
+      (trap-form))))
+
+;; ---- verifying an envelope ----------------------------------------------------------------------------
+
+(defn- statement-shape-ok? [statement [:ref :form/r] envelope [:ref :form/r]] :bool
+  (if (form/is-map? statement)
+    (if (= 12 (form/count-of statement))
+      (if (has? statement :format)
+        (if (has? statement :artifact-sha256)
+          (if (has? statement :signer)
+            (if (has? statement :public-key)
+              (if (has? statement :not-before)
+                (if (has? statement :expires)
+                  (if (kw? (fget statement :format) :kotoba.signature-statement/v1)
+                    (if (form/is-string? (fget statement :public-key))
+                      (if (form/eq (fget statement :signer)
+                                   (form/string-form (signer-id (form/string-value (fget statement :public-key)))))
+                        (if (form/eq (fget statement :artifact-sha256) (fget (fget envelope :artifact) :sha256))
+                          (if (interval-ok? (fget statement :not-before) (fget statement :expires))
+                            (form/is-string? (fget envelope :signature))
+                            false)
+                          false)
+                        false)
+                      false)
+                    false)
+                  false)
+                false)
+              false)
+            false)
+          false)
+        false)
+      false)
+    false))
+
+(defn- envelope-shape-ok? [envelope [:ref :form/r]] :bool
+  (if (form/is-map? envelope)
+    (if (= 8 (form/count-of envelope))
+      (if (has? envelope :format)
+        (if (has? envelope :artifact)
+          (if (has? envelope :statement)
+            (has? envelope :signature)
+            false)
+          false)
+        false)
+      false)
+    false))
+
+(defn- not-revoked-or-untrusted? [trust [:ref :form/r] statement [:ref :form/r]] :bool
+  (let [signer (fget statement :signer)
+        digest (fget statement :artifact-sha256)]
+    (if (member? (fget trust :trusted-signers) signer)
+      (if (member? (fget trust :revoked-signers) signer)
+        false
+        (if (member? (fget trust :revoked-artifacts) digest) false true))
+      false)))
+
+(defn- inside-validity? [statement [:ref :form/r] now :i64] :bool
+  (if (< now (form/int-value (fget statement :not-before)))
+    false
+    (< now (form/int-value (fget statement :expires)))))
+
+(defn- verified-result [envelope [:ref :form/r]] [:ref :form/r]
+  (let [statement (fget envelope :statement)]
+    (put (put (put (put (empty-map) :verified? (form/bool-form true))
+                   :signer (fget statement :signer))
+              :artifact (fget envelope :artifact))
+         :validity (put (put (empty-map) :not-before (fget statement :not-before))
+                        :expires (fget statement :expires)))))
+
+(defn verify [envelope [:ref :form/r] trust [:ref :form/r] now :i64] [:ref :form/r]
+  (if (kw? (fget envelope :format) :kotoba.signed-kexe/v1)
+    (if (envelope-shape-ok? envelope)
+      (let [trusted (validate-trust! trust)
+            statement (fget envelope :statement)]
+        (if (statement-shape-ok? statement envelope)
+          (if (verify-value (form/string-value (fget statement :public-key)) statement
+                            (form/string-value (fget envelope :signature)))
+            (if (not-revoked-or-untrusted? trust statement)
+              (if (inside-validity? statement now)
+                (let [verified (verifier/verify-artifact! (fget envelope :artifact))]
+                  (verified-result envelope))
+                (trap-form))
+              (trap-form))
+            (trap-form))
+          (trap-form)))
+      (trap-form))
+    (trap-form)))
