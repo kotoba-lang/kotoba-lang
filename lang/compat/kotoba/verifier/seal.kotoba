@@ -1,0 +1,214 @@
+;; kotoba.verifier.seal -- the artifact seal over the recursive `:form/r` record.
+;;
+;; `kotoba.artifact.core/sha256` and `valid-seal?` have a Kotoba reading over
+;; `:document`, whose containers are bounded (depth 8, 32 items): a native
+;; artifact's `:code` vector and its KIR program are far larger, so a .kexe can
+;; never BE a `:document`. This module is the same digest over a Form:
+;; SHA-256 of the UTF-8 of `(pr-str (canonical x))`, where `canonical` is the
+;; host's: a map's entries sorted by the printed text of their (canonical) key
+;; and written `{k v, k v}`, a set as a vector sorted by its members' text, a
+;; list as a vector, a vector item-wise, scalars as `pr-str` prints them, and a
+;; map whose keys are all keywords or symbols of ONE namespace as `#:ns{..}`
+;; (nbb prints with *print-namespace-maps* true -- the runtime the compiler's
+;; digests are taken on -- and this follows it, as artifact.core's document
+;; reading does).
+;;
+;; THE TEXT CAN DIFFER FROM THE HOST'S in exactly the places artifact.core's
+;; reading names: a string holding a control character other than \b \t \n \f \r
+;; (the host writes it raw, a document prints \uXXXX), an f64 leaf (printed with
+;; its IEEE-754 bits marker here, which no artifact carries), and two keys whose
+;; canonical text is equal. A seal computed here that differs from the host's
+;; therefore REFUSES (fail closed); it never accepts a value the host would not.
+;;
+;; The join of N texts is a balanced concatenation (O(n log n) bytes moved), not
+;; a left fold: a 1 MiB code vector is a million one-token texts.
+
+(ns kotoba.verifier.seal
+  (:require [kotoba.form :as form])
+  (:export [canonical-text sha256-form valid-seal?])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                       [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]}))
+
+;; ---- text lists -----------------------------------------------------------------------
+
+(defn- no-texts [] [:list :string] (typed-list-new [:list :string]))
+(defn- texts-at [xs [:list :string] i :i64] :string (typed-list-nth [:list :string] xs i))
+(defn- texts-add [xs [:list :string] t :string] [:list :string] (typed-list-conj [:list :string] xs t))
+
+;; the texts of xs[lo, hi) joined by SEP, balanced
+(defn- join-range [xs [:list :string] lo :i64 hi :i64 sep :string] :string
+  (if (>= lo hi)
+    ""
+    (if (= (+ lo 1) hi)
+      (texts-at xs lo)
+      (let [mid (quot (+ lo hi) 2)]
+        (string-concat (join-range xs lo mid sep)
+                       (string-concat sep (join-range xs mid hi sep)))))))
+
+;; ---- scalar text -------------------------------------------------------------------------
+
+(defn- pr-string [s :string] :string (document-edn-print (document-string s)))
+(defn- pr-keyword [k :keyword] :string (document-edn-print (document-keyword k)))
+
+(defn- scalar-text [f [:ref :form/r]] :string
+  (let [t (form/tag-of f)]
+    (cond
+      (= t 0) "nil"
+      (= t 1) (if (form/bool-value f) "true" "false")
+      (= t 2) (string-from-i64 (form/int-value f))
+      (= t 3) (pr-string (form/string-value f))
+      (= t 4) (pr-keyword (form/keyword-value f))
+      (= t 5) (form/symbol-value f)
+      (= t 10) (string-concat "#f64/" (string-from-i64 (form/bits-of f)))
+      :else "#unsupported")))
+
+;; ---- ordering by text (stable insertion) ---------------------------------------------------
+
+;; position in SORTED (texts) to insert TEXT after every text that is <= it
+(defn- insert-at [sorted [:list :string] text :string i :i64] :i64
+  (if (>= i (vector-count sorted))
+    i
+    (if (< (string-compare text (texts-at sorted i)) 0)
+      i
+      (insert-at sorted text (+ i 1)))))
+
+;; sort the (key-text, payload) pairs; PAYLOADS parallels KEYS. Answers the
+;; permutation as a list of source indexes, stably.
+(defn- order-into [keys [:list :string] i :i64 order [:list :string]] [:list :string]
+  ;; ORDER holds source indexes as decimal texts sorted by keys[index]
+  (if (>= i (vector-count keys))
+    order
+    (order-into keys (+ i 1) (order-insert keys order (texts-at keys i) i))))
+
+(defn- order-insert [keys [:list :string] order [:list :string] text :string idx :i64] [:list :string]
+  (let [p (order-position keys order text 0)]
+    (loop [j 0 acc (no-texts)]
+      (if (>= j (vector-count order))
+        (if (= j p) (texts-add acc (string-from-i64 idx)) acc)
+        (recur (+ j 1)
+               (texts-add (if (= j p) (texts-add acc (string-from-i64 idx)) acc)
+                          (texts-at order j)))))))
+
+(defn- order-position [keys [:list :string] order [:list :string] text :string i :i64] :i64
+  (if (>= i (vector-count order))
+    i
+    (if (< (string-compare text (texts-at keys (parse-index (texts-at order i)))) 0)
+      i
+      (order-position keys order text (+ i 1)))))
+
+(defn- parse-index [s :string] :i64
+  (loop [i 0 n 0]
+    (if (>= i (string-byte-length s))
+      n
+      (recur (+ i 1) (+ (* n 10) (- (string-code-point-at s i) 48))))))
+
+;; ---- namespaces of keys -----------------------------------------------------------------------
+
+;; the printed text of a keyword or symbol key
+(defn- key-print [k [:ref :form/r]] :string
+  (if (form/is-keyword? k) (pr-keyword (form/keyword-value k)) (form/symbol-value k)))
+
+;; namespace of a printed keyword/symbol text, "" when it has none
+(defn- key-ns [k [:ref :form/r] text :string] :string
+  (let [start (if (form/is-keyword? k) 1 0)
+        slash (string-index-of text "/")]
+    (if (and (or (form/is-keyword? k) (form/is-symbol? k)) (< start slash))
+      (string-substring text start slash)
+      "")))
+
+(defn- key-strip [k [:ref :form/r] text :string] :string
+  (let [rest-text (string-substring text (+ (string-index-of text "/") 1) (string-byte-length text))]
+    (if (form/is-keyword? k) (string-concat ":" rest-text) rest-text)))
+
+;; the namespace every key of the map shares, "" when they do not all share one
+(defn- shared-ns [m [:ref :form/r] i :i64 ns :string] :string
+  (if (>= i (form/count-of m))
+    ns
+    (let [k (form/nth-of m i)
+          text (if (or (form/is-keyword? k) (form/is-symbol? k)) (key-print k) "")
+          this (key-ns k text)]
+      (if (= 0 (string-byte-length this))
+        ""
+        (if (or (= i 0) (= 0 (string-compare ns this)))
+          (shared-ns m (+ i 2) this)
+          "")))))
+
+;; ---- the recursive text ------------------------------------------------------------------------
+
+;; texts of every kid of F
+(defn- kid-texts [f [:ref :form/r] i :i64 acc [:list :string]] [:list :string]
+  (if (>= i (form/count-of f))
+    acc
+    (kid-texts f (+ i 1) (texts-add acc (canonical-text (form/nth-of f i))))))
+
+(defn- sorted-texts [texts [:list :string]] [:list :string]
+  (let [order (order-into texts 0 (no-texts))]
+    (loop [j 0 acc (no-texts)]
+      (if (>= j (vector-count order))
+        acc
+        (recur (+ j 1) (texts-add acc (texts-at texts (parse-index (texts-at order j)))))))))
+
+(defn- seq-text [f [:ref :form/r] sorted :bool] :string
+  (let [texts (kid-texts f 0 (no-texts))
+        chosen (if sorted (sorted-texts texts) texts)]
+    (string-concat "[" (string-concat (join-range chosen 0 (vector-count chosen) " ") "]"))))
+
+;; entry i of a map: the KEY text and the "key value" text (the key stripped of
+;; the shared namespace when lifted)
+(defn- entry-keys [m [:ref :form/r] i :i64 acc [:list :string]] [:list :string]
+  (if (>= (+ i 1) (form/count-of m))
+    acc
+    (entry-keys m (+ i 2) (texts-add acc (canonical-text (form/nth-of m i))))))
+
+(defn- entry-texts [m [:ref :form/r] i :i64 lift :bool acc [:list :string]] [:list :string]
+  (if (>= (+ i 1) (form/count-of m))
+    acc
+    (let [k (form/nth-of m i)
+          kt (canonical-text k)
+          shown (if lift (key-strip k kt) kt)]
+      (entry-texts m (+ i 2) lift
+                   (texts-add acc (string-concat shown (string-concat " " (canonical-text (form/nth-of m (+ i 1))))))))))
+
+(defn- map-text [m [:ref :form/r]] :string
+  (let [common (shared-ns m 0 "")
+        lift (< 0 (string-byte-length common))
+        key-texts (entry-keys m 0 (no-texts))
+        entries (entry-texts m 0 lift (no-texts))
+        order (order-into key-texts 0 (no-texts))
+        sorted (loop [j 0 acc (no-texts)]
+                 (if (>= j (vector-count order))
+                   acc
+                   (recur (+ j 1) (texts-add acc (texts-at entries (parse-index (texts-at order j)))))))]
+    (let [prefix (if lift (string-concat "#:" common) "")
+          body (string-concat "{" (string-concat (join-range sorted 0 (vector-count sorted) ", ") "}"))]
+      (string-concat prefix body))))
+
+(defn canonical-text [f [:ref :form/r]] :string
+  (let [t (form/tag-of f)]
+    (cond
+      (= t 9) (map-text f)
+      (= t 8) (seq-text f true)
+      (or (= t 7) (= t 6)) (seq-text f false)
+      :else (scalar-text f))))
+
+(defn sha256-form [f [:ref :form/r]] :string
+  (hash/sha256 (canonical-text f)))
+
+;; constant-time equality of two digest texts over their UTF-8 bytes
+(defn- digest-equal? [a :string b :string] :bool
+  (let [x (string-to-utf8 a)
+        y (string-to-utf8 b)]
+    (if (= (bytes-count x) (bytes-count y))
+      (loop [i 0 diff 0]
+        (if (< i (bytes-count x))
+          (recur (+ i 1) (bit-or diff (bit-xor (bytes-at x i) (bytes-at y i))))
+          (= diff 0)))
+      false)))
+
+;; the artifact carries a :sha256 string equal to the digest of itself without it
+(defn valid-seal? [artifact [:ref :form/r]] :bool
+  (let [claimed (form/form-get artifact (form/keyword-form :sha256))]
+    (if (form/is-string? claimed)
+      (digest-equal? (form/string-value claimed)
+                     (sha256-form (form/dissoc-form artifact (form/keyword-form :sha256))))
+      false)))

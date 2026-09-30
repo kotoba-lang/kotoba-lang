@@ -1,0 +1,239 @@
+;; kotoba.verifier.region -- granted-region provenance for the guest-route
+;; kotoba.verifier twin: a REAL port of osaho's `granted-region-provenance`,
+;; `region-tainted-positions`, `traceable-region-base?` and `let-bindings`.
+;;
+;; On a hosted (non-kernel) target a program may not CHOOSE the base of a slice
+;; access: every base must be a parameter of the enclosing function (a region the
+;; caller granted) or a rodata literal, followed through `let` bindings, and every
+;; argument flowing into a tainted parameter position of an internal callee must
+;; be traceable too. `provenance-ok?` answers true when no offender is found.
+;;
+;; QUIRK KEPT: the host reports an offender with `some`, so an offender that is
+;; falsy (a missing argument, or the literal `false`) is not reported. `truthy?`
+;; reproduces that.
+
+(ns kotoba.verifier.region
+  (:require [kotoba.form :as form]
+            [kotoba.verifier.fx :as fx]
+            [kotoba.verifier.ops :as ops])
+  (:export [provenance-ok?])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                       [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]}))
+
+(defn- nilf [] [:ref :form/r] (form/nil-form))
+(defn- kw [k :keyword] [:ref :form/r] (form/keyword-form k))
+(defn- field [m [:ref :form/r] k :keyword] [:ref :form/r] (form/form-get m (form/keyword-form k)))
+
+;; a Form is truthy unless it is nil or the boolean false
+(defn- truthy? [f [:ref :form/r]] :bool
+  (not (or (form/is-nil? f) (and (form/is-bool? f) (not (form/bool-value f))))))
+
+(defn- head-name [f [:ref :form/r]] :string
+  (if (and (form/is-seq? f) (> (form/count-of f) 0) (form/is-symbol? (form/first-of f)))
+    (form/symbol-value (form/first-of f))
+    ""))
+
+(defn- region-call? [f [:ref :form/r]] :bool
+  (ops/granted-region-op? (head-name f)))
+
+;; ---- symbol sets (vec Forms) ---------------------------------------------------------
+
+(defn- has-sym? [xs [:ref :form/r] x [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of xs))
+    false
+    (if (form/eq (form/nth-of xs i) x)
+      true
+      (has-sym? xs x (+ i 1)))))
+
+(defn- conj-sym [xs [:ref :form/r] x [:ref :form/r]] [:ref :form/r]
+  (if (has-sym? xs x 0) xs (form/form-vec (form/append-form (form/kids-of xs) x))))
+
+(defn- disj-sym [xs [:ref :form/r] x [:ref :form/r]] [:ref :form/r]
+  (form/form-vec
+   (loop [i 0 acc (form/no-forms)]
+     (if (>= i (form/count-of xs))
+       acc
+       (recur (+ i 1)
+              (if (form/eq (form/nth-of xs i) x) acc (form/append-form acc (form/nth-of xs i))))))))
+
+;; ---- traceability ---------------------------------------------------------------------
+
+(defn- rodata-head? [name :string] :bool
+  (or (string=? name "ucs2") (or (string=? name "guid") (string=? name "bytes-literal"))))
+
+(defn- traceable-base? [expr [:ref :form/r] known [:ref :form/r]] :bool
+  (or (and (form/is-symbol? expr) (has-sym? known expr 0))
+      (and (form/is-seq? expr)
+           (rodata-head? (head-name expr))
+           (= 2 (form/count-of expr))
+           (form/is-string? (form/nth-of expr 1)))))
+
+;; ---- tainted parameter positions ---------------------------------------------------------
+
+;; index of SYM among PARAMS, -1 when absent
+(defn- index-of-param [params [:ref :form/r] sym [:ref :form/r] i :i64] :i64
+  (if (>= i (form/count-of params))
+    -1
+    (if (form/eq (form/nth-of params i) sym)
+      i
+      (index-of-param params sym (+ i 1)))))
+
+(defn- function-named [functions [:ref :form/r] name [:ref :form/r] i :i64] [:ref :form/r]
+  (if (>= i (form/count-of functions))
+    (nilf)
+    (if (form/eq (field (form/nth-of functions i) :name) name)
+      (form/nth-of functions i)
+      (function-named functions name (+ i 1)))))
+
+(defn- int-set-add [xs [:ref :form/r] n :i64] [:ref :form/r]
+  (let [x (form/int-form n)]
+    (if (has-sym? xs x 0) xs (form/form-vec (form/append-form (form/kids-of xs) x)))))
+
+;; direct taint of one function: the param indexes used directly as a base
+(defn- direct-taint [params [:ref :form/r] node [:ref :form/r] acc [:ref :form/r]] [:ref :form/r]
+  (let [here (if (and (region-call? node) (form/is-symbol? (form/nth-of node 1)))
+               (let [i (index-of-param params (form/nth-of node 1) 0)]
+                 (if (>= i 0) (int-set-add acc i) acc))
+               acc)]
+    (if (or (form/is-seq? node) (or (form/is-vec? node) (or (form/is-set? node) (form/is-map? node))))
+      (direct-taint-kids params node 0 here)
+      here)))
+
+(defn- direct-taint-kids [params [:ref :form/r] node [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of node))
+    acc
+    (direct-taint-kids params node (+ i 1) (direct-taint params (form/nth-of node i) acc))))
+
+(defn- direct-map [functions [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of functions))
+    acc
+    (let [f (form/nth-of functions i)]
+      (direct-map functions (+ i 1)
+                  (form/assoc-form acc (field f :name)
+                                   (direct-taint (field f :params) (field f :body) (form/form-vec (form/no-forms))))))))
+
+;; propagate through calls: an argument that is a param of the caller, passed into
+;; a tainted position of an internal callee, taints the caller's position
+(defn- propagate-node [f [:ref :form/r] functions [:ref :form/r] tainted [:ref :form/r]
+                       node [:ref :form/r] acc [:ref :form/r]] [:ref :form/r]
+  (let [callee-name (if (and (form/is-seq? node) (> (form/count-of node) 0)) (form/first-of node) (nilf))
+        callee (if (form/is-symbol? callee-name) (function-named functions callee-name 0) (nilf))
+        here (if (form/is-map? callee)
+               (propagate-positions f (form/form-get tainted callee-name) node 0 acc)
+               acc)]
+    (if (or (form/is-seq? node) (or (form/is-vec? node) (or (form/is-set? node) (form/is-map? node))))
+      (propagate-kids f functions tainted node 0 here)
+      here)))
+
+(defn- propagate-kids [f [:ref :form/r] functions [:ref :form/r] tainted [:ref :form/r]
+                       node [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of node))
+    acc
+    (propagate-kids f functions tainted node (+ i 1)
+                    (propagate-node f functions tainted (form/nth-of node i) acc))))
+
+(defn- propagate-positions [f [:ref :form/r] positions [:ref :form/r] call [:ref :form/r]
+                            j :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= j (form/count-of positions))
+    acc
+    (let [arg (form/nth-of call (+ 1 (form/int-value (form/nth-of positions j))))
+          i (if (form/is-symbol? arg) (index-of-param (field f :params) arg 0) -1)]
+      (propagate-positions f positions call (+ j 1) (if (>= i 0) (int-set-add acc i) acc)))))
+
+(defn- taint-size [tainted [:ref :form/r] i :i64 acc :i64] :i64
+  (if (>= (+ i 1) (form/count-of tainted))
+    acc
+    (taint-size tainted (+ i 2) (+ acc (form/count-of (form/nth-of tainted (+ i 1)))))))
+
+(defn- propagate-round [functions [:ref :form/r] tainted [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of functions))
+    acc
+    (let [f (form/nth-of functions i)
+          mine (propagate-node f functions tainted (field f :body) (form/form-get acc (field f :name)))]
+      (propagate-round functions tainted (+ i 1) (form/assoc-form acc (field f :name) mine)))))
+
+(defn- tainted-positions [functions [:ref :form/r] tainted [:ref :form/r]] [:ref :form/r]
+  (let [next (propagate-round functions tainted 0 tainted)]
+    (if (= (taint-size next 0 0) (taint-size tainted 0 0))
+      tainted
+      (tainted-positions functions next))))
+
+;; ---- the scoped scan ----------------------------------------------------------------------
+
+(defn- let-form? [f [:ref :form/r]] :bool
+  (and (string=? (head-name f) "let")
+       (form/is-vec? (form/nth-of f 1))
+       (= 0 (rem (form/count-of (form/nth-of f 1)) 2))))
+
+;; the first offender among forms i.. of NODE, each scanned under KNOWN
+(defn- scan-each [node [:ref :form/r] i :i64 known [:ref :form/r] functions [:ref :form/r]
+                  tainted [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of node))
+    (nilf)
+    (let [o (scan known (form/nth-of node i) functions tainted)]
+      (if (truthy? o)
+        o
+        (scan-each node (+ i 1) known functions tainted)))))
+
+(defn- scan-let-pairs [pairs [:ref :form/r] i :i64 env [:ref :form/r] form [:ref :form/r]
+                       functions [:ref :form/r] tainted [:ref :form/r]] [:ref :form/r]
+  (if (>= (+ i 1) (form/count-of pairs))
+    (scan-each form 2 env functions tainted)
+    (let [name (form/nth-of pairs i)
+          init (form/nth-of pairs (+ i 1))
+          o (scan env init functions tainted)]
+      (if (truthy? o)
+        o
+        (scan-let-pairs pairs (+ i 2)
+                        (if (traceable-base? init env) (conj-sym env name) (disj-sym env name))
+                        form functions tainted)))))
+
+(defn- scan-tainted-args [call [:ref :form/r] positions [:ref :form/r] j :i64 known [:ref :form/r]] [:ref :form/r]
+  (if (>= j (form/count-of positions))
+    (nilf)
+    (let [arg (form/nth-of call (+ 1 (form/int-value (form/nth-of positions j))))]
+      (if (and (not (traceable-base? arg known)) (truthy? arg))
+        arg
+        (scan-tainted-args call positions (+ j 1) known)))))
+
+(defn- scan [known [:ref :form/r] form [:ref :form/r] functions [:ref :form/r] tainted [:ref :form/r]] [:ref :form/r]
+  (cond
+    (let-form? form)
+    (scan-let-pairs (form/nth-of form 1) 0 known form functions tainted)
+
+    (region-call? form)
+    (let [base (form/nth-of form 1)]
+      (if (traceable-base? base known)
+        (scan-each form 2 known functions tainted)
+        base))
+
+    (and (form/is-seq? form) (> (form/count-of form) 0) (form/is-symbol? (form/first-of form))
+         (form/is-map? (function-named functions (form/first-of form) 0)))
+    (let [o (scan-tainted-args form (form/form-get tainted (form/first-of form)) 0 known)]
+      (if (truthy? o)
+        o
+        (scan-each form 1 known functions tainted)))
+
+    (or (form/is-seq? form) (or (form/is-vec? form) (or (form/is-set? form) (form/is-map? form))))
+    (scan-each form 0 known functions tainted)
+
+    :else (nilf)))
+
+(defn- params-set [params [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of params))
+    acc
+    (params-set params (+ i 1) (conj-sym acc (form/nth-of params i)))))
+
+(defn- first-offender [functions [:ref :form/r] all [:ref :form/r] tainted [:ref :form/r] i :i64] [:ref :form/r]
+  (if (>= i (form/count-of functions))
+    (nilf)
+    (let [f (form/nth-of functions i)
+          o (scan (params-set (field f :params) 0 (form/form-vec (form/no-forms))) (field f :body) all tainted)]
+      (if (truthy? o)
+        o
+        (first-offender functions all tainted (+ i 1))))))
+
+;; true when no base under FUNCTIONS is untraceable
+(defn provenance-ok? [functions [:ref :form/r]] :bool
+  (let [tainted (tainted-positions functions (direct-map functions 0 (form/form-map (form/no-forms))))]
+    (not (truthy? (first-offender functions functions tainted 0)))))

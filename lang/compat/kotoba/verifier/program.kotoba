@@ -1,0 +1,626 @@
+;; kotoba.verifier.program -- the runtime-KIR PROGRAM verifier of the guest-route
+;; kotoba.verifier twin: a REAL port of osaho's `verify-program!` (module shape,
+;; function shape, signature table, per-function expression walk, effect
+;; inference, module effect union, lowering budget) over `:form/r`.
+;;
+;; `verify-program-message` answers "" for an accepted program and otherwise the
+;; host's rejection message (same text; the first rejection wins, in the host's
+;; order). The KIR program is a Form: a map with :format :entry :exports
+;; :signature :effects :functions (and optionally :schemas).
+;;
+;; EFFECT SETS. The host holds sets of `[:cap/call id]` vectors and the keyword
+;; :state. Here a body's capability ids are int Forms in a duplicate-free list;
+;; :state is a flag. `infer-effects` is the host's fixpoint (each function's
+;; direct ids united with its callees' inferred ids until nothing grows).
+
+(ns kotoba.verifier.program
+  (:require [kotoba.form :as form]
+            [kotoba.verifier.fx :as fx]
+            [kotoba.verifier.kir :as vk])
+  (:export [verify-program-message boxed-aggregate-module? program-shape-ok?
+            native-boundary-type? native-float-boundary-type? effect-ids-of
+            state-flag-of ids-equal?])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                       [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
+             :verifier/vr [:record :verifier/vr [[:msg :string] [:nodes :i64]
+                                                  [:facts [:list [:ref :form/r]]]]]
+             :verifier/fw [:record :verifier/fw [[:msg :string] [:nodes :i64]
+                                                  [:ids [:list [:ref :form/r]]]
+                                                  [:calls [:list [:ref :form/r]]]]]}))
+
+(defn- max-functions [] :i64 1024)
+(defn- max-parameters [] :i64 64)
+(defn- max-schema-table-entries [] :i64 32)
+(defn- max-lowered-nodes [] :i64 100000)
+
+(defn- kw [k :keyword] [:ref :form/r] (form/keyword-form k))
+(defn- field [m [:ref :form/r] k :keyword] [:ref :form/r] (form/form-get m (form/keyword-form k)))
+(defn- has? [m [:ref :form/r] k :keyword] :bool (fx/has-key? m k))
+(defn- kw-is? [f [:ref :form/r] k :keyword] :bool (fx/kw-is? f k))
+
+;; ---- effect ids ---------------------------------------------------------------
+
+(defn- ids-has? [ids [:ref :form/r] id [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of ids))
+    false
+    (if (form/eq (form/nth-of ids i) id)
+      true
+      (ids-has? ids id (+ i 1)))))
+
+;; IDS (a vec Form of int Forms) with ID added unless present
+(defn- ids-add [ids [:ref :form/r] id [:ref :form/r]] [:ref :form/r]
+  (if (ids-has? ids id 0)
+    ids
+    (form/form-vec (form/append-form (form/kids-of ids) id))))
+
+(defn- ids-union-into [acc [:ref :form/r] more [:ref :form/r] i :i64] [:ref :form/r]
+  (if (>= i (form/count-of more))
+    acc
+    (ids-union-into (ids-add acc (form/nth-of more i)) more (+ i 1))))
+
+(defn- ids-empty [] [:ref :form/r] (form/form-vec (form/no-forms)))
+
+(defn ids-equal? [a [:ref :form/r] b [:ref :form/r]] :bool
+  (and (= (form/count-of a) (form/count-of b))
+       (ids-subset? a b 0)))
+
+(defn- ids-subset? [a [:ref :form/r] b [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of a))
+    true
+    (if (ids-has? b (form/nth-of a i) 0)
+      (ids-subset? a b (+ i 1))
+      false)))
+
+;; the capability ids of an effect SET Form (items [:cap/call n] and :state)
+(defn- effect-ids-from [effects [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of effects))
+    acc
+    (let [e (form/nth-of effects i)]
+      (effect-ids-from effects (+ i 1)
+                       (if (and (form/is-vec? e) (= 2 (form/count-of e)))
+                         (ids-add acc (form/nth-of e 1))
+                         acc)))))
+
+(defn effect-ids-of [effects [:ref :form/r]] [:ref :form/r]
+  (effect-ids-from effects 0 (ids-empty)))
+
+(defn- has-state? [effects [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of effects))
+    false
+    (if (kw-is? (form/nth-of effects i) :state)
+      true
+      (has-state? effects (+ i 1)))))
+
+(defn state-flag-of [effects [:ref :form/r]] :bool (has-state? effects 0))
+
+(defn- valid-effect? [e [:ref :form/r]] :bool
+  (or (kw-is? e :state)
+      (and (form/is-vec? e) (= 2 (form/count-of e))
+           (kw-is? (form/nth-of e 0) :cap/call)
+           (form/is-int? (form/nth-of e 1))
+           (>= (form/int-value (form/nth-of e 1)) 0)
+           (<= (form/int-value (form/nth-of e 1)) 255))))
+
+(defn- all-valid-effects? [effects [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of effects))
+    true
+    (if (valid-effect? (form/nth-of effects i))
+      (all-valid-effects? effects (+ i 1))
+      false)))
+
+;; ---- boundary types -------------------------------------------------------------
+
+(defn native-float-boundary-type? [t [:ref :form/r]] :bool (kw-is? t :f64))
+
+(defn native-boundary-type? [t [:ref :form/r]] :bool
+  (or (fx/word-field-type? t)
+      (or (native-float-boundary-type? t)
+          (or (fx/native-word-value-type? t 0)
+              (or (fx/native-scalar-record-type? t 0)
+                  (or (fx/native-scalar-variant-boundary-type? t)
+                      (fx/ref-type? t)))))))
+
+(defn- private-handle-type? [t [:ref :form/r]] :bool
+  (or (kw-is? t :vector-i64)
+      (or (kw-is? t :vector-f64) (or (kw-is? t :string-index) (kw-is? t :bytes)))))
+
+(defn- function-boundary-type? [t [:ref :form/r] exported :bool] :bool
+  (or (native-boundary-type? t)
+      (and (not exported)
+           (or (private-handle-type? t) (fx/native-handle-type? t 0)))))
+
+(defn- export-copy-result-type? [t [:ref :form/r]] :bool
+  (or (kw-is? t :vector-i64) (kw-is? t :vector-f64)))
+
+(defn- entry-result-type? [t [:ref :form/r]] :bool
+  (or (kw-is? t :i64)
+      (or (kw-is? t :bool)
+          (or (kw-is? t :string) (fx/native-scalar-variant-boundary-type? t)))))
+
+(defn- function-result-type? [t [:ref :form/r]] :bool
+  (or (kw-is? t :i64) (or (kw-is? t :bool) (kw-is? t :string))))
+
+;; the NAMED reason a type cannot cross a native boundary: [:slice ...]
+(defn- erased-source-carrier? [t [:ref :form/r]] :bool
+  (and (form/is-vec? t) (> (form/count-of t) 0) (kw-is? (form/nth-of t 0) :slice)))
+
+;; ---- recursive schema tables --------------------------------------------------------
+
+;; every [:ref X] mentioned anywhere under NODE, appended to ACC as the X Forms
+(defn- refs-kids [node [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (form/count-of node))
+    acc
+    (refs-kids node (+ i 1) (refs-of (form/nth-of node i) acc))))
+
+(defn- refs-of [node [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (let [here (if (fx/ref-type-loose? node)
+               (form/append-form acc (form/nth-of node 1))
+               acc)]
+    (if (or (form/is-seq? node) (or (form/is-vec? node) (or (form/is-set? node) (form/is-map? node))))
+      (refs-kids node 0 here)
+      here)))
+
+(defn- list-has? [xs [:list [:ref :form/r]] x [:ref :form/r]] :bool
+  (loop [i 0]
+    (if (>= i (vector-count xs))
+      false
+      (if (form/eq (typed-list-nth [:list [:ref :form/r]] xs i) x)
+        true
+        (recur (+ i 1))))))
+
+;; does START reach itself through the refs of the table's schemas
+(defn- reaches-self? [table [:ref :form/r] start [:ref :form/r]
+                      frontier [:list [:ref :form/r]] i :i64 seen [:list [:ref :form/r]]] :bool
+  (if (>= i (vector-count frontier))
+    false
+    (let [name (typed-list-nth [:list [:ref :form/r]] frontier i)]
+      (cond
+        (form/eq name start) true
+        (list-has? seen name) (reaches-self? table start frontier (+ i 1) seen)
+        :else (reaches-self? table start
+                             (refs-of (form/form-get table name) frontier)
+                             (+ i 1)
+                             (form/append-form seen name))))))
+
+(defn- some-start-reaches-self? [table [:ref :form/r] i :i64] :bool
+  (if (>= (+ i 1) (form/count-of table))
+    false
+    (let [start (form/nth-of table i)]
+      (or (reaches-self? table start (refs-of (form/nth-of table (+ i 1)) (form/no-forms)) 0 (form/no-forms))
+          (some-start-reaches-self? table (+ i 2))))))
+
+(defn- schema-entries-ok? [table [:ref :form/r] i :i64] :bool
+  (if (>= (+ i 1) (form/count-of table))
+    true
+    (let [name (form/nth-of table i)
+          descriptor (form/nth-of table (+ i 1))]
+      (if (and (form/is-keyword? name) (form/keyword-has-namespace? name)
+               (fx/native-handle-type? descriptor 0)
+               (form/is-vec? descriptor)
+               (form/eq name (form/nth-of descriptor 1)))
+        (schema-entries-ok? table (+ i 2))
+        false))))
+
+(defn- schemas-ok? [table [:ref :form/r]] :bool
+  (and (form/is-map? table)
+       (>= (quot (form/count-of table) 2) 1)
+       (<= (quot (form/count-of table) 2) (max-schema-table-entries))
+       (schema-entries-ok? table 0)
+       (some-start-reaches-self? table 0)))
+
+;; ---- module shape --------------------------------------------------------------------
+
+(defn- key-in-program? [k [:ref :form/r]] :bool
+  (or (kw-is? k :format)
+      (or (kw-is? k :entry)
+          (or (kw-is? k :exports)
+              (or (kw-is? k :signature)
+                  (or (kw-is? k :effects)
+                      (or (kw-is? k :functions) (kw-is? k :schemas))))))))
+
+(defn- program-keys-ok? [p [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of p))
+    true
+    (if (key-in-program? (form/nth-of p i))
+      (program-keys-ok? p (+ i 2))
+      false)))
+
+;; the number of distinct keys equals the number of entries (a duplicate key
+;; would otherwise pass the subset test twice)
+(defn- keys-distinct? [m [:ref :form/r] i :i64 j :i64] :bool
+  (if (>= i (form/count-of m))
+    true
+    (if (>= j i)
+      (keys-distinct? m (+ i 2) 0)
+      (if (form/eq (form/nth-of m i) (form/nth-of m j))
+        false
+        (keys-distinct? m i (+ j 2))))))
+
+(defn program-shape-ok? [p [:ref :form/r]] :bool
+  (and (form/is-map? p)
+       (keys-distinct? p 0 0)
+       (program-keys-ok? p 0)
+       (has? p :format) (has? p :entry) (has? p :exports)
+       (has? p :signature) (has? p :effects) (has? p :functions)
+       (= (quot (form/count-of p) 2) (if (has? p :schemas) 7 6))
+       (or (not (has? p :schemas)) (schemas-ok? (field p :schemas)))
+       (or (kw-is? (field p :format) :kotoba.kir/v3) (kw-is? (field p :format) :kotoba.kir/v4))
+       (or (and (form/is-symbol? (field p :entry))
+                (string=? (form/symbol-value (field p :entry)) "main"))
+           (and (form/is-nil? (field p :entry))
+                (form/is-vec? (field p :exports))
+                (> (form/count-of (field p :exports)) 0)))
+       (or (form/is-nil? (field p :entry))
+           (and (or (form/is-vec? (field (field p :signature) :params))
+                    (form/is-seq? (field (field p :signature) :params)))
+                (= 0 (form/count-of (field (field p :signature) :params)))))
+       (or (form/is-nil? (field p :entry))
+           (entry-result-type? (field (field p :signature) :result)))
+       (if (form/is-nil? (field p :entry))
+         (form/is-nil? (field p :signature))
+         (and (form/is-map? (field p :signature))
+              (= 2 (quot (form/count-of (field p :signature)) 2))
+              (has? (field p :signature) :params)
+              (has? (field p :signature) :result)))
+       (form/is-set? (field p :effects))
+       (all-valid-effects? (field p :effects) 0)
+       (form/is-vec? (field p :functions))
+       (form/is-vec? (field p :exports))
+       (>= (form/count-of (field p :functions)) 1)
+       (<= (form/count-of (field p :functions)) (max-functions))))
+
+;; ---- boxed-aggregate modules ------------------------------------------------------------
+
+(defn- form-boxed? [f [:ref :form/r]] :bool
+  (or (fx/boxed-payload-variant-type? f)
+      (and (form/is-seq? f)
+           (> (form/count-of f) 0)
+           (form/is-symbol? (form/first-of f))
+           (ops-hetero? (form/symbol-value (form/first-of f))))))
+
+(defn- ops-hetero? [n :string] :bool
+  (or (string=? n "hetero-vector-new")
+      (or (string=? n "hetero-vector-count")
+          (or (string=? n "hetero-vector-at") (string=? n "hetero-vector-assoc")))))
+
+(defn- boxed-kids? [node [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of node))
+    false
+    (or (boxed-in? (form/nth-of node i))
+        (boxed-kids? node (+ i 1)))))
+
+(defn- boxed-in? [node [:ref :form/r]] :bool
+  (or (form-boxed? node)
+      (and (or (form/is-seq? node) (or (form/is-vec? node) (or (form/is-set? node) (form/is-map? node))))
+           (boxed-kids? node 0))))
+
+(defn boxed-aggregate-module? [program [:ref :form/r]] :bool
+  (boxed-in? (field program :functions)))
+
+;; ---- function shape ---------------------------------------------------------------------
+
+(defn- key-in-function? [k [:ref :form/r]] :bool
+  (or (kw-is? k :name)
+      (or (kw-is? k :params)
+          (or (kw-is? k :result)
+              (or (kw-is? k :effects)
+                  (or (kw-is? k :body)
+                      (or (kw-is? k :param-types)
+                          (or (kw-is? k :closure-param-indexes)
+                              (or (kw-is? k :i64-pair-chain-param-indexes)
+                                  (kw-is? k :closure-result?))))))))))
+
+(defn- function-keys-ok? [fn-form [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of fn-form))
+    true
+    (if (key-in-function? (form/nth-of fn-form i))
+      (function-keys-ok? fn-form (+ i 2))
+      false)))
+
+(defn- all-valid-names? [xs [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of xs))
+    true
+    (if (fx/valid-name? (form/nth-of xs i))
+      (all-valid-names? xs (+ i 1))
+      false)))
+
+(defn- names-distinct? [xs [:ref :form/r] i :i64 j :i64] :bool
+  (if (>= i (form/count-of xs))
+    true
+    (if (>= j i)
+      (names-distinct? xs (+ i 1) 0)
+      (if (form/eq (form/nth-of xs i) (form/nth-of xs j))
+        false
+        (names-distinct? xs i (+ j 1))))))
+
+(defn- all-boundary-types? [types [:ref :form/r] i :i64 exported :bool] :bool
+  (if (>= i (form/count-of types))
+    true
+    (if (function-boundary-type? (form/nth-of types i) exported)
+      (all-boundary-types? types (+ i 1) exported)
+      false)))
+
+;; raw index vector: ints, strictly ascending, each in range and typed :i64
+(defn- index-type-i64? [f [:ref :form/r] i :i64] :bool
+  (if (has? f :param-types)
+    (kw-is? (form/nth-of (field f :param-types) i) :i64)
+    true))
+
+(defn- indexes-ok? [f [:ref :form/r] raw [:ref :form/r] i :i64 prev :i64] :bool
+  (if (>= i (form/count-of raw))
+    true
+    (let [x (form/nth-of raw i)]
+      (if (and (form/is-int? x)
+               (> (form/int-value x) prev)
+               (>= (form/int-value x) 0)
+               (< (form/int-value x) (form/count-of (field f :params)))
+               (index-type-i64? f (form/int-value x)))
+        (indexes-ok? f raw (+ i 1) (form/int-value x))
+        false))))
+
+(defn- closure-indexes-valid? [f [:ref :form/r]] :bool
+  (if (not (has? f :closure-param-indexes))
+    true
+    (and (form/is-vec? (field f :closure-param-indexes))
+         (indexes-ok? f (field f :closure-param-indexes) 0 -1))))
+
+(defn- in-closure-indexes? [f [:ref :form/r] n :i64] :bool
+  (if (has? f :closure-param-indexes)
+    (ids-has? (field f :closure-param-indexes) (form/int-form n) 0)
+    false))
+
+(defn- pair-chain-disjoint? [f [:ref :form/r] raw [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of raw))
+    true
+    (if (in-closure-indexes? f (form/int-value (form/nth-of raw i)))
+      false
+      (pair-chain-disjoint? f raw (+ i 1)))))
+
+(defn- pair-chain-valid? [f [:ref :form/r]] :bool
+  (if (not (has? f :i64-pair-chain-param-indexes))
+    true
+    (and (form/is-vec? (field f :i64-pair-chain-param-indexes))
+         (indexes-ok? f (field f :i64-pair-chain-param-indexes) 0 -1)
+         (pair-chain-disjoint? f (field f :i64-pair-chain-param-indexes) 0))))
+
+(defn- closure-result-valid? [f [:ref :form/r]] :bool
+  (if (not (has? f :closure-result?))
+    true
+    (and (form/is-true? (field f :closure-result?))
+         (kw-is? (field f :result) :i64))))
+
+(defn- exports-has? [exports [:ref :form/r] name [:ref :form/r]] :bool
+  (ids-has? exports name 0))
+
+(defn- function-ok? [f [:ref :form/r] exported :bool entry [:ref :form/r]] :bool
+  (and (form/is-map? f)
+       (function-keys-ok? f 0)
+       (has? f :name) (has? f :params) (has? f :result) (has? f :effects) (has? f :body)
+       (fx/valid-name? (field f :name))
+       (form/is-vec? (field f :params))
+       (<= (form/count-of (field f :params)) (max-parameters))
+       (all-valid-names? (field f :params) 0)
+       (names-distinct? (field f :params) 0 0)
+       (or (function-result-type? (field f :result))
+           (or (native-float-boundary-type? (field f :result))
+               (or (and exported
+                        (not (form/eq (field f :name) entry))
+                        (= 0 (form/count-of (field f :params)))
+                        (export-copy-result-type? (field f :result)))
+                   (function-boundary-type? (field f :result) exported))))
+       (or (not (has? f :param-types))
+           (and (form/is-vec? (field f :param-types))
+                (= (form/count-of (field f :param-types)) (form/count-of (field f :params)))
+                (all-boundary-types? (field f :param-types) 0 exported)))
+       (closure-indexes-valid? f)
+       (pair-chain-valid? f)
+       (closure-result-valid? f)
+       (form/is-set? (field f :effects))
+       (all-valid-effects? (field f :effects) 0)))
+
+(defn- carrier-types-clean? [f [:ref :form/r]] :bool
+  (if (form/is-map? f)
+    (and (not (erased-source-carrier? (field f :result)))
+         (if (form/is-vec? (field f :param-types))
+           (not (any-carrier? (field f :param-types) 0))
+           true))
+    true))
+
+(defn- any-carrier? [types [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of types))
+    false
+    (if (erased-source-carrier? (form/nth-of types i))
+      true
+      (any-carrier? types (+ i 1)))))
+
+;; the first failing function's message, "" when every function is well formed.
+;; SIGS accumulates {name params}.
+(defn- functions-shape-message [functions [:ref :form/r] i :i64 exports [:ref :form/r]
+                                entry [:ref :form/r]] :string
+  (if (>= i (form/count-of functions))
+    ""
+    (let [f (form/nth-of functions i)
+          exported (and (form/is-map? f) (exports-has? exports (field f :name)))]
+      (cond
+        (not (carrier-types-clean? f))
+        "runtime KIR function carries a source carrier type the machine does not"
+        (not (function-ok? f exported entry))
+        "runtime KIR function shape rejected"
+        :else (functions-shape-message functions (+ i 1) exports entry)))))
+
+(defn- signatures-of [functions [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of functions))
+    acc
+    (let [f (form/nth-of functions i)]
+      (signatures-of functions (+ i 1) (form/assoc-form acc (field f :name) (field f :params))))))
+
+(defn- results-of [functions [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of functions))
+    acc
+    (let [f (form/nth-of functions i)]
+      (results-of functions (+ i 1) (form/assoc-form acc (field f :name) (field f :result))))))
+
+(defn- exports-distinct? [exports [:ref :form/r]] :bool
+  (names-distinct? exports 0 0))
+
+(defn- exports-all-known? [exports [:ref :form/r] sigs [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of exports))
+    true
+    (if (form/form-has? sigs (form/nth-of exports i))
+      (exports-all-known? exports sigs (+ i 1))
+      false)))
+
+(defn- entry-identity-ok? [program [:ref :form/r] sigs [:ref :form/r]] :bool
+  (if (form/is-nil? (field program :entry))
+    (> (form/count-of (field program :exports)) 0)
+    (let [main (form/symbol-form "main")]
+      (and (form/form-has? sigs main)
+           (= 0 (form/count-of (form/form-get sigs main)))
+           (ids-has? (field program :exports) main 0)))))
+
+;; ---- per-function walk -----------------------------------------------------------------
+
+;; the capability ids among FACTS (int Forms) and the callee names (symbols)
+(defn- facts-ids [facts [:list [:ref :form/r]] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (vector-count facts))
+    acc
+    (let [f (typed-list-nth [:list [:ref :form/r]] facts i)]
+      (facts-ids facts (+ i 1) (if (form/is-int? f) (ids-add acc f) acc)))))
+
+(defn- facts-calls [facts [:list [:ref :form/r]] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (vector-count facts))
+    acc
+    (let [f (typed-list-nth [:list [:ref :form/r]] facts i)]
+      (facts-calls facts (+ i 1) (if (form/is-symbol? f) (ids-add acc f) acc)))))
+
+(defn- fw-new [msg :string nodes :i64 ids [:list [:ref :form/r]] calls [:list [:ref :form/r]]] [:ref :verifier/fw]
+  (record-new [:ref :verifier/fw] msg nodes ids calls))
+(defn- fw-msg [r [:ref :verifier/fw]] :string (record-get [:ref :verifier/fw] r :msg))
+(defn- fw-nodes [r [:ref :verifier/fw]] :i64 (record-get [:ref :verifier/fw] r :nodes))
+(defn- fw-ids [r [:ref :verifier/fw]] [:list [:ref :form/r]] (record-get [:ref :verifier/fw] r :ids))
+(defn- fw-calls [r [:ref :verifier/fw]] [:list [:ref :form/r]] (record-get [:ref :verifier/fw] r :calls))
+
+;; walk every function body (nodes shared across functions, as the host's one
+;; volatile); the first rejection stops the walk
+(defn- walk-functions [functions [:ref :form/r] i :i64 cx [:ref :form/r] nodes :i64
+                       ids-acc [:list [:ref :form/r]] calls-acc [:list [:ref :form/r]]] [:ref :verifier/fw]
+  (if (>= i (form/count-of functions))
+    (fw-new "" nodes ids-acc calls-acc)
+    (let [f (form/nth-of functions i)
+          r (vk/check-expr (field f :body) (vk/aggregate-param-locals f cx) cx 0
+                           (vk/vr-new "" nodes (form/no-forms)))]
+      (if (not (string=? (vk/vr-msg r) ""))
+        (fw-new (vk/vr-msg r) (vk/vr-nodes r) ids-acc calls-acc)
+        (let [arena (vk/verify-arena-scopes f cx)]
+          (if (not (string=? arena ""))
+            (fw-new arena (vk/vr-nodes r) ids-acc calls-acc)
+            (walk-functions functions (+ i 1) cx (vk/vr-nodes r)
+                            (form/append-form ids-acc (facts-ids (vk/vr-facts r) 0 (ids-empty)))
+                            (form/append-form calls-acc (facts-calls (vk/vr-facts r) 0 (ids-empty))))))))))
+
+;; ---- effect inference ------------------------------------------------------------------
+
+(defn- name-index-of [functions [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of functions))
+    acc
+    (name-index-of functions (+ i 1)
+                   (form/assoc-form acc (field (form/nth-of functions i) :name) (form/int-form i)))))
+
+(defn- list-at [xs [:list [:ref :form/r]] i :i64] [:ref :form/r]
+  (typed-list-nth [:list [:ref :form/r]] xs i))
+
+;; direct ids of function I united with the current inferred ids of each callee
+(defn- callee-union [calls [:ref :form/r] j :i64 idx [:ref :form/r] cur [:list [:ref :form/r]]
+                     acc [:ref :form/r]] [:ref :form/r]
+  (if (>= j (form/count-of calls))
+    acc
+    (let [where (form/form-get idx (form/nth-of calls j))]
+      (callee-union calls (+ j 1) idx cur
+                    (if (form/is-int? where)
+                      (ids-union-into acc (list-at cur (form/int-value where)) 0)
+                      acc)))))
+
+(defn- infer-step [direct [:list [:ref :form/r]] calls [:list [:ref :form/r]] idx [:ref :form/r]
+                   cur [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count direct))
+    acc
+    (infer-step direct calls idx cur (+ i 1)
+                (form/append-form acc (callee-union (list-at calls i) 0 idx cur (list-at direct i))))))
+
+(defn- total-size [xs [:list [:ref :form/r]] i :i64 acc :i64] :i64
+  (if (>= i (vector-count xs))
+    acc
+    (total-size xs (+ i 1) (+ acc (form/count-of (list-at xs i))))))
+
+(defn- infer-effects [direct [:list [:ref :form/r]] calls [:list [:ref :form/r]] idx [:ref :form/r]
+                      cur [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (let [next (infer-step direct calls idx cur 0 (form/no-forms))]
+    (if (= (total-size next 0 0) (total-size cur 0 0))
+      cur
+      (infer-effects direct calls idx next))))
+
+;; declared capability ids of every function, in order
+(defn- declared-ids [functions [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (form/count-of functions))
+    acc
+    (declared-ids functions (+ i 1)
+                  (form/append-form acc (effect-ids-of (field (form/nth-of functions i) :effects))))))
+
+(defn- all-ids-equal? [a [:list [:ref :form/r]] b [:list [:ref :form/r]] i :i64] :bool
+  (if (>= i (vector-count a))
+    true
+    (if (ids-equal? (list-at a i) (list-at b i))
+      (all-ids-equal? a b (+ i 1))
+      false)))
+
+(defn- union-all-ids [xs [:list [:ref :form/r]] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (vector-count xs))
+    acc
+    (union-all-ids xs (+ i 1) (ids-union-into acc (list-at xs i) 0))))
+
+(defn- any-state? [functions [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of functions))
+    false
+    (if (state-flag-of (field (form/nth-of functions i) :effects))
+      true
+      (any-state? functions (+ i 1)))))
+
+(defn- cost-total [functions [:ref :form/r] i :i64 acc :i64] :i64
+  (if (>= i (form/count-of functions))
+    acc
+    (let [c (+ acc (vk/lowered-cost (field (form/nth-of functions i) :body) (form/form-map (form/no-forms))))]
+      (cost-total functions (+ i 1) (if (> c (+ (max-lowered-nodes) 1)) (+ (max-lowered-nodes) 1) c)))))
+
+;; ---- the entry point --------------------------------------------------------------------------
+
+(defn verify-program-message [program [:ref :form/r]] :string
+  (if (not (program-shape-ok? program))
+    "runtime KIR module shape rejected"
+    (let [functions (field program :functions)
+          exports (field program :exports)
+          shape (functions-shape-message functions 0 exports (field program :entry))]
+      (if (not (string=? shape ""))
+        shape
+        (let [sigs (signatures-of functions 0 (form/form-map (form/no-forms)))]
+          (if (not (and (= (form/count-of functions) (quot (form/count-of sigs) 2))
+                        (exports-distinct? exports)
+                        (exports-all-known? exports sigs 0)
+                        (entry-identity-ok? program sigs)))
+            "runtime KIR entry or function identity rejected"
+            (let [results (results-of functions 0 (form/form-map (form/no-forms)))
+                  cx (vk/make-cx sigs results (boxed-aggregate-module? program))
+                  walked (walk-functions functions 0 cx 0 (form/no-forms) (form/no-forms))]
+              (if (not (string=? (fw-msg walked) ""))
+                (fw-msg walked)
+                (let [idx (name-index-of functions 0 (form/form-map (form/no-forms)))
+                      inferred (infer-effects (fw-ids walked) (fw-calls walked) idx (fw-ids walked))
+                      declared (declared-ids functions 0 (form/no-forms))]
+                  (cond
+                    (not (all-ids-equal? inferred declared 0)) "runtime KIR function effects rejected"
+                    (not (and (ids-equal? (union-all-ids inferred 0 (ids-empty))
+                                          (effect-ids-of (field program :effects)))
+                              (= (any-state? functions 0)
+                                 (state-flag-of (field program :effects)))))
+                    "runtime KIR module effects rejected"
+                    (> (cost-total functions 0 0) (max-lowered-nodes)) "runtime KIR lowering budget exhausted"
+                    :else ""))))))))))

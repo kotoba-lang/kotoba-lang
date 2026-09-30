@@ -1,0 +1,406 @@
+;; kotoba.verifier -- the GUEST-ROUTE twin of osaho's `kotoba/verifier.cljk`, the
+;; independent native-artifact verifier (ADR 0024: being stricter than the
+;; producer is sound, being looser is not).
+;;
+;; WHY A TWIN. The host module is ~3300 lines over host data -- keyword-keyed
+;; maps, sets of `[:cap/call n]` vectors, bigints, `ex-info` rejections, dynamic
+;; vars and volatiles. A Kotoba module holds compiler data as the recursive
+;; `:form/r` record (kotoba.form), so the Kotoba surface is the same computation
+;; over it. The project route takes this file instead of the .cljk (extension
+;; priority across source roots); the host behaviour of the .cljk is untouched.
+;;
+;; THE CONTRACT
+;;   (verify-artifact-message kexe)  -> :string   "" when accepted, else the host's
+;;                                    rejection message (same text, same order)
+;;   (verify-artifact! kexe)         -> the kexe Form when accepted; TRAPS when not
+;;                                    (a Kotoba function has no raise a caller can
+;;                                    see -- ask `verify-artifact-message` first
+;;                                    when the reason is needed)
+;;   (guest-integer? f)              -> f is an integer leaf
+;;   max-functions, max-expression-nodes, max-lowered-nodes,
+;;   native-float-boundary-types, target-lowering -- zero-arity / keyword
+;;   functions (an exported constant must be a function).
+;;   The KEXE is a Form (a map): parse the .kexe EDN text with kotoba.form/edn-form.
+;;
+;; WHAT IS REAL. Every check of the host's `verify-artifact!` that does not re-run
+;; the code generators or the KIR interpreter: the artifact schema and oracle
+;; marker, format, KIR identity, effects (against the KIR and the capability
+;; bitmap grammar), code-byte bounds, the SEAL (kotoba.verifier.seal: SHA-256 of
+;; the canonical text over Form), the KIR identity digest, the kernel-target and
+;; granted-region gates, target profile / lowering / KIR format, the WHOLE
+;; runtime-KIR program verification (kotoba.verifier.program / .kir: module and
+;; function shape, every operation family, records/variants/handles, effect
+;; inference, arena scopes, the lowering budget), fuel / limits / fuel ABI /
+;; context ABI, the compatibility descriptor, and the oracle marker.
+;;
+;; WHAT REMAINS (named, and refused rather than skipped)
+;;   1. The code region. The host re-emits the program with
+;;      `kotoba.native.x86-64/emit-program` / `kotoba.native.aarch64/emit-program`
+;;      and requires the artifact's :exports and :code to equal the result. Those
+;;      two emitters have no Kotoba port, so `verify-artifact-message` refuses
+;;      every artifact at this step ("native instruction stream cannot be
+;;      re-derived on the Kotoba route"), AFTER the checks above passed.
+;;      `verify-artifact-structure-message` is everything else, for a caller (and
+;;      a test) that wants the rest of the verdict; it also leaves out the oracle
+;;      re-run of item 2 (the marker itself is still checked).
+;;   2. The oracle re-run. `kotoba.kir/execute` on this route is the twin's named
+;;      refusal (the KIR interpreter has no native port), so an artifact whose
+;;      entry the host would re-execute is refused "native artifact oracle
+;;      evaluation rejected".
+;;
+;; Integers that do not fit i64 cannot be `:form/r` leaves and are refused as an
+;; unknown operation where the host says "integer is outside i64".
+
+(ns kotoba.verifier
+  (:require [kotoba.form :as form]
+            [kotoba.verifier.kirx :as ir]
+            [kotoba.kir.target :as target-profile]
+            [kotoba.verifier.fx :as fx]
+            [kotoba.verifier.kir :as vk]
+            [kotoba.verifier.ops :as ops]
+            [kotoba.verifier.program :as vp]
+            [kotoba.verifier.region :as region]
+            [kotoba.verifier.seal :as seal])
+  (:export [guest-integer? max-functions max-expression-nodes max-lowered-nodes
+            native-float-boundary-type? target-lowering
+            verify-artifact! verify-artifact-message verify-artifact-structure-message])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                       [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]}))
+
+(defn max-functions [] :i64 1024)
+(defn max-expression-nodes [] :i64 50000)
+(defn max-lowered-nodes [] :i64 100000)
+(defn- max-native-fuel [] :i64 9007199254740991)
+
+;; a value that IS a `.kotoba` integer literal as it reaches this verifier
+(defn guest-integer? [form [:ref :form/r]] :bool (form/is-int? form))
+
+(defn native-float-boundary-type? [t [:ref :form/r]] :bool (fx/kw-is? t :f64))
+
+;; :runtime-sysv-v1 / :runtime-aapcs64-v1 for the two native backends, :none else
+(defn target-lowering [backend :keyword] :keyword
+  (if (= backend :x86_64-kotoba-v1)
+    :runtime-sysv-v1
+    (if (= backend :aarch64-kotoba-v1) :runtime-aapcs64-v1 :none)))
+
+;; ---- Form helpers ------------------------------------------------------------------
+
+(defn- kf [k :keyword] [:ref :form/r] (form/keyword-form k))
+(defn- fld [m [:ref :form/r] k :keyword] [:ref :form/r] (form/form-get m (form/keyword-form k)))
+(defn- has? [m [:ref :form/r] k :keyword] :bool (fx/has-key? m k))
+(defn- empty-map [] [:ref :form/r] (form/form-map (form/no-forms)))
+(defn- put [m [:ref :form/r] k :keyword v [:ref :form/r]] [:ref :form/r]
+  (form/assoc-form m (form/keyword-form k) v))
+(defn- edn [text :string] [:ref :form/r] (form/edn-form text))
+(defn- kw-is? [f [:ref :form/r] k :keyword] :bool (fx/kw-is? f k))
+
+;; a duplicate-free map with exactly these keys present and no others: every
+;; key is in ALLOWED (a vec Form of keywords) and every REQUIRED key is present
+(defn- key-in? [k [:ref :form/r] allowed [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of allowed))
+    false
+    (if (form/eq k (form/nth-of allowed i))
+      true
+      (key-in? k allowed (+ i 1)))))
+
+(defn- keys-all-in? [m [:ref :form/r] allowed [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of m))
+    true
+    (if (key-in? (form/nth-of m i) allowed 0)
+      (keys-all-in? m allowed (+ i 2))
+      false)))
+
+(defn- all-present? [m [:ref :form/r] required [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of required))
+    true
+    (if (form/form-has? m (form/nth-of required i))
+      (all-present? m required (+ i 1))
+      false)))
+
+(defn- distinct-keys? [m [:ref :form/r] i :i64 j :i64] :bool
+  (if (>= i (form/count-of m))
+    true
+    (if (>= j i)
+      (distinct-keys? m (+ i 2) 0)
+      (if (form/eq (form/nth-of m i) (form/nth-of m j))
+        false
+        (distinct-keys? m i (+ j 2))))))
+
+(defn- artifact-fields [] [:ref :form/r]
+  (edn "[:format :target :target-profile :value :kir-sha256 :lowering :fuel-abi :context-abi :effects :limits :code :program :exports :compatibility :sha256]"))
+(defn- artifact-fields+oracle [] [:ref :form/r]
+  (edn "[:format :target :target-profile :value :kir-sha256 :lowering :fuel-abi :context-abi :effects :limits :code :program :exports :compatibility :sha256 :oracle]"))
+
+(defn- schema-ok? [kexe [:ref :form/r]] :bool
+  (and (form/is-map? kexe)
+       (distinct-keys? kexe 0 0)
+       (keys-all-in? kexe (artifact-fields+oracle) 0)
+       (all-present? kexe (artifact-fields) 0)
+       (= (quot (form/count-of kexe) 2) (if (has? kexe :oracle) 16 15))))
+
+(defn- lower-hex-64? [s :string] :bool
+  (and (= 64 (string-byte-length s))
+       (lower-hex-from? s 0)))
+
+(defn- lower-hex-from? [s :string i :i64] :bool
+  (if (>= i 64)
+    true
+    (let [c (string-code-point-at s i)]
+      (if (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 102)))
+        (lower-hex-from? s (+ i 1))
+        false))))
+
+(defn- effect-ok? [e [:ref :form/r]] :bool
+  (or (kw-is? e :state)
+      (and (form/is-vec? e) (= 2 (form/count-of e))
+           (kw-is? (form/nth-of e 0) :cap/call)
+           (form/is-int? (form/nth-of e 1))
+           (>= (form/int-value (form/nth-of e 1)) 0)
+           (<= (form/int-value (form/nth-of e 1)) 255))))
+
+(defn- effects-ok? [effects [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of effects))
+    true
+    (if (effect-ok? (form/nth-of effects i))
+      (effects-ok? effects (+ i 1))
+      false)))
+
+(defn- code-bytes-ok? [code [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of code))
+    true
+    (let [b (form/nth-of code i)]
+      (if (and (form/is-int? b) (>= (form/int-value b) 0) (<= (form/int-value b) 255))
+        (code-bytes-ok? code (+ i 1))
+        false))))
+
+(defn- oracle-marker-ok? [kexe [:ref :form/r]] :bool
+  (let [oracle (fld kexe :oracle)]
+    (and (form/is-map? oracle)
+         (distinct-keys? oracle 0 0)
+         (= 3 (quot (form/count-of oracle) 2))
+         (has? oracle :status) (has? oracle :trap) (has? oracle :fuel)
+         (kw-is? (fld oracle :status) :inconclusive)
+         (form/is-keyword? (fld oracle :trap))
+         (or (ir/budget-trap? (form/keyword-value (fld oracle :trap)))
+             (kw-is? (fld oracle :trap) :host/stack-exhausted))
+         (form/eq (fld oracle :fuel) (fx/get-in2 kexe :limits :fuel))
+         (form/is-nil? (fld kexe :value)))))
+
+;; steps 1-9: everything up to the runtime verification
+(defn- header-message [kexe [:ref :form/r]] :string
+  (let [program (fld kexe :program)
+        effects (fld kexe :effects)
+        code (fld kexe :code)
+        kir-sha (fld kexe :kir-sha256)]
+    (cond
+      (not (schema-ok? kexe)) "native artifact schema rejected"
+      (and (has? kexe :oracle) (not (oracle-marker-ok? kexe))) "native artifact oracle marker rejected"
+      (not (kw-is? (fld kexe :format) :kotoba.kexe/v1)) "unknown artifact format"
+      (not (and (form/is-string? kir-sha) (lower-hex-64? (form/string-value kir-sha))))
+      "missing or malformed KIR identity"
+      (not (form/eq effects (fld program :effects))) "artifact effects do not match runtime KIR"
+      (not (and (or (form/is-set? effects) (form/is-vec? effects)) (effects-ok? effects 0)))
+      "native artifact contains an unsupported effect"
+      (not (and (form/is-vec? code)
+                (>= (form/count-of code) 1)
+                (<= (form/count-of code) 1048576)
+                (code-bytes-ok? code 0)))
+      "malformed code bytes"
+      (not (seal/valid-seal? kexe)) "artifact integrity mismatch"
+      (not (string=? (form/string-value kir-sha) (seal/sha256-form program)))
+      "runtime KIR identity mismatch"
+      :else "")))
+
+;; ---- target ---------------------------------------------------------------------------
+
+(defn- kernel-target? [target [:ref :form/r]] :bool
+  (and (form/is-keyword? target)
+       (or (= (form/keyword-value target) :x86_64-aiueos-kernel-v1)
+           (or (= (form/keyword-value target) :aarch64-aiueos-kernel-v1)
+               (= (form/keyword-value target) :x86_64-aiueos-uefi-v1)))))
+
+(defn- backend-of [target [:ref :form/r]] :keyword
+  (if (form/is-keyword? target)
+    (option-value-of [:option :keyword] (target-profile/backend (form/keyword-value target)) :none)
+    :none))
+
+(defn- profile-of [target [:ref :form/r]] [:ref :form/r]
+  (if (form/is-keyword? target)
+    (form/from-document (target-profile/profile (form/keyword-value target)))
+    (form/nil-form)))
+
+;; does any list node under NODE have a head selected by MODE
+;; (1 hosted-refusal op, 2 granted-region op, 3 kernel-native op)?
+(defn- head-hit? [mode :i64 opn :string] :bool
+  (cond
+    (= mode 1) (or (and (>= (ops/kernel-memory-operation-arity opn) 0)
+                        (not (ops/granted-region-op? opn)))
+                   (ops/kernel-target-only-tail-op? opn))
+    (= mode 2) (ops/granted-region-op? opn)
+    :else (or (>= (ops/kernel-memory-operation-arity opn) 0) (ops/kernel-native-tail-op? opn))))
+
+(defn- tree-kids-hit? [node [:ref :form/r] mode :i64 i :i64] :bool
+  (if (>= i (form/count-of node))
+    false
+    (or (tree-has-head? (form/nth-of node i) mode)
+        (tree-kids-hit? node mode (+ i 1)))))
+
+(defn- tree-has-head? [node [:ref :form/r] mode :i64] :bool
+  (or (and (form/is-seq? node)
+           (> (form/count-of node) 0)
+           (form/is-symbol? (form/first-of node))
+           (head-hit? mode (form/symbol-value (form/first-of node))))
+      (and (or (form/is-seq? node) (or (form/is-vec? node) (or (form/is-set? node) (form/is-map? node))))
+           (tree-kids-hit? node mode 0))))
+
+;; steps 10a: the host's verify-runtime! up to and including verify-program!
+(defn- runtime-prefix-message [kexe [:ref :form/r]] :string
+  (let [target (fld kexe :target)
+        program (fld kexe :program)
+        functions (fld program :functions)
+        kernel (kernel-target? target)
+        backend (backend-of target)]
+    (cond
+      (and (not kernel) (tree-has-head? functions 1))
+      "bounded kernel memory operation requires the aiueos kernel target"
+      (and (not kernel) (tree-has-head? functions 2) (not (region/provenance-ok? functions)))
+      "region base must be granted by the caller, not chosen by the program"
+      (not (form/eq (profile-of target) (fld kexe :target-profile)))
+      "native target profile does not match target identity"
+      (= (target-lowering backend) :none) "not a native verifier target"
+      (not (kw-is? (fld kexe :lowering) (target-lowering backend))) "native runtime lowering mode is not admitted"
+      (not (or (kw-is? (fld program :format) :kotoba.kir/v3) (kw-is? (fld program :format) :kotoba.kir/v4)))
+      "native artifact requires runtime KIR v3 or v4"
+      :else (vp/verify-program-message program))))
+
+;; step 10b: the code region -- REFUSED: the emitters have no Kotoba port
+(defn- code-region-message [kexe [:ref :form/r]] :string
+  "native instruction stream cannot be re-derived on the Kotoba route: the x86-64 and aarch64 emitters have no Kotoba port")
+
+;; step 10c: fuel, limits, fuel ABI, context ABI
+(defn- context-abi-expected [] [:ref :form/r]
+  (edn "{:version 11 :fuel-offset 8 :allow-bitmap-offset 16 :allow-bitmap-bytes 32 :cap-call-offset 48 :pair-new-offset 56 :pair-first-offset 64 :pair-second-offset 72 :pair-capacity 4096 :kgraph-assert-offset 80 :kgraph-get-offset 88 :kgraph-count-offset 96 :kgraph-entity-at-offset 104 :kgraph-capacity 4096 :string-equal-offset 112 :string-concat-offset 120 :typed-cap-call-offset 128 :string-substring-offset 136 :string-code-point-at-offset 144 :string-pool-capacity 65536 :vector-new-empty-offset 152 :vector-conj-offset 160 :vector-count-offset 168 :vector-at-offset 176 :vector-assoc-offset 184 :vector-drop-offset 192 :vector-alloc-offset 200 :vector-assoc-in-place-offset 208 :string-index-of-offset 216 :arena-enter-offset 224 :arena-leave-offset 232 :string-compare-offset 240 :string-fold-ascii-offset 248 :string-find-blank-offset 256 :string-skip-blank-offset 264 :string-index-of-from-offset 272 :string-compare-lines-offset 280 :pair-used-pointer-offset 288 :pairs-base-offset 296 :pair-validated-base-offset 304 :vector-used-pointer-offset 312 :vectors-base-offset 320 :vector-items-base-offset 328 :string-find-byte-offset 336 :string-append-range-offset 344 :string-from-utf8-offset 352 :bytes-from-vector-offset 360 :bytes-slice-offset 368 :bytes-concat-offset 376 :vector-capacity 4096 :vector-item-capacity 65536}"))
+
+(defn- abi-message [kexe [:ref :form/r]] :string
+  (let [backend (backend-of (fld kexe :target))
+        limits (fld kexe :limits)
+        fuel (fld limits :fuel)]
+    (if (not (and (form/is-int? fuel) (>= (form/int-value fuel) 1) (<= (form/int-value fuel) (max-native-fuel))))
+      "native fuel budget is not admitted"
+      (let [unmetered (kw-is? (fld limits :fuel-metering) :off)
+            initial (if unmetered (max-native-fuel) (form/int-value fuel))
+            expected-fuel-abi (put (put (empty-map) :mode
+                                        (kf (if (= backend :x86_64-kotoba-v1) :hidden-context-r9 :hidden-context-x7)))
+                                   :initial (form/int-form initial))
+            expected-limits (let [base (put (put (put (empty-map) :memory-bytes (form/int-form 65536))
+                                                 :fuel fuel)
+                                            :stack-bytes (form/int-form 4096))]
+                              (if unmetered (put base :fuel-metering (kf :off)) base))]
+        (cond
+          (not (form/eq expected-fuel-abi (fld kexe :fuel-abi))) "fuel ABI is not admitted"
+          (not (form/eq expected-limits limits)) "resource limits are not admitted"
+          (not (form/eq (context-abi-expected) (fld kexe :context-abi))) "execution context ABI is not admitted"
+          :else "")))))
+
+;; ---- compatibility descriptor ---------------------------------------------------------------
+
+(defn- tender-contract [tp [:ref :form/r]] :keyword
+  (if (kw-is? (fld tp :runtime) :kotoba-linux-static-prelude-v1)
+    :kotoba.linux-static/v1
+    (let [ex (fld tp :execution)]
+      (cond
+        (kw-is? ex :javascript) :kotoba.restricted-esm/v1
+        (kw-is? ex :wasm) :kotoba.capability-host/v1
+        (kw-is? ex :native) :kotoba.supervisor/v1
+        (kw-is? ex :process) :kotoba.aiueos-process/v1
+        (kw-is? ex :kernel) :kotoba.aiueos-kernel/v1
+        (kw-is? ex :firmware) :kotoba.aiueos-firmware/v1
+        (kw-is? ex :cljs) :kotoba.cljs-host/v1
+        :else :kotoba.unsupported/v1))))
+
+(defn- value-abi-of [program [:ref :form/r]] :keyword
+  (cond
+    (ir/uses-f32? program) :kotoba.typed/mixed-f32-f64-v3
+    (ir/uses-f64? program) :kotoba.typed/mixed-f64-v2
+    (kw-is? (fld program :format) :kotoba.kir/v4) :kotoba.typed/externref-v1
+    :else :kotoba.i64/direct-v1))
+
+(defn- compatibility-message [kexe [:ref :form/r]] :string
+  (let [program (fld kexe :program)
+        kir-format (fld program :format)
+        typed (kw-is? kir-format :kotoba.kir/v4)
+        tp (fld kexe :target-profile)
+        expected (put (put (put (put (put (put (put (put (put (put (empty-map)
+                    :format (kf :kotoba.compatibility/v1))
+                    :compiler (form/string-form "kotoba-compiler/1"))
+                    :language (kf :kotoba.language/safe-v1))
+                    :hir (kf (if typed :kotoba.hir/v3 :kotoba.hir/v2)))
+                    :kir kir-format)
+                    :target (fld kexe :target))
+                    :runtime (fld tp :runtime))
+                    :value-abi (kf (value-abi-of program)))
+                    :tender-role (kf :kototama/component-tender-v1))
+                    :tender-contract (kf (tender-contract tp)))]
+    (if (form/eq expected (fld kexe :compatibility))
+      ""
+      "native compatibility metadata rejected")))
+
+;; ---- oracle -----------------------------------------------------------------------------------
+
+(defn- all-state? [effects [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of effects))
+    true
+    (if (kw-is? (form/nth-of effects i) :state)
+      (all-state? effects (+ i 1))
+      false)))
+
+(defn- oracle-message [kexe [:ref :form/r]] :string
+  (let [program (fld kexe :program)
+        effects (fld kexe :effects)
+        entry (fld program :entry)
+        inconclusive (kw-is? (fld (fld kexe :oracle) :status) :inconclusive)
+        rerun (and (all-state? effects 0)
+                   (not (tree-has-head? (fld program :functions) 3))
+                   (not (form/is-nil? entry)))]
+    (if rerun
+      ;; NAMED REFUSAL: the host re-executes the entry on the KIR interpreter,
+      ;; which has no Kotoba port (kotoba.kir's `execute` is a refusal), so the
+      ;; sealed value cannot be re-derived here.
+      "native artifact oracle evaluation rejected"
+      (if inconclusive
+        "native artifact oracle marker rejected: the oracle answered"
+        (if (form/is-nil? (fld kexe :value))
+          ""
+          "native artifact oracle value rejected")))))
+
+;; ---- entry points -----------------------------------------------------------------------------------
+
+(defn- pipeline [kexe [:ref :form/r] check-code :bool] :string
+  (let [h (header-message kexe)]
+    (if (not (string=? h ""))
+      h
+      (let [p (runtime-prefix-message kexe)]
+        (if (not (string=? p ""))
+          p
+          (let [c (if check-code (code-region-message kexe) "")]
+            (if (not (string=? c ""))
+              c
+              (let [a (abi-message kexe)]
+                (if (not (string=? a ""))
+                  a
+                  (let [d (compatibility-message kexe)]
+                    (if (not (string=? d ""))
+                      d
+                      (if check-code (oracle-message kexe) ""))))))))))))
+
+(defn verify-artifact-message [kexe [:ref :form/r]] :string (pipeline kexe true))
+
+(defn verify-artifact-structure-message [kexe [:ref :form/r]] :string (pipeline kexe false))
+
+(defn- refuse-form [] [:ref :form/r]
+  (let [refused (assert (= 1 0))] (form/nil-form)))
+
+(defn verify-artifact! [kexe [:ref :form/r]] [:ref :form/r]
+  (if (string=? (verify-artifact-message kexe) "")
+    kexe
+    (refuse-form)))

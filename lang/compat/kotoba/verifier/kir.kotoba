@@ -1,0 +1,1121 @@
+;; kotoba.verifier.kir -- the runtime-KIR expression verifier of the guest-route
+;; kotoba.verifier twin: a REAL port of osaho's `verify-expr!`, `verify-bindings!`,
+;; `lowered-cost`, `verify-arena-scopes!` and the schema/handle inference they
+;; lean on (record-schema-of, variant-schema-of, handle-type-of, binding-local,
+;; provider contracts), restated over the recursive `:form/r` record.
+;;
+;; HOW THE HOST'S EFFECTS BECAME VALUES
+;;   * `reject!` throws; a Kotoba function cannot. Every check answers a
+;;     `:verifier/vr` record {msg nodes facts}: `msg` is "" for accepted, else the
+;;     host's rejection message (same text), and the first rejection wins.
+;;   * `nodes` (the host's `(vswap! nodes inc)` budget shared across every
+;;     function of the program) and `facts` (the host's `(vswap! facts ...)`:
+;;     the capability ids and callee names a body mentions) ride in the record
+;;     that each check takes and returns.
+;;   * `*call-results*` / `*boxed-aggregates?*` / the signature table travel as
+;;     one context Form `cx` = {:sigs {name params} :results {name type} :boxed b}.
+;;   * `locals` is a map Form: symbol -> nil | type Form | the aggregate marker
+;;     {:aggregate/kind :variant :aggregate/type T}; key presence is `contains?`.
+;;
+;; WHERE IT DIFFERS ON PURPOSE
+;;   * An integer that does not fit i64 cannot be a `:form/r` int leaf; the reader
+;;     represents it as a tagged list, which is refused as an unknown operation
+;;     rather than as "integer is outside i64". Both refuse.
+;;   * A malformed branch entry of a `variant-match` (not a vector) is refused
+;;     as "variant dispatch rejected"; the host raises a `first` type error.
+;;   * `valid-name?` counts UTF-8 bytes where the host counts characters.
+
+(ns kotoba.verifier.kir
+  (:require [kotoba.form :as form]
+            [kotoba.verifier.fx :as fx]
+            [kotoba.verifier.ops :as ops])
+  (:export [check-expr verify-arena-scopes lowered-cost vr-new vr-msg vr-nodes vr-facts
+            make-cx aggregate-param-locals region-body-not-scalar-message
+            max-expression-nodes max-lowered-nodes native-provider-contract?
+            variant-local-form])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                       [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
+             :verifier/vr [:record :verifier/vr [[:msg :string] [:nodes :i64]
+                                                  [:facts [:list [:ref :form/r]]]]]}))
+
+(defn max-expression-nodes [] :i64 50000)
+(defn max-lowered-nodes [] :i64 100000)
+(defn- max-depth [] :i64 256)
+(defn- max-bindings [] :i64 4096)
+(defn- max-vector-literal-items [] :i64 16384)
+(defn- string-literal-byte-limit [] :i64 65536)
+
+(defn region-body-not-scalar-message [] :string
+  "runtime KIR arena-scope body rejected: not scalar -- a handle would escape the region it is released with")
+
+;; ---- the result record -------------------------------------------------------
+
+(defn vr-new [msg :string nodes :i64 facts [:list [:ref :form/r]]] [:ref :verifier/vr]
+  (record-new [:ref :verifier/vr] msg nodes facts))
+(defn vr-msg [r [:ref :verifier/vr]] :string (record-get [:ref :verifier/vr] r :msg))
+(defn vr-nodes [r [:ref :verifier/vr]] :i64 (record-get [:ref :verifier/vr] r :nodes))
+(defn vr-facts [r [:ref :verifier/vr]] [:list [:ref :form/r]] (record-get [:ref :verifier/vr] r :facts))
+
+(defn- ok? [r [:ref :verifier/vr]] :bool (string=? (vr-msg r) ""))
+(defn- fail [r [:ref :verifier/vr] msg :string] [:ref :verifier/vr]
+  (vr-new msg (vr-nodes r) (vr-facts r)))
+(defn- with-fact [r [:ref :verifier/vr] fact [:ref :form/r]] [:ref :verifier/vr]
+  (vr-new (vr-msg r) (vr-nodes r) (form/append-form (vr-facts r) fact)))
+
+;; ---- context ------------------------------------------------------------------
+
+(defn make-cx [sigs [:ref :form/r] results [:ref :form/r] boxed :bool] [:ref :form/r]
+  (form/form-map
+   (form/append-form
+    (form/append-form
+     (form/append-form
+      (form/append-form
+       (form/append-form
+        (form/append-form (form/no-forms) (form/keyword-form :sigs))
+        sigs)
+       (form/keyword-form :results))
+      results)
+     (form/keyword-form :boxed))
+    (form/bool-form boxed))))
+
+(defn- cx-sigs [cx [:ref :form/r]] [:ref :form/r] (form/form-get cx (form/keyword-form :sigs)))
+(defn- cx-results [cx [:ref :form/r]] [:ref :form/r] (form/form-get cx (form/keyword-form :results)))
+(defn- cx-boxed? [cx [:ref :form/r]] :bool (form/is-true? (form/form-get cx (form/keyword-form :boxed))))
+
+;; ---- small Form helpers -------------------------------------------------------
+
+(defn- kw [k :keyword] [:ref :form/r] (form/keyword-form k))
+(defn- nilf [] [:ref :form/r] (form/nil-form))
+(defn- present? [f [:ref :form/r]] :bool (not (form/is-nil? f)))
+(defn- op-text [f [:ref :form/r]] :string (form/symbol-value (form/first-of f)))
+(defn- is-op? [f [:ref :form/r] name :string] :bool (fx/head-is? f name))
+
+(defn- cap-id? [x [:ref :form/r]] :bool
+  (and (form/is-int? x) (>= (form/int-value x) 0) (<= (form/int-value x) 255)))
+
+(defn- kw-form-is? [f [:ref :form/r] k :keyword] :bool (fx/kw-is? f k))
+
+;; (get locals sym), the nil Form when unbound
+(defn- local-of [locals [:ref :form/r] sym [:ref :form/r]] [:ref :form/r]
+  (form/form-get locals sym))
+
+(defn- aggregate-marker? [local [:ref :form/r]] :bool
+  (and (form/is-map? local) (form/form-has? local (kw :aggregate/kind))))
+
+(defn variant-local-form [type [:ref :form/r]] [:ref :form/r]
+  (form/form-map
+   (form/append-form
+    (form/append-form
+     (form/append-form
+      (form/append-form (form/no-forms) (kw :aggregate/kind))
+      (kw :variant))
+     (kw :aggregate/type))
+    type)))
+
+;; the declared type of a field NAME in the [[name type] ...] vector FIELDS
+(defn- field-type-in [fields [:ref :form/r] name [:ref :form/r] i :i64] [:ref :form/r]
+  (if (>= i (form/count-of fields))
+    (nilf)
+    (let [entry (form/nth-of fields i)]
+      (if (form/eq (form/nth-of entry 0) name)
+        (form/nth-of entry 1)
+        (field-type-in fields name (+ i 1))))))
+
+(defn- has-field? [fields [:ref :form/r] name [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of fields))
+    false
+    (if (form/eq (form/nth-of (form/nth-of fields i) 0) name)
+      true
+      (has-field? fields name (+ i 1)))))
+
+(defn- type-ref-of [t [:ref :form/r]] [:ref :form/r] (form/nth-of t 1))
+
+;; nominal=: equal, or DECLARED is [:ref X] and TYPE's second element is X
+(defn- nominal= [t [:ref :form/r] declared [:ref :form/r]] :bool
+  (or (form/eq t declared)
+      (and (form/is-vec? declared) (= 2 (form/count-of declared))
+           (kw-form-is? (form/nth-of declared 0) :ref)
+           (form/is-vec? t)
+           (form/eq (form/nth-of declared 1) (form/nth-of t 1)))))
+
+(defn- record-reference? [t [:ref :form/r]] :bool
+  (and (form/is-vec? t) (= 2 (form/count-of t))
+       (kw-form-is? (form/nth-of t 0) :ref)
+       (form/is-keyword? (form/nth-of t 1))
+       (form/keyword-has-namespace? (form/nth-of t 1))))
+
+;; ---- provider contracts (clock 7, dataspace 24, ui commit 9, ui event 10) -------
+
+(defn- edn [text :string] [:ref :form/r] (form/edn-form text))
+
+(defn- clock-request-type [] [:ref :form/r]
+  (edn "[:variant :kotoba.clock/request [[:wall :bool] [:monotonic :bool]]]"))
+(defn- clock-result-type [] [:ref :form/r]
+  (edn "[:variant :kotoba.clock/result [[:wall [:record :kotoba.clock/wall [[:unix-millis :i64] [:observation-sequence :i64]]]] [:monotonic [:record :kotoba.clock/monotonic [[:nanos :i64] [:observation-sequence :i64]]]] [:error [:record :kotoba.clock/error [[:code :keyword] [:message :string]]]]]]"))
+(defn- dataspace-request-type [] [:ref :form/r]
+  (edn "[:variant :kotoba.dataspace/request [[:assert [:record :kotoba.dataspace/assert [[:assertion :document] [:facet :i64]]]] [:retract [:record :kotoba.dataspace/retract [[:assertion :document] [:facet :i64]]]] [:observe [:record :kotoba.dataspace/observe [[:pattern :document] [:facet :i64]]]] [:facet-enter :bool] [:facet-leave :i64]]]"))
+(defn- dataspace-result-type [] [:ref :form/r]
+  (edn "[:variant :kotoba.dataspace/result [[:asserted [:record :kotoba.dataspace/asserted [[:count :i64] [:notices :document]]]] [:retracted [:record :kotoba.dataspace/retracted [[:count :i64]]]] [:matches [:record :kotoba.dataspace/matches [[:bindings :document] [:notices :document]]]] [:facet [:record :kotoba.dataspace/facet [[:id :i64]]]] [:error [:record :kotoba.dataspace/error [[:code :keyword] [:message :string]]]]]]"))
+(defn- ui-commit-request-type [] [:ref :form/r]
+  (edn "[:record :kotoba.ui/commit-request [[:base-revision :i64] [:nodes [:set [:record :kotoba.ui/node [[:id :keyword] [:parent [:option :keyword]] [:kind :keyword] [:text :string]]]]]]]"))
+(defn- ui-commit-result-type [] [:ref :form/r]
+  (edn "[:record :kotoba.ui/commit-result [[:revision :i64] [:node-count :i64]]]"))
+(defn- ui-event-request-type [] [:ref :form/r]
+  (edn "[:record :kotoba.ui/event-request [[:after-revision :i64]]]"))
+(defn- ui-event-result-type [] [:ref :form/r]
+  (edn "[:option [:record :kotoba.ui/event [[:revision :i64] [:target :keyword] [:kind :keyword] [:value :string]]]]"))
+
+(defn- cap-is? [cap-id [:ref :form/r] n :i64] :bool
+  (and (form/is-int? cap-id) (= n (form/int-value cap-id))))
+
+(defn native-provider-contract? [cap-id [:ref :form/r] request [:ref :form/r] result [:ref :form/r]] :bool
+  (or (and (cap-is? cap-id 7)
+           (form/eq (clock-request-type) request)
+           (form/eq (clock-result-type) result))
+      (or (and (cap-is? cap-id 24)
+               (form/eq (dataspace-request-type) request)
+               (form/eq (dataspace-result-type) result))
+          (or (and (cap-is? cap-id 9)
+                   (form/eq (ui-commit-request-type) request)
+                   (form/eq (ui-commit-result-type) result))
+              (and (cap-is? cap-id 10)
+                   (form/eq (ui-event-request-type) request)
+                   (form/eq (ui-event-result-type) result))))))
+
+;; ---- schema and handle inference ---------------------------------------------
+
+(defn- record-new-schema [value [:ref :form/r]] [:ref :form/r]
+  (if (and (is-op? value "record-new")
+           (fx/native-scalar-record-type? (form/nth-of value 1) 0))
+    (form/nth-of value 1)
+    (nilf)))
+
+(defn- record-sroa-if-schema [value [:ref :form/r]] [:ref :form/r]
+  (if (and (is-op? value "if") (= 4 (form/count-of value)))
+    (let [then-schema (record-new-schema (form/nth-of value 2))
+          else-schema (record-new-schema (form/nth-of value 3))]
+      (if (and (form/eq then-schema else-schema)
+               (fx/scalar-replaced-record-type? then-schema))
+        then-schema
+        (nilf)))
+    (nilf)))
+
+(defn- variant-new-schema [value [:ref :form/r]] [:ref :form/r]
+  (if (and (is-op? value "variant-new") (= 4 (form/count-of value)))
+    (let [t (form/nth-of value 1)
+          tag (form/nth-of value 2)]
+      (if (and (or (fx/scalar-replaced-variant-type? t)
+                   (fx/boxed-aggregate-variant-type? t))
+               (has-field? (form/nth-of t 2) tag 0))
+        t
+        (nilf)))
+    (nilf)))
+
+(defn- variant-sroa-if-schema [value [:ref :form/r]] [:ref :form/r]
+  (if (and (is-op? value "if") (= 4 (form/count-of value)))
+    (let [then-schema (variant-new-schema (form/nth-of value 2))
+          else-schema (variant-new-schema (form/nth-of value 3))]
+      (if (form/eq then-schema else-schema) then-schema (nilf)))
+    (nilf)))
+
+(defn- provider-result-schema [form [:ref :form/r]] [:ref :form/r]
+  (if (and (is-op? form "typed-cap-call") (= 5 (form/count-of form))
+           (native-provider-contract? (form/nth-of form 1) (form/nth-of form 2) (form/nth-of form 3)))
+    (form/nth-of form 3)
+    (nilf)))
+
+;; a call of a module function (simple-symbol head bound in *call-results*)
+(defn- module-call? [form [:ref :form/r] cx [:ref :form/r]] :bool
+  (and (form/is-seq? form)
+       (fx/simple-sym? (form/first-of form))
+       (form/form-has? (cx-results cx) (form/first-of form))))
+
+(defn- call-record-schema [form [:ref :form/r] cx [:ref :form/r]] [:ref :form/r]
+  (if (module-call? form cx)
+    (let [r (form/form-get (cx-results cx) (form/first-of form))]
+      (if (or (fx/native-scalar-record-type? r 0) (record-reference? r)) r (nilf)))
+    (nilf)))
+
+(defn- variant-schema-of [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]] [:ref :form/r]
+  (cond
+    (and (is-op? form "variant-new") (= 4 (form/count-of form))
+         (fx/native-scalar-variant-type? (form/nth-of form 1)))
+    (form/nth-of form 1)
+
+    (is-op? form "if")
+    (variant-sroa-if-schema form)
+
+    (present? (provider-result-schema form))
+    (provider-result-schema form)
+
+    (form/is-symbol? form)
+    (let [local (local-of locals form)]
+      (if (and (aggregate-marker? local)
+               (fx/kw-is? (form/form-get local (kw :aggregate/kind)) :variant))
+        (form/form-get local (kw :aggregate/type))
+        (nilf)))
+
+    (module-call? form cx)
+    (let [result (form/form-get (cx-results cx) (form/first-of form))]
+      (if (fx/native-scalar-variant-boundary-type? result) result (nilf)))
+
+    :else (nilf)))
+
+(defn- record-schema-of [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]] [:ref :form/r]
+  (cond
+    (is-op? form "record-new") (form/nth-of form 1)
+    (is-op? form "if") (record-sroa-if-schema form)
+    (form/is-symbol? form) (local-of locals form)
+    (module-call? form cx) (call-record-schema form cx)
+    (and (is-op? form "record-get") (= 4 (form/count-of form)))
+    (let [t (form/nth-of form 1)
+          value (form/nth-of form 2)
+          field (form/nth-of form 3)]
+      (if (form/eq t (record-schema-of value locals cx))
+        (let [field-type (field-type-in (form/nth-of t 2) field 0)]
+          (if (fx/native-scalar-record-type? field-type 0) field-type (nilf)))
+        (nilf)))
+    (and (is-op? form "typed-cap-call") (= 5 (form/count-of form))
+         (native-provider-contract? (form/nth-of form 1) (form/nth-of form 2) (form/nth-of form 3))
+         (fx/native-scalar-record-type? (form/nth-of form 3) 0))
+    (form/nth-of form 3)
+    :else (nilf)))
+
+(defn- binding-record-schema [value [:ref :form/r] cx [:ref :form/r]] [:ref :form/r]
+  (let [a (record-new-schema value)]
+    (if (present? a) a
+      (let [b (call-record-schema value cx)]
+        (if (present? b) b
+          (let [c (record-sroa-if-schema value)]
+            (if (present? c) c
+              (let [result (provider-result-schema value)]
+                (if (fx/native-scalar-record-type? result 0) result (nilf))))))))))
+
+(defn- binding-variant-type [value [:ref :form/r]] [:ref :form/r]
+  (let [a (variant-new-schema value)]
+    (if (present? a) a
+      (let [b (variant-sroa-if-schema value)]
+        (if (present? b) b (provider-result-schema value))))))
+
+(defn- binding-local [value [:ref :form/r] cx [:ref :form/r]] [:ref :form/r]
+  (let [schema (binding-record-schema value cx)]
+    (if (present? schema)
+      schema
+      (let [t (binding-variant-type value)]
+        (if (present? t) (variant-local-form t) (nilf))))))
+
+;; the declared handle type FORM denotes in a boxed module
+(defn- handle-type-of [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]] [:ref :form/r]
+  (cond
+    (form/is-symbol? form)
+    (let [local (local-of locals form)]
+      (if (aggregate-marker? local)
+        (form/form-get local (kw :aggregate/type))
+        local))
+
+    (form/is-seq? form)
+    (cond
+      (or (is-op? form "record-new")
+          (or (is-op? form "variant-new")
+              (or (is-op? form "hetero-vector-new") (is-op? form "hetero-vector-assoc"))))
+      (form/nth-of form 1)
+
+      (is-op? form "hetero-vector-at")
+      (let [t (form/nth-of form 1)
+            index (form/nth-of form 3)]
+        (if (and (fx/handle-of? :vector t) (form/is-int? index)
+                 (>= (form/int-value index) 0)
+                 (< (form/int-value index) (form/count-of (form/nth-of t 1))))
+          (form/nth-of (form/nth-of t 1) (form/int-value index))
+          (nilf)))
+
+      (is-op? form "record-get")
+      (let [t (form/nth-of form 1)
+            field (form/nth-of form 3)]
+        (if (fx/handle-of? :record t)
+          (field-type-in (form/nth-of t 2) field 0)
+          (nilf)))
+
+      (is-op? form "if")
+      (let [then-type (handle-type-of (form/nth-of form 2) locals cx)]
+        (if (and (present? then-type)
+                 (form/eq then-type (handle-type-of (form/nth-of form 3) locals cx)))
+          then-type
+          (nilf)))
+
+      (module-call? form cx)
+      (form/form-get (cx-results cx) (form/first-of form))
+
+      :else (nilf))
+
+    :else (nilf)))
+
+;; ---- the expression walk -------------------------------------------------------
+
+;; every child of FORM from index FROM, each at DEPTH
+(defn- check-each [form [:ref :form/r] from :i64 locals [:ref :form/r] cx [:ref :form/r]
+                   depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (if (>= from (form/count-of form))
+    r
+    (let [r2 (check-expr (form/nth-of form from) locals cx depth r)]
+      (if (ok? r2)
+        (check-each form (+ from 1) locals cx depth r2)
+        r2))))
+
+(defn- check-args [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                   depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (check-each form 1 locals cx (+ depth 1) r))
+
+;; arity check against a table answer, then every argument
+(defn- check-arity-args [form [:ref :form/r] arity :i64 msg :string locals [:ref :form/r]
+                         cx [:ref :form/r] depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (if (= arity (fx/arg-count form))
+    (check-args form locals cx depth r)
+    (fail r msg)))
+
+(defn- check-one [child [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                  depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (check-expr child locals cx (+ depth 1) r))
+
+;; ---- let / bindings ---------------------------------------------------------------
+
+;; the binding names (even positions) of BINDINGS are pairwise distinct
+(defn- name-repeats? [bindings [:ref :form/r] i :i64 j :i64] :bool
+  (if (>= j i)
+    false
+    (if (form/eq (form/nth-of bindings i) (form/nth-of bindings j))
+      true
+      (name-repeats? bindings i (+ j 2)))))
+
+(defn- names-distinct? [bindings [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of bindings))
+    true
+    (if (name-repeats? bindings i 0)
+      false
+      (names-distinct? bindings (+ i 2)))))
+
+(defn- bindings-loop [bindings [:ref :form/r] i :i64 env [:ref :form/r] cx [:ref :form/r]
+                      depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (if (>= (+ i 1) (form/count-of bindings))
+    ;; finished: hand the accumulated env back through a marker fact
+    (with-fact r env)
+    (let [name (form/nth-of bindings i)
+          value (form/nth-of bindings (+ i 1))]
+      (if (not (fx/valid-name? name))
+        (fail r "runtime KIR local name rejected")
+        (let [r2 (check-expr value env cx (+ depth 1) r)]
+          (if (not (ok? r2))
+            r2
+            (let [local (binding-local value cx)
+                  local2 (if (present? local)
+                           local
+                           (if (cx-boxed? cx) (handle-type-of value env cx) (nilf)))]
+              (bindings-loop bindings (+ i 2) (form/assoc-form env name local2) cx depth r2))))))))
+
+;; the env a binding vector produces is the LAST fact of the returned record
+(defn- last-fact [r [:ref :verifier/vr]] [:ref :form/r]
+  (let [facts (vr-facts r)]
+    (typed-list-nth [:list [:ref :form/r]] facts (- (vector-count facts) 1))))
+
+(defn- drop-last-fact [r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [facts (vr-facts r)
+        n (- (vector-count facts) 1)]
+    (vr-new (vr-msg r) (vr-nodes r)
+            (loop [i 0 acc (form/no-forms)]
+              (if (>= i n)
+                acc
+                (recur (+ i 1) (form/append-form acc (typed-list-nth [:list [:ref :form/r]] facts i))))))))
+
+(defn- check-let [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                  depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (if (not (= 2 (fx/arg-count form)))
+    (fail r "runtime KIR let arity rejected")
+    (let [bindings (form/nth-of form 1)]
+      (if (not (and (form/is-vec? bindings)
+                    (= 0 (rem (form/count-of bindings) 2))
+                    (<= (quot (form/count-of bindings) 2) (max-bindings))))
+        (fail r "runtime KIR let bindings rejected")
+        (if (not (names-distinct? bindings 0))
+          (fail r "runtime KIR duplicate binding rejected")
+          (let [rb (bindings-loop bindings 0 locals cx depth r)]
+            (if (not (ok? rb))
+              rb
+              (let [env (last-fact rb)
+                    rc (drop-last-fact rb)]
+                (check-expr (form/nth-of form 2) env cx (+ depth 1) rc)))))))))
+
+;; ---- the families ---------------------------------------------------------------
+
+(defn- shift-count-ok-32? [form [:ref :form/r]] :bool
+  (let [c (form/nth-of form 2)]
+    (and (form/is-int? c) (>= (form/int-value c) 0) (<= (form/int-value c) 31))))
+
+(defn- shift-count-bad-64? [form [:ref :form/r]] :bool
+  (let [c (form/nth-of form 2)]
+    (and (form/is-int? c)
+         (not (and (>= (form/int-value c) 0) (<= (form/int-value c) 63))))))
+
+(defn- check-record-new [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                         depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [t (form/nth-of form 1)
+        ok-type (or (fx/native-scalar-record-type? t 0)
+                    (and (cx-boxed? cx) (fx/handle-of? :record t)))]
+    (if (and ok-type (= (form/count-of (form/nth-of t 2)) (- (form/count-of form) 2)))
+      (check-each form 2 locals cx (+ depth 1) r)
+      (fail r "runtime KIR record construction rejected"))))
+
+(defn- check-record-get [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                         depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [t (form/nth-of form 1)
+        value (form/nth-of form 2)
+        field (form/nth-of form 3)
+        schema (record-schema-of value locals cx)
+        declared (if (present? schema)
+                   schema
+                   (if (cx-boxed? cx) (handle-type-of value locals cx) (nilf)))]
+    (if (and (= 3 (fx/arg-count form))
+             (or (fx/native-scalar-record-type? t 0)
+                 (and (cx-boxed? cx) (fx/handle-of? :record t)))
+             (form/is-keyword? field)
+             (has-field? (form/nth-of t 2) field 0)
+             (or (form/eq t declared)
+                 (and (form/is-vec? declared) (= 2 (form/count-of declared))
+                      (kw-form-is? (form/nth-of declared 0) :ref)
+                      (form/eq (form/nth-of declared 1) (form/nth-of t 1)))))
+      (check-one value locals cx depth r)
+      (fail r "runtime KIR record projection rejected"))))
+
+(defn- check-variant-new [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                          depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [t (form/nth-of form 1)
+        tag (form/nth-of form 2)
+        payload (form/nth-of form 3)
+        case-type (if (or (fx/native-scalar-variant-type? t) (fx/boxed-payload-variant-type? t))
+                    (field-type-in (form/nth-of t 2) tag 0)
+                    (nilf))]
+    (if (and (= 3 (fx/arg-count form)) (present? case-type))
+      (check-one payload locals cx depth r)
+      (fail r "runtime KIR variant construction rejected"))))
+
+;; (mapv first cases) = (mapv first branches), branch by branch
+(defn- branch-tags-match? [cases [:ref :form/r] branches [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of cases))
+    true
+    (let [b (form/nth-of branches i)]
+      (if (and (form/is-vec? b)
+               (form/eq (form/nth-of (form/nth-of cases i) 0) (form/nth-of b 0)))
+        (branch-tags-match? cases branches (+ i 1))
+        false))))
+
+(defn- branches-shape-ok? [branches [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of branches))
+    true
+    (let [b (form/nth-of branches i)]
+      (if (and (form/is-vec? b) (= 3 (form/count-of b)) (fx/valid-name? (form/nth-of b 1)))
+        (branches-shape-ok? branches (+ i 1))
+        false))))
+
+(defn- variant-branches-loop [cases [:ref :form/r] branches [:ref :form/r] i :i64 boxed :bool
+                              locals [:ref :form/r] cx [:ref :form/r] depth :i64
+                              r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (if (>= i (form/count-of cases))
+    r
+    (let [payload-type (form/nth-of (form/nth-of cases i) 1)
+          b (form/nth-of branches i)
+          binder (form/nth-of b 1)
+          body (form/nth-of b 2)
+          local (cond
+                  (fx/native-scalar-record-type? payload-type 0) payload-type
+                  boxed (if (fx/native-handle-type? payload-type 0) payload-type (nilf))
+                  :else (nilf))
+          r2 (check-expr body (form/assoc-form locals binder local) cx (+ depth 1) r)]
+      (if (ok? r2)
+        (variant-branches-loop cases branches (+ i 1) boxed locals cx depth r2)
+        r2))))
+
+(defn- check-variant-match [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                            depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [t (form/nth-of form 1)
+        value (form/nth-of form 2)
+        branches (form/nth-of form 3)
+        boxed? (fx/boxed-payload-variant-type? t)
+        variant? (or (fx/native-scalar-variant-type? t) boxed?)
+        cases (if variant? (form/nth-of t 2) (nilf))
+        declared (if boxed?
+                   (handle-type-of value locals cx)
+                   (variant-schema-of value locals cx))]
+    (if (and (= 3 (fx/arg-count form))
+             variant?
+             (form/is-vec? branches)
+             (= (form/count-of cases) (form/count-of branches))
+             (branch-tags-match? cases branches 0)
+             (branches-shape-ok? branches 0)
+             (if boxed? (nominal= t declared) (form/eq t declared)))
+      (let [r2 (check-one value locals cx depth r)]
+        (if (ok? r2)
+          (variant-branches-loop cases branches 0 boxed? locals cx depth r2)
+          r2))
+      (fail r "runtime KIR variant dispatch rejected"))))
+
+(defn- head-is-kw? [t [:ref :form/r] k :keyword] :bool
+  (and (form/is-vec? t) (> (form/count-of t) 0) (kw-form-is? (form/nth-of t 0) k)))
+
+(defn- check-hetero-vector-new [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                                depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [t (form/nth-of form 1)]
+    (if (and (cx-boxed? cx) (fx/handle-of? :vector t)
+             (= (- (form/count-of form) 2) (form/count-of (form/nth-of t 1))))
+      (check-each form 2 locals cx (+ depth 1) r)
+      (fail r "runtime KIR heterogeneous vector construction rejected"))))
+
+(defn- hetero-arity [opn :string] :i64
+  (if (string=? opn "hetero-vector-count") 2 (if (string=? opn "hetero-vector-at") 3 4)))
+
+(defn- check-hetero-vector-op [form [:ref :form/r] opn :string locals [:ref :form/r] cx [:ref :form/r]
+                               depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [t (form/nth-of form 1)
+        value (form/nth-of form 2)
+        index (form/nth-of form 3)
+        item (form/nth-of form 4)
+        arity (hetero-arity opn)]
+    (if (and (cx-boxed? cx)
+             (= arity (fx/arg-count form))
+             (fx/handle-of? :vector t)
+             (nominal= t (handle-type-of value locals cx))
+             (or (string=? opn "hetero-vector-count")
+                 (and (form/is-int? index) (>= (form/int-value index) 0)
+                      (< (form/int-value index) (form/count-of (form/nth-of t 1))))))
+      (let [r2 (check-one value locals cx depth r)]
+        (if (and (ok? r2) (string=? opn "hetero-vector-assoc"))
+          (check-one item locals cx depth r2)
+          r2))
+      (fail r "runtime KIR heterogeneous vector operation rejected"))))
+
+;; option/result families: TYPE headed by HEAD and a handle type
+(defn- generic-type-ok? [t [:ref :form/r] head :keyword] :bool
+  (and (head-is-kw? t head) (fx/native-handle-type? t 0)))
+
+(defn- check-option-some [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                          depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (if (and (= 2 (fx/arg-count form)) (generic-type-ok? (form/nth-of form 1) :option))
+    (check-one (form/nth-of form 2) locals cx depth r)
+    (fail r "runtime KIR generic option operation rejected")))
+
+(defn- check-option-none [form [:ref :form/r] r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (if (and (= 1 (fx/arg-count form)) (generic-type-ok? (form/nth-of form 1) :option))
+    r
+    (fail r "runtime KIR generic option operation rejected")))
+
+(defn- check-value-fallback [form [:ref :form/r] head :keyword msg :string locals [:ref :form/r]
+                             cx [:ref :form/r] depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (if (and (= 3 (fx/arg-count form)) (generic-type-ok? (form/nth-of form 1) head))
+    (let [r2 (check-one (form/nth-of form 2) locals cx depth r)]
+      (if (ok? r2)
+        (check-one (form/nth-of form 3) locals cx depth r2)
+        r2))
+    (fail r msg)))
+
+(defn- check-option-match [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                           depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [t (form/nth-of form 1)
+        binder (form/nth-of form 4)]
+    (if (and (= 5 (fx/arg-count form)) (generic-type-ok? t :option) (fx/valid-name? binder))
+      (let [r1 (check-one (form/nth-of form 2) locals cx depth r)]
+        (if (not (ok? r1))
+          r1
+          (let [r2 (check-one (form/nth-of form 3) locals cx depth r1)]
+            (if (not (ok? r2))
+              r2
+              (check-one (form/nth-of form 5)
+                         (form/assoc-form locals binder
+                                          (if (fx/native-scalar-record-type? (form/nth-of t 1) 0)
+                                            (form/nth-of t 1)
+                                            (nilf)))
+                         cx depth r2)))))
+      (fail r "runtime KIR generic option match rejected"))))
+
+(defn- check-result-some [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                          depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (if (and (= 2 (fx/arg-count form)) (generic-type-ok? (form/nth-of form 1) :result))
+    (check-one (form/nth-of form 2) locals cx depth r)
+    (fail r "runtime KIR generic result operation rejected")))
+
+(defn- check-result-match [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                           depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [ok-binder (form/nth-of form 3)
+        err-binder (form/nth-of form 5)]
+    (if (and (= 6 (fx/arg-count form)) (generic-type-ok? (form/nth-of form 1) :result)
+             (fx/valid-name? ok-binder) (fx/valid-name? err-binder))
+      (let [r1 (check-one (form/nth-of form 2) locals cx depth r)]
+        (if (not (ok? r1))
+          r1
+          (let [r2 (check-one (form/nth-of form 4) (form/assoc-form locals ok-binder (nilf)) cx depth r1)]
+            (if (not (ok? r2))
+              r2
+              (check-one (form/nth-of form 6) (form/assoc-form locals err-binder (nilf)) cx depth r2)))))
+      (fail r "runtime KIR generic result match rejected"))))
+
+(defn- literal-limit-ok? [form [:ref :form/r] from :i64] :bool
+  (<= (- (form/count-of form) from) (max-vector-literal-items)))
+
+(defn- check-typed-set-new [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                            depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [t (form/nth-of form 1)]
+    (if (not (and (head-is-kw? t :set) (fx/native-word-value-type? t 0)))
+      (fail r "runtime KIR typed-set constructor rejected")
+      (if (not (literal-limit-ok? form 2))
+        (fail r "runtime KIR typed-set literal exceeds the item limit")
+        (check-each form 2 locals cx (+ depth 1) r)))))
+
+(defn- check-typed-set-conj [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                             depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [t (form/nth-of form 1)]
+    (if (and (= 3 (fx/arg-count form)) (head-is-kw? t :set) (fx/native-word-value-type? t 0))
+      (check-each form 2 locals cx (+ depth 1) r)
+      (fail r "runtime KIR typed-set conj rejected"))))
+
+(defn- check-typed-set-rest [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                             depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [t (form/nth-of form 1)]
+    (if (and (head-is-kw? t :set) (fx/native-word-value-type? t 0) (> (form/count-of form) 2))
+      (check-each form 2 locals cx (+ depth 1) r)
+      (fail r "runtime KIR typed-set operation rejected"))))
+
+(defn- check-typed-list-new [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                             depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [t (form/nth-of form 1)]
+    (if (not (and (head-is-kw? t :list) (fx/native-word-value-type? t 0)))
+      (fail r "runtime KIR typed-list constructor rejected")
+      (if (not (literal-limit-ok? form 2))
+        (fail r "runtime KIR typed-list literal exceeds the item limit")
+        (check-each form 2 locals cx (+ depth 1) r)))))
+
+(defn- check-typed-list-conj [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                              depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [t (form/nth-of form 1)]
+    (if (and (= 3 (fx/arg-count form)) (head-is-kw? t :list) (fx/native-word-value-type? t 0))
+      (check-each form 2 locals cx (+ depth 1) r)
+      (fail r "runtime KIR typed-list conj rejected"))))
+
+(defn- check-typed-list-nth [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                             depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [t (form/nth-of form 1)]
+    (if (and (= 3 (fx/arg-count form)) (head-is-kw? t :list) (fx/native-word-value-type? t 0))
+      (check-each form 2 locals cx (+ depth 1) r)
+      (fail r "runtime KIR typed-list nth rejected"))))
+
+(defn- check-rodata-literal [form [:ref :form/r] opn :string r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (if (not (= 1 (fx/arg-count form)))
+    (fail r "runtime KIR rodata literal arity rejected")
+    (if (not (form/is-string? (form/nth-of form 1)))
+      (fail r "runtime KIR rodata literal requires a string literal")
+      (if (fx/rodata-valid?
+           (if (string=? opn "ucs2")
+             :utf-16le-nul
+             (if (string=? opn "guid") :guid-mixed-endian :hex-bytes))
+           (form/string-value (form/nth-of form 1)))
+        r
+        (fail r "runtime KIR rodata literal is malformed for its encoding")))))
+
+(defn- check-function-address [form [:ref :form/r] cx [:ref :form/r] r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (if (not (= 1 (fx/arg-count form)))
+    (fail r "runtime KIR function address arity rejected")
+    (if (not (fx/simple-sym? (form/nth-of form 1)))
+      (fail r "runtime KIR function address requires a function name")
+      (if (form/form-has? (cx-sigs cx) (form/nth-of form 1))
+        r
+        (fail r "runtime KIR function address names no function in this module")))))
+
+(defn- check-cap-call [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                       depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (if (and (= 2 (fx/arg-count form)) (cap-id? (form/nth-of form 1)))
+    (check-one (form/nth-of form 2) locals cx depth
+               (with-fact r (form/nth-of form 1)))
+    (fail r "runtime KIR capability call rejected")))
+
+(defn- word-pair? [req [:ref :form/r] res [:ref :form/r]] :bool
+  (or (and (kw-form-is? req :i64) (kw-form-is? res :i64))
+      (or (and (kw-form-is? req :string) (kw-form-is? res :string))
+          (or (and (kw-form-is? req :option-i64) (kw-form-is? res :option-i64))
+              (and (kw-form-is? req :result-i64) (kw-form-is? res :result-i64))))))
+
+(defn- check-typed-cap-call [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                             depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [cap (form/nth-of form 1)
+        req (form/nth-of form 2)
+        res (form/nth-of form 3)]
+    (if (and (= 4 (fx/arg-count form)) (cap-id? cap)
+             (or (word-pair? req res) (native-provider-contract? cap req res)))
+      (check-one (form/nth-of form 4) locals cx depth (with-fact r cap))
+      (fail r "runtime KIR typed capability call rejected"))))
+
+(defn- check-arithmetic [form [:ref :form/r] opn :string locals [:ref :form/r] cx [:ref :form/r]
+                         depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [n (fx/arg-count form)
+        binary-only (or (string=? opn "quot") (or (string=? opn "bit-xor")
+                                                    (or (string=? opn "bit-and") (string=? opn "bit-or"))))]
+    (if (or (= n 0) (and binary-only (not (= n 2))))
+      (fail r "runtime KIR arithmetic arity rejected")
+      (check-args form locals cx depth r))))
+
+(defn- check-call-to-module [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                             depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [params (form/form-get (cx-sigs cx) (form/first-of form))]
+    (if (= (form/count-of params) (fx/arg-count form))
+      (check-args form locals cx depth (with-fact r (form/first-of form)))
+      (fail r "runtime KIR call arity rejected"))))
+
+;; the family dispatch, in the host's cond order
+(defn- check-call [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                   depth :i64 r [:ref :verifier/vr]] [:ref :verifier/vr]
+  (if (not (fx/simple-sym? (form/first-of form)))
+    (fail r "runtime KIR computed call rejected")
+    (let [opn (op-text form)]
+      (cond
+        (string=? opn "let") (check-let form locals cx depth r)
+        (string=? opn "if")
+        (if (= 3 (fx/arg-count form)) (check-args form locals cx depth r) (fail r "runtime KIR if arity rejected"))
+        (string=? opn "do")
+        (if (= 0 (fx/arg-count form)) (fail r "runtime KIR do arity rejected") (check-args form locals cx depth r))
+        (string=? opn "cap-call") (check-cap-call form locals cx depth r)
+        (string=? opn "typed-cap-call") (check-typed-cap-call form locals cx depth r)
+        (ops/arithmetic-op? opn) (check-arithmetic form opn locals cx depth r)
+        (string=? opn "bool-not")
+        (check-arity-args form 1 "runtime KIR bool-not arity rejected" locals cx depth r)
+        (>= (ops/i32-op-arity opn) 0)
+        (if (not (= (ops/i32-op-arity opn) (fx/arg-count form)))
+          (fail r "runtime KIR i32 operation arity rejected")
+          (if (and (ops/i32-shift-op? opn) (not (shift-count-ok-32? form)))
+            (fail r "runtime KIR i32 shift count rejected")
+            (check-args form locals cx depth r)))
+        (>= (ops/i64-op-arity opn) 0)
+        (if (not (= (ops/i64-op-arity opn) (fx/arg-count form)))
+          (fail r "runtime KIR i64 operation arity rejected")
+          (if (and (ops/i64-shift-op? opn) (shift-count-bad-64? form))
+            (fail r "runtime KIR i64 shift count rejected")
+            (check-args form locals cx depth r)))
+        (ops/comparison-op? opn)
+        (check-arity-args form 2 "runtime KIR comparison arity rejected" locals cx depth r)
+        (string=? opn "record-new") (check-record-new form locals cx depth r)
+        (string=? opn "record-get") (check-record-get form locals cx depth r)
+        (string=? opn "variant-new") (check-variant-new form locals cx depth r)
+        (string=? opn "variant-match") (check-variant-match form locals cx depth r)
+        (string=? opn "hetero-vector-new") (check-hetero-vector-new form locals cx depth r)
+        (or (string=? opn "hetero-vector-count")
+            (or (string=? opn "hetero-vector-at") (string=? opn "hetero-vector-assoc")))
+        (check-hetero-vector-op form opn locals cx depth r)
+        (or (string=? opn "option-some-of") (string=? opn "option-some?-of"))
+        (check-option-some form locals cx depth r)
+        (string=? opn "option-none-of") (check-option-none form r)
+        (string=? opn "option-value-of")
+        (check-value-fallback form :option "runtime KIR generic option projection rejected" locals cx depth r)
+        (string=? opn "option-match") (check-option-match form locals cx depth r)
+        (or (string=? opn "result-ok-of")
+            (or (string=? opn "result-err-of") (string=? opn "result-ok?-of")))
+        (check-result-some form locals cx depth r)
+        (or (string=? opn "result-value-of") (string=? opn "result-error-of"))
+        (check-value-fallback form :result "runtime KIR generic result projection rejected" locals cx depth r)
+        (string=? opn "result-match-of") (check-result-match form locals cx depth r)
+        (>= (ops/heap-op-arity opn) 0)
+        (check-arity-args form (ops/heap-op-arity opn) "runtime KIR heap operation arity rejected" locals cx depth r)
+        (>= (ops/kgraph-op-arity opn) 0)
+        (check-arity-args form (ops/kgraph-op-arity opn) "runtime KIR kgraph operation arity rejected" locals cx depth r)
+        (or (string=? opn "document-edn-read") (string=? opn "document-edn-print"))
+        (check-arity-args form 1 "runtime KIR document-edn operation arity rejected" locals cx depth r)
+        (>= (ops/string-op-arity opn) 0)
+        (check-arity-args form (ops/string-op-arity opn) "runtime KIR string operation arity rejected" locals cx depth r)
+        (>= (ops/region-op-arity opn) 0)
+        (check-arity-args form (ops/region-op-arity opn) "runtime KIR region operation arity rejected" locals cx depth r)
+        (>= (ops/tagged-i64-op-arity opn) 0)
+        (check-arity-args form (ops/tagged-i64-op-arity opn) "runtime KIR tagged i64 operation arity rejected" locals cx depth r)
+        (>= (ops/vector-op-arity opn) 0)
+        (check-arity-args form (ops/vector-op-arity opn) "runtime KIR vector operation arity rejected" locals cx depth r)
+        (>= (ops/bytes-op-arity opn) 0)
+        (check-arity-args form (ops/bytes-op-arity opn) "runtime KIR bytes operation arity rejected" locals cx depth r)
+        (ops/vector-constructor-op? opn)
+        (if (> (fx/arg-count form) (max-vector-literal-items))
+          (fail r "runtime KIR vector literal exceeds the item limit")
+          (check-args form locals cx depth r))
+        (string=? opn "typed-set-new") (check-typed-set-new form locals cx depth r)
+        (string=? opn "typed-set-conj") (check-typed-set-conj form locals cx depth r)
+        (or (string=? opn "typed-set-count") (string=? opn "typed-set-nth"))
+        (check-typed-set-rest form locals cx depth r)
+        (string=? opn "typed-list-new") (check-typed-list-new form locals cx depth r)
+        (string=? opn "typed-list-conj") (check-typed-list-conj form locals cx depth r)
+        (string=? opn "typed-list-nth") (check-typed-list-nth form locals cx depth r)
+        (>= (ops/string-index-op-arity opn) 0)
+        (check-arity-args form (ops/string-index-op-arity opn) "runtime KIR string-index operation arity rejected" locals cx depth r)
+        (>= (ops/xml-op-arity opn) 0)
+        (check-arity-args form (ops/xml-op-arity opn) "runtime KIR XML operation arity rejected" locals cx depth r)
+        (>= (ops/decimal-op-arity opn) 0)
+        (check-arity-args form (ops/decimal-op-arity opn) "runtime KIR decimal operation arity rejected" locals cx depth r)
+        (>= (ops/kernel-memory-arity opn) 0)
+        (check-arity-args form (ops/kernel-memory-arity opn) "runtime KIR kernel memory operation arity rejected" locals cx depth r)
+        (>= (ops/kernel-privileged-op-arity opn) 0)
+        (check-arity-args form (ops/kernel-privileged-op-arity opn) "runtime KIR kernel privileged operation arity rejected" locals cx depth r)
+        (or (string=? opn "ucs2")
+            (or (string=? opn "guid")
+                (or (string=? opn "bytes-literal") (string=? opn "bytes-literal-length"))))
+        (check-rodata-literal form opn r)
+        (string=? opn "kernel-function-address") (check-function-address form cx r)
+        (>= (ops/f64-op-arity opn) 0)
+        (check-arity-args form (ops/f64-op-arity opn) "runtime KIR f64 operation arity rejected" locals cx depth r)
+        (>= (ops/f32-op-arity opn) 0)
+        (check-arity-args form (ops/f32-op-arity opn) "runtime KIR f32 operation arity rejected" locals cx depth r)
+        (form/form-has? (cx-sigs cx) (form/first-of form))
+        (check-call-to-module form locals cx depth r)
+        :else (fail r "runtime KIR operation rejected")))))
+
+(defn check-expr [form [:ref :form/r] locals [:ref :form/r] cx [:ref :form/r]
+                  depth :i64 in [:ref :verifier/vr]] [:ref :verifier/vr]
+  (let [nodes (+ (vr-nodes in) 1)
+        r (vr-new (vr-msg in) nodes (vr-facts in))]
+    (cond
+      (> nodes (max-expression-nodes)) (fail r "runtime KIR expression budget exhausted")
+      (> depth (max-depth)) (fail r "runtime KIR expression depth rejected")
+      (form/is-int? form) r
+      (form/is-symbol? form)
+      (if (form/form-has? locals form) r (fail r "runtime KIR contains an unbound symbol"))
+      (form/is-bool? form) r
+      (form/is-string? form)
+      (if (<= (string-byte-length (form/string-value form)) (string-literal-byte-limit))
+        r
+        (fail r "runtime KIR string literal exceeds byte limit"))
+      (form/is-keyword? form)
+      (if (<= (string-byte-length (fx/kw-text form)) (string-literal-byte-limit))
+        r
+        (fail r "runtime KIR keyword literal exceeds byte limit"))
+      (form/is-seq? form) (check-call form locals cx depth r)
+      :else (fail r "runtime KIR value type rejected"))))
+
+;; ---- parameter locals ---------------------------------------------------------------
+
+;; {param -> schema} for the parameters of FUNCTION (a function map Form)
+(defn- param-local [t [:ref :form/r] cx [:ref :form/r]] [:ref :form/r]
+  (cond
+    (fx/native-scalar-variant-boundary-type? t) (variant-local-form t)
+    (or (fx/native-scalar-record-type? t 0)
+        (and (form/is-vec? t) (= 2 (form/count-of t))
+             (kw-form-is? (form/nth-of t 0) :ref)
+             (form/is-keyword? (form/nth-of t 1))))
+    t
+    (and (cx-boxed? cx) (fx/native-handle-type? t 0)) t
+    :else (nilf)))
+
+(defn- param-locals-loop [params [:ref :form/r] types [:ref :form/r] i :i64 cx [:ref :form/r]
+                          acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of params))
+    acc
+    (param-locals-loop params types (+ i 1) cx
+                       (form/assoc-form acc (form/nth-of params i)
+                                        (param-local (form/nth-of types i) cx)))))
+
+(defn aggregate-param-locals [function [:ref :form/r] cx [:ref :form/r]] [:ref :form/r]
+  (param-locals-loop (form/form-get function (kw :params))
+                     (form/form-get function (kw :param-types))
+                     0 cx (form/form-map (form/no-forms))))
+
+;; ---- lowered-cost --------------------------------------------------------------------
+
+(defn- cost-cap [n :i64] :i64 (if (> n (+ (max-lowered-nodes) 1)) (+ (max-lowered-nodes) 1) n))
+
+;; 1 + the summed cost of the kids of FORM from index FROM (each capped)
+(defn- cost-sum [form [:ref :form/r] from :i64 env [:ref :form/r] acc :i64] :i64
+  (if (>= from (form/count-of form))
+    acc
+    (cost-sum form (+ from 1) env
+              (cost-cap (+ acc (lowered-cost (form/nth-of form from) env))))))
+
+(defn- cost-of-int-or-cost [f [:ref :form/r] env [:ref :form/r]] :i64
+  (if (form/is-int? f) 1 (lowered-cost f env)))
+
+(defn- cost-sum-int-aware [form [:ref :form/r] from :i64 env [:ref :form/r] acc :i64] :i64
+  (if (>= from (form/count-of form))
+    acc
+    (cost-sum-int-aware form (+ from 1) env
+                        (cost-cap (+ acc (cost-of-int-or-cost (form/nth-of form from) env))))))
+
+(defn- env-cost [env [:ref :form/r] sym [:ref :form/r]] :i64
+  (if (form/form-has? env sym)
+    (form/int-value (form/form-get env sym))
+    1))
+
+(defn- cost-let [bindings [:ref :form/r] i :i64 env [:ref :form/r]] [:ref :form/r]
+  (if (>= (+ i 1) (form/count-of bindings))
+    env
+    (cost-let bindings (+ i 2)
+              (form/assoc-form env (form/nth-of bindings i)
+                               (form/int-form (lowered-cost (form/nth-of bindings (+ i 1)) env))))))
+
+(defn- cost-match-branches [branches [:ref :form/r] i :i64 env [:ref :form/r] acc :i64] :i64
+  (if (>= i (form/count-of branches))
+    acc
+    (let [b (form/nth-of branches i)]
+      (cost-match-branches
+       branches (+ i 1) env
+       (cost-cap (+ acc (lowered-cost (form/nth-of b 2)
+                                      (form/assoc-form env (form/nth-of b 1) (form/int-form 1)))))))))
+
+(defn- cost-of-map [m [:ref :form/r] i :i64 env [:ref :form/r] acc :i64] :i64
+  ;; a map destructures as a seq of [k v] entries: [op & args] drops the first
+  ;; entry, every other entry costs 1 + the cost of its value
+  (if (>= (+ i 1) (form/count-of m))
+    acc
+    (cost-of-map m (+ i 2) env
+                 (cost-cap (+ acc (+ 1 (lowered-cost (form/nth-of m (+ i 1)) env)))))))
+
+(defn lowered-cost [form [:ref :form/r] env [:ref :form/r]] :i64
+  (cond
+    (form/is-int? form) 1
+    (form/is-string? form) 1
+    (form/is-keyword? form) 1
+    (form/is-bool? form) 1
+    (form/is-symbol? form) (env-cost env form)
+    (form/is-map? form) (cost-of-map form 2 env 1)
+    (form/is-seq? form)
+    (cond
+      (is-op? form "record-new") (cost-sum form 3 env 1)
+      (is-op? form "record-get") (cost-cap (+ 1 (lowered-cost (form/nth-of form 2) env)))
+      (is-op? form "variant-new") (cost-cap (+ 1 (lowered-cost (form/nth-of form 3) env)))
+      (is-op? form "variant-match")
+      (cost-match-branches (form/nth-of form 3) 0 env
+                           (cost-cap (+ 1 (lowered-cost (form/nth-of form 2) env))))
+      (is-op? form "typed-cap-call") (cost-cap (+ 1 (lowered-cost (form/nth-of form 4) env)))
+      (ops/hetero-vector-op? (fx/sym-or-empty (form/first-of form)))
+      (cost-sum-int-aware form 2 env 1)
+      (is-op? form "typed-set-new") (cost-sum form 2 env 1)
+      (is-op? form "typed-set-conj")
+      (cost-cap (+ 1 (+ (lowered-cost (form/nth-of form 2) env) (lowered-cost (form/nth-of form 3) env))))
+      (or (is-op? form "typed-set-count") (is-op? form "typed-set-nth")) (cost-sum form 2 env 1)
+      (is-op? form "typed-list-new") (cost-sum form 2 env 1)
+      (is-op? form "typed-list-conj")
+      (cost-cap (+ 1 (+ (lowered-cost (form/nth-of form 2) env) (lowered-cost (form/nth-of form 3) env))))
+      (is-op? form "typed-list-nth") (cost-sum form 2 env 1)
+      (or (is-op? form "option-some-of")
+          (or (is-op? form "option-some?-of")
+              (or (is-op? form "result-ok-of")
+                  (or (is-op? form "result-err-of") (is-op? form "result-ok?-of")))))
+      (cost-cap (+ 1 (lowered-cost (form/nth-of form 2) env)))
+      (is-op? form "option-none-of") 1
+      (or (is-op? form "option-value-of")
+          (or (is-op? form "result-value-of") (is-op? form "result-error-of")))
+      (cost-cap (+ 1 (+ (lowered-cost (form/nth-of form 2) env) (lowered-cost (form/nth-of form 3) env))))
+      (is-op? form "option-match")
+      (cost-cap (+ 1 (+ (lowered-cost (form/nth-of form 2) env)
+                        (+ (lowered-cost (form/nth-of form 3) env)
+                           (lowered-cost (form/nth-of form 5)
+                                         (form/assoc-form env (form/nth-of form 4) (form/int-form 1)))))))
+      (is-op? form "result-match-of")
+      (cost-cap (+ 1 (+ (lowered-cost (form/nth-of form 2) env)
+                        (+ (lowered-cost (form/nth-of form 4)
+                                         (form/assoc-form env (form/nth-of form 3) (form/int-form 1)))
+                           (lowered-cost (form/nth-of form 6)
+                                         (form/assoc-form env (form/nth-of form 5) (form/int-form 1)))))))
+      (is-op? form "let")
+      (lowered-cost (form/nth-of form 2) (cost-let (form/nth-of form 1) 0 env))
+      :else (cost-sum form 1 env 1))
+    (form/is-vec? form)
+    (if (and (> (form/count-of form) 0)
+             (form/is-symbol? (form/nth-of form 0))
+             (string=? (form/symbol-value (form/nth-of form 0)) "let"))
+      (lowered-cost (form/nth-of form 2) (cost-let (form/nth-of form 1) 0 env))
+      (cost-sum form 1 env 1))
+    (form/is-set? form) (cost-sum form 1 env 1)
+    :else 1))
+
+;; ---- arena scopes -----------------------------------------------------------------------
+
+(defn- scalar-type-kw? [t [:ref :form/r]] :bool
+  (or (kw-form-is? t :i64) (or (kw-form-is? t :bool) (kw-form-is? t :f64))))
+
+;; bind the pairs of a let-binding vector into ENV, each :i64 when its value is
+;; scalar-shaped under the env so far and :other otherwise
+(defn- shaped-let-env [bindings [:ref :form/r] i :i64 env [:ref :form/r] cx [:ref :form/r]] [:ref :form/r]
+  (if (>= (+ i 1) (form/count-of bindings))
+    env
+    (shaped-let-env bindings (+ i 2)
+                    (form/assoc-form env (form/nth-of bindings i)
+                                     (if (region-scalar-shaped? (form/nth-of bindings (+ i 1)) env cx)
+                                       (kw :i64)
+                                       (kw :other)))
+                    cx)))
+
+(defn- region-scalar-shaped? [form [:ref :form/r] env [:ref :form/r] cx [:ref :form/r]] :bool
+  (cond
+    (or (form/is-int? form) (or (form/is-bool? form) (form/is-f64? form))) true
+    (form/is-symbol? form) (scalar-type-kw? (form/form-get env form))
+    (form/is-seq? form)
+    (let [n (fx/arg-count form)]
+      (cond
+        (and (is-op? form "let") (= 2 n) (form/is-vec? (form/nth-of form 1)))
+        (region-scalar-shaped? (form/nth-of form 2)
+                               (shaped-let-env (form/nth-of form 1) 0 env cx) cx)
+        (and (is-op? form "if") (= 3 n))
+        (and (region-scalar-shaped? (form/nth-of form 2) env cx)
+             (region-scalar-shaped? (form/nth-of form 3) env cx))
+        (and (is-op? form "do") (> n 0))
+        (region-scalar-shaped? (form/last-of form) env cx)
+        (and (is-op? form "arena-scope") (= 1 n))
+        (region-scalar-shaped? (form/nth-of form 1) env cx)
+        (and (is-op? form "typed-cap-call") (= 4 n))
+        (kw-form-is? (form/nth-of form 3) :i64)
+        (and (form/is-symbol? (form/first-of form))
+             (ops/region-scalar-operation? (form/symbol-value (form/first-of form))))
+        true
+        (module-call? form cx)
+        (scalar-type-kw? (form/form-get (cx-results cx) (form/first-of form)))
+        :else false))
+    :else false))
+
+;; "" when every arena-scope in FORM has a scalar-shaped body, else the message
+(defn- arena-walk [form [:ref :form/r] env [:ref :form/r] cx [:ref :form/r]] :string
+  (if (not (form/is-seq? form))
+    ""
+    (let [n (fx/arg-count form)]
+      (cond
+        (and (is-op? form "arena-scope") (= 1 n))
+        (if (region-scalar-shaped? (form/nth-of form 1) env cx)
+          (arena-walk (form/nth-of form 1) env cx)
+          (region-body-not-scalar-message))
+        (and (is-op? form "let") (= 2 n) (form/is-vec? (form/nth-of form 1)))
+        (let [bindings (form/nth-of form 1)
+              bad (arena-walk-bindings bindings 0 env cx)]
+          (if (string=? bad "")
+            (arena-walk (form/nth-of form 2) (shaped-let-env bindings 0 env cx) cx)
+            bad))
+        :else (arena-walk-each form 1 env cx)))))
+
+(defn- arena-walk-each [form [:ref :form/r] i :i64 env [:ref :form/r] cx [:ref :form/r]] :string
+  (if (>= i (form/count-of form))
+    ""
+    (let [m (arena-walk (form/nth-of form i) env cx)]
+      (if (string=? m "") (arena-walk-each form (+ i 1) env cx) m))))
+
+;; walk each binding value under the env accumulated so far
+(defn- arena-walk-bindings [bindings [:ref :form/r] i :i64 env [:ref :form/r] cx [:ref :form/r]] :string
+  (if (>= (+ i 1) (form/count-of bindings))
+    ""
+    (let [m (arena-walk (form/nth-of bindings (+ i 1)) env cx)]
+      (if (string=? m "")
+        (arena-walk-bindings bindings (+ i 2)
+                             (form/assoc-form env (form/nth-of bindings i)
+                                              (if (region-scalar-shaped? (form/nth-of bindings (+ i 1)) env cx)
+                                                (kw :i64)
+                                                (kw :other)))
+                             cx)
+        m))))
+
+(defn- arena-env [params [:ref :form/r] types [:ref :form/r] has-types :bool i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of params))
+    acc
+    (arena-env params types has-types (+ i 1)
+               (form/assoc-form acc (form/nth-of params i)
+                                (if has-types (form/nth-of types i) (kw :unknown))))))
+
+(defn verify-arena-scopes [function [:ref :form/r] cx [:ref :form/r]] :string
+  (arena-walk (form/form-get function (kw :body))
+              (arena-env (form/form-get function (kw :params))
+                         (form/form-get function (kw :param-types))
+                         (fx/has-key? function :param-types)
+                         0 (form/form-map (form/no-forms)))
+              cx))
