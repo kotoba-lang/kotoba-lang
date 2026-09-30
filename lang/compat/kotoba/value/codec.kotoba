@@ -1,0 +1,167 @@
+;; kotoba.value.codec -- the GUEST-ROUTE twin of io-ipld's
+;; `kotoba/value/codec.cljk` (and its `ipld.value` beneath it), ENCODE side
+;; only, over `:form/r`.
+;;
+;; WHY A TWIN. The host codec walks Clojure values (records Float64/Int64/Link,
+;; sets, maps, byte arrays), rebuilds them on decode and compares CBOR keys as
+;; host vectors. A Kotoba module holds such a value as the recursive `:form/r`
+;; record (kotoba.form), and the Kotoba CBOR module has an encoder over it
+;; (`cbor/encode-form`) and no decoder. So the guest surface is the encode
+;; half: `value->form` (Form -> the canonical `[type-code payload]` Form),
+;; `encode-value` (its CBOR bytes) and `encode-bounded` (with the ability's
+;; byte ceiling). For an admitted value the bytes equal the host's
+;; (amu scripts/selfhost-wall/probe-value-codec.cljs runs both on 14 values: nil,
+;; bool, ints, text, keyword, symbol, vector, list, set, map, f64).
+;;
+;; WHERE IT DIFFERS ON PURPOSE
+;;   * An exported function cannot abort, so where the host rejects
+;;     (`:value/integer-out-of-range`, a non-finite or negative-zero float, a
+;;     value outside the domain, a byte ceiling exceeded) this TRAPS.
+;;   * A Form f64 leaf (tag 10) is the host's explicit `Float64` wrapper; an
+;;     int64 wrapper and a Link have no Form tag and are not provided.
+;;   * A keyword or symbol is written as its text without the host's
+;;     read-back check (a keyword whose NAME contains "/" is not refused).
+;;   * decode-value / decode-bounded / verify-value-cid / form->value are not
+;;     provided: there is no CBOR decoder on this route.
+
+(ns kotoba.value.codec
+  (:require [cbor.core :as cbor]
+            [kotoba.form :as form])
+  (:export [codec-id encode-bounded encode-value max-safe-integer min-safe-integer value->form])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                       [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]}))
+
+(defn codec-id [] :string "kotoba.value.v1")
+(defn max-safe-integer [] :i64 9007199254740991)
+(defn min-safe-integer [] :i64 (- 0 9007199254740991))
+
+(defn- refuse-form [] [:ref :form/r]
+  (let [refused (assert (= 1 0))] (form/nil-form)))
+
+;; ns/name of a keyword (`keyword-name` answers the name part only).
+(defn- stable-name [k :keyword] :string
+  (let [text (document-edn-print (document-keyword k))]
+    (string-substring text 1 (string-byte-length text))))
+
+(defn- coded [code :i64 payload [:ref :form/r]] [:ref :form/r]
+  (form/form-vec (form/two-forms (form/int-form code) payload)))
+
+;; --- floats: the 8 big-endian bytes of a finite, non-negative-zero binary64 --
+
+(defn- f64-be [bits :i64 s :i64 out :vector-i64] :vector-i64
+  (if (< s 0)
+    out
+    (f64-be bits (- s 8) (vector-conj out (bit-and (u64-shift-right bits s) 255)))))
+
+(defn- f64-payload [bits :i64] [:ref :form/r]
+  (if (= 2047 (bit-and (u64-shift-right bits 52) 2047))
+    (refuse-form)
+    (if (= bits (i64-shift-left 1 63))
+      (refuse-form)
+      (form/bytes-form (bytes-from-vector-i64 (f64-be bits 56 []))))))
+
+;; --- canonical order: encoded key, shorter first, then bytewise --------------
+
+(defn- fragment-less-from? [a :vector-i64 b :vector-i64 i :i64 n :i64] :bool
+  (if (>= i n)
+    false
+    (let [x (vector-at a i)
+          y (vector-at b i)]
+      (if (< x y)
+        true
+        (if (> x y)
+          false
+          (fragment-less-from? a b (+ i 1) n))))))
+
+(defn- fragment-less? [a :vector-i64 b :vector-i64] :bool
+  (let [la (vector-count a)
+        lb (vector-count b)]
+    (if (< la lb)
+      true
+      (if (> la lb)
+        false
+        (fragment-less-from? a b 0 la)))))
+
+(defn- order-key [x [:ref :form/r] by-first :i64] :vector-i64
+  (cbor/encode-form (if (= by-first 1) (form/nth-of x 0) x)))
+
+(defn- insert-position [sorted [:list [:ref :form/r]] x [:ref :form/r] by-first :i64 i :i64] :i64
+  (if (>= i (vector-count sorted))
+    i
+    (if (fragment-less? (order-key x by-first)
+                        (order-key (typed-list-nth [:list [:ref :form/r]] sorted i) by-first))
+      i
+      (insert-position sorted x by-first (+ i 1)))))
+
+(defn- rebuild-with [sorted [:list [:ref :form/r]] x [:ref :form/r] p :i64 i :i64 acc [:list [:ref :form/r]]]
+  [:list [:ref :form/r]]
+  (let [n (vector-count sorted)
+        acc1 (if (= i p) (form/append-form acc x) acc)]
+    (if (< i n)
+      (rebuild-with sorted x p (+ i 1) (form/append-form acc1 (typed-list-nth [:list [:ref :form/r]] sorted i)))
+      acc1)))
+
+;; A stable insertion sort by the canonical order of the (first) form's bytes.
+(defn- sort-fold [items [:list [:ref :form/r]] by-first :i64 i :i64 sorted [:list [:ref :form/r]]]
+  [:list [:ref :form/r]]
+  (if (>= i (vector-count items))
+    sorted
+    (let [x (typed-list-nth [:list [:ref :form/r]] items i)]
+      (sort-fold items by-first (+ i 1)
+                 (rebuild-with sorted x (insert-position sorted x by-first 0) 0 (form/no-forms))))))
+
+;; --- the canonical form ------------------------------------------------------
+
+(defn- convert-list [kids [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count kids))
+    acc
+    (convert-list kids (+ i 1)
+                  (form/append-form acc (value->form (typed-list-nth [:list [:ref :form/r]] kids i))))))
+
+(defn- convert-pairs [kids [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= (+ i 1) (vector-count kids))
+    acc
+    (convert-pairs kids (+ i 2)
+                   (form/append-form
+                    acc
+                    (form/form-vec
+                     (form/two-forms (value->form (typed-list-nth [:list [:ref :form/r]] kids i))
+                                     (value->form (typed-list-nth [:list [:ref :form/r]] kids (+ i 1)))))))))
+
+(defn value->form
+  "The canonical `[type-code payload]` Form for the value Form X, before CBOR
+  encoding (traps on a value the codec does not admit)."
+  [x [:ref :form/r]] [:ref :form/r]
+  (let [tag (form/tag-of x)]
+    (cond
+      (= tag 0) (coded 0 (form/nil-form))
+      (= tag 1) (coded 1 x)
+      (= tag 2) (let [n (form/int-value x)]
+                  (if (and (<= (- 0 9007199254740991) n) (<= n 9007199254740991))
+                    (coded 2 x)
+                    (refuse-form)))
+      (= tag 3) (coded 4 x)
+      (= tag 4) (coded 5 (form/string-form (stable-name (form/keyword-value x))))
+      (= tag 5) (coded 6 (form/string-form (form/symbol-value x)))
+      (= tag 10) (coded 3 (f64-payload (form/bits-of x)))
+      (= tag 11) (coded 7 x)
+      (= tag 7) (coded 16 (form/form-vec (convert-list (form/kids-of x) 0 (form/no-forms))))
+      (= tag 6) (coded 17 (form/form-vec (convert-list (form/kids-of x) 0 (form/no-forms))))
+      (= tag 8) (coded 18 (form/form-vec
+                           (sort-fold (convert-list (form/kids-of x) 0 (form/no-forms)) 0 0 (form/no-forms))))
+      (= tag 9) (coded 19 (form/form-vec
+                           (sort-fold (convert-pairs (form/kids-of x) 0 (form/no-forms)) 1 0 (form/no-forms))))
+      :else (refuse-form))))
+
+(defn encode-value
+  "Canonical `kotoba.value.v1` bytes for the value Form X."
+  [x [:ref :form/r]] :bytes
+  (cbor/encode-form-bytes (value->form x)))
+
+(defn encode-bounded
+  "`encode-value`, refusing (a trap) an envelope larger than MAX-BYTES."
+  [x [:ref :form/r] max-bytes :i64] :bytes
+  (let [checked (assert (> max-bytes 0))
+        encoded (encode-value x)
+        within (assert (<= (bytes-count encoded) max-bytes))]
+    encoded))
