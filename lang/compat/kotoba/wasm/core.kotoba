@@ -1,0 +1,663 @@
+;; kotoba.wasm.core -- the GUEST-ROUTE twin of osaho/kotoba-wasm `kotoba/wasm/core.cljk`,
+;; narrowed to the UNTYPED (:kotoba.kir/v2, v3) emitter.
+;;
+;; WHY A TWIN. core.cljk is a 4.1k-line emitter written over host maps and lazy
+;; sequences: `emit-typed-function-body` alone is 2300 lines of `letfn`
+;; closures, `volatile!` accumulators, keyword-callback maps and heterogeneous
+;; token vectors (keywords mixed with integers). None of that has a Kotoba
+;; spelling, so the project route cannot link the host module. This module
+;; reads the KIR module as a `:form/r` (kotoba.form; KIR maps are read with
+;; form-get) and writes the module as `:bytes`.
+;;
+;; WHAT IS REAL. Byte-identical to host `emit` for every untyped module of the
+;; pure word profile: i64 literals and booleans, locals, let / if / do, calls,
+;; the arithmetic, comparison, bit, shift and i32-wrapping operators,
+;; frontend loop helpers (`__kotoba_loop_N`) lowered to a structured Wasm
+;; `loop`, and the capability / heap imports (`cap-call`, i64->i64
+;; `typed-cap-call`, `pair` / `pair-first` / `pair-second`).
+;; The fuel budget is a parameter (`emit-with-fuel`).
+;;
+;; WHAT IS A NAMED REFUSAL (assert failure, never skipped): a typed module
+;; (:kotoba.kir/v4: descriptor table, literal table, typed-function bodies,
+;; bool export wrappers, bulk vectors, every `kotoba:typed` import), the
+;; Component options (standard32, canonical scalars, named capability
+;; imports, core-param-types), a non-word typed capability call, and any call to
+;; a function the module does not define (the host throws there too).
+;;
+;; Environment = list of local names (index = position); functions = list of
+;; function names (index = position + import count). Both are searched from the
+;; END, so a later binding shadows an earlier one exactly like the host's
+;; `assoc`/`zipmap` maps.
+
+(ns kotoba.wasm.core
+  (:require [kotoba.form :as form]
+            [kotoba.kir.compatibility :as compat])
+  (:export [emit emit-with-fuel default-fuel max-fuel])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                       [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]}))
+
+(defn default-fuel [] :i64 512)
+(defn max-fuel [] :i64 4611686018427387903)
+
+(defn- refuse-bytes [] :bytes
+  (let [refused (assert (= 1 0))] (bytes-empty)))
+
+(defn- refuse-vec [out :vector-i64] :vector-i64
+  (let [refused (assert (= 1 0))] out))
+
+;; ---------------------------------------------------------------------------
+;; LEB128 and UTF-8 over a vector-i64 accumulator
+
+(defn- uleb-into [out :vector-i64 n :i64] :vector-i64
+  (if (< n 128)
+    (vector-conj out n)
+    (uleb-into (vector-conj out (bit-or (bit-and n 127) 128)) (u64-shift-right n 7))))
+
+(defn- sleb-into [out :vector-i64 n :i64] :vector-i64
+  (let [b (bit-and n 127)
+        n2 (i64-shift-right n 7)
+        sign (bit-and b 64)]
+    (if (or (and (= n2 0) (= sign 0)) (and (= n2 (- 0 1)) (not (= sign 0))))
+      (vector-conj out b)
+      (sleb-into (vector-conj out (bit-or b 128)) n2))))
+
+(defn- append-from [out :vector-i64 v :vector-i64 i :i64] :vector-i64
+  (if (>= i (vector-count v))
+    out
+    (append-from (vector-conj out (vector-at v i)) v (+ i 1))))
+
+(defn- utf8-into [out :vector-i64 s :string i :i64 n :i64] :vector-i64
+  (if (>= i n)
+    out
+    (let [c (string-code-point-at s i)]
+      (if (< c 128)
+        (utf8-into (vector-conj out c) s (+ i 1) n)
+        (if (< c 2048)
+          (utf8-into (vector-conj (vector-conj out (+ 192 (quot c 64))) (+ 128 (bit-and c 63)))
+                     s (+ i 2) n)
+          (if (< c 65536)
+            (utf8-into (vector-conj (vector-conj (vector-conj out (+ 224 (quot c 4096)))
+                                                 (+ 128 (bit-and (quot c 64) 63)))
+                                    (+ 128 (bit-and c 63)))
+                       s (+ i 3) n)
+            (utf8-into (vector-conj (vector-conj (vector-conj (vector-conj out (+ 240 (quot c 262144)))
+                                                              (+ 128 (bit-and (quot c 4096) 63)))
+                                                 (+ 128 (bit-and (quot c 64) 63)))
+                                    (+ 128 (bit-and c 63)))
+                       s (+ i 4) n)))))))
+
+(defn- name-into [out :vector-i64 s :string] :vector-i64
+  (let [n (string-byte-length s)]
+    (utf8-into (uleb-into out n) s 0 n)))
+
+(defn- vbytes [v :vector-i64] :bytes (bytes-from-vector-i64 v))
+
+(defn- section-bytes [id :i64 payload :bytes] :bytes
+  (bytes-concat (vbytes (uleb-into (vector-conj [] id) (bytes-count payload))) payload))
+
+;; ---------------------------------------------------------------------------
+;; names
+
+(defn- texts-none [] [:list :string] (typed-list-new [:list :string]))
+(defn- texts-at [xs [:list :string] i :i64] :string (typed-list-nth [:list :string] xs i))
+(defn- texts-add [xs [:list :string] t :string] [:list :string] (typed-list-conj [:list :string] xs t))
+
+;; index of the LAST entry equal to NAME, scanning down from I; -1 when absent
+(defn- last-index [xs [:list :string] name :string i :i64] :i64
+  (if (< i 0)
+    (- 0 1)
+    (if (string=? (texts-at xs i) name)
+      i
+      (last-index xs name (- i 1)))))
+
+(defn- kw-text [k :keyword] :string
+  (let [t (document-edn-print (document-keyword k))]
+    (string-substring t 1 (string-byte-length t))))
+
+;; `name` of a symbol/keyword text: the part after the namespace slash
+(defn- base-name [s :string] :string
+  (let [i (string-find-byte s 47 0)]
+    (if (or (< i 0) (= (string-byte-length s) 1))
+      s
+      (string-substring s (+ i 1) (string-byte-length s)))))
+
+(defn- kir-key [k :keyword] [:ref :form/r] (form/keyword-form k))
+
+;; text of a symbol Form, "" for anything else
+(defn- sym-or-empty [f [:ref :form/r]] :string
+  (if (form/is-symbol? f) (form/symbol-value f) ""))
+
+;; text of the head symbol of a list Form, "" otherwise
+(defn- head-text [f [:ref :form/r]] :string
+  (if (form/is-seq? f)
+    (if (> (form/count-of f) 0) (sym-or-empty (form/first-of f)) "")
+    ""))
+
+;; ---------------------------------------------------------------------------
+;; tree walks (host `tree-seq coll? seq`)
+
+;; is there a list node headed by the symbol NAME anywhere in F?
+(defn- contains-head-from? [f [:ref :form/r] name :string i :i64] :bool
+  (if (>= i (form/count-of f))
+    false
+    (if (contains-head? (form/nth-of f i) name)
+      true
+      (contains-head-from? f name (+ i 1)))))
+
+(defn- contains-head? [f [:ref :form/r] name :string] :bool
+  (if (and (form/is-seq? f) (string=? (head-text f) name))
+    true
+    (if (> (form/tag-of f) 5)
+      (contains-head-from? f name 0)
+      false)))
+
+;; any of ARGS (from index I, stepping STEP, below END) contains a self call
+(defn- any-contains-from? [f [:ref :form/r] name :string i :i64 step :i64 end :i64] :bool
+  (if (>= i end)
+    false
+    (if (contains-head? (form/nth-of f i) name)
+      true
+      (any-contains-from? f name (+ i step) step end))))
+
+;; typed-cap-call contracts: bit 1 = an i64->i64 one, bit 2 = any other
+(defn- tcc-flags-from [f [:ref :form/r] i :i64 acc :i64] :i64
+  (if (>= i (form/count-of f))
+    acc
+    (tcc-flags-from f (+ i 1) (bit-or acc (tcc-flags (form/nth-of f i))))))
+
+(defn- tcc-node-flags [f [:ref :form/r]] :i64
+  (if (and (form/is-seq? f) (and (string=? (head-text f) "typed-cap-call") (= (form/count-of f) 5)))
+    (if (and (form/eq (form/nth-of f 2) (form/keyword-form :i64))
+             (form/eq (form/nth-of f 3) (form/keyword-form :i64)))
+      1
+      2)
+    0))
+
+(defn- tcc-flags [f [:ref :form/r]] :i64
+  (if (> (form/tag-of f) 5)
+    (tcc-flags-from f 0 (tcc-node-flags f))
+    (tcc-node-flags f)))
+
+;; ---------------------------------------------------------------------------
+;; local-count, loop helpers
+
+(defn- sum-local-counts [f [:ref :form/r] i :i64 step :i64 end :i64 acc :i64] :i64
+  (if (>= i end)
+    acc
+    (sum-local-counts f (+ i step) step end (+ acc (local-count (form/nth-of f i))))))
+
+(defn- local-count [f [:ref :form/r]] :i64
+  (if (form/is-seq? f)
+    (if (string=? (head-text f) "let")
+      (let [bindings (form/nth-of f 1)
+            nb (form/count-of bindings)]
+        (+ (quot nb 2)
+           (+ (sum-local-counts bindings 1 2 nb 0)
+              (local-count (form/nth-of f 2)))))
+      (sum-local-counts f 1 1 (form/count-of f) 0))
+    0))
+
+(defn- digits-from? [s :string i :i64 n :i64] :bool
+  (if (>= i n)
+    true
+    (let [c (string-code-point-at s i)]
+      (if (and (>= c 48) (<= c 57))
+        (digits-from? s (+ i 1) n)
+        false))))
+
+;; `__kotoba_loop_\d+`, no namespace
+(defn- loop-helper-name? [s :string] :bool
+  (let [n (string-byte-length s)]
+    (and (> n 14)
+         (and (string=? (string-substring s 0 14) "__kotoba_loop_")
+              (digits-from? s 14 n)))))
+
+(defn- tail-safe? [f [:ref :form/r] name :string nparams :i64] :bool
+  (if (form/is-seq? f)
+    (let [op (head-text f)
+          n (form/count-of f)]
+      (if (string=? op name)
+        (and (= nparams (- n 1))
+             (not (any-contains-from? f name 1 1 n)))
+        (if (string=? op "let")
+          (let [bindings (form/nth-of f 1)]
+            (and (not (any-contains-from? bindings name 1 2 (form/count-of bindings)))
+                 (tail-safe? (form/nth-of f 2) name nparams)))
+          (if (string=? op "if")
+            (and (not (contains-head? (form/nth-of f 1) name))
+                 (and (tail-safe? (form/nth-of f 2) name nparams)
+                      (tail-safe? (form/nth-of f 3) name nparams)))
+            (if (string=? op "do")
+              (and (> n 1)
+                   (and (not (any-contains-from? f name 1 1 (- n 1)))
+                        (tail-safe? (form/nth-of f (- n 1)) name nparams)))
+              (not (contains-head-from? f name 0)))))))
+    true))
+
+;; the whole list F being a self call is checked by `tail-safe?` first; any
+;; other form must not mention the helper at all (host :else branch)
+
+;; ---------------------------------------------------------------------------
+;; opcode tables (-1 when absent)
+
+(defn- arith-op [op :string] :i64
+  (if (string=? op "+") 124
+    (if (string=? op "-") 125
+      (if (string=? op "*") 126
+        (if (string=? op "quot") 127
+          (if (string=? op "bit-and") 131
+            (if (string=? op "bit-xor") 133
+              (if (string=? op "bit-or") 132 (- 0 1)))))))))
+
+(defn- cmp-op [op :string] :i64
+  (if (string=? op "=") 81
+    (if (string=? op "<") 83
+      (if (string=? op ">") 85
+        (if (string=? op "<=") 87
+          (if (string=? op ">=") 89 (- 0 1)))))))
+
+(defn- shift64-op [op :string] :i64
+  (if (string=? op "i64-shift-left") 134
+    (if (string=? op "i64-shift-right") 135
+      (if (string=? op "u64-shift-right") 136 (- 0 1)))))
+
+(defn- i32bin-op [op :string] :i64
+  (if (string=? op "i32-wrapping-add") 106
+    (if (string=? op "i32-wrapping-mul") 108
+      (if (string=? op "i32-xor") 115 (- 0 1)))))
+
+(defn- i32shift-op [op :string] :i64
+  (if (string=? op "i32-shift-left") 116
+    (if (string=? op "i32-shift-right") 117
+      (if (string=? op "u32-shift-right") 118 (- 0 1)))))
+
+(defn- pair-op [op :string] :i64
+  (if (string=? op "pair") 0
+    (if (string=? op "pair-first") 1
+      (if (string=? op "pair-second") 2 (- 0 1)))))
+
+;; ---------------------------------------------------------------------------
+;; emit-expr. IMP: bit 0 = the module imports cap-call, bit 1 = the heap pair
+;; imports. TAIL = name of the structured loop helper being emitted ("" none).
+
+(defn- imp-shift [imp :i64] :i64
+  (+ (bit-and imp 1) (* 3 (quot imp 2))))
+
+(defn- pair-base [imp :i64] :i64 (bit-and imp 1))
+
+(defn- call-into [out :vector-i64 index :i64] :vector-i64
+  (uleb-into (vector-conj out 16) index))
+
+(defn- emit-all [f [:ref :form/r] i :i64 env [:list :string] fnames [:list :string]
+                 imp :i64 tail :string depth :i64 out :vector-i64] :vector-i64
+  (if (>= i (form/count-of f))
+    out
+    (emit-all f (+ i 1) env fnames imp tail depth
+              (emit-expr (form/nth-of f i) env fnames imp tail depth out))))
+
+(defn- emit-let-pairs [bindings [:ref :form/r] p :i64 npairs :i64 body [:ref :form/r]
+                       env [:list :string] fnames [:list :string]
+                       imp :i64 tail :string depth :i64 out :vector-i64] :vector-i64
+  (if (>= p npairs)
+    (emit-expr body env fnames imp tail depth out)
+    (let [nm (form/nth-of bindings (* 2 p))
+          cursor (vector-count env)
+          code (emit-expr (form/nth-of bindings (+ (* 2 p) 1)) env fnames imp tail depth out)
+          code2 (uleb-into (vector-conj code 33) cursor)]
+      (if (form/is-symbol? nm)
+        (emit-let-pairs bindings (+ p 1) npairs body (texts-add env (form/symbol-value nm))
+                        fnames imp tail depth code2)
+        (refuse-vec out)))))
+
+(defn- emit-do [f [:ref :form/r] i :i64 n :i64 env [:list :string] fnames [:list :string]
+                imp :i64 tail :string depth :i64 out :vector-i64] :vector-i64
+  (if (>= i n)
+    out
+    (let [code (emit-expr (form/nth-of f i) env fnames imp tail depth out)]
+      (emit-do f (+ i 1) n env fnames imp tail depth
+               (if (< i (- n 1)) (vector-conj code 26) code)))))
+
+(defn- emit-binop-rest [f [:ref :form/r] i :i64 opcode :i64 env [:list :string] fnames [:list :string]
+                        imp :i64 tail :string depth :i64 out :vector-i64] :vector-i64
+  (if (>= i (form/count-of f))
+    out
+    (emit-binop-rest f (+ i 1) opcode env fnames imp tail depth
+                     (vector-conj (emit-expr (form/nth-of f i) env fnames imp tail depth out) opcode))))
+
+(defn- emit-tail-sets [i :i64 out :vector-i64] :vector-i64
+  (if (< i 0)
+    out
+    (emit-tail-sets (- i 1) (uleb-into (vector-conj out 33) i))))
+
+(defn- e1 [f [:ref :form/r] env [:list :string] fnames [:list :string]
+           imp :i64 tail :string depth :i64 out :vector-i64] :vector-i64
+  (emit-expr (form/nth-of f 1) env fnames imp tail depth out))
+
+(defn- e2 [f [:ref :form/r] env [:list :string] fnames [:list :string]
+           imp :i64 tail :string depth :i64 out :vector-i64] :vector-i64
+  (emit-expr (form/nth-of f 2) env fnames imp tail depth out))
+
+(defn- emit-call [f [:ref :form/r] env [:list :string] fnames [:list :string]
+                  imp :i64 tail :string depth :i64 out :vector-i64] :vector-i64
+  (let [op (head-text f)
+        n (form/count-of f)]
+    (if (string=? op "let")
+      (let [bindings (form/nth-of f 1)]
+        (emit-let-pairs bindings 0 (quot (form/count-of bindings) 2) (form/nth-of f 2)
+                        env fnames imp tail depth out))
+      (if (string=? op "if")
+        (let [d2 (if (string=? tail "") depth (+ depth 1))
+              t (vector-conj (vector-conj (vector-conj (vector-conj (e1 f env fnames imp tail depth out) 80) 69) 4) 126)
+              th (vector-conj (emit-expr (form/nth-of f 2) env fnames imp tail d2 t) 5)]
+          (vector-conj (emit-expr (form/nth-of f 3) env fnames imp tail d2 th) 11))
+        (if (string=? op "do")
+          (emit-do f 1 n env fnames imp tail depth out)
+          (if (string=? op "cap-call")
+            (call-into (e2 f env fnames imp tail depth
+                           (sleb-into (vector-conj out 66) (form/int-value (form/nth-of f 1))))
+                       0)
+            (if (string=? op "typed-cap-call")
+              (if (and (form/eq (form/nth-of f 2) (form/keyword-form :i64))
+                       (form/eq (form/nth-of f 3) (form/keyword-form :i64)))
+                (call-into (emit-expr (form/nth-of f 4) env fnames imp tail depth
+                                      (sleb-into (vector-conj out 66) (form/int-value (form/nth-of f 1))))
+                           0)
+                (refuse-vec out))
+              (emit-call-2 f op n env fnames imp tail depth out))))))))
+
+(defn- emit-call-2 [f [:ref :form/r] op :string n :i64 env [:list :string] fnames [:list :string]
+                    imp :i64 tail :string depth :i64 out :vector-i64] :vector-i64
+  (if (>= (pair-op op) 0)
+    (call-into (emit-all f 1 env fnames imp tail depth out) (+ (pair-base imp) (pair-op op)))
+    (if (>= (arith-op op) 0)
+      (if (and (string=? op "-") (= n 2))
+        (vector-conj (e1 f env fnames imp tail depth (vector-conj (vector-conj out 66) 0)) 125)
+        (emit-binop-rest f 2 (arith-op op) env fnames imp tail depth (e1 f env fnames imp tail depth out)))
+      (if (or (string=? op "min") (string=? op "max"))
+        (let [a (e1 f env fnames imp tail depth out)
+              b (e2 f env fnames imp tail depth a)
+              a2 (e1 f env fnames imp tail depth b)
+              b2 (e2 f env fnames imp tail depth a2)]
+          (vector-conj (vector-conj b2 (if (string=? op "min") 83 85)) 27))
+        (emit-call-3 f op n env fnames imp tail depth out)))))
+
+(defn- emit-call-3 [f [:ref :form/r] op :string n :i64 env [:list :string] fnames [:list :string]
+                    imp :i64 tail :string depth :i64 out :vector-i64] :vector-i64
+  (if (string=? op "i32-wrap")
+    (vector-conj (vector-conj (e1 f env fnames imp tail depth out) 167) 172)
+    (if (string=? op "u32-wrap")
+      (vector-conj (vector-conj (e1 f env fnames imp tail depth out) 167) 173)
+      (if (string=? op "i64-extend-i32-u")
+        (vector-conj (e1 f env fnames imp tail depth out) 173)
+        (if (>= (i32bin-op op) 0)
+          (vector-conj
+           (vector-conj
+            (vector-conj (e2 f env fnames imp tail depth (vector-conj (e1 f env fnames imp tail depth out) 167)) 167)
+            (i32bin-op op))
+           172)
+          (if (>= (shift64-op op) 0)
+            (vector-conj (e2 f env fnames imp tail depth (e1 f env fnames imp tail depth out)) (shift64-op op))
+            (if (string=? op "bit-not")
+              (vector-conj (vector-conj (vector-conj (e1 f env fnames imp tail depth out) 66) 127) 133)
+              (emit-call-4 f op n env fnames imp tail depth out))))))))
+
+(defn- emit-call-4 [f [:ref :form/r] op :string n :i64 env [:list :string] fnames [:list :string]
+                    imp :i64 tail :string depth :i64 out :vector-i64] :vector-i64
+  (if (>= (i32shift-op op) 0)
+    (vector-conj
+     (vector-conj
+      (vector-conj (e2 f env fnames imp tail depth (vector-conj (e1 f env fnames imp tail depth out) 167)) 167)
+      (i32shift-op op))
+     (if (string=? op "u32-shift-right") 173 172))
+    (if (>= (cmp-op op) 0)
+      (vector-conj (vector-conj (emit-all f 1 env fnames imp tail depth out) (cmp-op op)) 173)
+      (if (and (not (string=? tail "")) (string=? op tail))
+        (uleb-into (vector-conj (emit-tail-sets (- n 2) (emit-all f 1 env fnames imp tail depth out)) 12) depth)
+        (let [idx (last-index fnames op (- (vector-count fnames) 1))]
+          (if (< idx 0)
+            (refuse-vec out)
+            (call-into (emit-all f 1 env fnames imp tail depth out) (+ idx (imp-shift imp)))))))))
+
+(defn- emit-expr [f [:ref :form/r] env [:list :string] fnames [:list :string]
+                  imp :i64 tail :string depth :i64 out :vector-i64] :vector-i64
+  (if (form/is-int? f)
+    (sleb-into (vector-conj out 66) (form/int-value f))
+    (if (form/is-bool? f)
+      (sleb-into (vector-conj out 66) (if (form/bool-value f) 1 0))
+      (if (form/is-symbol? f)
+        (let [idx (last-index env (form/symbol-value f) (- (vector-count env) 1))]
+          (if (< idx 0)
+            (refuse-vec out)
+            (uleb-into (vector-conj out 32) idx)))
+        (if (form/is-seq? f)
+          (emit-call f env fnames imp tail depth out)
+          (refuse-vec out))))))
+
+;; ---------------------------------------------------------------------------
+;; functions
+
+(defn- param-env [params [:ref :form/r] i :i64 env [:list :string]] [:list :string]
+  (if (>= i (form/count-of params))
+    env
+    (param-env params (+ i 1) (texts-add env (sym-or-empty (form/nth-of params i))))))
+
+(defn- append-n [out :vector-i64 b :i64 n :i64] :vector-i64
+  (if (<= n 0) out (append-n (vector-conj out b) b (- n 1))))
+
+(defn- function-type-full [np :i64] :bytes
+  (vbytes (vector-conj (vector-conj (append-n (uleb-into (vector-conj [] 96) np) 126 np) 1) 126)))
+
+(defn- function-body-bytes [f [:ref :form/r] fnames [:list :string] imp :i64] :bytes
+  (let [fname (sym-or-empty (form/form-get f (kir-key :name)))
+        params (form/form-get f (kir-key :params))
+        np (form/count-of params)
+        body (form/form-get f (kir-key :body))
+        locals (local-count body)
+        helper? (loop-helper-name? fname)
+        structured? (and helper? (tail-safe? body fname np))
+        decl (if (= locals 0)
+               (vector-conj [] 0)
+               (vector-conj (uleb-into (vector-conj [] 1) locals) 126))
+        charge (if helper?
+                 decl
+                 (append-from decl
+                              [35 0 80 4 64 0 11 35 0 66 1 125 36 0]
+                              0))
+        code0 (if structured? (append-from charge [2 126 3 64] 0) charge)
+        code1 (emit-expr body (param-env params 0 (texts-none)) fnames imp
+                         (if structured? fname "") 0 code0)
+        code2 (if structured? (append-from code1 [12 1 11 0 11] 0) code1)
+        full (vector-conj code2 11)]
+    (bytes-concat (vbytes (uleb-into [] (vector-count full))) (vbytes full))))
+
+(defn- function-names [fns [:ref :form/r] i :i64 out [:list :string]] [:list :string]
+  (if (>= i (form/count-of fns))
+    out
+    (function-names fns (+ i 1)
+                    (texts-add out (sym-or-empty (form/form-get (form/nth-of fns i) (kir-key :name)))))))
+
+(defn- all-bodies-flags [fns [:ref :form/r] i :i64 acc :i64] :i64
+  ;; bit 0 cap-call, bit 1 heap op, bit 2 i64 typed-cap, bit 3 non-word typed-cap
+  (if (>= i (form/count-of fns))
+    acc
+    (let [body (form/form-get (form/nth-of fns i) (kir-key :body))
+          tcc (tcc-flags body)]
+      (all-bodies-flags fns (+ i 1)
+                        (bit-or acc
+                                (bit-or (if (contains-head? body "cap-call") 1 0)
+                                        (bit-or (if (or (contains-head? body "pair")
+                                                        (or (contains-head? body "pair-first")
+                                                            (contains-head? body "pair-second")))
+                                                  2 0)
+                                                (* 4 tcc))))))))
+
+;; ---- types / functions / exports / code sections
+
+(defn- types-payload [fns [:ref :form/r] i :i64 out :bytes] :bytes
+  (if (>= i (form/count-of fns))
+    out
+    (types-payload fns (+ i 1)
+                   (bytes-concat out
+                                 (function-type-full
+                                  (form/count-of (form/form-get (form/nth-of fns i) (kir-key :params))))))))
+
+(defn- function-index-bytes [i :i64 n :i64 shift :i64 out :bytes] :bytes
+  (if (>= i n)
+    out
+    (function-index-bytes (+ i 1) n shift
+                          (bytes-concat out (vbytes (uleb-into [] (+ shift i)))))))
+
+(defn- code-payload [fns [:ref :form/r] i :i64 fnames [:list :string] imp :i64 out :bytes] :bytes
+  (if (>= i (form/count-of fns))
+    out
+    (code-payload fns (+ i 1) fnames imp
+                  (bytes-concat out (function-body-bytes (form/nth-of fns i) fnames imp)))))
+
+;; the :exports value may be a vector (or set/list) of symbols
+(defn- name-in-list? [xs [:ref :form/r] name :string i :i64] :bool
+  (if (>= i (form/count-of xs))
+    false
+    (if (string=? (sym-or-empty (form/nth-of xs i)) name)
+      true
+      (name-in-list? xs name (+ i 1)))))
+
+(defn- export-count [fns [:ref :form/r] i :i64 has-exps :bool exps [:ref :form/r] acc :i64] :i64
+  (if (>= i (form/count-of fns))
+    acc
+    (export-count fns (+ i 1) has-exps exps
+                  (+ acc (if (if has-exps
+                               (name-in-list? exps (sym-or-empty (form/form-get (form/nth-of fns i) (kir-key :name))) 0)
+                               true)
+                           1 0)))))
+
+(defn- export-payload [fns [:ref :form/r] i :i64 has-exps :bool exps [:ref :form/r]
+                       fnames [:list :string] shift :i64 out :vector-i64] :vector-i64
+  (if (>= i (form/count-of fns))
+    out
+    (let [nm (sym-or-empty (form/form-get (form/nth-of fns i) (kir-key :name)))]
+      (export-payload fns (+ i 1) has-exps exps fnames shift
+                      (if (if has-exps (name-in-list? exps nm 0) true)
+                        (uleb-into (vector-conj (name-into out (base-name nm)) 0)
+                                   (+ shift (last-index fnames nm (- (vector-count fnames) 1))))
+                        out)))))
+
+;; ---- imports
+
+(defn- import-entry [out :vector-i64 module :string field :string index :i64] :vector-i64
+  (uleb-into (vector-conj (name-into (name-into out module) field) 0) index))
+
+(defn- import-payload [imp :i64] :bytes
+  (let [shift (imp-shift imp)
+        a (uleb-into [] shift)
+        b (if (= 1 (bit-and imp 1)) (import-entry a "kotoba:cap" "call" 0) a)
+        pb (pair-base imp)
+        c (if (>= imp 2)
+            (import-entry (import-entry (import-entry b "kotoba:heap" "pair" pb)
+                                        "kotoba:heap" "pair-first" (+ pb 1))
+                          "kotoba:heap" "pair-second" (+ pb 2))
+            b)]
+    (vbytes c)))
+
+(defn- import-types [imp :i64] :vector-i64
+  (let [a (if (= 1 (bit-and imp 1)) [96 2 126 126 1 126] [])]
+    (if (>= imp 2)
+      (append-from (append-from (append-from a [96 2 126 126 1 126] 0) [96 1 126 1 126] 0) [96 1 126 1 126] 0)
+      a)))
+
+;; ---- compatibility custom section
+
+(defn- list-has? [xs [:ref :form/r] x [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of xs))
+    false
+    (if (form/eq (form/nth-of xs i) x) true (list-has? xs x (+ i 1)))))
+
+(defn- any-type-use? [fns [:ref :form/r] kw :keyword i :i64] :bool
+  (if (>= i (form/count-of fns))
+    false
+    (let [fn-form (form/nth-of fns i)
+          kwf (form/keyword-form kw)
+          pts (form/form-get fn-form (kir-key :param-types))]
+      (if (or (form/eq (form/form-get fn-form (kir-key :result)) kwf)
+              (and (form/is-vec? pts) (list-has? pts kwf 0)))
+        true
+        (any-type-use? fns kw (+ i 1))))))
+
+(defn- wasm-runtime [target :keyword] :string
+  (if (= target :wasm32-browser-kotoba-v1)
+    "kototama-browser-host-v1"
+    (if (= target :wasm32-wasi-kotoba-v1) "kototama-wasi-host-v1" "kototama-capability-host-v1")))
+
+(defn- compat-payload [kir [:ref :form/r] fns [:ref :form/r] target :keyword] :bytes
+  (let [profile (if (any-type-use? fns :f32 0)
+                  "kotoba.typed/mixed-f32-f64-v3"
+                  (if (any-type-use? fns :f64 0)
+                    "kotoba.typed/mixed-f64-v2"
+                    "kotoba.i64/direct-v1"))
+        v (vector-conj [] 1)
+        v1 (name-into v (compat/compiler-version))
+        v2 (name-into v1 (kw-text (compat/language-version)))
+        v3 (name-into v2 (kw-text (form/keyword-value (form/form-get kir (kir-key :format)))))
+        v4 (name-into v3 (kw-text target))
+        v5 (name-into v4 (wasm-runtime target))
+        v6 (name-into v5 profile)
+        v7 (name-into v6 (kw-text (compat/tender-role)))
+        v8 (name-into v7 "kotoba.capability-host/v1")]
+    (vbytes v8)))
+
+;; ---------------------------------------------------------------------------
+;; module
+
+(defn- untyped-format? [kir [:ref :form/r]] :bool
+  (let [fmt (form/form-get kir (kir-key :format))]
+    (and (form/is-keyword? fmt)
+         (or (= (form/keyword-value fmt) :kotoba.kir/v2)
+             (= (form/keyword-value fmt) :kotoba.kir/v3)))))
+
+(defn emit-with-fuel [kir [:ref :form/r] target :keyword fuel :i64] :bytes
+  (let [fns (form/form-get kir (kir-key :functions))
+        flags (all-bodies-flags fns 0 0)
+        imp (+ (if (or (= 1 (bit-and flags 1)) (= 4 (bit-and flags 4))) 1 0)
+               (if (= 2 (bit-and flags 2)) 2 0))
+        exps (form/form-get kir (kir-key :exports))
+        has-exps (not (form/is-nil? exps))
+        fnames (function-names fns 0 (texts-none))
+        nfns (form/count-of fns)
+        shift (imp-shift imp)]
+    (if (and (untyped-format? kir)
+             (and (> fuel 0) (and (<= fuel 4611686018427387903)
+                                  (= 0 (quot flags 8)))))
+      (let [target-sec (section-bytes 0 (vbytes (utf8-into (name-into [] "kotoba.target")
+                                                           (base-name (kw-text target))
+                                                           0
+                                                           (string-byte-length (base-name (kw-text target))))))
+            compat-sec (section-bytes 0 (bytes-concat (vbytes (name-into [] "kotoba.compatibility"))
+                                                      (compat-payload kir fns target)))
+            types-sec (section-bytes 1 (types-payload fns 0
+                                                      (bytes-concat (vbytes (uleb-into [] (+ nfns shift)))
+                                                                    (vbytes (import-types imp)))))
+            import-sec (if (> shift 0) (section-bytes 2 (import-payload imp)) (bytes-empty))
+            func-sec (section-bytes 3 (function-index-bytes 0 nfns shift
+                                                            (vbytes (uleb-into [] nfns))))
+            global-sec (section-bytes 6 (vbytes (vector-conj (sleb-into (vector-conj [1 126 1] 66) fuel) 11)))
+            export-sec (section-bytes 7 (vbytes (export-payload fns 0 has-exps exps fnames shift
+                                                                (uleb-into [] (export-count fns 0 has-exps exps 0)))))
+            code-sec (section-bytes 10 (code-payload fns 0 fnames imp (vbytes (uleb-into [] nfns))))]
+        (bytes-concat
+         (bytes-concat
+          (bytes-concat
+           (bytes-concat
+            (bytes-concat
+             (bytes-concat
+              (bytes-concat
+               (bytes-concat (vbytes [0 97 115 109 1 0 0 0]) target-sec)
+               compat-sec)
+              types-sec)
+             import-sec)
+            func-sec)
+           global-sec)
+          export-sec)
+         code-sec))
+      (refuse-bytes))))
+
+(defn emit [kir [:ref :form/r] target :keyword] :bytes
+  (emit-with-fuel kir target 512))
