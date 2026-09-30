@@ -1,0 +1,399 @@
+;; kotoba.kir.definition-identity -- the GUEST-ROUTE twin of osaho's
+;; `kotoba/kir/definition_identity.cljk`, over `:form/r`.
+;;
+;; WHY A TWIN. The host module walks Clojure data (keyword-keyed maps, sets,
+;; BigInts, byte arrays) and every top-level form of it is a host value. A
+;; Kotoba module holds compiler data as the recursive `:form/r` record
+;; (kotoba.form), so the Kotoba surface is the same computation over it, a
+;; different contract (Forms in; Forms, bytes and text out). The project route
+;; takes this file instead of the .cljk (extension priority across source
+;; roots); the host behaviour of the .cljk is untouched.
+;;
+;; THE COMPUTATION. `normalize` maps a Form to the closed tagged Form,
+;; `identity-payload` builds the payload Form from a definition Form,
+;; `canonical-bytes` encodes it with `cbor/encode-form` (the Form-tree twin of
+;; the host `cbor/encode`), and `definition-cid` addresses those bytes. For an
+;; accepted definition the bytes equal the host's.
+;;
+;; WHERE IT DIFFERS ON PURPOSE
+;;   * An exported function cannot abort, so where the host throws an ex-info
+;;     (a malformed definition, an inexact integer, a raw float, a value
+;;     outside the domain) the Kotoba function TRAPS. `definition-message`
+;;     answers what the host `definition-error` reports (its message, "" when
+;;     the definition is well formed), so a caller can ask first.
+;;   * Strings order by UTF-8 bytes (`string-compare`); the host orders by
+;;     UTF-16 code unit. They agree unless a string mixes astral characters
+;;     with characters in U+E000..U+FFFF.
+;;   * The dependency check is a base32 'b' multibase string whose decoded
+;;     first byte is 1, decoded by `mf/cid->bytes` once the alphabet has been
+;;     checked (the host is `cid?`, which is not provided here).
+;;   * Effect-row bridging, lock verification, admission and the conformance
+;;     runner are host-only (open maps and `ex-info` data).
+
+(ns kotoba.kir.definition-identity
+  (:require [cbor.core :as cbor]
+            [kotoba.form :as form]
+            [multiformats.core :as mf])
+  (:export [canonical-bytes canonical-hex definition-cid definition-message identity-payload normalize payload-version])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                       [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]}))
+
+(defn payload-version [] :i64 2)
+
+;; ns/name of a keyword, as the host `stable-name` prints it (`keyword-name`
+;; answers the name part only).
+(defn- stable-name [k :keyword] :string
+  (let [text (document-edn-print (document-keyword k))]
+    (string-substring text 1 (string-byte-length text))))
+
+(defn- refuse-form [] [:ref :form/r]
+  (let [refused (assert (= 1 0))] (form/nil-form)))
+
+(defn- tagged1 [tag :string] [:ref :form/r]
+  (form/form-vec (form/one-form (form/string-form tag))))
+
+(defn- tagged2 [tag :string payload [:ref :form/r]] [:ref :form/r]
+  (form/form-vec (form/two-forms (form/string-form tag) payload)))
+
+(defn- hex-digit-at [n :i64] :string
+  (string-substring "0123456789abcdef" n (+ n 1)))
+
+(defn- bytes-hex-from [data :bytes i :i64 out :string] :string
+  (if (>= i (bytes-count data))
+    out
+    (let [v (bit-and (bytes-at data i) 255)]
+      (bytes-hex-from data (+ i 1)
+                      (string-concat (string-concat out (hex-digit-at (u64-shift-right v 4)))
+                                     (hex-digit-at (bit-and v 15)))))))
+
+(defn- ascii-lower-from [s :string index :i64 out :string] :string
+  (if (= index (string-byte-length s))
+    out
+    (let [c (string-code-point-at s index)
+          width (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4)))]
+      (ascii-lower-from
+       s (+ index width)
+       (string-concat
+        out
+        (if (if (>= c 65) (<= c 90) false)
+          (string-substring "abcdefghijklmnopqrstuvwxyz" (- c 65) (+ (- c 65) 1))
+          (string-substring s index (+ index width))))))))
+
+(defn- hex-char? [c :i64] :bool
+  (or (and (>= c 48) (<= c 57))
+      (or (and (>= c 65) (<= c 70))
+          (and (>= c 97) (<= c 102)))))
+
+(defn- all-match-hex? [s :string i :i64 n :i64] :bool
+  (if (>= i n)
+    true
+    (if (hex-char? (string-code-point-at s i))
+      (all-match-hex? s (+ i 1) n)
+      false)))
+
+(defn- all-digits? [s :string i :i64 n :i64] :bool
+  (if (>= i n)
+    true
+    (let [c (string-code-point-at s i)]
+      (if (and (>= c 48) (<= c 57))
+        (all-digits? s (+ i 1) n)
+        false))))
+
+;; -?(0|[1-9][0-9]*)
+(defn- integer-text? [s :string] :bool
+  (let [n (string-byte-length s)
+        start (if (and (> n 0) (= (string-code-point-at s 0) 45)) 1 0)]
+    (if (>= start n)
+      false
+      (if (= (string-code-point-at s start) 48)
+        (= n (+ start 1))
+        (if (and (>= (string-code-point-at s start) 49) (<= (string-code-point-at s start) 57))
+          (all-digits? s (+ start 1) n)
+          false)))))
+
+;; the wrapper of an f64 / i64 literal: a one-entry map whose key is the
+;; wrapper keyword and whose value is text. Answers the text, or nil-form.
+(defn- wrapper-text [value [:ref :form/r] wrapper :keyword] [:ref :form/r]
+  (if (and (= 9 (form/tag-of value)) (= 2 (form/count-of value)))
+    (let [k (form/nth-of value 0)
+          v (form/nth-of value 1)]
+      (if (and (= 4 (form/tag-of k)) (= 3 (form/tag-of v)))
+        (if (= (form/keyword-value k) wrapper) v (form/nil-form))
+        (form/nil-form)))
+    (form/nil-form)))
+
+(defn- f64-literal-text [value [:ref :form/r]] [:ref :form/r]
+  (let [v (wrapper-text value :kotoba.lang.code-identity/f64)]
+    (if (= 3 (form/tag-of v))
+      (let [s (form/string-value v)]
+        (if (and (= 16 (string-byte-length s)) (all-match-hex? s 0 16)) v (form/nil-form)))
+      (form/nil-form))))
+
+(defn- i64-literal-text [value [:ref :form/r]] [:ref :form/r]
+  (let [v (wrapper-text value :kotoba.lang.code-identity/i64)]
+    (if (= 3 (form/tag-of v))
+      (if (integer-text? (form/string-value v)) v (form/nil-form))
+      (form/nil-form))))
+
+;; --- order over the normalized domain -------------------------------------
+
+(defn- rank [f [:ref :form/r]] :i64
+  (let [t (form/tag-of f)]
+    (if (= t 0) 0 (if (= t 1) 1 (if (= t 3) 2 (if (= t 7) 3 4))))))
+
+(defn- sign [n :i64] :i64
+  (if (< n 0) -1 (if (> n 0) 1 0)))
+
+(defn- cmp-form [a [:ref :form/r] b [:ref :form/r]] :i64
+  (let [ra (rank a)
+        rb (rank b)]
+    (if (not (= ra rb))
+      (if (< ra rb) -1 1)
+      (if (= ra 1)
+        (sign (- (form/int-value a) (form/int-value b)))
+        (if (= ra 2)
+          (sign (string-compare (form/string-value a) (form/string-value b)))
+          (if (= ra 3)
+            (cmp-kids a b 0)
+            0))))))
+
+(defn- cmp-kids [a [:ref :form/r] b [:ref :form/r] i :i64] :i64
+  (let [na (form/count-of a)
+        nb (form/count-of b)
+        n (if (< na nb) na nb)]
+    (if (= i n)
+      (sign (- na nb))
+      (let [c (cmp-form (form/nth-of a i) (form/nth-of b i))]
+        (if (= c 0)
+          (cmp-kids a b (+ i 1))
+          c)))))
+
+(defn- sort-key [x [:ref :form/r] by-first :i64] [:ref :form/r]
+  (if (= by-first 1) (form/nth-of x 0) x))
+
+(defn- insert-position [sorted [:list [:ref :form/r]] x [:ref :form/r] by-first :i64 i :i64] :i64
+  (if (>= i (vector-count sorted))
+    i
+    (if (< (cmp-form (sort-key x by-first)
+                     (sort-key (typed-list-nth [:list [:ref :form/r]] sorted i) by-first))
+           0)
+      i
+      (insert-position sorted x by-first (+ i 1)))))
+
+(defn- rebuild-with [sorted [:list [:ref :form/r]] x [:ref :form/r] p :i64 i :i64 acc [:list [:ref :form/r]]]
+  [:list [:ref :form/r]]
+  (let [n (vector-count sorted)
+        acc1 (if (= i p) (form/append-form acc x) acc)]
+    (if (< i n)
+      (rebuild-with sorted x p (+ i 1) (form/append-form acc1 (typed-list-nth [:list [:ref :form/r]] sorted i)))
+      acc1)))
+
+;; A stable insertion sort: an item goes after every item that is not greater.
+(defn- sort-fold [items [:list [:ref :form/r]] by-first :i64 i :i64 sorted [:list [:ref :form/r]]]
+  [:list [:ref :form/r]]
+  (if (>= i (vector-count items))
+    sorted
+    (let [x (typed-list-nth [:list [:ref :form/r]] items i)]
+      (sort-fold items by-first (+ i 1)
+                 (rebuild-with sorted x (insert-position sorted x by-first 0) 0 (form/no-forms))))))
+
+;; --- normalization -----------------------------------------------------------
+
+(defn- normalize-list [kids [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count kids))
+    acc
+    (normalize-list kids (+ i 1)
+                    (form/append-form acc (normalize (typed-list-nth [:list [:ref :form/r]] kids i))))))
+
+(defn- normalize-pairs [kids [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= (+ i 1) (vector-count kids))
+    acc
+    (normalize-pairs kids (+ i 2)
+                     (form/append-form
+                      acc
+                      (form/form-vec
+                       (form/two-forms (normalize (typed-list-nth [:list [:ref :form/r]] kids i))
+                                       (normalize (typed-list-nth [:list [:ref :form/r]] kids (+ i 1)))))))))
+
+(defn- normalize-map [value [:ref :form/r]] [:ref :form/r]
+  (let [f64-text (f64-literal-text value)]
+    (if (= 3 (form/tag-of f64-text))
+      (tagged2 "f64" (form/string-form (ascii-lower-from (form/string-value f64-text) 0 "")))
+      (let [i64-text (i64-literal-text value)]
+        (if (= 3 (form/tag-of i64-text))
+          (tagged2 "int" i64-text)
+          (tagged2 "map"
+                   (form/form-vec
+                    (sort-fold (normalize-pairs (form/kids-of value) 0 (form/no-forms)) 1 0 (form/no-forms)))))))))
+
+(defn normalize
+  "A Form -> the closed tagged Form. See the host `normalize`; what it throws
+  on, this traps on."
+  [value [:ref :form/r]] [:ref :form/r]
+  (let [tag (form/tag-of value)]
+    (cond
+      (= tag 0) (tagged1 "nil")
+      (= tag 1) (tagged2 "bool" value)
+      (= tag 2) (let [n (form/int-value value)]
+                  (if (and (<= (- 0 9007199254740991) n) (<= n 9007199254740991))
+                    (tagged2 "int" (form/string-form (string-from-i64 n)))
+                    (refuse-form)))
+      (= tag 3) (tagged2 "str" value)
+      (= tag 4) (tagged2 "kw" (form/string-form (stable-name (form/keyword-value value))))
+      (= tag 5) (tagged2 "sym" (form/string-form (form/symbol-value value)))
+      (= tag 11) (tagged2 "bytes" (form/string-form (bytes-hex-from (form/bytes-of value) 0 "")))
+      (= tag 9) (normalize-map value)
+      (= tag 8) (tagged2 "set"
+                         (form/form-vec
+                          (sort-fold (normalize-list (form/kids-of value) 0 (form/no-forms)) 0 0 (form/no-forms))))
+      (= tag 7) (tagged2 "vec" (form/form-vec (normalize-list (form/kids-of value) 0 (form/no-forms))))
+      (= tag 6) (tagged2 "list" (form/form-vec (normalize-list (form/kids-of value) 0 (form/no-forms))))
+      :else (refuse-form))))
+
+;; --- definition shape ----------------------------------------------------------
+
+(defn- key-of [name :string] [:ref :form/r]
+  (form/keyword-form (keyword-from-string name)))
+
+(defn- field [definition [:ref :form/r] name :string] [:ref :form/r]
+  (form/form-get definition (key-of name)))
+
+(defn- has-field? [definition [:ref :form/r] name :string] :bool
+  (form/form-has? definition (key-of name)))
+
+(defn- positive-int? [f [:ref :form/r]] :bool
+  (and (= 2 (form/tag-of f)) (> (form/int-value f) 0)))
+
+(defn- all-keywords? [kids [:list [:ref :form/r]] i :i64] :bool
+  (if (>= i (vector-count kids))
+    true
+    (if (= 4 (form/tag-of (typed-list-nth [:list [:ref :form/r]] kids i)))
+      (all-keywords? kids (+ i 1))
+      false)))
+
+(defn- base32-alphabet-char? [c :i64] :bool
+  (or (and (>= c 97) (<= c 122)) (and (>= c 50) (<= c 55))))
+
+(defn- all-base32? [s :string i :i64 n :i64] :bool
+  (if (>= i n)
+    true
+    (if (base32-alphabet-char? (string-code-point-at s i))
+      (all-base32? s (+ i 1) n)
+      false)))
+
+(defn- cid-text? [f [:ref :form/r]] :bool
+  (if (= 3 (form/tag-of f))
+    (let [s (form/string-value f)
+          n (string-byte-length s)]
+      (if (and (> n 1) (= 98 (string-code-point-at s 0)))
+        (if (all-base32? s 1 n)
+          (= 1 (bit-and (vector-at (mf/cid->bytes s) 0) 255))
+          false)
+        false))
+    false))
+
+(defn- all-cids? [kids [:list [:ref :form/r]] i :i64] :bool
+  (if (>= i (vector-count kids))
+    true
+    (if (cid-text? (typed-list-nth [:list [:ref :form/r]] kids i))
+      (all-cids? kids (+ i 1))
+      false)))
+
+(defn- dependency-repeats? [kids [:list [:ref :form/r]] i :i64 j :i64] :bool
+  (if (>= j (vector-count kids))
+    false
+    (if (= 0 (cmp-form (typed-list-nth [:list [:ref :form/r]] kids i)
+                       (typed-list-nth [:list [:ref :form/r]] kids j)))
+      true
+      (dependency-repeats? kids i (+ j 1)))))
+
+(defn- distinct-strings? [kids [:list [:ref :form/r]] i :i64] :bool
+  (if (>= i (vector-count kids))
+    true
+    (if (dependency-repeats? kids i (+ i 1))
+      false
+      (distinct-strings? kids (+ i 1)))))
+
+(defn- missing-field [definition [:ref :form/r]] :bool
+  (not (and (has-field? definition "definition/profile-version")
+            (has-field? definition "definition/desugar-contract-version")
+            (has-field? definition "definition/kir")
+            (has-field? definition "definition/effect-row")
+            (has-field? definition "definition/interface")
+            (has-field? definition "definition/dependencies"))))
+
+(defn definition-message
+  "What the host `definition-error` reports for the definition Form, as its
+  message; the empty string when the definition is well formed."
+  [definition [:ref :form/r]] :string
+  (if (not (= 9 (form/tag-of definition)))
+    "definition map required"
+    (if (missing-field definition)
+      "definition missing required field"
+      (if (not (positive-int? (field definition "definition/profile-version")))
+        "definition profile version must be positive integer"
+        (if (not (positive-int? (field definition "definition/desugar-contract-version")))
+          "definition desugar contract version must be positive integer"
+          (let [kir (field definition "definition/kir")
+                row (field definition "definition/effect-row")
+                deps (field definition "definition/dependencies")]
+            (if (not (= 9 (form/tag-of kir)))
+              "definition typed KIR map required"
+              (if (not (form/form-has? kir (key-of "op")))
+                "definition typed KIR must be an IR node with :op, not an arbitrary map"
+                (if (not (= 8 (form/tag-of row)))
+                  "definition effect row must be a set"
+                  (if (not (all-keywords? (form/kids-of row) 0))
+                    "definition effect row members must be keywords"
+                    (if (not (= 9 (form/tag-of (field definition "definition/interface"))))
+                      "definition interface map required"
+                      (if (not (= 7 (form/tag-of deps)))
+                        "definition dependencies vector required"
+                        (if (not (all-cids? (form/kids-of deps) 0))
+                          "definition dependency CID required"
+                          (if (not (distinct-strings? (form/kids-of deps) 0))
+                            "definition dependencies must be unique"
+                            ""))))))))))))))
+
+(defn- put [acc [:list [:ref :form/r]] k [:ref :form/r] v [:ref :form/r]] [:list [:ref :form/r]]
+  (form/append-form (form/append-form acc k) v))
+
+(defn identity-payload
+  "The payload Form addressed by `definition-cid` (host: the payload map)."
+  [definition [:ref :form/r]] [:ref :form/r]
+  (form/form-map
+   (put (put (put (put (put (put (put (form/no-forms)
+                                      (form/keyword-form :kotoba.definition-identity/version)
+                                      (form/int-form 2))
+                                 (form/keyword-form :profile-version)
+                                 (field definition "definition/profile-version"))
+                            (form/keyword-form :desugar-contract-version)
+                            (field definition "definition/desugar-contract-version"))
+                       (form/keyword-form :typed-kir)
+                       (field definition "definition/kir"))
+                  (form/keyword-form :effect-row)
+                  (field definition "definition/effect-row"))
+             (form/keyword-form :interface)
+             (field definition "definition/interface"))
+        (form/keyword-form :dependencies)
+        (form/form-vec (sort-fold (form/kids-of (field definition "definition/dependencies")) 0 0 (form/no-forms))))))
+
+(defn- canonical-fragment [definition [:ref :form/r]] :vector-i64
+  (let [checked (assert (= "" (definition-message definition)))]
+    (cbor/encode-form (normalize (identity-payload definition)))))
+
+(defn canonical-bytes
+  "The canonical DAG-CBOR block for the definition Form (a trap when it is
+  malformed; ask `definition-message` first)."
+  [definition [:ref :form/r]] :bytes
+  (bytes-from-vector-i64 (canonical-fragment definition)))
+
+(defn canonical-hex
+  "Lowercase hex of `canonical-bytes`."
+  [definition [:ref :form/r]] :string
+  (mf/hexify (canonical-fragment definition)))
+
+(defn definition-cid
+  "The CIDv1 dag-cbor identity of the definition Form."
+  [definition [:ref :form/r]] :string
+  (mf/cidv1-dag-cbor (canonical-fragment definition)))
