@@ -1,5 +1,14 @@
 # Agent rules
 
+## Refactoring is AST-based by default
+
+- Rule-shaped changes (a pattern at many sites, a rename, a module split, a
+  dialect port) use `kotoba refactor` (`plan`, `apply`, `verify`), not sed or
+  hand text edits. A hand edit is the exception; say why, and turn a repeated
+  hand edit into a rule in `lang/refactor-rules/`.
+- No Python or JVM on the CLI path; fail closed. Decision:
+  `docs/adr/ADR-ast-based-refactoring-is-the-default.md`.
+
 ## Language semantics are target-independent
 
 - wasm32 is one build target of the Amu native compiler, not the definition of
