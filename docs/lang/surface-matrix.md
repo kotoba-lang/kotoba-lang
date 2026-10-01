@@ -57,6 +57,7 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 |---|---|---|---|
 | `backend-parity` | `implemented-partial` |  |  |
 | `bounded-control-and-sugar` | `implemented-partial` |  |  |
+| `bytes-value` | `implemented-partial` | compiler-native-host, kir, kotoba-wasm, restricted-esm | Native bytes-at outside the value is an unnamed SIGILL (it is the inline vector read); every other refusal is named on every implemented backend. |
 | `computed-module-constant` | `implemented` | compiler |  |
 | `data-host-argument` | `implemented-partial` | compiler-host-cljs, compiler-host-jvm, kotoba-wasm |  |
 | `dataspace` | `implemented-partial` | compiler | Source forms make coordination native without making assertion data authoritative. Explicit facet enter/leave is the safe current lifecycle surface. |
