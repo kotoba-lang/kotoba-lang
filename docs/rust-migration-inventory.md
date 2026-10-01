@@ -1,4 +1,6 @@
-# Rust Migration Inventory
+# Rust Migration Inventory (historical)
+
+> **Superseded (2026-10-01)**: Rust is no longer permitted anywhere in the Kotoba toolchain, including adapter-owned repositories. The CLI is Kotoba on the nbb launcher / amu native route. This file is kept as a record of the migration; the policy below replaces the earlier "adapter-owned Rust" exception.
 
 This inventory records the active `kotoba-lang` Rust/Cargo migration state.
 `kotoba-v2025` is the explicit legacy exception and remains untouched as a
@@ -32,6 +34,11 @@ find orgs/kotoba-lang \
 
 ## Policy
 
-Kotoba language and protocol semantics must not be authored in Rust as the source
-of truth. Rust may remain only in an explicitly adapter-owned repository or in
-`kotoba-v2025` as legacy reference material.
+Kotoba language and protocol semantics must not be authored in Rust. Nothing that
+builds, tests, runs or releases Kotoba may require a Rust toolchain, crate,
+Cargo file or Rust host adapter. Host adapters consume `lang/cli.edn`
+(`:host-adapter-targets [:amu-nbb :amu-native]`) and are Kotoba. The only Rust
+that may be mentioned is a benchmark competitor in a comparison table or
+historical text. `scripts/check-legacy-runtime-absence.bb` guards against
+Cargo/Rust files returning. `kotoba-v2025` remains legacy reference material and
+is not a dependency.

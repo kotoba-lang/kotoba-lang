@@ -5,6 +5,8 @@
 - **Artifacts**: `kotoba-lang/transit`, `docs/lang/package-rules.md`, `docs/lang/README.md`
 - **Related**: `ADR-kotoba-package-cid-lock.md`, `ADR-safe-capability-language.md`, `ADR-kotoba-rad-git-sovereign-repo.md`
 
+> **Superseded note (2026-10-01)**: Kotoba has no Rust dependency. The CLI and everything it needs are Kotoba (`.cljk`/`.kotoba`) running on the nbb launcher or the amu native route. Where this ADR describes Rust as the implementation, bridge or host, that is historical record only; no Rust binary, crate or cargo build is required to build, test, run or release anything.
+
 > **Superseded**: at M1 maturity (one call site, two days old), the
 > Transit-style `~:`/`~$`/`~#` tag scheme decided here was replaced by plain
 > `application/json` (optionally gzip-compressed) to stay aligned with

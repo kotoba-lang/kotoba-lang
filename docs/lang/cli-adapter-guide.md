@@ -3,6 +3,8 @@
 **Contract:** [`lang/cli.edn`](../../lang/cli.edn)  
 **Matrix:** [`lang/cli-adapter-matrix.edn`](../../lang/cli-adapter-matrix.edn)
 
+Host adapter target: the Kotoba implementation on the nbb launcher / amu native route (`:host-adapter-targets [:amu-nbb :amu-native]` in `lang/cli.edn`). No Rust adapter exists or is required; `kotoba refactor` delegates to `amu refactor` only.
+
 ```bash
 # structural contract (13 commands)
 bb scripts/check-cli-contract.bb lang/cli.edn

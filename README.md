@@ -360,6 +360,8 @@ labels do not imply ecosystem, adoption, release, or production-SLO maturity.
 
 ## Install
 
+The `kotoba` CLI is Kotoba source running on the nbb launcher or the amu native route; it has no Rust dependency and needs no Rust toolchain.
+
 ### Homebrew (macOS and Linux)
 
 ```sh

@@ -65,7 +65,7 @@ Design rules each lib follows:
   take a host-injected capability handle (same seam as `kotobase.store/IStore`
   and `num.protocol/IBackend`). They never touch the OS directly.
 - **Plugs into the existing effect/capability boundary.** `wit` and `async`
-  surface `effects.rs` / `policy.rs` (deny-by-default, per-cid, interprocedural
+  surface effect/policy gates (formerly `effects.rs` / `policy.rs`, now Kotoba) (deny-by-default, per-cid, interprocedural
   effect gate from `ADR-safe-capability-language.md`) as a *user* API, not a new
   enforcement layer.
 - **stdlib versioning is separate from profile-version.** `:kotoba.lang/profile-version`
@@ -111,7 +111,7 @@ stability; async runtime maturity (intentionally host-driven).
   `test` property cases, and `test`'s PRNG/generators/quickcheck compose with
   the existing conformance fixture runner.
 - **`wit` + `async` maximize the capability differentiator.** The
-  deny-by-default enforcement already existed in `effects.rs` / `policy.rs`;
+  deny-by-default enforcement already existed in the effect/policy gates (formerly `effects.rs` / `policy.rs`);
   these libs turn it into the documented user-facing API — the one column where
   kotoba beats deno / rust / ts / python / go rather than trailing them.
 - **M5 consumer provenance is universal.** Every consumable leaf has a
@@ -160,7 +160,7 @@ they become follow-up work rather than drift. See `docs/lang/coverage.edn`
 
 - Does **not** change `lang/profile.edn` or `:kotoba.lang/profile-version`.
 - Does **not** invent new enforcement gates; `wit` / `async` reuse the existing
-  `effects.rs` / `policy.rs` boundary.
+  effect/policy boundary (formerly `effects.rs` / `policy.rs`).
 - Does **not** build the `:packages` CID-lock track — that is owner-led; this
   ADR only defers `registry` to it.
 

@@ -4,6 +4,8 @@
 **Date**: 2026-06-28
 **Deciders**: Jun Kawasaki
 
+> **Superseded note (2026-10-01)**: Kotoba has no Rust dependency. The CLI and everything it needs are Kotoba (`.cljk`/`.kotoba`) running on the nbb launcher or the amu native route. Where this ADR describes Rust as the implementation, bridge or host, that is historical record only; no Rust binary, crate or cargo build is required to build, test, run or release anything.
+
 ## Context
 
 `kotoba-git` already gives kotoba a byte-exact Git object bridge:

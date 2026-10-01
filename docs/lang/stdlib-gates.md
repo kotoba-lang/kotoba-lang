@@ -50,5 +50,5 @@ done
   gate set — it is deferred to the `:packages` CID-lock track
   (`docs/lang/package-rules.md`, `ADR-kotoba-package-cid-lock`).
 - This gate set does **not** cover the language *profile* (that is
-  `docs/lang/gates.md`, the Rust/cargo profile conformance suite). The stdlib
+  `docs/lang/gates.md`, the former profile conformance suite). The stdlib
   is a separate track with its own versioning (`docs/lang/stdlib-versioning.md`).

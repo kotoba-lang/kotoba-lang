@@ -108,7 +108,7 @@ kotoba check --safe --json cell.kotoba
 There is no `kotoba wasm` command group. `wasm` is a `--target` of `compile`,
 and the capability-safe profile is `--safe` on `check` — the former `wasm
 build` / `safe-policy` / `safe-build` / `selfhost-inspect` spellings are
-Rust-era names with no entry in `lang/cli.edn`.
+legacy names with no entry in `lang/cli.edn`.
 
 Namespace source roots are supplied with `-S` / `--source-path` or
 `KOTOBA_SOURCE_PATH`; `KOTOBA_CLJ_PATH` is retained only as a compatibility
@@ -311,7 +311,7 @@ the `kotoba-lang` org, in the same zero-dep `.cljc` + host-injected pattern as
   (←fs/io/wit/coll), `lint` (←fmt/lsp/fs/coll)
 
 Each lib is capability-parameterized (never direct-OS), plugs into the
-existing `effects.rs` / `policy.rs` deny-by-default boundary, and carries its
+existing deny-by-default effect/policy boundary (formerly `effects.rs` / `policy.rs`; those Rust files were removed, the boundary is now authored in Kotoba), and carries its
 own semver separate from `:kotoba.lang/profile-version` (the profile stays 1).
 Per-lib M0–M6 maturity and the full catalog are tracked in
 `docs/lang/coverage.edn` under `:stdlib` (track at `:m6`); the semver/compat

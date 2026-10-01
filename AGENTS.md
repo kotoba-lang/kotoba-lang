@@ -1,5 +1,14 @@
 # Agent rules
 
+## No Rust
+
+- The `kotoba` CLI and everything it needs is Kotoba (`.cljk`/`.kotoba`) running
+  on the nbb launcher or the amu native route. No Rust binary, crate, Cargo
+  file, cargo build, Rust host adapter or Rust parity target may be required to
+  build, test, run or release anything. `lang/cli.edn` names
+  `:host-adapter-targets [:amu-nbb :amu-native]`. Rust may appear only as a
+  benchmark competitor or in historical text.
+
 ## Refactoring is AST-based by default
 
 - Rule-shaped changes (a pattern at many sites, a rename, a module split, a

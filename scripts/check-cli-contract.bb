@@ -66,6 +66,9 @@
         command-ids (set (map :id commands))
         option-count (count (mapcat :options commands))]
     (assert! (pos-int? version) "contract must declare positive integer version")
+    (let [targets (get-in contract [:kotoba.cli.contract/scope :host-adapter-targets])]
+      (assert! (and (seq targets) (every? #{:amu-nbb :amu-native} targets))
+               "host-adapter-targets must be Kotoba on amu/nbb (:amu-nbb, :amu-native); no Rust or foreign runtime target"))
     (assert! (map? tier-labels) "contract must declare :kotoba.cli.contract/tier-labels")
     (assert! (map? option-types) "contract must declare :kotoba.cli.contract/option-types")
     (assert! (vector? commands) "contract must declare vector :kotoba.cli.contract/commands")
