@@ -1,9 +1,31 @@
 # Agent rules
 
+## The product does not depend on nbb, Node or the JVM
+
+Decision 2026-10-01: nbb, Node, the JVM and GraalVM are bootstrap references
+only. The end state is `kotoba`/`amu` built by Amu, running `check`, `refactor`,
+`compile` and `kotoba ...` with no node/nbb/JVM process. Details and the
+inventory tool live in `amu-measure`: `docs/selfhost-priority.md` (rules 8-11),
+`scripts/selfhost-wall/bootstrap-boundary.sh`, stage S6 of
+`docs/selfhost-core-rewrite-plan-20260930.md`.
+
+- New code on the product path is Kotoba (`.cljk`/`.kotoba`) with a `:kotoba`
+  reading that passes `amu check`. Never nbb-, Node- or JVM-only code. This
+  includes `lang/compat` twins: a twin is a Kotoba reading, not a host shim.
+- Host-only code (`node:*`, `js/*`, `java.*`, `:import`) lives behind
+  `#?(:cljs ...)`/`#?(:clj ...)` in files flagged `;; bootstrap-tooling` in the
+  first five lines, or under `scripts/`, `test/`, `bench/`.
+- A PR or commit that adds an nbb/Node/JVM dependency to the product path is
+  refused. `#?(:kotoba nil ...)` and named refusals are debt, not progress.
+- 100% means: the `amu` binary built by Amu itself runs the full check,
+  refactor and compile on its own sources with zero node/JVM/nbb processes,
+  verified by `scripts/selfhost-wall/no-host-processes.sh -- <command>` in
+  `amu-measure` (strace/dtruss execve trace; no tracer is a failure).
+
 ## No Rust
 
 - The `kotoba` CLI and everything it needs is Kotoba (`.cljk`/`.kotoba`) running
-  on the nbb launcher or the amu native route. No Rust binary, crate, Cargo
+  on the nbb launcher (bootstrap only) or the amu native route. No Rust binary, crate, Cargo
   file, cargo build, Rust host adapter or Rust parity target may be required to
   build, test, run or release anything. `lang/cli.edn` names
   `:host-adapter-targets [:amu-nbb :amu-native]`. Rust may appear only as a
