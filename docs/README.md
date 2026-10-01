@@ -22,6 +22,7 @@ are unchanged.
 | I want to… | Start here | Then read |
 |---|---|---|
 | install Kotoba and run a program | [Getting started](getting-started.md) | [Tooling reference](reference/tooling.md) |
+| change compiler sources | [Refactoring](refactoring.md) | [AGENTS.md](../AGENTS.md) |
 | learn the language surface | [Language reference](reference/language.md) | [Option/result](lang/option-result-guide.md), [records](lang/record-cookbook.md) |
 | implement a compiler or runtime | [Semantics SSoT](lang/semantics-ssot.md) | [grammar](../lang/guest-grammar.edn), [surface status](../lang/surface-status.edn), [conformance](../lang/conformance/manifest.edn) |
 | evaluate readiness honestly | [Maturity and comparison](maturity.md) | [coverage evidence](lang/coverage.edn), [engineering model](system-dynamics/kotoba-lang-maturity.md) |

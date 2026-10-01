@@ -465,6 +465,7 @@ authoritative in machine-readable contracts and qualification evidence.
 ## Documentation
 
 - [Getting started](docs/getting-started.md)
+- [Refactoring with `kotoba refactor` (the default workflow)](docs/refactoring.md)
 - [Localized GitHub start paths](docs/i18n/README.md)
 - [Documentation map](docs/README.md)
 - [Language surface status](lang/surface-status.edn)
