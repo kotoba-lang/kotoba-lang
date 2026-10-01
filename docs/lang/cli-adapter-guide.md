@@ -4,7 +4,7 @@
 **Matrix:** [`lang/cli-adapter-matrix.edn`](../../lang/cli-adapter-matrix.edn)
 
 ```bash
-# structural contract (8 commands)
+# structural contract (13 commands)
 bb scripts/check-cli-contract.bb lang/cli.edn
 # adapter matrix vs contract
 kbb -M:cli-adapter-matrix
@@ -22,6 +22,7 @@ kbb -M:cli-adapter-matrix
 | rad | M1 | — | contract-only |
 | deploy | M1 | — | contract-only |
 | hinshitsu | M1 | — | contract-only |
+| refactor | M1 | contract-only | validates argv, delegates to `amu refactor` (nbb/Kotoba only); `:refactor/engine-absent` when the engine is missing |
 
 ## Compiler extras (not in 8-id set)
 

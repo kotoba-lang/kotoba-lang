@@ -50,7 +50,10 @@ kotoba check --safe examples/policy-demo.kotoba
 The command surface is declared in [`lang/cli.edn`](../../lang/cli.edn) and
 enforced against the implementation by `kotoba.cli/conformance`; that contract
 is the authority when this document disagrees with it. Commands are `run`,
-`compile`, `check`, `graph`, `git`, `rad`, `deploy` and `hinshitsu`.
+`compile`, `check`, `graph`, `git`, `rad`, `deploy`, `hinshitsu` and `refactor`
+(AST-based refactoring, the default way to change source in bulk; it delegates
+to `amu refactor` and fails closed with `:refactor/engine-absent` without it;
+see `docs/adr/ADR-ast-based-refactoring-is-the-default.md`).
 
 The examples in `examples/` are intentionally small. The authoritative
 compatibility examples are the conformance fixtures under `lang/conformance/`.
@@ -279,7 +282,7 @@ ecosystem adoption, or production SLOs. See
 - `kotoba-lang`: language semantics, admitted grammar, and conformance vocabulary.
 - `kotoba-core-contracts`: source classification, package, and runtime-boundary contracts.
 - `kotoba-cli`: public compiler surface, declared in `lang/cli.edn`
-  (`run`, `compile`, `check`, `graph`, `git`, `rad`, `deploy`, `hinshitsu`).
+  (`run`, `compile`, `check`, `graph`, `git`, `rad`, `deploy`, `hinshitsu`, `refactor`).
 - `kotoba-clj`: compiler implementation crate and compatibility binary for the
   profile.
 - `kotoba-runtime`: host/runtime for compiled components.

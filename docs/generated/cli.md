@@ -192,6 +192,27 @@ Options:
 - **`--dry-run`** — Inspect the exact release graph without publishing. Set false for local-signed IPNS, or combine with --hosted for Passkey approval. Type: `boolean`; default: `true`.
 - **`--json`** — Emit the descriptor or publication receipt as JSON. Type: `boolean`.
 
+## `kotoba refactor`
+
+AST-based, offset-preserving, verifiable refactoring of Kotoba-family source (the default way to refactor; never regex or text edits). Machine-readable EDN results with format :kotoba.refactor/v1. Delegates to the amu refactor engine; fails closed with :refactor/engine-absent when the engine is not installed. No Python or JVM path.
+
+Maturity tier: `m1`.
+
+Subcommands: `list-rules`, `plan`, `apply`, `graph`, `split`, `verify`.
+
+Positionals:
+
+- **`subcommand`** — list-rules | plan <rule> <paths...> | apply <rule> <paths...> | graph <path> | split <path> --partition p.edn --out dir | verify. Type: `enum`; values: `list-rules`, `plan`, `apply`, `graph`, `split`, `verify`; required.
+- **`target`** — Rule id for plan/apply (see list-rules); source path for graph/split. Type: `string`.
+- **`paths`** — Files or directories to plan/apply the rule over. Type: `path`; repeatable.
+
+Options:
+
+- **`--check`** — apply: write nothing; exit non-zero if the rule would change any file (CI gate). Type: `boolean`.
+- **`--partition`** — split: EDN partition of the dependency graph into modules. Type: `path`.
+- **`--out`** — split: output directory for the extracted modules. Type: `path`.
+- **`--project`** — verify: project root whose test set is run before and after and compared per test. Type: `path`; default: `.`.
+
 ## `kotoba hinshitsu`
 
 Run software-quality checks (evidence, gates, coverage, visual regression) as data.

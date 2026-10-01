@@ -5,7 +5,7 @@
             [clojure.string :as str]))
 
 (def required-commands
-  #{:id :run :compile :check :graph :git :build :test :rad :deploy :library :hinshitsu})
+  #{:id :run :compile :check :graph :git :build :test :rad :deploy :library :hinshitsu :refactor})
 
 (defn fail! [& parts]
   (binding [*out* *err*]
