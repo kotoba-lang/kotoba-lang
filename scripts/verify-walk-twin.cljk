@@ -1,0 +1,200 @@
+(ns verify-walk-twin
+  "kotoba.walk (lang/compat/kotoba/walk.kotoba: walk / prewalk / postwalk over
+  kotoba.form's Form record) against clojure.walk on the host, on the KIR
+  interpreter.
+
+  The Form record lives in kotoba-hir/src/kotoba/form.cljk and the twin in
+  lang/compat/kotoba/walk.kotoba. Both are one module here: the twin's defns
+  are appended to form.cljk's text (its `form/` prefix dropped), so a single
+  `sema/analyze` reads them, and a probe per case builds the Form of a host
+  value, walks it with a visitor, and reduces the result to an i64 digest that
+  is computed identically on the host (see `digest`). A digest is order
+  independent over sets and maps, as the values are.
+
+      FORM=<kotoba-hir>/src/kotoba/form.cljk \\
+      WALK=lang/compat/kotoba/walk.kotoba \\
+      node --stack-size=4096 nbb/cli.js --classpath <amu cp> scripts/verify-walk-twin.cljk
+
+  A FAIL line is a difference; the exit code is not set."
+  (:require ["node:fs" :as fs]
+            [clojure.string :as str]
+            [clojure.walk :as walk]
+            [kotoba.sema :as sema]
+            [kotoba.kir :as kir]))
+
+(def form-src (.readFileSync fs (or (.. js/process -env -FORM) "kotoba-hir/src/kotoba/form.cljk") "utf8"))
+(def walk-src (.readFileSync fs (or (.. js/process -env -WALK) "lang/compat/kotoba/walk.kotoba") "utf8"))
+
+;; the twin without its ns form and `form/` qualifiers
+(def walk-body
+  (let [i (str/index-of walk-src "\n(defn- has-form?")]
+    (str/replace (subs walk-src i) #"(?<![:\w])form/" "")))
+
+(def M 1000000007)
+
+;; ---- the digest, on the host ---------------------------------------------
+
+(defn- md [x] (mod x M))
+(defn- cps [s] (mapv #(.codePointAt % 0) (js/Array.from s)))
+(defn- fold-bytes [h bs] (reduce (fn [h b] (md (+ (* h 131) b))) h bs))
+
+(defn digest [x]
+  (cond
+    (nil? x) 7
+    (boolean? x) (if x 12 11)
+    (integer? x) (md (+ (* (md x) 31) 3))
+    (string? x) (fold-bytes 5 (cps x))
+    (keyword? x) (fold-bytes 13 (cps (name x)))
+    (symbol? x) (fold-bytes 15 (cps (str x)))
+    (map-entry? x) (md (+ (* 131 (md (+ (* 131 17) (digest (key x))))) (digest (val x))))
+    (vector? x) (reduce (fn [h y] (md (+ (* h 131) (digest y)))) 17 x)
+    (seq? x) (reduce (fn [h y] (md (+ (* h 131) (digest y)))) 19 x)
+    (set? x) (reduce (fn [h y] (md (+ h (digest y)))) 23 x)
+    (map? x) (reduce (fn [h [k v]] (md (+ h (md (+ (* 131 (digest k)) (digest v)))))) 29 x)
+    :else (throw (ex-info "no digest" {:x x}))))
+
+;; ---- the digest, on Form -------------------------------------------------
+
+(defn- fdig-defs []
+  "
+(defn- md [x :i64] :i64 (let [r (rem x 1000000007)] (if (< r 0) (+ r 1000000007) r)))
+
+(defn- width [cp :i64] :i64 (cond (< cp 128) 1 (< cp 2048) 2 (< cp 65536) 3 :else 4))
+
+(defn- fold-string [h :i64 s :string n :i64] :i64
+  (loop [j 0 acc h]
+    (if (>= j n)
+      acc
+      (let [cp (string-code-point-at s j)]
+        (recur (+ j (width cp)) (md (+ (* acc 131) cp)))))))
+
+(defn- sdig [h :i64 s :string] :i64
+  (fold-string h s (string-byte-length s)))
+
+(defn- fdig-seq [xs [:list [:ref :form/r]] i :i64 h :i64] :i64
+  (let [n (vector-count xs)]
+    (loop [j i acc h]
+      (if (>= j n)
+        acc
+        (recur (+ j 1) (md (+ (* acc 131) (fdig (typed-list-nth [:list [:ref :form/r]] xs j)))))))))
+
+(defn- fdig-set [xs [:list [:ref :form/r]] h :i64] :i64
+  (let [n (vector-count xs)]
+    (loop [j 0 acc h]
+      (if (>= j n)
+        acc
+        (recur (+ j 1) (md (+ acc (fdig (typed-list-nth [:list [:ref :form/r]] xs j)))))))))
+
+(defn- fdig-map [xs [:list [:ref :form/r]] h :i64] :i64
+  (let [n (vector-count xs)]
+    (loop [j 0 acc h]
+      (if (>= (+ j 1) n)
+        acc
+        (recur (+ j 2)
+               (md (+ acc (md (+ (* 131 (fdig (typed-list-nth [:list [:ref :form/r]] xs j)))
+                                 (fdig (typed-list-nth [:list [:ref :form/r]] xs (+ j 1))))))))))))
+
+(defn- fdig [x [:ref :form/r]] :i64
+  (let [t (tag-of x)]
+    (cond
+      (= t 0) 7
+      (= t 1) (if (is-true? x) 12 11)
+      (= t 2) (md (+ (* (md (int-value x)) 31) 3))
+      (= t 3) (sdig 5 (string-value x))
+      (= t 4) (sdig 13 (keyword-name (keyword-value x)))
+      (= t 5) (sdig 15 (symbol-value x))
+      (= t 7) (fdig-seq (kids-of x) 0 17)
+      (= t 6) (fdig-seq (kids-of x) 0 19)
+      (= t 8) (fdig-set (kids-of x) 23)
+      (= t 9) (fdig-map (kids-of x) 29)
+      :else 0)))
+")
+
+;; ---- a host value as Form source -------------------------------------------
+
+(declare form-of)
+(defn lst [xs] (str "(typed-list-new [:list [:ref :form/r]] " (str/join " " (map form-of xs)) ")"))
+(defn form-of [x]
+  (cond
+    (nil? x) "(nil-form)"
+    (boolean? x) (str "(bool-form " x ")")
+    (integer? x) (str "(int-form " x ")")
+    (string? x) (str "(string-form " (pr-str x) ")")
+    (keyword? x) (str "(keyword-form " (pr-str x) ")")
+    (symbol? x) (str "(symbol-form " (pr-str (str x)) ")")
+    (vector? x) (str "(form-vec " (lst x) ")")
+    (seq? x) (str "(form-seq " (lst x) ")")
+    (set? x) (str "(form-set " (lst (seq x)) ")")
+    (map? x) (str "(form-map " (lst (mapcat identity x)) ")")
+    :else (throw (ex-info "no form" {:x x}))))
+
+;; ---- visitors, on both sides -----------------------------------------------
+
+(def visitors
+  {:identity
+   {:host (fn [x] x)
+    :form "(defn- vis [x [:ref :form/r]] [:ref :form/r] x)"}
+   :bump
+   {:host (fn [x] (if (integer? x) (inc x) x))
+    :form "(defn- vis [x [:ref :form/r]] [:ref :form/r] (if (is-int? x) (int-form (+ 1 (int-value x))) x))"}
+   :bang
+   {:host (fn [x] (if (string? x) (str x "!") x))
+    :form "(defn- vis [x [:ref :form/r]] [:ref :form/r] (if (is-string? x) (string-form (str (string-value x) \"!\")) x))"}
+   ;; structure-changing: 0 -> [9 8]; the prewalk descends into the vector
+   :expand
+   {:host (fn [x] (if (and (integer? x) (zero? x)) [9 8] x))
+    :form "(defn- vis [x [:ref :form/r]] [:ref :form/r] (if (and (is-int? x) (= 0 (int-value x))) (vec2 (int-form 9) (int-form 8)) x))"}
+   ;; a vector of two becomes its reverse: sees the map entries
+   :flip
+   {:host (fn [x] (if (and (vector? x) (= 2 (count x))) [(second x) (first x)] x))
+    :form "(defn- vis [x [:ref :form/r]] [:ref :form/r] (if (and (is-vec? x) (= 2 (count-of x))) (vec2 (nth-of x 1) (nth-of x 0)) x))"}
+   ;; a list becomes a vector of its items
+   :unlist
+   {:host (fn [x] (if (seq? x) (vec x) x))
+    :form "(defn- vis [x [:ref :form/r]] [:ref :form/r] (if (is-seq? x) (form-vec (kids-of x)) x))"}})
+
+(def cases
+  [nil true false 0 1 -7 "" "ab" "é" :k :ns/k 'sym
+   [] [0] [1 2 3] [0 [0 [0]]] ["a" [1 "b"] nil]
+   '() '(1 2) '(1 (2 3) [4])
+   #{} #{1 2 3} #{0 1}
+   {} {:a 1} {:a 1 :b [2 3]} {"k" {"z" 0}} {1 2 3 4} {:a {:b {:c 0}}}
+   [{:a 0} #{1 [2]} '(5 6)]])
+
+(defn prog-for [walker vis-key x]
+  (let [{:keys [form]} (get visitors vis-key)
+        call (case walker
+               :post (str "(postwalk (fn [y] (vis y)) " (form-of x) ")")
+               :pre (str "(prewalk (fn [y] (vis y)) " (form-of x) ")")
+               :walk (str "(walk (fn [y] (vis y)) (fn [y] (vis y)) " (form-of x) ")"))]
+    (-> form-src
+        (str/replace "{:kotoba/export [" "{:kotoba/export [probe ")
+        (str "\n" walk-body "\n" form "\n" (fdig-defs)
+             "\n(defn probe [] :i64 (fdig " call "))\n"))))
+
+(defn host-result [walker vis-key x]
+  (let [f (:host (get visitors vis-key))]
+    (case walker
+      :post (walk/postwalk f x)
+      :pre (walk/prewalk f x)
+      :walk (walk/walk f f x))))
+
+(defn run [walker vis-key x]
+  (try
+    (let [prog (prog-for walker vis-key x)
+          r (kir/execute (kir/lower (sema/analyze prog)) 'probe [] {:frames 5000})
+          got (js/Number r)
+          want (digest (host-result walker vis-key x))]
+      {:ok (= got want) :got got :want want})
+    (catch :default e {:ok false :error (ex-message e)})))
+
+(def fails (atom 0))
+(doseq [walker [:post :pre :walk]
+        vis-key [:identity :bump :bang :expand :flip :unlist]
+        x cases
+        ;; prewalk with :expand descends into the replacement; every other pair is finite
+        :when true]
+  (let [r (run walker vis-key x)]
+    (when-not (:ok r) (swap! fails inc))
+    (println (if (:ok r) "ok  " "FAIL") walker vis-key (pr-str x) (when-not (:ok r) (pr-str r)))))
+(println "failures" @fails)

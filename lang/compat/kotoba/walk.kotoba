@@ -1,0 +1,181 @@
+;; kotoba.walk -- clojure.walk's three function-taking walkers (walk, prewalk,
+;; postwalk) restated over `kotoba.form`'s recursive Form record, the value
+;; type of compiler data (KIR/HIR forms) on the Kotoba route.
+;;
+;; WHY THIS EXISTS (selfhost wall, 2026-10-01): `kotoba.native.machine_ir`
+;; (and through it kotoba.native.aarch64 / x86_64) is refused
+;;   `qualified call is not an admitted exported import: walk/postwalk`
+;; at its four `(walk/postwalk (fn [form] ...) body)` sites, 21 of the
+;; corpus's 25 clojure.walk call sites being the function-taking three.
+;; `clojure/walk.kotoba` carried only the DATA-taking four over `:document`
+;; because a callable parameter was i64-only; typed closure parameters landed
+;; (lang/guest-grammar.edn :callable-type :parameter-types
+;; :closure-result-types, 2026-09-12), and a Form -> Form visitor is a
+;; closure whose parameter and result are the record `[:ref :form/r]`.
+;;
+;; THE SHAPE, as the host's kotoba.lang.coll/clojure.walk (unbounded):
+;;   postwalk f x  = children first, then (f rebuilt)
+;;   prewalk  f x  = (f x) first, then its children, no outer
+;;   walk inner outer x = (outer (rebuild x with inner applied to children))
+;; Children: list / vector element-wise; a set element-wise and DEDUPLICATED
+;; (`into #{}`); a map by ENTRY -- each entry is handed to the visitor as the
+;; two-element vector [k v] (clojure.walk's MapEntry, which IS a vector of two
+;; to every visitor that is not asking map-entry?), its key and value walked
+;; first, and the visitor's answer put back with `into {}`: a two-vector
+;; contributes one binding (a later binding of the same key replaces the
+;; value, keeping the first position, as `assoc`), a map contributes its
+;; bindings, anything else TRAPS (`assert`) where the host throws. Scalars
+;; are leaves.
+;;
+;; WHERE THE TWO DIFFER (each is a Form property, not this file's choice):
+;;   * equality is kotoba.form/eq: a list and a vector are different kinds
+;;     (the host's `=` calls `(1 2)` and `[1 2]` equal), so a set rebuilt
+;;     from a list-and-vector pair keeps both.
+;;   * a Form map keeps source order; the host's array-map does for small
+;;     maps and a hash map does not.
+;;   * the visitor is a closure over Form, so a `fn` written at the call site
+;;     can capture only i64 words (typed captures are a separate wall), and
+;;     it cannot call gensym (no mutable counter): such a rewrite threads its
+;;     own counter or derives names from the node.
+;;   * nbb/JVM `postwalk` of a lazy seq returns a seq, of a list a list: both
+;;     are tag 6 here.
+;;
+;; THE RECURSIVE GROUP is five (go / rebuild / go-kids / go-map / pairs-loop's
+;; helpers do not recurse): well under the 8-member bound on a strongly
+;; connected component (`:definition-cid :recursive-group-too-large`).
+
+(ns kotoba.walk
+  (:require [kotoba.form :as form])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                       [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]})
+  (:export [walk prewalk postwalk]))
+
+;; ---------------------------------------------------------------------------
+;; shared pieces
+
+(defn- has-form? [xs [:list [:ref :form/r]] x [:ref :form/r]] :bool
+  (let [n (vector-count xs)]
+    (loop [i 0]
+      (if (>= i n)
+        false
+        (if (form/eq (typed-list-nth [:list [:ref :form/r]] xs i) x)
+          true
+          (recur (+ i 1)))))))
+
+;; A set's members after rebuilding: each kept once, the first occurrence in
+;; place.
+(defn- dedupe-forms [xs [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (let [n (vector-count xs)]
+    (loop [i 0 acc (form/no-forms)]
+      (if (>= i n)
+        acc
+        (let [x (typed-list-nth [:list [:ref :form/r]] xs i)]
+          (recur (+ i 1) (if (has-form? acc x) acc (form/append-form acc x))))))))
+
+;; The same container kind, over new children.
+(defn- with-kids [x [:ref :form/r] kids [:list [:ref :form/r]]] [:ref :form/r]
+  (let [t (form/tag-of x)]
+    (cond
+      (= t 6) (form/form-seq kids)
+      (= t 7) (form/form-vec kids)
+      (= t 8) (form/form-set (dedupe-forms kids))
+      :else x)))
+
+;; Every binding of E (a map) put into ACC.
+(defn- merge-pairs [acc [:ref :form/r] e [:ref :form/r]] [:ref :form/r]
+  (let [xs (form/kids-of e)
+        n (vector-count xs)]
+    (loop [j 0 m acc]
+      (if (>= (+ j 1) n)
+        m
+        (recur (+ j 2)
+               (form/assoc-form m
+                                (typed-list-nth [:list [:ref :form/r]] xs j)
+                                (typed-list-nth [:list [:ref :form/r]] xs (+ j 1))))))))
+
+;; `(into {} [entry])`: a two-vector is one binding, a map contributes its
+;; bindings, anything else has no meaning as an entry.
+(defn- entry-into [acc [:ref :form/r] e [:ref :form/r]] [:ref :form/r]
+  (cond
+    (and (form/is-vec? e) (= 2 (form/count-of e)))
+    (form/assoc-form acc (form/nth-of e 0) (form/nth-of e 1))
+    (form/is-map? e)
+    (merge-pairs acc e)
+    :else
+    (do (assert false) acc)))
+
+;; ---------------------------------------------------------------------------
+;; prewalk / postwalk: one recursion, `pre` says which side the visitor is on.
+
+(defn- go-kids [f [:fn [[[:ref :form/r]] [:ref :form/r]]] xs [:list [:ref :form/r]] pre :bool]
+  [:list [:ref :form/r]]
+  (let [n (vector-count xs)]
+    (loop [i 0 acc (form/no-forms)]
+      (if (>= i n)
+        acc
+        (recur (+ i 1)
+               (form/append-form acc (go f (typed-list-nth [:list [:ref :form/r]] xs i) pre)))))))
+
+(defn- go-map [f [:fn [[[:ref :form/r]] [:ref :form/r]]] x [:ref :form/r] pre :bool] [:ref :form/r]
+  (let [xs (form/kids-of x)
+        n (vector-count xs)]
+    (loop [j 0 acc (form/form-map (form/no-forms))]
+      (if (>= (+ j 1) n)
+        acc
+        (recur (+ j 2)
+               (entry-into acc
+                           (go f
+                               (form/vec2 (typed-list-nth [:list [:ref :form/r]] xs j)
+                                          (typed-list-nth [:list [:ref :form/r]] xs (+ j 1)))
+                               pre)))))))
+
+(defn- rebuild [f [:fn [[[:ref :form/r]] [:ref :form/r]]] x [:ref :form/r] pre :bool] [:ref :form/r]
+  (let [t (form/tag-of x)]
+    (cond
+      (= t 9) (go-map f x pre)
+      (and (>= t 6) (<= t 8)) (with-kids x (go-kids f (form/kids-of x) pre))
+      :else x)))
+
+(defn- go [f [:fn [[[:ref :form/r]] [:ref :form/r]]] x [:ref :form/r] pre :bool] [:ref :form/r]
+  (if pre
+    (rebuild f (f x) pre)
+    (f (rebuild f x pre))))
+
+(defn postwalk [f [:fn [[[:ref :form/r]] [:ref :form/r]]] x [:ref :form/r]] [:ref :form/r]
+  (go f x false))
+
+(defn prewalk [f [:fn [[[:ref :form/r]] [:ref :form/r]]] x [:ref :form/r]] [:ref :form/r]
+  (go f x true))
+
+;; ---------------------------------------------------------------------------
+;; walk: INNER on each child, OUTER on the rebuilt node. No recursion of its
+;; own -- the caller's INNER recurses if it wants to.
+
+(defn- inner-kids [inner [:fn [[[:ref :form/r]] [:ref :form/r]]] xs [:list [:ref :form/r]]]
+  [:list [:ref :form/r]]
+  (let [n (vector-count xs)]
+    (loop [i 0 acc (form/no-forms)]
+      (if (>= i n)
+        acc
+        (recur (+ i 1)
+               (form/append-form acc (inner (typed-list-nth [:list [:ref :form/r]] xs i))))))))
+
+(defn- inner-map [inner [:fn [[[:ref :form/r]] [:ref :form/r]]] x [:ref :form/r]] [:ref :form/r]
+  (let [xs (form/kids-of x)
+        n (vector-count xs)]
+    (loop [j 0 acc (form/form-map (form/no-forms))]
+      (if (>= (+ j 1) n)
+        acc
+        (recur (+ j 2)
+               (entry-into acc
+                           (inner (form/vec2 (typed-list-nth [:list [:ref :form/r]] xs j)
+                                             (typed-list-nth [:list [:ref :form/r]] xs (+ j 1))))))))))
+
+(defn walk [inner [:fn [[[:ref :form/r]] [:ref :form/r]]]
+            outer [:fn [[[:ref :form/r]] [:ref :form/r]]]
+            x [:ref :form/r]] [:ref :form/r]
+  (let [t (form/tag-of x)]
+    (cond
+      (= t 9) (outer (inner-map inner x))
+      (and (>= t 6) (<= t 8)) (outer (with-kids x (inner-kids inner (form/kids-of x))))
+      :else (outer x))))
