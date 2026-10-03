@@ -1,0 +1,217 @@
+;; kotoba.compiler.refactor.edit -- the GUEST-ROUTE twin of amu's
+;; `src/kotoba/compiler/refactor/edit.cljk` (text edits over source offsets).
+;;
+;; WHY A TWIN. The host module is dynamic Clojure: an edit is a map {:s :e :text :rule :ord}, `sort-by`
+;; takes a vector key, the conflict resolver destructures `[kept dropped]` and `reduce`s over a pair, and the
+;; transient/`apply str` of apply-edits, `re-find` of line-indent and the `#"..."` literal have no Kotoba
+;; spelling (seed: E1005 `#`; stage-0: variadic export). The guest route gets a module of the SAME NAME with a
+;; typed contract, as kotoba.compiler.refactor.cst does. Host behaviour is untouched.
+;;
+;; THE CONTRACT
+;;   :edit/e     = [s :i64] [e :i64] [text :string] [rule :string] [ord :i64]
+;;                 the host's {:s :e :text :rule :ord}; RULE is the rule's spelling (a keyword name on the host);
+;;                 ORD is 0 where the host has no :ord (the host's own `(or (:ord e) 0)`).
+;;   :edit/split = [kept [:list :edit/e]] [dropped [:list :edit/e]]   the host's `[kept dropped]`
+;;   (make-edit s e text rule ord)      -> :edit/e                   any edit (the host's literal map)
+;;   (replace-range s e text rule)       -> :edit/e                   (host replace-node over the node's :s :e)
+;;   (replace-node n text rule)          -> :edit/e                   n a :cst/node of the cst twin
+;;   (insert-at pos text rule ord)       -> :edit/e                   (host `insert-at pos text rule ord`, ord given)
+;;   (conflicts? a b) (nested? outer inner)               -> :bool
+;;   (resolve-conflicts edits)           -> :edit/split   (innermost first, then earliest; stable, as `sort-by`)
+;;   (apply-edits src edits)             -> :string       (sorted by [s, 0 for an insertion else 1, e, ord]; stable)
+;;   (line-starts src)                   -> [:list :i64]
+;;   (offset->line starts off)           -> :i64          1-based
+;;   (line-indent src off)               -> :string       the leading spaces/tabs of the line holding OFF
+;;   accessors edit-s edit-e edit-text edit-rule edit-ord, split-kept split-dropped, edits-new / edits-conj.
+;;
+;; OFFSETS count UTF-8 bytes (the unit `string-substring` takes; the host's are UTF-16 units). They agree on ASCII
+;; text. line-starts / offset->line / line-indent look for byte 10, 32 and 9 only, which never occur inside a
+;; multi-byte code point, so every offset stays on a code-point boundary when the caller's does.
+
+(ns kotoba.compiler.refactor.edit
+  (:require [kotoba.compiler.refactor.cst :as cst])
+  (:export [make-edit replace-range replace-node insert-at conflicts? nested? resolve-conflicts apply-edits
+            line-starts offset->line line-indent
+            edit-s edit-e edit-text edit-rule edit-ord split-kept split-dropped
+            edits-new edits-conj edits-count edits-nth])
+  (:schemas {:edit/e [:record :edit/e
+                      [[:s :i64] [:e :i64] [:text :string] [:rule :string] [:ord :i64]]]
+             :edit/split [:record :edit/split
+                          [[:kept [:list [:ref :edit/e]]] [:dropped [:list [:ref :edit/e]]]]]}))
+
+;; ---------------------------------------------------------------------------
+;; records and lists
+
+(defn- mk [s :i64 e :i64 text :string rule :string ord :i64] [:ref :edit/e]
+  (record-new [:ref :edit/e] s e text rule ord))
+
+(defn edit-s [x [:ref :edit/e]] :i64 (record-get [:ref :edit/e] x :s))
+(defn edit-e [x [:ref :edit/e]] :i64 (record-get [:ref :edit/e] x :e))
+(defn edit-text [x [:ref :edit/e]] :string (record-get [:ref :edit/e] x :text))
+(defn edit-rule [x [:ref :edit/e]] :string (record-get [:ref :edit/e] x :rule))
+(defn edit-ord [x [:ref :edit/e]] :i64 (record-get [:ref :edit/e] x :ord))
+
+(defn edits-new [] [:list [:ref :edit/e]] (typed-list-new [:list [:ref :edit/e]]))
+(defn edits-conj [xs [:list [:ref :edit/e]] x [:ref :edit/e]] [:list [:ref :edit/e]]
+  (typed-list-conj [:list [:ref :edit/e]] xs x))
+(defn edits-count [xs [:list [:ref :edit/e]]] :i64 (vector-count xs))
+(defn edits-nth [xs [:list [:ref :edit/e]] i :i64] [:ref :edit/e]
+  (typed-list-nth [:list [:ref :edit/e]] xs i))
+
+(defn split-kept [p [:ref :edit/split]] [:list [:ref :edit/e]] (record-get [:ref :edit/split] p :kept))
+(defn split-dropped [p [:ref :edit/split]] [:list [:ref :edit/e]] (record-get [:ref :edit/split] p :dropped))
+
+(defn make-edit [s :i64 e :i64 text :string rule :string ord :i64] [:ref :edit/e]
+  (mk s e text rule ord))
+
+(defn replace-range [s :i64 e :i64 text :string rule :string] [:ref :edit/e]
+  (mk s e text rule 0))
+
+(defn replace-node [n [:ref :cst/node] text :string rule :string] [:ref :edit/e]
+  (mk (cst/node-s n) (cst/node-e n) text rule 0))
+
+(defn insert-at [pos :i64 text :string rule :string ord :i64] [:ref :edit/e]
+  (mk pos pos text rule ord))
+
+(defn- ins? [x [:ref :edit/e]] :bool (= (edit-s x) (edit-e x)))
+
+;; ---------------------------------------------------------------------------
+;; conflicts
+
+;; a starts first (or at the same offset); the host swaps with `(<= (:s a) (:s b))`, so equal starts keep the order.
+(defn- conflicts-ordered? [a [:ref :edit/e] b [:ref :edit/e]] :bool
+  (let [a-ins (ins? a) b-ins (ins? b)]
+    (cond
+      (and a-ins b-ins) false
+      a-ins false
+      b-ins (and (> (edit-s b) (edit-s a)) (< (edit-s b) (edit-e a)))
+      :else (< (edit-s b) (edit-e a)))))
+
+(defn conflicts? [a [:ref :edit/e] b [:ref :edit/e]] :bool
+  (if (<= (edit-s a) (edit-s b))
+    (conflicts-ordered? a b)
+    (conflicts-ordered? b a)))
+
+(defn nested? [outer [:ref :edit/e] inner [:ref :edit/e]] :bool
+  (and (<= (edit-s outer) (edit-s inner))
+       (<= (edit-e inner) (edit-e outer))
+       (not (and (= (edit-s outer) (edit-s inner)) (= (edit-e outer) (edit-e inner))))))
+
+;; ---------------------------------------------------------------------------
+;; stable merge sort over a list of edits. MODE 0: the key of apply-edits [s, (0 insertion / 1), e, ord];
+;; MODE 1: the key of resolve-conflicts [(- e s), s].
+
+(defn- cmp [x :i64 y :i64] :i64 (if (< x y) -1 (if (> x y) 1 0)))
+
+(defn- cmp-key [mode :i64 a [:ref :edit/e] b [:ref :edit/e]] :i64
+  (if (= mode 0)
+    (let [c1 (cmp (edit-s a) (edit-s b))]
+      (if (not= c1 0)
+        c1
+        (let [c2 (cmp (if (ins? a) 0 1) (if (ins? b) 0 1))]
+          (if (not= c2 0)
+            c2
+            (let [c3 (cmp (edit-e a) (edit-e b))]
+              (if (not= c3 0) c3 (cmp (edit-ord a) (edit-ord b))))))))
+    (let [c1 (cmp (- (edit-e a) (edit-s a)) (- (edit-e b) (edit-s b)))]
+      (if (not= c1 0) c1 (cmp (edit-s a) (edit-s b))))))
+
+;; merge xs[i..xn) and ys[j..yn) onto acc; the left one wins a tie (stability).
+(defn- merge-lists [mode :i64 xs [:list [:ref :edit/e]] i :i64 ys [:list [:ref :edit/e]] j :i64
+                    acc [:list [:ref :edit/e]]] [:list [:ref :edit/e]]
+  (let [xn (vector-count xs) yn (vector-count ys)]
+    (if (>= i xn)
+      (if (>= j yn)
+        acc
+        (merge-lists mode xs i ys (+ j 1) (edits-conj acc (edits-nth ys j))))
+      (if (>= j yn)
+        (merge-lists mode xs (+ i 1) ys j (edits-conj acc (edits-nth xs i)))
+        (if (> (cmp-key mode (edits-nth xs i) (edits-nth ys j)) 0)
+          (merge-lists mode xs i ys (+ j 1) (edits-conj acc (edits-nth ys j)))
+          (merge-lists mode xs (+ i 1) ys j (edits-conj acc (edits-nth xs i))))))))
+
+(defn- slice [xs [:list [:ref :edit/e]] from :i64 to :i64] [:list [:ref :edit/e]]
+  (loop [k from acc (edits-new)]
+    (if (>= k to) acc (recur (+ k 1) (edits-conj acc (edits-nth xs k))))))
+
+(defn- sort-edits [mode :i64 xs [:list [:ref :edit/e]]] [:list [:ref :edit/e]]
+  (let [n (vector-count xs)]
+    (if (< n 2)
+      xs
+      (let [h (quot n 2)]
+        (merge-lists mode (sort-edits mode (slice xs 0 h)) 0 (sort-edits mode (slice xs h n)) 0 (edits-new))))))
+
+;; ---------------------------------------------------------------------------
+;; resolve-conflicts
+
+(defn- any-conflict? [kept [:list [:ref :edit/e]] x [:ref :edit/e] k :i64] :bool
+  (if (>= k (vector-count kept))
+    false
+    (if (conflicts? (edits-nth kept k) x) true (any-conflict? kept x (+ k 1)))))
+
+(defn resolve-conflicts [edits [:list [:ref :edit/e]]] [:ref :edit/split]
+  (let [sorted (sort-edits 1 edits) n (vector-count sorted)]
+    (loop [k 0 kept (edits-new) dropped (edits-new)]
+      (if (>= k n)
+        (record-new [:ref :edit/split] kept dropped)
+        (let [x (edits-nth sorted k)]
+          (if (any-conflict? kept x 0)
+            (recur (+ k 1) kept (edits-conj dropped x))
+            (recur (+ k 1) (edits-conj kept x) dropped)))))))
+
+;; ---------------------------------------------------------------------------
+;; apply-edits
+
+(defn- join-range [xs [:list :string] lo :i64 hi :i64] :string
+  (if (<= (- hi lo) 1)
+    (if (= hi lo) "" (typed-list-nth [:list :string] xs lo))
+    (let [mid (quot (+ lo hi) 2)]
+      (string-concat (join-range xs lo mid) (join-range xs mid hi)))))
+
+;; the pieces are joined by halves: every byte is copied O(log n) times (immutable strings, no GC), not O(n).
+(defn apply-edits [src :string edits [:list [:ref :edit/e]]] :string
+  (let [sorted (sort-edits 0 edits) n (vector-count sorted)]
+    (loop [k 0 pos 0 pieces (typed-list-new [:list :string])]
+      (if (>= k n)
+        (let [all (typed-list-conj [:list :string] pieces (string-substring src pos (string-byte-length src)))]
+          (join-range all 0 (vector-count all)))
+        (let [x (edits-nth sorted k)]
+          (recur (+ k 1) (edit-e x)
+                 (typed-list-conj [:list :string]
+                                  (typed-list-conj [:list :string] pieces (string-substring src pos (edit-s x)))
+                                  (edit-text x))))))))
+
+;; ---------------------------------------------------------------------------
+;; positions
+
+(defn line-starts [src :string] [:list :i64]
+  (loop [i 0 acc (typed-list-new [:list :i64] 0)]
+    (let [j (string-find-byte src 10 i)]
+      (if (< j 0)
+        acc
+        (recur (+ j 1) (typed-list-conj [:list :i64] acc (+ j 1)))))))
+
+;; 1-based line of offset: the last line start <= off (binary search as the host).
+(defn offset->line [starts [:list :i64] off :i64] :i64
+  (loop [lo 0 hi (- (vector-count starts) 1)]
+    (if (>= lo hi)
+      (+ lo 1)
+      (let [mid (quot (+ lo hi 1) 2)]
+        (if (<= (typed-list-nth [:list :i64] starts mid) off)
+          (recur mid hi)
+          (recur lo (- mid 1)))))))
+
+(defn- line-begin [src :string off :i64] :i64
+  (loop [from 0 begin 0]
+    (let [j (string-find-byte src 10 from)]
+      (if (or (< j 0) (>= j off))
+        begin
+        (recur (+ j 1) (+ j 1))))))
+
+(defn line-indent [src :string off :i64] :string
+  (let [ls (if (> off 0) (line-begin src off) 0)
+        size (string-byte-length src)]
+    (loop [i ls]
+      (if (and (< i size) (or (= (string-code-point-at src i) 32) (= (string-code-point-at src i) 9)))
+        (recur (+ i 1))
+        (string-substring src ls i)))))
