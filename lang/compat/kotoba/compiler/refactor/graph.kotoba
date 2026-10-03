@@ -1,0 +1,671 @@
+;; kotoba.compiler.refactor.graph -- the GUEST-ROUTE twin of amu's `src/kotoba/compiler/refactor/graph.cljk`: the
+;; top-level form inventory and scope-aware reference graph of a .cljk/.cljc namespace (amu refactor graph / partition /
+;; split).
+;;
+;; WHY A TWIN. The host module is dynamic Clojure over the host CST maps: chunks are maps of maps, the reference walk
+;; is a `letfn` of closures over `volatile!`s, Tarjan loops over maps and sets. The guest route gets typed records over
+;; the cst twin (kotoba.compiler.refactor.cst). Host behaviour is untouched.
+;;
+;; ORDER. The host's answers depend on cljs map iteration order in three places: the order `build` bumps adjacency
+;; entries (`(keys (:refs c))`, then `doseq` over def-chunks), and Tarjan's successor order `(keys (get adj v))`, which
+;; fixes the order of the SCC list. The twin keeps every such map as its insertion-ordered keys plus a HASHED flag (the
+;; map passed 8 entries and became a PersistentHashMap) and iterates them with kotoba.compiler.refactor.cljs-order.
+;;
+;; THE CONTRACT (host -> twin)
+;;   chunk map           -> :graph/chunk  idx node s e lead-s lines declares is-ns kotoba (has-kotoba-branch) defs refs
+;;                          refs-hashed binds; NAMES / KINDS / PRIVATE / DYNAMIC / PLATS / DEFNODES / DOC are derived from
+;;                          DEFS (find-defs' rows in order, declares excluded): chunk-names (distinct, in order),
+;;                          chunk-kind / chunk-private? / chunk-dynamic? (the LAST def of the name wins, as assoc-in),
+;;                          REFS = keys of the host :refs in first-reference order, own names removed (:ref-order);
+;;                          the host's per-role counts are not kept (no answer reads them).
+;;   (analysis src)      -> :graph/a  chunks, def-chunks (dc-names in insertion order, dc-hashed, dc-of name ->
+;;                          :vector-i64), adj (per chunk: targets in insertion order, weights, hashed), comps
+;;                          (Tarjan, dependencies first, each sorted), top-names count
+;;   (graph-data a)      -> the payload as typed parts (nodes-*, edges, sccs, dynamic-vars), see amu.refactor-graph
+;;   (line-of src off) (chunk-label c) (tarjan n adj skip) (pattern-syms node) as the host.
+;; OFFSETS are the cst twin's (UTF-8 bytes); line numbers agree with the host's.
+
+(ns kotoba.compiler.refactor.graph
+  (:require [kotoba.compiler.refactor.cst :as cst]
+            [kotoba.compiler.refactor.cljs-order :as ord])
+  (:export [analysis line-of count-newlines chunk-label pattern-syms tarjan
+            a-chunks a-src a-comps a-top-count a-dc-names a-dc-hashed a-dc-of a-adj chunk-count chunk-at
+            chunk-idx chunk-node chunk-s chunk-e chunk-lead-s chunk-lines chunk-declares chunk-is-ns? chunk-kotoba?
+            chunk-defs chunk-refs chunk-refs-hashed? chunk-binds chunk-names chunk-kind chunk-private? chunk-dynamic?
+            chunk-any-private? chunk-heads chunk-refs-in-map-order chunk-refers? chunk-binds?
+            def-name def-head def-node def-plat def-has-plat? def-private? def-dynamic? def-doc defs-count defs-at
+            adj-targets adj-weights adj-hashed? adj-at adj-keys-in-order comps-count comps-at])
+  (:schemas {:graph/def [:record :graph/def
+                         [[:name :string] [:head :string] [:node [:ref :cst/node]] [:plat :string] [:has-plat :bool]
+                          [:private :bool] [:dynamic :bool] [:doc :string]]]
+             :graph/chunk [:record :graph/chunk
+                           [[:idx :i64] [:node [:ref :cst/node]] [:s :i64] [:e :i64] [:lead-s :i64] [:lines :i64]
+                            [:declares [:list :string]] [:is-ns :bool] [:kotoba :bool]
+                            [:defs [:list [:ref :graph/def]]]
+                            [:refs [:list :string]] [:refs-hashed :bool] [:binds [:list :string]]]]
+             :graph/adj [:record :graph/adj [[:targets :vector-i64] [:weights :vector-i64] [:hashed :bool]]]
+             :graph/st [:record :graph/st
+                        [[:refs [:list :string]] [:seen [:list :string]] [:binds [:list :string]] [:bseen [:list :string]]]]
+             :graph/top [:record :graph/top [[:xs [:list :string]] [:tab :vector-i64]]]
+             :graph/benv [:record :graph/benv [[:st [:ref :graph/st]] [:env [:list :string]]]]
+             :graph/a [:record :graph/a
+                       [[:src :string] [:chunks [:list [:ref :graph/chunk]]]
+                        [:dc-names [:list :string]] [:dc-hashed :bool] [:dc-tab :vector-i64] [:dc-vals [:list :vector-i64]]
+                        [:adj [:list [:ref :graph/adj]]] [:comps [:list :vector-i64]]]]}))
+
+;; ---------------------------------------------------------------------------
+;; small helpers
+
+(defn- strs [] [:list :string] (typed-list-new [:list :string]))
+(defn- sconj [xs [:list :string] s :string] [:list :string] (typed-list-conj [:list :string] xs s))
+(defn- snth [xs [:list :string] i :i64] :string (typed-list-nth [:list :string] xs i))
+(defn- sset [] [:list :string] (typed-list-new [:list :string]))
+(defn- in? [s [:list :string] x :string] :bool (ord/member? s x))
+(defn- sadd [s [:list :string] x :string] [:list :string] (typed-list-conj [:list :string] s x))
+(defn- top? [t [:ref :graph/top] x :string] :bool
+  (>= (ord/tab-find (record-get [:ref :graph/top] t :tab) (record-get [:ref :graph/top] t :xs) x) 0))
+(defn- nodes-nth [xs [:list [:ref :cst/node]] i :i64] [:ref :cst/node] (typed-list-nth [:list [:ref :cst/node]] xs i))
+(defn- kid [n [:ref :cst/node] i :i64] [:ref :cst/node]
+  (let [ks (cst/node-kids n)] (if (< i (vector-count ks)) (nodes-nth ks i) (cst/nil-node))))
+(defn- nkids [n [:ref :cst/node]] :i64 (vector-count (cst/node-kids n)))
+(defn- ty [n [:ref :cst/node]] :keyword (cst/node-type n))
+
+(defn- includes? [s :string t :string] :bool (>= (string-index-of s t) 0))
+
+(defn- def-head? [h :string] :bool
+  (or (string=? h "def") (string=? h "defn") (string=? h "defn-") (string=? h "defonce") (string=? h "defmacro")
+      (string=? h "defmulti") (string=? h "defrecord") (string=? h "deftype") (string=? h "defprotocol")))
+
+(defn- let-like? [h :string] :bool
+  (or (string=? h "let") (string=? h "loop") (string=? h "when-let") (string=? h "if-let") (string=? h "when-some")
+      (string=? h "if-some") (string=? h "with-open") (string=? h "let*") (string=? h "binding") (string=? h "doseq")
+      (string=? h "for") (string=? h "dotimes")))
+
+;; the symbol text under meta, "" when not a symbol (host nil)
+(defn- sym-text [n [:ref :cst/node]] :string
+  (let [m (cst/strip-meta n)] (if (= :sym (ty m)) (cst/node-text m) "")))
+
+;; ---------------------------------------------------------------------------
+;; pattern-syms: all binder symbols of a destructuring pattern, as a list (a set on the host; callers only add them)
+
+(defn- cpw [p :i64] :i64 (if (< p 128) 1 (if (< p 2048) 2 (if (< p 65536) 3 4))))
+
+(defn- last-slash-part [t :string] :string
+  (let [n (string-byte-length t)
+        k (loop [i 0 k -1] (if (>= i n) k (let [p (string-code-point-at t i)] (recur (+ i (cpw p)) (if (= p 47) i k)))))]
+    (if (< k 0) t (string-substring t (+ k 1) n))))
+
+(defn- pattern-into [out [:list :string] n [:ref :cst/node]] [:list :string]
+  (let [t (ty n)]
+    (cond
+      (= t :sym) (let [x (cst/node-text n)]
+                   (if (and (not (string=? x "&")) (not (string=? x "_")) (not (includes? x "/"))) (sconj out x) out))
+      (= t :meta) (pattern-into out (kid n 1))
+      (= t :map)
+      (let [m (nkids n)]
+        (loop [i 0 acc out]
+          (if (>= i m)
+            acc
+            (let [k (kid n i)
+                  has-v (< (+ i 1) m)
+                  v (kid n (+ i 1))
+                  kt (if (cst/kw? k) (cst/node-text k) "")]
+              (recur (+ i 2)
+                     (cond
+                       (and (cst/kw? k) (or (string=? kt ":keys") (string=? kt ":strs") (string=? kt ":syms")) has-v)
+                       (let [vm (nkids v)]
+                         (loop [j 0 a acc]
+                           (if (>= j vm) a
+                               (recur (+ j 1) (if (cst/sym? (kid v j)) (sconj a (last-slash-part (cst/node-text (kid v j)))) a)))))
+                       (and (cst/kw? k) (string=? kt ":as") has-v) (pattern-into acc v)
+                       (and (cst/kw? k) (string=? kt ":or")) acc
+                       (not (cst/kw? k)) (pattern-into acc k)
+                       :else acc))))))
+      (or (= t :vec) (= t :rc) (= t :list))
+      (let [m (nkids n)] (loop [i 0 acc out] (if (>= i m) acc (recur (+ i 1) (pattern-into acc (kid n i))))))
+      :else out)))
+
+(defn pattern-syms [n [:ref :cst/node]] [:list :string] (pattern-into (strs) n))
+
+(defn- env-plus [env [:list :string] xs [:list :string]] [:list :string]
+  (let [m (vector-count xs)] (loop [i 0 e env] (if (>= i m) e (recur (+ i 1) (sadd e (snth xs i)))))))
+
+;; ---------------------------------------------------------------------------
+;; find-defs / classify
+
+(defn def-name [d [:ref :graph/def]] :string (record-get [:ref :graph/def] d :name))
+(defn def-head [d [:ref :graph/def]] :string (record-get [:ref :graph/def] d :head))
+(defn def-node [d [:ref :graph/def]] [:ref :cst/node] (record-get [:ref :graph/def] d :node))
+(defn def-plat [d [:ref :graph/def]] :string (record-get [:ref :graph/def] d :plat))
+(defn def-has-plat? [d [:ref :graph/def]] :bool (record-get [:ref :graph/def] d :has-plat))
+(defn def-private? [d [:ref :graph/def]] :bool (record-get [:ref :graph/def] d :private))
+(defn def-dynamic? [d [:ref :graph/def]] :bool (record-get [:ref :graph/def] d :dynamic))
+(defn def-doc [d [:ref :graph/def]] :string (record-get [:ref :graph/def] d :doc))
+(defn defs-count [xs [:list [:ref :graph/def]]] :i64 (vector-count xs))
+(defn defs-at [xs [:list [:ref :graph/def]] i :i64] [:ref :graph/def] (typed-list-nth [:list [:ref :graph/def]] xs i))
+(defn- dconj [xs [:list [:ref :graph/def]] d [:ref :graph/def]] [:list [:ref :graph/def]]
+  (typed-list-conj [:list [:ref :graph/def]] xs d))
+
+;; rows of find-defs: name ("*declare*" for a declare), head, node, plat; private/dynamic/doc filled by classify
+(defn- row [name :string head :string n [:ref :cst/node] plat :string hp :bool] [:ref :graph/def]
+  (record-new [:ref :graph/def] name head n plat hp false false ""))
+
+(defn- find-defs-into [out [:list [:ref :graph/def]] node [:ref :cst/node] plat :string hp :bool] [:list [:ref :graph/def]]
+  (let [n (cst/strip-meta node)]
+    (cond
+      (and (cst/lst? n) (> (nkids n) 0) (cst/sym? (kid n 0)))
+      (let [h (cst/node-text (kid n 0))]
+        (cond
+          (and (def-head? h) (> (nkids n) 1))
+          (let [nm (cst/strip-meta (kid n 1))]
+            (if (cst/sym? nm) (dconj out (row (cst/node-text nm) h n plat hp)) out))
+          (string=? h "declare") (dconj out (row "*declare*" h n plat hp))
+          (string=? h "do") (let [m (nkids n)] (loop [i 1 acc out] (if (>= i m) acc (recur (+ i 1) (find-defs-into acc (kid n i) plat hp)))))
+          :else out))
+      (= :rc (ty n))
+      (let [m (nkids n)]
+        (loop [i 0 acc out]
+          (if (>= (+ i 1) m) acc (recur (+ i 2) (find-defs-into acc (kid n (+ i 1)) (cst/node-text (kid n i)) true)))))
+      :else out)))
+
+;; the meta nodes attached in front of node (meta-exprs)
+(defn- meta-texts [src :string node [:ref :cst/node]] :string
+  (loop [n node acc "" first true]
+    (if (= :meta (ty n))
+      (let [m (kid n 0)
+            t (string-substring src (cst/node-s m) (cst/node-e m))]
+        (recur (kid n 1) (if first t (string-concat acc (string-concat " " t))) false))
+      acc)))
+
+(defn- doc-of [d [:ref :cst/node]] :string
+  (let [a (kid d 2) b (kid d 3)]
+    (cond (= :str (ty a)) (cst/node-text a)
+          (= :str (ty b)) (cst/node-text b)
+          :else "")))
+
+(defn chunk-idx [c [:ref :graph/chunk]] :i64 (record-get [:ref :graph/chunk] c :idx))
+(defn chunk-node [c [:ref :graph/chunk]] [:ref :cst/node] (record-get [:ref :graph/chunk] c :node))
+(defn chunk-s [c [:ref :graph/chunk]] :i64 (record-get [:ref :graph/chunk] c :s))
+(defn chunk-e [c [:ref :graph/chunk]] :i64 (record-get [:ref :graph/chunk] c :e))
+(defn chunk-lead-s [c [:ref :graph/chunk]] :i64 (record-get [:ref :graph/chunk] c :lead-s))
+(defn chunk-lines [c [:ref :graph/chunk]] :i64 (record-get [:ref :graph/chunk] c :lines))
+(defn chunk-declares [c [:ref :graph/chunk]] [:list :string] (record-get [:ref :graph/chunk] c :declares))
+(defn chunk-is-ns? [c [:ref :graph/chunk]] :bool (record-get [:ref :graph/chunk] c :is-ns))
+(defn chunk-kotoba? [c [:ref :graph/chunk]] :bool (record-get [:ref :graph/chunk] c :kotoba))
+(defn chunk-defs [c [:ref :graph/chunk]] [:list [:ref :graph/def]] (record-get [:ref :graph/chunk] c :defs))
+(defn chunk-refs [c [:ref :graph/chunk]] [:list :string] (record-get [:ref :graph/chunk] c :refs))
+(defn chunk-refs-hashed? [c [:ref :graph/chunk]] :bool (record-get [:ref :graph/chunk] c :refs-hashed))
+(defn chunk-binds [c [:ref :graph/chunk]] [:list :string] (record-get [:ref :graph/chunk] c :binds))
+
+(defn- mk-chunk [idx :i64 node [:ref :cst/node] s :i64 e :i64 lead :i64 lines :i64 declares [:list :string]
+                 is-ns :bool kot :bool defs [:list [:ref :graph/def]]] [:ref :graph/chunk]
+  (record-new [:ref :graph/chunk] idx node s e lead lines declares is-ns kot defs (strs) false (strs)))
+
+(defn- with-refs [c [:ref :graph/chunk] refs [:list :string] hashed :bool binds [:list :string]] [:ref :graph/chunk]
+  (record-new [:ref :graph/chunk] (chunk-idx c) (chunk-node c) (chunk-s c) (chunk-e c) (chunk-lead-s c) (chunk-lines c)
+              (chunk-declares c) (chunk-is-ns? c) (chunk-kotoba? c) (chunk-defs c) refs hashed binds))
+
+;; distinct names in order of first definition
+(defn chunk-names [c [:ref :graph/chunk]] [:list :string]
+  (let [ds (chunk-defs c) m (defs-count ds)]
+    (loop [i 0 seen (sset) acc (strs)]
+      (if (>= i m)
+        acc
+        (let [nm (def-name (defs-at ds i))]
+          (if (in? seen nm) (recur (+ i 1) seen acc) (recur (+ i 1) (sadd seen nm) (sconj acc nm))))))))
+
+(defn- last-def [c [:ref :graph/chunk] nm :string] :i64
+  (let [ds (chunk-defs c) m (defs-count ds)]
+    (loop [i 0 k -1] (if (>= i m) k (recur (+ i 1) (if (string=? (def-name (defs-at ds i)) nm) i k))))))
+
+(defn chunk-kind [c [:ref :graph/chunk] nm :string] :string
+  (let [k (last-def c nm)] (if (< k 0) "" (def-head (defs-at (chunk-defs c) k)))))
+(defn chunk-private? [c [:ref :graph/chunk] nm :string] :bool
+  (let [k (last-def c nm)] (and (>= k 0) (def-private? (defs-at (chunk-defs c) k)))))
+(defn chunk-dynamic? [c [:ref :graph/chunk] nm :string] :bool
+  (let [k (last-def c nm)] (and (>= k 0) (def-dynamic? (defs-at (chunk-defs c) k)))))
+
+;; (some true? (vals (:private c)))
+(defn chunk-any-private? [c [:ref :graph/chunk]] :bool
+  (let [ns (chunk-names c) m (vector-count ns)]
+    (loop [i 0] (cond (>= i m) false (chunk-private? c (snth ns i)) true :else (recur (+ i 1))))))
+
+;; (vec (sort (set (vals (:kinds c)))))
+(defn chunk-heads [c [:ref :graph/chunk]] [:list :string]
+  (let [ns (chunk-names c) m (vector-count ns)]
+    (ord/sort-strs (loop [i 0 seen (sset) acc (strs)]
+                     (if (>= i m)
+                       acc
+                       (let [h (chunk-kind c (snth ns i))]
+                         (if (in? seen h) (recur (+ i 1) seen acc) (recur (+ i 1) (sadd seen h) (sconj acc h)))))))))
+
+(defn count-newlines [src :string s :i64 e :i64] :i64
+  (loop [i s k 0] (if (>= i e) k (let [p (string-code-point-at src i)] (recur (+ i (cpw p)) (if (= p 10) (+ k 1) k))))))
+
+(defn- classify [src :string idx :i64 node [:ref :cst/node] lead :i64] [:ref :graph/chunk]
+  (let [n (cst/strip-meta node)
+        s (cst/node-s node)
+        e (cst/node-e node)
+        lines (+ 1 (count-newlines src s e))
+        kot (includes? (string-substring src s e) ":kotoba")]
+    (if (and (cst/lst? n) (> (nkids n) 0) (cst/sym-named? (kid n 0) "ns"))
+      (mk-chunk idx node s e lead lines (strs) true kot (typed-list-new [:list [:ref :graph/def]]))
+      (let [rows (find-defs-into (typed-list-new [:list [:ref :graph/def]]) node "" false)
+            m (defs-count rows)]
+        (loop [i 0 declares (strs) defs (typed-list-new [:list [:ref :graph/def]])]
+          (if (>= i m)
+            (mk-chunk idx node s e lead lines declares false kot defs)
+            (let [r (defs-at rows i)
+                  d (def-node r)]
+              (if (string=? (def-name r) "*declare*")
+                (recur (+ i 1)
+                       (let [dm (nkids d)]
+                         (loop [j 1 acc declares]
+                           (if (>= j dm) acc
+                               (recur (+ j 1) (let [t (sym-text (kid d j))] (if (> (string-byte-length t) 0) (sconj acc t) acc))))))
+                       defs)
+                (let [txt (meta-texts src (kid d 1))
+                      h (def-head r)]
+                  (recur (+ i 1) declares
+                         (dconj defs (record-new [:ref :graph/def] (def-name r) h d (def-plat r) (def-has-plat? r)
+                                                 (or (string=? h "defn-") (includes? txt ":private"))
+                                                 (includes? txt ":dynamic")
+                                                 (doc-of d)))))))))))))
+
+;; ---------------------------------------------------------------------------
+;; the scoped reference walk (refs-of)
+
+(defn- st-refs [st [:ref :graph/st]] [:list :string] (record-get [:ref :graph/st] st :refs))
+(defn- st-seen [st [:ref :graph/st]] [:list :string] (record-get [:ref :graph/st] st :seen))
+(defn- st-binds [st [:ref :graph/st]] [:list :string] (record-get [:ref :graph/st] st :binds))
+(defn- st-bseen [st [:ref :graph/st]] [:list :string] (record-get [:ref :graph/st] st :bseen))
+
+(defn- add-ref [st [:ref :graph/st] t :string] [:ref :graph/st]
+  (if (in? (st-seen st) t)
+    st
+    (record-new [:ref :graph/st] (sconj (st-refs st) t) (sadd (st-seen st) t) (st-binds st) (st-bseen st))))
+
+(defn- add-bind [st [:ref :graph/st] t :string] [:ref :graph/st]
+  (if (in? (st-bseen st) t)
+    st
+    (record-new [:ref :graph/st] (st-refs st) (st-seen st) (sconj (st-binds st) t) (sadd (st-bseen st) t))))
+
+(defn- sym-ref [st [:ref :graph/st] n [:ref :cst/node] env [:list :string] names [:ref :graph/top]] [:ref :graph/st]
+  (let [t (cst/node-text n)]
+    (if (and (top? names t) (not (in? env t))) (add-ref st t) st)))
+
+;; visit the kids of n from index i on
+(defn- body-from [st [:ref :graph/st] n [:ref :cst/node] i :i64 env [:list :string] names [:ref :graph/top]] [:ref :graph/st]
+  (let [m (nkids n)]
+    (loop [j i s st] (if (>= j m) s (recur (+ j 1) (visit s (kid n j) env names))))))
+
+;; bindings that answer the extended env too: a pair record
+(defn- benv [st [:ref :graph/st] env [:list :string]] [:ref :graph/benv] (record-new [:ref :graph/benv] st env))
+(defn- benv-st [b [:ref :graph/benv]] [:ref :graph/st] (record-get [:ref :graph/benv] b :st))
+(defn- benv-env [b [:ref :graph/benv]] [:list :string] (record-get [:ref :graph/benv] b :env))
+
+(defn- bindings-env [st0 [:ref :graph/st] v [:ref :cst/node] env0 [:list :string] names [:ref :graph/top]] [:ref :graph/benv]
+  (let [m (nkids v)]
+    (loop [i 0 st st0 env env0]
+      (if (>= i m)
+        (benv st env)
+        (let [pat (kid v i)
+              has-val (< (+ i 1) m)
+              val (kid v (+ i 1))]
+          (if (cst/kw? pat)
+            (let [let-vec (and (string=? ":let" (cst/node-text pat)) has-val (= :vec (ty val)))]
+              (if let-vec
+                (let [b (bindings-env st val env names)] (recur (+ i 2) (benv-st b) (benv-env b)))
+                (recur (+ i 2) (if has-val (visit st val env names) st) env)))
+            (recur (+ i 2) (if has-val (visit st val env names) st) (env-plus env (pattern-syms pat)))))))))
+
+;; fn-arity: params vector p, body = kids of n from index i
+(defn- fn-arity [st [:ref :graph/st] p [:ref :cst/node] n [:ref :cst/node] i :i64 env [:list :string] names [:ref :graph/top]] [:ref :graph/st]
+  (body-from st n i (env-plus env (pattern-syms p)) names))
+
+;; arities over the kids of n from index i
+(defn- arities [st [:ref :graph/st] n [:ref :cst/node] i :i64 env [:list :string] names [:ref :graph/top]] [:ref :graph/st]
+  (let [m (nkids n)]
+    (if (and (< i m) (= :vec (ty (kid n i))))
+      (fn-arity st (kid n i) n (+ i 1) env names)
+      (loop [j i s st]
+        (if (>= j m)
+          s
+          (let [a (kid n j)]
+            (recur (+ j 1)
+                   (if (and (= :list (ty a)) (> (nkids a) 0) (= :vec (ty (kid a 0))))
+                     (fn-arity s (kid a 0) a 1 env names)
+                     (visit s a env names)))))))))
+
+(defn- visit [st [:ref :graph/st] n [:ref :cst/node] env [:list :string] names [:ref :graph/top]] [:ref :graph/st]
+  (let [t (ty n)]
+    (cond
+      (= t :sym) (sym-ref st n env names)
+      (or (= t :kw) (= t :str) (= t :num) (= t :char) (= t :regex) (= t :nil)) st
+      (= t :meta) (visit (visit st (kid n 0) env names) (kid n 1) env names)
+      (= t :prefix) (if (string=? "'" (cst/node-prefix n)) st (visit st (kid n 0) env names))
+      (= t :list) (visit-list st n env names)
+      :else (body-from st n 0 env names))))
+
+(defn- visit-call [st [:ref :graph/st] n [:ref :cst/node] env [:list :string] names [:ref :graph/top]] [:ref :graph/st]
+  ;; the head in :call role: only a symbol head is a reference, which visit-list handles; any other head is visited
+  (visit st n env names))
+
+(defn- visit-list [st [:ref :graph/st] n [:ref :cst/node] env [:list :string] names [:ref :graph/top]] [:ref :graph/st]
+  (let [m (nkids n)]
+    (if (= m 0)
+      st
+      (let [h (kid n 0)
+            ht (if (= :sym (ty h)) (cst/node-text h) "")
+            is-sym (= :sym (ty h))
+            r0 (kid n 1)
+            nr (- m 1)]
+        (cond
+          (not is-sym) (body-from (visit-call st h env names) n 1 env names)
+          (string=? ht "quote") st
+          (or (string=? ht "declare") (string=? ht "ns")) st
+          (or (string=? ht "def") (string=? ht "defonce")) (body-from st n 2 env names)
+          (and (let-like? ht) (> nr 0) (= :vec (ty r0)))
+          (if (string=? ht "binding")
+            (let [bm (nkids r0)
+                  st2 (loop [i 0 s st]
+                        (if (>= i (- bm 1))
+                          s
+                          (let [tt (sym-text (kid r0 i))
+                                s1 (if (and (> (string-byte-length tt) 0) (top? names tt)) (add-ref (add-bind s tt) tt) s)]
+                            (recur (+ i 2) (visit s1 (kid r0 (+ i 1)) env names)))))]
+              (body-from st2 n 2 env names))
+            (let [b (bindings-env st r0 env names)]
+              (body-from (benv-st b) n 2 (benv-env b) names)))
+          (or (string=? ht "fn") (string=? ht "fn*"))
+          (if (and (> nr 0) (= :sym (ty r0)))
+            (arities st n 2 (sadd env (cst/node-text r0)) names)
+            (arities st n 1 env names))
+          (or (string=? ht "defn") (string=? ht "defn-"))
+          (let [start (loop [i 2 s st]
+                        (if (and (< i m) (let [tt (ty (kid n i))] (or (= tt :str) (= tt :map) (= tt :meta))))
+                          (recur (+ i 1) s)
+                          i))
+                st2 (loop [i 2 s st]
+                      (if (>= i start) s (recur (+ i 1) (if (= :map (ty (kid n i))) (visit s (kid n i) env names) s))))]
+            (arities st2 n start env names))
+          (and (string=? ht "letfn") (> nr 0) (= :vec (ty r0)))
+          (let [fm (nkids r0)
+                env2 (loop [i 0 e env]
+                       (if (>= i fm) e
+                           (recur (+ i 1) (let [f (kid r0 i)]
+                                            (if (and (cst/lst? f) (> (nkids f) 0) (= :sym (ty (kid f 0))))
+                                              (sadd e (cst/node-text (kid f 0))) e)))))
+                st2 (loop [i 0 s st]
+                      (if (>= i fm) s
+                          (recur (+ i 1) (let [f (kid r0 i)]
+                                           (if (and (cst/lst? f) (> (nkids f) 2) (= :vec (ty (kid f 1))))
+                                             (fn-arity s (kid f 1) f 2 env2 names) s)))))]
+            (body-from st2 n 2 env2 names))
+          (and (string=? ht "catch") (>= nr 2))
+          (let [tt (sym-text (kid n 2))]
+            (body-from st n 3 (if (> (string-byte-length tt) 0) (sadd env tt) env) names))
+          (and (string=? ht "as->") (>= nr 2))
+          (let [tt (sym-text (kid n 2))]
+            (body-from (visit st r0 env names) n 3 (if (> (string-byte-length tt) 0) (sadd env tt) env) names))
+          (and (string=? ht "case") (> nr 0))
+          (let [ncl (- nr 1)
+                st1 (visit st r0 env names)
+                ;; clauses are kids 2.. ; (range 0 (dec ncl) 2) visits clause i+1
+                st2 (loop [i 0 s st1] (if (>= i (- ncl 1)) s (recur (+ i 2) (visit s (kid n (+ 2 (+ i 1))) env names))))]
+            (if (= (bit-and ncl 1) 1) (visit st2 (kid n (+ 2 (- ncl 1))) env names) st2))
+          (and (string=? ht "condp") (> nr 0)) (body-from st n 1 env names)
+          :else (body-from (if (and (top? names ht) (not (in? env ht))) (add-ref st ht) st) n 1 env names))))))
+
+(defn- refs-of [c [:ref :graph/chunk] names [:ref :graph/top]] [:ref :graph/chunk]
+  (let [st (visit (record-new [:ref :graph/st] (strs) (sset) (strs) (sset)) (chunk-node c) (sset) names)
+        own (chunk-names c)
+        oset (env-plus (sset) own)
+        all (st-refs st)
+        m (vector-count all)
+        kept (loop [i 0 acc (strs)] (if (>= i m) acc (recur (+ i 1) (if (in? oset (snth all i)) acc (sconj acc (snth all i))))))]
+    ;; the host's refs map passed 8 keys (own names included) -> a hash map, its keys in HAMT order
+    (with-refs c kept (> m 8) (st-binds st))))
+
+;; ---------------------------------------------------------------------------
+;; analysis, adjacency, Tarjan
+
+(defn a-src [a [:ref :graph/a]] :string (record-get [:ref :graph/a] a :src))
+(defn a-chunks [a [:ref :graph/a]] [:list [:ref :graph/chunk]] (record-get [:ref :graph/a] a :chunks))
+(defn a-dc-names [a [:ref :graph/a]] [:list :string] (record-get [:ref :graph/a] a :dc-names))
+(defn a-dc-hashed [a [:ref :graph/a]] :bool (record-get [:ref :graph/a] a :dc-hashed))
+(defn- a-dc-tab [a [:ref :graph/a]] :vector-i64 (record-get [:ref :graph/a] a :dc-tab))
+(defn- a-dc-vals [a [:ref :graph/a]] [:list :vector-i64] (record-get [:ref :graph/a] a :dc-vals))
+(defn- dc-lookup [names [:list :string] tab :vector-i64 vals [:list :vector-i64] nm :string] :vector-i64
+  (let [k (ord/tab-find tab names nm)] (if (< k 0) (vector-alloc 0) (typed-list-nth [:list :vector-i64] vals k))))
+(defn a-adj [a [:ref :graph/a]] [:list [:ref :graph/adj]] (record-get [:ref :graph/a] a :adj))
+(defn a-comps [a [:ref :graph/a]] [:list :vector-i64] (record-get [:ref :graph/a] a :comps))
+(defn a-top-count [a [:ref :graph/a]] :i64 (vector-count (a-dc-names a)))
+(defn a-dc-of [a [:ref :graph/a] nm :string] :vector-i64
+  (dc-lookup (a-dc-names a) (a-dc-tab a) (a-dc-vals a) nm))
+(defn chunk-count [xs [:list [:ref :graph/chunk]]] :i64 (vector-count xs))
+(defn chunk-at [xs [:list [:ref :graph/chunk]] i :i64] [:ref :graph/chunk] (typed-list-nth [:list [:ref :graph/chunk]] xs i))
+(defn comps-count [xs [:list :vector-i64]] :i64 (vector-count xs))
+(defn comps-at [xs [:list :vector-i64] i :i64] :vector-i64 (typed-list-nth [:list :vector-i64] xs i))
+
+(defn adj-targets [x [:ref :graph/adj]] :vector-i64 (record-get [:ref :graph/adj] x :targets))
+(defn adj-weights [x [:ref :graph/adj]] :vector-i64 (record-get [:ref :graph/adj] x :weights))
+(defn adj-hashed? [x [:ref :graph/adj]] :bool (record-get [:ref :graph/adj] x :hashed))
+(defn adj-at [xs [:list [:ref :graph/adj]] i :i64] [:ref :graph/adj] (typed-list-nth [:list [:ref :graph/adj]] xs i))
+
+;; (keys (get adj u)) in cljs order
+(defn adj-keys-in-order [x [:ref :graph/adj]] :vector-i64
+  (let [ts (adj-targets x)
+        o (ord/map-order-ints ts (adj-hashed? x))
+        n (vector-count o)]
+    (loop [i 0 acc (vector-alloc 0)] (if (>= i n) acc (recur (+ i 1) (vector-conj acc (vector-at ts (vector-at o i))))))))
+
+;; (keys (:refs c)) in cljs order
+(defn chunk-refs-in-map-order [c [:ref :graph/chunk]] [:list :string]
+  (let [rs (chunk-refs c)
+        o (ord/map-order-strs rs (chunk-refs-hashed? c))
+        n (vector-count o)]
+    (loop [i 0 acc (strs)] (if (>= i n) acc (recur (+ i 1) (sconj acc (snth rs (vector-at o i))))))))
+
+(defn chunk-refers? [c [:ref :graph/chunk] nm :string] :bool
+  (let [rs (chunk-refs c) n (vector-count rs)]
+    (loop [i 0] (cond (>= i n) false (string=? (snth rs i) nm) true :else (recur (+ i 1))))))
+
+(defn chunk-binds? [c [:ref :graph/chunk] nm :string] :bool
+  (let [rs (chunk-binds c) n (vector-count rs)]
+    (loop [i 0] (cond (>= i n) false (string=? (snth rs i) nm) true :else (recur (+ i 1))))))
+
+(defn- vindex [v :vector-i64 x :i64] :i64
+  (let [n (vector-count v)] (loop [i 0] (cond (>= i n) -1 (= (vector-at v i) x) i :else (recur (+ i 1))))))
+
+;; adjacency rows are mutable while built: a :vector-i64 per row inside a list rebuilt per bump is O(n) per bump, so
+;; bumps go to a flat log first and rows are made once.
+(defn- bump-row [x [:ref :graph/adj] v :i64] [:ref :graph/adj]
+  (let [ts (adj-targets x) k (vindex ts v)]
+    (if (< k 0)
+      (let [ts2 (vector-conj ts v)]
+        (record-new [:ref :graph/adj] ts2 (vector-conj (adj-weights x) 1) (or (adj-hashed? x) (> (vector-count ts2) 8))))
+      (record-new [:ref :graph/adj] ts (vector-assoc (adj-weights x) k (+ 1 (vector-at (adj-weights x) k))) (adj-hashed? x)))))
+
+(defn- empty-adj [] [:ref :graph/adj] (record-new [:ref :graph/adj] (vector-alloc 0) (vector-alloc 0) false))
+
+;; bumps (u v pairs flattened, in order) -> adjacency rows
+(defn- rows-of [n :i64 log :vector-i64] [:list [:ref :graph/adj]]
+  (let [lm (quot (vector-count log) 2)
+        ;; per u, the list of v in bump order: counting sort by u (stable)
+        cnt (vector-alloc (+ n 1))
+        _c (loop [i 0] (if (>= i lm) 0 (let [u (vector-at log (* 2 i)) _ (vector-assoc! cnt (+ u 1) (+ 1 (vector-at cnt (+ u 1))))] (recur (+ i 1)))))
+        _p (loop [u 0] (if (>= u n) 0 (let [_ (vector-assoc! cnt (+ u 1) (+ (vector-at cnt (+ u 1)) (vector-at cnt u)))] (recur (+ u 1)))))
+        start (loop [u 0 acc (vector-alloc 0)] (if (> u n) acc (recur (+ u 1) (vector-conj acc (vector-at cnt u)))))
+        pos (loop [u 0 acc (vector-alloc 0)] (if (> u n) acc (recur (+ u 1) (vector-conj acc (vector-at cnt u)))))
+        sorted (vector-alloc lm)
+        _s (loop [i 0] (if (>= i lm) 0
+                           (let [u (vector-at log (* 2 i))
+                                 p (vector-at pos u)
+                                 _a (vector-assoc! sorted p (vector-at log (+ (* 2 i) 1)))
+                                 _b (vector-assoc! pos u (+ p 1))]
+                             (recur (+ i 1)))))]
+    (loop [u 0 acc (typed-list-new [:list [:ref :graph/adj]])]
+      (if (>= u n)
+        acc
+        (let [row (loop [k (vector-at start u) x (empty-adj)]
+                    (if (>= k (vector-at start (+ u 1))) x (recur (+ k 1) (bump-row x (vector-at sorted k)))))]
+          (recur (+ u 1) (typed-list-conj [:list [:ref :graph/adj]] acc row)))))))
+
+(defn- push2 [log :vector-i64 u :i64 v :i64] :vector-i64 (vector-conj (vector-conj log u) v))
+
+(defn- build-adj [chunks [:list [:ref :graph/chunk]] dc-names [:list :string] dc-hashed :bool dc-tab :vector-i64 dc-vals [:list :vector-i64]]
+  [:list [:ref :graph/adj]]
+  (let [n (chunk-count chunks)
+        log1 (loop [ci 0 log (vector-alloc 0)]
+               (if (>= ci n)
+                 log
+                 (let [c (chunk-at chunks ci)
+                       rs (chunk-refs-in-map-order c)
+                       rm (vector-count rs)
+                       idx (chunk-idx c)]
+                   (recur (+ ci 1)
+                          (loop [ri 0 lg log]
+                            (if (>= ri rm)
+                              lg
+                              (let [ts (dc-lookup dc-names dc-tab dc-vals (snth rs ri))
+                                    tm (vector-count ts)]
+                                (recur (+ ri 1)
+                                       (loop [ti 0 l lg]
+                                         (if (>= ti tm) l
+                                             (recur (+ ti 1) (if (= (vector-at ts ti) idx) l (push2 l idx (vector-at ts ti))))))))))))))
+        o (ord/map-order-strs dc-names dc-hashed)
+        om (vector-count o)
+        log2 (loop [k 0 log log1]
+               (if (>= k om)
+                 log
+                 (let [idxs (typed-list-nth [:list :vector-i64] dc-vals (vector-at o k))
+                       im (vector-count idxs)]
+                   (recur (+ k 1)
+                          (loop [i 0 l log]
+                            (if (>= i im) l
+                                (recur (+ i 1)
+                                       (loop [j 0 l2 l]
+                                         (if (>= j im) l2
+                                             (recur (+ j 1) (if (= i j) l2 (push2 l2 (vector-at idxs i) (vector-at idxs j)))))))))))))]
+    (rows-of n log2)))
+
+;; Tarjan (the host's iterative version: same visiting order, so the same SCC order). adjacency: per vertex its
+;; successors in cljs key order; skip: vertices left out (a 0/1 vector).
+(defn- succ-of [succ [:list :vector-i64] v :i64] :vector-i64 (typed-list-nth [:list :vector-i64] succ v))
+
+(defn tarjan [n :i64 succ [:list :vector-i64] skip :vector-i64] [:list :vector-i64]
+  (let [idx (loop [i 0 acc (vector-alloc 0)] (if (>= i n) acc (recur (+ i 1) (vector-conj acc -1))))
+        low (vector-alloc n)
+        on (vector-alloc n)
+        ;; frames: vertex and the position in its successor list
+        fv (vector-alloc (+ n 1))
+        fp (vector-alloc (+ n 1))
+        stack (vector-alloc (+ n 1))]
+    (loop [root 0 nf 0 ns 0 counter 0 comps (typed-list-new [:list :vector-i64])]
+      (cond
+        (> nf 0)
+        (let [v (vector-at fv (- nf 1))
+              p (vector-at fp (- nf 1))
+              ws (succ-of succ v)]
+          (if (< p (vector-count ws))
+            (let [w (vector-at ws p)
+                  _a (vector-assoc! fp (- nf 1) (+ p 1))]
+              (cond
+                (< (vector-at idx w) 0)
+                (let [_1 (vector-assoc! idx w counter) _2 (vector-assoc! low w counter)
+                      _3 (vector-assoc! stack ns w) _4 (vector-assoc! on w 1)
+                      _5 (vector-assoc! fv nf w) _6 (vector-assoc! fp nf 0)]
+                  (recur root (+ nf 1) (+ ns 1) (+ counter 1) comps))
+                (= (vector-at on w) 1)
+                (let [_1 (if (< (vector-at idx w) (vector-at low v)) (vector-assoc! low v (vector-at idx w)) low)]
+                  (recur root nf ns counter comps))
+                :else (recur root nf ns counter comps)))
+            ;; v done
+            (let [nf2 (- nf 1)
+                  _1 (if (> nf2 0)
+                       (let [pv (vector-at fv (- nf2 1))]
+                         (if (< (vector-at low v) (vector-at low pv)) (vector-assoc! low pv (vector-at low v)) low))
+                       low)]
+              (if (= (vector-at low v) (vector-at idx v))
+                (let [r (loop [k ns comp (vector-alloc 0)]
+                          (let [w (vector-at stack (- k 1))
+                                _ (vector-assoc! on w 0)]
+                            (if (= w v) (+ (* (- k 1) 1) 0) (recur (- k 1) comp))))
+                      comp (loop [k r acc (vector-alloc 0)] (if (>= k ns) acc (recur (+ k 1) (vector-conj acc (vector-at stack k)))))]
+                  (recur root nf2 r counter (typed-list-conj [:list :vector-i64] comps (ord/sort-ints comp))))
+                (recur root nf2 ns counter comps)))))
+        (< root n)
+        (if (or (= (vector-at skip root) 1) (>= (vector-at idx root) 0))
+          (recur (+ root 1) nf ns counter comps)
+          (let [_1 (vector-assoc! idx root counter) _2 (vector-assoc! low root counter)
+                _3 (vector-assoc! stack ns root) _4 (vector-assoc! on root 1)
+                _5 (vector-assoc! fv 0 root) _6 (vector-assoc! fp 0 0)]
+            (recur (+ root 1) 1 (+ ns 1) (+ counter 1) comps)))
+        :else comps))))
+
+(defn analysis [src :string] [:ref :graph/a]
+  (let [tops (cst/out-nodes (cst/parse src))
+        tn (vector-count tops)
+        chunks0 (loop [i 0 prev 0 acc (typed-list-new [:list [:ref :graph/chunk]])]
+                  (if (>= i tn)
+                    acc
+                    (let [t (nodes-nth tops i)]
+                      (recur (+ i 1) (cst/node-e t) (typed-list-conj [:list [:ref :graph/chunk]] acc (classify src i t prev))))))
+        n (chunk-count chunks0)
+        ;; def-chunks: name -> [idx..] in insertion order of names
+        dcr (loop [ci 0 names (strs) tab (ord/tab-new) vals (typed-list-new [:list :vector-i64])]
+              (if (>= ci n)
+                (record-new [:ref :graph/a] src chunks0 names false tab vals
+                            (typed-list-new [:list [:ref :graph/adj]]) (typed-list-new [:list :vector-i64]))
+                (let [c (chunk-at chunks0 ci)
+                      ns (chunk-names c)
+                      nm (vector-count ns)
+                      r (loop [k 0 names2 names tab2 tab vals2 vals]
+                          (if (>= k nm)
+                            (record-new [:ref :graph/a] src chunks0 names2 false tab2 vals2
+                                        (typed-list-new [:list [:ref :graph/adj]]) (typed-list-new [:list :vector-i64]))
+                            (let [x (snth ns k)
+                                  at (ord/tab-find tab2 names2 x)]
+                              (if (< at 0)
+                                (let [names3 (sconj names2 x)]
+                                  (recur (+ k 1) names3 (ord/tab-add tab2 names3 (- (vector-count names3) 1))
+                                         (typed-list-conj [:list :vector-i64] vals2 (vector-conj (vector-alloc 0) (chunk-idx c)))))
+                                (let [v (typed-list-nth [:list :vector-i64] vals2 at)]
+                                  (if (>= (vindex v (chunk-idx c)) 0)
+                                    (recur (+ k 1) names2 tab2 vals2)
+                                    ;; a name defined in a second chunk: rebuild the value list (rare)
+                                    (recur (+ k 1) names2 tab2
+                                           (let [vm (vector-count vals2)]
+                                             (loop [j 0 acc (typed-list-new [:list :vector-i64])]
+                                               (if (>= j vm) acc
+                                                   (recur (+ j 1) (typed-list-conj [:list :vector-i64] acc
+                                                                                   (if (= j at) (vector-conj v (chunk-idx c))
+                                                                                       (typed-list-nth [:list :vector-i64] vals2 j))))))))))))))]
+                  (recur (+ ci 1) (a-dc-names r) (a-dc-tab r) (a-dc-vals r)))))
+        dc-names (a-dc-names dcr)
+        dc-tab (a-dc-tab dcr)
+        dc-vals (a-dc-vals dcr)
+        topset (record-new [:ref :graph/top] dc-names dc-tab)
+        chunks (loop [ci 0 acc (typed-list-new [:list [:ref :graph/chunk]])]
+                 (if (>= ci n)
+                   acc
+                   (let [c (chunk-at chunks0 ci)]
+                     (recur (+ ci 1) (typed-list-conj [:list [:ref :graph/chunk]] acc (if (chunk-is-ns? c) c (refs-of c topset)))))))
+        hashed (> (vector-count dc-names) 8)
+        adj (build-adj chunks dc-names hashed dc-tab dc-vals)
+        succ (loop [u 0 acc (typed-list-new [:list :vector-i64])]
+               (if (>= u n) acc (recur (+ u 1) (typed-list-conj [:list :vector-i64] acc (adj-keys-in-order (adj-at adj u))))))
+        skip (loop [u 0 acc (vector-alloc 0)]
+               (if (>= u n) acc (recur (+ u 1) (vector-conj acc (if (chunk-is-ns? (chunk-at chunks u)) 1 0)))))
+        comps (tarjan n succ skip)]
+    (record-new [:ref :graph/a] src chunks dc-names hashed dc-tab dc-vals adj comps)))
+
+(defn line-of [src :string off :i64] :i64 (+ 1 (count-newlines src 0 off)))
+
+(defn chunk-label [c [:ref :graph/chunk]] :string
+  (let [ns (chunk-names c)]
+    (cond (> (vector-count ns) 0) (snth ns 0)
+          (> (vector-count (chunk-declares c)) 0) (string-concat "declare:" (snth (chunk-declares c) 0))
+          (chunk-is-ns? c) "ns"
+          :else (string-concat "form#" (string-from-i64 (chunk-idx c))))))

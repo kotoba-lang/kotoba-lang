@@ -1,0 +1,185 @@
+;; kotoba.compiler.refactor.cljs-order -- GUEST-ONLY helper of the refactor twins (no host module of this name): the
+;; iteration order of ClojureScript's persistent maps and sets, which the host refactor modules leak into their answers
+;; (`keys` of a map, `doseq` over one, `(sort (get adj u))` aside).
+;;
+;; A cljs map built by assoc/update iterates in INSERTION order while it is a PersistentArrayMap (at most 8 entries) and
+;; in HAMT order once it became a PersistentHashMap (on the 9th distinct key; it stays one after dissoc). HAMT order =
+;; the 32-bit hash read as 5-bit groups from the low bits (`trie-key`), ties (full collisions) in insertion order.
+;; Hashes are cljs.core/hash: strings m3-hash-int of the Java-style UTF-16 hash, integers (js-mod n 2147483647).
+;; The same hash code is in amu's seed/amu-main/src/amu/edn.kotoba (differentially checked there against nbb).
+;;
+;;   (str-hash s) (int-hash n) (trie-key h)                      -> :i64
+;;   (hash-order-strs xs) (hash-order-ints xs)                   -> :vector-i64 indices of xs in HAMT order
+;;   (map-order-strs xs hashed) (map-order-ints xs hashed)       -> :vector-i64 insertion order, or HAMT order when hashed
+;;   (sort-strs xs) (sort-ints xs)                               -> sorted copies (cljs `sort`: strings by `compare`,
+;;                                                                  here byte order = code point order; UTF-16 order differs
+;;                                                                  only between astral and U+E000..U+FFFF characters)
+;;   (sort-idx keys)                                             -> stable ascending order of the indices by keys
+
+(ns kotoba.compiler.refactor.cljs-order
+  (:export [str-hash int-hash trie-key sort-idx hash-order-strs hash-order-ints map-order-strs map-order-ints
+            sort-strs sort-ints iota tab-new tab-find tab-add tab-of member?]))
+
+(defn- u32 [x :i64] :i64 (bit-and x 4294967295))
+(defn- i32 [x :i64] :i64 (- (bit-xor (u32 x) 2147483648) 2147483648))
+(defn- imul [a :i64 b :i64] :i64 (i32 (* (u32 a) (u32 b))))
+(defn- rotl [x :i64 n :i64] :i64
+  (i32 (bit-or (i64-shift-left (u32 x) n) (u64-shift-right (u32 x) (- 32 n)))))
+(defn- ushr [x :i64 n :i64] :i64 (u64-shift-right (u32 x) n))
+(defn- mix-k1 [k1 :i64] :i64 (imul (rotl (imul (i32 k1) (i32 3432918353)) 15) 461845907))
+(defn- mix-h1 [h1 :i64 k1 :i64] :i64
+  (i32 (+ (imul (rotl (bit-xor (i32 h1) (i32 k1)) 13) 5) (i32 3864292196))))
+(defn- fmix [h :i64 len :i64] :i64
+  (let [a (bit-xor (i32 h) len)
+        b (i32 (bit-xor a (ushr a 16)))
+        c (imul b (i32 2246822507))
+        d (i32 (bit-xor c (ushr c 13)))
+        e (imul d (i32 3266489909))]
+    (i32 (bit-xor e (ushr e 16)))))
+(defn- m3-int [x :i64] :i64 (if (= (i32 x) 0) 0 (fmix (mix-h1 0 (mix-k1 x)) 4)))
+(defn- utf8-width [p :i64] :i64 (if (< p 128) 1 (if (< p 2048) 2 (if (< p 65536) 3 4))))
+
+(defn- java-hash [s :string] :i64
+  (let [n (string-byte-length s)]
+    (loop [i 0 h 0]
+      (if (>= i n)
+        h
+        (let [p (string-code-point-at s i)]
+          (if (< p 65536)
+            (recur (+ i (utf8-width p)) (+ (imul 31 h) p))
+            (let [q (- p 65536)]
+              (recur (+ i 4) (+ (imul 31 (+ (imul 31 h) (+ 55296 (u64-shift-right q 10)))) (+ 56320 (bit-and q 1023)))))))))))
+
+(defn str-hash [s :string] :i64 (m3-int (java-hash s)))
+(defn int-hash [n :i64] :i64 (- n (* (quot n 2147483647) 2147483647)))
+
+(defn trie-key [h :i64] :i64
+  (let [u (u32 h)]
+    (bit-or (i64-shift-left (bit-and u 31) 30)
+     (bit-or (i64-shift-left (bit-and (u64-shift-right u 5) 31) 25)
+      (bit-or (i64-shift-left (bit-and (u64-shift-right u 10) 31) 20)
+       (bit-or (i64-shift-left (bit-and (u64-shift-right u 15) 31) 15)
+        (bit-or (i64-shift-left (bit-and (u64-shift-right u 20) 31) 10)
+         (bit-or (i64-shift-left (bit-and (u64-shift-right u 25) 31) 5)
+                 (u64-shift-right u 30)))))))))
+
+(defn iota [n :i64] :vector-i64
+  (loop [i 0 acc (vector-alloc 0)] (if (>= i n) acc (recur (+ i 1) (vector-conj acc i)))))
+
+(defn- merge-run [keys :vector-i64 src :vector-i64 dst :vector-i64 lo :i64 mid :i64 hi :i64] :i64
+  (loop [i lo j mid k lo]
+    (cond (>= k hi) 0
+          (and (< i mid) (or (>= j hi) (<= (vector-at keys (vector-at src i)) (vector-at keys (vector-at src j)))))
+          (let [_ (vector-assoc! dst k (vector-at src i))] (recur (+ i 1) j (+ k 1)))
+          :else (let [_ (vector-assoc! dst k (vector-at src j))] (recur i (+ j 1) (+ k 1))))))
+
+(defn- merge-pass [keys :vector-i64 src :vector-i64 w :i64] :vector-i64
+  (let [n (vector-count src)
+        dst (vector-alloc n)]
+    (loop [lo 0]
+      (if (>= lo n)
+        dst
+        (let [mid (if (> (+ lo w) n) n (+ lo w))
+              hi (if (> (+ lo (* 2 w)) n) n (+ lo (* 2 w)))
+              _ (merge-run keys src dst lo mid hi)]
+          (recur hi))))))
+
+(defn sort-idx [keys :vector-i64] :vector-i64
+  (let [n (vector-count keys)]
+    (loop [w 1 v (iota n)]
+      (if (>= w n) v (recur (* w 2) (merge-pass keys v w))))))
+
+(defn hash-order-strs [xs [:list :string]] :vector-i64
+  (let [n (vector-count xs)]
+    (sort-idx (loop [i 0 acc (vector-alloc 0)]
+                (if (>= i n) acc (recur (+ i 1) (vector-conj acc (trie-key (str-hash (typed-list-nth [:list :string] xs i))))))))))
+
+(defn hash-order-ints [xs :vector-i64] :vector-i64
+  (let [n (vector-count xs)]
+    (sort-idx (loop [i 0 acc (vector-alloc 0)]
+                (if (>= i n) acc (recur (+ i 1) (vector-conj acc (trie-key (int-hash (vector-at xs i))))))))))
+
+(defn map-order-strs [xs [:list :string] hashed :bool] :vector-i64
+  (if hashed (hash-order-strs xs) (iota (vector-count xs))))
+
+(defn map-order-ints [xs :vector-i64 hashed :bool] :vector-i64
+  (if hashed (hash-order-ints xs) (iota (vector-count xs))))
+
+(defn sort-ints [xs :vector-i64] :vector-i64
+  (let [o (sort-idx xs) n (vector-count xs)]
+    (loop [i 0 acc (vector-alloc 0)] (if (>= i n) acc (recur (+ i 1) (vector-conj acc (vector-at xs (vector-at o i))))))))
+
+;; strings: merge sort with string-compare (stable)
+;; strings: merge sort with string-compare (stable)
+(defn- smerge-run [xs [:list :string] src :vector-i64 dst :vector-i64 lo :i64 mid :i64 hi :i64] :i64
+  (loop [i lo j mid k lo]
+    (cond (>= k hi) 0
+          (and (< i mid) (or (>= j hi) (<= (string-compare (typed-list-nth [:list :string] xs (vector-at src i))
+                                                           (typed-list-nth [:list :string] xs (vector-at src j))) 0)))
+          (let [_ (vector-assoc! dst k (vector-at src i))] (recur (+ i 1) j (+ k 1)))
+          :else (let [_ (vector-assoc! dst k (vector-at src j))] (recur i (+ j 1) (+ k 1))))))
+
+(defn- smerge-pass [xs [:list :string] src :vector-i64 w :i64] :vector-i64
+  (let [n (vector-count src)
+        dst (vector-alloc n)]
+    (loop [lo 0]
+      (if (>= lo n)
+        dst
+        (let [mid (if (> (+ lo w) n) n (+ lo w))
+              hi (if (> (+ lo (* 2 w)) n) n (+ lo (* 2 w)))
+              _ (smerge-run xs src dst lo mid hi)]
+          (recur hi))))))
+
+(defn sort-strs [xs [:list :string]] [:list :string]
+  (let [n (vector-count xs)
+        o (loop [w 1 v (iota n)] (if (>= w n) v (recur (* w 2) (smerge-pass xs v w))))]
+    (loop [i 0 acc (typed-list-new [:list :string])]
+      (if (>= i n) acc (recur (+ i 1) (typed-list-conj [:list :string] acc (typed-list-nth [:list :string] xs (vector-at o i))))))))
+
+;; ---------------------------------------------------------------------------
+;; string index (typed sets/maps of the seed hold at most 32 items / 31 entries, the reference's bounded collections):
+;; an open-addressing table over a [:list :string]; slot = position + 1, 0 empty. Built or grown by tab-add, which
+;; mutates the table it is given (one owner) and answers it, or a larger one.
+
+(defn- fnv [s :string] :i64
+  (let [n (string-byte-length s)]
+    (loop [i 0 h 1469598103934665603]
+      (if (>= i n)
+        (bit-and h 1152921504606846975)
+        (let [p (string-code-point-at s i)]
+          (recur (+ i (utf8-width p)) (* (bit-xor h p) 1099511628211)))))))
+
+(defn tab-new [] :vector-i64 (vector-alloc 16))
+
+;; position of s in xs through the table, -1 when absent
+(defn tab-find [tab :vector-i64 xs [:list :string] s :string] :i64
+  (let [m (- (vector-count tab) 1)]
+    (loop [k (bit-and (fnv s) m)]
+      (let [e (vector-at tab k)]
+        (cond (= e 0) -1
+              (string=? (typed-list-nth [:list :string] xs (- e 1)) s) (- e 1)
+              :else (recur (bit-and (+ k 1) m)))))))
+
+(defn- tab-put [tab :vector-i64 s :string pos :i64] :vector-i64
+  (let [m (- (vector-count tab) 1)]
+    (loop [k (bit-and (fnv s) m)]
+      (if (= (vector-at tab k) 0)
+        (vector-assoc! tab k (+ pos 1))
+        (recur (bit-and (+ k 1) m))))))
+
+;; record that xs[pos] = s (pos = the count of entries before it); grows at half load
+(defn tab-add [tab :vector-i64 xs [:list :string] pos :i64] :vector-i64
+  (if (< (* 2 (+ pos 1)) (vector-count tab))
+    (tab-put tab (typed-list-nth [:list :string] xs pos) pos)
+    (let [t2 (vector-alloc (* 4 (vector-count tab)))]
+      (loop [i 0 t t2]
+        (if (> i pos) t (recur (+ i 1) (tab-put t (typed-list-nth [:list :string] xs i) i)))))))
+
+(defn tab-of [xs [:list :string]] :vector-i64
+  (let [n (vector-count xs)]
+    (loop [i 0 t (tab-new)] (if (>= i n) t (recur (+ i 1) (tab-add t xs i))))))
+
+;; linear helpers for small lists
+(defn member? [xs [:list :string] s :string] :bool
+  (let [n (vector-count xs)]
+    (loop [i 0] (cond (>= i n) false (string=? (typed-list-nth [:list :string] xs i) s) true :else (recur (+ i 1))))))
