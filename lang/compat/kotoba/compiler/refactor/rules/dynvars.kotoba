@@ -1,0 +1,806 @@
+;; kotoba.compiler.refactor.rules.dynvars -- the GUEST-ROUTE twin of amu's
+;; `src/kotoba/compiler/refactor/rules/dynvars.cljk`, rule (c): dynamic vars -> explicit env threading (--target dual:
+;; #?(:kotoba <threaded defn> :default <original>); --target host-env: in place, host-valid).
+;;
+;; WHY A TWIN. The host rule is dynamic Clojure over maps and sets of names (vars, shared fns, scans, callers, C, E,
+;; blocked) with atoms and closures. Its answer depends on cljs iteration order (the `shared` map orders the findings;
+;; the C set orders `blocked`, whose values order the inventory's :blocked-reasons ties), so the twin keeps every such
+;; collection as an insertion-ordered list with the cljs "hashed past 8 entries" flag (kotoba.compiler.refactor.
+;; cljs-order gives the HAMT order then).
+;;   (find-all src nodes target observable) -> [:list :finding/f]   target "dual" | "host-env" (another target: dual's
+;;     view and texts); observable: names from --observable-from (host-env blocker). The inventory's :data is rows
+;;     (see inv-* below) that amu.refactor-plan prints.
+
+(ns kotoba.compiler.refactor.rules.dynvars
+  (:require [kotoba.compiler.refactor.cst :as cst]
+            [kotoba.compiler.refactor.edit :as edit]
+            [kotoba.compiler.refactor.finding :as fd]
+            [kotoba.compiler.refactor.cljs-order :as ord])
+  (:export [find-all field-of])
+  (:schemas {:dv/os [:record :dv/os [[:xs [:list :string]] [:tab :vector-i64] [:hashed :bool]]]
+             :dv/var [:record :dv/var [[:name :string] [:field :string] [:repr :string] [:new :bool]]]
+             :dv/fn [:record :dv/fn [[:name :string] [:node [:ref :cst/node]] [:arm :string] [:private :bool]]]
+             :dv/call [:record :dv/call [[:name :string] [:parent [:ref :cst/node]] [:idx :i64]]]
+             :dv/scan [:record :dv/scan [[:reads [:list :string]] [:binds [:list [:ref :cst/node]]] [:calls [:list [:ref :dv/call]]]
+                                         [:refs [:list :string]] [:muts [:list :string]] [:mutops [:list :string]]
+                                         [:threadrefs [:list :string]] [:shadowrefs [:list :string]] [:blockers [:ref :dv/os]]
+                                         [:locals [:ref :dv/os]]]]
+             :dv/a [:record :dv/a [[:target :string] [:view :string] [:vars [:list [:ref :dv/var]]]
+                                   [:shared [:list [:ref :dv/fn]]] [:shared-hashed :bool] [:scans [:list [:ref :dv/scan]]]
+                                   [:c [:ref :dv/os]] [:e [:ref :dv/os]] [:blocked-names [:list :string]]
+                                   [:blocked-sets [:list [:ref :dv/os]]] [:blocked-hashed :bool]]]
+             :dv/rx [:record :dv/rx [[:a [:ref :dv/a]] [:src :string] [:locals [:ref :dv/os]] [:envarg :string] [:pvs :vector-i64] [:in-e :bool]]]
+             :dv/sub [:record :dv/sub [[:ok :bool] [:text :string]]]}))
+
+;; ---------------------------------------------------------------------------
+;; helpers
+
+(defn- strs [] [:list :string] (typed-list-new [:list :string]))
+(defn- sconj [xs [:list :string] s :string] [:list :string] (typed-list-conj [:list :string] xs s))
+(defn- snth [xs [:list :string] i :i64] :string (typed-list-nth [:list :string] xs i))
+(defn- cat [a :string b :string] :string (string-concat a b))
+(defn- pieces [xs [:list :string]] :string
+  (let [n (vector-count xs)] (loop [i 0 acc ""] (if (>= i n) acc (recur (+ i 1) (cat acc (snth xs i)))))))
+(defn- member? [xs [:list :string] s :string] :bool (ord/member? xs s))
+(defn- includes? [s :string t :string] :bool (>= (string-index-of s t) 0))
+(defn- nodes-nth [xs [:list [:ref :cst/node]] i :i64] [:ref :cst/node] (typed-list-nth [:list [:ref :cst/node]] xs i))
+(defn- kid [n [:ref :cst/node] i :i64] [:ref :cst/node]
+  (let [ks (cst/node-kids n)] (if (and (>= i 0) (< i (vector-count ks))) (nodes-nth ks i) (cst/nil-node))))
+(defn- nkids [n [:ref :cst/node]] :i64 (vector-count (cst/node-kids n)))
+(defn- ty [n [:ref :cst/node]] :keyword (cst/node-type n))
+(defn- txt [src :string n [:ref :cst/node]] :string (string-substring src (cst/node-s n) (cst/node-e n)))
+(defn- join [xs [:list :string] sep :string] :string
+  (let [n (vector-count xs)] (loop [i 0 acc ""] (if (>= i n) acc (recur (+ i 1) (if (= i 0) (snth xs 0) (cat acc (cat sep (snth xs i)))))))))
+
+;; ordered string sets in cljs order
+(defn- os-new [] [:ref :dv/os] (record-new [:ref :dv/os] (strs) (ord/tab-new) false))
+(defn- os-xs [s [:ref :dv/os]] [:list :string] (record-get [:ref :dv/os] s :xs))
+(defn- os-has? [s [:ref :dv/os] x :string] :bool (>= (ord/tab-find (record-get [:ref :dv/os] s :tab) (os-xs s) x) 0))
+(defn- os-count [s [:ref :dv/os]] :i64 (vector-count (os-xs s)))
+(defn- os-conj [s [:ref :dv/os] x :string] [:ref :dv/os]
+  (if (os-has? s x)
+    s
+    (let [xs (sconj (os-xs s) x)]
+      (record-new [:ref :dv/os] xs (ord/tab-add (copy-vec (record-get [:ref :dv/os] s :tab)) xs (- (vector-count xs) 1))
+                  (or (record-get [:ref :dv/os] s :hashed) (> (vector-count xs) 8))))))
+;; a fresh copy (tab-add mutates the table it is given; a set may still be in use)
+(defn- copy-vec [v :vector-i64] :vector-i64
+  (let [n (vector-count v) w (vector-alloc n)] (loop [i 0] (if (>= i n) w (let [_ (vector-assoc! w i (vector-at v i))] (recur (+ i 1)))))))
+
+;; iteration order
+(defn- os-items [s [:ref :dv/os]] [:list :string]
+  (let [xs (os-xs s)
+        o (ord/map-order-strs xs (record-get [:ref :dv/os] s :hashed))
+        n (vector-count o)]
+    (loop [i 0 acc (strs)] (if (>= i n) acc (recur (+ i 1) (sconj acc (snth xs (vector-at o i))))))))
+(defn- os-of [xs [:list :string]] [:ref :dv/os]
+  (let [n (vector-count xs)] (loop [i 0 s (os-new)] (if (>= i n) s (recur (+ i 1) (os-conj s (snth xs i)))))))
+(defn- os-equal? [a [:ref :dv/os] b [:ref :dv/os]] :bool
+  (and (= (os-count a) (os-count b))
+       (let [xs (os-xs a) n (vector-count xs)] (loop [i 0] (cond (>= i n) true (os-has? b (snth xs i)) (recur (+ i 1)) :else false)))))
+
+;; ---------------------------------------------------------------------------
+;; fields
+
+(defn- strip-lead1 [s :string c :i64] :string
+  (if (and (> (string-byte-length s) 0) (= (string-code-point-at s 0) c)) (string-substring s 1 (string-byte-length s)) s))
+(defn- strip-trail1 [s :string c :i64] :string
+  (let [n (string-byte-length s)] (if (and (> n 0) (= (string-code-point-at s (- n 1)) c)) (string-substring s 0 (- n 1)) s)))
+
+;; field, repr ("" none), new
+(defn field-of [nm :string] [:ref :dv/var]
+  (cond
+    (string=? nm "*synthetic-counter*") (record-new [:ref :dv/var] nm "counter" "i64 counter (host: volatile)" false)
+    (string=? nm "*contextual-closure-result-type*") (record-new [:ref :dv/var] nm "result" "" false)
+    (string=? nm "*absence-mode*") (record-new [:ref :dv/var] nm "none" "bool (host: :none/:legacy keyword)" false)
+    (string=? nm "*function-arities*") (record-new [:ref :dv/var] nm "arities" "" false)
+    (string=? nm "*lexical-bindings*") (record-new [:ref :dv/var] nm "lexical" "" false)
+    (string=? nm "*local-types*") (record-new [:ref :dv/var] nm "types" "" false)
+    (string=? nm "*document-functions*") (record-new [:ref :dv/var] nm "docfns" "" false)
+    (string=? nm "*loop-counter*") (record-new [:ref :dv/var] nm "loop-counter" "i64 counter (host: volatile)" false)
+    (string=? nm "*schemas*") (record-new [:ref :dv/var] nm "schemas" "" false)
+    (string=? nm "*lifting-lazy-thunk?*") (record-new [:ref :dv/var] nm "lazy" "" false)
+    (string=? nm "*abort-lexical-context*") (record-new [:ref :dv/var] nm "abort-ctx" "string (host: keyword)" false)
+    (string=? nm "*used-capability-keywords*") (record-new [:ref :dv/var] nm "used-caps" "" false)
+    (string=? nm "*local-option-types*") (record-new [:ref :dv/var] nm "options" "" false)
+    :else
+    (let [a (strip-trail1 (strip-trail1 (strip-lead1 nm 42) 42) 63)
+          b (if (= (string-index-of a "private") 0)
+              (let [r (string-substring a 7 (string-byte-length a))] (strip-lead1 r 45))
+              a)]
+      (record-new [:ref :dv/var] nm b "" true))))
+
+(defn- v-name [v [:ref :dv/var]] :string (record-get [:ref :dv/var] v :name))
+(defn- v-field [v [:ref :dv/var]] :string (record-get [:ref :dv/var] v :field))
+(defn- v-repr [v [:ref :dv/var]] :string (record-get [:ref :dv/var] v :repr))
+(defn- v-new [v [:ref :dv/var]] :bool (record-get [:ref :dv/var] v :new))
+
+(defn- var-at [vars [:list [:ref :dv/var]] nm :string] :i64
+  (let [n (vector-count vars)] (loop [i 0] (cond (>= i n) -1 (string=? (v-name (typed-list-nth [:list [:ref :dv/var]] vars i)) nm) i :else (recur (+ i 1))))))
+(defn- var-of [vars [:list [:ref :dv/var]] nm :string] [:ref :dv/var] (typed-list-nth [:list [:ref :dv/var]] vars (var-at vars nm)))
+(defn- is-var? [vars [:list [:ref :dv/var]] nm :string] :bool (>= (var-at vars nm) 0))
+
+;; ---------------------------------------------------------------------------
+;; definitions
+
+(defn- meta-texts [n0 [:ref :cst/node]] [:list :string]
+  (loop [n n0 acc (strs)] (if (= :meta (ty n)) (recur (kid n 1) (sconj acc (cst/node-text (kid n 0)))) acc)))
+
+(defn- fn-name [n [:ref :cst/node]] :string
+  (let [nm (cst/strip-meta (kid n 1))] (if (cst/sym? nm) (cst/node-text nm) "")))
+
+;; param-vecs: [params body-start] pairs as nodes: for a single arity the defn node itself (body from the index after
+;; the params), for multi arity each list
+(defn- pv-list [fnode [:ref :cst/node]] [:list [:ref :cst/node]]
+  (let [m (nkids fnode)
+        st (loop [k 2] (cond (>= k m) m (or (cst/vec? (kid fnode k)) (cst/lst? (kid fnode k))) k :else (recur (+ k 1))))]
+    (if (cst/vec? (kid fnode st))
+      (typed-list-new [:list [:ref :cst/node]] fnode)
+      (loop [k st acc (typed-list-new [:list [:ref :cst/node]])]
+        (if (>= k m) acc (recur (+ k 1) (if (cst/lst? (kid fnode k)) (typed-list-conj [:list [:ref :cst/node]] acc (kid fnode k)) acc)))))))
+
+;; the params vector and the body start index of an arity holder (the defn for single arity, else the arity list)
+(defn- ar-params [fnode [:ref :cst/node] h [:ref :cst/node]] [:ref :cst/node]
+  (if (= (cst/node-s h) (cst/node-s fnode))
+    (let [m (nkids fnode)] (loop [k 2] (if (or (>= k m) (cst/vec? (kid fnode k)) (cst/lst? (kid fnode k))) (kid fnode k) (recur (+ k 1)))))
+    (kid h 0)))
+(defn- ar-body-start [fnode [:ref :cst/node] h [:ref :cst/node]] :i64
+  (if (= (cst/node-s h) (cst/node-s fnode))
+    (let [m (nkids fnode)] (loop [k 2] (if (or (>= k m) (cst/vec? (kid fnode k)) (cst/lst? (kid fnode k))) (+ k 1) (recur (+ k 1)))))
+    1))
+
+(defn- syms-in [acc [:ref :dv/os] n0 [:ref :cst/node]] [:ref :dv/os]
+  (let [n (cst/strip-meta n0)]
+    (if (cst/sym? n) (os-conj acc (cst/node-text n))
+        (let [m (nkids n)] (loop [i 0 a acc] (if (>= i m) a (recur (+ i 1) (syms-in a (kid n i)))))))))
+
+(defn- let-head? [h :string] :bool
+  (or (string=? h "let") (string=? h "let*") (string=? h "loop") (string=? h "for") (string=? h "doseq") (string=? h "when-let")
+      (string=? h "if-let") (string=? h "when-some") (string=? h "if-some") (string=? h "with-open") (string=? h "dotimes")))
+
+(defn- locals-go [acc [:ref :dv/os] n [:ref :cst/node]] [:ref :dv/os]
+  (let [t (ty n)]
+    (if (not (or (= t :list) (= t :vec) (= t :map) (= t :set) (= t :fnlit) (= t :rc) (= t :meta) (= t :prefix)))
+      acc
+      (let [a1 (if (cst/lst? n)
+                 (let [h (cst/head-text n) a0 (kid n 1)]
+                   (cond
+                     (let-head? h)
+                     (if (cst/vec? a0)
+                       (let [m (nkids a0)]
+                         (loop [k 0 a acc]
+                           (if (>= (+ k 1) m) a
+                               (let [p (kid a0 k) v (kid a0 (+ k 1))]
+                                 (recur (+ k 2)
+                                        (if (cst/kw? p)
+                                          (if (cst/vec? v) (let [vm (nkids v)] (loop [q 0 a2 a] (if (>= (+ q 1) vm) a2 (recur (+ q 2) (syms-in a2 (kid v q)))))) a)
+                                          (syms-in a p)))))))
+                       acc)
+                     (or (string=? h "fn") (string=? h "fn*"))
+                     (let [named (cst/sym? (kid n 1))
+                           a2 (if named (os-conj acc (cst/node-text (kid n 1))) acc)
+                           st (if named 2 1)]
+                       (if (cst/vec? (kid n st))
+                         (syms-in a2 (kid n st))
+                         (loop [k st a a2] (if (>= k (nkids n)) a (recur (+ k 1) (let [l (kid n k)] (if (and (cst/lst? l) (cst/vec? (kid l 0))) (syms-in a (kid l 0)) a)))))))
+                     (string=? h "catch") (if (>= (- (nkids n) 1) 2) (syms-in acc (kid n 2)) acc)
+                     (string=? h "letfn")
+                     (if (cst/vec? a0) (let [m (nkids a0)] (loop [k 0 a acc] (if (>= k m) a (recur (+ k 1) (syms-in a (kid (kid a0 k) 0)))))) acc)
+                     :else acc))
+                 acc)
+            m (nkids n)]
+        (loop [i 0 a a1] (if (>= i m) a (recur (+ i 1) (locals-go a (kid n i)))))))))
+
+(defn- locals-of [fnode [:ref :cst/node]] [:ref :dv/os]
+  (let [a (locals-go (os-new) fnode)
+        hs (pv-list fnode)
+        hn (vector-count hs)]
+    (loop [i 0 acc a] (if (>= i hn) acc (recur (+ i 1) (syms-in acc (ar-params fnode (nodes-nth hs i))))))))
+
+;; ---------------------------------------------------------------------------
+;; scanning a function
+
+(defn- sc-reads [s [:ref :dv/scan]] [:list :string] (record-get [:ref :dv/scan] s :reads))
+(defn- sc-binds [s [:ref :dv/scan]] [:list [:ref :cst/node]] (record-get [:ref :dv/scan] s :binds))
+(defn- sc-calls [s [:ref :dv/scan]] [:list [:ref :dv/call]] (record-get [:ref :dv/scan] s :calls))
+(defn- sc-refs [s [:ref :dv/scan]] [:list :string] (record-get [:ref :dv/scan] s :refs))
+(defn- sc-muts [s [:ref :dv/scan]] [:list :string] (record-get [:ref :dv/scan] s :muts))
+(defn- sc-mutops [s [:ref :dv/scan]] [:list :string] (record-get [:ref :dv/scan] s :mutops))
+(defn- sc-threadrefs [s [:ref :dv/scan]] [:list :string] (record-get [:ref :dv/scan] s :threadrefs))
+(defn- sc-shadowrefs [s [:ref :dv/scan]] [:list :string] (record-get [:ref :dv/scan] s :shadowrefs))
+(defn- sc-blockers [s [:ref :dv/scan]] [:ref :dv/os] (record-get [:ref :dv/scan] s :blockers))
+(defn- sc-locals [s [:ref :dv/scan]] [:ref :dv/os] (record-get [:ref :dv/scan] s :locals))
+
+(defn- sc [reads [:list :string] binds [:list [:ref :cst/node]] calls [:list [:ref :dv/call]] refs [:list :string]
+           muts [:list :string] mutops [:list :string] thr [:list :string] shr [:list :string] bl [:ref :dv/os] lc [:ref :dv/os]] [:ref :dv/scan]
+  (record-new [:ref :dv/scan] reads binds calls refs muts mutops thr shr bl lc))
+
+(defn- s-read [s [:ref :dv/scan] t :string] [:ref :dv/scan]
+  (sc (sconj (sc-reads s) t) (sc-binds s) (sc-calls s) (sc-refs s) (sc-muts s) (sc-mutops s) (sc-threadrefs s) (sc-shadowrefs s) (sc-blockers s) (sc-locals s)))
+(defn- s-mut [s [:ref :dv/scan] t :string op :string] [:ref :dv/scan]
+  (sc (sc-reads s) (sc-binds s) (sc-calls s) (sc-refs s) (sconj (sc-muts s) t) (sconj (sc-mutops s) op) (sc-threadrefs s) (sc-shadowrefs s) (sc-blockers s) (sc-locals s)))
+(defn- s-ref [s [:ref :dv/scan] t :string] [:ref :dv/scan]
+  (sc (sc-reads s) (sc-binds s) (sc-calls s) (sconj (sc-refs s) t) (sc-muts s) (sc-mutops s) (sc-threadrefs s) (sc-shadowrefs s) (sc-blockers s) (sc-locals s)))
+(defn- s-thr [s [:ref :dv/scan] t :string] [:ref :dv/scan]
+  (sc (sc-reads s) (sc-binds s) (sc-calls s) (sc-refs s) (sc-muts s) (sc-mutops s) (sconj (sc-threadrefs s) t) (sc-shadowrefs s) (sc-blockers s) (sc-locals s)))
+(defn- s-shr [s [:ref :dv/scan] t :string] [:ref :dv/scan]
+  (sc (sc-reads s) (sc-binds s) (sc-calls s) (sc-refs s) (sc-muts s) (sc-mutops s) (sc-threadrefs s) (sconj (sc-shadowrefs s) t) (sc-blockers s) (sc-locals s)))
+(defn- s-block [s [:ref :dv/scan] why :string] [:ref :dv/scan]
+  (sc (sc-reads s) (sc-binds s) (sc-calls s) (sc-refs s) (sc-muts s) (sc-mutops s) (sc-threadrefs s) (sc-shadowrefs s) (os-conj (sc-blockers s) why) (sc-locals s)))
+(defn- s-bind [s [:ref :dv/scan] n [:ref :cst/node]] [:ref :dv/scan]
+  (sc (sc-reads s) (typed-list-conj [:list [:ref :cst/node]] (sc-binds s) n) (sc-calls s) (sc-refs s) (sc-muts s) (sc-mutops s) (sc-threadrefs s) (sc-shadowrefs s) (sc-blockers s) (sc-locals s)))
+(defn- s-call [s [:ref :dv/scan] h :string parent [:ref :cst/node] idx :i64] [:ref :dv/scan]
+  (sc (sc-reads s) (sc-binds s) (typed-list-conj [:list [:ref :dv/call]] (sc-calls s) (record-new [:ref :dv/call] h parent idx)) (sc-refs s) (sc-muts s) (sc-mutops s) (sc-threadrefs s) (sc-shadowrefs s) (sc-blockers s) (sc-locals s)))
+
+(defn- mutator? [h :string] :bool
+  (or (string=? h "vswap!") (string=? h "vreset!") (string=? h "swap!") (string=? h "reset!") (string=? h "set!") (string=? h "deref")
+      (string=? h "alter-var-root") (string=? h "swap-vals!") (string=? h "reset-vals!")))
+
+(defn- go-kids [s [:ref :dv/scan] n [:ref :cst/node] from :i64 vars [:list [:ref :dv/var]] fns [:ref :dv/os] view :string] [:ref :dv/scan]
+  (let [m (nkids n)] (loop [i from a s] (if (>= i m) a (recur (+ i 1) (go a (kid n i) n i vars fns view))))))
+
+(defn- go [s [:ref :dv/scan] n [:ref :cst/node] parent [:ref :cst/node] idx :i64 vars [:list [:ref :dv/var]] fns [:ref :dv/os] view :string] [:ref :dv/scan]
+  (let [t (ty n)
+        locals (sc-locals s)]
+    (cond
+      (= t :rc)
+      (let [m (nkids n)]
+        (loop [k 0 a s]
+          (if (>= (+ k 1) m) a
+              (recur (+ k 2) (if (string=? (if (string=? (cst/node-text (kid n k)) ":kotoba") "kotoba" "default") view)
+                               (go a (kid n (+ k 1)) parent idx vars fns view) a)))))
+      (or (= t :str) (= t :num) (= t :kw) (= t :char) (= t :regex) (= t :nil)) s
+      (= t :sym)
+      (let [tx (cst/node-text n)]
+        (cond
+          (is-var? vars tx)
+          (let [s1 (s-read s tx)]
+            (if (and (cst/lst? parent) (mutator? (cst/head-text parent)) (= idx 1)) (s-mut s1 tx (cst/head-text parent)) s1))
+          (and (os-has? fns tx) (not (os-has? locals tx)))
+          (if (and (cst/lst? parent)
+                   (let [ph (cst/head-text parent)] (or (string=? ph "->") (string=? ph "->>") (string=? ph "some->") (string=? ph "some->>")))
+                   (>= idx 2))
+            (s-thr (s-block s "bare function symbol as a threading step") tx)
+            (if (and (cst/call-node? parent) (= idx 0)) s (s-ref s tx)))
+          (and (os-has? fns tx) (os-has? locals tx)) (s-shr (s-block s (cat "local binding shadows function " tx)) tx)
+          :else s))
+      (= t :prefix)
+      (let [p (cst/node-prefix n)]
+        (cond (or (string=? p "'") (string=? p "`")) s
+              (string=? p "@")
+              (let [k0 (kid n 0)
+                    s1 (if (and (cst/sym? k0) (is-var? vars (cst/node-text k0))) (s-mut s (cst/node-text k0) "deref") s)]
+                (go s1 k0 n 0 vars fns view))
+              (string=? p "#'") (go-kids (s-block s "var-quote #'x") n 0 vars fns view)
+              :else (go-kids s n 0 vars fns view)))
+      (or (= t :list) (= t :fnlit))
+      (let [h (cst/call-head-text n)
+            has-h (> (string-byte-length h) 0)]
+        (cond
+          (string=? h "quote") s
+          (string=? h "declare") s
+          (or (string=? h "with-redefs") (string=? h "alter-var-root") (string=? h "bound-fn") (string=? h "binding-conveyor-fn") (string=? h "var"))
+          (go-kids (s-block s h) n 0 vars fns view)
+          (string=? h "binding")
+          (let [bv (kid n 1)
+                ok (and (cst/vec? bv)
+                        (let [m (nkids bv)] (loop [k 0] (cond (>= (+ k 1) m) true
+                                                              (and (cst/sym? (kid bv k)) (is-var? vars (cst/node-text (kid bv k)))) (recur (+ k 2))
+                                                              :else false))))]
+            (if ok
+              (let [s1 (s-bind s n)
+                    m (nkids bv)
+                    s2 (loop [k 0 a s1] (if (>= (+ k 1) m) a (recur (+ k 2) (go a (kid bv (+ k 1)) bv 1 vars fns view))))]
+                ;; (rest as) with indices (+ 2 i)
+                (go-kids s2 n 2 vars fns view))
+              (go-kids (s-block s "binding of a non-module var") n 0 vars fns view)))
+          :else
+          (let [s1 (if (and has-h (os-has? fns h))
+                     (if (os-has? locals h)
+                       (s-shr (s-block s (cat "local binding shadows function " h)) h)
+                       (s-call s h parent idx))
+                     s)]
+            (go-kids s1 n 0 vars fns view))))
+      :else (go-kids s n 0 vars fns view))))
+
+(defn- scan-fn [src :string fnode [:ref :cst/node] view :string vars [:list [:ref :dv/var]] fns [:ref :dv/os]] [:ref :dv/scan]
+  (let [s0 (sc (strs) (typed-list-new [:list [:ref :cst/node]]) (typed-list-new [:list [:ref :dv/call]]) (strs) (strs) (strs) (strs) (strs)
+               (os-new) (locals-of fnode))
+        hs (pv-list fnode)
+        hn (vector-count hs)]
+    (loop [i 0 s s0]
+      (if (>= i hn) s
+          (let [h (nodes-nth hs i)
+                st (ar-body-start fnode h)
+                m (nkids h)]
+            (recur (+ i 1) (loop [k st a s] (if (>= k m) a (recur (+ k 1) (go a (kid h k) fnode 99 vars fns view))))))))))
+
+;; ---------------------------------------------------------------------------
+;; analysis
+
+(defn- fn-n [f [:ref :dv/fn]] :string (record-get [:ref :dv/fn] f :name))
+(defn- fn-node [f [:ref :dv/fn]] [:ref :cst/node] (record-get [:ref :dv/fn] f :node))
+(defn- fn-arm [f [:ref :dv/fn]] :string (record-get [:ref :dv/fn] f :arm))
+(defn- fn-private? [f [:ref :dv/fn]] :bool (record-get [:ref :dv/fn] f :private))
+(defn- fns-at [xs [:list [:ref :dv/fn]] i :i64] [:ref :dv/fn] (typed-list-nth [:list [:ref :dv/fn]] xs i))
+
+;; top forms: (node, arm) with arm "" plain, "kotoba", "default"
+(defn- tops-of [nodes [:list [:ref :cst/node]]] [:list [:ref :dv/fn]]
+  (let [m (vector-count nodes)]
+    (loop [i 0 acc (typed-list-new [:list [:ref :dv/fn]])]
+      (if (>= i m) acc
+          (let [n (nodes-nth nodes i)]
+            (recur (+ i 1)
+                   (if (= :rc (ty n))
+                     (let [bs (cst/rc-branches n) bm (vector-count bs)]
+                       (loop [k 0 a acc]
+                         (if (>= k bm) a
+                             (let [b (typed-list-nth [:list [:ref :cst/branch]] bs k)]
+                               (recur (+ k 1) (typed-list-conj [:list [:ref :dv/fn]] a
+                                                               (record-new [:ref :dv/fn] "" (cst/branch-form b) (if (string=? (cst/branch-key b) ":kotoba") "kotoba" "default") false)))))))
+                     (typed-list-conj [:list [:ref :dv/fn]] acc (record-new [:ref :dv/fn] "" n "" false)))))))))
+
+(defn- exports-of [nodes [:list [:ref :cst/node]]] [:list :string]
+  (let [m (vector-count nodes)
+        nsn (loop [i 0] (cond (>= i m) (cst/nil-node) (cst/call? (nodes-nth nodes i) "ns") (nodes-nth nodes i) :else (recur (+ i 1))))
+        mm (let [k (nkids nsn)] (loop [i 0] (cond (>= i k) (cst/nil-node) (cst/map? (kid nsn i)) (kid nsn i) :else (recur (+ i 1)))))
+        km (nkids mm)]
+    (loop [i 0 acc (strs)]
+      (if (>= (+ i 1) km) acc
+          (recur (+ i 2) (if (cst/kw-named? (kid mm i) ":kotoba/export")
+                           (let [v (kid mm (+ i 1))] (loop [j 0 a acc] (if (>= j (nkids v)) a (recur (+ j 1) (sconj a (cst/node-text (kid v j)))))))
+                           acc))))))
+
+(defn- scan-of [a-scans [:list [:ref :dv/scan]] shared [:list [:ref :dv/fn]] nm :string] [:ref :dv/scan]
+  (let [n (vector-count shared)]
+    (typed-list-nth [:list [:ref :dv/scan]] a-scans (loop [i 0] (if (string=? (fn-n (fns-at shared i)) nm) i (recur (+ i 1)))))))
+(defn- shared-at [shared [:list [:ref :dv/fn]] nm :string] :i64
+  (let [n (vector-count shared)] (loop [i 0] (cond (>= i n) -1 (string=? (fn-n (fns-at shared i)) nm) i :else (recur (+ i 1))))))
+
+;; a set of the call names and refs of a scan, in order
+(defn- callees [s [:ref :dv/scan]] [:list :string]
+  (let [cs (sc-calls s) n (vector-count cs)
+        a (loop [i 0 acc (strs)] (if (>= i n) acc (recur (+ i 1) (sconj acc (record-get [:ref :dv/call] (typed-list-nth [:list [:ref :dv/call]] cs i) :name)))))
+        rs (sc-refs s)]
+    (loop [i 0 acc a] (if (>= i (vector-count rs)) acc (recur (+ i 1) (sconj acc (snth rs i)))))))
+
+(defn- analyze [src :string nodes [:list [:ref :cst/node]] target :string observable [:list :string]] [:ref :dv/a]
+  (let [view (if (string=? target "host-env") "default" "kotoba")
+        exported (exports-of nodes)
+        tops (tops-of nodes)
+        tn (vector-count tops)
+        ;; vars: ^:dynamic defs outside :kotoba arms (a later def of a name replaces it in place)
+        vars (loop [i 0 acc (typed-list-new [:list [:ref :dv/var]])]
+               (if (>= i tn) acc
+                   (let [t (fns-at tops i) n (fn-node t)]
+                     (recur (+ i 1)
+                            (if (and (not (string=? (fn-arm t) "kotoba")) (cst/call? n "def") (member? (meta-texts (kid n 1)) ":dynamic"))
+                              (let [nm (cst/node-text (cst/strip-meta (kid n 1)))
+                                    at (var-at acc nm)
+                                    v (field-of nm)]
+                                (if (< at 0)
+                                  (typed-list-conj [:list [:ref :dv/var]] acc v)
+                                  (loop [j 0 b (typed-list-new [:list [:ref :dv/var]])] (if (>= j (vector-count acc)) b (recur (+ j 1) (typed-list-conj [:list [:ref :dv/var]] b (if (= j at) v (typed-list-nth [:list [:ref :dv/var]] acc j))))))))
+                              acc)))))
+        ;; defn entries (name, node, arm, private) in order
+        entries (loop [i 0 acc (typed-list-new [:list [:ref :dv/fn]])]
+                  (if (>= i tn) acc
+                      (let [t (fns-at tops i) n (fn-node t)]
+                        (recur (+ i 1)
+                               (if (or (cst/call? n "defn") (cst/call? n "defn-"))
+                                 (let [nm (fn-name n)]
+                                   (if (> (string-byte-length nm) 0)
+                                     (typed-list-conj [:list [:ref :dv/fn]] acc
+                                                      (record-new [:ref :dv/fn] nm n (fn-arm t) (or (cst/call? n "defn-") (member? (meta-texts (kid n 1)) ":private"))))
+                                     acc))
+                                 acc)))))
+        en (vector-count entries)
+        ;; shared: into {} (first position kept, the last value wins); hashed past 8 keys
+        shared (loop [i 0 acc (typed-list-new [:list [:ref :dv/fn]])]
+                 (if (>= i en) acc
+                     (let [f (fns-at entries i)]
+                       (recur (+ i 1)
+                              (if (or (string=? (fn-arm f) "") (and (string=? target "host-env") (string=? (fn-arm f) "default")))
+                                (let [at (shared-at acc (fn-n f))]
+                                  (if (< at 0)
+                                    (typed-list-conj [:list [:ref :dv/fn]] acc f)
+                                    (loop [j 0 b (typed-list-new [:list [:ref :dv/fn]])] (if (>= j (vector-count acc)) b (recur (+ j 1) (typed-list-conj [:list [:ref :dv/fn]] b (if (= j at) f (fns-at acc j))))))))
+                                acc)))))
+        sn (vector-count shared)
+        shared-hashed (> sn 8)
+        ;; ported-env (dual): hand-ported :kotoba defns that take the :fe/env record first
+        ported (if (string=? target "dual")
+                 (loop [i 0 acc (os-new)]
+                   (if (>= i en) acc
+                       (let [f (fns-at entries i)]
+                         (recur (+ i 1)
+                                (if (and (string=? (fn-arm f) "kotoba")
+                                         (let [hs (pv-list (fn-node f)) hn (vector-count hs)]
+                                           (loop [k 0] (cond (>= k hn) false
+                                                             (let [pv (ar-params (fn-node f) (nodes-nth hs k))]
+                                                               (and (>= (nkids pv) 2) (cst/sym-named? (kid pv 0) "env") (includes? (txt src (kid pv 1)) ":fe/env")))
+                                                             true
+                                                             :else (recur (+ k 1))))))
+                                  (os-conj acc (fn-n f)) acc)))))
+                 (os-new))
+        ;; shared in its iteration order
+        sord (ord/map-order-strs (loop [i 0 acc (strs)] (if (>= i sn) acc (recur (+ i 1) (sconj acc (fn-n (fns-at shared i)))))) shared-hashed)
+        fns (let [a (loop [i 0 s (os-new)] (if (>= i sn) s (recur (+ i 1) (os-conj s (fn-n (fns-at shared (vector-at sord i)))))))]
+              (let [pi (os-items ported)] (loop [i 0 s a] (if (>= i (vector-count pi)) s (recur (+ i 1) (os-conj s (snth pi i)))))))
+        scans (loop [i 0 acc (typed-list-new [:list [:ref :dv/scan]])]
+                (if (>= i sn) acc (recur (+ i 1) (typed-list-conj [:list [:ref :dv/scan]] acc (scan-fn src (fn-node (fns-at shared i)) view vars fns)))))
+        ;; direct: scans (iteration order) that read or bind, then ported
+        direct (let [a (loop [i 0 s (os-new)]
+                         (if (>= i sn) s
+                             (let [k (vector-at sord i) sc1 (typed-list-nth [:list [:ref :dv/scan]] scans k)]
+                               (recur (+ i 1) (if (or (> (vector-count (sc-reads sc1)) 0) (> (vector-count (sc-binds sc1)) 0)) (os-conj s (fn-n (fns-at shared k))) s)))))]
+                 (let [pi (os-items ported)] (loop [i 0 s a] (if (>= i (vector-count pi)) s (recur (+ i 1) (os-conj s (snth pi i)))))))
+        ;; callers: callee -> set of callers (scans iteration order)
+        callee-names (loop [i 0 cn (strs) cs (typed-list-new [:list [:ref :dv/os]])]
+                       (if (>= i sn) (record-new [:ref :dv/a] "" "" (typed-list-new [:list [:ref :dv/var]]) (typed-list-new [:list [:ref :dv/fn]]) false (typed-list-new [:list [:ref :dv/scan]]) (os-new) (os-new) cn cs false)
+                           (let [k (vector-at sord i) nm (fn-n (fns-at shared k)) ce (callees (typed-list-nth [:list [:ref :dv/scan]] scans k))
+                                 r (loop [j 0 cn2 cn cs2 cs]
+                                     (if (>= j (vector-count ce)) (record-new [:ref :dv/a] "" "" (typed-list-new [:list [:ref :dv/var]]) (typed-list-new [:list [:ref :dv/fn]]) false (typed-list-new [:list [:ref :dv/scan]]) (os-new) (os-new) cn2 cs2 false)
+                                         (let [c (snth ce j) at (loop [q 0] (cond (>= q (vector-count cn2)) -1 (string=? (snth cn2 q) c) q :else (recur (+ q 1))))]
+                                           (if (< at 0)
+                                             (recur (+ j 1) (sconj cn2 c) (typed-list-conj [:list [:ref :dv/os]] cs2 (os-conj (os-new) nm)))
+                                             (recur (+ j 1) cn2 (loop [q 0 b (typed-list-new [:list [:ref :dv/os]])] (if (>= q (vector-count cs2)) b (recur (+ q 1) (typed-list-conj [:list [:ref :dv/os]] b (if (= q at) (os-conj (typed-list-nth [:list [:ref :dv/os]] cs2 q) nm) (typed-list-nth [:list [:ref :dv/os]] cs2 q)))))))))))]
+                             (recur (+ i 1) (record-get [:ref :dv/a] r :blocked-names) (record-get [:ref :dv/a] r :blocked-sets)))))
+        cnames (record-get [:ref :dv/a] callee-names :blocked-names)
+        csets (record-get [:ref :dv/a] callee-names :blocked-sets)
+        ;; C: the closure of direct under callers
+        C (loop [c direct]
+            (let [items (os-items c)
+                  c2 (loop [i 0 acc c]
+                       (if (>= i (vector-count items)) acc
+                           (let [at (loop [q 0] (cond (>= q (vector-count cnames)) -1 (string=? (snth cnames q) (snth items i)) q :else (recur (+ q 1))))]
+                             (recur (+ i 1) (if (< at 0) acc (let [cl (os-items (typed-list-nth [:list [:ref :dv/os]] csets at))] (loop [j 0 a acc] (if (>= j (vector-count cl)) a (recur (+ j 1) (os-conj a (snth cl j)))))))))))]
+              (if (= (os-count c2) (os-count c)) c (recur c2))))
+        thread-refs (loop [i 0 acc (strs)] (if (>= i sn) acc (recur (+ i 1) (let [t (sc-threadrefs (typed-list-nth [:list [:ref :dv/scan]] scans i))] (loop [j 0 a acc] (if (>= j (vector-count t)) a (recur (+ j 1) (sconj a (snth t j)))))))))
+        shadow-refs (loop [i 0 acc (strs)] (if (>= i sn) acc (recur (+ i 1) (let [t (sc-shadowrefs (typed-list-nth [:list [:ref :dv/scan]] scans i))] (loop [j 0 a acc] (if (>= j (vector-count t)) a (recur (+ j 1) (sconj a (snth t j)))))))))
+        citems (os-items C)
+        cn (vector-count citems)
+        ;; blocked0: C order, names with blockers
+        b0 (loop [i 0 bn (strs) bs (typed-list-new [:list [:ref :dv/os]])]
+             (if (>= i cn) (record-new [:ref :dv/a] "" "" (typed-list-new [:list [:ref :dv/var]]) (typed-list-new [:list [:ref :dv/fn]]) false (typed-list-new [:list [:ref :dv/scan]]) (os-new) (os-new) bn bs false)
+                 (let [nm (snth citems i) k (shared-at shared nm)]
+                   (if (< k 0)
+                     (recur (+ i 1) bn bs)
+                     (let [b (blockers src target (fns-at shared k) (typed-list-nth [:list [:ref :dv/scan]] scans k) vars C thread-refs shadow-refs observable)]
+                       (if (> (os-count b) 0) (recur (+ i 1) (sconj bn nm) (typed-list-conj [:list [:ref :dv/os]] bs b)) (recur (+ i 1) bn bs)))))))
+        b0n (record-get [:ref :dv/a] b0 :blocked-names)
+        b0s (record-get [:ref :dv/a] b0 :blocked-sets)
+        ;; E: the unblocked members of C closed under callees in C
+        E (loop [e (let [a (loop [i 0 s (os-new)] (if (>= i cn) s (recur (+ i 1) (if (member? b0n (snth citems i)) s (os-conj s (snth citems i))))))] a)]
+            (let [ei (os-xs e)
+                  bad (loop [i 0 acc (strs)]
+                        (if (>= i (vector-count ei)) acc
+                            (let [nm (snth ei i) k (shared-at shared nm)
+                                  ce (if (< k 0) (strs) (callees (typed-list-nth [:list [:ref :dv/scan]] scans k)))
+                                  isbad (loop [j 0] (cond (>= j (vector-count ce)) false (and (os-has? C (snth ce j)) (not (os-has? e (snth ce j)))) true :else (recur (+ j 1))))]
+                              (recur (+ i 1) (if isbad (sconj acc nm) acc)))))]
+              (if (= (vector-count bad) 0)
+                e
+                (recur (let [xs (os-xs e)] (loop [i 0 s (record-new [:ref :dv/os] (strs) (ord/tab-new) (record-get [:ref :dv/os] e :hashed))]
+                                             (if (>= i (vector-count xs)) s (recur (+ i 1) (if (member? bad (snth xs i)) s (os-conj s (snth xs i)))))))))))
+        ;; propagated (C order), then blocked0 merged
+        prop (loop [i 0 acc (strs)]
+               (if (>= i cn) acc
+                   (let [nm (snth citems i)]
+                     (recur (+ i 1) (if (and (>= (shared-at shared nm) 0) (not (os-has? E nm)) (not (member? b0n nm))) (sconj acc nm) acc)))))
+        bnames (loop [i 0 acc prop] (if (>= i (vector-count b0n)) acc (recur (+ i 1) (sconj acc (snth b0n i)))))
+        bsets (loop [i 0 acc (loop [i2 0 a (typed-list-new [:list [:ref :dv/os]])] (if (>= i2 (vector-count prop)) a (recur (+ i2 1) (typed-list-conj [:list [:ref :dv/os]] a (os-conj (os-new) "calls a blocked function in C")))))]
+                (if (>= i (vector-count b0s)) acc (recur (+ i 1) (typed-list-conj [:list [:ref :dv/os]] acc (typed-list-nth [:list [:ref :dv/os]] b0s i)))))]
+    (record-new [:ref :dv/a] target view vars shared shared-hashed scans C E bnames bsets (> (vector-count bnames) 8))))
+
+
+(defn- thread-first? [h :string] :bool (or (string=? h "->") (string=? h "some->") (string=? h "cond->")))
+
+(defn- blockers [src :string target :string f [:ref :dv/fn] s [:ref :dv/scan] vars [:list [:ref :dv/var]] C [:ref :dv/os]
+                 thread-refs [:list :string] shadow-refs [:list :string] observable [:list :string]] [:ref :dv/os]
+  (let [nm (fn-n f)
+        text (txt src (fn-node f))
+        dual (string=? target "dual")
+        host (string=? target "host-env")
+        b1 (let [bi (os-items (sc-blockers s))] (loop [i 0 a (os-new)] (if (>= i (vector-count bi)) a (recur (+ i 1) (os-conj a (snth bi i))))))
+        b2 (if (includes? text "fenv") (os-conj b1 "a local/param already named fenv") b1)
+        b3 (if (member? thread-refs nm) (os-conj b2 "used as a bare threading step ((->> x f))") b2)
+        b4 (if (member? shadow-refs nm) (os-conj b3 "referenced where a local binding shadows its name (ambiguous)") b3)
+        b5 (if (and dual (> (vector-count (sc-muts s)) 0)) (os-conj b4 "var mutated through a ref (counter/registry: needs result threading)") b4)
+        b6 (if (member? (sc-mutops s) "set!") (os-conj b5 "set! of a dynamic var") b5)
+        b7 (if (and dual (let [rs (sc-refs s)] (loop [i 0] (cond (>= i (vector-count rs)) false (os-has? C (snth rs i)) true :else (recur (+ i 1))))))
+             (os-conj b6 "rewritable function used as a value") b6)
+        b8 (if (let [cs (sc-calls s)]
+                 (loop [i 0] (cond (>= i (vector-count cs)) false
+                                   (let [c (typed-list-nth [:list [:ref :dv/call]] cs i)
+                                         p (record-get [:ref :dv/call] c :parent)]
+                                     (and (os-has? C (record-get [:ref :dv/call] c :name)) (cst/lst? p) (thread-first? (cst/head-text p))
+                                          (not (= 1 (record-get [:ref :dv/call] c :idx)))))
+                                   true
+                                   :else (recur (+ i 1)))))
+             (os-conj b7 "call in thread-first position") b7)
+        b9 (if (and dual (let [rs (sc-reads s)] (loop [i 0] (cond (>= i (vector-count rs)) false (> (string-byte-length (v-repr (var-of vars (snth rs i)))) 0) true :else (recur (+ i 1))))))
+             (os-conj b8 "var whose env field has a different representation") b8)
+        b10 (if (and host (not (fn-private? f))) (os-conj b9 "public function (signature observable)") b9)
+        b11 (if (and host (member? observable nm)) (os-conj b10 "named by a test/other module (#'ns/f or alias/f)") b10)]
+    b11))
+
+;; ---------------------------------------------------------------------------
+;; rendering
+
+(defn- read-text [target :string vars [:list [:ref :dv/var]] nm :string] :string
+  (let [f (v-field (var-of vars nm))]
+    (if (string=? target "host-env") (pieces (typed-list-new [:list :string] "(:" f " fenv)")) (pieces (typed-list-new [:list :string] "(env-" f " fenv)")))))
+
+(defn- with-text [target :string vars [:list [:ref :dv/var]] nm :string envx :string valx :string] :string
+  (let [f (v-field (var-of vars nm))]
+    (if (string=? target "host-env")
+      (pieces (typed-list-new [:list :string] "(assoc " envx " :" f " " valx ")"))
+      (pieces (typed-list-new [:list :string] "(with-" f " " envx " " valx ")")))))
+
+;; the rewrite context
+(defn- rx [a [:ref :dv/a] src :string locals [:ref :dv/os] envarg :string pvs :vector-i64 in-e :bool] [:ref :dv/rx]
+  (record-new [:ref :dv/rx] a src locals envarg pvs in-e))
+(defn- rx-a [r [:ref :dv/rx]] [:ref :dv/a] (record-get [:ref :dv/rx] r :a))
+(defn- rx-src [r [:ref :dv/rx]] :string (record-get [:ref :dv/rx] r :src))
+(defn- rx-locals [r [:ref :dv/rx]] [:ref :dv/os] (record-get [:ref :dv/rx] r :locals))
+(defn- rx-envarg [r [:ref :dv/rx]] :string (record-get [:ref :dv/rx] r :envarg))
+(defn- rx-pvs [r [:ref :dv/rx]] :vector-i64 (record-get [:ref :dv/rx] r :pvs))
+(defn- rx-in-e [r [:ref :dv/rx]] :bool (record-get [:ref :dv/rx] r :in-e))
+(defn- a-target [a [:ref :dv/a]] :string (record-get [:ref :dv/a] a :target))
+(defn- a-view [a [:ref :dv/a]] :string (record-get [:ref :dv/a] a :view))
+(defn- a-vars [a [:ref :dv/a]] [:list [:ref :dv/var]] (record-get [:ref :dv/a] a :vars))
+(defn- a-e [a [:ref :dv/a]] [:ref :dv/os] (record-get [:ref :dv/a] a :e))
+
+(defn- all-var-pairs? [vars [:list [:ref :dv/var]] bv [:ref :cst/node]] :bool
+  (let [m (nkids bv)] (loop [k 0] (cond (>= (+ k 1) m) true (and (cst/sym? (kid bv k)) (is-var? vars (cst/node-text (kid bv k)))) (recur (+ k 2)) :else false))))
+
+;; the substitution: "" with ok false = copy
+(defn- subst [r [:ref :dv/rx] n [:ref :cst/node]] [:ref :dv/sub]
+  (let [a (rx-a r) vars (a-vars a) target (a-target a) src (rx-src r) t (ty n) none (record-new [:ref :dv/sub] false "")]
+    (cond
+      (= t :sym)
+      (let [tx (cst/node-text n)]
+        (cond (and (rx-in-e r) (is-var? vars tx)) (record-new [:ref :dv/sub] true (read-text target vars tx))
+              (and (os-has? (a-e a) tx) (not (os-has? (rx-locals r) tx)) (string=? target "host-env"))
+              (record-new [:ref :dv/sub] true (pieces (typed-list-new [:list :string] "(partial " tx " " (rx-envarg r) ")")))
+              :else none))
+      (= t :vec)
+      (if (and (rx-in-e r) (let [pv (rx-pvs r)] (loop [i 0] (cond (>= i (vector-count pv)) false (= (vector-at pv i) (cst/node-s n)) true :else (recur (+ i 1))))))
+        (record-new [:ref :dv/sub] true (cat "[fenv" (cat (if (> (nkids n) 0) " " "") (string-substring src (+ (cst/node-s n) 1) (cst/node-e n)))))
+        none)
+      (or (= t :list) (= t :fnlit))
+      (let [h (cst/call-head-text n)]
+        (cond
+          (string=? h "binding")
+          (let [bv (kid n 1)]
+            (if (and (rx-in-e r) (cst/vec? bv) (all-var-pairs? vars bv))
+              (record-new [:ref :dv/sub] true (binding-subst r n))
+              none))
+          (and (> (string-byte-length h) 0) (os-has? (a-e a) h) (not (os-has? (rx-locals r) h)))
+          (record-new [:ref :dv/sub] true (call-subst r n))
+          :else none))
+      :else none)))
+
+(defn- rk [r [:ref :dv/rx] k [:ref :cst/node]] :string
+  (let [s (subst r k)] (if (record-get [:ref :dv/sub] s :ok) (record-get [:ref :dv/sub] s :text) (copy r k))))
+
+(defn- copy [r [:ref :dv/rx] k [:ref :cst/node]] :string
+  (let [src (rx-src r) m (nkids k) view (a-view (rx-a r))]
+    (if (= m 0)
+      (txt src k)
+      (loop [i 0 pos (cst/node-s k) out ""]
+        (if (>= i m)
+          (cat out (string-substring src pos (cst/node-e k)))
+          (let [c (kid k i)
+                piece (cond (and (= :rc (ty k)) (= (bit-and i 1) 1))
+                            (let [arm (if (string=? (cst/node-text (kid k (- i 1))) ":kotoba") "kotoba" "default")]
+                              (if (string=? arm view) (rk r c) (txt src c)))
+                            (= :rc (ty k)) (txt src c)
+                            :else (rk r c))]
+            (recur (+ i 1) (cst/node-e c) (cat out (cat (string-substring src pos (cst/node-s c)) piece)))))))))
+
+(defn- binding-subst [r [:ref :dv/rx] n [:ref :cst/node]] :string
+  (let [src (rx-src r) a (rx-a r) vars (a-vars a) target (a-target a)
+        bv (kid n 1) bm (nkids bv)
+        new (loop [k 0 acc "fenv"] (if (>= (+ k 1) bm) acc (recur (+ k 2) (with-text target vars (cst/node-text (kid bv k)) acc (rk r (kid bv (+ k 1)))))))
+        m (nkids n)
+        body (loop [i 2 prev bv out ""] (if (>= i m) out (let [k (kid n i)] (recur (+ i 1) k (cat out (cat (string-substring src (cst/node-e prev) (cst/node-s k)) (rk r k)))))))]
+    (cat (cat "(let [fenv " (cat new "]")) (cat body (string-substring src (cst/node-e (kid n (- m 1))) (cst/node-e n))))))
+
+(defn- call-subst [r [:ref :dv/rx] n [:ref :cst/node]] :string
+  (let [src (rx-src r) h (kid n 0) m (nkids n)
+        rest (loop [i 1 prev h out ""] (if (>= i m) out (let [k (kid n i)] (recur (+ i 1) k (cat out (cat (string-substring src (cst/node-e prev) (cst/node-s k)) (rk r k)))))))]
+    (pieces (typed-list-new [:list :string] (string-substring src (cst/node-s n) (cst/node-s h)) (txt src h) " " (rx-envarg r)
+                            rest (string-substring src (cst/node-e (kid n (- m 1))) (cst/node-e n))))))
+
+(defn- rewrite-defn [a [:ref :dv/a] src :string fnode [:ref :cst/node] locals [:ref :dv/os] in-e :bool] :string
+  (let [hs (pv-list fnode)
+        pvs (loop [i 0 acc (vector-alloc 0)] (if (>= i (vector-count hs)) acc (recur (+ i 1) (vector-conj acc (cst/node-s (ar-params fnode (nodes-nth hs i)))))))
+        r (rx a src locals (if in-e "fenv" "(fe-current-env)") pvs in-e)
+        m (nkids fnode)
+        st (loop [k 2] (cond (>= k m) m (or (cst/vec? (kid fnode k)) (cst/lst? (kid fnode k))) k :else (recur (+ k 1))))
+        multi (cst/lst? (kid fnode st))
+        pre (string-substring src (cst/node-s fnode) (cst/node-s (kid fnode st)))
+        parts (loop [i st out ""]
+                (if (>= i m) out
+                    (let [k (kid fnode i)
+                          gap (if (= i st) "" (string-substring src (cst/node-e (kid fnode (- i 1))) (cst/node-s k)))
+                          body (if (and multi (cst/lst? k))
+                                 (let [km (nkids k)
+                                       inner (loop [j 1 prev (kid k 0) o ""] (if (>= j km) o (let [c (kid k j)] (recur (+ j 1) c (cat o (cat (string-substring src (cst/node-e prev) (cst/node-s c)) (rk r c)))))))]
+                                   (pieces (typed-list-new [:list :string] (string-substring src (cst/node-s k) (cst/node-s (kid k 0))) (rk r (kid k 0)) inner
+                                                           (string-substring src (cst/node-e (kid k (- km 1))) (cst/node-e k)))))
+                                 (rk r k))]
+                      (recur (+ i 1) (cat out (cat gap body))))))]
+    (cat pre (cat parts (string-substring src (cst/node-e (kid fnode (- m 1))) (cst/node-e fnode))))))
+
+;; ---------------------------------------------------------------------------
+;; findings
+
+(defn- region-of [f [:ref :dv/fn]] :keyword (if (string=? (fn-arm f) "") :shared :default))
+
+(defn- count-occ [rows [:list [:ref :finding/row]] a :string b :string] [:list [:ref :finding/row]]
+  (let [m (fd/rows-count rows)
+        at (loop [k 0] (cond (>= k m) -1 (and (string=? (fd/row-a (fd/rows-nth rows k)) a) (string=? (fd/row-b (fd/rows-nth rows k)) b)) k :else (recur (+ k 1))))]
+    (if (< at 0)
+      (fd/rows-conj rows (fd/row a b 1))
+      (loop [k 0 acc (fd/rows-new)] (if (>= k m) acc (recur (+ k 1) (fd/rows-conj acc (if (= k at) (fd/row a b (+ 1 (fd/row-n (fd/rows-nth rows k)))) (fd/rows-nth rows k)))))))))
+
+(defn- has-current-env? [src :string] :bool
+  (or (includes? src "(defn fe-current-env") (includes? src "(defn- fe-current-env")))
+
+;; the inventory as rows: ("occ" name region n), ("var" name field|repr|new reads binds muts as "f\tR\tN"), ("count"
+;; key "" n) for shared-fns C E, ("reason" text "" n) in printed order, ("new-field" f "" 0), ("entry" nm "" 0)
+(defn find-all [src :string nodes [:list [:ref :cst/node]] target :string observable [:list :string]] [:list [:ref :finding/f]]
+  (let [a (analyze src nodes target observable)
+        vars (a-vars a)
+        shared (record-get [:ref :dv/a] a :shared)
+        sn (vector-count shared)
+        scans (record-get [:ref :dv/a] a :scans)
+        C (record-get [:ref :dv/a] a :c)
+        E (a-e a)
+        starts (edit/line-starts src)
+        host (string=? target "host-env")
+        bnames (record-get [:ref :dv/a] a :blocked-names)
+        bsets (record-get [:ref :dv/a] a :blocked-sets)
+        sord (ord/map-order-strs (loop [i 0 acc (strs)] (if (>= i sn) acc (recur (+ i 1) (sconj acc (fn-n (fns-at shared i)))))) (record-get [:ref :dv/a] a :shared-hashed))
+        ;; per-function findings, shared order, members of C
+        out1 (loop [i 0 out (fd/fs-new)]
+               (if (>= i sn) out
+                   (let [k (vector-at sord i) f (fns-at shared k) nm (fn-n f) node (fn-node f)]
+                     (if (not (os-has? C nm))
+                       (recur (+ i 1) out)
+                       (let [ln (edit/offset->line starts (cst/node-s node))]
+                         (recur (+ i 1)
+                                (fd/fs-conj out
+                                            (if (os-has? E nm)
+                                              (let [new (rewrite-defn a src node (sc-locals (typed-list-nth [:list [:ref :dv/scan]] scans k)) true)
+                                                    text (if host new (pieces (typed-list-new [:list :string] "#?(:kotoba " new "\n   :default " (txt src node) ")")))]
+                                                (fd/auto "dynvars" (cst/node-s node) (cst/node-e node) (region-of f) ln target "fn" true
+                                                         (edit/edits-conj (edit/edits-new) (edit/replace-node node text "dynvars"))))
+                                              (let [bi (loop [q 0] (if (string=? (snth bnames q) nm) q (recur (+ q 1))))
+                                                    reasons (ord/sort-strs (os-xs (typed-list-nth [:list [:ref :dv/os]] bsets bi)))]
+                                                (fd/human "dynvars" (cst/node-s node) (cst/node-e node) (region-of f) ln target (join reasons "; ") "fn" true))))))))))
+        ;; host-env: non-E functions that call or reference an E function (scans order; a set -> its order)
+        touched (if host
+                  (loop [i 0 s (os-new)]
+                    (if (>= i sn) s
+                        (let [k (vector-at sord i) nm (fn-n (fns-at shared k)) sc1 (typed-list-nth [:list [:ref :dv/scan]] scans k)
+                              hit (and (not (os-has? E nm))
+                                       (let [ce (callees sc1)] (loop [j 0] (cond (>= j (vector-count ce)) false (os-has? E (snth ce j)) true :else (recur (+ j 1))))))]
+                          (recur (+ i 1) (if hit (os-conj s nm) s)))))
+                  (os-new))
+        ti (os-items touched)
+        out2 (loop [i 0 out out1]
+               (if (>= i (vector-count ti)) out
+                   (let [nm (snth ti i) k (shared-at shared nm) f (fns-at shared k) node (fn-node f)]
+                     (recur (+ i 1)
+                            (fd/fs-conj out (fd/auto "dynvars" (cst/node-s node) (cst/node-e node) (region-of f) (edit/offset->line starts (cst/node-s node))
+                                                     "host-env entry call sites" "entry" true
+                                                     (edit/edits-conj (edit/edits-new)
+                                                                      (edit/replace-node node (rewrite-defn (with-view a "default") src node (sc-locals (typed-list-nth [:list [:ref :dv/scan]] scans k)) false) "dynvars"))))))))
+        out3 (if (and host (> (os-count E) 0) (not (has-current-env? src)))
+               (let [m (vector-count nodes)
+                     nsn (loop [i 0] (cond (>= i m) (cst/nil-node) (cst/call? (nodes-nth nodes i) "ns") (nodes-nth nodes i) :else (recur (+ i 1))))
+                     ;; used-vars: reads of E functions; bound-vars: binding targets of E functions
+                     ei (os-xs E)
+                     allv (loop [i 0 acc (strs)]
+                            (if (>= i (vector-count ei)) acc
+                                (let [k (shared-at shared (snth ei i))
+                                      sc1 (if (< k 0) (typed-list-nth [:list [:ref :dv/scan]] scans 0) (typed-list-nth [:list [:ref :dv/scan]] scans k))
+                                      rs (if (< k 0) (strs) (sc-reads sc1))
+                                      a1 (loop [j 0 a2 acc] (if (>= j (vector-count rs)) a2 (recur (+ j 1) (if (member? a2 (snth rs j)) a2 (sconj a2 (snth rs j))))))
+                                      bs (if (< k 0) (typed-list-new [:list [:ref :cst/node]]) (sc-binds sc1))]
+                                  (recur (+ i 1)
+                                         (loop [j 0 a2 a1]
+                                           (if (>= j (vector-count bs)) a2
+                                               (recur (+ j 1) (let [bv (kid (nodes-nth bs j) 1)]
+                                                                (loop [q 0 a3 a2] (if (>= (+ q 1) (nkids bv)) a3 (recur (+ q 2) (let [x (cst/node-text (kid bv q))] (if (member? a3 x) a3 (sconj a3 x))))))))))))))
+                     sorted (ord/sort-strs allv)
+                     body (pieces (typed-list-new [:list :string] "\n\n(defn- fe-current-env\n  \"amu-refactor: the dynamic state as an explicit env map (host-env target).\"\n  []\n  {"
+                                                  (join (loop [i 0 acc (strs)] (if (>= i (vector-count sorted)) acc (recur (+ i 1) (sconj acc (cat ":" (cat (v-field (var-of vars (snth sorted i))) (cat " " (snth sorted i)))))))) "\n   ")
+                                                  "})\n"))]
+                 (fd/fs-conj out2 (fd/mk "dynvars" (cst/node-e nsn) (cst/node-e nsn) :shared "auto" 0 "" "" "prelude" true
+                                         (edit/edits-conj (edit/edits-conj (edit/edits-new) (edit/insert-at (cst/node-e nsn) "\n\n(declare fe-current-env)" "dynvars" 5))
+                                                          (edit/insert-at (string-byte-length src) body "dynvars" 5))
+                                         (fd/rows-new))))
+               out2)
+        ;; occurrences over the whole file by region
+        vs (cst/walk-visits nodes)
+        occ (loop [i 0 rows (fd/rows-new)]
+              (if (>= i (vector-count vs)) rows
+                  (let [v (typed-list-nth [:list [:ref :cst/visit]] vs i) n (cst/visit-node v) rg (keyword-name (cst/visit-region v))]
+                    (recur (+ i 1)
+                           (cond (and (cst/sym? n) (is-var? vars (cst/node-text n))) (count-occ rows (cst/node-text n) rg)
+                                 (and (cst/lst? n) (string=? "binding" (cst/head-text n))) (count-occ rows "(binding ...)" rg)
+                                 :else rows)))))
+        ;; a target other than dual/host-env: the host's read-text/with-text `case` throws (an internal error) as soon as
+        ;; an E function reads or binds a var; the caller reports it
+        crash (and (not host) (not (string=? target "dual"))
+                   (let [ei (os-xs E)]
+                     (loop [i 0] (cond (>= i (vector-count ei)) false
+                                       (let [k (shared-at shared (snth ei i))]
+                                         (and (>= k 0) (let [s1 (typed-list-nth [:list [:ref :dv/scan]] scans k)] (or (> (vector-count (sc-reads s1)) 0) (> (vector-count (sc-binds s1)) 0)))))
+                                       true
+                                       :else (recur (+ i 1))))))
+        inv (inventory a occ)
+        out4 (fd/fs-conj (if crash (fd/fs-conj out3 (fd/mk "dynvars" 0 0 :shared "crash" -1 "" "" "" false (edit/edits-new) (fd/rows-new))) out3)
+                         (fd/mk "dynvars" 0 0 :shared "info" -1 "" "" "inventory" true (edit/edits-new) inv))]
+    (if host
+      (loop [i 0 acc (fd/fs-new)] (if (>= i (fd/fs-count out4)) acc (recur (+ i 1) (fd/fs-conj acc (fd/with-force (fd/fs-nth out4 i))))))
+      out4)))
+
+
+(defn- with-view [a [:ref :dv/a] view :string] [:ref :dv/a]
+  (record-new [:ref :dv/a] (a-target a) view (a-vars a) (record-get [:ref :dv/a] a :shared) (record-get [:ref :dv/a] a :shared-hashed)
+              (record-get [:ref :dv/a] a :scans) (record-get [:ref :dv/a] a :c) (a-e a) (record-get [:ref :dv/a] a :blocked-names)
+              (record-get [:ref :dv/a] a :blocked-sets) (record-get [:ref :dv/a] a :blocked-hashed)))
+
+;; inventory rows, in the order amu.refactor-plan prints them
+(defn- inventory [a [:ref :dv/a] occ [:list [:ref :finding/row]]] [:list [:ref :finding/row]]
+  (let [vars (a-vars a)
+        scans (record-get [:ref :dv/a] a :scans)
+        sn (vector-count scans)
+        r0 (loop [i 0 acc (fd/rows-new)] (if (>= i (fd/rows-count occ)) acc (recur (+ i 1) (let [r (fd/rows-nth occ i)] (fd/rows-conj acc (fd/row (cat "occ\t" (fd/row-a r)) (fd/row-b r) (fd/row-n r)))))))
+        r1 (loop [i 0 acc r0]
+             (if (>= i (vector-count vars)) acc
+                 (let [v (typed-list-nth [:list [:ref :dv/var]] vars i) nm (v-name v)
+                       reads (loop [k 0 c 0] (if (>= k sn) c (recur (+ k 1) (+ c (let [rs (sc-reads (typed-list-nth [:list [:ref :dv/scan]] scans k))] (loop [j 0 c2 0] (if (>= j (vector-count rs)) c2 (recur (+ j 1) (if (string=? (snth rs j) nm) (+ c2 1) c2)))))))))
+                       binds (loop [k 0 c 0] (if (>= k sn) c (recur (+ k 1) (+ c (let [bs (sc-binds (typed-list-nth [:list [:ref :dv/scan]] scans k))]
+                                                                                    (loop [j 0 c2 0] (if (>= j (vector-count bs)) c2
+                                                                                                         (recur (+ j 1) (let [bv (kid (nodes-nth bs j) 1)] (if (loop [q 0] (cond (>= (+ q 1) (nkids bv)) false (string=? (cst/node-text (kid bv q)) nm) true :else (recur (+ q 2)))) (+ c2 1) c2))))))))))
+                       muts (loop [k 0 c 0] (if (>= k sn) c (recur (+ k 1) (+ c (let [ms (sc-muts (typed-list-nth [:list [:ref :dv/scan]] scans k))] (loop [j 0 c2 0] (if (>= j (vector-count ms)) c2 (recur (+ j 1) (if (string=? (snth ms j) nm) (+ c2 1) c2)))))))))]
+                   (recur (+ i 1) (fd/rows-conj acc (fd/row (cat "var\t" nm)
+                                                            (pieces (typed-list-new [:list :string] (v-field v) "\t" (v-repr v) "\t" (if (v-new v) "1" "0")
+                                                                                    "\t" (string-from-i64 reads) "\t" (string-from-i64 binds) "\t" (string-from-i64 muts)))
+                                                            0))))))
+        r2 (fd/rows-conj (fd/rows-conj (fd/rows-conj r1 (fd/row "count\tshared-fns" "" sn)) (fd/row "count\tC" "" (os-count (record-get [:ref :dv/a] a :c))))
+                         (fd/row "count\tE" "" (os-count (a-e a))))
+        ;; blocked-reasons: the blocked map's values in its order (hash order past 8 keys), each set in its order
+        bn (record-get [:ref :dv/a] a :blocked-names)
+        bs (record-get [:ref :dv/a] a :blocked-sets)
+        bo (ord/map-order-strs bn (record-get [:ref :dv/a] a :blocked-hashed))
+        seq (loop [i 0 acc (strs)] (if (>= i (vector-count bo)) acc (recur (+ i 1) (let [it (os-items (typed-list-nth [:list [:ref :dv/os]] bs (vector-at bo i)))] (loop [j 0 a2 acc] (if (>= j (vector-count it)) a2 (recur (+ j 1) (sconj a2 (snth it j)))))))))
+        ;; frequencies (insertion / hash order) then a stable sort by descending count
+        fk (loop [i 0 acc (strs)] (if (>= i (vector-count seq)) acc (recur (+ i 1) (if (member? acc (snth seq i)) acc (sconj acc (snth seq i))))))
+        fo (ord/map-order-strs fk (> (vector-count fk) 8))
+        r3 (let [n (vector-count fo)
+                 cnt (loop [i 0 acc (vector-alloc 0)] (if (>= i n) acc (recur (+ i 1) (vector-conj acc (let [x (snth fk (vector-at fo i))] (loop [j 0 c 0] (if (>= j (vector-count seq)) c (recur (+ j 1) (if (string=? (snth seq j) x) (+ c 1) c)))))))))
+                 o (ord/sort-idx (loop [i 0 acc (vector-alloc 0)] (if (>= i n) acc (recur (+ i 1) (vector-conj acc (- 0 (vector-at cnt i)))))))]
+             (loop [i 0 acc r2] (if (>= i n) acc (recur (+ i 1) (fd/rows-conj acc (fd/row "reason" (snth fk (vector-at fo (vector-at o i))) (vector-at cnt (vector-at o i))))))))
+        nf (ord/sort-strs (loop [i 0 acc (strs)] (if (>= i (vector-count vars)) acc (recur (+ i 1) (let [v (typed-list-nth [:list [:ref :dv/var]] vars i)] (if (v-new v) (sconj acc (v-field v)) acc))))))
+        r4 (loop [i 0 acc r3] (if (>= i (vector-count nf)) acc (recur (+ i 1) (fd/rows-conj acc (fd/row "new-field" (snth nf i) 0)))))
+        ;; entries: E members no scan calls
+        ei (os-xs (a-e a))
+        ent (ord/sort-strs (loop [i 0 acc (strs)]
+                             (if (>= i (vector-count ei)) acc
+                                 (let [nm (snth ei i)
+                                       called (loop [k 0] (cond (>= k sn) false
+                                                                (let [cs (sc-calls (typed-list-nth [:list [:ref :dv/scan]] scans k))]
+                                                                  (loop [j 0] (cond (>= j (vector-count cs)) false (string=? (record-get [:ref :dv/call] (typed-list-nth [:list [:ref :dv/call]] cs j) :name) nm) true :else (recur (+ j 1)))))
+                                                                true
+                                                                :else (recur (+ k 1))))]
+                                   (recur (+ i 1) (if called acc (sconj acc nm)))))))]
+    (loop [i 0 acc r4] (if (>= i (vector-count ent)) acc (recur (+ i 1) (fd/rows-conj acc (fd/row "entry" (snth ent i) 0)))))))
+
