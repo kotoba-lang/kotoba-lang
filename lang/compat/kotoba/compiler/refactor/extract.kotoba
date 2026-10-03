@@ -1,0 +1,512 @@
+;; kotoba.compiler.refactor.extract -- the GUEST-ROUTE twin of amu's `src/kotoba/compiler/refactor/extract.cljk`: cut a
+;; big namespace into modules according to a partition, plus a facade (amu refactor split), and the structural
+;; round-trip check.
+;;
+;; WHY A TWIN. The host module builds maps of maps over the host CST and regexes (ident, schema keys, ^:private); the
+;; twin is the same text assembly over the graph twin's typed chunks. Map iteration order that reaches the answer (the
+;; `mods` map deciding `owner` for a name defined in two modules; the :modules report map) follows cljs-order.
+;;
+;; THE CONTRACT
+;;   (extract src mod-names mod-orders mod-chunks ns-override) -> :ex/out   err/code "" on success; files as parallel
+;;     path/text lists (unsorted; the caller sorts), the report parts; mod-chunks: per module the chunk idx vector
+;;   (roundtrip src out)  -> :ex/rt
+
+(ns kotoba.compiler.refactor.extract
+  (:require [kotoba.compiler.refactor.cst :as cst]
+            [kotoba.compiler.refactor.graph :as g]
+            [kotoba.compiler.refactor.cljs-order :as ord])
+  (:export [extract roundtrip out-err out-code out-ns out-facade out-reexports out-paths out-texts out-mod-names
+            out-mod-paths out-mod-forms out-mod-lines out-mod-declares out-mod-requires
+            rt-ok? rt-original rt-split rt-missing rt-extra rt-facade-names rt-defined-names])
+  (:schemas {:ex/out [:record :ex/out [[:err :string] [:code :string] [:ns :string] [:facade :string] [:reexports :i64]
+                                       [:paths [:list :string]] [:texts [:list :string]]
+                                       [:mod-names [:list :string]] [:mod-paths [:list :string]] [:mod-forms :vector-i64]
+                                       [:mod-lines :vector-i64] [:mod-declares :vector-i64] [:mod-requires [:list [:list :string]]]]]
+             :ex/info [:record :ex/info [[:name :string] [:doc :string] [:attr :string] [:requires [:list [:ref :cst/node]]]
+                                         [:other [:list :string]]]]
+             :ex/need [:record :ex/need [[:mods [:list :string]] [:names [:list :string]] [:plats [:list :string]]]]
+             :ex/ed [:record :ex/ed [[:s :vector-i64] [:e :vector-i64] [:t [:list :string]]]]
+             :ex/rt [:record :ex/rt [[:ok :bool] [:original :i64] [:split :i64] [:missing :i64] [:extra :i64]
+                                     [:facade-names :i64] [:defined-names :i64]]]}))
+
+(defn- strs [] [:list :string] (typed-list-new [:list :string]))
+(defn- sconj [xs [:list :string] s :string] [:list :string] (typed-list-conj [:list :string] xs s))
+(defn- snth [xs [:list :string] i :i64] :string (typed-list-nth [:list :string] xs i))
+(defn- cat [a :string b :string] :string (string-concat a b))
+(defn- cpw [p :i64] :i64 (if (< p 128) 1 (if (< p 2048) 2 (if (< p 65536) 3 4))))
+(defn- includes? [s :string t :string] :bool (>= (string-index-of s t) 0))
+(defn- member? [xs [:list :string] s :string] :bool (ord/member? xs s))
+(defn- join [xs [:list :string] sep :string] :string
+  (let [n (vector-count xs)] (loop [i 0 acc ""] (if (>= i n) acc (recur (+ i 1) (if (= i 0) (snth xs 0) (cat acc (cat sep (snth xs i)))))))))
+(defn- nodes-nth [xs [:list [:ref :cst/node]] i :i64] [:ref :cst/node] (typed-list-nth [:list [:ref :cst/node]] xs i))
+(defn- kid [n [:ref :cst/node] i :i64] [:ref :cst/node]
+  (let [ks (cst/node-kids n)] (if (and (>= i 0) (< i (vector-count ks))) (nodes-nth ks i) (cst/nil-node))))
+(defn- nkids [n [:ref :cst/node]] :i64 (vector-count (cst/node-kids n)))
+(defn- txt [src :string n [:ref :cst/node]] :string (string-substring src (cst/node-s n) (cst/node-e n)))
+
+;; (str/replace s #"[^A-Za-z0-9-]" "-"): every code point (a UTF-16 unit on the host) outside the set -> "-"
+(defn- ident [s :string] :string
+  (let [n (string-byte-length s)]
+    (loop [i 0 acc ""]
+      (if (>= i n) acc
+          (let [p (string-code-point-at s i)
+                ok (or (and (>= p 65) (<= p 90)) (and (>= p 97) (<= p 122)) (and (>= p 48) (<= p 57)) (= p 45))]
+            (recur (+ i (cpw p)) (cat acc (if ok (string-substring s i (+ i 1)) (if (>= p 65536) "--" "-")))))))))
+
+(defn- path-part [s :string] :string
+  (let [n (string-byte-length s)]
+    (loop [i 0 acc ""]
+      (if (>= i n) acc
+          (let [p (string-code-point-at s i)] (recur (+ i (cpw p)) (cat acc (if (= p 45) "_" (string-substring s i (+ i (cpw p)))))))))))
+
+(defn- split-dots [s :string] [:list :string]
+  (let [n (string-byte-length s)]
+    (loop [from 0 acc (strs)]
+      (let [k (if (> from n) -1 (string-index-of (string-substring s from n) "."))]
+        (if (< k 0) (sconj acc (string-substring s from n)) (recur (+ from (+ k 1)) (sconj acc (string-substring s from (+ from k)))))))))
+
+(defn- blank? [s :string] :bool
+  (let [n (string-byte-length s)]
+    (loop [i 0] (cond (>= i n) true
+                      (let [p (string-code-point-at s i)] (or (= p 32) (= p 9) (= p 10) (= p 13) (= p 11) (= p 12) (= p 160) (= p 65279) (= p 5760) (= p 8232) (= p 8233) (= p 8239) (= p 8287) (= p 12288) (and (>= p 8192) (<= p 8202)))) (recur (+ i (cpw (string-code-point-at s i))))
+                      :else false))))
+
+;; ---------------------------------------------------------------------------
+;; ns
+
+(defn- ns-chunk [a [:ref :graph/a]] :i64
+  (let [cs (g/a-chunks a) n (g/chunk-count cs)] (loop [i 0] (cond (>= i n) -1 (g/chunk-is-ns? (g/chunk-at cs i)) i :else (recur (+ i 1))))))
+
+(defn- parse-ns [src :string node [:ref :cst/node]] [:ref :ex/info]
+  (let [i0 2
+        has-doc (= :str (cst/node-type (kid node i0)))
+        i1 (if has-doc (+ i0 1) i0)
+        has-attr (= :map (cst/node-type (kid node i1)))
+        i2 (if has-attr (+ i1 1) i1)
+        m (nkids node)]
+    (loop [i i2 reqs (typed-list-new [:list [:ref :cst/node]]) other (strs)]
+      (if (>= i m)
+        (record-new [:ref :ex/info] (cst/node-text (kid node 1)) (if has-doc (txt src (kid node i0)) "") (if has-attr (txt src (kid node i1)) "") reqs other)
+        (let [k (kid node i) t (cst/strip-meta k)]
+          (if (and (cst/lst? t) (> (nkids t) 0) (cst/kw-named? (kid t 0) ":require"))
+            (recur (+ i 1) (loop [j 1 acc (typed-list-new [:list [:ref :cst/node]])] (if (>= j (nkids t)) acc (recur (+ j 1) (typed-list-conj [:list [:ref :cst/node]] acc (kid t j))))) other)
+            (recur (+ i 1) reqs (sconj other (txt src k)))))))))
+
+(defn- i-name [x [:ref :ex/info]] :string (record-get [:ref :ex/info] x :name))
+(defn- i-doc [x [:ref :ex/info]] :string (record-get [:ref :ex/info] x :doc))
+(defn- i-attr [x [:ref :ex/info]] :string (record-get [:ref :ex/info] x :attr))
+(defn- i-requires [x [:ref :ex/info]] [:list [:ref :cst/node]] (record-get [:ref :ex/info] x :requires))
+(defn- i-other [x [:ref :ex/info]] [:list :string] (record-get [:ref :ex/info] x :other))
+
+(defn- spec-alias [v [:ref :cst/node]] :string
+  (let [m (nkids v)]
+    (loop [j 0]
+      (cond (>= j m) (cst/node-text (kid v 0))
+            (and (cst/kw-named? (kid v j) ":as") (< (+ j 1) m)) (cst/node-text (kid v (+ j 1)))
+            :else (recur (+ j 1))))))
+
+;; aliases used in the chunks: the part before "/" of every symbol holding "/" (not "/" itself)
+(defn- add-aliases [acc [:list :string] n [:ref :cst/node]] [:list :string]
+  (let [a2 (if (and (= :sym (cst/node-type n)) (includes? (cst/node-text n) "/") (not (string=? "/" (cst/node-text n))))
+             (let [t (cst/node-text n) k (string-index-of t "/") al (string-substring t 0 k)]
+               (if (member? acc al) acc (sconj acc al)))
+             acc)
+        m (nkids n)]
+    (loop [i 0 a a2] (if (>= i m) a (recur (+ i 1) (add-aliases a (kid n i)))))))
+
+(defn- spec-vec? [n [:ref :cst/node]] :bool (and (= :vec (cst/node-type n)) (> (nkids n) 0) (= :sym (cst/node-type (kid n 0)))))
+
+(defn- build-requires [info [:ref :ex/info] src :string used [:list :string]] [:list :string]
+  (let [rs (i-requires info) rn (vector-count rs)]
+    (loop [i 0 acc (strs)]
+      (if (>= i rn) acc
+          (let [e (nodes-nth rs i) t (cst/strip-meta e)]
+            (recur (+ i 1)
+                   (cond
+                     (= :vec (cst/node-type t)) (if (member? used (spec-alias t)) (sconj acc (txt src e)) acc)
+                     (= :rc (cst/node-type t))
+                     (let [m (nkids t)
+                           sp (cst/node-splice? t)
+                           branches (loop [k 0 bs (strs)]
+                                      (if (>= (+ k 1) m) bs
+                                          (let [kk (kid t k) v (kid t (+ k 1))
+                                                cands (if (spec-vec? v)
+                                                        (typed-list-new [:list [:ref :cst/node]] v)
+                                                        (if (= :vec (cst/node-type v))
+                                                          (loop [j 0 acc2 (typed-list-new [:list [:ref :cst/node]])] (if (>= j (nkids v)) acc2 (recur (+ j 1) (if (= :vec (cst/node-type (kid v j))) (typed-list-conj [:list [:ref :cst/node]] acc2 (kid v j)) acc2))))
+                                                          (typed-list-new [:list [:ref :cst/node]])))
+                                                specs (loop [j 0 acc2 (strs)] (if (>= j (vector-count cands)) acc2 (recur (+ j 1) (let [sv (nodes-nth cands j)] (if (member? used (spec-alias sv)) (sconj acc2 (txt src sv)) acc2)))))]
+                                            (recur (+ k 2)
+                                                   (if (= (vector-count specs) 0)
+                                                     bs
+                                                     (sconj bs (if sp
+                                                                 (cat (cst/node-text kk) (cat " [" (cat (join specs " ") "]")))
+                                                                 (cat (cst/node-text kk) (cat " " (snth specs 0))))))))))]
+                       (if (= (vector-count branches) 0) acc (sconj acc (cat (if sp "#?@(" "#?(") (cat (join branches " ") ")")))))
+                     :else acc)))))))
+
+;; ---------------------------------------------------------------------------
+;; edits of a form: defn- -> defn, ^:private dropped; applied from the end (sort-by [(- s) (- e)])
+
+(defn- local-edits [src :string c [:ref :graph/chunk]] :string
+  (let [ds (g/chunk-defs c) dn (g/defs-count ds)
+        ;; edits as (s e text) triples
+        es (loop [i 0 ss (vector-alloc 0) ee (vector-alloc 0) tt (strs)]
+             (if (>= i dn) (record-new [:ref :ex/ed] ss ee tt)
+                 (let [d (g/def-node (g/defs-at ds i))
+                       h (kid d 0)
+                       r1 (if (string=? "defn-" (cst/node-text h))
+                            (record-new [:ref :ex/ed] (vector-conj ss (cst/node-s h)) (vector-conj ee (cst/node-e h)) (sconj tt "defn"))
+                            (record-new [:ref :ex/ed] ss ee tt))
+                       r2 (loop [nm (kid d 1) r r1]
+                            (if (= :meta (cst/node-type nm))
+                              (let [m (kid nm 0)]
+                                (recur (kid nm 1)
+                                       (if (cst/kw-named? m ":private")
+                                         (record-new [:ref :ex/ed] (vector-conj (record-get [:ref :ex/ed] r :s) (cst/node-s nm))
+                                                     (vector-conj (record-get [:ref :ex/ed] r :e) (cst/node-s (kid nm 1)))
+                                                     (sconj (record-get [:ref :ex/ed] r :t) ""))
+                                         r)))
+                              r))]
+                   (recur (+ i 1) (record-get [:ref :ex/ed] r2 :s) (record-get [:ref :ex/ed] r2 :e) (record-get [:ref :ex/ed] r2 :t)))))
+        ss (record-get [:ref :ex/ed] es :s) ee (record-get [:ref :ex/ed] es :e) tt (record-get [:ref :ex/ed] es :t)
+        n (vector-count ss)
+        ;; key: descending s, then descending e (stable)
+        keys (loop [i 0 acc (vector-alloc 0)] (if (>= i n) acc (recur (+ i 1) (vector-conj acc (- 0 (+ (* (vector-at ss i) 4194304) (vector-at ee i)))))))
+        o (ord/sort-idx keys)
+        base (g/chunk-s c)]
+    (loop [k 0 t (string-substring src (g/chunk-s c) (g/chunk-e c))]
+      (if (>= k n) t
+          (let [i (vector-at o k)]
+            (recur (+ k 1) (cat (cat (string-substring t 0 (- (vector-at ss i) base)) (snth tt i))
+                                (string-substring t (- (vector-at ee i) base) (string-byte-length t)))))))))
+
+;; ---------------------------------------------------------------------------
+;; platforms: a name's plats over every chunk defining it (nil = all platforms, spelled "")
+
+(defn- plats-of [a [:ref :graph/a] nm :string] [:list :string]
+  (let [idxs (g/a-dc-of a nm) cs (g/a-chunks a)]
+    (loop [i 0 acc (strs)]
+      (if (>= i (vector-count idxs)) acc
+          (let [ds (g/chunk-defs (g/chunk-at cs (vector-at idxs i))) dn (g/defs-count ds)]
+            (recur (+ i 1) (loop [j 0 a2 acc]
+                             (if (>= j dn) a2
+                                 (let [d (g/defs-at ds j)
+                                       p (if (g/def-has-plat? d) (g/def-plat d) "#nil#")]
+                                   (recur (+ j 1) (if (and (string=? (g/def-name d) nm) (not (member? a2 p))) (sconj a2 p) a2)))))))))))
+
+(defn- nil-plat [] :string "#nil#")
+
+(defn- always? [ps [:list :string]] :bool
+  (or (member? ps (nil-plat)) (and (member? ps ":kotoba") (member? ps ":default"))))
+
+(defn- sorted-plats [ps [:list :string]] [:list :string]
+  (ord/sort-strs (loop [i 0 acc (strs)] (if (>= i (vector-count ps)) acc (recur (+ i 1) (if (string=? (snth ps i) (nil-plat)) acc (sconj acc (snth ps i))))))))
+
+(defn- plat-wrap [ps [:list :string] form :string] :string
+  (let [ks (sorted-plats ps)
+        bs (loop [i 0 acc (strs)] (if (>= i (vector-count ks)) acc (recur (+ i 1) (sconj acc (cat (snth ks i) (cat " " form))))))
+        bs2 (if (and (not (member? ps ":kotoba")) (member? ps ":default"))
+              (let [h (sconj (strs) ":kotoba nil")] (loop [i 0 acc h] (if (>= i (vector-count bs)) acc (recur (+ i 1) (sconj acc (snth bs i))))))
+              bs)]
+    (cat "#?(" (cat (join bs2 " ") ")"))))
+
+;; the group key of a plat set: (vec (sort (map str ps))) joined
+(defn- group-key [ps [:list :string]] :string
+  ;; cljs compares vectors by count first, then item by item
+  (let [ks (ord/sort-strs (loop [i 0 acc (strs)] (if (>= i (vector-count ps)) acc (recur (+ i 1) (sconj acc (if (string=? (snth ps i) (nil-plat)) "" (snth ps i)))))))
+        n (vector-count ks)]
+    (cat (cat (if (< n 10) "000" (if (< n 100) "00" "0")) (string-from-i64 n)) (cat " " (join ks " ")))))
+
+;; names (sorted) with their plats -> the :refer items text
+(defn- refer-items [names [:list :string] plats [:list [:list :string]]] :string
+  (let [n (vector-count names)
+        always (loop [i 0 acc (strs)] (if (>= i n) acc (recur (+ i 1) (if (always? (typed-list-nth [:list [:list :string]] plats i)) (sconj acc (snth names i)) acc))))
+        ;; groups: distinct plat sets (by key) in first-seen order, then sorted by key
+        gkeys (loop [i 0 acc (strs)]
+                (if (>= i n) acc
+                    (let [ps (typed-list-nth [:list [:list :string]] plats i)]
+                      (recur (+ i 1) (if (or (always? ps) (member? acc (group-key ps))) acc (sconj acc (group-key ps)))))))
+        sk (ord/sort-strs gkeys)
+        grouped (loop [g 0 acc (strs)]
+                  (if (>= g (vector-count sk)) acc
+                      (let [key (snth sk g)
+                            first-i (loop [i 0] (if (and (< i n) (or (always? (typed-list-nth [:list [:list :string]] plats i)) (not (string=? (group-key (typed-list-nth [:list [:list :string]] plats i)) key)))) (recur (+ i 1)) i))
+                            ps (typed-list-nth [:list [:list :string]] plats first-i)
+                            rows (loop [i 0 r (strs)] (if (>= i n) r (recur (+ i 1) (if (and (not (always? (typed-list-nth [:list [:list :string]] plats i))) (string=? (group-key (typed-list-nth [:list [:list :string]] plats i)) key)) (sconj r (snth names i)) r))))
+                            ks (sorted-plats ps)
+                            body (loop [i 0 b (strs)] (if (>= i (vector-count ks)) b (recur (+ i 1) (sconj b (cat (snth ks i) (cat " [" (cat (join rows " ") "]")))))))
+                            body2 (if (and (not (member? ks ":kotoba")) (member? ks ":default"))
+                                    (let [h (sconj (strs) ":kotoba []")] (loop [i 0 b h] (if (>= i (vector-count body)) b (recur (+ i 1) (sconj b (snth body i))))))
+                                    body)]
+                        (recur (+ g 1) (sconj acc (cat "#?@(" (cat (join body2 " ") ")")))))))]
+    (join (loop [i 0 acc always] (if (>= i (vector-count grouped)) acc (recur (+ i 1) (sconj acc (snth grouped i))))) " ")))
+
+;; ---------------------------------------------------------------------------
+;; extract
+
+(defn- fail [code :string msg :string] [:ref :ex/out]
+  (record-new [:ref :ex/out] msg code "" "" 0 (strs) (strs) (strs) (strs) (vector-alloc 0) (vector-alloc 0) (vector-alloc 0)
+              (typed-list-new [:list [:list :string]])))
+
+;; schema keys: every [a-z]+ between ":" and "/" in the text
+(defn- schema-keys [t :string] [:list :string]
+  (let [n (string-byte-length t)]
+    (loop [i 0 acc (strs)]
+      (if (>= i n) acc
+          (let [p (string-code-point-at t i)]
+            (if (= p 58)
+              (let [e (loop [j (+ i 1)] (if (and (< j n) (let [q (string-code-point-at t j)] (and (>= q 97) (<= q 122)))) (recur (+ j 1)) j))]
+                (if (and (> e (+ i 1)) (< e n) (= (string-code-point-at t e) 47))
+                  (recur (+ i 1) (let [k (string-substring t (+ i 1) e)] (if (member? acc k) acc (sconj acc k))))
+                  (recur (+ i 1) acc)))
+              (recur (+ i (cpw p)) acc)))))))
+
+(defn extract [src :string a [:ref :graph/a] mnames [:list :string] morders :vector-i64 mchunks [:list :vector-i64] ns-override :string]
+  [:ref :ex/out]
+  (let [nsi (ns-chunk a)]
+    (if (< nsi 0)
+      (fail "refactor/no-ns" "the source has no ns form")
+      (let [chunks (g/a-chunks a)
+            cn (g/chunk-count chunks)
+            info (parse-ns src (g/chunk-node (g/chunk-at chunks nsi)))
+            nsname (if (> (string-byte-length ns-override) 0) ns-override (i-name info))
+            mn (vector-count mnames)
+            ;; order: modules sorted by :order (stable)
+            oidx (ord/sort-idx morders)
+            order (loop [i 0 acc (strs)] (if (>= i mn) acc (recur (+ i 1) (sconj acc (snth mnames (vector-at oidx i))))))
+            ;; assign: chunk -> module (a later module wins, as into {})
+            assign (loop [m 0 v (loop [i 0 acc (vector-alloc 0)] (if (>= i cn) acc (recur (+ i 1) (vector-conj acc -1))))]
+                     (if (>= m mn) v
+                         (let [cs (typed-list-nth [:list :vector-i64] mchunks m)]
+                           (recur (+ m 1) (loop [j 0 v2 v] (if (>= j (vector-count cs)) v2
+                                                               (recur (+ j 1) (let [x (vector-at cs j)] (if (and (>= x 0) (< x cn)) (vector-assoc v2 x m) v2)))))))))
+            missing (loop [i 0 k 0] (if (>= i cn) k (recur (+ i 1) (let [c (g/chunk-at chunks i)] (if (and (> (vector-count (g/chunk-names c)) 0) (< (vector-at assign i) 0)) (+ k 1) k)))))]
+        (if (> missing 0)
+          (fail "refactor/partition-incomplete" "the partition does not place every defining form of the source (was it computed for another file?)")
+          (let [parts (split-dots nsname)
+                pn (vector-count parts)
+                base-dir (join (loop [i 0 acc (strs)] (if (>= i (- pn 1)) acc (recur (+ i 1) (sconj acc (path-part (snth parts i)))))) "/")
+                lastp (path-part (snth parts (- pn 1)))
+                mod-dir (cat base-dir (cat "/" lastp))
+                ;; owner: name -> module name; the mods map iterates in order (array) or by hash of the names (> 8)
+                mord (ord/map-order-strs order (> mn 8))
+                owner-names (loop [k 0 ns (strs) ms (strs)]
+                              (if (>= k mn) (record-new [:ref :ex/need] ms ns (strs))
+                                  (let [m (snth order (vector-at mord k))
+                                        r (loop [i 0 ns2 ns ms2 ms]
+                                            (if (>= i cn) (record-new [:ref :ex/need] ms2 ns2 (strs))
+                                                (let [c (g/chunk-at chunks i)]
+                                                  (if (and (>= (vector-at assign i) 0) (string=? (snth mnames (vector-at assign i)) m))
+                                                    (let [nms (g/chunk-names c)
+                                                          r2 (loop [j 0 n3 ns2 m3 ms2]
+                                                               (if (>= j (vector-count nms)) (record-new [:ref :ex/need] m3 n3 (strs))
+                                                                   (let [x (snth nms j)
+                                                                         at (loop [q 0] (cond (>= q (vector-count n3)) -1 (string=? (snth n3 q) x) q :else (recur (+ q 1))))]
+                                                                     (if (< at 0)
+                                                                       (recur (+ j 1) (sconj n3 x) (sconj m3 m))
+                                                                       (recur (+ j 1) n3 (loop [q 0 acc (strs)] (if (>= q (vector-count m3)) acc (recur (+ q 1) (sconj acc (if (= q at) m (snth m3 q)))))))))))]
+                                                      (recur (+ i 1) (record-get [:ref :ex/need] r2 :names) (record-get [:ref :ex/need] r2 :mods)))
+                                                    (recur (+ i 1) ns2 ms2)))))]
+                                    (recur (+ k 1) (record-get [:ref :ex/need] r :names) (record-get [:ref :ex/need] r :mods)))))
+                own-names (record-get [:ref :ex/need] owner-names :names)
+                own-mods (record-get [:ref :ex/need] owner-names :mods)
+                own-tab (ord/tab-of own-names)
+                ;; trivia: comments of dropped forms ride along to the next kept form
+                trivia (loop [i 0 pend "" out (strs)]
+                         (if (>= i cn) out
+                             (let [c (g/chunk-at chunks i)
+                                   lead (string-substring src (g/chunk-lead-s c) (g/chunk-s c))]
+                               (cond (g/chunk-is-ns? c) (recur (+ i 1) "" (sconj out ""))
+                                     (or (< (vector-at assign i) 0) (= (vector-count (g/chunk-names c)) 0))
+                                     (recur (+ i 1) (if (blank? lead) pend (cat pend lead)) (sconj out ""))
+                                     :else (recur (+ i 1) "" (sconj out (if (blank? pend) lead (cat pend lead))))))))
+                others (i-other info)
+                schema-clause (loop [i 0 acc (strs)] (if (>= i (vector-count others)) acc (recur (+ i 1) (if (includes? (snth others i) ":schemas") (sconj acc (snth others i)) acc))))
+                skeys (schema-keys (join schema-clause " "))
+                ;; per module
+                res (loop [k 0 paths (strs) texts (strs) mpaths (strs) mforms (vector-alloc 0) mlines (vector-alloc 0) mdecl (vector-alloc 0) mreqs (typed-list-new [:list [:list :string]])]
+                      (if (>= k mn)
+                        (record-new [:ref :ex/out] "" "" nsname "" 0 paths texts order mpaths mforms mlines mdecl mreqs)
+                        (let [m (snth order k)
+                              cidx (loop [i 0 acc (vector-alloc 0)] (if (>= i cn) acc (recur (+ i 1) (let [c (g/chunk-at chunks i)] (if (and (>= (vector-at assign i) 0) (string=? (snth mnames (vector-at assign i)) m) (> (vector-count (g/chunk-names c)) 0)) (vector-conj acc i) acc)))))
+                              ccount (vector-count cidx)
+                              here (loop [i 0 acc (strs)] (if (>= i ccount) acc (recur (+ i 1) (let [nms (g/chunk-names (g/chunk-at chunks (vector-at cidx i)))] (loop [j 0 a2 acc] (if (>= j (vector-count nms)) a2 (recur (+ j 1) (sconj a2 (snth nms j)))))))))
+                              ;; need: other module -> names (first-seen), each with its plats
+                              need (loop [i 0 nm (strs) nn (strs)]
+                                     (if (>= i ccount) (record-new [:ref :ex/need] nm nn (strs))
+                                         (let [c (g/chunk-at chunks (vector-at cidx i)) rs (g/chunk-refs c)
+                                               r (loop [j 0 nm2 nm nn2 nn]
+                                                   (if (>= j (vector-count rs)) (record-new [:ref :ex/need] nm2 nn2 (strs))
+                                                       (let [x (snth rs j) oi (ord/tab-find own-tab own-names x)]
+                                                         (if (and (>= oi 0) (not (string=? (snth own-mods oi) m)))
+                                                           (let [o (snth own-mods oi)
+                                                                 dup (loop [q 0] (cond (>= q (vector-count nn2)) false (and (string=? (snth nm2 q) o) (string=? (snth nn2 q) x)) true :else (recur (+ q 1))))]
+                                                             (recur (+ j 1) (if dup nm2 (sconj nm2 o)) (if dup nn2 (sconj nn2 x))))
+                                                           (recur (+ j 1) nm2 nn2)))))]
+                                           (recur (+ i 1) (record-get [:ref :ex/need] r :mods) (record-get [:ref :ex/need] r :names)))))
+                              need-mods (record-get [:ref :ex/need] need :mods)
+                              need-names (record-get [:ref :ex/need] need :names)
+                              ;; forward references inside the module
+                              fwd (loop [i 0 acc (strs)]
+                                    (if (>= i ccount) acc
+                                        (let [c (g/chunk-at chunks (vector-at cidx i)) rs (g/chunk-refs c) own (g/chunk-names c)]
+                                          (recur (+ i 1)
+                                                 (loop [j 0 a2 acc]
+                                                   (if (>= j (vector-count rs)) a2
+                                                       (let [x (snth rs j)]
+                                                         (recur (+ j 1)
+                                                                (if (and (member? here x) (>= (first-pos chunks cidx x) i) (not (member? own x)) (not (member? a2 x)))
+                                                                  (sconj a2 x) a2)))))))))
+                              dyn (loop [i 0 acc (strs)] (if (>= i ccount) acc (recur (+ i 1) (let [c (g/chunk-at chunks (vector-at cidx i)) nms (g/chunk-names c)] (loop [j 0 a2 acc] (if (>= j (vector-count nms)) a2 (recur (+ j 1) (if (g/chunk-dynamic? c (snth nms j)) (sconj a2 (snth nms j)) a2))))))))
+                              used (loop [i 0 acc (strs)] (if (>= i ccount) acc (recur (+ i 1) (add-aliases acc (g/chunk-node (g/chunk-at chunks (vector-at cidx i)))))))
+                              reqs (build-requires info src used)
+                              ;; deps: distinct need modules sorted by order position
+                              dmods (loop [i 0 acc (strs)] (if (>= i (vector-count need-mods)) acc (recur (+ i 1) (if (member? acc (snth need-mods i)) acc (sconj acc (snth need-mods i))))))
+                              dpos (loop [i 0 acc (vector-alloc 0)] (if (>= i (vector-count dmods)) acc (recur (+ i 1) (vector-conj acc (loop [q 0] (if (string=? (snth order q) (snth dmods i)) q (recur (+ q 1))))))))
+                              dsorted (let [o (ord/sort-idx dpos)] (loop [i 0 acc (strs)] (if (>= i (vector-count o)) acc (recur (+ i 1) (sconj acc (snth dmods (vector-at o i)))))))
+                              rq (loop [i 0 acc reqs]
+                                   (if (>= i (vector-count dsorted)) acc
+                                       (let [dep (snth dsorted i)
+                                             nms (ord/sort-strs (loop [q 0 a2 (strs)] (if (>= q (vector-count need-mods)) a2 (recur (+ q 1) (if (string=? (snth need-mods q) dep) (sconj a2 (snth need-names q)) a2)))))
+                                             pls (loop [q 0 a2 (typed-list-new [:list [:list :string]])] (if (>= q (vector-count nms)) a2 (recur (+ q 1) (typed-list-conj [:list [:list :string]] a2 (plats-of a (snth nms q))))))]
+                                         (recur (+ i 1) (sconj acc (cat "[" (cat nsname (cat "." (cat (ident dep) (cat " :refer [" (cat (refer-items nms pls) "]]")))))))))))
+                              nlines (loop [i 0 s 0] (if (>= i ccount) s (recur (+ i 1) (+ s (g/chunk-lines (g/chunk-at chunks (vector-at cidx i)))))))
+                              text-all (join (loop [i 0 acc (strs)] (if (>= i ccount) acc (recur (+ i 1) (sconj acc (let [c (g/chunk-at chunks (vector-at cidx i))] (string-substring src (g/chunk-s c) (g/chunk-e c))))))) " ")
+                              head0 (sconj (sconj (strs) (cat "(ns " (cat nsname (cat "." (ident m)))))
+                                           (cat "  \"Module `" (cat m (cat "` of " (cat nsname (cat ", cut from the original namespace by amu refactor split ("
+                                                (cat (string-from-i64 ccount) (cat " forms, " (cat (string-from-i64 nlines) (cat " lines). Depends on: "
+                                                (cat (if (> (vector-count dsorted) 0) (join dsorted ", ") "nothing in this split") ".\"")))))))))))
+                              head1 (if (> (vector-count rq) 0) (sconj head0 (cat "  (:require " (cat (join rq "\n            ") ")"))) head0)
+                              head2 (loop [i 0 acc head1]
+                                      (if (>= i (vector-count schema-clause)) acc
+                                          (recur (+ i 1) (if (loop [q 0] (cond (>= q (vector-count skeys)) false (includes? text-all (cat ":" (cat (snth skeys q) "/"))) true :else (recur (+ q 1))))
+                                                           (sconj acc (cat "  " (snth schema-clause i))) acc))))
+                              out0 (cat (join head2 "\n") ")\n")
+                              out1 (if (or (> (vector-count fwd) 0) (> (vector-count dyn) 0))
+                                     (cat out0 (cat "\n;; forward references inside this module (the cut keeps the original form order)\n(declare "
+                                                    (cat (join (loop [i 0 acc (strs)] (if (>= i (vector-count fwd)) acc (recur (+ i 1) (sconj acc (cat (if (member? dyn (snth fwd i)) "^:dynamic " "") (snth fwd i)))))) " ") ")\n")))
+                                     out0)
+                              body (loop [i 0 acc ""] (if (>= i ccount) acc (recur (+ i 1) (let [ci (vector-at cidx i) c (g/chunk-at chunks ci)] (cat acc (cat (snth trivia ci) (local-edits src c)))))))
+                              text (cat out1 (cat body "\n"))
+                              path (cat mod-dir (cat "/" (cat (path-part (ident m)) ".cljk")))]
+                          (recur (+ k 1) (sconj paths path) (sconj texts text) (sconj mpaths path) (vector-conj mforms ccount) (vector-conj mlines nlines)
+                                 (vector-conj mdecl (vector-count fwd)) (typed-list-conj [:list [:list :string]] mreqs (ord/sort-strs dsorted))))))
+                ;; facade
+                fh0 (sconj (strs) (cat "(ns " nsname))
+                fh1 (if (> (string-byte-length (i-doc info)) 0) (sconj fh0 (cat "  " (i-doc info))) fh0)
+                fh2 (if (> (string-byte-length (i-attr info)) 0) (sconj fh1 (cat "  " (i-attr info))) fh1)
+                fh3 (sconj fh2 (cat "  (:require " (cat (join (loop [i 0 acc (strs)] (if (>= i mn) acc (recur (+ i 1) (sconj acc (cat "[" (cat nsname (cat "." (cat (ident (snth order i)) (cat " :as " (cat (ident (snth order i)) "]")))))))))) "\n            ") ")")))
+                fh4 (loop [i 0 acc fh3] (if (>= i (vector-count others)) acc (recur (+ i 1) (if (includes? (snth others i) ":schemas") (sconj acc (cat "  " (snth others i))) acc))))
+                rows (loop [i 0 seen (strs) rows (strs)]
+                       (if (>= i cn) rows
+                           (let [c (g/chunk-at chunks i) nms (g/chunk-names c)
+                                 r (loop [j 0 s2 seen r2 rows]
+                                     (if (>= j (vector-count nms)) (record-new [:ref :ex/need] s2 r2 (strs))
+                                         (let [x (snth nms j) oi (ord/tab-find own-tab own-names x)]
+                                           (if (or (member? s2 x) (< oi 0))
+                                             (recur (+ j 1) s2 r2)
+                                             (let [ps (plats-of a x)
+                                                   idxs (g/a-dc-of a x)
+                                                   private (loop [q 0] (cond (>= q (vector-count idxs)) true (g/chunk-private? (g/chunk-at chunks (vector-at idxs q)) x) (recur (+ q 1)) :else false))
+                                                   dynamic (loop [q 0] (cond (>= q (vector-count idxs)) false (g/chunk-dynamic? (g/chunk-at chunks (vector-at idxs q)) x) true :else (recur (+ q 1))))
+                                                   form (cat "(def " (cat (if dynamic "^:dynamic " "") (cat (if private "^:private " "") (cat x (cat " " (cat (ident (snth own-mods oi)) (cat "/" (cat x ")"))))))))]
+                                               (recur (+ j 1) (sconj s2 x) (sconj r2 (if (always? ps) form (plat-wrap ps form)))))))))]
+                             (recur (+ i 1) (record-get [:ref :ex/need] r :mods) (record-get [:ref :ex/need] r :names)))))
+                facade (cat (join fh4 "\n") (cat ")\n\n;; Facade over the split modules (amu refactor split). Each name is re-exported as a value;\n"
+                                                  (cat ";; a ^:dynamic var is a SNAPSHOT here: rebind it through its owning module (see the split report).\n"
+                                                       (cat (join rows "\n") "\n"))))
+                fpath (cat base-dir (cat "/" (cat lastp ".cljk")))]
+            (record-new [:ref :ex/out] "" "" nsname fpath (vector-count rows)
+                        (sconj (out-paths res) fpath) (sconj (out-texts res) facade)
+                        order (out-mod-paths res) (out-mod-forms res) (out-mod-lines res) (out-mod-declares res) (out-mod-requires res))))))))
+
+
+;; the position (in cidx) of the first chunk of the module defining x
+(defn- first-pos [chunks [:list [:ref :graph/chunk]] cidx :vector-i64 x :string] :i64
+  (loop [i 0] (cond (>= i (vector-count cidx)) -1 (member? (g/chunk-names (g/chunk-at chunks (vector-at cidx i))) x) i :else (recur (+ i 1)))))
+
+(defn out-err [o [:ref :ex/out]] :string (record-get [:ref :ex/out] o :err))
+(defn out-code [o [:ref :ex/out]] :string (record-get [:ref :ex/out] o :code))
+(defn out-ns [o [:ref :ex/out]] :string (record-get [:ref :ex/out] o :ns))
+(defn out-facade [o [:ref :ex/out]] :string (record-get [:ref :ex/out] o :facade))
+(defn out-reexports [o [:ref :ex/out]] :i64 (record-get [:ref :ex/out] o :reexports))
+(defn out-paths [o [:ref :ex/out]] [:list :string] (record-get [:ref :ex/out] o :paths))
+(defn out-texts [o [:ref :ex/out]] [:list :string] (record-get [:ref :ex/out] o :texts))
+(defn out-mod-names [o [:ref :ex/out]] [:list :string] (record-get [:ref :ex/out] o :mod-names))
+(defn out-mod-paths [o [:ref :ex/out]] [:list :string] (record-get [:ref :ex/out] o :mod-paths))
+(defn out-mod-forms [o [:ref :ex/out]] :vector-i64 (record-get [:ref :ex/out] o :mod-forms))
+(defn out-mod-lines [o [:ref :ex/out]] :vector-i64 (record-get [:ref :ex/out] o :mod-lines))
+(defn out-mod-declares [o [:ref :ex/out]] :vector-i64 (record-get [:ref :ex/out] o :mod-declares))
+(defn out-mod-requires [o [:ref :ex/out]] [:list [:list :string]] (record-get [:ref :ex/out] o :mod-requires))
+
+;; ---------------------------------------------------------------------------
+;; roundtrip
+
+(defn- norm [t :string] :string
+  ;; (str/replace "(defn- " "(defn ") then #"\^:private\s+" -> ""
+  (let [a (loop [s t acc ""]
+            (let [k (string-index-of s "(defn- ")]
+              (if (< k 0) (cat acc s) (recur (string-substring s (+ k 7) (string-byte-length s)) (cat acc (cat (string-substring s 0 k) "(defn "))))))
+        n (string-byte-length a)]
+    (loop [i 0 from 0 acc ""]
+      (let [k (if (> i n) -1 (string-index-of (string-substring a i n) "^:private"))]
+        (if (< k 0)
+          (cat acc (string-substring a from n))
+          (let [at (+ i k) e0 (+ at 9)
+                e1 (loop [j e0] (if (and (< j n) (let [p (string-code-point-at a j)] (or (= p 32) (= p 9) (= p 10) (= p 13) (= p 11) (= p 12) (= p 160) (= p 65279) (= p 8232) (= p 8233)))) (recur (+ j (cpw (string-code-point-at a j)))) j))]
+            (if (> e1 e0)
+              (recur e1 e1 (cat acc (string-substring a from at)))
+              (recur (+ at 1) from acc))))))))
+
+;; normalized texts of the defining forms of a source
+(defn- defining-texts [src :string] [:list :string]
+  (let [a (g/analysis src) cs (g/a-chunks a) n (g/chunk-count cs)]
+    (loop [i 0 acc (strs)]
+      (if (>= i n) acc
+          (let [c (g/chunk-at cs i)]
+            (recur (+ i 1) (if (and (not (g/chunk-is-ns? c)) (> (vector-count (g/chunk-names c)) 0))
+                             (sconj acc (norm (string-substring src (g/chunk-s c) (g/chunk-e c)))) acc)))))))
+
+(defn- names-of [src :string] [:list :string]
+  (let [a (g/analysis src) cs (g/a-chunks a) n (g/chunk-count cs)]
+    (loop [i 0 acc (strs)]
+      (if (>= i n) acc
+          (let [nms (g/chunk-names (g/chunk-at cs i))]
+            (recur (+ i 1) (loop [j 0 a2 acc] (if (>= j (vector-count nms)) a2 (recur (+ j 1) (if (member? a2 (snth nms j)) a2 (sconj a2 (snth nms j))))))))))))
+
+;; sum over xs of max(0, count in xs - count in ys), by sorting both
+(defn- excess [xs [:list :string] ys [:list :string]] :i64
+  (let [a (ord/sort-strs xs) b (ord/sort-strs ys) an (vector-count a) bn (vector-count b)]
+    (loop [i 0 j 0 k 0]
+      (cond (>= i an) k
+            (>= j bn) (+ k (- an i))
+            :else (let [c (string-compare (snth a i) (snth b j))]
+                    (cond (< c 0) (recur (+ i 1) j (+ k 1))
+                          (> c 0) (recur i (+ j 1) k)
+                          :else (recur (+ i 1) (+ j 1) k)))))))
+
+(defn roundtrip [src :string o [:ref :ex/out]] [:ref :ex/rt]
+  (let [want (defining-texts src)
+        ps (out-paths o) ts (out-texts o) n (vector-count ps)
+        got (loop [i 0 acc (strs)]
+              (if (>= i n) acc
+                  (recur (+ i 1) (if (string=? (snth ps i) (out-facade o)) acc
+                                     (let [d (defining-texts (snth ts i))] (loop [j 0 a2 acc] (if (>= j (vector-count d)) a2 (recur (+ j 1) (sconj a2 (snth d j))))))))))
+        fi (loop [i 0] (if (string=? (snth ps i) (out-facade o)) i (recur (+ i 1))))
+        exported (names-of (snth ts fi))
+        defined (names-of src)
+        miss (excess want got)
+        extra (excess got want)
+        same-names (and (= (vector-count exported) (vector-count defined))
+                        (loop [i 0] (cond (>= i (vector-count exported)) true (member? defined (snth exported i)) (recur (+ i 1)) :else false)))]
+    (record-new [:ref :ex/rt] (and (= miss 0) (= extra 0) same-names) (vector-count want) (vector-count got) miss extra
+                (vector-count exported) (vector-count defined))))
+
+(defn rt-ok? [r [:ref :ex/rt]] :bool (record-get [:ref :ex/rt] r :ok))
+(defn rt-original [r [:ref :ex/rt]] :i64 (record-get [:ref :ex/rt] r :original))
+(defn rt-split [r [:ref :ex/rt]] :i64 (record-get [:ref :ex/rt] r :split))
+(defn rt-missing [r [:ref :ex/rt]] :i64 (record-get [:ref :ex/rt] r :missing))
+(defn rt-extra [r [:ref :ex/rt]] :i64 (record-get [:ref :ex/rt] r :extra))
+(defn rt-facade-names [r [:ref :ex/rt]] :i64 (record-get [:ref :ex/rt] r :facade-names))
+(defn rt-defined-names [r [:ref :ex/rt]] :i64 (record-get [:ref :ex/rt] r :defined-names))

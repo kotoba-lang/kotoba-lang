@@ -1,0 +1,703 @@
+;; kotoba.compiler.refactor.partition -- the GUEST-ROUTE twin of amu's `src/kotoba/compiler/refactor/partition.cljk`:
+;; the pass-ownership partition of a big namespace (amu refactor partition): atoms = SCCs of the reference graph, the
+;; driver and its root passes, owner sets, greedy merging under the acyclicity rule, module names, the cycle report.
+;;
+;; WHY A TWIN. The host module is dynamic Clojure over maps, sets and vectors of the graph analysis; several answers
+;; depend on cljs iteration order (`keys` of chunk-mod, of an adjacency map, of `work` and `indeg` in the cycle plan),
+;; which the twin reproduces with insertion-ordered int maps and kotoba.compiler.refactor.cljs-order. Scores are f64
+;; (JS doubles on the host: the same IEEE operations in the same order).
+;;
+;; THE CONTRACT
+;;   (partition-data a target driver-name labels-names labels-values) -> :pt/out
+;;     a: the graph twin's analysis; driver-name "" = find the driver; labels: the --names map's form names / labels
+;;     (strings). ERR "" on success, else the refusal message (no pass driver found ...).
+;;   The payload parts (modules, edges, blocking edges, method, cycles) are typed records read by amu.refactor-partition.
+
+(ns kotoba.compiler.refactor.partition
+  (:require [kotoba.compiler.refactor.graph :as g]
+            [kotoba.compiler.refactor.cljs-order :as ord])
+  (:export [partition-data out-err out-k out-chunk-keys out-chunk-ranks out-names out-mods out-edges out-blocking
+            out-driver out-roots out-initial out-cycles out-steps
+            mod-name mod-order mod-forms mod-lines mod-defs mod-req-names mod-req-counts mod-chunks mods-count mods-nth
+            cyc-size cyc-lines cyc-module cyc-has-module? cyc-forms cycs-count cycs-nth
+            step-label step-cut step-largest steps-count steps-nth token-of])
+  (:schemas {:pt/im [:record :pt/im [[:keys :vector-i64] [:vals :vector-i64] [:hashed :bool]]]
+             :pt/mod [:record :pt/mod [[:name :string] [:order :i64] [:forms :i64] [:lines :i64] [:defs :i64]
+                                       [:req-names [:list :string]] [:req-counts :vector-i64] [:chunks :vector-i64]]]
+             :pt/cyc [:record :pt/cyc [[:size :i64] [:lines :i64] [:module :string] [:has-module :bool] [:forms [:list :string]]]]
+             :pt/step [:record :pt/step [[:label :string] [:cut :i64] [:largest :i64]]]
+             :pt/chunks [:record :pt/chunks [[:mod :vector-i64] [:k :i64] [:driver [:list :string]] [:roots [:list :string]]
+                                             [:initial :i64] [:err :string] [:keys :vector-i64]]]
+             :pt/st [:record :pt/st [[:modof :vector-i64] [:members [:list :vector-i64]] [:alive :vector-i64]]]
+             :pt/tv [:record :pt/tv [[:toks [:list :string]] [:vals :vector-i64]]]
+             :pt/eb [:record :pt/eb [[:p :vector-i64] [:q :vector-i64] [:w :vector-i64]]]
+             :pt/init [:record :pt/init [[:keys [:list :string]] [:modof :vector-i64]]]
+             :pt/rows [:record :pt/rows [[:ms :vector-i64] [:ts [:list :string]] [:ls :vector-i64]]]
+             :pt/out [:record :pt/out [[:err :string] [:k :i64] [:chunk-keys :vector-i64] [:chunk-ranks :vector-i64]
+                                       [:names [:list :string]] [:mods [:list [:ref :pt/mod]]]
+                                       [:edges :vector-i64] [:blocking [:list :string]]
+                                       [:driver [:list :string]] [:roots [:list :string]] [:initial :i64]
+                                       [:cycles [:list [:ref :pt/cyc]]] [:steps [:list [:ref :pt/step]]]]]}))
+
+;; ---------------------------------------------------------------------------
+;; helpers
+
+(defn- strs [] [:list :string] (typed-list-new [:list :string]))
+(defn- sconj [xs [:list :string] s :string] [:list :string] (typed-list-conj [:list :string] xs s))
+(defn- snth [xs [:list :string] i :i64] :string (typed-list-nth [:list :string] xs i))
+(defn- vnew [] :vector-i64 (vector-alloc 0))
+(defn- vfill [n :i64 x :i64] :vector-i64 (loop [i 0 v (vector-alloc 0)] (if (>= i n) v (recur (+ i 1) (vector-conj v x)))))
+(defn- vidx [v :vector-i64 x :i64] :i64 (let [n (vector-count v)] (loop [i 0] (cond (>= i n) -1 (= (vector-at v i) x) i :else (recur (+ i 1))))))
+(defn- vset [v :vector-i64 i :i64 x :i64] :vector-i64 (let [_ (vector-assoc! v i x)] v))
+(defn- lnth [xs [:list :vector-i64] i :i64] :vector-i64 (typed-list-nth [:list :vector-i64] xs i))
+(defn- cpw [p :i64] :i64 (if (< p 128) 1 (if (< p 2048) 2 (if (< p 65536) 3 4))))
+(defn- u16-count [s :string] :i64
+  (let [n (string-byte-length s)]
+    (loop [i 0 k 0] (if (>= i n) k (let [p (string-code-point-at s i)] (recur (+ i (cpw p)) (+ k (if (>= p 65536) 2 1))))))))
+
+;; int -> int maps in cljs order (array map up to 8 entries, hash map after; dissoc keeps the kind)
+(defn- im-new [] [:ref :pt/im] (record-new [:ref :pt/im] (vnew) (vnew) false))
+(defn- im-keys [m [:ref :pt/im]] :vector-i64 (record-get [:ref :pt/im] m :keys))
+(defn- im-vals [m [:ref :pt/im]] :vector-i64 (record-get [:ref :pt/im] m :vals))
+(defn- im-hashed [m [:ref :pt/im]] :bool (record-get [:ref :pt/im] m :hashed))
+(defn- im-get [m [:ref :pt/im] k :i64] :i64 (let [i (vidx (im-keys m) k)] (if (< i 0) 0 (vector-at (im-vals m) i))))
+(defn- im-has? [m [:ref :pt/im] k :i64] :bool (>= (vidx (im-keys m) k) 0))
+(defn- im-add [m [:ref :pt/im] k :i64 d :i64] [:ref :pt/im]
+  (let [i (vidx (im-keys m) k)]
+    (if (< i 0)
+      (let [ks (vector-conj (im-keys m) k)] (record-new [:ref :pt/im] ks (vector-conj (im-vals m) d) (or (im-hashed m) (> (vector-count ks) 8))))
+      (record-new [:ref :pt/im] (im-keys m) (vector-assoc (im-vals m) i (+ d (vector-at (im-vals m) i))) (im-hashed m)))))
+(defn- im-dissoc [m [:ref :pt/im] k :i64] [:ref :pt/im]
+  (let [i (vidx (im-keys m) k) n (vector-count (im-keys m))]
+    (if (< i 0)
+      m
+      (loop [j 0 ks (vnew) vs (vnew)]
+        (if (>= j n) (record-new [:ref :pt/im] ks vs (im-hashed m))
+            (recur (+ j 1) (if (= j i) ks (vector-conj ks (vector-at (im-keys m) j))) (if (= j i) vs (vector-conj vs (vector-at (im-vals m) j)))))))))
+;; keys in iteration order
+(defn- im-order [m [:ref :pt/im]] :vector-i64
+  (let [ks (im-keys m) o (ord/map-order-ints ks (im-hashed m)) n (vector-count o)]
+    (loop [i 0 acc (vnew)] (if (>= i n) acc (recur (+ i 1) (vector-conj acc (vector-at ks (vector-at o i))))))))
+
+;; a set of ints given in insertion order -> its iteration order
+(defn- set-order [xs :vector-i64] :vector-i64
+  (let [o (ord/map-order-ints xs (> (vector-count xs) 8)) n (vector-count o)]
+    (loop [i 0 acc (vnew)] (if (>= i n) acc (recur (+ i 1) (vector-conj acc (vector-at xs (vector-at o i))))))))
+
+;; graph accessors
+(defn- chunks-of [a [:ref :graph/a]] [:list [:ref :graph/chunk]] (g/a-chunks a))
+(defn- chunk [a [:ref :graph/a] i :i64] [:ref :graph/chunk] (g/chunk-at (g/a-chunks a) i))
+(defn- first-name [c [:ref :graph/chunk]] :string (let [ns (g/chunk-names c)] (if (> (vector-count ns) 0) (snth ns 0) "")))
+(defn- has-names? [c [:ref :graph/chunk]] :bool (> (vector-count (g/chunk-names c)) 0))
+(defn- adj-row [a [:ref :graph/a] u :i64] [:ref :graph/adj] (g/adj-at (g/a-adj a) u))
+(defn- adj-w [r [:ref :graph/adj] v :i64] :i64 (let [i (vidx (g/adj-targets r) v)] (if (< i 0) 0 (vector-at (g/adj-weights r) i))))
+
+;; f64 helpers (the host's doubles)
+(defn- fl [n :i64] :f64 (i64-to-f64-rounded n))
+
+;; ---------------------------------------------------------------------------
+;; token-of: the leading word of the form's first name ("" = none)
+
+(defn- strip-lead [s :string c :i64] :string
+  (let [n (string-byte-length s)] (loop [i 0] (if (and (< i n) (= (string-code-point-at s i) c)) (recur (+ i 1)) (string-substring s i n)))))
+(defn- strip-trail-set [s :string] :string
+  (loop [n (string-byte-length s)]
+    (if (and (> n 0) (let [p (string-code-point-at s (- n 1))] (or (= p 63) (= p 33) (= p 42)))) (recur (- n 1)) (string-substring s 0 n))))
+(defn- strip-trail [s :string c :i64] :string
+  (loop [n (string-byte-length s)] (if (and (> n 0) (= (string-code-point-at s (- n 1)) c)) (recur (- n 1)) (string-substring s 0 n))))
+(defn- before-dash [s :string] :string (let [k (string-index-of s "-")] (if (< k 0) s (string-substring s 0 k))))
+(defn- blank? [s :string] :bool
+  (let [n (string-byte-length s)]
+    (loop [i 0] (cond (>= i n) true
+                      (let [p (string-code-point-at s i)] (or (= p 32) (= p 9) (= p 10) (= p 13) (= p 11) (= p 12))) (recur (+ i 1))
+                      :else false))))
+
+(defn token-of [c [:ref :graph/chunk]] :string
+  (let [nm (first-name c)]
+    (if (= (string-byte-length nm) 0)
+      ""
+      (let [t (strip-trail-set (before-dash (strip-lead (strip-lead nm 42) 45)))]
+        (if (blank? t) nm t)))))
+
+;; ---------------------------------------------------------------------------
+;; condense / closures / driver
+
+(defn- comps-n [a [:ref :graph/a]] :i64 (g/comps-count (g/a-comps a)))
+
+;; comp-of: chunk idx -> atom, -1 for none
+(defn- comp-of [a [:ref :graph/a]] :vector-i64
+  (let [cs (g/a-comps a) n (g/comps-count cs) v (vfill (g/chunk-count (chunks-of a)) -1)]
+    (loop [x 0] (if (>= x n) v
+                    (let [c (g/comps-at cs x) m (vector-count c)
+                          _ (loop [i 0] (if (>= i m) 0 (let [_ (vector-assoc! v (vector-at c i) x)] (recur (+ i 1)))))]
+                      (recur (+ x 1)))))))
+
+(defn- cadj-of [a [:ref :graph/a] co :vector-i64] [:list [:ref :pt/im]]
+  (let [n (comps-n a)
+        chunks (chunks-of a)
+        cn (g/chunk-count chunks)]
+    (loop [ci 0 rows (loop [x 0 acc (typed-list-new [:list [:ref :pt/im]])] (if (>= x n) acc (recur (+ x 1) (typed-list-conj [:list [:ref :pt/im]] acc (im-new)))))]
+      (if (>= ci cn)
+        rows
+        (let [c (g/chunk-at chunks ci)]
+          (if (g/chunk-is-ns? c)
+            (recur (+ ci 1) rows)
+            (let [row (adj-row a (g/chunk-idx c))
+                  ks (g/adj-keys-in-order row)
+                  km (vector-count ks)
+                  cu (vector-at co (g/chunk-idx c))]
+              (recur (+ ci 1)
+                     (loop [i 0 rs rows]
+                       (if (>= i km) rs
+                           (let [v (vector-at ks i) cv (vector-at co v)]
+                             (if (and (>= cu 0) (>= cv 0) (not (= cu cv)))
+                               (recur (+ i 1) (let [old (typed-list-nth [:list [:ref :pt/im]] rs cu)
+                                                    nw (im-add old cv (adj-w row v))]
+                                                (loop [j 0 acc (typed-list-new [:list [:ref :pt/im]])]
+                                                  (if (>= j n) acc (recur (+ j 1) (typed-list-conj [:list [:ref :pt/im]] acc (if (= j cu) nw (typed-list-nth [:list [:ref :pt/im]] rs j))))))))
+                               (recur (+ i 1) rs)))))))))))))
+
+(defn- crow [cadj [:list [:ref :pt/im]] x :i64] [:ref :pt/im] (typed-list-nth [:list [:ref :pt/im]] cadj x))
+
+;; closures as bitsets (atoms come dependencies first)
+(defn- bwords [n :i64] :i64 (+ (quot n 64) 1))
+(defn- bit? [b :vector-i64 i :i64] :bool (not (= 0 (bit-and (vector-at b (quot i 64)) (i64-shift-left 1 (- i (* 64 (quot i 64))))))))
+(defn- bit-set! [b :vector-i64 i :i64] :vector-i64
+  (let [w (quot i 64)] (vset b w (bit-or (vector-at b w) (i64-shift-left 1 (- i (* 64 w)))))))
+
+(defn- closures [cadj [:list [:ref :pt/im]] n :i64] [:list :vector-i64]
+  (loop [x 0 cl (typed-list-new [:list :vector-i64])]
+    (if (>= x n)
+      cl
+      (let [b (vector-alloc (bwords n))
+            _ (bit-set! b x)
+            ks (im-keys (crow cadj x))
+            km (vector-count ks)
+            _2 (loop [i 0]
+                 (if (>= i km) 0
+                     (let [o (lnth cl (vector-at ks i))
+                           _ (loop [w 0] (if (>= w (vector-count o)) 0 (let [_ (vector-assoc! b w (bit-or (vector-at b w) (vector-at o w)))] (recur (+ w 1)))))]
+                       (recur (+ i 1)))))]
+        (recur (+ x 1) (typed-list-conj [:list :vector-i64] cl b))))))
+
+(defn- bcount [b :vector-i64 n :i64] :i64 (loop [i 0 c 0] (if (>= i n) c (recur (+ i 1) (if (bit? b i) (+ c 1) c)))))
+(defn- csize [cl [:list :vector-i64] lines :vector-i64 v :i64 n :i64] :i64
+  (let [b (lnth cl v)] (loop [i 0 s 0] (if (>= i n) s (recur (+ i 1) (if (bit? b i) (+ s (vector-at lines i)) s))))))
+
+;; ---------------------------------------------------------------------------
+;; partition-chunks
+
+(defn- comp-lines [a [:ref :graph/a]] :vector-i64
+  (let [cs (g/a-comps a) n (g/comps-count cs)]
+    (loop [x 0 acc (vnew)]
+      (if (>= x n) acc
+          (let [c (g/comps-at cs x) m (vector-count c)]
+            (recur (+ x 1) (vector-conj acc (loop [i 0 s 0] (if (>= i m) s (recur (+ i 1) (+ s (g/chunk-lines (chunk a (vector-at c i))))))))))))))
+
+;; tokvec of a module: token -> lines, as parallel lists
+(defn- tokvec [a [:ref :graph/a] xs :vector-i64] [:ref :pt/tv]
+  (let [cs (g/a-comps a) xm (vector-count xs)]
+    (loop [i 0 toks (strs) vals (vnew)]
+      (if (>= i xm) (record-new [:ref :pt/tv] toks vals)
+          (let [c (g/comps-at cs (vector-at xs i)) m (vector-count c)
+                r (loop [j 0 t2 toks v2 vals]
+                    (if (>= j m) (record-new [:ref :pt/tv] t2 v2)
+                        (let [ch (chunk a (vector-at c j)) t (token-of ch)]
+                          (if (= (string-byte-length t) 0)
+                            (recur (+ j 1) t2 v2)
+                            (let [k (loop [q 0] (cond (>= q (vector-count t2)) -1 (string=? (snth t2 q) t) q :else (recur (+ q 1))))]
+                              (if (< k 0)
+                                (recur (+ j 1) (sconj t2 t) (vector-conj v2 (g/chunk-lines ch)))
+                                (recur (+ j 1) t2 (vector-assoc v2 k (+ (vector-at v2 k) (g/chunk-lines ch))))))))))]
+            (recur (+ i 1) (record-get [:ref :pt/tv] r :toks) (record-get [:ref :pt/tv] r :vals)))))))
+
+(defn- tv-toks [t [:ref :pt/tv]] [:list :string] (record-get [:ref :pt/tv] t :toks))
+(defn- tv-vals [t [:ref :pt/tv]] :vector-i64 (record-get [:ref :pt/tv] t :vals))
+
+(defn- norm [t [:ref :pt/tv]] :f64
+  (let [v (tv-vals t) n (vector-count v)]
+    (f64-sqrt (fl (loop [i 0 s 0] (if (>= i n) s (recur (+ i 1) (+ s (* (vector-at v i) (vector-at v i))))))))))
+
+(defn- cosine [u [:ref :pt/tv] v [:ref :pt/tv]] :f64
+  (let [ut (tv-toks u) uv (tv-vals u) vt (tv-toks v) vv (tv-vals v) n (vector-count ut)
+        d (loop [i 0 s 0]
+            (if (>= i n) s
+                (let [k (loop [q 0] (cond (>= q (vector-count vt)) -1 (string=? (snth vt q) (snth ut i)) q :else (recur (+ q 1))))]
+                  (recur (+ i 1) (if (< k 0) s (+ s (* (vector-at uv i) (vector-at vv k))))))))
+        nu (norm u) nv (norm v)]
+    (if (and (f64-gt nu (fl 0)) (f64-gt nv (fl 0))) (f64-div (fl d) (f64-mul nu nv)) (fl 0))))
+
+(defn- st-modof [s [:ref :pt/st]] :vector-i64 (record-get [:ref :pt/st] s :modof))
+(defn- st-members [s [:ref :pt/st]] [:list :vector-i64] (record-get [:ref :pt/st] s :members))
+(defn- st-alive [s [:ref :pt/st]] :vector-i64 (record-get [:ref :pt/st] s :alive))
+
+(defn- msize [s [:ref :pt/st] lines :vector-i64 m :i64] :i64
+  (let [xs (lnth (st-members s) m) n (vector-count xs)]
+    (loop [i 0 t 0] (if (>= i n) t (recur (+ i 1) (+ t (vector-at lines (vector-at xs i))))))))
+
+(defn- live-mods [s [:ref :pt/st]] :vector-i64
+  (let [al (st-alive s) n (vector-count al)]
+    (loop [i 0 acc (vnew)] (if (>= i n) acc (recur (+ i 1) (if (= (vector-at al i) 1) (vector-conj acc i) acc))))))
+
+;; edges-between: [p q] -> weight, as parallel vectors in first-seen order
+(defn- edges-between [s [:ref :pt/st] cadj [:list [:ref :pt/im]] n :i64] [:ref :pt/eb]
+  (let [mo (st-modof s)]
+    (loop [x 0 ps (vnew) qs (vnew) ws (vnew)]
+      (if (>= x n) (record-new [:ref :pt/eb] ps qs ws)
+          (let [r (crow cadj x) ks (im-keys r) km (vector-count ks)
+                res (loop [i 0 p2 ps q2 qs w2 ws]
+                      (if (>= i km) (record-new [:ref :pt/eb] p2 q2 w2)
+                          (let [v (vector-at ks i) pm (vector-at mo x) qm (vector-at mo v)]
+                            (if (= pm qm)
+                              (recur (+ i 1) p2 q2 w2)
+                              (let [k (loop [j 0] (cond (>= j (vector-count p2)) -1 (and (= (vector-at p2 j) pm) (= (vector-at q2 j) qm)) j :else (recur (+ j 1))))]
+                                (if (< k 0)
+                                  (recur (+ i 1) (vector-conj p2 pm) (vector-conj q2 qm) (vector-conj w2 (vector-at (im-vals r) i)))
+                                  (recur (+ i 1) p2 q2 (vector-assoc w2 k (+ (vector-at w2 k) (vector-at (im-vals r) i))))))))))]
+            (recur (+ x 1) (record-get [:ref :pt/eb] res :p) (record-get [:ref :pt/eb] res :q) (record-get [:ref :pt/eb] res :w)))))))
+
+;; a path src -> .. -> dst other than the direct edge, over the module edges
+(defn- reaches? [eb [:ref :pt/eb] src :i64 dst :i64 nm :i64] :bool
+  (let [ps (record-get [:ref :pt/eb] eb :p) qs (record-get [:ref :pt/eb] eb :q) en (vector-count ps)
+        seen (vfill nm 0)
+        _ (vector-assoc! seen src 1)]
+    (loop [st (vector-conj (vnew) src)]
+      (if (= (vector-count st) 0)
+        false
+        (let [u (vector-at st (- (vector-count st) 1))
+              st2 (loop [i 0 acc (vnew)] (if (>= i (- (vector-count st) 1)) acc (recur (+ i 1) (vector-conj acc (vector-at st i)))))
+              hit (loop [i 0] (cond (>= i en) false
+                                    (and (= (vector-at ps i) u) (= (vector-at qs i) dst) (not (= u src))) true
+                                    :else (recur (+ i 1))))]
+          (if hit
+            true
+            (recur (loop [i 0 acc st2]
+                     (if (>= i en) acc
+                         (let [q (vector-at qs i)]
+                           (if (and (= (vector-at ps i) u) (not (and (= u src) (= q dst))) (= (vector-at seen q) 0))
+                             (let [_ (vector-assoc! seen q 1)] (recur (+ i 1) (vector-conj acc q)))
+                             (recur (+ i 1) acc))))))))))))
+
+;; candidate tuples: [tiny cap -score p q]; compare lexicographically
+(defn- cand-less? [t1 :i64 c1 :i64 s1 :f64 p1 :i64 q1 :i64 t2 :i64 c2 :i64 s2 :f64 p2 :i64 q2 :i64] :bool
+  (cond (not (= t1 t2)) (< t1 t2)
+        (not (= c1 c2)) (< c1 c2)
+        (f64-lt s1 s2) true
+        (f64-gt s1 s2) false
+        (not (= p1 p2)) (< p1 p2)
+        :else (< q1 q2)))
+
+(defn- set-members [ms [:list :vector-i64] m :i64 xs :vector-i64] [:list :vector-i64]
+  (let [n (vector-count ms)]
+    (loop [i 0 acc (typed-list-new [:list :vector-i64])] (if (>= i n) acc (recur (+ i 1) (typed-list-conj [:list :vector-i64] acc (if (= i m) xs (lnth ms i))))))))
+
+(defn- vcat [a :vector-i64 b :vector-i64] :vector-i64 (loop [i 0 acc a] (if (>= i (vector-count b)) acc (recur (+ i 1) (vector-conj acc (vector-at b i))))))
+
+;; sort module ids by (key1, id) ascending
+(defn- sort-by-key [ids :vector-i64 keys :vector-i64] :vector-i64
+  (let [n (vector-count ids)]
+    (loop [i 0 acc (vnew)]
+      (if (>= i n) acc
+          (let [x (vector-at ids i) kx (vector-at keys i) m (vector-count acc)
+                pos (loop [j 0] (cond (>= j m) m
+                                      (let [y (vector-at acc j) ky (vector-at keys (vidx ids y))] (or (> ky kx) (and (= ky kx) (> y x)))) j
+                                      :else (recur (+ j 1))))]
+            (recur (+ i 1) (loop [j 0 b (vnew)]
+                             (cond (> j m) b
+                                   (= j pos) (recur (+ j 1) (if (< j m) (vector-conj (vector-conj b x) (vector-at acc j)) (vector-conj b x)))
+                                   :else (recur (+ j 1) (if (< j m) (vector-conj b (vector-at acc j)) b))))))))))
+
+(defn- topo [m :i64 deps-p :vector-i64 deps-q :vector-i64 msz :vector-i64 seen :vector-i64 order :vector-i64] :vector-i64
+  (if (= (vector-at seen m) 1)
+    order
+    (let [_ (vector-assoc! seen m 1)
+          ds (loop [i 0 acc (vnew)] (if (>= i (vector-count deps-p)) acc (recur (+ i 1) (if (and (= (vector-at deps-p i) m) (< (vidx acc (vector-at deps-q i)) 0)) (vector-conj acc (vector-at deps-q i)) acc))))
+          dk (loop [i 0 acc (vnew)] (if (>= i (vector-count ds)) acc (recur (+ i 1) (vector-conj acc (vector-at msz (vector-at ds i))))))
+          sorted (sort-by-key ds dk)
+          o2 (loop [i 0 o order] (if (>= i (vector-count sorted)) o (recur (+ i 1) (topo (vector-at sorted i) deps-p deps-q msz seen o))))]
+      (vector-conj o2 m))))
+
+(defn- partition-chunks [a [:ref :graph/a] target :i64 driver-name :string] [:ref :pt/chunks]
+  (let [chunks (chunks-of a)
+        cs (g/a-comps a)
+        n (g/comps-count cs)
+        co (comp-of a)
+        cadj (cadj-of a co)
+        lines (comp-lines a)
+        cl (closures cadj n)
+        min-root 100
+        min-lines 450
+        drv (if (> (string-byte-length driver-name) 0)
+              (loop [x 0]
+                (if (>= x n) -1
+                    (let [c (g/comps-at cs x)]
+                      (if (loop [i 0] (cond (>= i (vector-count c)) false
+                                            (let [ns (g/chunk-names (chunk a (vector-at c i)))]
+                                              (loop [j 0] (cond (>= j (vector-count ns)) false (string=? (snth ns j) driver-name) true :else (recur (+ j 1)))))
+                                            true
+                                            :else (recur (+ i 1))))
+                        x (recur (+ x 1))))))
+              (loop [x 0 best -1]
+                (if (>= x n) best
+                    (let [ks (im-keys (crow cadj x))
+                          big (loop [i 0 c 0] (if (>= i (vector-count ks)) c (recur (+ i 1) (if (>= (csize cl lines (vector-at ks i) n) min-root) (+ c 1) c))))]
+                      (recur (+ x 1) (if (and (>= big 3) (or (< best 0) (> (bcount (lnth cl x) n) (bcount (lnth cl best) n)))) x best))))))]
+    (if (< drv 0)
+      (record-new [:ref :pt/chunks] (vnew) 0 (strs) (strs) 0 "no pass driver found: no form directly calls three big passes (name one with --driver)" (vnew))
+      (let [roots (ord/sort-ints (let [ks (im-keys (crow cadj drv))]
+                                   (loop [i 0 acc (vnew)] (if (>= i (vector-count ks)) acc (recur (+ i 1) (if (>= (csize cl lines (vector-at ks i) n) min-root) (vector-conj acc (vector-at ks i)) acc))))))
+            rn (vector-count roots)
+            ;; mask key per atom: "D" for the driver set, else the owner root indices
+            mask (loop [x 0 acc (strs)]
+                   (if (>= x n) acc
+                       (recur (+ x 1)
+                              (sconj acc
+                                     (if (bit? (lnth cl x) drv)
+                                       "D"
+                                       (let [own (loop [ri 0 s ""] (if (>= ri rn) s (recur (+ ri 1) (if (bit? (lnth cl (vector-at roots ri)) x) (string-concat s (string-concat (string-from-i64 ri) ",")) s))))]
+                                         (if (= (string-byte-length own) 0) "D" own)))))))
+            ;; initial modules: one per distinct owner set, ids in order of first appearance
+            init (loop [x 0 keys (strs) modof (vnew)]
+                   (if (>= x n) (record-new [:ref :pt/init] keys modof)
+                       (let [k (snth mask x)
+                             m (loop [j 0] (cond (>= j (vector-count keys)) -1 (string=? (snth keys j) k) j :else (recur (+ j 1))))]
+                         (if (< m 0)
+                           (recur (+ x 1) (sconj keys k) (vector-conj modof (vector-count keys)))
+                           (recur (+ x 1) keys (vector-conj modof m))))))
+            nmods (vector-count (record-get [:ref :pt/init] init :keys))
+            modof0 (record-get [:ref :pt/init] init :modof)
+            members0 (loop [m 0 acc (typed-list-new [:list :vector-i64])]
+                       (if (>= m nmods) acc
+                           (recur (+ m 1) (typed-list-conj [:list :vector-i64] acc
+                                                           (loop [x 0 v (vnew)] (if (>= x n) v (recur (+ x 1) (if (= (vector-at modof0 x) m) (vector-conj v x) v))))))))
+            total (loop [x 0 s 0] (if (>= x n) s (recur (+ x 1) (+ s (vector-at lines x)))))
+            cap (f64-div (f64-mul (f64-from-bits 4610334938539176755) (fl total)) (fl target))
+            final (loop [s (record-new [:ref :pt/st] modof0 members0 (vfill nmods 1)) guard 0]
+                    (let [live (live-mods s)
+                          lm (vector-count live)
+                          small (loop [i 0 c 0] (if (>= i lm) c (recur (+ i 1) (if (< (msize s lines (vector-at live i)) min-lines) (+ c 1) c))))]
+                      (if (or (and (<= lm target) (= small 0)) (<= lm 2))
+                        s
+                        (let [eb (edges-between s cadj n)
+                              ps (record-get [:ref :pt/eb] eb :p) qs (record-get [:ref :pt/eb] eb :q) ws (record-get [:ref :pt/eb] eb :w)
+                              en (vector-count ps)
+                              ;; pair weights over unordered pairs
+                              pp (loop [i 0 a1 (vnew) b1 (vnew) w1 (vnew)]
+                                   (if (>= i en) (record-new [:ref :pt/eb] a1 b1 w1)
+                                       (let [p (if (< (vector-at ps i) (vector-at qs i)) (vector-at ps i) (vector-at qs i))
+                                             q (if (< (vector-at ps i) (vector-at qs i)) (vector-at qs i) (vector-at ps i))
+                                             k (loop [j 0] (cond (>= j (vector-count a1)) -1 (and (= (vector-at a1 j) p) (= (vector-at b1 j) q)) j :else (recur (+ j 1))))]
+                                         (if (< k 0)
+                                           (recur (+ i 1) (vector-conj a1 p) (vector-conj b1 q) (vector-conj w1 (vector-at ws i)))
+                                           (recur (+ i 1) a1 b1 (vector-assoc w1 k (+ (vector-at w1 k) (vector-at ws i))))))))
+                              pa (record-get [:ref :pt/eb] pp :p) pb (record-get [:ref :pt/eb] pp :q) pw (record-get [:ref :pt/eb] pp :w)
+                              pn (vector-count pa)
+                              ;; the best candidate that keeps the quotient acyclic: scan all, keep the least admissible
+                              best (loop [i 0 bi -1 bt 0 bc 0 bs (fl 0)]
+                                     (if (>= i pn) bi
+                                         (let [p (vector-at pa i) q (vector-at pb i)
+                                               sp (msize s lines p) sq (msize s lines q)
+                                               mn (if (< sp sq) sp sq)
+                                               score (f64-mul (f64-div (fl (vector-at pw i)) (fl (+ mn 20)))
+                                                              (f64-add (fl 1) (f64-mul (fl 3) (cosine (tokvec a (lnth (st-members s) p)) (tokvec a (lnth (st-members s) q))))))
+                                               ns (f64-neg score)
+                                               t (if (< mn min-lines) 0 1)
+                                               c (if (f64-gt (fl (+ sp sq)) cap) 1 0)
+                                               better (or (< bi 0) (cand-less? t c ns p q bt bc bs (vector-at pa bi) (vector-at pb bi)))]
+                                           (if (and better (not (reaches? eb p q nmods)) (not (reaches? eb q p nmods)))
+                                             (recur (+ i 1) i t c ns)
+                                             (recur (+ i 1) bi bt bc bs)))))
+                              pq (if (>= best 0)
+                                   (vector-conj (vector-conj (vnew) (vector-at pa best)) (vector-at pb best))
+                                   (let [ks (loop [i 0 acc (vnew)] (if (>= i lm) acc (recur (+ i 1) (vector-conj acc (msize s lines (vector-at live i))))))
+                                         ms (sort-by-key live ks)]
+                                     (vector-conj (vector-conj (vnew) (vector-at ms 0)) (vector-at ms 1))))
+                              p (vector-at pq 0) q (vector-at pq 1)
+                              qx (lnth (st-members s) q)
+                              mo (loop [i 0 v (st-modof s)] (if (>= i (vector-count qx)) v (recur (+ i 1) (vector-assoc v (vector-at qx i) p))))
+                              ms2 (set-members (set-members (st-members s) p (vcat (lnth (st-members s) p) qx)) q (vnew))
+                              al (vector-assoc (st-alive s) q 0)]
+                          (recur (record-new [:ref :pt/st] mo ms2 al) (+ guard 1))))))
+            ;; done: dependencies first
+            live (live-mods final)
+            lm (vector-count live)
+            msz (loop [m 0 acc (vnew)] (if (>= m nmods) acc (recur (+ m 1) (vector-conj acc (msize final lines m)))))
+            eb (edges-between final cadj n)
+            dp (record-get [:ref :pt/eb] eb :p) dq (record-get [:ref :pt/eb] eb :q)
+            seen (vfill nmods 0)
+            negk (loop [i 0 acc (vnew)] (if (>= i lm) acc (recur (+ i 1) (vector-conj acc (- 0 (vector-at msz (vector-at live i)))))))
+            starts (sort-by-key live negk)
+            order (loop [i 0 o (vnew)] (if (>= i lm) o (recur (+ i 1) (topo (vector-at starts i) dp dq msz seen o))))
+            rank (let [r (vfill nmods -1)] (loop [i 0] (if (>= i (vector-count order)) r (let [_ (vector-assoc! r (vector-at order i) i)] (recur (+ i 1))))))
+            fmo (st-modof final)
+            cn (g/chunk-count chunks)
+            ;; chunk -> rank (-1 none), and the chunk keys in insertion order
+            cm (vfill cn -1)
+            ckeys (loop [x 0 keys (vnew)]
+                    (if (>= x n) keys
+                        (let [c (g/comps-at cs x)]
+                          (recur (+ x 1)
+                                 (loop [i 0 k2 keys]
+                                   (if (>= i (vector-count c)) k2
+                                       (let [v (vector-at c i)]
+                                         (if (has-names? (chunk a v))
+                                           (let [_ (vector-assoc! cm v (vector-at rank (vector-at fmo x)))] (recur (+ i 1) (vector-conj k2 v)))
+                                           (recur (+ i 1) k2)))))))))
+            dnames (let [c (g/comps-at cs drv)]
+                     (loop [i 0 acc (strs)] (if (or (>= i (vector-count c)) (>= (vector-count acc) 3)) acc
+                                                (recur (+ i 1) (let [nm (first-name (chunk a (vector-at c i)))] (if (> (string-byte-length nm) 0) (sconj acc nm) acc))))))
+            rnames (loop [i 0 acc (strs)] (if (>= i rn) acc
+                                              (recur (+ i 1) (let [nm (first-name (chunk a (vector-at (g/comps-at cs (vector-at roots i)) 0)))] (if (> (string-byte-length nm) 0) (sconj acc nm) acc)))))]
+        (record-new [:ref :pt/chunks] cm (vector-count order) dnames rnames nmods "" ckeys)))))
+
+;; ---------------------------------------------------------------------------
+;; name-modules
+
+(defn- tok2 [nm :string] :string
+  ;; (first (str/split (-> nm (str/replace #"^\*+|\*+$" "") (str/replace #"^-+" "")) #"-"))
+  (before-dash (strip-lead (strip-trail (strip-lead nm 42) 42) 45)))
+
+(defn- name-modules [a [:ref :graph/a] cm :vector-i64 k :i64] [:list :string]
+  (let [chunks (chunks-of a) cn (g/chunk-count chunks)
+        ;; rows (mod tok lines) in chunk order
+        rows (loop [i 0 ms (vnew) ts (strs) ls (vnew)]
+               (if (>= i cn) (record-new [:ref :pt/rows] ms ts ls)
+                   (let [c (g/chunk-at chunks i)]
+                     (if (and (>= (vector-at cm (g/chunk-idx c)) 0) (has-names? c))
+                       (recur (+ i 1) (vector-conj ms (vector-at cm (g/chunk-idx c))) (sconj ts (tok2 (first-name c))) (vector-conj ls (g/chunk-lines c)))
+                       (recur (+ i 1) ms ts ls)))))
+        rms (record-get [:ref :pt/rows] rows :ms) rts (record-get [:ref :pt/rows] rows :ts) rls (record-get [:ref :pt/rows] rows :ls)
+        rn (vector-count rms)
+        ;; distinct tokens in first-seen order, and their totals
+        toks (loop [i 0 acc (strs)] (if (>= i rn) acc (recur (+ i 1) (if (loop [j 0] (cond (>= j (vector-count acc)) false (string=? (snth acc j) (snth rts i)) true :else (recur (+ j 1)))) acc (sconj acc (snth rts i))))))
+        tn (vector-count toks)
+        tot (loop [i 0 v (vfill tn 0)] (if (>= i rn) v (let [t (tok-index toks (snth rts i))] (recur (+ i 1) (vector-assoc v t (+ (vector-at v t) (vector-at rls i)))))))]
+    (loop [m 0 used (strs) names (strs)]
+      (if (>= m k)
+        names
+        (let [;; per token count in module m
+              cnt (loop [i 0 v (vfill tn 0)] (if (>= i rn) v (recur (+ i 1) (if (= (vector-at rms i) m) (let [t (tok-index toks (snth rts i))] (vector-assoc v t (+ (vector-at v t) (vector-at rls i)))) v))))
+              ;; candidates: tokens present, ordered by (-(cnt^2 / max(1, tot)), first-seen)
+              best (loop [t 0 bt -1 bs (fl 0)]
+                     (if (>= t tn) bt
+                         (let [c (vector-at cnt t)]
+                           (if (= c 0)
+                             (recur (+ t 1) bt bs)
+                             (let [sc (f64-neg (f64-div (fl (* c c)) (fl (if (> (vector-at tot t) 1) (vector-at tot t) 1))))
+                                   nm (snth toks t)
+                                   ok (and (> (u16-count nm) 2) (not (loop [j 0] (cond (>= j (vector-count used)) false (string=? (snth used j) nm) true :else (recur (+ j 1))))))]
+                               (if (and ok (or (< bt 0) (f64-lt sc bs)))
+                                 (recur (+ t 1) t sc)
+                                 (recur (+ t 1) bt bs)))))))
+              nm (if (>= best 0) (snth toks best) (string-concat "part" (string-from-i64 m)))]
+          (recur (+ m 1) (sconj used nm) (sconj names nm)))))))
+
+(defn- tok-index [toks [:list :string] t :string] :i64
+  (loop [j 0] (cond (>= j (vector-count toks)) -1 (string=? (snth toks j) t) j :else (recur (+ j 1)))))
+
+;; ---------------------------------------------------------------------------
+;; scc-report
+
+(defn- lines-of-comp [a [:ref :graph/a] c :vector-i64] :i64
+  (loop [i 0 s 0] (if (>= i (vector-count c)) s (recur (+ i 1) (+ s (g/chunk-lines (chunk a (vector-at c i))))))))
+
+(defn- succ-of-work [n :i64 work-keys :vector-i64 work-rows [:list [:ref :pt/im]] members :vector-i64] [:list :vector-i64]
+  (loop [u 0 acc (typed-list-new [:list :vector-i64])]
+    (if (>= u n) acc
+        (let [k (vidx work-keys u)]
+          (recur (+ u 1) (typed-list-conj [:list :vector-i64] acc
+                                          (if (and (>= k 0) (>= (vidx members u) 0)) (im-order (typed-list-nth [:list [:ref :pt/im]] work-rows k)) (vnew))))))))
+
+(defn- skip-of [n :i64 members :vector-i64] :vector-i64
+  (loop [u 0 acc (vnew)] (if (>= u n) acc (recur (+ u 1) (vector-conj acc (if (>= (vidx members u) 0) 0 1))))))
+
+(defn- max-cycle-lines [a [:ref :graph/a] cs [:list :vector-i64]] :i64
+  (loop [i 0 m 0] (if (>= i (vector-count cs)) m (recur (+ i 1) (let [c (lnth cs i)] (if (> (vector-count c) 1) (let [l (lines-of-comp a c)] (if (> l m) l m)) m))))))
+
+;; the last cycle of maximal lines (apply max-key), -1 when none
+(defn- worst-cycle [a [:ref :graph/a] cs [:list :vector-i64]] :i64
+  (loop [i 0 bi -1 bl 0]
+    (if (>= i (vector-count cs)) bi
+        (let [c (lnth cs i)]
+          (if (> (vector-count c) 1)
+            (let [l (lines-of-comp a c)] (if (or (< bi 0) (>= l bl)) (recur (+ i 1) i l) (recur (+ i 1) bi bl)))
+            (recur (+ i 1) bi bl))))))
+
+(defn- open-plan [a [:ref :graph/a] big :vector-i64] [:list [:ref :pt/step]]
+  (let [n (g/chunk-count (chunks-of a))
+        members (set-order big)
+        mn (vector-count members)
+        ;; work: u -> (select-keys (nth adj u) members), in members order
+        rows0 (loop [i 0 acc (typed-list-new [:list [:ref :pt/im]])]
+                (if (>= i mn) acc
+                    (let [u (vector-at members i) r (adj-row a u)]
+                      (recur (+ i 1) (typed-list-conj [:list [:ref :pt/im]] acc
+                                                      (loop [j 0 m (im-new)]
+                                                        (if (>= j mn) m
+                                                            (let [v (vector-at members j) w (vidx (g/adj-targets r) v)]
+                                                              (recur (+ j 1) (if (< w 0) m (im-add m v (vector-at (g/adj-weights r) w))))))))))))
+        ;; the work map's own keys: members order (into {} over the set)
+        wkeys members
+        skip (skip-of n members)]
+    (loop [rows rows0 steps (typed-list-new [:list [:ref :pt/step]]) i 0]
+      (let [sub (g/tarjan n (succ-of-work n wkeys rows members) skip)
+            wc (worst-cycle a sub)]
+        (if (or (< wc 0) (>= i 40))
+          steps
+          (let [worst (lnth sub wc)
+                ;; indeg over u in worst, v in (keys (work u)) within worst: insertion order
+                indeg (loop [k 0 m (im-new)]
+                        (if (>= k (vector-count worst)) m
+                            (let [u (vector-at worst k)
+                                  wk (vidx wkeys u)
+                                  ks (if (>= wk 0) (im-order (typed-list-nth [:list [:ref :pt/im]] rows wk)) (vnew))]
+                              (recur (+ k 1) (loop [j 0 m2 m] (if (>= j (vector-count ks)) m2 (recur (+ j 1) (if (>= (vidx worst (vector-at ks j)) 0) (im-add m2 (vector-at ks j) 1) m2))))))))
+                io (im-order indeg)
+                hub-k (loop [j 1 bh (vector-at io 0) bk (im-get indeg (vector-at io 0))]
+                        (if (>= j (vector-count io)) (vector-conj (vector-conj (vnew) bh) bk)
+                            (let [h (vector-at io j) c (im-get indeg h)] (if (> c bk) (recur (+ j 1) h c) (recur (+ j 1) bh bk)))))
+                hub (vector-at hub-k 0)
+                rows2 (loop [k 0 acc (typed-list-new [:list [:ref :pt/im]])]
+                        (if (>= k mn) acc (recur (+ k 1) (typed-list-conj [:list [:ref :pt/im]] acc (im-dissoc (typed-list-nth [:list [:ref :pt/im]] rows k) hub)))))
+                sub2 (g/tarjan n (succ-of-work n wkeys rows2 members) skip)]
+            (recur rows2
+                   (typed-list-conj [:list [:ref :pt/step]] steps
+                                    (record-new [:ref :pt/step] (g/chunk-label (chunk a hub)) (vector-at hub-k 1) (max-cycle-lines a sub2)))
+                   (+ i 1))))))))
+
+;; ---------------------------------------------------------------------------
+;; partition-data
+
+(defn- name-of [names [:list :string] r :i64] :string (if (and (>= r 0) (< r (vector-count names))) (snth names r) ""))
+
+(defn partition-data [a [:ref :graph/a] target :i64 driver-name :string label-forms [:list :string] label-values [:list :string]]
+  [:ref :pt/out]
+  (let [pc (partition-chunks a target driver-name)
+        err (record-get [:ref :pt/chunks] pc :err)]
+    (if (> (string-byte-length err) 0)
+      (record-new [:ref :pt/out] err 0 (vnew) (vnew) (strs) (typed-list-new [:list [:ref :pt/mod]]) (vnew) (strs) (strs) (strs) 0
+                  (typed-list-new [:list [:ref :pt/cyc]]) (typed-list-new [:list [:ref :pt/step]]))
+      (let [cm (record-get [:ref :pt/chunks] pc :mod)
+            k (record-get [:ref :pt/chunks] pc :k)
+            ckeys (record-get [:ref :pt/chunks] pc :keys)
+            chunks (chunks-of a)
+            cn (g/chunk-count chunks)
+            names0 (name-modules a cm k)
+            ;; --names labels: rank -> label (a later form wins)
+            names (loop [i 0 nm names0]
+                    (if (>= i (vector-count label-forms)) nm
+                        (recur (+ i 1)
+                               (loop [ci 0 nm2 nm]
+                                 (if (>= ci cn) nm2
+                                     (let [c (g/chunk-at chunks ci)
+                                           hit (and (>= (vector-at cm (g/chunk-idx c)) 0)
+                                                    (let [ns (g/chunk-names c)] (loop [j 0] (cond (>= j (vector-count ns)) false (string=? (snth ns j) (snth label-forms i)) true :else (recur (+ j 1))))))]
+                                       (recur (+ ci 1)
+                                              (if hit
+                                                (let [r (vector-at cm (g/chunk-idx c))]
+                                                  (loop [j 0 acc (strs)] (if (>= j (vector-count nm2)) acc (recur (+ j 1) (sconj acc (if (= j r) (snth label-values i) (snth nm2 j)))))))
+                                                nm2))))))))
+            mods (loop [m 0 acc (typed-list-new [:list [:ref :pt/mod]])]
+                   (if (>= m k) acc
+                       (let [r (loop [ci 0 forms 0 lines 0 defs 0 idxs (vnew) rnames (strs) rcounts (vnew)]
+                                 (if (>= ci cn)
+                                   (record-new [:ref :pt/mod] (name-of names m) m forms lines defs rnames rcounts idxs)
+                                   (let [c (g/chunk-at chunks ci)]
+                                     (if (= (vector-at cm (g/chunk-idx c)) m)
+                                       (let [ks (g/adj-keys-in-order (adj-row a (g/chunk-idx c)))
+                                             dr (loop [j 0 rn rnames rc rcounts]
+                                                  (if (>= j (vector-count ks)) (record-new [:ref :pt/mod] "" 0 0 0 0 rn rc (vnew))
+                                                      (let [v (vector-at ks j) vm (vector-at cm v)]
+                                                        (if (and (>= vm 0) (not (= vm m)))
+                                                          (let [dn (name-of names vm)
+                                                                at (loop [q 0] (cond (>= q (vector-count rn)) -1 (string=? (snth rn q) dn) q :else (recur (+ q 1))))]
+                                                            (if (< at 0)
+                                                              (recur (+ j 1) (sconj rn dn) (vector-conj rc 1))
+                                                              (recur (+ j 1) rn (vector-assoc rc at (+ 1 (vector-at rc at))))))
+                                                          (recur (+ j 1) rn rc)))))]
+                                         (recur (+ ci 1) (+ forms 1) (+ lines (g/chunk-lines c)) (+ defs (vector-count (g/chunk-names c)))
+                                                (vector-conj idxs (g/chunk-idx c))
+                                                (record-get [:ref :pt/mod] dr :req-names) (record-get [:ref :pt/mod] dr :req-counts)))
+                                       (recur (+ ci 1) forms lines defs idxs rnames rcounts)))))]
+                         (recur (+ m 1) (typed-list-conj [:list [:ref :pt/mod]] acc r)))))
+            ;; edges: u in (keys chunk-mod), v in (keys (nth adj u)) with v in chunk-mod
+            kord (ord/map-order-ints ckeys (> (vector-count ckeys) 8))
+            edges (loop [i 0 acc (vnew)]
+                    (if (>= i (vector-count kord)) acc
+                        (let [u (vector-at ckeys (vector-at kord i))
+                              ks (g/adj-keys-in-order (adj-row a u))]
+                          (recur (+ i 1) (loop [j 0 a2 acc] (if (>= j (vector-count ks)) a2
+                                                                 (recur (+ j 1) (if (>= (vector-at cm (vector-at ks j)) 0) (vector-conj (vector-conj a2 u) (vector-at ks j)) a2))))))))
+            blocking (loop [i 0 acc (strs)]
+                       (if (>= i (quot (vector-count edges) 2)) acc
+                           (let [u (vector-at edges (* 2 i)) v (vector-at edges (+ (* 2 i) 1))]
+                             (recur (+ i 1)
+                                    (if (> (vector-at cm v) (vector-at cm u))
+                                      (sconj (sconj (sconj (sconj acc (name-of names (vector-at cm u))) (g/chunk-label (chunk a u)))
+                                                    (name-of names (vector-at cm v)))
+                                             (g/chunk-label (chunk a v)))
+                                      acc)))))
+            ;; cycles: comps of size > 1, sorted by descending lines (stable)
+            cs (g/a-comps a)
+            cyc-idx (loop [x 0 acc (vnew)] (if (>= x (g/comps-count cs)) acc (recur (+ x 1) (if (> (vector-count (g/comps-at cs x)) 1) (vector-conj acc x) acc))))
+            cyc-sorted (let [ks (loop [i 0 acc (vnew)] (if (>= i (vector-count cyc-idx)) acc (recur (+ i 1) (vector-conj acc (- 0 (lines-of-comp a (g/comps-at cs (vector-at cyc-idx i))))))))
+                             o (ord/sort-idx ks)]
+                         (loop [i 0 acc (vnew)] (if (>= i (vector-count o)) acc (recur (+ i 1) (vector-conj acc (vector-at cyc-idx (vector-at o i)))))))
+            cycles (loop [i 0 acc (typed-list-new [:list [:ref :pt/cyc]])]
+                     (if (>= i (vector-count cyc-sorted)) acc
+                         (let [c (g/comps-at cs (vector-at cyc-sorted i))
+                               f0 (vector-at c 0)
+                               hm (>= (vector-at cm f0) 0)]
+                           (recur (+ i 1) (typed-list-conj [:list [:ref :pt/cyc]] acc
+                                                           (record-new [:ref :pt/cyc] (vector-count c) (lines-of-comp a c)
+                                                                       (if hm (name-of names (vector-at cm f0)) "") hm
+                                                                       (loop [j 0 fs (strs)] (if (or (>= j (vector-count c)) (>= j 8)) fs (recur (+ j 1) (sconj fs (g/chunk-label (chunk a (vector-at c j)))))))))))))
+            ;; the biggest cycle: the last of maximal lines in comps order
+            bigi (loop [i 0 bi -1 bl 0]
+                   (if (>= i (vector-count cyc-idx)) bi
+                       (let [l (lines-of-comp a (g/comps-at cs (vector-at cyc-idx i)))]
+                         (if (or (< bi 0) (>= l bl)) (recur (+ i 1) (vector-at cyc-idx i) l) (recur (+ i 1) bi bl)))))
+            steps (if (< bigi 0) (typed-list-new [:list [:ref :pt/step]]) (open-plan a (g/comps-at cs bigi)))]
+        (record-new [:ref :pt/out] "" k ckeys (let [v (vnew)] (loop [i 0 acc v] (if (>= i (vector-count ckeys)) acc (recur (+ i 1) (vector-conj acc (vector-at cm (vector-at ckeys i)))))))
+                    names mods edges blocking
+                    (record-get [:ref :pt/chunks] pc :driver) (record-get [:ref :pt/chunks] pc :roots) (record-get [:ref :pt/chunks] pc :initial)
+                    cycles steps)))))
+
+;; ---------------------------------------------------------------------------
+;; accessors
+
+(defn out-err [o [:ref :pt/out]] :string (record-get [:ref :pt/out] o :err))
+(defn out-k [o [:ref :pt/out]] :i64 (record-get [:ref :pt/out] o :k))
+(defn out-chunk-keys [o [:ref :pt/out]] :vector-i64 (record-get [:ref :pt/out] o :chunk-keys))
+(defn out-chunk-ranks [o [:ref :pt/out]] :vector-i64 (record-get [:ref :pt/out] o :chunk-ranks))
+(defn out-names [o [:ref :pt/out]] [:list :string] (record-get [:ref :pt/out] o :names))
+(defn out-mods [o [:ref :pt/out]] [:list [:ref :pt/mod]] (record-get [:ref :pt/out] o :mods))
+(defn out-edges [o [:ref :pt/out]] :vector-i64 (record-get [:ref :pt/out] o :edges))
+(defn out-blocking [o [:ref :pt/out]] [:list :string] (record-get [:ref :pt/out] o :blocking))
+(defn out-driver [o [:ref :pt/out]] [:list :string] (record-get [:ref :pt/out] o :driver))
+(defn out-roots [o [:ref :pt/out]] [:list :string] (record-get [:ref :pt/out] o :roots))
+(defn out-initial [o [:ref :pt/out]] :i64 (record-get [:ref :pt/out] o :initial))
+(defn out-cycles [o [:ref :pt/out]] [:list [:ref :pt/cyc]] (record-get [:ref :pt/out] o :cycles))
+(defn out-steps [o [:ref :pt/out]] [:list [:ref :pt/step]] (record-get [:ref :pt/out] o :steps))
+(defn mods-count [xs [:list [:ref :pt/mod]]] :i64 (vector-count xs))
+(defn mods-nth [xs [:list [:ref :pt/mod]] i :i64] [:ref :pt/mod] (typed-list-nth [:list [:ref :pt/mod]] xs i))
+(defn mod-name [m [:ref :pt/mod]] :string (record-get [:ref :pt/mod] m :name))
+(defn mod-order [m [:ref :pt/mod]] :i64 (record-get [:ref :pt/mod] m :order))
+(defn mod-forms [m [:ref :pt/mod]] :i64 (record-get [:ref :pt/mod] m :forms))
+(defn mod-lines [m [:ref :pt/mod]] :i64 (record-get [:ref :pt/mod] m :lines))
+(defn mod-defs [m [:ref :pt/mod]] :i64 (record-get [:ref :pt/mod] m :defs))
+(defn mod-req-names [m [:ref :pt/mod]] [:list :string] (record-get [:ref :pt/mod] m :req-names))
+(defn mod-req-counts [m [:ref :pt/mod]] :vector-i64 (record-get [:ref :pt/mod] m :req-counts))
+(defn mod-chunks [m [:ref :pt/mod]] :vector-i64 (record-get [:ref :pt/mod] m :chunks))
+(defn cycs-count [xs [:list [:ref :pt/cyc]]] :i64 (vector-count xs))
+(defn cycs-nth [xs [:list [:ref :pt/cyc]] i :i64] [:ref :pt/cyc] (typed-list-nth [:list [:ref :pt/cyc]] xs i))
+(defn cyc-size [c [:ref :pt/cyc]] :i64 (record-get [:ref :pt/cyc] c :size))
+(defn cyc-lines [c [:ref :pt/cyc]] :i64 (record-get [:ref :pt/cyc] c :lines))
+(defn cyc-module [c [:ref :pt/cyc]] :string (record-get [:ref :pt/cyc] c :module))
+(defn cyc-has-module? [c [:ref :pt/cyc]] :bool (record-get [:ref :pt/cyc] c :has-module))
+(defn cyc-forms [c [:ref :pt/cyc]] [:list :string] (record-get [:ref :pt/cyc] c :forms))
+(defn steps-count [xs [:list [:ref :pt/step]]] :i64 (vector-count xs))
+(defn steps-nth [xs [:list [:ref :pt/step]] i :i64] [:ref :pt/step] (typed-list-nth [:list [:ref :pt/step]] xs i))
+(defn step-label [s [:ref :pt/step]] :string (record-get [:ref :pt/step] s :label))
+(defn step-cut [s [:ref :pt/step]] :i64 (record-get [:ref :pt/step] s :cut))
+(defn step-largest [s [:ref :pt/step]] :i64 (record-get [:ref :pt/step] s :largest))
