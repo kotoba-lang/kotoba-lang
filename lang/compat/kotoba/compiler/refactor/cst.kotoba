@@ -1,0 +1,474 @@
+;; kotoba.compiler.refactor.cst -- the GUEST-ROUTE twin of amu's
+;; `src/kotoba/compiler/refactor/cst.cljk`, the lossless concrete syntax tree
+;; `amu refactor` rewrites .cljk/.cljc/.clj sources with.
+;;
+;; WHY A TWIN. The host module is dynamic Clojure: nodes are maps keyed by
+;; :type, the reader returns [node end] tuples, raises `ex-info`, and `walk`
+;; calls a side-effecting callback (`doseq`). None of that has a Kotoba
+;; spelling (stage-0: "unknown operation: set"; seed: E2003 `declare`). So the
+;; guest route gets a module of the SAME NAME with a typed contract, as
+;; kotoba.compiler.kotoba-reader does. Host behaviour is untouched: nbb and the
+;; JVM never see this file (the project loader picks the `.kotoba` twin only on
+;; the project route).
+;;
+;; THE CONTRACT
+;;   (parse src)                -> :cst/out  [nodes [:list :cst/node]] [err :string] [at :i64]
+;;                                 ERR "" on success; otherwise the host's ex-info
+;;                                 message ("unterminated collection", "mismatched )",
+;;                                 "bad string", "bad regex", "bad reader conditional",
+;;                                 "unreadable") and AT its :at; NODES is then empty (the host returns none).
+;;   :cst/node = [type :keyword] [s :i64] [e :i64] [kids [:list :cst/node]]
+;;               [text :string] [prefix :string] [splice :bool]
+;;     type is the host's :type (:list :vec :map :set :fnlit :rc :prefix :meta
+;;     :sym :kw :num :str :char :regex); TEXT is "" on collections, PREFIX "" except
+;;     on :prefix nodes, SPLICE false except on a `#?@` :rc node.
+;;     A host `nil` kid (a `#_` discarded where `^` / a prefix expected a form) is
+;;     the NIL NODE: type :nil, s = e = -1 (`nil-node?`).
+;;   Helpers, same names as the host where the arity is one:
+;;     text sym? kw? lst? vec? map? head head-text call-node? call-head-text args
+;;     strip-meta region-of-feature ->fn-view node-type node-s node-e node-kids
+;;     node-text node-prefix node-splice? nil-node nil-node?
+;;   The host's 2-arity predicates are spelled sym-named? / kw-named? / call?.
+;;   `head` answers the nil node, `head-text` / `call-head-text` answer "" where
+;;   the host answers nil. `rc-branches` answers [:list :cst/branch]
+;;   ([key :string] [form :cst/node]).
+;;   `walk` (callback + :skip) becomes `walk-visits`: the pre-order list of
+;;   :cst/visit [node] [region :keyword] [index :i64] [parent :i64] [key :cst/node]
+;;   -- exactly the calls the host makes with no :skip, in the same order; REGION
+;;   and INDEX are the host ctx's :region / :index, PARENT the position in the
+;;   list of the parent node's visit (-1 at top level; the host's :path is the
+;;   chain of parents plus, under an :rc node, its feature key KEY). A caller that
+;;   would answer :skip drops the visits whose parent chain reaches the skipped one
+;;   (`walk-visits-skipping` does it for a set of skipped visit positions).
+;;
+;; OFFSETS. Host offsets count UTF-16 units (`count` / `.charAt`); here they
+;; count UTF-8 bytes (the unit `string-substring` takes), so `text` and edits
+;; work on the guest string. They agree on ASCII text. One deliberate
+;; difference beyond the unit: after a `\` the host's char literal and string
+;; escape step two UTF-16 units, which splits an astral code point; here they
+;; step one whole code point.
+
+(ns kotoba.compiler.refactor.cst
+  (:export [parse text sym? sym-named? kw? kw-named? lst? vec? map? head head-text
+            call-node? call-head-text call? args strip-meta rc-branches
+            region-of-feature walk-visits walk-visits-skipping ->fn-view
+            node-type node-s node-e node-kids node-text node-prefix node-splice?
+            nil-node nil-node? out-nodes out-err out-at
+            visit-node visit-region visit-index visit-parent visit-key
+            branch-key branch-form])
+  (:schemas {:cst/node [:record :cst/node
+                        [[:type :keyword] [:s :i64] [:e :i64]
+                         [:kids [:list [:ref :cst/node]]]
+                         [:text :string] [:prefix :string] [:splice :bool]]]
+             ;; kind: 0 a node, 1 a discard (`#_`), 2 kids of a collection, 3 an error
+             :cst/rd [:record :cst/rd
+                      [[:node [:ref :cst/node]] [:kids [:list [:ref :cst/node]]]
+                       [:pos :i64] [:kind :i64] [:err :string]]]
+             :cst/out [:record :cst/out
+                       [[:nodes [:list [:ref :cst/node]]] [:err :string] [:at :i64]]]
+             :cst/branch [:record :cst/branch [[:key :string] [:form [:ref :cst/node]]]]
+             :cst/visit [:record :cst/visit
+                         [[:node [:ref :cst/node]] [:region :keyword] [:index :i64]
+                          [:parent :i64] [:key [:ref :cst/node]]]]}))
+
+;; ---------------------------------------------------------------------------
+;; nodes
+
+(defn- no-nodes [] [:list [:ref :cst/node]]
+  (typed-list-new [:list [:ref :cst/node]]))
+
+(defn- conj-node [xs [:list [:ref :cst/node]] x [:ref :cst/node]] [:list [:ref :cst/node]]
+  (typed-list-conj [:list [:ref :cst/node]] xs x))
+
+(defn- kid [xs [:list [:ref :cst/node]] i :i64] [:ref :cst/node]
+  (typed-list-nth [:list [:ref :cst/node]] xs i))
+
+(defn- mk [t :keyword s :i64 e :i64 kids [:list [:ref :cst/node]] tx :string p :string sp :bool]
+  [:ref :cst/node]
+  (record-new [:ref :cst/node] t s e kids tx p sp))
+
+(defn nil-node [] [:ref :cst/node] (mk :nil -1 -1 (no-nodes) "" "" false))
+
+(defn node-type [n [:ref :cst/node]] :keyword (record-get [:ref :cst/node] n :type))
+(defn node-s [n [:ref :cst/node]] :i64 (record-get [:ref :cst/node] n :s))
+(defn node-e [n [:ref :cst/node]] :i64 (record-get [:ref :cst/node] n :e))
+(defn node-kids [n [:ref :cst/node]] [:list [:ref :cst/node]] (record-get [:ref :cst/node] n :kids))
+(defn node-text [n [:ref :cst/node]] :string (record-get [:ref :cst/node] n :text))
+(defn node-prefix [n [:ref :cst/node]] :string (record-get [:ref :cst/node] n :prefix))
+(defn node-splice? [n [:ref :cst/node]] :bool (record-get [:ref :cst/node] n :splice))
+(defn nil-node? [n [:ref :cst/node]] :bool (= :nil (node-type n)))
+
+(defn- coll-node [t :keyword s :i64 e :i64 kids [:list [:ref :cst/node]]] [:ref :cst/node]
+  (mk t s e kids "" "" false))
+
+(defn- atom-node [t :keyword src :string s :i64 e :i64] [:ref :cst/node]
+  (mk t s e (no-nodes) (string-substring src s e) "" false))
+
+(defn- one-node [a [:ref :cst/node]] [:list [:ref :cst/node]]
+  (typed-list-new [:list [:ref :cst/node]] a))
+
+(defn- prefix-node [p :string s :i64 e :i64 f [:ref :cst/node]] [:ref :cst/node]
+  (mk :prefix s e (one-node f) "" p false))
+
+;; ---------------------------------------------------------------------------
+;; read results
+
+(defn- rd [node [:ref :cst/node] kids [:list [:ref :cst/node]] pos :i64 kind :i64 err :string]
+  [:ref :cst/rd]
+  (record-new [:ref :cst/rd] node kids pos kind err))
+
+(defn- rd-node [r [:ref :cst/rd]] [:ref :cst/node] (record-get [:ref :cst/rd] r :node))
+(defn- rd-kids [r [:ref :cst/rd]] [:list [:ref :cst/node]] (record-get [:ref :cst/rd] r :kids))
+(defn- rd-pos [r [:ref :cst/rd]] :i64 (record-get [:ref :cst/rd] r :pos))
+(defn- rd-kind [r [:ref :cst/rd]] :i64 (record-get [:ref :cst/rd] r :kind))
+(defn- rd-err [r [:ref :cst/rd]] :string (record-get [:ref :cst/rd] r :err))
+
+(defn- ok [node [:ref :cst/node] pos :i64] [:ref :cst/rd] (rd node (no-nodes) pos 0 ""))
+(defn- discarded [pos :i64] [:ref :cst/rd] (rd (nil-node) (no-nodes) pos 1 ""))
+(defn- kids-read [kids [:list [:ref :cst/node]] pos :i64] [:ref :cst/rd] (rd (nil-node) kids pos 2 ""))
+(defn- fail [msg :string at :i64] [:ref :cst/rd] (rd (nil-node) (no-nodes) at 3 msg))
+(defn- failed? [r [:ref :cst/rd]] :bool (= 3 (rd-kind r)))
+
+;; The node a read produced; the nil node for a discard (the host's nil).
+(defn- node-or-nil [r [:ref :cst/rd]] [:ref :cst/node]
+  (if (= 1 (rd-kind r)) (nil-node) (rd-node r)))
+
+;; ---------------------------------------------------------------------------
+;; characters (offsets stay on code-point boundaries)
+
+(defn- width [p :i64] :i64
+  (if (< p 128) 1 (if (< p 2048) 2 (if (< p 65536) 3 4))))
+
+;; The code point at i, or -1 past the end (the host's nil).
+(defn- pt [s :string n :i64 i :i64] :i64
+  (if (and (>= i 0) (< i n)) (string-code-point-at s i) -1))
+
+;; space tab newline return formfeed vtab comma nbsp U+2028 U+2029 U+FEFF
+(defn- ws? [p :i64] :bool
+  (or (= p 32) (= p 9) (= p 10) (= p 13) (= p 12) (= p 11) (= p 44)
+      (= p 160) (= p 8232) (= p 8233) (= p 65279)))
+
+;; ws, ( ) [ ] { } " ;
+(defn- delim? [p :i64] :bool
+  (or (ws? p) (= p 40) (= p 41) (= p 91) (= p 93) (= p 123) (= p 125) (= p 34) (= p 59)))
+
+(defn- hex? [p :i64] :bool
+  (or (and (>= p 48) (<= p 57)) (and (>= p 97) (<= p 102)) (and (>= p 65) (<= p 70))))
+
+(defn- alpha? [p :i64] :bool
+  (or (and (>= p 97) (<= p 122)) (and (>= p 65) (<= p 90))))
+
+(defn- octal? [p :i64] :bool (and (>= p 48) (<= p 55)))
+(defn- digit? [p :i64] :bool (and (>= p 48) (<= p 57)))
+
+;; ---------------------------------------------------------------------------
+;; scanning
+
+(defn- skip-line [s :string n :i64 i :i64] :i64
+  (loop [j i]
+    (let [p (pt s n j)]
+      (if (or (< p 0) (= p 10)) j (recur (+ j (width p)))))))
+
+(defn- skip-ws [s :string n :i64 i :i64] :i64
+  (loop [j i]
+    (let [p (pt s n j)]
+      (cond
+        (< p 0) j
+        (ws? p) (recur (+ j (width p)))
+        (= p 59) (recur (skip-line s n j))
+        :else j))))
+
+(defn- atom-end [s :string n :i64 i :i64] :i64
+  (loop [j i]
+    (let [p (pt s n j)]
+      (if (or (< p 0) (delim? p)) j (recur (+ j (width p)))))))
+
+;; End (exclusive) of the string literal whose opening quote is at i, or -1.
+(defn- string-end [s :string n :i64 i :i64] :i64
+  (loop [j (+ i 1)]
+    (let [p (pt s n j)]
+      (cond
+        (< p 0) -1
+        (= p 34) (+ j 1)
+        (= p 92) (let [q (pt s n (+ j 1))]
+                   (if (< q 0) -1 (recur (+ j 1 (width q)))))
+        :else (recur (+ j (width p)))))))
+
+(defn- four-hex? [s :string n :i64 i :i64] :bool
+  (and (hex? (pt s n i)) (hex? (pt s n (+ i 1))) (hex? (pt s n (+ i 2))) (hex? (pt s n (+ i 3)))))
+
+;; End of the character literal whose backslash is at i.
+(defn- char-end [s :string n :i64 i :i64] :i64
+  (let [c1 (pt s n (+ i 1))]
+    (cond
+      (< c1 0) (+ i 1)
+      (and (= c1 117) (four-hex? s n (+ i 2))) (+ i 6)
+      (and (= c1 111) (octal? (pt s n (+ i 2))))
+      (loop [j (+ i 2) k 0]
+        (if (and (< k 3) (octal? (pt s n j))) (recur (+ j 1) (+ k 1)) j))
+      (alpha? c1) (loop [j (+ i 2)] (if (alpha? (pt s n j)) (recur (+ j 1)) j))
+      :else (+ i 1 (width c1)))))
+
+;; :kw, :num or :sym for the atom text t (non-empty).
+(defn- atom-type [t :string] :keyword
+  (let [m (string-byte-length t)
+        c (pt t m 0)
+        ;; the second character only matters after an ASCII sign (byte 1 may be interior otherwise)
+        d (if (or (= c 43) (= c 45)) (pt t m 1) -1)]
+    (cond
+      (= c 58) :kw
+      (or (digit? c) (and (or (= c 43) (= c 45)) (digit? d))) :num
+      :else :sym)))
+
+(defn- closer-of [p :i64] :i64
+  (cond (= p 40) 41 (= p 91) 93 :else 125))
+
+(defn- coll-type [p :i64] :keyword
+  (cond (= p 40) :list (= p 91) :vec :else :map))
+
+;; ---------------------------------------------------------------------------
+;; the reader
+
+;; Kids up to CLOSE; i is just after the opener.
+(defn- read-until-close [s :string n :i64 i :i64 close :i64] [:ref :cst/rd]
+  (loop [j i kids (no-nodes)]
+    (let [k (skip-ws s n j)
+          c (pt s n k)]
+      (cond
+        (< c 0) (fail "unterminated collection" k)
+        (= c close) (kids-read kids (+ k 1))
+        (or (= c 41) (= c 93) (= c 125))
+        (fail (string-concat "mismatched " (string-substring s k (+ k 1))) k)
+        :else (let [r (read-form s n k)]
+                (cond
+                  (failed? r) r
+                  (= 1 (rd-kind r)) (recur (rd-pos r) kids)
+                  :else (recur (rd-pos r) (conj-node kids (rd-node r)))))))))
+
+(defn- read-coll [s :string n :i64 i :i64 skip :i64 close :i64 t :keyword sp :bool] [:ref :cst/rd]
+  (let [r (read-until-close s n (+ i skip) close)]
+    (if (failed? r)
+      r
+      (ok (mk t i (rd-pos r) (rd-kids r) "" "" sp) (rd-pos r)))))
+
+;; One form after a prefix of LEN bytes (skipping whitespace), wrapped as a :prefix node P.
+(defn- read-prefixed [s :string n :i64 i :i64 len :i64 p :string] [:ref :cst/rd]
+  (let [r (read-form s n (skip-ws s n (+ i len)))]
+    (if (failed? r)
+      r
+      (ok (prefix-node p i (rd-pos r) (node-or-nil r)) (rd-pos r)))))
+
+(defn- read-meta [s :string n :i64 i :i64] [:ref :cst/rd]
+  (let [rm (read-form s n (skip-ws s n (+ i 1)))]
+    (if (failed? rm)
+      rm
+      (let [rf (read-form s n (skip-ws s n (rd-pos rm)))]
+        (if (failed? rf)
+          rf
+          (ok (mk :meta i (rd-pos rf)
+                  (typed-list-new [:list [:ref :cst/node]] (node-or-nil rm) (node-or-nil rf))
+                  "" "" false)
+              (rd-pos rf)))))))
+
+(defn- read-dispatch [s :string n :i64 i :i64] [:ref :cst/rd]
+  (let [c2 (pt s n (+ i 1))]
+    (cond
+      (= c2 40) (read-coll s n i 2 41 :fnlit false)
+      (= c2 123) (read-coll s n i 2 125 :set false)
+      (= c2 34) (let [e (string-end s n (+ i 1))]
+                  (if (< e 0) (fail "bad regex" i) (ok (atom-node :regex s i e) e)))
+      (= c2 95) (let [r (read-form s n (skip-ws s n (+ i 2)))]
+                  (if (failed? r) r (discarded (rd-pos r))))
+      (= c2 63) (let [sp (= 64 (pt s n (+ i 2)))
+                      o (+ i 2 (if sp 1 0))]
+                  (if (= 40 (pt s n o))
+                    (let [r (read-until-close s n (+ o 1) 41)]
+                      (if (failed? r)
+                        r
+                        (ok (mk :rc i (rd-pos r) (rd-kids r) "" "" sp) (rd-pos r))))
+                    (fail "bad reader conditional" i)))
+      (= c2 35) (let [e (atom-end s n (+ i 2))] (ok (atom-node :sym s i e) e))
+      (= c2 39) (read-prefixed s n i 2 "#'")
+      :else (let [pe (atom-end s n (+ i 1))]
+              (read-prefixed s n i (- pe i) (string-substring s i pe))))))
+
+(defn- read-form [s :string n :i64 i :i64] [:ref :cst/rd]
+  (let [c (pt s n i)]
+    (cond
+      (or (= c 40) (= c 91) (= c 123)) (read-coll s n i 1 (closer-of c) (coll-type c) false)
+      (= c 34) (let [e (string-end s n i)]
+                 (if (< e 0) (fail "bad string" i) (ok (atom-node :str s i e) e)))
+      (= c 92) (let [e (char-end s n i)] (ok (atom-node :char s i e) e))
+      (= c 94) (read-meta s n i)
+      (= c 39) (read-prefixed s n i 1 "'")
+      (= c 96) (read-prefixed s n i 1 "`")
+      (= c 64) (read-prefixed s n i 1 "@")
+      (= c 126) (if (= 64 (pt s n (+ i 1)))
+                  (read-prefixed s n i 2 "~@")
+                  (read-prefixed s n i 1 "~"))
+      (= c 35) (read-dispatch s n i)
+      :else (let [e (atom-end s n i)]
+              (if (= e i)
+                (fail "unreadable" i)
+                (let [t (string-substring s i e)]
+                  (ok (mk (atom-type t) i e (no-nodes) t "" false) e)))))))
+
+(defn- out [nodes [:list [:ref :cst/node]] err :string at :i64] [:ref :cst/out]
+  (record-new [:ref :cst/out] nodes err at))
+
+(defn out-nodes [o [:ref :cst/out]] [:list [:ref :cst/node]] (record-get [:ref :cst/out] o :nodes))
+(defn out-err [o [:ref :cst/out]] :string (record-get [:ref :cst/out] o :err))
+(defn out-at [o [:ref :cst/out]] :i64 (record-get [:ref :cst/out] o :at))
+
+(defn parse [src :string] [:ref :cst/out]
+  (let [n (string-byte-length src)]
+    (loop [i 0 acc (no-nodes)]
+      (let [j (skip-ws src n i)]
+        (if (>= j n)
+          (out acc "" -1)
+          (let [r (read-form src n j)]
+            (cond
+              (failed? r) (out (no-nodes) (rd-err r) (rd-pos r))
+              (= 1 (rd-kind r)) (recur (rd-pos r) acc)
+              :else (recur (rd-pos r) (conj-node acc (rd-node r))))))))))
+
+;; ---------------------------------------------------------------------------
+;; node helpers
+
+(defn text [src :string n [:ref :cst/node]] :string (string-substring src (node-s n) (node-e n)))
+(defn sym? [n [:ref :cst/node]] :bool (= :sym (node-type n)))
+(defn sym-named? [n [:ref :cst/node] s :string] :bool (and (sym? n) (string=? s (node-text n))))
+(defn kw? [n [:ref :cst/node]] :bool (= :kw (node-type n)))
+(defn kw-named? [n [:ref :cst/node] s :string] :bool (and (kw? n) (string=? s (node-text n))))
+(defn lst? [n [:ref :cst/node]] :bool (= :list (node-type n)))
+(defn vec? [n [:ref :cst/node]] :bool (= :vec (node-type n)))
+(defn map? [n [:ref :cst/node]] :bool (= :map (node-type n)))
+
+(defn- first-kid [n [:ref :cst/node]] [:ref :cst/node]
+  (let [ks (node-kids n)]
+    (if (> (vector-count ks) 0) (kid ks 0) (nil-node))))
+
+(defn head [n [:ref :cst/node]] [:ref :cst/node]
+  (if (lst? n) (first-kid n) (nil-node)))
+
+(defn head-text [n [:ref :cst/node]] :string
+  (let [h (head n)] (if (sym? h) (node-text h) "")))
+
+(defn call-node? [n [:ref :cst/node]] :bool
+  (or (= :list (node-type n)) (= :fnlit (node-type n))))
+
+(defn call-head-text [n [:ref :cst/node]] :string
+  (if (call-node? n)
+    (let [h (first-kid n)] (if (sym? h) (node-text h) ""))
+    ""))
+
+(defn call? [n [:ref :cst/node] s :string] :bool
+  (and (lst? n) (string=? s (head-text n))))
+
+(defn- drop-nodes [xs [:list [:ref :cst/node]] k :i64] [:list [:ref :cst/node]]
+  (let [m (vector-count xs)]
+    (loop [i k acc (no-nodes)]
+      (if (>= i m) acc (recur (+ i 1) (conj-node acc (kid xs i)))))))
+
+(defn args [n [:ref :cst/node]] [:list [:ref :cst/node]] (drop-nodes (node-kids n) 1))
+
+(defn strip-meta [n [:ref :cst/node]] [:ref :cst/node]
+  (loop [m n]
+    (if (= :meta (node-type m))
+      (let [ks (node-kids m)]
+        (if (> (vector-count ks) 1) (recur (kid ks 1)) (nil-node)))
+      m)))
+
+(defn branch-key [b [:ref :cst/branch]] :string (record-get [:ref :cst/branch] b :key))
+(defn branch-form [b [:ref :cst/branch]] [:ref :cst/node] (record-get [:ref :cst/branch] b :form))
+
+(defn rc-branches [n [:ref :cst/node]] [:list [:ref :cst/branch]]
+  (let [ks (node-kids n)
+        m (vector-count ks)]
+    (loop [i 0 acc (typed-list-new [:list [:ref :cst/branch]])]
+      (if (>= (+ i 1) m)
+        acc
+        (recur (+ i 2)
+               (typed-list-conj [:list [:ref :cst/branch]] acc
+                                (record-new [:ref :cst/branch] (node-text (kid ks i)) (kid ks (+ i 1)))))))))
+
+(defn region-of-feature [k :string] :keyword (if (string=? k ":kotoba") :kotoba :default))
+
+;; ---------------------------------------------------------------------------
+;; walk
+
+(defn visit-node [v [:ref :cst/visit]] [:ref :cst/node] (record-get [:ref :cst/visit] v :node))
+(defn visit-region [v [:ref :cst/visit]] :keyword (record-get [:ref :cst/visit] v :region))
+(defn visit-index [v [:ref :cst/visit]] :i64 (record-get [:ref :cst/visit] v :index))
+(defn visit-parent [v [:ref :cst/visit]] :i64 (record-get [:ref :cst/visit] v :parent))
+(defn visit-key [v [:ref :cst/visit]] [:ref :cst/node] (record-get [:ref :cst/visit] v :key))
+
+(defn- conj-visit [vs [:list [:ref :cst/visit]] node [:ref :cst/node] region :keyword idx :i64 parent :i64 key [:ref :cst/node]]
+  [:list [:ref :cst/visit]]
+  (typed-list-conj [:list [:ref :cst/visit]] vs
+                   (record-new [:ref :cst/visit] node region idx parent key)))
+
+;; Visit N and its subtree in pre-order, appending to VS.
+(defn- visit [vs [:list [:ref :cst/visit]] n [:ref :cst/node] region :keyword idx :i64 parent :i64 key [:ref :cst/node]]
+  [:list [:ref :cst/visit]]
+  (let [me (vector-count vs)
+        vs1 (conj-visit vs n region idx parent key)
+        ks (node-kids n)
+        m (vector-count ks)]
+    (if (= :rc (node-type n))
+      (loop [i 0 acc vs1]
+        (if (>= (+ (* 2 i) 1) m)
+          acc
+          (let [k (kid ks (* 2 i))]
+            (recur (+ i 1)
+                   (visit acc (kid ks (+ (* 2 i) 1)) (region-of-feature (node-text k)) (+ (* 2 i) 1) me k)))))
+      (loop [i 0 acc vs1]
+        (if (>= i m)
+          acc
+          (recur (+ i 1) (visit acc (kid ks i) region i me (nil-node))))))))
+
+(defn walk-visits [nodes [:list [:ref :cst/node]]] [:list [:ref :cst/visit]]
+  (let [m (vector-count nodes)]
+    (loop [i 0 acc (typed-list-new [:list [:ref :cst/visit]])]
+      (if (>= i m)
+        acc
+        (recur (+ i 1) (visit acc (kid nodes i) :shared i -1 (nil-node)))))))
+
+;; The visits of `walk-visits` without the strict descendants of the visits at
+;; the positions in SKIPS (each visit is still listed itself, as the host calls
+;; f on a node before it answers :skip).
+(defn- skipped? [skips :vector-i64 p :i64] :bool
+  (let [ns (vector-count skips)]
+    (loop [k 0]
+      (if (>= k ns) false (if (= p (vector-at skips k)) true (recur (+ k 1)))))))
+
+;; Whether a strict ancestor of visit I is in SKIPS.
+(defn- under-skip? [vs [:list [:ref :cst/visit]] skips :vector-i64 i :i64] :bool
+  (loop [p (visit-parent (typed-list-nth [:list [:ref :cst/visit]] vs i))]
+    (cond
+      (< p 0) false
+      (skipped? skips p) true
+      :else (recur (visit-parent (typed-list-nth [:list [:ref :cst/visit]] vs p))))))
+
+(defn walk-visits-skipping [vs [:list [:ref :cst/visit]] skips :vector-i64] [:list [:ref :cst/visit]]
+  (let [m (vector-count vs)]
+    (loop [i 0 acc (typed-list-new [:list [:ref :cst/visit]])]
+      (if (>= i m)
+        acc
+        (recur (+ i 1)
+               (if (under-skip? vs skips i)
+                 acc
+                 (typed-list-conj [:list [:ref :cst/visit]] acc (typed-list-nth [:list [:ref :cst/visit]] vs i))))))))
+
+(defn ->fn-view [n [:ref :cst/node]] [:ref :cst/node]
+  (let [ks (node-kids n)
+        m (vector-count ks)
+        start (loop [i 2]
+                (if (and (< i m)
+                         (or (= :str (node-type (kid ks i))) (= :map (node-type (kid ks i)))))
+                  (recur (+ i 1))
+                  i))
+        acc0 (conj-node (no-nodes) (if (> m 0) (kid ks 0) (nil-node)))
+        kids (loop [i start acc acc0]
+               (if (>= i m) acc (recur (+ i 1) (conj-node acc (kid ks i)))))]
+    (coll-node :list (node-s n) (node-e n) kids)))
