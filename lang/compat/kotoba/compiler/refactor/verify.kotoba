@@ -1,0 +1,183 @@
+;; kotoba.compiler.refactor.verify -- the GUEST-ROUTE twin of amu's `src/kotoba/compiler/refactor/verify.cljk`: the
+;; pure part of `amu refactor verify` (normalize and compare the per-test outcome lines of two cljs.test runner outputs,
+;; and the node argument vector of one run). Starting the runs needs wire 20 (process spawn), which the amu image never
+;; holds; this module is what a spawning caller would compare with.
+;;
+;; WHY A TWIN. The host module uses regexes (#":line [0-9]+", the _test.cljk location, the :message capture), sets
+;; and answers a map. The twin spells the regexes as scanners and answers a record.
+;;
+;; THE CONTRACT
+;;   (outcomes text)          -> [:list :string]   sorted normalized outcome lines (FAIL in / ERROR in / expected: /
+;;                                                 nbb: lines normalized, `  actual:` lines reduced to their :message)
+;;   (summary text)           -> :string           the last "nbb: " line, "" when none (host nil)
+;;   (compare-runs b n)       -> :verify/cmp       ok ran baseline-summary baseline-lines candidate-summary
+;;                                                 candidate-lines only-baseline only-candidate (<= 50 each) differences
+;;   (run-argv nbb stack cp first-root runner) -> [:list :string]   first-root "" = none
+;; Strings are compared byte for byte (the host sorts UTF-16 strings; equal on the runner's ASCII output).
+
+(ns kotoba.compiler.refactor.verify
+  (:require [kotoba.compiler.refactor.cljs-order :as ord])
+  (:export [outcomes summary compare-runs run-argv cmp-ok? cmp-ran? cmp-bs cmp-bn cmp-ns cmp-nn cmp-only-b cmp-only-n
+            cmp-differences norm-line norm-actual])
+  (:schemas {:verify/cmp [:record :verify/cmp
+                          [[:ok :bool] [:ran :bool] [:bs :string] [:bn :i64] [:ns :string] [:nn :i64]
+                           [:only-b [:list :string]] [:only-n [:list :string]] [:differences :i64]]]}))
+
+(defn- strs [] [:list :string] (typed-list-new [:list :string]))
+(defn- sconj [xs [:list :string] s :string] [:list :string] (typed-list-conj [:list :string] xs s))
+(defn- snth [xs [:list :string] i :i64] :string (typed-list-nth [:list :string] xs i))
+(defn- cpw [p :i64] :i64 (if (< p 128) 1 (if (< p 2048) 2 (if (< p 65536) 3 4))))
+(defn- cat [a :string b :string] :string (string-concat a b))
+
+(defn- starts-with? [s :string t :string] :bool (= (string-index-of s t) 0))
+
+;; clojure.string/split on "\n": trailing empty strings dropped
+(defn- split-lines [text :string] [:list :string]
+  (let [n (string-byte-length text)
+        all (loop [from 0 acc (strs)]
+              (let [k (if (> from n) -1 (string-index-of (string-substring text from n) "\n"))]
+                (if (< k 0)
+                  (sconj acc (string-substring text from n))
+                  (recur (+ from (+ k 1)) (sconj acc (string-substring text from (+ from k)))))))]
+    (loop [m (vector-count all)]
+      (if (and (> m 0) (= (string-byte-length (snth all (- m 1))) 0))
+        (recur (- m 1))
+        (loop [i 0 out (strs)] (if (>= i m) out (recur (+ i 1) (sconj out (snth all i)))))))))
+
+(defn- interesting? [l :string] :bool
+  (or (starts-with? l "FAIL in") (starts-with? l "ERROR in") (starts-with? l "  expected:") (starts-with? l "nbb: ")))
+
+(defn- digit? [p :i64] :bool (and (>= p 48) (<= p 57)))
+
+;; (str/replace line #":line [0-9]+" ":line N")
+(defn- norm-line-numbers [s :string] :string
+  (let [n (string-byte-length s)]
+    (loop [i 0 from 0 acc ""]
+      (let [k (if (> i n) -1 (string-index-of (string-substring s i n) ":line "))]
+        (if (< k 0)
+          (cat acc (string-substring s from n))
+          (let [at (+ i k) d0 (+ at 6)
+                d1 (loop [j d0] (if (and (< j n) (digit? (string-code-point-at s j))) (recur (+ j 1)) j))]
+            (if (> d1 d0)
+              (recur d1 d1 (cat (cat acc (string-substring s from at)) ":line N"))
+              (recur (+ at 1) from acc))))))))
+
+;; (str/replace line #"\(([^)]*_test\.cljk):[0-9]+(?::[0-9]+)?\)" "($1)"): the leftmost "(" whose run of non-")" ends
+;; in "_test.cljk:" digits (":" digits)? ")"
+(defn- loc-at [s :string i :i64] :i64
+  ;; s[i] = "(" ; the end (after ")") of a match starting here, or -1
+  (let [n (string-byte-length s)
+        close (loop [j (+ i 1)] (cond (>= j n) -1 (= (string-code-point-at s j) 41) j :else (recur (+ j (cpw (string-code-point-at s j))))))]
+    ;; [^)]* is greedy and cannot cross ")": the group is s[i+1, x) with x <= close, followed by digits etc. then ")"
+    ;; at close: so the text between i+1 and close must be <name>_test.cljk:<digits>(:<digits>)?
+    (if (< close 0)
+      -1
+      (let [inner (string-substring s (+ i 1) close)
+            m (string-byte-length inner)
+            ;; strip (:digits)? then :digits from the end
+            e1 (loop [j m] (if (and (> j 0) (digit? (string-code-point-at inner (- j 1)))) (recur (- j 1)) j))
+            ok1 (and (< e1 m) (> e1 0) (= (string-code-point-at inner (- e1 1)) 58))
+            e2 (if ok1 (loop [j (- e1 1)] (if (and (> j 0) (digit? (string-code-point-at inner (- j 1)))) (recur (- j 1)) j)) -1)
+            ok2 (and ok1 (< e2 (- e1 1)) (> e2 0) (= (string-code-point-at inner (- e2 1)) 58))
+            ;; two numeric groups: name ends before e2-1; one group: name ends before e1-1
+            name-end (if ok2 (- e2 1) (if ok1 (- e1 1) -1))
+            name-end1 (if ok1 (- e1 1) -1)
+            suffix "_test.cljk"
+            sl (string-byte-length suffix)]
+        (cond
+          (and ok2 (>= name-end sl) (string=? (string-substring inner (- name-end sl) name-end) suffix)) (+ close 1)
+          (and ok1 (>= name-end1 sl) (string=? (string-substring inner (- name-end1 sl) name-end1) suffix)) (+ close 1)
+          :else -1)))))
+
+(defn- loc-name [s :string i :i64 end :i64] :string
+  ;; the group: from i+1 to the ":" before the line number(s)
+  (let [inner (string-substring s (+ i 1) (- end 1))
+        k (string-index-of inner "_test.cljk:")]
+    (string-substring inner 0 (+ k 10))))
+
+(defn- norm-locations [s :string] :string
+  (let [n (string-byte-length s)]
+    (loop [i 0 from 0 acc ""]
+      (if (>= i n)
+        (cat acc (string-substring s from n))
+        (let [p (string-code-point-at s i)]
+          (if (= p 40)
+            (let [end (loc-at s i)]
+              (if (< end 0)
+                (recur (+ i 1) from acc)
+                (recur end end (cat (cat acc (string-substring s from i)) (cat "(" (cat (loc-name s i end) ")"))))))
+            (recur (+ i (cpw p)) from acc)))))))
+
+(defn norm-line [l :string] :string (norm-locations (norm-line-numbers l)))
+
+;; (re-find #".*(:message \"[^\"]*\").*" line): the LAST ":message \"...\"" with no quote inside (greedy .*)
+(defn- message-of [l :string] :string
+  (let [n (string-byte-length l)]
+    (loop [i 0 found ""]
+      (let [k (if (> i n) -1 (string-index-of (string-substring l i n) ":message \""))]
+        (if (< k 0)
+          found
+          (let [at (+ i k)
+                q (+ at 10)
+                close (loop [j q] (cond (>= j n) -1 (= (string-code-point-at l j) 34) j :else (recur (+ j (cpw (string-code-point-at l j))))))]
+            (recur (+ at 1) (if (< close 0) found (string-substring l at (+ close 1))))))))))
+
+(defn- u16-count [s :string] :i64
+  (let [n (string-byte-length s)]
+    (loop [i 0 k 0] (if (>= i n) k (let [p (string-code-point-at s i)] (recur (+ i (cpw p)) (+ k (if (>= p 65536) 2 1))))))))
+
+;; (subs s 0 200) in UTF-16 units (a cut inside a surrogate pair keeps the whole code point here)
+(defn- take-u16 [s :string k :i64] :string
+  (let [n (string-byte-length s)]
+    (loop [i 0 u 0] (if (or (>= i n) (>= u k)) (string-substring s 0 i)
+                        (let [p (string-code-point-at s i)] (recur (+ i (cpw p)) (+ u (if (>= p 65536) 2 1))))))))
+
+(defn norm-actual [l :string] :string
+  (let [m (message-of l)
+        s (if (> (string-byte-length m) 0) (cat "actual " m) l)]
+    (if (> (u16-count s) 200) (take-u16 s 200) s)))
+
+(defn outcomes [text :string] [:list :string]
+  (let [ls (split-lines text)
+        n (vector-count ls)
+        a (loop [i 0 acc (strs)] (if (>= i n) acc (recur (+ i 1) (if (interesting? (snth ls i)) (sconj acc (norm-line (snth ls i))) acc))))
+        b (loop [i 0 acc a] (if (>= i n) acc (recur (+ i 1) (if (starts-with? (snth ls i) "  actual:") (sconj acc (norm-actual (snth ls i))) acc))))]
+    (ord/sort-strs b)))
+
+(defn summary [text :string] :string
+  (let [ls (split-lines text) n (vector-count ls)]
+    (loop [i 0 last ""] (if (>= i n) last (recur (+ i 1) (if (starts-with? (snth ls i) "nbb: ") (snth ls i) last))))))
+
+(defn- minus [xs [:list :string] ys [:list :string]] [:list :string]
+  (let [tab (ord/tab-of ys) n (vector-count xs)]
+    (loop [i 0 acc (strs)] (if (>= i n) acc (recur (+ i 1) (if (>= (ord/tab-find tab ys (snth xs i)) 0) acc (sconj acc (snth xs i))))))))
+
+(defn- take50 [xs [:list :string]] [:list :string]
+  (let [n (vector-count xs)] (loop [i 0 acc (strs)] (if (or (>= i n) (>= i 50)) acc (recur (+ i 1) (sconj acc (snth xs i)))))))
+
+(defn- same-list? [a [:list :string] b [:list :string]] :bool
+  (and (= (vector-count a) (vector-count b))
+       (loop [i 0] (cond (>= i (vector-count a)) true (string=? (snth a i) (snth b i)) (recur (+ i 1)) :else false))))
+
+(defn compare-runs [base :string new :string] [:ref :verify/cmp]
+  (let [bo (outcomes base) no (outcomes new)
+        bs (summary base) ns (summary new)
+        ob (minus bo no) on (minus no bo)
+        ran (and (> (string-byte-length bs) 0) (> (string-byte-length ns) 0))]
+    (record-new [:ref :verify/cmp] (and ran (same-list? bo no)) ran bs (vector-count bo) ns (vector-count no)
+                (take50 ob) (take50 on) (+ (vector-count ob) (vector-count on)))))
+
+(defn cmp-ok? [c [:ref :verify/cmp]] :bool (record-get [:ref :verify/cmp] c :ok))
+(defn cmp-ran? [c [:ref :verify/cmp]] :bool (record-get [:ref :verify/cmp] c :ran))
+(defn cmp-bs [c [:ref :verify/cmp]] :string (record-get [:ref :verify/cmp] c :bs))
+(defn cmp-bn [c [:ref :verify/cmp]] :i64 (record-get [:ref :verify/cmp] c :bn))
+(defn cmp-ns [c [:ref :verify/cmp]] :string (record-get [:ref :verify/cmp] c :ns))
+(defn cmp-nn [c [:ref :verify/cmp]] :i64 (record-get [:ref :verify/cmp] c :nn))
+(defn cmp-only-b [c [:ref :verify/cmp]] [:list :string] (record-get [:ref :verify/cmp] c :only-b))
+(defn cmp-only-n [c [:ref :verify/cmp]] [:list :string] (record-get [:ref :verify/cmp] c :only-n))
+(defn cmp-differences [c [:ref :verify/cmp]] :i64 (record-get [:ref :verify/cmp] c :differences))
+
+(defn run-argv [nbb :string stack :i64 cp :string first-root :string runner :string] [:list :string]
+  (typed-list-new [:list :string] "node" (cat "--stack-size=" (string-from-i64 stack)) nbb "--classpath"
+                  (if (> (string-byte-length first-root) 0) (cat first-root (cat ":" cp)) cp)
+                  runner))

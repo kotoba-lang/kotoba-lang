@@ -1,0 +1,465 @@
+;; kotoba.compiler.refactor.rules.destructure -- the GUEST-ROUTE twin of amu's
+;; `src/kotoba/compiler/refactor/rules/destructure.cljk`, rule (a): destructuring lambda parameters -> a plain parameter
+;; plus a `let` of fe-nth / fe-get / fe-nthnext (kotoba.compiler.refactor.prelude).
+;;
+;; WHY A TWIN. The host rule is dynamic Clojure: findings and expansions are maps ({:binds [[name expr]..]} |
+;; {:human reason}), the generated names come from an atom counter inside closures, the walk is a callback over
+;; `cst/walk`, regexes classify texts. The twin keeps the same algorithm over typed records: the counter is threaded
+;; (EXPANSION records carry the next counter), the walk is the cst twin's walk-visits (path = the parent chain).
+;;
+;; THE CONTRACT
+;;   (pat? node)                       -> :bool      as the host
+;;   (expand src pat v ctr)            -> :ds/x      binds (names/exprs, in order) or human reason; ctr: the last
+;;                                                   generated number used for "dd__<base>_<n>" names (base in the record)
+;;   (find-all src nodes)              -> [:list :finding/f]  the host's findings in order; the last one is the inventory
+;;                                                   ({:kind :inventory :status :info :data {:other-destructuring ..}})
+;;                                                   whose :data rows are (head, region name, count) in update-in order
+;;   (u16-count s)                     -> :i64       UTF-16 length (the host's `count` of a string)
+
+(ns kotoba.compiler.refactor.rules.destructure
+  (:require [kotoba.compiler.refactor.cst :as cst]
+            [kotoba.compiler.refactor.edit :as edit]
+            [kotoba.compiler.refactor.finding :as fd])
+  (:export [pat? expand find-all x-human x-names x-exprs x-ctr x-human? u16-count spaces plain-text? arities-of
+            ar-params ar-body ars-count ars-nth ars-ok?])
+  (:schemas {:ds/x [:record :ds/x [[:human :string] [:names [:list :string]] [:exprs [:list :string]] [:ctr :i64]
+                                   [:base :i64]]]
+             :ds/ar [:record :ds/ar [[:params [:ref :cst/node]] [:body [:list [:ref :cst/node]]]]]
+             :ds/ars [:record :ds/ars [[:ok :bool] [:xs [:list [:ref :ds/ar]]]]]
+             :ds/rw [:record :ds/rw [[:human :string] [:edits [:list [:ref :edit/e]]] [:ctr :i64]
+                                     [:names [:list :string]] [:exprs [:list :string]]]]}))
+
+;; ---------------------------------------------------------------------------
+;; helpers
+
+(defn- strs [] [:list :string] (typed-list-new [:list :string]))
+(defn- sconj [xs [:list :string] s :string] [:list :string] (typed-list-conj [:list :string] xs s))
+(defn- snth [xs [:list :string] i :i64] :string (typed-list-nth [:list :string] xs i))
+(defn- nodes-nth [xs [:list [:ref :cst/node]] i :i64] [:ref :cst/node] (typed-list-nth [:list [:ref :cst/node]] xs i))
+(defn- kid [n [:ref :cst/node] i :i64] [:ref :cst/node]
+  (let [ks (cst/node-kids n)] (if (and (>= i 0) (< i (vector-count ks))) (nodes-nth ks i) (cst/nil-node))))
+(defn- nkids [n [:ref :cst/node]] :i64 (vector-count (cst/node-kids n)))
+(defn- ty [n [:ref :cst/node]] :keyword (cst/node-type n))
+(defn- cpw [p :i64] :i64 (if (< p 128) 1 (if (< p 2048) 2 (if (< p 65536) 3 4))))
+
+(defn u16-count [s :string] :i64
+  (let [n (string-byte-length s)]
+    (loop [i 0 k 0] (if (>= i n) k (let [p (string-code-point-at s i)] (recur (+ i (cpw p)) (+ k (if (>= p 65536) 2 1))))))))
+
+(defn spaces [n :i64] :string (loop [i 0 acc ""] (if (>= i n) acc (recur (+ i 1) (string-concat acc " ")))))
+
+(defn- includes? [s :string t :string] :bool (>= (string-index-of s t) 0))
+(defn- starts-with? [s :string t :string] :bool
+  (let [n (string-byte-length s) m (string-byte-length t)]
+    (and (>= n m) (= (string-index-of s t) 0))))
+
+(defn- join [xs [:list :string] sep :string] :string
+  (let [n (vector-count xs)]
+    (loop [i 0 acc ""] (if (>= i n) acc (recur (+ i 1) (if (= i 0) (snth xs 0) (string-concat acc (string-concat sep (snth xs i)))))))))
+
+;; #"[^\s()]+" (or with []{} too when BRACKETS): non-empty, none of JS white space and the excluded characters
+(defn- js-space? [p :i64] :bool
+  (or (= p 32) (= p 9) (= p 10) (= p 11) (= p 12) (= p 13) (= p 160) (= p 5760) (= p 8232) (= p 8233) (= p 8239)
+      (= p 8287) (= p 12288) (= p 65279) (and (>= p 8192) (<= p 8202))))
+
+(defn plain-text? [s :string brackets :bool] :bool
+  (let [n (string-byte-length s)]
+    (and (> n 0)
+         (loop [i 0]
+           (if (>= i n)
+             true
+             (let [p (string-code-point-at s i)]
+               (if (or (js-space? p) (= p 40) (= p 41)
+                       (and brackets (or (= p 91) (= p 93) (= p 123) (= p 125))))
+                 false
+                 (recur (+ i (cpw p))))))))))
+
+;; ---------------------------------------------------------------------------
+;; expansions
+
+(defn x-human [x [:ref :ds/x]] :string (record-get [:ref :ds/x] x :human))
+(defn x-human? [x [:ref :ds/x]] :bool (> (string-byte-length (x-human x)) 0))
+(defn x-names [x [:ref :ds/x]] [:list :string] (record-get [:ref :ds/x] x :names))
+(defn x-exprs [x [:ref :ds/x]] [:list :string] (record-get [:ref :ds/x] x :exprs))
+(defn x-ctr [x [:ref :ds/x]] :i64 (record-get [:ref :ds/x] x :ctr))
+(defn- x-base [x [:ref :ds/x]] :i64 (record-get [:ref :ds/x] x :base))
+
+(defn- xh [reason :string ctr :i64 base :i64] [:ref :ds/x] (record-new [:ref :ds/x] reason (strs) (strs) ctr base))
+(defn- xb [names [:list :string] exprs [:list :string] ctr :i64 base :i64] [:ref :ds/x]
+  (record-new [:ref :ds/x] "" names exprs ctr base))
+
+(defn- gen-name [base :i64 k :i64] :string
+  (string-concat "dd__" (string-concat (string-from-i64 base) (string-concat "_" (string-from-i64 k)))))
+
+(defn- append-binds [names [:list :string] exprs [:list :string] x [:ref :ds/x]] [:ref :ds/x]
+  (let [n (vector-count (x-names x))]
+    (loop [i 0 ns names es exprs]
+      (if (>= i n)
+        (xb ns es (x-ctr x) (x-base x))
+        (recur (+ i 1) (sconj ns (snth (x-names x) i)) (sconj es (snth (x-exprs x) i)))))))
+
+(defn pat? [n [:ref :cst/node]] :bool
+  (let [p (cst/strip-meta n)]
+    (cond (= :vec (ty p)) (not (cst/kw? (kid p 0)))
+          (= :map (ty p)) true
+          :else false)))
+
+(defn- bind-name [n [:ref :cst/node]] :string
+  (let [m (cst/strip-meta n)] (if (cst/sym? m) (cst/node-text m) "")))
+
+(defn- expand-vec [src :string p [:ref :cst/node] v :string ctr :i64 base :i64] [:ref :ds/x]
+  (let [m (nkids p)]
+    (loop [k 0 i 0 names (strs) exprs (strs) c ctr]
+      (if (>= k m)
+        (xb names exprs c base)
+        (let [n (kid p k)]
+          (cond
+            (cst/sym-named? n "&")
+            (let [rp (cst/strip-meta (kid p (+ k 1)))]
+              (cond (cst/nil-node? rp) (xh "dangling &" c base)
+                    (cst/map? rp) (xh "& followed by a map pattern (keyword-args destructuring)" c base)
+                    :else (let [r (expand-at src rp (string-concat "(fe-nthnext " (string-concat v (string-concat " " (string-concat (string-from-i64 i) ")")))) c base)]
+                            (if (x-human? r) r
+                                (let [y (append-binds names exprs r)] (recur (+ k 2) i (x-names y) (x-exprs y) (x-ctr r)))))))
+            (cst/kw-named? n ":as")
+            (let [nm (bind-name (kid p (+ k 1)))]
+              (if (> (string-byte-length nm) 0)
+                (recur (+ k 2) i (sconj names nm) (sconj exprs v) c)
+                (xh ":as with a non-symbol" c base)))
+            :else
+            (let [r (expand-at src n (string-concat "(fe-nth " (string-concat v (string-concat " " (string-concat (string-from-i64 i) ")")))) c base)]
+              (if (x-human? r) r
+                  (let [y (append-binds names exprs r)] (recur (+ k 1) (+ i 1) (x-names y) (x-exprs y) (x-ctr r)))))))))))
+
+;; "keys" "strs" "syms" or "" ; and the namespace qualifier ("" when none) of a :ns/keys spelling
+(defn- keys-kind [kt :string] :string
+  (let [t (string-substring kt 1 (string-byte-length kt))
+        n (string-byte-length t)
+        sl (string-index-of t "/")
+        rest (if (< sl 0) t (string-substring t (+ sl 1) n))
+        ok-ns (or (< sl 0) (and (> sl 0) (< (string-index-of rest "/") 0)))]
+    (if (and ok-ns (or (string=? rest "keys") (string=? rest "strs") (string=? rest "syms"))) rest "")))
+
+(defn- keys-ns [kt :string] :string
+  (let [t (string-substring kt 1 (string-byte-length kt))
+        sl (string-index-of t "/")]
+    (if (< sl 0) "" (string-substring t 0 sl))))
+
+;; the :or defaults: names and default texts (a later one wins, as `into {}`)
+(defn- or-default [src :string p [:ref :cst/node] nm :string] :string
+  (let [m (nkids p)]
+    (loop [k 0 found ""]
+      (if (>= (+ k 1) m)
+        found
+        (let [kk (kid p k) vv (kid p (+ k 1))]
+          (recur (+ k 2)
+                 (if (cst/kw-named? kk ":or")
+                   (let [om (cst/strip-meta vv) on (nkids om)]
+                     (loop [j 0 f found]
+                       (if (>= (+ j 1) on)
+                         f
+                         (recur (+ j 2) (if (and (cst/sym? (kid om j)) (string=? (cst/node-text (kid om j)) nm))
+                                          (cst/text src (kid om (+ j 1)))
+                                          f)))))
+                   found)))))))
+
+(defn- has-or? [src :string p [:ref :cst/node] nm :string] :bool
+  (let [m (nkids p)]
+    (loop [k 0]
+      (if (>= (+ k 1) m)
+        false
+        (let [kk (kid p k) vv (kid p (+ k 1))]
+          (if (and (cst/kw-named? kk ":or")
+                   (let [om (cst/strip-meta vv) on (nkids om)]
+                     (loop [j 0]
+                       (cond (>= (+ j 1) on) false
+                             (and (cst/sym? (kid om j)) (string=? (cst/node-text (kid om j)) nm)) true
+                             :else (recur (+ j 2))))))
+            true
+            (recur (+ k 2))))))))
+
+(defn- split-slash-first [t :string] :string (let [k (string-index-of t "/")] (if (< k 0) t (string-substring t 0 k))))
+(defn- split-slash-last [t :string] :string
+  (let [n (string-byte-length t)]
+    (loop [i 0 last 0]
+      (if (>= i n) (string-substring t last n)
+          (let [p (string-code-point-at t i)] (recur (+ i (cpw p)) (if (= p 47) (+ i 1) last)))))))
+
+(defn- fe-get-text [v :string key :string dflt :string has :bool] :string
+  (string-concat (if has "(fe-get-or " "(fe-get ")
+                 (string-concat v (string-concat " " (string-concat key (string-concat (if has (string-concat " " dflt) "") ")"))))))
+
+(defn- expand-map [src :string p [:ref :cst/node] v :string ctr :i64 base :i64] [:ref :ds/x]
+  (let [m (nkids p)]
+    (loop [k 0 names (strs) exprs (strs) c ctr]
+      (if (>= (+ k 1) m)
+        (xb names exprs c base)
+        (let [kk (kid p k) vv (kid p (+ k 1))
+              kt (if (cst/kw? kk) (cst/node-text kk) "")
+              is-kw (cst/kw? kk)]
+          (cond
+            (and is-kw (string=? kt ":or")) (recur (+ k 2) names exprs c)
+            (and is-kw (string=? kt ":as"))
+            (let [nm (bind-name vv)]
+              (if (> (string-byte-length nm) 0) (recur (+ k 2) (sconj names nm) (sconj exprs v) c) (xh ":as with a non-symbol" c base)))
+            (and is-kw (> (string-byte-length (keys-kind kt)) 0))
+            (let [kind (keys-kind kt)
+                  nsq (keys-ns kt)
+                  items (cst/strip-meta vv)
+                  im (nkids items)
+                  bad (loop [j 0] (cond (>= j im) false
+                                        (starts-with? (cst/node-text (kid items j)) "::") true
+                                        :else (recur (+ j 1))))]
+              (if (or bad (not (string=? kind "keys")))
+                (xh (if (string=? kind "keys") "auto-resolved keyword (::k) inside :keys"
+                        (string-concat ":" (string-concat kind " destructuring (string/symbol keys)")))
+                    c base)
+                (let [y (loop [j 0 ns names es exprs]
+                          (if (>= j im)
+                            (xb ns es c base)
+                            (let [it (kid items j)
+                                  t0 (cst/node-text it)
+                                  t (if (cst/kw? it) (string-substring t0 1 (string-byte-length t0)) t0)
+                                  bse (split-slash-last t)
+                                  has-sl (includes? t "/")
+                                  q (if (> (string-byte-length nsq) 0) nsq (if has-sl (split-slash-first t) ""))
+                                  kw-text (string-concat ":" (string-concat q (string-concat (if (or (> (string-byte-length nsq) 0) has-sl) "/" "") bse)))
+                                  has (has-or? src p bse)
+                                  d (or-default src p bse)]
+                              (recur (+ j 1) (sconj ns bse) (sconj es (fe-get-text v kw-text d has))))))]
+                  (recur (+ k 2) (x-names y) (x-exprs y) c))))
+            :else
+            (let [kk-text (cst/text src vv)
+                  nm (bind-name kk)]
+              (cond
+                (> (string-byte-length nm) 0)
+                (recur (+ k 2) (sconj names nm) (sconj exprs (fe-get-text v kk-text (or-default src p nm) (has-or? src p nm))) c)
+                (pat? kk)
+                (let [g (gen-name base (+ c 1))
+                      r (expand-at src kk g (+ c 1) base)]
+                  (if (x-human? r) r
+                      (let [y (append-binds (sconj names g) (sconj exprs (string-concat "(fe-get " (string-concat v (string-concat " " (string-concat kk-text ")"))))) r)]
+                        (recur (+ k 2) (x-names y) (x-exprs y) (x-ctr r)))))
+                :else (xh "unrecognised map-pattern key" c base)))))))))
+
+(defn- kw-name-of [t :keyword] :string (keyword-name t))
+
+;; expand with a generated-name base and counter
+(defn- expand-at [src :string pat [:ref :cst/node] v :string ctr :i64 base :i64] [:ref :ds/x]
+  (let [p (cst/strip-meta pat)
+        t (ty p)]
+    (cond
+      (= t :sym) (if (string=? "_" (cst/node-text p)) (xb (strs) (strs) ctr base) (xb (sconj (strs) (cst/node-text p)) (sconj (strs) v) ctr base))
+      (or (= t :vec) (= t :map))
+      (if (plain-text? v false)
+        (if (= t :vec) (expand-vec src p v ctr base) (expand-map src p v ctr base))
+        (let [g (gen-name base (+ ctr 1))
+              r (if (= t :vec) (expand-vec src p g (+ ctr 1) base) (expand-map src p g (+ ctr 1) base))]
+          (if (x-human? r) r (append-binds (sconj (strs) g) (sconj (strs) v) r))))
+      :else (xh (string-concat "unsupported pattern " (kw-name-of t)) ctr base))))
+
+;; generated names are "dd__<base>_<n>", n counting from ctr + 1
+(defn expand [src :string pat [:ref :cst/node] v :string ctr :i64 base :i64] [:ref :ds/x]
+  (expand-at src pat v ctr base))
+
+;; ---------------------------------------------------------------------------
+;; arities
+
+(defn ar-params [a [:ref :ds/ar]] [:ref :cst/node] (record-get [:ref :ds/ar] a :params))
+(defn ar-body [a [:ref :ds/ar]] [:list [:ref :cst/node]] (record-get [:ref :ds/ar] a :body))
+(defn ars-ok? [a [:ref :ds/ars]] :bool (record-get [:ref :ds/ars] a :ok))
+(defn- ars-xs [a [:ref :ds/ars]] [:list [:ref :ds/ar]] (record-get [:ref :ds/ars] a :xs))
+(defn ars-count [a [:ref :ds/ars]] :i64 (vector-count (ars-xs a)))
+(defn ars-nth [a [:ref :ds/ars]] [:ref :ds/ar] (typed-list-nth [:list [:ref :ds/ar]] (ars-xs a) 0))
+(defn- ar-at [a [:ref :ds/ars] i :i64] [:ref :ds/ar] (typed-list-nth [:list [:ref :ds/ar]] (ars-xs a) i))
+
+(defn- kids-from [n [:ref :cst/node] i :i64] [:list [:ref :cst/node]]
+  (let [m (nkids n)]
+    (loop [k i acc (typed-list-new [:list [:ref :cst/node]])]
+      (if (>= k m) acc (recur (+ k 1) (typed-list-conj [:list [:ref :cst/node]] acc (kid n k)))))))
+
+;; [[params body] ...] of (fn name? [..] ..) / (fn name? ([..] ..) ...); ok false = the host's nil
+(defn arities-of [fnode [:ref :cst/node]] [:ref :ds/ars]
+  (let [st (if (cst/sym? (kid fnode 1)) 2 1)
+        m (nkids fnode)]
+    (cond
+      (cst/vec? (kid fnode st))
+      (record-new [:ref :ds/ars] true (typed-list-new [:list [:ref :ds/ar]] (record-new [:ref :ds/ar] (kid fnode st) (kids-from fnode (+ st 1)))))
+      (loop [k st] (cond (>= k m) true (cst/lst? (kid fnode k)) (recur (+ k 1)) :else false))
+      (record-new [:ref :ds/ars] true
+                  (loop [k st acc (typed-list-new [:list [:ref :ds/ar]])]
+                    (if (>= k m) acc
+                        (recur (+ k 1) (typed-list-conj [:list [:ref :ds/ar]] acc
+                                                        (record-new [:ref :ds/ar] (kid (kid fnode k) 0) (kids-from (kid fnode k) 1)))))))
+      :else (record-new [:ref :ds/ars] false (typed-list-new [:list [:ref :ds/ar]])))))
+
+(defn- any-pat? [pv [:ref :cst/node]] :bool
+  (let [m (nkids pv)] (loop [k 0] (cond (>= k m) false (pat? (kid pv k)) true :else (recur (+ k 1))))))
+
+(defn- any-ar-pat? [a [:ref :ds/ars]] :bool
+  (let [m (ars-count a)] (loop [k 0] (cond (>= k m) false (any-pat? (ar-params (ar-at a k))) true :else (recur (+ k 1))))))
+
+;; ---------------------------------------------------------------------------
+;; rewriting one fn
+
+(defn- line-start [starts [:list :i64] off :i64] :i64
+  (typed-list-nth [:list :i64] starts (- (edit/offset->line starts off) 1)))
+
+(defn- format-binds [src :string starts [:list :i64] ins :i64 names [:list :string] exprs [:list :string]] :string
+  (let [n (vector-count names)
+        flat (loop [i 0 acc (strs)] (if (>= i n) acc (recur (+ i 1) (sconj acc (string-concat (snth names i) (string-concat " " (snth exprs i)))))))
+        one (join flat " ")
+        col (u16-count (string-substring src (line-start starts ins) ins))]
+    (if (< (+ col (+ 6 (u16-count one))) 110)
+      (string-concat "(let [" (string-concat one "]"))
+      (string-concat "(let [" (string-concat (join flat (string-concat "\n" (spaces (+ col 6)))) "]")))))
+
+;; one arity -> edits, or a human reason; threads the counter
+(defn- rw-arity [src :string starts [:list :i64] pv [:ref :cst/node] body [:list [:ref :cst/node]] ctr :i64 base :i64
+                 acc [:list [:ref :edit/e]]] [:ref :ds/rw]
+  (let [m (nkids pv)
+        r (loop [k 0 c ctr names (strs) exprs (strs) pedits (edit/edits-new)]
+            (if (>= k m)
+              (record-new [:ref :ds/rw] "" pedits c names exprs)
+              (let [p (kid pv k)]
+                (if (pat? p)
+                  (let [g (gen-name base (+ c 1))
+                        x (expand-at src p g (+ c 1) base)]
+                    (if (x-human? x)
+                      (record-new [:ref :ds/rw] (x-human x) pedits (x-ctr x) names exprs)
+                      (let [y (append-binds names exprs x)]
+                        (recur (+ k 1) (x-ctr x) (x-names y) (x-exprs y)
+                               (edit/edits-conj pedits (edit/replace-node p g "destructure"))))))
+                  (recur (+ k 1) c names exprs pedits)))))]
+    (if (> (string-byte-length (rw-human r)) 0)
+      r
+      (let [names (rw-names r) exprs (rw-exprs r)
+            fb (nodes-nth body 0)
+            lb (nodes-nth body (- (vector-count body) 1))
+            ins (cst/node-s fb)
+            same-line (= (edit/offset->line starts ins) (edit/offset->line starts (cst/node-e pv)))
+            open (edit/insert-at ins (string-concat (format-binds src starts ins names exprs)
+                                                    (if same-line " " (string-concat "\n" (string-concat (edit/line-indent src ins) "  "))))
+                                 "destructure" -1)
+            close (edit/insert-at (cst/node-e lb) ")" "destructure" 1)
+            es0 (let [pe (rw-edits r) pm (edit/edits-count pe)]
+                  (loop [i 0 a acc] (if (>= i pm) a (recur (+ i 1) (edit/edits-conj a (edit/edits-nth pe i))))))
+            es (if (> (vector-count names) 0) (edit/edits-conj (edit/edits-conj es0 open) close) es0)]
+        (record-new [:ref :ds/rw] "" es (rw-ctr r) names exprs)))))
+
+(defn- rw-human [r [:ref :ds/rw]] :string (record-get [:ref :ds/rw] r :human))
+(defn- rw-edits [r [:ref :ds/rw]] [:list [:ref :edit/e]] (record-get [:ref :ds/rw] r :edits))
+(defn- rw-ctr [r [:ref :ds/rw]] :i64 (record-get [:ref :ds/rw] r :ctr))
+(defn- rw-names [r [:ref :ds/rw]] [:list :string] (record-get [:ref :ds/rw] r :names))
+(defn- rw-exprs [r [:ref :ds/rw]] [:list :string] (record-get [:ref :ds/rw] r :exprs))
+
+;; the rest parameter after & holds a destructuring pattern that is not a symbol
+(defn- rest-destructures? [pv [:ref :cst/node]] :bool
+  (let [m (nkids pv)
+        amp (loop [k 0] (cond (>= k m) m (cst/sym-named? (kid pv k) "&") k :else (recur (+ k 1))))]
+    (loop [k (+ amp 1)] (cond (>= k m) false (and (pat? (kid pv k)) (not (cst/sym? (kid pv k)))) true :else (recur (+ k 1))))))
+
+(defn- has-amp? [pv [:ref :cst/node]] :bool
+  (let [m (nkids pv)]
+    (loop [k 0] (cond (>= k m) false
+                      (and (cst/sym? (cst/strip-meta (kid pv k))) (string=? "&" (cst/node-text (kid pv k)))) true
+                      :else (recur (+ k 1))))))
+
+;; -> status "auto" with edits | "human" with a reason
+(defn- rewrite-fn [src :string starts [:list :i64] ix [:ref :finding/u16] n [:ref :cst/node]] [:ref :ds/rw]
+  (let [text (cst/text src n)
+        base (fd/u16-off ix (cst/node-s n))
+        ars (arities-of n)]
+    (cond
+      (not (ars-ok? ars)) (record-new [:ref :ds/rw] "unrecognised fn shape" (edit/edits-new) 0 (strs) (strs))
+      (includes? text (string-concat "dd__" (string-concat (string-from-i64 base) "_")))
+      (record-new [:ref :ds/rw] "generated-name collision (dd__)" (edit/edits-new) 0 (strs) (strs))
+      :else
+      (let [m (ars-count ars)]
+        (loop [k 0 c 0 es (edit/edits-new)]
+          (if (>= k m)
+            (record-new [:ref :ds/rw] "" es c (strs) (strs))
+            (let [a (ar-at ars k)
+                  pv (ar-params a)
+                  body (ar-body a)]
+              (if (not (any-pat? pv))
+                (recur (+ k 1) c es)
+                (cond
+                  (= (vector-count body) 0) (record-new [:ref :ds/rw] "empty body" es c (strs) (strs))
+                  (and (cst/map? (nodes-nth body 0)) (> (vector-count body) 1))
+                  (record-new [:ref :ds/rw] "pre/post condition map" es c (strs) (strs))
+                  (and (has-amp? pv) (rest-destructures? pv))
+                  (record-new [:ref :ds/rw] "destructuring in the & rest parameter" es c (strs) (strs))
+                  :else
+                  (let [r (rw-arity src starts pv body c base es)]
+                    (if (> (string-byte-length (rw-human r)) 0)
+                      r
+                      (recur (+ k 1) (rw-ctr r) (rw-edits r)))))))))))))
+
+;; ---------------------------------------------------------------------------
+;; the walk
+
+(defn- vnode [vs [:list [:ref :cst/visit]] i :i64] [:ref :cst/node] (cst/visit-node (typed-list-nth [:list [:ref :cst/visit]] vs i)))
+
+;; the host's (last path): the rc feature key under an :rc parent, else the parent node; the nil node at top level
+(defn- last-path [vs [:list [:ref :cst/visit]] v [:ref :cst/visit]] [:ref :cst/node]
+  (cond (not (cst/nil-node? (cst/visit-key v))) (cst/visit-key v)
+        (< (cst/visit-parent v) 0) (cst/nil-node)
+        :else (vnode vs (cst/visit-parent v))))
+
+(defn- context-of [p [:ref :cst/node]] :string
+  (cond (and (cst/lst? p) (> (string-byte-length (cst/head-text p)) 0)) (cst/head-text p)
+        (= :prefix (ty p)) "prefix"
+        :else "other"))
+
+(defn- other-head? [h :string] :bool
+  (or (string=? h "let") (string=? h "loop") (string=? h "doseq") (string=? h "for") (string=? h "when-let")
+      (string=? h "if-let") (string=? h "when-some") (string=? h "if-some")))
+
+(defn- pairs-pat? [bv [:ref :cst/node]] :bool
+  (let [m (nkids bv)] (loop [k 0] (cond (>= (+ k 1) m) false (pat? (kid bv k)) true :else (recur (+ k 2))))))
+
+;; inventory rows (head, region, count): bump in update-in order
+(defn- bump [rows [:list [:ref :finding/row]] h :string region :string] [:list [:ref :finding/row]]
+  (let [m (fd/rows-count rows)
+        at (loop [k 0] (cond (>= k m) -1
+                             (and (string=? (fd/row-a (fd/rows-nth rows k)) h) (string=? (fd/row-b (fd/rows-nth rows k)) region)) k
+                             :else (recur (+ k 1))))]
+    (if (< at 0)
+      (fd/rows-conj rows (fd/row h region 1))
+      (loop [k 0 acc (fd/rows-new)]
+        (if (>= k m) acc
+            (recur (+ k 1) (fd/rows-conj acc (if (= k at) (fd/row h region (+ 1 (fd/row-n (fd/rows-nth rows k)))) (fd/rows-nth rows k)))))))))
+
+(defn find-all [src :string nodes [:list [:ref :cst/node]]] [:list [:ref :finding/f]]
+  (let [vs (cst/walk-visits nodes)
+        nv (vector-count vs)
+        starts (edit/line-starts src)
+        ix (fd/u16-index src)]
+    (loop [i 0 out (fd/fs-new) other (fd/rows-new)]
+      (if (>= i nv)
+        (fd/fs-conj out (fd/mk "destructure" 0 0 :shared "info" -1 "" "" "inventory" true (edit/edits-new) other))
+        (let [v (typed-list-nth [:list [:ref :cst/visit]] vs i)
+              n (cst/visit-node v)
+              region (cst/visit-region v)
+              h (if (cst/lst? n) (cst/head-text n) "")
+              out2 (if (and (cst/lst? n) (or (string=? h "fn") (string=? h "fn*")))
+                     (let [ars (arities-of n)]
+                       (if (and (ars-ok? ars) (any-ar-pat? ars))
+                         (let [r (rewrite-fn src starts ix n)
+                               ctx (context-of (last-path vs v))
+                               line (edit/offset->line starts (cst/node-s n))]
+                           (fd/fs-conj out
+                                       (if (> (string-byte-length (rw-human r)) 0)
+                                         (fd/human "destructure" (cst/node-s n) (cst/node-e n) region line ctx (rw-human r) "" false)
+                                         (fd/auto "destructure" (cst/node-s n) (cst/node-e n) region line ctx "" false (rw-edits r)))))
+                         out))
+                     out)
+              other2 (if (cst/lst? n)
+                       (let [a0 (kid n 1)]
+                         (cond (and (other-head? h) (cst/vec? a0) (pairs-pat? a0)) (bump other h (keyword-name region))
+                               (and (or (string=? h "defn") (string=? h "defn-")) (let [fa (arities-of (cst/->fn-view n))] (and (ars-ok? fa) (any-ar-pat? fa))))
+                               (bump other "defn params" (keyword-name region))
+                               :else other))
+                       other)]
+          (recur (+ i 1) out2 other2))))))

@@ -1,0 +1,225 @@
+;; kotoba.compiler.refactor.core -- the GUEST-ROUTE twin of amu's `src/kotoba/compiler/refactor/core.cljk`: the driver
+;; of `amu refactor plan/apply` (parse -> rules find -> select conflict-free findings -> apply -> re-parse, until a pass
+;; changes nothing), the helper prelude insertion and the per-rule summary.
+;;
+;; WHY A TWIN. The host driver takes rule MAPS holding find functions and answers maps; the twin dispatches on the rule
+;; id ("a" .. "f") to the rule twins and answers typed records. Rule (c) dynvars has no twin yet: a run that names it is
+;; refused by the caller (amu.refactor-cli answers the declared stub), so `run` never sees "c".
+;;
+;; THE CONTRACT
+;;   :core/opts = [include-ported :bool] [lower-accessor :bool] [regions [:list :string]] (empty = the rule's default
+;;                #{:shared :default}) [max-passes :i64] [dry-run :bool]
+;;   (run src rule-ids opts)  -> :core/res  src (the output), first (the findings of the original source), applied
+;;                               (applied findings, pass set), passes, err (a pass produced text the cst twin cannot
+;;                               read: its message; "" otherwise)
+;;   (ensure-prelude src)     -> :string
+;;   (summary-rules first)    -> the rules in group-by order; summarize itself is printed by amu.refactor-cli
+
+(ns kotoba.compiler.refactor.core
+  (:require [kotoba.compiler.refactor.cst :as cst]
+            [kotoba.compiler.refactor.edit :as edit]
+            [kotoba.compiler.refactor.prelude :as prelude]
+            [kotoba.compiler.refactor.finding :as fd]
+            [kotoba.compiler.refactor.rules.destructure :as ra]
+            [kotoba.compiler.refactor.rules.reject :as rb]
+            [kotoba.compiler.refactor.rules.kwcallback :as rd]
+            [kotoba.compiler.refactor.rules.letdestructure :as re]
+            [kotoba.compiler.refactor.rules.lowerloops :as rf])
+  (:export [run ensure-prelude opts res-src res-first res-applied res-passes res-err])
+  (:schemas {:core/opts [:record :core/opts [[:include-ported :bool] [:lower-accessor :bool] [:regions [:list :string]]
+                                             [:max-passes :i64] [:dry-run :bool]]]
+             :core/res [:record :core/res [[:src :string] [:first [:list [:ref :finding/f]]]
+                                           [:applied [:list [:ref :finding/f]]] [:passes :i64] [:err :string]]]
+             :core/rg [:record :core/rg [[:s :vector-i64] [:e :vector-i64]]]
+             :core/sel [:record :core/sel [[:chosen [:list [:ref :finding/f]]] [:edits [:list [:ref :edit/e]]]]]}))
+
+(defn opts [ip :bool la :bool regions [:list :string] mp :i64 dry :bool] [:ref :core/opts]
+  (record-new [:ref :core/opts] ip la regions mp dry))
+(defn- o-ip [o [:ref :core/opts]] :bool (record-get [:ref :core/opts] o :include-ported))
+(defn- o-la [o [:ref :core/opts]] :bool (record-get [:ref :core/opts] o :lower-accessor))
+(defn- o-regions [o [:ref :core/opts]] [:list :string] (record-get [:ref :core/opts] o :regions))
+(defn- o-mp [o [:ref :core/opts]] :i64 (record-get [:ref :core/opts] o :max-passes))
+(defn- o-dry [o [:ref :core/opts]] :bool (record-get [:ref :core/opts] o :dry-run))
+
+(defn res-src [r [:ref :core/res]] :string (record-get [:ref :core/res] r :src))
+(defn res-first [r [:ref :core/res]] [:list [:ref :finding/f]] (record-get [:ref :core/res] r :first))
+(defn res-applied [r [:ref :core/res]] [:list [:ref :finding/f]] (record-get [:ref :core/res] r :applied))
+(defn res-passes [r [:ref :core/res]] :i64 (record-get [:ref :core/res] r :passes))
+(defn res-err [r [:ref :core/res]] :string (record-get [:ref :core/res] r :err))
+
+(defn- nodes-nth [xs [:list [:ref :cst/node]] i :i64] [:ref :cst/node] (typed-list-nth [:list [:ref :cst/node]] xs i))
+
+;; ---------------------------------------------------------------------------
+;; ported ranges: the non-:kotoba arms of every top-level reader conditional with a non-nil :kotoba arm
+
+(defn- ported-ranges [nodes [:list [:ref :cst/node]]] [:ref :core/rg]
+  (let [m (vector-count nodes)]
+    (loop [i 0 ss (vector-alloc 0) es (vector-alloc 0)]
+      (if (>= i m)
+        (record-new [:ref :core/rg] ss es)
+        (let [n (nodes-nth nodes i)]
+          (if (not (= :rc (cst/node-type n)))
+            (recur (+ i 1) ss es)
+            (let [bs (cst/rc-branches n)
+                  bm (vector-count bs)
+                  kot (loop [k 0] (cond (>= k bm) (cst/nil-node)
+                                        (string=? ":kotoba" (cst/branch-key (typed-list-nth [:list [:ref :cst/branch]] bs k)))
+                                        (cst/branch-form (typed-list-nth [:list [:ref :cst/branch]] bs k))
+                                        :else (recur (+ k 1))))]
+              (if (or (cst/nil-node? kot) (cst/sym-named? kot "nil"))
+                (recur (+ i 1) ss es)
+                (let [r (loop [k 0 s2 ss e2 es]
+                          (if (>= k bm)
+                            (record-new [:ref :core/rg] s2 e2)
+                            (let [b (typed-list-nth [:list [:ref :cst/branch]] bs k)]
+                              (if (string=? ":kotoba" (cst/branch-key b))
+                                (recur (+ k 1) s2 e2)
+                                (recur (+ k 1) (vector-conj s2 (cst/node-s (cst/branch-form b))) (vector-conj e2 (cst/node-e (cst/branch-form b))))))))]
+                  (recur (+ i 1) (record-get [:ref :core/rg] r :s) (record-get [:ref :core/rg] r :e)))))))))))
+
+(defn- in-ranges? [rg [:ref :core/rg] s :i64 e :i64] :bool
+  (let [ss (record-get [:ref :core/rg] rg :s) es (record-get [:ref :core/rg] rg :e) m (vector-count ss)]
+    (loop [k 0] (cond (>= k m) false (and (>= s (vector-at ss k)) (<= e (vector-at es k))) true :else (recur (+ k 1))))))
+
+(defn- region-ok? [o [:ref :core/opts] region :keyword] :bool
+  (let [rs (o-regions o) m (vector-count rs)]
+    (if (= m 0)
+      (or (= region :shared) (= region :default))
+      (loop [k 0] (cond (>= k m) false (string=? (typed-list-nth [:list :string] rs k) (keyword-name region)) true :else (recur (+ k 1)))))))
+
+(defn- find-rule [id :string src :string nodes [:list [:ref :cst/node]] o [:ref :core/opts]] [:list [:ref :finding/f]]
+  (cond (string=? id "a") (ra/find-all src nodes)
+        (string=? id "b") (rb/find-all src nodes)
+        (string=? id "d") (rd/find-all src nodes (o-la o))
+        (string=? id "e") (re/find-all src nodes)
+        (string=? id "f") (rf/find-all src nodes)
+        :else (fd/fs-new)))
+
+(defn- find-findings [src :string nodes [:list [:ref :cst/node]] ids [:list :string] o [:ref :core/opts]] [:list [:ref :finding/f]]
+  (let [rg (ported-ranges nodes)
+        m (vector-count ids)]
+    (loop [k 0 out (fd/fs-new)]
+      (if (>= k m)
+        out
+        (let [fs (find-rule (typed-list-nth [:list :string] ids k) src nodes o)
+              fm (fd/fs-count fs)]
+          (recur (+ k 1)
+                 (loop [j 0 acc out]
+                   (if (>= j fm)
+                     acc
+                     (let [f (fd/fs-nth fs j)
+                           f2 (fd/with-ported f (in-ranges? rg (fd/f-s f) (fd/f-e f)))]
+                       (recur (+ j 1) (if (region-ok? o (fd/f-region f2)) (fd/fs-conj acc f2) acc)))))))))))
+
+;; ---------------------------------------------------------------------------
+;; select-findings: autos with edits (not ported unless --include-ported / force), smallest span first (stable);
+;; a finding is applied only if none of its edits conflicts with an edit already chosen
+
+(defn- sort-by-span [xs [:list [:ref :finding/f]]] [:list [:ref :finding/f]]
+  (let [n (fd/fs-count xs)]
+    (if (< n 2)
+      xs
+      (let [h (quot n 2)
+            a (sort-by-span (loop [k 0 acc (fd/fs-new)] (if (>= k h) acc (recur (+ k 1) (fd/fs-conj acc (fd/fs-nth xs k))))))
+            b (sort-by-span (loop [k h acc (fd/fs-new)] (if (>= k n) acc (recur (+ k 1) (fd/fs-conj acc (fd/fs-nth xs k))))))
+            an (fd/fs-count a) bn (fd/fs-count b)]
+        (loop [i 0 j 0 acc (fd/fs-new)]
+          (cond (and (>= i an) (>= j bn)) acc
+                (>= i an) (recur i (+ j 1) (fd/fs-conj acc (fd/fs-nth b j)))
+                (>= j bn) (recur (+ i 1) j (fd/fs-conj acc (fd/fs-nth a i)))
+                (<= (- (fd/f-e (fd/fs-nth a i)) (fd/f-s (fd/fs-nth a i))) (- (fd/f-e (fd/fs-nth b j)) (fd/f-s (fd/fs-nth b j))))
+                (recur (+ i 1) j (fd/fs-conj acc (fd/fs-nth a i)))
+                :else (recur i (+ j 1) (fd/fs-conj acc (fd/fs-nth b j)))))))))
+
+(defn- any-conflict? [chosen [:list [:ref :edit/e]] es [:list [:ref :edit/e]]] :bool
+  (let [n (edit/edits-count es) m (edit/edits-count chosen)]
+    (loop [i 0]
+      (cond (>= i n) false
+            (loop [j 0] (cond (>= j m) false (edit/conflicts? (edit/edits-nth es i) (edit/edits-nth chosen j)) true :else (recur (+ j 1)))) true
+            :else (recur (+ i 1))))))
+
+;; -> chosen findings and their edits
+(defn- select [fs [:list [:ref :finding/f]] o [:ref :core/opts]] [:ref :core/sel]
+  (let [n (fd/fs-count fs)
+        autos (loop [k 0 acc (fd/fs-new)]
+                (if (>= k n) acc
+                    (let [f (fd/fs-nth fs k)]
+                      (recur (+ k 1) (if (and (string=? "auto" (fd/f-status f)) (> (edit/edits-count (fd/f-edits f)) 0)
+                                              (or (o-ip o) (fd/f-force? f) (not (fd/f-ported? f))))
+                                       (fd/fs-conj acc f) acc)))))
+        sorted (sort-by-span autos)
+        sn (fd/fs-count sorted)]
+    (loop [k 0 chosen (fd/fs-new) edits (edit/edits-new)]
+      (if (>= k sn)
+        (record-new [:ref :core/sel] chosen edits)
+        (let [f (fd/fs-nth sorted k)]
+          (if (any-conflict? edits (fd/f-edits f))
+            (recur (+ k 1) chosen edits)
+            (recur (+ k 1) (fd/fs-conj chosen f)
+                   (let [es (fd/f-edits f) em (edit/edits-count es)]
+                     (loop [i 0 acc edits] (if (>= i em) acc (recur (+ i 1) (edit/edits-conj acc (edit/edits-nth es i)))))))))))))
+
+;; ---------------------------------------------------------------------------
+;; ensure-prelude: the helper definitions the output calls, after the ns form, unless already defined
+
+(defn- js-space? [p :i64] :bool
+  (or (= p 32) (= p 9) (= p 10) (= p 11) (= p 12) (= p 13) (= p 160) (= p 5760) (= p 8232) (= p 8233) (= p 8239)
+      (= p 8287) (= p 12288) (= p 65279) (and (>= p 8192) (<= p 8202))))
+
+;; some occurrence of pat in src followed by a code point satisfying ok (1 = space or ")", 2 = space)
+(defn- occurs-then? [src :string pat :string mode :i64] :bool
+  (let [n (string-byte-length src) m (string-byte-length pat)]
+    (loop [from 0]
+      (let [k (if (> from n) -1 (string-index-of (string-substring src from n) pat))]
+        (if (< k 0)
+          false
+          (let [at (+ from (+ k m))]
+            (if (and (< at n)
+                     (let [p (string-code-point-at src at)] (or (js-space? p) (and (= mode 1) (= p 41)))))
+              true
+              (recur (+ from (+ k 1))))))))))
+
+(defn ensure-prelude [src :string] :string
+  (let [order (prelude/order)
+        n (vector-count order)
+        needed (loop [k 0 acc (typed-list-new [:list :string])]
+                 (if (>= k n) acc
+                     (let [nm (typed-list-nth [:list :string] order k)]
+                       (recur (+ k 1)
+                              (if (and (occurs-then? src (string-concat "(" nm) 1)
+                                       (not (occurs-then? src (string-concat "(defn " nm) 2))
+                                       (not (occurs-then? src (string-concat "(defn- " nm) 2)))
+                                (typed-list-conj [:list :string] acc nm)
+                                acc)))))
+        nn (vector-count needed)]
+    (if (= nn 0)
+      src
+      (let [nodes (cst/out-nodes (cst/parse src))
+            nm (vector-count nodes)
+            pos (loop [k 0] (cond (>= k nm) 0
+                                  (cst/call? (nodes-nth nodes k) "ns") (cst/node-e (nodes-nth nodes k))
+                                  :else (recur (+ k 1))))
+            defs (loop [k 0 acc ""]
+                   (if (>= k nn) acc
+                       (recur (+ k 1) (string-concat acc (string-concat (if (= k 0) "" "\n\n") (prelude/text-of (typed-list-nth [:list :string] needed k)))))))]
+        (string-concat (string-substring src 0 pos)
+                       (string-concat "\n\n" (string-concat defs (string-concat "\n" (string-substring src pos (string-byte-length src))))))))))
+
+;; ---------------------------------------------------------------------------
+;; run
+
+(defn run [src0 :string ids [:list :string] o [:ref :core/opts]] [:ref :core/res]
+  (loop [src src0 pass 1 first-f (fd/fs-new) have-first false applied (fd/fs-new)]
+    (let [p (cst/parse src)]
+      (if (> (string-byte-length (cst/out-err p)) 0)
+        (record-new [:ref :core/res] src first-f applied pass (cst/out-err p))
+        (let [fs (find-findings src (cst/out-nodes p) ids o)
+              sel (select fs o)
+              edits (record-get [:ref :core/sel] sel :edits)
+              chosen (record-get [:ref :core/sel] sel :chosen)
+              ff (if have-first first-f fs)]
+          (if (or (= (edit/edits-count edits) 0) (> pass (o-mp o)) (o-dry o))
+            (record-new [:ref :core/res] (if (o-dry o) src (ensure-prelude src)) ff applied pass "")
+            (recur (edit/apply-edits src edits) (+ pass 1) ff true
+                   (let [cm (fd/fs-count chosen)]
+                     (loop [k 0 acc applied] (if (>= k cm) acc (recur (+ k 1) (fd/fs-conj acc (fd/with-pass (fd/fs-nth chosen k) pass)))))))))))))
