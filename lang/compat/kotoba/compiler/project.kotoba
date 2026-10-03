@@ -1,0 +1,1970 @@
+(ns kotoba.compiler.project
+  "Guest twin (the Kotoba reading) of amu src/kotoba/compiler/project.cljk: the project linker. One closed
+  namespace->source map becomes one bounded source unit that the frontend analyses as a single namespace.
+
+  Same algorithm, same refusal sentences, same linked text as the host (amu `link-source`), over the typed
+  `:form/r` value (kotoba.form) instead of host data, and with `:fe/err` records (the frontend's refusal type) for
+  refusals, so a caller catches one type for the linker and the frontend. Owner: agent WALL2 (2026-10-04).
+
+  Differences from the host, each named:
+  - `resugar-capability-calls` has no Kotoba reading: the Kotoba frontend keeps no `:source-operation` on an
+    elaborated capability call, so the linked text keeps `(typed-cap-call ..)` there (the host restores the
+    friendly `(clock/now x)`; analysis of either text derives the same effect row).
+  - `admit-definition-closures!` is not run: a definition's closure counts distinct defined names, so it is at most
+    the number of linked functions, which the function-count check (run first, as in the host) has already bounded
+    by `max-project-functions` = `max-definition-closure-count`. The host check cannot fire after that check passes.
+  - a host map literal prints in hash order past 8 entries; a Form map prints in insertion order (same meaning).
+  - the attr-map rewrite of `module-info` is a copy of the frontend's `namespace-attr-map->clauses` (not a Kotoba
+    export of kotoba-sema yet), with the same key table and sentences.
+  - the limits are zero-argument functions (a Kotoba export names a function, never a constant)."
+  {:kotoba/export [attribute-error attribute-linked-error instantiate-forms instantiation-key key-binding key-namespace
+                   link-source linked-position max-definition-closure-count max-linked-source-bytes
+                   max-project-dependency-edges max-project-depth max-project-exports max-project-expression-nodes
+                   max-project-functions max-project-literals max-project-modules max-project-source-bytes
+                   max-project-string-literal-bytes max-template-parameters module-info module-namespaces
+                   source-position template-param-names with-module-file]}
+  (:require [kotoba.form :as form]
+            [kotoba.sema :as sema]
+            [kotoba.compiler.frontend.base :as base])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                       [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
+             :fe/err [:record :fe/err [[:msg :string] [:code :string] [:form [:ref :form/r]] [:phase :string] [:data [:ref :form/r]]]]
+             :ana/ir [:record :ana/ir [[:ok :bool] [:val [:ref :form/r]] [:err [:ref :fe/err]]]]
+             :pj/rb [:record :pj/rb [[:v [:ref :form/r]] [:bound [:ref :form/r]]]]
+             :pj/cnt [:record :pj/cnt [[:expr :i64] [:lit :i64] [:bytes :i64]]]
+             :pj/st [:record :pj/st [[:visiting [:ref :form/r]] [:linked [:ref :form/r]] [:order [:ref :form/r]] [:edges :i64] [:parsed [:ref :form/r]]]]
+             :pj/mi [:record :pj/mi [[:exports [:ref :form/r]] [:requires [:ref :form/r]] [:caps [:ref :form/r]] [:schemas [:ref :form/r]] [:params [:ref :form/r]]]]}))
+
+;; ---------------------------------------------------------------------------
+;; Limits (project.cljk lines 19-37)
+
+(defn max-project-modules [] :i64 256)
+(defn max-project-functions [] :i64 16384)
+(defn max-project-source-bytes [] :i64 8388608)
+(defn max-linked-source-bytes [] :i64 1048576)
+(defn max-definition-closure-count [] :i64 16384)
+(defn max-project-dependency-edges [] :i64 256)
+(defn max-project-depth [] :i64 64)
+(defn max-project-exports [] :i64 1024)
+(defn max-project-expression-nodes [] :i64 4194304)
+(defn max-project-literals [] :i64 4194304)
+(defn max-project-string-literal-bytes [] :i64 1048576)
+(defn max-template-parameters [] :i64 8)
+
+;; ---------------------------------------------------------------------------
+;; Form helpers
+
+(defn- nilf [] [:ref :form/r] (form/nil-form))
+(defn- kwf [x :keyword] [:ref :form/r] (form/keyword-form x))
+(defn- sym [s :string] [:ref :form/r] (form/symbol-form s))
+(defn- g [m [:ref :form/r] x :keyword] [:ref :form/r] (base/fget m x))
+(defn- p [m [:ref :form/r] x :keyword v [:ref :form/r]] [:ref :form/r] (base/fput m x v))
+(defn- t? [f [:ref :form/r]] :bool (base/ftruthy? f))
+(defn- present? [f [:ref :form/r]] :bool (not (form/is-nil? f)))
+(defn- emptyv [] [:ref :form/r] (form/form-vec (form/no-forms)))
+(defn- emptym [] [:ref :form/r] (form/form-map (form/no-forms)))
+(defn- emptys [] [:ref :form/r] (form/form-set (form/no-forms)))
+(defn- nth-l [xs [:list [:ref :form/r]] i :i64] [:ref :form/r] (typed-list-nth [:list [:ref :form/r]] xs i))
+(defn- cnt [f [:ref :form/r]] :i64 (form/count-of f))
+(defn- nth-f [f [:ref :form/r] i :i64] [:ref :form/r] (form/nth-of f i))
+(defn- m1 [k1 :keyword v1 [:ref :form/r]] [:ref :form/r] (p (emptym) k1 v1))
+(defn- m2 [k1 :keyword v1 [:ref :form/r] k2 :keyword v2 [:ref :form/r]] [:ref :form/r] (p (m1 k1 v1) k2 v2))
+(defn- intf [n :i64] [:ref :form/r] (form/int-form n))
+
+(defn- sym-is? [f [:ref :form/r] s :string] :bool
+  (and (form/is-symbol? f) (string=? (form/symbol-value f) s)))
+
+(defn- kw-is? [f [:ref :form/r] x :keyword] :bool
+  (and (form/is-keyword? f) (form/eq f (kwf x))))
+
+(defn- head-of [f [:ref :form/r]] [:ref :form/r]
+  (if (and (form/is-seq? f) (> (cnt f) 0)) (nth-f f 0) (nilf)))
+
+(defn- head-sym? [f [:ref :form/r] s :string] :bool (sym-is? (head-of f) s))
+(defn- head-kw? [f [:ref :form/r] x :keyword] :bool (kw-is? (head-of f) x))
+
+(defn- simple-sym? [f [:ref :form/r]] :bool (base/simple-symbol-form? f))
+
+(defn- blank-from? [s :string i :i64 n :i64] :bool
+  (if (>= i n)
+    true
+    (let [c (string-code-point-at s i)]
+      (if (or (= c 32) (= c 9) (= c 10) (= c 13) (= c 12) (= c 11))
+        (blank-from? s (+ i 1) n)
+        false))))
+
+(defn- blank? [s :string] :bool (blank-from? s 0 (string-byte-length s)))
+
+;; the kids of F from I on, as a list
+(defn- drop-kids-from [f [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt f)) acc (drop-kids-from f (+ i 1) (form/append-form acc (nth-f f i)))))
+
+(defn- drop-kids [f [:ref :form/r] i :i64] [:list [:ref :form/r]] (drop-kids-from f i (form/no-forms)))
+
+(defn- list-has-from? [xs [:list [:ref :form/r]] x [:ref :form/r] i :i64] :bool
+  (if (>= i (vector-count xs)) false (if (form/eq (nth-l xs i) x) true (list-has-from? xs x (+ i 1)))))
+
+(defn- list-has? [xs [:list [:ref :form/r]] x [:ref :form/r]] :bool (list-has-from? xs x 0))
+(defn- has-item? [coll [:ref :form/r] x [:ref :form/r]] :bool (list-has? (form/kids-of coll) x))
+
+(defn- set-add [s [:ref :form/r] x [:ref :form/r]] [:ref :form/r]
+  (if (has-item? s x) s (form/form-set (form/append-form (form/kids-of s) x))))
+
+(defn- set-remove-from [s [:ref :form/r] x [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt s))
+    acc
+    (set-remove-from s x (+ i 1) (if (form/eq (nth-f s i) x) acc (form/append-form acc (nth-f s i))))))
+
+(defn- set-remove [s [:ref :form/r] x [:ref :form/r]] [:ref :form/r]
+  (form/form-set (set-remove-from s x 0 (form/no-forms))))
+
+(defn- conj-v [v [:ref :form/r] x [:ref :form/r]] [:ref :form/r]
+  (form/form-vec (form/append-form (form/kids-of v) x)))
+
+;; the same collection kind as F with KIDS (list, vector, set, map)
+(defn- rebuild [f [:ref :form/r] kids [:list [:ref :form/r]]] [:ref :form/r]
+  (let [t (form/tag-of f)]
+    (cond (= t 6) (form/form-seq kids)
+          (= t 7) (form/form-vec kids)
+          (= t 8) (form/form-set kids)
+          :else (form/form-map kids))))
+
+;; the distinct items of XS, in first-seen order
+(defn- distinct-from [xs [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count xs))
+    acc
+    (distinct-from xs (+ i 1) (if (list-has? acc (nth-l xs i)) acc (form/append-form acc (nth-l xs i))))))
+
+(defn- distinct-list [xs [:list [:ref :form/r]]] [:list [:ref :form/r]] (distinct-from xs 0 (form/no-forms)))
+
+;; the first item of XS (from I) that occurs again after it, or nil
+(defn- first-dup [xs [:list [:ref :form/r]] i :i64] [:ref :form/r]
+  (if (>= i (vector-count xs))
+    (nilf)
+    (if (list-has-from? xs (nth-l xs i) (+ i 1)) (nth-l xs i) (first-dup xs (+ i 1)))))
+
+;; map M with every entry of N assoc'ed (Clojure's merge: N wins, new keys appended)
+(defn- merge-from [m [:ref :form/r] n [:ref :form/r] j :i64] [:ref :form/r]
+  (if (>= (+ j 1) (cnt n)) m (merge-from (form/assoc-form m (nth-f n j) (nth-f n (+ j 1))) n (+ j 2))))
+
+(defn- merge-maps [m [:ref :form/r] n [:ref :form/r]] [:ref :form/r]
+  (if (form/is-map? n) (merge-from (if (form/is-map? m) m (emptym)) n 0) m))
+
+(defn- sym-text [f [:ref :form/r]] :string (form/symbol-value f))
+
+;; `(str x)` of a form that names something: a symbol's text, a keyword's `:ns/name`, else its printed text
+(defn- str-of [f [:ref :form/r]] :string
+  (if (form/is-symbol? f) (form/symbol-value f) (pr f)))
+
+;; sort a list of forms by the text of (KEY-OF item): 0 the item, 1 its first kid; insertion sort (bounded lists)
+(defn- sort-key [x [:ref :form/r] mode :i64] :string
+  (if (= mode 1) (str-of (nth-f x 0)) (str-of x)))
+
+(defn- insert-sorted [acc [:list [:ref :form/r]] x [:ref :form/r] mode :i64] [:list [:ref :form/r]]
+  (let [n (vector-count acc)]
+    (insert-at acc x mode (insert-pos acc (sort-key x mode) mode 0 n))))
+
+(defn- insert-pos [acc [:list [:ref :form/r]] k :string mode :i64 i :i64 n :i64] :i64
+  (if (>= i n) n (if (> (string-compare (sort-key (nth-l acc i) mode) k) 0) i (insert-pos acc k mode (+ i 1) n))))
+
+(defn- insert-at [acc [:list [:ref :form/r]] x [:ref :form/r] mode :i64 at :i64] [:list [:ref :form/r]]
+  (insert-copy acc x at 0 (form/no-forms)))
+
+(defn- insert-copy [acc [:list [:ref :form/r]] x [:ref :form/r] at :i64 i :i64 out [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (let [out1 (if (= i at) (form/append-form out x) out)]
+    (if (>= i (vector-count acc))
+      out1
+      (insert-copy acc x at (+ i 1) (form/append-form out1 (nth-l acc i))))))
+
+(defn- sort-from [xs [:list [:ref :form/r]] mode :i64 i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count xs)) acc (sort-from xs mode (+ i 1) (insert-sorted acc (nth-l xs i) mode))))
+
+(defn- sort-by-text [xs [:list [:ref :form/r]] mode :i64] [:list [:ref :form/r]] (sort-from xs mode 0 (form/no-forms)))
+
+;; a map with its entries sorted by key text (`(into (sorted-map) m)` for symbol keys)
+(defn- entries-of [m [:ref :form/r] j :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= (+ j 1) (cnt m)) acc (entries-of m (+ j 2) (form/append-form acc (form/vec2 (nth-f m j) (nth-f m (+ j 1)))))))
+
+(defn- map-of-entries [es [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count es))
+    acc
+    (map-of-entries es (+ i 1) (form/append-form (form/append-form acc (nth-f (nth-l es i) 0)) (nth-f (nth-l es i) 1)))))
+
+(defn- sorted-map-of [m [:ref :form/r]] [:ref :form/r]
+  (if (form/is-map? m)
+    (form/form-map (map-of-entries (sort-by-text (entries-of m 0 (form/no-forms)) 1) 0 (form/no-forms)))
+    m))
+
+;; ---------------------------------------------------------------------------
+;; Printing: the host's `pr-str` of reader data (`source-text`), as a list of pieces joined once
+
+(defn- add [acc [:list :string] s :string] [:list :string] (typed-list-conj [:list :string] acc s))
+
+(defn- join-range [xs [:list :string] i :i64 j :i64] :string
+  (cond (>= i j) ""
+        (= (+ i 1) j) (typed-list-nth [:list :string] xs i)
+        :else (let [m (quot (+ i j) 2)] (string-concat (join-range xs i m) (join-range xs m j)))))
+
+(defn- join-all [xs [:list :string]] :string (join-range xs 0 (vector-count xs)))
+
+(defn- esc-piece [c :i64] :string
+  (cond (= c 34) "\\\"" (= c 92) "\\\\" (= c 10) "\\n" (= c 9) "\\t" (= c 13) "\\r" (= c 12) "\\f" (= c 8) "\\b" :else ""))
+
+(defn- cp-width [c :i64] :i64 (cond (< c 128) 1 (< c 2048) 2 (< c 65536) 3 :else 4))
+
+(defn- esc-into [acc [:list :string] s :string i :i64 start :i64] [:list :string]
+  (let [n (string-byte-length s)]
+    (if (>= i n)
+      (add acc (string-substring s start n))
+      (let [c (string-code-point-at s i)
+            e (esc-piece c)]
+        (if (> (string-byte-length e) 0)
+          (esc-into (add (add acc (string-substring s start i)) e) s (+ i 1) (+ i 1))
+          (esc-into acc s (+ i (cp-width c)) start))))))
+
+(defn- pr-kids-into [acc [:list :string] f [:ref :form/r] i :i64 sep :string] [:list :string]
+  (if (>= i (cnt f))
+    acc
+    (pr-kids-into (pr-into (if (> i 0) (add acc sep) acc) (nth-f f i)) f (+ i 1) sep)))
+
+(defn- pr-map-into [acc [:list :string] f [:ref :form/r] j :i64] [:list :string]
+  (if (>= (+ j 1) (cnt f))
+    acc
+    (pr-map-into (pr-into (add (pr-into (if (> j 0) (add acc ", ") acc) (nth-f f j)) " ") (nth-f f (+ j 1))) f (+ j 2))))
+
+(defn- pr-into [acc [:list :string] f [:ref :form/r]] [:list :string]
+  (cond
+    (form/is-nil? f) (add acc "nil")
+    (form/is-bool? f) (add acc (if (form/bool-value f) "true" "false"))
+    (form/is-int? f) (add acc (string-from-i64 (form/int-value f)))
+    (form/is-string? f) (add (esc-into (add acc "\"") (form/string-value f) 0 0) "\"")
+    (form/is-keyword? f) (add acc (base/form-text f))
+    (form/is-symbol? f) (add acc (form/symbol-value f))
+    (form/is-seq? f) (add (pr-kids-into (add acc "(") f 0 " ") ")")
+    (form/is-vec? f) (add (pr-kids-into (add acc "[") f 0 " ") "]")
+    (form/is-set? f) (add (pr-kids-into (add acc "#{") f 0 " ") "}")
+    (form/is-map? f) (add (pr-map-into (add acc "{") f 0) "}")
+    (form/is-f64? f) (add (add acc "(f64-from-bits ") (string-concat (string-from-i64 (form/bits-of f)) ")"))
+    :else (add acc "(bytes-empty)")))
+
+(defn- pr [f [:ref :form/r]] :string (join-all (pr-into (typed-list-new [:list :string]) f)))
+
+(defn- source-pieces [forms [:list [:ref :form/r]] i :i64 acc [:list :string]] [:list :string]
+  (if (>= i (vector-count forms)) acc (source-pieces forms (+ i 1) (add (pr-into acc (nth-l forms i)) "\n"))))
+
+;; one form per line, each line ending in a newline (`source-text`)
+(defn- source-text [forms [:list [:ref :form/r]]] :string
+  (join-all (source-pieces forms 0 (typed-list-new [:list :string]))))
+
+;; ---------------------------------------------------------------------------
+;; Refusals: an `:fe/err` with phase "project-link" and the host's ex-data as a map Form
+
+(defn- fail [msg :string data [:ref :form/r]] :i64
+  (throw (record-new [:ref :fe/err] msg "" (form/nil-form) "project-link" (p data :phase (kwf :project-link)))))
+
+(defn- need [ok :bool msg :string data [:ref :form/r]] :i64 (if ok 0 (fail msg data)))
+
+(defn- err-data [e [:ref :fe/err]] [:ref :form/r]
+  (let [d (record-get [:ref :fe/err] e :data)] (if (form/is-map? d) d (emptym))))
+
+(defn- err-with [e [:ref :fe/err] msg :string data [:ref :form/r]] [:ref :fe/err]
+  (record-assoc [:ref :fe/err] (record-assoc [:ref :fe/err] e :msg msg) :data data))
+
+;; ---------------------------------------------------------------------------
+;; Template keys (project.cljk 118-160)
+
+(defn- type-form? [item [:ref :form/r]] :bool
+  (or (form/is-keyword? item)
+      (and (form/is-vec? item) (form/is-keyword? (nth-f item 0)))))
+
+(defn instantiation-key
+  "The namespace for an ordinary module, `[namespace sorted-binding]` for an instantiation of a template."
+  [namespace [:ref :form/r] binding [:ref :form/r]] [:ref :form/r]
+  (if (present? binding) (form/vec2 namespace (sorted-map-of binding)) namespace))
+
+(defn key-namespace [key [:ref :form/r]] [:ref :form/r]
+  (if (form/is-vec? key) (nth-f key 0) key))
+
+(defn key-binding [key [:ref :form/r]] [:ref :form/r]
+  (if (form/is-vec? key) (nth-f key 1) (nilf)))
+
+(defn- key-namespaces [order [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt order)) acc (key-namespaces order (+ i 1) (form/append-form acc (key-namespace (nth-f order i))))))
+
+(defn module-namespaces [order [:ref :form/r]] [:ref :form/r]
+  (form/form-vec (distinct-list (key-namespaces order 0 (form/no-forms)))))
+
+(defn- describe-binding [namespace [:ref :form/r] binding [:ref :form/r]] :string
+  (str (str-of namespace) " with " (pr (sorted-map-of binding))))
+
+(defn- params-symbols [declared [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt declared))
+    acc
+    (params-symbols declared (+ i 1) (if (form/is-symbol? (nth-f declared i)) (form/append-form acc (nth-f declared i)) acc))))
+
+(defn template-param-names [declared [:ref :form/r]] [:ref :form/r]
+  (form/form-vec (params-symbols declared 0 (form/no-forms))))
+
+(defn- shape-params-msg [] :string "namespace :params must be a non-empty vector of distinct simple symbols")
+
+;; `[sym type? ...]` -> {:names [sym ...] :defaults {sym type ...}}
+(defn- tp-loop [name [:ref :form/r] declared [:ref :form/r] i :i64 names [:ref :form/r] defaults [:ref :form/r]] [:ref :form/r]
+  (if (>= i (cnt declared))
+    (m2 :names names :defaults defaults)
+    (let [item (nth-f declared i)
+          ok (need (and (simple-sym? item) (not (blank? (sym-text item))))
+                   (if (type-form? item) "namespace :params default type must follow a parameter symbol" (shape-params-msg))
+                   (p (m2 :namespace name :params declared) :item item))
+          nxt (nth-f declared (+ i 1))]
+      (if (and (< (+ i 1) (cnt declared)) (type-form? nxt))
+        (tp-loop name declared (+ i 2) (conj-v names item) (form/assoc-form defaults item nxt))
+        (tp-loop name declared (+ i 1) (conj-v names item) defaults)))))
+
+(defn- validate-template-params! [name [:ref :form/r] declared [:ref :form/r]] [:ref :form/r]
+  (let [ok (need (and (form/is-vec? declared) (> (cnt declared) 0)) (shape-params-msg) (m2 :namespace name :params declared))
+        r (tp-loop name declared 0 (emptyv) (emptym))
+        names (g r :names)
+        ok2 (need (= (cnt names) (vector-count (distinct-list (form/kids-of names)))) (shape-params-msg)
+                  (m2 :namespace name :params declared))
+        ok3 (need (<= (cnt names) (max-template-parameters)) "namespace :params exceed the template parameter limit"
+                  (p (m2 :namespace name :count (intf (cnt names))) :limit (intf (max-template-parameters))))]
+    r))
+
+(defn- all-simple-keys? [m [:ref :form/r] j :i64] :bool
+  (if (>= (+ j 1) (cnt m)) true (if (simple-sym? (nth-f m j)) (all-simple-keys? m (+ j 2)) false)))
+
+(defn- check-binding-values [name [:ref :form/r] spec [:ref :form/r] binding [:ref :form/r] own [:ref :form/r] j :i64] :i64
+  (if (>= (+ j 1) (cnt binding))
+    0
+    (let [v (nth-f binding (+ j 1))
+          ok (need (or (type-form? v) (and (simple-sym? v) (has-item? own v)))
+                   "import :with binds a parameter to something that is not a type form"
+                   (p (p (m2 :namespace name :spec spec) :parameter (nth-f binding j)) :value v))]
+      (check-binding-values name spec binding own (+ j 2)))))
+
+(defn- validate-binding! [name [:ref :form/r] spec [:ref :form/r] binding [:ref :form/r] own [:ref :form/r]] [:ref :form/r]
+  (let [ok (need (and (form/is-map? binding) (all-simple-keys? binding 0))
+                 "import :with must be a map from template parameter symbols to type forms" (m2 :namespace name :spec spec))
+        n (quot (cnt binding) 2)
+        ok2 (need (<= n (max-template-parameters)) "import :with exceeds the template parameter limit"
+                  (p (p (m2 :namespace name :spec spec) :count (intf n)) :limit (intf (max-template-parameters))))
+        ok3 (check-binding-values name spec binding own 0)]
+    (sorted-map-of binding)))
+
+;; ---------------------------------------------------------------------------
+;; The ns header (project.cljk 217-580)
+
+(defn- refused-reason [head [:ref :form/r]] :string
+  (cond (kw-is? head :import) "host interop (a Java / JS class) is outside the language"
+        (kw-is? head :require-macros) "macros are outside the language"
+        (kw-is? head :use) "an unqualified ambient namespace is outside the language"
+        (kw-is? head :load) "loading source at run time is outside the language"
+        (kw-is? head :gen-class) "host interop is outside the language"
+        :else ""))
+
+(defn- filter-head-kw [xs [:list [:ref :form/r]] x :keyword i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count xs))
+    acc
+    (filter-head-kw xs x (+ i 1) (if (head-kw? (nth-l xs i) x) (form/append-form acc (nth-l xs i)) acc))))
+
+(defn- remove-head-kw [xs [:list [:ref :form/r]] x :keyword i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count xs))
+    acc
+    (remove-head-kw xs x (+ i 1) (if (head-kw? (nth-l xs i) x) acc (form/append-form acc (nth-l xs i))))))
+
+(defn- rc-pair-keys [clause [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt clause)) acc (rc-pair-keys clause (+ i 2) (form/append-form acc (nth-f clause i)))))
+
+(defn- rc-check-keys [keys [:list [:ref :form/r]] i :i64 data [:ref :form/r]] :i64
+  (if (>= i (vector-count keys))
+    0
+    (let [k (nth-l keys i)
+          ok (need (not (kw-is? k :rename))
+                   "namespace clause :refer-clojure :rename is not admitted: renaming changes name resolution; :exclude and :only are admitted as no-ops"
+                   data)
+          ok2 (need (or (kw-is? k :exclude) (kw-is? k :only))
+                    (str "namespace clause :refer-clojure option " (pr k) " is not admitted; the admitted options are :exclude and :only")
+                    data)]
+      (rc-check-keys keys (+ i 1) data))))
+
+(defn- all-simple-items? [v [:ref :form/r] i :i64] :bool
+  (if (>= i (cnt v)) true (if (simple-sym? (nth-f v i)) (all-simple-items? v (+ i 1)) false)))
+
+(defn- rc-check-names [clause [:ref :form/r] i :i64 data [:ref :form/r]] :i64
+  (if (>= (+ i 1) (cnt clause))
+    0
+    (let [names (nth-f clause (+ i 1))
+          ok (need (and (form/is-vec? names) (<= (cnt names) (sema/max-functions)) (all-simple-items? names 0))
+                   (str "namespace clause :refer-clojure " (pr (nth-f clause i)) " takes a bounded vector of simple symbols")
+                   data)]
+      (rc-check-names clause (+ i 2) data))))
+
+(defn- rc-check-clauses [name [:ref :form/r] cs [:list [:ref :form/r]] i :i64] :i64
+  (if (>= i (vector-count cs))
+    0
+    (let [clause (nth-l cs i)
+          data (m2 :namespace name :clause clause)
+          noptions (- (cnt clause) 1)
+          ok (need (= 0 (mod noptions 2))
+                   "namespace clause :refer-clojure takes :exclude [sym ...] and/or :only [sym ...]" data)
+          keys (rc-pair-keys clause 1 (form/no-forms))
+          ok2 (rc-check-keys keys 0 data)
+          ok3 (need (= (vector-count keys) (vector-count (distinct-list keys))) "namespace clause :refer-clojure repeats an option" data)
+          ok4 (rc-check-names clause 1 data)]
+      (rc-check-clauses name cs (+ i 1)))))
+
+(defn- validate-refer-clojure-clauses! [name [:ref :form/r] cs [:list [:ref :form/r]]] :i64
+  (let [ok (need (<= (vector-count cs) 1) "namespace admits :refer-clojure at most once"
+                 (m2 :namespace name :clauses (form/form-vec cs)))]
+    (rc-check-clauses name cs 0)))
+
+;; the frontend's attr-map key table (kotoba-sema namespace_defs `namespace-attr-map-keys`)
+(defn- attr-head [k [:ref :form/r]] [:ref :form/r]
+  (cond (kw-is? k :kotoba/export) (kwf :export)
+        (kw-is? k :kotoba/capabilities) (kwf :capabilities)
+        (kw-is? k :kotoba/schemas) (kwf :schemas)
+        (kw-is? k :kotoba/params) (kwf :params)
+        :else (nilf)))
+
+(defn- unquote-attr-value [v [:ref :form/r]] [:ref :form/r]
+  (if (and (head-sym? v "quote") (= 2 (cnt v))) (nth-f v 1) v))
+
+(defn- clause-heads [cs [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count cs))
+    acc
+    (clause-heads cs (+ i 1) (if (form/is-seq? (nth-l cs i)) (form/append-form acc (head-of (nth-l cs i))) acc))))
+
+(defn- attr-check [name [:ref :form/r] attr [:ref :form/r] j :i64 heads [:list [:ref :form/r]]] :i64
+  (if (>= (+ j 1) (cnt attr))
+    0
+    (let [k (nth-f attr j)
+          head (attr-head k)
+          data (p (m2 :namespace name :attr-map attr) :code (kwf :kotoba.error/namespace-attr-map))
+          ok (need (present? head)
+                   (str "namespace attr-map key " (pr k)
+                        " is not admitted; the admitted keys are [:kotoba/capabilities :kotoba/export :kotoba/params :kotoba/schemas]")
+                   data)
+          ok2 (need (not (list-has? heads head))
+                    (str "namespace declares " (pr head) " twice: attr-map " (pr k) " and clause (" (pr head) " ...)")
+                    (p (m2 :namespace name :attr-map attr) :code (kwf :kotoba.error/namespace-clause-duplicate)))]
+      (attr-check name attr (+ j 2) heads))))
+
+(defn- attr-clauses [attr [:ref :form/r] j :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= (+ j 1) (cnt attr))
+    acc
+    (attr-clauses attr (+ j 2)
+                  (form/append-form acc (form/form-seq (form/two-forms (attr-head (nth-f attr j)) (unquote-attr-value (nth-f attr (+ j 1)))))))))
+
+(defn- attr-map->clauses [name [:ref :form/r] attr [:ref :form/r] explicit [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (let [ok (attr-check name attr 0 (clause-heads explicit 0 (form/no-forms)))]
+    (form/append-many (attr-clauses attr 0 (form/no-forms)) explicit)))
+
+(defn- synthetic-refer-alias [required [:ref :form/r]] [:ref :form/r]
+  (sym (str "kotoba_refer__" (join-all (alnum-into (typed-list-new [:list :string]) (sym-text required) 0)))))
+
+(defn- alnum? [c :i64] :bool (or (and (>= c 48) (<= c 57)) (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))))
+
+(defn- alnum-into [acc [:list :string] s :string i :i64] [:list :string]
+  (if (>= i (string-byte-length s))
+    acc
+    (let [c (string-code-point-at s i)]
+      (alnum-into (add acc (if (alnum? c) (string-substring s i (+ i 1)) "_")) s (+ i (cp-width c))))))
+
+(defn- require-shape-msg [] :string
+  "imports require [namespace :as alias], [namespace :refer [name ...]] or [namespace :as alias :with {parameter type}]")
+
+(defn- spec-check-keys [name [:ref :form/r] spec [:ref :form/r] i :i64] :i64
+  (if (>= i (cnt spec))
+    0
+    (let [k (nth-f spec i)
+          ok (need (or (kw-is? k :as) (kw-is? k :with) (kw-is? k :refer))
+                   (str "import option " (pr k) " is not admitted; the admitted options are :as, :refer and :with")
+                   (m2 :namespace name :spec spec))]
+      (spec-check-keys name spec (+ i 2)))))
+
+(defn- spec-option [spec [:ref :form/r] x :keyword i :i64] [:ref :form/r]
+  (if (>= (+ i 1) (cnt spec)) (nilf) (if (kw-is? (nth-f spec i) x) (nth-f spec (+ i 1)) (spec-option spec x (+ i 2)))))
+
+(defn- spec-has? [spec [:ref :form/r] x :keyword i :i64] :bool
+  (if (>= (+ i 1) (cnt spec)) false (if (kw-is? (nth-f spec i) x) true (spec-has? spec x (+ i 2)))))
+
+(defn- parse-require-spec! [name [:ref :form/r] spec [:ref :form/r]] [:ref :form/r]
+  (let [data (m2 :namespace name :spec spec)
+        ok (need (and (form/is-vec? spec) (> (cnt spec) 0)) (require-shape-msg) data)
+        required (nth-f spec 0)
+        ok1 (need (not (form/is-string? required)) "import names a host module by string; a Kotoba module is a simple symbol"
+                  (p data :host-module required))
+        ok2 (need (simple-sym? required) (require-shape-msg) data)
+        ok3 (need (= 0 (mod (- (cnt spec) 1) 2)) (require-shape-msg) data)
+        ok4 (spec-check-keys name spec 1)
+        keys (rc-pair-keys spec 1 (form/no-forms))
+        ok5 (need (= (vector-count keys) (vector-count (distinct-list keys))) "import spec repeats an option" data)
+        has-alias (spec-has? spec :as 1)
+        has-refer (spec-has? spec :refer 1)
+        has-with (spec-has? spec :with 1)
+        alias (spec-option spec :as 1)
+        refer (spec-option spec :refer 1)
+        ok6 (need (or (not has-alias) (simple-sym? alias)) (require-shape-msg) data)
+        ok7 (need (or has-alias has-refer) "import needs :as or :refer; a require with neither names nothing this module can use" data)
+        ok8 (need (or (not has-refer) (not (kw-is? refer :all))) ":refer :all is not admitted; name the imported functions" data)
+        ok9 (need (or (not has-refer) (and (form/is-vec? refer) (> (cnt refer) 0) (all-simple-items? refer 0)))
+                  ":refer takes a non-empty vector of simple symbols" data)
+        dup (if has-refer (first-dup (form/kids-of refer) 0) (nilf))
+        ok10 (need (not (present? dup)) (str ":refer names " (pr dup) " twice") data)
+        r0 (m2 :namespace required :alias (if has-alias alias (synthetic-refer-alias required)))
+        r1 (if has-refer (p r0 :refer (form/form-vec (form/kids-of refer))) r0)]
+    (if has-with (p (p r1 :with (spec-option spec :with 1)) :spec spec) r1)))
+
+(defn- parse-specs [name [:ref :form/r] clause [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (cnt clause)) acc (parse-specs name clause (+ i 1) (conj-v acc (parse-require-spec! name (nth-f clause i))))))
+
+(defn- def-head? [h [:ref :form/r]] :bool
+  (or (sym-is? h "defn") (sym-is? h "defn-") (sym-is? h "def") (sym-is? h "defrecord") (sym-is? h "defprotocol")
+      (sym-is? h "defmulti") (sym-is? h "defmethod")))
+
+(defn- definition-names [forms [:list [:ref :form/r]] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (vector-count forms))
+    acc
+    (let [f (nth-l forms i)]
+      (definition-names forms (+ i 1)
+        (if (and (form/is-seq? f) (def-head? (head-of f)) (form/is-symbol? (nth-f f 1))) (set-add acc (nth-f f 1)) acc)))))
+
+;; [name from] pairs of every referred name, in require order
+(defn- referred-pairs [requires [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt requires))
+    acc
+    (let [r (nth-f requires i)
+          refer (g r :refer)]
+      (referred-pairs requires (+ i 1) (referred-pairs-of refer (g r :namespace) 0 acc)))))
+
+(defn- referred-pairs-of [refer [:ref :form/r] from [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt refer)) acc (referred-pairs-of refer from (+ i 1) (form/append-form acc (form/vec2 (nth-f refer i) from)))))
+
+(defn- pair-firsts [xs [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count xs)) acc (pair-firsts xs (+ i 1) (form/append-form acc (nth-f (nth-l xs i) 0)))))
+
+(defn- check-collisions [name [:ref :form/r] pairs [:list [:ref :form/r]] defined [:ref :form/r] i :i64] :i64
+  (if (>= i (vector-count pairs))
+    0
+    (let [n (nth-f (nth-l pairs i) 0)
+          from (nth-f (nth-l pairs i) 1)
+          ok (need (not (has-item? defined n))
+                   (str "referred name " (str-of n) " (from " (str-of from) ") collides with a definition of this module")
+                   (p (m2 :namespace name :name n) :from from))]
+      (check-collisions name pairs defined (+ i 1)))))
+
+(defn- check-referred-names! [name [:ref :form/r] requires [:ref :form/r] forms [:list [:ref :form/r]]] :i64
+  (let [pairs (referred-pairs requires 0 (form/no-forms))
+        dup (first-dup (pair-firsts pairs 0 (form/no-forms)) 0)
+        ok (need (not (present? dup)) (str "referred name " (str-of dup) " is referred from more than one require spec")
+                 (m2 :namespace name :name dup))]
+    (check-collisions name pairs (definition-names forms 0 (emptys)) 0)))
+
+(defn- public-names [forms [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count forms))
+    acc
+    (let [f (nth-l forms i)
+          nm (nth-f f 1)]
+      (public-names forms (+ i 1)
+        (if (and (head-sym? f "defn") (simple-sym? nm) (not (base/fprivate-symbol? nm)))
+          (form/append-form acc (sym (sym-text nm)))
+          acc)))))
+
+(defn- public-definition-names [forms [:list [:ref :form/r]]] [:ref :form/r]
+  (form/form-vec (distinct-list (public-names forms 0 (form/no-forms)))))
+
+(defn- filter-head-sym [xs [:list [:ref :form/r]] s :string i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count xs))
+    acc
+    (filter-head-sym xs s (+ i 1) (if (head-sym? (nth-l xs i) s) (form/append-form acc (nth-l xs i)) acc))))
+
+(defn- first-map-index [xs [:list [:ref :form/r]] i :i64] :i64
+  (if (>= i (vector-count xs)) -1 (if (form/is-map? (nth-l xs i)) i (first-map-index xs (+ i 1)))))
+
+(defn- all-namespaced-keywords? [s [:ref :form/r] i :i64] :bool
+  (if (>= i (cnt s))
+    true
+    (if (and (form/is-keyword? (nth-f s i)) (form/keyword-has-namespace? (nth-f s i))) (all-namespaced-keywords? s (+ i 1)) false)))
+
+(defn- mi-acc [] [:ref :pj/mi] (record-new [:ref :pj/mi] (nilf) (emptyv) (nilf) (nilf) (nilf)))
+
+(defn- mi-clause [name [:ref :form/r] clause [:ref :form/r] a [:ref :pj/mi]] [:ref :pj/mi]
+  (let [two (and (form/is-seq? clause) (= 2 (cnt clause)))
+        v (nth-f clause 1)]
+    (cond
+      (and two (head-kw? clause :export) (form/is-vec? v) (form/is-nil? (record-get [:ref :pj/mi] a :exports)))
+      (record-assoc [:ref :pj/mi] a :exports (form/form-vec (form/kids-of v)))
+
+      (and two (head-kw? clause :capabilities) (form/is-set? v) (form/is-nil? (record-get [:ref :pj/mi] a :caps)))
+      (let [ok (need (and (<= (cnt v) (sema/max-namespace-capabilities)) (all-namespaced-keywords? v 0))
+                     "namespace :capabilities must be a bounded set of namespaced keywords"
+                     (m2 :namespace name :capabilities v))]
+        (record-assoc [:ref :pj/mi] a :caps v))
+
+      (and two (head-kw? clause :schemas) (form/is-map? v) (form/is-nil? (record-get [:ref :pj/mi] a :schemas)))
+      (record-assoc [:ref :pj/mi] a :schemas v)
+
+      (and two (head-kw? clause :params) (form/is-nil? (record-get [:ref :pj/mi] a :params)))
+      (record-assoc [:ref :pj/mi] a :params (validate-template-params! name v))
+
+      (head-kw? clause :require)
+      (record-assoc [:ref :pj/mi] a :requires (parse-specs name clause 1 (record-get [:ref :pj/mi] a :requires)))
+
+      (and (form/is-seq? clause) (> (string-byte-length (refused-reason (head-of clause))) 0))
+      (let [ok (fail (str "namespace clause " (pr (head-of clause)) " is not admitted: " (refused-reason (head-of clause))
+                          "; the admitted clauses are :export, :capabilities, :schemas, :params and :require")
+                     (m2 :namespace name :clause clause))]
+        a)
+
+      :else
+      (let [ok (fail "only one :export, one :capabilities, one :schemas, one :params and alias-only :require clauses are admitted"
+                     (m2 :namespace name :clause clause))]
+        a))))
+
+(defn- mi-loop [name [:ref :form/r] cs [:list [:ref :form/r]] i :i64 a [:ref :pj/mi]] [:ref :pj/mi]
+  (if (>= i (vector-count cs)) a (mi-loop name cs (+ i 1) (mi-clause name (nth-l cs i) a))))
+
+(defn- with-validated-bindings [name [:ref :form/r] requires [:ref :form/r] own [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (cnt requires))
+    acc
+    (let [r (nth-f requires i)]
+      (with-validated-bindings name requires own (+ i 1)
+        (conj-v acc (if (form/form-has? r (kwf :with))
+                      (form/dissoc-form (p r :with (validate-binding! name (g r :spec) (g r :with) own)) (kwf :spec))
+                      r))))))
+
+(defn- require-field [requires [:ref :form/r] x :keyword i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt requires)) acc (require-field requires x (+ i 1) (form/append-form acc (g (nth-f requires i) x)))))
+
+(defn- require-keys [requires [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt requires))
+    acc
+    (let [r (nth-f requires i)]
+      (require-keys requires (+ i 1) (form/append-form acc (instantiation-key (g r :namespace) (g r :with)))))))
+
+(defn module-info
+  "The bounded declared namespace, exports, alias-only requires, capability set, schemas and template parameters of
+  one project module (project.cljk `module-info`)."
+  [forms [:list [:ref :form/r]]] [:ref :form/r]
+  (let [nsfs (filter-head-sym forms "ns" 0 (form/no-forms))
+        ok (need (= 1 (vector-count nsfs)) "project module requires exactly one namespace" (m1 :count (intf (vector-count nsfs))))
+        nsf (nth-l nsfs 0)
+        name (nth-f nsf 1)
+        raw (drop-kids nsf 2)
+        has-doc (and (> (vector-count raw) 0) (form/is-string? (nth-l raw 0)))
+        c1 (if has-doc (drop-kids (form/form-seq raw) 1) raw)
+        has-attr (and (> (vector-count c1) 0) (form/is-map? (nth-l c1 0)))
+        clauses (if has-attr (drop-kids (form/form-seq c1) 1) c1)
+        ok1 (need (and (simple-sym? name) (not (blank? (sym-text name)))) "invalid project namespace" (m1 :namespace name))
+        ok2 (need (or (not has-doc) (<= (string-length (form/string-value (nth-l raw 0))) (sema/max-namespace-docstring-chars)))
+                  "namespace docstring exceeds admission limit" (m1 :namespace name))
+        stray (first-map-index clauses 0)
+        ok3 (need (< stray 0) "namespace attr-map must follow the docstring: (ns NAME DOCSTRING? ATTR-MAP? CLAUSE ...)"
+                  (m2 :namespace name :clause (if (< stray 0) (nilf) (nth-l clauses stray))))
+        ok4 (validate-refer-clojure-clauses! name (filter-head-kw clauses :refer-clojure 0 (form/no-forms)))
+        others (remove-head-kw clauses :refer-clojure 0 (form/no-forms))
+        remaining (if has-attr (attr-map->clauses name (nth-l c1 0) others) others)
+        a (mi-loop name remaining 0 (mi-acc))
+        params (record-get [:ref :pj/mi] a :params)
+        own (if (present? params) (g params :names) (nilf))
+        requires (with-validated-bindings name (record-get [:ref :pj/mi] a :requires) own 0 (emptyv))
+        exports (record-get [:ref :pj/mi] a :exports)
+        derived (form/is-nil? exports)
+        public (public-definition-names forms)
+        ok5 (need (or (not derived) (> (cnt public) 0))
+                  (str "project module " (str-of name) " exports nothing: every top-level defn is private;"
+                       " declare one with defn, or add an explicit :export vector")
+                  (m1 :namespace name))
+        aliases (require-field requires :alias 0 (form/no-forms))
+        ok6 (need (= (vector-count aliases) (vector-count (distinct-list aliases))) "duplicate import alias"
+                  (m2 :namespace name :requires requires))
+        ok7 (check-referred-names! name requires forms)
+        keys (require-keys requires 0 (form/no-forms))
+        ok8 (need (= (vector-count keys) (vector-count (distinct-list keys))) "duplicate imported namespace"
+                  (m2 :namespace name :requires requires))]
+    (p (p (p (p (p (p (p (p (emptym) :namespace name) :exports (if derived public exports))
+                      :exports-derived? (form/bool-form derived))
+                   :requires requires)
+                :capabilities (record-get [:ref :pj/mi] a :caps))
+             :schemas (record-get [:ref :pj/mi] a :schemas))
+          :params (if (present? params) (g params :names) (nilf)))
+       :param-defaults (if (present? params) (g params :defaults) (nilf)))))
+
+;; ---------------------------------------------------------------------------
+;; Rewrites of a module's forms before analysis (project.cljk 590-660)
+
+(defn- schemas-of-parsed [parsed [:ref :form/r] module [:ref :form/r]] [:ref :form/r]
+  (g (g (form/form-get parsed module) :info) :schemas))
+
+(defn- collide-check [parsed [:ref :form/r] a [:ref :form/r] ta [:ref :form/r] j :i64] :i64
+  (if (>= (+ j 1) (cnt ta))
+    0
+    (let [ok (collide-against parsed a (nth-f ta j) (nth-f ta (+ j 1)) 0)]
+      (collide-check parsed a ta (+ j 2)))))
+
+(defn- collide-against [parsed [:ref :form/r] a [:ref :form/r] schema [:ref :form/r] definition [:ref :form/r] i :i64] :i64
+  (if (>= (+ i 1) (cnt parsed))
+    0
+    (let [b (nth-f parsed i)
+          tb (schemas-of-parsed parsed b)
+          ok (need (or (form/eq a b) (not (form/is-map? tb)) (not (form/form-has? tb schema))
+                       (form/eq definition (form/form-get tb schema)))
+                   "modules declare the same schema name with different definitions"
+                   (m2 :schema schema :modules (form/vec2 a b)))]
+      (collide-against parsed a schema definition (+ i 2)))))
+
+(defn- reject-schema-collisions! [parsed [:ref :form/r] i :i64] :i64
+  (if (>= (+ i 1) (cnt parsed))
+    0
+    (let [a (nth-f parsed i)
+          ta (schemas-of-parsed parsed a)
+          ok (if (form/is-map? ta) (collide-check parsed a ta 0) 0)]
+      (reject-schema-collisions! parsed (+ i 2)))))
+
+(defn- map-forms-ns [forms [:list [:ref :form/r]] mode :i64 info [:ref :form/r] i :i64] [:list [:ref :form/r]]
+  (map-forms-ns-into forms mode info i (form/no-forms)))
+
+(defn- map-forms-ns-into [forms [:list [:ref :form/r]] mode :i64 info [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count forms))
+    acc
+    (let [f (nth-l forms i)]
+      (map-forms-ns-into forms mode info (+ i 1)
+        (form/append-form acc (if (head-sym? f "ns") (ns-rewrite f mode info) f))))))
+
+;; mode 0: with-derived-export (append `(:export [..])`); mode 1: without-requires; mode 2: with-dependency-schemas
+(defn- ns-rewrite [f [:ref :form/r] mode :i64 info [:ref :form/r]] [:ref :form/r]
+  (cond
+    (= mode 0) (form/form-seq (form/append-form (form/kids-of f) (form/form-seq (form/two-forms (kwf :export) (g info :exports)))))
+    (= mode 1) (form/form-seq (form/append-many (form/two-forms (nth-f f 0) (nth-f f 1)) (strip-linker-clauses f 2 (form/no-forms))))
+    :else (with-schemas-ns f info)))
+
+(defn- strip-linker-clauses [f [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt f))
+    acc
+    (let [c (nth-f f i)]
+      (strip-linker-clauses f (+ i 1)
+        (cond
+          (or (head-kw? c :require) (head-kw? c :params) (head-kw? c :refer-clojure)) acc
+          (and (form/is-map? c) (form/form-has? c (kwf :kotoba/params)))
+          (let [m (form/dissoc-form c (kwf :kotoba/params))] (if (> (cnt m) 0) (form/append-form acc m) acc))
+          :else (form/append-form acc c))))))
+
+(defn- own-schemas? [c [:ref :form/r]] :bool (and (head-kw? c :schemas) (form/is-map? (nth-f c 1))))
+
+(defn- own-schemas [f [:ref :form/r] i :i64] [:ref :form/r]
+  (if (>= i (cnt f)) (nilf) (if (own-schemas? (nth-f f i)) (nth-f (nth-f f i) 1) (own-schemas f (+ i 1)))))
+
+(defn- non-schema-clauses [f [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt f)) acc (non-schema-clauses f (+ i 1) (if (own-schemas? (nth-f f i)) acc (form/append-form acc (nth-f f i))))))
+
+(defn- with-schemas-ns [f [:ref :form/r] dep-schemas [:ref :form/r]] [:ref :form/r]
+  (let [merged (merge-maps dep-schemas (own-schemas f 2))]
+    (form/form-seq (form/append-form (form/append-many (form/two-forms (nth-f f 0) (nth-f f 1)) (non-schema-clauses f 2 (form/no-forms)))
+                                     (form/form-seq (form/two-forms (kwf :schemas) merged))))))
+
+;; ---------------------------------------------------------------------------
+;; Interfaces and import stubs (project.cljk 659-845)
+
+(defn- arity-of [clause [:ref :form/r]] :i64 (cnt (g clause :params)))
+
+(defn- source-name-of [function [:ref :form/r]] [:ref :form/r]
+  (let [s (g function :source-name)] (if (t? s) s (g function :name))))
+
+(defn- i64-types [n :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (<= n 0) acc (i64-types (- n 1) (form/append-form acc (kwf :i64)))))
+
+(defn- interface-of [f [:ref :form/r] linked-name [:ref :form/r]] [:ref :form/r]
+  (let [pt (g f :param-types)
+        r (g f :result)
+        m0 (p (p (p (p (p (p (emptym) :name (g f :name)) :params (g f :params))
+                          :param-types (if (t? pt) pt (form/form-vec (i64-types (cnt (g f :params)) (form/no-forms)))))
+                       :result (if (t? r) r (kwf :i64)))
+                    :effects (g f :effects))
+                 :linked-name linked-name)
+        cpc (g f :callable-param-contracts)
+        m1x (if (and (t? cpc) (> (cnt cpc) 0)) (p m0 :callable-param-contracts cpc) m0)
+        crc (g f :callable-result-contract)]
+    (if (t? crc) (p m1x :callable-result-contract crc) m1x)))
+
+;; the contract of parameter I: a vector by position, or a map keyed by index
+(defn- contract-at [contracts [:ref :form/r] i :i64] [:ref :form/r]
+  (cond (form/is-vec? contracts) (nth-f contracts i)
+        (form/is-map? contracts) (form/form-get contracts (intf i))
+        :else (nilf)))
+
+(defn- source-types [types [:ref :form/r] contracts [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt types))
+    acc
+    (let [c (contract-at contracts i)]
+      (source-types types contracts (+ i 1) (form/append-form acc (if (t? c) c (nth-f types i)))))))
+
+(defn- all-i64? [xs [:list [:ref :form/r]] i :i64] :bool
+  (if (>= i (vector-count xs)) true (if (kw-is? (nth-l xs i) :i64) (all-i64? xs (+ i 1)) false)))
+
+(defn- interleave-into [params [:ref :form/r] types [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (or (>= i (cnt params)) (>= i (vector-count types)))
+    acc
+    (interleave-into params types (+ i 1) (form/append-form (form/append-form acc (nth-f params i)) (nth-l types i)))))
+
+(defn- typed-params [params [:ref :form/r] types [:ref :form/r] contracts [:ref :form/r]] [:ref :form/r]
+  (let [st (source-types types contracts 0 (form/no-forms))]
+    (if (all-i64? st 0) params (form/form-vec (interleave-into params st 0 (form/no-forms))))))
+
+(defn- clause-params [c [:ref :form/r]] [:ref :form/r]
+  (typed-params (g c :params) (g c :param-types) (g c :callable-param-contracts)))
+
+(defn- clause-result [c [:ref :form/r]] [:ref :form/r]
+  (let [r (g c :callable-result-contract)] (if (t? r) r (g c :result))))
+
+(defn- call-list [head [:ref :form/r] args [:ref :form/r]] [:ref :form/r]
+  (form/form-seq (form/cons-onto head (form/kids-of args))))
+
+(defn- sym-call0 [s :string] [:ref :form/r] (form/form-seq (form/one-form (sym s))))
+
+(defn- stub-values [types [:ref :form/r] i :i64 mode :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  ;; mode 0: each item a type; mode 1: each item a [name type] field
+  (if (>= i (cnt types))
+    acc
+    (let [t (if (= mode 1) (nth-f (nth-f types i) 1) (nth-f types i))
+          v (stub-value t)]
+      (if (form/is-nil? v)
+        (form/one-form (nilf))
+        (stub-values types (+ i 1) mode (form/append-form acc v))))))
+
+(defn- has-nil-head? [xs [:list [:ref :form/r]]] :bool
+  (and (= 1 (vector-count xs)) (form/is-nil? (nth-l xs 0))))
+
+(defn- stub-value [type [:ref :form/r]] [:ref :form/r]
+  (let [h (if (form/is-vec? type) (nth-f type 0) (nilf))]
+    (cond
+      (kw-is? type :i64) (intf 0)
+      (kw-is? type :f64) (form/call1 "f64-from-bits" (intf 0))
+      (kw-is? type :f32) (form/call1 "f32-from-bits" (intf 0))
+      (kw-is? type :string) (form/string-form "")
+      (kw-is? type :keyword) (kwf :kotoba.stub/value)
+      (kw-is? type :symbol) (form/call1 "symbol" (form/string-form "kotoba.stub/value"))
+      (kw-is? type :map) (emptym)
+      (kw-is? type :bool) (form/bool-form false)
+      (kw-is? type :bytes) (form/call0 "bytes-empty")
+      (kw-is? type :document) (form/call0 "document-null")
+      (kw-is? type :option-i64) (form/call0 "option-none")
+      (kw-is? type :result-i64) (form/call1 "result-ok" (intf 0))
+      (kw-is? type :vector-i64) (form/call0 "vector-i64")
+      (kw-is? type :vector-f64) (form/call0 "vector-f64")
+      (kw-is? type :string-index) (form/call0 "string-index")
+      (kw-is? type :disjoint-set-i64) (form/call0 "disjoint-set-i64")
+      (kw-is? h :result) (let [v (stub-value (nth-f type 1))] (if (form/is-nil? v) v (form/call2 "result-ok-of" type v)))
+      (kw-is? h :option) (form/call1 "option-none-of" type)
+      (kw-is? h :list) (form/call1 "typed-list-new" type)
+      (kw-is? h :variant) (variant-stub type)
+      (kw-is? h :vector) (let [vs (stub-values (nth-f type 1) 0 0 (form/no-forms))]
+                           (if (has-nil-head? vs) (nilf) (form/form-seq (form/cons-onto (sym "hetero-vector") (form/cons-onto type vs)))))
+      (kw-is? h :set) (form/call1 "typed-set" type)
+      (kw-is? h :map) (form/call1 "typed-map-new" type)
+      (kw-is? h :record) (let [vs (stub-values (nth-f type 2) 0 1 (form/no-forms))]
+                           (if (has-nil-head? vs) (nilf) (form/form-seq (form/cons-onto (sym "record") (form/cons-onto type vs)))))
+      :else (nilf))))
+
+(defn- variant-stub [type [:ref :form/r]] [:ref :form/r]
+  (let [cases (nth-f type 2)
+        tag (nth-f cases 0)
+        c0 (if (form/is-map? cases) tag (nth-f tag 0))
+        pt (if (form/is-map? cases) (nth-f cases 1) (nth-f tag 1))
+        v (stub-value pt)]
+    (if (form/is-nil? v) v (form/call3 "variant-new" type c0 v))))
+
+(defn- stub-value! [type [:ref :form/r]] [:ref :form/r]
+  (let [v (stub-value type)
+        ok (need (present? v) "project import result type has no closed stub value" (m1 :type type))]
+    v))
+
+(defn- has-abort-effect? [effects [:ref :form/r]] :bool (has-item? effects (kwf :abort)))
+
+(defn- aborting-clause? [c [:ref :form/r]] :bool
+  (let [r (g c :result)]
+    (and (not (t? (g c :callable-result-contract)))
+         (has-abort-effect? (g c :effects))
+         (form/is-vec? r) (kw-is? (nth-f r 0) :result) (= 3 (cnt r)))))
+
+(defn- stub-error-name [stub [:ref :form/r]] [:ref :form/r] (sym (str (sym-text stub) "__abort_error")))
+
+(defn- error-value [stub [:ref :form/r] error-type [:ref :form/r]] [:ref :form/r]
+  (let [v (stub-value error-type)] (if (form/is-nil? v) (form/form-seq (form/one-form (stub-error-name stub))) v)))
+
+(defn- stub-body [stub [:ref :form/r] c [:ref :form/r]] [:ref :form/r]
+  (if (t? (g c :callable-result-contract))
+    (intf 0)
+    (let [v (stub-value (g c :result))] (if (form/is-nil? v) (call-list stub (g c :params)) v))))
+
+(defn- first-aborting-of-arity [aborting [:list [:ref :form/r]] arity :i64 i :i64] [:ref :form/r]
+  (if (>= i (vector-count aborting))
+    (nilf)
+    (if (= (arity-of (nth-l aborting i)) arity) (nth-l aborting i) (first-aborting-of-arity aborting arity (+ i 1)))))
+
+;; mode 0: an import stub's body (aborting clauses throw); mode 1: an export wrapper's body (the linked call)
+(defn- clause-body [mode :i64 stub [:ref :form/r] c [:ref :form/r] aborting [:list [:ref :form/r]]] [:ref :form/r]
+  (cond
+    (= mode 1) (call-list (g c :linked-name) (g c :params))
+    (t? (g c :kotoba.project/aborts))
+    (form/call1 "throw" (error-value stub (nth-f (g (first-aborting-of-arity aborting (arity-of c) 0) :result) 2)))
+    :else (stub-body stub c)))
+
+(defn- clause-forms-into [mode :i64 stub [:ref :form/r] clauses [:list [:ref :form/r]] aborting [:list [:ref :form/r]] i :i64] [:list [:ref :form/r]]
+  (cf-loop (record-new [:ref :pj/rb] stub (form/form-vec clauses)) mode aborting i (form/no-forms)))
+
+(defn- cf-loop [sc [:ref :pj/rb] mode :i64 aborting [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (let [stub (record-get [:ref :pj/rb] sc :v)
+        clauses (record-get [:ref :pj/rb] sc :bound)]
+    (if (>= i (cnt clauses))
+      acc
+      (let [c (nth-f clauses i)]
+        (cf-loop sc mode aborting (+ i 1)
+                 (form/append-form acc (form/form-seq (form/three-forms (clause-params c) (clause-result c) (clause-body mode stub c aborting)))))))))
+
+;; one `defn`/`defn-` for a name that denotes CLAUSES (single arity: the ordinary form)
+(defn- arity-declaration [op :string name [:ref :form/r] clauses [:list [:ref :form/r]] mode :i64 aborting [:list [:ref :form/r]]] [:ref :form/r]
+  (let [cs (clause-forms-into mode name clauses aborting 0)]
+    (if (= 1 (vector-count clauses))
+      (form/form-seq (form/cons-onto (sym op) (form/cons-onto name (form/kids-of (nth-l cs 0)))))
+      (form/form-seq (form/cons-onto (sym op) (form/cons-onto name cs))))))
+
+(defn- mark-aborting [clauses [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count clauses))
+    acc
+    (let [c (nth-l clauses i)]
+      (mark-aborting clauses (+ i 1)
+        (form/append-form acc (if (aborting-clause? c)
+                                (p (p c :result (nth-f (g c :result) 1)) :kotoba.project/aborts (form/bool-form true))
+                                c))))))
+
+(defn- aborting-of [clauses [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count clauses))
+    acc
+    (aborting-of clauses (+ i 1) (if (aborting-clause? (nth-l clauses i)) (form/append-form acc (nth-l clauses i)) acc))))
+
+(defn- unclosed-error-types [stub [:ref :form/r] aborting [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count aborting))
+    acc
+    (let [et (nth-f (g (nth-l aborting i) :result) 2)]
+      (unclosed-error-types stub aborting (+ i 1)
+        (if (form/is-seq? (error-value stub et)) (form/append-form acc et) acc)))))
+
+(defn- stub-forms [stub [:ref :form/r] clauses [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (let [aborting (aborting-of clauses 0 (form/no-forms))
+        declaration (arity-declaration "defn-" stub (mark-aborting clauses 0 (form/no-forms)) 0 aborting)
+        ets (distinct-list (unclosed-error-types stub aborting 0 (form/no-forms)))
+        ok (need (<= (vector-count ets) 1) "aborting import arities throw different unclosed error types"
+                 (m2 :stub stub :error-types (form/form-vec ets)))]
+    (if (= 1 (vector-count ets))
+      (form/two-forms declaration
+                      (form/form-seq (form/append-many (form/three-forms (sym "defn-") (stub-error-name stub) (emptyv))
+                                                       (form/two-forms (nth-l ets 0) (form/form-seq (form/one-form (stub-error-name stub)))))))
+      (form/one-form declaration))))
+
+;; ---------------------------------------------------------------------------
+;; Call rewrites (project.cljk 846-950)
+
+(defn- slash-at [s :string] :i64 (if (string=? s "/") -1 (string-find-byte s 47 0)))
+
+(defn- qualified-sym? [f [:ref :form/r]] :bool (and (form/is-symbol? f) (>= (slash-at (sym-text f)) 0)))
+
+(defn- sym-namespace [f [:ref :form/r]] :string (string-substring (sym-text f) 0 (slash-at (sym-text f))))
+
+(defn- sym-name [f [:ref :form/r]] :string
+  (let [s (sym-text f)] (string-substring s (+ 1 (slash-at s)) (string-byte-length s))))
+
+(defn- capability-operation? [op [:ref :form/r]] :bool
+  (form/form-has? (sema/capability-registry) (kwf (keyword-from-string (sym-text op)))))
+
+(defn- import-target [op [:ref :form/r] imported [:ref :form/r]] [:ref :form/r]
+  (let [hit (form/form-get imported op)]
+    (cond
+      (present? hit) hit
+      (string=? (sym-namespace op) "clojure.core") (sym (sym-name op))
+      (capability-operation? op) op
+      (string=? (sym-namespace op) "kotoba.reader") op
+      :else (let [ok (fail (str "qualified call is not an admitted exported import: " (sym-text op)) (m1 :call op))] op))))
+
+(defn- rewrite-import-calls [f [:ref :form/r] imported [:ref :form/r]] [:ref :form/r]
+  (cond
+    (form/is-seq? f)
+    (if (= 0 (cnt f))
+      f
+      (let [op (nth-f f 0)
+            op2 (if (qualified-sym? op) (import-target op imported) op)]
+        (form/form-seq (form/cons-onto op2 (ric-kids f imported 1 (form/no-forms))))))
+    (or (form/is-vec? f) (form/is-map? f)) (rebuild f (ric-kids f imported 0 (form/no-forms)))
+    :else f))
+
+(defn- ric-kids [f [:ref :form/r] imported [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt f)) acc (ric-kids f imported (+ i 1) (form/append-form acc (rewrite-import-calls (nth-f f i) imported)))))
+
+(defn- rename [names [:ref :form/r] op [:ref :form/r]] [:ref :form/r]
+  (let [hit (form/form-get names op)] (if (and (form/form-has? names op)) hit op)))
+
+(defn- rewrite-calls [f [:ref :form/r] names [:ref :form/r]] [:ref :form/r]
+  (cond
+    (form/is-seq? f)
+    (if (= 0 (cnt f)) f (form/form-seq (form/cons-onto (rename names (nth-f f 0)) (rc-kids f names 1 (form/no-forms)))))
+    (or (form/is-vec? f) (form/is-map? f)) (rebuild f (rc-kids f names 0 (form/no-forms)))
+    :else f))
+
+(defn- rc-kids [f [:ref :form/r] names [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt f)) acc (rc-kids f names (+ i 1) (form/append-form acc (rewrite-calls (nth-f f i) names)))))
+
+(defn- starts-with? [s :string prefix :string] :bool
+  (and (>= (string-byte-length s) (string-byte-length prefix))
+       (string=? (string-substring s 0 (string-byte-length prefix)) prefix)))
+
+;; `__kotoba_invoke(?:_.+)?\$arity[0-4]`
+(defn- invoke-dispatcher-name? [f [:ref :form/r]] :bool
+  (if (form/is-symbol? f)
+    (let [s (sym-text f)
+          n (string-byte-length s)
+          pre "__kotoba_invoke"
+          np 15]
+      (and (>= n (+ np 7))
+           (starts-with? s pre)
+           (string=? (string-substring s (- n 7) (- n 1)) "$arity")
+           (let [d (string-code-point-at s (- n 1))] (and (>= d 48) (<= d 52)))
+           (or (= n (+ np 7))
+               (and (= 95 (string-code-point-at s np)) (> n (+ np 8))))))
+    false))
+
+(defn- closure-apply-name? [f [:ref :form/r]] :bool (sym-is? f "__kotoba_closure_apply"))
+
+;; ---------------------------------------------------------------------------
+;; Project-wide admission counters (project.cljk 1018-1047)
+
+(defn- cnt-new [] [:ref :pj/cnt] (record-new [:ref :pj/cnt] 0 0 0))
+
+(defn- admit-node [f [:ref :form/r] c [:ref :pj/cnt]] [:ref :pj/cnt]
+  (cond
+    (form/is-symbol? f) c
+    (or (form/is-seq? f) (form/is-vec? f) (form/is-set? f) (form/is-map? f))
+    (let [c1 (if (form/is-seq? f)
+               (let [e (+ 1 (record-get [:ref :pj/cnt] c :expr))
+                     ok (need (<= e (max-project-expression-nodes)) "project expression nodes exceed limit"
+                              (m2 :count (intf e) :limit (intf (max-project-expression-nodes))))]
+                 (record-assoc [:ref :pj/cnt] c :expr e))
+               c)]
+      (admit-kids f 0 c1))
+    :else
+    (let [l (+ 1 (record-get [:ref :pj/cnt] c :lit))
+          ok (need (<= l (max-project-literals)) "project literals exceed limit"
+                   (m2 :count (intf l) :limit (intf (max-project-literals))))
+          c1 (record-assoc [:ref :pj/cnt] c :lit l)]
+      (if (form/is-string? f)
+        (let [b (+ (string-byte-length (form/string-value f)) (record-get [:ref :pj/cnt] c :bytes))
+              ok2 (need (<= b (max-project-string-literal-bytes)) "project string literal bytes exceed limit"
+                        (m2 :bytes (intf b) :limit (intf (max-project-string-literal-bytes))))]
+          (record-assoc [:ref :pj/cnt] c1 :bytes b))
+        c1))))
+
+(defn- admit-kids [f [:ref :form/r] i :i64 c [:ref :pj/cnt]] [:ref :pj/cnt]
+  (if (>= i (cnt f)) c (admit-kids f (+ i 1) (admit-node (nth-f f i) c))))
+
+(defn- admit-forms [forms [:list [:ref :form/r]] i :i64 c [:ref :pj/cnt]] [:ref :pj/cnt]
+  (if (>= i (vector-count forms)) c (admit-forms forms (+ i 1) (admit-node (nth-l forms i) c))))
+
+;; ---------------------------------------------------------------------------
+;; Attribution (project.cljk 1065-1145)
+
+(defn- span-line [f [:ref :form/r]] :i64 (quot (form/span-of f) 4294967296))
+
+(defn- form-contains? [f [:ref :form/r] needle [:ref :form/r]] :bool
+  (or (form/eq f needle)
+      (and (or (form/is-seq? f) (form/is-vec? f) (form/is-set? f) (form/is-map? f))
+           (kids-contain? f needle 0))))
+
+(defn- kids-contain? [f [:ref :form/r] needle [:ref :form/r] i :i64] :bool
+  (if (>= i (cnt f)) false (if (form-contains? (nth-f f i) needle) true (kids-contain? f needle (+ i 1)))))
+
+(defn- index-containing [forms [:list [:ref :form/r]] needle [:ref :form/r] i :i64] :i64
+  (if (>= i (vector-count forms)) -1 (if (form-contains? (nth-l forms i) needle) i (index-containing forms needle (+ i 1)))))
+
+;; which top-level form of FORMS the refusal E refers to: its form's line (one form per line), else the first form
+;; containing the refused form; -1 when neither locates it
+(defn- top-level-index [forms [:list [:ref :form/r]] e [:ref :fe/err]] :i64
+  (let [f (record-get [:ref :fe/err] e :form)
+        line (span-line f)]
+    (cond
+      (and (>= line 1) (<= line (vector-count forms))) (- line 1)
+      (present? f) (index-containing forms f 0)
+      :else -1)))
+
+(defn- strip-span [f [:ref :form/r]] [:ref :form/r] (record-assoc [:ref :form/r] f :span 0))
+
+(defn- attribute-error* [e [:ref :fe/err] module [:ref :form/r] line :i64 binding [:ref :form/r]] [:ref :fe/err]
+  (let [msg (if (present? binding)
+              (str (record-get [:ref :fe/err] e :msg) " in " (describe-binding module binding))
+              (record-get [:ref :fe/err] e :msg))
+        d0 (form/dissoc-form (p (err-data e) :source-module module) (kwf :span))
+        d1 (if (> line 0) (p d0 :span (m1 :line (intf line))) d0)
+        d2 (if (present? binding) (p d1 :source-binding (sorted-map-of binding)) d1)]
+    (record-assoc [:ref :fe/err] (err-with e msg d2) :form (strip-span (record-get [:ref :fe/err] e :form)))))
+
+(defn attribute-error
+  "The same refusal, attributed to MODULE at LINE (0: unknown); BINDING (nil for an ordinary module) is named in the
+  message for an instantiation of a template."
+  [e [:ref :fe/err] module [:ref :form/r] line :i64 binding [:ref :form/r]] [:ref :fe/err]
+  (attribute-error* e module line binding))
+
+(defn with-module-file
+  "Add `:source-file` to an attributed refusal from a module->path map (a Form map of symbol -> string)."
+  [e [:ref :fe/err] paths [:ref :form/r]] [:ref :fe/err]
+  (let [d (err-data e)
+        file (form/form-get paths (g d :source-module))]
+    (if (and (form/is-string? file) (form/is-nil? (g d :source-file)))
+      (err-with e (record-get [:ref :fe/err] e :msg) (p d :source-file file))
+      e)))
+
+(defn- attributed? [e [:ref :fe/err]] :bool (form/form-has? (err-data e) (kwf :source-module)))
+
+(defn- attribute-module-error [e [:ref :fe/err] module [:ref :form/r] original [:list [:ref :form/r]] analysed [:list [:ref :form/r]] binding [:ref :form/r]] [:ref :fe/err]
+  (if (attributed? e)
+    e
+    (let [index (top-level-index analysed e)
+          line (if (and (>= index 0) (< index (vector-count original))) (span-line (nth-l original index)) 0)]
+      (attribute-error* e module line binding))))
+
+(defn- definition-lines [forms [:list [:ref :form/r]] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (vector-count forms))
+    acc
+    (let [f (nth-l forms i)]
+      (definition-lines forms (+ i 1)
+        (if (and (or (head-sym? f "defn") (head-sym? f "defn-")) (form/is-symbol? (nth-f f 1)) (> (span-line f) 0))
+          (form/assoc-form acc (sym (sym-text (nth-f f 1))) (intf (span-line f)))
+          acc)))))
+
+;; ---------------------------------------------------------------------------
+;; Templates: substitution and the loose-parameter check (project.cljk 1151-1357)
+
+(defn- bound-type [binding [:ref :form/r] f [:ref :form/r]] [:ref :form/r] (form/form-get binding f))
+(defn- binds? [binding [:ref :form/r] f [:ref :form/r]] :bool (and (form/is-symbol? f) (form/form-has? binding f)))
+
+(defn- substitute-in-type [f [:ref :form/r] binding [:ref :form/r]] [:ref :form/r]
+  (cond (binds? binding f) (bound-type binding f)
+        (form/is-vec? f) (form/form-vec (sit-kids f binding 0 (form/no-forms)))
+        :else f))
+
+(defn- sit-kids [f [:ref :form/r] binding [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt f)) acc (sit-kids f binding (+ i 1) (form/append-form acc (substitute-in-type (nth-f f i) binding)))))
+
+(defn- spv-loop [params [:ref :form/r] binding [:ref :form/r] module [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt params))
+    acc
+    (let [pattern (nth-f params i)
+          has-next (< (+ i 1) (cnt params))
+          candidate (nth-f params (+ i 1))
+          ok (need (not (binds? binding pattern))
+                   "template parameter is used as a parameter name; a parameter symbol may only stand in a type position"
+                   (p (m2 :module module :parameter pattern) :params params))
+          sp (substitute-form pattern binding module)]
+      (cond
+        (and has-next (binds? binding candidate))
+        (spv-loop params binding module (+ i 2) (form/append-form (form/append-form acc sp) (bound-type binding candidate)))
+        (and has-next (type-form? candidate))
+        (spv-loop params binding module (+ i 2) (form/append-form (form/append-form acc sp) (substitute-in-type candidate binding)))
+        :else (spv-loop params binding module (+ i 1) (form/append-form acc sp))))))
+
+(defn- substitute-clause [clause [:ref :form/r] binding [:ref :form/r] module [:ref :form/r]] [:list [:ref :form/r]]
+  ;; CLAUSE: `([params] result? ..body)` as a seq Form (or the declaration tail of a single-arity defn)
+  (let [params2 (form/form-vec (spv-loop (nth-f clause 0) binding module 0 (form/no-forms)))
+        first-tail (nth-f clause 1)
+        has-result (and (> (cnt clause) 1) (binds? binding first-tail))
+        start (if has-result 2 1)
+        head (if has-result (form/two-forms params2 (bound-type binding first-tail)) (form/one-form params2))]
+    (sf-kids-into clause binding module start head)))
+
+(defn- sf-kids-into [f [:ref :form/r] binding [:ref :form/r] module [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt f)) acc (sf-kids-into f binding module (+ i 1) (form/append-form acc (substitute-form (nth-f f i) binding module)))))
+
+(defn- sd-clauses [decl [:ref :form/r] binding [:ref :form/r] module [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt decl))
+    acc
+    (let [c (nth-f decl i)]
+      (sd-clauses decl binding module (+ i 1)
+        (form/append-form acc (if (and (form/is-seq? c) (form/is-vec? (nth-f c 0)))
+                                (form/form-seq (substitute-clause c binding module))
+                                (substitute-form c binding module)))))))
+
+(defn- substitute-declaration [f [:ref :form/r] binding [:ref :form/r] module [:ref :form/r]] [:ref :form/r]
+  (let [has-doc (form/is-string? (nth-f f 2))
+        start (if has-doc 3 2)
+        decl (form/form-seq (drop-kids f start))
+        head (if has-doc (form/three-forms (nth-f f 0) (nth-f f 1) (nth-f f 2)) (form/two-forms (nth-f f 0) (nth-f f 1)))
+        rebuilt (if (form/is-vec? (nth-f decl 0))
+                  (substitute-clause decl binding module)
+                  (sd-clauses decl binding module 0 (form/no-forms)))]
+    (form/form-seq (form/append-many head rebuilt))))
+
+(defn- with-at [spec [:ref :form/r] i :i64] :i64
+  (if (>= i (cnt spec)) -1 (if (and (= 1 (mod i 2)) (kw-is? (nth-f spec i) :with)) i (with-at spec (+ i 1)))))
+
+(defn- substitute-map-values [m [:ref :form/r] binding [:ref :form/r] j :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= (+ j 1) (cnt m))
+    acc
+    (substitute-map-values m binding (+ j 2) (form/append-form (form/append-form acc (nth-f m j)) (substitute-in-type (nth-f m (+ j 1)) binding)))))
+
+(defn- replace-kid [f [:ref :form/r] at :i64 v [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt f)) acc (replace-kid f at v (+ i 1) (form/append-form acc (if (= i at) v (nth-f f i))))))
+
+(defn- substitute-spec [spec [:ref :form/r] binding [:ref :form/r]] [:ref :form/r]
+  (if (form/is-vec? spec)
+    (let [at (with-at spec 0)]
+      (if (and (>= at 0) (form/is-map? (nth-f spec (+ at 1))))
+        (form/form-vec (replace-kid spec (+ at 1) (form/form-map (substitute-map-values (nth-f spec (+ at 1)) binding 0 (form/no-forms))) 0 (form/no-forms)))
+        spec))
+    spec))
+
+(defn- substitute-specs [c [:ref :form/r] binding [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt c)) acc (substitute-specs c binding (+ i 1) (form/append-form acc (if (= i 0) (nth-f c 0) (substitute-spec (nth-f c i) binding))))))
+
+(defn- substitute-ns [f [:ref :form/r] binding [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt f))
+    acc
+    (let [c (nth-f f i)]
+      (substitute-ns f binding (+ i 1)
+        (form/append-form acc (if (head-kw? c :require) (form/form-seq (substitute-specs c binding 0 (form/no-forms))) c))))))
+
+(defn- substitute-form [f [:ref :form/r] binding [:ref :form/r] module [:ref :form/r]] [:ref :form/r]
+  (cond
+    (and (form/is-vec? f) (form/is-keyword? (nth-f f 0))) (substitute-in-type f binding)
+    (form/is-seq? f)
+    (cond
+      (or (head-sym? f "defn") (head-sym? f "defn-")) (substitute-declaration f binding module)
+      (head-sym? f "ns") (form/form-seq (substitute-ns f binding 0 (form/no-forms)))
+      :else (form/form-seq (sf-kids-into f binding module 0 (form/no-forms))))
+    (or (form/is-vec? f) (form/is-map? f)) (rebuild f (sf-kids-into f binding module 0 (form/no-forms)))
+    :else f))
+
+(defn- binding-head? [h [:ref :form/r]] :bool
+  (or (sym-is? h "let") (sym-is? h "loop") (sym-is? h "for") (sym-is? h "doseq") (sym-is? h "dotimes")
+      (sym-is? h "when-let") (sym-is? h "if-let") (sym-is? h "when-some") (sym-is? h "if-some")
+      (sym-is? h "when-first") (sym-is? h "binding")))
+
+(defn- pattern-symbols-into [f [:ref :form/r] acc [:ref :form/r]] [:ref :form/r]
+  (cond (form/is-symbol? f) (set-add acc f)
+        (or (form/is-seq? f) (form/is-vec? f) (form/is-set? f) (form/is-map? f)) (ps-kids f 0 acc)
+        :else acc))
+
+(defn- ps-kids [f [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (cnt f)) acc (ps-kids f (+ i 1) (pattern-symbols-into (nth-f f i) acc))))
+
+(defn- loose! [binding [:ref :form/r] module [:ref :form/r] s [:ref :form/r]] :i64
+  (fail (str "template parameter " (sym-text s) " reaches the frontend unsubstituted; "
+             "it may stand only in a type position (inside a keyword-headed "
+             "type vector, or as a parameter or result type of a defn)")
+        (m2 :module module :parameter s)))
+
+;; the loose-parameter walk; CTX = {:binding :module} as a map Form, BOUND a set Form
+(defn- ck [f [:ref :form/r] ctx [:ref :form/r] bound [:ref :form/r]] :i64
+  (let [binding (g ctx :binding)]
+    (cond
+      (form/is-symbol? f)
+      (if (and (binds? binding f) (not (has-item? bound f))) (loose! binding (g ctx :module) f) 0)
+      (form/is-seq? f)
+      (let [op (head-of f)]
+        (cond
+          (sym-is? op "ns") 0
+          (binding-head? op) (ck-from f ctx (ck-bindings (nth-f f 1) ctx bound 0) 2)
+          (sym-is? op "fn")
+          (if (form/is-vec? (nth-f f 1))
+            (ck-clause (form/form-seq (drop-kids f 1)) ctx bound)
+            (ck-clauses f ctx bound 1))
+          (sym-is? op "catch")
+          (let [n (cnt f)
+                binder (nth-f f (- n 2))
+                ok (ck-range f ctx bound 1 (- n 2))]
+            (ck (nth-f f (- n 1)) ctx (pattern-symbols-into binder bound)))
+          (or (sym-is? op "defn") (sym-is? op "defn-"))
+          (let [start (if (form/is-string? (nth-f f 2)) 3 2)
+                decl (form/form-seq (drop-kids f start))]
+            (if (form/is-vec? (nth-f decl 0)) (ck-clause decl ctx bound) (ck-clauses decl ctx bound 0)))
+          :else (ck-from f ctx bound 0)))
+      (or (form/is-vec? f) (form/is-map? f)) (ck-from f ctx bound 0)
+      :else 0)))
+
+(defn- ck-from [f [:ref :form/r] ctx [:ref :form/r] bound [:ref :form/r] i :i64] :i64
+  (if (>= i (cnt f)) 0 (let [ok (ck (nth-f f i) ctx bound)] (ck-from f ctx bound (+ i 1)))))
+
+(defn- ck-range [f [:ref :form/r] ctx [:ref :form/r] bound [:ref :form/r] i :i64 end :i64] :i64
+  (if (>= i end) 0 (let [ok (ck (nth-f f i) ctx bound)] (ck-range f ctx bound (+ i 1) end))))
+
+(defn- ck-clause [c [:ref :form/r] ctx [:ref :form/r] bound [:ref :form/r]] :i64
+  (ck-from c ctx (pattern-symbols-into (nth-f c 0) bound) 1))
+
+(defn- ck-clauses [f [:ref :form/r] ctx [:ref :form/r] bound [:ref :form/r] i :i64] :i64
+  (if (>= i (cnt f))
+    0
+    (let [c (nth-f f i)
+          ok (if (and (form/is-seq? c) (form/is-vec? (nth-f c 0))) (ck-clause c ctx bound) (ck c ctx bound))]
+      (ck-clauses f ctx bound (+ i 1)))))
+
+;; the scope after a binding vector (`:let [..]` nests; `:when`/`:while` take an expression)
+(defn- ck-bindings [v [:ref :form/r] ctx [:ref :form/r] bound [:ref :form/r] i :i64] [:ref :form/r]
+  (if (>= i (cnt v))
+    bound
+    (let [pattern (nth-f v i)
+          expr (nth-f v (+ i 1))]
+      (cond
+        (kw-is? pattern :let) (ck-bindings v ctx (ck-bindings expr ctx bound 0) (+ i 2))
+        (form/is-keyword? pattern) (let [ok (ck expr ctx bound)] (ck-bindings v ctx bound (+ i 2)))
+        :else (let [ok (ck expr ctx bound)] (ck-bindings v ctx (pattern-symbols-into pattern bound) (+ i 2)))))))
+
+(defn- ck-forms [forms [:list [:ref :form/r]] ctx [:ref :form/r] i :i64] :i64
+  (if (>= i (vector-count forms)) 0 (let [ok (ck (nth-l forms i) ctx (emptys))] (ck-forms forms ctx (+ i 1)))))
+
+(defn- substitute-all [forms [:list [:ref :form/r]] binding [:ref :form/r] module [:ref :form/r] i :i64] [:list [:ref :form/r]]
+  (sa-into forms binding module i (form/no-forms)))
+
+(defn- sa-into [forms [:list [:ref :form/r]] binding [:ref :form/r] module [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count forms)) acc (sa-into forms binding module (+ i 1) (form/append-form acc (substitute-form (nth-l forms i) binding module)))))
+
+(defn instantiate-forms
+  "The forms of a template module under BINDING: every parameter symbol in a type position replaced by its bound type
+  form, refused if one remains anywhere it is not a bound local."
+  [forms [:list [:ref :form/r]] binding [:ref :form/r] module [:ref :form/r]] [:list [:ref :form/r]]
+  (let [b (sorted-map-of binding)
+        substituted (substitute-all forms b module 0)
+        ok (ck-forms substituted (m2 :binding b :module module) 0)]
+    substituted))
+
+;; ---------------------------------------------------------------------------
+;; `:refer` (project.cljk 1359-1461)
+
+(defn- referred-alias-table [requires [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (cnt requires))
+    acc
+    (let [r (nth-f requires i)]
+      (referred-alias-table requires (+ i 1) (rat-names (g r :refer) (g r :alias) 0 acc)))))
+
+(defn- rat-names [refer [:ref :form/r] alias [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (cnt refer))
+    acc
+    (rat-names refer alias (+ i 1)
+               (form/assoc-form acc (nth-f refer i) (sym (str (sym-text alias) "/" (sym-text (nth-f refer i))))))))
+
+;; rewrite F with TABLE in scope BOUND; CTX = {:table}
+(defn- rr [f [:ref :form/r] table [:ref :form/r] bound [:ref :form/r]] [:ref :form/r]
+  (cond
+    (form/is-symbol? f)
+    (if (and (form/form-has? table f) (not (has-item? bound f))) (form/form-get table f) f)
+    (form/is-seq? f)
+    (let [op (head-of f)]
+      (cond
+        (or (sym-is? op "ns") (sym-is? op "quote")) f
+        (binding-head? op)
+        (let [r (rr-bindings (nth-f f 1) table bound 0 (form/no-forms))
+              b2 (record-get [:ref :pj/rb] r :bound)]
+          (form/form-seq (form/cons-onto op (form/cons-onto (record-get [:ref :pj/rb] r :v) (rr-kids f table b2 2 (form/no-forms))))))
+        (sym-is? op "fn")
+        (if (form/is-vec? (nth-f f 1))
+          (form/form-seq (form/cons-onto op (rr-clause (form/form-seq (drop-kids f 1)) table bound)))
+          (form/form-seq (form/cons-onto op (rr-clauses f table bound 1 (form/no-forms)))))
+        (sym-is? op "catch")
+        (let [n (cnt f)
+              binder (nth-f f (- n 2))
+              b2 (pattern-symbols-into binder bound)]
+          (form/form-seq (form/append-form (form/append-form (rr-range-into (record-new [:ref :pj/rb] f table) bound 0 (- n 2) (form/no-forms)) binder)
+                                           (rr (nth-f f (- n 1)) table b2))))
+        (or (sym-is? op "defn") (sym-is? op "defn-"))
+        (let [has-doc (form/is-string? (nth-f f 2))
+              start (if has-doc 3 2)
+              decl (form/form-seq (drop-kids f start))
+              head (if has-doc (form/three-forms op (nth-f f 1) (nth-f f 2)) (form/two-forms op (nth-f f 1)))
+              rebuilt (if (form/is-vec? (nth-f decl 0)) (rr-clause decl table bound) (rr-clauses decl table bound 0 (form/no-forms)))]
+          (form/form-seq (form/append-many head rebuilt)))
+        :else (form/form-seq (rr-kids f table bound 0 (form/no-forms)))))
+    (or (form/is-vec? f) (form/is-map? f) (form/is-set? f)) (rebuild f (rr-kids f table bound 0 (form/no-forms)))
+    :else f))
+
+(defn- rr-kids [f [:ref :form/r] table [:ref :form/r] bound [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt f)) acc (rr-kids f table bound (+ i 1) (form/append-form acc (rr (nth-f f i) table bound)))))
+
+(defn- rr-range-into [ft [:ref :pj/rb] bound [:ref :form/r] i :i64 end :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (let [f (record-get [:ref :pj/rb] ft :v)
+        table (record-get [:ref :pj/rb] ft :bound)]
+    (if (>= i end)
+      acc
+      (rr-range-into ft bound (+ i 1) end (form/append-form acc (if (= i 0) (nth-f f 0) (rr (nth-f f i) table bound)))))))
+
+;; `([params] ..tail)` -> the same with the tail rewritten in the params' scope (as a list of items)
+(defn- rr-clause [c [:ref :form/r] table [:ref :form/r] bound [:ref :form/r]] [:list [:ref :form/r]]
+  (let [params (nth-f c 0)
+        b2 (pattern-symbols-into params bound)]
+    (rr-kids c table b2 1 (form/one-form params))))
+
+(defn- rr-clauses [f [:ref :form/r] table [:ref :form/r] bound [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt f))
+    acc
+    (let [c (nth-f f i)]
+      (rr-clauses f table bound (+ i 1)
+        (form/append-form acc (if (and (form/is-seq? c) (form/is-vec? (nth-f c 0)))
+                                (form/form-seq (rr-clause c table bound))
+                                (rr c table bound)))))))
+
+;; [rewritten binding vector, scope after it]
+(defn- rr-bindings [v [:ref :form/r] table [:ref :form/r] bound [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:ref :pj/rb]
+  (if (>= i (cnt v))
+    (record-new [:ref :pj/rb] (form/form-vec acc) bound)
+    (let [pattern (nth-f v i)
+          expr (nth-f v (+ i 1))]
+      (cond
+        (kw-is? pattern :let)
+        (let [r (rr-bindings expr table bound 0 (form/no-forms))]
+          (rr-bindings v table (record-get [:ref :pj/rb] r :bound) (+ i 2)
+                       (form/append-form (form/append-form acc pattern) (record-get [:ref :pj/rb] r :v))))
+        (form/is-keyword? pattern)
+        (rr-bindings v table bound (+ i 2) (form/append-form (form/append-form acc pattern) (rr expr table bound)))
+        :else
+        (rr-bindings v table (pattern-symbols-into pattern bound) (+ i 2)
+                     (form/append-form (form/append-form acc pattern) (rr expr table bound)))))))
+
+(defn- rewrite-referred-symbols [forms [:list [:ref :form/r]] table [:ref :form/r]] [:list [:ref :form/r]]
+  (if (= 0 (cnt table)) forms (rrs-into forms table 0 (form/no-forms))))
+
+(defn- rrs-into [forms [:list [:ref :form/r]] table [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count forms)) acc (rrs-into forms table (+ i 1) (form/append-form acc (rr (nth-l forms i) table (emptys))))))
+
+(defn- check-referred-exports! [info [:ref :form/r] dependencies [:ref :form/r]] :i64
+  (cre-loop info dependencies 0))
+
+(defn- cre-loop [info [:ref :form/r] dependencies [:ref :form/r] i :i64] :i64
+  (let [requires (g info :requires)]
+    (if (>= i (cnt requires))
+      0
+      (let [r (nth-f requires i)
+            refer (g r :refer)
+            interface (g (form/form-get dependencies (instantiation-key (g r :namespace) (g r :with))) :interface)
+            ok (if (t? refer) (cre-names info r refer interface 0) 0)]
+        (cre-loop info dependencies (+ i 1))))))
+
+(defn- cre-names [info [:ref :form/r] r [:ref :form/r] refer [:ref :form/r] interface [:ref :form/r] i :i64] :i64
+  (if (>= i (cnt refer))
+    0
+    (let [n (nth-f refer i)
+          ok (need (form/form-has? interface n)
+                   (str "referred name " (sym-text n) " is not exported by " (sym-text (g r :namespace))
+                        "; its exports are " (pr (form/form-vec (sort-by-text (form/kids-of (form/keys-of interface)) 0))))
+                   (p (m2 :module (g info :namespace) :dependency (g r :namespace)) :name n))]
+      (cre-names info r refer interface (+ i 1)))))
+
+;; ---------------------------------------------------------------------------
+;; One module (project.cljk 1495-1642)
+
+;; [qualified clauses] of every export of every dependency, as vec2 Forms
+(defn- available [info [:ref :form/r] dependencies [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (let [requires (g info :requires)]
+    (if (>= i (cnt requires))
+      acc
+      (let [r (nth-f requires i)
+            key (instantiation-key (g r :namespace) (g r :with))
+            ok (need (form/form-has? dependencies key) "imported namespace was not resolved"
+                     (m2 :module (g info :namespace) :dependency (g r :namespace)))
+            interface (g (form/form-get dependencies key) :interface)]
+        (available info dependencies (+ i 1) (avail-exports interface (g r :alias) 0 acc))))))
+
+(defn- avail-exports [interface [:ref :form/r] alias [:ref :form/r] j :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= (+ j 1) (cnt interface))
+    acc
+    (avail-exports interface alias (+ j 2)
+                   (form/append-form acc (form/vec2 (sym (str (sym-text alias) "/" (sym-text (nth-f interface j)))) (nth-f interface (+ j 1)))))))
+
+;; dedupe AVAILABLE by qualified name, the later entry winning (`into {}`), keeping first-seen order of keys
+(defn- avail-map [xs [:list [:ref :form/r]] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (vector-count xs)) acc (avail-map xs (+ i 1) (form/assoc-form acc (nth-f (nth-l xs i) 0) (nth-f (nth-l xs i) 1)))))
+
+;; [qualified stub clauses] triples, sorted by qualified name, stubs numbered in that order
+(defn- stub-triples [sorted [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count sorted))
+    acc
+    (stub-triples sorted (+ i 1)
+                  (form/append-form acc (form/vec3 (nth-f (nth-l sorted i) 0) (sym (str "kotoba_import__" (string-from-i64 i)))
+                                                   (nth-f (nth-l sorted i) 1))))))
+
+(defn- arity-targets [clauses [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (cnt clauses))
+    acc
+    (let [c (nth-f clauses i)]
+      (arity-targets clauses (+ i 1) (form/assoc-form acc (intf (arity-of c)) (g c :linked-name))))))
+
+;; field K of every triple: 0 qualified -> stub (a map), 1 stub -> {arity linked-name}, 2 the set of stubs, 3 the set of
+;; error helpers
+(defn- triples-table [ts [:list [:ref :form/r]] mode :i64 i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (vector-count ts))
+    acc
+    (let [t (nth-l ts i)
+          stub (nth-f t 1)]
+      (triples-table ts mode (+ i 1)
+        (cond (= mode 0) (form/assoc-form acc (nth-f t 0) stub)
+              (= mode 1) (form/assoc-form acc stub (arity-targets (nth-f t 2) 0 (emptym)))
+              (= mode 2) (set-add acc stub)
+              :else (set-add acc (stub-error-name stub)))))))
+
+(defn- all-stub-forms [ts [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count ts))
+    acc
+    (all-stub-forms ts (+ i 1) (form/append-many acc (stub-forms (nth-f (nth-l ts i) 1) (form/kids-of (nth-f (nth-l ts i) 2)))))))
+
+(defn- ric-all [forms [:list [:ref :form/r]] imported [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count forms)) acc (ric-all forms imported (+ i 1) (form/append-form acc (rewrite-import-calls (nth-l forms i) imported)))))
+
+(defn- dependency-schemas [info [:ref :form/r] dependencies [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (let [requires (g info :requires)]
+    (if (>= i (cnt requires))
+      acc
+      (let [r (nth-f requires i)]
+        (dependency-schemas info dependencies (+ i 1)
+          (merge-maps acc (g (form/form-get dependencies (instantiation-key (g r :namespace) (g r :with))) :schemas)))))))
+
+(defn- stub-fns [fns [:ref :form/r] names [:ref :form/r] keep :bool i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  ;; KEEP true: the functions whose source name is in NAMES; false: the others
+  (if (>= i (cnt fns))
+    acc
+    (let [f (nth-f fns i)
+          in (has-item? names (source-name-of f))]
+      (stub-fns fns names keep (+ i 1) (if (= in keep) (form/append-form acc f) acc)))))
+
+(defn- stub-targets-of [stub-fs [:list [:ref :form/r]] targets [:ref :form/r] module [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (vector-count stub-fs))
+    acc
+    (let [f (nth-l stub-fs i)
+          sn (source-name-of f)
+          per (form/form-get targets sn)
+          target (form/form-get per (intf (arity-of f)))
+          ok (need (present? target) "linked import stub has no target for its arity"
+                   (p (m2 :module module :stub sn) :arity (intf (arity-of f))))]
+      (stub-targets-of stub-fs targets module (+ i 1) (form/assoc-form acc (g f :name) target)))))
+
+(defn- local-names [locals [:list [:ref :form/r]] mi :i64 i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (vector-count locals))
+    acc
+    (let [f (nth-l locals i)]
+      (local-names locals mi (+ i 1)
+        (form/assoc-form acc (g f :name)
+                         (if (t? (g f :loop-helper?))
+                           (sym (str "__kotoba_loop_" (string-from-i64 (+ (* mi 1000000) i))))
+                           (sym (str "kotoba_module__" (string-from-i64 mi) "__" (string-from-i64 i)))))))))
+
+(defn- dispatcher-names [names [:ref :form/r] j :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= (+ j 1) (cnt names))
+    acc
+    (let [n (nth-f names j)]
+      (dispatcher-names names (+ j 2) (if (or (invoke-dispatcher-name? n) (closure-apply-name? n)) (form/assoc-form acc n n) acc)))))
+
+(defn- span-map [f [:ref :form/r]] [:ref :form/r]
+  (let [s (form/span-of f)]
+    (if (= s 0) (nilf) (m2 :line (intf (quot s 4294967296)) :column (intf (mod s 4294967296))))))
+
+(defn- link-function [f [:ref :form/r] ctx [:ref :form/r] call-names [:ref :form/r]] [:ref :form/r]
+  ;; CTX: {:module :module-index :binding :defn-lines :local-names}
+  (let [original (g f :name)
+        f0 (p (p (p f :source-module (g ctx :module)) :source-span (span-map (g f :body)))
+              :source-line (form/form-get (g ctx :defn-lines) (source-name-of f)))
+        f1 (if (present? (g ctx :binding)) (p f0 :source-binding (g ctx :binding)) f0)
+        f2 (p (p f1 :name (form/form-get (g ctx :local-names) original)) :body (rewrite-calls (g f :body) call-names))]
+    (cond (invoke-dispatcher-name? original)
+          (p (p f2 :project-dispatcher original) :project-module-index (g ctx :module-index))
+          (closure-apply-name? original) (p f2 :project-closure-apply? (form/bool-form true))
+          :else f2)))
+
+(defn- link-functions [locals [:list [:ref :form/r]] ctx [:ref :form/r] call-names [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (vector-count locals))
+    acc
+    (link-functions locals ctx call-names (+ i 1) (conj-v acc (link-function (nth-l locals i) ctx call-names)))))
+
+(defn- clauses-named [locals [:list [:ref :form/r]] export [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count locals))
+    acc
+    (clauses-named locals export (+ i 1) (if (form/eq (source-name-of (nth-l locals i)) export) (form/append-form acc (nth-l locals i)) acc))))
+
+;; stable sort by arity (the host's `sort-by arity-of`)
+(defn- sort-by-arity [xs [:list [:ref :form/r]] a :i64 maxa :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (> a maxa) acc (sort-by-arity xs (+ a 1) maxa (form/append-many acc (of-arity xs a 0 (form/no-forms))))))
+
+(defn- of-arity [xs [:list [:ref :form/r]] a :i64 i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count xs)) acc (of-arity xs a (+ i 1) (if (= a (arity-of (nth-l xs i))) (form/append-form acc (nth-l xs i)) acc))))
+
+(defn- interfaces-of [cs [:list [:ref :form/r]] lnames [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (vector-count cs))
+    acc
+    (let [c (nth-l cs i)]
+      (interfaces-of cs lnames (+ i 1) (conj-v acc (interface-of c (form/form-get lnames (g c :name))))))))
+
+(defn- interface-map [info [:ref :form/r] locals [:list [:ref :form/r]] lnames [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (let [exports (g info :exports)]
+    (if (>= i (cnt exports))
+      acc
+      (let [export (nth-f exports i)
+            cs (sort-by-arity (clauses-named locals export 0 (form/no-forms)) 0 64 (form/no-forms))
+            ok (need (> (vector-count cs) 0) "export does not name a declared function"
+                     (m2 :module (g info :namespace) :export export))]
+        (interface-map info locals lnames (+ i 1) (form/assoc-form acc export (interfaces-of cs lnames 0 (emptyv))))))))
+
+(defn- analyze-module [mf [:ref :form/r] info [:ref :form/r] dependencies [:ref :form/r] module-index :i64 binding [:ref :form/r]] [:ref :form/r]
+  ;; MF: {:forms [..]} (the module's forms as a vector Form)
+  (let [forms (form/kids-of (g mf :forms))
+        module (g info :namespace)
+        avail (avail-map (available info dependencies 0 (form/no-forms)) 0 (emptym))
+        sorted (sort-by-text (entries-of avail 0 (form/no-forms)) 1)
+        ts (stub-triples sorted 0 (form/no-forms))
+        import->stub (triples-table ts 0 0 (emptym))
+        stub-targets (triples-table ts 1 0 (emptym))
+        stub-source-names (triples-table ts 2 0 (emptys))
+        stub-helper-names (triples-table ts 3 0 (emptys))
+        ok (check-referred-exports! info dependencies)
+        stripped (map-forms-ns forms 1 info 0)
+        exported (if (t? (g info :exports-derived?)) (map-forms-ns stripped 0 info 0) stripped)
+        rewritten (ric-all (rewrite-referred-symbols exported (referred-alias-table (g info :requires) 0 (emptym)))
+                           import->stub 0 (form/no-forms))
+        dep-schemas (dependency-schemas info dependencies 0 (emptym))
+        with-schemas (if (= 0 (cnt dep-schemas)) rewritten (map-forms-ns rewritten 2 dep-schemas 0))
+        augmented (form/append-many with-schemas (all-stub-forms ts 0 (form/no-forms)))
+        r (sema/analyze (source-text augmented) (m1 :lambda-id-base (intf (* module-index (sema/max-functions)))))
+        ok2 (if (record-get [:ref :ana/ir] r :ok)
+              0
+              (throw (attribute-module-error (record-get [:ref :ana/ir] r :err) module forms augmented binding)))
+        hir (record-get [:ref :ana/ir] r :val)
+        fns (g hir :functions)
+        stub-fs (stub-fns fns stub-source-names true 0 (form/no-forms))
+        locals (stub-fns (form/form-vec (stub-fns fns stub-source-names false 0 (form/no-forms))) stub-helper-names false 0 (form/no-forms))
+        stub->target (stub-targets-of stub-fs stub-targets module 0 (emptym))
+        lnames (local-names locals module-index 0 (emptym))
+        call-names (merge-maps (merge-maps lnames stub->target) (dispatcher-names lnames 0 (emptym)))
+        ctx (p (p (p (p (m1 :module module) :module-index (intf module-index)) :binding binding)
+                  :defn-lines (definition-lines forms 0 (emptym)))
+               :local-names lnames)
+        functions (link-functions locals ctx call-names 0 (emptyv))
+        interface (interface-map info locals lnames 0 (emptym))]
+    (p (p (p (p (m1 :namespace module) :requires (g info :requires)) :schemas (g info :schemas)) :functions functions)
+       :interface interface)))
+
+;; ---------------------------------------------------------------------------
+;; The linked unit (project.cljk 1644-1929)
+
+(defn- typed-trap [result [:ref :form/r]] [:ref :form/r]
+  (let [div0 (form/call2 "=" (form/call2 "quot" (intf 1) (intf 0)) (intf 0))]
+    (if (kw-is? result :bool)
+      div0
+      (let [d (stub-value! result)] (form/call3 "if" div0 d d)))))
+
+(defn- dispatcher-keys [fns [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt fns))
+    acc
+    (let [d (g (nth-f fns i) :project-dispatcher)]
+      (dispatcher-keys fns (+ i 1) (if (and (present? d) (not (list-has? acc d))) (form/append-form acc d) acc)))))
+
+(defn- entries-for [fns [:ref :form/r] d [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt fns))
+    acc
+    (entries-for fns d (+ i 1) (if (form/eq (g (nth-f fns i) :project-dispatcher) d) (form/append-form acc (nth-f fns i)) acc))))
+
+(defn- module-index-of [f [:ref :form/r]] :i64 (form/int-value (g f :project-module-index)))
+
+;; the entries in descending module index (the host reduces over `(reverse (sort-by :project-module-index entries))`)
+(defn- by-index-desc [xs [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count xs)) acc (by-index-desc xs (+ i 1) (insert-desc acc (nth-l xs i) 0))))
+
+(defn- insert-desc [acc [:list [:ref :form/r]] x [:ref :form/r] i :i64] [:list [:ref :form/r]]
+  ;; stable sort ascending then reversed == descending with later equal keys first
+  (if (>= i (vector-count acc))
+    (form/append-form acc x)
+    (if (>= (module-index-of x) (module-index-of (nth-l acc i)))
+      (insert-copy acc x i 0 (form/no-forms))
+      (insert-desc acc x (+ i 1)))))
+
+(defn- route [entries [:list [:ref :form/r]] closure [:ref :form/r] params [:ref :form/r] i :i64 fallback [:ref :form/r]] [:ref :form/r]
+  (if (>= i (vector-count entries))
+    fallback
+    (let [e (nth-l entries i)
+          lower (* (module-index-of e) (sema/max-functions))
+          upper (+ lower (sema/max-functions))
+          id (form/call1 "pair-first" closure)]
+      (route entries closure params (+ i 1)
+             (form/call3 "if" (form/call2 "and" (form/call2 ">" id (intf lower)) (form/call2 "<=" id (intf upper)))
+                         (call-list (g e :name) params) fallback)))))
+
+(defn- dispatcher-fn [d [:ref :form/r] entries [:list [:ref :form/r]]] [:ref :form/r]
+  (let [e0 (nth-l entries 0)
+        params (g e0 :params)
+        body (route (by-index-desc entries 0 (form/no-forms)) (nth-f params 0) params 0 (typed-trap (g e0 :result)))]
+    (p (p (p (p (p (p (emptym) :name d) :params params) :param-types (g e0 :param-types)) :result (g e0 :result)) :effects (emptys))
+       :body body)))
+
+(defn- dispatchers-into [fns [:ref :form/r] ds [:list [:ref :form/r]] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (vector-count ds))
+    acc
+    (dispatchers-into fns ds (+ i 1) (conj-v acc (dispatcher-fn (nth-l ds i) (entries-for fns (nth-l ds i) 0 (form/no-forms)))))))
+
+(defn- first-closure-apply [fns [:ref :form/r] i :i64] [:ref :form/r]
+  (if (>= i (cnt fns)) (nilf) (if (t? (g (nth-f fns i) :project-closure-apply?)) (nth-f fns i) (first-closure-apply fns (+ i 1)))))
+
+(defn- project-dispatchers [fns [:ref :form/r]] [:ref :form/r]
+  (let [routed (dispatchers-into fns (sort-by-text (dispatcher-keys fns 0 (form/no-forms)) 0) 0 (emptyv))
+        ca (first-closure-apply fns 0)]
+    (if (present? ca)
+      (conj-v routed (form/dissoc-form (p ca :name (sym "__kotoba_closure_apply")) (kwf :project-closure-apply?)))
+      routed)))
+
+(defn- vec-concat [a [:ref :form/r] b [:ref :form/r]] [:ref :form/r]
+  (form/form-vec (form/append-many (form/kids-of a) (form/kids-of b))))
+
+(defn- module-functions [linked [:ref :form/r] order [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (cnt order)) acc (module-functions linked order (+ i 1) (vec-concat acc (g (form/form-get linked (nth-f order i)) :functions)))))
+
+(defn- interface-clause-count [interface [:ref :form/r] j :i64 n :i64] :i64
+  (if (>= (+ j 1) (cnt interface)) n (interface-clause-count interface (+ j 2) (+ n (cnt (nth-f interface (+ j 1)))))))
+
+(defn- export-count [linked [:ref :form/r] order [:ref :form/r] i :i64 n :i64] :i64
+  (if (>= i (cnt order)) n (export-count linked order (+ i 1) (interface-clause-count (g (form/form-get linked (nth-f order i)) :interface) 0 n))))
+
+(defn- wrappers [exports [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count exports))
+    acc
+    (let [e (nth-l exports i)]
+      (wrappers exports (+ i 1) (form/append-form acc (arity-declaration "defn" (nth-f e 0) (form/kids-of (nth-f e 1)) 1 (form/no-forms)))))))
+
+(defn- merged-schemas [parsed [:ref :form/r] modules [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (cnt modules)) acc (merged-schemas parsed modules (+ i 1) (merge-maps acc (schemas-of-parsed parsed (nth-f modules i))))))
+
+(defn- definition-forms [fns [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt fns))
+    acc
+    (let [f (nth-f fns i)
+          crc (g f :callable-result-contract)]
+      (definition-forms fns (+ i 1)
+        (form/append-form acc (form/form-seq (form/append-many (form/three-forms (sym "defn-") (g f :name) (typed-params (g f :params) (g f :param-types) (g f :callable-param-contracts)))
+                                                               (form/two-forms (if (t? crc) crc (g f :result)) (g f :body)))))))))
+
+(defn- check-definition-bytes [forms [:list [:ref :form/r]] i :i64] :i64
+  (if (>= i (vector-count forms))
+    0
+    (let [b (string-byte-length (source-text (form/one-form (nth-l forms i))))
+          ok (need (<= b (max-linked-source-bytes)) "linked definition source exceeds byte limit"
+                   (p (m2 :definition-index (intf i) :bytes (intf b)) :limit (intf (max-linked-source-bytes))))]
+      (check-definition-bytes forms (+ i 1)))))
+
+(defn- export-names [exports [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count exports)) acc (export-names exports (+ i 1) (form/append-form acc (nth-f (nth-l exports i) 0)))))
+
+(defn- source-map-entries [fns [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (cnt fns))
+    acc
+    (let [f (nth-f fns i)
+          module (g f :source-module)]
+      (source-map-entries fns (+ i 1)
+        (if (present? module)
+          (let [e (p (p (p (p (p (emptym) :linked-line (intf (+ 2 i))) :module module) :source-name (g f :source-name))
+                        :source-span (g f :source-span))
+                     :source-line (g f :source-line))]
+            (conj-v acc (if (form/form-has? f (kwf :source-binding)) (p e :binding (g f :source-binding)) e)))
+          acc)))))
+
+;; ---- the visit (project.cljk 1731-1825), the state threaded as a record
+
+
+(defn- default-binding [parsed [:ref :form/r] r [:ref :form/r]] [:ref :form/r]
+  (if (present? (g r :with))
+    r
+    (let [info (g (form/form-get parsed (g r :namespace)) :info)
+          params (g info :params)
+          defaults (g info :param-defaults)]
+      (if (and (present? params) (all-defaulted? params defaults 0))
+        (p r :with (sorted-map-of defaults))
+        r))))
+
+(defn- all-defaulted? [params [:ref :form/r] defaults [:ref :form/r] i :i64] :bool
+  (if (>= i (cnt params)) true (if (form/form-has? defaults (nth-f params i)) (all-defaulted? params defaults (+ i 1)) false)))
+
+(defn- defaults-into [parsed [:ref :form/r] requires [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (cnt requires)) acc (defaults-into parsed requires (+ i 1) (conj-v acc (default-binding parsed (nth-f requires i))))))
+
+(defn- with-default-bindings [parsed [:ref :form/r] info [:ref :form/r]] [:ref :form/r]
+  (p info :requires (defaults-into parsed (g info :requires) 0 (emptyv))))
+
+(defn- not-in [xs [:ref :form/r] set [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (cnt xs)) acc (not-in xs set (+ i 1) (if (has-item? set (nth-f xs i)) acc (form/append-form acc (nth-f xs i))))))
+
+(defn- placeholder-map [params [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (cnt params)) acc (placeholder-map params (+ i 1) (form/assoc-form acc (nth-f params i) (sym "<type>")))))
+
+;; {:forms [..] :info info} of module NAME under BINDING
+(defn- instantiate [parsed [:ref :form/r] name [:ref :form/r] binding [:ref :form/r]] [:ref :form/r]
+  (let [entry (form/form-get parsed name)
+        forms (g entry :forms)
+        info (g entry :info)
+        params (g info :params)
+        defaults (g info :param-defaults)]
+    (cond
+      (and (present? params) (form/is-nil? binding))
+      (let [undefaulted (form/form-vec (not-in params (form/keys-of (if (form/is-map? defaults) defaults (emptym))) 0 (form/no-forms)))
+            ok (fail (str "template module " (sym-text name) " declares (:params " (pr params)
+                          ") and needs an instantiation: require it with :with " (pr (placeholder-map params 0 (emptym)))
+                          (if (and (form/is-map? defaults) (> (cnt defaults) 0))
+                            (str "; its parameter(s) " (pr undefaulted) " declare no default, so the require cannot omit :with")
+                            ""))
+                     (p (m2 :module name :params params) :undefaulted undefaulted))]
+        entry)
+
+      (and (form/is-nil? params) (present? binding))
+      (let [ok (fail (str "module " (sym-text name) " declares no (:params ...) but is required with :with " (pr binding))
+                     (m2 :module name :binding binding))]
+        entry)
+
+      (present? params)
+      (let [bound (form/keys-of binding)
+            missing (form/form-vec (not-in params bound 0 (form/no-forms)))
+            undeclared (form/form-vec (sort-by-text (not-in bound (form/form-set (form/kids-of params)) 0 (form/no-forms)) 0))
+            ok (need (= 0 (cnt missing))
+                     (str "template module " (sym-text name) " is required with :with " (pr binding)
+                          ", which does not bind its parameter(s) " (pr missing))
+                     (p (m2 :module name :binding binding) :missing missing))
+            ok2 (need (= 0 (cnt undeclared))
+                      (str "template module " (sym-text name) " is required with :with " (pr binding)
+                           ", which names parameter(s) it does not declare: " (pr undeclared))
+                      (p (m2 :module name :binding binding) :undeclared undeclared))
+            forms2 (instantiate-forms (form/kids-of forms) binding name)]
+        (m2 :forms (form/form-vec forms2) :info (with-default-bindings parsed (module-info forms2))))
+
+      :else (m2 :forms forms :info (with-default-bindings parsed info)))))
+
+(defn- visit [key [:ref :form/r] depth :i64 s [:ref :pj/st]] [:ref :pj/st]
+  (let [name (key-namespace key)
+        binding (key-binding key)
+        parsed (record-get [:ref :pj/st] s :parsed)
+        ok (need (<= depth (max-project-depth)) "project dependency depth exceeds limit" (m2 :module name :depth (intf depth)))
+        ok2 (need (form/form-has? parsed name) "required module is outside the closed project" (m1 :module name))
+        ok3 (need (not (has-item? (record-get [:ref :pj/st] s :visiting) name)) "cyclic module dependency rejected" (m1 :module name))]
+    (if (form/form-has? (record-get [:ref :pj/st] s :linked) key)
+      s
+      (let [s1 (record-assoc [:ref :pj/st] s :visiting (set-add (record-get [:ref :pj/st] s :visiting) name))
+            inst (instantiate parsed name binding)
+            info (g inst :info)
+            s2 (visit-requires (g info :requires) 0 depth s1)
+            order (record-get [:ref :pj/st] s2 :order)
+            ok4 (need (< (cnt order) (max-project-modules)) "project module count exceeds limit"
+                      (m1 :limit (intf (max-project-modules))))
+            module (analyze-module inst info (record-get [:ref :pj/st] s2 :linked) (cnt order) binding)
+            s3 (record-assoc [:ref :pj/st] s2 :linked (form/assoc-form (record-get [:ref :pj/st] s2 :linked) key module))
+            s4 (record-assoc [:ref :pj/st] s3 :order (conj-v order key))]
+        (record-assoc [:ref :pj/st] s4 :visiting (set-remove (record-get [:ref :pj/st] s4 :visiting) name))))))
+
+(defn- visit-requires [requires [:ref :form/r] i :i64 depth :i64 s [:ref :pj/st]] [:ref :pj/st]
+  (if (>= i (cnt requires))
+    s
+    (let [r (nth-f requires i)
+          e (+ 1 (record-get [:ref :pj/st] s :edges))
+          ok (need (<= e (max-project-dependency-edges)) "project dependency edges exceed limit" (m1 :edges (intf e)))
+          s1 (record-assoc [:ref :pj/st] s :edges e)]
+      (visit-requires requires (+ i 1) depth (visit (instantiation-key (g r :namespace) (g r :with)) (+ depth 1) s1)))))
+
+;; ---- parsing every module
+
+(defn- source-bytes [sources [:ref :form/r] j :i64 total :i64] :i64
+  (if (>= (+ j 1) (cnt sources))
+    total
+    (let [v (nth-f sources (+ j 1))
+          ok (need (form/is-string? v) "project source must be text" (emptym))]
+      (source-bytes sources (+ j 2) (+ total (string-byte-length (form/string-value v)))))))
+
+(defn- info-attributed [forms [:list [:ref :form/r]] declared [:ref :form/r]] [:ref :form/r]
+  (try (module-info forms)
+       (catch [:ref :fe/err] e
+         (throw (if (attributed? e) e (err-with e (record-get [:ref :fe/err] e :msg) (p (err-data e) :source-module declared)))))))
+
+(defn- parse-modules [sources [:ref :form/r] j :i64 c [:ref :pj/cnt] acc [:ref :form/r]] [:ref :form/r]
+  (if (>= (+ j 1) (cnt sources))
+    acc
+    (let [declared (nth-f sources j)
+          forms (sema/read-forms (form/string-value (nth-f sources (+ j 1))))
+          c1 (admit-forms forms 0 c)
+          info (info-attributed forms declared)
+          ok (need (form/eq declared (g info :namespace)) "source-map key does not match declared namespace"
+                   (m2 :key declared :declared (g info :namespace)))]
+      (parse-modules sources (+ j 2) c1 (form/assoc-form acc declared (m2 :forms (form/form-vec forms) :info info))))))
+
+(defn link-source
+  "Link a closed namespace->source map (a Form map of namespace symbol -> source string) into one bounded source unit:
+  {:source :root :module-order :modules :source-map} (project.cljk `link-source`)."
+  [sources [:ref :form/r] root [:ref :form/r]] [:ref :form/r]
+  (let [n (quot (cnt sources) 2)
+        ok (need (and (form/is-map? sources) (> n 0) (<= n (max-project-modules)))
+                 "project source map is empty or exceeds module limit" (m1 :count (if (form/is-map? sources) (intf n) (nilf))))
+        bytes (source-bytes sources 0 0)
+        ok2 (need (<= bytes (max-project-source-bytes)) "project source bytes exceed limit" (m1 :bytes (intf bytes)))
+        parsed (parse-modules sources 0 (cnt-new) (emptym))
+        ok3 (reject-schema-collisions! parsed 0)
+        s (visit root 1 (record-new [:ref :pj/st] (emptys) (emptym) (emptyv) 0 parsed))
+        linked (record-get [:ref :pj/st] s :linked)
+        order (record-get [:ref :pj/st] s :order)
+        root-module (form/form-get linked root)
+        mfns (module-functions linked order 0 (emptyv))
+        functions (vec-concat mfns (project-dispatchers mfns))
+        ecount (export-count linked order 0 0)
+        exports (sort-by-text (entries-of (g root-module :interface) 0 (form/no-forms)) 1)
+        ws (wrappers exports 0 (form/no-forms))
+        wcount (interface-clause-count (g root-module :interface) 0 0)
+        fcount (+ (cnt functions) wcount)
+        schemas (merged-schemas parsed (module-namespaces order) 0 (emptym))
+        defs (form/append-many (definition-forms functions 0 (form/no-forms)) ws)
+        ok4 (check-definition-bytes defs 0)
+        export-clause (form/form-seq (form/two-forms (kwf :export) (form/form-vec (export-names exports 0 (form/no-forms)))))
+        ns-form (if (> (cnt schemas) 0)
+                  (form/form-seq (form/append-many (form/three-forms (sym "ns") root export-clause)
+                                                   (form/one-form (form/form-seq (form/two-forms (kwf :schemas) schemas)))))
+                  (form/form-seq (form/three-forms (sym "ns") root export-clause)))
+        text (source-text (form/cons-onto ns-form defs))
+        smap (p (p (m1 :kotoba.source-map/version (intf 1)) :root root) :entries (source-map-entries functions 0 (emptyv)))
+        ok5 (need (<= fcount (max-project-functions)) "linked project exceeds function limit" (m1 :count (intf fcount)))
+        ok6 (need (<= ecount (max-project-exports)) "linked project exports exceed limit" (m1 :count (intf ecount)))]
+    (p (p (p (p (m1 :source (form/string-form text)) :root root) :module-order order)
+             :modules (form/form-set (form/kids-of order)))
+       :source-map smap)))
+
+;; ---------------------------------------------------------------------------
+;; Positions in the linked unit (project.cljk 1931-1979)
+
+(defn- entry-at [entries [:ref :form/r] line :i64 i :i64] [:ref :form/r]
+  (if (>= i (cnt entries))
+    (nilf)
+    (let [e (nth-f entries i)]
+      (if (= line (form/int-value (g e :linked-line))) e (entry-at entries line (+ i 1))))))
+
+(defn source-position
+  "The source-map entry of a linked LINE ({:module :source-name :source-span ..}), or nil (the ns form, a dispatcher
+  or an export wrapper)."
+  [source-map [:ref :form/r] line :i64] [:ref :form/r]
+  (entry-at (g source-map :entries) line 0))
+
+(defn linked-position
+  "Where in the authoring modules a refusal E raised against the linked source came from: {:module :line} (line 0
+  when unknown), or nil."
+  [source-map [:ref :form/r] linked-source :string e [:ref :fe/err]] [:ref :form/r]
+  (let [f (record-get [:ref :fe/err] e :form)
+        line (span-line f)
+        e1 (if (> line 0) (source-position source-map line) (nilf))
+        entry (if (present? e1)
+                e1
+                (if (present? f)
+                  (let [index (top-level-index (sema/read-forms linked-source) e)]
+                    (if (>= index 0) (source-position source-map (+ index 1)) (nilf)))
+                  (nilf)))]
+    (if (present? entry)
+      (m2 :module (g entry :module) :line (let [l (g entry :source-line)] (if (form/is-int? l) l (intf 0))))
+      (nilf))))
+
+(defn attribute-linked-error
+  "A refusal from compiling LINKED (a `link-source` result), attributed to the module and line it came from when
+  `linked-position` places it; otherwise the span into the linked unit is dropped."
+  [e [:ref :fe/err] linked [:ref :form/r]] [:ref :fe/err]
+  (cond
+    (attributed? e) e
+    (form/is-nil? (g linked :source-map)) e
+    :else
+    (let [pos (linked-position (g linked :source-map) (form/string-value (g linked :source)) e)]
+      (if (present? pos)
+        (attribute-error* e (g pos :module) (form/int-value (g pos :line)) (nilf))
+        (record-assoc [:ref :fe/err] (err-with e (record-get [:ref :fe/err] e :msg) (form/dissoc-form (err-data e) (kwf :span)))
+                      :form (strip-span (record-get [:ref :fe/err] e :form)))))))
