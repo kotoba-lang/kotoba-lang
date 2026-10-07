@@ -17,3 +17,9 @@ These fixtures are vendor blobs, not full sibling components. This is a byte/
 consumer compatibility diagnostic, not whole-component Q9 migration, native
 selfhost or JVM-free acceptance. Exact-head CI/main publication is pending.
 System One made no model attempt.
+
+Initial head 8d5bc43 failed actual CI because the workflow separately fetched and
+detached the old sibling Sema revision. The desired-pin byte fixture therefore
+did not describe that initial checkout. The follow-up synchronizes both workflow
+references with the deps test pin; the six-failure stale-copy control describes
+why the initial CI fails. Revised exact-head CI remains required before merge.
