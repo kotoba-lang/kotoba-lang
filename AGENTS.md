@@ -21,3 +21,11 @@ The machine authority is `lang/q9-migration.edn`; the accepted decision is
   use content-addressed golden vectors. JVM observations are diagnostic only.
 - Existing JVM/Clojure compiler and test paths are compatibility surfaces;
   they cannot satisfy or weaken Q9 acceptance.
+
+
+## Claude 向け追記（旧 CLAUDE.md より統合）
+
+In particular, Q9 migration is a complete-component move,
+not decision-core extraction, and its build/acceptance path is JVM-free:
+verified native `kotoba` plus Amu `--jvm-free`. Never use an installed JDK or
+`clojure` fallback to make a migration pass; block the migration instead.

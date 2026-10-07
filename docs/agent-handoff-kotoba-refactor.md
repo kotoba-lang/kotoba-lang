@@ -24,7 +24,7 @@ says "compiler" means that same repository:
   clone at `orgs/kotoba-lang/compiler` keeps fetching fine while the **west-managed
   path is empty**, so `bin/amu` looks missing. Materialise it with
   `west update --fetch smart amu` before concluding the toolchain is absent.
-  (Same failure mode as `kotoba-fleet-vcs` → `kagi`; see superproject CLAUDE.md.)
+  (Same failure mode as `kotoba-fleet-vcs` → `kagi`; see superproject AGENTS.md.)
 
 The 2026-08-10 `chore: migrate Amu paths across language tooling` sweep updated the
 plan, the ADRs and `lang/*.edn`, but **skipped this runbook** — hence this section

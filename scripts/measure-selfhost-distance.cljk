@@ -28,7 +28,9 @@
             ["node:child_process" :as cp]
             [kotoba.lang.text :as str]
             [cljs.pprint]
-            [kotoba.compiler.kotoba-reader :as kr]))
+            [cljs.reader :as reader]
+            [kotoba.compiler.kotoba-reader :as kr]
+            [selfhost-native :as native]))
 
 (def ^:private argv (vec (js->clj js/process.argv)))
 
@@ -249,9 +251,11 @@
                             (into []))
    :passed-files (->> rows (filter :ok) (map :file) sort vec)})
 
-(let [cp-entries (classpath)
-      cp-str (str/join ":" (conj cp-entries (path/join amu-root "src")))
-      all-sources (->> (conj (filterv #(str/ends-with? % "/src") cp-entries)
+(defn- measure-stage-1
+  "Stage 1 (read, single-file check, project check, reachability) over the
+  whole classpath -- the v2 result map, unchanged."
+  [cp-entries cp-str]
+  (let [all-sources (->> (conj (filterv #(str/ends-with? % "/src") cp-entries)
                              (path/join amu-root "src"))
                        (mapcat cljc-under) sort vec)
       excluded (filterv mechanism-layer? all-sources)
@@ -348,10 +352,100 @@
               ["A file that reads is not a file that compiles."
                "A file that `check` admits is not a file whose semantics survive lowering."
                "`check` is run per file. A file that declares (:require ...) is refused as needing a project; that refusal is this harness's single-file mode, not a language gap."]}]
-  (fs/writeFileSync output (with-out-str (cljs.pprint/pprint result)))
   (println "read gate  :" (:passed (:read-gate result)) "/" (count sources))
   (println "check gate :" (:passed (:check-gate result)) "/" (count sources))
   (println "project    :" (:passed (:project-check-gate result)) "/" (count sources)
            " reachable" (:passed (:reachable result)) "/" (:source-count (:reachable result))
            " unreachable" (:passed (:unreachable result)) "/" (:source-count (:unreachable result)))
+  result))
+
+;; ---------------------------------------------------------------------------
+;; Stages 2 and 3 (v3, 2026-09-26): native compile and native differential
+;; execution, for every module stage 1 admitted. See scripts/selfhost_native.cljk.
+;;
+;;   --reuse-stage1 <selfhost-distance.edn>  take stage 1 from a committed
+;;       file instead of re-running it (60-90 min). Refused unless its
+;;       :amu-commit is the --amu checkout's HEAD: stage 1 of another compiler
+;;       is not stage 1 of this one.
+;;   --no-native                skip stages 2 and 3 (the output then says so)
+;;   --native-only <a,b>        stage 2/3 only for stage-1 passes whose label
+;;                              ends with one of these (red proofs, debugging)
+;;   --substitute <file>=<copy> compile <copy> natively in place of <file>
+;;                              (the host still reads <file>) -- the red proofs
+;;   --native-work <dir>        where kexe / bin / loaders go (default: mkdtemp)
+;;   --seed <n> --random <n>    stage-3 generator seed and random cases per fn
+
+(defn- opts [flag]
+  (keep-indexed (fn [i a] (when (and (= a flag) (< (inc i) (count argv))) (nth argv (inc i)))) argv))
+
+(defn- git-head [dir]
+  (str/trim (str (.-stdout (cp/spawnSync "git" (clj->js ["-C" dir "rev-parse" "HEAD"]) #js {:encoding "utf8"})))))
+
+(defn- reused-stage-1 [file]
+  (let [m (reader/read-string (fs/readFileSync file "utf8"))
+        head (git-head amu-root)]
+    (when-not (= (:amu-commit m) head)
+      (println "REFUSE stage-1 reuse: file measured amu" (:amu-commit m) "but --amu is at" head)
+      (js/process.exit 2))
+    (when-not (seq (get-in m [:project-check-gate :passed-files]))
+      (println "REFUSE stage-1 reuse: no :project-check-gate :passed-files in" file)
+      (js/process.exit 2))
+    m))
+
+(let [cp-entries (classpath)
+      cp-str (str/join ":" (conj cp-entries (path/join amu-root "src")))
+      reuse (opt "--reuse-stage1")
+      stage-1 (if reuse (reused-stage-1 reuse) (measure-stage-1 cp-entries cp-str))
+      unlabel #(str/replace % "<amu>" (path/resolve amu-root))
+      label #(str/replace % (path/resolve amu-root) "<amu>")
+      passed (mapv unlabel (get-in stage-1 [:project-check-gate :passed-files]))
+      reach-passed (set (map unlabel (get-in stage-1 [:reachable :passed-files])))
+      only (some-> (opt "--native-only") (str/split #","))
+      files (if only (filterv (fn [f] (some #(str/ends-with? (label f) %) only)) passed) passed)
+      substitute (into {} (map (fn [s] (let [i (.indexOf s "=")]
+                                         [(path/resolve (subs s 0 i)) (path/resolve (subs s (inc i)))]))
+                               (opts "--substitute")))
+      source-roots (-> (filterv #(str/ends-with? % "/src") cp-entries)
+                       (conj (path/join amu-root "src"))
+                       (conj compat-root))
+      native? (not (some #{"--no-native"} argv))
+      stages (when native?
+               (println "stages 2/3 over" (count files) "stage-1 passes")
+               (native/measure {:amu-root (path/resolve amu-root) :cp-str cp-str :source-roots source-roots
+                                :grant grant-path :label label :reachable? reach-passed
+                                :substitute substitute
+                                :work (or (opt "--native-work") (native/tmp-work))
+                                :seed (js/parseInt (or (opt "--seed") "20260926") 10)
+                                :n-random (js/parseInt (or (opt "--random") "16") 10)}
+                              files))
+      top (fn [k]
+            (let [s1 (get-in stage-1 [k :passed])
+                  of (get-in stage-1 [k :source-count])
+                  s2 (when stages (get-in stages [:native-compile k :stage2 :ok]))
+                  s3 (when stages (get-in stages [:native-differential k :stage3 :ok]))]
+              {:sources of :stage1 s1 :stage2 s2 :stage3 s3}))
+      result (cond-> (assoc stage-1
+                            :kotoba.lang.selfhost/version 3
+                            :native-measured-at (when native? (subs (.toISOString (js/Date.)) 0 10))
+                            :stage-1-provenance (if reuse
+                                                  {:reused-from (path/basename reuse)
+                                                   :measured-at (:measured-at stage-1)
+                                                   :amu-commit (:amu-commit stage-1)}
+                                                  {:measured :this-run})
+                            :stages
+                            {1 "amu check admits the module on the project route (:project-check-gate)"
+                             2 "the module compiles as a native library for aarch64 AND x86_64, and the kotoba-verifier (extract-native) admits every export (:native-compile)"
+                             3 "every export, driven through tools/kexe_loader.c with generated boundary + seeded random inputs, answers what the module's host (nbb) reading answers, on every stage-2 isa (:native-differential)"}
+                            :top-line {:reachable (top :reachable) :unreachable (top :unreachable)})
+               stages (assoc :native-compile (:native-compile stages)
+                             :native-differential (:native-differential stages)
+                             :native-scope (if only {:partial only :substitute (into {} (map (fn [[a b]] [(label a) b]) substitute))} :all-stage-1-passes))
+               (not stages) (assoc :native-compile :not-run :native-differential :not-run))
+      tl (:reachable (:top-line result))]
+  (fs/writeFileSync output (with-out-str (cljs.pprint/pprint result)))
+  (println (str "SCANNED\t" (if stages (:scanned stages) 0)))
+  (println "reachable: stage1" (:stage1 tl) "/ stage2" (if stages (:stage2 tl) "NOT-RUN")
+           "/ stage3" (if stages (:stage3 tl) "NOT-RUN") "(of" (:sources tl) "reachable sources)")
+  (let [u (:unreachable (:top-line result))]
+    (println "unreachable: stage1" (:stage1 u) "/ stage2" (:stage2 u) "/ stage3" (:stage3 u)))
   (println "wrote" output))
