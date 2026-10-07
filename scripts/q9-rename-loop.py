@@ -27,7 +27,7 @@ What it does, in order, and what each step cost to learn:
   CONDITIONALS  `#?(:clj A :cljs B)` means the file is TWO programs. Resolving
              it PICKS ONE, which is a decision about meaning, so every site is
              logged with the branch taken and the branches dropped. Order is
-             :cljs, :default, :clj -- CLAUDE.md's runtime priority puts the JVM
+             :cljs, :default, :clj -- AGENTS.md's runtime priority puts the JVM
              last. `#?@(...)` is refused when the chosen branch is not a
              collection, because splicing a scalar injects garbage into the
              parent form.
@@ -43,7 +43,7 @@ What it does, in order, and what each step cost to learn:
 Anything that would change what the program MEANS beyond the logged reader
 conditionals is not applied. It is reported.
 
-WRITTEN IN PYTHON, which is a deviation. CLAUDE.md puts new operational tooling
+WRITTEN IN PYTHON, which is a deviation. AGENTS.md puts new operational tooling
 on kbb first and this workspace does not write .sh or .mjs; `which kbb` finds
 nothing on this machine (measured 2026-09-10) and this began as a throwaway
 driver that turned out to be worth keeping. Recorded rather than hidden; the
@@ -204,7 +204,7 @@ def report_unmapped(path, missing):
 # which is a decision about MEANING, not a rename -- so every site is logged
 # with the branch taken and the branches dropped. The order is :cljs, then
 # :default, then :clj, because Kotoba's live targets are wasm32-browser and
-# restricted ESM; the JVM branch is the compatibility one (CLAUDE.md runtime
+# restricted ESM; the JVM branch is the compatibility one (AGENTS.md runtime
 # priority: kotoba wasm > clojurewasm > ClojureScript > nbb, with JVM last).
 #
 # `#?@(...)` splices its chosen branch into the surrounding form; a chosen
