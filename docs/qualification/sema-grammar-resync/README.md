@@ -23,3 +23,18 @@ detached the old sibling Sema revision. The desired-pin byte fixture therefore
 did not describe that initial checkout. The follow-up synchronizes both workflow
 references with the deps test pin; the six-failure stale-copy control describes
 why the initial CI fails. Revised exact-head CI remains required before merge.
+
+The synchronized c7ad38dc checkout ran actual CI: 518 tests / 4,649 assertions,
+one failure and no errors. The remaining expectation was the historical empty
+record refusal. Published Sema's options-map-argument floor explicitly supersedes
+that refusal; Script PR112 now publishes matching JS codec support. Amu PR1251
+qualifies the normal JVM-free JS routes with published pins (81 / 576 portable
+assertions; offline Node 24.21.0 runs 1,000 fresh instances). That Amu consumer's
+CI/main publication remains pending. Amu PR1250 is already main a0604488.
+
+Reconcile the authority's historic blocker decision and manifest with the
+published empty-record floor, retain the version-2 withdrawal history, add a
+positive named constructor case, and keep two-nominal-result/reserved-name
+refusals and all withdrawn exports. Frozen stdlib module bytes and export lists
+are unchanged. This is consumer/contract compatibility work, not whole-component
+Q9 migration. Revised exact-head full CI is still required before merge.
