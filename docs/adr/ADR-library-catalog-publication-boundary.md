@@ -4,6 +4,12 @@ Status: accepted — 2026-08-29
 
 ## Decision
 
+Agent skills and MCP definitions are discovered through the separate
+[Kotoba extension registry](https://github.com/kotoba-lang/kotoba-registry).
+Its [reference ADR](ADR-kotoba-extension-registry-reference.md) distinguishes
+Hermes-format discovery from the library and signed package publication
+contracts described below.
+
 `kotoba-lang.org/libraries/` is the public library discovery and evidence
 surface. It explains immutable definition and release CIDs, exact dependency
 edges, GitHub provenance, target compatibility, and comparison methodology.

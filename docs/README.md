@@ -25,6 +25,7 @@ are unchanged.
 | learn the language surface | [Language reference](reference/language.md) | [Option/result](lang/option-result-guide.md), [records](lang/record-cookbook.md) |
 | implement a compiler or runtime | [Semantics SSoT](lang/semantics-ssot.md) | [grammar](../lang/guest-grammar.edn), [surface status](../lang/surface-status.edn), [conformance](../lang/conformance/manifest.edn) |
 | evaluate readiness honestly | [Maturity and comparison](maturity.md) | [coverage evidence](lang/coverage.edn), [engineering model](system-dynamics/kotoba-lang-maturity.md) |
+| discover agent skills or MCP tools | [Kotoba Registry](https://github.com/kotoba-lang/kotoba-registry) | [Extension registry ownership](adr/ADR-kotoba-extension-registry-reference.md) |
 
 Generated lookup surfaces: [CLI](generated/cli.md),
 [standard library](generated/stdlib.md),
