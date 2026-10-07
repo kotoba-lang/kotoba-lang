@@ -68,6 +68,7 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 | `first-class-closure-values` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | Public [:fn [parameter-types result-type] ...] contracts cross project-module boundaries; parameters are intentionally i64-only in the first ABI-neutral profile. Computed heads remain explicit, while their result descriptor is inferred from a closed consumer or return context and stays explicit only when ambiguous. |
 | `inline-fn-callbacks` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
 | `lazy-sequences` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
+| `library-heads` | `implemented-partial` | compiler-native-host, kir, kotoba-wasm, restricted-esm | subvec is :vector-i64 only (no :vector-f64 allocation to copy into). string-parse-i64 answers [:result :i64 :keyword], never traps and never wraps. |
 | `merge-with-head` | `not-yet-implemented` |  |  |
 | `module-type-parameters` | `implemented-partial` | compiler |  |
 | `multi-collection-map` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm |  |
@@ -87,7 +88,9 @@ WBS: **T2.2**. Disposition meanings live under `:dispositions` in the EDN source
 | `refer-clojure-no-op` | `implemented` | compiler |  |
 | `release-integration` | `implemented-partial` |  |  |
 | `require-refer` | `implemented-partial` | compiler |  |
+| `state-ability` | `implemented-partial` | compiler-native-host, kir, restricted-esm | resume exists only as a handler clause's tail and with only as a handle clause; slice 1 is one-shot and tail-resumptive. |
 | `string-predicate-typing` | `implemented-partial` | compiler, kotoba-cljs, kotoba-wasm | `string=?` and `string-contains?` infer `:bool`, like every other predicate, so     they compose under `and`/`or`/`not` and can be returned from a `:bool` function.     A string predicate no longer sits in an `:i64` position -- convert explicitly. |
+| `type-decided-predicates` | `implemented` | compiler-native-host, kir, kotoba-wasm, restricted-esm | = on two :string operands is string=?. Widened 2026-09-26 (gap 3 of the selfhost foundation, guest-grammar :sugar :type-predicates): on a :document each predicate asks (document-kind d) -- true?/integer? were refused there by name until then -- and nil?/some? ask the :null kind; on [:option T] a predicate T answers true for is presence. Still refused: an option whose payload answers by value, nil?/some? on a type with no absence, map?/coll? on a [:ref q]. |
 | `typed-closure-parameters` | `implemented-partial` | compiler, kir, wasm32 |  |
 | `typed-eval` | `implemented` | compiler, kir |  |
 

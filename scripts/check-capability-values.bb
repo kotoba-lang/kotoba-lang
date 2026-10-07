@@ -21,6 +21,21 @@
                                         [c coord])))
                               coordinates)}))
 
+;; coll (from f74e248f) ships kotoba/lang/coll.cljk, an extension bb's
+;; require does not search (`Could not locate kotoba/lang/coll.bb, ...clj or
+;; ...cljc`). Load such a dependency's .cljk source from the classpath before
+;; the namespaces below require it; a namespace bb can already find is left to
+;; require.
+(defn- preload-cljk! [ns-sym]
+  (let [base (-> (name ns-sym) (.replace "-" "_") (.replace "." "/"))]
+    (when-not (some #(io/resource (str base %)) [".bb" ".clj" ".cljc"])
+      (if-let [source (io/resource (str base ".cljk"))]
+        (load-string (slurp source))
+        (throw (ex-info (str "no source for " ns-sym " on the bb classpath")
+                        {:ns ns-sym}))))))
+
+(run! preload-cljk! '[kotoba.lang.coll kotoba.lang.text grant.causal-trust])
+
 ;; Run the exact same pure CLJC logic as the test suite: load the namespace
 ;; source directly so the gate cannot drift from the contract implementation.
 (load-file "src/kotoba/lang/capability_values.cljk")
