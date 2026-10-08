@@ -473,6 +473,8 @@ authoritative in machine-readable contracts and qualification evidence.
 - [Component role model](lang/component-role-model.edn)
 - [Library publication authority](lang/library-publication.edn)
 - [Public library catalog](https://kotoba-lang.org/libraries/)
+- [Kotoba extension registry: skills and MCP](https://github.com/kotoba-lang/kotoba-registry)
+- [Extension registry ownership and consumption](docs/adr/ADR-kotoba-extension-registry-reference.md)
 - [Maturity by axis](docs/maturity.md)
 - [Architecture decisions](docs/adr/)
 

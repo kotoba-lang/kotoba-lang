@@ -4,6 +4,12 @@ This is an executable acceptance check, not just an installation recipe. It
 installs the released CLI, runs its self-check, compiles a zero-authority
 program to WebAssembly, and executes the exported function.
 
+For agent skills and MCP tools, start with
+[Kotoba Registry](https://github.com/kotoba-lang/kotoba-registry) and its
+[verification contract](https://raw.githubusercontent.com/kotoba-lang/kotoba-registry/main/llms-full.txt).
+Verify an entry from one pinned registry commit before installation. These
+extensions are separate from the CLI and language package admission below.
+
 ## 1. Install
 
 On macOS or Linux with Homebrew:

@@ -8,9 +8,9 @@ The bounded public module list is `frozen`. Adding a public name requires a mani
 
 Source: [`lang/stdlib/core.kotoba`](../../lang/stdlib/core.kotoba).
 
-Records: `Err`, `None`, `Ok`, `Some`.
+Records: .
 
-Public names: `comp2`, `concat`, `err`, `err?`, `every?`, `find`, `group-by`, `merge`, `ok`, `ok?`, `option-none`, `option-none?`, `option-some`, `option-some?`, `option-value`, `partial1`, `range`, `range-step`, `reverse`, `reverse-into`, `select-keys`, `some`, `stdlib-binary-closure-anchor`, `unwrap-err`, `unwrap-ok`, `update`, `zipmap`.
+Public names: `comp2`, `concat`, `distinct`, `drop-while`, `every?`, `first-match`, `frequencies`, `get-in2`, `interpose`, `juxt2`, `keep`, `mapv`, `merge`, `partial1`, `partition`, `range`, `range-step`, `remove`, `reverse`, `reverse-into`, `sort`, `sort-by`, `stdlib-binary-closure-anchor`, `take-while`, `zipmap`.
 
 ## Language built-ins
 
