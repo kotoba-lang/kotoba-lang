@@ -389,11 +389,23 @@ keyword-only destructuring model (`lang/guest-grammar.edn`
 :as, or keyword-valued explicit entries"; string and symbol keys are read as
 values with `get` on a `[:map :string V]` literal or a quoted
 `[:map :symbol V]` (conformance `:portable-string-symbol-values`, and the
-negative `:string-symbol-destructuring-is-refused`, 2026-10-09). Strings, keywords,
-and quoted symbols now have deterministic tagged integer identities on all
-backends. Strings carry UTF-8 byte length and a bounded hash payload; distinct
-literals that collide inside one module are rejected before lowering. This is
-an immutable identity/value slice, not Clojure's full string or symbol API.
+negative `:string-symbol-destructuring-is-refused`, 2026-10-09).
+
+Strings, keywords and symbols are distinct value types (`:string`,
+`:keyword`, `:symbol`), not integer identities. KIR carries them as host
+values bounded by UTF-8 bytes (`kotoba.kir.value`: a string 65536, a keyword
+and a symbol 512 each; amu `kotoba.compiler.limits`), and wasm32-kotoba-v1
+loads a string or keyword literal as a sealed typed literal (a literal-table
+index and the `typed-literal` intrinsic, kotoba-wasm `core.cljk`). Measured
+2026-10-09 on both backends through `amu test --manifest`: a 210-byte string
+literal is admitted and `string-length` answers 210, `(+ 1 :a)` is refused
+"expected i64, got keyword", `(= :a 1)` is refused "equality operands must
+have the same value type", and `(= "abc" (str "ab" "c"))` is true -- string
+equality is by content, not by a literal ID. Until then this paragraph said
+the three had "deterministic tagged integer identities" with a bounded hash
+payload and module-level collision rejection; no such lowering remains in
+the pinned compiler, KIR or Wasm emitter. This is an immutable value slice,
+not Clojure's full string or symbol API.
 
 Nested `let` destructuring is now portable across compiler and primary
 Wasm/CLJS lowerers. Vector positional/`&` and map `:keys`/`:or`/`:as` plus
