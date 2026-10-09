@@ -382,8 +382,14 @@ The shared `pure-call-by-name-lazy-sequences` case covers infinite generation,
 bounded observation, mapping, and filtering. Primary lowering also rejects
 directly or transitively effectful thunks before emission.
 
-Likewise, map destructuring supports keyword identity (`:keys`, `:or`, `:as`,
-and explicit keyword patterns), plus `:strs` and `:syms`. Strings, keywords,
+Likewise, map destructuring supports keyword identity only (`:keys`, `:or`,
+`:as`, and explicit keyword patterns). `:strs` and `:syms` are outside the
+keyword-only destructuring model (`lang/guest-grammar.edn`
+`:nested-destructuring`) and are refused "map destructuring requires :keys,
+:as, or keyword-valued explicit entries"; string and symbol keys are read as
+values with `get` on a `[:map :string V]` literal or a quoted
+`[:map :symbol V]` (conformance `:portable-string-symbol-values`, and the
+negative `:string-symbol-destructuring-is-refused`, 2026-10-09). Strings, keywords,
 and quoted symbols now have deterministic tagged integer identities on all
 backends. Strings carry UTF-8 byte length and a bounded hash payload; distinct
 literals that collide inside one module are rejected before lowering. This is
