@@ -17,6 +17,14 @@ English remains the source of record. Published site start cards for
 [Français](https://kotoba-lang.org/fr/)
 are unchanged.
 
+## Whole-stack architecture
+
+[Roles and dependency diagrams](stack-architecture.md),
+[composition spec](../lang/stack-architecture.edn),
+[Japanese presentation](presentations/kotoba-lisp-machine.ja.md), and
+[refactor procedure](stack-refactor-procedure.md) describe the Lisp-machine
+architecture while keeping owner contracts and qualification evidence separate.
+
 ## Choose a path
 
 | I want to… | Start here | Then read |
