@@ -1,5 +1,11 @@
 # Neutral execution and target-profile implementation report
 
+Current v2 issuance/admission implementation and evidence are in the
+[target v2 migration report](execution-v2-migration.md), dated 2026-10-11.
+The neutral owner now has 17 exports: the previous 15 plus complete intent
+shape/keys with authority-issued invocation CID. The legacy facade stays at 46.
+The earlier ownership-unit measurements below retain their original scope.
+
 2026-10-10 · ABI ownership refactor, implementation and coordinated dependency integration.
 
 Neutral contracts now live in `kotoba.core.execution` in core-contracts. The
@@ -24,13 +30,13 @@ Component/WIT/WASI fields. Explicit identity projection rejects missing or
 mismatched bindings and supports inverse projection for compatible v1 values.
 Hosts must verify canonical binding bytes/profile contracts and issue new
 identity CIDs/signatures. Shape validation is not authorization or hash checking.
-V2 lease issuance is separate work; no automatic lease conversion is supplied.
+V2 lease issuance is now explicit in grant.execution-v2; automatic v1 lease conversion is not supplied.
 
 Legacy v1 wire fields, codec/hash rules, WIT, CIDs and signatures remain unchanged.
 Default runtime admission remains v1. Code Graph explicitly accepts either
 version and stores the v2 opaque binding index; it does not invent Component
-fields for neutral identities. New native/Script/EVM bindings and runtime v2
-admission remain profile-specific follow-up work. This CLJK API refactor is not
+fields for neutral identities. New profile bindings, signed issuance and explicit admission are implemented;
+activation/qualification remains profile-specific as recorded in the current report. This CLJK API refactor is not
 a whole-component Q9 source port.
 
 ## Dependency and architecture evidence

@@ -512,3 +512,5 @@ The neutral execution / Component profile API split is implemented; see
 [the implementation report](docs/stack-architecture-target-neutral-report.md).
 Core contracts, target profiles, legacy v1 compatibility and runtime qualification
 have separate entrypoints and evidence.
+
+See [target v2 issuance/admission](docs/execution-v2-migration.md) for canonical bindings, fresh invocations, durable lease consumption and per-host evidence.

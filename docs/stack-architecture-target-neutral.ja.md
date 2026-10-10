@@ -57,7 +57,7 @@ ABIそのものを不要にするのではない。**意味上のinterfaceと、
 | 言語の意味 | `kotoba-lang`と既存semantic/IR owner | WIT、ISA、socket、永続DB |
 | source/package/capabilityの共通契約 | 既存`kotoba-core-contracts`を使用。能力の意味は言語catalogと整合させ、重複定義しない | engine、provider handle、OS実装 |
 | VM状態・遷移・admission | `kototama`のVM spec。判定policyは`grant`、委任modelは`authority` | compiler backend、OS、network node |
-| 共通execution descriptor | `kotoba-core-contracts`の`kotoba.core.execution`へ移管済み。11個の既存neutral exportと4個のv2 exportを持つ | Wasm worldを全profileの必須項目にすること |
+| 共通execution descriptor | `kotoba-core-contracts`の`kotoba.core.execution`へ移管済み。11個の既存neutral exportと6個のv2 exportを持つ | Wasm worldを全profileの必須項目にすること |
 | target ABI/profile | `abi`をversioned profileのownerとして残す。WIT/Canonical ABI、native calling convention、Script bridge、EVM ABIをそれぞれ区別 | 全targetの意味をWasmから導出すること |
 | 分散application/data契約 | `kotoba-protocol`。bytes/CID・署名・暗号の実装は既存codec/crypto owner | DHT、DB、consensus実装の取り込み |
 
@@ -79,7 +79,8 @@ Scriptも既存bridge規約を明示し、JavaScript hostそのものを基底�
 明示的なidentityのv1→v2 projectionと逆projectionはbinding不一致を拒否する。
 binding blockのCID再計算・profile契約検証・新identityのCID/署名発行はhostの責務で、shape validatorだけでは保証しない。
 既存v1 wire/CID/署名/WITと`:aiueos/*` keyは維持し、default runtime admissionはv1のまま。
-Native/Script/EVM binding実装とruntimeのv2受入れは後続のprofile別移行である。
+v2 binding・発行・admission の明示APIと限定した実host経路を実装した。
+[移行レポート](execution-v2-migration.md)にprofile別の検証と未認定境界を記載する。
 
 WITはComponent interface/worldを記述し、Canonical ABIがそれをcore Wasmの値とmemoryへ写像する。
 このため、WITを全ターゲットの言語意味の正本に置かない。

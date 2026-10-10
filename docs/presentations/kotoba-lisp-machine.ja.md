@@ -76,9 +76,13 @@ flowchart LR
   V1 --> P
 ```
 
-neutral入口は15 export・source import 0。Component入口は39 export、互換入口は既存46 exportを維持。
+neutral入口は17 export・source import 0。Component入口は39 export、互換入口は既存46 exportを維持。
 新しいv2 identity/leaseはprofile bindingのCIDを参照し、既存v1のwire・CID・署名は変えない。
-AMUのnative既定経路を維持し、v2 runtime admissionと新target qualificationは別の移行として扱う。
+AMUのnative既定経路を維持し、v2 は明示 entrypoint として追加した。authority が invocation と intent/lease を発行し、host が実 artifact/runtime の binding と署名を検証して durable ledger に登録する。実行後に outcome・receipt・completed identity を生成する。
+
+23 target の閉じた契約と admission fixture を検証し、native、Node Core Wasm、restricted Script、bounded EVM、Wasmtime Component の純粋な結果 42 を確認した。全 host の qualification、effectful native/Script、async、Q9 の完了は主張しない。
+
+[移行単位の実装・検証](../execution-v2-migration.md)
 
 ## 6. target profile は実行する単位で揃える
 
