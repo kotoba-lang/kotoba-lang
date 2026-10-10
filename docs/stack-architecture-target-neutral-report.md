@@ -61,6 +61,11 @@ pins there starts bb/uberjar before the JVM-free lock resolver. CLI direct
 frontend/security floors must not override APIs required by the selected AMU.
 The procedure now requires this manifest/bootstrap/alias/lock closure check.
 
+The CLI closure also pins the complete JVM EDN parser correction: the earlier
+lexer-only fix left parser/form-span Character comparisons inconsistent. The
+owner correction preserves real character literals and does not widen admission.
+Security adoption remains fail-closed with its exact selected pin declared.
+
 ## Verification
 
 | Path | Result and boundary |
@@ -77,7 +82,8 @@ The procedure now requires this manifest/bootstrap/alias/lock closure check.
 | Host compatibility diagnostics | Kototama 11/40, Component core 3/17, executor 3/6; scratch read bridge, not native/Q9 qualification |
 | Murakumo shipped-KIR subset | 3 existing pure authority tests / 14 assertions; real CID fixtures, state/epoch/refusal |
 | Murakumo CI | All four repository jobs passed; signing/storage/HTTP qualification is not inferred from the portable subset |
-| Documents and presentation | 49 EDN documents; 48 checked documents / 18 authorities; site locale tests 20,743 assertions; 123 generated pages keep identical script blocks |
+| EDN owner portability | JVM 3 tests / 11 assertions; SCI 34 tests / 420 assertions; parser/lexer agreement, escapes and malformed-input refusals |
+| Documents and presentation | 51 EDN documents; 48 checked documents / 18 authorities; site locale tests 20,743 assertions; 123 generated pages keep identical script blocks |
 
 The existing full Murakumo SCI authority suite fails at its clj-only signing
 entrypoint on both unchanged main and this refactor; it is not reported as pass.
@@ -110,6 +116,9 @@ and reusable caches.
 | aiueos | [420](https://github.com/kotoba-lang/aiueos/pull/420) |
 | sahai | [10](https://github.com/kotoba-lang/sahai/pull/10) |
 | inga | [26](https://github.com/kotoba-lang/inga/pull/26) |
+| edn | [8](https://github.com/kotoba-lang/edn/pull/8) |
+| root | [3554](https://github.com/com-junkawasaki/root/pull/3554) |
+| kotoba-lang | [758](https://github.com/kotoba-lang/kotoba-lang/pull/758) |
 | kotoba | [639](https://github.com/kotoba-lang/kotoba/pull/639) |
 
 Root legend/ADR and this language composition report retain the canonical
