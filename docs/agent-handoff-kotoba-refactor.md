@@ -1,5 +1,7 @@
 # Agent handoff: Kotoba refactor (`.kotoba` migration)
 
+> **Moved 2026-10-10 (root ADR-2610100100 K2a):** the W6 inventories and documents this file cites (`lang/w6-*.edn`, `docs/w6-*.md`, `docs/adr/ADR-w6-*-v1.md`) and the Q9 candidate verification (`lang/q9-kotoba-candidate-verification.edn` and its generator) are archived in com-junkawasaki/root at `archive/kotoba-lang-migration-evidence-20261010/`, under the same paths.
+
 **Authoritative superproject ADR:**  
 `com-junkawasaki/root` → `90-docs/adr/2607289500-kotoba-refactor-agent-handoff-and-capability-repo-cid.edn`  
 (policy root: `ADR-2607279200` Clojure-shaped + safety elaboration)
