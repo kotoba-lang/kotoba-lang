@@ -66,6 +66,24 @@ lexer-only fix left parser/form-span Character comparisons inconsistent. The
 owner correction preserves real character literals and does not widen admission.
 Security adoption remains fail-closed with its exact selected pin declared.
 
+The target/host closure also includes the authority grammar bytes, actual
+`.cljk` compiler resource revisions, the native executor's metered/unmetered
+fuel schema, and the reviewed loader source/binary identity. A JVM project
+loader fix accepts already resolved `Path` objects while preserving the closed
+graph, namespace and real-path containment checks. Native exact-file grants
+now open the file without symlink traversal; they never become parent-directory
+grants. Directory beneath-resolution and opened-fd containment remain enforced.
+The artifact owner binds the repaired source digest and requires explicit new
+runtime trust. CLI loader caches use source bytes, flags and host profile,
+not checkout timestamps. The shim still enforces its explicit 512 default;
+AMU's native default may be unmetered under its own profile. Script budget
+exhaustion is checked on the emitted guest and its failure receipt. Qualified
+native browse routing includes entry counts and exact wire-34 listing bytes.
+The source-bound native fuzz ratchet advances with the loader; all existing
+x64/ARM64 coverage, feature and corpus minima and the 20,000-case condition
+are retained. A carried-forward threshold is not a new coverage measurement;
+Linux CI must produce the new source-bound coverage receipt.
+
 ## Verification
 
 | Path | Result and boundary |
@@ -82,8 +100,15 @@ Security adoption remains fail-closed with its exact selected pin declared.
 | Host compatibility diagnostics | Kototama 11/40, Component core 3/17, executor 3/6; scratch read bridge, not native/Q9 qualification |
 | Murakumo shipped-KIR subset | 3 existing pure authority tests / 14 assertions; real CID fixtures, state/epoch/refusal |
 | Murakumo CI | All four repository jobs passed; signing/storage/HTTP qualification is not inferred from the portable subset |
+| AMU JVM project seam | 1 regression / 3 assertions; root and transitive module from `Path` inputs; full NBB project integration passes |
+| Native file scope | 4 real executions: exact-file and directory reads; sibling and ungranted symlink refusals; compiled with strict warnings |
+| Loader sanitizer/fuzz | macOS ASan/UBSan deterministic 20,000-case run passes; Linux x64/ARM64 coverage gates retain their existing minima and bind the repaired loader fingerprint; final receipts in AMU PR 1279 |
+| Artifact profile owner | SCI 20 tests / 102 assertions; old-source refusal, explicit trust, untrusted and revoked runtime refusal |
 | EDN owner portability | JVM 3 tests / 11 assertions; SCI 34 tests / 420 assertions; parser/lexer agreement, escapes and malformed-input refusals |
-| Documents and presentation | 51 EDN documents; 48 checked documents / 18 authorities; site locale tests 20,743 assertions; 123 generated pages keep identical script blocks |
+| CLI host closure | Required CI: launcher 924 tests / 10,779 assertions and declared qualification 12 tests / 134 assertions, zero failures/errors; signed native + grammar 8 tests / 30 assertions locally |
+| Documents and presentation | 53 EDN documents; 48 checked documents / 18 authorities; site locale tests 20,743 assertions; 123 generated pages keep identical script blocks |
+
+The existing artifact full JVM suite has a `kerror/ExceptionInfo` class-resolution failure; its SCI suite is the portability evidence. The existing AMU JVM project suite has host-specific failures; only its new JVM seam regression and full NBB project integration are reported as passing.
 
 The existing full Murakumo SCI authority suite fails at its clj-only signing
 entrypoint on both unchanged main and this refactor; it is not reported as pass.
@@ -105,7 +130,7 @@ and reusable caches.
 |---|---|
 | kotoba-core-contracts | [26](https://github.com/kotoba-lang/kotoba-core-contracts/pull/26) |
 | abi | [23](https://github.com/kotoba-lang/abi/pull/23), [24](https://github.com/kotoba-lang/abi/pull/24) |
-| amu | [1278](https://github.com/kotoba-lang/amu/pull/1278) |
+| amu | [1278](https://github.com/kotoba-lang/amu/pull/1278), [1279](https://github.com/kotoba-lang/amu/pull/1279) |
 | grant | [11](https://github.com/kotoba-lang/grant/pull/11) |
 | kototama | [152](https://github.com/kotoba-lang/kototama/pull/152) |
 | kotoba-component | [122](https://github.com/kotoba-lang/kotoba-component/pull/122) |
@@ -117,6 +142,7 @@ and reusable caches.
 | sahai | [10](https://github.com/kotoba-lang/sahai/pull/10) |
 | inga | [26](https://github.com/kotoba-lang/inga/pull/26) |
 | edn | [8](https://github.com/kotoba-lang/edn/pull/8) |
+| artifact | [60](https://github.com/kotoba-lang/artifact/pull/60) |
 | root | [3554](https://github.com/com-junkawasaki/root/pull/3554) |
 | kotoba-lang | [758](https://github.com/kotoba-lang/kotoba-lang/pull/758) |
 | kotoba | [639](https://github.com/kotoba-lang/kotoba/pull/639) |

@@ -149,3 +149,36 @@ architecture direction does not authorize breaking existing wire contracts.
 - Is a cached result substituting for an effect that must actually happen?
 - Are persistence, placement and public entry points being mistaken for authority?
 - Can the updated docs be traced to owner contracts and measured manifests?
+
+## Target profile closure checks
+
+When advancing an AMU target dependency, qualify its complete host closure,
+not just API imports. Resolve direct and transitive coordinates, compare every
+vendored grammar copy with its pinned authority, and derive compiler revisions
+from the source resources actually loaded (`.cljk` after extension migration).
+Keep the SCI bootstrap manifest separate from compiled/test dependency locks.
+
+For native execution, couple loader source bytes with the artifact owner's
+reviewed runtime identity and the measured binary/toolchain profile. Reissue
+explicit trust after a source change; never edit away identity checks or
+broaden a file grant to its parent directory to obtain a passing run. Verify
+exact-file and directory reads, sibling and symlink refusals, and the host's
+actual default and explicit fuel budgets. Cache a built loader by source,
+flags and host profile rather than filesystem timestamp across checkouts.
+Update source-bound fuzz ratchets when loader bytes change, keeping or actually
+remeasuring the coverage/feature/corpus minima. Do not lower floors to fix a
+failure or label carried-forward minima as new observations. Execute sanitizer
+and Linux x64/ARM64 coverage-guided runs and record source, toolchain, seed,
+case count, reach counters and final CI conclusion.
+
+For Script targets, distinguish compile refusal from an emitted guest's runtime
+budget exhaustion and check the failure receipt and absence of effects. For
+native automatic routing, widen the admitted capability set only after the
+real compiled guest, wire bytes and resource refusals pass on that profile.
+A dated compiler limitation is not a permanent capability contract.
+
+Read each required CI job's final conclusion and actual test summary. Workflows
+with `if: !cancelled()` can run later checks after an earlier failure; reaching
+a later step is not a pass. Record existing host-specific baseline failures
+separately, then verify final remote-main ancestry, content and owner-managed
+west/fleet-db consistency before declaring the phase complete.
