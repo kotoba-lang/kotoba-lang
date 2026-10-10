@@ -80,7 +80,17 @@ neutral入口は15 export・source import 0。Component入口は39 export、互�
 新しいv2 identity/leaseはprofile bindingのCIDを参照し、既存v1のwire・CID・署名は変えない。
 AMUのnative既定経路を維持し、v2 runtime admissionと新target qualificationは別の移行として扱う。
 
-## 6. 説明とリファクターの正本
+## 6. target profile は実行する単位で揃える
+
+AMU の target と、実行 host の loader・executor・grammar・fuel・receipt を一式で検査する。
+neutral 契約へ物理 hash や OS の挙動を押し込まない。
+単一ファイル grant はそのファイルだけを許可し、親ディレクトリへ権限を広げない。
+loader source が変われば、その profile の runtime identity と trust を更新する。
+native・Script・Wasm の成功と拒否はそれぞれ実行成果物で示す。
+
+[実装と検証のレポート](../stack-architecture-target-neutral-report.md)
+
+## 7. 説明とリファクターの正本
 
 [全体仕様と依存図](../stack-architecture.md) ·
 [機械可読構成 spec](../../lang/stack-architecture.edn) ·
