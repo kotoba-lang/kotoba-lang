@@ -79,6 +79,10 @@ not checkout timestamps. The shim still enforces its explicit 512 default;
 AMU's native default may be unmetered under its own profile. Script budget
 exhaustion is checked on the emitted guest and its failure receipt. Qualified
 native browse routing includes entry counts and exact wire-34 listing bytes.
+The source-bound native fuzz ratchet advances with the loader; all existing
+x64/ARM64 coverage, feature and corpus minima and the 20,000-case condition
+are retained. A carried-forward threshold is not a new coverage measurement;
+Linux CI must produce the new source-bound coverage receipt.
 
 ## Verification
 
@@ -98,9 +102,10 @@ native browse routing includes entry counts and exact wire-34 listing bytes.
 | Murakumo CI | All four repository jobs passed; signing/storage/HTTP qualification is not inferred from the portable subset |
 | AMU JVM project seam | 1 regression / 3 assertions; root and transitive module from `Path` inputs; full NBB project integration passes |
 | Native file scope | 4 real executions: exact-file and directory reads; sibling and ungranted symlink refusals; compiled with strict warnings |
+| Loader sanitizer/fuzz | macOS ASan/UBSan deterministic 20,000-case run passes; Linux x64/ARM64 coverage gates retain their existing minima and bind the repaired loader fingerprint; final receipts in AMU PR 1279 |
 | Artifact profile owner | SCI 20 tests / 102 assertions; old-source refusal, explicit trust, untrusted and revoked runtime refusal |
 | EDN owner portability | JVM 3 tests / 11 assertions; SCI 34 tests / 420 assertions; parser/lexer agreement, escapes and malformed-input refusals |
-| CLI host closure | Focused project/cache/native browse/Script budget checks pass; signed native + grammar 8 tests / 30 assertions; full required CI receipt in PR 639 |
+| CLI host closure | Required CI: launcher 924 tests / 10,779 assertions and declared qualification 12 tests / 134 assertions, zero failures/errors; signed native + grammar 8 tests / 30 assertions locally |
 | Documents and presentation | 53 EDN documents; 48 checked documents / 18 authorities; site locale tests 20,743 assertions; 123 generated pages keep identical script blocks |
 
 The existing artifact full JVM suite has a `kerror/ExceptionInfo` class-resolution failure; its SCI suite is the portability evidence. The existing AMU JVM project suite has host-specific failures; only its new JVM seam regression and full NBB project integration are reported as passing.

@@ -165,6 +165,11 @@ broaden a file grant to its parent directory to obtain a passing run. Verify
 exact-file and directory reads, sibling and symlink refusals, and the host's
 actual default and explicit fuel budgets. Cache a built loader by source,
 flags and host profile rather than filesystem timestamp across checkouts.
+Update source-bound fuzz ratchets when loader bytes change, keeping or actually
+remeasuring the coverage/feature/corpus minima. Do not lower floors to fix a
+failure or label carried-forward minima as new observations. Execute sanitizer
+and Linux x64/ARM64 coverage-guided runs and record source, toolchain, seed,
+case count, reach counters and final CI conclusion.
 
 For Script targets, distinguish compile refusal from an emitted guest's runtime
 budget exhaustion and check the failure receipt and absence of effects. For
