@@ -1,14 +1,15 @@
 # Current selected owner dependencies
 
-Measured 2026-10-10 from 17 immutable owner source revisions; each revision is recorded in the [observation spec](../lang/stack-dependency-observation.edn). Arrows mean consumer → dependency. All coordinates and alias extra/replace/override descriptors are recorded. This selected graph is not a transitive lock or runtime qualification.
+Measured 2026-10-11 from 19 immutable owner source revisions; each revision is recorded in the [observation spec](../lang/stack-dependency-observation.edn). Arrows mean consumer → dependency. All coordinates and alias extra/replace/override descriptors are recorded. This selected graph is not a transitive lock or runtime qualification.
 
-Production dependencies (31 selected direct edges):
+Production dependencies (38 selected direct edges):
 
 ```mermaid
 flowchart LR
   abi["abi"]
   aiueos["aiueos"]
   amu["amu"]
+  artifact["artifact"]
   authority["authority"]
   code_graph["code-graph"]
   grant["grant"]
@@ -18,6 +19,7 @@ flowchart LR
   kotoba_core_contracts["kotoba-core-contracts"]
   kotoba_lang["kotoba-lang"]
   kotoba_protocol["kotoba-protocol"]
+  kotoba_vm["kotoba-vm"]
   kotobase["kotobase"]
   kototama["kototama"]
   kototama_component["kototama-component"]
@@ -25,15 +27,20 @@ flowchart LR
   sahai["sahai"]
   abi --> kotoba_core_contracts
   aiueos --> grant
+  amu --> artifact
   amu --> abi
   amu --> kotoba_component
   amu --> kotoba_core_contracts
+  artifact --> abi
+  artifact --> kotoba_core_contracts
   code_graph --> kotoba_core_contracts
   code_graph --> abi
   code_graph --> kotobase
+  grant --> artifact
   grant --> abi
   grant --> kotoba_core_contracts
   grant --> authority
+  kotoba --> artifact
   kotoba --> kotoba_lang
   kotoba --> kototama
   kotoba --> amu
@@ -44,8 +51,10 @@ flowchart LR
   kotoba_lang --> kotoba_core_contracts
   kotobase --> abi
   kotobase --> grant
+  kototama --> artifact
   kototama --> abi
   kototama --> grant
+  kototama --> kotoba_vm
   kototama --> kotoba_core_contracts
   kototama --> authority
   kototama_component --> abi
@@ -63,6 +72,7 @@ flowchart LR
   abi["abi"]
   aiueos["aiueos"]
   amu["amu"]
+  artifact["artifact"]
   authority["authority"]
   code_graph["code-graph"]
   grant["grant"]
@@ -72,6 +82,7 @@ flowchart LR
   kotoba_core_contracts["kotoba-core-contracts"]
   kotoba_lang["kotoba-lang"]
   kotoba_protocol["kotoba-protocol"]
+  kotoba_vm["kotoba-vm"]
   kotobase["kotobase"]
   kototama["kototama"]
   kototama_component["kototama-component"]
@@ -81,11 +92,13 @@ flowchart LR
   aiueos -.->|"test:extra"| amu
   aiueos -.->|"test-fleet:extra"| amu
   aiueos -.->|"verify-admissions:extra"| amu
+  amu -.->|"execution-v2:extra"| kototama
   inga -.->|"test:extra"| amu
   kotoba -.->|"dev:override"| kotoba_lang
   kotoba -.->|"dev:override"| amu
   kotoba -.->|"dev:override"| kotoba_core_contracts
   kotoba_lang -.->|"pure-product-examples:extra"| amu
+  kotoba_vm -.->|"test:extra"| inga
   kotobase -.->|"integration:extra"| kotoba
   kototama -.->|"component-host:extra"| kototama_component
   kototama -.->|"postgresql-interop:extra"| kotoba

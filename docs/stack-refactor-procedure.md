@@ -73,13 +73,38 @@ mixed descriptors. `kotoba.abi.contract` preserves all 46 legacy exports.
 The neutral namespace has no imports. See [consumer inventory](../lang/execution-profile-consumers.edn)
 and [implementation report](stack-architecture-target-neutral-report.md).
 
-For the next refactor, start from these explicit entrypoints. Keep v1 bytes,
-CIDs and signatures stable. Require a verified versioned profile-binding block
-before projecting v1 identities to v2; issue new identity CIDs/signatures and
-reject mismatched artifact, Component or WIT bindings. The projection helpers
-validate shape/equality, while hosts verify binding bytes and profile contracts.
-V2 lease issuance and native/Script/EVM bindings remain explicit follow-up work;
-do not turn on default v2 runtime admission through an import/pin update.
+The next unit now has explicit APIs: `abi.target` defines closed physical
+bindings, `artifact.execution` hashes/verifies canonical blocks, `grant.execution-v2`
+issues authority-selected invocations and narrowed leases, and
+`kototama.execution-v2` admits signed packets and consumes uses durably.
+See [v2 migration evidence and activation boundary](execution-v2-migration.md).
+V1 bytes/CIDs/signatures and existing completed-v2 fields remain stable.
+
+For each further profile migration:
+
+1. Refresh owner main, full exports and manifests; preserve unrelated WIP.
+2. Select the exact target/profile and physical ABI/metering; bind independently
+   verified artifact, semantic interface, measured runtime and package lock.
+3. Resolve finalized policy/basis, grants/approvals and authority-owned ceilings;
+   derive the permit and persist fresh 256-bit invocation entropy.
+4. Issue a canonical intent without future outcome/receipts, then narrowed leases
+   naming that intent. Sign for the concrete audience, epoch and validity window.
+5. Admit before instantiation/link/provider effects. Rehash all supplied blocks,
+   check role trust and referenced revocation, and durably register invocation/intent.
+6. Route every effect through a scoped provider that reserves a use atomically
+   before invocation. Enforce target meters and bounded cancellation; deny missing
+   adapters, unsupported hosts, stale finality, replay and ambient fallback.
+7. Execute real artifacts, sign observed receipts and create a new completed
+   identity. Test substitution, widening, exhaustion, restart, revocation and
+   trap handling. Record physical/hosted/fixture evidence separately.
+8. Update all four graphs, owner specs, report and presentation; merge owners in
+   dependency order, advance consumer floors/locks only to reachable main, then
+   use owner tooling for west pins/reconcile and verify final main content.
+
+Never reuse a failed or completed intent for another invocation, auto-reset a
+crash-locked journal, infer distributed finality from a local ledger, or activate
+v2 by changing imports alone. Native/Script effect wiring, browser/CLJS/static/mobile
+and async task hosts retain explicit acceptance gates; Q9 is a separate whole-component unit.
 
 Inventory `deps.edn`, `nbb.edn`, aliases and generated locks separately. AMU's
 `nbb.edn` is a stdlib bootstrap cache boundary; compiler owner pins belong in
