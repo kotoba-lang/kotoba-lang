@@ -36,8 +36,10 @@ replay and a second intent using an already registered invocation are denied.
 
 Metadata is bounded canonical DAG-CBOR with typed values and explicit CID links.
 Hosts rehash and check canonical encoding before decoding; flags such as
-`verified:true` never count as evidence. Large artifacts use the existing raw
+`verified:true` never count as evidence. Large Script artifacts use the existing raw
 content-block owner, not a truncated hash or JSON/EDN rendering of v2 descriptors.
+The current native adapter refuses sealed-envelope metadata beyond the 64 KiB
+block bound; larger native envelopes require a separate raw-block binding gate.
 Legacy native seal bytes retain their existing canonical encoding/hash domain.
 
 Authority and executor keys have separate trust sets. Admission checks the
