@@ -83,6 +83,7 @@ regenerated lock remain separate from the stdlib nbb bootstrap.
 |---|---|---|
 | All 23 declared profiles | Closed binding/CID contracts and authenticated admission fixtures | Fixture coverage does not qualify a physical host |
 | aarch64 macOS native | AMU JVM-free generated artifact, reproduced/measured loader, execution result 42, signed completion | Pure zero-argument i64 with explicit fuel; effectful native provider wiring denied |
+| x86_64 Linux native | AMU pinned Node/engine CI, generated lock, measured native loader, execution result 42, signed completion, unmetered artifact denied | Pure zero-argument i64; this job does not qualify other native hosts or effect providers |
 | Wasm core on Node | Checked source re-emission, actual WebAssembly execution, typed i64 result 42 | Browser/WASI host mechanisms need their own acceptance |
 | restricted Script on Node | Checked source re-emission, restricted output verification, bounded child execution, result 42 | Pure zero-argument i64; browser/CLJS and effect bridge are not enabled |
 | bounded EVM | Verified bytecode re-emission and actual VM execution, result 42 | Pure ABI subset; no mainnet state, calls, gas equality or settlement claim |
@@ -117,3 +118,5 @@ source migration with its own acceptance, separate from this explicit CLJK unit.
 Kototama runs `scripts/test-execution-v2.cljk` (7 tests, 170 assertions) and `scripts/test-component-v2.cljk` with explicitly selected Wasmtime/wasm-tools. AMU runs `scripts/test-execution-v2-targets.cljk` and `scripts/test-execution-v2-native.cljk` from its generated `execution-v2` / `native-run` lock aliases. The native gate includes an unmetered control that must be denied. ABI/core foundation coverage is 9 tests / 707 assertions; canonical blocks are 4 / 276; grant issuance is 2 / 12; the EVM owner suite is 56 / 193. Existing artifact coverage is 20 / 102 and Component v1 is 6 / 27.
 
 CI and physical evidence are recorded separately. The new AMU v2 job must execute on the pinned Node/engine and lock; a setup failure, missing package, stale lock, zero-test run or unstarted job is not a pass. Native sealed integers are normalized only after artifact verification; v1 metered flag omission retains its defined meaning and `off` remains refused.
+
+Owner-local bootstrap was also exercised without a supplied sibling classpath: artifact loaded its v2 content API and passed 4 / 276 assertions; grant loaded issuance and passed 2 / 12. Their `nbb.edn` Git dependencies match the declared owner source closure, and grant declares the content codec hash package in an npm lock. The AMU stdlib bootstrap remains separate.
