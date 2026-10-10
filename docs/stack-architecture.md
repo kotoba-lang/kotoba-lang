@@ -53,10 +53,13 @@ arrows describe optional deployment composition, not source imports.
 flowchart TB
   Source["Kotoba source / Codebase"] -->|check and project-link| Amu["AMU compiler · T2"]
   Language["Language contracts · T1"] -->|meaning| Amu
-  Amu -->|lower| Backends["Native / Wasm / Component / Script"]
+  Amu -->|lower| Backends["Native / Wasm / Component / Script / bounded EVM"]
   Backends -->|produce| Artifact["Checked artifact + provenance"]
-  ABI["abi · T0"] -->|shared contract| Amu
-  ABI -->|shared contract| VM["Kototama Lisp VM contract · T3"]
+  Neutral["Target-neutral interface / identity / execution contracts"] -->|shared meaning and descriptors| Amu
+  Neutral -->|shared meaning and descriptors| Hosts
+  Profiles["Selected target ABI profile"] -->|lowering boundary| Backends
+  Profiles -->|binding boundary| Hosts
+  VM["Kototama Lisp VM contract · T3"]
   VM -->|implemented by| Hosts["Runtime hosts / engines · T3"]
   Artifact -->|verify and runtime-link| Hosts
   Hosts -->|request decision| Grant["grant · T4"]
@@ -74,7 +77,10 @@ OS for a modern Lisp machine in development"] -->|request decision| Grant
 
 This is a composition diagram, not proof that every engine/provider/OS path
 is implemented or deployed. Native host defaults and portable Component
-profiles are target choices; neither changes the VM definition.
+profiles are target choices; neither changes the VM definition. Neutral and
+profile entrypoints describe the adopted direction; the actual `abi` schema
+split is pending versioned migration. A bounded EVM artifact is admitted by
+its external EVM profile and does not imply full Kototama engine conformance.
 
 ## Current dependency observation and intended contract dependencies
 
