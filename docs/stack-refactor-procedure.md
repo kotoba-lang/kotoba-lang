@@ -64,6 +64,29 @@ package dependencies or consensus guarantees have already changed.
     task worktrees only after custody and clean-state verification. Update
     personal memory only when the user asks, through an extension note.
 
+## Implemented entrypoints and the next migration boundary
+
+The ABI ownership split is implemented: `kotoba.core.execution` owns neutral
+plans, abilities, decisions, approvals and the closed v2 identity/lease shapes;
+`kotoba.abi.component` owns Component/WIT/WASI profiles and unchanged v1
+mixed descriptors. `kotoba.abi.contract` preserves all 46 legacy exports.
+The neutral namespace has no imports. See [consumer inventory](../lang/execution-profile-consumers.edn)
+and [implementation report](stack-architecture-target-neutral-report.md).
+
+For the next refactor, start from these explicit entrypoints. Keep v1 bytes,
+CIDs and signatures stable. Require a verified versioned profile-binding block
+before projecting v1 identities to v2; issue new identity CIDs/signatures and
+reject mismatched artifact, Component or WIT bindings. The projection helpers
+validate shape/equality, while hosts verify binding bytes and profile contracts.
+V2 lease issuance and native/Script/EVM bindings remain explicit follow-up work;
+do not turn on default v2 runtime admission through an import/pin update.
+
+Inventory `deps.edn`, `nbb.edn`, aliases and generated locks separately. AMU's
+`nbb.edn` is a stdlib bootstrap cache boundary; compiler owner pins belong in
+`deps.edn` and the regenerated `deps-lock.edn`. Adding them to that bootstrap
+starts the engine's bb/uberjar path on a cold cache and breaks JVM-free CI.
+Use the existing owner lock/resolver instead of creating a second resolver.
+
 ## Target-neutral and distributed migration order
 
 Apply these steps within the ten-step integration procedure above. The adopted

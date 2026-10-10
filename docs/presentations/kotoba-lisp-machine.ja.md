@@ -65,7 +65,22 @@ selfhost、C-free 本番経路、実機 qualification はそれぞれ証拠を�
 Codebase の保存を実行中 machine image の保存と呼びません。
 QEMU・hosted・hybrid の成功を C-free 実機の完了と読み替えません。
 
-## 5. 説明とリファクターの正本
+## 5. 中立契約とtarget profileの実装
+
+```mermaid
+flowchart LR
+  AMU["AMU / policy / storage"] --> N["core.execution：neutral descriptor"]
+  HOST["Component backend / host"] --> P["abi.component：WIT / WASI profile"]
+  P --> N
+  V1["abi.contract：v1互換facade"] --> N
+  V1 --> P
+```
+
+neutral入口は15 export・source import 0。Component入口は39 export、互換入口は既存46 exportを維持。
+新しいv2 identity/leaseはprofile bindingのCIDを参照し、既存v1のwire・CID・署名は変えない。
+AMUのnative既定経路を維持し、v2 runtime admissionと新target qualificationは別の移行として扱う。
+
+## 6. 説明とリファクターの正本
 
 [全体仕様と依存図](../stack-architecture.md) ·
 [機械可読構成 spec](../../lang/stack-architecture.edn) ·

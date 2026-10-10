@@ -507,3 +507,8 @@ bb scripts/check-legacy-runtime-absence.bb
 This repository is the CLJC/EDN language authority. Native, JVM, Node, or other
 launchers are adapters and must not define independent language or CLI
 semantics.
+
+The neutral execution / Component profile API split is implemented; see
+[the implementation report](docs/stack-architecture-target-neutral-report.md).
+Core contracts, target profiles, legacy v1 compatibility and runtime qualification
+have separate entrypoints and evidence.
