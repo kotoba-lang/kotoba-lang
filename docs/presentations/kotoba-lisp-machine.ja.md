@@ -1,5 +1,10 @@
 # Kotoba：現代の Lisp machine を組み立てる
 
+構成をさらに整える[ターゲット非依存・分散アーキテクチャの構成方針](../stack-architecture-target-neutral.ja.md)：
+WasmはAMUの出力先の一つ。中心に言語・VM・権限・identityの契約を置き、
+WIT等はtarget profile、IPFS等は配布、inga等は宣言したdomainの合意として接続する。
+実行targetと分散方式を独立に選び、各組合せのqualificationを明示する。
+
 ## 1. 全体像
 
 **AiueOS は、Kotoba による現代の Lisp machine を目指す OS。**

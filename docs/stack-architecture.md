@@ -12,13 +12,22 @@ and [topology ADR](https://github.com/com-junkawasaki/root/blob/main/90-docs/adr
 remain the workspace governance authorities. Composition does not redefine
 language semantics, VM transitions, authorization or OS qualification.
 
+The [target-neutral and distributed architecture direction](stack-architecture-target-neutral.ja.md)
+refines the intended dependency direction: Wasm is one compiler target, and
+WIT belongs to a Component profile. The current `abi` repository contains both
+shared descriptors and target-specific contracts; T0 is a historical role label,
+not a requirement that all language semantics depend on Wasm. The adopted direction
+keeps the dated manifest observation below and does not claim an implemented
+contract split. Its [machine-readable model](../lang/stack-architecture-target-neutral.edn)
+separates compilation targets from distribution and consensus profiles.
+
 ## Responsibility map
 
 | Component | Owns | Boundary |
 |---|---|---|
 | kotoba-lang, T1 | Language specification and semantic contracts | No VM or database is the language definition |
 | Kotoba CLI/library/Codebase | User commands, libraries, content-addressed definitions | Calls the compiler and runtime; separate from the T1 authority repo |
-| abi, T0 | WIT, capability and admission interchange contracts | Contract data, no permission decision or engine |
+| abi, T0 | Shared descriptors plus versioned target ABI profiles | Mixed ownership to split; T0 is not a universal Wasm foundation |
 | Amu, T2 | Checking, project linking, lowering and artifact production | Does not schedule work or decide grants |
 | Kototama, T3 | Closed S-expression transitions, IPLD state and receipts | VM contract; engines implement it |
 | Runtime hosts, T3 | Validation, runtime linking, budgets and execution | Implement a named profile and enforce admitted capabilities |
@@ -44,10 +53,13 @@ arrows describe optional deployment composition, not source imports.
 flowchart TB
   Source["Kotoba source / Codebase"] -->|check and project-link| Amu["AMU compiler · T2"]
   Language["Language contracts · T1"] -->|meaning| Amu
-  Amu -->|lower| Backends["Native / Wasm / Component / Script"]
+  Amu -->|lower| Backends["Native / Wasm / Component / Script / bounded EVM"]
   Backends -->|produce| Artifact["Checked artifact + provenance"]
-  ABI["abi · T0"] -->|shared contract| Amu
-  ABI -->|shared contract| VM["Kototama Lisp VM contract · T3"]
+  Neutral["Target-neutral interface / identity / execution contracts"] -->|shared meaning and descriptors| Amu
+  Neutral -->|shared meaning and descriptors| Hosts
+  Profiles["Selected target ABI profile"] -->|lowering boundary| Backends
+  Profiles -->|binding boundary| Hosts
+  VM["Kototama Lisp VM contract · T3"]
   VM -->|implemented by| Hosts["Runtime hosts / engines · T3"]
   Artifact -->|verify and runtime-link| Hosts
   Hosts -->|request decision| Grant["grant · T4"]
@@ -65,46 +77,25 @@ OS for a modern Lisp machine in development"] -->|request decision| Grant
 
 This is a composition diagram, not proof that every engine/provider/OS path
 is implemented or deployed. Native host defaults and portable Component
-profiles are target choices; neither changes the VM definition.
+profiles are target choices; neither changes the VM definition. Neutral and
+profile entrypoints describe the adopted direction; the actual `abi` schema
+split is pending versioned migration. A bounded EVM artifact is admitted by
+its external EVM profile and does not imply full Kototama engine conformance.
 
-## Selected direct library dependencies
+## Current dependency observation and intended contract dependencies
 
-Here an arrow means **consumer → direct dependency**. This graph is an
-observation of fetched `main` manifests on 2026-10-10, not a timeless policy
-or a complete transitive lock. Alias-only build, conformance and integration
-edges are recorded separately in the composition contract.
+The refreshed [current selected owner graph](stack-dependencies-current.md)
+records 13 fetched-main manifests and 19 edges among those selected owners;
+[its EDN observation](../lang/stack-dependency-observation.edn) retains all
+manifest coordinates and alias extra/replace dependencies. The previous
+composition snapshot covered a different eight-owner/23-edge selection and
+remains historical data, not a claim of current closure.
 
-```mermaid
-flowchart LR
-  CLI["Kotoba CLI/library"] --> AMU["Amu"]
-  CLI --> LANG["kotoba-lang"]
-  CLI --> VM["Kototama"]
-  CLI --> SCRIPT["kotoba-script"]
-  LANG --> G["grant"]
-  LANG --> KIR["osaho / checked KIR"]
-  AMU --> ABI["abi"]
-  AMU --> KIR
-  AMU --> BACK["Native / Wasm / Component / Script backends"]
-  VM --> ABI
-  VM --> G
-  VM --> AU["authority"]
-  VM --> ACTOR["kotoba-vm actor kernel"]
-  OS["AiueOS"] --> G
-  G --> ABI
-  G --> AU
-  DB["Kotobase"] --> G
-  DB --> ABI
-  DB --> STORE["kotobase-engine / storage"]
-```
-
-Existing T1 dependencies on grant and checked KIR must remain visible during
-refactoring; this report neither erases them nor certifies T1 isolation.
-Kotobase's language integration edge is alias-scoped; “database built on the
-language” does not mean every database repo directly imports the CLI at runtime.
-Amu's backend and ABI dependencies refute the old “security and Script only”
-snapshot. Kototama imports grant, not the OS, for permission decisions.
-The booted AiueOS kernel consumes verified compiler output, while host-side
-build aliases may depend on compiler libraries.
+The [intended contract DAG](stack-architecture-target-neutral.ja.md) describes
+future entrypoint boundaries. Its arrows mean consumer → contract dependency,
+not today's whole-repository imports. Wasm/WIT, native calling conventions,
+Script bridges and EVM ABI are selected profile boundaries, separate from
+neutral semantics and from distributed consistency domains.
 
 ## What the Lisp machine presentation means
 
