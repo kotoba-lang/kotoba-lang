@@ -14,11 +14,10 @@ language semantics, VM transitions, authorization or OS qualification.
 
 The [target-neutral and distributed architecture direction](stack-architecture-target-neutral.ja.md)
 refines the intended dependency direction: Wasm is one compiler target, and
-WIT belongs to a Component profile. The current `abi` repository contains both
-shared descriptors and target-specific contracts; T0 is a historical role label,
-not a requirement that all language semantics depend on Wasm. The adopted direction
-keeps the dated manifest observation below and does not claim an implemented
-contract split. Its [machine-readable model](../lang/stack-architecture-target-neutral.edn)
+WIT belongs to a Component profile. The implemented API split puts neutral descriptors in
+`kotoba.core.execution` and Component profiles in `kotoba.abi.component`, retaining
+`kotoba.abi.contract` as the v1 facade. T0 is an ownership label, not a requirement
+that language semantics depend on Wasm. Its [machine-readable model](../lang/stack-architecture-target-neutral.edn)
 separates compilation targets from distribution and consensus profiles.
 
 ## Responsibility map
@@ -27,7 +26,8 @@ separates compilation targets from distribution and consensus profiles.
 |---|---|---|
 | kotoba-lang, T1 | Language specification and semantic contracts | No VM or database is the language definition |
 | Kotoba CLI/library/Codebase | User commands, libraries, content-addressed definitions | Calls the compiler and runtime; separate from the T1 authority repo |
-| abi, T0 | Shared descriptors plus versioned target ABI profiles | Mixed ownership to split; T0 is not a universal Wasm foundation |
+| core-contracts, T0 | Neutral source/package/capability/execution descriptors | core.execution has no source imports |
+| abi, T0 | Target ABI profiles and v1 compatibility | WIT is a Component boundary |
 | Amu, T2 | Checking, project linking, lowering and artifact production | Does not schedule work or decide grants |
 | Kototama, T3 | Closed S-expression transitions, IPLD state and receipts | VM contract; engines implement it |
 | Runtime hosts, T3 | Validation, runtime linking, budgets and execution | Implement a named profile and enforce admitted capabilities |
@@ -77,22 +77,21 @@ OS for a modern Lisp machine in development"] -->|request decision| Grant
 
 This is a composition diagram, not proof that every engine/provider/OS path
 is implemented or deployed. Native host defaults and portable Component
-profiles are target choices; neither changes the VM definition. Neutral and
-profile entrypoints describe the adopted direction; the actual `abi` schema
-split is pending versioned migration. A bounded EVM artifact is admitted by
+profiles are target choices; neither changes the VM definition. Neutral/profile entrypoints and closed v2 identity/lease shapes are implemented;
+default runtime admission remains v1 pending an explicit profile-specific migration. A bounded EVM artifact is admitted by
 its external EVM profile and does not imply full Kototama engine conformance.
 
 ## Current dependency observation and intended contract dependencies
 
 The refreshed [current selected owner graph](stack-dependencies-current.md)
-records 13 fetched-main manifests and 19 edges among those selected owners;
+records 17 immutable source manifests and 31 edges among those selected owners;
 [its EDN observation](../lang/stack-dependency-observation.edn) retains all
 manifest coordinates and alias extra/replace dependencies. The previous
 composition snapshot covered a different eight-owner/23-edge selection and
 remains historical data, not a claim of current closure.
 
 The [intended contract DAG](stack-architecture-target-neutral.ja.md) describes
-future entrypoint boundaries. Its arrows mean consumer → contract dependency,
+the intended contract boundary, including the implemented neutral/profile split. Its arrows mean consumer → contract dependency,
 not today's whole-repository imports. Wasm/WIT, native calling conventions,
 Script bridges and EVM ABI are selected profile boundaries, separate from
 neutral semantics and from distributed consistency domains.

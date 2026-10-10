@@ -57,24 +57,29 @@ ABIそのものを不要にするのではない。**意味上のinterfaceと、
 | 言語の意味 | `kotoba-lang`と既存semantic/IR owner | WIT、ISA、socket、永続DB |
 | source/package/capabilityの共通契約 | 既存`kotoba-core-contracts`を使用。能力の意味は言語catalogと整合させ、重複定義しない | engine、provider handle、OS実装 |
 | VM状態・遷移・admission | `kototama`のVM spec。判定policyは`grant`、委任modelは`authority` | compiler backend、OS、network node |
-| 共通execution descriptor | `abi`内のtarget-neutral部分を明示し、完全な移動単位を決めてから`kotoba-core-contracts`へ移管する候補 | Wasm worldを全profileの必須項目にすること |
+| 共通execution descriptor | `kotoba-core-contracts`の`kotoba.core.execution`へ移管済み。11個の既存neutral exportと4個のv2 exportを持つ | Wasm worldを全profileの必須項目にすること |
 | target ABI/profile | `abi`をversioned profileのownerとして残す。WIT/Canonical ABI、native calling convention、Script bridge、EVM ABIをそれぞれ区別 | 全targetの意味をWasmから導出すること |
 | 分散application/data契約 | `kotoba-protocol`。bytes/CID・署名・暗号の実装は既存codec/crypto owner | DHT、DB、consensus実装の取り込み |
 
 移管先は「すべてのspecを置く巨大なcore」ではない。共通descriptorだけを扱い、language/VM/protocolの
-正本を吸収しない。既存`kotoba-core-contracts`にもcodec・署名・I/O等の依存があるため、
-移管前にcontract-only入口とadapter入口のtransitive closureを測定する必要がある。
+正本を吸収しない。`kotoba.core.execution`はrequireを持たず、transitive source importは0。
+既存core-contractsのcodec・署名・I/O入口と、この純粋なdescriptor入口のclosureを区別する。
 
-当面は新repoや一括改名を作らず、`abi`内でneutral contractとtarget profileの入口を分離する。
+新repoや一括改名は作らず、neutral入口はcore-contracts、Component profile入口は`kotoba.abi.component`とした。
+`kotoba.abi.contract`は46個の既存exportを保持するv1互換facade。
 repo単位で分離する場合も、独立consumerとrelease境界を確認してから決める。
 native ABIの機構ownerはnative backend/hostに残し、`abi`は共有する規約だけを持つ。
 Scriptも既存bridge規約を明示し、JavaScript hostそのものを基底にしない。
 
 現行`execution-identity`は`:component-cid`・`:wit-world-cid`を含み、lease等もcomponentを参照する。
 したがって**現在のdescriptorは完全にtarget-neutralではない**。
-新versionでは共通部にsemantic interface identityを置き、profile部にtarget契約とartifact identityを束縛する案とする。
-未知profile・未認定operationは拒否する。既存v1/v2、`:aiueos/*` wire key、CID算出規則は互換移行まで保持する。
-この構成方針は実際の新schema、field名、hash domainを制定しない。
+新しい`execution-identity/v2`と`capability-lease/v2`は中立ownerで閉じたfield集合を定義し、
+`:profile-binding-cid`を通してversioned target契約とartifactを束縛する。Component binding/v1は
+`:target`・`:profile`・`:profile-contract-cid`・`:artifact-cid`・`:interface-cid`・Component/WIT/WASIを持つ。
+明示的なidentityのv1→v2 projectionと逆projectionはbinding不一致を拒否する。
+binding blockのCID再計算・profile契約検証・新identityのCID/署名発行はhostの責務で、shape validatorだけでは保証しない。
+既存v1 wire/CID/署名/WITと`:aiueos/*` keyは維持し、default runtime admissionはv1のまま。
+Native/Script/EVM binding実装とruntimeのv2受入れは後続のprofile別移行である。
 
 WITはComponent interface/worldを記述し、Canonical ABIがそれをcore Wasmの値とmemoryへ写像する。
 このため、WITを全ターゲットの言語意味の正本に置かない。
@@ -207,7 +212,7 @@ capability等を拒否する。完全なdecentralized application targetと宣�
 2. capability/semantic interfaceとprofileの対応、target artifact binding、codec/hash/versionを制定する。
    既存identityを保持する移管と、新identityが必要な意味変更を区別する。
 3. neutral入口とtarget profile入口を分離し、既存consumer用の互換facadeを維持する。
-   共通契約の候補移管先は`kotoba-core-contracts`。versioned契約とclosure確認前には移さない。
+   このAPI分離は完了済み。後続は閉じたv2契約とbindingを使い、profileごとの実行経路を移行する。
 4. AMU/backendとruntime/OS consumerを対応するprofile単位で更新する。contract→adapterの逆importを禁止する。
 5. `kotoba-protocol`のapp/data契約とhata/mon/ito/nuno提案を接続し、未実装の機能を明示する。
    consensus契約はinga、実ネットワークやcryptoは既存ownerに残す。
@@ -218,19 +223,23 @@ capability等を拒否する。完全なdecentralized application targetと宣�
 
 ## 現在の根拠と残る判断
 
-2026-10-10にfetchしたmainを確認：language `f9ca6806793c`、AMU `4eb6c3f767ab`、
-abi `af5e5379d767`、core-contracts `e2b3a74f9591`、protocol `fd6a0c0fc668`。
-関連13 ownerの直接依存とaliasを再計測した[観測spec](../lang/stack-dependency-observation.edn)と[現在の依存図](stack-dependencies-current.md)を併記する。全transitive closureや実行qualificationの再計測ではない。
-ingaのmainも取得して責務を確認した。accountability ADRは設計根拠であり、その暗号・合意のqualificationを再確認したものではない。
-旧composition specの8 manifests/23 selected edgesは旧観測として保持する。
+2026-10-10のAPI分離で使用した17 ownerの不変Git source revisionを、
+[観測spec](../lang/stack-dependency-observation.edn)に記録した。[依存図](stack-dependencies-current.md)は
+選択owner間のproduction直接依存31 edgeとbuild/test/integration alias 24 edgeを別々に表示する。
+neutral/profile/facadeの全exportとproduction consumer 17 namespaceは
+[consumer inventory](../lang/execution-profile-consumers.edn)に記録している。
+このrepo単位の観測は全transitive lockや実行qualificationではない。
+neutral入口のsource closureはrequire 0であり、core-contracts repo全体のcodec/crypto依存とは異なる。
+旧composition specの8 manifests/23 selected edgesは歴史的観測として保持する。
+実装・test・main統合の根拠は[レポート](stack-architecture-target-neutral-report.md)にまとめる。
 
-今後決める点は、共通descriptorの移管範囲、schema versionとhash domain、native/Script profileの共通化範囲、
+中立descriptor ownerとv2の閉じたschemaは確定・実装済み。今後決める点は、profile bindingのcodec/hash domainの認定、native/Script profileの共通化範囲、
 VM conformanceのtarget別対象、consensus domainのmembership/finality/recovery、
 hata/mon/ito/nunoの正式なowner/API。これらを設計図だけで決定済みにはしない。
 
 参照：
-[core-contracts](https://github.com/kotoba-lang/kotoba-core-contracts/blob/e2b3a74f959142da054605b5c1c053a19edac494/README.md)、
-[abi descriptors](https://github.com/kotoba-lang/abi/blob/af5e5379d767c9172ddecbec1b2e76b84fdc58f6/src/kotoba/abi/contract.cljk)、
+[core-contracts](https://github.com/kotoba-lang/kotoba-core-contracts/blob/main/spec/execution-contract.edn)、
+[abi descriptors](https://github.com/kotoba-lang/abi/blob/main/spec/component-profile.edn)、
 [protocol planes](https://github.com/kotoba-lang/kotoba-protocol/blob/fd6a0c0fc66803e5693486eb741c9d508c129ff5/src/kotoba/protocol/layers.cljk)、
 [inga](https://github.com/kotoba-lang/inga/blob/main/README.md)、
 [accountability proposal](https://github.com/kotoba-lang/kotoba/blob/main/docs/ADR-accountability-tiered-anonymity.md)。

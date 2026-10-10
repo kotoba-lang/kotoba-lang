@@ -34,7 +34,8 @@
         (throw (ex-info (str "no source for " ns-sym " on the bb classpath")
                         {:ns ns-sym}))))))
 
-(run! preload-cljk! '[kotoba.lang.coll kotoba.lang.text grant.causal-trust])
+(run! preload-cljk! '[kotoba.lang.coll kotoba.lang.text authority.scope identity.causal
+                      grant.authority grant.causal-trust])
 
 ;; Run the exact same pure CLJC logic as the test suite: load the namespace
 ;; source directly so the gate cannot drift from the contract implementation.
