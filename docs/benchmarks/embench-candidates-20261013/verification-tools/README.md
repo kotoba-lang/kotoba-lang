@@ -1,0 +1,3 @@
+Preserved verifier source, not standalone tools. Imports and invocation paths depend on the original workspace and the pinned prior native-map/effects/source-pool decoder. Resolve and verify those dependencies through the handoff and local evidence manifest before use. Do not interpret a mapping-only receipt or an earlier failed audit as qualification. No verifier, compiler or measurement is executed by this publication.
+
+The historical verifiers use Python assertions. Replay them only with `sys.flags.optimize == 0` and `PYTHONOPTIMIZE` unset; an optimized run is not verification evidence. The standalone reconstruction utility uses unconditional checks and exclusive output creation, and was checked with both `python3 -O` and `PYTHONOPTIMIZE=1`.
