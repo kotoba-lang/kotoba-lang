@@ -242,6 +242,9 @@ For subsequent transport refactors:
    full admission and externally observable effect evidence.
 6. For loader changes, update reviewed source SHA and source-bound fuzz pin together;
    preserve both ISA coverage floors and the independently frozen bootstrap loader.
+   Register every new C function in the loader classification table, record any
+   residual protocol rules honestly, and run the full differential with each
+   source's declared context ABI before starting the long CI matrix.
 7. Merge owners first through normal PR checks; only then advance consumer dependency
    floors, regenerate locks and replay acceptance using locked main sources.
 8. Refresh observed dependency manifests and diagrams at immutable main snapshots.
