@@ -112,3 +112,22 @@ lease を署名し、Kototama が導いた scope と一致してからリンク�
 trap・再起動後の replay 拒否を Node Wasm／Script で検証する。
 これは同期 scalar profile の証拠であり、汎用 JS sandbox、native effect
 transport、async、分散本番、Q9 を一括で qualify するものではない。
+
+
+---
+
+## Native の各呼出しも host の lease 予約へ
+
+```mermaid
+flowchart LR
+  A[AMU: native artifact と measured loader] --> N[kototama-native: bounded pipe / worker]
+  N --> K[Kototama: authority と scope 検証]
+  K --> L[durable lease use reservation]
+  L --> P[scope を所有する provider]
+  P --> N
+```
+
+- ABI の中立契約は target の上位に固定しない。transport は native target の機構。
+- import ID と scope の対応は interface CID に含め、実行前に authenticated lease と一致させる。
+- 各呼出しで検証・予約・効果の順を守る。失敗や部分効果で使用回数は返さない。
+- 初期受入は POSIX Node・unary i64。分散 quota／finality、Windows、複合値、async、Q9/selfhost は個別に検証する。

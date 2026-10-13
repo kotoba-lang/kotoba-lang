@@ -82,8 +82,9 @@ regenerated lock remain separate from the stdlib nbb bootstrap.
 | Profile | V2 path and evidence | Remaining boundary |
 |---|---|---|
 | All 23 declared profiles | Closed binding/CID contracts and authenticated admission fixtures | Fixture coverage does not qualify a physical host |
-| aarch64 macOS native | AMU JVM-free generated artifact, reproduced/measured loader, execution result 42, signed completion | Pure zero-argument i64 with explicit fuel; effectful native provider wiring denied |
-| x86_64 Linux native | AMU pinned Node/engine CI, generated lock, measured native loader, execution result 42, signed completion, unmetered artifact denied | Pure zero-argument i64; this job does not qualify other native hosts or effect providers |
+| aarch64 macOS native | AMU JVM-free generated artifact, reproduced/measured loader, execution result 42, signed completion | Pure zero-argument i64 with explicit fuel; explicit POSIX Node unary i64 transport; general/Windows effects denied |
+| x86_64 Linux native | AMU pinned Node/engine CI, generated lock, measured native loader, execution result 42, signed completion, unmetered artifact denied | Pure zero-argument i64; closed unary i64 effects use host per-call reservation; other hosts/general values remain separate |
+| aarch64 Linux native | Locked-main Node CI, actual compiled/signed guest and measured loader; native provider 8 / 43 and transport 4 / 22 | Explicit POSIX Node unary i64, each use durably reserved before effect; Q9/general/Windows/async remain separate |
 | Wasm core on Node | Checked source re-emission, actual WebAssembly execution; pure v2 and explicit v3 scoped scalar provider result 42, durable use reservation and signed completion | Browser/WASI hosts and broader provider value profiles need their own acceptance |
 | restricted Script on Node | Pure v2 child execution; explicit v3 canonical scalar compiler output in a fresh VM context, scoped provider result 42 and signed completion | General JS sandboxing, broader values, browser/CLJS and async providers are not qualified |
 | bounded EVM | Verified bytecode re-emission and actual VM execution, result 42 | Pure ABI subset; no mainnet state, calls, gas equality or settlement claim |
@@ -159,5 +160,7 @@ Existing pure Wasm/Script/EVM execution remains tested. KIR v3/v4 are accepted
 only under the same explicit typed/effect/entry checks.
 
 See AMU's [owner contract](https://github.com/kotoba-lang/amu/blob/main/docs/execution-v2-providers.md).
-Native loader provider transport, general Script values, async tasks, other
+General native provider values and Windows transport, general Script values, async tasks, other
 physical hosts, distributed production/finality and Q9 remain separate gates.
+
+Native transport integration and limits are specified in [native lease transport](native-lease-transport.md). The five-argument pure adapter retains its prior interface; explicit bindings are included in the effect interface CID.

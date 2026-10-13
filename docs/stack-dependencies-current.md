@@ -119,3 +119,21 @@ flowchart LR
 Repo-level edges include multiple entrypoints. The neutral `kotoba.core.execution` namespace has no imports, while other core-contracts codec/crypto entrypoints have their own dependencies. `abi.component` imports that neutral namespace; the legacy facade imports both. The language's existing grant/osaho coupling remains visible. Alias cycles do not redefine the acyclic intended contract DAG. Compiler backends and IR libraries outside this selection remain in the complete coordinate records.
 
 See [the implemented API split](stack-architecture-target-neutral-report.md) and [the intended contract architecture](stack-architecture-target-neutral.ja.md).
+
+
+### Native runtime-service edge
+
+```mermaid
+flowchart LR
+  L[AMU measured loader] --> N[kototama-native pipe / IO worker]
+  N --> H[Kototama host call!]
+  H --> R[Durable lease reservation]
+  R --> P[Scope-owned provider]
+  P --> N
+```
+
+This is a runtime service graph, not a reverse library dependency. Kototama
+accepts a launcher plugin and imports no native engine. AMU selects the host
+through the optional native-run alias; node:worker_threads is a builtin.
+The artifact owner pins loader measurement and neutral ABI/core exports remain
+unchanged. See [transport integration](native-lease-transport.md).
