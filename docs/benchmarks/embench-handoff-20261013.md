@@ -31,12 +31,12 @@
 | v6 | source命令数96以上に限定。SGは個別2組とも遅い。未採用。 |
 | v7 | v3に、BL/MOV9/LDR8/CMP/CSETの正確な条件下でコピー除去を追加。動作・物理検証が進んだが、正式検査と全19本C比較・採用判断は未完了。 |
 
-基準unityを取得した後のソース復元だけは、次のスクリプトで行える。生成先は専用scratch内の新しいファイルを指定する。
+固定した基準unityも `v3-unity.kotoba.gz` として同じリポジトリへ保存した。次のスクリプトは圧縮元のハッシュと復元後の候補ハッシュを検証し、7候補のソースをこの保存資料から復元できる。生成先は専用scratch内の新しいファイルを指定する。
 
 ```sh
 python3 docs/benchmarks/embench-candidates-20261013/reconstruct.py \
   --manifest docs/benchmarks/embench-candidates-20261013/manifest.json \
-  --base /path/to/frozen-v3-unity.kotoba --candidate v7 \
+  --candidate v7 \
   --output /path/to/new-task-workspace/recovered-v7.kotoba
 ```
 

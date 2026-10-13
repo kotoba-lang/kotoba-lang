@@ -1,8 +1,12 @@
 """Recover a preserved unity source. No compilation, execution or networking."""
 from pathlib import Path
-import argparse, hashlib, json, re
-p=argparse.ArgumentParser();p.add_argument('--manifest',required=True);p.add_argument('--base',required=True);p.add_argument('--candidate',required=True);p.add_argument('--output',required=True);args=p.parse_args()
-manifest=Path(args.manifest);meta=json.loads(manifest.read_text());base=Path(args.base).read_bytes();assert hashlib.sha256(base).hexdigest()==meta['patchBaseline']['sourceUnitySHA256']
+import argparse, hashlib, json, re, gzip
+p=argparse.ArgumentParser();p.add_argument('--manifest',required=True);p.add_argument('--base');p.add_argument('--candidate',required=True);p.add_argument('--output',required=True);args=p.parse_args()
+manifest=Path(args.manifest);meta=json.loads(manifest.read_text())
+if args.base:base=Path(args.base).read_bytes()
+else:
+ archive=(manifest.parent/meta['patchBaseline']['preservedArchive']).read_bytes();assert hashlib.sha256(archive).hexdigest()==meta['patchBaseline']['preservedArchiveSHA256'];base=gzip.decompress(archive)
+assert hashlib.sha256(base).hexdigest()==meta['patchBaseline']['sourceUnitySHA256']
 row=next(x for x in meta['candidates']if x['id']==args.candidate);out=Path(args.output);assert not out.exists(),'Never overwrite an existing candidate or WIP'
 result=base
 if row['patch']:
