@@ -65,3 +65,7 @@ General values, Windows transport, async/cancellation contracts, external idempo
 and effect receipts, and large native envelope raw-block binding remain future units.
 
 Verified evidence: macOS ARM64 and Linux x64/ARM64 native provider 8 tests / 43 assertions; transport 4 / 22 on both Linux ISAs; host 8 / 174, native host 10 / 83, Wasm/Script provider 7 / 80. Public/trusted source-bound Linux fuzz retains both ISA floors. Native owner Actions remains disabled; no repository CI settings were changed.
+
+Packaged commands retain their baked providers and ignore ambient lease mode,
+even with inherited transport descriptors. The explicit transport belongs to
+non-embedded measured loader invocations.

@@ -257,3 +257,7 @@ async task lifecycle/cancellation, external effect receipts/idempotency/finality
 and raw native-envelope binding beyond the metadata bound. Q9 remains a whole
 component native Kotoba/JVM-free qualification and is never inferred from Node
 bootstrap host acceptance or a merged documentation record.
+
+Packaged-command regressions must also prove that ambient lease mode and
+inherited fd 3/4 cannot replace baked providers. Resolve reviewed defects before
+ordinary merge, then re-run source-bound identity/fuzz coupling and consumer locks.

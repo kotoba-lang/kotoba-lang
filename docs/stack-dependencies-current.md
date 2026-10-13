@@ -1,6 +1,6 @@
 # Current selected owner dependencies
 
-Measured 2026-10-13 from 19 immutable owner source revisions; each revision is recorded in the [observation spec](../lang/stack-dependency-observation.edn). Arrows mean consumer → dependency. All coordinates and alias extra/replace/override descriptors are recorded. This selected graph is not a transitive lock or runtime qualification.
+Measured 2026-10-14 from 19 immutable owner source revisions; each revision is recorded in the [observation spec](../lang/stack-dependency-observation.edn). Arrows mean consumer → dependency. All coordinates and alias extra/replace/override descriptors are recorded. This selected graph is not a transitive lock or runtime qualification.
 
 Production dependencies (38 selected direct edges):
 
