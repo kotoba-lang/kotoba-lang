@@ -103,7 +103,7 @@ For each further profile migration:
 
 Never reuse a failed or completed intent for another invocation, auto-reset a
 crash-locked journal, infer distributed finality from a local ledger, or activate
-v2 by changing imports alone. Native/Script effect wiring, browser/CLJS/static/mobile
+v2 by changing imports alone. Native effect transport, general Script/structural providers, browser/CLJS/static/mobile
 and async task hosts retain explicit acceptance gates; Q9 is a separate whole-component unit.
 
 Inventory `deps.edn`, `nbb.edn`, aliases and generated locks separately. AMU's
@@ -207,3 +207,22 @@ with `if: !cancelled()` can run later checks after an earlier failure; reaching
 a later step is not a pass. Record existing host-specific baseline failures
 separately, then verify final remote-main ancestry, content and owner-managed
 west/fleet-db consistency before declaring the phase complete.
+
+## Next provider acceptance unit after the scalar bridge
+
+The explicit Node Wasm/Script scalar bridge binds each typed import to an
+immutable scope and checks the lease-derived exact scope set before linking.
+Preserve its v3 artifact domain and the existing pure v2 domain separately.
+For additional values/providers, qualify the complete scoped call path and all
+bounds in both selected runtimes; do not open general JS/interop or an ambient
+import to fill a backend gap. Source limits and emitter metering alone do not
+bound allocation or blocking host callbacks. Include actual resource effects,
+use reservation, traps, revocation/expiry, restart and signed completion tests.
+
+Native is the next transport unit: the current measured loader executes effects
+inside the child process. First add a declared per-call mechanism crossing to
+the host so `call!` can reserve uses before each effect; pre-charging a whole run
+cannot substitute for that call boundary. Changes to loader source must carry
+source-bound measurement, both-ISA sanitizer/fuzz gates and the existing ratchets.
+Keep native effects denied until that complete path is accepted. Q9/native
+whole-component/selfhost acceptance remains a separate source/build gate.
