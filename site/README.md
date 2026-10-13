@@ -579,7 +579,7 @@ Static assets only — `wrangler.jsonc` declares no Worker script. The zone is
 served on the apex and `www`. The Cloudflare account that currently holds the
 zone is an infrastructure label, not the published operator.
 
-The published operator on this zone is **Kotoba Labs Inc.** Public contact
+The published operator on this zone is **Kotoba Foundation** Public contact
 is `support@kotoba-lang.org`. Sales contact is Ryo Awai. The footer, `/legal/`,
 and `security.txt` name only those facts. Do not publish a Specified
 Commercial Transactions Act table, Delaware file number, address, phone, or
