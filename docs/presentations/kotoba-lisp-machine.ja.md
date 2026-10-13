@@ -80,7 +80,7 @@ neutral入口は17 export・source import 0。Component入口は39 export、互�
 新しいv2 identity/leaseはprofile bindingのCIDを参照し、既存v1のwire・CID・署名は変えない。
 AMUのnative既定経路を維持し、v2 は明示 entrypoint として追加した。authority が invocation と intent/lease を発行し、host が実 artifact/runtime の binding と署名を検証して durable ledger に登録する。実行後に outcome・receipt・completed identity を生成する。
 
-23 target の閉じた契約と admission fixture を検証し、native、Node Core Wasm、restricted Script、bounded EVM、Wasmtime Component の純粋な結果 42 を確認した。全 host の qualification、effectful native/Script、async、Q9 の完了は主張しない。
+23 target の閉じた契約と admission fixture を検証し、native、Node Core Wasm、restricted Script、bounded EVM、Wasmtime Component の純粋な結果 42 を確認した。全 host の qualification、native／汎用Script provider、async、Q9 の完了は主張しない。
 
 [移行単位の実装・検証](../execution-v2-migration.md)
 
@@ -99,3 +99,16 @@ native・Script・Wasm の成功と拒否はそれぞれ実行成果物で示す
 [全体仕様と依存図](../stack-architecture.md) ·
 [機械可読構成 spec](../../lang/stack-architecture.edn) ·
 [全体リファクター手順](../stack-refactor-procedure.md)
+
+## 8. capability の権限を実際の呼出しまで結ぶ
+
+Node Wasm／Script の明示 v3 artifact は、typed import と
+capability・resource・purpose の scope を固定する。authority が intent と
+lease を署名し、Kototama が導いた scope と一致してからリンクする。
+呼出しごとに use を durable に予約し、provider が実 resource を操作する。
+結果・trap を観測して、新しい完了 identity と署名 receipt を作る。
+
+実 guest の provider-owned file への追記 1 回、結果 42、use 枯渇・失効・
+trap・再起動後の replay 拒否を Node Wasm／Script で検証する。
+これは同期 scalar profile の証拠であり、汎用 JS sandbox、native effect
+transport、async、分散本番、Q9 を一括で qualify するものではない。

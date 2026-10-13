@@ -84,8 +84,8 @@ regenerated lock remain separate from the stdlib nbb bootstrap.
 | All 23 declared profiles | Closed binding/CID contracts and authenticated admission fixtures | Fixture coverage does not qualify a physical host |
 | aarch64 macOS native | AMU JVM-free generated artifact, reproduced/measured loader, execution result 42, signed completion | Pure zero-argument i64 with explicit fuel; effectful native provider wiring denied |
 | x86_64 Linux native | AMU pinned Node/engine CI, generated lock, measured native loader, execution result 42, signed completion, unmetered artifact denied | Pure zero-argument i64; this job does not qualify other native hosts or effect providers |
-| Wasm core on Node | Checked source re-emission, actual WebAssembly execution, typed i64 result 42 | Browser/WASI host mechanisms need their own acceptance |
-| restricted Script on Node | Checked source re-emission, restricted output verification, bounded child execution, result 42 | Pure zero-argument i64; browser/CLJS and effect bridge are not enabled |
+| Wasm core on Node | Checked source re-emission, actual WebAssembly execution; pure v2 and explicit v3 scoped scalar provider result 42, durable use reservation and signed completion | Browser/WASI hosts and broader provider value profiles need their own acceptance |
+| restricted Script on Node | Pure v2 child execution; explicit v3 canonical scalar compiler output in a fresh VM context, scoped provider result 42 and signed completion | General JS sandboxing, broader values, browser/CLJS and async providers are not qualified |
 | bounded EVM | Verified bytecode re-emission and actual VM execution, result 42 | Pure ABI subset; no mainnet state, calls, gas equality or settlement claim |
 | Component v1 profile | Separate v2 byte/WIT/world admission and link; real Wasmtime fixture result 42 with WASI CLI disabled; world widening refused | Fixture is not AMU whole-project or effectful Component qualification |
 
@@ -120,3 +120,44 @@ Kototama runs `scripts/test-execution-v2.cljk` (7 tests, 170 assertions) and `sc
 CI and physical evidence are recorded separately. The new AMU v2 job must execute on the pinned Node/engine and lock; a setup failure, missing package, stale lock, zero-test run or unstarted job is not a pass. Native sealed integers are normalized only after artifact verification; v1 metered flag omission retains its defined meaning and `off` remains refused.
 
 Owner-local bootstrap was also exercised without a supplied sibling classpath: artifact loaded its v2 content API and passed 4 / 276 assertions; grant loaded issuance and passed 2 / 12. Their `nbb.edn` Git dependencies match the declared owner source closure, and grant declares the content codec hash package in an npm lock. The AMU stdlib bootstrap remains separate.
+
+## Scoped synchronous provider migration (2026-10-13)
+
+AMU's `compile-effect-envelope` adds a closed v3 artifact with explicit typed
+import ID → capability/resource/purpose bindings. This does not change the
+existing pure v2 artifact or default v1 admission. Kototama derives the trusted
+executor's scope set from authenticated leases; the guest cannot supply it.
+The exact artifact scopes are checked before instantiation. Every imported
+call crosses the durable use reservation before invoking its provider.
+
+```mermaid
+flowchart LR
+  A["Verified v3 artifact: typed import / scope"] --> B["Authority-signed intent and narrowed leases"]
+  B --> C["Kototama admission: derived process-local scopes"]
+  C --> D["Exact import match before instantiation"]
+  D --> E["Guest Wasm / canonical Script call"]
+  E --> F["Refresh trust / revocation; reserve use durably"]
+  F --> G["Bounded synchronous resource provider"]
+  G --> H["Observed result / trap; signed completion identity"]
+```
+
+The current reviewed provider profile is scalar `main() -> i64`, typed i64
+imports and bounded scalar helper operations. Allocation, unbounded shifts,
+structural/async values and other targets require their own acceptance; this
+is an adapter boundary, not a ceiling on Kotoba language semantics. Script
+adapts only independently re-emitted compiler output with no guest JS/module
+or ambient imports. Its fresh VM context disables dynamic string/Wasm code
+generation; it does not claim to isolate arbitrary hostile JavaScript.
+
+Actual Wasm and Script guests append once to a provider-owned private file,
+return `42` and verify signed completion. The provider suite covers exact scope
+refusal, substitution, signature/revocation, use exhaustion, traps/type errors,
+reopened-ledger replay, guest fuel and provider deadline overrun. Wasm deadline
+checks occur at call/completion boundaries and cannot preempt an arbitrary
+blocking host callback; trusted providers must enforce their own bounds.
+Existing pure Wasm/Script/EVM execution remains tested. KIR v3/v4 are accepted
+only under the same explicit typed/effect/entry checks.
+
+See AMU's [owner contract](https://github.com/kotoba-lang/amu/blob/main/docs/execution-v2-providers.md).
+Native loader provider transport, general Script values, async tasks, other
+physical hosts, distributed production/finality and Q9 remain separate gates.
