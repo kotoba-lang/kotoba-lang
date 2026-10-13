@@ -1,5 +1,9 @@
 # Kotoba
 
+Kotoba Lang OSS is stewarded by **Kotoba Foundation**. The centralized
+kotoba.cloud, murakumo.cloud, itonami.cloud and aozora.app services are operated
+by **Awai Network LLC**. See [governance and operator responsibilities](GOVERNANCE.md).
+
 **Start this job in another language:**
 [Bahasa Indonesia](docs/i18n/id/getting-started.md) ·
 [Basa Jawa](docs/i18n/jv/getting-started.md) ·
