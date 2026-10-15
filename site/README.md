@@ -485,6 +485,16 @@ the three that run from this repository have their paths passed through
 dead link**. Verified in both directions: renaming one entry's `:harness`
 exits non-zero naming the missing path, and all 20 rendered links return 200.
 
+The 15 October 2026 Embench comparison is published separately at
+`/blog/embench-c-parity-20261015/` with its machine-readable measurements at
+`/benchmarks/embench-c-parity-20261015.json`. It reports 19 translated ports
+against upstream C on one Apple M4 cycle (geometric-mean time ratio 0.7999),
+and links the immutable Amu reproduction package and kernel audit. It is one
+sample per workload, not a certified Embench score or a language-wide speed
+ranking. The 7 September Amu native comparison remains a separate dataset: 30
+exact result pairs against Clang/C11, Rust, Zig, Go c-shared, and Swift, with
+19 pairs qualifying in every run. The two benchmark suites are not combined.
+
 The `Bottom line` paragraph used to say that *no* current run qualified a speed
 ranking because its quiet-host gate failed. That was true of three of the five
 reports and false of the two that matter: the runtime suite records
