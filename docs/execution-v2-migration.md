@@ -116,7 +116,7 @@ source migration with its own acceptance, separate from this explicit CLJK unit.
 
 ## Repeatable acceptance
 
-Kototama runs `scripts/test-execution-v2.cljk` (7 tests, 170 assertions) and `scripts/test-component-v2.cljk` with explicitly selected Wasmtime/wasm-tools. AMU runs `scripts/test-execution-v2-targets.cljk` and `scripts/test-execution-v2-native.cljk` from its generated `execution-v2` / `native-run` lock aliases. The native gate includes an unmetered control that must be denied. ABI/core foundation coverage is 9 tests / 707 assertions; canonical blocks are 4 / 276; grant issuance is 2 / 12; the EVM owner suite is 56 / 193. Existing artifact coverage is 20 / 102 and Component v1 is 6 / 27.
+Kototama runs `scripts/test-execution-v2.cljk` (8 tests, 174 assertions for the transport-qualified host suite; the pre-transport baseline was 7 / 170) and `scripts/test-component-v2.cljk` with explicitly selected Wasmtime/wasm-tools. AMU runs `scripts/test-execution-v2-targets.cljk` and `scripts/test-execution-v2-native.cljk` from its generated `execution-v2` / `native-run` lock aliases. The native gate includes an unmetered control that must be denied. ABI/core foundation coverage is 9 tests / 707 assertions; canonical blocks are 4 / 276; grant issuance is 2 / 12; the EVM owner suite is 56 / 193. Existing artifact coverage is 20 / 102 and Component v1 is 6 / 27.
 
 CI and physical evidence are recorded separately. The new AMU v2 job must execute on the pinned Node/engine and lock; a setup failure, missing package, stale lock, zero-test run or unstarted job is not a pass. Native sealed integers are normalized only after artifact verification; v1 metered flag omission retains its defined meaning and `off` remains refused.
 
