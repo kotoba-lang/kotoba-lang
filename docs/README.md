@@ -33,6 +33,7 @@ architecture while keeping owner contracts and qualification evidence separate.
 | learn the language surface | [Language reference](reference/language.md) | [Option/result](lang/option-result-guide.md), [records](lang/record-cookbook.md) |
 | implement a compiler or runtime | [Semantics SSoT](lang/semantics-ssot.md) | [grammar](../lang/guest-grammar.edn), [surface status](../lang/surface-status.edn), [conformance](../lang/conformance/manifest.edn) |
 | evaluate readiness honestly | [Maturity and comparison](maturity.md) | [coverage evidence](lang/coverage.edn), [engineering model](system-dynamics/kotoba-lang-maturity.md) |
+| review the 15 October 2026 Embench comparison | [Embench methodology audit](benchmarks/embench-methodology-audit-20261015.md) | [source article](https://kotoba-lang.org/blog/embench-c-parity-20261015/), [reproduction package](https://github.com/kotoba-lang/amu/tree/72e59fa97288f8fd881bd014b65a66ae35a3d03d/bench/embench/reproduce-20261015/) |
 | discover agent skills or MCP tools | [Kotoba Registry](https://github.com/kotoba-lang/kotoba-registry) | [Extension registry ownership](adr/ADR-kotoba-extension-registry-reference.md) |
 
 Generated lookup surfaces: [CLI](generated/cli.md),
