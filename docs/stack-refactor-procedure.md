@@ -219,10 +219,45 @@ import to fill a backend gap. Source limits and emitter metering alone do not
 bound allocation or blocking host callbacks. Include actual resource effects,
 use reservation, traps, revocation/expiry, restart and signed completion tests.
 
-Native is the next transport unit: the current measured loader executes effects
-inside the child process. First add a declared per-call mechanism crossing to
-the host so `call!` can reserve uses before each effect; pre-charging a whole run
-cannot substitute for that call boundary. Changes to loader source must carry
-source-bound measurement, both-ISA sanitizer/fuzz gates and the existing ratchets.
-Keep native effects denied until that complete path is accepted. Q9/native
-whole-component/selfhost acceptance remains a separate source/build gate.
+Native unary i64 transport is implemented and passes local macOS ARM64 plus
+Linux x64/ARM64 bounded-profile acceptance:
+keep loader framing in AMU, POSIX process IO/supervision in kototama-native, and
+admission/durable reservation/provider ownership in Kototama. Authenticate launcher
+bindings through the interface CID and match all lease-derived scopes before spawn.
+Test actual compiled/signed guests, not per-run precharging or mocked predicates.
+
+For subsequent transport refactors:
+
+1. Refresh each owner main in isolated worktrees; preserve shared WIP/storage holds.
+2. Freeze the neutral contract and exact accepted target/value/host profile. Record
+   owner, dependency, artifact and runtime-service graphs separately.
+3. Extend the mechanism without importing engine implementations into neutral ABI
+   or Kototama core. Keep resource/scope selection and lease policy in the host.
+4. Qualify every call: refresh authority/lease/binding, durably reserve, then effect;
+   immutable import-to-scope matching must precede spawn/instantiation. Refuse
+   generic calls, unused/widened scopes and ambient provider fallback.
+5. Test real signed artifacts, result/completion, exhaustion, revocation/expiry,
+   corrupt/reopened ledger, partial-effect traps, malformed transport, output/deadline,
+   late answers and process-group termination. Separate IO mechanism tests from
+   full admission and externally observable effect evidence.
+6. For loader changes, update reviewed source SHA and source-bound fuzz pin together;
+   preserve both ISA coverage floors and the independently frozen bootstrap loader.
+   Register every new C function in the loader classification table, record any
+   residual protocol rules honestly, and run the full differential with each
+   source's declared context ABI before starting the long CI matrix.
+7. Merge owners first through normal PR checks; only then advance consumer dependency
+   floors, regenerate locks and replay acceptance using locked main sources.
+8. Refresh observed dependency manifests and diagrams at immutable main snapshots.
+   Advance only named west entries with the official writer; reconcile/sign/verify
+   fleet DB/head/projection and prove fresh-main ancestry/content before cleanup.
+9. Record actual main refs, evidence, preserved WIP and remaining profiles in memory.
+
+Remaining units include aggregate/native values, Windows/other-host transport,
+async task lifecycle/cancellation, external effect receipts/idempotency/finality,
+and raw native-envelope binding beyond the metadata bound. Q9 remains a whole
+component native Kotoba/JVM-free qualification and is never inferred from Node
+bootstrap host acceptance or a merged documentation record.
+
+Packaged-command regressions must also prove that ambient lease mode and
+inherited fd 3/4 cannot replace baked providers. Resolve reviewed defects before
+ordinary merge, then re-run source-bound identity/fuzz coupling and consumer locks.
