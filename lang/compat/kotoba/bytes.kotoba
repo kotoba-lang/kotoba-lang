@@ -1,0 +1,198 @@
+;; kotoba.bytes -- the byte string library: UTF-8, hex and base64 over the
+;; language's `:bytes` primitives (`bytes-operations`: bytes-empty/count/at/
+;; slice/concat, bytes-from-vector-i64, vector-i64-from-bytes, string-from-utf8).
+;;
+;; The codecs are written out here rather than named as builtins because the
+;; language surface has exactly those eight ops; everything else (UTF-8
+;; encoding from a string, validation, lossy decoding, hex, base64) is byte
+;; arithmetic over them. `utf8-text` is `string-from-utf8` (canonical UTF-8 or
+;; a named trap); `utf8-text-lossy` is the replacement-character walk, which
+;; is what a lossy decode means and needs no trap.
+;;
+;; The oracle is the host route (the callers' cljs byte helpers); the shapes
+;; are the callers' own signatures (kotoba.compiler.text-bytes and friends).
+
+(ns kotoba.bytes
+  (:export [empty-bytes bytes-length slice-bytes index-of-byte
+            bytes-from-ints ints-from-bytes
+            utf8-length utf8-bytes utf8-encode utf8-text utf8-text-lossy
+            utf8-valid utf8-string
+            hex unhex base64-encode base64-decode]))
+
+;; ---- primitives --------------------------------------------------------------------
+
+(defn empty-bytes [] :bytes (bytes-empty))
+(defn bytes-length [b :bytes] :i64 (bytes-count b))
+(defn slice-bytes [b :bytes i :i64 n :i64] :bytes (bytes-slice b i n))
+(defn bytes-from-ints [v :vector-i64] :bytes (bytes-from-vector-i64 v))
+(defn ints-from-bytes [b :bytes] :vector-i64 (vector-i64-from-bytes b))
+
+(defn index-of-byte [b :bytes x :i64] :i64
+  (let [n (bytes-count b)]
+    (loop [i 0]
+      (if (>= i n) -1 (if (= (bytes-at b i) x) i (recur (+ i 1)))))))
+
+;; ---- UTF-8 -------------------------------------------------------------------------
+
+(defn utf8-length [s :string] :i64 (string-byte-length s))
+
+;; UTF-8 encoding from code points: the width rule (1/2/3/4 bytes) is the
+;; standard one, and every code point of a kotoba string is scalar.
+(defn- imod [x :i64 y :i64] :i64 (- x (* (quot x y) y)))
+
+(defn- cp-width [p :i64] :i64
+  (if (< p 128) 1 (if (< p 2048) 2 (if (< p 65536) 3 4))))
+
+(defn- push-cp [acc :vector-i64 p :i64] :vector-i64
+  (let [w (cp-width p)]
+    (cond
+      (= w 1) (vector-conj acc p)
+      (= w 2) (vector-conj (vector-conj acc (+ 192 (quot p 64))) (+ 128 (imod p 64)))
+      (= w 3) (vector-conj
+                (vector-conj
+                  (vector-conj acc (+ 224 (quot p 4096)))
+                  (+ 128 (imod (quot p 64) 64)))
+                (+ 128 (imod p 64)))
+      :else (vector-conj
+              (vector-conj
+                (vector-conj
+                  (vector-conj acc (+ 240 (quot p 262144)))
+                  (+ 128 (imod (quot p 4096) 64)))
+                (+ 128 (imod (quot p 64) 64)))
+              (+ 128 (imod p 64))))))
+
+(defn utf8-bytes [s :string] :bytes
+  (let [n (string-byte-length s)]
+    (loop [i 0 acc (vector-i64)]
+      (if (>= i n) (bytes-from-vector-i64 acc)
+        (let [p (string-code-point-at s i)
+              w (cp-width p)]
+          (recur (+ i w) (push-cp acc p)))))))
+
+(defn utf8-encode [s :string] :bytes (utf8-bytes s))
+(defn utf8-string [s :string] :bytes (utf8-bytes s))
+(defn utf8-text [b :bytes] :string (string-from-utf8 b))
+
+;; UTF-8 validation: the canonical rules (no overlongs, no surrogates, no
+;; out-of-range). Returns whether `string-from-utf8` would accept the bytes.
+(defn- utf8-step [b :bytes i :i64] :i64
+  ;; the byte count of the sequence starting at i, or -1 when malformed
+  (let [n (bytes-count b)
+        c (bytes-at b i)]
+    (cond
+      (< c 128) 1
+      (< c 192) -1
+      (< c 224) (if (and (< (+ i 1) n) (= (imod (bytes-at b (+ i 1)) 64) 32))
+                  (if (>= c 194) 2 -1) -1)
+      (< c 240) (let [c2 (if (< (+ i 1) n) (bytes-at b (+ i 1)) -1)
+                      c3 (if (< (+ i 2) n) (bytes-at b (+ i 2)) -1)]
+                  (if (and (= (imod c2 64) 32) (= (imod c3 64) 32))
+                    (let [p (+ (* (- c 224) 4096) (* (imod c2 64) 64) (imod c3 64))]
+                      (if (and (>= p 2048) (not (and (>= p 55296) (<= p 57343)))) 3 -1))
+                    -1))
+      (< c 245) (let [c2 (if (< (+ i 1) n) (bytes-at b (+ i 1)) -1)
+                      c3 (if (< (+ i 2) n) (bytes-at b (+ i 2)) -1)
+                      c4 (if (< (+ i 3) n) (bytes-at b (+ i 3)) -1)]
+                  (if (and (= (imod c2 64) 32) (= (imod c3 64) 32) (= (imod c4 64) 32))
+                    (let [p (+ (* (- c 240) 262144) (* (imod c2 64) 4096) (* (imod c3 64) 64) (imod c4 64))]
+                      (if (and (>= p 65536) (<= p 1114111)) 4 -1))
+                    -1))
+      :else -1)))
+
+(defn utf8-valid [b :bytes] :bool
+  (let [n (bytes-count b)]
+    (loop [i 0]
+      (if (>= i n) true
+        (let [w (utf8-step b i)]
+          (if (< w 0) false (recur (+ i w))))))))
+
+;; Lossy decoding: every malformed sequence becomes U+FFFD (one per maximal
+;; subpart), the rest decodes canonically. Built as text, then re-read.
+(defn utf8-text-lossy [b :bytes] :string
+  (let [n (bytes-count b)]
+    (loop [i 0 acc ""]
+      (if (>= i n) acc
+        (let [w (utf8-step b i)]
+          (if (< w 0)
+            (recur (+ i 1) (string-concat acc "\uFFFD"))
+            (recur (+ i w) (string-concat acc (string-from-utf8 (bytes-slice b i w))))))))))
+
+;; ---- hex ---------------------------------------------------------------------------
+
+(defn- hex-digit [v :i64] :string
+  (if (< v 10) (string-from-i64 (+ 48 v)) (string-from-i64 (+ 87 v))))
+
+(defn hex [b :bytes] :string
+  (let [n (bytes-count b)]
+    (loop [i 0 acc ""]
+      (if (>= i n) acc
+        (let [c (bytes-at b i)]
+          (recur (+ i 1) (string-concat acc (string-concat (hex-digit (quot c 16)) (hex-digit (imod c 16))))))))))
+
+(defn- hex-val [c :i64] :i64
+  (cond
+    (and (>= c 48) (<= c 57)) (- c 48)
+    (and (>= c 97) (<= c 102)) (- c 87)
+    (and (>= c 65) (<= c 70)) (- c 55)
+    :else -1))
+
+(defn unhex [s :string] :bytes
+  (let [n (string-byte-length s)]
+    (loop [i 0 acc (vector-i64)]
+      (if (>= i n) (bytes-from-vector-i64 acc)
+        (let [hi (hex-val (string-code-point-at s i))
+              lo (if (< (+ i 1) n) (hex-val (string-code-point-at s (+ i 1))) -1)]
+          (if (or (< hi 0) (< lo 0)) (bytes-empty)
+            (recur (+ i 2) (vector-conj acc (+ (* hi 16) lo)))))))))
+
+;; ---- base64 ------------------------------------------------------------------------
+
+(defn- b64-digit [v :i64] :string
+  (cond
+    (< v 26) (string-from-i64 (+ 65 v))
+    (< v 52) (string-from-i64 (+ 97 (- v 26)))
+    (< v 62) (string-from-i64 (+ 48 (- v 52)))
+    (= v 62) "+"
+    :else "/"))
+
+(defn base64-encode [b :bytes] :string
+  (let [n (bytes-count b)]
+    (loop [i 0 acc ""]
+      (if (>= i n) acc
+        (let [c0 (bytes-at b i)
+              c1 (if (< (+ i 1) n) (bytes-at b (+ i 1)) -1)
+              c2 (if (< (+ i 2) n) (bytes-at b (+ i 2)) -1)
+              w (+ (* 65536 c0) (* 256 (if (< c1 0) 0 c1)) (if (< c2 0) 0 c2))
+              s (string-concat (b64-digit (quot w 262144))
+                  (string-concat (b64-digit (imod (quot w 4096) 64))
+                    (string-concat (if (< c1 0) "=" (b64-digit (imod (quot w 64) 64)))
+                      (if (< c2 0) "=" (b64-digit (imod w 64))))))]
+          (recur (+ i 3) (string-concat acc s)))))))
+
+(defn- b64-val [c :i64] :i64
+  (cond
+    (and (>= c 65) (<= c 90)) (- c 65)
+    (and (>= c 97) (<= c 122)) (- c 71)
+    (and (>= c 48) (<= c 57)) (+ c 4)
+    (= c 43) 62
+    (= c 47) 63
+    :else -1))
+
+(defn base64-decode [s :string] :bytes
+  (let [n (string-byte-length s)]
+    (loop [i 0 acc (vector-i64)]
+      (if (>= i n) (bytes-from-vector-i64 acc)
+        (let [d0 (if (< i n) (b64-val (string-code-point-at s i)) -1)
+              d1 (if (< (+ i 1) n) (b64-val (string-code-point-at s (+ i 1))) -1)
+              d2c (if (< (+ i 2) n) (string-code-point-at s (+ i 2)) 61)
+              d3c (if (< (+ i 3) n) (string-code-point-at s (+ i 3)) 61)
+              d2 (if (= d2c 61) -2 (b64-val d2c))
+              d3 (if (= d3c 61) -2 (b64-val d3c))]
+          (if (or (< d0 0) (< d1 0)) (bytes-empty)
+            (let [w (+ (* 262144 d0) (* 4096 d1)
+                       (* 64 (if (< d2 0) 0 d2))
+                       (if (< d3 0) 0 d3))
+                  acc2 (vector-conj acc (quot w 65536))
+                  acc3 (if (< d2 0) acc2 (vector-conj acc2 (imod (quot w 256) 256)))
+                  acc4 (if (< d3 0) acc3 (vector-conj acc3 (imod w 256)))]
+              (recur (+ i 4) acc4))))))))
