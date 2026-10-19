@@ -1,0 +1,241 @@
+(ns kotoba.artifact.core
+  {:kotoba/export [canonical-bytes edn-safe seal sha256 valid-seal?]}
+  )
+
+;; ---------------------------------------------------------------------------
+;; THE KOTOBA READING (superproject adr-2609242330, 2026-09-26).
+;;
+;; `#?(:kotoba A :default B)`: the Kotoba reader takes A; the JVM and
+;; ClojureScript readers ignore :kotoba and take B, so every host body below
+;; is byte-for-byte what it was.
+;;
+;; The host functions take ANY Clojure value -- the compiler hashes receipts,
+;; KIR programs and policies with them. The Kotoba value type that carries
+;; arbitrary nested EDN is `:document`, so every parameter here is a
+;; `:document`. Before this reading existed the Kotoba frontend typed the host
+;; body's parameter from its first use (`(into (empty x) (map (fn [[k v]] ..)) x)`)
+;; as `:vector-i64` and refused the entry destructuring -- a module with no
+;; Kotoba reading, not a language limit.
+;;
+;; The digest is the SAME digest the hosts compute: SHA-256 (the hash/sha256
+;; ability) of the UTF-8 of `pr-str` of `canonical`. `canonical-text` restates
+;; that text over a document: a map's entries sorted by their key's text and
+;; printed `{k v, k v}`, a set as a vector sorted by its items' text, a list as
+;; a vector, a vector item-wise, scalars as `pr-str` prints them, and a map
+;; whose keys all share one namespace as `#:ns{..}` (see `shared-ns`). It does NOT
+;; use `document-sha256` / `document-edn-print` of the whole value: those are
+;; the document profile's own identity and text (`{k v k v}`, a set as `#{..}`),
+;; a different digest from the one the hosts have been sealing with.
+;;
+;; WHERE THE TEXT CAN DIFFER FROM THE HOST's, named rather than approximated:
+;;   * a string holding a control character other than \b \t \n \f \r: the
+;;     host's pr-str writes it raw, a document prints it \uXXXX.
+;;   * an f64: a document prints a floating marker (1.0), ClojureScript's
+;;     pr-str prints 1 (the JVM prints 1.0; the two hosts already differ).
+;;   * key order: `string-compare` against ClojureScript's UTF-16 `compare`
+;;     differ only for text holding both a supplementary code point and a
+;;     code point in U+E000..U+FFFF at the same position.
+;;   * two distinct keys whose canonical text is equal -- a vector key and a
+;;     list key with the same items, both printed `[..]`: the host's
+;;     sorted-map-by keeps one entry, this prints both.
+;;   * the first two are what the printers' definitions say; they are not
+;;     exercised by scripts/verify-kotoba-digest.cljk, which checks the rest
+;;     (including `#:ns{..}` maps, below) against the host on nbb.
+
+;; A raw `.kotoba` i64 literal survives as a cljs `bigint` all the way into
+;; KIR bodies (`kotoba.compiler.kotoba-reader`'s own docstring: parsed as
+;; bigint specifically so a boundary literal like -9223372036854775808
+;; round-trips exactly). `pr-str` on a bare `bigint` in THIS nbb/SCI
+;; runtime renders `#object[BigInt 120]` -- neither valid EDN nor
+;; byte-identical to the JVM path's plain `120` for the SAME KIR, which
+;; would make every `sha256`/`canonical-bytes` call below produce a
+;; DIFFERENT digest for byte-identical values depending only on which
+;; runtime compiled them (confirmed live: kir-sha256 differed between the
+;; JVM and nbb-native compiles of the identical `examples/fuel.kotoba`
+;; source before this fix). `extend-protocol IPrintWithWriter` -- the
+;; normal way to teach `pr-str` a new type -- does not resolve under nbb's
+;; SCI interpreter (see `kotoba.compiler.kotoba-reader`'s own namespace
+;; docstring for why that reader exists at all: the SAME protocol-dispatch
+;; gap). Printing a `(symbol "120")` instead is a reader-transparent
+;; workaround, not a hack: `pr-str` of ANY symbol renders its bare name
+;; with no quoting, and re-reading that exact same digit text back through
+;; a standard EDN/Clojure reader parses it as a NUMBER token again (token
+;; classification is purely lexical, not tied to what originally produced
+;; the characters) -- so the printed bytes, and everything hashed from
+;; them, are identical to what a plain integer would have produced, with
+;; no precision loss for values outside `js/Number`'s safe range (unlike
+;; converting through `js/Number` first would cause).
+;; The write-time counterpart to `canonical` below, MINUS the
+;; sorting/normalization: preserves the value's own map-key/collection
+;; order (unlike `canonical`, which is deliberately order-independent for
+;; hashing) so a `pr-str`'d artifact/provenance map keeps the exact same
+;; shape a plain `pr-str` on the JVM path would produce, differing only in
+;; the one substitution that's actually needed. Exported (not `defn-`) so
+;; write-time callers (`kotoba.compiler.nbb.cli`'s `compile` command) can
+;; apply it to a whole result map before `pr-str`, same reason `canonical`
+;; itself needs it before hashing.
+(defn- item-at [v :document i :i64] :document
+     (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+
+(defn- list-item-at [l :document i :i64] :document
+     (option-value-of [:option :document] (document-list-at l i) (document-null)))
+
+(defn- entry-at [m :document i :i64] :document
+     (option-value-of [:option :document] (document-map-entry-at m i) (document-null)))
+
+(defn- string-of [d :document] :string
+     (option-value-of [:option :string] (document-string-value d) ""))
+
+;; A set's members as a vector, through its EDN text: `#{a b}` -> `[a b]`
+;; (the admitted document operations read a set only by membership; the same
+;; print/read pair lang/compat clojure.walk uses).
+(defn- set-items [s :document] :document
+     (let [t (document-edn-print s)]
+       (document-edn-read (string-concat "[" (string-concat (string-substring t 2 (- (string-length t) 1)) "]")))))
+
+;; The text item `i` of `v` sorts by: `v` is a vector of texts, or (`pair?`)
+;; of [sort-text key-text value-text] map entries.
+(defn- text-at [v :document i :i64 pair? :bool] :string
+     (if pair?
+       (string-of (item-at (item-at v i) 0))
+       (string-of (item-at v i))))
+
+(defn- min-index [v :document pair? :bool] :i64
+     (loop [i 1 best 0]
+       (if (< i (document-count v))
+         (recur (+ i 1) (if (< (string-compare (text-at v i pair?) (text-at v best pair?)) 0) i best))
+         best)))
+
+;; Selection sort by text, stable (the first of equal texts is taken first),
+;; as `sort-by pr-str` and `sorted-map-by compare-on-pr-str` order them.
+(defn- sort-by-text [v :document pair? :bool] :document
+     (loop [rest-v v acc (document-vector)]
+       (if (< 0 (document-count rest-v))
+         (let [m (min-index rest-v pair?)]
+           (recur (document-vector-remove rest-v m) (document-vector-conj acc (item-at rest-v m))))
+         acc)))
+
+;; `sep`-joined texts of a vector of texts (`pair?`: "key-text value-text").
+(defn- join-texts [v :document sep :string pair? :bool] :string
+     (loop [i 0 acc ""]
+       (if (< i (document-count v))
+         (let [t (if pair?
+                   (string-concat (string-of (item-at (item-at v i) 1))
+                                  (string-concat " " (string-of (item-at (item-at v i) 2))))
+                   (text-at v i false))]
+           (recur (+ i 1) (if (= i 0) t (string-concat acc (string-concat sep t)))))
+         acc)))
+
+(defn- scalar-text [d :document] :string
+     (let [kind (document-kind d)]
+       (if (= :null kind)
+         "nil"
+         (if (= :i64 kind)
+           (string-from-i64 (option-value-of [:option :i64] (document-i64-value d) 0))
+           (document-edn-print d)))))
+
+;; The recursive group: canonical-text and the three container texts.
+(defn- items-text [d :document kind :keyword] :string
+     (loop [i 0 acc (document-vector)]
+       (if (< i (document-count d))
+         (recur (+ i 1) (document-vector-conj acc (document-string
+                                                   (canonical-text (if (= :list kind) (list-item-at d i) (item-at d i))))))
+         (string-concat "[" (string-concat (join-texts (if (= :set kind) (sort-by-text acc false) acc) " " false) "]")))))
+
+;; A keyword or symbol key's namespace, from its printed text: `:a/b` and
+;; `a/b` -> "a"; "" for any other key or a key with no namespace.
+(defn- key-ns [kind :keyword text :string] :string
+     (let [start (if (= :keyword kind) 1 0)
+           slash (string-index-of text "/")]
+       (if (and (or (= :keyword kind) (= :symbol kind)) (< start slash))
+         (string-substring text start slash)
+         "")))
+
+;; The key's text with its namespace taken off (`:a/b` -> `:b`, `a/b` -> `b`).
+(defn- key-strip [kind :keyword text :string] :string
+     (let [rest-text (string-substring text (+ (string-index-of text "/") 1) (string-length text))]
+       (if (= :keyword kind) (string-concat ":" rest-text) rest-text)))
+
+;; The namespace every key shares, or "" when they do not all share one.
+;; ClojureScript's printer (nbb prints with *print-namespace-maps* true, the
+;; runtime the compiler's digests are taken on) then writes `#:ns{..}` with
+;; the keys stripped -- `lift-ns` in cljs.core -- in the order of the
+;; UNSTRIPPED keys (measured: `{:a/b 1 a/*x* 2}` prints `#:a{:b 1, *x* 2}`).
+;; The JVM prints `{:ns/k ..}`: the two hosts differ on such a map, and this
+;; follows nbb.
+(defn- shared-ns [d :document] :string
+     (loop [i 0 ns ""]
+       (if (< i (document-count d))
+         (let [k (item-at (entry-at d i) 0)
+               kind (document-kind k)
+               this (key-ns kind (if (or (= :keyword kind) (= :symbol kind)) (document-edn-print k) ""))]
+           (if (= 0 (string-length this))
+             ""
+             (if (or (= i 0) (= 0 (string-compare ns this)))
+               (recur (+ i 1) this)
+               "")))
+         ns)))
+(defn- map-text [d :document] :string
+     (let [ns (shared-ns d)
+           lift? (< 0 (string-length ns))]
+       (loop [i 0 acc (document-vector)]
+         (if (< i (document-count d))
+           (let [e (entry-at d i)
+                 k (item-at e 0)
+                 kt (canonical-text k)]
+             (recur (+ i 1) (document-vector-conj acc (document-vector (document-string kt)
+                                                                       (document-string (if lift? (key-strip (document-kind k) kt) kt))
+                                                                       (document-string (canonical-text (item-at e 1)))))))
+           (string-concat (if lift? (string-concat "#:" ns) "")
+                          (string-concat "{" (string-concat (join-texts (sort-by-text acc true) ", " true) "}")))))))
+
+(defn edn-safe [x :document] :document x)
+
+(defn- canonical-text
+     "`(pr-str (canonical x))` of the host reading, over a document."
+     [d :document] :string
+     (let [kind (document-kind d)]
+       (if (= :map kind)
+         (map-text d)
+         (if (= :set kind)
+           (items-text (set-items d) :set)
+           (if (= :vector kind)
+             (items-text d :vector)
+             (if (= :list kind)
+               (items-text d :list)
+               (scalar-text d)))))))
+
+(defn sha256 [value :document] :string
+     (hash/sha256 (canonical-text value)))
+
+(defn canonical-bytes [value :document] :bytes
+     (string-to-utf8 (canonical-text value)))
+
+(defn seal [artifact :document] :document
+     (let [payload (document-dissoc artifact :sha256)]
+       (document-assoc payload :sha256 (document-string (sha256 payload)))))
+
+;; Constant-time hex-digest comparison -- `MessageDigest/isEqual` on the
+;; JVM, `node:crypto`'s `timingSafeEqual` on Node (both fixed-length
+;; 64-char sha256 hex, so the length precondition `timingSafeEqual`
+;; requires always holds for two genuine digests; a length mismatch means
+;; `(:sha256 artifact)` was never a real digest to begin with, so failing
+;; that check the same way a mismatch would is the correct outcome, not a
+;; bypass).
+(defn- digest-equal?
+     "Constant-time equality of two digest texts over their UTF-8 bytes: every
+     byte is read whatever the first difference, as timingSafeEqual does."
+     [a :string b :string] :bool
+     (let [x (string-to-utf8 a) y (string-to-utf8 b)]
+       (if (= (bytes-count x) (bytes-count y))
+         (loop [i 0 diff 0]
+           (if (< i (bytes-count x))
+             (recur (+ i 1) (bit-or diff (bit-xor (bytes-at x i) (bytes-at y i))))
+             (= diff 0)))
+         false)))
+
+(defn valid-seal? [artifact :document] :bool
+     (let [claimed (option-value-of [:option :document] (document-get artifact :sha256) (document-null))]
+       (if (= :string (document-kind claimed))
+         (digest-equal? (string-of claimed) (sha256 (document-dissoc artifact :sha256)))
+         false)))
