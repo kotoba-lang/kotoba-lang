@@ -308,17 +308,23 @@ topological sort over the require graph, restricted to the host-bound nodes.
 `scripts/measure-host-port-order.cljk` computes it; `lang/host-port-order.edn`
 is the result.
 
-*(Not regenerable as of 2026-10-19.)* The script matches source files with
-`\.clj[cs]?$`, which the 2026-09-11 `.cljk` rename (ADR-2609111500) left
-matching nothing: `kotoba-verifier/src` holds 4 `.cljk` files and amu `src`
-holds 96, none of them `.clj`/`.cljc`/`.cljs`. A re-run today answers
-`reachable: 3, blockers: 0, waves: 0` with `:escapes {}` — an empty sweep, not
-a clean bill of health. The waves below are therefore a pre-rename snapshot.
-Regenerating takes two decisions, not one patch: a matcher that reads
-`.cljk`, and a replacement for the `:clj-only` predicate, whose definition
-("a `.clj` file with no `.cljc`/`.cljs` twin") was built on the extensions the
-rename removed — `cljk-origin.edn` records the pre-rename extension if that
-is what the predicate should consult.
+*(Was not regenerable; matcher and predicate repaired 2026-10-19.)* The
+script matched source files with `\.clj[cs]?$`, which the 2026-09-11 `.cljk`
+rename (ADR-2609111500) left matching nothing: `kotoba-verifier/src` holds 4
+`.cljk` files and amu `src` holds 96, none of them `.clj`/`.cljc`/`.cljs`, so
+a re-run answered `reachable: 3, blockers: 0, waves: 0` with `:escapes {}` —
+an empty sweep, not a clean bill of health. It now reads `.cljk`, fails
+closed (`REFUSED: ... an empty graph is not a measurement`) when nothing
+matches, and defines `:clj-only` by what survives the rename: no `.cljs` twin
+and no `:cljs` branch in any `#?(...)`/`#?@(...)` form (deliberately loose,
+like the script's `requires`). On the two-tree scope (kotoba-verifier/src +
+amu/src at `c4064497`) that re-run reads: reachable 101, JVM-removal
+blockers 17 in 4 waves, Kotoba-only 48 in 9 waves — and
+`kotoba.verifier.signing` drops out of the JVM blockers
+(`[:java-interop :js-interop :node-require]`, no `:clj-only`), which is the
+fact the wave tables below predate. The waves below are still the pre-rename
+snapshot; regenerating them over the full classpath (gitlibs pins included)
+is the remaining step.
 
 **Two hosts leave, not one.** `node:crypto` is not a smaller problem than
 `java.security` — it is the same problem with a different owner, and
