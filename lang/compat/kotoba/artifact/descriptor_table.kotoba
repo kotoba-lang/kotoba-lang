@@ -1,0 +1,171 @@
+(ns kotoba.artifact.descriptor-table
+  "The typed-value descriptor table an artifact carries, so a native loader can
+  be handed a DESCRIPTOR instead of a bare integer kind.
+
+  Why this exists. `tools/kexe_loader.c` validates a typed capability value
+  against `enum kexe_typed_kind_v1` -- an integer with exactly three inhabitants
+  (string, option-i64, result-i64) plus the raw i64 path. `kotoba.kir`
+  independently admits exactly the matching four pairs. That is why every
+  capability kit is still `:native-aot :pending`: `clock-v1`'s request is
+  `[:variant :kotoba.clock/request [[:wall :bool] [:monotonic :bool]]]` and its
+  result is a variant of records, and neither has an integer to be. An integer
+  cannot name a field, so nothing downstream of it can either.
+
+  What this namespace adds is the CARRIER. For the wasm target that role is
+  played by the `kotoba.typed` custom section: the emitter writes a descriptor
+  table into the module and the reader indexes into it. A native artifact has no
+  custom section, so the sealed artifact map is the section -- same job, same
+  descriptor bytes, different envelope.
+
+  ONE encoding, not two. Every descriptor byte here comes from
+  `kotoba.kir.descriptor/encode-descriptor`, the same function the wasm custom
+  section calls, which is why that function was moved to T0 in the first place
+  (ADR-2608049000). This namespace contributes no encoding of its own: it frames
+  a count, the shared descriptor bytes, and a contract region. A second
+  descriptor encoding is the specific thing being avoided, because a producer and
+  a checker that only ever agree with each other can agree on the same mistake.
+
+  Framing IS local, and deliberately so. The wasm section additionally carries a
+  literal table and a schema region that a native loader has no use for, and it
+  leads with an ABI version byte selected from the module's content. The rule
+  being kept is that there is one encoding of a DESCRIPTOR, not that every
+  carrier has the same shape. The two carriers agree where it matters: the
+  descriptor table is built by the shared `descriptor-table`, so index N denotes
+  the same type in a wasm custom section and in a native artifact compiled from
+  the same KIR.
+
+  Two readers make bytes a wire contract. While these bytes had exactly one
+  reader they were pinned only indirectly, through whatever the wasm emitter
+  happened to accept. A native loader is the second reader, so `:bytes-sha256`
+  pins the encoding the producer actually used. `validate!` re-encodes and
+  compares: a hand-edited artifact fails, and so does a verifier whose
+  `encode-descriptor` has drifted from the producer's. That is the same drift
+  detector `kotoba.artifact.runtime-identity` applies to the loader source, for
+  the same reason.
+
+  Scope. This namespace defines and validates what is carried. Emitting it from
+  the compiler, and walking a value against it in the loader (new decision-free
+  C), are separate landings. Nothing here qualifies any capability kit: every
+  kit remains `:native-aot :pending` until a value of its shape actually crosses
+  a real boundary."
+  {:kotoba/export [artifact-key attach carried contract descriptor-at format-tag section-bytes table validate! wire-version]}
+  (:require [kotoba.artifact.core :as artifact]
+            [kotoba.kir.descriptor :as descriptor]))
+
+(def format-tag :kotoba.descriptor-table/v1)
+
+;; Leading byte of the wire framing. The descriptor bytes that follow are
+;; versioned by `kotoba.kir.descriptor`; this versions the frame around them,
+;; so a loader that is handed a table it does not understand can refuse rather
+;; than misread a count as a tag.
+(def wire-version 1)
+
+(def artifact-key :descriptor-table)
+
+(def ^:private section-keys #{:format :descriptors :contracts :bytes-sha256})
+
+(def ^:private contract-keys #{:capability :request-index :result-index})
+
+(defn section-bytes
+  "Canonical wire bytes for a section.
+
+    [wire-version]
+    uleb(descriptor-count) descriptor*
+    uleb(contract-count)   (uleb capability, uleb request-index, uleb result-index)*
+
+  Descriptors are carried by value and contracts refer to them by index -- one
+  representation of each type, never two that can disagree. `descriptor*` is
+  `kotoba.kir.descriptor/encode-descriptor` verbatim."
+  [section]
+  (let [{:keys [descriptors contracts]} section]
+    (vec (concat [wire-version]
+                 (descriptor/uleb (count descriptors))
+                 (mapcat descriptor/encode-descriptor descriptors)
+                 (descriptor/uleb (count contracts))
+                 (mapcat (fn [{:keys [capability request-index result-index]}]
+                           (concat (descriptor/uleb capability)
+                                   (descriptor/uleb request-index)
+                                   (descriptor/uleb result-index)))
+                         contracts)))))
+
+(defn- contract-entries [kir]
+  (let [indices (descriptor/descriptor-indices kir)]
+    (mapv (fn [{:keys [id request-type result-type]}]
+            {:capability id
+             :request-index (get indices request-type)
+             :result-index (get indices result-type)})
+          (descriptor/capability-contracts kir))))
+
+(defn table
+  "Builds the section carried by an artifact compiled from `kir`.
+
+  The descriptor vector is `kotoba.kir.descriptor/descriptor-table` unchanged --
+  same members, same canonical order, therefore same indices as the wasm custom
+  section built from the same KIR. Deriving a different, contract-only table
+  here would have been smaller and would have made index N mean two things."
+  [kir]
+  (let [section {:format format-tag
+                 :descriptors (descriptor/descriptor-table kir)
+                 :contracts (contract-entries kir)}]
+    (assoc section :bytes-sha256 (artifact/sha256 (section-bytes section)))))
+
+(defn- canonical-order? [descriptors]
+  (= (vec descriptors) (vec (sort-by pr-str descriptors))))
+
+(defn- contract-entry? [count* entry]
+  (and (map? entry)
+       (= contract-keys (set (keys entry)))
+       (nat-int? (:capability entry))
+       (nat-int? (:request-index entry))
+       (nat-int? (:result-index entry))
+       (< (:request-index entry) count*)
+       (< (:result-index entry) count*)))
+
+(defn validate!
+  "Rejects a section that is not internally consistent.
+
+  `:bytes-sha256` is compared with `=` rather than a constant-time compare: it
+  detects drift, it does not authenticate. Authentication of the whole artifact
+  is `kotoba.artifact.core/valid-seal?`, which does compare in constant time and
+  which covers this section because the section is inside the sealed map."
+  [section]
+  (let [{:keys [descriptors contracts bytes-sha256]} section
+        count* (count descriptors)]
+    (when-not (and (map? section)
+                   (= section-keys (set (keys section)))
+                   (= format-tag (:format section))
+                   (vector? descriptors)
+                   (every? descriptor/descriptor? descriptors)
+                   (= count* (count (distinct descriptors)))
+                   (canonical-order? descriptors)
+                   (vector? contracts)
+                   (every? (partial contract-entry? count*) contracts)
+                   (= (count contracts) (count (distinct (map :capability contracts))))
+                   (= (mapv :capability contracts) (vec (sort (map :capability contracts))))
+                   (string? bytes-sha256)
+                   ;; Re-encode. Catches an edited artifact and an encoder that
+                   ;; has drifted from the one the producer ran.
+                   (= bytes-sha256 (artifact/sha256 (section-bytes section))))
+      (throw (ex-info "descriptor table rejected" {:phase :descriptor-table})))
+    section))
+
+(defn descriptor-at [section index]
+  (nth (:descriptors section) index))
+
+(defn contract
+  "Resolves one capability's contract to descriptors. This is what replaces the
+  loader's integer `request_kind`/`result_kind` arguments."
+  [section capability-id]
+  (when-let [entry (some #(when (= capability-id (:capability %)) %) (:contracts section))]
+    {:capability capability-id
+     :request (descriptor-at section (:request-index entry))
+     :result (descriptor-at section (:result-index entry))}))
+
+(defn attach
+  "Carries the table in `artifact` and reseals, so the descriptors are inside
+  the digest rather than beside it."
+  [artifact kir]
+  (artifact/seal (assoc artifact artifact-key (table kir))))
+
+(defn carried [artifact]
+  (get artifact artifact-key))
