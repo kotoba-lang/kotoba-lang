@@ -1,0 +1,263 @@
+(ns json.core
+  "Pure JSON encode/decode plus a pretty emitter used by kotoba DSLs."
+  {:kotoba/export [decode encode json]}
+  (:refer-clojure :exclude [read])
+  (:require [kotoba.lang.text :as str]))
+
+(def ^:private hex-digits "0123456789abcdef")
+
+(defn- hex4
+  "4-digit hex for a JSON `\\uXXXX` escape (portable: bit ops + a lookup
+  table, no Long/Integer interop that would only work on :clj)."
+  [n]
+  (apply str (for [shift [12 8 4 0]] (nth hex-digits (bit-and (bit-shift-right n shift) 0xf)))))
+
+(defn- char-code [ch]
+  )
+
+(defn- esc [s]
+  (apply str
+         (map (fn [ch]
+                (case ch
+                  \" "\\\""
+                  \\ "\\\\"
+                  \backspace "\\b"
+                  \formfeed "\\f"
+                  \newline "\\n"
+                  \return "\\r"
+                  \tab "\\t"
+                  ;; RFC 8259 §7: EVERY control character U+0000-U+001F must
+                  ;; be escaped, not just the 7 named above -- the fallback
+                  ;; case used to pass the rest through raw, producing a
+                  ;; JSON string literal with a literal control byte
+                  ;; embedded in it (invalid per both python's json and jq).
+                  (if (< (char-code ch) 0x20)
+                    (str "\\u" (hex4 (char-code ch)))
+                    (str ch))))
+              (str s))))
+
+(defn- kstr [k] (if (keyword? k) (name k) (str k)))
+
+(defn- numstr [n]
+  )
+
+(declare emit)
+(defn- emit [x ind pretty?]
+  (let [pad  (apply str (repeat ind "  "))
+        pad+ (str pad "  ")
+        sep  (if pretty? ",\n" ",")
+        kv   (if pretty? ": " ":")]
+    (cond
+      (nil? x)                      "null"
+      (boolean? x)                  (str x)
+      ;; `numstr` in BOTH branches. It used to be `(if pretty? (str x) ...)`,
+      ;; which made the same value serialize two ways: `{"scale":32}` compact
+      ;; and `{"scale": 32.0}` pretty. Pretty and compact must differ in
+      ;; whitespace and in nothing else -- a caller that digests compact JSON
+      ;; and reads it back pretty was comparing two encodings of one value.
+      ;;
+      ;; `numstr` is the one that survives, not `str`, because writing a
+      ;; whole-valued float without its fraction is DELIBERATE and shared with
+      ;; the `:cljs` branch, where `Math.trunc` does the same: JavaScript has
+      ;; one number type, so `32.0` and `32` are the same value there and a
+      ;; host-dependent encoding would break every digest taken across the two.
+      ;;
+      ;; ⚠ THE CONSEQUENCE IS REAL AND IS NOT A BUG HERE: a Clojure Double does
+      ;; not survive a JSON round trip, because `32.0` is written `32` and read
+      ;; back a Long. JSON has one number type; a caller whose TYPES matter
+      ;; must carry them itself rather than ask this namespace to. Found
+      ;; 2026-09-09 by `torch`'s checkpoint suite, whose GradScaler came back
+      ;; with `:scale 32` where it saved `32.0`.
+      (number? x)                   (numstr x)
+      (or (string? x) (keyword? x)) (str \" (esc (kstr x)) \")
+      (map? x) (if (empty? x) "{}"
+                 (let [entries (if pretty? x (sort-by (comp kstr key) x))]
+                   (str "{"
+                        (when pretty? "\n")
+                        (str/join sep
+                                  (for [[k v] entries]
+                                    (str (when pretty? pad+)
+                                         \" (esc (kstr k)) \" kv
+                                         (emit v (inc ind) pretty?))))
+                        (when pretty? (str "\n" pad))
+                        "}")))
+      (sequential? x) (if (empty? x) "[]"
+                        (str "["
+                             (when pretty? "\n")
+                             (str/join sep
+                                       (for [v x]
+                                         (str (when pretty? pad+)
+                                              (emit v (inc ind) pretty?))))
+                             (when pretty? (str "\n" pad))
+                             "]"))
+      :else (str \" (esc (str x)) \"))))
+
+(defn json
+  "Serialize EDN to a 2-space pretty JSON string. Keyword keys/values become strings."
+  [x]
+  (emit x 0 true))
+
+(defn encode
+  "Serialize EDN to compact JSON with deterministic map key order."
+  [x]
+  (emit x 0 false))
+
+(defn- hex-val
+  "One hex digit's value.
+
+  The bounds are numeric literals rather than `(int \\0)` and friends,
+  because that spelling was wrong on ClojureScript in a way that decoded
+  rather than threw: every `\\uXXXX` escape containing a-f or A-F silently
+  became a different character. `\\u65e5` decoded as U+6505 instead of
+  U+65E5 -- 攅 where 日 was written."
+  [ch]
+  (let [i (char-code ch)]
+    (cond
+      (<= 48 i 57) (- i 48)                ; 0-9
+      (<= 97 i 102) (+ 10 (- i 97))        ; a-f
+      (<= 65 i 70) (+ 10 (- i 65))         ; A-F
+      :else (throw (ex-info "invalid JSON unicode escape" {:char ch})))))
+
+(defn- codepoint [s i]
+  (reduce (fn [n ch] (+ (* n 16) (hex-val ch))) 0 (subs s i (+ i 4))))
+
+(defn- ws? [ch] (contains? #{\space \tab \newline \return} ch))
+(defn- skip-ws [s i]
+  (let [n (count s)]
+    (loop [i i]
+      (if (and (< i n) (ws? (nth s i)))
+        (recur (inc i))
+        i))))
+
+(declare read-value)
+
+(defn- read-string* [s i]
+  (loop [i (inc i) out []]
+    (let [ch (nth s i nil)]
+      (cond
+        (nil? ch) (throw (ex-info "unterminated JSON string" {:pos i}))
+        (= ch \") [(apply str out) (inc i)]
+        (= ch \\) (let [e (nth s (inc i) nil)]
+                    (case e
+                      \" (recur (+ i 2) (conj out \"))
+                      \\ (recur (+ i 2) (conj out \\))
+                      \/ (recur (+ i 2) (conj out \/))
+                      \b (recur (+ i 2) (conj out \backspace))
+                      \f (recur (+ i 2) (conj out \formfeed))
+                      \n (recur (+ i 2) (conj out \newline))
+                      \r (recur (+ i 2) (conj out \return))
+                      \t (recur (+ i 2) (conj out \tab))
+                      \u (recur (+ i 6) (conj out (char (codepoint s (+ i 2)))))
+                      (throw (ex-info "invalid JSON escape" {:pos i :escape e}))))
+        :else (recur (inc i) (conj out ch))))))
+
+;; RFC 8259 §6 number grammar, exactly: optional '-', an integer part (0, or
+;; 1-9 followed by more digits -- no leading zeros), an optional '.' + digits
+;; fraction, an optional e/E [+-] digits exponent.
+;; Spelled as a scan over one-character substrings rather than a host regex
+;; literal (a `#"..."` is host data and is refused on the Kotoba project
+;; route); the accepted language is the regex it replaced,
+;; -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?, matched against the whole
+;; token.
+(defn- char-at= [s i c]
+  (and (<= 0 i) (< i (count s)) (= c (subs s i (inc i)))))
+
+(defn- digit-at? [s i]
+  (and (<= 0 i) (< i (count s)) (str/includes? "0123456789" (subs s i (inc i)))))
+
+(defn- skip-digits [s i]
+  (loop [j i] (if (digit-at? s j) (recur (inc j)) j)))
+
+(defn- json-number? [s]
+  (let [i (if (char-at= s 0 "-") 1 0)
+        i (cond (char-at= s i "0") (inc i)
+                (digit-at? s i) (skip-digits s i)
+                :else -1)
+        i (if (char-at= s i ".")
+            (if (digit-at? s (inc i)) (skip-digits s (inc i)) -1)
+            i)
+        i (if (or (char-at= s i "e") (char-at= s i "E"))
+            (let [j (if (or (char-at= s (inc i) "+") (char-at= s (inc i) "-")) (+ i 2) (inc i))]
+              (if (digit-at? s j) (skip-digits s j) -1))
+            i)]
+    (= i (count s))))
+
+(defn- read-number [s i]
+  (let [n (count s)
+        end (loop [j i]
+              (if (and (< j n) (contains? #{\0 \1 \2 \3 \4 \5 \6 \7 \8 \9 \e \E \+ \- \.} (nth s j)))
+                (recur (inc j))
+                j))
+        token (subs s i end)]
+    ;; The scan above just grabs any run of digit/e/E/+/-/. chars -- it does
+    ;; NOT itself validate JSON number syntax, so a malformed token like
+    ;; "1.2.3" or "1e+5e3" reaches the host parser unchecked. JVM's
+    ;; Double/parseDouble and Long/parseLong both throw on those (fail
+    ;; closed) -- but JS's parseFloat/parseInt are lenient: they silently
+    ;; parse just the valid PREFIX and stop (parseFloat("1.2.3") => 1.2,
+    ;; parseInt("12--3", 10) => 12), never throwing -- so the exact same
+    ;; malformed JSON that correctly errors on :clj would silently decode
+    ;; to a truncated, wrong number on :cljs. Validated explicitly here,
+    ;; on BOTH platforms, so behavior doesn't depend on which host parser
+    ;; happens to be stricter.
+    (when-not (json-number? token)
+      (throw (ex-info "invalid JSON number" {:pos i :token token})))
+    [(if (or (str/includes? token ".") (str/includes? token "e") (str/includes? token "E"))
+       
+       )
+     end]))
+
+(defn- read-array [s i]
+  (loop [i (skip-ws s (inc i)) out []]
+    (case (nth s i nil)
+      \] [out (inc i)]
+      (let [[v j] (read-value s i)
+            j (skip-ws s j)
+            ch (nth s j nil)]
+        (case ch
+          \, (recur (skip-ws s (inc j)) (conj out v))
+          \] [(conj out v) (inc j)]
+          (throw (ex-info "expected comma or array end" {:pos j :char ch})))))))
+
+(defn- read-object [s i]
+  (loop [i (skip-ws s (inc i)) out {}]
+    (case (nth s i nil)
+      \} [out (inc i)]
+      (let [[k j] (read-string* s i)
+            j (skip-ws s j)]
+        (when-not (= \: (nth s j nil))
+          (throw (ex-info "expected object colon" {:pos j})))
+        (let [[v j] (read-value s (skip-ws s (inc j)))
+              j (skip-ws s j)
+              ch (nth s j nil)]
+          (case ch
+            \, (recur (skip-ws s (inc j)) (assoc out k v))
+            \} [(assoc out k v) (inc j)]
+            (throw (ex-info "expected comma or object end" {:pos j :char ch}))))))))
+
+(defn- starts? [s i lit] (= lit (subs s i (min (count s) (+ i (count lit))))))
+
+(defn- read-value [s i]
+  (let [i (skip-ws s i)
+        ch (nth s i nil)]
+    (cond
+      (= ch \") (read-string* s i)
+      (= ch \{) (read-object s i)
+      (= ch \[) (read-array s i)
+      (= ch \t) (if (starts? s i "true") [true (+ i 4)] (throw (ex-info "invalid JSON token" {:pos i})))
+      (= ch \f) (if (starts? s i "false") [false (+ i 5)] (throw (ex-info "invalid JSON token" {:pos i})))
+      (= ch \n) (if (starts? s i "null") [nil (+ i 4)] (throw (ex-info "invalid JSON token" {:pos i})))
+      ;; Numeric literals for the same reason as `hex-val`: on ClojureScript
+      ;; `(int \\0)` is 0 but `(int \\a)` is ALSO 0, so the old bound admitted
+      ;; every letter into `read-number`.
+      (or (= ch \-) (and ch (<= 48 (char-code ch) 57))) (read-number s i)
+      :else (throw (ex-info "invalid JSON value" {:pos i :char ch})))))
+
+(defn decode
+  "Parse JSON into Clojure data. Object keys are strings."
+  [s]
+  (let [[v i] (read-value s 0)
+        i (skip-ws s i)]
+    (when-not (= i (count s))
+      (throw (ex-info "trailing JSON input" {:pos i})))
+    v))
