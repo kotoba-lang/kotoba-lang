@@ -1,0 +1,296 @@
+(ns kotoba.phone.numbering
+  "Numbering-plan records and the deterministic pre-check for allocating a
+  number to a subject (番号払い出し).
+
+  A numbering plane has three things a contract layer can hold honestly: the
+  BLOCK an operator was given, the RECORD of what each number in it is doing,
+  and the arithmetic that says whether allocating one is admissible right now.
+  It holds none of the things that need law or judgement -- whether the operator
+  really holds the block, what a regulator requires of an assignment, who the
+  subject is. Those are the governor's.
+
+  ## Time is a number here, on purpose
+
+  The aging window is the only rule in this library that involves time, and it
+  is expressed in EPOCH MILLISECONDS passed in by the caller rather than parsed
+  from a timestamp string. Two reasons, both practical: a portable .cljc library
+  cannot parse ISO-8601 the same way on JVM and JS without a dependency, and a
+  pre-check that reads a clock gives a different answer depending on when it is
+  asked -- which is exactly what a consent surface cannot have between review
+  and approval. The caller converts once, at the edge, and the conversion is
+  visible in their code.
+
+  Portable (.cljc) across JVM / ClojureScript / SCI / GraalVM."
+  (:require [clojure.string :as str]
+            [kotoba.phone :as phone]))
+
+(def kinds
+  "What a block of numbers is FOR. The kind is not decoration: it decides
+  whether a number may be handed to a subject by this path at all."
+  #{:mobile :fixed :toll-free :premium-rate :short-code :machine})
+
+(def allocatable-kinds
+  "The kinds this pre-check will allocate.
+
+  `:premium-rate` and `:short-code` are excluded, and an operator who wants them
+  needs a different path with its own decision. A premium-rate number bills the
+  CALLER and pays the holder, which makes 'allocate me one' a request to be put
+  on the revenue side of a fraud that other people fund. A short code sits next
+  to the emergency and service ranges and is assigned under separate rules.
+  Neither is refused because it is impossible -- both are refused because they
+  are not the same decision as giving somebody a phone number."
+  #{:mobile :fixed :toll-free :machine})
+
+(def default-quarantine-days
+  "How long a released number ages before it may be allocated to somebody new.
+
+  Ninety days is a CHOSEN default, not a quoted regulation, and it is chosen
+  long rather than short: the thing being waited out is the tail of the previous
+  holder's account-recovery traffic -- password resets, one-time codes, bank
+  callbacks -- and that tail is measured in the time it takes a person to notice
+  a service they forgot they had. An operator with a rule of their own passes
+  it; this is what applies when nobody said."
+  90)
+
+(def ^:private ms-per-day (* 24 60 60 1000))
+
+(defn quarantine-ms
+  "The aging window in milliseconds. Accepts nil for the default."
+  ([] (quarantine-ms nil))
+  ([days] (* (long (or days default-quarantine-days)) ms-per-day)))
+
+;; ---------------------------------------------------------------------------
+;; Records
+;; ---------------------------------------------------------------------------
+
+(defn block
+  "Construct a numbering block record.
+
+  `first-msisdn` and `last-msisdn` are inclusive E.164 bounds. Returns nil when
+  the bounds are not E.164, are not the same length, or are inverted -- a block
+  whose ends disagree about how long its numbers are is not a range, and
+  admitting it here would make `in-block?` answer nonsense confidently."
+  [block-id first-msisdn last-msisdn kind & {:keys [operator country-code]}]
+  (let [f (phone/normalize-e164 first-msisdn)
+        l (phone/normalize-e164 last-msisdn)]
+    (when (and f l (contains? kinds kind)
+               (= (count f) (count l))
+               (<= (compare f l) 0))
+      {:phone/block-id     block-id
+       :phone/first        f
+       :phone/last         l
+       :phone/kind         kind
+       :phone/operator     operator
+       :phone/country-code (or country-code
+                               (:phone/country-code (phone/parse-e164 f)))})))
+
+(defn record
+  "Construct a number record -- what this operator knows about one MSISDN.
+
+  `:phone/released-at-ms` is nil until the number is released and is what the
+  aging window is measured from. `:phone/subject` is nil in the pool: a number
+  nobody holds must not name anybody."
+  [msisdn state & {:keys [subject iccid block-id released-at-ms changed-at-ms]}]
+  (when-let [m (phone/normalize-e164 msisdn)]
+    {:phone/msisdn         m
+     :phone/state          state
+     :phone/subject        subject
+     :phone/iccid          iccid
+     :phone/block-id       block-id
+     :phone/released-at-ms released-at-ms
+     :phone/changed-at-ms  changed-at-ms}))
+
+;; ---------------------------------------------------------------------------
+;; Block membership
+;; ---------------------------------------------------------------------------
+
+(defn in-block?
+  "True when msisdn falls inside block's inclusive bounds.
+
+  Compared as fixed-width digit strings rather than as integers: an E.164 number
+  can be 15 digits, which is past the exact-integer range of a JavaScript
+  number, and a comparison that silently loses precision at the top of a block
+  is worse than one that refuses. Equal length is guaranteed by `block`."
+  [{:phone/keys [first last]} msisdn]
+  (boolean
+   (when-let [m (phone/normalize-e164 msisdn)]
+     (and first last
+          (= (count m) (count first))
+          (<= (compare first m) 0)
+          (<= (compare m last) 0)))))
+
+(defn block-of
+  "The first block in blocks that contains msisdn, or nil."
+  [blocks msisdn]
+  (first (filter #(in-block? % msisdn) blocks)))
+
+;; ---------------------------------------------------------------------------
+;; The aging window
+;; ---------------------------------------------------------------------------
+
+(defn quarantine-remaining-ms
+  "How much of the aging window is left for this record, in milliseconds. 0 when
+  it has elapsed.
+
+  A record with NO `:phone/released-at-ms` returns the full window, not zero.
+  That is the fail-closed direction and it is the important one: not knowing
+  when a number was released is not evidence that it was released long ago, and
+  reading a missing timestamp as 'elapsed' would re-issue exactly the numbers
+  whose history was lost."
+  ([record now-ms] (quarantine-remaining-ms record now-ms nil))
+  ([{:phone/keys [released-at-ms]} now-ms days]
+   (let [window (quarantine-ms days)]
+     (if (and (number? released-at-ms) (number? now-ms))
+       (max 0 (- window (- now-ms released-at-ms)))
+       window))))
+
+(defn quarantine-elapsed?
+  "True when this record's aging window has fully elapsed. The fact
+  kotoba.phone.lifecycle/apply-event requires before `:recycle`."
+  ([record now-ms] (quarantine-elapsed? record now-ms nil))
+  ([record now-ms days] (zero? (quarantine-remaining-ms record now-ms days))))
+
+;; ---------------------------------------------------------------------------
+;; Allocation (払い出し)
+;; ---------------------------------------------------------------------------
+
+(defn allocation-issues
+  "Return a seq of reasons this number may not be allocated to this subject
+  right now, empty when it may. Pure and total.
+
+  Every fact is passed in:
+
+    :blocks           the blocks this operator holds
+    :records          what is known about numbers already
+    :msisdn           the number being asked for
+    :subject          who it would be assigned to
+    :now-ms           the instant to judge the aging window against
+    :quarantine-days  the operator's window, or nil for the default
+
+  The order matters for what a human is told: a malformed number is not
+  reported as 'unavailable', and a number aging in quarantine is reported as
+  aging rather than as taken, because those two lead a person to do completely
+  different things."
+  [{:keys [blocks records msisdn subject now-ms quarantine-days
+           allow-kinds]}]
+  (let [m       (phone/normalize-e164 msisdn)
+        blk     (when m (block-of blocks m))
+        allowed (or allow-kinds allocatable-kinds)
+        r       (when m (first (filter #(= m (:phone/msisdn %)) records)))]
+    (cond
+      (nil? m)
+      [{:phone/issue :number/malformed :phone/msisdn msisdn}]
+
+      (nil? blk)
+      [{:phone/issue :number/outside-block :phone/msisdn m}]
+
+      (not (contains? allowed (:phone/kind blk)))
+      [{:phone/issue :number/kind-not-allocatable
+        :phone/kind (:phone/kind blk)
+        :phone/allowed allowed}]
+
+      (or (nil? subject) (and (string? subject) (str/blank? subject)))
+      [{:phone/issue :number/subject-missing}]
+
+      ;; No record at all means the number has never been used: it is in the
+      ;; pool by virtue of being in a block this operator holds.
+      (nil? r) []
+
+      (= :quarantined (:phone/state r))
+      (if (quarantine-elapsed? r now-ms quarantine-days)
+        ;; Aged out, but still recorded as :quarantined -- the operator has not
+        ;; run `:recycle` yet. That is a real refusal (the pool does not contain
+        ;; it) and it names the operation that would fix it, rather than letting
+        ;; an allocation reach around the state machine.
+        [{:phone/issue :number/awaiting-recycle :phone/msisdn m}]
+        [{:phone/issue      :number/quarantine-incomplete
+          :phone/msisdn     m
+          :phone/remaining-ms (quarantine-remaining-ms r now-ms quarantine-days)}])
+
+      (not= :unallocated (:phone/state r))
+      [{:phone/issue :number/not-available
+        :phone/msisdn m
+        :phone/state (:phone/state r)}]
+
+      :else [])))
+
+(defn plan-allocation
+  "The ordered operations that allocate msisdn to subject, or a refusal.
+
+    {:phone/ok? true  :phone/plan [[:reserve {}] [:assign {:phone/subject s}]]}
+    {:phone/ok? false :phone/issues [...]}
+
+  TWO operations, not one, and they are returned rather than applied. A
+  reservation and an assignment are different commitments -- the first takes a
+  number out of the pool, the second names who holds it -- and a plane that
+  collapses them cannot answer 'who was it held for, and since when' when an
+  allocation is disputed. Returning the plan instead of applying it keeps this
+  function pure and lets the caller record each step through
+  kotoba.phone.lifecycle/apply-event, which is the only thing that may change a
+  state."
+  [{:keys [subject] :as request}]
+  (let [issues (allocation-issues request)]
+    (if (seq issues)
+      {:phone/ok? false :phone/issues (vec issues)}
+      {:phone/ok? true
+       :phone/plan [[:reserve {}]
+                    [:assign {:phone/subject subject}]]})))
+
+(defn- inc-digits
+  "The next fixed-width digit string after `digits`, or nil on overflow.
+
+  Digit-string arithmetic rather than integer arithmetic, for the reason
+  `in-block?` gives: 15 digits does not fit in a JavaScript number, and an
+  enumerator that quietly rounds at the top of a block would hand out numbers
+  that are not in it."
+  [digits]
+  (let [ds "0123456789"]
+    (loop [i (dec (count digits)), out digits, carry 1]
+      (cond
+        (zero? carry) out
+        (neg? i) nil
+        :else
+        ;; String indexing, not char arithmetic: `nth` on a string yields a
+        ;; Character on the JVM and a one-character String in ClojureScript, so
+        ;; anything built on (int ch) compiles on both and is wrong on one.
+        (let [d (+ (str/index-of ds (subs out i (inc i))) carry)
+              r (rem d 10)]
+          (recur (dec i)
+                 (str (subs out 0 i) (subs ds r (inc r)) (subs out (inc i)))
+                 (quot d 10)))))))
+
+(defn- block-msisdns
+  "A lazy ascending seq of the E.164 numbers in a block."
+  [{:phone/keys [first last]}]
+  (when (and first last)
+    (letfn [(step [d]
+              (lazy-seq
+               (when d
+                 (cons (str "+" d)
+                       (when (not= d (subs last 1))
+                         (step (inc-digits d)))))))]
+      (step (subs first 1)))))
+
+(defn available
+  "The MSISDNs in these blocks that could be allocated now, in ascending order.
+
+  `limit` is REQUIRED and capped at 1000, because a numbering block is a range
+  and enumerating one can be arbitrarily large -- a 10,000-number block is
+  ordinary and a country-code-wide range is not. A caller who wants the whole
+  block wants a range, not a list, and should ask `in-block?` instead.
+
+  A number aged out of quarantine but still recorded as `:quarantined` is NOT
+  offered. It is not in the pool until `:recycle` puts it there, and offering it
+  early would let an allocation reach around the one transition that exists to
+  make the wait unskippable."
+  [{:keys [blocks records]} limit]
+  (let [taken (into {} (map (juxt :phone/msisdn identity)) records)
+        cap   (min (long (or limit 0)) 1000)]
+    (vec
+     (take cap
+           (for [blk (sort-by :phone/first blocks)
+                 :when (contains? allocatable-kinds (:phone/kind blk))
+                 m (block-msisdns blk)
+                 :let [r (get taken m)]
+                 :when (or (nil? r) (= :unallocated (:phone/state r)))]
+             m)))))

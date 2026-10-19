@@ -1,0 +1,188 @@
+(ns game-production.spec
+  "The gameSpec vocabulary — reading and validating a game's design as data.
+
+  A gameSpec is the whole design of one game expressed as a datom set: scene,
+  player baseline, weapons, passives, enemies, bosses with phase-gated
+  movesets, waves, xp and coop rules. The runtime is shared; the spec is what
+  makes one game different from another.
+
+  Two properties this namespace exists to protect, both learned from the
+  survivors specs rather than invented:
+
+  1. **Every numeric is an integer.** ms, px, px/s and permille are the only
+     units, so a fractional literal is a design error the reader can catch —
+     not a rounding difference that shows up as drift between the balance
+     analysis here and the fixed-point runtime that actually plays the game.
+
+  2. **Ids are references.** `:weapon/evolves-to`, `:weapon/merge-passive`,
+     `:move/summon-id` and the coop synergy pairs all name another entity by
+     id. A typo in one of them does not fail at read time — it fails as a
+     weapon that never evolves, or a boss move that summons nothing, which is
+     invisible until someone plays for five minutes. They are checked here.
+
+  Pure: no IO, no generation, no runtime. Work-independent, per ADR-2607023000
+  (the craft layer holds vocabulary; the -ka repo holds the business).")
+
+;; ---------------------------------------------------------------------------
+;; reading
+
+(defn- v
+  "Value under any of the given keys — specs reach this code both as EDN
+  keywords and as JSON-ish strings across the HTTP boundary."
+  [m & ks]
+  (some #(get m %) ks))
+
+(defn scene [spec] (or (v spec :scene "scene") {}))
+(defn mechanic [spec] (or (v spec :mechanic "mechanic") {}))
+
+(defn weapons [spec] (vec (or (v (mechanic spec) :weapons "weapons") [])))
+(defn passives [spec] (vec (or (v (mechanic spec) :passives "passives") [])))
+(defn enemies [spec] (vec (or (v (mechanic spec) :enemies "enemies") [])))
+(defn bosses [spec] (vec (or (v (mechanic spec) :bosses "bosses") [])))
+(defn player [spec] (or (v (mechanic spec) :player "player") {}))
+(defn waves [spec] (or (v (mechanic spec) :waves "waves") {}))
+(defn day-cycle [spec] (or (v (mechanic spec) :day-cycle "day-cycle") {}))
+(defn coop [spec] (or (v (mechanic spec) :coop "coop") {}))
+
+(defn survive-ms
+  "The run length the spec wins at, or nil when it declares no survival goal."
+  [spec]
+  (some-> (v (mechanic spec) :win "win") (v :win/survive-ms "win/survive-ms") long))
+
+(defn ids
+  "Entity maps -> their ids, in declaration order."
+  [coll id-key]
+  (vec (keep #(v % id-key (name id-key)) coll)))
+
+(defn by-id
+  [coll id-key]
+  (into {} (keep (fn [m] (when-let [i (v m id-key (name id-key))] [i m]))) coll))
+
+(defn moves
+  "Every move of every phase of a boss, flattened, with its phase index."
+  [boss]
+  (vec (mapcat (fn [i phase]
+                 (map #(assoc % ::phase i) (or (v phase :phase/moveset "phase/moveset") [])))
+               (range)
+               (or (v boss :boss/phases "boss/phases") []))))
+
+;; ---------------------------------------------------------------------------
+;; validation
+
+(defn- int-like?
+  "True for values the integers-only rule accepts. `1.0` is rejected even
+  though it is numerically whole: the point is that the literal was written
+  as a fraction, and the next edit of it will not be whole."
+  [x]
+  )
+
+(defn- walk-numerics
+  "Every [path value] pair under m whose value is a number."
+  [m]
+  (letfn [(step [path x]
+            (cond
+              (map? x) (mapcat (fn [[k vv]] (step (conj path k) vv)) x)
+              (sequential? x) (mapcat (fn [i vv] (step (conj path i) vv)) (range) x)
+              (number? x) [[path x]]
+              :else nil))]
+    (step [] m)))
+
+(defn fractional-numerics
+  "Paths whose value violates the integers-only rule. Empty is the good case."
+  [spec]
+  (vec (keep (fn [[path x]] (when-not (int-like? x) {:path path :value x}))
+             (walk-numerics spec))))
+
+(defn- dup
+  [xs]
+  (vec (for [[x n] (frequencies xs) :when (> n 1)] x)))
+
+(defn- dangling
+  "Reference checks: {:from .. :ref .. :to ..} for each id that names nothing."
+  [pairs known kind]
+  (vec (for [[from r] pairs
+             :when (and (some? r) (not (contains? known r)))]
+         {:kind kind :from from :ref r})))
+
+(defn- phase-order-problems
+  "Phases must narrow monotonically toward 0 — `:phase/until-hp-permille` is the
+  hp floor the phase holds until, so an out-of-order list means a phase that
+  can never be entered."
+  [boss]
+  (let [bid (v boss :boss/id "boss/id")
+        ps (mapv #(some-> (v % :phase/until-hp-permille "phase/until-hp-permille") long)
+                 (or (v boss :boss/phases "boss/phases") []))]
+    (cond
+      (empty? ps) []
+      (some nil? ps) [{:kind :phase-missing-threshold :boss bid}]
+      (not= ps (vec (reverse (sort ps)))) [{:kind :phase-not-descending :boss bid :thresholds ps}]
+      (not (zero? (long (last ps)))) [{:kind :phase-does-not-reach-zero :boss bid :last (last ps)}]
+      :else [])))
+
+(defn- window-problems
+  "Night-rage windows: ascending, non-overlapping, inside the run."
+  [spec]
+  (let [ws (or (v (day-cycle spec) :day-cycle/night-rage-windows-ms
+                  "day-cycle/night-rage-windows-ms") [])
+        end (survive-ms spec)]
+    (vec (concat
+          (for [[a b] ws :when (>= (long a) (long b))]
+            {:kind :window-empty :window [a b]})
+          (for [[[_ b] [c _]] (partition 2 1 ws) :when (> (long b) (long c))]
+            {:kind :window-overlap :at [b c]})
+          (when end
+            (for [[a b] ws :when (or (neg? (long a)) (> (long b) (long end)))]
+              {:kind :window-outside-run :window [a b] :survive-ms end}))))))
+
+(defn problems
+  "spec -> vector of problems. Empty means the spec is internally consistent.
+
+  This is deliberately a list rather than a throw: a proposal that names one
+  weapon wrong should come back with that one fact, so the next iteration can
+  fix it, not with a stack trace that loses the other nine findings."
+  [spec]
+  (let [ws (weapons spec) ps (passives spec) es (enemies spec) bs (bosses spec)
+        wid (set (ids ws :weapon/id)) pid (set (ids ps :passive/id))
+        eid (set (ids es :enemy/id)) bid (set (ids bs :boss/id))]
+    (vec
+     (concat
+      (for [f (fractional-numerics spec)]
+        (assoc f :kind :fractional-numeric))
+      (for [[k dups] [[:weapon (dup (ids ws :weapon/id))]
+                      [:passive (dup (ids ps :passive/id))]
+                      [:enemy (dup (ids es :enemy/id))]
+                      [:boss (dup (ids bs :boss/id))]]
+            d dups]
+        {:kind :duplicate-id :entity k :id d})
+      (dangling (for [w ws] [(v w :weapon/id "weapon/id")
+                             (v w :weapon/evolves-to "weapon/evolves-to")])
+                wid :evolves-to-unknown-weapon)
+      (dangling (for [w ws] [(v w :weapon/id "weapon/id")
+                             (v w :weapon/merge-passive "weapon/merge-passive")])
+                pid :merge-passive-unknown)
+      (dangling (for [b bs, m (moves b)] [(v b :boss/id "boss/id")
+                                          (v m :move/summon-id "move/summon-id")])
+                eid :summon-unknown-enemy)
+      (dangling (concat
+                 (for [p (or (v (coop spec) :coop/synergy-pairs "coop/synergy-pairs") [])]
+                   [:coop (v p :synergy/a "synergy/a")])
+                 (for [p (or (v (coop spec) :coop/synergy-pairs "coop/synergy-pairs") [])]
+                   [:coop (v p :synergy/b "synergy/b")]))
+                wid :synergy-unknown-weapon)
+      (mapcat phase-order-problems bs)
+      (window-problems spec)
+      (let [{:keys [base min']} {:base (some-> (v (waves spec) :waves/base-spawn-interval-ms
+                                                  "waves/base-spawn-interval-ms") long)
+                                 :min' (some-> (v (waves spec) :waves/min-spawn-interval-ms
+                                                  "waves/min-spawn-interval-ms") long)}]
+        (when (and base min' (> min' base))
+          [{:kind :spawn-interval-inverted :base base :min min'}]))
+      (for [b bs
+            :let [at (some-> (v b :boss/at-ms "boss/at-ms") long)
+                  end (survive-ms spec)]
+            :when (and at end (> at end))]
+        {:kind :boss-after-run-ends :boss (v b :boss/id "boss/id") :at-ms at :survive-ms end})
+      (when (and (seq bid) (empty? es))
+        [{:kind :bosses-without-enemies}])))))
+
+(defn valid? [spec] (empty? (problems spec)))

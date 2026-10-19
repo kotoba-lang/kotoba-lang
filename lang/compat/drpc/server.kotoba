@@ -1,0 +1,191 @@
+(ns drpc.server
+  "The other half: reading a call off the wire and answering it.
+
+  `drpc.client` says which packets a call is made of; this recognises those
+  packets arriving and says which packets answer them. A storage node spends
+  most of its life on this side — an uplink dials *it* — so a client-only
+  library is a library that cannot be a node.
+
+  ## What arrives, and when a call is ready
+
+  A unary call is three packets on one stream:
+
+      Invoke      the rpc name
+      Message     the request
+      CloseSend   nothing more is coming
+
+  A call is not ready until `CloseSend`. The `Message` alone is not enough:
+  the client may still be sending, and a handler that ran on the first message
+  of a stream would answer a request it had only partly heard.
+
+  A *streaming* call is the same packets with more `Message`s in the middle,
+  so `feed` reports both: the call when its client stops speaking, and every
+  message as it arrives. An upload handler wants the second — waiting for the
+  whole stream means buffering a piece in memory before writing a byte of it.
+
+  ## What goes back
+
+  `drpcserver.handleRPC` sends the handler's reply and then `CloseSend`, or an
+  `Error` if the handler failed. Not `Close` — that is what a *client* sends
+  when it is finished with a stream, and a server that sent one would be
+  telling the client the stream is dead before the client has read the answer.
+
+  ## Refusals
+
+  A `Message` with no `Invoke` before it is a request for nothing, and a
+  second `Invoke` on one stream is two calls claiming the same id. Both are
+  refused rather than guessed at: this side is reachable by anyone who can
+  open a socket, and every guess is a decision made on a stranger's behalf.
+
+  `InvokeMetadata` is the exception, and it caught this namespace out. It
+  arrives **before** the `Invoke`, not after — `doInvoke` writes it first — so
+  metadata opens a stream and the name fills it in. Requiring the invoke first
+  reads as the same obvious rule and refuses every call a real client makes
+  with metadata attached.
+
+  ## Not here
+
+  Dispatch. Which handler serves `/piecestore.Piecestore/Upload` is the
+  application's business, and a routing table in this namespace would be a
+  registry every caller had to populate before it could read a packet.
+  Streaming calls are absent too — `drpc.client` describes a unary call and so
+  does this."
+  (:require [drpc.client :as c]
+            [drpc.wire :as w]))
+
+(defn- fail [msg data]
+  (throw (ex-info (str "drpc.server: " msg) data)))
+
+(defn incoming
+  "A server's view of one connection. `opts` go to `drpc.wire/reader`."
+  ([] (incoming {}))
+  ([opts]
+   {:reader  (if (seq opts) (w/reader opts) (w/reader))
+    :partial {}
+    :arrived []}))
+
+(defn- absorb [state {:keys [kind stream data]}]
+  (let [call (get-in state [:partial stream])]
+    (case kind
+      :invoke
+      (if (:rpc call)
+        (fail "a second invoke on one stream" {:stream stream})
+        ;; `call` may already exist: InvokeMetadata comes *before* Invoke in
+        ;; `doInvoke`, so metadata opens the stream and the name fills it in.
+        ;; Requiring the invoke first reads as the obvious rule and refuses
+        ;; every call a real client makes with metadata attached.
+        (assoc-in state [:partial stream]
+                  (merge call {:stream stream :rpc (c/utf8-string data) :request nil})))
+
+      :message
+      (if call
+        (-> state
+            ;; `:request` is the last one, which is what a unary handler
+            ;; wants; `:requests` is all of them, which is what an upload is
+            (assoc-in [:partial stream :request] (vec data))
+            (update-in [:partial stream :requests] (fnil conj []) (vec data))
+            (update :arrived conj {:stream stream :rpc (:rpc call) :data (vec data)}))
+        ;; a request for nothing: the name has not arrived, so there is no
+        ;; handler this could be for
+        (fail "a message before its invoke" {:stream stream}))
+
+      :invoke-metadata
+      (assoc-in state [:partial stream]
+                (merge {:stream stream :rpc nil :request nil} call
+                       {:metadata (vec data)}))
+
+      :close-send
+      (if call
+        (assoc-in state [:partial stream :ready?] true)
+        (fail "a close-send for a stream that never invoked" {:stream stream}))
+
+      ;; cancel and close end a call without one being made; the caller sees
+      ;; the stream disappear rather than a request it should answer
+      (:cancel :close)
+      (update state :partial dissoc stream)
+
+      state)))
+
+(defn feed
+  "Feed received bytes.
+
+  Returns
+
+      {:state    s
+       :calls    [{:stream n :rpc s :request bytes :requests [...] :metadata bytes}]
+       :messages [{:stream n :rpc s :data bytes}]}
+
+  `:calls` is one entry per call whose client has **finished speaking**, which
+  is what a unary handler waits for. `:messages` is every message as it
+  arrives, which is what an upload needs: a handler that waited for the whole
+  stream would buffer a piece in memory before writing a byte of it.
+
+  A call with no request at all is refused rather than handed over with nil:
+  an empty request is a real thing (`ContactPingRequest` has no fields and
+  still arrives as a zero-length `Message`), so nil would be a third state a
+  handler has to know about."
+  [state bs]
+  (let [{r :state packets :packets} (w/feed (:reader state) bs)
+        state (reduce absorb (assoc state :reader r :arrived []) packets)
+        ready (filterv (comp :ready? val) (:partial state))]
+    (doseq [[stream call] ready]
+      (when (nil? (:request call))
+        (fail "a call that closed without sending a request" {:stream stream :rpc (:rpc call)})))
+    {:state    (update state :partial #(apply dissoc % (map first ready)))
+     :calls    (mapv (fn [[_ call]] (dissoc call :ready?)) ready)
+     :messages (:arrived state)}))
+
+(defn send-message
+  "One `Message` on a stream this server is answering, without ending it.
+
+  `message-id` is the caller's to track: a server streaming a download writes
+  many of these and the ids advance per packet, the same rule that governs
+  the other direction."
+  ([stream message-id data] (send-message stream message-id data w/default-frame-size))
+  ([stream message-id data frame-size]
+   (w/encode-packet {:kind :message :stream stream :message message-id
+                     :data (vec data)}
+                    frame-size)))
+
+(defn end-response
+  "The `CloseSend` that finishes a streamed response."
+  [stream message-id]
+  (w/encode-packet {:kind :close-send :stream stream :message message-id :data []}))
+
+(defn respond
+  "The bytes answering a call: the reply, then `CloseSend`.
+
+  Message ids start at 1 on this side too — the server writes on the client's
+  stream but keeps its own count, which is what `newFrameLocked` does."
+  ([stream response] (respond stream response w/default-frame-size))
+  ([stream response frame-size]
+   (vec (concat (w/encode-packet {:kind :message :stream stream :message 1
+                                  :data (vec response)}
+                                 frame-size)
+                (w/encode-packet {:kind :close-send :stream stream :message 2
+                                  :data []}
+                                 frame-size)))))
+
+(defn- u64-be
+  "Eight bytes, most significant first. Built with integer arithmetic rather
+  than shifts: a code above 2^31 loses its top half to `bit-shift-right` on
+  the JVM and to JavaScript's 32-bit bitwise operators on the other side."
+  [n]
+  (loop [i 7, v n, out ()]
+    (if (neg? i)
+      (vec out)
+      (recur (dec i) (quot v 256) (conj out (mod v 256))))))
+
+(defn respond-error
+  "The bytes refusing a call: eight bytes of big-endian code, then the text.
+
+  `drpcwire.MarshalError`'s layout, and `drpcserver.handleRPC` sends this
+  *instead of* a reply rather than after one."
+  [stream code message]
+  (w/encode-packet {:kind :error :stream stream :message 1
+                    :data (into (u64-be code) (c/ascii-bytes message))}))
+
+(defn pending
+  "Streams that have invoked and not yet finished speaking."
+  [state]
+  (set (keys (:partial state))))

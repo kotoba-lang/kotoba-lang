@@ -1,0 +1,230 @@
+(ns drpc.client
+  "A unary RPC, as the packets it is made of.
+
+  `drpc.wire` turns packets into bytes and bytes back into packets. This says
+  *which* packets a call is, and what the ones coming back mean — and it says
+  it without touching a socket, so the same description drives a JVM stream, a
+  Node socket or a test that never opens one.
+
+  ## The sequence
+
+  `drpcconn.Conn.doInvoke` is four writes and one read:
+
+      InvokeMetadata   (only when there is metadata)
+      Invoke           body is the rpc name, e.g. /contact.Contact/PingNode
+      Message          body is the encoded request
+      CloseSend        empty body — nothing more will be sent
+      → Message        the response
+      Close
+
+  Message ids start at 1 and advance per packet within a stream
+  (`newFrameLocked` increments before building the frame), which is why they
+  are computed here rather than left to a caller: a call whose ids restart is
+  a call the far side discards as a replay.
+
+  ## Strings
+
+  An rpc name is ASCII by protobuf's own grammar and is refused if it is not,
+  rather than being mangled into something a server would not route. Error
+  messages coming back are another matter — they can hold anything a peer
+  wrote — so those are decoded as UTF-8, and the raw bytes are kept beside the
+  decoded text for a caller that would rather look at them."
+  (:require [clojure.string :as str]
+            [drpc.wire :as w]))
+
+(def first-stream
+  "The stream id a fresh connection's first call uses.
+
+  `Manager.NewClientStream` allocates `last + 1` starting from zero, so the
+  first client stream is 1. Streams are the caller's to allocate — this
+  library holds no connection and therefore no counter."
+  1)
+
+(defn- fail [msg data]
+  (throw (ex-info (str "drpc.client: " msg) data)))
+
+;; ── strings ─────────────────────────────────────────────────────────────────
+
+(defn- char-code [c]
+  )
+
+(defn ascii-bytes
+  "An ASCII string as bytes, refusing anything that is not ASCII."
+  [s]
+  (mapv (fn [c]
+          (let [v (char-code c)]
+            (when (> v 0x7f)
+              (fail "rpc names are ASCII" {:string s}))
+            v))
+        s))
+
+(defn utf8-string
+  "Bytes as a UTF-8 string.
+
+  Written out rather than delegated because `drpc` has no host layer and is
+  not going to grow one for error text. Malformed input becomes U+FFFD rather
+  than an exception: a peer's error message is not worth throwing a second
+  error over.
+
+  **One replacement character per bad byte**, which is Go's `utf8.DecodeRune`
+  convention (it reports size 1 on an invalid sequence) rather than the
+  maximal-subpart rule browsers use, where a truncated three-byte sequence
+  would collapse to a single U+FFFD. Both are defensible; the reference
+  implementation is Go, so this follows Go."
+  [bs]
+  (let [v (vec bs)
+        n (count v)]
+    (loop [i 0, out []]
+      (if (>= i n)
+        (str/join out)
+        (let [b (nth v i)
+              [cp len] (cond
+                         (< b 0x80) [b 1]
+                         (= 0xc0 (bit-and b 0xe0)) [(bit-and b 0x1f) 2]
+                         (= 0xe0 (bit-and b 0xf0)) [(bit-and b 0x0f) 3]
+                         (= 0xf0 (bit-and b 0xf8)) [(bit-and b 0x07) 4]
+                         :else [0xfffd 1])
+              enough? (<= (+ i len) n)
+              cp (if (and enough? (> len 1))
+                   (reduce (fn [acc k]
+                             (let [c (nth v (+ i k))]
+                               (if (= 0x80 (bit-and c 0xc0))
+                                 (bit-or (bit-shift-left acc 6) (bit-and c 0x3f))
+                                 (reduced 0xfffd))))
+                           cp (range 1 len))
+                   (if enough? cp 0xfffd))]
+          (recur (+ i (if enough? len 1))
+                 (conj out (if (> cp 0xffff)
+                             ;; outside the BMP: a surrogate pair, because both
+                             ;; runtimes' strings are UTF-16 underneath
+                             (let [x (- cp 0x10000)]
+                               (str (char (+ 0xd800 (bit-shift-right x 10)))
+                                    (char (+ 0xdc00 (bit-and x 0x3ff)))))
+                             (char cp)))))))))
+
+;; ── what a call writes ──────────────────────────────────────────────────────
+
+(defn packets
+  "The packets a unary call sends, in order.
+
+  `:stream` is the stream id, `:rpc` the name, `:request` the encoded request
+  bytes, `:metadata` optional encoded metadata."
+  [{:keys [stream rpc request metadata] :or {stream first-stream}}]
+  (let [parts (cond-> []
+                (seq metadata) (conj [:invoke-metadata (vec metadata)])
+                true           (conj [:invoke (ascii-bytes rpc)])
+                true           (conj [:message (vec request)])
+                true           (conj [:close-send []]))]
+    (mapv (fn [i [kind data]]
+            {:kind kind :stream stream :message (inc i) :data data})
+          (range) parts)))
+
+(defn request
+  "The bytes a unary call writes onto a connection."
+  ([opts] (request opts w/default-frame-size))
+  ([opts frame-size]
+   (vec (mapcat #(w/encode-packet % frame-size) (packets opts)))))
+
+;; ── what comes back ─────────────────────────────────────────────────────────
+
+(defn error->map
+  "A `:error` packet body: eight bytes of big-endian code, then the message.
+
+  `drpcwire.UnmarshalError` treats a body shorter than eight bytes as the
+  message itself with no code, and so does this — a peer that sends a truncated
+  error is still telling you something."
+  [data]
+  (let [v (vec data)]
+    (if (< (count v) 8)
+      {:code 0 :message (utf8-string v) :raw v}
+      {:code (reduce (fn [acc b] (+ (* acc 256) b)) 0 (subvec v 0 8))
+       :message (utf8-string (subvec v 8))
+       :raw v})))
+
+(def empty-result
+  "A call that has heard nothing yet.
+
+  `:message` is the first response and `:messages` is all of them. A unary
+  call has at most one and reads `:message`; a server-streaming call reads
+  `:messages` and is not finished until the peer says so."
+  {:message nil :messages [] :error nil :closed? false :ignored []})
+
+(defn collect
+  "Fold the packets received on `stream` into a unary result.
+
+  The three-argument form folds into a result already in progress, which is
+  what `drpc.session` needs: packets for one call arrive interleaved with
+  another's and cannot be collected in one pass.
+
+      {:message  bytes | nil    the response, if one arrived
+       :error    {...}  | nil    the peer's error, if it sent one
+       :closed?  bool            the peer closed the stream
+       :ignored  [...]           packets on other streams, untouched}
+
+  Packets for other streams are set aside rather than dropped: a connection
+  carries more than one call over its life, and silently discarding another
+  call's response is a hang rather than an error."
+  ([packets stream] (collect packets stream empty-result))
+  ([packets stream initial]
+   (reduce (fn [acc {:keys [kind data] :as packet}]
+             (if (not= stream (:stream packet))
+               (update acc :ignored conj packet)
+               (case kind
+                 :message    (-> acc
+                                 (cond-> (nil? (:message acc)) (assoc :message (vec data)))
+                                 (update :messages (fnil conj []) (vec data)))
+                 :error      (assoc acc :error (error->map data))
+                 :close      (assoc acc :closed? true)
+                 :close-send (assoc acc :closed-send? true)
+                 :cancel     (assoc acc :cancelled? true)
+                 acc)))
+           initial
+           packets)))
+
+(defn complete?
+  "Whether a result has everything a unary call was waiting for.
+
+  A response *or* an error ends the call. A close with neither is a peer that
+  hung up, which `collect` reports as `:closed?` and this treats as complete —
+  waiting longer would wait forever."
+  [{:keys [message error closed?]}]
+  (boolean (or message error closed?)))
+
+(defn stream-complete?
+  "Whether a *streaming* receive has everything it is going to get.
+
+  Not the same test as `complete?`. A unary call is done at its first message;
+  a server sending a stream of them is done when it says so — `CloseSend`,
+  which `drpcserver.handleRPC` writes after the handler returns. Applying the
+  unary rule to a stream reads the first chunk and calls the download
+  finished."
+  [{:keys [error closed? closed-send?]}]
+  (boolean (or error closed? closed-send?)))
+
+(defn open
+  "The packets that open a stream: metadata if there is any, then the invoke.
+
+  Nothing else — `doNewStream` writes exactly this and leaves the stream open,
+  which is what makes it a stream rather than a call."
+  [{:keys [stream rpc metadata] :or {stream first-stream}}]
+  (let [parts (cond-> []
+                (seq metadata) (conj [:invoke-metadata (vec metadata)])
+                true           (conj [:invoke (ascii-bytes rpc)]))]
+    (mapv (fn [i [kind data]]
+            {:kind kind :stream stream :message (inc i) :data data})
+          (range) parts)))
+
+(defn message
+  "One `Message` packet on an open stream."
+  [stream message-id data]
+  {:kind :message :stream stream :message message-id :data (vec data)})
+
+(defn close-send
+  "The `CloseSend` that ends the sending side of a stream."
+  [stream message-id]
+  {:kind :close-send :stream stream :message message-id :data []})
+
+(defn close-packet
+  "The `Close` a caller sends when it is done with a stream."
+  [stream message-id]
+  {:kind :close :stream stream :message message-id :data []})

@@ -1,0 +1,176 @@
+(ns jws.core
+  "JSON Web Signature, Compact Serialization — [RFC 7515](https://www.rfc-editor.org/rfc/rfc7515.txt).
+
+   The structure only. Signing and verifying are INJECTED, because a JWS library
+   that also owns the cryptography ends up owning key custody too, and because the
+   algorithms worth supporting here already exist next door:
+   `kotoba-lang/org-ietf-ed25519` for `EdDSA` and the P-256 primitives in
+   `kotoba-lang/org-w3-vc-data-integrity` for `ES256`.
+
+   ## The verifier is TOLD the algorithm; it does not read it
+
+   §4.1.1 requires `alg` to be present and understood, and §10 requires that it
+   \"accurately represents the algorithm used to construct the JWS Signature\".
+   Reading the algorithm out of the header and then using it to decide how to
+   verify is the classic algorithm-substitution flaw: the header is supplied by
+   whoever produced the token, so a verifier that trusts it lets the attacker
+   choose the check.
+
+   So `verify` REQUIRES `:expected-alg`, compares it to the header, and refuses a
+   mismatch by name. Callers who genuinely accept several algorithms pass a set —
+   which forces them to write down *which*, rather than accepting whatever arrives.
+
+   `alg` `none` (§6, \"Unsecured JWS\") is refused unconditionally and cannot be
+   enabled. RFC 7515 stops short of prohibiting it; every deployment that has
+   accepted one has regretted it, and this library has no use case that needs a
+   signature-shaped object with no signature.
+
+   ## crit
+
+   §4.1.11: if `crit` lists a header this implementation does not understand, the
+   JWS is INVALID. Not ignored — the producer used `crit` precisely to say \"reject
+   this if you don't handle it\", so ignoring it inverts the one thing it means.
+
+     (require '[jws.core :as jws])
+
+     (jws/sign {\"alg\" \"EdDSA\"} payload-string
+               {:sign (fn [signing-input] (ed/sign seed signing-input))
+                :json-encode json/write-str})
+
+     (jws/verify compact {:expected-alg \"EdDSA\"
+                          :verify (fn [signing-input sig] (ed/verify pub signing-input sig))
+                          :json-decode json/read-str})"
+  (:require [clojure.string :as str]
+            [multiformats.core :as mf]))
+
+(def unsecured-alg "none")
+
+;; §4.1.11 — the header parameters this implementation understands, so `crit` can
+;; be checked against something real rather than waved through.
+(def understood-headers #{"alg" "typ" "cty" "kid" "jku" "jwk" "x5u" "x5c" "x5t"
+                          "x5t#S256" "crit"})
+
+(defn- fail! [code msg data]
+  (throw (ex-info msg (assoc data :jws/error code))))
+
+(defn- utf8-bytes [s]
+  )
+
+(defn- bytes->string [b]
+  (let [ints (mapv #(bit-and % 0xff) (seq b))]
+    ))
+
+(defn b64url [x] (mf/base64url (if (string? x) (utf8-bytes x) x)))
+(defn b64url->bytes [s] (mf/base64url-decode s))
+(defn b64url->string [s] (bytes->string (mf/base64url-decode s)))
+
+(defn signing-input
+  "§5.1: `ASCII(BASE64URL(UTF8(header)) || '.' || BASE64URL(payload))`.
+
+   Returned as bytes, because that is what a signer consumes and because handing
+   back a string invites a caller to re-encode it in some other charset."
+  [header-b64 payload-b64]
+  (utf8-bytes (str header-b64 "." payload-b64)))
+
+;; ── sign ─────────────────────────────────────────────────────────────────────
+
+(defn sign
+  "Produce a Compact Serialization JWS.
+
+   `header` must carry `alg`. `payload` is a string — this library does not decide
+   how your claims serialize, and for SD-JWT the payload's exact bytes are what
+   later gets hashed.
+
+   `:sign` is `(fn [signing-input-bytes] -> signature-bytes)`."
+  [header payload {:keys [sign json-encode]}]
+  (when-not (fn? sign) (fail! :jws/no-signer ":sign is required" {}))
+  (when-not (fn? json-encode) (fail! :jws/no-json-encode ":json-encode is required" {}))
+  (let [alg (get header "alg")]
+    (when (str/blank? (str alg))
+      (fail! :jws/missing-alg "the `alg` header is REQUIRED (§4.1.1)" {}))
+    (when (= unsecured-alg alg)
+      (fail! :jws/unsecured
+             "`alg: none` produces a signature-shaped object with no signature"
+             {}))
+    (let [header-b64 (b64url (json-encode header))
+          payload-b64 (b64url payload)
+          sig (sign (signing-input header-b64 payload-b64))]
+      (when (zero? (count (seq sig)))
+        (fail! :jws/empty-signature "the signer returned no bytes" {}))
+      (str header-b64 "." payload-b64 "." (b64url sig)))))
+
+;; ── verify ───────────────────────────────────────────────────────────────────
+
+(defn decode-header
+  "The protected header, without verifying anything.
+
+   Named so that a caller cannot mistake it for verification: it exists for
+   selecting a key by `kid`, which necessarily happens before the signature is
+   checked. Nothing it returns is trustworthy yet."
+  [compact {:keys [json-decode]}]
+  (let [parts (str/split (str compact) #"\." -1)]
+    (when-not (= 3 (count parts))
+      (fail! :jws/malformed
+             "a Compact Serialization JWS has exactly three dot-separated parts"
+             {:parts (count parts)}))
+    (json-decode (b64url->string (first parts)))))
+
+(defn verify
+  "Verify a Compact Serialization JWS.
+
+   `:expected-alg` is REQUIRED — a string or a set of strings. The header's `alg`
+   must be one of them. This is not defensive decoration: choosing the algorithm
+   from the header means letting whoever produced the token choose how it is
+   checked.
+
+   `:verify` is `(fn [signing-input-bytes signature-bytes] -> boolean)`.
+
+   Returns `{:valid? true :header … :payload …}` or `{:valid? false :reason kw}`.
+   A bad signature is a `false`; a MALFORMED token throws, because that is a
+   different kind of problem and a caller may want to log it differently."
+  [compact {:keys [expected-alg verify json-decode]}]
+  (when-not (fn? verify) (fail! :jws/no-verifier ":verify is required" {}))
+  (when-not (fn? json-decode) (fail! :jws/no-json-decode ":json-decode is required" {}))
+  (when (nil? expected-alg)
+    (fail! :jws/expected-alg-required
+           (str ":expected-alg is required. Reading the algorithm from the header "
+                "and using it to decide how to verify lets whoever produced the "
+                "token choose the check (§10).")
+           {}))
+  (let [allowed (if (coll? expected-alg) (set expected-alg) #{expected-alg})
+        parts (str/split (str compact) #"\." -1)]
+    (when-not (= 3 (count parts))
+      (fail! :jws/malformed
+             "a Compact Serialization JWS has exactly three dot-separated parts"
+             {:parts (count parts)}))
+    (let [[header-b64 payload-b64 sig-b64] parts
+          header (json-decode (b64url->string header-b64))
+          alg (get header "alg")]
+      (cond
+        (str/blank? (str alg))
+        {:valid? false :reason :jws/missing-alg}
+
+        (= unsecured-alg alg)
+        {:valid? false :reason :jws/unsecured}
+
+        (not (contains? allowed alg))
+        ;; Named, not reported as a bad signature: the token may be perfectly
+        ;; signed with an algorithm this caller does not accept, and those are
+        ;; different facts.
+        {:valid? false :reason :jws/unexpected-alg :alg alg :allowed allowed}
+
+        ;; §4.1.11
+        (when-let [crit (get header "crit")]
+          (seq (remove understood-headers crit)))
+        {:valid? false :reason :jws/unsupported-critical-header
+         :unsupported (vec (remove understood-headers (get header "crit")))}
+
+        (str/blank? sig-b64)
+        {:valid? false :reason :jws/empty-signature}
+
+        :else
+        (if (boolean (try (verify (signing-input header-b64 payload-b64)
+                                  (b64url->bytes sig-b64))
+                          (catch  _ false)))
+          {:valid? true :header header :payload (b64url->string payload-b64)}
+          {:valid? false :reason :jws/bad-signature})))))

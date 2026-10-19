@@ -1,0 +1,287 @@
+(ns kotoba.kami-host
+  "A minimal, deterministic game-engine ECS host for the kami-* host
+  imports (kotoba-core-contracts \"kami/engine\", capability id 233): the
+  kami:engine vocabulary exposed through kotoba's single (module \"kotoba\")
+  ABI, so a `.kotoba` guest can drive real game logic.
+
+  PORTABLE (.cljc) per the repo-wide runtime priority (CLAUDE.md
+  2026-07-07: kotoba wasm > clojurewasm > ClojureScript > nbb, JVM last
+  resort). The guest is already kotoba wasm; this HOST's canonical
+  non-JVM runtime is ClojureScript — the whole ECS core below is plain
+  portable Clojure (atoms, sorted-map, double math, 32-bit-pair
+  xorshift64), and the wire layer splits by platform:
+
+    :cljs  `kami-host-imports` — a (module \"kotoba\") import object for
+           the native `js/WebAssembly` engine (browser or Node/nbb; the
+           JS API hands host functions real numbers and frounds f32
+           returns, so no bit-unpacking is needed). Exercised by
+           scripts/verify_kami_survivors_nbb.cljs (nbb, no JVM) and by
+           kotoba-lang/wasm-webcomponent's shadow-cljs build.
+    :clj   `kami-effects`/`kami-host-functions` — the Chicory wiring,
+           kept ONLY so the existing kotoba.wasm-exec test suite
+           (kami_game_test.clj) stays green; the JVM is the last-resort
+           runtime here, not the premise.
+
+  clojurewasm (`cljw`, the priority rung above ClojureScript) cannot host
+  this yet: its current FFI surface is `wasm/load`+`wasm/call` for
+  import-free modules — Clojure-provided host imports are explicitly the
+  future \"fuller Phase-16 FFI surface\" (docs/examples/wasm/README.md,
+  checked 2026-07-10), and this guest needs 12 host imports. Revisit when
+  that lands.
+
+  Same guest-computes/host-executes split as the gpu-set-position surface
+  (ADR-2607078000): this host owns ALL entity state (id -> tag/position/
+  velocity), the fixed-step Euler integration, the tick counter, the input
+  axes, and a SEEDED xorshift64 random stream (deterministic replay — same
+  seed, same game, on every runtime; never the OS RNG). The guest owns only
+  per-tick decisions: the driver calls `step!` then the guest's 0-arg
+  `main`, once per tick — no guest-side loop. Batch ops
+  (move-tagged-toward!/despawn-within!) stand in for per-entity iteration
+  the language deliberately doesn't have.
+
+  One state map (see `fresh-state`) lives for one game run; on the JVM
+  every wasm-facing op is guarded through
+  kotoba.wasm-exec/guarded-host-functions (fail-closed, receipted)."
+  )
+
+;; ---------------------------------------------------------------------------
+;; Seeded xorshift64 as a [hi lo] pair of unsigned 32-bit words — ONE
+;; portable implementation, bit-identical on the JVM (longs), ClojureScript
+;; (int32 bit ops), and nbb/SCI, instead of per-platform long-vs-BigInt
+;; branches that could silently drift.
+
+(defn- u32 [x]
+  )
+
+(defn- xor64 [[ah al] [bh bl]]
+  [(u32 (bit-xor ah bh)) (u32 (bit-xor al bl))])
+
+(defn- shl64 [[hi lo] n]
+  [(u32 (bit-or (bit-shift-left hi n) (unsigned-bit-shift-right (u32 lo) (- 32 n))))
+   (u32 (bit-shift-left lo n))])
+
+(defn- shr64 [[hi lo] n]
+  [(u32 (unsigned-bit-shift-right (u32 hi) n))
+   (u32 (bit-or (unsigned-bit-shift-right (u32 lo) n) (bit-shift-left hi (- 32 n))))])
+
+(defn- xorshift64 [s]
+  (let [s (xor64 s (shl64 s 13))
+        s (xor64 s (shr64 s 7))]
+    (xor64 s (shl64 s 17))))
+
+(def ^:private golden-gamma
+  "splitmix64's golden-gamma constant as a [hi lo] pair — the seed-0 remap
+  (xorshift's one forbidden state is 0)."
+  [0x9E3779B9 0x7F4A7C15])
+
+(defn- seed->pair
+  "SEED (a non-negative integer < 2^53, exact in every runtime's number
+  type) -> [hi lo]."
+  [seed]
+  (let [hi (u32 (quot seed 0x100000000))
+        lo (u32 (mod seed 0x100000000))]
+    (if (and (zero? hi) (zero? lo)) golden-gamma [hi lo])))
+
+(defn- pair-mod
+  "Unsigned 64-bit [hi lo] mod N (Long/remainderUnsigned's portable
+  equivalent), folded over 16-bit limbs so every intermediate stays exact
+  in double arithmetic (limbs < 2^16, r < n, r*65536+limb < 2^47 for any
+  n < 2^31)."
+  [[hi lo] n]
+  (reduce (fn [r limb] (mod (+ (* r 65536) limb) n))
+          0
+          [(unsigned-bit-shift-right (u32 hi) 16) (bit-and hi 0xFFFF)
+           (unsigned-bit-shift-right (u32 lo) 16) (bit-and lo 0xFFFF)]))
+
+;; ---------------------------------------------------------------------------
+;; Game state
+
+(defn fresh-state
+  "Fresh game state: tick counter, entity table (id -> {:tag :x :y :z :vx
+  :vy :vz}, a sorted map so id-order iteration — and therefore nearest-tagged
+  tie-breaking — is deterministic), host-owned input axes, and the seeded
+  xorshift64 rng word (SEED 0 is remapped to splitmix64's golden-gamma
+  constant rather than rejected)."
+  ([] (fresh-state 7))
+  ([seed]
+   {:tick (atom 0)
+    :next-id (atom 0)
+    :entities (atom (sorted-map))
+    :axes (atom {})
+    :rng (atom (seed->pair seed))}))
+
+;; ---------------------------------------------------------------------------
+;; Core ECS ops — plain portable data in, plain data out (unit-testable on
+;; any runtime without a wasm instance); the platform wire layers below
+;; only decode the ABI (string ptr/len, f32 values) and delegate here.
+
+(defn spawn-entity!
+  "Spawn a TAG-tagged entity at (0,0) with zero velocity; returns its id."
+  [state tag]
+  (let [id (dec (swap! (:next-id state) inc))]
+    (swap! (:entities state) assoc id
+           {:tag tag :x 0.0 :y 0.0 :z 0.0 :vx 0.0 :vy 0.0 :vz 0.0})
+    id))
+
+(defn despawn-entity!
+  "Remove entity ID; 0 when it existed, -1 when it didn't."
+  [state id]
+  (if (contains? @(:entities state) id)
+    (do (swap! (:entities state) dissoc id) 0)
+    -1))
+
+(defn set-position!
+  "Place entity ID at (X,Y); 0, or -1 for an unknown id."
+  [state id x y]
+  (if (contains? @(:entities state) id)
+    (do (swap! (:entities state) update id assoc :x (double x) :y (double y)) 0)
+    -1))
+
+(defn set-velocity!
+  "Point entity ID's velocity at (VX,VY) units/second; 0, or -1 for an
+  unknown id. `step!` integrates pos += vel * dt each fixed step."
+  [state id vx vy]
+  (if (contains? @(:entities state) id)
+    (do (swap! (:entities state) update id assoc :vx (double vx) :vy (double vy)) 0)
+    -1))
+
+(defn set-position3!
+  "Place entity ID at (X,Y,Z); additive 3D ABI, 0 or -1 for unknown id."
+  [state id x y z]
+  (if (contains? @(:entities state) id)
+    (do (swap! (:entities state) update id assoc
+               :x (double x) :y (double y) :z (double z)) 0)
+    -1))
+
+(defn set-velocity3!
+  "Set entity ID velocity to (VX,VY,VZ); 0 or -1 for unknown id."
+  [state id vx vy vz]
+  (if (contains? @(:entities state) id)
+    (do (swap! (:entities state) update id assoc
+               :vx (double vx) :vy (double vy) :vz (double vz)) 0)
+    -1))
+
+(defn get-x [state id]
+  (double (get-in @(:entities state) [id :x] 0.0)))
+
+(defn get-y [state id]
+  (double (get-in @(:entities state) [id :y] 0.0)))
+
+(defn get-z [state id]
+  (double (get-in @(:entities state) [id :z] 0.0)))
+
+(defn count-tagged [state tag]
+  (count (filter #(= tag (:tag %)) (vals @(:entities state)))))
+
+(defn- dist [ax ay bx by]
+  (Math/hypot (- ax bx) (- ay by)))
+
+(defn nearest-tagged
+  "Nearest TAG-tagged entity id within MAX-DIST of (X,Y), or -1. Ties go
+  to the lowest id (sorted-map iteration order)."
+  [state tag x y max-dist]
+  (let [x (double x) y (double y) max-dist (double max-dist)]
+    (or (first
+         (reduce (fn [[_ best-d :as best] [id e]]
+                   (if (= tag (:tag e))
+                     (let [d (dist x y (:x e) (:y e))]
+                       (if (and (<= d max-dist) (or (nil? best-d) (< d best-d)))
+                         [id d]
+                         best))
+                     best))
+                 [nil nil]
+                 @(:entities state)))
+        -1)))
+
+(defn move-tagged-toward!
+  "Point every TAG-tagged entity's velocity at (X,Y) at SPEED units/second
+  (an entity already at the target gets velocity zero instead of a NaN
+  direction); returns how many entities were repointed."
+  [state tag x y speed]
+  (let [x (double x) y (double y) speed (double speed)]
+    (count
+     (doall
+      (for [[id e] @(:entities state)
+            :when (= tag (:tag e))]
+        (let [d (dist x y (:x e) (:y e))]
+          (if (< d 1e-9)
+            (set-velocity! state id 0.0 0.0)
+            (set-velocity! state id
+                           (* speed (/ (- x (:x e)) d))
+                           (* speed (/ (- y (:y e)) d))))))))))
+
+(defn despawn-within!
+  "Despawn every TAG-tagged entity within RADIUS of (X,Y); returns how
+  many were despawned."
+  [state tag x y radius]
+  (let [x (double x) y (double y) radius (double radius)
+        hit (vec (for [[id e] @(:entities state)
+                       :when (and (= tag (:tag e))
+                                  (<= (dist x y (:x e) (:y e)) radius))]
+                   id))]
+    (doseq [id hit] (despawn-entity! state id))
+    (count hit)))
+
+(defn set-axis!
+  "Set host-owned input axis NAME (e.g. \"MoveX\") to V in [-1.0, 1.0] —
+  the driver-side stand-in for a real input device."
+  [state name v]
+  (swap! (:axes state) assoc name (double v))
+  nil)
+
+(defn axis [state name]
+  (double (get @(:axes state) name 0.0)))
+
+(defn tick-n [state]
+  @(:tick state))
+
+(defn rand-int!
+  "Uniform integer in [0, N) from the seeded xorshift64 stream (advances
+  it) — the same value on every runtime for the same seed and call
+  sequence."
+  [state n]
+  (pair-mod (swap! (:rng state) xorshift64) n))
+
+(def default-dt
+  "Fixed integration step: 60 steps/second, the same fixed-step convention
+  kami-engine-host.js / kami-script-runtime-rs use (16ms ticks)."
+  (/ 1.0 60.0))
+
+(defn step!
+  "Advance one fixed step: integrate every entity (pos += vel * dt), then
+  bump the tick counter. The driver calls this BEFORE each guest `main`
+  call, so the guest always observes freshly-integrated positions and a
+  tick counter starting at 1 — mirroring the now-days loop's \"host
+  recomputes, then calls main again\" ordering."
+  ([state] (step! state default-dt))
+  ([state dt]
+   (let [dt (double dt)]
+     (swap! (:entities state)
+            (fn [es]
+              (reduce-kv (fn [m id e]
+                           (assoc m id
+                                  (assoc e
+                                         :x (+ (:x e) (* (:vx e) dt))
+                                         :y (+ (:y e) (* (:vy e) dt))
+                                         :z (+ (:z e) (* (:vz e) dt)))))
+                         (sorted-map) es)))
+     (swap! (:tick state) inc))
+   nil))
+
+;; ---------------------------------------------------------------------------
+;; Wire layer, :cljs — the canonical non-JVM host path: a (module "kotoba")
+;; import object for the native js/WebAssembly engine (browser or Node).
+;; MEMORY-BOX is the deferred-memory convention (wasm-webcomponent's
+;; kgraph.js / kotoba-wasm-element.js): the module exports its own memory,
+;; so set (set! (.-memory memory-box) (.. instance -exports -memory)) after
+;; instantiation. No bit-unpacking: the WebAssembly JS API hands host
+;; functions real numbers and frounds f32 returns, landing on exactly the
+;; same f32 values the JVM path's floatToRawIntBits produces.
+
+
+
+;; ---------------------------------------------------------------------------
+;; Wire layer, :clj — Chicory wiring, kept for the existing kotoba.wasm-exec
+;; test suite only (the JVM is the last-resort runtime, not the premise).
+
+

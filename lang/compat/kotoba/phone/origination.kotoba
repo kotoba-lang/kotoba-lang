@@ -1,0 +1,302 @@
+(ns kotoba.phone.origination
+  "The deterministic pre-check for placing an outbound call (発信).
+
+  Answering a call and placing one are not the same authority. An inbound call
+  arrives whether or not anybody wanted it, and the decision is whether to
+  speak. An outbound call is an act this side chose to perform, against a
+  destination this side chose, at this side's cost -- it can defraud (toll
+  fraud), it can harass, and it can reach a party who never asked to be
+  reached. So it gets its own gate, and the gate is arithmetic and tables, run
+  BEFORE any human is asked, exactly as kotoba.card's amount checks are.
+
+  Four refusals here are worth stating plainly, because each one exists for a
+  failure that has a name:
+
+  1. AN EMERGENCY NUMBER IS NEVER A DESTINATION on this path. See
+     `emergency-issue` -- the reasoning is there and it is not about capability.
+  2. A SHORT CODE needs an explicit allowlist. Short numbers sit next to the
+     emergency and service ranges, and 'anything three digits' is how a typo
+     becomes a call somewhere consequential.
+  3. THE CALLING NUMBER MUST BE ONE THE SUBJECT HOLDS AND HAS ACTIVE. Presenting
+     a number you do not hold is caller-ID spoofing, and the reason this check
+     can exist at all is that numbering records and call records are on the same
+     plane (ADR-2607300300 D4). Split them across two stores and this function
+     cannot be written.
+  4. COST IS CHECKED AGAINST A STATED LIMIT, and an absent limit refuses. An
+     unknown limit is not an unlimited one -- the same rule the card adapter's
+     daily-limit gate follows, pointed at the toll-fraud version of the same
+     failure.
+
+  What is NOT here: whether the callee consented to be called, whether the hour
+  is lawful in their jurisdiction, whether the purpose is permitted. Those need
+  law or judgement and belong to the actor's Governor.
+
+  Portable (.cljc) across JVM / ClojureScript / SCI / GraalVM."
+  (:require [clojure.string :as str]
+            [kotoba.phone :as phone]))
+
+(def universal-emergency
+  "Short numbers that reach emergency services essentially everywhere.
+
+  112 is routed by GSM handsets regardless of the network's country, and 911 is
+  widely mapped alongside it. They are refused without reference to a country
+  code because a caller who gets the country wrong must not thereby get the
+  refusal wrong."
+  #{"112" "911"})
+
+(def emergency-numbers
+  "Emergency short numbers by ITU-T country code. REPRESENTATIVE, NOT
+  EXHAUSTIVE -- the same caveat kotoba.phone/country-codes carries.
+
+  Because it is not exhaustive, it is not the only defence: `classify` treats
+  any 3-or-4 digit destination as a `:short-code`, and short codes are refused
+  unless explicitly allowlisted. A country missing from this table therefore
+  fails CLOSED (its emergency number is refused as an unlisted short code)
+  rather than open."
+  {"1"  #{"911"}
+   "44" #{"999" "112"}
+   "81" #{"110" "118" "119"}
+   "82" #{"112" "119"}
+   "86" #{"110" "119" "120" "122"}
+   "33" #{"15" "17" "18" "112"}
+   "49" #{"110" "112"}
+   "39" #{"112" "113" "115" "118"}
+   "34" #{"112" "091" "092"}
+   "61" #{"000" "112"}
+   "64" #{"111"}
+   "91" #{"100" "101" "102" "112"}
+   "55" #{"190" "192" "193"}
+   "7"  #{"101" "102" "103" "112"}})
+
+(def premium-rate-prefixes
+  "National-number prefixes that bill the CALLER at a premium and pay the
+  called party. REPRESENTATIVE, NOT EXHAUSTIVE.
+
+  Toll fraud is the reason this table exists: the classic scheme is to originate
+  many calls to a premium number the fraudster shares revenue on, and the bill
+  lands on whoever's line placed them."
+  {"1"  ["900" "976"]
+   "44" ["9"]
+   "81" ["990"]
+   "49" ["900"]
+   "33" ["89"]
+   "61" ["190"]})
+
+(def toll-free-prefixes
+  "National-number prefixes that bill the CALLED party. REPRESENTATIVE."
+  {"1"  ["800" "833" "844" "855" "866" "877" "888"]
+   "44" ["800" "808"]
+   "81" ["120" "800"]
+   "49" ["800"]
+   "61" ["1800"]})
+
+(defn- short-code?
+  "True for a bare 2-4 digit destination -- a service or emergency number rather
+  than a subscriber number. Checked on the RAW input, because a short code never
+  survives E.164 normalization (which requires 6 digits)."
+  [destination]
+  (boolean (and (string? destination)
+                (re-matches #"\d{2,4}" (str/replace destination #"[\s\-().]" "")))))
+
+(defn- bare-digits
+  "Every digit in the destination, and nothing else."
+  [destination]
+  (str/replace (str destination) #"\D" ""))
+
+(defn- readings
+  "Every plausible reading of these digits as a national number.
+
+  An emergency number written internationally (`+81110`, `0081110`) is too short
+  to be valid E.164, so `phone/parse-e164` cannot split it and this does it by
+  hand: strip an international access prefix, then strip any country code that
+  the digits actually start with. Matching is exact against the tables, so a
+  real subscriber number that merely BEGINS with a country code and an emergency
+  number (`+81110 1234`) does not match anything."
+  [digits home-country-code]
+  (let [without-access (cond
+                         (str/starts-with? digits "011") (subs digits 3)
+                         (str/starts-with? digits "00")  (subs digits 2)
+                         :else digits)
+        codes (cons (str home-country-code) (keys emergency-numbers))]
+    ;; `hash-set`, not a set literal: the two readings are equal whenever there
+    ;; was no access prefix, and a literal with duplicate values throws.
+    (into (hash-set digits without-access)
+          (for [cc codes
+                d [digits without-access]
+                :when (and (seq cc) (str/starts-with? d cc) (> (count d) (count cc)))]
+            (subs d (count cc))))))
+
+(defn emergency?
+  "True when destination reaches emergency services, judged against the caller's
+  home country and the universal set.
+
+  Every spelling is recognised: the bare short code (`110`), the same number
+  written internationally (`+81110`), and with an access prefix (`0081110`). A
+  table that only knew one of them would be defeated by writing another, and the
+  refusal a caller gets for a badly formatted emergency number must not be
+  `:malformed` -- that reads as 'fix the format and try again', which is an
+  instruction to keep going until one works.
+
+  Matched against the union of EVERY country's table, not just the home
+  country's. The asymmetry is the same one `emergency-issue` describes: a
+  Japanese deployment being refused France's `18` costs it nothing it should
+  have had, and the alternative -- a home-country table that lets another
+  country's emergency number through -- costs somebody an ambulance."
+  [destination home-country-code]
+  (let [candidates (readings (bare-digits destination) home-country-code)
+        listed (into (get emergency-numbers (str home-country-code) #{})
+                     (apply concat (vals emergency-numbers)))]
+    (boolean (some #(or (contains? universal-emergency %)
+                        (contains? listed %))
+                   candidates))))
+
+(defn- prefixed?
+  [national prefixes]
+  (boolean (some #(str/starts-with? (str national) %) prefixes)))
+
+(defn classify
+  "Classify an outbound destination relative to the caller's home country.
+
+  Returns one of `:emergency` `:short-code` `:premium-rate` `:toll-free`
+  `:domestic` `:international` `:malformed`.
+
+  `:malformed` rather than a guess: a destination this library cannot parse is
+  one whose cost, jurisdiction and nature are all unknown, and the caller needs
+  to be told that rather than handed a default."
+  [destination home-country-code]
+  (let [home (str home-country-code)
+        parsed (phone/parse-e164 destination)
+        cc (:phone/country-code parsed)
+        national (:phone/national parsed)]
+    (cond
+      (emergency? destination home) :emergency
+      (short-code? destination) :short-code
+      (nil? parsed) :malformed
+      (and (= cc home) (prefixed? national (get premium-rate-prefixes home []))) :premium-rate
+      (and (= cc home) (prefixed? national (get toll-free-prefixes home []))) :toll-free
+      (= cc home) :domestic
+      :else :international)))
+
+(defn emergency-issue
+  "The emergency refusal, or nil.
+
+  READ THIS BEFORE CHANGING IT. This does not sit on anybody's dialer and does
+  not stop a person calling emergency services -- a human in trouble picks up a
+  phone and dials, and nothing in this fleet is between them and the call. What
+  it refuses is for a GOVERNED PROPOSAL to be the thing that dials: a machine-
+  originated emergency call, approved through an automated spine, reaching a
+  dispatcher who will send people to an address.
+
+  The asymmetry is why it is absolute rather than a policy knob. A wrongly
+  refused proposal costs a person a few seconds and their own phone. A wrongly
+  placed one sends an ambulance somewhere it is not needed and takes it from
+  somewhere it is, and no consent recorded on this side can give it back."
+  [destination home-country-code]
+  (when (emergency? destination home-country-code)
+    {:phone/issue :origination/emergency-destination
+     :phone/destination destination
+     :phone/detail
+     "緊急通報は governed proposal の宛先にできません（人が自分の電話から直接かけること）"}))
+
+(defn holds-active-number?
+  "True when records show this subject holding this number in `:active` state.
+
+  Both the holder AND the state are checked. A number a subject holds but has
+  suspended is not one they may present: the line is out of service, and
+  presenting it says otherwise to whoever is called."
+  [records subject msisdn]
+  (let [m (phone/normalize-e164 msisdn)]
+    (boolean
+     (and m
+          (some #(and (= m (:phone/msisdn %))
+                      (= :active (:phone/state %))
+                      (= (str subject) (str (:phone/subject %))))
+                records)))))
+
+(defn cost-issues
+  "Cost refusals, as a seq. Integer minor units throughout -- no floats, for the
+  same reason money is never a double.
+
+  Absent inputs refuse, and the refusal names which one was missing rather than
+  saying 'unknown', because 'we do not know the rate' and 'we do not know the
+  limit' are fixed by different people."
+  [{:keys [estimated-minutes rate-minor-per-minute daily-limit-minor
+           spent-today-minor]}]
+  (let [missing (cond-> []
+                  (not (and (number? estimated-minutes) (pos? estimated-minutes)))
+                  (conj :estimated-minutes)
+                  (not (and (number? rate-minor-per-minute) (not (neg? rate-minor-per-minute))))
+                  (conj :rate-minor-per-minute)
+                  (not (number? daily-limit-minor)) (conj :daily-limit-minor)
+                  (not (number? spent-today-minor)) (conj :spent-today-minor))]
+    (if (seq missing)
+      [{:phone/issue :origination/cost-unknown :phone/missing (vec missing)}]
+      (let [estimate (* (long estimated-minutes) (long rate-minor-per-minute))
+            total    (+ (long spent-today-minor) estimate)]
+        (if (> total (long daily-limit-minor))
+          [{:phone/issue :origination/daily-limit-exceeded
+            :phone/estimate-minor estimate
+            :phone/spent-today-minor spent-today-minor
+            :phone/daily-limit-minor daily-limit-minor}]
+          [])))))
+
+(defn origination-issues
+  "Return a seq of reasons this outbound call may not be placed, empty when it
+  may. Pure and total; every fact is passed in.
+
+    :records                what this operator knows about its numbers
+    :subject                who is placing the call
+    :calling-number         the number to present (must be held AND active)
+    :destination            who is being called
+    :home-country-code      the caller's country, for classification
+    :allowed-short-codes    the only short codes this deployment may dial
+    :allow-premium-rate?    explicit opt-in for a premium-rate destination
+    :estimated-minutes      / :rate-minor-per-minute
+    :daily-limit-minor      / :spent-today-minor
+    :retain-recording?      / :caller-consented-to-recording?
+
+  Ordered so that the refusal a person is told is the most consequential one
+  that applies: an emergency destination is reported as such even when the
+  calling number is also wrong, because fixing the calling number would not make
+  the call acceptable."
+  [{:keys [records subject calling-number destination home-country-code
+           allowed-short-codes allow-premium-rate?
+           retain-recording? caller-consented-to-recording?] :as request}]
+  (let [kind (classify destination home-country-code)
+        emergency (emergency-issue destination home-country-code)]
+    (cond
+      emergency [emergency]
+
+      (= :malformed kind)
+      [{:phone/issue :origination/destination-invalid :phone/destination destination}]
+
+      (and (= :short-code kind)
+           (not (contains? (set (map bare-digits (or allowed-short-codes [])))
+                           (bare-digits destination))))
+      [{:phone/issue :origination/short-code-not-allowed
+        :phone/destination destination}]
+
+      (not (holds-active-number? records subject calling-number))
+      [{:phone/issue :origination/calling-number-not-held
+        :phone/calling-number calling-number
+        :phone/subject subject}]
+
+      (and (= :premium-rate kind) (not (true? allow-premium-rate?)))
+      [{:phone/issue :origination/premium-rate-not-allowed
+        :phone/destination destination}]
+
+      :else
+      (vec (concat (phone/recording-retention-issues
+                    {:phone/retain? retain-recording?
+                     :phone/consented? caller-consented-to-recording?})
+                   ;; A toll-free or short-code call still has a cost of zero to
+                   ;; state; the caller states it rather than this function
+                   ;; assuming it, so the ledger records what was believed.
+                   (cost-issues request))))))
+
+(defn describe
+  "A one-line rendering of what would be dialled, for an operator log."
+  [{:keys [calling-number destination home-country-code]}]
+  (str (or (phone/normalize-e164 calling-number) calling-number)
+       " -> " destination
+       " (" (name (classify destination home-country-code)) ")"))

@@ -1,0 +1,231 @@
+(ns provider.http-transport
+  "Production transport for the bounded HTTP capability kit (ADR 0026,
+  `provider.http`), backed by a real blocking
+  `java.net.http.HttpClient`. See
+  docs/adr/0066-production-http-transport-bounded-redirect-following.md for
+  the full design rationale; this docstring is the summary.
+
+  This namespace does NOT define a new provider or a new capability, and does
+  NOT modify `http.cljc`. Every bound `http.cljc` already enforces on the
+  guest-facing request -- exact-origin allowlist, absolute-HTTPS-only, no
+  fragments, header-count/size/body/timeout bounds -- runs exactly as before,
+  unchanged and un-weakened, before this transport is ever invoked. This
+  namespace builds the one thing every provider in this ADR chain has always
+  deferred to the host (ADR 0026: 'Production hosts may implement deadlines
+  and I/O outside the guest, but must return the same bounded result'): a
+  real synchronous `(fn [request] -> reply)` you pass as `:transport` to
+  `provider.http/provider`.
+
+  ## SSRF is the primary threat model here, not an afterthought
+
+  ADR 0064's LLM transport always calls ONE fixed, host-chosen endpoint.
+  `:http/post` calls whatever HTTPS origin the GUEST names, bounded only by
+  the host's own closed `allowed-origins` set -- so, unlike the LLM
+  transport, this is a genuine server-side-request-forgery surface. Three
+  defenses this namespace adds ON TOP OF (never in place of) `http.cljc`'s
+  own bounds:
+
+  1. **Redirects are never auto-followed by the JDK.** The `HttpClient` is
+     built with `HttpClient$Redirect/NEVER`; THIS namespace owns the redirect
+     loop instead, and re-validates EVERY hop's resolved origin against the
+     exact same closed `allowed-origins` set the host also gave to
+     `http/provider` (a required constructor option here, not optional, and
+     it must be the identical set) before following it -- matching the
+     capability kit's own already-declared semantics
+     (`resources/kotoba/lang/capability-kits/http-v1.edn`:
+     `:redirects :transport-must-not-follow-outside-allowlist`). A redirect
+     whose target origin is not in the allow-list, or that would exceed
+     `:max-redirects` (default 5), is simply NOT followed -- the 3xx
+     response is returned to the guest as an ordinary typed `:ok` response
+     (never silently swallowed, never a thrown exception) so the guest or
+     its host can decide whether to issue a fresh, independently-bounded
+     `:http/post` call of its own.
+  2. **A best-effort private/loopback/link-local/multicast destination-IP
+     block runs before every hop's actual connection**
+     (`InetAddress/getAllByName` -> reject if ANY resolved address is
+     loopback, link-local, RFC1918/site-local, IPv6 unique-local
+     (`fc00::/7`), multicast, or any-local/wildcard). This is explicitly NOT
+     a complete DNS-rebinding defense -- see `destination-blocked?` and
+     docs/adr/0066 'Remaining gaps': the address checked here is not pinned
+     for the actual `HttpClient.send` connection that follows, so a TOCTOU
+     race against attacker-controlled DNS with a very short TTL is not fully
+     closed by this check alone.
+  3. **The response body is read through a length-bounded stream reader**
+     (never `BodyHandlers/ofByteArray`'s fully-unbounded in-memory buffer),
+     and every response header is folded to a bounded count/size before
+     being handed back to `http.cljc`. Both defend `http.cljc`'s own
+     post-transport checks (`value/bounded-string!` on the body,
+     `typed-headers` on the header set) -- which run OUTSIDE
+     `invoke-transport`'s try/catch -- from throwing an unhandled exception
+     on an ordinary large-body or many-header real-world response, which
+     would otherwise violate ADR 0026's own invariant that 'the guest never
+     receives a connection, stream, promise, or host exception'.
+
+  ## `:cljs` / nbb production transport (ADR 0117)
+
+  nbb/Node has no built-in *synchronous* HTTP primitive (`fetch` is
+  Promise-based). This namespace keeps the reference provider's synchronous
+  `(fn [request] -> reply)` contract by running each hop in a child
+  `node` process via `child_process.spawnSync` (the same blocking-subprocess
+  pattern this monorepo already uses for conformance launchers). The
+  redirect loop, allow-list revalidation, and connect-refusal asymmetry
+  stay in portable cljs so they match the `:clj` loop's structure and
+  remain unit-testable with `with-redefs`. Destination-IP blocking on
+  `:cljs` resolves hostnames through the same child (`dns.lookup`); IP
+  literals are checked without DNS. DNS-rebinding TOCTOU remains an
+  explicit remaining gap (same honesty as ADR 0066's `:clj` path)."
+  (:require [clojure.string :as string]
+            [provider.http :as http]
+            [kotoba.kir.value :as value])
+  )
+
+(def default-connect-timeout-ms
+  "HttpClient-level TCP connect timeout. Independent of the guest-supplied
+  per-request `timeout-ms` (which bounds each hop's whole request/response
+  cycle via `HttpRequest.Builder/timeout`, enforced already by `http.cljc`
+  to be within `[1, http/max-timeout-ms]`)."
+  5000)
+
+(def default-max-redirects
+  "How many redirect hops this namespace's own loop will follow before
+  giving up and returning the last 3xx response as-is. `0` disables
+  redirect-following entirely (every 3xx is returned immediately). Bounded
+  small on purpose: worst-case wall-clock time for one guest `:http/post`
+  call is bounded by `(inc max-redirects) * timeout-ms`, so this value
+  directly controls how much that can multiply the guest's own bounded
+  per-call timeout."
+  5)
+
+(def restricted-header-names
+  "Header names `java.net.http.HttpRequest.Builder/header` refuses to set
+  itself (a JDK client restriction, not a Kotoba bound). Dropped
+  defensively before building the outbound request so a guest that
+  happens to set one of these degrades quietly -- the header is simply not
+  forwarded -- instead of the whole call failing with an opaque
+  `IllegalArgumentException` thrown from deep inside the JDK client (which
+  would still be caught and typed by `http.cljc`'s `invoke-transport`, but
+  with no useful information)."
+  #{"connection" "content-length" "expect" "host" "upgrade"})
+
+;; ---------------------------------------------------------------------------
+;; origin canonicalization -- intentionally duplicated from
+;; `provider.http`'s private `https-origin` (that fn is
+;; `defn-`, not exported, and this namespace needs a non-throwing predicate
+;; form for the redirect loop). Keep the regex in sync if `http.cljc`'s ever
+;; changes -- see docs/adr/0066 for why this is a deliberate duplication
+;; rather than reaching into `http.cljc`'s private var.
+;; ---------------------------------------------------------------------------
+
+(def origin-pattern
+  #"https://([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::([0-9]+))?(?:/[^ ]*)?")
+
+(defn canonical-origin
+  "Returns the canonical `\"https://host[:port]\"` origin for `url`, or nil
+  if it is not an absolute HTTPS URL, carries a fragment, or otherwise fails
+  to parse -- never throws. Mirrors `http.cljc`'s own `https-origin`
+  acceptance rule exactly (same regex, same lower-cased host) so a set of
+  origins already validated as canonical by `http/provider` also validates
+  identically here."
+  [url]
+  (when (and (string? url) (not (string/includes? url "#")))
+    (when-let [[_ host port] (re-matches origin-pattern url)]
+      (str "https://" (string/lower-case host) (when port (str ":" port))))))
+
+;; ---------------------------------------------------------------------------
+;; destination-IP check (best-effort; see ns docstring point 2 and
+;; docs/adr/0066 Remaining gaps for what this does NOT close)
+;; ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+;; ---------------------------------------------------------------------------
+;; bounded response decoding -- defends `http.cljc`'s own post-transport
+;; `value/bounded-string!` / `typed-headers` checks (outside
+;; `invoke-transport`'s try/catch) from an unhandled exception on an
+;; ordinary large-body or many-header real response.
+;; ---------------------------------------------------------------------------
+
+
+
+(defn- truncate-to-byte-limit
+  "Trims `s` until its re-encoded UTF-8 byte count is `<= limit`. Shared by
+  `:clj` (post-decode safety net) and `:cljs` (header/body folding)."
+  [s limit]
+  (loop [s s]
+    (if (<= (value/utf8-byte-count! s) limit)
+      s
+      (recur (subs s 0 (max 0 (dec (count s))))))))
+
+
+
+
+
+;; ---------------------------------------------------------------------------
+;; per-hop request/response
+;; ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+;; ---------------------------------------------------------------------------
+;; public constructor
+;; ---------------------------------------------------------------------------
+
+
+
+(def default-get-stream-timeout-ms
+  "Per-hop timeout for get-stream (request schema has no timeout field)."
+  30000)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

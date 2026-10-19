@@ -1,0 +1,348 @@
+(ns kami.dance
+  "VRM dance stage as data — the CLJ/EDN twin of `kami-live` (ADR-0043/0044/0045),
+   projected onto the render-IR `kami.webgpu` already consumes.
+
+   A dance stage is a `:dance/*` EDN scene (the same vocabulary `kami_live::scene`
+   reads): a tempo grid (`:dance/show`), one-or-more VRM performers (`:dance/avatar`,
+   `:dance/cast`), a beat-synced setlist of dance moves (`:dance/setlist`), a static
+   stage set (`:dance/stage`), a crowd, lighting and a camera rig (`:dance/camera`).
+   Everything is data you fork and diff — a stage *is* a shareable artifact, exactly
+   like a kami game.
+
+   This namespace is the pure, cross-platform (`.cljc`) projection: given a scene and a
+   wall-clock time `t` (seconds), `frame-ir` returns a render-IR map
+
+     {:globals {:sky {…} :eye [..] :target [..]} :instances [{:pos :color :size :yaw …}]}
+
+   which `kami.webgpu/draw!` (or the WebGL2 path) renders with no GPU-specific code.
+   The performer is the same 6-box humanoid the native `dance_png` example poses from a
+   `DancePose` (root step + body yaw + vertical bob + arms-up + spine sway); the skinned
+   VRM mesh replaces it once the web executor consumes render-IR `:meshes`. The moves are
+   faithful ports of `kami_live::performer::DanceMove`, so a stage replays identically on
+   web and native given (bpm, t0)."
+  (:require [clojure.string :as str]))
+
+;; --- trig (cross-platform) ---------------------------------------------------
+(def ^:const TAU 6.283185307179586)
+(def ^:const PI  3.141592653589793)
+(defn- sin [x] )
+(defn- cos [x] )
+(defn- frac [x] (- x ))
+(defn- clamp01 [x] (max 0.0 (min 1.0 x)))
+(defn- lerp [a b t] (+ a (* (- b a) t)))
+(defn- smoothstep [t] (let [t (clamp01 t)] (* t t (- 3.0 (* 2.0 t)))))
+
+;; --- DancePose ----------------------------------------------------------------
+;; The reduced pose every move emits (mirrors kami_live::performer::DancePose):
+;;   {:root [x y z]   ;; world-space root drift (side-step / footwork)
+;;    :yaw f          ;; body rotation about Y (radians)
+;;    :bob f          ;; crouch(-)/jump(+) bias in metres
+;;    :arms-up f      ;; arms-up amount in [0,1]
+;;    :spine f}       ;; spine sway (Z-tilt, radians)
+(def rest-pose {:root [0.0 0.0 0.0] :yaw 0.0 :bob 0.0 :arms-up 0.0 :spine 0.0})
+
+;; --- dance moves: pure pose-over-time functions -------------------------------
+;; Faithful ports of kami_live's presets. `bf` = beat fraction [0,1), `barf` = bar
+;; fraction [0,1). Each returns a (partial) pose merged over `rest-pose`. Add a move
+;; by adding a key — it is then selectable from a setlist track's `:dance`.
+
+(defmulti move-pose
+  "Pose for a named dance move at (beat-frac, bar-frac). Unknown → :idle."
+  (fn [move _bf _barf] (keyword move)))
+
+(defmethod move-pose :default [_ bf barf] (move-pose :idle bf barf))
+
+(defmethod move-pose :idle [_ bf _]
+  (assoc rest-pose :bob (* 0.04 (sin (* bf TAU)))))
+
+(defmethod move-pose :four-on-floor [_ bf _]
+  (assoc rest-pose :bob (* -0.12 (- 1.0 (let [u (- 1.0 bf)] (* u u)))) :arms-up 0.2))
+
+(defmethod move-pose :wota [_ _ barf]
+  (assoc rest-pose
+         :bob (* 0.05 (sin (* barf TAU 2.0)))
+         :arms-up (if (< barf 0.25) 0.95 0.4)
+         :root [(* 0.15 (sin (* barf TAU))) 0.0 0.0]))
+
+(defmethod move-pose :kpop-point [_ bf barf]
+  (assoc rest-pose
+         :arms-up (if (< bf 0.4) 0.9 0.4)
+         :yaw (* 0.3 (sin (* barf TAU)))
+         :spine (* 0.05 (cos (* bf TAU)))))
+
+(defmethod move-pose :shuffle [_ bf barf]
+  (assoc rest-pose
+         :root [(* 0.4 (sin (* barf TAU))) 0.0 0.0]
+         :bob (* 0.03 (sin (* bf TAU 2.0)))))
+
+(defmethod move-pose :hold [_ _ _] rest-pose)
+
+(defmethod move-pose :bounce [_ bf _]
+  (assoc rest-pose
+         :bob (* -0.12 ( (sin (* bf PI))))
+         :arms-up 0.3))
+
+(defmethod move-pose :sway [_ bf barf]
+  (assoc rest-pose
+         :root [(* 0.22 (sin (* barf TAU))) 0.0 0.0]
+         :spine (* 0.16 (sin (* barf TAU)))
+         :bob (* 0.03 (sin (* bf TAU)))))
+
+(defmethod move-pose :spin [_ bf barf]
+  (assoc rest-pose
+         :yaw (* barf TAU)                ;; one full turn per bar
+         :arms-up 0.5
+         :bob (* 0.04 (sin (* bf TAU)))))
+
+(defmethod move-pose :headbang [_ bf _]
+  (assoc rest-pose
+         :bob (* -0.16 (- 1.0 (let [u (- 1.0 bf)] (* u u u))))
+         :arms-up 0.15))
+
+(defmethod move-pose :clap [_ bf _]
+  (assoc rest-pose
+         :arms-up (+ 0.5 (* 0.45 ( (sin (* bf TAU 2.0)))))
+         :bob (* 0.03 (sin (* bf TAU)))))
+
+;; --- beat grid: time → where we are in the show ------------------------------
+
+(defn show-grid
+  "Resolve the master tempo grid from `:dance/show`. Returns a map of derived constants."
+  [scene]
+  (let [show (:dance/show scene)
+        bpm  (or (:bpm show) 120.0)
+        meter (or (:meter show) [4 8])
+        bpb  (max 1 (nth meter 0))]      ;; beats per bar
+    {:bpm bpm :bpb bpb :spb (/ 60.0 bpm) :swing (or (:swing show) 0.0)}))
+
+(defn beat-at
+  "Position in the show at wall-clock `t` (seconds): total beats/bars and the fractional
+   phase within the current beat and bar (both in [0,1)). Deterministic given (bpm, t)."
+  [scene t]
+  (let [{:keys [spb bpb]} (show-grid scene)
+        total-beats (/ t spb)
+        bar ]
+    {:total-beats total-beats
+     :bar bar
+     :beat-frac (frac total-beats)
+     :bar-frac  (frac (/ total-beats bpb))}))
+
+(defn setlist-move
+  "The dance move keyword active at integer `bar`, by walking the `:dance/setlist`
+   `:bars` ranges (the setlist loops). Falls back to `:idle`."
+  [scene bar]
+  (let [tracks (vec (:dance/setlist scene))]
+    (if (empty? tracks)
+      {:move :idle :title nil :track 0}
+      (let [total (reduce + (map #(max 1 (or (:bars %) 8)) tracks))
+            b (mod bar (max 1 total))]
+        (loop [i 0 acc 0]
+          (if (>= i (count tracks))
+            {:move :idle :title nil :track 0}
+            (let [tk (nth tracks i)
+                  n (max 1 (or (:bars tk) 8))]
+              (if (< b (+ acc n))
+                {:move (or (:dance tk) :idle) :title (:title tk) :track i}
+                (recur (inc i) (+ acc n))))))))))
+
+;; --- the performer: a 6-box humanoid posed from a DancePose ------------------
+;; Ported from kami-live's `dance_png::humanoid`: legs/torso/head/arms as lit boxes,
+;; rotated by body yaw and lifted by arms-up. `home` is the performer's [x z] spot on
+;; the floor; `skin` overrides the default palette (so a cast reads as distinct dancers).
+
+(def default-skin
+  {:legs  [0.20 0.24 0.42]
+   :torso [0.30 0.45 0.90]
+   :head  [0.95 0.80 0.70]
+   :arms  [0.95 0.80 0.70]})
+
+(defn humanoid-instances
+  "Render-IR instances for one performer posed by `pose`, standing at `home` [x z]."
+  [pose [hx hz] skin]
+  (let [{:keys [yaw bob arms-up spine]} pose
+        [rx0 _ rz0] (:root pose)
+        s (sin yaw) c (cos yaw)
+        bx (+ hx rx0) bz (+ hz rz0)
+        by (max bob -0.2)
+        lift (* arms-up 0.35)
+        sk (merge default-skin skin)
+        ;; [local-x base-y local-z] [w h] color  (lean upper body by spine sway)
+        parts [[[-0.13 0.0  0.0] [0.16 0.80] (:legs sk)]
+               [[ 0.13 0.0  0.0] [0.16 0.80] (:legs sk)]
+               [[(* spine 0.30) 0.80 0.0] [0.42 0.55] (:torso sk)]
+               [[(* spine 0.55) 1.42 0.0] [0.26 0.26] (:head sk)]
+               [[(- (* spine 0.55) 0.32) (+ 0.85 lift) 0.0] [0.14 0.45] (:arms sk)]
+               [[(+ (* spine 0.55) 0.32) (+ 0.85 lift) 0.0] [0.14 0.45] (:arms sk)]]]
+    (mapv (fn [[[lx ly lz] size color]]
+            (let [wx (- (* lx c) (* lz s))
+                  wz (+ (* lx s) (* lz c))]
+              {:pos [(+ bx wx) (+ by ly) (+ bz wz)]
+               :color color :size size :yaw yaw
+               :metallic 0.0 :roughness 0.7 :emissive 0.0 :geo :box}))
+          parts)))
+
+;; --- stage set, crowd, floor -------------------------------------------------
+
+(defn stage-instances
+  "Static set pieces (`:dance/stage :props`) as boxes. `pulse` ∈ [0,1] brightens
+   emissive fixtures on the beat (LED walls / lit props breathe with the kick)."
+  [scene pulse]
+  (mapv (fn [{:keys [pos size color emissive]}]
+          (let [[px py pz] pos
+                [w h] (or size [1.0 1.0])
+                e (* (or emissive 0.0) (+ 0.7 (* 0.3 pulse)))]
+            {:pos [px (- py (* h 0.5)) pz]    ;; authored pos is the box centre
+             :color (or color [0.2 0.2 0.22]) :size [w h] :yaw 0.0
+             :metallic 0.1 :roughness 0.6 :emissive e :geo :box}))
+        (get-in scene [:dance/stage :props])))
+
+(defn floor-instance
+  "A wide dark dance floor under the cast."
+  [scene]
+  (let [f (:dance/floor scene)]
+    {:pos [0.0 -0.05 0.0]
+     :color (or (:color f) [0.10 0.10 0.13])
+     :size [(or (:size f) 24.0) 0.1] :yaw 0.0
+     :metallic 0.2 :roughness 0.5 :emissive 0.0 :geo :box}))
+
+(defn crowd-instances
+  "Deterministic audience: small bobbing boxes ringing the stage, placed by a seeded
+   xorshift (same seed → same crowd). `beats` drives a per-fan bob so the pit moves."
+  [scene beats]
+  (let [{:keys [fans seed radius]} (:dance/crowd scene)
+        n (min 600 (or fans 0))]
+    (when (pos? n)
+      (let [r0 (or radius 9.0)
+            seed0 (or seed 1)]
+        (loop [i 0, st (bit-or 1 seed0), acc (transient [])]
+          (if (>= i n)
+            (persistent! acc)
+            (let [s1 (bit-and (bit-xor st (bit-shift-left st 13)) 0x7fffffff)
+                  s2 (bit-and (bit-xor s1 (unsigned-bit-shift-right s1 17)) 0x7fffffff)
+                  st' (bit-and (bit-xor s2 (bit-shift-left s2 5)) 0x7fffffff)
+                  a (* (/ (bit-and s1 0xffff) 65535.0) TAU)
+                  rr (+ r0 (* (/ (bit-and s2 0xffff) 65535.0) 6.0))
+                  x (* (cos a) rr) z (+ 2.0 (* (sin a) rr 0.5))
+                  bob (* 0.12 (max 0.0 (sin (+ (* beats PI) (* i 1.7)))))
+                  hue (mod (* i 0.13) 1.0)]
+              (recur (inc i) st'
+                     (conj! acc {:pos [x bob z]
+                                 :color [(+ 0.3 (* 0.5 hue)) (+ 0.2 (* 0.4 (- 1.0 hue))) 0.6]
+                                 :size [0.34 0.7] :yaw 0.0
+                                 :metallic 0.0 :roughness 0.9 :emissive 0.0 :geo :box})))))))))
+
+;; --- camera + sky/lighting → render-IR globals -------------------------------
+
+(defn camera-eye-target
+  "Eye/target from `:dance/camera`: pick the latest `:shots` entry whose `:at-bar` ≤
+   the current bar and smoothstep-dolly toward the next shot through the bar. Eye sits
+   at the performer focus + `:offset`; the look target at focus + `:look`."
+  [scene {:keys [bar bar-frac]} [fx fy fz]]
+  (let [cam (:dance/camera scene)
+        shots (vec (sort-by #(or (:at-bar %) 0) (:shots cam)))
+        add (fn [[a b c] [d e f]] [(+ a d) (+ b e) (+ c f)])]
+    (if (empty? shots)
+      {:eye (add [fx fy fz] [0.0 3.0 8.0]) :target (add [fx fy fz] [0.0 1.0 0.0])}
+      (let [idx (loop [i 0 last 0]
+                  (if (or (>= i (count shots)) (> (or (:at-bar (nth shots i)) 0) bar))
+                    last (recur (inc i) i)))
+            cur (nth shots idx)
+            nxt (nth shots (min (dec (count shots)) (inc idx)))
+            span (max 1 (- (or (:at-bar nxt) 0) (or (:at-bar cur) 0)))
+            t (smoothstep (/ (+ (- bar (or (:at-bar cur) 0)) bar-frac) span))
+            off (mapv #(lerp %1 %2 t) (or (:offset cur) [0 3 8]) (or (:offset nxt) [0 3 8]))
+            look (mapv #(lerp %1 %2 t) (or (:look cur) [0 1 0]) (or (:look nxt) [0 1 0]))]
+        {:eye (add [fx fy fz] off) :target (add [fx fy fz] look)
+         :fov (or (:fov cam) 0.9)}))))
+
+(def stage-sky
+  {:club     {:horizon [0.06 0.05 0.10] :sun-dir [-0.3 -0.8 -0.4] :sun [0.7 0.6 0.9]}
+   :hall     {:horizon [0.10 0.10 0.16] :sun-dir [-0.4 -0.85 -0.35] :sun [1.0 0.95 0.9]}
+   :festival {:horizon [0.16 0.18 0.28] :sun-dir [-0.5 -0.7 -0.3] :sun [1.0 0.85 0.7]}})
+
+(defn sky-globals
+  "Sky/sun for the venue (`:dance/show :stage`), with a subtle beat pulse so the room
+   breathes with the kick."
+  [scene pulse]
+  (let [stage (get-in scene [:dance/show :stage] :hall)
+        base (get stage-sky stage (:hall stage-sky))
+        k (+ 0.85 (* 0.15 pulse))]
+    (update base :horizon (fn [[r g b]] [(* r k) (* g k) (* b k)]))))
+
+;; --- the cast: one-or-more performers ----------------------------------------
+
+(defn cast
+  "The performers on stage. `:dance/cast` is an explicit list of
+   {:home [x z] :dance <move-override> :skin {…}}; otherwise the single `:dance/avatar`
+   becomes a one-element cast. A cast member with no `:dance` follows the setlist."
+  [scene]
+  (let [explicit (:dance/cast scene)]
+    (if (seq explicit)
+      (vec explicit)
+      (let [av (:dance/avatar scene)
+            [hx _ hz] (or (:home av) [0.0 0.0 0.0])]
+        [{:home [hx hz] :skin nil :dance nil}]))))
+
+(defn performer-focus
+  "The camera focus point — the centroid of the cast's home spots, raised to head height."
+  [members]
+  (let [n (max 1 (count members))
+        sx (reduce + (map #(get-in % [:home 0]) members))
+        sz (reduce + (map #(get-in % [:home 1]) members))]
+    [(/ sx n) 1.0 (/ sz n)]))
+
+;; --- the frame ----------------------------------------------------------------
+
+(defn frame-ir
+  "Project the whole dance stage at time `t` (seconds) to a render-IR map for
+   `kami.webgpu/draw!`. Pure + deterministic. The performer(s), stage set, crowd and
+   floor become `:instances`; the venue sky + camera rig become `:globals`."
+  [scene t]
+  (let [grid (beat-at scene t)
+        members (cast scene)
+        ;; a sharp kick flash at the top of each beat, decaying through it
+        pulse (let [bf (:beat-frac grid)] (- 1.0 bf))
+        people (mapcat
+                 (fn [m]
+                   (let [move (or (:dance m)
+                                  (:move (setlist-move scene (:bar grid))))
+                         pose (move-pose move (:beat-frac grid) (:bar-frac grid))]
+                     (humanoid-instances pose (:home m) (:skin m))))
+                 members)
+        insts (vec (concat [(floor-instance scene)]
+                           (stage-instances scene pulse)
+                           (crowd-instances scene (:total-beats grid))
+                           people))
+        {:keys [eye target fov]} (camera-eye-target scene grid (performer-focus members))]
+    {:globals (cond-> {:sky (sky-globals scene pulse) :eye eye :target target}
+                fov (assoc :fov (* fov 60.0)))   ;; :dance/camera :fov is in radians-ish; scale to deg
+     :instances insts}))
+
+;; --- replication: what crosses the wire for a shared stage -------------------
+;; A shared stage syncs each remote dancer's spot + current move (and beat phase) — the
+;; geometry is reconstructed locally from the pose function, so the payload is tiny. This
+;; is the kami.netsync schema for `:stage/presence`; transport (WebRTC/kami-rtc) is the
+;; host's. Stored as data, forkable, retunable without touching transport code.
+
+(def presence-schema
+  {:components {:spot {:fields [:x :z]   :authority :owner :interp :lerp}
+                :move {:fields [:dance]  :authority :owner :interp :snap}
+                :clock {:fields [:t0]    :authority :owner :interp :snap}}})
+
+(defn presence-snapshot
+  "The wire payload for one local dancer at time `t`: spot + active move + clock origin."
+  [scene member t]
+  (let [grid (beat-at scene t)]
+    {:x (get-in member [:home 0]) :z (get-in member [:home 1])
+     :dance (name (or (:dance member) (:move (setlist-move scene (:bar grid)))))
+     :t0 t}))
+
+;; --- validation ---------------------------------------------------------------
+
+(defn valid-frame?
+  "A cheap structural check on a projected frame (mirrors kami.webgpu.ir/valid?)."
+  [ir]
+  (and (map? ir) (map? (:globals ir)) (sequential? (:instances ir))
+       (every? (fn [i] (and (vector? (:pos i)) (= 3 (count (:pos i)))
+                            (vector? (:color i)) (vector? (:size i))))
+               (:instances ir))))

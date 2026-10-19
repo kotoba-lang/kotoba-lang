@@ -1,0 +1,309 @@
+(ns oid4vp.core
+  "OpenID for Verifiable Presentations 1.0 — the Verifier side of the exchange.
+
+   A Verifier asks a Wallet for presentations by sending an Authorization Request
+   and validating the Authorization Response that comes back. This namespace
+   builds the request, states the invariants the spec puts on it, and validates
+   the response envelope.
+
+   ## Why the Verifier side, and only it
+
+   The Wallet side needs a holder key that can sign a presentation over a
+   Verifier-supplied nonce. A WebAuthn Passkey cannot: it signs its own
+   `authenticatorData || clientDataHash` and nothing else, so it cannot produce a
+   key-binding proof over bytes a Verifier chose. An implementation that pretended
+   otherwise would be the interesting half missing. The Verifier side has no such
+   problem and is complete here.
+
+   ## The one invariant worth reading twice
+
+   §5.3: when a presentation carries no key binding, the `nonce` is NOT echoed in
+   the response — there is no proof to bind it into. Session binding then rests
+   entirely on `state`, which becomes REQUIRED and must carry at least 128 bits of
+   entropy, be fresh per request, be stored in the session, and be checked on the
+   way back. `authorization-request` therefore refuses to build a request that
+   expects unbound presentations without a `state`, because such a response is
+   replayable by anyone who observes it once and nothing downstream could tell.
+
+   ## What this deliberately does not do
+
+   `validate-response` checks the response ENVELOPE — `state` against the session,
+   `vp_token` presence — and hands back the raw `vp_token`. It does not walk inside
+   it, and does not match returned credentials against the DCQL query.
+
+   That is a boundary, not an oversight: the normative text defining how
+   `vp_token` is keyed when `dcql_query` was used could not be retrieved from the
+   published specification while this was written, and guessing at the internal
+   shape of a structure whose contents gate an authorization decision is worse
+   than declining to. Callers must match claims themselves and MUST NOT read a
+   successful `validate-response` as \"the Wallet answered the query\".
+
+   Reference: https://openid.net/specs/openid-4-verifiable-presentations-1_0.html"
+  (:require [clojure.string :as str]))
+
+(def response-type "vp_token")
+
+;; §5.2
+(def response-modes
+  #{"fragment" "direct_post" "direct_post.jwt"})
+
+;; §5.9. A Client Identifier is `<prefix>:<orig>`; no prefix means a
+;; pre-registered client per RFC 6749.
+(def client-id-prefixes
+  #{"redirect_uri" "openid_federation" "decentralized_identifier"
+    "verifier_attestation" "x509_san_dns" "x509_hash"})
+
+;; §5.3. 128 bits. Counted in characters rather than bits because the parameter is
+;; a string and the encoding is the caller's: 22 characters is 128 bits of
+;; base64url, and 32 is 128 bits of hex, so the shorter bound is the safe one to
+;; enforce without pretending to know the alphabet.
+(def minimum-state-characters 22)
+(def minimum-nonce-characters 22)
+
+(defn- fail! [code msg data]
+  (throw (ex-info msg (assoc data :oid4vp/error code))))
+
+(defn- blank? [v] (or (nil? v) (and (string? v) (str/blank? v))))
+
+;; ── client_id ────────────────────────────────────────────────────────────────
+
+(defn parse-client-id
+  "Split a Client Identifier into `{:prefix :value}`.
+
+   A `nil` prefix means pre-registered (§5.9), which is legitimate and NOT an
+   error — but it is also the one form that carries no information about who the
+   Verifier is, so callers that care should check for it."
+  [client-id]
+  (when (blank? client-id)
+    (fail! :oid4vp/missing-client-id "client_id is REQUIRED" {}))
+  (let [i (str/index-of client-id ":")
+        candidate (when i (subs client-id 0 i))]
+    (if (and candidate (contains? client-id-prefixes candidate))
+      {:prefix candidate :value (subs client-id (inc i))}
+      ;; Not every colon is a prefix separator: `https://verifier.example` has
+      ;; one and is a perfectly good pre-registered identifier.
+      {:prefix nil :value client-id})))
+
+;; ── DCQL (§6) ────────────────────────────────────────────────────────────────
+
+(defn validate-dcql-query
+  "Check a DCQL query's shape. Returns the query, or throws.
+
+   Shape only. §6.1 requires a non-empty `credentials` array whose entries each
+   carry an `id` and a `format`, and any `claims` entry to carry a non-empty
+   `path` array. Whether a Wallet can satisfy it is the Wallet's question."
+  [query]
+  (when-not (map? query)
+    (fail! :oid4vp/dcql-not-an-object "a DCQL query must be a JSON object" {}))
+  (let [credentials (get query "credentials")]
+    (when-not (and (sequential? credentials) (seq credentials))
+      (fail! :oid4vp/dcql-credentials-empty
+             "DCQL `credentials` is REQUIRED and must be a non-empty array" {}))
+    (doseq [[index credential] (map-indexed vector credentials)]
+      (when-not (map? credential)
+        (fail! :oid4vp/dcql-credential-not-an-object
+               "each DCQL Credential Query must be an object" {:index index}))
+      (when (blank? (get credential "id"))
+        (fail! :oid4vp/dcql-credential-id-missing
+               "each DCQL Credential Query requires an `id`" {:index index}))
+      (when (blank? (get credential "format"))
+        (fail! :oid4vp/dcql-credential-format-missing
+               "each DCQL Credential Query requires a `format`" {:index index}))
+      (doseq [[claim-index claim] (map-indexed vector (get credential "claims"))]
+        (when-not (map? claim)
+          (fail! :oid4vp/dcql-claim-not-an-object
+                 "each DCQL claim must be an object"
+                 {:index index :claim claim-index}))
+        (let [path (get claim "path")]
+          (when-not (and (sequential? path) (seq path))
+            (fail! :oid4vp/dcql-claim-path-empty
+                   "a DCQL claim requires a non-empty `path` array"
+                   {:index index :claim claim-index})))))
+    ;; Duplicate ids would make a response ambiguous about which query an
+    ;; answer belongs to.
+    (let [ids (map #(get % "id") credentials)]
+      (when-not (= (count ids) (count (set ids)))
+        (fail! :oid4vp/dcql-duplicate-credential-id
+               "DCQL Credential Query ids must be unique"
+               {:ids (->> ids frequencies (keep (fn [[k v]] (when (> v 1) k))) vec)})))
+    query))
+
+(defn credential-query
+  "One DCQL Credential Query. `claims` is a seq of claims-path-pointer vectors."
+  [{:keys [id format claims multiple]}]
+  (when (blank? id) (fail! :oid4vp/dcql-credential-id-missing "`id` is required" {}))
+  (when (blank? format) (fail! :oid4vp/dcql-credential-format-missing "`format` is required" {}))
+  (cond-> {"id" id "format" format}
+    (seq claims) (assoc "claims" (mapv (fn [path] {"path" (vec path)}) claims))
+    (some? multiple) (assoc "multiple" (boolean multiple))))
+
+(defn dcql-query
+  "A DCQL query from Credential Queries, validated."
+  [credentials]
+  (validate-dcql-query {"credentials" (vec credentials)}))
+
+;; ── Authorization Request (§5) ───────────────────────────────────────────────
+
+(defn authorization-request
+  "Build an OID4VP Authorization Request as a parameter map.
+
+   Required:
+     :client-id      §5.9, optionally prefixed
+     :response-mode  one of `response-modes`
+     :nonce          fresh, high-entropy, stored with the session
+     and exactly one of :dcql-query / :scope
+
+   Conditionally required:
+     :state          REQUIRED unless every presentation you expect will carry a
+                     key binding. See `:holder-binding?` below.
+
+   Options:
+     :holder-binding?  default FALSE. Says whether the presentations you expect
+                       will carry a key binding proof. It defaults to false
+                       because that is the weaker assumption: with no binding the
+                       `nonce` is not echoed back (§5.3) and `state` is the only
+                       thing tying a response to your session, so a caller who
+                       has not thought about it gets the strict requirement rather
+                       than a replayable exchange.
+     :response-uri     required by `direct_post` / `direct_post.jwt`
+     :redirect-uri     required by `fragment`
+     :client-metadata :transaction-data :verifier-info
+
+   This function does not generate the nonce or the state. Both must come from
+   the caller's own CSPRNG, alongside the session they are stored in — a library
+   that minted them would be inventing session state it cannot see."
+  [{:keys [client-id response-mode nonce state dcql-query scope
+           holder-binding? response-uri redirect-uri client-metadata
+           transaction-data verifier-info]
+    :or {holder-binding? false}}]
+  (parse-client-id client-id)                ; throws when absent/blank
+  (when-not (contains? response-modes response-mode)
+    (fail! :oid4vp/bad-response-mode
+           (str "response_mode must be one of " (str/join ", " (sort response-modes)))
+           {:response-mode response-mode}))
+  (when (blank? nonce)
+    (fail! :oid4vp/missing-nonce "nonce is REQUIRED (§5)" {}))
+  (when (< (count nonce) minimum-nonce-characters)
+    (fail! :oid4vp/weak-nonce
+           (str "nonce needs sufficient entropy; fewer than "
+                minimum-nonce-characters " characters cannot carry 128 bits in any"
+                " common encoding")
+           {:length (count nonce)}))
+  (when (and (some? dcql-query) (some? scope))
+    (fail! :oid4vp/both-query-and-scope
+           "supply dcql_query OR scope, not both (§5)" {}))
+  (when (and (nil? dcql-query) (blank? scope))
+    (fail! :oid4vp/no-query
+           "one of dcql_query or scope is REQUIRED (§5)" {}))
+  (when dcql-query (validate-dcql-query dcql-query))
+  ;; §5.3 — the invariant this library exists to enforce.
+  (when-not holder-binding?
+    (when (blank? state)
+      (fail! :oid4vp/state-required-without-holder-binding
+             (str "state is REQUIRED when the expected presentations carry no key "
+                  "binding: the nonce is not echoed back, so state is the only "
+                  "thing binding the response to your session, and without it the "
+                  "response is replayable by anyone who observes it once")
+             {}))
+    (when (< (count state) minimum-state-characters)
+      (fail! :oid4vp/weak-state
+             (str "state must carry at least 128 bits of entropy (§5.3); fewer "
+                  "than " minimum-state-characters " characters cannot in any "
+                  "common encoding")
+             {:length (count state)})))
+  (when (and (contains? #{"direct_post" "direct_post.jwt"} response-mode)
+             (blank? response-uri))
+    (fail! :oid4vp/missing-response-uri
+           (str response-mode " requires response_uri") {}))
+  (when (and (= "fragment" response-mode) (blank? redirect-uri))
+    (fail! :oid4vp/missing-redirect-uri
+           "the fragment response mode requires redirect_uri" {}))
+  (cond-> {"response_type" response-type
+           "client_id" client-id
+           "response_mode" response-mode
+           "nonce" nonce}
+    (not (blank? state)) (assoc "state" state)
+    dcql-query (assoc "dcql_query" dcql-query)
+    (not (blank? scope)) (assoc "scope" scope)
+    (not (blank? response-uri)) (assoc "response_uri" response-uri)
+    (not (blank? redirect-uri)) (assoc "redirect_uri" redirect-uri)
+    client-metadata (assoc "client_metadata" client-metadata)
+    transaction-data (assoc "transaction_data" (vec transaction-data))
+    verifier-info (assoc "verifier_info" (vec verifier-info))))
+
+;; ── Authorization Response (§8) ──────────────────────────────────────────────
+
+(defn validate-response
+  "Validate an Authorization Response ENVELOPE against the session that asked.
+
+   `session` is what the Verifier stored when it built the request:
+   `{:state … :nonce … :holder-binding? …}`.
+
+   Returns `{:valid? true :vp-token …}` or `{:valid? false :reason kw}`.
+
+   An invalid response is a `false`, not an exception — a Wallet replying to the
+   wrong session is an ordinary thing to happen — while a malformed CALL (no
+   session) throws, because that is the caller's bug.
+
+   Read the docstring at the top of this namespace before trusting a `true`: this
+   validates the envelope only. It does NOT look inside `vp_token`, does not
+   verify any presentation, and does not check the Wallet answered the DCQL
+   query."
+  [response {:keys [state holder-binding?] :as session}]
+  (when-not (map? session)
+    (fail! :oid4vp/no-session
+           "a session is required to validate a response against" {}))
+  (when (and (not holder-binding?) (blank? state))
+    ;; The request should never have been built this way; if it was, there is
+    ;; nothing to check against and saying so is the only safe answer.
+    (fail! :oid4vp/session-without-state
+           (str "this session has no state, so an unbound presentation cannot be "
+                "tied to it — the request should have been refused when it was built")
+           {}))
+  (cond
+    (not (map? response))
+    {:valid? false :reason :oid4vp/response-not-an-object}
+
+    (blank? (get response "vp_token"))
+    {:valid? false :reason :oid4vp/missing-vp-token}
+
+    ;; §8.1 / §5.3: the state we stored must come back exactly.
+    (and (not (blank? state)) (not= state (get response "state")))
+    {:valid? false :reason :oid4vp/state-mismatch}
+
+    ;; A response carrying a state we never issued is not ours either.
+    (and (blank? state) (not (blank? (get response "state"))))
+    {:valid? false :reason :oid4vp/unexpected-state}
+
+    :else
+    {:valid? true
+     :vp-token (get response "vp_token")
+     ;; Handed back so a caller cannot forget which question this answers.
+     :state (get response "state")
+     :envelope-only? true}))
+
+;; ── request encoding ─────────────────────────────────────────────────────────
+
+(defn- form-encode [s]
+  )
+
+(defn request->query-params
+  "Request map -> seq of `[name value]`, with object-valued parameters JSON-encoded
+   by `json-encode`.
+
+   The encoder is injected rather than chosen here: this library has no JSON
+   dependency and does not want one, and a caller already has whichever encoder
+   its host uses. Passing a different encoder cannot change the meaning of the
+   request, only its byte-level formatting."
+  [request json-encode]
+  (for [[k v] (sort-by key request)]
+    [k (if (or (map? v) (sequential? v)) (json-encode v) (str v))]))
+
+(defn request->url
+  "An Authorization Request as a URL for `base` (e.g. `openid4vp://` or a Wallet's
+   authorization endpoint)."
+  [base request json-encode]
+  (let [pairs (request->query-params request json-encode)
+        query (str/join "&" (map (fn [[k v]] (str (form-encode k) "=" (form-encode v)))
+                                 pairs))]
+    (str base (if (str/includes? base "?") "&" "?") query)))

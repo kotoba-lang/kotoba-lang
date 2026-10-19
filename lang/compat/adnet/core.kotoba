@@ -1,0 +1,137 @@
+(ns adnet.core
+  "First-party ad network / ad-server core — pure Clojure/ClojureScript.
+
+  The ad-serving brain of our OWN ad network (an alternative to depending on a
+  third-party network like ExoClick and its fill rate), the advertising twin of
+  the x402 payment stack: advertisers bid in USDC (settled through the x402
+  rail, see adnet.billing), publishers (shinshi / isekai / kotobase / …) run
+  this auction at each placement to pick the winning creative, and a first-party
+  house ad backfills when no paid campaign qualifies. cloud-itonami operates the
+  advertiser-facing campaign management (its ops-LLM ⊣ CertGovernor propose →
+  govern → commit loop); this library is the pure selection + pacing logic both
+  the publisher ad-server and the advertiser control plane share.
+
+  Same invariants as the rest of kotoba-lang's monetization stack (pay/treasury):
+  pure .cljc, zero network I/O, zero deps. The host injects storage, the clock,
+  and USDC settlement; this namespace only decides which ad wins and what it
+  costs.
+
+  Money is USDC micros (integer, 6 decimals) on the wire, matching pay.core.")
+
+(def micros-per-usd 1000000)
+
+(defn- parse-int [s]
+  )
+
+(defn usd->micros [usd]
+  ;; "2.00" or 2 → 2000000. Truncates beyond 6 decimals (matches pay.core).
+  (let [[m whole frac] (re-matches #"(\d+)(?:\.(\d*))?" (str usd))]
+    (if m
+      (+ (* (parse-int whole) micros-per-usd)
+         (parse-int (subs (str (or frac "") "000000") 0 6)))
+      0)))
+
+;; ── model ──────────────────────────────────────────────────────────
+;; Campaign:
+;;   {:id "cmp-1" :advertiser "did:key:z…"
+;;    :creative {:type :image :image-url … :click-url … :alt …}   ; or :html/:text
+;;    :bid {:model :cpm|:cpc :usd "2.00"}   ; CPM = per 1000 impressions; CPC = per click
+;;    :targeting {:tier :adult|:general
+;;                :formats #{:rectangle :horizontal :vertical}   ; nil/empty = any
+;;                :placements #{"scene-detail" …}                 ; nil/empty = any
+;;                :geo #{"JP" …}}                                 ; nil/empty = any
+;;    :budget {:total-usd "100.00" :spent-micros 0 :daily-usd "10.00" :daily-spent-micros 0}
+;;    :flight {:start "2026-07-01T00:00:00Z" :end "2026-08-01T00:00:00Z"}   ; optional
+;;    :status :active|:paused}
+;;
+;; Placement (the serve request):
+;;   {:slot "scene-detail" :tier :adult :format :rectangle :geo "JP"
+;;    :now "2026-07-10T12:00:00Z"}
+
+(def ^:private assumed-ctr 0.002) ;; 0.2% — used to compare CPC bids as eCPM
+
+(defn- in-set? [s v]
+  (or (nil? s) (empty? s) (contains? s v)))
+
+(defn- within-flight? [{:keys [start end]} now]
+  (and (or (nil? start) (nil? now) (>= (compare now start) 0))
+       (or (nil? end)   (nil? now) (<  (compare now end) 0))))
+
+(defn- budget-left-micros [{:keys [total-usd spent-micros daily-usd daily-spent-micros]}]
+  (let [total-left (- (usd->micros (or total-usd "0")) (or spent-micros 0))
+        daily-left (if daily-usd
+                     (- (usd->micros daily-usd) (or daily-spent-micros 0))
+                     total-left)]
+    (max 0 (min total-left daily-left))))
+
+(defn eligible?
+  "Does `campaign` qualify to serve into `placement`? Pure — tier/format/
+  placement/geo match, in flight, active, and budget not exhausted."
+  [campaign placement]
+  (let [{:keys [status targeting flight budget]} campaign
+        {:keys [tier format slot geo now]} placement]
+    (and (= status :active)
+         (or (nil? (:tier targeting)) (= (:tier targeting) tier))
+         (in-set? (:formats targeting) format)
+         (in-set? (:placements targeting) slot)
+         (in-set? (:geo targeting) geo)
+         (within-flight? flight now)
+         (pos? (budget-left-micros budget)))))
+
+(defn ecpm-micros
+  "Normalize a campaign's bid to an effective CPM (USDC micros per 1000
+  impressions) so CPM and CPC bids rank on one axis. CPC × assumed CTR × 1000."
+  [{:keys [bid]}]
+  (let [b (usd->micros (:usd bid))]
+    (case (:model bid)
+      :cpm b
+      :cpc (long (* b assumed-ctr 1000))
+      0)))
+
+(defn select
+  "Run the auction: the eligible campaign with the highest eCPM wins (ties →
+  first). Returns the winning campaign, or nil when none qualify."
+  [campaigns placement]
+  (->> campaigns
+       (filter #(eligible? % placement))
+       (sort-by ecpm-micros >)
+       first))
+
+;; ── house ad (first-party backfill) ─────────────────────────────────
+
+(def house-ad
+  "Backfill when no paid campaign qualifies — promote our own economy rather
+  than show blank inventory. Points at the x402 catalog (agent demand) and the
+  creator-support rail (human demand)."
+  {:type :house
+   :title "USDC で応援・エージェント決済"
+   :body "推しをUSDCで応援、または x402 で per-request 決済"
+   :click-url "https://x402.nexus/catalog"})
+
+(defn serve
+  "Decide what to render at `placement`: the auction winner as a paid ad, or the
+  house ad. Returns {:kind :paid :campaign … :creative …} or {:kind :house
+  :creative house-ad}. The host renders :creative and records an impression
+  (adnet.billing/impression) against :campaign when :paid."
+  [campaigns placement]
+  (if-let [w (select campaigns placement)]
+    {:kind :paid :campaign w :creative (:creative w)}
+    {:kind :house :creative house-ad}))
+
+;; ── pacing / budget state (pure transitions) ────────────────────────
+
+(defn apply-spend
+  "Advance a campaign's budget by `micros` (after an impression/click was
+  charged). Auto-pauses when the total budget is exhausted. Pure."
+  [campaign micros]
+  (let [b (-> (:budget campaign)
+              (update :spent-micros (fnil + 0) micros)
+              (update :daily-spent-micros (fnil + 0) micros))
+        exhausted? (>= (:spent-micros b) (usd->micros (or (:total-usd b) "0")))]
+    (cond-> (assoc campaign :budget b)
+      exhausted? (assoc :status :paused))))
+
+(defn reset-daily
+  "Zero the daily-spent counter (host calls this at each UTC day boundary)."
+  [campaign]
+  (assoc-in campaign [:budget :daily-spent-micros] 0))

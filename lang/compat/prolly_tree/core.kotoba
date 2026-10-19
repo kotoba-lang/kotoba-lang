@@ -1,0 +1,179 @@
+(ns prolly-tree.core
+  "Content-addressed probabilistic B-tree (Prolly Tree) over CID-addressed
+  dag-cbor blocks.
+
+  Ports for storage are injected -- `put!` (cid, bytes -> ignored, called
+  once per node built) and `get-fn` (cid -> bytes) are passed in by the
+  caller. This namespace performs no I/O itself.
+
+  Chunk boundaries are probabilistic (~1/256 average chunk size), matching
+  the deleted kotoba-store Rust implementation. LEAF-level boundaries are
+  keyed on the entry's key; INTERNAL-level boundaries are keyed on the
+  CHILD's CID, never on the child's max-key -- keying an internal boundary
+  on max-key re-triggers the same boundary decision at every level for the
+  same key, which is an infinite-recursion bug the original Rust
+  implementation hit and fixed.
+
+  Update: `multiformats.core/sha256` and `cbor.core/encode` have grown real
+  `:cljs` branches (SHA-256 via @noble/hashes, portable CBOR byte buffers).
+  `utf8-bytes` below used `.getBytes` unconditionally despite the `.cljc`
+  extension -- a genuine gap in this namespace's own portability, not just
+  its dependencies' -- now split per-platform. Verified end to end under
+  ClojureScript (nbb), not just reasoned about: `build-tree`/`lookup` run
+  and byte-identically match the :clj path for the same input.
+
+  Update 2 (tag-42): child references in internal nodes are now REAL IPLD
+  links -- CBOR tag 42 over the binary CID, via `kotoba-lang/ipld` -- not
+  plain CID strings. This closes the honesty note the first landing
+  carried (`cbor.core` had no tag support then; it does now). A generic
+  DAG-CBOR/IPFS tool can walk the tree. NOTE: this changes every node's
+  bytes and therefore every CID -- a clean break, nothing in production
+  consumed the old format (see superproject ADR). Boundary math is
+  unchanged (still keyed on the child's CID string), so tree SHAPE is
+  identical; only the on-block encoding moved."
+  (:require [clojure.string :as str]
+            [multiformats.core :as mf]
+            [ipld.core :as ipld]))
+
+(def boundary-bits
+  "Chunk boundary fires when the low `boundary-bits` bits of the determinant
+  hash are all zero. 8 bits == ~1/256 average chunk size (BOUNDARY_MASK=0xFF
+  in the deleted Rust implementation)."
+  8)
+
+(defn- utf8-bytes [s]
+  )
+
+(defn- boundary?
+  "True ~1/(2^boundary-bits) of the time: the last byte of
+  sha256(str(x)-as-utf8) is all-zero under `boundary-bits`."
+  [x]
+  (let [h (mf/sha256 (utf8-bytes (str x)))
+        b (bit-and 0xff (aget h (dec (alength h))))]
+    (zero? (bit-and b (dec (bit-shift-left 1 boundary-bits))))))
+
+(defn- put-node!
+  "DAG-CBOR-encode `node` (links become tag 42), CID it, call
+  `(put! cid bytes)`, return the cid string."
+  [put! node]
+  (ipld/put-node! put! node))
+
+(defn- chunk-by
+  "Split `items` into chunks; a chunk ends right after any item for which
+  `boundary-fn` returns true, or at the end of `items`. Never splits an
+  empty input."
+  [boundary-fn items]
+  (if (empty? items)
+    []
+    (loop [remaining items chunk [] out []]
+      (if (empty? remaining)
+        (if (seq chunk) (conj out chunk) out)
+        (let [item (first remaining)
+              chunk' (conj chunk item)]
+          (if (boundary-fn item)
+            (recur (rest remaining) [] (conj out chunk'))
+            (recur (rest remaining) chunk' out)))))))
+
+(defn- build-leaf-level
+  "`sorted-entries`: seq of `[k v]`, already sorted by k. Returns a seq of
+  `[max-key cid]` summaries after put!-ing each leaf node."
+  [put! sorted-entries]
+  (mapv (fn [chunk]
+          (let [node {"kind" "leaf" "entries" (mapv vec chunk)}
+                cid (put-node! put! node)
+                max-key (first (last chunk))]
+            [max-key cid]))
+        (chunk-by (fn [[k _]] (boundary? k)) sorted-entries)))
+
+(defn- build-internal-level
+  "`child-summaries`: seq of `[max-key cid]`, already sorted by max-key.
+  Boundary is determined by the CHILD CID (see namespace docstring), not by
+  max-key. On-block, each child reference is a real IPLD link (tag 42);
+  in-memory summaries stay plain CID strings so the boundary math is
+  encoding-independent."
+  [put! child-summaries]
+  (mapv (fn [chunk]
+          (let [node {"kind" "internal"
+                      "children" (mapv (fn [[max-key cid]]
+                                         [max-key (ipld/link cid)])
+                                       chunk)}
+                cid (put-node! put! node)
+                max-key (first (last chunk))]
+            [max-key cid]))
+        (chunk-by (fn [[_ cid]] (boundary? cid)) child-summaries)))
+
+(defn build-tree
+  "Build a Prolly Tree from `sorted-entries` (seq of `[k v]`, sorted by `k`
+  ascending, `k` comparable via `compare`), calling `(put! cid bytes)` for
+  every node created. Returns the root CID string, or nil for empty input."
+  [put! sorted-entries]
+  (when (seq sorted-entries)
+    (loop [level (build-leaf-level put! sorted-entries)]
+      (if (= 1 (count level))
+        (second (first level))
+        (recur (build-internal-level put! level))))))
+
+(defn- get-node [get-fn cid]
+  (ipld/decode (get-fn cid)))
+
+(defn- child-cid
+  "A decoded internal-node child entry is `[max-key <tag-42 link>]`; return
+  the link's CID string."
+  [[_ link]]
+  (ipld/link-cid link))
+
+(defn lookup
+  "Point lookup of `k` under `root-cid`, fetching nodes via `(get-fn cid) ->
+  bytes`. Returns the value, or nil if `k` is absent or `root-cid` is nil
+  (empty tree)."
+  [get-fn root-cid k]
+  (when root-cid
+    (loop [cid root-cid]
+      (let [node (get-node get-fn cid)]
+        (case (get node "kind")
+          "leaf" (some (fn [[ek ev]] (when (= ek k) ev)) (get node "entries"))
+          "internal"
+          (let [children (get node "children")
+                target (or (some (fn [entry]
+                                   (when (<= (compare k (first entry)) 0)
+                                     (child-cid entry)))
+                                 children)
+                           (child-cid (last children)))]
+            (recur target)))))))
+
+(defn scan-prefix
+  "All `[k v]` pairs whose string key starts with `prefix`, fetching nodes via
+  `(get-fn cid) -> bytes`. Key-range pruned: since keys are sorted and an
+  internal node's children are `[max-key cid]` in order, a prefix-matching key
+  can only live in a child whose `max-key >= prefix` AND whose predecessor's
+  `max-key` has not already passed the prefix range. So we skip children entirely
+  below the prefix and stop once past it — descending into O(path) blocks for a
+  keyed read instead of the whole tree (ADR-2607022330 addendum 3 / #16). With an
+  empty `prefix` this is a full ordered scan, unchanged."
+  [get-fn root-cid prefix]
+  (when root-cid
+    (letfn [(past-prefix? [k]
+              ;; k sorts after the prefix AND is not itself within it → the whole
+              ;; remaining (sorted) range is beyond the prefix; stop.
+              (and (pos? (compare k prefix)) (not (str/starts-with? k prefix))))
+            (walk [cid]
+              (let [node (get-node get-fn cid)]
+                (case (get node "kind")
+                  "leaf" (filter (fn [[k _]] (str/starts-with? k prefix))
+                                 (get node "entries"))
+                  "internal"
+                  (loop [children (get node "children"), prev-max nil, out (transient [])]
+                    (if (empty? children)
+                      (persistent! out)
+                      (let [entry (first children)
+                            mk (first entry)]
+                        (cond
+                          ;; predecessor already past the prefix range → done
+                          (and (some? prev-max) (past-prefix? prev-max)) (persistent! out)
+                          ;; this child's whole range is below the prefix → skip
+                          (neg? (compare mk prefix)) (recur (rest children) mk out)
+                          ;; may contain matches → descend
+                          :else (recur (rest children) mk
+                                       (reduce conj! out (walk (child-cid entry))))))))))
+              )]
+      (vec (walk root-cid)))))

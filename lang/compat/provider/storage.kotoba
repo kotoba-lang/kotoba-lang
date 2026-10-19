@@ -1,0 +1,223 @@
+(ns provider.storage
+  "Bounded durable-storage adapter. Paths and backend handles stay host-owned.
+
+  Entry `:version`, option expected-version, and conflict current-version are
+  `:i64` ABI fields. On `:cljs` the canonical representation is JS `bigint`
+  (same rule ADR 0073 / provider#2–#4 applied to clock, log, http, state).
+  `cljs.core/integer?` does not recognize bigint, so `valid-version?` and
+  host↔ABI conversion must branch by host.
+
+  ADR 0273: pure `validate-*` deny fixtures (stable error keywords)."
+  (:require [kotoba.kir.value :as value]
+            ))
+
+(def capability-id 12)
+(def max-value-bytes 65536)
+(def expected-version-type [:option :i64])
+
+(def get-type [:record :kotoba.storage/get [[:key :keyword]]])
+(def put-type
+  [:record :kotoba.storage/put
+   [[:key :keyword] [:value :string] [:expected-version expected-version-type]]])
+(def delete-type
+  [:record :kotoba.storage/delete
+   [[:key :keyword] [:expected-version expected-version-type]]])
+(def request-type
+  [:variant :kotoba.storage/request
+   [[:get get-type] [:put put-type] [:delete delete-type]]])
+
+(def entry-type
+  [:record :kotoba.storage/entry
+   [[:key :keyword] [:value :string] [:version :i64]]])
+(def conflict-type
+  [:record :kotoba.storage/conflict
+   [[:key :keyword] [:current-version expected-version-type]]])
+(def error-type
+  [:record :kotoba.storage/error
+   [[:code :keyword] [:message :string] [:retryable :bool]]])
+(def result-type
+  [:variant :kotoba.storage/result
+   [[:found entry-type] [:missing :bool] [:written entry-type]
+    [:deleted :bool] [:conflict conflict-type] [:error error-type]]])
+
+(def schemas
+  {:kotoba.storage/get get-type
+   :kotoba.storage/put put-type
+   :kotoba.storage/delete delete-type
+   :kotoba.storage/request request-type
+   :kotoba.storage/entry entry-type
+   :kotoba.storage/conflict conflict-type
+   :kotoba.storage/error error-type
+   :kotoba.storage/result result-type})
+
+(defn- result [tag payload]
+  [result-type tag payload])
+
+(defn- valid-version?
+  "A storage version is a positive whole number in the host's canonical i64
+  representation. On `:cljs` that is a non-negative bigint ≥ 1."
+  [version]
+  )
+
+(defn- canonical-version
+  "Normalize a host-supplied version (plain number from mock/JSON transport
+  or already-bigint guest value) to the ABI i64 representation."
+  [version]
+  )
+
+(defn- host-version
+  "Transport may prefer a plain host number (JSON). On cljs guest→host."
+  [version]
+  )
+
+(defn validate-put-value
+  "Pure put value policy. Returns nil when ok, else an error keyword."
+  [text]
+  (try
+    (value/bounded-string! text max-value-bytes)
+    nil
+    (catch  _
+      :storage/value-too-large)))
+
+(defn validate-expected-version
+  "Pure expected-version policy after option present?.
+  `version` is the raw option payload when present is true.
+  Returns nil when ok, else an error keyword."
+  [present? version]
+  (when present?
+    (try
+      (let [v (canonical-version version)]
+        (if (valid-version? v) nil :storage/invalid-version))
+      (catch  _
+        :storage/invalid-version))))
+
+(defn validate-get
+  "Pure get policy. Keys are ABI keywords; returns nil when ok."
+  [key]
+  (when-not (keyword? key)
+    :storage/bad-key))
+
+(defn validate-put
+  "Pure put policy: key + value + optional expected version."
+  [key text present? version]
+  (or (validate-get key)
+      (validate-put-value text)
+      (validate-expected-version present? version)))
+
+(defn validate-delete
+  "Pure delete policy: key + optional expected version."
+  [key present? version]
+  (or (validate-get key)
+      (validate-expected-version present? version)))
+
+(defn- deny! [code context]
+  (throw (ex-info "storage request denied"
+                  (merge {:phase :storage-provider :code code} context))))
+
+(defn- option-version [version]
+  (if (nil? version)
+    [expected-version-type false]
+    (let [v (canonical-version version)]
+      (when-not (valid-version? v)
+        (throw (ex-info "storage version is invalid" {:phase :storage-provider})))
+      [expected-version-type true v])))
+
+(defn- expected-version [[actual-type present? version]]
+  (when-not (= actual-type expected-version-type)
+    (throw (ex-info "storage expected-version contract mismatch"
+                    {:phase :storage-provider})))
+  (when present?
+    (let [v (canonical-version version)]
+      (when-not (valid-version? v)
+        (throw (ex-info "storage expected version is invalid"
+                        {:phase :storage-provider})))
+      ;; transport gets host-native number for JSON/HTTP backends
+      (host-version v))))
+
+(defn- entry [key stored]
+  (let [{:keys [value version]} stored
+        v (canonical-version version)]
+    (value/bounded-string! value max-value-bytes)
+    (when-not (valid-version? v)
+      (throw (ex-info "storage version is invalid" {:phase :storage-provider})))
+    [entry-type key value v]))
+
+(defn- error [{:keys [code message retryable]}]
+  (value/bounded-keyword! code value/keyword-value-byte-limit)
+  (value/bounded-string! message value/string-value-byte-limit)
+  (result :error [error-type code message retryable]))
+
+(defn- invoke-transport [transport request]
+  (try
+    (transport request)
+    (catch  _
+      {:tag :error :error {:code :storage/transport
+                           :message "storage provider failed"
+                           :retryable false}})))
+
+(defn- typed-result [key reply]
+  (case (:tag reply)
+    :found (result :found (entry key reply))
+    :missing (result :missing false)
+    :written (result :written (entry key reply))
+    :deleted (result :deleted true)
+    :conflict (result :conflict
+                      [conflict-type key (option-version (:current-version reply))])
+    :error (error (:error reply))
+    (throw (ex-info "storage transport result tag is invalid"
+                    {:phase :storage-provider :tag (:tag reply)}))))
+
+(defn provider
+  "Creates a storage provider around a host-supplied synchronous transport.
+  The namespace is host-owned and never supplied by guest code. The transport
+  receives {:namespace kw :operation kw :key kw ...} and returns a tagged map.
+  It is responsible for durable commits, namespace quota, and atomic version
+  checks; the adapter validates and types both sides of the boundary."
+  [{:keys [storage-namespace transport]}]
+  (when-not (and (qualified-keyword? storage-namespace)
+                 (fn? transport))
+    (throw (ex-info "storage provider requires a qualified namespace and transport"
+                    {:phase :storage-provider})))
+  (value/bounded-keyword! storage-namespace value/keyword-value-byte-limit)
+  {:request-type request-type
+   :result-type result-type
+   :invoke
+   (fn [[actual-type operation payload]]
+     (when-not (= actual-type request-type)
+       (throw (ex-info "storage request contract mismatch"
+                       {:phase :storage-provider})))
+     (case operation
+       :get
+       (let [[_ key] payload]
+         (when-let [code (validate-get key)]
+           (deny! code {:operation :get :key key}))
+         (typed-result key
+                       (invoke-transport transport
+                                         {:namespace storage-namespace
+                                          :operation :get :key key})))
+
+       :put
+       (let [[_ key text version-option] payload
+             [_ present? version] version-option]
+         (when-let [code (validate-put key text present? version)]
+           (deny! code {:operation :put :key key}))
+         (let [expected (expected-version version-option)]
+           (typed-result key
+                         (invoke-transport transport
+                                           {:namespace storage-namespace
+                                            :operation :put :key key :value text
+                                            :expected-version expected}))))
+
+       :delete
+       (let [[_ key version-option] payload
+             [_ present? version] version-option]
+         (when-let [code (validate-delete key present? version)]
+           (deny! code {:operation :delete :key key}))
+         (let [expected (expected-version version-option)]
+           (typed-result key
+                         (invoke-transport transport
+                                           {:namespace storage-namespace
+                                            :operation :delete :key key
+                                            :expected-version expected}))))
+
+       (deny! :storage/unknown-op {:operation operation})))})

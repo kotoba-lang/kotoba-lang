@@ -1,0 +1,255 @@
+(ns imap.protocol
+  "Pure IMAP4rev1 (RFC 3501) command construction and response parsing --
+  no I/O here. `imap.transport` is the wire, `imap.client` drives the
+  request/response loop; this namespace only turns data into command
+  strings and turns response lines back into data, so it's testable
+  without a socket at all.
+
+  ## What this parses, and what it deliberately does not
+
+  Commands, tagged completions, untagged responses, response codes,
+  flag lists, SEARCH results and literal markers -- the wire syntax of
+  RFC 3501 §7 and §9.
+
+  **It does not parse messages.** A fetched message comes back as the
+  bytes the server sent, and `kotoba-lang/org-ietf-mime` turns those into
+  headers, parts, attachments and decoded text. That library already
+  existed when this one grew whole-message reads, and for one commit this
+  namespace carried its own `split-message` / `decode-body` /
+  quoted-printable decoder instead -- a worse copy of a tested thing,
+  which got multipart wrong (returning the raw parts) where `mime.parse`
+  gets it right (`multipart/alternative` orders worst-to-best, so the
+  *last* match wins). Message format is that library's subject and the
+  wire protocol is this one's."
+  (:require [clojure.string :as str]))
+
+(defn command
+  "One tagged command line (CRLF-terminated) for `tag` (e.g. \"A1\")."
+  [tag verb & args]
+  (str tag " " verb (when (seq args) (str " " (str/join " " args))) "\r\n"))
+
+(defn quote-string
+  "IMAP quoted string: wrap in double quotes, escaping embedded quotes and
+  backslashes (RFC 3501 section 4.3)."
+  [s]
+  (str "\"" (-> (str s) (str/replace "\\" "\\\\") (str/replace "\"" "\\\"")) "\""))
+
+(def ^:private statuses #{"OK" "NO" "BAD"})
+
+(defn- after-tag
+  "The rest of `line` after \"<tag> \", or nil if `line` doesn't start with
+  that exact tag (plain string match -- IMAP tags are caller-generated
+  alphanumeric atoms, never regex metacharacters, so no escaping is
+  needed)."
+  [tag line]
+  (let [prefix (str tag " ")]
+    (when (str/starts-with? (str line) prefix)
+      (subs (str line) (count prefix)))))
+
+(defn tagged-completion?
+  "True if `line` is the tagged completion for `tag` (\"<tag> OK/NO/BAD ...\")."
+  [tag line]
+  (boolean (when-let [rest-line (after-tag tag line)]
+             (contains? statuses (str/upper-case (first (str/split rest-line #"\s" 2)))))))
+
+(defn completion-status
+  "Parse a tagged completion line into {:status :ok|:no|:bad :text \"...\"}."
+  [tag line]
+  (when-let [rest-line (after-tag tag line)]
+    (let [[status text] (str/split rest-line #"\s" 2)]
+      (when (contains? statuses (str/upper-case status))
+        {:status (keyword (str/lower-case status)) :text (or text "")}))))
+
+(defn literal-size
+  "The byte count `n` if `line` ends with a literal marker \"{n}\", else nil."
+  [line]
+  (when-let [[_ n] (re-find #"\{(\d+)\}\s*$" (str line))]
+    (parse-long n)))
+
+(defn search-uids
+  "Parse a \"* SEARCH <n1> <n2> ...\" untagged line into a vector of longs,
+  or nil if `line` isn't a SEARCH response (including an empty result,
+  \"* SEARCH\" with no numbers, which parses to [])."
+  [line]
+  (when-let [[_ nums] (re-matches #"\* SEARCH(.*)" (str line))]
+    (->> (str/split (str/trim nums) #"\s+") (remove str/blank?) (mapv parse-long))))
+
+(defn parse-header-block
+  "A raw RFC 2822 header block (an IMAP literal payload) -> a map keyed by
+  lower-cased field name (e.g. :from :subject :date :message-id), value
+  trimmed. Folded (continuation) lines are unfolded first; unknown fields
+  are ignored, not just the four this library's `imap.client` requests by
+  default -- callers can pass any field list through."
+  [text]
+  (let [unfolded (str/replace (str text) #"\r\n[ \t]+" " ")
+        lines (remove str/blank? (str/split-lines unfolded))]
+    (reduce (fn [acc line]
+              (if-let [[_ k v] (re-matches #"([!-9;-~]+):\s*(.*)" line)]
+                (assoc acc (keyword (str/lower-case k)) (str/trim v))
+                acc))
+            {} lines)))
+
+;; ------------------------------------------------- untagged responses
+;;
+;; RFC 3501 §7. Everything the server says that is not a tagged completion
+;; arrives as `* ...`, and a client that ignores those cannot know how many
+;; messages a mailbox holds, which flags it accepts, or -- the one that
+;; matters most -- whether the UIDs it cached are still the same UIDs.
+
+(defn untagged?
+  "True when `line` is an untagged (`*`) response."
+  [line]
+  (str/starts-with? (str line) "* "))
+
+(defn parse-flags
+  "A parenthesised flag list -> a set of lower-cased keywords.
+
+  `\\Seen` becomes `:seen`; a server-defined keyword like `$Forwarded`
+  becomes `:$forwarded`. Lower-cased because RFC 3501 §2.3.2 makes system
+  flags case-insensitive, and two clients disagreeing about `\\SEEN` and
+  `\\Seen` is a bug that only appears against one server."
+  [s]
+  (->> (re-seq #"[\\$]?[A-Za-z0-9_.-]+"
+               (or (second (re-find #"\(([^)]*)\)" (str s))) ""))
+       (map #(keyword (str/lower-case (str/replace % #"^\\" ""))))
+       set))
+
+(defn response-code
+  "The `[CODE ...]` a status response may carry (RFC 3501 §7.1).
+
+  -> `{:code :uidvalidity :value \"1\"}`, or nil. The code is what turns
+  an `OK` into information: `[UIDVALIDITY 1]`, `[PERMANENTFLAGS (...)]`,
+  `[READ-ONLY]`, `[ALERT]`."
+  [line]
+  (when-let [[_ body] (re-find #"\[([^\]]*)\]" (str line))]
+    (let [[code value] (str/split (str/trim body) #"\s+" 2)]
+      (when (seq code)
+        {:code (keyword (str/lower-case code)) :value value}))))
+
+(defn parse-untagged
+  "One untagged line -> a fact about the mailbox or the session.
+
+  Returns nil for lines this does not model, which is most of them: a
+  caller folds what it recognises and is not obliged to understand the
+  rest. That is what RFC 3501 §7 asks for -- a client must tolerate
+  untagged responses it did not request and cannot interpret."
+  [line]
+  (let [line (str line)]
+    (cond
+      (not (untagged? line)) nil
+
+      (re-matches #"\* (\d+) (EXISTS|RECENT|EXPUNGE)" line)
+      (let [[_ n kind] (re-matches #"\* (\d+) (EXISTS|RECENT|EXPUNGE)" line)]
+        {:type (keyword (str/lower-case kind)) :value (parse-long n)})
+
+      (str/starts-with? line "* FLAGS")
+      {:type :flags :value (parse-flags line)}
+
+      (str/starts-with? line "* CAPABILITY")
+      {:type :capability
+       :value (->> (str/split (subs line (count "* CAPABILITY")) #"\s+")
+                   (remove str/blank?)
+                   (map str/upper-case)
+                   set)}
+
+      (re-matches #"\* (?:LIST|LSUB) .*" line)
+      (when-let [[_ attrs delimiter name-part]
+                 (re-matches #"\* (?:LIST|LSUB) \(([^)]*)\) (\"[^\"]*\"|NIL) (.*)" line)]
+        {:type :list
+         :attributes (parse-flags (str "(" attrs ")"))
+         :delimiter (when (not= "NIL" delimiter)
+                      (str/replace delimiter "\"" ""))
+         :name (-> name-part str/trim (str/replace #"^\"|\"$" ""))})
+
+      (str/starts-with? line "* STATUS")
+      {:type :status
+       :value (->> (str/split (str/trim (or (second (re-find #"\(([^)]*)\)\s*$" line)) ""))
+                              #"\s+")
+                   (remove str/blank?)
+                   (partition 2)
+                   (into {} (map (fn [[k v]]
+                                   [(keyword (str/lower-case k))
+                                    (or (parse-long v) v)]))))}
+
+      (re-matches #"\* (\d+) FETCH .*" line)
+      (let [[_ n] (re-matches #"\* (\d+) FETCH .*" line)]
+        (cond-> {:type :fetch :sequence (parse-long n)}
+          (re-find #"UID (\d+)" line)
+          (assoc :uid (parse-long (second (re-find #"UID (\d+)" line))))
+          (re-find #"FLAGS \(([^)]*)\)" line)
+          (assoc :flags (parse-flags (str "(" (second (re-find #"FLAGS \(([^)]*)\)" line)) ")")))
+          (re-find #"RFC822\.SIZE (\d+)" line)
+          (assoc :size (parse-long (second (re-find #"RFC822\.SIZE (\d+)" line))))
+          (re-find #"INTERNALDATE \"([^\"]*)\"" line)
+          (assoc :internal-date (second (re-find #"INTERNALDATE \"([^\"]*)\"" line)))))
+
+      (re-matches #"\* (OK|NO|BAD|BYE|PREAUTH)\b.*" line)
+      (let [[_ status] (re-matches #"\* (OK|NO|BAD|BYE|PREAUTH)\b.*" line)
+            {:keys [code value]} (response-code line)]
+        (cond-> {:type (keyword (str/lower-case status))}
+          code (assoc :code code :value value)
+          (= :permanentflags code) (assoc :value (parse-flags line))))
+
+      :else nil)))
+
+(defn mailbox-state
+  "Fold the untagged lines of a SELECT/EXAMINE into what the mailbox is.
+
+  `:uidvalidity` is the one that must not be dropped. RFC 3501 §2.3.1.1:
+  a UID is only meaningful together with the UIDVALIDITY it was issued
+  under, and when a server changes that value every cached UID now means
+  a different message, or none. A client that stores UIDs and never reads
+  UIDVALIDITY will, on the day a mailbox is rebuilt, quietly show one
+  message under another's identity."
+  [lines]
+  (reduce (fn [acc line]
+            (let [{:keys [type code value]} (parse-untagged line)]
+              (cond
+                (= :exists type) (assoc acc :exists value)
+                (= :recent type) (assoc acc :recent value)
+                (= :flags type) (assoc acc :flags value)
+                (= :capability type) (assoc acc :capabilities value)
+                (= :uidvalidity code) (assoc acc :uidvalidity (parse-long (str value)))
+                (= :uidnext code) (assoc acc :uidnext (parse-long (str value)))
+                (= :permanentflags code) (assoc acc :permanent-flags value)
+                (= :unseen code) (assoc acc :unseen (parse-long (str value)))
+                (= :read-only code) (assoc acc :read-only? true)
+                (= :read-write code) (assoc acc :read-only? false)
+                :else acc)))
+          {}
+          lines))
+
+;; ------------------------------------------------------ authentication
+
+(def ^:private nul "\u0000")
+
+(defn base64
+  "Base64 for a SASL payload.
+
+  A SASL payload carries NUL bytes and, for XOAUTH2, an OAuth token; both
+  reach the wire only through this. Delegated to the host encoder rather
+  than written out, because the platform's is already correct -- the same
+  call `org-ietf-smtp` makes, for the same reason."
+  [s]
+  )
+
+(defn plain-credentials
+  "SASL PLAIN (RFC 4616): `NUL user NUL pass`, for the caller to base64.
+
+  The leading NUL is the authorization identity, empty because a client
+  authenticating as itself does not assume another one. Omitting that
+  field entirely is the classic PLAIN bug, and servers reject the result
+  with a message that says nothing about which of the three was missing."
+  [user pass]
+  (str nul user nul pass))
+
+(defn xoauth2-credentials
+  "The XOAUTH2 SASL payload, for the caller to base64.
+
+  Not an IETF mechanism -- it is Google's, and Microsoft accepts the same
+  shape -- but it is how an OAuth grant reaches IMAP at all. Without it,
+  an OAuth-connected mailbox has to ask its owner for a second credential
+  in the form of an app password, to read a mailbox the first credential
+  already authorises."
+  [user access-token]
+  (str "user=" user nul "auth=Bearer " access-token nul nul))

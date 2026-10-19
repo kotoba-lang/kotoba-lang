@@ -1,0 +1,429 @@
+(ns pdf.core
+  "PDF COS object parser (ISO 32000). PDF is not a linear struct grammar, so
+   this is a hand-written recursive descent reader over the byte stream
+   (dict/array/string/name/number/ref/stream). Stream filters route
+   FlateDecode to org-ietf-deflate; other filters are opaque passthrough.
+   Extracted from kotoba-lang/kasane (kasane.cos, ADR-2606272100) as
+   `org-iso-pdf`.
+
+   R0 collects top-level `N G obj … endobj` objects by scan (robust against
+   classic or rebuilt xref), resolves the page tree, decodes content streams
+   and extracts shown text. Limitations: objects packed inside /ObjStm object
+   streams and DCTDecode/JPX image pixels are not decoded (opaque — DCTDecode
+   bytes can be fed to org-iso-jpeg's decoder, kept decoupled here)."
+  (:require [clojure.string :as str]
+            [deflate.core :as deflate]))
+
+;; ---- character classes ---------------------------------------------------
+(defn- code [c] )
+(defn- digit? [c] (and c (<= (code \0) (code c) (code \9))))
+(defn- oct?   [c] (and c (<= (code \0) (code c) (code \7))))
+(defn- alpha? [c] (and c (let [i (code c)] (or (<= (code \a) i (code \z)) (<= (code \A) i (code \Z))))))
+(def ^:private ws-set    #{\space \tab \newline \return \formfeed (char 0)})
+(def ^:private delim-set #{\( \) \< \> \[ \] \{ \} \/ \%})
+(defn- ws?    [c] (contains? ws-set c))
+(defn- delim? [c] (contains? delim-set c))
+
+;; ---- reader state (index atom over a Latin-1 string + parallel bytes) -----
+(defn- peek-c [st] (let [i @(:i st)] (when (< i (:len st)) (nth (:s st) i))))
+(defn- at     [st k] (let [i @(:i st)] (when (< (+ i k) (:len st)) (nth (:s st) (+ i k)))))
+(defn- next-c [st] (let [c (peek-c st)] (swap! (:i st) inc) c))
+(defn- looking-at? [st ^String word]
+  (let [i @(:i st)] (and (<= (+ i (count word)) (:len st))
+                         (= word (subs (:s st) i (+ i (count word)))))))
+
+(defn- skip-ws [st]
+  (loop []
+    (let [c (peek-c st)]
+      (cond
+        (ws? c)   (do (next-c st) (recur))
+        (= c \%)  (do (loop [] (let [d (peek-c st)] (when (and d (not= d \newline) (not= d \return)) (next-c st) (recur)))) (recur))
+        :else nil))))
+
+(defn- parse-num [t]
+  (let [t (if (str/starts-with? t "+") (subs t 1) t)
+        t (cond (str/starts-with? t ".")  (str "0" t)
+                (str/starts-with? t "-.") (str "-0" (subs t 1))
+                :else t)
+        t (if (str/ends-with? t ".") (str t "0") t)]
+    (if (str/includes? t ".")
+      
+      )))
+
+(declare parse-value parse-dict)
+
+(defn- parse-name [st]
+  (next-c st)                                                    ; /
+  (loop [acc []]
+    (let [c (peek-c st)]
+      (if (or (nil? c) (ws? c) (delim? c))
+        (keyword (apply str acc))
+        (do (next-c st) (recur (conj acc c)))))))
+
+(defn- parse-literal-string [st]
+  (next-c st)                                                    ; (
+  (loop [depth 1 acc []]
+    (let [c (next-c st)]
+      (cond
+        (nil? c) (apply str acc)
+        (= c \\) (let [e (next-c st)]
+                   (cond
+                     (= e \n) (recur depth (conj acc \newline))
+                     (= e \r) (recur depth (conj acc \return))
+                     (= e \t) (recur depth (conj acc \tab))
+                     (= e \b) (recur depth (conj acc \backspace))
+                     (= e \f) (recur depth (conj acc \formfeed))
+                     (= e \() (recur depth (conj acc \())
+                     (= e \)) (recur depth (conj acc \)))
+                     (= e \\) (recur depth (conj acc \\))
+                     (or (= e \newline) (= e \return)) (recur depth acc) ; line continuation
+                     (oct? e) (let [d2 (when (oct? (peek-c st)) (next-c st))
+                                    d3 (when (and d2 (oct? (peek-c st))) (next-c st))
+                                    n  (reduce (fn [a d] (+ (* a 8) (- (code d) (code \0)))) 0 (remove nil? [e d2 d3]))]
+                                (recur depth (conj acc (char (bit-and n 0xff)))))
+                     :else (recur depth (conj acc e))))
+        (= c \() (recur (inc depth) (conj acc \())
+        (= c \)) (if (= depth 1) (apply str acc) (recur (dec depth) (conj acc \))))
+        :else (recur depth (conj acc c))))))
+
+(defn- parse-hex-string [st]
+  (next-c st)                                                    ; <
+  (loop [hx []]
+    (let [c (next-c st)]
+      (cond
+        (or (nil? c) (= c \>)) (let [hx (if (odd? (count hx)) (conj hx \0) hx)]
+                                 (apply str (map (fn [[a b]] (char ( (str a b) 16)))
+                                                 (partition 2 hx))))
+        (ws? c) (recur hx)
+        :else   (recur (conj hx c))))))
+
+(defn- parse-array [st]
+  (next-c st)                                                    ; [
+  (loop [acc []]
+    (skip-ws st)
+    (if (or (nil? (peek-c st)) (= (peek-c st) \]))
+      (do (next-c st) acc)
+      (recur (conj acc (parse-value st))))))
+
+(defn- parse-keyword [st]
+  (loop [acc []]
+    (let [c (peek-c st)]
+      (if (and c (alpha? c))
+        (do (next-c st) (recur (conj acc c)))
+        (let [w (apply str acc)]
+          (case w "true" true "false" false "null" nil (keyword w)))))))
+
+(defn- parse-number-or-ref [st]
+  (let [t (loop [acc []]
+            (let [c (peek-c st)]
+              (if (and c (or (digit? c) (#{\+ \- \.} c)))
+                (do (next-c st) (recur (conj acc c)))
+                (apply str acc))))
+        n1 (parse-num t)]
+    (if (integer? n1)
+      (let [save @(:i st)]
+        (skip-ws st)
+        (if (digit? (peek-c st))
+          (let [t2 (loop [acc []] (let [c (peek-c st)] (if (digit? c) (do (next-c st) (recur (conj acc c))) (apply str acc))))]
+            (skip-ws st)
+            (if (and (= (peek-c st) \R)
+                     (let [a (at st 1)] (or (nil? a) (ws? a) (delim? a))))
+              (do (next-c st) {::ref [n1 (parse-num t2)]})
+              (do (reset! (:i st) save) n1)))
+          (do (reset! (:i st) save) n1)))
+      n1)))
+
+(defn- parse-stream [st dict]
+  (swap! (:i st) + 6)                                            ; consume "stream"
+  (when (= (peek-c st) \return) (next-c st))
+  (when (= (peek-c st) \newline) (next-c st))
+  (let [start @(:i st)
+        len   (get dict :Length)
+        endkw (str/index-of (:s st) "endstream" start)
+        data-end (if (integer? len)
+                   (+ start len)
+                   (let [e endkw]                               ; trim trailing EOL before endstream
+                     (cond (= (nth (:s st) (dec e)) \newline) (if (= (nth (:s st) (- e 2)) \return) (- e 2) (dec e))
+                           (= (nth (:s st) (dec e)) \return)  (dec e)
+                           :else e)))
+        raw (subvec (:bv st) start data-end)]
+    (reset! (:i st) (+ endkw 9))                                ; past "endstream"
+    {::stream true :dict dict :raw raw}))
+
+(defn- parse-dict [st]
+  (next-c st) (next-c st)                                        ; <<
+  (let [m (loop [m {}]
+            (skip-ws st)
+            (cond
+              (nil? (peek-c st)) m                              ; EOF guard
+              (and (= (peek-c st) \>) (= (at st 1) \>)) (do (next-c st) (next-c st) m)
+              (not= (peek-c st) \/) (do (next-c st) (recur m))  ; resync to next /name
+              :else (let [k (parse-name st) v (parse-value st)]
+                      (recur (assoc m k v)))))]
+    (skip-ws st)
+    (if (looking-at? st "stream") (parse-stream st m) m)))
+
+(defn- parse-value [st]
+  (skip-ws st)
+  (let [c (peek-c st)]
+    (cond
+      (nil? c) ::eof
+      (= c \<) (if (= (at st 1) \<) (parse-dict st) (parse-hex-string st))
+      (= c \() (parse-literal-string st)
+      (= c \[) (parse-array st)
+      (= c \/) (parse-name st)
+      (or (digit? c) (#{\+ \- \.} c)) (parse-number-or-ref st)
+      (alpha? c) (parse-keyword st)
+      :else (do (next-c st) (parse-value st)))))
+
+;; ---- top-level: scan objects, find trailer/root --------------------------
+(defn- ws-back [s i]   (loop [j i] (if (and (>= j 0) (ws? (nth s j))) (recur (dec j)) j)))
+(defn- int-back [s i]  (loop [j i] (if (and (>= j 0) (digit? (nth s j))) (recur (dec j))
+                                       (let [start (inc j)]
+                                         (when (<= start i) [(parse-num (subs s start (inc i))) start])))))
+
+(defn resolve-ref
+  "Resolve an indirect reference (one or more hops) against the object table."
+  [objs v]
+  (if (and (map? v) (contains? v ::ref))
+    (recur objs (get objs (::ref v)))
+    v))
+
+(defn- find-trailer [s bv objs]
+  (if-let [k (str/last-index-of s "trailer")]
+    (parse-value {:s s :bv bv :i (atom (+ k 7)) :len (count s)})
+    (if-let [cat (some (fn [[ref v]] (when (and (map? v) (= (:Type v) :Catalog)) ref)) objs)]
+      {:Root {::ref cat}} {})))
+
+(declare decode-stream expand-objstm)
+
+(defn parse
+  "Parse PDF `data` (seq of unsigned bytes) into {:objects :trailer :root}.
+   Objects packed inside /Type /ObjStm compressed object streams (ISO 32000
+   §7.5.7 — common in PDFs written by recent Acrobat/other real-world
+   tools) are expanded and merged into :objects (see expand-objstm)."
+  [data]
+  (let [bv (vec data)
+        s  (apply str (map char bv))
+        n  (count s)
+        objs (loop [from 0 acc {}]
+               (if-let [k (str/index-of s "obj" from)]
+                 (let [after (if (< (+ k 3) n) (nth s (+ k 3)) \space)]
+                   (if-not (or (ws? after) (delim? after) (= after \<) (= after \[))
+                     (recur (+ k 3) acc)
+                     (let [g  (int-back s (ws-back s (dec k)))
+                           o  (when g (int-back s (ws-back s (dec (second g)))))]
+                       (if (and g o)
+                         (let [st {:s s :bv bv :i (atom (+ k 3)) :len n}
+                               v  (parse-value st)]
+                           (recur @(:i st) (assoc acc [(first o) (first g)] v)))
+                         (recur (+ k 3) acc)))))
+                 acc))
+        objs (expand-objstm objs)
+        trailer (find-trailer s bv objs)]
+    {:objects objs :trailer trailer :root (resolve-ref objs (:Root trailer))}))
+
+;; ---- page tree -----------------------------------------------------------
+(defn- collect-pages [objs node inherited]
+  (let [node (resolve-ref objs node)
+        inh  (merge inherited (select-keys node [:MediaBox :Resources]))]
+    (cond
+      (= (:Type node) :Page)  [(merge inh node)]
+      (or (= (:Type node) :Pages) (:Kids node))
+      (vec (mapcat #(collect-pages objs % inh) (resolve-ref objs (:Kids node))))
+      :else [(merge inh node)])))
+
+(defn pages
+  "Return the leaf page dicts (with inherited MediaBox/Resources merged)."
+  [parsed]
+  (let [objs (:objects parsed)]
+    (collect-pages objs (resolve-ref objs (:Pages (:root parsed))) {})))
+
+;; ---- stream decode + text extraction -------------------------------------
+(defn decode-stream
+  "Decode a stream object's bytes by applying its /Filter chain. Unknown
+   filters (e.g. DCTDecode) pass through opaquely."
+  [objs stream]
+  (let [f  (resolve-ref objs (:Filter (:dict stream)))
+        fs (cond (nil? f) [] (keyword? f) [f] (vector? f) f :else [])]
+    (reduce (fn [b filt] (case filt :FlateDecode (deflate/inflate b) b))
+            (:raw stream) fs)))
+
+;; ---- object streams (/Type /ObjStm, ISO 32000 §7.5.7) ---------------------
+;; Real-world PDFs from recent Acrobat/other tools commonly pack many small
+;; objects into a compressed object stream instead of writing each as its
+;; own top-level "N G obj ... endobj" — the byte-level scan in `parse` can't
+;; see these (there's no literal "obj"/"endobj" text inside the compressed
+;; payload), so they need a dedicated expansion pass over the header table
+;; the ObjStm stream itself declares.
+(defn- objstm? [v]
+  (and (map? v) (::stream v) (= (:Type (:dict v)) :ObjStm)))
+
+(defn expand-objstm
+  "Decode every /Type /ObjStm object in `objs` and merge the objects it
+   contains back into the table (all at generation 0, per spec — an
+   object's generation is always 0 inside an object stream). An ObjStm's
+   own stream is: an N-pair header of whitespace-separated `objnum offset`
+   decimal integers, then (starting at byte /First) the N object values
+   concatenated back-to-back with no delimiter between them — an object's
+   end is only knowable from the next object's start (or end of stream for
+   the last one), so pairs are offset-sorted first. A stream can never be
+   nested inside an ObjStm (ISO 32000 §7.5.7), so the per-object parse
+   below never needs :bv (the raw-byte-vector reader-state field
+   parse-stream would use)."
+  [objs]
+  (reduce
+   (fn [acc [_ v]]
+     (if (objstm? v)
+       (let [decoded   (decode-stream acc v)
+             s         (apply str (map char decoded))
+             first-off (:First (:dict v))
+             nums      (mapv 
+                             (re-seq #"\d+" (subs s 0 first-off)))
+             pairs     (sort-by second (partition 2 nums))
+             bounded   (map (fn [[objnum off] nxt]
+                              [objnum off (if nxt (second nxt) (- (count s) first-off))])
+                            pairs (concat (rest pairs) [nil]))]
+         (reduce (fn [acc2 [objnum off end]]
+                   (let [obj-s (subs s (+ first-off off) (+ first-off end))
+                         val   (parse-value {:s obj-s :bv nil :i (atom 0) :len (count obj-s)})]
+                     (assoc acc2 [objnum 0] val)))
+                 acc bounded))
+       acc))
+   objs objs))
+
+(defn page-content-str [objs page]
+  (let [c     (:Contents page)
+        items (cond (vector? c) c (nil? c) [] :else [c])
+        streams (keep #(let [x (resolve-ref objs %)] (when (::stream x) x)) items)]
+    (apply str (map char (vec (mapcat #(decode-stream objs %) streams))))))
+
+(defn extract-text
+  "Collect strings shown between BT/ET in a content stream (R0 heuristic)."
+  [content]
+  (let [st {:s content :bv nil :i (atom 0) :len (count content)}]
+    (loop [in? false runs []]
+      (let [c (peek-c st)]
+        (cond
+          (nil? c) runs
+          (= c \()                       (let [s (parse-literal-string st)] (recur in? (if in? (conj runs s) runs)))
+          (and (= c \<) (not= (at st 1) \<)) (let [s (parse-hex-string st)] (recur in? (if in? (conj runs s) runs)))
+          (and (= c \B) (looking-at? st "BT")) (do (swap! (:i st) + 2) (recur true runs))
+          (and (= c \E) (looking-at? st "ET")) (do (swap! (:i st) + 2) (recur false runs))
+          :else (do (next-c st) (recur in? runs)))))))
+
+(defn page-text [objs page]
+  (extract-text (page-content-str objs page)))
+
+;; ---- image XObjects ------------------------------------------------------
+(defn page-images
+  "Image XObjects referenced from a page's /Resources /XObject. Returns
+   {:name :w :h :bpc :colorspace :filter :stream}."
+  [objs page]
+  (let [res  (resolve-ref objs (:Resources page))
+        xobj (resolve-ref objs (:XObject res))]
+    (when (map? xobj)
+      (keep (fn [[k v]]
+              (let [s (resolve-ref objs v)]
+                (when (and (map? s) (::stream s) (= (:Subtype (:dict s)) :Image))
+                  {:name       (name k)
+                   :w          (:Width (:dict s))
+                   :h          (:Height (:dict s))
+                   :bpc        (:BitsPerComponent (:dict s))
+                   :colorspace (resolve-ref objs (:ColorSpace (:dict s)))
+                   :filter     (resolve-ref objs (:Filter (:dict s)))
+                   :stream     s})))
+            xobj))))
+
+(defn decode-image
+  "Decode an image XObject (from page-images). FlateDecode → raw samples;
+   DCTDecode → the embedded JPEG bytes (feed to org-iso-jpeg's decode-rgb,
+   kept decoupled); other filters → opaque. JPXDecode/CCITT are opaque (R0)."
+  [_objs img]
+  (let [raw (:raw (:stream img))
+        f   (:filter img)
+        fs  (cond (nil? f) [] (keyword? f) [f] (vector? f) f :else [])]
+    (cond
+      (some #{:DCTDecode} fs)   {:fmt :jpeg :jpeg raw :w (:w img) :h (:h img)}
+      (some #{:FlateDecode} fs) {:fmt :raw  :samples (deflate/inflate raw) :w (:w img) :h (:h img) :bpc (:bpc img)}
+      :else                     {:fmt :opaque :opaque raw :w (:w img) :h (:h img)})))
+
+;; ---- portable writer ----------------------------------------------------
+(defn- pdf-number [value]
+  (if (integer? value) (str value)
+      (let [text (str (double value))]
+        (if (re-find #"[eE]" text)
+          
+          text))))
+
+(defn escape-text [value]
+  (-> (str value)
+      (str/replace "\\" "\\\\")
+      (str/replace "(" "\\(")
+      (str/replace ")" "\\)")))
+
+(defn text-command
+  [{:keys [x y text size font] :or {size 10 font "F1"}}]
+  (str "BT /" font " " (pdf-number size) " Tf " (pdf-number x) " "
+       (pdf-number y) " Td (" (escape-text text) ") Tj ET\n"))
+
+(defn line-command [{:keys [from to width] :or {width 1}}]
+  (str (pdf-number width) " w " (pdf-number (first from)) " "
+       (pdf-number (second from)) " m " (pdf-number (first to)) " "
+       (pdf-number (second to)) " l S\n"))
+
+(defn rect-command [{:keys [x y width height fill?]}]
+  (str (pdf-number x) " " (pdf-number y) " " (pdf-number width) " "
+       (pdf-number height) " re " (if fill? "f" "S") "\n"))
+
+(defn- pad-left [value width]
+  (let [text (str value)]
+    (str (apply str (repeat (max 0 (- width (count text))) "0")) text)))
+
+(defn write-document
+  "Write a standards-shaped PDF 1.4 byte vector with classic xref/trailer.
+  Pages accept {:width :height :content}; content is a PDF graphics stream."
+  [pages]
+  (when-not (seq pages)
+    (throw (ex-info "PDF document requires at least one page" {})))
+  (let [pages (vec pages) font-id (+ 3 (* 2 (count pages)))
+        page-id #(+ 3 (* 2 %)) content-id #(+ 4 (* 2 %))
+        page-kids (str/join " " (map #(str (page-id %) " 0 R") (range (count pages))))
+        bodies
+        (vec
+         (concat
+          ["<< /Type /Catalog /Pages 2 0 R >>"
+           (str "<< /Type /Pages /Kids [" page-kids "] /Count " (count pages) " >>")]
+          (mapcat (fn [index {:keys [width height content]
+                              :or {width 595 height 842 content ""}}]
+                    [(str "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 "
+                          (pdf-number width) " " (pdf-number height)
+                          "] /Resources << /Font << /F1 " font-id
+                          " 0 R >> >> /Contents " (content-id index) " 0 R >>")
+                     (str "<< /Length " (count content) " >>\nstream\n"
+                          content "endstream")])
+                  (range) pages)
+          ["<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]))
+        objects (mapv (fn [index body]
+                        (str (inc index) " 0 obj\n" body "\nendobj\n"))
+                      (range) bodies)
+        header "%PDF-1.4\n"
+        offsets (loop [position (count header) remaining objects result []]
+                  (if-let [object (first remaining)]
+                    (recur (+ position (count object)) (next remaining) (conj result position))
+                    result))
+        object-section (apply str objects)
+        xref-offset (+ (count header) (count object-section))
+        xref (str "xref\n0 " (inc (count objects)) "\n"
+                  "0000000000 65535 f \n"
+                  (apply str (map #(str (pad-left % 10) " 00000 n \n") offsets)))
+        trailer (str "trailer\n<< /Size " (inc (count objects)) " /Root 1 0 R >>\n"
+                     "startxref\n" xref-offset "\n%%EOF\n")
+        document (str header object-section xref trailer)]
+    ;; `code`, not `int`. On the JVM a String iterates as Characters and `int`
+    ;; gives the code point; on ClojureScript it iterates as one-character
+    ;; STRINGS and `int` gives nothing useful — the whole document came out as
+    ;; zeros. This function lives in a `.cljc` file, so it claimed to work on
+    ;; both platforms while producing garbage on one. (Measured 2026-07-31: the
+    ;; first four bytes were `00 00 00 00` instead of `%PDF`.)
+    (mapv #(bit-and (code %) 0xff) document)))

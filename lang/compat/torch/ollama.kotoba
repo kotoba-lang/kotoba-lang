@@ -1,0 +1,184 @@
+(ns torch.ollama
+  "Ollama-compatible `/api/generate` request and streaming response contract."
+  (:require [clojure.string :as str]
+            [torch.continuous :as continuous]
+            [torch.tokenizer :as tokenizer]))
+
+(defn- parse-integer [text]
+  )
+
+(defn parse-keep-alive
+  "Parse Ollama keep_alive into milliseconds. Numeric values are seconds;
+  strings accept `ms`, `s`, `m`, or `h`; -1 means indefinite residency."
+  [value]
+  (cond
+    (nil? value) 300000
+    (number? value)
+    (let [value (long value)]
+      (if (< value -1)
+        (throw (ex-info "invalid Ollama keep_alive" {:keep-alive value :status 400}))
+        (if (= -1 value) -1 (* 1000 value))))
+    (string? value)
+    (if-let [[_ amount unit] (re-matches #"^(-?[0-9]+)(ms|s|m|h)?$" value)]
+      (let [amount (parse-integer amount)
+            multiplier (case unit "ms" 1 "s" 1000 "m" 60000 "h" 3600000
+                             1000)]
+        (if (< amount -1)
+          (throw (ex-info "invalid Ollama keep_alive"
+                          {:keep-alive value :status 400}))
+          (if (= -1 amount) -1 (* amount multiplier))))
+      (throw (ex-info "invalid Ollama keep_alive" {:keep-alive value :status 400})))
+    :else (throw (ex-info "invalid Ollama keep_alive"
+                          {:keep-alive value :status 400}))))
+
+(defn normalize-generate-request
+  "Validate an Ollama generate body and translate options to torch sampling.
+  Durations/deadlines are milliseconds at this portable boundary; an HTTP host
+  is responsible for JSON and Ollama's nanosecond duration fields."
+  [body]
+  (let [{:keys [model prompt stream options timeout_ms keep_alive]} body
+        options (or options {})]
+    (when-not (and (string? model) (seq model) (string? prompt)
+                   (or (nil? stream) (boolean? stream)) (map? options))
+      (throw (ex-info "invalid Ollama generate request"
+                      {:status 400 :body body})))
+    {:model model :prompt prompt :stream (not= false stream)
+     :sampling
+     (cond-> {:max-new-tokens (long (or (:num_predict options) 128))
+              :temperature (double (or (:temperature options) 0.8))
+              :top-p (double (or (:top_p options) 0.9))
+              :repetition-penalty (double (or (:repeat_penalty options) 1.1))}
+       (:top_k options) (assoc :top-k (long (:top_k options)))
+       (:seed options) (assoc :seed (long (:seed options))))
+     :timeout-ms (when timeout_ms (long timeout_ms))
+     :keep-alive-ms (parse-keep-alive keep_alive)}))
+
+(defn- portable-chat [messages]
+  (str (apply str
+              (map (fn [{:keys [role content]}]
+                     (case role
+                       "system" (str "System: " content "\n")
+                       "user" (str "User: " content "\n")
+                       "assistant" (str "Assistant: " content "\n"))) messages))
+       "Assistant:"))
+
+(defn- llama3-chat [messages]
+  (str (apply str
+              (map (fn [{:keys [role content]}]
+                     (str "<|start_header_id|>" role "<|end_header_id|>\n\n"
+                          content "<|eot_id|>")) messages))
+       "<|start_header_id|>assistant<|end_header_id|>\n\n"))
+
+(defn- chatml-chat [messages]
+  (str (apply str (map (fn [{:keys [role content]}]
+                         (str "<|im_start|>" role "\n" content "<|im_end|>\n"))
+                       messages))
+       "<|im_start|>assistant\n"))
+
+(defn- llama2-chat [messages]
+  (let [system (some #(when (= "system" (:role %)) (:content %)) messages)
+        turns (remove #(= "system" (:role %)) messages)]
+    (loop [turns turns first-user? true output ""]
+      (if-let [{:keys [role content]} (first turns)]
+        (case role
+          "user" (recur (next turns) false
+                        (str output "[INST] "
+                             (when (and first-user? system)
+                               (str "<<SYS>>\n" system "\n<</SYS>>\n\n"))
+                             content " [/INST]"))
+          "assistant" (recur (next turns) first-user? (str output " " content " </s>")))
+        output))))
+
+(defn render-chat-prompt
+  "Render chat using recognized GGUF Jinja template families. Unknown model
+  templates fail explicitly; models without metadata use a portable fallback."
+  ([messages] (portable-chat messages))
+  ([messages template]
+   (cond
+     (nil? template) (portable-chat messages)
+     (str/includes? template "<|start_header_id|>") (llama3-chat messages)
+     (str/includes? template "<|im_start|>") (chatml-chat messages)
+     (str/includes? template "[INST]") (llama2-chat messages)
+     :else (throw (ex-info "unsupported GGUF chat template"
+                           {:status 400 :template template})))))
+
+(defn normalize-chat-request
+  "Validate Ollama `/api/chat` text messages and translate them to generation.
+  Multimodal content and tools are rejected until the model/runtime supports them."
+  [{:keys [model messages tools stream options timeout_ms keep_alive format
+           think logprobs top_logprobs] :as body}]
+  (when-not (and (string? model) (seq model) (vector? messages) (seq messages)
+                 (every? (fn [{:keys [role content] :as message}]
+                           (and (map? message) (#{"system" "user" "assistant"} role)
+                                (string? content) (not (contains? message :images))
+                                (not (contains? message :tool_calls))))
+                         messages)
+                 (or (nil? stream) (boolean? stream))
+                 (or (nil? options) (map? options)))
+    (throw (ex-info "invalid Ollama chat request" {:status 400 :body body})))
+  (when (seq tools)
+    (throw (ex-info "tool calling is not supported by this model runtime"
+                    {:status 400})))
+  (when (or (some? format) (= true think) (string? think) (= true logprobs)
+            (some? top_logprobs))
+    (throw (ex-info "requested Ollama chat capability is not supported"
+                    {:status 400})))
+  (assoc (normalize-generate-request
+          {:model model :prompt (render-chat-prompt messages) :stream stream
+           :options options :timeout_ms timeout_ms :keep_alive keep_alive})
+         :messages messages :chat? true))
+
+(defn normalize-embed-request
+  "Validate Ollama `/api/embed`; returns a canonical vector of input strings."
+  [{:keys [model input truncate dimensions keep_alive] :as body}]
+  (let [inputs (cond (string? input) [input]
+                     (and (vector? input) (every? string? input)) input
+                     :else nil)]
+    (when-not (and (string? model) (seq model) (seq inputs)
+                   (every? seq inputs)
+                   (or (nil? truncate) (boolean? truncate))
+                   (or (nil? dimensions) (pos-int? dimensions)))
+      (throw (ex-info "invalid Ollama embed request" {:status 400 :body body})))
+    {:model model :inputs inputs :truncate? (not= false truncate)
+     :dimensions dimensions :keep-alive-ms (parse-keep-alive keep_alive)}))
+
+(defn submit-generate
+  "Tokenize and submit an Ollama request to a continuous engine."
+  [engine* tokenizer* request-id body now-ms]
+  (let [{:keys [prompt sampling timeout-ms] :as request}
+        (normalize-generate-request body)
+        prompt-tokens (tokenizer/encode tokenizer* prompt)
+        options (cond-> sampling timeout-ms
+                  (assoc :deadline-ms (+ now-ms timeout-ms)))
+        submitted (continuous/submit engine* request-id prompt-tokens options)]
+    (assoc submitted :request request :prompt-tokens prompt-tokens)))
+
+(defn token-chunk
+  "One Ollama NDJSON streaming payload (before JSON encoding)."
+  [model created-at text]
+  {:model model :created_at created-at :response text :done false})
+
+(defn done-chunk
+  "Final Ollama generate payload with standard counts/durations."
+  [model created-at context
+   {:keys [done-reason total-duration load-duration prompt-eval-count
+           prompt-eval-duration eval-count eval-duration]
+    :or {done-reason "stop" total-duration 0 load-duration 0
+         prompt-eval-count 0 prompt-eval-duration 0 eval-count 0
+         eval-duration 0}}]
+  {:model model :created_at created-at :response "" :done true
+   :done_reason done-reason :context (vec context)
+   :total_duration total-duration :load_duration load-duration
+   :prompt_eval_count prompt-eval-count
+   :prompt_eval_duration prompt-eval-duration
+   :eval_count eval-count :eval_duration eval-duration})
+
+(defn chat-chunk
+  "Translate a generate chunk into Ollama `/api/chat` response shape."
+  [chunk]
+  (-> chunk
+      (dissoc :response :context)
+      (assoc :message {:role "assistant" :content (:response chunk "")})))
+
+(defn error-body [message]
+  {:error (str message)})

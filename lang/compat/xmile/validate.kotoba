@@ -1,0 +1,255 @@
+(ns xmile.validate
+  "Structural validation for xmile.model models, returning
+  kotoba.dsl.problem-shaped problems (:xmile/severity :error|:warn).
+
+  :error means the model is not valid XMILE (dangling reference, illegal
+  algebraic loop, malformed sim_specs/gf, a malformed DELAY1/DELAY3/SMTH1/
+  SMTH3/TREND call, ...). :warn means the model IS valid XMILE but
+  exercises a feature xmile.execute v1 does not yet simulate (arrays,
+  conveyor/queue transport, DELAY/DELAYN/SMTHN/FORCST, stochastic
+  functions, integration methods other than euler/rk4) -- see README
+  Follow-ups. A model with only :warn problems is spec-valid but
+  xmile.execute/run will throw if you actually try to run it.
+
+  DELAY1/DELAY3/SMTH1/SMTH3/TREND (xmile.expr/hidden-stock-builtins) are
+  IMPLEMENTED (xmile.execute/desugar-delays), so a call to one of them is
+  no longer flagged as :xmile/unsupported-builtin -- instead
+  `delay-smooth-problems` below checks it's a structurally usable call
+  (right argument count; a positive delay/smoothing/averaging-time where
+  that argument is a literal constant)."
+  (:require [clojure.string :as str]
+            [clojure.set :as set]
+            [kotoba.dsl.problem :as problem]
+            [xmile.model :as m]
+            [xmile.expr :as expr]))
+
+(def domain :xmile)
+
+(defn- err  [code subject msg] (problem/problem domain :error code subject msg))
+(defn- warn [code subject msg] (problem/problem domain :warn code subject msg))
+
+(defn- try-parse [eqn-str]
+  (try {:ok (expr/parse eqn-str)}
+       (catch  ex
+         {:error (ex-message ex)})))
+
+(defn sim-specs-problems [model]
+  (let [ss (:xmile/sim-specs model)]
+    (if-not ss
+      [(err :xmile/missing-sim-specs (:xmile/name model) "model has no :xmile/sim-specs")]
+      (cond-> []
+        (not (< (:xmile/start ss) (:xmile/stop ss)))
+        (conj (err :xmile/bad-sim-specs ss "sim_specs :xmile/start must be < :xmile/stop"))
+        (and (:xmile/dt ss) (not (pos? (:xmile/dt ss))))
+        (conj (err :xmile/bad-sim-specs ss "sim_specs :xmile/dt must be > 0"))
+        (not (contains? #{:euler :rk4} (:xmile/method ss :euler)))
+        (conj (warn :xmile/unsupported-method (:xmile/method ss)
+                     "xmile.execute v1 only implements :euler and :rk4 (sec 3.7.1 also allows rk2/rk45/gear)"))))))
+
+(defn- eqn-string [v] (:xmile/eqn v))
+
+(defn eqn-problems
+  "Per-variable equation problems: parse errors, dangling references
+  (sec 3.3), and calls to sec 3.5.2/3.5.3 built-ins xmile.expr does not
+  implement at all (v2 scope-out; DELAY1/DELAY3/SMTH1/SMTH3/TREND are
+  implemented -- see `delay-smooth-problems` below for their own
+  structural checks -- so calls to them are not flagged here)."
+  [model]
+  (let [names (m/variable-names model)
+        known (into names #{"TIME" "DT"})]
+    (mapcat
+     (fn [v]
+       (let [nm (:xmile/name v)
+             parsed (try-parse (eqn-string v))]
+         (if (:error parsed)
+           [(err :xmile/eqn-parse-error nm (str "could not parse equation: " (:error parsed)))]
+           (let [tree (:ok parsed)
+                 dangling (remove known (expr/free-vars tree))
+                 unsupported (filter expr/unsupported-builtins (expr/called-fns tree))]
+             (concat
+              (map #(err :xmile/dangling-ref [nm %] (str nm "'s equation references unknown identifier " %))
+                   dangling)
+              (map #(warn :xmile/unsupported-builtin [nm %]
+                          (str nm "'s equation calls " % ", not implemented by xmile.expr (v2 scope-out)"))
+                   unsupported))))))
+     (m/variables model))))
+
+(defn- const-num
+  "The literal numeric value of a :num expr node (or a :neg of one --
+  `parse` always represents a negative literal as unary minus applied to a
+  positive :num, e.g. \"-3\" => [:neg [:num 3.0]]), or nil if `e` isn't a
+  constant at all (i.e. it's some other expression -- delay/smoothing/
+  averaging-time positivity can only be statically checked when it's a
+  literal constant)."
+  [e]
+  (case (first e)
+    :num (second e)
+    :neg (when-let [n (const-num (second e))] (- n))
+    nil))
+
+(defn delay-smooth-problems
+  "Structural checks for sec 3.5.3 DELAY1/DELAY3/SMTH1/SMTH3/TREND calls
+  (xmile.expr/hidden-stock-builtins -- implemented via
+  xmile.execute/desugar-delays, not flagged as :xmile/unsupported-builtin
+  by eqn-problems above): each takes 2 or 3 arguments (input,
+  delay/smoothing/averaging-time[, initial]); where that time argument is a
+  literal constant, it must be > 0 (a non-positive delay/smoothing/
+  averaging time is nonsensical -- it isn't checked when the argument is
+  itself an expression, since that can't be known until simulated). The
+  optional 3rd argument (initial value, or for TREND an initial TREND) has
+  no such constraint -- a trend can legitimately be negative."
+  [model]
+  (mapcat
+   (fn [v]
+     (let [nm (:xmile/name v)
+           parsed (try-parse (eqn-string v))]
+       (if (:error parsed)
+         []
+         (mapcat
+          (fn [[fn-name args]]
+            (if-not (contains? expr/hidden-stock-builtins fn-name)
+              []
+              (let [n (count args)]
+                (cond
+                  (not (contains? #{2 3} n))
+                  [(err :xmile/bad-delay-call [nm fn-name]
+                        (str nm "'s call to " fn-name
+                             " takes 2 or 3 arguments (input, time[, initial]), got " n))]
+
+                  :else
+                  (let [time-arg (second args)
+                        c (const-num time-arg)]
+                    (if (and c (not (pos? c)))
+                      [(err :xmile/bad-delay-call [nm fn-name]
+                            (str nm "'s call to " fn-name
+                                 "'s delay/smoothing/averaging-time argument must be > 0, got " c))]
+                      []))))))
+          (expr/calls (:ok parsed))))))
+   (m/variables model)))
+
+(defn flow-ref-problems
+  "Every stock :xmile/inflows/:xmile/outflows name must be an existing :flow variable."
+  [model]
+  (mapcat
+   (fn [s]
+     (let [nm (:xmile/name s)]
+       (for [fname (into (:xmile/inflows s #{}) (:xmile/outflows s #{}))
+             :let [target (m/lookup model fname)]
+             :when (not (and target (m/flow? target)))]
+         (err :xmile/unknown-flow-ref [nm fname]
+              (str nm " names " fname " as an inflow/outflow, but it is not a known :flow variable")))))
+   (m/stocks model)))
+
+(defn- non-stock-deps
+  "{name -> #{names it depends on}} restricted to :flow/:aux variables --
+  a stock's current value is already known at the start of a step, so an
+  edge INTO a stock is not a same-tick ordering hazard; only cycles among
+  flow/aux equations are illegal (sec 3.3 implies whole-model equations
+  must be evaluable, i.e. acyclic once stocks are treated as known). Uses
+  `expr/same-tick-free-vars`, not plain `free-vars`: a reference that
+  appears only inside a DELAY1/DELAY3/SMTH1/SMTH3/TREND call's arguments is
+  ALSO not a same-tick hazard (xmile.execute desugars it into a hidden
+  stock -- see that namespace), which is what makes e.g. `A = DELAY1(B, 5)`
+  / `B = A + 1` a legal delay-mediated coupling, not an illegal loop."
+  [model]
+  (let [non-stock-names (into #{} (map :xmile/name (concat (m/flows model) (m/auxs model))))]
+    (into {}
+          (for [v (concat (m/flows model) (m/auxs model))
+                :let [parsed (try-parse (eqn-string v))]
+                :when (:ok parsed)]
+            [(:xmile/name v) (set/intersection non-stock-names (expr/same-tick-free-vars (:ok parsed)))]))))
+
+(defn algebraic-loop-problems
+  "Cycle-detect the flow/aux dependency graph via DFS (white/gray/black)."
+  [model]
+  (let [deps (non-stock-deps model)
+        color (atom {})
+        cycle (atom nil)]
+    (letfn [(visit [n path]
+              (when-not @cycle
+                (case (get @color n :white)
+                  :black nil
+                  :gray (reset! cycle (conj path n))
+                  :white (do (swap! color assoc n :gray)
+                             (doseq [d (get deps n)] (visit d (conj path n)))
+                             (swap! color assoc n :black)))))]
+      (doseq [n (keys deps)] (visit n []))
+      (if @cycle
+        [(err :xmile/algebraic-loop @cycle
+              (str "illegal algebraic loop (no stock breaks the cycle): " (str/join " -> " @cycle)))]
+        []))))
+
+(defn gf-problems [model]
+  (keep (fn [v]
+          (when-let [gf (:xmile/gf v)]
+            (let [xpts (:xmile/xpts gf) ypts (:xmile/ypts gf)]
+              (cond
+                (nil? ypts) (err :xmile/bad-gf (:xmile/name v) "gf has no :xmile/ypts")
+                (< (count ypts) 2) (err :xmile/bad-gf (:xmile/name v) "gf :xmile/ypts needs >= 2 points")
+                (and xpts (not= (count xpts) (count ypts)))
+                (err :xmile/bad-gf (:xmile/name v) "gf :xmile/xpts and :xmile/ypts must be the same length")))))
+        (m/variables model)))
+
+(defn not-yet-executable-problems
+  "Sec 3.7.2/3.7.3 conveyor/queue stocks and array-dimensioned (sec 4.5)
+  variables are valid XMILE but xmile.execute v1 does not simulate them."
+  [model]
+  (concat
+   (keep (fn [s] (when (m/special-stock? s)
+                   (warn :xmile/not-yet-executable (:xmile/name s)
+                         (str (:xmile/name s) " is a " (name (:xmile/stock-type s))
+                              " stock -- transport semantics not yet simulated by xmile.execute"))))
+         (m/stocks model))
+   (keep (fn [v] (when (m/dimensioned? v)
+                   (warn :xmile/not-yet-executable (:xmile/name v)
+                         (str (:xmile/name v) " is array-dimensioned -- not yet simulated by xmile.execute"))))
+         (m/variables model))))
+
+(defn validate
+  "All problems for `model`, most structural first."
+  [model]
+  (vec (concat (sim-specs-problems model)
+               (flow-ref-problems model)
+               (eqn-problems model)
+               (delay-smooth-problems model)
+               (algebraic-loop-problems model)
+               (gf-problems model)
+               (not-yet-executable-problems model))))
+
+(defn document-problems
+  "XMILE 1.0 whole-document requirements that cannot be checked on an
+  isolated model: a header, one or more models, and at least one global or
+  model-local simulation specification."
+  [doc]
+  (let [models (:xmile/models doc)
+        has-sim-specs? (or (:xmile/sim-specs doc)
+                           (some :xmile/sim-specs models))]
+    (cond-> []
+      (nil? (:xmile/header doc))
+      (conj (err :xmile/missing-header :xmile/document
+                 "XMILE 1.0 requires exactly one top-level header"))
+      (empty? models)
+      (conj (err :xmile/missing-model :xmile/document
+                 "XMILE 1.0 requires one or more model elements"))
+      (not has-sim-specs?)
+      (conj (err :xmile/missing-document-sim-specs :xmile/document
+                 "XMILE 1.0 requires sim_specs globally or on at least one model")))))
+
+(defn validate-doc
+  "Validate a complete `xmile.xml/parse-doc` result. Global sim_specs are
+  applied as the effective default for models that do not override them,
+  matching XMILE 1.0 section 2.3."
+  [doc]
+  (let [global-ss (:xmile/sim-specs doc)]
+    (vec
+     (concat
+      (document-problems doc)
+      (mapcat (fn [model]
+                (validate (cond-> model
+                            (and global-ss (nil? (:xmile/sim-specs model)))
+                            (assoc :xmile/sim-specs global-ss))))
+              (:xmile/models doc))))))
+
+(defn errors   [problems] (problem/errors domain problems))
+(defn warnings [problems] (problem/warnings domain problems))
+(defn valid?   [problems] (problem/valid? domain problems))

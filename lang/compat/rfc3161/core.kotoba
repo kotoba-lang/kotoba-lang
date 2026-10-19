@@ -1,0 +1,288 @@
+(ns rfc3161.core
+  "[RFC 3161](https://www.rfc-editor.org/rfc/rfc3161.html) time-stamp protocol —
+  build a request, parse and verify a token. Portable `.cljc`.
+
+  ## Why this exists, in one paragraph
+
+  A signature says who agreed. It does not say *when*, because the only time in
+  it is one the signer wrote down. An accredited timestamp authority signs a
+  statement that a digest existed before a moment, and that is the difference
+  between a claim and evidence. In Japan the 総務大臣認定タイムスタンプ is one of
+  the three ways to satisfy the tamper-evidence requirement for retained
+  electronic transaction data (電子帳簿保存法); in eIDAS it is what a qualified
+  timestamp is. Both name RFC 3161 and neither names a blockchain anchor, which
+  proves \"no later than\" and is not the thing the regulation asks for.
+
+  ## No default TSA, and that is the fail-closed part
+
+  There is no built-in TSA URL and no fallback. A library that shipped one would
+  produce timestamps that look official and are not accredited anywhere, and the
+  difference is invisible in the resulting token. `request` builds bytes; getting
+  them to a TSA and back is the caller's, and so is deciding which TSA is
+  accredited for their jurisdiction.
+
+  ## What `verify-token` checks, and the two that are easy to skip
+
+  `messageImprint` equality is the obvious one. The two that are not:
+
+  - **the signing certificate must carry `id-kp-timeStamping` as an
+    extended key usage, and it must be the ONLY one** (RFC 3161 §2.3, which says
+    the extension must be critical and contain exactly this KeyPurposeID). A TSA
+    key that is also a TLS key is a TSA key whose holder can be phished into
+    signing something else.
+  - **the nonce must come back unchanged.** Without it a token is a recording:
+    an old response for the same digest replays as a fresh one. `request`
+    generates no nonce for you — you pass one — because a nonce a library
+    invented is one the caller cannot check.
+
+  Time is returned as a string and never compared to a clock. Whether a
+  timestamp is recent enough is a policy question with a different answer for a
+  contract than for a log line."
+  (:require [asn1.core :as asn1]
+            [asn1.oid :as oid]
+            [cms.core :as cms]
+            [x509.core :as x509]))
+
+(defn fail! [code message data]
+  (throw (ex-info message (assoc data :type code))))
+
+(def status-codes
+  "`PKIStatus` (RFC 3161 §2.4.2). `:granted-with-mods` is a success in which the
+  TSA changed something about the request, so a caller that treats it as plain
+  success must still compare what came back to what it asked for — which
+  `verify-token` does regardless."
+  {0 :granted 1 :granted-with-mods 2 :rejection 3 :waiting
+   4 :revocation-warning 5 :revocation-notification})
+
+(def failure-info-bits
+  "`PKIFailureInfo` bit positions. Reported by name because a TSA that answers
+  `badAlg` and one that answers `timeNotAvailable` need different responses from
+  the caller, and a bare \"rejected\" tells them apart from nothing."
+  {0 :bad-alg 2 :bad-request 5 :bad-data-format 14 :time-not-available
+   15 :unaccepted-policy 16 :unaccepted-extension 17 :add-info-not-available
+   25 :system-failure})
+
+;; ── request ──────────────────────────────────────────────────────────────────
+
+(defn request
+  "A DER `TimeStampReq` over `digest`, as an int vector.
+
+    :digest        the message imprint — the digest of what is being timestamped
+    :digest-algorithm  name keyword (default :sha256)
+    :nonce         a large integer, REQUIRED. See the namespace docstring.
+    :policy        optional TSA policy OID, dotted
+    :cert-req?     ask the TSA to include its certificate (default true)
+
+  `cert-req?` defaults to true because a token whose signing certificate is not
+  in it can only be verified by somebody who already has that certificate — and
+  an evidence record that has to be completed later is one that can fail to be."
+  [{:keys [digest digest-algorithm nonce policy cert-req?]
+    :or {digest-algorithm :sha256 cert-req? true}}]
+  (let [digest (asn1/->ints digest)
+        expected (get-in oid/digest-algorithms [digest-algorithm :length])]
+    (when-not expected
+      (fail! :rfc3161/unsupported-digest-algorithm
+             (str "unsupported digest algorithm: " digest-algorithm)
+             {:algorithm digest-algorithm}))
+    (when-not (= expected (count digest))
+      ;; A length that disagrees with the named algorithm is a mistake the TSA
+      ;; would answer `badDataFormat` to, minutes and one network round trip
+      ;; later.
+      (fail! :rfc3161/digest-length-mismatch
+             (str digest-algorithm " is " expected " bytes, got " (count digest))
+             {:algorithm digest-algorithm :length (count digest)}))
+    (when (nil? nonce)
+      (fail! :rfc3161/nonce-required
+             "nonce is required — without it a replayed old response is indistinguishable from a fresh one"
+             {}))
+    (asn1/encode-ints
+     (asn1/sequence*
+      (cond-> [(asn1/integer 1)
+               (asn1/sequence*
+                [(asn1/sequence* [(asn1/oid (oid/dotted digest-algorithm)) (asn1/null*)])
+                 (asn1/octet-string digest)])]
+        policy (conj (asn1/oid policy))
+        :always (conj (asn1/integer nonce))
+        :always (conj (asn1/boolean* (boolean cert-req?))))))))
+
+;; ── response ─────────────────────────────────────────────────────────────────
+
+(defn- parse-failure-info [element]
+  (when element
+    (let [{:keys [unused-bits ints]} (asn1/bit-string-value element)
+          total (- (* 8 (count ints)) unused-bits)]
+      (into #{} (keep (fn [[bit name-kw]]
+                        (when (and (< bit total)
+                                   (pos? (bit-and (nth ints (quot bit 8))
+                                                  (bit-shift-left 1 (- 7 (mod bit 8))))))
+                          name-kw))
+                      failure-info-bits)))))
+
+(defn parse-response
+  "`TimeStampResp` → `{:status … :token-der …}`.
+
+  `:token-der` is present only on success. A rejection carries the TSA's reason
+  and is not an error to this function — the TSA answered, and what it answered
+  is information the caller needs."
+  [data]
+  (let [element (asn1/decode data)
+        [status-info token-element] (:asn1/elements element)
+        status-children (:asn1/elements status-info)
+        status (asn1/integer-value (first status-children))]
+    (cond-> {:status (get status-codes status status)
+             :status-code status
+             :success? (contains? #{0 1} status)}
+      (some #(= :utf8-string (:asn1/type (asn1/nth-element % 0))) (rest status-children))
+      (assoc :status-text (mapv asn1/string-value
+                                (:asn1/elements
+                                 (first (filter #(= :sequence (:asn1/type %))
+                                                (rest status-children))))))
+
+      (some #(= :bit-string (:asn1/type %)) status-children)
+      (assoc :failure-info
+             (parse-failure-info (first (filter #(= :bit-string (:asn1/type %))
+                                                status-children))))
+
+      token-element (assoc :token-der (:asn1/der token-element)))))
+
+(defn parse-tst-info
+  "`TSTInfo` (the eContent of the token's `SignedData`) → a map."
+  [data]
+  (let [element (asn1/decode data)
+        children (:asn1/elements element)
+        imprint (nth children 2)
+        nonce-element (first (filter #(= :integer (:asn1/type %)) (drop 4 children)))]
+    {:version (asn1/integer-value (nth children 0))
+     :policy (asn1/oid-value (nth children 1))
+     :digest-algorithm (asn1/oid-value (asn1/path imprint 0 0))
+     :message-imprint (:asn1/content (asn1/nth-element imprint 1))
+     :serial-number (asn1/integer-hex (nth children 3))
+     ;; GeneralizedTime, as a string. Never an instant — see the namespace
+     ;; docstring on why this library has no clock.
+     :gen-time (asn1/time-value (nth children 4))
+     :nonce (when nonce-element (asn1/integer-hex nonce-element))
+     :ordering? (when-let [b (first (filter #(= :boolean (:asn1/type %)) children))]
+                  (asn1/boolean-value b))
+     :tsa-name (when-let [n (asn1/find-context element 0)]
+                 (:asn1/der n))}))
+
+(defn parse-token
+  "A timestamp token (a CMS `ContentInfo` whose eContentType is `id-ct-TSTInfo`)."
+  [data]
+  (let [signed-data (cms/parse-signed-data data)]
+    (when-not (oid/is? (:cms/econtent-type signed-data) :ct-tst-info)
+      (fail! :rfc3161/not-a-timestamp-token
+             (str "eContentType is " (oid/describe (:cms/econtent-type signed-data))
+                  ", not id-ct-TSTInfo")
+             {:content-type (:cms/econtent-type signed-data)}))
+    (when (:cms/detached? signed-data)
+      ;; A token whose TSTInfo is not in it is not a token — there is nothing to
+      ;; read the time from.
+      (fail! :rfc3161/detached-token
+             "timestamp token carries no TSTInfo" {}))
+    {:signed-data signed-data
+     :tst-info (parse-tst-info (:cms/econtent signed-data))
+     :der (asn1/->ints data)}))
+
+;; ── verification ─────────────────────────────────────────────────────────────
+
+(defn timestamping-certificate?
+  "Whether `certificate` may sign timestamps.
+
+  RFC 3161 §2.3: the extended key usage extension MUST be present, MUST be
+  critical, and MUST contain `id-kp-timeStamping` **and nothing else**. The
+  exclusivity is the part implementations skip, and it is the point — a key that
+  is also a TLS server key is one whose holder can be induced to sign something
+  that is not a timestamp."
+  [certificate]
+  (let [eku (x509/extended-key-usage certificate)
+        ext (x509/extension certificate :extended-key-usage)]
+    (boolean (and ext (:critical? ext)
+                  (= #{(oid/dotted :kp-time-stamping)} eku)))))
+
+(defn- refused [reason detail]
+  {:verified false :reason reason :detail detail})
+
+(defn verify-token
+  "Verify a timestamp token against what was asked for.
+
+    :digest      the message imprint the caller timestamped. REQUIRED.
+    :nonce       the nonce hex from the request, when one was sent
+    :digest-fn   (fn [algorithm-name ints] -> ints)
+    :verify-fn   (fn [request] -> bool)
+    :trusted?    (fn [certificate] -> bool), optional. Whether the TSA's
+                 certificate is one this deployment accepts. Absent means the
+                 answer is `:indeterminate` rather than true — see below.
+
+  Returns `{:verified bool :trusted (true|false|:unknown) :gen-time \"…\" …}`.
+
+  **`:verified` and `:trusted` are separate on purpose.** A structurally sound
+  token signed by a certificate nobody has vouched for is exactly what an
+  attacker produces with `openssl ts` and their own CA — the cryptography is
+  perfect. Collapsing the two into one boolean is how a self-issued timestamp
+  reads as an accredited one. With no `:trusted?` the answer is `:unknown`, and
+  a caller must not read `:unknown` as yes."
+  [token {:keys [digest nonce digest-fn verify-fn trusted?]}]
+  (let [{:keys [signed-data tst-info]} token
+        signer (first (:cms/signer-infos signed-data))
+        certificate (cms/certificate-for signed-data (:signer/sid signer))]
+    (cond
+      (nil? digest)
+      (fail! :rfc3161/no-expected-digest
+             "検証対象の digest なしでは token は何も証明しません" {})
+
+      (nil? certificate)
+      (refused :tsa-certificate-not-found
+               "token に TSA の証明書が含まれていません（cert-req? false で要求した可能性）")
+
+      (not (timestamping-certificate? certificate))
+      (refused :not-a-timestamping-certificate
+               (str "EKU が critical な id-kp-timeStamping 単独ではありません: "
+                    (pr-str (x509/extended-key-usage certificate))))
+
+      (not= (vec (asn1/->ints digest)) (vec (asn1/->ints (:message-imprint tst-info))))
+      (refused :message-imprint-mismatch
+               "token の messageImprint が対象の digest と一致しません")
+
+      ;; A nonce that was sent and did not come back means this response is not
+      ;; an answer to this request.
+      (and nonce (not= nonce (:nonce tst-info)))
+      (refused :nonce-mismatch
+               (str "nonce " (pr-str (:nonce tst-info)) " ≠ " (pr-str nonce)))
+
+      (and nonce (nil? (:nonce tst-info)))
+      (refused :nonce-missing "nonce を送ったのに token に含まれていません")
+
+      :else
+      (let [result (cms/verify-signer-info
+                    signed-data signer
+                    {:digest-fn digest-fn :verify-fn verify-fn
+                     :certificate certificate})]
+        (if-not (:verified result)
+          (refused (:reason result) (:detail result))
+          {:verified true
+           :trusted (if trusted? (boolean (trusted? certificate)) :unknown)
+           :gen-time (:gen-time tst-info)
+           :serial-number (:serial-number tst-info)
+           :policy (:policy tst-info)
+           :digest-algorithm (:digest-algorithm tst-info)
+           :tsa certificate
+           :tsa-subject (:text (:x509/subject certificate))
+           ;; Reported so a caller can check it and so that a caller who does
+           ;; not is at least holding the fact rather than an assumption.
+           :tsa-certificate-valid-at-gen-time?
+           (x509/valid-at? certificate (:gen-time tst-info))})))))
+
+(defn accredited-note
+  "The sentence a UI should carry beside a timestamp whose `:trusted` is not
+  `true`.
+
+  Here rather than in each caller because every caller has the same obligation
+  and the phrasing is the part that gets softened. A timestamp from an
+  unvouched-for TSA is not \"probably fine\"; it is a claim by whoever issued the
+  certificate."
+  [{:keys [trusted]}]
+  (case trusted
+    true nil
+    false "この timestamp を発行した TSA は、この deployment が信頼する認証局ではありません。"
+    "この timestamp を発行した TSA が認定事業者かどうかは検証していません。電子帳簿保存法が求める認定タイムスタンプに該当するとは限りません。"))

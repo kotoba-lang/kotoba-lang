@@ -1,0 +1,241 @@
+(ns nameserver.edns
+  "EDNS(0) — RFC 6891 — as an interpretation layer over `nameserver.wire`.
+
+  EDNS0 is not a new message format. It is one pseudo-RR in the additional
+  section that overloads fields the RR header already has, and that overloading
+  is where implementations go wrong:
+
+  | RR field | in an OPT RR it means |
+  |---|---|
+  | NAME | must be root (`\".\"`), and nothing else |
+  | TYPE | 41 |
+  | **CLASS** | the sender's **maximum UDP payload size**, not a class |
+  | **TTL** | extended-RCODE (high 8 bits), EDNS version, DO flag, Z |
+  | RDATA | a sequence of `{code, length, data}` options |
+
+  So an OPT RR read as an ordinary RR says the class is `CLASS4096` and the TTL
+  is 32768 — both meaningless, both silently plausible. This namespace reads
+  those fields as what they are and leaves `wire` alone.
+
+  ## Why this matters beyond \"bigger packets\"
+
+  Without EDNS0 a response body is capped at 512 octets and anything larger is
+  truncated with the TC bit, forcing the client to retry over TCP. That is
+  merely slow for a big answer set — and **fatal** for DNSSEC, where a single
+  signed response routinely exceeds 512 octets, so a signed zone served without
+  EDNS0 pushes every query to TCP. EDNS0 is therefore a prerequisite for
+  `org-ietf-dnssec`, not an optimization.
+
+  ## The extended RCODE trap
+
+  RCODE is 4 bits in the header and 12 bits with EDNS0: the OPT TTL carries the
+  **high 8**, the header carries the low 4. Writing a 16-bit rcode into the
+  header alone silently truncates — `BADVERS` (16) becomes 0, so a version
+  negotiation failure is reported as success. `split-rcode` and `join-rcode`
+  keep the two halves together.
+
+  A server that receives an OPT with a version it does not support must answer
+  **BADVERS with its own OPT attached** (RFC 6891 §6.1.3), not FORMERR: the
+  client has to learn which version the server speaks, and a FORMERR does not
+  tell it."
+  (:require [nameserver.wire :as wire]))
+
+(def ^:const opt-type "TYPE41")
+(def ^:const version 0)
+
+(def ^:const min-payload
+  "RFC 6891 §6.2.3 — a requestor must not advertise less than 512, because that
+  is the floor the protocol already guarantees without EDNS0."
+  512)
+
+(def ^:const default-payload
+  "1232 octets. Not 4096: the historical default fragments on paths with a
+  1500-octet MTU once IPv6 headers are accounted for, and fragmented UDP DNS is
+  both unreliable and a known off-path spoofing vector. 1232 is the value the
+  DNS Flag Day 2020 consensus settled on and what resolvers now advertise."
+  1232)
+
+(defn- ttl->fields [ttl]
+  {:edns/extended-rcode (bit-and (bit-shift-right ttl 24) 0xFF)
+   :edns/version (bit-and (bit-shift-right ttl 16) 0xFF)
+   :edns/do? (pos? (bit-and ttl 0x8000))
+   :edns/z (bit-and ttl 0x7FFF)})
+
+(defn- fields->ttl [{:edns/keys [extended-rcode version do? z]
+                     :or {extended-rcode 0 version 0 do? false z 0}}]
+  (bit-or (bit-shift-left (bit-and extended-rcode 0xFF) 24)
+          (bit-shift-left (bit-and version 0xFF) 16)
+          (if do? 0x8000 0)
+          (bit-and z 0x7FFF)))
+
+(defn- parse-options
+  "RDATA is `{option-code:u16, option-length:u16, option-data}*`. Options this
+  library does not model are kept as raw bytes rather than dropped — an ECS or
+  cookie option a caller wants is otherwise invisible."
+  [raw]
+  (loop [i 0 acc []]
+    (if (> (+ i 4) (count raw))
+      acc
+      (let [code (bit-or (bit-shift-left (nth raw i) 8) (nth raw (inc i)))
+            len (bit-or (bit-shift-left (nth raw (+ i 2)) 8) (nth raw (+ i 3)))
+            end (+ i 4 len)]
+        (if (> end (count raw))
+          acc                                  ; truncated option: stop, keep what parsed
+          (recur end (conj acc {:edns.option/code code
+                                :edns.option/data (vec (subvec (vec raw) (+ i 4) end))})))))))
+
+(defn- emit-options [options]
+  (into [] (mapcat (fn [{:edns.option/keys [code data]}]
+                     (let [d (vec data)]
+                       (into [(bit-and (bit-shift-right code 8) 0xFF) (bit-and code 0xFF)
+                              (bit-and (bit-shift-right (count d) 8) 0xFF) (bit-and (count d) 0xFF)]
+                             d))))
+        options))
+
+;; ── reading ───────────────────────────────────────────────────────────────
+
+(defn opt-rr
+  "The OPT pseudo-RR from a decoded message's additional section, or nil.
+
+  RFC 6891 §6.1.1 permits **at most one**. More than one is a format error and
+  is reported as such rather than silently taking the first — two OPTs with
+  different payload sizes is a request the server cannot honour both halves of."
+  [message]
+  (let [opts (filterv #(= opt-type (:zone/type %)) (:dns/additional message))]
+    (cond
+      (empty? opts) nil
+      (> (count opts) 1) (throw (ex-info "more than one OPT RR (RFC 6891 §6.1.1)"
+                                         {:count (count opts)}))
+      :else (first opts))))
+
+(defn parse
+  "Interpret a message's OPT RR, or nil when there is none.
+
+  Returns `{:edns/payload-size :edns/version :edns/do? :edns/extended-rcode
+  :edns/options}`. `payload-size` is clamped up to 512: a requestor advertising
+  less is out of spec (§6.2.3) and honouring it would produce answers smaller
+  than plain DNS guarantees."
+  [message]
+  (when-let [rr (opt-rr message)]
+    (let [cls (:zone/class rr)
+          size (if (integer? cls)
+                 cls
+                 (or (some-> (re-matches #"CLASS(\d+)" (str cls)) second
+                             (as-> d ))
+                     min-payload))]
+      (merge (ttl->fields (or (:zone/ttl rr) 0))
+             {:edns/payload-size (max min-payload size)
+              :edns/options (parse-options (get-in rr [:zone/rdata :zone/raw] []))}))))
+
+(defn max-response-size
+  "How many octets a UDP response to this query may occupy.
+
+  Without an OPT this is the RFC 1035 §4.2.1 ceiling of 512. With one it is the
+  requestor's advertised size, further capped by the server's own limit — a
+  client asking for 65535 must not be able to make the server emit a datagram
+  that will fragment."
+  [query & [{:keys [server-max] :or {server-max default-payload}}]]
+  (if-let [e (parse query)]
+    (min (:edns/payload-size e) server-max)
+    min-payload))
+
+(defn do?
+  "Did the requestor set the DNSSEC OK bit? A server must not include DNSSEC
+  records in a response to a query without it (RFC 6891 §6.1.3) — doing so
+  inflates every answer for clients that cannot use them."
+  [query]
+  (boolean (:edns/do? (parse query))))
+
+;; ── writing ───────────────────────────────────────────────────────────────
+
+(defn opt-record
+  "Build an OPT pseudo-RR. Owner name is root and is not a parameter, because
+  RFC 6891 §6.1.2 permits nothing else."
+  [{:keys [payload-size do? extended-rcode options]
+    :or {payload-size default-payload do? false extended-rcode 0}}]
+  {:zone/name "."
+   :zone/type opt-type
+   ;; The CLASS field carries the payload size; `nameserver.wire` accepts the
+   ;; RFC 3597 generic `CLASSn` spelling, which is the only way to put an
+   ;; arbitrary number there.
+   :zone/class (str "CLASS" (max min-payload payload-size))
+   :zone/ttl (fields->ttl {:edns/extended-rcode extended-rcode
+                           :edns/version version
+                           :edns/do? do?})
+   :zone/rdata {:zone/raw (emit-options options)}})
+
+(defn split-rcode
+  "A 12-bit extended RCODE → `[header-nibble extended-high-8]`. The header
+  carries the low 4 bits and the OPT TTL the high 8; writing the whole value
+  into the header truncates, so BADVERS (16) becomes NOERROR (0) and a version
+  negotiation failure is reported as success."
+  [rcode]
+  [(bit-and rcode 0xF) (bit-and (bit-shift-right rcode 4) 0xFF)])
+
+(defn join-rcode
+  "The inverse: reassemble the 12-bit value from a response."
+  [header-rcode extended-high]
+  (bit-or (bit-and header-rcode 0xF) (bit-shift-left (bit-and extended-high 0xFF) 4)))
+
+(defn respond
+  "Attach an OPT RR to a response, mirroring what the query asked for.
+
+  A response carries an OPT **only if the query did** (RFC 6891 §6.1.1). A
+  server that always attaches one is talking EDNS0 at a client that did not
+  offer it, and old resolvers treat the unexpected additional record as a
+  malformed answer."
+  [response query & [{:keys [server-max extended-rcode]
+                      :or {server-max default-payload extended-rcode 0}}]]
+  (if-let [e (parse query)]
+    (update response :dns/additional (fnil conj [])
+            (opt-record {:payload-size server-max
+                         ;; Mirror DO rather than choosing: it is the client
+                         ;; saying whether it can use DNSSEC records, and a
+                         ;; server that sets it unilaterally inflates answers
+                         ;; for clients that will discard them.
+                         :do? (:edns/do? e)
+                         :extended-rcode (second (split-rcode extended-rcode))}))
+    response))
+
+(defn badvers
+  "The answer to an OPT whose version this server does not implement
+  (RFC 6891 §6.1.3): extended RCODE 16, **with an OPT attached** advertising
+  the version the server does speak. A FORMERR here would be a refusal that
+  never tells the client what to try instead."
+  [query server-max]
+  (let [[hdr ext] (split-rcode 16)]
+    {:dns/id (:dns/id query)
+     :dns/qr :response
+     :dns/opcode (:dns/opcode query)
+     :dns/aa? false :dns/tc? false
+     :dns/rd? (:dns/rd? query) :dns/ra? false
+     :dns/rcode (get {0 :noerror 1 :formerr 2 :servfail 3 :nxdomain 4 :notimp 5 :refused}
+                     hdr :noerror)
+     :dns/questions (:dns/questions query)
+     :dns/answers [] :dns/authority []
+     :dns/additional [(opt-record {:payload-size server-max :extended-rcode ext})]}))
+
+(defn supported-version?
+  "Is the query's EDNS version one this server implements? RFC 6891 defines
+  only version 0; a higher one is not an error in the query, it is a
+  negotiation this server loses."
+  [query]
+  (let [e (parse query)]
+    (or (nil? e) (= version (:edns/version e)))))
+
+(defn truncate-to
+  "Drop answer records until the encoded message fits `limit`, setting TC.
+
+  Truncation is a *message* property, not a record property, so the only
+  correct way to decide is to encode and measure — estimating from record sizes
+  ignores name compression and either wastes space or overflows. RFC 1035
+  §4.2.1 requires the TC bit whenever anything was dropped, because a client
+  that is not told the answer is partial will use it."
+  [message limit]
+  (loop [m message]
+    (if (or (<= (count (wire/encode-message m)) limit)
+            (empty? (:dns/answers m)))
+      (if (= (count (:dns/answers m)) (count (:dns/answers message)))
+        m
+        (assoc m :dns/tc? true))
+      (recur (update m :dns/answers pop)))))

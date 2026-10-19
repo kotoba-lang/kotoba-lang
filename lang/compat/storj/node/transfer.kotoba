@@ -1,0 +1,304 @@
+(ns storj.node.transfer
+  "Upload and Download as streams — the part `storj.node.service` could not
+  hold.
+
+  `service` answers one request with one response, which is the whole unary
+  surface and none of the transfers. `storj.node.piecestore` has decided what
+  an upload and a download are allowed to be since before there was anything
+  to drive it: `begin-upload`, `accept-chunk`, `finish-upload`,
+  `begin-download`, `sending`. This is what drives it, one message at a time.
+
+  ## What this returns, and what it does not do
+
+  `{:state s :out [...]}`, where each entry of `:out` is `{:message bytes}`,
+  `{:end true}` or `{:error {:code n :message s}}`. No DRPC framing: that
+  lives in `drpc.server` and `storj.node.host.rpc`, and a second place that
+  knew how to write a packet would be a second place to get message ids
+  wrong. Nothing here touches a socket either — a stream that ends is a value
+  saying so.
+
+  ## One message at a time is the point
+
+  `drpc.server/feed` hands over `:messages` as they arrive rather than
+  waiting for the client to finish, precisely so an upload does not have to
+  be complete before a node can act on it. This uses that.
+
+  It then buffers anyway, and the reason is worth stating rather than
+  discovering: `IBlobStore/-put` takes a whole blob. So a piece is held in
+  memory until `done`, which is a limit of that protocol and not of this
+  layer or the transport — the streaming is real up to the store, and stops
+  there. A node that must not hold a piece in memory needs `-put` to grow an
+  offset, and then this changes in one place.
+
+  ## V1 when the hash was checked, V0 when it was not
+
+  A V1 piece file is a 512-byte header area then the body, and the header
+  carries the uplink's hash, the uplink's *signature* over it, and the order
+  limit. That is what lets a restarted node answer an audit: the attestation
+  is the uplink's own, not the node's word for it.
+
+  Which is exactly why an unverified hash must not be written into one. The
+  signature in that header is the one thing a later reader cannot check
+  without the limit's key, so a header built from a hash nobody verified is a
+  file that looks proven and is not. So V1 is written when
+  `finish-upload` reports `:hash-verified? true`, and a body — V0 — when it
+  does not. The piece is still stored either way: refusing it would be
+  refusing pieces over a signature nobody claimed to send.
+
+  The two formats are told apart by filename, `.sj1` versus nothing, which is
+  `piece/blob-path`'s `version` argument. A read tries V1 then V0, because a
+  node really can hold both and looking only for the format this build writes
+  would report an older piece as `no such piece` — which reads as data loss.
+
+  ## A refused transfer is an error on that stream, not a closed connection
+
+  A node is reachable by anyone who completed a handshake. An upload that
+  fails admission ends *its* stream with an error and leaves every other
+  stream on the connection alone, which is the same rule `service/handle`
+  follows for the unary side."
+  (:require [proto.wire :as w]
+            [storj.node.pb :as pb]
+            [storj.node.piece :as piece]
+            [storj.node.piecestore :as ps]
+            [storj.node.protocols :as p]))
+
+(def upload-rpc   "/piecestore.Piecestore/Upload")
+(def download-rpc "/piecestore.Piecestore/Download")
+
+(def streaming-rpcs
+  "The two rpcs that are not request-and-response.
+
+  `service/handlers` deliberately does not contain these, and a dispatcher
+  that fell back to it for them would answer an upload with
+  `unimplemented` — so the split has to be visible to whoever routes."
+  #{upload-rpc download-rpc})
+
+(defn streaming? [rpc] (contains? streaming-rpcs rpc))
+
+(def transfer-error-code
+  "The code a refused transfer travels under. `drpcerr` gives no named
+  constant, and zero means no error at all, so this is the same non-zero
+  choice `service/unimplemented-code` makes for the same reason."
+  2)
+
+(defn transfers
+  "The state a connection keeps for its open transfers: stream id → transfer."
+  []
+  {})
+
+(defn- refuse
+  "End one stream with a reason a caller can act on.
+
+  The reasons come from `piecestore`/`orders` as data; they are rendered here
+  because the wire carries a string and nothing else."
+  [state stream reasons]
+  {:state (dissoc state stream)
+   :out   [{:error {:code transfer-error-code
+                    :message (str "transfer refused: "
+                                  (pr-str (mapv :reason reasons)))}}]})
+
+;; ── uploading ───────────────────────────────────────────────────────────────
+
+(defn- sign-piece-hash
+  "The node's own signature over its `PieceHash`, or nil.
+
+  `signing.SignPieceHash` signs the same `PieceHashSigning` bytes the uplink
+  does — `encode-piece-hash-for-signing` — but with the node's *identity* key
+  and ECDSA-SHA256, not the piece key and ed25519. Two signatures over the
+  same encoding with different keys and different algorithms, which is why
+  the encoder is shared and the signing is not.
+
+  nil when the node has no signer configured. An unsigned response is honest
+  about what happened; a fabricated one is not, and an uplink checks this to
+  learn the node accepted what it thinks it sent."
+  [{:keys [signer private-key]} fields]
+  ;; For *these* fields the encoder is a no-op: it drops the signature and a
+  ;; zero timestamp, and a hash being signed has neither yet — so `w/encode`
+  ;; alone would produce the same bytes, and a control that swaps them cannot
+  ;; fail. Said rather than left as a guard someone later assumes is load
+  ;; bearing. It is still the right call: this is the function that defines
+  ;; what a piece hash signature covers, the verifying side genuinely needs it
+  ;; (there the signature *is* present), and the two directions agreeing by
+  ;; construction is worth more than saving an encode.
+  (when (and signer private-key)
+    (p/-sign signer private-key :ecdsa-sha256
+             (pb/encode-piece-hash-for-signing (w/decode (w/encode fields))))))
+
+(defn- upload-response
+  "`PieceUploadResponse`. The node's own `done` — a `PieceHash` naming the
+  piece and its size, signed with this node's identity key when it has one."
+  [ctx {:keys [piece-id size hash hash-algorithm]}]
+  ;; the numbers are `pb/piece-hash`, and they are not in order: 2 is the
+  ;; hash, 3 is the signature, and the size is 4. Writing the size into 2 —
+  ;; which is what the first draft of this did — produces a message that
+  ;; encodes cleanly and tells an uplink its piece hashed to a number.
+  (let [fields (cond-> []
+                 piece-id (conj (w/bytes-field 1 (vec piece-id)))
+                 hash     (conj (w/bytes-field 2 (vec hash)))
+                 size     (conj (w/varint-field 4 size))
+                 hash-algorithm
+                 (conj (w/varint-field 6 (pb/enum-value
+                                          pb/piece-hash-algorithm
+                                          hash-algorithm))))
+        sig    (sign-piece-hash ctx fields)]
+    ;; the signature goes in last, and is not part of what was signed —
+    ;; `encode-piece-hash-for-signing` drops field 3 before hashing, so a
+    ;; signature built over `fields` and then appended to `fields` is
+    ;; consistent with what a verifier will recompute
+    (w/encode
+     [(w/message-field 1 (cond-> fields
+                           sig (conj (w/bytes-field 3 (vec sig)))))])))
+
+(defn- path-of
+  "Where a piece of this storage format lives.
+
+  Storj tells the two apart by filename: V1 ends in `.sj1` and V0 has no
+  suffix at all, which `piece/blob-path` already models. A node may hold both
+  — pieces predate the format — so the version is part of the address rather
+  than a node-wide setting."
+  [ctx piece-id version]
+  ((:paths ctx) piece-id version))
+
+(defn- read-blob
+  "A stored piece and where its body starts, V1 first.
+
+  Both are tried because a node really can hold both, and because trying only
+  the format this build writes would make every piece written by an earlier
+  one invisible — reported as `no such piece`, which reads as data loss."
+  [ctx piece-id]
+  (or (when-let [b (p/-get (:blobs ctx) (path-of ctx piece-id :v1))]
+        {:blob b :body (piece/body-offset :v1) :format :v1})
+      (when-let [b (p/-get (:blobs ctx) (path-of ctx piece-id :v0))]
+        {:blob b :body (piece/body-offset :v0) :format :v0})))
+
+(defn- begin-upload [state ctx stream msg]
+  (let [r (ps/begin-upload msg ctx)]
+    (if-not (:ok? r)
+      (refuse state stream (:reasons r))
+      {:state (assoc state stream {:kind :upload
+                                   :upload r
+                                   :buffer (vec (:accepted r))})
+       :out   []})))
+
+(defn- continue-upload
+  "One more message on an open upload: a chunk, or the `done` that ends it."
+  [state ctx stream {:keys [upload buffer]} msg]
+  (if (:done (ps/upload-parts msg))
+    (let [r (ps/finish-upload upload msg)]
+      (if-not (:ok? r)
+        (refuse state stream (:reasons r))
+        (let [;; V1 only when the uplink's signature was actually checked.
+              ;; The header carries that signature, and it is the one thing a
+              ;; later reader cannot check without the limit's key — so a
+              ;; header built from an unverified hash is a file that looks
+              ;; proven and is not. An unverified piece is still stored,
+              ;; because refusing it would be refusing pieces over a
+              ;; signature nobody claimed to send; it is stored as a body.
+              v1?  (:hash-verified? r)
+              fmt  (if v1? :v1 :v0)
+              blob (if v1?
+                     (piece/v1-file
+                      (piece/header-for
+                       {:hash (:hash r)
+                        :hash-algorithm (:hash-algorithm r)
+                        :signature (:signature r)
+                        :order-limit (:limit (:state r))
+                        :created-at (some-> (:clock ctx) p/-now-seconds)})
+                      buffer)
+                     buffer)]
+          ;; the store is reached only once every rule has answered yes
+          (p/-put (:blobs ctx) (path-of ctx (:piece-id r) fmt) blob)
+          {:state (dissoc state stream)
+           :out   [{:message (upload-response ctx r)} {:end true}]
+           :stored (assoc r :format fmt)})))
+    (let [r (ps/accept-chunk upload msg)]
+      (if-not (:ok? r)
+        (refuse state stream (:reasons r))
+        {:state (assoc state stream {:kind :upload
+                                     :upload (:state r)
+                                     :buffer (into buffer (:accepted r))})
+         :out   []}))))
+
+;; ── downloading ─────────────────────────────────────────────────────────────
+
+(def default-chunk-size
+  "How much goes in one `PieceDownloadResponse` when the client did not say.
+
+  Storj's own uplink asks for a maximum; this is only what happens when it
+  does not. Small enough that a download is visibly several messages, which
+  is the property being exercised."
+  262144)
+
+(defn- serve-download
+  "Read the range and hand back the messages that carry it.
+
+  The whole range is read from the store here for the same reason an upload
+  buffers: `IBlobStore/-get` returns a whole blob. The chunking below is real
+  — a client sees several messages — but the read behind it is not yet."
+  [state ctx stream msg]
+  (let [r (ps/begin-download msg ctx)]
+    (if-not (:ok? r)
+      (refuse state stream (:reasons r))
+      (let [{:keys [blob body]} (read-blob ctx (:piece-id r))]
+        (if (nil? blob)
+          ;; the limit authorised it and this node does not have it. Not a
+          ;; permission answer — a satellite reading this one as refusal
+          ;; would blame the uplink for a piece the node lost.
+          {:state (dissoc state stream)
+           :out   [{:error {:code transfer-error-code
+                            :message "no such piece"}}]}
+          (let [want   (or (pb/get-varint msg pb/piece-download-request
+                                          :maximum-chunk-size)
+                           default-chunk-size)
+                size   (max 1 (min want (:size r)))
+                slice  (subvec (vec blob)
+                               (min (count blob) (+ body (:offset r)))
+                               (min (count blob) (+ body (:offset r) (:size r))))
+                pieces (partition-all size slice)]
+            (loop [acc [] st r offset (:offset r) [c & more] pieces]
+              (if (nil? c)
+                {:state (dissoc state stream)
+                 :out   (conj acc {:end true})
+                 :sent  (:sent st)}
+                ;; `sending` cannot refuse here, because the slice above is
+                ;; already exactly the authorised range — that is worth
+                ;; saying rather than leaving as a guard a reader assumes is
+                ;; the bound. What it does provide is `:sent`, which is the
+                ;; count this reports. Kept rather than dropped because the
+                ;; day this streams from the store instead of slicing a whole
+                ;; blob, the slice stops being the bound and this becomes it.
+                (let [s (ps/sending st (count c))]
+                  (if-not (:ok? s)
+                    (refuse state stream (:reasons s))
+                    (recur (conj acc {:message (ps/download-chunk-response offset c)})
+                           (:state s)
+                           (+ offset (count c))
+                           more)))))))))))
+
+;; ── the one entry point ─────────────────────────────────────────────────────
+
+(defn message
+  "Drive one message of a streaming rpc.
+
+  `ctx` is what `piecestore` and the store need: `:blobs`, `:paths`,
+  `:node-id`, and whatever `orders/admit` reads. Returns `{:state s :out
+  [...]}` and never throws for anything a peer can send — the caller is
+  reachable by whoever completed a handshake."
+  [state ctx {:keys [stream rpc data]}]
+  (try
+    (let [open (get state stream)
+          msg  (w/decode data)]
+      (cond
+        open                (continue-upload state ctx stream open msg)
+        (= rpc upload-rpc)  (begin-upload state ctx stream msg)
+        (= rpc download-rpc) (serve-download state ctx stream msg)
+        :else
+        {:state state
+         :out   [{:error {:code transfer-error-code
+                          :message (str "not a streaming rpc: " rpc)}}]}))
+    (catch  e
+      {:state (dissoc state stream)
+       :out   [{:error {:code transfer-error-code
+                        :message (str "storj.node.transfer: " rpc " failed: "
+                                      (or 
+                                          "unknown"))}}]})))

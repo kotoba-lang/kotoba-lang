@@ -1,0 +1,532 @@
+(ns torch.train
+  "Bridge from a torch.model sequential description to num.autograd.
+  Supports dense and UNet/transformer reference training on synchronous num
+  arrays, returning new immutable weight maps after one SGD step."
+  (:require [num.array :as arr]
+            [num.autograd :as ag :include-macros true]
+            [num.core :as nm]
+            [num.protocol :as p]
+            [torch.model :as model]
+            [torch.optim :as optim]))
+
+(def supported-layers
+  #{:linear :conv2d :groupnorm :layernorm :rmsnorm :embedding :flatten :relu :silu :sigmoid :tanh :gelu :softmax :attention
+    :multihead-attention :llama-block :lm-head})
+
+(def parameter-keys
+  {:linear #{:w :b} :conv2d #{:w :b} :groupnorm #{:w :b} :layernorm #{:w :b}
+   :embedding #{:w}
+   :rmsnorm #{:w}
+   :llama-block #{:attn-norm :qw :kw :vw :ow :ffn-norm :gate :up :down}
+   :lm-head #{:w}
+   :multihead-attention #{:qw :qb :kw :kb :vw :vb :ow :ob}})
+
+(defn- fail [message data]
+  (throw (ex-info (str "torch.train: " message) data)))
+
+(defn- validate-weights! [layers weights]
+  (when-not (= (count layers) (count weights))
+    (fail "weights must contain one entry per normalized layer"
+          {:layers (count layers) :weights (count weights)}))
+  (doseq [[index layer weight] (map vector (range) layers weights)]
+    (let [layer-type (model/layer-type layer)]
+      (when-not (contains? supported-layers layer-type)
+        (fail (str "unsupported layer type: " layer-type)
+              {:index index :layer layer :supported supported-layers}))
+      (if-let [required (get parameter-keys layer-type)]
+        (when-not (and (map? weight) (every? #(some? (get weight %)) required))
+          (fail (str (name layer-type) " layers require :w and :b arrays")
+                {:index index :layer layer :required required}))
+        (when (some? weight)
+          (fail "parameterless layers require a nil weight entry"
+                {:index index :layer layer :weight weight}))))))
+
+(defn- track
+  ([state value parameters] (track state value parameters nil))
+  ([state value parameters runtime-values]
+   (-> state
+       (assoc :value value)
+       (update :parameters conj parameters)
+       (update :runtime-values conj runtime-values))))
+
+(defn- flatten-batch-shape [shape]
+  (if (<= (count shape) 1)
+    shape
+    [(first shape) (arr/nelems (subvec (vec shape) 1))]))
+
+(defn- forward-layer [state [layer weight runtime-options]]
+  (case (model/layer-type layer)
+    :linear
+    (let [w (ag/value (:w weight)) b (ag/value (:b weight))]
+      (track state (ag/add-bias* (ag/matmul* (:value state) w) b) {:w w :b b}))
+
+    :conv2d
+    (let [[_in _out _k stride padding dilation groups] (model/layer-args layer)
+          w (ag/value (:w weight)) b (ag/value (:b weight))]
+      (track state
+             (ag/conv2d-nchw* (:value state) w b
+                              {:stride (or stride 1) :padding (or padding 0)
+                               :dilation (or dilation 1) :groups (or groups 1)})
+             {:w w :b b}))
+
+    :groupnorm
+    (let [[groups _channels eps] (model/layer-args layer)
+          w (ag/value (:w weight)) b (ag/value (:b weight))]
+      (track state
+             (ag/group-norm-nchw* (:value state) groups w b (or eps 1.0e-5))
+             {:w w :b b}))
+
+    :layernorm
+    (let [w (ag/value (:w weight)) b (ag/value (:b weight))]
+      (track state (ag/layer-norm-last* (:value state) w b 1.0e-5)
+             {:w w :b b}))
+
+    :embedding
+    (let [w (ag/value (:w weight))]
+      (track state (ag/embedding* (:data (:value state)) w) {:w w}))
+
+    :rmsnorm
+    (let [[_features eps] (model/layer-args layer)
+          w (ag/value (:w weight))]
+      (track state (ag/rms-norm-last* (:value state) w (or eps 1.0e-5)) {:w w}))
+
+    :relu (track state (ag/relu* (:value state)) nil)
+    :silu (track state (ag/silu* (:value state)) nil)
+    :sigmoid (track state (ag/sigmoid* (:value state)) nil)
+    :tanh (track state (ag/tanh* (:value state)) nil)
+    :gelu (track state (ag/gelu* (:value state)) nil)
+    :softmax (track state (ag/softmax* (:value state)) nil)
+    :flatten
+    (track state
+           (ag/reshape* (:value state)
+                        (flatten-batch-shape (:shape (:data (:value state)))))
+           nil)
+    :attention
+    (let [args (model/layer-args layer)
+          heads (if (and (vector? args) (seq args)) (first args) 1)
+          input (:value state)
+          dtype (or (:dtype (:data input)) :f32)
+          stable-input (if (= dtype :f32) input (ag/cast* input :f32))
+          attended (ag/multi-head-attention* stable-input stable-input
+                                               stable-input heads)
+          output (if (= dtype :f32) attended (ag/cast* attended dtype))]
+      (track state
+             output
+             nil))
+
+    :llama-block
+    (let [[embed heads hidden opts] (model/layer-args layer)
+          opts (merge {:causal? true :rope? true} opts runtime-options)
+          kv-heads (long (or (:kv-heads opts) heads))
+          kv-embed (* kv-heads (quot embed heads))
+          eps (or (:eps opts) 1.0e-5)
+          input (:value state)
+          shape (:shape (:data input)) rank (count shape)
+          [batch sequence] (if (= rank 3) (take 2 shape) [1 (first shape)])
+          parameters (into {} (map (fn [[key array]] [key (ag/value array)]) weight))
+          flatten (fn [v]
+                    (if (= rank 3)
+                      (ag/reshape* v [(* batch sequence) (last (:shape (:data v)))]) v))
+          restore (fn [v features]
+                    (if (= rank 3) (ag/reshape* v [batch sequence features]) v))
+          linear (fn [v key out]
+                   (let [flat (flatten v)
+                         parameter (get parameters key)]
+                     (when-not (= (or (:dtype (:data flat)) :f32)
+                                  (or (:dtype (:data parameter)) :f32))
+                       (fail "Llama linear operands must have the same dtype"
+                             {:parameter key
+                              :input-dtype (:dtype (:data flat))
+                              :weight-dtype (:dtype (:data parameter))}))
+                     (restore (ag/matmul* flat parameter) out)))
+          normalized (ag/rms-norm-last* input (:attn-norm parameters) eps)
+          q0 (linear normalized :qw embed)
+          k0 (linear normalized :kw kv-embed)
+          value (linear normalized :vw kv-embed)
+          rope-opts {:theta (or (:rope-theta opts) 10000.0)
+                     :position-offset (or (:position-offset opts) 0)}
+          query (ag/rotary-embedding* q0 heads rope-opts)
+          key (ag/rotary-embedding* k0 kv-heads rope-opts)
+          _ (when-not (= (or (:dtype (:data query)) :f32)
+                         (or (:dtype (:data key)) :f32)
+                         (or (:dtype (:data value)) :f32))
+              (fail "Llama attention operands must have the same dtype"
+                    {:query (:dtype (:data query)) :key (:dtype (:data key))
+                     :value (:dtype (:data value))}))
+          attended (ag/multi-head-attention* query key value heads
+                                             {:causal? true :kv-heads kv-heads})
+          _ (when-not (= (or (:dtype (:data query)) :f32)
+                         (or (:dtype (:data attended)) :f32))
+              (fail "Llama attention changed dtype"
+                    {:input (:dtype (:data query))
+                     :output (:dtype (:data attended))}))
+          attention-output (linear attended :ow embed)
+          residual (ag/add* input attention-output)
+          ffn-input (ag/rms-norm-last* residual (:ffn-norm parameters) eps)
+          gate (ag/silu* (linear ffn-input :gate hidden))
+          up (linear ffn-input :up hidden)
+          down (linear (ag/mul* gate up) :down embed)
+          output (ag/add* residual down)]
+      (track state output parameters))
+
+    :lm-head
+    (let [[_embed vocab] (model/layer-args layer)
+          w (ag/value (:w weight)) value (:value state)
+          shape (:shape (:data value)) rank (count shape)
+          [batch sequence] (if (= rank 3) (take 2 shape) [1 (first shape)])
+          flat (if (= rank 3) (ag/reshape* value [(* batch sequence) (last shape)]) value)
+          projected (ag/matmul* flat w)
+          output (if (= rank 3) (ag/reshape* projected [batch sequence vocab]) projected)]
+      (track state output {:w w}))
+
+    :multihead-attention
+    (let [[embed heads opts] (model/layer-args layer)
+          context-array (:context runtime-options)
+          merged-options (merge opts (dissoc runtime-options :context))
+          rope? (:rope? merged-options)
+          rope-options {:theta (or (:rope-theta merged-options) 10000.0)
+                        :position-offset (or (:position-offset merged-options) 0)}
+          key-rope-options (assoc rope-options :position-offset
+                                  (or (:context-position-offset merged-options)
+                                      (:position-offset rope-options)))
+          attention-options (apply dissoc merged-options
+                                   [:rope? :rope-theta :position-offset
+                                    :context-position-offset])
+          input-value (:value state)
+          input-shape (:shape (:data input-value))
+          rank (count input-shape)
+          [batch sequence] (if (= rank 3) (take 2 input-shape)
+                               [1 (first input-shape)])
+          context-value (when context-array (ag/value context-array))
+          key-value-source (or context-value input-value)
+          source-layout
+          (fn [source]
+            (let [shape (:shape (:data source))
+                  source-rank (count shape)
+                  [source-batch source-sequence]
+                  (if (= source-rank 3) (take 2 shape) [1 (first shape)])]
+              {:rank source-rank :batch source-batch :sequence source-sequence
+               :flat (if (= source-rank 3)
+                       (ag/reshape* source [(* source-batch source-sequence) embed])
+                       source)}))
+          query-layout (source-layout input-value)
+          context-layout (source-layout key-value-source)
+          restore (fn [value {:keys [rank batch sequence]}]
+                    (if (= rank 3)
+                      (ag/reshape* value [batch sequence embed]) value))
+          parameters (into {} (map (fn [[key array]] [key (ag/value array)]) weight))
+          project (fn [layout weight-key bias-key]
+                    (restore
+                     (ag/add-bias*
+                      (ag/matmul* (:flat layout) (get parameters weight-key))
+                      (get parameters bias-key))
+                     layout))
+          query0 (project query-layout :qw :qb)
+          key0 (project context-layout :kw :kb)
+          query (if rope? (ag/rotary-embedding* query0 heads rope-options) query0)
+          key (if rope? (ag/rotary-embedding* key0 heads key-rope-options) key0)
+          value (project context-layout :vw :vb)
+          attention-dtype (or (:dtype (:data query)) :f32)
+          typed-fused? (and (= attention-dtype :f16)
+                            (nil? (:key-padding-mask attention-options))
+                            (satisfies? p/IDTypeTensorOps
+                                        (:backend (:data query))))
+          stable-query (if (or (= attention-dtype :f32) typed-fused?)
+                         query (ag/cast* query :f32))
+          stable-key (if (or (= attention-dtype :f32) typed-fused?)
+                       key (ag/cast* key :f32))
+          stable-value (if (or (= attention-dtype :f32) typed-fused?)
+                         value (ag/cast* value :f32))
+          stable-attended (if (seq attention-options)
+                            (ag/multi-head-attention* stable-query stable-key
+                                                      stable-value heads
+                                                      attention-options)
+                            (ag/multi-head-attention* stable-query stable-key
+                                                      stable-value heads))
+          attended (if (or (= attention-dtype :f32) typed-fused?)
+                     stable-attended (ag/cast* stable-attended attention-dtype))
+          attended-flat (if (= rank 3)
+                          (ag/reshape* attended [(* batch sequence) embed])
+                          attended)
+          output (restore
+                  (ag/add-bias* (ag/matmul* attended-flat (:ow parameters))
+                                (:ob parameters))
+                  query-layout)]
+      (track state output parameters
+             (when context-value {:context context-value})))))
+
+(defn- forward-graph [layers weights input layer-options]
+  (let [input-value (ag/value input)
+        state (reduce forward-layer
+                      {:value input-value :parameters [] :runtime-values []}
+                      (map vector layers weights layer-options))]
+    {:input input-value
+     :prediction (:value state)
+     :parameters (:parameters state)
+     :runtime-values (:runtime-values state)}))
+
+(defn- parameter-gradients [parameters]
+  (mapv (fn [layer-parameters]
+          (when layer-parameters
+            (into {} (map (fn [[key value]] [key @(:grad value)]))
+                  layer-parameters)))
+        parameters))
+
+(defn- runtime-gradients [runtime-values]
+  (mapv (fn [values]
+          (when values
+            (into {} (map (fn [[key value]] [key @(:grad value)])) values)))
+        runtime-values))
+
+(defn- layout-arrays [layout]
+  (mapcat (fn [entry] (when (map? entry) (vals entry))) layout))
+
+(defn- nested-arrays [value]
+  (cond
+    (and (map? value) (:backend value) (:handle value)) [value]
+    (map? value) (mapcat nested-arrays (vals value))
+    (sequential? value) (mapcat nested-arrays value)
+    :else []))
+
+(defn- release-tape-except!
+  "Release graph-owned forward/backward buffers while preserving returned or
+  caller-owned arrays. Queued GPU consumers remain ordered before destruction."
+  [tape preserved]
+  (let [preserved-handles (into #{} (keep :handle) preserved)
+        displaced (some-> tape meta :gradient-temporaries deref)
+        candidates (concat displaced
+                           (mapcat (fn [value] [(:data value) @(:grad value)])
+                                   @tape))]
+    (arr/release-all!
+     (remove #(or (nil? %) (contains? preserved-handles (:handle %)))
+             candidates))))
+
+(defn- scalar-readback [array]
+  (let [values (arr/->vec array)]
+    ))
+
+(defn prediction-and-gradients
+  "Run a sequential model and apply an explicit vector-Jacobian product.
+
+  `upstream-gradient` must match the prediction shape and backend. This is the
+  model-level equivalent of PyTorch's `prediction.backward(gradient)`: it does
+  not impose a loss function or synchronously read a scalar, so async GPU
+  backends can keep forward activations and the complete backward pass on the
+  device. Returns prediction, input gradient, and one parameter-gradient entry
+  per normalized layer. Optional `:layer-options` is aligned with normalized
+  layers and carries runtime inputs such as attention context/key-padding masks.
+  Gradients for runtime tensors are returned in `:layer-input-gradients`."
+  ([model* weights input upstream-gradient]
+   (prediction-and-gradients model* weights input upstream-gradient {}))
+  ([model* weights input upstream-gradient {:keys [layer-options]}]
+  (let [layers (model/execution-layers model*)
+        layer-options (or layer-options (repeat (count layers) nil))]
+    (validate-weights! layers weights)
+    (when-not (= (count layers) (count layer-options))
+      (fail "layer-options must contain one entry per normalized layer"
+            {:layers (count layers) :layer-options (count layer-options)}))
+    (when-not (= (:backend input) (:backend upstream-gradient))
+      (fail "upstream gradient must use the input backend"
+            {:input-backend (:backend input)
+             :gradient-backend (:backend upstream-gradient)}))
+    (let [[graph tape]
+          (ag/with-tape (forward-graph layers weights input layer-options))]
+      (when-not (= (:shape (:data (:prediction graph)))
+                   (:shape upstream-gradient))
+        (fail "upstream gradient shape must match prediction"
+              {:prediction (:shape (:data (:prediction graph)))
+               :gradient (:shape upstream-gradient)}))
+      (ag/backward! (:prediction graph) upstream-gradient tape)
+      {:prediction (:data (:prediction graph))
+       :input-gradient @(:grad (:input graph))
+       :layer-input-gradients (runtime-gradients (:runtime-values graph))
+       :gradients (parameter-gradients (:parameters graph))}))))
+
+(defn loss-and-gradients
+  "Run a supported sequential model and return prediction/loss/gradients.
+
+  Optional `:loss-scale` multiplies the backward seed while keeping the
+  reported loss unchanged. `:loss` is `:mse` (default) or stable token-label
+  `:cross-entropy`; the latter supports `:ignore-index`. `:layer-options` carries aligned runtime layer
+  inputs such as context and key-padding masks; their gradients are returned
+  in `:layer-input-gradients`. This is the reference seam used by
+  GradScaler."
+  ([model* weights input target]
+   (loss-and-gradients model* weights input target {}))
+  ([model* weights input target
+    {:keys [loss-scale autocast-dtype layer-options loss ignore-index]
+     :or {loss-scale 1.0 loss :mse ignore-index -100}}]
+  (when-not (and (number? loss-scale) (pos? loss-scale))
+    (fail "loss-scale must be a positive number" {:loss-scale loss-scale}))
+  (when-not (#{:mse :cross-entropy} loss)
+    (fail "loss must be :mse or :cross-entropy" {:loss loss}))
+  (let [layers (model/execution-layers model*)
+        master-weights weights
+        source-input input
+        source-target target
+        _ (when (and autocast-dtype
+                     (seq (remove #{:linear :conv2d :groupnorm :layernorm :rmsnorm
+                                    :embedding :flatten :silu :relu :sigmoid
+                                    :tanh :gelu :attention :multihead-attention
+                                    :llama-block :lm-head}
+                                  (map model/layer-type layers))))
+            (fail "training autocast layer lacks typed forward/backward support"
+                  {:dtype autocast-dtype}))
+        cast-array #(if autocast-dtype (arr/cast % autocast-dtype) %)
+        weights (if autocast-dtype
+                  (mapv (fn [weight]
+                          (when weight
+                            (into {} (map (fn [[key value]] [key (cast-array value)]))
+                                  weight)))
+                        weights)
+                  weights)
+        embedding-input? (= :embedding (model/layer-type (first layers)))
+        input (if embedding-input? input (cast-array input))
+        target (if (= loss :cross-entropy) target (cast-array target))
+        layer-options (or layer-options (repeat (count layers) nil))]
+    (validate-weights! layers weights)
+    (when-not (= (count layers) (count layer-options))
+      (fail "layer-options must contain one entry per normalized layer"
+            {:layers (count layers) :layer-options (count layer-options)}))
+    (let [[result tape]
+          (ag/with-tape
+            (let [graph (forward-graph layers weights input layer-options)
+                  prediction (:prediction graph)
+                  prediction-dtype (or (:dtype (:data prediction)) :f32)
+                  loss-node
+                  (if (= loss :cross-entropy)
+                    (ag/cross-entropy-loss* prediction target
+                                            {:ignore-index ignore-index})
+                    (let [stable-prediction (if (= prediction-dtype :f32)
+                                              prediction
+                                              (ag/cast* prediction :f32))
+                          stable-target (if (= prediction-dtype :f32)
+                                          target (arr/cast target :f32))]
+                      (ag/mse-loss* stable-prediction stable-target)))]
+              (assoc graph :loss loss-node)))]
+      (ag/backward! (:loss result) (arr/from-vec (:backend input) [loss-scale] []) tape)
+      (let [loss-value (scalar-readback (:data (:loss result)))
+            prediction (:data (:prediction result))
+            layer-input-gradients (runtime-gradients (:runtime-values result))
+            raw-gradients (parameter-gradients (:parameters result))
+            gradients (if autocast-dtype
+                        (mapv (fn [gradient]
+                                (when gradient
+                                  (into {} (map (fn [[key value]]
+                                                  [key (arr/cast value :f32)]))
+                                        gradient)))
+                              raw-gradients)
+                        raw-gradients)
+            preserved (concat [prediction source-input source-target]
+                              (layout-arrays master-weights)
+                              (layout-arrays gradients)
+                              (layout-arrays layer-input-gradients))]
+        (release-tape-except! tape preserved)
+        {:loss loss-value
+         :prediction prediction
+         :layer-input-gradients layer-input-gradients
+         :gradients gradients})))))
+
+(defn mixed-precision-adamw-step
+  "Run typed forward, scaled backward, overflow handling, and f32 AdamW update.
+
+  `weights` remain f32 master weights. The returned prediction has the autocast
+  dtype; gradients are unscaled to f32 before the optimizer update."
+  [model* weights input target optimizer-state scaler
+   {:keys [autocast-dtype adamw-options layer-options loss ignore-index
+           release-inputs?]
+    :or {autocast-dtype :f16 adamw-options {}}}]
+  (let [{:keys [gradients] :as pass}
+        (loss-and-gradients model* weights input target
+                            {:autocast-dtype autocast-dtype
+                             :loss-scale (:scale scaler)
+                             :layer-options layer-options
+                             :loss (or loss :mse)
+                             :ignore-index (or ignore-index -100)})
+        update (optim/scaled-adamw-step weights gradients optimizer-state
+                                         scaler adamw-options)]
+    (arr/release-all! (layout-arrays gradients))
+    (when (and release-inputs? (not (:skipped? update)))
+      (arr/release-all! (concat (layout-arrays weights)
+                                (nested-arrays optimizer-state))))
+    (merge (dissoc pass :gradients) update)))
+
+(defn mixed-precision-adamw-step-async
+  "GPU-capable mixed-precision AdamW step.
+
+  Runs the same typed forward and scaled backward as
+  `mixed-precision-adamw-step`, then uses device-side gradient unscale,
+  non-finite detection, and fused AdamW. ClojureScript returns a Promise; JVM
+  returns a completed CompletableFuture. Beyond the reported scalar loss, only
+  scalar overflow flags are read from an asynchronous device backend."
+  [model* weights input target optimizer-state scaler
+   {:keys [autocast-dtype adamw-options layer-options loss ignore-index
+           release-inputs?]
+    :or {autocast-dtype :f16 adamw-options {}}}]
+  (let [{:keys [gradients] :as pass}
+        (loss-and-gradients model* weights input target
+                            {:autocast-dtype autocast-dtype
+                             :loss-scale (:scale scaler)
+                             :layer-options layer-options
+                             :loss (or loss :mse)
+                             :ignore-index (or ignore-index -100)})
+        update (optim/scaled-adamw-step-async
+                weights gradients optimizer-state scaler adamw-options)
+        finish (fn [result]
+                 (arr/release-all! (layout-arrays gradients))
+                 (when (and release-inputs? (not (:skipped? result)))
+                   (arr/release-all! (concat (layout-arrays weights)
+                                             (nested-arrays optimizer-state))))
+                 (merge (dissoc pass :gradients) result))]
+    ))
+
+(defn optimizer-step
+  "Run MSE forward/backward and one immutable optimizer update.
+
+  Options accept `:optimizer` (`:sgd` or `:adamw`), `:optimizer-options`, and
+  the same `:layer-options` accepted by `loss-and-gradients`. Returns the
+  pre-update loss/prediction plus new weights and `:optimizer-state`, ready for
+  the next call."
+  ([model* weights input target]
+   (optimizer-step model* weights input target nil {}))
+  ([model* weights input target optimizer-state options]
+   (let [{:keys [optimizer optimizer-options layer-options]
+          :or {optimizer :adamw optimizer-options {}}} options
+         _ (when-not (#{:sgd :adamw} optimizer)
+             (fail "optimizer must be :sgd or :adamw" {:optimizer optimizer}))
+         pass (loss-and-gradients model* weights input target
+                                  {:layer-options layer-options})
+         update (case optimizer
+                  :sgd (optim/sgd-step weights (:gradients pass)
+                                       optimizer-state optimizer-options)
+                  :adamw (optim/adamw-step weights (:gradients pass)
+                                           optimizer-state optimizer-options))]
+     (-> pass
+         (dissoc :gradients)
+         (assoc :weights (:weights update)
+                :optimizer-state (:state update)
+                :optimizer optimizer)))))
+
+(defn- descend [learning-rate parameter gradient]
+  (let [shape (:shape parameter)
+        scalar-field (arr/from-vec (:backend parameter)
+                                   (repeat (arr/nelems shape) learning-rate)
+                                   shape)]
+    (nm/sub parameter (nm/mul scalar-field gradient))))
+
+(defn sgd-step
+  ([model* weights input target learning-rate]
+   (sgd-step model* weights input target learning-rate {}))
+  ([model* weights input target learning-rate options]
+  (when-not (and (number? learning-rate) (pos? learning-rate))
+    (fail "learning-rate must be a positive number" {:learning-rate learning-rate}))
+  (let [{:keys [gradients] :as result}
+        (loss-and-gradients model* weights input target options)
+        updated (mapv (fn [weight gradient]
+                        (when weight
+                          (into {} (map (fn [[key parameter]]
+                                         [key (descend learning-rate parameter
+                                                       (get gradient key))]))
+                                weight)))
+                      weights gradients)]
+    (assoc result :weights updated))))

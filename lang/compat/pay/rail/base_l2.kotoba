@@ -1,0 +1,129 @@
+(ns pay.rail.base-l2
+  "The first REAL `pay.core/PayRail` — one-shot USDC transfer on Base L2 via
+  an ERC-4337 sponsored write.
+
+  `pay`'s README has always named this adapter as the intended backing for
+  the rail seam, and until now it did not exist: `unprovisioned-rail` HOLDs
+  every operation, honestly, and every consumer got a HOLD. This namespace
+  provisions exactly ONE of the six methods.
+
+  WHAT IS REAL AND WHAT STILL HOLDS — the point of the split:
+
+    -pay!               REAL. USDC `transfer(address,uint256)` submitted as a
+                        UserOperation through the caller's bundle.
+    -pay-stream!        HOLDs. Superfluid adapter does not exist.
+    -pay-stream-stop!   HOLDs. Same.
+    -split-distribute!  HOLDs. 0xSplits adapter does not exist.
+    -escrow-open!       HOLDs. Safe-escrow adapter does not exist.
+    -escrow-release!    HOLDs. Same.
+
+  A rail that quietly answered all six would be worse than the unprovisioned
+  one, because a HOLD is visible and a fabricated receipt is not. The five
+  keep HOLDing with `:pay/unprovisioned-capability`, byte-identical to what
+  `unprovisioned-rail` returns, so nothing downstream can tell a
+  not-yet-built rail from a not-yet-built method.
+
+  NO KEY IS HELD HERE. The UserOperation is signed inside the caller's
+  `SmartAccount` (typically a WebAuthn passkey smart wallet); this namespace
+  encodes calldata and reads the receipt. That is `pay`'s standing rule —
+  a platform-held signing key is prohibited by design — and this adapter
+  does not weaken it.
+
+  REFUSALS ARE HOLDS, NOT EXCEPTIONS. `PayRail`'s contract is that methods
+  return data. A payment that must not happen returns a hold map with its
+  own reason (`:pay/unresolvable-payee`, `:pay/invalid-amount`,
+  `:pay/settlement-reverted`) rather than throwing, so a caller cannot
+  swallow a refusal in a `try` and proceed. Transport-level failures — an
+  RPC that is down, a bundler that is unreachable — are NOT payment
+  decisions and are left to propagate."
+  (:require [pay.core :as pay]
+            [kotoba.lang.base-l2.paymaster :as paymaster]))
+
+(def usdc-base
+  "USDC on Base L2. Same address `kotoba-lang/treasury` carries for \"base\"."
+  "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+
+(def ^:private address-re #"0x[0-9a-fA-F]{40}")
+
+(defn- hold
+  "The same shape `pay.core/unprovisioned-rail` returns, with a reason of our
+  own. Kept structurally identical so a caller's HOLD handling is one branch."
+  [reason op opts]
+  {:status :hold :reason reason :op op :opts opts})
+
+(defn- payee
+  "Resolve `to` to an EVM address, or nil.
+
+  `resolve-payee` is optional and exists for callers whose `:to` is a DID or
+  an internal account id. When it is absent, `:to` must already be an
+  address. Either way an unresolvable payee yields nil and the caller HOLDs —
+  it never falls back to `:to` itself, a zero address, or a default.
+  USDC sent to a guessed address is not recoverable."
+  [{:keys [resolve-payee]} to]
+  (let [a (if resolve-payee (resolve-payee to) to)]
+    (when (and (string? a) (re-matches address-re a)) a)))
+
+(defn- micros?
+  "USDC base units: a positive integer. A decimal string or a float here is a
+  units bug that misses by a factor of 10^6."
+  [n]
+  (and (integer? n) (pos? n)))
+
+(defrecord BaseL2Rail [config]
+  pay/PayRail
+  (-pay! [_ {:keys [to amount-micros for-uri] :as opts}]
+    (let [{:keys [usdc bundle]} config
+          addr (payee config to)]
+      (cond
+        (nil? addr) (hold :pay/unresolvable-payee :pay opts)
+        (not (micros? amount-micros)) (hold :pay/invalid-amount :pay opts)
+        :else
+        (let [tx (try
+                   (paymaster/sponsored-write-contract!
+                    {:address (or usdc usdc-base)
+                     :function-signature "transfer(address,uint256)"
+                     :arg-types ["address" "uint256"]
+                     :arg-values [addr (str amount-micros)]
+                     :value 0}
+                    bundle)
+                   (catch  e
+                     ;; A reverted UserOperation is a payment decision, so it
+                     ;; becomes a hold. Anything else (transport down, bundler
+                     ;; unreachable) is not, and propagates.
+                     (if (:user-op-hash (ex-data e))
+                       ::reverted
+                       (throw e))))]
+          (if (= ::reverted tx)
+            (hold :pay/settlement-reverted :pay opts)
+            (pay/->receipt {:tx-hash tx
+                            :from (some-> bundle :smart-account paymaster/account-address)
+                            :to addr
+                            :amount-micros amount-micros
+                            :record-uri for-uri}))))))
+
+  ;; ── still unprovisioned, and saying so ──
+  (-pay-stream! [_ opts]
+    (hold :pay/unprovisioned-capability :pay-stream opts))
+  (-pay-stream-stop! [_ stream-id]
+    (hold :pay/unprovisioned-capability :pay-stream-stop {:stream-id stream-id}))
+  (-split-distribute! [_ opts]
+    (hold :pay/unprovisioned-capability :split-distribute opts))
+  (-escrow-open! [_ opts]
+    (hold :pay/unprovisioned-capability :escrow-open opts))
+  (-escrow-release! [_ escrow-id to]
+    (hold :pay/unprovisioned-capability :escrow-release {:escrow-id escrow-id :to to})))
+
+(defn base-l2-rail
+  "Build the rail.
+
+    :bundle         REQUIRED. The `kotoba.lang.base-l2.paymaster` bundle
+                    {:bundler :smart-account :paymaster-address :gas-overrides}.
+                    The smart account is the payer and the only signer.
+    :usdc           Token address; defaults to `usdc-base`.
+    :resolve-payee  Optional `(fn [to] \"0x…\" | nil)` for callers whose `:to`
+                    is a DID or an account id rather than an address."
+  [{:keys [bundle] :as config}]
+  (when-not bundle
+    (throw (ex-info "pay.rail.base-l2 requires a :bundle (kotoba.lang.base-l2.paymaster) — it has no way to sign otherwise"
+                    {:config (dissoc config :bundle)})))
+  (->BaseL2Rail config))

@@ -1,0 +1,335 @@
+(ns merkle-lsm.compaction
+  "Compaction POLICY over `merkle-lsm.core`: range compaction scheduler,
+   L0 sub-levels, leases, safe-epoch pinning, garbage collection.
+
+   The MECHANISM (merge, retention, run emission) lives in
+   `merkle-lsm.core` (`compact-runs`, `compact-runs-partitioned`,
+   `compact-run-readers-streaming`, `compact-chunk`/`compact-chunks`).
+   This namespace decides WHICH runs to merge, WHEN, under WHICH lease, and
+   WHICH blocks are then unreachable -- it calls into core for the merge
+   itself (`compact-runs-partitioned`) and for reachability
+   (`linked-cids`).
+
+   Implements deterministic compaction selection, level-based merging with overlap detection,
+   intra-L0 compaction for write amplification reduction, and mark-sweep garbage collection.
+
+   All functions return immutable data. No effects are executed here.
+
+   Extracted verbatim from kotobase-peer @780b2216 (ADR-2607201600 M4)."
+  (:require [clojure.set :as set]
+            [merkle-lsm.core :as lsm]
+            [ipld.core :as ipld]))
+
+;; ============================================================================
+;; Range Overlap Detection
+;; ============================================================================
+
+(defn key-range-overlap?
+  "Check if two [min-key max-key] ranges have any overlap.
+   Returns true if ranges overlap, false otherwise.
+   Works with any comparable types (strings, numbers, vectors)."
+  [range-a range-b]
+  (let [[min-a max-a] range-a
+        [min-b max-b] range-b]
+    (and (not (nil? min-a)) (not (nil? min-b))
+         (not (nil? max-a)) (not (nil? max-b))
+         (not (pos? (compare min-a max-b)))
+         (not (pos? (compare min-b max-a))))))
+
+(defn run-key-range
+  "Extract [min-key max-key] range from a run or run-ref.
+   Handles both direct run objects and run-ref metadata."
+  [run]
+  (if-let [min-key (or (:first-component-min run)
+                       (get run "first-component-min")
+                       (:min-key run)
+                       (get run "min-key"))]
+    [min-key (or (:first-component-max run)
+                 (get run "first-component-max")
+                 (:max-key run)
+                 (get run "max-key"))]
+    (when-let [node (:node run)]
+      [(get node "min-key") (get node "max-key")])))
+
+;; ============================================================================
+;; Compaction Plan Selection
+;; ============================================================================
+
+(defn compaction-plan
+  "M4: Select overlapping runs from L0 and candidate next level for compaction.
+
+   Returns task descriptor {:index :level :l0-runs :target-runs :safe-epoch :manifest-cid :l0-count}
+   or nil if no compaction is warranted.
+
+   Scheduling policy: trigger when L0 run count exceeds threshold (default 4).
+   This bounds read amplification from unbounded novelty walk."
+  [manifest index safe-epoch level-threshold]
+  (let [indexes-map (get (:node manifest) "indexes")
+        index-name (name index)
+        index-levels (get indexes-map index-name)
+        l0-runs (mapv #(dissoc % :effects) (get index-levels "l0"))
+        l0-count (count l0-runs)]
+    (when (and (pos? l0-count) (>= l0-count level-threshold))
+      ;; Find overlapping L1 runs as target for compaction
+      (let [l0-ranges (keep run-key-range l0-runs)
+            target-runs (vec (filter
+                             (fn [run]
+                               (let [run-range (run-key-range run)]
+                                 (some #(key-range-overlap? % run-range) l0-ranges)))
+                             (get index-levels "l1")))]
+        {:index index
+         :level :l1
+         :l0-runs l0-runs
+         :target-runs target-runs
+         :safe-epoch safe-epoch
+         :manifest-cid (:cid manifest)
+         :l0-count l0-count}))))
+
+;; ============================================================================
+;; Production scheduler state
+;; ============================================================================
+
+(defn scheduler-task
+  "Build a deterministic task identity. CREATED-AT and worker identity are
+  intentionally excluded: retrying the same head and bounds yields one task
+  CID and therefore one idempotency domain."
+  [{:keys [db-id expected-head window-size target-run-rows]
+    :or {window-size 64 target-run-rows 4096}}]
+  (when-not (and (string? db-id) (seq db-id)
+                 (string? expected-head) (seq expected-head))
+    (throw (ex-info "Compaction task requires db-id and expected head"
+                    {:db-id db-id :expected-head expected-head})))
+  (when-not (and (pos-int? window-size) (pos-int? target-run-rows))
+    (throw (ex-info "Compaction bounds must be positive"
+                    {:window-size window-size :target-run-rows target-run-rows})))
+  (let [node {"format" "kotobase/compaction-task"
+              "version" 1
+              "db-id" db-id
+              "expected-head" expected-head
+              "window-size" window-size
+              "target-run-rows" target-run-rows}
+        bytes (ipld/encode node)]
+    {:id (ipld/cid bytes) :node node :bytes bytes}))
+
+(defn lease-node
+  "Construct the mutable lease value. TOKEN is a host-generated fencing token;
+  ATTEMPT monotonically increases when an expired task is reclaimed."
+  [{:keys [task owner token attempt acquired-at expires-at status]
+    :or {attempt 1 status :running}}]
+  (when-not (and task (:id task) (string? owner) (seq owner)
+                 (string? token) (seq token)
+                 (pos-int? attempt)
+                 (integer? acquired-at) (integer? expires-at)
+                 (> expires-at acquired-at))
+    (throw (ex-info "Invalid compaction lease"
+                    {:owner owner :token token :attempt attempt
+                     :acquired-at acquired-at :expires-at expires-at})))
+  {"format" "kotobase/compaction-lease"
+   "version" 1
+   "task-id" (:id task)
+   "db-id" (get-in task [:node "db-id"])
+   "expected-head" (get-in task [:node "expected-head"])
+   "owner" owner
+   "token" token
+   "attempt" attempt
+   "acquired-at" acquired-at
+   "expires-at" expires-at
+   "status" (name status)})
+
+(defn lease-active? [lease now-ms]
+  (and (= "running" (get lease "status"))
+       (> (get lease "expires-at" 0) now-ms)))
+
+(defn validate-lease-node
+  "Fail closed on malformed mutable scheduler state."
+  [lease]
+  (when-not (and (= "kotobase/compaction-lease" (get lease "format"))
+                 (= 1 (get lease "version"))
+                 (string? (get lease "task-id"))
+                 (string? (get lease "db-id"))
+                 (string? (get lease "expected-head"))
+                 (string? (get lease "owner"))
+                 (string? (get lease "token"))
+                 (pos-int? (get lease "attempt"))
+                 (integer? (get lease "acquired-at"))
+                 (integer? (get lease "expires-at"))
+                 (> (get lease "expires-at") (get lease "acquired-at"))
+                 (contains? #{"running" "completed" "failed"}
+                            (get lease "status")))
+    (throw (ex-info "Malformed compaction lease" {:lease lease})))
+  lease)
+
+(defn reclaimable? [lease now-ms]
+  (or (nil? lease) (not (lease-active? lease now-ms))))
+
+(defn bounded-batches
+  "Deterministically partition task inputs so a host never starts more than
+  MAX-CONCURRENCY compactions at once."
+  [max-concurrency values]
+  (when-not (pos-int? max-concurrency)
+    (throw (ex-info "max-concurrency must be positive"
+                    {:max-concurrency max-concurrency})))
+  (mapv vec (partition-all max-concurrency values)))
+
+;; ============================================================================
+;; Level-based Compaction
+;; ============================================================================
+
+(defn compact-with-level
+  "M4: Merge L0 runs with a single level (e.g., L1) to produce output runs.
+
+   Strategy:
+   1. Find target-level runs that overlap with L0 key ranges
+   2. Merge L0 + overlapping target runs into partitioned output
+   3. Return untouched target runs as-is (no copy overhead)
+
+   Returns: {:compacted [...] :untouched [...] :all-output [...]}"
+  [index tenant safe-epoch target-rows l0-runs level-runs]
+  (let [l0-ranges (mapv run-key-range l0-runs)
+        overlapping (filterv (fn [run]
+                              (let [run-range (run-key-range run)]
+                                (some #(key-range-overlap? % run-range) l0-ranges)))
+                            level-runs)
+        to-compact (vec (concat l0-runs overlapping))
+        untouched (vec (remove (set overlapping) level-runs))
+        compacted (lsm/compact-runs-partitioned index tenant safe-epoch target-rows to-compact)]
+    {:compacted compacted
+     :untouched untouched
+     :all-output (vec (concat compacted untouched))}))
+
+;; ============================================================================
+;; L0 Sub-levels (Intra-L0 Compaction)
+;; ============================================================================
+
+(defn l0-sublevels
+  "M4: Organize L0 runs into sub-levels (L0S0, L0S1, ...) based on write order.
+
+   Intra-L0 compaction avoids visiting lower levels, reducing write amplification
+   when L0 has multiple small runs.
+
+   Returns: {:l0s0 [...] :l0s1 [...] ...}"
+  [l0-runs max-per-sublevel]
+  (into (sorted-map)
+        (map-indexed (fn [i runs]
+                      [(keyword (str "l0s" i)) runs])
+                     (partition-all max-per-sublevel l0-runs))))
+
+(defn intra-l0-compaction
+  "M4: Compact consecutive L0 sub-levels without visiting lower levels.
+
+   Takes first 2 sublevels (oldest + second-oldest) and merges them into
+   a single run, reducing L0 run count while keeping metadata compact.
+
+   Returns: vector of merged runs, or nil if compaction not warranted."
+  [index tenant safe-epoch target-rows sublevels]
+  (let [sorted-sublevels (sort-by key sublevels)
+        sublevels-to-merge (->> sorted-sublevels (take 2) (mapv val) (apply concat) vec)]
+    (when (> (count sublevels-to-merge) 1)
+      (lsm/compact-runs-partitioned index tenant safe-epoch target-rows sublevels-to-merge))))
+
+;; ============================================================================
+;; Garbage Collection
+;; ============================================================================
+
+(defn gc-live-cids
+  "M4: Collect all CIDs reachable from a manifest and supplied previous manifests.
+
+   Walks:
+   - Manifest's CID itself
+   - Previous manifest link (if present)
+   - All run references in index levels
+   - Values within statistics (may contain IPLD Links)
+
+   Returns set of live CID strings."
+  [manifest & previous-manifests]
+  (let [cids (atom #{})
+        ;; Normalize CID to string format, handling both Link objects and raw strings
+        normalize-cid (fn [c]
+                       (cond
+                         (nil? c) nil
+                         (string? c) c
+                         :else (try (ipld/link-cid c) (catch  _ c))))
+
+        add-cid! (fn [c]
+                  (when-let [normalized (normalize-cid c)]
+                    (swap! cids conj normalized)))
+
+        visit-run-ref (fn [ref]
+                       (if-let [cid (get ref "cid")]
+                         (add-cid! cid)
+                         (when-let [run-cid (:cid ref)]
+                           (add-cid! run-cid))))
+
+        visit-indexes (fn [indexes-map]
+                       (doseq [[_index-name levels] indexes-map]
+                         (doseq [[_level-name runs] levels]
+                           (doseq [run-ref runs]
+                             (visit-run-ref run-ref)))))
+
+        visit-node (fn [node m]
+                    (add-cid! (:cid m))
+                    (when-let [prev-link (get node "previous")]
+                      (add-cid! prev-link))
+                    (when-let [indexes (get node "indexes")]
+                      (visit-indexes indexes))
+                    (when-let [stats (get node "statistics")]
+                      (doseq [v (vals stats)]
+                        (swap! cids into (lsm/linked-cids v)))))]
+    (visit-node (:node manifest) manifest)
+    (doseq [previous-manifest previous-manifests]
+      (when previous-manifest
+        (visit-node (:node previous-manifest) previous-manifest)))
+    @cids))
+
+(defn gc-candidates
+  "M4: Find unreachable CIDs by marking reachable blocks from manifest.
+
+   Returns set of CIDs that may be safely deleted:
+   difference(all_stored_cids, live_from_manifest)
+
+   In production, host would iterate through manifest chain (old → new)
+   and mark blocks as live before GC sweep."
+  [current-manifest all-stored-cids & previous-manifests]
+  (let [live-from-manifest (apply gc-live-cids current-manifest previous-manifests)]
+    (set/difference all-stored-cids live-from-manifest)))
+
+;; ============================================================================
+;; Safe-Epoch Pinning
+;; ============================================================================
+
+(defn safe-epoch-pin
+  "M4: Create a pin record to prevent GC of required snapshots.
+
+   Fields:
+   - :manifest-cid — head CID at pin time
+   - :epoch — manifest epoch number
+   - :epoch-readers — active query readers at each epoch [e1 e2 ...]
+   - :replicas — replication consumers at epochs [...]
+   - :legal-hold — explicit retention epoch (e.g., regulatory)
+
+   Returns immutable pin record."
+  [{:keys [manifest-cid epoch epoch-readers replicas legal-hold]}]
+  {:manifest-cid manifest-cid
+   :epoch epoch
+   :epoch-readers (or epoch-readers [])
+   :replicas (or replicas [])
+   :legal-hold legal-hold
+   :pinned-at })
+
+(defn minimum-safe-epoch
+  "M4: Compute minimum epoch that must be retained.
+
+   Combines:
+   1. Legal hold epochs (regulatory/compliance)
+   2. Active reader epochs (query snapshots in flight)
+   3. Replica epochs (standby sync lag)
+
+   Compaction may discard versions older than this epoch
+   (except newest-before-safe-epoch for MVCC)."
+  [pins]
+  (let [all-epochs (concat (map :epoch pins)
+                           (mapcat :epoch-readers pins)
+                           (mapcat :replicas pins))]
+    (if (seq all-epochs)
+      (reduce min all-epochs)
+      0)))

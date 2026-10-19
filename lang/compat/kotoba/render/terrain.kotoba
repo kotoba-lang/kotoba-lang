@@ -1,0 +1,140 @@
+(ns kotoba.render.terrain
+  "Deterministic heightfield patches with seam-stable LODs and skirts."
+  (:require [kotoba.render.procedural :as procedural]
+            [kotoba.render.terrain-biome :as terrain-biome]))
+
+(def details [:high :medium :low])
+(def detail-divisor {:high 1 :medium 2 :low 4})
+
+(defn- validate! [{:keys [patch size base-segments amplitude seed skirt-depth]} detail]
+  (when-not (contains? detail-divisor detail)
+    (throw (ex-info "unsupported terrain detail" {:detail detail :supported details})))
+  (when-not (and (= 2 (count patch)) (every? integer? patch))
+    (throw (ex-info "terrain patch must be two integer coordinates" {:patch patch})))
+  (when-not (and (number? size) (pos? size) (number? amplitude) (not (neg? amplitude))
+                 (number? skirt-depth) (not (neg? skirt-depth)))
+    (throw (ex-info "terrain size/amplitude/skirt-depth are invalid"
+                    {:size size :amplitude amplitude :skirt-depth skirt-depth})))
+  (when-not (and (integer? base-segments) (>= base-segments 4)
+                 (zero? (mod base-segments 4)))
+    (throw (ex-info "base-segments must be >=4 and divisible by four"
+                    {:base-segments base-segments})))
+  (when-not (and (integer? seed) (<= 0 seed 4294967295))
+    (throw (ex-info "terrain seed must be an unsigned 32-bit integer" {:seed seed}))))
+
+(defn- byte-noise [seed gx gz salt]
+  (bit-and (procedural/coordinate-hash seed gx gz salt) 255))
+
+(defn height-at
+  "Height at an absolute canonical grid coordinate. Adjacent patches and every
+   LOD call this with the same coordinates, so shared edges are byte-equal."
+  [{:keys [seed amplitude]} gx gz]
+  (let [smooth (quot (reduce + (for [dz [-1 0 1] dx [-1 0 1]]
+                                  (byte-noise seed (+ gx dx) (+ gz dz) 101))) 9)
+        detail (byte-noise seed gx gz 103)
+        combined (+ (* 3 smooth) detail)
+        centered (- combined 510)]
+    (* amplitude (/ centered 510.0))))
+
+(defn- normal-at [{:keys [size base-segments] :as spec} gx gz]
+  (let [spacing (/ size base-segments)
+        hl (height-at spec (dec gx) gz) hr (height-at spec (inc gx) gz)
+        hd (height-at spec gx (dec gz)) hu (height-at spec gx (inc gz))
+        nx (- (/ (- hr hl) (* 2.0 spacing)))
+        nz (- (/ (- hu hd) (* 2.0 spacing)))
+        length ( (+ (* nx nx) 1.0 (* nz nz)))]
+    [(/ nx length) (/ 1.0 length) (/ nz length)]))
+
+(defn- perimeter-indices [segments]
+  (let [row (inc segments)]
+    (vec (concat
+          (range 0 (inc segments))
+          (map #(+ (* % row) segments) (range 1 (inc segments)))
+          (map #(+ (* segments row) %) (range (dec segments) -1 -1))
+          (map #(* % row) (range (dec segments) 0 -1))))))
+
+(defn terrain-mesh
+  "Bake one patch as `[positions normals uvs indices]`.
+
+   `:patch [x z]` addresses patches in world space. `:base-segments` is the
+   canonical high grid and must be divisible by four. Medium/low sample every
+   2/4 canonical cells. A duplicated lowered perimeter creates a crack-hiding
+   skirt while retaining identical top-edge positions and normals."
+  ([spec] (terrain-mesh spec :high))
+  ([spec detail]
+   (let [spec (merge {:patch [0 0] :size 64.0 :base-segments 32
+                      :amplitude 8.0 :seed 0 :skirt-depth 2.0} spec)
+         _ (validate! spec detail)
+         {:keys [patch size base-segments skirt-depth]} spec
+         divisor (detail-divisor detail)
+         segments (quot base-segments divisor)
+         [patch-x patch-z] patch
+         origin-gx (* patch-x base-segments) origin-gz (* patch-z base-segments)
+         world-x (* patch-x size) world-z (* patch-z size)
+         spacing (/ size segments)
+         vertices (vec
+                   (for [iz (range (inc segments)) ix (range (inc segments))
+                         :let [gx (+ origin-gx (* ix divisor))
+                               gz (+ origin-gz (* iz divisor))]]
+                     {:position [(+ world-x (* ix spacing)) (height-at spec gx gz)
+                                 (+ world-z (* iz spacing))]
+                      :normal (normal-at spec gx gz)
+                      :uv [(/ (double gx) base-segments) (/ (double gz) base-segments)]}))
+         row (inc segments)
+         surface-indices
+         (vec (mapcat (fn [[iz ix]]
+                        (let [a (+ (* iz row) ix) b (inc a) c (+ a row) d (inc c)]
+                          [a c b b c d]))
+                      (for [iz (range segments) ix (range segments)] [iz ix])))
+         perimeter (perimeter-indices segments)
+         skirt-base (count vertices)
+         skirt-vertices (mapv (fn [index]
+                                (update (nth vertices index) :position
+                                        (fn [[x y z]] [x (- y skirt-depth) z])))
+                              perimeter)
+         edge-count (count perimeter)
+         skirt-indices
+         (vec (mapcat (fn [i]
+                        (let [j (mod (inc i) edge-count)
+                              top-a (nth perimeter i) top-b (nth perimeter j)
+                              skirt-a (+ skirt-base i) skirt-b (+ skirt-base j)]
+                          [top-a skirt-a top-b top-b skirt-a skirt-b]))
+                      (range edge-count)))
+         all-vertices (into vertices skirt-vertices)]
+     [(vec (mapcat :position all-vertices))
+      (vec (mapcat :normal all-vertices))
+      (vec (mapcat :uv all-vertices))
+      (into surface-indices skirt-indices)])))
+
+(defn mesh-bounds [[positions _normals _uvs _indices]]
+  (let [triples (partition 3 positions)]
+    {:min [(apply min (map first triples)) (apply min (map second triples))
+           (apply min (map #(nth % 2) triples))]
+     :max [(apply max (map first triples)) (apply max (map second triples))
+           (apply max (map #(nth % 2) triples))]}))
+
+(defn terrain-lods [spec]
+  (mapv (fn [[detail min-pixels]]
+          (let [[_ _ _ indices :as generated] (terrain-mesh spec detail)]
+            {:id detail :min-pixels min-pixels :mesh generated
+             :triangle-count (quot (count indices) 3)
+             :bounds (mesh-bounds generated)}))
+        [[:high 128.0] [:medium 48.0] [:low 0.0]]))
+
+(defn webgpu-registration [registration-id spec]
+  (let [biome (or (:biome spec) terrain-biome/default-biome)
+        layer-indices (terrain-biome/layer-indices biome)]
+    (into {}
+          (for [{detail :id :keys [mesh bounds triangle-count]} (terrain-lods spec)
+                :let [[positions normals uvs indices] mesh
+                      biome-weights (terrain-biome/mesh-weights biome mesh)
+                      vertex-count (count biome-weights)
+                      key (keyword (str (name registration-id) "-" (name detail)))]]
+            [key {:type :mesh
+                  :mesh {:positions (mapv vec (partition 3 positions))
+                         :normals (mapv vec (partition 3 normals))
+                         :uvs (mapv vec (partition 2 uvs))
+                         :biome-weights biome-weights
+                         :biome-layer-indices (vec (repeat vertex-count layer-indices))
+                         :indices indices}
+                  :bounds bounds :triangle-count triangle-count}]))))

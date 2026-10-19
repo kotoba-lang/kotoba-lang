@@ -1,0 +1,133 @@
+(ns kami.webgpu.submission
+  "Pure instance batching and packed submission packets for WebGPU executors.
+
+   Numeric colour/PBR values remain per-instance. Compatibility keys include
+   resource/pipeline state that cannot vary inside one instanced draw, avoiding
+   material aliasing while still batching differently coloured instances."
+  (:require [kotoba.render.foliage :as foliage]
+            [kotoba.render.instance :as render-instance]
+            [kami.webgpu.ir :as ir]))
+
+(def schema :kotoba.webgpu/submission-packets-v1)
+(def instance-floats 32)
+(def default-options
+  {:max-instances-per-packet 1024
+   :packet-budget 128
+   :lod-instance-budgets {:high 4096 :medium 8192 :low 16384 :none 16384}})
+
+(defn compatibility-key
+  "Exact, non-hashed draw-state identity. PBR scalars and colour are excluded
+   because the instance ABI carries them; texture/sampler/alpha/cull state is not."
+  [instance]
+  [(or (:pipeline instance) :main)
+   (or (:geo instance) :box)
+   (or (:lod instance) :none)
+   (or (:texture-set instance) :default)
+   (or (:sampler instance) :material)
+   (or (:alpha-mode instance) :opaque)
+   (boolean (:double-sided? instance))
+   (or (:shader-variant instance) :default)])
+
+(defn- model-and-instance-data
+  [{:keys [pos color size yaw metallic roughness emissive texture-layer textured?
+           uv-transform] :or {yaw 0.0} :as instance}]
+  (let [[x y z] pos [w h d] (ir/instance-size size)
+        sin 
+        cos 
+        s (sin yaw) c (cos yaw)
+        [uv-scale-u uv-scale-v uv-offset-u uv-offset-v]
+        (render-instance/normalize-uv-transform uv-transform)
+        [cutoff strength phase frequency]
+        (foliage/gpu-instance
+         (if (some #(contains? instance %) [:alpha-mode :alpha-cutoff :wind-strength
+                                             :wind-phase :wind-frequency])
+           instance {:alpha-mode :opaque}))]
+    [(* c w) 0.0 (* (- s) w) 0.0
+     0.0 h 0.0 0.0
+     (* s d) 0.0 (* c d) 0.0
+     x (+ y (* h 0.5)) z 1.0
+     (nth color 0) (nth color 1) (nth color 2) 1.0
+     (or metallic 0.0) (or roughness 0.65) (or emissive 0.0)
+     (cond (some? texture-layer) (double (inc texture-layer)) textured? 1.0 :else 0.0)
+     uv-scale-u uv-scale-v uv-offset-u uv-offset-v
+     cutoff strength phase frequency]))
+
+(defn pack-instances
+  "Return the exact flat 32-float-per-instance vertex payload as portable data."
+  [instances]
+  (vec (mapcat model-and-instance-data instances)))
+
+(defn- stable-key [key]
+  ;; compatibility-key is a fixed vector of scalar values, so `pr-str` is stable
+  ;; across CLJ/CLJS and does not depend on map iteration order.
+  (pr-str key))
+
+(defn- packet [packet-index key source-pairs]
+  (let [instances (mapv second source-pairs)
+        source-indices (mapv first source-pairs)
+        entity-ids (mapv (fn [[source-index instance]]
+                           (or (:entity-id instance) (:id instance) source-index))
+                         source-pairs)]
+    {:packet/index packet-index
+     :compatibility-key key
+     :pipeline (nth key 0) :geo (nth key 1) :lod (nth key 2)
+     :material-binding {:texture-set (nth key 3) :sampler (nth key 4)
+                        :alpha-mode (nth key 5) :double-sided? (nth key 6)
+                        :shader-variant (nth key 7)}
+     :instance-count (count instances)
+     :instance-data (pack-instances instances)
+     :provenance {:source-indices source-indices :entity-ids entity-ids
+                  :semantic-counts (frequencies
+                                    (map #(or (:semantic %) (:role %) :unspecified)
+                                         instances))}}))
+
+(defn build-submission-packets
+  "Group compatible instances and split them into bounded instanced packets.
+
+   Budgets are evidence-only and never silently cull source instances. LOD/density
+   selection remains an explicit upstream policy."
+  ([instances] (build-submission-packets instances nil))
+  ([instances options]
+   (let [{:keys [max-instances-per-packet packet-budget lod-instance-budgets]}
+         (merge default-options options)
+         _ (when-not (and (integer? max-instances-per-packet)
+                          (pos? max-instances-per-packet))
+             (throw (ex-info "packet size must be a positive integer"
+                             {:max-instances-per-packet max-instances-per-packet})))
+         indexed (mapv vector (range) instances)
+         groups (->> indexed
+                     (group-by (comp compatibility-key second))
+                     (sort-by (comp stable-key key)))
+         packets (vec
+                  (map-indexed
+                   (fn [packet-index [key pairs]] (packet packet-index key pairs))
+                   (mapcat (fn [[key pairs]]
+                             (map (fn [chunk] [key (vec chunk)])
+                                  (partition-all max-instances-per-packet pairs)))
+                           groups)))
+         lod-counts (frequencies (map #(or (:lod %) :none) instances))
+         lod-budget-checks
+         (into {} (map (fn [[lod count]]
+                         [lod {:count count :budget (get lod-instance-budgets lod 0)
+                               :within-budget? (<= count (get lod-instance-budgets lod 0))}])
+                       lod-counts))
+         source-count (count instances)
+         packet-count (count packets)]
+     {:schema schema :packets packets
+      :evidence {:schema :kotoba.webgpu/submission-packet-evidence-v1
+                 :source-instance-count source-count
+                 :submitted-instance-count (reduce + 0 (map :instance-count packets))
+                 :packet-count packet-count
+                 :compatibility-group-count (count groups)
+                 :packet-reduction (max 0 (- source-count packet-count))
+                 :packet-reduction-ratio (if (pos? source-count)
+                                           (- 1.0 (/ (double packet-count) source-count)) 0.0)
+                 :max-instances-per-packet max-instances-per-packet
+                 :packet-budget packet-budget
+                 :packet-budget-within? (<= packet-count packet-budget)
+                 :lod-budgets lod-budget-checks
+                 :lod-budget-within? (every? :within-budget? (vals lod-budget-checks))
+                 :provenance-complete?
+                 (= (set (range source-count))
+                    (set (mapcat #(get-in % [:provenance :source-indices]) packets)))
+                 :deterministic-order :compatibility-key-then-source-order}})))

@@ -1,0 +1,284 @@
+(ns kotoba.render.splat-loader
+  "PLY, .splat, and .spz file parsers for 3D Gaussian Splatting.
+   Ported from `kami-render/src/splat_loader.rs`.
+
+   Errors are signalled with `ex-info`, `(:type (ex-data e))` one of
+   `:invalid-header :missing-property :unexpected-eof :unsupported-format
+   :bad-magic :decompress`, mirroring the Rust `SplatLoadError` enum.
+
+   `load-spz` needs gzip decompression: implemented on the JVM via
+   `java.util.zip.GZIPInputStream` (`#?(:clj ...)`); on ClojureScript it
+   throws — the reference `flate2` crate has no zero-dep JS equivalent in
+   this port, so SPZ loading is JVM-only for now."
+  (:require [clojure.string :as str]
+            [kotoba.render.bits :as bits]
+            [kotoba.render.splat :as splat]
+            ))
+
+;; ---------------------------------------------------------------------------
+;; .splat (antimatter15 compact binary, 32 bytes/splat)
+;; ---------------------------------------------------------------------------
+
+(defn load-splat
+  "Load .splat binary format (antimatter15 compact: 32 bytes per splat).
+   Layout per splat (LE): position f32x3, scale f32x3 (already exp'd),
+   color u8x4 (RGBA 0..255), rotation u8x4 (quat normalized to 0..255)."
+  [bytes]
+  (let [stride 32
+        n (count bytes)]
+    (if (< n stride)
+      (splat/new-cloud)
+      (let [cnt (quot n stride)
+            splats
+            (vec
+             (for [i (range cnt)
+                   :let [off (* i stride)]
+                   :while (<= (+ off stride) n)]
+               (let [px (bits/f32-le bytes off) py (bits/f32-le bytes (+ off 4)) pz (bits/f32-le bytes (+ off 8))
+                     sx (bits/f32-le bytes (+ off 12)) sy (bits/f32-le bytes (+ off 16)) sz (bits/f32-le bytes (+ off 20))
+                     r (/ (double (bits/u8 bytes (+ off 24))) 255.0)
+                     g (/ (double (bits/u8 bytes (+ off 25))) 255.0)
+                     b (/ (double (bits/u8 bytes (+ off 26))) 255.0)
+                     a (/ (double (bits/u8 bytes (+ off 27))) 255.0)
+                     qw (- (/ (double (bits/u8 bytes (+ off 28))) 128.0) 1.0)
+                     qx (- (/ (double (bits/u8 bytes (+ off 29))) 128.0) 1.0)
+                     qy (- (/ (double (bits/u8 bytes (+ off 30))) 128.0) 1.0)
+                     qz (- (/ (double (bits/u8 bytes (+ off 31))) 128.0) 1.0)
+                     sh-dc [(- r 0.5) (- g 0.5) (- b 0.5)]
+                     log-scale [(Math/log (max sx 1e-8)) (Math/log (max sy 1e-8)) (Math/log (max sz 1e-8))]
+                     clamped-a (max 0.001 (min 0.999 a))
+                     logit-opacity (Math/log (/ clamped-a (- 1.0 clamped-a)))]
+                 {:position [px py pz] :opacity logit-opacity :scale log-scale
+                  :rotation [qw qx qy qz] :sh-dc sh-dc})))]
+        (assoc (splat/new-cloud) :splats splats)))))
+
+;; ---------------------------------------------------------------------------
+;; PLY (ASCII + binary_little_endian)
+;; ---------------------------------------------------------------------------
+
+(defn- find-bytes [bytes needle]
+  (let [n (count bytes) m (count needle)]
+    (loop [i 0]
+      (cond
+        (> (+ i m) n) nil
+        (= (subvec (vec bytes) i (+ i m)) (vec needle)) i
+        :else (recur (inc i))))))
+
+(defn- bytes->ascii-str [bytes start end]
+  (apply str (map char (subvec (vec bytes) start end))))
+
+(defn load-ply
+  "Load a PLY file (ASCII or binary_little_endian) containing 3D Gaussian
+   Splat data. Expected properties: x,y,z, opacity, scale_0/1/2,
+   rot_0/1/2/3, f_dc_0/1/2, and optionally f_rest_0.. for higher SH bands
+   (channel-major in the file, rearranged to coefficient-major in
+   `:sh-rest`, matching the Rust source)."
+  [bytes]
+  (let [sep (map int "end_header\n")
+        header-end (find-bytes bytes sep)]
+    (when (nil? header-end)
+      (throw (ex-info "invalid PLY header" {:type :invalid-header})))
+    (let [header (bytes->ascii-str bytes 0 header-end)
+          body-start (+ header-end (count sep))
+          lines (str/split-lines header)
+          parsed (reduce
+                  (fn [acc line]
+                    (let [parts (str/split (str/trim line) #"\s+")]
+                      (cond
+                        (and (>= (count parts) 3) (= (first parts) "element") (= (second parts) "vertex"))
+                        (assoc acc :vertex-count )
+
+                        (and (>= (count parts) 3) (= (first parts) "property"))
+                        (update acc :properties conj [(nth parts 1) (nth parts 2)])
+
+                        (and (>= (count parts) 3) (= (first parts) "format"))
+                        (assoc acc :format-binary (str/starts-with? (nth parts 1) "binary"))
+
+                        :else acc)))
+                  {:vertex-count 0 :properties [] :format-binary false}
+                  lines)
+          {:keys [vertex-count properties format-binary]} parsed]
+      (if (zero? vertex-count)
+        (splat/new-cloud)
+        (let [find-prop (fn [name] (some (fn [[i [_ n]]] (when (= n name) i))
+                                          (map-indexed vector properties)))
+              req (fn [name] (or (find-prop name)
+                                  (throw (ex-info (str "missing property: " name)
+                                                   {:type :missing-property :property name}))))
+              ix (req "x") iy (req "y") iz (req "z")
+              iopacity (find-prop "opacity")
+              iscale0 (find-prop "scale_0") iscale1 (find-prop "scale_1") iscale2 (find-prop "scale_2")
+              irot0 (find-prop "rot_0") irot1 (find-prop "rot_1") irot2 (find-prop "rot_2") irot3 (find-prop "rot_3")
+              idc0 (find-prop "f_dc_0") idc1 (find-prop "f_dc_1") idc2 (find-prop "f_dc_2")
+              rest-indices (vec (take-while some? (map find-prop (map #(str "f_rest_" %) (range)))))
+              rest-count (count rest-indices)
+              [sh-degree-loaded rest-per-splat] (case rest-count
+                                                   0 [0 0] 9 [1 9] 24 [2 24] 45 [3 45]
+                                                   [0 0])
+              coefs-per-channel (quot rest-per-splat 3)]
+          (if format-binary
+            (let [body (subvec (vec bytes) body-start (count bytes))
+                  stride (* (count properties) 4)]
+              (loop [v 0 splats [] sh-rest []]
+                (let [base (* v stride)]
+                  (if (or (>= v vertex-count) (> (+ base stride) (count body)))
+                    (assoc (splat/new-cloud) :splats splats :sh-degree sh-degree-loaded :sh-rest sh-rest)
+                    (let [rf (fn [prop-idx] (bits/f32-le body (+ base (* prop-idx 4))))
+                          position [(rf ix) (rf iy) (rf iz)]
+                          opacity (if iopacity (rf iopacity) 1.0)
+                          scale [(if iscale0 (rf iscale0) 0.01) (if iscale1 (rf iscale1) 0.01) (if iscale2 (rf iscale2) 0.01)]
+                          rotation [(if irot0 (rf irot0) 1.0) (if irot1 (rf irot1) 0.0)
+                                    (if irot2 (rf irot2) 0.0) (if irot3 (rf irot3) 0.0)]
+                          sh-dc [(if idc0 (rf idc0) 0.0) (if idc1 (rf idc1) 0.0) (if idc2 (rf idc2) 0.0)]
+                          new-rest (if (pos? coefs-per-channel)
+                                     (mapv (fn [c] [(rf (nth rest-indices c))
+                                                    (rf (nth rest-indices (+ coefs-per-channel c)))
+                                                    (rf (nth rest-indices (+ (* 2 coefs-per-channel) c)))])
+                                           (range coefs-per-channel))
+                                     [])]
+                      (recur (inc v)
+                             (conj splats {:position position :opacity opacity :scale scale
+                                           :rotation rotation :sh-dc sh-dc})
+                             (into sh-rest new-rest)))))))
+            (let [body-text (bytes->ascii-str bytes body-start (count bytes))
+                  body-lines (take vertex-count (str/split-lines body-text))]
+              (reduce
+               (fn [cloud line]
+                 (let [vals (->> (str/split (str/trim line) #"\s+")
+                                  (keep (fn [s] (try 
+                                                      (catch  _ nil))))
+                                  vec)]
+                   (if (< (count vals) (count properties))
+                     cloud
+                     (let [gv (fn [i default] (if i (nth vals i) default))
+                           position [(nth vals ix) (nth vals iy) (nth vals iz)]
+                           opacity (gv iopacity 1.0)
+                           scale [(gv iscale0 0.01) (gv iscale1 0.01) (gv iscale2 0.01)]
+                           rotation [(gv irot0 1.0) (gv irot1 0.0) (gv irot2 0.0) (gv irot3 0.0)]
+                           sh-dc [(gv idc0 0.0) (gv idc1 0.0) (gv idc2 0.0)]
+                           new-rest (if (pos? coefs-per-channel)
+                                      (mapv (fn [c] [(nth vals (nth rest-indices c))
+                                                     (nth vals (nth rest-indices (+ coefs-per-channel c)))
+                                                     (nth vals (nth rest-indices (+ (* 2 coefs-per-channel) c)))])
+                                            (range coefs-per-channel))
+                                      [])]
+                       (-> cloud
+                           (update :splats conj {:position position :opacity opacity :scale scale
+                                                  :rotation rotation :sh-dc sh-dc})
+                           (update :sh-rest into new-rest))))))
+               (assoc (splat/new-cloud) :sh-degree sh-degree-loaded)
+               body-lines))))))))
+
+;; ---------------------------------------------------------------------------
+;; SPZ (Niantic gzip-compressed binary container)
+;; ---------------------------------------------------------------------------
+
+(def ^:const spz-magic 0x5053474e) ;; ASCII "NGSP" little-endian u32
+
+(defn- spz-dim-for-degree [degree]
+  (case (int degree) 0 0 1 3 2 8 3 15 4 24 0))
+
+(defn- spz-unpack-quat-smallest-three
+  "Decode an SPZ v3 'smallest-three' packed quaternion (4 bytes → wxyz)."
+  [[r0 r1 r2 r3]]
+  (let [sqrt1_2 (/ 1.0 (Math/sqrt 2.0))
+        c-mask (dec (bit-shift-left 1 9))
+        comp0 (bit-or r0 (bit-shift-left r1 8) (bit-shift-left r2 16) (bit-shift-left r3 24))
+        i-largest (bit-and (unsigned-bit-shift-right comp0 30) 0x3)]
+    (loop [i 3 comp comp0 rot [0.0 0.0 0.0 0.0] sum-sq 0.0]
+      (if (< i 0)
+        (let [rot (assoc rot i-largest (Math/sqrt (max 0.0 (- 1.0 sum-sq))))]
+          ;; rot is xyzw; wxyz needed.
+          [(nth rot 3) (nth rot 0) (nth rot 1) (nth rot 2)])
+        (if (= i i-largest)
+          (recur (dec i) comp rot sum-sq)
+          (let [mag (bit-and comp c-mask)
+                negbit (bit-and (unsigned-bit-shift-right comp 9) 0x1)
+                comp' (unsigned-bit-shift-right comp 10)
+                v0 (* sqrt1_2 (/ (double mag) c-mask))
+                v (if (= negbit 1) (- v0) v0)]
+            (recur (dec i) comp' (assoc rot i v) (+ sum-sq (* v v)))))))))
+
+(defn- gunzip [byte-vec]
+  )
+
+(defn load-spz
+  "Load a Niantic SPZ Gaussian-splat file (`.spz`) — gzip-compressed binary,
+   legacy single-gzip-stream versions 1-3 (the v4+ multi-stream ZSTD layout
+   is out of scope, matching the Rust source's `flate2`-only decoder)."
+  [bytes]
+  (let [raw (try (gunzip bytes)
+                  (catch  e
+                    (throw (ex-info (str "gzip decompress failed: " (ex-message e)) {:type :decompress}))))]
+    (when (< (count raw) 16)
+      (throw (ex-info "unexpected end of data" {:type :unexpected-eof})))
+    (let [magic (bits/u32-le raw 0)]
+      (when (not= magic spz-magic)
+        (throw (ex-info "bad SPZ magic (not a gzip'd SPZ file)" {:type :bad-magic})))
+      (let [version (bits/u32-le raw 4)
+            num-points (bits/u32-le raw 8)
+            sh-degree-raw (bits/u8 raw 12)
+            fractional-bits (bits/u8 raw 13)]
+        (if (zero? num-points)
+          (splat/new-cloud)
+          (let [pos-stride (if (= version 1) 6 9)
+                alpha-stride 1
+                color-stride 3
+                scale-stride 3
+                rot-stride (if (>= version 3) 4 3)
+                sh-dim (spz-dim-for-degree sh-degree-raw)
+                sh-stride (* sh-dim 3)
+                pos-base 16
+                alpha-base (+ pos-base (* pos-stride num-points))
+                color-base (+ alpha-base (* alpha-stride num-points))
+                scale-base (+ color-base (* color-stride num-points))
+                rot-base (+ scale-base (* scale-stride num-points))
+                sh-base (+ rot-base (* rot-stride num-points))
+                total (+ sh-base (* sh-stride num-points))]
+            (when (< (count raw) total)
+              (throw (ex-info "unexpected end of data" {:type :unexpected-eof})))
+            (let [loaded-degree (min sh-degree-raw 3)
+                  loaded-coefs (spz-dim-for-degree loaded-degree)
+                  pos-scale (/ 1.0 (double (bit-shift-left 1 fractional-bits)))
+                  splats
+                  (vec
+                   (for [i (range num-points)]
+                     (let [position
+                           (if (= version 1)
+                             (let [b (+ pos-base (* i 6))]
+                               [(bits/half->f32 (bits/u16-le raw b))
+                                (bits/half->f32 (bits/u16-le raw (+ b 2)))
+                                (bits/half->f32 (bits/u16-le raw (+ b 4)))])
+                             (let [b (+ pos-base (* i 9))]
+                               [(* (bits/i24-le raw b) pos-scale)
+                                (* (bits/i24-le raw (+ b 3)) pos-scale)
+                                (* (bits/i24-le raw (+ b 6)) pos-scale)]))
+                           a (max 0.001 (min 0.999 (/ (double (bits/u8 raw (+ alpha-base i))) 255.0)))
+                           opacity (Math/log (/ a (- 1.0 a)))
+                           cb (+ color-base (* i 3))
+                           sh-dc [(/ (- (/ (double (bits/u8 raw cb)) 255.0) 0.5) 0.15)
+                                  (/ (- (/ (double (bits/u8 raw (+ cb 1))) 255.0) 0.5) 0.15)
+                                  (/ (- (/ (double (bits/u8 raw (+ cb 2))) 255.0) 0.5) 0.15)]
+                           sb (+ scale-base (* i 3))
+                           scale [(- (/ (double (bits/u8 raw sb)) 16.0) 10.0)
+                                  (- (/ (double (bits/u8 raw (+ sb 1))) 16.0) 10.0)
+                                  (- (/ (double (bits/u8 raw (+ sb 2))) 16.0) 10.0)]
+                           rb (+ rot-base (* i rot-stride))
+                           rotation (if (>= version 3)
+                                      (spz-unpack-quat-smallest-three
+                                       [(bits/u8 raw rb) (bits/u8 raw (+ rb 1)) (bits/u8 raw (+ rb 2)) (bits/u8 raw (+ rb 3))])
+                                      (let [x (- (/ (double (bits/u8 raw rb)) 127.5) 1.0)
+                                            y (- (/ (double (bits/u8 raw (+ rb 1))) 127.5) 1.0)
+                                            z (- (/ (double (bits/u8 raw (+ rb 2))) 127.5) 1.0)
+                                            w (Math/sqrt (max 0.0 (- 1.0 (+ (* x x) (* y y) (* z z)))))]
+                                        [w x y z]))]
+                       {:position position :opacity opacity :scale scale :rotation rotation :sh-dc sh-dc})))
+                  sh-rest
+                  (if (pos? loaded-coefs)
+                    (vec (for [i (range num-points) c (range loaded-coefs)
+                               :let [o (+ sh-base (* i sh-stride) (* c 3))]]
+                           [(/ (- (bits/u8 raw o) 128.0) 128.0)
+                            (/ (- (bits/u8 raw (+ o 1)) 128.0) 128.0)
+                            (/ (- (bits/u8 raw (+ o 2)) 128.0) 128.0)]))
+                    [])]
+              {:splats splats :sh-degree loaded-degree :sh-rest sh-rest})))))))

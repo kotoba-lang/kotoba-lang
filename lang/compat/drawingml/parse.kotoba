@@ -1,0 +1,1581 @@
+(ns drawingml.parse
+  "Small DrawingML XML to EDN projection helpers."
+  (:require [clojure.string :as str]
+            [xml.parse :as xp]))
+
+(def emu-per-inch 914400)
+
+(defn- parse-int-radix [s radix]
+  )
+
+(defn- codepoint-string [n]
+  )
+
+(defn- decode-numeric-entity
+  "&#8226;/&#x2022; -> the literal character. Bullet characters (buChar) are
+  routinely XML-escaped as numeric entities rather than the raw glyph."
+  [[raw hex dec]]
+  (try
+    (codepoint-string (if hex (parse-int-radix hex 16) (parse-int-radix dec 10)))
+    (catch  _
+      raw)))
+
+(defn xml-unescape [s]
+  (-> (str (or s ""))
+      (str/replace #"&#x([0-9A-Fa-f]+);|&#([0-9]+);" decode-numeric-entity)
+      (str/replace "&lt;" "<")
+      (str/replace "&gt;" ">")
+      (str/replace "&quot;" "\"")
+      (str/replace "&apos;" "'")
+      (str/replace "&amp;" "&")))
+
+(defn xml-attr [xml attr]
+  (some-> (second (re-find (re-pattern (str "\\b" attr "=\"([^\"]*)\"")) (or xml "")))
+          xml-unescape))
+
+(defn xml-texts [xml tag]
+  (->> (re-seq (re-pattern (str "<" tag "\\b[^>]*>([\\s\\S]*?)</" tag ">")) (or xml ""))
+       (map second)
+       (map xml-unescape)
+       (remove str/blank?)))
+
+(defn first-xml-text [xml tag]
+  (first (xml-texts xml tag)))
+
+(defn xml-elements [xml tag]
+  (re-seq (re-pattern (str "<" tag "\\b[\\s\\S]*?</" tag ">")) (or xml "")))
+
+(defn- doc-tree
+  "Parses `xml` (which may be a bare fragment of sibling shapes, not
+  necessarily a single-rooted document) into an xml.parse tree, wrapping it
+  in a synthetic root so parsing always has exactly one element to work
+  with regardless of the caller's input shape."
+  [xml]
+  (xp/parse (str "<root>" (or xml "") "</root>")))
+
+(defn- nested-group-nodes
+  "Every <p:grpSp> node in xml, any nesting depth, as PARSED TREE NODES
+  (not strings) -- xml.parse's find-all walks the real tree structure, so
+  a group inside a group is delimited correctly with no special handling
+  at all, unlike xml-elements' non-greedy regex (which, for a self-nesting
+  tag, matches only up to the FIRST closing tag found, truncating an outer
+  group at its innermost child's close). Document (pre-)order, i.e.
+  outermost-first."
+  [xml]
+  (xp/find-all (doc-tree xml) :p/grpSp))
+
+(defn parse-double-safe [x]
+  (when-not (str/blank? (str x))
+    (let [n ]
+      (when 
+        n))))
+
+(defn emu->inch [n fallback]
+  (if-let [value (parse-double-safe n)]
+    (if (pos? value)
+      (double (/ value emu-per-inch))
+      fallback)
+    fallback))
+
+(defn shape-name [block idx fallback]
+  (or (xml-attr (or (re-find #"<p:cNvPr\b[^>]*>" (or block "")) "") "name")
+      (str fallback "-" (inc idx))))
+
+(defn shape-hidden?
+  "A shape's own <p:cNvPr hidden=\"1\"/> -- PowerPoint's own \"Hide\" toggle
+  (Format > Selection Pane > eye icon), distinct from simply not being on
+  the visible layout. Previously entirely unhandled -- a hidden shape
+  (a common real-deck pattern: reference/backup content kept in the deck
+  but not shown, or animation-only content) always round-tripped as
+  visible, silently changing the deck's actual rendered appearance."
+  [block]
+  (= "1" (xml-attr (or (re-find #"<p:cNvPr\b[^>]*>" (or block "")) "") "hidden")))
+
+(defn placeholder [block]
+  (when-let [ph (re-find #"<p:ph\b[^>]*/?>" (or block ""))]
+    (cond-> {}
+      (xml-attr ph "type") (assoc :type (xml-attr ph "type"))
+      (xml-attr ph "idx") (assoc :idx (xml-attr ph "idx"))
+      (xml-attr ph "sz") (assoc :size (xml-attr ph "sz"))
+      (xml-attr ph "orient") (assoc :orient (xml-attr ph "orient")))))
+
+(defn- add-placeholder [shape block]
+  (cond-> shape
+    (placeholder block) (assoc :drawingml/placeholder (placeholder block))))
+
+(defn- containing-groups
+  "Every group NODE that structurally contains the shape parsed from
+  `block` (a shape's raw string block, from xml-elements), innermost
+  first -- the shape's full ancestor chain when it's nested inside a group
+  inside a group, not just its immediate parent.
+
+  Determines containment by re-parsing `block` into its own tree node and
+  checking, for each candidate group, whether that exact node appears
+  among the group's descendants (find-all is a pure function of the
+  string, so a shape re-parsed standalone is structurally identical to the
+  same shape found while parsing the whole document) -- NOT by substring-
+  matching raw text, which breaks the moment a node's text can't be
+  compared byte-for-byte (e.g. after re-serializing). group-nodes is in
+  outermost-first document order (see nested-group-nodes); since a filter
+  preserves relative order, reversing it after filtering yields innermost-
+  first without any span/length heuristics."
+  [group-nodes block]
+  (if (empty? group-nodes)
+    []
+    (let [shape-node (first (xp/el-elements (doc-tree block)))
+          shape-tag (xp/el-tag shape-node)]
+      (->> group-nodes
+           (filterv (fn [g] (some #(= % shape-node) (xp/find-all g shape-tag))))
+           rseq
+           vec))))
+
+(defn- node-name
+  "A tree node's own <p:cNvPr name=\"...\"/> value (find-all rather than
+  find-child since cNvPr can live a level or two down depending on which
+  nv*Pr wrapper the tag uses), or a generated fallback."
+  [node fallback-prefix idx]
+  (or (some-> (first (xp/find-all node :p/cNvPr)) (xp/el-attr "name"))
+      (str fallback-prefix "-" (inc idx))))
+
+(defn- group-metadata
+  "`chain` is a PRECOMPUTED (containing-groups groups block) result -- the
+  caller (shapes) computes it once per shape and reuses it here AND in
+  apply-group-geometry, instead of each independently re-parsing/re-
+  scanning for the same answer."
+  [groups chain]
+  (when-let [group-node (first chain)]
+    (let [idx (first (keep-indexed (fn [i g] (when (= g group-node) i)) groups))]
+      {:index idx
+       :id (node-name group-node "group" idx)})))
+
+(defn- add-group [shape group]
+  (cond-> shape
+    group (assoc :drawingml/group group)))
+
+(defn- group-xfrm
+  "A <p:grpSp> NODE's own transform: off/ext (its box in SLIDE
+  coordinates) and chOff/chExt (the origin/extent of the coordinate space
+  its CHILDREN's own xfrm off/ext are expressed in -- almost never
+  identical to off/ext, since PowerPoint lets a group's child coordinate
+  space be scaled independently of the group's on-slide box, e.g. when the
+  group has been resized after grouping). nil when the group has no xfrm
+  at all. Reads its DIRECT child <p:grpSpPr><a:xfrm> via find-child (not
+  find-all), since find-all would incorrectly also match a nested child
+  group's own xfrm."
+  [group-node]
+  (when-let [xfrm (some-> (xp/find-child group-node :p/grpSpPr) (xp/find-child :a/xfrm))]
+    (let [off (xp/find-child xfrm :a/off)
+          ext (xp/find-child xfrm :a/ext)
+          ch-off (xp/find-child xfrm :a/chOff)
+          ch-ext (xp/find-child xfrm :a/chExt)]
+      {:off-x (emu->inch (xp/el-attr off "x") 0)
+       :off-y (emu->inch (xp/el-attr off "y") 0)
+       :ext-w (emu->inch (xp/el-attr ext "cx") 1)
+       :ext-h (emu->inch (xp/el-attr ext "cy") 1)
+       :ch-off-x (emu->inch (xp/el-attr ch-off "x") 0)
+       :ch-off-y (emu->inch (xp/el-attr ch-off "y") 0)
+       :ch-ext-w (emu->inch (xp/el-attr ch-ext "cx") 1)
+       :ch-ext-h (emu->inch (xp/el-attr ch-ext "cy") 1)})))
+
+(defn apply-group-transform
+  "Maps a shape's xfrm from its group's CHILD coordinate space into slide
+  coordinates: absolute = group-off + (child-pos - group-chOff) * (group-ext
+  / group-chExt). A shape whose own :drawingml/x/y/w/h were read straight off
+  its <a:xfrm> (correct only when the shape is NOT inside a resized group)
+  is silently wrong once a group has been resized after its children were
+  grouped -- chOff/chExt no longer match off/ext 1:1, and every child's
+  coordinates need this rescale to land in the right place on the slide."
+  [shape group-xf]
+  (if-let [{:keys [off-x off-y ext-w ext-h ch-off-x ch-off-y ch-ext-w ch-ext-h]} group-xf]
+    (let [scale-x (if (zero? ch-ext-w) 1.0 (/ ext-w ch-ext-w))
+          scale-y (if (zero? ch-ext-h) 1.0 (/ ext-h ch-ext-h))]
+      (cond-> shape
+        (:drawingml/x shape) (update :drawingml/x #(+ off-x (* scale-x (- % ch-off-x))))
+        (:drawingml/y shape) (update :drawingml/y #(+ off-y (* scale-y (- % ch-off-y))))
+        (:drawingml/w shape) (update :drawingml/w #(* scale-x %))
+        (:drawingml/h shape) (update :drawingml/h #(* scale-y %))))
+    shape))
+
+(defn- apply-group-geometry
+  "Rescales a shape's geometry into slide coordinates, composing through
+  EVERY group it's nested inside (innermost first, then that group's own
+  parent, and so on) -- a shape inside a group inside a group needs both
+  transform levels applied in order, not just the immediate parent's.
+  `chain` is the same precomputed containing-groups result group-metadata
+  uses (see its docstring)."
+  [shape chain]
+  (reduce (fn [shp group-node] (apply-group-transform shp (group-xfrm group-node)))
+          shape
+          chain))
+
+(defn- apply-group-info
+  "Computes a shape's group-ancestor chain ONCE and applies both its
+  :drawingml/group metadata and its geometry rescaling from it, instead of
+  group-metadata and apply-group-geometry each independently re-deriving
+  the same chain (containing-groups isn't free: it re-parses `block` and
+  scans every group's subtree)."
+  [shape groups block]
+  (let [chain (containing-groups groups block)]
+    (-> shape
+        (add-group (group-metadata groups chain))
+        (apply-group-geometry chain))))
+
+(defn- source-extras [shape]
+  (cond-> {}
+    (:drawingml/group shape) (assoc :ooxml/group (:drawingml/group shape))
+    (:drawingml/placeholder shape) (assoc :ooxml/placeholder (:drawingml/placeholder shape))
+    (:drawingml/chart-rel-id shape) (assoc :ooxml/chart-rel-id (:drawingml/chart-rel-id shape))
+    (:drawingml/chart-part shape) (assoc :ooxml/chart-part (:drawingml/chart-part shape))
+    (:drawingml/workbook-part shape) (assoc :ooxml/workbook-part (:drawingml/workbook-part shape))))
+
+(defn- with-source [shape opts kind idx]
+  (cond-> shape
+    (:part opts)
+    (assoc :ooxml/source (cond-> (merge {:ooxml/part (:part opts)
+                                         :ooxml/kind kind
+                                         :ooxml/index idx}
+                                        (source-extras shape))
+                           (:source opts) (assoc :ooxml/source (:source opts))))))
+
+(def default-xfrm {:drawingml/x 0.8 :drawingml/y 0.8 :drawingml/w 8.4 :drawingml/h 0.7})
+
+(defn xfrm-explicit
+  "The shape's own <a:xfrm>/<p:xfrm> geometry, or nil when the block omits it.
+  PowerPoint omits <a:xfrm> on placeholders that were never moved/resized and
+  expects the slide layout/master geometry to apply instead. Rotation (`rot`,
+  60,000ths of a degree) and flip (`flipH`/`flipV`) live as attributes on the
+  xfrm tag itself, alongside off/ext -- previously read nowhere, so a rotated
+  or flipped shape silently imported upright/unflipped."
+  [block]
+  (when-let [[_ open-tag body] (or (re-find #"(<a:xfrm\b[^>]*>)([\s\S]*?)</a:xfrm>" (or block ""))
+                                   (re-find #"(<p:xfrm\b[^>]*>)([\s\S]*?)</p:xfrm>" (or block "")))]
+    (let [off (or (re-find #"<a:off\b[^>]*>" body) "")
+          ext (or (re-find #"<a:ext\b[^>]*>" body) "")
+          rotation (some-> (xml-attr open-tag "rot") parse-double-safe (/ 60000.0))]
+      (cond-> {:drawingml/x (emu->inch (xml-attr off "x") 0.8)
+               :drawingml/y (emu->inch (xml-attr off "y") 0.8)
+               :drawingml/w (emu->inch (xml-attr ext "cx") 8.4)
+               :drawingml/h (emu->inch (xml-attr ext "cy") 0.7)}
+        rotation (assoc :drawingml/rotation rotation)
+        (= "1" (xml-attr open-tag "flipH")) (assoc :drawingml/flip-h true)
+        (= "1" (xml-attr open-tag "flipV")) (assoc :drawingml/flip-v true)))))
+
+(defn placeholder-geometry-index
+  "Indexes placeholder geometry from a slideLayout/slideMaster XML string,
+  keyed by [idx type] (exact placeholder match) and [nil type] (type-only
+  fallback, first match wins). Feeds `xfrm`'s :placeholder-geometry opt so a
+  slide shape that omits <a:xfrm> can inherit its layout/master position."
+  [xml]
+  (reduce (fn [index block]
+            (if-let [ph (placeholder block)]
+              (if-let [geometry (xfrm-explicit block)]
+                (let [type (:type ph "body")]
+                  (cond-> index
+                    (and (:idx ph) (not (contains? index [(:idx ph) type])))
+                    (assoc [(:idx ph) type] geometry)
+
+                    (not (contains? index [nil type]))
+                    (assoc [nil type] geometry)))
+                index)
+              index))
+          {}
+          (xml-elements xml "p:sp")))
+
+(defn merge-placeholder-geometry-indexes
+  "Merges slideLayout and slideMaster placeholder geometry indexes, preferring
+  the (more specific) layout entries."
+  [layout-index master-index]
+  (merge master-index layout-index))
+
+;; The OOXML default colour map (used when no explicit <p:clrMap> override is
+;; available to the caller): bg1/tx1/bg2/tx2 are the placeholder-facing
+;; aliases PowerPoint actually emits in <a:schemeClr val="...">, resolved
+;; here to the theme's dk/lt slots.
+(def ^:private default-color-map
+  {:bg1 :lt1 :tx1 :dk1 :bg2 :lt2 :tx2 :dk2})
+
+(defn- raw-scheme-color-role
+  "The <a:schemeClr val=\"...\"/> value as-is (bg1/tx1/accent1/...), with no
+  bg/tx-alias translation applied."
+  [xml]
+  (some-> (second (re-find #"<a:schemeClr\b[^>]*\bval=\"([A-Za-z0-9]+)\"" (or xml "")))
+          str/lower-case
+          keyword))
+
+(defn scheme-color-role
+  "bg1/tx1/bg2/tx2 translated to their default (dk/lt) theme slot; every
+  other role (accent1-6, hlink, folHlink) passes through unchanged. This is
+  the OOXML *default* clrMap -- a deck with a non-default <p:clrMap>
+  override should resolve through that instead (see first-color's
+  theme-colors lookup, which checks for a pre-resolved alias entry first)."
+  [xml]
+  (let [role (raw-scheme-color-role xml)]
+    (get default-color-map role role)))
+
+(defn first-color
+  "theme-colors may contain the alias keys (:bg1/:tx1/:bg2/:tx2) directly,
+  pre-resolved through the SLIDE'S OWN (possibly non-default) <p:clrMap> by
+  the caller (see presentationml.parse/theme-color-map-for-slide) -- checked
+  before falling back to the OOXML default bg/tx->dk/lt translation, so a
+  deck with a custom clrMap resolves schemeClr correctly instead of always
+  assuming the default mapping."
+  ([xml] (first-color xml nil))
+  ([xml theme-colors]
+   (or (some-> (or (second (re-find #"<a:srgbClr\b[^>]*\bval=\"([0-9A-Fa-f]{6})\"" (or xml "")))
+                   (second (re-find #"\blastClr=\"([0-9A-Fa-f]{6})\"" (or xml ""))))
+               str/upper-case)
+       (let [role (raw-scheme-color-role xml)]
+         (or (get theme-colors role)
+             (get theme-colors (get default-color-map role role)))))))
+
+(defn- fill-block
+  "The content of a shape's fill element, whichever kind it is. A gradient
+  fill approximates to its FIRST stop's color and a pattern fill to its
+  foreground color -- not faithful, but a real (if imperfect) color beats
+  silently collapsing to the hardcoded shape-fallback color, which is what
+  happened when only <a:solidFill> was recognized."
+  [block]
+  (or (second (re-find #"<a:solidFill\b[^>]*>([\s\S]*?)</a:solidFill>" (or block "")))
+      (second (re-find #"<a:gradFill\b[^>]*>([\s\S]*?)</a:gradFill>" (or block "")))
+      (second (re-find #"<a:pattFill\b[^>]*>([\s\S]*?)</a:pattFill>" (or block "")))))
+
+(defn- spPr-block [block]
+  (second (re-find #"<p:spPr\b[^>]*>([\s\S]*?)</p:spPr>" (or block ""))))
+
+(defn blip-fill-rel-id
+  "A shape's own fill, when it's a picture used AS the fill (<a:blipFill>
+  inside <p:spPr> -- distinct from <p:pic>, where the picture IS the whole
+  shape). The blip's r:embed relationship id, or nil when the shape's own
+  fill isn't a picture at all. Previously totally unhandled: fill-block only
+  recognizes solidFill/gradFill/pattFill, so a blipFill shape's fill was
+  silently dropped, degrading to the hardcoded default fill color with no
+  trace it had ever been picture-filled."
+  [block]
+  (some->> (spPr-block block)
+           (re-find #"<a:blipFill\b[^>]*>[\s\S]*?<a:blip\b[^>]*\br:embed=\"([^\"]*)\"")
+           second))
+
+(defn blip-fill-part
+  "The blip fill's relationship resolved to a package part path via opts'
+  :rels (the same slide-relationship map chart-shape/hyperlink-url already
+  use)."
+  [block opts]
+  (when-let [rel-id (blip-fill-rel-id block)]
+    (get-in opts [:rels rel-id :target-path])))
+
+(defn picture-crop
+  "A picture's own crop, <a:blipFill><a:srcRect l=\"..\" t=\"..\" r=\"..\"
+  b=\"..\"/> (each side a percentage of the source image, in thousandths-
+  of-a-percent like this package's other percent-based OOXML fields), as
+  {:left/:top/:right/:bottom pct} with only non-zero sides present. Shared
+  by both <p:pic> (the whole shape is a picture) and shapes whose own FILL
+  is a picture (<a:blipFill> inside <p:spPr>) -- <a:srcRect> means the
+  same thing in either context, so a single regex search over the whole
+  shape block works for both without needing to know which case it is.
+  Previously entirely unhandled -- a cropped picture round-tripped as if
+  uncropped, silently showing the FULL original image instead of the
+  cropped region. nil when the picture isn't cropped at all, the
+  overwhelming common case."
+  [block]
+  (when-let [src-rect (re-find #"<a:srcRect\b[^>]*/?>" (or block ""))]
+    (let [side (fn [attr] (some-> (xml-attr src-rect attr) parse-double-safe (/ 1000.0)))]
+      (not-empty
+       (cond-> {}
+         (some-> (side "l") pos?) (assoc :left (side "l"))
+         (some-> (side "t") pos?) (assoc :top (side "t"))
+         (some-> (side "r") pos?) (assoc :right (side "r"))
+         (some-> (side "b") pos?) (assoc :bottom (side "b")))))))
+
+(defn picture-recolor
+  "A picture's own recolor effects, children of <a:blip> itself (not
+  <a:blipFill>) -- <a:grayscl/> (PowerPoint's Picture Format > Color >
+  Grayscale) and <a:alphaModFix amt=\"...\"/> (Washout/transparency,
+  amt a percentage of the ORIGINAL alpha in thousandths-of-a-percent
+  like this package's other percent fields), as {:grayscale? true
+  :alpha-mod pct}, only the effects actually present. A plain,
+  unmodified picture's <a:blip> is self-closing and carries neither, so
+  this only matches when <a:blip> has a paired closing tag at all.
+  Shared by both <p:pic> and a shape whose own fill is a picture, same
+  rationale as picture-crop. Previously entirely unhandled -- a
+  grayscale or washed-out picture round-tripped as if fully recolored
+  back to its original, unmodified appearance. nil when neither effect
+  is present, the overwhelming common case."
+  [block]
+  (when-let [blip-body (second (re-find #"<a:blip\b[^>]*>([\s\S]*?)</a:blip>" (or block "")))]
+    (let [alpha-mod (some-> (re-find #"<a:alphaModFix\b[^>]*/?>" blip-body) (xml-attr "amt") parse-double-safe (/ 1000.0))]
+      (not-empty
+       (cond-> {}
+         (re-find #"<a:grayscl\b" blip-body) (assoc :grayscale? true)
+         alpha-mod (assoc :alpha-mod alpha-mod))))))
+
+(defn solid-fill
+  ([block] (solid-fill block nil))
+  ([block theme-colors]
+   (some-> (fill-block block) (first-color theme-colors))))
+
+(defn- gradient-stop [gs-block theme-colors]
+  (let [gs-tag (or (re-find #"<a:gs\b[^>]*>" gs-block) "")
+        pos (some-> (xml-attr gs-tag "pos") parse-double-safe (/ 1000.0))]
+    (cond-> {:color (first-color gs-block theme-colors)}
+      pos (assoc :position pos))))
+
+(defn gradient-fill
+  "A shape's own <a:gradFill> as {:stops [{:position 0-100 :color \"hex\"}
+  ...] :angle deg}, in document order (position is OOXML's own pos
+  attribute, thousandths-of-a-percent -> a plain 0-100 percentage; angle
+  is <a:lin ang=\"...\">, 60,000ths of a degree -> plain degrees, same
+  conversion as rotation/shadow-angle elsewhere in this file), or nil when
+  the shape's fill isn't a gradient at all.
+
+  solid-fill/fill-block still approximate a gradient to its FIRST stop's
+  color alone (kept unchanged for simple callers that only want ONE
+  color) -- this is the FULL multi-stop fidelity alongside that
+  approximation, previously entirely unavailable: a two-or-more-stop
+  gradient (common for shape fills and slide/master backgrounds) always
+  flattened to a single flat color on round-trip, silently losing the
+  gradient effect entirely."
+  [block theme-colors]
+  (when-let [grad-body (second (re-find #"<a:gradFill\b[^>]*>([\s\S]*?)</a:gradFill>" (or block "")))]
+    (let [stops (vec (for [gs (xml-elements grad-body "a:gs")]
+                       (gradient-stop gs theme-colors)))
+          lin-tag (re-find #"<a:lin\b[^>]*>" grad-body)
+          angle (some-> (xml-attr lin-tag "ang") parse-double-safe (/ 60000.0))]
+      (when (seq stops)
+        (cond-> {:stops stops}
+          angle (assoc :angle angle))))))
+
+(defn line-fill
+  ([block] (line-fill block nil))
+  ([block theme-colors]
+   (some-> (second (re-find #"<a:ln\b[^>]*>([\s\S]*?)</a:ln>" (or block "")))
+           (first-color theme-colors))))
+
+(defn line-width
+  "A shape/connector line's width in points, from <a:ln w=\"...\"> (EMU,
+  12700 per point). nil when the line has no explicit width attribute at
+  all (the writer's own default, 1pt, applied when this is missing).
+  Previously unread anywhere -- every written line always exported at a
+  hardcoded 1pt regardless of the source deck's actual line weight."
+  [block]
+  (some-> (re-find #"<a:ln\b[^>]*>" (or block ""))
+          (xml-attr "w")
+          parse-double-safe
+          (/ 12700.0)))
+
+(defn line-dash
+  "A shape/connector line's dash style (:dash, :dashDot, :lgDash, :sysDot,
+  ...) from <a:ln>...<a:prstDash val=\"...\"/>..., or nil for the default
+  solid line. Previously unread anywhere -- every line always exported
+  solid regardless of the source deck's actual dash pattern."
+  [block]
+  (some-> (second (re-find #"<a:ln\b[^>]*>([\s\S]*?)</a:ln>" (or block "")))
+          (->> (re-find #"<a:prstDash\b[^>]*\bval=\"([A-Za-z]+)\""))
+          second
+          keyword))
+
+(defn line-cap
+  "A shape/connector line's cap style, from <a:ln cap=\"rnd|sq|flat\">, or
+  nil when the line has no explicit cap attribute (PowerPoint's own
+  default, flat). Previously unread anywhere -- every written line always
+  exported with no cap attribute regardless of the source deck's actual
+  cap style."
+  [block]
+  (when-let [cap (some-> (re-find #"<a:ln\b[^>]*>" (or block "")) (xml-attr "cap"))]
+    (case cap "rnd" :round "sq" :square nil)))
+
+(defn line-join
+  "A shape/connector line's corner-join style, from <a:ln>'s one child
+  among <a:round/>/<a:bevel/>/<a:miter lim=\"...\"/> (a choice group -- at
+  most one is ever present), as {:type :round}/{:type :bevel}/{:type
+  :miter :limit pct} (limit only when miter's own lim attribute is
+  explicit; OOXML's lim is a percentage x1000, converted to a plain
+  number same as other percentage attributes in this file). nil for the
+  OOXML default (round) or when the line has no <a:ln> at all. Previously
+  unread anywhere."
+  [block]
+  (when-let [ln-body (second (re-find #"<a:ln\b[^>]*>([\s\S]*?)</a:ln>" (or block "")))]
+    (cond
+      (re-find #"<a:bevel\b" ln-body) {:type :bevel}
+      (re-find #"<a:miter\b" ln-body)
+      (let [miter-tag (or (re-find #"<a:miter\b[^>]*/?>" ln-body) "")]
+        (cond-> {:type :miter}
+          (xml-attr miter-tag "lim") (assoc :limit (some-> (xml-attr miter-tag "lim") parse-double-safe (/ 1000.0)))))
+      (re-find #"<a:round\b" ln-body) {:type :round}
+      :else nil)))
+
+(defn- effect-lst-body
+  "A shape's own <p:spPr>'s <a:effectLst>...</a:effectLst> inner content,
+  or nil for a shape with no effects at all -- the shared scan point for
+  shadow/glow/reflection, which are all siblings within the same list."
+  [block]
+  (some-> (spPr-block block)
+          (->> (re-find #"<a:effectLst\b[^>]*>([\s\S]*?)</a:effectLst>"))
+          second))
+
+(defn shape-shadow
+  "A shape's own outer shadow (<p:spPr>'s <a:effectLst><a:outerShdw
+  blurRad=\"...\" dist=\"...\" dir=\"...\">...color...</a:outerShdw>
+  </a:effectLst>), as {:blur pt :distance pt :angle deg :color hex :alpha
+  pct}, or nil when the shape has no shadow."
+  [block theme-colors]
+  (let [effect-lst (effect-lst-body block)
+        outer-open (some->> effect-lst (re-find #"<a:outerShdw\b[^>]*>"))
+        outer-body (some-> effect-lst
+                           (->> (re-find #"<a:outerShdw\b[^>]*>([\s\S]*?)</a:outerShdw>"))
+                           second)]
+    (when outer-open
+      (let [color (first-color outer-body theme-colors)
+            alpha (some-> (re-find #"<a:alpha\b[^>]*\bval=\"(\d+)\"" (or outer-body "")) second
+                          parse-double-safe (/ 1000.0))]
+        (cond-> {:blur (some-> (xml-attr outer-open "blurRad") parse-double-safe (/ 12700.0))
+                 :distance (some-> (xml-attr outer-open "dist") parse-double-safe (/ 12700.0))
+                 :angle (some-> (xml-attr outer-open "dir") parse-double-safe (/ 60000.0))}
+          color (assoc :color color)
+          alpha (assoc :alpha alpha))))))
+
+(defn shape-glow
+  "A shape's own glow effect (<p:spPr>'s <a:effectLst><a:glow
+  rad=\"...\">...color...</a:glow></a:effectLst>), as {:radius pt :color
+  hex :alpha pct}, or nil when the shape has no glow."
+  [block theme-colors]
+  (let [effect-lst (effect-lst-body block)
+        glow-open (some->> effect-lst (re-find #"<a:glow\b[^>]*>"))
+        glow-body (some-> effect-lst
+                          (->> (re-find #"<a:glow\b[^>]*>([\s\S]*?)</a:glow>"))
+                          second)]
+    (when glow-open
+      (let [color (first-color glow-body theme-colors)
+            alpha (some-> (re-find #"<a:alpha\b[^>]*\bval=\"(\d+)\"" (or glow-body "")) second
+                          parse-double-safe (/ 1000.0))]
+        (cond-> {:radius (some-> (xml-attr glow-open "rad") parse-double-safe (/ 12700.0))}
+          color (assoc :color color)
+          alpha (assoc :alpha alpha))))))
+
+(defn shape-reflection
+  "A shape's own reflection effect (<p:spPr>'s <a:effectLst><a:reflection
+  .../></a:effectLst>, self-closing -- unlike shadow/glow, a reflection
+  mirrors the shape's OWN fill; it carries no color of its own), as {:blur
+  pt :distance pt :angle deg :start-alpha pct :end-alpha pct} (each key
+  only when its attribute is actually present), or nil when the shape has
+  no reflection at all."
+  [block]
+  (let [effect-lst (effect-lst-body block)
+        refl-tag (some->> effect-lst (re-find #"<a:reflection\b[^>]*/?>"))]
+    (when refl-tag
+      (cond-> {}
+        (xml-attr refl-tag "blurRad") (assoc :blur (some-> (xml-attr refl-tag "blurRad") parse-double-safe (/ 12700.0)))
+        (xml-attr refl-tag "dist") (assoc :distance (some-> (xml-attr refl-tag "dist") parse-double-safe (/ 12700.0)))
+        (xml-attr refl-tag "dir") (assoc :angle (some-> (xml-attr refl-tag "dir") parse-double-safe (/ 60000.0)))
+        (xml-attr refl-tag "stA") (assoc :start-alpha (some-> (xml-attr refl-tag "stA") parse-double-safe (/ 1000.0)))
+        (xml-attr refl-tag "endA") (assoc :end-alpha (some-> (xml-attr refl-tag "endA") parse-double-safe (/ 1000.0)))))))
+
+(defn- text-body [block]
+  (second (or (re-find #"<p:txBody\b[^>]*>([\s\S]*?)</p:txBody>" (or block ""))
+              (re-find #"<a:txBody\b[^>]*>([\s\S]*?)</a:txBody>" (or block "")))))
+
+(defn text-color
+  "A shape's text (run) color, scoped to its <p:txBody>/<a:txBody> only.
+  Unlike `solid-fill` on the whole shape block, this never picks up the
+  shape's own <p:spPr> fill — a non-:rect AutoShape (roundRect, oval, ...)
+  that has both a themed fill and a run without its own explicit color would
+  otherwise have its shape-fill color misattributed as its text color."
+  ([block] (text-color block nil))
+  ([block theme-colors]
+   (some-> (text-body block) (solid-fill theme-colors))))
+
+(defn xfrm
+  "Shape geometry: explicit <a:xfrm> when present, else placeholder geometry
+  inherited via opts' :placeholder-geometry index (built by
+  `placeholder-geometry-index`/`merge-placeholder-geometry-indexes` from the
+  slide's layout+master), else the historical fixed fallback."
+  ([block] (xfrm block {}))
+  ([block opts]
+   (or (xfrm-explicit block)
+       (when-let [ph (placeholder block)]
+         (let [index (:placeholder-geometry opts)
+               type (:type ph "body")]
+           (or (get index [(:idx ph) type])
+               (get index [nil type]))))
+       default-xfrm)))
+
+(defn font-size [block fallback]
+  (if-let [sz (some-> (re-find #"<a:rPr\b[^>]*>" (or block "")) (xml-attr "sz") parse-double-safe)]
+    (double (/ sz 100))
+    fallback))
+
+(defn- first-rpr [block]
+  (re-find #"<a:rPr\b[^>]*>" (or block "")))
+
+(defn bold? [block]
+  (= "1" (xml-attr (first-rpr block) "b")))
+
+(defn italic? [block]
+  (= "1" (xml-attr (first-rpr block) "i")))
+
+(defn underline? [block]
+  (let [u (xml-attr (first-rpr block) "u")]
+    (boolean (and u (not= "none" u)))))
+
+(def underline-style-map
+  "OOXML's raw `u` attribute values (besides \"sng\"/\"none\", already
+  covered by underline?'s plain boolean) mapped to friendlier keywords."
+  {"dbl" :double "heavy" :heavy "dotted" :dotted "dottedHeavy" :dotted-heavy
+   "dash" :dash "dashHeavy" :dash-heavy "dashLong" :dash-long "dashLongHeavy" :dash-long-heavy
+   "dotDash" :dot-dash "dotDashHeavy" :dot-dash-heavy "dotDotDash" :dot-dot-dash
+   "dotDotDashHeavy" :dot-dot-dash-heavy "wavy" :wavy "wavyHeavy" :wavy-heavy "wavyDbl" :wavy-double
+   "words" :words})
+
+(defn underline-style
+  "The run's specific underline style (:double/:heavy/:wavy/etc, from
+  OOXML's raw `u` attribute), when it's something OTHER than the plain
+  default single underline (\"sng\") underline?'s boolean already
+  covers. nil for \"sng\"/\"none\"/absent, so a plain underlined run's
+  round-trip output is unchanged (this key only appears alongside a
+  non-default style)."
+  [block]
+  (let [u (xml-attr (first-rpr block) "u")]
+    (when (and u (not= u "none") (not= u "sng"))
+      (get underline-style-map u (keyword u)))))
+
+(defn strikethrough? [block]
+  (let [s (xml-attr (first-rpr block) "strike")]
+    (boolean (and s (not= "noStrike" s)))))
+
+(defn baseline
+  "The run's baseline shift as a plain percentage (30.0 = 30% superscript,
+  -25.0 = 25% subscript), converted from OOXML's raw thousandths-of-a-
+  percent `baseline` attribute. nil when absent (no superscript/subscript)."
+  [block]
+  (some-> (xml-attr (first-rpr block) "baseline") parse-double-safe (/ 1000.0)))
+
+(defn- first-rpr-block
+  "The first run's full <a:rPr>...</a:rPr> (or self-closing <a:rPr/>), for
+  finding CHILD elements (like <a:hlinkClick>) that first-rpr's opening-tag-
+  only match can't see."
+  [block]
+  (or (re-find #"<a:rPr\b[^>]*>[\s\S]*?</a:rPr>" (or block ""))
+      (re-find #"<a:rPr\b[^>]*/>" (or block ""))))
+
+(defn hyperlink-rel-id [block]
+  (second (re-find #"<a:hlinkClick\b[^>]*\br:id=\"([^\"]*)\"" (or (first-rpr-block block) ""))))
+
+(defn char-spacing
+  "The run's character spacing (tracking) in points, converted from OOXML's
+  raw hundredths-of-a-point `spc` attribute. nil when absent (no explicit
+  tracking adjustment)."
+  [block]
+  (some-> (xml-attr (first-rpr block) "spc") parse-double-safe (/ 100.0)))
+
+(defn highlight-color
+  "The run's <a:highlight> color (a text-background highlight, distinct
+  from the shape's own fill/text color) -- scoped to the first run's own
+  <a:rPr>...</a:rPr> block since first-rpr's opening-tag-only match can't
+  see child elements. nil when absent (no highlight)."
+  ([block] (highlight-color block nil))
+  ([block theme-colors]
+   (when-let [hl (re-find #"<a:highlight\b[^>]*>[\s\S]*?</a:highlight>" (or (first-rpr-block block) ""))]
+     (first-color hl theme-colors))))
+
+(defn underline-color
+  "The run's <a:uFill> color -- the underline's OWN color, distinct from
+  the run's text color (<a:solidFill>), for when an underline is drawn
+  in a different color than the text itself. nil when absent (the
+  common case: the underline just uses the text's own color)."
+  ([block] (underline-color block nil))
+  ([block theme-colors]
+   (when-let [uf (re-find #"<a:uFill\b[^>]*>[\s\S]*?</a:uFill>" (or (first-rpr-block block) ""))]
+     (first-color uf theme-colors))))
+
+(defn hyperlink-url
+  "The run's hyperlink target URL, resolved through opts' :rels (the same
+  slide-relationship map chart-shape already uses for chart-rel-id) --
+  ONLY for an external hyperlink (the relationship's own TargetMode=
+  \"External\", the normal case for a web/email link). nil for an internal
+  same-deck \"jump to slide\" link (TargetMode absent -- Internal is the
+  schema default for a same-package relationship); see hyperlink-slide-part
+  for that case. Previously ungated on TargetMode at all -- an internal
+  jump-to-slide link's raw relative Target (e.g. \"slide3.xml\", resolved
+  to a package path by resolve-target) was captured here as if it were a
+  URL, silently misrepresenting it."
+  [block opts]
+  (when-let [rel-id (hyperlink-rel-id block)]
+    (let [rel (get (:rels opts) rel-id)]
+      (when (= "External" (:target-mode rel))
+        (:target-path rel)))))
+
+(defn hyperlink-slide-part
+  "A run's own internal \"jump to slide\" hyperlink, resolved through
+  opts' :rels -- the target slide's own package part path (e.g.
+  \"ppt/slides/slide3.xml\"), when the relationship's own TargetMode is
+  absent/Internal (the schema default for a same-package hyperlink).
+  Reference-metadata only, same pattern as image-part/chart-part -- the
+  raw part path, not resolved to a slide index/identity. Previously
+  entirely unhandled -- an internal jump-to-slide link always round-
+  tripped as if it were an external URL (via hyperlink-url, before its
+  own TargetMode gating existed), and on re-export got written back as
+  an invalid external relationship pointing at a bare internal filename."
+  [block opts]
+  (when-let [rel-id (hyperlink-rel-id block)]
+    (let [rel (get (:rels opts) rel-id)]
+      (when (and rel (not= "External" (:target-mode rel)))
+        (:target-path rel)))))
+
+(def ppaction-jumps
+  "PowerPoint's own built-in navigation actions
+  (ppaction://hlinkshowjump?jump=...) -- a hyperlink with NO relationship
+  at all (self-contained; unlike hyperlink-url/hyperlink-slide-part,
+  which resolve through a rel-id via opts' :rels)."
+  {"firstslide" :first-slide
+   "lastslide" :last-slide
+   "nextslide" :next-slide
+   "previousslide" :previous-slide
+   "lastslideviewed" :last-viewed-slide
+   "endshow" :end-show})
+
+(defn hyperlink-action
+  "A run's own built-in PowerPoint navigation action, from <a:hlinkClick
+  action=\"ppaction://hlinkshowjump?jump=...\"/> -- one of :first-slide/
+  :last-slide/:next-slide/:previous-slide/:last-viewed-slide/:end-show.
+  Previously entirely unhandled -- hyperlink-rel-id's own regex REQUIRES
+  r:id to be present, so an action-only hlinkClick (PowerPoint's built-in
+  Next/Previous/First/Last-slide navigation buttons, a common real-deck
+  pattern -- especially kiosk/training decks) was invisible to this
+  parser entirely, silently dropping the button's whole purpose. nil for
+  a plain hlinkClick with an r:id instead (the web-link/slide-jump-via-
+  relationship case, see hyperlink-url/hyperlink-slide-part) or no
+  hlinkClick at all."
+  [block]
+  (when-let [action (second (re-find #"<a:hlinkClick\b[^>]*\baction=\"([^\"]*)\"" (or (first-rpr-block block) "")))]
+    (get ppaction-jumps (second (re-find #"jump=(\w+)" action)))))
+
+(defn- paragraph-text
+  "A single <a:p>'s own text: its runs concatenated with no separator (they
+  are contiguous, differently-styled spans of the same line)."
+  [p-block]
+  (str/join "" (xml-texts p-block "a:t")))
+
+(defn paragraphs-text
+  "Paragraph-aware text extraction: <a:p> elements joined by newline (each is
+  its own line/bullet), while runs *within* a paragraph are concatenated
+  without a separator. Prior flattening (every <a:t> in the block joined by
+  newline) wrongly treated same-paragraph, differently-styled runs as
+  separate lines. Falls back to that flat join when no <a:p> boundary is
+  found (e.g. a bare fragment)."
+  [block]
+  (let [paragraphs (xml-elements block "a:p")]
+    (if (seq paragraphs)
+      (str/join "\n" (map paragraph-text paragraphs))
+      (str/join "\n" (xml-texts block "a:t")))))
+
+(defn- paragraph-pPr
+  "A paragraph's own <a:pPr> element (open+children+close, or self-closing),
+  or nil. algn lives as an attribute on the tag itself; bullet/line-spacing
+  live as child elements -- both need the full tag text, not just the inner
+  content, hence returning the whole match rather than a captured group."
+  [p-block]
+  (or (re-find #"<a:pPr\b[^>]*>[\s\S]*?</a:pPr>" (or p-block ""))
+      (re-find #"<a:pPr\b[^>]*/>" (or p-block ""))))
+
+(defn- paragraph-align [pPr]
+  (when pPr
+    (case (xml-attr pPr "algn")
+      "ctr" :center
+      "r" :right
+      "just" :justify
+      "l" :left
+      nil)))
+
+(defn- paragraph-bullet
+  "A paragraph's own bullet, {:type :none}/{:type :char :char \"...\"}/
+  {:type :auto-num :scheme \"...\" :start-at N}. start-at (the number an
+  <a:buAutoNum> restarts counting from, via its own startAt attribute) is
+  only present when the source XML actually sets it -- absent means
+  PowerPoint's own default of 1, same \"absent means default\" convention
+  as this package's other optional numeric fields. Previously unread --
+  a numbered list restarted (e.g. split across text boxes/slides, or
+  deliberately continued from an earlier list) always round-tripped
+  restarting from 1."
+  [pPr]
+  (when pPr
+    (cond
+      (re-find #"<a:buNone\b" pPr) {:type :none}
+      :else (or (when-let [ch (second (re-find #"<a:buChar\b[^>]*\bchar=\"([^\"]*)\"" pPr))]
+                  {:type :char :char (xml-unescape ch)})
+                (when-let [auto-num (re-find #"<a:buAutoNum\b[^>]*/?>" pPr)]
+                  (when-let [scheme (xml-attr auto-num "type")]
+                    (cond-> {:type :auto-num :scheme scheme}
+                      (some-> (xml-attr auto-num "startAt") parse-double-safe)
+                      (assoc :start-at (long (parse-double-safe (xml-attr auto-num "startAt")))))))))))
+
+(defn- paragraph-line-spacing
+  "A paragraph's line spacing as a multiplier (1.0 = single spacing), from
+  <a:lnSpc><a:spcPct val=\"150000\"/></a:lnSpc> (val is a percentage x1000).
+  <a:spcPts> (an absolute point size, not a multiplier) isn't convertible to
+  a multiplier without knowing the run's font size, so it's left unread for
+  now rather than guessed at."
+  [pPr]
+  (when pPr
+    (some-> (second (re-find #"<a:lnSpc>\s*<a:spcPct\b[^>]*\bval=\"([0-9]+)\"" pPr))
+            parse-double-safe
+            (/ 100000.0))))
+
+(defn- paragraph-level
+  "A paragraph's own outline/indent level, from <a:pPr lvl=\"N\">
+  (0-8, 0-based -- omitted on the tag means level 0, the top level).
+  Previously unread anywhere: a multi-level bulleted list (near-universal
+  in real decks -- sub-bullets under a bullet) collapsed to a single
+  visual level on round-trip, since every paragraph wrote as if it were
+  always level 0."
+  [pPr]
+  (when pPr
+    (some-> (xml-attr pPr "lvl") parse-double-safe long)))
+
+(defn- paragraph-rtl
+  "A paragraph's own right-to-left direction, from <a:pPr rtl=\"1\">, or
+  nil for the schema default (left-to-right, absent/\"0\") -- so this
+  key only appears for a genuinely RTL paragraph, and an unmodified
+  left-to-right deck's round-trip output is unchanged."
+  [pPr]
+  (when (and pPr (= "1" (xml-attr pPr "rtl")))
+    true))
+
+(defn- paragraph-margin-left
+  "A paragraph's own explicit left margin/indent, from <a:pPr marL=\"...\">
+  (EMU), in inches. PowerPoint normally derives this from the paragraph's
+  :level via the layout/master's own list-style defaults, so this is only
+  set when the SOURCE deck overrode it explicitly beyond what :level alone
+  implies -- captured verbatim rather than re-derived, since the level ->
+  default-margin mapping isn't itself modeled here."
+  [pPr]
+  (when pPr
+    (some-> (xml-attr pPr "marL") parse-double-safe (/ emu-per-inch))))
+
+(defn- paragraph-tab-stops
+  "A paragraph's own explicit tab stops, <a:pPr>'s <a:tabLst><a:tab
+  pos=\"...\" algn=\"l|ctr|r|dec\"/>...</a:tabLst>, as a vector of
+  {:position inches :align :left/:center/:right/:decimal} (align only
+  when non-default -- \"l\" IS the schema default, so it's dropped same
+  as this package's other absent-means-default fields), in document
+  order. Previously entirely unhandled -- a paragraph with explicit tab
+  stops (e.g. a numbered item's tab before an aligned value, or a
+  table-of-contents-style dot-leader layout) always round-tripped
+  losing them, falling back to the layout/master's own implicit default
+  tab stops. nil when the paragraph has no <a:tabLst> at all, the
+  overwhelming common case."
+  [pPr]
+  (when pPr
+    (when-let [tab-lst-body (second (re-find #"<a:tabLst\b[^>]*>([\s\S]*?)</a:tabLst>" pPr))]
+      (not-empty
+       (vec (for [tab-tag (re-seq #"<a:tab\b[^>]*/?>" tab-lst-body)
+                  :let [position (some-> (xml-attr tab-tag "pos") parse-double-safe (/ emu-per-inch))
+                        align (case (xml-attr tab-tag "algn") "ctr" :center "r" :right "dec" :decimal nil)]
+                  :when position]
+              (cond-> {:position position}
+                align (assoc :align align))))))))
+
+(defn paragraphs
+  "Structured per-paragraph extraction (text + alignment + bullet + line-
+  spacing), alongside (not replacing) the flattened text `paragraphs-text`
+  produces. Lets a writer reconstruct real bullets/alignment/spacing instead
+  of always emitting plain, unstyled lines -- the single biggest visible gap
+  versus a real PowerPoint-authored deck (bulleted lists are near-universal)."
+  [block]
+  (vec
+   (for [p-block (xml-elements block "a:p")
+         :let [pPr (paragraph-pPr p-block)
+               align (paragraph-align pPr)
+               bullet (paragraph-bullet pPr)
+               line-spacing (paragraph-line-spacing pPr)
+               level (paragraph-level pPr)
+               margin-left (paragraph-margin-left pPr)
+               tab-stops (paragraph-tab-stops pPr)
+               rtl (paragraph-rtl pPr)]]
+     (cond-> {:text (paragraph-text p-block)}
+       align (assoc :align align)
+       bullet (assoc :bullet bullet)
+       line-spacing (assoc :line-spacing line-spacing)
+       level (assoc :level level)
+       margin-left (assoc :margin-left margin-left)
+       tab-stops (assoc :tab-stops tab-stops)
+       rtl (assoc :rtl rtl)))))
+
+(defn- non-uniform-dimensions
+  "`ds`, a seq of inch values, kept as a vector only when they're NOT all
+  equal (rounded to 1/10000 inch to absorb EMU->inch float noise) -- the
+  cue table-column-widths/table-row-heights share to decide whether a
+  captured dimension list is worth carrying at all. nil for an empty seq
+  or one where every value is the same, the common case (this writer's
+  own historical even-division output, and the overwhelming majority of
+  real hand-authored tables)."
+  [ds]
+  (when (and (seq ds) (> (count (distinct (map #(Math/round (* % 10000.0)) ds))) 1))
+    (vec ds)))
+
+(defn table-column-widths
+  "The table's own <a:tblGrid>'s <a:gridCol w=\"...\"> widths, in inches,
+  one per column in document order. nil when the table has no <a:tblGrid>
+  at all, or when every column is the same width (this writer's own
+  historical even-division output) -- the common case, so an unmodified
+  table round-trips without carrying a redundant width list. Previously
+  never read anywhere -- an imported table with deliberately uneven
+  column widths (a common real-deck pattern: a wide 'description' column
+  beside a narrow 'amount' column) always regenerated with even
+  division, silently losing that layout."
+  [block]
+  (when-let [grid (second (re-find #"<a:tblGrid\b[^>]*>([\s\S]*?)</a:tblGrid>" (or block "")))]
+    (non-uniform-dimensions
+     (map #(/ (parse-double-safe (second %)) emu-per-inch)
+          (re-seq #"<a:gridCol\b[^>]*\bw=\"([^\"]*)\"" grid)))))
+
+(defn table-row-heights
+  "The table's own <a:tr h=\"...\"> heights, in inches, one per row in
+  document order. nil when the table has no rows, or when every row is
+  the same height (this writer's own historical even-division output).
+  Same pattern and rationale as table-column-widths, its sibling."
+  [block]
+  (non-uniform-dimensions
+   (map #(/ (parse-double-safe (second %)) emu-per-inch)
+        (re-seq #"<a:tr\b[^>]*\bh=\"([^\"]*)\"" (or block "")))))
+
+(defn table-rows
+  "The table's cell grid as rows of paragraph-aware cell text, reading <a:tr>
+  then <a:tc> in document order. Empty when the block has no rows."
+  [block]
+  (vec (for [row (xml-elements block "a:tr")]
+         (vec (map paragraphs-text (xml-elements row "a:tc"))))))
+
+(defn- table-cell-attrs [cell-block]
+  (let [tag (or (re-find #"<a:tc\b[^>]*>" (or cell-block "")) "")]
+    {:col-span (some-> (xml-attr tag "gridSpan") parse-double-safe long)
+     :row-span (some-> (xml-attr tag "rowSpan") parse-double-safe long)
+     :h-merge? (= "1" (xml-attr tag "hMerge"))
+     :v-merge? (= "1" (xml-attr tag "vMerge"))}))
+
+(defn- table-cell-fill [cell-block theme-colors]
+  (some-> (second (re-find #"<a:tcPr\b[^>]*>([\s\S]*?)</a:tcPr>" (or cell-block "")))
+          (solid-fill theme-colors)))
+
+(defn- table-cell-border-side [tcPr-block tag theme-colors]
+  (when-let [ln-body (second (re-find (re-pattern (str "<a:" tag "\\b[^>]*>([\\s\\S]*?)</a:" tag ">")) (or tcPr-block "")))]
+    (let [ln-open (or (re-find (re-pattern (str "<a:" tag "\\b[^>]*>")) tcPr-block) "")
+          width (some-> (xml-attr ln-open "w") parse-double-safe (/ 12700.0))
+          color (first-color ln-body theme-colors)
+          dash (some-> (second (re-find #"<a:prstDash\b[^>]*\bval=\"([A-Za-z]+)\"" ln-body)) keyword)]
+      (not-empty (cond-> {} width (assoc :width width) color (assoc :color color) dash (assoc :dash dash))))))
+
+(defn table-cell-borders
+  "A cell's own border sides (<a:tcPr>'s <a:lnL>/<a:lnR>/<a:lnT>/<a:lnB>,
+  plus the two diagonal sides <a:lnTlToBr>/<a:lnBlToRt> -- a corner-to-
+  corner rule some real decks use to strike out or visually split a cell),
+  each an <a:ln>-shaped element, as {:left {...} :right {...} :top {...}
+  :bottom {...} :diagonal-down {...} :diagonal-up {...}} (each side
+  {:width pt :color hex :dash keyword}, only the sub-keys actually
+  present) or nil for a cell with no border overrides at all (the
+  common case -- PowerPoint's own table-style default borders apply).
+  :dash (from <a:prstDash val=\"...\">, same set as shape/connector
+  line-dash) was previously unread here despite being read at the
+  shape level -- a dashed cell border always round-tripped as solid.
+  Previously unread anywhere -- a table with per-cell border
+  customization (e.g. a heavier top border on a header row, a
+  real-deck pattern) always round-tripped losing that override
+  entirely."
+  [cell-block theme-colors]
+  (when-let [tcPr (second (re-find #"<a:tcPr\b[^>]*>([\s\S]*?)</a:tcPr>" (or cell-block "")))]
+    (not-empty
+     (cond-> {}
+       (table-cell-border-side tcPr "lnL" theme-colors) (assoc :left (table-cell-border-side tcPr "lnL" theme-colors))
+       (table-cell-border-side tcPr "lnR" theme-colors) (assoc :right (table-cell-border-side tcPr "lnR" theme-colors))
+       (table-cell-border-side tcPr "lnT" theme-colors) (assoc :top (table-cell-border-side tcPr "lnT" theme-colors))
+       (table-cell-border-side tcPr "lnB" theme-colors) (assoc :bottom (table-cell-border-side tcPr "lnB" theme-colors))
+       (table-cell-border-side tcPr "lnTlToBr" theme-colors) (assoc :diagonal-down (table-cell-border-side tcPr "lnTlToBr" theme-colors))
+       (table-cell-border-side tcPr "lnBlToRt" theme-colors) (assoc :diagonal-up (table-cell-border-side tcPr "lnBlToRt" theme-colors))))))
+
+(def text-vertical-values
+  "<a:bodyPr>'s own vert=\"...\" values (vertical text layout -- East Asian
+  vertical writing, WordArt-style stacked text, Mongolian vertical layout),
+  each mapped to a keyword. Shared with <a:tcPr>'s own vert attribute
+  (table-cell-margins-and-anchor) -- same value set, same schema."
+  {"vert" :vert
+   "vert270" :vert270
+   "wordArtVert" :word-art-vert
+   "eaVert" :ea-vert
+   "mongolianVert" :mongolian-vert
+   "wordArtVertRtl" :word-art-vert-rtl})
+
+(defn table-cell-margins-and-anchor
+  "A cell's own <a:tcPr> margin/anchor/vert attributes (marL/marR/marT/marB
+  in EMU -> inches, anchor -> :top/:center/:bottom vertical text alignment,
+  vert -> :vertical rotated-text layout via the same text-vertical-values
+  map as <a:bodyPr>'s own vert), as {:margin-left/:margin-right/
+  :margin-top/:margin-bottom/:anchor/:vertical} with only the attributes
+  actually present -- matches on <a:tcPr>'s own OPENING tag text so a
+  SELF-CLOSING <a:tcPr .../> (a cell with margin/anchor/vert overrides but
+  no border/fill children) is captured too, unlike table-cell-borders/
+  table-cell-fill which need a paired tag's inner body and so only ever
+  see the paired form. nil for a cell with no margin/anchor/vert
+  overrides at all, the overwhelming common case (PowerPoint's own
+  default margins, top-anchored, horizontal text apply). vert was
+  previously unread anywhere -- a rotated header cell (e.g. a narrow
+  \"Qty\" column with vert270 text, a common real-deck pattern) always
+  round-tripped losing that rotation, rendering horizontal instead."
+  [cell-block]
+  (when-let [tcpr-open (re-find #"<a:tcPr\b[^>]*>" (or cell-block ""))]
+    (let [margin (fn [attr] (some-> (xml-attr tcpr-open attr) parse-double-safe (/ emu-per-inch)))
+          anchor (case (xml-attr tcpr-open "anchor") "t" :top "ctr" :center "b" :bottom nil)
+          vertical (get text-vertical-values (xml-attr tcpr-open "vert"))]
+      (not-empty
+       (cond-> {}
+         (margin "marL") (assoc :margin-left (margin "marL"))
+         (margin "marR") (assoc :margin-right (margin "marR"))
+         (margin "marT") (assoc :margin-top (margin "marT"))
+         (margin "marB") (assoc :margin-bottom (margin "marB"))
+         anchor (assoc :anchor anchor)
+         vertical (assoc :vertical vertical))))))
+
+(defn table-cells
+  "The table's cell grid, one entry per <a:tc> in document order, each
+  either:
+  - a plain string (the common case: no merge, no per-cell fill/borders)
+  - {:text ... :col-span N :row-span N :fill \"hex\" :borders {...}
+    :margin-left/:margin-right/:margin-top/:margin-bottom in :anchor
+    :top/:center/:bottom} for the ANCHOR cell of a merge and/or a cell
+    with its own background fill/border/margin/anchor override
+  - :h-merge/:v-merge/:hv-merge for a grid position covered by a preceding
+    cell's merge (OOXML still emits a <a:tc> there, hMerge=\"1\"/
+    vMerge=\"1\"/both, but it carries no content of its own).
+  Previously table-rows collapsed EVERY cell to its flattened paragraph
+  text regardless of merge/style -- a merged header row (a very common
+  real-deck pattern) silently duplicated its text into cells that should
+  have been empty merge continuations, and any per-cell background color,
+  border, margin, or vertical-anchor override was dropped entirely."
+  ([block] (table-cells block nil))
+  ([block theme-colors]
+   (vec (for [row (xml-elements block "a:tr")]
+          (vec (for [cell (xml-elements row "a:tc")]
+                 (let [{:keys [col-span row-span h-merge? v-merge?]} (table-cell-attrs cell)]
+                   (cond
+                     (and h-merge? v-merge?) :hv-merge
+                     h-merge? :h-merge
+                     v-merge? :v-merge
+                     :else
+                     (let [text (paragraphs-text cell)
+                           fill (table-cell-fill cell theme-colors)
+                           borders (table-cell-borders cell theme-colors)
+                           margins-anchor (table-cell-margins-and-anchor cell)
+                           span? (or (and col-span (> col-span 1)) (and row-span (> row-span 1)))]
+                       (if (or span? fill borders margins-anchor)
+                         (cond-> (merge {:text text} margins-anchor)
+                           (and col-span (> col-span 1)) (assoc :col-span col-span)
+                           (and row-span (> row-span 1)) (assoc :row-span row-span)
+                           fill (assoc :fill fill)
+                           borders (assoc :borders borders))
+                         text))))))))))
+
+(defn table-non-uniform?
+  "True when table-cells' grid has any merge/span/per-cell-fill cell -- the
+  cue a caller (table-shape) uses to decide whether the richer :cells grid
+  is worth carrying alongside the always-present flat :rows text grid."
+  [cells]
+  (boolean (some (fn [row] (some #(or (map? %) (keyword? %)) row)) cells)))
+
+(defn geometry [block]
+  (some-> (re-find #"<a:prstGeom\b[^>]*>" (or block ""))
+          (xml-attr "prst")
+          keyword))
+
+(defn- path-command-from-node
+  "One drawing command node (:a/moveTo/:a/lnTo/:a/cubicBezTo/:a/quadBezTo/
+  :a/arcTo/:a/close, as parsed by xml.parse) into the same {:cmd ...} shape
+  this package has always produced. moveTo/lnTo/cubicBezTo/quadBezTo carry
+  their <a:pt> points verbatim; arcTo carries its own wR/hR/stAng/swAng
+  attributes; close carries nothing."
+  [node]
+  (let [cmd-name (name (xp/el-tag node))]
+    (case cmd-name
+      "close" {:cmd :close}
+      "arcTo" {:cmd :arcTo
+               :w-radius (some-> (xp/el-attr node "wR") parse-double-safe)
+               :h-radius (some-> (xp/el-attr node "hR") parse-double-safe)
+               :start-angle (some-> (xp/el-attr node "stAng") parse-double-safe)
+               :swing-angle (some-> (xp/el-attr node "swAng") parse-double-safe)}
+      {:cmd (keyword cmd-name)
+       :pts (vec (for [pt (xp/el-elements node)
+                       :when (= "pt" (name (xp/el-tag pt)))]
+                   {:x (some-> (xp/el-attr pt "x") parse-double-safe)
+                    :y (some-> (xp/el-attr pt "y") parse-double-safe)}))})))
+
+(defn custom-geometry
+  "A shape's own <a:custGeom> path data (mutually exclusive with
+  <a:prstGeom> in OOXML -- a shape has one or the other), as a vector of
+  {:width N :height N :fill-rule \"...\" :commands [...]} maps (one per
+  <a:path> -- a compound geometry, e.g. a shape with a hole, can have more
+  than one). Raw coordinates stay in the path's own local unit space (NOT
+  EMU/inches) and are preserved verbatim rather than reinterpreted --
+  faithfully round-tripping the exact source path beats attempting to
+  render/re-derive it, which this package has no vector rasterizer for
+  anyway. nil when the shape has no <a:custGeom> at all (the overwhelming
+  common case -- prstGeom presets). Previously entirely unhandled: a
+  custom-path shape had NO geometry captured at all and, since rect-shape's
+  own gate required a recognized preset, was silently dropped on import.
+
+  Parses the isolated <a:custGeom> substring through xml.parse instead of
+  regex-scanning its command structure directly -- the old regex needed a
+  single alternation pattern to handle moveTo/lnTo/cubicBezTo/quadBezTo
+  (paired tags with <a:pt> children) and arcTo/close (self-closing, plain
+  attributes) uniformly; walking the parsed tree needs no such special
+  casing at all."
+  [block]
+  (when-let [cust-xml (re-find #"<a:custGeom\b[^>]*>[\s\S]*?</a:custGeom>" (or block ""))]
+    (let [cust-tree (xp/parse cust-xml)
+          paths (xp/find-all cust-tree :a/path)]
+      (not-empty
+       (vec (for [path paths]
+              (cond-> {:width (some-> (xp/el-attr path "w") parse-double-safe)
+                       :height (some-> (xp/el-attr path "h") parse-double-safe)
+                       :commands (mapv path-command-from-node (xp/el-elements path))}
+                (xp/el-attr path "fill") (assoc :fill-rule (xp/el-attr path "fill")))))))))
+
+(defn shape-adjustments
+  "A shape's own <a:prstGeom>'s adjustment handle values (<a:avLst><a:gd
+  name=\"...\" fmla=\"...\"/>...</a:avLst>), as a vector of {:name ... :fmla
+  ...} maps (raw fmla string preserved verbatim rather than interpreted --
+  formulas vary in structure by shape type, and round-tripping the exact
+  source text is always faithful where reinterpreting it might not be), or
+  nil for an empty/absent <a:avLst> (the common case for most shapes).
+  Previously unread anywhere -- a shape with a customized adjustment (e.g.
+  a roundRect with a non-default corner radius, a custom arrowhead ratio)
+  always round-tripped to the geometry's DEFAULT adjustment instead of the
+  source's actual one."
+  [block]
+  (when-let [geom-xml (re-find #"<a:prstGeom\b[^>]*>[\s\S]*?</a:prstGeom>" (or block ""))]
+    (let [gds (xp/find-all (xp/parse geom-xml) :a/gd)]
+      (not-empty
+       (vec (for [gd gds
+                  :let [gd-name (xp/el-attr gd "name") fmla (xp/el-attr gd "fmla")]
+                  :when (and gd-name fmla)]
+              {:name gd-name :fmla fmla}))))))
+
+(defn text-body-props
+  "A shape's own <a:bodyPr> (word-wrap, vertical anchor, internal margins,
+  autofit, vertical text direction) -- previously entirely unread. <a:bodyPr
+  wrap=\"square\"> was ALWAYS hardcoded on write regardless of source,
+  silently discarding wrap=\"none\" (no-wrap text boxes), any non-default
+  vertical anchor (PowerPoint's own vertical-center/-bottom text
+  alignment), custom internal margins, shrink-to-fit/resize-shape-to-fit
+  autofit, and vertical text layout (vert=\"vert\"/\"vert270\"/
+  \"wordArtVert\"/... -- East Asian vertical writing or WordArt-style
+  stacked text) -- all common in real hand-authored decks. Only
+  non-default values are captured (same \"absent means default\"
+  convention as align/bullet/line-spacing elsewhere in this file), so a
+  plain shape round-trips unchanged. nil for a shape with no <a:bodyPr>
+  at all."
+  [block]
+  (when-let [tag-xml (or (re-find #"<a:bodyPr\b[^>]*>[\s\S]*?</a:bodyPr>" (or block ""))
+                         (re-find #"<a:bodyPr\b[^>]*/>" (or block "")))]
+    (let [tag (xp/parse tag-xml)
+          autofit (cond
+                    (seq (xp/find-all tag :a/spAutoFit)) :resize-shape
+                    (seq (xp/find-all tag :a/noAutofit)) :none
+                    (seq (xp/find-all tag :a/normAutofit)) :shrink
+                    :else nil)
+          norm-autofit (when (= autofit :shrink) (first (xp/find-all tag :a/normAutofit)))]
+      (not-empty
+       (cond-> {}
+         (= "none" (xp/el-attr tag "wrap")) (assoc :wrap :none)
+         (= "ctr" (xp/el-attr tag "anchor")) (assoc :anchor :center)
+         (= "b" (xp/el-attr tag "anchor")) (assoc :anchor :bottom)
+         (= "1" (xp/el-attr tag "anchorCtr")) (assoc :anchor-center true)
+         (xp/el-attr tag "lIns") (assoc :margin-left (some-> (xp/el-attr tag "lIns") parse-double-safe (/ emu-per-inch)))
+         (xp/el-attr tag "tIns") (assoc :margin-top (some-> (xp/el-attr tag "tIns") parse-double-safe (/ emu-per-inch)))
+         (xp/el-attr tag "rIns") (assoc :margin-right (some-> (xp/el-attr tag "rIns") parse-double-safe (/ emu-per-inch)))
+         (xp/el-attr tag "bIns") (assoc :margin-bottom (some-> (xp/el-attr tag "bIns") parse-double-safe (/ emu-per-inch)))
+         autofit (assoc :autofit autofit)
+         (xp/el-attr norm-autofit "fontScale")
+         (assoc :font-scale (some-> (xp/el-attr norm-autofit "fontScale") parse-double-safe (/ 1000.0)))
+         (xp/el-attr norm-autofit "lnSpcReduction")
+         (assoc :line-spacing-reduction (some-> (xp/el-attr norm-autofit "lnSpcReduction") parse-double-safe (/ 1000.0)))
+         (get text-vertical-values (xp/el-attr tag "vert"))
+         (assoc :vertical (get text-vertical-values (xp/el-attr tag "vert"))))))))
+
+(defn shape-locks
+  "A text/rect shape's own <p:cNvSpPr><a:spLocks .../> flags (noGrp/noRot/
+  noChangeAspect/noMove/noResize/noSelect, each present in the source XML
+  as attr=\"1\"), as {:no-grp? true ...} with only the flags actually set
+  present. Same pattern as picture-locks, sibling element. Previously
+  never read anywhere -- the writer unconditionally hardcodes noGrp=\"1\"
+  regardless of the source shape's actual lock state, so a shape the
+  source deck left ungrouped-lockable always exports group-locked. nil
+  when the shape has no lock flags at all."
+  [block]
+  (when-let [locks-tag (re-find #"<a:spLocks\b[^>]*/?>" (or block ""))]
+    (not-empty
+     (cond-> {}
+       (= "1" (xml-attr locks-tag "noGrp")) (assoc :no-grp? true)
+       (= "1" (xml-attr locks-tag "noRot")) (assoc :no-rot? true)
+       (= "1" (xml-attr locks-tag "noChangeAspect")) (assoc :no-change-aspect? true)
+       (= "1" (xml-attr locks-tag "noMove")) (assoc :no-move? true)
+       (= "1" (xml-attr locks-tag "noResize")) (assoc :no-resize? true)
+       (= "1" (xml-attr locks-tag "noSelect")) (assoc :no-select? true)))))
+
+(defn text-shape
+  "A shape with a text label. When it also has a non-default geometry
+  (roundRect, oval, ...) and/or its own fill/line, those are carried too
+  (:drawingml/geometry/:drawingml/fill/:drawingml/line) instead of being
+  silently dropped -- previously only :rect-geometry, TEXT-LESS shapes
+  (rect-shape) preserved fill/line at all, so any styled AutoShape that also
+  had a label (a very common combination -- a callout box, a colored
+  process-diagram step) lost its box entirely on export, leaving only bare
+  text floating at the same position."
+  ([idx block] (text-shape idx block {}))
+  ([idx block opts]
+   (let [texts (vec (xml-texts block "a:t"))
+         text (paragraphs-text block)
+         paras (paragraphs block)
+         geom (geometry block)
+         fill (solid-fill block (:theme-colors opts))
+         line (line-fill block (:theme-colors opts))]
+     (when-not (str/blank? text)
+       (cond-> (add-placeholder
+                (merge {:drawingml/id (shape-name block idx "text")
+                        :drawingml/kind :text
+                        :drawingml/text text
+                        :drawingml/font-size (font-size block 20)
+                        :drawingml/color (or (text-color block (:theme-colors opts)) "17202A")}
+                       (xfrm block opts))
+                block)
+         (> (count texts) 1) (assoc :drawingml/source-kind :drawingml/text-runs)
+         (seq paras) (assoc :drawingml/paragraphs paras)
+         (and geom (not= :rect geom)) (assoc :drawingml/geometry geom)
+         fill (assoc :drawingml/fill fill)
+         line (assoc :drawingml/line line)
+         (bold? block) (assoc :drawingml/bold true)
+         (italic? block) (assoc :drawingml/italic true)
+         (underline? block) (assoc :drawingml/underline true)
+         (underline-style block) (assoc :drawingml/underline-style (underline-style block))
+         (underline-color block (:theme-colors opts)) (assoc :drawingml/underline-color (underline-color block (:theme-colors opts)))
+         (strikethrough? block) (assoc :drawingml/strikethrough true)
+         (baseline block) (assoc :drawingml/baseline (baseline block))
+         (char-spacing block) (assoc :drawingml/char-spacing (char-spacing block))
+         (highlight-color block (:theme-colors opts)) (assoc :drawingml/highlight (highlight-color block (:theme-colors opts)))
+         (hyperlink-url block opts) (assoc :drawingml/hyperlink (hyperlink-url block opts))
+         (hyperlink-slide-part block opts) (assoc :drawingml/hyperlink-slide-part (hyperlink-slide-part block opts))
+         (hyperlink-action block) (assoc :drawingml/hyperlink-action (hyperlink-action block))
+         (line-dash block) (assoc :drawingml/line-dash (line-dash block))
+         (line-width block) (assoc :drawingml/line-width (line-width block))
+         (line-cap block) (assoc :drawingml/line-cap (line-cap block))
+         (line-join block) (assoc :drawingml/line-join (line-join block))
+         (blip-fill-rel-id block) (assoc :drawingml/fill-image-rel-id (blip-fill-rel-id block))
+         (blip-fill-part block opts) (assoc :drawingml/fill-image-part (blip-fill-part block opts))
+         (picture-crop block) (assoc :drawingml/crop (picture-crop block))
+         (picture-recolor block) (assoc :drawingml/recolor (picture-recolor block))
+         (shape-adjustments block) (assoc :drawingml/adjustments (shape-adjustments block))
+         (shape-shadow block (:theme-colors opts)) (assoc :drawingml/shadow (shape-shadow block (:theme-colors opts)))
+         (shape-glow block (:theme-colors opts)) (assoc :drawingml/glow (shape-glow block (:theme-colors opts)))
+         (shape-reflection block) (assoc :drawingml/reflection (shape-reflection block))
+         (custom-geometry block) (assoc :drawingml/custom-geometry (custom-geometry block))
+         (text-body-props block) (assoc :drawingml/body-props (text-body-props block))
+         (gradient-fill block (:theme-colors opts)) (assoc :drawingml/gradient (gradient-fill block (:theme-colors opts)))
+         (shape-hidden? block) (assoc :drawingml/hidden true)
+         (shape-locks block) (assoc :drawingml/locks (shape-locks block)))))))
+
+(defn rect-shape
+  "A styled AutoShape with NO text label. Matches any recognized
+  <a:prstGeom> (rect, roundRect, ellipse, arrows, stars, ...) OR a custom-
+  path <a:custGeom> (:drawingml/geometry :custom, its raw path data in
+  :drawingml/custom-geometry) -- previously a custGeom shape (mutually
+  exclusive with prstGeom, so this gate alone required a recognized preset)
+  was silently dropped entirely on import. The actual preset is carried as
+  :drawingml/geometry so a writer can reproduce the real outline instead of
+  always drawing a plain rectangle."
+  ([idx block] (rect-shape idx block {}))
+  ([idx block opts]
+   (let [geom (geometry block)
+         custom (custom-geometry block)]
+     (when (or geom custom)
+       (cond-> (add-placeholder
+                (merge {:drawingml/id (shape-name block idx "rect")
+                        :drawingml/kind :rect
+                        :drawingml/geometry (or geom :custom)
+                        :drawingml/fill (or (solid-fill block (:theme-colors opts)) "EAF0F8")}
+                       (xfrm block opts))
+                block)
+         (line-fill block (:theme-colors opts)) (assoc :drawingml/line (line-fill block (:theme-colors opts)))
+         (line-dash block) (assoc :drawingml/line-dash (line-dash block))
+         (line-width block) (assoc :drawingml/line-width (line-width block))
+         (line-cap block) (assoc :drawingml/line-cap (line-cap block))
+         (line-join block) (assoc :drawingml/line-join (line-join block))
+         (blip-fill-rel-id block) (assoc :drawingml/fill-image-rel-id (blip-fill-rel-id block))
+         (blip-fill-part block opts) (assoc :drawingml/fill-image-part (blip-fill-part block opts))
+         (picture-crop block) (assoc :drawingml/crop (picture-crop block))
+         (picture-recolor block) (assoc :drawingml/recolor (picture-recolor block))
+         (shape-adjustments block) (assoc :drawingml/adjustments (shape-adjustments block))
+         (shape-shadow block (:theme-colors opts)) (assoc :drawingml/shadow (shape-shadow block (:theme-colors opts)))
+         (shape-glow block (:theme-colors opts)) (assoc :drawingml/glow (shape-glow block (:theme-colors opts)))
+         (shape-reflection block) (assoc :drawingml/reflection (shape-reflection block))
+         custom (assoc :drawingml/custom-geometry custom)
+         (gradient-fill block (:theme-colors opts)) (assoc :drawingml/gradient (gradient-fill block (:theme-colors opts)))
+         (shape-hidden? block) (assoc :drawingml/hidden true)
+         (shape-locks block) (assoc :drawingml/locks (shape-locks block)))))))
+
+(defn pic-blip-rel-id
+  "A <p:pic>'s own image, <a:blipFill><a:blip r:embed=\"...\"/>. Previously
+  unread anywhere -- a picture shape only ever carried its position/size,
+  with zero reference back to which actual image part it was, even though
+  the reference itself (not the raw bytes) is cheap to capture and
+  sufficient for an update-path patch to preserve or re-target it."
+  [block]
+  (some-> (re-find #"<a:blip\b[^>]*\br:embed=\"([^\"]*)\"" (or block "")) second))
+
+(defn pic-video-rel-id
+  "A <p:pic>'s linked video, <p:nvPr><a:videoFile r:link=\"...\"/>.
+  Previously unread anywhere -- video media was entirely unhandled."
+  [block]
+  (some-> (re-find #"<a:videoFile\b[^>]*\br:link=\"([^\"]*)\"" (or block "")) second))
+
+(defn pic-audio-rel-id
+  "A <p:pic>'s linked audio, <p:nvPr><a:audioFile r:link=\"...\"/>.
+  Previously unread anywhere -- audio media was entirely unhandled."
+  [block]
+  (some-> (re-find #"<a:audioFile\b[^>]*\br:link=\"([^\"]*)\"" (or block "")) second))
+
+(defn picture-locks
+  "A picture's own <p:cNvPicPr><a:picLocks .../> flags (noChangeAspect/
+  noMove/noResize/noRot, each present in the source XML as attr=\"1\"), as
+  {:no-change-aspect? true ...} with only the flags actually set present.
+  Previously never read anywhere -- the writer unconditionally hardcodes
+  noChangeAspect=\"1\" regardless of the source picture's actual lock
+  state, so an UNLOCKED picture in the source always exports locked. nil
+  when the picture has no lock flags at all."
+  [block]
+  (when-let [locks-tag (re-find #"<a:picLocks\b[^>]*/?>" (or block ""))]
+    (not-empty
+     (cond-> {}
+       (= "1" (xml-attr locks-tag "noChangeAspect")) (assoc :no-change-aspect? true)
+       (= "1" (xml-attr locks-tag "noMove")) (assoc :no-move? true)
+       (= "1" (xml-attr locks-tag "noResize")) (assoc :no-resize? true)
+       (= "1" (xml-attr locks-tag "noRot")) (assoc :no-rot? true)))))
+
+(defn pic-shape
+  ([idx block] (pic-shape idx block {}))
+  ([idx block opts]
+   (let [blip-rel (pic-blip-rel-id block)
+         video-rel (pic-video-rel-id block)
+         audio-rel (pic-audio-rel-id block)]
+     (cond-> (merge {:drawingml/id (shape-name block idx "pic")
+                     :drawingml/kind :pic
+                     :drawingml/text (shape-name block idx "Picture")
+                     :drawingml/source-kind :drawingml/pic
+                     :drawingml/font-size 12
+                     :drawingml/color "334155"}
+                    (xfrm block opts))
+       blip-rel (assoc :drawingml/image-rel-id blip-rel)
+       (:target-path (get (:rels opts) blip-rel)) (assoc :drawingml/image-part (:target-path (get (:rels opts) blip-rel)))
+       video-rel (assoc :drawingml/video-rel-id video-rel)
+       (:target-path (get (:rels opts) video-rel)) (assoc :drawingml/video-part (:target-path (get (:rels opts) video-rel)))
+       audio-rel (assoc :drawingml/audio-rel-id audio-rel)
+       (:target-path (get (:rels opts) audio-rel)) (assoc :drawingml/audio-part (:target-path (get (:rels opts) audio-rel)))
+       (picture-crop block) (assoc :drawingml/crop (picture-crop block))
+       (picture-recolor block) (assoc :drawingml/recolor (picture-recolor block))
+       (picture-locks block) (assoc :drawingml/locks (picture-locks block))
+       (shape-hidden? block) (assoc :drawingml/hidden true)))))
+
+(defn table-style-flags
+  "A table's own <a:tblPr> style flags (firstRow/lastRow/firstCol/
+  lastCol/bandRow/bandCol, each present in the source XML as
+  attr=\"1\"), as {:first-row? true ...} with only the flags actually
+  set present. nil when NONE are set at all (an unstyled table, or one
+  whose table style itself carries all emphasis with no per-flag
+  override). Previously entirely unhandled -- table-shape's writer
+  UNCONDITIONALLY hardcoded firstRow+bandRow regardless of the source
+  table's own flags, so ANY imported table (e.g. one banding COLUMNS
+  instead of rows, or with no header-row emphasis at all) silently had
+  its actual style flags overwritten on export."
+  [block]
+  (when-let [tblpr (re-find #"<a:tblPr\b[^>]*>" (or block ""))]
+    (not-empty
+     (cond-> {}
+       (= "1" (xml-attr tblpr "firstRow")) (assoc :first-row? true)
+       (= "1" (xml-attr tblpr "lastRow")) (assoc :last-row? true)
+       (= "1" (xml-attr tblpr "firstCol")) (assoc :first-col? true)
+       (= "1" (xml-attr tblpr "lastCol")) (assoc :last-col? true)
+       (= "1" (xml-attr tblpr "bandRow")) (assoc :band-row? true)
+       (= "1" (xml-attr tblpr "bandCol")) (assoc :band-col? true)))))
+
+(defn graphic-frame-locks
+  "A table/chart's own <p:cNvGraphicFramePr><a:graphicFrameLocks .../>
+  flags (noGrp/noDrilldown/noSelect/noChangeAspect/noMove/noResize, each
+  present in the source XML as attr=\"1\"), as {:no-grp? true ...} with
+  only the flags actually set present. Same pattern as shape-locks/
+  picture-locks, sibling element on a <p:graphicFrame> instead of a
+  <p:sp>/<p:pic>. Previously never read anywhere -- the writer
+  unconditionally hardcodes noGrp=\"1\" regardless of the source table/
+  chart's actual lock state. nil when there are no lock flags at all."
+  [block]
+  (when-let [locks-tag (re-find #"<a:graphicFrameLocks\b[^>]*/?>" (or block ""))]
+    (not-empty
+     (cond-> {}
+       (= "1" (xml-attr locks-tag "noGrp")) (assoc :no-grp? true)
+       (= "1" (xml-attr locks-tag "noDrilldown")) (assoc :no-drilldown? true)
+       (= "1" (xml-attr locks-tag "noSelect")) (assoc :no-select? true)
+       (= "1" (xml-attr locks-tag "noChangeAspect")) (assoc :no-change-aspect? true)
+       (= "1" (xml-attr locks-tag "noMove")) (assoc :no-move? true)
+       (= "1" (xml-attr locks-tag "noResize")) (assoc :no-resize? true)))))
+
+(defn table-shape
+  ([idx block] (table-shape idx block {}))
+  ([idx block opts]
+   (let [texts (vec (xml-texts block "a:t"))
+         rows (table-rows block)
+         cells (table-cells block (:theme-colors opts))]
+     (when (seq texts)
+       (cond-> (merge {:drawingml/id (shape-name block idx "table")
+                       :drawingml/kind :table
+                       :drawingml/text (if (seq rows)
+                                         (str/join "\n" (mapcat identity rows))
+                                         (str/join "\n" texts))
+                       :drawingml/source-kind :drawingml/table
+                       :drawingml/font-size 14
+                       :drawingml/color "17202A"}
+                      (xfrm block opts))
+         (seq rows) (assoc :drawingml/rows rows)
+         (table-non-uniform? cells) (assoc :drawingml/cells cells)
+         (table-style-flags block) (assoc :drawingml/table-style-flags (table-style-flags block))
+         (table-column-widths block) (assoc :drawingml/column-widths (table-column-widths block))
+         (table-row-heights block) (assoc :drawingml/row-heights (table-row-heights block))
+         (graphic-frame-locks block) (assoc :drawingml/locks (graphic-frame-locks block))
+         (shape-hidden? block) (assoc :drawingml/hidden true))))))
+
+(defn chart-shape
+  ([idx block] (chart-shape idx block {}))
+  ([idx block opts]
+   (when-let [chart (re-find #"<c:chart\b[^>]*/?>" (or block ""))]
+     (let [rel-id (xml-attr chart "r:id")
+           rel (get (:rels opts) rel-id)]
+       (cond-> (merge {:drawingml/id (shape-name block idx "chart")
+                       :drawingml/kind :chart
+                       :drawingml/text (shape-name block idx "Chart")
+                       :drawingml/source-kind :drawingml/chart
+                       :drawingml/font-size 12
+                       :drawingml/color "334155"}
+                      (xfrm block opts))
+         rel-id (assoc :drawingml/chart-rel-id rel-id)
+         (:target-path rel) (assoc :drawingml/chart-part (:target-path rel))
+         (:workbook-path rel) (assoc :drawingml/workbook-part (:workbook-path rel))
+         (graphic-frame-locks block) (assoc :drawingml/locks (graphic-frame-locks block))
+         (shape-hidden? block) (assoc :drawingml/hidden true))))))
+
+(defn graphic-frame-shape
+  ([idx block] (graphic-frame-shape idx block {}))
+  ([idx block opts]
+   (or (table-shape idx block opts)
+       (chart-shape idx block opts))))
+
+(defn fallback-text-shapes [texts]
+  (vec
+   (map-indexed
+    (fn [idx text]
+      {:drawingml/id (str "text-" (inc idx))
+       :drawingml/kind :text
+       :drawingml/text text
+       :drawingml/x 0.8
+       :drawingml/y (+ 0.75 (* idx 0.72))
+       :drawingml/w 8.4
+       :drawingml/h 0.6
+       :drawingml/font-size (if (zero? idx) 30 20)
+       :drawingml/color (if (zero? idx) "17202A" "334155")})
+    texts)))
+
+(defn- connector-endpoint
+  "One connector endpoint, <a:stCxn>/<a:endCxn id=\"...\" idx=\"...\"/>
+  inside <p:cNvCxnSpPr> -- id is the OTHER shape's own shape id (the
+  <p:cNvPr id=\"...\"> this connector snaps to), idx is which of that
+  shape's connection sites (0, 1, 2...) it's attached to. nil when this
+  end of the connector isn't attached to anything (a free-floating
+  endpoint, positioned purely by its own xfrm)."
+  [block tag]
+  (when-let [tag-str (re-find (re-pattern (str "<a:" tag "\\b[^>]*/?>")) (or block ""))]
+    (when-let [shape-id (xml-attr tag-str "id")]
+      (cond-> {:shape-id (long (parse-double-safe shape-id))}
+        (xml-attr tag-str "idx") (assoc :idx (long (parse-double-safe (xml-attr tag-str "idx"))))))))
+
+(defn connector-connections
+  "A connector's own shape-to-shape attachments, {:start {...} :end
+  {...}} (each {:shape-id N :idx N}, only the ends actually attached).
+  Previously entirely unhandled -- a connector attached to two shapes
+  (the overwhelmingly common real-deck case; flowcharts/diagrams routinely
+  rely on this so the connector follows a shape when it's moved) always
+  round-tripped as a free-floating line with no attachment info at all.
+  nil when NEITHER end is attached."
+  [block]
+  (not-empty
+   (cond-> {}
+     (connector-endpoint block "stCxn") (assoc :start (connector-endpoint block "stCxn"))
+     (connector-endpoint block "endCxn") (assoc :end (connector-endpoint block "endCxn")))))
+
+(defn connector-shape
+  "A <p:cxnSp> connector line/arrow between shapes. Previously totally
+  unhandled (zero references anywhere in this package) -- connectors are
+  common in flowcharts/diagrams and were silently vanishing on import."
+  ([idx block] (connector-shape idx block {}))
+  ([idx block opts]
+   (cond-> (merge {:drawingml/id (shape-name block idx "connector")
+                   :drawingml/kind :connector
+                   :drawingml/geometry (or (geometry block) :straightConnector1)
+                   :drawingml/line (or (line-fill block (:theme-colors opts)) "334155")}
+                  (xfrm block opts))
+     (line-dash block) (assoc :drawingml/line-dash (line-dash block))
+     (line-width block) (assoc :drawingml/line-width (line-width block))
+     (line-cap block) (assoc :drawingml/line-cap (line-cap block))
+     (line-join block) (assoc :drawingml/line-join (line-join block))
+     (shape-adjustments block) (assoc :drawingml/adjustments (shape-adjustments block))
+     (connector-connections block) (assoc :drawingml/connections (connector-connections block))
+     (shape-hidden? block) (assoc :drawingml/hidden true))))
+
+(defn shapes
+  ([xml] (shapes xml {}))
+  ([xml opts]
+  (let [groups (nested-group-nodes xml)
+        shape-blocks (vec (xml-elements xml "p:sp"))
+        graphic-frame-blocks (vec (xml-elements xml "p:graphicFrame"))
+        table-blocks (vec (xml-elements xml "a:tbl"))
+        parsed-shapes (vec (keep-indexed (fn [shape-idx block]
+                                           (some-> (or (text-shape shape-idx block opts)
+                                                       (rect-shape shape-idx block opts))
+                                                   (apply-group-info groups block)
+                                                   (with-source opts :p/sp shape-idx)))
+                                         shape-blocks))
+        pics (vec (map-indexed (fn [idx block]
+                                  (-> (pic-shape idx block opts)
+                                      (apply-group-info groups block)
+                                      (with-source opts :p/pic idx)))
+                                (xml-elements xml "p:pic")))
+        connectors (vec (map-indexed (fn [idx block]
+                                        (-> (connector-shape idx block opts)
+                                            (apply-group-info groups block)
+                                            (with-source opts :p/cxnSp idx)))
+                                      (xml-elements xml "p:cxnSp")))
+        graphic-frames (vec (keep-indexed (fn [idx block]
+                                             (some-> (graphic-frame-shape idx block opts)
+                                                     (apply-group-info groups block)
+                                                     (with-source opts :p/graphicFrame idx)))
+                                           graphic-frame-blocks))
+        standalone-tables (vec (keep-indexed
+                                (fn [idx block]
+                                  (when-not (some #(str/includes? % block) graphic-frame-blocks)
+                                    (some-> (table-shape idx block opts)
+                                            (with-source opts :a/tbl idx))))
+                                table-blocks))
+        parsed (vec (concat parsed-shapes pics connectors graphic-frames standalone-tables))]
+    (if (seq parsed)
+      parsed
+      (let [texts (vec (xml-texts xml "a:t"))]
+        (if (seq texts)
+          (vec (map-indexed (fn [idx shape]
+                              (with-source shape opts :fallback/text idx))
+                            (fallback-text-shapes texts)))
+          []))))))
+
+(defn valid-shape? [shape]
+  (and (map? shape)
+       (contains? #{:text :rect :pic :table :chart :connector} (:drawingml/kind shape))
+       (string? (:drawingml/id shape))))

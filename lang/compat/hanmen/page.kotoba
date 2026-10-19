@@ -1,0 +1,410 @@
+(ns hanmen.page
+  "版面 — one page, as placed marks in a coordinate space anybody can draw.
+
+  ## What this is for
+
+  `org-iso-pdf` answers what is *in* a document: the object graph, the page
+  tree, the strings shown between `BT`/`ET`. It does not answer where any of
+  it is, and a viewer is entirely a question of where. `pdf.core/extract-text`
+  returns a vector of strings in content-stream order — enough to search,
+  nothing to look at.
+
+  So this namespace is the value in between: a page is a size, a rotation and
+  a vector of **placed** items. Nothing here parses a format and nothing here
+  draws; `hanmen.pdf` fills it and `hanmen.svg` draws it, and a second
+  producer (an image, a `kasane` document, a Drive workbook) is a second
+  producer rather than a second viewer.
+
+  ## The coordinate space is the reader's, not the format's
+
+  PDF user space has its origin at the bottom-left and y increasing upward.
+  SVG, Canvas, CoreGraphics-in-UIKit and every raster buffer put it at the
+  top-left with y increasing downward. One of those has to be the space this
+  value is in, and it is the reader's: `[0 0]` is the top-left corner of the
+  page as displayed, x grows right, y grows down, and the unit is the page's
+  own (a PDF point, 1/72 inch).
+
+  Doing the flip here rather than in each drawer is the whole point. A viewer
+  that flips is a viewer that can flip twice, and a page drawn upside-down is
+  a bug that only a human eye catches.
+
+  ## Rotation is applied, not reported
+
+  `/Rotate 90` on a page means the reader sees it turned. `app-preview.model`
+  already learned that reporting the unrotated box lays out every thumbnail
+  grid wrongly, so `:page/width` and `:page/height` here are the size **as
+  seen**, and the marks inside are already turned to match. A consumer that
+  wanted the unrotated box would have to un-rotate, which nothing wants.
+
+  Everything here is pure and portable: no store, no clock, no host."
+  (:require [clojure.string :as str]))
+
+(def schema "kotoba-lang.hanmen.page.v1")
+
+(def item-kinds
+  "What a page can contain, and what each one means.
+
+  A closed set. A drawer switches on this key exhaustively, so a kind added
+  here without a case there is a mark that silently disappears — which is why
+  `hanmen.svg/emit-item` throws on an unknown kind rather than skipping it.
+
+  `:image` is a region whose pixels exist and are NOT in this value. It
+  carries the index of the image on its page, never its name: a name comes out
+  of the file, and an index cannot carry anything a document wrote. A drawer
+  that has somewhere to fetch pixels from can draw it; one that has not falls
+  back to outlining the region, which is what `hanmen.svg` does by default.
+
+  `:path` is everything a pen draws that is not an axis-aligned rectangle: a
+  curve, a diagonal, a polygon, a chart's plot line. It carries the path
+  already flattened into reader space, so a drawer emits it and does not do
+  geometry. `:rule` stays a separate kind rather than becoming a four-corner
+  path, because a rectangle is most of what documents actually draw and a
+  consumer that lays marks out itself can reason about a box and cannot
+  reason about a cubic.
+
+  `:frame` is the honest one. A shading, a pattern, a `/Type0` run nobody can
+  decode: a region of the page whose contents this does not have, where a
+  viewer that drew nothing would show a page that looks complete and is not.
+  So the region is placed, named and marked as undrawn. Silence is the one
+  thing it must not be."
+  #{:text :rule :path :image :frame})
+
+;; ── geometry ─────────────────────────────────────────────────────────────────
+
+(defn- finite? [n]
+  )
+
+(defn round
+  "To `places` decimals, as a double, so that two runs of the same input
+  produce byte-identical output.
+
+  Written out rather than taken from a formatter because the platforms
+  disagree: `format \"%.2f\"` is JVM-only, and `.toFixed` returns a string
+  with a locale-independent but *different* rounding rule at the halfway
+  point. Multiplying by a power of ten and rounding is the same arithmetic
+  everywhere, and determinism is what a digest over a rendering needs."
+  ([n] (round n 3))
+  ([n places]
+   (if-not (finite? n)
+     0.0
+     (let [f (Math/pow 10 places)]
+       (double (/ (Math/round (* (double n) f)) f))))))
+
+(defn num->str
+  "`200` rather than `200.0`, and `1.235` rather than `1.2349999999`.
+
+  Not cosmetic at this scale: path data is the largest thing in a rendering
+  and carries four numbers per curve, so two characters each is real bytes
+  in every response. Rounding first and dropping an integral tail is also
+  what makes two runs byte-identical, which a digest over a rendering needs.
+
+  Here rather than in `hanmen.svg` because `hanmen.pdf` builds path data and
+  would otherwise have its own copy — and two spellings of a number is how
+  two renderings of one page stop being equal."
+  [n]
+  (let [r (round n 3)
+        truncated ]
+    (if (== r truncated)
+      (str )
+      (str r))))
+
+(defn item
+  "One placed mark.
+
+  `x`/`y` is its top-left in reader space for a `:rule` and a `:frame`, and
+  the **baseline start** for `:text` — which is not the same point and is the
+  one every text renderer takes. Naming them the same would make a drawer
+  that treats them alike look correct on a rectangle and be a font's ascent
+  out on every line of prose."
+  [kind attrs]
+  (when-not (contains? item-kinds kind)
+    (throw (ex-info (str "unknown item kind: " kind)
+                    {:type :hanmen/unknown-item-kind :kind kind
+                     :known (vec (sort item-kinds))})))
+  (assoc attrs :item/kind kind))
+
+(defn text-item
+  "A run of text on one baseline.
+
+  `width` is what the *document* says the run occupies, and it is optional
+  because only a document that shipped its font's `/Widths` can say. When it
+  is there a drawer can make the glyphs fill exactly that much space no
+  matter which font it actually has; when it is not, the run starts in the
+  right place and ends wherever the drawer's font puts it. Those are
+  different qualities of answer and they are kept distinguishable rather than
+  averaged into a guess."
+  [{:keys [x y size text width font direction ink]}]
+  (item :text (cond-> {:item/x (round x) :item/y (round y)
+                       :item/size (round size)
+                       :item/text (str text)}
+                (finite? width) (assoc :item/width (round width))
+                (seq font) (assoc :item/font (str font))
+                ;; Ink, on the same scale as a rule's: 1 is as dark as this
+                ;; document goes and 0 is nothing. Text was the one mark that
+                ;; carried no colour, which is invisible on the documents
+                ;; everybody has — black on white — and wrong on the ones
+                ;; with a heading knocked out of a dark panel, where it drew
+                ;; the text in the same ink as the panel under it.
+                (finite? ink) (assoc :item/ink (round ink 3))
+                direction (assoc :item/direction direction))))
+
+(defn rule-item
+  "A filled rectangle: a table border, an underline, a highlight.
+
+  `ink` is **density, not colour**: 1.0 is as dark as this document goes and
+  0.0 is nothing. It is deliberately not PDF's `/G`, where 0 is black — this
+  value is in the reader's terms for the same reason the coordinates are, and
+  a producer converts on the way in. Carrying the format's inverted
+  convention into a format-neutral model is how a second producer ends up
+  drawing every rule in negative."
+  [{:keys [x y width height ink pattern]}]
+  (item :rule (cond-> {:item/x (round x) :item/y (round y)
+                       :item/width (round width) :item/height (round height)}
+                (finite? ink) (assoc :item/ink (round ink 3))
+                pattern (assoc :item/pattern pattern))))
+
+(defn image-item
+  "A raster whose pixels are somewhere else.
+
+  `index` is the image's position in the page's own image list, so a host can
+  route to it without a document-supplied string ever reaching a URL. That is
+  the whole reason it is not the `/XObject` name: the name is file content.
+
+  `media-type` is what the bytes already are when the host can pass them
+  through — a `DCTDecode` XObject IS a JPEG, so serving one costs no decoder.
+  nil when they are raw samples somebody has to encode."
+  [{:keys [x y width height index media-type]}]
+  (item :image (cond-> {:item/x (round x) :item/y (round y)
+                        :item/width (round width) :item/height (round height)
+                        :item/index index}
+                 (seq media-type) (assoc :item/media-type (str media-type)))))
+
+(defn path-item
+  "A drawn path, in reader space.
+
+  `d` is SVG path data — already transformed, already flattened to absolute
+  coordinates. Keeping the format rather than inventing a segment vocabulary
+  is a real decision and not laziness: every drawer this could have targets
+  it (SVG, Canvas's `Path2D`, CoreGraphics via a parser), the grammar is
+  tiny and closed, and a segment vocabulary would be a second spelling of it
+  that every consumer has to translate back.
+
+  `fill` and `stroke` are ink densities or nil. Both nil is a path that was
+  constructed and never painted, which is a clip path or a mistake, and
+  `hanmen.pdf` does not emit one.
+
+  `x`/`y`/`width`/`height` are the path's bounding box, and it is not
+  optional: without one a path cannot be clipped to the page, cannot be laid
+  out by a consumer, and cannot be told apart from a mark that is nowhere.
+  Every other kind has an extent and this one needs the same."
+  [{:keys [d fill stroke stroke-width x y width height pattern]}]
+  (item :path (cond-> {:item/d (str d)
+                       :item/x (round x) :item/y (round y)
+                       :item/width (round width) :item/height (round height)}
+                (finite? fill) (assoc :item/fill (round fill 3))
+                (finite? stroke) (assoc :item/stroke (round stroke 3))
+                (finite? stroke-width) (assoc :item/stroke-width
+                                              (round stroke-width 2))
+                ;; The fill is a PATTERN, not a colour. Present only when it
+                ;; is, so a drawer can say so rather than showing whatever
+                ;; colour happened to be set — which is what a reader who
+                ;; leaves it out ends up doing.
+                pattern (assoc :item/pattern pattern))))
+
+(defn frame-item
+  "A region whose contents are not decoded — see `item-kinds`."
+  [{:keys [x y width height label reason]}]
+  (item :frame {:item/x (round x) :item/y (round y)
+                :item/width (round width) :item/height (round height)
+                :item/label (str label)
+                :item/reason (or reason :undecoded)}))
+
+;; ── the page ─────────────────────────────────────────────────────────────────
+
+(defn clip
+  "One clip region: a path in reader space, and the clip it narrows.
+
+  A CHAIN and not a list, because PDF intersects clips and SVG unions the
+  paths inside one `clipPath`. Two rectangles in one element is the union of
+  two rectangles — the opposite of what a document that clipped twice
+  meant — so each one points at the one before it and the intersection comes
+  from the nesting."
+  [{:keys [id d parent]}]
+  (cond-> {:clip/id id :clip/d (str d)}
+    (some? parent) (assoc :clip/parent parent)))
+
+(defn page
+  "A page value. `width`/`height` are as seen — rotation already applied.
+
+  `clips` are referenced by items through `:item/clip`, rather than being
+  nested in the item vector. Marks arrive in painting order and a clip may
+  turn on and off between them, so nesting would either reorder the page or
+  repeat the clip — and painting order is the one thing a page cannot lose."
+  [{:keys [index width height rotation items label clips]}]
+  {:page/schema schema
+   :page/clips (vec clips)
+   :page/index (or index 0)
+   :page/label (or label (str "Page " (inc (or index 0))))
+   :page/width (round width)
+   :page/height (round height)
+   :page/rotation (or rotation 0)
+   :page/items (vec items)})
+
+(defn empty-page?
+  "No marks at all. Distinct from a page whose marks are all `:frame`, which
+  is a scanned page — one has nothing on it and the other has something this
+  cannot draw, and telling a reader the wrong one sends them to fix the wrong
+  thing."
+  [p]
+  (empty? (:page/items p)))
+
+(defn text-of
+  "Every text run, in the order the content stream placed them.
+
+  Reading order is not claimed and the docstring says so rather than letting
+  a caller find out from a two-column paper: content-stream order is the
+  order the *producer* wrote marks in, which for most tools is close enough
+  to reading order to search and nowhere near it to quote."
+  [p]
+  (into [] (comp (filter #(= :text (:item/kind %))) (map :item/text))
+        (:page/items p)))
+
+(defn text-chars [p] (reduce + 0 (map count (text-of p))))
+
+(defn- column-of
+  "Which vertical band a run starts in, given the page width and a column
+  count. Bands rather than clustering: a two-column paper puts every run
+  wholly inside one half, and a clustering that inferred the split from the
+  data would also infer one on a page that has no columns at all."
+  [width columns x]
+  (if (or (nil? width) (not (pos? width)) (< columns 2))
+    0
+    (min (dec columns) (long (/ (* columns (max 0.0 (double x))) (double width))))))
+
+(defn- column-count
+  "How many columns the runs are consistent with — 2 or 1.
+
+  Two columns only when BOTH halves carry a real share of the text and almost
+  nothing straddles the gutter. A page-wide title straddles it, which is why
+  the test is on the share rather than on the presence of a straddler.
+
+  Deliberately not 3+. Nothing in the sample this was measured against had
+  three, and a heuristic that can produce an answer nobody has checked is a
+  heuristic that will produce it on somebody's invoice."
+  [{:page/keys [width items]}]
+  (let [runs (filter #(= :text (:item/kind %)) items)
+        n (count runs)]
+    (if (or (< n 12) (not (pos? width)))
+      1
+      (let [mid (/ (double width) 2.0)
+            ;; A run straddles when it starts left of the gutter and its
+            ;; measured width carries it past. Unmeasured runs cannot
+            ;; straddle by this test, and are not counted either way.
+            straddling (count (filter (fn [{:item/keys [x width]}]
+                                        (and width (< x mid) (> (+ x width) mid)))
+                                      runs))
+            left (count (filter #(< (:item/x %) mid) runs))
+            right (- n left)]
+        (if (and (> (/ (double (min left right)) n) 0.25)
+                 (< (/ (double straddling) n) 0.05))
+          2
+          1)))))
+
+(defn reading-order
+  "The text runs, in the order a person reads them.
+
+  Content-stream order is the order the PRODUCER emitted marks. For most
+  single-column documents that is close enough to reading order to quote; for
+  a two-column paper it interleaves the columns, and for anything that draws
+  its header last it starts in the middle.
+
+  So: group into columns, then sort down the page and across the line. `band`
+  is what makes the second part work — two runs on one baseline rarely have
+  exactly equal `y`, and sorting on raw `y` puts a superscript before the word
+  it belongs to. Rounding to a band the height of the text makes them equal
+  again, which is the same thing the eye does.
+
+  This is a heuristic and is kept separate from `text-of` rather than replacing
+  it. `text-of` is what the document says in the order it said it — a fact.
+  This is a guess about how to read it, and a caller that needs the fact should
+  not have to opt out of the guess."
+  ([p] (reading-order p {}))
+  ([{:page/keys [width items] :as p} {:keys [band] :or {band 4.0}}]
+   (let [columns (column-count p)]
+     (->> items
+          (filter #(= :text (:item/kind %)))
+          (sort-by (juxt #(column-of width columns (:item/x %))
+                         #(Math/round (/ (double (:item/y %)) (double band)))
+                         :item/x))
+          vec))))
+
+(defn reading-text
+  "`reading-order`'s runs as one string, joined the way a line break is."
+  [p]
+  (str/join " " (map :item/text (reading-order p))))
+
+(defn scanned?
+  "Nothing to select and nothing to search: no text, but something there.
+
+  The same predicate `app-preview.model/scanned?` applies to a page listing,
+  answered here from the marks rather than from a reported count, so a viewer
+  and a listing cannot disagree about which pages a search can see."
+  [p]
+  (and (zero? (text-chars p))
+       (boolean (seq (:page/items p)))))
+
+(defn summary [p]
+  {:page/index (:page/index p)
+   :page/label (:page/label p)
+   :page/size [(:page/width p) (:page/height p)]
+   :page/rotation (:page/rotation p)
+   :page/items (count (:page/items p))
+   :page/text-chars (text-chars p)
+   :page/scanned? (scanned? p)})
+
+(defn document
+  "Pages plus what a listing needs to say about the whole of it."
+  [pages]
+  (let [pages (vec pages)]
+    {:document/schema schema
+     :document/pages pages
+     :document/count (count pages)
+     :document/text-chars (reduce + 0 (map text-chars pages))
+     :document/scanned-pages (into [] (comp (filter scanned?) (map :page/index)) pages)}))
+
+;; ── fitting ──────────────────────────────────────────────────────────────────
+
+(defn fit
+  "The scale that puts a page inside `[w h]`, and the size it comes out.
+
+  `:contain` is the whole page visible, `:width` is fit-to-width — the two
+  Preview actually offers. Zoom and pan are `kotoba-lang/canvaskit`'s
+  subject and are deliberately not re-derived here; this is the one number a
+  server-side render needs to choose an output size, which is a different
+  question from what a gesture does to a viewport."
+  ([p bounds] (fit p bounds :contain))
+  ([{:page/keys [width height]} [w h] mode]
+   (let [sx (if (pos? width) (/ (double w) width) 1.0)
+         sy (if (pos? height) (/ (double h) height) 1.0)
+         scale (case mode
+                 :contain (min sx sy)
+                 :width sx
+                 :actual 1.0)]
+     {:fit/scale (round scale 4)
+      :fit/width (round (* width scale) 2)
+      :fit/height (round (* height scale) 2)})))
+
+;; ── text, for search ─────────────────────────────────────────────────────────
+
+(defn- normalize [s] (str/lower-case (str/replace (str s) #"\s+" " ")))
+
+(defn matches?
+  "Whether `needle` appears in this page's text.
+
+  Whitespace-collapsed and case-folded, because a content stream breaks a
+  sentence wherever the producer moved the pen and a reader searching for
+  what they saw on the page did not type those breaks."
+  [p needle]
+  (let [needle (normalize needle)]
+    (or (str/blank? needle)
+        (str/includes? (normalize (str/join " " (text-of p))) needle))))

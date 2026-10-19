@@ -1,0 +1,168 @@
+(ns connector.auth
+  "OAuth 2.0 authorization-code, as pure data.
+
+  Every function here returns a URL string or a request map. None of them
+  performs a request, reads an environment variable, generates randomness or
+  hashes anything — those are the host's, and a library that did them would
+  hold exactly the ambient authority a connector exists to avoid.
+
+  PKCE follows from that: `code-challenge` takes the SHA-256 function as an
+  argument. The workspace already has base64url SHA-256 in several places and
+  none of them are portable .cljc; injecting it keeps this namespace loadable
+  on nbb, in a browser and on the JVM without choosing one.
+
+  The state parameter is the caller's too. It has to be — it is only worth
+  anything if the same process that minted it checks it on the way back, and a
+  library cannot do the second half."
+  (:require [clojure.string :as str]
+            [connector.uri :as uri]))
+
+(def ^{:doc "Alias of `connector.uri/query-string`, kept because a token
+  endpoint body is a query string and callers reach for it here."}
+  query-string uri/query-string)
+
+(def ^:private with-query uri/with-query)
+
+;; --- PKCE ---
+
+(def ^:private unreserved
+  "The 66 characters RFC 7636 allows in a code_verifier."
+  (vec (str "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")))
+
+(defn verifier
+  "A code_verifier built from caller-supplied random bytes.
+
+  Takes bytes rather than making them: a library that reached for a CSPRNG
+  would have to pick one per host, and the host already has the right one."
+  [random-bytes]
+  (let [s (apply str (map #(nth unreserved (mod (bit-and (int %) 0xff) 66)) random-bytes))]
+    (subs s 0 (min 128 (count s)))))
+
+(defn verifier-valid?
+  "RFC 7636 §4.1: 43-128 characters from the unreserved set."
+  [v]
+  (boolean (and (string? v)
+                (<= 43 (count v) 128)
+                (re-matches #"[A-Za-z0-9\-._~]+" v))))
+
+(defn code-challenge
+  "S256 challenge for `verifier`. `sha256-base64url` is host-injected and must
+  return base64url WITHOUT padding, as RFC 7636 requires."
+  [verifier sha256-base64url]
+  (sha256-base64url verifier))
+
+;; --- authorization request ---
+
+(defn authorization-url
+  "The URL to send a person to in order to grant `scopes`.
+
+  opts: {:client-id :redirect-uri :state :scopes :code-challenge :login-hint
+         :nonce}
+
+  `:scopes` is passed in rather than read off the descriptor because the whole
+  point of per-tool scopes is that consent is computed from what is enabled —
+  see `connector.consent`. Passing the descriptor's full scope list is possible
+  and is usually the wrong thing.
+
+  Scopes are sorted before joining. OAuth scope order is not significant
+  (RFC 6749 §3.3), so the same enabled set produces the same URL no matter how
+  the caller assembled it — which is what makes two consent URLs in a log
+  comparable at all."
+  [descriptor {:keys [client-id redirect-uri state scopes code-challenge
+                      login-hint nonce]}]
+  (let [auth (:connector/auth descriptor)]
+    (when-not (= :oauth2 (:connector.auth/kind auth))
+      (throw (ex-info "connector does not use oauth2"
+                      {:type :connector.auth/not-oauth2
+                       :connector/id (:connector/id descriptor)})))
+    (when (and (:connector.auth/pkce? auth) (str/blank? (str code-challenge)))
+      (throw (ex-info "connector declares PKCE but no code-challenge was given"
+                      {:type :connector.auth/pkce-required
+                       :connector/id (:connector/id descriptor)})))
+    (with-query
+      (:connector.auth/authorization-endpoint auth)
+      (cond-> (merge (:connector.auth/extra auth)
+                     {"response_type" "code"
+                      "client_id" client-id
+                      "redirect_uri" redirect-uri
+                      "state" state})
+        ;; Omitted entirely for providers with no scope mechanism. Sending an
+        ;; empty `scope=` to Notion is not harmless-looking noise — it is the
+        ;; descriptor claiming a narrowing that does not exist.
+        (not (false? (:connector.auth/scopes? auth)))
+        (assoc "scope" (str/join " " (sort (distinct scopes))))
+
+        ;; Sent only when the provider verifies it. GitHub's OAuth Apps ignore
+        ;; `code_challenge`; including it there would suggest a protection that
+        ;; is not in force.
+        (:connector.auth/pkce? auth)
+        (assoc "code_challenge" code-challenge "code_challenge_method" "S256")
+
+        (seq (str login-hint)) (assoc "login_hint" login-hint)
+        (seq (str nonce))      (assoc "nonce" nonce)))))
+
+;; --- token requests ---
+
+(defn- base64
+  "Base64 of an ASCII string. OAuth client ids and secrets are ASCII by
+  RFC 6749 §appendix-B, so no UTF-8 handling is needed here — and a client
+  credential that is not ASCII would break the Basic scheme itself."
+  [s]
+  )
+
+(defn- form-request
+  "A token-endpoint request. `client-auth` decides whether the secret goes in
+  the body (RFC 6749 client_secret_post) or an HTTP Basic header
+  (client_secret_basic) — Notion accepts only the latter, and a request sent
+  the wrong way fails with an error naming neither."
+  [auth url params client-id client-secret]
+  (let [basic? (and (= :basic (:connector.auth/client-auth auth))
+                    (seq (str client-secret)))]
+    {:connector.http/method :post
+     :connector.http/url url
+     :connector.http/headers
+     (cond-> {"content-type" "application/x-www-form-urlencoded"
+              "accept" "application/json"}
+       basic? (assoc "authorization"
+                     (str "Basic " (base64 (str client-id ":" client-secret)))))
+     :connector.http/body
+     (query-string (cond-> params
+                     (and (seq (str client-secret)) (not basic?))
+                     (assoc "client_secret" client-secret)))}))
+
+(defn token-exchange-request
+  "The request that turns an authorization code into tokens.
+
+  opts: {:client-id :client-secret :code :redirect-uri :code-verifier}
+
+  Returned, not sent. The caller owns the transport, and the caller is also the
+  only party that should ever hold the secret."
+  [descriptor {:keys [client-id client-secret code redirect-uri code-verifier]}]
+  (let [auth (:connector/auth descriptor)]
+    (form-request auth (:connector.auth/token-endpoint auth)
+                  (cond-> {"grant_type" "authorization_code"
+                           "code" code
+                           "client_id" client-id
+                           "redirect_uri" redirect-uri}
+                    (:connector.auth/pkce? auth) (assoc "code_verifier" code-verifier))
+                  client-id client-secret)))
+
+(defn refresh-request
+  "The request that exchanges a refresh token for a fresh access token.
+
+  opts: {:client-id :client-secret :refresh-token :scopes}"
+  [descriptor {:keys [client-id client-secret refresh-token scopes]}]
+  (let [auth (:connector/auth descriptor)]
+    (form-request auth (:connector.auth/token-endpoint auth)
+                  (cond-> {"grant_type" "refresh_token"
+                           "refresh_token" refresh-token
+                           "client_id" client-id}
+                    (and (seq scopes)
+                         (not (false? (:connector.auth/scopes? auth))))
+                    (assoc "scope" (str/join " " scopes)))
+                  client-id client-secret)))
+
+(defn authorization-header
+  "The Authorization header value for an access token."
+  [token]
+  (str "Bearer " token))

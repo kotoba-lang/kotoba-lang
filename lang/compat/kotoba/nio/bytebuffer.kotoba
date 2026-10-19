@@ -1,0 +1,246 @@
+(ns kotoba.nio.bytebuffer
+  "A portable byte buffer with java.nio.ByteBuffer semantics — position,
+  limit, relative get/put — identical on JVM Clojure and ClojureScript.
+
+  Why this exists: every kotoba-lang library that touches wire bytes needs
+  the same trio of operations — read a little-endian u64 from a byte
+  sequence, write one back, walk a cursor — and each hand-rolled version
+  quietly disagreed with the others. The JVM side reached for
+  java.nio.ByteBuffer (JVM-only, and big-endian by default — a real bug
+  kotoba-vm's keccak hit), the ClojureScript side reached for DataView,
+  and the two had to be kept honest separately. This namespace does it
+  once, with NO platform buffer underneath: the backing store is a plain
+  vector of ints in [0,255] — the byte shape every kotoba-lang library
+  already speaks — behind an atom. The reader conditional survives only
+  where the two runtimes genuinely disagree: unsigned 64-bit arithmetic.
+
+  The contract is the java.nio.ByteBuffer one, little-endian:
+
+  - `allocate` / `wrap` produce a buffer at position 0, limit = capacity.
+  - relative `get-byte` / `put-byte` / `get-u64` / `put-u64` / `get-bytes`
+    / `put-bytes` move position; the `-at` variants take an index and do
+    not.
+  - a relative read past the limit throws :nio/underflow; a relative write
+    that would run past the limit throws :nio/overflow (the
+    BufferUnderflowException / BufferOverflowException equivalents).
+  - `flip` sets limit = position, position = 0 (the write-then-read turn).
+
+  u64 note: 64-bit values cannot be plain JS numbers, so on :cljs `get-u64`
+  returns and `put-u64` accepts a BigInt; on :clj both use plain longs
+  (two's-complement bits — the bit pattern is the value). Host code that
+  must be platform-agnostic treats the value opaquely and hands it straight
+  back (keccak lanes do exactly this).")
+
+(defn- clamp-u8 [b] (bit-and (int b) 0xff))
+
+(defn capacity [buf] (count @(:bytes buf)))
+(defn position [buf] @(:pos buf))
+(defn limit [buf] @(:lim buf))
+(defn remaining [buf] (- (limit buf) (position buf)))
+
+(defn- ensure!
+  "Internal: bounds-check a relative read of n bytes at the cursor."
+  [buf n]
+  (when (> (+ (position buf) n) (limit buf))
+    (throw (ex-info "buffer underflow: read past limit"
+                    {:nio/error :nio/underflow
+                     :need (+ (position buf) n)
+                     :limit (limit buf)}))))
+
+(defn- ensure-writable!
+  "Internal: bounds-check a relative write of n bytes at the cursor."
+  [buf n]
+  (when (> (+ (position buf) n) (limit buf))
+    (throw (ex-info "buffer overflow: write past limit"
+                    {:nio/error :nio/overflow
+                     :need (+ (position buf) n)
+                     :limit (limit buf)}))))
+
+;; ---- construction -----------------------------------------------------
+
+(defn allocate
+  "A fresh zero-filled buffer of n bytes: position 0, limit n."
+  [n]
+  {:bytes (atom (vec (repeat (long n) 0)))
+   :pos   (atom 0)
+   :lim   (atom (long n))})
+
+(defn wrap
+  "A buffer over a COPY of bs (any portable byte shape), position 0,
+  limit (count bs). A copy, not a view: host byte-arrays are signed and JS
+  buffers alias — sharing the caller's mutable memory is exactly the class
+  of bug this library exists to stop."
+  [bs]
+  (let [v (vec (map clamp-u8 (seq bs)))]
+    {:bytes (atom v)
+     :pos   (atom 0)
+     :lim   (atom (count v))}))
+
+(defn buf->bytes
+  "The buffer's whole backing vector<int 0..255> (capacity bytes, not just
+  the unread remainder — slice with remaining->bytes if you need that)."
+  [buf]
+  @(:bytes buf))
+
+(defn remaining->bytes
+  "The bytes from position to limit, as vector<int 0..255>."
+  [buf]
+  (subvec @(:bytes buf) (position buf) (limit buf)))
+
+;; ---- cursor -----------------------------------------------------------
+
+(defn position!
+  "Set the cursor. Must be within [0, limit]."
+  [buf p]
+  (when (or (neg? p) (> p (limit buf)))
+    (throw (ex-info "position out of range"
+                    {:nio/error :nio/illegal-argument :p p :limit (limit buf)})))
+  (reset! (:pos buf) p)
+  buf)
+
+(defn limit!
+  "Set the limit. Must be within [0, capacity]; position is clamped down
+  if it now exceeds the limit (java.nio semantics)."
+  [buf l]
+  (when (or (neg? l) (> l (capacity buf)))
+    (throw (ex-info "limit out of range"
+                    {:nio/error :nio/illegal-argument :l l :capacity (capacity buf)})))
+  (reset! (:lim buf) l)
+  (when (> (position buf) l) (reset! (:pos buf) l))
+  buf)
+
+(defn flip
+  "limit = position, position = 0 — the write-then-read turn."
+  [buf]
+  (reset! (:lim buf) (position buf))
+  (reset! (:pos buf) 0)
+  buf)
+
+(defn rewind [buf] (reset! (:pos buf) 0) buf)
+
+(defn clear
+  "position = 0, limit = capacity (data is NOT erased, java.nio semantics)."
+  [buf]
+  (reset! (:pos buf) 0)
+  (reset! (:lim buf) (capacity buf))
+  buf)
+
+;; ---- byte access ------------------------------------------------------
+
+(defn get-byte
+  "Relative: read one byte at the cursor, advance by 1. The absolute form
+  takes an index and does not move the cursor."
+  ([buf]
+   (ensure! buf 1)
+   (let [p (position buf)]
+     (reset! (:pos buf) (inc p))
+     (nth @(:bytes buf) p)))
+  ([buf i]
+   (when (or (neg? i) (>= i (limit buf)))
+     (throw (ex-info "index out of range"
+                     {:nio/error :nio/illegal-argument :i i :limit (limit buf)})))
+   (nth @(:bytes buf) i)))
+
+(def get-byte-at get-byte)
+
+(defn put-byte
+  "Relative: write one byte at the cursor, advance by 1. The absolute form
+  takes an index first and does not move the cursor."
+  ([buf b]
+   (ensure-writable! buf 1)
+   (let [p (position buf)]
+     (swap! (:bytes buf) assoc p (clamp-u8 b))
+     (reset! (:pos buf) (inc p))
+     buf))
+  ([buf i b]
+   (when (or (neg? i) (>= i (limit buf)))
+     (throw (ex-info "index out of range"
+                     {:nio/error :nio/illegal-argument :i i :limit (limit buf)})))
+   (swap! (:bytes buf) assoc i (clamp-u8 b))
+   buf))
+
+(defn put-bytes
+  "Relative: write every byte of bs at the cursor, advance by (count bs)."
+  [buf bs]
+  (let [n (count bs)]
+    (ensure-writable! buf n)
+    (let [p (position buf)]
+      (swap! (:bytes buf)
+             (fn [v] (reduce (fn [v' k] (assoc v' (+ p k) (clamp-u8 (nth bs k))))
+                             v (range n))))
+      (reset! (:pos buf) (+ p n))
+      buf)))
+
+(defn get-bytes
+  "Relative: read n bytes at the cursor as vector<int 0..255>, advance by n."
+  [buf n]
+  (ensure! buf n)
+  (let [p (position buf)]
+    (reset! (:pos buf) (+ p n))
+    (subvec @(:bytes buf) p (+ p n))))
+
+;; ---- u64 access (little-endian) ---------------------------------------
+
+
+
+
+
+(defn get-u64
+  "Relative: read 8 little-endian bytes at the cursor as one unsigned
+  64-bit value (long on :clj — two's-complement bits; BigInt on :cljs),
+  advance by 8. The absolute form takes an index and does not move the
+  cursor."
+  ([buf]
+   (ensure! buf 8)
+   (let [p (position buf)
+         v (assemble-u64 @(:bytes buf) p)]
+     (reset! (:pos buf) (+ p 8))
+     v))
+  ([buf i]
+   (when (or (neg? i) (> (+ i 8) (limit buf)))
+     (throw (ex-info "index out of range"
+                     {:nio/error :nio/illegal-argument :i i :limit (limit buf)})))
+   (assemble-u64 @(:bytes buf) i)))
+
+(def get-u64-at get-u64)
+
+(defn put-u64
+  "Relative: write w (unsigned 64-bit; long bits on :clj, BigInt on :cljs)
+  as 8 little-endian bytes at the cursor, advance by 8."
+  [buf w]
+  (ensure-writable! buf 8)
+  (let [p (position buf)
+        bs (splat-u64 w)]
+    (swap! (:bytes buf)
+           (fn [v] (reduce (fn [v' k] (assoc v' (+ p k) (nth bs k))) v (range 8))))
+    (reset! (:pos buf) (+ p 8))
+    buf))
+
+(defn put-u64-at
+  "Absolute: write w as 8 little-endian bytes at index i, cursor unmoved."
+  [buf i w]
+  (when (or (neg? i) (> (+ i 8) (limit buf)))
+    (throw (ex-info "index out of range"
+                    {:nio/error :nio/illegal-argument :i i :limit (limit buf)})))
+  (let [bs (splat-u64 w)]
+    (swap! (:bytes buf)
+           (fn [v] (reduce (fn [v' k] (assoc v' (+ i k) (nth bs k))) v (range 8))))
+    buf))
+
+;; ---- portability seam -------------------------------------------------
+
+(defn ->u64
+  "Coerce a platform u64 to this runtime's canonical u64 shape (identity
+  on :clj when already a long; unsigned-BigInt passthrough on :cljs)."
+  [w]
+  )
+
+(defn u64->hex
+  "Debug/test helper: the value as 16 lowercase hex digits, both runtimes."
+  [w]
+  (let [hex "0123456789abcdef"
+        bs (splat-u64 (->u64 w))]
+    (apply str (map (fn [b]
+                      (str (nth hex (bit-shift-right b 4))
+                           (nth hex (bit-and b 0xf))))
+                    bs))))

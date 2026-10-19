@@ -1,0 +1,262 @@
+(ns pop3.client
+  "POP3 (RFC 1939) session driver over a `pop3.transport/Transport`.
+
+  `pop3.protocol` supplies the pure command/response functions; this
+  namespace is the stateful loop that reads a status line and, for the
+  multi-line commands, keeps reading until the `.` terminator.
+
+  ## The shape of a POP3 session, and the trap in it
+
+  POP3 has no folders, no flags and no server-side state worth the name.
+  A session opens, locks the maildrop, hands over messages by *number*,
+  and those numbers are assigned fresh each session and renumber the
+  moment anything is deleted. The only identifier that survives is the
+  UIDL (§7), which is why `list-messages!` returns it alongside the
+  number and why a caller that wants to know what it has already seen
+  must key on the UID and never on the number.
+
+  The other trap is DELE. `retrieve!` does not delete, and nothing here
+  deletes implicitly — a mail client that removes the server's only copy
+  as a side effect of reading it has destroyed the mailbox for every
+  other client the account is opened in. `delete!` exists and says so."
+  (:require [clojure.string :as str]
+            [pop3.protocol :as p]
+            [pop3.transport :as t]))
+
+
+
+(defn- send-line!
+  [{:keys [transport]} line]
+  (t/write! transport line)
+  (t/read-line! transport))
+
+(defn- assert-ok! [line verb]
+  (when-not (p/ok? line)
+    (throw (ex-info (str "POP3 " verb " failed: " (:text (p/status line)))
+                    {:verb verb :line line})))
+  line)
+
+(defn- read-multiline!
+  "Read body lines until the `.` terminator, byte-stuffing undone.
+
+  Called only after a `+OK` status line: RFC 1939 §3 sends the body only
+  on success, and reading for a terminator after `-ERR` waits for a line
+  that is never coming."
+  [{:keys [transport]}]
+  (loop [lines []]
+    (let [line (t/read-line! transport)]
+      (cond
+        (nil? line)
+        (throw (ex-info "POP3 connection closed mid-response" {:lines lines}))
+
+        (p/terminator? line) (p/unstuff lines)
+
+        :else (recur (conj lines line))))))
+
+;; ------------------------------------------------------------ capability
+
+(defn capabilities!
+  "CAPA (RFC 2449) -> the capability map, also attached to `session`.
+
+  A server that does not implement CAPA answers `-ERR`, which is not a
+  failure worth unwinding a session over — it means 'this is a plain RFC
+  1939 server', so the map comes back empty and the caller proceeds."
+  [session]
+  (let [line (send-line! session (p/command "CAPA"))]
+    (if (p/ok? line)
+      (let [caps (p/parse-capabilities (read-multiline! session))]
+        (assoc session
+               :capabilities caps
+               :sasl-mechanisms (p/sasl-mechanisms caps)))
+      (assoc session :capabilities {} :sasl-mechanisms #{}))))
+
+(defn supports?
+  "Whether a capability was advertised (case-insensitive)."
+  [session capability]
+  (contains? (:capabilities session {}) (str/upper-case (str capability))))
+
+
+
+;; -------------------------------------------------------- authentication
+
+(defn login!
+  "USER + PASS (RFC 1939 §7).
+
+  The password crosses in the clear. On an implicit-TLS session (port
+  995) or after `stls!` that is fine; on a bare port-110 session it is
+  not, and this does not refuse it because the caller may have a reason —
+  but `apop!` or `authenticate!` are the alternatives that exist."
+  [session user pass]
+  (assert-ok! (send-line! session (p/command "USER" user)) "USER")
+  (assert-ok! (send-line! session (p/command "PASS" pass)) "PASS")
+  session)
+
+
+
+(defn- auth!
+  "AUTH `mechanism` with one base64 initial response (RFC 5034).
+
+  The success line and the continuation both begin with `+` — `+OK`
+  against a bare `+ ` — so success is tested first. Testing the `+`
+  prefix first sends the credentials a second time, in answer to the
+  server saying they were accepted, and then blocks reading a reply that
+  is never coming."
+  [{:keys [transport] :as session} mechanism payload]
+  (t/write! transport (p/command "AUTH" mechanism))
+  (loop []
+    (let [line (t/read-line! transport)]
+      (cond
+        (nil? line)
+        (throw (ex-info "POP3 connection closed during AUTH" {:mechanism mechanism}))
+
+        (p/ok? line) session
+
+        (p/err? line)
+        (throw (ex-info (str "POP3 AUTH " mechanism " failed: "
+                             (:text (p/status line)))
+                        {:verb (str "AUTH " mechanism) :line line}))
+
+        (str/starts-with? (str line) "+")
+        (do (t/write! transport (str (p/base64 payload) "\r\n"))
+            (recur))
+
+        :else (recur)))))
+
+(defn auth-plain!
+  "AUTH PLAIN (RFC 5034 / RFC 4616)."
+  [session user pass]
+  (auth! session "PLAIN" (p/plain-credentials user pass)))
+
+(defn auth-xoauth2!
+  "AUTH XOAUTH2 with an OAuth2 access token.
+
+  What lets a mailbox already connected by OAuth be read over POP3
+  without asking its owner for an app password covering exactly what the
+  grant already covers."
+  [session user access-token]
+  (auth! session "XOAUTH2" (p/xoauth2-credentials user access-token)))
+
+(defn authenticate!
+  "Pick the strongest mechanism the server advertised.
+
+  XOAUTH2 when a token was given, then SASL PLAIN, then APOP where the
+  greeting offered it, then USER/PASS. A caller that knows which one it
+  wants calls it directly; this exists so the ordinary case does not make
+  every caller re-derive the same preference."
+  [session {:keys [user password access-token]}]
+  (let [mechanisms (:sasl-mechanisms session #{})]
+    (cond
+      (and access-token (contains? mechanisms "XOAUTH2"))
+      (auth-xoauth2! session user access-token)
+
+      (and password (contains? mechanisms "PLAIN"))
+      (auth-plain! session user password)
+
+      
+
+      password (login! session user password)
+
+      :else
+      (throw (ex-info "POP3 の認証情報がありません。"
+                      {:type :pop3/no-credential})))))
+
+;; ------------------------------------------------------------- the drop
+
+(defn stat!
+  "STAT -> `{:count n :size bytes}` (RFC 1939 §5)."
+  [session]
+  (let [line (assert-ok! (send-line! session (p/command "STAT")) "STAT")]
+    (or (p/parse-stat line) {:count 0 :size 0})))
+
+(defn list-messages!
+  "Every message in the maildrop as `{:number :size :uid}`.
+
+  LIST and UIDL joined on the message number, because neither alone is
+  enough: LIST gives sizes against numbers that do not survive the
+  session, UIDL gives the identifier that does. A caller deciding what it
+  has already downloaded keys on `:uid`; `:number` is only good for
+  naming a message to *this* session's RETR."
+  [session]
+  (let [_ (assert-ok! (send-line! session (p/command "LIST")) "LIST")
+        sizes (p/parse-scan-listing (read-multiline! session))
+        uids (if (false? (:uidl? session))
+               []
+               (let [line (send-line! session (p/command "UIDL"))]
+                 (if (p/ok? line)
+                   (p/parse-uidl-listing (read-multiline! session))
+                   ;; UIDL is optional in RFC 1939 (it is in the optional
+                   ;; commands section). A server without it leaves the
+                   ;; caller with numbers only, which is worth reporting
+                   ;; as an absent :uid rather than as a failed listing.
+                   [])))
+        uid-by-number (into {} (map (juxt :number :uid)) uids)]
+    (mapv #(assoc % :uid (get uid-by-number (:number %))) sizes)))
+
+(defn retrieve!
+  "RETR `number` -> the whole message as it was sent (RFC 1939 §5).
+
+  Bytes, not a parsed message: `kotoba-lang/org-ietf-mime` is what turns
+  these into headers, parts and decoded text.
+
+  **Does not delete.** POP3's historical default was to remove the
+  server's only copy as a side effect of reading it, which destroys the
+  mailbox for every other client the account is opened in. `delete!`
+  exists and has to be called."
+  [session number]
+  (assert-ok! (send-line! session (p/command "RETR" (str number))) "RETR")
+  (str/join "\r\n" (read-multiline! session)))
+
+(defn top!
+  "TOP `number` `lines` -> headers plus the first `lines` of the body.
+
+  Optional in RFC 1939 but near-universal, and the difference between
+  listing a mailbox and downloading it: a client can show who a message
+  is from and what it is about for a few hundred bytes rather than for
+  its attachments."
+  ([session number] (top! session number 0))
+  ([session number lines]
+   (assert-ok! (send-line! session (p/command "TOP" (str number) (str lines))) "TOP")
+   (str/join "\r\n" (read-multiline! session))))
+
+(defn delete!
+  "DELE `number` — mark for deletion (RFC 1939 §5).
+
+  Marked, not deleted: the maildrop is not changed until QUIT enters the
+  UPDATE state, and `reset!` before then takes every mark back off. That
+  is POP3's only undo, and it stops existing the moment `quit!` is
+  called."
+  [session number]
+  (assert-ok! (send-line! session (p/command "DELE" (str number))) "DELE")
+  true)
+
+(defn undelete-all!
+  "RSET — unmark everything this session marked for deletion.
+
+  Named for what it does rather than as `reset!`, which would shadow
+  `clojure.core/reset!` in every namespace that refers this one."
+  [session]
+  (assert-ok! (send-line! session (p/command "RSET")) "RSET")
+  session)
+
+(defn noop!
+  "NOOP — is this connection still alive (RFC 1939 §5)."
+  [session]
+  (assert-ok! (send-line! session (p/command "NOOP")) "NOOP")
+  session)
+
+(defn quit!
+  "QUIT and close the transport.
+
+  QUIT is not a courtesy here: it moves the session into UPDATE state,
+  which is when messages marked by `delete!` are actually removed and
+  when the maildrop lock is released. A client that drops the socket
+  instead leaves the mailbox locked until the server times the session
+  out, and every other client is refused in the meantime.
+
+  Swallows a failed QUIT response — the transport closes either way —
+  but not a transport-level exception raised before that point."
+  [{:keys [transport] :as session}]
+  (try (send-line! session (p/command "QUIT"))
+       (catch  _ nil))
+  (t/close! transport)
+  nil)

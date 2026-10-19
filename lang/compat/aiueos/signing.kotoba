@@ -1,0 +1,240 @@
+(ns aiueos.signing
+  "Manifest authenticity -- ed25519 verification of signed manifests
+  (ADR-0003), ported from the retired `aiueos/src/signing.rs` Rust module to
+  CLJC per ADR-2607022200.
+
+  A signature attests \"component `<id>` is exactly these bytes, vouched for
+  by this signer\" -- it covers the canonical signed message: the component
+  id, a newline, then the wasm sha256 hex digest (see `signed-message`). The
+  signer is resolved to a public key via the policy signer registry
+  (`:aiueos.policy/signers`, as produced by `aiueos.policy/parse-policy`).
+  This namespace does verification only; signing (key custody) lives in
+  tooling, not here.
+
+  `verify` returns ONE of two different map shapes -- the idiomatic Clojure
+  stand-in for Rust's `Result<SigStatus, Violation>`:
+
+  - a signing-status map: `{:aiueos.signing/status :unsigned}` (no
+    `:aiueos/signature` -- policy decides whether that's allowed to run) or
+    `{:aiueos.signing/status :verified :aiueos.signing/signer signer-id}`
+    (signature checked out against a registered signer's key).
+  - a violation map: `{:aiueos/component id :aiueos/kind :bad-signature
+    :aiueos/message \"...\"}`, the SAME shape `aiueos.policy`'s private
+    `violation` helper builds, so a caller can drop it straight into a
+    policy-decision's `:aiueos/violations` vector alongside
+    `aiueos.policy/verify-component`'s own violations.
+
+  Use `violation?` to tell the two shapes apart: a violation map always has
+  `:aiueos/kind`, a status map never does. A bad signature is NEVER
+  downgraded to `:unsigned` -- a forged attestation is worse than none, so
+  every deny path here returns a violation, never a status map.
+
+  The actual Ed25519 verify call is JVM-only (`java.security.Signature`,
+  algorithm string `\"Ed25519\"`, JDK 15+, no external crypto dependency) and
+  is `#?(:clj ...)` gated, following the same host-adapter-boundary pattern
+  as `aiueos.contract`'s `load-*` functions and `aiueos.audit`'s file-I/O
+  functions. CLJS/other hosts wanting to verify signatures need their own
+  adapter for that one step; `hex-decode`, `hex-encode`, `signed-message`,
+  and the unsigned/no-signer/unregistered-signer/no-wasm-sha256 deny paths
+  are pure CLJC and work on every host."
+  )
+
+;; ───────── hex codec (pure, portable to every CLJC host) ─────────
+
+(def ^:private hex-digits "0123456789abcdef")
+
+(def ^:private hex-value
+  "Every hex digit (both cases) -> its 0-15 value, for a strict decoder that
+  never silently accepts a bad digit."
+  (into {}
+        (concat (map-indexed (fn [i c] [c i]) "0123456789abcdef")
+                (map-indexed (fn [i c] [c i]) "0123456789ABCDEF"))))
+
+(defn hex-decode
+  "Strictly decode an even-length hex string `s` into a vector of byte values
+  (ints in [0,255], one per hex pair), most-significant nibble first. Throws
+  `ex-info` on odd length or an invalid hex digit -- a malformed key or
+  signature is never silently treated as empty. Pure CLJC (no host bignum or
+  byte-array types involved)."
+  [s]
+  (when-not (string? s)
+    (throw (ex-info "hex input must be a string"
+                     {:aiueos.signing/hex-error :not-a-string :value s})))
+  (when (odd? (count s))
+    (throw (ex-info (str "hex string must have even length, got " (count s) ": " (pr-str s))
+                     {:aiueos.signing/hex-error :odd-length :hex s})))
+  (mapv (fn [[hi lo]]
+          (let [h (get hex-value hi)
+                l (get hex-value lo)]
+            (when (or (nil? h) (nil? l))
+              (throw (ex-info (str "invalid hex digit in " (pr-str s))
+                               {:aiueos.signing/hex-error :bad-digit :hex s})))
+            (bit-or (bit-shift-left h 4) l)))
+        (partition 2 s)))
+
+(defn hex-encode
+  "Encode `bs` (any seqable of byte-ish values -- plain 0-255 ints as
+  `hex-decode` produces, or a JVM `byte-array`'s signed -128..127 elements)
+  into a lowercase hex string. The inverse of `hex-decode`."
+  [bs]
+  (apply str
+         (mapcat (fn [b]
+                   (let [v (bit-and (int b) 0xff)]
+                     [(nth hex-digits (bit-shift-right v 4))
+                      (nth hex-digits (bit-and v 0xf))]))
+                 bs)))
+
+;; ───────── artifact integrity (ADR-0003's other half; sha256, JVM-only --
+;; the comparison itself is pure and lives in `aiueos.manifest/
+;; verify-wasm-integrity`, mirroring the hex-codec/Ed25519 split above)
+;; ─────────
+
+
+
+;; ───────── canonical signed message ─────────
+
+(defn- id->str
+  "Canonical string form of an `:aiueos/component`-shaped id (a keyword or
+  non-empty string, per `aiueos.contract/component-id?`), for building the
+  signed message and human-readable violation text. Keywords render as
+  `ns/name` (no leading `:`); strings pass through unchanged."
+  [id]
+  (cond
+    (keyword? id) (if-let [ns* (namespace id)] (str ns* "/" (name id)) (name id))
+    (string? id) id
+    :else (str id)))
+
+(defn signed-message
+  "The canonical bytes a manifest signature covers: the component id, a
+  newline, then `:aiueos/wasm-sha256`. Returns `nil` if `manifest` has no
+  `:aiueos/wasm-sha256` -- there is nothing to bind a signature to.
+
+  Inlined here (rather than depending on a not-yet-landed
+  `aiueos.manifest/signed-message`, since `aiueos.manifest` is being ported
+  concurrently by another agent) -- this is the same one-line computation,
+  derived directly from `:aiueos/component` + `:aiueos/wasm-sha256`."
+  [manifest]
+  (when-let [sha (:aiueos/wasm-sha256 manifest)]
+    (str (id->str (:aiueos/component manifest)) "\n" sha)))
+
+;; ───────── result shape helpers ─────────
+
+(defn violation?
+  "True if `result` (the return of `verify`) is a bad-signature violation map
+  rather than a signing-status map. A violation always has `:aiueos/kind`
+  (`:bad-signature` here); a status map never does."
+  [result]
+  (and (map? result) (contains? result :aiueos/kind)))
+
+(defn unsigned?
+  "True if `result` (the return of `verify`) is the `:unsigned` status."
+  [result]
+  (= :unsigned (:aiueos.signing/status result)))
+
+(defn verified?
+  "True if `result` (the return of `verify`) is the `:verified` status."
+  [result]
+  (= :verified (:aiueos.signing/status result)))
+
+(defn signer-key-decision
+  "Resolve a signer registry entry to an active public key.
+
+  Legacy string entries remain active for research compatibility. A
+  lifecycle-aware entry is
+  `{:public-key hex :status :active :not-before-ms n :expires-at-ms n}`.
+  Every non-active status and every missing/out-of-window policy clock fails
+  closed. This function performs lifecycle admission before crypto verify."
+  [signer entry now-ms]
+  (cond
+    (string? entry)
+    {:allowed? true :public-key entry :legacy? true}
+
+    (not (map? entry))
+    {:allowed? false :reason :unregistered}
+
+    (not= :active (:status entry))
+    {:allowed? false :reason (or (:status entry) :missing-status)}
+
+    (not (string? (:public-key entry)))
+    {:allowed? false :reason :missing-public-key}
+
+    (and (or (contains? entry :not-before-ms)
+             (contains? entry :expires-at-ms))
+         (not (nat-int? now-ms)))
+    {:allowed? false :reason :missing-policy-clock}
+
+    (and (contains? entry :not-before-ms)
+         (or (not (nat-int? (:not-before-ms entry)))
+             (< now-ms (:not-before-ms entry))))
+    {:allowed? false :reason :not-yet-valid}
+
+    (and (contains? entry :expires-at-ms)
+         (or (not (nat-int? (:expires-at-ms entry)))
+             (>= now-ms (:expires-at-ms entry))))
+    {:allowed? false :reason :expired}
+
+    :else
+    {:allowed? true :public-key (:public-key entry) :legacy? false}))
+
+(defn- bad-signature
+  "Build a `:bad-signature` violation -- the same shape `aiueos.policy`'s
+  private `violation` helper builds: `{:aiueos/component c :aiueos/kind k
+  :aiueos/message m}`."
+  [component message]
+  {:aiueos/component component :aiueos/kind :bad-signature :aiueos/message message})
+
+;; ───────── Ed25519 (JVM-only; raw-key -> X.509 SPKI, same incantation as
+;; kagi.cacao/did-key->public) ─────────
+
+
+
+
+
+
+
+
+
+
+
+;; ───────── public API ─────────
+
+(defn verify
+  "Verify `manifest`'s (a normalized manifest map) signature against
+  `policy`'s (an effective policy, e.g. from `aiueos.policy/parse-policy`)
+  signer registry.
+
+  - No `:aiueos/signature` -> `{:aiueos.signing/status :unsigned}` (policy
+    decides whether that's allowed to run).
+  - Signed -> the signer must be registered in `:aiueos.policy/signers` AND
+    the signature must verify over `(signed-message manifest)`, else a hard
+    deny (a `:bad-signature` violation -- see the namespace docstring). A bad
+    signature is NEVER downgraded to unsigned.
+
+  Returns a signing-status map or a violation map -- see the namespace
+  docstring for the two shapes, and `violation?`/`unsigned?`/`verified?` to
+  tell them apart."
+  [manifest policy]
+  (let [component (:aiueos/component manifest)
+        sig-hex (:aiueos/signature manifest)]
+    (if (nil? sig-hex)
+      {:aiueos.signing/status :unsigned}
+      (or
+       (when (nil? (:aiueos/signer manifest))
+         (bad-signature component "signature present but no :aiueos/signer"))
+       (let [signer (:aiueos/signer manifest)
+             msg (signed-message manifest)]
+         (or
+          (when (nil? msg)
+            (bad-signature component "signed manifest must declare :aiueos/wasm-sha256"))
+          (let [entry (get (:aiueos.policy/signers policy) signer)
+                key-decision
+                (signer-key-decision signer entry
+                                     (:aiueos.policy/now-ms policy))
+                key-hex (:public-key key-decision)]
+            (or
+             (when-not (:allowed? key-decision)
+               (bad-signature component
+                              (str "signer `" (id->str signer)
+                                   "` is not active: "
+                                   (name (:reason key-decision)))))
+             (verify-signature-bytes component signer key-hex sig-hex msg)))))))))

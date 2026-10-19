@@ -1,0 +1,143 @@
+(ns kotoba.render.decal
+  "Portable terrain-projected PBR decals.
+
+   Decals are real tessellated meshes, not coplanar boxes. Every vertex is
+   projected through the same canonical heightfield sampler as roads. The
+   authored depth bias is converted to a world-space normal offset, which is
+   deterministic across WebGPU/WebGL/native backends and avoids z-fighting
+   without relying on a backend-specific raster-state sign convention."
+  (:require [kotoba.render.road :as road]))
+
+(def details [:high :medium :low])
+(def detail-budget
+  {:high {:rings 6 :sectors 32}
+   :medium {:rings 4 :sectors 20}
+   :low {:rings 2 :sectors 12}})
+
+(def default-material
+  {:base-color [0.18 0.15 0.12 0.88]
+   :metallic 0.0 :roughness 0.84 :normal-scale 0.7
+   :alpha-mode :blend :alpha-cutoff 0.05})
+
+(defn- sqrt [x] ( x))
+(defn- sin [x] ( x))
+(defn- cos [x] ( x))
+(def pi )
+
+(defn- finite-number? [x]
+  (and (number? x)
+       ))
+
+(defn- validate! [{:keys [center size rotation depth-bias terrain material]} detail]
+  (when-not (contains? detail-budget detail)
+    (throw (ex-info "unsupported decal detail" {:detail detail :supported details})))
+  (when-not (and (= 2 (count center)) (every? finite-number? center)
+                 (= 2 (count size)) (every? #(and (finite-number? %) (pos? %)) size)
+                 (finite-number? rotation)
+                 (finite-number? depth-bias) (pos? depth-bias))
+    (throw (ex-info "invalid decal projection" {:center center :size size
+                                                  :rotation rotation :depth-bias depth-bias})))
+  (when-not (and (map? terrain) (pos? (:size terrain)) (pos? (:base-segments terrain))
+                 (number? (:amplitude terrain)) (integer? (:seed terrain)))
+    (throw (ex-info "decal requires a canonical terrain heightfield" {:terrain terrain})))
+  (when-not (and (map? material)
+                 (#{:opaque :mask :blend} (:alpha-mode material))
+                 (<= 0.0 (:alpha-cutoff material) 1.0)
+                 (<= 0.0 (:metallic material) 1.0)
+                 (<= 0.04 (:roughness material) 1.0))
+    (throw (ex-info "invalid decal PBR/alpha material" {:material material}))))
+
+(defn- projected-normal [terrain x z]
+  (let [cell (/ (:size terrain) (:base-segments terrain))
+        e (* cell 0.5)
+        dx (/ (- (road/terrain-height terrain (+ x e) z)
+                 (road/terrain-height terrain (- x e) z)) (* 2.0 e))
+        dz (/ (- (road/terrain-height terrain x (+ z e))
+                 (road/terrain-height terrain x (- z e))) (* 2.0 e))
+        length (sqrt (+ (* dx dx) 1.0 (* dz dz)))]
+    [(/ (- dx) length) (/ 1.0 length) (/ (- dz) length)]))
+
+(defn decal-mesh
+  "Bake an elliptical terrain-projected stamp as `[positions normals uvs indices]`.
+
+   Concentric rings provide enough interior samples to follow uneven ground;
+   the outer ring may be alpha-masked/blended by the bound material texture.
+   `:size [width depth]`, `:center [x z]`, and `:rotation` are world-space."
+  ([spec] (decal-mesh spec :high))
+  ([spec detail]
+   (let [spec (-> {:center [0.0 0.0] :size [2.0 2.0] :rotation 0.0
+                   :depth-bias 0.006 :material default-material}
+                  (merge spec)
+                  (update :material #(merge default-material %)))
+         _ (validate! spec detail)
+         {:keys [center size rotation depth-bias terrain]} spec
+         [cx cz] center [width depth] size
+         {:keys [rings sectors]} (get detail-budget detail)
+         cr (cos rotation) sr (sin rotation)
+         sample (fn [ring sector]
+                  (let [radius (/ ring (double rings))
+                        angle (* 2.0 pi (/ sector (double sectors)))
+                        lx (* radius 0.5 width (cos angle))
+                        lz (* radius 0.5 depth (sin angle))
+                        x (+ cx (- (* lx cr) (* lz sr)))
+                        z (+ cz (+ (* lx sr) (* lz cr)))
+                        [nx ny nz :as normal] (projected-normal terrain x z)
+                        y (+ (road/terrain-height terrain x z) (* depth-bias ny))]
+                    {:position [(double (+ x (* depth-bias nx))) y
+                                (double (+ z (* depth-bias nz)))]
+                     :normal normal
+                     :uv [(+ 0.5 (* 0.5 radius (cos angle)))
+                          (+ 0.5 (* 0.5 radius (sin angle)))]}))
+         center-vertex (let [[x z] center
+                             [nx ny nz :as normal] (projected-normal terrain x z)]
+                         {:position [(+ x (* depth-bias nx))
+                                     (+ (road/terrain-height terrain x z) (* depth-bias ny))
+                                     (+ z (* depth-bias nz))]
+                          :normal normal :uv [0.5 0.5]})
+         vertices (into [center-vertex]
+                        (for [ring (range 1 (inc rings))
+                              sector (range sectors)]
+                          (sample ring sector)))
+         index-of (fn [ring sector]
+                    (if (zero? ring) 0
+                        (+ 1 (* (dec ring) sectors) (mod sector sectors))))
+         center-fan (mapcat (fn [s] [0 (index-of 1 (inc s)) (index-of 1 s)])
+                            (range sectors))
+         ring-quads (mapcat (fn [[ring sector]]
+                              (let [a (index-of ring sector)
+                                    b (index-of ring (inc sector))
+                                    c (index-of (inc ring) sector)
+                                    d (index-of (inc ring) (inc sector))]
+                                [a d c a b d]))
+                            (for [ring (range 1 rings) sector (range sectors)] [ring sector]))]
+     [(vec (mapcat :position vertices))
+      (vec (mapcat :normal vertices))
+      (vec (mapcat :uv vertices))
+      (vec (concat center-fan ring-quads))])))
+
+(defn decal-lods [spec]
+  (mapv (fn [[detail min-pixels]]
+          (let [[_ _ _ indices :as mesh] (decal-mesh spec detail)]
+            {:id detail :min-pixels min-pixels :mesh mesh
+             :triangle-count (quot (count indices) 3)}))
+        [[:high 96.0] [:medium 36.0] [:low 0.0]]))
+
+(defn webgpu-registration
+  "Register all LODs and retain renderer-neutral decal/material metadata."
+  [registration-id spec]
+  (let [material (merge default-material (:material spec))]
+    (into {}
+          (for [{detail :id :keys [mesh triangle-count]} (decal-lods spec)
+                :let [[positions normals uvs indices] mesh
+                      key (keyword (str (name registration-id) "-" (name detail)))]]
+            [key {:type :mesh
+                  :mesh {:positions (mapv vec (partition 3 positions))
+                         :normals (mapv vec (partition 3 normals))
+                         :uvs (mapv vec (partition 2 uvs)) :indices indices}
+                  :decal {:schema :kotoba.render/terrain-decal-v1
+                          :projection :terrain-following
+                          :depth-bias (:depth-bias spec 0.006)
+                          :alpha-mode (:alpha-mode material)
+                          :alpha-cutoff (:alpha-cutoff material)
+                          :pbr (select-keys material [:base-color :metallic :roughness :normal-scale])}
+                  :triangle-count triangle-count}]))))

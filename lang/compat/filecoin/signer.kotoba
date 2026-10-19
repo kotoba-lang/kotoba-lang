@@ -1,0 +1,189 @@
+(ns filecoin.signer
+  "secp256k1 signing for Filecoin — the `f1` path, on both runtimes.
+
+  `io-filecoin` deliberately pins no curve: signing is a seam
+  (`filecoin.protocols/ISigner`) so the same message code runs on a JVM, in a
+  Worker, or behind a WASM capability import, and a key can stay in a
+  Keychain. This repo is the seam filled in for the one case that needs no
+  new cryptography — secp256k1, which `eth-crypto` already implements
+  deterministically on both platforms.
+
+  ## What differs from Ethereum, and it is only the last step
+
+  The curve is the same and the signature is the same 65 bytes (r‖s‖v). The
+  chains part company at address derivation and at what gets hashed:
+
+  |  | Ethereum | Filecoin `f1` |
+  |---|---|---|
+  | address | keccak-256(X‖Y)[12:] | BLAKE2b-160(`0x04`‖X‖Y) |
+  | digest | keccak-256 of the payload | BLAKE2b-256 of the message CID |
+
+  Note the `0x04`. Ethereum hashes the 64-byte key; Filecoin hashes the
+  65-byte SEC1 uncompressed form, prefix included. Omitting it produces a
+  perfectly well-formed `f1` address for an account nobody controls, and
+  nothing complains until a transfer disappears into it.
+
+  ## What this cannot sign
+
+  - **`f3` (BLS12-381)** — no implementation of that curve exists anywhere in
+    this workspace.
+  - **Delegated (type 3)**, the FEVM path. A delegated signature covers the
+    RLP-encoded unsigned Ethereum transaction, keccak-hashed, not the message
+    CID — see `filecoin.signature`. It is not even the same *shape*, which is
+    worth writing down because a length check is the first thing that catches
+    a caller feeding one to `recover-public-key`:
+
+        EIP-1559 (type 2)   r ‖ s ‖ v          65 bytes, v ∈ {0,1}
+        legacy EIP-155      0x02 ‖ r ‖ s ‖ v   67 bytes on mainnet, since
+                                               v = chainId·2 + 35 = 663 takes
+                                               two, and the leading byte says
+                                               which kind it is
+
+    (`EthLegacy155TxSignaturePrefix`; lotus normalises both through
+    `ToVerifiableSignature`. Both shapes are present in this repo's mainnet
+    vectors.) `eth-crypto` now has RLP, keccak and EIP-1559 signing on both
+    runtimes, so building this is possible; what is missing is the exact
+    Filecoin↔EthTransaction round-trip lotus requires, and getting it wrong
+    produces a signature the network rejects rather than an error here."
+  (:require [eth-crypto.core :as eth]
+            [filecoin.address :as addr]
+            [filecoin.message :as msg]
+            [filecoin.protocols :as p]
+            [filecoin.signature :as sig]))
+
+(def ^:const private-key-bytes 32)
+(def ^:const signature-bytes 65)
+
+(def ^:const sec1-uncompressed-prefix
+  "The `0x04` that says \"what follows is an uncompressed point\". Ethereum
+  drops it before hashing; Filecoin does not."
+  0x04)
+
+;; ── bytes ────────────────────────────────────────────────────────────────────
+;; eth-crypto returns a byte-array on :clj and a vector of ints on :cljs, so
+;; everything crossing that boundary is normalised to a vector of ints here.
+
+(defn- ->ints [x]
+  (cond (nil? x) []
+        (vector? x) (mapv #(bit-and (int %) 0xff) x)
+        (string? x) (->ints (eth/hex->bytes x))
+        :else (mapv #(bit-and (int %) 0xff) (seq x))))
+
+(defn- ->platform-bytes [ints]
+  )
+
+(defn- big->32 [n]
+  (let [h 
+        h (str (apply str (repeat (- 64 (count h)) "0")) h)]
+    (->ints (eth/hex->bytes h))))
+
+;; ── keys ─────────────────────────────────────────────────────────────────────
+
+(defn public-key
+  "A 32-byte private key → the **65-byte** SEC1 uncompressed public key,
+  `0x04` ‖ X ‖ Y. This is the form Filecoin hashes; `eth-crypto` returns the
+  64 bytes without the prefix, because Ethereum hashes that."
+  [privkey]
+  (let [k (->ints privkey)]
+    (when-not (= private-key-bytes (count k))
+      (throw (ex-info "signer: a private key is 32 bytes" {:bytes (count k)})))
+    (into [sec1-uncompressed-prefix] (->ints (eth/private->public (->platform-bytes k))))))
+
+(defn address
+  "The `f1` address a private key controls."
+  ([privkey] (address privkey :mainnet))
+  ([privkey network] (addr/secp256k1 (public-key privkey) network)))
+
+(defn address-string
+  ([privkey] (addr/to-string (address privkey)))
+  ([privkey network] (addr/to-string (address privkey network))))
+
+;; ── signing ──────────────────────────────────────────────────────────────────
+
+(defn sign-digest
+  "A 32-byte digest → a 65-byte `r ‖ s ‖ v` signature, `v` ∈ {0,1}.
+
+  Deterministic: the nonce is RFC-6979, so the same key and digest always
+  give the same bytes. That is a correctness property rather than a
+  convenience — a repeated or biased nonce leaks the private key outright,
+  and a random one cannot be audited after the fact."
+  [privkey digest]
+  (let [d (->ints digest)]
+    (when-not (= 32 (count d))
+      (throw (ex-info "signer: a digest is 32 bytes" {:bytes (count d)})))
+    (let [{:keys [r s recovery-id]}
+          (eth/secp256k1-sign (->platform-bytes (->ints privkey)) (->platform-bytes d))]
+      (conj (into (big->32 r) (big->32 s)) recovery-id))))
+
+(defn recover-public-key
+  "Digest + 65-byte signature → the 65-byte public key that produced it."
+  [digest signature]
+  (let [s (->ints signature)]
+    (when-not (= signature-bytes (count s))
+      (throw (ex-info "signer: a signature is 65 bytes" {:bytes (count s)})))
+    (into [sec1-uncompressed-prefix]
+          (->ints (eth/ecrecover-pubkey (->platform-bytes (->ints digest))
+                                        (->platform-bytes s))))))
+
+(defn recover-address
+  "The `f1` address that signed. Recovery is what verification *is* here:
+  there is no separate check, only recovering the signer and seeing whether
+  it is the one the message claims."
+  ([digest signature] (recover-address digest signature :mainnet))
+  ([digest signature network]
+   (addr/secp256k1 (recover-public-key digest signature) network)))
+
+;; ── messages ─────────────────────────────────────────────────────────────────
+
+(defn sign-message
+  "Sign a message with secp256k1 — the whole `f1` path.
+
+  The digest is BLAKE2b-256 of the binary message CID, which is
+  `filecoin.message/digest-for-secp256k1`: the CID is already a BLAKE2b-256,
+  so the payload is hashed twice in total. Signing the CID unhashed produces
+  a signature nothing accepts."
+  [privkey message]
+  (sig/signed-message message
+                      (sig/signature sig/secp256k1
+                                     (sign-digest privkey (msg/digest-for-secp256k1 message)))))
+
+(defn verify-message
+  "Does the signature on this signed message come from its `from` address?
+
+  Only meaningful for type 1. A **BLS** signature is a different curve, and a
+  **delegated** one covers the Ethereum transaction rather than this digest —
+  for either, this returns false, which is correct but is not evidence the
+  signature is bad."
+  [signed]
+  (let [{:keys [message signature]} signed]
+    (and (= sig/secp256k1 (:type signature))
+         (let [from (:from message)
+               recovered (recover-address (msg/digest-for-secp256k1 message)
+                                          (:data signature)
+                                          (:network from :mainnet))]
+           (= (:payload from) (:payload recovered))))))
+
+(defn signer
+  "An `ISigner` over a private key, for the seam `io-filecoin` leaves open.
+
+  The protocol takes an `address` as well as a digest, because a host may
+  hold many keys; this one holds exactly one and **refuses** a request for
+  any other. Silently signing with the only key it has would be the wrong
+  answer to \"sign as someone else\".
+
+  Holds the key. Everything above is a plain function taking one, so a caller
+  who would rather keep the key in a KMS can implement `ISigner` directly and
+  never construct this."
+  ([privkey] (signer privkey :mainnet))
+  ([privkey network]
+   (let [mine (address privkey network)]
+     (reify p/ISigner
+       (sign [_ address digest]
+         (let [want (cond (nil? address) mine
+                          (map? address) address
+                          :else (addr/from-string address))]
+           (when-not (= (:payload mine) (:payload want))
+             (throw (ex-info "signer: asked to sign as a different address"
+                             {:have (addr/to-string mine)
+                              :asked (addr/to-string want)})))
+           (sig/signature sig/secp256k1 (sign-digest privkey digest))))))))

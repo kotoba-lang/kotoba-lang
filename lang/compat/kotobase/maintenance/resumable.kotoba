@@ -1,0 +1,152 @@
+(ns kotobase.maintenance.resumable
+  "Pure durable state for invocation-bounded query/materialization work.
+
+  Payloads and cursors are immutable IPLD values. The host owns only a small
+  ETag-CAS pointer to the latest checkpoint. EXPECTED-HEAD pins every task,
+  spill, and checkpoint to one database snapshot; a changed head fences resume."
+  (:require [ipld.core :as ipld]))
+
+(def format-version 1)
+(def kinds #{:join-frontier :bundle-compaction})
+(def statuses #{:running :completed :failed :cancelled})
+
+(defn- encoded [node]
+  (let [bytes (ipld/encode node)]
+    {:node node :bytes bytes :cid (ipld/cid bytes)}))
+
+(defn checkpoint-cid
+  "Canonical CID of a decoded checkpoint or an encoded checkpoint result."
+  [checkpoint]
+  (if (:cid checkpoint)
+    (:cid checkpoint)
+    (ipld/cid (ipld/encode (if (:node checkpoint)
+                             (:node checkpoint)
+                             checkpoint)))))
+
+(defn task
+  "Build a deterministic task identity. WORKLOAD-CID addresses the immutable
+  query/compaction input. Host identity, wall clock, token, and attempt are
+  deliberately excluded so retries share one idempotency domain."
+  [{:keys [kind db-id expected-head workload-cid max-items max-bytes]}]
+  (when-not (and (contains? kinds kind)
+                 (string? db-id) (seq db-id)
+                 (string? expected-head) (seq expected-head)
+                 workload-cid
+                 (pos-int? max-items) (pos-int? max-bytes))
+    (throw (ex-info "Invalid resumable execution task"
+                    {:kind kind :db-id db-id :expected-head expected-head
+                     :workload-cid workload-cid :max-items max-items
+                     :max-bytes max-bytes})))
+  (encoded
+   {"format" "kotobase/resumable-task"
+    "version" format-version
+    "kind" (name kind)
+    "db-id" db-id
+    "expected-head" expected-head
+    "workload" (ipld/link workload-cid)
+    "max-items" max-items
+    "max-bytes" max-bytes}))
+
+(defn initial-checkpoint
+  "Create attempt-scoped immutable state before the first work partition."
+  [{:keys [task token attempt cursor]}]
+  (when-not (and (:cid task) (string? token) (seq token) (pos-int? attempt))
+    (throw (ex-info "Invalid resumable execution attempt"
+                    {:token token :attempt attempt})))
+  (encoded
+   (cond->
+    {"format" "kotobase/resumable-checkpoint"
+     "version" format-version
+     "task" (ipld/link (:cid task))
+     "expected-head" (get-in task [:node "expected-head"])
+     "token" token
+     "attempt" attempt
+     "status" "running"
+     "next-ordinal" 0
+     "processed-items" 0
+     "processed-bytes" 0}
+     (some? cursor) (assoc "cursor" cursor))))
+
+(defn validate-checkpoint
+  "Fail closed on malformed or cross-attempt checkpoint state."
+  [checkpoint task token attempt]
+  (let [node (if (:node checkpoint) (:node checkpoint) checkpoint)]
+    (when-not
+     (and (= "kotobase/resumable-checkpoint" (get node "format"))
+          (= format-version (get node "version"))
+          (= (:cid task) (ipld/link-cid (get node "task")))
+          (= (get-in task [:node "expected-head"])
+             (get node "expected-head"))
+          (= token (get node "token"))
+          (= attempt (get node "attempt"))
+          (contains? (set (map name statuses)) (get node "status"))
+          (nat-int? (get node "next-ordinal"))
+          (nat-int? (get node "processed-items"))
+          (nat-int? (get node "processed-bytes")))
+      (throw (ex-info "Malformed or fenced resumable checkpoint"
+                      {:checkpoint node :task (:cid task)
+                       :token token :attempt attempt})))
+    node))
+
+(defn advance
+  "Append one immutable spill partition and its successor checkpoint. ORDINAL
+  must equal checkpoint.next-ordinal; duplicate or out-of-order work is fenced.
+  ITEM/BYTE counts are cumulative observability, not identity shortcuts."
+  [{:keys [task checkpoint token attempt ordinal cursor-after payload
+           item-count byte-count]}]
+  (let [current (validate-checkpoint checkpoint task token attempt)]
+    (when-not (and (= "running" (get current "status"))
+                   (= ordinal (get current "next-ordinal"))
+                   (nat-int? item-count) (nat-int? byte-count))
+      (throw (ex-info "Invalid resumable execution advance"
+                      {:status (get current "status")
+                       :expected-ordinal (get current "next-ordinal")
+                       :ordinal ordinal :item-count item-count
+                       :byte-count byte-count})))
+    (let [spill
+          (encoded
+           (cond->
+            {"format" "kotobase/resumable-spill"
+             "version" format-version
+             "task" (ipld/link (:cid task))
+             "expected-head" (get current "expected-head")
+             "token" token
+             "attempt" attempt
+             "ordinal" ordinal
+             "item-count" item-count
+             "byte-count" byte-count
+             "payload" payload}
+             (get current "spill-head")
+             (assoc "previous-spill" (get current "spill-head"))))
+          next-node
+          (cond->
+           (-> current
+               (assoc "next-ordinal" (inc ordinal)
+                      "spill-head" (ipld/link (:cid spill)))
+               (update "processed-items" + item-count)
+               (update "processed-bytes" + byte-count))
+            (some? cursor-after) (assoc "cursor" cursor-after))
+          next-checkpoint (encoded next-node)]
+      {:spill spill :checkpoint next-checkpoint})))
+
+(defn finish
+  "Create an immutable terminal checkpoint. RESULT-CID, when present, pins the
+  completed output; errors are data supplied by the host without a wall clock.
+  Cancellation is a terminal, result-free state whose reason remains canonical
+  data in the checkpoint."
+  [{:keys [task checkpoint token attempt status result-cid error]}]
+  (let [current (validate-checkpoint checkpoint task token attempt)]
+    (when-not (and (= "running" (get current "status"))
+                   (contains? #{:completed :failed :cancelled} status)
+                   (case status
+                     :completed (some? result-cid)
+                     :failed (some? error)
+                     :cancelled (some? error)
+                     false))
+      (throw (ex-info "Invalid resumable execution finish"
+                      {:current-status (get current "status")
+                       :status status :result-cid result-cid})))
+    (encoded
+     (cond-> (assoc current "status" (name status))
+       result-cid (assoc "result" (ipld/link result-cid))
+       (some? error) (assoc "error" error)))))

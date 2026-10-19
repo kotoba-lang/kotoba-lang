@@ -1,0 +1,294 @@
+(ns kagi.store
+  "SSoT 注入境界。コアは backend へ `:db-api` map `{:q :transact! :db :pull :entid}`
+  越しにのみ喋る(直呼び禁止)。`MemStore`(in-mem, test) ≡ `KotobaStore`(langchain
+  kotoba-db XRPC, CACAO 自己発行) を contract test で等価保証。
+
+  暗号文 blob 自体は kotoba `SealedBlockStore`(B2/IPFS cold)に置き、ここは CID/メタ/
+  grant/台帳のみ扱う。"
+  (:require [kagi.vault :as vault]))
+
+(defprotocol Store
+  (member [s did])
+  (put-member! [s member-rec])      ; depth-1 self-mint: actor が自分の公開鍵束を登録
+  (item [s id])
+  (items-in [s compartment])
+  (grants-of [s item-id])
+  (ledger [s])
+  ;; 副作用ゲート(operation の副作用ノードからのみ呼ぶ)
+  (put-item! [s item-rec])          ; :item/create | :item/update | :item/rotate
+  (put-grant! [s grant-rec])        ; :share/grant
+  (revoke-grant! [s grant-id])      ; :share/revoke
+  ;; 暗号文 blob(SealedBlockStore 抽象)
+  (block-get [s cid])
+  (block-put! [s cid bytes])
+  ;; 監査台帳(append-only、ハッシュ鎖)
+  (append-ledger! [s fact])
+  ;; Rotation block/item/grants/DAG event/ledger entry become visible together.
+  (commit-rekey! [s plan build-ledger])
+  ;; build-fn: (fn [ledger] entry) -- kagi.ledger/make-entry と同じ形。read
+  ;; ledger snapshot -> build entry -> append を一つの原子操作にする。呼び手
+  ;; (kagi.operation の :effect/:hold ノード)が (ledger s) を読んでから
+  ;; make-entry で :ledger/seq/:ledger/prev-hash/:ledger/hash を計算し、別途
+  ;; append-ledger! する2段階だと、2つの並行呼び出しが同じ snapshot から同じ
+  ;; seq/prev-hash を計算してしまい、どちらも改竄していないのに verify-chain
+  ;; が hash 鎖破損として検知してしまう(実測: MemStore で2並行呼び出しを再現
+  ;; したところ両方 :ledger/seq 0 になり verify-chain が :broken-at 1 を返した)。
+  (append-chained-ledger! [s build-fn]))
+
+(defprotocol SealedBlockStore
+  "Ciphertext-only block boundary. Implementations may use B2/Storj/IPFS/Kotoba,
+  but must never receive plaintext or raw VMKs.
+
+  **`cid` is a key, not a content hash.** This docstring used to say
+  \"content-addressed\", but the ids that actually arrive are minted by
+  `kagi.operation` as `\"cid:<item-id>:v<version>\"` — a path. Nothing here can
+  verify bytes against such an id, and an implementation that claims to is
+  lying. What the naming *does* give is that each version gets its own key, so
+  a key is written once and never legitimately rewritten with different bytes
+  — which is what `object-sealed-block-store` enforces instead."
+  (sealed-get [s cid])
+  (sealed-put! [s cid bytes]))
+
+(defrecord MemorySealedBlockStore [blocks]
+  SealedBlockStore
+  (sealed-get [_ cid] (get @blocks cid))
+  (sealed-put! [s cid bytes] (swap! blocks assoc cid bytes) s))
+
+(defn memory-sealed-block-store [] (->MemorySealedBlockStore (atom {})))
+
+;; ───────── object store 上の SealedBlockStore(B2 / Storj / 任意の S3) ─────────
+
+(defn- bytes=
+  "Byte 列の内容比較。`=` は JVM の `byte[]` では参照比較になるので使えない
+  (`org-signal` の CLJS 移植が同じ罠で毎メッセージ DH ratchet していた)。"
+  [a b]
+  (let [->seq (fn [x] (cond (nil? x) nil
+                            (sequential? x) (seq x)
+                            :else (seq )))]
+    (= (->seq a) (->seq b))))
+
+(defn- ->host-bytes
+  "四関数が返す「0-255 の vector」を、crypto provider が食える host のバイト列へ。
+
+  `storj.store` は両方向とも unsigned int の vector を契約にしている一方、
+  `kagi.crypto` の AEAD は JVM で `byte[]`、ブラウザで `Uint8Array` を取る。
+  変換を毎呼び出し側でやると、片方だけ忘れた経路が復号時まで気づかれない。"
+  [v]
+  (cond
+    (nil? v) nil
+    (sequential? v) 
+    :else v))
+
+(defrecord ObjectSealedBlockStore [get-object put-object exists? allow-overwrite?]
+  SealedBlockStore
+  (sealed-get [_ cid] (->host-bytes (get-object cid)))
+  (sealed-put! [s cid bytes]
+    ;; 既存キーへの上書きを既定で拒む。cid は version 込みなので、同じキーに
+    ;; 違うバイト列が来るのは bug か攻撃であり、黙って上書きすると **まだ grant が
+    ;; 指している前の版の暗号文が消える**。同一バイト列の再 PUT(部分失敗からの
+    ;; リトライ)は通す — ここで弾くと正当なリトライが詰む。
+    (when-not allow-overwrite?
+      (when (and exists? (exists? cid))
+        (let [existing (->host-bytes (get-object cid))]
+          (when-not (bytes= existing bytes)
+            (throw (ex-info "sealed block key already holds different ciphertext"
+                            {:cid cid
+                             :existing-bytes (count (or existing []))
+                             :incoming-bytes (count (or bytes []))}))))))
+    (put-object cid bytes)
+    s))
+
+(defn object-sealed-block-store
+  "`{:get-object :put-object :exists?}` の上に `SealedBlockStore` を張る。
+
+  この 4 関数は `storj.store/store-fns` が返す形そのもの(Storj Gateway-MT でも、
+  同じ S3 面を出す Backblaze B2 でも、endpoint 違いで同じものが使える)。**kagi は
+  io-storj に依存しない** —— 依存を持つのは両方を配線するアプリケーション側で、
+  それは `storj.store` の ns docstring が明示している設計意図でもある。
+
+  opts:
+    `:allow-overwrite?` 既定 false。true にすると既存キーの検査を省く(HEAD が
+    1 往復減るが、前の版の暗号文を消しうる)。"
+  ([fns] (object-sealed-block-store fns {}))
+  ([{:keys [get-object put-object exists?]} {:keys [allow-overwrite?]}]
+   (when-not (and (fn? get-object) (fn? put-object))
+     (throw (ex-info "object-sealed-block-store needs :get-object and :put-object"
+                     {:got (cond-> #{} (fn? get-object) (conj :get-object)
+                                       (fn? put-object) (conj :put-object))})))
+   (->ObjectSealedBlockStore get-object put-object exists? (boolean allow-overwrite?))))
+
+;; ───────── IPFS 上の SealedBlockStore ─────────
+;;
+;; **同じアダプタには載らない。** object store は「呼び出し側が名前を決めて、その名前に
+;; バイト列を置く」面だが、IPFS は逆で「バイト列を渡すと、内容から決まるアドレスが
+;; 返る」面。kagi が渡す `cid` は `cid:<item-id>:v<n>` という**パス**なので、IPFS に
+;; そのまま渡す先が無い。
+;;
+;; したがって IPFS 版は **name → CID の可変ポインタ層**を必ず伴う。それを隠して
+;; 「IPFS に置ける」と言うと、ポインタをどこに永続化するかという本質的な問いが
+;; 消えてしまう —— ここでは注入させて、呼び出し側に決めさせる(kagi なら Datomic graph、
+;; 他のホストなら KV でも構わない)。
+;;
+;; 引き換えに、object store 版には無い性質が 2 つ手に入る:
+;;   1. **同一バイト列は必ず同じ CID になる**ので、リトライの冪等性を GET して
+;;      比較せずに判定できる(object store 版は HEAD + GET が要った)。
+;;   2. **本物の content addressing** なので、取ってきたバイト列を検証できる
+;;      (`:verify-fn` を渡した場合のみ。渡さなければ gateway を信用することになる)。
+
+(defrecord IpfsSealedBlockStore [add-bytes cat-bytes get-pointer put-pointer! verify-fn]
+  SealedBlockStore
+  (sealed-get [_ cid]
+    (when-let [content-cid (get-pointer cid)]
+      (let [bytes (cat-bytes content-cid)]
+        (when (and verify-fn bytes (not (verify-fn content-cid bytes)))
+          (throw (ex-info "fetched bytes do not match the content address"
+                          {:key cid :content-cid content-cid})))
+        bytes)))
+  (sealed-put! [s cid bytes]
+    (let [content-cid (add-bytes bytes)
+          existing (get-pointer cid)]
+      ;; 既存ポインタが**別の** CID を指しているなら拒む。同じ CID なら、それは
+      ;; 同一バイト列の再投入(部分失敗からのリトライ)なので通す —— content
+      ;; addressing のおかげで、バイト列を取り直して比べる必要が無い。
+      (when (and existing (not= existing content-cid))
+        (throw (ex-info "sealed block key already points at different content"
+                        {:key cid :existing existing :incoming content-cid})))
+      (when-not existing
+        (put-pointer! cid content-cid))
+      s)))
+
+(defn ipfs-sealed-block-store
+  "IPFS の上に `SealedBlockStore` を張る。**ポインタ層が必須。**
+
+  引数:
+    `:add-bytes`   `[bytes] -> content-cid`（`kotoba.lang.ipfs/pin-blob` の `:cid`）
+    `:cat-bytes`   `[content-cid] -> bytes`（`fetch-blob`）
+    `:get-pointer` `[key] -> content-cid | nil`
+    `:put-pointer!` `[key content-cid] -> any`
+    `:verify-fn`   任意。`[content-cid bytes] -> boolean`。**渡さないと gateway を
+                   信用することになる**(暗号文は AEAD で封緘されているので改竄は
+                   復号時に落ちるが、原因が遠くなる)。"
+  [{:keys [add-bytes cat-bytes get-pointer put-pointer! verify-fn]}]
+  (let [missing (cond-> #{}
+                  (not (fn? add-bytes)) (conj :add-bytes)
+                  (not (fn? cat-bytes)) (conj :cat-bytes)
+                  (not (fn? get-pointer)) (conj :get-pointer)
+                  (not (fn? put-pointer!)) (conj :put-pointer!))]
+    (when (seq missing)
+      (throw (ex-info "ipfs-sealed-block-store is missing required functions"
+                      {:missing missing
+                       :note "IPFS はアドレスを返す面なので、name→CID のポインタ層が要る"}))))
+  (->IpfsSealedBlockStore add-bytes cat-bytes get-pointer put-pointer! verify-fn))
+
+;; ───────── MemStore(依存ゼロ、.cljc 可搬) ─────────
+
+(defrecord MemStore [a]
+  Store
+  (member [_ did] (get-in @a [:members did]))
+  (put-member! [s rec] (swap! a assoc-in [:members (:member/did rec)] rec) s)
+  (item [_ id] (get-in @a [:items id]))
+  (items-in [_ c] (filterv #(= c (:item/compartment %)) (vals (:items @a))))
+  (grants-of [_ item-id] (filterv #(= item-id (:grant/item %)) (vals (:grants @a))))
+  (ledger [_] (:ledger @a))
+  (put-item! [s rec] (swap! a assoc-in [:items (:item/id rec)] rec) s)
+  (put-grant! [s rec] (swap! a assoc-in [:grants (:grant/id rec)] rec) s)
+  (revoke-grant! [s gid] (swap! a assoc-in [:grants gid :grant/revoked] true) s)
+  (block-get [_ cid] (get-in @a [:blocks cid]))
+  (block-put! [s cid bytes] (swap! a assoc-in [:blocks cid] bytes) s)
+  ;; entry は kagi.ledger/make-entry が seq/prev-hash/hash/sig を付けた完成形を渡す。
+  ;; store は append-only の保管のみ担う(改竄検知のロジックは ledger ns)。
+  (append-ledger! [_ entry] (swap! a update :ledger (fnil conj []) entry) entry)
+  (commit-rekey! [_ {:keys [block item grants rotation-event]} build-ledger]
+    (let [captured (volatile! nil)]
+      (swap! a
+             (fn [state]
+               (let [entry (build-ledger (:ledger state))]
+                 (vreset! captured entry)
+                 (-> state
+                     (assoc-in [:blocks (:cid block)] (:bytes block))
+                     (assoc-in [:items (:item/id item)] item)
+                     (update :grants
+                             (fn [existing]
+                               (reduce (fn [acc grant]
+                                         (assoc acc (:grant/id grant) grant))
+                                       (or existing {}) grants)))
+                     (assoc-in [:rotation-events (:rotation/id rotation-event)] rotation-event)
+                     (update :ledger (fnil conj []) entry)))))
+      {:ledger-entry @captured :rotation-event rotation-event :item item}))
+  ;; swap! の再試行セマンティクスで read+build+append を原子化する: 競合して
+  ;; f が複数回呼ばれても、実際に CAS が成功した最後の呼び出しは常に「その時点の
+  ;; 最新 ledger」から entry を組み立てるので、2並行呼び出しが同じ seq/prev-hash
+  ;; を計算することは構造的に起こらない。
+  (append-chained-ledger! [_ build-fn]
+    (let [captured (volatile! nil)]
+      (swap! a (fn [state]
+                 (let [entry (build-fn (:ledger state))]
+                   (vreset! captured entry)
+                   (update state :ledger (fnil conj []) entry))))
+      @captured)))
+
+(defn mem-store
+  ([] (mem-store {}))
+  ([seed] (->MemStore (atom (merge {:members {} :items {} :grants {}
+                                    :blocks {} :ledger [] :rotation-events {}}
+                                   seed)))))
+
+;; ───────── KotobaStore(:db-api 越し) ─────────
+;; backend は `langchain.kotoba-db/kotoba-api`(kotoba-server XRPC) または
+;; `langchain.db/api`(in-process Datomic)。conn は CACAO 自己発行(kagi.identity)。
+;; schema は `kagi.vault/schema`。ここは shape のみ示す(配線は段階導入)。
+
+(defrecord KotobaStore [db-api conn sealed-block-store]
+  Store
+  (member [_ did] ((:pull db-api) conn '[*] [:member/did did]))
+  (put-member! [s rec] ((:transact! db-api) conn [rec]) s)
+  (item [_ id] ((:pull db-api) conn '[*] [:item/id id]))
+  (items-in [_ c]
+    ((:q db-api) '[:find [(pull ?e [*]) ...] :in $ ?c
+                   :where [?e :item/compartment ?c]] conn c))
+  (grants-of [_ item-id]
+    ((:q db-api) '[:find [(pull ?e [*]) ...] :in $ ?i
+                   :where [?e :grant/item ?i]] conn item-id))
+  (ledger [_]
+    ((:q db-api) '[:find [(pull ?e [*]) ...] :where [?e :ledger/seq _]] conn))
+  (put-item! [s rec] ((:transact! db-api) conn [rec]) s)
+  (put-grant! [s rec] ((:transact! db-api) conn [rec]) s)
+  (revoke-grant! [s gid] ((:transact! db-api) conn [{:grant/id gid :grant/revoked true}]) s)
+  (block-get [_ cid]
+    (when-not sealed-block-store
+      (throw (ex-info "SealedBlockStore is required for ciphertext access" {:cid cid})))
+    (sealed-get sealed-block-store cid))
+  (block-put! [s cid bytes]
+    (when-not sealed-block-store
+      (throw (ex-info "SealedBlockStore is required for ciphertext access" {:cid cid})))
+    (sealed-put! sealed-block-store cid bytes)
+    s)
+  (append-ledger! [_ fact] ((:transact! db-api) conn [fact]) fact)
+  ;; Rotation must be all-or-nothing. Main's :db-api exposes no such primitive,
+  ;; so this fails closed rather than committing a partial rekey; a backend that
+  ;; can do it supplies :transact-rotation!. MemStore gets real atomicity via swap!.
+  (commit-rekey! [_ plan build-ledger]
+    (if-let [tx! (:transact-rotation! db-api)]
+      (tx! conn plan build-ledger)
+      (throw (ex-info "backend lacks atomic rotation transaction"
+                      {:required :transact-rotation! :backend :kotoba-store}))))
+  ;; best-effort: the abstract :db-api transact! offers no compare-and-swap
+  ;; primitive to build this atomically the way MemStore's swap! does, so a
+  ;; genuine race between two KotobaStore-backed callers can still corrupt
+  ;; the hash chain (same residual limitation already noted elsewhere for
+  ;; langchain.db/transact!'s non-atomicity). Closes the race for the
+  ;; default, always-available MemStore backend; a real fix here would need
+  ;; either a backend-native optimistic-concurrency primitive or an
+  ;; application-level serialization point in front of KotobaStore.
+  (append-chained-ledger! [s build-fn]
+    (let [entry (build-fn (ledger s))]
+      ((:transact! db-api) conn [entry])
+      entry)))
+
+(defn kotoba-store
+  ([db-api conn] (->KotobaStore db-api conn nil))
+  ([db-api conn sealed-block-store]
+   (->KotobaStore db-api conn sealed-block-store)))
+
+;; schema を re-export(配線側が参照)
+(def schema vault/schema)

@@ -1,0 +1,634 @@
+(ns asn1.core
+  "X.690 DER, portable `.cljc`.
+
+  ## Why DER and not BER, stated as a rule rather than an omission
+
+  Every structure this library exists to serve — CMS SignedData, an X.509
+  certificate, an RFC 3161 timestamp token — is **signed**. A signature is over
+  bytes, so a parser that accepts a value it cannot re-encode identically is not
+  a lenient parser; it is a parser that will report a valid signature over
+  something the sender did not sign, or a broken one over something they did.
+
+  So the BER forms DER forbids are **rejected** rather than tolerated:
+
+  | rejected | why it matters |
+  |---|---|
+  | indefinite length (`0x80` … `00 00`) | length is not in the bytes, so two readers can disagree about where the element ends |
+  | non-minimal long-form length | `81 05` and `05` mean the same length and hash differently |
+  | non-minimal INTEGER (leading `00` / `FF`) | two encodings of the same number |
+  | constructed OCTET STRING / BIT STRING | the content is a concatenation, so the same octets have many encodings |
+  | trailing bytes after the outermost element | the thing that was hashed is not the thing that was parsed |
+
+  `decode` therefore either returns a structure whose `encode` reproduces the
+  input byte-for-byte, or throws. `der-round-trips?` asserts exactly that and is
+  what the tests hold every fixture to.
+
+  ## Every element keeps its own bytes
+
+  `:asn1/der` is the complete TLV of that element and `:asn1/content` is its
+  content octets, both retained on parse. This is not a convenience: CMS hashes
+  the DER of `eContent` and of `signedAttrs` **re-tagged from `[0] IMPLICIT` to
+  `SET`**, and PAdES needs the byte offsets of a signature placeholder inside a
+  document it must not otherwise touch. Recomputing those from a parsed tree
+  would mean re-encoding, and re-encoding is the thing that must not be in the
+  trust path.
+
+  ## Bytes
+
+  Functions accept anything byte-like — a `byte[]`, a `Uint8Array`, or a seq of
+  0–255 ints — following `io-multiformats`. Internally everything is a vector of
+  unsigned ints, which behaves identically on both platforms; `encode` returns
+  platform-native bytes and `encode-ints` returns the vector.
+
+  No clock, no network, no keys. Time values are parsed to strings and never to
+  an instant, because `UTCTime`'s two-digit year needs a sliding window whose
+  answer depends on when you ask."
+  (:require [clojure.string :as str]))
+
+(def ^:private tag-classes
+  {0 :universal 1 :application 2 :context 3 :private})
+
+(def ^:private class-bits
+  {:universal 0x00 :application 0x40 :context 0x80 :private 0xc0})
+
+(def universal-tags
+  "The X.690 universal tag numbers this library names. A map rather than a set
+  because a decoded element carries the number and a reader wants the name."
+  {1 :boolean 2 :integer 3 :bit-string 4 :octet-string 5 :null 6 :oid
+   10 :enumerated 12 :utf8-string 16 :sequence 17 :set 19 :printable-string
+   20 :t61-string 22 :ia5-string 23 :utc-time 24 :generalized-time
+   26 :visible-string 27 :general-string 28 :universal-string 30 :bmp-string})
+
+(def ^:private primitive-only
+  "Types DER requires in primitive form. Constructed encodings of these are BER
+  and are refused — see the namespace docstring."
+  #{:boolean :integer :bit-string :octet-string :null :oid :enumerated
+    :utf8-string :printable-string :ia5-string :utc-time :generalized-time})
+
+(defn fail!
+  [code message data]
+  (throw (ex-info message (assoc data :type code))))
+
+;; ── bytes ────────────────────────────────────────────────────────────────────
+
+(defn ->ints
+  "Anything byte-like as a vector of 0–255 ints."
+  [data]
+  (cond
+    (vector? data) data
+    (nil? data) []
+    :else (mapv #(bit-and (int %) 0xff) (seq data))))
+
+(defn ints->bytes
+  "A vector of 0–255 ints as platform-native bytes."
+  [ints]
+  )
+
+(defn hex
+  "Lowercase hex, for fixtures and error messages."
+  [data]
+  (str/join (map #(let [s (str/lower-case
+                          )]
+                    (if (= 1 (count s)) (str "0" s) s))
+                 (->ints data))))
+
+(defn unhex
+  "Hex string → int vector. Whitespace and `:` are ignored so a fixture can be
+  pasted from a spec or from `openssl asn1parse` without reformatting."
+  [s]
+  (let [clean (str/replace (str s) #"[\s:]" "")]
+    (when (odd? (count clean))
+      (fail! :asn1/bad-hex "hex string has an odd number of digits"
+             {:length (count clean)}))
+    (mapv #( % 16)
+          (map str/join (partition 2 clean)))))
+
+;; ── decoding ─────────────────────────────────────────────────────────────────
+
+(defn- at [ints i]
+  (or (get ints i)
+      (fail! :asn1/truncated "DER ended in the middle of an element"
+             {:offset i :length (count ints)})))
+
+(defn- read-tag [ints pos]
+  (let [first-byte (at ints pos)
+        klass (get tag-classes (bit-shift-right (bit-and first-byte 0xc0) 6))
+        constructed? (pos? (bit-and first-byte 0x20))
+        low (bit-and first-byte 0x1f)]
+    (if (< low 0x1f)
+      {:class klass :tag low :constructed? constructed? :pos (inc pos)}
+      ;; High-tag-number form. Base-128, and DER requires the minimal number of
+      ;; octets, so a leading 0x80 continuation byte would be a second spelling
+      ;; of the same tag.
+      (loop [i (inc pos) acc 0 n 0]
+        (let [b (at ints i)]
+          (when (and (zero? n) (= 0x80 (bit-and b 0x80)) (zero? (bit-and b 0x7f)))
+            (fail! :asn1/non-minimal-tag "high-tag-number form starts with 0x80"
+                   {:offset pos}))
+          (let [acc (+ (* acc 128) (bit-and b 0x7f))]
+            (if (pos? (bit-and b 0x80))
+              (recur (inc i) acc (inc n))
+              (do (when (< acc 0x1f)
+                    (fail! :asn1/non-minimal-tag
+                           "tag below 31 encoded in high-tag-number form"
+                           {:tag acc :offset pos}))
+                  {:class klass :tag acc :constructed? constructed?
+                   :pos (inc i)}))))))))
+
+(defn- read-length [ints pos]
+  (let [first-byte (at ints pos)]
+    (cond
+      (= 0x80 first-byte)
+      (fail! :asn1/indefinite-length
+             "indefinite length is BER, not DER — the element's end is not in the bytes"
+             {:offset pos})
+
+      (< first-byte 0x80) {:length first-byte :pos (inc pos)}
+
+      :else
+      (let [n (bit-and first-byte 0x7f)]
+        (when (= 0x7f n)
+          (fail! :asn1/reserved-length "length octet 0xff is reserved"
+                 {:offset pos}))
+        (let [length (reduce (fn [acc i] (+ (* acc 256) (at ints i)))
+                            0 (range (inc pos) (+ 1 pos n)))]
+          (when (< length 0x80)
+            (fail! :asn1/non-minimal-length
+                   "long-form length used for a value below 128"
+                   {:length length :offset pos}))
+          (when (zero? (at ints (inc pos)))
+            (fail! :asn1/non-minimal-length "long-form length has a leading zero octet"
+                   {:offset pos}))
+          {:length length :pos (+ 1 pos n)})))))
+
+(declare decode-content)
+
+(defn decode-at
+  "The one element starting at `pos`, and the offset just past it."
+  [ints pos]
+  (let [{:keys [class tag constructed?] value-pos :pos} (read-tag ints pos)
+        {:keys [length] content-pos :pos} (read-length ints value-pos)
+        end (+ content-pos length)]
+    (when (> end (count ints))
+      (fail! :asn1/truncated "element claims more content than there is"
+             {:offset pos :claimed length :available (- (count ints) content-pos)}))
+    (let [content (subvec ints content-pos end)
+          named (when (= :universal class) (get universal-tags tag))]
+      (when (and constructed? (contains? primitive-only named))
+        (fail! :asn1/constructed-primitive
+               (str "constructed " (name named) " is BER, not DER")
+               {:tag tag :offset pos}))
+      [(cond-> {:asn1/class class
+                :asn1/tag tag
+                :asn1/constructed? constructed?
+                :asn1/content content
+                :asn1/der (subvec ints pos end)}
+         named (assoc :asn1/type named)
+         constructed? (assoc :asn1/elements (decode-content content)))
+       end])))
+
+(defn- decode-content
+  "Every element in a constructed value's content octets."
+  [content]
+  (loop [pos 0 out []]
+    (if (>= pos (count content))
+      out
+      (let [[element next-pos] (decode-at content pos)]
+        (recur next-pos (conj out element))))))
+
+(defn decode
+  "The single DER element in `data`.
+
+  Trailing bytes are an error rather than ignored: the caller hashed or received
+  a specific byte range, and silently parsing a prefix of it would mean the
+  structure examined is not the one that arrived."
+  [data]
+  (let [ints (->ints data)
+        [element end] (decode-at ints 0)]
+    (when (not= end (count ints))
+      (fail! :asn1/trailing-bytes
+             "bytes remain after the outermost element"
+             {:consumed end :length (count ints)}))
+    element))
+
+;; ── encoding ─────────────────────────────────────────────────────────────────
+
+(defn- encode-tag [class tag constructed?]
+  (let [base (bit-or (get class-bits class)
+                     (if constructed? 0x20 0x00))]
+    (if (< tag 0x1f)
+      [(bit-or base tag)]
+      (let [septets (loop [v tag out ()]
+                      (if (zero? v)
+                        (vec out)
+                        (recur (quot v 128) (conj out (mod v 128)))))
+            septets (if (seq septets) septets [0])]
+        (into [(bit-or base 0x1f)]
+              (map-indexed (fn [i s]
+                             (if (= i (dec (count septets)))
+                               s
+                               (bit-or s 0x80)))
+                           septets))))))
+
+(defn- encode-length [length]
+  (if (< length 0x80)
+    [length]
+    (let [octets (loop [v length out ()]
+                   (if (zero? v) (vec out) (recur (quot v 256) (conj out (mod v 256)))))]
+      (into [(bit-or 0x80 (count octets))] octets))))
+
+(defn encode-ints
+  "An element as a vector of ints.
+
+  `:asn1/elements` wins over `:asn1/content` when both are present, so a caller
+  that edited a child does not have to remember to clear the parent's cached
+  content. `:asn1/der` is never trusted for output — an element that was parsed
+  and then modified would otherwise re-encode to its original bytes."
+  [{:asn1/keys [class tag constructed? content elements]}]
+  (let [content (if (and constructed? elements)
+                  (into [] (mapcat encode-ints) elements)
+                  (->ints content))]
+    (into (into (encode-tag class tag (boolean constructed?))
+                (encode-length (count content)))
+          content)))
+
+(defn encode
+  "An element as platform-native bytes."
+  [element]
+  (ints->bytes (encode-ints element)))
+
+(defn der-round-trips?
+  "Whether `data` decodes to something that re-encodes to exactly `data`.
+
+  The property the strictness in this namespace buys, asserted rather than
+  assumed. Every fixture in the test suite is held to it."
+  [data]
+  (let [ints (->ints data)]
+    (= ints (encode-ints (decode ints)))))
+
+;; ── OID ──────────────────────────────────────────────────────────────────────
+
+(defn encode-oid-content
+  "The content octets of an OBJECT IDENTIFIER given as a dotted string."
+  [dotted]
+  (let [arcs (mapv #( %)
+                   (str/split (str dotted) #"\."))]
+    (when (< (count arcs) 2)
+      (fail! :asn1/bad-oid "an OID needs at least two arcs" {:oid dotted}))
+    (let [[a b] arcs]
+      (when (or (neg? a) (> a 2))
+        (fail! :asn1/bad-oid "first arc must be 0, 1 or 2" {:oid dotted}))
+      (when (and (< a 2) (> b 39))
+        (fail! :asn1/bad-oid "second arc must be under 40 when the first is 0 or 1"
+               {:oid dotted}))
+      (into (vec (loop [v (+ (* 40 a) b) out ()]
+                   (if (zero? v) (or (seq out) [0]) (recur (quot v 128) (conj out (mod v 128))))))
+            ;; base-128, high bit set on all but the last septet of each arc
+            (mapcat (fn [arc]
+                      (let [septets (loop [v arc out ()]
+                                      (if (zero? v)
+                                        (vec (or (seq out) [0]))
+                                        (recur (quot v 128) (conj out (mod v 128)))))]
+                        (map-indexed (fn [i s]
+                                       (if (= i (dec (count septets))) s (bit-or s 0x80)))
+                                     septets)))
+                    (subvec arcs 2))))))
+
+(defn- fix-first-arcs [septet-value]
+  (cond (< septet-value 40) [0 septet-value]
+        (< septet-value 80) [1 (- septet-value 40)]
+        :else [2 (- septet-value 80)]))
+
+(defn decode-oid-content
+  "Content octets of an OBJECT IDENTIFIER → dotted string."
+  [content]
+  (let [ints (->ints content)
+        arcs (loop [i 0 acc 0 started? false out []]
+               (if (>= i (count ints))
+                 (do (when started?
+                       (fail! :asn1/bad-oid "OID ends mid-arc" {}))
+                     out)
+                 (let [b (nth ints i)]
+                   (when (and (not started?) (= 0x80 b))
+                     (fail! :asn1/non-minimal-oid "OID arc has a leading 0x80 septet" {}))
+                   (let [acc (+ (* acc 128) (bit-and b 0x7f))]
+                     (if (pos? (bit-and b 0x80))
+                       (recur (inc i) acc true out)
+                       (recur (inc i) 0 false (conj out acc)))))))]
+    (when (empty? arcs)
+      (fail! :asn1/bad-oid "empty OID" {}))
+    (str/join "." (into (fix-first-arcs (first arcs)) (rest arcs)))))
+
+(def safe-integer-limit
+  "The largest magnitude `integer-value` will return: 2^53 - 1.
+
+  Not a JVM limit — a portability one. `:cljs` numbers are doubles, so above
+  this an integer silently loses low bits, and an X.509 serial number is up to
+  20 octets. Returning an approximate serial number is worse than refusing:
+  `IssuerAndSerialNumber` matching in CMS compares serials, and two different
+  certificates that round to the same double would match each other.
+
+  Values above it are read with `integer-hex`, which is also how every X.509
+  tool prints a serial."
+  9007199254740991)
+
+;; ── typed constructors ───────────────────────────────────────────────────────
+
+(defn- universal [type content & {:keys [constructed?]}]
+  (let [tag (some (fn [[k v]] (when (= v type) k)) universal-tags)]
+    (cond-> {:asn1/class :universal
+             :asn1/tag tag
+             :asn1/type type
+             :asn1/constructed? (boolean constructed?)
+             :asn1/content (->ints content)}
+      constructed? (assoc :asn1/elements []))))
+
+(defn boolean*
+  "DER BOOLEAN: true is `0xff` and nothing else — `0x01` is BER."
+  [v]
+  (universal :boolean [(if v 0xff 0x00)]))
+
+(defn integer-from-hex
+  "INTEGER from a hex string of its two's-complement content octets.
+
+  For values `integer` refuses — a 64-bit RFC 3161 nonce, a certificate serial.
+  The caller supplies the exact octets, so nothing is rounded on the way in.
+
+  The leading `0x00` DER requires on a positive value whose high bit is set is
+  the CALLER's to include, because only they know whether the value is signed.
+  `unsigned-integer-from-hex` adds it."
+  [hex-string]
+  (universal :integer (unhex hex-string)))
+
+(defn unsigned-integer-from-hex
+  "INTEGER from hex, read as a non-negative number.
+
+  Adds the leading `0x00` when the high bit is set, and strips redundant leading
+  zeroes so the result is the minimal encoding DER requires."
+  [hex-string]
+  (let [ints (unhex hex-string)
+        trimmed (loop [v (vec ints)]
+                  (if (and (> (count v) 1) (zero? (first v))
+                           (zero? (bit-and (second v) 0x80)))
+                    (recur (subvec v 1))
+                    v))
+        trimmed (if (seq trimmed) trimmed [0])]
+    (universal :integer
+               (if (pos? (bit-and (first trimmed) 0x80))
+                 (into [0x00] trimmed)
+                 trimmed))))
+
+(defn integer
+  "INTEGER, minimal two's-complement.
+
+  Non-negative values get a leading `0x00` exactly when the high bit would
+  otherwise make them negative; that byte is required, not padding, and omitting
+  it is the classic way to turn a modulus into a negative number.
+
+  **Refuses a value larger than `safe-integer-limit`**, symmetric with
+  `integer-value`. Not a nicety: on `:cljs` a number is a double, so a 64-bit
+  value is ALREADY rounded before it reaches this function, and encoding it
+  produces bytes that differ from the JVM's for the same source literal. That is
+  the worst kind of failure — silent, platform-dependent, and inside a signed
+  structure. (Measured: an RFC 3161 nonce `0x7d82213101890cc3` encoded as
+  `…890c00` on nbb and `…890cc3` on the JVM, which would have made every
+  timestamp response fail its nonce check for a reason nobody could see.)
+
+  Use `integer-from-hex` for anything larger."
+  [n]
+  (when (> (abs n) safe-integer-limit)
+    (fail! :asn1/integer-too-large
+           (str "INTEGER " n " exceeds the exactly-representable range on :cljs. "
+                "Use integer-from-hex.")
+           {:value n}))
+  (universal
+   :integer
+   (if (zero? n)
+     [0]
+     (let [negative? (neg? n)
+           octets (loop [v (if negative? (- (- n) 1) n) out ()]
+                    (if (zero? v) (vec out) (recur (quot v 256) (conj out (mod v 256)))))
+           octets (if (seq octets) octets [0])
+           octets (if negative? (mapv #(bit-and (bit-not %) 0xff) octets) octets)]
+       (cond
+         (and (not negative?) (pos? (bit-and (first octets) 0x80))) (into [0x00] octets)
+         (and negative? (zero? (bit-and (first octets) 0x80))) (into [0xff] octets)
+         :else octets)))))
+
+(defn integer-hex
+  "INTEGER content as lowercase hex, exactly as encoded.
+
+  For values `integer-value` refuses — serial numbers, RSA moduli. The leading
+  `00` DER requires on a positive value whose high bit is set is PRESENT, because
+  this is the encoding and not the number; two certificates whose serials differ
+  only in that octet are different certificates."
+  [{:asn1/keys [content]}]
+  (hex content))
+
+(defn integer-value
+  "INTEGER content as a number. Rejects the non-minimal encodings DER forbids,
+  and refuses values too large to represent exactly on both platforms —
+  see `safe-integer-limit`."
+  [{:asn1/keys [content]}]
+  (let [ints (->ints content)]
+    (when (empty? ints)
+      (fail! :asn1/bad-integer "INTEGER has no content octets" {}))
+    (when (and (> (count ints) 1)
+               (or (and (= 0x00 (first ints)) (zero? (bit-and (second ints) 0x80)))
+                   (and (= 0xff (first ints)) (pos? (bit-and (second ints) 0x80)))))
+      (fail! :asn1/non-minimal-integer "INTEGER has a redundant leading octet"
+             {:hex (hex ints)}))
+    ;; Two's complement: the unsigned value minus 2^(8n) when the high bit is
+    ;; set. Complementing the octets and negating is the off-by-one version of
+    ;; this -- it computes -(2^(8n) - 1 - unsigned), which is the answer plus
+    ;; one. (Measured: every negative in the round-trip test came back one too
+    ;; large.)
+    ;; Checked before any arithmetic: 8 octets can already exceed the limit, and
+    ;; overflowing while computing the value we were about to refuse turns a
+    ;; clear refusal into an ArithmeticException from inside a reduce.
+    ;; (Measured: a 20-octet X.509 serial did exactly that.)
+    (when (> (count ints) 7)
+      (fail! :asn1/integer-too-large
+             (str "INTEGER is " (count ints)
+                  " octets — too large to represent exactly. Use integer-hex.")
+             {:octets (count ints) :hex (hex ints)}))
+    (let [unsigned (reduce (fn [acc b] (+ (* acc 256) b)) 0 ints)
+          value (if (pos? (bit-and (first ints) 0x80))
+                  (- unsigned (reduce * 1 (repeat (count ints) 256)))
+                  unsigned)]
+      (when (> (abs value) safe-integer-limit)
+        (fail! :asn1/integer-too-large
+               "INTEGER exceeds the exactly-representable range. Use integer-hex."
+               {:hex (hex ints)}))
+      value)))
+
+(defn octet-string [data] (universal :octet-string data))
+(defn null* [] (universal :null []))
+(defn utf8-string [s] (universal :utf8-string ))
+(defn printable-string [s] (universal :printable-string (map #(int %) s)))
+(defn ia5-string [s] (universal :ia5-string (map #(int %) s)))
+(defn utc-time [s] (universal :utc-time (map #(int %) s)))
+(defn generalized-time [s] (universal :generalized-time (map #(int %) s)))
+(defn oid [dotted] (universal :oid (encode-oid-content dotted)))
+
+(defn bit-string
+  "BIT STRING with `unused-bits` (0–7) trailing bits ignored in the last octet."
+  ([data] (bit-string data 0))
+  ([data unused-bits]
+   (when-not (<= 0 unused-bits 7)
+     (fail! :asn1/bad-bit-string "unused bits must be 0–7" {:unused-bits unused-bits}))
+   (universal :bit-string (into [unused-bits] (->ints data)))))
+
+(defn sequence*
+  [elements]
+  (assoc (universal :sequence [] :constructed? true) :asn1/elements (vec elements)))
+
+(defn set*
+  "SET, in the order given. Use `set-of` for SET OF, which DER orders for you."
+  [elements]
+  (assoc (universal :set [] :constructed? true) :asn1/elements (vec elements)))
+
+(defn octets<
+  "Lexicographic comparison of two octet vectors, shorter-is-a-prefix first.
+
+  NOT `compare` on the vectors. Clojure's vector comparator orders by COUNT
+  first and only then element-wise, so `[0x30 0x01 0x00]` would sort before
+  `[0x04 0x01 0x01 0x01]` — the opposite of what X.690 §11.6 says, and wrong in
+  exactly the case that matters: a SET OF mixing a short primitive with a longer
+  one. The two agree often enough that a test with three same-shaped elements
+  passes either way, which is how this would have shipped."
+  [a b]
+  (let [n (min (count a) (count b))]
+    (loop [i 0]
+      (cond
+        (= i n) (compare (count a) (count b))
+        (not= (nth a i) (nth b i)) (compare (nth a i) (nth b i))
+        :else (recur (inc i))))))
+
+(defn set-of
+  "SET OF, sorted by encoded value as DER requires (X.690 §11.6).
+
+  This is not cosmetic. `signedAttrs` in CMS is a SET OF and is hashed, so an
+  unsorted set produces a signature that a conforming verifier rejects — and one
+  that a lenient verifier accepts, which is worse because it ships."
+  [elements]
+  (assoc (universal :set [] :constructed? true)
+         :asn1/elements (vec (sort-by encode-ints octets< elements))))
+
+(defn explicit
+  "`[n] EXPLICIT` — the inner element wrapped in a context-tagged constructed
+  element, so the inner tag survives."
+  [n element]
+  {:asn1/class :context :asn1/tag n :asn1/constructed? true
+   :asn1/content [] :asn1/elements [element]})
+
+(defn implicit
+  "`[n] IMPLICIT` — the inner element's tag REPLACED by the context tag.
+
+  The inner element's constructedness is kept, because that is what distinguishes
+  an implicitly tagged SEQUENCE from an implicitly tagged OCTET STRING on the
+  wire."
+  [n element]
+  (assoc element :asn1/class :context :asn1/tag n :asn1/type nil))
+
+(defn retag
+  "The same content under a different tag, `:asn1/der` dropped.
+
+  Exists for one specific job that the CMS spec requires and that nothing else
+  in ASN.1 does: `signedAttrs` travels as `[0] IMPLICIT` and is hashed **as a
+  `SET`**. Anything that kept the parsed `:asn1/der` here would hash the wire
+  form and produce a signature nobody can verify."
+  [element class tag]
+  (-> element
+      (assoc :asn1/class class :asn1/tag tag)
+      (assoc :asn1/type (when (= :universal class) (get universal-tags tag)))
+      (dissoc :asn1/der)))
+
+;; ── reading ──────────────────────────────────────────────────────────────────
+
+(defn string-value
+  "Content octets of a string type as a string. UTF-8 for `UTF8String`, and
+  Latin-1 for the byte-per-character types, which is what they are."
+  [{:asn1/keys [type content]}]
+  (let [ints (->ints content)]
+    (if (= :utf8-string type)
+      
+      (str/join (map #(char %) ints)))))
+
+(defn oid-value [{:asn1/keys [content]}] (decode-oid-content content))
+
+(defn boolean-value
+  "BOOLEAN content. DER allows only `0x00` and `0xff`."
+  [{:asn1/keys [content]}]
+  (let [ints (->ints content)]
+    (when-not (= 1 (count ints))
+      (fail! :asn1/bad-boolean "BOOLEAN must be one octet" {:hex (hex ints)}))
+    (case (first ints)
+      0x00 false
+      0xff true
+      (fail! :asn1/non-der-boolean
+             "BOOLEAN must be 0x00 or 0xff in DER"
+             {:octet (first ints)}))))
+
+(defn bit-string-value
+  "`{:unused-bits n :ints [...]}` — the octets with the pad count kept, because
+  a BIT STRING's length in bits is not derivable from its octets."
+  [{:asn1/keys [content]}]
+  (let [ints (->ints content)]
+    (when (empty? ints)
+      (fail! :asn1/bad-bit-string "BIT STRING has no content" {}))
+    {:unused-bits (first ints) :ints (subvec ints 1)}))
+
+(defn time-value
+  "`UTCTime` / `GeneralizedTime` as an ISO 8601 string, or nil when the form is
+  one this does not read.
+
+  A STRING and not an instant on purpose. `UTCTime`'s year is two digits, so
+  turning it into a point in time needs a sliding-window rule (RFC 5280 says
+  50–99 is 19xx and 00–49 is 20xx) — a rule about the year 2049, applied by a
+  library with no clock. The window is applied because RFC 5280 fixes it, but
+  the result stays a string so nothing downstream mistakes it for a computed
+  moment."
+  [{:asn1/keys [type] :as element}]
+  (let [s (string-value element)]
+    (case type
+      :utc-time
+      (when-let [[_ yy mm dd hh mi ss] (re-matches #"(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})?Z" s)]
+        (let [year ( yy)]
+          (str (if (>= year 50) (+ 1900 year) (+ 2000 year))
+               "-" mm "-" dd "T" hh ":" mi ":" (or ss "00") "Z")))
+
+      :generalized-time
+      (when-let [[_ yyyy mm dd hh mi ss frac]
+                 (re-matches #"(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\.\d+)?Z" s)]
+        (str yyyy "-" mm "-" dd "T" hh ":" mi ":" ss (or frac "") "Z"))
+
+      nil)))
+
+(defn nth-element
+  "The `i`th child, or nil. Named rather than `nth` so a missing optional field
+  reads as absent instead of throwing an index error."
+  [element i]
+  (get (:asn1/elements element) i))
+
+(defn path
+  "Walk `:asn1/elements` by index. `(path cert 0 5)` is
+  `tbsCertificate.subject`."
+  [element & indices]
+  (reduce (fn [e i] (when e (nth-element e i))) element indices))
+
+(defn context-tag?
+  [element n]
+  (and (= :context (:asn1/class element)) (= n (:asn1/tag element))))
+
+(defn find-context
+  "The first `[n]` tagged child of `element`, or nil. Optional fields in an
+  ASN.1 SEQUENCE are identified by tag rather than position, so scanning is the
+  correct way to read them and counting is not."
+  [element n]
+  (first (filter #(context-tag? % n) (:asn1/elements element))))
+
+(defn unwrap-explicit
+  "The single element inside an `[n] EXPLICIT` wrapper."
+  [element]
+  (nth-element element 0))

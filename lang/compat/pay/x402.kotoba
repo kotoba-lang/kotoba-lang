@@ -1,0 +1,361 @@
+(ns pay.x402
+  "x402 (HTTP 402 Payment Required) protocol codec — pure Clojure/ClojureScript.
+
+  x402 is the open, in-band micropayment protocol Cloudflare's Monetization
+  Gateway standardizes (blog.cloudflare.com/monetization-gateway): a gated
+  resource answers `402` with its price + accepted asset + pay-to address; the
+  buyer (a human wallet OR an autonomous agent) pays in a stablecoin and
+  re-requests with an `X-PAYMENT` header carrying proof; a facilitator verifies
+  and the resource is served, with an `X-PAYMENT-RESPONSE` settlement receipt —
+  no redirect, no checkout page, no seller onboarding.
+
+  This namespace is the PROTOCOL layer only, matching kotoba-lang/pay's
+  invariants: pure .cljc, zero network I/O, zero key custody, zero deps. It
+  builds the 402 challenge, validates a decoded payment payload against the
+  requirements (scheme / network / recipient / amount / expiry — pure), and
+  builds the settlement receipt. The on-chain settle/verify itself is delegated
+  to the host — we are our OWN facilitator via kotoba-lang/treasury
+  (`verify-payment`) instead of a closed vendor service, and the resource-grant
+  decision reuses pay.core's verify-before-honor `entitle` philosophy.
+
+  Two schemes are supported:
+  - `\"exact\"` — the canonical x402 EVM scheme: the payload carries an EIP-3009
+    `transferWithAuthorization` (gasless USDC transfer) the facilitator submits.
+    We validate the authorization's recipient/amount/expiry (pure); the host
+    submits + confirms it on-chain.
+  - `\"transaction\"` — a fallback where the buyer already broadcast the tx and
+    the payload carries its hash. This maps 1:1 onto our existing
+    treasury/verify-payment + pay.core/entitle path (club-shinshi's claim flow),
+    so an agent and a human wallet share one rail."
+  (:require [clojure.string :as str]
+            [pay.core :as pay]))
+
+(def x402-version 1)
+(def x402-v2-version 2)
+(def base-caip2 "eip155:8453")
+
+(def v1-payment-header "X-PAYMENT")
+(def v1-payment-response-header "X-PAYMENT-RESPONSE")
+(def v2-payment-required-header "PAYMENT-REQUIRED")
+(def v2-payment-signature-header "PAYMENT-SIGNATURE")
+(def v2-payment-response-header "PAYMENT-RESPONSE")
+
+;; USDC on Base L2 (Coinbase Bridged), 6 decimals — same asset kotoba-lang/
+;; treasury's `base` chain uses; the default settlement asset.
+(def usdc-base "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+(def usdc-base-sepolia "0x036CbD53842c5426634e7929541eC2318f3dCF7e")
+
+(def usdc-by-network
+  "USDC per network, under both the plain name and the CAIP-2 form the v2
+  shape uses.
+
+  A requirement names an amount, a chain and a TOKEN, and the three have to
+  agree: an offer saying base-sepolia while naming mainnet USDC asks for a
+  token that does not exist where it says to send it.
+
+  Measured 2026-09-01 -- that offer was live. `:asset` fell back to `usdc-base`
+  whatever the network said, so every testnet listing carried the mainnet
+  token. A buyer whose policy allowlisted Sepolia USDC refused it as
+  asset-not-allowed, against a seller genuinely selling on the testnet. The
+  allowlist caught it and nothing else would have: the offer is well formed and
+  every field is individually plausible."
+  {"base" usdc-base
+   "base-sepolia" usdc-base-sepolia
+   "eip155:8453" usdc-base
+   "eip155:84532" usdc-base-sepolia})
+
+(defn usdc-for
+  "The USDC address for `network`, or a refusal. No fallback to mainnet: an
+  unknown network means this namespace does not know which token to name, and
+  naming the wrong one produces an offer that reads as valid and cannot be
+  paid."
+  [network]
+  (or (usdc-by-network network)
+      (throw (ex-info "no USDC address known for this network"
+                      {:type :x402/unknown-network :network network}))))
+
+(defn- parse-int
+  [s]
+  )
+
+(defn- lc [s] (some-> s str str/lower-case))
+
+;; ─── base64 header codec (UTF-8, portable) ──────────────────────────
+;; The X-PAYMENT / X-PAYMENT-RESPONSE header values are base64 of a JSON
+;; string. JSON (de)serialization stays with the host (JSON.stringify/parse in
+;; a cljs Worker; the JVM test injects a string) so the library keeps its
+;; zero-dep invariant — this only does the base64 envelope, portably across
+;; JVM / browser / Cloudflare Workers / nbb.
+
+(defn encode-header
+  "UTF-8 string → base64 (for an already-JSON-serialized payload)."
+  [s]
+  )
+
+(defn decode-header
+  "base64 → UTF-8 string (the host then JSON-parses it)."
+  [b64]
+  )
+
+;; ─── 402 challenge (seller side) ────────────────────────────────────
+
+(def eip712-domain-by-network
+  "The EIP-712 domain the USDC contract on each network actually declares.
+
+  NOT a constant. `extra.name` is the domain name a buyer signs under for the
+  `exact` scheme, and a domain that differs from the contract's own produces a
+  signature that recovers a DIFFERENT address -- so every payment is rejected,
+  and rejected as a bad signature, which points at the buyer rather than at
+  the offer that told it what to sign.
+
+  Measured 2026-09-01 by calling name() and version() on both contracts:
+  base mainnet 0x833589fC is `USD Coin`/`2`, base-sepolia 0x036CbD53 is
+  `USDC`/`2`. Every offer this workspace serves carried `USD Coin`, testnet
+  ones included. This is the same defect `usdc-by-network` was written for --
+  a per-network value left as a constant beside a field that was fixed -- and
+  it was on the same three live base-sepolia listings."
+  {"base"          {:name "USD Coin" :version "2"}
+   "base-sepolia"  {:name "USDC" :version "2"}
+   "eip155:8453"   {:name "USD Coin" :version "2"}
+   "eip155:84532"  {:name "USDC" :version "2"}})
+
+(defn eip712-domain-for
+  "The EIP-712 domain for a network, or a throw. Refuses rather than guessing:
+  a wrong domain is silently unspendable, and defaulting to the mainnet name
+  is exactly how every testnet offer came to carry it."
+  [network]
+  (or (eip712-domain-by-network network)
+      (throw (ex-info "no USDC EIP-712 domain known for this network"
+                      {:type :x402/unknown-network :network network}))))
+
+(defn payment-requirements
+  "One accepted payment option for the 402 body. `usd` is priced through
+  pay.core/parse-usdc so maxAmountRequired is USDC micros as a string
+  (bigint-safe on the wire, matching pay.core's receipt convention)."
+  [{:keys [pay-to usd resource description mime-type network asset
+           max-timeout-seconds scheme]
+    :or {network "base" mime-type "application/json"
+         max-timeout-seconds 60 scheme "exact"}}]
+  {:scheme scheme
+   :network network
+   :maxAmountRequired (str (pay/parse-usdc (str usd)))
+   :resource resource
+   :description (or description "")
+   :mimeType mime-type
+   :payTo pay-to
+   :maxTimeoutSeconds max-timeout-seconds
+   :asset (or asset (usdc-for network))
+   :extra (eip712-domain-for network)})
+
+(defn challenge
+  "The 402 response body: {:x402Version :accepts [reqs…] :error}. Pass one
+  requirement map or a seq of them (multiple accepted assets/networks)."
+  ([requirements] (challenge requirements "X-PAYMENT header is required"))
+  ([requirements error]
+   {:x402Version x402-version
+    :accepts (if (sequential? requirements) (vec requirements) [requirements])
+    :error error}))
+
+(defn v2-payment-requirements
+  "Official x402 v2 PaymentRequirements shape. Unlike v1, resource metadata is
+  separated into PaymentRequired.resource, `amount` replaces
+  `maxAmountRequired`, and EVM networks use CAIP-2 identifiers. This function
+  constructs schema only; it does not claim the host can settle EIP-3009."
+  [{:keys [pay-to usd max-timeout-seconds network asset extra]
+    :or {network base-caip2 max-timeout-seconds 60}}]
+  {:scheme "exact"
+   :network network
+   :amount (str (pay/parse-usdc (str usd)))
+   :asset (or asset (usdc-for network))
+   :payTo pay-to
+   :maxTimeoutSeconds max-timeout-seconds
+   :extra (merge (eip712-domain-for network)
+                 {:assetTransferMethod "eip3009"}
+                 extra)})
+
+(defn v2-payment-required
+  "Official v2 PaymentRequired object prior to JSON/base64 HTTP encoding."
+  [{:keys [resource accepts extensions error]}]
+  {:x402Version x402-v2-version
+   :error (or error "PAYMENT-SIGNATURE header is required")
+   :resource resource
+   :accepts (vec accepts)
+   :extensions (or extensions {})})
+
+(def ^:private v2-requirement-keys
+  [:scheme :network :amount :asset :payTo :maxTimeoutSeconds :extra])
+
+(defn v2-payload-errors
+  "Validate the version-independent core and exact/EIP-3009 economic fields of
+  a v2 PaymentPayload. Signature recovery, balance, simulation and broadcast
+  remain host/facilitator responsibilities. Exact v2 requires equality, not
+  merely >=, and the client's `accepted` requirement must echo the server's."
+  [{:keys [x402Version accepted payload]} requirements now-epoch-seconds]
+  (let [auth (:authorization payload)]
+    (cond-> []
+      (not= x402Version x402-v2-version) (conj :x402/version-mismatch)
+      (not= (select-keys accepted v2-requirement-keys)
+            (select-keys requirements v2-requirement-keys))
+      (conj :x402/accepted-requirements-mismatch)
+      (not= "exact" (:scheme requirements)) (conj :x402/scheme-mismatch)
+      (not (str/starts-with? (or (:network requirements) "") "eip155:"))
+      (conj :x402/network-not-caip2)
+      (not= (lc (:to auth)) (lc (:payTo requirements)))
+      (conj :x402/wrong-recipient)
+      (not= (parse-int (:value auth)) (parse-int (:amount requirements)))
+      (conj :x402/amount-not-exact)
+      (and (:validBefore auth)
+           (<= (parse-int (:validBefore auth)) now-epoch-seconds))
+      (conj :x402/authorization-expired)
+      (and (:validAfter auth)
+           (> (parse-int (:validAfter auth)) now-epoch-seconds))
+      (conj :x402/authorization-not-yet-valid)
+      (not (string? (:signature payload))) (conj :x402/missing-signature))))
+
+(defn v2-settlement-response
+  "Official v2 SettlementResponse returned in PAYMENT-RESPONSE. `network` is
+  the CAIP-2 network from the accepted requirement."
+  [{:keys [success transaction network payer error-reason]}]
+  (cond-> {:success (boolean success)
+           :transaction (or transaction "")
+           :network network
+           :payer payer}
+    error-reason (assoc :errorReason error-reason)))
+
+(defn v2-spend-policy-errors
+  "Pure agent-side policy check for one selected v2 requirement. The caller is
+  responsible for atomically persisting cumulative budget before signing; this
+  function makes the decision deterministic and wallet-independent.
+
+  Policy keys: :allowed-networks, :allowed-assets, :allowed-pay-tos (sets),
+  :max-per-call-micros, :spent-micros, and :max-total-micros. Missing allowlists
+  mean unrestricted; missing numeric limits mean no limit."
+  [requirements {:keys [allowed-networks allowed-assets allowed-pay-tos
+                        max-per-call-micros spent-micros max-total-micros]}]
+  (let [amount (parse-int (:amount requirements))
+        spent (or spent-micros 0)
+        allowed? (fn [xs value normalize]
+                   (or (nil? xs)
+                       (contains? (set (map normalize xs)) (normalize value))))]
+    (cond-> []
+      (not (pos? amount)) (conj :x402/non-positive-amount)
+      (not (allowed? allowed-networks (:network requirements) str))
+      (conj :x402/network-not-allowed)
+      (not (allowed? allowed-assets (:asset requirements) lc))
+      (conj :x402/asset-not-allowed)
+      (not (allowed? allowed-pay-tos (:payTo requirements) lc))
+      (conj :x402/pay-to-not-allowed)
+      (and max-per-call-micros (> amount max-per-call-micros))
+      (conj :x402/per-call-limit-exceeded)
+      (and max-total-micros (> (+ spent amount) max-total-micros))
+      (conj :x402/total-limit-exceeded))))
+
+(defn select-v2-requirement
+  "Return the first requirement admitted by `policy`, plus the next cumulative
+  spend value. Returns a denial map when no advertised option is acceptable."
+  [payment-required policy]
+  (let [evaluated (map (fn [r] [r (v2-spend-policy-errors r policy)])
+                       (:accepts payment-required))]
+    (if-let [[requirements _] (some (fn [[r errors]]
+                                      (when (empty? errors) [r errors]))
+                                    evaluated)]
+      {:ok? true
+       :requirements requirements
+       :next-spent-micros (+ (or (:spent-micros policy) 0)
+                               (parse-int (:amount requirements)))}
+      {:ok? false
+       :reason :x402/no-policy-compliant-requirement
+       :errors (vec (mapcat second evaluated))})))
+
+;; ─── payment payload validation (facilitator side, pure) ────────────
+;; A decoded X-PAYMENT payload:
+;;   {:x402Version 1 :scheme "exact" :network "base"
+;;    :payload {:signature "0x…"
+;;              :authorization {:from :to :value :validAfter :validBefore :nonce}}}
+;; or, for the "transaction" scheme:
+;;   {:x402Version 1 :scheme "transaction" :network "base"
+;;    :payload {:txHash "0x…" :from "0x…"}}
+
+(defn payload-errors
+  "Pure structural + economic validation of a decoded payment payload against
+  the chosen requirements, at `now-epoch-seconds` (int). [] when acceptable —
+  the host then settles/verifies on-chain. Never grants on shape alone."
+  [{:keys [scheme network payload] :as _payment} requirements now-epoch-seconds]
+  (let [{req-scheme :scheme req-net :network req-pay-to :payTo
+         req-amount :maxAmountRequired} requirements
+        auth (:authorization payload)]
+    (cond-> []
+      (not= scheme req-scheme)   (conj :x402/scheme-mismatch)
+      (not= network req-net)     (conj :x402/network-mismatch)
+
+      (= scheme "exact")
+      (as-> errs
+        (cond-> errs
+          (not= (lc (:to auth)) (lc req-pay-to))
+          (conj :x402/wrong-recipient)
+
+          (< (parse-int (:value auth)) (parse-int req-amount))
+          (conj :x402/underpaid)
+
+          (and (:validBefore auth)
+               (<= (parse-int (:validBefore auth)) now-epoch-seconds))
+          (conj :x402/authorization-expired)
+
+          (and (:validAfter auth)
+               (> (parse-int (:validAfter auth)) now-epoch-seconds))
+          (conj :x402/authorization-not-yet-valid)
+
+          (not (string? (:signature payload)))
+          (conj :x402/missing-signature)))
+
+      (= scheme "transaction")
+      (as-> errs
+        (cond-> errs
+          (not (string? (:txHash payload))) (conj :x402/missing-tx-hash))))))
+
+(defn acceptable?
+  [payment requirements now-epoch-seconds]
+  (empty? (payload-errors payment requirements now-epoch-seconds)))
+
+;; ─── settlement receipt (X-PAYMENT-RESPONSE) ────────────────────────
+
+(defn settlement-response
+  "The X-PAYMENT-RESPONSE body the seller returns once settled."
+  [{:keys [success tx network payer]}]
+  {:success (boolean success)
+   :transaction tx
+   :network network
+   :payer payer})
+
+;; ─── authorize: the verify-before-serve decision ────────────────────
+
+(defn authorize
+  "Tie the pure protocol checks to a host-supplied on-chain `verification`
+  ({:included bool :reason … :tx … :payer …}) — for the exact scheme the host
+  submits the EIP-3009 authorization and reports inclusion; for the
+  transaction scheme the host runs treasury/verify-payment (bridge it with
+  pay.core/verification<-treasury). Returns either
+    {:authorized? true  :settlement <X-PAYMENT-RESPONSE map>}
+  or
+    {:authorized? false :status 402 :reason kw :errors [...]}.
+  Never serves the resource unless the payment settled — the x402 form of
+  pay.core/entitle."
+  [payment requirements verification now-epoch-seconds]
+  (let [errors (payload-errors payment requirements now-epoch-seconds)]
+    (cond
+      (seq errors)
+      {:authorized? false :status 402 :reason :x402/invalid-payment :errors errors}
+
+      (not (:included verification))
+      {:authorized? false :status 402 :reason :x402/settlement-unverified
+       :detail (:reason verification)}
+
+      :else
+      {:authorized? true
+       :settlement (settlement-response
+                    {:success true
+                     :tx (:tx verification)
+                     :network (:network requirements)
+                     :payer (or (:payer verification)
+                                (get-in payment [:payload :from])
+                                (get-in payment [:payload :authorization :from]))})})))

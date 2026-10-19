@@ -1,0 +1,162 @@
+(ns kami.webgpu.quality
+  "Adapter from `:kotoba.render/quality-v1` plans to the capabilities currently
+   implemented by the browser WebGPU executor. Pure data; no JS API calls."
+  (:require [kami.webgpu.ir :as ir]))
+
+(def capabilities
+  {:backend :webgpu
+   :pbr #{:base-color :base-color-texture :metallic :roughness
+          :metallic-roughness-texture :normal-map :emissive}
+   :shadow {:directional true :max-cascades 4 :max-resolution 4096 :pcf-radius 1}
+   :post-process #{:tone-map :bloom}
+   :lod #{:consumer-culling :instance-budget :triangle-budget}})
+
+(defn quality-plan? [plan]
+  (= :kotoba.render/quality-v1 (:schema plan)))
+
+(defn- distance-squared [eye {:keys [pos]}]
+  (if (and eye pos)
+    (reduce + (map (fn [a b] (let [d (- a b)] (* d d))) eye pos))
+    0.0))
+
+(def default-lods
+  {:sphere [{:geo :sphere :min-pixels 36.0}
+            {:geo :sphere-lod1 :min-pixels 0.0}]
+   :cylinder [{:geo :cylinder :min-pixels 30.0}
+              {:geo :cylinder-lod1 :min-pixels 0.0}]
+   :stepped-tower [{:geo :stepped-tower :min-pixels 96.0}
+                   {:geo :stepped-tower-lod1 :min-pixels 32.0}
+                   {:geo :stepped-tower-lod2 :min-pixels 0.0}]
+   :industrial-block [{:geo :industrial-block :min-pixels 96.0}
+                      {:geo :industrial-block-lod1 :min-pixels 32.0}
+                      {:geo :industrial-block-lod2 :min-pixels 0.0}]})
+
+(defn projected-radius-px
+  "Projected pixel radius for an instance bounding sphere."
+  [radius distance fov-radians viewport-height]
+  (if (or (not (pos? radius)) (not (pos? distance)) (not (pos? viewport-height)))
+    0.0
+    (/ (* radius viewport-height)
+       (* 2.0 distance ( (/ fov-radians 2.0))))))
+
+(defn- level-index [levels geo]
+  (first (keep-indexed #(when (= geo (:geo %2)) %1) levels)))
+
+(defn- target-level [levels pixels]
+  (or (first (filter #(>= pixels (:min-pixels % 0.0)) levels))
+      (last levels)))
+
+(defn- stable-level [levels pixels current-geo hysteresis]
+  (let [target (target-level levels pixels)
+        current-index (level-index levels current-geo)
+        target-index (level-index levels (:geo target))]
+    (if (or (nil? current-index) (= current-index target-index))
+      target
+      (let [boundary (:min-pixels (nth levels (min current-index target-index)))
+            moving-to-detail? (< target-index current-index)
+            crossed? (if moving-to-detail?
+                       (>= pixels (* boundary (+ 1.0 hysteresis)))
+                       (< pixels (* boundary (- 1.0 hysteresis))))]
+        (if crossed? target (nth levels current-index))))))
+
+(defn apply-lod
+  "Select authored `:lods` or built-in procedural-mesh LODs. `state` maps a
+   stable instance id (or source index) to its previous geometry for hysteresis."
+  [instances eye fov-radians viewport-height bias state]
+  (if-not eye
+    {:instances instances :state state :switched-count 0 :levels {}}
+    (let [result
+          (reduce-kv
+           (fn [{:keys [instances state switched-count]} index instance]
+             (let [levels (or (:lods instance) (get default-lods (:geo instance)))]
+               (if-not (seq levels)
+                 {:instances (conj instances instance) :state state :switched-count switched-count}
+                 (let [key (or (:id instance) index)
+                       [x y z] (:pos instance)
+                       [ex ey ez] eye
+                       distance (
+                                 (+ (* (- x ex) (- x ex)) (* (- y ey) (- y ey)) (* (- z ez) (- z ez))))
+                       [width height depth] (ir/instance-size (:size instance))
+                       radius (* 0.5 (max width height depth))
+                       pixels (* (or bias 1.0)
+                                 (projected-radius-px radius distance fov-radians viewport-height))
+                       previous (get state key (:geo instance))
+                       selected (stable-level levels pixels previous 0.15)
+                       geo (:geo selected)]
+                   {:instances (conj instances (assoc instance :geo geo :lod/pixels pixels))
+                    :state (assoc state key geo)
+                    :switched-count (+ switched-count (if (= previous geo) 0 1))}))))
+           {:instances [] :state state :switched-count 0}
+           (vec instances))
+          counts (frequencies (map :geo (:instances result)))]
+      (assoc result :levels counts))))
+
+(defn density-plan
+  "Apply the effective instance/triangle budget. The common within-budget path
+   preserves the original collection without sorting. Over budget, retain hero
+   importance first, then nearest camera distance, then source order."
+  [instances eye {:keys [max-visible-instances max-visible-triangles]}]
+  (let [instance-limit (or max-visible-instances )
+        triangle-limit (or max-visible-triangles )
+        triangle-count (reduce + (map #(or (:triangles %) 12) instances))]
+    (if (and (<= (count instances) instance-limit)
+             (<= triangle-count triangle-limit))
+      {:instances instances :input-count (count instances) :visible-count (count instances)
+       :triangle-count triangle-count :culled-count 0 :budget-applied? false}
+      (let [ranked (sort-by (juxt (comp - #(or % 1.0) :importance)
+                                  #(distance-squared eye %)
+                                  :source-index)
+                            (map-indexed #(assoc %2 :source-index %1) instances))
+            result (reduce (fn [{:keys [instances triangles] :as acc} item]
+                             (let [n (or (:triangles item) 12)]
+                               (if (and (< (count instances) instance-limit)
+                                        (<= (+ triangles n) triangle-limit))
+                                 {:instances (conj instances (dissoc item :source-index))
+                                  :triangles (+ triangles n)}
+                                 acc)))
+                           {:instances [] :triangles 0} ranked)]
+        {:instances (:instances result)
+         :input-count (count instances)
+         :visible-count (count (:instances result))
+         :triangle-count (:triangles result)
+         :culled-count (- (count instances) (count (:instances result)))
+         :budget-applied? true}))))
+
+(defn resolve-plan
+  "Resolve a shared render-quality plan without silently claiming unsupported
+   effects. Returns the effective graph plus explicit `:degraded` evidence."
+  [graph plan]
+  (when-not (quality-plan? plan)
+    (throw (ex-info "unsupported render-quality schema" {:schema (:schema plan)})))
+  (let [requested-shadow (:shadow plan)
+        shadow-enabled? (:enabled? requested-shadow)
+        requested-cascades (or (:cascades requested-shadow) 0)
+        resolution (min (or (:resolution requested-shadow) 2048)
+                        (get-in capabilities [:shadow :max-resolution]))
+        post-kinds (mapv :kind (get-in plan [:post-process :passes]))
+        supported-post (vec (filter (:post-process capabilities) post-kinds))
+        unsupported-post (vec (remove (:post-process capabilities) post-kinds))
+        effective-cascades (if shadow-enabled? (max 1 (min 4 requested-cascades)) 1)
+        graph' (-> graph
+                   (assoc-in [:targets :shadow :size] [resolution resolution 4])
+                   (update :passes
+                           (fn [passes]
+                             (vec (filter #(or (nil? (:cascade %))
+                                               (< (:cascade %) effective-cascades))
+                                          passes)))))
+        degraded (cond-> []
+                   (seq unsupported-post)
+                   (conj {:feature :post-process :unsupported unsupported-post
+                          :effective supported-post})
+                   (not shadow-enabled?)
+                   (conj {:feature :shadow-disable :requested :off
+                          :effective :compatibility-shadow
+                          :reason :lit-pipeline-currently-requires-shadow-binding}))]
+    {:graph graph'
+     :quality-plan plan
+     :effective {:shadow {:enabled? true :cascades effective-cascades :resolution resolution
+                          :splits (vec (or (:splits requested-shadow) []))}
+                 :post-process supported-post
+                 :lod (:lod plan)}
+     :degraded degraded
+     :capabilities capabilities}))

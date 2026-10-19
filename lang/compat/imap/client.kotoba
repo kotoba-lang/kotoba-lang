@@ -1,0 +1,487 @@
+(ns imap.client
+  "IMAP4rev1 (RFC 3501) session driver: connect!/login!/select!/
+  search-unseen!/fetch-header!/mark-seen!/logout! over an `imap.transport/
+  Transport`. `imap.protocol` supplies the pure command/response
+  functions; this namespace is the stateful loop that reads lines (and any
+  literal a response carries) until a command's tagged completion arrives."
+  (:require [clojure.string :as str]
+            [imap.protocol :as p]
+            [imap.transport :as t]))
+
+
+
+(defn- tag! [{:keys [tag-counter]}] (str "A" (swap! tag-counter inc)))
+
+(defn- run-command!
+  "Send one tagged command; collect untagged lines until the tagged
+  completion.
+
+  Returns `{:completion {:status :text} :lines [...] :literal <string>
+  :literals [...]}`. `:literal` is the FIRST literal, kept because that is
+  what every existing caller reads; `:literals` is all of them in order,
+  which is what a multi-message FETCH produces. A response carrying two
+  literals used to overwrite the first with the second, so a fetch of two
+  messages returned the second one twice."
+  [{:keys [transport] :as session} verb & args]
+  (let [tag (tag! session)]
+    (t/write! transport (apply p/command tag verb args))
+    (loop [lines [] literals []]
+      (let [line (t/read-line! transport)]
+        (cond
+          (nil? line)
+          (throw (ex-info "IMAP connection closed mid-response" {:tag tag :verb verb :lines lines}))
+
+          (p/tagged-completion? tag line)
+          {:completion (p/completion-status tag line)
+           :lines lines
+           :literal (first literals)
+           :literals literals}
+
+          (p/literal-size line)
+          (recur (conj lines line)
+                 (conj literals (t/read-n! transport (p/literal-size line))))
+
+          :else (recur (conj lines line) literals))))))
+
+(defn- assert-ok! [{:keys [completion] :as resp} verb]
+  (when-not (= :ok (:status completion))
+    (throw (ex-info (str "IMAP " verb " failed: " (:text completion)) (assoc resp :verb verb))))
+  resp)
+
+(defn login!
+  "LOGIN with a plaintext user/pass (an app password for Gmail-style
+  accounts, per this library's TLS-only transport). Returns `session`."
+  [session user pass]
+  (assert-ok! (run-command! session "LOGIN" (p/quote-string user) (p/quote-string pass)) "LOGIN")
+  session)
+
+(defn capabilities!
+  "CAPABILITY -> the set the server advertises, also attached to `session`.
+
+  Worth asking rather than assuming: whether STARTTLS is required, which
+  SASL mechanisms exist, and whether IDLE is available are all answers
+  only the server has, and guessing produces a failure at the point of
+  use rather than at the point of connection."
+  [session]
+  (let [resp (assert-ok! (run-command! session "CAPABILITY") "CAPABILITY")
+        caps (or (some #(when (= :capability (:type (p/parse-untagged %)))
+                          (:value (p/parse-untagged %)))
+                       (:lines resp))
+                 ;; Some servers put it in the tagged OK's response code
+                 ;; instead of an untagged line.
+                 (when-let [{:keys [code value]} (p/response-code (:text (:completion resp)))]
+                   (when (= :capability code)
+                     (set (map str/upper-case (str/split (str value) #"\s+")))))
+                 #{})]
+    (assoc session :capabilities caps)))
+
+(defn supports?
+  "Whether a capability was advertised. Case-insensitive."
+  [session capability]
+  (contains? (:capabilities session #{}) (str/upper-case (str capability))))
+
+
+
+(defn- authenticate!
+  "AUTHENTICATE `mechanism` with one base64 initial response.
+
+  Sent as a continuation rather than as an initial response argument:
+  SASL-IR (RFC 4959) lets the payload ride on the command line, and not
+  every server implements it, so the two-step form is the one that works
+  everywhere."
+  [{:keys [transport] :as session} mechanism payload]
+  (let [tag (tag! session)]
+    (t/write! transport (p/command tag "AUTHENTICATE" mechanism))
+    (loop []
+      (let [line (t/read-line! transport)]
+        (cond
+          (nil? line)
+          (throw (ex-info "IMAP connection closed during AUTHENTICATE"
+                          {:mechanism mechanism}))
+
+          (str/starts-with? (str line) "+")
+          (do (t/write! transport (str (p/base64 payload) "\r\n"))
+              (recur))
+
+          (p/tagged-completion? tag line)
+          (do (assert-ok! {:completion (p/completion-status tag line) :lines []}
+                          (str "AUTHENTICATE " mechanism))
+              session)
+
+          :else (recur))))))
+
+(defn authenticate-plain!
+  "AUTHENTICATE PLAIN (RFC 4616). The SASL mechanism LOGIN should have
+  been, and the one to prefer where the server offers it."
+  [session user pass]
+  (authenticate! session "PLAIN" (p/plain-credentials user pass)))
+
+(defn authenticate-xoauth2!
+  "AUTHENTICATE XOAUTH2 with an OAuth2 access token.
+
+  This is what lets a mailbox already connected by OAuth be read over
+  IMAP without asking its owner for an app password as well. Google and
+  Microsoft both accept it; it is not an IETF mechanism, which is why it
+  is named for what it is."
+  [session user access-token]
+  (authenticate! session "XOAUTH2" (p/xoauth2-credentials user access-token)))
+
+(defn- select-like!
+  [session verb mailbox]
+  (let [resp (assert-ok! (run-command! session verb (p/quote-string mailbox)) verb)
+        state (p/mailbox-state (:lines resp))
+        ;; SELECT's own tagged OK carries [READ-WRITE] / [READ-ONLY].
+        {:keys [code]} (p/response-code (:text (:completion resp)))]
+    (assoc session
+           :mailbox (cond-> (assoc state :name mailbox)
+                      (= :read-only code) (assoc :read-only? true)
+                      (= :read-write code) (assoc :read-only? false)))))
+
+(defn select!
+  "SELECT `mailbox` (e.g. \"INBOX\"). Returns `session` with `:mailbox`.
+
+  `:mailbox` carries what the server said on the way in — `:exists`,
+  `:recent`, `:flags`, `:permanent-flags`, `:uidnext`, `:read-only?` and,
+  above all, **`:uidvalidity`**.
+
+  A client that stores UIDs across sessions and never reads UIDVALIDITY
+  is correct right up until a server reissues it (RFC 3501 §2.3.1.1),
+  after which every stored UID names a different message, or none. The
+  failure is silent and looks like corruption rather than like a protocol
+  mistake, which is why this is returned rather than discarded."
+  [session mailbox]
+  (select-like! session "SELECT" mailbox))
+
+(defn examine!
+  "EXAMINE `mailbox` — SELECT that cannot write.
+
+  The right call for a sync that only reads: it cannot set `\\Seen` by
+  accident, and on a shared mailbox that accident is visible to everyone
+  else looking at it."
+  [session mailbox]
+  (select-like! session "EXAMINE" mailbox))
+
+(defn list-mailboxes!
+  "LIST — every mailbox matching `pattern` (default `*`, i.e. all).
+
+  Returns `[{:name :delimiter :attributes #{…}} …]`. `:attributes`
+  carries `\\Noselect`, `\\HasChildren` and the RFC 6154 special-use
+  flags (`\\Sent`, `\\Drafts`, `\\Trash`, `\\Junk`, `\\Archive`) where a
+  server sets them — which is how a client finds the Sent folder instead
+  of guessing at its name in whatever language the account was created."
+  ([session] (list-mailboxes! session "*"))
+  ([session pattern]
+   (let [resp (assert-ok! (run-command! session "LIST" (p/quote-string "")
+                                        (p/quote-string pattern))
+                          "LIST")]
+     (into [] (keep #(let [parsed (p/parse-untagged %)]
+                       (when (= :list (:type parsed)) parsed)))
+           (:lines resp)))))
+
+(defn status!
+  "STATUS `mailbox` for `items` (default MESSAGES UNSEEN UIDNEXT UIDVALIDITY).
+
+  Answers how much is in a mailbox **without selecting it**, which is the
+  only way to poll several folders without disturbing the selected one."
+  ([session mailbox] (status! session mailbox ["MESSAGES" "UNSEEN" "UIDNEXT" "UIDVALIDITY"]))
+  ([session mailbox items]
+   (let [resp (assert-ok! (run-command! session "STATUS" (p/quote-string mailbox)
+                                        (str "(" (str/join " " items) ")"))
+                          "STATUS")]
+     (or (some #(let [parsed (p/parse-untagged %)]
+                  (when (= :status (:type parsed)) (:value parsed)))
+               (:lines resp))
+         {}))))
+
+(defn search!
+  "UID SEARCH `criteria` -> a vector of UIDs (longs), possibly empty.
+
+  `criteria` is raw IMAP search-key text (\"ALL\", \"UNSEEN\",
+  \"SINCE 1-Jan-2026\", \"FROM \\\"a@b\\\"\"). Passed through rather than
+  modelled: RFC 3501's search grammar is large, and a partial model of it
+  would be a vocabulary a caller has to learn *and* work around."
+  [session criteria]
+  (let [resp (assert-ok! (run-command! session "UID SEARCH" criteria) "UID SEARCH")]
+    (or (some p/search-uids (:lines resp)) [])))
+
+(defn search-unseen!
+  "UID SEARCH UNSEEN -> a vector of UIDs (longs), possibly empty."
+  [session]
+  (search! session "UNSEEN"))
+
+(defn search-all!
+  "UID SEARCH ALL -> every UID in the selected mailbox, ascending.
+
+  The whole mailbox rather than a page of it, because IMAP has no cursor:
+  UID SEARCH is how a client learns what exists, and the paging happens
+  afterwards on the returned UIDs (see `list-recent!`, which takes the tail).
+  This is a list of integers, not of messages -- the expensive call is the
+  per-UID fetch that follows, and that one is bounded."
+  [session]
+  (search! session "ALL"))
+
+(defn fetch-header!
+  "UID FETCH `uid`'s header, limited to `fields` (default FROM SUBJECT
+  DATE MESSAGE-ID) -> a map keyed by lower-cased field name (see
+  `imap.protocol/parse-header-block`). Uses BODY.PEEK so the message's
+  \\Seen flag is untouched -- see `mark-seen!` to set it explicitly once a
+  decision has actually been made."
+  ([session uid] (fetch-header! session uid ["FROM" "SUBJECT" "DATE" "MESSAGE-ID"]))
+  ([session uid fields]
+   (let [resp (assert-ok! (run-command! session "UID FETCH" (str uid)
+                                        (str "(BODY.PEEK[HEADER.FIELDS (" (str/join " " fields) ")])"))
+                          "UID FETCH")]
+     (p/parse-header-block (or (:literal resp) "")))))
+
+(defn list-unseen-headers!
+  "The convenience most callers want: every unseen message's header
+  (up to `:limit`, default 50), each with its `:uid` attached."
+  ([session] (list-unseen-headers! session {}))
+  ([session {:keys [limit fields] :or {limit 50}}]
+   (mapv (fn [uid] (assoc (if fields (fetch-header! session uid fields) (fetch-header! session uid))
+                          :uid uid))
+         (take limit (search-unseen! session)))))
+
+(defn fetch-message!
+  "UID FETCH `uid`'s whole message -> `{:uid :raw :flags :size
+  :internal-date}`.
+
+  **`:raw` is the message as the server sent it, and parsing it is
+  `kotoba-lang/org-ietf-mime`'s job**:
+
+      (-> (client/fetch-message! session 5) :raw mime/parse mime/message-parts)
+
+  This deliberately no longer returns `:headers`/`:body`/`:text`. It did
+  for one commit, by way of a `split-message` and a transfer-encoding
+  decoder written here — a second, worse copy of a library that already
+  existed in this org, and one that got `multipart/alternative` wrong:
+  it returned the raw parts, boundaries and all, where `mime.parse` knows
+  that alternatives are ordered worst-to-best and takes the last.
+
+  `:flags`, `:size` and `:internal-date` come from the same FETCH because
+  they arrive on its untagged line anyway, and a caller that wants to know
+  whether a message is already read should not need a second round trip
+  to find out.
+
+  BODY.PEEK, so reading a message does not silently mark it read — that
+  stays an explicit `mark-seen!`."
+  [session uid]
+  (let [resp (assert-ok! (run-command! session "UID FETCH" (str uid)
+                                       "(FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])")
+                         "UID FETCH")
+        meta (or (some #(let [parsed (p/parse-untagged %)]
+                          (when (= :fetch (:type parsed)) parsed))
+                       (:lines resp))
+                 {})]
+    (merge {:uid uid :raw (or (:literal resp) "")}
+           (select-keys meta [:flags :size :internal-date]))))
+
+(defn list-recent!
+  "The newest `:limit` messages in the selected mailbox, oldest first.
+
+  Newest by UID, which in IMAP ascends with arrival, so the tail of
+  `search-all!` is the recent end of the mailbox without a date search. The
+  fetch is per-UID and therefore bounded by `:limit` (default 50) -- the
+  unbounded part is the UID list, which is integers.
+
+  `:headers-only?` fetches header fields instead of whole messages, for a
+  caller building a list view that will fetch bodies on demand."
+  ([session] (list-recent! session {}))
+  ([session {:keys [limit headers-only?] :or {limit 50}}]
+   (let [uids (take-last limit (search-all! session))]
+     (mapv (fn [uid]
+             (if headers-only?
+               (assoc (fetch-header! session uid) :uid uid)
+               (fetch-message! session uid)))
+           uids))))
+
+(defn mark-seen!
+  "UID STORE `uid` +FLAGS.SILENT (\\Seen) -- the ADR-0022 gap this library
+  closes: curl-imap-fetch had no way to mark a message read after a
+  decision was made on it."
+  [session uid]
+  (assert-ok! (run-command! session "UID STORE" (str uid) "+FLAGS.SILENT" "(\\Seen)") "UID STORE")
+  true)
+
+(defn mark-unseen!
+  "UID STORE `uid` -FLAGS.SILENT (\\Seen) -- the inverse of `mark-seen!`.
+
+  Present because a mark that cannot be taken off is a trap: an interface
+  offering \"mark as unread\" over a client with only `mark-seen!` has to
+  either lie or keep the difference locally, where the server never learns
+  it and the next client to open the mailbox disagrees."
+  [session uid]
+  (assert-ok! (run-command! session "UID STORE" (str uid) "-FLAGS.SILENT" "(\\Seen)") "UID STORE")
+  true)
+
+(defn- flag-name [flag]
+  (let [s (if (keyword? flag) (name flag) (str flag))]
+    ;; `:seen` -> `\Seen`; `:$forwarded` and `\Seen` pass through. System
+    ;; flags are the five RFC 3501 §2.3.2 names; anything else is a
+    ;; server-defined keyword and takes no backslash.
+    (cond
+      (str/starts-with? s "\\") s
+      (str/starts-with? s "$") s
+      (contains? #{"seen" "answered" "flagged" "deleted" "draft" "recent"}
+                 (str/lower-case s))
+      (str "\\" (str/capitalize s))
+      :else s)))
+
+(defn store-flags!
+  "UID STORE with any flags, in any of the three modes (RFC 3501 §6.4.6).
+
+  `mode` is `:add` (`+FLAGS`), `:remove` (`-FLAGS`) or `:set` (`FLAGS`).
+  `mark-seen!`/`mark-unseen!` are this with one flag; they stay because
+  they are what most callers want, and this is here because `\\Flagged`,
+  `\\Deleted`, `\\Draft`, `\\Answered` and server keywords are the rest of
+  what a mail client does — starring, drafting, and answering a message
+  were all unreachable while `\\Seen` was the only flag this could write.
+
+  `.SILENT` because the updated FLAGS come back on the next fetch anyway,
+  and the untagged FETCH responses a non-silent STORE emits would have to
+  be parsed by every caller that does not want them."
+  [session uid mode flags]
+  (let [verb (case mode :add "+FLAGS.SILENT" :remove "-FLAGS.SILENT" :set "FLAGS.SILENT")]
+    (assert-ok! (run-command! session "UID STORE" (str uid) verb
+                              (str "(" (str/join " " (map flag-name flags)) ")"))
+                "UID STORE")
+    true))
+
+(defn fetch-flags!
+  "UID FETCH `uid` (FLAGS) -> the flag set, or nil.
+
+  The read half of `store-flags!`. `list-recent!` does not request flags,
+  so a caller that wants to know what is already read/starred asks here
+  rather than assuming — assuming is how every synced message arrives
+  unread and overwrites what somebody actually did."
+  [session uid]
+  (let [resp (assert-ok! (run-command! session "UID FETCH" (str uid) "(FLAGS)")
+                         "UID FETCH")]
+    (some #(let [parsed (p/parse-untagged %)]
+             (when (= :fetch (:type parsed)) (:flags parsed)))
+          (:lines resp))))
+
+(defn copy!
+  "UID COPY `uid` into `mailbox` (RFC 3501 §6.4.8)."
+  [session uid mailbox]
+  (assert-ok! (run-command! session "UID COPY" (str uid) (p/quote-string mailbox))
+              "UID COPY")
+  true)
+
+(defn move!
+  "UID MOVE `uid` into `mailbox` (RFC 6851), falling back to COPY +
+  \\Deleted where the server has no MOVE.
+
+  The fallback is not equivalent and says so: without MOVE, the original
+  is flagged deleted and stays until an EXPUNGE, so a caller that wants
+  it gone calls `expunge!` too. Silently doing the EXPUNGE here would
+  expunge *every* deleted message in the mailbox, not just this one."
+  [session uid mailbox]
+  (if (supports? session "MOVE")
+    (do (assert-ok! (run-command! session "UID MOVE" (str uid) (p/quote-string mailbox))
+                    "UID MOVE")
+        {:moved? true :expunge-required? false})
+    (do (copy! session uid mailbox)
+        (store-flags! session uid :add [:deleted])
+        {:moved? true :expunge-required? true})))
+
+(defn expunge!
+  "EXPUNGE — permanently remove every `\\Deleted` message in the selected
+  mailbox (RFC 3501 §6.4.3).
+
+  Irreversible, and mailbox-wide rather than per-message: it removes
+  everything currently flagged deleted, including messages some other
+  client flagged. Nothing here calls it implicitly for that reason."
+  [session]
+  (let [resp (assert-ok! (run-command! session "EXPUNGE") "EXPUNGE")]
+    (into [] (keep #(let [parsed (p/parse-untagged %)]
+                      (when (= :expunge (:type parsed)) (:value parsed))))
+          (:lines resp))))
+
+(defn create-mailbox!
+  "CREATE `mailbox` (RFC 3501 §6.3.3)."
+  [session mailbox]
+  (assert-ok! (run-command! session "CREATE" (p/quote-string mailbox)) "CREATE")
+  true)
+
+(defn append!
+  "APPEND a whole message into `mailbox` (RFC 3501 §6.3.11).
+
+  This is how a sent message gets into Sent. Without it, mail sent over
+  SMTP exists at the recipient and nowhere in the sender's own mailbox --
+  which is why every other client the account is opened in shows an empty
+  Sent folder for anything this application sent.
+
+  The message goes as a literal: `{n}` announced, then the bytes after
+  the server's continuation. `n` is the **byte** count, and for a message
+  with any non-ASCII in it that is not the character count -- announcing
+  the shorter number truncates the message and leaves the connection out
+  of sync with the protocol."
+  ([session mailbox message] (append! session mailbox message {}))
+  ([{:keys [transport] :as session} mailbox message {:keys [flags]}]
+   (let [tag (tag! session)
+         payload (str message)
+         size 
+         flag-part (when (seq flags)
+                     (str "(" (str/join " " (map flag-name flags)) ") "))]
+     (t/write! transport (str tag " APPEND " (p/quote-string mailbox) " "
+                              flag-part "{" size "}\r\n"))
+     (loop []
+       (let [line (t/read-line! transport)]
+         (cond
+           (nil? line)
+           (throw (ex-info "IMAP connection closed during APPEND" {:mailbox mailbox}))
+
+           (str/starts-with? (str line) "+")
+           (do (t/write! transport (str payload "\r\n")) (recur))
+
+           (p/tagged-completion? tag line)
+           (do (assert-ok! {:completion (p/completion-status tag line) :lines []} "APPEND")
+               true)
+
+           :else (recur)))))))
+
+(defn idle!
+  "IDLE (RFC 2177) — wait for the server to say something changed.
+
+  Polling every minute is what a client does without this, and it is both
+  slower to notice mail and more work for the server. `on-event` is called
+  with each untagged line as it arrives; returning `false` from it ends
+  the wait. DONE is always sent, including on the way out of an exception,
+  because a connection left in IDLE accepts no further commands.
+
+  Returns the untagged lines that arrived."
+  ([session on-event] (idle! session on-event {}))
+  ([{:keys [transport] :as session} on-event _opts]
+   (when-not (supports? session "IDLE")
+     (throw (ex-info "この IMAP サーバーは IDLE に対応していません。"
+                     {:type :imap/unsupported :capability "IDLE"})))
+   (let [tag (tag! session)]
+     (t/write! transport (p/command tag "IDLE"))
+     (try
+       (loop [events []]
+         (let [line (t/read-line! transport)]
+           (cond
+             (nil? line)
+             (throw (ex-info "IMAP connection closed during IDLE" {}))
+
+             (str/starts-with? (str line) "+") (recur events)
+
+             (p/tagged-completion? tag line) events
+
+             :else
+             (let [events (conj events line)]
+               (if (false? (on-event line))
+                 events
+                 (recur events))))))
+       (finally
+         (t/write! transport "DONE\r\n"))))))
+
+(defn logout!
+  "LOGOUT and close the transport. Swallows a failed LOGOUT response (the
+  transport is closed either way) but not a transport-level exception
+  raised before that point."
+  [{:keys [transport] :as session}]
+  (try (run-command! session "LOGOUT") (catch  _ nil))
+  (t/close! transport)
+  nil)

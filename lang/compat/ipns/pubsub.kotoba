@@ -1,0 +1,106 @@
+(ns ipns.pubsub
+  "Pure state/effect core for the IPNS PubSub Router specification.
+
+  Network ownership stays injected: this namespace emits subscribe, publish,
+  Fetch request/response, and persistence effects but never opens a socket.
+  Every received protobuf record is parsed and validated against the IPNS name
+  before sequence/EOL selection."
+  (:require [ipns.record :as record]))
+
+(def ^:private base64url-alphabet
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+
+(defn base64url-unpadded
+  "RFC 4648 base64url without padding, over unsigned octets."
+  [octets]
+  (let [xs (mapv #(bit-and % 0xff) octets)]
+    (loop [i 0 out []]
+      (if (>= i (count xs))
+        (apply str out)
+        (let [remaining (- (count xs) i)
+              a (nth xs i)
+              b (if (> remaining 1) (nth xs (inc i)) 0)
+              c (if (> remaining 2) (nth xs (+ i 2)) 0)
+              bits (+ (bit-shift-left a 16) (bit-shift-left b 8) c)
+              chars [(nth base64url-alphabet (bit-and 63 (bit-shift-right bits 18)))
+                     (nth base64url-alphabet (bit-and 63 (bit-shift-right bits 12)))
+                     (nth base64url-alphabet (bit-and 63 (bit-shift-right bits 6)))
+                     (nth base64url-alphabet (bit-and 63 bits))]
+              take-n (case remaining 1 2 2 3 4)]
+          (recur (+ i 3) (into out (take take-n chars))))))))
+
+(defn topic
+  "PubSub topic for an IPNS name:
+  `/record/` + base64url-unpadded(the binary local routing key)."
+  [name]
+  (str "/record/" (base64url-unpadded (record/routing-key name))))
+
+(defn init
+  "Create router state. Use `start-effects` when attaching it to a host."
+  [name]
+  {:name name :topic (topic name) :record nil :record-bytes nil})
+
+(defn start-effects
+  "Effects a host must perform to join the topic and provide persistent Fetch."
+  [state]
+  [{:op :pubsub/subscribe :topic (:topic state)}
+   {:op :fetch/serve :key (record/routing-key (:name state))}])
+
+(defn peer-subscribed
+  "Persistence protocol step: fetch the current record whenever a peer is
+  observed subscribing to this topic. Hosts may schedule the effect later."
+  [state peer]
+  {:op :fetch/request
+   :peer peer
+   :key (record/routing-key (:name state))})
+
+(defn fetch-request
+  "Answer a Fetch request from local persistent state, if one exists."
+  [state peer]
+  (when-let [bytes (:record-bytes state)]
+    {:op :fetch/respond
+     :peer peer
+     :key (record/routing-key (:name state))
+     :bytes bytes}))
+
+(defn- candidate [state bytes validation-options]
+  (try
+    (let [parsed (record/parse bytes)
+          checked (record/validate parsed (:name state) validation-options)]
+      (if (:valid? checked)
+        {:accepted? true :record parsed :bytes bytes}
+        {:accepted? false :reason (:reason checked) :validation checked}))
+    (catch  e
+      {:accepted? false :reason :malformed-record
+       :error-data (ex-data e)})))
+
+(defn ingest
+  "Validate and select a PubSub or Fetch record. A strictly better record is
+  persisted and republished, as required by the router spec. Returns
+  `{:state ... :effects [...] :accepted? ...}`. Invalid, expired, stale, and
+  duplicate records have no effects."
+  [state bytes validation-options]
+  (let [c (candidate state bytes validation-options)]
+    (cond
+      (not (:accepted? c)) (assoc c :state state :effects [])
+      (and (:record state) (not (record/better? (:record c) (:record state))))
+      {:state state :effects [] :accepted? false :reason :not-better}
+      :else
+      (let [next-state (assoc state :record (:record c) :record-bytes bytes)]
+        {:state next-state
+         :accepted? true
+         :effects [{:op :persist/put
+                    :key (record/routing-key (:name state)) :bytes bytes}
+                   {:op :pubsub/publish :topic (:topic state) :bytes bytes}]}))))
+
+(defn publish-local
+  "Validate a locally-created wire record before publishing it. Local origin
+  does not bypass name binding, signature, expiry, or monotonic selection."
+  [state bytes validation-options]
+  (ingest state bytes validation-options))
+
+(defn periodic-republish
+  "Optional fallback effect from the spec. The host owns scheduling."
+  [state]
+  (when-let [bytes (:record-bytes state)]
+    {:op :pubsub/publish :topic (:topic state) :bytes bytes}))

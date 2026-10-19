@@ -1,0 +1,166 @@
+(ns nfs.memory
+  "An in-memory `IFilesystem`. A reference implementation and the double the
+  conformance suite runs against — not a product.
+
+  Handles are stable identifiers rather than positions, because that is the
+  rule the protocol actually depends on and a double that breaks it lets a
+  bug through into every real implementation written from its example."
+  (:require [nfs.v3 :as nfs]
+            [xdr.core :as xdr]))
+
+(defn- handle-bytes [id] (xdr/->bytes (str "m:" id)))
+(defn- handle->id [h] (subs (xdr/utf8 (xdr/->bytes h)) 2))
+
+(defn store
+  "A fresh filesystem with an empty root."
+  []
+  (atom {:next 2
+         :nodes {"1" {:id "1" :type nfs/NF3DIR :name "" :children {}
+                      :mtime 0}}}))
+
+(defn- node [db id] (get-in db [:nodes id]))
+
+(defn- new-id! [state]
+  (let [id (str (:next @state))]
+    (swap! state update :next inc)
+    id))
+
+(defrecord MemoryFilesystem [state]
+  nfs/IFilesystem
+  (-root [_] (handle-bytes "1"))
+
+  (-attrs [_ h]
+    (let [id (handle->id h)
+          n (node @state id)]
+      (if (nil? n)
+        {:error nfs/NFS3ERR_NOENT}
+        {:type (:type n)
+         :size (if (= nfs/NF3DIR (:type n))
+                 4096
+                 )
+         :fileid 
+         :mtime (:mtime n)
+         :nlink (if (= nfs/NF3DIR (:type n))
+                  (+ 2 (count (:children n))) 1)})))
+
+  (-lookup [_ dir name]
+    (let [d (node @state (handle->id dir))]
+      (cond
+        (nil? d) {:error nfs/NFS3ERR_NOENT}
+        (not= nfs/NF3DIR (:type d)) {:error nfs/NFS3ERR_NOTDIR}
+        :else (if-let [id (get (:children d) name)]
+                (handle-bytes id)
+                {:error nfs/NFS3ERR_NOENT}))))
+
+  (-readdir [_ dir cookie max-entries]
+    (let [d (node @state (handle->id dir))]
+      (if (or (nil? d) (not= nfs/NF3DIR (:type d)))
+        {:error nfs/NFS3ERR_NOTDIR}
+        ;; Sorted so a cookie keeps meaning the same place between calls —
+        ;; the property the protocol needs and a map's iteration order does
+        ;; not give.
+        (let [all (vec (sort-by key (:children d)))
+              from (int cookie)
+              take-n (min max-entries (- (count all) from))
+              slice (subvec all from (+ from (max 0 take-n)))]
+          {:entries (map-indexed
+                     (fn [i [name id]]
+                       {:name name
+                        :fileid 
+                        :cookie (+ from i 1)
+                        :handle (handle-bytes id)})
+                     slice)
+           :eof? (>= (+ from (max 0 take-n)) (count all))}))))
+
+  (-read [_ h offset count]
+    (let [n (node @state (handle->id h))]
+      (cond
+        (nil? n) {:error nfs/NFS3ERR_NOENT}
+        (= nfs/NF3DIR (:type n)) {:error nfs/NFS3ERR_ISDIR}
+        :else
+        (let [b (or (:bytes n) (xdr/->bytes []))
+              len 
+              from (min offset len)
+              to (min len (+ from count))]
+          {:bytes 
+           :eof? (>= to len)}))))
+
+  (-write [_ h offset data]
+    (let [id (handle->id h)
+          n (node @state id)]
+      (if (nil? n)
+        {:error nfs/NFS3ERR_NOENT}
+        (let [old (or (:bytes n) (xdr/->bytes []))
+              olen 
+              dlen 
+              end (max olen (+ offset dlen))
+              out ]
+          
+          (swap! state assoc-in [:nodes id :bytes] out)
+          {:count dlen}))))
+
+  (-create [_ dir name _attrs]
+    (let [did (handle->id dir)]
+      (if (nil? (node @state did))
+        {:error nfs/NFS3ERR_NOENT}
+        (let [id (new-id! state)]
+          (swap! state #(-> %
+                            (assoc-in [:nodes id]
+                                      {:id id :type nfs/NF3REG :name name})
+                            (assoc-in [:nodes did :children name] id)))
+          (handle-bytes id)))))
+
+  (-mkdir [_ dir name _attrs]
+    (let [did (handle->id dir)]
+      (if (nil? (node @state did))
+        {:error nfs/NFS3ERR_NOENT}
+        (let [id (new-id! state)]
+          (swap! state #(-> %
+                            (assoc-in [:nodes id]
+                                      {:id id :type nfs/NF3DIR :name name
+                                       :children {}})
+                            (assoc-in [:nodes did :children name] id)))
+          (handle-bytes id)))))
+
+  (-remove [_ dir name]
+    (let [did (handle->id dir)]
+      (if-let [id (get-in @state [:nodes did :children name])]
+        (do (swap! state #(-> % (update-in [:nodes did :children] dissoc name)
+                              (update :nodes dissoc id)))
+            true)
+        {:error nfs/NFS3ERR_NOENT})))
+
+  (-rmdir [this dir name]
+    (let [did (handle->id dir)
+          id (get-in @state [:nodes did :children name])
+          n (when id (node @state id))]
+      (cond
+        (nil? n) {:error nfs/NFS3ERR_NOENT}
+        (seq (:children n)) {:error nfs/NFS3ERR_NOTEMPTY}
+        :else (nfs/-remove this dir name))))
+
+  (-rename [_ from-dir from-name to-dir to-name]
+    (let [fd (handle->id from-dir) td (handle->id to-dir)]
+      (if-let [id (get-in @state [:nodes fd :children from-name])]
+        (do (swap! state #(-> %
+                              (update-in [:nodes fd :children] dissoc from-name)
+                              (assoc-in [:nodes td :children to-name] id)))
+            true)
+        {:error nfs/NFS3ERR_NOENT})))
+
+  (-setattr [this h attrs]
+    (let [id (handle->id h)]
+      (when-let [size (:size attrs)]
+        (let [b (or (:bytes (node @state id)) (xdr/->bytes []))
+              out ]
+          
+          (swap! state assoc-in [:nodes id :bytes] out)))
+      (nfs/-attrs this h)))
+
+  (-fsstat [_ _]
+    {:tbytes 1099511627776 :fbytes 1099511627776 :abytes 1099511627776
+     :tfiles 1000000 :ffiles 1000000 :afiles 1000000}))
+
+(defn filesystem
+  ([] (filesystem (store)))
+  ([state] (->MemoryFilesystem state)))

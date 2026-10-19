@@ -1,0 +1,524 @@
+(ns kotoba.codebase.typed-code
+  "Definition identity computed from the compiler's checked KIR.
+
+  `semantic-code` hashes a definition the codebase normalizes for itself. That
+  gave content-addressed identity, but it also gave the workspace TWO answers
+  to `what is this definition`: the one the codebase stores, and the one the
+  compiler actually checks and lowers to a target. Nothing tied them together,
+  so a definition could be stored under one identity and compiled from another,
+  and neither could invalidate the other.
+
+  Here the identity is the checked KIR itself -- the same intermediate
+  representation the backends consume and qualify against. What a definition
+  IS and what gets executed or compiled are then the same object, and the
+  language coverage is the compiler's rather than a hand-maintained subset.
+
+  Three things participate in identity and one deliberately does not:
+
+  - the alpha-normalized body, so renaming a parameter is not a new definition;
+  - the typed interface (parameter types, result, declared effects), so a
+    signature change is a new definition even when the body is identical;
+  - direct dependencies as CID links, so changing a callee necessarily changes
+    every caller;
+  - NOT the definition's own name, and not the names of the functions it calls.
+
+  Alpha-normalization is verified rather than assumed. KIR has five binding
+  forms (`params`, `let`, `result-match-of`, `variant-match`, `option-match`),
+  and a sixth introduced later would silently leave a source-chosen name inside
+  a hash. So after renaming, any surviving original binder name that is not a
+  known call target fails the compile closed."
+  (:require [cbor.core :as cbor]
+            [kotoba.codebase.semantic-code :as semantic]))
+
+(def schema "kotoba.typed-definition.v1")
+(def group-schema "kotoba.typed-group.v1")
+(def member-schema "kotoba.typed-member.v1")
+(def contract-version 1)
+
+(def max-recursive-group 8)
+
+(defn- fail! [problem data]
+  (throw (ex-info (name problem) (assoc data :problem problem))))
+
+;; ---------------------------------------------------------------------------
+;; Canonical encoding of a KIR form
+;;
+;; Explicit rather than delegated: a KIR body carries f32 and f64 as host
+;; Float/Double, which a value codec either rejects as an unwrapped number or
+;; silently widens -- and widening loses exactly the distinction (f32 vs f64)
+;; the type system makes.
+
+(defn- stable-name [x]
+  (cond
+    (keyword? x) (if-let [n (namespace x)] (str n "/" (name x)) (name x))
+    (symbol? x) (str x)
+    :else (str x)))
+
+(defn- float-bits [x]
+  )
+
+(declare canonical-form)
+
+(defn- canonical-pairs [m]
+  (->> m
+       (map (fn [[k v]] [(canonical-form k) (canonical-form v)]))
+       (sort-by #(mapv (fn [b] (bit-and b 0xff)) (seq (cbor/encode (first %)))))
+       vec))
+
+(defn canonical-form
+  "One KIR form as canonical, portable data.
+
+  Fails closed on anything not enumerated: an unrecognised value in a body is a
+  reason to refuse an identity, not to invent an encoding for it."
+  [form]
+  (cond
+    (nil? form) ["nil"]
+    (boolean? form) ["bool" form]
+    (map? form) ["map" (canonical-pairs form)]
+    (some? (float-bits form)) (float-bits form)
+     ["int" (str form)]
+    (string? form) ["str" form]
+    (keyword? form) ["kw" (stable-name form)]
+    (symbol? form) ["sym" (str form)]
+    (vector? form) ["vec" (mapv canonical-form form)]
+    (set? form) ["set" (vec (sort-by #(mapv (fn [b] (bit-and b 0xff)) (seq (cbor/encode %)))
+                                     (map canonical-form form)))]
+    (sequential? form) ["list" (mapv canonical-form form)]
+    :else (fail! :typed-code/unsupported-form {:form (str form) :type (str (type form))})))
+
+(defn- reference-node
+  "A dependency inside a canonical body. Shaped like `semantic-code`'s
+  reference so `ir`'s traversal and CID substitution work on both."
+  [cid]
+  {"op" "reference" "cid" (semantic/cid-link cid)})
+
+(defn- group-node [index]
+  {"op" "recursive-reference" "index" index})
+
+;; ---------------------------------------------------------------------------
+;; Alpha normalization
+
+(def ^:private binder-name-prefix "k")
+
+(defn- canonical-binder [n] (symbol (str binder-name-prefix n)))
+
+(defn- ref-type-vector?
+  "`[:ref schema-name]` names a schema, not a local. Renaming inside it would
+  rewrite a type."
+  [form]
+  (and (vector? form) (= :ref (first form)) (= 2 (count form))))
+
+(declare normalize-form)
+
+(defn- normalize-seq [forms state]
+  (reduce (fn [{:keys [out state]} form]
+            (let [{:keys [form state]} (normalize-form form state)]
+              {:out (conj out form) :state state}))
+          {:out [] :state state}
+          forms))
+
+(defn- bind-one [state name]
+  (let [renamed (canonical-binder (:counter state))]
+    {:renamed renamed
+     :state (-> state
+                (update :counter inc)
+                (update :scope assoc name renamed)
+                (update :bound conj name))}))
+
+(defn- with-scope
+  "Run F with STATE's scope, then restore the outer scope but keep the counter
+  and the record of which names were bound."
+  [state f]
+  (let [outer (:scope state)
+        {:keys [form state]} (f state)]
+    {:form form :state (assoc state :scope outer)}))
+
+(defn- normalize-form
+  "Rename binders to canonical names, leaving everything else alone."
+  [form state]
+  (cond
+    (symbol? form)
+    {:form (get (:scope state) form form) :state state}
+
+    (ref-type-vector? form)
+    {:form form :state state}
+
+    (map? form)
+    (let [{:keys [out state]} (normalize-seq (mapcat identity form) state)]
+      {:form (apply hash-map out) :state state})
+
+    (vector? form)
+    (let [{:keys [out state]} (normalize-seq form state)]
+      {:form out :state state})
+
+    (seq? form)
+    (let [[op & args] form]
+      (case op
+        let
+        (with-scope
+          state
+          (fn [state]
+            (let [[bindings body] args
+                  {:keys [pairs state]}
+                  (reduce (fn [{:keys [pairs state]} [name value]]
+                            (let [{value :form state :state} (normalize-form value state)
+                                  {:keys [renamed state]} (bind-one state name)]
+                              {:pairs (conj pairs renamed value) :state state}))
+                          {:pairs [] :state state}
+                          (partition 2 bindings))
+                  {body :form state :state} (normalize-form body state)]
+              {:form (list 'let pairs body) :state state})))
+
+        result-match-of
+        (let [[type result-form ok-name ok-body err-name err-body] args
+              {result-form :form state :state} (normalize-form result-form state)
+              {ok :form state :state}
+              (with-scope state
+                (fn [state]
+                  (let [{:keys [renamed state]} (bind-one state ok-name)
+                        {body :form state :state} (normalize-form ok-body state)]
+                    {:form [renamed body] :state state})))
+              {err :form state :state}
+              (with-scope state
+                (fn [state]
+                  (let [{:keys [renamed state]} (bind-one state err-name)
+                        {body :form state :state} (normalize-form err-body state)]
+                    {:form [renamed body] :state state})))]
+          {:form (list 'result-match-of type result-form
+                       (first ok) (second ok) (first err) (second err))
+           :state state})
+
+        variant-match
+        (let [[type value-form branches] args
+              {value-form :form state :state} (normalize-form value-form state)
+              {:keys [out state]}
+              (reduce (fn [{:keys [out state]} [tag binder body]]
+                        (let [{branch :form state :state}
+                              (with-scope state
+                                (fn [state]
+                                  (let [{:keys [renamed state]} (bind-one state binder)
+                                        {body :form state :state} (normalize-form body state)]
+                                    {:form [tag renamed body] :state state})))]
+                          {:out (conj out branch) :state state}))
+                      {:out [] :state state}
+                      branches)]
+          {:form (list 'variant-match type value-form out) :state state})
+
+        option-match
+        (let [[type option-form none-body some-name some-body] args
+              {option-form :form state :state} (normalize-form option-form state)
+              {none-body :form state :state} (normalize-form none-body state)
+              {some :form state :state}
+              (with-scope state
+                (fn [state]
+                  (let [{:keys [renamed state]} (bind-one state some-name)
+                        {body :form state :state} (normalize-form some-body state)]
+                    {:form [renamed body] :state state})))]
+          {:form (list 'option-match type option-form none-body (first some) (second some))
+           :state state})
+
+        ;; Any other operator: the operator symbol itself may be a call target
+        ;; and is renamed only if it is locally bound, which it never is.
+        (let [{:keys [out state]} (normalize-seq args state)]
+          {:form (cons (get (:scope state) op op) out) :state state})))
+
+    :else {:form form :state state}))
+
+(defn- symbols-in [form]
+  (into #{} (filter symbol?) (tree-seq coll? seq form)))
+
+(defn alpha-normalize
+  "Canonically rename a function's binders. Returns `{:params :body :bound}`."
+  [{:keys [params body]}]
+  (let [state (reduce (fn [state name] (:state (bind-one state name)))
+                      {:counter 0 :scope {} :bound #{}}
+                      params)
+        renamed-params (mapv #(get (:scope state) %) params)
+        {body :form state :state} (normalize-form body state)]
+    {:params renamed-params :body body :bound (:bound state)}))
+
+(defn- verify-normalized!
+  "Refuse an identity that still contains a source-chosen binder name.
+
+  This is what makes the five-binder list checkable instead of assumed: a
+  binding form KIR gains later would leave its binder in the body, and this
+  fails rather than hashing it."
+  [{:keys [body bound]} call-targets]
+  (let [present (symbols-in body)
+        leaked (remove #(contains? call-targets %) (filter present bound))]
+    (when (seq leaked)
+      (fail! :typed-code/binder-not-normalized
+             {:symbols (vec (sort (map str leaked)))
+              :hint "a KIR binding form is not handled by alpha-normalize"}))))
+
+;; ---------------------------------------------------------------------------
+;; Dependency linking
+
+(defn- link-dependencies
+  "Replace call-target symbols with reference nodes, returning
+  `{:body :dependencies}`. RESOLVED maps a function name to its CID; GROUP maps
+  a name to its index inside the recursive group being built."
+  [body resolved group]
+  (let [dependencies (atom #{})]
+    (letfn [(walk [form]
+              (cond
+                (symbol? form)
+                (cond
+                  (contains? group form) (group-node (get group form))
+                  (contains? resolved form) (do (swap! dependencies conj (get resolved form))
+                                                (reference-node (get resolved form)))
+                  :else form)
+
+                (ref-type-vector? form) form
+                (map? form) (into {} (map (fn [[k v]] [(walk k) (walk v)])) form)
+                (vector? form) (mapv walk form)
+                ;; EAGER. `map` here is lazy, and the dependency set is
+                ;; collected as a side effect of walking -- reading the atom
+                ;; before the seq is forced returns an empty set, and a
+                ;; definition whose body links a callee would be stored
+                ;; declaring no dependencies at all.
+                (seq? form) (apply list (mapv walk form))
+                :else form))]
+      (let [linked (walk body)]
+        {:body linked :dependencies (vec (sort @dependencies))}))))
+
+(defn- canonical-body
+  "Canonical data for a body whose dependencies are already reference nodes."
+  [form]
+  (cond
+    (and (map? form) (contains? form "op")) form
+    (map? form) ["map" (canonical-pairs form)]
+    (vector? form) ["vec" (mapv canonical-body form)]
+    (set? form) ["set" (vec (sort-by #(mapv (fn [b] (bit-and b 0xff)) (seq (cbor/encode %)))
+                                     (map canonical-body form)))]
+    (sequential? form) ["list" (mapv canonical-body form)]
+    :else (canonical-form form)))
+
+;; ---------------------------------------------------------------------------
+;; Schemas
+;;
+;; A definition commits to the schemas it actually reaches, not to its module's
+;; whole table: otherwise an unrelated schema added elsewhere in the file would
+;; change this definition's identity.
+
+(defn- schema-refs [form]
+  (into #{}
+        (keep (fn [node] (when (ref-type-vector? node) (second node))))
+        (tree-seq coll? seq form)))
+
+(defn reachable-schemas [schemas roots]
+  (loop [pending (vec (schema-refs roots)) seen {}]
+    (if-let [name (first pending)]
+      (if (contains? seen name)
+        (recur (subvec pending 1) seen)
+        (let [definition (get schemas name)]
+          (recur (into (subvec pending 1) (schema-refs definition))
+                 (assoc seen name definition))))
+      (into (sorted-map-by (fn [a b] (compare (str a) (str b)))) seen))))
+
+;; ---------------------------------------------------------------------------
+;; Blocks
+
+(defn interface-block
+  "The typed interface a definition commits to, separate from its body.
+
+  Its own block, like `semantic-code`'s type block: two definitions with the
+  same interface share it, and a caller can check the contract it is linking
+  against without hydrating the callee's body."
+  [{:keys [params param-types result effects]} schemas]
+  {"schema" "kotoba.typed-interface.v1"
+   "version" 1
+   "arity" (count params)
+   "paramTypes" (mapv canonical-form (or param-types (vec (repeat (count params) :i64))))
+   "result" (canonical-form result)
+   "effects" (vec (sort (map stable-name effects)))
+   "schemas" (mapv (fn [[name definition]]
+                     [(canonical-form name) (canonical-form definition)])
+                   schemas)})
+
+(defn definition-block
+  [{:keys [body dependencies ir-format interface-cid profile-cid hash-contract-cid]}]
+  {"schema" schema
+   "version" contract-version
+   "irFormat" (stable-name ir-format)
+   "body" body
+   "interface" (semantic/cid-link interface-cid)
+   "dependencies" (mapv semantic/cid-link (sort dependencies))
+   "profile" (semantic/cid-link profile-cid)
+   "hashContract" (semantic/cid-link hash-contract-cid)})
+
+(defn default-contract-cid []
+  (semantic/source-cid
+   "kotoba.typed-definition.v1|kir-alpha-normalized|dag-cbor|sha2-256|typed-scc-v1"))
+
+;; ---------------------------------------------------------------------------
+;; Module compilation
+
+(defn- prepare
+  "Alpha-normalize one KIR function and canonicalize its schemas."
+  [function schemas call-targets]
+  (let [normalized (alpha-normalize function)]
+    (verify-normalized! normalized call-targets)
+    (assoc normalized
+           :schemas (reachable-schemas schemas
+                                       [(:param-types function) (:result function)
+                                        (:body function)]))))
+
+(defn- function-references [body names]
+  (into #{} (filter names) (symbols-in body)))
+
+(defn- strongly-connected
+  "Small deterministic SCC partition, mirroring `semantic-code`'s."
+  [graph]
+  (letfn [(reachable [start]
+            (loop [todo [start] seen #{}]
+              (if-let [node (peek todo)]
+                (if (contains? seen node)
+                  (recur (pop todo) seen)
+                  (recur (into (pop todo) (get graph node #{})) (conj seen node)))
+                seen)))]
+    (loop [remaining (set (keys graph)) out []]
+      (if-let [node (first (sort-by str remaining))]
+        (let [forward (reachable node)
+              component (set (filter #(contains? (reachable %) node) forward))]
+          (recur (set (remove component remaining)) (conj out component)))
+        out))))
+
+(defn- permutations [xs]
+  (if (empty? xs)
+    [[]]
+    (mapcat (fn [x] (map #(cons x %) (permutations (remove #{x} xs)))) xs)))
+
+(defn- group-candidate
+  [ordered prepared resolved ir-format profile-cid hash-contract-cid]
+  (let [indices (zipmap ordered (range))
+        members (mapv (fn [name]
+                        (let [{:keys [body params schemas]} (get prepared name)
+                              function (get prepared name)
+                              {:keys [body dependencies]} (link-dependencies body resolved indices)
+                              interface (interface-block (assoc (:function function)
+                                                                :params params)
+                                                         schemas)]
+                          {"interface" (semantic/cid-link (semantic/block-cid interface))
+                           "body" (canonical-body body)
+                           :interface-block interface
+                           :dependencies dependencies}))
+                      ordered)
+        dependencies (vec (sort (distinct (mapcat :dependencies members))))
+        block {"schema" group-schema "version" contract-version
+               "irFormat" (stable-name ir-format)
+               "members" (mapv #(select-keys % ["interface" "body"]) members)
+               "dependencies" (mapv semantic/cid-link dependencies)
+               "profile" (semantic/cid-link profile-cid)
+               "hashContract" (semantic/cid-link hash-contract-cid)}]
+    {:ordered ordered :block block
+     :bytes (mapv #(bit-and % 0xff) (seq (cbor/encode block)))
+     :interfaces (mapv :interface-block members)
+     :dependencies dependencies}))
+
+(defn- compile-group
+  [component prepared resolved ir-format profile-cid hash-contract-cid]
+  (when (> (count component) max-recursive-group)
+    (fail! :typed-code/recursive-group-too-large {:size (count component)}))
+  (let [candidates (map #(group-candidate (vec %) prepared resolved
+                                          ir-format profile-cid hash-contract-cid)
+                        (permutations (sort-by str component)))
+        chosen (first (sort-by :bytes candidates))
+        group-cid (semantic/block-cid (:block chosen))]
+    {:group-cid group-cid
+     :group-block (:block chosen)
+     :definitions
+     (into {}
+           (map-indexed
+            (fn [index name]
+              (let [interface (nth (:interfaces chosen) index)
+                    interface-cid (semantic/block-cid interface)
+                    member {"schema" member-schema "version" contract-version
+                            "group" (semantic/cid-link group-cid)
+                            "index" index
+                            "interface" (semantic/cid-link interface-cid)}]
+                [name {:name name :cid (semantic/block-cid member) :block member
+                       :interface-cid interface-cid :interface-block interface
+                       :group-cid group-cid :group-block (:block chosen)
+                       :dependency-cids (:dependencies chosen)}]))
+            (:ordered chosen)))}))
+
+(defn compile-module
+  "Split checked KIR into per-function content-addressed definitions.
+
+  `:definitions` seeds externally resolved names, so a module compiled against
+  a namespace links to the definitions that namespace selects rather than to
+  a name it hopes to find later."
+  ([kir] (compile-module kir {}))
+  ([kir {:keys [definitions profile-cid hash-contract-cid]
+         :or {definitions {}}}]
+   (let [profile-cid (or profile-cid (semantic/default-profile-cid))
+         hash-contract-cid (or hash-contract-cid (default-contract-cid))
+         ir-format (:format kir)
+         schemas (:schemas kir)
+         functions (:functions kir)
+         names (set (map :name functions))
+         call-targets (into names (keys definitions))
+         prepared (into {}
+                        (map (fn [function]
+                               [(:name function)
+                                (assoc (prepare function schemas call-targets)
+                                       :function function)]))
+                        functions)
+         graph (into {} (map (fn [[name {:keys [body]}]]
+                               [name (function-references body names)]))
+                     prepared)]
+     (loop [pending (vec (sort-by str names))
+            resolved (into {} (map (fn [[k v]] [(symbol (str k)) v])) definitions)
+            output {}]
+       (if (empty? pending)
+         {:schema "kotoba.typed-codebase.v1"
+          :ir-format ir-format
+          :profile-cid profile-cid
+          :hash-contract-cid hash-contract-cid
+          :definitions output}
+         (let [ready (filter (fn [name]
+                               (every? #(contains? resolved %) (get graph name)))
+                             pending)]
+           (if (seq ready)
+             (let [compiled
+                   (into {}
+                         (map (fn [name]
+                                (let [{:keys [body params schemas function]} (get prepared name)
+                                      {:keys [body dependencies]} (link-dependencies body resolved {})
+                                      interface (interface-block (assoc function :params params) schemas)
+                                      interface-cid (semantic/block-cid interface)
+                                      block (definition-block
+                                             {:body (canonical-body body)
+                                              :dependencies dependencies
+                                              :ir-format ir-format
+                                              :interface-cid interface-cid
+                                              :profile-cid profile-cid
+                                              :hash-contract-cid hash-contract-cid})]
+                                  [name {:name name :cid (semantic/block-cid block) :block block
+                                         :interface-cid interface-cid :interface-block interface
+                                         :dependency-cids dependencies}])))
+                         ready)]
+               (recur (vec (remove (set ready) pending))
+                      (into resolved (map (fn [[name {:keys [cid]}]] [name cid])) compiled)
+                      (into output compiled)))
+             ;; Everything left is in a cycle. Take one whose entire outward
+             ;; edge set is already resolved or inside itself.
+             (let [pending-set (set pending)
+                   pending-graph (into {} (map (fn [name]
+                                                 [name (into #{} (filter pending-set)
+                                                             (get graph name))]))
+                                       pending)
+                   component (first (filter (fn [members]
+                                              (every? #(or (contains? members %)
+                                                           (contains? resolved %))
+                                                      (mapcat graph members)))
+                                            (strongly-connected pending-graph)))]
+               (when-not component
+                 (fail! :typed-code/unresolvable-recursion {:symbols (mapv str pending)}))
+               (let [compiled (compile-group component prepared resolved
+                                             ir-format profile-cid hash-contract-cid)]
+                 (recur (vec (remove component pending))
+                        (into resolved (map (fn [[name {:keys [cid]}]] [name cid]))
+                              (:definitions compiled))
+                        (into output (:definitions compiled))))))))))))

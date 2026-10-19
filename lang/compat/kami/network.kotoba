@@ -1,0 +1,117 @@
+(ns kami.network
+  "M2 deterministic multiplayer contract.
+
+  This namespace deliberately owns no sockets or clocks. Hosts attach transport
+  and feed tick-stamped input envelopes through these pure functions, allowing
+  the same authority, impairment, snapshot, and reconciliation behaviour in
+  JVM headless tests and browser clients.")
+
+(def protocol-version 1)
+
+(defn input-envelope
+  "Create a versioned player input. `seq` is strictly increasing per client;
+  `tick` is the client's intended simulation tick."
+  [client-id seq tick commands]
+  {:net/version protocol-version
+   :input/client client-id
+   :input/seq seq
+   :input/tick tick
+   :input/commands (vec commands)})
+
+(defn valid-input?
+  [x]
+  (and (= protocol-version (:net/version x))
+       (some? (:input/client x))
+       (integer? (:input/seq x)) (not (neg? (:input/seq x)))
+       (integer? (:input/tick x)) (not (neg? (:input/tick x)))
+       (vector? (:input/commands x))))
+
+(defn authority
+  "Empty authoritative receive state."
+  [] {:authority/last-seq {} :authority/accepted [] :authority/rejected []})
+
+(defn receive-input
+  "Accept a valid, strictly newer per-client sequence exactly once. Invalid,
+  duplicate, and stale messages are retained as deterministic rejection data."
+  [state input]
+  (let [client (:input/client input)
+        previous (get-in state [:authority/last-seq client] -1)
+        reason (cond
+                 (not (valid-input? input)) :invalid
+                 (<= (:input/seq input) previous) :stale-or-duplicate)]
+    (if reason
+      (update state :authority/rejected conj {:reason reason :input input})
+      (-> state
+          (assoc-in [:authority/last-seq client] (:input/seq input))
+          (update :authority/accepted conj input)))))
+
+(defn drain-tick
+  "Return `[authority inputs]`, removing inputs due at or before `tick`.
+  Inputs have a total order independent of packet arrival order."
+  [state tick]
+  (let [{due true later false}
+        (group-by #(<= (:input/tick %) tick) (:authority/accepted state))]
+    [(assoc state :authority/accepted (vec later))
+     (vec (sort-by (juxt :input/tick (comp str :input/client) :input/seq) due))]))
+
+(defn snapshot
+  "Build an authoritative state snapshot acknowledging input sequences."
+  [tick world authority-state]
+  {:net/version protocol-version
+   :snapshot/tick tick
+   :snapshot/world world
+   :snapshot/ack (:authority/last-seq authority-state)})
+
+(defn reconcile
+  "Replace predicted state with a snapshot and replay unacknowledged local input.
+  `apply-input` is `(fn [world input] world)`. Returns the new client state and
+  retains only inputs newer than the authority acknowledgement."
+  [{:client/keys [id pending] :as client} snap apply-input]
+  (let [ack (get (:snapshot/ack snap) id -1)
+        pending' (->> pending
+                      (filter #(> (:input/seq %) ack))
+                      (sort-by :input/seq)
+                      vec)
+        world' (reduce apply-input (:snapshot/world snap) pending')]
+    (assoc client
+           :client/world world'
+           :client/pending pending'
+           :client/server-tick (:snapshot/tick snap))))
+
+(defn- mix32 [x]
+  ;; Integer-only avalanche, kept below signed overflow-sensitive arithmetic so
+  ;; CLJ and CLJS produce identical decisions.
+  (let [x (mod (+ (* 1664525 (mod x 4294967296)) 1013904223) 4294967296)] x))
+
+(defn impairment-decision
+  "Deterministically decide delivery for an input. Config uses integer units:
+  `:loss-permyriad` (0..10000), `:base-delay-ticks`, and `:jitter-ticks`.
+  The caller supplies a numeric seed; no wall clock or RNG state is consulted."
+  [{:keys [seed loss-permyriad base-delay-ticks jitter-ticks]
+    :or {seed 0 loss-permyriad 0 base-delay-ticks 0 jitter-ticks 0}}
+   input]
+  (let [char-code (fn [c] )
+        client-code (reduce (fn [n c] (mod (+ (* n 33) (char-code c)) 4294967296))
+                            5381 (str (:input/client input)))
+        sample (mix32 (+ seed client-code (* 97 (:input/seq input))))
+        dropped? (< (mod sample 10000) loss-permyriad)
+        jitter (if (pos? jitter-ticks)
+                 (- (mod (mix32 sample) (inc (* 2 jitter-ticks))) jitter-ticks)
+                 0)]
+    {:impairment/drop? dropped?
+     :impairment/deliver-tick (+ (:input/tick input)
+                                 (max 0 (+ base-delay-ticks jitter)))}))
+
+(defn impair
+  "Annotate and sort deliverable inputs; dropped inputs are returned separately."
+  [config inputs]
+  (let [annotated (mapv #(assoc % :input/impairment
+                               (impairment-decision config %)) inputs)]
+    {:deliver (->> annotated
+                   (remove #(get-in % [:input/impairment :impairment/drop?]))
+                   (sort-by (juxt #(get-in % [:input/impairment :impairment/deliver-tick])
+                                  (comp str :input/client) :input/seq))
+                   vec)
+     :drop (->> annotated
+                (filter #(get-in % [:input/impairment :impairment/drop?]))
+                vec)}))

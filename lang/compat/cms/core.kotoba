@@ -1,0 +1,393 @@
+(ns cms.core
+  "[RFC 5652](https://www.rfc-editor.org/rfc/rfc5652.html) `SignedData` — parse,
+  verify, and build. Portable `.cljc`.
+
+  ## The bug this namespace is mostly written to prevent
+
+  When `signedAttrs` is present, **the signature does not cover the content.** It
+  covers the DER of the attributes. The content is reached only through the
+  `messageDigest` attribute inside them, and the link exists only if somebody
+  checks it.
+
+  So the shape of the mistake is: verify the signature over `signedAttrs`,
+  observe that it is cryptographically valid, and report the content as signed —
+  without ever comparing `messageDigest` to the digest of the content in hand.
+  Every byte of content verifies. Any content verifies.
+
+  `verify-signer-info` therefore refuses when `signedAttrs` is present and either
+  required attribute is missing, and it compares them before it looks at the
+  signature at all. Three more refusals guard the same seam:
+
+  - **`contentType` must equal `eContentType`.** Without it a signature made over
+    an RFC 3161 token (`id-ct-TSTInfo`) can be presented as one made over
+    ordinary data — same bytes, different meaning.
+  - **A single-valued attribute with more than one value is refused.**
+    `messageDigest` is `SET OF` on the wire; a verifier that scans for a value
+    that matches lets the signer supply the real digest alongside any other.
+  - **Detached content that the caller did not supply is refused**, not treated
+    as empty. \"Verified over nothing\" must not read as verified.
+
+  ## Attributes are re-tagged before hashing
+
+  `signedAttrs` travels as `[0] IMPLICIT` and is hashed **as a `SET`** (§5.4).
+  `asn1.core/retag` exists for this and drops the parsed `:asn1/der`, so the wire
+  bytes cannot be hashed by accident — which would produce a signature no
+  conforming verifier accepts, and which a self-consistent implementation would
+  never notice.
+
+  ## Injected crypto
+
+  `verify` takes `:digest-fn` and `:verify-fn`. No keys and no algorithm
+  registry live here, for the reason `x509.core` and `data-integrity.core` both
+  give. `cms.jvm` (`:clj` only) supplies ready-made ones."
+  (:require [asn1.core :as asn1]
+            [asn1.oid :as oid]
+            [x509.core :as x509]))
+
+(defn fail! [code message data]
+  (throw (ex-info message (assoc data :type code))))
+
+;; ── attributes ───────────────────────────────────────────────────────────────
+
+(defn- parse-attribute [element]
+  (let [[type-element values-element] (:asn1/elements element)]
+    {:oid (asn1/oid-value type-element)
+     :name (oid/named (asn1/oid-value type-element))
+     :values (vec (:asn1/elements values-element))}))
+
+(defn attribute
+  "The attribute named `name-kw`, or nil."
+  [attributes name-kw]
+  (first (filter #(= name-kw (:name %)) attributes)))
+
+(defn single-value
+  "The one value of a single-valued attribute.
+
+  Refuses zero or many. RFC 5652 §11 says `contentType` and `messageDigest`
+  carry exactly one value, and a verifier that scanned a multi-valued attribute
+  for one that matches would let a signer put the honest digest next to any
+  other and have the pair accepted."
+  [attributes name-kw]
+  (when-let [attr (attribute attributes name-kw)]
+    (when-not (= 1 (count (:values attr)))
+      (fail! :cms/multi-valued-attribute
+             (str (name name-kw) " must carry exactly one value")
+             {:attribute name-kw :count (count (:values attr))}))
+    (first (:values attr))))
+
+;; ── parsing ──────────────────────────────────────────────────────────────────
+
+(defn parse-content-info
+  "`ContentInfo` → `{:content-type dotted :content element}`."
+  [data]
+  (let [element (asn1/decode data)
+        [type-element content-element] (:asn1/elements element)]
+    {:content-type (asn1/oid-value type-element)
+     :content (when content-element (asn1/unwrap-explicit content-element))
+     :der (:asn1/der element)}))
+
+(defn- parse-signer-identifier [element]
+  (if (asn1/context-tag? element 0)
+    ;; [0] IMPLICIT SubjectKeyIdentifier
+    {:kind :subject-key-identifier
+     :key-identifier (:asn1/content element)}
+    (let [[issuer serial] (:asn1/elements element)]
+      {:kind :issuer-and-serial
+       ;; The issuer name as BYTES. `x509.core/parse-name` explains why
+       ;; comparison is never textual.
+       :issuer-der (:asn1/der issuer)
+       :issuer (x509/parse-name issuer)
+       :serial-number (asn1/integer-hex serial)})))
+
+(defn- parse-signer-info [element]
+  (let [children (:asn1/elements element)
+        version (asn1/integer-value (nth children 0))
+        sid (parse-signer-identifier (nth children 1))
+        digest-alg (asn1/oid-value (asn1/nth-element (nth children 2) 0))
+        signed-attrs-element (asn1/find-context element 0)
+        unsigned-attrs-element (asn1/find-context element 1)
+        ;; Everything after the optional signedAttrs, found by shape rather than
+        ;; by index: signedAttrs is OPTIONAL and its presence shifts the rest.
+        remaining (drop 3 children)
+        remaining (if signed-attrs-element (rest remaining) remaining)
+        [sig-alg-element signature-element] (vec remaining)]
+    (cond-> {:signer/version version
+             :signer/sid sid
+             :signer/digest-algorithm digest-alg
+             :signer/signature-algorithm (asn1/oid-value
+                                          (asn1/nth-element sig-alg-element 0))
+             :signer/signature (:asn1/content signature-element)}
+      signed-attrs-element
+      (assoc :signer/signed-attrs
+             (mapv parse-attribute (:asn1/elements signed-attrs-element))
+             ;; §5.4: hashed as a SET, not as the [0] IMPLICIT it arrived as.
+             :signer/signed-attrs-der
+             (asn1/encode-ints (asn1/retag signed-attrs-element :universal 17)))
+
+      unsigned-attrs-element
+      (assoc :signer/unsigned-attrs
+             (mapv parse-attribute (:asn1/elements unsigned-attrs-element))))))
+
+(defn parse-signed-data
+  "A `ContentInfo` wrapping `SignedData` → a map.
+
+  `:cms/econtent` is nil for a detached signature, which is a different thing
+  from empty content and is kept distinguishable all the way to `verify`."
+  [data]
+  (let [{:keys [content-type content]} (parse-content-info data)]
+    (when-not (oid/is? content-type :signed-data)
+      (fail! :cms/not-signed-data
+             (str "expected SignedData, got " (oid/describe content-type))
+             {:content-type content-type}))
+    (let [children (:asn1/elements content)
+          version (asn1/integer-value (nth children 0))
+          digest-algorithms (into #{} (map #(asn1/oid-value (asn1/nth-element % 0)))
+                                  (:asn1/elements (nth children 1)))
+          encap (nth children 2)
+          econtent-type (asn1/oid-value (asn1/nth-element encap 0))
+          econtent-element (asn1/find-context encap 0)
+          certificates-element (asn1/find-context content 0)
+          signer-infos (last children)]
+      {:cms/version version
+       :cms/digest-algorithms digest-algorithms
+       :cms/econtent-type econtent-type
+       :cms/econtent (some-> econtent-element asn1/unwrap-explicit :asn1/content)
+       :cms/detached? (nil? econtent-element)
+       :cms/certificates (mapv #(x509/parse (:asn1/der %))
+                               (some-> certificates-element :asn1/elements))
+       :cms/signer-infos (mapv parse-signer-info (:asn1/elements signer-infos))})))
+
+;; ── finding the signer's certificate ─────────────────────────────────────────
+
+(defn certificate-for
+  "The certificate in `signed-data` that `sid` names, or nil.
+
+  Matched on encoded issuer bytes and hex serial, or on subject key identifier —
+  never on rendered name text."
+  [signed-data {:keys [kind issuer-der serial-number key-identifier]}]
+  (case kind
+    :issuer-and-serial
+    (first (filter (fn [c]
+                     (and (= (vec issuer-der) (vec (:der (:x509/issuer c))))
+                          (= serial-number (:x509/serial-number c))))
+                   (:cms/certificates signed-data)))
+
+    :subject-key-identifier
+    (first (filter (fn [c]
+                     (= (vec key-identifier)
+                        (vec (or (x509/subject-key-identifier c) []))))
+                   (:cms/certificates signed-data)))
+
+    nil))
+
+;; ── verifying ────────────────────────────────────────────────────────────────
+
+(defn- refused [reason detail]
+  {:verified false :reason reason :detail detail})
+
+(defn verify-signer-info
+  "Verify one `SignerInfo` against the content.
+
+  `opts`:
+
+    :content       the eContent octets. REQUIRED when the signature is detached
+                   and ignored otherwise.
+    :digest-fn     (fn [algorithm-name ints] -> ints)
+    :verify-fn     (fn [{:algorithm :algorithm-oid :public-key :signed :signature}] -> bool)
+    :certificate   the signer's certificate, when it is not carried in the message
+
+  Returns `{:verified bool …}` and does not throw for a bad signature — a
+  signature that does not verify is an answer, and a caller must not be able to
+  read \"it did not throw\" as \"it is good\". Malformed structure still throws."
+  [signed-data signer {:keys [content digest-fn verify-fn certificate]}]
+  (let [certificate (or certificate (certificate-for signed-data (:signer/sid signer)))
+        digest-name (oid/named (:signer/digest-algorithm signer))
+        econtent (if (:cms/detached? signed-data)
+                   (asn1/->ints content)
+                   (:cms/econtent signed-data))]
+    (cond
+      (nil? certificate)
+      (refused :signer-certificate-not-found
+               "SignerInfo が指す証明書がメッセージに含まれていません")
+
+      (nil? digest-name)
+      (refused :unsupported-digest-algorithm
+               (oid/describe (:signer/digest-algorithm signer)))
+
+      ;; Detached and the caller gave us nothing. NOT verified-over-empty.
+      (and (:cms/detached? signed-data) (nil? content))
+      (refused :detached-content-not-supplied
+               "detached signature に対して検証対象の content が渡されていません")
+
+      :else
+      (let [attrs (:signer/signed-attrs signer)]
+        (if (nil? attrs)
+          ;; No signedAttrs: the signature is over the content itself.
+          (let [ok? (try (boolean
+                          (verify-fn {:algorithm (oid/named (:signer/signature-algorithm signer))
+                                      :algorithm-oid (:signer/signature-algorithm signer)
+                                      :public-key (:x509/public-key certificate)
+                                      :signed econtent
+                                      :signature (:signer/signature signer)}))
+                         (catch  _ false))]
+            (if ok?
+              {:verified true :certificate certificate :signed-attrs? false}
+              (refused :signature-invalid "署名が content を検証しません")))
+
+          ;; signedAttrs present: the signature covers the ATTRIBUTES, and the
+          ;; content is reached only through messageDigest. Both links are
+          ;; checked before the signature, so a failure names the broken one.
+          (let [content-type-attr (single-value attrs :content-type)
+                digest-attr (single-value attrs :message-digest)]
+            (cond
+              (nil? content-type-attr)
+              (refused :missing-content-type-attribute
+                       "signedAttrs に contentType がありません（RFC 5652 §5.3 で必須）")
+
+              (nil? digest-attr)
+              (refused :missing-message-digest-attribute
+                       "signedAttrs に messageDigest がありません — これが無いと署名は content を指しません")
+
+              (not= (asn1/oid-value content-type-attr) (:cms/econtent-type signed-data))
+              (refused :content-type-mismatch
+                       (str "contentType " (oid/describe (asn1/oid-value content-type-attr))
+                            " ≠ eContentType " (oid/describe (:cms/econtent-type signed-data))))
+
+              (not= (vec (asn1/->ints (:asn1/content digest-attr)))
+                    (vec (asn1/->ints (digest-fn digest-name econtent))))
+              (refused :message-digest-mismatch
+                       "messageDigest が content の digest と一致しません — 署名は別の content のものです")
+
+              :else
+              (let [ok? (try (boolean
+                              (verify-fn {:algorithm (oid/named (:signer/signature-algorithm signer))
+                                          :algorithm-oid (:signer/signature-algorithm signer)
+                                          :public-key (:x509/public-key certificate)
+                                          :signed (:signer/signed-attrs-der signer)
+                                          :signature (:signer/signature signer)}))
+                             (catch  _ false))]
+                (if ok?
+                  {:verified true :certificate certificate :signed-attrs? true
+                   :signing-time (some-> (single-value attrs :signing-time)
+                                         asn1/time-value)}
+                  (refused :signature-invalid "署名が signedAttrs を検証しません"))))))))))
+
+(defn verify
+  "Verify every `SignerInfo`. `{:verified bool :signers [...]}`.
+
+  `:verified` is true only when there is at least one signer and all of them
+  verify. Zero signers is false rather than vacuously true: a `SignedData` with
+  no signatures is not a signed document."
+  [signed-data opts]
+  (let [results (mapv #(verify-signer-info signed-data % opts)
+                      (:cms/signer-infos signed-data))]
+    {:verified (boolean (and (seq results) (every? :verified results)))
+     :signers results}))
+
+;; ── building ─────────────────────────────────────────────────────────────────
+
+(defn- algorithm-identifier
+  "`AlgorithmIdentifier`. The NULL parameter is present for RSA and digest
+  algorithms and ABSENT for ECDSA — RFC 5758 §3.2 says so explicitly, and
+  including it produces a structure some verifiers reject."
+  [name-kw]
+  (if (contains? #{:ecdsa-with-sha256 :ecdsa-with-sha384 :ecdsa-with-sha512
+                   :ed25519}
+                 name-kw)
+    (asn1/sequence* [(asn1/oid (oid/dotted name-kw))])
+    (asn1/sequence* [(asn1/oid (oid/dotted name-kw)) (asn1/null*)])))
+
+(defn signed-attributes
+  "The `signedAttrs` a signature should carry, as a DER `SET OF`.
+
+  Returns `{:element … :der …}` where `:der` is the SET encoding — the bytes to
+  sign. The caller signs `:der` and puts `:element` in the message re-tagged to
+  `[0] IMPLICIT`; `build-signed-data` does both so a caller cannot mix them up.
+
+  `signing-time` is optional and is a CLAIM by the signer, not evidence. It is
+  accepted as an argument rather than read from a clock so that a caller who
+  wants an evidence-grade time reaches for RFC 3161 instead — which is the point
+  of `kotoba-lang/org-ietf-rfc3161` existing at all."
+  [{:keys [content-type message-digest signing-time extra]}]
+  (let [attrs (cond-> [(asn1/sequence*
+                        [(asn1/oid (oid/dotted :content-type))
+                         (asn1/set-of [(asn1/oid content-type)])])
+                       (asn1/sequence*
+                        [(asn1/oid (oid/dotted :message-digest))
+                         (asn1/set-of [(asn1/octet-string message-digest)])])]
+                signing-time
+                (conj (asn1/sequence*
+                       [(asn1/oid (oid/dotted :signing-time))
+                        (asn1/set-of [(asn1/generalized-time signing-time)])]))
+
+                (seq extra) (into extra))
+        set-element (asn1/set-of attrs)]
+    {:element set-element
+     :der (asn1/encode-ints set-element)}))
+
+(defn build-signed-data
+  "A `ContentInfo` wrapping `SignedData`, as int vector.
+
+  `sign-fn` receives the bytes to sign and returns the signature — the private
+  key never enters this library.
+
+    :content            the eContent octets
+    :detached?          omit eContent from the message (default false)
+    :content-type       eContentType, dotted (default id-data)
+    :digest-algorithm   name keyword (default :sha256)
+    :signature-algorithm name keyword
+    :certificates       [parsed x509 …], signer first
+    :signing-time       optional ISO instant for the signingTime attribute
+    :extra-signed-attrs additional attribute elements
+    :digest-fn          (fn [algorithm-name ints] -> ints)
+    :sign-fn            (fn [ints] -> signature ints)"
+  [{:keys [content detached? content-type digest-algorithm signature-algorithm
+           certificates signing-time extra-signed-attrs digest-fn sign-fn]
+    :or {digest-algorithm :sha256}}]
+  (let [content (asn1/->ints content)
+        content-type (or content-type (oid/dotted :data))
+        signer-certificate (first certificates)
+        _ (when-not signer-certificate
+            (fail! :cms/no-signer-certificate
+                   "SignerInfo は署名者証明書を指す必要があります" {}))
+        digest (asn1/->ints (digest-fn digest-algorithm content))
+        {attrs-element :element attrs-der :der}
+        (signed-attributes {:content-type content-type
+                            :message-digest digest
+                            :signing-time signing-time
+                            :extra extra-signed-attrs})
+        signature (asn1/->ints (sign-fn attrs-der))
+        signer-info
+        (asn1/sequence*
+         [(asn1/integer 1)
+          (asn1/sequence*
+           [(asn1/decode (:der (:x509/issuer signer-certificate)))
+            ;; The serial's own DER, kept by `x509/parse`. Re-encoding it from
+            ;; the hex would mean re-deriving the leading 0x00 that DER requires
+            ;; on a positive value with its high bit set — and a serial that
+            ;; differs by that octet is a different certificate.
+            (asn1/decode (:x509/serial-der signer-certificate))])
+          (algorithm-identifier digest-algorithm)
+          ;; The SET, re-tagged to [0] IMPLICIT for the wire. The DER that was
+          ;; signed is the SET form — the two differ in exactly one byte, and
+          ;; that byte is why `asn1/retag` exists.
+          (asn1/retag attrs-element :context 0)
+          (algorithm-identifier signature-algorithm)
+          (asn1/octet-string signature)])]
+    (asn1/encode-ints
+     (asn1/sequence*
+      [(asn1/oid (oid/dotted :signed-data))
+       (asn1/explicit
+        0
+        (asn1/sequence*
+         (cond-> [(asn1/integer 1)
+                  (asn1/set-of [(algorithm-identifier digest-algorithm)])
+                  (asn1/sequence*
+                   (cond-> [(asn1/oid content-type)]
+                     (not detached?)
+                     (conj (asn1/explicit 0 (asn1/octet-string content)))))]
+           (seq certificates)
+           (conj (asn1/retag (asn1/set* (mapv #(asn1/decode (:x509/der %)) certificates))
+                             :context 0))
+
+           :always (conj (asn1/set-of [signer-info])))))]))))

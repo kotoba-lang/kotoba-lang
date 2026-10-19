@@ -1,0 +1,344 @@
+(ns sd-jwt.core
+  "Selective Disclosure for JWTs — [RFC 9901](https://www.rfc-editor.org/rfc/rfc9901.html).
+
+   The salted-hash mechanism itself: an Issuer replaces a claim's value with a
+   digest, hands the cleartext over separately as a Disclosure, and a Holder
+   chooses which Disclosures to forward. A Verifier recomputes the digests and
+   puts back only what it was given.
+
+   This is the enterprise privacy primitive — \"prove you are an auditor at Acme
+   without revealing your name\" — and it needs no signature to be meaningful,
+   which is why it is separable from the JWS that carries it.
+
+   ## The one thing to get right
+
+   §4.2.3: **the digest is computed over the US-ASCII bytes of the
+   base64url-encoded Disclosure**, not over the JSON inside it. Two consequences,
+   both load-bearing:
+
+     1. Hashing the decoded JSON instead — the intuitive reading — produces
+        digests no other implementation can reproduce.
+     2. Because the Verifier re-hashes the *string it received*, the Issuer's
+        exact JSON serialization never has to be reproduced. **No canonicalization
+        is required anywhere in SD-JWT**, unlike Data Integrity. A whitespace
+        difference is simply part of the bytes that were hashed.
+
+   ## Reject versus ignore is asymmetric, and deliberately so
+
+   §7.1 requires REJECTING the whole SD-JWT for a duplicate digest, or for a
+   Disclosure that was sent but never referenced. But an embedded digest with no
+   matching Disclosure MUST be *ignored* — that is the normal case, since it is
+   exactly what a claim the Holder chose to withhold looks like. Collapsing those
+   two into one behaviour breaks either selective disclosure or the integrity
+   check, depending on which way you collapse it.
+
+   ## What this namespace does NOT do
+
+   No JWS. It does not sign, verify, or parse a compact JWS, and it does not check
+   `iss`/`exp`/`cnf` or a Key Binding JWT. `conceal`/`disclose` operate on the
+   payload as data, which is what makes them testable without a key. A JWS layer
+   belongs above this and can use `org-ietf-ed25519` or
+   `org-w3-vc-data-integrity`'s P-256 primitives.
+
+   JSON codecs are injected for the same reason `oid4vp.core` injects one: this
+   library has no JSON dependency and does not want one.
+
+     (require '[sd-jwt.core :as sd])
+
+     (def concealed
+       (sd/conceal {\"iss\" \"https://acme.example\" \"role\" \"auditor\" \"name\" \"Alice\"}
+                   [[\"name\"]]                       ; hide the name
+                   {:json-encode json/write-str :salt-fn my-csprng}))
+     ;; => {:payload {\"iss\" … \"role\" \"auditor\" \"_sd\" [\"<digest>\"]}
+     ;;     :disclosures [\"WyJf…\"]}"
+  (:require [clojure.string :as str]
+            [multiformats.core :as mf]))
+
+(def sd-claim "_sd")
+(def sd-alg-claim "_sd_alg")
+(def array-element-key "...")
+(def default-sd-alg "sha-256")
+(def separator "~")
+
+;; §4.1.1: 128 bits of entropy is the floor the salt needs.
+(def minimum-salt-bytes 16)
+
+(defn- fail! [code msg data]
+  (throw (ex-info msg (assoc data :sd-jwt/error code))))
+
+;; ── base64url ────────────────────────────────────────────────────────────────
+;; Reusing io-multiformats rather than a private copy: SD-JWT's base64url is
+;; RFC 4648 §5 without padding, exactly what that repo already provides and what
+;; several repos here had each grown their own of.
+
+(defn- utf8-bytes [s]
+  )
+
+(defn- ascii-bytes
+  "§4.2.3 says US-ASCII, and a base64url string is ASCII by construction, so this
+   is the same bytes as UTF-8 — named for what the spec says rather than what
+   happens to work."
+  [s]
+  (utf8-bytes s))
+
+(defn b64url [bytes-or-string]
+  (mf/base64url (if (string? bytes-or-string) (utf8-bytes bytes-or-string) bytes-or-string)))
+
+(defn b64url-decode-string [s]
+  (let [ints (mapv #(bit-and % 0xff) (seq (mf/base64url-decode s)))]
+    ))
+
+;; ── §4.2.3 digest ────────────────────────────────────────────────────────────
+
+(defn digest
+  "§4.2.3. The digest of a Disclosure, given the Disclosure's base64url STRING.
+
+   Takes the string, not the array, precisely because the hash is over those
+   bytes: a caller that has a Disclosure it received must hash what it received,
+   and a caller that just built one must hash exactly what it will send."
+  [disclosure-b64]
+  (when-not (string? disclosure-b64)
+    (fail! :sd-jwt/bad-disclosure "a Disclosure is a base64url string" {}))
+  (mf/base64url (mf/sha256 (ascii-bytes disclosure-b64))))
+
+;; ── §4.2.1 / §4.2.2 Disclosure construction ──────────────────────────────────
+
+(defn- check-salt! [salt]
+  (when-not (and (string? salt) (>= (count salt) 22))
+    ;; 22 base64url characters is 128 bits; shorter cannot carry the entropy
+    ;; §4.1.1 asks for, whatever alphabet the caller used.
+    (fail! :sd-jwt/weak-salt
+           (str "a salt needs at least " minimum-salt-bytes
+                " bytes of entropy (22 base64url characters)")
+           {:length (count (str salt))})))
+
+(defn object-disclosure
+  "§4.2.1. `[salt, claim-name, claim-value]`, base64url-encoded."
+  [salt claim-name claim-value {:keys [json-encode]}]
+  (check-salt! salt)
+  (b64url (json-encode [salt claim-name claim-value])))
+
+(defn array-disclosure
+  "§4.2.2. `[salt, value]` — two elements, not three."
+  [salt value {:keys [json-encode]}]
+  (check-salt! salt)
+  (b64url (json-encode [salt value])))
+
+;; ── §4.2.4 concealment ───────────────────────────────────────────────────────
+
+(defn- update-at
+  "`update-in`, but an EMPTY path means the map itself.
+
+   `(update-in m [] dissoc k)` does NOT do that — it assocs under a nil key, so a
+   top-level claim was left in place AND a `nil nil` entry appeared in the output.
+   Every top-level concealment went through that path, which is to say all the
+   common ones."
+  [m path f & args]
+  (if (seq path) (apply update-in m path f args) (apply f m args)))
+
+(defn- put-sd
+  "Add `digests` to the `_sd` array at `path`, shuffled.
+
+   §4.2.4.1: \"The Issuer MUST hide the original order of the claims\". Sorting
+   would be worse than doing nothing — a sorted array leaks nothing about the
+   original order but is trivially distinguishable from a shuffled one, and more
+   importantly a caller who sees sorted output may assume order is meaningful."
+  [payload path digests shuffle-fn]
+  (update-in payload (conj (vec path) sd-claim)
+             (fn [existing] (vec (shuffle-fn (into (vec existing) digests))))))
+
+(defn conceal
+  "Replace the claims named by `paths` with digests, returning the payload to sign
+   and the Disclosures to hand over.
+
+   Each path is a vector locating a claim: `[\"name\"]`, or `[\"address\" \"street\"]`
+   for a nested one. The last segment is the claim being hidden and everything
+   before it is the object it lives in.
+
+   Options:
+     :json-encode  REQUIRED
+     :salt-fn      REQUIRED, `(fn [] \"<base64url salt>\")` from your CSPRNG
+     :shuffle-fn   defaults to `shuffle`
+     :decoys       how many decoy digests to add (§4.2.5), default 0
+
+   The salt generator is injected rather than built in: this library has no
+   business holding a source of randomness, and a test needs a deterministic one."
+  [payload paths {:keys [json-encode salt-fn shuffle-fn decoys]
+                  :or {shuffle-fn shuffle decoys 0}
+                  :as options}]
+  (when-not (fn? json-encode) (fail! :sd-jwt/no-json-encode ":json-encode is required" {}))
+  (when-not (fn? salt-fn) (fail! :sd-jwt/no-salt-fn ":salt-fn is required" {}))
+  (let [result
+        (reduce
+         (fn [{:keys [payload disclosures]} path]
+           (let [path (vec path)
+                 parent (vec (butlast path))
+                 claim (last path)
+                 container (get-in payload parent)]
+             (when-not (map? container)
+               (fail! :sd-jwt/path-not-an-object
+                      "the parent of a concealed claim must be an object"
+                      {:path path}))
+             (when-not (contains? container claim)
+               (fail! :sd-jwt/claim-absent
+                      "cannot conceal a claim that is not present"
+                      {:path path}))
+             (let [value (get container claim)
+                   d (object-disclosure (salt-fn) claim value options)]
+               {:payload (-> payload
+                             (update-at parent dissoc claim)
+                             (put-sd parent [(digest d)] shuffle-fn))
+                :disclosures (conj disclosures d)})))
+         {:payload payload :disclosures []}
+         paths)
+        ;; §4.2.5: decoys are digests of nothing, so a Verifier cannot tell how
+        ;; many claims were withheld. Added last, over the same `_sd` array.
+        with-decoys
+        (if (pos? decoys)
+          (update result :payload
+                  (fn [p] (put-sd p [] (repeatedly decoys #(digest (b64url (salt-fn))))
+                                  shuffle-fn)))
+          result)]
+    (cond-> with-decoys
+      ;; §4.1.1: only needed when it is not the default, but stating it is
+      ;; friendlier to a Verifier than making it infer.
+      true (assoc-in [:payload sd-alg-claim] default-sd-alg))))
+
+;; ── §4 serialization ─────────────────────────────────────────────────────────
+
+(defn present
+  "§4. `<Issuer-signed JWT>~<D.1>~…~<D.N>~`
+
+   The trailing tilde is REQUIRED when there is no Key Binding JWT: \"the last
+   element MUST be an empty string and the last separating tilde character MUST
+   NOT be omitted\". Omitting it produces a string that parses as though the final
+   Disclosure were a KB-JWT."
+  ([jwt disclosures] (present jwt disclosures nil))
+  ([jwt disclosures kb-jwt]
+   (str jwt separator
+        (when (seq disclosures) (str (str/join separator disclosures) separator))
+        (or kb-jwt ""))))
+
+(defn parse-presentation
+  "Split a presentation into `{:jwt … :disclosures [...] :kb-jwt …}`.
+
+   A missing trailing tilde is refused rather than guessed at: the difference
+   between \"no KB-JWT\" and \"the last Disclosure is a KB-JWT\" is exactly that
+   character, and guessing wrong changes what was proved."
+  [presentation]
+  (when-not (string? presentation)
+    (fail! :sd-jwt/bad-presentation "a presentation is a string" {}))
+  (let [parts (str/split presentation (re-pattern separator) -1)]
+    (when (< (count parts) 2)
+      (fail! :sd-jwt/missing-trailing-separator
+             (str "a presentation must end with `" separator "` when there is no "
+                  "Key Binding JWT; without it the last Disclosure would read as one")
+             {}))
+    {:jwt (first parts)
+     :disclosures (vec (remove str/blank? (butlast (rest parts))))
+     :kb-jwt (let [last-part (last parts)]
+               (when-not (str/blank? last-part) last-part))}))
+
+;; ── §7.1 verifier reconstruction ─────────────────────────────────────────────
+
+(defn- walk-disclose
+  "Recursively replace embedded digests with their disclosed values.
+
+   Returns `[value used]` where `used` is the set of digests consumed, so the
+   caller can enforce §7.1's rule that an unreferenced Disclosure rejects the
+   whole SD-JWT."
+  [value by-digest used]
+  (cond
+    (map? value)
+    (let [digests (get value sd-claim)
+          base (dissoc value sd-claim sd-alg-claim)
+          ;; a digest with no Disclosure is IGNORED (§7.1) — it is what a claim the
+          ;; Holder withheld looks like, and rejecting would break disclosure.
+          [revealed used]
+          (reduce (fn [[acc used] d]
+                    (if-let [disclosure (get by-digest d)]
+                      [(assoc acc (nth disclosure 1) (nth disclosure 2)) (conj used d)]
+                      [acc used]))
+                  [{} used]
+                  (or digests []))
+          [walked used]
+          (reduce (fn [[acc used] [k v]]
+                    (let [[v' used'] (walk-disclose v by-digest used)]
+                      [(assoc acc k v') used']))
+                  [{} used]
+                  (merge base revealed))]
+      [walked used])
+
+    (sequential? value)
+    (reduce (fn [[acc used] element]
+              (if (and (map? element) (contains? element array-element-key))
+                (let [d (get element array-element-key)]
+                  (if-let [disclosure (get by-digest d)]
+                    (let [[v used'] (walk-disclose (nth disclosure 1) by-digest (conj used d))]
+                      [(conj acc v) used'])
+                    ;; withheld array element: dropped, not left as a placeholder
+                    [acc used]))
+                (let [[v used'] (walk-disclose element by-digest used)]
+                  [(conj acc v) used'])))
+            [[] used]
+            value)
+
+    :else [value used]))
+
+(defn disclose
+  "§7.1. Reconstruct the payload from `payload` plus the `disclosures` presented.
+
+   Returns the payload with disclosed claims put back. Rejects — per §7.1 — a
+   duplicate digest anywhere in the payload, and any Disclosure that was sent but
+   never referenced. A digest with no Disclosure is ignored, which is the normal
+   case for a withheld claim.
+
+   `:json-decode` is REQUIRED."
+  [payload disclosures {:keys [json-decode]}]
+  (when-not (fn? json-decode) (fail! :sd-jwt/no-json-decode ":json-decode is required" {}))
+  (let [;; §4.1.1: an algorithm we do not implement must not be silently treated
+        ;; as sha-256, or every digest would mismatch for the wrong reason.
+        alg (get payload sd-alg-claim default-sd-alg)
+        _ (when-not (= default-sd-alg alg)
+            (fail! :sd-jwt/unsupported-sd-alg
+                   (str "_sd_alg " alg " is not implemented; only " default-sd-alg)
+                   {:sd-alg alg}))
+        by-digest (reduce (fn [acc d]
+                            (let [parsed (json-decode (b64url-decode-string d))]
+                              (when-not (and (sequential? parsed)
+                                             (<= 2 (count parsed) 3))
+                                (fail! :sd-jwt/bad-disclosure
+                                       "a Disclosure is a 2- or 3-element array"
+                                       {:disclosure d}))
+                              (assoc acc (digest d) (vec parsed))))
+                          {} disclosures)
+        ;; §7.1: a duplicate digest rejects the whole SD-JWT. Counted over the
+        ;; payload rather than the Disclosures, because that is where an attacker
+        ;; would put a second copy to have one Disclosure fill two slots.
+        all-digests (let [found (atom [])]
+                      ((fn scan [v]
+                         (cond
+                           (map? v) (do (swap! found into (or (get v sd-claim) []))
+                                        (run! scan (vals (dissoc v sd-claim))))
+                           (sequential? v)
+                           (run! (fn [e]
+                                   (if (and (map? e) (contains? e array-element-key))
+                                     (swap! found conj (get e array-element-key))
+                                     (scan e)))
+                                 v)
+                           :else nil))
+                       payload)
+                      @found)]
+    (when-let [dupes (->> all-digests frequencies
+                          (keep (fn [[d n]] (when (> n 1) d))) seq)]
+      (fail! :sd-jwt/duplicate-digest
+             "the same digest appears more than once in the payload"
+             {:digests (vec dupes)}))
+    (let [[reconstructed used] (walk-disclose payload by-digest #{})
+          unused (remove used (keys by-digest))]
+      (when (seq unused)
+        (fail! :sd-jwt/unused-disclosure
+               (str "a Disclosure was presented that the payload never references; "
+                    "§7.1 requires rejecting the SD-JWT rather than ignoring it")
+               {:count (count unused)}))
+      reconstructed)))

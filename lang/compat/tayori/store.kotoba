@@ -1,0 +1,203 @@
+(ns tayori.store
+  "SSoT for tayori — a correspondence-drafting control plane, behind a `Store`
+  protocol so the backend is a swap (MemStore default ‖ DatomicStore via
+  langchain.db, itself swappable to real Datomic Local / kotoba-server).
+
+  Domain = the draft/review/send lifecycle across Email/Slack/WhatsApp threads
+  and git-backed documents. The actor only ever writes :draft/:revision
+  records (control-plane proposals); sending a message or publishing a
+  document is an EXTERNAL effect performed by a Channel/DocTarget port, and
+  only after human sign-off.
+
+    contact  — a correspondent: channel, address, consent (:known/:blocked),
+               first-contact? (never sent to before)
+    thread   — a conversation: channel, external-id, participants (contact
+               ids), tenant, status (:open/:closed)
+    message  — one message in a thread: from, body, ts, direction
+               (:inbound/:outbound)
+    document — a publish target: target (:git/:gdocs/:notion), path, tenant
+    draft    — the committed/proposed reply for a thread (text, confidence,
+               cites, redactions, status :proposed/:sent)
+    revision — the committed/proposed revision for a document (diff,
+               confidence, cites, redactions, status :proposed/:published)
+
+  Charter: the append-only **ledger is tayori's correspondence audit trail**
+  (who drafted what, on what basis, who approved sending/publishing, when) —
+  the property a mutable inbox/kanban can't give you. There is intentionally
+  no raw-body-at-rest requirement beyond the thread/document itself: the
+  ledger records dispositions and bases, not full message contents (anti-
+  surveillance, same charter as kekkai's ledger)."
+  (:require 
+            [clojure.string :as str]
+            [langchain.db :as d]))
+
+(defprotocol Store
+  (contact [s id])
+  (thread [s id])
+  (all-threads [s])
+  (messages-of [s thread-id] "messages on a thread, oldest→newest")
+  (document [s id])
+  (draft-of [s thread-id]     "committed/proposed draft for a thread, or nil")
+  (revision-of [s document-id] "committed/proposed revision for a document, or nil")
+  (ledger [s])
+  (record-datom! [s record]  "append/merge a tayori ground fact to the SSoT")
+  (append-ledger! [s fact]   "append one immutable correspondence-audit fact")
+  (seed! [s data]            "bulk-seed entity collections (idempotent upsert)"))
+
+;; ───────────────────────── demo data ─────────────────────────
+;; A fixed clock so drafts/tests are deterministic and offline-verifiable.
+(def demo-now 1750000000) ; ~2025-06-15Z, epoch seconds
+
+(defn demo-data
+  "alice's inbox: t-status (known boss, clean) / t-newbiz (first-contact
+  prospect) / t-blocked (a contact consent has blocked — :reply/send must
+  HOLD un-overridably) / t-chat (WhatsApp, known friend). d-memo is a git-
+  backed status memo alice is drafting a revision for."
+  []
+  {:contacts
+   {"c-boss"    {:id "c-boss"    :channel :email    :address "boss@example.com"
+                 :consent :known :first-contact? false}
+    "c-newbiz"  {:id "c-newbiz"  :channel :email    :address "biz@example.com"
+                 :consent :known :first-contact? true}
+    "c-blocked" {:id "c-blocked" :channel :email    :address "spam@example.com"
+                 :consent :blocked :first-contact? false}
+    "c-friend"  {:id "c-friend"  :channel :whatsapp :address "+15551234567"
+                 :consent :known :first-contact? false}}
+   :threads
+   {"t-status"  {:id "t-status"  :channel :email    :external-id "gm-1"
+                 :participants ["c-boss"] :tenant "alice" :status :open}
+    "t-newbiz"  {:id "t-newbiz"  :channel :email    :external-id "gm-2"
+                 :participants ["c-newbiz"] :tenant "alice" :status :open}
+    "t-blocked" {:id "t-blocked" :channel :email    :external-id "gm-3"
+                 :participants ["c-blocked"] :tenant "alice" :status :open}
+    "t-chat"    {:id "t-chat"    :channel :whatsapp :external-id "wa-1"
+                 :participants ["c-friend"] :tenant "alice" :status :open}}
+   :messages
+   {"t-status"  [{:thread-id "t-status" :from "c-boss" :ts demo-now
+                  :direction :inbound :body "明日の進捗どうですか?"}]
+    "t-newbiz"  [{:thread-id "t-newbiz" :from "c-newbiz" :ts demo-now
+                  :direction :inbound :body "御社サービスに興味があります"}]
+    "t-blocked" [{:thread-id "t-blocked" :from "c-blocked" :ts demo-now
+                  :direction :inbound :body "至急ご連絡ください"}]
+    "t-chat"    [{:thread-id "t-chat" :from "c-friend" :ts demo-now
+                  :direction :inbound :body "週末空いてる?"}]}
+   :documents
+   {"d-memo" {:id "d-memo" :target :git :path "memos/status.md" :tenant "alice"}}})
+
+;; ───────────────────────── MemStore (default) ─────────────────────────
+
+(defrecord MemStore [a]
+  Store
+  (contact [_ id] (get-in @a [:contacts id]))
+  (thread [_ id] (get-in @a [:threads id]))
+  (all-threads [_] (sort-by :id (vals (:threads @a))))
+  (messages-of [_ thread-id] (get-in @a [:messages thread-id] []))
+  (document [_ id] (get-in @a [:documents id]))
+  (draft-of [_ thread-id] (get-in @a [:drafts thread-id]))
+  (revision-of [_ document-id] (get-in @a [:revisions document-id]))
+  (ledger [_] (:ledger @a))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :contact  (swap! a update-in [:contacts id] merge value)
+      :thread   (swap! a update-in [:threads id] merge value)
+      :message  (swap! a update-in [:messages id] (fnil conj []) value)
+      :document (swap! a update-in [:documents id] merge value)
+      :draft    (swap! a update-in [:drafts id] merge value)
+      :revision (swap! a update-in [:revisions id] merge value)
+      nil)
+    s)
+  (append-ledger! [_ fact] (swap! a update :ledger conj fact) fact)
+  (seed! [s data] (swap! a merge (select-keys data
+                                              [:contacts :threads :messages :documents])) s))
+
+(defn seed-db []
+  (->MemStore (atom (assoc (demo-data) :drafts {} :revisions {} :ledger []))))
+
+;; ───────────────────────── DatomicStore (langchain.db) ─────────────────────────
+
+(def ^:private schema
+  {:contact/id  {:db/unique :db.unique/identity}
+   :thread/id   {:db/unique :db.unique/identity}
+   :document/id {:db/unique :db.unique/identity}
+   :draft/id    {:db/unique :db.unique/identity}
+   :revision/id {:db/unique :db.unique/identity}})
+
+(defn- enc [v] (pr-str v))
+(defn- dec* [s] (when s (edn/read-string s)))
+
+;; The store talks to its backend ONLY through the langchain.db `:db-api` map
+;; {:q :transact! :db :pull :entid}. langchain.db/api (in-process EAVT) and
+;; langchain.kotoba-db/kotoba-api (kotoba-server XRPC, e.g. kotobase.net) both
+;; implement it, so the same record runs on either by construction.
+
+(defn- q* [{:keys [api conn]} query & inputs]
+  (apply (:q api) query ((:db api) conn) inputs))
+(defn- pull* [{:keys [api conn]} pattern eid] ((:pull api) ((:db api) conn) pattern eid))
+(defn- tx* [{:keys [api conn]} txd] ((:transact! api) conn txd))
+
+(defrecord DatomicStore [api conn]
+  Store
+  (contact [this id]
+    (-> (pull* this [:contact/edn] [:contact/id id]) :contact/edn dec*))
+  (thread [this id]
+    (-> (pull* this [:thread/edn] [:thread/id id]) :thread/edn dec*))
+  (all-threads [this]
+    (->> (q* this '[:find [?id ...] :where [?e :thread/id ?id]])
+         (map #(thread this %)) (sort-by :id)))
+  (messages-of [this thread-id]
+    (->> (q* this '[:find [?v ...] :in $ ?tid :where
+                    [?r :message/thread ?tid] [?r :message/edn ?v]] thread-id)
+         (mapv dec*)))
+  (document [this id]
+    (-> (pull* this [:document/edn] [:document/id id]) :document/edn dec*))
+  (draft-of [this thread-id]
+    (-> (pull* this [:draft/edn] [:draft/id thread-id]) :draft/edn dec*))
+  (revision-of [this document-id]
+    (-> (pull* this [:revision/edn] [:revision/id document-id]) :revision/edn dec*))
+  (ledger [this]
+    ;; ordered by entity id (?e), never a client-precomputed :ledger/seq -- a
+    ;; caller-side `(count (ledger s))` read followed by a separate `tx*` write
+    ;; is a non-atomic read-modify-write; two concurrent append-ledger! calls
+    ;; can compute the SAME seq, and since :ledger/seq was a :db.unique/identity
+    ;; attr, the second transact! silently upserted onto (retracted +
+    ;; replaced) the first call's entity -- verified data loss against the
+    ;; real langchain.db transact! semantics. :db/id is allocated fresh per
+    ;; entity map with no unique attr to collide on, so ordering by it can
+    ;; never lose a fact this way.
+    (->> (q* this '[:find ?e ?f :where [?e :ledger/fact ?f]])
+         (sort-by first) (mapv (comp dec* second))))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :contact  (tx* s [{:contact/id id :contact/edn (enc (merge (contact s id) value))}])
+      :thread   (tx* s [{:thread/id id :thread/edn (enc (merge (thread s id) value))}])
+      :message  (tx* s [{:message/thread id :message/edn (enc value)}])
+      :document (tx* s [{:document/id id :document/edn (enc (merge (document s id) value))}])
+      :draft    (tx* s [{:draft/id id :draft/edn (enc (merge (draft-of s id) value))}])
+      :revision (tx* s [{:revision/id id :revision/edn (enc (merge (revision-of s id) value))}])
+      nil)
+    s)
+  (append-ledger! [s fact]
+    (tx* s [{:ledger/fact (enc fact)}]) fact)
+  (seed! [s data]
+    (doseq [[id c] (:contacts data)]  (record-datom! s {:kind :contact :id id :value c}))
+    (doseq [[id th] (:threads data)]  (record-datom! s {:kind :thread :id id :value th}))
+    (doseq [[id msgs] (:messages data) m msgs]
+      (record-datom! s {:kind :message :id id :value m}))
+    (doseq [[id doc] (:documents data)] (record-datom! s {:kind :document :id id :value doc}))
+    s))
+
+(defn datomic-store
+  "DatomicStore on the in-process langchain.db EAVT backend (default Datomic-
+  shaped store; verifiable offline). For the kotoba-server pod (kotobase.net),
+  see tayori.kotoba/kotoba-store — same record, different :db-api."
+  ([] (datomic-store nil))
+  ([data] (let [s (->DatomicStore d/api (d/create-conn schema))]
+            (when data (seed! s data)) s)))
+
+(defn datomic-seed-db [] (datomic-store (demo-data)))
+
+;; ───────────────────────── ledger formatting ─────────────────────────
+
+(defn ledger-line [{:keys [op subject disposition basis]}]
+  (str/join " · " [(name (or disposition :record)) (str "op=" op)
+                   (str "subject=" subject) (str "basis=" (pr-str basis))]))

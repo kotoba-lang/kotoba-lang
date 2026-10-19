@@ -1,0 +1,173 @@
+(ns ipni.find
+  "Query an indexer. Two HTTP surfaces, one identity:
+
+  - Delegated Routing V1 `GET /routing/v1/providers/{cid}` — same shape
+    kad.routing/find-providers consumes. Enough for gateway fetch.
+  - IPNI-native `GET /cid/{cid}` — ContextID and Metadata.
+
+  Default indexer is cid.contact. This process is not an indexer node.
+  Transport is injected: `http-fn` is
+  `(fn [{:keys [method url headers body]}] -> {:status :headers :body})`.
+  JSON parse is `parse-fn`. No HTTP client and no JSON library live here."
+  (:require [ipni.http :as http]))
+
+(def default-indexers [http/default-indexer])
+(def default-routers [http/default-routing-v1])
+
+(defn- body->map [body parse-fn]
+  (cond
+    (map? body) body
+    (nil? body) nil
+    (and parse-fn (or (string? body) (sequential? body)))
+    (try (parse-fn body)
+         (catch  _ :parse-failed))
+    :else :unparsed))
+
+(defn- provider-id [p]
+  (or (:ID p) (:id p) (get p "ID") (get p "id")
+      (let [prov (or (:Provider p) (:provider p) (get p "Provider"))]
+        (when (map? prov)
+          (or (:ID prov) (:id prov) (get prov "ID") (get prov "id"))))))
+
+(defn- provider-addrs [p]
+  (or (:Addrs p) (:addrs p) (get p "Addrs") (get p "addrs")
+      (let [prov (or (:Provider p) (:provider p) (get p "Provider"))]
+        (when (map? prov)
+          (or (:Addrs prov) (:addrs prov) (get prov "Addrs") (get prov "addrs"))))
+      []))
+
+(defn- provider-record
+  "Same shape as kotoba.protocol.discover/record, by convention not require."
+  [cid p]
+  (let [id (provider-id p)]
+    (when (string? id)
+      {:plane :discovery
+       :cid cid
+       :peer id
+       :addrs (vec (provider-addrs p))
+       :context-id (or (:ContextID p) (:contextID p) (get p "ContextID"))
+       :metadata (or (:Metadata p) (:metadata p) (get p "Metadata"))
+       :mutates-cid? false})))
+
+(defn- providers-of [body]
+  (or (:Providers body) (:providers body)
+      (get body "Providers") (get body "providers") []))
+
+(defn- native-providers [body]
+  (let [results (or (:MultihashResults body) (:multihashResults body)
+                    (get body "MultihashResults") [])]
+    (mapcat (fn [r]
+              (or (:ProviderResults r) (:providerResults r)
+                  (get r "ProviderResults") []))
+            results)))
+
+(defn get-providers
+  "GET `{router}/providers/{cid}` (routing v1). Never throws. Never
+  rewrites `cid`. 404 and empty Providers are success: we asked, nobody
+  provides. Transport failure is a different answer."
+  ([http-fn router cid] (get-providers http-fn router cid {}))
+  ([http-fn router cid {:keys [parse-fn]}]
+   (if-not (string? cid)
+     {:ok? false :reason :invalid-cid :value cid :router router}
+     (try
+       (let [{:keys [status body]} (http-fn {:method :get
+                                             :url (http/providers-url router cid)
+                                             :headers {"Accept" "application/json"}})
+             parsed (body->map body parse-fn)]
+         (cond
+           (= 404 status)
+           {:ok? true :providers [] :router router :cid cid :empty? true}
+           (not= 200 status)
+           {:ok? false :reason :http-error :status status :router router :cid cid}
+           (nil? parsed)
+           {:ok? false :reason :empty-body :router router :cid cid}
+           (#{:unparsed :parse-failed} parsed)
+           {:ok? false :reason :body-not-map :router router :cid cid}
+           (not (map? parsed))
+           {:ok? false :reason :body-not-map :router router :cid cid}
+           :else
+           {:ok? true
+            :providers (vec (keep #(provider-record cid %) (providers-of parsed)))
+            :router router
+            :cid cid}))
+       (catch  e
+         {:ok? false :reason :transport-error :router router :cid cid
+          :detail })))))
+
+(defn get-cid
+  "GET `{indexer}/cid/{cid}` — IPNI-native. ContextID and Metadata live
+  here. Do not use this as the default finder; routing v1 is enough for
+  gateway fetch."
+  ([http-fn indexer cid] (get-cid http-fn indexer cid {}))
+  ([http-fn indexer cid {:keys [parse-fn]}]
+   (if-not (string? cid)
+     {:ok? false :reason :invalid-cid :value cid :indexer indexer}
+     (try
+       (let [{:keys [status body]} (http-fn {:method :get
+                                             :url (http/cid-url indexer cid)
+                                             :headers {"Accept" "application/json"}})
+             parsed (body->map body parse-fn)]
+         (cond
+           (= 404 status)
+           {:ok? true :providers [] :indexer indexer :cid cid :empty? true}
+           (not= 200 status)
+           {:ok? false :reason :http-error :status status :indexer indexer :cid cid}
+           (nil? parsed)
+           {:ok? false :reason :empty-body :indexer indexer :cid cid}
+           (#{:unparsed :parse-failed} parsed)
+           {:ok? false :reason :body-not-map :indexer indexer :cid cid}
+           (not (map? parsed))
+           {:ok? false :reason :body-not-map :indexer indexer :cid cid}
+           :else
+           {:ok? true
+            :providers (vec (keep #(provider-record cid %) (native-providers parsed)))
+            :indexer indexer
+            :cid cid}))
+       (catch  e
+         {:ok? false :reason :transport-error :indexer indexer :cid cid
+          :detail })))))
+
+(defn score-providers
+  "Pure half: union by `:peer`. Quorum counts indexers that answered.
+  Empty union with quorum met is success. All transport failures are
+  `:all-routers-failed`. Does not rewrite `cid`."
+  [cid responses {:keys [quorum] :or {quorum 1}}]
+  (let [ok (filterv :ok? responses)
+        by-peer (reduce (fn [m p]
+                          (if (string? (:peer p))
+                            (assoc m (:peer p) p)
+                            m))
+                        {}
+                        (mapcat :providers ok))]
+    (if (>= (count ok) quorum)
+      {:ok? true
+       :cid cid
+       :providers (vec (vals by-peer))
+       :answered (count ok)
+       :routers (mapv #(or (:router %) (:indexer %)) ok)
+       :responses responses
+       :mutates-cid? false}
+      {:ok? false
+       :cid cid
+       :reason (if (empty? ok) :all-routers-failed :quorum-unmet)
+       :answered (count ok)
+       :quorum quorum
+       :responses responses})))
+
+(defn find-providers
+  "Ask cid.contact (or supplied routers) who serves `cid`.
+
+  Production wiring into kotoba.protocol.discover:
+
+      (fn [cid]
+        (ipni.find/find-providers http-fn cid opts))
+
+  kad.routing/find-providers remains the current live finder. This is
+  the IPNI-side twin so lookup can add cid.contact without kad owning
+  IPNI. This namespace does not require kotoba-protocol."
+  [http-fn cid {:keys [routers quorum]
+                :or {routers default-routers quorum 1}
+                :as opts}]
+  (score-providers cid
+                   (mapv #(get-providers http-fn % cid opts) routers)
+                   {:quorum quorum}))

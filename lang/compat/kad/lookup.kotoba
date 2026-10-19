@@ -1,0 +1,196 @@
+(ns kad.lookup
+  "The iterative Kademlia lookup, as a **pure state machine**.
+
+  A lookup is the part of Kademlia that is genuinely subtle and the part that
+  is normally impossible to test, because it is written as a loop around a
+  network socket. Here it is `state + responses -> state + next-queries`, so a
+  ten-round convergence over a simulated 10,000-peer network is an ordinary
+  `reduce` and the concurrency is the caller's problem.
+
+  ## The algorithm (Kademlia §2.3, as libp2p implements it)
+
+  Keep a shortlist of the `k` closest peers known so far. Repeatedly send the
+  query to up to `alpha` peers from the shortlist that have not been queried.
+  Each response contributes `closerPeers`, which are merged into the shortlist.
+  Stop when a full round produces nothing closer than what is already known and
+  the `k` closest have all been queried.
+
+  Three details that decide whether it converges or spins:
+
+  **Progress is measured against the closest peer, not the shortlist.** A round
+  that returns fifty new peers, none closer than the current best, is *no
+  progress* — that is the termination condition. Measuring \"did the shortlist
+  grow\" instead never terminates on a large network, because there is always
+  another peer.
+
+  **Failed peers are remembered as failed.** Otherwise the same unreachable
+  peer is selected every round forever: it is never marked queried, so it stays
+  eligible, and it is always among the closest.
+
+  **`alpha` bounds concurrency, `k` bounds the answer.** Confusing them makes
+  the lookup either serial (α=1) or a flood (α=k). libp2p uses α=3, k=20.
+
+  ## Value lookups stop early, peer lookups do not
+
+  A `GET_VALUE` for an IPNS name can stop as soon as it has enough valid
+  records to satisfy the quorum — but *only* if the caller validated them.
+  Stopping on the first record that parses lets any peer win a name by
+  answering first, so `record!` takes already-validated records and the
+  quorum is counted over those."
+  (:require [kad.key :as kkey]))
+
+(def ^:const default-k 20)
+(def ^:const default-alpha 3)
+
+(defn start
+  "Begin a lookup for `target` (a 32-octet DHT key) seeded with `peers`.
+
+  A peer is `{:peer/id … :peer/dht-key <32 octets> …}` — the caller supplies
+  the DHT key because computing it needs a hash function this namespace
+  deliberately does not import."
+  [target peers & [{:keys [k alpha quorum] :or {k default-k alpha default-alpha quorum 1}}]]
+  {:lookup/target target
+   :lookup/k k
+   :lookup/alpha alpha
+   :lookup/quorum quorum
+   :lookup/shortlist (vec (kkey/sort-closest target :peer/dht-key peers))
+   :lookup/queried #{}
+   :lookup/failed #{}
+   :lookup/in-flight #{}
+   :lookup/records []
+   :lookup/rounds 0})
+
+(defn- closest-key
+  "The distance of the nearest peer in the shortlist, or nil when empty. This
+  is the progress metric — not the shortlist's size."
+  [{:lookup/keys [target shortlist]}]
+  (when-let [p (first shortlist)]
+    (kkey/xor-distance (:peer/dht-key p) target)))
+
+(defn next-queries
+  "Up to `alpha` peers to query now: the closest that are neither queried,
+  failed, nor already in flight.
+
+  Returns at most `alpha` and never re-issues an outstanding query, which is
+  what keeps a slow peer from being asked the same thing every round."
+  [{:lookup/keys [shortlist queried failed in-flight alpha k]}]
+  (->> (take k shortlist)
+       (remove #(or (contains? queried (:peer/id %))
+                    (contains? failed (:peer/id %))
+                    (contains? in-flight (:peer/id %))))
+       (take alpha)
+       vec))
+
+(defn issue
+  "Mark `peers` as in flight. Separate from `next-queries` so a caller can
+  decide not to send some of them without corrupting the state."
+  [state peers]
+  (update state :lookup/in-flight into (map :peer/id peers)))
+
+(defn response
+  "Fold in one peer's answer: it is now queried, no longer in flight, and its
+  `closer-peers` join the shortlist.
+
+  New peers are merged and the whole shortlist re-sorted rather than appended —
+  a shortlist that is not in distance order makes `next-queries` pick the wrong
+  peers and the lookup wanders."
+  [state peer-id closer-peers]
+  (let [target (:lookup/target state)
+        known (into #{} (map :peer/id) (:lookup/shortlist state))
+        fresh (remove #(contains? known (:peer/id %)) closer-peers)]
+    (-> state
+        (update :lookup/queried conj peer-id)
+        (update :lookup/in-flight disj peer-id)
+        (update :lookup/shortlist
+                #(vec (kkey/sort-closest target :peer/dht-key (concat % fresh)))))))
+
+(defn failure
+  "Record that a peer did not answer. It stays in the shortlist — it is still a
+  fact about the topology — but is never selected again. Forgetting this is how
+  a lookup spins on one unreachable peer forever."
+  [state peer-id]
+  (-> state
+      (update :lookup/failed conj peer-id)
+      (update :lookup/in-flight disj peer-id)))
+
+(defn record!
+  "Add a record returned by `peer-id`.
+
+  Takes **already-validated** records. A lookup that counted unvalidated
+  records toward its quorum would let any peer win a name by answering first,
+  which is the cheapest attack on IPNS there is."
+  [state peer-id record]
+  (update state :lookup/records conj {:record record :from peer-id}))
+
+(defn round
+  "Advance the round counter and report whether the round made progress.
+
+  `progress?` compares the closest distance before and after — the termination
+  condition. Callers that fold responses without calling this still terminate
+  (via `done?`), but lose the ability to stop early on a stalled lookup."
+  [before after]
+  (let [a (closest-key before)
+        b (closest-key after)]
+    (-> after
+        (update :lookup/rounds inc)
+        (assoc :lookup/progress?
+               (boolean (and b (or (nil? a) (neg? (kkey/compare-distance b a)))))))))
+
+(defn done?
+  "Is the lookup finished?
+
+  Three ways: the quorum of validated records is met; every one of the `k`
+  closest has been queried or failed; or nothing is left to ask. The first is
+  why a value lookup is usually much cheaper than a peer lookup."
+  [{:lookup/keys [k shortlist queried failed records quorum in-flight] :as state}]
+  (let [top (take k shortlist)]
+    (boolean
+     (or (>= (count records) quorum)
+         (and (empty? in-flight) (empty? (next-queries state)))
+         (and (seq top)
+              (every? #(or (contains? queried (:peer/id %))
+                           (contains? failed (:peer/id %)))
+                      top))))))
+
+(defn result
+  "What the lookup found: the records (for a value lookup) and the `k` closest
+  peers (for a peer lookup), plus the counters worth logging."
+  [{:lookup/keys [k shortlist records queried failed rounds] :as state}]
+  {:records (mapv :record records)
+   :closest (vec (take k shortlist))
+   :queried (count queried)
+   :failed (count failed)
+   :rounds rounds
+   :done? (done? state)})
+
+(defn run
+  "Drive a lookup to completion with a caller-supplied `query-fn`.
+
+  `query-fn` is `(fn [peer] -> {:closer-peers [...] :record <validated-or-nil>})`
+  or nil/throw for a failure. It is synchronous here for the same reason the
+  rest of this namespace is pure — the concurrency belongs to whoever owns the
+  transport, and a synchronous driver makes the algorithm testable. A real node
+  issues the `alpha` queries of each round in parallel and folds them with
+  `response`/`failure` as they land.
+
+  `max-rounds` is a runaway guard, not a policy: a network that keeps returning
+  new-but-not-closer peers would otherwise loop, and a silent infinite loop in
+  name resolution is not an acceptable failure mode."
+  [state query-fn & [{:keys [max-rounds] :or {max-rounds 64}}]]
+  (loop [s state n 0]
+    (if (or (done? s) (>= n max-rounds))
+      (result s)
+      (let [batch (next-queries s)]
+        (if (empty? batch)
+          (result s)
+          (let [s' (issue s batch)
+                after (reduce
+                       (fn [acc p]
+                         (let [r (try (query-fn p)
+                                      (catch  _ nil))]
+                           (if (nil? r)
+                             (failure acc (:peer/id p))
+                             (cond-> (response acc (:peer/id p) (:closer-peers r))
+                               (:record r) (record! (:peer/id p) (:record r))))))
+                       s' batch)]
+            (recur (round s after) (inc n))))))))

@@ -1,0 +1,116 @@
+(ns ipni.advertise
+  "Putter for `kotoba.protocol.discover/advertise-live`.
+
+  Production:
+
+      (fn [rec]
+        (ipni.advertise/advertise http-fn rec opts))
+
+  Historic `kad.routing/provide` is a Bitswap envelope on
+  `PUT /routing/v1/providers`. That is not this. This writes an
+  advertisement chain and `PUT`s an announce message.
+
+  Returns the **content** CID in `:cid` so advertise-live does not see
+  `:cid-mismatch`. The advertisement CID is `:ad-cid`.
+
+  Injected:
+
+  - `http-fn` — transport
+  - `hash-fn` — `(fn [body] ad-cid-string)` of the encoded advertisement
+  - `encode-fn` — dag-cbor / JSON. Tests pass the map through
+  - `sign-fn` — optional. Unsigned is not a pass if the indexer 400s
+  - `put-fn` — `(fn [{:keys [cid body kind]}] …)` store blocks. Optional
+    when the publisher already has the bytes at `publisher-addrs`
+  - `addr-encode-fn` — `(fn [multiaddr-string] octets)`. REQUIRED: publisher
+    addresses go on the wire as base64 of the BINARY multiaddr, and parsing
+    one needs a multiformats table this library does not depend on. See
+    `ipni.announce`'s docstring for the three wire shapes measured against
+    production cid.contact
+
+  This process is not an indexer node. Gossip ingest is out of scope."
+  (:require [ipni.ad :as ad]
+            [ipni.octets :as oct]
+            [ipni.announce :as announce]
+            [ipni.http :as http]
+            [ipni.metadata :as metadata]))
+
+(defn- ->octets [b]
+  (let [o (oct/->octets b)]
+    (if (= :invalid o) nil o)))
+
+(defn put-announce
+  "PUT the announce message to one indexer. Never throws. Never rewrites
+  the content CID."
+  [http-fn url msg {:keys [encode-fn]}]
+  (if (:error msg)
+    (assoc msg :ok? false :reason (:error msg))
+    (try
+      (let [body (if encode-fn (encode-fn (:wire msg)) (:wire msg))
+            {:keys [status body]} (http-fn {:method :put
+                                            :url url
+                                            :headers {"Content-Type" "application/json"}
+                                            :body body})]
+        (if (<= 200 status 299)
+          {:ok? true :url url :status status :ad-cid (:ad-cid msg)}
+          {:ok? false :reason :rejected :status status :url url :ad-cid (:ad-cid msg)
+           :detail (when (and body (not (map? body)))
+                     (apply str (map char (take 200 (->octets body)))))}))
+      (catch  e
+        {:ok? false :reason :transport-error :url url :ad-cid (:ad-cid msg)
+         :detail }))))
+
+(defn advertise
+  "Build, optionally store, and announce one advertisement for `rec`.
+
+  `rec` is a discover record `{:cid :peer :addrs}`. `:cid` is content.
+  Succeeds if **any** indexer accepted the announce — one indexer having
+  the chain is enough, same rule as kad.routing/provide.
+
+  Required opts: `:hash-fn`, `:publisher-addrs`, `:context-id`.
+  `:entries` (multihashes) is required unless `:is-rm`.
+  Missing hash-fn is `:hash-fn-required`, not a green unsigned skip."
+  ([http-fn rec] (advertise http-fn rec {}))
+  ([http-fn rec {:keys [hash-fn encode-fn sign-fn put-fn addr-encode-fn
+                        publisher-addrs context-id is-rm previous-id
+                        entries metadata indexers announce-path]
+                 :or {indexers [http/default-indexer]
+                      announce-path "/ingest/announce"}
+                 :as opts}]
+   (cond
+     (:error rec) (assoc rec :ok? false)
+     (not (string? (:cid rec))) {:ok? false :reason :invalid-cid :value (:cid rec)}
+     (not (ifn? hash-fn)) {:ok? false :reason :hash-fn-required :cid (:cid rec)}
+     (not (sequential? publisher-addrs))
+     {:ok? false :reason :publisher-addrs-required :cid (:cid rec)}
+     (empty? publisher-addrs)
+     {:ok? false :reason :publisher-addrs-required :cid (:cid rec)}
+     :else
+     (let [built (ad/from-discover rec {:context-id context-id
+                                        :is-rm is-rm
+                                        :previous-id previous-id
+                                        :entries entries
+                                        :metadata (or metadata (metadata/gateway-http-bytes))})]
+       (if (:error built)
+         {:ok? false :reason (:error built) :cid (:cid rec) :error (:error built)}
+         (let [signed (ad/sign built sign-fn)
+               body (if encode-fn (encode-fn (ad/unsigned-fields signed)) signed)
+               ad-cid (hash-fn body)]
+           (when put-fn
+             (put-fn {:cid ad-cid :body body :kind :advertisement}))
+           (let [msg (announce/message {:ad-cid ad-cid
+                                        :addrs publisher-addrs
+                                        :addr-encode-fn addr-encode-fn})]
+             (if (:error msg)
+               {:ok? false :reason (:error msg) :cid (:cid rec)}
+               (let [results (mapv #(put-announce http-fn
+                                                  (http/announce-url % {:path announce-path})
+                                                  msg
+                                                  opts)
+                                   indexers)
+                     ok (filterv :ok? results)]
+                 {:ok? (boolean (seq ok))
+                  :cid (:cid rec)
+                  :ad-cid ad-cid
+                  :mutates-cid? false
+                  :accepted (mapv :url ok)
+                  :rejected (filterv (complement :ok?) results)})))))))))

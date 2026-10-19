@@ -1,0 +1,377 @@
+(ns ipns.record
+  "The **real IPNS Record** (specs.ipfs.tech/ipns/ipns-record) — the signed,
+  protobuf-encoded value that Kubo, Helia and every other IPFS implementation
+  puts into and reads out of the libp2p DHT.
+
+  This is not the same thing as `ipns.head`. That namespace signs a
+  kotobase-shaped map (`{:name :value :sequence :valid_until}`) for
+  kotobase.net's own XRPC registry, and no IPFS implementation can validate it.
+  Publishing those bytes to the DHT would put a record on the network that
+  every peer rejects. So the record format has to be right *before* the
+  transport question is even interesting — which is why this namespace exists
+  and why `ipns.head` is now documented as the local-registry format it always
+  was.
+
+  ## The record
+
+  A protobuf `IpnsEntry` whose interesting field is `data` — a DAG-CBOR map —
+  and whose signature covers that CBOR, not the protobuf:
+
+      signatureV2 = sign(privkey, \"ipns-signature:\" || data)
+
+  The other protobuf fields (`value`, `validity`, `validityType`, `sequence`,
+  `ttl`) are a **duplicate** of what is inside `data`, kept for readers that
+  predate V2. That duplication is the sharp edge: a validator must check the
+  two copies agree, because a record whose protobuf says one thing and whose
+  signed CBOR says another is a record that reads differently depending on
+  which half you look at. Signing only the CBOR and then rewriting the
+  protobuf half is precisely the attack the check exists to stop.
+
+  ## What is injected
+
+  Signing and verification, as `sign-fn` / `verify-fn`. Same reason as
+  `org-ietf-dnssec`: a library that imported an Ed25519 implementation would
+  need somewhere for the private key to be, and the key belongs in the caller's
+  keystore. It also makes every byte-level assertion testable without crypto —
+  the test suite's signer returns its input.
+
+  ## Scope
+
+  Ed25519 names only (`k51…`), which is what `ipns.core` derives and what
+  every modern IPNS name is. RSA names carry their public key in the `pubKey`
+  field because it does not fit in an identity multihash; that path is
+  documented as absent rather than half-built."
+  (:require [clojure.string :as str]
+            [cbor.core :as cbor]
+            [ipns.core :as core]
+            [protobuf.wire :as pb]))
+
+;; ── byte representation ───────────────────────────────────────────────────
+;;
+;; Three representations meet in this namespace and confusing them is silent:
+;; `protobuf.wire` speaks vectors of 0-255 ints, `cbor.core` speaks host byte
+;; arrays (byte-array / Uint8Array), and a Clojure vector handed to
+;; `cbor/encode` is `sequential?` — so it encodes as a CBOR **array**, not a
+;; byte string. A record whose Value is an array of small integers instead of a
+;; byte string is well-formed CBOR that no IPFS implementation will accept, and
+;; nothing about it looks wrong until a validator elsewhere rejects it.
+
+(defn ->bytes
+  "Vector of 0-255 ints → the host byte array `cbor.core` treats as a byte
+  string."
+  [v]
+  )
+
+(defn ->ints
+  "Anything byte-ish → a vector of 0-255 ints. On the JVM `vec` of a byte-array
+  gives signed bytes, so the mask is what keeps 0x80 from becoming -128 and
+  comparing unequal to the same octet that came off the wire."
+  [b]
+  (cond
+    (nil? b) nil
+    (vector? b) (mapv #(bit-and % 0xFF) b)
+    :else (mapv #(bit-and % 0xFF) (vec (seq )))))
+
+;; ── the protobuf schema (specs.ipfs.tech/ipns/ipns-record §Record Fields) ──
+
+(def schema
+  "`IpnsEntry`. Field numbers are the spec's and must not be renumbered — they
+  are the wire format, not an implementation detail."
+  {1 {:name :value :type :bytes}
+   2 {:name :signature-v1 :type :bytes}
+   3 {:name :validity-type :type :enum}
+   4 {:name :validity :type :bytes}
+   5 {:name :sequence :type :uint64}
+   6 {:name :ttl :type :uint64}
+   7 {:name :pub-key :type :bytes}
+   8 {:name :signature-v2 :type :bytes}
+   9 {:name :data :type :bytes}})
+
+(def ^:const validity-eol
+  "The only `ValidityType` the spec defines. A record with any other value is
+  refused rather than treated as EOL — an unrecognized validity rule is not
+  something to guess about, because guessing means deciding a record is still
+  valid when its author said something we did not understand."
+  0)
+
+(def ^:const max-size
+  "10 KiB (spec, §Record Size Limits). Checked before parsing, not after: the
+  point of a size limit is to bound the work a hostile record can cause."
+  10240)
+
+(def ^:const signature-v2-prefix "ipns-signature:")
+
+(def ^:const default-ttl-ns
+  "1 hour, in **nanoseconds** — the unit the spec uses for `ttl`. Reading it as
+  seconds or milliseconds produces a record that is technically valid and
+  cached for a wildly wrong duration."
+  3600000000000)
+
+;; ── the DAG-CBOR data field ───────────────────────────────────────────────
+
+(defn data-map
+  "The CBOR map that `data` holds. Keys are the spec's exact capitalized
+  strings; `cbor/encode` sorts them dag-cbor style, which is what makes the
+  signed bytes reproducible."
+  [{:keys [value validity validity-type sequence ttl]}]
+  {"Value" (->bytes value)
+   "Validity" (->bytes validity)
+   "ValidityType" (or validity-type validity-eol)
+   "Sequence" (or sequence 0)
+   "TTL" (or ttl default-ttl-ns)})
+
+(defn signing-input
+  "The octets `signatureV2` is computed over: the ASCII prefix
+  `\"ipns-signature:\"` followed by the raw `data` bytes.
+
+  Signing the protobuf instead — the obvious-looking mistake — produces a
+  signature no IPFS implementation accepts, because a validator reconstructs
+  this input from the `data` field it received and nothing else."
+  [data-bytes]
+  (into (vec (pb/utf8-bytes signature-v2-prefix)) (vec data-bytes)))
+
+;; ── validity ──────────────────────────────────────────────────────────────
+
+(defn- pad [n w]
+  (let [s (str n)] (str (apply str (repeat (max 0 (- w (count s))) "0")) s)))
+
+(defn rfc3339-nanos
+  "The `validity` field is an RFC 3339 timestamp **with nanosecond precision
+  and a `Z` suffix**, carried as ASCII bytes. Kubo writes exactly
+  `2006-01-02T15:04:05.000000000Z`, and other implementations compare these as
+  strings in places, so the fixed nine fractional digits are not optional
+  decoration."
+  [{:keys [year month day hour minute second nanos]}]
+  (str (pad year 4) "-" (pad month 2) "-" (pad day 2) "T"
+       (pad hour 2) ":" (pad minute 2) ":" (pad second 2)
+       "." (pad (or nanos 0) 9) "Z"))
+
+(defn parse-rfc3339
+  "Parse the validity timestamp back to `{:year … :nanos}`, or nil. Kept
+  strict — only the shape the spec mandates — because accepting a looser form
+  would mean accepting a record this library cannot reproduce byte-identically,
+  and that breaks the signature."
+  [s]
+  (when-let [m (re-matches #"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.(\d{9})Z"
+                           (str s))]
+    (let [n 
+          [_ y mo d h mi se na] m]
+      {:year (n y) :month (n mo) :day (n d)
+       :hour (n h) :minute (n mi) :second (n se) :nanos (n na)})))
+
+(defn- civil-days [y m d]
+  ;; Same proleptic Gregorian conversion as srs.time, inlined rather than
+  ;; depended upon: this library is zero-dep by design and one comparison
+  ;; function is not worth a dependency edge from IPNS to a domain registry.
+  (let [y (if (<= m 2) (dec y) y)
+        era (quot (if (>= y 0) y (- y 399)) 400)
+        yoe (- y (* era 400))
+        doy (+ (quot (+ (* 153 (+ m (if (> m 2) -3 9))) 2) 5) (dec d))
+        doe (+ (* yoe 365) (quot yoe 4) (- (quot yoe 100)) doy)]
+    (+ (* era 146097) doe -719468)))
+
+(defn validity->ms
+  "Validity timestamp → epoch milliseconds, for comparison against a caller's
+  clock. Nanoseconds below the millisecond are dropped; they exist in the
+  format for precision of *expression*, not because anything compares them."
+  [s]
+  (when-let [{:keys [year month day hour minute second nanos]} (parse-rfc3339 s)]
+    (+ (* (civil-days year month day) 86400000)
+       (* hour 3600000) (* minute 60000) (* second 1000)
+       (quot nanos 1000000))))
+
+(defn expired?
+  "Is this record past its EOL at `now-ms`? A record with an unparseable
+  validity is treated as expired — fail closed, because the alternative is
+  serving a name whose expiry we could not read."
+  [record now-ms]
+  (let [v (validity->ms (pb/utf8-string (:validity record)))]
+    (or (nil? v) (> now-ms v))))
+
+;; ── construction ──────────────────────────────────────────────────────────
+
+(defn create
+  "Build a signed IPNS record.
+
+  `value` is the path the name points at — `/ipfs/<cid>` or `/ipns/<name>` — as
+  a string; it goes on the wire as its UTF-8 bytes. `sign-fn` is
+  `(fn [octets] -> signature-octets)` bound to the private key by the caller.
+
+  Both halves are written: the `data` CBOR (which the signature covers) and the
+  duplicate protobuf fields (which older readers use). They are produced from
+  one input here, so they cannot disagree — the disagreement `validate` checks
+  for can only be introduced by someone editing the record afterwards."
+  [{:keys [value validity sequence ttl sign-fn]}]
+  (let [value-bytes (if (string? value) (pb/utf8-bytes value) (vec value))
+        validity-bytes (if (string? validity) (pb/utf8-bytes validity) (vec validity))
+        seq' (or sequence 0)
+        ttl' (or ttl default-ttl-ns)
+        data (->ints (cbor/encode (data-map {:value value-bytes
+                                            :validity validity-bytes
+                                            :validity-type validity-eol
+                                            :sequence seq'
+                                            :ttl ttl'})))
+        sig (->ints (sign-fn (signing-input data)))]
+    {:value value-bytes
+     :validity validity-bytes
+     :validity-type validity-eol
+     :sequence seq'
+     :ttl ttl'
+     :signature-v2 sig
+     :data data}))
+
+(defn serialize
+  "Record map → protobuf octets, ready for the DHT."
+  [record]
+  (pb/encode schema record))
+
+(defn parse
+  "Protobuf octets → record map. Refuses anything over the size limit before
+  decoding, which is the only point at which refusing is cheap."
+  [bs]
+  (when (> (count bs) max-size)
+    (throw (ex-info "IPNS record exceeds the 10 KiB limit"
+                    {:size (count bs) :max max-size})))
+  (pb/decode schema bs))
+
+;; ── validation (spec §Record Verification) ────────────────────────────────
+
+(defn- data-fields
+  "Read the five values out of the signed CBOR. Returns nil if `data` is not a
+  CBOR map with the expected keys — an unreadable `data` is a failure, not an
+  empty result, because everything downstream compares against it."
+  [data-bytes]
+  (try
+    (let [m (cbor/decode (->bytes (->ints data-bytes)))]
+      (when (map? m)
+        {:value (->ints (get m "Value"))
+         :validity (->ints (get m "Validity"))
+         :validity-type (get m "ValidityType")
+         :sequence (get m "Sequence")
+         :ttl (get m "TTL")}))
+    (catch  _ nil)))
+
+(defn validate
+  "Validate a parsed record against the name it claims to be for.
+
+  `verify-fn` is `(fn [pubkey-octets message-octets signature-octets] ->
+  boolean)`. `now-ms` is the caller's clock.
+
+  Returns `{:valid? true :fields {…}}` or `{:valid? false :reason …}` — a
+  value, never an exception, so a resolver collecting records from several
+  peers can score them all rather than aborting on the first bad one.
+
+  The checks, in the order the spec puts them:
+
+  1. `signatureV2` and `data` are **mandatory**. A V1-only record is refused
+     outright — V1 signatures were forgeable by rewriting the unsigned fields,
+     which is exactly why V2 exists, and accepting V1 \"for compatibility\"
+     reopens it.
+  2. The signature verifies over `\"ipns-signature:\" || data`.
+  3. Every protobuf field that is present **matches** its counterpart in the
+     signed CBOR. This is the check that makes the duplication safe.
+  4. `ValidityType` is EOL; anything else is refused rather than assumed.
+  5. The EOL is in the future."
+  [record name {:keys [verify-fn now-ms]}]
+  (let [pubkey (try (core/name->pubkey name)
+                    (catch  _ nil))
+        data (:data record)
+        sig (:signature-v2 record)
+        fields (when data (data-fields data))]
+    (cond
+      (nil? pubkey)
+      {:valid? false :reason :unsupported-name
+       :detail "only Ed25519 (k51…) names are supported; an RSA name carries its key in pubKey"}
+
+      (or (nil? sig) (nil? data))
+      {:valid? false :reason :missing-v2
+       :detail "signatureV2 and data are mandatory; a V1-only record is forgeable by rewriting the unsigned fields"}
+
+      (nil? fields)
+      {:valid? false :reason :malformed-data}
+
+      (not (verify-fn pubkey (signing-input data) sig))
+      {:valid? false :reason :bad-signature}
+
+      ;; The protobuf half must not contradict the signed half.
+      :else
+      (let [mismatches
+            (for [[k pb-v] [[:value (:value record)]
+                            [:validity (:validity record)]
+                            [:validity-type (:validity-type record)]
+                            [:sequence (:sequence record)]
+                            [:ttl (:ttl record)]]
+                  :when (some? pb-v)
+                  :let [cbor-v (get fields k)]
+                  :when (not= (if (sequential? pb-v) (vec pb-v) pb-v)
+                              (if (sequential? cbor-v) (vec cbor-v) cbor-v))]
+              k)]
+        (cond
+          (seq mismatches)
+          {:valid? false :reason :protobuf-cbor-mismatch :fields (vec mismatches)
+           :detail "the unsigned protobuf fields disagree with the signed CBOR; the record reads differently depending on which half you look at"}
+
+          (not= validity-eol (:validity-type fields))
+          {:valid? false :reason :unsupported-validity-type
+           :detail (str "unrecognized ValidityType " (:validity-type fields))}
+
+          (and now-ms (expired? fields now-ms))
+          {:valid? false :reason :expired
+           :detail (pb/utf8-string (:validity fields))}
+
+          :else {:valid? true :fields fields})))))
+
+;; ── record selection (spec §Record Selection) ─────────────────────────────
+
+(defn better?
+  "Is record `a` preferable to `b` for the same name?
+
+  A DHT lookup returns several records from several peers, and this is how a
+  resolver picks. Highest `Sequence` wins; on a tie the later EOL wins. Both
+  arguments must already have passed `validate` — selecting among unvalidated
+  records lets any peer win by claiming a large sequence number, which is the
+  cheapest possible attack on a name."
+  [a b]
+  (let [sa (or (:sequence a) 0) sb (or (:sequence b) 0)]
+    (cond
+      (not= sa sb) (> sa sb)
+      :else (let [va (validity->ms (pb/utf8-string (:validity a)))
+                  vb (validity->ms (pb/utf8-string (:validity b)))]
+              (and va vb (> va vb))))))
+
+(defn select
+  "The best of several validated records, or nil."
+  [records]
+  (reduce (fn [best r] (if (or (nil? best) (better? r best)) r best)) nil records))
+
+;; ── routing ───────────────────────────────────────────────────────────────
+
+(defn name->multihash
+  "The binary multihash inside a `k51…` name — the CIDv1 with its
+  version/codec prefix removed. This, not the text name, is what the routing
+  key is built from."
+  [name]
+  (when-not (str/starts-with? name "k")
+    (throw (ex-info "expected a base36 'k'-prefixed IPNS name" {:name name})))
+  (let [cid (core/base36-decode (subs name 1))]
+    (when-not (and (>= (count cid) 2) (= 0x01 (first cid)) (= 0x72 (second cid)))
+      (throw (ex-info "expected CIDv1 libp2p-key (0x01 0x72)" {:name name})))
+    (vec (drop 2 cid))))
+
+(defn routing-key
+  "The DHT routing key for a name: the ASCII bytes `/ipns/` followed by the
+  **binary multihash** of the public key.
+
+  Not the text name, and not the CID: a peer that builds the key from
+  `\"/ipns/k51…\"` computes a different key from every correct implementation
+  and its records land somewhere nobody looks. This is the single most
+  load-bearing byte-level detail in publishing to the DHT, and it fails
+  silently — the record is stored, just at the wrong address."
+  [name]
+  (into (vec (pb/utf8-bytes "/ipns/")) (name->multihash name)))
+
+(defn routing-key-string
+  "The same key as the string form used by HTTP delegated routing, where the
+  name is spelled as its CID text rather than as raw multihash octets."
+  [name]
+  (str "/ipns/" name))

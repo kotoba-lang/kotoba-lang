@@ -1,0 +1,1469 @@
+(ns hanmen.pdf
+  "A PDF page's content stream, walked, into `hanmen.page` marks.
+
+  ## Why this is not in `org-iso-pdf`
+
+  `org-iso-pdf` is the COS object model: objects, xref, the page tree, stream
+  filters. A content stream is not part of that model — it is a *program* in a
+  small stack language, and running it needs a graphics state, a text state
+  and a matrix stack that the object model has no reason to own. Keeping the
+  interpreter out of the spec repo is the same boundary `pdf.core` already
+  draws when it hands back opaque `DCTDecode` bytes rather than decoding them.
+
+  What `org-iso-pdf` does offer and this uses: `parse`, `pages`,
+  `page-content-str` and `resolve-ref`. Nothing here re-reads the file.
+
+  ## What placement actually requires
+
+  `pdf.core/extract-text` collects the strings between `BT` and `ET`. That is
+  the right answer for search and no answer at all for a viewer: it has no
+  `Tm`, so every run in the document is at the same place, which is nowhere.
+
+  Placing a run means carrying two matrices — the CTM, which `q`/`Q`/`cm`
+  move, and the text matrix, which `Tm`/`Td`/`T*` move and which every glyph
+  advances. The run's origin is `Trm` applied to the origin, and `Trm` is
+  `[Tfs·Th 0 0 Tfs 0 Trise] × Tm × CTM`. There is no shortcut: a producer that
+  emits one `Tm` and then a hundred `TJ`s — which is most of them — puts every
+  line after the first in the wrong place if the advance is not accumulated.
+
+  ## Advance width is the honest part
+
+  Where a run *starts* is exact: it comes out of the matrices. How wide it is
+  depends on the font's glyph widths, and a document only sometimes ships
+  them. When `/Widths` is there this computes the run's width in text space
+  and `hanmen.page/text-item` carries it, so a drawer can make its own font
+  occupy exactly that much. When it is not — a composite font, a standard-14
+  font with no `/Widths` — the width is **absent rather than estimated**, and
+  the drawer starts the run correctly and ends it wherever its font lands.
+
+  An estimate would be indistinguishable from a measurement in the output and
+  wrong by a different amount on every document. Absence is a fact a consumer
+  can act on.
+
+  ## CJK is decoded through `/ToUnicode` or not claimed
+
+  A composite (`/Type0`) font's codes are not characters — with `Identity-H`
+  they are glyph ids, and mapping them needs the font's `/ToUnicode` CMap.
+  This reads `beginbfchar` / `beginbfrange` and uses it.
+
+  A run neither route can read becomes a `:frame` marked
+  `:font/no-tounicode` rather than a run of mojibake: text nobody can read
+  is worse than a marked region, because it goes into search results and
+  into anything that quotes the page.
+
+  ## What is actually missing when that happens, measured
+
+  The obvious fallback is the embedded font's own `cmap`, read backwards —
+  `opentype.cmap` exists for exactly that. It is **not wired in here, and
+  the measurement is why**. Across 160 real documents and 576 `/Type0`
+  fonts: 549 ship `/ToUnicode` and are already read; 25 do not and are
+  `CIDFontType0C`; 2 have no embedded font at all; and **zero** are the SFNT
+  case the `cmap` route would have helped.
+
+  `CIDFontType0C` is bare CFF and has no `cmap` table to read. Decoding one
+  needs its charset (CID per glyph) and then a registry CMap resource —
+  Adobe-Japan1-UCS2 and its siblings — neither of which exists in this
+  workspace. So the frame names both the ordering and the font kind, and the
+  next person does not repeat the dead end this docstring records."
+  (:require [clojure.string :as str]
+            [hanmen.page :as page]
+            [pdf.core :as pdf]))
+
+;; ── matrices ─────────────────────────────────────────────────────────────────
+;; [a b c d e f], the PDF form: (x,y) -> (a·x + c·y + e, b·x + d·y + f).
+
+(def identity-matrix [1.0 0.0 0.0 1.0 0.0 0.0])
+
+(defn mul
+  "`m1` then `m2`."
+  [[a1 b1 c1 d1 e1 f1] [a2 b2 c2 d2 e2 f2]]
+  [(+ (* a1 a2) (* b1 c2))
+   (+ (* a1 b2) (* b1 d2))
+   (+ (* c1 a2) (* d1 c2))
+   (+ (* c1 b2) (* d1 d2))
+   (+ (* e1 a2) (* f1 c2) e2)
+   (+ (* e1 b2) (* f1 d2) f2)])
+
+(defn apply-point [[a b c d e f] [x y]]
+  [(+ (* a x) (* c y) e) (+ (* b x) (* d y) f)])
+
+(defn- translation [tx ty] [1.0 0.0 0.0 1.0 (double tx) (double ty)])
+
+(defn- y-scale
+  "How much this matrix stretches a unit step in y.
+
+  The font size a drawer needs is not `Tf`'s operand: a `cm` of `[0.5 0 0 0.5
+  0 0]` halves 12pt text to 6pt on the page, and a viewer that drew 12 would
+  be twice as big as the document on every scaled form ever produced."
+  [[_ b _ d _ _]]
+  (Math/sqrt (+ (* (double b) (double b)) (* (double d) (double d)))))
+
+;; ── tokenizer ────────────────────────────────────────────────────────────────
+
+(defn- ws? [c] (contains? #{\space \tab \newline \return \formfeed (char 0)} c))
+(defn- delim? [c] (contains? #{\( \) \< \> \[ \] \{ \} \/ \%} c))
+
+(defn- num-token? [^String s]
+  (boolean (re-matches #"[-+]?(\d+\.?\d*|\.\d+)" s)))
+
+(defn- read-literal-string
+  "A `(…)` string, from the index just after the open paren. Returns
+  `[chars next-index]`.
+
+  Parens nest and may be escaped, which is the whole reason this cannot be a
+  scan to the next `)`. Octal escapes are three digits at most and stop early
+  on a non-digit."
+  [^String s start]
+  (let [n (count s)]
+    (loop [i start depth 1 out (transient [])]
+      (if (>= i n)
+        [(persistent! out) i]
+        (let [c (.charAt s i)]
+          (cond
+            (= c \\)
+            (let [d (when (< (inc i) n) (.charAt s (inc i)))]
+              (case d
+                \n (recur (+ i 2) depth (conj! out \newline))
+                \r (recur (+ i 2) depth (conj! out \return))
+                \t (recur (+ i 2) depth (conj! out \tab))
+                \b (recur (+ i 2) depth (conj! out \backspace))
+                \f (recur (+ i 2) depth (conj! out \formfeed))
+                \newline (recur (+ i 2) depth out)
+                (if (and d (<= (int \0) (int d) (int \7)))
+                  (let [end (min n (+ i 4))
+                        octal (loop [j (inc i)]
+                                (if (and (< j end)
+                                         (<= (int \0) (int (.charAt s j)) (int \7)))
+                                  (recur (inc j))
+                                  j))]
+                    (recur octal depth
+                           (conj! out (char (mod 
+                                                 256)))))
+                  (recur (+ i 2) depth (if d (conj! out d) out)))))
+
+            (= c \() (recur (inc i) (inc depth) (conj! out c))
+            (= c \)) (if (= depth 1)
+                       [(persistent! out) (inc i)]
+                       (recur (inc i) (dec depth) (conj! out c)))
+            :else (recur (inc i) depth (conj! out c))))))))
+
+(defn- read-hex-string [^String s start]
+  (let [n (count s)
+        end (or (str/index-of s ">" start) n)
+        hex (str/replace (subs s start end) #"[^0-9A-Fa-f]" "")
+        hex (if (odd? (count hex)) (str hex "0") hex)]
+    [(mapv (fn [pair] (char ))
+           (map #(apply str %) (partition 2 hex)))
+     (inc end)]))
+
+(defn tokenize
+  "A content stream into `[:num n]` / `[:str chars]` / `[:name k]` /
+  `[:op \"Tj\"]` and the array/dict delimiters.
+
+  Inline images (`BI … ID … EI`) are skipped whole: their binary payload is
+  not tokens, and a tokenizer that tried would produce operators out of pixel
+  data. What is lost is one `:frame`, which is a smaller lie than a stream of
+  invented operators."
+  [^String s]
+  (let [n (count s)]
+    (loop [i 0 out (transient [])]
+      (if (>= i n)
+        (persistent! out)
+        (let [c (.charAt s i)]
+          (cond
+            (ws? c) (recur (inc i) out)
+
+            (= c \%) (recur (let [e (str/index-of s "\n" i)] (if e (inc e) n)) out)
+
+            (= c \()
+            (let [[chars next-i] (read-literal-string s (inc i))]
+              (recur next-i (conj! out [:str chars])))
+
+            (and (= c \<) (not= (when (< (inc i) n) (.charAt s (inc i))) \<))
+            (let [[chars next-i] (read-hex-string s (inc i))]
+              (recur next-i (conj! out [:str chars])))
+
+            (and (= c \<) (= (when (< (inc i) n) (.charAt s (inc i))) \<))
+            (recur (+ i 2) (conj! out [:dict-open]))
+
+            (and (= c \>) (= (when (< (inc i) n) (.charAt s (inc i))) \>))
+            (recur (+ i 2) (conj! out [:dict-close]))
+
+            (= c \[) (recur (inc i) (conj! out [:array-open]))
+            (= c \]) (recur (inc i) (conj! out [:array-close]))
+
+            (= c \/)
+            (let [end (loop [j (inc i)]
+                        (if (and (< j n) (not (ws? (.charAt s j))) (not (delim? (.charAt s j))))
+                          (recur (inc j)) j))]
+              (recur end (conj! out [:name (subs s (inc i) end)])))
+
+            :else
+            (let [end (loop [j i]
+                        (if (and (< j n) (not (ws? (.charAt s j))) (not (delim? (.charAt s j))))
+                          (recur (inc j)) j))
+                  word (subs s i (max end (inc i)))]
+              (cond
+                (num-token? word)
+                (recur end (conj! out [:num (double )]))
+
+                ;; An inline image's payload starts after `ID` and one space.
+                (= word "BI")
+                (let [ei (loop [j (or (str/index-of s "ID" i) n)]
+                           (let [k (str/index-of s "EI" j)]
+                             (cond (nil? k) n
+                                   ;; `EI` inside the payload is only a
+                                   ;; terminator when it is delimited.
+                                   (and (or (zero? k) (ws? (.charAt s (dec k))))
+                                        (or (>= (+ k 2) n) (ws? (.charAt s (+ k 2)))))
+                                   (+ k 2)
+                                   :else (recur (+ k 2)))))]
+                  (recur ei (conj! out [:op "BI-skipped"])))
+
+                :else (recur (max end (inc i)) (conj! out [:op word]))))))))))
+
+;; ── fonts ────────────────────────────────────────────────────────────────────
+
+(defn parse-tounicode
+  "`beginbfchar` / `beginbfrange` out of a `/ToUnicode` CMap, as code → string.
+
+  Only the two forms real producers emit. A `bfrange` whose destination is an
+  array is expanded elementwise; one whose destination is a single value is
+  incremented, which is what the spec says and what breaks if you assume the
+  array form is the only one."
+  [^String cmap]
+  (let [hex->long (fn [h] )
+        hex->str (fn [h] (apply str (map (fn [p] (char (hex->long (apply str p))))
+                                         (partition 4 4 nil h))))
+        chars (reduce
+               (fn [acc block]
+                 (reduce (fn [acc [_ src dst]]
+                           (assoc acc (hex->long src) (hex->str dst)))
+                         acc
+                         (re-seq #"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>" block)))
+               {}
+               (map second (re-seq #"(?s)beginbfchar(.*?)endbfchar" cmap)))]
+    (reduce
+     (fn [acc block]
+       (reduce
+        (fn [acc entry]
+          (let [[_ lo hi arr single] entry
+                lo (hex->long lo) hi (hex->long hi)]
+            (cond
+              (seq arr)
+              (reduce (fn [a [i [_ v]]] (assoc a (+ lo i) (hex->str v)))
+                      acc
+                      (map-indexed vector (re-seq #"<([0-9A-Fa-f]+)>" arr)))
+
+              (seq single)
+              (let [base (hex->long single)]
+                (reduce (fn [a i] (assoc a (+ lo i) (str (char (+ base i)))))
+                        acc
+                        (range 0 (inc (max 0 (- hi lo))))))
+
+              :else acc)))
+        acc
+        (re-seq #"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(?:\[([^\]]*)\]|<([0-9A-Fa-f]+)>)"
+                block)))
+     chars
+     (map second (re-seq #"(?s)beginbfrange(.*?)endbfrange" cmap)))))
+
+(defn- composite-widths
+  "A `/Type0` font's glyph widths, from its descendant's `/W` and `/DW`.
+
+  Composite fonts do not use `/Widths` — that is the simple-font key, and
+  looking only there leaves every CJK and every subset-CFF font with no
+  measured advance at all. The effect is not subtle: the pen then moves by
+  `default-width` per glyph, so consecutive glyphs of one word land far
+  apart, `coalesce` sees them as separate runs, and a page comes out one
+  letter at a time. Measured on a real cover page, where it looked like a
+  gap problem and was an advance problem.
+
+  `/W` is `[c [w …] | cfirst clast w]`, mixed in one array. `/DW` is the
+  default for anything the array does not mention, and 1000 when absent —
+  which is the spec's default and also why a missing `/DW` is not a reason
+  to fall back to this library's own."
+  [objs font-dict]
+  (let [desc (pdf/resolve-ref objs (first (pdf/resolve-ref
+                                           objs (:DescendantFonts font-dict))))
+        w (mapv #(pdf/resolve-ref objs %) (pdf/resolve-ref objs (:W desc)))
+        dw (double (or (pdf/resolve-ref objs (:DW desc)) 1000))]
+    (when (or (seq w) (:DW desc))
+      (with-meta
+        (loop [i 0 acc {}]
+          (cond
+            (>= i (count w)) acc
+            ;; `c [w …]` — consecutive codes from c.
+            (vector? (nth w (inc i) nil))
+            (recur (+ i 2)
+                   (into acc (map-indexed
+                              (fn [k width]
+                                [(+ (long (nth w i)) k)
+                                 (double (pdf/resolve-ref objs width))])
+                              (nth w (inc i)))))
+            ;; `cfirst clast w` — one width for the whole range.
+            (and (number? (nth w (inc i) nil)) (number? (nth w (+ i 2) nil)))
+            (let [lo (long (nth w i)) hi (long (nth w (inc i)))
+                  width (double (nth w (+ i 2)))]
+              (recur (+ i 3)
+                     (if (> (- hi lo) 0xFFFF)
+                       acc
+                       (into acc (map (fn [c] [c width])) (range lo (inc hi))))))
+            :else (recur (inc i) acc)))
+        {:default dw}))))
+
+(defn font-table
+  "The page's `/Resources /Font`, as name → what a run needs to know.
+
+  `cid->unicode` is the caller's resolver: `(fn [ordering] {cid \"str\"})` or
+  nil. It is INJECTED rather than looked up because a registry table is a
+  megabyte of resource on somebody's classpath, and this library reads no
+  files and has no classpath of its own. `kotoba-lang/com-adobe-cmap` is the
+  one that has them; a host wires it in the same way it wires `:image-href`.
+
+  `:widths` is code → glyph-space width; absent when the font did not ship
+  one. `:composite?` and `:to-unicode` decide whether a `/Type0` run can be
+  read at all."
+  ([objs page-dict] (font-table objs page-dict nil))
+  ([objs page-dict cid->unicode] (font-table objs page-dict cid->unicode nil))
+  ([objs page-dict cid->unicode encoding->cmap]
+   (let [res (pdf/resolve-ref objs (:Resources page-dict))
+        fonts (pdf/resolve-ref objs (:Font res))]
+    (when (map? fonts)
+      (into {}
+            (keep (fn [[k v]]
+                    (let [fd (pdf/resolve-ref objs v)]
+                      (when (map? fd)
+                        (let [subtype (:Subtype fd)
+                              ordering (when (= subtype :Type0)
+                                         (let [desc (pdf/resolve-ref
+                                                     objs (first (pdf/resolve-ref
+                                                                  objs (:DescendantFonts fd))))
+                                               csi (pdf/resolve-ref objs (:CIDSystemInfo desc))]
+                                           (when (map? csi)
+                                             (let [reg (pdf/resolve-ref objs (:Registry csi))
+                                                   ord (pdf/resolve-ref objs (:Ordering csi))]
+                                               (when (and reg ord)
+                                                 (str (apply str (map char reg)) "-"
+                                                      (apply str (map char ord))))))))
+                              first-char (pdf/resolve-ref objs (:FirstChar fd))
+                              widths (pdf/resolve-ref objs (:Widths fd))
+                              tu (pdf/resolve-ref objs (:ToUnicode fd))
+                              tu-map (when (and (map? tu) (:pdf.core/stream tu))
+                                       (parse-tounicode
+                                        (apply str (map char (pdf/decode-stream objs tu)))))]
+                          [(name k)
+                           {:base-font (some-> (:BaseFont fd) name)
+                            :composite? (= subtype :Type0)
+                            ;; Named so a refusal can say WHICH CMap resource
+                            ;; would decode it. "Adobe-Japan1" is a fact the
+                            ;; reader can act on; "cannot decode" is not.
+                            ;; `:embedded` says which kind of font file is
+                            ;; there, because that decides WHICH decoder is
+                            ;; missing — see the ns docstring.
+                            :ordering ordering
+                            ;; `/ToUnicode` first: it is what the producer
+                            ;; SAID the codes mean. The registry table is
+                            ;; what the COLLECTION says, which is right for
+                            ;; every font that uses the collection properly
+                            ;; and wrong for one that subsets it privately —
+                            ;; so it is the fallback and never the override.
+                            ;; A predefined encoding's codes are not CIDs
+                            ;; and are not all the same width — `90ms-RKSJ-H`
+                            ;; is Shift-JIS, one byte or two, declared in the
+                            ;; CMap itself. The resolver returns BOTH halves,
+                            ;; `{:split fn :text map}`, because the widths
+                            ;; are data in a file this library does not read:
+                            ;; taking only the table and splitting here would
+                            ;; be this namespace guessing at Shift-JIS.
+                            :encoding-cmap (when (and encoding->cmap
+                                                      (keyword? (:Encoding fd))
+                                                      (not (contains? #{:Identity-H :Identity-V}
+                                                                      (:Encoding fd))))
+                                             (encoding->cmap (name (:Encoding fd))))
+                            :to-unicode (or tu-map
+                                            (when (and cid->unicode ordering)
+                                              (cid->unicode ordering)))
+                            :to-unicode-source (cond tu-map :tounicode
+                                                     (and cid->unicode ordering) :registry)
+                            :embedded (when (= subtype :Type0)
+                                        (let [d (pdf/resolve-ref
+                                                 objs (first (pdf/resolve-ref
+                                                              objs (:DescendantFonts fd))))
+                                              desc (pdf/resolve-ref objs (:FontDescriptor d))]
+                                          (cond
+                                            (:FontFile2 desc) :sfnt
+                                            (:FontFile3 desc)
+                                            (or (:Subtype (:dict (pdf/resolve-ref
+                                                                  objs (:FontFile3 desc))))
+                                                :fontfile3)
+                                            :else :none)))
+                            :widths (or
+                                     ;; Composite first: a `/Type0` font has
+                                     ;; no `/Widths`, and the simple-font
+                                     ;; branch would silently find nothing.
+                                     (when (= subtype :Type0)
+                                       (composite-widths objs fd))
+                                     (when (and (number? first-char) (vector? widths))
+                                      (into {}
+                                            (keep-indexed
+                                             (fn [i w]
+                                               (let [w (pdf/resolve-ref objs w)]
+                                                 (when (number? w)
+                                                   [(+ (long first-char) i) (double w)]))))
+                                            widths)))}]))))
+                  fonts))))))
+
+(def ^:private default-width
+  "What a code is worth when the font did not say.
+
+  500/1000 em is the width of a digit in most of the standard 14, and it is
+  used **only to advance the pen** — never to report `:item/width`, which
+  stays absent so that nothing downstream mistakes this number for a
+  measurement."
+  500.0)
+
+(defn- codes-of
+  "A string operand's bytes as codes: one byte per code for a simple font,
+  two for a composite one.
+
+  Composite fonts are two-byte here because `Identity-H` is what essentially
+  every producer uses for CJK; a font with a different CMap will come out
+  wrong, and it comes out as `:frame` rather than as text because the
+  `/ToUnicode` lookup misses."
+  ([chars composite?] (codes-of chars composite? nil))
+  ([chars composite? split]
+   (cond
+     ;; The encoding says how wide its codes are, so this does not have to
+     ;; assume. Assuming two splits every ASCII character in a Shift-JIS
+     ;; string in half.
+     split (split (mapv int chars))
+     composite? (mapv (fn [[hi lo]] (+ (* 256 (int hi)) (int (or lo (char 0)))))
+                      (partition 2 2 nil chars))
+     :else (mapv int chars))))
+
+;; ── the walk ─────────────────────────────────────────────────────────────────
+
+(def ^:private initial-text-state
+  {:font nil :size 0.0 :char-spacing 0.0 :word-spacing 0.0
+   :horizontal 1.0 :leading 0.0 :rise 0.0 :render-mode 0})
+
+(defn- resources-of [objs dict]
+  (pdf/resolve-ref objs (:Resources dict)))
+
+(defn- ink-of
+  "Ink from a grey, scaled by a constant alpha.
+
+  Exact for one layer on paper — 50% of black ink is grey — and an
+  approximation the moment marks overlap. `apply-ext-gstate` says why that
+  trade is taken."
+  ([grey] (ink-of grey nil))
+  ([grey alpha]
+   (when (number? grey)
+     (* (- 1.0 grey) (double (or alpha 1.0))))))
+
+(defn- run-of
+  "One string operand, placed, as either a text item or a frame."
+  [{:keys [text-state ctm tm fonts] grey :gray alpha :fill-alpha} chars]
+  (let [{:keys [font size char-spacing word-spacing horizontal rise render-mode]} text-state
+        fd (get fonts font)
+        composite? (boolean (:composite? fd))
+        enc (:encoding-cmap fd)
+        codes (codes-of chars (or composite? (some? enc)) (:split enc))
+        widths (:widths fd)
+        tu (:to-unicode fd)
+        enc-text (:text enc)
+        text (cond
+               ;; The encoding's own table: code straight to characters,
+               ;; no CID in between.
+               enc-text (apply str (keep #(get enc-text %) codes))
+               composite? (apply str (keep #(get tu %) codes))
+               :else (apply str (map char codes)))
+        ;; Advance in *text space*, before Tm/CTM. Word spacing applies to
+        ;; single-byte code 32 only — applying it to a composite font's
+        ;; two-byte code that happens to contain 32 is a classic drift.
+        advance (reduce (fn [acc code]
+                          (+ acc
+                             (* (+ (* (/ (double (get widths code default-width)) 1000.0) size)
+                                   char-spacing
+                                   (if (and (not composite?) (= code 32)) word-spacing 0.0))
+                                horizontal)))
+                        0.0 codes)
+        trm (mul (mul [(* size horizontal) 0.0 0.0 size 0.0 rise] tm) ctm)
+        [x y] (apply-point trm [0.0 0.0])
+        drawn-size (* size (y-scale (mul tm ctm)))]
+    {:advance advance
+     :item (cond
+             ;; Mode 3 is "invisible", which is what a scanner writes under
+             ;; the page image so the text is selectable. It IS the text
+             ;; layer of a scanned page, so it is kept — dropping it would
+             ;; make exactly the documents that most need search unsearchable.
+             (and (or composite? (some? enc)) (empty? text) (seq codes))
+             (page/frame-item {:x x :y (- y drawn-size)
+                               :width (* advance (y-scale (mul tm ctm)))
+                               :height drawn-size
+                               :label (str (or (:base-font fd) "text")
+                                           (when (or (:ordering fd) (:embedded fd))
+                                             (str " ("
+                                                  (str/join ", "
+                                                            (remove nil?
+                                                                    [(:ordering fd)
+                                                                     (some-> (:embedded fd) name)]))
+                                                  ")")))
+                               :reason :font/no-tounicode})
+
+             (str/blank? text) nil
+
+             :else
+             (-> (page/text-item
+                  {:x x :y y :size drawn-size :text text
+                   :font (:base-font fd)
+                   ;; Through `tm × ctm`, not `ctm` alone. The advance is in
+               ;; TEXT space and the text matrix is what scales it — a
+               ;; producer that sets `Tf 1` and sizes with `Tm`, which is
+               ;; extremely common, otherwise gets a width a full font size
+               ;; too small. Measured: 0.61 where the glyph advanced 14.90,
+               ;; so every run looked separated from the next and a page
+               ;; came out one letter at a time.
+               ;;
+               ;; `drawn-size` already went through both. Two numbers from
+               ;; the same run disagreeing about which matrices apply is the
+               ;; shape of this bug, and the reason they are computed next
+               ;; to each other now.
+               :width (when widths (* advance (y-scale (mul tm ctm))))
+                   ;; Nil when no colour operator has run, which per the
+                   ;; spec means black — `hanmen.svg` reads an absent ink
+                   ;; as full.
+                   :ink (ink-of grey alpha)
+                   :direction (when (= render-mode 3) :invisible)})
+                 ;; Where the pen ends up, in reader space. Not part of the
+                 ;; model — `coalesce` strips both of these — but the exact
+                 ;; number the next run has to start at to be the same word.
+                 ;; Carrying it beats re-deriving it downstream from a width
+                 ;; that is often absent on purpose.
+                 ;; The same `tm × ctm` the width goes through. These two
+                 ;; are the same number by different names, and having them
+                 ;; disagree is what made a corrected width change nothing —
+                 ;; the join reads THIS one.
+                 (assoc ::end-x (page/round (+ x (* advance (y-scale (mul tm ctm)))))
+                        ::size-hint (page/round drawn-size))))}))
+
+(defn- flip
+  "Reader space out of PDF user space, with the page's rotation applied.
+
+  `[llx lly urx ury]` is the media box, which is not always at the origin —
+  a cropped page can have a negative `lly`, and treating the box as
+  `[0 0 w h]` shifts every mark on such a page by the offset. Measured on a
+  real cropped file, where the whole page rendered off the top edge."
+  [[llx lly urx ury] rotation]
+  (let [w (- urx llx) h (- ury lly)
+        to-origin (translation (- llx) (- lly))]
+    ;; `/Rotate` is CLOCKWISE, and the y-flip is folded into the same matrix
+    ;; rather than composed after it. Each of these therefore has determinant
+    ;; −1 — a flip composed with a rotation is orientation-reversing, and a
+    ;; matrix here with determinant +1 is a mirrored page. The first draft of
+    ;; the 90° case turned the page anticlockwise and read as plausible in
+    ;; every way except the one the test measured.
+    (case (mod (or rotation 0) 360)
+      90 {:matrix (mul to-origin [0.0 1.0 1.0 0.0 0.0 0.0]) :width h :height w}
+      180 {:matrix (mul to-origin [-1.0 0.0 0.0 1.0 w 0.0]) :width w :height h}
+      270 {:matrix (mul to-origin [0.0 -1.0 -1.0 0.0 h w]) :width h :height w}
+      {:matrix (mul to-origin [1.0 0.0 0.0 -1.0 0.0 h]) :width w :height h})))
+
+(defn- media-box [objs page-dict]
+  (let [b (mapv #(pdf/resolve-ref objs %) (pdf/resolve-ref objs (:MediaBox page-dict)))]
+    (if (and (= 4 (count b)) (every? number? b))
+      (mapv double b)
+      [0.0 0.0 612.0 792.0])))
+
+(defn- fill-grey
+  "The grey a colour operator's operands come to, or `previous` if they are
+  not a colour this understands.
+
+  Chosen by ARITY, because that is what actually distinguishes them: `g`
+  takes one component, `rg` three, `k` four, and `sc`/`scn` take however many
+  the current colour space has — so a single rule covers the named operators
+  and the space-dependent ones together. `scn` with a pattern name has no
+  numeric operands at all and falls through to `previous`, which is the
+  honest answer: a pattern's average colour is not something this can know.
+
+  CMYK converts through its naive RGB, which is what viewers do for
+  screen-only rendering and what nobody should print from."
+  [nums previous]
+  (case (count nums)
+    1 (double (first nums))
+    3 (let [[r g b] nums] (+ (* 0.299 r) (* 0.587 g) (* 0.114 b)))
+    4 (let [[c m y k] nums
+            [r g b] [(* (- 1.0 c) (- 1.0 k))
+                     (* (- 1.0 m) (- 1.0 k))
+                     (* (- 1.0 y) (- 1.0 k))]]
+        (+ (* 0.299 r) (* 0.587 g) (* 0.114 b)))
+    previous))
+
+
+;; ── paths ────────────────────────────────────────────────────────────────────
+
+(defn- device
+  "A path point, through the CTM, in reader space."
+  [state x y]
+  (mapv #(page/round % 3) (apply-point (:ctm state) [(double x) (double y)])))
+
+(defn- pt
+  "A path point as the two numbers path data wants."
+  [[x y]]
+  (str (page/num->str x) " " (page/num->str y)))
+
+(defn- seg [state s] (update state :path (fnil conj []) s))
+
+(defn- extend-bounds
+  "The running bounding box of the path being built.
+
+  Over the CONTROL points of a curve, not its true extent. A cubic stays
+  inside the hull of its control points, so this can be larger than the ink
+  and never smaller — and being larger only means a mark near the edge is
+  kept when it could have been dropped, which is the safe direction for
+  something whose whole job is deciding what to throw away."
+  [state [x y]]
+  (update state :bounds
+          (fn [[x0 y0 x1 y1]]
+            (if x0
+              [(min x0 x) (min y0 y) (max x1 x) (max y1 y)]
+              [x y x y]))))
+
+(defn- move-to [state x y]
+  (let [[px py] (device state x y)]
+    (-> state (seg (str "M" (pt [px py]))) (extend-bounds [px py])
+        (assoc :point [px py] :subpath-start [px py]))))
+
+(defn- line-to [state x y]
+  (let [[px py] (device state x y)]
+    (-> state (seg (str "L" (pt [px py]))) (extend-bounds [px py])
+        (assoc :point [px py]))))
+
+(defn- curve-to-abs [state [c1x c1y] [c2x c2y] [ex ey]]
+  (-> state
+      (seg (str "C" (pt [c1x c1y]) " " (pt [c2x c2y]) " " (pt [ex ey])))
+      (extend-bounds [c1x c1y]) (extend-bounds [c2x c2y]) (extend-bounds [ex ey])
+      (assoc :point [ex ey])))
+
+(defn- curve-to [state nums]
+  (if (= 6 (count nums))
+    (let [[x1 y1 x2 y2 x3 y3] nums]
+      (curve-to-abs state (device state x1 y1) (device state x2 y2)
+                    (device state x3 y3)))
+    state))
+
+(defn- close-path [state]
+  (-> state (seg "Z") (assoc :point (:subpath-start state))))
+
+(defn- rect-path
+  "`re`, remembered both ways.
+
+  As path segments, so a rectangle can be part of a larger path — and as a
+  rectangle, so `re … f` on its own still becomes a `:rule`. A document that
+  draws one box per table cell is the common case, and a box is worth more
+  to a consumer than a closed four-segment path."
+  [state x y w h]
+  (let [[x0 y0] (device state x y)
+        [x1 y1] (device state (+ x w) (+ y h))]
+    (-> state
+        (seg (str "M" (pt [x0 y0]) " L" (pt [x1 y0]) " L" (pt [x1 y1])
+                  " L" (pt [x0 y1]) " Z"))
+        (extend-bounds [x0 y0]) (extend-bounds [x1 y1])
+        (assoc :point [x0 y0] :subpath-start [x0 y0])
+        (update :rects (fnil conj []) [(min x0 x1) (min y0 y1)
+                                       (Math/abs (- x1 x0)) (Math/abs (- y1 y0))]))))
+
+(defn- intersect-box
+  "Two boxes, or the one that exists.
+
+  Nil is `everything`, not `nothing` — a page with no clip must not lose
+  every mark, and that is the direction this gets dangerously wrong."
+  [a b]
+  (cond
+    (nil? a) b
+    (nil? b) a
+    :else (let [[ax0 ay0 ax1 ay1] a [bx0 by0 bx1 by1] b]
+            [(max ax0 bx0) (max ay0 by0) (min ax1 bx1) (min ay1 by1)])))
+
+(defn- outside-box?
+  "Wholly outside — the same test the page boundary uses, and for the same
+  reason: a mark that straddles the edge is partly visible, and trimming it
+  needs geometry this does not do."
+  [[cx0 cy0 cx1 cy1] {:item/keys [x y width height]}]
+  (and (number? x)
+       (or (> x cx1) (> y cy1)
+           (and (number? width) (< (+ x width) cx0))
+           (and (number? height) (< (+ y height) cy0)))))
+
+(defn- remove-outside-clip
+  "Marks the clip cannot show.
+
+  A BOX and not the clip path itself, and the difference is worth naming: a
+  circular clip's box keeps the corners, so this shows a little more than
+  the document does. Showing slightly too much is a mark drawn where the
+  document drew nothing; showing too little is a mark MISSING, and a reader
+  cannot tell a missing mark from a document that never had one."
+  [clip items]
+  (if-not clip
+    items
+    (into [] (remove #(outside-box? clip %)) items)))
+
+(def ^:private fills #{"f" "F" "f*" "b" "b*" "B" "B*"})
+(def ^:private strokes #{"S" "s" "b" "b*" "B" "B*"})
+
+(defn- paint
+  "A painting operator: what the accumulated path becomes, and the state
+  with that path cleared.
+
+  A path made ONLY of rectangles becomes `:rule`s — one per rectangle, which
+  is what a table of boxes should be. Anything else becomes one `:path`,
+  because a curve's segments are not independently meaningful.
+
+  `n` paints nothing (it is there to end a clip), so it clears and emits
+  nothing. That is not a special case bolted on: every operator here clears,
+  and `n` is the one whose paint set is empty."
+  [state op]
+  (let [fill? (contains? fills op)
+        stroke? (contains? strokes op)
+        ;; The clip narrows on the way in and never widens: PDF intersects,
+        ;; so a `q`/`Q` pair is the only thing that puts it back. Tracked as
+        ;; a BOX rather than the path itself — see `clip-box`.
+        state (if (and (:pending-clip? state) (seq (:path state)))
+                (let [d (str/join " " (:path state))
+                      ;; Deduplicated on the path AND the clip it narrows: a
+                      ;; document that sets the same clip a hundred times —
+                      ;; which is what a table of clipped cells looks like —
+                      ;; should not produce a hundred identical definitions,
+                      ;; and the same path under two different parents is
+                      ;; two different regions.
+                      key* [d (:clip-id state)]
+                      reg (:clips state)
+                      known (get (:index @reg) key*)
+                      id (or known (count (:index @reg)))]
+                  (when (nil? known)
+                    (swap! reg #(-> %
+                                    (update :index assoc key* id)
+                                    (update :defs conj
+                                            (page/clip {:id id :d d
+                                                        :parent (:clip-id state)})))))
+                  (-> state
+                      (dissoc :pending-clip?)
+                      (assoc :clip (intersect-box (:clip state) (:bounds state))
+                             :clip-id id)))
+                (dissoc state :pending-clip?))
+        rects (:rects state)
+        segs (:path state)
+        only-rects? (and (seq rects)
+                         (= (count segs) (count rects)))
+        [bx0 by0 bx1 by1] (:bounds state)
+        clip (:clip state)
+        cleared (dissoc state :path :rects :point :subpath-start :bounds)]
+    {:state cleared
+     :items*
+     (mapv #(cond-> % (:clip-id state) (assoc :item/clip (:clip-id state)))
+      (remove-outside-clip
+       clip
+       (cond
+       (not (or fill? stroke?)) []
+
+       (and only-rects? fill?)
+       (mapv (fn [[x y w h]]
+               (page/rule-item (cond-> {:x x :y y :width w :height h
+                                        :ink (ink-of (:gray state)
+                                                     (:fill-alpha state))}
+                                 (:fill-pattern state)
+                                 (assoc :pattern (:fill-pattern state)))))
+             rects)
+
+       (and (seq segs) bx0)
+       [(page/path-item (cond-> {:d (str/join " " segs)
+                                 :x bx0 :y by0
+                                 :width (- bx1 bx0) :height (- by1 by0)
+                                 :fill (when fill? (ink-of (:gray state)
+                                                           (:fill-alpha state)))
+                                 :stroke (when stroke?
+                                           (or (ink-of (:stroke-gray state)
+                                                       (:stroke-alpha state))
+                                               (ink-of (:gray state)
+                                                       (:stroke-alpha state))))
+                                 :stroke-width (when stroke? (:line-width state))}
+                          (and fill? (:fill-pattern state))
+                          (assoc :pattern (:fill-pattern state))))]
+
+       :else [])))}))
+
+(defn- pattern-kind
+  "Which kind of pattern a name stands for, for marking a fill that uses it.
+
+  Tiling (type 1) is all the corpus has — 34 of them, and no shading
+  patterns at all. A tiling pattern is a content stream repeated over the
+  region, and running it would mean deciding how many times: a 2pt tile over
+  a page is thousands of copies. Marking the fill is the honest answer until
+  something needs more."
+  [objs state name]
+  (let [res (resources-of objs (:page-dict state))
+        pt (pdf/resolve-ref objs (get (pdf/resolve-ref objs (:Pattern res))
+                                      (keyword name)))
+        d (or (:dict pt) pt)]
+    (case (long (or (pdf/resolve-ref objs (:PatternType d)) 0))
+      1 :tiling
+      2 :shading
+      :unknown)))
+
+(defn- apply-ext-gstate
+  "`/ExtGState /<name>`, as far as this understands it.
+
+  `/ca` and `/CA` are constant alpha for fills and strokes. They multiply
+  into ink rather than becoming a separate channel, and that is exact for a
+  single layer on paper: 50% of black ink IS grey. It stops being exact once
+  things overlap, which is what a real compositor is for and what this is
+  not — said here so the approximation is a decision.
+
+  `/LW` is a line width in user space, like `w`. `/BM`, `/SMask` and the
+  rest are not read: measured at zero occurrences across the corpus, and a
+  soft mask nobody can test is a soft mask nobody should trust."
+  [objs state name]
+  (let [res (resources-of objs (:page-dict state))
+        gs (pdf/resolve-ref objs (get (pdf/resolve-ref objs (:ExtGState res))
+                                      (keyword name)))]
+    (if-not (map? gs)
+      state
+      (cond-> state
+        (number? (:ca gs)) (assoc :fill-alpha (double (:ca gs)))
+        (number? (:CA gs)) (assoc :stroke-alpha (double (:CA gs)))
+        (number? (:LW gs)) (assoc :line-width
+                                  (* (double (:LW gs)) (y-scale (:ctm state))))))))
+
+(defn- number-operands [stack]
+  (into [] (comp (filter #(= :num (first %))) (map second)) stack))
+
+(def max-form-depth
+  "How deep a form XObject may nest before this stops descending.
+
+  A form's `/Resources` can name the form itself, and a producer does not have
+  to be malicious to emit one — a template that includes itself by mistake is
+  an infinite content stream. `seen` below stops the direct cycle; this stops
+  the long one, and it stops it with a `:frame` so the page says where it gave
+  up rather than quietly missing a region."
+  12)
+
+(defn- image-media-type
+  "What the stored bytes ALREADY are, when they are something on their own.
+
+  A `DCTDecode` XObject is a JPEG file's compressed data — a host can serve it
+  as one without decoding anything, which is the cheapest possible way to put
+  a scanned page on screen. `FlateDecode` is raw samples and somebody has to
+  encode them; nil says so rather than guessing a type that would arrive at a
+  browser as a broken image."
+  [objs xo]
+  (let [f (pdf/resolve-ref objs (:Filter (:dict xo)))
+        fs (cond (nil? f) [] (keyword? f) [f] (vector? f) f :else [])]
+    (when (some #{:DCTDecode} fs) "image/jpeg")))
+
+(declare run-content)
+
+(defn- do-xobject
+  "`Do`. A form is RUN; an image is placed; anything else is framed.
+
+  Running the form is the whole point of this function existing. A form
+  XObject is a content stream with its own `/Matrix` and `/Resources` — a
+  figure, a stamp, a letterhead — and a viewer that outlines them instead
+  draws a page of empty boxes. Measured before it was written: one figure in
+  the sample produced 1,415 boxes where the drawing was."
+  [objs state name depth seen images]
+  (let [xo (pdf/resolve-ref objs (get (:xobjects state) (keyword name)))
+        [x0 y0] (apply-point (:ctm state) [0.0 0.0])
+        [x1 y1] (apply-point (:ctm state) [1.0 1.0])
+        box {:x (min x0 x1) :y (min y0 y1)
+             :width (Math/abs (- x1 x0)) :height (Math/abs (- y1 y0))}
+        ref (get (:xobjects state) (keyword name))]
+    (cond
+      (not (map? xo)) []
+
+      (= :Image (:Subtype (:dict xo)))
+      ;; The index is this image's position in `images`, which is the order
+      ;; `Do` reached it — forms included. A host resolving an index back to
+      ;; bytes MUST use `page-images`, which reads the same vector, rather
+      ;; than the page's `/XObject` dictionary: that is resource order, and
+      ;; the two agree only on documents that never invoke a form.
+      [(page/image-item (assoc box
+                               :index (dec (count (swap! images conj ref)))
+                               :media-type (image-media-type objs xo)))]
+
+      (and (= :Form (:Subtype (:dict xo)))
+           (< depth max-form-depth)
+           (not (contains? seen ref)))
+      (let [dict (:dict xo)
+            matrix (let [m (mapv #(pdf/resolve-ref objs %)
+                                 (pdf/resolve-ref objs (:Matrix dict)))]
+                     (if (and (= 6 (count m)) (every? number? m))
+                       (mapv double m)
+                       identity-matrix))
+            res (or (resources-of objs dict) {})
+            ;; The form's own resources, falling back to the page's. A form
+            ;; that names /F1 without declaring it means the page's /F1, and
+            ;; a reader that only looked in the form would silently place its
+            ;; text at size zero.
+            child (assoc state
+                         ;; The form's OWN resources for `gs` and `scn`, not
+                         ;; the page's. A form that names /G1 means its own
+                         ;; /G1, and looking up the page's is how a stamp
+                         ;; ends up drawn at the alpha of whatever the page
+                         ;; happened to call G1.
+                         :page-dict {:Resources (merge (or (resources-of objs (:page-dict state)) {})
+                                                       res)}
+                         :ctm (mul matrix (:ctm state))
+                         :fonts (merge (:fonts state)
+                                       (or (font-table objs {:Resources res}) {}))
+                         :xobjects (merge (:xobjects state)
+                                          (or (pdf/resolve-ref objs (:XObject res)) {}))
+                         :gs [] :tm identity-matrix :tlm identity-matrix
+                         :text-state initial-text-state)]
+        (run-content objs
+                     (apply str (map char (pdf/decode-stream objs xo)))
+                     child (inc depth) (conj seen ref) images))
+
+      (= :Form (:Subtype (:dict xo)))
+      [(page/frame-item (assoc box :label name :reason :form/too-deep))]
+
+      :else
+      [(page/frame-item (assoc box :label name :reason :xobject/not-run))])))
+
+(defn run-content
+  "One content stream into placed marks, in the state it is handed.
+
+  Called for a page and, recursively, for every form XObject it invokes. The
+  operand stack is reset after every operator, which is what a content
+  stream's grammar actually says and is why a malformed one degrades into
+  missing marks rather than into marks in the wrong place."
+  [objs content state depth seen images]
+  (loop [tokens (tokenize content)
+           stack []
+           state state
+           items (transient [])]
+      (if-let [[kind value] (first tokens)]
+        (let [rest-tokens (rest tokens)]
+          (if (not= kind :op)
+            (recur rest-tokens (conj stack [kind value]) state items)
+            (let [nums (number-operands stack)
+                  names (into [] (comp (filter #(= :name (first %))) (map second)) stack)
+                  strings (into [] (comp (filter #(= :str (first %))) (map second)) stack)
+                  ts (:text-state state)
+                  place (fn [state chars]
+                          (let [{:keys [advance item]} (run-of state chars)]
+                            [(update state :tm #(mul (translation advance 0.0) %))
+                             ;; Clipped like everything else. A heading
+                             ;; scrolled out of a clipped box is text the
+                             ;; document does not show, and showing it puts
+                             ;; a stray line across the page.
+                             (when (and item (not (and (:clip state)
+                                                        (outside-box? (:clip state) item))))
+                               (cond-> item
+                                 (:clip-id state) (assoc :item/clip (:clip-id state))))]))]
+              (case value
+                ;; The whole graphics state, not just the matrix. Colour,
+                ;; line width and the CLIP are all part of it — a `Q` that
+                ;; restored the matrix and left the clip would keep a
+                ;; narrowed clip for the rest of the page, and every mark
+                ;; after it would silently vanish.
+                "q" (recur rest-tokens []
+                           (update state :gs conj
+                                   (select-keys state [:ctm :gray :stroke-gray
+                                                       :line-width :clip
+                                                       :fill-alpha :stroke-alpha
+                                                       :fill-pattern :clip-id]))
+                           items)
+                "Q" (let [top (peek (:gs state))]
+                      (recur rest-tokens []
+                             (-> state
+                                 (update :gs pop)
+                                 ;; Dissoc first: `merge` cannot restore a
+                                 ;; key to ABSENT, so a clip set inside the
+                                 ;; q/Q pair would survive a restore that
+                                 ;; had none.
+                                 (dissoc :clip :line-width :clip-id
+                                         :fill-alpha :stroke-alpha :fill-pattern)
+                                 (merge (or top {})))
+                             items))
+                "cm" (recur rest-tokens []
+                            (cond-> state
+                              (= 6 (count nums)) (update :ctm #(mul (mapv double nums) %)))
+                            items)
+
+                "BT" (recur rest-tokens [] (assoc state :tm identity-matrix
+                                                  :tlm identity-matrix) items)
+                "ET" (recur rest-tokens [] state items)
+
+                "Tf" (recur rest-tokens []
+                            (assoc state :text-state
+                                   (assoc ts :font (last names)
+                                          :size (double (or (last nums) 0.0))))
+                            items)
+                "Tc" (recur rest-tokens [] (assoc-in state [:text-state :char-spacing]
+                                                     (double (or (last nums) 0.0))) items)
+                "Tw" (recur rest-tokens [] (assoc-in state [:text-state :word-spacing]
+                                                     (double (or (last nums) 0.0))) items)
+                "Tz" (recur rest-tokens [] (assoc-in state [:text-state :horizontal]
+                                                     (/ (double (or (last nums) 100.0)) 100.0)) items)
+                "TL" (recur rest-tokens [] (assoc-in state [:text-state :leading]
+                                                     (double (or (last nums) 0.0))) items)
+                "Ts" (recur rest-tokens [] (assoc-in state [:text-state :rise]
+                                                     (double (or (last nums) 0.0))) items)
+                "Tr" (recur rest-tokens [] (assoc-in state [:text-state :render-mode]
+                                                     (long (or (last nums) 0))) items)
+
+                "Td" (let [[tx ty] (take-last 2 nums)
+                           next-tlm (mul (translation (or tx 0.0) (or ty 0.0)) (:tlm state))]
+                       (recur rest-tokens [] (assoc state :tm next-tlm :tlm next-tlm) items))
+                "TD" (let [[tx ty] (take-last 2 nums)
+                           next-tlm (mul (translation (or tx 0.0) (or ty 0.0)) (:tlm state))]
+                       (recur rest-tokens []
+                              (-> state (assoc :tm next-tlm :tlm next-tlm)
+                                  (assoc-in [:text-state :leading] (- (double (or ty 0.0)))))
+                              items))
+                "Tm" (let [m (if (= 6 (count nums)) (mapv double nums) identity-matrix)]
+                       (recur rest-tokens [] (assoc state :tm m :tlm m) items))
+                "T*" (let [next-tlm (mul (translation 0.0 (- (:leading ts))) (:tlm state))]
+                       (recur rest-tokens [] (assoc state :tm next-tlm :tlm next-tlm) items))
+
+                ("Tj" "TJ" "'" "\"")
+                (let [;; `'` and `"` move to the next line first. `"` also
+                      ;; sets word and char spacing from its two numbers,
+                      ;; which a reader that ignored them would render with
+                      ;; the previous line's spacing.
+                      state (if (contains? #{"'" "\""} value)
+                              (let [next-tlm (mul (translation 0.0 (- (:leading ts))) (:tlm state))]
+                                (assoc state :tm next-tlm :tlm next-tlm))
+                              state)
+                      state (if (and (= value "\"") (= 2 (count nums)))
+                              (-> state
+                                  (assoc-in [:text-state :word-spacing] (double (first nums)))
+                                  (assoc-in [:text-state :char-spacing] (double (second nums))))
+                              state)]
+                  (if (= value "TJ")
+                    ;; The array interleaves strings with kerning numbers in
+                    ;; thousandths of text space, subtracted from the advance.
+                    (let [[state' items']
+                          (reduce (fn [[st acc] token]
+                                    (case (first token)
+                                      :str (let [[st' item] (place st (second token))]
+                                             [st' (if item (conj acc item) acc)])
+                                      :num (let [tsz (get-in st [:text-state :size])
+                                                 th (get-in st [:text-state :horizontal])
+                                                 tx (* (- (/ (double (second token)) 1000.0)) tsz th)]
+                                             [(update st :tm #(mul (translation tx 0.0) %)) acc])
+                                      [st acc]))
+                                  [state []]
+                                  stack)]
+                      (recur rest-tokens [] state'
+                             (reduce conj! items items')))
+                    (let [[state' item] (place state (or (last strings) []))]
+                      (recur rest-tokens [] state'
+                             (if item (conj! items item) items)))))
+
+                ;; ── path construction ────────────────────────────────
+                ;;
+                ;; Segments accumulate until a painting operator decides
+                ;; what to do with them. A rectangle is remembered as a
+                ;; rectangle as well, because `re … f` is most of what
+                ;; documents draw and a `:rule` is worth more downstream
+                ;; than a four-corner path.
+                "m" (let [[x y] (take-last 2 nums)]
+                      (recur rest-tokens [] (move-to state x y) items))
+                "l" (let [[x y] (take-last 2 nums)]
+                      (recur rest-tokens [] (line-to state x y) items))
+                "c" (recur rest-tokens [] (curve-to state (take-last 6 nums)) items)
+                ;; `v` and `y` are `c` with one control point implied — `v`
+                ;; repeats the current point and `y` repeats the endpoint.
+                ;; Treating either as a line is a curve drawn straight.
+                "v" (let [[x2 y2 x3 y3] (take-last 4 nums)
+                          [cx cy] (:point state)]
+                      (recur rest-tokens []
+                             (curve-to-abs state [cx cy] (device state x2 y2)
+                                           (device state x3 y3))
+                             items))
+                "y" (let [[x1 y1 x3 y3] (take-last 4 nums)
+                          end (device state x3 y3)]
+                      (recur rest-tokens []
+                             (curve-to-abs state (device state x1 y1) end end)
+                             items))
+                "h" (recur rest-tokens [] (close-path state) items)
+
+                "re" (if (= 4 (count (take-last 4 nums)))
+                       (let [[x y w h] (take-last 4 nums)]
+                         (recur rest-tokens [] (rect-path state x y w h) items))
+                       (recur rest-tokens [] state items))
+
+                ;; `W` marks the CURRENT path as the next clip. It does not
+                ;; take effect until the painting operator that follows,
+                ;; which is why it is a flag and not an assignment — `W n`
+                ;; is the idiom, and `n` is where the path is consumed.
+                ("W" "W*") (recur rest-tokens [] (assoc state :pending-clip? true) items)
+
+                ;; ── painting ─────────────────────────────────────────────
+                ("f" "F" "f*" "b" "b*" "B" "B*" "S" "s" "n")
+                (let [{:keys [state items*]} (paint state value)]
+                  (recur rest-tokens [] state (reduce conj! items items*)))
+
+                ;; Every operator that sets a fill colour, not only the two
+                ;; easy ones. `g` and `rg` were tracked and `k`/`sc`/`scn`
+                ;; were not, so a fill in CMYK or a named colour space
+                ;; recorded NO ink and drew at full strength — which is the
+                ;; PDF default and therefore not obviously a bug. Seen on a
+                ;; real poster: a pale panel behind a column came out as a
+                ;; solid block, in the one place looking at it was the only
+                ;; way to find out.
+                ;; Lower case sets the FILL colour and upper case the
+                ;; STROKE colour. Treating them as one is how a hairline
+                ;; table border ends up the colour of the cell behind it.
+                ("g" "rg" "k" "sc" "scn")
+                (recur rest-tokens []
+                       (-> state
+                           (assoc :gray (fill-grey nums (:gray state)))
+                           ;; `scn` with a NAME is a pattern, not a colour.
+                           ;; Leaving the previous colour — which is what
+                           ;; happened before — fills the shape in whatever
+                           ;; was last set, which is an arbitrary colour
+                           ;; presented as the document's. Marked instead.
+                           (as-> st (if (and (= value "scn") (seq names))
+                                      (assoc st :fill-pattern
+                                             (pattern-kind objs st (last names)))
+                                      (dissoc st :fill-pattern))))
+                       items)
+                ("G" "RG" "K" "SC" "SCN")
+                (recur rest-tokens []
+                       (assoc state :stroke-gray (fill-grey nums (:stroke-gray state)))
+                       items)
+                ;; `gs` — the graphics state a name stands for. Ignored
+                ;; entirely until now, and it is the most common operator in
+                ;; the corpus after the drawing ones: 1,100 calls across 86
+                ;; documents, 217 of them setting a stroke alpha below 1. A
+                ;; 30%-alpha hairline drawn at full ink is a black line
+                ;; where the document has a grey one.
+                "gs" (recur rest-tokens []
+                            (apply-ext-gstate objs state (last names))
+                            items)
+
+                "w" (recur rest-tokens []
+                           (assoc state :line-width
+                                  (* (double (or (last nums) 1.0)) (y-scale (:ctm state))))
+                           items)
+
+                "Do" (recur rest-tokens [] state
+                            (if-let [nm (last names)]
+                              (reduce conj! items
+                                      (mapv #(cond-> %
+                                               (:clip-id state)
+                                               (assoc :item/clip (:clip-id state)))
+                                            (remove-outside-clip
+                                             (:clip state)
+                                             (do-xobject objs state nm depth seen images))))
+                              items))
+
+                ;; Everything else — paths, clipping, colour spaces, marked
+                ;; content — advances no state this cares about. Not an
+                ;; error: a content stream is full of operators a viewer at
+                ;; this level has no opinion about.
+                (recur rest-tokens [] state items)))))
+        (persistent! items))))
+
+(def ^:private flush-fraction
+  "How much slack counts as *flush*, as a fraction of the type size.
+
+  Only flush runs join, and **no space is ever inserted**. That is a
+  reversal, and the measurement that caused it is worth keeping: on a real
+  cover page the gaps between consecutive glyphs formed one continuous
+  spread from 0.30 to 0.90 em with no gap in the histogram anywhere. There
+  is no threshold on that page that separates letter-spacing from a word
+  space — every choice invents characters somewhere, and the first version
+  of this put one between every pair of letters
+  (`F o r m  a l V e r i f i c a t i o n`).
+
+  Inventing a space is exactly the mistake this library refuses elsewhere:
+  a guess that is indistinguishable from a measurement once it is in the
+  output, and one that goes into `text-of` and into anything quoting the
+  page. So runs that the producer placed apart stay apart, at their own
+  coordinates, which is what the document actually says. A caller that wants
+  a line joins them — `reading-text` does, with a space, and that is a
+  presentation choice made at the edge rather than a character smuggled into
+  the model."
+  0.05)
+
+(defn coalesce
+  "Consecutive text runs that are one word, joined into one.
+
+  ## Why this is not cosmetic
+
+  A producer is free to emit one `Tj` per glyph, and plenty do — kerning
+  each pair individually is the easiest way to place type exactly. Measured:
+  an audit-report cover emitted 52 runs for one line, so `text-of` returned
+  `[\"O\" \"p\" \"e\" \"n\" …]`. That is not a search index and it is not a
+  quotation; it is a page nobody can read out of.
+
+  It is also what makes a drawn page look wrong. Each glyph placed at its own
+  document x, in a font that is not the document's, spaces unevenly — the
+  reader sees `Cont r act s` and blames the renderer. Joined, the browser
+  lays the word out itself and only the WORD's start comes from the
+  document, which is both truer and better looking.
+
+  ## Two thresholds, because a gap means three different things
+
+  Nothing (`< space-fraction`) is one word; a word space
+  (`< join-fraction`) is one phrase with a space put back; anything wider
+  ends the run. The last one is what stops a two-column line from becoming
+  a single sentence, and it is the failure that would be loud — the other
+  direction, losing every space, still looks like text.
+
+  **Both of the wider two need a MEASURED advance.** When the font shipped
+  no `/Widths` the pen position is computed from `default-width`, and a gap
+  derived from a guess is not evidence of anything: the real glyph is often
+  wider, so the gap appears inside a word. Measured on a real cover page,
+  where it produced `Form alVerification of |penZeppelin`. Unmeasured runs
+  therefore join only when they are flush, and never gain a space.
+
+  ## Joined only when they are exactly contiguous
+
+  The pen's end position is known (`::end-x`, from the advance), so this is
+  an equality test and not a guess: a run joins the previous one when it
+  starts where the previous one ended. A gap wider than that gets a space if
+  it is wide enough to be one, and otherwise starts a new run — so a two-
+  column line never becomes one word, and a tab stop does not swallow the
+  gap it was there to make.
+
+  Same baseline, same size, same font, same ink, same direction: anything
+  else is a different piece of type and stays its own run."
+  [items]
+  (letfn [(joinable? [a b]
+            (and (= :text (:item/kind a)) (= :text (:item/kind b))
+                 (= (:item/y a) (:item/y b))
+                 (= (:item/size a) (:item/size b))
+                 (= (:item/font a) (:item/font b))
+                 (= (:item/ink a) (:item/ink b))
+                 (= (:item/direction a) (:item/direction b))
+                 (::end-x a)
+                 (let [gap (- (:item/x b) (::end-x a))]
+                   (and (>= gap -0.5)
+                        (< gap (* flush-fraction (or (::size-hint a) 0.0)))))))
+          (join [a b]
+            (-> a
+                (update :item/text str (:item/text b))
+                (assoc ::end-x (::end-x b))
+                ;; The joined run's measured width is the distance the pen
+                ;; actually travelled, which is only knowable when both
+                ;; halves were measured.
+                (as-> m (if (and (:item/width a) (:item/width b))
+                          (assoc m :item/width (page/round
+                                                (- (::end-x b) (:item/x a))))
+                          (dissoc m :item/width)))))]
+    (into []
+          (map #(dissoc % ::end-x ::size-hint))
+          (reduce (fn [acc it]
+                    (let [prev (peek acc)]
+                      (if (and prev (joinable? prev it))
+                        (conj (pop acc) (join prev it))
+                        (conj acc it))))
+                  [] items))))
+
+(defn- on-page
+  "The marks that are on the page.
+
+  A content stream may draw anywhere; the page box is what the reader sees,
+  and PDF clips to it. Measured on a real poster: a rule at (9321, 10277) on
+  a 2384×3370 page — four page-widths off the edge. Harmless to a drawer
+  whose viewBox clips it, and not harmless to a count of what is on the
+  page, a digest over the marks, or anything that lays them out itself.
+
+  Only the far side, and only on the item's own start point. A text run's
+  `x` is a baseline START and its width is absent whenever the font shipped
+  no `/Widths` — so treating an unmeasured run as zero-wide and dropping it
+  for starting at −5 would delete text that is on the page. It did, on the
+  first run of this: the second half of a `TJ` whose kerning pulled it left
+  past the origin.
+
+  So a mark is dropped when it BEGINS past the right or bottom edge, which
+  is the case that was measured, and when a known positive extent puts it
+  entirely off the left or top. Anything else stays whole — trimming a
+  straddler would need the clip path this does not track, and half a letter
+  is worse than a letter that runs off."
+  [items width height]
+  (into []
+        (remove (fn [{:item/keys [x y] :as it}]
+                  (let [w (:item/width it)
+                        h (:item/height it)]
+                    (or (> x width) (> y height)
+                        (and (number? w) (pos? w) (< (+ x w) 0.0))
+                        (and (number? h) (pos? h) (< (+ y h) 0.0))))))
+        items))
+
+(defn walk
+  "One page's content stream into placed marks, plus the size it is on.
+
+  The page's own `/Resources` seed the state; a form XObject reached from here
+  gets its own, merged over these — see `do-xobject`."
+  ([objs page-dict] (walk objs page-dict nil))
+  ([objs page-dict {:keys [cid->unicode encoding->cmap]}]
+  (let [rotation (or (pdf/resolve-ref objs (:Rotate page-dict)) 0)
+        {base :matrix :keys [width height]} (flip (media-box objs page-dict) rotation)
+        res (resources-of objs page-dict)
+        images (atom [])
+        clips (atom {:index {} :defs []})
+        items (run-content
+               objs
+               (pdf/page-content-str objs page-dict)
+               {:ctm base :gs [] :text-state initial-text-state
+                :tm identity-matrix :tlm identity-matrix
+                ;; PDF's initial colour is BLACK, for fill and for stroke.
+                ;; Starting at nil made "no colour operator yet" and "a
+                ;; colour this cannot read" the same value, and it lost
+                ;; every constant alpha set before the first colour — which
+                ;; is most of them, because `gs` usually comes first.
+                :gray 0.0 :stroke-gray 0.0
+                :fonts (or (font-table objs page-dict cid->unicode encoding->cmap) {})
+                :xobjects (or (pdf/resolve-ref objs (:XObject res)) {})
+                ;; Kept so `gs` and `scn` can reach /ExtGState and /Pattern,
+                ;; which live in the resources rather than the stream.
+                :page-dict page-dict
+                :clips clips}
+               0 #{} images)]
+    {:items (coalesce (on-page items width height)) :width width :height height
+     :rotation rotation :image-refs @images :clips (:defs @clips)})))
+
+;; ── the public shape ─────────────────────────────────────────────────────────
+
+(defn page-dicts
+  "`pdf.core/pages`, minus the one it invents for a file that is not a PDF.
+
+  `collect-pages` walks from `(:Pages (:root parsed))`, and when the root is
+  nil — no catalog, no trailer, because the bytes were never a PDF — its
+  `:else` branch returns `[{}]`. One empty map, which counts as one page.
+  Measured: a text file uploaded as `application/pdf` reported a page and
+  rendered blank, which is the answer that sends somebody looking for the
+  missing content of a document that was never there.
+
+  A page dict says it is one, or carries content, or carries a box. A blank
+  page of a real document has the last two even with no content stream, so
+  this drops the phantom without dropping a legitimately empty page."
+  [parsed]
+  (into [] (filter (fn [d]
+                     (and (map? d)
+                          (or (= :Page (:Type d))
+                              (contains? d :Contents)
+                              (contains? d :MediaBox)))))
+        (pdf/pages parsed)))
+
+(defn page-at
+  "Page `index` of `parsed`, as a `hanmen.page` value.
+
+  `opts` may carry `:cid->unicode` and `:encoding->cmap` — see `font-table`.
+  Without them a composite font with no `/ToUnicode`, and a font using a
+  predefined encoding, both stay `:frame`s: which is what this did before
+  the options existed."
+  ([parsed index] (page-at parsed index nil))
+  ([parsed index opts]
+  (let [objs (:objects parsed)
+        dicts (page-dicts parsed)
+        dict (nth dicts index nil)]
+    (when dict
+      (let [{:keys [items width height rotation clips]} (walk objs dict opts)]
+        (page/page {:index index :width width :height height
+                    :rotation rotation :items items :clips clips}))))))
+
+(defn- colorspace-name [cs]
+  (case cs
+    (:DeviceGray :CalGray :G) :gray
+    (:DeviceRGB :CalRGB :RGB) :rgb
+    (:DeviceCMYK :CMYK) :cmyk
+    :Indexed :indexed
+    (:DeviceN :Separation) :separation
+    nil))
+
+(defn- colorspace-of
+  "The image's colour space, as a name a host can switch on.
+
+  An `/ICCBased` stream carries `/N` components and nothing else this can
+  use, so it is reported as the device space of that many components — which
+  is what every viewer does and what the profile almost always is. An
+  unknown space is nil rather than a guess: a wrong colour space produces an
+  image in confidently wrong colours, and that reads as a corrupt file."
+  [objs cs]
+  (let [cs (pdf/resolve-ref objs cs)]
+    (cond
+      (keyword? cs) (colorspace-name cs)
+      (vector? cs)
+      (let [head (pdf/resolve-ref objs (first cs))]
+        (cond
+          (= :Indexed head) :indexed
+          (= :ICCBased head)
+          (let [strm (pdf/resolve-ref objs (second cs))]
+            (case (long (or (pdf/resolve-ref objs (:N (:dict strm))) 0))
+              1 :gray 3 :rgb 4 :cmyk nil))
+          :else (colorspace-name head)))
+      :else nil)))
+
+(defn- palette-of
+  "An `/Indexed` space's lookup table, as bytes.
+
+  `[/Indexed base hival lookup]`, where `lookup` is a string or a stream.
+  Only an RGB base is returned — a palette over CMYK or a separation needs a
+  conversion this does not make, and half a palette is worse than none."
+  [objs cs]
+  (let [cs (pdf/resolve-ref objs cs)]
+    (when (and (vector? cs) (= :Indexed (pdf/resolve-ref objs (first cs))))
+      (let [base (pdf/resolve-ref objs (second cs))
+            lookup (pdf/resolve-ref objs (nth cs 3 nil))]
+        (when (= :rgb (colorspace-of objs base))
+          (cond
+            (string? lookup) (mapv #(bit-and (int %) 0xff) lookup)
+            (and (map? lookup) (:pdf.core/stream lookup))
+            (vec (pdf/decode-stream objs lookup))
+            (vector? lookup) (mapv #(bit-and (long %) 0xff) lookup)
+            :else nil))))))
+
+(defn page-images
+  "The page's images, in the order `Do` reached them — the order
+  `:item/index` counts in.
+
+  One traversal defines both, which is the point: reading the page's
+  `/XObject` dictionary instead would give resource order, and the two agree
+  only on a document that never invokes a form. A host that mixed them would
+  serve the wrong picture for the right box, on exactly the documents whose
+  pictures matter.
+
+  `:bytes` is what `pdf.core/decode-stream` gives: for `DCTDecode` that is a
+  JPEG file, ready to serve as one. For anything else it is raw samples and
+  `:media-type` is nil, which is the honest way to say somebody has to encode
+  them before a browser will show them."
+  [parsed index]
+  (let [objs (:objects parsed)
+        dict (nth (page-dicts parsed) index nil)]
+    (when dict
+      (mapv (fn [ref]
+              (let [xo (pdf/resolve-ref objs ref)
+                    d (:dict xo)]
+                {:media-type (image-media-type objs xo)
+                 ;; What the samples ARE, so a host can shape them for an
+                 ;; encoder without re-reading the object. Reported and not
+                 ;; converted: turning CMYK into RGB is a decision about
+                 ;; what a colour means, and this library does not have the
+                 ;; host's answer to that.
+                 :bits (pdf/resolve-ref objs (:BitsPerComponent d))
+                 :colorspace (colorspace-of objs (:ColorSpace d))
+                 :palette (palette-of objs (:ColorSpace d))
+                 :width (pdf/resolve-ref objs (:Width d))
+                 :height (pdf/resolve-ref objs (:Height d))
+                 :bytes (pdf/decode-stream objs xo)}))
+            (:image-refs (walk objs dict))))))
+
+(defn read-document
+  "Every page of `bytes`, as a `hanmen.page/document`.
+
+  `bytes` is whatever `pdf.core/parse` takes — a seq of unsigned byte
+  values. Reading the file is the caller's capability to spend, not this
+  library's: nothing here opens anything."
+  [bytes]
+  (let [parsed (pdf/parse bytes)
+        n (count (page-dicts parsed))]
+    (page/document (keep #(page-at parsed %) (range n)))))
+
+(defn page-count [parsed] (count (page-dicts parsed)))

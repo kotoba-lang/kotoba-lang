@@ -1,0 +1,129 @@
+(ns kotobase.federation
+  "Lightweight, salted-hash proof-of-retrievability for pinned blocks — a
+   periodic challenge/response BETWEEN REPLICA-HOLDING PEERS, not a
+   trustless prover-only scheme (see HONEST SCOPE below). Redesigned in
+   cljc from the pre-Rust-deletion kotoba-dht/availability_proof.rs
+   sketch (legacy ADR-2605252200 §5.2, 'lightweight PoSt'); reuses this
+   codebase's own portable SHA-256 (multiformats.core/sha256, real
+   JVM+cljs parity) instead of introducing blake3. See
+   90-docs/adr/2607051410-net-kotobase-distributed-storage-mesh-design.md
+   (com-junkawasaki/root) for the design this implements.
+
+   HONEST SCOPE: this is NOT Filecoin's PoRep/PoSt. A verifier holding
+   only a CID (a hash) cannot check hash(bytes ++ nonce) without already
+   possessing bytes — hash functions don't let you derive H(x||y) from
+   H(x) alone. So `verify` below requires the VERIFIER to independently
+   resolve the same block through its own get-fn (another replica-
+   holding peer, the tenant's own kept copy, or a rotating auditor from
+   an L3 provider-list) — this proves ongoing possession/freshness
+   between two parties who both once had the data, at the cost of one
+   compact hash instead of re-transferring the whole block every epoch.
+   Justified because kekkai gates mesh membership to known identities
+   (not an anonymous adversarial market) and durable pins already
+   require replication >= 2 for plain durability — so a verifying
+   replica-holder already exists at the tiers this audit is offered on
+   (see redundancy-tiers)."
+  (:require [multiformats.core :as mf]))
+
+;; Mirrors legacy ADR-2605252200 §5.1 pricing — only tiers with >=1
+;; OTHER replica holder can run this audit at all.
+(def redundancy-tiers
+  {:volatile {:replicas 1 :availability-proof? false}   ; base price, unauditable
+   :standard {:replicas 3 :availability-proof? false}   ; replicated, unaudited
+   :sla      {:replicas 5 :availability-proof? true}})  ; replicated + audited, premium
+
+(defn- bytes-concat
+  "a ++ b in the platform's native byte-buffer type (byte[] on :clj,
+   Uint8Array on :cljs) — the type multiformats.core/sha256 requires
+   directly, since it does no seq-coercion of its own. `a`/`b` are expected
+   to already be that native type (byte[]/Uint8Array) — the :clj branch
+   type-hints them directly instead of re-coercing via `(byte-array a)`,
+   which was needlessly recopying already-correctly-typed input (~40x
+   slower than the direct arraycopy below)."
+  [^bytes a ^bytes b]
+  )
+
+(defn- salted-hash [block-bytes nonce]
+  (mf/hexify (mf/sha256 (bytes-concat block-bytes nonce))))
+
+(defn challenge
+  "Verifier -> one challenge for one (node, cid) pair. `nonce` is
+   caller-supplied randomness (host chooses the source; this stays a
+   pure fn of its inputs, matching this codebase's Date.now/random
+   discipline elsewhere). `cid`/`nonce` are required at construction
+   time — a nil `nonce` would silently produce a hash with no freshness
+   guarantee instead of erroring, so this fails fast (ex-info, matching
+   this codebase's programmer-error discipline, e.g. murakumo.infer.
+   credits/job-cost) rather than degrading silently."
+  [cid nonce epoch]
+  (when (nil? cid)
+    (throw (ex-info "challenge: cid must not be nil" {:cid cid :nonce nonce :epoch epoch})))
+  (when (nil? nonce)
+    (throw (ex-info "challenge: nonce must not be nil" {:cid cid :nonce nonce :epoch epoch})))
+  {:kotobase.availability/cid cid
+   :kotobase.availability/nonce nonce
+   :kotobase.availability/epoch epoch})
+
+(defn prove
+  "Storage node's response through an injected CID get-fn. Returns nil (not a
+   fabricated proof) if the node lacks the block — the same fail-closed
+   discipline as the rest of Kotobase verification. `cid`/`nonce` are
+   required in `chal` (same fail-fast discipline as `challenge` above) —
+   a nil nonce here would silently produce a proof with no freshness
+   guarantee instead of erroring."
+  [get-fn {:kotobase.availability/keys [cid nonce] :as chal}]
+  (when (nil? cid)
+    (throw (ex-info "prove: cid must not be nil" {:chal chal})))
+  (when (nil? nonce)
+    (throw (ex-info "prove: nonce must not be nil" {:chal chal})))
+  (when-let [block-bytes (get-fn cid)]
+    {:kotobase.availability/cid cid
+     :kotobase.availability/proof (salted-hash block-bytes nonce)}))
+
+(defn verify
+  "Verifier resolves `cid` through ITS OWN get-fn (its own replica) and
+   recomputes the salted hash — only the compact `proof` crosses the
+   wire from the node under audit, not the block itself. Never throws;
+   fails closed on a missing local replica or a malformed/missing
+   response — including a `node-response` whose `:kotobase.availability/
+   proof` (or bytes flowing into bytes-concat/salted-hash) is a
+   malformed/non-byte type: that would otherwise throw out of
+   bytes-concat (ClassCastException on JVM / TypeError on cljs), so the
+   hash computation is wrapped and any such exception maps to
+   `:malformed` instead of propagating."
+  [verifier-get-fn {:kotobase.availability/keys [cid nonce]} node-response]
+  (let [local-bytes (verifier-get-fn cid)]
+    (cond
+      (nil? local-bytes) :verifier-lacks-replica
+      (nil? node-response) :missed
+      (not= (:kotobase.availability/cid node-response) cid) :malformed
+      :else
+      (let [expected (try (salted-hash local-bytes nonce)
+                           (catch  _ ::malformed))]
+        (cond
+          (= expected ::malformed) :malformed
+          (= (:kotobase.availability/proof node-response) expected) :ok
+          :else :failed)))))
+
+(defn audit-required?
+  "Does `tier` (a key of redundancy-tiers) require an availability audit
+   before a caller (murakumo/kekkai) invokes challenge/verify at all?
+   Pure lookup over redundancy-tiers — tiers with no other replica holder
+   (see the ns docstring's HONEST SCOPE) can't be audited and shouldn't
+   attempt to be."
+  [tier]
+  (:availability-proof? (get redundancy-tiers tier)))
+
+(defn audit-outcome
+  "One epoch's result for one (node, cid) pair -> a pure decision record.
+   Caller wires :ok into a storage economy's settle/credit path and
+   :failed/:missed into kekkai membership standing — this ns holds no
+   opinion on credits or admission; those policies belong to the host. Keys
+   are in the same :kotobase.availability/* namespace as
+   challenge/prove/verify's own output (unified from a prior :audit/*
+   namespace) for consistency across this whole ns."
+  [node cid epoch verdict]
+  {:kotobase.availability/node node
+   :kotobase.availability/cid cid
+   :kotobase.availability/epoch epoch
+   :kotobase.availability/verdict verdict})

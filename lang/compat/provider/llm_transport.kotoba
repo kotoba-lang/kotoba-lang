@@ -1,0 +1,160 @@
+(ns provider.llm-transport
+  "Production transport for the bounded LLM capability kit (ADR 0027,
+  `provider.llm`), wired to the repo-wide `murakumo-main`
+  fleet alias (root superproject CLAUDE.md, 'LLM モデル選択 -- murakumo-main
+  alias', ADR-2607173100).
+
+  This namespace does NOT define a new provider or a new capability. It
+  builds the one thing every provider in this ADR chain has always deferred
+  to the host (ADR 0027: 'Each provider instance owns ... an injected
+  synchronous transport'; ADR 0049's gap ledger: 'current providers are
+  identity wiring fixtures, not implementations' of the nine application
+  capabilities) -- a real synchronous `(fn [request] -> reply)` you pass as
+  `:transport` to `provider.llm/provider`. `llm.cljc` itself
+  is untouched: every bound (string/output-token/temperature/model-allowlist)
+  it already enforces before calling the transport is unchanged and un-
+  weakened by this namespace.
+
+  Model resolution follows the repo-wide mandatory order (CLAUDE.md, 'LLM
+  モデル選択'): ① env var / constructor-option override → ② `murakumo-main`
+  alias resolution (`GET {default-endpoint}/infer/models/murakumo-main` →
+  its `:alias-for`, consulted only for the concrete model name) → ③ on
+  failure, an endpoint-only fallback that bakes ONLY the default gateway
+  endpoint and sends the literal alias name `\"murakumo-main\"` as `model`
+  (never a concrete model id) so the `/v1/messages` worker resolves it
+  server-side via its own KV -- this fallback still adapts to a model swap
+  with zero redeploy, unlike baking a concrete id ever would. The wire
+  ENDPOINT this namespace calls is always the default gateway (or an
+  explicit override) -- never the alias entry's own `:endpoint` field, which
+  (verified live 2026-07-24) points at a differently-shaped OpenAI
+  chat.completions route on a different host; see `resolve-model`'s
+  docstring for the full investigation.
+
+  ## `:cljs` / nbb production transport (ADR 0118)
+
+  nbb/Node has no built-in *synchronous* HTTP primitive. This namespace keeps
+  the reference provider's synchronous `(fn [request] -> reply)` contract by
+  running alias GET and `/v1/messages` POST in a child `node` process via
+  `child_process.spawnSync` (same pattern as ADR 0117's HTTP transport).
+  Wire shape, ①→②→③ model resolution, typed HTTP status errors, and
+  `:on-call` audit match the `:clj` transport. See ADR 0064 + ADR 0118."
+  (:require [clojure.string :as string]
+            )
+  )
+
+(def default-endpoint
+  "The murakumo gateway. Fixed default for the ③ endpoint-only fallback --
+  never itself a concrete model id."
+  "https://api.murakumo.cloud")
+
+(def alias-name "murakumo-main")
+(def alias-path "/infer/models/murakumo-main")
+(def messages-path "/v1/messages")
+
+(def default-connect-timeout-ms 5000)
+(def default-request-timeout-ms 60000)
+(def default-alias-cache-ttl-ms
+  "How long a resolved {:endpoint :model} pair is reused before re-resolving
+  via ②. Keeps a hot loop from hitting the alias endpoint on every single
+  `:llm/generate` call while still picking up a fleet-main swap (PUT to the
+  alias entry, CLAUDE.md 'LLM モデル選択') within one TTL window."
+  60000)
+
+(def env-endpoint-var "KOTOBA_LLM_MURAKUMO_ENDPOINT")
+(def env-model-var "KOTOBA_LLM_MURAKUMO_MODEL")
+(def env-api-key-var "MURAKUMO_API_KEY")
+
+;; ---------------------------------------------------------------------------
+;; ① / ② / ③ resolution — endpoint + wire model, no I/O leaks into result
+;; ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+;; ---------------------------------------------------------------------------
+;; wire request / response — Anthropic Messages API shape (murakumo's
+;; documented live text-inference contract; see docs/adr/0064)
+;; ---------------------------------------------------------------------------
+
+(defn- request-body [{:keys [wire-model system prompt max-output-tokens
+                             temperature-milli]}]
+  (cond-> {"model" wire-model
+           "max_tokens" (int max-output-tokens)
+           "messages" [{"role" "user" "content" prompt}]
+           "temperature" (/ (double temperature-milli) 1000.0)}
+    (seq system) (assoc "system" system)))
+
+(defn- extract-text
+  "Concatenate every `type=\"text\"` content block. A refusal or an
+  otherwise-empty completion yields \"\" (allowed by
+  `value/bounded-string!` -- zero bytes is within any positive limit),
+  never nil."
+  [content-blocks]
+  (->> content-blocks
+       (filter #(= "text" (:type %)))
+       (map #(:text % ""))
+       (apply str)))
+
+(defn- finish-reason-keyword
+  "Map an upstream `stop_reason` string to a bounded kotoba keyword,
+  defensively sanitized -- an upstream value this namespace doesn't
+  control must never surface a byte-limit-violating or non-keyword-safe
+  string past this boundary."
+  [stop-reason]
+  (if (string? stop-reason)
+    (let [safe (-> stop-reason
+                   (subs 0 (min (count stop-reason) 64))
+                   (string/replace #"[^a-zA-Z0-9_.-]" "-"))]
+      (if (seq safe) (keyword safe) :unknown))
+    :unknown))
+
+(defn- token-count [usage k]
+  (let [v (get usage k)]
+    (if (and (integer? v) (<= 0 v)) v 0)))
+
+(defn- truncate-for-error-message [s limit]
+  (let [s (str s)]
+    (if (> (count s) limit) (str (subs s 0 limit) "...") s)))
+
+(defn- error-for-status
+  "Non-2xx HTTP status -> a typed `{:error ...}` reply (never thrown --
+  `provider.llm/invoke-transport` only catches exceptions
+  as a last-resort fallback; a real HTTP error is not exceptional here and
+  carries useful `:retryable` information the generic catch can't)."
+  [status body]
+  (let [retryable? (or (= status 429) (>= status 500))
+        code (case (int status)
+               429 :llm/rate-limited
+               401 :llm/unauthorized
+               403 :llm/forbidden
+               404 :llm/not-found
+               (if (>= status 500) :llm/upstream-error :llm/request-rejected))]
+    {:error {:code code
+             :message (str "murakumo transport HTTP " status ": "
+                           (truncate-for-error-message body 400))
+             :retryable retryable?}}))
+
+
+
+;; ---------------------------------------------------------------------------
+;; public constructor
+;; ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

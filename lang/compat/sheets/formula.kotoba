@@ -1,0 +1,505 @@
+(ns sheets.formula
+  "What `=SUM(B2:B9)` comes to.
+
+  A workbook here could hold a formula and never compute one. `sheets.xlsx`
+  writes `<f>` with no cached value on purpose — Excel recalculates on open,
+  which is correct — but inside this Drive a spreadsheet showed the text
+  `=SUM(B2:B9)` for ever. Computing is the whole point of a spreadsheet.
+
+  ## Nothing is stored
+
+  `values` takes a tab and returns what each cell comes to *now*. A computed
+  value written back into `:sheets/value` would be a second copy of something
+  derived, stale the moment any input changed, and indistinguishable
+  afterwards from a value somebody typed. The model holds formulas; this
+  answers what they mean.
+
+  ## Cells hold text, and that is not undone here
+
+  `sheets.csv` reads every field as a string, and `sheets.xlsx` writes every
+  cell as one, both for the same stated reason: guessing is how a part number
+  becomes a float. So evaluation parses text to a number *where a number is
+  required*, and says so when it cannot — it does not decide that `0042` was
+  a number all along.
+
+  Which follows Excel: `=A1+1` over text is `#VALUE!`, while `=SUM(A1:A9)`
+  ignores the text in the range. The difference is that arithmetic asks for
+  a number and an aggregate asks for the numbers there are.
+
+  ## Errors are values
+
+  `#DIV/0!`, `#VALUE!`, `#NAME?`, `#REF!`, `#CIRCULAR!` — a cell whose
+  formula cannot be computed holds the reason, which is what a spreadsheet
+  does and is more useful than an empty cell or a thrown exception. They
+  propagate: a sum over a range containing `#DIV/0!` is `#DIV/0!`, because
+  the alternative is a total that silently omits a number nobody can see is
+  missing."
+  (:require [clojure.string :as str]
+            [sheets.model :as model]))
+
+(def error-values
+  "The strings a cell holds when its formula cannot be computed."
+  #{"#DIV/0!" "#VALUE!" "#NAME?" "#REF!" "#CIRCULAR!" "#N/A"})
+
+(defn error? [x] (contains? error-values (str x)))
+
+;; ── reading a formula ───────────────────────────────────────────────────────
+
+(defn- number-token [s i]
+  (let [n (count s)]
+    (loop [j i seen-dot? false]
+      (cond
+        (>= j n) [(subs s i j) j]
+        (= \. (nth s j)) (if seen-dot? [(subs s i j) j] (recur (inc j) true))
+        (contains? (set "0123456789") (nth s j)) (recur (inc j) seen-dot?)
+        :else [(subs s i j) j]))))
+
+(def ^:private stops
+  "The characters a word ends at: whitespace, operators, punctuation, quote.
+
+  Defined as what stops a word rather than as what a word contains, because
+  a named range here is as likely to be 売上 as Sales. An allowlist of ASCII
+  letters would make every non-English name unspellable, which is a strange
+  thing for this Drive to decide."
+  (set " \t\n+-*/^%(),:<>=&\""))
+
+(defn- word-token
+  "A run of anything that is not a stop — a cell reference, a function name,
+  or a named range, which cannot be told apart until something follows."
+  [s i]
+  (let [n (count s)]
+    (loop [j i]
+      (if (and (< j n) (not (contains? stops (nth s j))))
+        (recur (inc j))
+        [(subs s i j) j]))))
+
+(defn- string-token
+  "A double-quoted literal. `\"\"` inside one is a literal quote, which is how
+  a spreadsheet spells it and not how most languages do."
+  [s i]
+  (let [n (count s)]
+    (loop [j (inc i) out []]
+      (cond
+        (>= j n) [(apply str out) j]
+        (= \" (nth s j)) (if (and (< (inc j) n) (= \" (nth s (inc j))))
+                           (recur (+ j 2) (conj out \"))
+                           [(apply str out) (inc j)])
+        :else (recur (inc j) (conj out (nth s j)))))))
+
+(defn tokens
+  "A formula as tokens. Never throws — an unreadable one becomes tokens the
+  parser refuses, which is a `#NAME?` in a cell rather than a 500."
+  [s]
+  (let [s (str s)
+        n (count s)]
+    (loop [i 0 out []]
+      (if (>= i n)
+        out
+        (let [c (nth s i)]
+          (cond
+            (contains? (set " \t\n") c) (recur (inc i) out)
+            (contains? (set "0123456789") c)
+            (let [[t j] (number-token s i)] (recur j (conj out [:number t])))
+            (= \" c) (let [[t j] (string-token s i)] (recur j (conj out [:string t])))
+            (contains? (set "+-*/^%(),:") c)
+            (recur (inc i) (conj out [(get {\( :lparen \) :rparen \, :comma
+                                            \: :colon}
+                                           c :op)
+                                      (str c)]))
+            (and (= \< c) (< (inc i) n) (= \= (nth s (inc i))))
+            (recur (+ i 2) (conj out [:op "<="]))
+            (and (= \< c) (< (inc i) n) (= \> (nth s (inc i))))
+            (recur (+ i 2) (conj out [:op "<>"]))
+            (and (= \> c) (< (inc i) n) (= \= (nth s (inc i))))
+            (recur (+ i 2) (conj out [:op ">="]))
+            (contains? (set "<>=") c) (recur (inc i) (conj out [:op (str c)]))
+            (= \& c) (recur (inc i) (conj out [:op "&"]))
+            :else (let [[t j] (word-token s i)]
+                    (if (= i j)
+                      ;; A character nothing knows. Consumed rather than
+                      ;; looped on for ever.
+                      (recur (inc i) (conj out [:unknown (str c)]))
+                      (recur j (conj out [:word t]))))))))))
+
+(defn parse-ref
+  "`B12` or `$B$12` → `[row col]`, or nil.
+
+  `$` is absolute addressing, which matters when a formula is copied and
+  nothing here copies formulas — so it is accepted and ignored rather than
+  refused, because refusing it would reject a file Excel wrote."
+  [word]
+  (when-let [[_ letters digits]
+             (re-matches #"\$?([A-Za-z]{1,3})\$?(\d{1,7})" (str word))]
+    (when-let [col (model/column-number letters)]
+      [ col])))
+
+;; ── the grammar ─────────────────────────────────────────────────────────────
+;;
+;; Precedence, loosest first: comparison, `&`, `+ -`, `* /`, `^`, unary `-`,
+;; then a primary. Recursive descent, one function per level, which is the
+;; shape the grammar already has.
+
+(declare parse-expr)
+
+(defn- parse-args [ts]
+  (loop [ts ts args []]
+    (if (or (empty? ts) (= :rparen (first (first ts))))
+      [args (rest ts)]
+      (let [[a ts] (parse-expr ts)
+            args (conj args a)]
+        (if (= :comma (first (first ts)))
+          (recur (rest ts) args)
+          [args (rest ts)])))))
+
+(defn- parse-primary [ts]
+  (let [[kind text] (first ts)]
+    (cond
+      (nil? kind) [[:error "#NAME?"] nil]
+      (= :number kind) [[:num text] (rest ts)]
+      (= :string kind) [[:str text] (rest ts)]
+      (and (= :op kind) (= "-" text))
+      (let [[e ts] (parse-primary (rest ts))] [[:neg e] ts])
+      (and (= :op kind) (= "+" text)) (parse-primary (rest ts))
+
+      (= :lparen kind)
+      (let [[e ts] (parse-expr (rest ts))]
+        [e (if (= :rparen (first (first ts))) (rest ts) ts)])
+
+      (= :word kind)
+      (cond
+        ;; A name followed by `(` is a call; otherwise it is a reference,
+        ;; and a reference that is not one is `#NAME?`.
+        (= :lparen (first (first (rest ts))))
+        (let [[args ts] (parse-args (rest (rest ts)))]
+          [[:call (str/upper-case text) args] ts])
+
+        ;; `A1:B9` — a range, which only means anything inside a call.
+        (= :colon (first (first (rest ts))))
+        [[:range text (second (first (rest (rest ts))))] (rest (rest (rest ts)))]
+
+        ;; A cell reference or a named range — and which it is cannot be
+        ;; decided here, because names live on the workbook and this only
+        ;; has the text. `eval-node` resolves it and answers `#NAME?` if it
+        ;; is neither.
+        :else [[:ref text] (rest ts)])
+
+      :else [[:error "#NAME?"] (rest ts)])))
+
+(defn- parse-binary [ts levels]
+  (if (empty? levels)
+    (parse-primary ts)
+    (let [ops (first levels)]
+      (loop [[left ts] (parse-binary ts (rest levels))]
+        (let [[kind text] (first ts)
+              op (when (= :op kind) text)]
+          (if (and op (contains? ops op))
+            (let [[right ts] (parse-binary (rest ts) (rest levels))]
+              (recur [[:op op left right] ts]))
+            [left ts]))))))
+
+(def ^:private precedence
+  [#{"=" "<>" "<" ">" "<=" ">="} #{"&"} #{"+" "-"} #{"*" "/"} #{"^"}])
+
+(defn- parse-expr [ts] (parse-binary ts precedence))
+
+(defn parse
+  "A formula's text as a tree. Never throws."
+  [text]
+  (let [text (str text)
+        text (if (str/starts-with? text "=") (subs text 1) text)]
+    (first (parse-expr (tokens text)))))
+
+;; ── computing ───────────────────────────────────────────────────────────────
+
+(defn- as-number
+  "Text as a number, or nil. The one place a string becomes one, and only
+  because something asked for a number."
+  [x]
+  (cond
+    (number? x) x
+    (nil? x) nil
+    :else (let [s (str/trim (str x))]
+            (when-not (str/blank? s)
+              ))))
+
+(defn format-number
+  "A number as the text a cell holds.
+
+  An integer without a decimal point, because `120.0` in a cell is a number
+  wearing floating point's clothes. Anything else to ten significant places
+  and no trailing zeros, which is enough to not surprise and not enough to
+  show the noise at the end of a double."
+  [n]
+  (let [d (double n)]
+    (cond
+      ;; `(not= d d)` is the portable NaN test — it is the only value that is
+      ;; not equal to itself, and `Double/isNaN` exists on one host only.
+      (not= d d) "#VALUE!"
+       "#VALUE!"
+      (zero? (mod d 1)) (str (long d))
+      :else (-> 
+                (str/replace #"0+$" "")
+                (str/replace #"\.$" "")))))
+
+(declare value-at)
+
+(defn- numbers-in
+  "Every number in a list of evaluated arguments, ranges flattened.
+
+  Text is skipped rather than refused, which is what an aggregate does: a
+  column of amounts with a heading on top sums to the amounts."
+  [xs]
+  (keep as-number (flatten xs)))
+
+(defn- compare-op [op a b]
+  (let [na (as-number a) nb (as-number b)
+        [x y] (if (and na nb) [na nb] [(str a) (str b)])
+        c (compare x y)]
+    (case op
+      "=" (zero? c) "<>" (not (zero? c))
+      "<" (neg? c) ">" (pos? c)
+      "<=" (not (pos? c)) ">=" (not (neg? c))
+      false)))
+
+(defn- truthy?
+  "Whether a value is true for `IF`, `AND`, `OR` and `NOT`.
+
+  A spreadsheet has booleans and this model has text, so both spellings
+  count: `TRUE` from a comparison, and a non-zero number. Empty text and
+  zero are false, which is Excel's rule and what somebody writing
+  `IF(A1,…)` means."
+  [x]
+  (cond
+    (boolean? x) x
+    (nil? x) false
+    (= "" (str x)) false
+    (as-number x) (not (zero? (as-number x)))
+    (= "FALSE" (str/upper-case (str x))) false
+    :else true))
+
+(defn- matches?
+  "Whether `v` satisfies a criterion the way `SUMIF` means it.
+
+  A criterion is a value to equal, or a comparison written as text —
+  `\">1000\"`, `\"<>Q1\"`. That second form is a spreadsheet convention and
+  not a general one: the operator is part of the *string*, so a criterion
+  reading `>1000` tests a comparison and one reading `1000` tests equality."
+  [v criterion]
+  (let [c (str criterion)]
+    (if-let [[_ op rest'] (re-matches #"(<=|>=|<>|<|>|=)(.*)" c)]
+      (compare-op op v rest')
+      (let [nv (as-number v) nc (as-number c)]
+        (if (and nv nc) (== nv nc) (= (str v) c))))))
+
+(defn- apply-fn [name args]
+  (let [nums (numbers-in args)
+        flat (flatten args)]
+    (cond
+      (some error? flat) (first (filter error? flat))
+      :else
+      (case name
+        "SUM" (reduce + 0 nums)
+        "AVERAGE" (if (seq nums) (/ (reduce + 0.0 nums) (count nums)) "#DIV/0!")
+        "COUNT" (count nums)
+        "COUNTA" (count (remove #(or (nil? %) (= "" %)) flat))
+        "MIN" (if (seq nums) (reduce min nums) 0)
+        "MAX" (if (seq nums) (reduce max nums) 0)
+        "ABS" (if-let [n (as-number (first flat))] (Math/abs (double n)) "#VALUE!")
+        "ROUND" (let [n (as-number (first flat))
+                      places (or (as-number (second flat)) 0)]
+                  (if n
+                    (let [f (Math/pow 10 places)]
+                      ;; `Math/round` rather than `rint`: JS has no rint, and
+                      ;; the half-up rounding a spreadsheet does is round's.
+                      (/ (double (Math/round (* (double n) f))) f))
+                    "#VALUE!"))
+
+        ;; ── conditional aggregates ──
+        ;;
+        ;; The pair that makes a spreadsheet useful for anything real:
+        ;; totalling the rows that match something. `SUMIF` takes an optional
+        ;; third range to add up instead of the one it tested, which is how
+        ;; Excel spells "test one column, total another".
+        "COUNTIF" (let [[tested criterion] args]
+                    (count (filter #(matches? % (first (flatten [criterion])))
+                                   (flatten [tested]))))
+        "SUMIF" (let [[tested criterion sum-range] args
+                      c (first (flatten [criterion]))
+                      xs (vec (flatten [tested]))
+                      ys (vec (flatten [(if (nil? sum-range) tested sum-range)]))]
+                  (reduce + 0
+                          (keep-indexed
+                           (fn [i v]
+                             (when (matches? v c) (as-number (nth ys i nil))))
+                           xs)))
+
+        ;; ── text ──
+        "LEN" (count (str (first flat)))
+        "LEFT" (let [t (str (first flat))
+                     n (long (or (as-number (second flat)) 1))]
+                 (subs t 0 (max 0 (min n (count t)))))
+        "RIGHT" (let [t (str (first flat))
+                      n (long (or (as-number (second flat)) 1))]
+                  (subs t (max 0 (- (count t) (max 0 n)))))
+        "MID" (let [t (str (first flat))
+                    start (long (or (as-number (nth flat 1 nil)) 1))
+                    n (long (or (as-number (nth flat 2 nil)) 0))
+                    from (min (max 0 (dec start)) (count t))]
+                (subs t from (min (+ from (max 0 n)) (count t))))
+        "UPPER" (str/upper-case (str (first flat)))
+        "LOWER" (str/lower-case (str (first flat)))
+        "TRIM" (str/trim (str (first flat)))
+        "CONCATENATE" (apply str (map str flat))
+
+        ;; ── logic ──
+        ;;
+        ;; Not short-circuiting, unlike `IF`. Excel's are not either — every
+        ;; argument is evaluated and an error in any of them is the answer,
+        ;; which the check at the top of this function already does.
+        "AND" (every? truthy? flat)
+        "OR" (boolean (some truthy? flat))
+        "NOT" (not (truthy? (first flat)))
+
+        ;; `IF` never reaches here — `eval-node` handles it before its
+        ;; arguments are evaluated. Named so that one arriving anyway would
+        ;; not read as an unknown function.
+        "IF" "#NAME?"
+        "#NAME?"))))
+
+(defn- eval-node [node tab seen opts]
+  (let [[kind a b] node]
+    (case kind
+      :num (or (as-number a) "#VALUE!")
+      :str a
+      :error a
+      :neg (let [v (eval-node a tab seen opts)]
+             (cond (error? v) v
+                   (as-number v) (- (as-number v))
+                   :else "#VALUE!"))
+      :ref (let [[row col] (parse-ref a)]
+             (cond
+               row (value-at tab row col seen opts)
+               ;; A word that is not a cell reference may be a named range —
+               ;; `=SUM(売上)`. Resolved to the range it stands for and then
+               ;; evaluated as one, so a name behaves exactly like the
+               ;; addresses it replaces rather than like a second kind of
+               ;; thing.
+               (get (:names opts) (str a))
+               (eval-node (let [{:keys [from to]} (get (:names opts) (str a))]
+                            [:range from to])
+                          tab seen opts)
+               ;; Neither an address nor a name anybody defined. Excel's
+               ;; answer for a word it does not know.
+               :else "#NAME?"))
+      :range (let [from (parse-ref a) to (parse-ref b)]
+               (if (and from to)
+                 (vec (for [row (range (min (first from) (first to))
+                                       (inc (max (first from) (first to))))
+                            col (range (min (second from) (second to))
+                                       (inc (max (second from) (second to))))]
+                        (value-at tab row col seen opts)))
+                 "#REF!"))
+      ;; `IF` chooses before it computes. Everything else takes evaluated
+      ;; arguments, and evaluating both branches of an IF defeats the thing
+      ;; it is most used for: `IF(A1=0,"ゼロ",100/A1)` guards a division by
+      ;; zero, and computing the guarded branch anyway makes the whole
+      ;; formula #DIV/0! — the error the guard exists to avoid. Measured
+      ;; before it was fixed.
+      :call (if (= "IF" a)
+              (let [test (eval-node (first b) tab seen opts)]
+                (cond
+                  (error? test) test
+                  (truthy? test) (if (> (count b) 1) (eval-node (nth b 1) tab seen opts) "")
+                  :else (if (> (count b) 2) (eval-node (nth b 2) tab seen opts) "")))
+              (apply-fn a (mapv #(eval-node % tab seen opts) b)))
+      :op (let [op a
+                x (eval-node b tab seen opts)
+                y (eval-node (nth node 3) tab seen opts)]
+            (cond
+              (error? x) x
+              (error? y) y
+              :else
+              (cond
+                  (contains? #{"=" "<>" "<" ">" "<=" ">="} op) (compare-op op x y)
+                  (= "&" op) (str x y)
+                  :else
+                  (let [nx (as-number x) ny (as-number y)]
+                    (if-not (and nx ny)
+                      "#VALUE!"
+                      (case op
+                        "+" (+ nx ny) "-" (- nx ny) "*" (* nx ny)
+                        "/" (if (zero? ny) "#DIV/0!" (/ (double nx) ny))
+                        "^" (Math/pow nx ny)
+                        "#VALUE!"))))))
+      "#NAME?")))
+
+(defn value-at
+  "What the cell at `row`,`col` comes to.
+
+  `seen` is the chain of cells being computed. A cell that appears in its own
+  chain is `#CIRCULAR!` — reported rather than recursed into, because the
+  alternative is a stack overflow, and a spreadsheet that crashes on a
+  self-reference is worse than one that says so."
+  ([tab row col] (value-at tab row col #{} {}))
+  ([tab row col seen] (value-at tab row col seen {}))
+  ([tab row col seen opts]
+   (let [key [row col]
+         cell (get-in tab [:sheets/cells key])]
+     (cond
+       (contains? seen key) "#CIRCULAR!"
+       (contains? cell :sheets/formula)
+       (let [v (eval-node (parse (:sheets/formula cell)) tab (conj seen key) opts)]
+         (cond (error? v) v
+               (number? v) (format-number v)
+               (boolean? v) (if v "TRUE" "FALSE")
+               (nil? v) ""
+               :else (str v)))
+       :else (or (:sheets/value cell) "")))))
+
+(defn names-of
+  "A workbook's named ranges as `{name {:from \"A1\" :to \"B9\"}}`, for the tab
+  `tab-id`.
+
+  A name belongs to the workbook and a range belongs to a tab, so a name
+  pointing at another tab is not resolvable from here — it is dropped rather
+  than resolved against the wrong sheet, which would be an answer computed
+  from the wrong numbers.
+
+  The tab is matched by its **title**, falling back to its id when it has
+  none — the same rule `sheets.xlsx` uses to write a `definedName`, because
+  a `definedName` references a sheet by its name and that is what somebody
+  defining a range writes. Matching the map key instead resolved a name in a
+  workbook whose tabs happen to be keyed by their titles and in no other,
+  which is every workbook this Drive creates."
+  [workbook tab]
+  (let [tab-name (or (:sheets/title tab) (:sheets/id tab))]
+    (into {}
+          (keep (fn [[name range]]
+                  (when (= tab-name (:sheets/tab range))
+                    (let [[from to] (str/split (str (:sheets/range range)) #":" 2)]
+                      (when (and from to) [(str name) {:from from :to to}])))))
+          (:sheets/named-ranges workbook))))
+
+(defn values
+  "Every cell of `tab` as what it comes to, keyed the same way the cells are.
+
+  Computed on demand and never written back: a stored result is a second
+  copy of something derived, stale the moment an input changes and
+  indistinguishable afterwards from a value somebody typed."
+  ([tab] (values tab {}))
+  ([tab opts]
+   (into {}
+         (map (fn [[key _]] [key (value-at tab (first key) (second key) #{} opts)]))
+         (:sheets/cells tab))))
+
+(defn workbook-values
+  "Every cell of every tab, with the workbook's named ranges resolvable.
+
+  The arity to use from an application: `values` on a bare tab cannot see
+  names, because names live on the workbook and a tab does not know which
+  workbook it is in."
+  [workbook]
+  (into {}
+        (map (fn [[tab-id tab]]
+               [tab-id (values tab {:names (names-of workbook tab)})]))
+        (:sheets/tabs workbook)))

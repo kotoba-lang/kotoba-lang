@@ -1,0 +1,104 @@
+(ns kotobase.maintenance.retention
+  "Pure retention-root records used by object-store hosts and GC. Mutable
+  registry entries point at immutable manifest CIDs; they are not a second
+  database model.")
+
+(def leased-kinds #{:reader :replication})
+(def durable-kinds #{:legal-hold :release :backup})
+(def kinds (into leased-kinds durable-kinds))
+
+(defn root-node
+  "Validate and construct the portable registry value. Reader and replication
+  roots require an expiry; legal-hold and release roots are durable until an
+  explicit CAS tombstone sets RELEASED-AT."
+  [{:keys [db-id kind id manifest-cid epoch expires-at released-at]}]
+  (when-not (and (string? db-id) (seq db-id))
+    (throw (ex-info "Retention root db-id must be non-empty" {:db-id db-id})))
+  (when-not (contains? kinds kind)
+    (throw (ex-info "Unknown retention root kind" {:kind kind})))
+  (when-not (and (string? id) (seq id))
+    (throw (ex-info "Retention root id must be non-empty" {:id id})))
+  (when-not (and (string? manifest-cid) (seq manifest-cid))
+    (throw (ex-info "Retention root manifest CID must be non-empty"
+                    {:manifest-cid manifest-cid})))
+  (when-not (and (integer? epoch) (not (neg? epoch)))
+    (throw (ex-info "Retention root epoch must be non-negative" {:epoch epoch})))
+  (when (and (contains? leased-kinds kind)
+             (not (and (integer? expires-at) (pos? expires-at))))
+    (throw (ex-info "Leased retention root requires a positive expires-at"
+                    {:kind kind :expires-at expires-at})))
+  (cond-> {"format" "kotobase/retention-root"
+           "version" 1
+           "db-id" db-id
+           "kind" (name kind)
+           "id" id
+           "manifest-cid" manifest-cid
+           "epoch" epoch}
+    expires-at (assoc "expires-at" expires-at)
+    released-at (assoc "released-at" released-at)))
+
+(defn active?
+  "True when NODE is a live GC root at NOW-MS. Expiry is strict: a lease with
+  expires-at equal to now is already inactive."
+  [node now-ms]
+  (and (nil? (get node "released-at"))
+       (let [kind (keyword (get node "kind"))]
+         (if (contains? leased-kinds kind)
+           (> (get node "expires-at" 0) now-ms)
+           (contains? durable-kinds kind)))))
+
+(defn validate-node
+  "Validate a decoded string-keyed registry value and return its canonical
+  representation. Unknown fields are not persisted across CAS updates."
+  [node]
+  (when-not (and (= "kotobase/retention-root" (get node "format"))
+                 (= 1 (get node "version")))
+    (throw (ex-info "Unsupported retention root format"
+                    {:format (get node "format") :version (get node "version")})))
+  (root-node {:db-id (get node "db-id")
+              :kind (keyword (get node "kind"))
+              :id (get node "id")
+              :manifest-cid (get node "manifest-cid")
+              :epoch (get node "epoch")
+              :expires-at (get node "expires-at")
+              :released-at (get node "released-at")}))
+
+(defn active-roots [nodes now-ms]
+  (filterv #(active? % now-ms) nodes))
+
+(defn minimum-safe-epoch
+  "Minimum epoch among active roots, or nil when the registry imposes no
+  retention boundary."
+  [nodes now-ms]
+  (when-let [epochs (seq (map #(get % "epoch") (active-roots nodes now-ms)))]
+    (reduce min epochs)))
+
+(defn safe-epoch-oracle
+  "Return one explicit conservative retention decision for compaction and GC.
+  CLOCK-SKEW-MS keeps a just-expired leased root active for that additional
+  interval; durable legal-hold/release/backup roots are unaffected."
+  [nodes now-ms clock-skew-ms]
+  (when-not (and (integer? now-ms) (not (neg? now-ms))
+                 (integer? clock-skew-ms) (not (neg? clock-skew-ms)))
+    (throw (ex-info "Safe-epoch oracle requires non-negative integer clocks"
+                    {:now-ms now-ms :clock-skew-ms clock-skew-ms})))
+  (let [effective-now (max 0 (- now-ms clock-skew-ms))
+        active (active-roots nodes effective-now)
+        epochs (mapv #(get % "epoch") active)]
+    {:safe-epoch (when (seq epochs) (reduce min epochs))
+     :active-roots active
+     :active-by-kind
+     (into (sorted-map)
+           (map (fn [[kind roots]] [kind (count roots)]))
+           (group-by #(get % "kind") active))
+     :evaluated-at now-ms
+     :effective-now effective-now
+     :clock-skew-ms clock-skew-ms}))
+
+(defn release-node
+  "Create the CAS replacement used instead of an unsafe unconditional delete."
+  [node released-at]
+  (when-not (and (integer? released-at) (pos? released-at))
+    (throw (ex-info "released-at must be a positive millisecond timestamp"
+                    {:released-at released-at})))
+  (assoc (validate-node node) "released-at" released-at))

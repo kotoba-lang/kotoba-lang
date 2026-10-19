@@ -1,0 +1,242 @@
+(ns provider.dataspace
+  "Reference host for :dataspace/transact v1 (root ADR-2608154100).
+
+  One provider instance is one dataspace. Guest code observes it only through
+  the typed request/result contract after the runtime has admitted capability
+  id 24. Assertions are inert documents; copying them does not grant observe.
+  Facet leave retracts assertions published in that facet and drops its
+  observations including undelivered notice mailboxes. Matching asserts
+  enqueue inert `:document` notices on observers; a matching retract
+  enqueues a `:retract` notice on the same mailbox. The observer's next
+  `:observe` (same facet+pattern) drains them. First observe of a
+  facet+pattern also replays already-present matching assertions as
+  `:assert` notices (Syndicate current-set). Guest callbacks / vat / `<-`
+  are not used.
+
+  Persistence is a swappable `{:q :transact!}` store (provider.dataspace-store).
+  Default is the in-memory reference. Hosts may inject provider.dataspace-kgraph
+  (kgraph EAV + incidence indexes) without changing guest ABI. kgraph-assert!
+  the i64 guest host-op is not this kit; incidence CID blocks are not this
+  kit. D1 is not a premise.
+
+  Kit EDN stays in kotoba-lang/amu (`dataspace-v1.edn`). This ns is the host
+  other runtimes inject. It IS a member of the provider-conformance
+  application closed set (`:capability-count` 10)."
+  (:require [clojure.edn :as edn]
+            [provider.dataspace-match :as match]
+            [provider.dataspace-store :as store]
+            [kotoba.kir.value :as value]
+            ))
+
+(def capability-id 24)
+(def max-assertions 256)
+(def max-observers 64)
+(def max-facets 32)
+(def max-edn-bytes 4096)
+
+(def assert-type
+  [:record :kotoba.dataspace/assert [[:assertion :document] [:facet :i64]]])
+(def retract-type
+  [:record :kotoba.dataspace/retract [[:assertion :document] [:facet :i64]]])
+(def observe-type
+  [:record :kotoba.dataspace/observe [[:pattern :document] [:facet :i64]]])
+(def request-type
+  [:variant :kotoba.dataspace/request
+   [[:assert assert-type]
+    [:retract retract-type]
+    [:observe observe-type]
+    [:facet-enter :bool]
+    [:facet-leave :i64]]])
+
+(def asserted-type
+  [:record :kotoba.dataspace/asserted [[:count :i64] [:notices :document]]])
+(def retracted-type
+  [:record :kotoba.dataspace/retracted [[:count :i64]]])
+(def matches-type
+  [:record :kotoba.dataspace/matches
+   [[:bindings :document] [:notices :document]]])
+(def facet-type
+  [:record :kotoba.dataspace/facet [[:id :i64]]])
+(def error-type
+  [:record :kotoba.dataspace/error [[:code :keyword] [:message :string]]])
+(def result-type
+  [:variant :kotoba.dataspace/result
+   [[:asserted asserted-type]
+    [:retracted retracted-type]
+    [:matches matches-type]
+    [:facet facet-type]
+    [:error error-type]]])
+
+(def schemas
+  {:kotoba.dataspace/assert assert-type
+   :kotoba.dataspace/retract retract-type
+   :kotoba.dataspace/observe observe-type
+   :kotoba.dataspace/request request-type
+   :kotoba.dataspace/asserted asserted-type
+   :kotoba.dataspace/retracted retracted-type
+   :kotoba.dataspace/matches matches-type
+   :kotoba.dataspace/facet facet-type
+   :kotoba.dataspace/error error-type
+   :kotoba.dataspace/result result-type})
+
+(defn- ->i64 [n] )
+(defn- i64->long [n] )
+
+(defn- result [tag payload]
+  [result-type tag payload])
+
+(defn- err [code message]
+  (result :error [error-type code message]))
+
+(defn- decode-document
+  "Admit only a tagged document node. Convert to a Clojure value for the
+  in-memory matcher. Documents cannot represent tagged literals, so #cap
+  cannot arrive as a document; a raw string is not a document."
+  [node]
+  (try
+    (let [doc (value/bounded-document! node)
+          text (value/document-edn-print doc)]
+      (value/bounded-string! text max-edn-bytes)
+      (edn/read-string {:readers {} :eof ::eof} text))
+    (catch  e
+      (throw e))
+    (catch  e
+      (throw (ex-info "dataspace document is invalid"
+                      {:phase :dataspace-provider
+                       :message (ex-message e)})))))
+
+(defn- encode-edn [form]
+  (value/document-edn-read
+   (binding [*print-namespace-maps* false]
+     (pr-str form))))
+
+(defn- encode-bindings [bindings]
+  (encode-edn (mapv #(into {} %) bindings)))
+
+(defn- encode-notices [notices]
+  (encode-edn (mapv (fn [n]
+                      {:kind (or (:kind n) :assert)
+                       :assertion (:assertion n)
+                       :bindings (into {} (:bindings n))})
+                    notices)))
+
+(defn- facet-id-or-root [facet-id]
+  (if (nil? facet-id) 0 (i64->long facet-id)))
+
+(defn- live-facet? [q facet-id]
+  (or (zero? facet-id) (q {:op :facet-live? :id facet-id})))
+
+(defn provider
+  "Creates one isolated dataspace. No ambient process dataspace.
+
+  Optional `:store` is a `{:q :transact!}` map (see provider.dataspace-store).
+  Default is the in-memory reference host."
+  ([] (provider {}))
+  ([{:keys [store]}]
+   (let [store (or store (store/memory-store))]
+     (when-not (store/store? store)
+       (throw (ex-info "dataspace store requires :q and :transact!"
+                       {:phase :dataspace-provider})))
+     (let [q (:q store)
+           tx! (:transact! store)]
+       {:request-type request-type
+        :result-type result-type
+        :invoke
+        (fn [request]
+          (when-not (and (vector? request) (= request-type (first request)))
+            (throw (ex-info "dataspace request contract mismatch"
+                            {:phase :dataspace-provider})))
+          (let [operation (second request)
+                payload (nth request 2 nil)]
+            (case operation
+              :assert
+              (let [[_ assertion-doc raw-facet] payload
+                    assertion (try (decode-document assertion-doc)
+                                   (catch  _
+                                     ::invalid))
+                    facet-id (facet-id-or-root raw-facet)
+                    counts (q {:op :counts})]
+                (cond
+                  (or (= assertion ::invalid) (= assertion ::eof))
+                  (err :dataspace/document-invalid "assertion is not a document")
+
+                  (not (live-facet? q facet-id))
+                  (err :dataspace/unknown-facet "facet handle is not live")
+
+                  (>= (:assertions counts) max-assertions)
+                  (err :dataspace/capacity "assertion limit reached")
+
+                  :else
+                  (let [{:keys [notices]} (tx! {:op :assert
+                                                :value assertion
+                                                :facet facet-id})]
+                    (result :asserted
+                            [asserted-type (->i64 1)
+                             (encode-bindings (or notices []))]))))
+
+              :retract
+              (let [[_ assertion-doc raw-facet] payload
+                    assertion (try (decode-document assertion-doc)
+                                   (catch  _
+                                     ::invalid))
+                    facet-id (facet-id-or-root raw-facet)]
+                (cond
+                  (or (= assertion ::invalid) (= assertion ::eof))
+                  (err :dataspace/document-invalid "assertion is not a document")
+
+                  (not (live-facet? q facet-id))
+                  (err :dataspace/unknown-facet "facet handle is not live")
+
+                  :else
+                  (let [{:keys [removed]} (tx! {:op :retract
+                                                :value assertion
+                                                :facet facet-id})]
+                    (result :retracted [retracted-type (->i64 removed)]))))
+
+              :observe
+              (let [[_ pattern-doc raw-facet] payload
+                    pattern (try (decode-document pattern-doc)
+                                 (catch  _
+                                   ::invalid))
+                    facet-id (facet-id-or-root raw-facet)
+                    counts (q {:op :counts})]
+                (cond
+                  (or (= pattern ::invalid) (= pattern ::eof))
+                  (err :dataspace/document-invalid "pattern is not a document")
+
+                  (not (live-facet? q facet-id))
+                  (err :dataspace/unknown-facet "facet handle is not live")
+
+                  (and (not (some (fn [observer]
+                                    (and (= facet-id (:facet observer))
+                                         (= pattern (:pattern observer))))
+                                  (q {:op :observers})))
+                       (>= (:observers counts) max-observers))
+                  (err :dataspace/capacity "observer limit reached")
+
+                  :else
+                  (let [{:keys [notices]} (tx! {:op :observe
+                                                :pattern pattern
+                                                :facet facet-id})
+                        bindings (into []
+                                       (keep #(match/match pattern (:value %)))
+                                       (q {:op :assertions}))]
+                    (result :matches [matches-type
+                                      (encode-bindings bindings)
+                                      (encode-notices (or notices []))]))))
+
+              :facet-enter
+              (let [counts (q {:op :counts})]
+                (if (>= (:facets counts) max-facets)
+                  (err :dataspace/capacity "facet limit reached")
+                  (let [{:keys [id]} (tx! {:op :facet-enter})]
+                    (result :facet [facet-type (->i64 id)]))))
+
+              :facet-leave
+              (let [facet-id (i64->long payload)]
+                (if-not (q {:op :facet-live? :id facet-id})
+                  (err :dataspace/unknown-facet "facet handle is not live")
+                  (let [{:keys [removed]} (tx! {:op :facet-leave :id facet-id})]
+                    (result :retracted [retracted-type (->i64 removed)]))))
+
+              (err :dataspace/unknown-op "unknown dataspace operation"))))}))))

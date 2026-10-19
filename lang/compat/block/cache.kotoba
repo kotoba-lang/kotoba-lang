@@ -1,0 +1,276 @@
+(ns block.cache
+  "A CID-keyed block cache, and the one property that makes it safe: **there
+  is no invalidation, by construction.**
+
+  A content-addressed block cannot change under its key. So a cache keyed by
+  CID never goes stale, never needs a TTL, and can be shared between readers,
+  requests and nodes without a coherence protocol. Every other cache in a
+  database exists in tension with writes; this one does not. That is worth
+  saying plainly, because it is the reason this library is 200 lines instead
+  of a distributed-invalidation problem.
+
+  It exists because kotobase does not have one. Measured 2026-08-01 on a
+  recursive Datalog query (`reaches` over a chain, `arrangement` cursor
+  source over a block store): the fixpoint issued 22 scans of the SAME
+  pattern, and block reads grew with the chain — 23 / 43 / 83 at k = 20 / 40
+  / 80. With the repeats served from cache the same query reads **2 blocks,
+  flat**. The saving grows with the data, which is the shape of a missing
+  cache rather than a slow one.
+
+  RisingWave's Hummock reaches its speed the same way — its own docs put the
+  hybrid block/metadata cache first among the reasons — but it has to
+  synthesize a cache key. kotobase's blocks ARE their keys, so a hit here is
+  content-verified for free, globally unique, and safe to share across
+  colos. That is the one axis on which a content-addressed store is
+  structurally better placed than an S3-backed one.
+
+  Composable on purpose: `wrap-get-fn` turns any `(fn [cid] bytes)` into a
+  cached one, so `arrangement`, `prolly-tree`, `chain` and `kotobase-peer`
+  all benefit without changing a line. `tiered` stacks a fast small cache in
+  front of a slow large one (memory in front of a Worker's Cache API, say),
+  and a tier is itself a cache, so they nest."
+  )
+
+(defprotocol IBlockCache
+  "`-lookup` returns the bytes or nil. `-store!` is best-effort: a cache that
+  refuses a block (too large, full, unavailable) must return normally, never
+  throw. A caching layer that can fail a read it was only meant to accelerate
+  is worse than no caching layer."
+  (-lookup [this cid])
+  (-store! [this cid bytes])
+  (-stats [this]))
+
+(defn lookup [cache cid] (-lookup cache cid))
+(defn store! [cache cid bytes] (-store! cache cid bytes) nil)
+(defn stats
+  "`{:hits :misses :stores :evictions :bytes :entries}`. Reported because the
+  number that decides whether any of this helps is the MISS RATE, not the
+  hit count — a cache with 10^6 hits and a 40% miss rate is still the thing
+  making the system slow."
+  [cache]
+  (-stats cache))
+
+(defn hit-rate
+  "Hits / (hits + misses), or nil before any lookup."
+  [cache]
+  (let [{:keys [hits misses]} (stats cache)
+        total (+ (or hits 0) (or misses 0))]
+    (when (pos? total) (double (/ hits total)))))
+
+(defn default-byte-count
+  "Size of a block, portably. Overridable because a host may hand us
+  something this does not know how to measure, and guessing a size is how a
+  byte-bounded cache silently stops being bounded."
+  [bytes]
+  )
+
+;; ── memory tier: bounded by BYTES, not entries ───────────────────────
+;; Entry counts are the wrong bound here. kotobase's blocks are sized by a
+;; controller (`kotobase-peer.block-sizing`) and range over roughly 16-128 KB,
+;; so "1000 entries" is anywhere from 16 MB to 128 MB — and on a Worker with
+;; 128 MB total that difference is the difference between working and being
+;; killed.
+
+(defrecord ^:no-doc MemoryCache [state max-bytes byte-count]
+  IBlockCache
+  (-lookup [_ cid]
+    (let [s @state]
+      (if-let [e (get (:m s) cid)]
+        (do (swap! state (fn [s] (-> s (update :hits inc) (update :tick inc)
+                                     (assoc-in [:m cid :n] (:tick s)))))
+            (:bytes e))
+        (do (swap! state update :misses inc) nil))))
+  (-store! [_ cid bytes]
+    (let [n (byte-count bytes)]
+      ;; a single block larger than the whole budget is not cached, rather
+      ;; than evicting everything to hold one thing that will not be reused.
+      (when (<= n max-bytes)
+        (swap! state
+               (fn [s]
+                 (let [s (if (contains? (:m s) cid)
+                           s
+                           (-> s
+                               (assoc-in [:m cid] {:bytes bytes :n (:tick s) :size n})
+                               (update :size + n)
+                               (update :stores inc)))
+                       s (update s :tick inc)]
+                   (if (<= (:size s) max-bytes)
+                     s
+                     ;; evict down to 80% in one pass rather than one block per
+                     ;; store: amortized, so a burst of large blocks does not
+                     ;; pay an eviction scan per block.
+                     (let [target (long (* 0.8 max-bytes))
+                           ordered (sort-by (comp :n val) (:m s))]
+                       (loop [s s [[k e] & more] ordered]
+                         (if (or (nil? k) (<= (:size s) target))
+                           s
+                           (recur (-> s (update :m dissoc k)
+                                      (update :size - (:size e))
+                                      (update :evictions inc))
+                                  more))))))))))
+    nil)
+  (-stats [_]
+    (let [s @state]
+      {:hits (:hits s) :misses (:misses s) :stores (:stores s)
+       :evictions (:evictions s) :bytes (:size s) :entries (count (:m s))})))
+
+(defn memory
+  "An in-process cache bounded by total bytes.
+
+  Eviction is least-recently-used, approximated by an access counter and
+  applied in batches down to 80% of the budget. Exact LRU with a linked list
+  would cost a mutable structure on both platforms for a policy whose whole
+  job is to be roughly right."
+  ([max-bytes] (memory max-bytes {}))
+  ([max-bytes {:keys [byte-count] :or {byte-count default-byte-count}}]
+   (->MemoryCache (atom {:m {} :size 0 :tick 0
+                         :hits 0 :misses 0 :stores 0 :evictions 0})
+                  max-bytes byte-count)))
+
+;; ── tiers ────────────────────────────────────────────────────────────
+
+(defrecord ^:no-doc TieredCache [tiers]
+  IBlockCache
+  (-lookup [_ cid]
+    ;; on a hit in a slower tier, fill the faster ones — otherwise the fast
+    ;; tier never learns what is hot and the tiering does nothing.
+    (loop [[t & more] tiers seen []]
+      (when t
+        (if-let [b (-lookup t cid)]
+          (do (doseq [f seen] (-store! f cid b)) b)
+          (recur more (conj seen t))))))
+  (-store! [_ cid bytes] (doseq [t tiers] (-store! t cid bytes)) nil)
+  (-stats [_] {:tiers (mapv -stats tiers)}))
+
+(defn tiered
+  "Check caches in order, fastest first, and promote on a hit from a slower
+  tier. A tier is itself a cache, so these nest."
+  [& caches]
+  (->TieredCache (vec caches)))
+
+(defrecord ^:no-doc NullCache []
+  IBlockCache
+  (-lookup [_ _] nil)
+  (-store! [_ _ _] nil)
+  (-stats [_] {:hits 0 :misses 0 :stores 0 :evictions 0 :bytes 0 :entries 0}))
+
+(defn null
+  "A cache that caches nothing. So a caller can be written one way and the
+  caching turned off by configuration, instead of growing an `if`."
+  []
+  (->NullCache))
+
+;; ── the composition point ────────────────────────────────────────────
+
+(defn wrap-get-fn
+  "Turn `(fn [cid] bytes)` into a cached one.
+
+  `:verify!` is called `(verify! cid bytes)` on a MISS ONLY, and must throw if
+  the block does not match its CID. This is the second saving and it is not
+  the small one: kotobase re-hashes every block on every read
+  (`kotobase-peer/verified-node`), so today a hot block is verified thousands
+  of times to prove something that cannot have changed. Verifying once, on
+  entry, is not a weakening — a content-addressed block that hashed correctly
+  when it was stored still hashes correctly, and the cache is in-process
+  memory, not a network peer whose bytes need re-checking.
+
+  Pass no `:verify!` and this is a plain read-through cache.
+
+  A nil from the underlying `get-fn` (missing block) is NOT cached: absence is
+  the one thing about a CID that can change later, when the block arrives."
+  ([cache get-fn] (wrap-get-fn cache get-fn {}))
+  ([cache get-fn {:keys [verify!]}]
+   (fn [cid]
+     (if-let [hit (lookup cache cid)]
+       hit
+       (let [bytes (get-fn cid)]
+         (when (some? bytes)
+           (when verify! (verify! cid bytes))
+           (store! cache cid bytes))
+         bytes)))))
+
+;; ── segmented: a metadata cache without a second get-fn ──────────────
+;; Hummock keeps its metadata cache and its block cache separate, and the
+;; reason is eviction, not bookkeeping: SST metadata is small and hot, data
+;; blocks are large and cold, and one large scan through a shared LRU evicts
+;; every hot metadata entry to hold blocks it will never read again.
+;;
+;; kotobase cannot make that split at the obvious place. `get-fn` is
+;; `(fn [cid] bytes)` and a CID does not say whether it addresses a snapshot
+;; node or a data block, so a caller wrapping one `get-fn` cannot route by
+;; kind. But it does not have to: the two kinds are separated by SIZE.
+;; Snapshot nodes and index roots are small; `kotobase-peer.block-sizing`
+;; deliberately keeps data blocks in the 16-128 KB range. Splitting on bytes
+;; recovers the same protection without asking the caller to know anything.
+
+(defrecord ^:no-doc SegmentedCache [small large threshold byte-count]
+  IBlockCache
+  (-lookup [_ cid] (or (-lookup small cid) (-lookup large cid)))
+  (-store! [_ cid bytes]
+    (if (<= (byte-count bytes) threshold)
+      (-store! small cid bytes)
+      (-store! large cid bytes))
+    nil)
+  (-stats [_] {:small (-stats small) :large (-stats large)}))
+
+(defn segmented
+  "Two byte-bounded segments with INDEPENDENT budgets, split on entry size.
+
+  This is the metadata cache. Entries at or under `:threshold-bytes` (default
+  8 KB — under `kotobase-peer.block-sizing`'s smallest data-block class, so
+  snapshot nodes land here and data blocks do not) get their own budget, and a
+  scan through large blocks cannot evict them.
+
+  Sizing them separately is the point. A shared budget with an LRU is not
+  equivalent: LRU is a recency heuristic, and a single wide scan is exactly
+  the access pattern that defeats it."
+  ([{:keys [small-max-bytes large-max-bytes threshold-bytes byte-count]
+     :or {threshold-bytes 8192 byte-count default-byte-count}}]
+   (->SegmentedCache (memory (or small-max-bytes (* 4 1024 1024)) {:byte-count byte-count})
+                     (memory (or large-max-bytes (* 32 1024 1024)) {:byte-count byte-count})
+                     threshold-bytes byte-count)))
+
+(defn segment-hit-rates
+  "`{:small r :large r}` — reported separately because a healthy metadata
+  segment and a thrashing block segment average out to a number that hides
+  both."
+  [^SegmentedCache c]
+  {:small (hit-rate (.-small c))
+   :large (hit-rate (.-large c))})
+
+;; ── async: the local tier ────────────────────────────────────────────
+;; A Worker's Cache API is the only thing on that platform that plays the role
+;; Hummock gives a local SSD: colo-local, survives the isolate, orders of
+;; magnitude closer than R2. It is also Promise-based, so it cannot sit behind
+;; the synchronous `IBlockCache`. Rather than pretend otherwise with a
+;; blocking shim, async caches are their own protocol and wrap the async
+;; get-fn that kotobase-peer already has (`cold-datoms-async`,
+;; `prolly-tree/scan-prefix-async`).
+
+(defprotocol IAsyncBlockCache
+  (-lookup-async [this cid])
+  (-store-async! [this cid bytes]))
+
+(defn wrap-async-get-fn
+  "Turn `(fn [cid]) -> Promise<bytes>` into a cached one.
+
+  Same two rules as the synchronous wrapper and for the same reasons:
+  `:verify!` runs on a MISS only, and a missing block is not cached because
+  absence is the one thing about a CID that can change later."
+  ([cache async-get-fn] (wrap-async-get-fn cache async-get-fn {}))
+  ([cache async-get-fn {:keys [verify!]}]
+   (fn [cid]
+     (-> (-lookup-async cache cid)
+         (.then (fn [hit]
+                  (if (some? hit)
+                    hit
+                    (-> (async-get-fn cid)
+                        (.then (fn [bytes]
+                                 (when (some? bytes)
+                                   (when verify! (verify! cid bytes))
+                                   (-store-async! cache cid bytes))
+                                 bytes)))))))))) 
+
+
+
+

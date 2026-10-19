@@ -1,0 +1,227 @@
+(ns drpc.wire
+  "DRPC's wire format — frames, and the reader that reassembles them into
+  packets.
+
+  DRPC is Storj's replacement for gRPC: the same request/response and
+  streaming shapes, without HTTP/2. That makes the framing small enough to
+  state completely:
+
+      control byte | stream id | message id | length | data
+                     <-------- varints -------->
+
+  and the control byte packs three things:
+
+      bit 0        done      — last frame of this packet
+      bits 1-6     kind      — invoke, message, error, cancel, close, …
+      bit 7        control   — forwards compatibility; unknown control
+                               packets are ignored rather than fatal
+
+  This namespace is data in, data out: no sockets, no TLS, no service
+  dispatch. A host owns the connection and feeds bytes to `feed`.
+
+  ## What the reader is actually enforcing
+
+  `feed` is a state machine and most of it is refusal. Frame IDs must increase
+  monotonically; a frame whose ID goes backwards is a protocol error rather
+  than something to sort out. A new ID abandons whatever packet was in
+  progress — that is deliberate in DRPC, and it is how an asynchronous
+  interrupt is expressed. Frames of one packet must agree on their kind. And
+  the accumulated payload is bounded, because otherwise a peer can ask for
+  memory simply by never setting `done`.
+
+  Transcribed from `storj.io/drpc/drpcwire` (`packet.go`, `reader.go`,
+  `split.go`); the reference vectors in the tests are that package's own
+  output.
+
+  ## Incomplete is not malformed
+
+  A frame that declares more data than has arrived is **not** an error. The
+  reference reader treats `not enough bytes yet` and `length exceeds what I
+  hold` identically: keep the bytes, read more. Only a varint longer than ten
+  bytes is malformed. Conflating the two would tear down a healthy connection
+  every time a frame straddled a TCP segment boundary."
+  (:require [proto.wire :as pw]))
+
+;; Varints here are the same LEB128 protobuf uses, so they come from
+;; `proto.wire` rather than being written again — the third copy of a varint
+;; reader is how the encodings quietly diverge.
+
+(def kinds
+  "Frame kinds. 0 is reserved for a future extension and never appears."
+  {1 :invoke           ; body is the name of the rpc
+   2 :message          ; body is an encoded message
+   3 :error            ; body is an error with a code
+   4 :cancel           ; the remote soft-cancelled
+   5 :close            ; the rpc is dead; no body
+   6 :close-send       ; no more messages will be sent; body must be empty
+   7 :invoke-metadata})
+
+(def kind-codes (into {} (map (fn [[k v]] [v k])) kinds))
+
+(def default-frame-size
+  "How much payload `split` puts in one frame when not told otherwise —
+  `SplitData`'s default."
+  (* 64 1024))
+
+(def default-max-buffer-size
+  "How much packet payload the reader will accumulate before refusing.
+  `ReaderOptions.MaximumBufferSize`'s default."
+  (* 4 1024 1024))
+
+(defn- fail [msg data]
+  (throw (ex-info (str "drpc.wire: " msg) data)))
+
+;; ── frames ───────────────────────────────────────────────────────────────────
+
+(defn- control-byte [{:keys [kind done? control?]}]
+  (let [code (or (kind-codes kind) (fail "unknown frame kind" {:kind kind}))]
+    (cond-> (bit-shift-left code 1)
+      done?    (bit-or 2r00000001)
+      control? (bit-or 2r10000000))))
+
+(defn encode-frame
+  "A frame map → bytes.
+
+      {:kind :message :stream 1 :message 1 :done? true :data [42]}"
+  [{:keys [stream message data] :as frame}]
+  (let [data (vec data)]
+    (-> [(control-byte frame)]
+        (into (pw/write-varint stream))
+        (into (pw/write-varint message))
+        (into (pw/write-varint (count data)))
+        (into data))))
+
+(defn parse-frame
+  "Parse one frame from `bs` at `offset`.
+
+  Returns `{:frame f :end n}`, or nil when the bytes for a whole frame have
+  not arrived yet. Throws only on a genuinely malformed varint — see the
+  namespace docstring on why `incomplete` and `malformed` must stay distinct."
+  ([bs] (parse-frame bs 0))
+  ([bs offset]
+   (let [v (vec bs)
+         n (count v)]
+     ;; the reference reader's own floor: a frame is at least a control byte
+     ;; and three one-byte varints
+     (when (>= (- n offset) 4)
+       (let [control (bit-and (nth v offset) 0xff)
+             code    (bit-shift-right (bit-and control 2r01111110) 1)
+             read    (fn [pos]
+                       ;; a truncated varint reads as "not yet", not as an error
+                       (try (pw/read-varint v pos)
+                            (catch  e
+                              (when (re-find #"longer than 10 bytes" (or (ex-message e) ""))
+                                (fail "varint too long" {:offset pos}))
+                              nil)))]
+         (when-let [{stream :value sl :length} (read (inc offset))]
+           (when-let [{message :value ml :length} (read (+ (inc offset) sl))]
+             (when-let [{length :value ll :length} (read (+ (inc offset) sl ml))]
+               (let [from (+ (inc offset) sl ml ll)
+                     to   (+ from length)]
+                 ;; not enough payload yet — wait, do not fail
+                 (when (<= to n)
+                   {:frame {:kind     (get kinds code [:unknown code])
+                            :stream   stream
+                            :message  message
+                            :done?    (pos? (bit-and control 2r00000001))
+                            :control? (pos? (bit-and control 2r10000000))
+                            :data     (subvec v from to)}
+                    :end   to}))))))))))
+
+;; ── splitting a packet into frames ───────────────────────────────────────────
+
+(defn split
+  "Split a packet into frames of at most `n` payload bytes each.
+
+  `n` of 0 means the default; a negative `n` means do not split. Only the last
+  frame carries `:done?`, which is what tells the far side the packet is
+  complete."
+  ([packet] (split packet default-frame-size))
+  ([{:keys [kind stream message data control?]} n]
+   (let [n    (cond (zero? n) default-frame-size
+                    (neg? n)  0
+                    :else     n)
+         data (vec data)]
+     (loop [rest data, out []]
+       (let [[chunk remaining] (if (and (pos? n) (> (count rest) n))
+                                 [(subvec rest 0 n) (subvec rest n)]
+                                 [rest []])
+             done? (empty? remaining)
+             frame {:kind kind :stream stream :message message
+                    :done? done? :control? (boolean control?) :data chunk}]
+         (if done?
+           (conj out frame)
+           (recur remaining (conj out frame))))))))
+
+;; ── the reader ───────────────────────────────────────────────────────────────
+
+(defn- id< [a b]
+  (or (< (:stream a) (:stream b))
+      (and (= (:stream a) (:stream b)) (< (:message a) (:message b)))))
+
+(defn reader
+  "A reader's initial state.
+
+  It starts expecting id (stream 1, message 1) — the first id DRPC issues —
+  so a peer cannot open with id 0 and then walk ids backwards."
+  ([] (reader {}))
+  ([{:keys [max-buffer-size] :or {max-buffer-size default-max-buffer-size}}]
+   {:max-buffer-size max-buffer-size
+    :id              {:stream 1 :message 1}
+    :buffer          []
+    :packet          nil}))
+
+(defn- accept-frame
+  "Fold one frame into the reader state. Returns `[state packet-or-nil]`."
+  [{:keys [id packet max-buffer-size] :as state} frame]
+  (let [fid {:stream (:stream frame) :message (:message frame)}]
+    (when (id< fid id)
+      (fail "id monotonicity violation" {:frame fid :expected-at-least id}))
+    (let [new-packet? (or (nil? packet) (not= id fid))
+          packet (if new-packet?
+                   {:kind     (:kind frame)
+                    :stream   (:stream frame)
+                    :message  (:message frame)
+                    :control? (:control? frame)
+                    :data     []}
+                   ;; a continuation frame can only raise the control flag,
+                   ;; never lower it: if any frame is control, the packet is
+                   (update packet :control? #(or % (:control? frame))))]
+      (when (and (not new-packet?) (not= (:kind frame) (:kind packet)))
+        (fail "packet kind change mid-packet"
+              {:frame (:kind frame) :packet (:kind packet)}))
+      (let [packet (update packet :data into (:data frame))
+            state  (assoc state :id fid)]
+        (when (> (count (:data packet)) max-buffer-size)
+          (fail "packet payload overflow"
+                {:size (count (:data packet)) :limit max-buffer-size}))
+        (if (:done? frame)
+          ;; the message id advances so a peer cannot resend under the same id
+          [(assoc state :packet nil :id (update fid :message inc)) packet]
+          [(assoc state :packet packet) nil])))))
+
+(defn feed
+  "Feed received bytes to a reader.
+
+  Returns `{:state s :packets [...]}`. Bytes that do not yet complete a frame
+  are kept in the state, so a caller can hand over whatever a socket read
+  produced without aligning anything."
+  [state bs]
+  (let [buffer (into (:buffer state) (map #(bit-and (int %) 0xff)) (seq bs))]
+    (when (> (count buffer) (+ (:max-buffer-size state) 28))
+      ;; 28 = the reference reader's maxFrameOverhead (1 control byte + three
+      ;; nine-byte varints). Without this a peer can hold memory open with a
+      ;; frame header it never finishes.
+      (fail "buffered data overflow"
+            {:buffered (count buffer) :limit (:max-buffer-size state)}))
+    (loop [state (assoc state :buffer buffer), packets []]
+      (if-let [{:keys [frame end]} (parse-frame (:buffer state))]
+        (let [[state packet] (accept-frame (assoc state :buffer (subvec (:buffer state) end))
+                                           frame)]
+          (recur state (cond-> packets packet (conj packet))))
+        {:state state :packets packets}))))
+
+(defn encode-packet
+  "A packet → the bytes of the frames it splits into."
+  ([packet] (encode-packet packet default-frame-size))
+  ([packet n] (vec (mapcat encode-frame (split packet n)))))

@@ -1,0 +1,209 @@
+(ns sd-jwt-vc.core
+  "SD-JWT-based Verifiable Digital Credentials — [draft-ietf-oauth-sd-jwt-vc](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-sd-jwt-vc).
+
+   Composition, not new cryptography: `sd-jwt.core` provides the salted-hash
+   mechanism, `jws.core` provides the signature envelope, and this adds the rules
+   that make the pair a credential — a type, a set of claims that must never be
+   optional, and a holder proof bound to one presentation.
+
+   ## Seven claims that cannot be selectively disclosed
+
+   `iss`, `nbf`, `exp`, `cnf`, `vct`, `vct#integrity`, `status` MUST NOT appear in
+   Disclosures. The reason is that each one is load-bearing for the Verifier's own
+   decision: a credential whose expiry, issuer, type or revocation pointer could be
+   withheld is one the Holder gets to choose the meaning of. `issue` refuses to
+   conceal them rather than trusting a caller to remember.
+
+   ## sd_hash covers the presentation, including the trailing tilde
+
+   RFC 9901 §4.3.1: the digest is over \"the US-ASCII bytes of the encoded SD-JWT,
+   i.e., the Issuer-signed JWT, a tilde character, and zero or more Disclosures
+   selected for presentation, each followed by a tilde character\" — and NOT the
+   KB-JWT itself.
+
+   So the hashed string ends with `~`, and omitting it produces a `sd_hash` that
+   fails against every other implementation. It is also what binds the proof to
+   *this* set of disclosures: a Holder who drops one Disclosure and reuses the
+   KB-JWT changes the hashed bytes, which is the whole point.
+
+   ## typ
+
+   `dc+sd-jwt` for the Issuer-signed JWT, `kb+jwt` for the Key Binding JWT. The
+   older `vc+sd-jwt` is accepted on verification during the transition the draft
+   allows, and never produced."
+  (:require [clojure.string :as str]
+            [jws.core :as jws]
+            [multiformats.core :as mf]
+            [sd-jwt.core :as sd]))
+
+(def sd-jwt-vc-typ "dc+sd-jwt")
+(def legacy-typ "vc+sd-jwt")
+(def kb-jwt-typ "kb+jwt")
+
+(def protected-claims
+  "Claims that MUST NOT be selectively disclosable. Each is load-bearing for the
+   Verifier's own decision, so a Holder able to withhold one would be choosing
+   what the credential means."
+  #{"iss" "nbf" "exp" "cnf" "vct" "vct#integrity" "status"})
+
+(defn- fail! [code msg data]
+  (throw (ex-info msg (assoc data :sd-jwt-vc/error code))))
+
+(defn- utf8-bytes [s]
+  )
+
+;; ── §4.3.1 sd_hash ───────────────────────────────────────────────────────────
+
+(defn sd-hash
+  "The `sd_hash` for a presentation prefix.
+
+   `presentation-prefix` is `<JWT>~<D.1>~…~<D.N>~` — trailing tilde INCLUDED, and
+   the KB-JWT excluded. Both halves of that sentence are load-bearing."
+  [presentation-prefix]
+  (when-not (str/ends-with? (str presentation-prefix) sd/separator)
+    (fail! :sd-jwt-vc/prefix-missing-trailing-separator
+           (str "the sd_hash input ends with `" sd/separator "`; without it the "
+                "digest fails against every other implementation")
+           {}))
+  (mf/base64url (mf/sha256 (utf8-bytes presentation-prefix))))
+
+(defn presentation-prefix
+  "`<JWT>~<D.1>~…~<D.N>~` — what `sd_hash` is computed over."
+  [issuer-jwt disclosures]
+  (sd/present issuer-jwt disclosures))
+
+;; ── issue ────────────────────────────────────────────────────────────────────
+
+(defn issue
+  "Produce an Issuer-signed SD-JWT VC.
+
+   `claims` is the full payload. `disclosable` is a seq of paths to conceal; any
+   path naming a protected claim is refused.
+
+   Options: `:sign` `:json-encode` `:salt-fn` (and `:shuffle-fn` `:decoys`), plus
+   `:alg` for the JWS header."
+  [claims disclosable {:keys [alg json-encode] :as options}]
+  (when (str/blank? (str (get claims "vct")))
+    (fail! :sd-jwt-vc/missing-vct
+           "`vct` is REQUIRED and must be a collision-resistant name" {}))
+  (when (str/blank? (str (get claims "iss")))
+    (fail! :sd-jwt-vc/missing-iss "`iss` is REQUIRED" {}))
+  (when (str/blank? (str alg))
+    (fail! :sd-jwt-vc/missing-alg ":alg is required for the JWS header" {}))
+  (doseq [path disclosable]
+    (when (contains? protected-claims (last path))
+      (fail! :sd-jwt-vc/protected-claim
+             (str "`" (last path) "` MUST NOT be selectively disclosable: a Holder "
+                  "able to withhold it would be choosing what the credential means")
+             {:claim (last path)})))
+  (let [{:keys [payload disclosures]} (sd/conceal claims disclosable options)
+        jwt (jws/sign {"alg" alg "typ" sd-jwt-vc-typ}
+                      (json-encode payload)
+                      options)]
+    {:issuer-jwt jwt
+     :disclosures disclosures
+     ;; The Issuer hands over everything; the Holder chooses later what to forward.
+     :presentation (sd/present jwt disclosures)}))
+
+;; ── verify ───────────────────────────────────────────────────────────────────
+
+(defn verify
+  "Verify an SD-JWT VC presentation and return its disclosed claims.
+
+   Required options:
+     :expected-alg  passed through to `jws/verify` — the verifier states the
+                    algorithm rather than reading it from the token
+     :verify        `(fn [signing-input sig] -> boolean)` for the ISSUER's key
+     :json-encode :json-decode
+
+   Key Binding (all three required together, or none):
+     :require-key-binding?  when true, a KB-JWT MUST be present and valid
+     :expected-audience     the `aud` this Verifier accepts
+     :expected-nonce        the nonce this Verifier issued
+     :verify-holder         `(fn [signing-input sig] -> boolean)` for the HOLDER's
+                            key, which the caller resolves from `cnf`
+
+   Returns `{:valid? true :claims … :header …}` or `{:valid? false :reason kw}`."
+  [presentation {:keys [expected-alg json-decode
+                        require-key-binding? expected-audience expected-nonce
+                        verify-holder]
+                 :as options}]
+  (let [{:keys [jwt disclosures kb-jwt]} (sd/parse-presentation presentation)
+        jws-result (jws/verify jwt (assoc options :expected-alg expected-alg))]
+    (cond
+      (not (:valid? jws-result))
+      {:valid? false :reason (:reason jws-result) :stage :issuer-jwt}
+
+      (not (contains? #{sd-jwt-vc-typ legacy-typ} (get (:header jws-result) "typ")))
+      ;; Explicit typing (RFC 8725): without it a token minted for some other
+      ;; purpose under the same key could be presented as a credential.
+      {:valid? false :reason :sd-jwt-vc/bad-typ
+       :typ (get (:header jws-result) "typ")}
+
+      :else
+      (let [payload (json-decode (:payload jws-result))]
+        (cond
+          (str/blank? (str (get payload "vct")))
+          {:valid? false :reason :sd-jwt-vc/missing-vct}
+
+          (and require-key-binding? (str/blank? (str kb-jwt)))
+          {:valid? false :reason :sd-jwt-vc/key-binding-required}
+
+          (and require-key-binding? (nil? (get payload "cnf")))
+          ;; §3.2.2: cnf is REQUIRED once Key Binding is supported. Without it
+          ;; there is no key to check the KB-JWT against, and accepting the
+          ;; KB-JWT's own key would let the Holder nominate themselves.
+          {:valid? false :reason :sd-jwt-vc/missing-cnf}
+
+          :else
+          (let [claims (sd/disclose payload disclosures options)]
+            (if-not require-key-binding?
+              {:valid? true :claims claims :header (:header jws-result)}
+              (let [kb (jws/verify kb-jwt (assoc options
+                                                 :expected-alg expected-alg
+                                                 :verify verify-holder))]
+                (cond
+                  (not (:valid? kb))
+                  {:valid? false :reason (:reason kb) :stage :kb-jwt}
+
+                  (not= kb-jwt-typ (get (:header kb) "typ"))
+                  {:valid? false :reason :sd-jwt-vc/bad-kb-typ
+                   :typ (get (:header kb) "typ")}
+
+                  :else
+                  (let [kb-claims (json-decode (:payload kb))
+                        expected-hash (sd-hash (presentation-prefix jwt disclosures))]
+                    (cond
+                      (not= expected-audience (get kb-claims "aud"))
+                      {:valid? false :reason :sd-jwt-vc/bad-audience
+                       :aud (get kb-claims "aud")}
+
+                      (not= expected-nonce (get kb-claims "nonce"))
+                      {:valid? false :reason :sd-jwt-vc/bad-nonce}
+
+                      (nil? (get kb-claims "iat"))
+                      {:valid? false :reason :sd-jwt-vc/missing-iat}
+
+                      (not= expected-hash (get kb-claims "sd_hash"))
+                      ;; This is what binds the proof to THIS set of disclosures.
+                      ;; A Holder who drops one and reuses the KB-JWT changes the
+                      ;; hashed bytes, which is the point.
+                      {:valid? false :reason :sd-jwt-vc/bad-sd-hash}
+
+                      :else
+                      {:valid? true :claims claims :header (:header jws-result)
+                       :key-binding {:audience (get kb-claims "aud")
+                                     :nonce (get kb-claims "nonce")
+                                     :iat (get kb-claims "iat")}})))))))))))
+
+(defn key-binding-jwt
+  "Build a KB-JWT for a presentation. The Holder's side, provided so a test — and a
+   wallet — can produce one correctly."
+  [issuer-jwt disclosures {:keys [alg audience nonce iat json-encode] :as options}]
+  (when (str/blank? (str audience)) (fail! :sd-jwt-vc/missing-audience "`aud` is REQUIRED" {}))
+  (when (str/blank? (str nonce)) (fail! :sd-jwt-vc/missing-nonce "`nonce` is REQUIRED" {}))
+  (when (nil? iat) (fail! :sd-jwt-vc/missing-iat "`iat` is REQUIRED" {}))
+  (jws/sign {"alg" alg "typ" kb-jwt-typ}
+            (json-encode {"aud" audience "nonce" nonce "iat" iat
+                          "sd_hash" (sd-hash (presentation-prefix issuer-jwt disclosures))})
+            options))

@@ -1,0 +1,291 @@
+(ns kotoba.phone.lifecycle
+  "MSISDN lifecycle as a pure state machine.
+
+  This namespace exists so that the question -- is this number operation even
+  reachable from the state we have on record? -- is answered by a total,
+  deterministic function with no I/O, no model and no policy. It is the intended
+  callee of a consent surface's pre-check (ADR-2607300300 D2), exactly as
+  kotoba.esim.lifecycle is for profiles and kotoba.card.lifecycle is for cards,
+  and it is deliberately the same shape as both so a reader who knows one knows
+  all three.
+
+  What this namespace decides: structural reachability, the one-active-MSISDN-
+  per-profile invariant, terminality, and the recycling path. What it
+  deliberately does NOT decide: whether an operator holds the numbering block,
+  whether a port-out is fraudulent, whether a jurisdiction permits an
+  assignment. Those need judgement or law and belong to the actor's Governor.
+
+  ## Recycling is enforced by the SHAPE of the graph, not by a check
+
+  A released number carries the previous subject's account-recovery reach: SMS
+  one-time codes, 'forgot password' callbacks, and the second factor for
+  everything they signed up to. Re-allocating it early hands all of that to
+  whoever gets it next, and that is the single worst thing a numbering plane can
+  do quietly.
+
+  So `:assign` is NOT reachable from `:released`. The only path back is
+  `:release -> :quarantine -> :recycle -> :reserve -> :assign`, and `:recycle`
+  refuses unless the caller states, as a fact, that the aging window has
+  elapsed. A caller who wants to skip the wait cannot express it: there is no
+  transition that would let them, and an absent fact refuses rather than
+  passing. The window's LENGTH is policy and lives in kotoba.phone.numbering;
+  what lives here is that it cannot be routed around.
+
+  Portable (.cljc) across JVM / ClojureScript / SCI / GraalVM."
+  (:require [clojure.string :as str]))
+
+(def states
+  "MSISDN states from the numbering operator's point of view.
+
+  `:foreign` is this library's modeling of a number that exists in the world but
+  not on this operator's plane -- it is what makes port-in expressible as a
+  transition rather than a special case, the same convenience
+  kotoba.esim.lifecycle's `:absent` is for a profile not yet installed.
+
+  `:released` and `:quarantined` are two states rather than one because they
+  answer different questions: `:released` means the subject is gone,
+  `:quarantined` means the number is aging and MAY NOT be re-allocated yet. One
+  state could not say both, and collapsing them is how an operator ends up
+  re-issuing a number the week its previous owner stopped paying."
+  #{:foreign :unallocated :reserved :assigned :active :suspended
+    :porting-out :released :quarantined :ported-out})
+
+(def terminal-states
+  "States no operation leads out of. A completed port-out is terminal FOR THIS
+  OPERATOR: the number continues to exist, on the recipient's plane, and nothing
+  this operator records about it afterwards is authoritative."
+  #{:ported-out})
+
+(def operations
+  "Number operations, each declaring the states it is reachable from and the
+  state it lands in.
+
+  Three rules here are easy to guess wrong:
+
+  - `:activate` is legal only from `:assigned`. Bringing a SUSPENDED line back
+    is `:restore`, a separately named decision, for the same reason
+    kotoba.card.lifecycle refuses to call unblocking an activate: a recovery and
+    a first activation carry different risk and should not share an audit word.
+
+  - `:release` is not reachable from `:porting-out`. A port-out in flight must
+    complete or be cancelled first; releasing underneath it would leave the
+    recipient importing a number this operator has already put back in the pool.
+
+  - `:port-in` lands in `:assigned`, not `:active`. The cutover is its own
+    decision and gets its own record, which is also the point at which the
+    one-active-MSISDN invariant below is tested."
+  {:port-in           {:from #{:foreign}      :to :assigned}
+   :reserve           {:from #{:unallocated}  :to :reserved}
+   :assign            {:from #{:reserved}     :to :assigned}
+   :activate          {:from #{:assigned}     :to :active}
+   :suspend           {:from #{:active}       :to :suspended}
+   :restore           {:from #{:suspended}    :to :active}
+   :release           {:from #{:assigned :active :suspended} :to :released}
+   :quarantine        {:from #{:released}     :to :quarantined}
+   :recycle           {:from #{:quarantined}  :to :unallocated}
+   :port-out-request  {:from #{:active}       :to :porting-out}
+   :port-out-cancel   {:from #{:porting-out}  :to :active}
+   :port-out-complete {:from #{:porting-out}  :to :ported-out}})
+
+(def takeover-signals
+  "Operations that move a line OUT of the current subject's control.
+
+  This is the vocabulary the cross-domain posture reads (ADR-2607300300 D4).
+  Whoever takes over a phone number has taken over the second factor for
+  everything else, so these are the number-plane analogue of an eSIM ownership
+  transfer and must lower the same subject's card posture. It lives in this
+  library rather than in a consent surface so that every consumer reads ONE
+  definition of 'the line changed hands'.
+
+  `:port-out-request` counts, not just completion: the request is the signal.
+  Waiting for a port-out to succeed before restricting spend hands the attacker
+  exactly the window the restriction exists to close."
+  #{:port-out-request :port-out-complete :release})
+
+(def provenance-unsettled-signals
+  "Operations after which the line's history is FRESH, which is a different
+  worry from a takeover and points the other way.
+
+  A number that has just been ported in, assigned, or recycled may be a stolen
+  line, or may still be receiving the previous holder's account-recovery
+  traffic. It should not immediately be treated as a settled second factor. A
+  consumer that only reads `takeover-signals` sees the victim's side and misses
+  the attacker's."
+  #{:port-in :assign :recycle})
+
+(defn terminal?
+  "True when state admits no further operation."
+  [state]
+  (contains? terminal-states state))
+
+(defn reachable?
+  "True when operation is admissible from state. False for any unknown state or
+  operation -- an unrecognized input is never treated as permissive."
+  [state operation]
+  (boolean
+   (when-let [{:keys [from]} (get operations operation)]
+     (and (contains? states state)
+          (contains? from state)))))
+
+(defn next-state
+  "The state operation lands in when applied to state, or nil when the operation
+  is not reachable from it."
+  [state operation]
+  (when (reachable? state operation)
+    (get-in operations [operation :to])))
+
+(defn transition-issues
+  "Return a seq of reasons operation cannot be applied to state, empty when it
+  can. Reasons are data so a governor can cite one rather than re-derive it."
+  [state operation]
+  (cond
+    (not (contains? operations operation))
+    [{:phone/issue :operation/unknown :phone/operation operation}]
+
+    (not (contains? states state))
+    [{:phone/issue :state/unknown :phone/state state}]
+
+    (terminal? state)
+    [{:phone/issue :state/terminal :phone/state state :phone/operation operation}]
+
+    (not (reachable? state operation))
+    [{:phone/issue     :transition/unreachable
+      :phone/state     state
+      :phone/operation operation
+      :phone/from      (get-in operations [operation :from] #{})}]
+
+    :else []))
+
+;; ---------------------------------------------------------------------------
+;; The one-active-MSISDN-per-profile invariant
+;; ---------------------------------------------------------------------------
+
+(defn active-msisdns
+  "The MSISDNs of records currently in `:active` state. records is a collection
+  of number records (see kotoba.phone.numbering/record)."
+  [records]
+  (into #{} (comp (filter #(= :active (:phone/state %)))
+                  (map :phone/msisdn))
+        records))
+
+(defn binding-conflict
+  "Return the MSISDN already active on this record's ICCID, or nil when nothing
+  is.
+
+  A profile carries one subscriber number at a time, so activating a second
+  MSISDN against the same ICCID takes the first line away as a side effect --
+  the same shape as kotoba.esim.lifecycle/enabled-conflict, and surfaced for the
+  same reason: the incumbent's loss should be a decision somebody made, not a
+  consequence they discover.
+
+  A record with no ICCID conflicts with nothing. A number can be held and billed
+  without being bound to a profile, and refusing that would make the pre-check
+  stricter than the world."
+  [records msisdn iccid]
+  (when (some? iccid)
+    (->> records
+         (filter #(and (= :active (:phone/state %))
+                       (= iccid (:phone/iccid %))
+                       (not= msisdn (:phone/msisdn %))))
+         (map :phone/msisdn)
+         first)))
+
+;; ---------------------------------------------------------------------------
+;; Applying an operation
+;; ---------------------------------------------------------------------------
+
+(defn- recycle-issues
+  "Why `:recycle` may not run. The aging window is passed IN as a fact rather
+  than computed here, because this namespace has no clock and must not acquire
+  one: a state machine whose answer depends on when you ask it cannot be
+  re-checked by a governor against the same recorded state.
+
+  An absent fact refuses. `nil` is not 'probably fine' -- it is nobody having
+  established that the window elapsed, and re-allocating on that basis is
+  precisely the failure this transition exists to prevent."
+  [{:phone/keys [quarantine-elapsed?]}]
+  (when-not (true? quarantine-elapsed?)
+    [{:phone/issue :recycle/quarantine-incomplete
+      :phone/detail
+      "quarantine が明けたという事実が示されていません（kotoba.phone.numbering/quarantine-elapsed? の結果を渡すこと）"}]))
+
+(defn- assign-issues
+  "Why `:assign` may not run. A number assigned to nobody is a number whose
+  subsequent operations have no owner to consent for them."
+  [{:phone/keys [subject]}]
+  (when (or (nil? subject) (and (string? subject) (str/blank? subject)))
+    [{:phone/issue :assign/subject-missing}]))
+
+(defn apply-event
+  "Apply operation to the number identified by msisdn within records, returning
+  either
+
+    {:phone/ok? true  :phone/records <updated> :phone/from s :phone/to s'}
+
+  or
+
+    {:phone/ok? false :phone/issues [...]}
+
+  and never throwing.
+
+  `opts` carries the facts this machine refuses to fetch:
+
+    :phone/quarantine-elapsed?  required by :recycle
+    :phone/subject              required by :assign and :port-in
+    :phone/iccid                the profile the number is being bound to
+
+  This is the whole surface a pre-check needs: it is total, it returns data, and
+  its refusals carry a reason."
+  ([records msisdn operation] (apply-event records msisdn operation {}))
+  ([records msisdn operation opts]
+   (let [target (first (filter #(= msisdn (:phone/msisdn %)) records))
+         state  (:phone/state target)
+         iccid  (or (:phone/iccid opts) (:phone/iccid target))
+         issues (cond
+                  (nil? target)
+                  [{:phone/issue :number/not-found :phone/msisdn msisdn}]
+
+                  (seq (transition-issues state operation))
+                  (vec (transition-issues state operation))
+
+                  (= :recycle operation) (recycle-issues opts)
+
+                  (contains? #{:assign :port-in} operation) (assign-issues opts)
+
+                  :else nil)
+         issues (or issues
+                    (when (and (contains? #{:activate :restore} operation)
+                               (binding-conflict records msisdn iccid))
+                      [{:phone/issue     :activate/would-displace
+                        :phone/msisdn    msisdn
+                        :phone/iccid     iccid
+                        :phone/incumbent (binding-conflict records msisdn iccid)}]))]
+     (if (seq issues)
+       {:phone/ok? false :phone/issues (vec issues)}
+       (let [to (next-state state operation)]
+         {:phone/ok?      true
+          :phone/from     state
+          :phone/to       to
+          :phone/records  (mapv (fn [r]
+                                  (if (= msisdn (:phone/msisdn r))
+                                    (cond-> (assoc r :phone/state to)
+                                      (:phone/subject opts) (assoc :phone/subject (:phone/subject opts))
+                                      (some? (:phone/iccid opts)) (assoc :phone/iccid (:phone/iccid opts))
+                                      ;; A recycled number keeps no trace of who
+                                      ;; held it. Carrying the subject forward
+                                      ;; into the pool is how a 'previous owner'
+                                      ;; field ends up on a stranger's line.
+                                      (= :recycle operation) (assoc :phone/subject nil :phone/iccid nil))
+                                    r))
+                                records)})))))
+
+(defn describe
+  "A one-line human-readable rendering of a transition, for an operator log.
+  Pure string building; no formatting library."
+  [state operation]
+  (if-let [to (next-state state operation)]
+    (str (name operation) ": " (name state) " -> " (name to))
+    (str (name operation) ": refused from " (if (keyword? state) (name state) (str state))
+         " (reachable from "
+         (str/join ", " (sort (map name (get-in operations [operation :from] #{}))))
+         ")")))

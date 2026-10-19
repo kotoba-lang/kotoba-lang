@@ -1,0 +1,353 @@
+(ns pay.x402-buyer
+  "What a paying agent decides BEFORE it signs anything.
+
+  Everything else in this library is the seller's half: build a challenge,
+  validate a payload, decide whether to serve. This is the other side, and it
+  is the half where an autonomous agent can do damage, so it is the half that
+  is pure.
+
+  ## Zero keys, zero I/O -- deliberately, and this is where it matters most
+
+  `plan` returns what WOULD be signed and paid. It does not sign, does not
+  fetch, and does not hold a key. The host supplies a signer (in this
+  workspace, `wallet.signer`'s protocol, whose production implementation keeps
+  the seed in a kagi compartment) and performs the retry.
+
+  Keeping the decision here means the question *may this agent spend this
+  money* is answerable by reading a pure function and running it on a table of
+  cases, rather than by reasoning about a network client.
+
+  ## No policy is not permission
+
+  `plan` REFUSES when it is given no spend policy. An agent that has not been
+  told what it may spend has not been authorised to spend anything, and the
+  most dangerous possible default here is the one that treats silence as
+  freedom.
+
+  This is the same shape as the rest of this workspace: a check that could not
+  measure must not return what a check that measured and approved returns.
+
+  ## It never widens what it was given
+
+  Every constraint narrows. `plan` cannot pick a network, asset, payee, scheme
+  or amount outside the policy, and when several offers are acceptable it takes
+  the cheapest with a deterministic tie-break -- never the first that happens to
+  parse, because parse order is not a decision anybody made.
+
+  ## Refusals are distinct on purpose
+
+  A buyer that refuses everything must be able to say which constraint bit.
+  Collapsing `over-cap` into a generic `not-acceptable` is how a spend limit
+  becomes indistinguishable from a typo in an asset address."
+  (:require [clojure.string :as str]
+            [pay.x402 :as x402]))
+
+(def ^:private amount-keys
+  "x402 v1 says `maxAmountRequired`; v2 says `amount`. Both are base units as a
+  string. Reading only one silently refuses every challenge of the other
+  version, which looks exactly like a seller offering nothing."
+  [:amount :maxAmountRequired])
+
+(defn- blank? [s] (or (nil? s) (and (string? s) (str/blank? s))))
+
+(defn- parse-amount
+  "The quoted amount as a non-negative number, or nil.
+
+  nil rather than 0: an unreadable amount is not a free offer, and returning 0
+  would make a malformed challenge the cheapest one on the table.
+
+  DECIMALS ARE READ, because not every rail is denominated in base units. A
+  chain asset quotes an integer by definition — USDC's `10000` is 10000 base
+  units of six-decimal USDC — but a LEDGER rail has no base unit, and
+  kotobase's storage read is priced at `0.1` credits against murakumo's
+  `1`. Measured 2026-08-31 against the live gateway: an integer-only parser
+  answered `:buyer/unreadable-amount` for every fractional credits offer, which
+  is an honest refusal of a perfectly well formed one — the storage rail was
+  unreachable for that reason alone.
+
+  A decimal on a base-unit rail is the seller quoting wrong, and it is not this
+  function's business to correct it: the cap it is compared against is in the
+  same units either way, so reading it changes nothing except that the buyer
+  can say what it saw."
+  [v]
+  (cond
+    (number? v) (when-not (neg? v) v)
+    (string? v) (let [t (str/trim v)]
+                  (when (re-matches #"\d+(\.\d+)?" t)
+                    ))
+    :else nil))
+
+(defn- amount-of [req]
+  (some parse-amount (map #(get req %) amount-keys)))
+
+(defn- allowed?
+  "A policy set that is absent does not constrain; a policy set that is present
+  constrains. Absent is not the same as empty -- an empty allowlist allows
+  nothing, and that must stay expressible."
+  [s v]
+  (or (nil? s) (contains? s v)))
+
+(defn- offers
+  "The `accepts` list of a v1 or v2 challenge."
+  [challenge]
+  (let [a (or (:accepts challenge) (get challenge "accepts"))]
+    (when (sequential? a) (vec a))))
+
+(defn asset-id
+  "The comparable identity of an offer's asset, as a string, or nil.
+
+  An on-chain offer quotes its asset as a contract address string. A credits
+  offer quotes a MAP (`{:symbol \"CREDITS\" :network \"murakumo\" :redeemable
+  false ...}`), because a ledger unit has no address to name.
+
+  Both shapes have to collapse to one before anything compares them. Left as
+  they arrive, a credits offer breaks the buyer twice over: `contains?` on a
+  set of address strings never matches a map, so an allowlist that names
+  CREDITS still refuses it; and sorting a map against a string throws
+  `ClassCastException` on the JVM while comparing arbitrarily under
+  ClojureScript. Measured 2026-08-31 against x402.nexus's own credits
+  requirement shape (`pay.facilitator/credits-requirements`)."
+  [asset]
+  (cond
+    (string? asset) asset
+    (map? asset) (some-> (or (:symbol asset) (get asset "symbol")) str)
+    :else nil))
+
+(defn rail
+  "`[network asset]` — the pair whose amounts are commensurable.
+
+  Two offers may be compared on price only if they are on the same rail. This
+  is the whole reason the pair exists as a value: 10000 base units of USDC is
+  $0.01 and 10000 credits is $100, and both arrive as the string \"10000\" in
+  the same field of the same challenge."
+  [{:keys [network asset]}]
+  [network asset])
+
+(defn- normalize [req]
+  {:scheme (or (:scheme req) (get req "scheme"))
+   :network (or (:network req) (get req "network"))
+   :asset (asset-id (or (:asset req) (get req "asset")))
+   :pay-to (or (:payTo req) (get req "payTo"))
+   :amount (amount-of req)
+   :resource (or (:resource req) (get req "resource"))
+   :raw req})
+
+(defn- cap-for
+  "The cap that applies to this offer's rail.
+
+  `:caps` is keyed by rail and wins when it names one, because a cap is a
+  quantity in a unit and the unit is the rail. `:max-amount` remains the
+  single-number form for a policy facing one rail; it is not per-rail, so a
+  policy that leaves it to cover two rails is capping one of them in the
+  other's units. `plan` refuses to CHOOSE between rails without `:prefer`, so
+  the only way that number is ever applied to a rail is that the operator
+  named that rail first."
+  [offer {:keys [caps max-amount]}]
+  (let [r (rail offer)]
+    (if (and caps (contains? caps r)) (get caps r) max-amount)))
+
+(defn- rejection
+  "Why this one offer cannot be taken, or nil when it can. Order is fixed so a
+  reader can predict which reason surfaces when several apply."
+  [{:keys [scheme network asset pay-to amount] :as offer}
+   {:keys [schemes networks assets pay-tos] :as policy}]
+  (let [max-amount (cap-for offer policy)]
+    (cond
+      (blank? scheme) :buyer/offer-has-no-scheme
+      (not (allowed? schemes scheme)) :buyer/scheme-not-allowed
+      (blank? network) :buyer/offer-has-no-network
+      (not (allowed? networks network)) :buyer/network-not-allowed
+      (not (allowed? assets asset)) :buyer/asset-not-allowed
+      (not (allowed? pay-tos pay-to)) :buyer/payee-not-allowed
+      (nil? amount) :buyer/unreadable-amount
+      (and max-amount (> amount max-amount)) :buyer/over-cap
+      :else nil)))
+
+(defn plan
+  "-> `{:pay {...} :rejected [...]}` or `{:refuse reason :rejected [...]}`.
+
+  `challenge` is the decoded 402 body. `policy` is what this agent may spend:
+
+      {:max-amount 1000            ; base units, per call. nil = no cap, and a
+                                   ; policy with no cap must say so by omitting
+                                   ; the key rather than by being absent
+       :schemes  #{\"exact\"}
+       :networks #{\"base\"}
+       :assets   #{\"0x8335…\"}     ; nil = unconstrained, #{} = nothing allowed
+       :pay-tos  #{\"0xA003…\"}
+       :caps     {[\"murakumo\" \"CREDITS\"] 1}   ; a cap per rail, in that rail's
+                                             ; own units. Wins over :max-amount
+       :prefer   [[\"murakumo\" \"CREDITS\"]      ; which rail to take when a seller
+                  [\"base\" \"0x8335…\"]]}        ; offers more than one
+
+  A seller may advertise the same resource on more than one rail — USDC on Base
+  and murakumo credits, say. Their amounts are not comparable, so when offers
+  from two rails survive the policy this REFUSES with
+  `:buyer/incomparable-rails` unless `:prefer` names one. Silence is not a
+  preference, for the same reason silence is not a spend authorisation.
+
+  `:pay` carries the chosen offer and the amount, which is what the host then
+  signs. `:rejected` always lists every offer that was not taken with its
+  reason -- including on success, because knowing you took the only acceptable
+  offer out of five is different from knowing you took one of five."
+  [challenge policy]
+  (let [os (offers challenge)]
+    (cond
+      (nil? policy)
+      {:refuse :buyer/no-policy :rejected []}
+
+      (empty? os)
+      {:refuse :buyer/no-offers :rejected []}
+
+      :else
+      (let [scored (for [o os
+                         :let [n (normalize o)]]
+                     (assoc n :rejected-because (rejection n policy)))
+            ok (remove :rejected-because scored)
+            no (filterv :rejected-because scored)
+            reasons (mapv (fn [r] {:reason (:rejected-because r)
+                                   :scheme (:scheme r) :network (:network r)
+                                   :amount (:amount r)})
+                          no)]
+        (if (empty? ok)
+          {:refuse (or (:reason (first reasons)) :buyer/nothing-acceptable)
+           :rejected reasons}
+          (let [rails (distinct (map rail ok))
+                ;; Cheapest is only a question WITHIN a rail. Across rails the
+                ;; amounts are quantities of different things, so the buyer does
+                ;; not get to decide -- the policy states an order, or nothing
+                ;; is paid. Guessing here is how paying $0.01 in credits gets
+                ;; recorded as having chosen the cheaper of two offers over
+                ;; $0.001 in USDC.
+                chosen-rail (if (= 1 (count rails))
+                              (first rails)
+                              (first (filter (set rails) (:prefer policy))))]
+            (if (nil? chosen-rail)
+              {:refuse :buyer/incomparable-rails
+               :rails (vec rails)
+               :rejected reasons}
+              ;; Cheapest, then a stable tie-break. Never "first that parsed":
+              ;; the order of `accepts` is the seller's choice, not the buyer's.
+              (let [on-rail (filter #(= chosen-rail (rail %)) ok)
+                    chosen (first (sort-by (juxt :amount :scheme) on-rail))]
+                {:pay (dissoc chosen :rejected-because)
+                 :rejected reasons}))))))))
+
+(defn credits-payment
+  "The `X-PAYMENT` payload for a chosen CREDITS offer, or `{:refuse reason}`.
+
+  Credits settle in murakumo's append-only ledger, so what authorises the
+  payment is not a signature over a chain transaction but a CACAO whose SIWE
+  `resources` name this exact transfer (`murakumo:transfer?to=<seller>&credits=
+  <amount>`) and whose nonce is single-use. This function does not mint it and
+  holds no key: the caller supplies the CACAO, and this assembles the envelope.
+
+  It REFUSES an offer that is not on a credits rail. The seller's scheme is what
+  says how a payment settles, and an envelope built for the wrong one is a
+  payment that will be validated by a validator expecting other fields --
+  `pay.facilitator/credits-gate` exists precisely so those two never share a
+  code path."
+  [{:keys [scheme network amount pay-to]} {:keys [payer cacao]}]
+  (cond
+    (not= "credits" scheme) {:refuse :buyer/not-a-credits-offer}
+    (blank? payer) {:refuse :buyer/no-payer-account}
+    (blank? cacao) {:refuse :buyer/no-authorization}
+    (nil? amount) {:refuse :buyer/unreadable-amount}
+    :else {:x402Version 1
+           :scheme "credits"
+           :network network
+           :payload {:payer payer :amount amount :to pay-to :cacao cacao}}))
+
+(defn payment-header
+  "A payment envelope as the `X-PAYMENT` header value, or nil for a refusal.
+
+  `json-encode` is required and is the host's JSON serializer
+  (`#(js/JSON.stringify (clj->js %))` in a Worker or under nbb). This library
+  does not serialize JSON — `x402/encode-header` takes an ALREADY-SERIALIZED
+  string and only does the base64 envelope, which is what keeps `pay`
+  zero-dependency.
+
+  Handing it the map instead was measured on 2026-08-31 against the live
+  gateway: base64 of a map's print form is not JSON, the facilitator's
+  `decode-payment` threw, nil came back, and `nil payment` takes the same
+  branch as no header at all — so a buyer that HAD paid was answered
+  `X-PAYMENT header is required`. Requiring the serializer is why that
+  particular silence cannot be produced from here again.
+
+  nil rather than the refusal encoded: a header built out of a refusal is a
+  request that looks paid."
+  [payment json-encode]
+  (when-not (:refuse payment)
+    (x402/encode-header (json-encode payment))))
+
+(defn payable? [r] (some? (:pay r)))
+
+;; ── where a policy comes from ───────────────────────────────────────────────
+
+(def policy-vocabulary
+  "The facts that say what an agent may spend, and how each one narrows.
+
+  `:min` takes the smaller of two, `:intersect` keeps only what both allow. Both
+  are narrowing operations, and that is the whole design: a later block in an
+  attenuated token can restrict what an earlier one granted and can never
+  widen it.
+
+  A predicate absent from a block says nothing -- it is not a grant of
+  everything, it is silence, and silence from one block cannot loosen a bound
+  another block set."
+  {'max-amount {:key :max-amount :narrow :min}
+   'network    {:key :networks   :narrow :intersect}
+   'asset      {:key :assets     :narrow :intersect}
+   'pay-to     {:key :pay-tos    :narrow :intersect}
+   'scheme     {:key :schemes    :narrow :intersect}})
+
+(defn- block-policy
+  "One block's facts -> the partial policy it declares, or nil when it declares
+  none. A block that says nothing about spending is not a block that permits
+  everything."
+  [facts]
+  (let [decls (keep (fn [[head & terms]]
+                      (when-let [v (get policy-vocabulary head)]
+                        [v (first terms)]))
+                    facts)]
+    (when (seq decls)
+      (reduce (fn [acc [{:keys [key narrow]} value]]
+                (case narrow
+                  :min (assoc acc key (if-let [prev (get acc key)]
+                                        (min prev value) value))
+                  :intersect (update acc key (fnil conj #{}) value)))
+              {} decls))))
+
+(defn- narrow
+  "Fold one block's policy onto what earlier blocks already allowed.
+
+  This is where the safety property lives. A cap only ever shrinks; an
+  allowlist only ever intersects. A block that raises a ceiling or adds a
+  network is not honoured -- it is a token trying to grant itself more than it
+  was given, which is the one thing attenuation must make impossible."
+  [acc b]
+  (if (nil? acc)
+    b
+    (reduce (fn [m [k v]]
+              (let [prev (get m k)]
+                (cond
+                  (nil? prev) (assoc m k v)
+                  (number? v) (assoc m k (min prev v))
+                  :else (assoc m k (into #{} (filter prev) v)))))
+            acc b)))
+
+(defn policy-from-facts
+  "Blocks of facts -> the policy `plan` takes, or nil when no block declared one.
+
+  `blocks` is a sequence of fact vectors, authority block first, in the order
+  the token carries them -- the host has verified the signature chain and read
+  the facts out before calling this. Keeping it over plain facts is why this
+  library still has no token dependency: what arrives is data, and the
+  narrowing rules are visible without knowing where it came from.
+
+  nil is the honest answer for a token that says nothing about spending, and it
+  composes with `plan`, which refuses without a policy. A token that grants no
+  spending authority and a caller who forgot to pass one are the same
+  situation, and they get the same answer."
+  [blocks]
+  (reduce narrow nil (keep block-policy blocks)))

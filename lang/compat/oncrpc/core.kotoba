@@ -1,0 +1,198 @@
+(ns oncrpc.core
+  "ONC RPC version 2 (RFC 5531) — the call/reply envelope NFS, MOUNT, NLM and
+  the portmapper all arrive in, as a pure `.cljc` function over bytes.
+
+  The envelope is small and entirely uninteresting until one detail is
+  wrong, at which point the client reports nothing useful and hangs. The
+  three that cost the most:
+
+  - **The arguments are not in the envelope.** A call is a fixed header
+    followed by program-specific bytes, so a decoder has to hand back
+    *where the header stopped* rather than just what it read. That is why
+    `decode-call` returns `:args-at`.
+  - **An accepted reply still carries a verifier**, before the accept
+    status. A server that omits it produces a reply that decodes as
+    garbage one field later.
+  - **`PROG_MISMATCH` and `RPC_MISMATCH` carry a version range**, and they
+    are the two replies a client actually reads carefully — they are how it
+    decides to retry with a different version instead of failing.
+
+  ## What this does not do
+
+  No transport, no threads, no sockets: the deploy shell owns those, the
+  same arrangement `org-ietf-webdav` uses. No AUTH_DH, no RPCSEC_GSS —
+  `AUTH_NONE` and `AUTH_SYS` are what a loopback filesystem export needs,
+  and pretending to more authentication than is implemented is worse than
+  offering less."
+  (:require [xdr.core :as xdr]))
+
+;; ── constants (RFC 5531 §9) ───────────────────────────────────────────────
+
+(def ^:const rpc-version 2)
+
+(def ^:const CALL 0)
+(def ^:const REPLY 1)
+
+(def ^:const MSG-ACCEPTED 0)
+(def ^:const MSG-DENIED 1)
+
+(def ^:const SUCCESS 0)
+(def ^:const PROG-UNAVAIL 1)
+(def ^:const PROG-MISMATCH 2)
+(def ^:const PROC-UNAVAIL 3)
+(def ^:const GARBAGE-ARGS 4)
+(def ^:const SYSTEM-ERR 5)
+
+(def ^:const RPC-MISMATCH 0)
+(def ^:const AUTH-ERROR 1)
+
+(def ^:const AUTH-NONE 0)
+(def ^:const AUTH-SYS 1)
+
+;; ── schemas ───────────────────────────────────────────────────────────────
+
+(def opaque-auth
+  [:struct [:flavor [:enum]] [:body [:opaque* 400]]])
+
+(def call-header
+  "Everything before the procedure arguments."
+  [:struct
+   [:xid [:uint]]
+   [:mtype [:enum]]
+   [:rpcvers [:uint]]
+   [:prog [:uint]]
+   [:vers [:uint]]
+   [:proc [:uint]]
+   [:cred opaque-auth]
+   [:verf opaque-auth]])
+
+(def auth-sys-parms
+  "RFC 5531 §8.2. The uid/gid a loopback export uses to decide ownership."
+  [:struct
+   [:stamp [:uint]]
+   [:machinename [:string 255]]
+   [:uid [:uint]]
+   [:gid [:uint]]
+   [:gids [:array* [:uint] 16]]])
+
+(def ^:private null-verf {:flavor AUTH-NONE :body (xdr/->bytes [])})
+
+;; ── decode a call ─────────────────────────────────────────────────────────
+
+(defn decode-call
+  "Bytes of one RPC message → the call header plus `:args-at`.
+
+  `:args-at` is the offset the program's own decoder starts at. Returns
+  `{:error …}` rather than throwing for a message that is not a version-2
+  call, because that is a reply this server has to send, not a crash."
+  [bs]
+  (let [{:keys [value end]} (xdr/decode call-header bs)]
+    (cond
+      (not= CALL (:mtype value))
+      {:error :not-a-call :xid (:xid value)}
+
+      (not= rpc-version (:rpcvers value))
+      {:error :rpc-mismatch :xid (:xid value) :rpcvers (:rpcvers value)}
+
+      :else (assoc value :args-at end))))
+
+(defn auth-sys
+  "The AUTH_SYS credential of a decoded call, or nil when it carries another
+  flavour. Nil rather than a default uid: a caller that wants \"nobody\"
+  should say so itself."
+  [call]
+  (when (= AUTH-SYS (:flavor (:cred call)))
+    (xdr/decode-value auth-sys-parms (:body (:cred call)))))
+
+;; ── build a reply ─────────────────────────────────────────────────────────
+
+(defn- reply-head [xid]
+  (-> (xdr/encode [:struct [:xid [:uint]] [:mtype [:enum]]]
+                  {:xid xid :mtype REPLY})))
+
+(defn- cat-bytes [& parts]
+  (xdr/->bytes (mapcat #(map (fn [b] (bit-and (int b) 0xff)) (seq %)) parts)))
+
+(defn accepted
+  "An accepted reply: `xid`, the verifier, `SUCCESS`, then `result-bytes`
+  exactly as the program encoded them."
+  ([xid result-bytes] (accepted xid null-verf result-bytes))
+  ([xid verf result-bytes]
+   (cat-bytes (reply-head xid)
+              (xdr/encode [:struct
+                           [:reply-stat [:enum]]
+                           [:verf opaque-auth]
+                           [:accept-stat [:enum]]]
+                          {:reply-stat MSG-ACCEPTED :verf verf
+                           :accept-stat SUCCESS})
+              (or result-bytes (xdr/->bytes [])))))
+
+(defn accept-error
+  "An accepted reply whose accept status is not SUCCESS — the program was
+  reached and refused, which is different from the call being rejected."
+  [xid accept-stat]
+  (cat-bytes (reply-head xid)
+             (xdr/encode [:struct
+                          [:reply-stat [:enum]]
+                          [:verf opaque-auth]
+                          [:accept-stat [:enum]]]
+                         {:reply-stat MSG-ACCEPTED :verf null-verf
+                          :accept-stat accept-stat})))
+
+(defn prog-mismatch
+  "`PROG_MISMATCH` with the version range this server does speak — the
+  reply a client reads to decide whether to retry at another version."
+  [xid low high]
+  (cat-bytes (reply-head xid)
+             (xdr/encode [:struct
+                          [:reply-stat [:enum]]
+                          [:verf opaque-auth]
+                          [:accept-stat [:enum]]
+                          [:low [:uint]]
+                          [:high [:uint]]]
+                         {:reply-stat MSG-ACCEPTED :verf null-verf
+                          :accept-stat PROG-MISMATCH :low low :high high})))
+
+(defn rpc-mismatch
+  "A rejected reply: this is not RPC version 2."
+  [xid low high]
+  (cat-bytes (reply-head xid)
+             (xdr/encode [:struct
+                          [:reply-stat [:enum]]
+                          [:reject-stat [:enum]]
+                          [:low [:uint]]
+                          [:high [:uint]]]
+                         {:reply-stat MSG-DENIED :reject-stat RPC-MISMATCH
+                          :low low :high high})))
+
+;; ── dispatch ──────────────────────────────────────────────────────────────
+
+(defn dispatch
+  "One request's bytes → one reply's bytes.
+
+  `programs` is `{prog-number {vers-number {proc-number handler}}}`, where a
+  handler is `(fn [call bytes args-at] result-bytes)`. The handler decodes
+  its own arguments because only it knows their schema; it is given the
+  whole message and the offset rather than a copy, so a 64 KiB WRITE does
+  not get sliced on the way in.
+
+  Every failure path here produces a *reply*. A filesystem client that
+  receives nothing does not fail — it retries, forever, and the mount hangs
+  with no indication of why."
+  [programs bs]
+  (let [call (decode-call bs)]
+    (cond
+      (= :rpc-mismatch (:error call)) (rpc-mismatch (:xid call) 2 2)
+      (:error call) nil                       ; not a call at all: say nothing
+      :else
+      (let [{:keys [xid prog vers proc args-at]} call
+            versions (get programs prog)
+            procs (get versions vers)]
+        (cond
+          (nil? versions) (accept-error xid PROG-UNAVAIL)
+          (nil? procs) (let [vs (keys versions)]
+                         (prog-mismatch xid (apply min vs) (apply max vs)))
+          (nil? (get procs proc)) (accept-error xid PROC-UNAVAIL)
+          :else
+          (let [handler (get procs proc)]
+            (accepted xid (handler call bs args-at))))))))

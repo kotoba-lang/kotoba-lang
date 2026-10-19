@@ -1,0 +1,151 @@
+(ns provider.scoped-fs
+  "Scoped filesystem kit (capability id 19) — first contract slice.
+
+  No ambient filesystem authority (same rule as provider.storage ADR 0049):
+  the host injects a root-scoped store. Paths are resolved purely against
+  declared roots; `..`, absolute paths, home `~`, null bytes, and empty
+  segments are rejected closed.
+
+  This is the kbb scoped-fs ability gap first slice: pure policy + injectable
+  mem store. Production OS mounts remain a later transport."
+  (:require [clojure.string :as str]
+            [kotoba.kir.value :as value]))
+
+(def capability-id 19)
+(def max-path-bytes 1024)
+(def max-value-bytes 65536)
+
+(def read-request-type
+  [:record :kotoba.fs/read-request
+   [[:root :keyword] [:path :string]]])
+
+(def write-request-type
+  [:record :kotoba.fs/write-request
+   [[:root :keyword] [:path :string] [:value :string]]])
+
+(def request-type
+  [:variant :kotoba.fs/request
+   [[:read read-request-type] [:write write-request-type]]])
+
+(def error-type
+  [:record :kotoba.fs/error
+   [[:code :keyword] [:message :string]]])
+
+(def result-type
+  [:variant :kotoba.fs/result
+   [[:content :string] [:written :bool] [:error error-type]]])
+
+(def schemas
+  {:kotoba.fs/read-request read-request-type
+   :kotoba.fs/write-request write-request-type
+   :kotoba.fs/request request-type
+   :kotoba.fs/error error-type
+   :kotoba.fs/result result-type})
+
+(defn- path-too-long? [s]
+  (> (value/utf8-byte-count! s) max-path-bytes))
+
+(defn resolve-path
+  "Pure path policy. Returns `{:ok normalized}` or `{:error keyword}`."
+  [relative]
+  (let [s (str relative)]
+    (cond
+      (str/blank? s) {:error :fs/empty-path}
+      (str/includes? s "\0") {:error :fs/null-byte}
+      (str/includes? s "\\") {:error :fs/backslash}
+      (str/starts-with? s "/") {:error :fs/absolute}
+      (str/starts-with? s "~") {:error :fs/home-escape}
+      (path-too-long? s) {:error :fs/path-too-long}
+      :else
+      (let [segs (vec (remove str/blank? (str/split s #"/")))
+            bad (some #{".." "."} segs)]
+        (cond
+          (empty? segs) {:error :fs/empty-path}
+          bad {:error :fs/escape}
+          :else {:ok (str/join "/" segs)})))))
+
+(defn- error [code message]
+  (value/bounded-keyword! code value/keyword-value-byte-limit)
+  (value/bounded-string! message value/string-value-byte-limit)
+  [result-type :error [error-type code message]])
+
+(defn- as-content [s]
+  (value/bounded-string! s max-value-bytes)
+  [result-type :content s])
+
+(defn- invoke-store [store op]
+  (try
+    (store op)
+    (catch  _
+      {:tag :error :code :fs/store :message "scoped-fs store failed"})))
+
+(defn mem-store
+  "In-memory root store for tests. `initial` is `{root-kw {rel-path string}}`."
+  [initial]
+  (let [state (atom (into {} (map (fn [[k v]] [k (into {} v)]) initial)))]
+    (fn [{:keys [op root path value]}]
+      (let [r (resolve-path path)]
+        (if-let [err (:error r)]
+          {:tag :error :code err :message (name err)}
+          (let [p (:ok r)]
+            (case op
+              :read
+              (if-let [v (get-in @state [root p])]
+                {:tag :content :value v}
+                {:tag :error :code :fs/not-found :message "not found"})
+
+              :write
+              (do
+                (swap! state assoc-in [root p] value)
+                {:tag :written})
+
+              {:tag :error :code :fs/unknown-op :message "unknown op"})))))))
+
+(defn provider
+  "Typed scoped-fs provider. Host supplies `allowed-roots` and `store`."
+  [{:keys [allowed-roots store]}]
+  (when-not (and (set? allowed-roots)
+                 (every? qualified-keyword? allowed-roots)
+                 (fn? store))
+    (throw (ex-info "scoped-fs requires allowed-roots and store"
+                    {:phase :scoped-fs-provider})))
+  (doseq [r allowed-roots]
+    (value/bounded-keyword! r value/keyword-value-byte-limit))
+  {:request-type request-type
+   :result-type result-type
+   :invoke
+   (fn [req]
+     (let [[actual-type tag payload] req]
+       (when-not (= actual-type request-type)
+         (throw (ex-info "scoped-fs contract mismatch"
+                         {:phase :scoped-fs-provider})))
+       (case tag
+         :read
+         (let [[_rtype root path] payload]
+           (when-not (contains? allowed-roots root)
+             (throw (ex-info "scoped-fs root not allowed"
+                             {:phase :scoped-fs-provider :root root})))
+           (value/bounded-string! path max-path-bytes)
+           (let [reply (invoke-store store {:op :read :root root :path path})]
+             (case (:tag reply)
+               :content (as-content (:value reply))
+               :error (error (:code reply) (or (:message reply) "read failed"))
+               (error :fs/store "bad store reply"))))
+
+         :write
+         (let [[_wtype root path value] payload]
+           (when-not (contains? allowed-roots root)
+             (throw (ex-info "scoped-fs root not allowed"
+                             {:phase :scoped-fs-provider :root root})))
+           (value/bounded-string! path max-path-bytes)
+           (value/bounded-string! value max-value-bytes)
+           (let [reply (invoke-store store {:op :write :root root :path path :value value})]
+             (case (:tag reply)
+               :written [result-type :written true]
+               :error (error (:code reply) (or (:message reply) "write failed"))
+               (error :fs/store "bad store reply"))))
+
+         (error :fs/unknown-op "unknown request tag"))))})
+
+(defn create-providers [opts]
+  {:providers {capability-id (provider opts)}})

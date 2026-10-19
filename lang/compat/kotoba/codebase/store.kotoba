@@ -1,0 +1,381 @@
+(ns kotoba.codebase.store
+  "Verified persistence for the C1–C4 semantic-code records.
+
+  Blocks are immutable canonical DAG-CBOR bytes keyed by CID; a namespace head
+  is the one mutable pointer, moved only by compare-and-set. WHERE those bytes
+  live is `kotoba.codebase.backend`'s question, not this namespace's: `root`
+  may be a filesystem path (the layout this repository has always written) or
+  any backend value, including one over a `kotobase.storage` provider.
+
+  What did NOT move to the backend is every integrity rule. A block still has
+  to re-encode to canonical CBOR under its CID here, an artifact still has to
+  hash to its raw CID here, and a head still has to lose a race here. A store
+  that checked those for us would be a store we would have to trust."
+  (:require [cbor.core :as cbor]
+            [kotoba.codebase.backend :as backend]
+            [kotoba.codebase.ir :as ir]
+            [kotoba.codebase.semantic-code :as semantic]
+            [multiformats.core :as mf]))
+
+(def store-schema backend/store-schema)
+
+(defn initialize!
+  "Create the durable layout. Safe to call repeatedly."
+  [root]
+  (backend/-initialize! (backend/coerce root)))
+
+(defn- initialized? [root]
+  (backend/-initialized? (backend/coerce root)))
+
+(defn- require-store! [root]
+  (when-not (initialized? root)
+    (throw (ex-info "semantic codebase is not initialized"
+                    {:problem :codebase/not-initialized :root (str root)}))))
+
+(defn put-block!
+  "Verify and persist an immutable semantic block. Existing bytes must match.
+  Returns the block CID."
+  [root cid block]
+  (require-store! root)
+  (when-not (:ok? (semantic/verify-block cid block))
+    (throw (ex-info "refusing block whose CID does not match its content"
+                    {:problem :codebase/cid-mismatch :cid cid})))
+  (when (= :conflict (backend/-put-bytes! (backend/coerce root) :block cid
+                                          (cbor/encode block)))
+    (throw (ex-info "existing CID has different bytes"
+                    {:problem :codebase/immutable-block-conflict :cid cid})))
+  cid)
+
+(defn- stored-block-bytes [root cid]
+  (or (backend/-get-bytes (backend/coerce root) :block cid)
+      (throw (ex-info "semantic block not found"
+                      {:problem :codebase/block-not-found :cid cid}))))
+
+(defn get-block
+  "Read a block and re-derive its CID before returning it."
+  [root cid]
+  (require-store! root)
+  (let [block (cbor/decode (stored-block-bytes root cid))]
+    (when-not (:ok? (semantic/verify-block cid block))
+      (throw (ex-info "stored semantic block failed CID verification"
+                      {:problem :codebase/corrupt-block :cid cid})))
+    block))
+
+(defn- verified-block-bytes [root cid]
+  (let [bytes (stored-block-bytes root cid)
+        block (cbor/decode bytes)]
+    (when-not (:ok? (semantic/verify-block cid block))
+      (throw (ex-info "stored semantic block failed CID verification"
+                      {:problem :codebase/corrupt-block :cid cid})))
+    {:cid cid :bytes bytes :block block}))
+
+(defn put-artifact!
+  "Persist compiled OUTPUT bytes under their own raw CIDv1 and return it.
+
+  Artifacts are raw bytes, not DAG-CBOR blocks, and are kept in their own
+  directory for that reason: `put-block!` verifies by re-encoding canonical
+  CBOR, which an emitted `.wasm` is not and must not be forced into. The
+  verification that matters is the same one either way -- the bytes hash to the
+  name they are filed under."
+  [root ^bytes output]
+  (require-store! root)
+  (let [cid (mf/cidv1-raw output)]
+    (when (= :conflict (backend/-put-bytes! (backend/coerce root) :artifact cid output))
+      (throw (ex-info "existing artifact CID has different bytes"
+                      {:problem :codebase/immutable-artifact-conflict :cid cid})))
+    cid))
+
+(defn get-artifact
+  "Read an artifact and re-derive its CID before returning it."
+  [root cid]
+  (require-store! root)
+  (when-let [bytes (backend/-get-bytes (backend/coerce root) :artifact cid)]
+    (when-not (= cid (mf/cidv1-raw bytes))
+      (throw (ex-info "stored artifact failed CID verification"
+                      {:problem :codebase/corrupt-artifact :cid cid})))
+    bytes))
+
+(defn raw-cid?
+  "Whether CID names a raw IPLD block rather than a DAG-CBOR block.
+
+  Release manifests link executable bytes with ordinary IPLD links.  The
+  codec, not the schema that happened to contain the link, decides which
+  verified store category owns the bytes."
+  [cid]
+  (try
+    (let [bytes (mf/cid->bytes cid)]
+      (= mf/codec-raw (bit-and 0xff )))
+    (catch  _ false)))
+
+(defn block-cids
+  "Every block CID present locally.
+
+  Presence, not reachability: a block that no namespace selects is still here
+  and still valid, which is what makes a hash usable before -- or after -- any
+  name points at it.
+
+  Enumeration is a property of a local layout, not of content addressing: a
+  backend with no directory to read refuses this rather than answering nothing."
+  [root]
+  (require-store! root)
+  (backend/-list-keys (backend/coerce root) :block))
+
+(defn head [root namespace]
+  (require-store! root)
+  (backend/-read-head (backend/coerce root) namespace))
+
+(defn- replace-head! [root namespace expected next-cid]
+  (let [result (backend/-swap-head! (backend/coerce root) namespace expected next-cid)]
+    (when-not (:ok? result)
+      (throw (ex-info "namespace head changed"
+                      {:problem :codebase/head-conflict :namespace namespace
+                       :expected expected :actual (:actual result)})))))
+
+(defn- cid-link->cid [link] (ir/link->cid link))
+
+(defn export-closure
+  "Return canonical bytes for the reachable blocks available in this local
+  store.  Every returned block is verified before it leaves the store.
+
+  Links to profile/contract identities that are not stored locally are reported
+  as `:missing`; callers decide whether those are required for their protocol."
+  [root roots]
+  (require-store! root)
+  (loop [pending (vec roots) seen #{} blocks [] artifacts [] missing #{}]
+    (if-let [cid (first pending)]
+      (cond
+        (contains? seen cid)
+        (recur (subvec pending 1) seen blocks artifacts missing)
+
+        (raw-cid? cid)
+        (if-let [bytes (get-artifact root cid)]
+          (recur (subvec pending 1) (conj seen cid) blocks
+                 (conj artifacts {:cid cid :bytes bytes}) missing)
+          (recur (subvec pending 1) (conj seen cid) blocks artifacts
+                 (conj missing cid)))
+
+        :else
+        ;; `ExceptionInfo` is a class on the JVM and an ordinary `js/Error`
+        ;; subclass on cljs, so the catch clause cannot be written once. The
+        ;; DISCRIMINATION is the same on both sides and stays in one place:
+        ;; only `:codebase/block-not-found` is absorbed, everything else
+        ;; rethrows, because swallowing an unrelated failure here would turn a
+        ;; corrupt block into a silently missing one.
+        (let [found (try
+                      (verified-block-bytes root cid)
+                      (catch  error
+                        (if (= :codebase/block-not-found (:problem (ex-data error)))
+                          {:missing? true}
+                          (throw error))))]
+          (if (:missing? found)
+            (recur (subvec pending 1) (conj seen cid) blocks artifacts
+                   (conj missing cid))
+            (let [{:keys [bytes block]} found
+                  next-cids (ir/block-links block)]
+            (recur (into (subvec pending 1) next-cids) (conj seen cid)
+                   (conj blocks {:cid cid :bytes bytes}) artifacts missing)))))
+      {:roots (vec roots) :blocks blocks :artifacts artifacts
+       :missing (vec (sort missing))})))
+
+(defn import-closure!
+  "Verify every received canonical block before persisting it.  Returns the
+  imported CIDs; no remote bytes are trusted by filename or claimed CID."
+  [root {:keys [blocks artifacts]}]
+  (require-store! root)
+  (let [block-cids
+        (mapv (fn [{:keys [cid bytes]}]
+                (when-not (and (string? cid) bytes)
+                  (throw (ex-info "invalid closure transfer record"
+                                  {:problem :codebase/invalid-transfer-record})))
+                (put-block! root cid (cbor/decode bytes)))
+              blocks)
+        artifact-cids
+        (mapv (fn [{:keys [cid bytes]}]
+                (when-not (and (string? cid) bytes (= cid (mf/cidv1-raw bytes)))
+                  (throw (ex-info "invalid artifact transfer record"
+                                  {:problem :codebase/invalid-artifact-transfer
+                                   :cid cid})))
+                (put-artifact! root bytes))
+              artifacts)]
+    (into block-cids artifact-cids)))
+
+(defn transfer-closure!
+  "Verified, transport-neutral closure transfer between two local stores.
+  Network adapters may carry the value produced by `export-closure` without
+  changing integrity semantics."
+  [from-root to-root roots]
+  (let [bundle (export-closure from-root roots)
+        imported (import-closure! to-root bundle)]
+    (assoc bundle :imported imported)))
+
+(defn- cache-descriptor
+  [{:keys [code-closure-cid compiler-contract-cid target-abi package-lock-cid
+           policy-cid input-cids effects]}]
+  (when-not (and (every? string? [code-closure-cid compiler-contract-cid target-abi
+                                  package-lock-cid policy-cid])
+                 (vector? input-cids) (every? string? input-cids)
+                 (or (nil? effects) (coll? effects)))
+    (throw (ex-info "invalid cache descriptor"
+                    {:problem :codebase/invalid-cache-descriptor})))
+  {"codeClosureCid" code-closure-cid "compilerContractCid" compiler-contract-cid
+   "targetAbi" target-abi "packageLockCid" package-lock-cid "policyCid" policy-cid
+   "inputCids" (vec (sort input-cids))
+   "effects" (vec (sort (map str effects)))})
+
+(defn cache-key
+  "Return the deterministic cache key for a pure compilation/test result, or
+  nil when declared effects make reuse unsafe.
+
+  The caller must supply CIDs for every authority-bearing input.  This makes a
+  cache hit conditional on code, compiler, ABI, dependency package lock,
+  policy, and immutable inputs—not merely source text."
+  [descriptor]
+  (let [{:strs [codeClosureCid compilerContractCid targetAbi packageLockCid policyCid inputCids effects]}
+        (cache-descriptor descriptor)]
+    (when (empty? effects)
+    (semantic/block-cid
+     {"schema" "kotoba.semantic-cache-key.v1"
+      "version" 1
+      "codeClosure" (semantic/cid-link codeClosureCid)
+      "compilerContract" (semantic/cid-link compilerContractCid)
+      "targetAbi" targetAbi
+      "packageLock" (semantic/cid-link packageLockCid)
+      "policy" (semantic/cid-link policyCid)
+      "inputs" (mapv semantic/cid-link inputCids)}))))
+
+(defn cache-put!
+  "Persist a cache entry only for an effect-free descriptor.  RESULT is an
+  immutable data result (for example an artifact CID and test receipt CID),
+  never an authority grant."
+  [root descriptor result]
+  (require-store! root)
+  (when-let [key (cache-key descriptor)]
+    (let [entry {"schema" "kotoba.semantic-cache-entry.v1" "version" 1
+                 "descriptor" (cache-descriptor descriptor) "result" result}]
+      (when (= :conflict (backend/-put-bytes! (backend/coerce root) :cache key
+                                              (cbor/encode entry)))
+        (throw (ex-info "cache key has conflicting result"
+                        {:problem :codebase/cache-conflict :key key})))
+      key)))
+
+(defn cache-get
+  "Return the cached pure result for DESCRIPTOR, or nil.  A descriptor mismatch
+  is a cache miss even if a corrupt/wrong file was placed at the key path."
+  [root descriptor]
+  (require-store! root)
+  (when-let [key (cache-key descriptor)]
+    (when-let [bytes (backend/-get-bytes (backend/coerce root) :cache key)]
+      (let [entry (cbor/decode bytes)]
+        (when (= (cache-descriptor descriptor) (get entry "descriptor"))
+          (get entry "result"))))))
+
+(defn namespace-view
+  "Decode and verify a namespace commit into ordinary CID strings."
+  [root cid]
+  (let [block (get-block root cid)]
+    (when-not (= "kotoba.namespace.v1" (get block "schema"))
+      (throw (ex-info "CID is not a namespace commit"
+                      {:problem :codebase/not-namespace-commit :cid cid})))
+    {:cid cid
+     :parents (mapv cid-link->cid (get block "parents"))
+     :bindings (into (sorted-map)
+                     (map (fn [[name link]] [name (cid-link->cid link)]))
+                     (get block "bindings"))}))
+
+(defn three-way-merge
+  "Deterministically merge three name→definition-CID maps.
+
+  A deletion is represented by an absent name.  Concurrent incompatible edits
+  are returned as data, never selected arbitrarily."
+  [base left right]
+  (reduce
+   (fn [{:keys [bindings conflicts] :as result} name]
+     (let [b (get base name) l (get left name) r (get right name)
+           chosen (cond (= l r) l (= l b) r (= r b) l :else ::conflict)]
+       (if (= ::conflict chosen)
+         (assoc result :conflicts (conj conflicts {:name name :base b :left l :right r}))
+         (assoc result :bindings (cond-> bindings chosen (assoc name chosen))))))
+   {:bindings (sorted-map) :conflicts []}
+   (sort (into #{} (concat (keys base) (keys left) (keys right))))))
+
+(defn- ancestor?
+  [root ancestor descendant]
+  (loop [pending [descendant] seen #{}]
+    (if-let [cid (first pending)]
+      (cond
+        (= ancestor cid) true
+        (contains? seen cid) (recur (next pending) seen)
+        :else (recur (into (vec (next pending)) (:parents (namespace-view root cid)))
+                     (conj seen cid)))
+      false)))
+
+(defn merge-namespace!
+  "Merge BASE, LEFT, and RIGHT namespace commits and CAS-select the resulting
+  two-parent commit.  Conflicts are returned without changing the selected
+  head."
+  [root namespace base-cid left-cid right-cid expected-head]
+  (require-store! root)
+  (when-not (and (ancestor? root base-cid left-cid)
+                 (ancestor? root base-cid right-cid))
+    (throw (ex-info "merge base is not an ancestor of both inputs"
+                    {:problem :codebase/invalid-merge-base :base base-cid
+                     :left left-cid :right right-cid})))
+  (let [base (:bindings (namespace-view root base-cid))
+        left (:bindings (namespace-view root left-cid))
+        right (:bindings (namespace-view root right-cid))
+        {:keys [bindings conflicts]} (three-way-merge base left right)]
+    (if (seq conflicts)
+      {:merged? false :conflicts conflicts}
+      (let [commit (semantic/namespace-commit {:parents [left-cid right-cid]
+                                                :bindings bindings})]
+        (put-block! root (:cid commit) (:block commit))
+        (replace-head! root namespace expected-head (:cid commit))
+        {:merged? true :namespace namespace :head (:cid commit)
+         :parents [left-cid right-cid] :bindings bindings}))))
+
+(defn publish-head!
+  "Advance a namespace head only after an injected authority verifier accepts
+  the publication request.  The target commit must already be locally present
+  and CID-verified; signature/key lifecycle belongs to the verifier adapter."
+  [root namespace cid expected-head authorize!]
+  (require-store! root)
+  (namespace-view root cid)
+  (let [request {:namespace namespace :cid cid :expected-head expected-head}]
+    (when-not (authorize! request)
+      (throw (ex-info "namespace head publication was not authorized"
+                      {:problem :codebase/publication-denied :request request})))
+    (replace-head! root namespace expected-head cid)
+    {:namespace namespace :head cid :published? true}))
+
+(defn commit-namespace!
+  "Persist a namespace commit and atomically select it as NAMESPACE's head.
+  EXPECTED-HEAD is nil for a new namespace, or the caller's observed head."
+  [root namespace bindings expected-head]
+  (require-store! root)
+  (when-not (and (string? namespace) (seq namespace))
+    (throw (ex-info "namespace must be a non-empty string"
+                    {:problem :codebase/invalid-namespace :namespace namespace})))
+  (doseq [[name cid] bindings]
+    (when-not (string? name) (throw (ex-info "binding name must be a string"
+                                              {:problem :codebase/invalid-binding})))
+    (get-block root cid))
+  (let [commit (semantic/namespace-commit
+                {:parents (cond-> [] expected-head (conj expected-head))
+                 :bindings bindings})]
+    (put-block! root (:cid commit) (:block commit))
+    (replace-head! root namespace expected-head (:cid commit))
+    (assoc commit :namespace namespace)))
+
+(defn resolve-name
+  "Resolve NAME in the selected namespace head, verifying the commit and
+  resolved definition block before returning its CID."
+  [root namespace name]
+  (let [head-cid (or (head root namespace)
+                     (throw (ex-info "namespace has no selected head"
+                                     {:problem :codebase/head-not-found :namespace namespace})))
+        cid (get-in (namespace-view root head-cid) [:bindings name])]
+    (when-not cid
+      (throw (ex-info "name not found in namespace" {:problem :codebase/name-not-found
+                                                      :namespace namespace :name name})))
+    (get-block root cid)
+    {:head head-cid :name name :cid cid}))

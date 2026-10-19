@@ -1,0 +1,332 @@
+(ns kagitaba.contract
+  "契約(subscription / membership / 継続課金)を kagitaba item の 1 section として
+  表す正準形と、その **時計に依存しない** 導出。
+
+  なぜ item の中に置くか: 契約は「アカウントとは別の何か」ではなく、既に持っている
+  アカウントの一側面。ログイン情報と契約情報を別 item に割ると、片方だけ更新されて
+  食い違う——1Password/Proton Pass が membership を 1 item にまとめているのと同じ理由で、
+  契約ごとに 1 item、その中の `Contract` section に契約事実を置く。
+
+  **欠損は 0 ではない。** 記録されていない金額は `:not-recorded`、壊れた値は
+  `:unparseable` を返し、どちらも数値 0 には決してならない。「未記録の月額」を 0 円と
+  して合計すると、合計は嘘になる(cloud-itonami-app の `account-services` が未計測の
+  使用量を `nil`/`:not-synced` に保つのと同じ規律)。
+
+  **秘匿性**: この section の field 型はどれも `kagitaba.field/sensitive-types` に
+  属さない——契約事実そのものは資格情報ではない。ただし kagi は item 単位で封緘するので、
+  同じ item の Login section にある `:concealed` と一緒に暗号化される。分類が
+  `:internal` であることは「平文で外に出してよい」を意味しない。
+
+  時計・乱数・IO を一切持たない純 `.cljc`。`today` を渡すのは呼び出し側の責務で、
+  ここには now が無い(同じ入力なら常に同じ出力)。"
+  (:require [clojure.string :as str]))
+
+;; ── 欠損の語彙 ───────────────────────────────────────────────────────────────
+
+(def not-recorded
+  "その事実がまだ記録されていない。0 でも false でも nil でもない。"
+  :contract/not-recorded)
+
+(def unparseable
+  "記録はされているが正準形に読めない。握り潰さず、そう報告する。"
+  :contract/unparseable)
+
+(defn recorded?
+  "実際の値か(欠損マーカーでないか)。"
+  [v]
+  (and (some? v) (not= v not-recorded) (not= v unparseable)))
+
+;; ── 語彙 ─────────────────────────────────────────────────────────────────────
+
+(def cycles
+  "課金周期 → 1 年あたりの課金回数。`:one-time` は継続課金ではないので回数を持たない。"
+  {:weekly 52 :monthly 12 :quarterly 4 :semiannual 2 :yearly 1 :one-time nil})
+
+(def statuses
+  "契約の現在状態。`:dormant` は「課金は無いがアカウントは残っている」——
+  kaiyaku が 縁 として切る対象になるのはこれも同じ。"
+  #{:active :trial :paused :cancelled :dormant})
+
+(def tribool
+  "yes/no/unknown。unknown を false に潰さない(自動更新の有無が不明なことと、
+  自動更新が無いことは別の事実)。"
+  #{:yes :no :unknown})
+
+;; ── field 仕様(この順で section に並ぶ) ─────────────────────────────────────
+
+(def field-specs
+  [{:id "plan" :title "plan" :type :string
+    :key :contract/plan :parse :text}
+   {:id "status" :title "status" :type :menu
+    :key :contract/status :parse :status}
+   {:id "amount-minor" :title "amount (minor units)" :type :string
+    :key :contract/amount-minor :parse :integer}
+   {:id "currency" :title "currency" :type :string
+    :key :contract/currency :parse :currency}
+   {:id "cycle" :title "billing cycle" :type :menu
+    :key :contract/cycle :parse :cycle}
+   {:id "started-on" :title "started on" :type :date
+    :key :contract/started-on :parse :date}
+   {:id "next-charge" :title "next charge" :type :date
+    :key :contract/next-charge :parse :date}
+   {:id "auto-renew" :title "auto renew" :type :menu
+    :key :contract/auto-renew :parse :tribool}
+   {:id "notice-days" :title "notice period (days)" :type :string
+    :key :contract/notice-days :parse :integer}
+   {:id "penalty-minor" :title "early-termination fee (minor units)" :type :string
+    :key :contract/penalty-minor :parse :integer}
+   {:id "payment-method" :title "payment method" :type :reference
+    :key :contract/payment-method :parse :text}
+   {:id "cancel-proc-id" :title "cancel procedure id" :type :string
+    :key :contract/cancel-proc-id :parse :text}
+   ;; 明細に出る加盟店名。「Claude Pro」の課金は明細では「ANTHROPIC」と出る——
+   ;; サービス名と加盟店表記は別物で、文字列としては一致しない。ここに 1 度書き
+   ;; 写しておくことだけが、課金と契約を**推測なしに**結びつける方法になる
+   ;; （突き合わせは kaiyaku.vault-ledger/reconcile）。
+   {:id "merchant-descriptor" :title "merchant on statement" :type :string
+    :key :contract/merchant-descriptor :parse :text}])
+
+(def section-id "contract")
+(def section-title "Contract")
+
+(def template
+  "`kagitaba.item/item*` の :sections にそのまま渡せる雛形(値は空)。"
+  [{:id section-id
+    :title section-title
+    :fields (mapv #(select-keys % [:id :title :type]) field-specs)}])
+
+(def ^:private spec-by-key (into {} (map (juxt :key identity)) field-specs))
+
+;; ── 暦(Howard Hinnant の civil-days。時計ではなく算術) ──────────────────────
+
+(defn- leap? [y]
+  (and (zero? (mod y 4)) (or (pos? (mod y 100)) (zero? (mod y 400)))))
+
+(defn- days-in-month [y m]
+  (case (long m)
+    (1 3 5 7 8 10 12) 31
+    (4 6 9 11) 30
+    2 (if (leap? y) 29 28)
+    nil))
+
+(defn days-from-civil
+  "[y m d] → 1970-01-01 からの通算日。proleptic Gregorian、負の日も返す。"
+  [[y m d]]
+  (let [y' (if (<= m 2) (dec y) y)
+        era (quot (if (>= y' 0) y' (- y' 399)) 400)
+        yoe (- y' (* era 400))
+        mp (mod (+ m 9) 12)
+        doy (+ (quot (+ (* 153 mp) 2) 5) (dec d))
+        doe (+ (* yoe 365) (quot yoe 4) (- (quot yoe 100)) doy)]
+    (+ (* era 146097) doe -719468)))
+
+(defn civil-from-days
+  "通算日 → [y m d]。`days-from-civil` の逆。"
+  [z]
+  (let [z' (+ z 719468)
+        era (quot (if (>= z' 0) z' (- z' 146096)) 146097)
+        doe (- z' (* era 146097))
+        yoe (quot (- (+ doe (quot doe 36524))
+                     (+ (quot doe 1460) (quot doe 146096)))
+                  365)
+        y (+ yoe (* era 400))
+        doy (- doe (+ (* 365 yoe) (quot yoe 4) (- (quot yoe 100))))
+        mp (quot (+ (* 5 doy) 2) 153)
+        d (inc (- doy (quot (+ (* 153 mp) 2) 5)))
+        m (+ mp (if (< mp 10) 3 -9))]
+    [(if (<= m 2) (inc y) y) m d]))
+
+(defn plus-days [date n] (civil-from-days (+ (days-from-civil date) n)))
+
+(defn plus-months
+  "月を n 進める。存在しない日は月末に丸める(1/31 + 1ヶ月 = 2/28、閏年は 2/29)。
+  月末丸めは請求日の実運用と一致し、日付を無効なまま持ち回るより安全。"
+  [[y m d] n]
+  (let [total (+ (* 12 y) (dec m) n)
+        y' (quot total 12)
+        m' (inc (mod total 12))]
+    [y' m' (min d (days-in-month y' m'))]))
+
+;; ── parse / print ────────────────────────────────────────────────────────────
+
+(def ^:private date-re #"^(\d{4})-(\d{2})-(\d{2})$")
+
+(defn- parse-long* [s]
+  )
+
+(defn parse-date
+  "\"YYYY-MM-DD\" → [y m d]。実在しない日付(2026-02-30 等)は nil。"
+  [s]
+  (when-let [[_ y m d] (and (string? s) (re-matches date-re s))]
+    (let [y (parse-long* y) m (parse-long* m) d (parse-long* d)]
+      (when (and y m d (<= 1 m 12))
+        (let [dim (days-in-month y m)]
+          (when (<= 1 d dim) [y m d]))))))
+
+(defn print-date [[y m d]]
+  (str y "-" (when (< m 10) "0") m "-" (when (< d 10) "0") d))
+
+(defn- parse-enum [s allowed]
+  (let [k (some-> s str/trim str/lower-case (str/replace "_" "-") keyword)]
+    (when (contains? allowed k) k)))
+
+(defn- parse-value [parse raw]
+  (cond
+    (or (nil? raw) (and (string? raw) (str/blank? raw))) not-recorded
+    :else
+    (let [s (str/trim (str raw))]
+      (or (case parse
+            :text s
+            :integer (parse-long* s)
+            :currency (when (re-matches #"^[A-Za-z]{3}$" s) (str/upper-case s))
+            :date (parse-date s)
+            :cycle (parse-enum s (set (keys cycles)))
+            :status (parse-enum s statuses)
+            :tribool (parse-enum s tribool)
+            nil)
+          unparseable))))
+
+(defn- print-value [parse v]
+  (cond
+    (nil? v) nil
+    (= v not-recorded) nil
+    (keyword? v) (name v)
+    (and (= parse :date) (vector? v)) (print-date v)
+    :else (str v)))
+
+;; ── section の組み立て / 読み出し ────────────────────────────────────────────
+
+(defn section
+  "契約 map(`:contract/*` キー、または短縮キー `:plan` 等)から `Contract` section を作る。
+  未指定の field も雛形として空のまま残す——後で埋める場所が見えているほうがよい。"
+  [contract]
+  {:id section-id
+   :title section-title
+   :fields (mapv (fn [{:keys [id title type key parse]}]
+                   (let [v (if (contains? contract key)
+                             (get contract key)
+                             (get contract (keyword (name key))))]
+                     {:id id :title title :type type
+                      :value (print-value parse v)}))
+                 field-specs)})
+
+(defn contract-section
+  "item から `Contract` section を取り出す。無ければ nil。
+
+  id と title の**どちらか**で照合する。id だけで引くと、外から入ってきた item が
+  すべて素通りする —— 1PUX の section は title を持つが id を持たないことがあり、
+  `kagitaba.import.onepux` はそれをそのまま写すので `:section/id` が nil になる。
+  実測（2026-07-30）: 1Password で `Contract` section を作って書き出した item を
+  import すると `contract?` が false を返し、金額も周期も入っているのに契約として
+  一度も認識されなかった。title 照合は大文字小文字と前後空白を無視する
+  （1Password 側の表記揺れはこちらの問題ではない）。"
+  [item]
+  (let [norm #(some-> % str/trim str/lower-case)
+        title (norm section-title)]
+    (first (filter #(or (= section-id (:section/id %))
+                        (= title (norm (:section/title %))))
+                   (:item/sections item)))))
+
+(defn contract?
+  "この item は契約事実を持つか。"
+  [item]
+  (some? (contract-section item)))
+
+(defn read-contract
+  "item → 正準契約 map。全キーが必ず存在し、値は実値 / `:contract/not-recorded` /
+  `:contract/unparseable` のいずれか。**欠損を 0 に変換しない。**"
+  [item]
+  (let [fields (:section/fields (contract-section item))
+        by-id (into {} (map (juxt :field/id identity)) fields)]
+    (into {:contract/item-id (:item/id item)
+           :contract/title (:item/title item)}
+          (map (fn [{:keys [id key parse]}]
+                 [key (parse-value parse (:field/value (get by-id id)))]))
+          field-specs)))
+
+(defn problems
+  "読めなかった field の一覧。空なら全て正準形。未記録は problem ではない
+  (記録されていないことと壊れていることは別の事実)。"
+  [contract]
+  (into []
+        (keep (fn [[k v]]
+                (when (= v unparseable)
+                  {:field (:id (spec-by-key k)) :key k :reason :unparseable})))
+        contract))
+
+;; ── 導出(すべて純関数。今日は引数で渡す) ───────────────────────────────────
+
+(defn charges-per-year
+  "1 年あたりの課金回数。周期が未記録/one-time なら欠損マーカーを返す。"
+  [contract]
+  (let [c (:contract/cycle contract)]
+    (if (recorded? c)
+      (or (get cycles c) not-recorded)
+      c)))
+
+(defn annualized-minor
+  "年額(minor units)。金額か周期のどちらかが欠ければ欠損のまま伝播する
+  ——片方を勝手に埋めて合計を作らない。"
+  [contract]
+  (let [a (:contract/amount-minor contract)
+        n (charges-per-year contract)]
+    (if (and (recorded? a) (recorded? n)) (* a n) not-recorded)))
+
+(defn advance-charge
+  "課金日を 1 周期進める。周期が未記録/one-time なら欠損マーカー。"
+  [date cycle]
+  (case cycle
+    :weekly (plus-days date 7)
+    :monthly (plus-months date 1)
+    :quarterly (plus-months date 3)
+    :semiannual (plus-months date 6)
+    :yearly (plus-months date 12)
+    not-recorded))
+
+(defn next-charge-on-or-after
+  "記録された次回課金日が `today` より過去なら、周期で未来まで巻き進める。
+  停止条件を持つ有界ループ(最大 512 周期)——無効な周期で回り続けない。"
+  [contract today]
+  (let [d (:contract/next-charge contract)
+        c (:contract/cycle contract)]
+    (if-not (and (recorded? d) (recorded? c) (get cycles c))
+      (if (recorded? d) d not-recorded)
+      (loop [d d n 0]
+        (cond
+          (>= n 512) unparseable
+          (>= (days-from-civil d) (days-from-civil today)) d
+          :else (let [d' (advance-charge d c)]
+                  (if (recorded? d') (recur d' (inc n)) not-recorded)))))))
+
+(defn notice-deadline
+  "予告期間を守って解約するための最終日 = 次回課金日 − 予告日数。
+  **この日付は回避対象ではない**——kaiyaku の G8 と同じで、開示された
+  解約コストとして提示するためだけに計算する。"
+  [contract today]
+  (let [charge (next-charge-on-or-after contract today)
+        days (:contract/notice-days contract)]
+    (cond
+      (not (recorded? charge)) charge
+      (not (recorded? days)) not-recorded
+      :else (plus-days charge (- days)))))
+
+(defn days-until
+  "today から date までの日数。過去なら負。欠損は伝播。"
+  [date today]
+  (if (recorded? date)
+    (- (days-from-civil date) (days-from-civil today))
+    date))
+
+(defn summary
+  "app が描画するための読みモデル。数えられない値は数えない。"
+  [item today]
+  (let [c (read-contract item)
+        charge (next-charge-on-or-after c today)
+        deadline (notice-deadline c today)]
+    (assoc c
+           :contract/next-charge-effective charge
+           :contract/days-to-charge (days-until charge today)
+           :contract/notice-deadline deadline
+           :contract/days-to-notice-deadline (days-until deadline today)
+           :contract/annualized-minor (annualized-minor c)
+           :contract/problems (problems c))))

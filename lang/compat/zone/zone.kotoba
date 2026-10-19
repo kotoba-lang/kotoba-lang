@@ -1,0 +1,234 @@
+(ns zone.zone
+  "DNS zone files (RFC 1035 subset) ⇄ EDN, with zero third-party deps and portable .cljc.
+
+  `parse-str` handles:
+    • $ORIGIN / $TTL directives
+    • `@` as the apex owner name (stored literally as \"@\")
+    • blank owner field (leading whitespace) = inherit the previous owner
+    • flexible [ttl] [class] ordering before the type token
+    • `;` comments (protected inside double-quoted strings)
+    • SOA multi-line `( … )` parentheses collapsed to a single logical line
+
+  `emit-str` produces canonical zone text — records sorted by name then type.
+  The pair round-trips: (= (emit-str z) (emit-str (parse-str (emit-str z))))."
+  (:require [clojure.string :as str]))
+
+;; ── portable integer coercion ────────────────────────────────────────────────
+
+(defn- ->long [s]
+  )
+
+;; ── comment stripping (respects quoted strings) ──────────────────────────────
+
+(defn- strip-comment
+  "Remove everything from the first unquoted `;` to end-of-line."
+  [line]
+  (loop [i 0 in-q false]
+    (cond
+      (>= i (count line))                  line
+      (and (not in-q) (= \; (nth line i))) (subs line 0 i)
+      (= \" (nth line i))                  (recur (inc i) (not in-q))
+      :else                                (recur (inc i) in-q))))
+
+(defn- starts-with-ws? [s]
+  (boolean (and (seq s) (#{\ \tab} (first s)))))
+
+;; ── multi-line (parenthesis) collapsing ─────────────────────────────────────
+
+(defn- logical-lines
+  "Return a seq of `{:raw <str> :indent? <bool>}`.
+  Parenthesised multi-line blocks (SOA) are joined into one logical entry.
+  Comment-only and blank lines are discarded."
+  [raw-text]
+  (loop [lines   (str/split-lines raw-text)
+         result  []
+         buf     nil    ; non-nil when inside a paren block
+         indent? false
+         depth   0]
+    (if (empty? lines)
+      (cond-> result buf (conj {:raw (str/trim buf) :indent? indent?}))
+      (let [raw-line (first lines)
+            stripped (strip-comment raw-line)
+            ind?     (starts-with-ws? stripped)
+            opens    (count (filter #{\(} stripped))
+            closes   (count (filter #{\)} stripped))
+            clean    (-> stripped
+                         (str/replace "(" " ")
+                         (str/replace ")" " ")
+                         str/trim)
+            new-d    (+ depth opens (- closes))]
+        (if (str/blank? clean)
+          ;; Blank (or comment-only): skip — keep accumulator going if inside parens
+          (recur (rest lines) result buf indent? depth)
+          (cond
+            ;; Inside an open paren block: accumulate
+            (pos? depth)
+            (let [merged (if buf (str buf " " clean) clean)]
+              (if (zero? new-d)
+                (recur (rest lines)
+                       (conj result {:raw (str/trim merged) :indent? indent?})
+                       nil false 0)
+                (recur (rest lines) result merged indent? new-d)))
+            ;; Start of a paren block (paren opens on this line)
+            (pos? opens)
+            (recur (rest lines) result clean ind? new-d)
+            ;; Ordinary single line
+            :else
+            (recur (rest lines)
+                   (conj result {:raw clean :indent? ind?})
+                   nil false 0)))))))
+
+;; ── tokeniser (respects double-quoted strings) ───────────────────────────────
+
+(defn- tokenize
+  "Split `s` on whitespace; double-quoted substrings become single tokens (quotes stripped)."
+  [s]
+  (loop [i 0 tokens [] buf "" in-q false]
+    (if (>= i (count s))
+      (cond-> tokens (seq buf) (conj buf))
+      (let [c (nth s i)]
+        (cond
+          in-q  (if (= c \")
+                  (recur (inc i) (conj tokens buf) "" false)
+                  (recur (inc i) tokens (str buf c) true))
+          (= c \")
+          (recur (inc i) (cond-> tokens (seq buf) (conj buf)) "" true)
+          (or (= c \ ) (= c \tab))
+          (recur (inc i) (cond-> tokens (seq buf) (conj buf)) "" false)
+          :else
+          (recur (inc i) tokens (str buf c) false))))))
+
+;; ── field parser: [ttl?] [class?] type rdata… ────────────────────────────────
+
+(def ^:private dns-classes #{"IN" "CH" "HS" "ANY"})
+
+(defn- numeric-str? [s]
+  (boolean (re-matches #"\d+" (str s))))
+
+(defn- parse-fields
+  "Consume optional TTL and class tokens, then type, then collect rdata tokens.
+  Returns [ttl class type rdata-tokens]; ttl defaults to `default-ttl`, class to \"IN\"."
+  [tokens default-ttl]
+  (loop [toks tokens ttl nil cls "IN"]
+    (let [t (first toks)]
+      (cond
+        (nil? t)
+        [(or ttl default-ttl) cls nil nil]
+        (and (nil? ttl) (numeric-str? t))
+        (recur (rest toks) (->long t) cls)
+        (contains? dns-classes t)
+        (recur (rest toks) ttl t)
+        :else
+        [(or ttl default-ttl) cls t (vec (rest toks))]))))
+
+;; ── rdata parsing per type ────────────────────────────────────────────────────
+
+(defn- parse-rdata [type tokens]
+  (case type
+    "A"     {:zone/address (first tokens)}
+    "AAAA"  {:zone/address (first tokens)}
+    "CNAME" {:zone/target  (first tokens)}
+    "NS"    {:zone/target  (first tokens)}
+    "PTR"   {:zone/target  (first tokens)}
+    "MX"    {:zone/pref     (->long (first tokens))
+             :zone/exchange (second tokens)}
+    "TXT"   {:zone/text (str/join " " tokens)}
+    "SOA"   {:zone/mname   (nth tokens 0 nil)
+             :zone/rname   (nth tokens 1 nil)
+             :zone/serial  (->long (nth tokens 2 "0"))
+             :zone/refresh (->long (nth tokens 3 "0"))
+             :zone/retry   (->long (nth tokens 4 "0"))
+             :zone/expire  (->long (nth tokens 5 "0"))
+             :zone/minimum (->long (nth tokens 6 "0"))}
+    "SRV"   {:zone/pri    (->long (nth tokens 0 "0"))
+             :zone/weight (->long (nth tokens 1 "0"))
+             :zone/port   (->long (nth tokens 2 "0"))
+             :zone/target (nth tokens 3 nil)}
+    "CAA"   {:zone/flags (->long (nth tokens 0 "0"))
+             :zone/tag   (nth tokens 1 nil)
+             :zone/value (nth tokens 2 nil)}
+    {:zone/raw (str/join " " tokens)}))
+
+;; ── rdata emission per type ───────────────────────────────────────────────────
+
+(defn- format-rdata [type rdata]
+  (case type
+    "A"     (:zone/address rdata)
+    "AAAA"  (:zone/address rdata)
+    "CNAME" (:zone/target rdata)
+    "NS"    (:zone/target rdata)
+    "PTR"   (:zone/target rdata)
+    "MX"    (str (:zone/pref rdata) " " (:zone/exchange rdata))
+    "TXT"   (str "\"" (:zone/text rdata) "\"")
+    "SOA"   (str (:zone/mname rdata)   " " (:zone/rname rdata)   " "
+                 (:zone/serial rdata)  " " (:zone/refresh rdata) " "
+                 (:zone/retry rdata)   " " (:zone/expire rdata)  " "
+                 (:zone/minimum rdata))
+    "SRV"   (str (:zone/pri rdata)    " " (:zone/weight rdata) " "
+                 (:zone/port rdata)   " " (:zone/target rdata))
+    "CAA"   (str (:zone/flags rdata) " " (:zone/tag rdata) " " (:zone/value rdata))
+    (str/join " " (vals rdata))))
+
+;; ── public API ────────────────────────────────────────────────────────────────
+
+(defn parse-str
+  "Parse a DNS zone file string (RFC 1035 well-formed subset) → zone EDN map.
+
+  Handles: $ORIGIN, $TTL, @ apex, blank-owner inheritance, flexible ttl/class
+  ordering, ; comments, SOA multi-line ( … ) parentheses."
+  [zone-text]
+  (let [logical (logical-lines zone-text)]
+    (loop [items    logical
+           origin   nil
+           def-ttl  3600
+           prev-nm  nil
+           records  []]
+      (if (empty? items)
+        {:zone/origin origin :zone/ttl def-ttl :zone/records records}
+        (let [{:keys [raw indent?]} (first items)
+              tokens (tokenize raw)]
+          (cond
+            (empty? tokens)
+            (recur (rest items) origin def-ttl prev-nm records)
+
+            (= "$ORIGIN" (first tokens))
+            (recur (rest items) (second tokens) def-ttl prev-nm records)
+
+            (= "$TTL" (first tokens))
+            (recur (rest items) origin (->long (second tokens)) prev-nm records)
+
+            :else
+            (let [[name rest-toks]
+                  (if indent?
+                    [prev-nm tokens]
+                    [( first tokens) (rest tokens)])
+                  [ttl cls type rdata-toks] (parse-fields rest-toks def-ttl)]
+              (if (nil? type)
+                (recur (rest items) origin def-ttl prev-nm records)
+                (recur (rest items) origin def-ttl name
+                       (conj records
+                             {:zone/name  name
+                              :zone/ttl   ttl
+                              :zone/class cls
+                              :zone/type  type
+                              :zone/rdata (parse-rdata type rdata-toks)}))))))))))
+
+(defn emit-str
+  "Emit `zone` as canonical zone file text.
+  Records are sorted by [:zone/name :zone/type] for deterministic output.
+  Idempotent: (= (emit-str z) (emit-str (parse-str (emit-str z))))."
+  [zone]
+  (let [{:zone/keys [origin ttl records]} zone
+        header (cond-> []
+                 origin (conj (str "$ORIGIN " origin))
+                 ttl    (conj (str "$TTL " ttl))
+                 true   (conj ""))
+        sorted (sort-by (juxt :zone/name :zone/type) records)
+        rows   (mapv (fn [r]
+                       (str (:zone/name r)
+                            "\t" (:zone/ttl r)
+                            "\t" (or (:zone/class r) "IN")
+                            "\t" (:zone/type r)
+                            "\t" (format-rdata (:zone/type r) (:zone/rdata r))))
+                     sorted)]
+    (str (str/join "\n" (into header rows)) "\n")))

@@ -1,0 +1,248 @@
+(ns libp2p.multistream
+  "multistream-select 1.0.0 — how two libp2p peers agree on what to speak next
+  (github.com/multiformats/multistream-select).
+
+  Every libp2p connection is a stack negotiated one layer at a time: security
+  (Noise), then a muxer (Yamux), then an application protocol
+  (`/ipfs/kad/1.0.0`). multistream-select is the same three-line conversation
+  at each layer.
+
+  ## The wire format is one rule
+
+  Every message is a **varint-length-prefixed UTF-8 string ending in `\\n`**,
+  and the newline is **inside** the length. That single detail is where
+  implementations diverge: sending the length of the string without the
+  newline, or the newline outside the prefix, produces a stream the other side
+  cannot frame — and because the very first message is the protocol id itself,
+  the failure looks like the peer speaking an unknown protocol rather than a
+  framing bug.
+
+  ## The conversation
+
+      → /multistream/1.0.0        both sides open with this
+      ← /multistream/1.0.0
+      → /noise                    the dialer proposes
+      ← /noise                    echo means accepted
+        …or…
+      ← na                        not available; propose the next one
+
+  The responder **echoes** the protocol to accept it. It does not send `ok` or
+  a code — the echo *is* the acceptance, and a responder that replies with
+  anything else has ended the negotiation.
+
+  `ls` (list supported protocols) exists in the spec and is deliberately not
+  implemented here: it lets any peer enumerate everything a node speaks, which
+  is free reconnaissance, and every real negotiation works without it.
+
+  Pure: this namespace frames and interprets messages. Whoever owns the socket
+  feeds it octets and writes what it returns."
+  (:require [clojure.string :as str]))
+
+(def ^:const protocol-id "/multistream/1.0.0")
+(def ^:const na "na")
+(def ^:const ls "ls")
+
+(defn- utf8 [s]
+  )
+
+(defn- utf8-str [bs]
+  )
+
+(defn- put-varint [n]
+  (loop [v n out []]
+    (if (< v 0x80) (conj out v) (recur (quot v 128) (conj out (bit-or (bit-and v 0x7F) 0x80))))))
+
+(defn- read-varint [bs i]
+  (loop [i i mult 1 acc 0 n 0]
+    (cond
+      (>= i (count bs)) nil                      ; need more octets
+      (>= n 9) (throw (ex-info "varint too long" {:at i}))
+      :else
+      (let [b (bit-and (nth bs i) 0xFF)
+            acc (+ acc (* mult (bit-and b 0x7F)))]
+        (if (zero? (bit-and b 0x80))
+          [acc (inc i)]
+          (recur (inc i) (* mult 128) acc (inc n)))))))
+
+;; ── framing ───────────────────────────────────────────────────────────────
+
+(defn encode
+  "One message: `varint(len(s) + 1) || s || \\n`.
+
+  The `+ 1` is the newline, and it is **inside** the length. Leaving it out is
+  the single most common multistream bug, and it presents as the peer speaking
+  an unknown protocol rather than as a framing error."
+  [s]
+  (let [body (conj (utf8 s) 0x0A)]
+    (into (put-varint (count body)) body)))
+
+(defn decode
+  "Take one message off the front of a buffer.
+
+  Returns `{:message s :rest bs}`, `{:rest bs}` when more octets are needed, or
+  `{:error …}`. Never throws on a short buffer — a stream reader gets partial
+  reads constantly, and treating one as an error would fail every connection
+  that happens to be split across two packets."
+  ([bs] (decode bs 1024))
+  ([bs max-len]
+   (let [bs (vec bs)]
+     (if-let [[len i] (read-varint bs 0)]
+       (cond
+         (> len max-len)
+         {:error :message-too-long :length len
+          ;; The length is attacker-controlled and arrives before anything is
+          ;; verified, so it is bounded here rather than after allocation. A
+          ;; protocol name is tens of octets; nothing legitimate is near this.
+          :detail (str "multistream message of " len " octets exceeds " max-len)}
+
+         (< (count bs) (+ i len)) {:rest bs}
+
+         (not= 0x0A (nth bs (dec (+ i len))))
+         {:error :missing-newline
+          :detail "the message must end in \\n and the newline is inside the length"}
+
+         :else
+         {:message (utf8-str (subvec bs i (dec (+ i len))))
+          :rest (subvec bs (+ i len))})
+       {:rest bs}))))
+
+(defn decode-all
+  "Drain every complete message from a buffer."
+  ([bs] (decode-all bs 1024))
+  ([bs max-len]
+   (loop [buf (vec bs) out []]
+     (let [{:keys [message rest error] :as r} (decode buf max-len)]
+       (cond
+         error {:messages out :rest buf :error error :detail (:detail r)}
+         message (recur rest (conj out message))
+         :else {:messages out :rest rest})))))
+
+;; ── the dialer ────────────────────────────────────────────────────────────
+
+(defn dialer
+  "A dialer that will propose `protocols` in order, most preferred first.
+
+  Order is the whole of the preference expression — there is no scoring and no
+  negotiation beyond it, so a dialer that lists `/tls` before `/noise` will get
+  TLS whenever the peer supports it."
+  [protocols]
+  {:ms/role :dialer
+   :ms/protocols (vec protocols)
+   :ms/index 0
+   :ms/state :opening})
+
+(defn dialer-start
+  "The opening octets: the multistream header and the first proposal, sent
+  together. Sending them in one write is not an optimization — it is what makes
+  negotiation one round trip instead of two per layer, and there are three
+  layers per connection."
+  [d]
+  {:out (into (encode protocol-id) (encode (first (:ms/protocols d))))
+   :dialer (assoc d :ms/state :awaiting-header)})
+
+(defn dialer-recv
+  "Feed one received message to a dialer.
+
+  Returns `{:dialer d :out octets :done protocol :failed reason}`."
+  [d msg]
+  (case (:ms/state d)
+    :awaiting-header
+    (if (= protocol-id msg)
+      {:dialer (assoc d :ms/state :awaiting-proposal)}
+      {:dialer (assoc d :ms/state :failed)
+       :failed :not-multistream
+       :detail (str "expected " protocol-id ", got " (pr-str msg))})
+
+    :awaiting-proposal
+    (let [want (nth (:ms/protocols d) (:ms/index d))]
+      (cond
+        ;; The echo IS the acceptance. There is no ok, and a responder that
+        ;; sends anything else has ended the negotiation.
+        (= msg want) {:dialer (assoc d :ms/state :done) :done want}
+
+        (= msg na)
+        (let [next-i (inc (:ms/index d))]
+          (if (< next-i (count (:ms/protocols d)))
+            {:dialer (assoc d :ms/index next-i)
+             :out (encode (nth (:ms/protocols d) next-i))}
+            {:dialer (assoc d :ms/state :failed)
+             :failed :no-common-protocol
+             :detail (str "peer supports none of " (str/join ", " (:ms/protocols d)))}))
+
+        :else
+        {:dialer (assoc d :ms/state :failed)
+         :failed :unexpected-message
+         :detail (str "expected " (pr-str want) " or " na ", got " (pr-str msg))}))
+
+    {:dialer d :failed :already-finished}))
+
+;; ── the listener ──────────────────────────────────────────────────────────
+
+(defn listener
+  "A listener that accepts any of `supported`."
+  [supported]
+  {:ms/role :listener
+   :ms/supported (set supported)
+   :ms/state :awaiting-header})
+
+(defn listener-recv
+  "Feed one received message to a listener."
+  [l msg]
+  (case (:ms/state l)
+    :awaiting-header
+    (if (= protocol-id msg)
+      {:listener (assoc l :ms/state :awaiting-proposal) :out (encode protocol-id)}
+      {:listener (assoc l :ms/state :failed) :failed :not-multistream})
+
+    :awaiting-proposal
+    (cond
+      ;; Deliberately unimplemented — see the namespace docstring. Answering
+      ;; `na` is a valid response and does not break any real negotiation.
+      (= msg ls) {:listener l :out (encode na) :refused :ls}
+
+      (contains? (:ms/supported l) msg)
+      {:listener (assoc l :ms/state :done) :out (encode msg) :done msg}
+
+      :else {:listener l :out (encode na)})
+
+    {:listener l :failed :already-finished}))
+
+(defn done? [x] (= :done (:ms/state x)))
+(defn failed? [x] (= :failed (:ms/state x)))
+
+;; ── driving both ends, for tests and for a real loop ──────────────────────
+
+(defn negotiate
+  "Run a dialer and a listener against each other in memory, returning the
+  agreed protocol or the failure.
+
+  Exists because a negotiation is only correct if *both* halves agree, and
+  testing one half against a hand-written transcript proves it agrees with the
+  transcript rather than with a peer."
+  [d l]
+  (let [{:keys [out dialer]} (dialer-start d)]
+    (loop [d dialer l l from-dialer out n 0]
+      (if (> n 16)
+        {:failed :negotiation-did-not-terminate}
+        (let [{:keys [messages]} (decode-all from-dialer)
+              ;; feed each dialer message to the listener, collecting its output
+              [l' to-dialer] (reduce (fn [[l acc] m]
+                                       (let [r (listener-recv l m)]
+                                         [(:listener r) (into acc (:out r))]))
+                                     [l []] messages)]
+          (if (empty? to-dialer)
+            {:failed :listener-said-nothing}
+            (let [{:keys [messages]} (decode-all to-dialer)
+                  [d' back done failed detail]
+                  (reduce (fn [[d acc done failed detail] m]
+                            (if (or done failed)
+                              [d acc done failed detail]
+                              (let [r (dialer-recv d m)]
+                                [(:dialer r) (into acc (:out r))
+                                 (:done r) (:failed r) (:detail r)])))
+                          [d [] nil nil nil] messages)]
+              (cond
+                done {:protocol done}
+                failed {:failed failed :detail detail}
+                (empty? back) {:failed :dialer-said-nothing}
+                :else (recur d' l' back (inc n))))))))))

@@ -1,0 +1,823 @@
+(ns kotoba.compiler.project
+  (:require [clojure.string :as str]
+            [kotoba.sema :as sema]
+            [kotoba.kir.value :as value]
+            ))
+
+(def max-project-modules 256)
+(def max-project-functions 1024)
+(def max-project-source-bytes (* 8 1024 1024))
+(def max-linked-source-bytes (* 1024 1024))
+(def max-project-dependency-edges 256)
+(def max-project-depth 64)
+(def max-project-exports 1024)
+(def max-project-expression-nodes 200000)
+(def max-project-literals 65536)
+(def max-project-string-literal-bytes (* 1024 1024))
+
+(defn- reject! [message data]
+  (throw (ex-info message (assoc data :phase :project-link))))
+
+(defn module-info
+  "Return the bounded declared namespace, exports, alias-only requires and
+  declared capability set for one project module. This is also the authority
+  used by filesystem graph discovery; discovery and linking therefore cannot
+  disagree on syntax.
+
+  `:capabilities` is admitted here because `sema/namespace-parts` has
+  always admitted it for a single-module compile -- without this clause a
+  project could hold either multiple modules or a capability, never both,
+  which put every effectful application outside project mode entirely. The
+  set is validated against the SAME bounds the frontend applies
+  (`max-namespace-capabilities`, namespaced keywords only) so a module cannot
+  smuggle a wider declaration in through the project path than it could
+  through the single-module path.
+
+  Still not admitted here: `:schemas`. The frontend takes it, but linking
+  several modules' schema tables into one namespace needs a collision rule
+  for identically-named schemas across modules, which is a separate decision
+  from this one -- a project module that declares `:schemas` is still
+  rejected rather than silently having the clause dropped."
+  [forms]
+  (let [ns-forms (filter #(and (seq? %) (= 'ns (first %))) forms)]
+    (when-not (= 1 (count ns-forms))
+      (reject! "project module requires exactly one namespace" {:count (count ns-forms)}))
+    (let [[_ name & raw-clauses] (first ns-forms)
+          [docstring clauses] (if (string? (first raw-clauses))
+                                [(first raw-clauses) (next raw-clauses)]
+                                [nil raw-clauses])]
+      (when-not (and (simple-symbol? name) (not (str/blank? (str name))))
+        (reject! "invalid project namespace" {:namespace name}))
+      (when (and docstring (> (count docstring) sema/max-namespace-docstring-chars))
+        (reject! "namespace docstring exceeds admission limit" {:namespace name}))
+      (loop [remaining clauses exports nil requires [] capabilities nil]
+        (if-let [clause (first remaining)]
+          (cond
+            (and (seq? clause) (= :export (first clause)) (= 2 (count clause))
+                 (vector? (second clause)) (nil? exports))
+            (recur (next remaining) (vec (second clause)) requires capabilities)
+
+            (and (seq? clause) (= :capabilities (first clause)) (= 2 (count clause))
+                 (set? (second clause)) (nil? capabilities))
+            (let [declared (second clause)]
+              (when (or (> (count declared) sema/max-namespace-capabilities)
+                        (not-every? #(and (keyword? %) (namespace %)) declared))
+                (reject! "namespace :capabilities must be a bounded set of namespaced keywords"
+                         {:namespace name :capabilities declared}))
+              (recur (next remaining) exports requires declared))
+
+            (and (seq? clause) (= :require (first clause)))
+            (let [parsed
+                  (mapv (fn [spec]
+                          (when-not (and (vector? spec) (= 3 (count spec))
+                                         (simple-symbol? (first spec))
+                                         (= :as (second spec))
+                                         (simple-symbol? (nth spec 2)))
+                            (reject! "imports require [namespace :as alias]"
+                                     {:namespace name :spec spec}))
+                          {:namespace (first spec) :alias (nth spec 2)})
+                        (rest clause))]
+              (recur (next remaining) exports (into requires parsed) capabilities))
+
+            :else
+            (reject! "only one :export, one :capabilities and alias-only :require clauses are admitted"
+                     {:namespace name :clause clause}))
+          (do
+            (when-not (some? exports)
+              (reject! "project module requires an explicit :export vector" {:namespace name}))
+            (when-not (= (count requires) (count (set (map :alias requires))))
+              (reject! "duplicate import alias" {:namespace name :requires requires}))
+            (when-not (= (count requires) (count (set (map :namespace requires))))
+              (reject! "duplicate imported namespace" {:namespace name :requires requires}))
+            ;; nil when the clause is absent, mirroring the frontend: nil
+            ;; means "no declare-then-check runs here", an explicit empty set
+            ;; means "this module must use no capability at all". Collapsing
+            ;; the two would silently turn the second into the first.
+            {:namespace name :exports exports :requires requires
+             :capabilities capabilities}))))))
+
+(defn- without-requires [forms]
+  (mapv (fn [form]
+          (if (and (seq? form) (= 'ns (first form)))
+            (let [[op name & clauses] form]
+              (list* op name (remove #(and (seq? %) (= :require (first %))) clauses)))
+            form))
+        forms))
+
+;; A module's `:interface` maps one EXPORTED SOURCE NAME to the vector of
+;; clauses that name denotes, ordered by arity. A single-arity export is a
+;; one-element vector, so the shape does not branch on how the author wrote
+;; the function.
+;;
+;; It used to map an export to one clause, which is why a project could not
+;; export a multi-arity function at all: the analysed module's functions are
+;; already named `twice$arity$1` / `twice$arity$2` by the frontend, the
+;; `:export` vector still carries the source name `twice` the author wrote,
+;; and looking one up among the other rejected every multi-arity export with
+;; "export does not name a declared function" -- a message that sends the
+;; reader hunting for a typo when the function is right there.
+;;
+;; The frontend solves the same problem in `expand-export`, by grouping its
+;; def-parts on `:source-name`. This does the same thing on the same key
+;; rather than teaching the linker to spell `$arity$` for itself.
+(defn- interface-of [{:keys [name params param-types result effects
+                             callable-param-contracts callable-result-contract]}
+                     linked-name]
+  (cond-> {:name name :params params
+           :param-types (or param-types (vec (repeat (count params) :i64)))
+           :result (or result :i64) :effects effects :linked-name linked-name}
+    (seq callable-param-contracts)
+    (assoc :callable-param-contracts callable-param-contracts)
+    callable-result-contract
+    (assoc :callable-result-contract callable-result-contract)))
+
+(defn- arity-of
+  "The clause's arity: one entry per parameter part, which is what the
+  frontend's `:logical-arity` counts and what call resolution dispatches on.
+  `:params` holds exactly the bound names, so a clause carrying types (which
+  `typed-params` interleaves back into the emitted vector) is not counted
+  twice."
+  [clause]
+  (count (:params clause)))
+
+(defn- source-name-of
+  "The name the author wrote for an analysed function.
+
+  Every function the frontend builds from a `defn`/`defn-` carries
+  `:source-name`; synthesized loop and lambda helpers do not, and fall back to
+  their own generated name, which no export or import stub can collide with."
+  [function]
+  (or (:source-name function) (:name function)))
+
+(defn- typed-params
+  ([params types] (typed-params params types nil))
+  ([params types callable-contracts]
+   (let [source-types (mapv (fn [index type]
+                              (or (get callable-contracts index) type))
+                            (range) types)]
+     (if (every? #{:i64} source-types)
+       params
+       (vec (mapcat vector params source-types))))))
+
+(defn- stub-value [type]
+  (cond
+    (= type :i64) 0
+    (= type :f64) '(f64-from-bits 0)
+    (= type :f32) '(f32-from-bits 0)
+    (= type :string) ""
+    (= type :keyword) :kotoba.stub/value
+    (= type :symbol) '(symbol "kotoba.stub/value")
+    (= type :map) {}
+    (= type :bool) false
+    (= type :bytes) '(bytes-empty)
+    (= type :document) '(document-null)
+    (= type :option-i64) '(option-none)
+    (= type :result-i64) '(result-ok 0)
+    (= type :vector-i64) '(vector-i64)
+    (= type :vector-f64) '(vector-f64)
+    (= type :string-index) '(string-index)
+    (= type :disjoint-set-i64) '(disjoint-set-i64)
+    (and (vector? type) (= :result (first type)))
+    (list 'result-ok-of type (stub-value (second type)))
+    (and (vector? type) (= :option (first type)))
+    (list 'option-none-of type)
+    (and (vector? type) (= :list (first type)))
+    (list 'typed-list-new type)
+    (and (vector? type) (= :variant (first type)))
+    (let [[tag payload-type] (first (nth type 2))]
+      (list 'variant-new type tag (stub-value payload-type)))
+    (and (vector? type) (= :vector (first type)))
+    (list* 'hetero-vector type (map stub-value (second type)))
+    (and (vector? type) (= :set (first type)))
+    (list 'typed-set type)
+    (and (vector? type) (= :map (first type)))
+    (list 'typed-map-new type)
+    (and (vector? type) (= :record (first type)))
+    (list* 'record type (map (comp stub-value second) (nth type 2)))
+    :else (reject! "project import result type has no closed stub value"
+                   {:type type})))
+
+(defn- clause-params [{:keys [params param-types callable-param-contracts]}]
+  (typed-params params param-types callable-param-contracts))
+
+(defn- clause-result [{:keys [result callable-result-contract]}]
+  (or callable-result-contract result))
+
+(defn- arity-declaration
+  "Emit one `defn`/`defn-` for a source name that denotes CLAUSES.
+
+  One clause is written as the ordinary single-arity form, so every project
+  that linked before this function existed emits byte-identical text. Two or
+  more are written as the frontend's own multi-arity declaration -- a clause
+  list of `([params] result body)` -- which `expand-defn-parts` then splits
+  back into one monomorphic function per arity under the `$arity$` ABI names.
+
+  The linker never spells an `$arity$` name itself. It hands the frontend the
+  same syntax an author would write and reads the answer back off
+  `:source-name`, so the two paths cannot drift into two conventions."
+  [op name clauses body-of]
+  (if (= 1 (count clauses))
+    (let [clause (first clauses)]
+      (list op name (clause-params clause) (clause-result clause) (body-of clause)))
+    (list* op name
+           (map (fn [clause]
+                  (list (clause-params clause) (clause-result clause) (body-of clause)))
+                clauses))))
+
+(defn- stub-body [{:keys [result callable-result-contract]}]
+  (if callable-result-contract
+    ;; The stub exists only for isolated type/effect analysis and is
+    ;; removed before linking. Its explicit result contract supplies
+    ;; the closure refinement without inventing a lambda ID/helper that
+    ;; could be mistaken for executable project code.
+    0
+    (stub-value result)))
+
+(defn- stub-form
+  "The import stub an importing module analyses in place of a dependency.
+
+  A multi-arity export needs a multi-arity stub, or the importing module can
+  call it at exactly one arity: the stub is what its own call resolution sees,
+  and the frontend rejects `no matching multi-arity clause` for the others."
+  [stub clauses]
+  (arity-declaration 'defn- stub clauses stub-body))
+
+(defn- capability-operation?
+  "True for a friendly capability operation such as `clock/now`.
+
+  These are namespaced calls that are not module references: the frontend
+  elaborates them into typed abilities against the capability catalog. The
+  linker used to see only `<ns>/<name>` and conclude that anything qualified
+  had to be an imported export, which made a friendly operation impossible to
+  write inside a project — the single-file path accepted it and the project
+  path rejected it with `qualified call is not an admitted exported import`.
+
+  Module imports are still resolved first, so an explicit `:require` alias
+  always wins over a capability of the same name; a project can never have a
+  capability silently displace a module it asked for."
+  [op]
+  (contains? sema/capability-registry
+             (keyword (namespace op) (name op))))
+
+(defn- resugar-capability-calls
+  "Put the friendly operation back into an emitted body.
+
+  Linking analyzes each module, so the bodies it emits are already elaborated:
+  `(clock/now seed)` has become `(typed-cap-call 7 :i64 :i64 seed)`. The linked
+  source is then re-analyzed in full, which re-derives the same ability and the
+  same effect — but not the friendly name, because by then there is nothing
+  left to name. A diagnostic raised during a project build therefore could not
+  point back at the operation the author wrote, and `:named-operations` came
+  out empty where a single-file build reported `#{:clock/now}`.
+
+  The elaborated form still carries `:source-operation` metadata, so exactly
+  the capability calls can be turned back into their source spelling. Nothing
+  else is touched: module-to-module calls keep their stubs and synthetic names,
+  so per-module isolation is unchanged — this restores provenance without
+  making one module's syntax able to mean something different after linking."
+  [form]
+  (cond
+    (seq? form)
+    (let [m (meta form)
+          walked (map resugar-capability-calls form)
+          operation (:source-operation m)]
+      (with-meta
+        (if (and operation (= 'typed-cap-call (first form)))
+          ;; (typed-cap-call <id> <request> <result> & args) -> (ns/name & args)
+          (apply list (symbol (namespace operation) (name operation)) (drop 4 walked))
+          (apply list walked))
+        m))
+
+    (vector? form) (with-meta (mapv resugar-capability-calls form) (meta form))
+    (map? form) (with-meta (into {} (map (fn [[k v]] [k (resugar-capability-calls v)])) form)
+                           (meta form))
+    :else form))
+
+(defn- rewrite-import-calls [form imported]
+  (cond
+    (seq? form)
+    (let [[op & args] form
+          op' (if (and (symbol? op) (namespace op))
+                (or (get imported op)
+                    ;; Left as written: elaboration into a typed ability is the
+                    ;; frontend's job, and it runs identically on linked source.
+                    (when (capability-operation? op) op)
+                    (reject! "qualified call is not an admitted exported import" {:call op}))
+                op)]
+      (list* op' (map #(rewrite-import-calls % imported) args)))
+    (vector? form) (mapv #(rewrite-import-calls % imported) form)
+    (map? form) (into (empty form)
+                      (map (fn [[k v]] [(rewrite-import-calls k imported)
+                                       (rewrite-import-calls v imported)]))
+                      form)
+    :else form))
+
+(defn- rewrite-calls [form names]
+  (cond
+    (seq? form) (let [[op & args] form]
+                  (list* (get names op op) (map #(rewrite-calls % names) args)))
+    (vector? form) (mapv #(rewrite-calls % names) form)
+    (map? form) (into (empty form)
+                      (map (fn [[k v]] [(rewrite-calls k names) (rewrite-calls v names)]))
+                      form)
+    :else form))
+
+(defn- invoke-dispatcher-name? [name]
+  (and (symbol? name)
+       (boolean (re-matches #"__kotoba_invoke(?:_.+)?\$arity[0-4]" (str name)))))
+
+(defn- closure-apply-name? [name]
+  (= '__kotoba_closure_apply name))
+
+;; `source-text` emits the linked module graph as text the reader has to read
+;; back, so anything it prints unreadably breaks linking rather than merely
+;; looking odd.
+;;
+;; On ClojureScript that is every integer. `kotoba.compiler.kotoba-reader`
+;; returns integer literals as JS `BigInt`, `pr-str` renders a BigInt as
+;; `#object[BigInt 42]`, and the reader answers `unsupported reader dispatch`
+;; on the way back in. So `link-source` failed for every project it would
+;; otherwise have linked -- measured 2026-08-31 against aiueos's 83 `.kotoba`
+;; objects, where the seven that got as far as this step all died here and the
+;; other 76 only looked healthier because they had already been rejected for
+;; a real reason. That is the JVM-free project linker gap the workspace Q9
+;; rule names, and it is one printer.
+;;
+;; The substitution is deliberately narrow: only integers are replaced, with a
+;; value whose whole behaviour is to print its own digits, and `pr-str` still
+;; decides how every collection, string, keyword and symbol is written. A
+;; global BigInt print handler would have reached `(pr-str hir)`, which
+;; `kotoba.compiler.nbb.compile-cache` uses as a cache KEY.
+
+
+
+
+(defn- source-text [forms]
+  (str (str/join "\n" (map #(pr-str ) forms))
+       "\n"))
+
+(defn- admit-project-forms!
+  [forms counters]
+  (loop [pending (seq forms)]
+    (when-let [node (first pending)]
+      (let [rest-pending (next pending)]
+        (cond
+          (coll? node)
+          (do
+            (when (and (seq? node)
+                       (> (vswap! (:expressions counters) inc)
+                          max-project-expression-nodes))
+              (reject! "project expression nodes exceed limit"
+                       {:count @(:expressions counters)
+                        :limit max-project-expression-nodes}))
+            (recur (concat (seq node) rest-pending)))
+
+          (not (symbol? node))
+          (do
+            (when (> (vswap! (:literals counters) inc) max-project-literals)
+              (reject! "project literals exceed limit"
+                       {:count @(:literals counters) :limit max-project-literals}))
+            (when (string? node)
+              (let [bytes (vswap! (:literal-bytes counters)
+                                  + (value/utf8-byte-count! node))]
+                (when (> bytes max-project-string-literal-bytes)
+                  (reject! "project string literal bytes exceed limit"
+                           {:bytes bytes :limit max-project-string-literal-bytes}))))
+            (recur rest-pending))
+
+          :else (recur rest-pending))))))
+
+;; ---------------------------------------------------------------------------
+;; Attributing a refusal to the module that wrote the form (amu-h10).
+;;
+;; The frontend never sees an author's file in project mode. It sees two
+;; synthetic texts: per module, `source-text` of that module's rewritten forms
+;; plus import stubs (`analyze-module`), and then the linked unit for the whole
+;; graph (`link-source`). Every `:span` it attaches refers to one of those, so
+;; a project-build diagnostic used to name the root file at a line and column
+;; that exist only in the linker's output -- `kernel.kotoba:73:297` -- and
+;; when the refusal carried no span at all it named the root file alone,
+;; which was simply the wrong file. Both texts print one top-level form per
+;; line, so a line in either is an index into a form vector this namespace
+;; holds; the original forms carry the reader's positions, so the index turns
+;; back into the author's line. The column is not recoverable (pr-str
+;; re-flows every form) and is dropped rather than misreported.
+
+(defn- form-contains?
+  "Structural containment: is `needle` `form` itself or a subform of it?"
+  [form needle]
+  (or (= form needle)
+      (and (coll? form)
+           (some #(form-contains? % needle)
+                 (if (map? form) (concat (keys form) (vals form)) (seq form))))))
+
+(defn- top-level-index
+  "Which top-level form of the text the frontend read a refusal refers to:
+  the line of its span (one form per line), or, when it carried no span, the
+  first form containing the rejected `:form`. nil when neither locates it."
+  [forms data]
+  (let [line (get-in data [:span :line])
+        needle (:form data)]
+    (cond
+      (and (number? line) (<= 1 line (count forms))) (dec line)
+      (contains? data :form)
+      (first (keep-indexed (fn [index form] (when (form-contains? form needle) index))
+                           forms)))))
+
+(defn attribute-error
+  "The same refusal, attributed: `:source-module` names the module that
+  wrote the form and `:span` is `{:line <that module's line>}` when the line
+  is known. Any span into a synthetic text is dropped -- it is a position no
+  author can open. The code, message, phase and every other datum stand."
+  [error module line]
+  (ex-info (ex-message error)
+           (-> (ex-data error)
+               (assoc :source-module module)
+               (dissoc :span)
+               (cond-> (number? line) (assoc :span {:line line})))
+           error))
+
+(defn with-module-file
+  "Add `:source-file` to an attributed refusal from a module->path map, when
+  the graph was loaded from paths (`--source-path`). A CID-pinned graph has no
+  paths, and the module name stands alone."
+  [error paths]
+  (let [data (ex-data error)
+        file (get paths (:source-module data))]
+    (if (and (map? data) (some? file) (nil? (:source-file data)))
+      (ex-info (ex-message error) (assoc data :source-file (str file)) error)
+      error)))
+
+(defn- attribute-module-error
+  "A refusal raised while analysing one module's augmented text. `original`
+  are the module's forms as read from the author's source, `analysed` the
+  forms the frontend actually read (rewritten originals, then import stubs,
+  in that order). A form index below `(count original)` is an author's form;
+  a stub has no author and yields the module without a line."
+  [error module original analysed]
+  (let [data (ex-data error)]
+    (if (or (not (map? data)) (contains? data :source-module))
+      error
+      (let [index (top-level-index analysed data)
+            line (when (and (some? index) (< index (count original)))
+                   (:line (meta (nth original index))))]
+        (attribute-error error module line)))))
+
+(defn- definition-lines
+  "Top-level `defn`/`defn-` name -> the line the author wrote it on."
+  [forms]
+  (into {}
+        (keep (fn [form]
+                (when (and (seq? form)
+                           (contains? #{'defn 'defn-} (first form))
+                           (symbol? (second form))
+                           (number? (:line (meta form))))
+                  [(second form) (:line (meta form))])))
+        forms))
+
+(defn- analyze-module [forms info dependencies module-index]
+  (let [available
+        (into {}
+              (mapcat (fn [{dep-name :namespace alias :alias}]
+                        (let [dependency (get dependencies dep-name)]
+                          (when-not dependency
+                            (reject! "imported namespace was not resolved"
+                                     {:module (:namespace info) :dependency dep-name}))
+                          (map (fn [[export clauses]]
+                                 [(symbol (str alias) (str export)) clauses])
+                               (:interface dependency))))
+                      (:requires info)))
+        stub-pairs (map-indexed (fn [index [qualified clauses]]
+                                  [qualified (symbol (str "kotoba_import__" index)) clauses])
+                                (sort-by (comp str key) available))
+        import->stub (into {} (map (fn [[qualified stub _]] [qualified stub]) stub-pairs))
+        ;; One stub name per import, and within it one linked target per
+        ;; arity. The stub name is the `:source-name` the frontend will put on
+        ;; every clause it splits out of the emitted `defn-`, so the two are
+        ;; joined below without either side parsing an `$arity$` suffix.
+        stub-targets (into {}
+                           (map (fn [[_ stub clauses]]
+                                  [stub (into {} (map (juxt arity-of :linked-name)) clauses)]))
+                           stub-pairs)
+        stub-source-names (into #{} (map second) stub-pairs)
+        rewritten (mapv #(rewrite-import-calls % import->stub) (without-requires forms))
+        augmented (into rewritten (map (fn [[_ stub clauses]] (stub-form stub clauses)) stub-pairs))
+        ;; Lambda IDs are artifact data. Give every source module a disjoint
+        ;; range so the project-level dispatcher can route a closure back to
+        ;; the module whose lifted helper owns that ID.
+        hir (try
+              (sema/analyze (source-text augmented)
+                            {:lambda-id-base (* module-index sema/max-functions)})
+              (catch  error
+                (throw (attribute-module-error error (:namespace info) forms augmented))))
+        defn-lines (definition-lines forms)
+        ;; Matched on `:source-name`, not `:name`: a multi-arity stub is one
+        ;; `defn-` that the frontend has already split into several functions
+        ;; with generated names. Filtering on `:name` would leave those in
+        ;; `locals`, where they would be emitted into the linked source as
+        ;; real functions returning a stub value.
+        stub-functions (filter #(contains? stub-source-names (source-name-of %))
+                               (:functions hir))
+        locals (vec (remove #(contains? stub-source-names (source-name-of %))
+                            (:functions hir)))
+        stub->target
+        (into {}
+              (map (fn [function]
+                     (let [target (get-in stub-targets
+                                          [(source-name-of function) (arity-of function)])]
+                       (when-not target
+                         (reject! "linked import stub has no target for its arity"
+                                  {:module (:namespace info)
+                                   :stub (source-name-of function)
+                                   :arity (arity-of function)}))
+                       [(:name function) target])))
+              stub-functions)
+        local-names (into {} (map-indexed (fn [function-index {:keys [name]}]
+                                            [name (symbol (str "kotoba_module__"
+                                                               module-index "__"
+                                                               function-index))])
+                                          locals))
+        global-dispatcher-names
+        (into {}
+              (keep (fn [name]
+                      (when (or (invoke-dispatcher-name? name)
+                                (closure-apply-name? name))
+                        [name name])))
+              (keys local-names))
+        call-names (merge local-names stub->target global-dispatcher-names)
+        functions (mapv (fn [function]
+                          (let [original-name (:name function)]
+                            (cond-> (-> function
+                                        ;; Captured before the rewrites below.
+                                        ;; rewrite-calls rebuilds forms with
+                                        ;; list* and drops metadata, and the
+                                        ;; linked text cannot carry it either
+                                        ;; -- serialization is pr-str. This is
+                                        ;; the position in the module the
+                                        ;; author actually wrote.
+                                        (assoc :source-module (:namespace info)
+                                               :source-span (:span (meta (:body function)))
+                                               ;; The defn line in the author's
+                                               ;; file, from the forms as READ
+                                               ;; (the augmented text above has
+                                               ;; already re-flowed them).
+                                               :source-line (get defn-lines (source-name-of function)))
+                                        (update :name local-names)
+                                        ;; Before renaming: rewrite-calls rebuilds forms
+                                        ;; with list*, which drops the :source-operation
+                                        ;; metadata this reads. A friendly head is not in
+                                        ;; the rename table, so it passes through
+                                        ;; untouched while its arguments still get
+                                        ;; renamed.
+                                        (update :body resugar-capability-calls)
+                                        (update :body rewrite-calls call-names))
+                              (invoke-dispatcher-name? original-name)
+                              (assoc :project-dispatcher original-name
+                                     :project-module-index module-index)
+                              (closure-apply-name? original-name)
+                              (assoc :project-closure-apply? true))))
+                        locals)
+        ;; Grouped on the AUTHORED name. `:export` carries what the author
+        ;; wrote; a multi-arity function reaches here as one analysed function
+        ;; per arity, none of which is called that.
+        by-source-name (group-by source-name-of locals)
+        interface
+        (into {}
+              (map (fn [export]
+                     (let [clauses (sort-by arity-of (get by-source-name export))]
+                       (when-not (seq clauses)
+                         (reject! "export does not name a declared function"
+                                  {:module (:namespace info) :export export}))
+                       [export (mapv #(interface-of % (get local-names (:name %)))
+                                     clauses)])))
+              (:exports info))]
+    {:namespace (:namespace info) :requires (:requires info)
+     :functions functions :interface interface}))
+
+(defn- wrapper-form
+  "The public `defn` the linked namespace exports for one of the root's
+  exports.
+
+  A multi-arity export becomes a multi-arity wrapper, so the linked
+  single-unit source says what the author's module said. Compiling that unit
+  re-derives the same `$arity$` export names a single-file compile of the same
+  function produces -- the two routes agree on the artifact's export surface
+  rather than one of them being unable to describe it."
+  [[export clauses]]
+  (arity-declaration 'defn export clauses
+                     (fn [{:keys [linked-name params]}] (list* linked-name params))))
+
+(defn- typed-trap [result-type]
+  (if (= :bool result-type)
+    '(= (quot 1 0) 0)
+    (let [default (stub-value result-type)]
+      (list 'if '(= (quot 1 0) 0) default default))))
+
+(defn- project-dispatchers [functions]
+  (let [dispatchers (group-by :project-dispatcher
+                              (filter :project-dispatcher functions))
+        routed
+        (mapv
+         (fn [[dispatcher-name entries]]
+           (let [{:keys [params param-types result]} (first entries)
+                 closure (first params)
+                 body
+                 (reduce
+                  (fn [fallback {:keys [name project-module-index]}]
+                    (let [lower (* project-module-index sema/max-functions)
+                          upper (+ lower sema/max-functions)
+                          id (list 'pair-first closure)]
+                      (list 'if
+                            (list 'and (list '> id lower) (list '<= id upper))
+                            (list* name params)
+                            fallback)))
+                  (typed-trap result)
+                  (reverse (sort-by :project-module-index entries)))]
+             {:name dispatcher-name :params params :param-types param-types
+              :result result :effects #{} :body body}))
+         (sort-by (comp str key) dispatchers))
+        closure-apply (first (filter :project-closure-apply? functions))]
+    (cond-> routed
+      closure-apply
+      (conj (-> closure-apply
+                (assoc :name '__kotoba_closure_apply)
+                (dissoc :project-closure-apply?))))))
+
+(defn link-source
+  "Link a closed namespace->source map into one bounded source unit."
+  [sources root]
+  (when-not (and (map? sources) (pos? (count sources))
+                 (<= (count sources) max-project-modules))
+    (reject! "project source map is empty or exceeds module limit"
+             {:count (when (map? sources) (count sources))}))
+  (let [source-bytes (reduce (fn [total source]
+                               (when-not (string? source)
+                                 (reject! "project source must be text" {}))
+                               (+ total (value/utf8-byte-count! source)))
+                             0 (vals sources))
+        _ (when (> source-bytes max-project-source-bytes)
+            (reject! "project source bytes exceed limit" {:bytes source-bytes}))
+        counters {:expressions (volatile! 0)
+                  :literals (volatile! 0)
+                  :literal-bytes (volatile! 0)}
+        parsed (into {}
+                     (map (fn [[declared source]]
+                            (let [forms (sema/read-forms source)
+                                  _ (admit-project-forms! forms counters)
+                                  info (module-info forms)]
+                              (when-not (= declared (:namespace info))
+                                (reject! "source-map key does not match declared namespace"
+                                         {:key declared :declared (:namespace info)}))
+                              [declared {:forms forms :info info}])))
+                     sources)
+        visiting (volatile! #{}) linked (volatile! {}) order (volatile! [])
+        edge-count (volatile! 0)]
+    (letfn [(visit [name depth]
+              (when (> depth max-project-depth)
+                (reject! "project dependency depth exceeds limit"
+                         {:module name :depth depth}))
+              (when-not (contains? parsed name)
+                (reject! "required module is outside the closed project" {:module name}))
+              (when (contains? @visiting name)
+                (reject! "cyclic module dependency rejected" {:module name}))
+              (when-not (contains? @linked name)
+                (vswap! visiting conj name)
+                (doseq [{dependency :namespace} (get-in parsed [name :info :requires])]
+                  (when (> (vswap! edge-count inc) max-project-dependency-edges)
+                    (reject! "project dependency edges exceed limit"
+                             {:edges @edge-count}))
+                  (visit dependency (inc depth)))
+                (let [module (analyze-module (get-in parsed [name :forms])
+                                             (get-in parsed [name :info])
+                                             @linked (count @order))]
+                  (vswap! linked assoc name module)
+                  (vswap! order conj name))
+                (vswap! visiting disj name)))]
+      (visit root 1))
+    (let [root-module (get @linked root)
+          module-functions (vec (mapcat #(get-in @linked [% :functions]) @order))
+          functions (into module-functions (project-dispatchers module-functions))
+          ;; Clauses, not export names. `max-project-exports` bounds the
+          ;; exported FUNCTION surface, and a multi-arity export is several
+          ;; functions -- the artifact carries `twice$arity$1` and
+          ;; `twice$arity$2`, not `twice`. Counting names would let a project
+          ;; carry several times the bound while reporting it was under it.
+          ;; Single-arity exports are one clause each, so no project that
+          ;; linked before this counts differently now.
+          export-count (reduce + (map (fn [module]
+                                        (reduce + (map count (vals (get-in @linked [module :interface])))))
+                                      @order))
+          exports (sort-by (comp str key) (:interface root-module))
+          wrappers (mapv wrapper-form exports)
+          ;; Same reason: one multi-arity wrapper form is several functions
+          ;; against `max-project-functions`.
+          wrapper-function-count (reduce + (map (comp count val) exports))
+          function-count (+ (count functions) wrapper-function-count)
+          ;; The linked namespace deliberately carries NO `:capabilities`
+          ;; clause even when its modules declared one. That clause is a
+          ;; source-level declare-then-check, and it has already run once per
+          ;; module inside `analyze-module`; running it again over the union
+          ;; would re-check a property that is already established, against a
+          ;; namespace no author wrote.
+          ;;
+          ;; This comment used to justify the omission differently -- that the
+          ;; linked source contained only integer `(cap-call 9 ...)` forms and
+          ;; so populated no used-keyword set. That stopped being true when
+          ;; `resugar-capability-calls` restored the friendly spelling: the
+          ;; linked source now reads `(clock/now seed)` and the keyword set
+          ;; would be populated. The omission still holds and linking a module
+          ;; that declares `:capabilities` still works, but the old reasoning
+          ;; would now mislead anyone acting on it.
+          ;;
+          ;; Nothing is weakened either way: the effects that policy and the
+          ;; artifact's requiredCapabilities are computed from come from the
+          ;; elaborated calls, not from this clause.
+          linked-source
+          (source-text
+           (into [(list 'ns root (list :export (vec (map first exports))))]
+                 (concat
+                  (map (fn [{:keys [name params param-types result body
+                                    callable-param-contracts callable-result-contract]}]
+                         (list 'defn- name
+                               (typed-params params param-types callable-param-contracts)
+                               (or callable-result-contract result)
+                               body))
+                       functions)
+                  wrappers)))
+          ;; source-text emits exactly one form per line, and the `ns` form is
+          ;; line 1, so an emitted function's linked line is its index + 2.
+          ;; Synthetic forms -- project dispatchers and export wrappers -- have
+          ;; no authoring module and are simply absent from the map rather than
+          ;; being attributed to one.
+          source-map {:kotoba.source-map/version 1
+                      :root root
+                      :entries (vec (keep-indexed
+                                     (fn [index function]
+                                       (when-let [module (:source-module function)]
+                                         {:linked-line (+ 2 index)
+                                          :module module
+                                          :source-name (:source-name function)
+                                          :source-span (:source-span function)
+                                          :source-line (:source-line function)}))
+                                     functions))}
+          linked-bytes (value/utf8-byte-count! linked-source)]
+      (when (> function-count max-project-functions)
+        (reject! "linked project exceeds function limit" {:count function-count}))
+      (when (> export-count max-project-exports)
+        (reject! "linked project exports exceed limit" {:count export-count}))
+      (when (> linked-bytes max-linked-source-bytes)
+        (reject! "linked project source exceeds byte limit" {:bytes linked-bytes}))
+      {:source
+       linked-source
+       :root root :module-order @order :modules (set @order)
+       :source-map source-map})))
+
+(defn source-position
+  "Translate a line in the linked source back to the module that wrote it.
+
+  The linked source is a synthetic single unit, so every span the frontend
+  derives from it -- and therefore every span in a diagnostic raised against a
+  project build -- refers to that intermediate rather than to anything an
+  author edited. Without a translation, a project-build error can name the
+  operation but not the file and line it came from.
+
+  Returns `{:module :source-name :source-span}` for a linked line that came
+  from a module, or nil for the `ns` form and for synthetic dispatchers and
+  export wrappers, which no author wrote."
+  [source-map linked-line]
+  (some (fn [entry] (when (= linked-line (:linked-line entry)) entry))
+        (:entries source-map)))
+
+(defn linked-position
+  "Where in the authoring modules a refusal raised against the LINKED source
+  came from: `{:module :line}` (line nil when the module is known but the
+  defn line is not), or nil when the refusal cannot be placed -- it referred
+  to the `ns` form, a synthetic dispatcher or an export wrapper, or carried
+  neither a span nor a form."
+  [source-map linked-source data]
+  (let [entry (or (when-let [line (get-in data [:span :line])]
+                    (source-position source-map line))
+                  (when (contains? data :form)
+                    (when-let [index (top-level-index (sema/read-forms linked-source) data)]
+                      (source-position source-map (inc index)))))]
+    (when entry
+      {:module (:module entry) :line (:source-line entry)})))
+
+(defn attribute-linked-error
+  "A refusal from compiling `linked` (a `link-source` result), attributed to
+  the module and line it came from when `linked-position` can place it. An
+  error `analyze-module` already attributed passes through unchanged. One
+  that cannot be placed keeps everything but its span: the span it carried
+  points into the linked unit, which no author wrote."
+  [error linked]
+  (let [data (ex-data error)]
+    (cond
+      (or (not (map? data)) (contains? data :source-module)) error
+      (nil? (:source-map linked)) error
+      :else
+      (if-let [{:keys [module line]} (linked-position (:source-map linked)
+                                                      (:source linked) data)]
+        (attribute-error error module line)
+        (if (contains? data :span)
+          (ex-info (ex-message error) (dissoc data :span) error)
+          error)))))

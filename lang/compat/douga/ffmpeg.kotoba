@@ -1,0 +1,120 @@
+(ns douga.ffmpeg
+  "Pure video-assembly (dougaka) planning — timeline -> ffmpeg render plan + command builders. No ffmpeg, network, or blob IO here."
+  (:require [clojure.string :as str]))
+
+(def ^:private res-aliases
+  {"720p" [1280 720]
+   "1080p" [1920 1080]
+   "480p" [854 480]})
+
+(defn parse-resolution
+  ([res] (parse-resolution res [1280 720]))
+  ([res default]
+   (let [s (-> (or res "") str/trim str/lower-case)]
+     (if (str/includes? s "x")
+       (try
+         (let [[w h] (str/split s #"x" 2)]
+           [(parse-long w) (parse-long h)])
+         (catch  _ default))
+       (get res-aliases s default)))))
+
+(defn- v [m & ks]
+  (some #(get m %) ks))
+
+(defn- scene-index [scene]
+  (long (or (v scene :index :scene_index "index" "scene_index") 0)))
+
+(defn build-render-plan
+  "Timeline -> ordered render plan. Mirrors the old Python build_render_plan:
+  scenes without a composite scene frame are skipped; voices are ordered by line."
+  [timeline]
+  (let [timeline (or timeline {})
+        scenes (or (v timeline :scenes "scenes") [])
+        lines (or (v timeline :lines "lines") [])
+        assets (or (v timeline :assets "assets") [])
+        want-v2 (boolean (v timeline :faceLayers :face-layers "faceLayers" "face_layers"))
+        v2-layout "kamishibai-cyber-v2-stage"
+        {:keys [v2 baked bgm]}
+        (reduce
+         (fn [acc a]
+           (let [kind (v a :kind "kind")
+                 blob (or (v a :blobKey :blob-key "blobKey" "blob_key") "")
+                 meta (let [m (v a :meta "meta")] (if (map? m) m {}))
+                 si (v meta :sceneIndex :scene-index "sceneIndex" "scene_index")]
+             (cond
+               (and (= kind "scene") (seq blob) (some? si))
+               (if (= (v meta :layout "layout") v2-layout)
+                 (assoc-in acc [:v2 (long si)] blob)
+                 (assoc-in acc [:baked (long si)] blob))
+
+               (and (= kind "bgm") (seq blob) (nil? (:bgm acc)))
+               (assoc acc :bgm blob)
+
+               :else acc)))
+         {:v2 {} :baked {} :bgm nil}
+         assets)
+        frame-by-scene (if want-v2 (merge baked v2) (merge v2 baked))
+        voices
+        (reduce
+         (fn [acc line]
+           (let [si (long (or (v line :sceneIndex :scene-index "sceneIndex" "scene_index") 0))
+                 li (long (or (v line :lineIndex :line-index "lineIndex" "line_index") 0))
+                 vk (v line :voiceBlobKey :voice-blob-key "voiceBlobKey" "voice_blob_key")
+                 spk (-> (or (v line :speaker "speaker") "left") str str/trim str/lower-case)
+                 text (-> (or (v line :text "text") "") str str/trim)]
+             (if (seq vk)
+               (update acc si (fnil conj []) [li vk text spk])
+               acc)))
+         {}
+         lines)
+        order (sort (set (concat (map scene-index scenes) (keys frame-by-scene))))
+        segments
+        (vec
+         (keep
+          (fn [si]
+            (when-let [frame (get frame-by-scene si)]
+              (let [ordered (sort-by first (get voices si []))]
+                {:scene-index si
+                 :frame-blob-key frame
+                 :voice-blob-keys (mapv second ordered)
+                 :texts (mapv #(nth % 2) ordered)
+                 :speakers (mapv #(nth % 3) ordered)})))
+          order))
+        [w h] (parse-resolution (or (v timeline :resolution "resolution") "1280x720"))]
+    {:segments segments
+     :bgm-blob-key bgm
+     :width w
+     :height h
+     :fps (long (or (v timeline :fps "fps") 30))}))
+
+(defn concat-audio-cmd [wav-paths out-path]
+  (let [n (count wav-paths)
+        streams (apply str (map-indexed (fn [i _] (str "[" i ":a]")) wav-paths))]
+    (vec (concat ["ffmpeg" "-y"]
+                 (mapcat (fn [p] ["-i" p]) wav-paths)
+                 ["-filter_complex" (str streams "concat=n=" n ":v=0:a=1[a]")
+                  "-map" "[a]" out-path]))))
+
+(defn silent-audio-cmd
+  ([out-path] (silent-audio-cmd out-path {:seconds 3.0 :sample-rate 24000}))
+  ([out-path {:keys [seconds sample-rate] :or {seconds 3.0 sample-rate 24000}}]
+   ["ffmpeg" "-y" "-f" "lavfi"
+    "-i" (str "anullsrc=r=" sample-rate ":cl=mono") "-t" (str seconds) out-path]))
+
+(defn scene-segment-cmd [frame-path audio-path out-path {:keys [width height fps]}]
+  ["ffmpeg" "-y" "-loop" "1" "-i" frame-path "-i" audio-path
+   "-vf" (str "scale=" width ":" height ":force_original_aspect_ratio=decrease,"
+              "pad=" width ":" height ":(ow-iw)/2:(oh-ih)/2,setsar=1")
+   "-r" (str fps) "-shortest" "-c:v" "libx264" "-pix_fmt" "yuv420p" "-c:a" "aac" out-path])
+
+(defn concat-segments-cmd [list-path out-path]
+  ["ffmpeg" "-y" "-f" "concat" "-safe" "0" "-i" list-path "-c" "copy" out-path])
+
+(defn bgm-mix-cmd [video-path bgm-path out-path]
+  ["ffmpeg" "-y" "-i" video-path "-stream_loop" "-1" "-i" bgm-path
+   "-filter_complex" "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0[a]"
+   "-map" "0:v" "-map" "[a]" "-c:v" "copy" "-c:a" "aac" out-path])
+
+(defn concat-list-text [paths]
+  (apply str (for [p paths]
+               (str "file '" (str/replace p #"'" (constantly "'\\''")) "'\n"))))
