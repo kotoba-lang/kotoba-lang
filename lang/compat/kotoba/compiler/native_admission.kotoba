@@ -1,0 +1,464 @@
+;; kotoba.compiler.native-admission -- the native admission gate of a typed HIR module, on the Kotoba route.
+;;
+;; The host gate is osaho `kotoba.kir/only-native-word-typed-features?` (with its helpers native-handle-type?,
+;; native-word-value-type?, native-scalar-record-type?, the operation tables and the provider contracts): nbb.cli's
+;; `compile-native!` refuses a `:kotoba.hir/v3` module the gate rejects, BEFORE anything is emitted, because the
+;; native backends would otherwise lower a program native does not qualify. The guest kir twin (kotoba.kir, .kotoba)
+;; carries no gate, so the Kotoba compile route needs this one. It is the same computation over kotoba.form's
+;; `:form/r`, clause for clause and in the host's order (an arity guard that fails falls through to the next clause,
+;; as on the host). Differential-tested against the host gate over every function and body sub-form of the corpus
+;; (seed/tests/native-admission/).
+;;
+;; Representation: the host's `*native-schemas*` binding is the explicit `schemas` argument (a nil Form when the
+;; module has none: no `[:ref ...]` is then admitted); the host's `seen` set is a list of keyword forms; an
+;; operation set is a space-padded string of names.
+(ns kotoba.compiler.native-admission
+  (:require [kotoba.form :as form]
+            [kotoba.string :as ks])
+  (:export [only-native-word-typed-features? function-admitted? body-admitted?])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                       [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]}))
+
+;; ---- small helpers ----
+
+(defn- kwf [k :keyword] [:ref :form/r] (form/keyword-form k))
+
+(defn- kw-is? [f [:ref :form/r] k :keyword] :bool
+  (and (form/is-keyword? f) (= (form/keyword-value f) k)))
+
+(defn- get-k [m [:ref :form/r] k :keyword] [:ref :form/r] (form/form-get m (kwf k)))
+
+(defn- one-of? [name :string names :string] :bool
+  (ks/includes? names (string-concat " " (string-concat name " "))))
+
+(defn- symbol-name-of [f [:ref :form/r]] :string
+  (if (form/is-symbol? f) (form/symbol-value f) ""))
+
+(defn- kw-one-of? [f [:ref :form/r] names :string] :bool
+  (and (form/is-keyword? f) (not (form/keyword-has-namespace? f))
+       (one-of? (keyword-name (form/keyword-value f)) names)))
+
+(defn- member? [xs [:list [:ref :form/r]] x [:ref :form/r]] :bool
+  (let [n (vector-count xs)]
+    (loop [i 0]
+      (if (>= i n) false
+        (if (form/eq (typed-list-nth [:list [:ref :form/r]] xs i) x) true (recur (inc i)))))))
+
+;; (= (count xs) (count (distinct (map first xs))))
+(defn- distinct-firsts? [xs [:ref :form/r]] :bool
+  (let [kids (form/kids-of xs)
+        n (vector-count kids)]
+    (loop [i 0 seen (form/no-forms)]
+      (if (>= i n) true
+        (let [k (form/first-of (typed-list-nth [:list [:ref :form/r]] kids i))]
+          (if (member? seen k) false (recur (inc i) (typed-list-conj [:list [:ref :form/r]] seen k))))))))
+
+;; (some #(= x (first %)) entries)
+(defn- some-first? [entries [:ref :form/r] x [:ref :form/r]] :bool
+  (let [kids (form/kids-of entries)
+        n (vector-count kids)]
+    (loop [i 0]
+      (if (>= i n) false
+        (if (form/eq (form/first-of (typed-list-nth [:list [:ref :form/r]] kids i)) x) true (recur (inc i)))))))
+
+(defn- vec-n? [f [:ref :form/r] n :i64] :bool (and (form/is-vec? f) (= n (form/count-of f))))
+
+;; [:head :ns/name members]: the shape every record / variant type starts with
+(defn- named-aggregate? [t [:ref :form/r] head :keyword] :bool
+  (and (vec-n? t 3) (kw-is? (form/nth-of t 0) head)
+       (form/keyword-has-namespace? (form/nth-of t 1))))
+
+;; ---- types ----
+
+(defn- word-field-type? [t [:ref :form/r]] :bool (kw-one-of? t " i64 bool string keyword document "))
+
+(defn- scalar-record-field? [field [:ref :form/r]] :bool
+  (and (vec-n? field 2) (form/is-keyword? (form/nth-of field 0))
+       (or (word-field-type? (form/nth-of field 1))
+           (native-word-value-type? (form/nth-of field 1) 0)
+           (native-scalar-record-type? (form/nth-of field 1)))))
+
+(defn- every-kid? [xs [:ref :form/r] i :i64 pred-code :i64] :bool
+  ;; pred-code 0: scalar-record field, 1: scalar-variant case, 2: boundary scalar-variant case
+  (if (>= i (form/count-of xs)) true
+    (let [x (form/nth-of xs i)
+          ok (cond (= pred-code 0) (scalar-record-field? x)
+                   (= pred-code 1) (and (vec-n? x 2) (form/is-keyword? (form/nth-of x 0))
+                                        (or (word-field-type? (form/nth-of x 1))
+                                            (native-scalar-record-type? (form/nth-of x 1))))
+                   :else (and (vec-n? x 2) (form/is-keyword? (form/nth-of x 0))
+                              (kw-one-of? (form/nth-of x 1) " i64 bool ")))]
+      (if ok (every-kid? xs (+ i 1) pred-code) false))))
+
+(defn native-scalar-record-type? [t [:ref :form/r]] :bool
+  (and (named-aggregate? t :record)
+       (form/is-vec? (form/nth-of t 2)) (> (form/count-of (form/nth-of t 2)) 0)
+       (every-kid? (form/nth-of t 2) 0 0)
+       (distinct-firsts? (form/nth-of t 2))))
+
+(defn- native-scalar-variant-type? [t [:ref :form/r]] :bool
+  (and (named-aggregate? t :variant)
+       (form/is-vec? (form/nth-of t 2)) (> (form/count-of (form/nth-of t 2)) 0)
+       (every-kid? (form/nth-of t 2) 0 1)
+       (distinct-firsts? (form/nth-of t 2))))
+
+(defn- native-boundary-scalar-variant-type? [t [:ref :form/r]] :bool
+  (and (named-aggregate? t :variant)
+       (form/is-vec? (form/nth-of t 2))
+       (>= (form/count-of (form/nth-of t 2)) 1) (<= (form/count-of (form/nth-of t 2)) 32)
+       (every-kid? (form/nth-of t 2) 0 2)
+       (distinct-firsts? (form/nth-of t 2))))
+
+(defn native-word-value-type? [t [:ref :form/r] depth :i64] :bool
+  (and (<= depth 8)
+       (or (kw-one-of? t " i64 bool string keyword document option-i64 result-i64 ")
+           (and (form/is-vec? t)
+                (let [h (form/nth-of t 0)]
+                  (cond
+                    (kw-is? h :option) (and (= 2 (form/count-of t))
+                                            (or (native-word-value-type? (form/nth-of t 1) (+ depth 1))
+                                                (native-scalar-record-type? (form/nth-of t 1))))
+                    (kw-is? h :set) (and (= 2 (form/count-of t))
+                                         (or (native-word-value-type? (form/nth-of t 1) (+ depth 1))
+                                             (native-scalar-record-type? (form/nth-of t 1))))
+                    (kw-is? h :result) (and (= 3 (form/count-of t))
+                                            (native-word-value-type? (form/nth-of t 1) (+ depth 1))
+                                            (native-word-value-type? (form/nth-of t 2) (+ depth 1)))
+                    :else false))))))
+
+(defn- member-list? [members [:ref :form/r] depth :i64 seen [:list [:ref :form/r]] schemas [:ref :form/r]] :bool
+  (and (form/is-vec? members)
+       (>= (form/count-of members) 1) (<= (form/count-of members) 32)
+       (loop [i 0]
+         (if (>= i (form/count-of members)) true
+           (let [m (form/nth-of members i)]
+             (if (and (vec-n? m 2) (form/is-keyword? (form/nth-of m 0))
+                      (native-handle-type? (form/nth-of m 1) (+ depth 1) seen schemas))
+               (recur (+ i 1))
+               false))))
+       (distinct-firsts? members)))
+
+(defn- every-handle? [xs [:ref :form/r] depth :i64 seen [:list [:ref :form/r]] schemas [:ref :form/r]] :bool
+  (loop [i 0]
+    (if (>= i (form/count-of xs)) true
+      (if (native-handle-type? (form/nth-of xs i) depth seen schemas) (recur (+ i 1)) false))))
+
+(defn native-handle-type? [t [:ref :form/r] depth :i64 seen [:list [:ref :form/r]] schemas [:ref :form/r]] :bool
+  (and (<= depth 32)
+       (or (native-word-value-type? t 0)
+           (native-scalar-record-type? t)
+           (and (form/is-vec? t) (> (form/count-of t) 0)
+                (let [h (form/nth-of t 0)]
+                  (cond
+                    (kw-is? h :ref)
+                    (let [k (form/nth-of t 1)]
+                      (and (= 2 (form/count-of t)) (form/is-keyword? k)
+                           (form/is-map? schemas) (form/form-has? schemas k)
+                           (or (member? seen k)
+                               (native-handle-type? (form/form-get schemas k) (+ depth 1)
+                                                    (typed-list-conj [:list [:ref :form/r]] seen k) schemas))))
+                    (or (kw-is? h :record) (kw-is? h :variant))
+                    (and (= 3 (form/count-of t)) (form/keyword-has-namespace? (form/nth-of t 1))
+                         (member-list? (form/nth-of t 2) depth seen schemas))
+                    (kw-is? h :vector)
+                    (let [items (form/nth-of t 1)]
+                      (and (= 2 (form/count-of t)) (form/is-vec? items)
+                           (>= (form/count-of items) 1) (<= (form/count-of items) 32)
+                           (every-handle? items (+ depth 1) seen schemas)))
+                    (kw-is? h :option)
+                    (and (= 2 (form/count-of t)) (native-handle-type? (form/nth-of t 1) (+ depth 1) seen schemas))
+                    (kw-is? h :result)
+                    (and (= 3 (form/count-of t))
+                         (native-handle-type? (form/nth-of t 1) (+ depth 1) seen schemas)
+                         (native-handle-type? (form/nth-of t 2) (+ depth 1) seen schemas))
+                    :else false))))))
+
+(defn- handle? [t [:ref :form/r] schemas [:ref :form/r]] :bool
+  (native-handle-type? t 0 (form/no-forms) schemas))
+
+(defn- aggregate-of? [head :keyword t [:ref :form/r] schemas [:ref :form/r]] :bool
+  (and (form/is-vec? t) (kw-is? (form/nth-of t 0) head) (handle? t schemas)))
+
+;; ---- provider contracts (the typed-cap-call request/result pairs native carries) ----
+
+(defn- clock-request [] [:ref :form/r]
+  (form/edn-form "[:variant :kotoba.clock/request [[:wall :bool] [:monotonic :bool]]]"))
+(defn- clock-result [] [:ref :form/r]
+  (form/edn-form "[:variant :kotoba.clock/result [[:wall [:record :kotoba.clock/wall [[:unix-millis :i64] [:observation-sequence :i64]]]] [:monotonic [:record :kotoba.clock/monotonic [[:nanos :i64] [:observation-sequence :i64]]]] [:error [:record :kotoba.clock/error [[:code :keyword] [:message :string]]]]]]"))
+(defn- dataspace-request [] [:ref :form/r]
+  (form/edn-form "[:variant :kotoba.dataspace/request [[:assert [:record :kotoba.dataspace/assert [[:assertion :document] [:facet :i64]]]] [:retract [:record :kotoba.dataspace/retract [[:assertion :document] [:facet :i64]]]] [:observe [:record :kotoba.dataspace/observe [[:pattern :document] [:facet :i64]]]] [:facet-enter :bool] [:facet-leave :i64]]]"))
+(defn- dataspace-result [] [:ref :form/r]
+  (form/edn-form "[:variant :kotoba.dataspace/result [[:asserted [:record :kotoba.dataspace/asserted [[:count :i64] [:notices :document]]]] [:retracted [:record :kotoba.dataspace/retracted [[:count :i64]]]] [:matches [:record :kotoba.dataspace/matches [[:bindings :document] [:notices :document]]]] [:facet [:record :kotoba.dataspace/facet [[:id :i64]]]] [:error [:record :kotoba.dataspace/error [[:code :keyword] [:message :string]]]]]]"))
+(defn- ui-commit-request [] [:ref :form/r]
+  (form/edn-form "[:record :kotoba.ui/commit-request [[:base-revision :i64] [:nodes [:set [:record :kotoba.ui/node [[:id :keyword] [:parent [:option :keyword]] [:kind :keyword] [:text :string]]]]]]]"))
+(defn- ui-commit-result [] [:ref :form/r]
+  (form/edn-form "[:record :kotoba.ui/commit-result [[:revision :i64] [:node-count :i64]]]"))
+(defn- ui-event-request [] [:ref :form/r]
+  (form/edn-form "[:record :kotoba.ui/event-request [[:after-revision :i64]]]"))
+(defn- ui-event-result [] [:ref :form/r]
+  (form/edn-form "[:option [:record :kotoba.ui/event [[:revision :i64] [:target :keyword] [:kind :keyword] [:value :string]]]]"))
+
+(defn- provider-contract? [cap :i64 req [:ref :form/r] res [:ref :form/r]] :bool
+  (or (and (= cap 7) (form/eq req (clock-request)) (form/eq res (clock-result)))
+      (and (= cap 24) (form/eq req (dataspace-request)) (form/eq res (dataspace-result)))
+      (and (= cap 9) (form/eq req (ui-commit-request)) (form/eq res (ui-commit-result)))
+      (and (= cap 10) (form/eq req (ui-event-request)) (form/eq res (ui-event-result)))))
+
+(defn- plain-cap-pair? [req [:ref :form/r] res [:ref :form/r]] :bool
+  (or (and (kw-is? req :i64) (kw-is? res :i64))
+      (and (kw-is? req :string) (kw-is? res :string))
+      (and (kw-is? req :option-i64) (kw-is? res :option-i64))
+      (and (kw-is? req :result-i64) (kw-is? res :result-i64))))
+
+;; ---- function boundaries ----
+
+(defn- native-boundary-type? [t0 [:ref :form/r] schemas [:ref :form/r]] :bool
+  (let [t (if (and (vec-n? t0 2) (kw-is? (form/nth-of t0 0) :ref) (form/is-keyword? (form/nth-of t0 1))
+                   (form/is-map? schemas) (form/form-has? schemas (form/nth-of t0 1)))
+            (form/form-get schemas (form/nth-of t0 1))
+            t0)]
+    (or (kw-one-of? t " i64 string keyword ")
+        (kw-is? t :f64)
+        (native-word-value-type? t 0)
+        (native-scalar-record-type? t)
+        (native-boundary-scalar-variant-type? t))))
+
+(defn- function-boundary-type? [t [:ref :form/r] schemas [:ref :form/r] exported :bool] :bool
+  (or (native-boundary-type? t schemas)
+      (kw-one-of? t " vector-i64 bytes ")
+      (and (not exported)
+           (or (kw-one-of? t " vector-i64 vector-f64 string-index bytes ")
+               (handle? t schemas)))))
+
+;; ---- operation tables ----
+
+(defn- non-string-typed-ops [] :string
+  " string-replace-all string-contains? string-split-count string-fold-case string-upper f32-to-bits f32-from-bits f64-to-f32-rounded f32-to-f64-exact f32-add f32-sub f32-mul f32-div f32-min f32-max f32-neg f32-abs f32-sqrt f32-eq f32-lt f32-le f32-gt f32-ge f32-unordered i64-to-f32-checked i64-to-f32-rounded f32-to-i64-checked f32-to-i64-truncating f64-to-bits f64-from-bits f64-add f64-sub f64-mul f64-div f64-min f64-max f64-neg f64-abs f64-sqrt f64-sin-quarter-turn f64-cos-quarter-turn f64-sin-bounded f64-cos-bounded f64-exp-near-zero f64-log-near-one f64-atan2-bounded f64-exp-bounded f64-log-bounded f64-eq f64-lt f64-le f64-gt f64-ge f64-unordered i64-to-f64-checked i64-to-f64-rounded f64-to-i64-checked f64-to-i64-truncating map-new map-get map-assoc bool-not option-some option-none option-some? option-value result-ok result-err result-ok? result-value result-error result-ok-of result-err-of result-ok?-of result-value-of result-error-of result-match-of variant-new variant-match option-some-of option-none-of option-some?-of option-value-of option-match typed-list-new typed-list-nth bytes-empty bytes-count bytes-at bytes-slice bytes-concat bytes-from-vector-i64 vector-i64-from-bytes string-from-utf8 hetero-vector-new hetero-vector-count hetero-vector-at hetero-vector-assoc hetero-vector-equal typed-set-new typed-set-count typed-set-contains typed-set-conj typed-set-disj typed-set-equal typed-set-nth typed-map-new typed-map-count typed-map-contains typed-map-get typed-map-entry-at typed-map-assoc typed-map-dissoc typed-map-equal typed-map-keys typed-map-vals xml-path-count xml-name-count xml-name-text xml-path-text xml-path-attr decimal-f64-parse decimal-f64x3-parse record-new record-get record-assoc record-equal vector-count vector-get vector-at vector-drop vector-take vector-assoc vector-assoc! vector-conj vector-alloc vector-f64-new vector-f64-count vector-f64-get vector-f64-at vector-f64-drop vector-f64-take vector-f64-assoc vector-f64-conj string-index-new string-index-count string-index-contains string-index-get string-index-assoc disjoint-set-i64-new disjoint-set-i64-count disjoint-set-i64-union document-null document-bool document-i64 document-f64 document-string document-keyword document-symbol document-vector document-list document-set document-map document-count document-kind document-equal? document-set-contains? document-contains document-get document-vector-at document-list-at document-map-entry-at document-vector-assoc document-vector-conj document-vector-drop document-vector-remove document-vector-sort document-assoc document-dissoc document-merge document-string-value document-keyword-value document-symbol-value document-bool-value document-i64-value document-f64-value document-sha256 document-print document-read document-edn-print document-edn-read i32-wrap u32-wrap i32-wrapping-add i32-wrapping-mul i32-xor i32-shift-left i32-shift-right u32-shift-right xorshift32 bit-or bit-not i64-shift-left i64-shift-right u64-shift-right min max keyword-from-string keyword-name symbol ")
+
+;; -1 absent, else the operand count (`native-bytes-operations`)
+(defn- bytes-arity [op :string] :i64
+  (cond (string=? op "bytes-empty") 0 (string=? op "bytes-count") 1 (string=? op "bytes-at") 2
+        (string=? op "bytes-slice") 3 (string=? op "bytes-concat") 2 (string=? op "bytes-from-vector-i64") 1
+        (string=? op "vector-i64-from-bytes") 1 (string=? op "string-from-utf8") 1 :else -1))
+
+;; -1 absent, -2 any count, -3 even, -4 at least one, else the operand count (`native-document-operation-arities`)
+(defn- document-arity [op :string] :i64
+  (cond (one-of? op " document-null ") 0
+        (one-of? op " document-vector document-list document-set ") -2
+        (one-of? op " document-map ") -3
+        (one-of? op " document-merge ") -4
+        (one-of? op " document-bool document-i64 document-string document-keyword document-symbol document-count document-kind document-vector-sort document-string-value document-keyword-value document-symbol-value document-bool-value document-i64-value document-edn-print document-edn-read ") 1
+        (one-of? op " document-equal? document-set-contains? document-contains document-get document-vector-at document-list-at document-map-entry-at document-vector-conj document-vector-drop document-vector-remove document-dissoc ") 2
+        (one-of? op " document-vector-assoc document-assoc ") 3
+        :else -1))
+
+;; ---- the body walk ----
+
+(defn- even-count? [n :i64] :bool (= n (* 2 (quot n 2))))
+
+(defn- walk-from [xs [:ref :form/r] i :i64 schemas [:ref :form/r]] :bool
+  (loop [j i]
+    (if (>= j (form/count-of xs)) true
+      (if (walk (form/nth-of xs j) schemas) (recur (+ j 1)) false))))
+
+(defn- in-range? [f [:ref :form/r] lo :i64 hi :i64] :bool
+  (and (form/is-int? f) (>= (form/int-value f) lo) (<= (form/int-value f) hi)))
+
+;; (= (mapv first cases) (mapv first branches)), then each branch [tag binder body] with a symbol binder
+(defn- match-branches? [cases [:ref :form/r] branches [:ref :form/r]] :bool
+  (and (= (form/count-of cases) (form/count-of branches))
+       (loop [i 0]
+         (if (>= i (form/count-of cases)) true
+           (if (form/eq (form/first-of (form/nth-of cases i)) (form/first-of (form/nth-of branches i)))
+             (recur (+ i 1)) false)))
+       (loop [i 0]
+         (if (>= i (form/count-of branches)) true
+           (let [b (form/nth-of branches i)]
+             (if (and (vec-n? b 3) (form/is-symbol? (form/nth-of b 1))) (recur (+ i 1)) false))))))
+
+(defn- branch-bodies? [branches [:ref :form/r] schemas [:ref :form/r]] :bool
+  (loop [i 0]
+    (if (>= i (form/count-of branches)) true
+      (if (walk (form/nth-of (form/nth-of branches i) 2) schemas) (recur (+ i 1)) false))))
+
+(defn- let-bindings? [bs [:ref :form/r] schemas [:ref :form/r]] :bool
+  (and (form/is-vec? bs) (even-count? (form/count-of bs))
+       (loop [i 0]
+         (if (>= i (form/count-of bs)) true
+           (if (and (form/is-symbol? (form/nth-of bs i)) (walk (form/nth-of bs (+ i 1)) schemas))
+             (recur (+ i 2)) false)))))
+
+(defn- option-type? [t [:ref :form/r] schemas [:ref :form/r]] :bool
+  (and (form/is-vec? t) (kw-is? (form/nth-of t 0) :option) (handle? t schemas)))
+
+(defn- result-type? [t [:ref :form/r] schemas [:ref :form/r]] :bool
+  (and (form/is-vec? t) (kw-is? (form/nth-of t 0) :result) (handle? t schemas)))
+
+(defn- set-type? [t [:ref :form/r]] :bool
+  (and (form/is-vec? t) (kw-is? (form/nth-of t 0) :set) (native-word-value-type? t 0)))
+
+(defn- walk-call [f [:ref :form/r] schemas [:ref :form/r]] :bool
+  (let [op (symbol-name-of (form/nth-of f 0))
+        n (- (form/count-of f) 1)
+        a0 (form/nth-of f 1) a1 (form/nth-of f 2) a2 (form/nth-of f 3) a3 (form/nth-of f 4)
+        a4 (form/nth-of f 5) a5 (form/nth-of f 6)]
+    (cond
+      (string=? op "record-new")
+      (and (or (native-scalar-record-type? a0) (aggregate-of? :record a0 schemas))
+           (= (- n 1) (form/count-of (form/nth-of a0 2)))
+           (walk-from f 2 schemas))
+      (string=? op "record-get")
+      (and (= 3 n)
+           (or (native-scalar-record-type? a0) (aggregate-of? :record a0 schemas))
+           (form/is-keyword? a2) (some-first? (form/nth-of a0 2) a2)
+           (walk a1 schemas))
+      (string=? op "variant-new")
+      (and (= 3 n)
+           (or (native-scalar-variant-type? a0) (aggregate-of? :variant a0 schemas))
+           (form/is-keyword? a1) (some-first? (form/nth-of a0 2) a1)
+           (walk a2 schemas))
+      (string=? op "variant-match")
+      (and (= 3 n)
+           (or (native-scalar-variant-type? a0) (aggregate-of? :variant a0 schemas))
+           (form/is-vec? a2)
+           (match-branches? (form/nth-of a0 2) a2)
+           (walk a1 schemas)
+           (branch-bodies? a2 schemas))
+      (string=? op "typed-cap-call")
+      (and (= 4 n) (in-range? a0 0 255)
+           (or (plain-cap-pair? a1 a2) (provider-contract? (form/int-value a0) a1 a2))
+           (walk a3 schemas))
+      (one-of? op " f64-add f64-sub f64-mul f64-div f64-min f64-max f64-abs f64-neg f64-sqrt f64-from-bits f64-to-bits ")
+      (walk-from f 1 schemas)
+      (one-of? op " f32-add f32-sub f32-mul f32-div f32-abs f32-neg f32-sqrt f32-from-bits f32-to-bits ")
+      (walk-from f 1 schemas)
+      (one-of? op " f32-to-f64-exact f64-to-f32-rounded i64-to-f32-rounded i64-to-f64-rounded ")
+      (and (= 1 n) (walk a0 schemas))
+      (one-of? op " f64-eq f64-lt f64-le f64-gt f64-ge f64-unordered ")
+      (and (= 2 n) (walk-from f 1 schemas))
+      (one-of? op " f32-eq f32-lt f32-le f32-gt f32-ge f32-unordered ")
+      (and (= 2 n) (walk-from f 1 schemas))
+      (one-of? op " keyword-name keyword-from-string ")
+      (and (= 1 n) (walk a0 schemas))
+      (string=? op "bool-not")
+      (and (= 1 n) (walk a0 schemas))
+      (one-of? op " bit-or bit-not ")
+      (walk-from f 1 schemas)
+      (one-of? op " min max ")
+      (and (= 2 n) (walk-from f 1 schemas))
+      (one-of? op " i64-shift-left i64-shift-right u64-shift-right ")
+      (and (= 2 n) (walk a0 schemas)
+           (if (form/is-int? a1) (in-range? a1 0 63) (walk a1 schemas)))
+      (string=? op "option-some") (and (= 1 n) (walk a0 schemas))
+      (string=? op "option-none") (= 0 n)
+      (string=? op "option-some?") (and (= 1 n) (walk a0 schemas))
+      (string=? op "option-value") (and (= 2 n) (walk-from f 1 schemas))
+      (one-of? op " result-ok result-err result-ok? ") (and (= 1 n) (walk a0 schemas))
+      (one-of? op " result-value result-error ") (and (= 2 n) (walk-from f 1 schemas))
+      (one-of? op " option-some-of option-some?-of ")
+      (and (= 2 n) (option-type? a0 schemas) (walk a1 schemas))
+      (string=? op "option-none-of")
+      (and (= 1 n) (option-type? a0 schemas))
+      (string=? op "option-value-of")
+      (and (= 3 n) (option-type? a0 schemas) (walk a1 schemas) (walk a2 schemas))
+      (string=? op "option-match")
+      (and (= 5 n) (option-type? a0 schemas) (form/is-symbol? a3)
+           (walk a1 schemas) (walk a2 schemas) (walk a4 schemas))
+      (one-of? op " result-ok-of result-err-of result-ok?-of ")
+      (and (= 2 n) (result-type? a0 schemas) (walk a1 schemas))
+      (one-of? op " result-value-of result-error-of ")
+      (and (= 3 n) (result-type? a0 schemas) (walk a1 schemas) (walk a2 schemas))
+      (string=? op "result-match-of")
+      (and (= 6 n) (result-type? a0 schemas) (form/is-symbol? a2) (form/is-symbol? a4)
+           (walk a1 schemas) (walk a3 schemas) (walk a5 schemas))
+      (one-of? op " i32-wrap u32-wrap i32-wrapping-add i32-wrapping-mul i32-xor i32-shift-left i32-shift-right u32-shift-right ")
+      (walk-from f 1 schemas)
+      (one-of? op " vector-new vector-alloc vector-count vector-get vector-at vector-drop vector-take vector-assoc vector-assoc! vector-conj vector-f64-new vector-f64-count vector-f64-get vector-f64-at vector-f64-drop vector-f64-take vector-f64-assoc vector-f64-conj ")
+      (walk-from f 1 schemas)
+      (>= (bytes-arity op) 0)
+      (and (= n (bytes-arity op)) (walk-from f 1 schemas))
+      (string=? op "typed-set-new")
+      (and (set-type? a0) (walk-from f 2 schemas))
+      (string=? op "typed-set-conj")
+      (and (= 3 n) (set-type? a0) (walk a1 schemas) (walk a2 schemas))
+      (one-of? op " typed-set-count typed-set-nth ")
+      (and (set-type? a0) (walk-from f 2 schemas))
+      (string=? op "hetero-vector-new")
+      (and (aggregate-of? :vector a0 schemas)
+           (= (- n 1) (form/count-of (form/nth-of a0 1)))
+           (walk-from f 2 schemas))
+      (string=? op "hetero-vector-count")
+      (and (= 2 n) (aggregate-of? :vector a0 schemas) (walk a1 schemas))
+      (one-of? op " hetero-vector-at hetero-vector-assoc ")
+      (let [at? (string=? op "hetero-vector-at")]
+        (and (= (if at? 3 4) n)
+             (aggregate-of? :vector a0 schemas)
+             (form/is-int? a2) (>= (form/int-value a2) 0)
+             (< (form/int-value a2) (form/count-of (form/nth-of a0 1)))
+             (walk a1 schemas)
+             (or at? (walk a3 schemas))))
+      (and (string=? op "string-contains?") (= 2 n)) (walk-from f 1 schemas)
+      (and (string=? op "string-replace-all") (= 3 n)) (walk-from f 1 schemas)
+      (and (string=? op "arena-scope") (= 1 n)) (walk a0 schemas)
+      (and (string=? op "string-compare") (= 2 n)) (walk-from f 1 schemas)
+      (and (string=? op "string-fold-ascii") (= 1 n)) (walk a0 schemas)
+      (and (string=? op "string-find-blank") (= 2 n)) (walk-from f 1 schemas)
+      (and (string=? op "string-skip-blank") (= 2 n)) (walk-from f 1 schemas)
+      (and (string=? op "string-index-of-from") (= 3 n)) (walk-from f 1 schemas)
+      (and (string=? op "string-compare-lines") (= 4 n)) (walk-from f 1 schemas)
+      (and (string=? op "string-find-byte") (= 3 n)) (walk-from f 1 schemas)
+      (and (string=? op "string-append-range") (= 4 n)) (walk-from f 1 schemas)
+      (not (= -1 (document-arity op)))
+      (let [ar (document-arity op)]
+        (and (cond (= ar -3) (even-count? n)
+                   (= ar -2) true
+                   (= ar -4) (> n 0)
+                   :else (= ar n))
+             (walk-from f 1 schemas)))
+      (string=? op "string-index-new") (= 0 n)
+      (string=? op "string-index-count") (and (= 1 n) (walk a0 schemas))
+      (one-of? op " string-index-contains string-index-get ") (and (= 2 n) (walk-from f 1 schemas))
+      (string=? op "string-index-assoc") (and (= 3 n) (walk-from f 1 schemas))
+      (string=? op "let")
+      (and (let-bindings? a0 schemas) (walk a1 schemas))
+      :else
+      ;; a head that is not a symbol names nothing in the table, and the host never walks the head
+      (and (not (and (form/is-symbol? (form/nth-of f 0)) (one-of? op (non-string-typed-ops))))
+           (walk-from f 1 schemas)))))
+
+(defn walk [f [:ref :form/r] schemas [:ref :form/r]] :bool
+  (if (form/is-seq? f) (walk-call f schemas) true))
+
+;; ---- module ----
+
+(defn- every-param-type? [ts [:ref :form/r] schemas [:ref :form/r] exported :bool] :bool
+  (loop [i 0]
+    (if (>= i (form/count-of ts)) true
+      (if (function-boundary-type? (form/nth-of ts i) schemas exported) (recur (+ i 1)) false))))
+
+(defn function-admitted?
+  "One function of HIR module M under the gate: its boundary types and its body."
+  [m [:ref :form/r] fun [:ref :form/r]] :bool
+  (let [schemas (get-k m :schemas)
+        name (get-k fun :name)
+        exported (member? (form/kids-of (get-k m :exports)) name)
+        entry? (form/eq name (get-k m :entry))
+        result (get-k fun :result)]
+    (and (every-param-type? (get-k fun :param-types) schemas exported)
+         (or (kw-one-of? result " i64 string bool ")
+             (kw-is? result :f64)
+             (and exported (not entry?) (= 0 (form/count-of (get-k fun :params)))
+                  (kw-one-of? result " vector-i64 vector-f64 "))
+             (and (not entry?) (function-boundary-type? result schemas exported)))
+         (walk (get-k fun :body) schemas))))
+
+(defn body-admitted?
+  "A body form of module M under the gate, as nbb.cli's probe: an :i64 function with no parameters."
+  [m [:ref :form/r] body [:ref :form/r]] :bool
+  (walk body (get-k m :schemas)))
+
+(defn only-native-word-typed-features? [m [:ref :form/r]] :bool
+  (let [fs (get-k m :functions)]
+    (loop [i 0]
+      (if (>= i (form/count-of fs)) true
+        (if (function-admitted? m (form/nth-of fs i)) (recur (+ i 1)) false)))))
