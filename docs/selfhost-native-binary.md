@@ -262,10 +262,8 @@ signer alone is not enough — and it needs an explicit `--now`. And the command
 that accepts a signed envelope is `verify-signed`; `amu verify <signed.kexe>`
 answers `native artifact schema rejected`.
 
-What remains open is the parity question raised below: this run proves one
-host's route is JVM-free, not that the two host implementations agree. A key
-generated on one host verifying on the other, in both directions, is the rung
-still to climb.
+What this run proves is that one host's route is JVM-free. The cross-host
+question raised below was closed the same day, in the next section.
 
 ### There are two signing surfaces, and one of them is already portable
 
@@ -298,7 +296,31 @@ host is accepted by the other. Signing code that has only ever been run one
 way is signing code whose portability nobody has measured — and this
 document's own ladder exists because the JVM-free claim had never been run
 against a `PATH` with no `java` on it. The 2026-10-19 run above closes the
-`PATH` question on one host; the cross-host question is still open.
+`PATH` question on one host.
+
+**The cross-host question is closed too (2026-10-19).** kotoba-verifier PR
+#72 (merged `deb2d554`) added a live-exchange parity test — whichever host
+runs it spawns the other as the worker — and measured 18/18 cases: keys
+generated on either host accepted on the other in both directions,
+signatures made on either host verified on the other, Ed25519 determinism
+(byte-identical signatures for the same key and value), and three negatives
+(corrupted signature, wrong-key signature, tampered value) refused on **both**
+hosts. The merged tip was re-run from both drivers afterwards
+(`nbb: 9 tests, 18 passed` and `jvm: 9 tests, 18 passed`, both exit 0),
+because the first version of that PR's entry carried its invocation text in
+the ns docstring and a doc-only commit broke `clojure.core/ns` on the JVM
+(`Extra input spec: :clojure.core.specs.alpha/ns-form`) and the SCI entry
+(`$CP is not ISeqable`) — a case not run is not a case passed, and neither is
+an entry that no longer loads.
+
+Two upstream defects the parity work found are open, and they belong to the
+language/engine side rather than to signing: `kotoba.kir` resolves to
+`kotoba-kir`'s `kir.cljc` (which exports `default-fuel`, not `max-fuel`)
+ahead of the pinned `osaho`, so the repo's own `run-tests.cljk` fails at
+`origin/main` `231997a` with `Unable to resolve symbol: ir/max-fuel`; and
+`clojure.core/ns` evaluates `{:kotoba/export [...]}` attr-maps on a real JVM
+(`Unable to resolve symbol`) where SCI treats the map as data — the vectors
+want quoting.
 
 ## The order the hosts can leave in
 
