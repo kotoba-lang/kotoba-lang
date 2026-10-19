@@ -244,20 +244,28 @@ checkout:
 | `amu sign` | **yes** |
 | `amu verify-signed --trust` | **yes** (`:verified? true`) |
 | `amu measure-runtime` (builds the `kotoba-loader` Mach-O) | **yes** |
-| `amu run` / `amu receipt` | stops at usage — `missing --policy`, not a JVM refusal |
+| `amu run <signed.kexe> --trust --policy --input --executor-key --runtime --loader` | **yes** — `:status :ok`, `:result 42` |
+| `amu verify-receipt` | **yes** (`:verified? true`) |
 
-The gap this section was written to name is closed: a native artifact can be
-produced, signed, verified, and its runtime measured, with no JVM on `PATH`.
-What is not measured here: `run` and `receipt` need a capability policy file
-(`--policy`), and whether the full execute path answers once one is supplied
-is untested by this run.
+The gap this section was written to name is closed: the whole trust chain —
+produce, sign, verify, measure the runtime, execute under a policy and an
+input, mint a receipt, verify the receipt — runs with no JVM on `PATH`. The
+execute step is real: `amu run` drove the signed `aiueos-probe.kotoba` artifact
+under the measured runtime (`:kotoba.native-runtime/v6`) with `{:allow #{}}`
+and `{:args []}`, answered `:result 42`, and wrote a receipt
+(`receipt-sha256 2126b78d…`).
 
-Two things the 2026-09-08 table got wrong in detail. The command that accepts
-a signed envelope is `verify-signed`; `amu verify <signed.kexe>` answers
-`native artifact schema rejected`. And the parity question raised below — a
-key generated on one host verifying on the other, in both directions — is
-still unanswered: this run proves one host's route is JVM-free, not that the
-two host implementations agree.
+Two usage details the old table could not have known. `verify-receipt` rejects
+the receipt until the *executor* key's signer is in the trust set's
+`:trusted-signers` — `executor receipt attestation rejected`, the artifact
+signer alone is not enough — and it needs an explicit `--now`. And the command
+that accepts a signed envelope is `verify-signed`; `amu verify <signed.kexe>`
+answers `native artifact schema rejected`.
+
+What remains open is the parity question raised below: this run proves one
+host's route is JVM-free, not that the two host implementations agree. A key
+generated on one host verifying on the other, in both directions, is the rung
+still to climb.
 
 ### There are two signing surfaces, and one of them is already portable
 
