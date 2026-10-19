@@ -1,0 +1,461 @@
+;; multiformats.core — base58 / base32 / varint / multihash / CIDv1 in pure Clojure.
+;;
+;; Across a kotoba/IPFS codebase the same handful of encodings get reimplemented in
+;; every actor: base58btc for did:key, base32 for the multibase 'b' CID, the
+;; sha2-256 multihash, and `CIDv1`. Worse, computing a file's CID usually means
+;; shelling out to `ipfs add --only-hash` — a runtime dependency on the ipfs CLI
+;; just to get a content address. This library is that logic once, byte-identical
+;; to `ipfs add --cid-version=1 --raw-leaves` for single-block (≤256 KiB) inputs.
+;;
+;;   (require '[multiformats.core :as mf])
+;;   (mf/cidv1-raw (.getBytes "hello\n"))       ;=> "bafkrei…"  == ipfs add --raw-leaves
+;;   (mf/cid-of-file "path/to/blob.wasm")        ;=> "bafkrei…"  (single-block, :clj only)
+;;   (mf/kotoba-cid "ibuki")                     ;=> "bafyrei…"  dag-cbor CID of the name
+;;   (mf/base58btc some-bytes) (mf/base32 some-bytes)
+;;   (mf/cid->bytes "bafkrei…")                  ;=> the 0x01 0x55 0x12 0x20 … bytes
+;;
+;; PORTABLE (.cljc, real on both platforms — this is the fix for the honesty note
+;; every downstream repo in this ecosystem carried: "multiformats/dag-cbor are
+;; today JVM-only despite living in .cljc-named files"). `sha256` / `sha384` use
+;; `kotoba-lang/org-nist-sha2` on both hosts (pure `.cljc`, no npm). Everything
+;; else (varint, base32, CID assembly) is either fully shared bit-arithmetic or
+;; a small per-platform byte construction. Only `cid-of-file` stays :clj-only —
+;; that's genuine file I/O, not a gap.
+(ns multiformats.core
+  {:kotoba/export [base32 base32-decode base58btc base58btc-decode base64url base64url-decode cid->bytes cid->multihash cid->parts cidv1 cidv1-dag-cbor cidv1-raw codec-dag-cbor codec-raw hexify install-sha256! kotoba-cid max-exact multihash-sha256 portable-sha256 sha256 sha256-provider sha384 single-block-limit unhex varint varint-decode]}
+  (:require [kotoba.lang.text :as str]
+            [multiformats.base32 :as base32-codec]
+            [sha2.core :as sha2]
+            [sha2.sha512 :as sha512])
+  )
+
+;; ── base58btc — base-256 ↔ base-58 by integer division, no BigInteger, so it
+;; runs in the browser too (did:key 'z' multibase). ──────────────────────────
+(def ^:private b58-alphabet "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+(def ^:private b58-idx (into {} (map-indexed (fn [i c] [c i]) b58-alphabet)))
+
+(defn- ->ints [data] (map #(bit-and (int %) 0xff) (seq data)))
+
+(defn base58btc
+  "Bytes (a byte-array, Uint8Array, or a seq of 0..255 ints) → base58btc
+   (Bitcoin alphabet) String. Pure integer arithmetic — clj + cljs."
+  [data]
+  (let [in (->ints data)
+        digits (reduce
+                (fn [digits b]
+                  (let [[digits carry]
+                        (reduce (fn [[ds carry] d]
+                                  (let [v (+ (* d 256) carry)]
+                                    [(conj ds (rem v 58)) (quot v 58)]))
+                                [[] b] digits)]
+                    (loop [digits digits carry carry]
+                      (if (pos? carry)
+                        (recur (conj digits (rem carry 58)) (quot carry 58))
+                        digits))))
+                [] in)
+        nzeros (count (take-while zero? in))]
+    (str (apply str (repeat nzeros \1))
+         (apply str (map #(nth b58-alphabet %) (rseq digits))))))
+
+(defn base58btc-decode
+  "base58btc String → raw bytes (a byte-array on :clj, a vector of ints on
+   :cljs). Leading '1's decode to leading zero bytes. Pure integer
+   arithmetic, portable."
+  [s]
+  (let [bytes (reduce
+               (fn [bs c]
+                 ;; b58-idx returns nil for a character outside the
+                 ;; alphabet. On :clj, feeding that nil into `carry` below
+                 ;; throws a NullPointerException the first time `+`/`pos?`
+                 ;; touches it (fails closed, but only by accident of the
+                 ;; JVM's own unboxing semantics, not by design). On :cljs,
+                 ;; both `+` and `pos?` silently coerce nil to 0 instead of
+                 ;; throwing (confirmed via a real compiled shadow-cljs
+                 ;; build: `(+ 290 nil)` => 290, not an error) -- so an
+                 ;; invalid character used to silently decode as if its
+                 ;; index were 0 mid-string, or -- worse -- an invalid
+                 ;; FIRST character made the whole function silently return
+                 ;; an EMPTY byte vector instead of raising anything at
+                 ;; all. Same platform-inconsistent bug class already
+                 ;; fixed in this repo's own unhex/base32-decode.
+                 (let [idx (or (b58-idx c)
+                               (throw (ex-info "multiformats: invalid base58btc character" {:char c})))
+                       [bs carry]
+                       (reduce (fn [[acc carry] d]
+                                 (let [v (+ (* d 58) carry)]
+                                   [(conj acc (rem v 256)) (quot v 256)]))
+                               [[] idx] bs)]
+                   (loop [bs bs carry carry]
+                     (if (pos? carry)
+                       (recur (conj bs (rem carry 256)) (quot carry 256))
+                       bs))))
+               [] (seq s))
+        nzeros (count (take-while #(= \1 %) s))
+        out (concat (repeat nzeros 0) (rseq bytes))]
+    ))
+
+;; ── hashing ──────────────────────────────────────────────────────────────────
+(defn- byte-seq [b]
+  (mapv #(bit-and (int %) 0xff) b))
+
+(defn- digest-bytes [digest]
+  )
+
+(defn portable-sha256
+  "SHA-256 via `kotoba-lang/org-nist-sha2`. Available on every host, and the
+  answer this library gives when nothing faster has been installed."
+  [b]
+  (digest-bytes (sha2/sha256 (byte-seq b))))
+
+;; ── the digest seam ──────────────────────────────────────────────────────────
+;;
+;; WHY. The portable digest is ~500x slower than the host's, and it is on a
+;; path that runs per block. Measured 2026-09-08 with compiled ClojureScript on
+;; node (load 29):
+;;
+;;      4,795 bytes   portable 1.39 ms   node:crypto 0.0036 ms   382x
+;;    384,843 bytes   portable  117 ms   node:crypto 0.17   ms   700x
+;;
+;; and the cost is the compression loop, not the conversion: `vec(array-seq)`
+;; is 6 ms of the 117 and the digest over the vector is 90. So accepting typed
+;; arrays without converting would buy about a fifth, and this buys the rest.
+;;
+;; It reaches callers. `ipld.core/get-verified-block` re-derives a CID for
+;; every block a traversal touches, so `ipfs.kotobase.net`'s selector surface
+;; paid it per block per restart. Measured live the same day on one 384,843-byte
+;; leaf: ~0.45 s through the route that verifies with `crypto.subtle`, ~1.4-2.0 s
+;; through the route that verifies here.
+;;
+;; WHY A SEAM AND NOT A REQUIRE. A synchronous host digest exists on the JVM
+;; (`MessageDigest`) and on Node/workerd (`node:crypto`), and NOT in a browser:
+;; WebCrypto's `digest` is async and every caller above this line is sync. So
+;; the JVM takes it unconditionally and ClojureScript is given a way to install
+;; one, rather than this namespace requiring `node:crypto` and breaking every
+;; browser build that has never needed it.
+;;
+;; WHAT AN INSTALLER MUST NOT DO is install a different function.
+;; `install-sha256!` proves the candidate against the portable implementation
+;; on a fixed corpus before it accepts it, and REFUSES rather than returning
+;; false -- a caller that ignored a false would be running an unverified digest
+;; under a name that promises SHA-256.
+
+
+
+(def ^:private install-corpus
+  "Empty, one byte, a block boundary either side of 64, and a two-block
+   message. The boundaries are where a wrong implementation is wrong: padding
+   is what `pad` exists for, and a digest that agrees on 32 bytes and disagrees
+   on 64 is the one this corpus is here to catch."
+  [0 1 55 56 63 64 65 127 128 129])
+
+(defn install-sha256!
+  "Install a faster synchronous SHA-256 `f` (bytes -> 32 bytes), after proving
+  it agrees with the portable implementation. Returns the installed fn.
+
+  Throws when it disagrees on any corpus input, or when it is absent on a host
+  that has no seam. Refusing beats returning false: this is called for its
+  effect, and a caller that dropped the result would be running an unverified
+  digest under a name that promises SHA-256."
+  [f]
+  )
+
+(defn sha256-provider
+  "Which digest `sha256` will actually run: `:message-digest` on the JVM,
+  `:installed` or `:portable` on ClojureScript.
+
+  Exists because the alternative is believing. Measured 2026-09-09, a consumer
+  of this library carried the comment \"sha256 itself is already provided for
+  both hosts by io-multiformats (MessageDigest on the JVM, @noble/hashes on
+  cljs), so do not write one\" -- and the cljs half had never been true. It was
+  the portable implementation, at 180x to 3000x the cost of the host digest
+  depending on input length, and nothing in the library let that comment be
+  checked.
+
+  A consumer that cares can now assert it, and a build can gate on it.
+
+  It reports which IMPLEMENTATION runs, not whether `install-sha256!` was
+  called: installing `portable-sha256` through the seam still answers
+  `:portable`, because the question a consumer asks is whether it is paying the
+  slow one."
+  []
+  )
+
+(defn sha256
+  "SHA-256 digest bytes.
+
+  The JVM uses `MessageDigest`, which is always present. ClojureScript uses
+  whatever `install-sha256!` has proved and installed, and the portable
+  implementation until something has -- ask `sha256-provider` rather than
+  assuming, because the difference is 180x to 3000x."
+  [b]
+  )
+
+(defn sha384
+  "SHA-384 digest bytes (48 bytes). Same backend as `sha256`.
+
+  RDFC-1.0 names SHA-384 as an optional canonicalization hash. SHA-384
+  is not a truncation of SHA-512, so both backends compute it directly."
+  [b]
+  (digest-bytes (sha512/sha384 (byte-seq b))))
+
+;; ── unsigned varint (LEB128) ──────────────────────────────────────────────────
+
+(def max-exact
+  "Largest integer both hosts represent exactly, 2^53-1.
+
+  The same constant `proto.wire/max-exact` and `protobuf.wire/max-exact` name.
+  Three libraries in this workspace encode the same base-128 varint, and they
+  have to agree about which values exist -- when they did not, the same octets
+  meant different numbers depending on which one read them."
+  9007199254740991)
+
+(defn varint
+  "Unsigned base-128 varint (LEB128).
+
+  Arithmetic rather than shifts. Measured 2026-08-17, the ClojureScript branch
+  used `unsigned-bit-shift-right`, which operates on int32 there, so every
+  value at or above 2^32 produced DIFFERENT OCTETS from the JVM:
+
+      2^32  ->  JVM [128 128 128 128 16]   CLJS [128 0]
+      2^35  ->  JVM [128 128 128 128 128 1] CLJS [128 0]
+
+  Not an error either way. `[128 0]` is a well-formed varint that decodes to
+  zero, so a CID or multiaddr built in a Worker would have been accepted
+  everywhere and meant something else.
+
+  Nothing reaches that today -- multicodec and multiaddr protocol codes are
+  all small -- so this was latent rather than live. It is fixed anyway, for the
+  reason `dev-protobuf` learned the hard way: its range note said the values it
+  encoded stayed far inside the exact range, and the example it gave was the
+  counterexample."
+  [n]
+  (when (or (neg? n) (> n max-exact))
+    (throw (ex-info "varint out of range" {:value n :max-exact max-exact})))
+  )
+
+(defn varint-decode
+  "Read one unsigned base-128 varint (LEB128) at `offset` of a byte-indexable
+  `bytes`. Returns `{:value n :next i}`, or `{:error kw}` — never a bare nil.
+
+  The inverse of `varint`, and it is here rather than in a caller because a
+  private copy already diverged from it. `ipld.core` carried a `defn-`
+  `read-varint` whose accumulator was `(bit-shift-left (bit-and b 0x7f) shift)`.
+  That is the SAME int32 defect `varint` itself was fixed for on 2026-08-17,
+  reflected into the decoder and left there — measured 2026-08-20, the varint
+  of 2^32 (`[128 128 128 128 16]`) decodes as:
+
+      JVM   4294967296
+      CLJS  0
+
+  Not an error either way, so a header carrying a large multicodec would have
+  been accepted on both runtimes and meant something else on one. Nothing
+  reaches it today (CID version 1 and codecs 0x55/0x70/0x71 are all one group),
+  which is exactly why it survived: the encoder's fix was reviewed, the
+  decoder was in another repo and not public, so nobody compared them.
+
+  Arithmetic, not shifts, for that reason.
+
+  **The error cases are distinct on purpose.** A truncated header, a header
+  that never terminates, and a value too large to be exact are three different
+  facts about the input, and a caller that sees `nil` for all three cannot
+  report which one it got. `:incomplete` means the bytes ran out mid-varint;
+  `:unterminated` means the continuation bit stayed set past the widest value
+  this codec admits; `:not-exact` means the value decoded past `max-exact`,
+  where a ClojureScript number stops being able to hold it exactly — refusing
+  is the only answer that means the same thing on both runtimes."
+  [bytes offset]
+  (let [n (count bytes)]
+    (loop [i offset mult 1 value 0 groups 0]
+      (cond
+        (>= i n) {:error :incomplete}
+        :else
+        (let [b (bit-and (long (nth bytes i)) 0xff)
+              value (+ value (* (bit-and b 0x7f) mult))]
+          (cond
+            (> value max-exact) {:error :not-exact}
+            (zero? (bit-and b 0x80)) {:value value :next (inc i)}
+            ;; max-exact is 53 bits = 8 groups, so group index 7 is the last
+            ;; legitimate one and `mult` never grows past 128^7. Bounding here
+            ;; rather than after the multiply is not a style choice: 128^9
+            ;; is Long.MAX_VALUE + 1, so a guard placed one step later throws
+            ;; `long overflow` on the JVM instead of reporting the malformed
+            ;; input. Found by this function's own :unterminated test.
+            (>= groups 7) {:error :unterminated}
+            :else (recur (inc i) (* mult 128) value (inc groups))))))))
+
+;; Stable aliases preserve the existing API. CID parsers that do not hash can
+;; require `multiformats.base32` directly and avoid the SHA/npm dependency.
+(def base32 base32-codec/encode)
+(def base32-decode base32-codec/decode)
+
+;; ── base64url, no padding (multibase prefix `u`, RFC 4648 §5) ────────────────
+(def ^:private b64url-alphabet
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+(def ^:private b64url-idx
+  (into {} (map-indexed (fn [i c] [c i]) b64url-alphabet)))
+
+(defn base64url
+  "Bytes to base64url without padding (RFC 4648 §5)."
+  [bytes]
+  (->> (->ints bytes)
+       (partition 3 3 nil)
+       (mapcat
+        (fn [chunk]
+          (let [n (count chunk)
+                [b0 b1 b2] (concat chunk (repeat (- 3 n) 0))
+                v (bit-or (bit-shift-left b0 16) (bit-shift-left b1 8) b2)
+                chars [(bit-and (bit-shift-right v 18) 0x3f)
+                       (bit-and (bit-shift-right v 12) 0x3f)
+                       (bit-and (bit-shift-right v 6) 0x3f)
+                       (bit-and v 0x3f)]]
+            (map #(nth b64url-alphabet %) (take (inc n) chars)))))
+       (apply str)))
+
+(defn base64url-decode
+  "base64url to raw bytes. Padding is tolerated; bad input is rejected."
+  [text]
+  (let [text (str/replace text #"=+$" "")
+        out (loop [chars (seq text) buffer 0 bit-count 0 acc []]
+              (if (empty? chars)
+                acc
+                (let [ch (first chars)
+                      idx (or (b64url-idx ch)
+                              (throw (ex-info "multiformats: invalid base64url character"
+                                              {:char ch})))
+                      buffer (bit-or (bit-shift-left buffer 6) idx)
+                      bit-count (+ bit-count 6)]
+                  (if (>= bit-count 8)
+                    (recur (rest chars) buffer (- bit-count 8)
+                           (conj acc
+                                 (bit-and
+                                  (unsigned-bit-shift-right buffer (- bit-count 8))
+                                  0xff)))
+                    (recur (rest chars) buffer bit-count acc)))))]
+    ))
+
+;; ── multihash (sha2-256 = 0x12, length 0x20) ──────────────────────────────────
+;; Returns an array-like on both platforms (byte-array / Uint8Array), NOT a
+;; plain vector on :cljs -- `aget`/`alength` (as this namespace's own docs
+;; imply are safe on any "bytes" this library hands back, and as
+;; `boundary?`-style consumers downstream do) silently return nil/0 on a
+;; ClojureScript PersistentVector instead of throwing, which is exactly the
+;; kind of gap that stays invisible until it corrupts output.
+(defn multihash-sha256 [b]
+  (let [h (sha256 b)]
+    ))
+
+;; ── CIDv1 ─────────────────────────────────────────────────────────────────────
+;; codec multicodecs: raw = 0x55, dag-pb = 0x70, dag-cbor = 0x71
+(def codec-raw 0x55)
+(def codec-dag-cbor 0x71)
+
+(defn cidv1
+  "CIDv1 string from a content codec + a multihash. base32 'b' multibase."
+  [codec multihash]
+  (let [body (concat (seq (varint 0x01)) (seq (varint codec)) (seq multihash))]
+    (str "b" (base32 ))))
+
+(defn cidv1-raw
+  "CIDv1 of raw bytes (codec 0x55). Byte-identical to
+   `ipfs add --cid-version=1 --raw-leaves` for a single block (input ≤ 256 KiB)."
+  [b]
+  (cidv1 codec-raw (multihash-sha256 b)))
+
+(defn cidv1-dag-cbor
+  "CIDv1 with the dag-cbor codec (0x71) over sha2-256 of the given bytes."
+  [b]
+  (cidv1 codec-dag-cbor (multihash-sha256 b)))
+
+(defn kotoba-cid
+  "KotobaCid::from_bytes(name) — CIDv1 dag-cbor sha2-256 of the UTF-8 name string.
+   Matches the kotoba node's graph/RID content addressing."
+  [name]
+  (cidv1-dag-cbor ))
+
+(defn cid->bytes
+  "Decode a base32 'b' multibase CIDv1 back to its (version,codec,multihash) bytes."
+  [cid]
+  (when-not (str/starts-with? cid "b")
+    (throw (ex-info "expected base32 'b' multibase CID" {:cid cid})))
+  (base32-decode (subs cid 1)))
+
+;; ── CID disassembly ──────────────────────────────────────────────────────────
+;; `cidv1` assembles (version, codec, multihash); until 2026-08-20 nothing took
+;; one apart. `ipld.core/cid-codec` read the codec and stopped there, so the
+;; multihash — the part IPNI actually indexes, and the part that is the SAME
+;; for two CIDs of one content under different codecs — could not be obtained
+;; from a CID anywhere in this workspace.
+;;
+;; That distinction is the point. A CID answers *what is this*; a multihash
+;; answers *where is it*, because a provider record is keyed by digest and does
+;; not care whether the caller wants the bytes as raw or as dag-pb. Deriving
+;; one direction is total (`cid->multihash`); the other is not a function, and
+;; there is deliberately no `multihash->cid`.
+
+(defn- byte-view
+  "Array-like on both runtimes, never a ClojureScript vector.
+
+  `cid->bytes` hands back a JVM byte-array but a cljs PersistentVector, and
+  this namespace's own multihash note records why that asymmetry bites:
+  `aget`/`alength` return nil/0 on a vector instead of throwing. Anything
+  shaped like a multihash leaves here shaped like `multihash-sha256`'s output."
+  [xs]
+  )
+
+(defn cid->parts
+  "`{:version :codec :multihash}` of a base32 CIDv1, or `{:error kw}`.
+
+  `:multihash` is array-like (see `byte-view`) and is the remainder of the
+  decoded CID after the two varint headers — it is NOT re-validated as a
+  well-formed multihash, because this function's job is to say what the CID
+  declares, not to judge it. `:error` is `:not-cidv1` for a v0 `Qm…` or any
+  other version, otherwise whatever `varint-decode` reported."
+  [cid]
+  (let [bytes (try (vec (cid->bytes cid))
+                   (catch  _ nil))]
+    (if (nil? bytes)
+      {:error :not-base32-cid}
+      (let [v (varint-decode bytes 0)]
+        (cond
+          (:error v) v
+          (not= 1 (:value v)) {:error :not-cidv1}
+          :else
+          (let [c (varint-decode bytes (:next v))]
+            (if (:error c)
+              c
+              {:version 1
+               :codec (:value c)
+               :multihash (byte-view (subvec bytes (:next c)))})))))))
+
+(defn cid->multihash
+  "The multihash bytes a CIDv1 carries, or nil.
+
+  Total in the direction that is a function: every CIDv1 names exactly one
+  multihash, and two CIDs differing only in codec name the same one. The
+  reverse is not a function — a multihash does not determine a codec — so a
+  caller holding only this cannot reconstruct the CID it came from, and is
+  not meant to."
+  [cid]
+  (:multihash (cid->parts cid)))
+
+;; ── file helper (single-block raw CID) — genuinely :clj-only: file I/O differs
+;; by platform, this isn't a gap the way sha256/CID assembly were. ────────────
+(def ^:const single-block-limit 262144) ; ipfs default chunker = 256 KiB
+
+
+
+;; ── hex (handy alongside the codecs) ──────────────────────────────────────────
+(defn hexify [b]
+  )
+
+(defn unhex [s]
+  (let [s (str/replace s #"\s" "")]
+    (when (odd? (count s))
+      ;; `(partition 2 s)` on an odd-length string silently drops the
+      ;; trailing incomplete nibble instead of erroring -- a truncated/
+      ;; malformed hex string (an odd number of hex digits is never valid
+      ;; encoded byte data) must fail loudly, not quietly decode a
+      ;; shorter-than-intended byte array.
+      (throw (ex-info "unhex: odd-length hex string" {:s s})))
+    (let [pairs (partition 2 s)]
+      )))
