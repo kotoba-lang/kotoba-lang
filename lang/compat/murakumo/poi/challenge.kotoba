@@ -1,0 +1,246 @@
+(ns murakumo.poi.challenge
+  "Capacity challenges and replay verification on the live text heads
+  (ADR-261010 §2, ADR-261010b §5).
+
+  A round sends every healthy head one short protocol-issued job: a fresh
+  random nonce phrase to repeat, greedy (temperature 0, fixed seed), with
+  logprobs. The node does not choose the job, so the work cannot be
+  wash-traded. The producer's usage and timings become a receipt. A different
+  head, picked at random, replays the same request; the verdict compares the
+  two greedy token-id sequences position by position and passes at ≥ 3/4
+  agreement, provided the producer also met the decode-speed floor for its
+  class."
+  (:require [clojure.string :as str]
+            [murakumo.poi.core :as poi]
+            [murakumo.poi.ledger :as ledger]
+            ["node:crypto" :as crypto]))
+
+(def default-model "mishima")
+(def default-p-active-m
+  "Active parameters (millions) per served model, for uVCU."
+  {"mishima" 27000})
+(def min-decode-tok-s
+  "Decode-speed floor per model: below this the head cannot be the hardware it
+  is registered as (memory-bandwidth timing, ADR-261010 §2)."
+  {"mishima" 2.0})
+(def match-num 3)
+(def match-den 4)
+
+(def ^:private words
+  ["amber" "basalt" "cedar" "delta" "ember" "fjord" "garnet" "harbor" "indigo"
+   "juniper" "kelp" "lumen" "meadow" "nectar" "onyx" "pepper" "quartz" "river"
+   "saffron" "tundra" "umber" "violet" "willow" "xenon" "yarrow" "zephyr"])
+
+(defn nonce-phrase []
+  (let [b (.randomBytes crypto 6)]
+    (str/join " " (map #(nth words (mod % (count words))) (array-seq b)))))
+
+(defn request-body [model phrase]
+  {:model model
+   :messages [{:role "user" :content (str "Repeat exactly, with nothing else: " phrase)}]
+   :max_tokens 16 :temperature 0 :seed 7 :logprobs true :top_logprobs 1
+   :cache_prompt false})
+
+(defn- post-json [url body timeout-ms]
+  (let [ctl (js/AbortController.)
+        t (js/setTimeout #(.abort ctl) timeout-ms)]
+    (-> (js/fetch url #js {:method "POST"
+                           :headers #js {"content-type" "application/json"}
+                           :body (js/JSON.stringify (clj->js body))
+                           :signal (.-signal ctl)})
+        (.then (fn [r] (.then (.json r) (fn [j] {:status (.-status r)
+                                                  :body (js->clj j :keywordize-keys true)}))))
+        (.finally #(js/clearTimeout t)))))
+
+(defn healthy? [{:keys [url]}]
+  (let [ctl (js/AbortController.)
+        t (js/setTimeout #(.abort ctl) 5000)]
+    (-> (js/fetch (str url "/health") #js {:signal (.-signal ctl)})
+        (.then #(= 200 (.-status %)))
+        (.catch (constantly false))
+        (.finally #(js/clearTimeout t)))))
+
+(defn token-ids [body]
+  (mapv :id (get-in body [:choices 0 :logprobs :content])))
+
+(defn run-job
+  "One request to one head. Resolves {:ok? ... :ids ... :usage ... :timings ...}."
+  [head body]
+  (-> (post-json (str (:url head) "/v1/chat/completions") body 120000)
+      (.then (fn [{:keys [status body]}]
+               {:ok? (and (= 200 status) (seq (token-ids body)))
+                :status status
+                :ids (token-ids body)
+                :usage (:usage body)
+                :timings (:timings body)}))
+      (.catch (fn [e] {:ok? false :error (str e)}))))
+
+(defn compare-ids [a b]
+  (let [n (count a)]
+    {:matched (count (filter true? (map = a b))) :total n}))
+
+(def max-verifiers
+  "A verifier that cannot answer (busy, error, empty output) says nothing about
+  the producer, so the replay moves to another random head, up to this many."
+  3)
+
+(defn- shuffled-others [heads exclude]
+  (let [others (vec (remove #(= (:name %) (:name exclude)) heads))]
+    (loop [v others out []]
+      (if (empty? v)
+        out
+        (let [i (.randomInt crypto (count v))]
+          (recur (into (subvec v 0 i) (subvec v (inc i))) (conj out (nth v i))))))))
+
+(defn- replay
+  "Replay `body` on up to max-verifiers random other heads; resolves the first
+  verifier that answered with tokens as {:verifier head :res res :tried n}, or
+  {:tried n} when none could."
+  [heads producer body]
+  (let [candidates (take max-verifiers (shuffled-others heads producer))]
+    (reduce (fn [p v]
+              (.then p (fn [acc]
+                         (if (:res acc)
+                           acc
+                           (.then (run-job v body)
+                                  (fn [res] (if (:ok? res)
+                                              {:verifier v :res res :tried (inc (:tried acc))}
+                                              (update acc :tried inc))))))))
+            (js/Promise.resolve {:tried 0})
+            candidates)))
+
+(defn- receipt-of [job-id head model res]
+  (let [{:keys [prompt_tokens completion_tokens]} (:usage res)
+        cached (or (get-in res [:usage :prompt_tokens_details :cached_tokens]) 0)]
+    {:type "receipt" :kind "capacity" :job job-id
+     :node (:name head) :head (:url head) :model model
+     :t-in (or prompt_tokens 0) :t-out (or completion_tokens 0) :cached cached
+     :uvcu (poi/uvcu-text {:p-active-m (get default-p-active-m model 0)
+                           :t-in (or prompt_tokens 0) :t-out (or completion_tokens 0)
+                           :cached cached})
+     :decode-tok-s (get-in res [:timings :predicted_per_second])
+     :prompt-ms (get-in res [:timings :prompt_ms])
+     :predicted-ms (get-in res [:timings :predicted_ms])
+     :ids-digest (.digest (.update (.createHash crypto "sha256") (str/join "," (:ids res))) "hex")}))
+
+(defn challenge-one
+  "Challenge `head`, then replay on another random head. Appends the receipt
+  and the verdict; resolves a summary map."
+  [dir key heads head {:keys [model] :or {model default-model}}]
+  (let [job-id (str "cap_" (.toString (.randomBytes crypto 8) "hex"))
+        body (request-body model (nonce-phrase))]
+    (-> (run-job head body)
+        (.then
+         (fn [res]
+           (if-not (:ok? res)
+             {:job job-id :node (:name head) :skipped (or (:error res) (str "HTTP " (:status res)))}
+             (let [receipt (receipt-of job-id head model res)
+                   _ (ledger/append-receipt! dir key receipt)]
+               (-> (replay heads head body)
+                   (.then
+                    (fn [{:keys [verifier tried] vres :res}]
+                      (if-not verifier
+                        ;; nobody could replay: inconclusive, neither pass nor fail
+                        (let [verdict {:type "verdict" :job job-id :node (:name head)
+                                       :inconclusive true :tried tried}]
+                          (ledger/append-receipt! dir key verdict)
+                          {:job job-id :node (:name head) :uvcu (:uvcu receipt)
+                           :tok-s (:decode-tok-s receipt) :match "-" :pass "inconclusive"})
+                        (let [{:keys [matched total]} (compare-ids (:ids res) (:ids vres))
+                              fast? (>= (or (:decode-tok-s receipt) 0) (get min-decode-tok-s model 0))
+                              agree? (poi/verify-pass? {:matched matched :total total
+                                                        :min-num match-num :min-den match-den})
+                              verdict {:type "verdict" :job job-id :node (:name head)
+                                       :verifier (:name verifier) :tried tried
+                                       :matched matched :total total
+                                       :fast fast? :pass (and fast? agree?)}]
+                          (ledger/append-receipt! dir key verdict)
+                          {:job job-id :node (:name head) :verifier (:name verifier)
+                           :uvcu (:uvcu receipt) :tok-s (:decode-tok-s receipt)
+                           :match (str matched "/" total) :pass (:pass verdict)}))))))))))))
+
+(defn round!
+  "Challenge every healthy head once, sequentially (heads run one slot, so this
+  never stacks more than one protocol job on a head)."
+  [dir key heads opts]
+  (-> (js/Promise.all (clj->js (map healthy? heads)))
+      (.then (fn [ok]
+               (let [live (vec (keep-indexed (fn [i h] (when (aget ok i) h)) heads))]
+                 (reduce (fn [p head]
+                           (.then p (fn [acc]
+                                      (.then (challenge-one dir key live head opts)
+                                             #(conj acc %)))))
+                         (js/Promise.resolve [])
+                         live))))))
+
+;; ------------------------------------------------- customer job receipts
+
+(def default-resident-port
+  "The resident's port (resident.example.json), used only for a head the
+  topology does not name."
+  8796)
+
+(defn- get-json [url timeout-ms]
+  (let [ctl (js/AbortController.)
+        t (js/setTimeout #(.abort ctl) timeout-ms)]
+    (-> (js/fetch url #js {:signal (.-signal ctl)})
+        (.then (fn [r] (if (.-ok r) (.then (.json r) #(js->clj % :keywordize-keys true)) nil)))
+        (.catch (constantly nil))
+        (.finally #(js/clearTimeout t)))))
+
+(defn- url-host [u] (second (re-matches #"https?://([^:/]+).*" (str u))))
+
+(defn topology-residents
+  "{host {:name node :url resident-url}} for the enabled nodes of a parsed
+  fleet topology (string keys, as in deploy/fleet-topology.json)."
+  [topology]
+  (into {} (for [n (get topology "nodes")
+                 :let [u (get n "url") host (url-host u)]
+                 :when (and host (not (false? (get n "enabled"))))]
+             [host {:name (get n "node") :url (str/replace u #"/+$" "")}])))
+
+(defn resident-url
+  "Where a head's resident serves /poi/receipts: the URL the topology gives for
+  its node (:resident-url), else the head's host on the default resident port."
+  [head]
+  (or (some-> (:resident-url head) (str/replace #"/+$" ""))
+      (str "http://" (url-host (:url head)) ":" default-resident-port)))
+
+(defn collect!
+  "Pull node-signed customer receipts from every head's resident and record
+  each new one, wrapped and countersigned by the coordinator. A receipt is
+  taken only if it verifies against the did it names and that did is the one
+  first seen for the node (pinned in the ledger), so a node cannot sign for
+  another. Resolves {node new-count}."
+  [dir key heads]
+  (let [pins (ledger/node-dids dir)
+        seen (ledger/node-receipt-digests dir)]
+    (reduce
+     (fn [p head]
+       (.then p
+              (fn [acc]
+                (let [since (ledger/last-node-receipt-at dir (:name head))]
+                  (.then (get-json (str (resident-url head) "/poi/receipts?since=" since) 10000)
+                         (fn [resp]
+                           (let [did (:did resp)
+                                 pinned (get pins (:name head))
+                                 docs (when (and did (or (nil? pinned) (= pinned did)))
+                                        (filter #(and (ledger/signed? %)
+                                                      (= did (get-in % [:payload :issuer]))
+                                                      (not (seen (ledger/doc-digest %))))
+                                                (:receipts resp)))]
+                             (doseq [d docs]
+                               (let [{:keys [job model t-in t-out cached at]} (:payload d)]
+                                 (ledger/append-receipt!
+                                  dir key
+                                  {:type "receipt" :kind "customer" :job job :node (:name head) :did did
+                                   :model model :t-in t-in :t-out t-out :cached cached :node-at at
+                                   :uvcu (poi/uvcu-text {:p-active-m (get default-p-active-m model 0)
+                                                         :t-in (or t-in 0) :t-out (or t-out 0) :cached (or cached 0)})
+                                   :node-doc d})))
+                             (assoc acc (:name head) (cond (nil? resp) "unreachable"
+                                                           (and pinned (not= pinned did)) "did mismatch"
+                                                           :else (count docs))))))))))
+     (js/Promise.resolve {})
+     heads)))
+

@@ -1,0 +1,173 @@
+(ns murakumo.mesh.ledger-cli
+  "Operator commands for the mesh ledger.
+
+    kbb -cp src:resources -m murakumo.mesh.ledger-cli sync   --host root@seed [--ledger kekkai-tailnet.edn] [--dry-run]
+    kbb -cp src:resources -m murakumo.mesh.ledger-cli revoke NAME-or-DID --host root@seed [--reason R]
+    kbb -cp src:resources -m murakumo.mesh.ledger-cli list   [--ledger kekkai-tailnet.edn]
+
+  `sync` pulls what the seed admitted into the operator's ledger and pushes the
+  operator's revocations to the seed. The merge runs INSIDE the seed server, over
+  a root-only unix socket reached through ssh (`--socket`), as one step like a
+  join -- so a join landing while you sync is never lost, which a read-modify-write
+  of the file over ssh could not promise. `revoke` always writes the operator's own
+  ledger first -- that is the one fleet operations consult -- and then tries the
+  seed; if the seed is unreachable the revocation still stands locally and the
+  next `sync` carries it over.
+
+  A revocation stops the node being operated on (the kekkai gate) and stops it
+  enrolling again (the seed refuses a revoked DID). It does NOT take the radio
+  off the mesh: the node still holds the SAE passphrase. Rotating the passphrase
+  is the cutoff for that, and is not done here.
+
+  Exit: 0 done, 1 failed, 2 bad usage, 3 done but the sides disagree about a key
+  (see the report; nothing was overwritten)."
+  (:require ["node:fs" :as fs]
+            [kotoba.bytes :as kbytes]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [murakumo.durable-file :as durable]
+            [murakumo.mesh.install :as install]
+            [murakumo.mesh.ledger :as ledger]
+            [murakumo.ssh :as ssh]))
+
+(def default-socket install/admin-socket)
+(def default-local-path "kekkai-tailnet.edn")
+
+(defn- safe-path? [p] (boolean (re-matches #"/[A-Za-z0-9_./-]+" (str p))))
+
+;; ── local ──────────────────────────────────────────────────────────────────
+
+(defn local-read
+  "{:ledger} -- a missing local file is an empty ledger (first sync) -- or {:error}."
+  [path]
+  (if-not (.existsSync fs path)
+    {:ledger {:nodes {}}}
+    (ledger/parse (str (.readFileSync fs path "utf8")))))
+
+(defn local-write!
+  "Atomic. The previous file is kept as `<path>.bak`, and the very first one as
+  `<path>.orig` and never overwritten: the example ledger is hand-commented, a
+  rewrite drops the comments, and `.bak` would lose them on the second write."
+  [path l]
+  (when (.existsSync fs path)
+    (.copyFileSync fs path (str path ".bak"))
+    (when-not (.existsSync fs (str path ".orig")) (.copyFileSync fs path (str path ".orig"))))
+  (durable/write! path (kbytes/utf8-bytes (ledger/serialize l))))
+
+;; ── seed ──────────────────────────────────────────────────────────────────
+
+(defn admin-sync
+  "Ask the seed server to reconcile against `local`. {:ok? :ledger :report :changed?}
+  or {:error kw :detail str}. curl's own status separates 'could not reach the
+  server' from 'the server refused': an HTTP answer is always on the last line."
+  [host socket local dry-run?]
+  (let [cmd (str "sudo -n curl -sS --unix-socket " socket
+                 " -X POST -H 'content-type: application/edn' --data-binary @-"
+                 " -w '\n%{http_code}' http://seed/admin/sync")
+        {:keys [exit out err]} (ssh/sh-in host cmd (pr-str {:ledger local :dry-run? (boolean dry-run?)}))
+        lines (str/split-lines (str out))
+        code (last lines)
+        body (str/join "\n" (butlast lines))]
+    (cond
+      (not (zero? exit)) {:error :seed-unreachable
+                          :detail (str "is the enrol server running, and is the socket " socket "? " (str/trim (str err)))}
+      (not= "200" code) {:error :seed-refused
+                         :detail (str "HTTP " code " " (str/trim body))}
+      :else (let [r (try (edn/read-string body) (catch :default _ nil))]
+              (if (and (map? r) (:ok? r))
+                r
+                {:error :seed-bad-reply :detail (str/trim body)})))))
+
+;; ── commands ───────────────────────────────────────────────────────────────
+
+(defn- summarize [{:keys [added updated conflicts kept-revoked revoked-on-seed]}]
+  (str "added " (count added) (when (seq added) (str " " (pr-str added)))
+       ", updated " (count updated) (when (seq updated) (str " " (pr-str updated)))
+       ", revoked on seed " (count revoked-on-seed) (when (seq revoked-on-seed) (str " " (pr-str revoked-on-seed)))
+       (when (seq kept-revoked) (str ", kept revoked (seed disagreed) " (pr-str kept-revoked)))
+       (when (seq conflicts) (str "\nCONFLICT, key differs for authorized name, local kept: " (pr-str conflicts)))))
+
+(defn sync!
+  [{:keys [host ledger socket dry-run?] :or {ledger default-local-path socket default-socket}}]
+  (let [l (local-read ledger)]
+    (if (:error l)
+      {:ok? false :msg (str "local ledger: " (name (:error l)))}
+      (let [r (admin-sync host socket (:ledger l) dry-run?)]
+        (if (:error r)
+          {:ok? false :msg (str "seed: " (name (:error r)) " " (:detail r))}
+          (do (when (and (not dry-run?) (not= (:ledger r) (:ledger l)))
+                (local-write! ledger (:ledger r)))
+              {:ok? true :report (:report r)
+               :msg (str (when dry-run? "dry run: ") (summarize (:report r)))}))))))
+
+(defn revoke!
+  "Merge, revoke locally, then push. Each seed call is one atomic step on the
+  server, so a join that lands in between is kept, not overwritten. The operator's
+  ledger is written before the push: a revocation must stand even if the seed
+  cannot be reached, and the next `sync` carries it over."
+  [selector {:keys [host ledger socket reason now-ms] :or {ledger default-local-path socket default-socket}}]
+  (let [l (local-read ledger)]
+    (if (:error l)
+      {:ok? false :msg (str "local ledger: " (name (:error l)))}
+      (let [a1 (when host (admin-sync host socket (:ledger l) false))
+            seed-up? (and a1 (not (:error a1)))
+            base (if seed-up? (:ledger a1) (:ledger l))
+            rv (ledger/revoke base selector {:now-ms now-ms :reason reason})]
+        (cond
+          (= :not-found (:error rv)) {:ok? false :msg (str "no node named or keyed " selector)}
+          (= :already-revoked (:error rv))
+          (do (when (and seed-up? (not= base (:ledger l))) (local-write! ledger base))
+              {:ok? true :msg (str selector " was already revoked" (when seed-up? "; ledgers synced"))})
+          :else
+          (let [names (:revoked rv)
+                _ (local-write! ledger (:ledger rv))]
+            (if-not seed-up?
+              {:ok? true :partial? true
+               :msg (str "revoked " (pr-str names) " in the local ledger; seed not updated ("
+                         (if host (str (name (:error a1)) ": " (:detail a1)) "no --host")
+                         ") -- run `sync` when it is reachable")}
+              (let [a2 (admin-sync host socket (:ledger rv) false)]
+                (if (:error a2)
+                  {:ok? true :partial? true
+                   :msg (str "revoked " (pr-str names) " locally; the seed did not take it: "
+                             (name (:error a2)) " " (:detail a2) " -- run `sync` to retry")}
+                  {:ok? true :msg (str "revoked " (pr-str names) " locally and on the seed")})))))))))
+
+(defn list-nodes [{:keys [ledger] :or {ledger default-local-path}}]
+  (let [l (local-read ledger)]
+    (if (:error l)
+      {:ok? false :msg (str "local ledger: " (name (:error l)))}
+      {:ok? true
+       :msg (str/join "\n"
+                      (for [[n e] (sort-by key (:nodes (:ledger l)))]
+                        (str (:status e) "\t" n "\t" (or (:address e) "-") "\t" (:did e)
+                             (when (:admitted-by e) (str "\t" (name (:admitted-by e)))))))})))
+
+(defn- parse-args [args]
+  (loop [m {} [k v & more :as as] (rest args)]
+    (if (empty? as)
+      (assoc m :cmd (first args))
+      (case k
+        "--dry-run" (recur (assoc m :dry-run? true) (rest as))
+        "--host" (recur (assoc m :host v) more)
+        "--ledger" (recur (assoc m :ledger v) more)
+        "--socket" (recur (assoc m :socket v) more)
+        "--reason" (recur (assoc m :reason v) more)
+        (if (and (nil? (:selector m)) (not (str/starts-with? (str k) "--")))
+          (recur (assoc m :selector k) (rest as))
+          (throw (ex-info (str "unknown argument " k) {:arg k})))))))
+
+(defn -main [& args]
+  (let [o (try (parse-args args) (catch :default e (println (ex-message e)) nil))
+        usage! (fn [] (println "usage: ledger-cli sync --host H | revoke NAME|DID --host H [--reason R] | list  [--ledger P] [--dry-run]")
+                 (js/process.exit 2))]
+    (when-not (and o (#{"sync" "revoke" "list"} (:cmd o))) (usage!))
+    (when (and (:socket o) (not (safe-path? (:socket o)))) (usage!))
+    (let [r (case (:cmd o)
+              "sync" (if (:host o) (sync! o) (do (usage!) nil))
+              "revoke" (if (:selector o) (revoke! (:selector o) (assoc o :now-ms (.now js/Date))) (do (usage!) nil))
+              "list" (list-nodes o))]
+      (println (:msg r))
+      (js/process.exit (cond (not (:ok? r)) 1
+                             (seq (get-in r [:report :conflicts])) 3
+                             :else 0)))))

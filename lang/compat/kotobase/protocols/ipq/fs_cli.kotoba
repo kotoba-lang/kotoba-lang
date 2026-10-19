@@ -1,0 +1,401 @@
+(ns kotobase.protocols.ipq.fs-cli
+  "Agent/toolcall entrypoint for materializing one verified IPQ filesystem CAR."
+  (:require [cljs.reader :as reader]
+            [clojure.string :as str]
+            [ipld.car :as car]
+            [ipld.car.bytes :as bytes]
+            [ipld.core :as ipld]
+            [kotobase.protocols.ipq.fs :as fs]
+            [multiformats.core :as mf]))
+
+(def node-crypto (js/require "node:crypto"))
+(def node-fs (js/require "node:fs"))
+(def node-path (js/require "node:path"))
+(def child-process (js/require "node:child_process"))
+
+(def git-manifest-path ".kotoba/ipq.edn")
+(def git-manifest-schema "kotoba.ipq.git-project.v1")
+
+(defn snapshot-adl-capability []
+  {:version fs/adl-version
+   :validate-representation (fn [value]
+                              (try (do (bytes/bcount value) true)
+                                   (catch :default _ false)))
+   :decode ipld/decode
+   :encode ipld/encode
+   :validate-logical map?
+   :fuel-costs {:validate-representation 1
+                :decode 1
+                :encode 1
+                :validate-logical 1}})
+
+(def option-spec
+  {"--car" :car
+   "--root" :root
+   "--scope-root" :scope-root
+   "--cache-root" :cache-root
+   "--project" :project
+   "--snapshot" :snapshot
+   "--tree" :tree
+   "--blocks-dir" :blocks-dir
+   "--paths" :paths})
+
+(def command-options
+  {"materialize" #{:car :root :scope-root :cache-root :blocks-dir}
+   "git-materialize" #{:car :project :snapshot :cache-root :blocks-dir}
+   "snapshot" #{:tree :scope-root :car :blocks-dir :paths}})
+
+(defn refuse! [problem message data]
+  (throw (ex-info message (assoc data :phase :ipq-fs-cli :problem problem))))
+
+(defn parse-args [argv]
+  (let [command (first argv)
+        allowed (get command-options command)]
+    (when-not allowed
+      (refuse! :command
+               (str "usage: ipq_fs_materialize.cljk "
+                    "materialize --car FILE --root CID [--scope-root /PATH] [--cache-root DIR]\n"
+                    "   or: ipq_fs_materialize.cljk git-materialize --project DIR --snapshot NAME --car FILE [--cache-root DIR]")
+               {:argv argv}))
+    (loop [remaining (next argv) options {:command command}]
+      (if (empty? remaining)
+        (do
+          (case command
+            "materialize"
+            (when-not (and (string? (:car options)) (string? (:root options)))
+              (refuse! :required-option "--car and --root are required"
+                       {:options (keys options)}))
+
+            "git-materialize"
+            (when-not (and (string? (:car options))
+                           (string? (:project options))
+                           (string? (:snapshot options)))
+              (refuse! :required-option "--car, --project, and --snapshot are required"
+                       {:options (keys options)}))
+
+            "snapshot"
+            ;; --blocks-dir is required, not optional. Every entry this
+            ;; writer emits NAMES its bytes, so a run that put them nowhere
+            ;; has produced a manifest describing content no reader can
+            ;; reach. Making it optional would let the writer succeed at
+            ;; producing something unusable.
+            (when-not (and (string? (:tree options)) (string? (:car options))
+                           (string? (:blocks-dir options)))
+              (refuse! :required-option "--tree, --car and --blocks-dir are required"
+                       {:options (keys options)})))
+          (cond-> options
+            (contains? #{"materialize" "snapshot"} command)
+            (assoc :scope-root (or (:scope-root options) "/"))))
+        (let [[flag value & more] remaining
+              option (get option-spec flag)]
+          (when-not option
+            (refuse! :unknown-option "unknown IPQ filesystem materialize option" {:option flag}))
+          (when-not (contains? allowed option)
+            (refuse! :option-not-allowed "option is not valid for this materialize mode"
+                     {:command command :option flag}))
+          (when-not (and value (not (.startsWith value "--")))
+            (refuse! :option-value "IPQ filesystem materialize option requires a value"
+                     {:option flag}))
+          (when (contains? options option)
+            (refuse! :duplicate-option "IPQ filesystem materialize option was repeated"
+                     {:option flag}))
+          (recur more (assoc options option value)))))))
+
+(defn git-output! [project args problem message]
+  (try
+    (str/trim
+     (.execFileSync child-process "git" (clj->js (concat ["-C" project] args))
+                    #js {:encoding "utf8"
+                         :stdio #js ["ignore" "pipe" "pipe"]}))
+    (catch :default e
+      (refuse! problem message
+               {:project project
+                :git-args (vec args)
+                :git-exit-code (.-status e)}))))
+
+(defn exact-keys? [value expected]
+  (and (map? value) (= expected (set (keys value)))))
+
+(defn snapshot-entry? [entry]
+  (and (exact-keys? entry #{:root :scope-root})
+       (string? (:root entry)) (not (str/blank? (:root entry)))
+       (string? (:scope-root entry)) (.startsWith (:scope-root entry) "/")))
+
+(defn read-git-snapshot! [{:keys [project snapshot]}]
+  (let [project (.resolve node-path project)
+        top (git-output! project ["rev-parse" "--show-toplevel"]
+                         :git-project "--project is not inside a Git worktree")
+        commit (git-output! top ["rev-parse" "HEAD"]
+                            :git-head "Git project has no readable HEAD")
+        status (git-output! top ["status" "--porcelain" "--" git-manifest-path]
+                            :git-status "could not inspect the IPQ project manifest")]
+    (when-not (str/blank? status)
+      (refuse! :git-manifest-dirty
+               "the project IPQ manifest must be committed and unchanged"
+               {:git-project top :manifest git-manifest-path :status status}))
+    (let [source (git-output! top ["show" (str commit ":" git-manifest-path)]
+                              :git-manifest "HEAD does not contain .kotoba/ipq.edn")
+          manifest (try (reader/read-string source)
+                        (catch :default _
+                          (refuse! :git-manifest-syntax
+                                   "HEAD:.kotoba/ipq.edn is not readable EDN"
+                                   {:git-project top :git-commit commit})))
+          entry (get (:snapshots manifest) snapshot)]
+      (when-not (exact-keys? manifest #{:schema :snapshots})
+        (refuse! :git-manifest-shape "IPQ project manifest has unknown or missing fields"
+                 {:git-project top :git-commit commit}))
+      (when-not (= git-manifest-schema (:schema manifest))
+        (refuse! :git-manifest-schema "unsupported IPQ project manifest schema"
+                 {:expected git-manifest-schema :actual (:schema manifest)}))
+      (when-not (and (map? (:snapshots manifest))
+                     (every? #(and (string? %) (not (str/blank? %)))
+                             (keys (:snapshots manifest)))
+                     (every? snapshot-entry? (vals (:snapshots manifest))))
+        (refuse! :git-manifest-shape
+                 "IPQ project snapshots must map non-empty string names to exact root/scope entries"
+                 {:git-project top :git-commit commit}))
+      (when-not entry
+        (refuse! :git-snapshot "named IPQ snapshot is not present in HEAD:.kotoba/ipq.edn"
+                 {:snapshot snapshot :git-project top :git-commit commit}))
+      {:root (:root entry)
+       :scope-root (:scope-root entry)
+       :git-project top
+       :git-commit commit
+       :git-snapshot snapshot
+       :git-manifest git-manifest-path})))
+
+(defn directory-block-port
+  "A block port over a local directory of `<cid>` files — the same layout the
+   bytes plane stores at `ipld/{cid}`.
+
+  Fetch authority stays outside this command, which is why this exists at all:
+  the host puts blocks somewhere on disk by whatever means it is entitled to,
+  and the CLI reads them. It never opens a socket.
+
+  `cid` cannot escape the directory: `fs/validate-snapshot!` has already
+  refused any entry whose CID is not `bafkrei` + 52 base32 characters, and
+  resolution runs after validation."
+  [dir]
+  {:get (fn [cid]
+          (let [file (.join node-path dir cid)]
+            (when (.existsSync node-fs file)
+              {:bytes (.readFileSync node-fs file)})))})
+
+;; ── the digest ───────────────────────────────────────────────────────────────
+;;
+;; multiformats ships a portable SHA-256 and a seam to replace it, and asks
+;; callers not to assume which one is running. Measured 2026-09-23 on 82 real
+;; documents (3.08 MB) with nothing installed: reading them cost 60 ms and
+;; hashing them cost 16,595 ms — 202 ms a file, 276x the I/O. Every CID this
+;; command computes or VERIFIES pays it, so `materialize` of those same 82
+;; files took 9.2 s.
+;;
+;; The first version of this fix hashed with node:crypto in a local function
+;; and left the library's own `cidv1-raw` alone. That made the WRITER fast
+;; and the reader slow, because `fs/resolve-content!` — the half that checks
+;; what a port returned — calls the library. Installing through the seam
+;; fixes both, and is what the seam is for: kotobase-ipfs and the control
+;; plane already install @noble/hashes the same way.
+;;
+;; `install-sha256!` proves the candidate against the portable implementation
+;; over a block-boundary corpus and THROWS on disagreement, so at module
+;; scope a wrong digest fails the command rather than producing CIDs from it
+;; — the right way round for a value that is an identity.
+;;
+;; node:crypto rather than a package: this namespace is already Node-only and
+;; the runtime's digest needs no dependency to be added.
+(defonce ^:private installed-sha256
+  (mf/install-sha256!
+   (fn [b]
+     (-> (.createHash node-crypto "sha256")
+         (.update (if (instance? js/Uint8Array b) b (js/Uint8Array.from (into-array b))))
+         (.digest)))))
+
+(defn- refuse-unusable-name! [name]
+  (when (or (str/includes? name "/") (str/includes? name "\n")
+            (str/includes? name "\t") (= name ".") (= name ".."))
+    (refuse! :unusable-name
+             "a file name cannot appear in a canonical snapshot path"
+             {:name name})))
+
+(defn- file-entry!
+  "One file becomes one referenced entry, and its block is written on the way
+   when a blocks dir was given."
+  [abs path blocks-dir bytes-total]
+  (let [stat (.lstatSync node-fs abs)]
+    (when (.isSymbolicLink stat)
+      (refuse! :symlink "a snapshot cannot carry a symbolic link" {:path path}))
+    (when-not (.isFile stat)
+      (refuse! :not-regular "a snapshot carries regular files and directories only"
+               {:path path}))
+    (let [buf (.readFileSync node-fs abs)
+          cid (mf/cidv1-raw (bytes/as-bytes buf))]
+      (when blocks-dir
+        (.writeFileSync node-fs (.join node-path blocks-dir cid) buf))
+      (swap! bytes-total + (.-byteLength buf))
+      {"path" path "type" "file" "cid" cid "size" (.-byteLength buf)})))
+
+(defn- from-paths!
+  "Snapshot exactly the files a list names, and the directories they need.
+
+  A whole tree is often not what one wants to fix a CID over. The audited
+  part of a real site is 600 documents inside 27,431 files, and the entry
+  ceiling refuses the latter — so without this the only way to snapshot the
+  documents would be to copy them somewhere first, which produces a CID over
+  the copy rather than over the tree.
+
+  Paths are relative to `--tree`, one per line, `#` comments and blank lines
+  ignored. A path that is not there is a REFUSAL, not a skip: a snapshot that
+  silently contains less than it was asked for is a snapshot whose CID says
+  nothing about what was left out."
+  [tree scope-root blocks-dir paths-file]
+  (when-not (.existsSync node-fs paths-file)
+    (refuse! :no-paths-file "there is no such path list" {:paths paths-file}))
+  (let [lines (->> (str/split (str (.readFileSync node-fs paths-file "utf8")) #"\n")
+                   (map str/trim)
+                   (remove #(or (= "" %) (str/starts-with? % "#"))))
+        bytes-total (atom 0)
+        by-path (atom {scope-root {"path" scope-root "type" "directory"}})]
+    (when (empty? lines)
+      (refuse! :no-paths "the path list names no files" {:paths paths-file}))
+    (doseq [relative lines]
+      (let [segments (str/split relative #"/")]
+        (when (or (str/starts-with? relative "/") (some #{"" "." ".."} segments))
+          (refuse! :unusable-path "a listed path must be relative and canonical"
+                   {:path relative}))
+        (doseq [segment segments] (refuse-unusable-name! segment))
+        (let [abs (.join node-path tree relative)
+              path (str scope-root "/" relative)]
+          (when-not (.existsSync node-fs abs)
+            (refuse! :no-such-path "the path list names a file that is not there"
+                     {:path relative}))
+          ;; Every ancestor, so the snapshot validates: an entry whose parent
+          ;; is missing is refused by the reader, and the reader is right.
+          (reduce (fn [prefix segment]
+                    (let [dir (str prefix "/" segment)]
+                      (swap! by-path update dir
+                             #(or % {"path" dir "type" "directory"}))
+                      dir))
+                  scope-root
+                  (butlast segments))
+          (swap! by-path assoc path
+                 (file-entry! abs path blocks-dir bytes-total))
+          (when (> (count @by-path) fs/max-entries)
+            (refuse! :entry-limit
+                     "this path list needs more entries than one snapshot admits"
+                     {:maximum fs/max-entries :reached (count @by-path)})))))
+    {:entries (vec (vals @by-path)) :bytes @bytes-total}))
+
+(defn- collect-entries!
+  "Walk a real directory into snapshot entries, writing each file's block into
+   `blocks-dir` on the way when one is given.
+
+  Every file becomes a REFERENCED entry. Inlining small files would be a
+  legitimate option — version 1 is better for a tree that fits in a block —
+  but a writer that sometimes inlines produces two shapes for the same input
+  depending on a threshold, and there is no measurement here saying where to
+  put it."
+  [tree scope-root blocks-dir]
+  (let [entries (atom [{"path" scope-root "type" "directory"}])
+        bytes-total (atom 0)]
+    (letfn [(count-entry! []
+              ;; Checked DURING the walk, not after it. Blocks are written as
+              ;; they are read, so a tree that is over the limit would
+              ;; otherwise pay for a full copy of its content before being
+              ;; told. Measured on a real site: 27,431 files, 213 MiB, all
+              ;; written before a refusal that the first 4,097 entries had
+              ;; already decided.
+              (when (> (count @entries) fs/max-entries)
+                (refuse! :entry-limit
+                         "this tree has more entries than one snapshot admits"
+                         {:maximum fs/max-entries :reached (count @entries)})))
+            (walk [abs prefix]
+              (doseq [name (sort (js->clj (.readdirSync node-fs abs)))]
+                (refuse-unusable-name! name)
+                (let [child (.join node-path abs name)
+                      path (str prefix "/" name)
+                      stat (.lstatSync node-fs child)]
+                  (cond
+                    (.isSymbolicLink stat)
+                    (refuse! :symlink "a snapshot cannot carry a symbolic link"
+                             {:path path})
+
+                    (.isDirectory stat)
+                    (do (swap! entries conj {"path" path "type" "directory"})
+                        (count-entry!)
+                        (walk child path))
+
+                    :else
+                    (do (swap! entries conj
+                               (file-entry! child path blocks-dir bytes-total))
+                        (count-entry!))))))]
+      (walk tree scope-root))
+    {:entries @entries :bytes @bytes-total}))
+
+(defn snapshot!
+  "A real directory becomes one CID-fixed manifest CAR."
+  [{:keys [tree scope-root car blocks-dir paths]}]
+  (when-not (.existsSync node-fs tree)
+    (refuse! :no-tree "there is no such directory to snapshot" {:tree tree}))
+  (when blocks-dir
+    (.mkdirSync node-fs blocks-dir #js {:recursive true}))
+  (let [{:keys [entries bytes]} (if paths
+                                  (from-paths! tree scope-root blocks-dir paths)
+                                  (collect-entries! tree scope-root blocks-dir))
+        ;; Sorted by path, for BOTH routes. The root CID is a function of the
+        ;; encoded entries, so an order that came from how the files were
+        ;; found would make the same set of files under the same names hash
+        ;; differently depending on which flag was used to name them.
+        entries (vec (sort-by #(get % "path") entries))
+        logical {"version" fs/snapshot-write-version "entries" entries}
+        representation (ipld/encode logical)
+        root (mf/cidv1-raw representation)
+        encoded (car/encode {:roots [root]
+                             :blocks [{:cid root :bytes representation}]})]
+    (.writeFileSync node-fs car (:bytes encoded))
+    ;; Read it back through the reader that will read it in production. A
+    ;; writer verified only by its own arithmetic is a writer nobody has
+    ;; checked — and when `blocks-dir` was given, this also proves every
+    ;; block it just wrote resolves.
+    (let [verified (fs/mount (cond-> {:car-bytes (:bytes encoded)
+                                      :root root
+                                      :scope-root scope-root
+                                      :adl-capability (snapshot-adl-capability)}
+                               blocks-dir (assoc :blocks (directory-block-port blocks-dir))))]
+      {:status :snapshot
+       :root root
+       :scope-root scope-root
+       :car car
+       :blocks-dir blocks-dir
+       :entries (count entries)
+       :files (count (filter #(= "file" (get % "type")) entries))
+       :referenced-bytes bytes
+       :manifest-bytes (bytes/bcount representation)
+       :verified-entries (count (:entries verified))})))
+
+(defn materialize! [{:keys [car root scope-root cache-root blocks-dir] :as options}]
+  (when cache-root
+    (set! (.. js/process -env -KOTOBA_IPQ_FS_CACHE) cache-root))
+  (let [mount (fs/mount (cond-> {:car-bytes (.readFileSync node-fs car)
+                                 :root root
+                                 :scope-root scope-root
+                                 :adl-capability (snapshot-adl-capability)}
+                          blocks-dir (assoc :blocks (directory-block-port blocks-dir))))
+        files (count (filter (fn [[_ entry]] (= "file" (get entry "type")))
+                             (:entries mount)))]
+    (merge {:status :materialized
+            :ipq-profile (:ipq-profile mount)
+            :root (:root mount)
+            :scope-root (:scope-root mount)
+            :local-root (:local-root mount)
+            :entries (count (:entries mount))
+            :files files
+            :loaded (get-in mount [:receipt :loaded])}
+           (select-keys options [:git-project :git-commit :git-snapshot :git-manifest]))))
+
+(defn run! [argv]
+  (let [{:keys [command] :as options} (parse-args argv)]
+    (case command
+      "materialize" (materialize! options)
+      "git-materialize" (materialize! (merge options (read-git-snapshot! options)))
+      "snapshot" (snapshot! options))))

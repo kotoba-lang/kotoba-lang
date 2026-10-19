@@ -1,0 +1,261 @@
+(ns ipld.patch
+  "IPLD Patch -- the six declarative operations, over one Data Model node.
+
+  A patch is a list of operations applied linearly to a subject document, in
+  the shape RFC 6902 established and the IPLD Patch spec adopts: `add`,
+  `replace`, `remove`, `copy`, `move`, `test`, carried as Data Model maps with
+  the string keys `\"op\"`, `\"path\"`, `\"value\"` and `\"from\"`. Because the
+  operations are themselves Data Model data, a patch is a document like any
+  other -- it can be carried in any codec, and it has an address (`ops-cid`)
+  computed by the node codec that already exists rather than by a second one.
+
+  **Atomicity is free here and is not a feature this namespace implements.**
+  The spec requires that any erroring operation leaves the whole patch
+  unapplied. Data Model nodes are immutable values, so a rejected `apply-ops`
+  throws and the caller still holds the document it passed in. Nothing is
+  rolled back because nothing was mutated.
+
+  Four things the spec leaves open are decided here, fail-closed, because a
+  silent choice would make two conforming implementations disagree about what
+  the same patch means:
+
+  - **Paths do not cross links.** A path segment that lands on a `:link` is
+    refused with `:patch/path-crosses-link`. Editing through a link is not a
+    document edit: it rewrites the linked block, which moves that block's CID,
+    which moves every ancestor. That is a graph rewrite with block-writing
+    authority, and the upstream fixtures deliberately cover single blocks only
+    (`fixtures-1`: *the data can still be a tree ... but contains no links*).
+    The fixtures that would specify the multi-block case do not exist yet.
+  - **No `~0`/`~1` unescaping.** RFC 6902 escapes `~` and `/` inside a
+    reference token; the IPLD Patch spec says nothing about it. Implementing
+    the RFC rule silently would make `\"/a~1b\"` name the key `a/b` here and
+    the key `a~1b` in an implementation that read the spec literally -- the
+    same patch, two documents. A map key containing `/` is therefore not
+    addressable through the wire path form, and an operation naming one fails
+    as not-found. `parse-path` is public so a caller inside this workspace can
+    pass exact segments instead.
+  - **List indices are canonical decimal, no leading zeros** (adopted from
+    RFC 6902). Without the rule `\"/01\"` and `\"/1\"` address the same element
+    through two spellings, and `ops-cid` would give one meaning two addresses.
+  - **`move` refuses to move a node into its own child** (adopted from
+    RFC 6902), and the empty root path `\"\"` is refused outright: `remove` at
+    the root has no defined result, and inventing one per operation is how the
+    six operations stop meaning the same thing to two readers.
+
+  Two limits are stated rather than glossed. **ADL nodes are not writable**:
+  `ipld.data-model/INode` is a read interface (lookup, contains?, entries,
+  length) with no write side, so an ADL substrate reached by a path is refused
+  rather than silently materialised into a native map. And **the spec's
+  ordering rule is vacuous here**: it says a map addition goes at the end, but
+  a Clojure map is unordered and DAG-CBOR fixes key order canonically at encode
+  time, so map order is not observable in this Data Model. List order is
+  observable, and `add` inserts exactly where the index says."
+  {:kotoba/export [apply-ops equal? operations ops-cid parse-path]}
+  (:require [ipld.core :as core]
+            [ipld.data-model :as dm]
+            [ipld.link :as link]
+            [kotoba.lang.text :as text]))
+
+(def operations
+  "The six operations, and the fields each one requires beyond \"op\"."
+  {"add"     #{"path" "value"}
+   "replace" #{"path" "value"}
+   "remove"  #{"path"}
+   "copy"    #{"path" "from"}
+   "move"    #{"path" "from"}
+   "test"    #{"path" "value"}})
+
+(defn- reject! [problem data]
+  (throw (ex-info (str "ipld.patch: " (name problem))
+                  (assoc data :problem problem))))
+
+;; ---------------------------------------------------------------- paths
+
+(defn- canonical-index
+  "Parse a list index the way RFC 6902 requires: decimal digits, and no
+  leading zero unless the index is exactly 0."
+  [raw path]
+  (when-not (and (string? raw) (seq raw) (re-matches #"[0-9]+" raw))
+    (reject! :patch/list-index-not-a-number {:segment raw :path path}))
+  (when (and (< 1 (count raw)) (= \0 (nth raw 0)))
+    (reject! :patch/list-index-not-canonical {:segment raw :path path}))
+  )
+
+(defn parse-path
+  "Split a wire path into raw string segments.
+
+  `\"/foo/1\"` becomes `[\"foo\" \"1\"]`. Segments stay strings: whether `\"1\"`
+  means the map key or the list index is decided by the node it is applied to,
+  not by the path. No unescaping is performed -- see the namespace docstring."
+  [wire]
+  (when-not (string? wire)
+    (reject! :patch/path-not-a-string {:path wire}))
+  (when (= "" wire)
+    (reject! :patch/root-path-unsupported {:path wire}))
+  (when-not (text/starts-with? wire "/")
+    (reject! :patch/path-not-absolute {:path wire}))
+  (vec (rest (text/split wire #"/" -1))))
+
+(defn- writable! [node path]
+  (when (satisfies? dm/INode node)
+    (reject! :patch/adl-node-not-writable {:path path}))
+  node)
+
+(defn- container-key
+  "Resolve one raw segment against the node it addresses into a map key or a
+  list index, refusing every node kind that cannot hold one."
+  [node raw path]
+  (writable! node path)
+  (case (dm/kind node)
+    :map raw
+    :list (canonical-index raw path)
+    :link (reject! :patch/path-crosses-link {:path path})
+    (reject! :patch/path-through-scalar {:path path :kind (dm/kind node)})))
+
+(defn- put [node k value]
+  (case (dm/kind node)
+    :map (assoc node k value)
+    :list (assoc (vec node) k value)))
+
+(defn- insert [node k value path]
+  (case (dm/kind node)
+    :map (assoc node k value)
+    :list (let [v (vec node)]
+            (when-not (<= 0 k (count v))
+              (reject! :patch/list-index-out-of-range
+                       {:path path :index k :length (count v)}))
+            (into (conj (subvec v 0 k) value) (subvec v k)))))
+
+(defn- drop-key [node k path]
+  (case (dm/kind node)
+    :map (do (when-not (contains? node k)
+               (reject! :patch/path-not-found {:path path}))
+             (dissoc node k))
+    :list (let [v (vec node)]
+            (when-not (< -1 k (count v))
+              (reject! :patch/list-index-out-of-range
+                       {:path path :index k :length (count v)}))
+            (into (subvec v 0 k) (subvec v (inc k))))))
+
+(defn- alter-at
+  "Apply `f` to the container that holds the last segment, and rebuild the
+  spine above it. `f` receives the container and the resolved key."
+  [node segments path f]
+  (let [raw (first segments)
+        k   (container-key node raw path)]
+    (if (= 1 (count segments))
+      (f node k)
+      (do
+        (when-not (dm/contains-segment? node k)
+          (reject! :patch/path-not-found {:path path}))
+        (put node k (alter-at (dm/lookup node k) (rest segments) path f))))))
+
+(defn- value-at [node segments path]
+  (reduce (fn [current raw]
+            (let [k (container-key current raw path)]
+              (when-not (dm/contains-segment? current k)
+                (reject! :patch/path-not-found {:path path}))
+              (dm/lookup current k)))
+          node
+          segments))
+
+;; ------------------------------------------------------------- equality
+
+(defn- bytes-equal? [a b]
+  )
+
+(defn equal?
+  "Data Model equality, as the `test` operation needs it.
+
+  `=` is not enough. Two byte arrays with identical contents are different
+  objects under `=` on both runtimes, so a `test` written with `=` would
+  refuse a document that matches. Links compare by CID rather than by wrapper
+  identity.
+
+  One platform difference is inherited rather than introduced: on
+  ClojureScript an integral float and an int are the same host value, so this
+  cannot tell `2` from `2.0` there. That is the limit `ipld.value` names and
+  answers with an explicit `float64` wrapper at the value codec; a Data Model
+  `test` has no wrapper to read."
+  [a b]
+  (let [ka (dm/kind a)]
+    (and (= ka (dm/kind b))
+         (case ka
+           :bytes (bytes-equal? a b)
+           :link  (= (link/link-cid a) (link/link-cid b))
+           :map   (and (= (dm/length a) (dm/length b))
+                       (every? (fn [[k v]]
+                                 (and (dm/contains-segment? b k)
+                                      (equal? v (dm/lookup b k))))
+                               (dm/entries a)))
+           :list  (and (= (dm/length a) (dm/length b))
+                       (every? (fn [[i v]] (equal? v (dm/lookup b i)))
+                               (dm/entries a)))
+           (= a b)))))
+
+;; ----------------------------------------------------------- operations
+
+(defn- prefix? [shorter longer]
+  (and (< (count shorter) (count longer))
+       (= shorter (subvec longer 0 (count shorter)))))
+
+(defn- apply-op [node op]
+  (when-not (map? op)
+    (reject! :patch/operation-not-a-map {:op op}))
+  (let [kind (get op "op")
+        required (get operations kind)]
+    (when-not required
+      (reject! :patch/unknown-operation {:op kind}))
+    (doseq [field required]
+      (when-not (contains? op field)
+        (reject! :patch/operation-missing-field {:op kind :field field})))
+    (let [wire (get op "path")
+          segments (parse-path wire)
+          value (get op "value")]
+      (case kind
+        "add" (alter-at node segments wire
+                        (fn [container k] (insert container k value wire)))
+        "replace" (alter-at node segments wire
+                            (fn [container k]
+                              (when-not (dm/contains-segment? container k)
+                                (reject! :patch/path-not-found {:path wire}))
+                              (put container k value)))
+        "remove" (alter-at node segments wire
+                           (fn [container k] (drop-key container k wire)))
+        "test" (let [found (value-at node segments wire)]
+                 (if (equal? found value)
+                   node
+                   (reject! :patch/test-failed {:path wire :expected value :found found})))
+        ("copy" "move")
+        (let [from (get op "from")
+              from-segments (parse-path from)
+              _ (when (and (= kind "move") (prefix? from-segments segments))
+                  (reject! :patch/move-into-own-child {:from from :path wire}))
+              moved (value-at node from-segments from)
+              base (if (= kind "move")
+                     (alter-at node from-segments from
+                               (fn [container k] (drop-key container k from)))
+                     node)]
+          (alter-at base segments wire
+                    (fn [container k] (insert container k moved wire))))))))
+
+(defn apply-ops
+  "Apply an OperationSequence to a Data Model node, returning the new node.
+
+  Operations are applied linearly. Any operation that cannot be applied throws
+  with a `:problem` naming why, and the document the caller passed in is
+  untouched -- see the namespace docstring on atomicity."
+  [node ops]
+  (when-not (sequential? ops)
+    (reject! :patch/operations-not-a-list {:ops ops}))
+  (reduce apply-op node ops))
+
+(defn ops-cid
+  "The address of a patch, through the node codec this repository already has.
+
+  A patch is Data Model data, so it needs no identity of its own: this is
+  `ipld.core/encode` plus `ipld.core/cid`, named here only so a caller does not
+  have to know that. It addresses the operations, not their effect -- two
+  patches that produce the same document from the same input are two patches."
+  [ops]
+  (core/cid (core/encode (vec ops))))

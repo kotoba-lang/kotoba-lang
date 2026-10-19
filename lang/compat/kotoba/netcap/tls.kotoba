@@ -1,0 +1,239 @@
+(ns kotoba.netcap.tls
+  "TLS client streams as a network capability -- the pure half.
+
+  Replaces `javax.net.ssl` at the call sites that open a TLS client stream
+  (root codemod scripts/migrate-javax-net-ssl-to-kotoba-netcap-tls.cljk). The
+  same split as kotoba-lang/process: this namespace decides (validation,
+  defaults, the grant), a DRIVER does the socket work, and the driver is
+  injected by the host. Nothing here opens a socket or reads a trust store.
+
+  A connection is reached only through a CONNECTOR: a driver plus the
+  endpoints it was granted (`connector`). `connect!` validates the request,
+  checks the grant, fills the defaults and only then calls the driver. The
+  host's own door (`kotoba.netcap.tls-host/connect`) is a connector with the
+  grant `:any`, the same place `kotoba.lang.process-host/sh` stands for
+  processes: host code may use it, guest code is handed a connector.
+
+  ## Request
+
+    {:host \"imap.example.com\"      ; DNS name (ASCII, STD3) or IP literal
+     :port 993                     ; 1..65535
+     :timeout-ms 20000             ; read timeout, 1..600000 (default 20000)
+     :connect-timeout-ms 20000     ; TCP connect timeout (default :timeout-ms)
+     :server-name \"...\"            ; SNI + the name verified (default :host,
+                                   ; none for an IP literal, RFC 6066 s3)
+     :trust :system                ; the host's default trust store (default)
+            | {:anchors-pem \"-----BEGIN CERTIFICATE-----...\"}  ; only these CAs
+            | {:pin-spki-sha256 #{\"<64 hex>\" ..}}  ; leaf key pin, no chain
+     :identity {:cert-chain-pem \"..\" :key-pem \"..\"}  ; client cert (mTLS),
+                                   ; PKCS#8 key
+     :protocols #{\"TLSv1.3\" \"TLSv1.2\"}}  ; default: the host's
+
+  The peer's certificate is ALWAYS checked against the name for :system and
+  :anchors-pem trust (HTTPS endpoint identification, RFC 6125) -- there is no
+  switch to turn that off. A `javax.net.ssl.SSLSocketFactory/getDefault`
+  socket does NOT do that check (JSSE leaves endpoint identification off for
+  a bare socket), so a call site moved here refuses a peer the old code
+  accepted: that difference is the point, and it is named where it happens.
+  With :pin-spki-sha256 the pin IS the peer's identity: the chain and the name
+  are not checked, the leaf's SubjectPublicKeyInfo digest is.
+
+  Refusals are ex-info {::error <keyword> ...}; the literal keywords are the
+  contract (`refusals`). A request's :identity never appears in ex-data."
+  (:require [kotoba.lang.text :as str]))
+
+(def surface
+  "The capability token this surface is granted under (netcap's `net:<s>`)."
+  "net:tls")
+
+(def surface-effects #{:connect})
+
+(def default-timeout-ms 20000)
+(def max-timeout-ms 600000)
+
+(def protocol-names #{"TLSv1.2" "TLSv1.3"})
+
+(def refusals
+  "Every ::error keyword this namespace refuses with."
+  #{:host-missing :host-invalid :port-invalid :timeout-invalid
+    :connect-timeout-invalid :server-name-invalid :trust-invalid
+    :identity-invalid :protocols-invalid :not-granted :request-invalid})
+
+(defprotocol TlsDriver
+  (-connect [driver request]
+    "Open a TLS client stream for a VALIDATED, defaulted request (see
+    `connect!`). Returns the host's stream (or a promise of it on a host
+    whose sockets are asynchronous); host I/O failures are thrown as the
+    host throws them."))
+
+;; ---------------------------------------------------------------------------
+;; names
+;; ---------------------------------------------------------------------------
+
+(defn- ipv4? [s]
+  (boolean
+   (when-let [[_ & octets] (re-matches #"(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})" s)]
+     (every? #(and (or (= "0" %) (not (str/starts-with? % "0")))
+                   (<= 0 ( % 10) 255))
+             octets))))
+
+(defn- ipv6? [s]
+  (let [s (if (and (str/starts-with? s "[") (str/ends-with? s "]")) (subs s 1 (dec (count s))) s)]
+    (boolean (and (str/includes? s ":")
+                  (re-matches #"[0-9A-Fa-f:.]+" s)
+                  (<= 2 (count (filter #(= \: %) s)) 7)))))
+
+(defn ip-literal?
+  "Is `host` an IPv4 dotted quad or an IPv6 literal (optionally [bracketed])?"
+  [host]
+  (boolean (and (string? host) (or (ipv4? host) (ipv6? host)))))
+
+(defn dns-name?
+  "An ASCII host name under the STD3 rules SNI requires: labels of letters,
+  digits and hyphens, 1..63 each, not starting or ending with a hyphen, total
+  <= 253, optional trailing dot, and a last label that is not all digits (so
+  \"256.1.1.1\" -- no address, and no name either -- is refused, RFC 3696 s2).
+  Underscores and non-ASCII are NOT names here (javax.net.ssl.SNIHostName
+  refuses them too)."
+  [s]
+  (boolean
+   (and (string? s)
+        (let [s (if (str/ends-with? s ".") (subs s 0 (dec (count s))) s)
+              labels (str/split s #"\." -1)]
+          (and (< 0 (count s) 254)
+               (every? #(re-matches #"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?" %) labels)
+               (not (re-matches #"[0-9]+" (peek labels))))))))
+
+;; ---------------------------------------------------------------------------
+;; validation
+;; ---------------------------------------------------------------------------
+
+(defn- int-in? [v lo hi] (and (integer? v) (<= lo v hi)))
+
+(def ^:private hex64 #"[0-9a-f]{64}")
+
+(defn- pem-blocks [s label]
+  (when (string? s)
+    (count (re-seq (re-pattern (str "-----BEGIN " label "-----[\\s\\S]+?-----END " label "-----")) s))))
+
+(defn- trust-ok? [t]
+  (cond
+    (= :system t) true
+    (map? t) (let [ks (set (keys t))]
+               (cond
+                 (= ks #{:anchors-pem}) (pos? (or (pem-blocks (:anchors-pem t) "CERTIFICATE") 0))
+                 (= ks #{:pin-spki-sha256}) (let [p (:pin-spki-sha256 t)]
+                                              (and (set? p) (seq p) (every? #(and (string? %) (re-matches hex64 %)) p)))
+                 :else false))
+    :else false))
+
+(defn- identity-ok? [i]
+  (and (map? i)
+       (= #{:cert-chain-pem :key-pem} (set (keys i)))
+       (pos? (or (pem-blocks (:cert-chain-pem i) "CERTIFICATE") 0))
+       (= 1 (pem-blocks (:key-pem i) "PRIVATE KEY"))))
+
+(defn validate-connect
+  "nil when `req` may be attempted, else the refusal keyword. Pure."
+  [req]
+  (let [{:keys [host port timeout-ms connect-timeout-ms server-name trust identity protocols]} req]
+    (cond
+      (not (map? req)) :request-invalid
+      (or (nil? host) (and (string? host) (str/blank? host))) :host-missing
+      (not (or (ip-literal? host) (dns-name? host))) :host-invalid
+      (not (int-in? port 1 65535)) :port-invalid
+      (and (contains? req :timeout-ms) (not (int-in? timeout-ms 1 max-timeout-ms))) :timeout-invalid
+      (and (contains? req :connect-timeout-ms) (not (int-in? connect-timeout-ms 1 max-timeout-ms))) :connect-timeout-invalid
+      (and (contains? req :server-name) (not (dns-name? server-name))) :server-name-invalid
+      (and (contains? req :trust) (not (trust-ok? trust))) :trust-invalid
+      (and (contains? req :identity) (not (identity-ok? identity))) :identity-invalid
+      (and (contains? req :protocols)
+           (not (and (set? protocols) (seq protocols) (every? protocol-names protocols)))) :protocols-invalid
+      :else nil)))
+
+(defn server-name
+  "The SNI name sent and the name the certificate is checked against: the
+  request's :server-name, else the host unless it is an IP literal (no SNI
+  for an address, RFC 6066 s3). A trailing dot is dropped."
+  [{:keys [host] :as req}]
+  (let [n (or (:server-name req) (when-not (ip-literal? host) host))]
+    (when n (if (str/ends-with? n ".") (subs n 0 (dec (count n))) n))))
+
+(defn normalize
+  "The request a driver receives: validated fields plus defaults."
+  [req]
+  (let [timeout (or (:timeout-ms req) default-timeout-ms)
+        trust (or (:trust req) :system)]
+    (cond-> {:host (:host req)
+             :port (:port req)
+             :timeout-ms timeout
+             :connect-timeout-ms (or (:connect-timeout-ms req) timeout)
+             :server-name (server-name req)
+             :trust trust
+             :verify-hostname? (not (and (map? trust) (contains? trust :pin-spki-sha256)))}
+      (:identity req) (assoc :identity (:identity req))
+      (:protocols req) (assoc :protocols (:protocols req)))))
+
+(defn- redacted [req] (if (map? req) (cond-> (dissoc req :identity) (:identity req) (assoc :identity :redacted)) req))
+
+(defn refuse!
+  "Throw the refusal `kw` for `req` (its :identity redacted)."
+  [kw req]
+  (throw (ex-info (str "kotoba.netcap.tls refused: " (name kw)) {::error kw :request (redacted req)})))
+
+;; ---------------------------------------------------------------------------
+;; the capability
+;; ---------------------------------------------------------------------------
+
+(defn- grant-ok? [allow]
+  (or (= :any allow) (= :none allow)
+      (and (set? allow)
+           (every? #(or (string? %) (and (vector? %) (= 2 (count %)) (string? (first %)) (integer? (second %))))
+                   allow))))
+
+(defn connector
+  "A granted TLS connect capability: `driver` (a TlsDriver) and the endpoints
+  it reaches. `:allow` is :any, :none (the default -- a connector nobody
+  granted anything reaches nothing), or a set of host strings (any port) and
+  [host port] pairs."
+  ([driver] (connector driver {}))
+  ([driver {:keys [allow] :or {allow :none}}]
+   (when-not (satisfies? TlsDriver driver)
+     (throw (ex-info "kotoba.netcap.tls/connector: not a TlsDriver" {::error :request-invalid})))
+   (when-not (grant-ok? allow)
+     (throw (ex-info "kotoba.netcap.tls/connector: :allow must be :any, :none or a set" {::error :request-invalid})))
+   {::capability surface ::driver driver ::allow allow}))
+
+(defn connector? [x] (and (map? x) (= surface (::capability x)) (some? (::driver x))))
+
+(defn allows?
+  "Does connector `c` reach host:port? Host names compare case-insensitively
+  (without a trailing dot)."
+  [c host port]
+  (let [allow (::allow c)
+        norm (fn [h] (let [h (str/lower h)] (if (str/ends-with? h ".") (subs h 0 (dec (count h))) h)))
+        h (norm host)]
+    (cond
+      (= :any allow) true
+      (set? allow) (boolean (some (fn [a] (if (string? a)
+                                             (= h (norm a))
+                                             (and (= h (norm (first a))) (= port (second a)))))
+                                  allow))
+      :else false)))
+
+(defn connect!
+  "Open a TLS client stream through connector `c`: validate, check the grant,
+  default, then the driver. Refusals throw ex-info {::error kw}; the driver's
+  host I/O failures propagate as the host throws them."
+  [c req]
+  (when-not (connector? c) (refuse! :request-invalid req))
+  (when-let [kw (validate-connect req)] (refuse! kw req))
+  (when-not (allows? c (:host req) (:port req)) (refuse! :not-granted req))
+  (-connect (::driver c) (normalize req)))
+
+(defn recording-driver
+  "A TlsDriver for tests: records every request it receives in the atom
+  `calls` and answers (f request)."
+  [calls f]
+  (reify TlsDriver
+    (-connect [_ request] (swap! calls conj request) (f request))))

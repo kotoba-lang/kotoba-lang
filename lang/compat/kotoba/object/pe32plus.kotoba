@@ -1,0 +1,233 @@
+(ns kotoba.object.pe32plus
+  "Validated PE32+ record and image encoder.
+
+  This namespace owns container bytes only. Callers retain target policy,
+  entry shims, section placement decisions, imports, and relocation choice."
+  {:kotoba/export [align-up encode-image encode-optional-header encode-section-header little-endian machine-codes max-image-bytes max-section-count pad-to subsystem-codes]}
+  (:require [kotoba.lang.text :as str]))
+
+(def machine-codes {:x86-64 0x8664 :aarch64 0xaa64})
+(def subsystem-codes {:efi-application 10})
+(def max-section-count 32)
+(def max-image-bytes (* 64 1024 1024))
+
+;; 2^(8*i). Powers of two, exact as a JVM long and as a JS double alike --
+;; the same table `kotoba.object.elf64` and `.macho64` carry, for the same
+;; reason. This file is the one member of the family that did not get it when
+;; the others did.
+(def ^:private byte-scale
+  [1 256 65536 16777216 4294967296 1099511627776 281474976710656 72057594037927936])
+
+(defn little-endian
+  "Encode a non-negative integer in exactly `width` little-endian bytes.
+
+  This used to be `(bit-and (unsigned-bit-shift-right (long n) (* 8 i)) 0xff)`.
+  cljs bitwise ops take their shift count mod 32, so at width 8 -- which
+  `image-base`, `stack-reserve`, `stack-commit`, `heap-reserve` and
+  `heap-commit` all use -- bytes 4 through 7 repeated bytes 0 through 3.
+  Measured 2026-08-25 under nbb: `(little-endian 0x140000000 8)`, the image
+  base link.exe picks for a 64-bit PE, encoded as `[0 0 0 64 0 0 0 64]`
+  instead of `[0 0 0 64 1 0 0 0]`.
+
+  No caller in this workspace reaches it today: every default here is below
+  2^32 (`image-base` 0x400000, the stack and heap fields 0x100000/0x1000) and
+  nothing overrides them, so all four high bytes are zero. That makes the
+  defect latent, not absent -- the width-8 contract is what this function
+  offers, and it was wrong for four of the eight bytes it promises.
+
+  `n` above 2^53 is not exactly representable on ClojureScript. That limit is
+  the runtime's, not this function's, and it is above every field PE32+ has."
+  [n width]
+  (when-not (and (integer? n) (integer? width) (<= 1 width 8) (<= 0 n))
+    (throw (ex-info "invalid little-endian field" {:value n :width width})))
+  (mapv #(mod (quot n (nth byte-scale %)) 256) (range width)))
+
+(defn align-up [n alignment]
+  (when-not (and (integer? n) (<= 0 n)
+                 (integer? alignment) (pos? alignment)
+                 (zero? (bit-and alignment (dec alignment))))
+    (throw (ex-info "invalid PE alignment" {:value n :alignment alignment})))
+  (* alignment (quot (+ n (dec alignment)) alignment)))
+
+(defn pad-to [bytes size]
+  (let [bytes (vec bytes)]
+    (when-not (and (integer? size) (<= 0 size max-image-bytes))
+      (throw (ex-info "invalid PE region allocation" {:size size})))
+    (when (> (count bytes) size)
+      (throw (ex-info "PE32+ region exceeds its allocation"
+                      {:size size :actual (count bytes)})))
+    (into bytes (repeat (- size (count bytes)) 0))))
+
+;; A character's code point, portably. `(int c)` works on the JVM, where
+;; iterating a string yields Characters; in ClojureScript it yields
+;; single-character STRINGS and `int` gives NaN, so every comparison against it
+;; is false and the validator below rejects perfectly good ASCII. Measured
+;; 2026-08-20 under nbb: a PE image build failed with "PE section name must be
+;; 1-8 printable ASCII bytes" for the name "text".
+(defn- code-point [c]
+  ;; :default -- the Kotoba reader's only feature is :kotoba, so a #?-only
+  ;; body read as nothing ("function body is empty", adr-2609111900). The
+  ;; :cljs form, so the compiler refuses the host call by name here.
+  (.charCodeAt (str c) 0))
+
+(defn- ascii-bytes [value]
+  (when-not (and (string? value) (<= 1 (count value) 8)
+                 (every? #(<= 0x20 (code-point %) 0x7e) value))
+    (throw (ex-info "PE section name must be 1-8 printable ASCII bytes"
+                    {:name value})))
+  (mapv code-point value))
+
+(defn encode-section-header
+  [{:keys [name virtual-size rva raw-size raw-offset characteristics]}]
+  (doseq [[field value] [[:virtual-size virtual-size] [:rva rva]
+                         [:raw-size raw-size] [:raw-offset raw-offset]
+                         [:characteristics characteristics]]]
+    (when-not (and (integer? value) (<= 0 value 0xffffffff))
+      (throw (ex-info "invalid PE section field" {:field field :value value}))))
+  (vec (concat (pad-to (ascii-bytes name) 8)
+               (little-endian virtual-size 4) (little-endian rva 4)
+               (little-endian raw-size 4) (little-endian raw-offset 4)
+               (repeat 12 0) (little-endian characteristics 4))))
+
+(defn encode-optional-header
+  [{:keys [entry-rva text-rva text-size initialized-size image-size headers-size
+           image-base section-alignment file-alignment subsystem
+           dll-characteristics stack-reserve stack-commit heap-reserve heap-commit
+           data-directories]}]
+  (let [subsystem-code (get subsystem-codes subsystem)]
+    (when-not subsystem-code
+      (throw (ex-info "unsupported PE subsystem" {:subsystem subsystem})))
+    (when-not (= 0xf0 (+ 112 (* 16 8)))
+      (throw (ex-info "internal PE32+ optional-header size mismatch" {})))
+    (let [fixed (vec (concat
+                      (little-endian 0x20b 2) [0 0]
+                      (little-endian (align-up text-size file-alignment) 4)
+                      (little-endian initialized-size 4) (little-endian 0 4)
+                      (little-endian entry-rva 4) (little-endian text-rva 4)
+                      (little-endian image-base 8)
+                      (little-endian section-alignment 4)
+                      (little-endian file-alignment 4)
+                      (little-endian 2 2) (little-endian 0 2)
+                      (little-endian 0 2) (little-endian 0 2)
+                      (little-endian 2 2) (little-endian 0 2)
+                      (little-endian 0 4) (little-endian image-size 4)
+                      (little-endian headers-size 4) (little-endian 0 4)
+                      (little-endian subsystem-code 2)
+                      (little-endian dll-characteristics 2)
+                      (little-endian stack-reserve 8) (little-endian stack-commit 8)
+                      (little-endian heap-reserve 8) (little-endian heap-commit 8)
+                      (little-endian 0 4) (little-endian 16 4)))
+          directories (mapcat (fn [index]
+                                (let [{:keys [rva size]} (get data-directories index
+                                                                 {:rva 0 :size 0})]
+                                  (concat (little-endian rva 4)
+                                          (little-endian size 4))))
+                              (range 16))]
+      (vec (concat fixed directories)))))
+
+(defn encode-image
+  "Encode a fully laid-out PE32+ image. Section bytes and placement are caller
+  decisions; this function validates their record fields and materializes the
+  DOS, COFF, optional, section-table, and padded raw regions."
+  [{:keys [machine entry-rva text-rva image-base section-alignment file-alignment
+           headers-size image-size subsystem dll-characteristics sections
+           data-directories stack-reserve stack-commit heap-reserve heap-commit]
+    :or {image-base 0x400000 section-alignment 0x1000 file-alignment 0x200
+         headers-size 0x200 subsystem :efi-application
+         dll-characteristics 0x160 stack-reserve 0x100000 stack-commit 0x1000
+         heap-reserve 0x100000 heap-commit 0x1000 data-directories {}}}]
+  (let [machine-code (get machine-codes machine)
+        sections (vec sections)]
+    (when-not machine-code
+      (throw (ex-info "unsupported PE machine" {:machine machine})))
+    (when-not (<= 1 (count sections) max-section-count)
+      (throw (ex-info "invalid PE section count" {:count (count sections)})))
+    (doseq [[left right] (partition 2 1 (sort-by :raw-offset sections))]
+      (when (> (+ (:raw-offset left) (:raw-size left)) (:raw-offset right))
+        (throw (ex-info "overlapping PE raw sections"
+                        {:left (:name left) :right (:name right)}))))
+    (doseq [section sections]
+      (when-not (= (:raw-size section)
+                   (align-up (count (:bytes section)) file-alignment))
+        (throw (ex-info "PE section raw size is not canonical"
+                        {:section (:name section) :raw-size (:raw-size section)
+                         :bytes (count (:bytes section))}))))
+    ;; boot: VIRTUAL placement, which this encoder did not look at until
+    ;; 2026-09-02. Every check above is about raw file offsets, so a caller
+    ;; that laid its sections out with frozen RVAs -- amu's `package-efi`
+    ;; froze .text at 0x1000 and .data at 0x2000 -- produced a VALID FILE
+    ;; whose second section is mapped over the tail of the first as soon as
+    ;; the first grows past one page. That is silent corruption at run time,
+    ;; not a refusal at build time: the bytes are all present in the file and
+    ;; every existing assertion passes. The loader is the first thing that
+    ;; disagrees, and it does so by executing the wrong page.
+    ;;
+    ;; The four rules are the PE loader's own, restated where the image is
+    ;; built: an RVA is section-aligned, no section starts inside the mapped
+    ;; headers, two sections' mapped spans do not overlap, and SizeOfImage
+    ;; covers every span. A section's mapped span is its virtual size rounded
+    ;; UP to the section alignment, because that is the granularity at which
+    ;; the loader assigns pages -- rounding down would admit exactly the
+    ;; overlap this exists to refuse.
+    (let [headers-span (align-up headers-size section-alignment)]
+      (doseq [{:keys [name rva virtual-size]} sections]
+        (when-not (and (integer? rva) (integer? virtual-size)
+                       (<= 0 rva 0xffffffff) (<= 0 virtual-size 0xffffffff))
+          (throw (ex-info "invalid PE section virtual placement"
+                          {:section name :rva rva :virtual-size virtual-size})))
+        (when-not (zero? (mod rva section-alignment))
+          (throw (ex-info "PE section virtual address is not section-aligned"
+                          {:section name :rva rva
+                           :section-alignment section-alignment})))
+        (when (< rva headers-span)
+          (throw (ex-info "PE section virtual address overlaps the headers"
+                          {:section name :rva rva :headers-span headers-span}))))
+      (doseq [[left right] (partition 2 1 (sort-by :rva sections))]
+        (when (> (+ (:rva left) (align-up (:virtual-size left) section-alignment))
+                 (:rva right))
+          (throw (ex-info "overlapping PE virtual sections"
+                          {:left (:name left) :right (:name right)
+                           :left-rva (:rva left)
+                           :left-virtual-size (:virtual-size left)
+                           :right-rva (:rva right)}))))
+      (let [required (reduce max headers-span
+                             (map #(+ (:rva %)
+                                      (align-up (:virtual-size %) section-alignment))
+                                  sections))]
+        (when-not (and (integer? image-size) (<= required image-size))
+          (throw (ex-info "PE image size does not cover its sections"
+                          {:image-size image-size :required required})))
+        (when-not (zero? (mod image-size section-alignment))
+          (throw (ex-info "PE image size is not section-aligned"
+                          {:image-size image-size
+                           :section-alignment section-alignment})))))
+    (let [text (first sections)
+          initialized-size (reduce + 0 (map :raw-size (rest sections)))
+          optional (encode-optional-header
+                    {:entry-rva entry-rva :text-rva text-rva
+                     :text-size (count (:bytes text))
+                     :initialized-size initialized-size :image-size image-size
+                     :headers-size headers-size :image-base image-base
+                     :section-alignment section-alignment :file-alignment file-alignment
+                     :subsystem subsystem :dll-characteristics dll-characteristics
+                     :stack-reserve stack-reserve :stack-commit stack-commit
+                     :heap-reserve heap-reserve :heap-commit heap-commit
+                     :data-directories data-directories})
+          coff (vec (concat (little-endian machine-code 2)
+                            (little-endian (count sections) 2)
+                            (repeat 12 0) (little-endian 0xf0 2)
+                            (little-endian 0x22 2)))
+          dos (assoc (vec (repeat 0x80 0)) 0 0x4d 1 0x5a 0x3c 0x80)
+          headers (pad-to (concat dos [0x50 0x45 0 0] coff optional
+                                  (mapcat encode-section-header sections))
+                          headers-size)
+          bytes (reduce (fn [out {:keys [raw-offset raw-size bytes name]}]
+                          (when (> (count out) raw-offset)
+                            (throw (ex-info "PE section overlaps headers or prior data"
+                                            {:section name :offset raw-offset})))
+                          (into (pad-to out raw-offset) (pad-to bytes raw-size)))
+                        headers (sort-by :raw-offset sections))]
+      (when (> (count bytes) max-image-bytes)
+        (throw (ex-info "PE image exceeds byte limit"
+                        {:bytes (count bytes) :limit max-image-bytes})))
+      bytes)))

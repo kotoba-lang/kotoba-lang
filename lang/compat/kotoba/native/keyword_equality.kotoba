@@ -1,0 +1,106 @@
+(ns kotoba.native.keyword-equality
+  "`=` on keyword operands, lowered for BOTH native ISAs onto `string=?`.
+
+  ## The defect this closes (measured 2026-09-15, amu 73ddd26)
+
+  A keyword is carried on native as the same one-word `pair(offset,length)`
+  handle a string is, over its printed text, and every evaluation of a
+  keyword literal is a fresh `pair_new`. `=` lowers to a word compare
+  (`cmp` + `cset`), so two handles over the same bytes compare unequal:
+
+      (= :end :end)                          -> 0 on aarch64, 1 on KIR/js/wasm
+      (let [k (:phase (->R :end))] (= :end k)) -> 0 on aarch64
+
+  `case` on a keyword desugars to that same `=`, so every keyword dispatch
+  on native took the default arm. The interpreter, the restricted-ESM and
+  the wasm targets compare keywords by content; native did not.
+
+  ## The lowering
+
+  Keyword equality is content equality, and the content of a keyword handle
+  is the bytes `string=?` already compares (host call, slot 112 on both
+  ISAs). So `(= a b)` becomes `(string=? a b)` whenever either operand is
+  keyword-typed, and `=` on anything else is left as the word compare it was.
+  No new representation, no new host operation, no ABI bump.
+
+  What counts as keyword-typed is decided from the KIR itself, with no
+  inference beyond it: a keyword literal; a parameter whose `:param-types`
+  entry is `:keyword`; a `let` binding whose value is keyword-typed (the
+  bindings are walked in order, so a later binding sees the earlier ones);
+  a `record-get` whose descriptor names the field `:keyword`; a call to a
+  function of this module whose `:result` is `:keyword`; and an `if` whose
+  arms are keyword-typed. A `let`'s type is its body's. Anything else is
+  not keyword-typed and its `=` is untouched -- a value this cannot see the
+  type of is a word compare, as before, never a byte compare of two integers.
+
+  `variant-match` and `typed-cap-call` binders are not looked into: a
+  keyword bound by them keeps the word compare it had. That is the
+  remaining gap, and it is named here rather than papered over.
+
+  ## Order
+
+  Runs first in `emit-program`, before `vector-region/rewrite-program` and
+  the string helpers: those passes read `string=?` and must see the rewritten
+  form, and nothing they introduce compares keywords.")
+
+(defn- record-field-type [descriptor field]
+  (when (and (vector? descriptor) (= :record (first descriptor)))
+    (some (fn [[name type]] (when (= name field) type)) (nth descriptor 2 []))))
+
+(defn- keyword-typed?
+  "Whether `form` is a keyword by the rules in the namespace doc. `env` maps a
+  symbol to its type where known; `results` maps a function name to its
+  `:result`."
+  [form env results]
+  (cond
+    (keyword? form) true
+    (symbol? form) (= :keyword (get env form))
+    (seq? form)
+    (let [[op & args] form]
+      (cond
+        (= op 'record-get) (= :keyword (record-field-type (first args) (nth args 2 nil)))
+        (= op 'if) (and (keyword-typed? (nth args 1 nil) env results)
+                        (keyword-typed? (nth args 2 nil) env results))
+        (= op 'let) (let [[bindings body] args
+                          env (reduce (fn [env [name value]]
+                                        (assoc env name (if (keyword-typed? value env results) :keyword :other)))
+                                      env (partition 2 bindings))]
+                      (keyword-typed? body env results))
+        (= op 'do) (keyword-typed? (last args) env results)
+        (symbol? op) (= :keyword (get results op))
+        :else false))
+    :else false))
+
+(defn- rewrite-form [form env results]
+  (cond
+    (not (seq? form)) form
+    :else
+    (let [[op & args] form]
+      (cond
+        (= op 'let)
+        (let [[bindings body] args
+              [env rebound]
+              (reduce (fn [[env acc] [name value]]
+                        (let [value' (rewrite-form value env results)
+                              type (if (keyword-typed? value env results) :keyword :other)]
+                          [(assoc env name type) (conj acc name value')]))
+                      [env []] (partition 2 bindings))]
+          (list 'let rebound (rewrite-form body env results)))
+
+        (and (= op '=) (= 2 (count args))
+             (or (keyword-typed? (first args) env results)
+                 (keyword-typed? (second args) env results)))
+        (list 'string=? (rewrite-form (first args) env results) (rewrite-form (second args) env results))
+
+        :else
+        (cons op (map #(rewrite-form % env results) args))))))
+
+(defn rewrite-function [{:keys [params param-types] :as function} results]
+  (let [env (zipmap params (or param-types (repeat (count params) :i64)))]
+    (update function :body rewrite-form env results)))
+
+(defn rewrite-program
+  "The KIR module with every keyword `=` lowered to `string=?`."
+  [kir]
+  (let [results (into {} (map (juxt :name :result)) (:functions kir))]
+    (update kir :functions (fn [functions] (mapv #(rewrite-function % results) functions)))))

@@ -1,0 +1,339 @@
+(ns murakumo.infer.capacity
+  "Capacity planning from measurements — pure data → data.
+
+  What `rebalance` decides is which POOL a mini belongs to. What `schedule`
+  decides is which node runs one media job. Neither answers the three
+  questions that failed the fleet on 2026-09-10/11, all of them about the
+  HEADS (gad, b70) rather than the minis:
+
+    1. residency — which models may stay loaded on a node whose memory they
+       share (gad: 46 GB for ComfyUI + a 20 GB text engine + a 43 GB video
+       model that excludes everything else);
+    2. text slot geometry — how many slots a head runs and therefore how
+       large a request it can take, and so what output ceiling a caller may
+       ask for (16384 was asked, 0% of calls fit, every turn went to a
+       stopped engine);
+    3. workforce cadence — how often 156 Bots may ask for a slot when the
+       resident runs two at a time.
+
+  Every input is a MEASUREMENT with its provenance
+  (resources/murakumo/capacity-observations.edn). Every output states the
+  objective it maximised and the alternatives it rejected with their scores,
+  so a reader disagrees with a number, not with a feeling. Quantile
+  distributions are interpolated piecewise-linearly between the measured
+  points — coarse, and stated as such in `:assumptions`.
+
+  ⚠ Temporary constraint (ADR-2608650000 class: backend, not language): the
+  sibling planners here (`plan`, `schedule`, `rebalance`) keep their formulas
+  in shipped `:infer-*` KIR oracles (T6.4). This module is plain portable
+  Clojure because the KIR toolchain is not on the path of the machine that
+  had to compute today's plan. Removal condition: port the scalar formulas
+  (`fit-share`, `output-ceiling`, `calls-per-day`) to `kotoba/infer_capacity_core`
+  and call them through `murakumo.kotoba.oracle` like the siblings."
+  (:require [kotoba.lang.text :as str]))
+
+;; ---- distributions -----------------------------------------------------------
+
+(defn- cdf-points
+  "A measured {:p50 :p90 :p99 :max} → [[x F]] with (0 0) prepended."
+  [{:keys [p50 p90 p99 max]}]
+  [[0 0.0] [p50 0.5] [p90 0.9] [p99 0.99] [max 1.0]])
+
+(defn cdf
+  "P(X <= x) for a quantile-described distribution, piecewise linear between
+  the measured points. Above :max it is 1, below 0 it is 0."
+  [dist x]
+  (let [pts (cdf-points dist)]
+    (cond
+      (<= x 0) 0.0
+      (>= x (first (last pts))) 1.0
+      :else
+      (loop [[[x0 f0] & more] pts]
+        (let [[x1 f1] (first more)]
+          (if (<= x x1)
+            (+ f0 (* (- f1 f0) (/ (- x x0) (double (- x1 x0)))))
+            (recur more)))))))
+
+;; ---- text: output ceiling and slot fit ------------------------------------------
+
+(defn output-ceiling
+  "The max_tokens a caller should ask for: the smallest power of two at or
+  above 1.5 × the p99 completion, never below `floor`. 1.5× because the p99
+  is a sample and the cost of clipping a real answer is a truncated tool
+  call; 2× would have re-admitted 8192 for a p99 of 2618."
+  ([completion-dist] (output-ceiling completion-dist 1024))
+  ([{:keys [p99]} floor]
+   (loop [c floor]
+     (if (>= c (* 1.5 p99)) c (recur (* 2 c))))))
+
+(defn fit-share
+  "Share of calls whose prompt + max_tokens fit one slot."
+  [prompt-dist slot-ctx overhead max-tokens]
+  (cdf prompt-dist (- slot-ctx overhead max-tokens)))
+
+(defn admitted-prompt-tokens
+  "The largest prompt (in tokens) the GATEWAY admits to a head at a given
+  max_tokens, under its deployed estimator. The gateway sees bytes, not
+  tokens: it estimates tokens = bytes / divisor and admits when
+  estimate + max_tokens <= usable. A prompt of T tokens is
+  T × bytes-per-token bytes, so it is admitted when
+  T <= (usable − max_tokens) × divisor / bytes-per-token.
+
+  This is a DIFFERENT bound from the slot's own (`fit-share`): the slot is
+  what would run, the admission is what is let in. When the divisor is
+  smaller than the real bytes-per-token the gateway refuses prompts the
+  slot could hold — the whole of the 2026-09-11 outage lived in that gap."
+  [{:keys [divisor usable-tokens]} bytes-per-token max-tokens]
+  (* (- usable-tokens max-tokens) (/ divisor (double bytes-per-token))))
+
+(defn admitted-share
+  "Share of calls the gateway admits AND the slot holds."
+  [prompt-dist admission bytes-per-token slot-ctx overhead max-tokens]
+  (cdf prompt-dist (min (- slot-ctx overhead max-tokens)
+                        (admitted-prompt-tokens admission bytes-per-token max-tokens))))
+
+(defn call-seconds
+  "Wall time of one call: prefill + decode. `prefill-tok-s` is an assumption
+  when the corpus has not measured it (b70 reports decode only)."
+  [{:keys [tok-s prefill-tok-s]} prompt-p50 completion-p50]
+  (+ (/ prompt-p50 (double (or prefill-tok-s 400)))
+     (/ completion-p50 (double tok-s))))
+
+(defn text-plan
+  "For one head, score every slot geometry it could run.
+
+  objective = served calls/day = min(demand, capacity) × fit-share, where
+  capacity = parallel × 86400 / call-seconds. Demand is what the workforce
+  would send if nothing refused it."
+  [{:keys [ctx-total overhead-tokens prefill-tok-s] :as engine}
+   {:keys [prompt-tokens completion-tokens]}
+   demand-calls-per-day
+   & [{:keys [admission bytes-per-token]}]]
+  (let [max-tokens (output-ceiling completion-tokens)
+        call-s (call-seconds engine (:p50 prompt-tokens) (:p50 completion-tokens))
+        retry-tokens (max 1024 (quot max-tokens 2))
+        ;; `admission` is the gateway's deployed estimator; pass one whose
+        ;; divisor equals `bytes-per-token` to score the head as if the
+        ;; gateway estimated tokens correctly — the difference is the value
+        ;; of fixing the gateway, in calls per day.
+        share (fn [slot oh mt]
+                (if admission
+                  (admitted-share prompt-tokens admission bytes-per-token slot oh mt)
+                  (fit-share prompt-tokens slot oh mt)))
+        options (for [parallel [1 2 4]
+                      :let [slot (quot ctx-total parallel)
+                            oh (or overhead-tokens 1024)
+                            fit (share slot oh max-tokens)
+                            ;; A call that did not fit is retried once with
+                            ;; half the output budget — cheaper than any
+                            ;; second engine, and it recovers every prompt
+                            ;; between the two thresholds.
+                            fit-retry (share slot oh retry-tokens)
+                            capacity (/ (* parallel 86400) call-s)
+                            served (* (min demand-calls-per-day capacity) fit-retry)]]
+                  {:parallel parallel :slot-ctx slot
+                   :max-request-tokens (- slot oh)
+                   :fit-share fit
+                   :fit-share-with-retry fit-retry
+                   :capacity-calls-per-day capacity
+                   :served-calls-per-day served})
+        top (apply max-key :served-calls-per-day options)
+        current (first (filter #(= (:parallel %) (:parallel engine)) options))
+        ;; Stability is part of the objective: a geometry change is a restart
+        ;; of the head. Keep the current geometry unless another serves at
+        ;; least 1% more — a tie must not become a change.
+        best (if (and current
+                      (>= (:served-calls-per-day current)
+                          (* 0.99 (:served-calls-per-day top))))
+               current
+               top)]
+    {:max-tokens max-tokens
+     :retry-max-tokens retry-tokens
+     :call-seconds call-s
+     :admission (or admission :slot-only)
+     :chosen (assoc best :kept-current? (= best current))
+     :rejected (vec (remove #(= % best) options))
+     :assumptions (cond-> ["prompt distribution interpolated piecewise-linearly between p50/p90/p99/max"]
+                    (nil? prefill-tok-s) (conj "prefill 400 tok/s assumed (unmeasured); decode uses the measured tok-s"))}))
+
+;; ---- residency ----------------------------------------------------------------------
+
+(defn residency-plan
+  "Which models stay loaded on a shared-memory node.
+
+  Greedy by value density (requests/day per GB), the standard knapsack
+  heuristic, with three hard rules:
+
+  - an `:exclusive?` model is never resident (it preempts the node when a job
+    arrives, and the plan says how many preemption-hours/day that costs);
+  - the sum stays under memory − headroom;
+  - a `:model/process?` model (its own engine process, e.g. the text ring)
+    on a node that has an exclusive preemptor is resident only if it would
+    serve at least `restart-floor-calls` calls per preemption. Each
+    preemption is a stop/start of that process, and the fleet measured what
+    a restart rally costs (45 rebuilds/24h, each a 1–2 min outage,
+    2026-09-06/07). Below the floor the engine is more outage than service.
+    ONE explicit constant, in the corpus, so the threshold is a sentence a
+    reader can dispute.
+
+  `demand` maps :model/id → requests/day."
+  [{:keys [node/memory-gb node/headroom-gb restart-floor-calls] :or {restart-floor-calls 50}} models demand]
+  (let [budget (- memory-gb headroom-gb)
+        exclusive (filter :model/exclusive? models)
+        preemptions-per-day (reduce + 0 (map #(get demand (:model/id %) 0) exclusive))
+        scored (->> models
+                    (map (fn [m] (let [d (get demand (:model/id m) 0)]
+                                   (assoc m :requests-per-day d
+                                          :density (/ d (double (:model/footprint-gb m)))))))
+                    (sort-by :density >))
+        below-floor? (fn [m] (and (:model/process? m)
+                                  (pos? preemptions-per-day)
+                                  (< (:requests-per-day m) (* restart-floor-calls preemptions-per-day))))
+        {:keys [resident used refused]}
+        (reduce (fn [{:keys [used] :as acc} m]
+                  (cond
+                    (:model/exclusive? m) acc
+                    (below-floor? m)
+                    (update acc :refused conj {:model (:model/id m)
+                                               :requests-per-day (:requests-per-day m)
+                                               :floor (* restart-floor-calls preemptions-per-day)
+                                               :why (str "below the restart floor: " preemptions-per-day
+                                                         " preemption(s)/day × " restart-floor-calls
+                                                         " calls each; a resident process here is more outage than service")})
+                    ;; Zero demand earns no residency: memory held for a
+                    ;; model nobody asked for in the window is memory the
+                    ;; next request has to evict first (gad's ComfyUI held
+                    ;; 38 GB this way on 2026-09-11).
+                    (and (pos? (:requests-per-day m))
+                         (<= (+ used (:model/footprint-gb m)) budget))
+                    (-> acc (update :resident conj (:model/id m)) (update :used + (:model/footprint-gb m)))
+                    :else acc))
+                {:resident [] :used 0.0 :refused []}
+                scored)
+        exclusive (filter :model/exclusive? scored)]
+    {:budget-gb budget
+     :resident resident
+     :resident-gb used
+     :refused refused
+     :on-demand (vec (keep #(when-not (or (:model/exclusive? %) (:model/process? %) (some #{(:model/id %)} resident)) (:model/id %)) scored))
+     :preempting (vec (for [m exclusive]
+                        {:model (:model/id m)
+                         :requests-per-day (:requests-per-day m)
+                         :hours-per-day (/ (* (:requests-per-day m) (:model/warm-s m)) 3600.0)
+                         :note "evicts every resident model while it runs; the text engine must be stopped and restarted around it"}))
+     :ranking (mapv #(select-keys % [:model/id :model/footprint-gb :requests-per-day :density :model/exclusive?]) scored)}))
+
+;; ---- workforce -----------------------------------------------------------------------
+
+(def cadence-base
+  "Minutes between runs by role class, BEFORE capacity scaling. Probes must
+  be frequent to mean anything; strategy roles produce the same answer
+  whether asked hourly or daily."
+  {:probe 15 :ops 60 :strategy 360})
+
+(defn workforce-plan
+  "How often each class may run so the requested runs/day fit the resident's
+  capacity at a utilisation target. Scales every cadence by the same factor
+  k ≥ 1 (rounded up to 5 min) so relative priority is kept and the answer is
+  one number a reader can check: demand/capacity."
+  [{:keys [max-active run-s roles-by-class outcomes-last-50]} & [{:keys [utilisation] :or {utilisation 0.7}}]]
+  (let [capacity (* max-active (/ 86400.0 (:p50 run-s)) utilisation)
+        counts (dissoc roles-by-class :how)
+        demand (reduce + (for [[cls n] counts] (* n (/ 1440.0 (get cadence-base cls)))))
+        k (max 1.0 (/ demand capacity))
+        round5 (fn [m] (* 5 (Math/ceil (/ m 5.0))))
+        cadences (into {} (for [[cls base] cadence-base] [cls (int (round5 (* base k)))]))
+        wasted (when-let [o outcomes-last-50]
+                 (let [total (reduce + (vals (dissoc o :how)))]
+                   (/ (+ (:invalid-input o 0) (:not-configured o 0)) (double total))))]
+    {:capacity-runs-per-day capacity
+     :requested-runs-per-day demand
+     :scale k
+     :cadence-minutes cadences
+     :resulting-runs-per-day (reduce + (for [[cls n] counts] (* n (/ 1440.0 (get cadences cls)))))
+     :wasted-share wasted
+     :note (when (and wasted (> wasted 0.3))
+             (str "more than " (int (* 100 wasted)) "% of recent runs ended in invalid-input / not-configured — those slots were spent on nothing; fixing the goals is worth more than any cadence"))}))
+
+;; ---- the plan ------------------------------------------------------------------------
+
+(defn plan
+  "The whole plan from one observation corpus. `demand-by-model` is derived
+  here from the corpus' :demand block; callers with live counts pass their
+  own via `opts`."
+  [{:keys [nodes models demand workforce gateway] :as corpus} & [opts]]
+  (let [by-id (into {} (map (juxt :node/id identity) nodes))
+        gad (by-id "gad")
+        b70 (by-id "b70")
+        text-calls (:text-calls demand)
+        wf (workforce-plan workforce opts)
+        ;; calls/day the workforce would send at the planned cadence
+        calls-per-day (* (:resulting-runs-per-day wf) (:per-run-p50 text-calls))
+        bpt (get-in gateway [:bytes-per-token :bot-request-mix] 6.4)
+        deployed-admission (:admission gateway)
+        ;; as deployed, and as it would be with an estimator that matches the measured ratio
+        b70-plan (text-plan (:node/text-engine b70) text-calls calls-per-day
+                            {:admission deployed-admission :bytes-per-token bpt})
+        b70-fixed (text-plan (:node/text-engine b70) text-calls calls-per-day
+                             {:admission (assoc deployed-admission :divisor bpt) :bytes-per-token bpt})
+        unfit-calls (* calls-per-day (- 1 (get-in b70-plan [:chosen :fit-share-with-retry])))
+        unfit-fixed (* calls-per-day (- 1 (get-in b70-fixed [:chosen :fit-share-with-retry])))
+        ;; what gad's ring could take of the unfit remainder, at its own speed
+        ring-call-s (call-seconds (:node/text-engine gad) (:p50 (:prompt-tokens text-calls)) (:p50 (:completion-tokens text-calls)))
+        ring-capacity (/ (* (get-in gad [:node/text-engine :parallel] 1) 86400) ring-call-s)
+        demand-by-model (or (:demand-by-model opts)
+                            {"sdxl-image-set" (get-in demand [:image :requests])
+                             "ltx-2.3-22b-fp8" (get-in demand [:video-034 :requests] 0)
+                             "minimax-h3" (get-in demand [:video :requests])
+                             "qwen3.8-27b-ring" unfit-calls})
+        gad-models (filter #(= "gad" (:model/node %)) models)
+        residency (residency-plan gad gad-models demand-by-model)]
+    {:placement/version 2
+     :placement/measured-on (:measured-on corpus)
+     :text {:head "b70"
+            :max-tokens (:max-tokens b70-plan)
+            :retry-max-tokens (:retry-max-tokens b70-plan)
+            :geometry (:chosen b70-plan)
+            :rejected (:rejected b70-plan)
+            :calls-per-day calls-per-day
+            :unfit-calls-per-day unfit-calls
+            :unfit-fallback (if (some #{"qwen3.8-27b-ring"} (:resident residency))
+                              (str "gad ring (resident), capacity " (int ring-capacity) " calls/day at " (int ring-call-s) " s/call")
+                              "none after the half-budget retry — the remainder is accepted loss")
+            :ring {:call-seconds ring-call-s :capacity-calls-per-day ring-capacity}
+            :gateway-fix {:admitted-share-now (get-in b70-plan [:chosen :fit-share-with-retry])
+                          :admitted-share-if-estimator-matched (get-in b70-fixed [:chosen :fit-share-with-retry])
+                          :calls-recovered-per-day (- unfit-calls unfit-fixed)
+                          :note "the gateway estimates tokens as bytes/divisor; with the divisor equal to the measured bytes-per-token these calls reach b70 instead of gad"}
+            :assumptions (into (:assumptions b70-plan)
+                               (when (get-in gad [:node/text-engine :prefill-tok-s])
+                                 ["gad prefill tok/s is an assumption stated in the corpus"]))}
+     :gad residency
+     :workforce wf
+     :gateway-derived {:b70-max-request-tokens (get-in b70-plan [:chosen :max-request-tokens])
+                       :note "replaces the 15360 literal in readiness/b70-request-eligible?; equal today, derived from slot-ctx − overhead"}}))
+
+(defn- format-1 [x] (/ (Math/round (* 10.0 x)) 10.0))
+
+(defn summary
+  "One screen a person reads before applying."
+  [{:keys [text gad workforce gateway-derived] :as p}]
+  (str/join "\n"
+   [(str "capacity plan v" (:placement/version p) " (measured " (:placement/measured-on p) ")")
+    (str "text  head b70: max_tokens " (:max-tokens text) " (retry " (:retry-max-tokens text) ")"
+         "  parallel " (get-in text [:geometry :parallel]) " slot " (get-in text [:geometry :slot-ctx])
+         "  fit " (int (* 100 (get-in text [:geometry :fit-share]))) "% / " (int (* 100 (get-in text [:geometry :fit-share-with-retry]))) "% with retry"
+         "  served " (int (get-in text [:geometry :served-calls-per-day])) "/" (int (:calls-per-day text)) " calls/day")
+    (str "      unfit " (int (:unfit-calls-per-day text)) "/day → " (:unfit-fallback text))
+    (str "      gateway estimator fix would admit " (int (* 100 (get-in text [:gateway-fix :admitted-share-if-estimator-matched])))
+         "% instead of " (int (* 100 (get-in text [:gateway-fix :admitted-share-now]))) "% = +"
+         (int (get-in text [:gateway-fix :calls-recovered-per-day])) " calls/day on b70")
+    (str "gad   budget " (:budget-gb gad) " GB: resident " (pr-str (:resident gad)) " (" (:resident-gb gad) " GB)"
+         "  on-demand " (pr-str (:on-demand gad))
+         "  preempting " (pr-str (mapv :model (:preempting gad)))
+         (when (seq (:refused gad)) (str "\n      refused " (pr-str (mapv (juxt :model :why) (:refused gad))))))
+    (str "bots  capacity " (int (:capacity-runs-per-day workforce)) " runs/day, requested " (int (:requested-runs-per-day workforce))
+         " → scale " (format-1 (:scale workforce)) " cadence " (pr-str (:cadence-minutes workforce))
+         (when-let [n (:note workforce)] (str "\n      ⚠ " n)))
+    (str "gate  b70 max request tokens " (:b70-max-request-tokens gateway-derived))]))
+

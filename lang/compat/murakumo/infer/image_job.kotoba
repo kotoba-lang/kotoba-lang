@@ -1,0 +1,139 @@
+(ns murakumo.infer.image-job
+  "An image render as a queue job: the pure half.
+
+  Owner instruction 2026-09-10: publish the WAI image capability on
+  murakumo.cloud as the free `awai-network/hokusai`.
+
+  ## Why the pull queue and not an inbound gateway
+
+  The obvious shape is a gateway that reaches into a node and renders. The
+  fleet already has one for gad -- a Cloudflare Tunnel to a bridge on
+  `gad:8189`. Building the second one the same way was rejected on the day's
+  measurements: **the minis have no reliable inbound path.** issachar and
+  joseph were up, on the LAN, with port 22 open and no credential or route
+  that reached them, because their only way in was an overlay network that
+  had dropped. An image tier fronted by an inbound tunnel inherits exactly
+  that failure.
+
+  The pull queue does not. It is outbound-only, it is what the text plane
+  already uses, and a node behind a broken tunnel simply stops claiming.
+
+  ## The size ceiling is measured, not chosen
+
+  `waiREALMIX_v11` on a 16 GiB M4, 25 steps, warm:
+
+      768x768    72 s   swap -40 MB    compressed 0.11 GB   stable
+      1024x1024 152 s   swap +1675 MB  compressed 5.94 GB   swapping
+
+  So 1024 is refused rather than served slowly. A free tier that pages is not
+  a slower free tier; it is a node that stops answering its heartbeat while it
+  thrashes, which takes the whole node out of the pool."
+  (:require [kotoba.lang.text :as str]))
+
+(def model-id "awai-network/hokusai")
+(def checkpoint "waiREALMIX_v11.safetensors")
+(def job-kind "render-image")
+(def comfy-port 8188)
+
+(def allowed-sizes
+  "Measured stable on a 16 GiB node. 1024x1024 is deliberately absent."
+  #{[512 512] [640 640] [768 768] [768 512] [512 768]})
+
+(def limits
+  {:max-steps 30 :default-steps 25 :max-prompt 2000 :default-size [768 768]})
+
+(defn parse-size
+  "\"768x768\" -> [768 768]. nil for anything this fleet will not serve, so the
+  caller refuses with a reason rather than silently substituting a size the
+  requester did not ask for."
+  [s]
+  (when (string? s)
+    (let [[w h] (map #(try 
+                           (catch  _ nil))
+                     (str/split (str/trim s) #"[xX×]"))]
+      (when (and (integer? w) (integer? h) (contains? allowed-sizes [w h])) [w h]))))
+
+(defn validate
+  "An OpenAI images request -> {:ok input} or {:error code :message ...}.
+
+  Every refusal names a reason a caller can act on. `n` above 1 is refused
+  rather than looped: one 768x768 render is 72 s on this hardware and the
+  queue's result window is two minutes, so a batch of four would be a
+  guaranteed timeout dressed as a feature."
+  [{:keys [prompt negative_prompt size n steps seed] :as _body}]
+  (cond
+    (or (not (string? prompt)) (str/blank? prompt))
+    {:error "prompt_required" :message "prompt is required"}
+
+    (> (count prompt) (:max-prompt limits))
+    {:error "prompt_too_long"
+     :message (str "prompt must be at most " (:max-prompt limits) " characters")}
+
+    (and (some? n) (not= 1 n))
+    {:error "one_image_per_request"
+     :message "n must be 1: a render is ~72 s on this hardware and the queue's result window is two minutes"}
+
+    (and (some? size) (nil? (parse-size size)))
+    {:error "unsupported_size"
+     :message (str "size must be one of "
+                   (str/join ", " (sort (map (fn [[w h]] (str w "x" h)) allowed-sizes)))
+                   " — 1024x1024 is not served because it pages on a 16 GiB node")}
+
+    (and (some? steps) (or (not (integer? steps)) (< steps 1) (> steps (:max-steps limits))))
+    {:error "invalid_steps"
+     :message (str "steps must be an integer between 1 and " (:max-steps limits))}
+
+    :else
+    (let [[w h] (or (parse-size size) (:default-size limits))]
+      {:ok {:model model-id
+            :prompt prompt
+            :negative (or negative_prompt "blurry, low quality, watermark")
+            :width w :height h
+            :steps (or steps (:default-steps limits))
+            :seed (if (integer? seed) seed 0)}})))
+
+(defn workflow
+  "A ComfyUI API-format graph for one render.
+
+  Node ids are strings because that is what ComfyUI's API format uses; the
+  checkpoint name is the on-disk filename, not a registry id, because
+  CheckpointLoaderSimple validates against the filesystem and rejects the
+  prompt otherwise -- and the rejection surfaces through the poller as
+  `node became unreachable mid-render`, which sends an operator to the
+  network when the fault is a name."
+  [{:keys [prompt negative width height steps seed]}]
+  {"3" {:class_type "KSampler"
+        :inputs {:seed seed :steps steps :cfg 6.0
+                 :sampler_name "euler_ancestral" :scheduler "normal" :denoise 1.0
+                 :model ["4" 0] :positive ["6" 0] :negative ["7" 0] :latent_image ["5" 0]}}
+   "4" {:class_type "CheckpointLoaderSimple" :inputs {:ckpt_name checkpoint}}
+   "5" {:class_type "EmptyLatentImage" :inputs {:width width :height height :batch_size 1}}
+   "6" {:class_type "CLIPTextEncode" :inputs {:text prompt :clip ["4" 1]}}
+   "7" {:class_type "CLIPTextEncode" :inputs {:text negative :clip ["4" 1]}}
+   "8" {:class_type "VAEDecode" :inputs {:samples ["3" 0] :vae ["4" 2]}}
+   "9" {:class_type "SaveImage" :inputs {:filename_prefix "hokusai" :images ["8" 0]}}})
+
+(defn image-from-history
+  "ComfyUI `/history/<id>` -> {:filename :subfolder :type} for the saved image.
+
+  Returns nil when the entry exists but carries no image: a finished job with
+  no output is a failed render, and treating an empty history as `not done
+  yet` is how a poller waits out its whole timeout on a job that already
+  stopped."
+  [history prompt-id]
+  (let [entry (get history (keyword prompt-id) (get history prompt-id))
+        outputs (:outputs entry)]
+    (when outputs
+      (first (for [[_ node] outputs
+                   img (:images node)
+                   :when (:filename img)]
+               {:filename (:filename img)
+                :subfolder (or (:subfolder img) "")
+                :type (or (:type img) "output")})))))
+
+(defn view-path
+  "The ComfyUI path that returns the image bytes."
+  [{:keys [filename subfolder type]}]
+  (str "/view?filename=" filename
+       "&subfolder=" (or subfolder "")
+       "&type=" (or type "output")))

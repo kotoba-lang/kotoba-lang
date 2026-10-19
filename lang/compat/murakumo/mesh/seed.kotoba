@@ -1,0 +1,127 @@
+(ns murakumo.mesh.seed
+  "The seed's enrol endpoint as a pure state machine: (state, request, deps) ->
+  [state' response]. The HTTP server in `murakumo.mesh.seed-server` only moves
+  bytes in and out; every decision is here so it can be tested without a socket,
+  a radio, or a key.
+
+  Two round trips, because a proof of key possession must be about a nonce the
+  seed issued, not one the joiner chose:
+
+    POST /enroll/challenge  {:did :node-name}
+      -> {:nonce :endpoint :issued-ms}
+    POST /enroll/claim      {:nonce :signature}
+      -> 200 {:ok? true :status \"authorized\" :address ...}
+         202 {:ok? true :status \"pending\"}
+         4xx {:ok? false :reason ...}
+
+  The challenge is bound to the node name and key at issue time, so the claim
+  carries neither: a joiner cannot sign for one key and enrol another, or
+  swap the name after the seed has looked at it. A challenge is single use,
+  consumed whether the claim succeeds or not.
+
+  Injected `deps`: {:now-ms :new-nonce :endpoint :verify}. `:verify` is
+  `(fn [did message signature-hex] bool)`, `ed25519.core/verify-did` in the
+  shell. The key is the one inside the DID, so there is nothing to bind."
+  (:require [murakumo.mesh :as mesh]
+            [murakumo.mesh.ledger :as ledger]))
+
+(def challenge-ttl-ms 60000)
+
+(def max-pending-challenges
+  "A pending challenge is memory a stranger on the mesh can ask for. Capped, and
+  expired ones are dropped on every request, so the cap cannot be held full by
+  stale entries."
+  64)
+
+(defn initial-state [ledger]
+  {:ledger ledger :challenges {}})
+
+(defn- respond [state status body] [state {:status status :body body}])
+
+(defn- live-challenges [challenges now-ms]
+  (into {} (filter (fn [[_ c]] (< (- now-ms (:issued-ms c)) challenge-ttl-ms))) challenges))
+
+(defn- valid-node-name? [s]
+  (and (string? s) (boolean (re-matches #"[a-z0-9][a-z0-9-]{0,62}" s))))
+
+(defn- issue-challenge
+  [state {:keys [did node-name]} {:keys [now-ms new-nonce endpoint]}]
+  (let [state (update state :challenges live-challenges now-ms)]
+    (cond
+      (not (valid-node-name? node-name))
+      (respond state 400 {:ok? false :reason :invalid-node-name})
+
+      (not (mesh/did-key? did))
+      (respond state 400 {:ok? false :reason :invalid-did})
+
+      (>= (count (:challenges state)) max-pending-challenges)
+      (respond state 503 {:ok? false :reason :too-many-pending})
+
+      :else
+      (let [nonce (new-nonce)]
+        (respond (assoc-in state [:challenges nonce]
+                           {:did did :node-name node-name :issued-ms now-ms})
+                 200 {:ok? true :nonce nonce :endpoint endpoint :issued-ms now-ms})))))
+
+(defn- claim
+  [state {:keys [nonce signature]} {:keys [now-ms endpoint verify]}]
+  (let [live (live-challenges (:challenges state) now-ms)
+        c (get live nonce)
+        ;; Consumed on any outcome: a failed proof must not be retried against
+        ;; the same nonce.
+        state (assoc state :challenges (dissoc live nonce))]
+    (if-not c
+      (respond state 403 {:ok? false :reason :unknown-or-expired-nonce})
+      (let [msg (mesh/proof-message {:nonce nonce :endpoint endpoint
+                                     :did (:did c) :node-name (:node-name c)})
+            v (mesh/admit (:ledger state)
+                          {:did (:did c) :node-name (:node-name c) :now-ms now-ms
+                           :proof-valid? (boolean (and (string? signature)
+                                                       (verify (:did c) msg signature)))})
+            state (assoc state :ledger (:ledger v))
+            addr (get-in v [:ledger :nodes (:node-name c) :address])]
+        (case (:decision v)
+          :grant (respond state 200 {:ok? true :status "authorized" :address addr
+                                     :node-name (:node-name c) :reason (:reason v)})
+          :pending (respond state 202 {:ok? true :status "pending" :reason (:reason v)})
+          (respond state 403 {:ok? false :reason (:reason v)}))))))
+
+(defn handle
+  "Route one request. `req` is {:method :path :body}, body already parsed.
+  Unknown paths and methods are 404/405, never an error, so a port scan of the
+  mesh learns nothing from the failure shape."
+  [state {:keys [method path body]} deps]
+  (cond
+    (not= :post method) (respond state 405 {:ok? false :reason :method-not-allowed})
+    (not (map? body)) (respond state 400 {:ok? false :reason :malformed-body})
+    (= "/enroll/challenge" path) (issue-challenge state body deps)
+    (= "/enroll/claim" path) (claim state body deps)
+    :else (respond state 404 {:ok? false :reason :not-found})))
+
+;; ── operator operations ────────────────────────────────────────────────────
+
+(defn admin
+  "Operator operations on the seed's ledger, run INSIDE the server.
+
+  They used to be a read-modify-write over ssh, and a join landing between the
+  read and the write was lost. Here the operation is one synchronous step on the
+  ledger as it is at that instant, exactly like a join, so the two cannot
+  interleave. `ledger` is the seed's current ledger.
+
+    POST /admin/sync {:ledger <operator's> :dry-run? bool}
+      -> {:ok? true :ledger <operator's, merged> :report {...} :changed? bool}
+
+  Returns {:status :body :ledger} where `:ledger` is the seed's ledger to persist
+  (unchanged for a dry run)."
+  [seed-ledger {:keys [method path body]}]
+  (cond
+    (not= :post method) {:status 405 :body {:ok? false :reason :method-not-allowed} :ledger seed-ledger}
+    (not= "/admin/sync" path) {:status 404 :body {:ok? false :reason :not-found} :ledger seed-ledger}
+    (not (and (map? body) (ledger/valid? (:ledger body))))
+    {:status 400 :body {:ok? false :reason :invalid-ledger} :ledger seed-ledger}
+    :else
+    (let [{:keys [local remote report]} (ledger/sync-plan (update (:ledger body) :nodes #(or % {})) seed-ledger)]
+      {:status 200
+       :ledger (if (:dry-run? body) seed-ledger remote)
+       :body {:ok? true :ledger local :report report :dry-run? (boolean (:dry-run? body))
+              :changed? (ledger/changed? report)}})))

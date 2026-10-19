@@ -1,0 +1,116 @@
+(ns kototama.component-authority-daemon
+  "Production configuration and lifecycle for the Component authority receiver."
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kototama.component-authority :as authority]
+            [kototama.component-authority-http :as http])
+  (:import [java.io FileInputStream]
+           [java.security KeyStore]
+           [java.util.concurrent CountDownLatch]
+           [javax.net.ssl KeyManagerFactory SSLContext TrustManagerFactory]))
+
+(def config-keys
+  #{:bind-host :port :path :audience :trusted-keys :tls})
+(def tls-keys #{:pkcs12-path :password-env})
+(def trusted-key-keys #{:issuer :public-key-hex})
+
+(defn- reject [reason message data]
+  (throw (ex-info message
+                  (assoc data :kototama.authority-daemon/reason reason))))
+
+(defn- unhex32 [value]
+  (when (and (string? value) (re-matches #"[0-9a-f]{64}" value))
+    (byte-array
+     (map (fn [[a b]]
+            (unchecked-byte (Integer/parseInt (str a b) 16)))
+          (partition 2 value)))))
+
+(defn load-config [path]
+  (let [config (edn/read-string (slurp path))]
+    (when-not (and (map? config)
+                   (= config-keys (set (keys config)))
+                   (string? (:bind-host config))
+                   (pos-int? (:port config))
+                   (string? (:path config))
+                   (.startsWith ^String (:path config) "/")
+                   (string? (:audience config))
+                   (seq (:audience config))
+                   (map? (:trusted-keys config))
+                   (seq (:trusted-keys config))
+                   (every?
+                    (fn [[key-id entry]]
+                      (and (string? key-id) (seq key-id)
+                           (map? entry)
+                           (= trusted-key-keys (set (keys entry)))
+                           (string? (:issuer entry)) (seq (:issuer entry))
+                           (some? (unhex32 (:public-key-hex entry)))))
+                    (:trusted-keys config))
+                   (or (nil? (:tls config))
+                       (and (map? (:tls config))
+                            (= tls-keys (set (keys (:tls config))))
+                            (every? #(and (string? %) (seq %))
+                                    ((juxt :pkcs12-path :password-env)
+                                     (:tls config))))))
+      (reject :invalid-config "Authority daemon configuration is not exact"
+              {:path path}))
+    config))
+
+(defn tls-context
+  [{:keys [pkcs12-path password-env]}]
+  (when pkcs12-path
+    (let [password-value (System/getenv password-env)]
+      (when-not (seq password-value)
+        (reject :missing-tls-password
+                "Authority daemon TLS password environment variable is missing"
+                {:password-env password-env}))
+      (let [password (.toCharArray ^String password-value)
+            key-store (KeyStore/getInstance "PKCS12")]
+        (with-open [input (FileInputStream. (io/file pkcs12-path))]
+          (.load key-store input password))
+        (let [kmf (KeyManagerFactory/getInstance
+                   (KeyManagerFactory/getDefaultAlgorithm))
+              tmf (TrustManagerFactory/getInstance
+                   (TrustManagerFactory/getDefaultAlgorithm))
+              context (SSLContext/getInstance "TLSv1.3")]
+          (.init kmf key-store password)
+          (.init tmf key-store)
+          (.init context (.getKeyManagers kmf) (.getTrustManagers tmf) nil)
+          context)))))
+
+(defn start-from-config!
+  [config-path]
+  (let [config (load-config config-path)
+        tls (tls-context (:tls config))
+        state (atom (authority/initial-state))
+        trusted-keys
+        (into {}
+              (map (fn [[key-id {:keys [issuer public-key-hex]}]]
+                     [key-id {:issuer issuer
+                              :public-key (unhex32 public-key-hex)}]))
+              (:trusted-keys config))
+        receiver (http/start!
+                  {:bind-host (:bind-host config)
+                   :port (:port config)
+                   :path (:path config)
+                   :allow-remote? (some? tls)
+                   :tls-context tls
+                   :state state
+                   :trust {:trusted-keys trusted-keys
+                           :audience (:audience config)
+                           :now-ms #(System/currentTimeMillis)}})]
+    (assoc receiver :state state :config config)))
+
+(defn -main [& [config-path]]
+  (let [config-path (or config-path
+                        (System/getenv "KOTOTAMA_AUTHORITY_CONFIG"))]
+    (when-not (seq config-path)
+      (binding [*out* *err*]
+        (println "KOTOTAMA_AUTHORITY_CONFIG or a config path argument is required"))
+      (System/exit 2))
+    (let [{:keys [port stop!]} (start-from-config! config-path)
+          latch (CountDownLatch. 1)]
+      (.addShutdownHook
+       (Runtime/getRuntime)
+       (Thread. (fn [] (stop!) (.countDown latch))))
+      (println (pr-str {:ok? true :service :component-authority :port port}))
+      (.await latch))))

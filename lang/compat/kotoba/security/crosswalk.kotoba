@@ -1,0 +1,164 @@
+(ns kotoba.security.crosswalk
+  "SOC 2 Trust Services Criteria / ISO/IEC 27001:2022 Annex A と、この repo が
+   実際に持っている証拠との突き合わせ。純関数のみ —— I/O は呼び出し側。
+
+   ## この名前空間が守る 1 つの不変条件
+
+   **設計の証拠を何本積んでも、運用の有効性の主張にはならない。**
+
+   SOC 2 Type I は『ある時点の統制の設計の適正性』、Type II は『一定期間の
+   運用の有効性』に対する意見である。`policy/control-crosswalk.edn` の
+   `:crosswalk/claim-strength` が各 claim を `:design` / `:implementation` /
+   `:operating` に分類し、`type-ii-readiness` は **`:operating` の claim が
+   1 本も無ければ ready を返せない**。
+
+   ADR-2608231500。
+
+   ## 測れなかったことを clean にしない
+
+   `readiness` は 3 種類の『満たしていない』を **区別して返す**:
+
+     :unevidenced   要求 claim があり、証拠にそれが無い
+     :not-mapped    要求 claim が空 —— 誰もこの規準に証拠を割り当てていない
+     :stale-claim   crosswalk が要求する claim 名が evidence-index の語彙に
+                    そもそも存在しない（写像側の腐り）
+
+   3 つを 1 つの『未達』に畳むと、**写像を書き忘れた規準が、証拠が無い規準と
+   同じ顔になる**。`:not-mapped` を 0 件に近づける作業と、証拠を作る作業は
+   別の仕事である。"
+  {:kotoba/export [claim-strength control-status evidence-claims framework-report gaps-by-control strengths type-i-readiness type-ii-readiness]}
+  (:require [kotoba.lang.coll :as set]
+            [kotoba.lang.text :as str]))
+
+(def strengths [:design :implementation :operating])
+
+;; .indexOf は host method なので cljc では使わない。zipmap で順位を持つ。
+(def ^:private rank-of (zipmap strengths (range)))
+(defn- rank [s] (rank-of s))
+
+(defn evidence-claims
+  "evidence-index register → 実際に主張されている claim の集合。
+
+   `:evidence/result` が `:passing` か `:baseline` の entry だけを数える。
+   失敗した証拠は証拠ではない。"
+  [evidence-index]
+  (->> (:evidence evidence-index)
+       (filter #(#{:passing :baseline} (:evidence/result %)))
+       (mapcat :evidence/claims)
+       set))
+
+(defn claim-strength
+  "claim → 強さ。crosswalk が分類していない claim は **nil を返す**（既定値で
+   埋めない）。既定を `:design` にすると、分類し忘れた claim が『設計まで在る』
+   として静かに数えられる。"
+  [crosswalk claim]
+  (get (:crosswalk/claim-strength crosswalk) claim))
+
+(defn control-status
+  "1 つの統制について、証拠がどこまで届いているかを返す。
+
+   `:strength` は満たされた claim の中の **最小** 強さ。最大ではない ——
+   1 本だけ実装まで届いていても、他が設計止まりならその統制は設計止まり。"
+  [crosswalk claims control]
+  (let [required (or (:control/requires-claims control) #{})
+        known (set (keys (:crosswalk/claim-strength crosswalk)))
+        stale (set/set-difference required known)
+        satisfied (set/set-intersection required claims)
+        missing (set/set-difference required claims stale)
+        ss (keep #(claim-strength crosswalk %) satisfied)]
+    (cond-> {:control/id (:control/id control)
+             :control/framework (:control/framework control)
+             :control/required required
+             :control/satisfied satisfied
+             :control/missing missing}
+      (seq stale) (assoc :control/stale-claims stale)
+      true
+      (assoc :control/status
+             (cond
+               (seq stale)          :stale-claim
+               (empty? required)    :not-mapped
+               (seq missing)        :unevidenced
+               :else                :evidenced)
+             :control/strength
+             (when (and (seq required) (empty? missing) (empty? stale) (seq ss))
+               (nth strengths (apply min (map rank ss))))))))
+
+(defn framework-report
+  "1 つの framework について、統制ごとの status と、その集計を返す。"
+  [crosswalk evidence-index framework]
+  (let [claims (evidence-claims evidence-index)
+        cs (filter #(= framework (:control/framework %)) (:crosswalk/controls crosswalk))
+        rows (mapv #(control-status crosswalk claims %) cs)]
+    {:framework framework
+     :controls rows
+     :counts (frequencies (map :control/status rows))
+     :strengths (frequencies (keep :control/strength rows))
+     :total (count rows)}))
+
+(defn type-i-readiness
+  "Type I（設計の適正性）に対する現在地。
+
+   Type I は運用期間を要さないので、`:evidenced` であれば強さが `:design`
+   でも数える。ただし **`:not-mapped` を分母から外さない** —— 写像が無い
+   規準は『該当なし』ではない。"
+  [report]
+  (let [{:keys [counts total]} report
+        evidenced (get counts :evidenced 0)]
+    {:attestation :type-i
+     :evidenced evidenced
+     :total total
+     :unevidenced (get counts :unevidenced 0)
+     :not-mapped (get counts :not-mapped 0)
+     :stale-claim (get counts :stale-claim 0)
+     :ready? (= evidenced total)
+     :why (when (not= evidenced total)
+            (str "統制 " total " のうち証拠が届いているのは " evidenced
+                 "。未証拠 " (get counts :unevidenced 0)
+                 " / 未写像 " (get counts :not-mapped 0)
+                 " / 写像の腐り " (get counts :stale-claim 0)))}))
+
+(defn type-ii-readiness
+  "Type II（一定期間の運用の有効性）に対する現在地。
+
+   **2 つの独立した条件の AND** で、どちらか一方では ready にならない:
+
+     1. 全統制が `:evidenced` かつ強さが `:operating`
+     2. 運用側の register が `:operational/readiness :qualified` を返す
+
+   条件 2 を入れているのは、crosswalk 側だけを埋めて『運用できている』と
+   主張できてしまうのを防ぐため。運用の現在地を知っているのは
+   `registers/remaining-operational-gaps.edn` であって、この写像ではない。"
+  [report operational-gaps]
+  (let [{:keys [controls total]} report
+        operating (count (filter #(= :operating (:control/strength %)) controls))
+        op-ready? (= :qualified (:operational/readiness operational-gaps))
+        external (->> (:gaps operational-gaps)
+                      (filter #(= :external-operation-required (:status %)))
+                      (map :workstream)
+                      sort vec)]
+    {:attestation :type-ii
+     :operating operating
+     :total total
+     :operational-readiness (:operational/readiness operational-gaps)
+     :external-operation-required external
+     :ready? (and op-ready? (= operating total))
+     :why (cond
+            (not op-ready?)
+            (str "運用側 register が " (pr-str (:operational/readiness operational-gaps))
+                 "。外部運用待ちの workstream " (count external) " 本: "
+                 (str/join ", " (map name external)))
+            (not= operating total)
+            (str "運用の証拠まで届いている統制は " operating "/" total
+                 "。設計・実装の証拠は Type II の証拠にならない。")
+            :else nil)}))
+
+(defn gaps-by-control
+  "統制ごとの `:control/gap`（人が書いた説明）を、status と併せて返す。
+   report のあとで人が読む用。"
+  [crosswalk report]
+  (let [by-id (into {} (map (juxt :control/id identity) (:crosswalk/controls crosswalk)))]
+    (->> (:controls report)
+         (map (fn [r] (assoc r :control/gap (:control/gap (by-id (:control/id r))))))
+         (remove #(= :evidenced (:control/status %)))
+         (sort-by :control/id)
+         vec)))

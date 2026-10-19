@@ -1,0 +1,285 @@
+(ns mime.codec
+  "Transfer encodings and charset decoding — RFC 2045 §6 and RFC 2047 §4.
+
+  THE INPUT CONTRACT, which is the thing to get right before anything
+  else here makes sense: every function in this library takes a **binary
+  string** — the raw message bytes decoded one-byte-per-character
+  (latin-1), so character `n` is byte `n`. It is NOT a UTF-8 decode of
+  the message.
+
+  A message is bytes. Its headers say which charset those bytes are in,
+  and different parts of one message routinely disagree — a UTF-8 body
+  next to an ISO-2022-JP subject next to a binary attachment. Decoding
+  the whole thing as UTF-8 up front destroys every part that was not
+  UTF-8, and quietly: you get U+FFFD, not an error. So the wire form
+  stays byte-per-char until the headers say what each part is, and the
+  decode happens here, per part.
+
+    JS:  new TextDecoder('latin1').decode(bytes)
+    JVM: (String. bytes StandardCharsets/ISO_8859_1)"
+  (:require [kotoba.lang.text :as str]))
+
+(defn char-code
+  "The numeric code of a character, on both hosts.
+
+  Not `(int c)`: ClojureScript has no character type — a `\\a` literal is
+  a one-character string, and `int` on it goes through `Math.trunc`,
+  which returns 0 for `\\0`, NaN for `\\a`, and silently wrong answers
+  for everything in between. The first version of this namespace used
+  `int` throughout and every body decoded to a run of blanks."
+  [c]
+  )
+
+;; ------------------------------------------------------------- base64
+
+(def ^:private b64-alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+
+(def ^:private b64-index
+  (into {} (map-indexed (fn [i c] [c i]) b64-alphabet)))
+
+(defn decode-base64
+  "base64 -> binary string. Ignores whitespace and any character outside
+  the alphabet, per RFC 2045 §6.8's instruction to discard characters
+  that cannot occur in base64 data — real mail wraps lines, and some
+  senders pad wrong."
+  [s]
+  (let [chars (filterv b64-index s)]
+    (loop [[a b c d & more] chars out []]
+      (if (nil? a)
+        (apply str (map char out))
+        (let [ia (b64-index a) ib (b64-index b 0)
+              ic (b64-index c) id (b64-index d)
+              n (+ (* (or ia 0) 262144) (* ib 4096)
+                   (* (or ic 0) 64) (or id 0))
+              b1 (bit-and (quot n 65536) 0xff)
+              b2 (bit-and (quot n 256) 0xff)
+              b3 (bit-and n 0xff)]
+          (recur more
+                 (cond-> (conj out b1)
+                   (some? c) (conj b2)
+                   (some? d) (conj b3))))))))
+
+(defn- b64-char [n] (nth b64-alphabet n))
+
+(defn encode-base64
+  "binary string -> base64. Present so tests can build fixtures without a
+  host encoder, and so a caller re-emitting a part does not need one."
+  [s]
+  (let [codes (mapv #(bit-and (char-code %) 0xff) s)]
+    (apply str
+           (mapcat (fn [group]
+                     (let [[x y z] group
+                           n (+ (* x 65536) (* (or y 0) 256) (or z 0))
+                           c1 (b64-char (quot n 262144))
+                           c2 (b64-char (mod (quot n 4096) 64))
+                           c3 (if y (b64-char (mod (quot n 64) 64)) \=)
+                           c4 (if z (b64-char (mod n 64)) \=)]
+                       [c1 c2 c3 c4]))
+                   (partition-all 3 codes)))))
+
+;; --------------------------------------------------- quoted-printable
+
+(def ^:private hex-digits
+  (into {} (map-indexed (fn [i c] [c i]) "0123456789abcdef")))
+
+(defn- hex-val [c]
+  (or (hex-digits c) (hex-digits (first (str/lower (str c))))))
+
+(defn decode-quoted-printable
+  "RFC 2045 §6.7 -> binary string. `underscore-is-space?` for the RFC 2047
+  §4.2 'Q' variant, where `_` means space and only there.
+
+  A soft line break (`=` at end of line) joins lines; a malformed `=`
+  escape is left as written rather than dropped, because a mangled body
+  that is readable beats one silently missing characters."
+  ([s] (decode-quoted-printable s false))
+  ([s underscore-is-space?]
+   (let [n (count s)]
+     (loop [i 0 out []]
+       (if (>= i n)
+         (apply str out)
+         (let [c (nth s i)]
+           (cond
+             (and underscore-is-space? (= \_ c))
+             (recur (inc i) (conj out \space))
+
+             (not= \= c)
+             (recur (inc i) (conj out c))
+
+             ;; soft line break: "=\r\n" or "=\n"
+             (and (< (+ i 2) n) (= \return (nth s (inc i))) (= \newline (nth s (+ i 2))))
+             (recur (+ i 3) out)
+
+             (and (< (inc i) n) (= \newline (nth s (inc i))))
+             (recur (+ i 2) out)
+
+             :else
+             (let [h1 (when (< (inc i) n) (hex-val (nth s (inc i))))
+                   h2 (when (< (+ i 2) n) (hex-val (nth s (+ i 2))))]
+               (if (and h1 h2)
+                 (recur (+ i 3) (conj out (char (+ (* 16 h1) h2))))
+                 (recur (inc i) (conj out c)))))))))))
+
+;; -------------------------------------------------- percent (RFC 2231)
+
+(defn decode-percent
+  "RFC 2231 §4 percent-encoding -> binary string.
+
+  Separate from `decode-quoted-printable` despite the shared `%XX`/`=XX`
+  shape: this one has no soft line breaks and no `_`-is-space rule, and
+  folding them together would mean one of the two silently accepting
+  syntax the other forbids. A malformed escape is left as written, the
+  same choice quoted-printable makes and for the same reason — a filename
+  that reads oddly beats a filename with characters missing."
+  [s]
+  (let [n (count s)]
+    (loop [i 0 out []]
+      (if (>= i n)
+        (apply str out)
+        (let [c (nth s i)]
+          (if (not= \% c)
+            (recur (inc i) (conj out c))
+            (let [h1 (when (< (inc i) n) (hex-val (nth s (inc i))))
+                  h2 (when (< (+ i 2) n) (hex-val (nth s (+ i 2))))]
+              (if (and h1 h2)
+                (recur (+ i 3) (conj out (char (+ (* 16 h1) h2))))
+                (recur (inc i) (conj out c))))))))))
+
+;; ------------------------------------------------- transfer encodings
+
+(defn decode-transfer
+  "Apply a Content-Transfer-Encoding. Unknown encodings pass through
+  unchanged — RFC 2045 §6.4 says a receiver that does not recognise one
+  should treat the part as application/octet-stream, not discard it."
+  [encoding s]
+  (case (some-> encoding str/trim str/lower)
+    "base64" (decode-base64 s)
+    "quoted-printable" (decode-quoted-printable s)
+    s))
+
+;; ------------------------------------------------------------ charset
+
+(defn- utf8-decode
+  "UTF-8 binary string -> characters. Written out rather than delegated
+  because this library is pure `.cljc` and both hosts' decoders live
+  behind different, effectful APIs. Malformed sequences become U+FFFD,
+  as the standard requires — never an exception, because a single bad
+  byte must not lose a whole message."
+  [s]
+  (let [n (count s)
+        b #(bit-and (char-code (nth s %)) 0xff)]
+    (loop [i 0 out []]
+      (if (>= i n)
+        (apply str out)
+        (let [c (b i)]
+          (cond
+            (< c 0x80) (recur (inc i) (conj out (char c)))
+
+            (and (= 0xc0 (bit-and c 0xe0)) (< (inc i) n))
+            (recur (+ i 2) (conj out (char (+ (* 64 (bit-and c 0x1f))
+                                              (bit-and (b (inc i)) 0x3f)))))
+
+            (and (= 0xe0 (bit-and c 0xf0)) (< (+ i 2) n))
+            (recur (+ i 3) (conj out (char (+ (* 4096 (bit-and c 0x0f))
+                                              (* 64 (bit-and (b (inc i)) 0x3f))
+                                              (bit-and (b (+ i 2)) 0x3f)))))
+
+            (and (= 0xf0 (bit-and c 0xf8)) (< (+ i 3) n))
+            ;; astral plane: emit the surrogate pair, so the result is a
+            ;; valid string on both hosts
+            (let [cp (+ (* 262144 (bit-and c 0x07))
+                        (* 4096 (bit-and (b (inc i)) 0x3f))
+                        (* 64 (bit-and (b (+ i 2)) 0x3f))
+                        (bit-and (b (+ i 3)) 0x3f))
+                  v (- cp 0x10000)]
+              (recur (+ i 4) (conj out (char (+ 0xd800 (quot v 1024)))
+                                  (char (+ 0xdc00 (mod v 1024))))))
+
+            :else (recur (inc i) (conj out (char 0xfffd)))))))))
+
+(def native-charsets
+  "Charsets decoded here, with no host help. Everything else needs a
+  decoder injected — see `decode-charset`."
+  #{"utf-8" "utf8" "us-ascii" "ascii" "iso-8859-1" "latin1" "latin-1" "8859-1"})
+
+(defn decode-charset
+  "binary string + charset name -> text.
+
+  UTF-8, US-ASCII and ISO-8859-1 are decoded here. **Everything else
+  requires `decoder`**, a fn of `[charset binary-string] -> string`,
+  because the rest of the world's charsets are lookup tables and a
+  stateful escape machine (ISO-2022-JP), and inventing those inside a
+  pure library would be both large and worse than the host's own
+  `TextDecoder`/`Charset`, which are already correct and already there.
+
+  With no decoder and a charset this does not know, the bytes come back
+  as latin-1 rather than as an exception: a Japanese subject rendered as
+  mojibake is a bad read, but a message that cannot be received at all
+  is a lost one. Callers that care can detect it — `decodable?` says
+  which case they are in, so the choice is theirs and not silent."
+  ([s charset] (decode-charset s charset nil))
+  ([s charset decoder]
+   (let [cs (some-> charset str/trim str/lower (str/replace "\"" ""))]
+     (cond
+       (or (nil? cs) (contains? #{"utf-8" "utf8"} cs)) (utf8-decode s)
+       (contains? native-charsets cs) s          ; latin-1 IS the binary string
+       (some? decoder) (decoder cs s)
+       :else s))))
+
+(defn valid-utf8?
+  "Whether this binary string is a well-formed UTF-8 sequence.
+
+  Structural, not statistical: every lead byte must be followed by the
+  right number of continuation bytes and nothing may be left over. Pure
+  ASCII counts (it is valid UTF-8), and so does the empty string."
+  [s]
+  (let [n (count s)
+        b #(bit-and (char-code (nth s %)) 0xff)]
+    (loop [i 0]
+      (if (>= i n)
+        true
+        (let [c (b i)
+              width (cond
+                      (< c 0x80) 1
+                      (= 0xc0 (bit-and c 0xe0)) 2
+                      (= 0xe0 (bit-and c 0xf0)) 3
+                      (= 0xf0 (bit-and c 0xf8)) 4
+                      :else 0)]
+          (cond
+            (zero? width) false
+            (> (+ i width) n) false
+            (not (every? #(= 0x80 (bit-and (b %) 0xc0))
+                         (range (inc i) (+ i width))))
+            false
+            :else (recur (+ i width))))))))
+
+(defn decode-8bit-header
+  "A header value that carries raw 8-bit bytes, best-effort.
+
+  RFC 5322 §2.2 says a header field is US-ASCII and RFC 2047 is how
+  non-ASCII gets in, so a raw UTF-8 `Subject:` is malformed mail. It is
+  also *common* mail — plenty of senders emit it, particularly for
+  Japanese — and the two ways to treat it are to hand back the bytes as
+  latin-1, which renders as mojibake, or to notice that they are
+  well-formed UTF-8 and decode them.
+
+  This does the second, and only when the bytes really are valid UTF-8.
+  That guard is what keeps a genuinely latin-1 header (`Müller`, one byte
+  per character) from being mangled by a decode it never asked for:
+  `0xFC` alone is not a legal UTF-8 lead byte, so such a header fails the
+  check and passes through untouched. Deliberately not a charset guess —
+  there is exactly one alternative interpretation here, and it is either
+  structurally possible or it is not."
+  [s]
+  (if (and (some #(>= (bit-and (char-code %) 0xff) 0x80) s)
+           (valid-utf8? s))
+    (decode-charset s "utf-8")
+    s))
+
+(defn decodable?
+  "Whether `decode-charset` can handle this charset without a host
+  decoder. Lets a caller decide what to do about the ones it cannot,
+  instead of finding out from mojibake."
+  [charset]
+  (let [cs (some-> charset str/trim str/lower (str/replace "\"" ""))]
+    (or (nil? cs) (contains? native-charsets cs))))

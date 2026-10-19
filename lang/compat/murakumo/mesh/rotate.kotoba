@@ -1,0 +1,167 @@
+(ns murakumo.mesh.rotate
+  "SAE passphrase rotation: pure planning for `murakumo.mesh.rotate-cli`.
+
+  Revoking a node stops fleet operations and re-enrolment but leaves its radio on
+  the mesh, because it still holds the passphrase. Rotation is the cutoff for
+  that: every node that should stay gets the new passphrase, the revoked one does
+  not, and the old passphrase stops meaning anything.
+
+  ## Who is rotated
+
+  Only `authorized` mesh members in the operator's ledger, plus the seed (which is not a
+  ledger entry). Revoked nodes are skipped on purpose -- that is the cutoff.
+  Pending nodes are skipped too: they were never admitted, and rotating them would
+  hand an unadmitted machine the new secret. A pending node admitted later joins
+  with the new token.
+
+  ## How nodes are reached
+
+  Over SSH to each node's tailnet host, NOT over the mesh. The mesh is exactly
+  what is changing underneath, so a rotation that rode it would cut itself off
+  halfway. A node with no host it can be reached at outside the mesh cannot be
+  rotated and is reported, not guessed at.
+
+  ## Order and failure
+
+  Non-seed nodes first, the seed last, and a failed node does not stop the rest:
+  every node that does rotate is one more on the new passphrase. Progress is kept
+  by the caller, so a failed node is retried with the SAME new passphrase. A node
+  that cannot be rotated is either fixed and retried, or revoked, which drops it
+  from the targets and lets the rotation complete.
+
+  Every value rendered into shell is validated first."
+  (:require [kotoba.lang.text :as str]
+            [murakumo.mesh :as mesh]
+            [murakumo.mesh.install :as install]))
+
+(def default-seed-name "seed")
+
+(defn generate-passphrase
+  "From 32 hex characters of randomness the caller supplies. Refused when it is
+  not a valid passphrase, so a short or reused value cannot get through."
+  [random-hex]
+  (when-not (mesh/valid-passphrase? random-hex)
+    (throw (ex-info "random value is not a valid passphrase" {:reason :weak-passphrase})))
+  random-hex)
+
+(defn targets
+  "Who to rotate and how to reach them.
+
+  `ledger` the operator's; `host-map` {name ssh-host}; `seed-host` the seed's.
+  Returns {:nodes [{:name :host :role}] seed last, :unresolved [names with no
+  host], :skipped {:revoked [...] :pending [...]}}."
+  [ledger {:keys [host-map seed-host seed-name] :or {seed-name default-seed-name}}]
+  (let [entries (sort-by key (:nodes ledger))
+        by (fn [status] (vec (keep (fn [[n e]] (when (= status (:status e)) n)) entries)))
+        revoked-dids (set (keep (fn [[_ e]] (when (= "revoked" (:status e)) (:did e))) entries))
+        members (vec (keep (fn [[n e]] (when (and (not= n seed-name)
+                                                (= "authorized" (:status e))
+                                                (not (revoked-dids (:did e)))
+                                                (mesh/mesh-member? e)) n)) entries))
+        resolved (keep (fn [n] (when-let [h (get host-map n)]
+                                 {:name n :did (get-in ledger [:nodes n :did]) :host h :role :node})) members)]
+    {:nodes (vec (concat resolved [{:name seed-name :did (get-in ledger [:nodes seed-name :did])
+                                   :host seed-host :role :seed}]))
+     :unresolved (vec (remove #(contains? host-map %) members))
+     :skipped {:revoked (by "revoked") :pending (by "pending")}}))
+
+(defn host-map
+  "name -> ssh host: the fleet's declared hosts, overridden by explicit pairs.
+  Mesh node names follow fleet names by convention; a name the fleet does not
+  know needs an explicit pair."
+  [fleet overrides]
+  (merge (into {} (keep (fn [n] (when (and (:name n) (:host n)) [(:name n) (:host n)])) (:nodes fleet)))
+         overrides))
+
+(defn parse-pair
+  "\"name=host\" -> [name host], or nil."
+  [s]
+  (when-let [[_ n h] (re-matches #"([a-z0-9][a-z0-9-]{0,62})=([A-Za-z0-9@._:-]{1,200})" (str s))]
+    [n h]))
+
+;; ── per-node state ─────────────────────────────────────────────────────────
+
+(defn new-state [passphrase now-ms] {:passphrase passphrase :started-ms now-ms :done []})
+
+(defn expose [state node]
+  ;; Record before invoking SSH: a failed command may already have written it.
+  (assoc-in state [:exposed (:name node)] (select-keys node [:name :did :host :role])))
+
+(defn restart-required?
+  "Never resume a secret exposed to a revoked or changed recipient. Legacy
+  progress has no identity evidence and starts afresh conservatively."
+  [state ledger target-nodes]
+  (let [current (into {} (map (juxt :name #(select-keys % [:name :did :host :role])) target-nodes))
+        revoked-dids (set (keep (fn [[_ e]] (when (= "revoked" (:status e)) (:did e))) (:nodes ledger)))]
+    (boolean
+     (or (and (seq (:done state)) (not (seq (:exposed state))))
+         (some (fn [[n e]] (or (not= e (get current n))
+                               (= "revoked" (get-in ledger [:nodes n :status]))
+                               (and (:did e) (revoked-dids (:did e))))) (:exposed state))))))
+
+(defn mark-done [state node-name token]
+  (cond-> (update state :done #(vec (distinct (conj % node-name))))
+    token (assoc :join-token token)))
+
+(defn remaining [state target-nodes]
+  (let [done (set (:done state))]
+    (vec (remove #(contains? done (:name %)) target-nodes))))
+
+(defn complete? [state target-nodes unresolved]
+  (and (empty? unresolved) (empty? (remaining state target-nodes))))
+
+;; ── the node script ────────────────────────────────────────────────────────
+
+(defn rotate-script
+  "Rotate one node. The new passphrase is read from STDIN (see `stdin-for`), not
+  rendered into the script, so it is not in the remote process list. Idempotent:
+  running it again with the same passphrase leaves the same state. Config files are written to `.new` and renamed, so a failure
+  midway never leaves a node with a half-written passphrase file.
+
+  The seed also rewrites its join token (field 4 is the passphrase) and prints
+  it; the token is what a new joiner is installed with."
+  [{:keys [role iface] :or {iface "mesh0"}}]
+  (when-not (re-matches #"[a-z][a-z0-9]{0,14}" iface)
+    (throw (ex-info "bad iface" {:field :iface})))
+  (str "set -eu\n"
+       "[ \"$(id -u)\" = 0 ] || { echo 'must run as root' >&2; exit 2; }\n"
+       "[ -s " install/etc-dir "/wpa-mesh.conf.tpl ] || { echo 'mesh is not installed on this node' >&2; exit 2; }\n"
+       install/read-passphrase-snippet
+       "( umask 077; printf 'MESH_PASSPHRASE=%s\\n' \"$MESH_PASSPHRASE\" > " install/etc-dir "/mesh.env.new )\n"
+       "mv " install/etc-dir "/mesh.env.new " install/etc-dir "/mesh.env\n"
+       ". " install/etc-dir "/mesh.env\n"
+       "( umask 077; sed \"s/" mesh/passphrase-placeholder "/$MESH_PASSPHRASE/\" " install/etc-dir "/wpa-mesh.conf.tpl > " install/etc-dir "/wpa-mesh.conf.new )\n"
+       "chmod 600 " install/etc-dir "/wpa-mesh.conf.new\n"
+       "mv " install/etc-dir "/wpa-mesh.conf.new " install/etc-dir "/wpa-mesh.conf\n"
+       (when (= :seed role)
+         (str "[ -s " install/etc-dir "/mesh-join-token ] || { echo 'no join token on the seed' >&2; exit 2; }\n"
+              "( umask 077; awk -F: -v p=\"$MESH_PASSPHRASE\" 'BEGIN{OFS=\":\"}{$4=p; print}' " install/etc-dir "/mesh-join-token > " install/etc-dir "/mesh-join-token.new )\n"
+              "mv " install/etc-dir "/mesh-join-token.new " install/etc-dir "/mesh-join-token\n"))
+       "systemctl restart murakumo-mesh-wpa.service\n"
+       "ok=0; for i in $(seq 1 30); do systemctl is-active --quiet murakumo-mesh-wpa.service && ok=1 && break; sleep 1; done\n"
+       "[ \"$ok\" = 1 ] || { echo 'FAILED: murakumo-mesh-wpa.service not active' >&2; journalctl -u murakumo-mesh-wpa.service -n 20 --no-pager >&2; exit 1; }\n"
+       (when (= :seed role)
+         (str "echo \"JOIN_TOKEN=$(cat " install/etc-dir "/mesh-join-token)\"\n"))))
+
+(defn stdin-for
+  "What to pipe to `rotate-script`. Refuses an invalid passphrase here as well, so
+  a bad value fails on the operator's machine, before any node is touched."
+  [passphrase]
+  (when-not (mesh/valid-passphrase? passphrase)
+    (throw (ex-info "bad passphrase" {:reason :weak-passphrase})))
+  (str passphrase "\n"))
+
+(defn peers-script
+  "How many mesh peers this node sees. Printed as PEERS=n after waiting up to 30 s
+  for the mesh to re-form on the new passphrase."
+  [{:keys [iface] :or {iface "mesh0"}}]
+  (when-not (re-matches #"[a-z][a-z0-9]{0,14}" iface)
+    (throw (ex-info "bad iface" {:field :iface})))
+  (str "n=0; for i in $(seq 1 30); do n=$(iw dev " iface " station dump 2>/dev/null | grep -c '^Station' || true); "
+       "[ \"${n:-0}\" -ge 1 ] && break; sleep 1; done\n"
+       "echo \"PEERS=${n:-0}\"\n"))
+
+(defn peers-from-output [out]
+  (some (fn [l] (when-let [n (second (re-matches #"PEERS=(\d+)" (str/trim l)))]
+                  ))
+        (str/split-lines (str out))))

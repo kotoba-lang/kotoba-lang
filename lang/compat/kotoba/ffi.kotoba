@@ -1,0 +1,196 @@
+(ns kotoba.ffi
+  "Declared foreign-function bindings and native memory as a host capability.
+
+  Two halves in one namespace:
+
+  PURE (both hosts) -- C scalar types as keywords, their LP64 sizes and
+  alignments, `signature` data and its validation, C struct layout math
+  (`struct-layout`), and the declared binding table (`library` / `declared`).
+  Nothing here touches native code.
+
+  HOST (JVM only, `java.lang.foreign`, JDK 22+) -- linker, symbol lookup,
+  downcalls, arenas and memory segments. Native code is ambient authority,
+  so it only enters where the host provides it: on the kbb engine (SCI on
+  Node) there is no built-in FFI, and every host fn throws
+  `{:kotoba.ffi/error :unsupported-host :host :node}`.
+
+  Errors are `ex-info` whose data carries `:kotoba.ffi/error <keyword>`; the
+  keyword is the contract, the message is prose.")
+
+;; ---------------------------------------------------------------------------
+;; errors
+
+(defn- refuse
+  ([reason data] (refuse reason data nil))
+  ([reason data cause]
+   (let [m (merge {:kotoba.ffi/error reason} data)]
+     (if cause
+       (throw (ex-info (str "kotoba.ffi: " (name reason)) m cause))
+       (throw (ex-info (str "kotoba.ffi: " (name reason)) m))))))
+
+(defn error-reason
+  "The `:kotoba.ffi/error` keyword of an exception thrown by this namespace,
+  or nil."
+  [e]
+  (:kotoba.ffi/error (ex-data e)))
+
+;; ---------------------------------------------------------------------------
+;; PURE: C scalar types (LP64: long and pointer are 8 bytes)
+
+(def type-table
+  "keyword -> {:size :align :kind :signed?}. `:void` is a return type only."
+  {:i8   {:size 1 :align 1 :kind :int :signed? true}
+   :u8   {:size 1 :align 1 :kind :int :signed? false}
+   :i16  {:size 2 :align 2 :kind :int :signed? true}
+   :u16  {:size 2 :align 2 :kind :int :signed? false}
+   :i32  {:size 4 :align 4 :kind :int :signed? true}
+   :u32  {:size 4 :align 4 :kind :int :signed? false}
+   :i64  {:size 8 :align 8 :kind :int :signed? true}
+   :f32  {:size 4 :align 4 :kind :float}
+   :f64  {:size 8 :align 8 :kind :float}
+   :ptr  {:size 8 :align 8 :kind :ptr}
+   :void {:size 0 :align 1 :kind :void}})
+
+(defn type?
+  "Is `t` a known C type keyword (including `:void`)?"
+  [t]
+  (contains? type-table t))
+
+(defn- check-type [t]
+  (when-not (type? t) (refuse :unknown-type {:type t}))
+  t)
+
+(defn- check-value-type [t]
+  (check-type t)
+  (when (= :void t) (refuse :void-has-no-value {:type t}))
+  t)
+
+(defn type-size [t] (:size (type-table (check-value-type t))))
+(defn type-align [t] (:align (type-table (check-value-type t))))
+
+(def ^:private int-ranges
+  {:i8  [-128 127]
+   :u8  [0 255]
+   :i16 [-32768 32767]
+   :u16 [0 65535]
+   :i32 [-2147483648 2147483647]
+   :u32 [0 4294967295]
+   :i64 [-9223372036854775808 9223372036854775807]})
+
+(defn check-value
+  "Validate that `v` fits C type `t`; returns `v`. Integers must be integral
+  and within the type's range (`:value-out-of-range`), floats must be numbers
+  (`:not-a-number`). `:ptr` values are host objects and are checked by the
+  host fns."
+  [t v]
+  (check-value-type t)
+  (case (:kind (type-table t))
+    :int (do (when-not (integer? v) (refuse :not-an-integer {:type t :value v}))
+             (let [[lo hi] (int-ranges t)]
+               (when-not (<= lo v hi) (refuse :value-out-of-range {:type t :value v :min lo :max hi})))
+             v)
+    :float (do (when-not (number? v) (refuse :not-a-number {:type t :value v})) v)
+    :ptr v))
+
+;; ---------------------------------------------------------------------------
+;; PURE: signatures
+
+(defn signature
+  "A foreign function's C signature as data:
+  `{:kotoba.ffi/ret ret :kotoba.ffi/args [arg ...]}`. `ret` is a type or
+  `:void`; `args` a sequential of non-void types. Refusals: `:unknown-type`,
+  `:args-not-sequential`, `:void-argument`."
+  [ret args]
+  (check-type ret)
+  (when-not (sequential? args) (refuse :args-not-sequential {:args args}))
+  (doseq [a args]
+    (check-type a)
+    (when (= :void a) (refuse :void-argument {:args (vec args)})))
+  {:kotoba.ffi/ret ret :kotoba.ffi/args (vec args)})
+
+(defn signature-void
+  "`(signature :void args)` -- FunctionDescriptor/ofVoid."
+  [args]
+  (signature :void args))
+
+(defn signature?
+  [x]
+  (and (map? x) (contains? x :kotoba.ffi/ret) (contains? x :kotoba.ffi/args)))
+
+;; ---------------------------------------------------------------------------
+;; PURE: struct layout (C rules: each field at the next multiple of its
+;; alignment, struct alignment = max field alignment, size rounded up to it)
+
+(defn- align-up [n a] (* a (quot (+ n (dec a)) a)))
+
+(declare struct-layout)
+
+(defn- field-shape
+  "size/align of a field type: a scalar keyword, a nested struct-layout
+  result, or `[:array elem n]`."
+  [t]
+  (cond
+    (keyword? t) {:size (type-size t) :align (type-align t)}
+    (and (map? t) (contains? t :size) (contains? t :align)) {:size (:size t) :align (:align t)}
+    (and (vector? t) (= :array (first t)) (= 3 (count t)))
+    (let [[_ elem n] t]
+      (when-not (and (integer? n) (pos? n)) (refuse :bad-array-length {:type t}))
+      (let [{:keys [size align]} (field-shape elem)]
+        {:size (* size n) :align align}))
+    :else (refuse :unknown-type {:type t})))
+
+(defn struct-layout
+  "C layout of `fields` = `[[name type] ...]` in declaration order. A type is
+  a scalar keyword, another `struct-layout` result (nested struct) or
+  `[:array type n]`. Returns `{:size :align :offsets {name offset} :fields
+  [{:name :type :offset :size :align} ...]}`. Refusals: `:empty-struct`,
+  `:duplicate-field`, `:unknown-type`, `:bad-field`, `:bad-array-length`."
+  [fields]
+  (when-not (and (sequential? fields) (seq fields)) (refuse :empty-struct {:fields fields}))
+  (loop [fs (seq fields) off 0 align 1 out [] seen #{}]
+    (if-not fs
+      {:size (align-up off align) :align align
+       :offsets (into {} (map (juxt :name :offset)) out)
+       :fields out}
+      (let [f (first fs)]
+        (when-not (and (sequential? f) (= 2 (count f))) (refuse :bad-field {:field f}))
+        (let [[nm t] f]
+          (when (seen nm) (refuse :duplicate-field {:name nm}))
+          (let [{fs-size :size fs-align :align} (field-shape t)
+                at (align-up off fs-align)]
+            (recur (next fs) (+ at fs-size) (max align fs-align)
+                   (conj out {:name nm :type t :offset at :size fs-size :align fs-align})
+                   (conj seen nm))))))))
+
+;; ---------------------------------------------------------------------------
+;; PURE: declared binding table
+
+(defn library
+  "A declared binding table: `{:symbols {\"name\" signature ...}}`. Every
+  signature is validated (`signature?` or refused `:bad-signature`). Only a
+  declared symbol can be bound."
+  [{:keys [symbols] :as spec}]
+  (when-not (map? symbols) (refuse :bad-library {:spec spec}))
+  (doseq [[k s] symbols]
+    (when-not (string? k) (refuse :bad-symbol-name {:name k}))
+    (when-not (signature? s) (refuse :bad-signature {:name k :signature s})))
+  {:kotoba.ffi/symbols symbols})
+
+(defn declared
+  "The declared signature of `name` in `lib`, or refuse `:undeclared-symbol`."
+  [lib name]
+  (or (get (:kotoba.ffi/symbols lib) name)
+      (refuse :undeclared-symbol {:name name :declared (vec (sort (keys (:kotoba.ffi/symbols lib))))})))
+
+;; ---------------------------------------------------------------------------
+;; HOST
+
+
+
+(def host-fns
+  "Every host fn of the contract (for the refusal census on kbb)."
+  '[layout descriptor native-linker default-lookup loader-lookup library-lookup
+    load-library! find-symbol find-symbol! downcall method-handle invoke invoke-list
+    confined-arena shared-arena auto-arena global-arena alloc alloc-bytes c-string
+    put! fetch byte-size copy-from! of-array reinterpret address null-segment
+    segment-string as-slice map-file bind])

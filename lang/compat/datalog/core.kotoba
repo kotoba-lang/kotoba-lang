@@ -1,0 +1,1755 @@
+(ns datalog.core
+  "Conjunctive multi-clause Datalog join over `datalog.query`'s single
+  triple-pattern router -- a Datomic-SHAPED (not Datomic-compatible)
+  `:find`/`:where` surface. `datalog.query` on its own is single-`[s p o]`-
+  pattern only, with no variable binding across clauses; this is the layer
+  that binds, joins, recurses, negates, and aggregates.
+
+  Extracted from `kotoba-lang/arrangement`'s `arrangement.datalog`, leaving
+  arrangement's persistence half (commits, CIDs, prolly-tree snapshots)
+  behind. Nothing here touches storage: a query runs against either an
+  in-memory `datalog.index` db or anything satisfying
+  `datom.source/IPatternSource` (see `scan*`), and that protocol is this
+  library's only runtime dependency.
+
+  A clause is `[e a v]` where each position is a bound value, a logic
+  variable (a symbol whose name starts with `?`, e.g. `?x`), or the
+  wildcard `_`. `q` binds variables left-to-right across `:where` clauses
+  via nested-loop join (each clause's still-unbound variables become
+  wildcards in the pattern handed to `datalog.query/query`; already-
+  bound variables are substituted in as concrete values and re-checked
+  against each candidate row), and projects the `:find` variables.
+
+  ADR-2607061200 staged roadmap, Stage 2: negation (`(not [e a v])`
+  clauses) and aggregation (`(count ?v)`/`(sum ?v)`/etc. in `:find`).
+  Stage 3/4 (this landing): recursive rules -- Datomic-shaped `:rules`
+  (`[[(rule-name ?a ?b) clause ...] ...]`, invoked from `:where` as
+  `(rule-name ?x ?y)`), evaluated to a least fixpoint via semi-naive
+  iteration. All three compose on top of the Stage 1 join without
+  changing it, per the roadmap's own plan.
+
+  **Negation and `visible?`** (security-relevant, not just a semantics
+  choice): a `(not [e a v])` clause is evaluated through the exact same
+  `visible?`-filtered `datalog.query/query` as every positive clause.
+  A caller-redacted fact and a genuinely absent fact are therefore
+  indistinguishable to `not` -- `visible?` is a first-class effect
+  (ADR-2607050500), so a query must never be able to infer a hidden fact's
+  *presence* by testing its *absence*. This is why negation is NOT
+  implemented as \"run the positive query, then set-difference against
+  the unfiltered db\" -- that would leak exactly this way. Rule bodies
+  thread the same `visible?` through every clause they contain (triple,
+  `not`, or nested rule invocation), so this guarantee holds recursively.
+
+  **Safe negation**: every logic variable inside a `(not [e a v])` clause
+  must already be bound by an earlier positive clause IN THE SAME `:where`
+  OR rule body (checked statically, before any join or fixpoint runs) --
+  `not` only ever narrows an existing binding, it can never itself
+  introduce or enumerate a variable's values. `_` (wildcard) is exempt --
+  it doesn't bind, so `(not [?x :flag _])` (\"no flag fact of any value\")
+  is always safe. `(not (rule-name ...))` -- negating a RULE invocation,
+  not a plain triple pattern -- is deliberately NOT supported: combining
+  recursion and negation soundly requires stratification (a rule may
+  never negate itself, even transitively), which this landing does not
+  implement; throws a clear error instead of silently misbehaving.
+
+  **Rules and fixpoint**: `:rules` groups multiple named definitions,
+  each `[(rule-name ?param ...) clause ...]` -- a rule name may have
+  several definitions (each an alternative/OR branch, e.g. a recursive
+  rule's base case and inductive case are two definitions of the same
+  name). A `:where` (or another rule body's) clause `(rule-name ?arg ...)`
+  joins against that rule's CURRENT materialized tuple set exactly like a
+  triple clause joins against `db` -- arg positions may be bound values,
+  logic variables (bound or not yet bound), or `_`.
+
+  Evaluated via semi-naive least-fixpoint iteration: seed round derives
+  whatever every rule's non-recursive (base-case) definitions produce
+  from `db` alone; each subsequent round re-evaluates every definition
+  once per rule-invocation clause position within it, using that
+  position's rule's DELTA (newly-derived-last-round tuples) and every
+  other rule-invocation's FULL (all tuples derived so far) -- the
+  standard semi-naive rewriting, chosen over naive re-evaluation from the
+  start so this doesn't need a later rewrite once real datasets make
+  naive's full-recompute-every-round cost matter. Guaranteed to terminate
+  (derivation is monotonic -- tuples are only ever added -- over `db`'s
+  finite domain); a defensive iteration cap throws if the fixpoint
+  somehow fails to converge, rather than looping forever.
+
+  ADR-2607061200 query-language follow-up (this landing): `:in` (extra
+  positional query parameters beyond `db`/`visible?`), predicate/function
+  `:where` clauses (`[(> ?age 18)]`, `[(str ?a ?b) ?c]`, a WHITELISTED
+  function registry -- see `query-fns` -- not arbitrary code execution),
+  and `or`/`or-join` (union across alternative derivations).
+
+  **Execution strategies** (ADR-2608021000, ported from arrangement): a join
+  step issues ONE scan per distinct substituted pattern rather than one per
+  binding; with a caller-supplied `:clause-cardinality` hint it may instead
+  read a small relation once and hash join it; and variables no remaining
+  clause and no `:find` element reads are pruned between steps. Every one of
+  these is a strategy and none is allowed to change an answer -- the ported
+  test suites assert each against the path it replaces.
+
+  **`:limit` is NOT pushed into the join.** An ordered drive -- walking the
+  ordering clause's distinct values through the value-ordered index and
+  stopping at `:limit` -- was landed upstream and then REVERTED there
+  (`arrangement` a98588c), because it re-derives every remaining clause once
+  per value group, including the clauses that do not depend on the driver at
+  all. On LDBC IC02 that turned 882 rows into 6.5M of pure repetition to avoid
+  joining 7,355, and the harness went from ~4-5 minutes of CPU to over 15.
+  The equivalence tests all still passed: what broke was cost, and a small
+  fixture has too few distinct values for the pathology to appear. The correct
+  shape is a join reordering (evaluate driver-independent clauses once, run
+  only the dependent ones per group, semi-join the two) and is not written
+  yet. `:limit` therefore applies to the finished projection.
+
+  **Known gaps, stated rather than implied** (see also the README):
+  `not-join` (generalized negation over a multi-clause conjunction with
+  explicit variable scoping, vs. today's single-triple `not`) is NOT
+  implemented. `pull` does not exist -- projection is positional `:find`
+  vectors only. Stratified negation is NOT implemented, which is why
+  `(not (rule-name ...))` throws instead of guessing. There is no
+  `:with`, no `:find` pull/collection/scalar shorthand (`?x .`, `[?x ...]`).
+  There is no query PLANNER: `:where` clauses join strictly left-to-right in
+  the order written, and `:clause-cardinality` is a hint a caller's own
+  planner supplies, not one this library computes."
+  (:require [datalog.query :as query]
+            [datalog.index :as index]
+            [datom.source :as ds]
+            [kotoba.lang.text :as str]
+            [clojure.set :as set]))
+
+(def ^:dynamic ^:private *pattern-source?*
+  "Whether the db of the query currently running satisfies `IPatternSource`.
+
+  `scan*` used to ask that question with `satisfies?` on every call, and `q`
+  calls `scan*` once per DISTINCT SUBSTITUTED PATTERN -- 882 times for one
+  clause of LDBC IC02 alone, roughly 1,800 times for the whole query. Measured
+  2026-08-14: `satisfies?` on a materialized-map db costs 11,305 ns and the keyed
+  index read it guards costs 210 ns, so the check was 54x the work it protected
+  and 89% of that query
+  (kotobase-peer bench/results/2026-08-14-the-residue-is-a-protocol-check.edn).
+
+  The type does not change during a query, so `q` decides once and binds this.
+  `nil` means nobody decided -- a direct call to an internal, or work that
+  escaped the binding -- and `scan*` falls back to asking, so the answer is
+  never wrong, only slower."
+  nil)
+
+(defn- scan*
+  "Resolve one clause pattern against `db`, which may be EITHER a materialized
+  db (the historical argument) or anything satisfying
+  `datom.source/IPatternSource`.
+
+  This one function is what puts the whole Datalog engine on top of the seam.
+  Every clause resolution in this namespace goes through it, so swapping a
+  cursor source in for a materialized db changes the cost of a join without
+  changing a line of join logic — which is the point of having had a seam at
+  all. `visible?` is applied identically in both branches; a source that
+  filtered differently from `datalog.query/query` would let a negation
+  observe a fact a positive clause cannot see."
+  [db pattern visible?]
+  (if (if (some? *pattern-source?*) *pattern-source?* (satisfies? ds/IPatternSource db))
+    (into #{} (filter visible?) (ds/scan db pattern))
+    ;; a vector, not a set: an index scan yields distinct quads, and every
+    ;; consumer here maps, keeps or seqs over the result (iteration 41)
+    (query/query-vec db pattern visible?)))
+
+(defn- scan-range*
+  "Resolve `[lo, hi)` on `attr` against `db`. Prefers `IRangeSource` so a
+  cursor or lake source can prune; degrades to an attribute scan plus
+  `in-range?` on any other `IPatternSource`; uses `query-range` on a
+  materialized index map."
+  [db attr lo hi opts visible?]
+  (cond
+    (satisfies? ds/IRangeSource db)
+    (into #{} (filter visible?) (ds/scan-range db attr lo hi opts))
+    (if (some? *pattern-source?*) *pattern-source?* (satisfies? ds/IPatternSource db))
+    (into #{}
+          (filter (fn [q] (and (visible? q) (ds/in-range? (:o q) lo hi opts))))
+          (ds/scan db [nil attr nil]))
+    :else
+    (query/query-range db attr lo hi visible? opts)))
+
+(defn- lvar?
+  "True for a Datalog logic variable: a symbol whose name starts with `?`.
+  `_` is the wildcard, not a variable -- it never binds."
+  [x]
+  (and (symbol? x) (not= x '_) (= \? (first (name x)))))
+
+(defn- wildcard? [x] (= x '_))
+
+(defn- substitute
+  "`clause` position -> concrete `datalog.query` pattern position: a
+  wildcard or an unbound variable becomes `nil` (query's own wildcard);
+  a bound variable becomes its current value; anything else passes through
+  as the literal it already is."
+  [term binding]
+  (cond
+    (wildcard? term) nil
+    (lvar? term)     (get binding term)
+    :else            term))
+
+(defn- unify-positional
+  "Extend `binding` with `terms`'s variables against one matched `values`
+  seq (same order/count as `terms`). Returns the extended binding, or nil
+  if a variable bound earlier in this same clause conflicts with another
+  position's value (e.g. `[?x :likes ?x]` against a row where s != o).
+  Used for both triple clauses (`terms`/`values` are `[e a v]`/`[s p o]`)
+  and rule invocations (`terms`/`values` are the invocation's args/a
+  matched tuple in the rule's own param order).
+
+  Walked by index rather than by `(map vector terms values)`. That form reads
+  better and allocated a lazy seq plus one pair vector per TERM on every matched
+  row -- four objects a row for a triple clause, on the hottest path here.
+  Measured 2026-08-14 over 361,246 rows of the LDBC `hasCreator` clause shape,
+  with both forms asserted to return equal bindings: 316.3 ns a row for the
+  `map vector` form against 100.5 ns for this one.
+
+  End to end that reaches a single-clause scan as about -12% and a three-clause
+  LDBC join as -2% to -5%
+  (kotobase-peer bench/results/2026-08-14-unify-indexed-landed.edn).
+
+  `terms` is a clause vector for a triple and a rule invocation's arg seq for a
+  rule, so neither is assumed indexed; a seq is converted once per call rather
+  than once per term."
+  [binding terms values]
+  (let [tv (if (vector? terms) terms (vec terms))
+        vv (if (vector? values) values (vec values))
+        n (count tv)]
+    (loop [i 0 b binding]
+      (if (or (nil? b) (== i n))
+        b
+        (let [term (nth tv i)]
+          (cond
+            (or (wildcard? term) (not (lvar? term))) (recur (inc i) b)
+            (contains? b term) (if (= (get b term) (nth vv i)) (recur (inc i) b) nil)
+            :else (recur (inc i) (assoc b term (nth vv i)))))))))
+
+(defn- not-clause?
+  "`(not [e a v])` -- a `:where` element that isn't itself a triple pattern
+  but a negation of one. Distinguished from a positive `[e a v]` clause by
+  being a seq (list) headed by the symbol `not`, vs. a vector."
+  [x]
+  (and (seq? x) (= 'not (first x))))
+
+(defn- negated-pattern [not-clause] (second not-clause))
+
+(def ^:private reserved-clause-heads
+  "Symbols that head a special-form clause (`not`/`or`/`or-join`) rather
+  than a rule invocation -- `rule-invocation?` excludes all of these, not
+  just `not` (a clause `(or ...)` is not an attempted call to a rule
+  literally named `or`)."
+  #{'not 'or 'or-join 'and})
+
+(defn- rule-invocation?
+  "`(rule-name ?arg ...)` -- a `:where`/rule-body element that's neither a
+  triple-pattern vector nor a special-form clause (`not`/`or`/`or-join`),
+  but an invocation of a name declared in `:rules`."
+  [x]
+  (and (seq? x) (symbol? (first x)) (not (contains? reserved-clause-heads (first x)))))
+
+(defn- rule-name [invocation] (first invocation))
+(defn- rule-args [invocation] (vec (rest invocation)))
+
+(defn- clause-lvars [pattern] (into #{} (filter lvar?) pattern))
+
+(defn- cmp< [a b] (neg? (compare a b)))
+(defn- cmp> [a b] (pos? (compare a b)))
+(defn- cmp<= [a b] (not (pos? (compare a b))))
+(defn- cmp>= [a b] (not (neg? (compare a b))))
+
+(defn- db-arg? [x] (= '$ x))
+
+(defn- norm-collection-key [x]
+  (cond
+    (keyword? x) (if-let [ns* (namespace x)]
+                   (str ns* "/" (name x))
+                   (name x))
+    :else x))
+
+(defn- ds-contains? [coll item]
+  (let [item' (norm-collection-key item)]
+    (if (set? coll)
+      (boolean (some #(= item' (norm-collection-key %)) coll))
+      (contains? coll item))))
+
+(defn- ds-get-else [db e a default]
+  (let [a' (norm-collection-key a)
+        os (get (index/entity-attrs db e) a')]
+    (if (seq os)
+      (first os)
+      default)))
+
+(defn- ds-missing? [db e a]
+  (let [a' (norm-collection-key a)]
+    (not (contains? (index/entity-attrs db e) a'))))
+
+(def ^:private query-fns
+  "The WHITELISTED function registry predicate/function `:where` clauses
+  may call (`[(fn-sym arg...)]` / `[(fn-sym arg...) result-var]`) --
+  deliberately a fixed whitelist, not arbitrary code execution: a query is
+  caller-supplied data in this codebase's threat model, same reasoning as
+  `visible?`/rule invocations being data too, never `eval`'d source."
+  {'<              cmp<
+   '>              cmp>
+   '<=             cmp<=
+   '>=             cmp>=
+   '=              =
+   'not=           not=
+   '+              +
+   '-              -
+   '*              *
+   '/              /
+   'str            str
+   'count          count
+   'ground         identity
+   ;; String predicates. Deliberately NOT regex: a caller-supplied pattern is
+   ;; a ReDoS vector, and a query is caller-supplied data in this codebase's
+   ;; threat model (the same reasoning that makes this a whitelist at all).
+   ;; These three are linear in their inputs and cannot backtrack.
+   'starts-with?   str/starts-with?
+   'ends-with?     str/ends-with?
+   'includes?      str/includes?
+   'string<?       (fn [a b] (neg? (compare (str a) (str b))))
+   'lower-case     str/lower
+   'upper-case     str/upper
+   'contains?      ds-contains?
+   'get-else       ds-get-else
+   'missing?       ds-missing?})
+
+(defn- predicate-clause?
+  "`[(fn-sym arg...)]` or `[(fn-sym arg...) result-var]` -- a `:where`
+  element that's a VECTOR whose first element is itself a seq (the
+  function-call form), distinguishing it from a plain `[e a v]` triple
+  pattern (whose first element is never a seq)."
+  [x]
+  (and (vector? x) (seq? (first x))))
+
+(defn- clause-fn-call [pred-clause] (first pred-clause))
+(defn- clause-result-binding [pred-clause] (second pred-clause))
+(defn- fn-call-sym [fn-call] (first fn-call))
+(defn- fn-call-args [fn-call] (vec (rest fn-call)))
+
+(def ^:private range-pred-ops '#{< > <= >=})
+
+(defn- range-clause?
+  "A fused value-interval clause produced by `fuse-value-ranges`."
+  [x]
+  (and (map? x) (contains? x :range/a)))
+
+(defn- range-pred-on
+  "If `clause` is `[(op ?v ground)]` with a comparison op, describe it."
+  [clause]
+  (when (and (predicate-clause? clause)
+             (nil? (clause-result-binding clause)))
+    (let [call (clause-fn-call clause)
+          op (fn-call-sym call)
+          args (fn-call-args call)]
+      (when (and (contains? range-pred-ops op)
+                 (= 2 (count args))
+                 (lvar? (first args))
+                 (not (lvar? (second args)))
+                 (not (wildcard? (second args))))
+        {:var (first args) :op op :bound (second args)}))))
+
+(defn- apply-range-op
+  [bounds {:keys [op bound]}]
+  (case op
+    >  (assoc bounds :lo bound :lo-open? true)
+    >= (assoc bounds :lo bound :lo-open? false)
+    <  (assoc bounds :hi bound :hi-open? true)
+    <= (assoc bounds :hi bound :hi-open? false)))
+
+(defn- fuse-value-ranges
+  "Rewrite `:where` so `[?e attr ?v]` plus later comparison predicates on
+  `?v` become one range clause, and those predicates are dropped.
+
+  Only fuses when `attr` is ground and the comparison's other argument is
+  ground. Unfusable clauses pass through unchanged, so a query with no
+  range predicates is byte-identical after this pass."
+  [where]
+  (let [where (vec where)
+        triples (vec (keep-indexed
+                      (fn [i c]
+                        (when (and (vector? c)
+                                   (not (predicate-clause? c))
+                                   (= 3 (count c)))
+                          (let [[e a v] c]
+                            (when (and (lvar? v)
+                                       (not (lvar? a))
+                                       (not (wildcard? a)))
+                              {:i i :e e :a a :v v}))))
+                      where))
+        by-var (reduce (fn [m t]
+                         (if (contains? m (:v t)) m (assoc m (:v t) t)))
+                       {} triples)
+        pred-at (into {}
+                      (keep-indexed
+                       (fn [i c]
+                         (when-let [p (range-pred-on c)]
+                           (when-let [t (get by-var (:var p))]
+                             (when (> i (:i t))
+                               [i p]))))
+                       where))]
+    (if (empty? pred-at)
+      where
+      (let [preds-by-var (reduce-kv (fn [m _ p]
+                                      (update m (:var p) (fnil conj []) p))
+                                    {} pred-at)
+            used-pred (set (keys pred-at))
+            fused-i (into #{} (keep (fn [[v t]]
+                                      (when (contains? preds-by-var v) (:i t)))
+                                    by-var))]
+        (into []
+              (keep-indexed
+               (fn [i c]
+                 (cond
+                   (contains? used-pred i) nil
+                   (contains? fused-i i)
+                   (let [t (first (filter #(= i (:i %)) triples))
+                         bounds (reduce apply-range-op
+                                        {:lo nil :hi nil :lo-open? false :hi-open? true}
+                                        (get preds-by-var (:v t)))]
+                     {:range/e (:e t)
+                      :range/a (:a t)
+                      :range/v (:v t)
+                      :range/lo (:lo bounds)
+                      :range/hi (:hi bounds)
+                      :range/lo-open? (:lo-open? bounds)
+                      :range/hi-open? (:hi-open? bounds)})
+                   :else c)))
+              where)))))
+
+(defn- composite-clause? [x] (and (map? x) (contains? x :composite/e)))
+
+(declare group-cut form-lvars agg-find? agg-var)
+
+(defn- fuse-composites
+  "Rewrite two ADJACENT clauses on the same fresh entity into one lookup
+  through the group order (`datalog.index/grouped-values`):
+
+      [?e g ?gv] [?e a ?av]           ?gv bound (or ground), ?e fresh
+      [?e g ?gv] {:range/e ?e ...}    the same with a value range on a
+
+  becomes `{:composite/e ?e :composite/g g :composite/gv gv :composite/a a
+  :composite/v av ...}`. `join-clause` answers it from the pair's sorted
+  entries under gv: a point when av is bound or ground, a cut when it is a
+  range, all of them when it is free -- one lookup per binding instead of
+  every `[?e g gv]` entity walked and filtered on `a`. Measured 2026-09-12
+  (ayatori iteration 45, LDBC IC05 on the full SF1): a reached person's
+  memberships joined after a date, and their posts in a given forum, were
+  ~300 keyed lookups each per person before this; the group order answers
+  both in O(log n + hits). Bound-ness is tracked in clause order from the
+  inputs, so a fusion never reads a variable no earlier clause bound."
+  ([where initial-binding] (fuse-composites where initial-binding nil))
+  ([where initial-binding find]
+  (let [where (vec where)
+        triple? (fn [c] (and (vector? c) (not (predicate-clause? c)) (= 3 (count c))))
+        ground-attr? (fn [a] (and (not (lvar? a)) (not (wildcard? a))))
+        ;; COUNT PUSHDOWN: when `:find` wants exactly `(count ?e)` of the entity a
+        ;; LAST-clause composite binds, and ?e appears in no other clause and
+        ;; nowhere else in :find, the lookup can answer with one binding per
+        ;; input weighted by its number of entries instead of one per entry.
+        ;; LDBC IC05 (iteration 47): ~200k (forum, post) bindings materialized
+        ;; for 20 rows of counts.
+        count-var (when (and find (= 1 (count (filter agg-find? find))))
+                    (let [a (first (filter agg-find? find))]
+                      (when (and (= 'count (first a)) (lvar? (agg-var a))
+                                 (not (some #{(agg-var a)} (remove agg-find? find))))
+                        (agg-var a))))
+        occurrences (fn [v] (count (filter #(contains? (form-lvars %) v) where)))]
+    (loop [i 0 bound (set (keys initial-binding)) out []]
+      (if (>= i (count where))
+        out
+        (let [c (nth where i)
+              n (nth where (inc i) nil)
+              fused
+              (when (and (triple? c) n)
+                (let [[e g gv] c]
+                  (when (and (lvar? e) (not (contains? bound e)) (ground-attr? g)
+                             (or (not (lvar? gv)) (contains? bound gv)) (not (wildcard? gv)))
+                    (cond
+                      (and (triple? n) (= e (first n)) (ground-attr? (second n)) (not (wildcard? (nth n 2))))
+                      {:composite/e e :composite/g g :composite/gv gv :composite/a (second n) :composite/v (nth n 2)}
+                      (and (range-clause? n) (= e (:range/e n)) (ground-attr? (:range/a n)))
+                      {:composite/e e :composite/g g :composite/gv gv :composite/a (:range/a n) :composite/v (:range/v n)
+                       :composite/lo (:range/lo n) :composite/hi (:range/hi n)
+                       :composite/lo-open? (boolean (:range/lo-open? n)) :composite/hi-open? (boolean (:range/hi-open? n))
+                       :composite/range? true}
+                      :else nil))))]
+          (if fused
+            (let [last? (= (+ i 2) (count where))
+                  ;; the entity var must be the composite's own and appear in these two clauses only
+                  fused (if (and last? count-var (= count-var (:composite/e fused))
+                               (= 2 (occurrences count-var))
+                               (not (:composite/range? fused))
+                               (or (not (lvar? (:composite/v fused))) (contains? bound (:composite/v fused))))
+                          (assoc fused :composite/count-into count-var)
+                          fused)]
+              (recur (+ i 2) (into bound (form-lvars fused)) (conj out fused)))
+            (recur (inc i) (into bound (form-lvars c)) (conj out c)))))))))
+
+(defn- eval-fn-arg [db binding x]
+  (if (db-arg? x) db (substitute x binding)))
+
+(defn- eval-fn-call [db binding fn-call]
+  (let [fsym (fn-call-sym fn-call)
+        f (get query-fns fsym)]
+    (when-not f
+      (throw (ex-info "datalog.core: unknown or disallowed function in query clause -- see query-fns for the whitelist"
+                      {:fn fsym})))
+    (apply f (map #(eval-fn-arg db binding %) (fn-call-args fn-call)))))
+
+(defn- and-clause?
+  "A multi-clause branch inside `or`/`or-join`, written the way Datomic writes
+  it: `(and [?e :a 1] [?e :b 2])`.
+
+  A branch used to be one clause, which meant a branch could not both BIND a
+  variable and CONSTRAIN it -- so `(or-join [?e] (and [?e :age ?a] [(> ?a 18)]))`
+  was inexpressible and every comparison inside a disjunction had to be
+  refused. `and` is the form that makes a branch a conjunction; it is only
+  meaningful inside `or`/`or-join`, where a branch position exists."
+  [x] (and (seq? x) (= 'and (first x))))
+
+(defn- and-clauses [x] (vec (rest x)))
+
+(defn- or-clause? [x] (and (seq? x) (= 'or (first x))))
+(defn- or-branches [x] (vec (rest x)))
+(defn- or-join-clause? [x] (and (seq? x) (= 'or-join (first x))))
+(defn- or-join-vars [x] (vec (second x)))
+(defn- or-join-branches [x] (vec (rest (rest x))))
+
+(defn- check-clause-safety!
+  "Static pass over a `:where` vector or a rule body, in order (optionally
+  seeded with `initial-bound`, used to check an `or`/`or-join` branch
+  against whatever's already bound OUTSIDE it): every lvar inside a
+  `(not [e a v])` clause, or every ARG lvar inside a predicate/function
+  clause, must already have been bound by an earlier POSITIVE clause (a
+  plain triple, a rule invocation, or a function clause's own result
+  binding -- all bind the same way). Throws on the first violation
+  instead of running an unsafe (unboundedly enumerable) negation/
+  function-call, or if a `not`'s negated form isn't a plain triple
+  pattern at all (negating a rule invocation isn't supported -- see ns
+  docstring). `not`/predicate clauses never contribute new bindings; a
+  function clause's `result-var` does. `or` checks every branch against
+  the SAME outer `bound-so-far` (branches are alternatives, not
+  sequential) and does not itself extend `bound-so-far` (branches aren't
+  required to bind the same variables); `or-join` additionally makes its
+  declared shared-vars available afterward."
+  ([clauses] (check-clause-safety! clauses #{}))
+  ([clauses initial-bound]
+   (reduce (fn [bound-so-far clause]
+             (cond
+               (not-clause? clause)
+               (let [pattern (negated-pattern clause)]
+                 (when-not (vector? pattern)
+                   (throw (ex-info "datalog.core: negation of a rule invocation is not supported -- only (not [e a v]) triple patterns"
+                                   {:clause clause})))
+                 (let [unbound (set/difference (clause-lvars pattern) bound-so-far)]
+                   (when (seq unbound)
+                     (throw (ex-info "datalog.core: unsafe negation -- variable(s) not bound by an earlier positive clause"
+                                     {:clause clause :unbound unbound})))
+                   bound-so-far))
+
+               (predicate-clause? clause)
+               (let [fn-call (clause-fn-call clause)
+                     result-binding (clause-result-binding clause)
+                     unbound (set/difference (clause-lvars (fn-call-args fn-call)) bound-so-far)]
+                 ;; Checked HERE and not only in `eval-fn-call`, which never
+                 ;; runs when no binding reaches the clause: a query naming a
+                 ;; function that does not exist used to succeed silently
+                 ;; whenever the result set was empty, which is the worst place
+                 ;; to be lenient — it is exactly the case where a typo looks
+                 ;; like a correct answer of "nothing matched".
+                 (when-not (contains? query-fns (fn-call-sym fn-call))
+                   (throw (ex-info "datalog.core: unknown or disallowed function in query clause -- see query-fns for the whitelist"
+                                   {:fn (fn-call-sym fn-call) :clause clause})))
+                 (when (seq unbound)
+                   (throw (ex-info "datalog.core: unsafe function/predicate clause -- variable(s) not bound by an earlier clause"
+                                   {:clause clause :unbound unbound})))
+                 (if (lvar? result-binding) (conj bound-so-far result-binding) bound-so-far))
+
+               (or-clause? clause)
+               ;; An `and` branch is checked as the conjunction it is, so a
+               ;; clause inside it may rely on one earlier in the SAME branch.
+               (do (doseq [branch (or-branches clause)]
+                     (check-clause-safety! (if (and-clause? branch) (and-clauses branch) [branch])
+                                           bound-so-far))
+                   bound-so-far)
+
+               (or-join-clause? clause)
+               (do (doseq [branch (or-join-branches clause)]
+                     (check-clause-safety! (if (and-clause? branch) (and-clauses branch) [branch])
+                                           bound-so-far))
+                   (into bound-so-far (or-join-vars clause)))
+
+               :else (into bound-so-far (clause-lvars clause))))
+           initial-bound
+           clauses)))
+
+(def ^:private hash-join-row-budget
+  "Prefer ONE broad scan plus an in-memory hash join over N keyed scans when
+  the clause's whole relation is no larger than this multiple of N.
+
+  Both sides of that comparison are real costs. A keyed scan is cheap per row
+  but has a fixed cost per call -- and over `datom.source/IPatternSource` it
+  may be a network round trip -- so N of them is N fixed costs. A broad scan
+  is one fixed cost and `card` rows. Below the budget the single scan wins.
+
+  4 is where the measured workload sits on either side without being near the
+  line (kotobase-peer bench/results/2026-08-01-ic09-diagnosis.edn, LDBC SNB
+  SF1 subset): `[?msg \"hasCreator\" ?f2]` is 7,355 rows against <=9,892
+  distinct keys, so it hashes; `[?f1 \"knows\" ?f2]` is 361,246 rows against
+  882 keys, so it does not -- and it must not, because that broad scan takes
+  a second on its own. A starting point chosen to put those two on opposite
+  sides, not a tuned constant."
+  4)
+
+(defn- broad-pattern
+  "The clause with every variable and wildcard nil -- its literal constants
+  only. Every substituted pattern for this clause is a specialization of it,
+  so one scan of this returns a superset of what all of them would."
+  [clause]
+  (mapv (fn [t] (if (or (lvar? t) (wildcard? t)) nil t)) clause))
+
+(defn- bound-positions
+  "Indices where a substituted pattern pinned a value the broad pattern left
+  open -- the columns a hash index for this pattern has to be keyed on."
+  [pattern clause]
+  (let [broad (broad-pattern clause)]
+    (into [] (keep-indexed (fn [i v] (when (and (some? v) (nil? (nth broad i))) i))) pattern)))
+
+(defn- hash-join-rows
+  "One broad scan, indexed by whichever columns the substituted patterns
+  pinned, then a lookup per distinct pattern. Groups whose patterns pin
+  DIFFERENT columns each get their own index -- that only happens when
+  bindings reaching this clause carry different variables (an `or` branch,
+  say), and it stays correct rather than needing to be excluded."
+  [groups clause db visible?]
+  (let [rows (into [] (map (fn [q] [(:s q) (:p q) (:o q)])) (scan* db (broad-pattern clause) visible?))
+        indexes (into {}
+                      (map (fn [positions]
+                             [positions (group-by (fn [r] (mapv #(nth r %) positions)) rows)]))
+                      (distinct (map (fn [[pattern _]] (bound-positions pattern clause)) groups)))]
+    (into #{}
+          (mapcat (fn [[pattern group]]
+                    (let [positions (bound-positions pattern clause)
+                          key (mapv #(nth pattern %) positions)
+                          matched (if (seq positions)
+                                    (get (get indexes positions) key)
+                                    rows)]
+                      (mapcat (fn [binding]
+                                (keep #(unify-positional binding clause %) matched))
+                              group))))
+          groups)))
+
+(defn- keyed-fast-path
+  "The two keyed shapes straight off the index, or nil when the clause is
+  not one of them (the caller then takes the general path):
+
+    [?e a ?v]  with a ground and ?e bound in EVERY binding  -- :eavt point
+    [?e a v]   with a ground, v ground or bound in every binding, ?e free
+               -- :avet point
+
+  The general path substitutes each binding into a pattern, groups equal
+  patterns, scans each once into a vector of quad maps and unifies each
+  row back: four allocations a row before the set. On a five-clause keyed
+  join over 882 friends (LDBC IS3 on the full SF1) that was 1.3 us per
+  binding-clause against 0.16 for a hand-written walk of the same index
+  (ayatori iteration 42, 2026-09-12). Here a binding reaches its values in
+  one index lookup and extends itself in place; `visible?` still sees
+  every quad as a map. Only on a materialized db -- a pattern source keeps
+  the general path, whose scans are the seam."
+  [bindings clause db visible?]
+  (when (and (vector? clause) (= 3 (count clause))
+             (not (if (some? *pattern-source?*) *pattern-source?* (satisfies? ds/IPatternSource db)))
+             (seq bindings))
+    (let [[e a v] clause]
+      (when (and (not (lvar? a)) (not (wildcard? a)) (lvar? e))
+        (cond
+          ;; entity bound: extend by its values of `a`
+          (every? #(contains? % e) bindings)
+          (into #{}
+                (mapcat (fn [b]
+                          (let [s (get b e)]
+                            (keep (fn [o]
+                                    (when (visible? {:s s :p a :o o})
+                                      (cond (wildcard? v) b
+                                            (lvar? v) (if (contains? b v)
+                                                        (when (= (get b v) o) b)
+                                                        (assoc b v o))
+                                            :else (when (= v o) b))))
+                                  (get (index/entity-attrs db s) a)))))
+                bindings)
+          ;; value ground or bound, entity free: the subjects holding it
+          (and (not (wildcard? v))
+               (or (not (lvar? v)) (every? #(contains? % v) bindings)))
+          (into #{}
+                (mapcat (fn [b]
+                          (let [o (if (lvar? v) (get b v) v)]
+                            (keep (fn [s] (when (visible? {:s s :p a :o o}) (assoc b e s)))
+                                  (index/by-predicate-value db a o)))))
+                bindings)
+          :else nil)))))
+
+(declare join-clause)
+
+(defn- join-branch
+  "One `or`/`or-join` branch against `bindings`: a conjunction when it is
+  `(and ...)`, a single clause otherwise. Threading the bindings through the
+  conjunction is what lets a branch bind a variable in one clause and constrain
+  it in the next."
+  [bindings branch db visible? extension-for cardinality]
+  (if (and-clause? branch)
+    (reduce (fn [bs c] (join-clause bs c db visible? extension-for cardinality))
+            bindings
+            (and-clauses branch))
+    (join-clause bindings branch db visible? extension-for cardinality)))
+
+(defn- join-clause
+  "One step of the join: for every binding so far,
+  - `(not [e a v])`: drop the binding iff the fully-substituted pattern
+    has ANY `visible?`-filtered match against `db` -- keep it otherwise.
+  - `(rule-name ?arg ...)`: resolve against `(extension-for rule-name)`
+    (a set of tuples in that rule's own param order, supplied by the
+    fixpoint driver or, for a rule-free query, `q` itself) exactly like a
+    triple clause resolves against `db`.
+  - `[(fn-sym arg...)]`: keep the binding iff the (whitelisted, see
+    `query-fns`) function call returns truthy -- a predicate, binds
+    nothing new.
+  - `[(fn-sym arg...) result-var]`: compute the function call and unify
+    `result-var` against it -- a function clause, binds `result-var`.
+  - `(or clause1 clause2 ...)`: union of resolving EACH branch against
+    the current bindings independently (an alternative/OR derivation,
+    not a conjunction).
+  - `(or-join [?shared...] clause1 clause2 ...)`: like `or`, but only
+    `?shared` propagates back out of each branch (see `or-join-step`) --
+    branches may use their own internal variable names for everything
+    else.
+  - `[e a v]`: resolve against `db` via `datalog.query/query`.
+  Triple and negation cases query through the same `visible?`-filtered
+  `datalog.query/query`, so a negation can never observe a fact
+  `visible?` would hide (see the ns docstring)."
+  ([bindings clause db visible? extension-for]
+   (join-clause bindings clause db visible? extension-for nil))
+  ([bindings clause db visible? extension-for cardinality]
+  (cond
+    (composite-clause? clause)
+    (let [{e :composite/e g :composite/g gv-term :composite/gv a :composite/a v :composite/v
+           lo :composite/lo hi :composite/hi lo-open? :composite/lo-open? hi-open? :composite/hi-open? range? :composite/range?} clause
+          groups (index/grouped-values db g a)
+          count-into (:composite/count-into clause)
+          term-val (fn [b t] (if (lvar? t) (get b t) t))]
+      (into #{}
+            (mapcat (fn [b]
+                      (let [gv (term-val b gv-term)]
+                        (when-let [ss (get groups gv)]
+                          (let [entries (cond
+                                          range? (group-cut ss lo hi lo-open? hi-open? :asc)
+                                          (or (not (lvar? v)) (contains? b v))
+                                          (let [x (term-val b v)]
+                                            (subseq ss >= [x :datalog.index/lo] <= [x :datalog.index/hi]))
+                                          :else (seq ss))]
+                            (if count-into
+                              ;; one binding, weighted by the visible entries (none -> no binding)
+                              (let [n (count (filter (fn [[val ent]] (and (visible? {:s ent :p g :o gv}) (visible? {:s ent :p a :o val}))) entries))]
+                                (when (pos? n) [(assoc b ::weight n)]))
+                              (keep (fn [[val ent]]
+                                      (when (and (visible? {:s ent :p g :o gv}) (visible? {:s ent :p a :o val}))
+                                        (let [b (assoc b e ent)]
+                                          (if (lvar? v)
+                                            (if (contains? b v) (when (= (get b v) val) b) (assoc b v val))
+                                            b))))
+                                    entries))))))
+            bindings)))
+
+    (not-clause? clause)
+    (let [pattern (negated-pattern clause)]
+      (into #{}
+            (remove (fn [binding]
+                      (seq (scan* db (mapv #(substitute % binding) pattern) visible?))))
+            bindings))
+
+    (rule-invocation? clause)
+    (let [args (rule-args clause)
+          extension (extension-for (rule-name clause))]
+      (into #{}
+            (mapcat (fn [binding]
+                      (let [substituted (mapv #(substitute % binding) args)
+                            matches? (fn [tuple]
+                                       (every? true? (map (fn [want got] (or (nil? want) (= want got)))
+                                                           substituted tuple)))]
+                        (keep #(unify-positional binding args %)
+                              (filter matches? extension)))))
+            bindings))
+
+    (predicate-clause? clause)
+    (let [fn-call (clause-fn-call clause)
+          result-binding (clause-result-binding clause)]
+      (if result-binding
+        (into #{}
+              (keep (fn [binding]
+                      (unify-positional binding [result-binding] [(eval-fn-call db binding fn-call)])))
+              bindings)
+        (into #{} (filter (fn [binding] (eval-fn-call db binding fn-call))) bindings)))
+
+    (or-clause? clause)
+    (into #{} (mapcat (fn [branch] (join-branch bindings branch db visible? extension-for cardinality)))
+          (or-branches clause))
+
+    (or-join-clause? clause)
+    (let [shared-vars (set (or-join-vars clause))
+          branches (or-join-branches clause)]
+      (into #{}
+            (mapcat (fn [binding]
+                      (into #{}
+                            (mapcat (fn [branch]
+                                      (into #{}
+                                            (map (fn [extended]
+                                                   (reduce (fn [b v]
+                                                             (if (contains? extended v) (assoc b v (get extended v)) b))
+                                                           binding
+                                                           shared-vars)))
+                                            (join-branch #{binding} branch db visible? extension-for cardinality))))
+                            branches)))
+            bindings))
+
+    (range-clause? clause)
+    (let [groups (group-by (fn [binding]
+                             {:a (substitute (:range/a clause) binding)
+                              :lo (substitute (:range/lo clause) binding)
+                              :hi (substitute (:range/hi clause) binding)
+                              :e (substitute (:range/e clause) binding)})
+                           bindings)
+          terms [(:range/e clause) (:range/a clause) (:range/v clause)]
+          opts {:lo-open? (:range/lo-open? clause)
+                :hi-open? (:range/hi-open? clause)}]
+      ;; When the entity is already BOUND, the range is a question about one
+      ;; entity's values of `a`, not about the attribute's whole value domain:
+      ;; a keyed scan of `[e a _]` and an `in-range?` test. The relation-wide
+      ;; `scan-range*` is right only for an open entity. Measured 2026-09-11
+      ;; (ayatori iteration 18, LDBC SNB IC09 on the SF1 subset): with ?msg
+      ;; bound from the join, one `scan-range*` per DISTINCT message walked all
+      ;; 86,932 creationDate values each time -- the fused range made the query
+      ;; slower than the unfused filter it replaced, which is the opposite of
+      ;; what the fusion is for.
+      (into #{}
+            (mapcat (fn [[{:keys [a lo hi e]} group]]
+                      (let [rows (if (some? e)
+                                   (filter #(ds/in-range? (:o %) lo hi opts)
+                                           (scan* db [e a nil] visible?))
+                                   (scan-range* db a lo hi opts visible?))]
+                        (mapcat (fn [binding]
+                                  (keep #(unify-positional binding terms
+                                                           [(:s %) (:p %) (:o %)])
+                                        rows))
+                                group))))
+            groups))
+
+    :else
+    ;; One `scan*` per DISTINCT substituted pattern, not one per binding.
+    ;;
+    ;; Measured (kotobase-peer bench/results/2026-08-01-ic09-diagnosis.edn,
+    ;; ADR-2608021000): LDBC SNB IC09's two-hop expansion spent 35.6 s of its
+    ;; 45.3 s inside this function. The planner was not the problem -- it chose
+    ;; the right clause order, and its cardinality probes were 8% of the time.
+    ;; The cost was that a step carrying ~31,750 bindings issued ~31,750
+    ;; separate `scan*` calls, each building its own result set and running
+    ;; `visible?` over it, while those bindings substitute down to at most a
+    ;; few thousand distinct patterns.
+    ;;
+    ;; Bindings sharing a substituted pattern now share one scan and are
+    ;; unified against its rows individually, so the returned set is identical
+    ;; row for row. This changes how often the source is asked, not what is
+    ;; asked or what comes back -- which matters most for `IPatternSource`,
+    ;; where every scan may be a network round trip.
+    (let [fast (keyed-fast-path bindings clause db visible?)]
+     (if (some? fast)
+      fast
+     (let [groups (group-by (fn [binding] (mapv #(substitute % binding) clause)) bindings)
+          card (get cardinality clause)]
+      ;; ONE broad scan plus a hash join when the clause's whole relation is
+      ;; small relative to the number of keyed scans it would replace;
+      ;; otherwise a keyed scan per distinct pattern.
+      ;;
+      ;; Batching to one scan per distinct pattern (the previous change) took
+      ;; IC09's two-hop join from 35.6 s to 2.1 s, but left it index-nested-
+      ;; loop against Neo4j's 246 ms on the same data. The remaining shape is
+      ;; a step that issues thousands of keyed scans against a relation with
+      ;; only a few thousand rows in it -- reading the whole thing once is
+      ;; strictly less work than reading most of it in pieces.
+      ;;
+      ;; `cardinality` is the planner's own per-clause row estimate, which it
+      ;; already computes to order the clauses; without it (rule bodies, or a
+      ;; caller that did not plan) this stays on the keyed path, which is the
+      ;; safe default -- a broad scan of a large relation is exactly the
+      ;; mistake the budget exists to avoid.
+      (if (and card (<= card (* hash-join-row-budget (count groups))))
+        (hash-join-rows groups clause db visible?)
+        (into #{}
+              (mapcat (fn [[pattern group]]
+                        (let [rows (scan* db pattern visible?)]
+                          (mapcat (fn [binding]
+                                    (keep #(unify-positional binding clause [(:s %) (:p %) (:o %)])
+                                          rows))
+                                  group))))
+              groups))))))))
+
+;; ── recursive rules: parsing + semi-naive fixpoint ──────────────────────────
+
+(defn- parse-rules
+  "`:rules` (`[[(rule-name ?a ?b) clause ...] ...]`) -> `{rule-name
+  [{:params [?a ?b] :body [clause ...]} ...]}` -- a rule name maps to
+  EVERY definition given for it (multiple definitions = alternative/OR
+  derivations, e.g. a recursive rule's base case + inductive case).
+  Validates every definition of the same name declares the same param
+  COUNT (arity) -- Datomic itself requires this, and it's what lets a
+  `:where`/body invocation be checked without knowing which definition
+  will end up firing."
+  [rules]
+  (let [grouped (reduce (fn [acc [[rname & params] & body]]
+                          (update acc rname (fnil conj []) {:params (vec params) :body (vec body)}))
+                        {}
+                        rules)]
+    (doseq [[rname defs] grouped]
+      (let [arities (into #{} (map (comp count :params)) defs)]
+        (when (> (count arities) 1)
+          (throw (ex-info "datalog.core: rule definitions for the same name must all declare the same arity"
+                          {:rule rname :arities arities})))))
+    grouped))
+
+(defn- check-unknown-rules!
+  "Static pass: every `(rule-name ...)` invocation anywhere in `:where` or
+  any rule body must name a rule actually defined in `:rules` -- throws
+  immediately instead of silently joining against an empty extension."
+  [clauses parsed-rules]
+  (doseq [clause clauses
+          :when (rule-invocation? clause)]
+    (let [rname (rule-name clause)]
+      (when-not (contains? parsed-rules rname)
+        (throw (ex-info "datalog.core: unknown rule invoked -- not defined in :rules"
+                        {:rule rname})))
+      (let [{:keys [params]} (first (get parsed-rules rname))]
+        (when (not= (count params) (count (rule-args clause)))
+          (throw (ex-info "datalog.core: rule invoked with the wrong number of arguments"
+                          {:rule rname :expected (count params) :got (count (rule-args clause))})))))))
+
+(defn- eval-body-variant
+  "Evaluate `body` (a conjunction of clauses) against `db`, where the
+  rule-invocation clause at index `delta-idx` (if any) resolves against
+  `delta-map`, and every OTHER rule-invocation clause resolves against
+  `full-map` -- the semi-naive rewriting: one variant per rule-invocation
+  position, so a round only re-derives combinations touching at least one
+  tuple newly discovered LAST round, never recomputing purely-old ones."
+  [db visible? body full-map delta-map delta-idx]
+  (reduce
+   (fn [bindings [i clause]]
+     (join-clause bindings clause db visible?
+                  (fn [rname] (if (= i delta-idx) (get delta-map rname #{}) (get full-map rname #{})))
+                  nil))
+   #{{}}
+   (map-indexed vector body)))
+
+(defn- project-params [bindings params]
+  (into #{} (map (fn [binding] (mapv #(get binding %) params))) bindings))
+
+(defn- rule-invocation-indices [body]
+  (into [] (keep-indexed (fn [i clause] (when (rule-invocation? clause) i))) body))
+
+(def ^:private max-fixpoint-iterations
+  "Defensive cap, not a tuning knob: derivation is monotonic over `db`'s
+  finite domain, so a correct fixpoint always converges long before this.
+  Existing only to fail loudly (not hang) if it somehow doesn't."
+  10000)
+
+(defn- fixpoint
+  "Semi-naive least fixpoint over every rule in `parsed-rules`. Returns
+  `{rule-name #{tuple ...}}`, each tuple in that rule's own param order --
+  ready to hand to `join-clause`'s `extension-for` for the top-level
+  `:where` (or a caller evaluating one rule body against another's
+  results, though this landing only nests rules through `:where`/bodies,
+  never re-enters `fixpoint` itself)."
+  [db visible? parsed-rules]
+  (let [seed (reduce (fn [acc [rname defs]]
+                       (assoc acc rname
+                              (into #{} (mapcat (fn [{:keys [params body]}]
+                                                  (project-params (eval-body-variant db visible? body {} {} -1) params)))
+                                    defs)))
+                     {}
+                     parsed-rules)]
+    (loop [full seed, delta seed, iterations 0]
+      (when (> iterations max-fixpoint-iterations)
+        (throw (ex-info "datalog.core: fixpoint did not converge within the iteration cap"
+                        {:iterations iterations})))
+      (if (every? empty? (vals delta))
+        full
+        (let [candidates
+              (reduce (fn [acc [rname defs]]
+                        (assoc acc rname
+                               (into #{}
+                                     (mapcat (fn [{:keys [params body]}]
+                                               (let [idxs (rule-invocation-indices body)]
+                                                 (mapcat (fn [delta-idx]
+                                                           (project-params (eval-body-variant db visible? body full delta delta-idx) params))
+                                                         idxs))))
+                                     defs)))
+                      {}
+                      parsed-rules)
+              new-delta (into {} (map (fn [[rname _]]
+                                        [rname (set/difference (get candidates rname #{}) (get full rname #{}))]))
+                              parsed-rules)
+              full' (merge-with set/union full new-delta)]
+          (recur full' new-delta (inc iterations)))))))
+
+(def ^:private aggregate-fns
+  "Datomic-shaped `:find` aggregates. Each reduces the seq of one aggregate
+  variable's bound values across a group of bindings. `min`/`max` on an
+  empty group are `nil` (\"no minimum exists\"), not a thrown arity error;
+  `avg` forces double division (`(double (count vals))`) so JVM/cljs/nbb
+  agree -- integer `/` gives a Clojure ratio on JVM but a float on cljs."
+  {'count          count
+   'count-distinct (fn [vals] (count (distinct vals)))
+   'sum            (fn [vals] (reduce + 0 vals))
+   'avg            (fn [vals] (when (seq vals) (/ (reduce + 0 vals) (double (count vals)))))
+   'min            (fn [vals] (when (seq vals) (apply min vals)))
+   'max            (fn [vals] (when (seq vals) (apply max vals)))})
+
+(defn- agg-find?
+  "`(count ?v)`/`(sum ?v)`/etc. -- a `:find` element that isn't a plain
+  projected variable but an aggregate over one."
+  [x]
+  (and (seq? x) (contains? aggregate-fns (first x))))
+
+(defn- agg-fn [x] (get aggregate-fns (first x)))
+(defn- agg-var [x] (second x))
+
+(defn- form-lvars
+  "Every logic variable anywhere in `form`, at any nesting depth. Deliberately
+  structural rather than clause-aware: a triple, a `not`, an `or-join`, a
+  function call and a rule invocation all just contain symbols, and
+  over-approximating (keeping a variable that turns out not to be needed) is
+  always safe while under-approximating drops a binding a later clause was
+  going to join on."
+  [form]
+  (cond
+    (lvar? form) #{form}
+    (coll? form) (into #{} (mapcat form-lvars) form)
+    :else #{}))
+
+(defn- prune-bindings
+  "Drop variables no remaining clause and no output needs.
+
+  A binding set is a set, so removing a column MERGES bindings that differed
+  only in it. That is the point: measured (kotobase-peer
+  bench/results/2026-08-02-ic02-diagnosis.edn), LDBC IC09 carried 55,335
+  bindings into a step that only ever used 8,130 distinct values of one
+  variable -- the other 47,000 existed solely because two earlier variables
+  were still along for the ride, and every one of them cost a substitution, a
+  scan or a hash lookup, and a unification.
+
+  `needed` must include every variable of every REMAINING clause (including
+  ones nested in `or`/`not`/rule invocations) plus every `:find` element, or
+  this silently deletes a join key."
+  [bindings needed]
+  (if (or (empty? bindings)
+          (every? needed (keys (first bindings))))
+    bindings
+    (into #{} (map #(select-keys % needed)) bindings)))
+
+(defn- project
+  "`bindings` -> `:find`-ordered rows. With no aggregate `:find` elements,
+  this is the original per-binding projection (a plain set of tuples, one
+  per binding). With any aggregate element, the non-aggregate `:find`
+  elements become GROUP-BY columns: bindings are partitioned by their
+  values at those columns, and each aggregate column is computed once per
+  group. An all-aggregate `:find` (no group-by columns) is Datomic's
+  ungrouped-aggregate shape -- exactly one output row, computed over every
+  binding as a single implicit group (so e.g. `(count ?e)` over zero
+  matches is `#{[0]}`, not `#{}`)."
+  [bindings find]
+  (if (some agg-find? find)
+    (let [group-vars (into [] (remove agg-find?) find)
+          row (fn [group-bindings]
+                (mapv (fn [f]
+                        (cond
+                          ;; a binding may carry a WEIGHT: a composite lookup that
+                          ;; was asked only for `(count ?e)` folds its entries into
+                          ;; one binding weighted by their number (iteration 47);
+                          ;; `count` sums weights, every other aggregate sees the
+                          ;; bindings as they are (weights are only attached when
+                          ;; count is the only aggregate over that variable)
+                          (and (agg-find? f) (= 'count (first f)))
+                          (reduce + 0 (map #(if (contains? % ::weight) (::weight %) (if (contains? % (agg-var f)) 1 0)) group-bindings))
+                          (agg-find? f)
+                          ((agg-fn f) (mapv #(get % (agg-var f)) group-bindings))
+                          :else (get (first group-bindings) f)))
+                      find))]
+      (if (empty? group-vars)
+        #{(row bindings)}
+        (into #{}
+              (map (fn [[_ group-bindings]] (row group-bindings)))
+              (group-by (fn [binding] (mapv #(get binding %) group-vars)) bindings))))
+    (into #{} (map (fn [binding] (mapv #(get binding %) find))) bindings)))
+
+(defn- flatten-clauses
+  "`or`/`or-join` branches, flattened alongside their own clause -- so a
+  static pass over the result also sees any rule invocation nested
+  inside a branch, not just top-level `:where`/rule-body clauses."
+  [clauses]
+  (mapcat (fn [clause]
+            (cond
+              (or-clause? clause) (cons clause (flatten-clauses (or-branches clause)))
+              (or-join-clause? clause) (cons clause (flatten-clauses (or-join-branches clause)))
+              :else [clause]))
+          clauses))
+
+(defn- order-spec
+  "Normalize `:order-by` into `[[find-position direction] ...]`. Each element
+  is a `:find` element (a plain var, or an aggregate form written exactly as
+  it appears in `:find`), optionally wrapped as `[element :asc|:desc]`.
+  Ordering by something not in `:find` is rejected rather than silently
+  ignored -- the rows being ordered ARE the projection, so a key outside it
+  does not exist at this point."
+  [find order-by]
+  (mapv (fn [element]
+          (let [[k dir] (if (and (vector? element) (#{:asc :desc} (second element)))
+                          element
+                          [element :asc])
+                ;; portable index lookup -- this ns is .cljc and
+                ;; `.indexOf` with a java.util.List hint does not exist on cljs
+                idx (or (first (keep-indexed (fn [i e] (when (= e k) i)) find)) -1)]
+            (when (neg? idx)
+              (throw (ex-info "datalog.core: :order-by key is not in :find"
+                              {:key k :find find})))
+            [idx dir]))
+        order-by))
+
+(defn- compare-rows [spec a b]
+  (reduce (fn [_ [idx dir]]
+            (let [c (compare (nth a idx) (nth b idx))
+                  c (if (= dir :desc) (- c) c)]
+              (if (zero? c) 0 (reduced c))))
+          0 spec))
+
+(defn- order+limit
+  "Apply `:order-by` / `:limit` to a projected result.
+
+  RETURN TYPE: without either key this returns the SET `project` produced,
+  exactly as before. With either key it returns a VECTOR, because an ordered
+  result is a sequence and a set cannot carry order -- a caller asking for
+  ordering is asking for the thing a set cannot represent. `:limit` alone
+  also returns a vector; without `:order-by` WHICH rows come back is
+  unspecified (the set's iteration order), so a bare `:limit` is only
+  meaningful for `count`-style probes, not for top-N.
+
+  WHAT THIS IS NOT: the limit is applied to the finished projection, so the
+  join still does all of its work. It makes top-N EXPRESSIBLE -- the caller
+  no longer sorts the whole result in host code -- but it does not yet make
+  it cheaper. Pushing a limit into the join needs the ordering clause to
+  drive iteration, which is possible here because the value-ordered index
+  already yields `[p o s]` in `o` order; that is a separate change and is
+  not claimed by this one."
+  [rows find order-by limit]
+  (if (and (empty? order-by) (nil? limit))
+    rows
+    (let [spec (order-spec find order-by)
+          ordered (if (seq spec)
+                    (vec (sort #(compare-rows spec %1 %2) rows))
+                    (vec rows))]
+      (if limit (vec (take limit ordered)) ordered))))
+
+
+;; ── α-canonical form ─────────────────────────────────────────────────────────
+
+(defn- ordered-lvars
+  "Logic variables in `form`, in source order, distinct.
+
+  Vectors, lists and sets are walked in their own order. **Maps are not walked
+  at all.** A Clojure map has no defined iteration order, so numbering a
+  variable by where it turned up inside one would make the canonical name
+  depend on hashing — a normalizer whose output varies by runtime is worse
+  than none, because two runtimes would content-address the same query
+  differently and neither would report a disagreement. The only map a query
+  carries is `:clause-cardinality`, whose keys are clauses that must already
+  appear in `:where`; it is renamed, never numbered."
+  [form]
+  (cond
+    (lvar? form)  [form]
+    (map? form)   []
+    (coll? form)  (into [] (comp (mapcat ordered-lvars) (distinct)) form)
+    :else         []))
+
+(defn- rename-lvars
+  "Substitute every logic variable in `form` through `m`, preserving
+  collection type and order.
+
+  List-ness is load-bearing, not cosmetic: `not-clause?`, `or-clause?`,
+  `or-join-clause?` and `rule-invocation?` all dispatch on `seq?`, so a
+  `(not [?e :a ?v])` rebuilt as a vector would silently stop being a negation
+  and start being a triple pattern with a symbol in entity position.
+
+  A variable absent from `m` is an error rather than a pass-through. It can
+  only arise from a query that names a variable in `:order-by` or
+  `:clause-cardinality` which no `:in`/`:find`/`:where` introduces — already
+  malformed, and inventing a name for it would produce a canonical form for a
+  query that cannot run."
+  [form m]
+  (cond
+    (lvar? form)   (or (get m form)
+                       (throw (ex-info "datalog.core/normalize: logic variable outside :in/:find/:where"
+                                       {:var form :known (vec (sort (keys m)))})))
+    (map? form)    (persistent!
+                    (reduce-kv (fn [acc k v]
+                                 (assoc! acc (rename-lvars k m) (rename-lvars v m)))
+                               (transient {}) form))
+    (vector? form) (mapv #(rename-lvars % m) form)
+    (set? form)    (into #{} (map #(rename-lvars % m)) form)
+    (seq? form)    (apply list (map #(rename-lvars % m) form))
+    :else          form))
+
+(defn- canonical-names [vars]
+  (zipmap vars (map #(symbol (str "?" %)) (range))))
+
+(defn- normalize-rule-definition
+  "One `[(rule-name ?param ...) clause ...]` definition, numbered in its own
+  scope.
+
+  A rule's parameters are bound by the invocation, not by the enclosing query,
+  so `[(anc ?a ?b) [?a :parent ?b]]` and `[(anc ?x ?y) [?x :parent ?y]]` are
+  the same rule and must reach the same canonical form regardless of what the
+  query around them calls its variables. The rule NAME is an ordinary symbol,
+  not a variable, and is left alone — `:where` refers to it by name."
+  [definition]
+  (rename-lvars definition (canonical-names (ordered-lvars definition))))
+
+(defn normalize
+  "α-canonical form of a query: every logic variable renamed to `?0`, `?1`, …
+  in order of first appearance, with everything else left exactly as written.
+
+  Two queries that differ only in what they call their variables normalize to
+  the identical value, so `(= (normalize a) (normalize b))` decides
+  α-equivalence, and a caller that content-addresses queries can address the
+  normal form instead of the text. **That caller is not this library** — see
+  the README's \"What this is NOT\": there is no CID here, and a canonical
+  value is exactly the seam that keeps it out. Hand the result to whatever
+  owns content addressing in your stack.
+
+  Numbering runs over `:in`, then `:find`, then `:where`, in that order. What
+  is deliberately NOT reordered:
+
+  - **`:find` order** is the projection. Two queries returning the same
+    columns in a different order return different answers.
+  - **`:where` order** decides which queries are legal at all. Safe negation
+    is checked statically against it — every variable inside a `(not …)` must
+    be bound by an EARLIER positive clause — so sorting clauses would change
+    the accepted language, not just the plan. It is also the join order the
+    caller owns (see `q`'s `:clause-cardinality` note).
+  - **`:in` order** is positional against `inputs`.
+
+  So this is α-equivalence and nothing more. It does not decide whether two
+  queries mean the same thing; two clause orders that compute the same
+  relation normalize differently, and that is correct here rather than
+  incomplete — a canonical form that claimed more would have to be wrong
+  somewhere, and quietly.
+
+  `:rules` definitions are each numbered in their OWN scope, because their
+  parameters are bound by invocation rather than by the enclosing query.
+  Rule names, `_`, `$`, whitelisted function symbols, keywords and every
+  literal value pass through untouched.
+
+  `:clause-cardinality` is renamed through the same map, keys included. It is
+  keyed BY CLAUSE, so renaming `:where` without it would leave every hint
+  keyed to a clause that no longer occurs — the hints would not error, they
+  would simply stop matching, and the only visible effect would be a slower
+  query. Not reordering `:where` is what makes those keys still findable."
+  [query]
+  (let [scoped (canonical-names
+                (into [] (comp cat (distinct))
+                      [(ordered-lvars (:in query))
+                       (ordered-lvars (:find query))
+                       (ordered-lvars (:where query))]))]
+    (cond-> query
+      (contains? query :in)     (update :in rename-lvars scoped)
+      (contains? query :find)   (update :find rename-lvars scoped)
+      (contains? query :where)  (update :where rename-lvars scoped)
+      (contains? query :order-by) (update :order-by rename-lvars scoped)
+      (contains? query :clause-cardinality)
+      (update :clause-cardinality rename-lvars scoped)
+      (contains? query :rules)
+      (update :rules #(mapv normalize-rule-definition %)))))
+
+;; ── canonical form over the order-irrelevant positions ───────────────────────
+
+(defn- type-rank
+  "A total order across kinds, so `compare-forms` never compares apples to
+  pears. List and vector are ranked apart on purpose: list-ness decides whether
+  a form is a negation, a disjunction or a rule invocation, so two forms that
+  differ only in it are genuinely different clauses."
+  [x]
+  (cond (nil? x) 0 (boolean? x) 1 (number? x) 2 (string? x) 3
+        (keyword? x) 4 (symbol? x) 5 (vector? x) 6 (seq? x) 7
+        (set? x) 8 (map? x) 9
+        :else (throw (ex-info "datalog.core/canonicalize: value outside the orderable subset"
+                              {:value x :type (type x)}))))
+
+(declare compare-forms)
+
+(defn- compare-seqs [a b]
+  (or (first (remove zero? (map compare-forms a b)))
+      (compare (count a) (count b))))
+
+(defn- compare-forms
+  "A total order over the EDN a query is made of.
+
+  `pr-str` would have been shorter and is not available: a set or a map has no
+  defined iteration order, so ordering by printed text makes the answer depend
+  on the host. `arrangement` records the same hazard on its key path, where two
+  byte arrays with identical contents blinded differently. Sets and maps here
+  are compared through their own sorted contents, which is defined everywhere."
+  [a b]
+  (let [ra (type-rank a) rb (type-rank b)]
+    (if (not= ra rb)
+      (compare ra rb)
+      (case ra
+        (0) 0
+        (1) (compare a b)
+        (2) (compare a b)
+        (3) (compare a b)
+        (4 5) (compare (str a) (str b))
+        (6 7) (compare-seqs a b)
+        (8) (compare-seqs (sort compare-forms a) (sort compare-forms b))
+        (9) (compare-seqs (map (fn [[k v]] [k v]) (sort-by key compare-forms a))
+                          (map (fn [[k v]] [k v]) (sort-by key compare-forms b)))))))
+
+(defn- permutations [coll]
+  (if (<= (count coll) 1)
+    [(vec coll)]
+    (for [i (range (count coll))
+          p (permutations (concat (take i coll) (drop (inc i) coll)))]
+      (into [(nth coll i)] p))))
+
+(defn- cartesian [colls]
+  (if (empty? colls)
+    [()]
+    (for [x (first colls) more (cartesian (rest colls))] (cons x more))))
+
+(defn- form-variants
+  "Every rewriting of `form` that differs only in an order this engine does not
+  read.
+
+  Exactly three such positions exist, and each was measured rather than taken
+  from a docstring -- permuting it leaves `q`'s answer identical, while
+  permuting `:where` changes whether the query is ACCEPTED at all:
+
+    (or b1 b2 ...)             branches are alternatives checked against the
+    (or-join [v] b1 b2 ...)    same outer bindings, then unioned
+    :rules definitions         alternatives of one name, unioned to a fixpoint
+
+  `(and c1 c2)` inside a branch is NOT permuted: it is a conjunction, and a
+  clause in it may rely on one earlier in the same branch."
+  [form]
+  (cond
+    (or (or-clause? form) (or-join-clause? form))
+    (let [head (if (or-join-clause? form) (take 2 form) (take 1 form))
+          branches (if (or-join-clause? form) (or-join-branches form) (or-branches form))]
+      (for [bs (cartesian (map form-variants branches))
+            p (permutations bs)]
+        (apply list (concat head p))))
+
+    (vector? form) (map vec (cartesian (map form-variants form)))
+    (seq? form) (map #(apply list %) (cartesian (map form-variants form)))
+    :else [form]))
+
+(def orbit-limit
+  "How many rewritings `canonicalize` will consider before refusing.
+
+  It picks the minimum over an orbit, so the orbit has to be enumerated, and
+  the size is a product of factorials. Real queries sit far below this -- two
+  disjunctions of three branches each is 72 -- but the bound is a refusal
+  rather than a truncation: silently canonicalising over a PREFIX of the orbit
+  would return a value that is not the minimum and cannot be told from one
+  that is."
+  5040)
+
+(defn- query-variants [query]
+  (let [wheres (if (contains? query :where) (form-variants (:where query)) [::absent])
+        rules  (if (contains? query :rules)
+                 (for [defs (permutations (:rules query))
+                       bodies (cartesian (map form-variants defs))]
+                   (vec bodies))
+                 [::absent])]
+    (for [w wheres r rules]
+      (cond-> query
+        (not= ::absent w) (assoc :where w)
+        (not= ::absent r) (assoc :rules r)))))
+
+(defn canonicalize
+  "`normalize`, and additionally minimal over the orders this engine does not
+  read. Throws when the orbit exceeds `orbit-limit`.
+
+  `normalize` decides α-equivalence and is total. This decides α-equivalence
+  PLUS the three order-irrelevant positions above, and is partial -- the two
+  contracts are separate functions rather than one flag because a caller has
+  to know which of them it got.
+
+  The minimum is taken over the orbit rather than by sorting each position in
+  place, and that is not fussiness. Renaming numbers variables by first
+  appearance, so it depends on branch order; sorting branches depends on the
+  names. Sorting-then-renaming and renaming-then-sorting each leave pairs that
+  do not converge. Minimising over the orbit has no such dependency: every
+  order is renamed, and the smallest result is the same value whichever order
+  was written.
+
+  What is NOT reordered stays exactly as `normalize` leaves it -- `:find`
+  (the projection), `:in` (positional against `inputs`), `:where` (whose order
+  decides which queries are legal), and `(and ...)` inside a branch."
+  [query]
+  (let [vs (take (inc orbit-limit) (query-variants query))]
+    (when (> (count vs) orbit-limit)
+      (throw (ex-info "datalog.core/canonicalize: orbit exceeds the limit -- refusing to return a value that is not the minimum"
+                      {:limit orbit-limit})))
+    (reduce (fn [a b] (if (neg? (compare-forms b a)) b a)) (map normalize vs))))
+;; ── ordered drive: :order-by + :limit walked through the value index ──────────
+
+(def ^:dynamic *ordered-drive*
+  "Whether `q` may answer an `:order-by`/`:limit` query by walking the
+  ordering attribute's values in order and stopping at the limit. Bound to
+  false by the equivalence tests, which compare the drive against the plain
+  join on the same query; never rebound by callers."
+  true)
+
+(defn- ordered-window
+  "The values of `a` between `lo` and `hi` (nil = unbounded; open flags as
+  in the fused range), in `dir` order, off `datalog.index/ordered-values`
+  (a sorted-set): `subseq`/`rsubseq` cuts, no sort per query."
+  [db a lo hi lo-open? hi-open? dir]
+  (let [ss (index/ordered-values db a)
+        lo-test (if lo-open? > >=)
+        hi-test (if hi-open? < <=)
+        sub (if (= dir :desc) rsubseq subseq)]
+    (cond
+      (and (nil? lo) (nil? hi)) (if (= dir :desc) (rseq ss) (seq ss))
+      (nil? hi) (sub ss lo-test lo)
+      (nil? lo) (sub ss hi-test hi)
+      :else (sub ss lo-test lo hi-test hi))))
+
+(defn- ordered-drive-plan
+  "The shape the drive answers, or nil.
+
+  `:order-by`'s first key is a plain variable `?v`; `:limit` is a positive
+  integer; no rules, aggregates, `or`, `not`, or unfused predicates; exactly
+  one clause binds `?v` in value position -- `[?e attr ?v]` or the fused range
+  on it -- with `attr` ground and `?e` a variable no input binds. That clause
+  is the DRIVER. Clauses that mention `?e` or `?v` are DEPENDENT and run per
+  value group from the driver's binding; every other clause is INDEPENDENT and
+  runs exactly once. The two halves meet in a hash semi-join on their shared
+  variables. This is the join reordering the ns docstring named as the
+  correct shape when the first pushdown was reverted (`arrangement` a98588c):
+  nothing is re-derived per value group that does not depend on the value."
+  [where find order-by limit parsed-rules initial-binding]
+  (let [[k dir] (let [e (first order-by)]
+                  (if (and (vector? e) (#{:asc :desc} (second e))) e [e :asc]))]
+    (when (and (seq order-by) (integer? limit) (pos? limit)
+               (lvar? k) (some #{k} find)
+               (empty? parsed-rules)
+               (not (some agg-find? find))
+               ;; triples, fused ranges, and predicate clauses (a predicate runs
+               ;; where join-clause runs it: in the half its variables put it)
+               (every? (fn [c] (or (range-clause? c)
+                                   (predicate-clause? c)
+                                   (and (vector? c) (= 3 (count c)))))
+                       where))
+      (let [drivers (filter (fn [c]
+                              (if (range-clause? c)
+                                (and (= k (:range/v c)) (lvar? (:range/e c))
+                                     (not (lvar? (:range/a c))) (not (wildcard? (:range/a c)))
+                                     (not (contains? initial-binding (:range/e c))))
+                                (let [[e a v] c]
+                                  (and (= k v) (lvar? e) (not (lvar? a)) (not (wildcard? a))
+                                       (not (contains? initial-binding e))))))
+                            where)]
+        (when (= 1 (count drivers))
+          (let [driver (first drivers)
+                e (if (range-clause? driver) (:range/e driver) (first driver))
+                a (if (range-clause? driver) (:range/a driver) (second driver))
+                rest-clauses (remove #(identical? % driver) where)
+                dependent (filter #(some #{e k} (form-lvars %)) rest-clauses)
+                independent (remove #(some #{e k} (form-lvars %)) rest-clauses)]
+            ;; the driver must actually be the ONLY binder of ?e among the
+            ;; dependent clauses' entity positions? no -- ?e may appear
+            ;; anywhere; what matters is that no other clause binds ?v
+            ;; no other clause may bind or constrain ?v (a predicate on ?v that
+            ;; was not fused into the range stays with the plain join)
+            (when (not-any? (fn [c] (some #{k} (form-lvars c))) rest-clauses)
+              (let [ind-vars (into (set (keys initial-binding)) (mapcat form-lvars) independent)
+                    ;; GROUP clause: a dependent triple `[?e g ?f]` with `?f`
+                    ;; bound by the independent half (or an input). The drive
+                    ;; then merges the g-groups of `?f`'s values in value order
+                    ;; (`index/grouped-values`) instead of walking every value.
+                    group (some (fn [c]
+                                  (when (and (vector? c) (= 3 (count c)))
+                                    (let [[e' g f] c]
+                                      (when (and (= e' e) (not (lvar? g)) (not (wildcard? g))
+                                                 (lvar? f) (contains? ind-vars f))
+                                        {:clause c :g g :f f}))))
+                                dependent)]
+                {:driver driver :e e :a a :v k :dir dir
+                 :lo (when (range-clause? driver) (:range/lo driver))
+                 :hi (when (range-clause? driver) (:range/hi driver))
+                 :lo-open? (boolean (when (range-clause? driver) (:range/lo-open? driver)))
+                 :hi-open? (if (range-clause? driver) (boolean (:range/hi-open? driver)) true)
+                 :dependent (vec dependent)
+                 :independent (vec independent)
+                 :group group}))))))))
+
+(def ^:private ordered-drive-value-budget
+  "How many distinct values the drive walks before giving up and handing the
+  query to the plain join. The drive pays per value walked and wins when hits
+  are dense (a large friend-of-friend set, or an empty range); when hits are
+  sparse it walks thousands of values to fill a small limit. Measured
+  2026-09-11 (ayatori iteration 19, LDBC SF1 subset, official parameters):
+  IC09 163 -> 2.7 ms, but an unbounded drive took IC02's non-empty answers
+  from 1.1 to 17.1 ms -- 30 friends' messages are 0.3% of 86,932 dates, so
+  20 hits cost ~6,000 values. 512 values is under a millisecond of walking;
+  a query that has not filled its limit by then is one the plain join
+  answers cheaply."
+  512)
+
+(defn- group-cut
+  "One group's `[v e]` entries inside the window, in `dir` order, off a
+  sorted-set under `index/ve-compare`. The leading bound is a `subseq`/
+  `rsubseq` cut on a sentinel key (`[v ::lo]` sorts below every `[v e]`,
+  `[v ::hi]` above), so a window far from the ends costs nothing to reach;
+  the trailing bound is a lazy `take-while` on the value."
+  [ss lo hi lo-open? hi-open? dir]
+  (if (= dir :desc)
+    (let [head (cond (nil? hi) (rseq ss)
+                     hi-open? (rsubseq ss < [hi :datalog.index/lo])
+                     :else (rsubseq ss <= [hi :datalog.index/hi]))]
+      (if (nil? lo) head
+          (take-while #(let [c (compare (first %) lo)] (if lo-open? (pos? c) (not (neg? c)))) head)))
+    (let [head (cond (nil? lo) (seq ss)
+                     lo-open? (subseq ss > [lo :datalog.index/hi])
+                     :else (subseq ss >= [lo :datalog.index/lo]))]
+      (if (nil? hi) head
+          (take-while #(let [c (compare (first %) hi)] (if hi-open? (neg? c) (not (pos? c)))) head)))))
+
+(defn- merge-groups
+  "K-way merge of `{gv (seq of [v e])}` in `dir` value order into a lazy seq
+  of `[v e gv]`. One head per group in a heap; each step pops the first
+  (asc) or last (desc) and pushes that group's next.
+
+  On the JVM the heap is a `java.util.PriorityQueue` owned by the lazy seq
+  that realizes it (realized once, cached; never shared): IC09 on the full
+  SF1 merges ~2,200 groups for 20 rows, and the persistent sorted-map heap
+  was most of its 8.7 ms (ayatori iteration 37). Elsewhere a sorted-map."
+  [cuts dir]
+  )
+
+(defn- ordered-drive
+  "Answer `q` for the shape `ordered-drive-plan` accepted. Returns the
+  ordered, limited VECTOR `order+limit` would have returned, or
+  `::exhausted-budget` when the walk passed `ordered-drive-value-budget`
+  values without filling the limit -- the caller then runs the plain join."
+  [db {:keys [e a v dir lo hi lo-open? hi-open? dependent independent group]}
+   find order-by limit visible? clause-cardinality initial-binding]
+  (let [find-vars (form-lvars find)
+        dep-vars (into #{e v} (mapcat form-lvars) dependent)
+        ind-vars (into (set (keys initial-binding)) (mapcat form-lvars) independent)
+        shared (vec (set/intersection (into dep-vars (keys initial-binding)) ind-vars))
+        ;; independent half, once
+        b0 (reduce (fn [bindings [i clause]]
+                     (-> (join-clause bindings clause db visible? (constantly #{}) clause-cardinality)
+                         (prune-bindings (into (set/union find-vars (set shared))
+                                               (mapcat form-lvars (subvec independent (inc i)))))))
+                   #{initial-binding}
+                   (map-indexed vector independent))
+        b0-index (group-by #(select-keys % shared) b0)
+        ;; Grouped or global walk? The grouped merge pays one cut per group
+        ;; the independent half reached (|G|). The global walk pays one step
+        ;; per value and hits at the rate E_G / N_e -- the entries in those
+        ;; groups over all entries of the ordering attribute -- so it fills
+        ;; `limit` in about limit * N_e / E_G steps, and past the value budget
+        ;; it would hand the query to the plain join. Global only when that
+        ;; step count is under both half the budget and |G|. E_G is a count
+        ;; per group (O(1) on a sorted-set), N_e the attribute's subject count.
+        ;; Measured 2026-09-12 (ayatori iteration 39, full SF1): IC09 reaches
+        ;; ~2,200 of ~9,900 creators holding 22% of all messages -- ~90 steps
+        ;; against 2,200 cuts, and the cuts were the largest engine term in
+        ;; the JFR profile; a first rule on group COUNTS alone sent IC07
+        ;; (2,000 message groups holding 0.2% of all likes) to the global
+        ;; walk, which exhausted its budget and fell to the plain join at
+        ;; 81 ms p50 -- refuted the same hour, hence the entry ratio.
+        groups (when group (index/grouped-values db (:g group) a))
+        gvs (when group (into #{} (keep #(get % (:f group))) b0))
+        group (when group
+                (let [n-e (count (get (:aevt db) a {}))
+                      e-g (reduce + 0 (map #(count (get groups %)) gvs))
+                      steps (if (pos? e-g) (/ (* limit n-e) e-g) ##Inf)]
+                  (when-not (< steps (min (/ ordered-drive-value-budget 2) (count gvs)))
+                    group)))
+        ;; with a group clause, the merge binds ?f itself: the clause leaves
+        ;; the chain, its variable stays in dep-vars so the semi-join keys on it
+        dependent (if group (vec (remove #(identical? % (:clause group)) dependent)) dependent)
+        ;; dependent half, per driver binding
+        chain (fn [starts]
+                (reduce (fn [bindings [i clause]]
+                          (-> (join-clause bindings clause db visible? (constantly #{}) clause-cardinality)
+                              (prune-bindings (into (set/union find-vars (set shared))
+                                                    (mapcat form-lvars (subvec dependent (inc i)))))))
+                        starts
+                        (map-indexed vector dependent)))
+        {g :g f :f} group
+        walk (if group
+               ;; the groups the independent half reached, merged in value order
+               (merge-groups (into {} (keep (fn [gv] (when-let [ss (get groups gv)]
+                                                        (when-let [cut (seq (group-cut ss lo hi lo-open? hi-open? dir))]
+                                                          [gv cut]))))
+                                   gvs)
+                             dir)
+               (ordered-window db a lo hi lo-open? hi-open? dir))
+        spec (order-spec find order-by)
+        ;; Values are walked in CHUNKS: the dependent chain runs once per
+        ;; chunk over every driver binding in it, so the per-step machinery
+        ;; (grouping, scans, pruning, projection) is paid per chunk and not
+        ;; per value. A chunk's rows all precede the next chunk's in the
+        ;; order, so sorting within the chunk and stopping after the chunk
+        ;; that fills the limit is exact. Measured 2026-09-11: per value the
+        ;; chain cost ~80 us, so 500 values were 40 ms; per chunk of 32 the
+        ;; same walk is a few ms.
+        chunk-rows (fn [values]
+                     (let [starts (if group
+                                    ;; entries are [value entity gv]; the two quads
+                                    ;; they stand for pass `visible?` like a scan would
+                                    (into #{}
+                                          (keep (fn [[value ent gv]]
+                                                  (when (and (visible? {:s ent :p a :o value})
+                                                             (visible? {:s ent :p g :o gv}))
+                                                    (assoc initial-binding e ent v value f gv))))
+                                          values)
+                                    (into #{}
+                                          (mapcat (fn [value]
+                                                    (map (fn [quad] (assoc initial-binding e (:s quad) v value))
+                                                         (scan* db [nil a value] visible?))))
+                                          values))
+                           joined (into #{}
+                                        (mapcat (fn [c] (map #(merge % c) (get b0-index (select-keys c shared)))))
+                                        (chain starts))]
+                       (vec (sort #(compare-rows spec %1 %2) (project joined find)))))]
+    ;; chunk sizes grow from `limit` (a dense query stops after one chunk
+    ;; having looked at about `limit` values) to 64
+    (loop [walk walk acc [] walked 0 size (max 1 limit)]
+      (cond
+        (or (empty? walk) (>= (count acc) limit)) (vec (take limit acc))
+        (>= walked ordered-drive-value-budget) ::exhausted-budget
+        :else (let [;; a grouped walk is entries, several per value: a chunk
+                    ;; ends on a VALUE boundary so ties never straddle two
+                    ;; chunks (each chunk is sorted by the full spec on its own)
+                    n (if group
+                        (let [head (take size walk)
+                              last-v (first (last head))]
+                          (+ size (count (take-while #(= (first %) last-v) (drop size walk)))))
+                        size)
+                    chunk (take n walk)]
+                (recur (drop n walk)
+                       (into acc (chunk-rows chunk))
+                       (+ walked (count chunk))
+                       (min 64 (* 2 size))))))))
+
+(defn q
+  "`{:find [?var ...] :in [?param ...] :where [[e a v] ...] :rules [...]}`
+  over `db`. `visible?` is required and threaded into every underlying
+  `datalog.query/query` call, same convention as `datalog.query`
+  itself (ADR-2607050500). Returns a set of `:find`-ordered vectors --
+  `nil` for any plain `:find` var a clause never bound (e.g. wildcard-only
+  clauses).
+
+  `:where` clauses may be:
+    - `(not [e a v])` (see ns docstring for the `visible?`/safety contract)
+    - `(rule-name ?arg ...)`, invoking a `:rules` definition
+    - `[(fn-sym arg...)]` / `[(fn-sym arg...) result-var]`, a whitelisted
+      predicate/function call (see `query-fns`)
+    - `(or clause ...)` / `(or-join [?shared ...] clause ...)`, union
+      across alternative derivations
+  `:find` elements may be `(count ?v)`, `(count-distinct ?v)`, `(sum ?v)`,
+  `(avg ?v)`, `(min ?v)`, or `(max ?v)` alongside plain variables, which
+  then act as GROUP-BY columns (see `project`).
+
+  `:in` (optional) declares extra query parameters -- `inputs` (a 4th,
+  optional arg, positional, same order as `:in`) supplies their values.
+  `'$` in `:in` is accepted as a no-op placeholder for `db` itself
+  (already passed separately); every other symbol consumes one value
+  from `inputs`, pre-bound before `:where` runs.
+
+  `:rules` (optional; omit or `[]` for plain Stage 1/2 queries, unchanged)
+  is `[[(rule-name ?param ...) clause ...] ...]` -- see ns docstring for
+  the fixpoint/semi-naive contract, safety, and the `visible?` guarantee
+  extending recursively into rule bodies.
+
+  `:order-by` / `:limit` (optional) make top-N expressible in the query
+  instead of in host code. `:order-by` is a vector of `:find` elements,
+  each optionally `[element :asc|:desc]` (default `:asc`); a key that is
+  not in `:find` is an error, not a no-op. Supplying either key changes
+  the return type from a SET to a VECTOR, because an ordered result is a
+  sequence. `:limit` without `:order-by` returns an unspecified subset --
+  useful for probes, not for top-N.
+
+  `:clause-cardinality` (optional) is `{clause estimated-rows}` -- a
+  planner's own per-clause row estimate, which it already computes in
+  order to choose a clause order. When a clause's whole relation is small
+  relative to the number of keyed scans a join step would issue for it,
+  the executor reads that relation ONCE and hash-joins instead. Omit it
+  and every step stays on the keyed path, which is the safe default: a
+  broad scan of a large relation is the mistake the budget avoids, and a
+  hint that is absent is not a hint that is wrong. It never changes an
+  answer -- see `hash-join-rows` and the equivalence tests.
+
+  These are applied to the finished projection: the join still does all
+  of its work, so this makes top-N SAYABLE, not yet cheaper. Every LDBC
+  SNB complex read is a \"most recent N\" query, and until this existed a
+  caller had to materialize the whole join and sort it in host code
+  (kotobase-peer bench/results/2026-08-01-ldbc-snb-interactive.edn did
+  exactly that, and said so). Pushing the limit into the join is a
+  separate change -- see `order+limit`."
+  ([db query visible?] (q db query visible? []))
+  ([db {:keys [find where rules in order-by limit clause-cardinality]} visible? inputs]
+   (binding [*pattern-source?* (satisfies? ds/IPatternSource db)]
+    (let [in-syms (vec (remove #{'$} (or in [])))
+         initial-binding (into {} (map vector in-syms inputs))
+         parsed-rules (parse-rules (or rules []))
+         all-clauses (flatten-clauses (into where (mapcat :body) (mapcat val parsed-rules)))]
+     (check-clause-safety! where (set in-syms))
+     (doseq [[_ defs] parsed-rules] (doseq [{:keys [body]} defs] (check-clause-safety! body)))
+     (check-unknown-rules! all-clauses parsed-rules)
+     (let [where (fuse-value-ranges where)
+           drive (when (and *ordered-drive*
+                            (not (if (some? *pattern-source?*) *pattern-source?* false)))
+                   (ordered-drive-plan where find order-by limit parsed-rules initial-binding))]
+      (let [driven (when drive
+                     (ordered-drive db drive find order-by limit visible? clause-cardinality initial-binding))]
+       (if (and driven (not= driven ::exhausted-budget))
+        driven
+        (let [;; composite lookups only where the drive did not take the query
+              ;; and the db is materialized (the group order is an index of it)
+              where (if (or drive (if (some? *pattern-source?*) *pattern-source?* false))
+                      where
+                      (fuse-composites where initial-binding find))
+              full (fixpoint db visible? parsed-rules)
+           ;; With an aggregate in :find, binding MULTIPLICITY is observable --
+           ;; `project` computes each aggregate over the bindings in its group,
+           ;; so two bindings differing only in a column nobody reads are two
+           ;; rows to `(count ?x)`. Pruning would merge them and change the
+           ;; answer, so it is off entirely in that case rather than
+           ;; conditionally per column.
+           prune? (not (some agg-find? find))
+           bindings (reduce (fn [bindings [i clause]]
+                              (let [bs (join-clause bindings clause db visible?
+                                                    #(get full % #{}) clause-cardinality)]
+                                (if prune?
+                                  (prune-bindings bs (into (form-lvars find)
+                                                           (form-lvars (subvec (vec where) (inc i)))))
+                                  bs)))
+                            #{initial-binding}
+                            (map-indexed vector where))]
+       (order+limit (project bindings find) find order-by limit)))))))))
+
+

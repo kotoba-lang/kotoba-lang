@@ -1,0 +1,106 @@
+(ns murakumo.ci.attest
+  "Persist execution receipts in bonsai and sign runner-independent verdicts
+   with nekko sigrefs."
+  (:require [bonsai.object :as object]
+            [murakumo.blob :as blob]
+            [bonsai.refs :as refs]
+            [nekko.sigref :as sigref]
+            [murakumo.canonical :as canonical]))
+
+(def terminal-results #{:passed :failed :timed-out :cancelled})
+
+(defn- utf8 [x]
+  (canonical/encode-bytes x))
+
+(defn artifact-manifest [receipt]
+  (->> (concat (->> (:receipt/jobs receipt)
+                    (mapcat :ci.job/steps)
+                    (mapcat :ci.step/artifacts))
+               (when-let [bundle (:receipt/release-bundle receipt)] [bundle]))
+       (map #(select-keys % [:path :cid :digest :size :type]))
+       (sort-by (juxt :path :cid :digest))
+       vec))
+
+(defn verdict
+  "Runner-independent claim. Different logs/timings still converge, while a
+   different result or artifact identity necessarily produces another CID."
+  [receipt]
+  {:verdict/version 1
+   :verdict/run-id (:receipt/run-id receipt)
+   :verdict/source (:receipt/source receipt)
+   :verdict/pipeline-digest (:receipt/pipeline-digest receipt)
+   :verdict/status (:receipt/status receipt)
+   :verdict/artifacts (artifact-manifest receipt)})
+
+(defn verdict-cid [verdict-document]
+  (blob/cid (utf8 verdict-document)))
+
+(defn result-ref [run-id] (str "refs/ci/results/" run-id))
+(defn receipt-ref [run-id runner-id]
+  (str "refs/ci/receipts/" run-id "/" runner-id))
+
+(defn attest
+  "Write verdict and full receipt objects into `db`, create the runner receipt
+   ref, and sign the shared result ref. Returns the updated db and sigref."
+  [db rid signer-seed execution ts]
+  (let [receipt (:receipt execution)
+        status (:receipt/status receipt)]
+    (when-not (contains? terminal-results status)
+      (throw (ex-info "murakumo-ci: receipt result is not terminal"
+                      {:reason :invalid-receipt-status :status status})))
+    (when-not (= (:result execution) status)
+      (throw (ex-info "murakumo-ci: execution and receipt disagree"
+                      {:reason :receipt-result-mismatch})))
+    (let [v (verdict receipt)
+          verdict-bytes (utf8 v)
+          receipt-bytes (utf8 receipt)
+          [db verdict-cid] (blob/write db verdict-bytes)
+          [db receipt-cid] (blob/write db receipt-bytes)
+          [db tree-cid] (object/write-tree db [{:name "receipt.edn" :cid receipt-cid :kind :blob}
+                                                {:name "verdict.edn" :cid verdict-cid :kind :blob}])
+          parent (get-in receipt [:receipt/source :source/kotoba-commit])
+          [db commit-cid] (object/write-commit
+                           db {:tree tree-cid :parents (cond-> [] parent (conj parent))
+                               :author (:receipt/runner-id receipt)
+                               :message (str "CI receipt " (:receipt/run-id receipt))
+                               :ts 0})
+          vote-ref (result-ref (:receipt/run-id receipt))
+          sr (sigref/sign signer-seed rid vote-ref verdict-cid ts)
+          signer (get sr "signer")]
+      (when-not (= signer (:receipt/runner-id receipt))
+        (throw (ex-info "murakumo-ci: receipt runner does not own signing key"
+                        {:reason :runner-key-mismatch
+                         :receipt/runner (:receipt/runner-id receipt)
+                         :signer signer})))
+      {:db (refs/set-ref db rid (receipt-ref (:receipt/run-id receipt) signer) commit-cid)
+       :blobs {verdict-cid verdict-bytes receipt-cid receipt-bytes}
+       :receipt-commit-cid commit-cid
+       :receipt-blob-cid receipt-cid
+       :verdict-cid verdict-cid
+       :sigref sr})))
+
+(defn canonical-verdict
+  "Threshold result over valid nekko sigrefs. Duplicate votes by one DID
+   count once. Split quorum is rejected explicitly."
+  [{:keys [rid run-id delegates threshold]} sigrefs]
+  (when-not (and (pos-int? threshold) (<= threshold (count delegates)))
+    (throw (ex-info "murakumo-ci: invalid verdict threshold"
+                    {:reason :invalid-threshold})))
+  (let [ref (result-ref run-id)
+        votes (reduce (fn [m sr]
+                        (let [signer (get sr "signer")]
+                          (if (and (contains? delegates signer)
+                                   (= rid (get sr "rid"))
+                                   (= ref (get sr "ref"))
+                                   (sigref/valid? sr))
+                            (update m (get sr "commit") (fnil conj #{}) signer)
+                            m))) {} sigrefs)
+        winners (->> votes
+                     (keep (fn [[cid signers]]
+                             (when (>= (count signers) threshold) cid)))
+                     sort vec)]
+    (case (count winners)
+      0 nil
+      1 (first winners)
+      (throw (ex-info "murakumo-ci: split verdict quorum"
+                      {:reason :split-quorum :verdicts winners})))))

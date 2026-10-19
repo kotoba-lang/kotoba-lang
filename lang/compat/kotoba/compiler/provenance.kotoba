@@ -1,0 +1,163 @@
+(ns kotoba.compiler.provenance
+  {:kotoba/export [attach descriptor schema verify!]}
+  (:require [kotoba.artifact.core :as artifact]
+                        [kotoba.compiler.definition-identity :as definition-identity]
+                        [kotoba.kir.compatibility :as compatibility]
+                        [sha2.core :as sha2])
+  )
+
+(def schema :kotoba.provenance/v1)
+
+;; Same JVM `MessageDigest`/Node `node:crypto` split
+;; `kotoba.artifact.core/sha256` uses -- see that namespace's own
+;; comment for why. `hex` uses `clojure.core/format`, which doesn't exist
+;; in cljs at all (not just "throws" -- `format`'s cljs branch is
+;; ITSELF unused, `node:crypto`'s `.digest "hex"` already returns a hex
+;; string), so it's behind the reader-conditional too, not just its call
+;; site.
+
+
+;; ── the pure path (adr-2609242330 S1) ─────────────────────────────────────
+;; What every `:default` below is built from. Bytes are a vector of ints
+;; 0..255; text is UTF-8 already in Kotoba, so its bytes are its code points
+;; re-encoded, read at byte offsets. The host branches must answer the same
+;; strings -- test/kotoba/compiler/provenance_pure_test.cljk runs these
+;; functions on nbb against node:crypto / Buffer.
+
+(defn- utf8-code-point
+  "OUT with the UTF-8 encoding of the scalar value CP appended."
+  [out cp]
+  (cond
+    (< cp 0x80) (conj out cp)
+    (< cp 0x800) (conj out (+ 0xC0 (quot cp 64)) (+ 0x80 (bit-and cp 0x3F)))
+    (< cp 0x10000) (conj out (+ 0xE0 (quot cp 4096))
+                         (+ 0x80 (bit-and (quot cp 64) 0x3F))
+                         (+ 0x80 (bit-and cp 0x3F)))
+    :else (conj out (+ 0xF0 (quot cp 262144))
+                (+ 0x80 (bit-and (quot cp 4096) 0x3F))
+                (+ 0x80 (bit-and (quot cp 64) 0x3F))
+                (+ 0x80 (bit-and cp 0x3F)))))
+
+(defn- hex-digit [d]
+  (let [digits "0123456789abcdef"]
+    (string-substring digits d (inc d))))
+
+(defn- pure-hex
+  "Lowercase hex of a vector of ints 0..255."
+  [bytes]
+  (reduce (fn [acc b]
+            (str acc (hex-digit (quot (bit-and b 0xff) 16)) (hex-digit (bit-and b 15))))
+          "" bytes))
+
+(defn- raw-sha256 [bytes]
+  (pure-hex (sha2/sha256 bytes)))
+(defn- utf8-vector
+  "The UTF-8 bytes of VALUE as a vector of ints (the Kotoba text walk)."
+  [value]
+  (let [n (string-byte-length value)]
+                (loop [i 0 out []]
+                  (if (< i n)
+                    (let [cp (string-code-point-at value i)]
+                      (recur (+ i (cond (< cp 0x80) 1 (< cp 0x800) 2 (< cp 0x10000) 3 :else 4))
+                             (utf8-code-point out cp)))
+                    out))))
+(defn- text-sha256 [value]
+  (raw-sha256 (utf8-vector value)))
+(defn- byte-size [value]
+  (string-byte-length value))
+(defn- vector-sha256
+  "SHA-256 hex of a vector of ints (each masked to a byte, as the host
+  byte containers do)."
+  [bytes]
+  (raw-sha256 (mapv #(bit-and % 0xff) bytes)))
+(defn- bytes-identity [format bytes]
+  {:format format :sha256 (vector-sha256 bytes) :size (count bytes)})
+
+(defn- outputs [result]
+  (cond-> (sorted-map)
+    (= :wasm/v1 (:format result))
+    (assoc :primary (bytes-identity :wasm (:bytes result)))
+    (= :wasm-component/v1 (:format result))
+    (assoc :primary (bytes-identity :wasm-component (:bytes result)))
+    (= :cljs/v1 (:format result))
+    (assoc :primary {:format :cljs-source :sha256 (text-sha256 (:source result))
+                     :size (byte-size (:source result))})
+    (= :javascript/v1 (:format result))
+    (assoc :primary {:format :javascript-source :sha256 (text-sha256 (:source result))
+                     :size (byte-size (:source result))})
+    (= :kexe/v1 (:format result))
+    (assoc :primary {:format :kotoba.kexe/v1 :sha256 (get-in result [:artifact :sha256])})
+    ;; The EVM backend's own artifact already carries byte vectors plus their
+    ;; digests (evm/emit computes :runtime-sha256/:creation-sha256 itself), so
+    ;; the primary output identity reuses those digests rather than re-hashing
+    ;; the vectors here. Before this branch an `:evm/v1` result proved nothing
+    ;; about its emitted bytes: `:outputs` came out `{}` on BOTH runtimes --
+    ;; this file is .cljc and both share it -- so the provenance seal bound
+    ;; only the source, HIR and KIR. The same gap every other backend closed
+    ;; when this map grew its first branches.
+    (= :evm/v1 (:format result))
+    (assoc :primary {:format :evm-creation-bytes
+                     :sha256 (or (:creation-sha256 result)
+                                 (vector-sha256 (:creation-bytes result)))
+                     :size (count (:creation-bytes result))})
+    (= :kototama/program-v1 (:format result))
+    (assoc :primary {:format :dag-cbor
+                     :cid (:program-cid result)
+                     :size (count (:program-bytes result))})
+    (:binary result) (assoc :binary (bytes-identity (:format (:binary result)) (:bytes (:binary result))))
+    (:object result) (assoc :object (bytes-identity (:format (:object result)) (:bytes (:object result))))))
+
+(defn descriptor
+  ([source policy result] (descriptor source policy {} result))
+  ([source policy build-metadata result]
+   (artifact/seal
+    {:format schema
+    :builder :kotoba-compiler/v1
+    :compiler compatibility/compiler-version
+    :language compatibility/language-version
+    :source-sha256 (text-sha256 source)
+    :policy-sha256 (artifact/sha256 policy)
+    :build-metadata-sha256 (artifact/sha256 build-metadata)
+    :hir-sha256 (artifact/sha256 (:hir result))
+    :kir-sha256 (artifact/sha256 (:kir result))
+    :target (:target result)
+    :target-profile-sha256 (artifact/sha256 (or (:target-profile result)
+                                                (get-in result [:artifact :target-profile])))
+    :compatibility-sha256 (artifact/sha256 (:compatibility result))
+    ;; ADR 0300. The definition graph, addressed by content: one CID per
+    ;; top-level function, its direct dependencies as CIDs, and the effect row
+    ;; that CID seals. `:hir-sha256` and `:kir-sha256` above are hashes of one
+    ;; whole-module value, so they answer "is this the same build?" and nothing
+    ;; smaller; this answers "which of these definitions are the same code",
+    ;; which is the question a rename asks and the one a cache has to key on.
+    ;; A backend whose result carries no typed KIR gets a named reason rather
+    ;; than an empty map -- see `definition-identity/describe`.
+    :definitions (definition-identity/describe result)
+    :outputs (outputs result)})))
+
+(defn attach [source policy build-metadata result]
+  (let [provenance (descriptor source policy build-metadata result)]
+    (cond-> (assoc result :provenance provenance)
+      (:manifest result) (assoc-in [:manifest :kotoba.artifact/provenance] provenance))))
+
+(defn- sha256-equal? [a b]
+  (let [n (string-byte-length a)]
+                (and (= n (string-byte-length b))
+                     (zero? (loop [i 0 acc 0]
+                              (if (< i n)
+                                (recur (inc i) (bit-or acc (bit-xor (string-code-point-at a i)
+                                                                    (string-code-point-at b i))))
+                                acc))))))
+
+(defn verify!
+  ([source policy result] (verify! source policy {} result))
+  ([source policy build-metadata result]
+   (let [actual (:provenance result)
+        expected (descriptor source policy build-metadata (dissoc result :provenance))]
+    (when-not (and (map? actual)
+                   (= (set (keys expected)) (set (keys actual)))
+                   (artifact/valid-seal? actual)
+                   (sha256-equal? (:sha256 actual) (:sha256 expected)))
+      (throw (ex-info "compilation provenance rejected"
+                      {:phase :provenance :reason :identity-mismatch})))
+     actual)))

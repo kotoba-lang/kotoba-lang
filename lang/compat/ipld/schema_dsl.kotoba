@@ -1,0 +1,277 @@
+(ns ipld.schema-dsl
+  "IPLD Schema DSL parser producing normalized Schema DMT maps.
+
+  The DMT, not this parser's transient syntax state, is the public result and
+  source of truth. Unsupported or malformed syntax is rejected with a token
+  offset; no declaration is skipped."
+  {:kotoba/export [parse punctuation scalar-kinds tokenize]}
+  (:require [kotoba.lang.text :as str]
+            [kotoba.lang.edn :as reader]))
+
+(defn- fail! [problem data]
+  (throw (ex-info (str "ipld schema dsl: " (name problem))
+                  (assoc data :type :ipld/schema-dsl :problem problem))))
+
+(def punctuation #{\{ \} \[ \] \( \) \: \| \& \= \,})
+
+(defn tokenize [source]
+  (let [n (count source)]
+    (loop [i 0 out []]
+      (if (= i n)
+        out
+        (let [c (nth source i)]
+          (cond
+            (boolean (re-matches #"\s" (str c))) (recur (inc i) out)
+            (= c \#) (let [end (or (str/index-of source "\n" i) n)]
+                        (recur end out))
+            (contains? punctuation c)
+            (recur (inc i) (conj out {:kind :punct :value (str c) :at i}))
+            (= c \")
+            (let [end (loop [j (inc i) escaped? false]
+                        (when (= j n) (fail! :unterminated-string {:at i}))
+                        (let [x (nth source j)]
+                          (cond escaped? (recur (inc j) false)
+                                (= x \\) (recur (inc j) true)
+                                (= x \" ) j
+                                :else (recur (inc j) false))))
+                  literal (subs source i (inc end))]
+              (recur (inc end)
+                     (conj out {:kind :string :value (reader/read-string literal) :at i})))
+            (or (boolean (re-matches #"[0-9]" (str c)))
+                (and (= c \-) (< (inc i) n)
+                     (boolean (re-matches #"[0-9]" (str (nth source (inc i)))))))
+            (let [value (re-find #"^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?"
+                                 (subs source i))
+                  value (first value)
+                  integer? (boolean (re-matches #"-?[0-9]+" value))]
+              (recur (+ i (count value))
+                     (conj out {:kind (if integer? :int :float)
+                                :value (if integer?
+                                         
+                                         )
+                                :at i})))
+            (or (boolean (re-matches #"[A-Za-z]" (str c))) (= c \_) (= c \-))
+            (let [end (loop [j (inc i)]
+                        (if (and (< j n)
+                                 (let [x (nth source j)]
+                                   (or (boolean (re-matches #"[A-Za-z0-9]" (str x)))
+                                       (= x \_) (= x \-))))
+                          (recur (inc j)) j))
+                  value (subs source i end)]
+              (recur end (conj out {:kind :id :value value :at i})))
+            :else (fail! :unexpected-character {:at i :character (str c)})))))))
+
+(defn- parser [source] {:tokens (vec (tokenize source)) :index (atom 0)})
+(defn- peek-token [{:keys [tokens index]}] (get tokens @index))
+(defn- take-token! [{:keys [tokens index] :as p}]
+  (or (let [token (get tokens @index)] (swap! index inc) token)
+      (fail! :unexpected-eof {:token-index @index :parser p})))
+(defn- accept! [p value]
+  (when (= value (:value (peek-token p))) (take-token! p)))
+(defn- expect! [p value]
+  (let [token (take-token! p)]
+    (when-not (= value (:value token))
+      (fail! :unexpected-token {:expected value :actual (:value token) :at (:at token)}))
+    token))
+(defn- expect-kind! [p kind]
+  (let [token (take-token! p)]
+    (when-not (= kind (:kind token))
+      (fail! :unexpected-token-kind {:expected kind :actual token}))
+    (:value token)))
+
+(declare parse-type-ref!)
+
+(def scalar-kinds #{"bool" "string" "bytes" "int" "float" "any"})
+
+(defn- parse-type-ref! [p]
+  (let [token (peek-token p)]
+    (cond
+      (= "&" (:value token))
+      (do (take-token! p)
+          (let [expected (expect-kind! p :id)]
+            {"link" (cond-> {} (not= "Any" expected) (assoc "expectedType" expected))}))
+
+      (= "[" (:value token))
+      (do (take-token! p)
+          (let [nullable? (boolean (accept! p "nullable"))
+                value-type (parse-type-ref! p)]
+            (expect! p "]")
+            {"list" (cond-> {"valueType" value-type}
+                      nullable? (assoc "valueNullable" true))}))
+
+      (= "{" (:value token))
+      (do (take-token! p)
+          (let [key-type (parse-type-ref! p)]
+            (when-not (string? key-type)
+              (fail! :map-key-must-be-named {:key-type key-type :at (:at token)}))
+            (expect! p ":")
+            (let [nullable? (boolean (accept! p "nullable"))
+                  value-type (parse-type-ref! p)]
+              (expect! p "}")
+              {"map" (cond-> {"keyType" key-type "valueType" value-type}
+                       nullable? (assoc "valueNullable" true))})))
+
+      (= :id (:kind token))
+      (let [name (:value (take-token! p))]
+        (if (contains? scalar-kinds name)
+          (if (= "bytes" name)
+            {"bytes" {"representation" {"bytes" {}}}}
+            {name {}})
+          name))
+
+      :else (fail! :expected-type-reference {:actual token}))))
+
+(defn- literal! [p]
+  (let [{:keys [kind value] :as token} (take-token! p)]
+    (case kind
+      (:string :int :float) value
+      :id (case value "true" true "false" false "null" nil
+                (fail! :expected-literal {:actual token}))
+      (fail! :expected-literal {:actual token}))))
+
+(defn- param-value! [p]
+  (if (accept! p "[")
+    (loop [out []]
+      (if (accept! p "]") out
+          (let [value (literal! p)]
+            (accept! p ",")
+            (recur (conj out value)))))
+    (literal! p)))
+
+(defn- parse-params! [p]
+  (if-not (accept! p "{")
+    {}
+    (loop [out {}]
+      (if (accept! p "}") out
+          (let [key (expect-kind! p :id)
+                value (param-value! p)]
+            (recur (assoc out key value)))))))
+
+(defn- representation! [p default]
+  (if-not (accept! p "representation") default
+      (let [strategy (expect-kind! p :id)]
+        {strategy (parse-params! p)})))
+
+(defn- field-annotation! [p]
+  (when (accept! p "(")
+    (loop [out {}]
+      (if (accept! p ")") out
+          (let [name (expect-kind! p :id)
+                value (literal! p)]
+            (recur (assoc out name value)))))))
+
+(defn- parse-struct! [p]
+  (expect! p "{")
+  (loop [fields {} repr-fields {}]
+    (if (accept! p "}")
+      (let [representation (representation! p {"map" {}})
+            representation (if (and (seq repr-fields) (contains? representation "map"))
+                             (assoc-in representation ["map" "fields"] repr-fields)
+                             representation)]
+        {"struct" {"fields" fields "representation" representation}})
+      (let [field-name (expect-kind! p :id)
+            optional? (boolean (accept! p "optional"))
+            nullable? (boolean (accept! p "nullable"))
+            field-type (parse-type-ref! p)
+            annotation (field-annotation! p)]
+        (when (contains? fields field-name)
+          (fail! :duplicate-field {:field field-name}))
+        (recur (assoc fields field-name
+                      (cond-> {"type" field-type}
+                        optional? (assoc "optional" true)
+                        nullable? (assoc "nullable" true)))
+               (cond-> repr-fields annotation (assoc field-name annotation)))))))
+
+(defn- parse-union! [p]
+  (expect! p "{")
+  (loop [entries []]
+    (if (accept! p "}")
+      (do
+        (expect! p "representation")
+        (let [strategy (expect-kind! p :id)
+              params (parse-params! p)
+              members (mapv first entries)
+              table (into {} (map (fn [[member discriminant]]
+                                    [(str discriminant) member]) entries))]
+          (when-not (contains? #{"keyed" "kinded" "envelope" "inline"
+                                 "stringprefix" "bytesprefix"} strategy)
+            (fail! :unsupported-union-representation {:representation strategy}))
+          (let [details (case strategy
+                          ("keyed" "kinded") table
+                          "envelope" (assoc params "discriminantTable" table)
+                          "inline" (assoc params "discriminantTable" table)
+                          ("stringprefix" "bytesprefix") {"prefixes" table})]
+            {"union" {"members" members
+                      "representation" {strategy details}}})))
+      (do
+        (expect! p "|")
+        (let [member (parse-type-ref! p)
+              discriminant (:value (take-token! p))]
+          (recur (conj entries [member discriminant])))))))
+
+(defn- parse-enum! [p]
+  (expect! p "{")
+  (loop [members [] mappings {}]
+    (if (accept! p "}")
+      (let [strategy (if (accept! p "representation") (expect-kind! p :id) "string")
+            mappings (if (= "int" strategy)
+                       (into {} (map (fn [[member value]]
+                                      [member (if (string? value)
+                                                
+                                                value)]) mappings))
+                       mappings)]
+        (when-not (contains? #{"string" "int"} strategy)
+          (fail! :unsupported-enum-representation {:representation strategy}))
+        {"enum" (cond-> {"members" members "representation" {strategy mappings}})})
+      (do
+        (expect! p "|")
+        (let [token (take-token! p)
+              member (str (:value token))
+              represented (when (accept! p "(")
+                            (let [value (literal! p)] (expect! p ")") value))]
+          (recur (conj members member)
+                 (cond-> mappings (some? represented) (assoc member represented))))))))
+
+(defn- parse-definition! [p]
+  (let [head (:value (peek-token p))]
+    (case head
+      "struct" (do (take-token! p) (parse-struct! p))
+      "union" (do (take-token! p) (parse-union! p))
+      "enum" (do (take-token! p) (parse-enum! p))
+      "unit" (do (take-token! p) (expect! p "representation")
+                 {"unit" {"representation" (expect-kind! p :id)}})
+      (let [type-ref (parse-type-ref! p)]
+        (if (and (map? type-ref) (accept! p "representation"))
+          (let [strategy (expect-kind! p :id)
+                params (if (= "advanced" strategy)
+                         (expect-kind! p :id)
+                         (parse-params! p))
+                kind (first (keys type-ref))]
+            (case kind
+              "map" (assoc-in type-ref ["map" "representation"] {strategy params})
+              "list" (assoc-in type-ref ["list" "representation"] {strategy params})
+              "bytes" (assoc-in type-ref ["bytes" "representation"] {strategy params})
+              (fail! :representation-not-allowed {:kind kind :strategy strategy})))
+          type-ref)))))
+
+(defn parse
+  "Parse a complete IPLD Schema DSL document into `{\"types\" ...}` DMT."
+  [source]
+  (let [p (parser source)]
+    (loop [types {} advanced {}]
+      (if-not (peek-token p)
+        (cond-> {"types" types} (seq advanced) (assoc "advanced" advanced))
+        (let [record (expect-kind! p :id)]
+          (case record
+            "advanced"
+            (let [name (expect-kind! p :id)]
+              (when (contains? advanced name) (fail! :duplicate-advanced {:name name}))
+              (recur types (assoc advanced name {})))
+            "type"
+            (let [name (expect-kind! p :id)
+                  definition (if (accept! p "=")
+                               {"copy" {"fromType" (expect-kind! p :id)}}
+                               (parse-definition! p))]
+              (when (contains? types name) (fail! :duplicate-type {:name name}))
+              (recur (assoc types name definition) advanced))
+            (fail! :unknown-record {:record record})))))))

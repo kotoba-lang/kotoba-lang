@@ -1,0 +1,138 @@
+;; murakumo.overlay.tcp-driver — Node-hosted overlay RPC over TCP.
+
+(ns murakumo.overlay.tcp-driver
+  "The overlay RPC (`murakumo.overlay.rpc`) on a host that has Node but no QUIC: one EDN line
+  in, one EDN line out, per connection.
+
+  Where it is safe to run. The transport adds no authentication of its own, exactly as the
+  QUIC driver trusts any certificate: who is speaking is established one layer up (signed
+  runner/issuer identities, leases, capabilities checked at the destination). So it binds
+  only to loopback or the Tailnet range 100.64.0.0/10, whose WireGuard layer already
+  authenticates and encrypts the link, and refuses anything else. Do not expose it to the
+  internet.
+
+  `request!` is synchronous because its callers are: it runs the socket I/O in a short-lived
+  `node` child process (stdin: the request, stdout: the result) and waits for it.
+
+  Bounded: one request line at most `max-line-bytes`, an idle connection is dropped after
+  `idle-ms`, and at most `max-connections` are served at once.
+
+  Node only."
+  (:require ["node:child_process" :as cp]
+            ["node:net" :as net]
+            [kotoba.lang.edn :as edn]
+            [murakumo.overlay.rpc-core :as rpc]))
+
+(def default-timeout-ms 3000)
+(def max-line-bytes (* 8 1024 1024))
+(def idle-ms 30000)
+(def max-connections 64)
+
+(defn bind-ok?
+  "Loopback or the Tailnet range 100.64.0.0/10; never a wildcard."
+  [host]
+  (boolean
+   (or (contains? #{"127.0.0.1" "::1" "localhost"} host)
+       (when-let [[_ b c d] (re-matches #"100\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})" (str host))]
+         (and (<= 64 (js/Number b) 127)
+              (every? #(and (= % (str (js/Number %))) (<= 0 (js/Number %) 255)) [b c d]))))))
+
+;; ---- client (synchronous, through a child process) ---------------------------------------
+
+(def ^:private client-js
+  ;; stdin: {"host","port","line","timeoutMs","maxBytes"}; stdout: {"ok":true,"line":..} | {"ok":false,"reason","message"}
+  "const net=require('node:net');let raw='';process.stdin.on('data',c=>raw+=c);process.stdin.on('end',()=>{const q=JSON.parse(raw);let buf=Buffer.alloc(0),done=false;const out=o=>{if(!done){done=true;process.stdout.write(JSON.stringify(o),()=>process.exit(0))}};const s=net.connect({host:q.host,port:q.port});s.setTimeout(q.timeoutMs,()=>{s.destroy();out({ok:false,reason:'timeout',message:'no response in '+q.timeoutMs+' ms'})});s.on('error',e=>out({ok:false,reason:'stream-error',message:e.message}));s.on('connect',()=>s.write(q.line+'\\n'));s.on('data',c=>{buf=Buffer.concat([buf,c]);if(buf.length>q.maxBytes){s.destroy();return out({ok:false,reason:'stream-error',message:'response too large'})}const i=buf.indexOf(10);if(i>=0){s.end();out({ok:true,line:buf.subarray(0,i).toString('utf8')})}});s.on('close',()=>out({ok:false,reason:'stream-error',message:'closed before a response'}))});")
+
+(defn request!
+  "One round trip, blocking. -> {:ok? true :request envelope :response edn} or
+  {:ok? false :reason :stream-error|:timeout|:invalid-request :message string}."
+  [request payload timeout-ms]
+  (let [{:keys [host port]} (:connect request)
+        timeout-ms (or timeout-ms default-timeout-ms)]
+    (cond
+      (not (and (string? host) (bind-ok? host) (js/Number.isSafeInteger port) (<= 1 port 65535)))
+      {:ok? false :reason :invalid-request :message "endpoint must be loopback or a Tailnet address with a port"}
+
+      :else
+      (let [envelope (rpc/request-envelope request payload)
+            line (pr-str envelope)]
+        (if (> (.-length (js/Buffer.from line "utf8")) max-line-bytes)
+          {:ok? false :reason :invalid-request :message "request too large"}
+          (let [r (.spawnSync cp js/process.execPath #js ["-e" client-js]
+                              #js {:input (js/JSON.stringify #js {:host host :port port :line line
+                                                                  :timeoutMs timeout-ms :maxBytes max-line-bytes})
+                                   :encoding "utf8" :timeout (+ timeout-ms 5000) :maxBuffer (* 2 max-line-bytes)})
+                out (when (and (not (.-error r)) (= 0 (.-status r)) (seq (.-stdout r)))
+                      (js/JSON.parse (.-stdout r)))]
+            (cond
+              (nil? out) {:ok? false :reason :stream-error
+                          :message (str "client failed: " (or (some-> r .-error .-message) (.-stderr r) "no output"))}
+              (not (aget out "ok")) {:ok? false :reason (keyword (aget out "reason")) :message (aget out "message")}
+              :else (let [response (try (edn/read-string (aget out "line")) (catch :default _ ::unreadable))]
+                      (if (= ::unreadable response)
+                        {:ok? false :reason :stream-error :message "unreadable response"}
+                        {:ok? true :request envelope :response response})))))))))
+
+;; ---- server --------------------------------------------------------------------------------
+
+(defn- serve-connection! [socket handler active]
+  (let [chunks (atom []) size (atom 0) answered (atom false)
+        answer! (fn [text]
+                  (when-not @answered
+                    (reset! answered true)
+                    (.end socket (str text "\n"))))
+        finish! (fn [bytes]
+                  (let [{:keys [response-line]} (rpc/handle-request-envelope (.toString bytes "utf8") handler)]
+                    (answer! response-line)))]
+    (.setTimeout socket idle-ms (fn [] (.destroy socket)))
+    (.on socket "error" (fn [_] (.destroy socket)))
+    (.on socket "close" (fn [] (swap! active dec)))
+    (.on socket "data"
+         (fn [chunk]
+           (when-not @answered
+             ;; Look for the delimiter in the new chunk only, and count only the bytes before
+             ;; it, so a line of exactly max-line-bytes is accepted and a fragmented line is
+             ;; concatenated once rather than on every chunk.
+             (let [i (.indexOf chunk 10)
+                   line-part (if (neg? i) chunk (.subarray chunk 0 i))]
+               (swap! size + (.-length line-part))
+               (cond
+                 (> @size max-line-bytes)
+                 (answer! (pr-str {:error "request too large"}))
+
+                 (neg? i)
+                 (swap! chunks conj chunk)
+
+                 :else
+                 (finish! (js/Buffer.concat (clj->js (conj @chunks line-part)))))))))))
+
+(defn start-rpc-server!
+  "Listen on the endpoint `request` describes and answer every connection with `handler`.
+  -> Promise<{:port n :close! (fn [] Promise)}>. Rejects for an endpoint that is not loopback
+  or Tailnet."
+  [request handler]
+  (let [{:keys [host port]} (:connect request)]
+    (if-not (and (string? host) (bind-ok? host) (js/Number.isSafeInteger port) (<= 0 port 65535))
+      (js/Promise.reject (js/Error. "murakumo tcp overlay: bind only to loopback or the Tailnet"))
+      (let [active (atom 0)
+            server (.createServer net
+                                  (fn [socket]
+                                    (if (>= @active max-connections)
+                                      (.destroy socket)
+                                      (do (swap! active inc) (serve-connection! socket handler active)))))]
+        (js/Promise.
+         (fn [resolve reject]
+           (.once server "error" reject)
+           (.listen server port host
+                    (fn [] (resolve {:port (.-port (.address server))
+                                     :close! (fn [] (js/Promise. (fn [ok _] (.close server (fn [] (ok nil))))))})))))))))
+
+(defn serve-rpc!
+  "Long-running listener, like the QUIC driver's: prints one listening line and then serves
+  until the process ends. -> a Promise that never settles (the server keeps the process alive)."
+  [request handler]
+  (-> (start-rpc-server! request handler)
+      (.then (fn [{:keys [port]}]
+               (println (pr-str {:ok? true :type "murakumo.overlay.tcp-listener" :mode :listening
+                                 :transport :tcp :listen {:host (get-in request [:connect :host]) :port port}}))
+               (js/Promise. (fn [_ _] nil))))))

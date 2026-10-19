@@ -1,0 +1,215 @@
+(ns kotoba.security.crypto-policy
+  "FIPS/PQC crypto policy checks (kotoba-lang/kotoba#264).
+
+  Deployable, testable policy over cryptographic envelopes and the crypto
+  inventory register. Modes (policy/crypto-policy.edn):
+
+  - :crypto-agile     envelopes must carry provider and algorithm metadata;
+  - :hybrid-required  KEM envelopes must be hybrid classical+PQ for epochs
+                      >= :hybrid-epoch-floor;
+  - :fips-required    providers must be FIPS-validated and inventory entries
+                      must not be :crypto/fips-status :not-claimed.
+
+  See docs/fips-validation.md and docs/pqc-roadmap.md."
+  {:kotoba/export [check-envelope check-inventory check-production-envelope classical-kems envelope-error evaluate-pq-provider hybrid-kem-components? invalid inventory-entry-error inventory-entry-required inventory-error known-modes missing-key policy-error pq-kems provider-metadata-error rotate-envelope]}
+  (:require [kotoba.lang.coll :as set]))
+
+;; clojure.core/some, spelled as the loop it is. In Kotoba `some` is the
+;; option constructor and a two-argument `(some pred coll)` is refused as a
+;; name collision (kotoba-sema frontend); this is the same definition as
+;; clojure.core/some -- the first logical-true (pred x), in order, stopping
+;; there -- so the host answer is unchanged on nbb and the JVM.
+(defn- first-truthy [pred coll]
+  (loop [s (seq coll)]
+    (when s
+      (or (pred (first s)) (recur (next s))))))
+
+(def known-modes
+  #{:crypto-agile :hybrid-required :fips-required})
+
+(def classical-kems #{:x25519 :p-256})
+(def pq-kems #{:ml-kem-768})
+
+(defn evaluate-pq-provider
+  "Qualify the deployed ML-KEM provider identity and executable module.
+
+  Certification is deliberately not inferred from algorithm labels or KATs."
+  [evidence expected-module-digest]
+  (let [algorithms (set (:provider/algorithms evidence))
+        violations
+        (cond-> []
+          (not (keyword? (:provider/id evidence))) (conj :provider-id)
+          (not (string? (:provider/implementation-version evidence)))
+          (conj :implementation-version)
+          (not= expected-module-digest (:provider/module-digest evidence))
+          (conj :module-binding)
+          (not (contains? algorithms :ml-kem-768)) (conj :ml-kem-768)
+          (not= true (:provider/known-answer-tests-passed? evidence))
+          (conj :known-answer-tests)
+          (not= true (:provider/encapsulation-verified? evidence))
+          (conj :encapsulation)
+          (not= true (:provider/decapsulation-verified? evidence))
+          (conj :decapsulation)
+          (not= true (:provider/invalid-ciphertext-rejected? evidence))
+          (conj :invalid-ciphertext)
+          (not= true (:provider/module-load-failed-closed? evidence))
+          (conj :module-load-fail-closed))]
+    {:pq-provider/qualified? (empty? violations)
+     :pq-provider/id (:provider/id evidence)
+     :pq-provider/module-digest (:provider/module-digest evidence)
+     :pq-provider/violations violations
+     :pq-provider/non-claims #{:fips-validation :side-channel-certification}}))
+
+(defn hybrid-kem-components? [algorithms]
+  (let [algorithms (set algorithms)]
+    (and (seq (set/set-intersection algorithms classical-kems))
+         (seq (set/set-intersection algorithms pq-kems)))))
+
+(defn invalid
+  [message data]
+  {:valid? false :message message :data data})
+
+(defn missing-key
+  [m keys message]
+  (first-truthy (fn [k] (when-not (contains? m k) (invalid message {:missing k}))) keys))
+
+(defn policy-error
+  [policy]
+  (or
+   (when-not (= 1 (:kotoba.security/crypto-policy-version policy))
+     (invalid "crypto policy version 1 required"
+              {:value (:kotoba.security/crypto-policy-version policy)}))
+   (when-not (contains? known-modes (:mode policy))
+     (invalid "unknown crypto policy mode"
+              {:mode (:mode policy) :allowed known-modes}))))
+
+(defn provider-metadata-error
+  "Envelopes missing provider metadata are rejected under any mode
+  (docs/fips-validation.md: record crypto provider metadata in envelopes)."
+  [envelope]
+  (let [provider (:envelope/provider envelope)]
+    (or
+     (when (nil? provider)
+       (invalid "provider metadata required" {:envelope envelope}))
+     (when-not (keyword? (:provider/id provider))
+       (invalid "provider id required" {:provider provider}))
+     (when-not (boolean? (:provider/fips-validated provider))
+       (invalid "provider fips-validated flag required" {:provider provider})))))
+
+(defn envelope-error
+  [policy envelope]
+  (or
+   (policy-error policy)
+   (provider-metadata-error envelope)
+   (when-not (and (vector? (:envelope/algorithms envelope))
+                  (seq (:envelope/algorithms envelope)))
+     (invalid "envelope algorithm metadata required"
+              {:value (:envelope/algorithms envelope)}))
+   (case (:mode policy)
+     :fips-required
+     (when-not (true? (get-in envelope [:envelope/provider :provider/fips-validated]))
+       (invalid "fips-validated provider required"
+                {:provider (:envelope/provider envelope)}))
+
+     :hybrid-required
+     (when (and (true? (:envelope/kem? envelope))
+                (>= (:envelope/epoch envelope 0)
+                    (:hybrid-epoch-floor policy 0))
+                (or (not (true? (:envelope/hybrid? envelope)))
+                    (not (hybrid-kem-components? (:envelope/algorithms envelope)))))
+       (invalid "hybrid kem required for new epochs"
+                {:epoch (:envelope/epoch envelope)
+                 :algorithms (:envelope/algorithms envelope)
+                 :hybrid-epoch-floor (:hybrid-epoch-floor policy)}))
+
+     :crypto-agile nil)))
+
+(defn check-envelope
+  "Validates envelope metadata against the crypto policy.
+  Returns {:valid? true} or {:valid? false :message .. :data ..}."
+  [policy envelope]
+  (if-let [error (envelope-error policy envelope)]
+    error
+    {:valid? true}))
+
+(defn check-production-envelope
+  "Strict production admission rejects migration-era legacy envelopes."
+  [policy envelope]
+  (let [checked (check-envelope policy envelope)]
+    (cond
+      (not (:valid? checked)) checked
+      (not= :hybrid-required (:mode policy))
+      (invalid "production boundary requires hybrid-required mode"
+               {:mode (:mode policy)})
+      (< (:envelope/epoch envelope 0) (:hybrid-epoch-floor policy 0))
+      (invalid "legacy envelope epoch forbidden at production boundary"
+               {:epoch (:envelope/epoch envelope)
+                :hybrid-epoch-floor (:hybrid-epoch-floor policy)})
+      (not (hybrid-kem-components? (:envelope/algorithms envelope)))
+      (invalid "production boundary requires classical plus ML-KEM-768"
+               {:algorithms (:envelope/algorithms envelope)})
+      :else checked)))
+
+(defn rotate-envelope
+  "Require a strictly newer epoch and a complete classical+ML-KEM envelope."
+  [policy current next-envelope]
+  (let [checked (check-envelope policy next-envelope)]
+    (cond
+      (not (:valid? checked)) checked
+      (<= (:envelope/epoch next-envelope 0) (:envelope/epoch current 0))
+      (invalid "envelope epoch must increase"
+               {:current (:envelope/epoch current) :next (:envelope/epoch next-envelope)})
+      :else {:valid? true :previous-epoch (:envelope/epoch current)
+             :current-epoch (:envelope/epoch next-envelope)
+             :algorithms (:envelope/algorithms next-envelope)})))
+
+(def inventory-entry-required
+  [:crypto/use
+   :crypto/current
+   :crypto/target
+   :crypto/pq-status
+   :crypto/fips-status])
+
+(defn inventory-entry-error
+  [policy entry]
+  (or
+   (missing-key entry inventory-entry-required
+                "missing required crypto inventory field")
+   (when-not (keyword? (:crypto/use entry))
+     (invalid "crypto use keyword required" {:value (:crypto/use entry)}))
+   (when-not (seq (:crypto/current entry))
+     (invalid "crypto current algorithms required" {:use (:crypto/use entry)}))
+   (when-not (seq (:crypto/target entry))
+     (invalid "crypto target algorithms required" {:use (:crypto/use entry)}))
+   (when-not (keyword? (:crypto/pq-status entry))
+     (invalid "crypto pq-status keyword required" {:use (:crypto/use entry)}))
+   (when-not (keyword? (:crypto/fips-status entry))
+     (invalid "crypto fips-status keyword required" {:use (:crypto/use entry)}))
+   (when (and (= :fips-required (:mode policy))
+              (= :not-claimed (:crypto/fips-status entry)))
+     (invalid "fips status not-claimed forbidden under fips-required"
+              {:use (:crypto/use entry)}))))
+
+(defn inventory-error
+  [policy register]
+  (or
+   (policy-error policy)
+   (when-not (= :kotoba.security/crypto-inventory (:register/type register))
+     (invalid "crypto inventory register type required"
+              {:value (:register/type register)}))
+   (when-not (= 1 (:register/version register))
+     (invalid "crypto inventory register version 1 required"
+              {:value (:register/version register)}))
+   (when-not (seq (:inventory register))
+     (invalid "crypto inventory entries required" {}))
+   (first-truthy (fn [entry] (inventory-entry-error policy entry))
+         (:inventory register))))
+
+(defn check-inventory
+  "Validates a crypto-inventory register against the crypto policy.
+  Structure is always enforced; FIPS strictness only under :fips-required.
+  Returns {:valid? true} or {:valid? false :message .. :data ..}."
+  [policy register]
+  (if-let [error (inventory-error policy register)]
+    error
+    {:valid? true}))

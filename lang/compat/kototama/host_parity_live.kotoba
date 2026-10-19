@@ -1,0 +1,2114 @@
+(ns kototama.host-parity-live
+  "T8.4 first slice — live host runners for host-parity critical imports.
+
+  `kotoba.lang.host-parity/run-conformance` is pure matrix scoring. This ns
+  **actually links and calls** selected imports on the JVM tender (Chicory)
+  and reports which host-parity case ids are live-proven.
+
+  Browser/Node live coverage: `web/verify-host-parity-live.mjs` (actor-host
+  under Node WebAssembly; maps host-parity case ids). Legacy smoke:
+  `web/verify-actor-host.mjs`.
+
+  ADR: docs/grade-a-host-parity-live-runner.md"
+  (:require [kotoba.bytes :as kbytes] [json.data-json :as json]
+            [clojure.java.io :as io]
+            [kotoba.process :as shell]
+            [kotoba.lang.text :as str]
+            [kototama.contract :as contract]
+            [kototama.tender :as tender]
+            [kototama.postgresql-pool-provider :as pg-pool]
+            [kototama.postgresql-wire-provider :as pg-wire]
+            [kototama.transport-provider :as transport]))
+
+(defn- wat->wasm
+  "Assemble WAT → Wasm via wasm-tools (same path as tender-test)."
+  [wat]
+  (let [in (java.io.File/createTempFile "host-parity-live" ".wat")
+        out (java.io.File/createTempFile "host-parity-live" ".wasm")]
+    (try
+      (spit in wat)
+      (let [{:keys [exit err]}
+            (shell/sh "wasm-tools" "parse" (.getPath in) "-o" (.getPath out))]
+        (when-not (zero? exit)
+          (throw (ex-info "wasm-tools parse failed"
+                          {:stderr err :wat wat}))))
+      (with-open [is (io/input-stream out)]
+        (.readAllBytes is))
+      (finally
+        (.delete in)
+        (.delete out)))))
+
+;; Minimal guests — prove import linkage, not algorithm correctness
+;; (correctness already covered by tender_test + actor-host smokes).
+
+(def ^:private sha256-hex-wat
+  "(module
+     (import \"kotoba\" \"sha256_hex\" (func $sha256_hex (param i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"hello\")
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $sha256_hex (i32.const 0) (i32.const 5) (i32.const 100) (i32.const 64)))))")
+
+(def ^:private clock-monotonic-wat
+  "(module
+     (import \"kotoba\" \"clock_monotonic\" (func $clock_monotonic (result i64)))
+     (func (export \"main\") (result i64) (call $clock_monotonic)))")
+
+(def ^:private log-write-wat
+  "(module
+     (import \"kotoba\" \"log_write\" (func $log_write (param i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"ok\")
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $log_write (i32.const 0) (i32.const 2)))))")
+
+(def ^:private gen-keypair-wat
+  "Writes 32-byte seed + 32-byte pubkey (64 bytes total)."
+  "(module
+     (import \"kotoba\" \"gen_keypair\" (func $gen_keypair (param i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $gen_keypair (i32.const 0) (i32.const 64)))))")
+
+
+(def ^:private random-bytes-wat
+  "Fill 32 random bytes; returns 32 on success."
+  "(module
+     (import \"kotoba\" \"random_bytes\" (func $random_bytes (param i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $random_bytes (i32.const 0) (i32.const 32)))))")
+
+(def ^:private sign-wat
+  "gen_keypair → sign fixed message \"ok\"; returns signature byte count (64)."
+  "(module
+     (import \"kotoba\" \"gen_keypair\" (func $gen_keypair (param i32 i32) (result i32)))
+     (import \"kotoba\" \"sign\" (func $sign (param i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 64) \"ok\")
+     (func (export \"main\") (result i64)
+       (drop (call $gen_keypair (i32.const 0) (i32.const 64)))
+       (i64.extend_i32_s
+         (call $sign
+           (i32.const 0)   ;; seed
+           (i32.const 64)  ;; msg
+           (i32.const 2)
+           (i32.const 128) ;; sig out
+           (i32.const 64)))))")
+
+(def ^:private verify-wat
+  "gen_keypair → sign → verify; returns 1 on success."
+  "(module
+     (import \"kotoba\" \"gen_keypair\" (func $gen_keypair (param i32 i32) (result i32)))
+     (import \"kotoba\" \"sign\" (func $sign (param i32 i32 i32 i32 i32) (result i32)))
+     (import \"kotoba\" \"verify\" (func $verify (param i32 i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 64) \"ok\")
+     (func (export \"main\") (result i64)
+       (drop (call $gen_keypair (i32.const 0) (i32.const 64)))
+       (drop (call $sign
+               (i32.const 0) (i32.const 64) (i32.const 2)
+               (i32.const 128) (i32.const 64)))
+       (i64.extend_i32_s
+         (call $verify
+           (i32.const 32)  ;; pub (second half of gen_keypair)
+           (i32.const 32)
+           (i32.const 64)  ;; msg
+           (i32.const 2)
+           (i32.const 128) ;; sig
+           (i32.const 64)))))")
+
+(def ^:private log-read-wat
+  "Read log store into buffer; empty default store returns 0."
+  "(module
+     (import \"kotoba\" \"log_read\" (func $log_read (param i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $log_read (i32.const 0) (i32.const 256)))))")
+
+(def ^:private cbor-encode-wat
+  "Pure allowlist host import: encode empty map-ish bytes (T8.4 expand)."
+  "(module
+     (import \"kotoba\" \"cbor_encode\" (func $cbor_encode (param i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"{}\")
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s
+         (call $cbor_encode (i32.const 0) (i32.const 2) (i32.const 64) (i32.const 256)))))")
+
+(def ^:private json-encode-wat
+  "Pure allowlist host import: encode \"{}\" (T8.4 expand)."
+  "(module
+     (import \"kotoba\" \"json_encode\" (func $json_encode (param i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"{}\")
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s
+         (call $json_encode (i32.const 0) (i32.const 2) (i32.const 64) (i32.const 256)))))")
+
+(defn- http-post-wat
+  "http_post guest; URL baked into data segment (ASCII, no quotes)."
+  [url]
+  (str "(module
+          (import \"kotoba\" \"http_post\" (func $http_post (param i32 i32 i32 i32 i32 i32) (result i32)))
+          (memory (export \"memory\") 1)
+          (data (i32.const 0) \"" url "\")
+          (data (i32.const 50) \"body\")
+          (func (export \"main\") (result i64)
+            (i64.extend_i32_s
+              (call $http_post (i32.const 0) (i32.const " (count url) ")
+                               (i32.const 50) (i32.const 4)
+                               (i32.const 200) (i32.const 256)))))"))
+
+
+(defn- http-fetch-wat
+  "http_fetch guest; URL baked into data segment (ASCII, no quotes)."
+  [url]
+  (str "(module
+          (import \"kotoba\" \"http_fetch\" (func $http_fetch (param i32 i32 i32 i32) (result i32)))
+          (memory (export \"memory\") 1)
+          (data (i32.const 0) \"" url "\")
+          (func (export \"main\") (result i64)
+            (i64.extend_i32_s
+              (call $http_fetch (i32.const 0) (i32.const " (count url) ")
+                                (i32.const 200) (i32.const 256)))))"))
+
+(defn- prove-http-fetch-jvm
+  "Live-prove :http-fetch links and SSRF gate runs (loopback fail-closed -1)."
+  []
+  (let [url "http://127.0.0.1:9/"
+        wasm (wat->wasm (http-fetch-wat url))
+        caps (contract/host-caps {:grants [:http-fetch]
+                                  :limits {:max-http-fetches 1}})
+        started (System/currentTimeMillis)
+        n (tender/run-main wasm [:http-fetch] caps)
+        elapsed (- (System/currentTimeMillis) started)]
+    {:ok? (and (= -1 n) (< elapsed 2000))
+     :id :http-fetch-jvm-available
+     :import :http-fetch
+     :imports [:http-fetch]
+     :host :jvm
+     :result n
+     :elapsed-ms elapsed
+     :live? true
+     :note "fail-closed loopback proves host linked + SSRF gate"}))
+
+(defn- wat-escape
+  "Escape for WAT data string literals (TAB/LF/quote/backslash)."
+  [^String s]
+  (-> s
+      (str/replace "\\" "\\\\")
+      (str/replace "\"" "\\\"")
+      (str/replace "\t" "\\t")
+      (str/replace "\n" "\\n")))
+
+(defn- http-post-headers-wat
+  "http_post_headers guest; URL/body/headers at fixed offsets."
+  [url body headers]
+  (str "(module
+          (import \"kotoba\" \"http_post_headers\"
+            (func $h (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+          (memory (export \"memory\") 1)
+          (data (i32.const 0) \"" (wat-escape url) "\")
+          (data (i32.const 100) \"" (wat-escape body) "\")
+          (data (i32.const 200) \"" (wat-escape headers) "\")
+          (func (export \"main\") (result i64)
+            (i64.extend_i32_s
+              (call $h (i32.const 0) (i32.const " (count url) ")
+                       (i32.const 100) (i32.const " (count body) ")
+                       (i32.const 200) (i32.const " (count headers) ")
+                       (i32.const 500) (i32.const 256)))))"))
+
+(defn- prove-http-post-headers-jvm
+  "Live-prove :http-post-headers SSRF gate (loopback fail-closed -1)."
+  []
+  (let [url "http://127.0.0.1:9/"
+        body "body"
+        headers "X-Test\t1"
+        wasm (wat->wasm (http-post-headers-wat url body headers))
+        caps (contract/host-caps {:grants [:http-post-headers]
+                                  :limits {:max-http-posts 1}})
+        started (System/currentTimeMillis)
+        n (tender/run-main wasm [:http-post-headers] caps)
+        elapsed (- (System/currentTimeMillis) started)]
+    {:ok? (and (= -1 n) (< elapsed 2000))
+     :id :http-post-headers-jvm-available
+     :import :http-post-headers
+     :imports [:http-post-headers]
+     :host :jvm
+     :result n
+     :elapsed-ms elapsed
+     :live? true
+     :note "fail-closed loopback proves host linked + SSRF gate"}))
+
+(defn- json-extract-field-wat
+  "json_extract_field guest; JSON at 0, field at 100, out at 300."
+  [json-text field out-cap]
+  (str "(module
+          (import \"kotoba\" \"json_extract_field\"
+            (func $j (param i32 i32 i32 i32 i32 i32) (result i32)))
+          (memory (export \"memory\") 1)
+          (data (i32.const 0) \"" (wat-escape json-text) "\")
+          (data (i32.const 100) \"" (wat-escape field) "\")
+          (func (export \"main\") (result i64)
+            (i64.extend_i32_s
+              (call $j (i32.const 0) (i32.const " (count json-text) ")
+                       (i32.const 100) (i32.const " (count field) ")
+                       (i32.const 300) (i32.const " out-cap ")))))"))
+
+(defn- prove-json-extract-field-jvm
+  "Live-prove :json-extract-field pure host (extract \"ok\" from {\"x\":\"ok\"})."
+  []
+  (let [json-text "{\"x\":\"ok\"}"
+        field "x"
+        wasm (wat->wasm (json-extract-field-wat json-text field 64))
+        caps (contract/host-caps {:grants [:json-extract-field]
+                                  :limits {}})
+        n (tender/run-main wasm [:json-extract-field] caps)]
+    {:ok? (= 2 n) ;; "ok"
+     :id :json-extract-field-jvm-live
+     :import :json-extract-field
+     :imports [:json-extract-field]
+     :host :jvm
+     :result n
+     :live? true
+     :note "pure host extract string field — no network"}))
+
+(def ^:private llm-infer-wat
+  "(module
+     (import \"kotoba\" \"llm_infer\" (func $llm_infer (param i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"hi\")
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s
+         (call $llm_infer (i32.const 0) (i32.const 2) (i32.const 100) (i32.const 64)))))")
+
+(defn- prove-http-post-jvm
+  "Live-prove :http-post links and SSRF gate runs (loopback fail-closed -1).
+  Completing a real public POST is not required for host-parity availability."
+  []
+  (let [url "http://127.0.0.1:9/"
+        wasm (wat->wasm (http-post-wat url))
+        caps (contract/host-caps {:grants [:http-post]
+                                  :limits {:max-http-posts 1}})
+        started (System/currentTimeMillis)
+        n (tender/run-main wasm [:http-post] caps)
+        elapsed (- (System/currentTimeMillis) started)]
+    {:ok? (and (= -1 n) (< elapsed 2000))
+     :id :http-post-jvm-available
+     :import :http-post
+     :imports [:http-post]
+     :host :jvm
+     :result n
+     :elapsed-ms elapsed
+     :live? true
+     :note "fail-closed loopback proves host linked + SSRF gate"}))
+
+(defn- prove-llm-infer-jvm
+  "Live-prove :llm-infer with injected :infer-fn (no network)."
+  []
+  (let [wasm (wat->wasm llm-infer-wat)
+        caps (contract/host-caps {:grants [:llm-infer]
+                                  :limits {:max-llm-infers 1}})
+        n (tender/run-main wasm [:llm-infer] caps
+                           {:llm-client {:infer-fn (fn [_] "pong")}})]
+    {:ok? (= 4 n) ;; "pong" length
+     :id :llm-infer-jvm-available
+     :import :llm-infer
+     :imports [:llm-infer]
+     :host :jvm
+     :result n
+     :live? true
+     :note "injected infer-fn — no Anthropic network"}))
+
+(def ^:private kagi-sign-wat
+  "(module
+     (import \"kotoba\" \"kagi_sign\" (func $kagi_sign (param i32 i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"kagi://ops/key\")
+     (data (i32.const 32) \"msg\")
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s
+         (call $kagi_sign (i32.const 0) (i32.const 14)
+                          (i32.const 32) (i32.const 3)
+                          (i32.const 64) (i32.const 64)))))")
+
+(defn- prove-kagi-sign-jvm
+  "Live-prove :kagi-sign via decision-aware inject (no Keychain / kagi binary)."
+  []
+  (let [wasm (wat->wasm kagi-sign-wat)
+        decisions [{:ref "kagi://ops/key" :purpose "release"}]
+        caps (contract/host-caps {:grants [:kagi-sign]
+                                  :limits {:max-kagi-signs 1}})
+        sig (byte-array 64 (byte 7))
+        n (tender/run-main wasm [:kagi-sign] caps
+                           {:kagi-decisions decisions
+                            :kagi-client
+                            {:authorized-sign-fn
+                             (fn [ds ref msg]
+                               (when (and (= ds decisions)
+                                          (= ref "kagi://ops/key")
+                                          (= (kbytes/utf8-string ^bytes msg) "msg"))
+                                 sig))}})]
+    {:ok? (= 64 n)
+     :id :kagi-sign-jvm-available
+     :import :kagi-sign
+     :imports [:kagi-sign]
+     :host :jvm
+     :result n
+     :live? true
+     :note "injected authorized-sign-fn + decisions — no kagi/Keychain"}))
+
+(defn- transport-connect-wat
+  "transport_connect guest; host ASCII baked into data segment."
+  [host port]
+  (str "(module
+          (import \"kotoba\" \"transport_connect\" (func $tc (param i32 i32 i32) (result i64)))
+          (memory (export \"memory\") 1)
+          (data (i32.const 0) \"" host "\")
+          (func (export \"main\") (result i64)
+            (call $tc (i32.const 0) (i32.const " (count host) ")
+                      (i32.const " port "))))"))
+
+(defn- prove-transport-connect-jvm
+  "Live-prove :transport-connect via inject (provider-host-functions).
+  Empty endpoint allowlist fails closed with handle 0 — no real socket."
+  []
+  (let [host "example.com"
+        port 443
+        wasm (wat->wasm (transport-connect-wat host port))
+        caps {:grants #{:transport-connect}
+              :limits {:max-transport-connections 1
+                       :max-transport-connect-ms 100
+                       :max-transport-read-ms 100
+                       :max-transport-read-bytes 1024
+                       :max-transport-write-bytes 1024
+                       ;; set but empty → endpoint-allowed? false for all
+                       :transport-endpoint-allowlist #{}}}
+        provider (transport/native-provider caps {})
+        started (System/currentTimeMillis)]
+    (try
+      (let [n (tender/run-main wasm [:transport-connect] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})
+            elapsed (- (System/currentTimeMillis) started)]
+        {:ok? (and (zero? n) (< elapsed 2000))
+         :id :transport-connect-jvm-inject-available
+         :import :transport-connect
+         :imports [:transport-connect]
+         :host :jvm
+         :result n
+         :elapsed-ms elapsed
+         :live? true
+         :note "inject transport-provider; empty allowlist fail-closed (0)"})
+
+      (finally
+        ((:close! provider))))))
+
+(defn- tls-open-wat
+  "tls_open on invalid handle 0; server-name ASCII in data segment."
+  [server-name]
+  (str "(module
+          (import \"kotoba\" \"tls_open\" (func $tls (param i64 i32 i32) (result i64)))
+          (memory (export \"memory\") 1)
+          (data (i32.const 0) \"" server-name "\")
+          (func (export \"main\") (result i64)
+            (call $tls (i64.const 0) (i32.const 0) (i32.const " (count server-name) "))))"))
+
+(defn- prove-tls-open-jvm
+  "Live-prove :tls-open inject. Handle 0 has no TCP entry → fail-closed 0."
+  []
+  (let [server "example.com"
+        wasm (wat->wasm (tls-open-wat server))
+        caps {:grants #{:tls-open}
+              :limits {:max-transport-connections 1
+                       :max-transport-connect-ms 100
+                       :max-transport-read-ms 100
+                       :max-transport-read-bytes 1024
+                       :max-transport-write-bytes 1024
+                       :transport-endpoint-allowlist #{}}}
+        provider (transport/native-provider caps {})
+        started (System/currentTimeMillis)]
+    (try
+      (let [n (tender/run-main wasm [:tls-open] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})
+            elapsed (- (System/currentTimeMillis) started)]
+        {:ok? (and (zero? n) (< elapsed 2000))
+         :id :tls-open-jvm-inject-available
+         :import :tls-open
+         :imports [:tls-open]
+         :host :jvm
+         :result n
+         :elapsed-ms elapsed
+         :live? true
+         :note "inject transport-provider; invalid handle fail-closed (0)"})
+      (finally
+        ((:close! provider))))))
+
+(defn- transport-close-wat
+  "transport_close on unknown handle → -1."
+  []
+  "(module
+     (import \"kotoba\" \"transport_close\" (func $tc (param i64) (result i32)))
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $tc (i64.const 99)))))")
+
+(defn- prove-transport-close-jvm
+  "Live-prove :transport-close inject with unknown handle (returns -1)."
+  []
+  (let [wasm (wat->wasm (transport-close-wat))
+        caps {:grants #{:transport-close}
+              :limits {:max-transport-connections 1
+                       :max-transport-connect-ms 100
+                       :max-transport-read-ms 100
+                       :max-transport-read-bytes 1024
+                       :max-transport-write-bytes 1024
+                       :transport-endpoint-allowlist #{}}}
+        provider (transport/native-provider caps {})]
+    (try
+      (let [n (tender/run-main wasm [:transport-close] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :transport-close-jvm-inject-available
+         :import :transport-close
+         :imports [:transport-close]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject transport-provider; unknown handle → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- transport-write-fail-wat
+  "transport_write on unknown handle → -1."
+  []
+  "(module
+     (import \"kotoba\" \"transport_write\" (func $tw (param i64 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"xx\")
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s
+         (call $tw (i64.const 99) (i32.const 0) (i32.const 2)))))")
+
+(defn- prove-transport-write-jvm-inject
+  "Live-prove :transport-write inject; unknown handle fail-closed (-1)."
+  []
+  (let [wasm (wat->wasm (transport-write-fail-wat))
+        caps {:grants #{:transport-write}
+              :limits {:max-transport-connections 1
+                       :max-transport-connect-ms 100
+                       :max-transport-read-ms 100
+                       :max-transport-read-bytes 1024
+                       :max-transport-write-bytes 1024
+                       :allow-write-imports? true
+                       :transport-endpoint-allowlist #{}}}
+        provider (transport/native-provider caps {})]
+    (try
+      (let [n (tender/run-main wasm [:transport-write] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :transport-write-jvm-inject-available
+         :import :transport-write
+         :imports [:transport-write]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject transport-provider; unknown handle → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- transport-read-fail-wat
+  "transport_read on unknown handle → -1."
+  []
+  "(module
+     (import \"kotoba\" \"transport_read\" (func $tr (param i64 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s
+         (call $tr (i64.const 99) (i32.const 0) (i32.const 16)))))")
+
+(defn- prove-transport-read-jvm-inject
+  "Live-prove :transport-read inject; unknown handle fail-closed (-1)."
+  []
+  (let [wasm (wat->wasm (transport-read-fail-wat))
+        caps {:grants #{:transport-read}
+              :limits {:max-transport-connections 1
+                       :max-transport-connect-ms 100
+                       :max-transport-read-ms 100
+                       :max-transport-read-bytes 1024
+                       :max-transport-write-bytes 1024
+                       :transport-endpoint-allowlist #{}}}
+        provider (transport/native-provider caps {})]
+    (try
+      (let [n (tender/run-main wasm [:transport-read] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :transport-read-jvm-inject-available
+         :import :transport-read
+         :imports [:transport-read]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject transport-provider; unknown handle → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- transport-rw-loopback-wat
+  "connect → write \"hi\" → read echo → close. Returns bytes read (2) on success.
+  host ASCII and port baked into data / immediates."
+  [host port]
+  (str "(module
+          (import \"kotoba\" \"transport_connect\" (func $tc (param i32 i32 i32) (result i64)))
+          (import \"kotoba\" \"transport_write\" (func $tw (param i64 i32 i32) (result i32)))
+          (import \"kotoba\" \"transport_read\" (func $tr (param i64 i32 i32) (result i32)))
+          (import \"kotoba\" \"transport_close\" (func $tcl (param i64) (result i32)))
+          (memory (export \"memory\") 1)
+          (data (i32.const 0) \"" host "\")
+          (data (i32.const 16) \"hi\")
+          (func (export \"main\") (result i64)
+            (local $h i64)
+            (local $wn i32)
+            (local $rn i32)
+            (local.set $h
+              (call $tc (i32.const 0) (i32.const " (count host) ")
+                        (i32.const " port ")))
+            (if (i64.eqz (local.get $h))
+              (then (return (i64.const -2))))
+            (local.set $wn
+              (call $tw (local.get $h) (i32.const 16) (i32.const 2)))
+            (if (i32.ne (local.get $wn) (i32.const 2))
+              (then (return (i64.const -3))))
+            (local.set $rn
+              (call $tr (local.get $h) (i32.const 32) (i32.const 16)))
+            (drop (call $tcl (local.get $h)))
+            (i64.extend_i32_s (local.get $rn))))"))
+
+(defn- with-loopback-echo
+  "Start 127.0.0.1 ServerSocket echo (read once → write back), call f with port.
+  Always closes server. Echo thread is daemon-style via future + timeout."
+  [f]
+  (let [srv (java.net.ServerSocket. 0 1 (java.net.InetAddress/getByName "127.0.0.1"))
+        port (.getLocalPort srv)
+        echo (future
+               (try
+                 (let [s (.accept srv)
+                       in (.getInputStream s)
+                       out (.getOutputStream s)
+                       buf (byte-array 16)
+                       n (.read in buf)]
+                   (when (pos? n)
+                     (.write out buf 0 n)
+                     (.flush out))
+                   (.close s))
+                 (catch Exception _ nil)))]
+    (try
+      (f port)
+      (finally
+        (try (.close srv) (catch Exception _ nil))
+        (try
+          (deref echo 3000 :timeout)
+          (catch Exception _ nil))))))
+
+(defn- prove-transport-rw-jvm-loopback-success
+  "Live-prove :transport-write + :transport-read success on real loopback TCP
+  via transport-provider inject (connect → write \"hi\" → echo read)."
+  []
+  (with-loopback-echo
+    (fn [port]
+      (let [host "127.0.0.1"
+            ep (str host ":" port)
+            wasm (wat->wasm (transport-rw-loopback-wat host port))
+            caps {:grants #{:transport-connect :transport-write
+                            :transport-read :transport-close}
+                  :limits {:max-transport-connections 2
+                           :max-transport-connect-ms 2000
+                           :max-transport-read-ms 2000
+                           :max-transport-read-bytes 1024
+                           :max-transport-write-bytes 1024
+                           :allow-write-imports? true
+                           :transport-endpoint-allowlist #{ep}}}
+            provider (transport/native-provider caps {})
+            started (System/currentTimeMillis)]
+        (try
+          (let [n (tender/run-main
+                   wasm
+                   [:transport-connect :transport-write
+                    :transport-read :transport-close]
+                   caps
+                   {:provider-host-functions (:host-functions provider)})
+                elapsed (- (System/currentTimeMillis) started)]
+            {:ok? (and (= 2 n) (< elapsed 5000))
+             :id :transport-rw-jvm-loopback-success
+             :import :transport-write
+             :imports [:transport-connect :transport-write
+                       :transport-read :transport-close]
+             :host :jvm
+             :result n
+             :elapsed-ms elapsed
+             :live? true
+             :note "loopback ServerSocket echo; write+read success (2 bytes)"})
+          (finally
+            ((:close! provider))))))))
+
+(defn- tls-server-end-point-wat
+  "tls_server_end_point on non-TLS handle 0; out buffer cap 32."
+  []
+  "(module
+     (import \"kotoba\" \"tls_server_end_point\" (func $sep (param i64 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s
+         (call $sep (i64.const 0) (i32.const 0) (i32.const 32)))))")
+
+(defn- prove-tls-server-end-point-jvm
+  "Live-prove :tls-server-end-point inject. No TLS session → -1."
+  []
+  (let [wasm (wat->wasm (tls-server-end-point-wat))
+        caps {:grants #{:tls-server-end-point}
+              :limits {:max-transport-connections 1
+                       :max-transport-connect-ms 100
+                       :max-transport-read-ms 100
+                       :max-transport-read-bytes 1024
+                       :max-transport-write-bytes 1024
+                       :transport-endpoint-allowlist #{}}}
+        provider (transport/native-provider caps {})]
+    (try
+      (let [n (tender/run-main wasm [:tls-server-end-point] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :tls-server-end-point-jvm-available
+         :import :tls-server-end-point
+         :imports [:tls-server-end-point]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject transport-provider; non-TLS handle → -1"})
+      (finally
+        ((:close! provider))))))
+
+
+(defn- pg-pool-acquire-wat
+  "pg_pool_acquire on unknown pool id → -1."
+  []
+  "(module
+     (import \"kotoba\" \"pg_pool_acquire\" (func $a (param i32) (result i32)))
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $a (i32.const 99)))))")
+
+(defn- prove-pg-pool-acquire-jvm
+  "Live-prove :pg-pool-acquire inject fail-closed (unknown pool → -1)."
+  []
+  (let [wasm (wat->wasm (pg-pool-acquire-wat))
+        caps {:grants #{:pg-pool-acquire}
+              :limits {}}
+        provider (pg-pool/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-pool-acquire] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-pool-acquire-jvm-inject-available
+         :import :pg-pool-acquire
+         :imports [:pg-pool-acquire]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject pool fail-closed provider; unknown pool → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg-pool-close-wat
+  "pg_pool_close on unknown pool id → -1."
+  []
+  "(module
+     (import \"kotoba\" \"pg_pool_close\" (func $c (param i32) (result i32)))
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $c (i32.const 99)))))")
+
+(defn- prove-pg-pool-close-jvm
+  "Live-prove :pg-pool-close inject fail-closed (unknown pool → -1)."
+  []
+  (let [wasm (wat->wasm (pg-pool-close-wat))
+        caps {:grants #{:pg-pool-close}
+              :limits {}}
+        provider (pg-pool/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-pool-close] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-pool-close-jvm-inject-available
+         :import :pg-pool-close
+         :imports [:pg-pool-close]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject pool fail-closed provider; unknown pool → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg-pool-open-wat
+  "pg_pool_open with baked host/user/db/cred; fail-closed inject → -1."
+  []
+  "(module
+     (import \"kotoba\" \"pg_pool_open\"
+       (func $o (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"h\")
+     (data (i32.const 8) \"u\")
+     (data (i32.const 16) \"d\")
+     (data (i32.const 24) \"c\")
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s
+         (call $o
+           (i32.const 0) (i32.const 1)  ;; host
+           (i32.const 5432)             ;; port
+           (i32.const 8) (i32.const 1)  ;; user
+           (i32.const 16) (i32.const 1) ;; db
+           (i32.const 24) (i32.const 1)))))") ;; cred
+
+(defn- prove-pg-pool-open-jvm
+  "Live-prove :pg-pool-open inject fail-closed (no SCRAM/PG → -1)."
+  []
+  (let [wasm (wat->wasm (pg-pool-open-wat))
+        caps {:grants #{:pg-pool-open}
+              :limits {}}
+        provider (pg-pool/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-pool-open] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-pool-open-jvm-inject-available
+         :import :pg-pool-open
+         :imports [:pg-pool-open]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject pool fail-closed provider; open without SCRAM → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg-pool-health-wat
+  "pg_pool_health on unknown pool → -1."
+  []
+  "(module
+     (import \"kotoba\" \"pg_pool_health\" (func $h (param i32) (result i32)))
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $h (i32.const 99)))))")
+
+(defn- prove-pg-pool-health-jvm
+  "Live-prove :pg-pool-health inject fail-closed (unknown pool → -1)."
+  []
+  (let [wasm (wat->wasm (pg-pool-health-wat))
+        caps {:grants #{:pg-pool-health}
+              :limits {}}
+        provider (pg-pool/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-pool-health] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-pool-health-jvm-inject-available
+         :import :pg-pool-health
+         :imports [:pg-pool-health]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject pool fail-closed provider; unknown pool → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg-pool-query-wat
+  "pg_pool_query on unknown lease → -1 (write-effect import)."
+  []
+  "(module
+     (import \"kotoba\" \"pg_pool_query\"
+       (func $q (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"SELECT 1\")
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s
+         (call $q
+           (i32.const 99)          ;; lease
+           (i32.const 0) (i32.const 8)  ;; sql
+           (i32.const 64) (i32.const 0) ;; params
+           (i32.const 128) (i32.const 256)))))") ;; out
+
+(defn- prove-pg-pool-query-jvm
+  "Live-prove :pg-pool-query inject fail-closed (no lease → -1)."
+  []
+  (let [wasm (wat->wasm (pg-pool-query-wat))
+        caps {:grants #{:pg-pool-query}
+              :limits {:allow-write-imports? true}}
+        provider (pg-pool/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-pool-query] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-pool-query-jvm-inject-available
+         :import :pg-pool-query
+         :imports [:pg-pool-query]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject pool fail-closed provider; query without lease → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg-pool-release-wat
+  "pg_pool_release on unknown lease → -1."
+  []
+  "(module
+     (import \"kotoba\" \"pg_pool_release\" (func $r (param i32) (result i32)))
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $r (i32.const 99)))))")
+
+(defn- prove-pg-pool-release-jvm
+  "Live-prove :pg-pool-release inject fail-closed (unknown lease → -1)."
+  []
+  (let [wasm (wat->wasm (pg-pool-release-wat))
+        caps {:grants #{:pg-pool-release}
+              :limits {}}
+        provider (pg-pool/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-pool-release] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-pool-release-jvm-inject-available
+         :import :pg-pool-release
+         :imports [:pg-pool-release]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject pool fail-closed provider; unknown lease → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg-pool-stats-wat
+  "pg_pool_stats on unknown pool → -1."
+  []
+  "(module
+     (import \"kotoba\" \"pg_pool_stats\" (func $s (param i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s
+         (call $s (i32.const 99) (i32.const 0) (i32.const 64)))))")
+
+(defn- prove-pg-pool-stats-jvm
+  "Live-prove :pg-pool-stats inject fail-closed (unknown pool → -1)."
+  []
+  (let [wasm (wat->wasm (pg-pool-stats-wat))
+        caps {:grants #{:pg-pool-stats}
+              :limits {}}
+        provider (pg-pool/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-pool-stats] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-pool-stats-jvm-inject-available
+         :import :pg-pool-stats
+         :imports [:pg-pool-stats]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject pool fail-closed provider; unknown pool → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg-pool-drain-wat
+  "pg_pool_drain on unknown pool → -1."
+  []
+  "(module
+     (import \"kotoba\" \"pg_pool_drain\" (func $d (param i32) (result i32)))
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $d (i32.const 99)))))")
+
+(defn- prove-pg-pool-drain-jvm
+  "Live-prove :pg-pool-drain inject fail-closed (unknown pool → -1)."
+  []
+  (let [wasm (wat->wasm (pg-pool-drain-wat))
+        caps {:grants #{:pg-pool-drain}
+              :limits {}}
+        provider (pg-pool/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-pool-drain] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-pool-drain-jvm-inject-available
+         :import :pg-pool-drain
+         :imports [:pg-pool-drain]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject pool fail-closed provider; unknown pool → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg-cancel-register-wat
+  "pg_cancel_register on non-TLS handle 0 → 0 (fail-closed)."
+  []
+  "(module
+     (import \"kotoba\" \"pg_cancel_register\"
+       (func $r (param i64 i32 i32) (result i32)))
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s
+         (call $r (i64.const 0) (i32.const 1) (i32.const 2)))))")
+
+(defn- prove-pg-cancel-register-jvm
+  "Live-prove :pg-cancel-register inject; no TLS session → 0."
+  []
+  (let [wasm (wat->wasm (pg-cancel-register-wat))
+        caps {:grants #{:pg-cancel-register}
+              :limits {:max-pg-cancel-handles 4
+                       :max-pg-cancel-requests 4
+                       :max-transport-connections 1
+                       :max-transport-connect-ms 100
+                       :max-transport-read-ms 100
+                       :max-transport-read-bytes 1024
+                       :max-transport-write-bytes 1024
+                       :transport-endpoint-allowlist #{}}}
+        provider (transport/native-provider caps {})]
+    (try
+      (let [n (tender/run-main wasm [:pg-cancel-register] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (zero? n)
+         :id :pg-cancel-register-jvm-inject-available
+         :import :pg-cancel-register
+         :imports [:pg-cancel-register]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject transport-provider; non-TLS handle fail-closed (0)"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg-cancel-wat
+  "pg_cancel on unknown handle → -1."
+  []
+  "(module
+     (import \"kotoba\" \"pg_cancel\" (func $c (param i32) (result i32)))
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $c (i32.const 99)))))")
+
+(defn- prove-pg-cancel-jvm
+  "Live-prove :pg-cancel inject; unknown cancel handle → -1."
+  []
+  (let [wasm (wat->wasm (pg-cancel-wat))
+        caps {:grants #{:pg-cancel}
+              :limits {:max-pg-cancel-handles 4
+                       :max-pg-cancel-requests 4
+                       :max-transport-connections 1
+                       :max-transport-connect-ms 100
+                       :max-transport-read-ms 100
+                       :max-transport-read-bytes 1024
+                       :max-transport-write-bytes 1024
+                       :transport-endpoint-allowlist #{}}}
+        provider (transport/native-provider caps {})]
+    (try
+      (let [n (tender/run-main wasm [:pg-cancel] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-cancel-jvm-inject-available
+         :import :pg-cancel
+         :imports [:pg-cancel]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject transport-provider; unknown cancel handle → -1"})
+      (finally
+        ((:close! provider))))))
+
+
+
+(defn- pg-open-wat
+  "pg_open with dummy host/user/db segments; fail-closed inject → handle 0."
+  []
+  "(module
+     (import \"kotoba\" \"pg_open\"
+       (func $o (param i32 i32 i32 i32 i32 i32 i32) (result i64)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"h\")
+     (data (i32.const 8) \"u\")
+     (data (i32.const 16) \"d\")
+     (func (export \"main\") (result i64)
+       (call $o
+         (i32.const 0) (i32.const 1)
+         (i32.const 5432)
+         (i32.const 8) (i32.const 1)
+         (i32.const 16) (i32.const 1))))")
+
+(defn- prove-pg-open-jvm
+  "Live-prove :pg-open wire inject fail-closed (no SCRAM/PG → handle 0)."
+  []
+  (let [wasm (wat->wasm (pg-open-wat))
+        caps {:grants #{:pg-open} :limits {}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-open] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (zero? n)
+         :id :pg-open-jvm-inject-available
+         :import :pg-open
+         :imports [:pg-open]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed provider; open → handle 0"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg-query-wat
+  "pg_query on handle 0; fail-closed → -1."
+  []
+  "(module
+     (import \"kotoba\" \"pg_query\"
+       (func $q (param i64 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"SELECT 1\")
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s
+         (call $q
+           (i64.const 0)
+           (i32.const 0) (i32.const 8)
+           (i32.const 64) (i32.const 256)))))")
+
+(defn- prove-pg-query-jvm
+  "Live-prove :pg-query wire inject fail-closed (no session → -1)."
+  []
+  (let [wasm (wat->wasm (pg-query-wat))
+        caps {:grants #{:pg-query}
+              :limits {:allow-write-imports? true}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-query] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-query-jvm-inject-available
+         :import :pg-query
+         :imports [:pg-query]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed provider; query → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg-simple-query-wat
+  "pg_simple_query with baked conn+sql; fail-closed → -1."
+  []
+  "(module
+     (import \"kotoba\" \"pg_simple_query\"
+       (func $q (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"h\")
+     (data (i32.const 8) \"SELECT 1\")
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s
+         (call $q
+           (i32.const 0) (i32.const 1)
+           (i32.const 5432)
+           (i32.const 8) (i32.const 8)
+           (i32.const 64) (i32.const 256)))))")
+
+(defn- prove-pg-simple-query-jvm
+  "Live-prove :pg-simple-query wire inject fail-closed → -1."
+  []
+  (let [wasm (wat->wasm (pg-simple-query-wat))
+        caps {:grants #{:pg-simple-query}
+              :limits {:allow-write-imports? true}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-simple-query] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-simple-query-jvm-inject-available
+         :import :pg-simple-query
+         :imports [:pg-simple-query]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed provider; simple-query → -1"})
+      (finally
+        ((:close! provider))))))
+
+
+(defn- pg-prepare-wat
+  "pg_prepare on handle 0; fail-closed → -1."
+  []
+  "(module
+     (import \"kotoba\" \"pg_prepare\"
+       (func $p (param i64 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"s\")
+     (data (i32.const 8) \"SELECT 1\")
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s
+         (call $p
+           (i64.const 0)
+           (i32.const 0) (i32.const 1)
+           (i32.const 8) (i32.const 8)
+           (i32.const 32) (i32.const 64)
+           (i32.const 128) (i32.const 4)))))")
+
+(defn- prove-pg-prepare-jvm
+  "Live-prove :pg-prepare wire inject fail-closed → -1."
+  []
+  (let [wasm (wat->wasm (pg-prepare-wat))
+        caps {:grants #{:pg-prepare}
+              :limits {:allow-write-imports? true}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-prepare] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-prepare-jvm-inject-available
+         :import :pg-prepare
+         :imports [:pg-prepare]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed provider; prepare → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg-session-reset-wat
+  "pg_session_reset on handle 0; fail-closed → -1."
+  []
+  "(module
+     (import \"kotoba\" \"pg_session_reset\"
+       (func $r (param i64 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s
+         (call $r
+           (i64.const 0)
+           (i32.const 0) (i32.const 64)
+           (i32.const 128) (i32.const 4)))))")
+
+(defn- prove-pg-session-reset-jvm
+  "Live-prove :pg-session-reset wire inject fail-closed → -1."
+  []
+  (let [wasm (wat->wasm (pg-session-reset-wat))
+        caps {:grants #{:pg-session-reset} :limits {}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-session-reset] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-session-reset-jvm-inject-available
+         :import :pg-session-reset
+         :imports [:pg-session-reset]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed provider; session-reset → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg-close-statement-wat
+  "pg_close_statement on handle 0; fail-closed → -1."
+  []
+  "(module
+     (import \"kotoba\" \"pg_close_statement\"
+       (func $c (param i64 i32 i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"s\")
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s
+         (call $c
+           (i64.const 0)
+           (i32.const 0) (i32.const 1)
+           (i32.const 32) (i32.const 64)
+           (i32.const 128) (i32.const 4)))))")
+
+(defn- prove-pg-close-statement-jvm
+  "Live-prove :pg-close-statement wire inject fail-closed → -1."
+  []
+  (let [wasm (wat->wasm (pg-close-statement-wat))
+        caps {:grants #{:pg-close-statement} :limits {}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-close-statement] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-close-statement-jvm-inject-available
+         :import :pg-close-statement
+         :imports [:pg-close-statement]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed provider; close-statement → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg_query_state-wat
+  []
+  "(module
+     (import \"kotoba\" \"pg_query_state\" (func $f (param i64 i32 i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $f (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))))")
+
+(defn- prove-pg-query-state-jvm
+  "Live-prove :pg-query-state inject fail-closed (→ -1)."
+  []
+  (let [wasm (wat->wasm (pg_query_state-wat))
+        caps {:grants #{:pg-query-state}
+              :limits {:allow-write-imports? true}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-query-state] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-query-state-jvm-inject-available
+         :import :pg-query-state
+         :imports [:pg-query-state]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed provider → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg_prepare_typed-wat
+  []
+  "(module
+     (import \"kotoba\" \"pg_prepare_typed\" (func $f (param i64 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $f (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))))")
+
+(defn- prove-pg-prepare-typed-jvm
+  "Live-prove :pg-prepare-typed inject fail-closed (→ -1)."
+  []
+  (let [wasm (wat->wasm (pg_prepare_typed-wat))
+        caps {:grants #{:pg-prepare-typed}
+              :limits {:allow-write-imports? true}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-prepare-typed] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-prepare-typed-jvm-inject-available
+         :import :pg-prepare-typed
+         :imports [:pg-prepare-typed]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed provider → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg_execute_params2-wat
+  []
+  "(module
+     (import \"kotoba\" \"pg_execute_params2\" (func $f (param i64 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $f (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))))")
+
+(defn- prove-pg-execute-params2-jvm
+  "Live-prove :pg-execute-params2 inject fail-closed (→ -1)."
+  []
+  (let [wasm (wat->wasm (pg_execute_params2-wat))
+        caps {:grants #{:pg-execute-params2}
+              :limits {:allow-write-imports? true}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-execute-params2] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-execute-params2-jvm-inject-available
+         :import :pg-execute-params2
+         :imports [:pg-execute-params2]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed provider → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg_execute_params-wat
+  []
+  "(module
+     (import \"kotoba\" \"pg_execute_params\" (func $f (param i64 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $f (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))))")
+
+(defn- prove-pg-execute-params-jvm
+  "Live-prove :pg-execute-params inject fail-closed (→ -1)."
+  []
+  (let [wasm (wat->wasm (pg_execute_params-wat))
+        caps {:grants #{:pg-execute-params}
+              :limits {:allow-write-imports? true}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-execute-params] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-execute-params-jvm-inject-available
+         :import :pg-execute-params
+         :imports [:pg-execute-params]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed provider → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg_bind_portal-wat
+  []
+  "(module
+     (import \"kotoba\" \"pg_bind_portal\" (func $f (param i64 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $f (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))))")
+
+(defn- prove-pg-bind-portal-jvm
+  "Live-prove :pg-bind-portal inject fail-closed (→ -1)."
+  []
+  (let [wasm (wat->wasm (pg_bind_portal-wat))
+        caps {:grants #{:pg-bind-portal}
+              :limits {:allow-write-imports? true}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-bind-portal] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-bind-portal-jvm-inject-available
+         :import :pg-bind-portal
+         :imports [:pg-bind-portal]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed provider → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg_fetch_portal-wat
+  []
+  "(module
+     (import \"kotoba\" \"pg_fetch_portal\" (func $f (param i64 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $f (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))))")
+
+(defn- prove-pg-fetch-portal-jvm
+  "Live-prove :pg-fetch-portal inject fail-closed (→ -1)."
+  []
+  (let [wasm (wat->wasm (pg_fetch_portal-wat))
+        caps {:grants #{:pg-fetch-portal}
+              :limits {:allow-write-imports? true}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-fetch-portal] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-fetch-portal-jvm-inject-available
+         :import :pg-fetch-portal
+         :imports [:pg-fetch-portal]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed provider → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg_close_portal-wat
+  []
+  "(module
+     (import \"kotoba\" \"pg_close_portal\" (func $f (param i64 i32 i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $f (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))))")
+
+(defn- prove-pg-close-portal-jvm
+  "Live-prove :pg-close-portal inject fail-closed (→ -1)."
+  []
+  (let [wasm (wat->wasm (pg_close_portal-wat))
+        caps {:grants #{:pg-close-portal}
+              :limits {:allow-write-imports? true}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-close-portal] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-close-portal-jvm-inject-available
+         :import :pg-close-portal
+         :imports [:pg-close-portal]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed provider → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg_copy_out-wat
+  []
+  "(module
+     (import \"kotoba\" \"pg_copy_out\" (func $f (param i64 i32 i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $f (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))))")
+
+(defn- prove-pg-copy-out-jvm
+  "Live-prove :pg-copy-out inject fail-closed (→ -1)."
+  []
+  (let [wasm (wat->wasm (pg_copy_out-wat))
+        caps {:grants #{:pg-copy-out}
+              :limits {:allow-write-imports? true}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-copy-out] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-copy-out-jvm-inject-available
+         :import :pg-copy-out
+         :imports [:pg-copy-out]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed provider → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg_copy_in-wat
+  []
+  "(module
+     (import \"kotoba\" \"pg_copy_in\" (func $f (param i64 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $f (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))))")
+
+(defn- prove-pg-copy-in-jvm
+  "Live-prove :pg-copy-in inject fail-closed (→ -1)."
+  []
+  (let [wasm (wat->wasm (pg_copy_in-wat))
+        caps {:grants #{:pg-copy-in}
+              :limits {:allow-write-imports? true}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-copy-in] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-copy-in-jvm-inject-available
+         :import :pg-copy-in
+         :imports [:pg-copy-in]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed provider → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg_execute_batch-wat
+  []
+  "(module
+     (import \"kotoba\" \"pg_execute_batch\" (func $f (param i64 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $f (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))))")
+
+(defn- prove-pg-execute-batch-jvm
+  "Live-prove :pg-execute-batch inject fail-closed (→ -1)."
+  []
+  (let [wasm (wat->wasm (pg_execute_batch-wat))
+        caps {:grants #{:pg-execute-batch}
+              :limits {:allow-write-imports? true}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-execute-batch] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-execute-batch-jvm-inject-available
+         :import :pg-execute-batch
+         :imports [:pg-execute-batch]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed provider → -1"})
+      (finally
+        ((:close! provider))))))
+
+
+(defn- pg_open_scram-wat
+  "pg_open_scram with dummy segments; fail-closed inject → handle 0."
+  []
+  "(module
+     (import \"kotoba\" \"pg_open_scram\"
+       (func $o (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i64)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"h\")
+     (data (i32.const 8) \"u\")
+     (data (i32.const 16) \"d\")
+     (data (i32.const 24) \"p\")
+     (data (i32.const 32) \"n\")
+     (func (export \"main\") (result i64)
+       (call $o
+         (i32.const 0) (i32.const 1)
+         (i32.const 5432)
+         (i32.const 8) (i32.const 1)
+         (i32.const 16) (i32.const 1)
+         (i32.const 24) (i32.const 1)
+         (i32.const 32) (i32.const 1))))")
+
+(defn- prove-pg-open-scram-jvm
+  "Live-prove :pg-open-scram wire inject fail-closed (→ handle 0)."
+  []
+  (let [wasm (wat->wasm (pg_open_scram-wat))
+        caps {:grants #{:pg-open-scram} :limits {}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-open-scram] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (zero? n)
+         :id :pg-open-scram-jvm-inject-available
+         :import :pg-open-scram
+         :imports [:pg-open-scram]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed SCRAM open → handle 0"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg_open_scram_random-wat
+  []
+  "(module
+     (import \"kotoba\" \"pg_open_scram_random\"
+       (func $o (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i64)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"h\")
+     (data (i32.const 8) \"u\")
+     (data (i32.const 16) \"d\")
+     (data (i32.const 24) \"p\")
+     (func (export \"main\") (result i64)
+       (call $o
+         (i32.const 0) (i32.const 1)
+         (i32.const 5432)
+         (i32.const 8) (i32.const 1)
+         (i32.const 16) (i32.const 1)
+         (i32.const 24) (i32.const 1))))")
+
+(defn- prove-pg-open-scram-random-jvm
+  "Live-prove :pg-open-scram-random inject fail-closed (→ handle 0)."
+  []
+  (let [wasm (wat->wasm (pg_open_scram_random-wat))
+        caps {:grants #{:pg-open-scram-random} :limits {}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-open-scram-random] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (zero? n)
+         :id :pg-open-scram-random-jvm-inject-available
+         :import :pg-open-scram-random
+         :imports [:pg-open-scram-random]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed SCRAM random open → handle 0"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg_open_scram_cancellable_random-wat
+  []
+  "(module
+     (import \"kotoba\" \"pg_open_scram_cancellable_random\"
+       (func $o (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i64)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"h\")
+     (data (i32.const 8) \"u\")
+     (data (i32.const 16) \"d\")
+     (data (i32.const 24) \"p\")
+     (func (export \"main\") (result i64)
+       (call $o
+         (i32.const 0) (i32.const 1)
+         (i32.const 5432)
+         (i32.const 8) (i32.const 1)
+         (i32.const 16) (i32.const 1)
+         (i32.const 24) (i32.const 1)
+         (i32.const 64) (i32.const 4))))")
+
+(defn- prove-pg-open-scram-cancellable-random-jvm
+  "Live-prove :pg-open-scram-cancellable-random inject fail-closed (→ handle 0)."
+  []
+  (let [wasm (wat->wasm (pg_open_scram_cancellable_random-wat))
+        caps {:grants #{:pg-open-scram-cancellable-random} :limits {}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-open-scram-cancellable-random] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (zero? n)
+         :id :pg-open-scram-cancellable-random-jvm-inject-available
+         :import :pg-open-scram-cancellable-random
+         :imports [:pg-open-scram-cancellable-random]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed SCRAM cancellable open → handle 0"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg_cancel_authority_use-wat
+  []
+  "(module
+     (import \"kotoba\" \"pg_cancel_authority_use\"
+       (func $f (param i32) (result i32)))
+     (func (export \"main\") (result i32)
+       (call $f (i32.const 0))))")
+
+(defn- prove-pg-cancel-authority-use-jvm
+  "Live-prove :pg-cancel-authority-use inject fail-closed (→ -1)."
+  []
+  (let [wasm (wat->wasm (pg_cancel_authority_use-wat))
+        caps {:grants #{:pg-cancel-authority-use} :limits {}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-cancel-authority-use] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-cancel-authority-use-jvm-inject-available
+         :import :pg-cancel-authority-use
+         :imports [:pg-cancel-authority-use]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed cancel-authority-use → -1"})
+      (finally
+        ((:close! provider))))))
+
+(defn- pg_close_scram-wat
+  []
+  "(module
+     (import \"kotoba\" \"pg_close_scram\"
+       (func $f (param i64) (result i32)))
+     (func (export \"main\") (result i32)
+       (call $f (i64.const 0))))")
+
+(defn- prove-pg-close-scram-jvm
+  "Live-prove :pg-close-scram inject fail-closed (→ -1)."
+  []
+  (let [wasm (wat->wasm (pg_close_scram-wat))
+        caps {:grants #{:pg-close-scram} :limits {}}
+        provider (pg-wire/fail-closed-inject-provider)]
+    (try
+      (let [n (tender/run-main wasm [:pg-close-scram] caps
+                               {:provider-host-functions
+                                (:host-functions provider)})]
+        {:ok? (= -1 n)
+         :id :pg-close-scram-jvm-inject-available
+         :import :pg-close-scram
+         :imports [:pg-close-scram]
+         :host :jvm
+         :result n
+         :live? true
+         :note "inject wire fail-closed close-scram → -1"})
+      (finally
+        ((:close! provider))))))
+
+;; ── :scram-sha256 purpose-bound host (restored kototama#120) ─────────────
+;; Matrix case :scram-sha256-jvm-available (host-parity.edn) was data-only until
+;; this prove. Password never enters guest memory; guest supplies salt / iters /
+;; auth-message and receives client-proof||server-signature (64 bytes).
+
+(def ^:private scram-sha256-wat
+  "Guest calls scram_sha256 with ref=db/primary, salt=saltsalt (8), iters=4096,
+   auth=28-byte placeholder, out-cap=64."
+  "(module
+     (import \"kotoba\" \"scram_sha256\"
+       (func $scram (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"db/primary\")
+     (data (i32.const 32) \"saltsalt\")
+     (data (i32.const 64) \"n,,n=u,r=r1,r=r2,c=biws,p=x\")
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s
+         (call $scram
+           (i32.const 0) (i32.const 10)
+           (i32.const 32) (i32.const 8)
+           (i32.const 4096)
+           (i32.const 64) (i32.const 28)
+           (i32.const 128) (i32.const 64)))))")
+
+(defn- prove-scram-sha256-jvm
+  "Live-prove :scram-sha256 via host credentials inject (no live PG / password in guest)."
+  []
+  (let [wasm (wat->wasm scram-sha256-wat)
+        caps (contract/host-caps
+              {:grants [:scram-sha256]
+               :limits {:max-scram-proofs 1
+                        :allow-secret-imports? true
+                        :scram-credential-allowlist #{"db/primary"}}})
+        n (tender/run-main wasm [:scram-sha256] caps
+                           {:scram-credentials {"db/primary" "s3cret"}})]
+    {:ok? (= 64 n)
+     :id :scram-sha256-jvm-available
+     :import :scram-sha256
+     :imports [:scram-sha256]
+     :host :jvm
+     :result n
+     :live? true
+     :note "injected scram-credentials + allowlist; PBKDF2/HMAC host-side → 64"}))
+
+(defn- prove-scram-sha256-jvm-deny
+  "Live-prove :scram-sha256 fail-closed when allowlist/credentials absent → -1."
+  []
+  (let [wasm (wat->wasm scram-sha256-wat)
+        caps (contract/host-caps
+              {:grants [:scram-sha256]
+               :limits {:max-scram-proofs 1
+                        :allow-secret-imports? true}})
+        n (tender/run-main wasm [:scram-sha256] caps {})]
+    {:ok? (= -1 n)
+     :id :scram-sha256-jvm-deny-available
+     :import :scram-sha256
+     :imports [:scram-sha256]
+     :host :jvm
+     :result n
+     :live? true
+     :note "no allowlist/credentials → fail-closed -1"}))
+
+(def jvm-live-corpus
+  "Host-parity case ids that this runner can live-prove on JVM tender.
+  Ids match lang/host-parity.edn :conformance :cases where listed;
+  pure allowlist host imports (cbor/json) are T8.4 expand extras.
+  Entries may use :prove (0-arity) instead of :wat/:check."
+  [{:id :sha256-hex-all-available
+    :import :sha256-hex
+    :imports [:sha256-hex]
+    :host :jvm
+    :wat sha256-hex-wat
+    :check (fn [n] (= 64 n))}
+   {:id :clock-monotonic-all
+    :import :clock-monotonic
+    :imports [:clock-monotonic]
+    :host :jvm
+    :wat clock-monotonic-wat
+    :check (fn [n] (pos? n))}
+   {:id :log-write-all-available
+    :import :log-write
+    :imports [:log-write]
+    :host :jvm
+    :wat log-write-wat
+    :check (fn [n] (not (neg? n)))}
+   {:id :log-read-all-available
+    :import :log-read
+    :imports [:log-read]
+    :host :jvm
+    :wat log-read-wat
+    :check (fn [n] (not (neg? n)))}
+   {:id :gen-keypair-all-available
+    :import :gen-keypair
+    :imports [:gen-keypair]
+    :host :jvm
+    :wat gen-keypair-wat
+    :check (fn [n] (= 64 n))}
+   {:id :random-bytes-all-available
+    :import :random-bytes
+    :imports [:random-bytes]
+    :host :jvm
+    :wat random-bytes-wat
+    :check (fn [n] (= 32 n))}
+
+   {:id :sign-all-available
+    :import :sign
+    :imports [:gen-keypair :sign]
+    :host :jvm
+    :wat sign-wat
+    :check (fn [n] (= 64 n))}
+   {:id :verify-all-available
+    :import :verify
+    :imports [:gen-keypair :sign :verify]
+    :host :jvm
+    :wat verify-wat
+    :check (fn [n] (= 1 n))}
+   {:id :cbor-encode-jvm-live
+    :import :cbor-encode
+    :imports [:cbor-encode]
+    :host :jvm
+    :wat cbor-encode-wat
+    :check (fn [n] (pos? n))}
+   {:id :json-encode-jvm-live
+    :import :json-encode
+    :imports [:json-encode]
+    :host :jvm
+    :wat json-encode-wat
+    :check (fn [n] (pos? n))}
+   {:id :http-post-jvm-available
+    :import :http-post
+    :prove prove-http-post-jvm}
+   {:id :llm-infer-jvm-available
+    :import :llm-infer
+    :prove prove-llm-infer-jvm}
+   {:id :kagi-sign-jvm-available
+    :import :kagi-sign
+    :prove prove-kagi-sign-jvm}
+   {:id :transport-connect-jvm-inject-available
+    :import :transport-connect
+    :prove prove-transport-connect-jvm}
+   {:id :tls-open-jvm-inject-available
+    :import :tls-open
+    :prove prove-tls-open-jvm}
+   {:id :transport-close-jvm-inject-available
+    :import :transport-close
+    :prove prove-transport-close-jvm}
+   {:id :transport-write-jvm-inject-available
+    :import :transport-write
+    :prove prove-transport-write-jvm-inject}
+   {:id :transport-read-jvm-inject-available
+    :import :transport-read
+    :prove prove-transport-read-jvm-inject}
+   {:id :transport-rw-jvm-loopback-success
+    :import :transport-write
+    :prove prove-transport-rw-jvm-loopback-success}
+   {:id :tls-server-end-point-jvm-available
+    :import :tls-server-end-point
+    :prove prove-tls-server-end-point-jvm}
+   {:id :pg-pool-open-jvm-inject-available
+    :import :pg-pool-open
+    :prove prove-pg-pool-open-jvm}
+   {:id :pg-pool-acquire-jvm-inject-available
+    :import :pg-pool-acquire
+    :prove prove-pg-pool-acquire-jvm}
+   {:id :pg-pool-health-jvm-inject-available
+    :import :pg-pool-health
+    :prove prove-pg-pool-health-jvm}
+   {:id :pg-pool-close-jvm-inject-available
+    :import :pg-pool-close
+    :prove prove-pg-pool-close-jvm}
+   {:id :pg-pool-query-jvm-inject-available
+    :import :pg-pool-query
+    :prove prove-pg-pool-query-jvm}
+   {:id :pg-pool-release-jvm-inject-available
+    :import :pg-pool-release
+    :prove prove-pg-pool-release-jvm}
+   {:id :pg-pool-stats-jvm-inject-available
+    :import :pg-pool-stats
+    :prove prove-pg-pool-stats-jvm}
+   {:id :pg-pool-drain-jvm-inject-available
+    :import :pg-pool-drain
+    :prove prove-pg-pool-drain-jvm}
+   {:id :pg-cancel-register-jvm-inject-available
+    :import :pg-cancel-register
+    :prove prove-pg-cancel-register-jvm}
+   {:id :pg-cancel-jvm-inject-available
+    :import :pg-cancel
+    :prove prove-pg-cancel-jvm}
+   {:id :pg-open-jvm-inject-available
+    :import :pg-open
+    :prove prove-pg-open-jvm}
+   {:id :pg-query-jvm-inject-available
+    :import :pg-query
+    :prove prove-pg-query-jvm}
+   {:id :pg-simple-query-jvm-inject-available
+    :import :pg-simple-query
+    :prove prove-pg-simple-query-jvm}
+   {:id :pg-prepare-jvm-inject-available
+    :import :pg-prepare
+    :prove prove-pg-prepare-jvm}
+   {:id :pg-session-reset-jvm-inject-available
+    :import :pg-session-reset
+    :prove prove-pg-session-reset-jvm}
+   {:id :pg-close-statement-jvm-inject-available
+    :import :pg-close-statement
+    :prove prove-pg-close-statement-jvm}
+   {:id :pg-query-state-jvm-inject-available
+    :import :pg-query-state
+    :prove prove-pg-query-state-jvm}
+   {:id :pg-prepare-typed-jvm-inject-available
+    :import :pg-prepare-typed
+    :prove prove-pg-prepare-typed-jvm}
+   {:id :pg-execute-params2-jvm-inject-available
+    :import :pg-execute-params2
+    :prove prove-pg-execute-params2-jvm}
+   {:id :pg-execute-params-jvm-inject-available
+    :import :pg-execute-params
+    :prove prove-pg-execute-params-jvm}
+   {:id :pg-bind-portal-jvm-inject-available
+    :import :pg-bind-portal
+    :prove prove-pg-bind-portal-jvm}
+   {:id :pg-fetch-portal-jvm-inject-available
+    :import :pg-fetch-portal
+    :prove prove-pg-fetch-portal-jvm}
+   {:id :pg-close-portal-jvm-inject-available
+    :import :pg-close-portal
+    :prove prove-pg-close-portal-jvm}
+   {:id :pg-copy-out-jvm-inject-available
+    :import :pg-copy-out
+    :prove prove-pg-copy-out-jvm}
+   {:id :pg-copy-in-jvm-inject-available
+    :import :pg-copy-in
+    :prove prove-pg-copy-in-jvm}
+   {:id :pg-execute-batch-jvm-inject-available
+    :import :pg-execute-batch
+    :prove prove-pg-execute-batch-jvm}
+   {:id :pg-open-scram-jvm-inject-available
+    :import :pg-open-scram
+    :prove prove-pg-open-scram-jvm}
+   {:id :pg-open-scram-random-jvm-inject-available
+    :import :pg-open-scram-random
+    :prove prove-pg-open-scram-random-jvm}
+   {:id :pg-open-scram-cancellable-random-jvm-inject-available
+    :import :pg-open-scram-cancellable-random
+    :prove prove-pg-open-scram-cancellable-random-jvm}
+   {:id :pg-cancel-authority-use-jvm-inject-available
+    :import :pg-cancel-authority-use
+    :prove prove-pg-cancel-authority-use-jvm}
+   {:id :pg-close-scram-jvm-inject-available
+    :import :pg-close-scram
+    :prove prove-pg-close-scram-jvm}
+   {:id :scram-sha256-jvm-available
+    :import :scram-sha256
+    :prove prove-scram-sha256-jvm}
+   {:id :scram-sha256-jvm-deny-available
+    :import :scram-sha256
+    :prove prove-scram-sha256-jvm-deny}
+   {:id :http-fetch-jvm-available
+    :import :http-fetch
+    :prove prove-http-fetch-jvm}
+   {:id :http-post-headers-jvm-available
+    :import :http-post-headers
+    :prove prove-http-post-headers-jvm}
+   {:id :json-extract-field-jvm-live
+    :import :json-extract-field
+    :prove prove-json-extract-field-jvm}])
+
+(defn prove-import
+  "Live-run one corpus entry on JVM tender. Returns
+  {:ok? bool :id ... :import ... :result ... :error? ...}."
+  [{:keys [id import imports wat check prove] :as entry}]
+  (if prove
+    (try
+      (prove)
+      (catch Exception e
+        {:ok? false
+         :id id
+         :import import
+         :host :jvm
+         :live? true
+         :error (.getMessage e)
+         :error-class (.getName (class e))}))
+    (try
+      (let [req (or imports [import])
+            wasm (wat->wasm wat)
+            caps (contract/host-caps
+                  {:grants (set req)
+                   :limits {:allow-write-imports? true
+                            :allow-secret-imports? true
+                            :max-log-write-bytes 1024
+                            :max-log-read-bytes 1024
+                            :max-random-bytes 4096}})
+            result (tender/run-main wasm req caps)
+            ok? (boolean (and (number? result) (check result)))]
+        {:ok? ok?
+         :id id
+         :import import
+         :imports req
+         :host :jvm
+         :result result
+         :live? true})
+      (catch Exception e
+        {:ok? false
+         :id id
+         :import import
+         :host :jvm
+         :live? true
+         :error (.getMessage e)
+         :error-class (.getName (class e))}))))
+
+(defn run-jvm-live
+  "Run the JVM live corpus. Returns
+  {:ok? bool :total N :passed N :failed [...] :results [...] :host :jvm
+   :note ...}."
+  []
+  (let [results (mapv prove-import jvm-live-corpus)
+        failed (filterv (complement :ok?) results)]
+    {:ok? (empty? failed)
+     :host :jvm
+     :total (count results)
+     :passed (- (count results) (count failed))
+     :failed failed
+     :results results
+     :case-ids (mapv :id jvm-live-corpus)
+     :note "T8.4: JVM tender live proofs (crypto/clock/log/cbor/json/http-fetch/headers/llm/kagi/scram-sha256/transport/pg-pool/wire)."}))
+
+(defn run-node-live
+  "Shell out to web/verify-host-parity-live.mjs (Node WebAssembly + actor-host).
+  Returns map with :ok? / :total / :passed / :failed / :results, or
+  {:ok? false :skipped? true ...} when node/wasm-tools unavailable."
+  []
+  (let [script (io/file "web/verify-host-parity-live.mjs")]
+    (if-not (.exists script)
+      {:ok? false :skipped? true :host :node
+       :error "web/verify-host-parity-live.mjs not found (run from kototama root)"}
+      (let [{:keys [exit out err]}
+            (shell/sh "node" (.getPath script)
+                      :dir (.getAbsolutePath (io/file ".")))]
+        (if-let [line (->> (str/split-lines (str out))
+                           (filter #(str/starts-with? % "HOST_PARITY_LIVE_JSON:"))
+                           first)]
+          (let [json-str (subs line (count "HOST_PARITY_LIVE_JSON:"))
+                m (json/read-str json-str :key-fn keyword)
+                failed (vec (or (:failed m) []))]
+            {:ok? (and (zero? exit) (boolean (:ok m)))
+             :host :node
+             :total (or (:total m) 0)
+             :passed (or (:passed m) 0)
+             :failed failed
+             :results (vec (or (:results m) []))
+             :case-ids (mapv keyword (or (:case_ids m) []))
+             :source (:wasm_webcomponent_source m)
+             :note (:note m)
+             :stderr (when-not (str/blank? (str err)) (str/trim err))})
+          {:ok? false
+           :host :node
+           :error (str "node runner failed exit=" exit
+                       " out=" (str/trim (str out))
+                       " err=" (str/trim (str err)))})))))
+
+(defn report
+  "Compact snapshot for doctor/CLI (JVM + optional Node live)."
+  ([] (report {:node? true}))
+  ([{:keys [node?] :or {node? true}}]
+   (let [jvm (run-jvm-live)
+         node (when node? (run-node-live))]
+     {:t84-slice :jvm-and-node-live
+      :jvm jvm
+      :node node
+      :ok? (and (:ok? jvm) (or (nil? node) (:ok? node) (:skipped? node)))
+      :browser-runner "web/verify-actor-host.mjs"
+      :node-runner "web/verify-host-parity-live.mjs"
+      :matrix-runner "kotoba.lang.host-parity/run-conformance (pure data)"})))

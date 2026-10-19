@@ -1,0 +1,207 @@
+(ns kotobase.storage.verify
+  "CID verification as a property of the STORE, not of each caller.
+
+  The block plane is deliberately hostable on infrastructure nobody trusts:
+  `core.cljc` says blocks may live \"anywhere that can hold immutable bytes
+  (including untrusted, erasure-coded, content-addressed networks)\". That is
+  only sound if somebody re-hashes what comes back. Today nobody does it in
+  one place — the check is re-implemented at half a dozen call sites, and it
+  is MISSING on the two hottest read paths in the fleet (the prolly-tree's
+  `get-node` and the peer Worker's `get-node!` both decode bytes straight
+  from the store). A decorator moves the check to the seam every read already
+  crosses, so a caller cannot forget it and a new caller inherits it.
+
+  ## The failure policy is to THROW, and that is the opposite of `signed-head`
+
+  `signed-head/verify-chain` treats an unverifiable head as ABSENT: \"an
+  untrusted host is expected to be able to serve rubbish, and the caller's
+  job is to not believe it.\" That is right THERE and wrong HERE, and the
+  difference is what absence means to the caller.
+
+  - A ref that reads as absent means \"no head published\". The caller's next
+    move — publish from genesis, or refuse to proceed — is safe by
+    construction. Absence is a state the ref plane genuinely has.
+
+  - A block that reads as absent means \"this node is not here\", and a
+    tree walk cannot distinguish that from \"this subtree does not exist\".
+    Omitting a tampered block would turn a corrupt store into a SHORTER
+    ANSWER: rows quietly missing from a query result, with no error anywhere
+    and nothing in the result to say the store lied. It would also be
+    indistinguishable from a plain cache miss, so the retry logic every
+    caller already has would paper over an attack.
+
+  Worse, absence of a block is already anomalous in a way absence of a ref
+  is not: a CID is only ever asked for because something POINTED at it. So a
+  mismatch is not \"the host has nothing\" — it is positive proof that the
+  host returned bytes that are not the bytes, and the only honest thing to
+  do with proof of a lying host is to stop.
+
+  Hence `:kotobase.storage/cid-mismatch`, thrown, carrying the CID asked for
+  and the CID the bytes actually hash to. `classify` is provided for the one
+  caller that legitimately wants to survey damage rather than stop on it —
+  a scrub or repair pass — so wanting that does not require making the read
+  path lenient.
+
+  ## `cid-of` is injected, because this library has no runtime dependencies
+
+  `deps.edn` keeps `io-multiformats` TEST-ONLY on purpose: this namespace
+  sits under every provider including Worker builds, and pulling a hashing
+  library in here would put `@noble/hashes` in all of them. So the hash
+  function arrives as a parameter, `(fn [bytes] cid-string)`, exactly as
+  `kotobase/code_graph.cljc` injects its `verify` fn and as `signed-head`
+  injects `sign-fn`/`verify-fn`. The caller already has a CID implementation;
+  it does not need a second one.
+
+  ## What is delegated, and why the shape is chosen at construction
+
+  The decorator is built by `verifying-block-store`, which returns a value
+  implementing `IRefStore` **only when the wrapped store does**. Always
+  implementing it would make `storage/ref-store?` — and therefore
+  `backend?` and `validate-backend!` — answer true for a block-only store
+  wrapped here, which is a worse lie than the one it avoids. Never
+  implementing it would silently strip the ref plane off a full backend, so
+  wrapping a working backend would break its refs. Deciding at construction
+  is the only option where `satisfies?` keeps telling the truth.
+
+  `-capabilities` delegates and adds `:verified-blocks`, so \"reads through
+  this store are checked\" is discoverable the same way every other
+  guarantee in this contract is, rather than being a fact about how the
+  store happened to be assembled.
+
+  `-put-blocks!` is NOT verified. The threat model is a host returning bytes
+  you did not write; the bytes on a put came from this process. A caller that
+  computes its own CIDs wrongly builds a store that now fails its OWN reads,
+  loudly, which is the same defect surfacing at the same seam without paying
+  to hash every write twice.
+
+  The large-object plane (`kotobase.storage.object`) is out of scope: it
+  moves bytes the process never holds (`:presigned-transfer`), so its
+  integrity check belongs at the transfer, not here.
+
+  ## Sync and async are separate decorators
+
+  `-get-blocks` returns a map on the JVM and a Promise on Worker providers
+  (`core/async-ports`, `async_contract.cljs`). Verification cannot straddle
+  that, so there are two: `verifying-block-store` and, on ClojureScript,
+  `async-verifying-block-store`. The sync one detects a Promise-returning
+  store and says which to use instead, rather than hashing a Promise object
+  and reporting every block as tampered."
+  (:require [kotobase.storage.core :as storage]))
+
+(def verified-capability
+  "Added to `-capabilities` by both decorators."
+  :verified-blocks)
+
+(def mismatch-type :kotobase.storage/cid-mismatch)
+
+(defn- mismatch!
+  [cid actual]
+  (throw (ex-info (str "block does not hash to the CID it was returned "
+                       "under -- the store returned bytes that are not the "
+                       "bytes: " cid)
+                  {:type mismatch-type
+                   :cid cid
+                   :actual-cid actual})))
+
+(defn check-blocks
+  "A realized `-get-blocks` result, or a throw.
+
+  Every entry is re-hashed with `cid-of` and required to equal its own key.
+  A nil value is dropped rather than reported as tampering: nil is not
+  wrong bytes, it is a provider spelling \"missing\" the way the contract
+  says not to, and the contract's answer for missing is omission."
+  [cid-of found]
+  (reduce-kv
+   (fn [acc cid bytes]
+     (if (nil? bytes)
+       acc
+       (let [actual (cid-of bytes)]
+         (if (= cid actual)
+           (assoc acc cid bytes)
+           (mismatch! cid actual)))))
+   {} found))
+
+(defn classify
+  "`{:verified {cid bytes} :mismatched {cid actual-cid}}` — the survey a
+  scrub or repair pass needs.
+
+  Separate from `check-blocks` on purpose. Wanting to enumerate damage is a
+  real requirement; satisfying it with an option on the read path would make
+  every hot read one keyword away from silently trusting the host."
+  [cid-of found]
+  (reduce-kv
+   (fn [acc cid bytes]
+     (if (nil? bytes)
+       acc
+       (let [actual (cid-of bytes)]
+         (if (= cid actual)
+           (assoc-in acc [:verified cid] bytes)
+           (assoc-in acc [:mismatched cid] actual)))))
+   {:verified {} :mismatched {}} found))
+
+(defn- require-fn!
+  [cid-of]
+  (when-not (ifn? cid-of)
+    (throw (ex-info "verifying block store requires a cid-of function"
+                    {:type :kotobase.storage/invalid-configuration
+                     :missing :cid-of}))))
+
+(defn- require-block-store!
+  [inner]
+  (when-not (storage/block-store? inner)
+    (throw (ex-info "verifying block store must wrap an IBlockStore"
+                    {:type :kotobase.storage/invalid-block-store}))))
+
+(defn- capabilities-of
+  [inner]
+  (conj (set (storage/-capabilities inner)) verified-capability))
+
+(defn- realized
+  "The map `-get-blocks` promised, or a throw naming the right decorator.
+
+  Without this a Promise-returning store hashes the Promise object itself
+  and every block in the batch reports as tampered -- an alarming, entirely
+  wrong diagnosis of a wiring mistake."
+  [found]
+  (if (map? found)
+    found
+    (throw (ex-info (str "-get-blocks did not return a map; this store looks "
+                         "asynchronous -- wrap it with "
+                         "async-verifying-block-store instead")
+                    {:type :kotobase.storage/async-store-in-sync-decorator
+                     :got (str (type found))}))))
+
+(defn verifying-block-store
+  "Wrap a SYNCHRONOUS store so every block `-get-blocks` returns is re-hashed
+  against the CID it was returned under.
+
+  `cid-of` is `(fn [bytes] cid-string)`; see the namespace docstring for why
+  it is injected rather than depended upon. A block whose bytes do not match
+  throws `:kotobase.storage/cid-mismatch`. Missing CIDs stay missing.
+
+  `IRefStore` is delegated when, and only when, `inner` implements it, so
+  `storage/backend?` keeps answering truthfully about the result."
+  [inner cid-of]
+  (require-block-store! inner)
+  (require-fn! cid-of)
+  (if (storage/ref-store? inner)
+    (reify
+      storage/IBlockStore
+      (-put-blocks! [_ blocks] (storage/-put-blocks! inner blocks))
+      (-get-blocks [_ cids]
+        (check-blocks cid-of (realized (storage/-get-blocks inner cids))))
+      storage/IRefStore
+      (-read-ref [_ ref-name] (storage/-read-ref inner ref-name))
+      (-compare-and-set-ref! [_ ref-name expected next-cid]
+        (storage/-compare-and-set-ref! inner ref-name expected next-cid))
+      storage/IBackendCapabilities
+      (-capabilities [_] (capabilities-of inner)))
+    (reify
+      storage/IBlockStore
+      (-put-blocks! [_ blocks] (storage/-put-blocks! inner blocks))
+      (-get-blocks [_ cids]
+        (check-blocks cid-of (realized (storage/-get-blocks inner cids))))
+      storage/IBackendCapabilities
+      (-capabilities [_] (capabilities-of inner)))))
+
+

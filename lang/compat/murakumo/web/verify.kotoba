@@ -1,0 +1,125 @@
+(ns murakumo.web.verify
+  "M4 of ADR-260929: dual-zone fetch verification.
+
+  A `:web/fetch` job with :verify-replicas n is run on n nodes in DISTINCT
+  zones and the outcomes are compared. Disagreement is returned as data, never
+  silently resolved:
+
+    :agree                 same status and same raw content hash
+    :agree-after-extraction raw bytes differ (ads, timestamps) but the extracted
+                           markdown is identical — the ADR's 'compare after
+                           extraction' rule
+    :disagree              both differ; per-node hashes are returned
+    :insufficient-replicas fewer than n nodes produced a receipt
+
+  Fewer distinct zones than replicas is a refusal, not a quiet downgrade to
+  same-zone replicas (which would prove nothing about origin honesty).
+
+  A node is {:node-did s :zone s :fetch! (fn [job] -> worker result)
+             :extract! (fn [job] -> worker result)
+             :receipt-valid? (fn [receipt signature] -> bool)}; dispatching to a
+  remote node is the caller's transport. When :receipt-valid? is present, a
+  replica whose receipt does not verify against that node's key, or whose
+  receipt names a different node-did, is an ERROR (:receipt/bad-signature), not
+  evidence; a node without it is marked :unauthenticated in the record. The output receipt attests the COMPARISON; the
+  per-node receipts inside the record are the evidence and stay independently
+  signed."
+  (:require [murakumo.canonical :as canonical]
+            [murakumo.web :as web]
+            [murakumo.web.worker :as w]))
+
+(def default-replicas 2)
+
+(defn select-nodes
+  "First node of each distinct zone, in input order, until n. nil if not enough zones."
+  [nodes n]
+  (let [picked (reduce (fn [acc node]
+                         (if (or (>= (count acc) n) (some #(= (:zone node) (:zone %)) acc))
+                           acc
+                           (conj acc node)))
+                       [] nodes)]
+    (when (= n (count picked)) picked)))
+
+(defn- status-of [{:keys [receipt]}] (get-in receipt [:evidence :status]))
+
+(defn- judge
+  "replicas: [{:node-did :zone :fetch-cid :receipt :extract {:receipt ...}?}]"
+  [replicas]
+  (let [receipts (mapv :receipt replicas)
+        raw (web/compare-replicas receipts)
+        statuses (set (map status-of replicas))]
+    (cond
+      (> (count statuses) 1)
+      {:status :disagree :reason :status
+       :by-node (into (sorted-map) (map (juxt :node-did status-of)) replicas)}
+
+      (= :agree (:status raw)) raw
+
+      (= :disagree (:status raw))
+      (let [ex (mapv #(get-in % [:extract :receipt]) replicas)]
+        (if (every? some? ex)
+          (let [cmp (web/compare-replicas ex)]
+            (if (= :agree (:status cmp))
+              {:status :agree-after-extraction :content-hash (:content-hash cmp)
+               :raw-by-node (:by-node raw)}
+              {:status :disagree :reason :content
+               :by-node (:by-node raw) :extracted-by-node (:by-node cmp)}))
+          {:status :disagree :reason :content :by-node (:by-node raw)}))
+
+      :else raw)))
+
+(defn verify-fetch!
+  "env {:nodes [...] :put! :sign! :now-ms :node-did}, job {:job-id :url :verify-replicas}
+  -> {:ok {:verdict :record :record-cid :receipt :signature}} | {:refused ..}"
+  [{:keys [nodes put! sign! now-ms node-did]} {:keys [job-id url verify-replicas] :as job}]
+  (let [n (or verify-replicas default-replicas)
+        valid (web/validate-job (assoc job :kind :web/fetch :verify-replicas n))]
+    (cond
+      (:refused valid) {:refused :job/invalid :detail (:refused valid)}
+      (< n 2) {:refused :verify/needs-two-replicas}
+      :else
+      (if-let [chosen (select-nodes nodes n)]
+        (let [started (now-ms)
+              runs (mapv (fn [{:keys [node-did zone fetch! extract! receipt-valid?]}]
+                           (let [r (fetch! {:job-id (str job-id "/" zone) :url url})
+                                 authentic? (if receipt-valid?
+                                              (boolean (and (:ok r)
+                                                            (= node-did (get-in r [:ok :receipt :node-did]))
+                                                            (receipt-valid? (get-in r [:ok :receipt]) (get-in r [:ok :signature]))))
+                                              true)]
+                             (if (and (:ok r) (not authentic?))
+                               {:node-did node-did :zone zone :error :receipt/bad-signature}
+                             (if-let [ok (:ok r)]
+                               (let [ex (when extract!
+                                          (extract! {:job-id (str job-id "/" zone "/x")
+                                                     :fetch-cid (:output-cid ok) :format :markdown}))]
+                                 (cond-> {:node-did node-did :zone zone :fetch-cid (:output-cid ok)
+                                          :receipt (:receipt ok) :signature (:signature ok)
+                                          :extract (:ok ex)}
+                                   (not receipt-valid?) (assoc :unauthenticated true)))
+                               {:node-did node-did :zone zone :error (:refused r) :detail (:detail r)}))))
+                         chosen)
+              good (filterv :receipt runs)
+              verdict (if (= n (count good))
+                        (judge good)
+                        {:status :insufficient-replicas
+                         :errors (mapv #(select-keys % [:node-did :zone :error]) (remove :receipt runs))})
+              record {:url url :replicas-requested n :verdict verdict
+                      :replicas (mapv #(dissoc % :extract) runs)
+                      :extracts (into {} (keep (fn [r] (when-let [e (:extract r)]
+                                                         [(:zone r) {:receipt (:receipt e) :signature (:signature e)}])))
+                                      runs)}
+              bs (w/utf8-bytes (canonical/string record))
+              cid (w/raw-cid bs)]
+          (if-not (put! cid bs)
+            {:refused :store/put-failed :detail cid}
+            (let [r (web/receipt {:job-id job-id :kind :web/fetch
+                                  :input-cids (mapv :fetch-cid good) :output-cid cid
+                                  :node-did node-did :started-at started
+                                  :finished-at (max started (now-ms))
+                                  :evidence {:verify (:status verdict) :replicas n
+                                             :zones (mapv :zone chosen)}})]
+              {:ok {:verdict verdict :record record :record-cid cid :receipt r
+                    :signature (sign! (web/receipt-signing-string r))}})))
+        {:refused :verify/insufficient-zones
+         :detail {:requested n :available (count (distinct (map :zone nodes)))}}))))

@@ -1,0 +1,76 @@
+(ns murakumo.infer.keepalive
+  "fetch-shaped HTTP client whose idle sockets are only ever closed by the server.
+
+  Node's fetch (undici) drops an idle socket after the server's advertised
+  keep-alive minus a margin (~3 s against a 5 s server), so a client that polls
+  every 10-45 s opens a new connection each time and closes it first. The
+  closer holds TIME_WAIT, on an ephemeral port. On a macOS kernel past ~49.7
+  days of uptime TIME_WAIT is never reaped (ADR-260902), and the resident's
+  probes, topology polls and backend hops filled dan's whole ephemeral range.
+
+  This agent has keepAlive and NO client idle timeout: a free socket waits
+  until the server ends it. The server is then the active closer, so TIME_WAIT
+  lands on the service port (18094, 8188, 8796) instead of the ephemeral range,
+  and a caller polling inside the server's keep-alive window reuses one socket."
+  (:require ["node:http" :as http] ["node:https" :as https] ["node:stream" :as stream]))
+
+(defn- server-closed-agent [module]
+  (let [a (new (.-Agent module) #js {:keepAlive true :scheduling "lifo"})]
+    ;; Node's default arms an idle timer one second short of the server's
+    ;; Keep-Alive hint, which makes the client the closer again. Keep the
+    ;; socket with no timer; the agent drops it when the server ends it.
+    (set! (.-keepSocketAlive a)
+          (fn [socket]
+            (.setKeepAlive socket true 1000)
+            (.unref socket)
+            (.setTimeout socket 0)
+            true))
+    a))
+
+;; Lane backends and peers may be http:// or https://, as with js/fetch.
+(def transports {"http:" [http (server-closed-agent http)]
+                 "https:" [https (server-closed-agent https)]})
+
+(def ^:private null-body-status #{204 205 304})
+
+(defn fetch
+  "Subset of js/fetch used by the resident: method, headers, body, signal.
+  Resolves to a standard js/Response. Redirects are never followed."
+  ([url] (fetch url #js {}))
+  ([url opts] (fetch url opts true))
+  ([url opts retry?]
+   (js/Promise.
+    (fn [resolve reject]
+      (let [[module agent] (or (get transports (.-protocol (js/URL. url)))
+                               (throw (js/Error. (str "unsupported URL scheme: " url))))
+            req (.request module url
+                          #js {:method (or (.-method opts) "GET")
+                               :headers (or (.-headers opts) #js {})
+                               :signal (.-signal opts)
+                               :agent agent}
+                          (fn [res]
+                            (let [status (.-statusCode res)
+                                  headers (js/Headers.)
+                                  raw (.-rawHeaders res)]
+                              (doseq [i (range 0 (.-length raw) 2)]
+                                (.append headers (aget raw i) (aget raw (inc i))))
+                              (if (contains? null-body-status status)
+                                (do (.resume res) (resolve (js/Response. nil #js {:status status :headers headers})))
+                                (resolve (js/Response. (.toWeb (.-Readable stream) res)
+                                                       #js {:status status :headers headers}))))))]
+        ;; A server may end an idle socket just as it is reused. Only a GET is
+        ;; resent: a reset POST may already be executing, and work is never replayed.
+        (.on req "error" (fn [e]
+                           (if (and retry? (= "GET" (.-method req)) (.-reusedSocket req) (= "ECONNRESET" (.-code e)))
+                             (resolve (fetch url opts false))
+                             (reject e))))
+        (if-let [body (.-body opts)] (.end req body) (.end req)))))))
+
+;; Our own servers advertise a keep-alive longer than any resident poll cadence
+;; (topology: 10 s * peers / fanout, ~45 s at 13 peers), so peers reuse sockets.
+(def server-keep-alive-ms 120000)
+
+(defn keep-alive! [server]
+  (set! (.-keepAliveTimeout server) server-keep-alive-ms)
+  (set! (.-headersTimeout server) (+ server-keep-alive-ms 1000))
+  server)

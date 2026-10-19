@@ -1,0 +1,135 @@
+(ns kotoba.compiler.execution-targets
+  "Explicit Node composition for bounded Wasm/Script/EVM profiles and scoped synchronous providers.
+  Not part of language semantics or the ordinary compiler closure."
+  {:kotoba/export [compile-envelope compile-effect-envelope measure-runtime mechanisms]}
+  (:require [kotoba.sema :as sema] [kotoba.kir :as kir]
+            [kotoba.wasm.core :as wasm] [kotoba.script :as script]
+            [kotoba.compiler.backend.evm :as evm]
+            [kotoba.artifact.execution :as blocks] [kotoba.artifact.content-identity :as content] [kotoba.artifact.core :as artifact]
+            [kotoba.abi.target :as abi] [kotoba.core.execution :as core] [kotoba.value.codec :as value]
+            [kototama.evm-tender :as tender]
+            ))
+
+(def ^:private targets #{:wasm32-kotoba-v1 :js-kotoba-v1 :evm256-kotoba-v1})
+(def ^:private limit-keys #{:fuel :max-frames :memory-pages :deadline-ms :max-output-bytes :gas :step-limit})
+(defn- reject! [reason] (throw (ex-info "target v2 refused" {:phase :execution-target :reason reason})))
+(defn- limits! [limits]
+  (when-not (and (= limit-keys (set (keys limits))) (every? pos-int? (vals limits))
+                 (<= (:fuel limits) 1000000) (<= (:max-frames limits) 10000) (<= (:memory-pages limits) 256)
+                 (<= (:deadline-ms limits) 10000) (<= (:max-output-bytes limits) 65536)
+                 (<= (:gas limits) 10000000) (<= (:step-limit limits) 1000000))
+    (reject! :invalid-bounds))
+  limits)
+(defn- checked [source]
+  (when-not (and (string? source) (<= (count source) 65536)) (reject! :source-limit))
+  (let [program (kir/lower (sema/analyze source))]
+    (when-not (and (contains? #{:kotoba.kir/v3 :kotoba.kir/v4} (:format program)) (= #{} (:effects program))
+                   (= [(symbol "main")] (:exports program))
+                   (= [] (get-in program [:signature :params])) (= :i64 (get-in program [:signature :result])))
+      (reject! :pure-zeroarg-i64-required))
+    program))
+(defn- output [program target limits]
+  (case target
+    :wasm32-kotoba-v1 (let [raw (wasm/emit program target {:fuel (:fuel limits) :memory-pages (:memory-pages limits)})]
+                         )
+    :js-kotoba-v1 (script/verify-output! (script/emit program {:fuel (:fuel limits) :frames (:max-frames limits)}))
+    :evm256-kotoba-v1 (let [a (evm/emit program)] (evm/verify-artifact! a) (:runtime-bytes a))
+    (reject! :unsupported-target)))
+(defn compile-envelope [source target limits]
+  (when-not (contains? targets target) (reject! :unsupported-target))
+  (limits! limits)
+  {:format :kotoba.target-execution-artifact/v2 :source source :target target :limits limits
+   :output (output (checked source) target limits)})
+(defn- id-number [id]
+  )
+
+(defn- bindings! [bindings]
+  (when-not (and (vector? bindings) (<= 1 (count bindings) 64)
+                 (every? (fn [b]
+                           (and (= #{:id :scope} (set (keys b)))
+                                (pos-int? (:id b)) (id-number (:id b))
+                                (vector? (:scope b)) (= 3 (count (:scope b)))
+                                (every? core/cid? (take 2 (:scope b)))
+                                (keyword? (nth (:scope b) 2)))) bindings)
+                 (= (count bindings) (count (distinct (map :id bindings))))
+                 (= (count bindings) (count (distinct (map :scope bindings)))))
+    (reject! :invalid-provider-bindings))
+  bindings)
+
+(def ^:private scalar-provider-ops
+  '#{typed-cap-call let if do loop recur + - * quot rem = not= < <= > >=
+     not and or bit-and bit-or bit-xor bit-not})
+
+(defn- effect-program [source bindings]
+  (when-not (and (string? source) (<= (count source) 65536)) (reject! :source-limit))
+  (let [program (kir/lower (sema/analyze source))
+        forms (mapcat #(tree-seq coll? seq (:body %)) (:functions program))
+        calls (filter #(and (seq? %) (= (first %) (symbol "typed-cap-call"))) forms)
+        ids (set (map #(id-number (second %)) calls))
+        allowed-ops (into scalar-provider-ops (map :name (:functions program)))
+        effects (set (map (fn [e] (when (and (vector? e) (= 2 (count e)) (= :cap/call (first e)))
+                                    (id-number (second e)))) (:effects program)))]
+    (when-not (and (every? #(or (not (seq? %)) (contains? allowed-ops (first %))) forms)
+                   (every? (fn [f] (and (every? #{:i64 :bool} (:param-types f))
+                                       (contains? #{:i64 :bool} (:result f)))) (:functions program)))
+      (reject! :bounded-scalar-provider-profile-required))
+    (when-not (and (contains? #{:kotoba.kir/v3 :kotoba.kir/v4} (:format program))
+                   (= [(symbol "main")] (:exports program))
+                   (= [] (get-in program [:signature :params]))
+                   (= :i64 (get-in program [:signature :result]))
+                   (seq calls) (not (contains? ids nil)) (= ids effects (set (map :id bindings)))
+                   (every? #(and (= 5 (count %)) (= :i64 (nth % 2)) (= :i64 (nth % 3))) calls)
+                   (not-any? #(and (seq? %) (= (first %) (symbol "cap-call"))) forms))
+      (reject! :scoped-i64-provider-contract-required))
+    program))
+
+(defn- named-imports [bindings]
+  (mapv (fn [{:keys [id]}]
+          {:id id :module "kotoba:lease/v2" :field (str "call_" id)
+           :type [0x60 1 0x7e 1 0x7e]}) bindings))
+
+(defn compile-effect-envelope
+  "An explicit v3 artifact binds each executable typed i64 import to one
+  immutable capability/resource/purpose scope. V2 pure artifacts are unchanged.
+  Only reviewed synchronous Node Wasm and Script mechanisms are enabled."
+  [source target limits bindings]
+  (when-not (contains? #{:wasm32-kotoba-v1 :js-kotoba-v1} target)
+    (reject! :effect-target-not-supported))
+  (limits! limits) (bindings! bindings)
+  (let [program (effect-program source bindings)
+        emitted (if (= :wasm32-kotoba-v1 target)
+                  (let [raw (wasm/emit program target
+                              {:fuel (:fuel limits) :memory-pages (:memory-pages limits)
+                               :capability-imports (named-imports bindings)})]
+                    )
+                  (output program target limits))]
+    {:format :kotoba.target-execution-artifact/v3 :source source :target target
+     :limits limits :bindings bindings :output emitted}))
+
+(defn- effect-envelope? [envelope]
+  (= :kotoba.target-execution-artifact/v3 (:format envelope)))
+(defn- verify! [envelope]
+  (when-not (if (effect-envelope? envelope)
+              (and (= #{:format :source :target :limits :bindings :output} (set (keys envelope)))
+                   (= envelope (compile-effect-envelope (:source envelope) (:target envelope)
+                                                        (:limits envelope) (:bindings envelope))))
+              (and (= #{:format :source :target :limits :output} (set (keys envelope)))
+                   (= envelope (compile-envelope (:source envelope) (:target envelope) (:limits envelope)))))
+    (reject! :artifact-reemission-mismatch))
+  envelope)
+
+(defn measure-runtime
+  "Review-selected ADAPTER-SOURCE is this module's source file. Its CID is
+  admitted by the authority. Measurement includes the actual Node executable.
+  This is hosted execution evidence, not browser/mainnet/native qualification."
+  [adapter-source]
+  )
+
+
+
+
+
+
+
+(defn mechanisms [runtime adapter-source]
+  )

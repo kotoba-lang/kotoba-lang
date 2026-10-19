@@ -1,0 +1,1024 @@
+(ns kotodama.inference.host.jvm
+  "JVM host adapter: real local Gemma4 GGUF -> end-to-end text generation.
+
+  This is the promoted, library-grade home for what used to live only in
+  `verify/kotodama/verify/gemma4_e4b_generate_smoke.cljk`. It is `.clj`-only on
+  purpose: per `kotodama.inference.ports`, the portable `.cljc` kernel never
+  opens a file or touches a host runtime, so all GGUF-file IO and the JVM
+  forward pass live here, while the loop/tokenizer/sampler stay portable.
+
+  ## Architecture: Gemma4 = plain block + Per-Layer Embeddings (PLE)
+
+  The real `gemma4:e4b` GGUF (introspected directly, not assumed) is NOT a
+  plain transformer and NOT the AltUp architecture people often assume for
+  Gemma3n/4. It has *no* `altup_*` / `laurel_*` tensors. Instead every `blk.N`
+  carries, on top of the usual attention+MLP+QK-norm+sandwich-norm tensors:
+
+    * `inp_gate`  [hidden -> 256]  (HF `per_layer_input_gate`)
+    * `proj`      [256 -> hidden]  (HF `per_layer_projection`)
+    * `post_norm` [hidden]         (HF `post_per_layer_input_norm`)
+    * `layer_output_scale` [1]     (HF `layer_scalar`)
+
+  plus three top-level tensors that build the per-layer inputs:
+
+    * `per_layer_token_embd` [42*256, vocab]  (bf16; HF `embed_tokens_per_layer`)
+    * `per_layer_model_proj` [hidden -> 42*256] (HF `per_layer_model_projection`)
+    * `per_layer_proj_norm`  [256]              (HF `per_layer_projection_norm`)
+
+  Each decoder layer's output is the plain-block output plus a residual PLE
+  contribution `proj(gelu(inp_gate(h)) * per_layer_input[layer])` (post-normed),
+  and the whole layer output is scaled by `layer_output_scale`. The per-layer
+  inputs are `(rmsnorm(per_layer_model_proj(embed)/sqrt(hidden)) +
+  per_layer_token_embd(id)*sqrt(256)) / sqrt(2)`, reshaped to [layer, 256].
+
+  Conventions verified against the GGUF tensors + HF `modeling_gemma4.py`
+  (see `kotodama.inference.ops` docstring): RMSNorm multiplies by `weight`
+  (weights are full-scale ~8, not delta-from-1); attention softmax scale is 1.0
+  (learned q/k norms carry the scaling); values get a *weightless* RMS norm;
+  RoPE is rotate-half/NEOX; MLP + PLE gate use gelu_pytorch_tanh; embeddings are
+  scaled by sqrt(hidden). All of these differ from the golden 2-block
+  `compose-gemma-block` path, which is left untouched.
+
+  ## KV-cache
+
+  `forward-logits` maintains an optional per-layer K/V cache in the session so a
+  decode step only projects/normalizes/RoPEs the *new* token's K/V and reuses
+  cached K/V for prior positions. It is a pure optimization: with the cache off
+  every position is recomputed each step, and both paths must produce identical
+  token ids (asserted by `verify/kotodama/verify/gemma4_e4b_ple_generate_smoke`)."
+  (:require [kotoba.lang.text :as str]
+            [kotodama.inference.gguf :as gguf]
+            [kotodama.inference.ggml-kdot :as kdot]
+            [kotodama.inference.ops :as ops]
+            [kotodama.inference.tokenizer :as tokenizer]
+            [kotodama.inference.decode :as decode])
+  (:import (java.io RandomAccessFile)))
+
+;; ---------------------------------------------------------------------------
+;; GGUF byte/metadata IO (JVM-only)
+;; ---------------------------------------------------------------------------
+
+(defn- u8 [^RandomAccessFile f] (.readUnsignedByte f))
+(defn- le-u32 [^RandomAccessFile f]
+  (long (+ (u8 f) (bit-shift-left (u8 f) 8) (bit-shift-left (u8 f) 16) (bit-shift-left (u8 f) 24))))
+(defn- le-f32 [^RandomAccessFile f] (Float/intBitsToFloat (unchecked-int (le-u32 f))))
+(defn- le-u64 [^RandomAccessFile f]
+  (let [lo (le-u32 f) hi (le-u32 f)] (+ lo (* hi 4294967296))))
+(defn- read-string* [^RandomAccessFile f]
+  (let [n (le-u64 f) b (byte-array n)] (.readFully f b) (String. b "UTF-8")))
+(defn- skip! [^RandomAccessFile f n] (.seek f (+ (.getFilePointer f) n)))
+
+(declare skip-value!)
+(defn- skip-array! [^RandomAccessFile f]
+  (let [element-type (le-u32 f) n (le-u64 f)] (dotimes [_ n] (skip-value! f element-type))))
+(defn- skip-value! [^RandomAccessFile f value-type]
+  (case (int value-type)
+    0 (skip! f 1) 1 (skip! f 1) 2 (skip! f 2) 3 (skip! f 2)
+    4 (skip! f 4) 5 (skip! f 4) 6 (skip! f 4) 7 (skip! f 1)
+    8 (skip! f (le-u64 f)) 9 (skip-array! f) 10 (skip! f 8) 11 (skip! f 8) 12 (skip! f 8)
+    (throw (ex-info "unknown GGUF metadata value type" {:gguf/value-type value-type}))))
+(defn- read-scalar [^RandomAccessFile f value-type]
+  (case (int value-type)
+    0 (u8 f) 1 (.readByte f) 2 (do (skip! f 2) :uint16) 3 (do (skip! f 2) :int16)
+    4 (le-u32 f) 5 (unchecked-int (le-u32 f)) 6 (double (le-f32 f))
+    7 (not (zero? (u8 f))) 8 (read-string* f) 10 (le-u64 f) 11 (le-u64 f)
+    12 (do (skip! f 8) :float64)
+    (throw (ex-info "unknown GGUF scalar value type" {:gguf/value-type value-type}))))
+
+(def ^:private materialize-array-keys
+  #{"tokenizer.ggml.tokens" "tokenizer.ggml.merges"
+    "gemma4.attention.sliding_window_pattern"})
+
+(defn- read-array-values! [^RandomAccessFile f]
+  (let [element-type (le-u32 f) n (le-u64 f)]
+    (vec (repeatedly n #(read-scalar f element-type)))))
+
+(defn- align-up [n alignment]
+  (let [rem (mod n alignment)]
+    (if (zero? rem) n (+ n (- alignment rem)))))
+
+(defn read-gguf!
+  "Read GGUF metadata (scalars + `materialize-array-keys` arrays; other arrays
+  skipped) plus a tensor index restricted to `wanted` tensor names."
+  [path wanted]
+  (with-open [f (RandomAccessFile. path "r")]
+    (let [magic (String. (byte-array [(byte (u8 f)) (byte (u8 f)) (byte (u8 f)) (byte (u8 f))]) "US-ASCII")
+          _version (le-u32 f)
+          tensor-count (le-u64 f)
+          kv-count (le-u64 f)]
+      (when-not (= "GGUF" magic) (throw (ex-info "not a GGUF file" {:path path :magic magic})))
+      (let [metadata (atom {})]
+        (dotimes [_ kv-count]
+          (let [k (read-string* f) t (le-u32 f)]
+            (if (= 9 (int t))
+              (if (contains? materialize-array-keys k)
+                (swap! metadata assoc k (read-array-values! f))
+                (skip-array! f))
+              (swap! metadata assoc k (read-scalar f t)))))
+        (let [tensors (atom {})]
+          (dotimes [_ tensor-count]
+            (let [name (read-string* f)
+                  n-dims (le-u32 f)
+                  dims (vec (repeatedly n-dims #(le-u64 f)))
+                  tensor-type (le-u32 f)
+                  offset (le-u64 f)]
+              (when (wanted name)
+                (swap! tensors assoc name {:shape dims :type tensor-type :offset offset}))))
+          (let [alignment (long (get @metadata "general.alignment" 32))
+                tensor-data-start (align-up (.getFilePointer f) alignment)]
+            {:gguf/metadata @metadata
+             :gguf/tensors @tensors
+             :gguf/tensor-data-start tensor-data-start}))))))
+
+
+(defn gguf-path
+  "Where a model's GGUF artifact is, from `KOTODAMA_GGUF_PATH`, and from
+  nowhere else.
+
+  ⚠ THIS USED TO BE `ollama-gguf-path`, which shelled out to
+  `ollama show <model> --modelfile` and read the FROM line. It was removed
+  2026-09-09 (owner instruction: no vLLM, Ollama, MLX or llama.cpp
+  underneath). Reading a GGUF file is not a dependence -- the file is a real
+  artifact and this host decodes it itself, Q4_K, Q6_K, BF16 and F32, in the
+  rows below. Asking Ollama WHERE the file is made Ollama required to run a
+  host that never needed it to compute anything, which is the dependence
+  wearing a small enough coat to be missed.
+
+  Fail closed with the variable named rather than falling back to a second
+  route: a host that quietly finds the file another way is a host whose
+  requirements cannot be read off its failure."
+  [model]
+  (or (System/getenv "KOTODAMA_GGUF_PATH")
+      (throw (ex-info (str "set KOTODAMA_GGUF_PATH to the GGUF artifact for "
+                           model " -- this host no longer asks Ollama where "
+                           "it is")
+                      {:model model :variable "KOTODAMA_GGUF_PATH"}))))
+
+;; ---------------------------------------------------------------------------
+;; fast array-only row dequantize (byte-for-byte the portable gguf decode,
+;; self-checked at startup). Q4_K (12), Q6_K (14), BF16 (30), F32 (0).
+;; ---------------------------------------------------------------------------
+
+(defn- u8b ^long [^bytes bytes i] (bit-and 0xff (long (aget bytes i))))
+(defn- i8b ^long [^bytes bytes i] (let [x (u8b bytes i)] (if (> x 127) (- x 256) x)))
+(defn- le-u16b ^long [^bytes bytes i] (+ (u8b bytes i) (bit-shift-left (u8b bytes (inc i)) 8)))
+
+(defn- q4-k-scale ^long [^bytes b scales-off j]
+  (if (< j 4)
+    (bit-and (u8b b (+ scales-off j)) 63)
+    (bit-or (bit-and (u8b b (+ scales-off j 4)) 0x0f)
+            (bit-shift-left (bit-shift-right (u8b b (+ scales-off (- j 4))) 6) 4))))
+(defn- q4-k-min ^long [^bytes b scales-off j]
+  (if (< j 4)
+    (bit-and (u8b b (+ scales-off j 4)) 63)
+    (bit-or (bit-shift-right (u8b b (+ scales-off j 4)) 4)
+            (bit-shift-left (bit-shift-right (u8b b (+ scales-off j)) 6) 4))))
+
+(defn- decode-q4-k-row! [^bytes row-bytes ^doubles out row-width]
+  (let [block-count (quot row-width gguf/qk-k)]
+    (dotimes [block block-count]
+      (let [bo (* block gguf/q4-k-block-bytes)
+            out-base (* block gguf/qk-k)
+            scales-off (+ bo 4)
+            d (gguf/fp16->double (le-u16b row-bytes bo))
+            dmin (gguf/fp16->double (le-u16b row-bytes (+ bo 2)))]
+        (loop [group 0 is 0]
+          (when (< group 4)
+            (let [d1 (* d (q4-k-scale row-bytes scales-off is))
+                  d2 (* d (q4-k-scale row-bytes scales-off (inc is)))
+                  min1 (* dmin (q4-k-min row-bytes scales-off is))
+                  min2 (* dmin (q4-k-min row-bytes scales-off (inc is)))
+                  base (+ out-base (* group 64))
+                  q-base (+ bo 16 (* group 32))]
+              (dotimes [l 32]
+                (let [q (u8b row-bytes (+ q-base l))]
+                  (aset out (+ base l) (double (- (* d1 (bit-and q 0x0f)) min1)))
+                  (aset out (+ base l 32) (double (- (* d2 (bit-shift-right q 4)) min2)))))
+              (recur (inc group) (+ is 2)))))))
+    out))
+
+(defn- decode-q6-k-row! [^bytes row-bytes ^doubles out row-width]
+  (let [block-count (quot row-width gguf/qk-k)]
+    (dotimes [block block-count]
+      (let [bo (* block gguf/q6-k-block-bytes)
+            out-base (* block gguf/qk-k)
+            d (gguf/fp16->double (le-u16b row-bytes (+ bo 208)))]
+        (dotimes [group 2]
+          (let [base (+ out-base (* group 128))
+                ql-base (+ bo (* group 64))
+                qh-base (+ bo 128 (* group 32))
+                scale-base (+ bo 192)]
+            (dotimes [l 32]
+              (let [is (quot l 16)
+                    ql0 (u8b row-bytes (+ ql-base l))
+                    ql32 (u8b row-bytes (+ ql-base 32 l))
+                    qh (u8b row-bytes (+ qh-base l))
+                    q1 (- (bit-or (bit-and ql0 0x0f) (bit-shift-left (bit-and (bit-shift-right qh 0) 0x03) 4)) 32)
+                    q2 (- (bit-or (bit-and ql32 0x0f) (bit-shift-left (bit-and (bit-shift-right qh 2) 0x03) 4)) 32)
+                    q3 (- (bit-or (bit-shift-right ql0 4) (bit-shift-left (bit-and (bit-shift-right qh 4) 0x03) 4)) 32)
+                    q4 (- (bit-or (bit-shift-right ql32 4) (bit-shift-left (bit-and (bit-shift-right qh 6) 0x03) 4)) 32)]
+                (aset out (+ base l) (double (* d (i8b row-bytes (+ scale-base is 0)) q1)))
+                (aset out (+ base l 32) (double (* d (i8b row-bytes (+ scale-base is 2)) q2)))
+                (aset out (+ base l 64) (double (* d (i8b row-bytes (+ scale-base is 4)) q3)))
+                (aset out (+ base l 96) (double (* d (i8b row-bytes (+ scale-base is 6)) q4)))))))))
+    out))
+
+(defn- decode-bf16-row! [^bytes row-bytes ^doubles out row-width]
+  ;; bf16 -> f32: high 16 bits of the f32; little-endian pairs.
+  (dotimes [i row-width]
+    (let [bits (bit-shift-left (le-u16b row-bytes (* i 2)) 16)]
+      (aset out i (double (Float/intBitsToFloat (unchecked-int bits))))))
+  out)
+
+(defn- decode-f32-row! [^bytes row-bytes ^doubles out row-width]
+  (dotimes [i row-width]
+    (let [b (* i 4)
+          bits (bit-or (u8b row-bytes b)
+                       (bit-shift-left (u8b row-bytes (+ b 1)) 8)
+                       (bit-shift-left (u8b row-bytes (+ b 2)) 16)
+                       (bit-shift-left (u8b row-bytes (+ b 3)) 24))]
+      (aset out i (double (Float/intBitsToFloat (unchecked-int bits))))))
+  out)
+
+(defn- row-byte-count ^long [row-width tensor-type]
+  (case (int tensor-type)
+    0 (* 4 (long row-width))
+    12 (gguf/q4-k-row-byte-count row-width)
+    14 (gguf/q6-k-row-byte-count row-width)
+    30 (* 2 (long row-width))
+    (throw (ex-info "unsupported row tensor type" {:type tensor-type}))))
+
+(defn- row-byte-offset ^long [row-index row-width tensor-type]
+  (case (int tensor-type)
+    0 (* (long row-index) 4 (long row-width))
+    12 (gguf/q4-k-row-byte-offset row-index row-width)
+    14 (gguf/q6-k-row-byte-offset row-index row-width)
+    30 (* (long row-index) 2 (long row-width))
+    (throw (ex-info "unsupported row tensor type" {:type tensor-type}))))
+
+(defn- decode-row! [^bytes row-bytes ^doubles out tensor-type row-width]
+  (case (int tensor-type)
+    0 (decode-f32-row! row-bytes out row-width)
+    12 (decode-q4-k-row! row-bytes out row-width)
+    14 (decode-q6-k-row! row-bytes out row-width)
+    30 (decode-bf16-row! row-bytes out row-width)
+    (throw (ex-info "unsupported row tensor type" {:type tensor-type}))))
+
+(defn- decode-row ^doubles [^bytes row-bytes tensor-type row-width]
+  (decode-row! row-bytes (double-array row-width) tensor-type row-width))
+
+(defn decode-row-matches-portable?
+  "Self-check: fast array decode == portable `kotodama.inference.gguf` vector
+  decode, for one real row. Throws-on-mismatch is the caller's job."
+  [^RandomAccessFile f tensor-data-start tensor row-width row-index]
+  (let [tensor-type (long (:type tensor))
+        row-bytes-n (row-byte-count row-width tensor-type)
+        row-offset (row-byte-offset row-index row-width tensor-type)
+        row-buf (byte-array row-bytes-n)]
+    (.seek f (+ (long tensor-data-start) (long (:offset tensor)) (long row-offset)))
+    (.readFully f row-buf)
+    (let [reference (case (int tensor-type)
+                      12 (gguf/q4-k-blocks->values row-buf)
+                      14 (gguf/q6-k-blocks->values row-buf))
+          fast (vec (decode-row row-buf tensor-type row-width))]
+      (= reference fast))))
+
+;; ---------------------------------------------------------------------------
+;; weight access: read a single row, or project a batch of input vectors
+;; through a whole tensor. Optionally caches the dequantized tensor (flat
+;; float[]) in the session so repeated forwards skip disk read + dequant.
+;; ---------------------------------------------------------------------------
+
+(defn- read-row-doubles
+  "Dequantize a single row of `tensor` into a Clojure double vector."
+  [^RandomAccessFile f tensor-data-start tensor row-width row-index]
+  (let [tensor-type (long (:type tensor))
+        n-bytes (row-byte-count row-width tensor-type)
+        offset (row-byte-offset row-index row-width tensor-type)
+        row-buf (byte-array n-bytes)]
+    (.seek f (+ (long tensor-data-start) (long (:offset tensor)) (long offset)))
+    (.readFully f row-buf)
+    (vec (decode-row row-buf tensor-type row-width))))
+
+(defn- read-f32-vector [^RandomAccessFile f tensor-data-start tensor]
+  (let [n (long (first (:shape tensor)))]
+    (.seek f (+ (long tensor-data-start) (long (:offset tensor))))
+    (vec (repeatedly n #(double (le-f32 f))))))
+
+(defn- cache-tensor!
+  "Materialize a whole tensor as a flat float[] (row-major, num-rows*row-width)
+  and store it in the session weight cache. Returns the float[]."
+  [session tensor-name tensor]
+  (let [{:keys [^RandomAccessFile file gguf/tensor-data-start weight-cache]} session
+        [row-width num-rows] (:shape tensor)
+        row-width (long row-width)
+        num-rows (long num-rows)
+        tensor-type (long (:type tensor))
+        row-bytes-n (long (row-byte-count row-width tensor-type))
+        out (float-array (* row-width num-rows))
+        row-buf (byte-array row-bytes-n)
+        row-d (double-array row-width)]
+    (.seek file (+ (long tensor-data-start) (long (:offset tensor))))
+    (dotimes [r num-rows]
+      (.readFully file row-buf)
+      (decode-row! row-buf row-d tensor-type row-width)
+      (let [base (* r row-width)]
+        (dotimes [i row-width] (aset out (+ base i) (float (aget row-d i))))))
+    (swap! weight-cache assoc tensor-name {:data out :row-width row-width :num-rows num-rows})
+    (get @weight-cache tensor-name)))
+
+(defn dot-f32
+  "Dot product with an explicit float32 multiply/accumulate boundary.
+
+  This is a diagnostic bridge to ggml's float accumulation. It is not yet a
+  substitute for the final Q4_K/Q6_K block-dot kernels, whose reduction order
+  also matters for bit-level parity."
+  [a b]
+  (when-not (= (count a) (count b))
+    (throw (ex-info "dot input lengths differ" {:a-count (count a) :b-count (count b)})))
+  (let [^floats af (float-array a)
+        ^floats bf (float-array b)
+        n (alength af)]
+    (double
+     (loop [i (int 0) s (float 0.0)]
+       (if (< i n)
+         (recur (unchecked-inc-int i)
+                (float (+ s (float (* (aget af i) (aget bf i))))))
+         s)))))
+
+(defn- dot-f32-cached
+  [^floats weights weight-base ^doubles input n]
+  (double
+   (loop [i (long 0) s (float 0.0)]
+     (if (< i n)
+       (recur (unchecked-inc i)
+              (float (+ s (float (* (aget weights (+ weight-base i))
+                                    (float (aget input i)))))))
+       s))))
+
+(defn- dot-f32-row
+  [^doubles weights ^doubles input n]
+  (double
+   (loop [i (long 0) s (float 0.0)]
+     (if (< i n)
+       (recur (unchecked-inc i)
+              (float (+ s (float (* (float (aget weights i))
+                                    (float (aget input i)))))))
+       s))))
+
+(defn- project-batch
+  "tensor: {:shape [row-width num-rows]}. inputs: vector of double vectors, each
+  length row-width. Returns a vector of double-arrays, one per input, each
+  length num-rows: out[p][r] = sum_i W[r][i] * inputs[p][i]."
+  [session tensor-name tensor inputs]
+  (let [{:keys [^RandomAccessFile file gguf/tensor-data-start weight-cache cache-weights?]} session
+        float32? (boolean (get-in session [:dbg :float32-matmul?]))
+        ggml-k-dot? (and (boolean (get-in session [:dbg :ggml-k-dot?]))
+                         (#{12 14} (long (:type tensor))))
+        native-k-dot? (and (boolean (get-in session [:dbg :native-k-dot?]))
+                           (#{12 14} (long (:type tensor))))
+        metal-k-dot? (and (boolean (get-in session [:dbg :metal-k-dot?]))
+                          (#{12 14} (long (:type tensor))))
+        [row-width num-rows] (:shape tensor)
+        row-width (long row-width)
+        num-rows (long num-rows)
+        tensor-type (long (:type tensor))
+        n-pos (long (count inputs))
+        ^objects in-arr (into-array (map double-array inputs))
+        ^objects outputs (into-array (repeatedly n-pos #(double-array num-rows)))]
+    (cond
+      metal-k-dot?
+      (let [metal-matvec (requiring-resolve 'kotodama.inference.host.metal-kdot/matvec)
+            tensor-bytes (* num-rows (row-byte-count row-width tensor-type))]
+        (metal-matvec (:metal-worker session) tensor-type (:model-path session)
+                      (+ (long tensor-data-start) (long (:offset tensor))) tensor-bytes
+                      tensor-name num-rows row-width inputs))
+
+      native-k-dot?
+      (let [matvec-mapped (requiring-resolve 'kotodama.inference.host.native-kdot/matvec-mapped)
+            tensor-bytes (* num-rows (row-byte-count row-width tensor-type))]
+        (matvec-mapped tensor-type
+                       (:model-path session)
+                       (+ (long tensor-data-start) (long (:offset tensor)))
+                       tensor-bytes num-rows row-width inputs))
+
+      ggml-k-dot?
+      (let [q8-inputs (mapv kdot/quantize-q8-k inputs)
+            row-bytes-n (long (row-byte-count row-width tensor-type))
+            row-buf (byte-array row-bytes-n)
+            dot-row (case (int tensor-type)
+                      12 kdot/dot-q4-k-q8-k
+                      14 kdot/dot-q6-k-q8-k)]
+        (.seek file (+ (long tensor-data-start) (long (:offset tensor))))
+        (dotimes [r num-rows]
+          (.readFully file row-buf)
+          (dotimes [p n-pos]
+            (let [^doubles out (aget outputs p)]
+              (aset out r (double (dot-row row-buf (nth q8-inputs p)))))))
+        (vec outputs))
+
+      cache-weights?
+      (let [cached (or (get @weight-cache tensor-name) (cache-tensor! session tensor-name tensor))
+            ^floats data (:data cached)]
+        (dotimes [r num-rows]
+          (let [wbase (* r row-width)]
+            (dotimes [p n-pos]
+              (let [^doubles in (aget in-arr p)
+                    ^doubles out (aget outputs p)]
+                (aset out r
+                      (if float32?
+                        (dot-f32-cached data wbase in row-width)
+                        (double (loop [i (long 0) s 0.0]
+                                  (if (< i row-width)
+                                    (recur (unchecked-inc i)
+                                           (+ s (* (double (aget data (+ wbase i))) (aget in i))))
+                                    s)))))))))
+        (vec outputs))
+
+      :else
+      (let [row-bytes-n (long (row-byte-count row-width tensor-type))
+            row-buf (byte-array row-bytes-n)
+            row-d (double-array row-width)]
+        (.seek file (+ (long tensor-data-start) (long (:offset tensor))))
+        (dotimes [r num-rows]
+          (.readFully file row-buf)
+          (decode-row! row-buf row-d tensor-type row-width)
+          (dotimes [p n-pos]
+            (let [^doubles in (aget in-arr p)
+                  ^doubles out (aget outputs p)]
+              (aset out r
+                    (if float32?
+                      (dot-f32-row row-d in row-width)
+                      (double (loop [i (long 0) s 0.0]
+                                (if (< i row-width)
+                                  (recur (unchecked-inc i) (+ s (* (aget row-d i) (aget in i))))
+                                  s))))))))
+        (vec outputs)))))
+
+(defn- project-batches
+  "Project one activation batch through multiple tensors. On Metal, tensors
+  with a shared input width use one Q8_K quantization/upload/submission/readback
+  transaction. Other backends retain the established independent path."
+  [session tensor-specs inputs]
+  (let [metal? (and (boolean (get-in session [:dbg :metal-k-dot?]))
+                    (every? (fn [[_ tensor]] (#{12 14} (long (:type tensor))))
+                            tensor-specs))
+        widths (mapv #(long (first (:shape (second %)))) tensor-specs)]
+    (if (and metal? (seq tensor-specs) (apply = widths))
+      (let [matvec-many (requiring-resolve 'kotodama.inference.host.metal-kdot/matvec-many)
+            tensor-data-start (long (:gguf/tensor-data-start session))
+            requests
+            (mapv (fn [[tensor-name tensor]]
+                    (let [[cols rows] (:shape tensor)
+                          tensor-type (long (:type tensor))]
+                      {:tensor-type tensor-type
+                       :rows (long rows)
+                       :cols (long cols)
+                       :tensor-offset (+ tensor-data-start (long (:offset tensor)))
+                       :tensor-bytes (* (long rows) (row-byte-count (long cols) tensor-type))
+                       :cache-key tensor-name}))
+                  tensor-specs)]
+        (matvec-many (:metal-worker session) (:model-path session) requests inputs))
+      (mapv (fn [[tensor-name tensor]]
+              (project-batch session tensor-name tensor inputs))
+            tensor-specs))))
+
+;; ---------------------------------------------------------------------------
+;; model metadata + PLE per-layer-input construction
+;; ---------------------------------------------------------------------------
+
+(defn model-expected
+  "Model-shape facts from the file's own metadata (never assumed)."
+  [metadata]
+  {:gemma4/block-count (long (get metadata "gemma4.block_count"))
+   :gemma4/embedding-length (long (get metadata "gemma4.embedding_length"))
+   :gemma4/embedding-length-per-layer-input (long (get metadata "gemma4.embedding_length_per_layer_input"))
+   :gemma4/feed-forward-length (long (get metadata "gemma4.feed_forward_length"))
+   :gemma4/attention-head-count (long (get metadata "gemma4.attention.head_count"))
+   :gemma4/attention-head-count-kv (long (get metadata "gemma4.attention.head_count_kv"))
+   :gemma4/rope-dimension-count (long (get metadata "gemma4.rope.dimension_count"))
+   :gemma4/rope-dimension-count-swa (long (get metadata "gemma4.rope.dimension_count_swa"))
+   :gemma4/rope-freq-base (double (get metadata "gemma4.rope.freq_base"))
+   :gemma4/rope-freq-base-swa (double (get metadata "gemma4.rope.freq_base_swa"))
+   :gemma4/shared-kv-layers (long (get metadata "gemma4.attention.shared_kv_layers" 0))
+   :gemma4/rms-eps (double (get metadata "gemma4.attention.layer_norm_rms_epsilon" 1.0e-6))
+   :gemma4/final-logit-softcapping (double (get metadata "gemma4.final_logit_softcapping" 30.0))})
+
+(defn kv-share-map
+  "Map shared layer index -> donor layer index (the last non-shared layer of the
+  same attention type). Matches Ollama's `KVShareMap`. Empty if no sharing."
+  [expected swa-pattern]
+  (let [block-count (long (:gemma4/block-count expected))
+        shared (long (:gemma4/shared-kv-layers expected))]
+    (if (or (zero? shared) (nil? swa-pattern))
+      {}
+      (let [first-shared (- block-count shared)
+            type-of (fn [i] (if (false? (nth swa-pattern i)) :full :sliding))]
+        (into {}
+              (for [i (range first-shared block-count)
+                    :let [ti (type-of i)
+                          donor (last (filter #(= ti (type-of %)) (range first-shared)))]
+                    :when donor]
+                [i donor]))))))
+
+(defn full-rope-divisors
+  "Proportional RoPE divisors for full/global layers: divisor[i] =
+  freq-base^(2i/global-head-dim) for the first `partial*ghd/2` pairs, 1e10
+  (effective identity) for the rest. Matches Ollama's `FullRopeFreqs`."
+  [global-head-dim freq-base partial-rotary-factor]
+  (let [ghd (long global-head-dim)
+        half (quot ghd 2)
+        rope-angles (long (* partial-rotary-factor (/ ghd 2.0)))]
+    (mapv (fn [i]
+            (if (< i rope-angles)
+              (Math/pow (double freq-base) (/ (* 2.0 i) (double ghd)))
+              1.0e10))
+          (range half))))
+
+(defn- swa-divisors
+  "Standard NEOX RoPE divisors for sliding layers: theta^(2i/head-dim)."
+  [head-dim theta]
+  (let [d (long head-dim) half (quot d 2)]
+    (mapv (fn [i] (Math/pow (double theta) (/ (* 2.0 i) (double d)))) (range half))))
+
+(defn- tensor-name [layer-index suffix] (str "blk." layer-index "." suffix ".weight"))
+(defn- global-layer? [layer-index swa-pattern]
+  ;; swa-pattern[i] = true => sliding/local; false => global.
+  (false? (nth swa-pattern layer-index)))
+
+(defn per-layer-inputs
+  "Build the PLE per-layer inputs for `token-ids`.
+
+  Returns a vector (one per position) of vectors (one per layer, length
+  block-count) of `per-layer-dim` (256) double vectors. Combines the
+  token-identity embedding `per_layer_token_embd(id)*sqrt(dim)` with the
+  context projection `rmsnorm(per_layer_model_proj(embed)/sqrt(hidden))`,
+  then scales the sum by 1/sqrt(2)."
+  [session token-ids embeds]
+  (let [{:keys [^RandomAccessFile file gguf/tensor-data-start gguf/tensors expected]} session
+        hidden (long (:gemma4/embedding-length expected))
+        block-count (long (:gemma4/block-count expected))
+        per-dim (long (:gemma4/embedding-length-per-layer-input expected))
+        eps (:gemma4/rms-eps expected)
+        pl-embd (get tensors "per_layer_token_embd.weight")
+        proj-tensor (get tensors "per_layer_model_proj.weight")
+        proj-norm-w (read-f32-vector file tensor-data-start (get tensors "per_layer_proj_norm.weight"))
+        model-proj-scale (/ 1.0 (Math/sqrt (double hidden)))
+        token-embd-scale (Math/sqrt (double per-dim))
+        input-scale (/ 1.0 (Math/sqrt 2.0))
+        dbg (:dbg session {})
+        rmsn (fn [xs w] (if (:rmsnorm-add-one? dbg)
+                          (ops/gemma-rmsnorm-values xs w eps)
+                          (ops/rmsnorm-weighted-values xs w eps)))
+        ;; context projection for all positions in one pass (packed 42*256)
+        projections (project-batch session "per_layer_model_proj.weight" proj-tensor embeds)]
+    (mapv
+     (fn [token-id ^doubles proj]
+       (let [pl-row (read-row-doubles file tensor-data-start pl-embd (* block-count per-dim) token-id)]
+         (mapv
+          (fn [layer]
+            (let [base (* layer per-dim)
+                  proj-chunk (mapv #(* model-proj-scale (aget proj (+ base %))) (range per-dim))
+                  proj-normed (rmsn proj-chunk proj-norm-w)
+                  token-chunk (mapv #(* token-embd-scale (nth pl-row (+ base %))) (range per-dim))]
+              (mapv (fn [a b] (* input-scale (+ (double a) (double b)))) proj-normed token-chunk)))
+          (range block-count))))
+     token-ids projections)))
+
+;; ---------------------------------------------------------------------------
+;; Gemma4 decoder block with per-layer-input gating + optional KV cache.
+;; ---------------------------------------------------------------------------
+
+(defn- slice-head [^doubles arr h dim]
+  (let [start (int (* (long h) (long dim)))
+        end (int (* (long (inc h)) (long dim)))]
+    (vec (java.util.Arrays/copyOfRange arr start end))))
+
+(defn vector-summary
+  "Return a deterministic, compact numerical fingerprint for `values`.
+
+  The summary is deliberately backend-neutral so traces from this JVM host can
+  be compared with Ollama/llama.cpp layer probes without retaining multi-GB
+  activation tensors. `:first` and `:last` contain at most three values."
+  [values]
+  (let [xs (mapv double values)
+        n (count xs)]
+    (if (zero? n)
+      {:count 0 :sum 0.0 :rms 0.0 :min nil :max nil :first [] :last []}
+      (let [{:keys [sum square-sum min-value max-value]}
+            (reduce (fn [{:keys [sum square-sum min-value max-value]} x]
+                      (let [x (double x)]
+                        {:sum (+ sum x)
+                         :square-sum (+ square-sum (* x x))
+                         :min-value (Math/min min-value x)
+                         :max-value (Math/max max-value x)}))
+                    {:sum 0.0
+                     :square-sum 0.0
+                     :min-value Double/POSITIVE_INFINITY
+                     :max-value Double/NEGATIVE_INFINITY}
+                    xs)
+            edge-count (min 3 n)]
+        {:count n
+         :sum sum
+         :rms (Math/sqrt (/ square-sum n))
+         :min min-value
+         :max max-value
+         :first (subvec xs 0 edge-count)
+         :last (subvec xs (- n edge-count) n)}))))
+
+(defn- trace-batch!
+  [session layer-index stage base-pos batch]
+  (when-let [trace-fn (get-in session [:dbg :trace-fn])]
+    (when (seq batch)
+      (let [position (+ (long base-pos) (dec (count batch)))
+            values (peek (vec batch))]
+        (trace-fn (assoc (vector-summary values)
+                         :layer layer-index
+                         :stage stage
+                         :position position))))))
+
+(defn gemma4-block-forward
+  "Run one Gemma4 decoder layer over `new-hidden` (the NEW positions, a vector
+  of hidden-size double vectors, at absolute positions base-pos..base-pos+n-1),
+  appending each new position's K/V to `kv-cache` (an atom holding a vector of
+  {:k [...] :v [...]} per layer, keyed by absolute position) and attending over
+  the full cached history. Returns the new positions' hidden vectors."
+  [session layer-index new-hidden base-pos per-layer-inputs-per-pos kv-cache]
+  (let [{:keys [^RandomAccessFile file gguf/tensor-data-start gguf/tensors expected swa-pattern kv-share-map rope-freqs]} session
+        eps (:gemma4/rms-eps expected)
+        head-count (long (:gemma4/attention-head-count expected))
+        kv-head-count (long (:gemma4/attention-head-count-kv expected))
+        heads-per-kv (quot head-count kv-head-count)
+        global? (global-layer? layer-index swa-pattern)
+        ;; KV sharing: layers past the sharing boundary reuse a donor layer's
+        ;; K/V (Ollama/HF `num_kv_shared_layers`). Their own attn_k/attn_v are
+        ;; present in the GGUF but unused by the reference runtime.
+        donor (when-not (:disable-kv-share? (:dbg session {})) (get (or kv-share-map {}) layer-index))
+        theta (if global? (:gemma4/rope-freq-base expected) (:gemma4/rope-freq-base-swa expected))
+        t* (fn [suffix] (get tensors (tensor-name layer-index suffix)))
+        rf (fn [suffix] (read-f32-vector file tensor-data-start (t* suffix)))
+        attn-norm-w (rf "attn_norm")
+        post-attn-norm-w (rf "post_attention_norm")
+        ffn-norm-w (rf "ffn_norm")
+        post-ffn-norm-w (rf "post_ffw_norm")
+        post-norm-w (rf "post_norm")
+        q-norm-w (rf "attn_q_norm")
+        k-norm-w (rf "attn_k_norm")
+        layer-scalar (first (rf "layer_output_scale"))
+        q-tensor (t* "attn_q") k-tensor (t* "attn_k") v-tensor (t* "attn_v")
+        q-width (long (second (:shape q-tensor)))
+        k-width (long (second (:shape k-tensor)))
+        q-head-dim (quot q-width head-count)
+        kv-head-dim (quot k-width kv-head-count)
+        rope-dim q-head-dim
+        ;; --- debug-switchable ops (defaults = confirmed Gemma4 semantics) ---
+        dbg (:dbg session {})
+        rmsn (fn [xs w] (if (:rmsnorm-add-one? dbg)
+                          (ops/gemma-rmsnorm-values xs w eps)
+                          (ops/rmsnorm-weighted-values xs w eps)))
+        ;; sliding layers: standard NEOX rope over head_dim. global/full layers:
+        ;; partial rotary via rope_freqs freq-factors (only the first ~64 pairs
+        ;; rotate; the rest use a ~1e30 divisor => identity).
+        rope-divisors (when (and global? rope-freqs (not (:global-full-rope? dbg)))
+                        (mapv (fn [j ff]
+                                (* (Math/pow (double theta) (/ (* 2.0 j) (double rope-dim)))
+                                   (double ff)))
+                              (range) rope-freqs))
+        ropef (fn [v pos]
+                (cond
+                  (:rope-interleaved? dbg) (ops/rope-interleaved-values v pos rope-dim theta)
+                  rope-divisors (ops/rope-neox-divisors-values v pos rope-dim rope-divisors)
+                  :else (ops/rope-neox-values v pos rope-dim theta)))
+        ;; Gemma4 normalizes Q and K per head and defines attention scaling as
+        ;; 1.0 (HF Gemma4TextAttention.scaling and Ollama's model both do this).
+        ;; Keep the old sqrt scaling only as an explicit diagnostic switch.
+        attn-scale (cond
+                     (:attn-scale-sqrt? dbg) (/ 1.0 (Math/sqrt (double q-head-dim)))
+                     (and global? (:global-scale-256? dbg)) (/ 1.0 (Math/sqrt 256.0))
+                     :else 1.0)
+        attnf (fn [q ks vs] (ops/causal-attention-values-scaled q ks vs attn-scale))
+        mlp-act (if (:mlp-silu? dbg)
+                  ops/gated-mlp-activation-values
+                  ops/gelu-gated-mlp-activation-values)
+        vnormf (fn [v] (if (:disable-vnorm? dbg) v (ops/rms-normalize-values v eps)))
+        gate-act (if (:mlp-silu? dbg) ops/silu-value ops/gelu-tanh-value)
+        ;; The stored layer_output_scale is part of the trained checkpoint.
+        ;; Reference implementations multiply the complete decoder-layer output
+        ;; by it. It must therefore be active by default; the bypass is retained
+        ;; solely for controlled regression comparisons.
+        layer-scalar (if (:disable-layer-scalar? dbg) 1.0 layer-scalar)
+        ;; --- attention branch ---
+        normed (mapv #(rmsn % attn-norm-w) new-hidden)
+        [q-all k-all v-all]
+        (project-batches session
+                         (cond-> [[(tensor-name layer-index "attn_q") q-tensor]]
+                           (nil? donor)
+                           (into [[(tensor-name layer-index "attn_k") k-tensor]
+                                  [(tensor-name layer-index "attn_v") v-tensor]]))
+                         normed)
+        n-new (count new-hidden)
+        ;; per new position: q heads (norm+rope) — always computed from this layer
+        new-q-heads (mapv (fn [i ^doubles q-arr]
+                            (let [pos (+ base-pos i)]
+                              (mapv (fn [h]
+                                      (-> (slice-head q-arr h q-head-dim)
+                                          (rmsn q-norm-w)
+                                          (ropef pos)))
+                                    (range head-count))))
+                          (range) q-all)
+        ;; K/V: donor layers reuse an earlier layer's cached K/V; otherwise
+        ;; compute this layer's K/V (norm+rope for K, weightless-norm for V) and
+        ;; append to the cache.
+        {:keys [k v]}
+        (if donor
+          (get @kv-cache donor)
+          (let [new-k-heads (mapv (fn [i ^doubles k-arr]
+                                    (let [pos (+ base-pos i)]
+                                      (mapv (fn [h]
+                                              (-> (slice-head k-arr h kv-head-dim)
+                                                  (rmsn k-norm-w)
+                                                  (ropef pos)))
+                                            (range kv-head-count))))
+                                  (range) k-all)
+                new-v-heads (mapv (fn [^doubles v-arr]
+                                    (mapv (fn [h] (vnormf (slice-head v-arr h kv-head-dim)))
+                                          (range kv-head-count)))
+                                  v-all)]
+            (swap! kv-cache update layer-index
+                   (fn [layer-cache]
+                     (let [lc (or layer-cache {:k [] :v []})]
+                       {:k (into (:k lc) new-k-heads)
+                        :v (into (:v lc) new-v-heads)})))
+            (get @kv-cache layer-index)))
+        attn-concat (mapv
+                     (fn [i]
+                       (let [pos (+ base-pos i)
+                             q-heads (nth new-q-heads i)]
+                         (vec (mapcat
+                               (fn [h]
+                                 (let [kv-h (quot h heads-per-kv)
+                                       k-up (mapv #(nth (nth k %) kv-h) (range (inc pos)))
+                                       v-up (mapv #(nth (nth v %) kv-h) (range (inc pos)))]
+                                   (:values (attnf (nth q-heads h) k-up v-up))))
+                               (range head-count)))))
+                     (range n-new))
+        attn-out (project-batch session (tensor-name layer-index "attn_output") (t* "attn_output") attn-concat)
+        post-attn (mapv #(rmsn (vec %) post-attn-norm-w) attn-out)
+        residual1 (mapv ops/add-values new-hidden post-attn)
+        ;; --- MLP branch ---
+        ffn-normed (mapv #(rmsn % ffn-norm-w) residual1)
+        [gate-all up-all]
+        (project-batches session
+                         [[(tensor-name layer-index "ffn_gate") (t* "ffn_gate")]
+                          [(tensor-name layer-index "ffn_up") (t* "ffn_up")]]
+                         ffn-normed)
+        activation (mapv (fn [^doubles g ^doubles u]
+                           (mlp-act (vec g) (vec u))) gate-all up-all)
+        down-all (project-batch session (tensor-name layer-index "ffn_down") (t* "ffn_down") activation)
+        post-ffn (mapv #(rmsn (vec %) post-ffn-norm-w) down-all)
+        residual2 (mapv ops/add-values residual1 post-ffn)
+        ;; --- per-layer-input (PLE) gating ---
+        gate-proj (project-batch session (tensor-name layer-index "inp_gate") (t* "inp_gate") residual2)
+        gated (mapv (fn [i ^doubles gp]
+                      (let [pli (nth (nth per-layer-inputs-per-pos i) layer-index)]
+                        (mapv (fn [g p] (* (gate-act g) (double p))) (vec gp) pli)))
+                    (range n-new) gate-proj)
+        ple-proj (project-batch session (tensor-name layer-index "proj") (t* "proj") gated)
+        ple-normed (mapv #(rmsn (vec %) post-norm-w) ple-proj)
+        residual3 (if (:disable-ple? dbg)
+                    residual2
+                    (mapv ops/add-values residual2 ple-normed))
+        output (mapv (fn [h] (mapv #(* (double %) (double layer-scalar)) h)) residual3)]
+    (trace-batch! session layer-index :input base-pos new-hidden)
+    (trace-batch! session layer-index :attention/norm base-pos normed)
+    (trace-batch! session layer-index :attention/q base-pos
+                  (mapv #(vec (mapcat identity %)) new-q-heads))
+    (when-not donor
+      (trace-batch! session layer-index :attention/k base-pos
+                    (mapv #(vec (mapcat identity %)) (take-last n-new k)))
+      (trace-batch! session layer-index :attention/v base-pos
+                    (mapv #(vec (mapcat identity %)) (take-last n-new v))))
+    (trace-batch! session layer-index :attention/context base-pos attn-concat)
+    (trace-batch! session layer-index :attention/project base-pos attn-out)
+    (trace-batch! session layer-index :attention/post-norm base-pos post-attn)
+    (trace-batch! session layer-index :attention/residual base-pos residual1)
+    (trace-batch! session layer-index :mlp/norm base-pos ffn-normed)
+    (trace-batch! session layer-index :mlp/gate base-pos (mapv vec gate-all))
+    (trace-batch! session layer-index :mlp/up base-pos (mapv vec up-all))
+    (trace-batch! session layer-index :mlp/activation base-pos activation)
+    (trace-batch! session layer-index :mlp/down base-pos (mapv vec down-all))
+    (trace-batch! session layer-index :mlp/post-norm base-pos post-ffn)
+    (trace-batch! session layer-index :mlp/residual base-pos residual2)
+    (trace-batch! session layer-index :ple/gate base-pos (mapv vec gate-proj))
+    (trace-batch! session layer-index :ple/gated-input base-pos gated)
+    (trace-batch! session layer-index :ple/project base-pos (mapv vec ple-proj))
+    (trace-batch! session layer-index :ple/post-norm base-pos ple-normed)
+    (trace-batch! session layer-index :ple/residual base-pos residual3)
+    (trace-batch! session layer-index :output base-pos output)
+    ;; --- layer output scale ---
+    output))
+
+;; ---------------------------------------------------------------------------
+;; full forward: embed new positions, build PLE inputs, run all layers,
+;; return dense softcapped logits for the LAST position.
+;; ---------------------------------------------------------------------------
+
+(defn- softcap [x cap] (* cap (Math/tanh (/ (double x) (double cap)))))
+
+(defn forward-logits
+  "Run the model over `token-ids` and return dense softcapped logits for the
+  last position. Uses the session KV cache: only positions beyond the cache's
+  current length are recomputed. Pass `:reset?` true (default when the cache is
+  disabled) to recompute every position from scratch."
+  [session token-ids]
+  (let [{:keys [^RandomAccessFile file gguf/tensor-data-start gguf/tensors expected kv-cache use-kv-cache?]} session
+        hidden (long (:gemma4/embedding-length expected))
+        block-count (long (:gemma4/block-count expected))
+        eps (:gemma4/rms-eps expected)
+        embd-tensor (get tensors "token_embd.weight")
+        output-norm-w (read-f32-vector file tensor-data-start (get tensors "output_norm.weight"))
+        dbg (:dbg session {})
+        embed-scale (if (:disable-embed-scale? dbg) 1.0 (Math/sqrt (double hidden)))
+        rmsn (fn [xs w] (if (:rmsnorm-add-one? dbg)
+                          (ops/gemma-rmsnorm-values xs w eps)
+                          (ops/rmsnorm-weighted-values xs w eps)))
+        n (count token-ids)
+        cached-len (if use-kv-cache? (long (:len @kv-cache 0)) 0)
+        _ (when-not use-kv-cache? (reset! kv-cache {:len 0}))
+        base-pos cached-len
+        new-ids (subvec (vec token-ids) base-pos n)
+        embeds (mapv (fn [id]
+                       (let [row (read-row-doubles file tensor-data-start embd-tensor hidden id)]
+                         (mapv #(* (double %) embed-scale) row)))
+                     new-ids)
+        pli (per-layer-inputs session new-ids embeds)
+        _ (trace-batch! session -1 :embedding base-pos embeds)
+        _ (when-let [trace-fn (get-in session [:dbg :trace-fn])]
+            (doseq [layer-index (range block-count)]
+              (trace-fn (assoc (vector-summary (nth (peek pli) layer-index))
+                               :layer layer-index
+                               :stage :ple/input
+                               :position (+ base-pos (dec (count pli)))))))
+        trace? (:trace-rms? dbg)
+        rms (fn [v] (Math/sqrt (/ (reduce + (map #(* (double %) (double %)) v)) (count v))))
+        _ (when trace?
+            (println (format "  embed[last] rms=%.4f  pli[last][0] rms=%.4f"
+                             (rms (peek embeds)) (rms (nth (nth pli (dec (count pli))) 0)))))
+        max-layers (:max-layers dbg block-count)
+        final-new (reduce
+                   (fn [hidden-vecs layer-index]
+                     (let [out (gemma4-block-forward session layer-index hidden-vecs base-pos pli kv-cache)]
+                       (when trace?
+                         (println (format "  after layer %2d rms=%.5f" layer-index (rms (peek out)))))
+                       out))
+                   embeds
+                   (range (min block-count max-layers)))
+        _ (swap! kv-cache assoc :len n)
+        last-hidden (rmsn (peek final-new) output-norm-w)
+        [logits] (project-batch session "token_embd.weight" embd-tensor [last-hidden])
+        cap (:gemma4/final-logit-softcapping expected)
+        capped-logits (mapv #(softcap % cap) logits)]
+    (trace-batch! session block-count :output/norm base-pos [last-hidden])
+    (trace-batch! session block-count :output/logits base-pos [logits])
+    (trace-batch! session block-count :output/softcapped-logits base-pos [capped-logits])
+    capped-logits))
+
+;; ---------------------------------------------------------------------------
+;; stable public entry point
+;; ---------------------------------------------------------------------------
+
+(def default-model "gemma4:e4b")
+
+(defn- layer-tensor-names [layer-index]
+  (mapv #(tensor-name layer-index %)
+        ["attn_norm" "attn_q" "attn_k" "attn_v" "attn_q_norm" "attn_k_norm"
+         "attn_output" "post_attention_norm" "ffn_norm" "ffn_gate" "ffn_up"
+         "ffn_down" "post_ffw_norm" "post_norm" "inp_gate" "proj" "layer_output_scale"]))
+
+(defn- wanted-tensor-names [block-count]
+  (into #{"token_embd.weight" "output_norm.weight" "rope_freqs.weight"
+          "per_layer_token_embd.weight" "per_layer_model_proj.weight" "per_layer_proj_norm.weight"}
+        (mapcat layer-tensor-names)
+        (range block-count)))
+
+(defn load-model
+  "Open a real GGUF and return a session usable by `generate` / `forward-logits`.
+
+  opts:
+    :kotodama/model-path    resolved GGUF path, OR
+    :kotodama/model         a local Ollama tag (resolved via `ollama show`)
+    :kotodama/cache-weights? keep dequantized weights (flat float[]) in memory
+                             so repeated forwards skip disk read + dequant
+                             (fast, ~20GB RAM for gemma4:e4b; default false)
+    :kotodama/use-kv-cache?  reuse cached K/V across decode steps (default true)
+
+  The returned session holds an open RandomAccessFile; call `close-model` when
+  done. The session is single-threaded (its RandomAccessFile position and KV
+  cache are mutated per forward)."
+  [{:keys [kotodama/model-path kotodama/model kotodama/cache-weights? kotodama/use-kv-cache?]
+    :or {model default-model use-kv-cache? true} :as opts}]
+  (let [path (or model-path (gguf-path model))
+        {:gguf/keys [metadata tensors tensor-data-start]} (read-gguf! path (wanted-tensor-names 128))
+        expected (model-expected metadata)
+        hidden (long (:gemma4/embedding-length expected))
+        swa-pattern (get metadata "gemma4.attention.sliding_window_pattern")
+        ;; Gemma always conditions on a leading BOS (id=2). The GGUF's
+        ;; `add_bos_token=false` is about the *chat template* adding it, not
+        ;; about raw completion — matching Ollama, we prepend BOS ourselves.
+        tok (tokenizer/build {:tokens (get metadata "tokenizer.ggml.tokens")
+                              :merges (get metadata "tokenizer.ggml.merges")
+                              :bos-token-id (long (get metadata "tokenizer.ggml.bos_token_id"))
+                              :eos-token-id (long (get metadata "tokenizer.ggml.eos_token_id"))
+                              :add-bos-token? (boolean (:kotodama/add-bos-token? opts true))
+                              ;; Gemma SPM prepends a leading word-boundary marker
+                              ;; (add_dummy_prefix); the key is absent in this GGUF
+                              ;; and defaults to true.
+                              :add-space-prefix? (boolean (get metadata "tokenizer.ggml.add_space_prefix" true))
+                              :unknown-token-id (long (get metadata "tokenizer.ggml.unknown_token_id" 3))})
+        eos-ids (into #{(:kotodama.tokenizer/eos-token-id tok)}
+                      (some-> (get metadata "tokenizer.ggml.eot_token_id") long vector))
+        file (RandomAccessFile. path "r")
+        metal-worker (when (get-in opts [:kotodama/dbg :metal-k-dot?])
+                       ((requiring-resolve 'kotodama.inference.host.metal-kdot/start-worker)))]
+    ;; startup self-check that the fast array decode matches the portable decode
+    (when-not (and (decode-row-matches-portable? file tensor-data-start
+                                                 (get tensors "blk.0.attn_q.weight") hidden 0)
+                   (decode-row-matches-portable? file tensor-data-start
+                                                 (get tensors "token_embd.weight") hidden
+                                                 (:kotodama.tokenizer/bos-token-id tok)))
+      (when metal-worker
+        ((requiring-resolve 'kotodama.inference.host.metal-kdot/close-worker!) metal-worker))
+      (.close file)
+      (throw (ex-info "fast array row decode diverged from portable kotodama.inference.gguf decode" {})))
+    {:file file
+     :model-path path
+     :metal-worker metal-worker
+     :gguf/metadata metadata
+     :gguf/tensors tensors
+     :gguf/tensor-data-start tensor-data-start
+     :expected expected
+     :swa-pattern swa-pattern
+     :kv-share-map (kv-share-map expected swa-pattern)
+     ;; per-pair rope freq factors for global/full layers (partial rotary).
+     :rope-freqs (when-let [t (get tensors "rope_freqs.weight")]
+                   (read-f32-vector file tensor-data-start t))
+     :kotodama/tokenizer tok
+     :kotodama/eos-token-ids eos-ids
+     :cache-weights? (boolean cache-weights?)
+     :use-kv-cache? (boolean use-kv-cache?)
+     :dbg (:kotodama/dbg opts {})
+     :weight-cache (atom {})
+     :kv-cache (atom {:len 0})}))
+
+(defn close-model [session]
+  (when-let [worker (:metal-worker session)]
+    ((requiring-resolve 'kotodama.inference.host.metal-kdot/close-worker!) worker))
+  (when-let [^RandomAccessFile f (:file session)] (.close f))
+  (reset! (:kv-cache session) {:len 0})
+  (reset! (:weight-cache session) {})
+  {:kotodama/closed? true})
+
+(defn reset-cache! [session]
+  (reset! (:kv-cache session) {:len 0})
+  session)
+
+(defn generate
+  "Stable JVM production entry point. Loads (or reuses) a real GGUF Gemma4
+  model and runs `kotodama.inference.decode/generate`.
+
+  opts (a single map):
+    :kotodama/session      an already-loaded session from `load-model` (reused
+                           across calls); if absent, one is loaded from
+                           :kotodama/model-path / :kotodama/model and closed
+                           after the call
+    :kotodama/model-path   resolved GGUF path
+    :kotodama/model        local Ollama tag (default \"gemma4:e4b\")
+    :kotodama/prompt       string
+    :kotodama/max-tokens   int (default 32)
+    :kotodama/cache-weights? / :kotodama/use-kv-cache?  (see `load-model`)
+    :kotodama/on-token     optional (fn [token-id token-text step-nanos])
+
+  Returns the `kotodama.inference.decode/generate` result map
+  (:kotodama/text, :kotodama/generated-token-ids, :kotodama/stop-reason, ...)
+  plus :kotodama/model and :gemma4/block-count."
+  [{:keys [kotodama/session kotodama/prompt kotodama/max-tokens kotodama/on-token
+           kotodama/sample-opts] :as opts
+    :or {max-tokens 32}}]
+  (let [own? (nil? session)
+        session (or session (load-model opts))]
+    (try
+      (reset-cache! session)
+      (let [tok (:kotodama/tokenizer session)
+            forward-fn (fn [token-ids] (forward-logits session token-ids))
+            result (decode/generate {:kotodama/tokenizer tok
+                                     :kotodama/forward-fn forward-fn
+                                     :kotodama/prompt prompt
+                                     :kotodama/max-tokens max-tokens
+                                     :kotodama/eos-token-ids (:kotodama/eos-token-ids session)
+                                     :kotodama/sample-opts (or sample-opts {})
+                                     :kotodama/on-token on-token})]
+        (assoc result
+               :kotodama/model (:kotodama/model opts default-model)
+               :gemma4/block-count (:gemma4/block-count (:expected session))))
+      (finally
+        (when own? (close-model session))))))

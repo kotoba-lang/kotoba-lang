@@ -1,0 +1,101 @@
+(ns murakumo.mesh.client
+  "A joiner's side of enrolment: prove the device key to the seed and, once
+  admitted, take the address the seed allocated. Runs on the kbb engine.
+
+  The key is a raw 32-byte Ed25519 seed kept in `<state>/device.key`, created
+  0600 on first use. A joiner that did not persist it would present a new
+  identity on every boot -- admitted again as a stranger each time, or refused
+  as a second key for a name the seed already trusts. The DID is derived from it
+  (`ed25519.core/did-key-from-seed`), so the DID the seed records is the key it
+  verifies against.
+
+  Exit codes are for systemd (`Restart=on-failure`): 0 admitted and address
+  applied, 1 pending (retry after human admission) or
+  anything worth retrying -- mesh not peered yet, seed not up, claim refused."
+  (:require ["node:fs" :as fs]
+            ["node:crypto" :as crypto]
+            ["node:child_process" :as cp]
+            [ed25519.core :as ed]
+            [kotoba.lang.edn :as edn]
+            [murakumo.durable-file :as durable]
+            [kotoba.bytes :as kbytes]
+            [murakumo.mesh :as mesh]))
+
+(defn load-or-create-seed!
+  "The device seed (Buffer) under `dir`, created on first use."
+  [dir]
+  (let [path (str dir "/device.key")]
+    (if (.existsSync fs path)
+      (js/Buffer.from (.trim (str (.readFileSync fs path "utf8"))) "hex")
+      (let [seed (.randomBytes crypto 32)]
+        (.mkdirSync fs dir #js {:recursive true})
+        ;; mode at creation, not chmod after: no window where the key is readable.
+        (.writeFileSync fs path (str (.toString seed "hex") "\n") #js {:mode 0600 :flag "wx"})
+        seed))))
+
+(defn- post [base path body]
+  (-> (js/fetch (str base path)
+                #js {:method "POST" :headers #js {"content-type" "application/edn"}
+                     :body (pr-str body) :signal (js/AbortSignal.timeout 10000)})
+      (.then (fn [r] (-> (.text r)
+                         (.then (fn [t] {:status (.-status r)
+                                         :body (try (edn/read-string t) (catch :default _ nil))})))))))
+
+(defn sign-proof
+  "Hex Ed25519 signature over the seed's proof message."
+  [seed message]
+  (ed/hexify (ed/sign seed (js/Buffer.from message "utf8"))))
+
+(defn enrol!
+  "Run the two round trips. Resolves to the seed's final {:status :body}."
+  [seed-base node-name seed]
+  (let [did (ed/did-key-from-seed seed)]
+    (-> (post seed-base "/enroll/challenge" {:did did :node-name node-name})
+        (.then (fn [ch]
+                 (if-not (= 200 (:status ch))
+                   ch
+                   (let [{:keys [nonce endpoint]} (:body ch)
+                         sig (sign-proof seed (mesh/proof-message {:nonce nonce :endpoint endpoint
+                                                                   :did did :node-name node-name}))]
+                     (post seed-base "/enroll/claim" {:nonce nonce :signature sig}))))))))
+
+(defn apply-address!
+  "Persist the allocated address and re-run the address script, so the node has
+  it now and keeps it across reboots."
+  [state-dir address script]
+  (durable/write! (str state-dir "/mesh-address") (kbytes/utf8-bytes (str address "\n")))
+  (.-status (.spawnSync cp "/bin/sh" #js [script])))
+
+(defn finish-enrol!
+  "Return the systemd exit status, including application and pending failures."
+  [r node-name state addr-script]
+  (case (:status r)
+    200 (let [address (get-in r [:body :address])]
+          (if-not (mesh/allocated-address? address)
+            (do (js/console.error "enrol failed: missing allocated address") 1)
+            (if (= 0 (apply-address! state address addr-script))
+              (do (println "enrolled" node-name "address" address) 0)
+              (do (js/console.error "enrol failed: allocated address could not be applied") 1))))
+    202 (do (println "pending: a human must admit" node-name "in the ledger; retrying") 1)
+    (do (js/console.error "enrol failed" (:status r) (pr-str (:body r))) 1)))
+
+(defn- parse-args [args]
+  (loop [m {:state "/var/lib/murakumo" :addr-script "/usr/local/lib/murakumo/mesh-addr.sh"} [k v & more :as as] args]
+    (if (empty? as)
+      m
+      (recur (case k
+               "--seed" (assoc m :seed v)
+               "--node-name" (assoc m :node-name v)
+               "--state" (assoc m :state v)
+               "--addr-script" (assoc m :addr-script v)
+               "--iface" m ; accepted for the unit's sake; the address script owns the interface
+               (throw (ex-info (str "unknown argument " k) {:arg k})))
+             more))))
+
+(defn -main [& args]
+  (let [{:keys [seed node-name state addr-script]} (parse-args args)
+        key-seed (load-or-create-seed! state)]
+    (-> (enrol! seed node-name key-seed)
+        (.catch (fn [e] {:status 0 :body {:reason (str e)}}))
+        (.then (fn [r]
+                 (js/process.exit (finish-enrol! r node-name state addr-script)))))))

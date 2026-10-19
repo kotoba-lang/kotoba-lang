@@ -1,0 +1,103 @@
+(ns murakumo.device-report
+  "A claimed device reports for itself (`POST /api/devices/:did/heartbeat`).
+
+  The collector path (`POST /api/devices/snapshot`) needs one shared token and an operator host
+  that can reach every box; a device signing with the key it already minted needs neither. The
+  server half has existed for some time (`devices-http/device-heartbeat`); nothing on a device
+  called it, so a claimed box showed `never seen` in the console however healthy it was.
+
+  What is signed is `grant.device-attest/heartbeat-signing-input`: the domain, the DID, the
+  endpoint the request reached, and the SHA-256 of the body AS SENT, so this namespace signs the
+  exact string it posts and does not re-encode it. A telemetry signature cannot be replayed as
+  an enrolment proof: the domain differs.
+
+  Metrics are only facts about the machine's own health: load, free memory, uptime, platform. No
+  host name, address, SSID or account data is sent, and the console must not need any."
+  (:require [grant.device-attest :as attest]
+            ["node:crypto" :as crypto]
+            ["node:os" :as os]))
+
+(def exit-codes
+  "What a one-shot run exits with, so a supervisor can tell outcomes apart without parsing logs.
+  `:stale` is 0: the same millisecond twice is not a fault. `:not-claimed` is 4: until the claim
+  goes through the box has nothing to report to, which is expected, not an error."
+  {:accepted 0 :stale 0 :rejected 1 :error 2 :unreachable 3 :not-claimed 4 :clock-ahead 5})
+
+(defn heartbeat-path [did]
+  (str "/api/devices/" (js/encodeURIComponent did) "/heartbeat"))
+
+(defn endpoint-of
+  "The origin the request reaches: what the server binds the signature to."
+  [site]
+  (.-origin (js/URL. site)))
+
+(defn- round2 [x] (/ (js/Math.round (* 100 x)) 100))
+
+(defn collect-metrics
+  "The machine's own health, as a string-keyed map (it goes out as JSON)."
+  []
+  (let [total (.totalmem os)]
+    {"load1" (round2 (first (js/Array.from (.loadavg os))))
+     "mem-free-ratio" (if (pos? total) (round2 (/ (.freemem os) total)) 0)
+     "uptime-s" (js/Math.floor (.uptime os))
+     "platform" (.platform os)
+     "arch" (.arch os)
+     "node" js/process.version}))
+
+(defn body-text
+  "The exact JSON posted. Key order is fixed; the server hashes these bytes as received."
+  [now-ms metrics]
+  (js/JSON.stringify #js {"observed-at-ms" now-ms "metrics" (clj->js metrics)}))
+
+(defn body-sha256 [text]
+  (.digest (.update (.createHash crypto "sha256") (js/Buffer.from text "utf8")) "hex"))
+
+(defn signing-input
+  "The string both sides sign, or `{:error reason}`."
+  [did endpoint body-sha]
+  (attest/heartbeat-signing-input {:did did :endpoint endpoint :body-sha256 body-sha}))
+
+(defn sign
+  "base64url Ed25519 signature of `input` with the device's private key (PEM)."
+  [private-key-pem input]
+  (.toString (.sign crypto nil (js/Buffer.from input "utf8") private-key-pem) "base64url"))
+
+(defn interpret
+  "What a response means: `{:outcome ...}`. `status` is nil when the request did not complete,
+  which is not folded into any answer from the server."
+  [{:keys [status body]}]
+  (cond
+    (nil? status) {:outcome :unreachable}
+    (and (= 202 status) (true? (get body "accepted"))) {:outcome :accepted}
+    (= 401 status) {:outcome :rejected :reason :bad-signature}
+    (= 409 status) (case (get body "reason")
+                     ("unknown-device" "not-claimed") {:outcome :not-claimed}
+                     "stale" {:outcome :stale}
+                     "future-dated" {:outcome :clock-ahead}
+                     {:outcome :error :status status})
+    :else {:outcome :error :status status}))
+
+(defn once!
+  "Send one heartbeat. `fetch-fn` and `now-fn` are injected so the wire can be tested without
+  a network. Returns a Promise of `{:outcome ... :exit-code n}`."
+  [fetch-fn now-fn site id metrics]
+  (let [site (endpoint-of site)
+        did (.-did id)
+        text (body-text (now-fn) metrics)
+        input (signing-input did (endpoint-of site) (body-sha256 text))]
+    (if-not (string? input)
+      (js/Promise.resolve {:outcome :error :exit-code (:error exit-codes)})
+      (-> (fetch-fn (str (.replace site #"/+$" "") (heartbeat-path did))
+                    #js {:method "POST" :redirect "error"
+                         :headers #js {"content-type" "application/json"
+                                       "x-aiueos-signature" (sign (.-privateKey id) input)}
+                         :body text
+                         :signal (js/AbortSignal.timeout 10000)})
+          (.then (fn [response]
+                   (-> (.json response)
+                       (.then (fn [body] (js->clj body)))
+                       (.catch (fn [_] {}))
+                       (.then (fn [body]
+                                (let [r (interpret {:status (.-status response) :body body})]
+                                  (assoc r :exit-code (get exit-codes (:outcome r) 2))))))))
+          (.catch (fn [_] {:outcome :unreachable :exit-code (:unreachable exit-codes)}))))))

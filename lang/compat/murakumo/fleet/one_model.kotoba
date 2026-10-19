@@ -1,0 +1,257 @@
+(ns murakumo.fleet.one-model
+  "One node hosts one model. Pure decisions over a node's process list.
+
+  Owner instruction 2026-09-10: the murakumo cloud fleet is to be designed so
+  that a node hosts, as a rule, a single model.
+
+  ## What was actually running
+
+  Measured the same day across the six reachable minis, and the rule was broken
+  on every one of them:
+
+    node       llama-server  rpc-server  ComfyUI  ollama
+    dan             1            1          1       1
+    judah           1            1          0       1
+    joseph          1            1          1       1
+    benjamin        1            1          1       1
+    issachar        1            1          1       1
+    simeon          1            1          1       1
+
+  Four model planes on one 16 GiB machine. That is not a tidiness complaint:
+  measuring the 27B on levi the previous day required stopping the edge server
+  (7.9 GB resident), ComfyUI, ollama and the RPC worker before the weights
+  would load at all, and a 32k-token context then took the node off the network
+  entirely. A node that hosts four models has no model it can actually serve at
+  full size, and nothing in the fleet said so.
+
+  ## Why an idle process still counts
+
+  Only llama-server is large at rest — 7.9 GB on issachar, against ComfyUI's
+  0.68 GB and an rpc-server and ollama both under 200 MB. Counting only
+  resident bytes would call those three free and they are not: each claims
+  memory the moment it is asked to work, and the failure that produces is a
+  node that looks like it has room right up to the moment two models are busy
+  together. So this counts HOSTS, not bytes.
+
+  `rpc-server` counts even though the model it serves belongs to another node.
+  It lends this machine's RAM and GPU to gad's distributed ring, which is
+  hosting part of a model by any definition that matters to the node's own
+  capacity.
+
+  ## What this namespace is not
+
+  It does not decide which model a node should host, and it does not perform
+  an eviction. It answers one question — how many model planes are on this
+  node, and which — and names the launchd jobs each plane is served by, so
+  that the installer can refuse to add a second and an eviction can be
+  reviewed before it is run."
+  (:require [kotoba.lang.text :as str]))
+
+(def planes
+  "Process signatures that mean a model is hosted here, and which plane it
+  serves. Ordered: the first match wins, so a more specific signature has to
+  come before a more general one.
+
+  Matched on the command line rather than the executable name because the
+  same binary serves different planes -- `llama-server` is the node's own
+  model, `rpc-server` is a shard of somebody else's.
+
+  Matched case-INSENSITIVELY, and each signature is specific enough to be a
+  program rather than a word. The first version matched `ComfyUI` exactly,
+  which is how gad spells it; the six minis spell it `comfyui/main.py`, so the
+  checker reported them as hosting three planes when they host four. An
+  under-report is the dangerous direction here — it lets an install proceed
+  onto a node that is already full. `comfyui/main.py` and `ollama serve` carry
+  the specificity that case-sensitivity was standing in for, without the miss.
+
+  `:daemons` are launchd labels KNOWN to serve the plane. They are a hint for
+  reporting, NOT the eviction list -- see `discover-script` and
+  `labels-from-discovery`, which ask launchd what it actually starts. Measured
+  2026-09-10: benjamin serves the ad-hoc plane from `ai.gftd.ollama.benjamin`
+  while dan and simeon use `com.murakumo.ollama`, so an eviction driven by this
+  table left ollama running on benjamin and reported a clean sweep. A fixed
+  table cannot name a label that varies per node.
+
+  The original note stands for what these labels are FOR: Killing the
+  process is not evicting the plane: measured on issachar 2026-09-10, all four
+  planes were system LaunchDaemons with KeepAlive, so a `pkill` is undone in
+  seconds and a `bootout` is undone by the next boot -- and the next boot is
+  exactly when nobody is watching. An eviction that does not name the job is a
+  restart with extra steps."
+  [{:plane :text        :match "llama-server"
+    :what "this node's own text model"
+    :daemons ["com.murakumo.edge-server" "com.murakumo.edge-join"
+              "com.murakumo.model-server" "com.murakumo.model-join"]}
+   {:plane :ring-member :match "rpc-server"
+    :what "a shard of another node's model, over llama.cpp RPC"
+    :daemons ["com.murakumo.rpc-worker"]}
+   {:plane :media       :match "comfyui/main.py"
+    :what "image and video checkpoints"
+    :daemons ["com.murakumo.comfyui"]}
+   {:plane :ad-hoc      :match "ollama serve"
+    :what "whatever ollama has pulled; a second text model by another name"
+    :daemons ["com.murakumo.ollama"]}
+   ;; The audio lane (2026-09-11, oppai studio): Qwen3-TTS served by mlx-audio's
+   ;; own server (`python -m mlx_audio.server`). Matched on the module path the
+   ;; way :media is matched on `comfyui/main.py` — the interpreter is the same
+   ;; venv python that runs ComfyUI, so the executable name says nothing.
+   {:plane :audio       :match "mlx_audio"
+    :what "a speech / audio generation model over mlx-audio"
+    :daemons ["com.murakumo.mlx-audio"]}])
+
+(defn classify-line
+  "The plane one process line hosts, or nil."
+  [line]
+  (let [l (str/lower (str line))]
+    (some (fn [{:keys [match] :as p}]
+            (when (str/includes? l match) (dissoc p :match)))
+          planes)))
+
+(defn hosts
+  "Every model plane found in `lines`, deduplicated by plane.
+
+  Deduplicated because two llama-server processes for the same model are one
+  host with a worker, not two models -- and because the question this answers
+  is how many MODELS, which is what the rule is about."
+  [lines]
+  (->> lines
+       (keep classify-line)
+       (reduce (fn [acc p] (if (some #(= (:plane %) (:plane p)) acc) acc (conj acc p))) [])
+       vec))
+
+(defn verdict
+  "How this node stands against the rule.
+
+    :one    exactly one plane — what the fleet is being designed toward
+    :none   nothing hosted; a node with capacity and no model
+    :many   the rule is broken, and `:extra` names what has to go
+
+  `:none` is deliberately not a failure. A node that hosts nothing is
+  available, and reporting it as a violation would push an operator to fill it
+  before deciding what it is for."
+  [lines]
+  (let [found (hosts lines)]
+    (case (count found)
+      0 {:verdict :none :hosts [] :extra []}
+      1 {:verdict :one :hosts found :extra []}
+      {:verdict :many :hosts found
+       ;; The node's own text model is the one to keep by default: it is the
+       ;; plane the fleet enrols and serves from. Everything else is what an
+       ;; eviction removes, and naming them here is what makes the removal
+       ;; reviewable instead of a guess at the terminal.
+       :extra (vec (remove #(= :text (:plane %)) found))})))
+
+(defn keeps
+  "Which plane a node should keep, given what it hosts and what it is FOR.
+
+  `wanted` is the plane the operator is installing. When a node already hosts
+  that plane, keeping it is a no-op; when it hosts a different one, that other
+  one is what has to go. Stated as a function rather than left to the caller
+  because `edge install` and a dedicated-model install ask the same question
+  and must not answer it two ways."
+  [lines wanted]
+  (let [found (hosts lines)]
+    {:keep (or (first (filter #(= wanted (:plane %)) found))
+               {:plane wanted :what "requested, not yet present"})
+     :evict (vec (remove #(= wanted (:plane %)) found))}))
+
+(def discover-script
+  "Shell that asks launchd which job starts each model plane on THIS node.
+
+  Reads every plist's ProgramArguments and classifies by the executable path,
+  not by the label. That is the only check that worked in the 2026-09-09 gftd
+  cutover, and it is the same reason: a name tells you what somebody called a
+  job, and the argv tells you what the job runs. Prints `<plane> <label>` lines
+  and nothing else; an unreadable plist contributes nothing rather than a
+  guess."
+  (str "for d in /Library/LaunchDaemons /Library/LaunchAgents \"$HOME/Library/LaunchAgents\"; do\n"
+       "  [ -d \"$d\" ] || continue\n"
+       "  for p in \"$d\"/*.plist; do\n"
+       "    [ -f \"$p\" ] || continue\n"
+       "    a=$(sudo -n /usr/libexec/PlistBuddy -c 'Print :ProgramArguments' \"$p\" 2>/dev/null | tr '\\n' ' ')\n"
+       "    case \"$a\" in\n"
+       "      *llama-server*)    echo \"text $(basename \"$p\" .plist)\" ;;\n"
+       "      *rpc-server*)      echo \"ring-member $(basename \"$p\" .plist)\" ;;\n"
+       "      *comfyui/main.py*|*ComfyUI/main.py*) echo \"media $(basename \"$p\" .plist)\" ;;\n"
+       "      *ollama*)          echo \"ad-hoc $(basename \"$p\" .plist)\" ;;\n"
+       "      *mlx_audio*)       echo \"audio $(basename \"$p\" .plist)\" ;;\n"
+       "    esac\n"
+       "  done\n"
+       "done | sort -u"))
+
+(defn labels-from-discovery
+  "`discover-script` output -> {plane #{label ...}}.
+
+  A line naming a plane this table does not know is dropped rather than
+  guessed at: the classifier and this parser have to agree on the vocabulary,
+  and silently inventing a plane would put an unrecognised label into an
+  eviction."
+  [out]
+  (let [known (set (map :plane planes))]
+    (reduce (fn [acc line]
+              (let [[p l] (str/split (str/trim (str line)) #"\s+")
+                    kw (when p (keyword p))]
+                (if (and l (contains? known kw)) (update acc kw (fnil conj #{}) l) acc)))
+            {}
+            (str/split (str out) #"\n"))))
+
+(defn evict-labels
+  "The labels to evict so that only `keep-plane` is left.
+
+  Takes the MEASURED planes as well as the discovered labels, because without
+  them a missing label is ambiguous and the two meanings need opposite
+  responses:
+
+    running, and discovery found a label   -> evict it
+    not running                            -> nothing to evict, not a problem
+    RUNNING, and discovery found no label  -> refuse
+
+  The third case is not hypothetical. Measured 2026-09-10 on dan: a
+  `llama-server` holding 2.6 GB on :8094, parent PID 1, owned by no launchd
+  job at all. Nothing can evict it by label, and a tool that quietly reported
+  `nothing to evict` would have called that node tidy.
+
+  Without `hosting`, a plane that simply is not running looks identical to one
+  that could not be read, and every safe eviction gets refused -- which is how
+  the first version of this behaved on judah."
+  ([discovered keep-plane] (evict-labels discovered keep-plane nil))
+  ([discovered keep-plane hosting]
+   (let [hosting (when hosting (set hosting))
+         others (remove #(= keep-plane (:plane %)) planes)
+         ;; When the caller did not measure, fall back to "assume every other
+         ;; plane might be running" -- the conservative direction.
+         running (filter #(or (nil? hosting) (contains? hosting (:plane %))) others)
+         found (mapcat #(get discovered (:plane %)) running)
+         unowned (remove #(seq (get discovered (:plane %))) running)]
+     {:labels (vec (distinct found))
+      :guessed (vec (distinct (mapcat :daemons unowned)))
+      :planes-not-discovered (vec (map :plane unowned))})))
+
+(defn daemons-to-evict
+  "The launchd labels an eviction of `planes-to-evict` has to stop.
+
+  Deduplicated and ordered as given. A plane whose daemon label is unknown to
+  this table contributes nothing here, which is why `evict-plan` reports the
+  planes it could not name a job for rather than reporting a clean eviction."
+  [planes-to-evict]
+  (vec (distinct (mapcat :daemons planes-to-evict))))
+
+(defn evict-plan
+  "What evicting these planes means, as data.
+
+  `:unnamed` is the point of the return shape. A plane this table has no
+  daemon label for cannot be evicted durably -- something outside launchd is
+  starting it -- and reporting that as a successful eviction is precisely the
+  shape AGENTS.md forbids: a check that could not run returning the value of a
+  check that ran and found nothing wrong."
+  [planes-to-evict]
+  {:planes (vec planes-to-evict)
+   :daemons (daemons-to-evict planes-to-evict)
+   :unnamed (vec (remove (comp seq :daemons) planes-to-evict))})
+
+(defn report-line [node {:keys [verdict hosts extra]}]
+  (str (format "[%-10s] %-5s " node (name verdict))
+       (str/join ", " (map #(name (:plane %)) hosts))
+       (when (seq extra)
+         (str "  -- breaks the rule; extra: "
+              (str/join ", " (map #(str (name (:plane %)) " (" (:what %) ")") extra))))))

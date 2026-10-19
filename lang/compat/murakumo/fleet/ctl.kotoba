@@ -1,0 +1,437 @@
+(ns murakumo.fleet.ctl
+  "murakumo as kubectl — ADR-2610071730 P4.
+
+    murakumo get nodes|classes|leases [-f INTENT] [--json]
+    murakumo describe node NAME
+    murakumo diff -f INTENT [--live SIGNED.json | --token-file T]
+    murakumo cordon|uncordon NAME -f INTENT          edit the intent file (revision +1)
+    murakumo apply -f INTENT [--dry-run] (--private-key-file K | --signed DOC) --token-file T [--to URL]
+    murakumo rollout status
+
+  Reads come from the residents' signed self-reports (L2): every tailnet
+  resident is asked and the newest verified document per node wins, so the
+  answer does not depend on any one node. Nothing here uses ssh.
+
+  The only write is `apply`: it validates the intent (the resident's schema-1
+  validator and the spec-version 2 linter), refuses a revision that does not
+  advance past the live one, signs it with the operator key, POSTs it to one
+  resident with the fleet token and follows the residents' reports until they
+  all hold the new revision (gossip carries it; no node is special)."
+  (:require [clojure.string :as str]
+            [murakumo.fleet.spec :as spec]
+            [murakumo.fleet.spec-cli :as cli]
+            [murakumo.fleet-health :as fh]
+            [murakumo.infer.replicated-topology :as topo]
+            ["node:fs" :as fs]
+            ["node:crypto" :as crypto]))
+
+(defn- opt [args k] (second (drop-while #(not= % k) args)))
+(defn- flag? [args k] (boolean (some #{k} args)))
+(defn- pad [s n] (let [s (str s)] (if (>= (count s) n) s (str s (apply str (repeat (- n (count s)) " "))))))
+(defn- read-json [f] (js->clj (js/JSON.parse (str (.readFileSync fs f "utf8")))))
+(defn- payload-of [d] (if (contains? d "payload") (get d "payload") d))
+
+(defn base-url [u] (str/replace (str u) #"/+$" ""))
+
+(defn trusted-endpoint?
+  "Only resident endpoints the signed-topology validator itself accepts (tailnet
+  :8796/:8797, or loopback when explicitly allowed) may receive the fleet token."
+  [u allow-loopback?]
+  (topo/endpoint? (str (base-url u) "/") allow-loopback?))
+
+(defn resident-urls
+  "Where to ask: the intent's ENABLED node URLs when given, else every online
+  tailnet node on the resident port. Trailing slashes are stripped."
+  [intent]
+  (if (seq (get intent "nodes"))
+    (vec (distinct (for [n (get intent "nodes") :when (and (get n "url") (not (false? (get n "enabled"))))] (base-url (get n "url")))))
+    (vec (for [n (or (fh/tailnet) []) :when (:online n)] (str "http://" (:ip n) ":8796")))))
+
+(defn resident-targets
+  "[url node] for resident-docs: the intent binds each URL to its node; tailnet
+  discovery does not (node nil — such a URL can never pin a key)."
+  [intent]
+  (if (seq (get intent "nodes"))
+    (vec (distinct (for [n (get intent "nodes") :when (and (get n "url") (not (false? (get n "enabled"))))]
+                     [(base-url (get n "url")) (get n "node")])))
+    (mapv (fn [u] [u nil]) (resident-urls intent))))
+
+(defn expected-nodes
+  "Enabled intent nodes, the ones apply and rollout status wait for."
+  [intent]
+  (set (for [n (get intent "nodes") :when (not (false? (get n "enabled")))] (get n "node"))))
+
+(defn fresh-doc? [p now] (>= (get p "at" 0) (- now (* 5 60 1000))))
+
+(defn- age [ms] (let [s (js/Math.round (/ (- (js/Date.now) ms) 1000))]
+                  (cond (< s 120) (str s "s") (< s 7200) (str (quot s 60) "m") :else (str (quot s 3600) "h"))))
+
+;; ---------------------------------------------------------------- pure views
+
+(defn node-status
+  "Ready | NotReady | Stale for a raw payload at time now."
+  [p now]
+  (cond (< (get p "at" 0) (- now (* 5 60 1000))) "Stale"
+        (every? #(get % "ready") (vals (get p "lanes"))) "Ready"
+        :else "NotReady"))
+
+(defn nodes-table [docs now]
+  (for [[n p] docs]
+    {"NAME" n "STATUS" (node-status p now)
+     "LANES" (str/join "," (for [[id l] (get p "lanes")] (str id (when-not (get l "ready") "!"))))
+     "PRESSURE" (get {1 "normal" 2 "warn" 4 "CRIT"} (get-in p ["host" "pressure"]) "-")
+     "FREE" (some-> (get-in p ["host" "free-pct"]) (str "%"))
+     "TOPOLOGY" (get-in p ["topology" "revision"])
+     "RELEASE" (get p "release")
+     "CONVERGE" (get-in p ["converge" "mode"] "-")
+     "AGE" (age (get p "at"))}))
+
+(defn leases-table [docs]
+  (for [[n p] docs
+        [c l] (get-in p ["converge" "leases"])]
+    {"CLASS" c "ASKED-BY" n "HELD" (get l "held") "HOLDER" (get l "holder")
+     "EPOCH" (get l "epoch") "UNTIL" (some-> (get l "until") js/Date. .toISOString) "ERROR" (get l "error")}))
+
+(defn rollout-status
+  "Release and topology revision groups across nodes. Converged only when every
+  report is fresh, every expected node reported (when an expected set is
+  given), and they agree on one release and one revision — and, when a target
+  is given ({:release prefix :revision n} from the intent), on THAT release and
+  revision: agreement on the old release is not a finished rollout."
+  ([docs] (rollout-status docs nil (js/Date.now)))
+  ([docs expected now] (rollout-status docs expected now nil))
+  ([docs expected now target]
+   (let [by (fn [f] (into (sorted-map) (map (fn [[k v]] [k (vec (sort (map key v)))]) (group-by (comp f val) docs))))
+         stale (vec (sort (for [[n p] docs :when (not (fresh-doc? p now))] n)))
+         missing (vec (sort (remove (set (keys docs)) (or expected #{}))))]
+     {:releases (by #(get % "release"))
+      :revisions (by #(get-in % ["topology" "revision"]))
+      :stale stale :missing missing
+      :converged? (and (seq docs) (empty? stale) (empty? missing)
+                       (= 1 (count (distinct (map #(get % "release") (vals docs)))))
+                       (= 1 (count (distinct (map #(get-in % ["topology" "revision"]) (vals docs)))))
+                       (or (nil? (:release target)) (every? #(= (:release target) (get % "release")) (vals docs)))
+                       (or (nil? (:revision target)) (every? #(= (:revision target) (get-in % ["topology" "revision"])) (vals docs))))})))
+
+(defn intent-diff
+  "What applying `intent` would change against the live payload: node roles /
+  pins / enabled / cordoned, policies, and the spec-version 2 sections."
+  [live intent]
+  (let [nodes (fn [p] (into {} (for [n (get p "nodes")] [(get n "node") n])))
+        ln (nodes live) in (nodes intent)
+        node-keys ["url" "owner-id" "failure-domain" "enabled" "cordoned" "roles" "pins" "overrides" "labels"]]
+    (vec
+     (concat
+      (for [n (sort (keys in)) :when (not (contains? ln n))] {:what "node" :name n :change "added"})
+      (for [n (sort (keys ln)) :when (not (contains? in n))] {:what "node" :name n :change "removed (refused: retire as disabled)"})
+      (for [n (sort (keys in)) :when (contains? ln n)
+            k node-keys
+            :let [a (get-in ln [n k]) b (get-in in [n k])]
+            :when (not= a b)]
+        {:what "node" :name n :field k :from a :to b})
+      (for [k ["gateways" "policies" "spec-version" "models" "classes" "trust" "converge" "agents"]
+            :let [a (get live k) b (get intent k)]
+            :when (not= a b)]
+        {:what k :from (when a (if (map? a) (str (count a) " entries") a)) :to (when b (if (map? b) (str (count b) " entries") b))})
+      [{:what "revision" :from (get live "revision") :to (get intent "revision")}]))))
+
+(defn cordon
+  "The intent with node cordoned (or not), revision advanced by one."
+  [intent node on?]
+  (when-not (some #(= node (get % "node")) (get intent "nodes"))
+    (throw (js/Error. (str "no node " node " in the intent"))))
+  (-> intent
+      (update "nodes" (fn [ns] (mapv #(if (= node (get % "node"))
+                                         (if on? (assoc % "cordoned" true) (dissoc % "cordoned"))
+                                         %)
+                                      ns)))
+      (update "revision" inc)))
+
+(defn parse-waves
+  "\"a;b,c;d\" -> [[\"a\"] [\"b\" \"c\"] [\"d\"]]"
+  [s]
+  (vec (for [w (str/split (str s) #";") :let [ns (vec (remove str/blank? (map str/trim (str/split w #","))))] :when (seq ns)] ns)))
+
+(defn rollout-plan
+  "The intent with agents.resident pinned to sha in waves, revision +1."
+  [intent sha package-sha waves settle-ms urls]
+  (let [known (set (map #(get % "node") (get intent "nodes")))
+        unknown (remove known (mapcat identity waves))]
+    (when (seq unknown) (throw (js/Error. (str "not in the intent: " (str/join "," unknown)))))
+    (when-not (= (count (mapcat identity waves)) (count (set (mapcat identity waves))))
+      (throw (js/Error. "a node appears in two waves")))
+    (-> intent
+        (assoc-in ["agents" "resident"]
+                  (cond-> {"sha256" sha "waves" waves}
+                    package-sha (assoc "package-sha256" package-sha)
+                    settle-ms (assoc "settle-ms" settle-ms)
+                    (seq urls) (assoc "urls" (vec urls))))
+        (assoc "spec-version" (or (get intent "spec-version") 2))
+        (update "revision" inc))))
+
+(defn- rollout-sha [f]
+  (when (.existsSync fs f) (.digest (.update (.createHash crypto "sha256") (.readFileSync fs f)) "hex")))
+
+(defn diff-line [d]
+  (str "  " (pad (:what d) 10) (pad (or (:name d) "") 14) (pad (or (:field d) "") 16)
+       (if (:change d) (:change d) (str (pr-str (:from d)) " -> " (pr-str (:to d))))))
+
+(defn parse-positive [s default]
+  (let [n (if (nil? s) default (js/Number s))]
+    (when-not (and (js/Number.isFinite n) (pos? n)) (throw (js/Error. (str "not a positive number: " s))))
+    n))
+
+;; ---------------------------------------------------------------- I/O
+
+(defn- print-table [rows cols]
+  (let [w (into {} (for [c cols] [c (+ 2 (apply max (count c) (map #(count (str (get % c))) rows)))]))]
+    (println (apply str (map #(pad % (w %)) cols)))
+    (doseq [r rows] (println (apply str (map #(pad (or (get r %) "-") (w %)) cols))))))
+
+(defn- live-payload
+  "The live signed payload: fetched with the fleet token (GET /topology from the
+  first trusted resident endpoint that answers 2xx) or read from a signed mirror
+  file. The token is never sent to an endpoint the topology validator would
+  refuse, so reviewing an untrusted intent cannot leak it."
+  [args urls]
+  (if-let [tf (opt args "--token-file")]
+    (let [token (str/trim (str (.readFileSync fs tf "utf8")))
+          ok-urls (filter #(trusted-endpoint? % (flag? args "--allow-loopback")) urls)]
+      (letfn [(try-from [[u & more]]
+                (if-not u
+                  (js/Promise.reject (js/Error. "no trusted resident returned /topology"))
+                  (-> (js/fetch (str (base-url u) "/topology") #js {:headers #js {"authorization" (str "Bearer " token)}
+                                                                    :redirect "error"
+                                                                    :signal (.timeout js/AbortSignal 5000)})
+                      (.then (fn [r] (if (.-ok r) (.json r) nil)) (fn [_] nil))
+                      ;; exactly one step to the next endpoint, on any failure
+                      (.then (fn [doc] (if doc doc (try-from more)))))))]
+        (.then (try-from ok-urls) #(payload-of (js->clj %)))))
+    (js/Promise.resolve (payload-of (read-json (or (opt args "--live") "deploy/fleet-topology.signed.json"))))))
+
+(defn- sign-payload [payload key-file]
+  (let [st (.lstatSync fs key-file)]
+    (when-not (and (.isFile st) (not (.isSymbolicLink st)) (zero? (bit-and (.-mode st) 63)))
+      (throw (js/Error. "private signing key must be a regular 0600 file")))
+    {"payload" payload
+     "signature" (.toString (.sign crypto nil (js/Buffer.from (topo/encoded payload)) (.readFileSync fs key-file "utf8")) "base64url")}))
+
+(defn- wait-revision!
+  "Follow the residents' reports until EVERY expected node reports, freshly,
+  the applied revision with the applied digest and no topology conflict."
+  [targets expected revision digest timeout-ms poll-ms]
+  (let [deadline (+ (js/Date.now) timeout-ms)]
+    (letfn [(poll []
+              (-> (cli/resident-docs targets)
+                  (.then (fn [docs]
+                           (let [now (js/Date.now)
+                                 good? (fn [p] (and p (fresh-doc? p now)
+                                                    (= revision (get-in p ["topology" "revision"]))
+                                                    (= digest (get-in p ["topology" "digest"]))
+                                                    (not (get-in p ["topology" "conflict"]))))
+                                 have (sort (filter #(good? (get docs %)) expected))
+                                 lag (sort (remove (set have) expected))]
+                             (println (str "  " (count have) "/" (count expected) " residents hold " revision
+                                           (when (seq lag) (str "  waiting: " (str/join "," lag)))))
+                             (cond (empty? lag) 0
+                                   (> (js/Date.now) deadline) (do (println (str "timed out; not confirmed on: " (str/join "," lag))) 1)
+                                   :else (js/Promise. (fn [r] (js/setTimeout #(r (poll)) poll-ms)))))))))]
+      (poll))))
+
+(defn run
+  "Promise of the exit code."
+  [[verb & args]]
+  (let [intent-file (opt args "-f")
+        intent (when intent-file (payload-of (read-json intent-file)))
+        urls (resident-urls intent)
+        targets (resident-targets intent)
+        now (js/Date.now)]
+    (case verb
+      "get"
+      (case (first args)
+        "nodes" (.then (cli/resident-docs targets)
+                       (fn [docs]
+                         (if (flag? args "--json") (println (js/JSON.stringify (clj->js docs) nil 1))
+                             (print-table (nodes-table docs now) ["NAME" "STATUS" "LANES" "PRESSURE" "FREE" "TOPOLOGY" "RELEASE" "CONVERGE" "AGE"]))
+                         (cond (empty? docs) (do (println "no resident reported (none reachable or verifiable)") 1)
+                               (some #(not= "Ready" (node-status % now)) (vals docs)) 1
+                               :else 0)))
+        "classes" (if-not intent
+                    (do (println "get classes needs -f INTENT") (js/Promise.resolve 2))
+                    (.then (cli/resident-observations intent)
+                           (fn [l2]
+                             (let [plan (spec/placement intent l2 now)]
+                               (print-table (for [[c {:keys [nodes wanted short?]}] plan]
+                                              {"CLASS" c "WANTED" wanted
+                                               "PLACED" (count nodes)
+                                               ;; every node seen running it, placed or not (drift shows the rest)
+                                               "RUNNING" (count (filter #(contains? (:running (val %)) c) l2))
+                                               "NODES" (str/join "," nodes) "SHORT" (if short? "yes" "")})
+                                            ["CLASS" "WANTED" "PLACED" "RUNNING" "SHORT" "NODES"])
+                               (if (some :short? (vals plan)) 1 0)))))
+        "leases" (.then (cli/resident-docs targets)
+                        (fn [docs] (let [rows (leases-table docs)]
+                                     (if (seq rows) (print-table rows ["CLASS" "ASKED-BY" "HELD" "HOLDER" "EPOCH" "UNTIL" "ERROR"])
+                                         (println "no leases reported (no node enforces convergence on a rendezvous share)"))
+                                     0)))
+        (do (println "murakumo get nodes|classes|leases") (js/Promise.resolve 2)))
+
+      "describe"
+      (let [n (second args)]
+        (.then (cli/resident-docs targets)
+               (fn [docs]
+                 (if-let [p (get docs n)]
+                   (do (println (str "Name:      " n "\nDid:       " (get p "did") "\nStatus:    " (node-status p now)
+                                     "\nReported:  " (age (get p "at")) " ago\nRelease:   " (get p "release")
+                                     "\nTopology:  " (get-in p ["topology" "revision"]) " " (subs (str (get-in p ["topology" "digest"])) 0 12)
+                                     (when (get-in p ["topology" "conflict"]) "  CONFLICT")))
+                       (println "Host:") (doseq [[k v] (sort (get p "host"))] (println (str "  " (pad k 16) v)))
+                       (println "Lanes:") (doseq [[id l] (get p "lanes")] (println (str "  " (pad id 12) (get l "kind") " " (get l "model") " ctx=" (get l "context") (if (get l "ready") "  ready" "  NOT ready") " failures=" (get l "failures"))))
+                       (println "Units:") (doseq [[u st] (get p "units")] (println (str "  " (pad u 36) st)))
+                       (when (seq (get p "models")) (println "Models:") (doseq [[m f] (get p "models")] (println (str "  " (pad m 28) (pr-str f)))))
+                       (println (str "Converge:  " (get-in p ["converge" "mode"] "-") (when-let [r (get-in p ["converge" "reason"])] (str " (" r ")"))))
+                       (doseq [st (get-in p ["converge" "plan"])] (println (str "  " (pad (get st "class") 28) (get st "step") (when-let [r (get st "reason")] (str "  " r)))))
+                       (doseq [[c l] (get-in p ["converge" "leases"])] (println (str "  lease " c " " (pr-str l))))
+                       0)
+                   (do (println (str "no verified report from " n)) 1)))))
+
+      "diff"
+      (if-not intent
+        (do (println "diff needs -f INTENT") (js/Promise.resolve 2))
+        (.then (live-payload args urls)
+               (fn [live]
+                 (doseq [d (intent-diff live intent)] (println (diff-line d)))
+                 0)))
+
+      ("cordon" "uncordon")
+      (let [n (first args)]
+        (if-not (and n intent-file)
+          (do (println (str "murakumo " verb " NAME -f INTENT")) (js/Promise.resolve 2))
+          (let [next (cordon intent n (= verb "cordon"))]
+            (.writeFileSync fs intent-file (str (js/JSON.stringify (clj->js next) nil 2) "\n"))
+            (println (str verb "ed " n " in " intent-file " (revision " (get next "revision") "); placement will move its "
+                          "shares once applied: murakumo apply -f " intent-file))
+            (js/Promise.resolve 0))))
+
+      "apply"
+      (if-not intent
+        (do (println "apply needs -f INTENT") (js/Promise.resolve 2))
+        (let [problems (spec/validate intent)]
+          (try (topo/validate! (js->clj (clj->js intent) :keywordize-keys true) (flag? args "--allow-loopback"))
+               (catch :default e (println (str "  ! resident validator: " (.-message e))) (js/process.exit 1)))
+          (if (seq problems)
+            (do (doseq [p problems] (println (str "  ! " (str/join "." (:path p)) ": " (:problem p)))) (js/Promise.resolve 1))
+            (.then (live-payload args urls)
+                   (fn [live]
+                     (doseq [d (intent-diff live intent)] (println (diff-line d)))
+                     (cond
+                       (not (> (get intent "revision") (get live "revision")))
+                       (do (println (str "refused: revision " (get intent "revision") " does not advance past live " (get live "revision"))) 1)
+
+                       (flag? args "--dry-run")
+                       (do (println "dry run: nothing signed or sent") 0)
+
+                       (not (and (or (opt args "--private-key-file") (opt args "--signed")) (opt args "--token-file")))
+                       (do (println "apply needs --private-key-file (operator) or --signed DOC (co-signed, P5b) and --token-file (fleet), or --dry-run") 2)
+
+                       :else
+                       (let [timeout-ms (* 1000 (parse-positive (opt args "--timeout-s") 300))
+                             poll-ms (parse-positive (opt args "--poll-ms") 10000)
+                             allow? (flag? args "--allow-loopback")
+                             doc (if-let [sf (opt args "--signed")]
+                                   ;; a quorum document co-signed by several operators (topology sign --key-id + cosign)
+                                   (let [d (read-json sf)]
+                                     (when-not (= (topo/encoded (get d "payload")) (topo/encoded intent))
+                                       (throw (js/Error. "the signed document's payload differs from the intent")))
+                                     d)
+                                   (sign-payload intent (opt args "--private-key-file")))
+                             digest (topo/digest (js->clj (clj->js intent) :keywordize-keys true))
+                             token (str/trim (str (.readFileSync fs (opt args "--token-file") "utf8")))
+                             send-to (vec (filter #(trusted-endpoint? % allow?)
+                                                  (if-let [to (opt args "--to")] [(base-url to)] urls)))]
+                         (println (str "signed revision " (get intent "revision") " digest " (subs digest 0 12)))
+                         (letfn [(submit [[u & more]]
+                                   (if-not u
+                                     (js/Promise.resolve nil)
+                                     (-> (js/fetch (str u "/topology") #js {:method "POST" :body (topo/encoded doc) :redirect "error"
+                                                                            :headers #js {"authorization" (str "Bearer " token) "content-type" "application/json"}
+                                                                            :signal (.timeout js/AbortSignal 10000)})
+                                         (.then (fn [r]
+                                                  (cond (.-ok r) (do (println (str "accepted by " u)) u)
+                                                        ;; 4xx: every resident validates the same way; stop
+                                                        (< (.-status r) 500) (.then (.text r) (fn [t] (println (str "refused by " u ": " (.-status r) " " t)) :refused))
+                                                        :else (submit more)))
+                                                (fn [_] (submit more))))))]
+                           (-> (submit send-to)
+                               (.then (fn [accepted]
+                                        (cond (= :refused accepted) 1
+                                              (nil? accepted) (do (println "no trusted resident accepted the topology") 1)
+                                              :else (wait-revision! targets (expected-nodes intent) (get intent "revision")
+                                                                    digest timeout-ms poll-ms)))))))))))))
+
+      "rollout"
+      (case (first args)
+        "status"
+        (.then (cli/resident-docs targets)
+               (fn [docs]
+                 (let [{:keys [releases revisions converged? stale missing]}
+                       (rollout-status docs (when intent (expected-nodes intent)) (js/Date.now)
+                                       (when intent
+                                         {:release (some-> (get-in intent ["agents" "resident" "sha256"]) (subs 0 16))
+                                          :revision (get intent "revision")}))]
+                   (when (seq stale) (println (str "Stale reports: " (str/join "," stale))))
+                   (when (seq missing) (println (str "No report: " (str/join "," missing))))
+                   (println "Release:") (doseq [[r ns] releases] (println (str "  " (pad r 18) (count ns) "  " (str/join "," ns))))
+                   (println "Topology revision:") (doseq [[r ns] revisions] (println (str "  " (pad r 18) (count ns) "  " (str/join "," ns))))
+                   (when-let [rows (seq (for [[n p] docs :let [r (get p "rollout")] :when (and r (not= "none" (get r "state")))] [n r]))]
+                     (println "Self-update (P5a):")
+                     (doseq [[n r] rows]
+                       (println (str "  " (pad n 12) (pad (get r "state") 16) (pad (or (get r "target") "") 18)
+                                     (when (get r "wave") (str "wave " (get r "wave") "  ")) (or (get r "reason") "")
+                                     (when-let [u (get r "updated")] (str "  updated " (get u "from") " -> " (subs (str (get u "to")) 0 16)))))))
+                   (println (if converged? "rolled out: every reporting resident runs one release and one revision"
+                                "in progress or diverged"))
+                   (if converged? 0 1))))
+
+        "plan"
+        (let [rel (opt args "--release") waves (opt args "--waves")]
+          (if-not (and intent-file rel waves)
+            (do (println "murakumo rollout plan -f INTENT --release node.mjs --waves \"a;b,c;d\" [--settle-ms N] [--url https://…]")
+                (js/Promise.resolve 2))
+            (let [sha (rollout-sha rel)
+                  _ (when-not sha (throw (js/Error. (str "release not readable: " rel))))
+                  pkg (rollout-sha (str (.replace rel #"[^/]*$" "") "package.json"))
+                  next (rollout-plan intent sha pkg (parse-waves waves)
+                                     (some-> (opt args "--settle-ms") (parse-positive nil))
+                                     (keep second (filter #(= "--url" (first %)) (partition 2 1 args))))
+                  problems (spec/validate next)]
+              ;; nothing is written unless the next intent is valid
+              (when (seq problems)
+                (throw (js/Error. (str/join "; " (for [p problems] (str (str/join "." (:path p)) ": " (:problem p)))))))
+              (.writeFileSync fs intent-file (str (js/JSON.stringify (clj->js next) nil 2) "\n"))
+              (println (str "planned resident " (subs sha 0 16) " in " (count (parse-waves waves)) " waves (revision "
+                            (get next "revision") "); next: murakumo rollout push --to <resident> --token-file T " rel
+                            " && murakumo apply -f " intent-file))
+              (js/Promise.resolve 0))))
+
+        "push"
+        (let [f (last args) to (some-> (opt args "--to") base-url) tf (opt args "--token-file")]
+          (cond
+            (not (and to tf f (.existsSync fs f)))
+            (do (println "murakumo rollout push --to URL --token-file T node.mjs") (js/Promise.resolve 2))
+
+            ;; the fleet token goes only to an endpoint the topology validator accepts
+            (not (trusted-endpoint? to (flag? args "--allow-loopback")))
+            (do (println (str "refused: " to " is not a resident endpoint (tailnet :8796/:8797, or loopback with --allow-loopback)"))
+                (js/Promise.resolve 2))
+
+            :else
+            (-> (js/fetch (str to "/release") #js {:method "POST" :body (.readFileSync fs f) :redirect "error"
+                                                    :headers #js {"authorization" (str "Bearer " (str/trim (str (.readFileSync fs tf "utf8"))))}
+                                                    :signal (.timeout js/AbortSignal 60000)})
+                (.then (fn [r] (.then (.text r) (fn [t] (println (str (.-status r) " " t)) (if (.-ok r) 0 1))))))))
+
+        (do (println "murakumo rollout status|plan|push") (js/Promise.resolve 2)))
+
+      (do (println (:doc (meta #'run)) "\n" (-> 'murakumo.fleet.ctl find-ns meta :doc))
+          (js/Promise.resolve (if (#{"help" "--help" nil} verb) 0 2))))))

@@ -1,0 +1,763 @@
+(ns kotoba.compiler.kotoba-reader
+  "A small, purpose-built reader for the admission-gated `.kotoba` grammar
+  (lists, vectors, maps, sets, keywords, symbols, integers, strings, and
+  `#?(...)` reader-conditionals), used ONLY on the `:cljs` (nbb) side.
+
+  This exists because `kotoba.compiler.frontend`'s reference reader is
+  `clojure.tools.reader`, a JVM-only library. Its nominal ClojureScript
+  sibling (`cljs.tools.reader`, same Maven artifact) turned out to depend on
+  several `cljs.core` internals (`cljs.core.ExceptionInfo` instance checks,
+  `IPrintWithWriter`/`pr-writer` protocol dispatch, and a `:require-macros`
+  cross-namespace macro) that nbb's SCI-based interpreter does not resolve --
+  confirmed by spiking it directly (three distinct unresolved-symbol classes
+  in as many fixes, not one isolated gap). Rather than keep chasing an
+  open-ended compatibility surface against a general-purpose reader never
+  designed for SCI, this reader covers exactly the grammar
+  `kotoba.compiler.frontend/analyze` actually accepts (see its
+  `forbidden-heads`/`reserved-function-names` and the total absence of `#{`
+  or `#?` in every checked-in `examples/*.kotoba` fixture) plus `#?()`
+  reader-conditionals and `#{}` sets for read-time parity with the JVM path
+  (frontend still requests `:read-cond :allow` and a set literal must at
+  least PARSE the same on both runtimes, even though `validate-expr` rejects
+  a set value identically on both afterward).
+
+  Integer literals are parsed as JS `bigint` (not `js/Number`), so a literal
+  at the true i64 boundary (e.g. -9223372036854775808) round-trips exactly
+  instead of losing precision the moment it's read -- required for
+  `kotoba.kir`'s compile-time oracle (constant-folds a pure `main`
+  by literally *executing* it) to match the JVM path's `Long` wraparound
+  arithmetic bit-for-bit, not just within the JS safe-integer range."
+  {:kotoba/export [ReaderState read-forms]}
+  (:require [kotoba.lang.text :as str]))
+
+(defn- whitespace-char? [ch]
+  (or (= ch " ") (= ch "\t") (= ch "\n") (= ch "\r") (= ch ",")))
+
+(defn- delimiter-char? [ch]
+  (contains? #{"(" ")" "[" "]" "{" "}" "\"" ";" nil} ch))
+
+;; `depth`/`max-depth` and `max-token-chars` mirror
+;; `kotoba.compiler.bounded-edn/preflight!`'s two DURING-parse guards
+;; (bracket depth and raw non-string token length) exactly -- both nil (the
+;; default, via `read-forms`'s 1-arity) means unlimited, matching `.kotoba`
+;; SOURCE parsing's current behavior on both runtimes (the JVM path's
+;; `clojure.tools.reader` has no such limits either -- only bounded-edn's
+;; various EDN side-channel files, via `read-file`, get them). `--policy`
+;; is the one nbb-side caller (`kotoba.compiler.nbb.cli`) that passes real
+;; limits, since it's the untrusted-ish EDN input bounded-edn was built to
+;; harden on the JVM path. Both are checked DURING parsing, not in a
+;; post-parse pass (unlike node-count/string-length, which
+;; `kotoba.compiler.nbb.cli/validate-edn-shape!` checks after): unbounded
+;; bracket nesting risks a real JS stack overflow, and `max-token-chars`
+;; specifically must cover NUMBER tokens too (a huge digit run becomes a
+;; `js/BigInt`, which has no `keyword?`/`symbol?` name to check length of
+;; after the fact -- confirmed live: an earlier version of this file only
+;; checked token length post-parse against `keyword?`/`symbol?` names,
+;; silently letting an oversized NUMERIC literal through uncaught)."
+(defrecord ReaderState [source length position depth max-depth max-token-chars line-starts])
+
+(defn- char-at
+  "The one-character STRING at index I of S. `(nth s i)` is a String on
+  ClojureScript but a java.lang.Character on the JVM, and every comparison in
+  this reader is against one-character strings (\" \", \"(\", \"\\\\\" ...) since
+  44f162c took the host char literals out. With `nth`, on the JVM nothing was
+  whitespace or a delimiter, and `read-forms` returned the WHOLE source as one
+  symbol (measured 2026-09-25 through kotoba-lang's JVM suite: 1,300 failures
+  and errors, `only ns, def, defn, and defn- are allowed at top level`)."
+  [s i]
+  (subs s i (inc i)))
+
+(defn- peek-ch [st]
+  (let [{:keys [source length position]} st]
+    (when (< position length) (char-at source position))))
+
+(defn- peek-ch2 [st]
+  (let [{:keys [source length position]} st]
+    (when (< (inc position) length) (char-at source (inc position)))))
+
+(defn- advance [st] (update st :position inc))
+
+(defn- line-start-offsets
+  "Offset of the first character of every line in SOURCE, ascending.
+
+  Read once per source so a position can become a line/column by binary
+  search. The version this replaces re-derived the answer from scratch at
+  every located node -- `subs` the whole prefix, then split it on newlines --
+  which is O(position) per node and therefore quadratic in source size."
+  [source]
+  (loop [from 0 acc [0]]
+    (if-let [i (str/index-of source "\n" from)]
+      (recur (inc i) (conj acc (inc i)))
+      acc)))
+
+(defn- line-index
+  "Index of the greatest line start that is <= POSITION."
+  [starts position]
+  (loop [lo 0 hi (dec (count starts))]
+    (if (>= lo hi)
+      lo
+      (let [mid (quot (+ lo hi 1) 2)]
+        (if (<= (nth starts mid) position) (recur mid hi) (recur lo (dec mid)))))))
+
+(defn- source-location [st]
+  (let [position (:position st)
+        starts (:line-starts st)
+        i (line-index starts position)]
+    {:line (inc i)
+     :column (inc (- position (nth starts i)))
+     :offset position}))
+
+(defn- located [value start end]
+  (if (or (coll? value) (symbol? value))
+    (with-meta value (merge (meta value) (source-location start)
+                            {:end-offset (:position end)}))
+    value))
+
+(defn- reject! [message data]
+  (throw (ex-info message (merge {:phase :read} data))))
+
+(declare read-form read-delimited)
+
+(defn- fn-shorthand-arg-num
+  "Returns the positional arg number of `%`/`%N`, or nil if X is not one."
+  [x]
+  (when (and (symbol? x) (not (namespace x)))
+    (let [n (name x)]
+      (cond
+        (= n "%") 1
+        (re-matches #"%[0-9]+" n)
+        (let [v ]
+          (when-not (pos? v)
+            (reject! "fn shorthand arg must be %1 or higher" {:token n}))
+          v)))))
+
+(defn- rewrite-fn-shorthand
+  "Rewrites `%`/`%N` symbols against PARAMS (a map N -> param symbol)."
+  [params x]
+  (cond
+    (fn-shorthand-arg-num x)
+    (let [num (fn-shorthand-arg-num x)]
+      (when-not (contains? params num)
+        (reject! (str "%" num " exceeds the shorthand's arg count") {:arg num}))
+      (get params num))
+
+    (seq? x) (apply list (mapv #(rewrite-fn-shorthand params %) x))
+    (vector? x) (mapv #(rewrite-fn-shorthand params %) x)
+    (map? x) (into {} (map (fn [[k v]]
+                             [(rewrite-fn-shorthand params k)
+                              (rewrite-fn-shorthand params v)]))
+                   x)
+    :else x))
+
+(defn- read-fn-shorthand
+  "Reads `#(body...)` as `(fn [p1 p2 ...] (do body...))` -- minimal Clojure
+  `#()` surface sugar. Supports `%` (arg 1) and `%N` (arg N, sparse OK:
+  params only up to the highest N used). `%&` rest args are rejected
+  fail-closed: the admission-gated inline-lambda grammar has no rest-arg
+  shape, so admitting one here would only move the rejection into
+  synthesized code. Empty body is rejected. Zero new backend lowering: the
+  frontend's `(fn ...)` + `(do ...)` lowerings (qualified in the
+  mapv/filterv iteration and by the existing `do` head) do the rest.
+
+  The `do` wrapper is UNCONDITIONAL, even for a single body form: a 1-form
+  `(do X)` collapses to X in the existing `do` desugar, so the KIR matches a
+  hand-written single-expression `(fn ...)`.
+
+  Meta: the synthesized `fn`/`params`/`do` levels carry the `#` position's
+  location plus `:end-offset` at the closing paren, mirroring what
+  `located` attaches to a reader-read collection (`:end-offset` included --
+  measured: a synthesized level WITHOUT `:end-offset` made loop typing read
+  the shorthand's exits as `:i64` while the hand-written form typed as
+  `:vector-i64`, so meta shape is load-bearing, not cosmetic)."
+  [st]
+  (let [st-open (advance (advance st)) ; consume `#` and `(`
+        [st forms] (read-delimited st-open ")")]
+    (when (empty? forms)
+      (reject! "#() shorthand requires a body" {}))
+    (when (some #(and (symbol? %) (not (namespace %)) (= "%&" (name %)))
+                (tree-seq coll? seq forms))
+      (reject! "%& rest args are not admitted in #() shorthand" {}))
+    (let [nums (->> (tree-seq coll? seq forms)
+                    (keep fn-shorthand-arg-num)
+                    distinct
+                    sort)
+          n (or (last nums) 0)
+          params (vec (map #(symbol (str "p" %))
+                           (range 1 (inc n))))
+          param-map (zipmap (range 1 (inc n)) params)
+          body-forms (mapv #(rewrite-fn-shorthand param-map %) forms)
+          start-meta (source-location st-open)
+          end-meta (merge (source-location st-open)
+                          {:end-offset (:position st)})]
+      [st (with-meta
+            (list 'fn
+                  (with-meta params start-meta)
+                  ;; Clojure `#()` semantics: the forms inside are the
+                  ;; arguments of ONE call form -- `#(* % 2)` is
+                  ;; `(fn [%1] (* %1 2))`, NOT `(fn [%1] (do * %1 2))`.
+                  ;; `(first forms)` is the callee; the rest are its
+                  ;; arguments. (Measured: treating the contents as `do`
+                  ;; siblings typed the map loop's exit `:i64` and rejected
+                  ;; with loop-result-type; one call form matches the
+                  ;; hand-written `(fn [p1] (* p1 2))` KIR.)
+                  (with-meta (cons (first body-forms) (rest body-forms))
+                             end-meta))
+            end-meta)])))
+
+(defn- skip-ws+comments [st]
+  (loop [st st]
+    (let [ch (peek-ch st)]
+      (cond
+        (nil? ch) st
+        (whitespace-char? ch) (recur (advance st))
+        (= ch ";") (recur (loop [st (advance st)]
+                           (let [ch (peek-ch st)]
+                             (if (or (nil? ch) (= ch "\n"))
+                               st
+                               (recur (advance st))))))
+        :else st))))
+
+(defn- read-while [st pred]
+  (loop [st st acc []]
+    (let [ch (peek-ch st)]
+      (if (and ch (pred ch))
+        (recur (advance st) (conj acc ch))
+        [st (apply str acc)]))))
+
+(defn- token-char? [ch]
+  (not (or (whitespace-char? ch) (delimiter-char? ch))))
+
+(defn- parse-int-token
+  "Returns a JS bigint on `:cljs`, and on `:clj` a `Long` when the token fits
+  in one, else a `BigInt`. Nil if TOKEN is not an integer literal, so the
+  caller falls back to symbol/keyword handling -- this mirrors
+  `clojure.tools.reader`'s own dispatch: a bare `-` or `+`, or a token like
+  `-foo`, is a symbol, not a number.
+
+  ## The `:clj` branch promotes; it did not, and that was the bug
+
+  This used to call `(bigint token)` unconditionally, so on the JVM EVERY
+  integer -- `5` included -- came back `clojure.lang.BigInt` where
+  `clojure.tools.reader` returns `java.lang.Long`. Measured against the real
+  library 2026-09-08: `5` and `9223372036854775807` are `Long`,
+  `9223372036854775808` is `BigInt`. This now does the same.
+
+  It went unnoticed because `(= 5 (bigint 5))` is true in Clojure, so no
+  program ever computed a wrong VALUE from it. What it broke was every
+  assertion that compares a printed AST or a sha256 of one: `5` and `5N` are
+  different text. Across the corpus that was 18 assertions, and every one of
+  them was a golden-hash or `pr-str` mismatch rather than a wrong answer --
+  which is why nothing caught it until both hosts were put through this
+  reader.
+
+  The `:cljs` branch is unchanged and deliberately still unconditional:
+  ClojureScript has no `Long`, and a JS `Number` loses precision above 2^53,
+  so bigint is the only representation that reaches the i64 boundary intact."
+  [token]
+  (cond
+    ;; A leading zero on a multi-digit token, refused before the decimal
+    ;; branch can swallow it. `clojure.tools.reader` reads `0377` as OCTAL 255;
+    ;; this reader read it as decimal 377. Same source, two hosts, two
+    ;; different numbers, no error on either -- the worst of the three possible
+    ;; outcomes, and the one that was live until 2026-09-08.
+    ;;
+    ;; Refusing rather than implementing octal is deliberate: every
+    ;; leading-zero match in the checked-in `.kotoba` corpus is an ADR number
+    ;; inside a comment, so no program pays for this, and picking one host's
+    ;; interpretation silently is how the divergence got here.
+    (re-matches #"[+-]?0[0-9]+" token)
+    (reject! (str "a leading zero is not an octal prefix in Kotoba: " token
+                  " -- write it in decimal, or 0x hex")
+             {:token token})
+
+    (re-matches #"[+-]?[0-9]+" token)
+    
+
+    ;; Hex. 79 `.kotoba` files in this workspace use `0x...` literals, and
+    ;; NONE of them could be read here until 2026-09-08: `0xF000` matched no
+    ;; number pattern, fell through to `symbol`, and was refused downstream as
+    ;; `unbound or dynamic symbol is forbidden: 0xF000` -- a refusal that sends
+    ;; the author looking for a missing binding instead of a missing literal.
+    ;;
+    ;; It was invisible while the JVM read source with `clojure.tools.reader`,
+    ;; which handles hex for free. Making this the reader for both hosts is
+    ;; what surfaced it: kotoba-lang/amu's `bit-or-and-not-match-jvm-semantics`
+    ;; and `i64-shifts-cover-the-full-width` went red on `(bit-or 0xF000
+    ;; 0x00F0)`.
+    (re-matches #"[+-]?0[xX][0-9a-fA-F]+" token)
+    (let [neg? (str/starts-with? token "-")
+          digits (subs token (if (or neg? (str/starts-with? token "+")) 3 2))]
+      )
+
+    :else nil))
+
+(defn- numeric-looking?
+  "A token that begins like a number but matched no number pattern.
+
+  These must be REFUSED, not handed to `symbol`. `0377` used to read as the
+  BigInt 377 here while `clojure.tools.reader` read it as octal 255 -- a
+  silently DIFFERENT VALUE across hosts, which is worse than either host
+  refusing. `2r1010` and `1e5` became symbols and were reported as unbound
+  variables.
+
+  Nothing in the checked-in `.kotoba` corpus uses a leading-zero or radix
+  literal (every match is an ADR number inside a comment), so refusing them
+  costs no existing program and closes the class rather than the one instance
+  of it. If Kotoba ever wants octal, it gets an explicit prefix and a branch
+  above, not a leading zero."
+  [token]
+  (boolean (re-matches #"[+-]?[0-9][0-9a-zA-Z_.]*" token)))
+
+(defn- f64-form [number]
+  (with-meta
+    
+    {:kotoba.reader/f64-literal true}))
+
+(defn- parse-f64-token [token]
+  (when (re-matches #"[+-]?(?:(?:[0-9]+\.[0-9]*|[0-9]*\.[0-9]+)(?:[eE][+-]?[0-9]+)?|[0-9]+[eE][+-]?[0-9]+)" token)
+    (f64-form )))
+
+(defn- read-token [st]
+  (let [[st token] (read-while st token-char?)]
+    (when (zero? (count token)) (reject! "expected a form" {:position (:position st)}))
+    (when (and (:max-token-chars st) (> (count token) (:max-token-chars st)))
+      (reject! "EDN token exceeds limit" {:limit (:max-token-chars st)}))
+    [st token]))
+
+(defn- read-symbol-or-number [st]
+  (let [[st token] (read-token st)]
+    [st (case token
+          "nil" nil
+          "true" true
+          "false" false
+          (or (parse-int-token token)
+              (parse-f64-token token)
+              ;; A token that starts like a number and parsed as neither is a
+              ;; malformed literal, not a variable name. Saying so here is the
+              ;; difference between `unsupported numeric literal: 0377` and
+              ;; `unbound or dynamic symbol is forbidden: 0377`.
+              ;; `0N` / `1.5M` -- host arbitrary-precision literals. Read as
+              ;; tagged forms (refused by name in admission if selected), so
+              ;; a :clj branch that spells one no longer refuses the file.
+              (when-let [m (re-matches #"([+-]?[0-9]+)N" token)]
+                (list 'kotoba.reader/bigint (second m)))
+              (when-let [m (re-matches #"([+-]?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)M" token)]
+                (list 'kotoba.reader/bigdec (second m)))
+              (when (numeric-looking? token)
+                (reject! (str "unsupported numeric literal: " token
+                              " -- decimal, 0x hex and decimal f64 are the "
+                              "forms this reader accepts")
+                         {:token token}))
+              (symbol token)))]))
+
+(defn- read-keyword [st]
+  (let [st (advance st) ; consume leading `:`
+        [st token] (read-token st)]
+    [st (keyword token)]))
+
+(defn- unescape [s]
+  (loop [i 0 acc (transient [])]
+    (if (>= i (count s))
+      (apply str (persistent! acc))
+      (let [ch (char-at s i)]
+        (if (and (= ch "\\") (< (inc i) (count s)))
+          (let [nxt (char-at s (inc i))
+                ;; `\uXXXX` -- exactly four hex digits, one UTF-16 code unit,
+                ;; as Clojure's reader defines it. Measured 2026-09-11 in the
+                ;; compiler's own bounded_edn / elf64 sources; without it the
+                ;; whole file is refused at the reader, before any semantics.
+                [mapped width]
+                (if (= nxt "u")
+                  (let [hex (subs s (+ i 2) (min (count s) (+ i 6)))]
+                    (when-not (and (= 4 (count hex)) (re-matches #"[0-9a-fA-F]{4}" hex))
+                      (reject! "unsupported string escape" {:escape nxt :hex hex}))
+                    [(char ) 6])
+                  [(case nxt
+                     "n" "\n" "t" "\t" "r" "\r"
+                     "\\" "\\" "\"" "\"" "0" (char 0)
+                     ;; `\b` and `\f` are the two remaining single-letter
+                     ;; escapes Clojure's StringReader accepts (backspace,
+                     ;; form feed). Measured 2026-09-12: the reader refused
+                     ;; osaho's `kir/value.cljk` (a JSON escape table) and
+                     ;; THIS file (its own EDN printer) whole for one each,
+                     ;; and every compiler module that requires either was
+                     ;; refused `source reader rejected input` in a dependency.
+                     "b" (char 8) "f" (char 12)
+                     (reject! "unsupported string escape" {:escape nxt}))
+                   2])]
+            (recur (+ i width) (conj! acc mapped)))
+          (recur (inc i) (conj! acc ch)))))))
+
+(defn- read-string-literal [st]
+  (let [st (advance st)] ; consume opening quote
+    (loop [st st acc []]
+      (let [ch (peek-ch st)]
+        (cond
+          (nil? ch) (reject! "unterminated string literal" {})
+          (= ch "\"") [(advance st) (unescape (apply str acc))]
+          (and (= ch "\\") (some? (peek-ch2 st)))
+          (recur (advance (advance st)) (conj acc ch (peek-ch2 st)))
+          :else (recur (advance st) (conj acc ch)))))))
+
+(defn- read-regex-body
+  "Body of a `#\"...\"` literal, raw: Clojure's regex reader keeps every
+  backslash for the pattern engine and treats only `\\\"` as an escape."
+  [st]
+  (loop [st st acc []]
+    (let [ch (peek-ch st)]
+      (cond
+        (nil? ch) (reject! "unterminated regex literal" {})
+        (= ch "\"") [(advance st) (apply str acc)]
+        (and (= ch "\\") (= (peek-ch2 st) "\"")) (recur (advance (advance st)) (conj acc "\""))
+        (and (= ch "\\") (some? (peek-ch2 st))) (recur (advance (advance st)) (conj acc ch (peek-ch2 st)))
+        :else (recur (advance st) (conj acc ch))))))
+
+(defn- splice?
+  "The marker `#?@` leaves for the enclosing `read-delimited`: a map, because
+  the reader's own values are the only currency read-form returns, and no
+  admitted source form is a map with this key."
+  [form]
+  (and (map? form) (true? (:kotoba.reader/splice form))))
+
+(defn- read-delimited
+  "Reads forms up to CLOSE (already-consumed OPEN), returning `[state forms]`.
+  Bumps `:depth` for the duration of this container and restores the
+  parent's depth on close, checking `:max-depth` (if set) on entry --
+  see `ReaderState`'s docstring for why this needs to happen here, not
+  only in a post-parse pass."
+  [st close]
+  (let [depth (inc (:depth st))]
+    (when (and (:max-depth st) (> depth (:max-depth st)))
+      (reject! "EDN nesting exceeds limit" {:limit (:max-depth st)}))
+    (loop [st (assoc st :depth depth) acc []]
+      (let [st (skip-ws+comments st)
+            ch (peek-ch st)]
+        (cond
+          (nil? ch) (reject! "unterminated collection" {:expected close})
+          (= ch close) [(assoc (advance st) :depth (dec depth)) acc]
+          :else (let [[st' form skip?] (read-form st)]
+                  (recur st' (cond skip? acc
+                                   (splice? form) (into acc (:forms form))
+                                   :else (conj acc form)))))))))
+
+(defn- reader-conditional-branch
+  "Given the parsed clauses vector `[:kotoba a :clj b :default c ...]`,
+  selects the first clause whose feature is `:kotoba` or `:default` --
+  mirrors `clojure.tools.reader`'s `:features #{:kotoba}` selection this
+  compiler's frontend already requests. Returns `[form matched?]`.
+
+  An odd number of forms is refused, as `clojure.tools.reader` refuses it:
+  until 2026-10-09 `partition 2` dropped the unpaired last form, so
+  `#?(:kotoba (defn main [] 1) :clj)` was read as if it had no `:clj` clause
+  and ADMITTED (kotoba-lang lang/conformance/negative/
+  malformed_reader_conditional.cljk). Checked before a branch is chosen,
+  so a malformed clause after a matching one is refused too."
+  [clauses]
+  (when (odd? (count clauses))
+    (reject! "reader conditional requires feature/expression pairs"
+             {:forms (count clauses)}))
+  (loop [pairs (partition 2 clauses)]
+    (if-let [[feature form] (first pairs)]
+      (if (or (= feature :kotoba) (= feature :default))
+        [form true]
+        (recur (next pairs)))
+      [nil false])))
+
+(defn- reader-map
+  "Build reader maps without hashing their keys. JavaScript BigInt values are
+  exact Kotoba i64 literals but cannot be hashed by nbb when nested in a
+  vector/map key. A deterministic printed-form comparator keeps arbitrary EDN
+  keys readable while frontend elaboration supplies the semantic ordering."
+  [forms]
+  (reduce (fn [out [key value]] (assoc out key value))
+          (sorted-map-by (fn [left right]
+                           (compare (pr-str left) (pr-str right))))
+          (partition 2 forms)))
+
+(defn- reader-set
+  "`cljs.core/set` above eight elements, with a name for what it does.
+
+  An exact Kotoba i64 literal reads as a JavaScript BigInt, `cljs.core/set`
+  switches to a hashed representation above eight elements, and nbb cannot
+  hash a BigInt. `#{1 2 3 4 5 6 7 8}` therefore read and
+  `#{1 2 3 4 5 6 7 8 9}` threw a raw `TypeError` that reached the caller as
+  `source reader rejected input` with no reason attached.
+
+  This does NOT lift the limit. Reading the set is only the first barrier:
+  measured 2026-09-08, building the set without hashing (a `sorted-set-by`
+  over printed forms) gets past the reader and then hits the SAME BigInt hash
+  inside frontend elaboration, turning a refusal into an internal compiler
+  error -- which is worse. So the limit stands and is named instead.
+
+  `max-typed-set-items` is 32. For a set of exact integers on this host the
+  real ceiling is 8, and until the frontend stops hashing those elements the
+  declared bound overstates what can be written.
+
+  ## Why the guard is `:cljs` only
+
+  `(catch :default ...)` is not a JVM catch clause -- Clojure reads `:default`
+  as a class name and refuses to compile the file. This is a `.cljc`, so the
+  first version of this function broke `kbb -M:test` for the whole
+  repository, and it went in green because the run that reported green never
+  compiled this namespace on the JVM.
+
+  Writing it as `#?(:clj Exception :cljs :default)` would compile, and would
+  be worse: the hazard does not exist on the JVM at all -- a Clojure set
+  hashes a BigInt without complaint -- so a JVM catch here could only swallow
+  a real error. The host that has the failure mode is the host that gets the
+  guard."
+  [forms]
+  )
+
+(defn- read-form
+  "Returns `[state form skip?]`. `skip?` is true for a `#?()` clause with no
+  matching feature (nothing to splice in) so the caller omits it entirely."
+  [st]
+  (let [st (skip-ws+comments st)
+        start st
+        ch (peek-ch st)]
+    (cond
+      (nil? ch) (reject! "unexpected end of input" {})
+
+      (= ch "(") (let [[st forms] (read-delimited (advance st) ")")]
+                  [st (located (apply list forms) start st) false])
+
+      (= ch "[") (let [[st forms] (read-delimited (advance st) "]")]
+                  [st (located (vec forms) start st) false])
+
+      (= ch "{") (let [[st forms] (read-delimited (advance st) "}")]
+                  (when (odd? (count forms))
+                    (reject! "map literal must contain an even number of forms" {}))
+                  [st (located (reader-map forms) start st) false])
+
+      (= ch "\"") (let [[st s] (read-string-literal st)] [st s false])
+
+      ;; `@a` is `(deref a)`. This dispatch had no case for `@` at all, and
+      ;; `@` is not a delimiter, so `@a` fell through to
+      ;; `read-symbol-or-number` and was read as the single SYMBOL `@a`.
+      ;; `unbound-symbol!` then rejected it -- correctly, given what it was
+      ;; handed; the input was already wrong by then. The refusal read
+      ;; `@a is not a parameter, a let binding, or a function of this module`,
+      ;; which sends the author looking for a missing binding that is not the
+      ;; problem.
+      ;;
+      ;; `@` is load-bearing: `frontend.cljc`'s `deref-form?` recognizes both
+      ;; `(deref x)` and `(clojure.core/deref x)`, and the local-state slice
+      ;; spells the feature `@a` in its own design notes. It was invisible
+      ;; while the JVM read source with `clojure.tools.reader`, which expands
+      ;; `@` for free. It became visible the moment both hosts were put
+      ;; through this reader -- 17 assertions in `local_state_test`.
+      ;;
+      ;; The other Clojure reader macros -- quote, syntax-quote, unquote,
+      ;; var-quote -- are equally absent here. Nothing in the `.kotoba`
+      ;; corpus exercises them, so their absence is UNMEASURED, not
+      ;; known-good. Do not read this clause as evidence the rest are covered.
+      ;; (`^meta` was on this list until 2026-09-11; see the `\^` arm below.)
+      (= ch "@") (let [[st inner _] (read-form (advance st))]
+                  [st (located (list 'deref inner) start st) false])
+
+      ;; `'form` -> `(quote form)`. Measured 2026-09-11 (adr-2609111900): the
+      ;; quote character was not a delimiter, so `'#{a b}` fell through to
+      ;; `read-symbol-or-number`, which took `'` as a one-character symbol
+      ;; and left `#{a b}` to be read as a MAP -- "map literal must contain
+      ;; an even number of forms" on 32 of the compiler's own 178 sources,
+      ;; every one of them a quoted set of symbols. Worse, `'sym` read
+      ;; silently as the symbol named `'sym`. Whether `quote` is admitted is
+      ;; the frontend's decision; the reader's job is to hand over what was
+      ;; written.
+      (= ch "'") (let [[st inner skipped?] (read-form (advance st))]
+                  (when skipped? (reject! "quote must precede a form" {}))
+                  [st (located (list 'quote inner) start st) false])
+
+      ;; `^meta form`. Same defect shape as `@` above, measured 2026-09-11
+      ;; at 8b288047: `^` is not a delimiter, so `^:private` fell through to
+      ;; `read-symbol-or-number` and became the SYMBOL `^:private`, shifting
+      ;; every element after the head by two. `(defn ^:private h [x :i64]
+      ;; :i64 x)` was refused with `function parameters must be a vector`
+      ;; pointing at `h` -- true of what the reader handed over, and not the
+      ;; author's mistake.
+      ;;
+      ;; Normalised as Clojure normalises: `^:kw` is `{:kw true}`, `^sym` and
+      ;; `^"str"` are `{:tag ...}`, `^{...}` is the map itself. Stacked
+      ;; metadata merges with the OUTERMOST (leftmost) winning on a shared
+      ;; key -- measured on Clojure 1.12: `(meta '^{:a 1} ^{:a 2} x)` is
+      ;; `{:a 1}` -- because the inner form is read first and the outer map
+      ;; is assoc'd over it.
+      ;;
+      ;; Two things this arm refuses rather than guesses. A form that cannot
+      ;; carry metadata (keyword, number, string, nil, boolean) is a refusal
+      ;; in `:phase :read`, not a silent drop: metadata that vanishes is
+      ;; worse than metadata that is refused, because `^:private` on the
+      ;; wrong element would compile as public. And a `#?()` clause with no
+      ;; matching feature leaves nothing to attach to.
+      ;;
+      ;; `located` runs on the RESULT so the span starts at `^` (Clojure puts
+      ;; the `^` position on a seq too), and `located` merges into the
+      ;; existing meta -- it does not `with-meta` a fresh map -- so the user's
+      ;; keys survive it. A refusal inside a `^:private` function still
+      ;; carries a `:span`; `reader_metadata_test` pins that.
+      (= ch "^")
+      (let [[st meta-form meta-skipped?] (read-form (advance st))
+            _ (when meta-skipped?
+                (reject! "metadata must be a keyword, symbol, string, or map"
+                         {:meta nil}))
+            m (cond
+                (keyword? meta-form) {meta-form true}
+                (symbol? meta-form) {:tag meta-form}
+                (string? meta-form) {:tag meta-form}
+                (map? meta-form) meta-form
+                :else (reject! "metadata must be a keyword, symbol, string, or map"
+                               {:meta meta-form}))
+            [st form skipped?] (read-form st)]
+        (when skipped?
+          (reject! "metadata must precede a form" {:meta m}))
+        ;; A decimal literal reads as the synthesised `(f64-from-bits N)`
+        ;; list (`f64-form`) -- a collection standing for a number. `coll?`
+        ;; alone would let `^:a 1.5` through while `^:a 1` is refused; the
+        ;; reader's own marker says which collections are literals.
+        (when-not (and (or (symbol? form) (coll? form))
+                       (not (:kotoba.reader/f64-literal (meta form))))
+          (reject! "metadata may only precede a symbol or a collection"
+                   {:meta m :form form}))
+        ;; `{}` first so the result is a plain map even when M is the
+        ;; comparator-ordered map `reader-map` builds and FORM has no meta.
+        [st (located (with-meta form (merge {} (meta form) m)) start st) false])
+
+      (= ch ":") (read-keyword st)
+
+      (= ch "#")
+      (let [ch2 (peek-ch2 st)]
+        (cond
+          (= ch2 "(") (read-fn-shorthand st)
+          (= ch2 "{") (let [[st forms] (read-delimited (advance (advance st)) "}")]
+                       [st (located (reader-set forms) start st) false])
+          ;; `#_ form` -- the discard is a reader-level comment: the next
+          ;; form is read (so nesting and balance are honoured) and dropped.
+          (= ch2 "_") (let [[st _ _] (read-form (advance (advance st)))]
+                       [st nil true])
+          (= ch2 "?") (let [st (advance (advance st))
+                           splicing? (= (peek-ch st) "@")
+                           st (if splicing? (advance st) st)
+                           st (skip-ws+comments st)]
+                       (when-not (= (peek-ch st) "(")
+                         (reject! (if splicing? "expected `(` after `#?@`" "expected `(` after `#?`") {}))
+                       (let [[st clauses] (read-delimited (advance st) ")")
+                             [form matched?] (reader-conditional-branch clauses)]
+                         (cond
+                           (not matched?) [st nil true]
+                           ;; `#?@(...)` splices the chosen branch's elements
+                           ;; into the enclosing collection. Clojure requires
+                           ;; a collection there and refuses a top-level
+                           ;; splice; both are refused here the same way.
+                           splicing? (do (when-not (sequential? form)
+                                           (reject! "`#?@` branch must be a sequential collection" {:form form}))
+                                         (when (zero? (:depth st))
+                                           (reject! "`#?@` is not admitted at top level" {}))
+                                         [st {:kotoba.reader/splice true :forms (vec form)} false])
+                           :else [st form false])))
+          ;; `#:ns{...}` -- namespaced map literal. Unqualified keyword keys
+          ;; take the namespace; `_/k` keeps the key bare; qualified keys and
+          ;; non-keyword keys are untouched. Values are never rewritten.
+          (= ch2 ":") (let [[st ns-token] (read-token (advance (advance st)))
+                           st (skip-ws+comments st)]
+                       (when (or (str/blank? ns-token) (not= (peek-ch st) "{"))
+                         (reject! "expected `{` after `#:ns`" {:ns ns-token}))
+                       (let [[st forms] (read-delimited (advance st) "}")
+                             _ (when (odd? (count forms))
+                                 (reject! "map literal must contain an even number of forms" {}))
+                             qualify (fn [k]
+                                       (cond (not (keyword? k)) k
+                                             (= "_" (namespace k)) (keyword (name k))
+                                             (namespace k) k
+                                             :else (keyword ns-token (name k))))
+                             forms (vec (map-indexed (fn [i f] (if (even? i) (qualify f) f)) forms))]
+                         [st (located (reader-map forms) start st) false]))
+          (= ch2 "#") (let [[st token] (read-token (advance (advance st)))
+                            value (case token
+                                    "NaN" (f64-form )
+                                    "Inf" (f64-form )
+                                    "-Inf" (f64-form )
+                                    (reject! "unsupported symbolic f64 literal" {:token token}))]
+                        [st (located value start st) false])
+          ;; `#"..."` -- a HOST regex literal. It is READ, not admitted: the
+          ;; form `(kotoba.reader/regex "pattern")` survives so that a
+          ;; `:clj` / `:cljs` branch of a reader conditional can be read
+          ;; and discarded, and the frontend refuses it by name if it
+          ;; reaches admission (regex in guest source is a string pattern
+          ;; handed to kotoba.lang.bounded-regex). Measured 2026-09-11: 35 of
+          ;; the compiler'"'"'s own 178 sources were refused at the reader for
+          ;; this literal alone, most of them inside branches that would
+          ;; never have been selected. The pattern is taken raw, as Clojure
+          ;; does: only `\"` is an escape inside a regex literal.
+          (= ch2 "\"") (let [[st pat] (read-regex-body (advance (advance st)))]
+                       [st (located (list 'kotoba.reader/regex pat) start st) false])
+          ;; `#js {...}` / `#js [...]` -- host interop literal, same treatment:
+          ;; read as `(kotoba.reader/js <form>)`, refused by name in admission.
+          (= ch2 "j") (let [[st token] (read-token (advance st))]
+                       (when-not (= token "js")
+                         (reject! "unsupported reader dispatch" {:next ch2 :token token}))
+                       (let [[st form skipped?] (read-form st)]
+                         (when skipped? (reject! "`#js` must precede a form" {}))
+                         [st (located (list 'kotoba.reader/js form) start st) false]))
+          ;; `#=` -- reader evaluation. Refused HERE, as a dispatch, so the
+          ;; refusal is about the macro and not about two characters that
+          ;; happen to sit inside a string or a comment (the frontend used to
+          ;; grep the whole source for them).
+          (= ch2 "=") (reject! "reader evaluation is forbidden" {:next ch2})
+          :else (reject! "unsupported reader dispatch" {:next ch2})))
+
+      ;; `\c` character literal. Measured 2026-09-11 (adr-2609111900): the
+      ;; backslash was not a delimiter, so `\\` and `\space` read SILENTLY as
+      ;; the symbols `\\` / `\space`, and `\"` / `\(` -- the compiler'"'"'s own
+      ;; lexers are full of them -- started a string or a list and refused the
+      ;; file with an unrelated message. A char is HOST data (Kotoba text is
+      ;; UTF-8 bytes; the guest spells a byte as an integer), so it reads as
+      ;; the tagged form `(kotoba.reader/char "c")` and is refused by name in
+      ;; admission if a selected branch still carries it.
+      (= ch "\\")
+      (let [st (advance st)
+            c (peek-ch st)
+            _ (when (nil? c) (reject! "unexpected end of input after `\\`" {}))
+            [st text] (if (or (delimiter-char? c) (whitespace-char? c) (= c "\\") (= c "\"") (= c ";"))
+                        [(advance st) (str c)]
+                        (read-token st))
+            value (case text
+                    "newline" "\n" "space" " " "tab" "\t" "formfeed" "\f"
+                    "backspace" "\b" "return" "\r"
+                    (cond
+                      (= 1 (count text)) text
+                      (re-matches #"u[0-9a-fA-F]{4}" text)
+                      (str (char ))
+                      (re-matches #"o[0-7]{1,3}" text)
+                      (str (char ))
+                      :else (reject! "unsupported character literal" {:literal (str "\\" text)})))]
+        [st (located (list 'kotoba.reader/char value) start st) false])
+
+      (= ch ")") (reject! "unmatched `)`" {})
+      (= ch "]") (reject! "unmatched `]`" {})
+      (= ch "}") (reject! "unmatched `}`" {})
+
+      :else (let [[st form] (read-symbol-or-number st)]
+              [st (located form start st) false]))))
+
+(defn read-forms
+  "Reads every top-level form in SOURCE, returning a vector -- mirrors
+  `kotoba.compiler.frontend`'s own JVM `read-forms` loop (which drives
+  `clojure.tools.reader` one form at a time until EOF).
+
+  OPTS (default `{}`, via the 1-arity -- unlimited, matching `.kotoba`
+  SOURCE parsing's current behavior on both runtimes) may set `:max-depth`
+  and/or `:max-token-chars` to bound bracket nesting / raw token length --
+  see `ReaderState`'s docstring for why these are checked here rather than
+  in a post-parse pass."
+  ([source] (read-forms source {}))
+  ([source opts]
+   (loop [st (->ReaderState source (count source) 0 0
+                            (:max-depth opts) (:max-token-chars opts)
+                            (line-start-offsets source))
+          acc []]
+     (let [st (skip-ws+comments st)]
+       (if (nil? (peek-ch st))
+         acc
+         (let [[st' form skip?] (read-form st)]
+           (recur st' (if skip? acc (conj acc form)))))))))

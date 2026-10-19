@@ -1,0 +1,477 @@
+(ns kototama.postgresql-pool-provider
+  "Opaque PostgreSQL lease table. Protocol/auth/reset stay in compiled Kotoba
+  providers; this JVM boundary owns only bounded pool membership and freshness."
+  (:require [kotoba.bytes :as kbytes] [kototama.tender :as tender])
+  (:import (com.dylibso.chicory.wasm.types ValType)
+           (java.nio ByteBuffer ByteOrder)))
+
+(defn- copy-in! [from-instance from-ptr to-instance to-ptr len]
+  (let [bytes (.readBytes (.memory from-instance) (int from-ptr) (int len))]
+    (.write (.memory to-instance) (int to-ptr) bytes 0 (int len))))
+
+(defn- copy-bytes! [bytes to-instance to-ptr]
+  (.write (.memory to-instance) (int to-ptr) bytes 0 (alength ^bytes bytes)))
+
+(defn- read-bytes [instance ptr len]
+  (.readBytes (.memory instance) (int ptr) (int len)))
+
+(defn- copy-out! [from-instance from-ptr to-instance to-ptr len]
+  (copy-in! from-instance from-ptr to-instance to-ptr len))
+
+(defn- invoke [instance export args]
+  (aget ^longs (.apply (.export instance export) (long-array args)) 0))
+
+(defn pool-provider
+  [{:keys [scram-session query-session query-session-fn max-pools max-leases
+           max-connections-per-pool acquire-wait-ms idle-timeout-ms
+           max-lifetime-ms drain-wait-ms clock-ms]
+    :or {max-pools 4 max-leases 16 max-connections-per-pool 4
+         acquire-wait-ms 1000 idle-timeout-ms 30000 max-lifetime-ms 300000
+         drain-wait-ms 5000
+         clock-ms #(System/currentTimeMillis)}}]
+  (when-not (and (pos? max-pools) (pos? max-leases)
+                 (pos? max-connections-per-pool)
+                 (<= max-connections-per-pool max-leases)
+                 (not (neg? acquire-wait-ms)) (not (neg? idle-timeout-ms))
+                 (pos? max-lifetime-ms) (not (neg? drain-wait-ms)))
+    (throw (ex-info "Invalid PostgreSQL pool bounds" {})))
+  (let [scram (:instance scram-session)
+        new-query-session (or query-session-fn (constantly query-session))
+        scram-page (.grow (.memory scram) 1)
+        _ (when (neg? scram-page)
+            (throw (ex-info "PostgreSQL pool scratch memory unavailable" {})))
+        scram-base (* scram-page 65536)
+        lock (Object.)
+        scram-lock (Object.)
+        state (atom {:next-pool 1 :next-connection 1 :next-lease 1 :next-waiter 1
+                     :pools {} :leases {} :waiters {}
+                     :free-query-scratch []})
+        close-channel! (fn [channel]
+                         (locking scram-lock
+                           (invoke scram "pg-close-scram" [channel])))
+        valid-small? (fn [n] (and (pos? (long n)) (<= (long n) 255)))
+        metric! (fn [pool-id key & [amount]]
+                  (swap! state update-in [:pools pool-id :metrics key]
+                         (fnil + 0) (long (or amount 1))))
+        open-channel!
+        (fn [{:keys [host port user database credential]}]
+          (locking scram-lock
+            (let [host-ptr scram-base user-ptr (+ scram-base 256)
+                  db-ptr (+ scram-base 512) credential-ptr (+ scram-base 768)]
+              (copy-bytes! host scram host-ptr)
+              (copy-bytes! user scram user-ptr)
+              (copy-bytes! database scram db-ptr)
+              (copy-bytes! credential scram credential-ptr)
+              (invoke scram "pg-open-scram-random"
+                      [host-ptr (alength ^bytes host) port
+                       user-ptr (alength ^bytes user)
+                       db-ptr (alength ^bytes database)
+                       credential-ptr (alength ^bytes credential)]))))
+        expired? (fn [now {:keys [status created-at last-used-at]}]
+                   (and (= :idle status)
+                        (or (>= (- now created-at) max-lifetime-ms)
+                            (and (pos? idle-timeout-ms)
+                                 (>= (- now last-used-at) idle-timeout-ms)))))
+        reap!
+        (fn [pool-id]
+          (let [now (long (clock-ms))
+                expired (->> (get-in @state [:pools pool-id :connections])
+                             (filter (fn [[_ connection]] (expired? now connection)))
+                             (map first) vec)]
+            (doseq [connection-id expired]
+              (when-let [channel (get-in @state [:pools pool-id :connections connection-id :channel])]
+                (close-channel! channel)))
+            (when (seq expired)
+              (let [scratch (mapv #(select-keys
+                                    (get-in @state [:pools pool-id :connections %])
+                                    [:query-instance :query-base]) expired)]
+                (swap! state (fn [s]
+                               (-> s
+                                   (update-in [:pools pool-id :connections]
+                                              #(apply dissoc % expired))
+                                   (update :free-query-scratch into scratch)))))
+              (metric! pool-id :evictions (count expired)))
+            (count expired)))
+        grow!
+        (fn [pool-id]
+          (let [pool (get-in @state [:pools pool-id])]
+            (when (and pool
+                       (< (count (:connections pool)) max-connections-per-pool))
+              (let [channel (open-channel! (:config pool))]
+                (when-not (neg? channel)
+                  (let [reused-scratch (peek (:free-query-scratch @state))
+                        query-instance (or (:query-instance reused-scratch)
+                                           (:instance (new-query-session)))
+                        query-page (when-not reused-scratch
+                                     (.grow (.memory query-instance) 1))
+                        query-base (or (:query-base reused-scratch)
+                                       (when-not (neg? query-page) (* query-page 65536)))]
+                    (if (nil? query-base)
+                      (do (close-channel! channel) nil)
+                      (let [connection-id (:next-connection @state)
+                            now (long (clock-ms))]
+                        (swap! state (fn [s]
+                                       (-> (if reused-scratch
+                                             (update s :free-query-scratch pop)
+                                             s)
+                                           (update :next-connection inc)
+                                           (assoc-in [:pools pool-id :connections connection-id]
+                                                     {:channel channel :status :idle
+                                                      :execution-lock (Object.)
+                                                      :query-instance query-instance
+                                                      :query-base query-base
+                                                      :created-at now :last-used-at now}))))
+                        (metric! pool-id :connections-created)
+                        connection-id))))))))
+        lease-idle!
+        (fn [pool-id]
+          (when-let [[connection-id _]
+                     (first (filter (fn [[_ c]] (= :idle (:status c)))
+                                    (get-in @state [:pools pool-id :connections])))]
+            (let [lease-id (:next-lease @state)]
+              (swap! state (fn [s]
+                             (-> s
+                                 (update :next-lease inc)
+                                 (assoc-in [:pools pool-id :connections connection-id :status]
+                                           :leased)
+                                 (assoc-in [:leases lease-id]
+                                           {:pool-id pool-id
+                                            :connection-id connection-id}))))
+              lease-id)))
+        open-fn
+        (tender/host-fn
+         "pg_pool_open"
+         [ValType/I32 ValType/I32 ValType/I32 ValType/I32 ValType/I32
+          ValType/I32 ValType/I32 ValType/I32 ValType/I32]
+         ValType/I32
+         (fn [consumer args]
+           (locking lock
+             (let [host-len (aget args 1) user-len (aget args 4)
+                   db-len (aget args 6) credential-len (aget args 8)]
+               (if (or (not (every? valid-small? [host-len user-len db-len credential-len]))
+                       (>= (count (:pools @state)) max-pools))
+                 -1
+                 (let [pool-id (:next-pool @state)
+                       config {:host (read-bytes consumer (aget args 0) host-len)
+                               :port (aget args 2)
+                               :user (read-bytes consumer (aget args 3) user-len)
+                               :database (read-bytes consumer (aget args 5) db-len)
+                               :credential (read-bytes consumer (aget args 7) credential-len)}]
+                   (swap! state (fn [s] (-> s (update :next-pool inc)
+                                            (assoc-in [:pools pool-id]
+                                                      {:config config :status :open
+                                                       :connections {}
+                                                       :metrics {:acquires 0 :waits 0
+                                                                 :timeouts 0 :evictions 0
+                                                                 :connections-created 0}}))))
+                   (if (grow! pool-id)
+                     pool-id
+                     (do (swap! state update :pools dissoc pool-id) -1))))))))
+        acquire-fn
+        (tender/host-fn
+         "pg_pool_acquire" [ValType/I32] ValType/I32
+         (fn [_ args]
+           (locking lock
+             (let [pool-id (aget args 0)
+                   deadline (+ (System/nanoTime) (* 1000000 (long acquire-wait-ms)))]
+               (loop [waiter-id nil]
+                 (reap! pool-id)
+                 (let [queue (get-in @state [:waiters pool-id] [])
+                       pool-status (get-in @state [:pools pool-id :status])
+                       at-head? (or (and (nil? waiter-id) (empty? queue))
+                                    (= waiter-id (first queue)))
+                       capacity? (< (count (:leases @state)) max-leases)
+                       lease (when (and (= :open pool-status) at-head? capacity?)
+                               (or (lease-idle! pool-id)
+                                   (when (grow! pool-id) (lease-idle! pool-id))))]
+                   (cond
+                     (nil? (get-in @state [:pools pool-id]))
+                     (do (when waiter-id
+                           (swap! state update-in [:waiters pool-id]
+                                  #(vec (remove #{waiter-id} %))))
+                         -1)
+
+                     (not= :open pool-status)
+                     (do (when waiter-id
+                           (swap! state update-in [:waiters pool-id]
+                                  #(vec (remove #{waiter-id} %))))
+                         -1)
+
+                     lease
+                     (do (when waiter-id
+                           (swap! state update-in [:waiters pool-id]
+                                  #(vec (rest %))))
+                         (.notifyAll lock)
+                         (metric! pool-id :acquires)
+                         lease)
+
+                     :else
+                     (let [waiter-id (or waiter-id (:next-waiter @state))
+                           new-waiter? (nil? (some #{waiter-id} queue))
+                           _ (when new-waiter?
+                               (swap! state (fn [s]
+                                              (-> s
+                                                  (update :next-waiter inc)
+                                                  (update-in [:waiters pool-id]
+                                                             (fnil conj []) waiter-id))))
+                               (metric! pool-id :waits))
+                           remaining-ms (quot (- deadline (System/nanoTime)) 1000000)]
+                       (if (pos? remaining-ms)
+                         (do (.wait lock (long remaining-ms)) (recur waiter-id))
+                         (do (swap! state update-in [:waiters pool-id]
+                                    #(vec (remove #{waiter-id} %)))
+                             (metric! pool-id :timeouts)
+                             (.notifyAll lock)
+                             -1))))))))))
+        query-fn
+        (tender/host-fn
+         "pg_pool_query"
+         [ValType/I32 ValType/I32 ValType/I32 ValType/I32 ValType/I32
+         ValType/I32 ValType/I32] ValType/I32
+         (fn [consumer args]
+           (let [lease-id (aget args 0)
+                 lease (locking lock (get-in @state [:leases lease-id]))
+                 {:keys [pool-id connection-id]} lease
+                 connection (locking lock
+                              (get-in @state [:pools pool-id :connections connection-id]))
+                 query-len (aget args 2) out-cap (aget args 4) meta-cap (aget args 6)]
+             (if (or (nil? connection) (not (valid-small? query-len))
+                     (neg? out-cap) (> out-cap 32768) (< meta-cap 7))
+               -1
+               (locking (:execution-lock connection)
+                 (if (not= lease (locking lock (get-in @state [:leases lease-id])))
+                   -1
+                   (let [channel (:channel connection)
+                         query-base (:query-base connection)
+                         query-instance (:query-instance connection)
+                         query-ptr query-base out-ptr (+ query-base 1024)
+                         meta-ptr (+ query-base 50000)]
+                     (copy-in! consumer (aget args 1) query-instance query-ptr query-len)
+                     (let [n (invoke query-instance "pg-query-state"
+                                     [channel query-ptr query-len out-ptr out-cap
+                                      meta-ptr meta-cap])]
+                       (when (pos? n)
+                         (copy-out! query-instance out-ptr consumer (aget args 3) n)
+                         (copy-out! query-instance meta-ptr consumer (aget args 5) 7))
+                       n))))))))
+        release-fn
+        (tender/host-fn
+         "pg_pool_release" [ValType/I32] ValType/I32
+         (fn [_ args]
+           (let [lease-id (aget args 0)
+                 [lease connection]
+                 (locking lock
+                   (let [{:keys [pool-id connection-id] :as lease}
+                         (get-in @state [:leases lease-id])]
+                     (when lease (swap! state update :leases dissoc lease-id))
+                     [lease (get-in @state [:pools pool-id :connections connection-id])]))
+                 {:keys [pool-id connection-id]} lease]
+             (if (nil? connection)
+               -1
+               (locking (:execution-lock connection)
+                 (let [channel (:channel connection)
+                       query-base (:query-base connection)
+                       query-instance (:query-instance connection)
+                       reset-result (invoke query-instance "pg-session-reset"
+                                            [channel (+ query-base 1024) 32768
+                                             (+ query-base 50000) 7])]
+                   (locking lock
+                     (if (pos? reset-result)
+                       (do (swap! state update-in [:pools pool-id :connections connection-id]
+                                  assoc :status :idle :last-used-at (long (clock-ms)))
+                           (.notifyAll lock) 0)
+                       (do (close-channel! channel)
+                           (swap! state (fn [s]
+                                          (-> s
+                                              (update-in [:pools pool-id :connections]
+                                                         dissoc connection-id)
+                                              (update :free-query-scratch conj
+                                                      {:query-instance query-instance
+                                                       :query-base query-base}))))
+                           (metric! pool-id :evictions)
+                           (.notifyAll lock) -1)))))))))
+        stats-fn
+        (tender/host-fn
+         "pg_pool_stats" [ValType/I32 ValType/I32 ValType/I32] ValType/I32
+         (fn [consumer args]
+           (locking lock
+             (let [pool-id (aget args 0) out-ptr (aget args 1) cap (aget args 2)
+                   pool (get-in @state [:pools pool-id])]
+               (if (or (nil? pool) (< cap 32))
+                 -1
+                 (let [connections (vals (:connections pool))
+                       metrics (:metrics pool)
+                       values [(if (= :open (:status pool)) 1 2)
+                               (count connections)
+                               (count (filter #(= :idle (:status %)) connections))
+                               (count (filter #(= :leased (:status %)) connections))
+                               (count (get-in @state [:waiters pool-id] []))
+                               (:acquires metrics 0) (:timeouts metrics 0)
+                               (:evictions metrics 0)]
+                       buffer (doto (ByteBuffer/allocate 32)
+                                (.order ByteOrder/BIG_ENDIAN))]
+                   (doseq [value values] (.putInt buffer (int value)))
+                   (.write (.memory consumer) (int out-ptr) (.array buffer) 0 32)
+                   32))))))
+        health-fn
+        (tender/host-fn
+         "pg_pool_health" [ValType/I32] ValType/I32
+         (fn [_ args]
+           (let [pool-id (aget args 0)
+                 checks (locking lock
+                          (when-let [pool (get-in @state [:pools pool-id])]
+                            (let [idle (->> (:connections pool)
+                                            (filter (fn [[_ c]] (= :idle (:status c))))
+                                            vec)]
+                              (doseq [[connection-id _] idle]
+                                (swap! state assoc-in
+                                       [:pools pool-id :connections connection-id :status]
+                                       :checking))
+                              idle)))]
+             (if (nil? checks)
+               -1
+               (reduce
+                (fn [healthy [connection-id connection]]
+                  (locking (:execution-lock connection)
+                    (let [query-instance (:query-instance connection)
+                          query-base (:query-base connection)
+                          sql (kbytes/utf8-bytes "select 1")
+                          _ (copy-bytes! sql query-instance query-base)
+                          result (invoke query-instance "pg-query-state"
+                                         [(:channel connection) query-base (alength sql)
+                                          (+ query-base 1024) 32768
+                                          (+ query-base 50000) 7])]
+                      (locking lock
+                        (if (pos? result)
+                          (do (swap! state update-in
+                                     [:pools pool-id :connections connection-id]
+                                     assoc :status :idle :last-used-at (long (clock-ms)))
+                              (inc healthy))
+                          (do (close-channel! (:channel connection))
+                              (swap! state (fn [s]
+                                             (-> s
+                                                 (update-in [:pools pool-id :connections]
+                                                            dissoc connection-id)
+                                                 (update :free-query-scratch conj
+                                                         (select-keys connection
+                                                                      [:query-instance :query-base])))))
+                              (metric! pool-id :evictions)
+                              healthy))))))
+                0 checks)))))
+        drain-fn
+        (tender/host-fn
+         "pg_pool_drain" [ValType/I32] ValType/I32
+         (fn [_ args]
+           (let [pool-id (aget args 0)
+                 deadline (+ (System/nanoTime) (* 1000000 (long drain-wait-ms)))]
+             (locking lock
+               (if-not (get-in @state [:pools pool-id])
+                 -1
+                 (do
+                   (swap! state assoc-in [:pools pool-id :status] :draining)
+                   (.notifyAll lock)
+                   (loop []
+                     (let [active? (some #(contains? #{:leased :checking} (:status %))
+                                         (vals (get-in @state
+                                                       [:pools pool-id :connections])))
+                           remaining-ms (quot (- deadline (System/nanoTime)) 1000000)]
+                       (if (and active? (pos? remaining-ms))
+                         (do (.wait lock (long remaining-ms)) (recur))
+                         (let [pool (get-in @state [:pools pool-id])
+                               forced (count (filter
+                                              #(contains? #{:leased :checking} (:status %))
+                                              (vals (:connections pool))))]
+                           (doseq [[_ {:keys [channel]}] (:connections pool)]
+                             (close-channel! channel))
+                           (swap! state (fn [s]
+                                          (-> s
+                                              (update :leases
+                                                      (fn [leases]
+                                                        (into {} (remove
+                                                                  (fn [[_ lease]]
+                                                                    (= pool-id (:pool-id lease)))
+                                                                  leases))))
+                                              (update :free-query-scratch into
+                                                      (mapv #(select-keys %
+                                                                          [:query-instance :query-base])
+                                                            (vals (:connections pool))))
+                                              (update :pools dissoc pool-id)
+                                              (update :waiters dissoc pool-id))))
+                           (.notifyAll lock)
+                           forced))))))))))
+        close-fn
+        (tender/host-fn
+         "pg_pool_close" [ValType/I32] ValType/I32
+         (fn [_ args]
+           (locking lock
+             (let [pool-id (aget args 0) pool (get-in @state [:pools pool-id])]
+               (if (or (nil? pool) (some #(= pool-id (:pool-id %)) (vals (:leases @state))))
+                 -1
+                 (do (doseq [[_ {:keys [channel]}] (:connections pool)]
+                       (close-channel! channel))
+                     (swap! state (fn [s]
+                                    (-> s
+                                        (update :free-query-scratch into
+                                                (mapv #(select-keys % [:query-instance :query-base])
+                                                      (vals (:connections pool))))
+                                        (update :pools dissoc pool-id)
+                                        (update :waiters dissoc pool-id))))
+                     (.notifyAll lock)
+                     0))))))
+        close! (fn []
+                 (locking lock
+                   (doseq [[_ pool] (:pools @state)
+                           [_ {:keys [channel]}] (:connections pool)]
+                     (close-channel! channel))
+                   (swap! state assoc :pools {} :leases {} :waiters {})
+                   (.notifyAll lock)))]
+    {:host-functions
+     {:pg-pool-open open-fn :pg-pool-acquire acquire-fn
+      :pg-pool-query query-fn :pg-pool-release release-fn
+      :pg-pool-stats stats-fn :pg-pool-health health-fn
+      :pg-pool-drain drain-fn :pg-pool-close close-fn}
+     :state state :close! close!}))
+
+(defn fail-closed-inject-provider
+  "T8.4 inject surface without SCRAM/query sessions or a live PostgreSQL.
+
+  Returns the same host-function keys as `pool-provider`, each ABI-matched
+  and always failing closed (-1). Use with tender `open-session`
+  `:provider-host-functions` to live-prove actor:host pg-pool-* linkage.
+  Production callers must use `pool-provider` with real scram/query sessions
+  (see docs/postgresql-qualification.edn)."
+  []
+  (let [deny (fn [_ _] -1)
+        open-fn
+        (tender/host-fn
+         "pg_pool_open"
+         [ValType/I32 ValType/I32 ValType/I32 ValType/I32 ValType/I32
+          ValType/I32 ValType/I32 ValType/I32 ValType/I32]
+         ValType/I32
+         deny)
+        acquire-fn
+        (tender/host-fn "pg_pool_acquire" [ValType/I32] ValType/I32 deny)
+        query-fn
+        (tender/host-fn
+         "pg_pool_query"
+         [ValType/I32 ValType/I32 ValType/I32 ValType/I32 ValType/I32
+          ValType/I32 ValType/I32]
+         ValType/I32
+         deny)
+        release-fn
+        (tender/host-fn "pg_pool_release" [ValType/I32] ValType/I32 deny)
+        stats-fn
+        (tender/host-fn
+         "pg_pool_stats" [ValType/I32 ValType/I32 ValType/I32] ValType/I32 deny)
+        health-fn
+        (tender/host-fn "pg_pool_health" [ValType/I32] ValType/I32 deny)
+        drain-fn
+        (tender/host-fn "pg_pool_drain" [ValType/I32] ValType/I32 deny)
+        close-fn
+        (tender/host-fn "pg_pool_close" [ValType/I32] ValType/I32 deny)]
+    {:host-functions
+     {:pg-pool-open open-fn :pg-pool-acquire acquire-fn
+      :pg-pool-query query-fn :pg-pool-release release-fn
+      :pg-pool-stats stats-fn :pg-pool-health health-fn
+      :pg-pool-drain drain-fn :pg-pool-close close-fn}
+     :close! (fn [])}))

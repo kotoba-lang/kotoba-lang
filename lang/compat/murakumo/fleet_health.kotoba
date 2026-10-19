@@ -1,0 +1,208 @@
+(ns murakumo.fleet-health
+  "`murakumo fleet health` -- one screen of fleet state, in seconds, without ssh.
+
+  Every fleet node that runs an itonami-agent peer (kotoba-lang/itonami-agent,
+  :7420) reports its own health on GET /itonami/v1/peer, signed with its
+  did:key: memory-pressure level, free %, swap, TCP TIME_WAIT count and the
+  ephemeral port floor, whether each of its own inference rails answers, the
+  models it lends, its load and the agent revision. This command reads that
+  from every node in parallel, verifies the signature, adds what tailscale
+  knows (online, last seen) and whether the murakumo resident answers on
+  :8094, and prints one row per node plus the problems found.
+
+  Why (2026-10-07): checking dan / levi / zebulun / judah meant a round of ssh
+  per node, and a node in trouble (memory pressure, port exhaustion) is exactly
+  the one whose ssh times out. The node now says how it is over plain HTTP,
+  and the operator reads all of them at once.
+
+  Read-only: nothing is written anywhere. Expected peers are the URLs in
+  ~/.itonami/peers.edn (the itonami mesh this host trusts); a node listed
+  there without an answering peer is a problem, any other node is shown for
+  context only. Exit 0 no problem, 1 problems, 2 tailscale unreadable."
+  (:require [kotoba.lang.text :as str]
+            ["node:child_process" :as cp]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+;; ---------------------------------------------------------------- inputs
+
+(defn- sh-out [argv timeout-ms]
+  (let [r (cp/spawnSync (first argv) (clj->js (rest argv)) #js {:encoding "utf8" :timeout timeout-ms})]
+    (when (zero? (.-status r)) (.-stdout r))))
+
+(defn tailnet
+  "tailscale status --json -> [{:name :ip :online :os :last-seen :self?}]"
+  []
+  (when-let [out (sh-out ["tailscale" "status" "--json"] 20000)]
+    (let [d (js->clj (js/JSON.parse out))
+          self (get d "Self")]
+      (vec (for [p (cons self (vals (get d "Peer")))
+                 :let [ip (first (get p "TailscaleIPs"))]
+                 :when ip]
+             {:name (get p "HostName") :ip ip :os (get p "OS")
+              :self? (identical? p self)
+              :online (or (identical? p self) (boolean (get p "Online")))
+              :last-seen (get p "LastSeen")})))))
+
+(defn expected-peers
+  "URL -> did from ~/.itonami/peers.edn (read as text: only the :url/:did pairs)."
+  []
+  (let [f (.join path (or (aget js/process.env "ITONAMI_DIR") (.join path (.homedir os) ".itonami")) "peers.edn")]
+    (if (.existsSync fs f)
+      (into {} (for [[_ url did] (re-seq #"\{:url \x22([^\x22]+)\x22, :did \x22([^\x22]+)\x22\}" (str (.readFileSync fs f "utf8")))]
+                 [url did]))
+      {})))
+
+;; ---------------------------------------------------------------- did:key signature
+
+(def ^:private b58 "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+(defn- unbase58 [s]
+  (let [big58 (js/BigInt 58)
+        n (reduce (fn [acc c] (+ (* acc big58) (js/BigInt (.indexOf b58 c)))) (js/BigInt 0) s)
+        hex (.toString n 16)
+        hex (if (odd? (count hex)) (str "0" hex) hex)]
+    (js/Buffer.concat #js [(js/Buffer.alloc (count (take-while #(= % \1) s)))
+                           (if (= n (js/BigInt 0)) (js/Buffer.alloc 0) (js/Buffer.from hex "hex"))])))
+
+(defn verify-envelope
+  "{payload did sig} signed by an ed25519 did:key -> payload map, or nil."
+  [env]
+  (try
+    (let [did (get env "did")
+          [_ z] (re-matches #"^did:key:z(.+)$" (str did))
+          b (unbase58 z)
+          k (.createPublicKey crypto #js {:key (js/Buffer.concat #js [(js/Buffer.from "302a300506032b6570032100" "hex") (.subarray b 2)])
+                                          :format "der" :type "spki"})]
+      (when (and (= 0xed (aget b 0)) (= 0x01 (aget b 1))
+                 (.verify crypto nil (js/Buffer.from (str (get env "payload"))) k (js/Buffer.from (str (get env "sig")) "base64")))
+        (assoc (js->clj (js/JSON.parse (get env "payload"))) "did" did)))
+    (catch :default _ nil)))
+
+;; ---------------------------------------------------------------- probes
+
+(defn- fetch-json [url timeout-ms]
+  (let [ctrl (js/AbortController.)
+        t (js/setTimeout #(.abort ctrl) timeout-ms)
+        t0 (js/Date.now)]
+    (-> (js/fetch url #js {:signal (.-signal ctrl)})
+        (.then (fn [r] (.then (.text r) (fn [txt] {:status (.-status r) :ms (- (js/Date.now) t0)
+                                                   :body (try (js->clj (js/JSON.parse txt)) (catch :default _ nil))}))))
+        (.catch (fn [e] {:status 0 :ms (- (js/Date.now) t0) :error (or (.-name e) (.-message e))}))
+        (.finally #(js/clearTimeout t)))))
+
+(defn read-node
+  "Probe one node: its itonami peer and the murakumo resident compat port."
+  [{:keys [ip online] :as node} peer-url]
+  (if-not online
+    (js/Promise.resolve (assoc node :peer {:status :offline} :resident {:status :offline}))
+    (-> (js/Promise.all
+         #js [(fetch-json (str peer-url "/itonami/v1/peer") 30000)
+              (fetch-json (str "http://" ip ":8094/health") 5000)])
+        (.then (fn [[p r]]
+                 (let [payload (when (= 200 (:status p)) (verify-envelope (:body p)))]
+                   (assoc node
+                          :peer (cond payload {:status :ok :ms (:ms p) :info payload}
+                                      (= 200 (:status p)) {:status :bad-signature}
+                                      :else {:status :down :error (or (:error p) (str "http " (:status p)))})
+                          :resident (if (= 200 (:status r)) {:status :ok :ms (:ms r)} {:status :down}))))))))
+
+;; ---------------------------------------------------------------- assessment
+
+(def pressure-name {1 "normal" 2 "warn" 4 "CRIT"})
+
+(defn problems
+  "Human-readable problems of one node row. expected? = listed in peers.edn."
+  [{:keys [online peer last-seen]} expected? majority-rev]
+  (let [h (get-in peer [:info "health"])]
+    (vec (remove nil?
+                 [(when (and expected? (not online)) (str "offline since " last-seen))
+                  (when (and expected? online (not= :ok (:status peer))) (str "itonami peer " (name (:status peer)) (when-let [e (:error peer)] (str " (" e ")"))))
+                  (when (some-> (get h "pressure_level") (>= 4)) "memory pressure CRITICAL")
+                  (when (= 2 (get h "pressure_level")) "memory pressure warn")
+                  (when (some-> (get h "mem_free_pct") (< 10)) (str "free memory " (get h "mem_free_pct") "%"))
+                  (when (some-> (get h "tcp_time_wait") (> 20000)) (str (get h "tcp_time_wait") " TIME_WAIT sockets (port exhaustion risk)"))
+                  (when-let [down (seq (filter #(and (get % "agent") (not (get % "ok"))) (get h "rails")))]
+                    (str "rail down: " (str/join "," (map #(get % "name") down))))
+                  (when (and (= :ok (:status peer)) (empty? (get-in peer [:info "agent_models"])))
+                    "lends no agent model")
+                  (when (and majority-rev (get h "revision") (not= majority-rev (get h "revision")))
+                    (str "agent revision " (get h "revision") " (fleet " majority-rev ")"))]))))
+
+;; ---------------------------------------------------------------- rendering
+
+(defn- pad [s n] (let [s (str s)] (if (>= (count s) n) s (str s (apply str (repeat (- n (count s)) " "))))))
+
+(defn render-row [{:keys [name online peer resident self?]}]
+  (let [i (:info peer) h (get i "health")]
+    (str (pad (str name (when self? "*")) 12)
+         (pad (if online "up" "OFFLINE") 8)
+         (pad (case (:status peer) :ok (str "ok " (:ms peer) "ms") :offline "-" (clojure.core/name (:status peer))) 11)
+         (pad (or (get h "revision") "-") 9)
+         (pad (if-let [l (get h "loadavg")] (first l) "-") 7)
+         (pad (if h (str (get pressure-name (get h "pressure_level") (get h "pressure_level"))
+                         " " (get h "mem_free_pct") "% swap " (some-> (get h "swap_used_mb") (/ 1024) (.toFixed 1)) "G")
+                  "-") 26)
+         (pad (if h (get h "tcp_time_wait") "-") 8)
+         (pad (if h (str/join "," (for [r (get h "rails") :when (get r "agent")] (str (if (get r "ok") "+" "!") (get r "name")))) "-") 22)
+         (pad (if h (str (count (get i "agent_models")) " agent") "-") 9)
+         (case (:status resident) :ok "ok" :offline "-" "down"))))
+
+(def header
+  (str (pad "NODE" 12) (pad "NET" 8) (pad "PEER" 11) (pad "REV" 9) (pad "LOAD" 7)
+       (pad "MEMORY" 26) (pad "TWAIT" 8) (pad "RAILS (agent)" 22) (pad "MODELS" 9) ":8094"))
+
+(defn- opt [args k] (second (drop-while #(not= % k) args)))
+
+(defn usage []
+  (println "murakumo fleet health [--node N] [--all] [--port 7420] [--json]
+
+  Every macOS tailnet node: online / last seen (tailscale), the itonami-agent
+  peer's signed self-report (memory pressure, free %, swap, TIME_WAIT, rails,
+  lent models, revision) and the murakumo resident on :8094. Then the
+  problems found. Nodes in ~/.itonami/peers.edn are expected to run a peer.
+
+  --node N   one node (name, IP, or name prefix)
+  --all      every tailnet node, not only macOS
+  --port P   itonami peer port for nodes not in peers.edn (default 7420)
+  --json     machine-readable
+
+Read-only, no ssh. Exit 0 no problem, 1 problems, 2 tailscale unreadable."))
+
+(defn run
+  "Promise of the exit code."
+  [args]
+  (if (some #{"--help" "help"} args)
+    (do (usage) (js/Promise.resolve 0))
+    (let [nodes (tailnet)
+          expected (expected-peers)
+          port (or (opt args "--port") "7420")
+          q (opt args "--node")]
+      (if-not nodes
+        (do (println "tailscale status failed") (js/Promise.resolve 2))
+        (let [url-of (fn [{:keys [ip]}] (or (first (filter #(str/includes? % (str "//" ip ":")) (keys expected)))
+                                            (str "http://" ip ":" port)))
+              picked (cond
+                       q (filter #(or (= (:name %) q) (= (:ip %) q) (str/starts-with? (str (:name %)) q)) nodes)
+                       (some #{"--all"} args) nodes
+                       :else (filter #(= "macOS" (:os %)) nodes))]
+          (-> (js/Promise.all (clj->js (map #(read-node % (url-of %)) picked)))
+              (.then
+               (fn [rs]
+                 (let [rows (sort-by (juxt (comp not :self?) :name) (array-seq rs))
+                       revs (keep #(get-in % [:peer :info "health" "revision"]) rows)
+                       majority (when (seq revs) (key (apply max-key val (frequencies revs))))
+                       expected-ips (set (keep #(second (re-find #"//([^:/]+):" %)) (keys expected)))
+                       rows (map #(assoc % :problems (problems % (or (:self? %) (contains? expected-ips (:ip %))) majority)) rows)
+                       bad (filter (comp seq :problems) rows)]
+                   (if (some #{"--json"} args)
+                     (println (js/JSON.stringify (clj->js (map #(dissoc % :resident) rows)) nil 1))
+                     (do (println header)
+                         (doseq [r rows] (println (render-row r)))
+                         (println)
+                         (if (seq bad)
+                           (doseq [r bad p (:problems r)] (println (str "  ! " (:name r) ": " p)))
+                           (println "  no problems"))))
+                   (if (seq bad) 1 0))))))))))

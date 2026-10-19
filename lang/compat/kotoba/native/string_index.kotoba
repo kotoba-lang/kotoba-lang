@@ -1,0 +1,149 @@
+(ns kotoba.native.string-index
+  "Native lowering for the bounded canonical string -> i64 index.
+
+  The public KIR value is canonical and sorted. Native code keeps an opaque
+  private representation in the existing context-owned vector arena:
+
+      [key-handle value key-handle value ...]
+
+  Order is deliberately unobservable: the language exposes only new, count,
+  contains, get and assoc. No string-index handle may cross a kexe export
+  boundary. This therefore needs neither a new host callback nor a context ABI
+  bump, and keeps lookup/update decisions in emitted Kotoba machine code.
+
+  The reference limits are re-derived here: 128 entries and 65536 aggregate
+  UTF-8 key bytes. A rejected insertion traps through an intentionally
+  out-of-range vector-at, using an existing native trap path."
+  {:kotoba/export [augment-functions find-name key-bytes-name lower]})
+
+(def find-name 'kotoba$string-index-find)
+(def key-bytes-name 'kotoba$string-index-key-bytes)
+
+(def ^:private index-symbol 'kotoba$string-index-value)
+(def ^:private key-symbol 'kotoba$string-index-key)
+(def ^:private item-symbol 'kotoba$string-index-item)
+(def ^:private position-symbol 'kotoba$string-index-position)
+
+(def ^:private entry-limit 128)
+(def ^:private key-byte-limit 65536)
+
+(def ^:private find-function
+  {:name find-name
+   :params '[index key position]
+   :param-types [:string-index :string :i64]
+   :result :i64
+   :body
+   (list 'if
+         (list '>= 'position (list 'vector-count 'index))
+         -1
+         (list 'if
+               (list 'string=? (list 'vector-at 'index 'position) 'key)
+               'position
+               (list find-name 'index 'key (list '+ 'position 2))))})
+
+(def ^:private key-bytes-function
+  {:name key-bytes-name
+   :params '[index position total]
+   :param-types [:string-index :i64 :i64]
+   :result :i64
+   :body
+   (list 'if
+         (list '>= 'position (list 'vector-count 'index))
+         'total
+         (list key-bytes-name
+               'index
+               (list '+ 'position 2)
+               (list '+ 'total
+                     (list 'string-byte-length
+                           (list 'vector-at 'index 'position)))))})
+
+(defn- uses? [form]
+  (cond
+    (seq? form) (or (contains? '#{string-index-new string-index-count
+                                  string-index-contains string-index-get
+                                  string-index-assoc}
+                                (first form))
+                    (boolean (some uses? (rest form))))
+    (vector? form) (boolean (some uses? form))
+    :else false))
+
+(defn lower
+  "Rewrite one string-index operation into existing vector/string/pair ops."
+  [op args]
+  (case op
+    string-index-new
+    (list 'vector-new)
+
+    string-index-count
+    (list 'quot (list 'vector-count (first args)) 2)
+
+    string-index-contains
+    (let [[index key] args]
+      (list 'let [index-symbol index key-symbol key]
+            (list 'if
+                  (list '< (list find-name index-symbol key-symbol 0) 0)
+                  0 1)))
+
+    string-index-get
+    (let [[index key] args]
+      (list 'let [index-symbol index key-symbol key
+                  position-symbol (list find-name index-symbol key-symbol 0)]
+            (list 'if
+                  (list '< position-symbol 0)
+                  (list 'option-none-of [:option :i64])
+                  (list 'option-some-of [:option :i64]
+                        (list 'vector-at index-symbol
+                              (list '+ position-symbol 1))))))
+
+    string-index-assoc
+    (let [[index key item] args
+          words-limit (* 2 entry-limit)]
+      (list 'let [index-symbol index key-symbol key item-symbol item
+                  position-symbol (list find-name index-symbol key-symbol 0)]
+            (list 'if
+                  (list '>= position-symbol 0)
+                  (list 'vector-assoc index-symbol
+                        (list '+ position-symbol 1)
+                        item-symbol)
+                  (list 'if
+                        (list '>= (list 'vector-count index-symbol)
+                              words-limit)
+                        ;; Guaranteed out of range, hence a native trap.
+                        (list 'vector-at index-symbol
+                              (list 'vector-count index-symbol))
+                        (list 'if
+                              (list '>
+                                    (list '+
+                                          (list key-bytes-name index-symbol 0 0)
+                                          (list 'string-byte-length key-symbol))
+                                    key-byte-limit)
+                              (list 'vector-at index-symbol
+                                    (list 'vector-count index-symbol))
+                              (list 'vector-conj
+                                    (list 'vector-conj index-symbol key-symbol)
+                                    item-symbol))))))
+
+    (throw (ex-info "unknown native string-index operation"
+                    {:phase :native :operation op}))))
+
+(defn augment-functions
+  "Append the private helpers exactly when a declared body uses string-index.
+
+  Helpers are never exported because each backend captures the declared export
+  set before calling this function. The operation is idempotent and rejects a
+  source-level collision rather than silently redirecting lowered calls."
+  [functions]
+  (if-not (some #(uses? (:body %)) functions)
+    functions
+    (let [declared (into {} (map (juxt :name identity)) functions)
+          wanted [find-function key-bytes-function]
+          clashes (filter (fn [helper]
+                            (when-let [existing (get declared (:name helper))]
+                              (not= existing helper)))
+                          wanted)]
+      (when (seq clashes)
+        (throw (ex-info
+                "a program function collides with a native string-index helper"
+                {:phase :native :functions (mapv :name clashes)})))
+      (vec (concat functions
+                   (remove #(contains? declared (:name %)) wanted))))))

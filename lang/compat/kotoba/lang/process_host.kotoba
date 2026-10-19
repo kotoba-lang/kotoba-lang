@@ -1,0 +1,193 @@
+(ns kotoba.lang.process-host
+  "Real OS spawn for kotoba.lang.process. Separate namespace so requiring
+  `kotoba.lang.process` pulls in no ProcessBuilder / child_process.
+
+  Twin of kotoba.lang.fs-host. No ambient PATH: `:binaries` map required.
+  `#?(:clj ProcessBuilder, :cljs child_process.spawnSync)`."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.lang.process :as process])
+  )
+
+(defn resolve-binary
+  "Look up basename in host `:binaries`. Pure map lookup — never PATH."
+  [binaries basename]
+  (when (and (map? binaries) (string? basename))
+    (let [p (get binaries basename)]
+      (when (and (string? p) (not (str/blank? p)))
+        p))))
+
+(defn absolute-path?
+  [p]
+  (and (string? p)
+       (not (str/blank? p))
+       ))
+
+(defn- truncate-utf8 [s max-bytes]
+  (let [s (str s)]
+    ))
+
+(defn- validate-binaries! [binaries]
+  (when-not (and (map? binaries) (seq binaries)
+                 (every? string? (keys binaries))
+                 (every? string? (vals binaries)))
+    (throw (ex-info "process-host requires non-empty :binaries map"
+                    {:type :process/spawn :phase :process-host})))
+  (doseq [[_ p] binaries]
+    (when-not (absolute-path? p)
+      (throw (ex-info "process-host binary paths must be absolute"
+                      {:type :process/spawn :phase :process-host :path p})))))
+
+
+
+;; ---------------------------------------------------------------------------
+;; `sh` — a policy-gated, portable drop-in for clojure.java.shell/sh.
+;;
+;; Unlike `os-spawn` above (which requires a host-supplied absolute-path
+;; :binaries map and never touches PATH), `sh` mirrors clojure.java.shell/sh's
+;; own ergonomics: argv[0] is a bare command name resolved by the OS's normal
+;; executable search (ProcessBuilder / child_process do this themselves, the
+;; same mechanism clojure.java.shell/sh itself relies on) — NOT a second PATH
+;; scan implemented by this library. `sh` does NOT require `clojure.java.shell`
+;; itself (that would defeat the point of this migration); the JVM branch
+;; talks to `java.lang.ProcessBuilder` directly, and the ClojureScript/nbb
+;; branch talks to Node's `child_process.spawnSync` directly.
+;;
+;; Every call is validated by `process/validate-spawn` BEFORE the OS spawn
+;; primitive is ever invoked. When validate-spawn rejects the argv, `sh`
+;; returns immediately with a sentinel `:exit -1` result — ProcessBuilder /
+;; spawnSync is never called, so a rejected command never actually runs.
+
+
+
+
+
+(defn sh
+  "Policy-gated, SYNCHRONOUS drop-in for `clojure.java.shell/sh`.
+
+  `(sh cmd & args)` — args may end in an options MAP. That is NOT
+  clojure.java.shell/sh's grammar, which takes keyword/value options after
+  the leading strings; `java-shell-sh` below parses that grammar and is what
+  kotoba.process/sh is. Blocks until the child process exits and returns
+  `{:exit <int> :out <string> :err <string>}` — the same keys and the same
+  blocking contract real callers depend on. This is never async: there is no
+  promise/future/callback under this name, because that would silently break
+  every caller that expects `sh` to have returned only once the process is
+  done.
+
+  Every argv is checked by `kotoba.lang.process/validate-spawn` BEFORE
+  anything is spawned. If validate-spawn rejects the argv (bad shape, a path
+  separator in argv[0], or — when an `:allowed` set is supplied — argv[0] not
+  in it), `sh` returns immediately with `{:exit -1 :out \"\" :err \"sh
+  rejected: <reason>\"}` and NEVER calls the OS spawn primitive
+  (ProcessBuilder on the JVM, `child_process.spawnSync` on ClojureScript/nbb)
+  for that argv. This is a real security boundary: a rejected command is not
+  spawned-then-discarded, it is never launched.
+
+  Supported opts:
+    :in       string piped to the child's stdin, which is then closed so
+              stdin-reading commands (e.g. `cat`) see EOF and exit
+    :dir      working directory, as a string (portable across JVM/nbb)
+    :allowed  optional set enforced by validate-spawn's basename allowlist;
+              omit to skip it (validate-spawn's structural checks — argv
+              shape, no path separators in argv[0] — still apply)
+    :max-stdout-bytes / :timeout-ms
+              override this library's default bounds (`process/max-stdout-bytes`
+              65536 / `process/max-timeout-ms` 600000ms); values above those
+              constants are themselves rejected by validate-spawn
+
+  NOT implemented — documented, not silently approximated:
+    :out      real clojure.java.shell/sh's :out selects the stdout encoding
+              (or :bytes). This always returns a UTF-8 string.
+    :env      real clojure.java.shell/sh's :env replaces the child's
+              environment. Not implemented: the child inherits this
+              process's environment unchanged. Per-call env override is a
+              real gap, not silently ignored.
+    non-string argv coercion — real clojure.java.shell/sh stringifies
+              non-string args (e.g. numbers, keywords) via `stringify-arg`.
+              Here every element of argv is passed through `str`, which is
+              close but not byte-identical for every Clojure value (e.g.
+              `:foo` becomes \"foo\" via clojure.java.shell but \":foo\" via
+              plain `str` on the JVM — cljs printing differs again). Callers
+              that need exact clojure.java.shell stringify semantics must
+              stringify their own args before calling `sh`.
+    unbounded execution — real clojure.java.shell/sh blocks with no timeout.
+              `sh` always applies `:timeout-ms` (default
+              `process/max-timeout-ms`, 600000ms) and destroys the child
+              process if it is exceeded, consistent with the rest of this
+              library's fail-safe bounds."
+  [& args]
+  (let [opts? (map? (last args))
+        opts (if opts? (last args) {})
+        cmd+args (if opts? (butlast args) args)
+        argv (vec (map str cmd+args))
+        allowed (:allowed opts)
+        max-out (or (:max-stdout-bytes opts) process/max-stdout-bytes)
+        t-ms (or (:timeout-ms opts) process/max-timeout-ms)
+        err (process/validate-spawn argv max-out t-ms allowed)]
+    (if err
+      {:exit -1 :out "" :err (str "sh rejected: " (name err))}
+      (sh-transport! argv (assoc opts :max-stdout-bytes max-out :timeout-ms t-ms)))))
+
+(defn java-shell-sh
+  "`sh` with clojure.java.shell/sh's ARGUMENT GRAMMAR, over `sh` above.
+
+  clojure.java.shell/sh does not take a trailing options map (despite what
+  `sh`'s docstring above used to suggest): it splits its args with
+  `(split-with string? args)` -- the leading strings are the command, and
+  everything from the first non-string on is keyword/value options,
+  `(sh \"git\" \"status\" :dir d :in s)`. A trailing map there is an odd
+  option count and throws. This function parses exactly that way, so a call
+  site written for clojure.java.shell means the same argv here; `sh` above
+  would have run `git status :dir <d>` -- the options as arguments.
+
+  Options:
+    :in :dir     honoured (passed to `sh`); :in must be a string
+    :allowed :max-stdout-bytes :timeout-ms
+                 passed to `sh` (kotoba policy; clojure.java.shell has none)
+    :env :in-enc :out-enc
+                 THROW -- `sh` does not implement them, and ignoring :env
+                 silently would run the child in the wrong environment
+    anything else ignored, as clojure.java.shell ignores it
+  An odd option count throws, as clojure.java.shell does. The bounds and the
+  {:exit -1 ..} refusals are `sh`'s (see its docstring)."
+  [& args]
+  (let [[cmd opts] (split-with string? args)]
+    (when (odd? (count opts))
+      (throw (ex-info "No value supplied for key (clojure.java.shell options are keyword/value pairs)"
+                      {:type :process/bad-options :options (vec opts)})))
+    (let [o (apply hash-map opts)]
+      (when-let [bad (seq (filter #(contains? o %) [:env :in-enc :out-enc]))]
+        (throw (ex-info (str "not implemented by kotoba.process/sh: " (pr-str (vec bad)))
+                        {:type :process/unsupported-option :options (vec bad)})))
+      (when (and (contains? o :in) (not (string? (:in o))))
+        (throw (ex-info "kotoba.process/sh :in must be a string" {:type :process/unsupported-option})))
+      (apply sh (concat cmd [(select-keys o [:in :dir :allowed :max-stdout-bytes :timeout-ms])])))))
+
+(defn os-spawn
+  "Build an IProcess backed by the OS.
+
+  opts:
+    :binaries   required {basename absolute-path}
+    :allowed    optional set of basenames (defaults to keys of :binaries)
+    :spawn-sync optional cljs test double (bin args-js opts-js) -> result-js"
+  [{:keys [binaries allowed spawn-sync] :as opts}]
+  (validate-binaries! binaries)
+  (let [allowed (or allowed (set (keys binaries)))]
+    (reify process/IProcess
+      (spawn! [_ {:keys [argv max-stdout-bytes timeout-ms]
+                  :or {max-stdout-bytes 65536
+                       timeout-ms 5000}}]
+        (if-let [err (process/validate-spawn argv max-stdout-bytes timeout-ms allowed)]
+          {:tag :error :code err :message (name err)}
+          (let [cmd (first argv)
+                bin (resolve-binary binaries cmd)
+                max-out (long max-stdout-bytes)
+                t-ms (long timeout-ms)]
+            (cond
+              (nil? bin)
+              {:tag :error
+               :code :process/no-binary
+               :message (str "no host binary for " cmd)}
+
+              :else
+              )))))))

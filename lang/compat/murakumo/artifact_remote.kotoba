@@ -1,0 +1,134 @@
+(ns murakumo.artifact-remote
+  "Remote, chunked CAS receiver. Only objects belonging to the capability's
+   signed release bundle are accepted."
+  (:require [kotoba.bytes :as kbytes] [kotoba.io :as kio]
+            [kotoba.lang.text :as str]
+            [murakumo.artifact-protocol :as protocol]
+            [murakumo.cd.bundle :as bundle]
+            [murakumo.cd.capability :as capability]))
+
+(def default-max-object-bytes (* 512 1024 1024))
+(def default-max-chunk-bytes (* 48 1024))
+
+(defn- denied [reason] {:ok? false :reason reason})
+
+(defn- expected-scope [document action]
+  (if (= action :rollback)
+    {:bundle-cid (:cd.capability/previous-artifact-cid document)
+     :revision (:cd.capability/previous-revision document)}
+    {:bundle-cid (:cd.capability/artifact-cid document)
+     :revision (:cd.capability/revision document)}))
+
+(defn- authorized? [{:keys [rid issuers clock-fn]} request]
+  (let [issued (:murakumo.artifact/issued-capability request)
+        document (:capability issued)
+        action (:murakumo.artifact/release-action request)
+        expected (expected-scope document action)]
+    (and (= (:bundle-cid expected) (:murakumo.artifact/bundle-cid request))
+         (= (:revision expected) (:murakumo.artifact/revision request))
+         (capability/verify
+          {:rid rid :issuers issuers :now (clock-fn)
+           :environment (:murakumo.artifact/environment request)
+           :artifact-cid (:cd.capability/artifact-cid document)
+           :previous-artifact-cid (:cd.capability/previous-artifact-cid document)
+           :verdict-cid (:murakumo.artifact/verdict-cid request)
+           :revision (:cd.capability/revision document)
+           :previous-revision (:cd.capability/previous-revision document)}
+          issued))))
+
+(defn- object-allowed? [get-bytes request]
+  (let [bundle-cid (:murakumo.artifact/bundle-cid request)
+        object-cid (:murakumo.artifact/object-cid request)]
+    (or (= bundle-cid object-cid)
+        (when-let [bundle-bytes (get-bytes bundle-cid)]
+          (let [document (bundle/decode bundle-cid bundle-bytes)]
+            (contains? (set (map :cid (:cd.bundle/components document))) object-cid))))))
+
+(defn handler
+  [{:keys [node-id temp-dir put! get-bytes max-object-bytes max-chunk-bytes
+           transfer-ttl-seconds]
+    :or {max-object-bytes default-max-object-bytes
+         max-chunk-bytes default-max-chunk-bytes
+         transfer-ttl-seconds 600}
+    :as opts}]
+  (let [transfers (atom {})
+        temp-root (kio/file temp-dir)
+        _ (kio/mkdirs temp-root)
+        cleanup! (fn [id]
+                   (when-let [transfer (get @transfers id)]
+                     (swap! transfers dissoc id)
+                     (kio/delete (:file transfer))))]
+    (fn [request]
+      (let [operation (:murakumo.artifact/operation request)
+            respond #(protocol/response operation node-id %)
+            id (:murakumo.artifact/transfer-id request)]
+        (try
+          (doseq [[transfer-id {:keys [created-at]}] @transfers
+                  :when (>= (- (long ((:clock-fn opts))) (long created-at))
+                            transfer-ttl-seconds)]
+            (cleanup! transfer-id))
+          (cond
+            (not (protocol/valid-request? request)) (respond (denied :invalid-request))
+            (not= node-id (:murakumo.artifact/node request)) (respond (denied :wrong-node))
+            (not (re-matches #"[A-Za-z0-9_-]{16,128}" id)) (respond (denied :invalid-transfer-id))
+            (not (authorized? opts request)) (respond (denied :unauthorized))
+            (not (object-allowed? get-bytes request)) (respond (denied :object-out-of-scope))
+            :else
+            (case operation
+              :begin
+              (let [size (:murakumo.artifact/size request)]
+                (cond
+                  (get-bytes (:murakumo.artifact/object-cid request))
+                  (respond {:ok? true :status :present})
+                  (not (and (integer? size) (<= 0 size max-object-bytes)))
+                  (respond (denied :invalid-object-size))
+                  (contains? @transfers id) (respond (denied :transfer-exists))
+                  :else
+                  (let [file (kio/temp-file temp-root "artifact-" ".part")]
+                    (locking transfers
+                      (if (contains? @transfers id)
+                        (do (kio/delete file) (respond (denied :transfer-exists)))
+                        (do
+                          (swap! transfers assoc id
+                                 {:file file :size size :received 0 :next-seq 0
+                                  :created-at ((:clock-fn opts))
+                                  :object-cid (:murakumo.artifact/object-cid request)})
+                          (respond {:ok? true :status :ready})))))))
+
+              :chunk
+              (if-let [{:keys [file size received next-seq object-cid]} (get @transfers id)]
+                (let [sequence (:murakumo.artifact/sequence request)
+                      encoded (:murakumo.artifact/data request)
+                      bytes (when (and (string? encoded)
+                                       (<= (count encoded)
+                                           (+ 4 (* 4 (long (Math/ceil (/ max-chunk-bytes 3.0)))))))
+                              (kbytes/base64-decode-bytes ^String encoded))]
+                  (if-not (and (= object-cid (:murakumo.artifact/object-cid request))
+                               (= next-seq sequence) bytes
+                               (<= (alength bytes) max-chunk-bytes)
+                               (<= (+ received (alength bytes)) size))
+                    (do (cleanup! id) (respond (denied :invalid-chunk)))
+                    (do
+                      (kio/write-bytes file bytes #{:append :create :write})
+                      (swap! transfers update id
+                             #(-> % (update :received + (alength bytes))
+                                  (update :next-seq inc)))
+                      (respond {:ok? true :status :continued}))))
+                (respond (denied :unknown-transfer)))
+
+              :commit
+              (if-let [{:keys [file size received object-cid]} (get @transfers id)]
+                (if-not (and (= object-cid (:murakumo.artifact/object-cid request))
+                             (= size received))
+                  (do (cleanup! id) (respond (denied :incomplete-transfer)))
+                  (let [bytes (kio/read-all-bytes file)]
+                    (put! object-cid bytes)
+                    (cleanup! id)
+                    (respond {:ok? true :status :stored :cid object-cid})))
+                (respond (denied :unknown-transfer)))
+
+              :abort (do (cleanup! id) (respond {:ok? true :status :aborted}))))
+          (catch Throwable t
+            (cleanup! id)
+            (respond {:ok? false :reason :replication-failed
+                      :message (ex-message t)})))))))

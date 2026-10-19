@@ -1,0 +1,168 @@
+(ns murakumo.factory
+  "The factory provisioning station — what turns `:tofu` into `:attested`.
+
+  Without one, every box ships trusted-on-first-use: the fleet has no way to
+  tell a device it manufactured from a device someone built to look like one.
+  `aiueos.enroll` reports that honestly as `:tofu` rather than hiding it, and
+  this namespace is what makes the other grade reachable.
+
+  ## What the station does, and what it deliberately does not
+
+  For each unit it issues a **birth certificate**: a document binding the
+  hardware serial, the model and a per-device *factory* public key, signed by
+  the factory root. It also draws the claim token that goes on the label.
+
+  It does **not** generate the device's operational key. That is generated on
+  the device at first boot and never leaves it (`aiueos.provider.device`). The
+  factory key exists only to vouch for provenance; if it were also the
+  operational key, the factory would hold every device's private half forever,
+  which is the property the whole design exists to avoid.
+
+  ## Usage
+
+      kotoba run kotoba/factory.kotoba
+      ;; leftover Java library (not a start path): murakumo.factory/-main
+      ;; still issues keys when invoked as a namespace; do not add a
+      ;; :factory alias. Guest owns admission only — keygen is HOLD.
+
+  The root private key is read from a file the operator supplies. This
+  namespace never generates a root key and never writes one: root custody is an
+  operator decision, and a tool that silently created a root would make it
+  ambiguous which root a fleet trusts."
+  (:require [kotoba.bytes :as kbytes] [aiueos.key-lifecycle :as kl]
+            [aiueos.provider.device :as device]
+            [murakumo.enroll :as enroll]
+            [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.lang.text :as str])
+  (:import [java.security KeyFactory SecureRandom]
+           [java.security.spec PKCS8EncodedKeySpec]))
+
+(def certificate-version 1)
+(def signature-key :murakumo.factory/signature)
+
+(defn- rng ^SecureRandom [] (SecureRandom/getInstanceStrong))
+
+(defn draw-token
+  "A claim token for the label. 160 bits from the strong RNG, hex.
+
+  It is not a secret — the label is printed and photographable — but it must be
+  unguessable, because guessing it against an unclaimed device in its claim
+  window is the one attack the state machine cannot refuse on its own."
+  ([] (draw-token (rng)))
+  ([^SecureRandom r]
+   (let [b (byte-array 20)]
+     (.nextBytes r b)
+     (str "T-" (str/upper (str/join (map #(format "%02x" (bit-and % 0xff)) b)))))))
+
+(defn birth-certificate
+  "The unsigned document. `:factory-public-key` is the per-device factory key's
+  X.509 base64 form; the operational key is absent on purpose — it does not
+  exist until the device first boots."
+  [{:keys [serial model factory-public-key issued-ms]}]
+  {:murakumo.factory/version certificate-version
+   :murakumo.factory/serial serial
+   :murakumo.factory/model model
+   :murakumo.factory/factory-public-key factory-public-key
+   :murakumo.factory/issued-ms issued-ms})
+
+(defn sign-certificate
+  "Sign a birth certificate with the factory root key."
+  [cert root-private-key]
+  (kl/sign-document cert signature-key root-private-key))
+
+(defn certificate-valid?
+  "Does `cert` verify under `root-public-key`? Fail-closed."
+  [cert root-public-key]
+  (and (= certificate-version (:murakumo.factory/version cert))
+       (some? (:murakumo.factory/serial cert))
+       (kl/document-signature-valid? cert signature-key root-public-key)))
+
+(defn provision
+  "Everything one unit needs, as data.
+
+  Returns `{:serial :model :token :certificate :factory-public-key
+  :factory-private-key-b64}`. The factory private key is returned rather than
+  written, so the caller decides custody; `issue!` below writes only what is
+  safe to keep."
+  [{:keys [serial model issued-ms root-private-key] :as unit}]
+  (let [kp (kl/generate-key-pair)
+        pub (kl/public-key-base64 kp)
+        cert (sign-certificate
+              (birth-certificate (assoc unit :factory-public-key pub))
+              root-private-key)]
+    {:serial serial
+     :model model
+     :token (draw-token)
+     :factory-public-key pub
+     :factory-private-key-b64 (kbytes/base64-encode
+                                               (.getEncoded (.getPrivate kp)))
+     :certificate cert
+     :issued-ms issued-ms}))
+
+(defn unit-record
+  "The record the fleet stores for a provisioned-but-never-booted unit.
+
+  `:did` is nil and `:state` is `:factory`: the device has no operational key
+  yet, so it has no name yet. A station that invented a DID here would be
+  naming a key that does not exist."
+  [{:keys [serial model token certificate factory-public-key]}]
+  {:serial serial
+   :model model
+   :did nil
+   :state :factory
+   :token token
+   :attested? true
+   :attestation-valid? true
+   :factory-public-key factory-public-key
+   :certificate certificate})
+
+(defn label-for
+  "The label payload for a unit whose device key is now known — i.e. after
+  first boot. Before that there is nothing to name, and this returns nil rather
+  than a placeholder."
+  [{:keys [model token]} public-key-hex endpoint]
+  (enroll/label {:public-key-hex public-key-hex :model model
+                 :endpoint endpoint :token token}))
+
+;; ── CLI ────────────────────────────────────────────────────────────────────
+
+(defn- read-private-key [path]
+  (let [b64 (str/trim (slurp path))]
+    (.generatePrivate (KeyFactory/getInstance "Ed25519")
+                      (PKCS8EncodedKeySpec. (kbytes/base64-decode-bytes b64)))))
+
+(defn- arg [args flag] (second (drop-while #(not= flag %) args)))
+
+(defn issue!
+  "Provision one unit and write two files under `out`: the fleet record
+  (`<serial>.unit.edn`, safe to keep and to ship to the fleet plane) and the
+  factory private key (`<serial>.factory-key.b64`, which the operator is
+  responsible for destroying or escrowing). They are separate files so that
+  handing the fleet its record cannot hand it the key by accident."
+  [{:keys [serial model out root-key issued-ms]}]
+  (let [unit (provision {:serial serial :model model
+                         :issued-ms (or issued-ms (System/currentTimeMillis))
+                         :root-private-key (read-private-key root-key)})]
+    (io/make-parents (io/file out "x"))
+    (spit (io/file out (str serial ".unit.edn")) (pr-str (unit-record unit)))
+    (spit (io/file out (str serial ".factory-key.b64")) (:factory-private-key-b64 unit))
+    unit))
+
+(defn -main [& args]
+  (case (first args)
+    "issue"
+    (let [unit (issue! {:serial (arg args "--serial")
+                        :model (arg args "--model")
+                        :out (or (arg args "--out") "units")
+                        :root-key (arg args "--root-key")})]
+      (println "serial     " (:serial unit))
+      (println "model      " (:model unit))
+      (println "token      " (:token unit))
+      (println "factory key" (subs (:factory-public-key unit) 0 24) "…")
+      (println)
+      (println "The device generates its own operational key at first boot.")
+      (println "The label can only be printed once that key is known."))
+    (do (binding [*out* *err*]
+          (println "usage: kotoba run kotoba/factory.kotoba"))
+        (System/exit 2))))

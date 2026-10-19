@@ -1,0 +1,178 @@
+(ns ipld.car.bytes
+  "Portable byte primitives for the CAR wire format.
+
+  CAR is a byte format, not a data format: every offset a range read depends
+  on is a count of bytes in one specific encoding. So this namespace is
+  deliberately narrow and total — it does the four things the format needs
+  (concatenate, slice, read a little-endian integer, read an unsigned varint)
+  and refuses the cases where JVM and JavaScript would disagree instead of
+  picking one silently.
+
+  The refusal that matters is `u64`: JavaScript numbers are exact only below
+  2^53, and a CAR offset past that would encode as a different integer on the
+  two runtimes. The format allows it; this library does not, and says so."
+  (:refer-clojure :exclude [concat]))
+
+(def ^:const max-safe-integer 9007199254740991) ; 2^53 - 1
+
+
+
+(defn native?
+  "Is `x` already this runtime's byte container?"
+  [x]
+  )
+
+(defn ->bytes
+  "A seq of unsigned byte values → the runtime's byte container."
+  [xs]
+  )
+
+(defn as-bytes
+  "Normalise foreign byte representations.
+
+  This exists because the sibling libraries are not uniform: on the JVM
+  `multiformats.base32/decode` returns a `byte[]`, and on ClojureScript it
+  returns a Clojure vector of numbers. Both are correct for their callers and
+  neither is wrong, but a byte format cannot be written against two shapes —
+  `.length` on a vector is `undefined`, which silently allocates a zero-length
+  buffer instead of failing. Everything entering this namespace is normalised
+  once, here, rather than by a convention each call site is expected to
+  remember."
+  [x]
+  (cond
+    (native? x) x
+    (or (sequential? x) (seq? x)) (->bytes x)
+    
+    :else (throw (ex-info "car: not a byte container"
+                          {:type :car/not-bytes :value-type (type x)}))))
+
+(defn bcount [b]
+  (if (native? b)
+    
+    (clojure.core/count b)))
+
+(defn bget
+  "The unsigned value of byte `i`. JVM bytes are signed; this is the only
+  correct way to read one as a number on both runtimes."
+  [b i]
+  (if (native? b)
+    
+    (bit-and (nth b i) 0xff)))
+
+(defn concat
+  "Concatenate byte containers into one."
+  [parts*]
+  (let [parts (map as-bytes parts*)
+        total (reduce + 0 (map bcount parts))]
+    ))
+
+(defn slice
+  "Bytes `[start, end)` as a new container."
+  [b* start end]
+  (let [b (as-bytes b*)]
+    (when (or (neg? start) (< end start) (> end (bcount b)))
+      (throw (ex-info "car: slice out of range"
+                      {:type :car/slice-out-of-range
+                       :start start :end end :size (bcount b)})))
+    ))
+
+(defn equal?
+  [a b]
+  (and (= (bcount a) (bcount b))
+       (every? #(= (bget a %) (bget b %)) (range (bcount a)))))
+
+;; ── little-endian fixed-width integers ───────────────────────────────────────
+;; CARv2's header and index use LE fixed widths, while the block framing uses
+;; varints. Mixing the two up is the classic CAR bug, so they are named apart.
+
+(defn u32-le [n]
+  (when (or (neg? n) (> n 0xffffffff))
+    (throw (ex-info "car: uint32 out of range" {:type :car/uint-range :value n})))
+  (->bytes [(bit-and n 0xff)
+            (bit-and (unsigned-bit-shift-right n 8) 0xff)
+            (bit-and (unsigned-bit-shift-right n 16) 0xff)
+            (bit-and (unsigned-bit-shift-right n 24) 0xff)]))
+
+(defn need!
+  "Assert that `[off, off+n)` lies inside `b`, and return `off`.
+
+  Every fixed-width read below goes through this, and the reason is a
+  disagreement rather than tidiness. Out of range, JVM `aget` throws and
+  JavaScript `aget` yields `undefined`, so `read-u32-le` returns `NaN` on
+  ClojureScript -- and `NaN` fails every comparison silently: a loop written
+  `(= i n)` against a `NaN` count never ends, and `(> v max-safe-integer)`
+  is false for `NaN`, so even this namespace's own range guard passes it
+  through. Measured 2026-09-06 on nbb, a truncated CARv2 index decoded that
+  way did not terminate and did not yield the event loop.
+
+  A read that could not be performed must not return a value shaped like one
+  that could. This is the check that makes the two runtimes agree."
+  [b off n]
+  (when (or (neg? off) (neg? n) (> (+ off n) (bcount b)))
+    (throw (ex-info "car: read outside buffer"
+                    {:type :car/read-out-of-range
+                     :offset off :width n :size (bcount b)})))
+  off)
+
+(defn read-u32-le [b off]
+  (need! b off 4)
+  (+ (bget b off)
+     (* 256 (bget b (+ off 1)))
+     (* 65536 (bget b (+ off 2)))
+     (* 16777216 (bget b (+ off 3)))))
+
+(defn u64-le
+  "Eight little-endian bytes. Refuses values above 2^53-1: the CAR format
+  permits them, but a JavaScript host cannot hold one exactly, so encoding it
+  here would produce a file whose offsets differ by runtime."
+  [n]
+  (when (or (neg? n) (> n max-safe-integer))
+    (throw (ex-info "car: uint64 outside the exactly-representable range"
+                    {:type :car/uint64-not-exact :value n :limit max-safe-integer})))
+  (let [lo (mod n 4294967296)
+        hi (long (/ (- n lo) 4294967296))]
+    (concat [(u32-le lo) (u32-le hi)])))
+
+(defn read-u64-le [b off]
+  (need! b off 8)
+  (let [lo (read-u32-le b off)
+        hi (read-u32-le b (+ off 4))
+        v  (+ lo (* hi 4294967296))]
+    (when (> v max-safe-integer)
+      (throw (ex-info "car: uint64 in file exceeds the exactly-representable range"
+                      {:type :car/uint64-not-exact :offset off})))
+    v))
+
+;; ── unsigned varint (LEB128) ─────────────────────────────────────────────────
+
+(defn varint
+  "Unsigned LEB128 bytes for `n`."
+  [n]
+  (when (neg? n)
+    (throw (ex-info "car: varint is unsigned" {:type :car/varint-negative :value n})))
+  (loop [v n out []]
+    (if (< v 0x80)
+      (->bytes (conj out v))
+      (recur (unsigned-bit-shift-right v 7)
+             (conj out (bit-or (bit-and v 0x7f) 0x80))))))
+
+(defn read-varint
+  "Read an unsigned LEB128 at `off`. Returns `{:value n :length bytes-read}`.
+
+  Bounded at nine continuation bytes: an unterminated varint in a truncated or
+  hostile file must fail rather than walk the buffer."
+  [b off]
+  (loop [i off shift 0 acc 0]
+    (when (>= i (bcount b))
+      (throw (ex-info "car: varint runs past end of buffer"
+                      {:type :car/varint-truncated :offset off})))
+    (when (> shift 63)
+      (throw (ex-info "car: varint too long" {:type :car/varint-too-long :offset off})))
+    (let [byte-v (bget b i)
+          acc' (+ acc (* (bit-and byte-v 0x7f) (Math/pow 2 shift)))]
+      (if (zero? (bit-and byte-v 0x80))
+        (do (when (> acc' max-safe-integer)
+              (throw (ex-info "car: varint outside the exactly-representable range"
+                              {:type :car/uint64-not-exact :offset off})))
+            {:value (long acc') :length (inc (- i off))})
+        (recur (inc i) (+ shift 7) acc')))))

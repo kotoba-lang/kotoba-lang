@@ -1,0 +1,511 @@
+;; murakumo.infer.media — media generation over the fleet's resident ComfyUI.
+;;
+;; Image/video/audio jobs are the media-first face of murakumo inference
+;; (ADR-2607030030 amendment): each job runs WHOLE on one node — job-parallel,
+;; no layer sharding, no RPC pipeline — so the fleet is a render farm and the
+;; economics are Civitai-Buzz-shaped (credits per image/second), settled into
+;; the same memory×time ledger as text inference.
+;;
+;; The workflow wire format is ComfyUI's API JSON — the same shape
+;; comfyui-clj (kotoba-lang/comfyui) models as portable cljc data, so this
+;; kbb -M:operator can later hand graphs to that engine unchanged.
+;;
+;;   bb murakumo infer media nodes                  which nodes serve which checkpoints
+;;   bb murakumo infer media generate <node> "<prompt>" [neg] [WxH] [steps]
+;;
+;; Fleet ports stay unexposed: dispatch + polling ride ssh loopback curls,
+;; the image comes home over scp.
+
+(ns murakumo.infer.media
+  (:require [kotoba.http.form-urlencoded :as form-urlencoded] [kotoba.io :as io]
+            [kotoba.lang.http.host.babashka :as http]
+            [babashka.process :as p]
+            [json.compat :as json]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [murakumo.fleet :as fleet]
+            [murakumo.infer.credits :as credits]
+            [murakumo.infer.schedule :as sched]
+            [murakumo.config :as config]
+            [murakumo.secret :as secret]
+            [murakumo.ssh :as ssh]
+            [murakumo.tunnel :as tunnel]))
+
+(def ^:private comfy-port 8188)
+(def ^:private runs-file ".murakumo-infer-runs.edn")  ; local settled-run ledger
+
+(defn- comfy [host path]
+  (let [out (ssh/curl-local host (str "http://localhost:" comfy-port path))]
+    (when-not (str/blank? out)
+      (json/parse-string out true))))
+
+(defn- checkpoints [host]
+  (some-> (comfy host "/object_info/CheckpointLoaderSimple")
+          :CheckpointLoaderSimple :input :required :ckpt_name first))
+
+(defn txt2img-workflow
+  "ComfyUI API-format graph as data (checkpoint → clip± → ksampler → vae →
+   save). Deterministic given :seed — reproducibility is what makes the run
+   receipt-able."
+  [{:keys [ckpt prompt negative width height steps cfg seed]
+    :or {negative "lowres, bad anatomy, watermark" width 832 height 1216
+         steps 24 cfg 6.0 seed 20260703}}]
+  {"1" {:class_type "CheckpointLoaderSimple" :inputs {:ckpt_name ckpt}}
+   "2" {:class_type "CLIPTextEncode" :inputs {:clip ["1" 1] :text prompt}}
+   "3" {:class_type "CLIPTextEncode" :inputs {:clip ["1" 1] :text negative}}
+   "4" {:class_type "EmptyLatentImage" :inputs {:width width :height height :batch_size 1}}
+   "5" {:class_type "KSampler" :inputs {:model ["1" 0] :positive ["2" 0] :negative ["3" 0]
+                                        :latent_image ["4" 0] :seed seed :steps steps
+                                        :cfg cfg :sampler_name "euler_ancestral"
+                                        :scheduler "normal" :denoise 1.0}}
+   "6" {:class_type "VAEDecode" :inputs {:samples ["5" 0] :vae ["1" 2]}}
+   "7" {:class_type "SaveImage" :inputs {:images ["6" 0] :filename_prefix "murakumo"}}})
+
+(defn i2v-workflow
+  "Image-to-video (Wan/LTX-style) ComfyUI graph as data: load an i2v diffusion
+   model, encode the driving image + prompt, sample N frames, decode, save as an
+   animated webp. Frame count = fps×seconds (per-second billing lines up)."
+  [{:keys [ckpt image prompt width height seconds fps steps seed]
+    :or {width 640 height 640 seconds 3 fps 16 steps 20 seed 20260703}}]
+  ;; SVD is image-only conditioning: the driving image + clip-vision carry the
+  ;; signal; there is no text-prompt node (`prompt` kept for API symmetry/logs).
+  (let [frames (int (* fps seconds))
+        _ prompt]
+    {"1" {:class_type "ImageOnlyCheckpointLoader" :inputs {:ckpt_name ckpt}}
+     "2" {:class_type "LoadImage" :inputs {:image image}}
+     "4" {:class_type "SVD_img2vid_Conditioning"
+          :inputs {:clip_vision ["1" 1] :init_image ["2" 0] :vae ["1" 2]
+                   :width width :height height :video_frames frames
+                   :motion_bucket_id 127 :fps fps :augmentation_level 0.0}}
+     "5" {:class_type "KSampler" :inputs {:model ["1" 0] :positive ["4" 0] :negative ["4" 1]
+                                          :latent_image ["4" 2] :seed seed :steps steps
+                                          :cfg 3.0 :sampler_name "euler" :scheduler "karras"
+                                          :denoise 1.0}}
+     "6" {:class_type "VAEDecode" :inputs {:samples ["5" 0] :vae ["1" 2]}}
+     "7" {:class_type "SaveAnimatedWEBP"
+          :inputs {:images ["6" 0] :filename_prefix "murakumo-vid"
+                   :fps fps :lossless false :quality 85 :method "default"}}}))
+
+(defn ltxv-t2v-workflow
+  "LTX-Video text-to-video (DiT) ComfyUI graph as data. Native ComfyUI LTX
+   nodes: EmptyLTXVLatentVideo sizes the clip (length must be 8k+1 frames),
+   LTXVConditioning carries the frame_rate. Distilled 2B fits a 16 GB mini with
+   headroom — the DiT samples far faster per step than SVD's UNet."
+  [{:keys [ckpt clip prompt negative width height seconds fps steps cfg seed]
+    :or {clip "t5xxl_fp8_e4m3fn.safetensors"
+         negative "worst quality, blurry, jittery, distorted"
+         width 704 height 480 seconds 3 fps 24 steps 24 cfg 3.0 seed 20260703}}]
+  ;; LTX 2B is diffusion-only: the text encoder (T5-XXL) is loaded SEPARATELY via
+  ;; CLIPLoader type=ltxv — the checkpoint's own CLIP output is nil.
+  (let [length (inc (* 8 (max 1 (int (/ (* fps seconds) 8)))))]  ; 8k+1 frames
+    {"1" {:class_type "CheckpointLoaderSimple" :inputs {:ckpt_name ckpt}}
+     "9" {:class_type "CLIPLoader" :inputs {:clip_name clip :type "ltxv"}}
+     "2" {:class_type "CLIPTextEncode" :inputs {:clip ["9" 0] :text prompt}}
+     "3" {:class_type "CLIPTextEncode" :inputs {:clip ["9" 0] :text negative}}
+     "4" {:class_type "EmptyLTXVLatentVideo" :inputs {:width width :height height
+                                                      :length length :batch_size 1}}
+     "5" {:class_type "LTXVConditioning" :inputs {:positive ["2" 0] :negative ["3" 0]
+                                                  :frame_rate fps}}
+     "6" {:class_type "KSampler" :inputs {:model ["1" 0] :positive ["5" 0] :negative ["5" 1]
+                                          :latent_image ["4" 0] :seed seed :steps steps
+                                          :cfg cfg :sampler_name "euler" :scheduler "normal"
+                                          :denoise 1.0}}
+     "7" {:class_type "VAEDecode" :inputs {:samples ["6" 0] :vae ["1" 2]}}
+     "8" {:class_type "SaveAnimatedWEBP"
+          :inputs {:images ["7" 0] :filename_prefix "murakumo-ltx"
+                   :fps fps :lossless false :quality 85 :method "default"}}}))
+
+(defn txt2audio-workflow
+  "Text-to-audio (Stable-Audio / audio-diffusion style) ComfyUI graph as data.
+   Duration in seconds → per-audio-second billing."
+  [{:keys [ckpt prompt negative seconds steps seed]
+    :or {negative "" seconds 10 steps 50 seed 20260703}}]
+  {"1" {:class_type "CheckpointLoaderSimple" :inputs {:ckpt_name ckpt}}
+   "2" {:class_type "CLIPTextEncode" :inputs {:clip ["1" 1] :text prompt}}
+   "3" {:class_type "CLIPTextEncode" :inputs {:clip ["1" 1] :text negative}}
+   "4" {:class_type "EmptyLatentAudio" :inputs {:seconds seconds}}
+   "5" {:class_type "KSampler" :inputs {:model ["1" 0] :positive ["2" 0] :negative ["3" 0]
+                                        :latent_image ["4" 0] :seed seed :steps steps
+                                        :cfg 5.0 :sampler_name "dpmpp_3m_sde_gpu"
+                                        :scheduler "exponential" :denoise 1.0}}
+   "6" {:class_type "VAEDecodeAudio" :inputs {:samples ["5" 0] :vae ["1" 2]}}
+   "7" {:class_type "SaveAudio" :inputs {:audio ["6" 0] :filename_prefix "murakumo-aud"}}})
+
+(defn- submit! [host workflow]
+  (let [body (json/generate-string {:prompt workflow})
+        out (:out (ssh/sh host (format "curl -s -m 30 -X POST http://localhost:%d/prompt -H 'Content-Type: application/json' -d %s"
+                                       comfy-port (pr-str body))))]
+    (:prompt_id (json/parse-string out true))))
+
+;; Each poll iteration opens a FRESH SSH connection (`comfy` -> `ssh/curl-local`
+;; -> a brand-new `ssh` subprocess, no connection reuse — see ssh.clj). At the
+;; old flat 3s interval, a single ~84s image render alone cost ~28 separate SSH
+;; connections to the same fleet node; back-to-back/overlapping requests during
+;; rapid testing multiplied that further and reliably tripped intermittent
+;; 502/524s from the gateway (root-caused 2026-07-09/10 — connection churn on
+;; the remote sshd side, not a code bug in the gateway/CLI themselves; a
+;; process restart "fixing" it was coincidental with the load clearing, not a
+;; real fix). Poll fast only for the first `fast-window-s` (in case of a
+;; genuinely quick job), then back off to a longer interval for the remainder
+;; — a typical 60-90s image render now costs ~9-12 connections instead of
+;; ~20-30, with a worst-case completion-detection delay of `slow-interval-s`
+;; (a few seconds against a multi-second-to-minutes render is negligible).
+(def ^:private fast-interval-s 2)
+(def ^:private fast-window-s 8)
+(def ^:private slow-interval-s 8)
+
+(defn- poll-interval-s [waited]
+  (if (< waited fast-window-s) fast-interval-s slow-interval-s))
+
+;; A crashed ComfyUI process (connection refused) and "still rendering" both
+;; produce an empty body through the old blank-string-only check — curl's own
+;; exit code is the only thing that tells them apart (0 vs e.g. 7). One
+;; refused connection can be a process mid-restart, so this requires a few
+;; CONSECUTIVE misses (not one) before giving up — observed live 2026-07-13:
+;; a real render finished (confirmed via the node's own ComfyUI log) but the
+;; process then died with no crash report, and await-history silently polled
+;; connection-refused for the full 900s timeout instead of surfacing the
+;; failure in seconds.
+(def ^:private max-unreachable-polls 3)
+
+;; ComfyUI's queue + history are both in-process memory, not persisted — a
+;; crash-and-respawn (the self-healing LaunchDaemon now does this
+;; automatically, see deploy/com.murakumo.comfyui.plist.tmpl) loses BOTH,
+;; not just connectivity. Observed live 2026-07-13, right after the dead-
+;; node fix above landed: a real render on `benjamin` completed ("Prompt
+;; executed in 157.45 seconds" in its own log), the process then crashed the
+;; same way as before, launchd respawned it seconds later — and the FRESH
+;; process had no memory of the prompt-id at all. /history/<id> on it
+;; returns `{}` forever, indistinguishable from "genuinely still rendering"
+;; by body alone, so a bare reachable-but-empty check now silently waits out
+;; the full timeout on a job that has already vanished. /queue is the
+;; distinguishing signal: a job that's actually in flight is always in
+;; queue_running or queue_pending; one that's neither queued nor in history
+;; isn't coming back.
+(defn- in-queue? [host prompt-id]
+  (let [{:keys [exit out]} (ssh/curl-local-raw host (str "http://localhost:" comfy-port "/queue"))]
+    (and (zero? exit)
+         (not (str/blank? out))
+         (boolean (let [q (json/parse-string out true)]
+                    (some #(= prompt-id (second %))
+                          (concat (:queue_running q) (:queue_pending q))))))))
+
+(defn- history-poll
+  "One poll for prompt-id's status on host. :reachable? false means curl
+   itself failed to connect (exit != 0) — the node's ComfyUI process is down,
+   not just busy. When reachable but not yet complete, also checks /queue —
+   see in-queue? above for why (a stale-but-reachable process's empty history
+   looks identical to \"still rendering\")."
+  [host prompt-id]
+  (let [{:keys [exit out]} (ssh/curl-local-raw host (str "http://localhost:" comfy-port "/history/" prompt-id))]
+    (if (or (not (zero? exit)) (str/blank? out))
+      {:reachable? false}
+      (let [history (get (json/parse-string out true) (keyword prompt-id))]
+        (if (get-in history [:status :completed])
+          {:reachable? true :done? true :history history}
+          {:reachable? true :done? false :queued? (in-queue? host prompt-id)})))))
+
+(defn- await-history [host prompt-id timeout-s]
+  (loop [waited 0 misses 0]
+    (when (> waited timeout-s)
+      (throw (ex-info "generation timed out" {:host host :prompt-id prompt-id})))
+    (let [{:keys [reachable? done? history queued?]} (history-poll host prompt-id)]
+      (cond
+        (and reachable? done?)
+        history
+
+        (or (not reachable?) (and reachable? (not queued?)))
+        (if (>= (inc misses) max-unreachable-polls)
+          (throw (ex-info (if reachable?
+                            "job vanished from the node's queue and history (ComfyUI process likely crashed and respawned mid-render, losing in-memory state)"
+                            "node became unreachable mid-render (ComfyUI process likely crashed or was restarted)")
+                          {:host host :prompt-id prompt-id :consecutive-misses (inc misses)}))
+          (let [interval (poll-interval-s waited)]
+            (Thread/sleep (* interval 1000))
+            (recur (+ waited interval) (inc misses))))
+
+        :else
+        (let [interval (poll-interval-s waited)]
+          (Thread/sleep (* interval 1000))
+          (recur (+ waited interval) 0))))))
+
+(defn- settle! [node model units duration-ms]
+  (let [run {:model model
+             :units units
+             :duration-ms duration-ms
+             :plan {:assignments [{:node node :span 1
+                                   :est-bytes (:mem-bytes node 17179869184)}]}}
+        settled (assoc (credits/settle run)
+                       :model (:model/id model) :units units :duration-ms duration-ms)
+        ledger (or (try (edn/read-string (slurp runs-file)) (catch Exception _ nil)) [])]
+    (spit runs-file (pr-str (conj ledger settled)))
+    settled))
+
+(defn- live-node
+  "Probe one fleet node into the shape murakumo.infer.schedule expects:
+   which engines it serves, which checkpoints it holds, free RAM, queue depth."
+  [n]
+  (let [host (:host n)
+        stats (comfy host "/system_stats")
+        cks (set (try (checkpoints host) (catch Exception _ nil)))
+        queue (or (some-> (comfy host "/queue") :queue_running count) 0)]
+    (when stats
+      {:name (:name n) :host host
+       :engines #{:comfyui}
+       :checkpoints cks
+       :free-bytes (get-in stats [:system :ram_free] 0)
+       :queue queue})))
+
+(defn live-fleet [f]
+  (->> (:nodes f) (pmap live-node) (filter some?) vec))
+
+(defn- fetch-artifact!
+  "Bring one rendered artifact home over the SAME ssh loopback curl that
+   dispatch and polling already ride, redirected straight into a local file.
+
+   ⚠ THIS REPLACED AN scp WHOSE PATH WAS RELATIVE TO THE LOGIN USER'S HOME.
+   The old line was `scp host:comfyui/output/<file> murakumo-<file>`, and
+   measured 2026-09-10: ssh to `gad` lands as **root** ($HOME=/root) while
+   ComfyUI lives in /home/gad, so `comfyui/output/` did not exist and the copy
+   failed every time. Its exit code was discarded, so `run-job!` returned a
+   history saying the render had succeeded -- while the local file kept
+   whatever an EARLIER run had left under that name. ComfyUI's output counter
+   had since restarted at 00001, so the names collided: the gateway base64'd
+   and served images dated two months earlier, at byte sizes matching no
+   render on the node. Three different prompts each returned a different
+   stale file, so even \"the bytes changed\" did not expose it.
+
+   A wrong image returned as success is worse than an error, so every failure
+   here throws. The node-side path is gone entirely -- /view is answered by
+   ComfyUI itself, which knows where its own output lives."
+  [host file local]
+  (let [enc  #(form-urlencoded/form-encode (str %))
+        q    (str "/view?filename=" (enc (:filename file))
+                  "&subfolder=" (enc (or (:subfolder file) ""))
+                  "&type=" (enc (or (:type file) "output")))
+        ;; ⚠ `:wrap? false` IS REQUIRED HERE. tunnel/ssh-argv normally wraps the
+        ;; remote command so it echoes an in-band `__murakumo_rc=<n>` sentinel,
+        ;; which the string path strips. Redirecting RAW BYTES leaves nowhere
+        ;; to strip it, so the sentinel is appended to the artifact: measured
+        ;; 2026-09-10, a 315,996-byte png arrived as 316,012 -- exactly 16
+        ;; bytes longer. PNG readers ignore trailing bytes after IEND, so the
+        ;; image still displays and only a checksum shows the corruption,
+        ;; which for a receipt-able render is the whole point. Unwrapped, ssh's
+        ;; own exit code is what we check -- correct here, because a transport
+        ;; failure is the only failure this call can have.
+        ;;
+        ;; ⚠ NOT base64-through-stdout. That was the first fix and it hit a
+        ;; different wall: `ssh/sh` returns its output as a STRING through the
+        ;; tunnel's result path, which caps a value at 65,536 bytes -- a
+        ;; 310 KB png is 413 KB of base64 and the call died with
+        ;; `string exceeds UTF-8 byte limit`. Raw bytes are redirected
+        ;; straight into the local file instead, so nothing image-sized ever
+        ;; becomes a string.
+        cmd  (str "curl -sS -m 300 'http://localhost:" comfy-port q "'")
+        ;; `apply`, matching murakumo.ssh's own call shape: ssh-argv returns
+        ;; the argv as a seq, and passing it as ONE argument makes the program
+        ;; name the literal string "[ssh".
+        {:keys [exit]} (apply p/sh {:out :write :out-file (io/file local)}
+                              (tunnel/ssh-argv host cmd {:wrap? false}))]
+    (when-not (zero? exit)
+      (throw (ex-info "artifact fetch failed on node"
+                      {:host host :file (:filename file) :exit exit})))
+    (let [f (io/file local)]
+      (when-not (and (io/exists? f) (pos? (io/length f)))
+        (throw (ex-info "artifact fetch produced no bytes"
+                        {:host host :file (:filename file)})))
+      local)))
+
+(defn run-job!
+  "Render ONE media job on `node` and return its ComfyUI history. `kind` ∈
+   #{:image :video :audio}; `opts` are the workflow params. Blocking. Fetches
+   the artifact home over scp. Pure of the ledger — the caller settles."
+  [node kind opts]
+  (let [host (:host node)
+        ;; :ckpt from opts (scheduler resolves the model's checkpoint) or first
+        ckpt (or (:ckpt opts) (first (checkpoints host)))
+        [wf out-node] (case kind
+                        :image [(txt2img-workflow (assoc opts :ckpt ckpt)) :7]
+                        :video [(i2v-workflow (assoc opts :ckpt ckpt :image (:image opts "seed.png"))) :7]
+                        :ltx-video [(ltxv-t2v-workflow (assoc opts :ckpt ckpt)) :8]
+                        :audio [(txt2audio-workflow (assoc opts :ckpt ckpt)) :7])
+        pid (submit! host wf)
+        hist (await-history host pid 900)
+        out (get-in hist [:outputs out-node])
+        file (or (get-in out [:images 0]) (get-in out [:gifs 0]) (get-in out [:audio 0]))]
+    (when file
+      (fetch-artifact! host file (str "murakumo-" (:filename file))))
+    hist))
+
+(defn run-custom-workflow!
+  "Submit an arbitrary caller-supplied ComfyUI API-format `workflow` graph
+  (e.g. a comfyui-clj/yukkuri.comfy-built workflow, not one of this
+  namespace's own txt2img/i2v/ltx/audio builders) on `node` and return the
+  local path of the artifact its `output-node` (a node id, e.g. \"7\") saved
+  — the same submit -> poll -> scp path `run-job!` uses, generalized to a
+  graph this namespace didn't build. `output-key` selects which output list
+  to read (:images (default), :gifs, or :audio), matching whichever
+  Save* node type the workflow's output node actually is. Blocking. Returns
+  nil if the output node produced no file."
+  ([node workflow output-node] (run-custom-workflow! node workflow output-node :images))
+  ([node workflow output-node output-key]
+   (let [host (:host node)
+         pid (submit! host workflow)
+         hist (await-history host pid 900)
+         out (get-in hist [:outputs (keyword output-node)])
+         file (first (get out output-key))]
+     (when file
+       (let [remote (format "comfyui/output/%s" (:filename file))
+             local (str "murakumo-" (:filename file))]
+         (p/sh "scp" "-o" "BatchMode=yes" (str host ":" remote) local)
+         local)))))
+
+(defn cmd-nodes [_]
+  (let [f (fleet/enrich (fleet/load-fleet))]
+    (println (format "%-10s %6s %6s  %s" "NODE" "FREE" "QUEUE" "CHECKPOINTS"))
+    (doseq [n (live-fleet f)]
+      (println (format "%-10s %5.1fG %6d  %s"
+                       (:name n)
+                       (/ (double (:free-bytes n)) 1e9)
+                       (:queue n)
+                       (str/join ", " (:checkpoints n)))))))
+
+(defn- resolve-node
+  "Pick the node to run `model`: the named node if given & eligible, else the
+   scheduler's choice over the live fleet. Returns the fleet node map."
+  [f model node-name]
+  (let [live (live-fleet f)]
+    (if node-name
+      (or (first (filter #(= node-name (:name %)) (:nodes f)))
+          (throw (ex-info (str "unknown node " node-name) {})))
+      (if-let [chosen (sched/pick live model)]
+        (first (filter #(= (:name chosen) (:name %)) (:nodes f)))
+        (throw (ex-info "no eligible node for this model" {:model (:model/id model)}))))))
+
+(defn cmd-generate [[node-name prompt negative size steps]]
+  (let [cfg (edn/read-string (slurp "infer.edn"))
+        f (fleet/enrich (fleet/load-fleet))
+        img-model (or (first (filter #(= :image (:model/kind %)) (vals (:models cfg))))
+                      {:model/id "animagine-xl-4.0" :model/engine :comfyui :credit/per-image 100})
+        ;; when no node named, the scheduler routes the job (render-farm mode)
+        node (resolve-node f img-model (when (and node-name (not= node-name "-")) node-name))
+        host (:host node)
+        ckpt (or (first (checkpoints host))
+                 (do (println "no checkpoint on" (:name node)) (System/exit 1)))
+        model (or (first (filter #(= ckpt (get % :model/gguf (:model/checkpoint %)))
+                                 (vals (:models cfg))))
+                  {:model/id ckpt :credit/per-image 100})
+        [w h] (if size (map parse-long (str/split size #"x")) [832 1216])
+        wf (txt2img-workflow {:ckpt ckpt :prompt prompt :negative negative
+                              :width w :height h
+                              :steps (or (some-> steps parse-long) 24)})
+        t0 (System/currentTimeMillis)
+        pid (submit! host wf)
+        _ (println (format "[%s] %s → prompt %s, sampling…" (:name node) ckpt pid))
+        hist (await-history host pid 600)
+        ms (- (System/currentTimeMillis) t0)
+        img (get-in hist [:outputs :7 :images 0])
+        remote (format "comfyui/output/%s" (:filename img))
+        local (str "murakumo-" (:filename img))]
+    (p/sh "scp" "-o" "BatchMode=yes" (str host ":" remote) local)
+    (let [settled (settle! node model {:images 1} ms)]
+      (println (format "image → %s  (%.1fs on %s)" local (/ ms 1000.0) (:name node)))
+      (println (format "settled: %.1f credits — %s earns %.1f, treasury %.1f"
+                       (:run/total settled)
+                       node-name
+                       (double (get (:run/shares settled) node-name 0.0))
+                       (:run/treasury settled))))))
+
+;; ── model-map: fleet-wide "what's loaded where", across ALL categories ─────
+;; Answers "which terminal has which model loaded" across text/image/video/
+;; audio/text-to-3d in one snapshot — text-to-3d is always :unsupported
+;; because no such model is registered anywhere in infer.edn (an honest gap,
+;; not hidden). Distinct from murakumo.infer.orchestrate's POST /infer/placement
+;; (that publishes the REBALANCER's desired pool-seat allocation — a different
+;; concept from "what is actually resident on each node right now").
+
+(def ^:private checkpoint-family-aliases
+  "Small hand-maintained keyword→registered-model-id table for matching a
+   live ComfyUI checkpoint filename back to infer.edn's registry when the
+   exact filename has drifted (a node's checkpoint got upgraded without the
+   registry's :model/checkpoint being updated to match — a real, observed
+   case: ltxv-2b-0.9.1 registered as ltx-video-2b-v0.9.1.safetensors, but
+   naphtali/issachar actually run ltxv-2b-0.9.6-distilled-04-25.safetensors)."
+  {"ltxv" "ltxv-2b-0.9.1" "ltx-video" "ltxv-2b-0.9.1"
+   "animagine" "animagine-xl-4.0"
+   "svd" "svd-xt"
+   "stable-audio" "stable-audio-open"})
+
+(defn- match-checkpoint
+  "Live checkpoint filename → {:model-id :model-kind :match}. :exact when it
+   byte-matches a registered :model/checkpoint; :family-guess when only a
+   known family keyword matches (registry is stale, but we can still label
+   the category); :unregistered when neither matches (surfaced, not hidden)."
+  [ckpt reg]
+  (or (when-let [[id m] (first (filter (fn [[_ m]] (= ckpt (:model/checkpoint m))) reg))]
+        {:model-id id :model-kind (:model/kind m) :match :exact})
+      (when-let [[kw id] (first (filter (fn [[kw _]] (str/includes? (str/lower ckpt) kw))
+                                        checkpoint-family-aliases))]
+        {:model-id id :model-kind (:model/kind (get reg id)) :match :family-guess})
+      {:model-id nil :model-kind nil :match :unregistered}))
+
+(defn- current-text-model
+  "Query the head's own /v1/models to see which registered text model is
+   actually serving right now (matched by GGUF filename) — the fleet serves
+   exactly one text model at a time (standalone-GPU on the head; see
+   ADR-2607051431), so this is a single lookup, not a per-node scan. An RPC-
+   ring deployment would additionally involve worker nodes per
+   .murakumo-infer-plan.edn's shard assignments — not resolved here, a known
+   simplification since standalone-on-head is this fleet's current mode."
+  [cfg]
+  (let [head (:infer/head cfg)
+        port (:infer/api-port cfg 8080)
+        host (or (:api-host head) (some-> (:host head) (str/split #"@") last))
+        url (format "http://%s:%s/v1/models" host port)]
+    (try
+      (let [body (-> (http/get url {:timeout 4000}) :body (json/parse-string true))
+            path (get-in body [:data 0 :id])
+            fname (some-> path (str/split #"/") last)
+            hit (first (filter (fn [[_ m]] (= fname (:model/gguf m))) (:models cfg)))]
+        (if hit
+          {:model-id (first hit) :status :serving :node (:name head)}
+          {:model-id nil :status :unknown :raw-path path :node (:name head)}))
+      (catch Exception e {:model-id nil :status :unreachable :error (.getMessage e) :node (:name head)}))))
+
+(defn cmd-model-map
+  "kbb -M:murakumo infer media model-map [--push]
+   Prints (and, with --push, POSTs to MURAKUMO_API_URL's /infer/model-map,
+   same Bearer-token gate as tools/hwmetrics-report's /infer/hwmetrics) a
+   fleet-wide snapshot of what's loaded where, across text/image/video/audio
+   (text-to-3d listed as unsupported — no model registered for it anywhere)."
+  [args]
+  (let [push? (some #{"--push"} args)
+        cfg (edn/read-string (slurp "infer.edn"))
+        reg (:models cfg)
+        text (current-text-model cfg)
+        f (fleet/enrich (fleet/load-fleet))
+        media-rows (for [n (live-fleet f)
+                        ckpt (:checkpoints n)]
+                    (merge {:node (:name n) :engine :comfyui :checkpoint ckpt
+                            :free-bytes (:free-bytes n) :queue (:queue n)}
+                           (match-checkpoint ckpt reg)))
+        snapshot {:ts (System/currentTimeMillis)
+                  :text text
+                  :media (vec media-rows)
+                  :unsupported-categories [:text-to-3d]}]
+    (println (json/generate-string snapshot {:pretty true}))
+    (when push?
+      (let [url (str (config/api-url) "/infer/model-map")
+            token (secret/resolve-metrics-token)]
+        (http/post url {:headers (cond-> {"content-type" "application/json"}
+                                   token (assoc "authorization" (str "Bearer " token)))
+                        :body (json/generate-string snapshot) :timeout 8000})
+        (println "pushed to" url)))
+    snapshot))
+
+(defn -main [& [cmd & args]]
+  (case cmd
+    "nodes" (cmd-nodes args)
+    "generate" (cmd-generate args)
+    "model-map" (cmd-model-map args)
+    (println "usage: bb murakumo infer media nodes | generate <node> \"<prompt>\" [neg] [WxH] [steps] | model-map [--push]")))

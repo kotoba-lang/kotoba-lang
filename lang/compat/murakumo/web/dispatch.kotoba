@@ -1,0 +1,110 @@
+(ns murakumo.web.dispatch
+  "Coordinator-side transport for web nodes (ADR-260929): one `ssh` per request
+  to `web_node.cljs` on the node, EDN in on stdin, one EDN line out.
+
+  This rides the SSH path fleet operations already use (fleet.edn, RULES.md #1:
+  BatchMode), so a node opens no new listening port. Hosts and paths come from
+  operator config and are validated against a strict pattern before they reach
+  a shell; job data only ever travels on stdin.
+
+  A node map returned by `remote-node` plugs straight into
+  `murakumo.web.verify/verify-fetch!`."
+  (:require [cljs.reader :as reader]
+            [murakumo.web :as web]
+            [murakumo.web.host :as host]))
+
+(def ^:private cp (js/require "child_process"))
+
+(def default-home ".murakumo-web")
+(def default-timeout-ms 120000)
+(def crawl-timeout-ms 900000)
+
+(defn- safe-token?
+  "Operator-config host/path: a strict character set, and never a leading '-'
+  (that would read as an ssh option)."
+  [s]
+  (boolean (and (string? s) (re-matches #"[A-Za-z0-9._@:/~-]+" s) (not (= \- (first s))))))
+
+(defn- remote-command [home]
+  (str "MURAKUMO_WEB_HOME=\"$HOME/" home "\" nbb -cp \"$HOME/" home "/bundle\" \"$HOME/" home "/bundle/web_node.cljs\""))
+
+(defn- modal-python
+  "The Python that has `modal` installed: the interpreter on the `modal` shim's
+  shebang, or $MURAKUMO_MODAL_PYTHON."
+  []
+  (or (.. js/process -env -MURAKUMO_MODAL_PYTHON)
+      (let [r (.spawnSync cp "sh" #js ["-c" "head -1 \"$(command -v modal)\""] #js {:encoding "utf8"})
+            line (some-> (.-stdout r) .trim)]
+        (when (and line (.startsWith line "#!")) (subs line 2)))))
+
+(defn- script-path [name]
+  (.join (js/require "path") (or (.. js/process -env -MURAKUMO_REPO) ".") "scripts" name))
+
+(defn- call-once [{:keys [host home timeout-ms transport app fn-name]} op job]
+  (let [modal? (= transport :modal)
+        py (when modal? (modal-python))
+        r (if modal?
+            (if py
+              (.spawnSync cp py #js [(script-path "modal_call.py") app (or fn-name "run")]
+                          #js {:input (pr-str {:op op :job job}) :timeout timeout-ms
+                               :maxBuffer (* 64 1024 1024) :encoding "utf8"})
+              #js {:error (js/Error. "no python with modal found")})
+            (.spawnSync cp "ssh"
+                        #js ["-o" "BatchMode=yes" "-o" "ConnectTimeout=8" "--" host (remote-command home)]
+                        #js {:input (pr-str {:op op :job job}) :timeout timeout-ms
+                             :maxBuffer (* 64 1024 1024) :encoding "utf8"}))]
+    (cond
+      (.-error r) {:refused :dispatch/spawn-failed :detail (str (.-message (.-error r)))}
+      (not (zero? (.-status r)))
+      {:refused (if modal? :dispatch/modal-failed :dispatch/ssh-failed)
+       :transient? (and (not modal?) (= 255 (.-status r)))  ; ssh's own connection failure
+       :detail {:status (.-status r)
+                :stderr (subs (str (.-stderr r)) 0 (min 300 (count (str (.-stderr r)))))}}
+      :else
+      (let [line (last (remove empty? (.split (str (.-stdout r)) "\n")))]
+        (try (reader/read-string line)
+             (catch :default _ {:refused :dispatch/bad-reply}))))))
+
+(def idempotent-ops
+  "Ops that are safe to repeat after an AMBIGUOUS ssh failure. Exit 255 does not prove the
+  remote command never started (the connection can drop after stdin is delivered), so anything
+  that touches a third party (:fetch, :crawl, :search — origin requests and politeness) or
+  changes state (:sync, :gc, :configure) is NEVER retried automatically; the caller decides.
+  What remains is local reads and local, content-addressed computation."
+  #{:whoami :health :config-status :get :extract :index :index-search})
+
+(defn call!
+  "Run one op on `host`. Returns the node's EDN result, or {:refused :dispatch/...}.
+  A transient ssh failure (exit 255) on an idempotent op is retried once."
+  [{:keys [host home timeout-ms] :or {home default-home timeout-ms default-timeout-ms} :as cfg} op job]
+  (cond
+    (and (= :modal (:transport cfg)) (not (and (safe-token? (:app cfg)) (safe-token? (or (:fn-name cfg) "run")))))
+    {:refused :dispatch/bad-modal-target}
+    (and (not= :modal (:transport cfg)) (not (safe-token? host))) {:refused :dispatch/bad-host}
+    (not (safe-token? home)) {:refused :dispatch/bad-home}
+    :else
+    (let [cfg (assoc cfg :home home :timeout-ms timeout-ms)
+          r (call-once cfg op job)]
+      (if (and (:transient? r) (idempotent-ops op))
+        (let [r2 (call-once cfg op job)]
+          (cond-> r2 (:refused r2) (assoc :retried? true)))
+        r))))
+
+(defn remote-node
+  "Node map for verify-fetch!. `zone` is the OPERATOR's declaration in the
+  registry; the node's own identity is read once with :whoami."
+  [{:keys [host zone] :as cfg}]
+  (let [who (call! cfg :whoami {})]
+    (when-let [ok (:ok who)]
+      {:host (or host (:app cfg)) :zone zone :node-did (:node-did ok) :public-key-hex (:public-key-hex ok)
+       :cfg cfg
+       ;; only receipts signed by THIS node's key, naming this node's did, count
+       :receipt-valid? (fn [receipt signature]
+                         (boolean (and (string? signature)
+                                       (host/verify? (:public-key-hex ok) (web/receipt-signing-string receipt) signature))))
+       :fetch! #(call! cfg :fetch %)
+       :extract! #(call! cfg :extract %)
+       :crawl! #(call! (assoc cfg :timeout-ms crawl-timeout-ms) :crawl %)
+       :search! #(call! cfg :search %)
+       :get! #(call! cfg :get %)
+       :health! #(call! cfg :health {})})))

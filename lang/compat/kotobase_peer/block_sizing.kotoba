@@ -1,0 +1,289 @@
+(ns kotobase-peer.block-sizing
+  "Pure, bounded controller for choosing the next Merkle run block size.
+
+  The controller never jumps more than one declared size class per decision.
+  It requires a qualified current cohort, applies explicit cost weights, and
+  changes class only after a hysteresis margin. Hosts persist the returned
+  decision in the same immutable manifest epoch as the selected size.")
+
+;; These are 17 bytes below 16 KiB / 32 KiB / 64 KiB / 128 KiB, and the 17 is
+;; load-bearing — do not "tidy" them back to round powers of two.
+;;
+;; A client-sealed block is padded to a bucket from
+;; `kotoba.lang.pqh.crypto/PAD-BUCKETS`, and `pick-bucket` must fit
+;; `len + 1 (ISO/IEC 7816-4 delimiter) + 16 (AEAD tag)`. A class sitting
+;; exactly ON a power of two therefore overflows by 17 bytes into the next
+;; bucket. Measured 2026-08-07 with the round values, every class was
+;; pathological:
+;;
+;;   16384 -> needs 16401 -> 65536 bucket   (+300% padding)
+;;   32768 -> needs 32785 -> 65536 bucket   (+100%)
+;;   65536 -> needs 65553 -> no bucket      (ciphertextBlob; inline padding bypassed)
+;;   131072 -> needs 131089 -> no bucket    (same)
+;;
+;; At 17 below, each class lands in its own bucket at 0.0-0.1% overhead.
+;; Enforced by the `block-sizing-pad-alignment-check` fleet gate
+;; (superproject ADR-2608070400 D6).
+(def size-classes [16367 32751 65519 131055])
+
+(def default-policy
+  {:minimum-samples 3
+   :hysteresis-ratio 0.10
+   :request-ms-equivalent 0.0
+   :mib-ms-equivalent 0.0
+   :cpu-weight 0.0
+   :cache-miss-ms-equivalent 0.0})
+
+(def default-qualification-policy
+  {:minimum-regions 2
+   :minimum-samples-per-class 3
+   :required-orders #{:ascending :descending}
+   :require-cpu-source? true
+   :require-cache-source? true})
+
+(defn- finite-non-negative? [value]
+  (and (number? value)
+       
+       (not (neg? value))))
+
+(defn- valid-observation? [observation]
+  (and (map? observation)
+       (contains? (set size-classes) (:block-bytes observation))
+       (pos-int? (:samples observation))
+       (every? finite-non-negative?
+               (map observation
+                    [:wall-p95-ms :cpu-ms :fetched-blocks
+                     :fetched-bytes :cache-hit-ratio]))
+       (<= (:cache-hit-ratio observation) 1)))
+
+(defn- normalized-policy [policy]
+  (let [policy (merge default-policy policy)]
+    (when-not
+     (and (pos-int? (:minimum-samples policy))
+          (finite-non-negative? (:hysteresis-ratio policy))
+          (< (:hysteresis-ratio policy) 1)
+          (every? finite-non-negative?
+                  (map policy
+                       [:request-ms-equivalent :mib-ms-equivalent
+                        :cpu-weight :cache-miss-ms-equivalent])))
+      (throw (ex-info "Invalid block sizing policy" {:policy policy})))
+    policy))
+
+(defn- valid-source? [source]
+  (and (keyword? source)
+       (not (contains? #{:unknown :synthetic} source))))
+
+(defn- valid-sample? [sample]
+  (and (map? sample)
+       (contains? (set size-classes) (:block-bytes sample))
+       (string? (:region sample))
+       (seq (:region sample))
+       (pos-int? (:round sample))
+       (contains? #{:ascending :descending} (:order sample))
+       (pos-int? (:sequence sample))
+       (string? (:head-key sample))
+       (seq (:head-key sample))
+       (string? (:prefix sample))
+       (seq (:prefix sample))
+       (every? finite-non-negative?
+               (map sample [:wall-ms :cpu-ms :fetched-blocks
+                            :fetched-bytes :cache-hit-ratio]))
+       (<= (:cache-hit-ratio sample) 1)))
+
+(defn- p95 [values]
+  (let [values (vec (sort values))
+        index (dec )]
+    (nth values index)))
+
+(defn- mean [values]
+  (/ (reduce + 0 values) (count values)))
+
+(defn- complete-round? [samples]
+  (let [ordered (sort-by :sequence samples)
+        order (:order (first ordered))
+        expected (if (= :ascending order)
+                   size-classes
+                   (vec (reverse size-classes)))]
+    (and (= (count size-classes) (count ordered))
+         (= expected (mapv :block-bytes ordered))
+         (= (range 1 (inc (count size-classes)))
+            (map :sequence ordered))
+         (every? #(= order (:order %)) ordered))))
+
+(defn qualify-samples
+  "Validate and aggregate raw block-size trials into controller observations.
+
+  Production eligibility requires complete ascending/descending rounds in each
+  required region, unique immutable heads and isolated class prefixes,
+  qualified metric sources,
+  and enough samples for every size class. Incomplete evidence is returned with
+  explicit reasons; malformed or duplicate samples fail closed."
+  ([samples] (qualify-samples samples nil))
+  ([samples policy]
+   (let [policy (merge default-qualification-policy policy)
+         samples (vec samples)
+         identities (mapv (juxt :region :round :block-bytes) samples)
+         class-prefixes
+         (group-by (juxt :region :block-bytes) samples)
+         prefix-owners
+         (mapv (fn [[owner cohort]]
+                 [owner (set (map :prefix cohort))])
+               class-prefixes)]
+     (when-not
+      (and (pos-int? (:minimum-regions policy))
+           (pos-int? (:minimum-samples-per-class policy))
+           (set? (:required-orders policy))
+           (seq (:required-orders policy))
+           (every? #{:ascending :descending} (:required-orders policy))
+           (every? boolean?
+                   [(:require-cpu-source? policy)
+                    (:require-cache-source? policy)]))
+       (throw (ex-info "Invalid block sizing qualification policy"
+                       {:policy policy})))
+     (when-not (and (every? valid-sample? samples)
+                    (= (count identities) (count (set identities)))
+                    (= (count samples) (count (set (map :head-key samples))))
+                    (every? #(= 1 (count (second %))) prefix-owners)
+                    (= (count prefix-owners)
+                       (count (set (map (comp first second) prefix-owners)))))
+       (throw (ex-info "Block sizing samples must be valid and unique"
+                       {:samples samples})))
+     (let [regions (set (map :region samples))
+           rounds (group-by (juxt :region :round) samples)
+           incomplete-rounds
+           (->> rounds
+                (keep (fn [[round trial]]
+                        (when-not (complete-round? trial) round)))
+                sort vec)
+           missing-orders
+           (->> regions
+                (keep (fn [region]
+                        (let [present (set (map :order
+                                               (filter #(= region (:region %))
+                                                       samples)))
+                              missing (set (remove present
+                                                   (:required-orders policy)))]
+                          (when (seq missing) [region missing]))))
+                (into (sorted-map)))
+           class-counts (frequencies (map :block-bytes samples))
+           undersampled
+           (->> size-classes
+                (filter #(< (get class-counts % 0)
+                            (:minimum-samples-per-class policy)))
+                vec)
+           missing-cpu
+           (when (:require-cpu-source? policy)
+             (count (remove #(valid-source? (:cpu-source %)) samples)))
+           missing-cache
+           (when (:require-cache-source? policy)
+             (count (remove #(valid-source? (:cache-source %)) samples)))
+           reasons
+           (cond-> []
+             (< (count regions) (:minimum-regions policy))
+             (conj :insufficient-regions)
+             (seq incomplete-rounds) (conj :incomplete-rounds)
+             (seq missing-orders) (conj :missing-order-coverage)
+             (seq undersampled) (conj :undersampled-classes)
+             (pos? (or missing-cpu 0)) (conj :missing-cpu-provenance)
+             (pos? (or missing-cache 0)) (conj :missing-cache-provenance))
+           observations
+           (mapv
+            (fn [block-bytes]
+              (let [cohort (filter #(= block-bytes (:block-bytes %)) samples)]
+                {:block-bytes block-bytes
+                 :samples (count cohort)
+                 :wall-p95-ms (if (seq cohort)
+                                (p95 (map :wall-ms cohort)) 0)
+                 :cpu-ms (if (seq cohort) (mean (map :cpu-ms cohort)) 0)
+                 :fetched-blocks
+                 (if (seq cohort) (mean (map :fetched-blocks cohort)) 0)
+                 :fetched-bytes
+                 (if (seq cohort) (mean (map :fetched-bytes cohort)) 0)
+                 :cache-hit-ratio
+                 (if (seq cohort) (mean (map :cache-hit-ratio cohort)) 0)}))
+            size-classes)]
+       {:eligible? (empty? reasons)
+        :reasons reasons
+        :regions (vec (sort regions))
+        :class-counts (into (sorted-map) class-counts)
+        :incomplete-rounds incomplete-rounds
+        :missing-orders missing-orders
+        :missing-cpu-samples (or missing-cpu 0)
+        :missing-cache-samples (or missing-cache 0)
+        :observations observations
+        :policy policy}))))
+
+(defn cohort-score
+  "Return the explicit wall/resource score for one validated observation."
+  [observation policy]
+  (when-not (valid-observation? observation)
+    (throw (ex-info "Invalid block sizing observation"
+                    {:observation observation})))
+  (let [{:keys [request-ms-equivalent mib-ms-equivalent cpu-weight
+                cache-miss-ms-equivalent]}
+        (normalized-policy policy)]
+    (+ (:wall-p95-ms observation)
+       (* cpu-weight (:cpu-ms observation))
+       (* request-ms-equivalent (:fetched-blocks observation))
+       (* mib-ms-equivalent (/ (:fetched-bytes observation) 1048576.0))
+       (* cache-miss-ms-equivalent (- 1 (:cache-hit-ratio observation))))))
+
+(defn- adjacent-classes [current]
+  (let [index (first (keep-indexed
+                      (fn [index size]
+                        (when (= current size) index))
+                      size-classes))]
+    (set (subvec size-classes (max 0 (dec index))
+                 (min (count size-classes) (+ index 2))))))
+
+(defn select-next
+  "Choose a next block size from qualified current/adjacent cohorts.
+
+  INPUT is {:current bytes :observations [...] :policy {...}}. Duplicate
+  cohorts, unknown classes, malformed metrics, and an invalid current class
+  fail closed. Missing qualified evidence holds the current class. The result
+  includes deterministic scores and the exact reason for audit persistence."
+  [{:keys [current observations policy]}]
+  (let [classes (set size-classes)
+        policy (normalized-policy policy)
+        observations (vec observations)
+        observed-classes (mapv :block-bytes observations)]
+    (when-not (contains? classes current)
+      (throw (ex-info "Current block size is not an allowed class"
+                      {:current current :size-classes size-classes})))
+    (when-not (and (every? valid-observation? observations)
+                   (= (count observed-classes)
+                      (count (set observed-classes))))
+      (throw (ex-info "Block sizing cohorts must be valid and unique"
+                      {:observations observations})))
+    (let [qualified
+          (->> observations
+               (filter #(<= (:minimum-samples policy) (:samples %)))
+               (filter #(contains? (adjacent-classes current)
+                                   (:block-bytes %)))
+               (map (fn [observation]
+                      [(:block-bytes observation)
+                       (cohort-score observation policy)]))
+               (into (sorted-map)))
+          current-score (get qualified current)]
+      (if-not current-score
+        {:current current :selected current :changed? false
+         :reason :insufficient-current-evidence
+         :qualified-scores qualified :policy policy}
+        (let [[best-size best-score]
+              (first (sort-by (juxt second first) qualified))
+              improvement (if (zero? current-score)
+                            0.0
+                            (/ (- current-score best-score) current-score))
+              change? (and (not= current best-size)
+                           (<= (:hysteresis-ratio policy) improvement))]
+          {:current current
+           :selected (if change? best-size current)
+           :changed? change?
+           :reason (cond
+                     (= current best-size) :current-best
+                     change? :hysteresis-passed
+                     :else :hysteresis-held)
+           :improvement-ratio improvement
+           :qualified-scores qualified
+           :policy policy})))))

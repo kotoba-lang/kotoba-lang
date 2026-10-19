@@ -1,0 +1,216 @@
+(ns murakumo.infer.lease
+  "Quorum leases for placement ownership — ADR-2610071730 P3b.
+
+  A lease says: node N holds slot S of class C until T. It settles the shares
+  that placement assigns by rendezvous (not pinned by the operator), so that
+  nodes whose L2 views differ for a moment never both start the same share.
+
+  Built on the single-decree Paxos acceptor of murakumo.infer.jobs (`vote`,
+  `adopted`, `majority`, the same signed-topology voters `policies.job-voters`
+  and the same fleet token), with a chain of epochs because a single decree is
+  write-once:
+
+    id    = <base>_<epoch>, base = l_<sha256(class) 24 hex>_<slot>
+    value = {node class slot epoch until revision}
+
+  acquire: ask the voters for the highest epoch they accepted for base (hint),
+  learn that epoch's value with a prepare/accept round (adopting any accepted
+  value, which completes it), then
+    - held by me and close to expiry  -> propose epoch+1 for me (renew)
+    - held by another, past until+skew -> propose epoch+1 for me (take over)
+    - held by another, valid           -> report the holder, do nothing
+    - epoch open (no value)            -> propose it for me
+  A lost race simply adopts the other value: that node holds the share.
+
+  Safety does not depend on clocks (Paxos); liveness and expiry do, so a holder
+  treats its lease as ending `skew-ms` early and a challenger waits `skew-ms`
+  late. Two of three voters down: nothing can be acquired or renewed, holders
+  stop being sure at `until`, and the resident only ever starts on a lease it
+  holds — it fails closed.
+
+  Voters keep each id in its own file (persisted before replying) and delete
+  epochs older than the newest accepted minus `keep-epochs`."
+  (:require [clojure.string :as str]
+            [murakumo.infer.jobs :as jobs]
+            [murakumo.infer.replicated-topology :as topo]
+            ["node:fs" :as fs] ["node:path" :as path] ["node:crypto" :as crypto]))
+
+(def ttl-ms (* 15 60 1000))
+(def renew-before-ms (* 10 60 1000))
+(def skew-ms (* 60 1000))
+(def keep-epochs 3)
+
+(defn base-of [class slot]
+  (str "l_" (subs (.digest (.update (.createHash crypto "sha256") (str class)) "hex") 0 24) "_" slot))
+
+(defn id-of [base epoch] (str base "_" epoch))
+
+(defn parse-id [id]
+  (when-let [[_ base e] (re-matches #"^(l_[0-9a-f]{24}_\d{1,3})_(\d{1,12})$" (str id))]
+    [base (js/parseInt e 10)]))
+
+;; ---------------------------------------------------------------- acceptor (voters)
+
+(defn valid-value?
+  "Shape and bounds of a lease value; node must be an enabled topology node."
+  [value nodes now]
+  (and (map? value)
+       (string? (:node value)) (some #(and (= (:node value) (:node %)) (:enabled %)) nodes)
+       (string? (:class value)) (<= 1 (count (:class value)) 128)
+       (js/Number.isSafeInteger (:slot value)) (<= 0 (:slot value) 255)
+       (js/Number.isSafeInteger (:epoch value)) (<= 1 (:epoch value))
+       (js/Number.isSafeInteger (:until value)) (<= (:until value) (+ now ttl-ms skew-ms))))
+
+(defn handle
+  "Pure acceptor step for one id: [state' reply]. body {:op :ballot :value}."
+  [state {:keys [op] :as body} id nodes now]
+  (case op
+    "read" [state {:accepted (:accepted state) :accepted-ballot (:accepted-ballot state)}]
+    ("prepare" "accept")
+    (if (and (= "accept" op) (not (valid-value? (:value body) nodes now)))
+      [state {:ok false :reason "invalid lease value"}]
+      (if (and (= "accept" op) (not= (:epoch (:value body)) (second (parse-id id))))
+        [state {:ok false :reason "epoch does not match id"}]
+        (let [{:keys [ok state]} (jobs/vote state body)]
+          [state {:ok ok :accepted (:accepted state) :accepted-ballot (:accepted-ballot state)}])))
+    [state {:ok false :reason "unknown op"}]))
+
+(defn start-acceptor!
+  "Voter side: a lease store under dir. Returns {:handle! (fn [id body]) :hint (fn [base]) }."
+  [dir topology]
+  (.mkdirSync fs dir #js {:recursive true :mode 448})
+  (let [file #(.join path dir (str % ".json"))
+        states (atom (into {} (for [f (array-seq (.readdirSync fs dir))
+                                    :let [id (str/replace f #"\.json$" "")]
+                                    :when (parse-id id)
+                                    :let [s (try (js->clj (js/JSON.parse (.readFileSync fs (file id) "utf8")) :keywordize-keys true)
+                                                 (catch :default _ nil))]
+                                    :when (and s (= (:record-digest s) (topo/digest (dissoc s :record-digest))))]
+                                [id (dissoc s :record-digest)])))
+        hint (fn [base] (reduce max 0 (for [[id s] @states :let [[b e] (parse-id id)] :when (and (= b base) (:accepted s))] e)))
+        gc! (fn [base newest]
+              (doseq [[id _] @states
+                      :let [[b e] (parse-id id)]
+                      :when (and (= b base) (< e (- newest keep-epochs)))]
+                (swap! states dissoc id)
+                (try (.unlinkSync fs (file id)) (catch :default _ nil))))]
+    {:path dir
+     :handle! (fn [id body]
+                (if-not (parse-id id)
+                  {:ok false :reason "invalid lease id"}
+                  (let [[state reply] (handle (get @states id {}) body id (:nodes (topo/payload topology)) (js/Date.now))]
+                    (when (not= state (get @states id))
+                      ;; persist BEFORE replying
+                      (topo/persist! (file id) (assoc state :record-digest (topo/digest state)))
+                      (swap! states assoc id state)
+                      (when-let [[b e] (and (:accepted state) (parse-id id))] (gc! b e)))
+                    reply)))
+     :hint hint}))
+
+;; ---------------------------------------------------------------- client (any resident)
+
+(defn- ballot [] [(js/Date.now) (.randomUUID crypto)])
+
+(defn- check-quorum!
+  "Too few answers -> unavailable (fail closed); enough answers but too few ok
+  -> preempted by a higher ballot (retry)."
+  [rs need phase]
+  (cond (< (count rs) need) (throw (js/Error. (str "lease quorum unavailable (" phase ")")))
+        (< (count (filter :ok rs)) need) (throw (js/Error. (str "lease preempted (" phase ")")))
+        :else rs))
+
+(defn- once! [call! need id value]
+  (let [b (ballot)]
+    (-> (call! id "prepare" {:ballot b})
+        (.then (fn [rs]
+                 (check-quorum! rs need "prepare")
+                 (let [v (jobs/adopted (filter :ok rs) value)]
+                   (-> (call! id "accept" {:ballot b :value v})
+                       (.then (fn [rs2] (check-quorum! rs2 need "accept") v)))))))))
+
+(defn round!
+  "Paxos for id with my value. call! : (fn [id op body]) -> Promise of the
+  replies from the voters that answered. Resolves to the chosen value (mine or
+  an adopted one). A round preempted by a competing proposer is retried after
+  a short random backoff (the retry adopts whatever is accepted by then);
+  rejects when no majority answers."
+  ([call! n-voters id value] (round! call! n-voters id value 5))
+  ([call! n-voters id value tries]
+   (-> (once! call! (jobs/majority n-voters) id value)
+       (.catch (fn [e]
+                 ;; matched by message: SCI re-wraps errors thrown inside callbacks
+                 (if (and (re-find #"lease preempted" (str (.-message e))) (> tries 1))
+                   (-> (js/Promise. (fn [r] (js/setTimeout r (+ 20 (rand-int 200)))))
+                       (.then (fn [_] (round! call! n-voters id value (dec tries)))))
+                   (throw e)))))))
+
+(defn- learn-once! [call! need id]
+  (let [b (ballot)]
+    (-> (call! id "prepare" {:ballot b})
+        (.then (fn [rs]
+                 (check-quorum! rs need "learn")
+                 (if-let [v (jobs/adopted (filter :ok rs) nil)]
+                   (-> (call! id "accept" {:ballot b :value v})
+                       (.then (fn [rs2] (check-quorum! rs2 need "learn accept") v)))
+                   nil))))))
+
+(defn learn!
+  "The value chosen at id, completing a partially accepted one; nil when
+  nothing was accepted by the voters that answered (the epoch is open).
+  Retried like round! when preempted."
+  ([call! n-voters id] (learn! call! n-voters id 5))
+  ([call! n-voters id tries]
+   (-> (learn-once! call! (jobs/majority n-voters) id)
+       (.catch (fn [e]
+                 (if (and (re-find #"lease preempted" (str (.-message e))) (> tries 1))
+                   (-> (js/Promise. (fn [r] (js/setTimeout r (+ 20 (rand-int 200)))))
+                       (.then (fn [_] (learn! call! n-voters id (dec tries)))))
+                   (throw e)))))))
+
+(defn decide
+  "Pure: what to do given the current epoch e and its value v.
+  -> [:hold v] | [:propose epoch] | [:held-by v]"
+  [me e v now]
+  (cond
+    (nil? v) [:propose (max 1 e)]
+    (= me (:node v)) (if (> now (- (:until v) renew-before-ms)) [:propose (inc e)] [:hold v])
+    (> now (+ (:until v) skew-ms)) [:propose (inc e)]
+    :else [:held-by v]))
+
+(defn acquire!
+  "Try to hold (class, slot) for me. hint! : (fn [base]) -> Promise of the max
+  epoch among voters. Resolves to {:held? bool :lease value-or-nil}."
+  [{:keys [call! hint! n-voters me revision]} class slot]
+  (let [base (base-of class slot)
+        now (js/Date.now)
+        mine (fn [epoch] {:node me :class class :slot slot :epoch epoch :until (+ now ttl-ms) :revision revision})]
+    (-> (hint! base)
+        (.then (fn [e]
+                 (-> (if (pos? e) (learn! call! n-voters (id-of base e)) (js/Promise.resolve nil))
+                     (.then (fn [v]
+                              (let [[what x] (decide me e v now)]
+                                (case what
+                                  :hold {:held? true :lease x}
+                                  :held-by {:held? false :lease x}
+                                  :propose (-> (round! call! n-voters (id-of base x) (mine x))
+                                               (.then (fn [chosen] {:held? (= me (:node chosen)) :lease chosen})))))))))))))
+
+(defn held-now?
+  "A holder trusts its lease only until `until - skew`."
+  [lease me now]
+  (and lease (= me (:node lease)) (< now (- (:until lease) skew-ms))))
+
+;; ---------------------------------------------------------------- HTTP wiring
+
+(defn http-client
+  "call!/hint! over the voters' /leases routes with the fleet token."
+  [voters token]
+  (let [n (count voters)
+        all! (fn [f] (-> (js/Promise.allSettled (clj->js (map f voters)))
+                         (.then (fn [rs] (vec (for [r (array-seq rs) :when (= "fulfilled" (.-status r))] (.-value r)))))))]
+    {:n-voters n
+     :call! (fn [id op body] (all! #(jobs/request! (str (:url %) "/leases/" id "/" op) token "POST" body 5000)))
+     :hint! (fn [base] (-> (all! #(jobs/request! (str (:url %) "/leases/hint/" base) token "GET" nil 5000))
+                           (.then (fn [rs]
+                                    (when (< (count rs) (jobs/majority n)) (throw (js/Error. "lease quorum unavailable (hint)")))
+                                    (reduce max 0 (map :epoch rs))))))}))

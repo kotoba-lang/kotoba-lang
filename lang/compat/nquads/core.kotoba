@@ -1,0 +1,302 @@
+(ns nquads.core
+  "RDF 1.1 N-Quads — [W3C REC](https://www.w3.org/TR/n-quads/).
+
+   Terms and datasets as data, plus the serialization RDF Dataset Canonicalization
+   hashes over. First layer of the `-rdfc-` cryptosuite stack: RDFC-1.0 canonicalizes
+   an abstract dataset and hashes its N-Quads form, so getting these bytes exactly
+   right is a prerequisite for producing a canonical hash anybody else agrees with.
+
+   ## N-Quads has no canonical form; the canonical N-Triples grammar supplies one
+
+   The N-Quads grammar defines serialization, not normalization — several byte
+   sequences are legal for the same term, and `\"a\\u0062\"` and `\"ab\"` are the same
+   literal. RDFC-1.0 hashes the *canonical n-quads form*, whose layout rules come
+   from [A Canonical form of N-Triples](https://www.w3.org/TR/rdf12-n-triples/#canonical-ntriples).
+   `serialize-*` here implements THAT, not merely something the grammar accepts,
+   because a serializer that picks a different legal spelling produces a different
+   hash for the same graph.
+
+   Inside a quoted literal:
+
+   - **ECHAR** — exactly seven characters: BS `\\b`, HT `\\t`, LF `\\n`, FF `\\f`,
+     CR `\\r`, `\\\"` and `\\\\`.
+   - **UCHAR** — U+0000-U+0007, VT (U+000B), U+000E-U+001F, DEL (U+007F), and
+     anything not matching XML 1.1's `Char` production (unpaired surrogates,
+     U+FFFE, U+FFFF). Written lowercase `\\u` with **four UPPERCASE hex digits**.
+   - Everything else native UTF-8 — including `'`, space, and the C1 range
+     U+0080-U+008F, which *do* match `Char` and so are not escaped.
+
+   An IRI carries no ECHAR, but the IRIREF production does admit UCHAR, so
+   `<urn:ex:\\u221e>` and `<urn:ex:∞>` are the same IRI and only the second is
+   canonical. Parsing therefore decodes UCHAR in IRIs too.
+
+   (This escaping was wrong in the first version of this library, which escaped only
+   four characters and carried a test asserting that tab and form feed are *not*
+   escaped. Every self-written test agreed with it. The official RDFC-1.0 vector for
+   escaping — `test060` — is what disproved it, which is the whole argument for
+   validating against someone else's expected bytes rather than your own.)
+
+   ## Terms
+
+   `{:type :iri :value \"…\"}`, `{:type :blank :value \"b0\"}` (the label WITHOUT the
+   `_:` prefix), and `{:type :literal :value \"…\" :datatype \"…\" :language \"…\"}`.
+
+   The prefix is left off a blank node label because the prefix is serialization and
+   the label is identity — RDFC-1.0 relabels these, and it relabels labels, not
+   strings that happen to begin with two characters.
+
+   A language-tagged literal's datatype IS `rdf:langString`, so naming a different
+   one is a contradiction rather than extra information, and the datatype is never
+   written alongside a language tag."
+  (:require [kotoba.lang.text :as str]))
+
+(def xsd-string "http://www.w3.org/2001/XMLSchema#string")
+(def rdf-lang-string "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString")
+
+(defn- fail! [code msg data]
+  (throw (ex-info msg (assoc data :nquads/error code))))
+
+;; ── terms ────────────────────────────────────────────────────────────────────
+
+;; The IRIREF production excludes U+0000-U+0020 and < > " { } | ^ ` backslash.
+;; Written as an escaped range rather than literal control bytes, which is both
+;; correct and readable — a literal range here is invisible in a diff.
+(def ^:private forbidden-in-iri #"[\u0000- <>\"{}|^`\\]")
+
+(defn iri [value]
+  (when (str/blank? (str value))
+    (fail! :nquads/blank-iri "an IRI cannot be blank" {}))
+  (when (re-find forbidden-in-iri value)
+    ;; A serializer that let these through would emit something no parser accepts.
+    (fail! :nquads/bad-iri
+           "an IRIREF may not contain control characters or < > \" { } | ^ ` backslash"
+           {:value value}))
+  {:type :iri :value value})
+
+(defn blank
+  "A blank node. `label` is WITHOUT the `_:` prefix."
+  [label]
+  (when (str/blank? (str label))
+    (fail! :nquads/blank-label "a blank node needs a label" {}))
+  {:type :blank :value label})
+
+(defn literal
+  ([value] (literal value nil nil))
+  ([value datatype] (literal value datatype nil))
+  ([value datatype language]
+   (when-not (string? value)
+     (fail! :nquads/bad-literal "a literal value is a string" {}))
+   (when (and language datatype (not= datatype rdf-lang-string))
+     (fail! :nquads/language-and-datatype
+            "a language-tagged literal's datatype is rdf:langString and is not written"
+            {:datatype datatype :language language}))
+   (cond-> {:type :literal :value value}
+     ;; Canonical N-Triples: "Alphabetic characters in LANG_DIR MUST use only the
+     ;; lowercase letters, with any uppercase letters case mapped to lowercase."
+     language (assoc :language (str/lower language))
+     ;; And: a literal with datatype xsd:string "MUST NOT use the datatype IRI part".
+     ;; In RDF 1.1 a plain literal IS xsd:string-typed, so this drops a spelling
+     ;; difference, not information -- the two are the same term.
+     (and datatype (not language) (not= datatype xsd-string))
+     (assoc :datatype datatype))))
+
+;; ── serialization ────────────────────────────────────────────────────────────
+
+(def ^:private echars
+  "The seven characters canonical N-Triples requires be written as ECHAR."
+  {0x08 "\\b" 0x09 "\\t" 0x0A "\\n" 0x0C "\\f" 0x0D "\\r"
+   0x22 "\\\"" 0x5C "\\\\"})
+
+(defn- xml11-char?
+  "XML 1.1 `Char ::= [#x1-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]`.
+
+   Note what is EXCLUDED: U+0000, the surrogate range, U+FFFE and U+FFFF. The C1
+   controls U+0080-U+009F are included, so they are emitted natively — surprising,
+   but that is what the production says."
+  [cp]
+  (or (<= 0x01 cp 0xD7FF)
+      (<= 0xE000 cp 0xFFFD)
+      (<= 0x10000 cp 0x10FFFF)))
+
+(defn- uchar-required?
+  "The explicit UCHAR list, plus everything `Char` rejects."
+  [cp]
+  (or (<= 0x00 cp 0x07)
+      (= 0x0B cp)                                            ; VT
+      (<= 0x0E cp 0x1F)
+      (= 0x7F cp)                                            ; DEL
+      (not (xml11-char? cp))))
+
+(defn- code-points-of [s]
+  )
+
+(defn- uchar [cp]
+  ;; Lowercase \u, four UPPERCASE hex digits -- both halves of that are normative.
+  (let [h ]
+    (str "\\u" (str/upper (str (subs "000" 0 (- 4 (count h))) h)))))
+
+(defn- code-point->str [cp]
+  )
+
+(defn escape-literal
+  "Canonical N-Triples escaping inside `STRING_LITERAL_QUOTE`.
+
+   Seven ECHARs; UCHAR for U+0000-U+0007, VT, U+000E-U+001F, DEL and anything XML
+   1.1's `Char` production rejects; everything else native UTF-8.
+
+   Done a code point at a time rather than by successive `str/replace` — the old
+   implementation replaced backslash first precisely because sequential replacement
+   re-escapes its own output, and a single pass has no such ordering hazard."
+  [s]
+  (apply str (map (fn [cp]
+                    (or (get echars cp)
+                        (when (uchar-required? cp) (uchar cp))
+                        (code-point->str cp)))
+                  (code-points-of s))))
+
+(defn serialize-term [{:keys [type value datatype language] :as term}]
+  (case type
+    :iri (str "<" value ">")
+    :blank (str "_:" value)
+    :literal (str "\"" (escape-literal value) "\""
+                  (cond
+                    language (str "@" language)
+                    datatype (str "^^<" datatype ">")
+                    :else ""))
+    (fail! :nquads/unknown-term-type "a term is :iri, :blank or :literal" {:term term})))
+
+(defn serialize-statement
+  "One N-Quads line, terminated by a space, a period and a newline.
+
+   The space before the period is not decoration: the grammar separates terminals
+   with whitespace, so without it a trailing period would read as part of the
+   preceding term."
+  [{:keys [subject predicate object graph]}]
+  (when-not (#{:iri :blank} (:type subject))
+    (fail! :nquads/bad-subject "a subject is an IRI or a blank node" {:subject subject}))
+  (when-not (= :iri (:type predicate))
+    (fail! :nquads/bad-predicate "a predicate is an IRI" {:predicate predicate}))
+  (str (serialize-term subject) " "
+       (serialize-term predicate) " "
+       (serialize-term object) " "
+       (when graph (str (serialize-term graph) " "))
+       ".\n"))
+
+(defn serialize-dataset
+  "A dataset as N-Quads, statements in the order given.
+
+   NOT sorted here. RDFC-1.0 sorts the canonical N-Quads as one of its own numbered
+   steps, and sorting earlier would hide whether that step ran."
+  [statements]
+  (apply str (map serialize-statement statements)))
+
+;; ── parsing ──────────────────────────────────────────────────────────────────
+
+(defn- code-point->string [cp]
+  )
+
+(defn- parse-hex [s]
+  )
+
+(defn- unescape-literal
+  "ECHAR and UCHAR, both directions of the grammar's latitude.
+
+   A parser that ignored UCHAR would silently mangle any document that used it, and
+   RDFC-1.0 has to be able to read documents it did not write."
+  [s]
+  (loop [chars (seq s) out []]
+    (if-not (seq chars)
+      (apply str out)
+      (let [c (first chars)]
+        (if (not= \\ c)
+          (recur (rest chars) (conj out c))
+          (let [e (second chars)]
+            (case e
+              \t (recur (drop 2 chars) (conj out \tab))
+              \b (recur (drop 2 chars) (conj out \backspace))
+              \n (recur (drop 2 chars) (conj out \newline))
+              \r (recur (drop 2 chars) (conj out \return))
+              \f (recur (drop 2 chars) (conj out \formfeed))
+              \" (recur (drop 2 chars) (conj out \"))
+              \' (recur (drop 2 chars) (conj out \'))
+              \\ (recur (drop 2 chars) (conj out \\))
+              \u (recur (drop 6 chars)
+                        (into out (seq (code-point->string
+                                        (parse-hex (apply str (take 4 (drop 2 chars))))))))
+              \U (recur (drop 10 chars)
+                        (into out (seq (code-point->string
+                                        (parse-hex (apply str (take 8 (drop 2 chars))))))))
+              (fail! :nquads/bad-escape (str "unknown escape: backslash " e)
+                     {:escape (str e)}))))))))
+
+(defn- unescape-iri
+  "UCHAR only. The IRIREF production admits `\\uXXXX` / `\\UXXXXXXXX` but NOT ECHAR,
+   so `<urn:ex:a\\tb>` is not an IRI with a tab in it — it is malformed, and saying so
+   is better than inventing a character.
+
+   Decoding matters because `<urn:ex:\\u221e>` and `<urn:ex:∞>` are the SAME IRI and
+   only the second is canonical; a parser that skipped this would hash them apart."
+  [s]
+  (loop [chars (seq s) out []]
+    (if-not (seq chars)
+      (apply str out)
+      (let [c (first chars)]
+        (if (not= \\ c)
+          (recur (rest chars) (conj out c))
+          (case (second chars)
+            \u (recur (drop 6 chars)
+                      (into out (seq (code-point->string
+                                      (parse-hex (apply str (take 4 (drop 2 chars))))))))
+            \U (recur (drop 10 chars)
+                      (into out (seq (code-point->string
+                                      (parse-hex (apply str (take 8 (drop 2 chars))))))))
+            (fail! :nquads/bad-iri-escape
+                   "an IRIREF admits UCHAR only, not ECHAR"
+                   {:escape (str (second chars))})))))))
+
+(def ^:private line-re
+  ;; Covers the shapes RDFC-1.0 produces and consumes, and refuses anything else
+  ;; rather than half-reading it.
+  #"^\s*(<[^>]*>|_:\S+)\s+(<[^>]*>)\s+(<[^>]*>|_:\S+|\"(?:[^\"\\]|\\.)*\"(?:@[A-Za-z0-9-]+|\^\^<[^>]*>)?)\s*(<[^>]*>|_:\S+)?\s*\.\s*$")
+
+(defn- parse-term [s]
+  (cond
+    (str/starts-with? s "<") (iri (unescape-iri (subs s 1 (dec (count s)))))
+    (str/starts-with? s "_:") (blank (subs s 2))
+    (str/starts-with? s "\"")
+    (let [close (loop [i 1]
+                  (cond
+                    (>= i (count s)) (fail! :nquads/unterminated-literal
+                                            "unterminated literal" {:term s})
+                    (= \\ (nth s i)) (recur (+ i 2))
+                    (= \" (nth s i)) i
+                    :else (recur (inc i))))
+          body (unescape-literal (subs s 1 close))
+          suffix (subs s (inc close))]
+      (cond
+        (str/starts-with? suffix "@") (literal body nil (subs suffix 1))
+        (str/starts-with? suffix "^^<")
+        (literal body (unescape-iri (subs suffix 3 (dec (count suffix)))))
+        (str/blank? suffix) (literal body)
+        :else (fail! :nquads/bad-literal-suffix "a literal takes @lang or ^^<iri>"
+                     {:suffix suffix})))
+    :else (fail! :nquads/bad-term (str "unrecognised term: " s) {:term s})))
+
+(defn parse-statement [line]
+  (if-let [[_ s p o g] (re-matches line-re line)]
+    (cond-> {:subject (parse-term s)
+             :predicate (parse-term p)
+             :object (parse-term o)}
+      g (assoc :graph (parse-term g)))
+    (fail! :nquads/unparseable "not a well-formed N-Quads statement" {:line line})))
+
+(defn parse
+  "N-Quads document -> vector of statements.
+
+   Blank lines and `#` comments are skipped; anything else that does not parse
+   THROWS rather than being dropped, because silently ignoring a line loses a
+   triple from the graph being hashed."
+  [document]
+  (->> (str/split-lines (str document))
+       (remove #(or (str/blank? %) (str/starts-with? (str/triml %) "#")))
+       (mapv parse-statement)))

@@ -1,0 +1,136 @@
+(ns kotoba.native.vector-region
+  "Conservative escape analysis and scalar-region lowering for bounded native
+  vector literals.  A literal is admitted only when every lexical use is a
+  count/read with no identity observation or function-boundary escape."
+  {:kotoba/export [rewrite-expression rewrite-program]})
+
+(def ^:private max-items 32)
+(def ^:private constructors '#{vector-new vector-f64-new})
+(def ^:private counts '#{vector-count vector-f64-count})
+(def ^:private ats '#{vector-at vector-f64-at})
+(def ^:private gets '#{vector-get vector-f64-get})
+
+(defn- constructor-items [form]
+  (when (and (seq? form) (contains? constructors (first form))
+             (<= (dec (count form)) max-items))
+    (vec (rest form))))
+
+(defn- bound-names [bindings]
+  (set (keep #(when (symbol? %) %) (take-nth 2 bindings))))
+
+(declare safe-uses?)
+(defn- safe-seq? [form target]
+  (let [op (first form) args (rest form)]
+    (cond
+      (and (contains? counts op) (= 1 (count args)) (= target (first args))) true
+      (and (or (contains? ats op) (contains? gets op))
+           (<= 2 (count args) 3) (= target (first args)))
+      (every? #(safe-uses? % target) (rest args))
+      (= op 'let)
+      (let [[bindings & body] args]
+        (and (vector? bindings)
+             (every? #(safe-uses? % target) (take-nth 2 (rest bindings)))
+             (or (contains? (bound-names bindings) target)
+                 (every? #(safe-uses? % target) body))))
+      :else (every? #(safe-uses? % target) form))))
+
+(defn- safe-uses? [form target]
+  (cond
+    (= form target) false
+    (seq? form) (safe-seq? form target)
+    (vector? form) (every? #(safe-uses? % target) form)
+    (map? form) (every? #(and (safe-uses? (key %) target)
+                              (safe-uses? (val %) target)) form)
+    (set? form) (every? #(safe-uses? % target) form)
+    :else true))
+
+(defn- all-symbols [form]
+  (into #{} (filter symbol?) (tree-seq coll? seq form)))
+
+(defn- fresh! [state used label]
+  (loop []
+    (let [n (swap! state inc)
+          candidate (symbol (str "kotoba$region$" label "$" n))]
+      (if (contains? used candidate) (recur) candidate))))
+
+(declare rewrite*)
+(defn- select-form [items index fallback state used]
+  (let [i (fresh! state used "index")
+        n (count items)
+        selected (reduce (fn [otherwise [position item]]
+                           (list 'if (list '= i position) item otherwise))
+                         fallback
+                         (reverse (map-indexed vector items)))]
+    (list 'let [i (rewrite* index state used)]
+          (list 'if (list '>= i 0)
+                (list 'if (list '< i n) selected fallback)
+                fallback))))
+
+(defn- rewrite-read [op args regions state used]
+  (let [[subject index fallback] args
+        items (get regions subject)
+        literal-items (constructor-items subject)]
+    (cond
+      (and items (contains? counts op)) (count items)
+      (and items (contains? ats op))
+      (select-form items index (list 'quot 1 0) state used)
+      (and items (contains? gets op))
+      (select-form items index (rewrite* fallback state used) state used)
+      (and literal-items
+           (or (contains? counts op) (contains? ats op) (contains? gets op)))
+      (let [slots (mapv (fn [_] (fresh! state used "item")) literal-items)
+            bindings (vec (mapcat vector slots (map #(rewrite* % state used) literal-items)))
+            result (cond
+                     (contains? counts op) (count slots)
+                     (contains? ats op) (select-form slots index (list 'quot 1 0) state used)
+                     :else (select-form slots index (rewrite* fallback state used) state used))]
+        (list 'let bindings result))
+      :else nil)))
+
+(defn- rewrite-with-regions [form regions state used]
+  (cond
+    (seq? form)
+    (let [op (first form) args (rest form)]
+      (if-let [read (rewrite-read op args regions state used)]
+        read
+        (if (= op 'let)
+          (let [[bindings & body] args]
+            (loop [pairs (partition 2 bindings) out [] active regions]
+              (if-let [[name value] (first pairs)]
+                (if-let [items (and (symbol? name) (constructor-items value))]
+                  (let [remainder (concat (map second (rest pairs)) body)]
+                    (if (every? #(safe-uses? % name) remainder)
+                      (let [slots (mapv (fn [_] (fresh! state used "item")) items)
+                            lowered (mapcat vector slots
+                                            (map #(rewrite-with-regions % active state used) items))]
+                        (recur (rest pairs) (into out lowered)
+                               (assoc active name slots)))
+                      (recur (rest pairs)
+                             (conj out name (rewrite-with-regions value active state used))
+                             (dissoc active name))))
+                  (recur (rest pairs)
+                         (conj out name (rewrite-with-regions value active state used))
+                         (dissoc active name)))
+                (list* 'let (vec out)
+                       (map #(rewrite-with-regions % active state used) body)))))
+          (apply list (map #(rewrite-with-regions % regions state used) form)))))
+    (vector? form) (mapv #(rewrite-with-regions % regions state used) form)
+    (map? form) (into (empty form) (map (fn [[k v]] [(rewrite-with-regions k regions state used)
+                                                      (rewrite-with-regions v regions state used)]) form))
+    (set? form) (set (map #(rewrite-with-regions % regions state used) form))
+    :else form))
+
+(defn- rewrite* [form state used]
+  (if-let [items (constructor-items form)]
+    ;; Immediate non-escaping consumer handling happens at the parent.  A bare
+    ;; constructor remains materialized because it escapes.
+    (apply list (first form) (map #(rewrite* % state used) items))
+    (rewrite-with-regions form {} state used)))
+
+(defn rewrite-expression [form]
+  (let [used (all-symbols form)] (rewrite* form (atom 0) used)))
+
+(defn rewrite-program [kir]
+  (update kir :functions
+          (fn [functions]
+            (mapv #(update % :body rewrite-expression) functions))))

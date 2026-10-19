@@ -1,0 +1,256 @@
+(ns murakumo.fleet-ps
+  "`murakumo fleet ps` -- what each fleet node is running, read in one command:
+  memory and swap, the model servers (llama-server / mlx_lm / ollama / vllm)
+  with the arguments they were started with and what their /slots say, the
+  largest processes, and the murakumo / itonami / gftd / kotoba / inga services
+  with the service each process belongs to.
+
+  Why (2026-09-25): answering \"what is loaded on the M4 minis and what shares
+  their 16 GB\" took an hour of hand-typed ssh -- and the first attempt under
+  the nodes' zsh login shell silently printed nothing, because zsh does not
+  word-split $PS and aborts on an unmatched glob. The probe therefore always
+  runs under /bin/sh -s with the script on stdin, never through the login shell.
+
+  Read-only: no sudo, nothing written on the node. A node that cannot be read
+  is printed as UNREACHABLE with the reason and makes the exit code 1; it is
+  never dropped from the listing. Exit 2 when no node matched."
+  (:require [kotoba.lang.text :as str]
+            [murakumo.bench :as bench]
+            ["node:child_process" :as cp]))
+
+(def probe-script
+  ;; Runs on the node under /bin/sh. KEY=VALUE lines plus tab-separated rows:
+  ;;   PROC    pid ppid rss_kb command      (largest resident first)
+  ;;   MODEL   pid ppid rss_kb command      (model servers)
+  ;;   SERVICE label state pid              (launchd / systemd units by name)
+  "os=$(uname -s); echo \"HOST=$(hostname -s)\"; echo \"OS=$os\"
+if [ \"$os\" = Darwin ]; then
+  echo \"MEM_BYTES=$(sysctl -n hw.memsize)\"
+  echo \"FREE_PCT=$(memory_pressure 2>/dev/null | awk -F': ' '/free percentage/{gsub(/%/,\"\",$2); print $2}')\"
+  echo \"SWAP_USED_MB=$(sysctl -n vm.swapusage | awk '{gsub(/M/,\"\",$6); print $6}')\"
+  PS=\"ps -axo pid=,ppid=,rss=,command=\"
+else
+  echo \"MEM_BYTES=$(awk '/MemTotal/{print $2*1024}' /proc/meminfo)\"
+  echo \"FREE_PCT=$(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{printf \"%d\", a*100/t}' /proc/meminfo)\"
+  echo \"SWAP_USED_MB=$(awk '/SwapTotal/{t=$2} /SwapFree/{f=$2} END{printf \"%d\", (t-f)/1024}' /proc/meminfo)\"
+  PS=\"ps -eo pid=,ppid=,rss=,args=\"
+fi
+$PS | sort -k3 -nr | head -14 | while read -r pid ppid rss cmd; do printf 'PROC\\t%s\\t%s\\t%s\\t%s\\n' \"$pid\" \"$ppid\" \"$rss\" \"$cmd\"; done
+$PS | grep -E 'llama-server|mlx_lm|ollama serve|vllm' | grep -v grep | while read -r pid ppid rss cmd; do printf 'MODEL\\t%s\\t%s\\t%s\\t%s\\n' \"$pid\" \"$ppid\" \"$rss\" \"$cmd\"; done
+for f in /Library/LaunchDaemons/*.plist \"$HOME\"/Library/LaunchAgents/*.plist /etc/systemd/system/*.service; do
+  [ -f \"$f\" ] || continue
+  b=$(basename \"$f\"); case \"$b\" in *murakumo*|*itonami*|*gftd*|*kotoba*|*mishima*|*inga*) ;; *) continue;; esac
+  l=${b%.plist}; l=${l%.service}
+  if [ \"$os\" = Darwin ]; then
+    dom=gui/$(id -u); case \"$f\" in /Library/*) dom=system;; esac
+    st=$(launchctl print \"$dom/$l\" 2>/dev/null | awk -F' = ' '/^\\tstate =/{print $2; exit}'); [ -n \"$st\" ] || st=not-loaded; pid=$(launchctl print \"$dom/$l\" 2>/dev/null | awk '/^\\tpid =/{print $3; exit}')
+  else st=$(systemctl is-active \"$l\" 2>/dev/null); pid=$(systemctl show -p MainPID --value \"$l\" 2>/dev/null); fi
+  printf 'SERVICE\\t%s\\t%s\\t%s\\n' \"$l\" \"${st:-unknown}\" \"${pid:-}\"
+done
+")
+
+;; ── parsing (pure) ────────────────────────────────────────────────────────────
+
+(defn- int-or-nil [s]
+  (let [n (js/parseInt (str s) 10)] (when-not (js/isNaN n) n)))
+
+(defn- num-or-nil [s]
+  (let [n (js/parseFloat (str s))] (when-not (js/isNaN n) n)))
+
+(defn- row [cols]
+  {:pid (int-or-nil (nth cols 1 nil)) :ppid (int-or-nil (nth cols 2 nil))
+   :rss-kb (int-or-nil (nth cols 3 nil)) :cmd (str/join "\t" (drop 4 cols))})
+
+(defn parse-probe
+  "Probe stdout -> {:host :os :mem-bytes :free-pct :swap-used-mb :procs :models :services}.
+  Numbers are numbers (or nil): a string-typed :free-pct compares wrongly and
+  sorts wrongly without ever throwing."
+  [text]
+  (reduce
+   (fn [acc line]
+     (let [cols (str/split line #"\t")]
+       (case (first cols)
+         "PROC" (update acc :procs conj (row cols))
+         "MODEL" (update acc :models conj (row cols))
+         "SERVICE" (update acc :services conj {:label (nth cols 1 nil) :state (nth cols 2 nil)
+                                               :pid (int-or-nil (nth cols 3 nil))})
+         (if-let [[_ k v] (re-matches #"([A-Z_]+)=(.*)" line)]
+           (case k
+             "HOST" (assoc acc :host v)
+             "OS" (assoc acc :os v)
+             "MEM_BYTES" (assoc acc :mem-bytes (num-or-nil v))
+             "FREE_PCT" (assoc acc :free-pct (num-or-nil v))
+             "SWAP_USED_MB" (assoc acc :swap-used-mb (num-or-nil v))
+             acc)
+           acc))))
+   {:procs [] :models [] :services []}
+   (str/split-lines (str text))))
+
+(defn- flag [argv & names]
+  (some (fn [n] (second (drop-while #(not= n %) argv))) names))
+
+(defn parse-model-cmd
+  "A model server's command line -> what it serves and how."
+  [cmd]
+  (let [argv (str/split (str/trim (str cmd)) #"\s+")
+        exe (last (str/split (first argv) #"/"))
+        model (flag argv "-m" "--model")]
+    {:engine exe
+     :model (some-> model (str/split #"/") last)
+     :model-path model
+     :ctx (int-or-nil (flag argv "-c" "--ctx-size"))
+     :parallel (int-or-nil (flag argv "-np" "--parallel"))
+     :kv-k (flag argv "-ctk" "--cache-type-k")
+     :kv-v (flag argv "-ctv" "--cache-type-v")
+     :flash-attn (flag argv "-fa" "--flash-attn")
+     :host (flag argv "--host")
+     :port (int-or-nil (flag argv "--port"))}))
+
+(defn owner-label
+  "The service a process belongs to: the unit whose pid is the process or its
+  parent (a launchd job that runs `npm exec` owns the node process under it)."
+  [services {:keys [pid ppid]}]
+  (let [by-pid (into {} (keep (fn [s] (when (:pid s) [(:pid s) (:label s)])) services))]
+    (or (get by-pid pid) (get by-pid ppid))))
+
+(defn exit-code
+  "0 every node read, 1 any unreachable, 2 nothing to read."
+  [results]
+  (cond (empty? results) 2
+        (some :error results) 1
+        :else 0))
+
+;; ── rendering ─────────────────────────────────────────────────────────────────
+
+(defn- gb [kb] (when kb (.toFixed (/ kb 1048576) 1)))
+
+(defn- short-cmd [cmd]
+  (let [argv (str/split (str/trim (str cmd)) #"\s+")
+        exe (last (str/split (first argv) #"/"))]
+    (str exe (when (#{"node" "python" "python3" "Python"} exe)
+               (some->> (rest argv) (remove #(str/starts-with? % "-")) first (str " ")
+                        (#(subs % 0 (min 60 (count %)))))))))
+
+(defn render-node [{:keys [node error probe slots]}]
+  (let [head (str (:name node) " (" (:ip node) ")")]
+    (if error
+      (str head "  UNREACHABLE  " error)
+      (let [{:keys [os mem-bytes free-pct swap-used-mb procs models services]} probe
+            model-pids (set (map :pid models))
+            lines (concat
+                   [(str head "  " os "  " (some-> mem-bytes (/ 1073741824) js/Math.round) " GB"
+                         "  free " free-pct "%  swap " (some-> swap-used-mb (/ 1024) (.toFixed 1)) " GB")]
+                   (for [m models
+                         :let [a (parse-model-cmd (:cmd m)) s (get slots (:pid m))]]
+                     (str "  model   " (:engine a) " pid " (:pid m) "  " (gb (:rss-kb m)) " GB  " (:model a)
+                          "  ctx " (or (:n-ctx s) (:ctx a)) (when (and (:n-ctx s) (:ctx a) (not= (:n-ctx s) (:ctx a)))
+                                                                 (str " (argv " (:ctx a) ")"))
+                          "  kv " (or (:kv-k a) "f16") "/" (or (:kv-v a) "f16")
+                          "  fa " (or (:flash-attn a) "auto") "  parallel " (or (:parallel a) "-")
+                          "  " (:host a) ":" (:port a)
+                          (cond (:error s) (str "  slots: " (:error s))
+                                s (str "  slots " (:busy s) "/" (:total s) " busy")
+                                :else "")))
+                   (for [p procs :when (not (model-pids (:pid p)))
+                         :let [label (owner-label services p)]
+                         :when (> (or (:rss-kb p) 0) 204800)]
+                     (str "  shares  " (gb (:rss-kb p)) " GB  " (short-cmd (:cmd p))
+                          (when label (str "  [" label "]"))))
+                   [(str "  units   "
+                         (str/join ", " (for [s services :when (= "running" (:state s))] (:label s)))
+                         (let [idle (count (remove #(= "running" (:state %)) services))]
+                           (when (pos? idle) (str "  (+" idle " not running)"))))])]
+        (str/join "\n" lines)))))
+
+;; ── I/O ───────────────────────────────────────────────────────────────────────
+
+(defn- ssh-probe
+  "Resolve to {:stdout} or {:error}. The script goes to /bin/sh -s on stdin."
+  [node user timeout-ms]
+  (js/Promise.
+   (fn [resolve _]
+     (let [target (if user (str user "@" (:ip node)) (:name node))
+           argv (cond-> ["-o" "BatchMode=yes" "-o" "ConnectTimeout=8"]
+                  user (into ["-o" "ProxyCommand=tailscale nc %h %p"])
+                  true (into [target "/bin/sh" "-s"]))
+           child (cp/spawn "ssh" (clj->js argv))
+           out (atom "") err (atom "")
+           timer (js/setTimeout #(.kill child "SIGKILL") timeout-ms)]
+       (.on (.-stdout child) "data" #(swap! out str %))
+       (.on (.-stderr child) "data" #(swap! err str %))
+       (.on child "error" (fn [e] (js/clearTimeout timer) (resolve {:error (.-message e)})))
+       (.on child "close"
+            (fn [code sig]
+              (js/clearTimeout timer)
+              (resolve (if (and (zero? code) (str/includes? @out "HOST="))
+                         {:stdout @out}
+                         {:error (str (if sig (str "killed " sig) (str "ssh exit " code)) " "
+                                      (str/trim (subs @err 0 (min 160 (count @err)))))}))))
+       (.end (.-stdin child) probe-script)))))
+
+(defn- fetch-slots
+  "llama-server /slots -> {:n-ctx :busy :total} or {:error}."
+  [{:keys [host port]}]
+  (if-not (and host port)
+    (js/Promise.resolve nil)
+    (-> (js/fetch (str "http://" host ":" port "/slots") #js {:signal (js/AbortSignal.timeout 5000)})
+        (.then #(.json %))
+        (.then (fn [j]
+                 (let [s (js->clj j :keywordize-keys true)
+                       s (if (map? s) [s] s)]
+                   {:n-ctx (:n_ctx (first s)) :total (count s) :busy (count (filter :is_processing s))})))
+        (.catch (fn [e] {:error (.-message e)})))))
+
+(defn- read-node [node user]
+  (-> (ssh-probe node user 45000)
+      (.then (fn [{:keys [stdout error]}]
+               (if error
+                 {:node node :error error}
+                 (let [probe (parse-probe stdout)
+                       llama (filter #(str/includes? (:cmd %) "llama-server") (:models probe))]
+                   (-> (js/Promise.all (clj->js (map #(fetch-slots (parse-model-cmd (:cmd %))) llama)))
+                       (.then (fn [ss]
+                                {:node node :probe probe
+                                 :slots (zipmap (map :pid llama) (js->clj ss :keywordize-keys true))})))))))))
+
+(defn- opt [args k] (second (drop-while #(not= k %) args)))
+
+(defn usage []
+  (println "murakumo fleet ps [--node NAME] [--all] [--user USER] [--json]
+
+  What every online macOS fleet node is running: memory, swap, the model
+  servers with their ctx / KV cache / flash-attn / parallel and live /slots,
+  what else is resident (with the launchd unit it belongs to), and which
+  murakumo / itonami / gftd / kotoba / inga units are running.
+
+  --node NAME   one node (tailnet host name or IP, prefix allowed)
+  --all         every online node, not only macOS
+  --user USER   ssh USER@<tailnet ip> through `tailscale nc` instead of the
+                ssh config host alias (the default)
+  --json        machine-readable
+
+Read-only (no sudo). Exit 0 all read, 1 some UNREACHABLE, 2 no node matched."))
+
+(defn run-command
+  "Entry for `murakumo fleet <command>`. Returns a Promise of the exit code."
+  [command args]
+  (if-not (= command "ps")
+    (do (usage) (js/Promise.resolve (if (#{"help" "--help" nil} command) 0 2)))
+    (let [nodes (bench/tailnet-nodes)
+          q (opt args "--node")
+          user (opt args "--user")]
+      (if (:error nodes)
+        (do (println (:error nodes)) (js/Promise.resolve 2))
+        (let [picked (cond q (keep identity [(bench/resolve-node nodes q)])
+                           (some #{"--all"} args) (filter :online (rest nodes))
+                           :else (filter #(and (:online %) (= "macOS" (:os %))) (rest nodes)))]
+          (-> (js/Promise.all (clj->js (map #(read-node % user) picked)))
+              (.then (fn [rs]
+                       (let [results (vec (array-seq rs))]
+                         (if (some #{"--json"} args)
+                           (println (js/JSON.stringify (clj->js results) nil 1))
+                           (doseq [r (sort-by #(get-in % [:node :name]) results)]
+                             (println (render-node r))
+                             (println)))
+                         (when (empty? results) (println (str "no node matched" (when q (str " " q)))))
+                         (exit-code results))))))))))

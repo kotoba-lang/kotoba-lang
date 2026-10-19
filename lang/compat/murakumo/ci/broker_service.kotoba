@@ -1,0 +1,195 @@
+(ns murakumo.ci.broker-service
+  "Persistent, versioned broker RPC service for remote Murakumo runners."
+  (:require ["node:crypto" :as crypto]
+            [kotoba.lang.error :as kerror] [murakumo.ci.broker :as broker]
+            [murakumo.ci.attest :as attest]
+            [murakumo.ci.artifact-upload :as artifact-upload]
+            [murakumo.ci.protocol :as protocol]
+            [murakumo.ci.store :as store]
+            [murakumo.overlay.rpc :as rpc]
+            [nekko.sigref :as sigref]))
+
+(def default-lease-ttl-ms 60000)
+
+(defn token
+  "A fresh lease bearer token: 256 bits from the operating system's CSPRNG (node:crypto), as 64
+  lower-case hex characters. The lease token is the credential a runner presents for every later
+  call on its run, so it must be unguessable and must not come from a seeded or time-based
+  generator."
+  []
+  (.toString (.randomBytes crypto 32) "hex"))
+
+(defn create
+  [{:keys [store clock-ms lease-ttl-ms token-fn broker-key replicas rid
+           authorized-runners require-attestation? artifact-upload-opts
+           artifact-exists?]
+    :or {clock-ms #(System/currentTimeMillis)
+         lease-ttl-ms default-lease-ttl-ms
+         token-fn token
+         replicas 1
+         broker-key store/default-key}}]
+  (let [restored (store/restore store broker-key)
+        initial (or restored (broker/empty-broker))
+        _ (when-not restored (store/checkpoint! store broker-key initial))
+        state (atom initial)
+        commit! (fn [next-state]
+                  (store/checkpoint! store broker-key next-state)
+                  (reset! state next-state)
+                  next-state)
+        transition! (fn [f]
+                      (locking state
+                        (let [[next-state value] (f @state)]
+                          (commit! next-state)
+                          value)))
+        submit! (fn [run]
+                  (locking state
+                    (let [logical-id (:ci.run/id run)
+                          children (mapv (fn [index]
+                                           (assoc run
+                                                  :ci.run/id (if (= replicas 1)
+                                                               logical-id
+                                                               (str logical-id ".replica." index))
+                                                  :ci.run/logical-id logical-id
+                                                  :ci.run/replica index))
+                                         (range replicas))
+                          next-state (reduce broker/submit @state children)]
+                      (commit! next-state)
+                      {:ci.run/logical-id logical-id
+                       :ci.run/replicas (mapv :ci.run/id children)})))
+        runner-used? (fn [current logical-id runner-id]
+                       (some (fn [[_ run]]
+                               (and (= logical-id (:ci.run/logical-id run))
+                                    (or (= runner-id
+                                           (get-in run [:ci.run/lease :ci.lease/runner-id]))
+                                        (= runner-id
+                                           (get-in run [:ci.run/attestation :signer])))))
+                             (:murakumo.ci/runs current)))
+        validate-attestation!
+        (fn [current lease attestation]
+          (when (and require-attestation? (not (map? attestation)))
+            (throw (ex-info "murakumo-ci: signed attestation required"
+                            {:reason :attestation-required})))
+          (when attestation
+            (let [run (get-in current [:murakumo.ci/runs (:ci.lease/run-id lease)])
+                  logical-id (:ci.run/logical-id run)
+                  sr (:sigref attestation)
+                  signer (get sr "signer")
+                  verdict (:verdict attestation)]
+              (when-not (and (sigref/valid? sr)
+                             (= signer (:ci.lease/runner-id lease))
+                             (or (nil? authorized-runners)
+                                 (contains? authorized-runners signer))
+                             (= rid (get sr "rid"))
+                             (= (attest/result-ref logical-id) (get sr "ref"))
+                             (= (:verdict-cid attestation) (get sr "commit"))
+                             (map? verdict)
+                             (= (:verdict-cid attestation)
+                                (attest/verdict-cid verdict)))
+                (throw (ex-info "murakumo-ci: invalid runner attestation"
+                                {:reason :invalid-runner-attestation})))
+              (when artifact-exists?
+                (let [artifact-cids (map #(or (:cid %) (:digest %))
+                                         (:verdict/artifacts verdict))
+                      ;; The receipt commit is stored as quads inside the snapshot, not as
+                      ;; an object of its own, so the snapshot stands for it here.
+                      required (concat [(:verdict-cid attestation)
+                                        (:receipt-snapshot-cid attestation)]
+                                       artifact-cids)]
+                  (when-not (and (every? string? required)
+                                 (every? artifact-exists? required))
+                    (throw (ex-info "murakumo-ci: attested objects unavailable in coordinator CAS"
+                                    {:reason :attested-objects-unavailable
+                                     :missing (vec (remove #(and (string? %)
+                                                                 (artifact-exists? %))
+                                                           required))})))))
+              (assoc attestation :signer signer))))
+        upload-handler (when artifact-upload-opts
+                         (artifact-upload/handler
+                          (merge artifact-upload-opts
+                                 {:broker-state state :clock-ms clock-ms})))
+        handler
+        (fn [message]
+          (try
+            (if-not (protocol/valid? message)
+              (protocol/message :ci/error {:reason :invalid-message})
+              (let [type (:murakumo.ci/type message)
+                    body (:murakumo.ci/body message)
+                    now (clock-ms)]
+                (if (contains? artifact-upload/operations type)
+                  (if upload-handler
+                    (upload-handler message)
+                    (protocol/message :ci/error {:reason :artifact-upload-unavailable}))
+                  (case type
+                  :ci/lease-request
+                  (transition!
+                   (fn [current]
+                     (let [current (broker/expire current now)
+                           [next-state lease]
+                           (broker/lease-where
+                            current body (token-fn) now lease-ttl-ms
+                            (fn [_ run]
+                              (not (runner-used? current (:ci.run/logical-id run)
+                                                 (:runner/id body)))))]
+                       [next-state
+                        (if lease
+                          (protocol/lease-offer
+                           lease (get-in next-state
+                                         [:murakumo.ci/runs (:ci.lease/run-id lease)]))
+                          (protocol/message :ci/no-work {}))])))
+
+                  :ci/run-started
+                  (transition! #(vector (broker/start % (:lease body) now)
+                                        (protocol/message :ci/ack
+                                                          {:operation :run-started})))
+
+                  :ci/heartbeat
+                  (transition!
+                   (fn [current]
+                     (let [[next-state renewed]
+                           (broker/heartbeat current (:lease body) now lease-ttl-ms)]
+                       [next-state (protocol/message :ci/heartbeat-ack
+                                                     {:lease renewed})])))
+
+                  :ci/run-completed
+                  (transition!
+                   (fn [current]
+                     (let [verified (validate-attestation!
+                                     current (:lease body) (:attestation body))
+                           completed (broker/complete current (:lease body) now
+                                                      (:result body) (:receipt/cid body))
+                           completed (if verified
+                                       (assoc-in completed
+                                                 [:murakumo.ci/runs
+                                                  (:ci.lease/run-id (:lease body))
+                                                  :ci.run/attestation]
+                                                 verified)
+                                       completed)]
+                       [completed (protocol/message :ci/ack
+                                                    {:operation :run-completed})])))
+
+                  :ci/run-status
+                  (let [logical-id (:run-id body)
+                        runs (->> (:murakumo.ci/runs @state)
+                                  vals
+                                  (filter #(= logical-id (:ci.run/logical-id %)))
+                                  (sort-by :ci.run/replica)
+                                  vec)]
+                    (protocol/message
+                     :ci/run-status
+                     {:logical-id logical-id :runs runs
+                      :attestations (vec (keep :ci.run/attestation runs))}))
+
+                  (protocol/message :ci/error {:reason :unsupported-message
+                                               :type type})))))
+            (catch kerror/ExceptionInfo e
+              (protocol/message :ci/error
+                                (merge {:reason :transition-rejected}
+                                       (ex-data e))))
+            (catch Throwable t
+              (protocol/message :ci/error {:reason :broker-failure
+                                           :message (.getMessage t)}))))]
+    {:state state :submit! submit! :handler handler}))
+
+(defn serve! [overlay-request service]
+  (rpc/serve-rpc!
+   overlay-request (:handler service)))

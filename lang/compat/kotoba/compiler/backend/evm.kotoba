@@ -1,0 +1,178 @@
+(ns kotoba.compiler.backend.evm
+  "Fail-closed checked-KIR to EVM bytecode lowering.
+
+  The first vertical slice owns one Ethereum ABI surface: a pure, zero-arity
+  `main() -> int64`.  It intentionally rejects storage, calls, capabilities,
+  parameters, additional functions, and every KIR expression outside bounded
+  i64 literals, addition, and multiplication.  The emitted creation bytecode
+  deploys a conventional EVM runtime with a selector dispatcher, ABI-word
+  return, and revert-on-unknown-selector behavior."
+  {:kotoba/export [abi emit max-expression-depth max-expression-nodes selector-main target-name verify-artifact!]}
+  (:require [kotoba.artifact.core :as artifact]
+            [kotoba.kir.target :as target]
+            ))
+
+(def target-name :evm256-kotoba-v1)
+(def selector-main [0xdf 0xfe 0xad 0xd0])
+(def max-expression-nodes 16)
+(def max-expression-depth 12)
+
+(def ^:private exact-artifact-keys
+  #{:format :target :target-profile :abi :selector :kir :kir-sha256
+    :runtime-bytes :creation-bytes :runtime-sha256 :creation-sha256
+    :limits})
+
+(defn- reject! [message data]
+  (throw (ex-info message (merge {:phase :evm-lowering :target target-name}
+                                 data))))
+
+;; This file is .cljc, so it claims both runtimes. Until 2026-08-25 the two
+;; functions below were written only for the JVM and the claim was false in
+;; three separate ways, none of which the JVM suite could see:
+;;
+;;   1. `Long/MIN_VALUE` is not a symbol ClojureScript can resolve, so the
+;;      namespace did not even LOAD there -- measured with the resolved
+;;      classpath, the only one of amu's fifteen .cljc namespaces that failed.
+;;      Its neighbours use the same constant and load fine because theirs sit
+;;      inside `#?(:clj ...)`, which the cljs reader strips before it is read.
+;;   2. `integer?` does not recognise a JS bigint, and on ClojureScript every
+;;      .kotoba integer VALUE is a bigint (`kotoba.kir.cljs-i64`'s docstring
+;;      states this and gives the reason: plain cljs numbers are doubles and
+;;      lose precision above 2^53). So `i64?` would have answered false for
+;;      every literal it was handed.
+;;   3. cljs bitwise ops coerce to int32, so `unsigned-bit-shift-right` by 56
+;;      is a shift by 24 -- `56 & 31`. That one is the dangerous kind: it
+;;      returns a number rather than failing, and would have emitted wrong
+;;      PUSH8 operands silently.
+;;
+;; Both branches are held to byte-for-byte identity by
+;; `test/nbb/run.cljk`'s evm case against the JVM's pinned bytes.
+
+(defn- i64? [value]
+  )
+
+(defn- i64-bytes [value]
+  )
+
+(defn- expression-shape
+  ([form] (expression-shape form 0))
+  ([form depth]
+   (when (> depth max-expression-depth)
+     (reject! "EVM expression depth exceeds the target profile"
+              {:reason :expression-depth :limit max-expression-depth}))
+   (cond
+     (i64? form) {:nodes 1}
+
+     (and (seq? form)
+          (= 3 (count form))
+          (contains? '#{+ *} (first form)))
+     (let [left (expression-shape (second form) (inc depth))
+           right (expression-shape (nth form 2) (inc depth))
+           nodes (inc (+ (:nodes left) (:nodes right)))]
+       (when (> nodes max-expression-nodes)
+         (reject! "EVM expression exceeds the target profile"
+                  {:reason :expression-nodes :limit max-expression-nodes}))
+       {:nodes nodes})
+
+     :else
+     (reject! "unsupported checked-KIR expression for the EVM target"
+              {:reason :unsupported-expression :form form}))))
+
+(defn- emit-expr [form]
+  (if (i64? form)
+    (into [0x67] (i64-bytes form))                 ; PUSH8
+    (let [[op left right] form]
+      (vec (concat (emit-expr left)
+                   (emit-expr right)
+                   [(case op + 0x01 * 0x02)        ; ADD / MUL
+                    0x67]                          ; PUSH8 mask
+                   [0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff]
+                   [0x16])))))                     ; AND = i64 wrapping
+
+(defn- admitted-main [kir]
+  (let [functions (:functions kir)
+        function (first functions)]
+    (when-not (contains? #{:kotoba.kir/v3 :kotoba.kir/v4} (:format kir))
+      (reject! "unsupported KIR format for the EVM target"
+               {:reason :kir-format :format (:format kir)}))
+    (when-not (and (= 'main (:entry kir))
+                   (= ['main] (:exports kir))
+                   (= 1 (count functions))
+                   (= 'main (:name function))
+                   (empty? (:params function))
+                   (empty? (or (:param-types function) []))
+                   (= :i64 (:result function))
+                   (empty? (or (:effects kir) #{}))
+                   (empty? (or (:effects function) #{})))
+      (reject! "EVM v1 requires one pure zero-arity main returning i64"
+               {:reason :entry-contract}))
+    (expression-shape (:body function))
+    function))
+
+(defn- runtime-bytes [body]
+  ;; 0x14 is the byte offset of JUMPDEST. Unknown/short selectors revert.
+  (let [dispatcher [0x60 0x00 0x35                   ; PUSH1 0; CALLDATALOAD
+                    0x60 0xe0 0x1c                   ; PUSH1 224; SHR
+                    0x63 0xdf 0xfe 0xad 0xd0 0x14   ; PUSH4 selector; EQ
+                    0x60 0x14 0x57                   ; PUSH1 body; JUMPI
+                    0x60 0x00 0x60 0x00 0xfd         ; REVERT(0,0)
+                    0x5b]                            ; JUMPDEST
+        result [0x60 0x07 0x0b                       ; SIGNEXTEND byte 7
+                0x60 0x00 0x52                       ; MSTORE(0, value)
+                0x60 0x20 0x60 0x00 0xf3]           ; RETURN(0, 32)
+        runtime (vec (concat dispatcher (emit-expr body) result))]
+    (when (> (count runtime) 255)
+      (reject! "EVM runtime exceeds one-byte creation envelope"
+               {:reason :runtime-bytes :limit 255 :actual (count runtime)}))
+    runtime))
+
+(defn- creation-bytes [runtime]
+  ;; The creation prefix is exactly 12 bytes and returns the copied runtime.
+  (let [size (count runtime)]
+    (vec (concat [0x60 size 0x60 0x0c 0x60 0x00 0x39
+                  0x60 size 0x60 0x00 0xf3]
+                 runtime))))
+
+(def abi
+  [{:type "function"
+    :name "main"
+    :stateMutability "pure"
+    :inputs []
+    :outputs [{:name "" :type "int64"}]}])
+
+(defn emit
+  "Lower an already checked KIR module to a deployable EVM artifact."
+  [kir]
+  (let [function (admitted-main kir)
+        runtime (runtime-bytes (:body function))
+        creation (creation-bytes runtime)
+        profile (target/profile target-name)]
+    {:format :evm/v1
+     :target target-name
+     :target-profile profile
+     :abi abi
+     :selector selector-main
+     :kir kir
+     :kir-sha256 (artifact/sha256 kir)
+     :runtime-bytes runtime
+     :creation-bytes creation
+     :runtime-sha256 (artifact/sha256 runtime)
+     :creation-sha256 (artifact/sha256 creation)
+     :limits {:expression-nodes max-expression-nodes
+              :expression-depth max-expression-depth
+              :runtime-bytes 255
+              :ambient-precompiles false}}))
+
+(defn verify-artifact!
+  "Independently re-emit the closed KIR and require byte-for-byte identity."
+  [candidate]
+  (when-not (= exact-artifact-keys (set (keys candidate)))
+    (reject! "EVM artifact has an invalid key set"
+             {:reason :artifact-keys
+              :expected exact-artifact-keys
+              :actual (set (keys candidate))}))
+  (let [expected (emit (:kir candidate))]
+    (when-not (= expected candidate)
+      (reject! "EVM artifact does not match checked-KIR re-emission"
+               {:reason :artifact-mismatch})))
+  candidate)

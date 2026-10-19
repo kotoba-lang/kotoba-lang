@@ -1,0 +1,233 @@
+(ns murakumo.infer.fleet-gateway
+  "Replicated stateless entrypoints; each resident owns admission and recovery."
+  (:require [murakumo.infer.resident :as r]
+            [murakumo.infer.jobs :as jobs]
+            [murakumo.infer.replicated-topology :as topo]
+            [clojure.string :as str]
+            ["node:child_process" :as cp] ["node:fs" :as fs] ["node:http" :as http] ["node:crypto" :as crypto]))
+
+(defn candidates [reports model kind now stale-ms]
+  (vec (for [[node report] reports
+             :when (< (- now (:at report 0)) stale-ms)
+             [lane l] (:lanes report)
+             :when (and (:ready l) (not (:busy l)) (= model (:model l)) (= kind (:kind l)))]
+         (merge (select-keys l [:max-image-tokens :max-images :input-tokenizer])
+                {:node node :lane (name lane) :context (:context l 0)}))))
+
+(defn gateway-input-tokens! [choices peers body bytes token]
+  "Ask one qualified same-model resident for a digest-bound tokenizer estimate.
+  It does not admit or execute a job; execution owners verify admission again."
+  (if-let [{:keys [node lane]} (first (filter #(= "llama-template" (:input-tokenizer %)) choices))]
+    (let [peer (get peers node)
+          digest (.digest (.update (.createHash crypto "sha256") bytes) "hex")]
+      (-> (js/fetch (str (.-origin (js/URL. (:url peer))) "/estimate/" lane)
+                    #js {:method "POST" :signal (.timeout js/AbortSignal 7000)
+                         :headers #js {"authorization" (str "Bearer " token) "content-type" "application/json"}
+                         :body bytes})
+          (.then (fn [resp] (when-not (.-ok resp) (throw (js/Error. "estimate unavailable"))) (.json resp)))
+          (.then (fn [result]
+                   (when (and (= digest (.-digest result)) (= (:model body) (.-model result))
+                              (= "backend-tokenizer" (.-source result))
+                              (js/Number.isSafeInteger (aget result "input-tokens"))
+                              (<= 0 (aget result "input-tokens") 2097280))
+                     (aget result "input-tokens"))))
+          (.catch (fn [_] nil))))
+    (js/Promise.resolve nil)))
+
+(defn start! [config]
+  (let [token (r/private-token (:token-file config))
+        topology (topo/start! config token)
+        reports (atom {})
+        active (atom 0)
+        ingress-state (atom {:desired nil :failures 0 :applying false})
+        serving? #(and (topo/gateway-allowed? topology (:node config))
+                       (not (and (:drain-file config) (.existsSync fs (:drain-file config)))))
+        sync-ingress! (fn []
+                        (when (and (seq (:tunnel-start-argv config)) (seq (:tunnel-stop-argv config)))
+                          (let [now (js/Date.now)
+                                healthy? (boolean (and (serving?)
+                                           (some (fn [[node report]]
+                                                   (and (< (- now (:at report 0)) 15000)
+                                                        (topo/conformant-report? topology node report)
+                                                        (some #(= "image" (:kind %)) (vals (:lanes report))))) @reports)))
+                                failures (if healthy? 0 (inc (:failures @ingress-state)))
+                                apply? (and (not (:applying @ingress-state))
+                                            (or (not= healthy? (:desired @ingress-state))
+                                                (>= (- now (:last-applied @ingress-state 0)) (:tunnel-reconcile-ms config 30000)))
+                                            (or healthy? (and (zero? @active) (>= failures (:tunnel-failure-threshold config 3)))))]
+                            (swap! ingress-state assoc :failures failures)
+                            (when apply?
+                              (swap! ingress-state assoc :applying true)
+                              (let [[bin & args] (if healthy? (:tunnel-start-argv config) (:tunnel-stop-argv config))]
+                                (.execFile cp bin (clj->js args) #js {:timeout 10000}
+                                  (fn [error _ _]
+                                    (swap! ingress-state #(cond-> (assoc % :applying false) (nil? error) (assoc :desired healthy? :last-applied now)))
+                                    (println (js/JSON.stringify (clj->js {:event "image-ingress" :enabled healthy? :ok (nil? error)}))))))))))
+        peers (atom (into {} (for [p (if topology (topo/nodes topology) (:peers config))] [(:node p) p])))
+        polling (atom false)
+        headers #js {"authorization" (str "Bearer " token) "content-type" "application/json"}
+        tick! (fn []
+                (when (compare-and-set! polling false true)
+                  (when topology
+                    (reset! peers (into {} (for [p (topo/nodes topology)] [(:node p) p])))
+                    (swap! reports #(into {} (filter (fn [[node report]] (topo/conformant-report? topology node report)) %))))
+                  (-> (js/Promise.allSettled
+                       (clj->js (for [[node p] @peers]
+                                  (-> (js/fetch (str (.-origin (js/URL. (:url p))) "/health")
+                                                #js {:headers headers :signal (.timeout js/AbortSignal 5000)})
+                                      (.then (fn [resp] (when-not (.-ok resp) (throw (js/Error. "peer unavailable"))) (.json resp)))
+                                      (.then (fn [body]
+                                               (when-not (and (= node (.-node body)) (topo/conformant-report? topology node (js->clj body :keywordize-keys true))) (throw (js/Error. "peer identity mismatch")))
+                                               (swap! reports assoc node
+                                                      (assoc (js->clj body :keywordize-keys true) :at (js/Date.now)))))
+                                      (.catch (fn [_] (swap! reports dissoc node)))))))
+                      (.finally (fn [] (reset! polling false) (sync-ingress!))))))
+        handler (fn [req res compatibility?]
+                  (cond
+                    (and (not compatibility?) (not (r/authorized? req token))) (r/json! res 401 {:error "unauthorized"})
+                    (and (not compatibility?) (str/starts-with? (.-url req) "/jobs/"))
+                    (let [id (subs (.-url req) 6) method (.-method req)
+                          endpoints (for [[node report] @reports
+                                          :when (and (:jobs report) (< (- (js/Date.now) (:at report 0)) 15000)
+                                                     (topo/conformant-report? topology node report))]
+                                      (:url (get @peers node)))]
+                      (if-not (and (jobs/valid-id? id) (contains? #{"GET" "POST"} method) (serving?))
+                        (r/json! res 503 {:error "job_gateway_unavailable"})
+                        (letfn [(forward [urls body]
+                                  (if-let [url (first urls)]
+                                    (-> (jobs/request! (str url "/jobs/" id) token method body 30000)
+                                        (.catch (fn [_] (forward (rest urls) body))))
+                                    (js/Promise.reject (js/Error. "job quorum unavailable"))))]
+                          (-> (if (= method "POST")
+                                (-> (r/read-body! req 2097152)
+                                    (.then #(js->clj (js/JSON.parse (.toString %)) :keywordize-keys true)))
+                                (js/Promise.resolve nil))
+                              (.then #(forward endpoints %))
+                              (.then #(r/json! res (if (= method "POST") 202 200) %))
+                              (.catch (fn [_] (r/json! res 503 {:error "job_not_admitted" :retry "same-id-only"})))))))
+                    (and topology (not compatibility?) (= "GET" (.-method req)) (= "/topology" (.-url req)))
+                    (r/json! res 200 (topo/document topology))
+                    (and topology (not compatibility?) (= "POST" (.-method req)) (= "/topology" (.-url req)))
+                    (-> (r/read-body! req 262144)
+                        (.then (fn [bytes]
+                                 ((:accept! topology) (js->clj (js/JSON.parse (.toString bytes)) :keywordize-keys true))
+                                 (r/json! res 200 (topo/summary topology))))
+                        (.catch (fn [_] (r/json! res 400 {:error "invalid_topology"}))))
+                    (and (= "GET" (.-method req))
+                         (contains? (if compatibility? #{"/health" "/readiness"} #{"/health"}) (.-url req)))
+                    (let [now (js/Date.now)
+                          live (if (serving?)
+                                 (into {} (filter (fn [[node p]] (and (< (- now (:at p)) 15000) (topo/conformant-report? topology node p))) @reports)) {})]
+                      (if compatibility?
+                        (let [image-lanes (for [[_ p] live [_ lane] (:lanes p) :when (= "image" (:kind lane))] lane)
+                              models (into {} (for [model (distinct (map :model image-lanes))
+                                                    :let [ls (filter #(= model (:model %)) image-lanes)]]
+                                                [model {:ready (boolean (some :ready ls))
+                                                        :free (boolean (some #(and (:ready %) (not (:busy %))) ls))}]))]
+                          (r/json! res (if (seq image-lanes) 200 503) {:ok (boolean (seq image-lanes)) :busy (boolean (some :busy image-lanes)) :models models}))
+                        (r/json! res (if (and (seq live) (serving?)) 200 503)
+                                 {:node (:node config) :topology (topo/summary topology) :resilience (topo/resilience topology live) :peers live :inflight @active :draining (not (serving?)) :admission "node-owned"})))
+                    (and (= "POST" (.-method req)) (not (serving?)))
+                    (r/json! res 503 {:error "topology_gateway_unavailable" :executed false})
+                    (and (= "POST" (.-method req))
+                         (contains? (if compatibility? #{"/v1/images/generations"} #{"/v1/chat/completions" "/v1/images/generations"}) (.-url req)))
+                    (do
+                      (swap! active inc)
+                      (let [released? (atom false) release! #(when (compare-and-set! released? false true) (swap! active dec))]
+                        (.once res "finish" release!) (.once res "close" release!))
+                    (-> (r/read-body! req (:max-body-bytes config 2097152))
+                        (.then (fn [bytes]
+                                 (let [body (js->clj (js/JSON.parse (.toString bytes)) :keywordize-keys true)
+                                       kind (if (= "/v1/chat/completions" (.-url req)) "text" "image")
+                                       choices (candidates (into {} (filter (fn [[node report]] (topo/conformant-report? topology node report)) @reports)) (:model body) kind (js/Date.now) 15000)]
+                                   (-> (if (= kind "text") (gateway-input-tokens! choices @peers body bytes token) (js/Promise.resolve nil))
+                                       (.then (fn [input] {:bytes bytes :input-tokens input}))))))
+                        (.then
+                         (fn [{:keys [bytes input-tokens]}]
+                           (let [_ (when (.-destroyed res) (throw (js/Error. "caller disconnected")))
+                                 body (js->clj (js/JSON.parse (.toString bytes)) :keywordize-keys true)
+                                 kind (if (= "/v1/chat/completions" (.-url req)) "text" "image")
+                                 _ (when (and (= kind "text") (not (r/valid-output-budget? body)))
+                                     (throw (js/Error. "invalid output budget")))
+                                 incoming-id (aget (.-headers req) "x-murakumo-job-id")
+                                 nonce (str/replace (.randomUUID crypto) #"-" "")
+                                 choices (candidates (into {} (filter (fn [[node report]] (topo/conformant-report? topology node report)) @reports)) (:model body) kind (js/Date.now) 15000)
+                                 choices (filterv #(or (= kind "image")
+                                                      (when-let [input (or (when (= "llama-template" (:input-tokenizer %)) input-tokens) (r/request-input-tokens % body (.-length bytes)))]
+                                                        (>= (:context %) (+ input (r/output-reservation % (:max_tokens body 1024)))))) choices)
+                                 ;; Random first peer spreads simultaneous arrivals across gateways.
+                                 choices (if (seq choices)
+                                           (let [n (.randomInt crypto (count choices))]
+                                             (vec (concat (subvec choices n) (subvec choices 0 n)))) [])
+                                 ;; A retry is pinned to its original owner, even if health changed.
+                                 [owner lane suffix] (when incoming-id (str/split incoming-id #"_" 3))
+                                 choices (if incoming-id [{:node owner :lane lane}] choices)
+                                 controller (js/AbortController.)
+                                 timer (js/setTimeout #(.abort controller) (:request-timeout-ms config 490000))]
+                             (.on res "close" #(when-not (.-writableEnded res) (.abort controller)))
+                             (letfn [(attempt [remaining]
+                                       (if-let [{:keys [node lane]} (first remaining)]
+                                         (if-let [p (or (get @peers node) (when incoming-id (topo/node-entry topology node)))]
+                                           (let [id (or incoming-id (str node "_" lane "_" nonce))]
+                                             (when-not (and (re-matches #"[A-Za-z0-9-]+" node)
+                                                            (re-matches #"[A-Za-z0-9-]+" lane)
+                                                            (or (nil? incoming-id) (re-matches #"[a-f0-9]{32}" (or suffix ""))))
+                                               (throw (js/Error. "invalid job id")))
+                                             (-> (js/fetch (str (.-origin (js/URL. (:url p))) "/execute/" lane)
+                                                           #js {:method "POST" :signal (.-signal controller)
+                                                                :headers #js {"authorization" (str "Bearer " token)
+                                                                              "content-type" "application/json"
+                                                                              "x-murakumo-job-id" id}
+                                                                :body bytes})
+                                                 (.then (fn [resp]
+                                                          ;; Retry only an explicit pre-admission refusal.
+                                                          ;; Timeouts, broken connections and 5xx after execution are ambiguous.
+                                                          (if (and (nil? incoming-id) (contains? #{429 503} (.-status resp)))
+                                                            (-> (.json resp)
+                                                                (.then (fn [refusal]
+                                                                         (if (false? (.-executed refusal))
+                                                                           (attempt (rest remaining))
+                                                                           (r/json! res 502 {:error "execution_unknown" :job-id id :retryable false})))))
+                                                            (do
+                                                              (.writeHead res (.-status resp)
+                                                                          #js {"content-type" (or (.get (.-headers resp) "content-type") "application/json")
+                                                                               "x-murakumo-job-id" id "x-murakumo-node" node})
+                                                              (let [reader (.getReader (.-body resp))]
+                                                                (letfn [(pump []
+                                                                          (-> (.read reader)
+                                                                              (.then (fn [part]
+                                                                                       (if (.-done part) (.end res)
+                                                                                           (do (.write res (.from js/Buffer (.-value part))) (pump)))))))]
+                                                                  (pump)))))))
+                                                 (.catch (fn [_]
+                                                           (when-not (.-headersSent res)
+                                                             (r/json! res 502 {:error "execution_unknown" :job-id id :retryable false}))
+                                                           (when-not (.-writableEnded res) (.end res))))))
+                                           (r/json! res 400 {:error "unknown_job_owner"}))
+                                         (r/json! res 429 {:error "no_ready_capacity" :executed false})))]
+                               (-> (js/Promise.resolve (attempt choices))
+                                   (.finally #(js/clearTimeout timer)))))))
+                        (.catch (fn [_] (when-not (.-headersSent res) (r/json! res 400 {:error "invalid_request"}))))))
+                    :else (r/json! res 404 {:error "not_found"})))
+        server (.createServer http (fn [req res] (handler req res false)))
+        compat-server (when (:compat-image-port config)
+                        (when-not (contains? #{"127.0.0.1" "::1"} (:compat-image-bind config "127.0.0.1"))
+                          (throw (js/Error. "image compatibility ingress must remain loopback")))
+                        (.createServer http (fn [req res] (handler req res true))))]
+    (doseq [[node p] @peers]
+      (when-not (and (re-matches #"[A-Za-z0-9-]+" node) (:url p))
+        (throw (js/Error. "invalid peer manifest"))))
+    (.listen server (:port config 8797) (:bind config "127.0.0.1"))
+    (when compat-server (.listen compat-server (:compat-image-port config) (:compat-image-bind config "127.0.0.1")))
+    (tick!)
+    (let [timer (js/setInterval tick! (:probe-interval-ms config 3000))
+          stop-watchdog! (r/service-watchdog! config #(.-listening server))]
+      {:server server :reports reports
+       :close (fn [] (stop-watchdog!) (when topology ((:close topology))) (js/clearInterval timer) (.close server) (when compat-server (.close compat-server)))})))
+
+(defn run-command [command args]
+  (case command
+    "serve" (let [[flag file] args]
+              (when-not (and (= flag "--config") file) (throw (js/Error. "gateway serve --config FILE")))
+              (start! (js->clj (js/JSON.parse (.readFileSync fs file "utf8")) :keywordize-keys true)))
+    (println "murakumo gateway serve --config FILE — replicated fleet entrypoint")))

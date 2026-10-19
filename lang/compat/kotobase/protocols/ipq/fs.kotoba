@@ -1,0 +1,668 @@
+(ns kotobase.protocols.ipq.fs
+  "Read-only filesystem providers backed by one verified IPQ/1 selection.
+
+  The transport and representation boundaries stay separate:
+
+  * IPQ replays a selector against the returned CAR and verifies every CID.
+  * the named, versioned ADL turns the selected raw representation into a
+    logical filesystem snapshot;
+  * this namespace validates that logical value and exposes the existing
+    `:fs/browse` (wire 34) and `:fs/app-data` (wire 35) string contracts.
+
+  `find`, `grep`, and the other Kotoba commands therefore keep their existing
+  capability calls.  The host chooses this provider instead of a local-filesystem
+  provider; the guest never receives ambient network or block-store authority."
+  (:require [kotoba.lang.text :as str]
+            [ipld.car.bytes :as bytes]
+            [ipld.car.trustless :as trustless]
+            [ipld.schema :as schema]
+            [ipld.selector :as selector]
+            [kotobase.protocols.ipq :as ipq]
+            [multiformats.core :as mf]
+            ))
+
+(def ^:const browse-provider-id 34)
+(def ^:const app-data-provider-id 35)
+(def ^:const adl-name "KotobaFsSnapshot")
+
+(def ^:const adl-version
+  "The REPRESENTATION codec's version — what `ipld.schema` dispatches on.
+
+  Distinct from the snapshot's own `\"version\"` field below, which says how
+  the decoded logical value is shaped. Until 2026-09-23 one constant served
+  both, which read as if bumping the format would also bump the codec."
+  1)
+
+(def snapshot-versions
+  "The logical snapshot formats this reader accepts.
+
+  1 — every file's bytes are inline, as UTF-8 `text`.
+  2 — a file may instead NAME its bytes: `cid` + `size`.
+
+  Both are read. 1 is not deprecated and not a lesser form: for a tree that
+  fits in one block it is strictly better, because the answer is COMPLETE
+  when it arrives and there is nothing further to fetch. 2 exists because 1
+  cannot describe anything larger than a single IPQ response, which is a
+  ceiling on the TREE and not on the answer — measured 2026-09-23 against a
+  real site, 40.65 MiB across 600 documents against a 4 MiB budget, with no
+  arrangement of selectors that would have helped."
+  #{1 2})
+
+(def ^:const snapshot-write-version
+  "What a writer emits. Reading stays wider than writing on purpose."
+  2)
+
+(def ^:const default-cache-capacity 16)
+
+(def ^:const max-entries 4096)
+
+(def ^:const max-entry-nodes
+  "The most logical nodes ONE entry can occupy.
+
+  A referenced file entry is a map plus four keys and four values — nine. An
+  inline file is seven, a directory five. The budget has to admit the largest,
+  and this constant exists so the two ceilings cannot drift apart again.
+
+  They did drift. `:max-adl-output-nodes` was a literal 32,768, and when
+  version 2 added two keys to a file entry it silently became the binding
+  ceiling: measured 2026-09-23, a snapshot of 4,000 REFERENCED entries was
+  refused `:adl-output-nodes-exceeded` while `:max-entries` = 4,096 never got
+  to decide, and 4,000 INLINE entries mounted. That is the same failure the
+  note beside the old literal was written about the last time it happened,
+  which is the argument for deriving it rather than writing the answer down
+  again."
+  9)
+
+(def ^:const snapshot-wrapper-nodes
+  "The value AROUND the entries: the snapshot map, its two keys, the version
+   scalar, and the entries vector — five.
+
+  Left out of the first derivation, and the arithmetic missed by two: a
+  snapshot of exactly `max-entries` referenced entries needed 36,869 output
+  nodes against a budget of 36,864. Close enough to look like a rounding
+  argument, which is why it is written as a term instead."
+  5)
+
+(def limits
+  "The logical expansion budget after IPQ's own four traversal budgets.
+
+  ADL expansion is separately bounded because a small representation can
+  decode to a large logical value.
+
+  There are TWO content ceilings because there are two kinds of content and
+  they cost different things.
+
+  `:max-inline-content-bytes` bounds bytes that are ALREADY IN the block being
+  validated. By the time this ceiling is checked they have been fetched, held
+  and decoded, so it cannot usefully exceed IPQ/1's per-response ceiling — and
+  it is now DERIVED from it rather than restating the same literal, which is
+  what the previous docstring claimed while a second copy of 4194304 sat
+  underneath it.
+
+  `:max-referenced-bytes` bounds bytes a manifest ORDERS someone to fetch.
+  Those never sit in one response: they arrive one block at a time and land in
+  the disk cache, so what binds them is that cache rather than memory.
+  `fs-disk/max-cache-roots` keeps 16 materialized trees, so this value times
+  sixteen is the worst case on disk: 2 GiB. It is checkable from the manifest
+  ALONE, before the first fetch — which is the property worth having, because
+  a budget you can only discover by exhausting it has already cost you the
+  thing it was meant to protect.
+
+  It was 64 MiB for half a day, chosen from the cache arithmetic alone and
+  before anything had measured the tree it exists to admit. That tree —
+  kotoba.cloud's `public/` with the content-addressed block stores pruned,
+  which is what a remote audit needs — is 85,115,326 bytes across 737 files
+  in 1,368 entries. The entry count fit with room to spare and the byte
+  budget refused it by 27%. A ceiling derived from one true constraint can
+  still be the wrong number if nobody checked it against the case it was
+  for.
+
+  `:max-file-bytes` bounds ONE referenced file, because that block has to come
+  back inside one IPQ selection. Derived, for the same reason as the first."
+  {:max-entries max-entries
+   :max-inline-content-bytes (:max-bytes ipq/limits)
+   :max-referenced-bytes 134217728
+   :max-file-bytes (:max-bytes ipq/limits)
+   :adl {:max-depth 32
+         :max-nodes 16384
+         :max-adl-fuel 1000000
+         ;; Derived, so that `:max-entries` is the ceiling that DECIDES. A
+         ;; budget which refuses a snapshot before the declared entry limit
+         ;; can speak is not a second safeguard, it is the first one wearing
+         ;; someone else's name.
+         ;;
+         ;; ONE MORE than the limit, at the widest entry shape: the ADL
+         ;; expands before entries can be counted, so a snapshot that is over
+         ;; by one has to fit here in order to be refused as `:entry-limit`
+         ;; rather than as an expansion budget. Nine nodes of headroom buys
+         ;; the refusal its right name in both entry shapes.
+         :max-adl-output-nodes (+ snapshot-wrapper-nodes
+                                  (* (inc max-entries) max-entry-nodes))
+         :max-adl-output-bytes 4194304
+         :check-adl-determinism? true}})
+
+(def snapshot-selector-bytes
+  "Canonical selector for an IPQ filesystem snapshot: match the raw root."
+  (selector/encode {:selector :matcher}))
+
+(def ^:private compiled-snapshot-schema
+  (schema/compile-schema
+   {"types" {"Snapshot"
+             {"bytes" {"representation" {"advanced" adl-name}}}}
+    "advanced" {adl-name {"version" adl-version}}}))
+
+(defn- fail! [problem message data]
+  (throw (ex-info message (assoc data
+                                 :phase :ipq-fs
+                                 :problem problem))))
+
+(defn- utf8-byte-count [text]
+  )
+
+(defn- forbidden-path-text? [path]
+  (or (str/includes? path "\n")
+      (str/includes? path "\t")
+      (str/includes? path "EXISTS_SEP")
+      (str/includes? path "STAT_SEP")
+      (str/includes? path "RANGE_SEP")
+      (str/includes? path "WRITE_SEP")))
+
+(defn- canonical-path? [path]
+  (and (string? path)
+       (str/starts-with? path "/")
+       (or (= path "/") (not (str/ends-with? path "/")))
+       (not (forbidden-path-text? path))
+       (every? #(and (not= % "") (not= % ".") (not= % ".."))
+               (rest (str/split path #"/" -1)))))
+
+(defn- within-scope? [scope-root path]
+  (or (= path scope-root)
+      (and (not= scope-root "/")
+           (str/starts-with? path (str scope-root "/")))
+      (and (= scope-root "/") (str/starts-with? path "/"))))
+
+(defn- parent-path [path]
+  (when-not (= path "/")
+    (let [parts (str/split path #"/")]
+      (if (= 2 (count parts))
+        "/"
+        (apply str (interpose "/" (butlast parts)))))))
+
+(defn- base-name [path]
+  (last (str/split path #"/")))
+
+(def ^:private entry-shapes
+  "The exact key set of every admitted entry, and what each one means.
+
+  Exactness is the point: an entry carrying BOTH `text` and `cid` would be two
+  claims about the same bytes with no rule for which wins, so it is not a
+  supported shape rather than a shape with a tie-break."
+  {#{"path" "type"} :directory
+   #{"path" "type" "text"} :inline
+   #{"path" "type" "cid" "size"} :referenced})
+
+(def ^:private content-cid-pattern
+  "Raw CIDv1 over sha2-256, base32 — `bafkrei` + 52.
+
+  Narrow on purpose. This provider serves file BYTES, and that is the one
+  codec whose block IS the bytes; a dag-cbor or dag-pb CID names a structure
+  this namespace would have to interpret, and accepting one here would defer
+  the refusal to the moment somebody tried to read the file."
+  #"^bafkrei[a-z2-7]{52}$")
+
+(defn- entry-form [entry kind]
+  (let [form (get entry-shapes (set (keys entry)))]
+    (when (if (= kind "directory")
+            (= form :directory)
+            (contains? #{:inline :referenced} form))
+      form)))
+
+(defn- validate-entry! [scope-root version entry]
+  (when-not (map? entry)
+    (fail! :entry-not-map "IPQ filesystem entry must be a map" {:entry entry}))
+  (let [path (get entry "path")
+        kind (get entry "type")]
+    (when-not (contains? #{"directory" "file"} kind)
+      (fail! :unknown-entry-type "IPQ filesystem entry type is not supported"
+             {:path path :type kind}))
+    (let [form (entry-form entry kind)]
+      (when-not form
+        (fail! :entry-fields "IPQ filesystem entry fields are not exact"
+               {:path path :type kind :keys (set (keys entry))}))
+      (when-not (canonical-path? path)
+        (fail! :noncanonical-path "IPQ filesystem path is not canonical" {:path path}))
+      (when-not (within-scope? scope-root path)
+        (fail! :path-outside-scope "IPQ filesystem path is outside its mount scope"
+               {:scope-root scope-root :path path}))
+      (case form
+        :inline
+        (when-not (string? (get entry "text"))
+          (fail! :file-text-required "IPQ filesystem file content must be text"
+                 {:path path}))
+
+        :referenced
+        (do
+          ;; A version-1 reader would have refused this entry as
+          ;; `:entry-fields`, which is true but says the wrong thing. A
+          ;; snapshot that declares 1 and names content by CID is a WRITER
+          ;; that disagrees with itself, and that is worth its own name.
+          (when-not (contains? snapshot-versions version)
+            (fail! :snapshot-version "IPQ filesystem snapshot version is not supported"
+                   {:supported snapshot-versions :actual version}))
+          (when (= 1 version)
+            (fail! :referenced-entry-unsupported
+                   "IPQ filesystem snapshot version 1 cannot name content by CID"
+                   {:path path :version version}))
+          (when-not (and (string? (get entry "cid"))
+                         (re-matches content-cid-pattern (get entry "cid")))
+            (fail! :content-cid-form
+                   "IPQ filesystem content CID is not a raw CIDv1 over sha2-256"
+                   {:path path :cid (get entry "cid")}))
+          (let [size (get entry "size")]
+            (when-not (and (int? size) (<= 0 size (:max-file-bytes limits)))
+              (fail! :content-size
+                     "IPQ filesystem referenced file size is absent or out of range"
+                     {:path path :size size :maximum (:max-file-bytes limits)}))))
+
+        nil)
+      entry)))
+
+(defn- validate-snapshot! [scope-root value]
+  (when-not (and (map? value) (= #{"version" "entries"} (set (keys value))))
+    (fail! :snapshot-fields "IPQ filesystem snapshot fields are not exact"
+           {:keys (when (map? value) (set (keys value)))}))
+  (when-not (contains? snapshot-versions (get value "version"))
+    (fail! :snapshot-version "IPQ filesystem snapshot version is not supported"
+           {:supported snapshot-versions :actual (get value "version")}))
+  (let [version (get value "version")
+        entries (get value "entries")]
+    (when-not (vector? entries)
+      (fail! :entries-not-vector "IPQ filesystem entries must be a vector" {}))
+    (when (> (count entries) (:max-entries limits))
+      (fail! :entry-limit "IPQ filesystem snapshot exceeds the entry limit"
+             {:maximum (:max-entries limits) :actual (count entries)}))
+    (let [entries (mapv #(validate-entry! scope-root version %) entries)
+          by-path (into {} (map (juxt #(get % "path") identity)) entries)]
+      (when-not (= (count entries) (count by-path))
+        (fail! :duplicate-path "IPQ filesystem snapshot contains duplicate paths" {}))
+      (when-not (= "directory" (get-in by-path [scope-root "type"]))
+        (fail! :scope-root-required "IPQ filesystem scope root must be a directory"
+               {:scope-root scope-root}))
+      (doseq [entry entries
+              :let [path (get entry "path") parent (parent-path path)]
+              :when (not= path scope-root)]
+        (when-not (= "directory" (get-in by-path [parent "type"]))
+          (fail! :parent-directory-required
+                 "IPQ filesystem entry parent must exist and be a directory"
+                 {:path path :parent parent})))
+      ;; Counted apart, because they are two different bills. Inline bytes
+      ;; are already paid for; referenced bytes are an INSTRUCTION to fetch,
+      ;; and the whole reason to total them here — before a single block is
+      ;; asked for — is that a manifest which orders too much should be
+      ;; refused while refusing is still free.
+      (let [referenced (filterv #(= :referenced (entry-form % (get % "type"))) entries)
+            inline-bytes (transduce (comp (filter #(= :inline (entry-form % (get % "type"))))
+                                          (map #(utf8-byte-count (get % "text"))))
+                                    + 0 entries)
+            referenced-bytes (transduce (map #(get % "size")) + 0 referenced)]
+        (when (> inline-bytes (:max-inline-content-bytes limits))
+          (fail! :inline-content-limit
+                 "IPQ filesystem snapshot exceeds the inline content limit"
+                 {:maximum (:max-inline-content-bytes limits) :actual inline-bytes}))
+        (when (> referenced-bytes (:max-referenced-bytes limits))
+          (fail! :referenced-content-limit
+                 "IPQ filesystem snapshot names more content than one mount may fetch"
+                 {:maximum (:max-referenced-bytes limits) :actual referenced-bytes}))
+        {:by-path by-path
+         :referenced referenced
+         :referenced-bytes referenced-bytes}))))
+
+(defn- children-index
+  "parent path -> its entries, each list ordered by path.
+
+  Built from the FINAL entry map rather than alongside validation, so that a
+  mount which resolved referenced content indexes the resolved entries and
+  not the manifest rows they replaced."
+  [by-path]
+  (into {}
+        (map (fn [[parent children]]
+               [parent (vec (sort-by #(get % "path") children))]))
+        (reduce-kv (fn [index path entry]
+                     (if-let [parent (parent-path path)]
+                       (update index parent (fnil conj []) entry)
+                       index))
+                   {}
+                   by-path)))
+
+(defn- utf8-text [b]
+  )
+
+(defn- resolve-content!
+  "Referenced entries become inline entries, one verified block at a time.
+
+  Every block is checked three ways, and each failure has its own name
+  because each sends an operator somewhere different:
+
+    :content-block-missing   the port has no such block
+    :content-cid-mismatch    it answered with bytes that are not the ones named
+    :content-size-mismatch   the bytes are right and the manifest's size was not
+
+  The CID is RECOMPUTED here rather than taken from the port. A port that can
+  be asked for one CID and answer with other bytes is the entire reason
+  content addressing is worth anything; a resolver that skips the check has
+  quietly turned the CID back into a filename.
+
+  What comes out is the version-1 shape — `text`, no `cid`, no `size` — so
+  every consumer downstream (browse, stat, read, disk materialization) sees
+  one entry shape and needed no change to gain this. The identities are not
+  discarded: they move to the mount receipt, which is where a caller looks to
+  ask what was fetched."
+  [get-block referenced by-path]
+  (reduce
+   (fn [acc entry]
+     (let [path (get entry "path")
+           cid (get entry "cid")
+           declared (get entry "size")
+           block (get-block cid)
+           raw (when block (bytes/as-bytes (:bytes block)))]
+       (when-not raw
+         (fail! :content-block-missing
+                "IPQ filesystem content block was not provided" {:path path :cid cid}))
+       (when-not (= cid (mf/cidv1-raw raw))
+         (fail! :content-cid-mismatch
+                "IPQ filesystem content block does not match the CID it was asked for"
+                {:path path :cid cid}))
+       (let [actual (bytes/bcount raw)]
+         (when-not (= declared actual)
+           (fail! :content-size-mismatch
+                  "IPQ filesystem content block is not the size its manifest declared"
+                  {:path path :cid cid :declared declared :actual actual}))
+         ;; Invalid UTF-8 decodes to U+FFFD, three bytes where one stood, so
+         ;; the re-encoded length is strictly larger whenever replacement
+         ;; happened — an exact test on both runtimes, rather than a decoder
+         ;; flag only one of them has.
+         ;;
+         ;; What follows from it is a CLASSIFICATION, not a refusal. A
+         ;; filesystem snapshot that cannot hold a PNG is not describing
+         ;; filesystems, and the reason to refuse binary here was never the
+         ;; snapshot: it was wire 35, whose result type is a string. So the
+         ;; bytes are kept and the refusal moves to the one operation that
+         ;; genuinely cannot serve them — `app-data` :read. Everything else a
+         ;; caller does with a binary file (browse, EXISTS, STAT, and reading
+         ;; it off the materialized tree with ordinary tools, which is what
+         ;; ADR-2609063500 says agents do) works.
+         (let [text (utf8-text raw)]
+           (assoc acc path
+                  (if (= (utf8-byte-count text) actual)
+                    (-> entry (dissoc "cid" "size") (assoc "text" text))
+                    (-> entry (dissoc "cid" "size")
+                        (assoc "bytes" raw "encoding" "binary"))))))))
+   by-path
+   referenced))
+
+(defn- assert-request-path! [mount path]
+  (when-not (canonical-path? path)
+    (fail! :noncanonical-request-path "filesystem request path is not canonical"
+           {:path path}))
+  (when-not (within-scope? (:scope-root mount) path)
+    (fail! :request-outside-scope "filesystem request is outside the IPQ mount"
+           {:scope-root (:scope-root mount) :path path}))
+  path)
+
+(def ^:private mount-option-keys
+  ;; `:blocks` is AUTHORITY, not identity: it is deliberately absent from
+  ;; `cache-key` below, so two mounts of the same root are the same mount no
+  ;; matter which host port resolved their content.
+  #{:car-bytes :root :selector-bytes :scope-root :adl-capability :blocks})
+
+(defn- assert-mount-identity-options!
+  [{:keys [root scope-root adl-capability] :or {scope-root "/"} :as options}]
+  (when-not (every? mount-option-keys (keys options))
+    (fail! :unknown-option "IPQ filesystem mount options are not exact"
+           {:keys (set (keys options))}))
+  (when-not (and (string? root) (map? adl-capability))
+    (fail! :mount-identity
+           "IPQ filesystem mount identity requires root and ADL capability" {}))
+  (when-not (canonical-path? scope-root)
+    (fail! :scope-root "IPQ filesystem scope root is not canonical"
+           {:scope-root scope-root}))
+  options)
+
+(defn- assert-mount-options! [{:keys [car-bytes] :as options}]
+  (assert-mount-identity-options! options)
+  (when-not car-bytes
+    (fail! :mount-input "IPQ filesystem mount requires CAR bytes" {}))
+  options)
+
+(defn browse
+  "Wire-34 response for one directory in a mounted IPQ snapshot."
+  [mount path]
+  (assert-request-path! mount path)
+  (when-not (= "directory" (get-in mount [:entries path "type"]))
+    (fail! :not-directory "fs/browse target is not a directory" {:path path}))
+  (->> (get (:children-by-parent mount) path [])
+       (map (fn [entry]
+              (str (base-name (get entry "path")) "\t"
+                   (if (= "directory" (get entry "type")) "1" "0"))))
+       (str/join "\n")))
+
+(defn- strip-suffix [value suffix]
+  (subs value 0 (- (count value) (count suffix))))
+
+(defn- binary-entry? [entry]
+  (= "binary" (get entry "encoding")))
+
+(defn- entry-byte-count [entry]
+  (if (binary-entry? entry)
+    (bytes/bcount (get entry "bytes"))
+    (utf8-byte-count (get entry "text"))))
+
+(defn- stat-response [mount entry]
+  (str "0 " (if (= "file" (get entry "type"))
+               
+               0)
+       " 0 " (if (= "directory" (get entry "type")) "1" "0")))
+
+(defn app-data
+  "Wire-35 read/EXISTS/STAT response for a mounted IPQ snapshot.
+
+  The provider is intentionally read-only. RANGE and WRITE are refused by name
+  instead of being silently treated as path text; find and grep need full read,
+  EXISTS, and STAT only."
+  [mount request]
+  (let [[operation path]
+        (cond
+          (str/ends-with? request "EXISTS_SEP") [:exists (strip-suffix request "EXISTS_SEP")]
+          (str/ends-with? request "STAT_SEP") [:stat (strip-suffix request "STAT_SEP")]
+          (str/includes? request "RANGE_SEP") [:range request]
+          (str/includes? request "WRITE_SEP") [:write request]
+          :else [:read request])]
+    (when (contains? #{:range :write} operation)
+      (fail! :read-only-profile "IPQ filesystem provider does not admit this operation"
+             {:operation operation}))
+    (assert-request-path! mount path)
+    (let [entry (get (:entries mount) path)]
+      (case operation
+        :exists (if entry "1" "0")
+        :stat (if entry
+                (stat-response mount entry)
+                (fail! :not-found "fs/app-data STAT target does not exist" {:path path}))
+        :read (cond
+                (nil? entry) (fail! :not-found "fs/app-data target does not exist" {:path path})
+                (= "directory" (get entry "type"))
+                (fail! :is-directory "fs/app-data cannot read a directory" {:path path})
+                ;; Wire 35's result type is a string. A binary file is in the
+                ;; snapshot, is listed, and STATs correctly — it just cannot
+                ;; come back through THIS port, and says so rather than
+                ;; arriving as replacement characters that look like content.
+                (binary-entry? entry)
+                (fail! :binary-content
+                       "fs/app-data cannot read a binary file through a string provider"
+                       {:path path :bytes (entry-byte-count entry)})
+                :else )))))
+
+(declare mount default-mount)
+
+(defn provider-registry
+  "Exact provider descriptors accepted by Kotoba's reference runtime.
+
+  One argument accepts an already resolved mount. Two arguments are the default
+  host path: mount identity plus a zero-argument CAR fetch function, with the
+  process-bounded verified cache consulted before that function is called.
+
+  The numeric keys are the stable wire ids used by find, grep, cat, head, tail,
+  wc, sort, uniq, diff, awk, sed, stat, shasum, which, ls, du, and cp/rm reads."
+  ([mount]
+   {browse-provider-id {:request-type :string :result-type :string
+                        :invoke #(browse mount %)}
+    app-data-provider-id {:request-type :string :result-type :string
+                          :invoke #(app-data mount %)}})
+  ([identity-options fetch-car]
+   (provider-registry (default-mount identity-options fetch-car))))
+
+(defn create-mount-cache
+  "Create a bounded cache for already verified immutable mounts.
+
+  Cache instances are explicit so hosts choose the trust and lifetime boundary;
+  there is no process-global cache.  Eviction is FIFO and capacity is exact."
+  ([] (create-mount-cache default-cache-capacity))
+  ([capacity]
+   (when-not (and (integer? capacity) (pos? capacity))
+     (fail! :cache-capacity "IPQ filesystem mount cache capacity must be positive"
+            {:capacity capacity}))
+   {:format :kotobase.ipq/fs-mount-cache-v1
+    :capacity capacity
+    :state (atom {:order [] :mounts {}})}))
+
+(defn- cache-key [{:keys [root selector-bytes scope-root adl-capability]
+                   :or {selector-bytes snapshot-selector-bytes scope-root "/"}}]
+  ;; Capability identity belongs in the key.  The same ADL name/version does
+  ;; not prove that two host implementations have identical semantics.
+  [root (vec (bytes/as-bytes selector-bytes)) scope-root adl-capability])
+
+(defn- assert-cache! [cache]
+  (when-not (and (map? cache)
+                 (= :kotobase.ipq/fs-mount-cache-v1 (:format cache))
+                 (integer? (:capacity cache)) (pos? (:capacity cache))
+                 )
+    (fail! :mount-cache "IPQ filesystem mount cache is not valid" {}))
+  cache)
+
+(defn lookup-mount
+  "Look up a verified mount before fetching a CAR; return nil on cache miss.
+
+  `options` requires root and the same selector, scope, and exact ADL capability
+  that will be passed to `mount-cached`. `:car-bytes` is optional and ignored."
+  [cache options]
+  (assert-cache! cache)
+  (assert-mount-identity-options! options)
+  (when-let [cached (get-in @(:state cache) [:mounts (cache-key options)])]
+    (assoc-in 
+              [:receipt :cache] :hit)))
+
+(defn mount-cached
+  "Return a verified mount from an explicit bounded cache, or verify and cache it.
+
+  A hit deliberately does not replay the supplied CAR: the requested root is a
+  content identity and the cached value has already been verified under the same
+  selector, scope, and exact ADL capability.  Call `mount` when every supplied
+  CAR itself must be audited (for example to reject newly appended unused blocks)."
+  [cache options]
+  (assert-cache! cache)
+  (assert-mount-options! options)
+  (let [key (cache-key options)
+        state (:state cache)]
+    (if-let [cached (lookup-mount cache options)]
+      cached
+      (let [verified (mount options)]
+        (swap! state
+               (fn [{:keys [order mounts]}]
+                 (if (contains? mounts key)
+                   {:order order :mounts mounts}
+                   (let [order' (conj order key)
+                         mounts' (assoc mounts key verified)
+                         overflow (- (count order') (:capacity cache))
+                         evicted (if (pos? overflow) (subvec order' 0 overflow) [])]
+                     {:order (if (pos? overflow) (subvec order' overflow) order')
+                      :mounts (apply dissoc mounts' evicted)}))))
+        (assoc-in verified [:receipt :cache] :miss)))))
+
+(defn mount
+  "Verify an IPQ/1 CAR, decode its one raw match through the versioned ADL, and
+  return an immutable read-only filesystem mount.
+
+  Required options are `:car-bytes`, `:root`, and `:adl-capability`. Optional
+  `:selector-bytes` defaults to the root matcher and `:scope-root` defaults to
+  `/`. The ADL capability must declare version 1; production callers can pass
+  `ipld.schema/wasm-adl-capability`, while tests may use a pure capability.
+
+  Optional `:blocks` is a host-injected block port, `{:get (fn [cid] {:bytes
+  ...})}` — the same shape `ipq/handle` already takes, because it is the same
+  authority. A version-2 snapshot that names content by CID needs it and says
+  so by name (`:blocks-port-required`) rather than mounting into a tree whose
+  files turn out to be unreadable one call later. This namespace still has no
+  ambient network or block-store authority of its own: the host hands it a
+  port or it refuses."
+  [{:keys [car-bytes root selector-bytes scope-root adl-capability blocks]
+    :or {selector-bytes snapshot-selector-bytes scope-root "/"}
+    :as options}]
+  (assert-mount-options! options)
+  (let [replayed (trustless/replay-selection (bytes/as-bytes car-bytes)
+                                             root selector-bytes ipq/limits)
+        matches (:matches replayed)]
+    (when-not (empty? (:unused replayed))
+      (fail! :unused-blocks "IPQ filesystem CAR contains blocks outside its proof"
+             {:unused (:unused replayed)}))
+    (when-not (and (= 1 (count matches)) (= [] (:path (first matches))))
+      (fail! :snapshot-match "IPQ filesystem selector must match only the raw root"
+             {:matches (mapv :path matches)}))
+    (let [decoded (schema/representation->logical!
+                   compiled-snapshot-schema "Snapshot" (:value (first matches))
+                   (assoc (:adl limits) :adl-capabilities {adl-name adl-capability}))
+          {:keys [by-path referenced referenced-bytes]}
+          (validate-snapshot! scope-root (:logical-value decoded))
+          get-block (:get blocks)
+          _ (when (and (seq referenced) (not (fn? get-block)))
+              (fail! :blocks-port-required
+                     "IPQ filesystem snapshot names content by CID but no block port was given"
+                     {:referenced (count referenced) :referenced-bytes referenced-bytes}))
+          resolved (if (seq referenced)
+                     (resolve-content! get-block referenced by-path)
+                     by-path)]
+      (let [verified
+            {:format :kotobase.ipq/fs-mount-v1
+             :ipq-profile ipq/profile
+             :root root
+             :scope-root scope-root
+             :entries resolved
+             :children-by-parent (children-index resolved)
+             :receipt {:loaded (mapv :cid (:loaded replayed))
+                       :selector-bytes selector-bytes
+                       :adl-name adl-name
+                       :adl-version adl-version
+                       ;; What this mount fetched beyond its own root, by
+                       ;; path. Empty for a version-1 snapshot, and that is a
+                       ;; fact about the snapshot rather than a gap.
+                       :content-cids (into {} (map (juxt #(get % "path") #(get % "cid"))) referenced)
+                       :referenced-bytes referenced-bytes
+                       :adl-fuel-used (:adl-fuel-used decoded)
+                       :adl-determinism-checked? (:adl-determinism-checked? decoded)
+                       :adl-receipts (:adl-receipts decoded)}}]
+        ))))
+
+(defonce ^:private default-mount-cache
+  (create-mount-cache default-cache-capacity))
+
+(defn default-mount
+  "Resolve a mount through the default bounded cache, fetching only on miss.
+
+  `identity-options` carries root and the optional selector/scope plus the exact
+  ADL capability. `fetch-car` is a zero-argument function so network authority
+  stays with the host and is never invoked on a cache hit."
+  [identity-options fetch-car]
+  (assert-mount-identity-options! identity-options)
+  (when-not (fn? fetch-car)
+    (fail! :fetch-car "default IPQ filesystem mount requires a CAR fetch function" {}))
+  (or (lookup-mount default-mount-cache identity-options)
+      (mount-cached default-mount-cache
+                    (assoc identity-options :car-bytes (fetch-car)))))

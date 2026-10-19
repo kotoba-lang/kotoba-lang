@@ -1,0 +1,157 @@
+(ns kotoba.security.alert-delivery
+  "Pluggable sinks for continuous-monitoring v1 alerts (R-005 pager wiring).
+
+  Sinks (structured public alert maps only — never secrets):
+  - file:    write EDN+JSON under a directory (default always-on; canonical map)
+  - webhook: POST vendor-adapted JSON when KOTOBA_SECURITY_ALERT_WEBHOOK set
+  - stdout:  print pretty JSON (canonical map)
+
+  Vendor adapters (Slack Incoming Webhook / PagerDuty Events API v2 / generic)
+  live in kotoba.security.alert-adapters. Selection:
+    KOTOBA_SECURITY_ALERT_SINK=slack|pagerduty|generic
+    or URL heuristics (hooks.slack.com / events.pagerduty.com)
+    else generic (raw continuous-monitoring v1 map).
+
+  nbb/node helpers. CLI exit policy lives in scripts/emit-alert.cljk."
+  {:kotoba/export [alert->json build-alert default-file-dir deliver-all! deliver-file! deliver-stdout! deliver-sync-file-stdout! deliver-webhook! webhook-body]}
+  (:require ["node:fs" :as fs]
+            ["node:https" :as https]
+            ["node:http" :as http]
+            ["node:path" :as path]
+            ["node:url" :as url]
+            [kotoba.lang.text :as str]
+            [kotoba.security.alert-adapters :as aa]
+            [kotoba.security.key-lifecycle :as kl]))
+
+(defn alert->json
+  [alert-or-body]
+  (.stringify js/JSON (clj->js alert-or-body) nil 2))
+
+(defn- ensure-dir!
+  [dir]
+  (when-not (fs/existsSync dir)
+    (fs/mkdirSync dir #js {:recursive true})))
+
+(defn deliver-file!
+  "Write canonical alert as EDN + JSON under dir. Returns {:ok? true :sink :file ...}.
+  File sink is always the raw continuous-monitoring map (not vendor-shaped)."
+  [alert dir]
+  (ensure-dir! dir)
+  (let [id (or (:alert/id alert) "alert")
+        stem (-> id
+                 (str/replace #"[^a-zA-Z0-9._-]+" "-")
+                 (str/replace #"^-+" "")
+                 (str/replace #"-+$" ""))
+        edn-path (path/join dir (str stem ".edn"))
+        json-path (path/join dir (str stem ".json"))]
+    (fs/writeFileSync edn-path (pr-str alert))
+    (fs/writeFileSync json-path (alert->json alert))
+    (fs/appendFileSync (path/join dir "alerts.ndjson")
+                       (str (.stringify js/JSON (clj->js alert)) "\n"))
+    {:ok? true :sink :file :path edn-path :json-path json-path :dir dir}))
+
+(defn deliver-stdout!
+  [alert]
+  (println (alert->json alert))
+  {:ok? true :sink :stdout})
+
+(defn webhook-body
+  "Vendor-adapted body for webhook POST. Never invents secrets.
+
+  Uses KOTOBA_SECURITY_ALERT_SINK / URL heuristics / KOTOBA_SECURITY_PAGERDUTY_ROUTING_KEY."
+  [alert webhook-url]
+  (let [env (.-env js/process)
+        env-sink (some-> (.-KOTOBA_SECURITY_ALERT_SINK env) not-empty)
+        routing (some-> (.-KOTOBA_SECURITY_PAGERDUTY_ROUTING_KEY env) not-empty)
+        adapted (aa/adapt-alert alert {:url webhook-url
+                                       :env-sink env-sink
+                                       :routing-key routing})]
+    adapted))
+
+(defn deliver-webhook!
+  "POST vendor-adapted JSON alert to url. Returns a Promise of result map."
+  [alert webhook-url]
+  (js/Promise.
+   (fn [resolve]
+     (try
+       (let [{:keys [sink body]} (webhook-body alert webhook-url)
+             u (url/URL. webhook-url)
+             body-str (alert->json body)
+             body-buf (js/Buffer.from body-str "utf8")
+             is-https? (= "https:" (.-protocol u))
+             lib (if is-https? https http)
+             opts #js {:protocol (.-protocol u)
+                       :hostname (.-hostname u)
+                       :port (.-port u)
+                       :path (str (.-pathname u) (or (.-search u) ""))
+                       :method "POST"
+                       :headers #js {"Content-Type" "application/json"
+                                     "Content-Length" (str (.-length body-buf))
+                                     "User-Agent" "kotoba-security-emit-alert/1"}}
+             req (.request lib opts
+                           (fn [res]
+                             (let [chunks #js []]
+                               (.on res "data" (fn [c] (.push chunks c)))
+                               (.on res "end"
+                                    (fn []
+                                      (let [status (.-statusCode res)
+                                            ok? (and status (>= status 200) (< status 300))]
+                                        (resolve {:ok? ok?
+                                                  :sink :webhook
+                                                  :vendor sink
+                                                  :status status
+                                                  :host (.-hostname u)
+                                                  :path (.-pathname u)})))))))]
+         (.on req "error"
+              (fn [err]
+                (resolve {:ok? false
+                          :sink :webhook
+                          :vendor sink
+                          :error (str err)
+                          :host (try (.-hostname (url/URL. webhook-url))
+                                     (catch :default _ "invalid-url"))})))
+         (.write req body-buf)
+         (.end req))
+       (catch :default e
+         (resolve {:ok? false :sink :webhook :error (str e)}))))))
+
+(defn default-file-dir
+  "Prefer evidence/<date>/alerts under repo root when evidence/ exists; else /tmp."
+  [root date]
+  (if (and root (fs/existsSync (path/join root "evidence")))
+    (path/join root "evidence" date "alerts")
+    "/tmp/kotoba-security-alerts"))
+
+(defn build-alert
+  [opts]
+  (kl/emit-alert opts))
+
+(defn deliver-sync-file-stdout!
+  "Synchronous delivery for file + optional stdout. Returns results vector."
+  [alert {:keys [file-dir stdout?]}]
+  (cond-> [(deliver-file! alert file-dir)]
+    stdout? (conj (deliver-stdout! alert))))
+
+(defn deliver-all!
+  "Deliver to file (required by default), optional webhook, optional stdout.
+  Returns Promise {:ok? bool :results [...] :webhook-skipped? bool}."
+  [alert {:keys [file-dir stdout? webhook no-file?]
+          :or {stdout? false no-file? false}}]
+  (let [env-wh (or webhook
+                   (not-empty (.-KOTOBA_SECURITY_ALERT_WEBHOOK js/process.env)))
+        sync-results (cond-> []
+                       (not no-file?) (conj (deliver-file! alert file-dir))
+                       stdout? (conj (deliver-stdout! alert)))
+        webhook-skipped? (nil? env-wh)]
+    (if env-wh
+      (-> (deliver-webhook! alert env-wh)
+          (.then (fn [wh]
+                   (let [results (conj sync-results wh)
+                         any-ok? (boolean (some :ok? results))]
+                     {:ok? any-ok?
+                      :results results
+                      :webhook-skipped? webhook-skipped?}))))
+      (js/Promise.resolve
+       {:ok? (boolean (some :ok? sync-results))
+        :results sync-results
+        :webhook-skipped? webhook-skipped?}))))

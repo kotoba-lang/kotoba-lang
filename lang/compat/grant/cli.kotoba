@@ -1,0 +1,218 @@
+(ns grant.cli
+  "CLJC authority for the aiueos CLI contract, mirroring
+  `kotoba-lang/kotoba-lang`'s `kotoba.cli` pattern (ADR-2607022200) so aiueos
+  gets the same split: this namespace owns the command contract loading,
+  request shaping, and command result model; host binaries (the retired
+  Rust `aiueos/src/bin/aiueos.rs`, or any future JVM/Node/native launcher)
+  are adapters that consume `resources/aiueos/cli.edn` and
+  `grant.cli/dispatch` instead of defining command semantics
+  independently.
+
+  `command-result` takes ALREADY-PARSED EDN values (a manifest map, a
+  components vector, a policy overlay map -- never a bare file path):
+  reading `--policy foo.edn` off disk and handing this namespace the parsed
+  EDN is the host adapter's job, exactly like every other namespace in this
+  repo (`grant.contract`, `grant.broker`, ...) stays host-neutral. This
+  keeps `grant.cli` `.cljc`-portable (JVM/CLJS/kotoba-Wasm), not JVM-only.
+
+  Each command in `resources/aiueos/cli.edn` declares a `:coverage`:
+  - `:full` -- computed entirely here (`verify`, `inspect`, `surface`,
+    `audit`'s query shape).
+  - `:decision-only` -- the grant/deny decision is computed here
+    (`admit`, `run`, `up`); executing a `:grant`ed component is a native
+    host-adapter concern (ADR-2607022200 Layer 3), flagged via
+    `:aiueos/host-action :adapter-required`.
+  - `:adapter-only` -- no CLJC decision role (`sign`, `check`, `compile`,
+    `hash`, `image`, `vm`) -- `check`/`compile` delegate to
+    kototama/kotoba-clj (see `grant.broker`'s namespace docstring), `sign`
+    is key-custody tooling, `image`/`vm` are native provisioning."
+  (:require [kotoba.lang.text :as str]
+            [grant.broker :as broker]
+            [grant.graph :as graph]
+            [grant.policy :as policy]
+            [grant.surface :as surface]
+            
+            ))
+
+(def default-contract-resource
+  "Classpath resource that owns the aiueos CLI command contract."
+  "aiueos/cli.edn")
+
+(def required-commands
+  #{:verify :inspect :surface :audit :admit :run :up :sign :check :compile :hash :image :vm})
+
+(def coverage-kinds #{:full :decision-only :adapter-only})
+
+
+
+
+
+
+
+(defn- duplicate-set [xs]
+  (->> xs frequencies (filter (fn [[_ n]] (> n 1))) (map first) set))
+
+(defn- failure [code message data]
+  {:aiueos.cli/ok? false :aiueos.cli/code code :aiueos.cli/message message :aiueos.cli/data data})
+
+(defn- success [code data]
+  {:aiueos.cli/ok? true :aiueos.cli/code code :aiueos.cli/data data})
+
+(defn validate-contract
+  "Return a structured validation result for the aiueos CLI contract."
+  [contract]
+  (let [version (:aiueos.cli.contract/version contract)
+        coverage-labels (:aiueos.cli.contract/coverage-labels contract)
+        option-types (:aiueos.cli.contract/option-types contract)
+        commands (:aiueos.cli.contract/commands contract)
+        command-ids (mapv :id commands)
+        bad-coverage (remove #(contains? coverage-kinds (:coverage %)) commands)
+        errors (cond-> []
+                 (not (pos-int? version))
+                 (conj {:error :contract/version :expected :positive-int :actual version})
+
+                 (not (map? coverage-labels))
+                 (conj {:error :contract/coverage-labels})
+
+                 (not (map? option-types))
+                 (conj {:error :contract/option-types})
+
+                 (not (vector? commands))
+                 (conj {:error :contract/commands})
+
+                 (and (vector? commands) (not= required-commands (set command-ids)))
+                 (conj {:error :contract/command-set
+                        :expected required-commands :actual (set command-ids)})
+
+                 (seq (duplicate-set command-ids))
+                 (conj {:error :contract/duplicate-command :ids (duplicate-set command-ids)})
+
+                 (seq bad-coverage)
+                 (conj {:error :contract/coverage
+                        :ids (mapv :id bad-coverage)}))]
+    (if (seq errors)
+      (failure :contract/invalid "aiueos CLI contract is invalid" {:errors errors})
+      (success :contract/valid
+               {:version version
+                :commands command-ids
+                :command-count (count commands)
+                :option-count (count (mapcat :options commands))}))))
+
+(defn command-specs [contract]
+  (into {} (map (juxt :id identity)) (:aiueos.cli.contract/commands contract)))
+
+(defn commands-by-coverage
+  "Command ids grouped by `:coverage` (`:full`/`:decision-only`/`:adapter-only`)."
+  [contract]
+  (->> (:aiueos.cli.contract/commands contract)
+       (group-by :coverage)
+       (reduce-kv (fn [acc k v] (assoc acc k (set (map :id v)))) {})))
+
+;; ───────── computed commands (:full / :decision-only) ─────────
+
+(defn- verify-request [{:keys [aiueos/manifest aiueos/components aiueos/policy-overlay]}]
+  (let [eff-policy (policy/parse-policy policy-overlay)]
+    (if components
+      (broker/verify-system components eff-policy)
+      (broker/verify-one manifest (graph/build [manifest]) eff-policy))))
+
+(defn- inspect-request [{:keys [aiueos/components]}]
+  (let [g (graph/build components)]
+    {:aiueos/providers (graph/all-providers g)
+     :aiueos/boot-order (graph/boot-order components)
+     :aiueos/depths (graph/depths components)}))
+
+(defn- surface-request [{:keys [aiueos/surface-id]}]
+  (if-let [s (surface/by-id (name surface-id))]
+    {:aiueos/surface-id surface-id :aiueos/offered (surface/offered s)}
+    (failure :surface/unknown "unknown surface id" {:id surface-id})))
+
+(defn- audit-request
+  "Query/filter an already-loaded audit log. `:aiueos/audit-events` is the
+  host adapter's already-read log (e.g. via `grant.audit/read-log`) --
+  this namespace stays host-neutral and never reads the log file itself.
+  Optional `:aiueos/event`/`:aiueos/component` narrow the result, matching
+  the retired Rust `aiueos audit --event/--component` flags."
+  [{:keys [aiueos/audit-events aiueos/event aiueos/component]}]
+  {:aiueos/audit-events
+   (cond->> (or audit-events [])
+     event (filterv #(= event (:aiueos/event %)))
+     component (filterv #(= component (:aiueos/component %))))})
+
+(defn- decision-request
+  "Shared shape for `admit`/`run`/`up`: compute the grant/deny decision and
+  flag that executing a `:grant` still needs a host adapter."
+  [{:keys [aiueos/manifest aiueos/components aiueos/policy-overlay]} floor-fn]
+  (let [eff-policy (policy/parse-policy policy-overlay)
+        decision (if components
+                   (broker/verify-system components eff-policy)
+                   (let [m (cond-> manifest floor-fn floor-fn)]
+                     (broker/verify-one m (graph/build [m]) eff-policy)))]
+    (assoc decision :aiueos/host-action
+           (if (= :grant (:aiueos/decision decision)) :adapter-required nil))))
+
+;; ───────── dispatch ─────────
+
+(defn command-result
+  "Return the CLJC-authoritative result for `command-id` given `request` (a
+  map of already-parsed EDN values, see namespace docstring). Every result
+  carries `:aiueos.cli/command`."
+  [contract command-id request]
+  (let [spec (get (command-specs contract) command-id)]
+    (cond
+      (nil? spec)
+      (failure :command/unknown "unknown aiueos CLI command" {:command command-id})
+
+      (= command-id :verify) (assoc (verify-request request) :aiueos.cli/command command-id)
+      (= command-id :inspect) (assoc (inspect-request request) :aiueos.cli/command command-id)
+      (= command-id :surface) (assoc (surface-request request) :aiueos.cli/command command-id)
+      (= command-id :audit) (assoc (audit-request request) :aiueos.cli/command command-id)
+      (= command-id :admit) (assoc (decision-request request broker/floor-trust-for-admission)
+                                    :aiueos.cli/command command-id)
+      (contains? #{:run :up} command-id)
+      (assoc (decision-request request nil) :aiueos.cli/command command-id)
+
+      :else
+      {:aiueos.cli/ok? true
+       :aiueos.cli/command command-id
+       :aiueos.cli/coverage (:coverage spec)
+       :aiueos/summary (:summary spec)
+       :aiueos/request request
+       :aiueos/host-action :adapter-required})))
+
+(defn- normalize-option-id [s]
+  (keyword (str/replace s #"^--?" "")))
+
+(defn parse-argv
+  "Small data parser for host-neutral CLI args -- shapes argv into
+  `{:positionals [...] :options {...}}`. Mirrors `kotoba.cli/parse-argv`.
+  It is NOT a file reader: `:path`/`:edn`-typed option values stay strings
+  here; a host adapter resolves them to parsed EDN before calling
+  `command-result`."
+  [argv]
+  (loop [args (seq argv) positionals [] options {}]
+    (if-not args
+      {:positionals positionals :options options}
+      (let [arg (first args)]
+        (if (str/starts-with? arg "-")
+          (let [k (normalize-option-id arg)
+                more (next args)
+                v (first more)]
+            (if (or (nil? v) (str/starts-with? v "-"))
+              (recur more positionals (assoc options k true))
+              (recur (next more) positionals
+                     (update options k (fn [old]
+                                          (cond (nil? old) v
+                                                (vector? old) (conj old v)
+                                                :else [old v]))))))
+          (recur (next args) (conj positionals arg) options))))))
+
+(defn dispatch
+  "Dispatch a request as data using the CLJC authority. `argv` is used only
+  to name the command (`(first argv)`); the rest of `argv` and any file
+  reading is a host-adapter concern -- pass the resolved EDN as `request`.
+  `(dispatch contract [\"verify\"] {:aiueos/manifest m})`."
+  ([argv request] (dispatch  argv request))
+  ([contract argv request]
+   (let [command-id (some-> (first argv) keyword)]
+     (command-result contract command-id request))))

@@ -1,0 +1,236 @@
+(ns eth-crypto.core
+  "Standalone, dependency-free Ethereum crypto primitives: Keccak-256, EIP-55,
+  EIP-712 typed data, secp256k1 (sign / recover), RLP, and EIP-155 legacy +
+  EIP-1559 (type-2) transaction signing. No third-party dependencies on either
+  platform — only clojure.* + java.math.BigInteger under :clj, and js/BigInt
+  under :cljs.
+
+  PORTABILITY: the ENTIRE public API now works on BOTH :clj and :cljs. It did
+  not always — this file was :clj-only for its whole crypto half, with throwing
+  :cljs stubs, and the reasons were real rather than lazy. Recording what they
+  were and how each was closed, because the same traps apply to anyone porting
+  comparable code:
+
+      keccak256              Keccak-f[1600] needs REAL 64-bit lane ops (θ/ρ/π/χ/ι
+                             over 25×64-bit words), and cljs's bit-xor/bit-and/
+                             bit-shift-left compile to native JS bitwise
+                             operators, which ECMAScript defines on 32-BIT
+                             integers. Running the permutation with them would
+                             not fail to compile — it would silently truncate
+                             every lane and return a WRONG hash (wrong address,
+                             wrong selector, wrong signing digest, no error).
+                             CLOSED by eth-crypto.keccak, which carries lanes as
+                             js/BigInt (JS bitwise ops are defined on BigInt too).
+
+      secp256k1, RFC 6979    Needed java.math.BigInteger's modInverse/modPow for
+                             the EC point math, plus javax.crypto for HMAC.
+                             js/BigInt has arbitrary precision but NEITHER modular
+                             operation, and the browser's SubtleCrypto is async
+                             (which would make signing return a Promise and infect
+                             every caller). CLOSED by eth-crypto.secp256k1
+                             (extended Euclid + square-and-multiply) and
+                             eth-crypto.sha256 (pure-cljs SHA-256/HMAC — SHA-256
+                             is defined on 32-bit words, so unlike Keccak it is a
+                             natural fit for cljs).
+
+      EIP-712 values, RLP    Needed the above, plus a type-level distinction
+                             between a byte string and a list that vectors cannot
+                             express. CLOSED by eth-crypto.js-core; see its ns
+                             docstring for the byte-string representation and why
+                             RLP forces the question.
+
+  The two halves are held together by shared vectors, not by hope: the same
+  external references (the EIP-712 'Ether Mail' spec digest and signature, the
+  EIP-155 canonical worked example, viem's EIP-1559 vectors) gate both, so a
+  divergence turns one of the two suites red. Run the cljs side with
+  `kbb --backend sci --classpath src:test bin/run_tests.cljk`.
+
+  NOT CONSTANT-TIME, on either platform: BigInteger and BigInt arithmetic are
+  variable-time and `pt-mul` is a plain double-and-add. Fine for signing with a
+  key its owner controls; NOT suitable for a shared process signing for others.
+
+  KECCAK-256 IS NOT SHA3-256: this is Keccak-256 (the original Keccak
+  submission's pad10*1 padding — first pad byte 0x01, last byte |= 0x80), NOT the
+  NIST-finalized SHA3-256 (FIPS 202 padding, 0x06 domain-separated). Ethereum
+  uses the former. java.security's SHA3-256 provider (JDK 9+) implements the
+  LATTER and is NOT interchangeable, which is why Keccak-f[1600] is implemented
+  here directly rather than delegated to java.security.MessageDigest.
+
+  IMPLEMENTATION NOTE — why pure Clojure, not BouncyCastle (:clj side):
+  babashka is a GraalVM *native image*. It can only use Java classes baked into
+  the bb binary; arbitrary jars on the classpath are NOT loadable at runtime
+  (`java.security` exposes SHA3-256 but NOT Keccak-256, and any
+  `org.bouncycastle.*` import throws ClassNotFoundException). So Keccak-256 is
+  implemented here as the Keccak-f[1600] permutation, and secp256k1 ecrecover via
+  `java.math.BigInteger` (which IS available). Verified against the canonical
+  EIP-712 'Ether Mail' spec vector — see test/eth_crypto/test_eth_crypto.cljk.
+
+  Public API (all of it dual-platform):
+    keccak256           bytes -> 32 bytes (Keccak-256, NOT SHA3-256)
+    eip55-checksum      20-byte addr (or hex) -> EIP-55 mixed-case 0x string
+    encode-type / type-hash   EIP-712 canonical type string + its keccak
+    encode-data         types primary data -> ABI-encoded struct bytes
+    hash-struct         types primary data -> 32-byte hashStruct
+    domain-separator    domain-map -> 32-byte EIP712Domain hashStruct
+    eip712-digest       domain types primary message -> 32-byte signing digest
+    ecrecover           32-byte digest + 65-byte sig{r,s,v} -> 20-byte address
+    ecrecover-checksum  as above -> EIP-55 0x… string
+    private->public     32-byte privkey -> 64-byte uncompressed pubkey (no 0x04)
+    address-of-privkey  32-byte privkey -> EIP-55 0x… address
+    secp256k1-sign      privkey + digest -> {:r :s :recovery-id} (RFC 6979, low-s)
+    signature->bytes    {:r :s :recovery-id} -> 65-byte r‖s‖v
+    rlp-encode          byte-string / nested list -> canonical Ethereum RLP bytes
+    legacy-digest       tx -> 32-byte digest keccak(rlp(legacy payload))
+    sign-tx-legacy      tx + privkey -> 0x… raw signed EIP-155 legacy transaction
+    eip1559-digest      tx -> 32-byte digest keccak(0x02 || rlp(payload))
+    eip1559-raw         tx + {:r :s :recovery-id} -> 0x… raw signed type-2 tx
+    sign-tx-eip1559     tx + privkey -> 0x… raw signed EIP-1559 (type-2) transaction
+    raw-tx-hash         raw signed tx (hex/bytes) -> 0x… tx hash, pre-broadcast"
+  (:require [kotoba.lang.text :as str]
+            ;; cljs-only: the three namespaces that close the gaps which made
+            ;; this file's crypto half :clj-only (BigInt Keccak lanes, pure-cljs
+            ;; HMAC-SHA256 for RFC 6979, and modInverse/modPow for secp256k1).
+            ))
+
+;; ─── hex / byte helpers — PORTABLE (:clj + :cljs) ─────────────────────
+;; NOTE: ClojureScript has no `byte-array` (confirmed absent from cljs.core —
+;; unlike int-array/long-array/double-array/object-array, which ARE defined
+;; there), so :clj keeps a real byte-array/aset-byte representation and :cljs
+;; uses a plain vector of 0..255 ints. bytes->hex is representation-agnostic
+;; (works over either via `seq`+`bit-and`, no #?() needed).
+
+(defn strip0x ^String [^String s]
+  (if (str/starts-with? s "0x") (subs s 2) s))
+
+(defn hex->bytes
+  "0x-prefixed (or bare) hex string -> bytes. Returns a real byte-array under
+  :clj; returns a vector of 0..255 ints under :cljs (no byte-array there).
+  Throws on an odd-length hex string -- an odd number of hex digits is
+  never valid encoded byte data, and `(quot (count s) 2)` would otherwise
+  silently drop the trailing nibble instead of erroring."
+  [s]
+  (let [s (strip0x s)]
+    (when (odd? (count s))
+      (throw (ex-info "eth-crypto: odd-length hex string" {:s s})))
+    (let [n (quot (count s) 2)]
+      )))
+
+(def ^:private hex-digits "0123456789abcdef")
+
+(defn bytes->hex
+  "bytes (a :clj byte-array, or the :cljs vector-of-ints hex->bytes returns —
+  anything seq-able of 0..255/-128..127 ints works) -> lowercase hex string."
+  ^String [b]
+  (apply str
+         (mapcat (fn [x]
+                   (let [v (bit-and x 0xff)]
+                     [(nth hex-digits (bit-shift-right v 4))
+                      (nth hex-digits (bit-and v 0xf))]))
+                 (seq b))))
+
+(defn utf8
+  "UTF-8 bytes of a string. Real byte-array under :clj; vector of 0..255 ints
+  (via js/TextEncoder) under :cljs — same representation hex->bytes uses."
+  [^String s]
+  )
+
+;; ─── Keccak-256 (Keccak-f[1600], Ethereum padding — NOT SHA3) ─────────
+;; :clj-only — see ns docstring (64-bit lane ops; cljs bitwise ops are 32-bit
+;; and would silently corrupt the hash rather than fail to compile).
+
+ ;; end #?(:clj (do …)) — Keccak-256
+
+;; ClojureScript Keccak-256: 64-bit lanes on js/BigInt, in eth-crypto.keccak.
+;; The hazard the earlier stub warned about is real and is why that namespace
+;; exists rather than a naive port: cljs bit-and/bit-shift-left compile to native
+;; JS bitwise operators, which ECMAScript defines on 32-BIT integers, so running
+;; Keccak-f[1600]'s 64-bit permutation with them would not fail to compile — it
+;; would silently truncate every lane and return a wrong hash (a wrong address, a
+;; wrong selector, a wrong signing digest, no error anywhere).
+
+
+;; ─── EIP-55 checksum address — PORTABLE (pure string/hex logic) ──────
+;; Calls keccak256 (above), so on :cljs this compiles fine but throws at call
+;; time via keccak256's stub — only the HASH COMPUTATION is :clj-only, not
+;; this formatting logic.
+
+(def ^:private hex-val (zipmap (seq "0123456789abcdef") (range 16)))
+(def ^:private hex-upper (zipmap (seq "abcdef") (seq "ABCDEF")))
+
+(defn eip55-checksum
+  "EIP-55 mixed-case checksum of a 20-byte address (bytes, or a 0x/bare hex
+  string). Uppercases each hex letter of the lowercase address whose
+  corresponding keccak256(lowercase-address-string) hex nibble is >= 8."
+  ^String [addr]
+  (let [b (if (string? addr) (hex->bytes addr) addr)
+        lower (bytes->hex b)                          ; 40 lowercase hex chars
+        hash (bytes->hex (keccak256 (utf8 lower)))]
+    (apply str "0x"
+           (map (fn [i]
+                  (let [c (nth lower i)
+                        h (get hex-val (nth hash i))]
+                    (if (and (>= h 8) (contains? hex-upper c))
+                      (get hex-upper c)
+                      c)))
+                (range (count lower))))))
+
+;; ─── EIP-712 typed-data encoder ──────────────────────────────────────
+;; types : {typeName(str) [{:name str :type str} ...]}
+;; data  : {fieldName(str) value}
+;;
+;; encode-type/find-deps/type-hash (canonical type-string + its keccak) are
+;; PORTABLE (encode-type/find-deps are pure clojure.string; type-hash just
+;; calls the already-defined keccak256, :clj-only per above). Everything that
+;; encodes struct VALUES (uint->32, encode-field, encode-data, hash-struct,
+;; domain-separator, eip712-digest) needs java.math.BigInteger and is
+;; :clj-only, wrapped below.
+
+(defn- find-deps [types primary]
+  (let [seen (atom #{})]
+    (letfn [(go [t]
+              (when (and (contains? types t) (not (@seen t)))
+                (swap! seen conj t)
+                (doseq [{:keys [type]} (get types t)]
+                  (go (str/replace type #"\[.*\]" "")))))]
+      (go primary)
+      @seen)))
+
+(defn encode-type ^String [types primary]
+  (let [deps (disj (find-deps types primary) primary)
+        ordered (cons primary (sort deps))]
+    (apply str
+           (map (fn [t]
+                  (str t "("
+                       (str/join "," (map #(str (:type %) " " (:name %)) (get types t)))
+                       ")"))
+                ordered))))
+
+(defn type-hash [types primary]
+  (keccak256 (utf8 (encode-type types primary))))
+
+ ;; end #?(:clj (do …)) — EIP-712 values / secp256k1 / RLP / tx signing
+
+;; ClojureScript: the same public API, REAL (no longer throwing stubs).
+;;
+;; Implemented in three cljs-only namespaces this branch delegates to, because
+;; the two gaps that made this half :clj-only were specific and are now closed:
+;;   eth-crypto.keccak     — Keccak-f[1600] with 64-bit lanes on js/BigInt
+;;                           (JS bitwise ops are 32-bit and would have silently
+;;                           computed a WRONG hash — see the ns docstring above)
+;;   eth-crypto.sha256     — pure-cljs SHA-256 + HMAC-SHA256 for RFC 6979
+;;                           (javax.crypto has no cljs equivalent, and the
+;;                           browser's SubtleCrypto is async, which would make
+;;                           signing return a Promise and infect every caller)
+;;   eth-crypto.secp256k1  — point arithmetic + RFC 6979 + recovery, with
+;;                           modInverse/modPow implemented (BigInt has neither)
+;; plus eth-crypto.js-core for EIP-712 value encoding, RLP and tx assembly.
+;;
+;; Byte strings on this side are vectors of ints 0..255 at the public boundary
+;; (matching hex->bytes above), converted at the edge for the internals; see
+;; js-core's ns docstring for why RLP in particular needs a type-level
+;; distinction between a byte string and a list.
+;;
+;; Both halves are verified against the SAME external vectors — the EIP-712
+;; 'Ether Mail' spec digest and signature, the EIP-155 canonical worked example,
+;; and viem's EIP-1559 vectors — so a divergence turns one of the two suites red.
+

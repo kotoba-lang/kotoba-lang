@@ -1,0 +1,535 @@
+(ns kotoba.wasm.canonical-abi
+  "Checked Canonical ABI layout plans. This namespace describes transport;
+  it does not admit a descriptor for component emission by itself."
+  {:kotoba/export [export-plan layout layout-leaves profile string-encoding]}
+  (:require [kotoba.kir.value :as value]))
+
+(def profile :component-model/standard32-v1)
+(def string-encoding :utf8)
+
+(defn- reject [message data]
+  (throw (ex-info message (assoc data :phase :canonical-abi-layout))))
+
+(defn- align-up [value alignment]
+  (* alignment (quot (+ value (dec alignment)) alignment)))
+
+(declare layout*)
+
+(defn- discriminant-byte-size
+  "In-memory byte width of a variant discriminant for `case-count` cases,
+  mirroring the Component Model spec's `discriminant_type`: u8 up to 256
+  cases, u16 up to 65536, u32 beyond (`variant-case-limit` in
+  `kotoba.kir.value` keeps every admitted variant well under the u8
+  boundary today; the wider cases are implemented for spec fidelity, not
+  because anything in this codebase currently produces them)."
+  [case-count]
+  (cond (<= case-count 256) 1
+        (<= case-count 65536) 2
+        :else 4))
+
+(defn- join-core-type
+  "The Component Model spec's `join`: the single core wasm value type two
+  positions of two different variant cases' flattened payloads must share
+  when they occupy the same flat position. Identical types need no
+  coercion; an i32/f32 mismatch (a scalar/bool case sharing a position with
+  an f32 case) still fits in i32; every other mismatch (anything touching
+  i64 or f64 against a different type) widens to i64. This is intentionally
+  exactly the three-line spec function, not a superset or a subset of it."
+  [a b]
+  (cond (= a b) a
+        (= #{a b} #{:i32 :f32}) :i32
+        :else :i64))
+
+(defn- variant-flatten-payload
+  "Fold every case's own flat core-type sequence into one joined sequence,
+  left to right, matching `flatten_variant`'s loop: each case's own flat
+  types are compared position-by-position against whatever the fold has
+  already accumulated there (via `join-core-type`), and any position past
+  the fold's current length is simply appended. This is a component-level
+  flattening (the shape the guest receives as bare core wasm parameters),
+  distinct from the in-memory union layout `variant-layout` computes below
+  for the result area (see docstring there)."
+  [case-layouts]
+  (reduce
+   (fn [flat {:keys [layout]}]
+     (let [case-flat (:flat layout)]
+       (loop [index 0 acc flat]
+         (if (>= index (count case-flat))
+           acc
+           (let [core-type (nth case-flat index)]
+             (recur (inc index)
+                    (if (< index (count acc))
+                      (update acc index join-core-type core-type)
+                      (conj acc core-type))))))))
+   []
+   case-layouts))
+
+(defn- variant-layout
+  "Checked Canonical ABI layout for one sealed variant schema: an in-memory
+  union (discriminant byte width from `discriminant-byte-size`, aligned
+  payload area sized to the widest case, per `elem_size_variant`/
+  `alignment_variant` in the Component Model spec) used to plan the
+  indirect-result area, plus a component-level `:flat` core-value sequence
+  ([i32 discriminant] ++ `variant-flatten-payload`) used to plan the wasm
+  core function signature when this variant is a direct parameter or
+  result. Unlike a record, a variant's memory layout and its flat core
+  signature are genuinely different shapes (a union vs. a join), so both
+  are computed and kept side by side on the same layout map rather than
+  reusing one `:flat` for both purposes the way record layouts do."
+  [descriptor schemas visited]
+  (let [identity (second descriptor)
+        schema (get schemas identity)]
+    (when (contains? visited identity)
+      (reject "recursive schema has no bounded Canonical ABI layout"
+              {:descriptor descriptor :identity identity}))
+    (when-not (and (vector? schema) (= :variant (first schema)) (= identity (second schema)))
+      (reject "variant reference has no matching schema identity"
+              {:descriptor descriptor :schema schema}))
+    (let [cases (nth schema 2)
+          case-layouts (mapv (fn [[tag payload-type]]
+                               {:tag tag
+                                :layout (layout* payload-type schemas (conj visited identity))})
+                             cases)
+          discriminant-size (discriminant-byte-size (count cases))
+          payload-alignment (reduce max 1 (map (comp :alignment :layout) case-layouts))
+          payload-offset (align-up discriminant-size payload-alignment)
+          payload-size (reduce max 0 (map (comp :size :layout) case-layouts))
+          alignment (max discriminant-size payload-alignment)]
+      {:descriptor descriptor
+       :identity identity
+       :kind :variant
+       :cases case-layouts
+       :discriminant-size discriminant-size
+       :payload-offset payload-offset
+       :alignment alignment
+       :size (align-up (+ payload-offset payload-size) alignment)
+       :flat (into [:i32] (variant-flatten-payload case-layouts))})))
+
+(defn- record-layout [descriptor schemas visited]
+  (let [identity (second descriptor)
+        schema (get schemas identity)]
+    (when (contains? visited identity)
+      (reject "recursive schema has no bounded Canonical ABI layout"
+              {:descriptor descriptor :identity identity}))
+    (when-not (and (vector? schema) (= :record (first schema)) (= identity (second schema)))
+      (reject "record reference has no matching schema identity"
+              {:descriptor descriptor :schema schema}))
+    (let [fields (nth schema 2)
+          planned
+          (loop [remaining fields offset 0 alignment 1 result []]
+            (if-let [[field field-type] (first remaining)]
+              (let [field-layout (layout* field-type schemas (conj visited identity))
+                    field-offset (align-up offset (:alignment field-layout))]
+                (recur (next remaining)
+                       (+ field-offset (:size field-layout))
+                       (max alignment (:alignment field-layout))
+                       (conj result {:name field :offset field-offset :layout field-layout})))
+              {:fields result :alignment alignment :end offset}))]
+      {:descriptor descriptor
+       :identity identity
+       :size (align-up (:end planned) (:alignment planned))
+       :alignment (:alignment planned)
+       :flat (vec (mapcat (comp :flat :layout) (:fields planned)))
+       :fields (:fields planned)})))
+
+(defn- unit-case-layout
+  "The zero-size, zero-flat-core-values shape for a payload-less case, used
+  only by `option`'s `none` case in this file. No admitted top-level
+  descriptor produces this shape via `layout*` itself -- every real type in
+  this profile carries at least one flat core value and at least one byte of
+  size/alignment -- so it is synthesized locally here rather than routed
+  through `layout*`, exactly the way Component Model spec's own `unit` case
+  needs no payload type of its own."
+  []
+  {:size 0 :alignment 1 :flat []})
+
+(defn- structural-union-layout
+  "Shared discriminant+payload-area math for a structural (non-nominal)
+  union of `case-layouts` (each `{:tag :layout}`, the same shape
+  `variant-layout` builds its own `case-layouts` binding from), reusing
+  `discriminant-byte-size`/`variant-flatten-payload`/`join-core-type`
+  unchanged -- exactly `variant-layout`'s own union-of-cases math, minus the
+  `schemas` lookup, `identity`, and `visited`-set entry a *nominal* schema
+  needs. `option`/`result` are structural, not nominal (parallel to why
+  `:list` carries no schema-table identity of its own): the Component Model
+  spec defines `option<T>`/`result<T, E>` as anonymous type constructors, the
+  same way `list<T>` is, not sealed named types a caller registers once and
+  references by identity thereafter."
+  [case-layouts]
+  (let [discriminant-size (discriminant-byte-size (count case-layouts))
+        payload-alignment (reduce max 1 (map (comp :alignment :layout) case-layouts))
+        payload-offset (align-up discriminant-size payload-alignment)
+        payload-size (reduce max 0 (map (comp :size :layout) case-layouts))
+        alignment (max discriminant-size payload-alignment)]
+    {:discriminant-size discriminant-size
+     :payload-offset payload-offset
+     :alignment alignment
+     :size (align-up (+ payload-offset payload-size) alignment)
+     :flat (into [:i32] (variant-flatten-payload case-layouts))}))
+
+(defn- structural-product-layout
+  "Shared sequential offset/alignment fold for a structural (non-nominal)
+  fixed-length product of `element-layouts` (each an already-computed
+  `layout*` result, in declared positional order), factored out of
+  `record-layout`'s own per-field loop exactly the way `structural-union-layout`
+  above factors out `variant-layout`'s own discriminant/payload math for a
+  structural union -- `tuple` is structural, not nominal (parallel to why
+  `:list`/`:option`/`:result` carry no schema-table identity of their own):
+  the Component Model spec defines `tuple<T1, T2, ...>` as an anonymous type
+  constructor, the same way `list<T>`/`option<T>`/`result<T, E>` are, not a
+  sealed named type a caller registers once and references by identity
+  thereafter.
+
+  The result deliberately reuses the key name `:fields` (each entry
+  `{:offset :layout}`, positional -- no `:name`, unlike a record field's own
+  `{:name :offset :layout}`) rather than a bespoke key such as `:elements`:
+  `layout-leaves`'s existing nested-record recursion clause,
+  `(contains? layout :fields)`, only ever destructures `:offset`/`:layout`
+  from each entry and never depends on `:name` being present, so a tuple's
+  own layout is recursed into by that clause for free with **zero changes**
+  to `layout-leaves` (verified directly, see Evidence) -- exactly the
+  `record-layout`/`variant-layout`/`list-layout`/`option-layout`/
+  `result-layout` precedent of reusing an existing generic call site rather
+  than adding a new one. This reuse is the correct one (not a coincidental
+  key-name collision): a tuple, like a nested record and unlike a
+  variant/option/result, is a pure fixed-offset product with no discriminant,
+  so every element's own absolute offset is already the final answer for
+  flattening, the same reason a nested record's own `:fields` are recursed
+  into today."
+  [element-layouts]
+  (let [planned
+        (loop [remaining element-layouts offset 0 alignment 1 result []]
+          (if-let [element-layout (first remaining)]
+            (let [element-offset (align-up offset (:alignment element-layout))]
+              (recur (next remaining)
+                     (+ element-offset (:size element-layout))
+                     (max alignment (:alignment element-layout))
+                     (conj result {:offset element-offset :layout element-layout})))
+            {:fields result :alignment alignment :end offset}))]
+    {:size (align-up (:end planned) (:alignment planned))
+     :alignment (:alignment planned)
+     :flat (vec (mapcat (comp :flat :layout) (:fields planned)))
+     :fields (:fields planned)}))
+
+(defn- tuple-layout
+  "Checked Canonical ABI layout for a structural `[:tuple item-descriptor-1
+  item-descriptor-2 ... item-descriptor-n]` (the Component Model's
+  `tuple<T1, T2, ...>`): sugar over the same sequential offset/alignment fold
+  `record-layout` uses for a sealed record's fields, specialized to a
+  positional (unnamed), non-nominal fixed-length product -- structurally
+  exactly an anonymous record. `item-layouts` is kept alongside on the
+  returned map (the plain ordered layout sequence, no offset annotation),
+  exactly the reason `list-layout`/`option-layout`/`result-layout` keep their
+  own item/ok/err layout(s) alongside: so a caller can inspect any element's
+  own shape without re-deriving it from the descriptor or walking `:fields`.
+
+  Item count is bounded by `value/canonical-tuple-item-limit` (32, see that
+  constant's own docstring for why this magnitude and why its own name). At
+  least one item type is required -- an empty tuple has no admitted shape in
+  this slice, exactly as a sealed record requires at least one field
+  (`kotoba.kir.value`'s own `validate-value-type!` record-field check).
+
+  Each item descriptor may be any already-admitted Canonical ABI descriptor,
+  including another `:tuple`/`:option`/`:result`/`:list` -- recursively
+  re-entering `layout*` with `visited` threaded straight through unchanged (a
+  tuple carries no identity of its own to add), exactly as list/option/result
+  already do. Nesting a tuple inside a tuple is not rejected (contrast ADR
+  0065's deliberate list-of-list rejection): every level is still a single
+  fixed-size, fixed-offset product with no independent runtime-variable
+  length or stride of its own, so there is no genuinely-harder shape here to
+  guard against, the same reasoning ADR 0068 already gave for not rejecting
+  option-of-option/result-of-result."
+  [descriptor schemas visited]
+  (let [item-descriptors (vec (rest descriptor))]
+    (when (empty? item-descriptors)
+      (reject "tuple descriptor must have at least one item type"
+              {:descriptor descriptor}))
+    (when (> (count item-descriptors) value/canonical-tuple-item-limit)
+      (reject "tuple item count exceeds bound"
+              {:descriptor descriptor
+               :count (count item-descriptors)
+               :max value/canonical-tuple-item-limit}))
+    (let [item-layouts (mapv #(layout* % schemas visited) item-descriptors)]
+      (merge {:descriptor descriptor
+              :kind :tuple
+              :item-layouts item-layouts}
+             (structural-product-layout item-layouts)))))
+
+(defn- option-layout
+  "Checked Canonical ABI layout for a structural `[:option item-descriptor]`
+  (the Component Model's `option<T>`): sugar over the same union-of-cases
+  math `variant-layout` uses, specialized to exactly the two cases
+  `option<T>` always has -- a payload-less `none` (`unit-case-layout`) and a
+  `some` case carrying `item-descriptor`'s own recursive `layout*` result.
+  `item-layout` is kept alongside on the returned map (not discarded once
+  folded into `:flat`), exactly the reason `list-layout` keeps its own
+  `:item-layout` alongside: so a caller can derive the payload area's shape
+  or recurse into a nested record/variant/list/option/result item without
+  re-deriving it from the descriptor. `item-descriptor` may be any
+  already-admitted Canonical ABI descriptor, including another `:option`,
+  `:result`, or `:list` -- unlike `[:list [:list ...]]`, nesting an option or
+  result inside another one is not a genuinely harder shape (both sides are
+  still a single fixed-size union payload area, exactly the same recursive
+  shape a variant case whose own payload is another variant already has),
+  so no analogous rejection applies here. A `visited` guard is threaded
+  straight through into `item-descriptor`'s own `layout*` call unchanged, so
+  an item type reaching back to an *enclosing* record/variant's own identity
+  (including by way of an option) is still caught by that record/variant's
+  own existing recursion guard, exactly as `list-layout` already does."
+  [descriptor schemas visited]
+  (when-not (= 2 (count descriptor))
+    (reject "option descriptor must be exactly [:option item-descriptor]"
+            {:descriptor descriptor}))
+  (let [item-descriptor (second descriptor)
+        item-layout (layout* item-descriptor schemas visited)
+        case-layouts [{:tag :none :layout (unit-case-layout)}
+                      {:tag :some :layout item-layout}]]
+    (merge {:descriptor descriptor
+            :kind :option
+            :item-layout item-layout
+            :cases case-layouts
+            ;; Declarative obligation for a future codegen consumer, exactly
+            ;; the same "documents an obligation, nothing in this repository
+            ;; reads it programmatically" contract every other :validation
+            ;; tag in this file already has (confirmed by grep, see ADR).
+            ;; `variant-layout` itself carries no analogous tag for its own
+            ;; discriminant today -- a pre-existing gap this ADR does not
+            ;; also need to close, since it is out of this task's scope.
+            :validation [:bounded-discriminant]}
+           (structural-union-layout case-layouts))))
+
+(defn- result-layout
+  "Checked Canonical ABI layout for a structural `[:result ok-descriptor
+  err-descriptor]` (the Component Model's `result<T, E>`): sugar over the
+  same union-of-cases math `variant-layout` uses, specialized to exactly the
+  two cases `result<T, E>` always has -- `ok` carrying `ok-descriptor` and
+  `err` carrying `err-descriptor`. Both payload types are required (matching
+  `kotoba.kir.value`'s own domain-level `[:result T E]` descriptor
+  shape at `validate-value-type!`, which also always requires both types
+  present); the Component Model spec's optional-payload `result<>`/
+  `result<T>`/`result<_, E>` shapes are not admitted by this slice, matching
+  this task's own scope boundary. `ok-layout`/`err-layout` are kept
+  alongside on the returned map for the same reason `list-layout` keeps its
+  own `:item-layout` and `option-layout` keeps its own `:item-layout`: so a
+  caller can recurse into either payload's own shape without re-deriving it
+  from the descriptor. Either descriptor may be any already-admitted
+  Canonical ABI descriptor, including another `:option`/`:result`/`:list`;
+  see `option-layout`'s docstring for why no list-of-list-style rejection
+  applies to nesting a union inside a union. `visited` is threaded straight
+  through into both payload types' own `layout*` calls unchanged, exactly as
+  `option-layout`/`list-layout` already do."
+  [descriptor schemas visited]
+  (when-not (= 3 (count descriptor))
+    (reject "result descriptor must be exactly [:result ok-descriptor err-descriptor]"
+            {:descriptor descriptor}))
+  (let [ok-descriptor (second descriptor)
+        err-descriptor (nth descriptor 2)
+        ok-layout (layout* ok-descriptor schemas visited)
+        err-layout (layout* err-descriptor schemas visited)
+        case-layouts [{:tag :ok :layout ok-layout}
+                      {:tag :err :layout err-layout}]]
+    (merge {:descriptor descriptor
+            :kind :result
+            :ok-layout ok-layout
+            :err-layout err-layout
+            :cases case-layouts
+            :validation [:bounded-discriminant]}
+           (structural-union-layout case-layouts))))
+
+(defn- list-layout
+  "Checked Canonical ABI layout for a bounded `[:list item-descriptor]`: a
+  pointer+length pair in linear memory, the same two-core-value `[:i32 :i32]`
+  shape ADR 0040/0041 already gave bare `string`/`keyword` parameters and
+  results, generalized from a byte-addressed buffer (length in UTF-8 bytes)
+  to an element-addressed one (length in items). `item-layout` is the item
+  descriptor's own recursive `layout*` result, kept alongside (not flattened
+  away) so a caller can derive the buffer's per-element stride
+  (`align-up` of the item's own `:size` to its own `:alignment`) and recurse
+  into a nested record/variant item without re-deriving its shape from the
+  descriptor -- exactly how a record field's own nested `:fields`/`:cases`
+  layout is kept alongside today. Item count is bounded by
+  `value/canonical-list-item-limit`, exposed here as `:max-items` (the same
+  role `:max-bytes` plays for a bounded string/keyword) so callers can tell a
+  list leaf apart from a plain scalar leaf or a string/keyword leaf without
+  re-deriving it from the descriptor; the corresponding `:validation` tag is
+  `:bounded-item-count`, alongside the same `:checked-pointer-range` tag
+  every other indirect (pointer-bearing) leaf already carries. Nested lists
+  additionally share `value/canonical-list-total-item-limit` across the
+  complete active graph; exposing it as `:max-total-items` prevents a caller
+  from accidentally multiplying the per-node bound at each depth.
+
+  An item type that is itself a recursive nominal schema (a record/variant that
+  reaches back to an identity already in `visited`, including by way of a
+  list) is still caught by `record-layout`/`variant-layout`'s own existing
+  recursion guard: `visited` is threaded straight through unchanged, exactly
+  as a record field or variant case payload's own type already does."
+  [descriptor schemas visited]
+  (let [item-descriptor (second descriptor)
+        item-layout (layout* item-descriptor schemas visited)]
+      {:descriptor descriptor
+       :size 8
+       :alignment 4
+       :flat [:i32 :i32]
+       :item-layout item-layout
+       :max-items value/canonical-list-item-limit
+       :max-total-items value/canonical-list-total-item-limit
+       :validation [:checked-pointer-range :bounded-item-count
+                    :bounded-total-item-count]}))
+
+(defn- layout* [descriptor schemas visited]
+  (cond
+    (= descriptor :i64) {:descriptor :i64 :size 8 :alignment 8 :flat [:i64]}
+    (= descriptor :f32) {:descriptor :f32 :size 4 :alignment 4 :flat [:f32]}
+    (= descriptor :f64) {:descriptor :f64 :size 8 :alignment 8 :flat [:f64]}
+    (= descriptor :bool) {:descriptor :bool :size 1 :alignment 1 :flat [:i32]
+                          :validation [:canonical-bool]}
+    (= descriptor :string) {:descriptor :string
+                            :size 8
+                            :alignment 4
+                            :flat [:i32 :i32]
+                            :encoding string-encoding
+                            :max-bytes value/string-value-byte-limit
+                            :validation [:checked-pointer-range :valid-utf8]}
+    (= descriptor :keyword) {:descriptor :keyword
+                             :size 8
+                             :alignment 4
+                             :flat [:i32 :i32]
+                             :encoding string-encoding
+                             :max-bytes value/keyword-value-byte-limit
+                             :validation [:checked-pointer-range :valid-utf8]}
+    (= descriptor :symbol) {:descriptor :symbol
+                            :size 8
+                            :alignment 4
+                            :flat [:i32 :i32]
+                            :encoding string-encoding
+                            :max-bytes value/symbol-value-byte-limit
+                            :validation [:checked-pointer-range :valid-utf8
+                                         :valid-symbol-source]}
+    (= descriptor :vector-i64)
+    (assoc (list-layout [:list :i64] schemas visited)
+           :descriptor :vector-i64)
+    (= descriptor :vector-f64)
+    (assoc (list-layout [:list :f64] schemas visited)
+           :descriptor :vector-f64)
+    (and (vector? descriptor) (= :ref (first descriptor)))
+    (let [schema (get schemas (second descriptor))]
+      (if (and (vector? schema) (= :variant (first schema)))
+        (variant-layout descriptor schemas visited)
+        (record-layout descriptor schemas visited)))
+    (and (vector? descriptor) (= :record (first descriptor)))
+    (let [identity (second descriptor)]
+      (when-not (= descriptor (get schemas identity))
+        (reject "inline record differs from sealed schema identity"
+                {:descriptor descriptor :schema (get schemas identity)}))
+      (assoc (record-layout [:ref identity] schemas visited) :descriptor descriptor))
+    (and (vector? descriptor) (= :variant (first descriptor)))
+    (let [identity (second descriptor)]
+      (when-not (= descriptor (get schemas identity))
+        (reject "inline variant differs from sealed schema identity"
+                {:descriptor descriptor :schema (get schemas identity)}))
+      (assoc (variant-layout [:ref identity] schemas visited) :descriptor descriptor))
+    (and (vector? descriptor) (= :list (first descriptor)))
+    (list-layout descriptor schemas visited)
+    ;; Sets lower as Component Model lists (same pointer+length ABI). Item
+    ;; count uses typed-set-item-limit (32), not the list bound (16384) —
+    ;; matching kotoba.kir.value's set domain. Required for log-v1 fields/
+    ;; entries which are [:set record] in the capability kit.
+    (and (vector? descriptor) (= :set (first descriptor)))
+    (assoc (list-layout [:list (second descriptor)] schemas visited)
+           :descriptor descriptor
+           :max-items value/typed-set-item-limit
+           :max-total-items value/typed-set-item-limit)
+    (and (vector? descriptor) (= :option (first descriptor)))
+    (option-layout descriptor schemas visited)
+    (and (vector? descriptor) (= :result (first descriptor)))
+    (result-layout descriptor schemas visited)
+    (and (vector? descriptor) (= :tuple (first descriptor)))
+    (tuple-layout descriptor schemas visited)
+    :else
+    (reject "descriptor has no qualified Canonical ABI layout"
+            {:descriptor descriptor})))
+
+(defn layout
+  "Return the closed standard32 memory and flat-value layout for one admitted
+  descriptor. Aggregate descriptors are added only with matching lift/lower
+  implementations."
+  ([descriptor] (layout descriptor {}))
+  ([descriptor schemas] (layout* descriptor schemas #{})))
+
+(defn layout-leaves
+  "Flatten one record layout (as returned by `layout`) into an ordered list
+  of leaves, in the same left-to-right depth-first order as the layout's own
+  `:flat` vector. A field whose own layout is itself a nested record layout
+  (that is, it carries a `:fields` key) is recursed into so every nested leaf
+  gets its own absolute store/load offset; this is how one level of nested
+  aggregate lowering reuses the same flat-scalar codegen as a plain record.
+  A field whose own layout is a bounded `tuple` (also carries a `:fields` key,
+  `structural-product-layout`'s own positional `{:offset :layout}` entries)
+  is recursed into by this same clause with no dedicated branch of its own:
+  a tuple is a pure fixed-offset product exactly like a nested record, so
+  every element's own absolute offset is already the final answer for
+  flattening, unlike a list/option/result whose payload interpretation is
+  either runtime-length (list) or discriminant-gated (option/result).
+  A field whose own layout is a bounded `string`/`keyword` (carries a
+  `:max-bytes` key, the same pointer+length linear-memory shape ADR 0040/0041
+  already gave bare string parameters/results) is exposed as
+  `{:offset :descriptor :max-bytes}` instead of the plain scalar leaf's
+  `{:offset :descriptor}`, so callers can tell a two-core-value pointer+length
+  leaf from a one-core-value scalar leaf without re-deriving it from the
+  descriptor. A field whose own layout is a bounded `list` (carries a
+  `:max-items` key, the pointer+length shape `list-layout` above gives a
+  bounded `[:list ...]`) is likewise exposed as its own leaf shape,
+  `{:offset :descriptor :max-items :item-layout}`, rather than being
+  recursed into the way a nested record's `:fields` are: a list's own items
+  live in a separately-addressed buffer at a length only known at runtime,
+  not at a further fixed offset inside this record's own layout, so there is
+  nothing further to flatten here -- `:item-layout` is carried on the leaf
+  itself so a caller can still derive the item stride/shape without
+  re-deriving it from the descriptor. Every consumer must still bound
+  nesting depth before calling this (`layout` itself only rejects unbounded
+  recursive schemas, not depth generally)."
+  ([record-layout] (layout-leaves record-layout 0))
+  ([record-layout base-offset]
+   (vec
+    (mapcat (fn [{:keys [offset layout]}]
+              (let [absolute (+ base-offset offset)]
+                (cond
+                  (contains? layout :fields)
+                  (layout-leaves layout absolute)
+
+                  (contains? layout :max-bytes)
+                  [{:offset absolute :descriptor (:descriptor layout)
+                    :max-bytes (:max-bytes layout)}]
+
+                  (contains? layout :max-items)
+                  [{:offset absolute :descriptor (:descriptor layout)
+                    :max-items (:max-items layout)
+                    :max-total-items (:max-total-items layout)
+                    :item-layout (:item-layout layout)}]
+
+                  :else
+                  [{:offset absolute :descriptor (:descriptor layout)}])))
+            (:fields record-layout)))))
+
+(defn export-plan
+  "Plan the standard32 core signature and result-area contract for one KIR
+  export. Multi-flat results use the Canonical ABI indirect-result convention."
+  ([function] (export-plan function {}))
+  ([{:keys [name params param-types result]} schemas]
+  (when-not (= (count params) (count param-types))
+    (reject "parameter names and types differ in arity"
+            {:function name :params (count params) :types (count param-types)}))
+  (let [parameter-layouts (mapv #(layout % schemas) param-types)
+        result-layout (layout result schemas)
+        result-flat (:flat result-layout)
+        indirect-result? (> (count result-flat) 1)]
+    {:profile profile
+     :function name
+     :parameters (mapv (fn [parameter abi-layout]
+                         {:name parameter :layout abi-layout})
+                       params parameter-layouts)
+     :core-params (vec (mapcat :flat parameter-layouts))
+     :result-layout result-layout
+     :indirect-result? indirect-result?
+     :core-results (if indirect-result? [:i32] result-flat)
+     :post-return-params (if indirect-result? [:i32] result-flat)})))

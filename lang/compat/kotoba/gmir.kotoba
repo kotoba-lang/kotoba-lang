@@ -1,0 +1,1215 @@
+(ns kotoba.gmir
+  "Closed target-independent Generic Machine IR contract."
+  {:kotoba/export [max-arity capability-kinds function-id? i64-value? instruction-keysets kernel-atomic-ops kernel-dequant-dot-block-limit kernel-dequant-dot-formats kernel-dequant-dot-maximum kernel-dequant-dot-operations kernel-dot-f32-element-limit kernel-dot-f32-maximum kernel-window-maxima kernel-window-operations label? rodata-alignment rodata-bytes rodata-content? rodata-encodings runtime-operation-arities slice-item-limit slice-operations supported-versions validate! version vreg vreg? x86-privileged-action-arities]})
+
+(def version 3)
+(def supported-versions #{1 2 3})
+
+(defn- reject! [problem instruction]
+  (throw (ex-info (str "GMIR rejected: " (name problem))
+                  {:phase :gmir :problem problem :instruction instruction})))
+
+;; How many arguments a function may take and a call may pass. Five was the
+;; number of registers the native call convention passes arguments in; beyond
+;; that the native backends pass them on the stack (kotoba-native, 2026-09-23),
+;; so the register count is no longer the language's arity. Still a bound:
+;; admission is finite, and this is the one every layer below agrees on.
+(def max-arity 64)
+
+(defn vreg
+  "Construct a canonical virtual-register identifier."
+  [index]
+  (when-not (and (integer? index) (not (neg? index)))
+    (reject! :invalid-virtual-register-index {:index index}))
+  (keyword "kotoba.gmir.vreg" (str index)))
+
+(defn vreg? [value]
+  (and (keyword? value)
+       (= "kotoba.gmir.vreg" (namespace value))
+       (boolean (re-matches #"(?:0|[1-9][0-9]*)" (name value)))))
+
+(defn label? [value]
+  (and (keyword? value) (some? (namespace value))))
+
+(defn i64-value?
+  "True for an exact signed i64 on the current host."
+  [value]
+  )
+
+(def instruction-keysets
+  {:gmir/argument #{:gmir/op :gmir/dst :gmir/index}
+   :gmir/constant #{:gmir/op :gmir/dst :gmir/value}
+   :gmir/data-address #{:gmir/op :gmir/dst :gmir/content}
+   ;; boot-lit: the address of a read-only literal the backend places in the
+   ;; code image itself. `:gmir/data-address` above is NOT this operation:
+   ;; that one names a UTF-8 string the value runtime pairs with a length and
+   ;; resolves against a runtime base, and it is the string-literal half of a
+   ;; managed value. This one is the address of raw bytes with no runtime
+   ;; behind it at all -- what a firmware call needs when it takes a
+   ;; `CHAR16 *` or an `EFI_GUID *`.
+   :gmir/rodata-address #{:gmir/op :gmir/dst :gmir/content
+                          :gmir/rodata-encoding}
+   ;; boot-scratch: the address of a FUNCTION in this same module, which is
+   ;; what `:jump-to` has always needed and nothing produced. Its own
+   ;; instruction rather than a privileged action, for the reason
+   ;; `:rodata-address` is: the operand is a NAME, not a virtual register, and
+   ;; every privileged action's arguments are vregs by the time a backend sees
+   ;; them. `:gmir/function` is a `function-id?` symbol, the same shape
+   ;; `:gmir/callee` carries, and a v3 module resolves it against its own
+   ;; function list exactly as it resolves a callee.
+   :gmir/function-address #{:gmir/op :gmir/dst :gmir/function}
+   :gmir/add #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/subtract #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/multiply #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/quotient #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/bit-and #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/bit-or #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/bit-xor #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/shift-left #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/shift-right-signed #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/shift-right-unsigned #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f64-add #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f64-subtract #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f64-multiply #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f64-divide #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f64-min #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f64-max #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f64-sqrt #{:gmir/op :gmir/dst :gmir/input}
+   :gmir/f64-equal #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f64-less-than #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f64-less-or-equal #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f64-greater-than #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f64-greater-or-equal #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f64-unordered #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   ;; f32: binary32, the parallel family
+   ;; (kotoba-lang docs/adr/ADR-kotoba-floating-point-on-native.md).
+   ;;
+   ;; Same operand shapes as the f64 family above and the same one-word vreg --
+   ;; an f32 travels as its binary32 pattern SIGN-EXTENDED from bit 31, which is
+   ;; still one machine word and needs no new value kind here.
+   ;;
+   ;; TWO f64 members have no f32 twin, and their absence is the decision rather
+   ;; than an omission: x86's MINSS/MAXSS return the SECOND operand when either
+   ;; input is NaN, while AArch64's FMIN/FMAX and the KIR oracle's Math/min
+   ;; return the NaN. `:gmir/f64-min`/`:gmir/f64-max` above therefore already
+   ;; mean two different things on the two targets; that is recorded upstream
+   ;; and not repaired here, and this width does not inherit it.
+   :gmir/f32-add #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f32-subtract #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f32-multiply #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f32-divide #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f32-sqrt #{:gmir/op :gmir/dst :gmir/input}
+   :gmir/f32-equal #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f32-less-than #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f32-less-or-equal #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f32-greater-than #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f32-greater-or-equal #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/f32-unordered #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   ;; Width conversions. Only the four on which both ISAs and the KIR oracle
+   ;; agree for EVERY input: widening is exact and total, narrowing is
+   ;; round-to-nearest-even with overflow to an infinity, and every i64 has a
+   ;; defined image at both widths. The `-checked` conversions trap in the
+   ;; oracle and no backend emits that check; the truncating float-to-int ones
+   ;; have THREE answers out of domain (x86 yields the integer indefinite value,
+   ;; AArch64 saturates, the oracle traps). Neither family is declared here,
+   ;; because an operation that cannot mean one thing is not an operation.
+   :gmir/f32-to-f64 #{:gmir/op :gmir/dst :gmir/input}
+   :gmir/f64-to-f32 #{:gmir/op :gmir/dst :gmir/input}
+   :gmir/i64-to-f32 #{:gmir/op :gmir/dst :gmir/input}
+   :gmir/i64-to-f64 #{:gmir/op :gmir/dst :gmir/input}
+   :gmir/kernel-load-u8 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                          :gmir/index :gmir/maximum}
+   :gmir/kernel-store-u8 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                           :gmir/index :gmir/stored :gmir/maximum}
+   :gmir/kernel-load-u32 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                           :gmir/index :gmir/maximum}
+   :gmir/kernel-store-u32 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                            :gmir/index :gmir/stored :gmir/maximum}
+   ;; memwidth: the two remaining MMIO transfer widths. A device register file
+   ;; is not all bytes and words -- 16-bit is what a PCI vendor/device ID pair
+   ;; and most legacy device registers are, and 64-bit is what a descriptor
+   ;; ring pointer is. They carry EXACTLY the fields their u8/u32 siblings do,
+   ;; because the only thing that differs is how many bytes the access moves;
+   ;; the width lives in the operation name, the way it already does for the
+   ;; two that were here first.
+   :gmir/kernel-load-u16 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                           :gmir/index :gmir/maximum}
+   :gmir/kernel-store-u16 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                            :gmir/index :gmir/stored :gmir/maximum}
+   :gmir/kernel-load-u64 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                           :gmir/index :gmir/maximum}
+   :gmir/kernel-store-u64 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                            :gmir/index :gmir/stored :gmir/maximum}
+   ;; memwidth: the slice family (amu ADR 0285). Same four sources, and
+   ;; deliberately the same keyset, so nothing downstream has to learn a new
+   ;; instruction SHAPE. Two things differ and neither is a field:
+   ;;
+   ;;   * `:gmir/index` counts ELEMENTS, not bytes, and the backend scales it
+   ;;     into the addressing mode. `:gmir/length` counts elements too.
+   ;;   * `:gmir/maximum` is `slice-item-limit`, which is an address-space
+   ;;     bound rather than a window profile. ADR 0285's whole point is that
+   ;;     the carrier does not go through the vector arena and therefore is
+   ;;     not bounded by `vector-item-limit`; a 10 GiB model region is a
+   ;;     legitimate slice and 16384 is not its ceiling.
+   :gmir/slice-load-u8 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                         :gmir/index :gmir/maximum}
+   :gmir/slice-store-u8 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                          :gmir/index :gmir/stored :gmir/maximum}
+   :gmir/slice-load-u16 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                          :gmir/index :gmir/maximum}
+   :gmir/slice-store-u16 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                           :gmir/index :gmir/stored :gmir/maximum}
+   :gmir/slice-load-u32 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                          :gmir/index :gmir/maximum}
+   :gmir/slice-store-u32 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                           :gmir/index :gmir/stored :gmir/maximum}
+   :gmir/slice-load-u64 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                          :gmir/index :gmir/maximum}
+   :gmir/slice-store-u64 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                           :gmir/index :gmir/stored :gmir/maximum}
+   ;; The lock pair carries exactly the load's fields: it reads and writes one
+   ;; u32 at `index`, and the value it produces is whether this caller won.
+   ;; `:gmir/stored` is deliberately absent -- what gets stored is fixed by the
+   ;; operation (1 to acquire, 0 to release), not supplied by the guest, which
+   ;; is the whole difference between a lock and a compare-exchange.
+   :gmir/kernel-try-lock-u32 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                               :gmir/index :gmir/maximum}
+   :gmir/kernel-unlock-u32 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                             :gmir/index :gmir/maximum}
+   ;; sysops: the general atomic family. The lock pair above fixes both its
+   ;; comparand and its replacement, which is what makes it a lock; these six
+   ;; take the word from the guest, which is what makes them the read-modify-
+   ;; writes a device driver's descriptor ring needs -- a producer index the
+   ;; guest advances by its own delta, an ownership word it swaps for its own
+   ;; value, a doorbell it claims against its own comparand.
+   ;;
+   ;; They carry exactly the store's fields, plus `:gmir/expected` for the two
+   ;; compare-exchanges. `:gmir/stored` is the guest's operand in every case:
+   ;; the addend for `atomic-add`, the replacement for `xchg` and `cmpxchg`.
+   ;; `:gmir/dst` is the word that was in memory BEFORE the operation, for all
+   ;; six -- a compare-exchange that returned only a success flag would force
+   ;; the caller to re-read, which is the race the instruction exists to close.
+   :gmir/kernel-atomic-add-u32 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                                 :gmir/index :gmir/stored :gmir/maximum}
+   :gmir/kernel-atomic-add-u64 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                                 :gmir/index :gmir/stored :gmir/maximum}
+   :gmir/kernel-xchg-u32 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                           :gmir/index :gmir/stored :gmir/maximum}
+   :gmir/kernel-xchg-u64 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                           :gmir/index :gmir/stored :gmir/maximum}
+   :gmir/kernel-cmpxchg-u32 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                              :gmir/index :gmir/expected :gmir/stored
+                              :gmir/maximum}
+   :gmir/kernel-cmpxchg-u64 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                              :gmir/index :gmir/expected :gmir/stored
+                              :gmir/maximum}
+   ;; sysops: end
+   ;; simd: one dot product of two f32 regions, as ONE operation.
+   ;;
+   ;; It is not a load family member and not a composition of them. Every
+   ;; other memory operation here moves one element and lets the guest write
+   ;; the loop; this one owns the loop, because what it exists to select is a
+   ;; vector instruction sequence -- eight lanes at a time on a machine that
+   ;; has AVX2, and a scalar sequence with the SAME accumulation tree on a
+   ;; machine that does not. A guest-written loop over `slice-load-u32` can
+   ;; express the arithmetic and cannot express that choice: the backend
+   ;; would have to recognise the loop to vectorise it, and a backend that
+   ;; recognises loops is a different program from this one.
+   ;;
+   ;; TWO regions, so TWO bases and TWO lengths. `:gmir/base`/`:gmir/length`
+   ;; stay the names of the FIRST region rather than becoming
+   ;; `:gmir/first-base`, so that anything downstream reading `:gmir/base`
+   ;; still finds a base; the second pair is named for its position.
+   ;; `:gmir/count` counts ELEMENTS, and the lengths count BYTES -- the same
+   ;; split the slice family made, kept here because the lengths describe
+   ;; regions the caller declared in bytes and the count describes how many
+   ;; four-byte elements of them to read.
+   ;;
+   ;; `:gmir/maximum` is the byte ceiling on BOTH lengths, pinned to one
+   ;; value the way the lock pair's 4096 is, so a second spelling has to be
+   ;; added deliberately.
+   :gmir/kernel-dot-f32 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                          :gmir/second-base :gmir/second-length
+                          :gmir/count :gmir/maximum}
+   ;; simd: end
+   ;; dequant: the fused dequantize-and-dot family, one operation per
+   ;; quantization format.
+   ;;
+   ;; THE OPERAND SHAPE IS BLOCK-SCALE, NOT TWO REGIONS AND A COUNT. A
+   ;; quantized row is not a vector of elements; it is a vector of BLOCKS,
+   ;; each holding a scale and a run of packed codes, and the byte stride and
+   ;; the element stride are DIFFERENT numbers (34 bytes carry 32 elements in
+   ;; Q8_0; 144 bytes carry 256 in Q4_K). So `:gmir/count` counts BLOCKS here
+   ;; where `:gmir/kernel-dot-f32` counts elements, and both spans are derived
+   ;; from it by the format's own strides. Nothing downstream may assume the
+   ;; two regions have the same length.
+   ;;
+   ;; The keyset is `:gmir/kernel-dot-f32`'s, deliberately: the second region
+   ;; is still a base and a length at position 2, the answer is still one
+   ;; f32 word, and every pass that already walks those keys keeps working.
+   ;; What differs is only the arithmetic between them, which is the format.
+   :gmir/kernel-dequant-dot-q8-0 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                                   :gmir/second-base :gmir/second-length
+                                   :gmir/count :gmir/maximum}
+   :gmir/kernel-dequant-dot-q4-k #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                                   :gmir/second-base :gmir/second-length
+                                   :gmir/count :gmir/maximum}
+   :gmir/kernel-dequant-dot-q6-k #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                                   :gmir/second-base :gmir/second-length
+                                   :gmir/count :gmir/maximum}
+   ;; dequant-iq: the codebook family. Same keyset, same operand shape --
+   ;; what differs is that a code is an INDEX INTO A TABLE rather than a
+   ;; number, and the table belongs to the format rather than to the block.
+   :gmir/kernel-dequant-dot-iq4-xs #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                                   :gmir/second-base :gmir/second-length
+                                   :gmir/count :gmir/maximum}
+   :gmir/kernel-dequant-dot-iq2-s #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                                  :gmir/second-base :gmir/second-length
+                                  :gmir/count :gmir/maximum}
+   :gmir/kernel-dequant-dot-iq3-xxs #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                                    :gmir/second-base :gmir/second-length
+                                    :gmir/count :gmir/maximum}
+   :gmir/kernel-dequant-dot-iq3-s #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                                  :gmir/second-base :gmir/second-length
+                                  :gmir/count :gmir/maximum}
+   ;; dequant-ptq1: Prism's group-128 ternary (ADR 0031). Same keyset: a
+   ;; code is a base-3 digit and the block's one scale is in the block.
+   :gmir/kernel-dequant-dot-ptq1-0 #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                                   :gmir/second-base :gmir/second-length
+                                   :gmir/count :gmir/maximum}
+   ;; dequant: end
+   :gmir/kernel-subregion #{:gmir/op :gmir/dst :gmir/base :gmir/length
+                            :gmir/offset :gmir/size}
+   :gmir/equal #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/less-than #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/greater-than #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/less-or-equal #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/greater-or-equal #{:gmir/op :gmir/dst :gmir/left :gmir/right}
+   :gmir/label #{:gmir/op :gmir/id}
+   :gmir/branch-zero #{:gmir/op :gmir/test :gmir/target}
+   :gmir/jump #{:gmir/op :gmir/target}
+   :gmir/phi #{:gmir/op :gmir/dst :gmir/incomings}
+   :gmir/call #{:gmir/op :gmir/dst :gmir/callee :gmir/arguments}
+   :gmir/tail-call #{:gmir/op :gmir/callee :gmir/arguments}
+   :gmir/runtime-call #{:gmir/op :gmir/dst :gmir/runtime :gmir/arguments}
+   :gmir/x86-privileged #{:gmir/op :gmir/dst :gmir/action :gmir/arguments}
+   :gmir/capability-call #{:gmir/op :gmir/dst :gmir/capability
+                           :gmir/kind :gmir/arguments}
+   :gmir/return #{:gmir/op :gmir/value}})
+
+
+;; memwidth: the checked-memory families, as data rather than as a set
+;; repeated at each of the four places that used to name them.
+;;
+;; `kernel-window-operations` are BYTE-indexed accesses into a window whose
+;; declared length the operation's `:gmir/maximum` caps. `slice-operations`
+;; are ELEMENT-indexed accesses into a host-supplied region whose ceiling is
+;; the address space (amu ADR 0285); their `:gmir/index` is scaled by the
+;; access width in the addressing mode rather than added as a byte offset.
+
+(def kernel-window-operations
+  #{:gmir/kernel-load-u8 :gmir/kernel-store-u8
+    :gmir/kernel-load-u16 :gmir/kernel-store-u16
+    :gmir/kernel-load-u32 :gmir/kernel-store-u32
+    :gmir/kernel-load-u64 :gmir/kernel-store-u64})
+
+(def kernel-window-maxima
+  "Declared window ceilings. 65536 costs the same `cmp r64, imm32` that 512
+  does, so the tier exists because the encoding is identical, not because a
+  caller asked for it."
+  #{512 4096 16384 65536})
+
+(def slice-operations
+  #{:gmir/slice-load-u8 :gmir/slice-store-u8
+    :gmir/slice-load-u16 :gmir/slice-store-u16
+    :gmir/slice-load-u32 :gmir/slice-store-u32
+    :gmir/slice-load-u64 :gmir/slice-store-u64})
+
+(def slice-item-limit
+  "2^40 elements. Chosen so that `length * 8` -- the widest element this family
+  carries -- stays under 2^43 and therefore cannot wrap a 64-bit address
+  computation, while still admitting regions three orders of magnitude beyond
+  the 10 GiB model image that motivated the carrier. It is an ADDRESS-SPACE
+  bound, deliberately not derived from `vector-item-limit` (16384): ADR 0285's
+  decision is that the carrier does not travel through the vector arena, and
+  therefore that arena's item bound is not its ceiling."
+  1099511627776)
+
+;; simd: the f32 dot product's byte ceiling on each of its two regions.
+;;
+;; 65536 and only 65536, and pinned as a single value rather than drawn from
+;; `kernel-window-maxima`, for the reason the lock pair's 4096 is pinned: one
+;; spelling of the operation names one ceiling, and a second has to be added
+;; deliberately. It is the largest tier the window family already declares, so
+;; it costs the same `cmp r64, imm32` every other ceiling does.
+;;
+;; It is NOT the slice family's address-space bound. A region this operation
+;; reads travels through the same declared-window discipline every
+;; `kernel-load-*` uses; the carrier that is bounded by the address space
+;; instead is `slice-*`, and giving this operation that bound would be
+;; deciding ADR 0285's question here rather than there.
+(def kernel-dot-f32-maximum 65536)
+
+(def kernel-dot-f32-element-limit
+  "How many four-byte elements the ceiling above admits. DERIVED, so the two
+  cannot drift: a count above this makes `count * 4` exceed any admissible
+  length, and bounding the count is also what keeps that product from wrapping
+  a 64-bit multiply before it is compared."
+  (quot kernel-dot-f32-maximum 4))
+;; simd: end
+
+;; dequant: the fused family's strides and ceilings.
+;;
+;; ONE TABLE, because every consumer of this family needs the same two
+;; numbers and a second transcription of them is a second place for them to
+;; be wrong. `:block-bytes` is `sizeof(block_*)` in
+;; `os/aiueos/kernel/qwen35_quant.c` (asserted there by a negative-array
+;; typedef); `:block-elements` is that format's QK.
+(def kernel-dequant-dot-formats
+  {:gmir/kernel-dequant-dot-q8-0 {:block-bytes 34  :block-elements 32}
+   :gmir/kernel-dequant-dot-q4-k {:block-bytes 144 :block-elements 256}
+   :gmir/kernel-dequant-dot-q6-k {:block-bytes 210 :block-elements 256}
+   ;; dequant-iq: the four codebook formats. 306 of the Qwen3.5 model's 866
+   ;; tensors carry one of these, which is more than any other family.
+   :gmir/kernel-dequant-dot-iq4-xs {:block-bytes 136 :block-elements 256}
+   :gmir/kernel-dequant-dot-iq2-s {:block-bytes 82 :block-elements 256}
+   :gmir/kernel-dequant-dot-iq3-xxs {:block-bytes 98 :block-elements 256}
+   :gmir/kernel-dequant-dot-iq3-s {:block-bytes 110 :block-elements 256}
+   ;; dequant-ptq1: 24 bytes of five trits, 2 bytes of four, an fp16 scale.
+   ;; 402 of the Ternary Bonsai 2 27B artifact's 851 tensors (ADR 0031).
+   :gmir/kernel-dequant-dot-ptq1-0 {:block-bytes 28 :block-elements 128}})
+
+(def kernel-dequant-dot-operations (set (keys kernel-dequant-dot-formats)))
+
+(def kernel-dequant-dot-maximum
+  "The byte ceiling on EACH region, the same 65536 the f32 dot product
+  declares. Shared rather than derived per format: the ceiling describes what
+  a caller may declare as a window, and that is a property of the window
+  discipline, not of the encoding inside it."
+  kernel-dot-f32-maximum)
+
+(defn kernel-dequant-dot-block-limit
+  "How many blocks the ceiling admits for OP. DERIVED from both strides and
+  from the ceiling, so no copy of it can drift: it is the smaller of what the
+  packed region can hold and what the f32 region can hold, and bounding the
+  block count is what keeps `count * block-bytes` and `count * elements * 4`
+  from wrapping a 64-bit multiply before either is compared with a length."
+  [op]
+  (let [{:keys [block-bytes block-elements]} (get kernel-dequant-dot-formats op)]
+    (min (quot kernel-dequant-dot-maximum block-bytes)
+         (quot kernel-dequant-dot-maximum (* 4 block-elements)))))
+;; dequant: end
+
+;; sysops: the general atomic read-modify-write family, named once so the
+;; keyset table, the operand check and the ceiling check cannot drift apart --
+;; and so `kotoba.mir` and `kotoba.native.machine-ir` can derive their own
+;; tables from this one rather than transcribing it.
+(def kernel-atomic-ops
+  #{:gmir/kernel-atomic-add-u32 :gmir/kernel-atomic-add-u64
+    :gmir/kernel-xchg-u32 :gmir/kernel-xchg-u64
+    :gmir/kernel-cmpxchg-u32 :gmir/kernel-cmpxchg-u64})
+;; sysops: end
+
+;; memwidth: every operation that carries a `:gmir/index` operand -- the two
+;; windowed families, the slice family, the lock pair and (merged from the
+;; sysops branch) the general atomics. Named once so the operand check cannot
+;; drift from the keyset table.
+(def ^:private indexed-memory-operations
+  (into #{:gmir/kernel-try-lock-u32 :gmir/kernel-unlock-u32}
+        (concat kernel-window-operations slice-operations kernel-atomic-ops)))
+
+(def ^:private v1-operations
+  (disj (set (keys instruction-keysets)) :gmir/phi :gmir/tail-call))
+
+(def ^:private v2-operations
+  (set (keys instruction-keysets)))
+
+(def ^:private v3-operations
+  (set (keys instruction-keysets)))
+
+(defn- operations-for [program-version]
+  (case program-version
+    1 v1-operations
+    2 (disj v2-operations :gmir/call :gmir/tail-call)
+    3 v3-operations
+    #{}))
+
+(defn function-id?
+  "True for a canonical source-level function identifier. Symbols remain data
+  here; target linkage names are deliberately owned by later layers."
+  [value]
+  (and (symbol? value) (not (empty? (name value)))))
+
+(def runtime-operation-arities
+  "Closed target-independent host-runtime operation contract. The runtime
+  operation names and arities are semantic; target context-table offsets and
+  calling conventions remain owned by MIR/codegen."
+  {:pair 2
+   :pair-first 1
+   :pair-second 1
+   :kgraph-assert! 3
+   :kgraph-get 2
+   :kgraph-count 1
+   :kgraph-entity-at 2
+   :string-byte-length 1
+   :string=? 2
+   :string-concat 2
+   :string-substring 3
+   :string-code-point-at 2
+   :vector-new-empty 0
+   :vector-conj 2
+   :vector-count 1
+   :vector-at 2
+   :vector-assoc 3
+   :vector-drop 2
+   ;; ABI v4 (superproject ADR-2609010200). Two operations the six above
+   ;; cannot express.
+   ;;
+   ;; `:vector-alloc` allocates n zeros. `vector-new` is variadic -- its arity
+   ;; IS the literal's element count -- so a struct of arrays with a million
+   ;; slots would need a million arguments in source, and the literal limit
+   ;; refuses that long before the item limit does.
+   ;;
+   ;; `:vector-assoc-in-place` is `:vector-assoc` lowered to a store: same
+   ;; arity, same meaning, and it returns the same handle rather than a new
+   ;; one. It is a SEPARATE runtime operation and not a flag on the first,
+   ;; because the two call different host slots and a flag would have to be
+   ;; carried through every layer between here and the encoder.
+   ;;
+   ;; Naming: KIR spells the source-level head `vector-assoc!`. The runtime
+   ;; operation is spelled out because this table is the host contract, where
+   ;; the distinction that matters is store-versus-copy rather than the claim
+   ;; the bang makes. Neither family gains an f64 twin: KIR declares no
+   ;; `vector-f64-alloc` and no `vector-f64-assoc!`.
+   :vector-alloc 1
+   :vector-assoc-in-place 3
+   ;; ABI v5 (2026-09-15). `(string-index-of haystack needle)` -> the first
+   ;; UTF-8 byte offset of the needle in the haystack, or -1; an empty needle
+   ;; traps, as it does in the reference interpreter. Until now this was a
+   ;; source rewrite over `string-substring` / `string=?` /
+   ;; `string-code-point-at` (kotoba-native's string_search.cljk): one pair
+   ;; handle and three or four host callbacks per haystack byte, so a `grep`
+   ;; over a 3.3 MB file exhausted a 4 Mi-handle arena after 2 MB at about
+   ;; 75 ns/byte. A host slot makes it one call and lets the host use memmem
+   ;; / memchr, the way every fast grep does. Two arguments, like `string=?`.
+   :string-index-of 2
+   ;; ABI v6 (2026-09-16, superproject ADR-2609160044). The two halves of
+   ;; `(arena-scope body)`: ENTER records the arenas' marks, LEAVE releases
+   ;; every pair handle, pool byte, vector handle and vector item allocated
+   ;; since. They exist only as the paired lowering of that KIR head -- no
+   ;; KIR program names them -- so LIFO holds by construction; the host still
+   ;; traps a leave at depth 0. No arguments, no result that means anything.
+   :arena-enter 0
+   :arena-leave 0
+   ;; ABI v7 (2026-09-16, superproject ADR-2609160044 follow-up). Four text
+   ;; operations the command binaries measured to need on the host side:
+   ;; `string-compare` (byte order, -1/0/1 -- sort's merge spent one host
+   ;; call per code point), `string-fold-ascii` (A-Z to a-z, a new string --
+   ;; grep -i folded each line in 26 passes), `string-find-blank` /
+   ;; `string-skip-blank` (the first blank / non-blank byte offset at or
+   ;; after an offset, -1 / length when none -- wc and awk walked words a
+   ;; code point per call).
+   :string-compare 2
+   :string-fold-ascii 1
+   :string-find-blank 2
+   :string-skip-blank 2
+   ;; ABI v8 (2026-09-16). Two more the line-oriented commands measured to
+   ;; need: `string-index-of-from` (the first occurrence of NEEDLE in S at
+   ;; or after byte offset FROM, absolute, -1 when none -- every line walk
+   ;; was cutting a view to search from an offset, a handle per search),
+   ;; `string-compare-lines` (byte order of the newline-terminated line of
+   ;; A starting at I against the line of B starting at J, -1/0/1 -- sort's
+   ;; merge and uniq cut two views per comparison).
+   :string-index-of-from 3
+   :string-compare-lines 4
+   ;; ABI v10 (2026-09-16). Two operations that take no VIEW and mint none:
+   ;; `string-find-byte` (the first offset at or after FROM holding the ASCII
+   ;; byte B, -1 when none -- a line walk's newline or delimiter search
+   ;; without a needle handle per search), `string-append-range` (ACC with
+   ;; bytes [START, END) of S appended -- one call where a view and a
+   ;; concat were two, and a handle fewer). Measured 2026-09-16: a 33 MB
+   ;; `cut -f2` spent 44% of its time minting views.
+   :string-find-byte 3
+   :string-append-range 4
+   ;; ABI v11 (2026-09-25, superproject adr-2609242330). `:bytes` values and
+   ;; the string constructor. A bytes value is a vector-arena handle, so
+   ;; count / at / empty are the vector slots; these four are what the
+   ;; vector table cannot express: `string-from-utf8` (a validated
+   ;; bytes-to-string copy that names the first bad sequence),
+   ;; `bytes-from-vector` (a copy that refuses an item outside [0,255];
+   ;; also the lowering of vector-i64-from-bytes, whose items always pass),
+   ;; `bytes-slice` (a view) and `bytes-concat` (a copy).
+   :string-from-utf8 1
+   :bytes-from-vector 1
+   :bytes-slice 3
+   :bytes-concat 2
+   ;; amu ADR 0353 point 7 (floor :allocation-budget-native, 2026-09-30):
+   ;; one unit of the run's fuel, debited in front of every constructor the
+   ;; reference (kotoba.kir `cell-constructor-ops`) charges. No arguments;
+   ;; its result means nothing. It is not a host slot: kotoba-mir addresses
+   ;; it at the context's fuel word, and both encoders emit it inline.
+   :fuel-charge 0})
+
+(def x86-privileged-action-arities
+  "Closed x86-64 kernel instruction family. These actions are semantic at
+  GMIR; MIR owns target admission and rejects them for every other target."
+  {:boot-info 0
+   :read-cr0 0 :write-cr0 1
+   :read-cr2 0 :read-cr3 0 :write-cr3 1 :invlpg 1
+   :read-cs 0 :page-fault-handler-address 0
+   :rt-timer-handler-address 0
+   :page-fault-recovery-handler-address 0
+   :configure-page-fault-recovery 2 :load-idt 2
+   :double-fault-handler-address 0
+   ;; amu-h7: the canned #UD handler, zero-arity and an ADDRESS like the three
+   ;; canned handler addresses above it. Vector 6 is the trap this toolchain's
+   ;; own bounded loads and fuel charges raise (`ud2`), so a kernel with no
+   ;; gate for it dies silently; the address lets it install one.
+   :undefined-opcode-handler-address 0
+   :configure-double-fault-ist 2 :load-gdt-tss 2
+   :probe-guard-write 0 :probe-text-write 0 :probe-nx-execute 0
+   :probe-recoverable-guard-write 0 :probe-double-fault 0
+   :cli 0 :sti 0 :hlt 0 :pause 0
+   :out-u8 2 :out-u32 2 :in-u8 1 :in-u32 1
+   :read-msr 1 :write-msr 2
+   :cpuid-eax 2 :cpuid-ebx 2 :cpuid-ecx 2 :cpuid-edx 2
+   ;; simdprep: `xgetbv` reads XCR[ecx] into edx:eax, so one argument -- the
+   ;; XCR index -- and one i64 result carrying both halves.
+   ;;
+   ;; It is here because the `cpuid` four cannot express a CPU feature check
+   ;; on their own. Leaf 1 ECX bit 28 says the CPU implements AVX; XCR0 bits 1
+   ;; and 2 say the OPERATING SYSTEM has agreed to save and restore the SSE
+   ;; and YMM register state across a context switch. A kernel that reads only
+   ;; the first and uses YMM anyway does not fault: it computes wrong answers
+   ;; intermittently and only under load, because its vector registers are not
+   ;; preserved.
+   ;;
+   ;; The ordering this cannot state -- `xgetbv` raises #UD unless
+   ;; CR4.OSXSAVE is set, which is leaf 1 ECX bit 27, so 27 must be tested
+   ;; BEFORE XCR0 is read -- is a property of a SEQUENCE of actions, and this
+   ;; table describes one action at a time. kotoba-native
+   ;; docs/avx2-guard-sequence.md carries it.
+   :xgetbv 1
+   ;; xsave: the three actions that let a kernel ANSWER the question `:xgetbv`
+   ;; asks. The paragraph above says a guard must test CR4.OSXSAVE before
+   ;; reading XCR0; it does not say who SETS CR4.OSXSAVE, and until these three
+   ;; existed the answer was "a C function", because this table named CR0 and
+   ;; CR3 and stopped.
+   ;;
+   ;; `:read-cr4` and `:write-cr4` are the twins of `:read-cr0`/`:write-cr0`,
+   ;; at the same arities and for the same reason: a control register is one
+   ;; machine word, read whole and written whole. CR4 is where the extended
+   ;; state bits live -- OSFXSR (9), OSXMMEXCPT (10) and OSXSAVE (18) -- and
+   ;; the third of those is precisely the bit `xgetbv` faults without.
+   ;;
+   ;; `:xsetbv` is `:write-msr` with a different opcode: `(index, value)`,
+   ;; index in ECX and value split across EDX:EAX, exactly as `wrmsr` takes
+   ;; them. Arity 2 rather than 1, because XCR0 is not the only XCR the
+   ;; architecture reserves room for and an index that came from whatever was
+   ;; left in ECX would write a register nobody named.
+   ;;
+   ;; WHAT THIS TABLE CANNOT STATE, for the same reason it cannot state
+   ;; `xgetbv`'s ordering: `xsetbv` raises #GP when the value sets a bit XCR0
+   ;; does not define, when bit 0 (x87) is clear, and when the YMM bit is set
+   ;; without the SSE bit. Those are properties of a VALUE and of a SEQUENCE --
+   ;; CR4.OSXSAVE must already be set when `xsetbv` executes -- and this table
+   ;; describes one action at a time. kotoba-native docs/avx2-guard-sequence.md
+   ;; carries the sequence.
+   :read-cr4 0 :write-cr4 1
+   :xsetbv 2
+   ;; xsave: end
+   ;; sysops: barriers, the timestamp counter and the GS-base swap.
+   ;;
+   ;; The three barriers are the ordering half of a device driver. A ring
+   ;; descriptor written before a doorbell is only written before the doorbell
+   ;; if something says so, and on x86 that something is `sfence`/`lfence`/
+   ;; `mfence`. They are 0-arity and return 0, exactly like `:cli`.
+   ;;
+   ;; They ride the x86 privileged channel, which `kotoba.mir` admits for the
+   ;; x86-64 target and no other, so they are x86-only by construction. That
+   ;; is a decision, not an oversight: AArch64 has `dmb ishld`/`dmb ishst`/
+   ;; `dmb ish`, but those are barriers under a WEAK memory model where the
+   ;; question they answer is different from the one `lfence`/`sfence` answer
+   ;; under x86-TSO. A portable barrier operator would have to name the
+   ;; ordering it guarantees rather than the instruction it emits, and that is
+   ;; a separate decision with its own operator family -- not a translation of
+   ;; these three.
+   ;;
+   ;; `:rdtsc` and `:rdtscp` return the 64-bit timestamp counter. AArch64's
+   ;; nearest reading, `mrs cntvct_el0`, is a DIFFERENT CLOCK -- a fixed-
+   ;; frequency system counter, not a core cycle counter -- so it is not a
+   ;; translation either.
+   ;;
+   ;; `:swapgs` exchanges GS.base with KERNEL_GS_BASE and returns 0. It is the
+   ;; one instruction a ring-0 entry path cannot express any other way.
+   :fence-load 0 :fence-store 0 :fence-full 0
+   :rdtsc 0 :rdtscp 0
+   :swapgs 0
+   ;; sysops: end
+   ;; boot: the UEFI firmware boundary. A BOOTX64.EFI written in Kotoba has to
+   ;; reach three things this family could not name.
+   ;;
+   ;; `:system-table` is the second argument UEFI passes to an EFI image entry
+   ;; point, read from the context slot the entry shim parks it in -- the twin
+   ;; of `:boot-info`, which reads the slot beside it. 0-arity, and a pure
+   ;; read of compiler-owned memory.
+   ;;
+   ;; `:load-ptr` is `(base, byte-offset) -> the 64-bit word there`. The
+   ;; firmware owns EFI_SYSTEM_TABLE and every protocol structure hanging off
+   ;; it, so a guest cannot declare a window over them the way the checked
+   ;; `kernel-load-*` family requires: the length is the firmware's, not the
+   ;; guest's, and asserting one would be inventing it. This reads the
+   ;; boundary the way `:in-u8` reads a device -- unchecked, privileged, never
+   ;; oracled -- and callers past that boundary use the checked family.
+   ;;
+   ;; `:uefi-call2` is `(base, slot-offset, a, b) -> status`: call the
+   ;; Microsoft x64 function pointer at `[base+slot-offset]` with `a` and `b`
+   ;; in RCX and RDX. FOUR operands rather than a variadic argument list,
+   ;; because `kotoba.mir`'s conservative expansion hands privileged actions
+   ;; the scratch tier and that tier is four registers wide on x86-64. Two
+   ;; UEFI arguments is what a bootloader's first calls need (ConOut methods,
+   ;; ExitBootServices); GetMemoryMap's five and OpenProtocol's six need an
+   ;; argument channel that does not fit in registers at all, and that is a
+   ;; separate decision.
+   ;;
+   ;; `:jump-to` is `(address, boot-info)` and does not return: it enters a
+   ;; kernel with the SysV first argument set, which is the handoff
+   ;; `package-embedded-kernel` hand-assembles today.
+   :system-table 0
+   :load-ptr 2
+   :uefi-call2 4
+   :jump-to 2
+   ;; boot: end
+   ;; boot-lit: the separate decision the paragraph above defers, taken.
+   ;;
+   ;; `:uefi-call4` is `(base, slot, a, b, c, d)` and `:uefi-call6` is
+   ;; `(base, slot, a, b, c, d, e, f)`. The register tier did NOT get wider:
+   ;; `kotoba.mir`'s conservative expansion now draws privileged argument
+   ;; registers from the scratch tier FOLLOWED BY the preserved tier, and the
+   ;; preserved tier is callee-saved under Microsoft x64 as well as under the
+   ;; internal SysV ABI, so an argument parked there survives the firmware
+   ;; call it is an argument to. That is the whole trick; nothing about the
+   ;; call itself needed a wider machine.
+   ;;
+   ;; TWO arities rather than one variadic action, and rather than one
+   ;; six-argument action used for everything, because the count is the only
+   ;; thing that distinguishes `AllocatePages(type, memtype, pages, &addr)`
+   ;; from `OpenProtocol(h, &guid, &iface, agent, controller, attributes)` at
+   ;; this layer, and a call site that passes four arguments to a six-argument
+   ;; action has to invent two. Microsoft x64 would let those two be garbage
+   ;; -- the callee reads only what it declares -- but "the extra words are
+   ;; ignored" is a property of the CALLEE, and this table describes the
+   ;; caller.
+   ;;
+   ;; `:uefi-call2` keeps its own narrower encoding. It is not a special case
+   ;; of these: its emitted frame is 0x50 where theirs is 0x60, and those
+   ;; bytes are the ones that booted (amu ADR-0291).
+   :uefi-call4 6
+   :uefi-call6 8
+   ;; boot-lit: end
+   ;; boot-scratch: `() -> the base of the writable scratch area the image
+   ;; packager reserves inside the image's own `.data`, immediately past the
+   ;; hidden context.
+   ;;
+   ;; It exists because every remaining UEFI boot service takes an OUT-POINTER
+   ;; and a Kotoba UEFI application had no address it was allowed to write.
+   ;; `.text` -- where the literal pool of ADR-0011 lives -- is `0x60000020`,
+   ;; read and execute; `:boot-info` and `:system-table` answer with words the
+   ;; firmware handed over, not with the address of the context they were
+   ;; parked in. So `AllocatePages`, `HandleProtocol` and `GetMemoryMap` were
+   ;; all unreachable, and `OpenProtocol` was reachable only because
+   ;; `EFI_OPEN_PROTOCOL_TEST_PROTOCOL` makes the firmware ignore its
+   ;; `Interface` out-parameter.
+   ;;
+   ;; Zero-arity and an ADDRESS, like `:page-fault-handler-address` -- not a
+   ;; load, so nothing is read out of the context and no slot has to be
+   ;; published. The backend's answer is one `lea` off the context register.
+   ;;
+   ;; The LENGTH is not a second action here. It is a compile-time constant
+   ;; that the source writes as the window length of the checked
+   ;; `kernel-load-*`/`kernel-store-*` it declares over the region, and
+   ;; kotoba-sema refuses a window wider than the reservation. A second action
+   ;; returning the same number would be a second spelling of one constant.
+   :scratch-region 0
+   ;; boot-scratch: end
+   ;; fwstore: `(base, slot, allocate-type, memory-type, page-count,
+   ;; address-hint) -> the base of the pages the firmware just allocated, or
+   ;; ZERO`. Six operands, and the only action in this table that both CALLS
+   ;; the firmware and answers with an address rather than with a status.
+   ;;
+   ;; `:scratch-region` above gave a UEFI application an out-pointer, which is
+   ;; what `AllocatePages` needs to answer at all. It did not give it a way to
+   ;; USE the answer: the page is at an address the firmware chose, so it
+   ;; reaches the program through a load, and kotoba-sema's region-provenance
+   ;; rule refuses a base that came from one. A UEFI application could
+   ;; allocate a page and could not write it.
+   ;;
+   ;; The fix is not to admit loaded words as bases -- that deletes the rule
+   ;; rather than extending it. It is to make the ALLOCATION itself the
+   ;; producer of the address, so that the pairing of a base with a length is
+   ;; established by the same instruction that obtained the base. The out-word
+   ;; the firmware writes through lives in this action's own outgoing frame:
+   ;; the program never names it, so there is no second writer of it and no
+   ;; way to hand this action an address it did not get from `AllocatePages`.
+   ;;
+   ;; `address-hint` is the word the out-pointer is PRE-LOADED with. For
+   ;; `AllocateAnyPages` (0) the firmware ignores it; for `AllocateMaxAddress`
+   ;; (1) it is the ceiling; for `AllocateAddress` (2) it is the requested
+   ;; base. All three allocate exactly `page-count` 4 KiB pages, which is why
+   ;; the length of the answer is known at the call site under every one of
+   ;; them.
+   ;;
+   ;; ZERO on failure, rather than a status beside the address. Kotoba has no
+   ;; multi-value return on a firmware target, and a null base is the one
+   ;; answer every bounded memory operation already refuses -- so a caller that
+   ;; forgets to test it traps at the first access instead of writing at
+   ;; whatever the out-word happened to hold. The EFI_STATUS itself is not
+   ;; reported; see the ADR, which records that as the price.
+   :uefi-alloc-region 6
+   ;; fwstore: end
+   ;; isr: `(vector) -> the address of the toolchain-generated interrupt entry
+   ;; for that vector`, which is what an IDT gate descriptor needs in its three
+   ;; offset fields.
+   ;;
+   ;; ONE argument, and it is the vector NUMBER rather than a name. An entry is
+   ;; named `aiueos-isr-<vector>` in the source, so the name and the vector
+   ;; carry the same information; taking the number is what lets this ride the
+   ;; ordinary privileged channel, whose operands are virtual registers by the
+   ;; time any backend sees them. A name would have to survive as a literal
+   ;; through GMIR, MIR and register allocation, and nothing in this IR carries
+   ;; a symbol operand.
+   ;;
+   ;; The answer is a LOAD from the image's kernel context, not an address the
+   ;; encoder knows: the entries are laid down by the ELF image packager, which
+   ;; runs after every byte of the function has been emitted. That is also why
+   ;; it has no answer at all in the relocatable-object route, where the
+   ;; context is the object's own private 80 bytes -- kotoba-native refuses
+   ;; there rather than reading past it.
+   :isr-entry-address 1
+   ;; isr: end
+   })
+
+;; boot-lit: read-only literals ────────────────────────────────────────────
+;;
+;; Three encodings, closed, because each one is a shape some firmware ABI
+;; already fixed and none of them is a generalisation of another.
+;;
+;; `:utf-16le-nul` is what UEFI calls a `CHAR16 *`: UCS-2 code units, little
+;; endian, terminated by a 16-bit zero. Surrogates are REFUSED rather than
+;; encoded, because a surrogate pair is UTF-16 and UEFI's `SIMPLE_TEXT_OUTPUT`
+;; is specified over UCS-2; writing the pair would produce two code units the
+;; firmware renders as two replacement glyphs, which is a wrong answer that
+;; looks like a working one.
+;;
+;; `:guid-mixed-endian` is `EFI_GUID`, whose first three fields are integers
+;; (4, 2 and 2 bytes, little-endian on the wire) and whose last two are byte
+;; arrays written in order. That mixture is why the canonical text form of a
+;; GUID cannot simply be hex-decoded: `5B1B31A1-...` starts `a1 31 1b 5b` in
+;; memory. Getting it backwards does not fault -- `HandleProtocol` just
+;; returns `EFI_UNSUPPORTED` for a protocol nobody installed.
+;;
+;; `:hex-bytes` is the escape hatch: exactly the bytes written, for a
+;; structure neither of the two above describes.
+;;
+;; The CONTENT stays the source text in every case and the bytes are derived,
+;; so dedup keys on what the program wrote and two spellings of the same GUID
+;; are two literals. That is deliberate: a canonicalising decoder here would
+;; be a second place that has to agree with the frontend's validator about
+;; what a GUID is.
+
+(def rodata-encodings
+  #{:utf-16le-nul :guid-mixed-endian :hex-bytes})
+
+(def rodata-alignment
+  "Every literal starts on an 8-byte boundary. UCS-2 needs 2 and `EFI_GUID`
+  needs 4; 8 is chosen because edk2's `CompareGuid` reads the structure as two
+  `UINT64`s on 64-bit builds, and because one rule for the whole pool is
+  cheaper to verify than three."
+  8)
+
+(defn- hex-digit [character]
+  (let [code ]
+    (cond
+      (<= 48 code 57) (- code 48)
+      (<= 97 code 102) (- code 87)
+      (<= 65 code 70) (- code 55)
+      :else nil)))
+
+(defn- hex-bytes
+  "Decode an even-length hex string, or nil if it is not one."
+  [text]
+  (when (even? (count text))
+    (loop [index 0 out []]
+      (if (>= index (count text))
+        out
+        (let [high (hex-digit (nth text index))
+              low (hex-digit (nth text (inc index)))]
+          (if (and high low)
+            (recur (+ index 2) (conj out (+ (* 16 high) low)))
+            nil))))))
+
+(def ^:private guid-field-widths
+  "Hex-digit counts of the five canonical GUID fields."
+  [8 4 4 4 12])
+
+(defn- guid-fields
+  "Split canonical GUID text on `-` into its five hex fields, or nil when the
+  shape is not 8-4-4-4-12 hex digits. Written as a fold over characters rather
+  than with `clojure.string/split`: this namespace deliberately requires
+  nothing, and `split` on a trailing separator drops the empty field, which
+  would make `...-` parse as a four-field GUID."
+  [text]
+  (let [parts (reduce (fn [out character]
+                        (if (= \- character)
+                          (conj out "")
+                          (conj (pop out) (str (peek out) character))))
+                      [""]
+                      text)]
+    (when (and (= 5 (count parts))
+               (= guid-field-widths (mapv count parts))
+               (every? #(some? (hex-bytes %)) parts))
+      parts)))
+
+(defn- surrogate? [code] (<= 0xd800 code 0xdfff))
+
+(defn- utf-16le-nul-bytes [text]
+  (loop [index 0 out []]
+    (if (>= index (count text))
+      (conj out 0 0)
+      (let [code ]
+        (if (surrogate? code)
+          nil
+          (recur (inc index)
+                 (conj out (bit-and code 0xff) (bit-and (bit-shift-right code 8) 0xff))))))))
+
+(defn rodata-bytes
+  "The bytes ENCODING gives CONTENT, or nil when CONTENT is not a well-formed
+  literal for it. The single authority: `validate!` refuses on nil, and every
+  backend that places a literal pool asks this rather than decoding again."
+  [encoding content]
+  (when (string? content)
+    (case encoding
+      :utf-16le-nul (utf-16le-nul-bytes content)
+      :hex-bytes (hex-bytes content)
+      :guid-mixed-endian
+      (when-let [[a b c d e] (guid-fields content)]
+        (let [[a0 a1 a2 a3] (hex-bytes a)
+              [b0 b1] (hex-bytes b)
+              [c0 c1] (hex-bytes c)]
+          (vec (concat [a3 a2 a1 a0 b1 b0 c1 c0]
+                       (hex-bytes d) (hex-bytes e)))))
+      nil)))
+
+(defn rodata-content?
+  "True when CONTENT is a well-formed literal under ENCODING."
+  [encoding content]
+  (and (contains? rodata-encodings encoding)
+       (some? (rodata-bytes encoding content))))
+;; boot-lit: end
+
+(def capability-kinds
+  "Closed native capability boundary. Zero is the scalar callback profile;
+  positive values are the typed host ABI discriminator."
+  {:i64 0 :string 1 :option-i64 2 :result-i64 3 :clock-v1 4 :dataspace-v1 5
+   :ui-commit-v1 6 :ui-event-v1 7})
+
+(defn- phi-incoming? [incoming]
+  (and (map? incoming)
+       (= #{:gmir/predecessor :gmir/value} (set (keys incoming)))
+       (label? (:gmir/predecessor incoming))
+       (vreg? (:gmir/value incoming))))
+
+(defn- preceding-label
+  [instructions index]
+  (loop [cursor (dec index)]
+    (when (not (neg? cursor))
+      (let [instruction (nth instructions cursor)]
+        (cond
+          (= :gmir/label (:gmir/op instruction)) (:gmir/id instruction)
+          (= :gmir/phi (:gmir/op instruction)) (recur (dec cursor))
+          :else nil)))))
+
+(defn- block-label-before
+  [instructions index]
+  (some (fn [cursor]
+          (let [instruction (nth instructions cursor)]
+            (when (= :gmir/label (:gmir/op instruction))
+              (:gmir/id instruction))))
+        (range (dec index) -1 -1)))
+
+(defn- validate-phis!
+  [instructions]
+  (doseq [[index {:gmir/keys [op incomings] :as instruction}]
+          (map-indexed vector instructions)
+          :when (= :gmir/phi op)]
+    (let [join (preceding-label instructions index)
+          incoming-predecessors (mapv :gmir/predecessor incomings)
+          incoming-set (set incoming-predecessors)
+          jump-predecessors
+          (->> instructions
+               (map-indexed vector)
+               (keep (fn [[jump-index candidate]]
+                       (when (and (= :gmir/jump (:gmir/op candidate))
+                                  (= join (:gmir/target candidate)))
+                         (block-label-before instructions jump-index))))
+               set)]
+      (when-not join
+        (reject! :phi-not-at-block-entry instruction))
+      (when-not (and (vector? incomings)
+                     (<= 2 (count incomings))
+                     (every? phi-incoming? incomings)
+                     (= (count incoming-predecessors) (count incoming-set)))
+        (reject! :invalid-phi-incomings instruction))
+      (when-not (= incoming-set jump-predecessors)
+        (reject! :phi-predecessor-mismatch
+                 {:join join :incoming incoming-set :jumps jump-predecessors}))
+      (when (some #(and (= :gmir/branch-zero (:gmir/op %))
+                        (= join (:gmir/target %)))
+                  instructions)
+        (reject! :phi-critical-edge instruction))
+      (let [join-index (first
+                        (keep-indexed
+                         (fn [candidate-index candidate]
+                           (when (and (= :gmir/label (:gmir/op candidate))
+                                      (= join (:gmir/id candidate)))
+                             candidate-index))
+                         instructions))]
+        (when (or (zero? join-index)
+                  (not= :gmir/jump (:gmir/op (nth instructions (dec join-index)))))
+          (reject! :phi-fallthrough-predecessor instruction))))))
+
+(defn- validate-instructions!
+  [program-version instructions]
+  (when-not (vector? instructions)
+    (reject! :non-canonical-instructions instructions))
+  (doseq [instruction instructions]
+    (let [op (:gmir/op instruction)
+          allowed (operations-for program-version)]
+      (when-not (and (contains? allowed op)
+                     (= (get instruction-keysets op) (set (keys instruction))))
+        (reject! :non-canonical-instruction instruction))
+      (doseq [register (keep instruction [:gmir/dst :gmir/input :gmir/left
+                                           :gmir/right :gmir/test :gmir/base
+                                           :gmir/length :gmir/stored
+                                           ;; sysops: the compare-exchange
+                                           ;; comparand is an operand like any
+                                           ;; other and must be a vreg.
+                                           :gmir/expected
+                                           ;; simd: the second region's pair
+                                           ;; and the element count are
+                                           ;; operands like any other.
+                                           :gmir/second-base :gmir/second-length
+                                           :gmir/count
+                                           :gmir/offset :gmir/size])]
+        (when-not (vreg? register)
+          (reject! :invalid-virtual-register instruction)))
+      (when (and (contains? indexed-memory-operations op)
+                 (not (vreg? (:gmir/index instruction))))
+        (reject! :invalid-virtual-register instruction))
+      (when (and (= op :gmir/return) (not (vreg? (:gmir/value instruction))))
+        (reject! :invalid-virtual-register instruction))
+      (when (contains? #{:gmir/call :gmir/tail-call} op)
+        (when-not (and (or (= op :gmir/tail-call)
+                           (vreg? (:gmir/dst instruction)))
+                       (function-id? (:gmir/callee instruction))
+                       (vector? (:gmir/arguments instruction))
+                       (<= (count (:gmir/arguments instruction)) max-arity)
+                       (every? vreg? (:gmir/arguments instruction)))
+          (reject! :invalid-call instruction)))
+      (when (= op :gmir/runtime-call)
+        (let [runtime (:gmir/runtime instruction)
+              arguments (:gmir/arguments instruction)
+              expected (get runtime-operation-arities runtime ::missing)]
+          (when-not (and (vreg? (:gmir/dst instruction))
+                         (not= ::missing expected)
+                         (vector? arguments)
+                         (= expected (count arguments))
+                         (every? vreg? arguments))
+            (reject! :invalid-runtime-call instruction))))
+      (when (= op :gmir/x86-privileged)
+        (let [action (:gmir/action instruction)
+              arguments (:gmir/arguments instruction)
+              expected (get x86-privileged-action-arities action ::missing)]
+          (when-not (and (vreg? (:gmir/dst instruction))
+                         (not= ::missing expected)
+                         (vector? arguments)
+                         (= expected (count arguments))
+                         (every? vreg? arguments))
+            (reject! :invalid-x86-privileged instruction))))
+      (when (= op :gmir/capability-call)
+        (when-not (and (vreg? (:gmir/dst instruction))
+                       (vector? (:gmir/arguments instruction))
+                       (= 1 (count (:gmir/arguments instruction)))
+                       (vreg? (first (:gmir/arguments instruction)))
+                       (integer? (:gmir/capability instruction))
+                       (<= 0 (:gmir/capability instruction) 255)
+                       (contains? capability-kinds (:gmir/kind instruction)))
+          (reject! :invalid-capability-call instruction)))
+      (when (= op :gmir/phi)
+        (when-not (and (vector? (:gmir/incomings instruction))
+                       (every? phi-incoming? (:gmir/incomings instruction)))
+          (reject! :invalid-phi-incomings instruction)))
+      (when (and (= op :gmir/constant)
+                 (not (i64-value? (:gmir/value instruction))))
+        (reject! :constant-not-i64 instruction))
+      (when (and (= op :gmir/data-address)
+                 (not (string? (:gmir/content instruction))))
+        (reject! :invalid-data-content instruction))
+      ;; boot-lit: a literal whose content does not decode under its own
+      ;; encoding is refused HERE, not at the backend that lays out the pool.
+      ;; A malformed GUID has no failure mode downstream -- sixteen bytes get
+      ;; placed either way and the firmware answers `EFI_UNSUPPORTED` for a
+      ;; protocol nobody installed, which is indistinguishable from asking for
+      ;; a protocol this machine does not have.
+      (when (= op :gmir/rodata-address)
+        (when-not (rodata-content? (:gmir/rodata-encoding instruction)
+                                   (:gmir/content instruction))
+          (reject! :invalid-rodata-content instruction)))
+      ;; boot-scratch: the shape of the name is checked here; WHICH names
+      ;; exist is checked by the module, which is the only thing that knows.
+      ;; A flat v1/v2 program has no function list to resolve against, so the
+      ;; instruction has no answer there and is refused rather than left to
+      ;; the backend, whose `encode-mc` passes an EMPTY callee-label table and
+      ;; would report `unknown-call-target` about a call the program does not
+      ;; contain.
+      (when (= op :gmir/function-address)
+        (when-not (and (vreg? (:gmir/dst instruction))
+                       (function-id? (:gmir/function instruction)))
+          (reject! :invalid-function-address instruction))
+        (when-not (= 3 program-version)
+          (reject! :function-address-needs-a-module instruction)))
+      (when (and (= op :gmir/argument)
+                 (not (and (integer? (:gmir/index instruction))
+                           (not (neg? (:gmir/index instruction))))))
+        (reject! :argument-index-invalid instruction))
+      ;; memwidth: one table for every windowed access instead of one clause
+      ;; per width. The clause per width is how `kernel-store-u8` came to be
+      ;; the only operation in the family that could not name a 16 KiB window
+      ;; -- not by decision, but because its own `when` said so and nothing
+      ;; else did.
+      (when (contains? kernel-window-operations op)
+        (when-not (contains? kernel-window-maxima (:gmir/maximum instruction))
+          (reject! :invalid-kernel-memory-maximum instruction)))
+      ;; memwidth: a slice's ceiling is the address space, not a window
+      ;; profile. It is pinned to one value for the same reason the lock
+      ;; pair's 4096 is: a second spelling has to be added deliberately.
+      (when (contains? slice-operations op)
+        (when-not (= slice-item-limit (:gmir/maximum instruction))
+          (reject! :invalid-kernel-memory-maximum instruction)))
+      ;; 4096 and only 4096, because there is one spelling of each lock
+      ;; operation and it names a page. The value runtime's lock word lives at
+      ;; offset 0 of an RW/NX page, and its callers declare lengths of 512 and
+      ;; 4096; a 512 ceiling would trap the 4096 ones on the length check
+      ;; before reaching the word they share. Pinned as a single value rather
+      ;; than a set so a second spelling has to be added deliberately.
+      (when (contains? #{:gmir/kernel-try-lock-u32 :gmir/kernel-unlock-u32} op)
+        (when-not (= 4096 (:gmir/maximum instruction))
+          (reject! :invalid-kernel-memory-maximum instruction)))
+      ;; sysops: the general atomics share the lock pair's single ceiling for
+      ;; the same reason -- one spelling each, naming a page. Pinned as one
+      ;; value rather than a set so a second spelling has to be added
+      ;; deliberately.
+      (when (contains? kernel-atomic-ops op)
+        (when-not (= 4096 (:gmir/maximum instruction))
+          (reject! :invalid-kernel-memory-maximum instruction)))
+      ;; sysops: end
+      ;; simd: one spelling, one ceiling, pinned as a single value for the
+      ;; reason the lock pair's is.
+      (when (= :gmir/kernel-dot-f32 op)
+        (when-not (= kernel-dot-f32-maximum (:gmir/maximum instruction))
+          (reject! :invalid-kernel-memory-maximum instruction)))
+      ;; simd: end
+      ;; dequant: same rule, one ceiling for the whole family.
+      (when (contains? kernel-dequant-dot-operations op)
+        (when-not (= kernel-dequant-dot-maximum (:gmir/maximum instruction))
+          (reject! :invalid-kernel-memory-maximum instruction)))
+      ;; dequant: end
+      (when (contains? #{:gmir/label :gmir/branch-zero :gmir/jump} op)
+        (let [id (if (= op :gmir/label)
+                   (:gmir/id instruction)
+                   (:gmir/target instruction))]
+          (when-not (label? id)
+            (reject! :invalid-label instruction))))))
+  (let [labels (map :gmir/id (filter #(= :gmir/label (:gmir/op %)) instructions))
+        label-set (set labels)
+        targets (keep :gmir/target instructions)]
+    (when-not (= (count labels) (count label-set))
+      (reject! :duplicate-label {:labels labels}))
+    (doseq [target targets]
+      (when-not (contains? label-set target)
+        (reject! :unresolved-target {:target target})))
+    (when (contains? #{2 3} program-version)
+      (validate-phis! instructions)))
+  instructions)
+
+(defn- validate-v3-module!
+  [{:gmir/keys [entry functions] :as program}]
+  (when-not (and (= #{:gmir/version :gmir/entry :gmir/functions}
+                    (set (keys program)))
+                 (function-id? entry)
+                 (vector? functions)
+                 (seq functions))
+    (reject! :non-canonical-module program))
+  (let [names (mapv :gmir/name functions)
+        signatures (into {} (map (juxt :gmir/name :gmir/arity) functions))]
+    (when-not (and (every? function-id? names)
+                   (= (count names) (count (distinct names))))
+      (reject! :invalid-function-names names))
+    (when-not (contains? signatures entry)
+      (reject! :missing-entry-function {:entry entry}))
+    (doseq [{:gmir/keys [name arity instructions] :as function} functions]
+      (when-not (and (= #{:gmir/name :gmir/arity :gmir/instructions}
+                        (set (keys function)))
+                     (function-id? name)
+                     (integer? arity)
+                     (<= 0 arity max-arity))
+        (reject! :non-canonical-function function))
+      (validate-instructions! 3 instructions)
+      (let [argument-indices (mapv :gmir/index
+                                   (filter #(= :gmir/argument (:gmir/op %))
+                                           instructions))]
+        (when-not (and (every? #(< % arity) argument-indices)
+                       (= (count argument-indices)
+                          (count (distinct argument-indices))))
+          (reject! :invalid-function-arguments
+                   {:function name :arity arity :indices argument-indices})))
+      ;; boot-scratch: a named function's address resolves against this
+      ;; module's own function list, exactly as a callee does. `:gmir/call`
+      ;; below reports `:unresolved-callee`; this reports its own keyword
+      ;; because the two are different mistakes -- one calls something that is
+      ;; not there, the other takes the address of something that is not
+      ;; there, and only the second can still be a name the author spelled
+      ;; wrong in a program that has no call to it at all.
+      (doseq [{:gmir/keys [function] :as instruction}
+              (filter #(= :gmir/function-address (:gmir/op %)) instructions)]
+        (when-not (contains? signatures function)
+          (reject! :unresolved-function-address
+                   {:function name :instruction instruction
+                    :declared (vec (sort names))})))
+      (doseq [{:gmir/keys [callee arguments] :as call}
+              (filter #(contains? #{:gmir/call :gmir/tail-call}
+                                   (:gmir/op %)) instructions)]
+        (let [callee-arity (get signatures callee ::missing)]
+          (when (= ::missing callee-arity)
+            (reject! :unresolved-callee call))
+          (when-not (= callee-arity (count arguments))
+            (reject! :call-arity-mismatch
+                     {:function name :call call :expected callee-arity}))))))
+  program)
+
+(defn validate!
+  "Validate and return a closed GMIR program. v1 is scalar/control, v2 adds
+  phi values, and v3 owns a non-empty function module with bounded scalar
+  direct calls. Labels and virtual registers remain function-local."
+  [program]
+  (when-not (and (map? program)
+                 (contains? supported-versions (:gmir/version program)))
+    (reject! :non-canonical-program program))
+  (if (= 3 (:gmir/version program))
+    (validate-v3-module! program)
+    (do
+      (when-not (= #{:gmir/version :gmir/instructions} (set (keys program)))
+        (reject! :non-canonical-program program))
+      (validate-instructions! (:gmir/version program) (:gmir/instructions program))
+      program))
+  program)

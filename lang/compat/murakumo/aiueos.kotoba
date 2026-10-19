@@ -1,0 +1,140 @@
+#!/usr/bin/env kbb
+;; murakumo aiueos — operator surface for bare-metal aiueos fleet nodes.
+;;
+;;   kbb --backend sci src/murakumo/aiueos.cljk image                 # build the release image
+;;   kbb --backend sci src/murakumo/aiueos.cljk verify                # USB boot equivalence gate
+;;   kbb --backend sci src/murakumo/aiueos.cljk flash --device …      # write a USB stick
+;;   kbb --backend sci src/murakumo/aiueos.cljk enroll --tier native --mem-bytes … --inbound
+;;
+;; The fleet's other nodes are macOS machines reached over SSH, running
+;; kotoba-server under a LaunchAgent. An aiueos node is not that: it is a
+;; bare-metal OS with no Node, no JVM, and (today) no network stack, so none of
+;; murakumo's SSH/launchctl provisioning applies to it. What an operator can do
+;; is build and flash its medium, and compute the enrollment record it would
+;; post — which is what this surface is.
+;;
+;; `enroll` deliberately does NOT reimplement the participation decision. It
+;; calls `murakumo.infer.join`, the same namespace the rest of murakumo uses, and
+;; then prints the wire arguments that aiueos's own mirror of that decision
+;; (`os/aiueos/kotoba/murakumo-join-plan.kotoba`) would be handed for the same
+;; node. Those two implementations are checked against each other across the
+;; full matrix by `test/murakumo/aiueos_join_plan_parity_test.cljk`; this command
+;; is where the agreement gets used rather than merely asserted.
+
+(ns murakumo.aiueos
+  (:require [kotoba.lang.text :as str]
+            [murakumo.infer.join :as join]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+
+(defn- die [& msg]
+  (binding [*out* *err*] (apply println (cons "error:" msg)))
+  (.exit js/process 1))
+
+(defn- arg [args flag]
+  (let [i (.indexOf (to-array args) flag)]
+    (when (>= i 0) (nth (vec args) (inc i) nil))))
+
+(defn- flag? [args f] (>= (.indexOf (to-array args) f) 0))
+
+(defn- aiueos-root [args]
+  (let [root (or (arg args "--aiueos")
+                 (.-AIUEOS_ROOT js/process.env)
+                 ;; west lays sibling repos out as orgs/<org>/<repo>.
+                 (.resolve path (.cwd js/process) ".." "aiueos"))]
+    (when-not (.existsSync fs (.join path root "os" "aiueos"))
+      (die "no aiueos checkout at" root
+           "\n       pass --aiueos <path> or set AIUEOS_ROOT"))
+    root))
+
+(defn- run! [cmd argv opts]
+  (let [r (.spawnSync cp cmd (to-array argv)
+                      (clj->js (merge {:stdio "inherit" :shell false} opts)))]
+    (or (.-status r) 1)))
+
+;; ------------------------------------------------------------------ commands
+
+(defn- cmd-image [args]
+  (let [root (aiueos-root args)]
+    (println "building aiueos release image in" root)
+    (.exit js/process
+           (run! (.join path root "os" "aiueos" "scripts" "build-release-image.sh")
+                 [] {:cwd root}))))
+
+(defn- cmd-verify [args]
+  (let [root (aiueos-root args)]
+    (.exit js/process
+           (run! "nbb" [(.join path root "os" "aiueos" "scripts" "smoke-qemu-usb-boot.cljk")]
+                 {:cwd root}))))
+
+(defn- cmd-flash [args]
+  ;; Pass through untouched. The guards that matter (removable-only, whole-disk
+  ;; only, receipt match, readback) live in the aiueos tool; wrapping them here
+  ;; would mean a second place to get them wrong.
+  (let [root (aiueos-root args)
+        passthrough (remove #{"flash"} args)]
+    (.exit js/process
+           (run! "nbb" (into [(.join path root "os" "aiueos" "scripts" "flash-usb.cljk")]
+                             passthrough)
+                 {:cwd root}))))
+
+;; Authority: os/aiueos/contracts/murakumo-node-v1.edn :work-kinds.
+(def work-kind-codes
+  {:media-postproc 1 :small-shard 2 :embarrassingly-parallel 3 :prompt-eval 4
+   :host-large-model 5 :low-latency-pipeline 6 :media-generate 7 :full-shard 8})
+
+(def tier-codes {:browser 0 :wasm 1 :native 2})
+
+(defn- cmd-enroll [args]
+  (let [tier (keyword (or (arg args "--tier") "native"))
+        mem (when-let [m (arg args "--mem-bytes")] (js/parseInt m 10))
+        inbound? (flag? args "--inbound")
+        node-name (or (arg args "--name") "aiueos-node")
+        did (or (arg args "--did") "did:aiueos:unregistered")
+        kind (keyword (or (arg args "--work-kind") "media-generate"))]
+    (when-not (contains? tier-codes tier)
+      (die "unknown tier" tier "-- one of" (str/join ", " (map name (keys tier-codes)))))
+    (when-not (contains? work-kind-codes kind)
+      (die "unknown work kind" kind))
+    (let [caps (cond-> {:name node-name :did did :tier tier
+                        :inbound-reachable? inbound?}
+                 mem (assoc :mem-bytes mem))
+          record (join/enrollment caps)]
+      (println ";; enrollment record — post to /infer/nodes")
+      (println (pr-str record))
+      (println)
+      (println ";; the same decision as aiueos would compute it on the node")
+      (println ";; (os/aiueos/kotoba/murakumo-join-plan.kotoba, arity 4)")
+      (println (pr-str {:aiueos/entry 'aiueos-murakumo-join-plan
+                        :aiueos/node (+ (tier-codes tier) (if inbound? 4 0))
+                        :aiueos/kind (work-kind-codes kind)
+                        ;; `present` packed into bit 0 so a declared 0 bytes
+                        ;; stays distinct from no declaration at all.
+                        :aiueos/mem-request (if mem (inc (* 2 mem)) 0)
+                        :aiueos/contract "os/aiueos/contracts/murakumo-node-v1.edn"}))
+      (println)
+      (println ";; NOTE: aiueos bare-metal has no network stack yet, so a node")
+      (println ";;       can compute this plan and cannot yet post it. Enrolling")
+      (println ";;       an aiueos node is an operator action from here until the")
+      (println ";;       hosted profile lands. See aiueos ADR-0019."))))
+
+(defn -main [& args]
+  (let [args (vec args)
+        cmd (first args)]
+    (case cmd
+      "image" (cmd-image args)
+      "verify" (cmd-verify args)
+      "flash" (cmd-flash args)
+      "enroll" (cmd-enroll args)
+      (do (binding [*out* *err*]
+            (println "usage: murakumo aiueos <image|verify|flash|enroll> [opts]")
+            (println "  image                 build the aiueos GPT release image")
+            (println "  verify                USB boot equivalence gate (QEMU)")
+            (println "  flash  --device …     write the image to a USB stick")
+            (println "  enroll --tier native --mem-bytes N [--inbound]")
+            (println "                        enrollment record + aiueos wire args"))
+          (.exit js/process 2)))))
+
+(apply -main *command-line-args*)

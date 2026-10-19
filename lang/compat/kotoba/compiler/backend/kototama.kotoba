@@ -1,0 +1,279 @@
+(ns kotoba.compiler.backend.kototama
+  "Emit Kototama's engine-neutral closed expression artifact from checked KIR.
+
+  This backend serializes semantics as data. It emits no Wasm, host source,
+  function pointer, or register-machine instruction stream."
+  {:kotoba/export [artifact-tag emit expression]}
+  (:require [ipld.core :as ipld]))
+
+(def artifact-tag "kototama.vm/program")
+(def artifact-version 1)
+
+(defn- reject! [reason data]
+  (throw (ex-info "Kototama artifact emission refused"
+                  (merge {:phase :kototama-emission :reason reason} data))))
+
+(defn- text-name [value]
+  (cond
+    (symbol? value) (if-let [n (namespace value)]
+                      (str n "/" (name value))
+                      (name value))
+    (keyword? value) (if-let [n (namespace value)]
+                       (str n "/" (name value))
+                       (name value))
+    :else (reject! :name-must-be-symbol-or-keyword {:value value})))
+
+(defn- compare-bytes [left right]
+  (loop [left (seq left), right (seq right)]
+    (cond
+      (nil? left) (if (nil? right) 0 -1)
+      (nil? right) 1
+      :else (let [a (bit-and (int (first left)) 0xff)
+                  b (bit-and (int (first right)) 0xff)]
+              (if (= a b)
+                (recur (next left) (next right))
+                (compare a b))))))
+
+(defn- canonical-sort [values]
+  (sort (fn [left right]
+          (compare-bytes (ipld/encode left) (ipld/encode right)))
+        values))
+
+(defn- integer-value? [value]
+  (or (integer? value)
+      false))
+
+(defn- integer-form [value]
+  ["integer" (str value)])
+
+(defn- bytes-value? [value]
+  false)
+
+(defn- bytes-form [value]
+  ["bytes" (mapv #(bit-and (int %) 0xff) value)])
+
+(defn- quoted-value? [value]
+  (or (nil? value) (boolean? value) (string? value) (integer-value? value)
+      (and (vector? value) (every? quoted-value? value))))
+
+(declare expression wire-data)
+
+(defn- wire-data [value]
+  (cond
+    (or (nil? value) (boolean? value) (string? value)) value
+    (integer-value? value) (integer-form value)
+    (bytes-value? value) (bytes-form value)
+    (keyword? value) ["keyword" (text-name value)]
+    (symbol? value) ["symbol" (text-name value)]
+    (vector? value) (mapv wire-data value)
+    (seq? value) ["list" (mapv wire-data value)]
+    (set? value) (vec (canonical-sort (map wire-data value)))
+    (map? value) ["map"
+                  (->> value
+                       (map (fn [[key item]]
+                              [(wire-data key) (wire-data item)]))
+                       (sort (fn [[left] [right]]
+                               (compare-bytes (ipld/encode left)
+                                              (ipld/encode right))))
+                       vec)]
+    :else (reject! :non-portable-value {:value-type (type value)})))
+
+(defn- wire-type [value]
+  (cond
+    (or (keyword? value) (symbol? value)) (text-name value)
+    (vector? value) (mapv wire-type value)
+    :else (reject! :invalid-type-tag {:value value})))
+
+(def ^:private arithmetic-ops
+  #{'+ '- '* '/ 'quot 'rem 'mod})
+
+(def ^:private arithmetic-names
+  {'+ "add" '- "sub" '* "mul" '/ "div"
+   'quot "quot" 'rem "mod" 'mod "mod"})
+
+(def ^:private comparison-ops '#{= < > <= >=})
+(def ^:private actor-ops
+  #{"self" "caller" "address" "method" "params" "value"
+    "call" "static-call" "delegate-call" "create" "emit"})
+(def ^:private state-ops #{"root" "open" "read" "write" "link" "stat" "set-state"})
+(def ^:private data-i64-types #{:i64 :bool :string :vector-i64 :map})
+
+(defn expression
+  "Encode one checked KIR expression in Kototama's closed, tagged form."
+  [form locals functions]
+  (cond
+    (or (nil? form) (boolean? form) (string? form))
+    ["const" form]
+
+    (integer-value? form) ["const" (integer-form form)]
+
+    (keyword? form) (reject! :unsupported-value-kind {:kind :keyword})
+
+    (symbol? form)
+    (if (contains? locals form)
+      ["var" (text-name form)]
+      (reject! :unbound-symbol {:symbol form}))
+
+    (vector? form) ["vector" (mapv #(expression % locals functions) form)]
+
+    (set? form) (reject! :unsupported-value-kind {:kind :set})
+
+    (map? form)
+    ["map" (->> form
+                (map (fn [[key item]]
+                       [(expression key locals functions)
+                        (expression item locals functions)]))
+                (sort (fn [[left] [right]]
+                        (compare-bytes (ipld/encode left) (ipld/encode right))))
+                vec)]
+
+    (not (seq? form)) (reject! :unsupported-expression {:form form})
+
+    :else
+    (let [[head & args] form
+          op (when (or (symbol? head) (keyword? head)) (text-name head))]
+      (when-not op (reject! :invalid-expression-head {:form form}))
+      (case op
+        "if" (do
+               (when-not (= 3 (count args))
+                 (reject! :invalid-if-arity {:form form}))
+               (into ["if"] (mapv #(expression % locals functions) args)))
+
+        "do" ["do" (mapv #(expression % locals functions) args)]
+
+        "get" (do
+                (when-not (= 2 (count args))
+                  (reject! :invalid-get-arity {:form form}))
+                ["get" (expression (first args) locals functions)
+                 (expression (second args) locals functions)])
+
+        "assoc" (do
+                  (when-not (= 3 (count args))
+                    (reject! :invalid-assoc-arity {:form form}))
+                  ["assoc" (expression (first args) locals functions)
+                   (expression (second args) locals functions)
+                   (expression (nth args 2) locals functions)])
+
+        "dissoc" (do
+                   (when-not (= 2 (count args))
+                     (reject! :invalid-dissoc-arity {:form form}))
+                   ["dissoc" (expression (first args) locals functions)
+                    (expression (second args) locals functions)])
+
+        "let" (let [[bindings body & extra] args]
+                (when-not (and (empty? extra) (vector? bindings)
+                               (even? (count bindings)))
+                  (reject! :invalid-let-bindings {:form form}))
+                (loop [pairs (partition 2 bindings)
+                       locals* locals
+                       wire-bindings []]
+                  (if-let [[name value] (first pairs)]
+                    (do
+                      (when-not (symbol? name)
+                        (reject! :invalid-let-name {:name name}))
+                      (recur (next pairs)
+                             (conj locals* name)
+                             (conj wire-bindings
+                                   [(text-name name)
+                                    (expression value locals* functions)])))
+                    ["let" wire-bindings
+                     (expression body locals* functions)])))
+
+        "loop" (let [[bindings body & extra] args]
+                 (when-not (and (empty? extra) (vector? bindings)
+                                (even? (count bindings)))
+                   (reject! :invalid-loop-bindings {:form form}))
+                 (let [names (map first (partition 2 bindings))]
+                   (when-not (every? symbol? names)
+                     (reject! :invalid-loop-name {:names names}))
+                   ["loop"
+                    (mapv (fn [[name value]]
+                            [(text-name name) (expression value locals functions)])
+                          (partition 2 bindings))
+                    (expression body (into locals names) functions)]))
+
+        "recur" ["recur" (mapv #(expression % locals functions) args)]
+
+        "quote" (do
+                  (when-not (= 1 (count args))
+                    (reject! :invalid-quote-arity {:form form}))
+                  (when-not (quoted-value? (first args))
+                    (reject! :unsupported-quoted-value {:value (first args)}))
+                  ["const" (wire-data (first args))])
+
+        "cap-call" ["effect" "invoke-capability"
+                    (mapv #(expression % locals functions) args)]
+        "typed-cap-call" ["effect" "invoke-capability"
+                          (mapv #(expression % locals functions) args)]
+
+        (cond
+          (contains? arithmetic-ops head)
+          ["arith" (get arithmetic-names head)
+           (mapv #(expression % locals functions) args)]
+          (contains? comparison-ops head)
+          ["compare" op (mapv #(expression % locals functions) args)]
+          (contains? actor-ops op)
+          (reject! :unsupported-actor-operation {:operation op})
+          (contains? state-ops op)
+          (reject! :unsupported-state-operation {:operation op})
+          (= op "authorize")
+          (reject! :unsupported-authorization-operation {:operation op})
+          (contains? functions head)
+          ["call" op (mapv #(expression % locals functions) args)]
+          :else (reject! :unsupported-expression-operation
+                         {:operation op :form form}))))))
+
+(defn emit
+  "Emit a canonical DAG-CBOR Kototama program block from checked KIR.
+
+  Returns the closed program node and its content CID/bytes. The output is
+  independent of Amu's Wasm, Script, native, or EVM backends."
+  [kir]
+  (when-not (and (map? kir)
+                 (contains? #{:kotoba.kir/v3 :kotoba.kir/v4} (:format kir))
+                 (or (nil? (:entry kir)) (symbol? (:entry kir)))
+                 (vector? (:functions kir)))
+    (reject! :invalid-kir-shape {:format (:format kir)}))
+  (let [functions (into {} (map (juxt :name identity) (:functions kir)))
+        typed? (= :kotoba.kir/v4 (:format kir))
+        exports (->> (or (:exports kir) (keys functions))
+                     (map text-name) sort vec)
+        entry (:entry kir)]
+    (when-not (or (nil? entry)
+                  (and (contains? functions entry)
+                       (some #{(text-name entry)} exports)))
+      (reject! :entry-not-exported {:entry entry :exports (:exports kir)}))
+    (let [methods
+          (into {}
+                (map (fn [[function-name function]]
+                       (let [params (:params function)
+                             param-types (or (:param-types function)
+                                             (vec (repeat (count params) (if typed? :value :i64))))
+                             result-type (:result function)
+                             locals (set params)
+                             effects (->> (:effects function)
+                                          (map wire-data)
+                                          canonical-sort
+                                          vec)]
+                         (when-not (and (= (count params) (count param-types))
+                                        (if typed?
+                                          (and (every? data-i64-types param-types)
+                                               (contains? data-i64-types result-type))
+                                          (and (every? #{:i64} param-types)
+                                               (= :i64 result-type))))
+                           (reject! :unsupported-value-profile
+                                    {:function function-name
+                                     :params param-types :result result-type}))
+                         [(text-name function-name)
+                          {"params" (mapv text-name params)
+                           "param-types" (mapv #(if typed? "value" (wire-type %)) param-types)
+                           "result" (if typed? "value" (wire-type (:result function)))
+                           "effects" effects
+                           "body" (expression (:body function) locals functions)}])))
+                (sort-by (comp text-name key) functions))
+          node [artifact-tag artifact-version
+                {"entry" (when entry (text-name entry))
+                 "exports" exports
+                 "value-profile" (if typed? "kototama.data-i64/v1" "kotoba.i64-wrap/v1")
+                 "methods" methods}]]
+      (merge {:node node} (ipld/node->block node)))))

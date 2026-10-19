@@ -1,0 +1,138 @@
+(ns dango.caveat
+  "The caveat language: a closed, total predicate over request facts.
+
+  This is what stands where Biscuit has Datalog. It is deliberately small:
+  a fixed operator table, a fixed fact vocabulary, no recursion, no user
+  functions, no eval, no I/O. `holds?` always answers a boolean, and a form
+  it cannot evaluate is refused by `problems` before evaluation; nothing a presenter writes can make evaluation loop, allocate without
+  bound, or reach outside the request map it is handed.
+
+  Across blocks, caveats are conjoined (`dango.chain`), so a block can only
+  ever narrow what its parent allowed.
+
+  ## Fail closed on the value, refuse on the shape
+
+  A caveat that names an operator or fact outside the vocabulary is a
+  malformed token: `problems` reports it and the chain is refused with that
+  reason. A well-formed caveat that cannot be decided for THIS request — the
+  fact is absent, or the operands have different types — is `false`, never
+  an error the caller might mistake for a pass. Negation cannot flip that:
+  the evaluator is three-valued, and only a final `true` holds."
+  (:require [kotoba.lang.text :as str]))
+
+(def operators
+  "Operator → arity. `:variadic` takes one or more arguments. A form is a
+  vector whose head is one of these keywords — `[:and [:<= :req/bytes 10]
+  [:prefix? :req/path \"ds/\"]]` — never a list: nothing here is code, so
+  nothing here can be mistaken for code to evaluate (owner decision
+  2026-09-24; the same family as UCAN 1.0 policy)."
+  {:and :variadic :or :variadic :not 1
+   := 2 :< 2 :<= 2 :> 2 :>= 2
+   :prefix? 2 :member? 2})
+
+(def facts
+  "The request facts a caveat may name. Per-surface facts are an open
+  question (adr-2609242100-capability-chain-is-ipld-sexpr-biscuit-is-an-adapter
+  gaps); adding one is a vocabulary change, not a
+  code change, and nothing else may be referenced."
+  #{:req/path :req/bytes :req/now :req/kind :req/resource :req/holder})
+
+(def max-nodes 256)
+(def max-depth 16)
+
+(defn- fact-ref? [x]
+  (and (keyword? x) (= "req" (namespace x))))
+
+(defn- literal? [x]
+  (or (string? x) (integer? x) (boolean? x) (nil? x)
+      (and (keyword? x) (not (fact-ref? x)))
+      (and (set? x) (every? #(or (string? %) (integer? %) (keyword? %)) x))))
+
+(defn- walk
+  "One step of `problems`: ACC is {:budget n :out [...]}, threaded through
+  the whole form so the node budget is global, not per branch."
+  [x depth acc]
+  (let [acc (update acc :budget dec)]
+    (cond
+      (neg? (:budget acc)) acc
+      (> depth max-depth) (update acc :out conj [:dango/caveat-too-large [:depth depth]])
+      (vector? x)
+      (let [op (first x)
+            args (rest x)
+            arity (get operators op)]
+        (cond
+          (nil? arity) (update acc :out conj [:dango/unknown-operator op])
+          (and (= :variadic arity) (empty? args))
+          (update acc :out conj [:dango/malformed-caveat [:no-arguments op]])
+          (and (integer? arity) (not= arity (count args)))
+          (update acc :out conj [:dango/malformed-caveat [:arity op (count args)]])
+          :else (reduce (fn [a arg] (walk arg (inc depth) a)) acc args)))
+      (fact-ref? x) (if (contains? facts x)
+                      acc
+                      (update acc :out conj [:dango/unknown-fact x]))
+      (literal? x) acc
+      :else (update acc :out conj [:dango/malformed-caveat [:not-a-term (str x)]]))))
+
+(defn problems
+  "Vector of [reason detail] for one caveat form. Empty = well-formed.
+
+  Walks with an explicit depth and a node budget, so a hostile form is
+  refused by size before anything else looks at it."
+  [form]
+  (let [r (walk form 0 {:budget max-nodes :out []})]
+    (if (neg? (:budget r))
+      [[:dango/caveat-too-large [:nodes max-nodes]]]
+      (:out r))))
+
+;; Three values: true, false, and `unknown` for "cannot be decided for this
+;; request" (an absent fact, operands of different types). Kleene logic keeps
+;; unknown from turning into true: `(not unknown)` is unknown, `and` is false
+;; if any argument is false, `or` is true if any argument is true, and only a
+;; final `true` holds. Two-valued logic here was fail-open —
+;; `[:not [:= :req/kind :data/write]]` held when the request carried no kind.
+(def ^:private unknown ::unknown)
+
+(defn- same-kind? [a b]
+  (or (and (integer? a) (integer? b))
+      (and (string? a) (string? b))
+      (and (boolean? a) (boolean? b))))
+
+(defn- compare-op [op a b]
+  (cond
+    (or (= unknown a) (= unknown b)) unknown
+    (= op :=) (if (or (same-kind? a b) (and (keyword? a) (keyword? b))) (= a b) unknown)
+    (contains? #{:< :<= :> :>=} op) (if (and (integer? a) (integer? b))
+                             (case op :< (< a b) :<= (<= a b) :> (> a b) :>= (>= a b))
+                             unknown)
+    (= op :prefix?) (if (and (string? a) (string? b)) (str/starts-with? a b) unknown)
+    (= op :member?) (if (set? b) (contains? b a) unknown)))
+
+(defn- ev
+  "Evaluate a form `problems` already accepted: true, false or `unknown` for
+  a predicate, the value for a term."
+  [x request]
+  (cond
+    (vector? x)
+    (let [op (first x)
+          args (rest x)]
+      (case op
+        :and (let [vs (map #(ev % request) args)]
+              (cond (some false? vs) false
+                    (every? true? vs) true
+                    :else unknown))
+        :or (let [vs (map #(ev % request) args)]
+             (cond (some true? vs) true
+                   (every? false? vs) false
+                   :else unknown))
+        :not (let [v (ev (first args) request)]
+              (if (boolean? v) (not v) unknown))
+        (compare-op op (ev (first args) request) (ev (second args) request))))
+    (fact-ref? x) (if (contains? request x) (get request x) unknown)
+    :else x))
+
+(defn holds?
+  "Does well-formed caveat FORM hold for REQUEST (a map of `facts` keys)?
+  Always a boolean. Call `problems` first; a malformed form here is false."
+  [form request]
+  (and (empty? (problems form))
+       (true? (ev form request))))

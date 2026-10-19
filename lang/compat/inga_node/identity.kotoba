@@ -1,0 +1,52 @@
+(ns inga-node.identity
+  "This witness's key, generated HERE and never sent anywhere.
+
+  ## Why generation is local rather than distribution central
+
+  The fleet's standing invariant is that nodes are given tests, not secrets.
+  A consensus witness needs a signing key, which looks like it breaks that —
+  and would, if the key were minted centrally and pushed out. It is not. Each
+  node generates its own seed on first start, writes it 0600, and publishes
+  the PUBLIC half. Nothing secret is ever transmitted, so the invariant holds
+  with nothing to argue about.
+
+  This is also what makes the fault-model claim change. The Cloudflare
+  deployment kept all four seeds in one Worker `env`, and said so honestly:
+  four replicas under one operator is crash fault tolerance, because
+  compromising that Worker compromises every witness at once with no
+  threshold left to cross. Four machines that each generated their own key
+  have a threshold. `inga-replica`'s own docstring named this as the thing
+  that would change the claim — *splitting the keys across separately
+  deployed Workers (and then across operators) is what would change it, not
+  adding replicas.* This is that split."
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            ["node:crypto" :as nc]
+            [inga-node.seams :as seams]))
+
+(defn- seed-path [data-dir] (path/join data-dir "seed"))
+
+(defn- generate-seed-hex []
+  (-> (nc/generateKeyPairSync "ed25519")
+      .-privateKey
+      (.export #js {:format "der" :type "pkcs8"})
+      ;; the PKCS#8 prefix for Ed25519 is 16 fixed bytes; the seed is the rest
+      (.subarray 16)
+      (.toString "hex")))
+
+(defn ensure-seed!
+  "The seed for this node, creating it on first start. Returns hex.
+
+  0600 at creation, not chmod-ed after: a key that is world-readable for the
+  microsecond between write and chmod was world-readable."
+  [data-dir]
+  (let [f (seed-path data-dir)]
+    (when-not (fs/existsSync data-dir) (fs/mkdirSync data-dir #js {:recursive true}))
+    (if (fs/existsSync f)
+      (.trim (fs/readFileSync f "utf8"))
+      (let [hex (generate-seed-hex)]
+        (fs/writeFileSync f hex #js {:encoding "utf8" :mode 0600})
+        (js/console.log "inga-node: generated a new witness seed at" f)
+        hex))))
+
+(defn public-hex [seed-hex] (seams/public-hex seed-hex))

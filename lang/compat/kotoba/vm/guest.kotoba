@@ -1,0 +1,179 @@
+(ns kotoba.vm.guest
+  "v1 guest: a register machine over kernel syscalls, or a named host-fn.
+
+  The IPLD code block is:
+
+    {\"kotoba.vm/guest\" 1
+     \"methods\" {name [op …]}}
+
+  or
+
+    {\"kotoba.vm/guest\" 1
+     \"host\" \"counter\"}
+
+  `host` looks up `:host-guests` on the Machine — a test seam, not a
+  production loader. Production code is the methods table. Neither form
+  can see the block store except by issuing a syscall.
+
+  Ops are data, not a stack language. A register is a string. Literals
+  stay literals. The machine charges `:guest/op` per instruction on top
+  of whatever the syscall itself charges."
+  (:require [ipld.core :as ipld]
+            [kotoba.vm.kernel :as k]
+            [kotoba.vm.syscall :as sc]))
+
+(def guest-version 1)
+
+(defn- halted? [ctx]
+  (or (:exhausted? ctx) (:aborted? ctx)))
+
+(defn- load-code
+  "Verified read of the actor's code CID. CID mismatch throws. Missing
+  or ill-shaped code is a refusal the Machine maps onto `:no-code` /
+  `:not-callable`."
+  [ctx code-cid]
+  (let [bytes (ipld/get-verified-block (:get-fn ctx) code-cid)]
+    (when (nil? bytes)
+      (throw (ex-info "kotoba.vm: code block missing"
+                      {:type :kotoba.vm/no-code :cid code-cid})))
+    (let [node (ipld/decode bytes)]
+      (when-not (and (map? node) (= guest-version (get node "kotoba.vm/guest")))
+        (throw (ex-info "kotoba.vm: not a v1 guest block"
+                        {:type :kotoba.vm/not-callable :cid code-cid})))
+      node)))
+
+(defn- reg [regs x]
+  (if (contains? regs x) (get regs x) x))
+
+(defn- step
+  [ctx regs op]
+  (let [ctx (k/charge ctx (sc/costs :guest/op))]
+    (if (halted? ctx)
+      [ctx regs]
+      (let [[op0 a b c d] op]
+        (case op0
+          "self"
+          (let [ctx (k/self-root ctx)]
+            [ctx (assoc regs a (:result ctx))])
+
+          "args" [ctx (assoc regs a (:args ctx))]
+          "method" [ctx (assoc regs a (:method ctx))]
+          "caller" [ctx (assoc regs a (:from ctx))]
+          "address" [ctx (assoc regs a (:to ctx))]
+
+          "const" [ctx (assoc regs a b)]
+          "empty" [ctx (assoc regs a {})]
+
+          "open"
+          (let [ctx (k/ipld-open ctx (reg regs a))]
+            [ctx (assoc regs b (:result ctx))])
+
+          "node"
+          (let [ctx (k/ipld-node ctx (reg regs a))]
+            [ctx (assoc regs b (:result ctx))])
+
+          "get"
+          [ctx (assoc regs c (get (reg regs a) b))]
+
+          "put"
+          [ctx (assoc regs d (assoc (reg regs a) b (reg regs c)))]
+
+          "inc"
+          (let [v (reg regs a)
+                n (inc (long (or v 0)))]
+            [ctx (assoc regs b n)])
+
+          "add"
+          [ctx (assoc regs c (+ (long (or (reg regs a) 0))
+                                (long (or (reg regs b) 0))))]
+
+          "nth"
+          [ctx (assoc regs c (nth (reg regs a) (long b) nil))]
+
+          "write-node"
+          (let [ctx (k/write-node ctx (reg regs a))]
+            [ctx (assoc regs b (:result ctx))])
+
+          "set-state"
+          (let [ctx (k/set-state ctx (reg regs a))]
+            [ctx regs])
+
+          "call"
+          (let [to (reg regs a)
+                method b
+                args (or (reg regs c) [])
+                ctx (k/actor-call ctx {:to to :method method :args args})]
+            [ctx (assoc regs d (:result ctx))])
+
+          "return"
+          [(assoc ctx :return (reg regs a)) regs]
+
+          "halt" [(assoc ctx :halted true) regs]
+
+          (let [ctx (k/abort ctx :not-callable)]
+            [ctx regs]))))))
+
+(defn- run-ops
+  [ctx ops]
+  (loop [ctx ctx
+         regs {}
+         ops ops]
+    (cond
+      (or (halted? ctx) (:halted ctx) (empty? ops)) ctx
+      :else
+      (let [[ctx regs] (step ctx regs (first ops))]
+        (recur ctx regs (rest ops))))))
+
+(defn- run-host
+  [ctx name]
+  (let [f (get (:host-guests ctx) name)]
+    (if-not (ifn? f)
+      (assoc ctx :aborted? true :last-error :not-callable)
+      (let [ctx* (atom ctx)
+            sys (k/syscalls ctx*)
+            message {:method (:method ctx)
+                     :args (:args ctx)
+                     :caller (:from ctx)
+                     :address (:to ctx)}
+            ret (f sys message)
+            ctx @ctx*]
+        (cond
+          (halted? ctx) ctx
+          (and (map? ret) (contains? ret :error))
+          (assoc ctx :aborted? true :last-error (:error ret))
+          (and (map? ret) (contains? ret :state))
+          (let [ctx (if (:state ret)
+                      (k/set-state ctx (:state ret))
+                      ctx)]
+            (cond-> ctx
+              (contains? ret :return) (assoc :return (:return ret))))
+          :else ctx)))))
+
+(defn invoke
+  "Run the callee at `(:to ctx)` against `(:method ctx)` / `(:args ctx)`.
+  Does not flush. Does not update `(:actors ctx)` — the Machine does
+  that from `:self-state` on success."
+  [ctx]
+  (try
+    (let [callee (get-in ctx [:actors (:to ctx)])
+          code-cid (:code callee)]
+      (cond
+        (nil? callee) (assoc ctx :last-error :no-actor)
+        (nil? code-cid) (assoc ctx :last-error :no-code)
+        :else
+        (let [node (load-code ctx code-cid)]
+          (if-let [host (get node "host")]
+            (run-host ctx host)
+            (let [ops (get-in node ["methods" (:method ctx)])]
+              (if (nil? ops)
+                (assoc ctx :aborted? true :last-error :not-callable)
+                (run-ops ctx ops)))))))
+    (catch :default e
+      (let [t (:type (ex-data e))]
+        (cond
+          (= t :ipld/cid-mismatch) (throw e)
+          (= t :kotoba.vm/no-code)
+          (assoc ctx :last-error :no-code)
+          (= t :kotoba.vm/not-callable)
+          (assoc ctx :aborted? true :last-error :not-callable)
+          :else (throw e))))))

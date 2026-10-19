@@ -1,0 +1,275 @@
+(ns murakumo.infer.submit
+  "Enqueue one `qwen38-generate` job — a real prompt for a bare-metal AIUEOS
+  device — and optionally wait for the token array it generates.
+
+  Protocol v3 of the device-P256 worker (network-awai/cloud-murakumo-api
+  `docs/device-worker-v3.md`) carries the prompt as an array of vocabulary ids
+  rather than as text, because the device has no tokenizer. So the caller
+  tokenises, and the caller detokenises. This is that caller.
+
+  ## Why the bounds are not repeated here
+
+  The server owns the contract: 1..32768 prompt tokens, 1..4096 max-tokens,
+  every id below the 248320-entry vocabulary, greedy only. It refuses a
+  violation with one pinned literal, and this command prints that literal
+  verbatim. Restating the numbers here would create a second copy that drifts
+  silently the day the vocabulary changes — the failure mode where a client
+  refuses a job the server would have accepted, or promises one it would not.
+  Pre-flight here is STRUCTURAL only: is this actually a vector of token ids.
+
+  ## Why the tokenizer is injected
+
+  `torch.tokenizer` is portable `.cljc`, but it lives in a west sibling. This
+  namespace does not require it, so `--tokens-file` — the path that always
+  works — needs nothing on the classpath but this repository, and the whole
+  core is testable without a second checkout. `scripts/infer-submit.cljk`
+  supplies `encode`/`decode` from torch.
+
+  It does NOT read a `.gguf`. `torch.gguf` — the thing that turns GGUF
+  tokenizer metadata into a `torch.tokenizer` — is `.clj`, JVM-only, and this
+  client runs on nbb. A JVM-free GGUF metadata reader is real work and is not
+  in this command; until it exists, extract the vocabulary once with the JVM
+  and keep the EDN."
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            ["node:fs" :as fs]))
+
+(def job-kind "qwen38-generate")
+
+;; The Qwen3.8 graph contract's own ids (aiueos
+;; os/aiueos/contracts/qwen38-qwen35-runtime-v1.edn :41-42). These are
+;; identifiers, not bounds: they name specific tokens, and they change only if
+;; the model does.
+(def bos-token 248044)
+(def eos-token 248046)
+
+(defn parse-args [args]
+  (loop [xs args, acc {}]
+    (if-let [a (first xs)]
+      (if (str/starts-with? a "--")
+        (recur (drop 2 xs) (assoc acc (keyword (subs a 2)) (second xs)))
+        (recur (rest xs) acc))
+      acc)))
+
+(defn token-vector?
+  "Structural only. Whether this is the SHAPE of a token array at all -- the
+  server decides whether it is an acceptable one."
+  [xs]
+  (and (vector? xs)
+       (boolean (seq xs))
+       (every? #(and (number? %) (integer? %) (not (neg? %))) xs)))
+
+(defn parse-tokens-file
+  "An EDN token file is either a bare vector of ids or a map that may also
+  carry `:max-tokens` and `:stop-tokens`, so one file can describe a whole job."
+  [text]
+  (let [value (edn/read-string text)]
+    (cond
+      (vector? value) {:tokens value}
+      (map? value) (select-keys value [:tokens :max-tokens :stop-tokens])
+      :else (throw (ex-info "--tokens-file must hold an EDN vector of token ids, or a map with :tokens"
+                            {:read (pr-str value)})))))
+
+(defn job-input
+  "The `:input` of a qwen38-generate queue job.
+
+  Precedence: an explicit `--max-tokens` wins over one carried by the tokens
+  file, which wins over the default. `:temperature` is fixed at 0 -- v3 is
+  greedy, and a sampled job would need its seed inside the device's signature
+  to stay reproducible."
+  [{:keys [tokens max-tokens stop-tokens]} opts]
+  (when-not (token-vector? tokens)
+    (throw (ex-info "no prompt tokens: pass --tokens-file, or --prompt with --tokenize-with torch --vocab-file"
+                    {:tokens (pr-str tokens)})))
+  {:tokens tokens
+   :max-tokens (or (some-> (:max-tokens opts) js/parseInt)
+                   max-tokens
+                   64)
+   :stop-tokens (or (some->> (:stop-tokens opts)
+                             (#(str/split % #","))
+                             (mapv js/parseInt))
+                    stop-tokens
+                    [eos-token])
+   :temperature 0})
+
+(defn submit-body
+  "The whole POST /infer/queue body, including the placement contract. A
+  `--target-did` pins the job to one physical device and never falls back."
+  [input opts]
+  (cond-> {:kind job-kind
+           :price (or (some-> (:price opts) js/parseInt) 1)
+           :input input}
+    (:target-did opts) (assoc :target-did (:target-did opts))))
+
+(defn control-auth [opts env]
+  (let [candidates [[:cacao (:cacao opts)]
+                    [:bearer (:token opts)]
+                    [:cacao (get env "MURAKUMO_NODE_CACAO")]
+                    [:bearer (get env "MURAKUMO_SERVICE_TOKEN")]]]
+    (some (fn [[kind credential]]
+            (when-not (str/blank? (str credential))
+              {:kind kind :credential credential}))
+          candidates)))
+
+(defn auth-headers [auth]
+  (cond-> {"content-type" "application/json"}
+    (= :bearer (:kind auth)) (assoc "authorization"
+                                    (str "Bearer " (:credential auth)))
+    (= :cacao (:kind auth)) (assoc "authorization"
+                                   (str "CACAO " (:credential auth)))))
+
+(defn api!
+  "One control-plane call. The response body is parsed when it is JSON and
+  returned as text when it is not, so a proxy error page is reported rather
+  than crashing the command."
+  [fetch base auth method path body]
+  (-> (fetch (str base path)
+             (clj->js (cond-> {:method (str/upper (name method))
+                               :headers (auth-headers auth)}
+                        body (assoc :body (js/JSON.stringify (clj->js body))))))
+      (.then (fn [response]
+               (-> (.text response)
+                   (.then (fn [text]
+                            {:status (.-status response)
+                             :body (try (js->clj (js/JSON.parse text)
+                                                 :keywordize-keys true)
+                                        (catch :default _ text))})))))))
+
+(defn result-tokens
+  "The generated array out of GET /infer/queue/:id/result, or nil while the
+  job is still pending. `:text` is deliberately nil on that route: the API has
+  no vocabulary and cannot detokenise."
+  [body]
+  (when (vector? (:output-tokens body)) (:output-tokens body)))
+
+(defn- read-edn! [path]
+  (edn/read-string (fs/readFileSync path "utf8")))
+
+(defn resolve-tokens!
+  "Read the prompt, either as ids or by encoding text with an injected
+  tokenizer. Returns nil when neither source was named, so the caller prints
+  usage rather than submitting an empty job."
+  [opts encode]
+  (cond
+    (:tokens-file opts)
+    (parse-tokens-file (fs/readFileSync (:tokens-file opts) "utf8"))
+
+    (= "torch" (:tokenize-with opts))
+    (do
+      (when-not encode
+        (println "--tokenize-with torch needs torch on the classpath")
+        (println "  kbb --backend sci --classpath src:../torch/src scripts/infer-submit.cljk …")
+        (js/process.exit 1))
+      (when-not (:vocab-file opts)
+        (println "--tokenize-with torch needs --vocab-file <edn> ({:tokens [...] :merges [...]}).")
+        (println "It cannot read a .gguf: torch.gguf is .clj (JVM only) and this client runs on nbb.")
+        (js/process.exit 1))
+      (when-not (:prompt opts)
+        (println "--tokenize-with torch needs --prompt <text>.")
+        (js/process.exit 1))
+      {:tokens (vec (encode (read-edn! (:vocab-file opts)) (:prompt opts)))})
+
+    :else nil))
+
+(def usage
+  (str "usage: kbb --backend sci --classpath src:../torch/src scripts/infer-submit.cljk \\\n"
+       "         (--tokens-file ids.edn | --tokenize-with torch --vocab-file v.edn --prompt TEXT) \\\n"
+       "         [--max-tokens 64] [--stop-tokens 248046,...] [--price 1] \\\n"
+       "         [--target-did did:key:z...] [--base https://api.murakumo.cloud] \\\n"
+       "         [--wait 120] [--detokenize]\n\n"
+       "Enqueues one qwen38-generate job: a token-array prompt for a bare-metal\n"
+       "AIUEOS device. Auth is MURAKUMO_NODE_CACAO or MURAKUMO_SERVICE_TOKEN\n"
+       "(or --cacao / --token). See device-worker-v3.md in cloud-murakumo-api."))
+
+(defn poll-result!
+  "GET the result until it exists or --wait elapses. The device settles a token
+  array; :text is nil on the wire, so detokenising is this side's job."
+  [log fetch base auth job-id deadline decode vocab]
+  (-> (api! fetch base auth :get (str "/infer/queue/" job-id "/result") nil)
+      (.then
+       (fn [{:keys [status body]}]
+         (cond
+           (= 200 status)
+           (let [tokens (result-tokens body)]
+             (log (str "[submit] stop-reason " (:stop-reason body)
+                       " tokens " (count (or tokens []))))
+             (log (pr-str (or tokens (:text body))))
+             (when (and decode vocab tokens)
+               (log (str "[submit] text: " (decode vocab tokens))))
+             :settled)
+
+           (> (js/Date.now) deadline)
+           (do (log (str "[submit] still pending after --wait; job-id " job-id))
+               :pending)
+
+           :else
+           (js/Promise.
+            (fn [resolve]
+              (js/setTimeout
+               #(resolve (poll-result! log fetch base auth job-id deadline
+                                       decode vocab))
+               3000))))))))
+
+(defn run!
+  "The whole command with every effect injected, so it can be driven in a test.
+  `:log` defaults to println; a test supplies its own to assert on what an
+  operator is actually shown."
+  [{:keys [fetch args env encode decode log]}]
+  (let [log (or log println)
+        opts (parse-args args)
+        base (str/replace (or (:base opts) "https://api.murakumo.cloud") #"/+$" "")
+        auth (control-auth opts env)
+        source (resolve-tokens! opts encode)]
+    (cond
+      (or (nil? source) (:help opts))
+      (do (log usage) (js/Promise.resolve :usage))
+
+      (nil? auth)
+      (do (log "MURAKUMO_NODE_CACAO or MURAKUMO_SERVICE_TOKEN must be set (or --cacao/--token).")
+          (js/Promise.resolve :unauthenticated))
+
+      :else
+      (let [input (job-input source opts)
+            body (submit-body input opts)]
+        (log (str "[submit] " (count (:tokens input))
+                  " prompt tokens, max-tokens " (:max-tokens input)
+                  " -> " base "/infer/queue"))
+        (-> (api! fetch base auth :post "/infer/queue" body)
+            (.then
+             (fn [{:keys [status body]}]
+               (if-not (= 201 status)
+                 ;; The server's pinned rejection literal, verbatim. This
+                 ;; command does not paraphrase it and does not pre-empt it.
+                 (do (log (str "[submit] rejected (" status "): "
+                               (or (:error body) (pr-str body))))
+                     :rejected)
+                 (let [job-id (:job-id body)
+                       wait (some-> (:wait opts) js/parseInt)]
+                   (log (str "[submit] job-id " job-id))
+                   (if-not wait
+                     :submitted
+                     (poll-result! log fetch base auth job-id
+                                   (+ (js/Date.now) (* 1000 wait))
+                                   decode
+                                   (when (:detokenize opts)
+                                     (some-> (:vocab-file opts) read-edn!)))))))))))))
+
+(defn main!
+  "Entry point body. `encode`/`decode` come from the launcher so this
+  namespace never requires a west sibling."
+  [args encode decode]
+  (-> (run! {:fetch js/fetch
+             :args args
+             :env {"MURAKUMO_SERVICE_TOKEN" (aget js/process.env "MURAKUMO_SERVICE_TOKEN")
+                   "MURAKUMO_NODE_CACAO" (aget js/process.env "MURAKUMO_NODE_CACAO")}
+             :encode encode
+             :decode decode})
+      (.then (fn [outcome]
+               (when (contains? #{:usage :unauthenticated :rejected} outcome)
+                 (js/process.exit 1))
+               outcome))
+      ;; A control plane that is unreachable is an operator's problem to read,
+      ;; not a stack trace to decode.
+      (.catch (fn [error]
+                (println (str "[submit] control plane unreachable: " error))
+                (js/process.exit 1)))))

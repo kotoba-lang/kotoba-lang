@@ -1,0 +1,125 @@
+(ns murakumo.infer.chat-route
+  "Live-signal routing of ONE chat request over the Mishima edge nodes — pure data → data.
+
+  `schedule` places media jobs and `rebalance` sizes pools; neither routes chat.
+  This namespace decides which node answers a chat request from signals that were
+  measured, not declared (ADR-261003):
+
+    alive      — only a node that ANSWERED the fixed probe correctly (`probe-ok?`);
+                 an open port or a 200 on /health never admits a node.
+    eligible   — alive, a free slot, and a context window that covers the request.
+    order      — [manual-low-priority, latency-tier, last-used]: a slow node is
+                 demoted by its own EWMA, ties go to the least recently used.
+
+  Same inputs → same pick (no clock, no RNG, no I/O): the caller passes `:last-used`
+  and observed milliseconds in. Hosts: the operator-Mac router today, the gateway
+  Worker later.
+
+  ⚠ Temporary constraint (same class as `capacity`): the sibling planners keep
+  their formulas in shipped `:infer-*` KIR oracles. This module is plain portable
+  Clojure because the KIR toolchain is not on the path of the machine that had to
+  route traffic during the 2026-10-02 `gad` outage. Removal condition: port
+  `ewma`, `latency-tier` and `order-key` to `kotoba/infer_chat_route_core` and call
+  them through `murakumo.kotoba.oracle` like the siblings.")
+
+(def default-config
+  {:alpha 0.3                 ; EWMA weight of the newest sample
+   :tier-ms [5000 15000]      ; ≤5 s tier 0, ≤15 s tier 1, else tier 2
+   :default-slots 1})
+
+;; ---- liveness ---------------------------------------------------------------
+
+(def probe-question "2+3は? 数字だけで答えて。")
+
+(defn probe-ok?
+  "True iff `content` is a short answer of five to `probe-question`.
+  Catches wrong numbers, degenerate output (all \"0\", empty, runaway reasoning)
+  that /health cannot see."
+  [content]
+  (let [s (str content)
+        n (count s)]
+    (boolean (and (pos? n) (< n 12)
+                  (re-matches #"\s*(?:5|答えは5|5です)[。.!！]?\s*" s)))))
+
+;; ---- latency ----------------------------------------------------------------
+
+(defn ewma
+  "Exponentially weighted moving average. First sample (nil prev) is taken as is."
+  [prev sample alpha]
+  (if (nil? prev)
+    sample
+    (+ (* alpha sample) (* (- 1 alpha) prev))))
+
+(defn observe
+  "Fold one PROBE time (ms) into the node's EWMA. Probe time only: the question
+  is fixed, so it is comparable across nodes; request time is not (it scales with
+  the prompt)."
+  ([node ms] (observe default-config node ms))
+  ([cfg node ms] (assoc node :ewma-ms (ewma (:ewma-ms node) ms (:alpha cfg)))))
+
+(defn latency-tier
+  "0 fast / 1 slow / 2 very slow. A node with no observation yet is tier 0."
+  [cfg ewma-ms]
+  (let [[fast slow] (:tier-ms cfg)]
+    (cond (nil? ewma-ms) 0
+          (<= ewma-ms fast) 0
+          (<= ewma-ms slow) 1
+          :else 2)))
+
+;; ---- eligibility and order ---------------------------------------------------
+
+(defn slots [cfg node] (or (:slots node) (:default-slots cfg)))
+
+(defn fits?
+  "Does the node's window cover measured prompt tokens and effective output?
+  Omitted max-tokens uses the node's measured/configured :default-max-tokens.
+  Unknown budgets or context, and invalid token counts, fail closed. The caller
+  must supply the prompt estimate and the actual backend default when omitted."
+  [node {:keys [prompt-tokens max-tokens]}]
+  (let [output (or max-tokens (:default-max-tokens node))
+        ctx (:ctx node)]
+    (boolean
+     (and (integer? prompt-tokens) (<= 0 prompt-tokens)
+          (integer? output) (<= 0 output)
+          (integer? ctx) (<= 0 ctx)
+          (>= ctx (+ prompt-tokens output))))))
+
+(defn eligible?
+  ([node req] (eligible? default-config node req))
+  ([cfg node req]
+   (boolean (and (:alive? node)
+                 (< (or (:inflight node) 0) (slots cfg node))
+                 (fits? node req)))))
+
+(defn order-key
+  "Lower is better. Manual pin first, then measured latency, then least recently used."
+  [cfg node]
+  [(if (:low-priority? node) 1 0)
+   (latency-tier cfg (:ewma-ms node))
+   (or (:last-used node) 0)])
+
+(defn pick
+  "Choose the node for `req`.
+   → {:node id}                       a node to use now
+   → {:wait true}                     a node could take it once a slot frees
+   → {:none :too-long}                no live node can ever fit this request
+   → {:none :no-live-node}            nothing is alive"
+  ([nodes req] (pick default-config nodes req))
+  ([cfg nodes req]
+   (let [alive (filter :alive? nodes)
+         able  (filter #(fits? % req) alive)
+         free  (filter #(eligible? cfg % req) nodes)]
+     (cond
+       (empty? alive) {:none :no-live-node}
+       (empty? able)  {:none :too-long}
+       (empty? free)  {:wait true}
+       :else {:node (:id (first (sort-by #(order-key cfg %) free)))}))))
+
+;; ---- capacity ----------------------------------------------------------------
+
+(defn total-slots
+  "Concurrent requests the live fleet can serve: what fallback bots must be
+  counted against."
+  ([nodes] (total-slots default-config nodes))
+  ([cfg nodes]
+   (reduce + 0 (map #(slots cfg %) (filter :alive? nodes)))))

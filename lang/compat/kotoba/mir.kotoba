@@ -1,0 +1,3360 @@
+(ns kotoba.mir
+  "Closed target-selected Machine IR and deterministic allocation."
+  {:kotoba/export [allocate-registers allocator-pool call-argument-registers capability-argument-registers capability-context-offsets counted-self-recur-plan counted-self-recur-plans instruction-keysets kernel-atomic-ops kernel-dequant-dot-maximum kernel-dequant-dot-operations kernel-dot-f32-maximum kernel-window-maxima kernel-window-operations leaf-registers physical-registers preserved-registers privileged-argument-registers return-registers runtime-argument-registers runtime-context-offsets saved-registers select-target slice-item-limit slice-operations supported-versions targets validate! version]}
+  (:require [clojure.set :as set]
+            [kotoba.gmir :as gmir]))
+
+(def version 3)
+(def supported-versions #{1 2 3})
+(def targets #{:x86-64 :aarch64})
+
+(def physical-registers
+  "The always-available scratch tier. Every allocation path may use these, and
+  the conservative all-vreg path uses only these."
+  {:x86-64 [:x86-64/rax :x86-64/rcx :x86-64/rdx :x86-64/r8]
+   :aarch64 [:aarch64/x0 :aarch64/x1 :aarch64/x2 :aarch64/x3]})
+
+(def leaf-registers
+  "Caller-saved registers a function that calls nothing may use without saving
+  anything. On x86-64 these are the incoming argument registers, dead once the
+  entry plan has copied the arguments out; on AArch64 they are the temporaries
+  below the encoder's own scratch pair. A function that makes a call must not
+  use them, so only the no-call paths are offered this tier."
+  {:x86-64 [:x86-64/rdi :x86-64/rsi]
+   :aarch64 [:aarch64/x5 :aarch64/x6 :aarch64/x8 :aarch64/x9
+             :aarch64/x10 :aarch64/x11 :aarch64/x12]})
+
+(def preserved-registers
+  "Callee-saved registers. Available on every path, at the cost of a save and a
+  restore in the frame for exactly the ones a function actually assigns --
+  which is why allocation reports them rather than the frame guessing."
+  {:x86-64 [:x86-64/rbx :x86-64/r12 :x86-64/r13 :x86-64/r14 :x86-64/r15]
+   :aarch64 [:aarch64/x19 :aarch64/x20 :aarch64/x21 :aarch64/x22
+             :aarch64/x23 :aarch64/x24 :aarch64/x25 :aarch64/x26]})
+
+(defn privileged-argument-registers
+  "boot-lit: the registers the conservative expansion may hand a privileged
+  action's operands, in order. The scratch tier first -- an action narrow
+  enough to stay inside it costs no frame save -- then the preserved tier,
+  which is callee-saved under Microsoft x64 as well as under the internal ABI.
+
+  That second half is what makes `:uefi-call6` possible at all: its eight
+  operands do not fit in four registers, and an operand held in a caller-saved
+  register would not survive the firmware call it is an operand to.
+
+  Derived rather than written out, so it stays as wide as the two tiers are.
+  `x86-privileged-action-arities`'s widest entry has to fit; the suite asserts
+  that it does rather than trusting the arithmetic."
+  [target]
+  (vec (concat (get physical-registers target)
+               (get preserved-registers target))))
+
+(defn allocator-pool
+  "The registers an allocation path may hand out. The scratch tier comes first
+  so that a function small enough to stay inside it costs no frame save; the
+  preserved tier comes last for the same reason."
+  [target {:keys [leaf?]}]
+  (vec (concat (get physical-registers target)
+               (when leaf? (get leaf-registers target))
+               (get preserved-registers target))))
+
+(defn- x86-quotient-steered-pool
+  "The x86-64 pool with RAX and RDX removed.
+
+  `imul r10` inside every constant division writes RDX:RAX, so a value the
+  allocator parks there is saved and restored around each quotient -- four
+  stack operations a time, thirty-two per narrow-kernel call, measured as the
+  largest x86 mechanism behind the gcc deficit (amu
+  docs/codegen-coscientist.md, iterations 40-42). An earlier version only
+  DEMOTED the pair, arguing that under pressure the extra capacity was worth
+  the saves; the hardware counters refuted that (iteration 48: kernel_deep
+  retires at IPC 5.74 -- the retire width is the wall, and every value parked
+  in RAX/RDX buys its residency with four stack operations per quotient it
+  crosses, where a spill slot pays two moves once). Under exclusion the
+  pressure lands on spill slots instead and every quotient's saves elide.
+  Leaf functions only: the call paths split pools by POSITION in
+  `rebuild-pool-lists`, and a reordered prefix would misclassify the tiers
+  there."
+  [leaf?]
+  (vec (concat [:x86-64/rcx :x86-64/r8]
+               (when leaf? (get leaf-registers :x86-64))
+               (get preserved-registers :x86-64))))
+
+(defn saved-registers
+  "Which preserved registers a physical instruction sequence names, in pool
+  order, so a frame can save them in order and restore them in reverse.
+
+  Derived rather than carried: a field saying which registers a body uses has
+  to be kept equal to the body, and the two drift silently in the direction
+  that omits a save. Encoders call this on the stream they are about to emit."
+  [target instructions]
+  (let [preserved (set (get preserved-registers target))]
+    (into []
+          (filter (into #{} (mapcat (fn [instruction]
+                                      (filter preserved
+                                              (tree-seq coll? seq instruction)))
+                                    instructions)))
+          (get preserved-registers target))))
+
+(def call-argument-registers
+  {:x86-64 [:x86-64/rdi :x86-64/rsi :x86-64/rdx :x86-64/rcx :x86-64/r8]
+   :aarch64 [:aarch64/x0 :aarch64/x1 :aarch64/x2 :aarch64/x3 :aarch64/x4]})
+
+(def runtime-argument-registers
+  "The context pointer is the first C argument (rdi / x0); a runtime
+  operation's own arguments follow in the next four. Three sufficed until
+  ABI v8 (2026-09-16): `string-compare-lines` is the first four-argument
+  runtime operation, and its fourth argument rides in the fourth C argument
+  register (rcx's successor r8, x3's successor x4), which the loader's C
+  signature receives as its fifth parameter."
+  {:x86-64 [:x86-64/rsi :x86-64/rdx :x86-64/rcx :x86-64/r8]
+   :aarch64 [:aarch64/x1 :aarch64/x2 :aarch64/x3 :aarch64/x4]})
+
+(def runtime-context-offsets
+  {:pair 56 :pair-first 64 :pair-second 72
+   :kgraph-assert! 80 :kgraph-get 88 :kgraph-count 96
+   :kgraph-entity-at 104
+   :string-byte-length 72 :string=? 112 :string-concat 120
+   :string-substring 136 :string-code-point-at 144
+   :vector-new-empty 152 :vector-conj 160 :vector-count 168
+   :vector-at 176 :vector-assoc 184 :vector-drop 192
+   ;; ABI v4 (superproject ADR-2609010200). The context struct these offsets
+   ;; index is `kexe_context_v4` in amu's tools/kexe_loader.c, whose
+   ;; `_Static_assert`s pin the same two numbers from the C side; the version
+   ;; moved because a guest bakes an offset in, so appending to a v3 host
+   ;; would have v4-compiled code jump through uninitialised memory.
+   ;;
+   ;; Both are past 127, so x86-64 encodes `call qword ptr [r9+disp32]` --
+   ;; the same branch offsets 128 and above have taken since string-substring.
+   ;; AArch64's LDR unsigned-offset imm12 reaches 8*4095, so both are ordinary
+   ;; there.
+   :vector-alloc 200 :vector-assoc-in-place 208
+   ;; ABI v5 (2026-09-15). `string-index-of` as a host slot, appended after
+   ;; the v4 pair for the same one-directional reason: a v4 host has nothing
+   ;; at 216, so `kexe_context_v5` in amu's tools/kexe_loader.c refuses any
+   ;; other version and pins this number with a `_Static_assert`. Past 127,
+   ;; so x86-64 takes the disp32 form like every slot since string-substring.
+   :string-index-of 216
+   ;; ABI v6 (2026-09-16, superproject ADR-2609160044): the region reset
+   ;; pair. Appended after v5's slot for the same one-directional reason; a
+   ;; v5 host has nothing at 224 / 232.
+   :arena-enter 224 :arena-leave 232
+   ;; ABI v7 (2026-09-16): the four text slots, appended after v6's pair.
+   :string-compare 240 :string-fold-ascii 248
+   :string-find-blank 256 :string-skip-blank 264
+   ;; ABI v8 (2026-09-16): the two line slots, appended after v7's four.
+   :string-index-of-from 272 :string-compare-lines 280
+   ;; ABI v9 (2026-09-16) put six DATA pointers at 288-328 (kotoba-native
+   ;; ADR 0084) -- not slots, nothing calls them. ABI v10 (2026-09-16): the
+   ;; two range slots, appended after those.
+   :string-find-byte 336 :string-append-range 344})
+
+(def capability-argument-registers
+  {:x86-64 {:i64 [:x86-64/rdx]
+            :string [:x86-64/r8]
+            :option-i64 [:x86-64/r8]
+            :result-i64 [:x86-64/r8]
+            :clock-v1 [:x86-64/r8]
+            :dataspace-v1 [:x86-64/r8]
+            :ui-commit-v1 [:x86-64/r8]
+            :ui-event-v1 [:x86-64/r8]}
+   :aarch64 {:i64 [:aarch64/x2]
+            :string [:aarch64/x4]
+            :option-i64 [:aarch64/x4]
+            :result-i64 [:aarch64/x4]
+            :clock-v1 [:aarch64/x4]
+            :dataspace-v1 [:aarch64/x4]
+            :ui-commit-v1 [:aarch64/x4]
+            :ui-event-v1 [:aarch64/x4]}})
+
+(def capability-context-offsets
+  {:i64 48 :string 128 :option-i64 128 :result-i64 128 :clock-v1 128
+   :dataspace-v1 128 :ui-commit-v1 128 :ui-event-v1 128})
+
+(def return-registers
+  {:x86-64 :x86-64/rax
+   :aarch64 :aarch64/x0})
+
+(defn- reject! [problem instruction]
+  (throw (ex-info (str "MIR rejected: " (name problem))
+                  {:phase :mir :problem problem :instruction instruction})))
+
+(declare call-argument-registers)
+
+(def ^:private stack-argument-ops
+  #{:mir/incoming-load :mir/outgoing-argument :mir/incoming-argument-store})
+
+(def instruction-keysets
+  {:mir/argument #{:mir/op :mir/dst :mir/index}
+   :mir/constant #{:mir/op :mir/dst :mir/value}
+   :mir/data-address #{:mir/op :mir/dst :mir/content}
+   ;; boot-lit: the address of a read-only literal placed in the code image
+   ;; (kotoba-gmir ADR-0011). Distinct from `:mir/data-address` above, which
+   ;; is a managed string the value runtime resolves against a runtime base.
+   :mir/rodata-address #{:mir/op :mir/dst :mir/content :mir/rodata-encoding}
+   ;; boot-scratch: the address of a function in the same module (kotoba-gmir
+   ;; ADR-0013). One destination, no sources, and a NAME -- the same shape as
+   ;; the literal above, with a symbol where that one has a string.
+   :mir/function-address #{:mir/op :mir/dst :mir/function}
+   :mir/add #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/subtract #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/multiply #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/multiply-add #{:mir/op :mir/dst :mir/left :mir/right :mir/addend}
+   :mir/multiply-subtract #{:mir/op :mir/dst :mir/left :mir/right :mir/addend}
+   :mir/quotient #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/quotient-constant #{:mir/op :mir/dst :mir/left :mir/divisor}
+   :mir/bit-and #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/bit-or #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/bit-xor #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/shift-left #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/shift-right-signed #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/shift-right-unsigned #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f64-add #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f64-subtract #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f64-multiply #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f64-divide #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f64-min #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f64-max #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f64-sqrt #{:mir/op :mir/dst :mir/input}
+   :mir/f64-equal #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f64-less-than #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f64-less-or-equal #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f64-greater-than #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f64-greater-or-equal #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f64-unordered #{:mir/op :mir/dst :mir/left :mir/right}
+   ;; f32: binary32 (kotoba-lang ADR-kotoba-floating-point-on-native). Same
+   ;; operand shapes and the same one-word vreg as the f64 family above -- an
+   ;; f32 travels as its binary32 pattern sign-extended from bit 31.
+   ;;
+   ;; No f32-min/f32-max, and the absence is the decision: x86 MINSS/MAXSS
+   ;; return the SECOND operand when either input is NaN while AArch64 FMIN and
+   ;; the KIR oracle return the NaN, so :mir/f64-min above already means two
+   ;; things on the two targets. Recorded upstream, not inherited here.
+   :mir/f32-add #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f32-subtract #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f32-multiply #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f32-divide #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f32-sqrt #{:mir/op :mir/dst :mir/input}
+   :mir/f32-equal #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f32-less-than #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f32-less-or-equal #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f32-greater-than #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f32-greater-or-equal #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/f32-unordered #{:mir/op :mir/dst :mir/left :mir/right}
+   ;; Width conversions -- one source in, one value out, exactly like f32-sqrt.
+   :mir/f32-to-f64 #{:mir/op :mir/dst :mir/input}
+   :mir/f64-to-f32 #{:mir/op :mir/dst :mir/input}
+   :mir/i64-to-f32 #{:mir/op :mir/dst :mir/input}
+   :mir/i64-to-f64 #{:mir/op :mir/dst :mir/input}
+   :mir/kernel-load-u8 #{:mir/op :mir/dst :mir/base :mir/length
+                         :mir/index :mir/maximum}
+   :mir/kernel-store-u8 #{:mir/op :mir/dst :mir/base :mir/length
+                          :mir/index :mir/stored :mir/maximum}
+   :mir/kernel-load-u32 #{:mir/op :mir/dst :mir/base :mir/length
+                          :mir/index :mir/maximum}
+   :mir/kernel-store-u32 #{:mir/op :mir/dst :mir/base :mir/length
+                           :mir/index :mir/stored :mir/maximum}
+   ;; memwidth: the two remaining MMIO transfer widths, and the slice family.
+   ;; Every one carries exactly the fields its u8/u32 sibling does -- the width
+   ;; is in the operation name, and for the slice family the only other
+   ;; difference is that `:mir/index` counts elements rather than bytes.
+   :mir/kernel-load-u16 #{:mir/op :mir/dst :mir/base :mir/length
+                          :mir/index :mir/maximum}
+   :mir/kernel-store-u16 #{:mir/op :mir/dst :mir/base :mir/length
+                           :mir/index :mir/stored :mir/maximum}
+   :mir/kernel-load-u64 #{:mir/op :mir/dst :mir/base :mir/length
+                          :mir/index :mir/maximum}
+   :mir/kernel-store-u64 #{:mir/op :mir/dst :mir/base :mir/length
+                           :mir/index :mir/stored :mir/maximum}
+   :mir/slice-load-u8 #{:mir/op :mir/dst :mir/base :mir/length
+                        :mir/index :mir/maximum}
+   :mir/slice-store-u8 #{:mir/op :mir/dst :mir/base :mir/length
+                         :mir/index :mir/stored :mir/maximum}
+   :mir/slice-load-u16 #{:mir/op :mir/dst :mir/base :mir/length
+                         :mir/index :mir/maximum}
+   :mir/slice-store-u16 #{:mir/op :mir/dst :mir/base :mir/length
+                          :mir/index :mir/stored :mir/maximum}
+   :mir/slice-load-u32 #{:mir/op :mir/dst :mir/base :mir/length
+                         :mir/index :mir/maximum}
+   :mir/slice-store-u32 #{:mir/op :mir/dst :mir/base :mir/length
+                          :mir/index :mir/stored :mir/maximum}
+   :mir/slice-load-u64 #{:mir/op :mir/dst :mir/base :mir/length
+                         :mir/index :mir/maximum}
+   :mir/slice-store-u64 #{:mir/op :mir/dst :mir/base :mir/length
+                          :mir/index :mir/stored :mir/maximum}
+   ;; memwidth: end
+   ;; The lock pair carries the load's fields: three sources in, one value
+   ;; out. No `:mir/stored` -- the stored word is fixed by the operation, not
+   ;; supplied by the guest.
+   :mir/kernel-try-lock-u32 #{:mir/op :mir/dst :mir/base :mir/length
+                              :mir/index :mir/maximum}
+   :mir/kernel-unlock-u32 #{:mir/op :mir/dst :mir/base :mir/length
+                            :mir/index :mir/maximum}
+   ;; sysops: the general atomic family (kotoba-gmir ADR 0007). The lock pair
+   ;; fixes its comparand and replacement; these take the word from the guest,
+   ;; which is what a device descriptor ring needs. `:mir/stored` is the
+   ;; addend for the adds and the replacement for the swaps and the
+   ;; compare-exchanges; `:mir/expected` exists only on the two
+   ;; compare-exchanges and is the comparand the lock withholds. `:mir/dst` is
+   ;; the word memory held BEFORE the operation, for all six.
+   :mir/kernel-atomic-add-u32 #{:mir/op :mir/dst :mir/base :mir/length
+                                :mir/index :mir/stored :mir/maximum}
+   :mir/kernel-atomic-add-u64 #{:mir/op :mir/dst :mir/base :mir/length
+                                :mir/index :mir/stored :mir/maximum}
+   :mir/kernel-xchg-u32 #{:mir/op :mir/dst :mir/base :mir/length
+                          :mir/index :mir/stored :mir/maximum}
+   :mir/kernel-xchg-u64 #{:mir/op :mir/dst :mir/base :mir/length
+                          :mir/index :mir/stored :mir/maximum}
+   :mir/kernel-cmpxchg-u32 #{:mir/op :mir/dst :mir/base :mir/length
+                             :mir/index :mir/expected :mir/stored :mir/maximum}
+   :mir/kernel-cmpxchg-u64 #{:mir/op :mir/dst :mir/base :mir/length
+                             :mir/index :mir/expected :mir/stored :mir/maximum}
+   ;; sysops: end
+   ;; simd: one dot product of two f32 regions (kotoba-gmir ADR 0010).
+   ;;
+   ;; The keyset is GMIR's, renamed. Two regions, so two bases and two
+   ;; lengths; `:mir/base`/`:mir/length` stay the FIRST region's names so
+   ;; anything reading `:mir/base` still finds a base. `:mir/count` counts
+   ;; ELEMENTS while the lengths count BYTES, and `:mir/maximum` is the byte
+   ;; ceiling on both, pinned to one value.
+   ;;
+   ;; It is deliberately NOT in `schedulable-integer-operations`: it reads
+   ;; memory, branches, and clobbers registers the scheduler does not model,
+   ;; so it stays a hard barrier like every other memory operation.
+   :mir/kernel-dot-f32 #{:mir/op :mir/dst :mir/base :mir/length
+                         :mir/second-base :mir/second-length
+                         :mir/count :mir/maximum}
+   ;; simd: end
+   ;; dequant: the fused dequantize-and-dot family. The f32 dot product's
+   ;; keyset exactly, because the operand SHAPE is the same one -- two
+   ;; regions, a ceiling and a count. What the count counts differs (blocks,
+   ;; not elements) and that is the format's business, not the keyset's.
+   :mir/kernel-dequant-dot-q8-0 #{:mir/op :mir/dst :mir/base :mir/length
+                                  :mir/second-base :mir/second-length
+                                  :mir/count :mir/maximum}
+   :mir/kernel-dequant-dot-q4-k #{:mir/op :mir/dst :mir/base :mir/length
+                                  :mir/second-base :mir/second-length
+                                  :mir/count :mir/maximum}
+   :mir/kernel-dequant-dot-q6-k #{:mir/op :mir/dst :mir/base :mir/length
+                                  :mir/second-base :mir/second-length
+                                  :mir/count :mir/maximum}
+   ;; dequant-iq: the four codebook formats (kotoba-gmir ADR 0027). Same
+   ;; keyset again: their codebook is read-only data the compiler places,
+   ;; not a region a caller passes, so no operand of theirs is new.
+   :mir/kernel-dequant-dot-iq4-xs #{:mir/op :mir/dst :mir/base :mir/length
+                                  :mir/second-base :mir/second-length
+                                  :mir/count :mir/maximum}
+   :mir/kernel-dequant-dot-iq2-s #{:mir/op :mir/dst :mir/base :mir/length
+                                 :mir/second-base :mir/second-length
+                                 :mir/count :mir/maximum}
+   :mir/kernel-dequant-dot-iq3-xxs #{:mir/op :mir/dst :mir/base :mir/length
+                                   :mir/second-base :mir/second-length
+                                   :mir/count :mir/maximum}
+   :mir/kernel-dequant-dot-iq3-s #{:mir/op :mir/dst :mir/base :mir/length
+                                 :mir/second-base :mir/second-length
+                                 :mir/count :mir/maximum}
+   ;; dequant: end
+   :mir/kernel-subregion #{:mir/op :mir/dst :mir/base :mir/length
+                           :mir/offset :mir/size}
+   :mir/equal #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/less-than #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/greater-than #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/less-or-equal #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/greater-or-equal #{:mir/op :mir/dst :mir/left :mir/right}
+   :mir/spill-load #{:mir/op :mir/dst :mir/slot}
+   :mir/spill-store #{:mir/op :mir/src :mir/slot}
+   :mir/move #{:mir/op :mir/dst :mir/src}
+   ;; Stack-passed arguments (2026-09-23). A call passes its first five
+   ;; arguments in `call-argument-registers` and every one after that on the
+   ;; stack, at the bottom of the caller's frame: argument i (i >= 5) at
+   ;; [sp + 8(i - 5)]. The callee reads it from that INCOMING area, above its
+   ;; own frame; where that is depends on frame sizes only the encoder knows,
+   ;; so these name the argument by index, never by offset.
+   ;;
+   ;; They are introduced by `stack-argument-rewrite`, before allocation, and
+   ;; are ordinary instructions to the allocators: `incoming-load` defines a
+   ;; value, the two stores read one. All barriers to scheduling.
+   :mir/incoming-load #{:mir/op :mir/dst :mir/index}
+   :mir/outgoing-argument #{:mir/op :mir/src :mir/index}
+   ;; A tail call writes the callee's stack arguments into its OWN incoming
+   ;; area. Safe because every incoming argument was loaded at entry, before
+   ;; anything in the body could run.
+   :mir/incoming-argument-store #{:mir/op :mir/src :mir/index}
+   ;; Physical-only AArch64 self-tail re-entry. The boundary carries the
+   ;; allocator-owned parameter homes; recur edges have already performed the
+   ;; simultaneous assignment into exactly those registers.
+   :mir/reentry #{:mir/op :mir/parameters}
+   :mir/recur #{:mir/op :mir/arguments}
+   :mir/label #{:mir/op :mir/id}
+   :mir/branch-zero #{:mir/op :mir/test :mir/target}
+   :mir/branch-nonzero #{:mir/op :mir/test :mir/target}
+   :mir/jump #{:mir/op :mir/target}
+   :mir/phi #{:mir/op :mir/dst :mir/incomings}
+   :mir/call #{:mir/op :mir/dst :mir/callee :mir/arguments}
+   :mir/tail-call #{:mir/op :mir/callee :mir/arguments}
+   :mir/runtime-call #{:mir/op :mir/dst :mir/runtime :mir/context-offset
+                       :mir/arguments}
+   :mir/x86-privileged #{:mir/op :mir/dst :mir/action :mir/arguments}
+   :mir/capability-call #{:mir/op :mir/dst :mir/capability :mir/kind
+                          :mir/context-offset :mir/arguments}
+   :mir/return #{:mir/op :mir/value}})
+
+
+;; memwidth: the checked-memory families, as data rather than as a set spelled
+;; out at each of the five places that used to name their members by hand.
+;;
+;; `kernel-window-operations` are BYTE-indexed accesses into a declared window
+;; capped by `:mir/maximum`. `slice-operations` are ELEMENT-indexed accesses
+;; into a host-supplied region whose ceiling is the address space (amu ADR
+;; 0285); the backend scales `:mir/index` by the access width in the addressing
+;; mode instead of adding it as a byte offset.
+
+(def kernel-window-operations
+  #{:mir/kernel-load-u8 :mir/kernel-store-u8
+    :mir/kernel-load-u16 :mir/kernel-store-u16
+    :mir/kernel-load-u32 :mir/kernel-store-u32
+    :mir/kernel-load-u64 :mir/kernel-store-u64})
+
+(def kernel-window-maxima #{512 4096 16384 65536})
+
+(def slice-operations
+  #{:mir/slice-load-u8 :mir/slice-store-u8
+    :mir/slice-load-u16 :mir/slice-store-u16
+    :mir/slice-load-u32 :mir/slice-store-u32
+    :mir/slice-load-u64 :mir/slice-store-u64})
+
+(def slice-item-limit
+  "2^40 elements -- an address-space bound, not a window profile, and
+  deliberately not derived from any vector arena bound. Mirrors
+  `kotoba.gmir/slice-item-limit`; `kotoba.mir-test` asserts the two equal
+  rather than trusting the transcription."
+  1099511627776)
+
+;; sysops: the MIR names of the general atomic family, derived from GMIR's own
+;; set so the two cannot drift. `kotoba.mir` renames `:gmir/x` to `:mir/x`
+;; wholesale, so deriving is exact rather than a transcription.
+(def kernel-atomic-ops
+  (into #{} (map #(keyword "mir" (name %))) gmir/kernel-atomic-ops))
+;; sysops: end
+
+;; simd: the f32 dot product's byte ceiling, taken from GMIR's own var rather
+;; than transcribed, so the two cannot drift the way `slice-item-limit` has to
+;; be asserted equal by a test.
+(def kernel-dot-f32-maximum gmir/kernel-dot-f32-maximum)
+;; simd: end
+
+;; dequant: the fused family's operations and ceiling, taken from GMIR's own
+;; vars rather than transcribed.
+(def kernel-dequant-dot-operations
+  (into #{} (map #(keyword "mir" (name %))) gmir/kernel-dequant-dot-operations))
+
+(def kernel-dequant-dot-maximum gmir/kernel-dequant-dot-maximum)
+;; dequant: end
+
+;; memwidth: every operation that carries a `:mir/index` operand -- the two
+;; windowed families, the slice family, the lock pair, and (merged from the
+;; sysops branch) the general atomics.
+(def ^:private indexed-memory-operations
+  (into #{:mir/kernel-try-lock-u32 :mir/kernel-unlock-u32}
+        (concat kernel-window-operations slice-operations kernel-atomic-ops)))
+;; memwidth: end
+
+(def ^:private v1-operations
+  (disj (set (keys instruction-keysets)) :mir/phi :mir/call :mir/tail-call
+        :mir/quotient-constant :mir/branch-nonzero :mir/reentry :mir/recur))
+
+(def ^:private v2-operations
+  (disj (set (keys instruction-keysets)) :mir/call :mir/tail-call
+        :mir/quotient-constant :mir/branch-nonzero :mir/reentry :mir/recur))
+
+(def ^:private v3-operations
+  (set (keys instruction-keysets)))
+
+(defn- operations-for [program-version]
+  (case program-version
+    1 v1-operations
+    2 v2-operations
+    3 v3-operations
+    #{}))
+
+(defn- physical-register? [target value]
+  ;; Physical registers are namespaced keywords. Guard that closed type before
+  ;; asking a hash set about VALUE: nbb cannot hash a JavaScript BigInt
+  ;; primitive (it attempts to attach a closure uid), and integer immediates
+  ;; legitimately flow through instruction-sources beside registers.
+  (and (keyword? value)
+       (contains? (set (concat (get physical-registers target)
+                               (get leaf-registers target)
+                               (get preserved-registers target)
+                               (get call-argument-registers target)))
+                  value)))
+
+(defn- call-operation? [op]
+  (contains? #{:mir/call :mir/tail-call :mir/runtime-call
+               :mir/capability-call} op))
+
+(defn- argument-registers-for-call [target {:mir/keys [op kind]}]
+  (case op
+    :mir/runtime-call (get runtime-argument-registers target)
+    :mir/capability-call (get-in capability-argument-registers [target kind])
+    (get call-argument-registers target)))
+
+(defn- validate-flat!
+  [{:mir/keys [version target registers instructions frame-slots] :as program}]
+  (when-not (and (map? program)
+                 (contains? #{#{:mir/version :mir/target :mir/registers :mir/instructions}
+                              #{:mir/version :mir/target :mir/registers :mir/instructions
+                                :mir/frame-slots}}
+                            (set (keys program)))
+                 (contains? supported-versions version)
+                 (contains? targets target)
+                 (contains? #{:virtual :physical} registers)
+                 (vector? instructions)
+                 (or (nil? frame-slots)
+                     (and (= :physical registers)
+                          (integer? frame-slots)
+                          (<= 0 frame-slots 4095))))
+    (reject! :non-canonical-program program))
+  (let [register? (if (= :virtual registers)
+                    gmir/vreg?
+                    #(physical-register? target %))]
+    (doseq [instruction instructions]
+      (let [op (:mir/op instruction)
+            allowed (operations-for version)]
+        (when-not (and (contains? allowed op)
+                       (= (get instruction-keysets op) (set (keys instruction))))
+          (reject! :non-canonical-instruction instruction))
+        (when (and (= :virtual registers)
+                   (contains? #{:mir/spill-load :mir/spill-store :mir/move} op))
+          (reject! :physical-operation-in-virtual-program instruction))
+        (when (and (contains? #{:mir/reentry :mir/recur} op)
+                   (or (= :virtual registers) (not= 3 version)))
+          (reject! :direct-reentry-profile-violation instruction))
+        (when (and (= :virtual registers)
+                   (contains? #{:mir/multiply-add :mir/multiply-subtract} op))
+          (reject! :target-selected-operation-in-virtual-program instruction))
+        (when (and (= :mir/branch-nonzero op) (not= :aarch64 target))
+          (reject! :target-selected-operation-target-mismatch instruction))
+        (doseq [register (concat
+                          (keep instruction [:mir/dst :mir/src :mir/input
+                                             :mir/left :mir/right :mir/addend :mir/test
+                                             :mir/base :mir/length
+                                             ;; simd: the second region's pair
+                                             ;; and the element count.
+                                             :mir/second-base :mir/second-length
+                                             :mir/count
+                                             :mir/stored :mir/offset :mir/size])
+                          (when (vector? (:mir/arguments instruction))
+                            (:mir/arguments instruction))
+                          (when (vector? (:mir/parameters instruction))
+                            (:mir/parameters instruction)))]
+          (when-not (register? register)
+            (reject! :register-profile-violation instruction)))
+        ;; memwidth: one table for every windowed access instead of a clause
+        ;; per width. The clause per width is how `kernel-store-u8` came to be
+        ;; the only member of the family that could not name a 16 KiB window.
+        ;; The set now also carries the sysops atomics, which index the same way.
+        (when (and (contains? indexed-memory-operations op)
+                   (not (register? (:mir/index instruction))))
+          (reject! :register-profile-violation instruction))
+        (when (contains? kernel-window-operations op)
+          (when-not (contains? kernel-window-maxima (:mir/maximum instruction))
+            (reject! :invalid-kernel-memory-maximum instruction)))
+        (when (contains? slice-operations op)
+          (when-not (= slice-item-limit (:mir/maximum instruction))
+            (reject! :invalid-kernel-memory-maximum instruction)))
+        ;; memwidth: end
+        (when (contains? #{:mir/kernel-try-lock-u32 :mir/kernel-unlock-u32} op)
+          (when-not (= 4096 (:mir/maximum instruction))
+            (reject! :invalid-kernel-memory-maximum instruction)))
+        ;; sysops: one spelling each, naming a page -- pinned as a single value
+        ;; rather than a set, exactly as the lock pair's is.
+        (when (contains? kernel-atomic-ops op)
+          (when-not (= 4096 (:mir/maximum instruction))
+            (reject! :invalid-kernel-memory-maximum instruction)))
+        ;; sysops: end
+        ;; simd: one spelling, one ceiling.
+        (when (= :mir/kernel-dot-f32 op)
+          (when-not (= kernel-dot-f32-maximum (:mir/maximum instruction))
+            (reject! :invalid-kernel-memory-maximum instruction)))
+        ;; simd: end
+        ;; dequant: one ceiling for the whole family.
+        (when (contains? kernel-dequant-dot-operations op)
+          (when-not (= kernel-dequant-dot-maximum (:mir/maximum instruction))
+            (reject! :invalid-kernel-memory-maximum instruction)))
+        ;; dequant: end
+        (when (and (= op :mir/return) (not (register? (:mir/value instruction))))
+          (reject! :register-profile-violation instruction))
+        (when (= op :mir/phi)
+          (when (= :physical registers)
+            (reject! :phi-in-physical-program instruction))
+          (when-not (and (vector? (:mir/incomings instruction))
+                         (every? (fn [incoming]
+                                   (and (map? incoming)
+                                        (= #{:mir/predecessor :mir/value}
+                                           (set (keys incoming)))
+                                        (gmir/label? (:mir/predecessor incoming))
+                                        (register? (:mir/value incoming))))
+                                 (:mir/incomings instruction)))
+            (reject! :invalid-phi-incomings instruction)))
+        (when (contains? #{:mir/call :mir/tail-call} op)
+          (when-not (and (= 3 version)
+                         (gmir/function-id? (:mir/callee instruction))
+                         (vector? (:mir/arguments instruction))
+                         (<= (count (:mir/arguments instruction)) gmir/max-arity))
+            (reject! :invalid-call instruction))
+          (when (= :physical registers)
+            ;; A physical call names only the argument REGISTERS; arguments
+            ;; past the fifth were stored into the frame before it.
+            (when-not (and (or (= op :mir/tail-call)
+                               (= (:mir/dst instruction)
+                                  (get return-registers target)))
+                           (<= (count (:mir/arguments instruction))
+                               (count (get call-argument-registers target)))
+                           (= (:mir/arguments instruction)
+                              (subvec (get call-argument-registers target)
+                                      0 (count (:mir/arguments instruction)))))
+              (reject! :physical-call-profile-violation instruction))))
+        (when (= :mir/reentry op)
+          (when-not (and (vector? (:mir/parameters instruction))
+                         (<= (count (:mir/parameters instruction)) gmir/max-arity))
+            (reject! :invalid-direct-reentry instruction)))
+        (when (= :mir/recur op)
+          (when-not (and (vector? (:mir/arguments instruction))
+                         (<= (count (:mir/arguments instruction)) gmir/max-arity))
+            (reject! :invalid-direct-recur instruction)))
+        (when (= op :mir/runtime-call)
+          (let [runtime (:mir/runtime instruction)
+                arguments (:mir/arguments instruction)
+                expected (get gmir/runtime-operation-arities runtime ::missing)]
+            (when-not (and (not= ::missing expected)
+                           (= expected (count arguments))
+                           (= (get runtime-context-offsets runtime)
+                              (:mir/context-offset instruction)))
+              (reject! :invalid-runtime-call instruction))
+            (when (= :physical registers)
+              (when-not (and (= (:mir/dst instruction)
+                                (get return-registers target))
+                             (= arguments
+                                (subvec (get runtime-argument-registers target)
+                                        0 (count arguments))))
+                (reject! :physical-runtime-call-profile-violation instruction)))))
+        (when (= op :mir/x86-privileged)
+          (let [action (:mir/action instruction)
+                arguments (:mir/arguments instruction)
+                expected (get gmir/x86-privileged-action-arities action ::missing)]
+            (when-not (and (= :x86-64 target)
+                           (not= ::missing expected)
+                           (= expected (count arguments)))
+              (reject! :invalid-x86-privileged instruction))))
+        (when (= op :mir/capability-call)
+          (let [kind (:mir/kind instruction)
+                capability (:mir/capability instruction)
+                arguments (:mir/arguments instruction)]
+            (when-not (and (contains? gmir/capability-kinds kind)
+                           (integer? capability) (<= 0 capability 255)
+                           (= 1 (count arguments))
+                           (= (get capability-context-offsets kind)
+                              (:mir/context-offset instruction)))
+              (reject! :invalid-capability-call instruction))
+            (when (= :physical registers)
+              (when-not (and (= (:mir/dst instruction)
+                                (get return-registers target))
+                             (= arguments
+                                (get-in capability-argument-registers
+                                        [target kind])))
+                (reject! :physical-capability-call-profile-violation
+                         instruction)))))
+        (when (and (= op :mir/constant)
+                   (not (gmir/i64-value? (:mir/value instruction))))
+          (reject! :constant-not-i64 instruction))
+        (when (and (= op :mir/quotient-constant)
+                   (not (gmir/i64-value? (:mir/divisor instruction))))
+          (reject! :constant-divisor-not-i64 instruction))
+        (when (and (= op :mir/data-address)
+                   (not (string? (:mir/content instruction))))
+          (reject! :invalid-data-content instruction))
+        ;; boot-lit: re-derived from `kotoba.gmir` rather than trusted through
+        ;; selection, for the reason every other re-derivation here exists: a
+        ;; literal that arrives malformed at THIS layer still gets a pool
+        ;; entry and an address, and the wrongness only appears as firmware
+        ;; answering a question nobody asked.
+        (when (and (= op :mir/rodata-address)
+                   (not (gmir/rodata-content? (:mir/rodata-encoding instruction)
+                                              (:mir/content instruction))))
+          (reject! :invalid-rodata-content instruction))
+        ;; boot-scratch: re-derived here for the reason above -- selection
+        ;; copies the name through untouched, and a hand-built MIR program
+        ;; that never passed `gmir/validate!` would otherwise reach the
+        ;; backend's label table with something that is not a name.
+        (when (and (= op :mir/function-address)
+                   (not (gmir/function-id? (:mir/function instruction))))
+          (reject! :invalid-function-address instruction))
+        (when (and (= op :mir/argument)
+                   (not (and (integer? (:mir/index instruction))
+                             (not (neg? (:mir/index instruction))))))
+          (reject! :argument-index-invalid instruction))
+        (when (contains? #{:mir/spill-load :mir/spill-store} op)
+          (when-not (and (integer? (:mir/slot instruction))
+                         (some? frame-slots)
+                         (<= 0 (:mir/slot instruction))
+                         (< (:mir/slot instruction) frame-slots))
+            (reject! :spill-slot-invalid instruction)))
+        (when (contains? stack-argument-ops op)
+          (when-not (and (integer? (:mir/index instruction))
+                         (<= (count (get call-argument-registers target))
+                             (:mir/index instruction))
+                         (< (:mir/index instruction) gmir/max-arity))
+            (reject! :stack-argument-index-invalid instruction)))
+        (when (contains? #{:mir/label :mir/branch-zero :mir/branch-nonzero
+                           :mir/jump} op)
+          (let [id (if (= op :mir/label) (:mir/id instruction) (:mir/target instruction))]
+            (when-not (gmir/label? id)
+              (reject! :invalid-label instruction))))))
+    (let [labels (map :mir/id (filter #(= :mir/label (:mir/op %)) instructions))
+          label-set (set labels)
+          targets (keep :mir/target instructions)]
+      (when-not (= (count labels) (count label-set))
+        (reject! :duplicate-label {:labels labels}))
+      (doseq [branch-target targets]
+        (when-not (contains? label-set branch-target)
+          (reject! :unresolved-target {:target branch-target})))
+      (when (and (= 2 version) (= :virtual registers))
+        (gmir/validate!
+         {:gmir/version 2
+          :gmir/instructions
+          (mapv (fn [instruction]
+                  (reduce-kv
+                   (fn [out key value]
+                     (if (= key :mir/context-offset)
+                       out
+                       (assoc out
+                              (case key
+                                :mir/op :gmir/op
+                                :mir/dst :gmir/dst
+                                :mir/index :gmir/index
+                                :mir/value :gmir/value
+                                :mir/left :gmir/left
+                                :mir/right :gmir/right
+                                :mir/id :gmir/id
+                                :mir/test :gmir/test
+                                :mir/target :gmir/target
+                                :mir/incomings :gmir/incomings
+                                :mir/content :gmir/content
+                                :mir/runtime :gmir/runtime
+                                :mir/capability :gmir/capability
+                                :mir/kind :gmir/kind
+                                :mir/arguments :gmir/arguments)
+                              (cond
+                                (= key :mir/op) (keyword "gmir" (name value))
+                                (= key :mir/incomings)
+                                (mapv (fn [incoming]
+                                        {:gmir/predecessor (:mir/predecessor incoming)
+                                         :gmir/value (:mir/value incoming)})
+                                      value)
+                                :else value))))
+                   {} instruction))
+                instructions)}))))
+  program)
+
+(defn- valid-direct-reentry-prefix?
+  "The reentry marker is meaningful only after the public ABI arguments have
+  been materialized into the homes it names. Symbolically execute the closed
+  entry transport language so malformed external MIR cannot place the marker
+  before a required move (or name a home containing another parameter)."
+  [target arity instructions reentry-index parameters]
+  (let [abi (subvec (get call-argument-registers target) 0 arity)
+        argument-prefix (subvec instructions 0 (min arity (count instructions)))
+        canonical-arguments?
+        (and (= arity (count argument-prefix))
+             (= (vec (range arity)) (mapv :mir/index argument-prefix))
+             (= abi (mapv :mir/dst argument-prefix))
+             (every? #(= :mir/argument (:mir/op %)) argument-prefix))]
+    (when (and canonical-arguments? (<= arity reentry-index))
+      (let [initial {:registers (zipmap abi (range arity)) :slots {}}
+            result
+            (reduce
+             (fn [state {:mir/keys [op dst src slot]}]
+               (if (= ::invalid state)
+                 (reduced state)
+                 (case op
+                   :mir/move
+                   (if (contains? (:registers state) src)
+                     (assoc-in state [:registers dst] (get-in state [:registers src]))
+                     (reduced ::invalid))
+
+                   :mir/spill-store
+                   (if (contains? (:registers state) src)
+                     (assoc-in state [:slots slot] (get-in state [:registers src]))
+                     (reduced ::invalid))
+
+                   :mir/spill-load
+                   (if (contains? (:slots state) slot)
+                     (assoc-in state [:registers dst] (get-in state [:slots slot]))
+                     (reduced ::invalid))
+
+                   (reduced ::invalid))))
+             initial
+             (subvec instructions arity reentry-index))]
+        (and (not= ::invalid result)
+             (= (vec (range arity))
+                (mapv #(get-in result [:registers %]) parameters)))))))
+
+(defn- validate-v3-module!
+  [{:mir/keys [target registers entry functions] :as module}]
+  (when-not (and (= #{:mir/version :mir/target :mir/registers
+                      :mir/entry :mir/functions}
+                    (set (keys module)))
+                 (contains? targets target)
+                 (contains? #{:virtual :physical} registers)
+                 (gmir/function-id? entry)
+                 (vector? functions)
+                 (seq functions))
+    (reject! :non-canonical-module module))
+  (let [names (mapv :mir/name functions)
+        signatures (into {} (map (juxt :mir/name :mir/arity) functions))]
+    (when-not (and (every? gmir/function-id? names)
+                   (= (count names) (count (distinct names)))
+                   (contains? signatures entry))
+      (reject! :invalid-module-functions {:entry entry :names names}))
+    (doseq [{:mir/keys [name arity frame-slots frame-policy instructions]
+             :as function} functions]
+      (let [expected-keys (if (= :virtual registers)
+                            #{:mir/name :mir/arity :mir/instructions}
+                            #{:mir/name :mir/arity :mir/frame-slots
+                              :mir/frame-policy :mir/instructions})
+            calls (filter #(or (call-operation? (:mir/op %))
+                               (= :mir/recur (:mir/op %)))
+                          instructions)
+            direct-calls (filter #(contains? #{:mir/call :mir/tail-call}
+                                              (:mir/op %)) instructions)]
+        (when-not (and (= expected-keys (set (keys function)))
+                       (gmir/function-id? name)
+                       (integer? arity) (<= 0 arity gmir/max-arity)
+                       (or (= :virtual registers)
+                           (contains? #{:allocator :all-vregs :call-live}
+                                      frame-policy)))
+          (reject! :non-canonical-function function))
+        (validate-flat!
+         (cond-> {:mir/version 3 :mir/target target :mir/registers registers
+                  :mir/instructions instructions}
+           (= :physical registers) (assoc :mir/frame-slots frame-slots)))
+        (when (= :physical registers)
+          ;; Arguments past the register count arrive on the stack and are
+          ;; read by `:mir/incoming-load`, so only the register ones are
+          ;; `:mir/argument` markers here.
+          (let [register-arity (min arity (count (get call-argument-registers target)))
+                arguments (filterv #(= :mir/argument (:mir/op %)) instructions)
+                expected-registers (subvec (get call-argument-registers target)
+                                           0 register-arity)]
+            (when-not (and (= register-arity (count arguments))
+                           (= (vec (range register-arity)) (mapv :mir/index arguments))
+                           (= expected-registers (mapv :mir/dst arguments))
+                           (every? #(< (:mir/index %) arity)
+                                   (filter #(= :mir/incoming-load (:mir/op %))
+                                           instructions)))
+              (reject! :entry-argument-profile-violation
+                       {:function name :arguments arguments}))))
+        (when (and (= :physical registers)
+                   (if (seq calls)
+                     (not (contains? #{:all-vregs :call-live} frame-policy))
+                     (not= :allocator frame-policy)))
+          (reject! :call-frame-policy-violation function))
+        (when (= :physical registers)
+          (let [register-arity (min arity (count (get call-argument-registers target)))
+                reentries (filterv #(= :mir/reentry (:mir/op %)) instructions)
+                recurs (filterv #(= :mir/recur (:mir/op %)) instructions)
+                reentry-index (first (keep-indexed
+                                      #(when (= :mir/reentry (:mir/op %2)) %1)
+                                      instructions))
+                recur-terminates?
+                (every? (fn [[index instruction]]
+                          (if (= :mir/recur (:mir/op instruction))
+                            (let [next-instruction (get instructions (inc index))]
+                              (or (nil? next-instruction)
+                                  (= :mir/label (:mir/op next-instruction))))
+                            true))
+                        (map-indexed vector instructions))]
+            (when-not (if (seq recurs)
+                        (and (= 1 (count reentries))
+                             (= register-arity (count (:mir/parameters (first reentries))))
+                             (= register-arity
+                                (count (distinct
+                                        (:mir/parameters (first reentries)))))
+                             (valid-direct-reentry-prefix?
+                              target register-arity instructions reentry-index
+                              (:mir/parameters (first reentries)))
+                             recur-terminates?
+                             (every? #(= (:mir/parameters (first reentries))
+                                         (:mir/arguments %))
+                                     recurs))
+                        (empty? reentries))
+              (reject! :invalid-direct-reentry-contract function))))
+        (when (and (= :physical registers) (= :all-vregs frame-policy))
+          (let [value-ops (into
+                           ;; memwidth: the two families join by being
+                           ;; families, not by six more hand-written entries.
+                           (into kernel-window-operations slice-operations)
+                           #{:mir/argument :mir/constant :mir/add :mir/subtract
+                            :mir/multiply :mir/quotient :mir/quotient-constant
+                            :mir/bit-and :mir/bit-or
+                            :mir/bit-xor :mir/shift-left :mir/shift-right-signed
+                            :mir/shift-right-unsigned
+                            :mir/f64-add :mir/f64-subtract :mir/f64-multiply
+                            :mir/f64-divide :mir/f64-min :mir/f64-max
+                            :mir/f64-sqrt :mir/f64-equal :mir/f64-less-than
+                            :mir/f64-less-or-equal :mir/f64-greater-than
+                            :mir/f64-greater-or-equal :mir/f64-unordered
+                            ;; f32: value-producing exactly as the f64 family
+                            ;; is -- one word out, no clobber the f64 twins do
+                            ;; not already have.
+                            :mir/f32-add :mir/f32-subtract :mir/f32-multiply
+                            :mir/f32-divide :mir/f32-sqrt :mir/f32-equal
+                            :mir/f32-less-than :mir/f32-less-or-equal
+                            :mir/f32-greater-than :mir/f32-greater-or-equal
+                            :mir/f32-unordered
+                            :mir/f32-to-f64 :mir/f64-to-f32
+                            :mir/i64-to-f32 :mir/i64-to-f64
+                            :mir/kernel-load-u8 :mir/kernel-store-u8
+                            :mir/kernel-load-u32 :mir/kernel-store-u32
+                            :mir/kernel-try-lock-u32 :mir/kernel-unlock-u32
+                            :mir/kernel-subregion
+                            ;; simd: the dot product produces a value too.
+                            :mir/kernel-dot-f32
+                            ;; dequant: and so does every fused format.
+                            :mir/kernel-dequant-dot-q8-0
+                            :mir/kernel-dequant-dot-q4-k
+                            :mir/kernel-dequant-dot-q6-k
+                            :mir/kernel-dequant-dot-iq4-xs
+                            :mir/kernel-dequant-dot-iq2-s
+                            :mir/kernel-dequant-dot-iq3-xxs
+                            :mir/kernel-dequant-dot-iq3-s
+                            :mir/equal :mir/less-than
+                            :mir/greater-than :mir/less-or-equal
+                            :mir/greater-or-equal :mir/call :mir/runtime-call
+                            :mir/capability-call :mir/x86-privileged
+                            ;; sysops: every atomic produces a value too.
+                            :mir/data-address
+                            ;; boot-lit: so does a literal's address.
+                            :mir/rodata-address
+                            ;; boot-scratch: and so does a function's.
+                            :mir/function-address})
+                  value-ops (into value-ops kernel-atomic-ops)]
+            (doseq [[index instruction] (map-indexed vector instructions)
+                    :when (contains? value-ops (:mir/op instruction))]
+              (let [store (get instructions (inc index))]
+                (when-not (and (= :mir/spill-store (:mir/op store))
+                               (= (:mir/dst instruction) (:mir/src store)))
+                  (reject! :unbacked-call-frame-value
+                           {:function name :instruction instruction}))))
+            (doseq [[index {:mir/keys [arguments] :as call}]
+                    (map-indexed vector instructions)
+                    :when (call-operation? (:mir/op call))]
+              (let [loads (when (>= index (count arguments))
+                            (subvec instructions (- index (count arguments)) index))]
+                (when-not (and (some? loads)
+                               (= (count loads) (count arguments))
+                               (every? #(= :mir/spill-load (:mir/op %)) loads)
+                               (= arguments (mapv :mir/dst loads)))
+                  (reject! :non-parallel-call-arguments
+                           {:function name :call call}))))))
+        (doseq [{:mir/keys [callee arguments] :as call} direct-calls]
+          (let [callee-arity (get signatures callee ::missing)
+                register-count (count (get call-argument-registers target))]
+            (when (= ::missing callee-arity)
+              (reject! :unresolved-callee call))
+            ;; Virtual MIR names every argument. Physical MIR names the
+            ;; register ones; the rest were stored just before the call.
+            (when-not (= (if (and (= :physical registers)
+                                  (> callee-arity register-count))
+                           register-count
+                           callee-arity)
+                         (count arguments))
+              (reject! :call-arity-mismatch
+                       {:function name :call call :expected callee-arity}))))
+        ;; Every stack argument a physical call needs is stored between the
+        ;; previous call and it, exactly once, into the area its kind reads:
+        ;; the frame's outgoing area for a call, the function's own incoming
+        ;; area for a tail call.
+        (when (= :physical registers)
+          (let [register-count (count (get call-argument-registers target))]
+            (when-let [left
+                       (seq
+            (reduce
+             (fn [pending [index {:mir/keys [op callee] :as instruction}]]
+               (cond
+                 (contains? #{:mir/outgoing-argument :mir/incoming-argument-store} op)
+                 (conj pending instruction)
+
+                 ;; A direct recur IS a self tail call (the allocator turned
+                 ;; it into a jump), so it consumes the incoming-area stores
+                 ;; exactly as one would.
+                 (or (call-operation? op) (= :mir/recur op))
+                 (let [callee-arity (cond
+                                      (contains? #{:mir/call :mir/tail-call} op)
+                                      (get signatures callee 0)
+                                      (= :mir/recur op) arity
+                                      :else 0)
+                       expected-op (if (contains? #{:mir/tail-call :mir/recur} op)
+                                     :mir/incoming-argument-store
+                                     :mir/outgoing-argument)
+                       wanted (set (range register-count (max register-count callee-arity)))]
+                   (when-not (and (= wanted (set (map :mir/index pending)))
+                                  (= (count wanted) (count pending))
+                                  (every? #(= expected-op (:mir/op %)) pending))
+                     (reject! :stack-argument-profile-violation
+                              {:function name :call instruction
+                               :stores pending}))
+                   [])
+
+                 :else pending))
+             []
+             (map-indexed vector instructions)))]
+              (reject! :stack-argument-profile-violation
+                       {:function name :stores (vec left)})))))))
+  module)
+
+(defn validate!
+  "Validate virtual or physical MIR and return it unchanged. v3 modules own
+  independent function frames and a closed scalar direct-call graph."
+  [{:mir/keys [version] :as program}]
+  (if (= 3 version)
+    (validate-v3-module! program)
+    (validate-flat! program)))
+
+(defn- select-instruction [target instruction]
+  (reduce-kv
+   (fn [out key value]
+     (assoc out
+            (case key
+              :gmir/op :mir/op
+              :gmir/dst :mir/dst
+              :gmir/index :mir/index
+              :gmir/value :mir/value
+              :gmir/input :mir/input
+              :gmir/left :mir/left
+              :gmir/right :mir/right
+              :gmir/id :mir/id
+              :gmir/test :mir/test
+              :gmir/target :mir/target
+              :gmir/incomings :mir/incomings
+              :gmir/content :mir/content
+
+              ;; boot-lit: the literal encoding travels with its content.
+
+              :gmir/rodata-encoding :mir/rodata-encoding
+              ;; boot-scratch: the named function travels with its address.
+              :gmir/function :mir/function
+              :gmir/callee :mir/callee
+              :gmir/runtime :mir/runtime
+              :gmir/action :mir/action
+              :gmir/capability :mir/capability
+              :gmir/kind :mir/kind
+              :gmir/arguments :mir/arguments
+              :gmir/base :mir/base
+              :gmir/length :mir/length
+              :gmir/stored :mir/stored
+              ;; sysops: the compare-exchange comparand.
+              :gmir/expected :mir/expected
+              ;; simd: the dot product's second region and element count.
+              :gmir/second-base :mir/second-base
+              :gmir/second-length :mir/second-length
+              :gmir/count :mir/count
+              :gmir/offset :mir/offset
+              :gmir/size :mir/size
+              :gmir/maximum :mir/maximum)
+            (cond
+              (= key :gmir/op) (keyword "mir" (name value))
+              (= key :gmir/incomings)
+              (mapv (fn [incoming]
+                      {:mir/predecessor (:gmir/predecessor incoming)
+                       :mir/value (:gmir/value incoming)})
+                    value)
+              :else value)))
+   (case (:gmir/op instruction)
+     :gmir/runtime-call
+     {:mir/context-offset (get runtime-context-offsets
+                                (:gmir/runtime instruction))}
+     :gmir/capability-call
+     {:mir/context-offset (get capability-context-offsets
+                                (:gmir/kind instruction))}
+     {})
+   instruction))
+
+(defn- instruction-sources [instruction]
+  (concat (keep instruction [:mir/src :mir/input :mir/left :mir/right :mir/addend
+                             :mir/test :mir/value :mir/base :mir/length
+                             ;; sysops: the compare-exchange comparand is read
+                             ;; like any other source. Omitting it here would
+                             ;; leave the allocator free to reuse the register
+                             ;; holding it.
+                             :mir/expected
+                             ;; simd: the dot product reads five values. Every
+                             ;; one has to be here or liveness kills an input
+                             ;; and the allocator reuses the register holding
+                             ;; it.
+                             :mir/second-base :mir/second-length :mir/count
+                             :mir/stored :mir/offset :mir/size])
+          (when (vector? (:mir/incomings instruction))
+            (map :mir/value (:mir/incomings instruction)))
+          ;; memwidth: every operation that carries a `:mir/index` operand.
+          (when (contains? indexed-memory-operations (:mir/op instruction))
+            [(:mir/index instruction)])
+          (when (vector? (:mir/arguments instruction))
+            (:mir/arguments instruction))))
+
+(def ^:private schedulable-integer-operations
+  "Pure, non-trapping integer operations admitted to local scheduling. Every
+  other operation is a hard barrier: in particular constants, memory, calls,
+  division, labels, terminators, phi transport, and target-selected ops."
+  #{:mir/add :mir/subtract :mir/multiply
+    :mir/bit-and :mir/bit-or :mir/bit-xor
+    :mir/shift-left :mir/shift-right-signed :mir/shift-right-unsigned
+    :mir/equal :mir/less-than :mir/greater-than
+    :mir/less-or-equal :mir/greater-or-equal})
+
+(def ^:private scheduling-latencies
+  "Portable scheduling heuristic, not a microarchitecture benchmark. The
+  target key keeps policy explicit as the profiles diverge; both current
+  profiles conservatively model integer multiply as the only multi-cycle op."
+  {:x86-64 {:mir/multiply 3}
+   :aarch64 {:mir/multiply 3}})
+
+(defn- scheduling-latency [target instruction]
+  (get-in scheduling-latencies [target (:mir/op instruction)] 1))
+
+(defn- scheduling-register? [target value]
+  (or (gmir/vreg? value) (physical-register? target value)))
+
+(defn- segment-predecessors [target instructions]
+  "Register dependencies within one scheduling segment. SSA vregs need RAW
+  edges only, but post-allocation physical registers are reused: preserve WAR
+  and WAW order too, or a later definition can move before an earlier read or
+  an earlier definition can move after the value meant to replace it."
+  (loop [index 0
+         last-def {}
+         readers-since-def {}
+         preds []]
+    (if (= index (count instructions))
+      preds
+      (let [instruction (nth instructions index)
+            sources (->> (instruction-sources instruction)
+                         (filter #(scheduling-register? target %))
+                         set)
+            dst (:mir/dst instruction)
+            register-dst? (scheduling-register? target dst)
+            raw-preds (keep last-def sources)
+            ;; Capture anti-dependencies before recording this instruction as
+            ;; a reader. A read-modify-write reads the old value and defines
+            ;; the new value atomically; it must not depend on itself.
+            war-preds (when register-dst? (get readers-since-def dst))
+            waw-pred (when register-dst? (get last-def dst))
+            pred-indexes (cond-> (into (set raw-preds) war-preds)
+                           (some? waw-pred) (conj waw-pred))
+            readers-since-def
+            (reduce #(update %1 %2 (fnil conj #{}) index)
+                    readers-since-def sources)
+            readers-since-def (if register-dst?
+                                (assoc readers-since-def dst #{})
+                                readers-since-def)
+            last-def (if register-dst? (assoc last-def dst index) last-def)]
+        (recur (inc index) last-def readers-since-def
+               (conj preds pred-indexes))))))
+
+(defn- segment-ready-at-cycle? [predecessors completion cycle index]
+  (every? #(and (contains? completion %)
+                (<= (get completion %) cycle))
+          (nth predecessors index)))
+
+(defn- segment-order-positions [order-indices]
+  (into {}
+        (map-indexed (fn [position original-index]
+                       [original-index position])
+                     order-indices)))
+
+(defn- valid-scheduled-segment?
+  "True when ORDER-INDICES is an exact, register-dependency-respecting
+  permutation of the original integer indexes in INSTRUCTIONS."
+  [target instructions order-indices]
+  (let [instruction-count (count instructions)]
+    (and (= instruction-count (count order-indices))
+         (every? integer? order-indices)
+         (= (frequencies order-indices)
+            (zipmap (range instruction-count) (repeat 1)))
+         (let [predecessors (segment-predecessors target instructions)
+               positions (segment-order-positions order-indices)]
+           (every? (fn [index]
+                     (every? #(< (positions %)
+                                 (positions index))
+                             (nth predecessors index)))
+                   (range instruction-count))))))
+
+(defn- verify-scheduled-segment!
+  [target instructions order-indices]
+  (when-not (valid-scheduled-segment? target instructions order-indices)
+    (reject! :schedule-violates-register-dependencies
+             {:segment instructions :scheduled-indexes order-indices}))
+  order-indices)
+
+(defn- segment-completion-times
+  "Modeled completion cycles for an explicit permutation of original integer
+  instruction indexes. This is a portable structural score, not wall-clock
+  performance evidence."
+  [target instructions order-indices]
+  (verify-scheduled-segment! target instructions order-indices)
+  (let [predecessors (segment-predecessors target instructions)
+        instruction-count (count instructions)]
+    (loop [cycle 0
+           order-position 0
+           completion {}
+           times (vec (repeat instruction-count 0))]
+      (if (= order-position instruction-count)
+        times
+        (let [index (nth order-indices order-position)]
+          (if (segment-ready-at-cycle? predecessors completion cycle index)
+            (let [done (+ cycle
+                          (scheduling-latency target
+                                              (nth instructions index)))]
+              (recur (inc cycle)
+                     (inc order-position)
+                     (assoc completion index done)
+                     (assoc times index done)))
+            (recur (inc cycle) order-position completion times)))))))
+
+(defn- segment-sum-completion-times
+  [target instructions order-indices]
+  (reduce + (segment-completion-times target instructions order-indices)))
+
+(defn- schedule-integer-segment-indices
+  "Return a deterministic dependency-aware permutation of original indexes."
+  [target instructions]
+  (if (< (count instructions) 2)
+    (vec (range (count instructions)))
+    (let [predecessors (segment-predecessors target instructions)
+          successors
+          (reduce-kv (fn [out index inputs]
+                       (reduce #(update %1 %2 conj index) out inputs))
+                     (vec (repeat (count instructions) #{}))
+                     predecessors)
+          heights
+          (reduce (fn [out index]
+                    (assoc out index
+                           (+ (scheduling-latency target (nth instructions index))
+                              (reduce max 0 (map #(nth out %) (nth successors index))))))
+                  (vec (repeat (count instructions) 0))
+                  (reverse (range (count instructions))))]
+      (verify-scheduled-segment!
+       target
+       instructions
+       (loop [cycle 0
+              remaining (set (range (count instructions)))
+              completion {}
+              out []]
+         (if (empty? remaining)
+           out
+           (let [ready (->> remaining
+                            (filter (fn [index]
+                                      (segment-ready-at-cycle? predecessors
+                                                                 completion
+                                                                 cycle
+                                                                 index)))
+                            (sort-by (fn [index] [(- (nth heights index)) index]))
+                            first)]
+             (if (nil? ready)
+               (recur (inc cycle) remaining completion out)
+               (recur (inc cycle)
+                      (disj remaining ready)
+                      (assoc completion ready
+                             (+ cycle
+                                (scheduling-latency target
+                                                    (nth instructions ready))))
+                      (conj out ready))))))))))
+
+(defn- schedule-integer-segment
+  "Deterministic dependency-aware list scheduling for one barrier-free SSA
+  segment. Critical-path height breaks ties first, original position second.
+  A conceptual issue cycle lets independent work fill modeled dependency
+  latency without inserting machine instructions or claiming wall-clock gain."
+  [target instructions]
+  (mapv #(nth instructions %)
+        (schedule-integer-segment-indices target instructions)))
+
+(defn- aarch64-fusion-pair?
+  "True when INDEX and INDEX+1 are an already-adjacent multiply/add pair the
+  downstream AArch64 selector can turn into one MADD/MSUB. Keep such pairs
+  fixed: separating them would regress code quality before MC fusion runs."
+  [target instructions use-counts index]
+  (let [multiply (nth instructions index nil)
+        consumer (nth instructions (inc index) nil)
+        product (:mir/dst multiply)
+        consumer-op (:mir/op consumer)
+        consumes-product?
+        (or (and (= :mir/add consumer-op)
+                 (or (= product (:mir/left consumer))
+                     (= product (:mir/right consumer))))
+            (and (= :mir/subtract consumer-op)
+                 (= product (:mir/right consumer))))]
+    (and (= :mir/multiply (:mir/op multiply))
+         (scheduling-register? target product)
+         (= 1 (get use-counts product))
+         consumes-product?)))
+
+(defn- protected-scheduling-indexes [target instructions]
+  (if-not (= :aarch64 target)
+    #{}
+    (let [use-counts (frequencies (filter #(scheduling-register? target %)
+                                          (mapcat instruction-sources instructions)))]
+      (reduce (fn [out index]
+                (if (aarch64-fusion-pair? target instructions use-counts index)
+                  (conj out index (inc index))
+                  out))
+              #{}
+              (range (max 0 (dec (count instructions))))))))
+
+(defn- schedule-instructions
+  "Schedule only consecutive pure integer segments. Barriers retain their
+  exact position relative to all surrounding segments. Labels, branches,
+  spills, moves, and calls are barriers, so each basic block is scheduled
+  independently once register allocation has fixed physical identities."
+  [target instructions]
+  (let [protected (protected-scheduling-indexes target instructions)]
+    (letfn [(flush-segment [out segment]
+              (into out (schedule-integer-segment target segment)))]
+      (let [{:keys [out segment]}
+            (reduce (fn [{:keys [out segment]} instruction]
+                      (let [index (+ (count out) (count segment))]
+                        (if (and (not (contains? protected index))
+                                 (contains? schedulable-integer-operations
+                                            (:mir/op instruction)))
+                          {:out out :segment (conj segment instruction)}
+                          {:out (conj (flush-segment out segment) instruction)
+                           :segment []})))
+                    {:out [] :segment []}
+                    instructions)]
+        (flush-segment out segment)))))
+
+(defn- schedule-program [{:mir/keys [target] :as program}]
+  (update program :mir/instructions #(schedule-instructions target %)))
+
+(defn- host-number
+  "A guest i64 literal narrowed to a host number, for BOUNDED comparisons only.
+
+  MIR carries KIR literals through unchanged, and on ClojureScript a guest i64
+  is a JavaScript BigInt while every number this namespace synthesizes is a
+  plain one. The two do not compare, and they fail SILENTLY in both
+  directions: `(zero? (js/BigInt 0))` and `(integer? (js/BigInt 0))` are both
+  false, so a guard written with either simply stops recognizing its case.
+
+  Measured 2026-09-08 through amu on nbb, `(if (= a 0) a a)` on aarch64: 12
+  bytes when the literal reached here as a host number, 24 when it reached
+  here as a BigInt. `aarch64-fuse-zero-equality-branches` below tests its
+  constant with `zero?`, so the fusion never fired for a literal that came
+  from the READER -- which is every literal written in real source. It fired
+  only for the ones the frontend synthesizes. The JVM emits 12 for the same
+  program, because a Long compares to 0.
+
+  Two consequences, and the second is the one that turns a missed
+  optimization into a correctness problem. The fusion was dead on the
+  JVM-free front. And emission stopped being a function of the KIR VALUE:
+  `kotoba-verifier` re-derives the instruction stream from sealed KIR and
+  rejects any drift, so once `amu extract-native` read artifacts with a
+  reader that preserves i64 exactly, a closure-bearing artifact was refused
+  as \"native instruction stream rejected\" -- correctly, by a verifier with
+  no way to tell representation drift from a tampered artifact.
+
+  Narrowing is safe HERE because every caller compares against a small bound
+  (zero, or membership in `#{-1 0}`), and a literal too large for a double is
+  unequal to those under either representation. Do not carry the result
+  onward: `gmir/i64-value?` is the exact test, and this is not it."
+  [value]
+  )
+
+(defn- aarch64-fuse-zero-equality-branches
+  "Turn one SSA-only `zero; equal; branch-zero` triple into branch-nonzero.
+
+  Both removed definitions must have exactly one use in the complete function,
+  including phi incoming edges. Exact adjacency excludes labels and other
+  control-flow boundaries. This runs before physical allocation, where vreg
+  identity still makes global use counts meaningful."
+  [target instructions]
+  (if-not (= :aarch64 target)
+    (vec instructions)
+    (let [instructions (vec instructions)
+          use-counts (frequencies
+                      (filter gmir/vreg?
+                              (mapcat instruction-sources instructions)))]
+      (loop [index 0, out []]
+        (if (>= index (count instructions))
+          (vec out)
+          (let [constant (get instructions index)
+                equal (get instructions (inc index))
+                branch (get instructions (+ index 2))
+                zero (:mir/dst constant)
+                result (:mir/dst equal)
+                left (:mir/left equal)
+                right (:mir/right equal)
+                operand (cond (= zero left) right
+                              (= zero right) left)
+                fuse? (and (= :mir/constant (:mir/op constant))
+                           (zero? (host-number (:mir/value constant)))
+                           (= :mir/equal (:mir/op equal))
+                           (= :mir/branch-zero (:mir/op branch))
+                           (= result (:mir/test branch))
+                           (gmir/vreg? operand)
+                           (= 3 (count (set [zero result operand])))
+                           (= 1 (get use-counts zero))
+                           (= 1 (get use-counts result)))]
+            (if fuse?
+              (recur (+ index 3)
+                     (conj out {:mir/op :mir/branch-nonzero
+                                :mir/test operand
+                                :mir/target (:mir/target branch)}))
+              (recur (inc index) (conj out constant)))))))))
+
+(defn- select-instructions
+  "Select one function while retaining SSA constants long enough to choose a
+  target-independent constant-divisor operation. A divisor vreg disappears
+  from the closed operation after its literal value is captured. Its constant
+  definition is removed only when no other selected instruction consumes it."
+  [target instructions constant-division?]
+  (let [{:keys [out specialized-divisors]}
+        (reduce
+         (fn [{:keys [constants out specialized-divisors]} instruction]
+           (let [right (:gmir/right instruction)
+                 specialized? (and constant-division?
+                                   (= :gmir/quotient (:gmir/op instruction))
+                                   (contains? constants right))
+                 selected (select-instruction target instruction)
+                 selected (if specialized?
+                            (-> selected
+                                (assoc :mir/op :mir/quotient-constant
+                                       :mir/divisor (get constants right))
+                                (dissoc :mir/right))
+                            selected)
+                 constants (if (= :gmir/constant (:gmir/op instruction))
+                             (assoc constants (:gmir/dst instruction)
+                                    (:gmir/value instruction))
+                             constants)]
+             {:constants constants
+              :specialized-divisors (cond-> specialized-divisors
+                                      specialized? (conj right))
+              :out (conj out selected)}))
+         {:constants {} :specialized-divisors #{} :out []}
+         instructions)
+        ;; NBB represents admitted i64 literals as JavaScript BigInt values.
+        ;; They are not SSA identities and must not enter a CLJS hash-set
+        ;; (which would attempt object identity bookkeeping on a primitive).
+        out (aarch64-fuse-zero-equality-branches target out)
+        live-sources (->> out
+                          (mapcat instruction-sources)
+                          (filter gmir/vreg?)
+                          set)]
+    (->> out
+         (remove (fn [{:mir/keys [op dst]}]
+                   (and (= :mir/constant op)
+                        (contains? specialized-divisors dst)
+                        (not (contains? live-sources dst)))))
+         vec)))
+
+(defn select-target
+  "Select the closed GMIR operation set into target MIR, preserving vregs."
+  [target program]
+  (when-not (contains? targets target)
+    (reject! :unsupported-target {:target target}))
+  (gmir/validate! program)
+  (let [instructions (if (= 3 (:gmir/version program))
+                       (mapcat :gmir/instructions (:gmir/functions program))
+                       (:gmir/instructions program))
+        privileged (filter #(= :gmir/x86-privileged (:gmir/op %)) instructions)
+        ;; simd: `kernel-dot-f32` IS NO LONGER X86-ONLY (2026-09-09). The
+        ;; contract of the operation is an ORDER OF SUMMATION rather than a dot
+        ;; product, and that is exactly why an AArch64 arm was admissible only
+        ;; once it reproduced the order: `kotoba.native.machine-ir`'s
+        ;; `a64-kernel-dot-f32` is the x86 SCALAR arm instruction for
+        ;; instruction -- four accumulators, lower half before upper, then
+        ;; `(s0+s1)+(s2+s3)` -- and AArch64 scalar FMUL/FADD are IEEE-754
+        ;; round-to-nearest-even on the same operands SSE's mulss/addss are, so
+        ;; the three arms agree by construction. It is scalar and not NEON
+        ;; deliberately: the cheap NEON reduction computes a different tree.
+        ;;
+        ;; dequant: Q8_0 LEFT THIS SET ON 2026-09-09 and the K-quants did not.
+        ;; The reason was never the tree -- the tree has an AArch64 spelling --
+        ;; it is each format's per-block DECODE. Q8_0's is one fp16 scale and
+        ;; eight sign-extended bytes per group, which transliterates from the
+        ;; x86 scalar arm directly (`a64-kernel-dequant-dot`, verified against
+        ;; the assembler and executed). Q4_K's nibble split and Q6_K's six-bit
+        ;; regroup do not, and the four codebook formats need a read-only table
+        ;; on the machine before either backend can have an arm at all.
+        ;;
+        ;; The set is spelled by SUBTRACTION from gmir's rather than listed, so
+        ;; a format added upstream is refused here until someone decides
+        ;; otherwise -- the fail-closed direction.
+        aarch64-fused-dequant '#{:gmir/kernel-dequant-dot-q8-0}
+        dot-products (filter #(and (contains? gmir/kernel-dequant-dot-operations
+                                              (:gmir/op %))
+                                   (not (contains? aarch64-fused-dequant
+                                                   (:gmir/op %))))
+                             instructions)
+        ;; boot-lit/adr: A LITERAL'S ADDRESS SELECTS ON BOTH TARGETS AS OF
+        ;; 2026-09-09, and the refusal that stood here is gone rather than
+        ;; narrowed -- `targets` holds exactly two, so a refusal for
+        ;; "not x86-64" was a refusal for AArch64 and nothing else.
+        ;;
+        ;; The refusal said the blocker was ADRP+ADD's 4 KiB page split. That
+        ;; was the wrong instruction. `adr Xd, label` reaches +/-1 MiB in ONE
+        ;; instruction with no page arithmetic at all, and the literal pool
+        ;; that `kotoba.native`'s layout pass places sits at the end of the
+        ;; same emitted buffer as the code -- so the distance is bounded by
+        ;; the size of one program, which is exactly the fact a LINKER cannot
+        ;; know and this backend can. ADRP exists for the case where the
+        ;; symbol might be four gigabytes away; that case does not arise here.
+        ;;
+        ;; ⚠ The lesson is the one this workspace's own rule names: a refusal
+        ;; that says "the layout pass does not model X" is a statement about
+        ;; an implementation, and the way to honour it is to measure it, not
+        ;; to design around it. Measuring it found that X was never needed.
+        ;; boot-scratch/adr: A FUNCTION'S ADDRESS SELECTS ON BOTH TARGETS AS
+        ;; OF 2026-09-09, for the same reason and by the same instruction as
+        ;; the literal's did earlier the same day.
+        ;;
+        ;; The refusal that stood here said a function's address is
+        ;; `lea dst,[rip+disp32]` too, "so it is x86-only for exactly the
+        ;; reason the literal is". That sentence was true and it survived its
+        ;; own premise by a few hours: the literal's reason stopped holding
+        ;; when `adr` turned out to reach the pool in one instruction, and a
+        ;; function's label is in the same emitted buffer as the code exactly
+        ;; as the pool is. Deleting the reason and leaving the conclusion is
+        ;; how a gap outlives the thing that caused it.
+        ;;
+        ;; ⚠ THE TWO KEYWORDS WERE STILL WORTH KEEPING APART while they both
+        ;; existed. `kotoba-native`'s `isa-parity` and this file's own tests
+        ;; each held a control that would have gone red if one refusal had
+        ;; been widened for both -- which is what let the literal's move on
+        ;; its own, hours before this one, with evidence for each.
+        ]
+    (when (and (not= :x86-64 target) (seq privileged))
+      (reject! :x86-privileged-target-mismatch
+               {:target target :actions (mapv :gmir/action privileged)}))
+    (when (and (not= :x86-64 target) (seq dot-products))
+      (reject! :x86-simd-target-mismatch
+               {:target target
+                :operations (vec (distinct (map :gmir/op dot-products)))})))
+  (validate!
+   (if (= 3 (:gmir/version program))
+     {:mir/version 3
+      :mir/target target
+      :mir/registers :virtual
+      :mir/entry (:gmir/entry program)
+      :mir/functions
+      (mapv (fn [{:gmir/keys [name arity instructions]}]
+              {:mir/name name :mir/arity arity
+               :mir/instructions (select-instructions target instructions true)})
+            (:gmir/functions program))}
+     {:mir/version (:gmir/version program)
+      :mir/target target
+      :mir/registers :virtual
+      :mir/instructions (mapv #(select-instruction target %)
+                              (:gmir/instructions program))})))
+
+(defn- sources [instruction]
+  (instruction-sources instruction))
+
+(defn- preceding-label [instructions index]
+  (loop [cursor (dec index)]
+    (when (not (neg? cursor))
+      (let [instruction (nth instructions cursor)]
+        (cond
+          (= :mir/label (:mir/op instruction)) (:mir/id instruction)
+          (= :mir/phi (:mir/op instruction)) (recur (dec cursor))
+          :else nil)))))
+
+(defn- lower-phis
+  [{:mir/keys [instructions] :as program}]
+  (let [phis (->> instructions
+                  (map-indexed vector)
+                  (filter (fn [[_ instruction]] (= :mir/phi (:mir/op instruction))))
+                  vec)
+        slot-by-dst (into {} (map-indexed (fn [slot [_ instruction]]
+                                           [(:mir/dst instruction) slot])
+                                         phis))
+        stores-by-edge
+        (reduce (fn [stores [index {:mir/keys [dst incomings]}]]
+                  (let [join (preceding-label instructions index)
+                        slot (get slot-by-dst dst)]
+                    (reduce (fn [out incoming]
+                              (update out [(:mir/predecessor incoming) join]
+                                      (fnil conj [])
+                                      {:mir/op :mir/merge-store
+                                       :mir/src (:mir/value incoming)
+                                       :mir/slot slot}))
+                            stores incomings)))
+                {} phis)
+        lowered
+        (:out
+         (reduce (fn [{:keys [label out]} {:mir/keys [op target dst] :as instruction}]
+                   (case op
+                     :mir/label {:label (:mir/id instruction)
+                                 :out (conj out instruction)}
+                     :mir/phi {:label label
+                               :out (conj out {:mir/op :mir/merge-load
+                                              :mir/dst dst
+                                              :mir/slot (get slot-by-dst dst)})}
+                     :mir/jump {:label label
+                                :out (into out
+                                           (concat (get stores-by-edge [label target] [])
+                                                   [instruction]))}
+                     {:label label :out (conj out instruction)}))
+                 {:label nil :out []}
+                 instructions))]
+    {:program (assoc program :mir/instructions (vec lowered))
+     :merge-slots (count phis)
+     :merge-dst-by-slot (into {} (map-indexed (fn [slot [_ instruction]]
+                                                [slot (:mir/dst instruction)])
+                                              phis))}))
+
+(def ^:private parallel-copy-temp ::parallel-copy-temp)
+
+(defn- remove-at [values index]
+  (into (subvec values 0 index) (subvec values (inc index))))
+
+(defn- schedule-parallel-copies
+  "Lower simultaneous physical-register copies deterministically. Acyclic
+  copies become moves. A cycle is broken with one reusable frame slot."
+  [copies temp-slot]
+  (loop [pending (vec (remove #(= (:mir/dst %) (:mir/src %)) copies))
+         out []
+         used-temp? false]
+    (if (empty? pending)
+      {:instructions out :used-temp? used-temp?}
+      (let [pending-sources (set (map :mir/src pending))
+            ready-index (first
+                         (keep-indexed
+                          (fn [index {:mir/keys [dst]}]
+                            (when-not (contains? pending-sources dst) index))
+                          pending))]
+        (if (some? ready-index)
+          (let [{:mir/keys [dst src]} (nth pending ready-index)
+                instruction (if (= parallel-copy-temp src)
+                              {:mir/op :mir/spill-load
+                               :mir/dst dst
+                               :mir/slot temp-slot}
+                              {:mir/op :mir/move :mir/dst dst :mir/src src})]
+            (recur (remove-at pending ready-index)
+                   (conj out instruction)
+                   used-temp?))
+          (let [{:mir/keys [src]} (first pending)]
+            (recur (mapv (fn [copy]
+                           (if (= src (:mir/src copy))
+                             (assoc copy :mir/src parallel-copy-temp)
+                             copy))
+                         pending)
+                   (conj out {:mir/op :mir/spill-store
+                              :mir/src src
+                              :mir/slot temp-slot})
+                   true)))))))
+
+(defn- coalesce-phi-transports
+  "Replace complete edge merge-store groups and their join loads with a
+  deterministic parallel-copy schedule. Invalid or incomplete groups retain
+  the frame-backed representation instead of being partially rewritten."
+  [{:mir/keys [instructions frame-slots] :as program} merge-slots]
+  (if (zero? merge-slots)
+    program
+    (let [loads-by-slot (group-by :mir/slot
+                                  (filter #(and (= :mir/spill-load (:mir/op %))
+                                                (< (:mir/slot %) merge-slots))
+                                          instructions))
+          stores-by-slot (group-by :mir/slot
+                                   (filter #(and (= :mir/spill-store (:mir/op %))
+                                                 (< (:mir/slot %) merge-slots))
+                                           instructions))
+          candidates (set (range merge-slots))
+          complete? (every? #(and (= 1 (count (get loads-by-slot %)))
+                                  (<= 2 (count (get stores-by-slot %))))
+                            candidates)
+          load-register (into {} (map (fn [slot]
+                                        [slot (:mir/dst (first (get loads-by-slot slot)))])
+                                      candidates))
+          compact-slot (fn [slot]
+                         (- slot (count (filter #(< % slot) candidates))))
+          merge-store? #(and (= :mir/spill-store (:mir/op %))
+                             (contains? candidates (:mir/slot %)))]
+      (if-not complete?
+        program
+        (let [{:keys [out used-temp? valid?]}
+              (loop [remaining instructions, out [], used-temp? false]
+                (if-let [{:mir/keys [op slot] :as instruction} (first remaining)]
+                  (cond
+                    (merge-store? instruction)
+                    (let [[stores tail] (split-with merge-store? remaining)]
+                      (if (= :mir/jump (:mir/op (first tail)))
+                        (let [copies (mapv (fn [{:mir/keys [src slot]}]
+                                             {:mir/dst (get load-register slot)
+                                              :mir/src src})
+                                           stores)
+                              scheduled (schedule-parallel-copies
+                                         copies
+                                         (- frame-slots (count candidates)))]
+                          (recur tail
+                                 (into out (:instructions scheduled))
+                                 (or used-temp? (:used-temp? scheduled))))
+                        {:out out :used-temp? used-temp? :valid? false}))
+
+                    (and (= :mir/spill-load op) (contains? candidates slot))
+                    (recur (next remaining) out used-temp?)
+
+                    (contains? instruction :mir/slot)
+                    (recur (next remaining)
+                           (conj out (assoc instruction :mir/slot (compact-slot slot)))
+                           used-temp?)
+
+                    :else
+                    (recur (next remaining) (conj out instruction) used-temp?))
+                  {:out out :used-temp? used-temp? :valid? true}))]
+          (if-not valid?
+            program
+            (validate-flat! (assoc program
+                                   :mir/frame-slots (+ (- frame-slots (count candidates))
+                                                       (if used-temp? 1 0))
+                                   :mir/instructions (vec out)))))))))
+
+(defn- instruction-def [instruction]
+  (when (gmir/vreg? (:mir/dst instruction))
+    (:mir/dst instruction)))
+
+(def ^:private terminators
+  #{:mir/jump :mir/branch-zero :mir/branch-nonzero :mir/return})
+
+(defn- basic-blocks [instructions]
+  (let [n (count instructions)
+        leaders (sort
+                 (into #{0}
+                       (mapcat
+                        (fn [index]
+                          (let [op (:mir/op (nth instructions index))]
+                            (cond
+                              (= op :mir/label) [index]
+                              (contains? terminators op)
+                              (when (< (inc index) n) [(inc index)])
+                              :else nil)))
+                        (range n))))
+        block-count (count leaders)]
+    (mapv (fn [block-index]
+            (let [start (nth leaders block-index)
+                  end (if (< (inc block-index) block-count)
+                        (dec (nth leaders (inc block-index)))
+                        (dec n))]
+              {:index block-index :start start :end end}))
+          (range block-count))))
+
+(defn- label-block-indexes [instructions blocks]
+  (into {}
+        (keep (fn [{:keys [index start]}]
+                (when (= :mir/label (:mir/op (nth instructions start)))
+                  [(:mir/id (nth instructions start)) index]))
+              blocks)))
+
+(defn- block-successors [instructions blocks label->block]
+  (mapv (fn [{:keys [index end]}]
+          (let [op (:mir/op (nth instructions end))]
+            (cond
+              (= op :mir/return) []
+              (= op :mir/jump)
+              [(get label->block (:mir/target (nth instructions end)))]
+              (contains? #{:mir/branch-zero :mir/branch-nonzero} op)
+              (vec (remove nil?
+                           [(when (< (inc index) (count blocks)) (inc index))
+                            (get label->block
+                                 (:mir/target (nth instructions end)))]))
+              (< (inc index) (count blocks)) [(inc index)]
+              :else [])))
+        blocks))
+
+(defn- block-predecessors [successors]
+  (let [block-count (count successors)]
+    (reduce (fn [preds from]
+              (reduce (fn [acc to]
+                        (update acc to (fnil conj #{}) from))
+                      preds
+                      (nth successors from)))
+            (vec (repeat block-count #{}))
+            (range block-count))))
+
+(defn- intersect-dominator-sets [sets]
+  (if (empty? sets)
+    #{}
+    (let [[head & tail] sets]
+      (reduce set/intersection head tail))))
+
+(defn- cfg-dominator-sets [predecessors]
+  (let [block-count (count predecessors)
+        universe (set (range block-count))
+        initial (mapv (fn [block-index]
+                        (if (zero? block-index) #{0} universe))
+                      (range block-count))]
+    (loop [dom initial]
+      (let [next-dom
+            (mapv (fn [block-index]
+                    (if (zero? block-index)
+                      #{0}
+                      (let [preds (seq (nth predecessors block-index))]
+                        (if preds
+                          (conj (intersect-dominator-sets
+                                 (map #(nth dom %) preds))
+                                block-index)
+                          (nth dom block-index)))))
+                  (range block-count))]
+        (if (= next-dom dom)
+          dom
+          (recur next-dom))))))
+
+(defn- cfg-immediate-dominators [dominators]
+  (mapv (fn [block-index]
+          (when (pos? block-index)
+            (let [strict (disj (nth dominators block-index) block-index)]
+              (first (filter (fn [candidate]
+                               (not (some (fn [other]
+                                            (and (not= other candidate)
+                                                 (contains? (nth dominators other)
+                                                            candidate)))
+                                          strict)))
+                             strict)))))
+        (range (count dominators))))
+
+(defn- cfg-dominates? [dominators dominator block-index]
+  (contains? (nth dominators block-index) dominator))
+
+(defn- cfg-dominator-analysis [instructions]
+  (let [blocks (basic-blocks instructions)
+        label->block (label-block-indexes instructions blocks)
+        successors (block-successors instructions blocks label->block)
+        predecessors (block-predecessors successors)
+        dominators (cfg-dominator-sets predecessors)]
+    {:blocks blocks
+     :successors successors
+     :predecessors predecessors
+     :dominators dominators
+     :immediate-dominators (cfg-immediate-dominators dominators)}))
+
+(defn- block-use-def [instructions blocks]
+  (mapv (fn [{:keys [start end]}]
+          (reduce (fn [{:keys [uses defs]} index]
+                    (let [instruction (nth instructions index)]
+                      ;; Only reads before a local definition are live-in.
+                      ;; Counting later reads makes loop-local temporaries look
+                      ;; live across the back edge and lengthens their lifetime
+                      ;; to the latch.
+                      {:uses (into uses (remove defs
+                                                (filter gmir/vreg?
+                                                        (sources instruction))))
+                       :defs (if-let [definition (instruction-def instruction)]
+                               (conj defs definition)
+                               defs)}))
+                  {:uses #{} :defs #{}}
+                  (range start (inc end))))
+        blocks))
+
+(defn- cfg-live-variables [instructions]
+  (let [blocks (basic-blocks instructions)
+        label->block (label-block-indexes instructions blocks)
+        successors (block-successors instructions blocks label->block)
+        use-def (block-use-def instructions blocks)
+        block-count (count blocks)
+        empty (vec (repeat block-count #{}))]
+    (loop [live-in empty
+           live-out empty]
+      (let [next-out (mapv (fn [block-index]
+                             (reduce into #{}
+                                     (map #(nth live-in %) (nth successors block-index))))
+                           (range block-count))
+            next-in (mapv (fn [block-index]
+                            (let [{:keys [uses defs]} (nth use-def block-index)
+                                  out (nth next-out block-index)]
+                              (into uses (remove defs out))))
+                          (range block-count))]
+        (if (and (= next-in live-in) (= next-out live-out))
+          {:blocks blocks :live-in next-in :live-out next-out}
+          (recur next-in next-out))))))
+
+(defn- back-edge-block-ends [instructions blocks label->block]
+  (into #{}
+        (keep (fn [{:keys [index end]}]
+                (let [op (:mir/op (nth instructions end))]
+                  (when (contains? #{:mir/jump :mir/branch-zero
+                                     :mir/branch-nonzero} op)
+                    (let [target (:mir/target (nth instructions end))
+                          target-block (get label->block target)]
+                      (when (and (some? target-block) (<= target-block index))
+                        end)))))
+              blocks)))
+
+(defn- cfg-last-uses [instructions]
+  (let [textual (reduce-kv
+                 (fn [uses index instruction]
+                   (reduce #(assoc %1 %2 index) uses
+                           (filter gmir/vreg? (sources instruction))))
+                 {} instructions)
+        blocks (basic-blocks instructions)
+        label->block (label-block-indexes instructions blocks)
+        {:keys [live-out]} (cfg-live-variables instructions)
+        back-edges (back-edge-block-ends instructions blocks label->block)]
+    (reduce (fn [uses block-index]
+              (let [end (:end (nth blocks block-index))]
+                (if (contains? back-edges end)
+                  (reduce (fn [out value]
+                            (assoc out value (max (get out value -1) end)))
+                          uses
+                          (nth live-out block-index))
+                  uses)))
+            textual
+            (range (count blocks)))))
+
+(defn- last-uses [instructions]
+  (cfg-last-uses instructions))
+
+(defn- ordered-vregs [values]
+  (sort-by (fn [value] (or (:gmir/id value) (str value))) values))
+
+(defn- use-indexes
+  "Every instruction index at which VALUE is a source, in order."
+  [instructions]
+  (reduce-kv
+   (fn [uses index instruction]
+     (reduce (fn [indexes value]
+               (update indexes value (fnil conj []) index))
+             uses
+             (distinct (filter gmir/vreg? (sources instruction)))))
+   {} instructions))
+
+(defn- direct-recur-home-candidates
+  "Map a self-tail argument SSA value to its exact allocator-owned parameter
+  home when that recur is the value's sole use.  A repeated argument is not a
+  candidate: one producer cannot define two homes, and the parallel-copy
+  scheduler must retain responsibility for duplicating it.  Register
+  availability is checked separately at the producer, where interference is
+  known."
+  [instructions current-function parameter-homes indexes]
+  (let [sites (->> instructions
+                   (keep-indexed
+                    (fn [index {:mir/keys [op callee arguments] :as instruction}]
+                      (when (and (= :mir/tail-call op)
+                                 (= current-function callee)
+                                 (= (count arguments)
+                                    (count parameter-homes)))
+                        [index instruction])))
+                   vec)]
+    ;; Multiple recur sites need path-sensitive interference.  This deliberately
+    ;; small slice fails closed until the allocator owns that proof.
+    (if (= 1 (count sites))
+      (let [[index {:mir/keys [arguments]}] (first sites)
+            counts (frequencies arguments)]
+        (reduce (fn [out [value home]]
+                  (if (and (gmir/vreg? value)
+                           (= 1 (get counts value))
+                           (= [index] (get indexes value)))
+                    (assoc out value home)
+                    out))
+                {}
+                (map vector arguments parameter-homes)))
+      {})))
+
+(def ^:private direct-home-control-boundaries
+  #{:mir/label :mir/jump :mir/branch-zero :mir/branch-nonzero
+    :mir/return :mir/tail-call :mir/recur :mir/reentry})
+
+(defn- straight-line-to-recur?
+  "The suffix after a producer reaches its sole recur use without crossing a
+  control-flow or call boundary.  Register interference is handled separately;
+  this guard keeps the optimization local and fail-closed."
+  [instructions producer-index recur-index]
+  (every? (fn [instruction]
+            (and (not (call-operation? (:mir/op instruction)))
+                 (not (contains? direct-home-control-boundaries
+                                 (:mir/op instruction)))))
+          (subvec instructions (inc producer-index) recur-index)))
+
+(defn- next-use-of [indexes index value]
+  (some (fn [use]
+          (when (>= use index) use))
+        (get indexes value)))
+
+(defn- furthest-victim
+  "The assigned value with the furthest next use, excluding PROTECTED
+  operands. Ties keep the earlier ordered-vregs entry so the choice does
+  not depend on hash-map iteration."
+  [assigned indexes index protected]
+  (let [candidates (filterv (fn [value]
+                              (not (contains? protected value)))
+                            (ordered-vregs (keys assigned)))]
+    (when (seq candidates)
+      (reduce (fn [best value]
+                (let [best-use (or (next-use-of indexes index best) -1)
+                      value-use (or (next-use-of indexes index value) -1)]
+                  (if (> value-use best-use) value best)))
+              (first candidates)
+              (rest candidates)))))
+
+(defn- expire-assigned
+  "Remove VALUES from STATE's assignment without returning a register that is
+  still owned by another SSA value (the latter occurs after a dying-left
+  destination coalesces onto its source register).
+
+  Freed registers return to the end of the free list, so a register is reused
+  only after every other free one has been. That ordering is what the encoders'
+  byte-exact expectations were written against, and it is why the pool grows on
+  demand instead of being offered whole: handing out a wide pool up front makes
+  a body needing three registers touch all of them, reach the preserved tier,
+  and pay a save and a restore it never needed."
+  [state values]
+  (let [expired (vec (ordered-vregs values))
+        assigned (:assigned state)
+        remaining (apply dissoc assigned expired)
+        still-owned (set (vals remaining))
+        freed (remove still-owned (map assigned expired))]
+    (-> state
+        (assoc :assigned remaining)
+        (update :free into freed))))
+
+(defn- rebuild-pool-lists
+  "Re-split POOL into the scratch free list and the reserve (leaf + preserved)
+  after a call has clobbered every caller-saved register."
+  [target pool assigned]
+  (let [owned (set (vals assigned))
+        scratch-count (count (get physical-registers target))]
+    {:free (vec (remove owned (take scratch-count pool)))
+     :reserve (vec (remove owned (drop scratch-count pool)))}))
+
+(defn- expire-assigned-in-pool
+  "Expire VALUES and restore the allocator's scratch/reserve partition.
+
+  `expire-assigned` deliberately knows nothing about target register classes.
+  Call-capable allocation must reclassify released preserved registers instead
+  of appending them to the scratch list. Previously-used preserved registers go
+  to the front of reserve: reusing one costs no additional frame save, while
+  consuming a never-used preserved register adds a save/restore pair."
+  [target state values]
+  (let [assigned (:assigned state)
+        remaining (apply dissoc assigned values)
+        still-owned (set (vals remaining))
+        released (vec (remove still-owned (map assigned (ordered-vregs values))))
+        scratch? (set (get physical-registers target))
+        state (expire-assigned state values)]
+    (-> state
+        (update :free (fn [free]
+                        (into (vec (remove (set released) free))
+                              (filter scratch? released))))
+        (update :reserve #(into (vec (remove scratch? released)) %)))))
+
+(defn- drop-backed-assignments
+  "A reload in one arm does not satisfy a use in another. Values that already
+  have a slot are dropped from the assignment at every label so the next use
+  in this block loads them again. Values that were never spilled stay: their
+  definition dominates the split. Callers skip this when nothing assigned is
+  backed -- rebuilding the pool lists on a leaf scramble coalescing."
+  [target pool assigned backed]
+  (let [kept (into {} (remove (fn [[value _]] (contains? backed value)) assigned))
+        lists (rebuild-pool-lists target pool kept)]
+    {:assigned kept :free (:free lists) :reserve (:reserve lists)}))
+
+(defn- physicalize-call
+  [target instruction call-registers return-register]
+  (let [op (:mir/op instruction)]
+    (cond-> {:mir/op op :mir/arguments call-registers}
+      (not= :mir/tail-call op) (assoc :mir/dst return-register)
+      (contains? #{:mir/call :mir/tail-call} op)
+      (assoc :mir/callee (:mir/callee instruction))
+      (= :mir/runtime-call op)
+      (assoc :mir/runtime (:mir/runtime instruction)
+             :mir/context-offset (:mir/context-offset instruction))
+      (= :mir/capability-call op)
+      (assoc :mir/capability (:mir/capability instruction)
+             :mir/kind (:mir/kind instruction)
+             :mir/context-offset (:mir/context-offset instruction)))))
+
+(defn- entry-argument-plan
+  "Materialize a function's ABI inputs as canonical self-markers followed by a
+  bounded set of direct entry spills and a parallel copy into allocator
+  registers. Values in PRESERVED-VALUES take the callee-saved tier first so an
+  entry argument that crosses a call is not immediately stored and reloaded.
+  Unused inputs need only their marker. Inputs beyond the allocator profile are
+  backed directly from their ABI registers and loaded lazily."
+  [target pool instructions last-use slot-base stable-slots preserved-values]
+  (let [[arguments remaining] (split-with #(= :mir/argument (:mir/op %))
+                                          instructions)]
+    (when (some #(= :mir/argument (:mir/op %)) remaining)
+      (reject! :spill-required {:problem :non-prefix-argument}))
+    (let [arguments (vec arguments)
+          remaining (vec remaining)
+          allocator-registers pool
+          abi-registers (get call-argument-registers target)
+          used (filterv #(contains? last-use (:mir/dst %)) arguments)]
+      (let [scratch-count (count (get physical-registers target))
+            initial {:scratch (vec (take scratch-count allocator-registers))
+                     :preserved (vec (drop scratch-count allocator-registers))
+                     :register-inputs [] :spill-inputs [] :assigned {}}
+            {:keys [register-inputs spill-inputs assigned] :as placement}
+            (reduce
+             (fn [state instruction]
+               (let [value (:mir/dst instruction)
+                     primary (if (contains? preserved-values value)
+                               :preserved :scratch)
+                     secondary (if (= primary :preserved) :scratch :preserved)
+                     tier (cond
+                            (seq (get state primary)) primary
+                            (seq (get state secondary)) secondary
+                            :else nil)]
+                 (if tier
+                   (let [register (first (get state tier))]
+                     (-> state
+                         (update tier #(vec (rest %)))
+                         (update :register-inputs conj [instruction register])
+                         (assoc-in [:assigned value] register)))
+                   (update state :spill-inputs conj instruction))))
+             initial used)
+            input-register (fn [instruction]
+                             (or (get abi-registers (:mir/index instruction))
+                                 (reject! :spill-required instruction)))
+            [entry-spills next-slot]
+            (reduce (fn [[slots next-slot] instruction]
+                      (let [value (:mir/dst instruction)]
+                        (if-let [slot (get stable-slots value)]
+                          [(assoc slots value slot) next-slot]
+                          [(assoc slots value next-slot) (inc next-slot)])))
+                    [{} slot-base]
+                    spill-inputs)
+            markers (mapv #(assoc % :mir/dst (input-register %)) arguments)
+            stores (mapv (fn [instruction]
+                           {:mir/op :mir/spill-store
+                            :mir/src (input-register instruction)
+                            :mir/slot (get entry-spills (:mir/dst instruction))})
+                         spill-inputs)
+            copies (mapv (fn [[instruction register]]
+                           {:mir/dst register
+                            :mir/src (input-register instruction)})
+                         register-inputs)
+            scheduled (schedule-parallel-copies copies next-slot)]
+        {:argument-count (count arguments)
+         :remaining remaining
+         :assigned assigned
+         :entry-spills entry-spills
+         :stable-slots (merge stable-slots entry-spills)
+         :stable-slot-count next-slot
+         :temp-slot next-slot
+         :free (:scratch placement)
+         :reserve (:preserved placement)
+         :instructions (into markers (concat stores (:instructions scheduled)))
+         :parameter-homes (when (and (empty? entry-spills)
+                                     (= (count arguments) (count assigned)))
+                            (mapv #(get assigned (:mir/dst %)) arguments))
+         :used-temp? (:used-temp? scheduled)}))))
+
+(defn- call-live-slots
+  "Assign stable slots only to SSA values whose definition precedes a call and
+  whose final use follows that call. Slots are ordered by definition, so the
+  result is deterministic and independent of target register names."
+  [instructions]
+  (let [last-use (last-uses instructions)
+        call-indexes (->> instructions
+                          (keep-indexed (fn [index instruction]
+                                          (when (call-operation? (:mir/op instruction))
+                                            index)))
+                          vec)
+        definitions (->> instructions
+                         (keep-indexed (fn [index instruction]
+                                         (when (gmir/vreg? (:mir/dst instruction))
+                                           [(:mir/dst instruction) index])))
+                         vec)
+        crossing (filter (fn [[value definition-index]]
+                           (some (fn [call-index]
+                                   (< definition-index call-index
+                                      (get last-use value -1)))
+                                 call-indexes))
+                         definitions)]
+    (into {} (map-indexed (fn [slot [value _]] [value slot]) crossing))))
+
+(defn- store-at-definition
+  "Splice the spill-store in immediately after VALUE was defined, rather than
+  leaving it where the register ran out.
+
+  This allocator walks one flat instruction list that contains labels and
+  branches, so the point of exhaustion can sit inside one arm of a branch while
+  the reload lands in the other. A store left there writes a slot on a path that
+  was not taken, and the other path reads whatever was in it. A definition
+  dominates every use of its value, because the program is in SSA form, so a
+  store placed there is executed before any reload of it can be reached.
+
+  Every definition position at or after the splice moves along by one."
+  [{:keys [out def-position] :as state} value register slot]
+  (let [position (or (get def-position value)
+                     (reject! :spill-required
+                              {:problem :no-definition-to-store-at :value value}))
+        store {:mir/op :mir/spill-store :mir/src register :mir/slot slot}]
+    (assoc state
+           :out (into (conj (subvec out 0 position) store) (subvec out position))
+           :def-position (reduce-kv (fn [positions other other-position]
+                                      (assoc positions other
+                                             (if (>= other-position position)
+                                               (inc other-position)
+                                               other-position)))
+                                    {} def-position))))
+
+(defn- allocate-without-spills
+  "Linear-scan allocation. The pool grows on demand; when it is empty the
+  live value with the furthest next use is stored, not every SSA value.
+  A body that fits never reaches the spill step, so its assignment is
+  byte-for-byte what it was.
+
+  A function that contains a call is offered the non-leaf pool (scratch then
+  preserved, no leaf-tier caller-saved). Values live across a call prefer the
+  preserved tier at their definition so a call does not have to move them.
+  Remaining live caller-saved values are stored at their definition -- the
+  store dominates every reload, including the arm that does not contain the
+  call -- then dropped from the assignment. A reload in one arm does not
+  satisfy a use in another: at every label after the entry, backed values
+  that are currently assigned leave the assignment so the next use in that
+  block loads them again. The call itself uses the ABI registers. Pressure
+  that still cannot complete falls out as :spill-required."
+  [{:mir/keys [version target registers instructions] :as program} merge-slots
+   current-function]
+  (when-not (= :virtual registers)
+    (reject! :registers-not-virtual program))
+  (let [last-use (last-uses instructions)
+        indexes (use-indexes instructions)
+        calls? (boolean (some #(call-operation? (:mir/op %)) instructions))
+        quotients? (boolean (some #(contains? #{:mir/quotient-constant
+                                                :mir/quotient}
+                                              (:mir/op %))
+                                  instructions))
+        ;; Straight-line only: `rebuild-pool-lists` splits pools by POSITION
+        ;; at label boundaries too (`drop-backed-assignments`), and a
+        ;; reordered prefix misclassifies the tiers there -- measured as two
+        ;; new variant-sroa failures before this guard existed.
+        straight-line? (not-any? #(contains? #{:mir/label :mir/branch-zero
+                                               :mir/branch-nonzero :mir/jump
+                                               :mir/phi}
+                                             (:mir/op %))
+                                 instructions)
+        pool (if (and (= :x86-64 target) quotients? (not calls?)
+                      straight-line?)
+               (x86-quotient-steered-pool true)
+               (allocator-pool target {:leaf? (not calls?)}))
+        crossing (if calls? (set (keys (call-live-slots instructions))) #{})
+        preserved-set (set (get preserved-registers target))
+        return-register (get return-registers target)
+        self-tail? (and current-function
+                        (some #(and (= :mir/tail-call (:mir/op %))
+                                    (= current-function (:mir/callee %)))
+                              instructions))
+        host-calls? (boolean
+                     (some #(contains? #{:mir/runtime-call
+                                         :mir/capability-call}
+                                       (:mir/op %))
+                           instructions))
+        x86-direct-reentry? (and (= :x86-64 target)
+                                 self-tail?
+                                 (not host-calls?))
+        ;; AArch64 already admits every call-crossing entry into its preserved
+        ;; tier.  The x86 slice is deliberately narrower: only parameters of a
+        ;; self-tail function with no runtime/capability callback. Its direct
+        ;; recur edge stays inside the one frame, so every parameter home must
+        ;; survive ordinary guest calls in the body. Callback-bearing helpers
+        ;; retain the established x86 scratch-and-slot plan that the earlier
+        ;; broad change regressed.
+        preserved-entry-values
+        (if (= :aarch64 target)
+          crossing
+          (if x86-direct-reentry?
+            (into #{}
+                  (keep #(when (= :mir/argument (:mir/op %)) (:mir/dst %)))
+                  instructions)
+            #{}))
+        entry (entry-argument-plan target pool instructions last-use
+                                   merge-slots {} preserved-entry-values)
+        parameter-homes (:parameter-homes entry)
+        direct-reentry? (and self-tail?
+                             (or (= :aarch64 target) x86-direct-reentry?)
+                             parameter-homes)
+        recur-home-candidates
+        (if direct-reentry?
+          (direct-recur-home-candidates instructions current-function
+                                        parameter-homes indexes)
+          {})]
+    (letfn [(spill-assigned [state value instruction]
+              (let [register (get-in state [:assigned value])]
+                (when-not register
+                  (reject! :spill-required instruction))
+                (let [existing (get-in state [:backed value])
+                      slot (or existing (:next-slot state))
+                      next-slot (if existing
+                                  (:next-slot state)
+                                  (inc (:next-slot state)))]
+                  (when (> next-slot 4095)
+                    (reject! :spill-frame-too-large {:frame-slots next-slot}))
+                  ;; A value already in a slot needs no second store: it never
+                  ;; changes, so what was written the first time is still what
+                  ;; is there.
+                  (cond-> (-> state
+                              (assoc-in [:backed value] slot)
+                              (assoc :next-slot next-slot)
+                              (update :assigned dissoc value)
+                              (update :free conj register))
+                    (not existing) (store-at-definition value register slot)))))
+            (take-register [state instruction protected prefer]
+              (let [primary (if (= prefer :preserved) :reserve :free)
+                    secondary (if (= prefer :preserved) :free :reserve)
+                    from-primary (first (get state primary))]
+                (if from-primary
+                  [(assoc state primary (vec (rest (get state primary))))
+                   from-primary]
+                  (let [from-secondary (first (get state secondary))]
+                    (if from-secondary
+                      [(assoc state secondary (vec (rest (get state secondary))))
+                       from-secondary]
+                      ;; No second pass with an empty PROTECTED set. Evicting
+                      ;; an operand of the instruction being allocated loses it:
+                      ;; the source was just loaded and nothing reloads it, and
+                      ;; the destination does not exist yet. Rejecting here
+                      ;; sends the function to the conservative all-vreg path,
+                      ;; which is slower and correct. Unreachable in both
+                      ;; suites today -- an instruction would need every
+                      ;; register held by its own operands.
+                      (if-let [victim (furthest-victim (:assigned state)
+                                                       indexes
+                                                       (:index state)
+                                                       protected)]
+                        (let [register (get-in state [:assigned victim])
+                              state (spill-assigned state victim instruction)]
+                          [(assoc state :free (vec (rest (:free state))))
+                           register])
+                        (reject! :spill-required instruction)))))))
+            (emit-call [state index instruction]
+              (let [{:mir/keys [op dst arguments callee]} instruction
+                    direct-recur? (and direct-reentry?
+                                       (= :mir/tail-call op)
+                                       (= current-function callee)
+                                       ;; A backed source needs a load. Mixing
+                                       ;; those loads with a parallel register
+                                       ;; copy can overwrite a still-needed
+                                       ;; source, so that site retains the
+                                       ;; ordinary ABI tail path.
+                                       (every? #(contains? (:assigned state) %)
+                                               arguments))]
+                (if direct-recur?
+                  (let [copies (mapv (fn [value register]
+                                       {:mir/dst register
+                                        :mir/src (get-in state [:assigned value])})
+                                     arguments parameter-homes)
+                        temp-slot (or (:temp-slot state) (:next-slot state))
+                        scheduled (schedule-parallel-copies copies temp-slot)
+                        pinning-temp? (and (:used-temp? scheduled)
+                                           (not (:used-temp? state)))]
+                    (-> state
+                        (update :out into (:instructions scheduled))
+                        (update :out conj {:mir/op :mir/recur
+                                           :mir/arguments parameter-homes})
+                        (assoc :used-temp? (or (:used-temp? state)
+                                               (:used-temp? scheduled))
+                               :next-slot (cond-> (:next-slot state)
+                                            pinning-temp? inc)
+                               :temp-slot (if (:used-temp? scheduled)
+                                            temp-slot
+                                            (:temp-slot state)))))
+                  (let [call-registers (subvec (argument-registers-for-call
+                                            target instruction)
+                                           0 (count arguments))
+                    live-across (->> (keys (:assigned state))
+                                     (filter #(> (get last-use % -1) index))
+                                     ordered-vregs)
+                    state (reduce (fn [state value]
+                                    (let [register (get-in state [:assigned value])]
+                                      (if (contains? preserved-set register)
+                                        state
+                                        (spill-assigned state value instruction))))
+                                  state live-across)
+                    copies (->> (map vector arguments call-registers)
+                                (keep (fn [[value register]]
+                                        (when-let [source (get-in state
+                                                                  [:assigned value])]
+                                          {:mir/dst register :mir/src source})))
+                                vec)
+                    loads (->> (map vector arguments call-registers)
+                               (keep (fn [[value register]]
+                                       (when-not (contains? (:assigned state) value)
+                                         (let [slot (get (:backed state) value)]
+                                           (when-not slot
+                                             (reject! :spill-required instruction))
+                                           {:mir/op :mir/spill-load
+                                            :mir/dst register
+                                            :mir/slot slot}))))
+                               vec)
+                    temp-slot (or (:temp-slot state) (:next-slot state))
+                    scheduled (schedule-parallel-copies copies temp-slot)
+                    pinning-temp? (and (:used-temp? scheduled)
+                                       (not (:used-temp? state)))
+                    state (-> state
+                              (update :out into (:instructions scheduled))
+                              (update :out into loads)
+                              (update :out conj
+                                      (physicalize-call target instruction
+                                                        call-registers
+                                                        return-register))
+                              (assoc :used-temp? (or (:used-temp? state)
+                                                     (:used-temp? scheduled))
+                                     :next-slot (cond-> (:next-slot state)
+                                                  pinning-temp? inc)
+                                     :temp-slot (if (:used-temp? scheduled)
+                                                  temp-slot
+                                                  (:temp-slot state))))
+                    kept (into {}
+                               (filter (fn [[_ register]]
+                                         (contains? preserved-set register))
+                                       (:assigned state)))
+                    kept (if (and (gmir/vreg? dst) (not= :mir/tail-call op))
+                           (assoc kept dst return-register)
+                           kept)
+                    lists (rebuild-pool-lists target pool kept)
+                    state (assoc state
+                                 :assigned kept
+                                 :free (:free lists)
+                                 :reserve (:reserve lists))
+                    state (if (and (gmir/vreg? dst)
+                                   (contains? crossing dst)
+                                   (seq (:reserve state)))
+                            (let [preserved (first (:reserve state))]
+                              (-> state
+                                  (update :out conj {:mir/op :mir/move
+                                                     :mir/dst preserved
+                                                     :mir/src return-register})
+                                  (assoc-in [:assigned dst] preserved)
+                                  (assoc :reserve (vec (rest (:reserve state))))
+                                  (update :free conj return-register)))
+                            state)
+                    expired (filter #(= index (get last-use %))
+                                    (keys (:assigned state)))
+                    state (expire-assigned-in-pool target state expired)]
+                (if (gmir/vreg? dst)
+                  (assoc-in state [:def-position dst] (count (:out state)))
+                  state)))))]
+      (loop [index (:argument-count entry), remaining (:remaining entry)
+             assigned (:assigned entry), free (:free entry)
+             reserve (:reserve entry)
+             backed (:entry-spills entry)
+             next-slot (cond-> (:stable-slot-count entry)
+                         (:used-temp? entry) inc)
+             out (cond-> (:instructions entry)
+                   direct-reentry? (conj {:mir/op :mir/reentry
+                                          :mir/parameters parameter-homes}))
+             used-temp? (:used-temp? entry)
+             ;; A RESERVATION, not a proposal. `entry-argument-plan` names one
+             ;; past its own spills, which is only reserved when the entry
+             ;; parallel copy actually used it -- `next-slot` was stepped past
+             ;; it then. Carried forward unused, it is the slot the body's
+             ;; first `spill-assigned` is handed, and the next cycle-breaking
+             ;; store lands on a live value. Left nil, `emit-call` derives the
+             ;; temporary from the CURRENT `next-slot` and pins it on first
+             ;; use, which is what the rest of this loop already assumes.
+             ;; Measured 2026-09-02: `hkdf-sha256.kotoba` read its own `ctx`
+             ;; back as the literal 92 (aiueos ADR-0136).
+             temp-slot (when (:used-temp? entry) (:temp-slot entry))
+             ;; Everything the entry plan assigned is in place by the end of its
+             ;; own instructions, so that is where a store of one of them goes.
+             ;;
+             ;; One instruction later when this function has a direct reentry
+             ;; edge. `store-at-definition` is allowed to splice a store at a
+             ;; definition because, under SSA, a definition dominates every use
+             ;; of its value -- but the recur edge REDEFINES the parameter homes
+             ;; and jumps back to the `:mir/reentry` marker, which is placed
+             ;; after the entry plan. A store left at the entry plan therefore
+             ;; runs once, before the loop, while the reloads inside the body
+             ;; run every iteration: from the second iteration on they answer
+             ;; with the value the parameter had on ENTRY.
+             ;;
+             ;; Measured 2026-09-02 on `os/aiueos/kotoba/aiueos/sha256.kotoba`
+             ;; compiled for x86_64-aiueos-kernel-v1: `round-block` stored its
+             ;; loop counter once at the entry plan and reloaded it inside the
+             ;; loop to compute `i + 1`, so `i` was 1 on every iteration after
+             ;; the first, `(= i 64)` never held, and the object spun until the
+             ;; fuel guard trapped with #UD (aiueos ADR-0150).
+             ;;
+             ;; Placing it after the marker puts the store at the top of the
+             ;; loop body, where the parameter home register is correct on the
+             ;; entry path AND on every back edge.
+             def-position (zipmap (keys (:assigned entry))
+                                  (repeat (cond-> (count (:instructions entry))
+                                            direct-reentry? inc)))]
+        (if-let [instruction (first remaining)]
+          (if (call-operation? (:mir/op instruction))
+            (let [state (emit-call {:assigned assigned :free free :reserve reserve
+                                    :backed backed :next-slot next-slot
+                                    :out out :used-temp? used-temp?
+                                    :temp-slot temp-slot
+                                    :def-position def-position
+                                    :index index}
+                                   index instruction)]
+              (recur (inc index) (next remaining)
+                     (:assigned state) (vec (:free state)) (:reserve state)
+                     (:backed state) (:next-slot state)
+                     (:out state) (:used-temp? state) (:temp-slot state)
+                     (:def-position state)))
+            (let [drop? (and (= :mir/label (:mir/op instruction))
+                             (pos? index)
+                             (some #(contains? backed %) (keys assigned)))
+                  block (if drop?
+                          (drop-backed-assignments target pool assigned backed)
+                          {:assigned assigned :free free :reserve reserve})
+                  assigned (:assigned block)
+                  free (:free block)
+                  reserve (:reserve block)
+                  srcs (distinct (filter gmir/vreg? (sources instruction)))
+                  protected (set srcs)
+                  loaded (reduce (fn [state source]
+                                   (if (contains? (:assigned state) source)
+                                     state
+                                     (let [slot (get (:backed state) source)]
+                                       (when-not slot
+                                         (reject! :spill-required instruction))
+                                       (let [prefer (if (contains? crossing source)
+                                                      :preserved :scratch)
+                                             [state register]
+                                             (take-register (assoc state :index index)
+                                                            instruction
+                                                            protected
+                                                            prefer)]
+                                         (-> state
+                                             (assoc-in [:assigned source] register)
+                                             (update :out conj {:mir/op :mir/spill-load
+                                                                :mir/dst register
+                                                                :mir/slot slot}))))))
+                                 {:assigned assigned :free free :reserve reserve
+                                  :backed backed :next-slot next-slot
+                                  :out out :index index
+                                  :def-position def-position}
+                                 srcs)
+                  assigned (:assigned loaded)
+                  free (:free loaded)
+                  reserve (:reserve loaded)
+                  backed (:backed loaded)
+                  next-slot (:next-slot loaded)
+                  out (:out loaded)
+                  def-position (:def-position loaded)]
+              (let [dst (:mir/dst instruction)
+                    prefer (if (contains? crossing dst) :preserved :scratch)
+                    [assigned free reserve backed next-slot out def-position]
+                    (if (gmir/vreg? dst)
+                      (do
+                        (when (contains? assigned dst)
+                          (reject! :multiple-definition instruction))
+                        (let [desired-home (get recur-home-candidates dst)
+                              recur-use (first (get indexes dst))
+                              home-owner (when desired-home
+                                           (some (fn [[value register]]
+                                                   (when (= desired-home register)
+                                                     value))
+                                                 assigned))
+                              ;; A definition may overwrite its requested home
+                              ;; only when the register is free, or when the old
+                              ;; value is an operand whose final CFG use is this
+                              ;; very instruction.  Physical integer operations
+                              ;; read all operands before writing DST, so this
+                              ;; preserves simultaneous SSA semantics.  Any
+                              ;; interference falls back to ordinary allocation
+                              ;; and the proven parallel-copy scheduler.
+                              direct-home (when (and desired-home
+                                                     (contains?
+                                                      schedulable-integer-operations
+                                                      (:mir/op instruction))
+                                                     (straight-line-to-recur?
+                                                      instructions index recur-use)
+                                                     (or (nil? home-owner)
+                                                         (and (contains? protected
+                                                                         home-owner)
+                                                              (= index
+                                                                 (get last-use
+                                                                      home-owner)))))
+                                            desired-home)
+                              dying-left (when (and (= prefer :scratch)
+                                                    (gmir/vreg? (:mir/left instruction))
+                                                    (= index (get last-use
+                                                                  (:mir/left instruction))))
+                                           (get assigned (:mir/left instruction)))
+                              from-primary (if (= prefer :preserved)
+                                             (first reserve)
+                                             (first free))
+                              register (or direct-home from-primary dying-left)
+                              [state register]
+                              (if register
+                                [{:assigned assigned
+                                  :free (if direct-home
+                                          (vec (remove #{direct-home} free))
+                                          (if (and from-primary (= prefer :scratch))
+                                            (vec (rest free))
+                                            free))
+                                  :reserve (if direct-home
+                                             (vec (remove #{direct-home} reserve))
+                                             (if (and from-primary
+                                                      (= prefer :preserved))
+                                               (vec (rest reserve))
+                                               reserve))
+                                  :backed backed
+                                  :next-slot next-slot :out out :index index
+                                  :def-position def-position}
+                                 register]
+                                (take-register {:assigned assigned :free free
+                                                :reserve reserve :backed backed
+                                                :def-position def-position
+                                                :next-slot next-slot :out out
+                                                :index index}
+                                               instruction
+                                               protected
+                                               prefer))]
+                          [(assoc (:assigned state) dst register)
+                           (:free state) (:reserve state)
+                           (:backed state) (:next-slot state) (:out state)
+                           (:def-position state)]))
+                      [assigned free reserve backed next-slot out def-position])
+                    allocated (reduce-kv
+                               (fn [result key value]
+                                 (assoc result key
+                                        (cond
+                                          (gmir/vreg? value) (get assigned value)
+                                          (and (= key :mir/arguments) (vector? value))
+                                          (mapv assigned value)
+                                          :else value)))
+                               {} instruction)
+                    allocated (case (:mir/op allocated)
+                                :mir/merge-store
+                                {:mir/op :mir/spill-store
+                                 :mir/src (:mir/src allocated)
+                                 :mir/slot (:mir/slot allocated)}
+                                :mir/merge-load
+                                {:mir/op :mir/spill-load
+                                 :mir/dst (:mir/dst allocated)
+                                 :mir/slot (:mir/slot allocated)}
+                                allocated)
+                    expired (filter #(or (= index (get last-use %))
+                                         (and (= dst %)
+                                              (not (contains? last-use %))))
+                                    (keys assigned))
+                    state (if calls?
+                            (expire-assigned-in-pool
+                             target
+                             {:assigned assigned :free free :reserve reserve}
+                             expired)
+                            (expire-assigned
+                             {:assigned assigned :free free}
+                             expired))]
+                (recur (inc index) (next remaining)
+                       (:assigned state) (vec (:free state))
+                       (if calls? (:reserve state) reserve)
+                       backed next-slot
+                       (conj out allocated) used-temp? temp-slot
+                       (if (gmir/vreg? dst)
+                         (assoc def-position dst (inc (count out)))
+                         def-position)))))
+          (let [out (if (some #(= :mir/recur (:mir/op %)) out)
+                      out
+                      (vec (remove #(= :mir/reentry (:mir/op %)) out)))]
+            (validate-flat!
+             {:mir/version version
+              :mir/target target
+              :mir/registers :physical
+              :mir/frame-slots (+ next-slot
+                                  (if used-temp? 1 0))
+              :mir/instructions out})))))))
+
+(defn- validate-ssa-definition-order [instructions]
+  (:ordered
+   (reduce (fn [{:keys [defined ordered] :as state}
+                {:mir/keys [dst] :as instruction}]
+             (doseq [source (filter gmir/vreg? (sources instruction))]
+               (when-not (contains? defined source)
+                 (reject! :use-before-definition instruction)))
+             (if (gmir/vreg? dst)
+               (do
+                 (when (contains? defined dst)
+                   (reject! :multiple-definition instruction))
+                 {:defined (conj defined dst) :ordered (conj ordered dst)})
+               state))
+           {:defined #{} :ordered []}
+           instructions)))
+
+(defn- slot-sources
+  "Values whose frame contents are read by INSTRUCTION. A lowered merge-load
+  is a slot use: the value was written on each incoming edge, not defined at
+  the join."
+  [instruction]
+  (if (= :mir/merge-load (:mir/op instruction))
+    [(:mir/dst instruction)]
+    (filter gmir/vreg? (sources instruction))))
+
+(defn- slot-definition
+  "The frame value defined by INSTRUCTION. A merge-store defines the phi
+  destination on its edge; the later merge-load only materializes that slot."
+  [instruction merge-dst-by-slot]
+  (case (:mir/op instruction)
+    :mir/merge-store (get merge-dst-by-slot (:mir/slot instruction))
+    :mir/merge-load nil
+    (instruction-def instruction)))
+
+(defn- slot-block-use-def [instructions blocks merge-dst-by-slot]
+  (mapv (fn [{:keys [start end]}]
+          (reduce (fn [{:keys [uses defs]} index]
+                    (let [instruction (nth instructions index)
+                          read (remove defs (slot-sources instruction))
+                          definition (slot-definition instruction merge-dst-by-slot)]
+                      {:uses (into uses read)
+                       :defs (cond-> defs (gmir/vreg? definition)
+                               (conj definition))}))
+                  {:uses #{} :defs #{}}
+                  (range start (inc end))))
+        blocks))
+
+(defn- slot-liveness [instructions merge-dst-by-slot]
+  (let [blocks (basic-blocks instructions)
+        label->block (label-block-indexes instructions blocks)
+        successors (block-successors instructions blocks label->block)
+        use-def (slot-block-use-def instructions blocks merge-dst-by-slot)
+        block-count (count blocks)
+        empty (vec (repeat block-count #{}))]
+    (loop [live-in empty live-out empty]
+      (let [next-out (mapv (fn [block-index]
+                             (reduce into #{}
+                                     (map #(nth live-in %)
+                                          (nth successors block-index))))
+                           (range block-count))
+            next-in (mapv (fn [block-index]
+                            (let [{:keys [uses defs]} (nth use-def block-index)]
+                              (into uses (remove defs (nth next-out block-index)))))
+                          (range block-count))]
+        (if (and (= next-in live-in) (= next-out live-out))
+          {:blocks blocks :live-in next-in :live-out next-out}
+          (recur next-in next-out))))))
+
+(defn- add-interference [graph definition live]
+  (if-not (gmir/vreg? definition)
+    graph
+    (reduce (fn [out value]
+              (if (= definition value)
+                out
+                (-> out
+                    (update definition (fnil conj #{}) value)
+                    (update value (fnil conj #{}) definition))))
+            (update graph definition (fnil identity #{}))
+            live)))
+
+(defn- spill-interference
+  "Build conservative SSA frame-slot interference from fixed-point CFG
+  liveness. Mutually exclusive branch values may share a slot; values live
+  together at a join or around a back edge may not."
+  [instructions merge-dst-by-slot]
+  (let [{:keys [blocks live-out]} (slot-liveness instructions merge-dst-by-slot)]
+    (reduce
+     (fn [graph block-index]
+       (let [{:keys [start end]} (nth blocks block-index)]
+         (:graph
+          (reduce
+           (fn [{:keys [graph live]} index]
+             (let [instruction (nth instructions index)
+                   definition (slot-definition instruction merge-dst-by-slot)
+                   graph (add-interference graph definition live)
+                   live (into (cond-> live (gmir/vreg? definition)
+                               (disj definition))
+                              (slot-sources instruction))]
+               {:graph graph :live live}))
+           {:graph graph :live (nth live-out block-index)}
+           (range end (dec start) -1)))))
+     {}
+     (range (count blocks)))))
+
+(defn- spill-slots [instructions offset merge-dst-by-slot]
+  (let [ordered (validate-ssa-definition-order instructions)
+        interference (spill-interference instructions merge-dst-by-slot)]
+    (reduce (fn [slots value]
+              (let [unavailable (into #{} (keep slots)
+                                      (get interference value))
+                    slot (first (remove unavailable (range offset 4096)))]
+                (when-not slot
+                  (reject! :spill-frame-too-large {:frame-slots 4096}))
+                (assoc slots value slot)))
+            {}
+            ordered)))
+
+(defn- allocate-with-spills
+  [{:mir/keys [version target instructions] :as program} merge-dst-by-slot]
+  (let [slots (spill-slots instructions 0 merge-dst-by-slot)
+        slot-count (if (seq slots) (inc (apply max (vals slots))) 0)
+        [r0 r1 r2 r3] (get physical-registers target)
+        argument-registers (get call-argument-registers target)]
+    (when (> slot-count 4095)
+      (reject! :spill-frame-too-large {:frame-slots slot-count}))
+    (letfn [(slot-of [instruction value]
+              (or (get slots value)
+                  (reject! :use-before-definition instruction)))
+            (load-value [instruction value register]
+              {:mir/op :mir/spill-load :mir/dst register
+               :mir/slot (slot-of instruction value)})
+            (store-value [instruction value register]
+              {:mir/op :mir/spill-store :mir/src register
+               :mir/slot (slot-of instruction value)})]
+      (validate-flat!
+        {:mir/version version
+        :mir/target target
+        :mir/registers :physical
+        :mir/frame-slots slot-count
+        :mir/instructions
+        (vec
+         (mapcat
+          (fn [{:mir/keys [op dst input left right test value callee arguments
+                           base length index stored offset size maximum]
+                :as instruction}]
+            (case op
+              :mir/argument
+              (let [register (or (get argument-registers (:mir/index instruction))
+                                 (reject! :argument-index-invalid instruction))]
+                [(assoc instruction :mir/dst register)
+                 (store-value instruction dst register)])
+
+              :mir/constant
+              [(assoc instruction :mir/dst r0)
+               (store-value instruction dst r0)]
+
+              :mir/data-address
+              [(assoc instruction :mir/dst r0)
+               (store-value instruction dst r0)]
+
+              ;; boot-lit: a literal's address reads nothing and writes one
+              ;; register, exactly like the managed string address above.
+              :mir/rodata-address
+              [(assoc instruction :mir/dst r0)
+               (store-value instruction dst r0)]
+
+              ;; boot-scratch: a function's address reads nothing either. The
+              ;; label it resolves against belongs to the module, which this
+              ;; layer never sees; the backend holds the table.
+              :mir/function-address
+              [(assoc instruction :mir/dst r0)
+               (store-value instruction dst r0)]
+
+              :mir/merge-store
+              (let [phi-dst (or (get merge-dst-by-slot (:mir/slot instruction))
+                                (reject! :unknown-merge-slot instruction))]
+                [(load-value instruction (:mir/src instruction) r0)
+                 (store-value instruction phi-dst r0)])
+
+              :mir/merge-load
+              []
+
+              :mir/quotient-constant
+              [(load-value instruction left r0)
+               {:mir/op op :mir/dst r0 :mir/left r0
+                :mir/divisor (:mir/divisor instruction)}
+               (store-value instruction dst r0)]
+
+              (:mir/add :mir/subtract :mir/multiply :mir/quotient
+               :mir/bit-and :mir/bit-or :mir/bit-xor
+               :mir/shift-left :mir/shift-right-signed :mir/shift-right-unsigned
+               :mir/f64-add :mir/f64-subtract :mir/f64-multiply
+               :mir/f64-divide :mir/f64-min :mir/f64-max
+               :mir/f64-equal :mir/f64-less-than :mir/f64-less-or-equal
+               :mir/f64-greater-than :mir/f64-greater-or-equal
+               :mir/f64-unordered
+               ;; f32: two sources in, one value out, same as the f64 twins.
+               :mir/f32-add :mir/f32-subtract :mir/f32-multiply
+               :mir/f32-divide :mir/f32-equal :mir/f32-less-than
+               :mir/f32-less-or-equal :mir/f32-greater-than
+               :mir/f32-greater-or-equal :mir/f32-unordered
+               :mir/equal :mir/less-than :mir/greater-than
+               :mir/less-or-equal :mir/greater-or-equal)
+              [(load-value instruction left r0)
+               (load-value instruction right r1)
+               {:mir/op op :mir/dst r0 :mir/left r0 :mir/right r1}
+               (store-value instruction dst r0)]
+
+              ;; One source in, one value out. The f32 conversions join
+              ;; f64-sqrt here rather than getting their own arm: the shape is
+              ;; the same and the WIDTH lives entirely in the encoder.
+              (:mir/f64-sqrt :mir/f32-sqrt
+               :mir/f32-to-f64 :mir/f64-to-f32
+               :mir/i64-to-f32 :mir/i64-to-f64)
+              [(load-value instruction input r0)
+               {:mir/op op :mir/dst r0 :mir/input r0}
+               (store-value instruction dst r0)]
+
+              ;; memwidth: u16/u64 and the whole slice family select exactly
+              ;; the way u8/u32 already did -- three sources in, one value out.
+              (:mir/kernel-load-u8 :mir/kernel-load-u16
+               :mir/kernel-load-u32 :mir/kernel-load-u64
+               :mir/slice-load-u8 :mir/slice-load-u16
+               :mir/slice-load-u32 :mir/slice-load-u64
+               :mir/kernel-try-lock-u32 :mir/kernel-unlock-u32)
+              [(load-value instruction base r0)
+               (load-value instruction length r1)
+               (load-value instruction index r2)
+               {:mir/op op :mir/dst r0 :mir/base r0 :mir/length r1
+                :mir/index r2 :mir/maximum maximum}
+               (store-value instruction dst r0)]
+
+              (:mir/kernel-store-u8 :mir/kernel-store-u16
+               :mir/kernel-store-u32 :mir/kernel-store-u64
+               :mir/slice-store-u8 :mir/slice-store-u16
+               :mir/slice-store-u32 :mir/slice-store-u64)
+              [(load-value instruction base r0)
+               (load-value instruction length r1)
+               (load-value instruction index r2)
+               (load-value instruction stored r3)
+               {:mir/op op :mir/dst r3 :mir/base r0 :mir/length r1
+                :mir/index r2 :mir/stored r3 :mir/maximum maximum}
+               (store-value instruction dst r3)]
+
+              ;; sysops: the add and swap forms take the store's four operands
+              ;; and produce a fifth value, so they fit the scratch tier the
+              ;; same way -- `dst` aliases `base`, which the encoder's bounds
+              ;; check has already consumed by the time the result is written.
+              (:mir/kernel-atomic-add-u32 :mir/kernel-atomic-add-u64
+               :mir/kernel-xchg-u32 :mir/kernel-xchg-u64)
+              [(load-value instruction base r0)
+               (load-value instruction length r1)
+               (load-value instruction index r2)
+               (load-value instruction stored r3)
+               {:mir/op op :mir/dst r0 :mir/base r0 :mir/length r1
+                :mir/index r2 :mir/stored r3 :mir/maximum maximum}
+               (store-value instruction dst r0)]
+
+              ;; The compare-exchanges need FIVE registers live at once, one
+              ;; more than the scratch tier holds. They borrow the call
+              ;; argument tier, which `physical-register?` already admits and
+              ;; which this same function already hands to a five-argument
+              ;; call. Nothing lives across the instruction: every operand is
+              ;; loaded from its slot immediately before and dead immediately
+              ;; after, so borrowing the tier cannot collide with a call's own
+              ;; use of it.
+              ;;
+              ;; On x86-64 that tier is rdi/rsi/rdx/rcx/r8 and deliberately
+              ;; excludes RAX, which `lock cmpxchg` fixes as its comparand
+              ;; register and which the encoder saves and restores anyway.
+              (:mir/kernel-cmpxchg-u32 :mir/kernel-cmpxchg-u64)
+              (let [[c0 c1 c2 c3 c4] (get call-argument-registers target)]
+                [(load-value instruction base c0)
+                 (load-value instruction length c1)
+                 (load-value instruction index c2)
+                 (load-value instruction (:mir/expected instruction) c3)
+                 (load-value instruction stored c4)
+                 {:mir/op op :mir/dst c0 :mir/base c0 :mir/length c1
+                  :mir/index c2 :mir/expected c3 :mir/stored c4
+                  :mir/maximum maximum}
+                 (store-value instruction dst c0)])
+              ;; sysops: end
+
+              ;; simd: FIVE registers live at once -- two bases, two lengths
+              ;; and a count -- one more than the scratch tier holds, so it
+              ;; borrows the call-argument tier exactly as the compare-
+              ;; exchanges above do, and for the same reason: nothing lives
+              ;; across the instruction, because every operand is loaded from
+              ;; its slot immediately before and dead immediately after.
+              ;;
+              ;; The encoder pushes and pops everything else it touches
+              ;; (RAX/RCX/RDX around the feature-detection `cpuid` calls, RBX
+              ;; around the whole sequence), so borrowing this tier cannot
+              ;; collide with a call's own use of it.
+              ;; dequant: the fused family borrows the same tier for the
+              ;; same reason -- five operands, none of them live across the
+              ;; instruction.
+              (:mir/kernel-dot-f32
+               :mir/kernel-dequant-dot-q8-0
+               :mir/kernel-dequant-dot-q4-k
+               :mir/kernel-dequant-dot-q6-k)
+              (let [[c0 c1 c2 c3 c4] (get call-argument-registers target)]
+                [(load-value instruction base c0)
+                 (load-value instruction length c1)
+                 (load-value instruction (:mir/second-base instruction) c2)
+                 (load-value instruction (:mir/second-length instruction) c3)
+                 (load-value instruction (:mir/count instruction) c4)
+                 {:mir/op op :mir/dst c0 :mir/base c0 :mir/length c1
+                  :mir/second-base c2 :mir/second-length c3 :mir/count c4
+                  :mir/maximum maximum}
+                 (store-value instruction dst c0)])
+              ;; simd: end
+
+              :mir/kernel-subregion
+              [(load-value instruction base r0)
+               (load-value instruction length r1)
+               (load-value instruction offset r2)
+               (load-value instruction size r3)
+               {:mir/op op :mir/dst r0 :mir/base r0 :mir/length r1
+                :mir/offset r2 :mir/size r3}
+               (store-value instruction dst r0)]
+
+              :mir/x86-privileged
+              ;; boot: the whole scratch tier, not the first two of it. The
+              ;; vector was `[r0 r1]` while no action took more than two
+              ;; arguments, so `:uefi-call2`'s four would have thrown out of
+              ;; `subvec` rather than allocating. The tier is exactly four
+              ;; registers wide on both targets, which is also why
+              ;; `:uefi-call2` takes four operands and not five.
+              ;;
+              ;; boot-lit: and then `:uefi-call6` took eight. The tier did not
+              ;; get wider -- the PRESERVED tier follows it, and every
+              ;; register in that tier is callee-saved under Microsoft x64
+              ;; (RBX, RBP, RDI, RSI, R12-R15) as well as under the internal
+              ;; ABI, so an argument parked there survives the firmware call
+              ;; it is an argument to. The scratch tier comes first so an
+              ;; action narrow enough to stay inside it still costs no frame
+              ;; save; `mir/saved-registers` derives the saves from the
+              ;; emitted stream, so naming a preserved register here is what
+              ;; makes the frame save it.
+              (let [argument-registers
+                    (subvec (privileged-argument-registers target)
+                            0 (count arguments))]
+                (concat
+                 (mapv (fn [value register]
+                         (load-value instruction value register))
+                       arguments argument-registers)
+                 [{:mir/op op :mir/dst r0 :mir/action (:mir/action instruction)
+                   :mir/arguments argument-registers}
+                  (store-value instruction dst r0)]))
+
+              (:mir/branch-zero :mir/branch-nonzero)
+              [(load-value instruction test r0)
+               (assoc instruction :mir/test r0)]
+
+              :mir/tail-call
+              (let [call-registers (subvec (get call-argument-registers target)
+                                           0 (count arguments))]
+                (concat
+                 (mapv (fn [argument register]
+                         (load-value instruction argument register))
+                       arguments call-registers)
+                 [{:mir/op :mir/tail-call :mir/callee callee
+                   :mir/arguments call-registers}]))
+
+              (:mir/call :mir/runtime-call :mir/capability-call)
+              (let [call-registers (subvec (argument-registers-for-call target instruction)
+                                           0 (count arguments))]
+                (concat
+                 (mapv (fn [value register]
+                         (load-value instruction value register))
+                       arguments call-registers)
+                 [(cond-> {:mir/op op
+                           :mir/dst (get return-registers target)
+                           :mir/arguments call-registers}
+                    (= :mir/call op) (assoc :mir/callee callee)
+                    (= :mir/runtime-call op)
+                    (assoc :mir/runtime (:mir/runtime instruction)
+                           :mir/context-offset (:mir/context-offset instruction))
+                    (= :mir/capability-call op)
+                    (assoc :mir/capability (:mir/capability instruction)
+                           :mir/kind (:mir/kind instruction)
+                           :mir/context-offset (:mir/context-offset instruction)))
+                  (store-value instruction dst (get return-registers target))]))
+
+              :mir/return
+              [(load-value instruction value r0)
+               (assoc instruction :mir/value r0)]
+
+              (:mir/label :mir/jump) [instruction]
+              (reject! :unsupported-spill-operation instruction)))
+          instructions))}))))
+
+(defn- back-edge?
+  "Does any jump or branch in INSTRUCTIONS target a label at or before it?
+
+  ADR 0012 routes functions with control flow to the linear scanner,
+  including those with a back edge. This predicate is not a routing guard.
+  Leftover pressure still falls back to all-vreg via `:spill-required`."
+  [instructions]
+  (let [label-index (reduce-kv (fn [indexes index instruction]
+                                 (if (= :mir/label (:mir/op instruction))
+                                   (assoc indexes (:mir/id instruction) index)
+                                   indexes))
+                               {} instructions)]
+    (boolean
+     (some (fn [[index instruction]]
+             (and (contains? #{:mir/jump :mir/branch-zero
+                               :mir/branch-nonzero} (:mir/op instruction))
+                  (when-let [target (get label-index (:mir/target instruction))]
+                    (<= target index))))
+           (map-indexed vector instructions)))))
+
+(defn- allocate-with-policy
+  "Try the linear scanner, including call-clobber handling. A function that
+  still cannot complete falls back to the conservative all-vreg path. Returns
+  [allocated-program frame-policy].
+
+  Call plus a backward jump uses the scanner (`:call-live`) when it
+  completes. After `lower-phis`, latch last-uses sit after their defs, so a
+  prefix-argument terminating call+loop is not `:spill-required`. Iteration
+  23's empty set was `:non-prefix-argument` (label before `:mir/argument`).
+  Iteration 27: the full amu suite with `back-edge?` false failed only the
+  production all-vreg policy asserts. `last-uses` is CFG-backed."
+  [program]
+  (let [current-function (::current-function (meta program))]
+    (validate-flat! program)
+    (let [{:keys [program merge-slots merge-dst-by-slot]} (lower-phis program)
+        calls? (boolean (some #(call-operation? (:mir/op %))
+                              (:mir/instructions program)))]
+      (let [schedule-allocated
+            (fn [allocated]
+              (schedule-program allocated))]
+        (try
+          (let [allocated (schedule-allocated
+                           (coalesce-phi-transports
+                            (allocate-without-spills program merge-slots
+                                                     current-function)
+                            merge-slots))]
+            [allocated (if calls? :call-live :allocator)])
+          (catch  error
+            (if (= :spill-required (:problem (ex-data error)))
+              [(schedule-allocated
+                (allocate-with-spills program merge-dst-by-slot))
+               (if calls? :all-vregs :allocator)]
+              (throw error))))))))
+
+;; ── stack-passed arguments ──────────────────────────────────────────────────
+;;
+;; Rewrites a virtual function so that nothing downstream of it has to know an
+;; argument can live anywhere but a register:
+;;
+;;   :mir/argument, index i >= 5    -> :mir/incoming-load i
+;;   :mir/call with n > 5 arguments -> :mir/outgoing-argument for 5..n-1,
+;;                                     then the call with the first five
+;;   :mir/tail-call, n > 5          -> :mir/incoming-argument-store for
+;;                                     5..n-1, then the tail call
+;;
+;; The loads are placed right after the argument prefix, where the entry plan
+;; ends -- and after a direct-reentry marker, so a self-tail loop reloads them
+;; from the incoming area its own tail call just rewrote. The stores sit
+;; immediately before their call, after every argument value is computed,
+;; so nothing between them can reach the stack area they write.
+;;
+;; A function with no stack arguments comes back unchanged, and its
+;; allocation is byte-for-byte what it was.
+
+(defn- stack-argument-rewrite [instructions target]
+  (let [limit (count (get call-argument-registers target))
+        stack? (fn [{:mir/keys [op index arguments]}]
+                 (or (and (= :mir/argument op) (>= index limit))
+                     (and (contains? #{:mir/call :mir/tail-call} op)
+                          (> (count arguments) limit))))]
+    (if-not (some stack? instructions)
+      instructions
+      (let [[arguments body] (split-with #(= :mir/argument (:mir/op %)) instructions)
+            register-arguments (filterv #(< (:mir/index %) limit) arguments)
+            loads (->> arguments
+                       (filter #(>= (:mir/index %) limit))
+                       (mapv (fn [{:mir/keys [dst index]}]
+                               {:mir/op :mir/incoming-load :mir/dst dst
+                                :mir/index index})))
+            calls (mapcat
+                   (fn [{:mir/keys [op arguments] :as instruction}]
+                     (if (and (contains? #{:mir/call :mir/tail-call} op)
+                              (> (count arguments) limit))
+                       (let [store (if (= op :mir/call)
+                                     :mir/outgoing-argument
+                                     :mir/incoming-argument-store)]
+                         (conj (vec (map-indexed
+                                     (fn [k value]
+                                       {:mir/op store :mir/src value
+                                        :mir/index (+ limit k)})
+                                     (drop limit arguments)))
+                               (assoc instruction :mir/arguments
+                                      (subvec arguments 0 limit))))
+                       [instruction]))
+                   body)]
+        (vec (concat register-arguments loads calls))))))
+
+(defn- allocate-flat
+  "Allocate virtual MIR deterministically. No-call bodies spill only values
+  that do not fit. Call-containing bodies use the same scanner, keeping
+  live-across values in the preserved tier; leftover pressure still takes
+  the conservative all-vreg path."
+  [program]
+  (first (allocate-with-policy program)))
+
+(defn allocate-registers
+  "Allocate a legacy flat program or every function in a v3 module. A function
+  containing a straight-line call stores only values live across that call and
+  reloads them lazily. A function that also has control flow uses the linear
+  scanner: live-across values prefer preserved registers, and remaining
+  caller-saved values are stored at their definition. Entry arguments beyond
+  the four-register allocator profile use bounded direct ABI spills. Leftover
+  pressure that the linear allocator cannot complete still takes the
+  conservative all-vreg path. Pure integer scheduling runs after allocation on
+  physical MIR, one basic block at a time."
+  [{:mir/keys [version target registers entry functions] :as program}]
+  (validate! program)
+  (if (= 3 version)
+    (do
+      (when-not (= :virtual registers)
+        (reject! :registers-not-virtual program))
+      (validate!
+       {:mir/version 3
+        :mir/target target
+        :mir/registers :physical
+        :mir/entry entry
+        :mir/functions
+        (mapv (fn [{:mir/keys [name arity instructions]}]
+                (let [virtual {:mir/version 3 :mir/target target
+                               :mir/registers :virtual
+                               :mir/instructions (stack-argument-rewrite
+                                                  instructions target)}
+                      ;; Straight-line call functions previously took
+                      ;; allocate-call-live first, which routes every
+                      ;; call-crossing value through a stable slot. The
+                      ;; linear scanner keeps preserved-register assignments
+                      ;; alive across calls and moves a call-crossing call
+                      ;; result into the preserved tier -- measured on the
+                      ;; qualified call fixture as +6.7% over the slot shape
+                      ;; (amu docs/codegen-coscientist.md, iteration 20-21).
+                      ;; The scanner already carries its own conservative
+                      ;; all-vreg fallback.
+                      [allocated frame-policy]
+                      (allocate-with-policy
+                       (vary-meta virtual assoc ::current-function name))]
+                  {:mir/name name
+                   :mir/arity arity
+                   :mir/frame-slots (:mir/frame-slots allocated)
+                   :mir/frame-policy frame-policy
+                   :mir/instructions (:mir/instructions allocated)}))
+              functions)}))
+    (allocate-flat program)))
+
+(def ^:private bulk-fuel-pure-ops
+  "MIR operations that cannot call, touch memory/capabilities, or trap.  Keep
+  this allow-list closed: adding an operation is a proof obligation, not a
+  throughput tweak.  In particular, general quotient is absent; the selected
+  constant form is admitted separately only for divisors other than 0/-1."
+  #{:mir/argument :mir/constant
+    :mir/add :mir/subtract :mir/multiply
+    :mir/multiply-add :mir/multiply-subtract
+    :mir/bit-and :mir/bit-or :mir/bit-xor
+    :mir/shift-left :mir/shift-right-signed :mir/shift-right-unsigned
+    :mir/equal :mir/less-than :mir/greater-than
+    :mir/less-or-equal :mir/greater-or-equal
+    :mir/move})
+
+(defn- bulk-fuel-pure-instruction? [{:mir/keys [op divisor]}]
+  (or (contains? bulk-fuel-pure-ops op)
+      ;; Same representation hazard as `host-number`'s docstring records: a
+      ;; divisor that came from the reader is a BigInt, `integer?` is false
+      ;; for one, and this whole clause silently stopped admitting it.
+      (and (= :mir/quotient-constant op)
+           (gmir/i64-value? divisor)
+           (not (contains? #{-1 0} (host-number divisor))))))
+
+(defn- bulk-fuel-pure-leaf?
+  "Prove a closed direct callee finite, pure and nontrapping.  `leaf` is
+  intentionally literal here: calls, branches and tail calls are not admitted,
+  even when another analysis could prove them finite.  This keeps the proof
+  local and prevents a call-graph cycle from entering bulk-fuel admission."
+  [{:mir/keys [name instructions]}]
+  (and (symbol? name)
+       (= 1 (count (filter #(= :mir/return (:mir/op %)) instructions)))
+       (every? (fn [instruction]
+                 (or (= :mir/return (:mir/op instruction))
+                     (bulk-fuel-pure-instruction? instruction)))
+               instructions)))
+
+(defn- counted-self-recur-plan*
+  [{:mir/keys [name arity instructions]} pure-leaf-callees]
+  (let [instructions (vec instructions)
+        indexed (map-indexed vector instructions)
+        branches (filterv (fn [[_ instruction]]
+                            (contains? #{:mir/branch-zero :mir/branch-nonzero}
+                                       (:mir/op instruction)))
+                          indexed)
+        labels (filterv (fn [[_ instruction]]
+                          (= :mir/label (:mir/op instruction)))
+                        indexed)
+        returns (filterv (fn [[_ instruction]]
+                           (= :mir/return (:mir/op instruction)))
+                         indexed)
+        tails (filterv (fn [[_ instruction]]
+                         (= :mir/tail-call (:mir/op instruction)))
+                       indexed)
+        arguments (->> instructions
+                       (filter #(= :mir/argument (:mir/op %)))
+                       (sort-by :mir/index)
+                       vec)
+        definitions (into {} (keep (fn [{:mir/keys [dst] :as instruction}]
+                                     (when dst [dst instruction])))
+                                   instructions)]
+    (when (and (symbol? name)
+               (integer? arity)
+               (= arity (count arguments))
+               (= (range arity) (map :mir/index arguments))
+               (= 1 (count branches))
+               (= 1 (count labels))
+               (= 1 (count returns))
+               (= 1 (count tails)))
+      (let [[[branch-index branch]] branches
+            [[label-index label]] labels
+            [[return-index _]] returns
+            [[tail-index tail]] tails
+            counter (:mir/test branch)
+            counter-index (first (keep-indexed
+                                  (fn [index argument]
+                                    (when (= counter (:mir/dst argument)) index))
+                                  arguments))
+            next-counter (when (some? counter-index)
+                           (nth (:mir/arguments tail) counter-index nil))
+            decrement (get definitions next-counter)
+            one (get definitions (:mir/right decrement))
+            structural-ops #{:mir/branch-nonzero :mir/return :mir/label
+                             :mir/tail-call}]
+        (when (and (= :mir/branch-nonzero (:mir/op branch))
+                   (= (inc branch-index) return-index)
+                   (= (+ branch-index 2) label-index)
+                   (= (:mir/target branch) (:mir/id label))
+                   (= tail-index (dec (count instructions)))
+                   (= name (:mir/callee tail))
+                   (= arity (count (:mir/arguments tail)))
+                   (some? counter-index)
+                   (= :mir/subtract (:mir/op decrement))
+                   (= counter (:mir/left decrement))
+                   (= :mir/constant (:mir/op one))
+                   (= 1 (:mir/value one))
+                   (every? (fn [instruction]
+                             (or (contains? structural-ops (:mir/op instruction))
+                                 (bulk-fuel-pure-instruction? instruction)
+                                 (and (= :mir/call (:mir/op instruction))
+                                      (contains? pure-leaf-callees
+                                                 (:mir/callee instruction)))))
+                           instructions))
+          {:counter-parameter counter-index
+           :runtime-domain :nonnegative-i64
+           :charge :entry-plus-exact-self-recur-count})))))
+
+(defn counted-self-recur-plan
+  "Return the conservative bulk-fuel proof for one selected virtual-MIR
+  function, or nil.
+
+  The admitted CFG has one latch branch, one base return, one body label and
+  one terminal self tail-call.  Its counter is an entry argument tested
+  directly for nonzero and the corresponding recur argument is exactly
+  `counter - 1`.  The remaining body is closed, pure and nontrapping.
+
+  This proves the iteration count for a non-negative runtime counter.  A
+  backend must retain ordinary per-edge charging for negative counters; this
+  function does not authorize wrapping a negative value into a bulk charge."
+  [function]
+  (counted-self-recur-plan* function #{}))
+
+(defn counted-self-recur-plans
+  "Map function names to proven counted/pure self-recur fuel plans.  PROGRAM
+  must already be selected virtual MIR so target-specific trapping operations
+  are visible to the proof."
+  [{:mir/keys [version registers functions] :as program}]
+  (validate! program)
+  (when-not (and (= 3 version) (= :virtual registers))
+    (reject! :bulk-fuel-analysis-requires-selected-virtual-module program))
+  (let [pure-leaf-callees (into #{}
+                                (keep (fn [{:mir/keys [name] :as function}]
+                                        (when (bulk-fuel-pure-leaf? function)
+                                          name)))
+                                functions)]
+    (into {}
+          (keep (fn [{:mir/keys [name] :as function}]
+                  (when-let [plan (counted-self-recur-plan*
+                                   function pure-leaf-callees)]
+                    [name plan])))
+          functions)))

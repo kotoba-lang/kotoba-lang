@@ -1,0 +1,187 @@
+(ns kura.node.gf
+  "The fast multiply-accumulate — the one seam ADR-2607299200 section 5 names
+  as *mechanism* rather than decision.
+
+  `erasure.gf/scale-add` is the definition: a vector of integers, one
+  `gf/mul` per byte through a pair of log/exp lookups. It is the oracle, and
+  it is far too slow to move a petabyte. This namespace is what a node
+  actually runs, and the only thing that makes it legitimate is
+  `kura.node.gf-test/byte-equality-with-the-reference`, which asserts the two
+  agree **byte for byte** rather than approximately or on a sample of
+  convenient inputs.
+
+  **The trick is one table per coefficient.** Multiplication in GF(2^8) by a
+  fixed `c` is a permutation of the 256 byte values, so `mul-table(c)` is 256
+  bytes and the inner loop degenerates to
+
+      acc[i] ^= table[xs[i]]
+
+  — an indexed load and an xor, no logarithms, no branches. Encoding a stripe
+  reuses one table across the whole shard, so the table cost is amortised over
+  megabytes. The tables are built from `erasure.gf/mul-def`, the table-free
+  definition, so a bug in the fast path cannot be a bug shared with its own
+  oracle.
+
+  **Buffers, not vectors.** `Uint8Array` on ClojureScript, `byte[]` on the
+  JVM. Java bytes are signed, which is a real hazard here — an index of -1 is
+  not an index of 255 — so every read masks with `0xff` and every comparison
+  happens in the unsigned domain. `->bytes` and `->vec` convert at the edges
+  so the oracle can be compared against without either side knowing about the
+  other's representation."
+  (:require [erasure.gf :as gf]))
+
+;; --- representation --------------------------------------------------------
+
+(defn alloc
+  "A zeroed buffer of `n` bytes."
+  [n]
+  )
+
+(defn blength [buf]
+  )
+
+(defn bget
+  "Unsigned byte at `i`. The `0xff` mask is not defensive — on the JVM a byte
+  is signed and 200 reads back as -56, which indexes a table out of bounds."
+  [buf i]
+  )
+
+(defn bset! [buf i v]
+  
+  buf)
+
+(defn ->bytes
+  "Convert a reference shard (vector of ints) into a buffer."
+  [v]
+  (let [n (count v)
+        out (alloc n)]
+    (dotimes [i n] (bset! out i (nth v i)))
+    out))
+
+(defn ->vec
+  "Convert a buffer back into a reference shard, for comparison with
+  `erasure.gf`. Always unsigned."
+  [buf]
+  (let [n (blength buf)]
+    (mapv #(bget buf %) (range n))))
+
+;; --- the tables ------------------------------------------------------------
+
+(def mul-tables
+  "`mul-tables[c][x] = gf_mul(c, x)`, 256 x 256.
+
+  Built from `erasure.gf/mul-def` — the table-free Russian-peasant definition
+  — rather than from `erasure.gf/mul`, which is itself table-driven. Deriving
+  the fast path from the slow path's own tables would mean a shared bug could
+  never be detected by comparing them."
+  (delay
+    (mapv (fn [c] (mapv (fn [x] (gf/mul-def c x)) (range 256)))
+          (range 256))))
+
+(defn mul-table
+  "The 256-entry table for coefficient `c`."
+  [c]
+  (nth @mul-tables (bit-and c 0xff)))
+
+;; --- the inner loop --------------------------------------------------------
+
+(defn scale-add!
+  "`acc ^= c * xs`, in place, over whole buffers.
+
+  Destructive because the alternative is allocating a shard-sized buffer per
+  coefficient, and an encode applies k of them: at 4 MiB shards and k=16 that
+  is 64 MiB of garbage per stripe for no benefit. Callers that need the
+  original keep their own copy; `scale-add` is the non-destructive form."
+  [acc c xs]
+  (let [c (bit-and c 0xff)]
+    (if (zero? c)
+      acc
+      (let [t (mul-table c)
+            n (blength acc)]
+        (assert (= n (blength xs)) "buffers must be equal length")
+        (dotimes [i n]
+          (bset! acc i (bit-xor (bget acc i) (nth t (bget xs i)))))
+        acc))))
+
+(defn scale-add
+  "Non-destructive `acc + c * xs`. Matches `erasure.gf/scale-add`'s shape for
+  callers that have not moved to buffers."
+  [acc c xs]
+  (let [n (blength acc)
+        out (alloc n)]
+    (dotimes [i n] (bset! out i (bget acc i)))
+    (scale-add! out c xs)))
+
+(defn xor-into!
+  "`acc ^= xs`. Local parity is a plain xor, so it skips the table entirely —
+  this is the path a single-shard repair runs, and it does no multiplies at
+  all (ADR-2607299200 section 1)."
+  [acc xs]
+  (let [n (blength acc)]
+    (assert (= n (blength xs)) "buffers must be equal length")
+    (dotimes [i n] (bset! acc i (bit-xor (bget acc i) (bget xs i))))
+    acc))
+
+(defn xor-shards
+  "Xor a sequence of equal-length buffers into a fresh one."
+  [shards len]
+  (reduce xor-into! (alloc len) shards))
+
+(defn concat-shards
+  "One buffer of `size` bytes from `shards` in order, truncating the tail.
+
+  Truncation is the point rather than an edge case. A stripe is padded up to a
+  multiple of k so that no shard is ragged (`kura.manifest/plan` explains why),
+  so the last stripe of almost every object carries zeros that were never part
+  of the object. `size` is what makes that padding invisible, and it has to be
+  applied here — the layer that reassembles — because nothing below this knows
+  how long the object was."
+  [shards size]
+  (let [out (alloc size)]
+    (loop [ss (seq shards) at 0]
+      (if (or (nil? ss) (>= at size))
+        out
+        (let [s (first ss)
+              n (min (blength s) (- size at))]
+          (dotimes [i n] (bset! out (+ at i) (bget s i)))
+          (recur (next ss) (+ at (blength s))))))))
+
+;; --- the linear combination the codec needs --------------------------------
+
+(defn apply-row
+  "Combine `shards` (buffers) under `coeffs` into one fresh buffer — the
+  buffer-native counterpart of `erasure.matrix/apply-row`."
+  [coeffs shards len]
+  (let [acc (alloc len)]
+    (doseq [[c s] (map vector coeffs shards)]
+      (scale-add! acc c s))
+    acc))
+
+(defn provider
+  "The provider record a node hands to anything that wants the fast path.
+
+  Returned as data rather than a protocol implementation so that a caller can
+  swap in the reference functions for a conformance run without either side
+  knowing which one it got — the property ADR-2607299200 section 5 asks for."
+  []
+  {:name ::table-driven
+   :scale-add scale-add
+   :scale-add! scale-add!
+   :xor-into! xor-into!
+   :apply-row apply-row
+   :alloc alloc
+   :->bytes ->bytes
+   :->vec ->vec})
+
+(def reference-provider
+  "The same surface backed by `erasure.gf` over reference vectors. Slow, and
+  the thing the fast provider is checked against."
+  {:name ::reference
+   :scale-add (fn [acc c xs] (->bytes (gf/scale-add (->vec acc) c (->vec xs))))
+   :apply-row (fn [coeffs shards len]
+                (->bytes (reduce (fn [a [c s]] (gf/scale-add a c (->vec s)))
+                                 (gf/zero-shard len)
+                                 (map vector coeffs shards))))
+   :alloc alloc
+   :->bytes ->bytes
+   :->vec ->vec})

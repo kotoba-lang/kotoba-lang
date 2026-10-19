@@ -1,0 +1,182 @@
+(ns kotoba.security.host-denial-telemetry
+  "Aggregate continuous-monitoring alert files into summary EDN (R-005).
+
+  Scans denial receipts / structured alerts (typically under
+  evidence/<date>/alerts or a configurable directory) and produces:
+  - counts by severity, name, signal, capability
+  - host-capability-denial-spike tallies
+  - optional threshold evaluation for monitoring alerts
+
+  Pure data transforms — no network, no secrets. File IO lives in the
+  nbb scripts (aggregate-host-denial.cljs / metric-collect.cljs)."
+  {:kotoba/export [aggregate alert-map? default-spike-name default-threshold host-denial-alert? metric-counts parse-alert-edn spike-monitoring-alert summary-schema]}
+  (:require [kotoba.lang.text :as str]
+            [kotoba.security.key-lifecycle :as kl]
+            [kotoba.lang.edn :as edn]))
+
+(def summary-schema "kotoba.security.host-denial-telemetry/v1")
+
+(def default-spike-name "host-capability-denial-spike")
+
+(def default-threshold
+  "Default: one host-denial-spike alert OR summed denial-count >= 50."
+  {:spike-alert-count 1
+   :denial-count-sum 50})
+
+(defn alert-map?
+  "True when m looks like a continuous-monitoring v1 alert."
+  [m]
+  (and (map? m)
+       (or (contains? m :alert/name)
+           (contains? m :alert/id)
+           (contains? m :alert/schema))))
+
+(defn host-denial-alert?
+  "True for host-capability-denial-spike and capability-denial denials."
+  [alert]
+  (let [name (str (or (:alert/name alert) ""))
+        signal (:alert/signal alert)
+        decision (:alert/decision alert)]
+    (or (= name default-spike-name)
+        (str/includes? name "host-denial")
+        (str/includes? name "host-capability-denial")
+        (and (= signal :capability-denial)
+             (contains? #{:deny "deny"} decision)))))
+
+(defn- inc-count [m k]
+  (update m k (fnil inc 0)))
+
+(defn- keywordish [x]
+  (cond
+    (keyword? x) x
+    (string? x) (keyword x)
+    (nil? x) :unknown
+    :else (keyword (str x))))
+
+(defn- denial-count-of
+  "Per-alert denial tally (defaults to 1 for deny decisions, else 0)."
+  [alert]
+  (let [n (:alert/denial-count alert)]
+    (cond
+      (number? n) n
+      (host-denial-alert? alert) 1
+      (contains? #{:deny "deny"} (:alert/decision alert)) 1
+      :else 0)))
+
+(defn metric-counts
+  "Mini collector: counts by severity, name (type), and signal.
+
+  -> {:total N
+      :by-severity {..,}
+      :by-name {..}
+      :by-signal {..}
+      :by-decision {..}}"
+  [alerts]
+  (reduce
+   (fn [acc alert]
+     (-> acc
+         (update :total (fnil inc 0))
+         (update :by-severity inc-count (keywordish (:alert/severity alert)))
+         (update :by-name inc-count (str (or (:alert/name alert) "unknown")))
+         (update :by-signal inc-count (keywordish (:alert/signal alert)))
+         (update :by-decision inc-count (keywordish (:alert/decision alert)))))
+   {:total 0
+    :by-severity {}
+    :by-name {}
+    :by-signal {}
+    :by-decision {}}
+   alerts))
+
+(defn aggregate
+  "Aggregate alert maps into a host-denial / monitoring summary.
+
+  opts:
+    :threshold  map with :spike-alert-count and/or :denial-count-sum
+    :source-dir string (recorded only)
+    :observed-at ISO-8601 string
+    :run-id string
+    :evidence-id string (default EV-0018)"
+  ([alerts] (aggregate alerts {}))
+  ([alerts {:keys [threshold source-dir observed-at run-id evidence-id]
+            :or {threshold default-threshold
+                 evidence-id "EV-0018"}}]
+   (let [alerts (filterv alert-map? alerts)
+         metrics (metric-counts alerts)
+         host-alerts (filterv host-denial-alert? alerts)
+         spike-alerts (filterv #(= default-spike-name (str (:alert/name %))) alerts)
+         spike-count (count spike-alerts)
+         denial-sum (reduce + 0 (map denial-count-of host-alerts))
+         by-cap (reduce (fn [m a]
+                          (let [c (or (:alert/capability a) :unknown)]
+                            (inc-count m (keywordish c))))
+                        {}
+                        host-alerts)
+         thr-spike (:spike-alert-count threshold)
+         thr-sum (:denial-count-sum threshold)
+         exceeded? (boolean
+                    (or (and (number? thr-spike) (>= spike-count thr-spike))
+                        (and (number? thr-sum) (>= denial-sum thr-sum))))]
+     {:summary/schema summary-schema
+      :summary/observed-at observed-at
+      :summary/run-id run-id
+      :summary/source-dir source-dir
+      :summary/evidence-id evidence-id
+      :summary/alert-count (:total metrics)
+      :summary/by-severity (:by-severity metrics)
+      :summary/by-name (:by-name metrics)
+      :summary/by-signal (:by-signal metrics)
+      :summary/by-decision (:by-decision metrics)
+      :summary/by-capability by-cap
+      :summary/host-denial-alert-count (count host-alerts)
+      :summary/host-denial-spike-count spike-count
+      :summary/denial-count-sum denial-sum
+      :summary/threshold threshold
+      :summary/threshold-exceeded? exceeded?
+      :summary/alert-ids (mapv #(or (:alert/id %) (:alert/name %)) alerts)
+      :summary/host-denial-alert-ids
+      (mapv #(or (:alert/id %) (:alert/name %)) host-alerts)})))
+
+(defn spike-monitoring-alert
+  "Build a continuous-monitoring alert when aggregation exceeds threshold.
+  Returns nil when not exceeded."
+  [summary]
+  (when (:summary/threshold-exceeded? summary)
+    (kl/emit-alert
+     {:alert "host-capability-denial-spike"
+      :severity :SEV-2
+      :signal :capability-denial
+      :source "kotoba.security.host-denial-telemetry"
+      :run-id (or (:summary/run-id summary) "host-denial-aggregate")
+      :component "kotoba-lang/security"
+      :package nil
+      :key-id nil
+      :reason (str "aggregated host-denial threshold exceeded: spike-count="
+                   (:summary/host-denial-spike-count summary)
+                   " denial-sum="
+                   (:summary/denial-count-sum summary)
+                   " (threshold "
+                   (pr-str (:summary/threshold summary))
+                   ")")
+      :policy "aiueos/manifest-capability"
+      :decision :deny
+      :evidence-id (or (:summary/evidence-id summary) "EV-0018")
+      :observed-at (or (:summary/observed-at summary)
+                       "1970-01-01T00:00:00Z")
+      :extra {:alert/related-rule "continuous-monitoring.md#alert-rules"
+              :alert/denial-count (:summary/denial-count-sum summary)
+              :alert/window-seconds nil
+              :alert/capability (or (some-> (:summary/by-capability summary)
+                                            keys first name)
+                                    "host/*")
+              :alert/aggregated? true
+              :alert/source-summary-schema summary-schema}})))
+
+(defn parse-alert-edn
+  "Parse EDN text into an alert map (or nil if not an alert)."
+  [text]
+  (try
+    (let [m (edn/read-string text)]
+      (when (alert-map? m) m))
+    (catch  _
+      nil)))
+

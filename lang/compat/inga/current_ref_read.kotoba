@@ -1,0 +1,171 @@
+(ns inga.current-ref-read
+  "Challenge-bound quorum reads of one ref's committed head.
+
+  A witness signs its own current projection, never a value supplied by the
+  caller. A client collects replies for one unpredictable challenge and
+  verifies a configured quorum against its trusted validator profile. The
+  result is a fresh quorum observation; it is not a write certificate or an
+  exact-event finality proof. Those are separate evidence layers."
+  (:require [kotoba.lang.text :as str]
+            [inga.quorum :as quorum]))
+
+(def version "inga.current-ref-read/v1")
+(def max-safe-integer 9007199254740991)
+
+(defn- safe-text?
+  [value]
+  (and (string? value)
+       (seq value)
+       (not (str/includes? value "\n"))
+       (not (str/includes? value "\r"))
+       (not (str/includes? value "\u0000"))))
+
+(defn- safe-natural?
+  [value]
+  (and (integer? value) (<= 0 value max-safe-integer)))
+
+(defn- head-valid?
+  [head-seq head-cid]
+  (or (and (nil? head-seq) (nil? head-cid))
+      (and (safe-natural? head-seq) (safe-text? head-cid))))
+
+(defn payload
+  "Canonical domain-separated payload a witness signs for one read.
+
+  Returns nil for malformed claims. Field names and line terminators make
+  concatenation unambiguous; identifiers carrying line breaks are refused."
+  [{:keys [version chain-id witness ref head-seq head-cid challenge observed-at]}]
+  (when (and (= version inga.current-ref-read/version)
+             (safe-text? chain-id)
+             (safe-text? witness)
+             (safe-text? ref)
+             (safe-text? challenge)
+             (head-valid? head-seq head-cid)
+             (safe-natural? observed-at))
+    (str "inga/current-ref-read/v1\n"
+         "chain=" chain-id "\n"
+         "witness=" witness "\n"
+         "ref=" ref "\n"
+         "head-seq=" (if (nil? head-seq) "none" head-seq) "\n"
+         "head-cid=" (or head-cid "none") "\n"
+         "challenge=" challenge "\n"
+         "observed-at=" observed-at "\n")))
+
+(defn signed-read
+  "Attach this witness's signature to a read claim, or return nil.
+
+  The caller must take head-seq/head-cid from the local committed projection;
+  this function deliberately accepts no raw HTTP or client-supplied record."
+  [read sign-fn]
+  (when (and (map? read) (fn? sign-fn))
+    (when-let [signed-payload (payload (assoc read :version version))]
+      (let [signature (sign-fn signed-payload)]
+        (when (safe-text? signature)
+          (assoc read :version version :signature signature))))))
+
+(defn- context-valid?
+  [{:keys [chain-id witnesses quorum verify-fn ref challenge now max-age-ms]}]
+  (and (safe-text? chain-id)
+       (safe-text? ref)
+       (safe-text? challenge)
+       (vector? witnesses)
+       (seq witnesses)
+       (every? safe-text? witnesses)
+       (= (count witnesses) (count (set witnesses)))
+       (try (boolean (quorum/->predicate quorum))
+            (catch  _ false))
+       (fn? verify-fn)
+       (safe-natural? now)
+       (safe-natural? max-age-ms)
+       (pos? max-age-ms)))
+
+(defn- read-claims-valid?
+  [read {:keys [chain-id ref challenge now max-age-ms]}]
+  (and (map? read)
+       (= version (:version read))
+       (= chain-id (:chain-id read))
+       (= ref (:ref read))
+       (= challenge (:challenge read))
+       (safe-text? (:witness read))
+       (head-valid? (:head-seq read) (:head-cid read))
+       (safe-natural? (:observed-at read))
+       (< (- now (:observed-at read)) max-age-ms)
+       (<= (:observed-at read) now)
+       (safe-text? (:signature read))))
+
+(defn- valid-read?
+  [read {:keys [witnesses verify-fn] :as context}]
+  (and (read-claims-valid? read context)
+       (some #{(:witness read)} witnesses)
+       (try
+         (true? (verify-fn (:witness read) (payload read) (:signature read)))
+         (catch  _ false))))
+
+(defn verify-quorum
+  "Verify distinct witness replies for the exact chain, ref, challenge and
+  freshness window. Returns a normalized `:verified` proof only when one
+  committed head has a quorum of valid witness signatures.
+
+  `context` requires the trusted chain id, ordered witness IDs, quorum
+  predicate/threshold, synchronous signature verifier, requested ref and
+  unpredictable challenge, current time, and maximum read age. Duplicate
+  replies from one witness count once. If that witness signs different heads
+  for one challenge, the whole read is rejected as equivocation."
+  [reads {:keys [quorum max-age-ms now] :as context}]
+  (cond
+    (not (context-valid? context))
+    {:status :rejected :reason :invalid-context}
+
+    (not (and (vector? reads) (every? map? reads)))
+    {:status :rejected :reason :malformed-reads}
+
+    :else
+    (let [valid (filterv #(valid-read? % context) reads)
+          by-witness (group-by :witness valid)
+          conflicting-witness? (some (fn [[_ replies]]
+                                       (> (count (set (map (juxt :head-seq :head-cid)
+                                                           replies)))
+                                          1))
+                                     by-witness)]
+      (cond
+        conflicting-witness?
+        {:status :rejected :reason :witness-equivocation}
+
+        (empty? valid)
+        {:status :unresolved :reason :no-valid-reads}
+
+        :else
+        (let [distinct-reads (mapv (fn [[_ replies]]
+                                     (apply max-key :observed-at replies))
+                                   by-witness)
+              groups (group-by (juxt :head-seq :head-cid) distinct-reads)
+              winners (filterv (fn [[_ replies]]
+                                 (quorum/met? quorum (set (map :witness replies))))
+                               groups)]
+          (cond
+            (> (count winners) 1)
+            {:status :rejected :reason :ambiguous-quorum}
+
+            (= 1 (count winners))
+            (let [[[head-seq head-cid] replies] (first winners)
+                  replies (vec (sort-by :witness replies))
+                  observed-at (apply min (map :observed-at replies))]
+              {:status :verified
+               :proof {:schema version
+                       :trust "inga-quorum-current-ref-read"
+                       :decision :verified
+                       :chain-id (:chain-id context)
+                       :ref (:ref context)
+                       :challenge (:challenge context)
+                       :head-seq head-seq
+                       :head-cid head-cid
+                       :witnesses (mapv :witness replies)
+                       :reads replies
+                       :observed-at observed-at
+                       :expires-at (+ observed-at max-age-ms)}})
+
+            (> (count groups) 1)
+            {:status :unresolved :reason :conflicting-reads}
+
+            :else
+            {:status :unresolved :reason :below-quorum}))))))

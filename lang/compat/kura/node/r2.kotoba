@@ -1,0 +1,105 @@
+(ns kura.node.r2
+  "A shard store on a Cloudflare R2 **binding**.
+
+  Not the S3 API. A Worker talking to its own bucket over SigV4 would be
+  signing requests to itself and paying an HTTP round trip for it; the binding
+  is a direct call. `kura.node.s3` remains the right adapter for a bucket at
+  another provider, or for R2 reached from outside a Worker.
+
+  Async natively, so it implements `kura.node.async/IAsyncShardStore` — which
+  is the protocol that exists because the synchronous one silently reported
+  every read as absent when handed a promise.
+
+  **Independence.** R2 is one provider and, for a fleet keyed only by object
+  prefix, one bucket. `open` still requires the declaration and the honest
+  answer here is `:shared-substrate` unless the operator is genuinely running
+  separate accounts — `kura.node.store/audit` will then report the fleet as
+  the single failure domain it is."
+  (:require [kotoba.lang.text :as str]
+            [kura.node.async :as async]
+            [kura.node.store :as store]))
+
+(defn- shard-key [prefix shard-id]
+  (str (when (seq prefix) (str (str/replace prefix #"/+$" "") "/")) shard-id))
+
+(defn- ->u8> [obj]
+  (if (nil? obj)
+    (js/Promise.resolve nil)
+    (-> (.arrayBuffer obj) (.then #(js/Uint8Array. %)))))
+
+(defrecord R2Store [bucket prefix desc]
+  async/IAsyncShardStore
+  (-put-shard!> [_ shard-id bytes]
+    (if-not (store/valid-shard-id? shard-id)
+      (js/Promise.reject (js/Error. (str "bad shard id: " shard-id)))
+      (-> (.put bucket (shard-key prefix shard-id) bytes)
+          (.then (fn [_] {:shard-id shard-id :bytes-written (.-length ^js bytes)})))))
+
+  (-get-shard> [_ shard-id]
+    (-> (.get bucket (shard-key prefix shard-id)) (.then ->u8>)))
+
+  (-get-range> [_ shard-id offset length]
+    ;; A real ranged read, not a whole-object fetch and a slice — the
+    ;; systematic layout's benefit is that a range costs a range
+    ;; (ADR-2607299200 section 7).
+    (-> (.get bucket (shard-key prefix shard-id)
+              #js {:range #js {:offset offset :length length}})
+        (.then ->u8>)))
+
+  (-delete-shard!> [_ shard-id]
+    ;; R2's delete resolves whether or not the key existed, so "did this
+    ;; remove something" needs a prior head. The contract asks for it because
+    ;; a repair scheduler that cannot tell a deleted shard from an absent one
+    ;; cannot tell a completed drain from a no-op.
+    (let [k (shard-key prefix shard-id)]
+      (-> (.head bucket k)
+          (.then (fn [h]
+                   (if h
+                     (-> (.delete bucket k) (.then (fn [_] true)))
+                     false))))))
+
+  (-list-shards> [_ p]
+    ;; ^js on every property READ is load-bearing, not decoration. Method
+    ;; calls (.put/.get/.head/.list) survive :advanced; property reads like
+    ;; .-objects and .-key get renamed when the compiler cannot infer the
+    ;; type, and a renamed read returns undefined rather than failing. The
+    ;; live R2 run caught exactly this: 18 assertions passed and listing
+    ;; returned an empty vector, because .-objects had become .-Xa. No unit
+    ;; test could find it — they do not run through :advanced.
+    (let [full (shard-key prefix (or p ""))]
+      (-> (.list bucket #js {:prefix full})
+          (.then (fn [res]
+                   (->> (.-objects ^js res)
+                        (map #(.-key ^js %))
+                        (map #(str/replace % (re-pattern (str "^" prefix "/")) ""))
+                        (filter #(str/starts-with? % (or p "")))
+                        sort
+                        vec))))))
+
+  (-shard-size> [_ shard-id]
+    (-> (.head bucket (shard-key prefix shard-id))
+        (.then (fn [h] (when h (.-size ^js h))))))
+
+  store/INodeIdentity
+  (-descriptor [_] desc))
+
+(defn open
+  "Open an R2-binding shard store.
+
+  `:bucket` is the Worker's R2 binding. `:independence` and `:failure-domain`
+  are required and have no default, same as every other backend — the
+  flattering answer is the one that voids the durability argument."
+  [{:keys [node-id bucket prefix independence failure-domain]
+    :or {prefix "kura"}}]
+  (assert (some? bucket) "an R2 binding is required")
+  (->R2Store
+   bucket prefix
+   (store/descriptor
+    {:node-id node-id
+     :failure-domain failure-domain
+     :independence independence
+     ;; Baked in because an R2 binding can only be Cloudflare, and staying
+     ;; reachable is the product being paid for. Unlike S3 below, there is no
+     ;; self-hosted case that speaks this interface.
+     :availability :always-on
+     :capabilities #{:range-read :list :delete :size-without-read :durable-put}})))

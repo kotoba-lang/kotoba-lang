@@ -1,0 +1,259 @@
+;; murakumo.infer.gateway — OpenAI-images-compatible HTTP front for the
+;; fleet's resident ComfyUI (murakumo.infer.media).
+;;
+;; kotoba-lang/comfyui's comfyui.gateway/render-via-gateway (the host-fn every
+;; comfyui-clj-based generation graph calls) expects `POST {base}/v1/images/
+;; generations` -> `{:data [{:b64_json "..."}]}`. Nothing implements that
+;; contract for the murakumo fleet today — the fleet's ComfyUI ports are
+;; deliberately unexposed (SSH-loopback only, per media.clj's header comment),
+;; so no COMFY_URL anywhere in the ecosystem (cloud-murakumo, ai-gftd-yukkuri)
+;; can reach it. This is that bridge: one process, run on a machine with SSH
+;; access to the fleet, that translates the gateway's HTTP contract into
+;; murakumo.infer.media/run-job! (job-parallel dispatch + poll + scp already
+;; proven by `kbb -M:murakumo infer media generate`).
+;;
+;;   bb murakumo infer gateway [port=8790]
+;;   POST /v1/images/generations  {:prompt :n :size "WxH" :model? :seed?}
+;;                                 -> {:data [{:b64_json ...}]}
+;;   POST /workflows/run  {:workflow {...ComfyUI API-format graph...}
+;;                         :output-node "7" :output-key? "images"
+;;                         :checkpoint? "animagine-xl-4.0.safetensors"}
+;;                                 -> {:b64_json ... :filename ...}
+;;                         For callers with their own custom node graph (e.g.
+;;                         yukkuri.comfy's background/character/scene-composite
+;;                         workflows) that the simple txt2img-only
+;;                         /v1/images/generations shape can't express.
+;;   POST /v1/chat/completions  {:model? :messages [{:role :content}] ...}
+;;                                 -> OpenAI chat-completions-shaped response,
+;;                         VERBATIM passthrough from the backend (see below).
+;;                         Added ADR-2607110200-followup (cloud-itonami.media,
+;;                         same-day owner instruction "cloud-murakumo 側を必要
+;;                         であれば修正、更新"): murakumo's OWN public dispatch
+;;                         API (/infer/dispatch -> relay -> browser-swarm
+;;                         worker) has no HTTP-pollable output-retrieval path
+;;                         for a headless caller — confirmed empirically
+;;                         (relay.gftd.ai/stats showed 0 connected workers,
+;;                         and /infer/runs' ledger entries carry only
+;;                         credits/shares telemetry, no :output field
+;;                         anywhere — the browser-swarm model returns results
+;;                         over the dispatching tab's own live WSS session,
+;;                         not to a stateless server caller). This route
+;;                         reuses the exact same synchronous-HTTP-proxy shape
+;;                         as /v1/images/generations above, but for TEXT: it
+;;                         forwards to an OpenAI-compatible text backend
+;;                         (MURAKUMO_TEXT_BACKEND_URL env, default a local
+;;                         Ollama at http://localhost:11434 — any fleet node
+;;                         running Ollama works, same "any fleet node with a
+;;                         public endpoint" posture as deploy/relay.md's own
+;;                         relay). Unlike the image path, this does NOT
+;;                         dispatch via SSH + media/run-job! — Ollama's own
+;;                         /v1/chat/completions is already OpenAI-shaped, so
+;;                         there is nothing to translate, only to proxy.
+;;   GET  /health                  -> {:ok :fleet-nodes}
+;;
+;; Scope: image (txt2img, fleet-dispatched via SSH) + text (proxied to an
+;; OpenAI-compatible backend) — NOT unified dispatch: image jobs still need
+;; murakumo's own fleet scheduler (pick-any-node!/media/run-job!) because
+;; ComfyUI has no HTTP-reachable OpenAI-images-compatible surface of its own;
+;; text generation already does (Ollama), so text is a plain proxy.
+;; Blocking (one request = one full render/generation) — fine for the
+;; current job-parallel/render-farm model; a queue-backed async variant
+;; (poll-by-id) is a follow-up if request-time synchronous serving becomes a
+;; problem. Not deployed/exposed by this commit — running it reachable from
+;; outside localhost (Cloudflare Tunnel, Tailscale funnel, or a plain --bind)
+;; is an operational step the fleet owner takes separately, same as
+;; renderer-mac's README documents for its own tunnel.
+(ns murakumo.infer.gateway
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.http.host.babashka :as http-client]
+            [json.compat :as json]
+            [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [murakumo.fleet :as fleet]
+            [murakumo.infer.media :as media]
+            [murakumo.infer.schedule :as sched]
+            [murakumo.config :as config]
+            [kotoba.lang.http.host.httpkit :as http]))
+
+(defn- parse-size [size]
+  (if-let [[_ w h] (and size (re-matches #"(\d+)x(\d+)" size))]
+    [(parse-long w) (parse-long h)]
+    [832 1216]))
+
+(defn default-image-checkpoint
+  "Used when the caller omits :model. Override via MURAKUMO_DEFAULT_IMAGE_CKPT
+  (exact-name config inject via config/image-checkpoint)."
+  []
+  (config/image-checkpoint))
+
+(defn normalize-ckpt
+  "Caller-supplied :model → the ComfyUI CheckpointLoaderSimple filename.
+   Callers naturally pass registry model ids (\"animagine-xl-4.0\") but
+   CheckpointLoaderSimple validates against on-disk names
+   (\"animagine-xl-4.0.safetensors\") and rejects the prompt otherwise —
+   worse, the rejection comes back through the poller as the misleading
+   『node became unreachable mid-render』(実測 2026-07-15: 拡張子なしの
+   model 指定で gad 側は invalid-prompt を返していたのに、gateway は
+   unreachable と報告した)。nil は nil のまま (呼び出し側の default に任せる)。"
+  [model]
+  (when model
+    (cond-> model
+      (not (str/ends-with? model ".safetensors")) (str ".safetensors"))))
+
+(defn- image-filename
+  "The SaveImage output filename from a run-job! history (:image kind always
+  lands on node :7, per media.clj's `run-job!` case)."
+  [hist]
+  (get-in hist [:outputs :7 :images 0 :filename]))
+
+(defn generate-image!
+  "{:prompt :negative :n :size :model :seed} -> {:data [{:b64_json ...}]}.
+  Picks a fleet node via murakumo.infer.schedule/pick (any node serving
+  :comfyui; prefers one already holding the requested checkpoint, else any
+  eligible node — media.clj's run-job! resolves a default checkpoint when
+  :model is absent), runs ONE image job (blocking), reads the scp'd file,
+  and returns it base64-encoded. Throws ex-info if no fleet node is eligible
+  or the render/scp produced no file."
+  [{:keys [prompt negative n size model seed]}]
+  (let [ckpt (or (normalize-ckpt model) (default-image-checkpoint))
+        [width height] (parse-size size)
+        f (fleet/enrich (fleet/load-fleet))
+        live (media/live-fleet f)
+        wanted {:model/engine :comfyui :model/checkpoint ckpt}
+        node-info (or (sched/pick live wanted)
+                      (throw (ex-info "no eligible murakumo fleet node for :comfyui" {:live-count (count live) :checkpoint ckpt})))
+        node (or (first (filter #(= (:name node-info) (:name %)) (:nodes f)))
+                 (throw (ex-info "picked node not found in fleet.edn" {:node (:name node-info)})))
+        hist (media/run-job! node :image (cond-> {:prompt prompt :width width :height height :ckpt ckpt}
+                                           negative (assoc :negative negative)
+                                           ;; ⚠ A REQUEST WITHOUT A SEED MUST NOT INHERIT
+                                           ;; media.clj's fixed default. That default is right
+                                           ;; for the CLI -- `txt2img-workflow` is deterministic
+                                           ;; on purpose so a run is receipt-able -- but it makes
+                                           ;; the graph byte-identical across calls, and ComfyUI
+                                           ;; then reports `execution_cached` for every node and
+                                           ;; returns a history whose `outputs` is EMPTY.
+                                           ;; Measured 2026-09-10: that reads as "the render
+                                           ;; produced no output file", i.e. an identical prompt
+                                           ;; asked twice fails the second time, for a reason
+                                           ;; found nowhere in the error. Callers who want
+                                           ;; reproducibility still get it by passing :seed.
+                                           :always (assoc :seed (or seed (rand-int 2147483647)))))
+        filename (image-filename hist)]
+    (when-not filename
+      (throw (ex-info "murakumo render produced no output file" {:history hist})))
+    (let [local (str "murakumo-" filename)
+          bytes (.readAllBytes (io/input-stream local))]
+      {:data [{:b64_json (kbytes/base64-encode bytes)}]
+       :murakumo {:node (:name node-info) :width width :height height :n (or n 1)}})))
+
+(defn pick-any-node!
+  "Pick a live fleet node serving :comfyui and (per schedule/eligible?)
+  either holding `checkpoint` or free to fetch it. `checkpoint` should
+  match whatever CheckpointLoaderSimple name is baked into the caller's
+  workflow — a nil checkpoint would make schedule/eligible? treat EVERY
+  :comfyui node as eligible regardless of which (possibly video-only)
+  model it actually holds, so callers should always pass one; `run-workflow!`
+  defaults to `default-image-checkpoint` when the request omits it. Throws
+  ex-info if none is eligible."
+  ([f] (pick-any-node! f (default-image-checkpoint)))
+  ([f checkpoint]
+   (let [live (media/live-fleet f)
+         node-info (or (sched/pick live {:model/engine :comfyui :model/checkpoint checkpoint})
+                       (throw (ex-info "no eligible murakumo fleet node for :comfyui" {:live-count (count live) :checkpoint checkpoint})))]
+     (or (first (filter #(= (:name node-info) (:name %)) (:nodes f)))
+         (throw (ex-info "picked node not found in fleet.edn" {:node (:name node-info)}))))))
+
+(defn run-workflow!
+  "{:workflow :output-node :output-key :checkpoint?} -> {:b64_json ...
+  :filename ...}. Runs an arbitrary caller-supplied ComfyUI API-format graph
+  on an eligible fleet node (`:checkpoint`, if given, should match the
+  workflow's own CheckpointLoaderSimple name, for correct node selection —
+  see `pick-any-node!`) via `media/run-custom-workflow!`. Throws ex-info if
+  no node is eligible or the workflow produced no output file."
+  [{:keys [workflow output-node output-key checkpoint] :or {output-key "images"}}]
+  (let [f (fleet/enrich (fleet/load-fleet))
+        node (pick-any-node! f (or checkpoint (default-image-checkpoint)))
+        local (media/run-custom-workflow! node workflow output-node (keyword output-key))]
+    (when-not local
+      (throw (ex-info "murakumo workflow produced no output file" {:output-node output-node :output-key output-key})))
+    (let [bytes (.readAllBytes (io/input-stream local))]
+      {:b64_json (kbytes/base64-encode bytes)
+       :filename local})))
+
+(def default-text-backend-url
+  "Any OpenAI-compatible /v1/chat/completions server. See config/default-text-backend-url."
+  config/default-text-backend-url)
+
+(defn- text-backend-url []
+  (config/text-backend-url))
+
+(defn generate-text!
+  "Verbatim OpenAI-chat-completions proxy: POST `body` (already OpenAI-shaped
+  — :model/:messages/etc, whatever the caller sent) to
+  `{(text-backend-url)}/v1/chat/completions`, return the backend's parsed
+  JSON response as-is. No translation needed (unlike generate-image!,
+  Ollama's /v1/chat/completions is already the exact target shape) — the
+  ONLY value this fn adds over the caller hitting Ollama directly is a
+  stable murakumo-branded URL + being reachable from outside localhost once
+  an operator exposes this gateway (Cloudflare Tunnel / Tailscale funnel).
+  Throws ex-info on a non-2xx backend response or an unreachable backend."
+  [body]
+  (let [url (str (text-backend-url) "/v1/chat/completions")
+        resp (try
+               (http-client/post url {:headers {"content-type" "application/json"}
+                                      :body (json/generate-string body)
+                                      :throw false})
+               (catch Exception e
+                 (throw (ex-info "murakumo text backend unreachable"
+                                 {:url url :detail (ex-message e)}))))]
+    (if (<= 200 (:status resp) 299)
+      (json/parse-string (:body resp) true)
+      (throw (ex-info "murakumo text backend returned an error"
+                      {:url url :status (:status resp) :body (:body resp)})))))
+
+(defn- json-response [status body]
+  {:status status :headers {"content-type" "application/json"} :body (json/generate-string body)})
+
+(defn- http-handler [req]
+  (case [(:request-method req) (:uri req)]
+    [:post "/v1/images/generations"]
+    (try
+      (let [body (json/parse-string (slurp (:body req)) true)]
+        (json-response 200 (generate-image! body)))
+      (catch Exception e
+        (json-response 502 {:error {:message (ex-message e) :data (ex-data e)}})))
+
+    [:post "/workflows/run"]
+    (try
+      (let [{:keys [workflow] :as body} (json/parse-string (slurp (:body req)) true)]
+        (if-not (and (map? workflow) (seq workflow))
+          (json-response 400 {:error "workflow (object) required"})
+          (json-response 200 (run-workflow! body))))
+      (catch Exception e
+        (json-response 502 {:error {:message (ex-message e) :data (ex-data e)}})))
+
+    [:post "/v1/chat/completions"]
+    (try
+      (let [body (json/parse-string (slurp (:body req)) true)]
+        (if-not (seq (:messages body))
+          (json-response 400 {:error "messages (array) required"})
+          (json-response 200 (generate-text! body))))
+      (catch Exception e
+        (json-response 502 {:error {:message (ex-message e) :data (ex-data e)}})))
+
+    [:get "/health"]
+    (try
+      (let [f (fleet/enrich (fleet/load-fleet))]
+        (json-response 200 {:ok true :fleet-nodes (count (media/live-fleet f))
+                            :text-backend (text-backend-url)}))
+      (catch Exception e
+        (json-response 503 {:ok false :error (ex-message e)})))
+
+    (json-response 404 {:error "not_found"})))
+
+(defn -main [& [port]]
+  (let [port (or (some-> port parse-long) 8790)]
+    (http/run-server http-handler {:port port})
+    (println (format "murakumo comfyui gateway on http://0.0.0.0:%d  (POST /v1/images/generations, POST /workflows/run, POST /v1/chat/completions -> %s, GET /health)"
+                     port (text-backend-url)))
+    @(promise)))

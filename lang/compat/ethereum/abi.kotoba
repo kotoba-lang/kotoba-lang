@@ -1,0 +1,278 @@
+(ns ethereum.abi
+  "Ethereum contract ABI argument encoding and decoding, portable.
+
+  `encode` takes a vector of type strings and a vector of values and produces
+  the argument block of a call; `decode` reverses it. Types are the ordinary
+  Solidity spelling — `\"uint256\"`, `\"address\"`, `\"bytes\"`,
+  `\"bytes32[]\"`, `\"(address,uint256)[]\"`.
+
+  **There is no keccak here, and therefore no `function-selector`.** A
+  selector is `keccak256(signature)[0..4]`, and the only keccak in this
+  workspace is `eth-crypto.core/keccak256`, which is JVM-only by design — its
+  ClojureScript branch throws rather than silently truncating to 32 bits. So
+  `encode-call` takes the selector as a parameter. Callers hold theirs as
+  constants next to the signature they came from, and check them in a
+  JVM-only test; that keeps this library on both runtimes and keeps the
+  selector where a reader can see which signature produced it.
+
+  ## The part that is easy to get wrong
+
+  Encoding is **head/tail**, not concatenation. Each argument contributes a
+  32-byte head; a dynamic argument's head is an *offset* into a tail block
+  and the value goes at that offset. Which types are dynamic is structural:
+  `bytes`, `string` and `T[]` always are, a tuple is dynamic if any component
+  is, and `T[k]` is dynamic if `T` is. Encoding a `bytes32[2]` as dynamic, or
+  a `(uint256,bytes)` as static, produces a well-formed call that reads
+  garbage — the ABI has no lengths or tags for a decoder to notice with.
+
+  Offsets are relative to the **start of the block they appear in**, not to
+  the start of the call. Inside a dynamic array's tail, the elements' offsets
+  restart from that array's own base. Getting this wrong is invisible for a
+  single argument and wrong for two."
+  (:require [kotoba.lang.text :as str]
+            [ethereum.abi.word :as w]))
+
+(def ^:const word-bytes 32)
+
+;; ── type parsing ─────────────────────────────────────────────────────────────
+
+(declare parse-type)
+
+(defn- parse-nat
+  "A decimal string → an integer, refusing anything that is not one.
+
+  Not `parseInt`/`parseLong` directly: the JVM throws on `\"x\"` and
+  JavaScript answers `NaN`, so `uint256[x]` would be a parse error on one
+  runtime and an array of NaN elements on the other. Values past 2^53 are
+  refused as well, since that is where the JavaScript side stops counting."
+  [s what]
+  (when-not (re-matches #"\d+" (str s))
+    (throw (ex-info (str "abi: " what " is not a number") {:value (str s)})))
+  (when (> (count (str s)) 15)
+    (throw (ex-info (str "abi: " what " is too large") {:value (str s)})))
+  ( (str s)))
+
+(defn- split-top-level
+  "Split on commas that are not inside parentheses or brackets."
+  [s]
+  (loop [i 0 depth 0 start 0 out []]
+    (cond
+      (= i (count s)) (if (zero? (count s)) [] (conj out (subs s start)))
+      :else
+      (let [c (nth s i)]
+        (cond
+          (or (= c \() (= c \[)) (recur (inc i) (inc depth) start out)
+          (or (= c \)) (= c \])) (recur (inc i) (dec depth) start out)
+          (and (= c \,) (zero? depth)) (recur (inc i) depth (inc i)
+                                              (conj out (subs s start i)))
+          :else (recur (inc i) depth start out))))))
+
+(defn- parse-array-suffix
+  "`\"uint256[3]\"` → `[\"uint256\" \"[3]\"]`, or nil when there is no
+  trailing `[...]`. Matches only the *last* one, so `uint256[2][3]` peels
+  right to left as the spec requires."
+  [s]
+  (when (str/ends-with? s "]")
+    (let [i (str/last-index-of s "[")]
+      (when i [(subs s 0 i) (subs s (inc i) (dec (count s)))]))))
+
+(defn parse-type
+  "A Solidity type string → a type map."
+  [s]
+  (let [s (str/trim s)]
+    (if-let [[base len] (parse-array-suffix s)]
+      (let [element (parse-type base)]
+        (if (str/blank? len)
+          {:kind :array :element element :dynamic? true}
+          (let [n (parse-nat len "array length")]
+            {:kind :fixed-array :element element :length n
+             :dynamic? (:dynamic? element)})))
+      (cond
+        (and (str/starts-with? s "(") (str/ends-with? s ")"))
+        (let [components (mapv parse-type (split-top-level (subs s 1 (dec (count s)))))]
+          {:kind :tuple :components components
+           :dynamic? (boolean (some :dynamic? components))})
+
+        (= s "address") {:kind :address :dynamic? false}
+        (= s "bool") {:kind :bool :dynamic? false}
+        (= s "bytes") {:kind :bytes :dynamic? true}
+        (= s "string") {:kind :string :dynamic? true}
+
+        (re-matches #"u?int\d*" s)
+        (let [signed? (str/starts-with? s "int")
+              digits (re-find #"\d+" s)
+              bits (if digits (parse-nat digits "integer width") 256)]
+          (when-not (and (zero? (mod bits 8)) (<= 8 bits 256))
+            (throw (ex-info "abi: bad integer width" {:type s})))
+          {:kind :int :bits bits :signed? signed? :dynamic? false})
+
+        (re-matches #"bytes\d+" s)
+        (let [n (parse-nat (re-find #"\d+" s) "bytesN width")]
+          (when-not (<= 1 n 32)
+            (throw (ex-info "abi: bad bytesN width" {:type s})))
+          {:kind :fixed-bytes :length n :dynamic? false})
+
+        :else (throw (ex-info "abi: unknown type" {:type s}))))))
+
+;; ── values ───────────────────────────────────────────────────────────────────
+
+(defn- ->ints [v]
+  (cond
+    (nil? v) []
+    (string? v) (w/hex->ints v)
+    (vector? v) (mapv #(bit-and (int %) 0xff) v)
+    :else (mapv #(bit-and (int %) 0xff) (seq v))))
+
+(defn- utf8 [s]
+  )
+
+(defn- utf8-> [bs]
+  )
+
+(defn- pad-right [bs]
+  (let [r (mod (count bs) word-bytes)]
+    (if (zero? r) (vec bs) (into (vec bs) (repeat (- word-bytes r) 0)))))
+
+(defn- address->word [v]
+  (let [bs (w/hex->ints v)]
+    (when (> (count bs) 20)
+      (throw (ex-info "abi: address is longer than 20 bytes" {:value v})))
+    (into (vec (repeat (- word-bytes (count bs)) 0)) bs)))
+
+;; ── encode ───────────────────────────────────────────────────────────────────
+
+(declare encode-type encode-block)
+
+(defn- encode-type [t v]
+  (case (:kind t)
+    :int (w/->word (str v) (:bits t) (:signed? t))
+    :bool (conj (vec (repeat 31 0)) (if v 1 0))
+    :address (address->word v)
+    :fixed-bytes (let [bs (->ints v)]
+                   (when-not (= (count bs) (:length t))
+                     (throw (ex-info "abi: bytesN length mismatch"
+                                     {:expected (:length t) :got (count bs)})))
+                   (pad-right bs))
+    :bytes (let [bs (->ints v)]
+             (into (w/->word (str (count bs)) 256 false) (pad-right bs)))
+    :string (let [bs (utf8 v)]
+              (into (w/->word (str (count bs)) 256 false) (pad-right bs)))
+    :fixed-array (do
+                   (when-not (= (count v) (:length t))
+                     (throw (ex-info "abi: fixed array length mismatch"
+                                     {:expected (:length t) :got (count v)})))
+                   (encode-block (repeat (:length t) (:element t)) v))
+    :array (into (w/->word (str (count v)) 256 false)
+                 (encode-block (repeat (count v) (:element t)) v))
+    :tuple (encode-block (:components t) v)
+    (throw (ex-info "abi: cannot encode" {:type t}))))
+
+(defn- encode-block
+  "The head/tail layout of a sequence of typed values. Offsets are relative
+  to the start of *this* block, which is why this is one function used at
+  every nesting level rather than a top-level special case."
+  [types values]
+  (let [types (vec types) values (vec values)]
+    (when-not (= (count types) (count values))
+      (throw (ex-info "abi: wrong number of values"
+                      {:types (count types) :values (count values)})))
+    (let [encoded (mapv encode-type types values)
+          head-size (reduce + (map (fn [t e]
+                                     (if (:dynamic? t) word-bytes (count e)))
+                                   types encoded))]
+      (loop [i 0 offset head-size head [] tail []]
+        (if (= i (count types))
+          (into head tail)
+          (let [t (nth types i) e (nth encoded i)]
+            (if (:dynamic? t)
+              (recur (inc i) (+ offset (count e))
+                     (into head (w/->word (str offset) 256 false))
+                     (into tail e))
+              (recur (inc i) offset (into head e) tail))))))))
+
+(defn encode
+  "Type strings + values → the ABI argument block, as a vector of ints."
+  [types values]
+  (encode-block (mapv parse-type types) values))
+
+(defn argument-types
+  "The argument types of a canonical signature: `\"addPieces(uint256,address,(bytes)[],bytes)\"`
+  → `[\"uint256\" \"address\" \"(bytes)[]\" \"bytes\"]`.
+
+  Here rather than in each caller because a caller that keeps the signature
+  and the type vector as two separate literals has two things to keep in
+  step, and the ABI gives no sign when they drift."
+  [signature]
+  (let [open (str/index-of signature "(")
+        inner (subs signature (inc open) (dec (count signature)))]
+    (if (str/blank? inner) [] (mapv str/trim (split-top-level inner)))))
+
+(defn encode-hex [types values]
+  (str "0x" (w/ints->hex (encode types values))))
+
+(defn encode-call
+  "`selector` (4 bytes, hex with or without `0x`) ++ the argument block.
+
+  The selector is a parameter because computing it needs keccak — see this
+  namespace's docstring."
+  [selector types values]
+  (let [sel (w/hex->ints selector)]
+    (when-not (= 4 (count sel))
+      (throw (ex-info "abi: a selector is 4 bytes" {:got (count sel)})))
+    (into (vec sel) (encode types values))))
+
+(defn encode-call-hex [selector types values]
+  (str "0x" (w/ints->hex (encode-call selector types values))))
+
+;; ── decode ───────────────────────────────────────────────────────────────────
+
+(declare decode-type decode-block)
+
+(defn- head-size
+  "How many bytes a value of this type occupies in a head. Static tuples and
+  static fixed arrays are inlined, so this recurses rather than assuming 32."
+  [t]
+  (if (:dynamic? t)
+    word-bytes
+    (case (:kind t)
+      :tuple (reduce + (map head-size (:components t)))
+      :fixed-array (* (:length t) (head-size (:element t)))
+      word-bytes)))
+
+(defn- decode-type [t bs offset]
+  (case (:kind t)
+    :int (w/word-> (subvec bs offset (+ offset word-bytes)) (:signed? t))
+    :bool (not (zero? (nth bs (+ offset 31))))
+    :address (str "0x" (w/ints->hex (subvec bs (+ offset 12) (+ offset word-bytes))))
+    :fixed-bytes (subvec bs offset (+ offset (:length t)))
+    :bytes (let [n (parse-nat (w/word-> (subvec bs offset (+ offset word-bytes)) false)
+                              "bytes length")]
+             (subvec bs (+ offset word-bytes) (+ offset word-bytes n)))
+    :string (let [n (parse-nat (w/word-> (subvec bs offset (+ offset word-bytes)) false)
+                               "string length")]
+              (utf8-> (subvec bs (+ offset word-bytes) (+ offset word-bytes n))))
+    :fixed-array (decode-block (repeat (:length t) (:element t)) bs offset)
+    :array (let [n (parse-nat (w/word-> (subvec bs offset (+ offset word-bytes)) false)
+                              "array length")]
+             (decode-block (repeat n (:element t)) bs (+ offset word-bytes)))
+    :tuple (decode-block (:components t) bs offset)
+    (throw (ex-info "abi: cannot decode" {:type t}))))
+
+(defn- decode-block [types bs base]
+  (loop [ts (vec types) at base out []]
+    (if (empty? ts)
+      out
+      (let [t (first ts)]
+        (if (:dynamic? t)
+          (let [off (parse-nat (w/word-> (subvec bs at (+ at word-bytes)) false)
+                               "offset")]
+            (recur (rest ts) (+ at word-bytes)
+                   (conj out (decode-type t bs (+ base off)))))
+          (recur (rest ts) (+ at (head-size t))
+                 (conj out (decode-type t bs at))))))))
+
+(defn decode
+  "The inverse of `encode`. Integers come back as decimal strings, `bytes`
+  as vectors of ints, `address` as a lowercase `0x…` string."
+  [types data]
+  (decode-block (mapv parse-type types) (->ints data) 0))

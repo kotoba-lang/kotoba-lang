@@ -1,0 +1,147 @@
+(ns kotoba.native.string-search
+  "`string-contains?` and `string-replace-all`, lowered for BOTH native ISAs
+  onto `string-index-of` -- which is a HOST operation (ABI v5, 2026-09-15).
+
+  ## What changed, and why
+
+  Until ABI v5 `string-index-of` itself was a source rewrite here: two
+  helpers walked the haystack one code point at a time, and at every position
+  took a `string-substring` window and compared it with `string=?`. A string
+  value on native is a `pair(offset,length)` handle and the only things that
+  can read its bytes are the host callbacks, so that was the only shape
+  available without a context slot -- and a slot was avoided because it is an
+  ABI bump whose loader lives in another repository.
+
+  Measured 2026-09-15 on a packaged `grep` (org-ieee-grep): one pair handle
+  per haystack byte (the window view, never reclaimed) and three or four host
+  callbacks per byte, about 75 ns/byte; a 3.3 MB file exhausted a 4 Mi-handle
+  arena after 2 MB, where `/usr/bin/grep -F` read the whole file in 10 ms.
+  That is not a constant factor a rewrite can recover. The search is now
+  context slot 216 (`kotoba.mir/runtime-context-offsets`, arity 2 in
+  `kotoba.gmir/runtime-operation-arities`); the host answers with memmem /
+  memchr, the way every fast grep does, and allocates nothing.
+
+  ## What is still lowered here
+
+  `string-contains?` is `(if (< (string-index-of h n) 0) 0 1)` -- the same
+  0/1 fold the old rewrite ended with. `string-replace-all` keeps its driver
+  helper, `kotoba$string-replace-from`, with the scan replaced by one
+  `string-index-of` per occurrence over the SUFFIX it hands on, so a
+  replacement containing the needle is never rescanned and the result matches
+  `kotoba.lang.text/replace`'s non-overlapping, left-to-right answer.
+
+  ## The empty needle
+
+  `kotoba.kir`'s evaluator TRAPS on an empty needle
+  (`:empty-string-search-needle` / `:empty-string-replacement-needle`) rather
+  than returning a value, and so does the host slot (SIGILL) -- an empty
+  needle occurs at offset 0 in every string, and a lowering that answered 0
+  would be indistinguishable from a real match at the start. Nothing here
+  needs to check for it: every path reaches `string-index-of`.
+
+  ## Fuel
+
+  `emit-function` charges one unit of fuel per function entry and
+  `emit-tail-self-call` one per iteration; a host callback charges none. The
+  driver therefore spends one unit per OCCURRENCE replaced, where the old
+  scan spent one per code point examined. The suffix expression appears
+  twice rather than being `let`-bound: binding it would cost the x86-64
+  tail-self-call fast path (`emit-call` requires `(zero? temp-depth)`), while
+  repeating it costs only `string-substring`, a VIEW -- no pool bytes and no
+  fuel."
+  {:kotoba/export [augment-functions lower-contains lower-replace-all replace-from-name]})
+
+;; Bound to the operands so each is evaluated exactly once, matching the
+;; reference interpreter, which evaluates every argument once before applying.
+(def ^:private subject 'kotoba$string-replace-subject)
+(def ^:private replace-needle 'kotoba$string-replace-needle)
+(def ^:private replacement 'kotoba$string-replace-replacement)
+
+(def replace-from-name 'kotoba$string-replace-from)
+
+(def ^:private helper-names #{replace-from-name})
+
+;; ACC ++ S with every occurrence of N replaced by R. K is the offset of the
+;; next occurrence in S, or -1 -- the caller finds the first one, and each
+;; iteration finds the next in the SUFFIX it hands on. A window that compares
+;; equal to N has N's byte length, so a match at K ends at exactly
+;; `(+ k (string-byte-length n))`.
+(def ^:private replace-from-function
+  (let [suffix (list 'string-substring 's
+                     (list '+ 'k (list 'string-byte-length 'n))
+                     (list 'string-byte-length 's))]
+    {:name replace-from-name
+     :params '[acc s n r k]
+     :param-types [:string :string :string :string :i64]
+     :result :string
+     :body (list 'if (list '< 'k 0)
+                 (list 'string-concat 'acc 's)
+                 (list replace-from-name
+                       (list 'string-concat 'acc
+                             (list 'string-concat
+                                   (list 'string-substring 's 0 'k) 'r))
+                       suffix 'n 'r
+                       (list 'string-index-of suffix 'n)))}))
+
+(defn- uses? [ops form]
+  (cond
+    (seq? form) (or (contains? ops (first form))
+                    (boolean (some #(uses? ops %) (rest form))))
+    (vector? form) (boolean (some #(uses? ops %) form))
+    :else false))
+
+(defn lower-contains
+  "`(string-contains? h n)` as the host search folded to 0/1. The operands
+  reach `string-index-of` once each, so nothing needs binding."
+  [args]
+  (let [[h n] args]
+    (list 'if (list '< (list 'string-index-of h n) 0) 0 1)))
+
+(defn lower-replace-all
+  "`(string-replace-all s n r)` over the driver above and the host search."
+  [args]
+  (let [[s n r] args]
+    (list 'let [subject s replace-needle n replacement r]
+          (list replace-from-name
+                ;; The empty accumulator is a zero-length view of the subject
+                ;; rather than the literal "": offset 0 is a boundary of every
+                ;; string, and this asks nothing of the literal table.
+                (list 'string-substring subject 0 0)
+                subject replace-needle replacement
+                (list 'string-index-of subject replace-needle)))))
+
+(defn augment-functions
+  "FUNCTIONS plus the replace driver, exactly when a body reaches
+  `string-replace-all`.
+
+  A program that does not is returned unchanged -- byte for byte, since the
+  helper code is what would otherwise be appended -- so this cannot move the
+  emission of any existing program. `string-contains?` and `string-index-of`
+  need no helper at all since ABI v5.
+
+  The helper is appended, never exported: `emit-program` derives its export
+  set from the ORIGINAL function list, so a program's public surface is the
+  same whether or not it replaces in a string.
+
+  IDEMPOTENT. A helper already present with the definition this would append
+  is left alone rather than appended a second time -- a second copy would put
+  every call displacement past the first copy at the wrong distance. A name
+  present with a DIFFERENT definition is a real collision and is refused,
+  because the calls this lowering emits would silently go there instead."
+  [functions]
+  (let [bodies (map :body functions)
+        replaces? (some #(uses? '#{string-replace-all} %) bodies)]
+    (if-not replaces?
+      functions
+      (let [declared (into {} (map (juxt :name identity)) functions)
+            wanted [replace-from-function]
+            clash (filter
+                   (fn [helper]
+                     (when-let [existing (get declared (:name helper))]
+                       (not= existing helper)))
+                   wanted)]
+        (when (seq clash)
+          (throw (ex-info "a program function collides with a native string-search helper"
+                          {:phase :native :functions (mapv :name clash)})))
+        (vec (concat functions
+                     (remove #(contains? declared (:name %)) wanted)))))))

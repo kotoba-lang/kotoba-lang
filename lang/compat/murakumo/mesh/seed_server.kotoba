@@ -1,0 +1,166 @@
+(ns murakumo.mesh.seed-server
+  "Node shell around `murakumo.mesh.seed`: a node:http server bound to the mesh
+  address only, so the endpoint does not exist on the LAN or the tailnet.
+
+  Runs on the kbb engine like the rest of the edge control plane -- no JVM.
+
+  Everything decided lives in the pure handler. This file reads bytes, calls it,
+  persists the ledger, and writes bytes -- and refuses to acknowledge a grant it
+  could not persist, because an admitted node the ledger forgot on reboot is a
+  node that re-enrols under a different address. Node runs the handler to
+  completion per request, so two joiners cannot be handed the same address."
+  (:require ["node:http" :as http]
+            ["node:fs" :as fs]
+            ["node:crypto" :as crypto]
+            [ed25519.core :as ed]
+            [kotoba.bytes :as kbytes]
+            [kotoba.lang.edn :as edn]
+            [murakumo.durable-file :as durable]
+            [murakumo.mesh :as mesh]
+            [murakumo.mesh.ledger :as ledger]
+            [murakumo.mesh.seed :as seed]))
+
+(def max-body-bytes (* 64 1024))
+
+(defn load-ledger
+  "{:ledger l} or {:error kw}. :missing is its own answer: only startup may turn
+  it into an empty ledger. Anything unreadable stays an error, because treating a
+  corrupt file as empty and then persisting over it is how a revocation list is
+  lost."
+  [path]
+  (if-not (.existsSync fs path)
+    {:error :missing}
+    (try (ledger/parse (str (.readFileSync fs path "utf8")))
+         (catch :default _ {:error :unreadable}))))
+
+(defn read-ledger
+  "Ledger for display/startup: empty WITHOUT the auto-admit opt-in when absent."
+  [path]
+  (let [{l :ledger error :error} (load-ledger path)]
+    (cond l l
+          (= :missing error) {:nodes {}}
+          :else (throw (ex-info "ledger unreadable; refusing to start over it" {:path path :error error})))))
+
+(defn persist-ledger! [path ledger]
+  (durable/write! path (kbytes/utf8-bytes (str (pr-str ledger) "\n"))))
+
+(defn new-nonce [] (.toString (.randomBytes crypto 16) "hex"))
+
+(defn verify
+  "Ed25519 signature (hex) over `message` by the key inside `did`. False, not an
+  exception, for anything malformed: a stranger's garbage is a refusal."
+  [did message signature-hex]
+  (try (and (string? signature-hex)
+            (boolean (re-matches #"[0-9a-f]{128}" signature-hex))
+            (boolean (ed/verify-did did (js/Buffer.from message "utf8")
+                                    (js/Buffer.from signature-hex "hex"))))
+       (catch :default _ false)))
+
+(defn deps [endpoint]
+  {:now-ms (.now js/Date) :new-nonce new-nonce :endpoint endpoint :verify verify})
+
+(defn serve!
+  "Handle one parsed request against `state-atom`; returns [status body]."
+  [state-atom endpoint ledger-path req]
+  ;; The file is the source of truth, read on every request: a revocation written
+  ;; by `ledger-cli` while the server runs must take effect on the next join, and
+  ;; a server holding a stale copy would also persist it back over the revocation.
+  (let [{:keys [ledger error]} (load-ledger ledger-path)]
+    (if-not ledger
+      [503 {:ok? false :reason :ledger-unreadable :detail error}]
+      (let [old (assoc @state-atom :ledger ledger)
+            [new-state resp] (seed/handle old req (deps endpoint))]
+        (if (and (not= (:ledger old) (:ledger new-state))
+                 (try (persist-ledger! ledger-path (:ledger new-state)) false
+                      (catch :default _ true)))
+          [500 {:ok? false :reason :ledger-not-persisted}]
+          (do (reset! state-atom new-state)
+              [(:status resp) (:body resp)]))))))
+
+(defn- reply! [res status body]
+  (let [payload (str (pr-str body) "\n")]
+    (.writeHead res status #js {"content-type" "application/edn"
+                                "content-length" (.byteLength js/Buffer payload)})
+    (.end res payload)))
+
+(defn serve-admin!
+  "Operator operation against the file ledger; returns [status body]. One
+  synchronous step -- load, decide, persist -- like a join, so a join cannot land
+  between the operator's read and write."
+  [ledger-path req]
+  (let [{l :ledger error :error} (load-ledger ledger-path)]
+    (if-not l
+      [503 {:ok? false :reason :ledger-unreadable :detail error}]
+      (let [r (seed/admin l req)]
+        (if (and (not= l (:ledger r))
+                 (try (persist-ledger! ledger-path (:ledger r)) false
+                      (catch :default _ true)))
+          [500 {:ok? false :reason :ledger-not-persisted}]
+          [(:status r) (:body r)])))))
+
+(defn- request-handler
+  "node:http handler: read the body (bounded), parse it, run `dispatch` on
+  {:method :path :body}, reply with EDN."
+  [dispatch]
+  (fn [req res]
+    (let [chunks (atom []) size (atom 0) done? (atom false)
+          finish! (fn [status body] (when-not @done? (reset! done? true) (reply! res status body)))]
+      (.on req "data"
+           (fn [c]
+             (swap! size + (.-length c))
+             (if (> @size max-body-bytes)
+               (do (finish! 413 {:ok? false :reason :too-large}) (.destroy req))
+               (swap! chunks conj c))))
+      (.on req "error" (fn [_] (finish! 400 {:ok? false :reason :bad-request})))
+      (.on req "end"
+           (fn []
+             (when-not @done?
+               (let [body (try (edn/read-string (.toString (js/Buffer.concat (clj->js @chunks)) "utf8"))
+                               (catch :default _ nil))
+                     [status out] (try (dispatch {:method (keyword (.toLowerCase (.-method req)))
+                                                  :path (.-pathname (js/URL. (.-url req) "http://x"))
+                                                  :body body})
+                                       (catch :default _ [500 {:ok? false :reason :internal}]))]
+                 (finish! status out))))))))
+
+(defn start-admin!
+  "Listen for operator operations on a unix socket. Not on the mesh: the mesh
+  address is reachable by every node holding the passphrase, including a revoked
+  one, and an admin endpoint there would let the node being revoked un-revoke
+  itself. The socket lives in a 0700 directory and is chmod 0600, so only root on
+  the seed can open it -- the filesystem is the authentication."
+  [{:keys [admin-socket ledger]}]
+  (when (.existsSync fs admin-socket) (.unlinkSync fs admin-socket))
+  (let [server (.createServer http (request-handler #(serve-admin! ledger %)))]
+    (.listen server admin-socket (fn [] (.chmodSync fs admin-socket 0600)))
+    server))
+
+(defn start!
+  "Bind and listen; returns the server. With `:admin-socket`, also serves operator
+  operations there."
+  [{:keys [bind port ledger admin-socket] :as opts}]
+  (let [endpoint (str "http://" bind ":" port "/enroll")
+        state (atom (seed/initial-state (read-ledger ledger)))
+        server (.createServer http (request-handler #(serve! state endpoint ledger %)))]
+    (.listen server port bind)
+    (when admin-socket (start-admin! opts))
+    server))
+
+(defn- parse-args [args]
+  (loop [m {:bind mesh/seed-address :port mesh/enroll-port :ledger "kekkai-tailnet.edn"} [k v & more :as as] args]
+    (if (empty? as)
+      m
+      (recur (case k
+               "--bind" (assoc m :bind v)
+               "--port" (assoc m :port (js/parseInt v 10))
+               "--ledger" (assoc m :ledger v)
+               "--admin-socket" (assoc m :admin-socket v)
+               (throw (ex-info (str "unknown argument " k) {:arg k})))
+             more))))
+
+(defn -main [& args]
+  (let [opts (parse-args args)]
+    (start! opts)
+    (println "murakumo mesh enrol endpoint on" (:bind opts) (:port opts)
+             "ledger" (:ledger opts)
+             "auto-admit" (mesh/auto-admit-enabled? (read-ledger (:ledger opts))))))

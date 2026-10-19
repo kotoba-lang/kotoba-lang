@@ -1,0 +1,131 @@
+(ns kotoba.security.anchor-relayer
+  "Deterministic authenticated anchor-relayer state machine."
+  {:kotoba/export [confirm due-jobs enqueue make-state monitoring policy-path read-policy reconcile record-failure record-submitted]}
+  (:require [kotoba.lang.edn :as edn]))
+
+(def policy-path "qualification/anchor-relayer-policy.edn")
+
+(defn read-policy []
+  (edn/read-string (slurp policy-path)))
+
+(defn make-state []
+  {:jobs {} :events []})
+
+(defn enqueue
+  [policy state verified-auth {:keys [anchor-digest payload-cid]}
+   now-ms]
+  (cond
+    (not (:valid? verified-auth))
+    {:ok? false :code :relayer/unauthenticated :state state}
+
+    (not= (:audience policy) (:audience verified-auth))
+    {:ok? false :code :relayer/audience :state state}
+
+    (not (contains? (:authorized-subjects policy) (:subject verified-auth)))
+    {:ok? false :code :relayer/subject :state state}
+
+    (not (and (string? anchor-digest) (not-empty anchor-digest)
+              (string? payload-cid) (not-empty payload-cid)))
+    {:ok? false :code :relayer/invalid-request :state state}
+
+    (contains? (:jobs state) anchor-digest)
+    {:ok? true :code :relayer/idempotent
+     :job (get-in state [:jobs anchor-digest]) :state state}
+
+    :else
+    (let [job {:anchor-digest anchor-digest :payload-cid payload-cid
+               :status :queued :attempts 0 :created-at-ms now-ms
+               :next-at-ms now-ms}
+          state (-> state
+                    (assoc-in [:jobs anchor-digest] job)
+                    (update :events conj
+                            {:event :enqueued :anchor-digest anchor-digest
+                             :at-ms now-ms}))]
+      {:ok? true :code :relayer/enqueued :job job :state state})))
+
+(defn due-jobs [state now-ms]
+  (->> (:jobs state)
+       vals
+       (filter #(and (contains? #{:queued :retry} (:status %))
+                     (<= (:next-at-ms %) now-ms)))
+       (sort-by (juxt :next-at-ms :anchor-digest))
+       vec))
+
+(defn record-submitted [state anchor-digest tx-hash block-number now-ms]
+  (if-let [job (get-in state [:jobs anchor-digest])]
+    (-> state
+        (assoc-in [:jobs anchor-digest]
+                  (assoc job :status :submitted :tx-hash tx-hash
+                         :submitted-block block-number
+                         :attempts (inc (:attempts job))
+                         :updated-at-ms now-ms))
+        (update :events conj {:event :submitted :anchor-digest anchor-digest
+                              :tx-hash tx-hash :at-ms now-ms}))
+    state))
+
+(defn record-failure [policy state anchor-digest reason now-ms]
+  (if-let [job (get-in state [:jobs anchor-digest])]
+    (let [attempts (inc (:attempts job))
+          exhausted? (>= attempts (:maximum-attempts policy))
+          delay (nth (:backoff-ms policy)
+                     (min (dec attempts)
+                          (dec (count (:backoff-ms policy)))))
+          job (assoc job :attempts attempts :last-error reason
+                     :updated-at-ms now-ms
+                     :status (if exhausted? :failed :retry)
+                     :next-at-ms (when-not exhausted? (+ now-ms delay)))]
+      (-> state
+          (assoc-in [:jobs anchor-digest] job)
+          (update :events conj
+                  {:event (if exhausted? :exhausted :retry)
+                   :anchor-digest anchor-digest :at-ms now-ms
+                   :reason reason})))
+    state))
+
+(defn confirm [policy state anchor-digest tx-hash observed-block head-block now-ms]
+  (let [job (get-in state [:jobs anchor-digest])
+        deep-enough? (and (integer? observed-block) (integer? head-block)
+                          (>= (- head-block observed-block)
+                              (:confirmation-depth policy)))]
+    (if (and (= :submitted (:status job))
+             (= tx-hash (:tx-hash job))
+             deep-enough?)
+      (-> state
+          (assoc-in [:jobs anchor-digest]
+                    (assoc job :status :confirmed
+                           :confirmed-block observed-block
+                           :updated-at-ms now-ms))
+          (update :events conj {:event :confirmed
+                                :anchor-digest anchor-digest
+                                :tx-hash tx-hash :at-ms now-ms}))
+      state)))
+
+(defn reconcile [state chain-events]
+  (let [by-digest (group-by :anchor-digest chain-events)]
+    (vec
+     (concat
+      (for [[digest job] (:jobs state)
+            :when (= :confirmed (:status job))
+            :let [events (get by-digest digest)]
+            :when (empty? events)]
+        {:code :reconcile/missing :anchor-digest digest})
+      (for [[digest events] by-digest
+            :when (> (count events) 1)]
+        {:code :reconcile/duplicate :anchor-digest digest
+         :count (count events)})
+      (for [[digest events] by-digest
+            event events
+            :let [job (get-in state [:jobs digest])]
+            :when (and job (not= (:payload-cid job) (:payload-cid event)))]
+        {:code :reconcile/digest-mismatch :anchor-digest digest})))))
+
+(defn monitoring [policy state now-ms]
+  (let [jobs (vals (:jobs state))]
+    {:queue-depth (count (filter #(contains? #{:queued :retry} (:status %))
+                                jobs))
+     :failed (count (filter #(= :failed (:status %)) jobs))
+     :stale (count (filter #(and (not= :confirmed (:status %))
+                                 (>= (- now-ms (:created-at-ms %))
+                                     (:stale-after-ms policy)))
+                           jobs))
+     :status-counts (frequencies (map :status jobs))}))

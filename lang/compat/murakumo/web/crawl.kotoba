@@ -1,0 +1,194 @@
+(ns murakumo.web.crawl
+  "M2 of ADR-260929: the `:web/crawl` coordinator. It owns only the frontier,
+  the budget and the politeness rules; every byte still goes through
+  `murakumo.web.worker/fetch!`, so URL policy, redirect checks and receipts are
+  the ones M1 already enforces.
+
+  Sequential by design (one page at a time per crawl): per-host delay is then a
+  plain wait, not a scheduler. Parallelism belongs to running many crawls.
+
+  env = the worker env plus  :sleep! (fn [ms] -> nil)."
+  (:require [kotoba.lang.text :as text]
+            [murakumo.canonical :as canonical]
+            [murakumo.web.url :as url]
+            [murakumo.web :as web]
+            [murakumo.web.robots :as robots]
+            [murakumo.web.worker :as w]))
+
+(def max-robots-delay-ms 60000)
+
+(def default-deadline-ms
+  "Wall-clock budget for one crawl. Below the dispatch timeout so a slow crawl
+  ends itself, stores its manifest and reports :deadline-exhausted? instead of
+  being killed with nothing saved."
+  600000)
+(def max-skipped-recorded 1000)
+
+;; --- URL normalisation / resolution: see murakumo.web.url (kept here as aliases) ---------
+
+(def parse-url url/parse-url)
+(def normalize-url url/normalize-url)
+(def resolve-url url/resolve-url)
+
+(defn in-scope?
+  "`root-host` is the host of the seed a URL was discovered from. :same-domain
+  means that host and its subdomains — not sibling domains (no public-suffix list)."
+  [scope root-host host]
+  (case scope
+    :same-host (= host root-host)
+    :same-domain (or (= host root-host) (text/ends-with? host (str "." root-host)))
+    false))
+
+;; --- politeness ---------------------------------------------------------------
+
+(defn- html? [content-type]
+  (boolean (and content-type (re-find #"(?i)html" content-type))))
+
+(defn- origin [u] (let [p (parse-url u)] (url/render (assoc p :path "" :query ""))))
+
+(declare wait!)
+
+(defn- robots-policy!
+  "Fetch (once per origin) and cache robots.txt. Returns {:groups :basis :cid :status}.
+  The robots request counts as a hit on the host: the next fetch waits the delay."
+  [env cache last-fetch delay-ms crawl-id url]
+  (let [o (origin url)]
+    (or (get @cache o)
+        (let [host (:host (parse-url url))
+              _ (wait! env last-fetch host delay-ms)
+              r (w/fetch! env {:job-id (str crawl-id "/robots") :url (str o "/robots.txt")})
+              _ (swap! last-fetch assoc host ((:now-ms env)))
+              status (get-in r [:ok :receipt :evidence :status])
+              cid (get-in r [:ok :output-cid])
+              body (when (and cid status (<= 200 status 299))
+                     (some-> ((:get-bytes! env) cid) w/utf8-string))
+              policy (assoc (robots/for-status status body) :cid cid :status status)]
+          (swap! cache assoc o policy)
+          policy))))
+
+(defn- wait! [{:keys [sleep! now-ms]} last-fetch host delay-ms]
+  (let [wait (- (+ (get @last-fetch host 0) delay-ms) (now-ms))]
+    (when (pos? wait) (sleep! wait))))
+
+;; --- crawl ----------------------------------------------------------------------
+
+(defn- link-urls [env page-cid final-url]
+  (some->> ((:get-bytes! env) page-cid)
+           w/utf8-string
+           w/links-of
+           (keep #(resolve-url final-url %))
+           distinct))
+
+(declare finish)
+
+(defn crawl!
+  "job {:job-id :plan} -> {:ok {:manifest-cid :manifest :receipt :signature}} | {:refused ..}
+  opts {:limits ...} lets the OPERATOR raise plan ceilings; a bot's plan cannot."
+  ([env job] (crawl! env job nil))
+  ([{:keys [put! sign! now-ms node-did] :as env} {:keys [job-id plan]} {:keys [limits deadline-ms] :or {deadline-ms default-deadline-ms}}]
+   (let [valid (if limits (web/validate-plan plan limits) (web/validate-plan plan))]
+     (if (:refused valid)
+       {:refused :job/invalid :detail (:refused valid)}
+       (let [{:keys [seeds max-pages max-depth delay-ms scope]} plan
+             started (now-ms)
+             cache (atom {}) last-fetch (atom {})
+             norm (distinct (map normalize-url seeds))
+             root-of (into {} (map (fn [u] [u (:host (parse-url u))]) norm))
+             init (mapv (fn [u] {:url u :depth 0 :root (root-of u)}) norm)
+             max-queue (* 20 max-pages)]
+         (loop [queue init i 0 seen (set (map :url init))
+                pages [] skipped [] stats {:attempts 0 :fetched 0 :out-of-scope 0 :skipped 0 :frontier-dropped 0}]
+           (let [skip (fn [entry reason & [more]]
+                        [(if (< (count skipped) max-skipped-recorded)
+                           (conj skipped (merge {:url (:url entry) :reason reason} more)) skipped)
+                         (update stats :skipped inc)])
+                 more? (< i (count queue))]
+             (cond
+               (>= (:attempts stats) max-pages)
+               (finish env job-id plan started pages skipped (cond-> stats more? (assoc :budget-exhausted? true)) cache)
+
+               (>= (- (now-ms) started) deadline-ms)
+               (finish env job-id plan started pages skipped (assoc stats :deadline-exhausted? true) cache)
+
+               (not more?)
+               (finish env job-id plan started pages skipped stats cache)
+
+               :else
+               (let [{:keys [url depth root] :as entry} (nth queue i)
+                     p (parse-url url)
+                     policy (robots-policy! env cache last-fetch delay-ms job-id url)
+                     rd (robots/crawl-delay-ms (:groups policy))]
+                 (cond
+                   (not (robots/allowed? (:groups policy) (str (:path p) (:query p))))
+                   (let [[sk st] (skip entry (if (= :unreachable-disallow-all (:basis policy))
+                                               :robots/unreachable :robots/disallowed))]
+                     (recur queue (inc i) seen pages sk st))
+
+                   (and rd (> rd max-robots-delay-ms))
+                   (let [[sk st] (skip entry :robots/crawl-delay-too-long)]
+                     (recur queue (inc i) seen pages sk st))
+
+                   :else
+                   (do
+                     (wait! env last-fetch (:host p) (max delay-ms (or rd 0)))
+                     ;; redirects are NOT followed inside the worker: each target goes back
+                     ;; through robots / scope / dedupe like any other discovered URL
+                     (let [r (w/fetch! env {:job-id (str job-id "/" i) :url url :follow-redirects? false})
+                           stats (update stats :attempts inc)]
+                       (swap! last-fetch assoc (:host p) (now-ms))
+                       (if (:refused r)
+                         (let [[sk st] (skip entry (:refused r))]
+                           (recur queue (inc i) seen pages sk (assoc st :attempts (:attempts stats))))
+                         (let [{:keys [receipt signature output-cid]} (:ok r)
+                               ev (:evidence receipt)
+                               status (:status ev)
+                               enqueue (fn [urls depth]
+                                         (reduce (fn [[q sn out dropped] u]
+                                                   (let [h (:host (parse-url u))]
+                                                     (cond
+                                                       (contains? sn u) [q sn out dropped]
+                                                       (not (in-scope? scope root h)) [q sn (inc out) dropped]
+                                                       (:refused (web/check-url u)) [q sn out dropped]
+                                                       (>= (count q) max-queue) [q sn out (inc dropped)]
+                                                       :else [(conj q {:url u :depth depth :root root}) (conj sn u) out dropped])))
+                                                 [queue seen 0 0] urls))]
+                           (cond
+                             ;; 3xx: follow only through the frontier, same depth
+                             (:location ev)
+                             (let [[q sn out dropped] (enqueue [(normalize-url (:location ev))] depth)
+                                   [sk st] (skip entry :http/redirect {:location (:location ev)})]
+                               (recur q (inc i) sn pages sk
+                                      (-> st (assoc :attempts (:attempts stats))
+                                          (update :out-of-scope + out) (update :frontier-dropped + dropped))))
+
+                             ;; 4xx/5xx/1xx: recorded as skipped, never indexed, links not followed
+                             (not (<= 200 status 299))
+                             (let [[sk st] (skip entry (keyword "http" (str "status-" status)))]
+                               (recur queue (inc i) seen pages sk (assoc st :attempts (:attempts stats))))
+
+                             :else
+                             (let [page {:url url :depth depth :cid output-cid :status status
+                                         :final-url (:final-url ev) :receipt receipt :signature signature}
+                                   found (when (and (< depth max-depth) (html? (:content-type ev)))
+                                           (link-urls env output-cid (:final-url ev)))
+                                   [q sn out dropped] (enqueue found (inc depth))]
+                               (recur q (inc i) sn (conj pages page) skipped
+                                      (-> stats (update :fetched inc)
+                                          (update :out-of-scope + out)
+                                          (update :frontier-dropped + dropped)))))))))))))))))))
+
+(defn- finish [{:keys [put! sign! now-ms node-did]} job-id plan started pages skipped stats cache]
+  (let [manifest {:crawl-id job-id :plan plan :pages pages :skipped skipped :stats stats
+                  :robots (into (sorted-map)
+                                (map (fn [[o p]] [o (select-keys p [:basis :cid :status])]))
+                                @cache)}
+        bs (w/utf8-bytes (canonical/string manifest))
+        cid (w/raw-cid bs)]
+    (if-not (put! cid bs)
+      {:refused :store/put-failed :detail cid}
+      (let [r (web/receipt {:job-id job-id :kind :web/crawl
+                            :input-cids (mapv :cid pages) :output-cid cid :node-did node-did
+                            :started-at started :finished-at (max started (now-ms))
+                            :evidence (assoc stats :pages (count pages))})]
+        {:ok {:manifest-cid cid :manifest manifest :receipt r
+              :signature (sign! (web/receipt-signing-string r))}}))))

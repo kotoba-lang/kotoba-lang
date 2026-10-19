@@ -1,0 +1,149 @@
+(ns murakumo.cd.bundle
+  "Content-addressed, deployable Kotoba release bundles."
+  (:require [kotoba.bytes :as kbytes] [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [kotoba.lang.text :as str]
+            [murakumo.blob :as blob]
+            [murakumo.canonical :as canonical]
+            [murakumo.durable-file :as durable-file])
+  (:import
+           [java.nio.file Files LinkOption]))
+
+(def version 1)
+
+(defn safe-relative-path? [path]
+  (and (string? path)
+       (not (str/blank? path))
+       (not (str/starts-with? path "/"))
+       (not (str/includes? path "\\"))
+       (every? #(and (not (str/blank? %)) (not (#{"." ".."} %)))
+               (str/split path #"/"))))
+
+(defn- component-valid? [{:keys [path cid]}]
+  (and (safe-relative-path? path) (string? cid) (not (str/blank? cid))))
+
+(defn- resolved-manifest? [manifest component-cids]
+  (try
+    (let [document (edn/read-string manifest)
+          components (:kotoba.app/components document)
+          manifest-cids (mapv #(or (:cid %) (:kotoba.component/cid %)) components)]
+      (and (map? document)
+           (vector? components)
+           (seq components)
+           (every? map? components)
+           (not-any? #(or (contains? % :src) (contains? % :kotoba.component/src)) components)
+           (every? string? manifest-cids)
+           (= (set manifest-cids) (set component-cids))))
+    (catch Exception _ false)))
+
+(defn valid? [bundle]
+  (let [components (:cd.bundle/components bundle)
+        paths (map :path components)]
+    (and (map? bundle)
+         (= version (:cd.bundle/version bundle))
+         (string? (:cd.bundle/revision bundle))
+         (not (str/blank? (:cd.bundle/revision bundle)))
+         (string? (:cd.bundle/manifest bundle))
+         (not (str/blank? (:cd.bundle/manifest bundle)))
+         (vector? components)
+         (seq components)
+         (every? component-valid? components)
+         (= (count paths) (count (distinct paths)))
+         (resolved-manifest? (:cd.bundle/manifest bundle) (map :cid components)))))
+
+(defn create [{:keys [revision manifest components]}]
+  (let [bundle {:cd.bundle/version version
+                :cd.bundle/revision revision
+                :cd.bundle/manifest manifest
+                :cd.bundle/components (->> components
+                                            (mapv #(select-keys % [:path :cid]))
+                                            (sort-by :path)
+                                            vec)}]
+    (when-not (valid? bundle)
+      (throw (ex-info "murakumo-cd: invalid release bundle"
+                      {:reason :invalid-release-bundle})))
+    bundle))
+
+(defn cid [bundle]
+  (blob/cid (canonical/encode-bytes bundle)))
+
+(defn store [db bundle]
+  (when-not (valid? bundle)
+    (throw (ex-info "murakumo-cd: invalid release bundle"
+                    {:reason :invalid-release-bundle})))
+  (let [bytes (canonical/encode-bytes bundle)
+        [db bundle-cid] (blob/write db bytes)]
+    {:db db :blobs {bundle-cid bytes} :bundle bundle :bundle-cid bundle-cid}))
+
+(defn decode
+  "Decode bytes fetched by CID and verify both content identity and schema."
+  [expected-cid bytes]
+  (when-not (= expected-cid
+               (blob/cid bytes))
+    (throw (ex-info "murakumo-cd: release bundle CID mismatch"
+                    {:reason :bundle-cid-mismatch :expected expected-cid})))
+  (let [bundle (edn/read-string (kbytes/utf8-string ^bytes bytes))]
+    (when-not (valid? bundle)
+      (throw (ex-info "murakumo-cd: invalid release bundle"
+                      {:reason :invalid-release-bundle})))
+    bundle))
+
+(defn load-bundle [fetch-bytes bundle-cid]
+  (if-let [bytes (fetch-bytes bundle-cid)]
+    (decode bundle-cid bytes)
+    (throw (ex-info "murakumo-cd: release bundle unavailable"
+                    {:reason :bundle-unavailable :bundle-cid bundle-cid}))))
+
+(defn- verified-component [fetch-bytes {:keys [path cid]}]
+  (let [bytes (fetch-bytes cid)]
+    (when-not bytes
+      (throw (ex-info "murakumo-cd: component unavailable"
+                      {:reason :component-unavailable :cid cid :path path})))
+    (when-not (= cid (blob/cid bytes))
+      (throw (ex-info "murakumo-cd: component CID mismatch"
+                      {:reason :component-cid-mismatch :cid cid :path path})))
+    [path bytes]))
+
+(defn materialize!
+  "Verify every component and atomically publish an immutable release directory.
+   Returns paths used by the concrete Kotoba activation adapter."
+  [fetch-bytes releases-root bundle-cid bundle]
+  (when-not (= bundle-cid (cid bundle))
+    (throw (ex-info "murakumo-cd: bundle document does not match requested CID"
+                    {:reason :bundle-cid-mismatch})))
+  (let [revision (:cd.bundle/revision bundle)]
+    (when-not (safe-relative-path? revision)
+      (throw (ex-info "murakumo-cd: unsafe release revision"
+                      {:reason :unsafe-revision :revision revision})))
+    (let [root (.toPath (io/file releases-root))
+          target (.resolve root revision)
+          marker (.resolve target "bundle.cid")]
+      (Files/createDirectories root (make-array java.nio.file.attribute.FileAttribute 0))
+      (if (Files/isDirectory target (make-array LinkOption 0))
+        (if (= bundle-cid (str/trim (slurp (.toFile marker))))
+          {:release-dir (str target) :manifest-path (str (.resolve target "kotoba.app.edn"))
+           :bundle-cid bundle-cid :reused? true}
+          (throw (ex-info "murakumo-cd: immutable revision already has another bundle"
+                          {:reason :revision-collision :revision revision})))
+        (let [tmp (Files/createTempDirectory root ".release-"
+                                             (make-array java.nio.file.attribute.FileAttribute 0))]
+          (try
+            (doseq [[path bytes] (map #(verified-component fetch-bytes %)
+                                      (:cd.bundle/components bundle))]
+              (let [dest (.normalize (.resolve tmp path))]
+                (when-not (.startsWith dest tmp)
+                  (throw (ex-info "murakumo-cd: component escaped release directory"
+                                  {:reason :unsafe-component-path :path path})))
+                (Files/createDirectories (.getParent dest)
+                                         (make-array java.nio.file.attribute.FileAttribute 0))
+                (Files/write dest bytes (make-array java.nio.file.OpenOption 0))))
+            (Files/write (.resolve tmp "kotoba.app.edn")
+                         (kbytes/utf8-bytes (:cd.bundle/manifest bundle))
+                         (make-array java.nio.file.OpenOption 0))
+            (Files/write (.resolve tmp "bundle.cid")
+                         (kbytes/utf8-bytes (str bundle-cid "\n"))
+                         (make-array java.nio.file.OpenOption 0))
+            (durable-file/move! tmp target)
+            {:release-dir (str target) :manifest-path (str (.resolve target "kotoba.app.edn"))
+             :bundle-cid bundle-cid :reused? false}
+            (finally (durable-file/delete-tree! tmp))))))))

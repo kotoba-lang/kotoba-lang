@@ -1,0 +1,678 @@
+(ns kotoba.native.document
+  "Native `:document` values (gap 2 of the selfhost foundation, superproject
+  adr-2609242330), for BOTH native ISAs from one source.
+
+  ## Representation
+
+  A native document is the one-word string handle it has always been here:
+  the document's CANONICAL EDN text, exactly what `document-edn-print`
+  answers on the reference (osaho `kotoba.kir.value/document-edn-print`):
+  `nil`, `true` / `false`, a decimal i64, an escaped string, a keyword's or
+  symbol's text, and `[a b]` / `(a b)` / `#{a b}` / `{k v k v}` with one space
+  between forms, set items and map keys in canonical order. That is what the
+  dataspace provider already exchanged with the host, so this adds no ABI, no
+  context slot and no loader code: every operation below is a rewrite onto
+  the string slots native already has (`string-code-point-at`,
+  `string-find-byte`, `string-append-range`, `string-compare`, ...) plus the
+  private helper functions appended by `augment-functions`. Every decision --
+  scanning, ordering, bounds -- is emitted Kotoba machine code.
+
+  Canonical text makes structural equality `string=?`: two documents are
+  equal exactly when their canonical texts are.
+
+  ## Order
+
+  Map keys that are both keywords compare by their text, set items and every
+  other key pair by `document-compare`'s canonical bytes
+  (`kotoba.kir.value/document-canonical-bytes`), which `kotoba$doc-canon`
+  re-derives from the text. Native compares in UTF-8 byte order
+  (`string-compare`); the reference compares keyword keys as host strings, so
+  the two can disagree only between a supplementary-plane character and one in
+  U+E000..U+FFFF.
+
+  ## Bounds
+
+  The reference's document bounds are re-derived here and trap through the
+  existing out-of-range `vector-at` path when exceeded: 32 items per
+  container, depth 8, 4096 nodes (a keyword map key consumes no node, as on
+  the reference). A string value, and so a document's text, is bounded by the
+  native string limit and the string pool budget (`:budget/bytes`); the
+  reference bounds the document's payload text only, so a document whose
+  payload is near 64 KiB can trap here first.
+
+  ## Not here (refused by name before this lowering)
+
+  `document-f64` / `document-f64-value` (native has no f64 text),
+  `document-sha256`, `document-print` / `document-read` (canonical bytes as
+  hex). `document-edn-read` stays the identity it was: its input must already
+  be canonical text (what a native document, or the dataspace provider,
+  hands it)."
+  {:kotoba/export [operations lower augment-functions helper-names]})
+
+;; ── the helper vocabulary ────────────────────────────────────────────────────
+
+(def ^:private trap
+  ;; An out-of-range read of an empty vector: the native trap path
+  ;; `kotoba.native.string-index` already uses for a rejected insertion.
+  '(vector-at (vector-new) 0))
+
+(defn- h [name params types result body]
+  {:name name :params params :param-types types :result result :body body})
+
+(def ^:private helpers
+  [;; byte width of a code point
+   (h 'kotoba$doc-width '[c] [:i64] :i64
+      '(if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
+   (h 'kotoba$doc-closer? '[c] [:i64] :bool
+      '(if (= c 93) true (if (= c 41) true (= c 125))))
+   (h 'kotoba$doc-trap '[] [] :i64 trap)
+
+   ;; ── scanning ──
+   (h 'kotoba$doc-token-end '[s i] [:string :i64] :i64
+      '(if (>= i (string-byte-length s))
+         i
+         (let [c (string-code-point-at s i)]
+           (if (= c 32) i
+               (if (kotoba$doc-closer? c) i
+                   (kotoba$doc-token-end s (+ i (kotoba$doc-width c))))))))
+   (h 'kotoba$doc-string-end '[s i] [:string :i64] :i64
+      '(let [q (string-find-byte s 34 i)
+             b (string-find-byte s 92 i)]
+         (if (< b 0) (+ q 1)
+             (if (< b q) (kotoba$doc-string-end s (+ b 2)) (+ q 1)))))
+   (h 'kotoba$doc-seq-end '[s i] [:string :i64] :i64
+      '(let [c (string-code-point-at s i)]
+         (if (= c 32) (kotoba$doc-seq-end s (+ i 1))
+             (if (kotoba$doc-closer? c) (+ i 1)
+                 (kotoba$doc-seq-end s (kotoba$doc-end s i))))))
+   (h 'kotoba$doc-end '[s i] [:string :i64] :i64
+      '(let [c (string-code-point-at s i)]
+         (if (= c 34) (kotoba$doc-string-end s (+ i 1))
+             (if (= c 91) (kotoba$doc-seq-end s (+ i 1))
+                 (if (= c 40) (kotoba$doc-seq-end s (+ i 1))
+                     (if (= c 123) (kotoba$doc-seq-end s (+ i 1))
+                         (if (= c 35) (kotoba$doc-seq-end s (+ i 2))
+                             (kotoba$doc-token-end s i))))))))
+   (h 'kotoba$doc-open '[d] [:string] :i64
+      '(if (= (string-code-point-at d 0) 35) 2 1))
+   ;; offset of item K at or after I, or -1 when the container closes first
+   (h 'kotoba$doc-item '[d i k] [:string :i64 :i64] :i64
+      '(let [c (string-code-point-at d i)]
+         (if (= c 32) (kotoba$doc-item d (+ i 1) k)
+             (if (kotoba$doc-closer? c) -1
+                 (if (= k 0) i (kotoba$doc-item d (kotoba$doc-end d i) (- k 1)))))))
+   ;; offset of the container's closing bracket
+   (h 'kotoba$doc-close '[d] [:string] :i64
+      '(- (string-byte-length d) 1))
+   (h 'kotoba$doc-count-from '[d i n] [:string :i64 :i64] :i64
+      '(let [c (string-code-point-at d i)]
+         (if (= c 32) (kotoba$doc-count-from d (+ i 1) n)
+             (if (kotoba$doc-closer? c) n
+                 (kotoba$doc-count-from d (kotoba$doc-end d i) (+ n 1))))))
+   (h 'kotoba$doc-forms '[d] [:string] :i64
+      '(kotoba$doc-count-from d (kotoba$doc-open d) 0))
+
+   ;; ── region comparison, without allocating a view ──
+   ;; s[i,j) against all of t from k
+   (h 'kotoba$doc-region=? '[s i j t k] [:string :i64 :i64 :string :i64] :bool
+      '(if (= i j) (= k (string-byte-length t))
+           (if (>= k (string-byte-length t)) false
+               (let [c (string-code-point-at s i)]
+                 (if (= c (string-code-point-at t k))
+                   (kotoba$doc-region=? s (+ i (kotoba$doc-width c)) j t
+                                        (+ k (kotoba$doc-width c)))
+                   false)))))
+
+;; ── number tokens (osaho document-edn-read's two patterns), over t[i, e) ──
+   (h 'kotoba$doc-digit? '[c] [:i64] :bool '(if (< c 48) false (< c 58)))
+   (h 'kotoba$doc-at '[t i e] [:string :i64 :i64] :i64
+      '(if (>= i e) -1 (string-code-point-at t i)))
+   (h 'kotoba$doc-digits-end '[t i e] [:string :i64 :i64] :i64
+      '(if (>= i e) i
+           (if (kotoba$doc-digit? (string-code-point-at t i))
+             (kotoba$doc-digits-end t (+ i 1) e) i)))
+   ;; an optional exponent at I: its end, I when absent, -1 when malformed
+   (h 'kotoba$doc-exp-end '[t i e] [:string :i64 :i64] :i64
+      '(let [c (kotoba$doc-at t i e)]
+         (if (if (= c 101) true (= c 69))
+           (let [s (kotoba$doc-at t (+ i 1) e)
+                 j (if (if (= s 43) true (= s 45)) (+ i 2) (+ i 1))
+                 k (kotoba$doc-digits-end t j e)]
+             (if (> k j) k -1))
+           i)))
+   ;; 2 for an i64 token, 3 for an f64 token, 0 otherwise
+   (h 'kotoba$doc-number-kind '[t i e] [:string :i64 :i64] :i64
+      '(let [c0 (kotoba$doc-at t i e)
+             i0 (if (if (= c0 43) true (= c0 45)) (+ i 1) i)
+             d1 (kotoba$doc-digits-end t i0 e)]
+         (if (= d1 e)
+           (if (> d1 i0) 2 0)
+           (let [c (string-code-point-at t d1)]
+             (if (= c 46)
+               (let [d2 (kotoba$doc-digits-end t (+ d1 1) e)]
+                 (if (if (= d1 i0) (= d2 (+ d1 1)) false)
+                   0
+                   (if (= (kotoba$doc-exp-end t d2 e) e) 3 0)))
+               (if (if (= c 101) true (= c 69))
+                 (if (= d1 i0) 0
+                     (let [x (kotoba$doc-exp-end t d1 e)]
+                       (if (< x 0) 0
+                           (if (= (kotoba$doc-exp-end t x e) e) 3 0))))
+                 0))))))
+   ;; the kind of the form d[i, e):
+   ;; 0 null 1 bool 2 i64 3 f64 4 string 5 keyword 6 symbol
+   ;; 7 vector 8 list 9 set 10 map
+   (h 'kotoba$doc-kind-at '[d i e] [:string :i64 :i64] :i64
+      '(let [c (string-code-point-at d i)]
+         (if (= c 34) 4
+             (if (= c 58) 5
+                 (if (= c 91) 7
+                     (if (= c 40) 8
+                         (if (= c 35) 9
+                             (if (= c 123) 10
+                                 (if (kotoba$doc-region=? d i e "nil" 0) 0
+                                     (if (kotoba$doc-region=? d i e "true" 0) 1
+                                         (if (kotoba$doc-region=? d i e "false" 0) 1
+                                             (let [k (kotoba$doc-number-kind d i e)]
+                                               (if (= k 0) 6 k)))))))))))))
+   (h 'kotoba$doc-kind '[d] [:string] :i64
+      '(kotoba$doc-kind-at d 0 (string-byte-length d)))
+   (h 'kotoba$doc-require '[d lo hi] [:string :i64 :i64] :string
+      '(let [k (kotoba$doc-kind d)]
+         (if (< k lo) (kotoba$doc-trap) (if (> k hi) (kotoba$doc-trap) d))))
+
+   ;; ── decimal text ──
+   ;; digits of -M (M <= 0) appended to ACC
+   (h 'kotoba$doc-dec-neg '[acc m] [:string :i64] :string
+      '(let [q (quot m 10)
+             d (- 0 (- m (* q 10)))]
+         (string-append-range (if (= q 0) acc (kotoba$doc-dec-neg acc q))
+                              "0123456789" d (+ d 1))))
+   (h 'kotoba$doc-dec '[n] [:i64] :string
+      '(if (< n 0) (kotoba$doc-dec-neg "-" n) (kotoba$doc-dec-neg "" (- 0 n))))
+   ;; an i64 token's value; accumulated negative so the minimum reads back
+   (h 'kotoba$doc-parse-neg '[t i acc] [:string :i64 :i64] :i64
+      '(if (>= i (string-byte-length t)) acc
+           (kotoba$doc-parse-neg t (+ i 1)
+                                 (- (* acc 10) (- (string-code-point-at t i) 48)))))
+   (h 'kotoba$doc-parse-i64 '[t] [:string] :i64
+      '(let [c (string-code-point-at t 0)]
+         (if (= c 45) (kotoba$doc-parse-neg t 1 0)
+             (- 0 (kotoba$doc-parse-neg t (if (= c 43) 1 0) 0)))))
+
+   ;; ── strings ──
+   (h 'kotoba$doc-plain? '[c] [:i64] :bool
+      '(if (< c 32) false (if (= c 34) false (bool-not (= c 92)))))
+   (h 'kotoba$doc-plain-end '[s i] [:string :i64] :i64
+      '(if (>= i (string-byte-length s)) i
+           (let [c (string-code-point-at s i)]
+             (if (kotoba$doc-plain? c)
+               (kotoba$doc-plain-end s (+ i (kotoba$doc-width c))) i))))
+   (h 'kotoba$doc-escape-char '[acc c] [:string :i64] :string
+      '(if (= c 34) (string-concat acc "\\\"")
+           (if (= c 92) (string-concat acc "\\\\")
+               (if (= c 8) (string-concat acc "\\b")
+                   (if (= c 9) (string-concat acc "\\t")
+                       (if (= c 10) (string-concat acc "\\n")
+                           (if (= c 12) (string-concat acc "\\f")
+                               (if (= c 13) (string-concat acc "\\r")
+                                   (string-append-range
+                                    (string-append-range (string-concat acc "\\u00")
+                                                         "0123456789abcdef" (quot c 16) (+ (quot c 16) 1))
+                                    "0123456789abcdef" (- c (* (quot c 16) 16))
+                                    (+ (- c (* (quot c 16) 16)) 1))))))))))
+   (h 'kotoba$doc-escape-from '[acc s i] [:string :string :i64] :string
+      '(let [j (kotoba$doc-plain-end s i)
+             acc (string-append-range acc s i j)]
+         (if (>= j (string-byte-length s))
+           (string-concat acc "\"")
+           (kotoba$doc-escape-from (kotoba$doc-escape-char acc (string-code-point-at s j))
+                                   s (+ j 1)))))
+   (h 'kotoba$doc-escape '[s] [:string] :string
+      '(kotoba$doc-escape-from "\"" s 0))
+   (h 'kotoba$doc-hex '[c] [:i64] :i64
+      '(if (< c 58) (- c 48) (if (< c 71) (- c 55) (- c 87))))
+   ;; the text of T's quoted string [I, END) with its escapes undone
+   (h 'kotoba$doc-unescape-from '[acc t i end] [:string :string :i64 :i64] :string
+      '(let [b (string-find-byte t 92 i)]
+         (if (if (< b 0) true (>= b end))
+           (string-append-range acc t i end)
+           (let [acc (string-append-range acc t i b)
+                 e (string-code-point-at t (+ b 1))]
+             (if (= e 117)
+               (let [u (+ (* 16 (kotoba$doc-hex (string-code-point-at t (+ b 4))))
+                          (kotoba$doc-hex (string-code-point-at t (+ b 5))))]
+                 (if (if (= (string-code-point-at t (+ b 2)) 48)
+                       (if (= (string-code-point-at t (+ b 3)) 48) (< u 32) false)
+                       false)
+                   (kotoba$doc-unescape-from
+                    (string-append-range acc kotoba$doc-control u (+ u 1)) t (+ b 6) end)
+                   (kotoba$doc-trap)))
+               (kotoba$doc-unescape-from
+                (string-concat acc
+                               (if (= e 110) "\n"
+                                   (if (= e 116) "\t"
+                                       (if (= e 98) "\b"
+                                           (if (= e 102) "\f"
+                                               (if (= e 114) "\r"
+                                                   (if (= e 34) "\"" "\\")))))))
+                t (+ b 2) end))))))
+   (h 'kotoba$doc-unescape '[t] [:string] :string
+      '(kotoba$doc-unescape-from "" t 1 (- (string-byte-length t) 1)))
+
+   ;; ── symbols: refuse a text that would read back as something else ──
+   (h 'kotoba$doc-symbol-char-ok? '[c] [:i64] :bool
+      ;; not whitespace, not , [ ] { } ( ) \" ' ; ` ~ ^ \\
+      '(if (<= c 32) false
+           (if (= c 44) false (if (= c 91) false (if (= c 93) false
+           (if (= c 123) false (if (= c 125) false (if (= c 40) false (if (= c 41) false
+           (if (= c 34) false (if (= c 39) false (if (= c 59) false (if (= c 96) false
+           (if (= c 126) false (if (= c 94) false (bool-not (= c 92)))))))))))))))))
+   (h 'kotoba$doc-symbol-chars-ok? '[s i] [:string :i64] :bool
+      '(if (>= i (string-byte-length s)) true
+           (let [c (string-code-point-at s i)]
+             (if (kotoba$doc-symbol-char-ok? c)
+               (kotoba$doc-symbol-chars-ok? s (+ i (kotoba$doc-width c)))
+               false))))
+   (h 'kotoba$doc-symbol '[s] [:string] :string
+      '(if (= (string-byte-length s) 0) (kotoba$doc-trap)
+           (if (kotoba$doc-symbol-chars-ok? s 0)
+             (let [c (string-code-point-at s 0)]
+               (if (= c 58) (kotoba$doc-trap)
+                   (if (= c 35) (kotoba$doc-trap)
+                       (if (string=? s "nil") (kotoba$doc-trap)
+                           (if (string=? s "true") (kotoba$doc-trap)
+                               (if (string=? s "false") (kotoba$doc-trap)
+                                   (if (= (kotoba$doc-number-kind s 0 (string-byte-length s)) 0) s (kotoba$doc-trap))))))))
+             (kotoba$doc-trap))))
+
+   ;; ── bounds: depth (levels) and nodes, as the reference counts them ──
+   (h 'kotoba$doc-max '[a b] [:i64 :i64] :i64 '(if (> a b) a b))
+   (h 'kotoba$doc-keyword-at? '[d i] [:string :i64] :bool
+      '(= (string-code-point-at d i) 58))
+   ;; levels below offset I (the items of a container) -- M is the running max
+(h 'kotoba$doc-depth-items '[d i m map? key?] [:string :i64 :i64 :bool :bool] :i64
+      '(let [c (string-code-point-at d i)]
+         (if (= c 32) (kotoba$doc-depth-items d (+ i 1) m map? key?)
+             (if (kotoba$doc-closer? c) m
+                 (let [here (if (if key? (kotoba$doc-keyword-at? d i) false)
+                              0
+                              (kotoba$doc-depth-at d i))]
+                   (kotoba$doc-depth-items d (kotoba$doc-end d i) (kotoba$doc-max m here) map?
+                                           (if map? (bool-not key?) false)))))))
+   ;; levels of the form at I (a scalar is one)
+   (h 'kotoba$doc-depth-at '[d i] [:string :i64] :i64
+      '(let [k (kotoba$doc-kind-at d i (kotoba$doc-end d i))]
+         (if (< k 7) 1
+             (+ 1 (kotoba$doc-depth-items d (+ i (if (= k 9) 2 1)) 0 (= k 10) (= k 10))))))
+   (h 'kotoba$doc-nodes-items '[d i n map? key?] [:string :i64 :i64 :bool :bool] :i64
+      '(let [c (string-code-point-at d i)]
+         (if (= c 32) (kotoba$doc-nodes-items d (+ i 1) n map? key?)
+             (if (kotoba$doc-closer? c) n
+                 (let [here (if (if key? (kotoba$doc-keyword-at? d i) false)
+                              0
+                              (kotoba$doc-nodes-at d i))]
+                   (kotoba$doc-nodes-items d (kotoba$doc-end d i) (+ n here) map?
+                                           (if map? (bool-not key?) false)))))))
+   (h 'kotoba$doc-nodes-at '[d i] [:string :i64] :i64
+      '(let [k (kotoba$doc-kind-at d i (kotoba$doc-end d i))]
+         (if (< k 7) 1
+             (+ 1 (kotoba$doc-nodes-items d (+ i (if (= k 9) 2 1)) 0 (= k 10) (= k 10))))))
+   ;; D itself when it is within the reference's bounds, else a trap
+   (h 'kotoba$doc-bounded '[d] [:string] :string
+      '(let [k (kotoba$doc-kind d)]
+         (if (< k 7) d
+             (if (> (if (= k 10) (quot (kotoba$doc-forms d) 2) (kotoba$doc-forms d)) 32)
+               (kotoba$doc-trap)
+               (if (> (kotoba$doc-depth-at d 0) 9)
+                 (kotoba$doc-trap)
+                 (if (> (kotoba$doc-nodes-at d 0) 4096) (kotoba$doc-trap) d))))))
+
+   ;; ── canonical bytes (document-compare's order) ──
+   (h 'kotoba$doc-len-text '[acc tag s] [:string :string :string] :string
+      '(string-concat (string-concat (string-concat (string-concat acc tag)
+                                                    (kotoba$doc-dec (string-byte-length s)))
+                                     ":")
+                      s))
+   (h 'kotoba$doc-len-range '[acc tag d i e] [:string :string :string :i64 :i64] :string
+      '(string-append-range (string-concat (string-concat (string-concat acc tag)
+                                                          (kotoba$doc-dec (- e i)))
+                                           ":")
+                            d i e))
+   (h 'kotoba$doc-canon-items '[acc d i map? key?] [:string :string :i64 :bool :bool] :string
+      '(let [c (string-code-point-at d i)]
+         (if (= c 32) (kotoba$doc-canon-items acc d (+ i 1) map? key?)
+             (if (kotoba$doc-closer? c) acc
+                 (let [e (kotoba$doc-end d i)
+                       acc (if key?
+                             (if (kotoba$doc-keyword-at? d i)
+                               (kotoba$doc-len-range acc "K" d i e)
+                               (kotoba$doc-canon-at (string-concat acc "D") d i))
+                             (kotoba$doc-canon-at acc d i))]
+                   (kotoba$doc-canon-items acc d e map? (if map? (bool-not key?) false)))))))
+   ;; ACC followed by the canonical bytes of the form at I
+   (h 'kotoba$doc-canon-at '[acc d i] [:string :string :i64] :string
+      '(let [e (kotoba$doc-end d i)
+             k (kotoba$doc-kind-at d i e)]
+         (if (= k 0) (string-concat acc "n")
+             (if (= k 1) (string-concat acc (if (kotoba$doc-region=? d i e "true" 0) "bt" "bf"))
+                 (if (= k 2) (string-concat (string-append-range (string-concat acc "i") d i e) ";")
+                     (if (= k 3) (kotoba$doc-trap)
+                         (if (= k 4) (kotoba$doc-len-text acc "s"
+                                                          (kotoba$doc-unescape-from "" d (+ i 1) (- e 1)))
+                             (if (= k 5) (kotoba$doc-len-range acc "k" d i e)
+                                 (if (= k 6) (kotoba$doc-len-range acc "y" d i e)
+                                     (let [open (+ i (if (= k 9) 2 1))
+                                           forms (kotoba$doc-count-from d open 0)
+                                           head (string-concat
+                                                 (string-concat
+                                                  (string-concat acc
+                                                                 (if (= k 7) "v" (if (= k 8) "l"
+                                                                                  (if (= k 9) "e" "m"))))
+                                                  (kotoba$doc-dec (if (= k 10) (quot forms 2) forms)))
+                                                 ":")]
+                                       (kotoba$doc-canon-items head d open (= k 10) (= k 10))))))))))))
+   (h 'kotoba$doc-canon '[d] [:string] :string '(kotoba$doc-canon-at "" d 0))
+   (h 'kotoba$doc-compare '[a b] [:string :string] :i64
+      '(string-compare (kotoba$doc-canon a) (kotoba$doc-canon b)))
+   ;; a[i, j) against b[k, l) in code point (= UTF-8 byte) order
+   (h 'kotoba$doc-region-compare '[a i j b k l] [:string :i64 :i64 :string :i64 :i64] :i64
+      '(if (= i j) (if (= k l) 0 -1)
+           (if (= k l) 1
+               (let [x (string-code-point-at a i)
+                     y (string-code-point-at b k)]
+                 (if (< x y) -1
+                     (if (> x y) 1
+                         (kotoba$doc-region-compare a (+ i (kotoba$doc-width x)) j
+                                                    b (+ k (kotoba$doc-width y)) l)))))))
+   ;; KEY against the key m[i, e) in map-key order: two keywords by their
+   ;; text, anything else by canonical bytes
+   (h 'kotoba$doc-key-compare-at '[key m i e] [:string :string :i64 :i64] :i64
+      '(if (if (= (string-code-point-at key 0) 58) (kotoba$doc-keyword-at? m i) false)
+         (kotoba$doc-region-compare key 0 (string-byte-length key) m i e)
+         (string-compare (kotoba$doc-canon key) (kotoba$doc-canon-at "" m i))))
+
+   ;; ── maps ──
+   ;; offset of the entry whose key is KEY, or -1
+   (h 'kotoba$doc-map-find '[m key i] [:string :string :i64] :i64
+      '(let [c (string-code-point-at m i)]
+         (if (= c 32) (kotoba$doc-map-find m key (+ i 1))
+             (if (kotoba$doc-closer? c) -1
+                 (let [ke (kotoba$doc-end m i)]
+                   (if (kotoba$doc-region=? m i ke key 0) i
+                       (kotoba$doc-map-find m key (kotoba$doc-end m (+ ke 1)))))))))
+   ;; offset of the first entry whose key sorts after KEY (or the closing
+   ;; brace); traps on an equal key when UNIQUE?
+   (h 'kotoba$doc-map-slot '[m key i unique?] [:string :string :i64 :bool] :i64
+      '(let [c (string-code-point-at m i)]
+         (if (= c 32) (kotoba$doc-map-slot m key (+ i 1) unique?)
+             (if (kotoba$doc-closer? c) i
+                 (let [ke (kotoba$doc-end m i)
+                       order (kotoba$doc-key-compare-at key m i ke)]
+                   (if (< order 0) i
+                       (if (if unique? (= order 0) false) (kotoba$doc-trap)
+                           (kotoba$doc-map-slot m key (kotoba$doc-end m (+ ke 1)) unique?))))))))
+   ;; M with KEY VALUE inserted at slot Q
+   (h 'kotoba$doc-insert-at '[m q entry] [:string :i64 :string] :string
+      '(if (= q (kotoba$doc-close m))
+         (if (= q (kotoba$doc-open m))
+           (string-concat (string-append-range "" m 0 q)
+                          (string-concat entry (string-substring m q (string-byte-length m))))
+           (string-concat (string-concat (string-append-range "" m 0 q) " ")
+                          (string-concat entry (string-substring m q (string-byte-length m)))))
+         (string-concat (string-append-range "" m 0 q)
+                        (string-concat (string-concat entry " ")
+                                       (string-substring m q (string-byte-length m))))))
+   (h 'kotoba$doc-map-put '[m key value unique?] [:string :string :string :bool] :string
+      '(kotoba$doc-bounded
+        (kotoba$doc-insert-at m (kotoba$doc-map-slot m key 1 unique?)
+                              (string-concat (string-concat key " ") value))))
+   (h 'kotoba$doc-assoc '[m key value] [:string :string :string] :string
+      '(let [p (kotoba$doc-map-find m key 1)]
+         (if (< p 0)
+           (kotoba$doc-map-put m key value false)
+           (let [vs (+ (kotoba$doc-end m p) 1)
+                 ve (kotoba$doc-end m vs)]
+             (kotoba$doc-bounded
+              (string-concat (string-append-range "" m 0 vs)
+                             (string-concat value (string-substring m ve (string-byte-length m)))))))))
+   ;; D with the forms [P, E) removed, together with one separating space
+   (h 'kotoba$doc-cut '[d p e] [:string :i64 :i64] :string
+      '(if (= (string-code-point-at d e) 32)
+         (string-append-range (string-append-range "" d 0 p) d (+ e 1) (string-byte-length d))
+         (if (= (string-code-point-at d (- p 1)) 32)
+           (string-append-range (string-append-range "" d 0 (- p 1)) d e (string-byte-length d))
+           (string-append-range (string-append-range "" d 0 p) d e (string-byte-length d)))))
+   (h 'kotoba$doc-dissoc '[m key] [:string :string] :string
+      '(let [p (kotoba$doc-map-find m key 1)]
+         (if (< p 0) m
+             (kotoba$doc-cut m p (kotoba$doc-end m (+ (kotoba$doc-end m p) 1))))))
+   (h 'kotoba$doc-get '[m key] [:string :string] [:option :document]
+      '(let [p (kotoba$doc-map-find m key 1)]
+         (if (< p 0) (option-none-of [:option :document])
+             (let [vs (+ (kotoba$doc-end m p) 1)]
+               (option-some-of [:option :document]
+                               (string-substring m vs (kotoba$doc-end m vs)))))))
+   (h 'kotoba$doc-merge-from '[acc m i] [:string :string :i64] :string
+      '(let [c (string-code-point-at m i)]
+         (if (= c 32) (kotoba$doc-merge-from acc m (+ i 1))
+             (if (kotoba$doc-closer? c) acc
+                 (let [ke (kotoba$doc-end m i)
+                       ve (kotoba$doc-end m (+ ke 1))]
+                   (kotoba$doc-merge-from
+                    (kotoba$doc-assoc acc (string-substring m i ke)
+                                      (string-substring m (+ ke 1) ve))
+                    m ve))))))
+   (h 'kotoba$doc-merge '[a b] [:string :string] :string
+      '(kotoba$doc-merge-from a b 1))
+   (h 'kotoba$doc-entry-at '[m i] [:string :i64] [:option :document]
+      '(if (< i 0) (option-none-of [:option :document])
+           (let [p (kotoba$doc-item m 1 (* 2 i))]
+             (if (< p 0) (option-none-of [:option :document])
+                 (let [ke (kotoba$doc-end m p)]
+                   (option-some-of [:option :document]
+                                   (string-concat
+                                    (string-concat "[" (string-substring m p (kotoba$doc-end m (+ ke 1))))
+                                    "]")))))))
+
+   ;; ── vectors, lists, sets ──
+   (h 'kotoba$doc-nth '[d i] [:string :i64] [:option :document]
+      '(if (< i 0) (option-none-of [:option :document])
+           (let [p (kotoba$doc-item d (kotoba$doc-open d) i)]
+             (if (< p 0) (option-none-of [:option :document])
+                 (option-some-of [:option :document]
+                                 (string-substring d p (kotoba$doc-end d p)))))))
+   (h 'kotoba$doc-conj '[v x] [:string :string] :string
+      '(kotoba$doc-bounded (kotoba$doc-insert-at v (kotoba$doc-close v) x)))
+   (h 'kotoba$doc-vector-assoc '[v i x] [:string :i64 :string] :string
+      '(let [p (if (< i 0) -1 (kotoba$doc-item v 1 i))]
+         (if (< p 0) (kotoba$doc-trap)
+             (kotoba$doc-bounded
+              (string-concat (string-append-range "" v 0 p)
+                             (string-concat x (string-substring v (kotoba$doc-end v p)
+                                                                (string-byte-length v))))))))
+   (h 'kotoba$doc-vector-remove '[v i] [:string :i64] :string
+      '(let [p (if (< i 0) -1 (kotoba$doc-item v 1 i))]
+         (if (< p 0) (kotoba$doc-trap)
+             (kotoba$doc-cut v p (kotoba$doc-end v p)))))
+   (h 'kotoba$doc-vector-drop '[v n] [:string :i64] :string
+      '(if (< n 0) (kotoba$doc-trap)
+           (if (> n (kotoba$doc-forms v)) (kotoba$doc-trap)
+               (if (= n 0) v
+                   (let [p (kotoba$doc-item v 1 n)]
+                     (if (< p 0) "[]"
+                         (string-append-range "[" v p (string-byte-length v))))))))
+   (h 'kotoba$doc-set-contains '[s x i] [:string :string :i64] :bool
+      '(let [c (string-code-point-at s i)]
+         (if (= c 32) (kotoba$doc-set-contains s x (+ i 1))
+             (if (kotoba$doc-closer? c) false
+                 (let [e (kotoba$doc-end s i)]
+                   (if (kotoba$doc-region=? s i e x 0) true
+                       (kotoba$doc-set-contains s x e)))))))
+   ;; offset of the first item that sorts after X; traps on an equal one when
+   ;; UNIQUE? (a set), keeps order among equals otherwise (a sort)
+   (h 'kotoba$doc-item-slot '[s cx i unique?] [:string :string :i64 :bool] :i64
+      '(let [c (string-code-point-at s i)]
+         (if (= c 32) (kotoba$doc-item-slot s cx (+ i 1) unique?)
+             (if (kotoba$doc-closer? c) i
+                 (let [order (string-compare cx (kotoba$doc-canon-at "" s i))]
+                   (if (< order 0) i
+                       (if (if unique? (= order 0) false) (kotoba$doc-trap)
+                           (kotoba$doc-item-slot s cx (kotoba$doc-end s i) unique?))))))))
+   (h 'kotoba$doc-set-put '[s x] [:string :string] :string
+      '(kotoba$doc-bounded
+        (kotoba$doc-insert-at s (kotoba$doc-item-slot s (kotoba$doc-canon x) 2 true) x)))
+   (h 'kotoba$doc-sort-from '[acc v i] [:string :string :i64] :string
+      '(let [c (string-code-point-at v i)]
+         (if (= c 32) (kotoba$doc-sort-from acc v (+ i 1))
+             (if (kotoba$doc-closer? c) acc
+                 (let [e (kotoba$doc-end v i)
+                       x (string-substring v i e)]
+                   (kotoba$doc-sort-from
+                    (kotoba$doc-insert-at acc (kotoba$doc-item-slot acc (kotoba$doc-canon x) 1 false) x)
+                    v e))))))
+   (h 'kotoba$doc-vector-sort '[v] [:string] :string
+      '(kotoba$doc-sort-from "[]" v 1))])
+
+(def helper-names (set (map :name helpers)))
+
+;; The control characters 0..31, one byte each: what a `\u00XX` escape in a
+;; canonical string reads back as.
+(def ^:private control-text
+  (apply str (map char (range 32))))
+
+(def ^:private control-binding 'kotoba$doc-control)
+
+;; ── the surface operations ──────────────────────────────────────────────────
+
+(def operations
+  "The document operations this lowering answers. Refused before it (by the
+  native gate): document-f64, document-f64-value, document-sha256,
+  document-print, document-read."
+  '#{document-null document-bool document-i64 document-string document-keyword
+     document-symbol document-vector document-list document-set document-map
+     document-count document-kind document-equal? document-set-contains?
+     document-contains document-get document-vector-at document-list-at
+     document-map-entry-at document-vector-assoc document-vector-conj
+     document-vector-drop document-vector-remove document-vector-sort
+     document-assoc document-dissoc document-merge document-string-value
+     document-keyword-value document-symbol-value document-bool-value
+     document-i64-value document-edn-print document-edn-read})
+
+(def ^:private kind-keywords
+  [:null :bool :i64 :f64 :string :keyword :symbol :vector :list :set :map])
+
+(defn- require-kind [form lo hi]
+  (list 'kotoba$doc-require form lo hi))
+
+(defn- joined [open items close]
+  (if (empty? items)
+    (str open close)
+    (reduce (fn [acc item] (list 'string-concat acc item))
+            (list 'string-concat open (first items))
+            (concat (mapcat (fn [item] [" " item]) (rest items)) [close]))))
+
+(defn- value-of [kind form payload]
+  (let [d (gensym "document__")]
+    (list 'let [d form]
+          (list 'if (list '= (list 'kotoba$doc-kind d) kind)
+                (list 'option-some-of [:option (nth kind-keywords kind)] (payload d))
+                (list 'option-none-of [:option (nth kind-keywords kind)])))))
+
+(defn lower
+  "Rewrite one document operation onto the string slots and the helpers."
+  [op args]
+  (case op
+    document-null "nil"
+    document-bool (list 'if (first args) "true" "false")
+    document-i64 (list 'kotoba$doc-dec (first args))
+    document-string (list 'kotoba$doc-escape (first args))
+    document-keyword (first args)
+    document-symbol (list 'kotoba$doc-symbol (first args))
+    document-vector (if (> (count args) 32) trap (list 'kotoba$doc-bounded (joined "[" args "]")))
+    document-list (if (> (count args) 32) trap (list 'kotoba$doc-bounded (joined "(" args ")")))
+    document-set (if (> (count args) 32) trap
+                     (reduce (fn [acc item] (list 'kotoba$doc-set-put acc item)) "#{}" args))
+    document-map (if (> (count args) 64) trap
+                     (reduce (fn [acc [k v]] (list 'kotoba$doc-map-put acc k v true))
+                             "{}" (partition 2 args)))
+    document-count (let [d (gensym "document__")]
+                     (list 'let [d (require-kind (first args) 7 10)]
+                           (list 'if (list '= (list 'kotoba$doc-kind d) 10)
+                                 (list 'quot (list 'kotoba$doc-forms d) 2)
+                                 (list 'kotoba$doc-forms d))))
+    document-kind (let [k (gensym "kind__")]
+                    (list 'let [k (list 'kotoba$doc-kind (first args))]
+                          (reduce (fn [acc index]
+                                    (list 'if (list '= k index) (nth kind-keywords index) acc))
+                                  :map (range 9 -1 -1))))
+    document-equal? (list 'string=? (first args) (second args))
+    document-set-contains? (list 'kotoba$doc-set-contains
+                                 (require-kind (first args) 9 9) (second args) 2)
+    document-contains (list '>= (list 'kotoba$doc-map-find (require-kind (first args) 10 10)
+                                      (second args) 1)
+                            0)
+    document-get (list 'kotoba$doc-get (require-kind (first args) 10 10) (second args))
+    (document-vector-at) (list 'kotoba$doc-nth (require-kind (first args) 7 7) (second args))
+    (document-list-at) (list 'kotoba$doc-nth (require-kind (first args) 8 8) (second args))
+    document-map-entry-at (list 'kotoba$doc-entry-at (require-kind (first args) 10 10)
+                                (second args))
+    document-vector-assoc (list 'kotoba$doc-vector-assoc (require-kind (first args) 7 7)
+                                (second args) (nth args 2))
+    document-vector-conj (list 'kotoba$doc-conj (require-kind (first args) 7 7) (second args))
+    document-vector-drop (list 'kotoba$doc-vector-drop (require-kind (first args) 7 7)
+                               (second args))
+    document-vector-remove (list 'kotoba$doc-vector-remove (require-kind (first args) 7 7)
+                                 (second args))
+    document-vector-sort (list 'kotoba$doc-vector-sort (require-kind (first args) 7 7))
+    document-assoc (list 'kotoba$doc-assoc (require-kind (first args) 10 10)
+                         (second args) (nth args 2))
+    document-dissoc (list 'kotoba$doc-dissoc (require-kind (first args) 10 10) (second args))
+    document-merge (reduce (fn [acc m] (list 'kotoba$doc-merge acc (require-kind m 10 10)))
+                           (require-kind (first args) 10 10) (rest args))
+    document-string-value (value-of 4 (first args) (fn [d] (list 'kotoba$doc-unescape d)))
+    document-keyword-value (value-of 5 (first args) identity)
+    document-symbol-value (value-of 6 (first args) identity)
+    document-bool-value (value-of 1 (first args) (fn [d] (list 'string=? d "true")))
+    document-i64-value (value-of 2 (first args) (fn [d] (list 'kotoba$doc-parse-i64 d)))
+    ;; Identity at the ABI: the native document IS its canonical EDN text.
+    (document-edn-print document-edn-read) (first args)
+    (throw (ex-info "unknown native document operation" {:phase :native :operation op}))))
+
+(defn- uses? [form]
+  (cond
+    (seq? form) (or (and (contains? operations (first form))
+                         (not (contains? '#{document-edn-print document-edn-read} (first form))))
+                    (boolean (some uses? (rest form))))
+    (vector? form) (boolean (some uses? form))
+    :else false))
+
+(defn- substitute-control
+  "The helpers name the control-character table by a symbol so their bodies
+  stay printable; it becomes the literal here."
+  [form]
+  (cond
+    (= form control-binding) control-text
+    (seq? form) (apply list (map substitute-control form))
+    (vector? form) (mapv substitute-control form)
+    :else form))
+
+(defn augment-functions
+  "FUNCTIONS plus the document helpers, exactly when a body uses a document
+  operation this lowering answers. A program that does not is returned
+  unchanged, so no existing emission moves. Idempotent; a program function
+  with a helper's name and another definition is refused, because the calls
+  this lowering emits would go there instead (as string-index does)."
+  [functions]
+  (if-not (some #(uses? (:body %)) functions)
+    functions
+    (let [declared (into {} (map (juxt :name identity)) functions)
+          wanted (mapv #(update % :body substitute-control) helpers)
+          clashes (filter (fn [helper]
+                            (when-let [existing (get declared (:name helper))]
+                              (not= existing helper)))
+                          wanted)]
+      (when (seq clashes)
+        (throw (ex-info "a program function collides with a native document helper"
+                        {:phase :native :functions (mapv :name clashes)})))
+      (vec (concat functions (remove #(contains? declared (:name %)) wanted))))))

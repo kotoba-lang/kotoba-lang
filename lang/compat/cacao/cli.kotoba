@@ -1,0 +1,135 @@
+;; cacao.cli — identity-primitives CLI (DID / CACAO / seed).
+;;
+;; RENAMED from kotoba.cli: that ns name collided with kotoba-lang/kotoba-lang's
+;; canonical kotoba.cli (contract dispatch) — any project depending on both got
+;; alphabetical-classpath shadowing (cacao src sorts first, silently hiding
+;; cli/dispatch). Identity CLI belongs under cacao's own prefix.
+;;
+;; A tiny, self-sovereign command surface over the kotoba identity stack:
+;;
+;;   kotoba id --address <0x…>           → derive did:pkh:eip155:8453:… (wallet-first).
+;;   kotoba seed                         → mint a fresh raw Ed25519 seed (legacy/internal). SECRET.
+;;   kotoba did    --seed <b64>          → derive the public did:key:z6Mk… from a seed.
+;;   kotoba cacao  --seed <b64> --aud <did> --resource <uri> [--ttl-h N] [--nonce X]
+;;                                       → mint a signed, expiring CACAO capability (base64).
+;;
+;; DESIGN: pure argument handling (parse / validate / usage) is portable .cljc so
+;; it reads & tests the same on any Clojure host. All CRYPTO + IO is JVM-only and
+;; lives behind #?(:clj …): seed randomness (SecureRandom), base64 (java.util.Base64),
+;; the iat/exp instants (java.time), and the actual require of ed25519.core /
+;; cacao.core (both JVM libraries). Runs on babashka — bb has JCA Ed25519 sign/verify,
+;; and ed25519.core derives the public key in pure Clojure, so nothing here needs a
+;; native crypto dep. We DERIVE the issuer DID from the seed and NEVER print the seed
+;; except from the `seed` command (whose whole job is to emit it, with a stderr warning).
+(ns cacao.cli
+  (:require [kotoba.lang.text :as str]
+            )
+  )
+
+;; ── pure argument handling (portable .cljc) ───────────────────────────────────
+
+(def usage
+  (str "kotoba — wallet-first identity / CACAO primitives\n"
+       "\n"
+       "USAGE\n"
+       "  kotoba id    --address <0x-address> [--chain-id <eip155-id>]\n"
+       "  kotoba seed\n"
+       "  kotoba did   --seed <b64>\n"
+       "  kotoba cacao --seed <b64> --aud <did> --resource <uri> [--resource <uri> …]\n"
+       "               [--ttl-h <hours>] [--nonce <str>]\n"
+       "  kotoba cacao --seed <b64> --apex [--op-cap <cap> …] [--ttl-h <hours>] [--nonce <str>]\n"
+       "\n"
+       "COMMANDS\n"
+       "  id     Derive did:pkh from a public EVM wallet address (default: Base 8453).\n"
+       "         Proof of control happens with SIWE; no private key enters this CLI.\n"
+       "  seed   Legacy/internal: generate a raw Ed25519 seed. THIS IS SECRET.\n"
+       "  did    Legacy/internal: derive did:key:z6Mk… from an Ed25519 seed.\n"
+       "  cacao  Mint a signed, expiring CACAO capability (iss is derived from the seed).\n"
+       "         With --apex, mint one the kotobase.net apex accepts (see --apex below).\n"
+       "\n"
+       "OPTIONS\n"
+       "  --address <0x>  public Ethereum wallet address\n"
+       "  --chain-id <n>  EIP-155 chain id for `id` (default 8453 / Base)\n"
+       "  --seed <b64>    raw 32-byte Ed25519 seed, base64-encoded (SECRET)\n"
+       "  --aud <did>     audience DID the CACAO is minted for\n"
+       "  --resource <u>  a kotoba:// resource URI to grant; repeatable\n"
+       "  --ttl-h <n>     lifetime in hours from now (default 24)\n"
+       "  --nonce <s>     explicit nonce (default: random)\n"
+       "  --apex          mint for the kotobase.net apex: supplies the domain,\n"
+       "                  audience, caip122 header and resource set it requires.\n"
+       "                  Without this, the default domain is kotoba.etzhayyim.com\n"
+       "                  and the apex answers a bare 401 that names no reason.\n"
+       "  --op-cap <c>    (--apex only) an operation capability to grant, e.g.\n"
+       "                  datom:read; repeatable\n"))
+
+(defn parse-opts
+  "Parse a flat `--flag value` argv (a seq of strings) into a keyword→value map.
+   A flag repeated more than once accumulates into a vector (in argv order).
+   Purely functional — no IO, no host interop.
+
+   A flag with no value — last in argv, or immediately followed by another
+   `--flag` — is a BOOLEAN and parses to `true`. Without this, `--apex
+   --op-cap datom:read` bound :apex to the string \"--op-cap\" and silently
+   dropped the capability: the flag ate the flag after it. No option value in
+   this CLI (seeds, DIDs, URIs, hours) begins with `--`, so treating that
+   prefix as \"not my value\" is unambiguous."
+  [args]
+  (loop [m {} args (seq args)]
+    (if-let [a (first args)]
+      (if (str/starts-with? a "--")
+        (let [k (keyword (subs a 2))
+              nxt (second args)
+              boolean? (or (nil? nxt) (str/starts-with? nxt "--"))
+              v (if boolean? true nxt)
+              m (if (contains? m k)
+                  (update m k (fn [old] (conj (if (vector? old) old [old]) v)))
+                  (assoc m k v))]
+          (recur m (if boolean? (next args) (nnext args))))
+        (recur m (next args)))
+      m)))
+
+(defn as-vec
+  "Normalize a parse-opts value (nil | scalar | vector) into a vector."
+  [v]
+  (cond (nil? v) [] (vector? v) v :else [v]))
+
+(def ^:private ethereum-address-re #"^0x[0-9A-Fa-f]{40}$")
+
+(defn wallet-did
+  "Public EVM address -> chain-bound did:pkh. Returns nil for invalid input."
+  ([address] (wallet-did address 8453))
+  ([address chain-id]
+   (when (and (string? address)
+              (re-matches ethereum-address-re address)
+              (integer? chain-id)
+              (pos? chain-id))
+     (str "did:pkh:eip155:" chain-id ":" (str/lower address)))))
+
+(defn validate
+  "Given a command keyword and parsed opts, return a seq of human-readable error
+   strings (empty when the invocation is well-formed). Pure."
+  [command opts]
+  (case command
+    :id    (cond-> []
+             (not (:address opts)) (conj "--address <0x-address> is required")
+             (and (:address opts) (not (re-matches ethereum-address-re (str (:address opts)))))
+             (conj "--address must be a 20-byte 0x Ethereum address"))
+    :seed  []
+    :did   (if (:seed opts) [] ["--seed <b64> is required"])
+    ;; --apex supplies aud/domain/header/resources itself, so demanding them
+    ;; would only invite a caller to pass values the apex then rejects.
+    :cacao (if (contains? opts :apex)
+             (cond-> []
+               (not (:seed opts)) (conj "--seed <b64> is required")
+               (:aud opts)      (conj "--aud is set by --apex; drop it")
+               (:resource opts) (conj "--resource is set by --apex; use --op-cap instead"))
+             (cond-> []
+               (not (:seed opts)) (conj "--seed <b64> is required")
+               (not (:aud opts))  (conj "--aud <did> is required")
+               (:op-cap opts)     (conj "--op-cap requires --apex")
+               (empty? (as-vec (:resource opts))) (conj "at least one --resource <uri> is required")))
+    [(str "unknown command: " (name (or command :?)))]))
+
+;; ── JVM-only crypto + IO (behind #?(:clj …)) ──────────────────────────────────
+
+

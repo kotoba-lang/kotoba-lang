@@ -1,0 +1,195 @@
+(ns kotobase.storage.async-contract
+  "Reusable Promise-based conformance suite for Worker storage providers.
+
+  The suite this replaces ran eight checks, all sequential, all from one
+  writer. That verified the SHAPE of `-compare-and-set-ref!` and nothing
+  about its strength: a provider whose store ignores the `If-Match`
+  precondition passes every one of those checks, because a single writer
+  never observes the difference. It surfaces later as a lost update, with
+  no error anywhere.
+
+  So the contract now has two halves. The sequential half is unchanged.
+  The concurrent half races writers against the same expected head and
+  requires exactly one to win -- the only check that can tell an enforced
+  precondition from an ignored one -- and it runs when, and only when, the
+  backend declares `:linearizable-ref`. A backend declaring
+  `:single-writer-ref` is not asked to pass it, and the result says so by
+  name, so a passing run cannot be read as a claim the backend never made."
+  (:require [kotobase.storage.core :as storage]))
+
+(def ^:private race-width
+  "Writers in the concurrent CAS check.
+
+  Four rather than two: a store that serializes correctly and one that
+  merely happens to order two requests look alike at width two."
+  4)
+
+(defn- bytes-of [& values] (js/Uint8Array. (clj->js (vec values))))
+
+(defn- all [promises] (js/Promise.all (to-array promises)))
+
+(defn- failure [message data]
+  (ex-info (str "storage contract: " message)
+           (assoc data :type :kotobase.storage/contract-violation)))
+
+(defn- checker []
+  (let [n (atom 0)]
+    {:tally #(deref n)
+     :check (fn [ok? message data]
+              (swap! n inc)
+              (when-not ok? (throw (failure message data)))
+              ok?)}))
+
+;; ── the concurrent half ──────────────────────────────────────────────────────
+
+(defn- race-cas
+  "Fire `race-width` CAS attempts at the same expected head, concurrently,
+   each proposing a different next CID.
+
+   `round` keeps the proposals of a later race disjoint from the winner of
+   an earlier one. Without it the writer that happens to propose exactly
+   the current head performs a no-op publish, leaves `current` equal to
+   `expected`, and a second writer then legitimately matches too -- two
+   winners, from a backend that did nothing wrong. That was a flake in
+   this check, not a finding about any store."
+  [backend ref-name round expected]
+  (all (map (fn [i]
+              (storage/-compare-and-set-ref!
+               backend ref-name expected (str "cid-race-" round "-" i)))
+            (range race-width))))
+
+(defn- verify-race
+  "One race, from `expected` to whatever wins. Resolves to the winner's CID.
+
+   Three assertions, and the second matters as much as the first: a loser
+   must report the CID that actually won, because a caller that cannot see
+   the winner cannot retry against it -- it will either spin or overwrite."
+  [backend check round expected]
+  (-> (race-cas backend "race" round expected)
+      (.then
+       (fn [results]
+         (let [results (vec (array-seq results))
+               winners (filterv :published? results)
+               losers (vec (remove :published? results))]
+           (check (= 1 (count winners))
+                  (if (> (count winners) 1)
+                    (str (count winners) " of " race-width
+                         " concurrent writers all published from the same"
+                         " expected head -- the store is not enforcing the"
+                         " precondition, so this backend must not declare"
+                         " :linearizable-ref")
+                    "no concurrent writer published; a live head became unreachable")
+                  {:expected expected :results results})
+           (let [winner (:current (first winners))]
+             (check (every? #(= winner (:current %)) losers)
+                    "a concurrent CAS loser did not observe the winner"
+                    {:winner winner :losers losers})
+             (-> (storage/-read-ref backend "race")
+                 (.then (fn [head]
+                          (check (= winner (:cid head))
+                                 "the published head is not the CAS winner"
+                                 {:winner winner :head head})
+                          winner)))))))))
+
+(defn- verify-concurrency
+  "Race twice: once from genesis (nil) and once from an established head.
+
+   Both, because they take different paths in every provider here --
+   genesis is `If-None-Match: *`, an update is `If-Match: <etag>` -- and a
+   store can enforce one while ignoring the other."
+  [backend check]
+  (-> (verify-race backend check "genesis" nil)
+      (.then (fn [winner] (verify-race backend check "update" winner)))))
+
+;; ── the sequential half ──────────────────────────────────────────────────────
+
+(defn- verify-blocks [backend check]
+  (let [a (bytes-of 1 2 3)
+        b (bytes-of 4 5)]
+    (-> (storage/-put-blocks! backend [{:cid "cid-a" :bytes a}
+                                       {:cid "cid-b" :bytes b}])
+        (.then (fn [_]
+                 ;; Re-putting identical bytes must be a no-op, not a
+                 ;; collision: two writers folding the same state produce
+                 ;; the same blocks, and that is normal, not a conflict.
+                 (storage/-put-blocks! backend [{:cid "cid-a" :bytes a}])))
+        (.then (fn [_] (storage/-get-blocks backend ["cid-a" "cid-b" "missing"])))
+        (.then (fn [found]
+                 (check (= #{"cid-a" "cid-b"} (set (keys found)))
+                        "batch get must return present blocks and omit misses"
+                        {:found (set (keys found))})
+                 (check (= [1 2 3] (vec (get found "cid-a")))
+                        "block bytes did not round-trip"
+                        {:got (vec (get found "cid-a"))}))))))
+
+(defn- verify-sequential-refs [backend check]
+  (-> (storage/-read-ref backend "main")
+      (.then (fn [missing]
+               (check (nil? missing) "a missing ref must read as nil" {:got missing})
+               (storage/-compare-and-set-ref! backend "main" nil "cid-a")))
+      (.then (fn [created]
+               (check (:published? created) "genesis CAS must win" {:got created})
+               (storage/-compare-and-set-ref! backend "main" nil "cid-b")))
+      (.then (fn [lost]
+               (check (false? (:published? lost)) "a stale CAS must lose" {:got lost})
+               (check (= "cid-a" (:current lost))
+                      "a CAS loser must observe the winner" {:got lost})
+               (storage/-compare-and-set-ref! backend "main" "cid-a" "cid-b")))
+      (.then (fn [updated]
+               (check (:published? updated) "a current-head CAS must win" {:got updated})
+               (storage/-read-ref backend "main")))
+      (.then (fn [current]
+               (check (= "cid-b" (:cid current))
+                      "the published ref did not resolve to the new CID"
+                      {:got current})))))
+
+;; ── entry ────────────────────────────────────────────────────────────────────
+
+(defn verify
+  "Run the shared backend contract.
+
+   -> Promise<{:checks n :profile p :concurrency :verified|:not-claimed}>.
+
+   `:profile` is echoed from the backend's own declaration rather than
+   inferred, and `:concurrency` says whether the race actually ran. A
+   caller reading `{:checks 12}` alone could not tell a linearizable
+   backend from one that opted out of being tested for it."
+  [backend]
+  ;; Every failure is a REJECTION, including the capability validation that
+  ;; runs before the first await. A caller that attached only `.catch`
+  ;; would otherwise take a synchronous throw for exactly the malformed
+  ;; backends this is meant to report on -- the one case where the caller
+  ;; is least likely to have a try around it.
+  (try
+    (storage/validate-backend! backend)
+    (let [{:keys [check tally]} (checker)
+          profile (storage/ref-profile backend)
+          linearizable? (storage/linearizable? backend)]
+      (-> (verify-blocks backend check)
+          (.then (fn [_] (verify-sequential-refs backend check)))
+          (.then (fn [_] (when linearizable? (verify-concurrency backend check))))
+          (.then (fn [_]
+                   {:checks (tally)
+                    :profile profile
+                    :concurrency (if linearizable? :verified :not-claimed)}))))
+    (catch :default e (js/Promise.reject e))))
+
+(defn verify!
+  "`verify` as a process gate: prints the result and sets a non-zero exit
+   code on a violation.
+
+   Here rather than in each provider because the suite this replaces
+   reported success by printing and exited 0 either way -- so every
+   provider's `test/run.cljk` was green by construction."
+  [backend label]
+  (-> (verify backend)
+      (.then (fn [result]
+               (println (str label " contract: " (pr-str result)))
+               result))
+      (.catch (fn [error]
+                (js/console.error (str label " contract FAILED: "
+                                       (.-message error)))
+                (when-let [data (ex-data error)]
+                  (js/console.error (pr-str data)))
+                (set! (.-exitCode js/process) 1)
+                (js/Promise.reject error)))))

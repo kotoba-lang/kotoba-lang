@@ -1,0 +1,436 @@
+(ns rdf-canon.core
+  "RDF Dataset Canonicalization (RDFC-1.0) — [W3C REC](https://www.w3.org/TR/rdf-canon/).
+
+   Second layer of the `-rdfc-` cryptosuite stack. `nquads.core` fixes the bytes for
+   a term; this fixes which *blank node labels* those bytes carry, so that two
+   parties holding the same graph produce the same hash even though blank node
+   labels are arbitrary.
+
+   ## Complete, including N-degree hashing
+
+   All of §4.4.3 is implemented: first-degree hashing (§4.6), Hash Related Blank
+   Node (§4.7), and the Hash N-Degree Quads algorithm (§4.8) that resolves blank
+   nodes *sharing* a first-degree hash by exploring the graph around them.
+
+   N-degree hashing is the part worth explaining, because it is where the cost is.
+   When two blank nodes cannot be told apart by their own quads, RDFC-1.0
+   distinguishes them by the shortest \"gossip path\" through their neighbours — and
+   it finds that path by trying **every permutation** of the related nodes at each
+   step, recursing as it goes. That is factorial work, which is why:
+
+   ## The work limit is a spec requirement, not a nicety
+
+   §4.4.3 states that implementations **MUST** defend against denial of service \"by
+   raising suitable exceptions and terminating early\". A 10-node clique of mutually
+   referencing blank nodes is a tiny document that would otherwise run effectively
+   forever; the official test suite ships exactly that as `test074`, and the only
+   correct answer is to refuse.
+
+   So every N-degree call and every permutation examined draws down `:max-work`, and
+   exhausting it throws `:rdf-canon/work-limit-exceeded`. Raise it deliberately if
+   you own the input; do not raise it for input from strangers, which is the case
+   this limit exists for.
+
+   The default's margin is measured, not guessed: across the official suite the
+   heaviest legitimate vector spends **3,348** units (`test044`/`045`/`046`, the
+   \"deep diff\" cases), the next heaviest only 54, and the clique exceeds even a
+   2,000,000-unit budget. So the distribution is sharply bimodal and the default sits
+   about 30x above every real document while still refusing the attack promptly.
+
+   ## Correctness is measured, not asserted
+
+   `test/fixtures/rdfc10/` holds the **entire official W3C test suite** — 64
+   canonical-form vectors, 21 issued-identifier-map vectors and the poison test —
+   checked in so the suite needs no network. Every claim this library makes is
+   checked against W3C's own expected output, byte for byte. A canonicalizer that
+   only agreed with itself would be worthless: the whole point is that two
+   independent parties produce the same bytes.
+
+   ## Code point order, not UTF-16 order
+
+   §4.4.3 orders serialized quads and hashes in *code point* order. A JVM string
+   compare is UTF-16 **code unit** order, and the two differ for supplementary
+   characters: a surrogate pair leads with 0xD800-0xDBFF and so sorts before
+   U+E000-U+FFFF under code units, and after them under code points.
+   `compare-code-points` implements the specified order rather than the convenient
+   one.
+
+   (Note this is the OPPOSITE requirement to RFC 8785 JCS, which explicitly wants
+   UTF-16 code unit order for property names. Two specs, two orders, and using one
+   library's comparator for the other's job is a silent interoperability bug.)
+
+   ## Hash algorithm
+
+   SHA-256 by default; `{:hash-algorithm :sha384}` selects the OPTIONAL SHA-384
+   variant the spec names and the suite covers. The digest is threaded through every
+   layer rather than hardcoded, because the first-degree and related-node hashes
+   feed the final one — mixing algorithms between layers would produce a hash nobody
+   else computes."
+  (:require [multiformats.core :as mf]
+            [nquads.core :as nq]))
+
+(def canonical-prefix "c14n")
+
+(def temporary-prefix
+  "§4.4.3 step 5.2.2 initializes the temporary issuer with the prefix `b`. The
+   value is observable: temporary identifiers are written into the paths that get
+   hashed, so a different prefix yields different hashes."
+  "b")
+
+(def default-max-work
+  "Units of N-degree work (one call, or one permutation examined) allowed per
+   canonicalization. See the namespace docstring: bounding this is a spec MUST, not
+   a tuning knob, and the 30x margin over the heaviest official vector is measured."
+  100000)
+
+(def measured-worst-legitimate-work
+  "The most work any legitimate vector in the official suite requires — measured by
+   binary-searching the smallest budget each one passes with, not estimated. The
+   suite's next-heaviest vector needs 54, so real documents cluster far below this."
+  3348)
+
+(defn- fail! [code msg data]
+  (throw (ex-info msg (assoc data :rdf-canon/error code))))
+
+(defn- utf8-bytes [s]
+  )
+
+(defn- hex [bs]
+  (apply str (map (fn [b]
+                    (let [i (bit-and b 0xff)]
+                      (str (when (< i 16) "0")
+                           )))
+                  (seq bs))))
+
+;; ── hash algorithms ──────────────────────────────────────────────────────────
+
+(def hash-algorithms
+  "The algorithms RDFC-1.0 names: SHA-256 (default) and SHA-384 (optional)."
+  {:sha256 mf/sha256
+   :sha384 mf/sha384})
+
+(defn- digest-for [algorithm]
+  (let [k (or algorithm :sha256)]
+    (or (get hash-algorithms k)
+        (fail! :rdf-canon/unknown-hash-algorithm
+               "RDFC-1.0 defines SHA-256 and SHA-384"
+               {:requested k :known (set (keys hash-algorithms))}))))
+
+(defn- digest-hex [digest s] (hex (digest (utf8-bytes s))))
+
+(defn sha256-hex [s] (digest-hex mf/sha256 s))
+
+;; ── code point order ─────────────────────────────────────────────────────────
+
+(defn- code-points [s]
+  )
+
+(defn compare-code-points
+  "§4.4.3's ordering. NOT `compare`: that is UTF-16 code unit order on the JVM, and
+   the two disagree for supplementary characters."
+  [a b]
+  (let [x (code-points a) y (code-points b)]
+    (loop [i 0]
+      (cond
+        (and (= i (count x)) (= i (count y))) 0
+        (= i (count x)) -1
+        (= i (count y)) 1
+        :else (let [c (compare (nth x i) (nth y i))]
+                (if (zero? c) (recur (inc i)) c))))))
+
+;; ── §4.5 identifier issuer ───────────────────────────────────────────────────
+
+(defn issuer
+  "An identifier issuer: a prefix, a counter, and the map of what it has issued.
+
+   `:order` records the sequence in which labels were issued, because §4.4.3 step
+   5.3.1 requires canonical identifiers to be granted to a temporary issuer's labels
+   *in the same order* it issued them."
+  [prefix]
+  {:prefix prefix :counter 0 :issued {} :order []})
+
+(defn issue
+  "§4.5.2 Issue Identifier. Returns `[issuer' identifier]`.
+
+   Returns the EXISTING identifier when one was already issued for this label —
+   issuing a second would break the bijection the canonical form depends on."
+  [{:keys [prefix counter issued order] :as iss} existing]
+  (if-let [already (get issued existing)]
+    [iss already]
+    (let [id (str prefix counter)]
+      [{:prefix prefix :counter (inc counter)
+        :issued (assoc issued existing id)
+        :order (conj order existing)}
+       id])))
+
+;; ── dataset helpers ──────────────────────────────────────────────────────────
+
+(defn- blank-labels-of [{:keys [subject predicate object graph]}]
+  (into #{} (comp (keep identity)
+                  (filter #(= :blank (:type %)))
+                  (map :value))
+        [subject predicate object graph]))
+
+(defn blank-node-to-quads
+  "§4.4.3 step 2. Blank node label -> the quads mentioning it."
+  [statements]
+  (reduce (fn [acc st]
+            (reduce (fn [m label] (update m label (fnil conj []) st))
+                    acc (blank-labels-of st)))
+          {} statements))
+
+(defn- relabel-term [term f]
+  (if (= :blank (:type term)) (nq/blank (f (:value term))) term))
+
+(defn- relabel-statement [st f]
+  (reduce (fn [m k] (if (get m k) (update m k relabel-term f) m))
+          st [:subject :predicate :object :graph]))
+
+;; ── §4.6 Hash First Degree Quads ─────────────────────────────────────────────
+
+(defn hash-first-degree
+  "§4.6.3. Every blank node component is replaced with `a` if it is the reference
+   node and `z` otherwise; the serialized quads are code point ordered,
+   concatenated, and hashed."
+  ([bnode->quads reference] (hash-first-degree bnode->quads reference mf/sha256))
+  ([bnode->quads reference digest]
+   (let [quads (get bnode->quads reference)]
+     (when-not (seq quads)
+       (fail! :rdf-canon/unknown-blank-node
+              "no quads mention this blank node" {:label reference}))
+     (->> quads
+          (map #(nq/serialize-statement
+                 (relabel-statement % (fn [label] (if (= label reference) "a" "z")))))
+          (sort compare-code-points)
+          (apply str)
+          (digest-hex digest)))))
+
+;; ── the work budget (§4.4.3's MUST) ──────────────────────────────────────────
+
+(defn- spend! [budget]
+  (when (neg? (swap! budget dec))
+    (fail! :rdf-canon/work-limit-exceeded
+           (str "N-degree hashing exceeded the work limit. RDFC-1.0 requires "
+                "implementations to defend against denial of service by "
+                "terminating early: distinguishing blank nodes that share a "
+                "first-degree hash costs factorial time in the worst case, so a "
+                "small document of mutually referencing blank nodes (a clique) can "
+                "run effectively forever. Raise :max-work only for input you own.")
+           {:limit-kind :max-work})))
+
+;; ── §4.7 Hash Related Blank Node ─────────────────────────────────────────────
+
+(defn- hash-related-blank-node
+  "§4.7.3. A hash characterizing HOW `related` is related to the node being hashed:
+   its position in the quad, the predicate, and its identity.
+
+   Identity is the canonical identifier if one exists, else the temporary one this
+   issuer has granted, else — for a node not yet named at all — its first-degree
+   hash. The graph position carries no predicate, since a graph name has none."
+  [{:keys [canonical-issuer hf digest]} related quad iss position]
+  (let [named (or (get (:issued canonical-issuer) related)
+                  (get (:issued iss) related))]
+    (digest-hex digest
+                (str position
+                     (when-not (= "g" position)
+                       (str "<" (get-in quad [:predicate :value]) ">"))
+                     (if named (str "_:" named) (hf related))))))
+
+;; ── §4.8 Hash N-Degree Quads ─────────────────────────────────────────────────
+
+(defn- permutations
+  "Lazy, so the work budget can stop a factorial enumeration part way through
+   instead of after materializing all of it."
+  [coll]
+  (let [v (vec coll)]
+    (if (<= (count v) 1)
+      (list v)
+      (lazy-seq
+       (mapcat (fn [i]
+                 (let [x (nth v i)
+                       others (into (subvec v 0 i) (subvec v (inc i)))]
+                   (map #(into [x] %) (permutations others))))
+               (range (count v)))))))
+
+(defn- abandon?
+  "§4.8.3 steps 5.4.5 and 5.4.6.5. A path already greater than the chosen one can
+   only stay greater as it is extended, so abandoning it cannot change the result —
+   this is purely an optimization, and a load-bearing one."
+  [chosen-path path]
+  (and (seq chosen-path)
+       (>= (count path) (count chosen-path))
+       (pos? (compare-code-points path chosen-path))))
+
+(declare hash-n-degree)
+
+(defn- walk-permutation
+  "§4.8.3 steps 5.4.1-5.4.6 for ONE permutation `p`.
+
+   Returns `{:path … :issuer …}`, or nil when one of the two early-exit tests
+   abandoned this permutation."
+  [{:keys [canonical-issuer] :as state} iss chosen-path p]
+  (let [;; 5.4.4 — name every related node, collecting those that need recursion
+        [issuer-copy path recursion-list]
+        (reduce (fn [[ic pth rl] related]
+                  (if-let [cid (get (:issued canonical-issuer) related)]
+                    ;; 5.4.4.1 — already canonical, so there is nothing to explore
+                    [ic (str pth "_:" cid) rl]
+                    ;; 5.4.4.2 — temporary name, and recurse later if it is new
+                    (let [rl' (if (get (:issued ic) related) rl (conj rl related))
+                          [ic' tid] (issue ic related)]
+                      [ic' (str pth "_:" tid) rl'])))
+                [iss "" []]
+                p)]
+    (when-not (abandon? chosen-path path)                    ; 5.4.5
+      ;; 5.4.6 — extend the path with each recursive result
+      (let [r (reduce
+               (fn [[ic pth] related]
+                 (let [[ic-res h] (hash-n-degree state related ic)
+                       ;; 5.4.6.2 issues from issuer copy — already granted at
+                       ;; 5.4.4.2, so this is a lookup — and only 5.4.6.4 then
+                       ;; replaces issuer copy with the recursion's issuer.
+                       [_ tid] (issue ic related)
+                       pth' (str pth "_:" tid "<" h ">")]
+                   (if (abandon? chosen-path pth')            ; 5.4.6.5
+                     (reduced nil)
+                     [ic-res pth'])))
+               [issuer-copy path]
+               recursion-list)]
+        (when r {:path (second r) :issuer (first r)})))))
+
+(defn- hash-n-degree
+  "§4.8.3. Returns `[issuer' hash]` for `identifier`.
+
+   Characterizes a blank node by the graph AROUND it, when its own quads are not
+   enough to tell it apart from another. Each group of equally-related neighbours
+   contributes the shortest path through them, in code point order — the search for
+   which is the factorial part the work budget bounds."
+  [{:keys [bnode->quads budget digest] :as state} identifier iss]
+  (spend! budget)
+  (let [;; step 2 — Hn: related hash -> the neighbours sharing it. The predicate
+        ;; position is absent because RDF predicates cannot be blank nodes.
+        hn (reduce
+            (fn [acc quad]
+              (reduce
+               (fn [m [position term]]
+                 (if (and term (= :blank (:type term)) (not= (:value term) identifier))
+                   (update m (hash-related-blank-node state (:value term) quad
+                                                      iss position)
+                           (fnil conj []) (:value term))
+                   m))
+               acc
+               [["s" (:subject quad)] ["o" (:object quad)] ["g" (:graph quad)]]))
+            {}
+            (get bnode->quads identifier))
+        ;; steps 3-5 — data to hash, one group at a time in code point order
+        [issuer' data]
+        (reduce
+         (fn [[cur data] related-hash]
+           (let [best (reduce (fn [best p]
+                                (spend! budget)
+                                (if-let [r (walk-permutation state cur (:path best) p)]
+                                  ;; 5.4.7
+                                  (if (or (empty? (:path best))
+                                          (neg? (compare-code-points (:path r)
+                                                                     (:path best))))
+                                    r
+                                    best)
+                                  best))
+                              {:path "" :issuer nil}
+                              (permutations (get hn related-hash)))]
+             ;; 5.1 + 5.5 append; 5.6 replaces the issuer with the chosen one
+             [(or (:issuer best) cur) (str data related-hash (:path best))]))
+         [iss ""]
+         (sort compare-code-points (keys hn)))]
+    [issuer' (digest-hex digest data)]))                     ; step 6
+
+;; ── §4.4.3 the canonicalization algorithm ────────────────────────────────────
+
+(defn canonicalize-dataset
+  "Return `{:statements … :issued …}` with blank nodes canonically relabelled.
+
+   `:issued` is the input-label -> canonical-label map, which is what the official
+   suite's map tests check.
+
+   Options: `:hash-algorithm` (`:sha256` default, or `:sha384`) and `:max-work`."
+  ([statements] (canonicalize-dataset statements nil))
+  ([statements opts]
+   (let [digest (digest-for (:hash-algorithm opts))
+         budget (atom (or (:max-work opts) default-max-work))
+         ;; An RDF dataset is a SET of quads (RDF 1.1 Concepts §4), so a repeated
+         ;; line is the same quad, not two. Deduplicating also denies the cheapest
+         ;; way to inflate a permutation group.
+         statements (vec (distinct statements))
+         bnode->quads (blank-node-to-quads statements)
+         hf (memoize (fn [label] (hash-first-degree bnode->quads label digest)))
+         ;; step 3
+         hash->labels (reduce (fn [acc label]
+                                (update acc (hf label) (fnil conj []) label))
+                              {}
+                              (sort compare-code-points (keys bnode->quads)))
+         ordered (sort compare-code-points (keys hash->labels))
+         ;; step 4 — canonical identifiers for the blank nodes with a UNIQUE hash
+         [after-unique shared]
+         (reduce (fn [[ci sh] h]
+                   (let [labels (get hash->labels h)]
+                     (if (> (count labels) 1)
+                       [ci (conj sh h)]
+                       [(first (issue ci (first labels))) sh])))
+                 [(issuer canonical-prefix) []]
+                 ordered)
+         ;; step 5 — and for the rest, via N-degree hashing
+         final
+         (reduce
+          (fn [ci h]
+            (let [state {:bnode->quads bnode->quads :canonical-issuer ci
+                         :hf hf :digest digest :budget budget}
+                  ;; 5.2 — one N-degree result per not-yet-canonical node
+                  results (reduce
+                           (fn [acc n]
+                             (if (get (:issued ci) n)
+                               acc
+                               (let [[tmp _] (issue (issuer temporary-prefix) n)
+                                     [tmp' hash] (hash-n-degree state n tmp)]
+                                 (conj acc {:issuer tmp' :hash hash}))))
+                           []
+                           (get hash->labels h))]
+              ;; 5.3 — in hash order, grant canonical identifiers to each temporary
+              ;; issuer's labels IN THE ORDER IT ISSUED THEM
+              (reduce (fn [c {tmp-issuer :issuer}]
+                        (reduce (fn [c2 existing] (first (issue c2 existing)))
+                                c (:order tmp-issuer)))
+                      ci
+                      (sort-by :hash compare-code-points results))))
+          after-unique
+          shared)
+         issued (:issued final)]
+     ;; Every blank node must now have a canonical identifier. Falling back to the
+     ;; input label here would emit plausible-looking non-canonical output, which is
+     ;; the failure mode this library exists to prevent.
+     (doseq [label (keys bnode->quads)]
+       (when-not (get issued label)
+         (fail! :rdf-canon/unlabelled-blank-node
+                "a blank node came out of canonicalization without a canonical identifier"
+                {:label label})))
+     {:statements (mapv #(relabel-statement % (fn [l] (get issued l))) statements)
+      :issued issued})))
+
+(defn canonicalize
+  "§4.4.3 step 7: the serialized canonical form of a dataset.
+
+   Takes N-Quads text or a seq of statements; returns canonical N-Quads — blank
+   nodes relabelled `c14n0`, `c14n1`, … and the statements code point ordered."
+  ([input] (canonicalize input nil))
+  ([input opts]
+   (let [statements (if (string? input) (nq/parse input) (vec input))
+         {:keys [statements]} (canonicalize-dataset statements opts)]
+     (->> statements
+          (map nq/serialize-statement)
+          (sort compare-code-points)
+          (apply str)))))
+
+(defn canonical-hash
+  "The hash of the canonical form — what a `-rdfc-` cryptosuite signs over."
+  ([input] (canonical-hash input nil))
+  ([input opts]
+   (digest-hex (digest-for (:hash-algorithm opts)) (canonicalize input opts))))

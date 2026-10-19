@@ -1,0 +1,502 @@
+#!/usr/bin/env kbb
+;; murakumo.infer.topology-probe — measure the fleet's interconnect, and find
+;; the nodes without being told what they are.
+;;
+;;   kbb --backend sci src/murakumo/infer/topology_probe.cljk discover
+;;   kbb --backend sci src/murakumo/infer/topology_probe.cljk nominal
+;;   kbb --backend sci src/murakumo/infer/topology_probe.cljk thunderbolt
+;;   kbb --backend sci src/murakumo/infer/topology_probe.cljk measure [--bytes-mib 128] [--port 40060]
+;;   kbb --backend sci src/murakumo/infer/topology_probe.cljk strategy <model-id>
+;;
+;; The default port is 40060, below macOS' 49152-65535 ephemeral range. That is
+;; not a preference: measured 2026-08-15, a first run on 50060 failed on `asher`
+;; alone, which is exactly the node fleet.edn already moved off 50052 because
+;; tailscaled owns persistent outbound flows in that range. The probe reported
+;; those two boundaries as unverified rather than inventing numbers for them,
+;; which is how the collision was visible at all.
+;;
+;; This is the feed for murakumo.infer.topology. It produces observations; it
+;; makes no decisions, and in particular it never decides that an observation
+;; it failed to take is fine. Every fact it emits carries `:method`, and the
+;; core refuses the ones that are claims rather than transfers.
+;;
+;; ── the two commands that look alike and are not ──────────────────────
+;;
+;; `nominal` reads what each interface says it negotiated. It is fast, safe,
+;; moves no traffic, and CANNOT lift the evidence gate. It is here because
+;; knowing the fleet claims 1000baseT is genuinely useful for planning a cable
+;; purchase -- just not for planning a tensor-parallel run.
+;;
+;; `measure` moves real bytes between real pairs. Only its output counts.
+;;
+;; They are separate verbs on purpose. A single `probe` that silently fell back
+;; from one to the other would reintroduce exactly the ambiguity the topology
+;; core exists to remove.
+
+(ns murakumo.infer.topology-probe
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [murakumo.kotoba.oracle :as oracle]))
+
+(oracle/preload! [:infer-topology :fleet-inventory :task-plan :infer-plan])
+
+(require '[murakumo.infer.topology :as topo]
+         '[murakumo.task.exec :as exec])
+
+;; ── local commands (bounded; nothing here may hang the operator) ──────
+
+(defn local-cmd
+  "Run a local command with a hard wall clock. Resolves to
+   {:out :err :code :timeout?} and never rejects: a probe that could not run
+   is data, not an exception."
+  [argv {:keys [timeout-ms] :or {timeout-ms 8000}}]
+  (js/Promise.
+   (fn [resolve _reject]
+     (let [child (.spawn cp (first argv) (to-array (rest argv))
+                         #js {:stdio #js ["ignore" "pipe" "pipe"]})
+           out (atom "") err (atom "") done (atom false)
+           timer (js/setTimeout
+                  (fn [] (when-not @done (reset! done :timeout) (.kill child "SIGKILL")))
+                  timeout-ms)]
+       (.on (.-stdout child) "data" #(swap! out str (.toString %)))
+       (.on (.-stderr child) "data" #(swap! err str (.toString %)))
+       (.on child "error" (fn [e]
+                            (js/clearTimeout timer)
+                            (when-not @done
+                              (reset! done true)
+                              (resolve {:out "" :err (.-message e) :code nil}))))
+       (.on child "close" (fn [code]
+                            (js/clearTimeout timer)
+                            (let [t (= :timeout @done)]
+                              (when (or t (not @done))
+                                (reset! done true)
+                                (resolve {:out @out :err @err
+                                          :code code :timeout? t})))))))))
+
+;; ── inventory (as an overlay, not as the source of truth) ─────────────
+
+(defn load-fleet []
+  (-> (.readFileSync fs "fleet.edn" "utf8") edn/read-string))
+
+(defn fleet-nodes
+  "fleet.edn's nodes. Note the demotion: from here on this file treats the
+   inventory as POLICY (labels, roles, credentials, exclusions), not as the
+   answer to 'what is out there'. `discover` reconciles the two and reports
+   both directions of the difference."
+  []
+  (:nodes (load-fleet)))
+
+;; ── discover: what is actually reachable ──────────────────────────────
+
+(defn- parse-tailscale [json-text]
+  (try
+    (let [j (js/JSON.parse json-text)
+          peers (js->clj (or (.-Peer j) #js {}) :keywordize-keys true)]
+      (vec (for [[_ p] peers]
+             {:name (some-> (:HostName p) str/lower)
+              :dns (:DNSName p)
+              :ips (:TailscaleIPs p)
+              :online? (true? (:Online p))
+              :os (:OS p)
+              :source :tailscale})))
+    (catch :default _ [])))
+
+(defn- parse-dns-sd
+  "`dns-sd -B` streams a table; we take the instance names it printed before
+   the clock ran out. Bonjour is the only source here that needs no config at
+   all -- no inventory, no tailnet, no credentials."
+  [text]
+  (->> (str/split-lines text)
+       (keep (fn [line]
+               (when-let [m (re-find #"Add\s+\S+\s+\d+\s+\S+\s+_\S+\._tcp\.\s+(.+)$" line)]
+                 (str/trim (second m)))))
+       distinct
+       (mapv (fn [n] {:name (str/lower n) :source :mdns}))))
+
+(defn discover
+  "Node set from live signals, reconciled against the inventory.
+
+  Three independent sources, because each is blind in a different way:
+  Bonjour sees only this LAN, Tailscale sees only what joined the tailnet, and
+  fleet.edn sees only what someone wrote down. The interesting output is the
+  disagreement -- a node in the tailnet but not the inventory is doing work
+  nobody is planning for, and a node in the inventory but nowhere else is a
+  plan against a machine that is not there.
+
+  This is the failure murakumo.infer.join recorded on 2026-07-31 from the
+  other side: 45 nodes enrolled in the registry, and the ten machines actually
+  running work were not among them."
+  []
+  (-> (js/Promise.all
+       #js [(local-cmd ["tailscale" "status" "--json"] {:timeout-ms 10000})
+            (local-cmd ["dns-sd" "-B" "_ssh._tcp" "local."] {:timeout-ms 4000})])
+      (.then
+       (fn [[ts mdns]]
+         (let [tailnet (parse-tailscale (:out ts))
+               bonjour (parse-dns-sd (:out mdns))
+               inventory (mapv (fn [n] {:name (:name n) :source :inventory}) (fleet-nodes))
+               names (fn [xs] (set (keep :name xs)))
+               tn (names tailnet) bn (names bonjour) iv (names inventory)
+               live (into (sorted-set) (concat tn bn))]
+           {:sources {:tailscale {:seen (count tn)
+                                  :ok? (zero? (or (:code ts) 1))
+                                  :error (when-not (zero? (or (:code ts) 1))
+                                           (str/trim (:err ts)))}
+                      :mdns {:seen (count bn) :bounded-by :timeout}
+                      :inventory {:seen (count iv)}}
+            :online (vec (sort (names (filter :online? tailnet))))
+            :discovered (vec live)
+            ;; The two directions of disagreement, named rather than merged.
+            :undeclared (vec (sort (remove iv live)))
+            :missing (vec (sort (remove live iv)))
+            ;; Evidence floor: no source answering is not an empty fleet.
+            :evidence (cond
+                        (and (empty? tn) (empty? bn)) :none
+                        (or (empty? tn) (empty? bn)) :partial
+                        :else :both-sources)})))))
+
+;; ── nominal: what the interfaces claim ────────────────────────────────
+
+(def ^:private media-cmd
+  ;; en0 is the built-in ethernet on these minis; bridge0 is the Thunderbolt
+  ;; bridge macOS creates by default. Both are printed so a fleet that grows a
+  ;; Thunderbolt fabric shows it here first.
+  (str "printf 'MEDIA\\t'; ifconfig en0 2>/dev/null | awk '/media:/{print $2, $3; exit}'"
+       "; printf 'BRIDGE\\t'; ifconfig bridge0 2>/dev/null | awk '/status:/{print $2; exit}'"
+       "; printf 'TBPORTS\\t'; networksetup -listallhardwareports 2>/dev/null"
+       " | grep -c 'Thunderbolt [0-9]'"))
+
+(defn- media->mbps
+  "`1000baseT` -> 1000. Unparseable media is nil, not zero: we did not learn
+   the speed, which is different from learning it is zero."
+  [s]
+  (when s
+    (when-let [m (re-find #"(\d+)base" s)]
+      (js/parseInt (second m) 10))))
+
+(defn- ssh-fanout
+  "One command on many nodes. Reuses murakumo.task.exec's ssh dialect (in-band
+   exit sentinel, ControlMaster reuse) rather than spawning ssh here."
+  [nodes cmd]
+  (let [dir (exec/control-dir! {})
+        opts {:control-path (exec/control-path dir) :timeout-ms 25000}]
+    (-> (js/Promise.all
+         (to-array
+          (for [n nodes]
+            (exec/run-one {:task {:cmd cmd} :node (:name n) :host (:host n)} opts))))
+        (.then (fn [rs]
+                 (exec/close-masters! dir)
+                 (vec rs))))))
+
+(defn- parse-media [stdout]
+  (let [row (fn [k] (some->> (str/split-lines (or stdout ""))
+                             (some (fn [l] (when (str/starts-with? l (str k "\t"))
+                                             (str/trim (subs l (inc (count k)))))))))]
+    {:media (row "MEDIA")
+     :bridge (row "BRIDGE")
+     :tb-ports (some-> (row "TBPORTS") (js/parseInt 10))}))
+
+(defn nominal
+  "Per-node interface claims. Emits `:method :nominal` facts, which the
+  topology core will refuse to count. That refusal is the point."
+  []
+  (let [nodes (filter :rpc-ip (fleet-nodes))]
+    (-> (ssh-fanout nodes media-cmd)
+        (.then (fn [rs]
+                 (let [rows (for [r rs]
+                              (let [p (parse-media (:stdout r))]
+                                (merge {:node (:node r)
+                                        :reachable? (= 0 (:exit r))}
+                                       p
+                                       {:mbps (media->mbps (:media p))})))]
+                   {:rows (vec rows)
+                    :reachable (count (filter :reachable? rows))
+                    :asked (count nodes)
+                    ;; SCANNED floor: zero reachable nodes is not a clean fleet.
+                    :evidence (cond
+                                (zero? (count (filter :reachable? rows))) :none
+                                (< (count (filter :reachable? rows)) (count nodes)) :partial
+                                :else :complete)}))))))
+
+;; ── thunderbolt: the cable-arrived detector ───────────────────────────
+
+(defn thunderbolt
+  "Is there a Thunderbolt fabric yet?
+
+  Measured 2026-08-15: three Thunderbolt ports per mini, all three already
+  enrolled as `bridge0` members by macOS, `bridge0 status: inactive` on every
+  node checked. Thirty ports, zero cables. Nothing on the node side has to
+  change for that to become a fabric, which is precisely why something has to
+  be watching -- otherwise the first cable is plugged in and every plan keeps
+  assuming 1 GbE."
+  []
+  (-> (nominal)
+      (.then (fn [{:keys [rows] :as n}]
+               (let [active (filter #(= "active" (:bridge %)) rows)]
+                 (assoc n
+                        :tb-ports-total (reduce + 0 (keep :tb-ports rows))
+                        :bridges-active (count active)
+                        :fabric? (>= (count active) 2)
+                        :note (if (>= (count active) 2)
+                                "bridge0 is active on multiple nodes — run `measure` before believing it"
+                                "no Thunderbolt fabric; pipeline parallel remains the only affordable scheme")))))))
+
+;; ── measure: move real bytes ──────────────────────────────────────────
+
+;; ── the transport, and why it is not `nc` ─────────────────────────────
+;;
+;; The first version of this probe piped `dd` into `nc` on both ends. It
+;; reported 9,587-14,913 Mbps across a fleet whose every interface reads
+;; 1000baseT -- fifteen times the physical ceiling. Measured cause: macOS `nc`
+;; abandons the connection when the send buffer fills, so 133,120 bytes of a
+;; 16,777,216-byte transfer arrived, `nc` exited 0, and the 8 ms it took to
+;; fail became the denominator. Sender exit code, elapsed time and the absence
+;; of any error all said success.
+;;
+;; Two things changed. The transfer is python3 (present on every node checked,
+;; and it does not have that bug), and -- the part that matters -- the RECEIVER
+;; counts the bytes and the fact is discarded unless the count matches. A probe
+;; that cannot verify its own transfer has not measured a link; it has measured
+;; how fast it can fail.
+
+(defn- rx-script [port]
+  ;; Accept one connection, drain it, print the byte count. Runs in the
+  ;; foreground of its ssh session so the operator holds it open for exactly as
+  ;; long as the transfer needs -- a backgrounded listener dies with the
+  ;; session and takes the measurement's meaning with it.
+  (str "import socket\n"
+       "s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+       "s.settimeout(45);s.bind((\"\"," port "));s.listen(1)\n"
+       "print(\"UP\",flush=True)\n"
+       "c,_=s.accept();n=0\n"
+       "while True:\n"
+       "    b=c.recv(1<<20)\n"
+       "    if not b: break\n"
+       "    n+=len(b)\n"
+       "print(\"RX\\t%d\"%n,flush=True)\n"))
+
+(defn- tx-script [ip port mib]
+  ;; Timed on the sending node. At 1 GbE a 128 MiB transfer is ~1.1 s and ssh
+  ;; setup is a few hundred ms, so timing it from the operator would overstate
+  ;; the link by tens of percent.
+  (str "import socket,time\n"
+       "buf=b\"\\0\"*(1<<22);total=" mib "*(1<<20);sent=0\n"
+       "s=socket.create_connection((\"" ip "\"," port "),10)\n"
+       "t=time.time()\n"
+       "while sent<total:\n"
+       "    s.sendall(buf);sent+=len(buf)\n"
+       "s.close();e=time.time()\n"
+       "print(\"TX\\t%d\"%sent);print(\"MS\\t%d\"%int((e-t)*1000))\n"))
+
+(defn- loopback-script [mib]
+  ;; The instrument measuring itself. Same code path over 127.0.0.1, so the
+  ;; result is this node's ceiling for THIS prober -- not a number anyone has
+  ;; to believe, and not one that has to be updated when the hardware changes.
+  (str "import socket,threading,time\n"
+       "srv=socket.socket();srv.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+       "srv.bind((\"127.0.0.1\",0));srv.listen(1);port=srv.getsockname()[1]\n"
+       "def rx():\n"
+       "    c,_=srv.accept()\n"
+       "    while c.recv(1<<20): pass\n"
+       "th=threading.Thread(target=rx);th.start()\n"
+       "buf=b\"\\0\"*(1<<22);total=" mib "*(1<<20);sent=0\n"
+       "s=socket.create_connection((\"127.0.0.1\",port),5)\n"
+       "t=time.time()\n"
+       "while sent<total:\n"
+       "    s.sendall(buf);sent+=len(buf)\n"
+       "s.close();e=time.time();th.join()\n"
+       "print(\"MS\\t%d\"%int((e-t)*1000))\n"))
+
+(defn- py [script]
+  ;; Heredoc rather than `python3 -c`: the scripts contain quotes and newlines
+  ;; that would otherwise have to survive two levels of shell quoting.
+  (str "python3 - <<'MKEOF'\n" script "MKEOF"))
+
+(defn- row-of [stdout k]
+  (some->> (str/split-lines (or stdout ""))
+           (some (fn [l] (when (str/starts-with? l (str k "\t"))
+                           (js/parseInt (str/trim (subs l (inc (count k)))) 10))))))
+
+(defn- mbps-of [bytes ms]
+  (when (and (number? bytes) (number? ms) (pos? ms))
+    (js/Math.round (/ (* bytes 8) ms 1000))))
+
+(defn calibrate
+  "This node's ceiling for this prober, over loopback. Returns Mbps, or nil
+  when it could not be established — which callers must treat as 'unknown',
+  never as 'no limit'."
+  [node mib]
+  (if-not (:host node)
+    (js/Promise.resolve nil)
+    (-> (ssh-fanout [node] (py (loopback-script mib)))
+        (.then (fn [[r]] (mbps-of (* mib 1048576) (row-of (:stdout r) "MS"))))
+        (.catch (fn [_] nil)))))
+
+(defn- measure-pair
+  "One directed boundary, verified at the receiver.
+
+  Returns a link fact for every outcome, because the failures are information:
+  `:mbps nil` is never-observed, `:mbps 0` is observed-dead, a short byte count
+  is `:tcp-stream-unverified`, and a transfer at the prober's own ceiling is
+  `:method-limited` — a floor on the link, not a measurement of it."
+  [a b {:keys [port mib ceiling]}]
+  (let [expect (* mib 1048576)
+        rx (ssh-fanout [b] (py (rx-script port)))
+        tx (-> (js/Promise. (fn [res] (js/setTimeout res 2500)))
+               (.then (fn [_] (ssh-fanout [a] (py (tx-script (:rpc-ip b) port mib))))))]
+    (-> (js/Promise.all #js [rx tx])
+        (.then
+         (fn [[[r] [t]]]
+           (let [received (row-of (:stdout r) "RX")
+                 sent (row-of (:stdout t) "TX")
+                 ms (row-of (:stdout t) "MS")
+                 mbps (mbps-of expect ms)
+                 complete? (and (= received expect) (= sent expect))
+                 ;; Two ways to be method-limited, and the second one is the
+                 ;; one that would otherwise pass silently: the calibration
+                 ;; itself failed, so we have no ceiling to compare against.
+                 ;; A fast reading we cannot rule out as our own prober is not
+                 ;; a link speed. Below the gbe ceiling this cannot arise —
+                 ;; no prober on this hardware is the bottleneck at 1 GbE.
+                 limited? (and complete? mbps
+                               (if ceiling
+                                 (>= mbps (* 0.8 ceiling))
+                                 (>= mbps 5000)))]
+             (topo/link
+              {:from (:name a) :to (:name b)
+               :at (js/Date.now)
+               :method (cond limited? :method-limited
+                             complete? :tcp-stream
+                             (number? received) :tcp-stream-unverified
+                             :else :tcp-stream-unverified)
+               ;; A short transfer is NOT reported as its apparent speed. That
+               ;; apparent speed is what produced the 15 Gbps reading.
+               :mbps (when complete? mbps)
+               :received received
+               :expected-bytes expect}))))
+        (.catch (fn [e]
+                  (topo/link {:from (:name a) :to (:name b)
+                              :method :tcp-stream-unverified
+                              :mbps nil :error (str e)}))))))
+
+(defn- measure-chain
+  "Walk the ring in order, one boundary at a time. Serial on purpose:
+  concurrent transfers would measure contention on a shared switch and report
+  it as link speed."
+  [nodes opts]
+  (let [pairs (map vector nodes (rest nodes))]
+    (reduce (fn [p [a b]]
+              (.then p (fn [acc]
+                         (.then (measure-pair a b opts)
+                                (fn [l] (conj acc l))))))
+            (js/Promise.resolve [])
+            pairs)))
+
+(defn measure
+  "Measured link facts for the fleet's ring order, folded into a fabric.
+
+  Calibrates against the first node before measuring anything, so a reading
+  that turns out to be the prober's own ceiling is labelled rather than
+  reported as a link speed."
+  [{:keys [port mib] :or {port 40060 mib 128}}]
+  (let [nodes (vec (filter :rpc-ip (fleet-nodes)))
+        ring {:ranks (count nodes) :closed? false
+              :expected (max 0 (dec (count nodes)))}]
+    (-> (calibrate (first nodes) (max 1 (quot mib 2)))
+        (.then (fn [ceiling]
+                 (-> (measure-chain nodes {:port port :mib mib :ceiling ceiling})
+                     (.then (fn [links]
+                              (let [f (topo/fabric ring links)]
+                                {:fabric (dissoc f :links)
+                                 :report (topo/report f)
+                                 :bytes-per-boundary (* mib 1048576)
+                                 :prober-ceiling-mbps ceiling
+                                 :prober (:name (first nodes))})))))))))
+
+;; ── strategy: the whole loop, end to end ──────────────────────────────
+
+(defn strategy
+  "Measure the fabric, then ask `choose-strategy` what it implies for `model-id`.
+
+  This verb exists because a producer with no consumer is the defect this
+  namespace was written to fix. `choose-strategy` sat shipped and parity-tested
+  for months while nothing fed it; a measurement plane nothing reads would be
+  the same mistake one layer down.
+
+  The ranks here are the nodes the probe walked, not a memory-weighted shard
+  plan — `infer plan <model>` owns that, and it needs the live memory map. What
+  this answers is the question the shard plan cannot: given what the wire
+  actually does today, which parallelism is affordable at all."
+  [{:keys [model-id] :as opts}]
+  (let [models (:models (edn/read-string (.readFileSync fs "infer.edn" "utf8")))
+        model (get models model-id)]
+    (if-not model
+      (js/Promise.resolve
+       {:error :unknown-model :model-id model-id :known (vec (sort (keys models)))})
+      (-> (measure opts)
+          (.then (fn [{:keys [fabric report prober-ceiling-mbps]}]
+                   (let [d (topo/decide {:fabric fabric :model model})]
+                     {:model model-id
+                      :strategy (:strategy d)
+                      :why (:why d)
+                      :link-gbps (:link-gbps d)
+                      :evidence (:evidence d)
+                      :gated? (:gated? d)
+                      :coverage (:coverage report)
+                      :min-mbps (:min-mbps report)
+                      :prober-ceiling-mbps prober-ceiling-mbps
+                      ;; The sentence an operator can act on. `:pipeline` with
+                      ;; `:evidence :measured` is a finding; `:pipeline` with
+                      ;; anything else is a to-do.
+                      :note (if (:gated? d)
+                              (str "link unproven (" (name (:evidence d))
+                                   ") — pipeline is the safe default, not a measurement")
+                              (str "measured " (:min-mbps report)
+                                   " Mbps on the slowest boundary"))})))))))
+
+;; ── CLI ───────────────────────────────────────────────────────────────
+
+(defn- flag [args k default]
+  (if-let [i (some (fn [[i v]] (when (= v k) i)) (map-indexed vector args))]
+    (js/parseInt (nth args (inc i)) 10)
+    default))
+
+(defn- positional
+  "First bare argument, skipping flags AND their values.
+
+  `(remove #(str/starts-with? % \"--\") argv)` is the obvious spelling and it
+  is wrong: for `strategy --bytes-mib 64 qwen` it returns \"64\". That is the
+  trap the workspace rules record from fleet gates, where the same shape made
+  `\"10\"` a directory path."
+  [args]
+  (first (loop [[a & more] args, out []]
+           (cond (nil? a) out
+                 (str/starts-with? a "--") (recur (rest more) out)
+                 :else (recur more (conj out a))))))
+
+(defn -main [& args]
+  (let [[cmd & rest] args
+        out (fn [m] (println (pr-str m)))]
+    (case cmd
+      "discover" (.then (discover) out)
+      "nominal" (.then (nominal) out)
+      "thunderbolt" (.then (thunderbolt) out)
+      "measure" (.then (measure {:port (flag rest "--port" 40060)
+                                 :mib (flag rest "--bytes-mib" 128)})
+                       out)
+      "strategy" (.then (strategy {:port (flag rest "--port" 40060)
+                                   :mib (flag rest "--bytes-mib" 128)
+                                   :model-id (positional rest)})
+                        out)
+      (binding [*print-fn* *print-err-fn*]
+        (println "usage: topology_probe.cljs discover|nominal|thunderbolt|measure|strategy")
+        (println)
+        (println "  discover            nodes from tailscale + Bonjour, reconciled against fleet.edn")
+        (println "  nominal             interface media claims (cannot lift the evidence gate)")
+        (println "  thunderbolt         bridge0 state across the fleet — the cable-arrived detector")
+        (println "  measure             real transfers between ring neighbours [--bytes-mib N] [--port P]")
+        (println "  strategy <model>    measure, then what choose-strategy makes of it")))))
+
+(apply -main *command-line-args*)

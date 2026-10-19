@@ -1,0 +1,538 @@
+(ns arrangement.core
+  "CID-addressed commit snapshotting of the 4-covering-index Arrangement, via
+  `prolly-tree.core`. Repo formerly `quad-store` (renamed: it stores triples
+  `{:s :p :o}`, not RDF quads -- `Arrangement` names the actual structure
+  instead of overloading `quad`, and aligns this whole substrate with Datomic
+  terminology per the design this org tracks kotoba : kotobase = Clojure :
+  Datomic against, ADR-2607032500).
+
+  **The indices themselves are no longer defined here.** They live in
+  `kotoba-lang/datalog`'s `datalog.index` -- `:eavt`/`:aevt`/`:avet`/`:vaet`,
+  named for their sort orders -- and this namespace re-exports them below so
+  existing callers keep working unchanged. This repo owns the half that
+  persists one: `commit!`, `restore`, `commit-delta!`, and the
+  blinded/encrypted leaf format they share.
+
+  ## Two vocabularies, on purpose: in memory vs on the wire
+
+  The in-memory index keys were renamed to their sort orders on 2026-08-20
+  (`datalog` `a43dc1cf`). **The persisted `index-roots` keys were not.** A
+  snapshot still names its four roots by the strings spo, pso, pos, ocp,
+  and `arrangement.source` still reads them under those names.
+
+  That is not an oversight and not laziness. Those strings are inside the
+  dag-cbor block the commit CID is the hash of: renaming them changes the CID
+  of every snapshot of every graph. `kotobase-peer`'s fold convergence is
+  built on identical state producing an identical CID, so a fleet mid-upgrade
+  -- some writers on the old name, some on the new -- would write two CIDs for
+  one graph and diverge **without erroring**, which is the exact failure the
+  deterministic nonce exists to prevent.
+
+  The mechanism for changing it already exists and is `current-schema-version`
+  (whose docstring already says to bump it the day the 4-index shape changes
+  incompatibly, and to give readers a migration keyed on the old value). Doing
+  that is a decision with a migration attached, not a side effect of an
+  in-memory rename. Until someone makes it, the keyword-to-wire-name pairing
+  lives in exactly one place -- `index-names` below -- so there is one line to
+  change rather than a search.
+
+  A triple is `{:s subject :p predicate :o object}`. s/p/o are still
+  treated as opaque values for indexing purposes (general typed-value
+  support -- int/bytes/bool beyond string and `ipld.core/Link` -- remains a
+  follow-up), but an `ipld.core/Link` value is now recognized and preserved
+  end to end: through the hot db, through a commit snapshot's index-root
+  (`index-root` below), and back out again on a cold read (see
+  `kotoba-lang/kotobase-peer`'s `cold-datoms`/`hydrate-db`, which call
+  `edn->link` on read).
+
+  `:o` values that are references to other entities are additionally
+  indexed in `:vaet` for reverse-reference lookup when `ref?` (default:
+  `ipld.core/link?`, ADR-2607023200 §6-4 -- \"ref? naturalizes to: is the
+  value a Link\") says so; a caller can still pass a different predicate to
+  `assert-quad`/`retract-quad` to opt out or widen it. Supplying that
+  default is now precisely this namespace's job: `datalog.index` requires
+  `ref?` explicitly, because that one default was the ONLY thing tying the
+  quad index to IPLD, and IPLD is what stayed here."
+  (:require [datalog.index :as index]
+            [prolly-tree.core :as pt]
+            [arrangement.range-index :as ri]
+            [ipld.core :as ipld]
+            [ipld.value :as v]))
+
+;; ── The four covering indexes: re-exported from `datalog.index` ──────────────
+;;
+;; COMPATIBILITY SHIM. `arrangement.core`'s index functions are a PUBLIC
+;; surface with existing callers (`kotobase-peer`, `kotobase-query`,
+;; `kotoba-git`/`bonsai`, `kotoba-rad`/`nekko`, `loop-system-dynamics`,
+;; `net-kotobase`), so they keep resolving here and keep their arities,
+;; arglists and docstrings. What changed is where the code IS: exactly one
+;; copy, in `kotoba-lang/datalog`.
+;;
+;; This is a shim, not a home. Removing it is a follow-up, to be done once
+;; those consumers require `datalog.index` directly; the aliases below are
+;; deliberately mechanical and exhaustive -- every public var of
+;; `datalog.index`, in its declaration order -- so that "did we miss one" is
+;; answerable by reading rather than by testing.
+;;
+;; `assert-quad` and `retract-quad` additionally supply the `ref?` default
+;; (`ipld.core/link?`) that `datalog.index` requires explicitly. That default
+;; is the whole of what IPLD ever contributed to the index, which is why the
+;; split fell where it did.
+;;
+;; These are `defn` wrappers rather than `(def x index/x)` aliases for a
+;; reason found by the test suite, not guessed: ClojureScript's analyzer
+;; computes `:arglists` for a `def` from its init expression and OVERWRITES a
+;; declared one, so an aliased var reports `()` as its signature on cljs
+;; while reporting the right thing on the JVM. Docstrings survive; arglists
+;; do not. A caller reading `(doc arr/entity-attrs)` in a cljs REPL would
+;; have seen the shim, which is exactly what a compatibility shim must not
+;; do. A wrapper costs one call and reads identically on both runtimes.
+
+(defn empty-db
+  "A db with all four indices empty. Just a map -- nothing to close, nothing
+  to open, safe to hold in an atom or thread through pure functions.
+
+  Delegates to `datalog.index/empty-db`."
+  []
+  (index/empty-db))
+
+(defn assert-quad
+  "Add `{:s :p :o}` to `db`'s 4 indices. `ref?` (default: `ipld.core/link?`)
+  decides whether `:o` is also indexed in `:vaet` for reverse-reference
+  lookup.
+
+  Delegates to `datalog.index/assert-quad`, supplying the `ipld.core/link?`
+  default that namespace deliberately refuses to guess at."
+  ([db q] (index/assert-quad db q ipld/link?))
+  ([db q ref?] (index/assert-quad db q ref?)))
+
+(defn retract-quad
+  "Remove `{:s :p :o}` from `db`'s 4 indices. `ref?` (default:
+  `ipld.core/link?`) must agree with the one used to assert the same quad,
+  otherwise the `:vaet` entry is left behind.
+
+  Delegates to `datalog.index/retract-quad`, supplying the `ipld.core/link?`
+  default that namespace deliberately refuses to guess at."
+  ([db q] (index/retract-quad db q ipld/link?))
+  ([db q ref?] (index/retract-quad db q ref?)))
+
+(defn mutable-db
+  "A mutable bulk-loading accumulator over `db`. Delegates to
+  `datalog.index/mutable-db`."
+  [db] (index/mutable-db db))
+
+(defn assert-quads!
+  "Add `quads` to a `mutable-db`. `ref?` defaults to `ipld.core/link?`.
+
+  Delegates to `datalog.index/assert-quads!`."
+  ([mdb quads] (index/assert-quads! mdb quads ipld/link?))
+  ([mdb quads ref?] (index/assert-quads! mdb quads ref?)))
+
+(defn persist-db
+  "Finish a `mutable-db`. Delegates to `datalog.index/persist-db`."
+  [mdb] (index/persist-db mdb))
+
+(defn assert-quads
+  "Bulk `assert-quad`. `ref?` defaults to `ipld.core/link?`.
+
+  Delegates to `datalog.index/assert-quads`."
+  ([db quads] (index/assert-quads db quads ipld/link?))
+  ([db quads ref?] (index/assert-quads db quads ref?)))
+
+(defn entity-attrs
+  "All `{p #{o...}}` for subject `s` (EAVT-style).
+
+  Delegates to `datalog.index/entity-attrs`."
+  [db s] (index/entity-attrs db s))
+
+(defn by-predicate
+  "All `{s #{o...}}` for predicate `p` (AEVT-style scan).
+
+  Delegates to `datalog.index/by-predicate`."
+  [db p] (index/by-predicate db p))
+
+(defn by-predicate-value
+  "All subjects `s` where `[s p o]` holds (AVET-style point lookup).
+
+  Delegates to `datalog.index/by-predicate-value`."
+  [db p o] (index/by-predicate-value db p o))
+
+(defn by-predicate-range
+  "AVET-style value interval: `{s #{o...}}` for predicate `p` whose object
+  is in `[lo, hi)`. Delegates to `datalog.index/by-predicate-range`."
+  ([db p lo hi] (index/by-predicate-range db p lo hi))
+  ([db p lo hi opts] (index/by-predicate-range db p lo hi opts)))
+
+(defn refs-to
+  "All `{p #{s...}}` referencing object `o` -- the `:vaet` reverse lookup;
+  only populated for quads asserted with a truthy `ref?`.
+
+  Delegates to `datalog.index/refs-to`."
+  [db o] (index/refs-to db o))
+
+(defn legacy-db?
+  "True if `db` still carries the pre-rename index keys `:spo`/`:pso`/`:pos`/
+  `:ocp` instead of `:eavt`/`:aevt`/`:avet`/`:vaet`.
+
+  Delegates to `datalog.index/legacy-db?`. Note this asks about the IN-MEMORY
+  keys; a snapshot's persisted `index-roots` still use the old strings at
+  `current-schema-version` 2 and are not what this detects (see the ns
+  docstring)."
+  [db] (index/legacy-db? db))
+
+(defn check-shape!
+  "Throw if `db` is a pre-rename db rather than letting the renamed key read
+  as `nil` and a query answer zero rows successfully.
+
+  Delegates to `datalog.index/check-shape!`."
+  [db] (index/check-shape! db))
+
+;; ── Link <-> EDN-safe round-trip ─────────────────────────────────────────────
+;; `ipld.core/Link` is a bare deftype with no reader/print-method (by design --
+;; the codebase's `dag-cbor`/`ipld` layer round-trips Links via CBOR tag 42,
+;; never via a JVM/cljs-specific reader macro). `index-root` below persists
+;; keys through `pr-str`/`edn/read-string` (a prolly-tree leaf key, not a
+;; dag-cbor block), so a raw Link would NOT survive that round-trip. Represent
+;; it instead as a plain 2-vector `["ipld/link" cid]` -- ordinary, portable EDN
+;; that needs no custom reader on either JVM or ClojureScript.
+;; Still load-bearing on the KEY path (see `index-root`): a leaf key is built
+;; with `pr-str`, and `pr-str` of a Link record is platform-dependent record
+;; printing. It is NO LONGER used on the value path, which is `ipld.value`
+;; (`kotoba.value.v1`) as of schema-version 2 — that codec carries a Link as a
+;; real tag-42 value and needs no textual stand-in. `edn->link` remains the
+;; read path for schema-version 1 snapshots.
+(defn link->edn
+  "A Link becomes `[\"ipld/link\" cid]`; anything else passes through."
+  [v] (if (ipld/link? v) ["ipld/link" (ipld/link-cid v)] v))
+
+(defn edn->link
+  "Inverse of `link->edn`: reconstructs the Link, or passes through anything
+  that isn't the `[\"ipld/link\" cid]` shape."
+  [v] (if (and (vector? v) (= 2 (count v)) (= "ipld/link" (first v)))
+        (ipld/link (second v))
+        v))
+
+(defn blind-input
+  "What `blind-fn` sees for one s/p/o component.
+
+  PUBLIC because deriving it is exactly how a cold reader seeks by prefix
+  without materializing the db (`arrangement.source/cursor`, and
+  `kotobase-peer`'s `cold-datoms` before it). Keeping it private forced every
+  such reader to re-implement it, which is how two copies of a crypto input
+  drift apart.
+
+  Deliberately NOT the `kotoba.value.v1` bytes: `blind-fn` is a caller-supplied
+  keyed MAC whose output a cold reader re-derives to seek by prefix
+  (`kotobase-peer`'s `cold-datoms`), so changing its input is a cross-repo
+  crypto change, not a local one. Typed round-tripping is the VALUE slot's job
+  — which is exactly where a component's type was being lost before."
+  [component]
+  ;; An ALLOWLIST, because the failure mode is silent. `blind-fn` serializes
+  ;; what it is handed — the reference implementation `pr-str`s it — and
+  ;; `pr-str` is canonical for only some values:
+  ;;
+  ;;   set / map      iteration order is undefined -> two runtimes derive
+  ;;                  different seek tokens for the same component
+  ;;   byte array     prints as `#object[[B 0x… "[B@…"]`, an identity hash —
+  ;;                  not stable across two arrays with the SAME bytes, or
+  ;;                  even across runs
+  ;;   record         platform-dependent record printing
+  ;;
+  ;; None of these were rejected before; they produced divergent keys quietly.
+  ;; A Link is admitted by name (it is a `defrecord`, so `map?` is true for it)
+  ;; and goes through `link->edn`, which exists for exactly this reason.
+  ;;
+  ;; A VECTOR is admitted when every element is: its order is defined and
+  ;; `pr-str` prints it element by element, so it has one canonical form once
+  ;; each element does. bonsai stores a tree's entries and a commit's parents
+  ;; as one vector each; rejecting vectors made every bonsai repo
+  ;; unpersistable. It is wrapped as `["arrangement/vector" [...]]` so that a
+  ;; literal vector `["ipld/link" cid]` and a real Link (which becomes that
+  ;; same pair) derive DIFFERENT key inputs.
+  ;;
+  ;; This bounds the KEY path only. The VALUE slot is `kotoba.value.v1` and
+  ;; accepts the codec's full admitted set.
+  (letfn [(canonical [c]
+            (cond
+              (or (nil? c) (boolean? c) (integer? c) (string? c)
+                  (keyword? c) (symbol? c))
+              c
+
+              (ipld/link? c) (link->edn c)
+
+              (vector? c) ["arrangement/vector" (mapv canonical c)]
+
+              :else
+              (throw (ex-info "arrangement: component is not a blindable scalar"
+                              {:problem :arrangement/component-not-blindable
+                               :component-type (type c)}))))]
+    (canonical component)))
+
+;; ── index-root: JVM (sync) / cljs (async, ADR-2607051000 Worker addendum) ──
+;; `blind-fn`/`encrypt-fn` carry a DIFFERENT contract per platform, by design:
+;; JVM `javax.crypto` is synchronous (`(blind-fn x) -> string`, `(encrypt-fn
+;; bytes) -> bytes`, called directly). The Worker's Web Crypto
+;; (`crypto.subtle.sign`/`.encrypt`) is Promise-based — there is no
+;; synchronous AEAD/HMAC primitive in that runtime — so the cljs contract is
+;; `(blind-fn x) -> js/Promise<string>`, `(encrypt-fn bytes) -> js/Promise<
+;; bytes>`, and `index-root`/`commit!` become Promise-returning too. This
+;; does NOT touch `put!`/`get-fn` (still synchronous on both platforms,
+;; unchanged from `prolly-tree.core`/`ipld.core`'s existing contract) — the
+;; async boundary is isolated to the crypto step alone, resolved BEFORE the
+;; (still-synchronous) tree is built. The JVM body below is byte-identical to
+;; the one ADR-2607051000's implementation PR merged; only a cljs sibling is
+;; new."
+
+
+(defn- index-root
+  "Flatten one index map into sorted `[key val]` prolly-tree entries and
+  build a tree from it (ADR-2607051000, ciphertext-over-CID persistence:
+  accepted 2026-07-06, this fn implements its corrected key/value split —
+  see ADR-2607061800's addendum for why the original ADR text was wrong
+  about the value slot).
+
+  `key` is `(pr-str [(blind-fn a) (blind-fn b) (blind-fn c)])` (each position
+  passed through `blind-input` first, then `blind-fn` — a keyed, deterministic
+  MAC, e.g. HMAC-SHA256 — so the leaf key is queryable by prefix for a caller
+  who already knows the plaintext component, but is NOT the plaintext, and is
+  NOT order-preserving/full ciphertext).
+
+  `val` is `(encrypt-fn (ipld.value/encode-value [a b c]))` — an AEAD
+  ciphertext blob of the REAL triple. This is the correction: the ORIGINAL
+  triple lived only in the (now-blinded, one-way, unrecoverable) key, so once
+  the key stopped being plaintext there was nowhere left to read the actual
+  s/p/o payload back from — `val` now carries it, encrypted, so `cold-datoms`
+  (in `kotoba-lang/kotobase-peer`) can decrypt a matched leaf's value to
+  reconstruct the row instead of trying to invert the key.
+
+  **schema-version 2** (ADR-kotoba-canonical-value-codec, VC3): the value slot
+  encodes with `kotoba.value.v1` instead of `ipld/encode`. `ipld/encode` is a
+  NODE codec — it writes a keyword as text and hands back a string, and has no
+  defined order for a set — so a typed component did not survive the
+  round-trip even though its CID verified. The value codec is what makes the
+  s/p/o this repo's own `assert-quad` already accepts (ordinary map keys, any
+  value) actually persistable. The KEY path is deliberately unchanged; see
+  `blind-input`.
+
+  `blind-fn`/`encrypt-fn` are REQUIRED (no default — matching this
+  codebase's no-silent-default stance, ADR-2607050700, same as
+  `schema-version` below): synchronous on JVM (`(blind-fn blind-input-
+  component) -> string`, `(encrypt-fn bytes) -> bytes`); Promise-returning
+  on cljs (see the platform-contract note above). Returns the root CID
+  directly on JVM, a `js/Promise` of it on cljs."
+  [put! m blind-fn encrypt-fn]
+  )
+
+(defn- range-index-root
+  "One prolly tree over the declared range partitions, or nil when there are
+  none.
+
+  Keys are `arrangement.range-index/leaf-key`: the bucket ordinal in clear,
+  every other component blinded. That clear ordinal IS the disclosure, and it
+  is budgeted and checked in `range-index` -- `validate-partition!` runs here,
+  on the write path, so an unstated or understated budget cannot reach a
+  block.
+
+  The value slot is the same AEAD ciphertext of `[p o s]` the pos index
+  writes, so a matched leaf decodes through the identical path.
+
+  Returns nil for no partitions, which is what keeps a snapshot committed
+  without them BYTE-IDENTICAL to one from before this existed. Fold
+  convergence (`kotobase-peer.core/fold!`) depends on identical state giving
+  an identical CID, so a range index that silently appeared in every snapshot
+  would break the property the deterministic nonce exists to protect."
+  [put! db partitions blind-fn encrypt-fn]
+  (when (seq partitions)
+    (let [ps (mapv ri/validate-partition! partitions)]
+      )))
+
+(def current-schema-version
+  "The current `\"schema-version\"` value for this index shape
+  (ADR-2607050500, \"Schema evolution\"). Not a hidden default -- `commit!`
+  requires the caller to pass a version explicitly (see below); this is
+  just the value to pass when you have no other one in mind. Bump this --
+  and give callers a migration path keyed on the old value -- the day the
+  4-index shape changes incompatibly.
+
+  **2** (was 1): the leaf VALUE slot moved from `ipld/encode` (a node codec,
+  which loses a keyword's type and has no defined order for a set) to
+  `kotoba.value.v1` via `ipld.value` — ADR-kotoba-canonical-value-codec, VC3.
+  The migration is read-compatible, not a rewrite: `restore` still reads a
+  version-1 snapshot through the old codec (see `supported-schema-versions`).
+  What a version-1 snapshot CANNOT do is retroactively recover a type it never
+  persisted — a keyword written under version 1 comes back as the string it
+  was stored as. New writes are version 2."
+  2)
+
+(def supported-schema-versions
+  "Snapshot versions `restore` can read. Writing is always
+  `current-schema-version`; reading accepts the older shape so an existing
+  store keeps opening. Anything outside this set is rejected by name rather
+  than interpreted under the current index shape."
+  #{1 2})
+
+(defn commit!
+  "Snapshot `db`'s 4 indices into 4 prolly-trees via `put!`
+  (`prolly-tree.core`-shaped port: `(put! cid bytes)`), CID-address the
+  commit itself (dag-cbor of `{schema-version index-roots prev}`, where
+  every root and `prev` is a REAL tag-42 IPLD link via `kotoba-lang/ipld`
+  -- an empty index snapshots as null), and return the commit CID string.
+  `prev` is the previous commit CID, or nil for the first commit.
+
+  `schema-version` is REQUIRED (ADR-2607050500: schema evolution is a
+  caller-declared choice, not a silently-assumed default) -- pass
+  `current-schema-version` if you have no other version in mind, but state
+  it. Content-addressed: committing the same `db` + `prev` + `schema-
+  version` twice returns the same CID.
+
+  `blind-fn`/`encrypt-fn` are REQUIRED (ADR-2607051000, accepted
+  2026-07-06) and threaded unchanged to `index-root` for all 4 indices —
+  see `index-root`'s docstring for their contract, including the
+  synchronous-JVM/Promise-cljs platform split. Returns the commit CID
+  directly on JVM, a `js/Promise` of it on cljs.
+
+  The 7-argument arity takes `partitions` -- declared range partitions (see
+  `arrangement.range-index`) -- and writes ONE extra tree under the
+  `\"range\"` index root. Passing nil or an empty sequence writes nothing and
+  produces a byte-identical snapshot to the 6-argument form, which is the
+  property that makes this backward compatible in both directions: an old
+  reader ignores an unknown root key, and a caller who declares no partition
+  gets exactly the bytes they got before. Nothing here is opt-out; a range
+  index exists only where someone stated a budget for it."
+  ([put! db prev schema-version blind-fn encrypt-fn]
+   (commit! put! db prev schema-version blind-fn encrypt-fn nil))
+  ([put! db prev schema-version blind-fn encrypt-fn partitions]
+   (let [->link #(some-> % ipld/link)]          ; empty index -> nil root -> null
+     )))
+
+(defn restore
+  "Rebuild a complete in-memory arrangement from a snapshot produced by
+  `commit!`. Reads only the persisted spo covering index (the wire name of
+  `:eavt` -- see the ns docstring) and derives the
+  other three indexes by re-asserting every recovered triple. `get-fn` is
+  `(fn [cid] bytes)` and `decrypt-fn` is the inverse of the encrypt function
+  supplied to `commit!` (synchronous on clj, Promise-returning on cljs).
+
+  A nil snapshot returns an empty db. Unknown schema versions are rejected
+  instead of being interpreted with the current index shape; a version this
+  build still supports (`supported-schema-versions`) is decoded with the codec
+  that WROTE it, never reinterpreted under the current one. Returns a db on
+  clj and a Promise of a db on cljs."
+  [get-fn snapshot-cid decrypt-fn]
+  ;; Note the `index/` calls: the persistence half reaches DOWN into
+  ;; `datalog.index` directly rather than through the compat shim above, so
+  ;; that removing the shim one day is a deletion and not a rewrite. This --
+  ;; `index/assert-quad` and `index/empty-db` -- is the whole of what the
+  ;; persistence half needs from the index half, which is why the split was
+  ;; cheap enough to be worth making.
+  (if (nil? snapshot-cid)
+    
+    (let [snapshot (ipld/decode (get-fn snapshot-cid))
+          schema-version (get snapshot "schema-version")
+          _ (when-not (contains? supported-schema-versions schema-version)
+              (throw (ex-info "Unsupported arrangement snapshot schema"
+                              {:problem :arrangement/unsupported-schema-version
+                               :supported supported-schema-versions
+                               :current current-schema-version
+                               :actual schema-version
+                               :snapshot-cid snapshot-cid})))
+          ;; The codec is chosen by the version the snapshot RECORDS, so a
+          ;; version-1 leaf keeps its original (type-lossy) reading instead of
+          ;; being re-interpreted as kotoba.value.v1 bytes.
+          decode-leaf (if (= 1 schema-version)
+                        (fn [bytes] (mapv edn->link (ipld/decode bytes)))
+                        v/decode-value)
+          root-cid (some-> (get-in snapshot ["index-roots" "spo"]) ipld/link-cid)
+          entries (if root-cid (pt/scan-prefix get-fn root-cid "") [])
+          build (fn [triples]
+                  (reduce (fn [db [s p o]]
+                            (index/assert-quad db {:s s :p p :o o} ipld/link?))
+                          (index/empty-db)
+                          triples))]
+      )))
+
+;; ── Incremental commit ──────────────────────────────────────────────────────
+
+(defn- index-triple
+  "The triple `index` stores for quad `{s p o}`, or nil when that index skips
+  it. Mirrors `assert-quad`'s four `upd` calls exactly; if those ever diverge,
+  a delta commit stops matching a full one and the tests below say so."
+  [index {:keys [s p o]} ref?]
+  (case index
+    :eavt [s p o]
+    :aevt [p s o]
+    :avet [p o s]
+    :vaet (when (ref? o) [o p s])))
+
+(def ^:private index-names
+  "In-memory index keyword -> the name it is stored under in a snapshot's
+  `index-roots` map.
+
+  The left column is `datalog.index`'s vocabulary; the right column is the
+  wire, frozen at `current-schema-version` 2 because those strings are hashed
+  into the commit CID. See the ns docstring for why the two are allowed to
+  differ. This vector is the only place the two meet -- if the wire names ever
+  move, they move here and in `arrangement.source`, behind a version bump."
+  [[:eavt "spo"] [:aevt "pso"] [:avet "pos"] [:vaet "ocp"]])
+
+(defn- prev-root
+  "Root CID of one index in a previously committed snapshot, or nil."
+  [snapshot name]
+  (some-> (get-in snapshot ["index-roots" name]) ipld/link-cid))
+
+(defn commit-delta!
+  "Commit `quads` ON TOP of `prev-commit-cid` without rebuilding the indices,
+  and return the new commit CID.
+
+  `commit!` flattens four in-memory index maps and builds four trees from
+  scratch, so a caller holding a large graph must materialize all of it to add
+  one fact. That is why a fold is O(graph) however little novelty it has, and
+  why folding a million-entity graph does not fit in a Worker's budget. Here
+  each index's previous tree is extended in place through
+  `prolly-tree/insert-many`: only the leaves the new keys land in are read and
+  rewritten, and the internal levels are re-chunked once.
+
+  The result is CID-IDENTICAL to `(commit! put! db prev schema-version ...)`
+  for the db that would result from asserting the same quads — the tests treat
+  any divergence as a failure. It has to be: the whole point of a
+  content-addressed snapshot is that the same content has the same name, and a
+  delta path that produced a different CID for the same graph would break
+  every equality check above it — CAS, dedup, replication — while looking like
+  it worked.
+
+  `prev-commit-cid` nil commits the quads as a first snapshot. `quads` is a
+  seq of `{:s :p :o}`. `ref?` (default `ipld.core/link?`) decides whether `:o`
+  is also indexed in `:vaet`, matching `assert-quad`. `get-fn` reads blocks;
+  everything else matches `commit!`'s contract, including its
+  synchronous-JVM / Promise-cljs split."
+  ([put! get-fn prev-commit-cid quads schema-version blind-fn encrypt-fn]
+   (commit-delta! put! get-fn prev-commit-cid quads schema-version blind-fn
+                  encrypt-fn ipld/link?))
+  ([put! get-fn prev-commit-cid quads schema-version blind-fn encrypt-fn ref?]
+   (let [snapshot (when prev-commit-cid (ipld/decode (get-fn prev-commit-cid)))
+         ->link #(some-> % ipld/link)
+         triples-for (fn [index] (keep #(index-triple index % ref?) quads))]
+     )))
+
+(defn commit-changes!
+  "Commit asserted and retracted quads on top of `prev-commit-cid` without a
+  full index rebuild.
+
+  `changes` is `{:assertions [...] :retractions [...]}`. Callers must collapse
+  repeated operations for the same logical quad to their final operation.
+  Retractions are applied first and assertions second, so the final operation
+  wins if a caller nevertheless supplies a quad in both collections.
+
+  The resulting snapshot is CID-identical to `commit!` of the resulting db.
+  This is the mixed-operation counterpart to assertion-only `commit-delta!`.
+  It uses Prolly's deterministic `delete-many`/`insert-many` primitives and
+  retains the JVM synchronous / ClojureScript Promise contract."
+  ([put! get-fn prev-commit-cid changes schema-version blind-fn encrypt-fn]
+   (commit-changes! put! get-fn prev-commit-cid changes schema-version
+                    blind-fn encrypt-fn ipld/link?))
+  ([put! get-fn prev-commit-cid {:keys [assertions retractions]}
+    schema-version blind-fn encrypt-fn ref?]
+   (let [->link #(some-> % ipld/link)
+         triples-for (fn [index quads]
+                       (keep #(index-triple index % ref?) quads))]
+     )))

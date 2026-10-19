@@ -1,0 +1,84 @@
+(ns murakumo.infer.poi-receipt
+  "Node-signed receipts for customer jobs (ADR-261010 §2, ADR-261010b §3).
+
+  After a text job completes, the resident records what the model server
+  reported about it: prompt, cached and completion tokens, and timings. It
+  never records the prompt or the output. The receipt is signed with the same
+  per-node ed25519 key as the node's observation (did:key), appended to
+  `<state-file>.poi-receipts.jsonl` (0600), and served on the private bind at
+  GET /poi/receipts?since=<ms>. The Proof of Inference coordinator collects
+  them, checks the signature against the node's did, and converts tokens to
+  uVCU with its own model table, so nodes carry no economic constants."
+  (:require [clojure.string :as str]
+            [murakumo.infer.observation :as observation]
+            ["node:fs" :as fs]))
+
+(def tail-bytes
+  "How much of a response the resident keeps to find usage: the final SSE
+  chunk or the JSON body's usage/timings object fits well inside it."
+  8192)
+(def rotate-bytes (* 32 1024 1024))
+(def max-served 2000)
+
+(defn tail
+  "Keep the last `tail-bytes` of a growing response string."
+  [acc chunk]
+  (let [s (str acc chunk)]
+    (if (> (count s) tail-bytes) (subs s (- (count s) tail-bytes)) s)))
+
+(defn- parse [s]
+  (try (js->clj (js/JSON.parse s) :keywordize-keys true) (catch :default _ nil)))
+
+(defn usage-of
+  "{:t-in :t-out :cached :prompt-ms :predicted-ms} from a JSON response body or
+  from the last SSE data chunks that carry usage or timings; nil when the
+  response says nothing about usage."
+  [text]
+  (let [docs (if (str/includes? text "data:")
+               (->> (str/split text #"\n")
+                    (keep #(second (re-matches #"^data:\s*(\{.*\})\s*$" %)))
+                    (keep parse)
+                    reverse)
+               (keep parse [text]))
+        u (some :usage docs)
+        t (some :timings docs)]
+    (when (or u t)
+      {:t-in (or (:prompt_tokens u) (some-> t :prompt_n (+ (or (:cache_n t) 0))) 0)
+       :t-out (or (:completion_tokens u) (:predicted_n t) 0)
+       :cached (or (get-in u [:prompt_tokens_details :cached_tokens]) (:cache_n t) 0)
+       :prompt-ms (:prompt_ms t)
+       :predicted-ms (:predicted_ms t)})))
+
+(defn receipt
+  "The payload a node signs for one completed job."
+  [{:keys [node did job lane model at]} usage]
+  (merge {:type "node-receipt" :kind "customer" :v 1
+          :node node :issuer did :did did :job job :lane lane :model model :at at}
+         usage))
+
+(defn- rotate! [file]
+  (when (and (.existsSync fs file) (> (.-size (.statSync fs file)) rotate-bytes))
+    (.renameSync fs file (str file ".1"))))
+
+(defn append!
+  "Sign and append one receipt. Never throws: losing a receipt must not fail
+  the job it describes."
+  [file key payload]
+  (try
+    (rotate! file)
+    (.appendFileSync fs file (str (js/JSON.stringify (clj->js (observation/sign key payload))) "\n")
+                     #js {:mode 384})
+    true
+    (catch :default _ false)))
+
+(defn since
+  "Signed receipts with :at greater than `at`, oldest first, at most max-served."
+  [file at]
+  (if-not (.existsSync fs file)
+    []
+    (->> (str/split-lines (.readFileSync fs file "utf8"))
+         (remove str/blank?)
+         (keep parse)
+         (filter #(> (or (get-in % [:payload :at]) 0) at))
+         (take max-served)
+         vec)))

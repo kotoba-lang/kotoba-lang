@@ -1,0 +1,246 @@
+(ns oak.semantic
+  "Mechanism adapters for OaK's ontology-authored semantics.
+
+  The application decisions stay in `kernel.kotoba`.  This namespace binds
+  existing portable engines to the plans the Kotoba runtime exports:
+  `org-w3-owl2`'s OWL 2 RL rules evaluated by `datalog`, `sparql` over the
+  materialized RDF graph, and the sovereign `kotoba-lang/shacl` Wasm validator
+  over the selected input shape.  It never interprets generated source text
+  and it refuses operators outside the engines' proved semantics."
+  (:require [datalog.core :as datalog]
+            [datom.source :as source]
+            [owl.rl :as rl]
+            [owl.rules :as owl]
+            [sparql.core :as sparql]))
+
+(def supported-owl-profile :owl2-rl)
+(def supported-shacl-property-constraints
+  #{:shacl/in})
+(def supported-shacl-datatypes
+  #{:string :number :integer :boolean :keyword :map :vector})
+
+(defn triple [s p o] {:s s :p p :o o})
+
+(defn- rule-query [db rules query]
+  (datalog/q db (assoc query :rules rules) (constantly true)))
+
+(defn materialize-owl2-rl
+  "Materialize the RDFS/OWL 2 RL Horn closure of arbitrary triples.
+
+  This is general over the input graph, not tailored to the tender fixture.
+  `owl.rules/triple-rules` owns the supported semantics; the Datalog engine
+  evaluates them to a least fixpoint."
+  [triples]
+  (let [db (source/of-quads (set triples))
+        rules (owl/triple-rules)
+        derived-triples (rule-query db rules
+                                    '{:find [?s ?p ?o]
+                                      :where [(owl-triple ?s ?p ?o)]})
+        derived-types (rule-query db rules
+                                  '{:find [?s ?c]
+                                    :where [(owl-type ?s ?c)]})]
+    (into (set triples)
+          (concat (map (fn [[s p o]] (triple s p o)) derived-triples)
+                  (map (fn [[s c]] (triple s :rdf/type c)) derived-types)))))
+
+(def supported-owl-rules
+  "The OWL 2 RL rule ids the complete path (`entail`, `materialize` with
+  opts) evaluates -- `owl.rules/supported-rules`. Refuse an axiom whose rule
+  is not here rather than reason without it."
+  owl/supported-rules)
+
+(def supported-owl-vocabulary
+  "The owl:/rdfs:/rdf:/xsd: IRIs the complete path gives RL semantics to --
+  `owl.rules/supported-vocabulary`; `owl.rules/vocabulary-status` says what
+  happens to every other known IRI."
+  owl/supported-vocabulary)
+
+(defn- check-profile! [profile]
+  (when-not (= profile supported-owl-profile)
+    (throw (ex-info "OaK has no qualified engine for the requested OWL profile"
+                    {:code :oak/unsupported-owl-profile
+                     :requested profile
+                     :supported supported-owl-profile}))))
+
+(defn entail
+  "The COMPLETE OWL 2 RL/RDF closure (Profiles §4.3 Tables 4-9, as
+  `owl.rules/owl2-rl-rules` states them) with its inconsistencies, as data.
+
+  opts are `owl.rl/entail`'s: `:schema?` (default true -- EMIT the
+  subClassOf/subPropertyOf closures, equivalences and propagated
+  domains/ranges as triples), `:vocabulary` (default the keyword vocabulary
+  this adapter's `triple` callers use), `:rules` (a subset).
+
+  Returns {:graph #{triple} :inferred #{triple}
+           :inconsistencies [{:rule id :table n :triples [triple ...]}]
+           :consistent? bool :rules [id] :diagnostics {...} :counts {...}
+           :profile :owl2-rl :engine :owl.rl}
+  An inconsistent graph is a result here, never an exception."
+  ([profile triples] (entail profile triples {}))
+  ([profile triples opts]
+   (check-profile! profile)
+   (assoc (rl/entail triples opts) :profile profile :engine :owl.rl)))
+
+(defn materialize
+  "Run a named OWL profile or fail closed.  Full OWL 2 DL/SROIQ is not
+  silently approximated by RL.
+
+  Two arities, two contracts:
+
+  `(materialize :owl2-rl triples)` -- UNCHANGED: `materialize-owl2-rl`, the
+  RDFS core of `owl.rules/triple-rules` evaluated by `datalog`. Same rules,
+  same output set, byte for byte, as before `entail` existed; callers that
+  compare entailed sets keep their equalities.
+
+  `(materialize :owl2-rl triples opts)` -- the complete RL closure of
+  `entail`, as a set. Its set is a SUPERSET of the 2-arity one (schema
+  triples, owl:sameAs, datatype typing, axiomatic triples), so it is opt-in.
+  An inconsistent graph throws `:oak/owl-inconsistent` carrying the
+  structured `:inconsistencies`; pass `:allow-inconsistent? true` to get the
+  closure anyway, or call `entail` to get both as data."
+  ([profile triples]
+   (check-profile! profile)
+   (materialize-owl2-rl triples))
+  ([profile triples opts]
+   (let [r (entail profile triples (dissoc opts :allow-inconsistent?))]
+     (when (and (not (:consistent? r)) (not (:allow-inconsistent? opts)))
+       (throw (ex-info "OWL 2 RL: the graph is inconsistent"
+                       {:code :oak/owl-inconsistent
+                        :inconsistencies (:inconsistencies r)})))
+     (:graph r))))
+
+(defn- logic-var [x]
+  (if (and (keyword? x) (.startsWith (name x) "?"))
+    (symbol (name x))
+    x))
+
+(defn- triple-pattern [pattern]
+  (mapv logic-var pattern))
+
+(defn plan->algebra
+  "Translate the closed ontology plan representation to `sparql.core`'s EDN
+  algebra.  Unknown operators are rejected instead of becoming empty plans."
+  [plan]
+  (case (first plan)
+    :sparql/bgp
+    {:sparql/op :bgp :patterns (mapv triple-pattern (rest plan))}
+
+    :sparql/project
+    {:sparql/op :project
+     :vars (mapv logic-var (second plan))
+     :pattern (plan->algebra (nth plan 2))}
+
+    :sparql/distinct
+    {:sparql/op :distinct :pattern (plan->algebra (second plan))}
+
+    :sparql/slice
+    {:sparql/op :slice :offset (second plan) :limit (nth plan 2)
+     :pattern (plan->algebra (nth plan 3))}
+
+    (throw (ex-info "unsupported ontology SPARQL operator"
+                    {:code :oak/unsupported-sparql-operator
+                     :operator (first plan)}))))
+
+(defn execute
+  "OWL materialization followed by the real sibling SPARQL engine."
+  [profile plan triples]
+  (let [graph (materialize profile triples)
+        quads (map (fn [{:keys [s p o]}]
+                     {:subject s :predicate p :object o}) graph)]
+    (sparql/select (plan->algebra plan) quads)))
+
+(defn- shacl-constraint->entry [constraint]
+  (case (first constraint)
+    :shacl/in [:in (vec (rest constraint))]
+    (throw (ex-info "unsupported ontology SHACL property constraint"
+                    {:code :oak/unsupported-shacl-constraint
+                     :constraint (first constraint)
+                     :supported supported-shacl-property-constraints}))))
+
+(defn- property-plan->shacl [property]
+  (when-not (and (vector? property)
+                 (= :shacl/property (first property))
+                 (<= 5 (count property)))
+    (throw (ex-info "invalid ontology SHACL property plan"
+                    {:code :oak/invalid-shacl-property-plan
+                     :property property})))
+  (let [[_ path datatype min-count max-count & constraints] property]
+    (when-not (and (keyword? path)
+                   (keyword? datatype)
+                   (contains? supported-shacl-datatypes datatype)
+                   (integer? min-count)
+                   (integer? max-count)
+                   (<= 0 min-count max-count))
+      (throw (ex-info "invalid ontology SHACL property operands"
+                      {:code :oak/invalid-shacl-property-operands
+                       :property property})))
+    (when-not (= (count constraints) (count (set (map first constraints))))
+      (throw (ex-info "duplicate ontology SHACL property constraint"
+                      {:code :oak/duplicate-shacl-constraint
+                       :property property})))
+    (into {:path path
+           :datatype datatype
+           :min-count min-count
+           :max-count max-count}
+          (map shacl-constraint->entry constraints))))
+
+(defn shape-plan->shacl
+  "Translate the closed OaK shape plan to `kotoba-lang/shacl`'s canonical
+  document ABI.  The target is returned separately because validation of a
+  concrete node does not need RDF target discovery.  Unknown rows and
+  constraints are rejected rather than ignored."
+  [plan]
+  (when-not (and (vector? plan)
+                 (= :shacl/node (first plan))
+                 (keyword? (second plan)))
+    (throw (ex-info "invalid ontology SHACL node plan"
+                    {:code :oak/invalid-shacl-node-plan
+                     :plan plan})))
+  {:target (second plan)
+   :shape {:shacl/type :node-shape
+           :property (mapv property-plan->shacl (drop 2 plan))}})
+
+(defn ontology->rdf
+  "Project OaK ontology rows into RDF for candidate discovery.
+
+  Each component is typed through a role-specific implementation class, so
+  querying the role only succeeds if OWL subclass entailment actually ran."
+  [ontology]
+  (let [components (filter #(= :component (first %)) ontology)
+        roles (set (map #(nth % 2) components))]
+    (into
+     (set
+      (mapcat (fn [role]
+                (let [impl-class (keyword "oak.role" (str (name role) "-implementation"))]
+                  [(triple impl-class :rdfs/subClassOf role)
+                   (triple role :rdfs/subClassOf :oak/component)]))
+              roles))
+     (concat
+      (map (fn [[_ id role]]
+             (triple id :rdf/type
+                     (keyword "oak.role" (str (name role) "-implementation"))))
+           components)
+      (keep (fn [row]
+              (when (= :permits (first row))
+                (triple (second row) :oak/permits (nth row 3))))
+            ontology)))))
+
+(defn candidates-for-role
+  "Discover role candidates by OWL entailment plus SPARQL, and report whether
+  each is permitted for the goal."
+  [ontology goal role]
+  (let [graph (materialize supported-owl-profile (ontology->rdf ontology))
+        quads (map (fn [{:keys [s p o]}]
+                     {:subject s :predicate p :object o}) graph)
+        rows (sparql/select
+              {:sparql/op :project
+               :vars ['?candidate]
+               :pattern {:sparql/op :bgp
+                         :patterns [['?candidate :rdf/type role]]}}
+              quads)
+        permitted (set (map :o (filter #(and (= goal (:s %))
+                                             (= :oak/permits (:p %))) graph)))]
+    (mapv (fn [row]
+            (let [id (get row '?candidate)]
+              {:id id :permitted? (contains? permitted id)}))
+          rows)))

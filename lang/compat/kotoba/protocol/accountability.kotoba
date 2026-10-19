@@ -1,0 +1,484 @@
+(ns kotoba.protocol.accountability
+  "Accountability tiers for anonymity (ADR-2610081200, R0).
+
+  Accountability attaches to the power an act exercises, not to the
+  person. The same principal may act at :t0 for one act and :t3 for
+  another. Three layers:
+
+    L0  invariants   — this ns. Fixed data. Neither consensus nor a
+                       profile may change it.
+    L1  policy       — a content-addressed object a graph adopts:
+                       act → externality → minimum tier, open params.
+    L2  profile      — fills L1's open params for one jurisdiction,
+                       industry, or community. May raise a tier,
+                       never lower one, never touch L0.
+
+  Two bindings that meet take the stricter requirement (max tier).
+  Nothing here verifies a credential or a signature: the held tier is
+  a claim that `kotoba-auth` / credential verification must back.
+  The shape is enough to fail closed:
+
+    unknown act, unbound act, missing threshold   → strictest outcome
+    policy below an L0 externality floor          → invalid policy
+    profile lowering a tier or naming an L0 key   → invalid profile
+    act evaluated under a later policy            → :retroactive
+    disclosure of a :t0/:t1 act                   → :no-disclosure-path"
+  (:require [kotoba.protocol.ref :as ref]
+            [kotoba.protocol.vocab :as vocab]))
+
+(def version 1)
+
+(def l0-version
+  "The L0 a policy declares itself bound to. A later L0 must contain
+  every invariant of this one."
+  "kotoba/accountability/v1")
+
+;; ── L0: tiers ───────────────────────────────────────────────────────────────
+
+(def tier-order [:t0 :t1 :t2 :t3])
+
+(def tiers
+  {:t0 {:name :anonymous
+        :visible :credential-predicate-only
+        :linkable :never
+        :disclosure-path? false}
+   :t1 {:name :contextual-pseudonym
+        :visible :pairwise-did-and-context-reputation
+        :linkable :within-context
+        :disclosure-path? false}
+   :t2 {:name :escrowed-pseudonym
+        :visible :pairwise-did-and-context-reputation
+        :linkable :within-context
+        :disclosure-path? :threshold-escrow}
+   :t3 {:name :accountable
+        :visible :verified-identity
+        :linkable :always
+        :disclosure-path? :public-log}})
+
+(defn tier? [t] (contains? tiers t))
+
+(defn tier-rank [t]
+  (when (tier? t)
+    (first (keep-indexed (fn [i x] (when (= x t) i)) tier-order))))
+
+(defn tier>=
+  "Does held tier `a` satisfy required tier `b`? Unknown is false."
+  [a b]
+  (let [ra (tier-rank a) rb (tier-rank b)]
+    (boolean (and ra rb (>= ra rb)))))
+
+(defn max-tier
+  "The stricter of the given tiers. This is the policy meet."
+  [& ts]
+  (when (and (seq ts) (every? tier? ts))
+    (reduce (fn [a b] (if (tier>= a b) a b)) ts)))
+
+;; ── L0: externalities ───────────────────────────────────────────────────────
+
+(def externalities
+  "An act is classified by what it does to others, not by any statute.
+  `:floor` is L0 and binds every policy. `:default` is the L1 starting
+  point a policy may copy or raise."
+  {:holds-others-data   {:floor :t3 :default :t3
+                         :doc "operates infra holding others' data or metadata"}
+   :intrudes-privacy    {:floor :t3 :default :t3
+                         :doc "requests the key to another principal's sealed data"}
+   :restricts-rights    {:floor :t3 :default :t3
+                         :doc "moderation, suspension, validation-rule change"}
+   :root-of-trust       {:floor :t3 :default :t3
+                         :doc "issues credentials or holds a disclosure share"}
+   :irreversible-spread {:floor :t1 :default :t2
+                         :doc "publishes code or packages others depend on"}
+   :value-transfer      {:floor :t1 :default :t1
+                         :doc "moves value irreversibly; threshold-escalated"}
+   :acts-for-other      {:floor :t2 :default :t2
+                         :doc "an agent acting for a principal; the chain must reach this tier"}
+   :expression          {:floor :t0 :default :t1
+                         :doc "posting"}
+   :anonymity-is-value  {:floor :t0 :default :t0
+                         :doc "private messaging, whistleblowing, secret ballot"}
+   :self-sovereign      {:floor :t0 :default :t0
+                         :doc "reading, storing and reading back one's own data"}})
+
+(defn externality? [e] (contains? externalities e))
+
+(defn floor-of [externality] (get-in externalities [externality :floor]))
+
+;; ── L0: invariants ──────────────────────────────────────────────────────────
+
+(def disclosure-floor
+  {:k-min 3
+   :n-min 5
+   ;; No single jurisdiction, organisation or operator may hold more
+   ;; than this share of a trustee set.
+   :max-share-num 1
+   :max-share-den 3})
+
+(def invariants
+  "Ids are stable: a later L0 must contain every one of these."
+  {:l0/no-disclosure-path-below-t2
+   "A :t0 or :t1 act has no disclosure path. A path that does not exist cannot be compelled."
+   :l0/no-retroactive-raise
+   "A policy or profile applies only to acts after it takes effect."
+   :l0/disclosure-always-logged
+   "A disclosure that is not in the transparency log is not a protocol disclosure."
+   :l0/profile-cannot-break-l0
+   "A profile fills open params and raises tiers. Nothing else."
+   :l0/power-acts-always-logged
+   "Acts at an externality whose floor is :t3 are logged under every profile."
+   :l0/trustee-diversity
+   "No jurisdiction, organisation or operator holds more than 1/3 of a trustee set."
+   :l0/disclosure-threshold-floor
+   "k >= 3 and n >= 5."
+   :l0/notice-must-expire
+   "Notice to a disclosed principal may be delayed, never withheld forever."})
+
+(def l0-param-keys
+  "Params whose bounds L0 constrains. A policy must declare them inside
+  the L0 bounds; a profile can only pick a value inside the policy's."
+  #{:param/disclosure-k :param/disclosure-n :param/notice-max-days})
+
+;; ── L1: policy ──────────────────────────────────────────────────────────────
+
+(def policy-keys
+  #{:policy/id :policy/parent :policy/l0 :policy/effective-from
+    :policy/actions :policy/params :policy/adopted-by})
+
+(defn- optional-ref-error [k v]
+  (when (and (some? v) (not (ref/canonical-ref-uri? v)))
+    {:error :not-a-canonical-ref :key k :value v}))
+
+(defn- range-ok? [{:keys [min max]}]
+  (and (or (nil? min) (number? min))
+       (or (nil? max) (number? max))
+       (or (nil? min) (nil? max) (<= min max))))
+
+(defn- param-errors [params]
+  (concat
+   (for [[k spec] params
+         :when (not (and (keyword? k) (map? spec) (range-ok? spec)))]
+     {:error :param-shape :param k :value spec})
+   (let [k-min (get-in params [:param/disclosure-k :min])
+         n-min (get-in params [:param/disclosure-n :min])
+         notice-max (get-in params [:param/notice-max-days :max])]
+     (remove nil?
+             [(when-not (and (number? k-min) (>= k-min (:k-min disclosure-floor)))
+                {:error :l0-violation :invariant :l0/disclosure-threshold-floor
+                 :param :param/disclosure-k :value k-min})
+              (when-not (and (number? n-min) (>= n-min (:n-min disclosure-floor)))
+                {:error :l0-violation :invariant :l0/disclosure-threshold-floor
+                 :param :param/disclosure-n :value n-min})
+              (when-not (number? notice-max)
+                {:error :l0-violation :invariant :l0/notice-must-expire
+                 :param :param/notice-max-days :value notice-max})]))))
+
+(defn- action-errors [actions params]
+  (if-not (and (map? actions) (seq actions))
+    [{:error :actions-required}]
+    (mapcat
+     (fn [[act {:keys [externality tier escalate] :as spec}]]
+       (remove nil?
+               [(when-not (keyword? act) {:error :action-not-keyword :action act})
+                (when-not (externality? externality)
+                  {:error :unknown-externality :action act :value externality})
+                (when-not (tier? tier)
+                  {:error :unknown-tier :action act :value tier})
+                (when (and (externality? externality) (tier? tier)
+                           (not (tier>= tier (floor-of externality))))
+                  {:error :l0-violation :invariant :l0/power-acts-always-logged
+                   :action act :tier tier :floor (floor-of externality)})
+                (when escalate
+                  (let [{:keys [above to]} escalate]
+                    (cond
+                      (not (contains? params above))
+                      {:error :escalate-param-undeclared :action act :param above}
+                      (not (and (tier? to) (tier? tier) (tier>= to tier) (not= to tier)))
+                      {:error :escalate-not-a-raise :action act :from tier :to to})))
+                (when-let [extra (seq (remove #{:externality :tier :escalate :doc} (keys spec)))]
+                  {:error :unknown-key :action act :keys (vec extra)})]))
+     actions)))
+
+(defn policy-errors
+  "[] when `p` is a valid L1 policy, else every error found."
+  [p]
+  (if-not (map? p)
+    [{:error :not-a-map}]
+    (vec
+     (concat
+      (remove nil?
+              [(when-let [extra (seq (remove policy-keys (keys p)))]
+                 {:error :unknown-key :keys (vec extra)})
+               (when-not (= l0-version (:policy/l0 p))
+                 {:error :l0-mismatch :value (:policy/l0 p) :expected l0-version})
+               (optional-ref-error :policy/id (:policy/id p))
+               (optional-ref-error :policy/parent (:policy/parent p))
+               (when-not (nat-int? (:policy/effective-from p))
+                 {:error :effective-from-required :value (:policy/effective-from p)})
+               (when-not (map? (:policy/params p))
+                 {:error :params-required})
+               (when-let [bad (seq (remove vocab/did-key? (:policy/adopted-by p)))]
+                 {:error :not-a-key :key :policy/adopted-by :value (vec bad)})])
+      (when (map? (:policy/params p)) (param-errors (:policy/params p)))
+      (action-errors (:policy/actions p) (:policy/params p))))))
+
+(defn valid-policy? [p] (empty? (policy-errors p)))
+
+(defn default-policy
+  "An L1 policy that copies every externality default. `actions` maps
+  act → externality (plus an optional `:escalate`)."
+  [{:keys [effective-from actions params]}]
+  {:policy/l0 l0-version
+   :policy/effective-from effective-from
+   :policy/params (merge {:param/disclosure-k {:min (:k-min disclosure-floor)}
+                          :param/disclosure-n {:min (:n-min disclosure-floor)}
+                          :param/notice-max-days {:min 0 :max 365}}
+                         params)
+   :policy/actions (into {}
+                         (map (fn [[act spec]]
+                                (let [{:keys [externality] :as spec}
+                                      (if (keyword? spec) {:externality spec} spec)]
+                                  [act (merge {:tier (get-in externalities [externality :default])}
+                                              spec)])))
+                         actions)})
+
+;; ── L2: profile ─────────────────────────────────────────────────────────────
+
+(def profile-keys
+  #{:profile/id :profile/policy :profile/scope :profile/effective-from
+    :profile/params :profile/authorizers :profile/credential-issuers
+    :profile/tier-raises})
+
+(def scope-kinds #{:jurisdiction :industry :community})
+
+(defn profile-errors
+  "[] when `pr` is a valid L2 profile for `policy`, else every error.
+  Unknown keys are errors: that is how a profile is kept from naming L0."
+  [policy pr]
+  (if-not (map? pr)
+    [{:error :not-a-map}]
+    (let [params (:policy/params policy)
+          actions (:policy/actions policy)]
+      (vec
+       (concat
+        (remove nil?
+                [(when-let [extra (seq (remove profile-keys (keys pr)))]
+                   {:error :unknown-key :invariant :l0/profile-cannot-break-l0
+                    :keys (vec extra)})
+                 (optional-ref-error :profile/id (:profile/id pr))
+                 (when-not (ref/canonical-ref-uri? (:profile/policy pr))
+                   {:error :not-a-canonical-ref :key :profile/policy
+                    :value (:profile/policy pr)})
+                 (when (and (:policy/id policy)
+                            (not= (:policy/id policy) (:profile/policy pr)))
+                   {:error :policy-mismatch :expected (:policy/id policy)
+                    :value (:profile/policy pr)})
+                 (when-not (contains? scope-kinds (get-in pr [:profile/scope :kind]))
+                   {:error :scope-kind :value (:profile/scope pr)})
+                 (when-not (nat-int? (:profile/effective-from pr))
+                   {:error :effective-from-required :value (:profile/effective-from pr)})
+                 (when (and (nat-int? (:profile/effective-from pr))
+                            (nat-int? (:policy/effective-from policy))
+                            (< (:profile/effective-from pr) (:policy/effective-from policy)))
+                   {:error :l0-violation :invariant :l0/no-retroactive-raise
+                    :value (:profile/effective-from pr)})
+                 (when-let [bad (seq (remove vocab/did-key? (:profile/credential-issuers pr)))]
+                   {:error :not-a-key :key :profile/credential-issuers :value (vec bad)})
+                 (when-let [bad (seq (remove #(and (map? %) (keyword? (:kind %)))
+                                             (:profile/authorizers pr)))]
+                   {:error :authorizer-shape :value (vec bad)})])
+        (for [[k v] (:profile/params pr)
+              :let [{:keys [min max] :as spec} (get params k)]
+              :when (or (nil? spec)
+                        (not (number? v))
+                        (and min (< v min))
+                        (and max (> v max)))]
+          (if (nil? spec)
+            {:error :param-undeclared :param k}
+            {:error :param-out-of-range :param k :value v :range spec}))
+        (for [[act t] (:profile/tier-raises pr)
+              :let [base (get-in actions [act :tier])]
+              :when (not (and base (tier? t) (tier>= t base)))]
+          (if (nil? base)
+            {:error :unknown-action :action act}
+            {:error :l0-violation :invariant :l0/profile-cannot-break-l0
+             :action act :tier t :policy-tier base})))))))
+
+(defn valid-profile? [policy pr] (empty? (profile-errors policy pr)))
+
+;; ── requirement and meet ────────────────────────────────────────────────────
+
+(defn requirement
+  "Minimum tier for `act` under one binding {:policy :profile}, in
+  `ctx` {:at n :value v}. → {:tier t} | {:error …}. Fail closed: an
+  escalation whose threshold is unset escalates."
+  [{:keys [policy profile]} act {:keys [at value]}]
+  (let [spec (get-in policy [:policy/actions act])
+        effective-from (max (or (:policy/effective-from policy) 0)
+                            (or (:profile/effective-from profile) 0))]
+    (cond
+      (not (valid-policy? policy)) {:error :invalid-policy}
+      (and profile (not (valid-profile? policy profile))) {:error :invalid-profile}
+      (nil? spec) {:error :unknown-action :action act}
+      (not (nat-int? at)) {:error :act-time-required}
+      (< at effective-from) {:error :retroactive :at at :effective-from effective-from}
+      :else
+      (let [base (max-tier (:tier spec)
+                           (or (get-in profile [:profile/tier-raises act]) (:tier spec)))
+            {:keys [above to]} (:escalate spec)
+            threshold (when above (get-in profile [:profile/params above]))
+            escalate? (and above
+                           (or (not (number? threshold))
+                               (not (number? value))
+                               (> value threshold)))]
+        {:tier (if escalate? (max-tier base to) base)}))))
+
+(defn meet
+  "Requirement for `act` across every binding it touches: the stricter
+  wins. No bindings is an error, not :t0."
+  [bindings act ctx]
+  (if (empty? bindings)
+    {:error :accountability-unbound}
+    (let [rs (map #(requirement % act ctx) bindings)]
+      (or (first (filter :error rs))
+          {:tier (apply max-tier (map :tier rs))}))))
+
+(defn decide
+  "Pure tier check. `:allow` or `{:deny …}`. `held` is a claim;
+  verifying it is not this ns's job."
+  [{:keys [action tier accountability context]}]
+  (let [r (meet accountability action context)]
+    (cond
+      (:error r) {:deny (:error r) :detail r}
+      (tier>= (or tier :t0) (:tier r)) :allow
+      :else {:deny :tier-insufficient :required (:tier r) :held (or tier :t0)})))
+
+;; ── L0: disclosure ──────────────────────────────────────────────────────────
+
+(defn- over-share? [n total]
+  (> (* n (:max-share-den disclosure-floor))
+     (* total (:max-share-num disclosure-floor))))
+
+(defn trustee-set-errors
+  "Trustees are maps with :did :jurisdiction :org. Checks k/n floors and
+  the 1/3 diversity bound on each axis."
+  [{:keys [k trustees]}]
+  (let [n (count trustees)]
+    (vec
+     (concat
+      (remove nil?
+              [(when-not (and (nat-int? k) (>= k (:k-min disclosure-floor)))
+                 {:error :l0-violation :invariant :l0/disclosure-threshold-floor :k k})
+               (when (< n (:n-min disclosure-floor))
+                 {:error :l0-violation :invariant :l0/disclosure-threshold-floor :n n})
+               (when (and (nat-int? k) (> k n))
+                 {:error :k-exceeds-n :k k :n n})
+               (when-let [bad (seq (remove #(vocab/did-key? (:did %)) trustees))]
+                 {:error :not-a-key :value (mapv :did bad)})])
+      (for [axis [:jurisdiction :org]
+            [v group] (group-by axis trustees)
+            :when (or (nil? v) (over-share? (count group) n))]
+        (if (nil? v)
+          {:error :trustee-axis-missing :axis axis}
+          {:error :l0-violation :invariant :l0/trustee-diversity
+           :axis axis :value v :count (count group) :n n}))))))
+
+(defn disclosure-errors
+  "A disclosure request is admissible only for a :t2 act, with evidence,
+  an authorizer the profile names, a diverse trustee set, and a log
+  entry. Admissible is not executed: the k-of-n opening is elsewhere."
+  [profile {:keys [act-tier evidence authorizer trustee-set log-entry]}]
+  (vec
+   (concat
+    (remove nil?
+            [(case act-tier
+               (:t0 :t1) {:error :no-disclosure-path
+                          :invariant :l0/no-disclosure-path-below-t2 :tier act-tier}
+               :t3 {:error :already-public :tier act-tier}
+               :t2 nil
+               {:error :unknown-tier :value act-tier})
+             (when-not (ref/canonical-ref-uri? (:act evidence))
+               {:error :evidence-act-required})
+             (when-not (ref/canonical-ref-uri? (:warrant evidence))
+               {:error :evidence-warrant-required})
+             (when-not (some #(= (:kind authorizer) (:kind %)) (:profile/authorizers profile))
+               {:error :authorizer-not-in-profile :value (:kind authorizer)})
+             (when-not (ref/canonical-ref-uri? log-entry)
+               {:error :l0-violation :invariant :l0/disclosure-always-logged})])
+    (trustee-set-errors trustee-set))))
+
+;; ── policy composition (R1) ─────────────────────────────────────────────────
+
+(defn- compose-param [a b]
+  (let [lo (keep :min [a b])
+        hi (keep :max [a b])]
+    (cond-> {}
+      (seq lo) (assoc :min (apply max lo))
+      (seq hi) (assoc :max (apply min hi)))))
+
+(defn- compose-action [a b]
+  (let [ea (:escalate a) eb (:escalate b)
+        stricter-ext (if (tier>= (floor-of (:externality a)) (floor-of (:externality b)))
+                       (:externality a)
+                       (:externality b))]
+    (cond
+      (and ea eb (not= (:above ea) (:above eb)))
+      {:error :escalate-conflict :params [(:above ea) (:above eb)]}
+      :else
+      (cond-> {:externality stricter-ext
+               :tier (max-tier (:tier a) (:tier b))}
+        (or ea eb) (assoc :escalate {:above (:above (or ea eb))
+                                     :to (apply max-tier (keep :to [ea eb]))})))))
+
+(defn compose-policies
+  "The meet of whole policies: every act from any of them, each at the
+  stricter tier; every param at the intersection of ranges. The result
+  is derived, not adopted, so it carries no id. → {:policy p} | {:error …}."
+  [policies]
+  (let [invalid (first (keep-indexed (fn [i p] (when-not (valid-policy? p) i)) policies))]
+    (cond
+      (empty? policies) {:error :no-policies}
+      invalid {:error :invalid-policy :index invalid}
+      :else
+      (let [actions (apply merge-with
+                           (fn [a b] (if (:error a) a (compose-action a b)))
+                           (map :policy/actions policies))
+            params (apply merge-with compose-param (map :policy/params policies))
+            bad-act (some (fn [[act v]] (when (:error v) (assoc v :action act))) actions)
+            bad-param (some (fn [[k {:keys [min max]}]]
+                              (when (and min max (> min max))
+                                {:error :param-range-empty :param k}))
+                            params)
+            p {:policy/l0 l0-version
+               :policy/effective-from (apply max (map :policy/effective-from policies))
+               :policy/params params
+               :policy/actions actions}]
+        (or bad-act
+            bad-param
+            (when-let [errs (seq (policy-errors p))] {:error :composed-invalid :errors (vec errs)})
+            {:policy p})))))
+
+;; ── receipt visibility (R1) ─────────────────────────────────────────────────
+
+(def owner-only-receipt-fields
+  "What an owner-only receipt may carry in plaintext: enough for a
+  custody cross-audit to match a key release, nothing about the reader."
+  #{:graph :operation :ts-unix :visibility})
+
+(defn receipt-visibility
+  "Self-access is receipted to the owner only. Anyone else's access,
+  anonymous included, stays operator-visible. Receipts are always
+  written: an unreceipted key release is still a custodian offence."
+  [{:keys [accessor owner]}]
+  (if (and (vocab/did-key? accessor) (= accessor owner))
+    :owner-only
+    :operator))
+
+(defn receipt-errors
+  "[] when `receipt` carries no more than its visibility allows."
+  [{:keys [visibility] :as receipt}]
+  (case visibility
+    :operator []
+    :owner-only (if-let [extra (seq (remove owner-only-receipt-fields (keys receipt)))]
+                  [{:error :owner-only-receipt-leaks :keys (vec (sort extra))}]
+                  [])
+    [{:error :unknown-visibility :value visibility}]))

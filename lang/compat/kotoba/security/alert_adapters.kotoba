@@ -1,0 +1,180 @@
+(ns kotoba.security.alert-adapters
+  "Vendor payload adapters for continuous-monitoring v1 alerts (R-005).
+
+  Pure data transforms — no network, no secrets. Used by alert-delivery to
+  shape Slack Incoming Webhook and PagerDuty Events API v2 bodies while
+  leaving the file sink on the canonical alert map.
+
+  Selection (first match wins):
+  1. explicit kind arg or env KOTOBA_SECURITY_ALERT_SINK (slack|pagerduty|generic)
+  2. URL heuristics (hooks.slack.com → slack, events.pagerduty.com → pagerduty)
+  3. default :generic
+
+  Never invents tokens/routing keys. PagerDuty payloads omit routing_key when
+  unset so callers can inject from env at delivery time."
+  {:kotoba/export [adapt-alert generic-payload known-sinks normalize-sink pagerduty-payload select-sink sink-from-url slack-payload]}
+  (:require [kotoba.lang.text :as str]))
+
+(def known-sinks
+  #{:slack :pagerduty :generic :file})
+
+(defn normalize-sink
+  "Coerce string/keyword sink name to keyword, or nil if unknown/blank."
+  [x]
+  (when (some? x)
+    (let [k (cond
+              (keyword? x) x
+              (string? x) (keyword (str/lower (str/trim x)))
+              :else nil)]
+      (when (contains? known-sinks k) k))))
+
+(defn sink-from-url
+  "Heuristic vendor detection from webhook URL host/path."
+  [url]
+  (when (string? url)
+    (let [u (str/lower url)]
+      (cond
+        (or (str/includes? u "hooks.slack.com")
+            (str/includes? u "slack.com/services/"))
+        :slack
+
+        (or (str/includes? u "events.pagerduty.com")
+            (str/includes? u "pagerduty.com/v2/enqueue")
+            (str/includes? u "events.eu.pagerduty.com"))
+        :pagerduty
+
+        :else nil))))
+
+(defn select-sink
+  "Choose sink kind from {:sink :url :env-sink}.
+
+  env-sink is typically the value of KOTOBA_SECURITY_ALERT_SINK."
+  [{:keys [sink url env-sink]}]
+  (or (normalize-sink sink)
+      (normalize-sink env-sink)
+      (sink-from-url url)
+      :generic))
+
+(defn- alert-title
+  [alert]
+  (or (:alert/name alert)
+      (:alert/id alert)
+      "kotoba-security-alert"))
+
+(defn- alert-severity-str
+  [alert]
+  (let [s (:alert/severity alert)]
+    (cond
+      (keyword? s) (name s)
+      (string? s) s
+      :else "SEV-3")))
+
+(defn- severity->pagerduty
+  "Map Kotoba SEV-* to PagerDuty Events API v2 severity."
+  [sev]
+  (case (str/upper (str sev))
+    ("SEV-1" "CRITICAL") "critical"
+    ("SEV-2" "ERROR" "HIGH") "error"
+    ("SEV-3" "WARNING" "MEDIUM") "warning"
+    ("SEV-4" "INFO" "LOW") "info"
+    "warning"))
+
+(defn- alert-summary
+  [alert]
+  (let [name (alert-title alert)
+        sev (alert-severity-str alert)
+        reason (or (:alert/reason alert) "")]
+    (str "[" sev "] " name
+         (when (seq reason) (str " — " reason)))))
+
+(defn- custom-details
+  "Flatten selected alert fields into a JSON-friendly map for vendor payloads."
+  [alert]
+  (into {}
+        (keep (fn [[k v]]
+                (when (some? v)
+                  [(if (keyword? k) (name k) (str k))
+                   (cond
+                     (keyword? v) (name v)
+                     (map? v) (pr-str v)
+                     :else v)])))
+        (select-keys alert
+                     [:alert/id :alert/name :alert/severity :alert/signal
+                      :alert/source :alert/run-id :alert/component
+                      :alert/package :alert/key-id :alert/reason
+                      :alert/policy :alert/decision :alert/evidence-id
+                      :alert/observed-at :alert/schema
+                      :alert/simulation? :alert/related-rule])))
+
+(defn slack-payload
+  "Slack Incoming Webhook body (text + simple blocks). No secrets."
+  [alert]
+  (let [summary (alert-summary alert)
+        sev (alert-severity-str alert)
+        details (custom-details alert)
+        detail-lines (->> details
+                          (sort-by key)
+                          (map (fn [[k v]] (str "• *" k "*: " v)))
+                          (str/join "\n"))]
+    {:text summary
+     :blocks
+     [{:type "header"
+       :text {:type "plain_text"
+              :text (str "Kotoba Security · " sev)
+              :emoji true}}
+      {:type "section"
+       :text {:type "mrkdwn" :text (str "*" (alert-title alert) "*\n" summary)}}
+      {:type "section"
+       :text {:type "mrkdwn"
+              :text (if (seq detail-lines)
+                      detail-lines
+                      "_no detail fields_")}}]}))
+
+(defn pagerduty-payload
+  "PagerDuty Events API v2 enqueue body.
+
+  opts:
+  - :routing-key  optional; omit when unset (never invent)
+  - :event-action default \"trigger\"
+  - :dedup-key    default alert/id or alert/run-id"
+  ([alert] (pagerduty-payload alert {}))
+  ([alert {:keys [routing-key event-action dedup-key]
+           :or {event-action "trigger"}}]
+   (let [sev (severity->pagerduty (alert-severity-str alert))
+         source (or (:alert/component alert)
+                    (:alert/source alert)
+                    "kotoba-lang/security")
+         body {:event_action event-action
+               :payload {:summary (alert-summary alert)
+                         :severity sev
+                         :source source
+                         :component (or (:alert/component alert) "security")
+                         :group (or (some-> (:alert/signal alert) name) "security")
+                         :class (or (:alert/name alert) "kotoba.security.alert")
+                         :custom_details (custom-details alert)}}
+         body (if (and (string? routing-key) (seq routing-key))
+                (assoc body :routing_key routing-key)
+                body)
+         dk (or dedup-key (:alert/id alert) (:alert/run-id alert))]
+     (cond-> body
+       (and (string? dk) (seq dk)) (assoc :dedup_key dk)))))
+
+(defn generic-payload
+  "Identity-shaped JSON-friendly map (canonical continuous-monitoring v1)."
+  [alert]
+  alert)
+
+(defn adapt-alert
+  "Return {:sink kind :body map} for the chosen vendor.
+
+  opts keys: :sink :url :env-sink :routing-key :event-action :dedup-key"
+  ([alert] (adapt-alert alert {}))
+  ([alert opts]
+   (let [kind (select-sink opts)
+         body (case kind
+                :slack (slack-payload alert)
+                :pagerduty (pagerduty-payload alert opts)
+                :generic (generic-payload alert)
+                :file (generic-payload alert)
+                (generic-payload alert))]
+     {:sink kind :body body})))

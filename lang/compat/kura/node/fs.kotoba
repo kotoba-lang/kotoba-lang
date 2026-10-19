@@ -1,0 +1,137 @@
+(ns kura.node.fs
+  "A shard store on a local filesystem.
+
+  The point is not convenience. `/audit` currently reports the Phase 0 fleet as
+  **two** failure domains against a code that needs three, and the two are
+  rented: Cloudflare and Backblaze. A box somebody actually owns is a third
+  domain in the sense that matters — different company, different hardware,
+  different power, different control plane — and it is the only one that can be
+  added without opening an account with anyone.
+
+  It is also what `run a node` has to mean. An operator network whose only
+  backend implementations are other people's clouds is not a storage network,
+  it is a reseller with extra steps.
+
+  **`:independent`, and that is a claim the operator makes.** Unlike the rented
+  backends, a self-hosted node genuinely is its own domain — but only if it is
+  genuinely somebody else's machine. Twenty of these in one rack are one
+  domain, and `kura.node.store/audit` will only know that if the operator says
+  so in `:failure-domain`. The suite cannot check it; nothing can.
+
+  **Durability here is the operator's, not ours.** A single disk with no
+  redundancy is a node that will eventually lose a shard, which is precisely
+  what the erasure code exists to absorb — but the operator should know that is
+  the arrangement rather than assume the network is protecting their disk."
+  (:require ["node:fs/promises" :as fsp]
+            ["node:path" :as path]
+            [kotoba.lang.text :as str]
+            [kura.node.async :as async]
+            [kura.node.store :as store]))
+
+(defn- shard-path [root prefix shard-id]
+  (path/join root (or prefix "kura") shard-id))
+
+(defn- ensure-dir> [p]
+  (fsp/mkdir (path/dirname p) #js {:recursive true}))
+
+(defn- missing? [e]
+  (= "ENOENT" (.-code ^js e)))
+
+(defrecord FsStore [root prefix desc]
+  async/IAsyncShardStore
+  (-put-shard!> [_ shard-id bytes]
+    (if-not (store/valid-shard-id? shard-id)
+      (js/Promise.reject (js/Error. (str "bad shard id: " shard-id)))
+      (let [p (shard-path root prefix shard-id)]
+        (-> (ensure-dir> p)
+            ;; Write to a temp name and rename. A crash mid-write otherwise
+            ;; leaves a short file that reads back as a shard, and a silently
+            ;; truncated shard is worse than an absent one — the absent one is
+            ;; repaired, the truncated one corrupts a reconstruction.
+            (.then (fn [_]
+                     (let [tmp (str p ".partial")]
+                       (-> (fsp/writeFile tmp bytes)
+                           (.then (fn [_] (fsp/rename tmp p)))))))
+            (.then (fn [_] {:shard-id shard-id :bytes-written (.-length ^js bytes)}))))))
+
+  (-get-shard> [_ shard-id]
+    (-> (fsp/readFile (shard-path root prefix shard-id))
+        (.then (fn [b] (js/Uint8Array. (.-buffer ^js b) (.-byteOffset ^js b) (.-length ^js b))))
+        (.catch (fn [e] (if (missing? e) nil (throw e))))))
+
+  (-get-range> [_ shard-id offset length]
+    (-> (fsp/open (shard-path root prefix shard-id) "r")
+        (.then (fn [fh]
+                 (let [buf (js/Buffer.alloc length)]
+                   (-> (.read ^js fh buf 0 length offset)
+                       (.then (fn [r]
+                                (-> (.close ^js fh)
+                                    (.then (fn [_]
+                                             ;; Clipped to what was actually
+                                             ;; read: a range past the end is
+                                             ;; short, not an error, which is
+                                             ;; what the contract asks for.
+                                             (js/Uint8Array.
+                                              (.-buffer buf) 0 (.-bytesRead r)))))))))))
+        (.catch (fn [e] (if (missing? e) nil (throw e))))))
+
+  (-delete-shard!> [_ shard-id]
+    (-> (fsp/unlink (shard-path root prefix shard-id))
+        (.then (fn [_] true))
+        (.catch (fn [e] (if (missing? e) false (throw e))))))
+
+  (-list-shards> [_ p]
+    (let [base (path/join root (or prefix "kura"))]
+      (-> (fsp/readdir base #js {:recursive true :withFileTypes true})
+          (.then (fn [entries]
+                   (->> entries
+                        (filter #(.isFile ^js %))
+                        (map (fn [e]
+                               ;; `parentPath` is Node >= 20.12/21.4; before
+                               ;; that the same value is `path`, which is now
+                               ;; the deprecated alias. Reading only the new
+                               ;; name yields undefined on Node 18 and throws
+                               ;; from path/join with a message about the
+                               ;; argument rather than about the version —
+                               ;; found by running this node on Ubuntu/Node
+                               ;; 18.19, where the contract suite stopped at
+                               ;; case 14 of 19. The newer name is tried first
+                               ;; so the deprecated one is only a fallback.
+                               (-> (path/join (or (.-parentPath ^js e)
+                                                  (.-path ^js e))
+                                              (.-name ^js e))
+                                   (str/replace (str base "/") ""))))
+                        ;; The temp files a crashed write leaves behind are not
+                        ;; shards and must never appear in an audit tree.
+                        (remove #(str/ends-with? % ".partial"))
+                        (filter #(str/starts-with? % (or p "")))
+                        sort
+                        vec)))
+          (.catch (fn [e] (if (missing? e) [] (throw e)))))))
+
+  (-shard-size> [_ shard-id]
+    (-> (fsp/stat (shard-path root prefix shard-id))
+        (.then (fn [st] (.-size ^js st)))
+        (.catch (fn [e] (if (missing? e) nil (throw e))))))
+
+  store/INodeIdentity
+  (-descriptor [_] desc))
+
+(defn open
+  "Open a filesystem shard store rooted at `:root`.
+
+  `:failure-domain` is required and is the operator's claim about what this
+  machine shares with the rest of their fleet — `{:operator \"alice\" :site
+  \"home\"}` says something the audit can use; omitting it says nothing and is
+  refused."
+  [{:keys [node-id root prefix failure-domain independence availability]
+    :or {prefix "kura" independence :independent}}]
+  (assert (and (string? root) (seq root)) "a root directory is required")
+  (->FsStore
+   root prefix
+   (store/descriptor
+    {:node-id node-id
+     :failure-domain failure-domain
+     :independence independence
+     :availability availability
+     :capabilities #{:range-read :list :delete :size-without-read :durable-put}})))

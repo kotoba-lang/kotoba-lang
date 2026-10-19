@@ -1,0 +1,124 @@
+(ns kotoba.security.release-evidence
+  "L6 / F-007: safe-release evidence gate (ADR-2607180900).
+
+  A safe release may proceed only when an evidence packet is complete:
+  - package-verification receipt (verified)
+  - signed guest module (S5) verified against trust
+  - key-register snapshot without blocked publisher
+  - SBOM / provenance (mandatory for safe release)
+
+  Missing packet items fail closed. Exceptions are governance records only;
+  they never waive cryptographic safe-release admission."
+  {:kotoba/export [evaluate required-evidence-keys required-release-evidence safe-release-ready?]}
+  (:require [kotoba.security.package-admission :as package-admission]
+            [kotoba.security.signed-module :as signed-module])
+  (:import [java.time Instant]))
+
+(def required-evidence-keys
+  #{:package-receipt :signed-module :trust :key-register})
+
+(def required-release-evidence
+  #{:sbom :provenance})
+
+(defn- today []
+  (subs (str (Instant/now)) 0 10))
+
+(defn- key-register-authorizes-signer?
+  [key-register signer]
+  (boolean
+   (some (fn [key]
+           (and (= signer (or (:key/signer key) (:key/id key)))
+                (= :active (:key/status key))))
+         (:keys key-register))))
+
+(defn- receipt-component-cids
+  [receipt]
+  (into #{}
+        (keep (fn [entry]
+                (or (:package/component-cid entry)
+                    (get-in entry [:package/build :component-cid]))))
+        (:kotoba.package/entries receipt)))
+
+(defn evaluate
+  "Evaluate a release evidence packet.
+
+  PACKET:
+  {:package-receipt <receipt from package-admission>
+   :signed-module <envelope from signed-module/sign>
+   :trust {:trusted-signers #{did...} :revoked-signers #{...}}
+   :key-register {:keys [...]}
+   :sbom <map or path-identity optional>
+   :provenance <map optional>
+   :component-bytes <required integrity>
+   :now \"YYYY-MM-DD\"
+   :require-component-cid? true}
+
+  Returns {:ok? bool :problems [...] :evidence {...}}."
+  [packet]
+  (let [now (or (:now packet) (today))
+        problems (atom [])
+        note! (fn [p] (swap! problems conj p))
+        receipt (:package-receipt packet)
+        release (package-admission/safe-release-ready?
+                 receipt
+                 {:require-component-cid?
+                  (boolean (:require-component-cid? packet true))})
+        _ (when-not (:ok? release)
+            (doseq [p (:problems release)]
+              (note! (assoc p :evidence :package-receipt))))
+        mod-result (when (:signed-module packet)
+                     (signed-module/verify
+                      (:signed-module packet)
+                      (or (:trust packet) {})
+                      {:now now
+                       :component-bytes (:component-bytes packet)}))
+        _ (cond
+            (nil? (:signed-module packet))
+            (note! {:problem :release/missing-signed-module
+                    :message "signed guest module required for safe release"})
+
+            (not (:ok? mod-result))
+            (doseq [p (:problems mod-result)]
+              (note! (assoc p :evidence :signed-module))))
+        signer (or (:signer mod-result)
+                   (get-in packet [:signed-module :statement :signer]))
+        component-cid (get-in mod-result [:module :component-cid])
+        receipt-cids (receipt-component-cids receipt)
+        _ (when-not (:component-bytes packet)
+            (note! {:problem :release/missing-component-bytes
+                    :message "component bytes required to bind release evidence"}))
+        _ (when (and component-cid (not (contains? receipt-cids component-cid)))
+            (note! {:problem :release/component-not-in-receipt
+                    :component-cid component-cid
+                    :message "signed component CID must equal an admitted receipt entry"}))
+        _ (when (and signer
+                     (not (key-register-authorizes-signer?
+                           (:key-register packet) signer)))
+            (note! {:problem :release/signer-not-active
+                    :signer signer
+                    :message "module signer must be present and active in key-register"}))
+        _ (when (nil? (:key-register packet))
+            (note! {:problem :release/missing-key-register
+                    :message "key-register snapshot required for safe release"}))
+        _ (when (nil? (:trust packet))
+            (note! {:problem :release/missing-trust
+                    :message "trust context required for safe release"}))
+        _ (doseq [kind required-release-evidence]
+            (when (nil? (get packet kind))
+              (note! {:problem :release/missing-evidence
+                      :kind kind
+                      :message (str (name kind) " required for safe release")})))]
+    {:ok? (empty? @problems)
+     :problems @problems
+     :evidence {:package-verified? (true? (:ok? release))
+                :module-verified? (true? (:ok? mod-result))
+                :signer signer
+                :checked-at now}}))
+
+(defn safe-release-ready?
+  "F-007 gate entry point. True only when evaluate returns :ok?"
+  [packet]
+  (let [r (evaluate packet)]
+    {:ok? (:ok? r)
+     :problems (:problems r)
+     :evidence (:evidence r)}))

@@ -1,0 +1,160 @@
+(ns murakumo.cd.automation
+  "Durable bridge from a canonical CI deployment action to capability-gated
+   artifact replication and progressive rollout. Environment state advances
+   only after a successful terminal receipt."
+  (:require [ed25519.core :as ed]
+            [murakumo.artifact-store :as artifact-store]
+            [murakumo.blob :as blob]
+            [murakumo.canonical :as canonical]
+            [murakumo.cd.bundle :as bundle]
+            [murakumo.cd.controller :as controller]
+            [murakumo.cd.receipt :as receipt]
+            [murakumo.cd.release :as release]
+            [murakumo.cd.rollout :as rollout]
+            [murakumo.identity :as identity]
+            [bonsai.repo :as repo]))
+
+(def state-bucket "murakumo-cd-environments")
+
+(defn policy-key [deployment]
+  (identity/graph-cid (canonical/string [:deployment deployment])))
+
+(defn- load-complete-bundle [source-get artifact]
+  (let [document (bundle/load-bundle source-get artifact)]
+    (doseq [{:keys [cid]} (:cd.bundle/components document)]
+      (when-not (source-get cid)
+        (throw (ex-info "murakumo-cd: release component unavailable"
+                        {:reason :component-unavailable :bundle-cid artifact
+                         :cid cid}))))
+    document))
+
+(defn valid-policy? [policy]
+  (and (string? (:environment policy))
+       (re-matches #"[A-Za-z0-9._-]+" (:environment policy))
+       (vector? (:targets policy))
+       (seq (:targets policy))
+       (every? #(and (string? %) (re-matches #"[A-Za-z0-9._-]+" %))
+               (:targets policy))
+       (= (count (:targets policy)) (count (distinct (:targets policy))))
+       (set? (:deploy-refs policy))
+       (seq (:deploy-refs policy))
+       (every? #(and (string? %) (re-matches #"refs/[A-Za-z0-9._/-]+" %))
+               (:deploy-refs policy))
+       (map? (:nodes policy))
+       (every? #(contains? (:nodes policy) %) (:targets policy))
+       (every? (fn [[_ endpoint]]
+                 (and (string? (:host endpoint))
+                      (pos-int? (:port endpoint))
+                      (contains? #{nil :quic :tcp} (:transport endpoint))))
+               (:nodes policy))
+       (pos-int? (or (:batch-size policy) 1))
+       (artifact-store/valid-cid? (:previous-artifact-cid policy))
+       (bundle/safe-relative-path? (:previous-revision policy))
+       (pos-int? (or (:capability-ttl-seconds policy) 900))
+       (map? (:session policy))
+       (every? #(and (string? %) (seq %))
+               [(:overlay (:session policy)) (:node (:session policy))])))
+
+(defn create-executor
+  [{:keys [store source-get store-artifact! rid policies issuer-seeds request-fn
+           clock-seconds persist-fn]
+    :or {clock-seconds #(quot (System/currentTimeMillis) 1000)}}]
+  (fn [action]
+    (let [deployment (:ci.action/deployment action)
+          policy (get policies deployment)
+          seed (get issuer-seeds deployment)]
+      (when-not (and (valid-policy? policy) (= 32 (some-> seed alength)))
+        (throw (ex-info "murakumo-cd: deployment policy or issuer unavailable"
+                        {:reason :deployment-policy-unavailable
+                         :deployment deployment})))
+      (when-not (fn? store-artifact!)
+        (throw (ex-info "murakumo-cd: receipt CAS is unavailable"
+                        {:reason :receipt-store-unavailable})))
+      (let [key (policy-key deployment)
+            existing ((:get store) state-bucket key)
+            artifact (:ci.action/bundle-cid action)
+            revision (:ci.action/revision action)]
+        (if (and (= artifact (:cd.environment/artifact-cid existing))
+                 (= revision (:cd.environment/revision existing)))
+          {:ok? true :status :already-deployed :state existing}
+          (let [previous-artifact (or (:cd.environment/artifact-cid existing)
+                                      (:previous-artifact-cid policy))
+                previous-revision (or (:cd.environment/revision existing)
+                                      (:previous-revision policy))
+                document (load-complete-bundle source-get artifact)
+                _ (when-not (= revision (:cd.bundle/revision document))
+                    (throw (ex-info "murakumo-cd: action and bundle revision disagree"
+                                    {:reason :release-revision-mismatch})))
+                _ (load-complete-bundle source-get previous-artifact)
+                now (clock-seconds)
+                finalized {:state :canonical :result :passed
+                           :verdict-cid (:ci.action/verdict-cid action)
+                           :verdict (:ci.action/verdict action)}
+                issued (release/issue-deployment
+                        seed rid finalized
+                        {:artifact-cid artifact
+                         :previous-artifact-cid previous-artifact
+                         :environment (:environment policy)
+                         :revision revision :previous-revision previous-revision
+                         :now now :ttl (or (:capability-ttl-seconds policy) 900)
+                         :nonce (identity/graph-cid
+                                 (canonical/string
+                                  [(:ci.action/verdict-cid action)
+                                   deployment artifact]))})
+                issuer (ed/did-key-from-seed seed)
+                plan (rollout/plan
+                      {:capability-cid (:capability-cid issued)
+                       :artifact-cid artifact
+                       :previous-artifact-cid previous-artifact
+                       :environment (:environment policy)
+                       :revision revision :previous-revision previous-revision
+                       :targets (:targets policy)
+                       :batch-size (or (:batch-size policy) 1)})
+                result (controller/execute-release!
+                        {:node-lookup #(get (:nodes policy) %)
+                         :session (:session policy)
+                         :issued-capability issued :source-get source-get
+                         :request-fn request-fn
+                         :timeout-ms (:timeout-ms policy)
+                         :chunk-bytes (:chunk-bytes policy)
+                         :clock-fn clock-seconds :rollout-plan plan
+                         :verification-policy
+                         {:rid rid :issuers #{issuer}
+                          :environment (:environment policy)
+                          :artifact-cid artifact
+                          :previous-artifact-cid previous-artifact
+                          :verdict-cid (:ci.action/verdict-cid action)
+                          :revision revision :previous-revision previous-revision}})]
+            (when-not (= :succeeded (get-in result [:rollout :cd.rollout/state]))
+              (throw (ex-info "murakumo-cd: automated rollout did not succeed"
+                              {:reason :rollout-unsuccessful
+                               :state (get-in result [:rollout :cd.rollout/state])
+                               :receipt-cid (:receipt-cid result)
+                               :events (get-in result [:rollout :cd.rollout/events])})))
+            (let [attestation (receipt/attest (repo/empty-repo) rid seed result now)
+                  _ (blob/put-all! store-artifact! (:blobs attestation))
+                  snapshot ((or persist-fn repo/persist!)
+                            store-artifact! (:db attestation) nil)]
+              ;; the snapshot is a Promise on kbb; see murakumo.blob/then
+              (blob/then
+               snapshot
+               (fn [snapshot-cid]
+                (let [receipt-proof (-> attestation
+                                        (dissoc :db :blobs)
+                                        (assoc :receipt-snapshot-cid snapshot-cid))
+                      next-state {:cd.environment/version 1
+                                  :cd.environment/deployment deployment
+                                  :cd.environment/environment (:environment policy)
+                                  :cd.environment/artifact-cid artifact
+                                  :cd.environment/revision revision
+                                  :cd.environment/verdict-cid
+                                  (:ci.action/verdict-cid action)
+                                  :cd.environment/capability-cid (:capability-cid issued)
+                                  :cd.environment/receipt-cid (:receipt-cid result)
+                                  :cd.environment/receipt-attestation receipt-proof
+                                  :cd.environment/updated-at now}]
+                  ((:put! store) state-bucket key next-state)
+                  {:ok? true :status :deployed :state next-state
+                   :receipt (:receipt result)
+                   :receipt-cid (:receipt-cid result)
+                   :receipt-attestation receipt-proof}))))))))))

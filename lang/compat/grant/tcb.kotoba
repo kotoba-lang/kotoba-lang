@@ -1,0 +1,169 @@
+(ns grant.tcb
+  "The trusted-computing-base record for this repository, and the check that
+  keeps it true.
+
+  Three properties, each of which was a real defect somewhere else first:
+
+  - **Digests.** Trusted code cannot change without the record changing. Same
+    mechanism `aiueos.tcb` uses; this repository's files were nineteen entries
+    in that inventory until the split (root ADR-2608219500).
+
+  - **Completeness.** A file in `src/` with no entry is an error. Everything
+    here is authority code, so a curated inventory would only be an argument
+    waiting to happen -- and the failure mode of curation is silent: a new
+    namespace is simply not listed, and nothing is wrong until it is.
+
+  - **Pins.** Recorded external pins are compared with the ones `deps.edn`
+    resolves. `kototama.tcb` asked only whether a boundary HAD a pin, and
+    measured 2026-08-22 three of its six recorded pins were wrong -- one of
+    them naming a SHA `deps.edn` had not pinned for weeks -- while its suite
+    stayed green. `:external-to-deps true` marks the boundaries that are not
+    Clojure dependencies at all; it is required rather than inferred from
+    absence, because a coordinate with a typo is also absent."
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.lang.text :as str])
+  (:import (java.security MessageDigest)))
+
+(def inventory-path "qualification/tcb-inventory.edn")
+(def source-root "src")
+
+(defn- hex [^bytes value]
+  (apply str (map #(format "%02x" (bit-and (int %) 0xff)) value)))
+
+(defn sha256-file [path]
+  (with-open [input (io/input-stream (io/file path))]
+    (let [digest (MessageDigest/getInstance "SHA-256")
+          buffer (byte-array 16384)]
+      (loop []
+        (let [read (.read input buffer)]
+          (when (pos? read)
+            (.update digest buffer 0 read)
+            (recur))))
+      (hex (.digest digest)))))
+
+(defn read-inventory []
+  (edn/read-string (slurp inventory-path)))
+
+(defn- source-files
+  "Every Clojure source file under `src/`, as repo-relative paths."
+  []
+  (->> (io/file-seq (io/file source-root))
+       (filter #(io/file? %))
+       (map #(io/path %))
+       (filter #(re-find #"\.clj[cs]?$" %))
+       sort))
+
+(defn- declared-deps []
+  (into {} (map (fn [[k v]] [(str k) v]))
+        (:deps (edn/read-string (slurp "deps.edn")))))
+
+(defn- file-errors [files]
+  (mapcat (fn [{:keys [path role sha256]}]
+            (let [f (io/file path)]
+              (cond
+                (not (io/exists? f)) [{:kind :missing-file :path path}]
+                (not (keyword? role)) [{:kind :missing-role :path path}]
+                (not= sha256 (sha256-file path))
+                [{:kind :digest-drift :path path
+                  :expected sha256 :actual (sha256-file path)}]
+                :else [])))
+          files))
+
+(defn- completeness-errors [files]
+  (let [listed (set (map :path files))]
+    (for [path (source-files)
+          :when (not (contains? listed path))]
+      {:kind :source-file-not-in-tcb :path path})))
+
+(defn- external-errors [external]
+  (let [deps (declared-deps)]
+    (keep (fn [{:keys [coordinate git-sha version minimum-version external-to-deps]}]
+            (let [declared (get deps coordinate)
+                  resolved (or (:git/sha declared) (:mvn/version declared))
+                  recorded (or git-sha version)]
+              (cond
+                (not (and coordinate (or recorded minimum-version)))
+                {:kind :unversioned-external-boundary :coordinate coordinate}
+
+                external-to-deps
+                (when declared
+                  {:kind :external-marked-not-a-dependency-but-declared
+                   :coordinate coordinate})
+
+                (nil? declared)
+                {:kind :external-not-in-deps :coordinate coordinate}
+
+                (not= (str recorded) (str resolved))
+                {:kind :external-pin-drift :coordinate coordinate
+                 :expected recorded :actual resolved})))
+          external)))
+
+(def adoption-path "security-adoption.edn")
+
+(defn- ns->path
+  "`grant.deployment-profile` -> `src/grant/deployment_profile.cljk|clj`."
+  [sym]
+  (let [base (str source-root "/" (-> (str sym) (str/replace "." "/") (str/replace "-" "_")))]
+    (first (filter #(io/exists? (io/file %)) [(str base ".cljk") (str base ".cljc") (str base ".clj") (str base ".cljs")]))))
+
+(defn adoption-errors
+  "The adoption record, against the source it describes.
+
+  Read rather than believed: every entrypoint must exist and must really
+  require every control listed against it, and the declared union must be
+  exactly what the entrypoints use. A record nothing reads is the failure
+  aiueos ADR-0067 named -- and when the grant plane moved, aiueos's record
+  still listed two entrypoints that were no longer in that repository at all."
+  ([] (adoption-errors (edn/read-string (slurp adoption-path))))
+  ([adoption]
+   (let [entries (:security-sensitive-entrypoints adoption)
+         declared (set (map str (:required-control-namespaces adoption)))
+         sha (:security/git-sha adoption)
+         dep-sha (:git/sha (get (declared-deps) "io.github.kotoba-lang/security"))]
+     (concat
+      (when (not= (str sha) (str dep-sha))
+        [{:kind :adoption-security-pin-drift :expected sha :actual dep-sha}])
+      (mapcat
+      (fn [[entry controls]]
+        (if-let [path (ns->path entry)]
+          (let [source (slurp path)]
+            (for [c controls
+                  :when (not (str/includes? source (str c)))]
+              {:kind :adoption-control-not-required :entrypoint entry :control (str c)}))
+          [{:kind :adoption-entrypoint-missing :entrypoint entry}]))
+      entries)
+      (let [used (set (map str (mapcat val entries)))]
+        (concat
+         (for [c (sort (remove used declared))]
+           {:kind :adoption-control-declared-but-unused :control c})
+         (for [c (sort (remove declared used))]
+           {:kind :adoption-control-used-but-undeclared :control c})))))))
+
+(defn validate
+  ([] (validate (read-inventory)))
+  ([inventory]
+   (let [files (:tcb/files inventory)
+         paths (mapv :path files)
+         external (:tcb/external inventory)
+         errors (vec (concat
+                      (when-not (= 1 (:tcb/version inventory))
+                        [{:kind :unsupported-version :actual (:tcb/version inventory)}])
+                      (when-not (= (count paths) (count (set paths)))
+                        [{:kind :duplicate-path}])
+                      (when-not (seq external)
+                        [{:kind :missing-external-boundaries}])
+                      (file-errors files)
+                      (completeness-errors files)
+                      (external-errors external)
+                      (adoption-errors)))]
+     {:valid? (empty? errors)
+      :files (count files)
+      :external (count external)
+      :errors errors})))
+
+(defn -main [& _]
+  (let [result (validate)]
+    (prn result)
+    (when-not (:valid? result)
+      (System/exit 1))))

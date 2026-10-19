@@ -1,0 +1,275 @@
+(ns kotodama.inference.ops
+  "Portable transformer ops used by the direct Gemma verifier path."
+  (:require [num.array :as arr]))
+
+(defn gemma-rmsnorm-values
+  "Gemma RMSNorm over host values.
+
+  Gemma stores the RMSNorm scale as an offset weight, so the multiplier is
+  `(1 + weight)` after RMS normalization."
+  ([xs weights] (gemma-rmsnorm-values xs weights 1.0e-6))
+  ([xs weights eps]
+   (when-not (= (count xs) (count weights))
+     (throw (ex-info "RMSNorm input and weight lengths differ"
+                     {:input-count (count xs)
+                      :weight-count (count weights)})))
+   (let [n (count xs)
+         mean-square (/ (reduce + (map #(* (double %) (double %)) xs)) n)
+         inv-rms (/ 1.0 )]
+     (mapv (fn [x w]
+             (* (double x) inv-rms (+ 1.0 (double w))))
+           xs
+           weights))))
+
+(defn values->num
+  "Upload op output values to a num-clj backend as an NDArray."
+  [backend values shape]
+  (arr/from-vec backend values shape))
+
+(defn rope-interleaved-values
+  "Apply interleaved rotary position embedding to a value prefix.
+
+  Values are interpreted as `[x0 y0 x1 y1 ...]`. This helper is intentionally
+  prefix-friendly so verifiers can prove the Q/K lowering boundary before full
+  head materialization lands."
+  [values position rope-dim theta]
+  (when-not (zero? (mod (count values) 2))
+    (throw (ex-info "RoPE input count must be even"
+                    {:value-count (count values)})))
+  (when-not (pos? rope-dim)
+    (throw (ex-info "RoPE dimension must be positive"
+                    {:rope-dim rope-dim})))
+  (when-not (pos? theta)
+    (throw (ex-info "RoPE theta must be positive"
+                    {:theta theta})))
+  (let [pos (double position)
+        dim (double rope-dim)]
+    (vec
+     (mapcat
+      (fn [pair-index [x y]]
+        (let [angle (/ pos )
+              c 
+              s 
+              xd (double x)
+              yd (double y)]
+          [(- (* xd c) (* yd s))
+           (+ (* xd s) (* yd c))]))
+      (range)
+      (partition 2 values)))))
+
+(defn dot-values [xs ys]
+  (when-not (= (count xs) (count ys))
+    (throw (ex-info "Dot inputs must have the same length"
+                    {:x-count (count xs)
+                     :y-count (count ys)})))
+  (reduce + (map #(* (double %1) (double %2)) xs ys)))
+
+(defn add-values
+  "Elementwise residual add over host values."
+  [xs ys]
+  (when-not (= (count xs) (count ys))
+    (throw (ex-info "Add inputs must have the same length"
+                    {:x-count (count xs)
+                     :y-count (count ys)})))
+  (mapv #(+ (double %1) (double %2)) xs ys))
+
+(defn silu-value [x]
+  (let [xd (double x)]
+    (/ xd (+ 1.0 ))))
+
+(defn gated-mlp-activation-values
+  "Gemma gated MLP activation for matching gate/up projection prefixes."
+  [gate-values up-values]
+  (when-not (= (count gate-values) (count up-values))
+    (throw (ex-info "Gate and up projection counts differ"
+                    {:gate-count (count gate-values)
+                     :up-count (count up-values)})))
+  (mapv #(* (silu-value %1) (double %2)) gate-values up-values))
+
+(defn single-token-attention-values
+  "Single-token causal attention over one Q head and one matching KV head.
+
+  With a single visible key, softmax has one entry with weight 1.0. The score
+  is still returned because it proves the scaled QK boundary before multi-token
+  GQA lands."
+  [q-head k-head v-head]
+  (when-not (= (count q-head) (count k-head))
+    (throw (ex-info "Q and K head dimensions differ"
+                    {:q-count (count q-head)
+                     :k-count (count k-head)})))
+  (let [head-dim (count q-head)
+        score (/ (dot-values q-head k-head)
+                 )]
+    {:score score
+     :weights [1.0]
+     :values (vec v-head)}))
+
+(defn softmax-values [xs]
+  (let [values (mapv double xs)
+        max-value (reduce max values)
+        exps (mapv 
+                   values)
+        total (reduce + exps)]
+    (mapv #(/ % total) exps)))
+
+(defn causal-attention-values
+  "Causal attention for one Q head over visible K/V heads."
+  [q-head k-heads v-heads]
+  (when-not (= (count k-heads) (count v-heads))
+    (throw (ex-info "K/V token counts differ"
+                    {:k-count (count k-heads)
+                     :v-count (count v-heads)})))
+  (doseq [k-head k-heads]
+    (when-not (= (count q-head) (count k-head))
+      (throw (ex-info "Q and K head dimensions differ"
+                      {:q-count (count q-head)
+                       :k-count (count k-head)}))))
+  (let [head-dim (count q-head)
+        scores (mapv #(/ (dot-values q-head %)
+                         )
+                     k-heads)
+        weights (softmax-values scores)
+        values (mapv (fn [i]
+                       (reduce +
+                               (map #(* (double %1)
+                                        (double (nth %2 i)))
+                                    weights
+                                    v-heads)))
+                     (range head-dim))]
+    {:scores scores
+     :weights weights
+     :values values}))
+
+;; ---------------------------------------------------------------------------
+;; Gemma4 (per-layer-embedding architecture) correct ops.
+;;
+;; These are ADDITIVE: they exist alongside the golden-verified ops above and
+;; are the ones the Gemma4/PLE forward pass composes. The differences from the
+;; original ops are all confirmed against the real GGUF tensors + Hugging Face
+;; `modeling_gemma4.py` (see host/jvm.clj docstring for the tensor evidence):
+;;
+;;   * Gemma4RMSNorm multiplies by `weight` directly (NOT `1 + weight`) because
+;;     the GGUF stores full-scale norm weights (attn_norm ~= 8, q_norm ~= 0.98),
+;;     not the "delta from 1" Gemma2/3 convention `gemma-rmsnorm-values` assumes.
+;;   * value states are RMS-normalized with a *weightless* norm (v_norm,
+;;     `with_scale=False`) — there is no GGUF tensor for it.
+;;   * attention softmax scale is 1.0 (Gemma4 `self.scaling = 1.0`); the QK
+;;     magnitude is controlled by the learned q_norm / k_norm weights, not a
+;;     `1/sqrt(head_dim)` divide.
+;;   * RoPE is rotate-half / NEOX (pairs `(i, i+dim/2)`), not the GPT-J
+;;     interleaved pairing `rope-interleaved-values` implements.
+;;   * the gated MLP and the per-layer-input gate use `gelu_pytorch_tanh`, not
+;;     SiLU.
+;; ---------------------------------------------------------------------------
+
+(defn rmsnorm-weighted-values
+  "Gemma4 RMSNorm: normalize by RMS, then multiply by `weights` directly.
+
+  Unlike `gemma-rmsnorm-values` this does NOT add 1.0 to the weight — the
+  Gemma4 GGUF stores full-scale RMSNorm weights."
+  ([xs weights] (rmsnorm-weighted-values xs weights 1.0e-6))
+  ([xs weights eps]
+   (when-not (= (count xs) (count weights))
+     (throw (ex-info "RMSNorm input and weight lengths differ"
+                     {:input-count (count xs) :weight-count (count weights)})))
+   (let [n (count xs)
+         mean-square (/ (reduce + (map #(* (double %) (double %)) xs)) n)
+         inv-rms (/ 1.0 )]
+     (mapv (fn [x w] (* (double x) inv-rms (double w))) xs weights))))
+
+(defn rms-normalize-values
+  "Weightless RMS normalization (Gemma4 v_norm, `with_scale=False`)."
+  ([xs] (rms-normalize-values xs 1.0e-6))
+  ([xs eps]
+   (let [n (count xs)
+         mean-square (/ (reduce + (map #(* (double %) (double %)) xs)) n)
+         inv-rms (/ 1.0 )]
+     (mapv (fn [x] (* (double x) inv-rms)) xs))))
+
+(defn rope-neox-values
+  "Rotate-half / NEOX rotary position embedding over a full head vector.
+
+  `values` is one head of length `head-dim` (which must equal `rope-dim` for a
+  fully-rotated head, as Gemma4 uses). Pairs dimension `j` with `j + dim/2` and
+  rotates both by angle `position / theta^(2j/dim)`. This matches Hugging Face
+  `apply_rotary_pos_emb` with `emb = cat(freqs, freqs)`."
+  [values position rope-dim theta]
+  (let [d (long rope-dim)
+        half (quot d 2)
+        v (vec values)
+        pos (double position)]
+    (when-not (= (count v) d)
+      (throw (ex-info "RoPE head length must equal rope-dim"
+                      {:value-count (count v) :rope-dim rope-dim})))
+    (loop [j 0 out (transient (vec (repeat d 0.0)))]
+      (if (< j half)
+        (let [angle (/ pos )
+              c 
+              s 
+              x (double (nth v j))
+              y (double (nth v (+ j half)))]
+          (recur (inc j)
+                 (-> out
+                     (assoc! j (- (* x c) (* y s)))
+                     (assoc! (+ j half) (+ (* x s) (* y c))))))
+        (persistent! out)))))
+
+(defn rope-neox-divisors-values
+  "Rotate-half / NEOX RoPE using an explicit per-pair `divisors` vector (length
+  head-dim/2). Pair `j` (dims `j` and `j+dim/2`) rotates by `position/divisors[j]`.
+  A divisor of ~1e10 leaves the pair effectively unrotated (identity), which is
+  how Gemma4's `full_attention` layers implement partial/proportional rotary."
+  [values position head-dim divisors]
+  (let [d (long head-dim)
+        half (quot d 2)
+        v (vec values)
+        pos (double position)]
+    (when-not (= (count v) d)
+      (throw (ex-info "RoPE head length must equal head-dim"
+                      {:value-count (count v) :head-dim head-dim})))
+    (loop [j 0 out (transient (vec (repeat d 0.0)))]
+      (if (< j half)
+        (let [angle (/ pos (double (nth divisors j)))
+              c 
+              s 
+              x (double (nth v j))
+              y (double (nth v (+ j half)))]
+          (recur (inc j)
+                 (-> out
+                     (assoc! j (- (* x c) (* y s)))
+                     (assoc! (+ j half) (+ (* x s) (* y c))))))
+        (persistent! out)))))
+
+(defn gelu-tanh-value
+  "gelu_pytorch_tanh: 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))."
+  [x]
+  (let [xd (double x)
+        c 0.7978845608028654 ; sqrt(2/pi)
+        inner (* c (+ xd (* 0.044715 xd xd xd)))]
+    (* 0.5 xd (+ 1.0 ))))
+
+(defn gelu-gated-mlp-activation-values
+  "Gemma4 gated MLP activation: gelu_pytorch_tanh(gate) * up."
+  [gate-values up-values]
+  (when-not (= (count gate-values) (count up-values))
+    (throw (ex-info "Gate and up projection counts differ"
+                    {:gate-count (count gate-values) :up-count (count up-values)})))
+  (mapv #(* (gelu-tanh-value %1) (double %2)) gate-values up-values))
+
+(defn causal-attention-values-scaled
+  "Causal attention for one Q head over visible K/V heads, with an explicit
+  softmax `scale` on the QK dot products (Gemma4 uses `scale` = 1.0)."
+  [q-head k-heads v-heads scale]
+  (when-not (= (count k-heads) (count v-heads))
+    (throw (ex-info "K/V token counts differ"
+                    {:k-count (count k-heads) :v-count (count v-heads)})))
+  (let [head-dim (count q-head)
+        sc (double scale)
+        scores (mapv #(* sc (dot-values q-head %)) k-heads)
+        weights (softmax-values scores)
+        values (mapv (fn [i]
+                       (reduce +
+                               (map #(* (double %1) (double (nth %2 i)))
+                                    weights v-heads)))
+                     (range head-dim))]
+    {:scores scores :weights weights :values values}))

@@ -1,0 +1,284 @@
+(ns murakumo.infer.edge
+  "Resident launchd plans for the Murakumo edge replica and queue worker.
+
+  ## These are LaunchDaemons, and that is the whole point
+
+  They were LaunchAgents until 2026-09-09. Measured that day on all six
+  reachable minis: `who` is empty and /dev/console is owned by root, so no
+  interactive session exists, so `~/Library/LaunchAgents` is never loaded and
+  `launchctl` from ssh answers `125: Domain does not support specified action`.
+  The workers that were running had been started by hand -- 10d21h old on hosts
+  that had booted 24 days earlier, a two-week gap in which those nodes served
+  nothing and nobody could see it, because a node that is enrolled and dark and
+  a node that is enrolled and busy both answer the registry the same way.
+
+  That mattered more than a missing convenience, because the cure for the three
+  dark nodes is a reboot: their ephemeral port range is full of TIME_WAIT the
+  kernel does not reclaim (benjamin 48,298 of 49,152; the count was unchanged
+  45 s after its producer was killed). So the fleet was in a loop -- the repair
+  is a reboot, and a reboot is what the supervision could not survive.
+
+  A LaunchDaemon in the system domain loads at boot with no login, which is
+  what `murakumo.infer.clj` already does for the RPC worker. `UserName` keeps
+  the process running as the node user, because the model, the nbb runtime and
+  `join.env` all live under that user's home.
+
+  Ranked first, unanimously, by `murakumo.cluster.cosci`: every admissible
+  design in that tournament is `:launch-daemon-system`, and it is the one
+  dimension whose answer does not depend on any unmeasured input."
+  (:require [kotoba.lang.text :as str]
+            [kotodama.inference.edge :as inference-edge]))
+
+(def model-id "murakumo-edge")
+(def server-label "com.murakumo.edge-server")
+(def join-label "com.murakumo.edge-join")
+(def port 8092)
+
+(defn labels-for
+  "The launchd labels that serve `model` on a node.
+
+  murakumo-edge keeps the names it has had since these jobs existed; every
+  other model shares ONE pair, `com.murakumo.model-{server,join}`. That is not
+  an oversight to be tidied later -- it is the one-model rule expressed in
+  launchd. A node cannot hold two dedicated models because they would be the
+  same job, and installing the second is therefore replacing the first rather
+  than joining it. The edge pair is the same plane under an older name, so a
+  dedicated install boots the edge pair out by name (see `install-script`)."
+  [model]
+  (if (= model-id model)
+    {:server server-label :join join-label}
+    {:server "com.murakumo.model-server" :join "com.murakumo.model-join"}))
+
+(def daemon-dir "/Library/LaunchDaemons")
+
+(def legacy-agent-dir
+  "Where these two jobs lived until 2026-09-09. `install-script` removes the
+  file as well as unloading it: leaving it behind means the next machine that
+  does get a login session starts a second copy of a job that is already
+  running in the system domain, and two edge-join workers on one node claim
+  each other's jobs."
+  "Library/LaunchAgents")
+
+(defn- xml [value]
+  (-> (str value) (str/replace "&" "&amp;") (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;") (str/replace "\"" "&quot;")))
+
+(defn- plist
+  "A system-domain LaunchDaemon that runs as `user`.
+
+  `UserName` is not decoration: without it launchd runs the job as root, the
+  process writes root-owned files into the node user's ~/.murakumo, and the
+  next non-root run fails on its own logs."
+  [label user argv stdout stderr]
+  (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+       "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+       "<plist version=\"1.0\"><dict>\n"
+       "<key>Label</key><string>" (xml label) "</string>\n"
+       "<key>UserName</key><string>" (xml user) "</string>\n"
+       "<key>ProgramArguments</key><array>"
+       (apply str (map #(str "<string>" (xml %) "</string>") argv))
+       "</array>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n"
+       ;; 60, not launchd's 5. Measured 2026-09-10 on simeon: the worker exits
+       ;; when its startup enrolment fetch fails, KeepAlive restarts it, and at
+       ;; a five-second throttle that is ~720 restarts an hour, each opening a
+       ;; socket. simeon burned through the 53,536-port range it had just been
+       ;; given -- 53,181 in TIME_WAIT -- and the crash loop, not the poller,
+       ;; was what spent them.
+       ;;
+       ;; This is a bound on the bleeding, not the cure. The cure is for
+       ;; enrolment to retry in-process under `murakumo.infer.backoff` like the
+       ;; poll and heartbeat loops already do, instead of exiting and letting
+       ;; launchd retry on a fixed cadence -- which is precisely the pattern
+       ;; ADR-2609021500 rule 1 forbids, arrived at from outside the process.
+       "<key>ThrottleInterval</key><integer>60</integer>\n"
+       "<key>StandardOutPath</key><string>" (xml stdout) "</string>\n"
+       "<key>StandardErrorPath</key><string>" (xml stderr) "</string>\n"
+       "</dict></plist>\n"))
+
+(defn model-server-plan
+  "The resident llama-server plan for one model on one node.
+
+  The port comes from the artifact, not from this namespace: murakumo-edge
+  serves 8092 and a dedicated model serves its own, so that a conversion can be
+  verified against the new plane before the old one is torn down, and so that
+  \"which plane answered\" is never a question about timing."
+  [model {:keys [home llama-server memory-bytes]}]
+  (let [user (last (str/split home #"/"))
+        {:keys [server]} (labels-for model)
+        plan (inference-edge/plan-for-model
+              model {:home home :llama-server llama-server
+                     :memory-bytes memory-bytes})]
+    (when-not (:admitted? plan)
+      (throw (ex-info (str model " does not fit this node") plan)))
+    (assoc plan :label server
+           :home home
+           :model model
+           :orphan-pattern (str "murakumo/models/" model)
+           :plist (plist server user (:argv plan)
+                         (str home "/.murakumo/edge/" model "-server.log")
+                         (str home "/.murakumo/edge/" model "-server.err.log")))))
+
+(defn server-plan
+  "The murakumo-edge replica plan. Log paths unchanged so an existing node's
+  files do not move underneath whoever is tailing them."
+  [{:keys [home llama-server memory-bytes] :as opts}]
+  (let [user (last (str/split home #"/"))
+        plan (model-server-plan model-id opts)]
+    (assoc plan :plist (plist server-label user (:argv plan)
+                              (str home "/.murakumo/edge/server.log")
+                              (str home "/.murakumo/edge/server.err.log")))))
+
+(defn install-script
+  "Shell to install one rendered plan as a system LaunchDaemon on a node.
+
+  Same idiom as `murakumo.infer/install-rpc-worker-service!`, plus the removal
+  of the legacy LaunchAgent. `bootout` before `bootstrap` so a re-run replaces
+  the definition rather than failing on it -- and note that launchd caches the
+  definition it loaded, so writing the file is not loading it (the 2026-09-09
+  root ADR records a fleet cutover where 57 jobs were rewritten, all reported
+  as reloaded, and exactly one was still running its old definition)."
+  [{:keys [label plist home orphan-pattern]}]
+  (str "sudo -n /usr/bin/tee " daemon-dir "/" label ".plist >/dev/null <<'MURAKUMO_EDGE_PLIST'\n"
+       plist
+       "MURAKUMO_EDGE_PLIST\n"
+       "sudo -n /usr/sbin/chown root:wheel " daemon-dir "/" label ".plist; "
+       "sudo -n /bin/chmod 644 " daemon-dir "/" label ".plist; "
+       ;; Retire the LaunchAgent that could never load, and any hand-started
+       ;; orphan of it, before the daemon claims the port and the queue slot.
+       "/bin/launchctl bootout gui/$(id -u)/" label " >/dev/null 2>&1 || true; "
+       "rm -f " home "/" legacy-agent-dir "/" label ".plist; "
+       ;; The processes actually running on these nodes are NOT launchd jobs --
+       ;; they are orphans of a session that ended, so `bootout` does not touch
+       ;; them. Without this line the bootstrap below starts a second worker
+       ;; beside the first, and two edge-join workers on one node race each
+       ;; other for the same queue jobs ("already claimed, trying next" is what
+       ;; that looks like in the log, from both of them).
+       "pkill -f '" orphan-pattern "' >/dev/null 2>&1 || true; "
+       "sudo -n /bin/launchctl bootout system/" label " >/dev/null 2>&1 || true; sleep 1; "
+       "sudo -n /bin/launchctl bootstrap system " daemon-dir "/" label ".plist; "
+       "sudo -n /bin/launchctl kickstart -k system/" label "; "
+       ;; Assert the loaded definition, not the file. `launchctl list` cannot
+       ;; tell a stale definition from a fresh one; `print` shows the path the
+       ;; running job will actually write to.
+       "sudo -n /bin/launchctl print system/" label " | grep -F '" home "' >/dev/null "
+       "|| { echo 'MURAKUMO_EDGE_INSTALL_UNVERIFIED " label "' >&2; exit 3; }"))
+
+(defn model-join-plan
+  "The queue worker for one model on one node.
+
+  Same worker, same env file, same trust tier as the edge join -- what changes
+  is which model it enrols for and which local port it executes against. The
+  two are one decision: a worker enrolled for murakumo-27b that points at 8092
+  claims 27B jobs and answers them with the 9B."
+  [model {:keys [home nbb node-name local-port]}]
+  (let [user (last (str/split home #"/"))
+        {:keys [join]} (labels-for model)
+        root (str home "/.murakumo/edge/murakumo")
+        command (str "set -a; source " home "/.murakumo/edge/join.env; set +a; exec "
+                     nbb " --classpath " root "/src " root
+                     "/scripts/infer-join.cljk --model " model
+                     " --base https://api.murakumo.cloud --name " node-name
+                     ;; These are fleet.edn hardware operated by AWAI Network,
+                     ;; which is exactly what docs/adr-secure-community-cloud.md
+                     ;; calls :awai-secure. The join worker defaults to
+                     ;; community on purpose (an unauthenticated provider must
+                     ;; never become Secure by omission), so the operator of the
+                     ;; hardware has to say so here. Without it the ten resident
+                     ;; Ornith minis enrolled Community, workloads asked for
+                     ;; Secure, placement requires an exact tier match with no
+                     ;; fallback, and murakumo-edge answered 503 with every node
+                     ;; live, ready and idle.
+                     " --trust-tier awai-secure"
+                     " --local-url http://127.0.0.1:" local-port "/v1 --slots 1 --poll-ms 1000")]
+    {:label join
+     :home home
+     :model model
+     :argv ["/bin/zsh" "-lc" command]
+     :orphan-pattern "murakumo/scripts/infer-join.cljk"
+     :plist (plist join user ["/bin/zsh" "-lc" command]
+                   (str home "/.murakumo/edge/" model "-join.log")
+                   (str home "/.murakumo/edge/" model "-join.err.log"))}))
+
+(defn join-plan
+  "The murakumo-edge queue worker. Log paths unchanged, as with `server-plan`."
+  [{:keys [home] :as opts}]
+  (let [user (last (str/split home #"/"))
+        plan (model-join-plan model-id (assoc opts :local-port port))]
+    (assoc plan :plist
+           (plist join-label user (:argv plan)
+                  (str home "/.murakumo/edge/join.log")
+                  (str home "/.murakumo/edge/join.err.log")))))
+
+;; ── the wired-memory limit a dedicated node needs to survive a boot ────────
+;;
+;; `iogpu.wired_limit_mb` is how much unified memory Metal may wire. Measured
+;; on issachar 2026-09-10: the 27B wires 15,222 MiB while serving, and the
+;; node's own default is 13,312 -- below it. `murakumo infer provision` already
+;; raises the limit, with `sysctl -w`, which does not survive a boot. So the
+;; failure this daemon exists to prevent is the quiet one: the node reboots,
+;; the limit reverts, the model loads anyway on the CPU, llama-server reports
+;; healthy, the queue worker enrols, and every job is served at a fraction of
+;; the speed by a node that says nothing is wrong.
+
+(def wired-limit-label "com.murakumo.iogpu-wired-limit")
+
+(defn wired-limit-plist
+  [mb]
+  (when-not (and (integer? mb) (pos? mb))
+    (throw (ex-info "wired limit must be a positive whole number of MiB" {:mb mb})))
+  (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+       "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+       "<plist version=\"1.0\"><dict>\n"
+       "<key>Label</key><string>" wired-limit-label "</string>\n"
+       "<key>ProgramArguments</key><array>"
+       "<string>/usr/sbin/sysctl</string><string>-w</string>"
+       "<string>iogpu.wired_limit_mb=" mb "</string>"
+       "</array>\n<key>RunAtLoad</key><true/>\n"
+       "</dict></plist>\n"))
+
+(defn wired-limit-script
+  "Install the limit as a root LaunchDaemon and apply it now.
+
+  Verified by reading the sysctl back, not by the exit status of `launchctl`:
+  bootstrapping a job that runs `sysctl -w` succeeds whether or not the write
+  did, and a node that reports a successful install while sitting at 13,312 is
+  the exact failure the daemon is for."
+  [mb]
+  (str "sudo -n /usr/bin/tee " daemon-dir "/" wired-limit-label ".plist >/dev/null <<'MURAKUMO_WIRED_PLIST'\n"
+       (wired-limit-plist mb)
+       "MURAKUMO_WIRED_PLIST\n"
+       "sudo -n /usr/sbin/chown root:wheel " daemon-dir "/" wired-limit-label ".plist; "
+       "sudo -n /bin/chmod 644 " daemon-dir "/" wired-limit-label ".plist; "
+       "sudo -n /bin/launchctl bootout system/" wired-limit-label " >/dev/null 2>&1 || true; sleep 1; "
+       "sudo -n /bin/launchctl bootstrap system " daemon-dir "/" wired-limit-label ".plist; "
+       "sudo -n /bin/launchctl kickstart -k system/" wired-limit-label "; sleep 1; "
+       "got=$(sysctl -n iogpu.wired_limit_mb); "
+       "[ \"$got\" = \"" mb "\" ] || { echo \"MURAKUMO_WIRED_LIMIT_UNVERIFIED want=" mb " got=$got\" >&2; exit 3; }"))
+
+(defn evict-script
+  "Stop these launchd jobs and keep them stopped across a boot.
+
+  The plist is moved into `evicted-by-murakumo/` rather than deleted: launchd
+  only scans the top level of /Library/LaunchDaemons, so the job is durably
+  gone, and putting a node back is one `mv`. Deleting would make the eviction
+  the kind of destructive act that needs a decision behind it every time."
+  [labels]
+  (str "sudo -n /bin/mkdir -p " daemon-dir "/evicted-by-murakumo; "
+       (apply str
+              (for [l labels]
+                (str "sudo -n /bin/launchctl bootout system/" l " >/dev/null 2>&1 || true; "
+                     "[ -f " daemon-dir "/" l ".plist ] && "
+                     "sudo -n /bin/mv " daemon-dir "/" l ".plist "
+                     daemon-dir "/evicted-by-murakumo/" l ".plist || true; ")))
+       ;; Report what is still loaded, so the caller can tell an eviction that
+       ;; ran from one that was refused by a missing sudo grant.
+       ;;
+       ;; The sleep is not padding. Measured 2026-09-10 on simeon and dan, this
+       ;; count was taken the instant after the last `bootout` and reported 1
+       ;; and 2 jobs still loaded; both were 0 a few seconds later, with every
+       ;; plist parked. `bootout` returns before launchd has finished unloading,
+       ;; so a count taken immediately reports a failure the node does not have
+       ;; -- and a guard that cries wolf is a guard an operator learns to skip.
+       "sleep 5; "
+       "echo MURAKUMO_STILL_LOADED=$(sudo -n /bin/launchctl list 2>/dev/null | "
+       "grep -cE '" (str/join "|" labels) "')"))

@@ -1,0 +1,251 @@
+(ns murakumo.infer.rollout
+  "Staged self-update of the resident — ADR-2610071730 P5a.
+
+  The operator pins a release in the signed intent:
+
+    \"agents\": {\"resident\": {\"sha256\": \"<64 hex of node.mjs>\",
+                              \"package-sha256\": \"<optional: package.json>\",
+                              \"urls\": [\"https://…/node.mjs\"],          optional
+                              \"waves\": [[\"zebulun\"], [\"issachar\", \"levi\"], …],
+                              \"settle-ms\": 300000}}
+
+  Each resident finds its own wave. It upgrades only when every node of every
+  earlier wave reports (in its signed observation) the target release, all
+  lanes ready, and a process that has been up for settle-ms — the health gate.
+  A wave that does not become healthy stops everything after it. Rolling back
+  is the same thing with the previous sha256 at a higher revision.
+
+  Getting the bytes is peer-to-peer first: any resident already running the
+  target, or holding it in its cache, serves GET /release/<sha256>; the intent's
+  urls are a fallback. Whatever the source, the bytes are kept only if their
+  sha256 is the pinned one.
+
+  Applying: drain (no new admission), wait for in-flight work to finish,
+  atomically replace the release file, leave a marker, exit 0. The supervisor
+  (launchd KeepAlive / systemd Restart=always) starts the new release, which
+  removes the drain it was handed and reports the update."
+  (:require [clojure.string :as str]
+            [murakumo.infer.jobs :as jobs]
+            [murakumo.infer.replicated-topology :as topo]
+            ["node:fs" :as fs] ["node:path" :as path] ["node:crypto" :as crypto]))
+
+(def default-settle-ms (* 5 60 1000))
+(def gate-freshness-ms
+  ;; a wave gate counts only reports this recent: a resident that crashed after
+  ;; reporting healthy must not open the next wave from its last words
+  (* 2 60 1000))
+(def drain-limit-ms (* 10 60 1000))
+(def max-release-bytes (* 32 1024 1024))
+(def started-at (js/Date.now))
+
+(defn sha256-hex [buf] (.digest (.update (.createHash crypto "sha256") buf) "hex"))
+(defn file-sha [f] (try (sha256-hex (.readFileSync fs f)) (catch :default _ nil)))
+
+;; ---------------------------------------------------------------- pure gate
+
+(defn spec-of [intent] (get-in intent ["agents" "resident"]))
+
+(defn wave-of [spec node]
+  (first (keep-indexed (fn [i w] (when (some #{node} w) i)) (get spec "waves"))))
+
+(defn node-healthy?
+  "Does this observation payload show the target running, ready and settled?"
+  [p target now settle-ms]
+  (and p
+       (number? (get p "at")) (>= (get p "at") (- now gate-freshness-ms))
+       (= (subs target 0 16) (get p "release"))
+       (seq (get p "lanes"))
+       (every? #(get % "ready") (vals (get p "lanes")))
+       (number? (get p "started-at"))
+       (<= (get p "started-at") (- now settle-ms))))
+
+(defn decide
+  "What this node should do: {:state :at-target|:not-in-rollout|:waiting|:upgrade|:blocked ...}.
+  docs: node -> raw observation payload (string keys)."
+  [intent node current-sha local-package-sha docs now]
+  (let [spec (spec-of intent)
+        target (get spec "sha256")
+        settle (get spec "settle-ms" default-settle-ms)
+        w (wave-of spec node)]
+    (cond
+      (not (and (string? target) (re-matches #"[0-9a-f]{64}" target))) {:state :none}
+      (= target current-sha) {:state :at-target :target target}
+      (nil? w) {:state :not-in-rollout :target target}
+      (and (get spec "package-sha256") (not= (get spec "package-sha256") local-package-sha))
+      {:state :blocked :target target :reason "release needs different dependencies (package.json differs)"}
+      :else
+      (let [earlier (mapcat identity (take w (get spec "waves")))
+            not-ready (vec (remove #(node-healthy? (get docs %) target now settle) earlier))]
+        (if (seq not-ready)
+          {:state :waiting :target target :wave w :reason (str "earlier waves not healthy yet: " (str/join "," not-ready))}
+          {:state :upgrade :target target :wave w})))))
+
+;; ---------------------------------------------------------------- fetch
+
+(defn- read-bounded
+  "The response body, refused as soon as it exceeds max-release-bytes (never
+  buffered past the bound)."
+  [r]
+  (let [len (some-> (.get (.-headers r) "content-length") (js/parseInt 10))]
+    (if (and len (> len max-release-bytes))
+      (do (try (.cancel (.-body r)) (catch :default _ nil))
+          (js/Promise.reject (js/Error. "release too large")))
+      (let [reader (.getReader (.-body r)) chunks #js [] total (atom 0)]
+        (letfn [(step []
+                  (.then (.read reader)
+                         (fn [x]
+                           (if (.-done x)
+                             (js/Buffer.concat chunks)
+                             (do (swap! total + (.-byteLength (.-value x)))
+                                 (if (> @total max-release-bytes)
+                                   (do (.cancel reader) (throw (js/Error. "release too large")))
+                                   (do (.push chunks (js/Buffer.from (.-value x))) (step))))))))]
+          (step))))))
+
+(defn- fetch-bytes [url token]
+  (-> (js/fetch url #js {:redirect "error" :signal (.timeout js/AbortSignal 60000)
+                         :headers (if token #js {"authorization" (str "Bearer " token)} #js {})})
+      (.then (fn [r] (when-not (.-ok r) (throw (js/Error. (str url " -> " (.-status r)))))
+               (read-bounded r)))))
+
+(defn fetch-release!
+  "Peers first (those reporting the target), then the intent's urls. Resolves
+  to bytes whose sha256 is target, or rejects."
+  [target peer-urls urls token]
+  (let [sources (concat (for [u peer-urls] [(str (str/replace u #"/$" "") "/release/" target) token])
+                        (for [u urls :when (str/starts-with? (str u) "https://")] [u nil]))]
+    (letfn [(try-from [[[u tok] & more] errs]
+              (if-not u
+                (js/Promise.reject (js/Error. (str "release " (subs target 0 12) " unavailable: " (str/join "; " errs))))
+                ;; each source exactly once: the outcome of this one is settled
+                ;; first, then (outside its handlers) the next one is tried
+                (-> (fetch-bytes u tok)
+                    (.then (fn [buf] (if (= target (sha256-hex buf)) {:buf buf} {:err (str u " sha256 mismatch")}))
+                           (fn [e] {:err (.-message e)}))
+                    (.then (fn [{:keys [buf err]}] (if buf buf (try-from more (conj errs err))))))))]
+      (try-from sources []))))
+
+;; ---------------------------------------------------------------- service
+
+(defn release-file [config] (or (:release-file config) (aget (.-argv js/process) 1)))
+(defn- cache-dir [config] (.join path (.dirname path (:state-file config)) "releases"))
+(defn- marker-file [config] (str (:state-file config) ".self-update.json"))
+
+(defn serve-release
+  "Bytes for GET /release/<sha>: the running release or a cached one; nil if not here."
+  [config sha]
+  (when (re-matches #"[0-9a-f]{64}" (str sha))
+    (let [own (release-file config)
+          cached (.join path (cache-dir config) (str sha ".mjs"))]
+      (cond (= sha (file-sha own)) (.readFileSync fs own)
+            (= sha (file-sha cached)) (.readFileSync fs cached)
+            :else nil))))
+
+(defn accept-push!
+  "POST /release (fleet token): cache bytes under their own sha256."
+  [config buf]
+  (when (> (.-length buf) max-release-bytes) (throw (js/Error. "release too large")))
+  (let [sha (sha256-hex buf)]
+    (.mkdirSync fs (cache-dir config) #js {:recursive true :mode 448})
+    (topo/persist! (.join path (cache-dir config) (str sha ".mjs.json")) {:sha256 sha :at (js/Date.now)})
+    (.writeFileSync fs (.join path (cache-dir config) (str sha ".mjs")) buf #js {:mode 420})
+    sha))
+
+(defn on-start!
+  "A release started by a self-update removes the drain it was handed and
+  returns the update record (published once in the observation)."
+  [config]
+  (let [m (marker-file config)]
+    (when (.existsSync fs m)
+      (let [rec (try (js->clj (js/JSON.parse (.readFileSync fs m "utf8"))) (catch :default _ {}))]
+        (when-let [d (get rec "drain-file")] (try (.unlinkSync fs d) (catch :default _ nil)))
+        (.unlinkSync fs m)
+        rec))))
+
+(defn start!
+  "Begin following the intent's resident release. docs-fn: node -> raw payload
+  (string keys) of the fleet's observations; busy-fn: true while work is in
+  flight; topology: the signed replica. Returns {:status :close}."
+  [config token topology docs-fn busy-fn & [{:keys [exit!] :or {exit! #(js/process.exit 0)}}]]
+  (let [node (:node config)
+        rf (release-file config)
+        ;; what this process runs: read once at start, so a release renamed into
+        ;; place by an interrupted handoff is still seen as not yet running
+        running-sha (file-sha rf)
+        pkg (.join path (.dirname path rf) "package.json")
+        updated (on-start! config)
+        state (atom (cond-> {:state "none"} updated (assoc :updated updated)))
+        busy-flag (atom false)
+        tick! (fn []
+                (when (compare-and-set! busy-flag false true)
+                  (let [intent (js->clj (js/JSON.parse (topo/encoded (topo/payload topology))))
+                        conflicted? (boolean (some-> topology :conflict deref))
+                        now (js/Date.now)
+                        docs (docs-fn)
+                        d (if conflicted? {:state :waiting :reason "topology conflict"}
+                              (decide intent node running-sha (file-sha pkg) docs now))]
+                    (swap! state merge {:state (name (:state d)) :target (some-> (:target d) (subs 0 16))
+                                        :wave (:wave d) :reason (:reason d) :at now})
+                    (cond
+                      (not= :upgrade (:state d))
+                      (reset! busy-flag false)
+
+                      ;; the target is already in place on disk (a handoff that
+                      ;; renamed but did not get to exit): finish the handoff
+                      (= (:target d) (file-sha rf))
+                      (do (swap! state assoc :state "restarting") (exit!))
+
+                      :else
+                      (let [target (:target d)
+                            others (remove #(= node (get % "node")) (get intent "nodes"))
+                            running? #(= (subs target 0 16) (get-in docs [(get % "node") "release"]))
+                            ;; peers running the target first, then any peer (it may hold it in cache)
+                            peer-urls (map #(get % "url") (concat (filter running? others) (remove running? others)))
+                            ;; the resident defaults :drain-file to <state-file>.draining,
+                            ;; so admission and health see this same file
+                            drain (or (:drain-file config) (str (:state-file config) ".draining"))]
+                        (swap! state assoc :state "fetching")
+                        (-> (fetch-release! target peer-urls (get-in intent ["agents" "resident" "urls"] []) token)
+                            (.then (fn [buf]
+                                     (swap! state assoc :state "draining")
+                                     (.writeFileSync fs drain "self-update")
+                                     ;; never replace under in-flight work: past the limit the
+                                     ;; rollout fails here (drain removed) and is retried later
+                                     (js/Promise.
+                                      (fn [resolve reject]
+                                        (let [t0 (js/Date.now)]
+                                          (letfn [(wait [] (cond (not (busy-fn)) (resolve buf)
+                                                                 (> (- (js/Date.now) t0) (:rollout-drain-limit-ms config drain-limit-ms))
+                                                                 (reject (js/Error. "in-flight work did not finish while draining; will retry"))
+                                                                 :else (js/setTimeout wait 2000)))]
+                                            (wait)))))))
+                            (.then (fn [buf]
+                                     ;; atomic replace keeping owner and mode, then hand over.
+                                     ;; The marker goes first; once the rename commits nothing
+                                     ;; may stop the exit (a later failure would leave the old
+                                     ;; process running with the new bytes on disk)
+                                     (let [st (.statSync fs rf)
+                                           from (subs (or running-sha "") 0 16)
+                                           tmp (str rf "." (.randomUUID crypto) ".tmp")]
+                                       (.writeFileSync fs tmp buf #js {:mode (bit-and (.-mode st) 511)})
+                                       (try (.chownSync fs tmp (.-uid st) (.-gid st)) (catch :default _ nil))
+                                       (topo/persist! (marker-file config)
+                                                      {:from from :to target
+                                                       :at (js/Date.now) :drain-file drain})
+                                       (try (.renameSync fs tmp rf)
+                                            (catch :default e
+                                              (try (.unlinkSync fs tmp) (catch :default _ nil))
+                                              (try (.unlinkSync fs (marker-file config)) (catch :default _ nil))
+                                              (throw e)))
+                                       (try (topo/sync-parent! rf) (catch :default _ nil))
+                                       (swap! state assoc :state "restarting")
+                                       (exit!))))
+                            (.catch (fn [e]
+                                      (try (.unlinkSync fs drain) (catch :default _ nil))
+                                      (swap! state assoc :state "failed" :reason (.-message e))
+                                      (reset! busy-flag false)))))))))
+        timer (js/setInterval tick! (:rollout-interval-ms config 60000))
+        first-run (js/setTimeout tick! (:rollout-first-delay-ms config 30000))]
+    {:status (fn [] (into {} (remove (comp nil? val) @state)))
+     :tick! tick!
+     :close (fn [] (js/clearInterval timer) (js/clearTimeout first-run))}))

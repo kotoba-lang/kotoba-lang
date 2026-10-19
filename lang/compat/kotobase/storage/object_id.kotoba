@@ -1,0 +1,241 @@
+(ns kotobase.storage.object-id
+  "One identity for a large object, and pure conversions to the two Git
+  ecosystems that address the same bytes by their own names.
+
+  git-lfs, git-annex and kotobase all carry the SAME digest:
+
+      git-lfs      oid sha256:<hex>              + size
+      git-annex    SHA256E-s<size>--<hex>[.ext]
+      kotobase     CIDv1(raw, sha2-256)          = 0x01 0x55 0x12 0x20 <hex>
+
+  So the mapping is a pure function in both directions and needs no registry.
+  That is the whole reason LFS and annex can share one object plane instead of
+  one store each (superproject ADR-2608012600 D1).
+
+  Two configurations break the derivation, and both fail CLOSED here rather
+  than resolving to some other object:
+
+  - `chunk=` — every chunk key carries the WHOLE file's hash
+    (`SHA256E-s100000-S32768-C1..C4--975cf8…` are all the same digest), which
+    is not the sha256 of the chunk's own bytes.
+  - client-side encryption — `GPGHMACSHA1--c51589…` is an HMAC, not a content
+    hash, and the stored bytes are ciphertext.
+
+  In those two cases the caller must record an explicit binding (the
+  `:binding/derivable false` datom in ADR-2608012600 D3). `wire-id->cid`
+  returns nil and `require-cid` throws; neither invents a CID.
+
+  Zero dependencies on purpose: this namespace sits under every provider in
+  the family, including Worker builds. The base32/multihash arithmetic is
+  cross-checked against `io-multiformats` in the test suite (a :test-only
+  dependency) so the two implementations cannot drift silently."
+  (:require [kotoba.lang.text :as str]))
+
+;; ── base32, RFC 4648 lower-case unpadded — the multibase 'b' alphabet ────────
+;; Bytes are plain int vectors here: no byte-array/Uint8Array split, so the
+;; whole namespace is one shared implementation.
+
+(def ^:private b32-alphabet "abcdefghijklmnopqrstuvwxyz234567")
+
+(def ^:private b32-index
+  (into {} (map-indexed (fn [i c] [c i]) b32-alphabet)))
+
+(defn- mask [bits] (dec (bit-shift-left 1 bits)))
+
+(defn- base32-encode
+  "int-seq → lower-case unpadded base32."
+  [bs]
+  (let [[out acc bits]
+        (reduce (fn [[out acc bits] b]
+                  (loop [out out
+                         acc (bit-or (bit-shift-left acc 8) (bit-and b 0xff))
+                         bits (+ bits 8)]
+                    (if (>= bits 5)
+                      (let [bits' (- bits 5)]
+                        (recur (conj out (nth b32-alphabet
+                                              (bit-and (bit-shift-right acc bits') 0x1f)))
+                               (bit-and acc (mask bits'))
+                               bits'))
+                      [out acc bits])))
+                [[] 0 0] bs)]
+    (apply str (cond-> out
+                 (pos? bits)
+                 (conj (nth b32-alphabet (bit-and (bit-shift-left acc (- 5 bits)) 0x1f)))))))
+
+(defn- base32-decode
+  "lower-case unpadded base32 → int vector, or nil for an invalid character or
+  non-zero padding bits.
+
+  The explicit nil check is load-bearing on ClojureScript, where a missing
+  alphabet entry coerces to 0 through `|0` and would decode an invalid
+  character as if it were 'a'."
+  [s]
+  (loop [cs (seq s) acc 0 bits 0 out []]
+    (if-not cs
+      (when (zero? (bit-and acc (mask bits))) out)
+      (if-let [v (b32-index (first cs))]
+        (let [acc (bit-or (bit-shift-left acc 5) v)
+              bits (+ bits 5)]
+          (if (>= bits 8)
+            (let [bits' (- bits 8)]
+              (recur (next cs) (bit-and acc (mask bits')) bits'
+                     (conj out (bit-and (bit-shift-right acc bits') 0xff))))
+            (recur (next cs) acc bits out)))
+        nil))))
+
+;; ── hex ─────────────────────────────────────────────────────────────────────
+
+(def ^:private hex-re #"^[0-9a-f]{64}$")
+
+(defn- unhex
+  "64-char lower-case hex → int vector, or nil."
+  [s]
+  (when (and (string? s) (re-matches hex-re s))
+    (mapv (fn [i] )
+          (range 32))))
+
+(defn- hexify [bs]
+  (apply str (map (fn [b]
+                    )
+                  bs)))
+
+;; ── CIDv1(raw, sha2-256) ────────────────────────────────────────────────────
+;; 0x01 version, 0x55 raw codec, 0x12 0x20 sha2-256/32-byte multihash. All four
+;; are single-byte varints, so the prefix is a literal.
+
+(def ^:private cid-prefix [0x01 0x55 0x12 0x20])
+
+(defn digest-hex->cid
+  "sha2-256 digest hex → `bafkrei…`, or nil when the hex is not 32 bytes."
+  [hex]
+  (when-let [digest (unhex hex)]
+    (str "b" (base32-encode (into cid-prefix digest)))))
+
+(defn cid->digest-hex
+  "`bafkrei…` → sha2-256 digest hex, or nil for anything that is not a
+  CIDv1/raw/sha2-256. dag-pb directories and other codecs are not large
+  objects and are rejected here rather than downstream."
+  [cid]
+  (when (and (string? cid) (str/starts-with? cid "b"))
+    (let [bs (base32-decode (subs cid 1))]
+      (when (and bs (= 36 (count bs)) (= cid-prefix (subvec bs 0 4)))
+        (hexify (subvec bs 4))))))
+
+;; ── git-lfs ─────────────────────────────────────────────────────────────────
+
+(defn parse-lfs-oid
+  "LFS oid → {:digest-hex hex}, or nil.
+
+  Accepts both the batch-API form (bare hex) and the pointer-file form
+  (`sha256:<hex>`). Any other hash function is not derivable: LFS permits
+  other oid types in principle and every one of them would need a binding."
+  [oid]
+  (when (string? oid)
+    (let [[algo hex] (if (str/includes? oid ":")
+                       (str/split oid #":" 2)
+                       ["sha256" oid])]
+      (when (and (= "sha256" algo) (re-matches hex-re (str hex)))
+        {:digest-hex hex}))))
+
+(defn cid->lfs-oid
+  "CID → the bare hex oid the LFS batch API uses, or nil."
+  [cid]
+  (cid->digest-hex cid))
+
+;; ── git-annex ───────────────────────────────────────────────────────────────
+
+(def ^:private derivable-backends #{"SHA256" "SHA256E"})
+
+(defn parse-annex-key
+  "annex key → a map describing it, or nil when it is not a key at all.
+
+      SHA256E-s100000--<hex>.wav
+      SHA256E-s100000-S32768-C1--<hex>.wav   (chunked)
+      GPGHMACSHA1--c51589…                   (encrypted)
+
+  `:derivable?` is the only field callers normally need: it is true exactly
+  when the key's name IS the sha256 of the bytes this remote will be asked to
+  store."
+  [k]
+  (when (string? k)
+    (when-let [i (str/index-of k "--")]
+      (when (pos? i)
+        (let [fields (str/split (subs k 0 i) #"-")
+              backend (first fields)
+              flags (into {} (keep (fn [f]
+                                     (when (seq f) [(subs f 0 1) (subs f 1)])))
+                          (rest fields))
+              nm (subs k (+ i 2))
+              chunked? (contains? flags "C")
+              hex (when (and (contains? derivable-backends backend)
+                             (>= (count nm) 64))
+                    (let [h (subs nm 0 64)]
+                      (when (re-matches hex-re h) h)))
+              ext (when hex (subs nm 64))]
+          (when (seq backend)
+            {:backend backend
+             :name nm
+             :size (when-let [s (get flags "s")]
+                     )
+             :chunked? chunked?
+             :extension (when (seq ext) ext)
+             :digest-hex hex
+             :derivable? (boolean (and hex (not chunked?)))}))))))
+
+(defn cid->annex-key
+  "CID + byte count (+ optional extension) → the SHA256E key git-annex would
+  have produced for those bytes, or nil.
+
+  The extension is part of the key, so a caller that drops it produces a
+  different key for the same bytes; it is required to be passed explicitly
+  rather than defaulted."
+  ([cid size] (cid->annex-key cid size nil))
+  ([cid size ext]
+   (when-let [hex (cid->digest-hex cid)]
+     (when (and (integer? size) (not (neg? size)))
+       (str "SHA256E-s" size "--" hex (or ext ""))))))
+
+;; ── the shared entry points ─────────────────────────────────────────────────
+
+(defn wire-id->cid
+  "`:lfs` oid or `:annex` key → CID, or nil when the identity is not derivable
+  from the wire id.
+
+  nil means the caller MUST consult an explicit binding. It never means
+  'probably this other CID'."
+  [protocol wire-id]
+  (case protocol
+    :lfs (some-> (parse-lfs-oid wire-id) :digest-hex digest-hex->cid)
+    :annex (let [{:keys [derivable? digest-hex]} (parse-annex-key wire-id)]
+             (when derivable? (digest-hex->cid digest-hex)))
+    nil))
+
+(defn derivable?
+  [protocol wire-id]
+  (some? (wire-id->cid protocol wire-id)))
+
+(defn require-cid
+  "Like `wire-id->cid` but throws instead of returning nil.
+
+  Use this on any path that would otherwise transfer bytes: silently choosing
+  a different CID for a chunked or encrypted key writes one object's bytes
+  under another object's name."
+  [protocol wire-id]
+  (or (wire-id->cid protocol wire-id)
+      (throw (ex-info (str "large-object identity is not derivable from this "
+                           (name (or protocol :unknown)) " id — record an "
+                           "explicit binding instead")
+                      {:type :kotobase.storage/object-id-not-derivable
+                       :protocol protocol
+                       :wire-id wire-id
+                       :reason (case protocol
+                                 :annex (let [{:keys [backend chunked?]}
+                                              (parse-annex-key wire-id)]
+                                          (cond
+                                            (nil? backend) :unparseable
+                                            chunked? :chunked
+                                            (not (derivable-backends backend))
+                                            :non-sha256-backend
+                                            :else :malformed-name))
+                                 :lfs :non-sha256-oid
+                                 :unknown-protocol)}))))

@@ -1,0 +1,516 @@
+(ns murakumo.bench
+  "Measure inference speed on a murakumo node, from one command.
+
+  The workflow this replaces was done by hand four times in one day (adr-2609121101,
+  adr-2609121253, adr-2609121325): ssh to a box, start a server or a bench binary,
+  read a number out of a log, write it into an ADR. The measurement was fine; what
+  was missing was that the next person had to redo the ssh by hand, and that two
+  runs of the same configuration could disagree about what was measured because the
+  argv was never written down.
+
+  So this records argv, the binary, the model's byte count and hash, the host's
+  memory, and the engine's own output, and appends ONE JSON object per run to
+  `$MURAKUMO_BENCH_LEDGER` (default ~/.local/share/murakumo/bench-ledger.jsonl).
+  Rows are never rewritten — comparison is `murakumo bench ledger` over the file.
+
+  ## Two engines, two shapes of number
+
+  - `--engine llama` runs `llama-bench` (autoregressive GGUF: pp512 / tg128).
+  - `--engine diffuse` runs `diffuse-cli` (LLaDA / Dream block diffusion: the unit
+    of work is a denoising step over a block, so \"tokens/s\" alone hides whether
+    the run was cheap because it converged in 3 steps or expensive at 32). Both
+    `tok/s` and `tokens per denoising step` are recorded.
+
+  ## Reaching the node
+
+  `tailscale ssh <MagicDNS name>` did NOT resolve in this fleet on 2026-09-12
+  (`Could not resolve hostname …tail110d8b.ts.net.`), while `tailscale status
+  --json` had the peer list and `ssh -o ProxyCommand='tailscale nc %h %p' <ip>`
+  worked. So the node is resolved to its tailnet IP here, and MagicDNS is not on
+  the path.
+
+  ## Boundary
+
+  This measures. It does not enrol a node, start a service, register a model or
+  publish a result — `murakumo node check/join` and infer.edn own those, and a
+  speed number is not evidence that a node is qualified to serve."
+  (:require [kotoba.lang.text :as str]
+            ["node:child_process" :as cp]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+;; ── ledger ────────────────────────────────────────────────────────────────────
+
+(def default-ledger-name "bench-ledger.jsonl")
+
+(defn ledger-path []
+  (or (aget js/process.env "MURAKUMO_BENCH_LEDGER")
+      (.join path (.homedir os) ".local" "share" "murakumo" default-ledger-name)))
+
+(defn- full-kw
+  "JSON key for a keyword, KEEPING the namespace. `clj->js` defaults to `name`,
+  which would write `:bench/metrics` as \"metrics\" and read it back as `:metrics`
+  — a ledger whose keys silently lose their namespace is one nobody can join on."
+  [k]
+  (if-let [n (namespace k)] (str n "/" (name k)) (name k)))
+
+(defn append-row!
+  "Append one JSON object. Append-only: nothing in this namespace rewrites or
+  truncates the file, so a wrong row stays visible next to the right one."
+  [p row]
+  (.mkdirSync fs (.dirname path p) #js {:recursive true})
+  (.appendFileSync fs p (str (js/JSON.stringify (clj->js row :keyword-fn full-kw)) "\n") "utf8"))
+
+(defn read-rows
+  "Every parseable row in the ledger. A line that does not parse is reported, not
+  dropped — a ledger that silently skips is a ledger that lies about its length."
+  [p]
+  (if-not (.existsSync fs p)
+    {:rows [] :bad 0}
+    (let [lines (remove str/blank? (str/split (.readFileSync fs p "utf8") #"\n"))]
+      (reduce (fn [acc line]
+                (try (update acc :rows conj (js->clj (js/JSON.parse line) :keywordize-keys true))
+                     (catch :default _ (update acc :bad inc))))
+              {:rows [] :bad 0}
+              lines))))
+
+;; ── process plumbing ──────────────────────────────────────────────────────────
+
+(defn sh
+  "Run argv with NO shell. The remote command is a single argv element, so the
+  quoting of a prompt or a path is ssh's problem and not the local shell's."
+  [argv {:keys [timeout-ms input] :or {timeout-ms 1800000}}]
+  (let [r (cp/spawnSync (first argv) (to-array (rest argv))
+                        (clj->js (cond-> {:encoding "utf8"
+                                          :maxBuffer (* 96 1024 1024)
+                                          :timeout timeout-ms}
+                                   input (assoc :input input))))]
+    {:status (or (.-status r) -1)
+     :stdout (or (.-stdout r) "")
+     :stderr (or (.-stderr r) "")
+     :signal (.-signal r)
+     :error (some-> (.-error r) .-message)}))
+
+(defn- q
+  "POSIX single-quote a value for a remote shell."
+  [s]
+  (str "'" (str/replace (str s) #"'" "'\\''") "'"))
+
+;; ── node resolution (tailnet, not MagicDNS) ───────────────────────────────────
+
+(defn parse-nodes
+  "tailscale status --json -> [{:name :ip :online :os}], self first."
+  [json-str]
+  (let [d (js->clj (js/JSON.parse json-str) :keywordize-keys true)
+        self (:Self d)
+        rows (cons self (vals (:Peer d)))]
+    (->> rows
+         (keep (fn [p]
+                 (when-let [ip (first (:TailscaleIPs p))]
+                   {:name (:HostName p)
+                    :ip ip
+                    :online (if (identical? p self) true (boolean (:Online p)))
+                    :os (:OS p)})))
+         (sort-by (fn [n] (if (= (:name n) (:HostName self)) 0 1)))
+         vec)))
+
+(defn resolve-node [nodes q]
+  (or (first (filter #(or (= (:name %) q) (= (:ip %) q)) nodes))
+      (first (filter #(str/starts-with? (:name %) (str q)) nodes))))
+
+(defn tailnet-nodes []
+  (let [r (sh ["tailscale" "status" "--json"] {:timeout-ms 20000})]
+    (if (zero? (:status r))
+      (parse-nodes (:stdout r))
+      {:error (str "tailscale status failed: " (:status r) " " (:error r) (:stderr r))})))
+
+;; ── remote command construction ───────────────────────────────────────────────
+
+(defn ssh-argv
+  "The one ssh spelling that worked across this fleet. `ProxyCommand=…` is a single
+  argv element; %h/%p are expanded by ssh itself."
+  [user ip remote-cmd timeout-s]
+  ["ssh" "-o" "StrictHostKeyChecking=accept-new"
+   "-o" "ConnectTimeout=10"
+   "-o" (str "ServerAliveInterval=" (max 5 (quot (or timeout-s 60) 12)))
+   "-o" "ProxyCommand=tailscale nc %h %p"
+   (str user "@" ip) remote-cmd])
+
+(defn host-probe-cmd []
+  (str "echo HOST=$(hostname);"
+       " echo KERNEL=$(uname -r);"
+       " echo THREADS=$(nproc);"
+       " echo MEMTOTAL_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo);"
+       " echo GTT_BYTES=$(cat /sys/class/drm/card*/device/mem_info_gtt_total 2>/dev/null | head -1);"
+       " echo VRAM_BYTES=$(cat /sys/class/drm/card*/device/mem_info_vram_total 2>/dev/null | head -1)"))
+
+(defn parse-kv
+  "KEY=VALUE lines -> {:key VALUE}. The key is a KEYWORD: a string-keyed map
+  answers `(:threads host)` with nil, and nil silently flows into every default
+  downstream — the run then reports a machine it never looked at."
+  [text]
+  (->> (str/split-lines (str text))
+       (keep (fn [line]
+               (when-let [m (re-matches #"([A-Z_][A-Z0-9_]*)=(.*)" (str/trim line))]
+                 [(keyword (str/lower (second m))) (str/trim (nth m 2))])))
+       (into {})))
+
+(defn model-probe-cmd [model]
+  (str "if [ -f " (q model) " ]; then"
+       " echo MODEL_BYTES=$(stat -c%s " (q model) ");"
+       " echo MODEL_SHA8=$(sha256sum " (q model) " | cut -c1-8);"
+       " else echo MODEL_MISSING=1; fi"))
+
+(defn llama-bench-remote
+  "llama-bench prints a markdown table; the two rows that matter are pp<n> and tg<n>.
+
+  The binary is invoked as `./NAME`, not `NAME`: a name without a slash is looked
+  up in PATH only, and the runtimes in this fleet live next to their own .so in a
+  build directory rather than on PATH. LD_LIBRARY_PATH is set to that directory
+  for the same reason — harmless when the binary is static, required when it is not."
+  [{:keys [bin model p n r t ngl fa binname] :or {p 512 n 128 r 3 t 4 fa "on"}}]
+  (let [dir (or bin ".")
+        name (or binname "llama-bench")]
+    (str "cd " (q dir) " && export LD_LIBRARY_PATH=" (q dir) ":${LD_LIBRARY_PATH:-} &&"
+         " ./" name
+         " -m " (q model)
+         " -fa " fa
+         " -p " p " -n " n " -r " r " -t " t
+         (when ngl (str " -ngl " ngl)))))
+
+(defn llama-bench-row
+  "Pull the s/t value out of the table row whose test column is `label`.
+
+  The label is matched through `\\|\\s*LABEL\\s*\\|` and NOT through the string
+  \"| LABEL |\": llama-bench pads every column to its width, so the real line
+  reads `|           pp512 |` and a single-space literal never matches. (Measured
+  on k16: the padded form is what the binary emits.)
+
+  The regex group for the number is NON-capturing on purpose: `re-find` with a
+  capture group returns [whole group], and `js/parseFloat` of a vector is NaN —
+  a rate that looks like a number in the ledger and is not one."
+  [text label]
+  (let [pat (re-pattern (str "\\|\\s*" label "\\s*\\|"))]
+    (some (fn [line]
+            (when (re-find pat line)
+              (let [fields (remove str/blank? (str/split line #"\|"))]
+                (some-> (re-find #"[0-9]+(?:\.[0-9]+)?" (str/trim (last fields)))))))
+          (str/split-lines (str text)))))
+
+(defn parse-llama-bench [text]
+  (let [pp (some-> (llama-bench-row text "pp512") js/parseFloat)
+        tg (some-> (llama-bench-row text "tg128") js/parseFloat)]
+    (cond-> {}
+      pp (assoc :pp512 pp)
+      tg (assoc :tg128 tg))))
+
+(defn diffuse-remote
+  "Build the diffuse-cli argv and the wrapper that runs it under GNU time.
+
+  `threshold` is the confidence needed to commit a token (default 0.95): LOWER
+  values commit earlier and cut denoising steps, which is the first lever to try
+  when tok/s is disk-bound — but it trades quality, so a threshold row and a 0.95
+  row are not the same configuration, and the ledger must carry the threshold in
+  argv (it does)."
+  [{:keys [bin binname model prompt n steps t temp threshold timeout-s]
+    :or {n 96 steps 32 t 4 temp 0}}]
+  (let [tag "murakumo-bench"
+        dir (or bin ".")
+        binname (or binname "diffuse-cli")]
+    (str "cd " (q dir) " && export LD_LIBRARY_PATH=" (q dir) ":${LD_LIBRARY_PATH:-} &&"
+         " rm -f /tmp/" tag ".time /tmp/" tag ".err /tmp/" tag ".out &&"
+         " timeout " (or timeout-s 3600) " /usr/bin/time -v -o /tmp/" tag ".time ./" binname
+         " -m " (q model)
+         " -p " (q prompt)
+         " -n " n " -s " steps " -t " t " --temp " temp
+         (when threshold (str " --threshold " threshold))
+         " > /tmp/" tag ".out 2> /tmp/" tag ".err; echo RC=$?;"
+         " echo ===TIME; cat /tmp/" tag ".time 2>/dev/null;"
+         " echo ===STEPS; tr '\\r' '\\n' < /tmp/" tag ".err 2>/dev/null | grep -c 'block ' ;"
+         " echo ===PROMPT; grep -o 'Prompt: [0-9]* tokens' /tmp/" tag ".err 2>/dev/null | tail -1;"
+         " echo ===GENERATING; grep -o 'Generating [0-9]* tokens' /tmp/" tag ".err 2>/dev/null | tail -1;"
+         " echo ===LASTSTEP; tr '\\r' '\\n' < /tmp/" tag ".err 2>/dev/null | grep 'block ' | tail -1;"))) 
+
+(defn parse-gnu-time
+  "GNU time -v report -> seconds, peak RSS, I/O faults."
+  [text]
+  (let [grab (fn [re] (some-> (re-find re (str text)) second))
+        wall (grab #"Elapsed \(wall clock\) time \(h:mm:ss or m:ss\):\s*([0-9:.]+)")
+        rss  (grab #"Maximum resident set size \(kbytes\):\s*([0-9]+)")
+        maj  (grab #"Major \(requiring I/O\) page faults:\s*([0-9]+)")
+        wall-s (when wall
+                 (let [parts (mapv js/parseFloat (str/split wall #":"))]
+                   (cond (= 3 (count parts)) (+ (* 3600 (nth parts 0)) (* 60 (nth parts 1)) (nth parts 2))
+                         (= 2 (count parts)) (+ (* 60 (nth parts 0)) (nth parts 1))
+                         :else (nth parts 0))))]
+    (cond-> {}
+      wall-s (assoc :wall-s wall-s)
+      rss (assoc :max-rss-kb (js/parseInt rss))
+      maj (assoc :major-faults (js/parseInt maj)))))
+
+(defn parse-diffuse
+  "Everything the diffuse run says about itself."
+  [text]
+  (let [after (fn [marker]
+                (some-> (re-find (re-pattern (str "===" marker "\n([^\\n]*)")) (str text)) second))
+        steps (some-> (after "STEPS") str/trim js/parseInt)
+        rc    (some-> (re-find #"RC=([0-9]+)" (str text)) second js/parseInt)
+        gen   (some-> (re-find #"GENERATING\nGenerating ([0-9]+) tokens" (str text)) second js/parseInt)]
+    (cond-> (parse-gnu-time text)
+      steps (assoc :denoise-steps steps)
+      gen   (assoc :tokens gen)
+      rc    (assoc :exit rc))))
+
+(defn sha8
+  "First 8 hex chars of sha256 — enough to tell two runs of the same output from
+  two runs that only look alike, and short enough to read in a table."
+  [s]
+  (-> (.createHash crypto "sha256") (.update (str s)) (.digest "hex") (subs 0 8)))
+
+;; ── the row ───────────────────────────────────────────────────────────────────
+
+(defn row
+  "One measurement. `metrics` is engine-specific; `non-claims` is where the caller
+  says what this run does NOT establish."
+  [{:keys [node engine bin model remote metrics out sha non-claims extra]}]
+  (cond-> {:bench/at (str (.replace (.toISOString (js/Date.)) #"\.\d{3}Z$" "Z"))
+           :bench/node (:name node)
+           :bench/node-ip (:ip node)
+           :bench/engine engine
+           :bench/bin bin
+           :bench/model model
+           :bench/argv remote
+           :bench/metrics metrics}
+    (:bytes extra) (assoc :bench/model-bytes (:bytes extra))
+    (:sha extra)   (assoc :bench/model-sha8 (:sha extra))
+    (:host extra)  (assoc :bench/host (:host extra))
+    sha            (assoc :bench/out-sha8 sha)
+    non-claims     (assoc :bench/non-claims non-claims)))
+
+(defn ledger-line
+  "One terminal row, fixed width so a shell history of runs reads as a table."
+  [{:keys [bench/node bench/engine bench/model bench/metrics bench/model-sha8]}]
+  (let [{:keys [tok-s tg128 pp512 denoise-steps tokens max-rss-kb wall-s exit]} metrics]
+    (str (str/format "%-16s %-12s %-8s %-30s"
+                     (str node) (str engine) (str (or model-sha8 "-"))
+                     (.basename path (str model)))
+         (cond
+           tg128 (str/format "tg128=%-7s pp512=%-7s rss=%.2fG" (str tg128) (str pp512)
+                             (/ (or max-rss-kb 0) 1048576.0))
+           tok-s (str/format "tok/s=%-6.2f steps=%-4s tokens=%-4s wall=%.0fs rss=%.2fG"
+                             tok-s (str denoise-steps) (str tokens) (or wall-s 0)
+                             (/ (or max-rss-kb 0) 1048576.0))
+           :else (str "exit=" (str exit) " — the engine printed no rate")))))
+
+;; ── commands ──────────────────────────────────────────────────────────────────
+
+(defn usage []
+  (println "Murakumo bench — measure inference speed on a node, and record it.
+
+  murakumo bench nodes                         List tailnet nodes (name, ip, online)
+  murakumo bench run --node NAME --model PATH --engine ENGINE [options]
+  murakumo bench ledger [--limit N] [--ledger PATH]
+
+Engines:
+  llama     autoregressive GGUF via llama-bench      -> pp512 / tg128
+  diffuse   LLaDA / Dream block diffusion via diffuse-cli -> tok/s, tokens per step
+
+run options:
+  --node NAME|IP        node name or tailnet IP (MagicDNS is not used)
+  --user USER           ssh user (default: root)
+  --bin DIR             directory holding the runtime binary
+  --bin-name NAME       binary name when --bin is a directory (default per engine)
+  --model PATH          model file ON THE NODE (bytes + sha8 are recorded)
+  --prompt TEXT         diffuse only; the same prompt across runs is the point
+  --p 512 --n 128 --r 3 --t 4    llama-bench protocol (defaults shown)
+  --ngl N               llama only; 0 = CPU. GPU offload is a separate question.
+  --steps 32            diffuse only: denoising steps per block
+  --temp 0
+  --timeout-s 3600      kill the remote run after this many seconds
+  --env K=V             export one variable in the remote shell before the run
+                        (e.g. --env DIFFUSE_MMAP_MADV=willneed; the tool exists to
+                        compare policies, so the policy has to be a parameter)
+  --label TEXT          written into the ledger row for later grepping
+  --no-record           print the row, do not append it
+
+The ledger is append-only JSONL ($MURAKUMO_BENCH_LEDGER or
+~/.local/share/murakumo/bench-ledger.jsonl). Nothing here enrols a node or
+publishes a number."))
+
+(defn parse-args
+  "Boolean flags carry no value. `--no-record` (and nothing else today) means
+  true by its presence; everything else is --key value and an odd remainder is
+  a missing value, which is refused rather than guessed."
+  [args]
+  (let [bools #{"--no-record"}
+        pairs (loop [rest args acc []]
+                (if (empty? rest)
+                  (seq acc)
+                  (let [k (first rest)]
+                    (if (contains? bools k)
+                      (recur (next rest) (conj acc [k "true"]))
+                      (do (when (< (count rest) 2)
+                            (throw (js/Error. (str "bench: missing value for " k))))
+                          (recur (drop 2 rest) (conj acc [(first rest) (second rest)])))))))]
+    (when (nil? pairs)
+      (throw (js/Error. "bench: no options")))
+    (reduce (fn [m [k v]]
+              (let [k (str/replace k #"^--" "")]
+                (assoc m (keyword k) v)))
+            {}
+            pairs)))
+
+(defn- num [v d] (if (nil? v) d (js/parseInt v)))
+
+(defn cmd-nodes [_opts]
+  (let [nodes (tailnet-nodes)]
+    (if (:error nodes)
+      (println "bench nodes:" (:error nodes))
+      (do (println (str/format "%-24s %-18s %-6s %s" "NAME" "TAILNET IP" "ONLINE" "OS"))
+          (doseq [n nodes]
+            (println (str/format "%-24s %-18s %-6s %s" (:name n) (:ip n)
+                                 (if (:online n) "yes" "no") (str (:os n)))))))))
+
+(defn measure
+  "Run one measurement and return it.
+
+  Returns {:entry row :status ssh-exit :stdout text :stderr text :host facts
+           :warning string-or-nil}.
+
+  Nothing is printed and nothing is written here. `cmd-run` (CLI) and the MCP
+  tool both call this, so the two surfaces cannot disagree about what a
+  measurement is — the failure this codebase keeps meeting is a second path
+  that answers a slightly different question."
+  [opts]
+  (let [engine (or (:engine opts) "llama")
+        nodes (tailnet-nodes)
+        _ (when (:error nodes) (throw (js/Error. (:error nodes))))
+        node (resolve-node nodes (:node opts))
+        _ (when-not node (throw (js/Error. (str "bench: no tailnet node matches " (:node opts)))))
+        user (or (:user opts) "root")
+        timeout-s (num (:timeout-s opts) 3600)
+        probe (sh (ssh-argv user (:ip node)
+                            (str (host-probe-cmd) "; " (model-probe-cmd (:model opts)))
+                            timeout-s))
+        host (parse-kv (:stdout probe))]
+    (when (or (not= 0 (:status probe)) (= "1" (:model_missing host)))
+      (throw (js/Error. (str "bench: cannot probe " (:name node) " — "
+                             "status=" (:status probe) " " (str/trim (:stderr probe))))))
+    (let [threads (num (:threads host) 4)
+          remote (case engine
+                   "llama" (llama-bench-remote {:bin (or (:bin opts) ".")
+                                                :model (:model opts)
+                                                :p (num (:p opts) 512)
+                                                :n (num (:n opts) 128)
+                                                :r (num (:r opts) 3)
+                                                :t (num (:t opts) threads)
+                                                :ngl (:ngl opts)})
+                   "diffuse" (diffuse-remote {:bin (or (:bin opts) ".")
+                                              :binname (:bin-name opts)
+                                              :model (:model opts)
+                                              :prompt (or (:prompt opts)
+                                                          "Explain why the sky appears blue, in two or three sentences.")
+                                              :n (num (:n opts) 96)
+                                              :steps (num (:steps opts) 32)
+                                              :threshold (when (:threshold opts)
+                                                           (js/parseFloat (:threshold opts)))
+                                              :t (num (:t opts) threads)
+                                              :temp (or (:temp opts) 0)
+                                              :timeout-s timeout-s})
+                   (throw (js/Error. (str "bench: unknown engine " engine))))
+          t0 (js/Date.now)
+          ;; `export K=V;` and not a bare `K=V cmd` prefix: the remote command
+          ;; starts with `cd`, and `K=V cd /dir` scopes the variable to the
+          ;; builtin, not to the engine that runs after it.
+          remote-cmd (if-let [e (:env opts)] (str "export " e "; " remote) remote)
+          r (sh (ssh-argv user (:ip node) remote-cmd (+ timeout-s 120)))
+          elapsed (/ (- (js/Date.now) t0) 1000.0)
+          parsed (assoc (case engine
+                          "llama" (parse-llama-bench (:stdout r))
+                          "diffuse" (parse-diffuse (:stdout r)))
+                        :ssh-elapsed-s elapsed)
+          tokens (:tokens parsed)
+          wall (:wall-s parsed)
+          metrics (cond-> parsed
+                    (and tokens wall (pos? wall))
+                    (assoc :tok-s (/ tokens wall)
+                           :tok-per-step (/ tokens (max 1 (or (:denoise-steps parsed) 1))))
+                    (not= 0 (:status r))
+                    (assoc :ssh-status (:status r)))
+          entry (row {:node node
+                      :engine (if (= engine "llama") "llama-bench" "diffuse-cli")
+                      :bin (or (:bin opts) ".")
+                      :model (:model opts)
+                      :remote remote-cmd
+                      :metrics metrics
+                      :out (sha8 (:stdout r))
+                      :extra {:bytes (some-> (:model_bytes host) js/parseInt)
+                              :sha (:model_sha8 host)
+                              :host (select-keys host [:host :kernel :threads :memtotal_kb
+                                                       :gtt_bytes :vram_bytes])}
+                      :non-claims ["the ssh wall clock is not the engine's own timing"
+                                   "one run; a second run of the same configuration is a different row"]})]
+      {:entry entry
+       :status (:status r)
+       :stdout (:stdout r)
+       :stderr (:stderr r)
+       :host host
+       :warning (cond
+                  (= "0" (str tokens)) "the engine reported zero generated tokens"
+                  (not= 0 (:status r)) (str "ssh exit " (:status r))
+                  (str/blank? (str (:stdout r))) "the remote command printed nothing"
+                  (and (= engine "llama") (nil? (:tg128 parsed)))
+                  "llama-bench printed no tg128 row — nothing was measured"
+                  (and (= engine "diffuse") (nil? (:tokens parsed)))
+                  "diffuse-cli printed no token count — nothing was measured"
+                  :else nil)})))
+
+(defn cmd-run [opts]
+  (let [{:keys [entry status stdout stderr host warning]} (measure opts)
+        p (or (:ledger opts) (ledger-path))]
+    (println (str "node " (:bench/node entry) " (" (:bench/node-ip entry) ")"
+                  " threads=" (:threads host)
+                  " mem=" (:memtotal_kb host) " kB"
+                  " gtt=" (:gtt_bytes host)
+                  " model=" (:bench/model-bytes entry) " B"
+                  " sha8=" (:bench/model-sha8 entry)))
+    (println (ledger-line entry))
+    (when warning (println (str "WARNING: " warning)))
+    ;; A remote run can fail while ssh succeeds (the engine refuses the model,
+    ;; the binary is not there). Printing the tail only on a non-zero ssh status
+    ;; hid exactly those cases — the first run of this tool recorded a row that
+    ;; said "the engine printed no rate" and nothing about why.
+    (when (and (or warning (not= 0 status)) (not (str/blank? (str stdout))))
+      (println (subs (str stdout) (max 0 (- (count (str stdout)) 1500)))))
+    (when (not= 0 status)
+      (println (str "ssh stderr: " (first (str/split-lines (str stderr))))))
+    (when-not (:no-record opts)
+      (append-row! p entry)
+      (println (str "recorded -> " p)))
+    status))
+
+(defn cmd-ledger [opts]
+  (let [p (or (:ledger opts) (ledger-path))
+        {:keys [rows bad]} (read-rows p)]
+    (when (zero? (count rows))
+      (println "bench ledger: no rows in" p))
+    (doseq [r (take-last (num (:limit opts) 50) rows)]
+      (println (ledger-line r)))
+    (println (str "ledger " p " rows=" (count rows) " unparseable=" bad))))
+
+(defn cmd-help [_opts] (usage))
+
+(defn run-command
+  "Entry point for `murakumo bench <command> …`. Throws nothing it can predict;
+  returns the process exit code."
+  [command args]
+  (let [commands {"nodes" cmd-nodes "run" cmd-run "ledger" cmd-ledger
+                  "help" cmd-help "--help" cmd-help}]
+    (if-let [f (get commands (or command "help"))]
+      (try (f (parse-args args)) 0
+           (catch :default e (println (.-message e)) 1))
+      (do (println (str "bench: unknown command " command))
+          (usage)
+          1))))

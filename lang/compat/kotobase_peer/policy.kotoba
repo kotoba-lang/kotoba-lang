@@ -1,0 +1,376 @@
+(ns kotobase-peer.policy
+  "Read-visibility policy — the concrete form of ADR-2607050500's
+  'capability/purpose-scoped redaction' placeholder (Phase 3,
+  ADR-2607174500).
+
+  The policy is IN-GRAPH DATA, not worker configuration: datoms on the
+  well-known entity `kotobase.policy/read` travel with the chain, so any
+  peer that syncs the graph enforces the identical policy — the same
+  distribution argument as the materialized views (ADR-2607166600).
+
+  Model (deliberately minimal, additive later):
+    {:db/id \"kotobase.policy/read\"
+     :kotobase.policy/protected-prefixes \"[\\\":dm.\\\" \\\":secret.\\\"]\"}
+  Rows whose :a starts with ANY protected prefix are visible only to a
+  viewer with sufficient CLEARANCE. A graph with NO policy entity is fully
+  public — exactly today's behavior, so rollout is zero-regression by
+  construction.
+
+  Clearance has four levels, not two (ADR-2607280100 D3). A policy may add
+
+    :kotobase.policy/prefix-levels \"{\\\":dm.\\\" :confidential}\"
+
+  which says how protected each prefix is; the prefix LIST still says what
+  is protected. A prefix with no level is `:restricted`, which is what the
+  binary rule already meant — so the old behaviour is the top case of the
+  new rule rather than a branch beside it, and every pre-existing policy
+  keeps its exact meaning without being rewritten.
+
+  The labels are `kotoba.security.information-flow`'s. There is one
+  classification lattice in this workspace (ADR-2607280100 D1, after two
+  copies of it were found), and this namespace deliberately does not keep a
+  local four-entry map that would be free to drift from it.
+
+  `visible-for` returns the row post-filter every read producer in
+  kotobase-peer already threads (datoms / cold-datoms / hot-datoms / q /
+  view-rows — 'Query is a first-class effect'): the seam existed
+  everywhere, this ns just decides the fn from (policy × viewer caps)."
+  (:require 
+            [kotoba.lang.text :as str]
+            [kotoba.security.information-flow :as flow]
+            [authority.scope :as scope]
+            [ipld.core :as ipld]))
+
+(def policy-entity "kotobase.policy/read")
+
+(def read-protected-capability "kotoba://can/datom:read-protected")
+(def read-capability "kotoba://can/datom:read")
+(def decrypt-capability "kotoba://can/datom:decrypt")
+(def transact-capability "kotoba://can/datom:transact")
+(def policy-admin-capability "kotoba://can/datom:policy-admin")
+
+;; ---------------------------------------------------------------- clearance
+;; ADR-2607280100 Step 2 (D3). The prefix list stays the list of PROTECTED
+;; prefixes; a level only says how protected. A prefix with no level is
+;; `:restricted`, which is what the binary rule already meant, so the old
+;; behaviour is the top case of the new one rather than a branch beside it.
+
+(def read-classified-capability-prefix
+  "A per-level read capability: this prefix plus a lattice label, e.g.
+  `kotoba://can/datom:read-classified/confidential`. The label is
+  `kotoba.security.information-flow`'s -- there is one lattice
+  (ADR-2607280100 D1) and this namespace does not get a second one."
+  "kotoba://can/datom:read-classified/")
+
+(def ^:private top-rank (apply max (vals flow/ranks)))
+
+(defn- object-rank
+  "The rank an ATTRIBUTE's declared level earns. Unknown or missing coerces
+  UP, to the top, exactly as `flow/join` does: on the object side the safe
+  reading of a label nobody can rank is the most protected one."
+  [label]
+  (if-let [canonical (flow/canonical label)]
+    (get flow/ranks canonical)
+    top-rank))
+
+;; The per-level read grant, as a scope in the ONE capability lattice
+;; (kotoba-lang/authority over lang/capability-semantics.edn; root
+;; ADR-2608180200 / adr-2609241800 step 7). `[... :*]` covers exactly the
+;; strictly-longer scopes under the prefix, so `covers?` answers "is this a
+;; per-level read grant" by segment equality -- no substring left to confuse
+;; `datom:read-classifiedX/...` with `datom:read-classified/...`.
+(def read-classified-scope
+  (scope/parse (str read-classified-capability-prefix "*")))
+
+(defn- classified-label
+  "The lattice label a per-level read grant names, or nil when CAP is not one.
+  Exactly one segment under the prefix: anything longer names no label in
+  `flow/ranks` (the old substring rule produced a namespaced keyword that
+  `flow/canonical` could never rank), so refusing it here changes no rank."
+  [cap]
+  (let [s (scope/parse cap)]
+    (when (and (scope/covers? read-classified-scope s)
+               (= (count read-classified-scope) (count s))
+               (string? (peek s)))
+      (keyword (peek s)))))
+
+(defn clearance-rank
+  "The viewer's clearance rank, from verified capability strings.
+
+  Unknown labels coerce DOWN here -- an unrecognised capability grants
+  nothing. This is the OPPOSITE rounding to `object-rank`, and deliberately
+  so: both directions are the fail-closed one for their own side, and a
+  single shared rule would have to be wrong on one of them. Coercing a
+  subject's unknown label up is privilege escalation by typo.
+
+  `read-protected-capability` is the legacy grant and means top clearance,
+  which is what it already meant when the rule was binary.
+
+  Decided by `authority.scope` (the one decider, root adr-2609241800 step
+  7), not a local `starts-with?`: see `classified-label`. The equivalence
+  with the old substring rule is pinned case by case in
+  kotobase-peer.policy-authority-test."
+  [caps]
+  (let [caps (set caps)]
+    (if (contains? caps read-protected-capability)
+      top-rank
+      (reduce (fn [best cap]
+                (if-let [label (classified-label cap)]
+                  (max best (get flow/ranks (or (flow/canonical label) :public) 0))
+                  best))
+              0
+              caps))))
+
+(defn policy-cid
+  "Stable content identity of the normalized policy decision input."
+  [policy]
+  (when policy
+    (:cid (ipld/node->block {"type" "kotobase/read-policy/v1"
+                             "policy" (pr-str policy)}))))
+
+(defn visibility-evidence [visible?]
+  (select-keys (meta visible?) [:policy-cid :policy-reason :policy-mode]))
+
+(defn policy-of
+  "Current-state rows ({:e :a :v_edn ...}) of the POLICY ENTITY →
+  {:protected-prefixes [...]}, or nil when the graph declares no policy.
+  Tolerant of extra rows (callers may pass a whole-entity read)."
+  [rows]
+  (let [attrs (reduce (fn [m {:keys [e a v_edn added]}]
+                        (if (and (= e policy-entity) (not (false? added)))
+                          (assoc m a v_edn)
+                          m))
+                      {} rows)
+        ;; v_edn is the wire-EDN of the stored value; the stored value is
+        ;; itself an EDN string of the prefix vector (the same
+        ;; string-blob convention tx values use throughout this stack).
+        read-vec (fn [k]
+                   (try
+                     (some-> (get attrs k)
+                             edn/read-string
+                             (as-> v (if (string? v) (edn/read-string v) v)))
+                     (catch  _ nil)))
+        read-value (fn [k]
+                     (try
+                       (some-> (get attrs k) edn/read-string)
+                       (catch  _ nil)))
+        ;; Same tolerance `read-vec` has, for the same reason. Every value a
+        ;; transaction carries over the wire arrives as a string BLOB -- the
+        ;; caller pr-strs the map, the tx layer stores that string, and
+        ;; `v_edn` is the pr-str OF that string. One `edn/read-string` on a
+        ;; blob hands back a String, `map?` says false, and the level is
+        ;; dropped in silence: the prefix falls back to `:restricted` and a
+        ;; correctly-cleared viewer is refused with no error anywhere.
+        ;;
+        ;; Measured 2026-09-10 through kotobase-server's `transact`, which is
+        ;; the only way a REMOTE client can install a policy at all:
+        ;;   :kotobase.policy/prefix-levels => "\"{\\\":dm.\\\" :confidential}\""
+        ;; The tests here built rows by hand with a single `pr-str`, so they
+        ;; pinned a shape the wire never produces and stayed green.
+        read-map (fn [k]
+                   (try
+                     (some-> (get attrs k)
+                             edn/read-string
+                             (as-> v (if (string? v) (edn/read-string v) v)))
+                     (catch  _ nil)))
+        prefixes (read-vec ":kotobase.policy/protected-prefixes")
+        prefix-levels (read-map ":kotobase.policy/prefix-levels")
+        prefix-levels (when (and (map? prefix-levels)
+                                 (every? string? (keys prefix-levels))
+                                 (every? keyword? (vals prefix-levels)))
+                        prefix-levels)
+        owner-attrs (read-vec ":kotobase.policy/owner-attrs")
+        write-prefixes (read-vec ":kotobase.policy/write-prefixes")
+        write-entity-prefixes (read-vec ":kotobase.policy/write-entity-prefixes")
+        write-actions (read-vec ":kotobase.policy/write-actions")
+        max-datoms (read-value ":kotobase.policy/max-datoms-per-tx")
+        required-purpose (read-value ":kotobase.policy/required-purpose")]
+    (when (and (sequential? prefixes) (seq prefixes)
+               (every? string? prefixes))
+      (cond-> {:protected-prefixes (vec prefixes)}
+        ;; A level per protected prefix (ADR-2607280100 D3). Supplementary:
+        ;; a prefix is protected because it is in the LIST, and a level only
+        ;; says how much. Two sources of truth for \"is this protected\" is how
+        ;; a prefix drops out of one of them.
+        (seq prefix-levels)
+        (assoc :prefix-levels prefix-levels
+               ;; Recorded rather than only coerced. flow/unknown-labels
+               ;; exists because a silent safe answer accumulates -- that ns
+               ;; says so about this exact lattice.
+               :unknown-levels (flow/unknown-labels (vals prefix-levels)))
+        (contains? #{:public :private :sealed}
+                   (read-value ":kotobase.policy/security-mode"))
+        (assoc :security-mode (read-value ":kotobase.policy/security-mode"))
+        ;; Phase 3c (ADR-2607174500 addendum 2): attrs whose VALUE is a DID
+        ;; that owns the entity. A viewer whose verified CACAO issuer DID
+        ;; matches ANY owner-attr value on an entity sees that entity's
+        ;; protected rows even without the read-protected capability — the
+        ;; owner reading their own data (e.g. a DM's :dm.message/author).
+        (and (sequential? owner-attrs) (seq owner-attrs)
+             (every? string? owner-attrs))
+        (assoc :owner-attrs (vec owner-attrs))
+        (and (sequential? write-prefixes) (seq write-prefixes)
+             (every? string? write-prefixes))
+        (assoc :write-prefixes (vec write-prefixes))
+        (and (sequential? write-entity-prefixes) (seq write-entity-prefixes)
+             (every? string? write-entity-prefixes))
+        (assoc :write-entity-prefixes (vec write-entity-prefixes))
+        (and (sequential? write-actions) (seq write-actions)
+             (every? #(contains? #{:assert :retract} %) write-actions))
+        (assoc :write-actions (set write-actions))
+        (and (integer? max-datoms) (pos? max-datoms))
+        (assoc :max-datoms-per-tx max-datoms)
+        (and (string? required-purpose) (seq required-purpose))
+        (assoc :required-purpose required-purpose)))))
+
+(defn visible-for
+  "(policy × viewer capability strings) → the `visible?` row fn.
+  nil policy → (constantly true): a policy-less graph stays fully public.
+
+  With a policy, a row under a protected prefix is visible when the viewer's
+  clearance rank is at least the prefix's level rank — `(>= viewer level)`,
+  so clearance reaches its OWN level and no higher. A prefix with no
+  declared level is `:restricted`, and `read-protected-capability` is top
+  clearance, which together reproduce the binary rule exactly.
+
+  Where two prefixes both match an attribute, the HIGHER decides: otherwise
+  a broad low-level prefix would be a door into everything beneath it.
+
+  The policy entity's own rows are always visible (a viewer may inspect what
+  is being withheld — redaction, not stealth), and owner-based disclosure
+  (Phase 3c) is orthogonal to clearance."
+  ([policy caps] (visible-for policy caps nil))
+  ([policy caps owned-entities]
+   (if (nil? policy)
+     (constantly true)
+     (let [prefixes (:protected-prefixes policy)
+           levels (:prefix-levels policy)
+           viewer-rank (clearance-rank caps)
+           ;; Precomputed once, not per row: a read filter runs on every row
+           ;; a producer emits.
+           ranked (mapv (fn [p] [p (object-rank (get levels p))]) prefixes)
+           owned (set owned-entities)]
+       (if (>= viewer-rank top-rank)
+         ;; Top clearance clears every rank, so this is the same answer the
+         ;; general branch gives -- kept because it is the common case.
+         (constantly true)
+         ;; rows arrive in TWO shapes depending on the producer: datoms/
+         ;; hot-datoms/view-rows emit {:e :a :v_edn}, arrangement.query (q)
+         ;; emits {:s :p :o} — treat :a/:p and :e/:s as the same positions
+         ;; (they are; see kotobase-peer.core/datoms' docstring).
+         (fn [row]
+           (let [ent (or (:e row) (:s row))
+                 attr (or (:a row) (:p row))]
+             (or (= ent policy-entity)
+                 (contains? owned ent)       ; owner-based disclosure (Phase 3c)
+                 ;; The highest rank among EVERY matching prefix, so an
+                 ;; overlapping pair cannot be used to read at the lower of
+                 ;; the two. nil = matched nothing = not protected.
+                 ;; This `starts-with?` is over ATTRIBUTE names (":dm."), the
+                 ;; graph's own local policy -- not over a capability. The
+                 ;; capability half of the decision is `clearance-rank`,
+                 ;; which asks authority.scope (adr-2609241800 step 7).
+                 (let [required (reduce (fn [best [p r]]
+                                          (if (str/starts-with? (or attr "") p)
+                                            (max (or best 0) r)
+                                            best))
+                                        nil
+                                        ranked)]
+                   (or (nil? required) (>= viewer-rank required)))))))))))
+
+(defn visible-for-mode
+  "Fail-closed visibility entry point for network services. MODE is the graph's
+  creation-time mode when policy data is absent/unparseable. Private/sealed
+  graphs deny data rows on policy failure; legacy-public is explicit migration
+  compatibility, never an implicit default."
+  [policy caps owned-entities mode]
+  (let [mode (or (:security-mode policy) mode :legacy-public)
+        caps (set caps)
+        policy-row? (fn [row] (= policy-entity (or (:e row) (:s row))))
+        [visible? reason]
+        (cond
+          (= mode :legacy-public) [(visible-for policy caps owned-entities) :legacy-public]
+          (and (= mode :public) (nil? policy)) [policy-row? :deny/missing-public-policy]
+          (nil? policy) [policy-row? :deny/missing-policy]
+          (and (= mode :private) (not (contains? caps read-capability)))
+          [policy-row? :deny/missing-read-capability]
+          (= mode :sealed)
+          (if (contains? caps decrypt-capability)
+            [(visible-for policy caps owned-entities) :allow/decrypt-capability]
+            [policy-row? :deny/missing-decrypt-capability])
+          :else [(visible-for policy caps owned-entities) :policy-filtered])]
+    (with-meta visible? {:policy-cid (policy-cid policy)
+                         :policy-reason reason :policy-mode mode})))
+
+(defn- quad-action [quad]
+  (if (contains? #{:retract :retract-entity} (:op quad)) :retract :assert))
+
+(defn write-decision
+  "Authorize a complete transaction before any block is written. CONTEXT must
+  contain normalized effective capabilities, never raw CACAO resources.
+  Returns {:allowed? ... :denials [...]}; callers commit only when allowed.
+
+  A valid policy grants ordinary writes only to :write-prefixes. Policy/schema/
+  authority records require the separately trusted policy-admin capability.
+  Missing policy is permitted only in explicit :legacy-public mode."
+  [policy context quads mode]
+  (let [caps (set (:effective-caps context))
+        admin? (contains? caps policy-admin-capability)
+        transact? (contains? caps transact-capability)
+        mode (or (:security-mode policy) mode :legacy-public)
+        prefixes (:write-prefixes policy)
+        entity-prefixes (:write-entity-prefixes policy)
+        allowed-actions (or (:write-actions policy) #{:assert :retract})
+        max-datoms (:max-datoms-per-tx policy)
+        required-purpose (:required-purpose policy)
+        purpose (:purpose context)
+        owner-attrs (set (:owner-attrs policy))
+        ;; The prefix tests below are over ATTRIBUTE / ENTITY names -- the
+        ;; graph's local policy, the `local-policy` term of
+        ;; requested ∩ delegated ∩ local-policy. The capability half is the
+        ;; exact membership of `effective-caps` above, which the caller has
+        ;; already decided through authority (adr-2609241800 step 7).
+        protected-prefixes [":kotobase.policy/" ":kotobase.authority/"
+                            ":kotobase.schema/" ":db/"]
+        denial
+        (fn [{:keys [s p] :as quad}]
+          (let [p (or p "")
+                action (quad-action quad)
+                immutable-mode-change? (and policy
+                                            (= p ":kotobase.policy/security-mode"))
+                protected? (or (= s policy-entity)
+                               (contains? owner-attrs p)
+                               (some #(str/starts-with? p %) protected-prefixes))
+                prefix-ok? (or (and (= mode :legacy-public) (nil? policy))
+                               (some #(str/starts-with? p %) prefixes))
+                entity-ok? (or (empty? entity-prefixes)
+                               (some #(str/starts-with? (or s "") %) entity-prefixes))]
+            (cond
+              (not transact?) {:quad quad :reason :write/missing-transact-capability}
+              (and required-purpose (not= required-purpose purpose))
+              {:quad quad :reason :write/purpose-denied}
+              (not (contains? allowed-actions action))
+              {:quad quad :reason :write/action-denied}
+              (not entity-ok?) {:quad quad :reason :write/entity-denied}
+              immutable-mode-change?
+              {:quad quad :reason :write/security-mode-immutable}
+              (and protected? (not admin?))
+              {:quad quad :reason :write/policy-admin-required}
+              (and (not protected?) (not prefix-ok?))
+              {:quad quad :reason :write/attribute-denied}
+              :else nil)))
+        denials (cond-> (vec (keep denial quads))
+                  (and max-datoms (> (count quads) max-datoms))
+                  (conj {:reason :write/quota-exceeded
+                         :count (count quads) :max max-datoms}))]
+    {:allowed? (empty? denials) :denials denials
+     :policy-mode mode}))
+
+(defn assert-write-authorized!
+  [policy context quads mode]
+  (let [decision (write-decision policy context quads mode)]
+    (when-not (:allowed? decision)
+      (throw (ex-info "kotobase write policy denied transaction"
+                      {:type :kotobase.policy/write-denied
+                       :decision decision})))
+    decision))

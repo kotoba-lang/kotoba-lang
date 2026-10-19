@@ -1,0 +1,232 @@
+(ns kotoba.native.affine
+  "Is this vector binding used LINEARLY — at most once on every path, with a
+  consuming update as its last use?
+
+  ## Why the question is worth asking
+
+  `vector-assoc` allocates. The native host says so in its own words: *every
+  operation that changes an element allocates rather than mutates*, and
+  `checked_vector_assoc` is a `memmove` of the whole vector followed by a bump
+  into an arena that is never reclaimed. Two consequences, both measured
+  rather than reasoned about:
+
+  - one element write costs O(length)
+  - the number of writes a vector may ever receive is
+    `arena / length` — **a 16,384-item vector, the longest KIR admits, can be
+    updated four times in the life of a program** (65,536 / 16,384)
+
+  An order book is a struct of arrays with about a million slots per field and
+  a write on every order. Both numbers are wrong for it by orders of
+  magnitude, and neither is a safety property: `surface-status.edn` classifies
+  the whole native vector entry `:implemented-partial`, and its `:state` entry
+  says plainly that **the invariant is AMBIENT, not mutation itself**.
+
+  ## What linearity buys, and why it is not a new semantics
+
+  If a vector handle is dead after an update, updating it in place and
+  allocating a copy are indistinguishable to every observer. So this analysis
+  does not change what a program MEANS. It decides when the backend may lower
+  `vector-assoc` to a store instead of a copy, which is why the answer has to
+  be conservative: a wrong `true` here silently mutates a value somebody still
+  holds.
+
+  ## What conservative means here
+
+  `false` for anything not obviously linear. The shapes admitted are the ones
+  a struct-of-arrays actually writes:
+
+      (let [v (vector-i64-new n)
+            v (vector-assoc v 0 x)      ; shadows — the old v is dead
+            v (vector-assoc v 1 y)]
+        (vector-at v 0))
+
+  A binding that is READ after being consumed, referenced twice on one path,
+  returned, passed to a function, or captured is refused. Escape analysis for
+  literals already exists next door in `kotoba.native.vector-region`; this is
+  the same posture applied to the update path rather than to construction.
+
+  Not wired to a backend. `surface-status.edn` records the widening and its
+  preconditions, and the lowering is one of them."
+  {:kotoba/export [consuming linear-let-thread? linear-parameter? linear? reading]}
+  (:require [kotoba.lang.coll :as set]))
+
+;; clojure.core/some, spelled as the loop it is. In Kotoba `some` is the
+;; option constructor and a two-argument `(some pred coll)` is refused as a
+;; name collision (kotoba-sema frontend); this is the same definition as
+;; clojure.core/some -- the first logical-true (pred x), in order, stopping
+;; there -- so the host answer is unchanged on nbb and the JVM.
+(defn- first-truthy [pred coll]
+  (loop [s (seq coll)]
+    (when s
+      (or (pred (first s)) (recur (next s))))))
+
+(def consuming
+  "Operations that make the vector they are given dead.
+
+  `vector-drop` is here with the assoc family: it returns a view of a suffix,
+  and a view whose parent is later written in place is a view of something
+  else. Admitting it as non-consuming would make the one operation that
+  ALIASES the safe one."
+  '#{vector-assoc vector-f64-assoc vector-conj vector-f64-conj
+     vector-drop vector-f64-drop
+     ;; `vector-take` answers a view of a PREFIX (machine_ir lowers it onto
+     ;; the bytes-slice view), so it aliases for `vector-drop`'s reason.
+     vector-take vector-f64-take})
+
+(def reading
+  "Operations that observe without consuming."
+  '#{vector-count vector-f64-count vector-at vector-f64-at
+     vector-get vector-f64-get nth})
+
+(def ^:private branching
+  "Heads whose arms are alternatives, not a sequence.
+
+  Only one arm runs, so uses in different arms are uses on DIFFERENT PATHS and
+  the count is the maximum rather than the sum. Getting this wrong is not a
+  small conservatism: the shape Kotoba programs actually use to thread a
+  vector is tail recursion, base case reading and step case consuming --
+
+      (defn go [v :vector-i64 i :i64 n :i64] :i64
+        (if (>= i n)
+          (vector-at v 0)
+          (go (vector-assoc v 0 i) (+ i 1) n)))
+
+  -- and summing the arms calls that two uses, which refuses the one shape
+  that matters."
+  '#{if cond case when when-not if-let when-let})
+
+(defn- symbol-set-contains? [items item]
+  (typed-set-contains [:set :symbol] items item))
+
+(defn- sym-uses
+  "How many times `target` can be used on the WORST SINGLE PATH through
+  `form`.
+
+  Counted rather than detected, because `at most once` is the question and
+  `appears at all` is a different one — a binding used twice on one path
+  cannot be consumed by either use."
+  [form target]
+  (cond
+    (= form target) 1
+    (and (seq? form) (symbol-set-contains? branching (first form)) (< 2 (count form)))
+    ;; The test runs on every path; the arms are alternatives. This does not
+    ;; separate `cond`/`case` tests from their arms, which over-counts a test
+    ;; and never under-counts an arm -- the safe direction.
+    (+ (sym-uses (second form) target)
+       (reduce max 0 (map #(sym-uses % target) (drop 2 form))))
+    (seq? form) (reduce + 0 (map #(sym-uses % target) form))
+    (vector? form) (reduce + 0 (map #(sym-uses % target) form))
+    (map? form) (reduce + 0 (map #(+ (sym-uses (key %) target)
+                                     (sym-uses (val %) target)) form))
+    (set? form) (reduce + 0 (map #(sym-uses % target) form))
+    :else 0))
+
+(defn- consuming-call?
+  [form target]
+  (and (seq? form)
+       (symbol-set-contains? consuming (first form))
+       (= target (second form))))
+
+(defn- reading-call?
+  [form target]
+  (and (seq? form)
+       (symbol-set-contains? reading (first form))
+       (= target (second form))))
+
+(defn- position-ok?
+  "`target` may appear only as the FIRST argument of a vector operation.
+
+  Anywhere else — an argument to something that is not a vector operation, a
+  return value, an element being stored — is an escape: the handle reaches
+  code this analysis cannot see, and code it cannot see may hold it."
+  [form target]
+  (cond
+    (= form target) false
+    (seq? form)
+    (if (or (consuming-call? form target) (reading-call? form target))
+      ;; The first argument is the vector; every other argument must not
+      ;; mention it. `(vector-assoc v 0 v)` stores the handle into itself.
+      (every? #(zero? (sym-uses % target)) (drop 2 form))
+      (every? #(position-ok? % target) form))
+    (vector? form) (every? #(position-ok? % target) form)
+    (map? form) (every? #(and (position-ok? (key %) target)
+                              (position-ok? (val %) target)) form)
+    (set? form) (every? #(position-ok? % target) form)
+    :else true))
+
+(defn linear?
+  "True when `target` may be updated in place inside `form`.
+
+  Three conditions, and each of them is a way a wrong `true` would corrupt a
+  live value:
+
+  1. **at most one use** — two uses on one path means the second sees what the
+     first consumed
+  2. **every use is in vector-operation position** — anywhere else the handle
+     escapes to code this cannot see
+  3. **a consumed binding is not read afterwards** — enforced by 1, and stated
+     because it is the property that matters"
+  [form target]
+  (and (<= (sym-uses form target) 1)
+       (position-ok? form target)))
+
+(defn- binding-pairs [bindings] (partition 2 bindings))
+
+(defn linear-parameter?
+  "True when a function parameter is threaded linearly through its body.
+
+  The shape Kotoba actually uses, because `let` cannot rebind a name:
+
+      (defn go [v :vector-i64 i :i64 n :i64] :i64
+        (if (>= i n)
+          (vector-at v 0)
+          (go (vector-assoc v 0 i) (+ i 1) n)))
+
+  One use per path -- read in the base case, consumed in the step -- which is
+  linear exactly when alternatives are counted as alternatives."
+  [body param]
+  (linear? body param))
+
+(defn linear-let-thread?
+  "True when a `let` threads a vector through DISTINCT names, each consuming
+  the one before.
+
+      (let [a (vector-new 1 2 3)
+            b (vector-assoc a 0 9)]
+        (vector-at b 0))
+
+  ## Distinct names, because the language refuses the other shape
+
+  This was `linear-let-chain?` and looked for one name rebound over and over
+  -- `v`, then `v`, then `v` -- which is how the same idea is written in
+  Clojure. **Kotoba refuses it**: `amu check` answers `duplicate let binding`
+  (measured 2026-09-01, amu e96dd8c6). So the first version described a
+  program that cannot be written, and would have been a gate nothing could
+  ever pass. Found by compiling one."
+  [form names]
+  (and (seq? form) (= 'let (first form)) (vector? (second form))
+       (<= 2 (count names))
+       (let [pairs (vec (binding-pairs (second form)))
+             body (drop 2 form)
+             bound (set (map first pairs))]
+         (and (every? (fn [name] (symbol-set-contains? bound name)) names)
+              ;; Every name in the thread is used at most once across all the
+              ;; initialisers, only in vector-operation position, and linearly
+              ;; in the body. A name read after the update that consumed it is
+              ;; exactly what makes an in-place store visible to somebody who
+              ;; did not ask for it.
+              (every? (fn [n]
+                        (and (<= (reduce + 0 (map #(sym-uses (second %) n) pairs)) 1)
+                             (every? #(position-ok? (second %) n) pairs)))
+                      names)
+              ;; Every name but the last is consumed by some later initialiser,
+              ;; and is then DEAD -- zero uses in the body. `linear?` is not
+              ;; enough here: one read of a consumed name is still one use, and
+              ;; it is precisely the read that would see the in-place store.
+              (every? (fn [n]
+                        (and (first-truthy (fn [pair] (consuming-call? (second pair) n)) pairs)
+                             (every? #(zero? (sym-uses % n)) body)))
+                      (butlast names))
+              ;; The last name is the live one and may be read, linearly.
+              (let [live (last names)]
+                (every? #(linear? % live) body))))))

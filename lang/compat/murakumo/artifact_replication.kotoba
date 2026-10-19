@@ -1,0 +1,93 @@
+(ns murakumo.artifact-replication
+  "Controller-side chunked replication of signed release objects over QUIC."
+  (:require [murakumo.overlay.rpc :as rpc]
+            [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            [murakumo.artifact-protocol :as protocol]
+            [murakumo.cd.bundle :as bundle]))
+
+(def default-chunk-bytes (* 48 1024))
+(def default-timeout-ms 10000)
+
+(defn- chunks [bytes size]
+  (map-indexed
+   (fn [idx offset]
+     (let [end (min (alength bytes) (+ offset size))]
+       [idx (.slice bytes offset end)]))
+   (range 0 (alength bytes) size)))
+
+(defn create-overlay-replicator
+  [{:keys [node-lookup session issued-capability source-get request-fn
+           timeout-ms chunk-bytes]
+    :or {timeout-ms default-timeout-ms chunk-bytes default-chunk-bytes}}]
+  (let [request-fn (or request-fn
+                       rpc/request!)
+        capability-document (:capability issued-capability)
+        environment (:cd.capability/environment capability-document)
+        verdict (:cd.capability/verdict-cid capability-document)
+        rpc (fn [target node operation fields]
+              (let [overlay-request {:type "murakumo.overlay.adapter-request"
+                                     :version 1 :transport (or (:transport target) :quic)
+                                     :session session :connect target}
+                    payload (protocol/request
+                             operation
+                             (merge {:murakumo.artifact/node node
+                                     :murakumo.artifact/issued-capability issued-capability
+                                     :murakumo.artifact/environment environment
+                                     :murakumo.artifact/verdict-cid verdict}
+                                    fields))
+                    {:keys [ok? response error]}
+                    (request-fn overlay-request payload timeout-ms)]
+                (if (and ok? (protocol/valid-response? response operation node))
+                  (:murakumo.artifact/result response)
+                  {:ok? false :reason :transport-failed
+                   :error (or error :invalid-response)})))
+        send-object!
+        (fn [target node scope object-cid bytes]
+          (let [id (str/replace (str (random-uuid)) "-" "")
+                fields (assoc scope
+                              :murakumo.artifact/transfer-id id
+                              :murakumo.artifact/object-cid object-cid)
+                begin (rpc target node :begin
+                           (assoc fields :murakumo.artifact/size (alength bytes)))]
+            (if-not (:ok? begin)
+              begin
+              (if (= :present (:status begin))
+                begin
+                (loop [remaining (chunks bytes chunk-bytes)]
+                  (if-let [[sequence chunk] (first remaining)]
+                    (let [result (rpc target node :chunk
+                                      (assoc fields
+                                             :murakumo.artifact/sequence sequence
+                                             :murakumo.artifact/data
+                                             (kbytes/base64-encode chunk)))]
+                      (if (:ok? result)
+                        (recur (rest remaining))
+                        result))
+                    (rpc target node :commit fields)))))))]
+    (fn [{:keys [node artifact-cid revision action]}]
+      (if-let [target (node-lookup node)]
+        (try
+          (let [bundle-bytes (source-get artifact-cid)
+                document (when bundle-bytes (bundle/decode artifact-cid bundle-bytes))]
+            (if-not document
+              {:ok? false :reason :bundle-unavailable}
+              (let [scope {:murakumo.artifact/release-action action
+                           :murakumo.artifact/bundle-cid artifact-cid
+                           :murakumo.artifact/revision revision}
+                    objects (into [[artifact-cid bundle-bytes]]
+                                  (map (fn [{:keys [cid]}]
+                                         [cid (source-get cid)]))
+                                  (:cd.bundle/components document))]
+                (loop [remaining objects replicated []]
+                  (if-let [[cid bytes] (first remaining)]
+                    (if-not bytes
+                      {:ok? false :reason :object-unavailable :cid cid}
+                      (let [result (send-object! target node scope cid bytes)]
+                        (if (:ok? result)
+                          (recur (rest remaining) (conj replicated cid))
+                          result)))
+                    {:ok? true :replicated replicated})))))
+          (catch Throwable t
+            {:ok? false :reason :replication-failed
+             :message (.getMessage t)}))
+        {:ok? false :reason :node-not-found}))))

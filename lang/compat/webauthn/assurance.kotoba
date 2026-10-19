@@ -1,0 +1,214 @@
+(ns webauthn.assurance
+  "How much a registered Passkey credential actually proves about where its
+  private key lives.
+
+  This exists because of one decision and one hazard.
+
+  The decision (2026-07-30): payments are approved with a **Secure Enclave key
+  requiring Touch ID**, so that an agent cannot approve on the human's behalf.
+  The key is non-extractable and every signature needs the sensor.
+
+  The hazard: *asking* for a platform authenticator does not *get* you one. The
+  `authenticatorSelection` in a registration request is a request to the client,
+  and the client is the thing we are trying to constrain. Chrome DevTools ships
+  a **virtual authenticator** that reports `platform`, performs user
+  verification automatically, and signs whatever it is asked to -- programmatically,
+  with no human. An agent that drives a browser can turn it on. So a check that
+  reads `authenticatorAttachment` off the response and concludes 'hardware' is
+  not a gate; it is a comment.
+
+  What is actually verifiable, weakest to strongest:
+
+  | level | based on | a lying client... |
+  |---|---|---|
+  | `:unknown` | nothing recorded | n/a |
+  | `:platform-claimed` | `authenticatorAttachment` in the response | ...simply says `platform`. UNSIGNED. |
+  | `:platform-attested` | AAGUID inside signed authenticator data | ...must forge signed authData |
+  | `:hardware-attested` | attestation chain to a configured root | ...must forge Apple's signature |
+
+  Only the bottom two rows are evidence. `:platform-claimed` is recorded because
+  it is worth having in the ledger, and named `claimed` so that nobody reads it
+  as `verified`.
+
+  A caveat that matters in practice: a browser may deliberately ZERO the AAGUID
+  for privacy when attestation is `none`. A zeroed AAGUID therefore means 'the
+  browser withheld it', NOT 'this authenticator is suspicious'. That is why
+  registration asks for `direct` attestation -- to get the AAGUID at all -- and
+  why an all-zero AAGUID drops to `:platform-claimed` rather than being refused.
+
+  Everything here is PURE. It grades a stored map -- the ceremony and the
+  enforcement live in the consuming application, so this rule can be tested
+  without a browser, a device, or a human finger.
+
+  ## Where this came from, and why it is shared
+
+  Written for `cloud-itonami-app` on 2026-07-30, when payments were bound to a
+  Secure Enclave key requiring Touch ID. `cloud-itonami` (the Cloudflare edge)
+  had no equivalent: it recorded `backup-eligible?`/`backup-state?` on each
+  credential and computed a recovery posture from them, but nothing that said
+  what the key material actually proves. Two surfaces of one product disagreeing
+  about how strong a passkey is, is the failure this move prevents.
+
+  Moved here 2026-08-07 rather than into a new repo: \"what a WebAuthn
+  credential proves\" is this repository's subject."
+  (:require [kotoba.lang.coll :as kcoll] [kotoba.lang.text :as str]))
+
+(def schema "webauthn.assurance.v1")
+
+(def zero-aaguid
+  "All-zero AAGUID: the authenticator did not identify its model. Privacy, not
+  suspicion -- browsers zero it under `none` attestation."
+  "00000000-0000-0000-0000-000000000000")
+
+(def platform-aaguids
+  "Published AAGUIDs of platform authenticators whose private keys are held in a
+  secure element and cannot be exported.
+
+  Deliberately EXCLUDES Windows Hello's software profile
+  (6028b017-b1d4-4c02-b4b3-afcdafc96bb2), which is a genuine platform
+  authenticator whose key is NOT in hardware. That exclusion is the entire point
+  of having a list rather than trusting the `platform` label: `platform` and
+  `hardware-backed` are different properties, and only the second one stops an
+  agent from signing."
+  {"adce0002-35bc-c60a-648b-0b25f1f05503" "Chrome on macOS (Touch ID / Secure Enclave)"
+   "fbfc3007-154e-4ecc-8c0b-6e020557d7bd" "Apple Passkey (iCloud Keychain)"
+   "08987058-cadc-4b81-b6e1-30de50dcbe96" "Windows Hello (hardware)"
+   "9ddd1817-af5a-4672-a2b9-3e3dd95000a9" "Windows Hello (VBS-backed)"})
+
+(def levels
+  "Weakest to strongest. Index order IS the comparison, so a policy floor is a
+  position in this vector rather than a set of special cases."
+  [:unknown :platform-claimed :platform-attested :hardware-attested])
+
+(defn level-rank [level]
+  (let [i (kcoll/index-of levels level)]
+    (if (neg? i) 0 i)))
+
+(defn at-least?
+  "True when `level` is at or above `floor`.
+
+  An unrecognised LEVEL ranks 0, so it clears nothing above `:unknown`. An
+  unrecognised FLOOR is UNSATISFIABLE -- not treated as `:unknown` -- because a
+  misspelt floor in configuration would otherwise be permissive, and a typo that
+  silently disables a gate is the failure mode this whole namespace exists to
+  prevent. Fail closed in both directions."
+  [level floor]
+  (let [f (kcoll/index-of levels floor)]
+    (and (nat-int? f)
+         (>= (level-rank level) f))))
+
+(defn- known-aaguid? [aaguid]
+  (contains? platform-aaguids (some-> aaguid str/lower)))
+
+(defn assurance
+  "Grade one stored credential. PURE.
+
+  Returns
+    {:passkey/assurance     one of `levels`
+     :passkey/aaguid-label  the model name, when the AAGUID is recognised
+     :passkey/basis         what the level rests on, in words}
+
+  The order of the checks is the order of the evidence: a trusted attestation
+  chain beats a recognised AAGUID beats the client's own word."
+  [{:keys [attachment aaguid attestation-trusted? attestation-type]}]
+  (let [platform? (= "platform" (some-> attachment name))]
+    (cond
+      (true? attestation-trusted?)
+      {:passkey/assurance :hardware-attested
+       :passkey/aaguid-label (get platform-aaguids (some-> aaguid str/lower))
+       :passkey/basis (str "attestation chain verified against a configured root"
+                           (when attestation-type (str " (" attestation-type ")")))}
+
+      (known-aaguid? aaguid)
+      {:passkey/assurance :platform-attested
+       :passkey/aaguid-label (get platform-aaguids (str/lower aaguid))
+       :passkey/basis "AAGUID inside signed authenticator data matches a known hardware-backed platform authenticator"}
+
+      platform?
+      {:passkey/assurance :platform-claimed
+       :passkey/basis (if (or (nil? aaguid) (= zero-aaguid aaguid))
+                        "client reported platform attachment; AAGUID was withheld by the browser, so this is UNSIGNED and a client that controls the browser can say the same"
+                        "client reported platform attachment; AAGUID is unrecognised. UNSIGNED.")}
+
+      :else
+      {:passkey/assurance :unknown
+       :passkey/basis (if attachment
+                        (str "attachment reported as " attachment)
+                        "no attachment recorded (registered before assurance was captured, or a cross-platform authenticator)")})))
+
+;; ---------------------------------------------------------------------------
+;; policy
+;; ---------------------------------------------------------------------------
+
+(def default-policy
+  "What a credential must be before it may authorize anything.
+
+  `:min-assurance :platform-claimed` is the shipped floor, and it is chosen
+  because it is the strongest floor that is KNOWN to be reachable. The stronger
+  ones depend on what this machine's browser actually returns for a Touch ID
+  registration -- whether it discloses a real AAGUID under `direct` attestation --
+  and that is measurable rather than guessable. Setting a floor here that the
+  hardware cannot clear would register a passkey successfully and then refuse
+  every payment, which looks like a bug and is worse than a stated limitation.
+
+  `credential-assurance-report` exists to close that loop: register once, read
+  what was actually achieved, then raise this floor with evidence. Doing it in
+  that order is the difference between a policy and a guess."
+  {:min-assurance :platform-claimed
+   :require-user-verification? true})
+
+(defn policy-for
+  "`default-policy` with a deployment's overrides on top. `nil` overrides are
+  the default.
+
+  Takes the overrides directly rather than digging them out of a configuration
+  shape. A shared library that knew where one application keeps its policy
+  would make every other application store it in the same place -- and the
+  first one to disagree would silently get the default floor instead of its own."
+  [overrides]
+  (merge default-policy (or overrides {})))
+
+(defn policy-issues
+  "Why this credential may not authorize under this policy. Empty when it may.
+
+  PURE, and a seq of reasons rather than a boolean, so a refusal can say which
+  requirement failed -- a human told only 'refused' has no way to act."
+  [credential policy]
+  (let [{:keys [min-assurance require-user-verification?]}
+        (merge default-policy policy)
+        {level :passkey/assurance :as graded} (assurance credential)]
+    (cond-> []
+      (not (at-least? level min-assurance))
+      (conj {:passkey/issue :credential/assurance-too-low
+             :passkey/actual level
+             :passkey/required min-assurance
+             :passkey/basis (:passkey/basis graded)})
+
+      ;; Recorded at registration from the SIGNED authenticator data, not from
+      ;; the client's word, which is why it is worth re-checking here: a
+      ;; credential enrolled without user verification can be signed with
+      ;; without a finger, forever.
+      (and require-user-verification?
+           (not (true? (:user-verified? credential))))
+      (conj {:passkey/issue :credential/user-verification-not-established}))))
+
+(defn report
+  "Everything known about one credential's assurance, for a human deciding
+  whether to raise the floor."
+  [credential]
+  (merge {:schema schema
+          :credential-id (:credential-id credential)
+          :attachment (:attachment credential)
+          :aaguid (:aaguid credential)
+          :attestation-type (:attestation-type credential)
+          :attestation-trusted? (boolean (:attestation-trusted? credential))
+          :user-verified? (boolean (:user-verified? credential))
+          :discoverable? (:discoverable? credential)
+          ;; A synced credential exists on more than this device by design.
+          ;; Not a defect -- iCloud Keychain passkeys are backed up on purpose --
+          ;; but it does mean 'this key is in THIS Mac's Secure Enclave' is no
+          ;; longer the claim being made, so it is surfaced rather than buried.
+          :backup-eligible? (:backup-eligible? credential)
+          :backed-up? (:backed-up? credential)
+          :created-at (:created-at credential)}
+         (assurance credential)))

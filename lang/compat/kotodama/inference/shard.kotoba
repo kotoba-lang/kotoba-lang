@@ -1,0 +1,108 @@
+(ns kotodama.inference.shard
+  "Layer-sharded execution contracts for kotoba-native distributed inference.
+
+  This is the missing seam between murakumo.infer.plan (memory-weighted
+  contiguous layer ranges over a fleet) and the kotodama.inference runtime
+  (torch-clj graphs computed by num-clj backends): given a plan-shaped
+  assignment list, decide WHICH GGUF tensors each rank owns, and prove that
+  running the decoder stack rank-by-rank — with the activation crossing an
+  EDN handoff between ranks — is byte-for-byte the same computation as the
+  unsharded forward.
+
+  Everything here is pure cljc: it runs in the JVM verifier, in babashka on a
+  fleet node, in a browser WebGPU host, and inside a kotoba WASM component.
+  File IO and transport stay host-injected, as everywhere else in kotodama."
+  (:require [kotoba.lang.text :as str]
+            ))
+
+;; ── tensor ownership ────────────────────────────────────────────────────────
+;; GGUF decoder tensors follow llama.cpp naming: repeating blocks are
+;; `blk.<N>.<role>`, the embedding is `token_embd.*`, and the head is
+;; `output_norm.*` / `output.*`. The FIRST serving rank owns the embedding,
+;; the LAST owns the head — same convention llama.cpp's own device split uses.
+
+(defn- blk-index [tensor-name]
+  (when (str/starts-with? tensor-name "blk.")
+    (let [rest' (subs tensor-name 4)
+          dot (str/index-of rest' ".")]
+      (when dot
+        ))))
+
+(defn owned-tensor?
+  "Does the rank holding `{:layers [lo hi) :first? :last?}` own `tensor-name`?"
+  [{:keys [layers first? last?]} tensor-name]
+  (let [[lo hi] layers]
+    (if-let [n (blk-index tensor-name)]
+      (and (>= n lo) (< n hi))
+      (cond
+        (str/starts-with? tensor-name "token_embd") (boolean first?)
+        (or (str/starts-with? tensor-name "output_norm")
+            (str/starts-with? tensor-name "output.")
+            (= tensor-name "output")) (boolean last?)
+        ;; anything unrecognized rides with the head rank so nothing is orphaned
+        :else (boolean last?)))))
+
+(defn plan->rank-specs
+  "murakumo.infer.plan assignments (`[{:layers [lo hi) :span n …} …]`, ring
+  order) → rank specs with :first?/:last? derived from serving order. Nodes
+  with zero span do not serve and get no spec."
+  [assignments]
+  (let [serving (vec (filter (comp pos? :span) assignments))]
+    (vec (map-indexed
+          (fn [i a]
+            (-> (select-keys a [:layers :span :node])
+                (assoc :rank i
+                       :first? (zero? i)
+                       :last? (= i (dec (count serving))))))
+          serving))))
+
+(defn covers-exactly?
+  "Do the rank specs tile [0, n-layers) with no gap and no overlap?"
+  [rank-specs n-layers]
+  (and (seq rank-specs)
+       (= 0 (-> rank-specs first :layers first))
+       (= n-layers (-> rank-specs last :layers second))
+       (every? (fn [[a b]] (= (second (:layers a)) (first (:layers b))))
+               (partition 2 1 rank-specs))))
+
+;; ── the handoff ─────────────────────────────────────────────────────────────
+;; What crosses the wire between rank i and rank i+1 is ONE activation vector
+;; (per token position) plus enough position to keep RoPE/causality aligned.
+;; It is deliberately printable EDN: the same value can ride an HTTP body, a
+;; libp2p stream, a KSE event, or a test's pr-str round-trip.
+
+(defn handoff
+  "Rank boundary payload: the hidden state leaving `layer` (exclusive hi)."
+  [layer pos hidden]
+  {:shard/v 1
+   :shard/layer layer
+   :shard/pos pos
+   :shard/hidden (vec hidden)})
+
+(defn write-handoff [h] (pr-str h))
+
+(defn read-handoff [s]
+  (let [h (edn/read-string s)]
+    (when-not (= 1 (:shard/v h))
+      (throw (ex-info "unknown shard handoff version" {:handoff h})))
+    h))
+
+;; ── sharded execution ───────────────────────────────────────────────────────
+
+(defn rank-forward
+  "Run one rank's contiguous slice: fold `layer-fn` (hidden, layer-index →
+  hidden) over [lo, hi). Pure — the layer-fn closes over that rank's weights."
+  [layer-fn hidden [lo hi]]
+  (reduce layer-fn hidden (range lo hi)))
+
+(defn sharded-forward
+  "Compose every rank's slice with the activation crossing a SERIALIZED
+  handoff at each boundary — the executable claim that the EDN payload carries
+  everything the next rank needs. Returns the final hidden state."
+  [layer-fn hidden rank-specs {:keys [pos] :or {pos 0}}]
+  (reduce (fn [h {:keys [layers]}]
+            (let [out (rank-forward layer-fn h layers)
+                  wire (write-handoff (handoff (second layers) pos out))]
+              (:shard/hidden (read-handoff wire))))
+          (vec hidden)
+          rank-specs))

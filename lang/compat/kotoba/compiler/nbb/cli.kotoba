@@ -1,0 +1,784 @@
+(ns kotoba.compiler.nbb.cli
+  "Shared ordinary-native CLI implementation. ISA-specific executable
+  entrypoints inject exactly one emitter, so compiling AArch64 never loads
+  x86-64 code and vice versa."
+  {:kotoba/export [native-feature-refusal-message native-value-abi run! targets
+                  unqualified-native-feature]}
+  (:require [kotoba.compiler.capability-names :as cap-names]
+            [kotoba.compiler.kexe-fs-forms :as kexe-fs-forms]
+            [kotoba.compiler.nbb.cli-support :as support]
+            [kotoba.compiler.nbb.compile-cache :as compile-cache]
+            [kotoba.compiler.nbb.verdict-cache :as verdict-cache]
+            [kotoba.compiler.definition-identity :as definition-identity]
+            [kotoba.sema :as sema]
+            [kotoba.compiler.nbb.io :as nbb-io]
+            [kotoba.compiler.nbb.output-set :as output-set]
+            [kotoba.compiler.nbb.project-source :as project-source]
+            [kotoba.compiler.effect-row :as effect-row]
+            [kotoba.artifact.core :as artifact]
+            [kotoba.kir.compatibility :as compatibility]
+            [kotoba.compiler.host-integer :as host-integer]
+            [kotoba.kir :as ir]
+            [kotoba.compiler.provenance :as provenance]
+            [kotoba.compiler.source-path :as source-path]
+            [kotoba.compiler.uefi-operations :as uefi]
+            [kotoba.kir.target :as target-profile]
+            [kotoba.compiler.js-value-target :as js-value-target]
+            [kotoba.verifier :as verifier]
+            [kotoba.compiler.text-bytes :as text-bytes]
+            [kotoba.compiler.base64-text :as base64-text]
+            ;; The env/read ability (catalog wire 33, superproject
+            ;; adr-2609242330 S5); under nbb the alias names the
+            ;; mechanism-layer handler.
+            ))
+
+;; Mirrors `kotoba.compiler.cli`'s `parse-target`, restricted to ORDINARY
+;; (non-aiueos) native target names -- everything this fast
+;; path claims. The `x86_64-aiueos-*`/`aarch64-aiueos-*` firmware/kernel
+;; sub-targets (ELF64/PE32+ packaging via `kotoba.compiler.packaging.*`,
+;; only reachable through `kbb -M:run compile` directly, not this
+;; usage-documented list) stay JVM-only -- out of scope here, same
+;; boundary `kotoba.compiler.core/compile-source*`'s own `cond->` draws
+;; between the sealed `:kexe/v1` artifact (every ordinary native target)
+;; and the extra `:binary`/`:object` packaging (aiueos targets only).
+;; Every other name in the JVM `parse-target` table falls through to the
+;; JVM path in `bin/kotoba` before this script is ever spawned.
+(def targets
+  {"x86_64" :x86_64-kotoba-v1
+   "x86_64-linux" :x86_64-linux-kotoba-v1
+   "x86_64-macos" :x86_64-macos-kotoba-v1
+   "x86_64-windows" :x86_64-windows-kotoba-v1
+   "aarch64" :aarch64-kotoba-v1
+   "aarch64-linux" :aarch64-linux-kotoba-v1
+   ;; superproject adr-2609251400 C2: the same two ISA emitters, packaged by
+   ;; `kotoba.native.linux-static` into an ELF that runs with no loader and no
+   ;; libc. `--output` holds the executable (see native-package).
+   "x86_64-linux-static" :x86_64-linux-static-kotoba-v1
+   "aarch64-linux-static" :aarch64-linux-static-kotoba-v1
+   "aarch64-macos" :aarch64-macos-kotoba-v1
+   "aarch64-windows" :aarch64-windows-kotoba-v1
+   "aarch64-android" :aarch64-android-kotoba-v1
+   "aarch64-ios" :aarch64-ios-kotoba-v1
+   ;; The aiueos profiles reach the same two ISA emitters as the entries above
+   ;; -- `target/backend` maps every one of them to :x86_64-kotoba-v1 or
+   ;; :aarch64-kotoba-v1 -- so nothing about code generation kept them off this
+   ;; route. What kept them off was that this driver had no packaging step, and
+   ;; admitting a kernel target without one would have written artifact EDN to
+   ;; a path named `.o`: a silent wrong answer rather than a refusal. With
+   ;; `kotoba.compiler.nbb.native-package` supplying the same ELF64/PE32+
+   ;; packagers the JVM CLI calls, the object build no longer needs a JDK.
+   "x86_64-aiueos-kernel-v1" :x86_64-aiueos-kernel-v1
+   "x86_64-aiueos-user-v1" :x86_64-aiueos-user-v1
+   "x86_64-aiueos-uefi-v1" :x86_64-aiueos-uefi-v1
+   "aarch64-aiueos-kernel-v1" :aarch64-aiueos-kernel-v1})
+
+;; fuel64: the same ceiling `kotoba.verifier` enforces, which is
+;; `kotoba.kir/max-fuel` -- read rather than copied, because a JVM-free route
+;; that admitted a different budget from the verifier would produce artifacts
+;; the verifier then refused, and the diagnostic would name the artifact rather
+;; than the disagreement. 2^20 until 2026-09-03; see the ADR.
+(def ^:private max-native-fuel ir/max-fuel)
+
+
+(defn native-value-abi
+  "The value ABI stamped into a native artifact's compatibility descriptor.
+
+  This mirrored only the last two branches. `kotoba.compiler.core` (the JVM
+  compiler), `kotoba.compiler.nbb.wasm-cli` and `kotoba.verifier` all select
+  from FOUR, so any program carrying floating point compiled through this
+  JDK-free driver stamped `:kotoba.typed/externref-v1` while the verifier
+  re-derived `:kotoba.typed/mixed-f64-v2` and refused the artifact with
+  `native compatibility metadata rejected` -- a diagnostic that names the
+  metadata rather than the missing branch, so it reads as an unsupported
+  program rather than a driver that cannot describe it.
+
+  Measured 2026-08-30: a `vector-f64` module reached this path and was refused
+  exactly so. It is not vector-specific; `uses-f64?` is true for any f64
+  literal, since the frontend desugars one into `f64-from-bits`.
+
+  Derived from the KIR rather than the HIR because the KIR is what the
+  verifier reads back out of the sealed artifact. `kotoba.compiler.core`
+  derives the same answer from the HIR; deriving it here from the value the
+  checker actually inspects removes the possibility of the two disagreeing."
+  [kir typed-values?]
+  (cond
+    (ir/uses-f32? kir) :kotoba.typed/mixed-f32-f64-v3
+    (ir/uses-f64? kir) :kotoba.typed/mixed-f64-v2
+    typed-values? :kotoba.typed/externref-v1
+    :else :kotoba.i64/direct-v1))
+
+(defn- native-fuel! [policy]
+  (let [declared (or (get-in policy [:budgets :fuel]) 512)
+        ;; Bounded EDN preserves integer literals as BigInt on the Node path.
+        ;; The native ABI and KIR oracle use plain host integers. Converting
+        ;; only after this bound check is exact in JavaScript and preserves the
+        ;; original policy value for provenance hashing.
+        ;;
+        ;; fuel64: `Number.isSafeInteger` was ALREADY enforcing the ceiling
+        ;; this stream went on to choose. It is `<= 2^53-1` by definition, so
+        ;; the JVM-free route has refused anything the KIR counter could not
+        ;; decrement since the day it was written -- the `max-native-fuel` test
+        ;; beside it (2^20) was simply four hundred million times tighter and
+        ;; hid it. The ceiling is not an invention; it is the number this line
+        ;; already implemented, now written down where the other routes can
+        ;; read it.
+        fuel (host-integer/narrow declared)]
+    (when-not (and (host-integer/safe-integer? fuel)
+                   (<= 1 fuel max-native-fuel))
+      (throw (ex-info "native fuel budget is not admitted"
+                      {:phase :verify :fuel declared
+                       :maximum max-native-fuel})))
+    fuel))
+
+(defn- fuel-policy!
+  "The policy with `--fuel` folded into `[:budgets :fuel]` -- after refusing
+  the case where both were given and disagree. Mirrors
+  `kotoba.compiler.core/refuse-fuel-declared-twice!` (amu-h6): the flag used
+  to overwrite the policy's number here silently, so the policy's author never
+  learned theirs was not the one sealed.
+
+  Compared as decimal text: the flag is a BigInt (`support/emit-metadata`) and
+  the policy value is a BigInt or a plain integer depending on how it was
+  read, and `=` does not cross that boundary."
+  [policy emit-metadata]
+  (let [flag (:fuel emit-metadata)
+        from-policy (get-in policy [:budgets :fuel])]
+    (when (and (some? flag) (some? from-policy) (not= (str flag) (str from-policy)))
+      (throw (ex-info "fuel declared twice with different values: --fuel and the policy's :budgets :fuel must agree"
+                      {:phase :usage :reason :fuel-declared-twice
+                       :flag flag :policy from-policy})))
+    (cond-> policy
+      (some? flag) (assoc-in [:budgets :fuel] flag))))
+
+(defn- read-policy!
+  "`--policy`, with named grants canonicalised to wire ids. Same seam and same
+  reason as `kotoba.compiler.nbb.wasm-cli/read-policy!`."
+  [args]
+  (cap-names/wire-policy (support/read-policy args)))
+
+(defn- admission-policy
+  "The policy admission reads. `:linux-static` (superproject adr-2609251400
+  C3: the grant and fs scope a static ELF seals) is PACKAGING input, not an
+  admission rule -- osaho's admission refuses keys it does not know, and it
+  should -- so it is taken off here and handed to the packager whole
+  (`serialized-native`). It still reaches the provenance record and the
+  compile cache key, both of which read the policy as written. The
+  top-level `:spawn` (the :process/spawn grant, kotoba-lang
+  lang/capability-catalog.edn :process/spawn :grant) is packaging input for
+  the same reason."
+  [policy]
+  (dissoc policy :linux-static :spawn))
+
+(defn- decode-policy!
+  "The cached-compile counterpart of `read-policy!`, for already-read material."
+  [material]
+  (cap-names/wire-policy (support/parse-policy-material material)))
+
+;; Mirrors `kotoba.compiler.core/compile-source*`'s `:else` (native) branch
+;; byte-for-byte -- same sealed `:kotoba.kexe/v1` shape, same
+;; `fuel-abi`/`context-abi`/`limits` constants, same pre-checks -- so a
+;; `.kexe` produced here and one produced by `kbb -M:run compile` for
+;; the identical source/target/policy verify identically against either
+;; artifact's own `:sha256` seal and against `verifier/verify-artifact!`.
+;; Deliberately does NOT replicate the `x86_64-aiueos-*`/`aarch64-aiueos-*`
+;; `:binary`/`:object` packaging step (see `targets`' own comment above for
+;; why that stays out of scope).
+(defn- resolve-hir! [source opts stage-cache]
+  (support/timed "frontend"
+                 #(compile-cache/resolve-stage!
+                   stage-cache :hir
+                   ;; The whole options map, not just :language-profile. A
+                   ;; linked project carries :admit-linked-synthetics?, and a
+                   ;; key blind to it would answer a linked question with an
+                   ;; unlinked HIR -- inside one worker process, where the two
+                   ;; kinds of compile share a stage cache. Tag raised to v3 so
+                   ;; entries written under the old key miss rather than being
+                   ;; read under the new meaning.
+                   (pr-str [:kotoba.hir-cache/v3 source opts])
+                   (fn [] (sema/analyze source opts)))))
+
+(defn- resolve-kir! [hir stage-cache oracle-fuel]
+  (support/timed "kir-lower"
+                 #(compile-cache/resolve-stage!
+                   ;; Native oracle evaluation is reusable only when the
+                   ;; admitted HIR is byte-for-byte semantically identical --
+                   ;; and now also only under the same oracle budget, which is
+                   ;; part of the key for the same reason the HIR is: a
+                   ;; different budget is a different execution and can seal a
+                   ;; different value (or none).
+                   stage-cache :kir (pr-str [hir oracle-fuel])
+                   (fn [] (ir/lower hir {:oracle-fuel oracle-fuel})))))
+
+;; Naming the feature a native target refused (ADR 0351).
+;;
+;; `ir/only-native-word-typed-features?` answers one boolean for the whole
+;; program, and until 2026-09-24 that boolean was the whole diagnostic: "typed
+;; values currently require ..." with nothing saying WHICH form. That was
+;; tolerable while native had to be asked for by name; once an omitted
+;; --target means the host's native target, a program that compiled to Wasm
+;; yesterday with no flag is refused today, and the refusal has to say what
+;; to change.
+;;
+;; The locator asks the SAME predicate smaller questions rather than
+;; re-implementing its admission table -- a second table would be a second
+;; answer that could drift. A body form is probed as the body of a one-function
+;; program with an `:i64` result and no parameters (so the boundary rules pass
+;; and only `walk` decides), and the search descends into the first child that
+;; is refused on its own; a form whose children all pass is the culprit. Let
+;; bindings and match branches are vectors, which the predicate's `walk`
+;; admits wholesale, so their elements are searched as children.
+(defn- probe-body-admitted? [hir body]
+  (ir/only-native-word-typed-features?
+   (assoc hir :functions [{:name '__amu_native_probe :params [] :param-types []
+                           :result :i64 :body body}])))
+
+(defn- form-children [form]
+  (letfn [(spread [x] (if (vector? x) (mapcat spread x) [x]))]
+    (cond (seq? form) (mapcat spread (rest form))
+          (vector? form) (mapcat spread form)
+          :else [])))
+
+(defn- refused-form [hir form]
+  (if-let [child (some #(when-not (probe-body-admitted? hir %) %) (form-children form))]
+    (recur hir child)
+    form))
+
+(defn- bounded-pr [value]
+  ;; `edn-safe` prints an nbb BigInt as the plain integer token, not as
+  ;; `#object[BigInt 1]` (see extract-native below).
+  (let [text (pr-str (artifact/edn-safe value))]
+    (if (> (count text) 160) (str (subs text 0 157) "...") text)))
+
+(defn unqualified-native-feature
+  "The first thing in HIR the native admission gate refuses, as
+  `{:function f :feature op :form text}` for a body form or
+  `{:function f :boundary-types [t ...]}` for a function signature -- or nil
+  when no single function is refused on its own (the gate then still refuses,
+  with the general message)."
+  [hir]
+  (some
+   (fn [{:keys [name param-types result] :as f}]
+     (let [alone (assoc hir :functions [f])]
+       (when-not (ir/only-native-word-typed-features? alone)
+         (if (ir/only-native-word-typed-features? (assoc alone :functions [(assoc f :body 0)]))
+           (let [form (refused-form hir (:body f))]
+             {:function name
+              :feature (if (seq? form) (first form) form)
+              :form (bounded-pr form)})
+           (let [signature (fn [params result*]
+                             (ir/only-native-word-typed-features?
+                              (assoc alone :functions
+                                     [(assoc f :params (vec (take (count params) (:params f)))
+                                             :param-types params :result result* :body 0)])))
+                 refused (vec (concat
+                               (for [t param-types :when (not (signature [t] :i64))] t)
+                               (when (and result (not (signature [] result))) [result])))]
+             {:function name
+              :boundary-types (if (seq refused)
+                                refused
+                                (cond-> (vec param-types) result (conj result)))})))))
+   (:functions hir)))
+
+(defn- target-origin
+  "Where this compile's --target came from, as `bin/amu` recorded it for the
+  child: :host (the host default), :env (AMU_TARGET), or :explicit. The
+  launcher writes or removes the variable on every spawn, so an ambient value
+  is never read."
+  []
+  (case (env/read "AMU_TARGET_ORIGIN")
+    "host" :host
+    "env" :env
+    :explicit))
+
+(defn native-feature-refusal-message
+  "The refusal for a program native does not qualify. Always names the
+  feature and the wasm32 targets that carry typed values; says that amu chose
+  the target only when it did. The hint is given for an explicit native
+  target too: the person who asked for native by name needs to know where the
+  feature IS qualified just as much, and the pre-ADR-0351 message already
+  pointed there. What differs is only whether they know native was chosen."
+  [target found origin]
+  (let [target-name (some (fn [[k v]] (when (= v target) k)) targets)]
+    (str "typed values currently require the kotoba-script web target, typed Wasm "
+         "target, or qualified native string/scalar-record/option-i64/result-i64 features"
+         (cond
+           (:feature found)
+           (str ": native target " target-name " does not qualify `" (:feature found)
+                "` (in function `" (:function found) "`: " (:form found) ")")
+           (:boundary-types found)
+           (str ": native target " target-name " does not qualify the boundary type"
+                (when (next (:boundary-types found)) "s") " "
+                (bounded-pr (:boundary-types found))
+                " of function `" (:function found) "`")
+           :else "")
+         ". The wasm32 targets carry typed values: compile with `--target "
+         "wasm32-browser` (browser / Worker) or `--target wasm32-wasi` (WASI host). "
+         "Nothing was written"
+         (case origin
+           :host (str "; --target was omitted, so amu chose this host's native target "
+                      target-name " (amu ADR 0351) and did not fall back to wasm.")
+           :env (str "; AMU_TARGET chose " target-name
+                     ", and amu did not fall back to wasm.")
+           "."))))
+
+;; P4 of superproject adr-2609242100, section 2: deterministic fuel is OFF by
+;; default on the native profile. These are the targets that profile covers --
+;; a binary this machine runs under the POSIX kexe loader, whose default is
+;; now unmetered. Every other native target keeps metering on by default and
+;; says why: the aiueos kernel / user / UEFI objects replenish fuel per call
+;; and per interrupt entry by tier (kotoba-native elf64 / interrupt-abi, and
+;; `elf64/artifact-fuel` requires one sealed bound), the Windows loader runs
+;; a fixed 512, and android / ios are packaged by routes this step did not
+;; change. `--fuel n` (or policy :budgets :fuel) opts ANY target into
+;; metering at n, for replay and determinism.
+(def unmetered-default-targets
+  #{:x86_64-kotoba-v1 :x86_64-linux-kotoba-v1 :x86_64-macos-kotoba-v1
+    :aarch64-kotoba-v1 :aarch64-linux-kotoba-v1 :aarch64-macos-kotoba-v1
+    ;; adr-2609251400 C2: the static ELF runs the native profile, so its
+    ;; default is the native profile's (fuel off); the prelude starts the
+    ;; counter at the artifact's :fuel-abi :initial as the loader does.
+    :x86_64-linux-static-kotoba-v1 :aarch64-linux-static-kotoba-v1})
+
+;; The budget the compile-time oracle runs under when the artifact is
+;; unmetered: `kotoba.kir/lower`'s own default, named here because the
+;; verifier re-derives the value under the artifact's `:limits :fuel`, so the
+;; two must be handed the same number.
+(def unmetered-oracle-fuel 100000)
+
+(defn- oracle-report
+  "What the compile-time oracle did, for the compile output and the sealed
+  artifact (adr-2609242100 section 4): :verified (the entry's value was
+  re-derived by the reference and sealed), :inconclusive (the reference ran
+  out of a resource first -- NOT a mismatch; the artifact seals no value and
+  says so), or :not-applicable (no pure i64/bool entry to fold)."
+  [kir]
+  (cond
+    (:oracle-inconclusive kir) {:status :inconclusive :trap (:oracle-inconclusive kir)}
+    (some? (:oracle-value kir)) {:status :verified}
+    :else {:status :not-applicable}))
+
+(defn- compile-native! [hir target backend policy emit-metadata emit-program stage-cache]
+  (js-value-target/reject-outside-js-target! target hir)
+  (when (and (= :kotoba.hir/v3 (:format hir))
+             (not (and (contains? #{:x86_64-kotoba-v1 :aarch64-kotoba-v1} backend)
+                       (ir/only-native-word-typed-features? hir))))
+    (let [found (unqualified-native-feature hir)
+          origin (target-origin)]
+      (throw (ex-info (native-feature-refusal-message target found origin)
+                      (cond-> {:phase :target :target target :backend backend
+                               :value-profile :kotoba.value/typed-v1
+                               :target-origin origin
+                               :wasm-targets ["wasm32-browser" "wasm32-wasi"]}
+                        (:function found) (assoc :function (str (:function found)))
+                        (:feature found) (assoc :feature (str (:feature found)))
+                        (:boundary-types found) (assoc :boundary-types (:boundary-types found)))))))
+  ;; Keep the JDK-free self-hosted driver aligned with the JVM compiler:
+  ;; ordinary native artifacts are exportable libraries when their target
+  ;; profile does not require an entry symbol. Aiueos firmware/kernel/process
+  ;; profiles still fail closed because their declared entry must exist.
+  (when (and (nil? (:entry hir))
+             (not (and (contains? #{:x86_64-kotoba-v1 :aarch64-kotoba-v1} backend)
+                       (nil? (:entry (target-profile/profile target))))))
+    (throw (ex-info "entryless libraries currently require the kotoba-script web target, the Wasm target, or an entryless native target"
+                    {:phase :target :target target :backend backend})))
+  ;; boot: the same target gate the JVM route applies. A gate on one route is
+  ;; not a gate -- this driver serves `--target x86_64-aiueos-uefi-v1
+  ;; --artifact image` and would otherwise be the way around it.
+  (uefi/reject-outside-uefi-target! target hir)
+  ;; boot-lit: and the literal pool. Gated on both routes, for the reason the
+  ;; line above is gated on both.
+  (uefi/reject-rodata-literals-outside-native-targets! target hir)
+  (let [admission (support/timed
+                   "admission"
+                   #(effect-row/check hir (support/capability-policy policy)))
+        ;; The DECLARED budget, computed before lowering rather than after,
+        ;; because `kotoba.kir/lower` seals the entry's value by executing it
+        ;; and that execution used to have a private budget no caller could
+        ;; name (osaho c24c92a1). Two things follow from passing this one:
+        ;; a program the author gave enough fuel for now compiles, and the
+        ;; sealed value is derived under the same budget `kotoba.verifier`
+        ;; re-derives it under -- which used to be true only when both
+        ;; happened to fit inside the private constant.
+        ;; P4: metered when the caller named a budget, or when the target's
+        ;; profile keeps fuel on (see `unmetered-default-targets`). A metered
+        ;; artifact's oracle runs under the SAME budget its run gets, so an
+        ;; oracle that runs out is exactly a run that would trap -- which is
+        ;; now `:inconclusive`, not a refused compile. Before P4 the oracle
+        ;; used 100,000 here and the verifier re-derived under 512, so every
+        ;; program between the two was refused at verification.
+        metered? (or (some? (support/oracle-fuel emit-metadata policy))
+                     (not (contains? unmetered-default-targets target)))
+        declared-fuel (if metered?
+                        (native-fuel! (fuel-policy! policy emit-metadata))
+                        unmetered-oracle-fuel)
+        kir-result (resolve-kir! hir stage-cache declared-fuel)
+        kir (:value kir-result)
+        value (:oracle-value kir)
+        profile (target-profile/profile target)
+        typed-values? (= :kotoba.kir/v4 (:format kir))
+        value-abi (native-value-abi kir typed-values?)
+        compat (compatibility/descriptor
+                {:hir-format (:format hir) :kir-format (:format kir)
+                 :target target :target-profile profile :value-abi value-abi})
+        ;; Consensus gas (superproject adr-2610092340 D12): a schedule the
+        ;; caller named rides IN the program, because the verifier re-emits
+        ;; from the program alone and kotoba-native's charge-gas reads it there.
+        program (cond-> (ir/native-program kir)
+                  (:gas-schedule emit-metadata) (assoc :gas-schedule (:gas-schedule emit-metadata)))
+        ;; Verification re-emits from this closed program. Do not let
+        ;; compiler-private KIR metadata influence the bytes being sealed.
+        emitted (support/timed "native-emit" #(emit-program program))
+        code (:code emitted)
+        ;; A kexe-loader program carrying the token of an :fs/app-data form
+        ;; the loader does not answer (kotoba-lang lang/capability-catalog.edn
+        ;; :status :proposed -- OWNER since S5) is refused by name here,
+        ;; before anything is written.
+        _ (kexe-fs-forms/refuse-unanswered! target code)
+        artifact-map
+        (support/timed
+         "artifact-seal"
+         (fn []
+           (artifact/seal
+            (cond-> {:format :kotoba.kexe/v1 :target target :target-profile profile :value value
+             :kir-sha256 (artifact/sha256 program)
+             :lowering (case backend
+                         :x86_64-kotoba-v1 :runtime-sysv-v1
+                         :aarch64-kotoba-v1 :runtime-aapcs64-v1)
+             :fuel-abi (case backend
+                         :x86_64-kotoba-v1
+                         {:mode :hidden-context-r9 :initial (if metered? declared-fuel max-native-fuel)}
+                         :aarch64-kotoba-v1
+                         {:mode :hidden-context-x7 :initial (if metered? declared-fuel max-native-fuel)})
+             :context-abi (cond-> {:version 11 :fuel-offset 8 :allow-bitmap-offset 16
+                           :allow-bitmap-bytes 32 :cap-call-offset 48
+                           :pair-new-offset 56 :pair-first-offset 64
+                           :pair-second-offset 72 :pair-capacity 4096
+                           :kgraph-assert-offset 80 :kgraph-get-offset 88
+                           :kgraph-count-offset 96 :kgraph-entity-at-offset 104
+                           :kgraph-capacity 4096
+                           :string-equal-offset 112 :string-concat-offset 120
+                           :typed-cap-call-offset 128
+                           :string-substring-offset 136
+                           :string-code-point-at-offset 144
+                           :string-pool-capacity 65536
+                           :vector-new-empty-offset 152
+                           :vector-conj-offset 160
+                           :vector-count-offset 168
+                           :vector-at-offset 176
+                           :vector-assoc-offset 184
+                           :vector-drop-offset 192
+                           :vector-alloc-offset 200
+                           :vector-assoc-in-place-offset 208
+                           :string-index-of-offset 216
+                           :arena-enter-offset 224
+                           :arena-leave-offset 232
+                           :string-compare-offset 240
+                           :string-fold-ascii-offset 248
+                           :string-find-blank-offset 256
+                           :string-skip-blank-offset 264
+                           :string-index-of-from-offset 272
+                           :string-compare-lines-offset 280
+                           :pair-used-pointer-offset 288
+                           :pairs-base-offset 296
+                           :pair-validated-base-offset 304
+                           :vector-used-pointer-offset 312
+                           :vectors-base-offset 320
+                           :vector-items-base-offset 328
+                           :string-find-byte-offset 336
+                           :string-append-range-offset 344
+                           ;; ABI v11 (2026-09-25, superproject adr-2609242330): the string
+                           ;; constructor and the three bytes slots.
+                           :string-from-utf8-offset 352
+                           :bytes-from-vector-offset 360
+                           :bytes-slice-offset 368
+                           :bytes-concat-offset 376
+                           :vector-capacity 4096
+                           :vector-item-capacity 65536}
+                             ;; v12: the gas word at 384, only for a gas-metered program (its
+                             ;; code checks the version before it decrements 384).
+                             (:gas-schedule program) (assoc :version 12 :gas-offset 384))
+             :effects (:effects hir)
+             :compatibility compat
+             ;; Unmetered: `:fuel` is the ORACLE's budget (what the verifier
+             ;; re-derives the value under) and `:fuel-abi :initial` is the
+             ;; counter's ceiling the loader starts at. A metered artifact is
+             ;; shaped exactly as before P4.
+             :limits (cond-> {:memory-bytes 65536 :fuel declared-fuel :stack-bytes 4096}
+                       (not metered?) (assoc :fuel-metering :off))
+             :code (mapv #(bit-and (int %) 0xff) code)
+             :program program :exports (:exports emitted)}
+              ;; The artifact says its value was NOT oracle-verified. Present
+              ;; only then, so every other artifact is shaped as before.
+              (:oracle-inconclusive kir)
+              (assoc :oracle {:status :inconclusive
+                              :trap (:oracle-inconclusive kir)
+                              :fuel declared-fuel})))))
+        ;; Computed here rather than inside provenance so the verdict key and
+        ;; the provenance record share ONE computation: `describe` returns
+        ;; `(:definitions result)` unchanged when it is already present.
+        report (definition-identity/describe {:hir hir :kir kir})
+        ;; adr-2609242100 P5: the compile-time verifier verdict is a function
+        ;; of the sealed artifact, the verifier's code and the limits table,
+        ;; so it is answered once per key and replayed after that. See
+        ;; `kotoba.compiler.nbb.verdict-cache` for the key and the integrity
+        ;; checks. A refusal is replayed with the same message and ex-data.
+        verify (support/timed
+                "native-verify"
+                #(verdict-cache/resolve!
+                  (verdict-cache/open-store) :kotoba.verdict/native-verify
+                  {:definitions (definition-identity/cache-material report (:exports hir))
+                   :subject (artifact/sha256 artifact-map)
+                   :target target
+                   :capabilities (artifact/sha256 (support/capability-policy policy))}
+                  (fn [] (verifier/verify-artifact! artifact-map))))]
+    {:format :kexe/v1 :target target :hir hir :kir kir
+     :definitions report
+     :admission admission :artifact artifact-map :compatibility compat
+     :stage-cache {:kir (:cache kir-result)}
+     :oracle (oracle-report kir)
+     :fuel-metering (if metered? :on :off)
+     :verdict-cache {:native-verify (:cache verify)}}))
+
+(defn- serialized-native [source policy emit-metadata result package artifact-kind]
+  (let [provenance-result (support/timed "provenance"
+                                         #(provenance/attach source policy emit-metadata result))]
+    (cond-> {:artifact-text (support/timed
+                             "artifact-serialize"
+                             #(pr-str (artifact/edn-safe (:artifact provenance-result))))
+             :provenance-text (support/timed
+                               "provenance-serialize"
+                               #(pr-str (artifact/edn-safe (:provenance provenance-result))))}
+      ;; Packaged from the sealed artifact map, never from the EDN text above.
+      ;; `artifact/edn-safe` prints an i64 as a plain integer token, so text
+      ;; that round-trips is not the same value -- packaging the reparse would
+      ;; be packaging a lossy copy of what was verified.
+      package (assoc :binary (support/timed
+                              "native-package"
+                              #(package (:target result) (:artifact result)
+                                        artifact-kind policy))))))
+
+(defn- write-native! [output {:keys [artifact-text provenance-text binary]} target]
+  (let [;; adr-2609251400 C2: a static ELF is the program itself, so it is
+        ;; published executable -- 0700, the posture the loader binary gets.
+        ;; Every other packaged form stays 0600.
+        mode (when (and binary (= :static (:linkage (target-profile/profile target))))
+               448)
+provenance-output (str output ".provenance.edn")
+        publication-output (str output ".publication.edn")
+        ;; When a target packages, `--output` holds the ELF64/PE32+ bytes and
+        ;; the artifact EDN is not published at all -- the JVM CLI's behaviour
+        ;; exactly. The output set therefore identifies what was written, not
+        ;; what it was derived from; `output-set/descriptor` hashes a Buffer
+        ;; and a string the same way, and `verify-output-set` already reads
+        ;; every member as bytes, so neither end needed a binary special case.
+        published (or binary artifact-text)
+        publication-text (output-set/serialize output published provenance-text)]
+    (support/timed
+     "output-set-write"
+     #(nbb-io/write-set! [(if binary
+                        (cond-> {:path output :bytes binary} mode (assoc :mode mode))
+                        {:path output :text artifact-text})
+                      {:path provenance-output :text provenance-text}
+                      {:path publication-output :text publication-text}]))
+    (cond-> {:provenance-output provenance-output
+             :publication-output publication-output}
+      binary (assoc :artifact-bytes (.-length binary)))))
+
+(defn- compile-uncached! [args source linked? target backend output emit-program package]
+  (let [policy (support/timed "policy-read" #(read-policy! args))
+        emit-metadata (support/emit-metadata args)
+        artifact-kind (support/option args "--artifact")
+        hir (:value (resolve-hir! source
+                                  (project-source/analyze-opts (admission-policy policy) linked?) nil))
+        result (compile-native! hir target backend (admission-policy policy) emit-metadata emit-program nil)
+        serialized (serialized-native source policy emit-metadata result
+                                      package artifact-kind)
+        {:keys [provenance-output publication-output artifact-bytes]}
+        (write-native! output serialized target)]
+    (cond-> {:ok true :target target :output output
+             :provenance-output provenance-output
+             :publication-output publication-output
+             :oracle (:oracle result)
+             :fuel-metering (:fuel-metering result)
+             :verdict-cache (:verdict-cache result)}
+      artifact-bytes (assoc :artifact-bytes artifact-bytes))))
+
+(defn- compile-cached! [args source linked? target backend output emit-program package context]
+  (let [policy-attempt (support/timed
+                        "policy-read"
+                        #(try {:material (support/read-policy-material args)}
+                              (catch :default error {:error error})))
+        material (:material policy-attempt)
+        emit-metadata (support/emit-metadata args)
+        artifact-kind (support/option args "--artifact")
+        key (when material
+              (support/timed "cache-key"
+                             #(compile-cache/key-for target source material
+                                                     emit-metadata linked?
+                                                     artifact-kind)))
+        artifact-cache (:artifacts context)
+        stage-cache (:stages context)
+        cached (when key (support/timed "cache-lookup"
+                                        #(compile-cache/lookup! artifact-cache key)))]
+    ;; Qualification applies even when no lowering/emission runs on a hit.
+    (when cached
+      (let [policy (decode-policy! material)
+            hir (:value (resolve-hir! source
+                                     (project-source/analyze-opts (admission-policy policy) linked?)
+                                     stage-cache))]
+        (js-value-target/reject-outside-js-target! target hir)))
+    (if cached
+      (let [artifact-valid? (support/timed
+                             "cache-artifact-integrity"
+                             #(= (:artifact-sha256 cached)
+                                 (compile-cache/sha256 (:artifact-text cached))))
+            provenance-valid? (support/timed
+                               "cache-provenance-integrity"
+                               #(= (:provenance-sha256 cached)
+                                   (compile-cache/sha256 (:provenance-text cached))))
+            ;; A packaged target's `--output` is the ELF64/PE32+ bytes, so a
+            ;; hit that restored only the two EDN texts would republish the
+            ;; artifact EDN under a path named `.o`. Cached base64 is checked
+            ;; on the same footing as the texts: a cache that cannot prove
+            ;; what it holds is evicted, never served short.
+            binary-valid? (support/timed
+                           "cache-binary-integrity"
+                           #(or (nil? (:binary-base64 cached))
+                                (= (:binary-sha256 cached)
+                                   (compile-cache/sha256 (:binary-base64 cached)))))]
+        (when-not (and artifact-valid? provenance-valid? binary-valid?)
+          (compile-cache/remove! artifact-cache key)
+          (throw (ex-info "compiler cache integrity mismatch" {:cache-key key})))
+        (let [restored (cond-> cached
+                         (:binary-base64 cached)
+                         (assoc :binary (base64-text/decode (:binary-base64 cached))))
+              {:keys [provenance-output publication-output artifact-bytes]}
+              (write-native! output restored target)]
+          (cond-> {:ok true :target target :output output
+                   :provenance-output provenance-output
+                   :publication-output publication-output
+                   :cache :hit :cache-key key}
+            artifact-bytes (assoc :artifact-bytes artifact-bytes))))
+      (let [_ (when-let [error (:error policy-attempt)] (throw error))
+            policy (support/timed "policy-decode"
+                                  #(decode-policy! material))
+            hir-result (resolve-hir! source
+                                     (project-source/analyze-opts (admission-policy policy) linked?)
+                                     stage-cache)
+            hir (:value hir-result)
+            result (compile-native! hir target backend (admission-policy policy) emit-metadata
+                                    emit-program stage-cache)
+            serialized (serialized-native source policy emit-metadata result
+                                          package artifact-kind)
+            {:keys [provenance-output publication-output artifact-bytes]}
+            (write-native! output serialized target)
+            binary-base64 (some-> (:binary serialized) base64-text/encode)
+            sealed (cond-> (assoc (dissoc serialized :binary)
+                                  :artifact-sha256 (compile-cache/sha256 (:artifact-text serialized))
+                                  :provenance-sha256 (compile-cache/sha256 (:provenance-text serialized)))
+                     binary-base64 (assoc :binary-base64 binary-base64
+                                          :binary-sha256 (compile-cache/sha256 binary-base64)))
+            size (+ (text-bytes/utf8-length (:artifact-text serialized))
+                    (text-bytes/utf8-length (:provenance-text serialized))
+                    (if binary-base64
+                      (text-bytes/utf8-length binary-base64)
+                      0))]
+        (support/timed "cache-store" #(compile-cache/put! artifact-cache key sealed size))
+        (cond-> {:ok true :target target :output output
+                 :provenance-output provenance-output
+                 :publication-output publication-output
+                 :cache :miss :cache-key key
+                 :stage-cache {:hir (:cache hir-result)
+                               :kir (get-in result [:stage-cache :kir])}
+                 :oracle (:oracle result)
+                 :fuel-metering (:fuel-metering result)
+                 :verdict-cache (:verdict-cache result)}
+          artifact-bytes (assoc :artifact-bytes artifact-bytes))))))
+
+(defn run!
+  "`package` is the ISA entrypoint's artifact packager (or nil for a driver
+  that has none). Supplied rather than required here so the Wasm driver, which
+  shares this namespace, does not load two native packagers it never calls."
+  [args expected-backend emit-program package context]
+  (case (first args)
+    "compile"
+    (let [target-name (support/option args "--target")
+            target (get targets target-name)
+            _ (when-not target
+                (support/usage-error!
+                 (str "error: nbb native path does not cover target " target-name)))
+            _ (when (and context (not= target (:target context)))
+                (support/usage-error!
+                 (str "error: worker is locked to target " (name (:target context)))))
+            backend (target-profile/backend target)
+            _ (when-not (= expected-backend backend)
+                (support/usage-error!
+                 (str "error: target " target-name " does not match loaded native ISA")))
+            ;; Rejected before any compilation, matching the JVM CLI: an
+            ;; unknown `--artifact` must not be discovered after the work.
+            _ (when-not (contains? #{nil "object" "image"} (support/option args "--artifact"))
+                (throw (ex-info "unknown native artifact kind"
+                                {:phase :artifact-target
+                                 :artifact (support/option args "--artifact")})))
+            ;; A module declaring `(:require ...)` is resolved and linked the
+            ;; same way the Wasm driver resolves one, through the same shared
+            ;; `project-source/resolve-source!`. This used to read the entry
+            ;; file alone: `--source-path` and `--module-lock` were accepted on
+            ;; the command line and never looked at, so a kernel object could
+            ;; not import anything and every helper had to be copied into every
+            ;; source that needed it.
+            resolved (project-source/resolve-source! args)
+            input (:input resolved)
+            source (:source resolved)
+            linked? (:linked? resolved)
+            output (or (support/option args "--output") (str input ".kexe"))
+            result (try
+                     (if context
+                       (compile-cached! args source linked? target backend output
+                                        emit-program package context)
+                       (compile-uncached! args source linked? target backend output
+                                          emit-program package))
+                     ;; A refusal against the linked unit names the module
+                     ;; and line that wrote the form (amu-h10), as on the
+                     ;; JVM route's `compile-project`.
+                     (catch :default error
+                       (throw (project-source/attribute-error error resolved))))]
+        (merge result (project-source/inputs-record resolved)))
+
+    "extract-native"
+    ;; EDN has no i64 type marker: the writer prints an nbb bigint as the same
+    ;; plain integer token the JVM writes, so a reader that returns Numbers
+    ;; cannot be told the difference and rounds -- see
+    ;; `support/read-artifact-file!`, which is the reader this now uses and
+    ;; carries the measurement.
+    ;;
+    ;; What is worth keeping HERE is why the old code looked like it had
+    ;; already handled this: it restored `:value` alone, with a postwalk, and
+    ;; that is the one place the loss had been noticed. The constants live in
+    ;; `:program`, which it left rounded. Reading exactly needs no restoring
+    ;; step at all, so the postwalk is gone rather than widened.
+    (let [input (second args)
+          artifact-map (source-path/admit-native-artifact!
+                        (support/read-artifact-file! input) input)
+          symbol (symbol (or (support/option args "--symbol") "main"))
+          output (or (support/option args "--output") "program.bin")
+          _ (verifier/verify-artifact! artifact-map)
+          export (get (:exports artifact-map) symbol)]
+      (when-not export
+        (throw (ex-info "unknown native export" {:phase :verify :entry symbol})))
+      ;; `:code` is machine bytes, and they arrive as BigInt like everything
+      ;; else the reader returns. `Buffer.from` throws on a BigInt element, so
+      ;; narrow here -- at the one place that needs Numbers -- rather than
+      ;; walking the artifact and widening what the verifier was handed.
+      (nbb-io/write-bytes! output
+                       (text-bytes/bytes-from-ints (mapv host-integer/narrow (:code artifact-map))))
+      ;; `:offset`, `:length` and `:arity` come out of the artifact, so they
+      ;; are BigInts too, and `pr-str` renders a BigInt as
+      ;; `#object[BigInt 10500]` -- unreadable to the caller that has to pass
+      ;; the offset to `kexe_loader`. `edn-safe` is the writer's own
+      ;; convention for this: a BigInt prints as the same plain integer token
+      ;; the JVM route prints, so the two routes' results stay comparable.
+      (artifact/edn-safe (merge {:ok true :output output :symbol symbol} export)))
+
+    (support/usage-error!
+     (str "error: nbb native path does not cover command " (first args)))))

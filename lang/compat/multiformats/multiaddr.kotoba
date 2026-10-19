@@ -1,0 +1,318 @@
+(ns multiformats.multiaddr
+  "Multiaddr — self-describing network addresses (multiformats.io/multiaddr).
+
+  `/ip4/127.0.0.1/tcp/4001/p2p/QmPeer` instead of `127.0.0.1:4001`. The
+  difference is not cosmetic and it is the reason libp2p uses them: a
+  `host:port` string is only meaningful if you *already know* what protocol is
+  meant, so the knowledge lives outside the value and every layer that touches
+  it has to be told again. A multiaddr carries that knowledge inside itself, so
+  a value can be passed to something that has never heard of QUIC and still be
+  parsed, stored and compared correctly.
+
+  ## The binary form is the identity
+
+  A multiaddr has a human string form and a binary form, and the **binary** one
+  is canonical: `/ip4/127.0.0.1/tcp/4001` is one specific octet sequence, and
+  two addresses are the same address when their octets match. Comparing the
+  strings instead makes `/ip4/127.0.0.1/tcp/04001` a different address from
+  `/ip4/127.0.0.1/tcp/4001`, and lets a peer be entered twice in a routing
+  table under two spellings of one address.
+
+  So `parse` normalizes through the binary form, and `equal?` compares octets.
+
+  ## Protocol codes are the wire
+
+  Each component is `<varint protocol-code><value>`. The codes come from the
+  multicodec table and are not ours to choose — `/tcp` is 6 and will always be
+  6. Sizes are fixed for some protocols (ip4 is 4 octets, tcp is 2), zero for
+  flags like `/quic`, and length-prefixed for variable ones like `/p2p`.
+  Getting a size wrong does not fail loudly: it consumes the wrong number of
+  octets and reinterprets everything after it as a different address."
+  {:kotoba/export [->octets ->string code->name components encapsulate equal? parse peer-id protocol protocol-names protocols transport value-for without-peer-id]}
+  (:require [kotoba.lang.text :as str]
+            [multiformats.core :as mf]))
+
+;; ── the protocol table ────────────────────────────────────────────────────
+;;
+;; :size is in BITS for fixed-width protocols, 0 for flags, and :variable for
+;; length-prefixed ones — the same convention the multiaddr spec's own table
+;; uses, kept rather than converted so it can be checked against the source.
+
+(def protocols
+  {"ip4"        {:code 4    :size 32}
+   "tcp"        {:code 6    :size 16}
+   "udp"        {:code 273  :size 16}
+   "dccp"       {:code 33   :size 16}
+   "ip6"        {:code 41   :size 128}
+   "ip6zone"    {:code 42   :size :variable}
+   "dns"        {:code 53   :size :variable}
+   "dns4"       {:code 54   :size :variable}
+   "dns6"       {:code 55   :size :variable}
+   "dnsaddr"    {:code 56   :size :variable}
+   "sctp"       {:code 132  :size 16}
+   "udt"        {:code 301  :size 0}
+   "utp"        {:code 302  :size 0}
+   ;; /unix takes a filesystem path, which contains slashes, so it consumes the
+   ;; REST of the address rather than one segment. Parsing it as one segment is
+   ;; why `/unix/tmp/sock` looks like an unknown protocol `sock`.
+   "unix"       {:code 400  :size :variable :consumes-rest true}
+   "p2p"        {:code 421  :size :variable}
+   "ipfs"       {:code 421  :size :variable}   ; the old spelling of /p2p
+   "onion"      {:code 444  :size 96}
+   "onion3"     {:code 445  :size 296}
+   "quic"       {:code 460  :size 0}
+   "quic-v1"    {:code 461  :size 0}
+   "webtransport" {:code 465 :size 0}
+   "ws"         {:code 477  :size 0}
+   "wss"        {:code 478  :size 0}
+   "p2p-circuit" {:code 290 :size 0}
+   "tls"        {:code 448  :size 0}
+   "noise"      {:code 454  :size 0}
+   "http"       {:code 480  :size 0}
+   "https"      {:code 443  :size 0}})
+
+(def code->name
+  "Reverse lookup. `/ipfs` and `/p2p` share code 421, and the canonical
+  rendering is `p2p` — the older spelling parses and does not come back out."
+  (reduce (fn [m [n {:keys [code]}]]
+            (if (and (contains? m code) (= n "ipfs")) m (assoc m code n)))
+          {} protocols))
+
+(defn protocol [nm] (get protocols nm))
+
+;; ── varint ────────────────────────────────────────────────────────────────
+
+(defn- utf8
+  "String → UTF-8 octets. `(map int (seq s))` is JVM-only thinking: on the JVM
+  `seq` of a string yields Characters and `int` gives the code point, while in
+  ClojureScript it yields one-character *strings* and `int` gives NaN — so
+  every string-valued component (`/dns4/…`, `/unix/…`) encoded as zeros there
+  and decoded back as blanks. Caught by CI, not by the JVM suite."
+  [s]
+  )
+
+(defn- utf8-str [bs]
+  )
+
+(defn- put-varint
+  "`multiformats.core/varint` returns a host byte array, whose bytes are
+  SIGNED on the JVM — 0x91 comes back as -111. Masking here is what keeps the
+  encoded address from differing between platforms for the same input."
+  [n]
+  (mapv #(bit-and % 0xFF) (vec (seq (mf/varint n)))))
+
+(defn- read-varint
+  "Returns `[value next-index]`.
+
+  A multiaddr arrives from a peer, so every refusal here is reachable by
+  anyone. Two of them were not doing what they say:
+
+  **The multiplier is capped.** Left to grow it reaches 128^9 = 2^63 on the
+  ninth byte and throws `ArithmeticException: long overflow` on the JVM --
+  a host-level crash, from which the guard below never runs -- while
+  ClojureScript's doubles sail past and report the intended
+  `varint too long in multiaddr`. Measured 2026-08-17: ten 0x80 octets, a
+  legal thing for a hostile peer to send, produced those two different
+  outcomes from the same input. Capping is safe: past `mf/max-exact` any
+  nonzero byte trips the range check below regardless of the exact multiplier.
+
+  **The value is bounded.** ClojureScript stops representing integers exactly
+  at 2^53, so without this a large varint would decode to a quietly wrong
+  number there and an exact one on the JVM."
+  [bs i]
+  (loop [i i mult 1 acc 0 n 0]
+    (when (>= i (count bs)) (throw (ex-info "truncated varint in multiaddr" {:at i})))
+    (when (>= n 9) (throw (ex-info "varint too long in multiaddr" {:at i})))
+    (let [b (bit-and (nth bs i) 0xFF)
+          acc (+ acc (* mult (bit-and b 0x7F)))]
+      (when (> acc mf/max-exact)
+        (throw (ex-info "varint out of range in multiaddr"
+                        {:at i :max-exact mf/max-exact})))
+      (if (zero? (bit-and b 0x80))
+        [acc (inc i)]
+        (recur (inc i) (if (> mult mf/max-exact) mult (* mult 128)) acc (inc n))))))
+
+;; ── values ────────────────────────────────────────────────────────────────
+
+(defn- ip4->octets [s]
+  (let [parts (str/split s #"\.")]
+    (when-not (= 4 (count parts)) (throw (ex-info "not an IPv4 address" {:value s})))
+    (mapv (fn [p]
+            (let [n ]
+              (when-not (<= 0 n 255) (throw (ex-info "IPv4 octet out of range" {:value s})))
+              n))
+          parts)))
+
+(defn- octets->ip4 [bs] (str/join "." bs))
+
+(defn- ip6->octets [s]
+  ;; `::` elides one run of zero groups and may appear at either end or not at
+  ;; all. Splitting unconditionally and hoping is how a sentinel character ends
+  ;; up inside a hex group; the presence of `::` is checked instead.
+  (let [gap? (str/includes? s "::")
+        [head tail] (if gap? (str/split s #"::" 2) [s ""])
+        parse (fn [x] (if (str/blank? x) []
+                          (mapv 
+                                (str/split x #":"))))
+        h (parse head)
+        t (parse (or tail ""))
+        gap (- 8 (count h) (count t))]
+    (when (or (neg? gap) (and (not gap?) (pos? gap)))
+      (throw (ex-info "not an IPv6 address" {:value s})))
+    (vec (mapcat (fn [g] [(bit-and (bit-shift-right g 8) 0xFF) (bit-and g 0xFF)])
+                 (into (into (vec h) (repeat gap 0)) t)))))
+
+(defn- octets->ip6 [bs]
+  (let [groups (mapv (fn [i] (bit-or (bit-shift-left (nth bs (* 2 i)) 8) (nth bs (inc (* 2 i)))))
+                     (range 8))]
+    (str/join ":" (map  groups))))
+
+(defn- port->octets [s]
+  (let [n ]
+    (when-not (<= 0 n 65535) (throw (ex-info "port out of range" {:value s})))
+    [(bit-and (bit-shift-right n 8) 0xFF) (bit-and n 0xFF)]))
+
+(defn- octets->port [bs] (str (+ (* 256 (nth bs 0)) (nth bs 1))))
+
+(defn- value->octets [nm v]
+  (case nm
+    "ip4" (ip4->octets v)
+    "ip6" (ip6->octets v)
+    ("tcp" "udp" "dccp" "sctp") (port->octets v)
+    ;; /p2p carries a peer ID, which is a base58btc multihash in the string form
+    ;; and the raw multihash on the wire. Storing the text would make two
+    ;; spellings of one peer compare unequal.
+    ("p2p" "ipfs") (mapv #(bit-and % 0xFF) (vec (seq (mf/base58btc-decode v))))
+    (utf8 v)))
+
+(defn- octets->value [nm bs]
+  (case nm
+    "ip4" (octets->ip4 bs)
+    "ip6" (octets->ip6 bs)
+    ("tcp" "udp" "dccp" "sctp") (octets->port bs)
+    ("p2p" "ipfs") (mf/base58btc bs)
+    (utf8-str bs)))
+
+;; ── encode ────────────────────────────────────────────────────────────────
+
+(defn components
+  "`/ip4/127.0.0.1/tcp/4001` → `[[\"ip4\" \"127.0.0.1\"] [\"tcp\" \"4001\"]]`.
+
+  A flag protocol like `/quic` has no value and yields `[\"quic\" nil]` — not
+  `[\"quic\" \"\"]`, because an empty string is a value and this has none."
+  [s]
+  (when-not (str/starts-with? (str s) "/")
+    (throw (ex-info "a multiaddr must start with /" {:value s})))
+  (loop [parts (remove str/blank? (str/split (str s) #"/")) out []]
+    (if (empty? parts)
+      out
+      (let [nm (first parts)
+            p (or (protocol nm) (throw (ex-info "unknown multiaddr protocol" {:protocol nm})))]
+        (cond
+          (= 0 (:size p)) (recur (rest parts) (conj out [nm nil]))
+          (:consumes-rest p)
+          (if (empty? (rest parts))
+            (throw (ex-info "multiaddr protocol is missing its value" {:protocol nm}))
+            (conj out [nm (str "/" (str/join "/" (rest parts)))]))
+          (empty? (rest parts))
+          (throw (ex-info "multiaddr protocol is missing its value" {:protocol nm}))
+          :else (recur (drop 2 parts) (conj out [nm (second parts)])))))))
+
+(defn ->octets
+  "Multiaddr string → its canonical binary form."
+  [s]
+  (vec (mapcat (fn [[nm v]]
+                 (let [{:keys [code size]} (protocol nm)
+                       payload (if (= 0 size) [] (value->octets nm v))]
+                   (cond
+                     (= 0 size) (put-varint code)
+                     (= :variable size) (concat (put-varint code)
+                                                (put-varint (count payload))
+                                                payload)
+                     :else
+                     (let [want (quot size 8)]
+                       (when-not (= want (count payload))
+                         (throw (ex-info "wrong value width for protocol"
+                                         {:protocol nm :want want :got (count payload)})))
+                       (concat (put-varint code) payload)))))
+               (components s))))
+
+(defn ->string
+  "Canonical binary form → the string form. Round-tripping through here is what
+  normalizes `/tcp/04001` to `/tcp/4001`."
+  [octets]
+  (let [bs (vec octets)]
+    (loop [i 0 out []]
+      (if (>= i (count bs))
+        (str "/" (str/join "/" out))
+        (let [[code j] (read-varint bs i)
+              nm (or (code->name code)
+                     (throw (ex-info "unknown multiaddr protocol code" {:code code :at i})))
+              {:keys [size]} (protocol nm)]
+          (cond
+            (= 0 size) (recur j (conj out nm))
+            (= :variable size)
+            (let [[len k] (read-varint bs j)
+                  end (+ k len)]
+              (when (> end (count bs))
+                (throw (ex-info "truncated multiaddr component" {:protocol nm})))
+              (recur end (conj out nm (octets->value nm (subvec bs k end)))))
+            :else
+            (let [w (quot size 8) end (+ j w)]
+              (when (> end (count bs))
+                (throw (ex-info "truncated multiaddr component" {:protocol nm})))
+              (recur end (conj out nm (octets->value nm (subvec bs j end)))))))))))
+
+(defn parse
+  "Normalize a multiaddr string by round-tripping it through the binary form —
+  which is what makes it comparable. Throws on anything malformed rather than
+  returning a partially-understood address."
+  [s]
+  (->string (->octets s)))
+
+(defn equal?
+  "Two multiaddrs are the same address when their **octets** match. Comparing
+  the strings would make `/tcp/04001` a different address from `/tcp/4001`,
+  and let one peer occupy two routing-table entries."
+  [a b]
+  (= (->octets a) (->octets b)))
+
+;; ── inspection ────────────────────────────────────────────────────────────
+
+(defn value-for
+  "The value of the first `protocol-name` component, or nil."
+  [s protocol-name]
+  (some (fn [[nm v]] (when (= nm protocol-name) v)) (components s)))
+
+(defn peer-id
+  "The `/p2p/…` peer ID, or nil. A multiaddr without one names a *place*; with
+  one it names a *peer at* a place, and libp2p dials the second — connecting to
+  an address without checking which peer answered is how you end up talking to
+  whoever holds that IP today."
+  [s]
+  (or (value-for s "p2p") (value-for s "ipfs")))
+
+(defn without-peer-id
+  "The transport half of an address, for a dialer that already knows the peer."
+  [s]
+  (str "/" (str/join "/" (mapcat (fn [[nm v]] (if (#{"p2p" "ipfs"} nm) [] (if v [nm v] [nm])))
+                                 (components s)))))
+
+(defn encapsulate
+  "Append `b` to `a` — `/ip4/1.2.3.4/tcp/80` + `/ws` → `/ip4/1.2.3.4/tcp/80/ws`."
+  [a b]
+  (parse (str a b)))
+
+(defn protocol-names [s] (mapv first (components s)))
+
+(defn transport
+  "A rough classification for a dialer: which transport this address wants."
+  [s]
+  (let [ps (set (protocol-names s))]
+    (cond
+      (ps "p2p-circuit") :relay
+      (or (ps "quic-v1") (ps "quic")) :quic
+      (or (ps "wss") (ps "ws")) :websocket
+      (ps "tcp") :tcp
+      (ps "udp") :udp
+      :else :unknown)))

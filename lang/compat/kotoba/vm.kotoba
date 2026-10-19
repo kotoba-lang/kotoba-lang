@@ -1,0 +1,172 @@
+(ns kotoba.vm
+  "Machine / Call Manager: apply a message to an actor tree.
+
+  This is the FVM Machine analogue for a Kotoba app-chain. It is not
+  Filecoin's FVM, not an EVM, and not a database kernel. The proving
+  slice is: IPLD syscalls, invocation-local handles, a message-local
+  overlay that flushes on success and drops on revert, fuel charged
+  before effect, nested sync `actor/call` with child-revert.
+
+  ## Seams
+
+  `apply-message` is the whole-tree entry. Nested mutations of other
+  actors need this — `inga.state`'s `:invoke-fn` is only allowed to
+  write the callee's own record, so the thin `invoke-fn` adapter here
+  wraps a single-actor `apply-message` and maps exits onto
+  `inga.state/refusal-reasons`.
+
+  `:get-fn` / `:put!` are the io-ipld storage port. This repo does not
+  depend on inga or codebase; they inject this, or they don't. The
+  inga bind is proven in `test/kotoba/vm_inga_bind_test.cljk` (inga is a
+  test extra-dep). Filecoin protocol clients are not a dependency.
+
+  ## What this is not
+
+  - kototama: Wasm host / runtime-link. Not an IPLD actor tree.
+  - codebase.actor: a pure `(state, message) → next-state`. No syscalls.
+  - io-filecoin: a Filecoin protocol client. No actor state, no HAMT, no FVM.
+  - kotoba-lang/machine: hardware CPU/cache descriptors. Not this Machine.
+  - the historical etzhayyim `kotoba-vm` Rust Pregel crate. Different repo,
+    different plane, retired with the Rust engine."
+  (:require [ipld.core :as ipld]
+            [kotoba.vm.guest :as guest]
+            [kotoba.vm.kernel :as k]))
+
+(def refusal-reasons
+  "Subset of `inga.state/refusal-reasons` this kernel can name.
+  Anything else becomes `:call-failed` at the adapter — a loss of
+  detail, not of safety."
+  #{:no-actor :no-code :not-callable :fuel-exhausted :invalid-result
+    :call-failed})
+
+(def default-fuel 100000)
+
+(defn- exit-of [ctx]
+  (cond
+    (:exhausted? ctx) :fuel-exhausted
+    (= :no-actor (:last-error ctx)) :no-actor
+    (= :no-code (:last-error ctx)) :no-code
+    (= :not-callable (:last-error ctx)) :not-callable
+    (= :invalid-result (:last-error ctx)) :invalid-result
+    (:aborted? ctx) :aborted
+    (:last-error ctx) :aborted
+    :else :ok))
+
+(defn- ctx-for
+  [{:keys [get-fn put! host-guests max-depth]}
+   {:keys [actors from to method args fuel]}]
+  {:get-fn get-fn
+   :put! put!
+   :overlay {}
+   :handles {}
+   :next-handle 1
+   :spent 0
+   :budget (long (or fuel default-fuel))
+   :exhausted? false
+   :aborted? false
+   :crossings 0
+   :copied-bytes 0
+   :actors actors
+   :from from
+   :to to
+   :method method
+   :args (or args [])
+   :depth 0
+   :max-depth (or max-depth k/max-call-depth)
+   :host-guests (or host-guests {})
+   :self-state (get-in actors [to :state])
+   :return nil
+   :invoke-actor guest/invoke
+   :last-error nil
+   :result nil})
+
+(defn apply-message
+  "Apply one message to an in-memory actor map against a block store.
+
+    {:actors {addr {:code :state :nonce :balance}}
+     :from :to :method :args :fuel}
+
+  Returns
+
+    {:actors {…}
+     :receipt {:exit :ok|:fuel-exhausted|:no-actor|:no-code|:not-callable|:aborted|:invalid-result
+               :return :fuel-used :crossings :copied-bytes}
+     :ok? bool}
+
+  If not `:ok?`, `:actors` is the input map unchanged and the overlay
+  is not flushed. Fuel used is still reported — the work happened."
+  [machine message]
+  (when-not (and (ifn? (:get-fn machine)) (ifn? (:put! machine)))
+    (throw (ex-info "kotoba.vm/apply-message needs :get-fn and :put!"
+                    {:type :kotoba.vm/invalid-machine})))
+  (if-not (contains? (:actors message) (:to message))
+    {:actors (:actors message)
+     :ok? false
+     :receipt {:exit :no-actor :return nil :fuel-used 0 :crossings 0 :copied-bytes 0}}
+    (let [original (:actors message)
+          ctx (ctx-for machine message)
+          ctx (guest/invoke ctx)
+          exit (exit-of ctx)
+          ok? (= :ok exit)
+          ctx (if ok? (k/flush! ctx) ctx)
+          actors (if-not ok?
+                   original
+                   (let [base (:actors ctx)
+                         callee (assoc (get base (:to message)
+                                            (get original (:to message)))
+                                       :state (:self-state ctx))
+                         actors (assoc base (:to message) callee)]
+                     (cond-> actors
+                       (and (some? (:from message))
+                            (contains? actors (:from message)))
+                       (update-in [(:from message) :nonce] inc))))]
+      {:actors actors
+       :ok? ok?
+       :receipt {:exit exit
+                 :return (when ok? (:return ctx))
+                 :fuel-used (:spent ctx)
+                 :crossings (:crossings ctx)
+                 :copied-bytes (:copied-bytes ctx)}})))
+
+(defn invoke-fn
+  "An `inga.state`-shaped `:invoke-fn`.
+
+  Takes `{:keys [address caller code state method args fuel]}` and
+  answers `{:state cid}` or `{:refused reason}` from the closed set
+  inga records. Nested `actor/call` to an address that is not this
+  callee is `:no-actor` here — the consensus seam cannot write another
+  actor's record. Use `apply-message` for that.
+
+  CID mismatch in the store is rethrown, same as `codebase.actor`."
+  [{:keys [get-fn put!] :as machine}]
+  (when-not (and (ifn? get-fn) (ifn? put!))
+    (throw (ex-info "kotoba.vm/invoke-fn needs :get-fn and :put!"
+                    {:type :kotoba.vm/invalid-machine})))
+  (fn [{:keys [address caller code state method args fuel]}]
+    (let [actors {address {:code code :state state :nonce 0 :balance 0}}
+          result (apply-message machine
+                                {:actors actors
+                                 :from caller
+                                 :to address
+                                 :method method
+                                 :args args
+                                 :fuel (or fuel default-fuel)})
+          exit (get-in result [:receipt :exit])]
+      (if (:ok? result)
+        {:state (get-in result [:actors address :state])}
+        {:refused (if (contains? refusal-reasons exit)
+                    (if (= :aborted exit) :call-failed exit)
+                    :call-failed)}))))
+
+(defn put-code!
+  "Encode a v1 guest node, store it, return its CID."
+  [put! node]
+  (ipld/put-node! put! node))
+
+(defn memory-store
+  "In-process CID → bytes. Tests and the proving slice."
+  []
+  (let [a (atom {})]
+    {:get-fn (fn [cid] (get @a cid))
+     :put! (fn [cid bytes] (swap! a assoc cid bytes) cid)
+     :blocks a}))

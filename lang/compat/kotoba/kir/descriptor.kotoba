@@ -1,0 +1,330 @@
+(ns kotoba.kir.descriptor
+  "Structural type descriptors over KIR, and their canonical byte encoding.
+
+  Extracted from `kotoba.wasm.typed` (2026-08-04, ADR-2608049000) without
+  behaviour change. Nothing here was ever wasm-specific: the encoding walks
+  KIR to find which types a module uses and serialises them, and its only
+  dependency was `kotoba.kir.cljs-i64` for BigInt-safe map keys. It lived in
+  the wasm repo because that is where it was first needed, which is a fact
+  about extraction order rather than about coupling.
+
+  It moves to T0 because a SECOND consumer needs it. The native capability
+  boundary can carry exactly four shapes today -- i64, string, option-i64,
+  result-i64 -- because the loader is handed an integer `kind` rather than a
+  structure, so a capability whose request is a variant with a record payload
+  (`clock-v1` is one) cannot cross it at all. Fixing that means giving the
+  loader a descriptor, and there must be exactly ONE encoding of a descriptor:
+  two would look correct on both sides while disagreeing, which is the failure
+  mode where a producer and a checker agree on the same mistake.
+
+  `kotoba.wasm.typed` re-exports these names, so wasm callers are unchanged.
+
+  No require: measured after extraction, the descriptor half never touched
+  `kotoba.kir.cljs-i64`. Its single use is in `infer-type`, which stays with
+  the wasm-specific half."
+  {:kotoba/export [boolean-result-ops capability-contracts descriptor-indices descriptor-table descriptor? encode-descriptor keyword-text primitive-tags scalar-adt-aliases text-bytes uleb utf8]}
+  (:require [kotoba.bytes :as kbytes]))
+
+(def primitive-tags
+  {:i64 0 :string 1 :keyword 2 :bool 3 :symbol 19 :vector-i64 11 :f64 12 :f32 13
+   :vector-f64 14 :string-index 16 :disjoint-set-i64 17 :document 18 :bytes 21})
+
+(def scalar-adt-aliases
+  {:option-i64 [:option :i64]
+   :result-i64 [:result :i64 :i64]})
+
+(def boolean-result-ops
+  '#{f64-eq f64-lt f64-le f64-gt f64-ge f64-unordered
+     f32-eq f32-lt f32-le f32-gt f32-ge f32-unordered
+     bool-not option-some? result-ok? option-some?-of result-ok?-of
+     typed-set-contains typed-map-contains document-contains document-equal?})
+
+
+(defn descriptor? [value]
+  ;; nbb cannot hash JavaScript BigInt as a map key. Guard before contains?
+  ;; because literal i64 values are walked alongside descriptors.
+  (or (and (keyword? value)
+           (or (contains? primitive-tags value)
+               (contains? scalar-adt-aliases value)))
+      (and (vector? value)
+           (or (= :list (first value))
+               (contains? #{:option :result :variant :vector :set :map :record :ref}
+                          (first value))))))
+
+(defn- host-integer
+  "N as an integer the host's bit operations accept. On ClojureScript an i64 is
+  a BigInt -- a capability id reaches this encoder as one -- and `bit-and`
+  against a Number literal throws `Cannot mix BigInt and other types`, so
+  emitting any module with a capability contract failed there. Every operand
+  this file encodes is a count, index, id or byte length, so the conversion is
+  exact; one that is not exactly representable is refused rather than
+  silently truncated into a shorter LEB128.
+
+  Written out rather than requiring `kotoba.kir.cljs-i64`, because this
+  namespace's extraction premise is that the descriptor half does not depend
+  on it."
+  [n]
+  n)
+
+(defn uleb [n]
+  (loop [n (host-integer n) out []]
+    (let [byte (bit-and n 0x7f)
+          remaining (unsigned-bit-shift-right n 7)]
+      (if (zero? remaining)
+        (conj out byte)
+        (recur remaining (conj out (bit-or byte 0x80)))))))
+
+(defn- utf8-code-point
+  "OUT with the UTF-8 encoding of the scalar value CP appended."
+  [out cp]
+  (cond
+    (< cp 0x80) (conj out cp)
+    (< cp 0x800) (conj out (+ 0xC0 (quot cp 64)) (+ 0x80 (bit-and cp 0x3F)))
+    (< cp 0x10000) (conj out (+ 0xE0 (quot cp 4096))
+                         (+ 0x80 (bit-and (quot cp 64) 0x3F))
+                         (+ 0x80 (bit-and cp 0x3F)))
+    :else (conj out (+ 0xF0 (quot cp 262144))
+                (+ 0x80 (bit-and (quot cp 4096) 0x3F))
+                (+ 0x80 (bit-and (quot cp 64) 0x3F))
+                (+ 0x80 (bit-and cp 0x3F)))))
+
+(defn utf8 [text]
+  (let [n (string-byte-length text)]
+                (loop [i 0 out []]
+                  (if (< i n)
+                    (let [cp (string-code-point-at text i)]
+                      (recur (+ i (cond (< cp 0x80) 1 (< cp 0x800) 2 (< cp 0x10000) 3 :else 4))
+                             (utf8-code-point out cp)))
+                    out))))
+
+(defn text-bytes [text]
+  (let [bytes (utf8 text)]
+    (into (uleb (count bytes)) bytes)))
+
+(defn keyword-text [value]
+  (str value))
+
+(declare encode-descriptor)
+
+(defn- encode-named-members [members]
+  (into (uleb (count members))
+        (mapcat (fn [[member-name member-type]]
+                  (concat (text-bytes (keyword-text member-name))
+                          (encode-descriptor member-type)))
+                members)))
+
+(defn encode-descriptor [descriptor]
+  (if-let [expanded (get scalar-adt-aliases descriptor)]
+    (encode-descriptor expanded)
+    (if-let [tag (get primitive-tags descriptor)]
+    [tag]
+    (case (first descriptor)
+      :option (into [4] (encode-descriptor (second descriptor)))
+      :result (into [5] (concat (encode-descriptor (second descriptor))
+                                (encode-descriptor (nth descriptor 2))))
+      :variant (into [6] (concat (text-bytes (keyword-text (second descriptor)))
+                                 (encode-named-members (nth descriptor 2))))
+      :vector (into [7] (concat (uleb (count (second descriptor)))
+                                (mapcat encode-descriptor (second descriptor))))
+      :set (into [8] (encode-descriptor (second descriptor)))
+      :list (into [20] (encode-descriptor (second descriptor)))
+      :map (into [10] (concat (encode-descriptor (second descriptor))
+                              (encode-descriptor (nth descriptor 2))))
+      :record (into [9] (concat (text-bytes (keyword-text (second descriptor)))
+                                (encode-named-members (nth descriptor 2))))
+      :ref (into [15] (text-bytes (keyword-text (second descriptor))))
+      (throw (ex-info "unsupported typed descriptor"
+                      {:phase :kir-descriptor :descriptor descriptor}))))))
+
+(defn- walk [value found]
+  (cond
+    (descriptor? value)
+    (let [found (conj found value)]
+      (if-not (vector? value)
+        found
+        (case (first value)
+          :option (walk (second value) found)
+          :result (->> found (walk (second value)) (walk (nth value 2)))
+          :variant (reduce (fn [result [_ type]] (walk type result)) found (nth value 2))
+          :vector (reduce (fn [result type] (walk type result)) found (second value))
+          :set (walk (second value) found)
+          :list (walk (second value) found)
+          :map (->> found (walk (second value)) (walk (nth value 2)))
+          :record (reduce (fn [result [_ type]] (walk type result)) found (nth value 2))
+          :ref found
+          found)))
+
+    (and (seq? value) (contains? boolean-result-ops (first value)))
+    (reduce (fn [result item] (walk item result))
+            (conj found :bool)
+            value)
+    (and (seq? value)
+         (contains? '#{option-some option-none option-some? option-value}
+                    (first value)))
+    (reduce (fn [result item] (walk item result))
+            (conj found :option-i64)
+            value)
+    (and (seq? value)
+         (contains? '#{result-ok result-err result-ok? result-value result-error}
+                    (first value)))
+    (reduce (fn [result item] (walk item result))
+            (conj found :result-i64)
+            value)
+    ;; T4.5 / T1.3: intermediate vector-i64 (e.g. pure main returning i64 from
+    ;; vector-count/at) must seal :vector-i64 even when it never appears in an
+    ;; export signature — mirror the vector-f64 body walk.
+    (and (seq? value)
+         (contains? '#{vector-new vector-count vector-get vector-at
+                      vector-drop vector-take vector-assoc vector-conj}
+                    (first value)))
+    (reduce (fn [result item] (walk item result))
+            (conj found :vector-i64)
+            value)
+    (and (seq? value)
+         (contains? '#{vector-f64-new vector-f64-count vector-f64-get vector-f64-at
+                      vector-f64-drop vector-f64-take vector-f64-assoc vector-f64-conj}
+                    (first value)))
+    (reduce (fn [result item] (walk item result))
+            (conj found :vector-f64)
+            value)
+    (and (seq? value)
+         (contains? '#{string-index-new string-index-count string-index-contains
+                      string-index-get string-index-assoc}
+                    (first value)))
+    (reduce (fn [result item] (walk item result)) (conj found :string-index) value)
+    (and (seq? value)
+         (contains? '#{disjoint-set-i64-new disjoint-set-i64-count disjoint-set-i64-union}
+                    (first value)))
+    (reduce (fn [result item] (walk item result)) (conj found :disjoint-set-i64) value)
+    (and (seq? value)
+         (contains? '#{document-null document-bool document-i64 document-f64
+                      document-string document-keyword document-symbol document-vector document-list document-set document-map
+                      document-count document-kind document-vector-at document-list-at document-map-entry-at document-vector-assoc
+                      document-vector-conj document-vector-drop document-vector-remove
+                      document-equal? document-set-contains? document-sha256 document-print document-read
+                      document-edn-print document-edn-read document-contains document-get document-assoc
+                      document-dissoc document-merge document-string-value document-keyword-value document-symbol-value
+                      document-bool-value document-i64-value document-f64-value}
+                    (first value)))
+    (reduce (fn [result item] (walk item result))
+            (cond-> (conj found :document)
+              (= 'document-kind (first value)) (conj :keyword)
+              (= 'document-sha256 (first value)) (conj :string)
+              (contains? '#{document-print document-edn-print} (first value)) (conj :string))
+            value)
+    (and (seq? value) (= 'keyword-from-string (first value)))
+    (reduce (fn [result item] (walk item result)) (conj found :keyword) value)
+    (and (seq? value) (= 'symbol (first value)))
+    (reduce (fn [result item] (walk item result)) (conj found :symbol) value)
+    (and (seq? value) (= 'bytes-empty (first value)))
+    (conj found :bytes)
+    ;; 2026-09-25 (superproject adr-2609242330): every other bytes head, and
+    ;; the two conversions and the string constructor, name BOTH of their
+    ;; types -- a host that receives the operand and builds the result checks
+    ;; each against its sealed descriptor, and a module whose signatures
+    ;; mention neither (bytes built and consumed inside one body) would
+    ;; otherwise have no descriptor for them at all.
+    (and (seq? value) (contains? '#{bytes-count bytes-at bytes-slice bytes-concat} (first value)))
+    (reduce (fn [result item] (walk item result)) (conj found :bytes) value)
+    (and (seq? value) (contains? '#{bytes-from-vector-i64 vector-i64-from-bytes} (first value)))
+    (reduce (fn [result item] (walk item result)) (conj found :bytes :vector-i64) value)
+    (and (seq? value) (= 'string-from-utf8 (first value)))
+    (reduce (fn [result item] (walk item result)) (conj found :bytes :string) value)
+    (map? value) (reduce (fn [result item] (walk item result)) found (vals value))
+    (coll? value) (reduce (fn [result item] (walk item result)) found value)
+    (string? value) (conj found :string)
+    (keyword? value) (conj found :keyword)
+    (boolean? value) (conj found :bool)
+    :else found))
+
+(defn descriptor-table [kir]
+  (->> (walk kir #{})
+       (sort-by pr-str)
+       vec))
+
+(defn descriptor-indices [kir]
+  (into {} (map-indexed (fn [index descriptor] [descriptor index])
+                        (descriptor-table kir))))
+
+;; A capability id is an i64 KIR value, so on ClojureScript it is a JS
+;; BigInt -- and cljs.core can do neither of the two things a collection does
+;; with a value it is asked to deduplicate, order, or group by:
+;;
+;;   (hash    (js/BigInt 7))              throws "Cannot create property
+;;                                        'closure_uid_...' on bigint '7'"
+;;   (compare (js/BigInt 7) (js/BigInt 23)) throws "Cannot compare 23 to 7"
+;;
+;; `capability-contracts` reached both. Measured 2026-09-09 under nbb:
+;;
+;;   step      threw at            because
+;;   distinct  9 distinct ids      a set of 8 or fewer is a linear array set;
+;;                                 past that it hashes
+;;   sort-by   the SECOND contract `compare` on the `juxt` vector's first slot
+;;   group-by  9 distinct ids      same array-map/hash-map threshold
+;;
+;; The middle one is the one that fired in practice, and it fired at TWO
+;; capabilities: `amu compile --target wasm32-browser` answered `internal
+;; compiler error` (exit 70) for every module declaring two or more
+;; capabilities, while the same module compiled and ran on aarch64-macos --
+;; the native path never builds this table.
+;;
+;; The narrowing is `host-integer`, the same exact, fail-closed conversion
+;; `uleb` already applies to this very id one call later, so nothing new is
+;; assumed about the value. Only the KEYS are narrowed; `:id` itself is
+;; carried through untouched, because it is a KIR value and the encoder
+;; downstream is entitled to see the value it was given.
+
+(defn- contract-id
+  "The capability id as a key a host collection can hash and order."
+  [contract]
+  (host-integer (:id contract)))
+
+(defn- contract-identity
+  "What makes two contracts the same contract. `distinct`'s question, asked
+  of a value whose id has been narrowed; the request and result types are
+  keywords and vectors of keywords, which both hosts already hash."
+  [contract]
+  [(contract-id contract) (:request-type contract) (:result-type contract)])
+
+(defn- contract-order
+  "The canonical order of the table. Identical to the `(juxt :id (comp pr-str
+  :request-type) (comp pr-str :result-type))` this replaces -- on the JVM
+  `host-integer` is `identity`, so the emitted bytes do not move."
+  [contract]
+  [(contract-id contract)
+   (pr-str (:request-type contract))
+   (pr-str (:result-type contract))])
+
+(defn- distinct-contracts
+  "`distinct` over `contract-identity`, first occurrence winning."
+  [contracts]
+  (:out (reduce (fn [{:keys [seen] :as acc} contract]
+                  (let [identity* (contract-identity contract)]
+                    (if (contains? seen identity*)
+                      acc
+                      (-> acc
+                          (update :seen conj identity*)
+                          (update :out conj contract)))))
+                {:seen #{} :out []}
+                contracts)))
+
+(defn capability-contracts
+  "Returns the sealed typed capability contracts used by KIR. One capability
+  id has exactly one request/result contract per module."
+  [kir]
+  (let [contracts (->> (:functions kir)
+                       (mapcat #(tree-seq coll? seq (:body %)))
+                       (keep (fn [form]
+                               (when (and (seq? form) (= 'typed-cap-call (first form)))
+                                 (let [[_ id request-type result-type] form]
+                                   {:id id :request-type request-type :result-type result-type}))))
+                       distinct-contracts
+                       (sort-by contract-order)
+                       vec)]
+    (doseq [grouped (vals (group-by contract-id contracts))]
+      (when (> (count grouped) 1)
+        (throw (ex-info "typed capability id has conflicting contracts"
+                        {:phase :kir-descriptor
+                         :capability (:id (first grouped))
+                         :contracts grouped}))))
+    contracts))

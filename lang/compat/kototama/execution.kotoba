@@ -1,0 +1,150 @@
+(ns kototama.execution
+  "An execution is a value, and its CID is a cache key only sometimes.
+
+  Root ADR-2608160200: `{program, input, state, runtime, policy, effects} →
+  CID`. `amu` already does this for builds — a sealed output set with signed
+  provenance — and this is the runtime half.
+
+  **The CID is always an identity and only sometimes a memo key.** That
+  distinction is the whole namespace. `same program, same input, therefore
+  same result` is true for a pure computation and false for anything that
+  read a clock, a random source or the network, and a cache that cannot tell
+  them apart is a cache that never notices the world changed. So:
+
+  - `execution-cid` always answers. It is what a transaction cites.
+  - `memo-key` answers **nil** unless the execution is replayable, and the
+    caller cannot get a key without going through it.
+
+  Two functions rather than a flag because a flag is easy to ignore.
+
+  ## What makes an execution replayable
+
+  An effect is replayable when the log carries enough to reproduce it
+  without performing it again:
+
+  - a **source** (clock, randomness, a network read) must have its *value*
+    recorded. An outcome of `:ok` says the call happened, not what it
+    returned, and replaying against `:ok` invents the answer.
+  - a **sink** (a write, a publish) must have an outcome recorded, so replay
+    knows whether to consider it done.
+  - an effect whose kind is **not classified at all** refuses the memo. This
+    is `capability-semantics.edn`'s `:unknown-kind :deny` applied here: the
+    conservative direction is the one where an unrecognised effect cannot
+    silently become cacheable by being unfamiliar.
+
+  The classification is passed in, not hardcoded, because the vocabulary of
+  effect kinds belongs to `kotoba-lang`'s `lang/capability-semantics.edn`
+  and a second copy here would drift from it.
+
+  ## Receipts
+
+  A receipt is what `capability-semantics.edn` requires —
+  `:receipt/cap`, `:receipt/at`, `:receipt/call`, `:receipt/outcome` — plus
+  `:receipt/value` for a source. `kototama.linear-journal` chains
+  consumption entries; those are not yet these receipts, and this namespace
+  does not pretend otherwise: it reads whatever receipts it is handed."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            [multiformats.core :as mf]))
+
+(def required-receipt-keys
+  "From `kotoba-lang`'s `lang/capability-semantics.edn`. Named here so a
+  drift between the two is a changed constant rather than a silent
+  disagreement."
+  #{:receipt/cap :receipt/at :receipt/call :receipt/outcome})
+
+(def execution-keys
+  "The fields an execution value is addressed over, in the order the
+  canonical form writes them."
+  [:program :input :state :runtime :policy :effects])
+
+(defn canonical-form
+  "The execution reduced to exactly the addressed fields, with `:effects`
+  sorted.
+
+  Anything else a caller carries — timing, host names, a log handle — is
+  deliberately dropped: two runs of the same program on the same input under
+  the same policy are the same execution, and letting incidental fields into
+  the identity would make every run unique and the CID useless."
+  [execution]
+  (-> (select-keys execution execution-keys)
+      (update :effects #(when % (vec (sort-by (comp str :effect/kind) %))))))
+
+(defn canonical-string [execution]
+  (pr-str (into (sorted-map) (canonical-form execution))))
+
+(defn execution-cid
+  "Raw CIDv1 of the execution's canonical bytes.
+
+  Always available. This is the identity a receipt or a transaction cites,
+  whether or not the execution may be memoised."
+  [execution]
+  (mf/cidv1-raw ))
+
+;; ── replayability ───────────────────────────────────────────────────────────
+
+(defn- receipt-for [receipts effect]
+  (first (filter #(= (:effect/kind effect) (:receipt/call %)) receipts)))
+
+(defn- complete-receipt? [r]
+  (every? #(contains? r %) required-receipt-keys))
+
+(defn memo-verdict
+  "Whether this execution's CID may be used as a cache key, and why not.
+
+  `classify` maps an effect kind to `:source` or `:sink`; a kind it does not
+  know refuses the memo.
+
+  Returns `{:memoizable? bool :reason kw :offending [...]}`."
+  [{:keys [effects receipts]} classify]
+  (let [effects (vec effects)]
+    (cond
+      (empty? effects)
+      {:memoizable? true :reason :pure}
+
+      :else
+      (let [unknown (filterv #(nil? (classify (:effect/kind %))) effects)
+            classified (remove #(nil? (classify (:effect/kind %))) effects)
+            missing-receipt (filterv #(not (complete-receipt? (receipt-for receipts %)))
+                                     classified)
+            ;; A source needs its VALUE, not just an outcome: replaying a
+            ;; clock read against `:ok` invents the time.
+            valueless-sources
+            (filterv (fn [e]
+                       (and (= :source (classify (:effect/kind e)))
+                            (let [r (receipt-for receipts e)]
+                              (and (complete-receipt? r)
+                                   (not (contains? r :receipt/value))))))
+                     classified)]
+        (cond
+          (seq unknown)
+          {:memoizable? false :reason :unknown-effect-kind :offending unknown}
+
+          (seq missing-receipt)
+          {:memoizable? false :reason :unreceipted-effect :offending missing-receipt}
+
+          (seq valueless-sources)
+          {:memoizable? false :reason :source-value-not-recorded
+           :offending valueless-sources}
+
+          :else {:memoizable? true :reason :replayable})))))
+
+(defn memo-key
+  "The execution's CID **if** it may be used as a cache key, otherwise nil.
+
+  A caller that wants a key has to come through here. `execution-cid` is
+  always available for citation, and the two are separate functions so that
+  using an identity as a cache key is a decision someone made rather than a
+  field they ignored."
+  [execution classify]
+  (when (:memoizable? (memo-verdict execution classify))
+    (execution-cid execution)))
+
+(defn explain
+  "One line for a log or a receipt."
+  [execution classify]
+  (let [{:keys [memoizable? reason offending]} (memo-verdict execution classify)]
+    (str (execution-cid execution) " "
+         (if memoizable? "memoizable" "not a cache key")
+         " (" (name reason) ")"
+         (when (seq offending)
+           (str ": " (str/join ", " (map (comp str :effect/kind) offending)))))))

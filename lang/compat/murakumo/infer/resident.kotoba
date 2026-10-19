@@ -1,0 +1,629 @@
+(ns murakumo.infer.resident
+  "Node-owned admission and recovery. Gateways hold no execution slots."
+  (:require [clojure.string :as str]
+            [clojure.walk :as walk]
+            [murakumo.infer.jobs :as jobs]
+            [murakumo.infer.replicated-topology :as topo]
+            [murakumo.infer.keepalive :as ka]
+            [murakumo.infer.observation :as observation]
+            [murakumo.infer.poi-receipt :as poi-receipt]
+            [murakumo.infer.converge :as converge]
+            [murakumo.infer.lease :as lease]
+            [murakumo.infer.rollout :as rollout]
+            ["node:fs" :as fs] ["node:http" :as http]
+            ["node:crypto" :as crypto] ["node:child_process" :as cp]))
+
+(defn output-reservation [lane maximum]
+  ;; max_tokens is an upper bound, not a promise to fill it. Tokenizer-enabled
+  ;; heads reserve 8K for an agent turn and enforce their remaining context.
+  (if (= "llama-template" (:input-tokenizer lane)) (min maximum 8192) maximum))
+
+(defn eligible? [lane request]
+  (and (= (:model lane) (:model request))
+       (number? (:input-tokens request))
+       (>= (:context lane 0) (+ (:input-tokens request 0) (:max-tokens request 0)))))
+
+(defn request-input-tokens [lane body byte-count]
+  ;; Image bytes are transport, not text tokens. Only explicitly bounded vision
+  ;; lanes admit inline images; never let a backend fetch caller-supplied URLs.
+  ;; The backend must enforce the same per-image maximum declared by the lane.
+  (let [images (atom [])
+        compact (walk/postwalk
+                 (fn [v]
+                   (if (and (map? v) (= "image_url" (:type v)))
+                     (do (swap! images conj (get-in v [:image_url :url]))
+                         (assoc-in v [:image_url :url] "")) v)) body)
+        n (count @images)
+        budget (:max-image-tokens lane)
+        maximum (:max-images lane 1)]
+    (if (zero? n) byte-count
+      (when (and (js/Number.isSafeInteger budget) (<= 1024 budget 8192)
+                 (js/Number.isSafeInteger maximum) (<= 1 maximum 4)
+                 (<= n maximum)
+                 (every? #(and (string? %)
+                               (re-matches #"data:image/(png|jpeg);base64,[A-Za-z0-9+/]+={0,2}" %)) @images))
+        (+ (.byteLength js/Buffer (js/JSON.stringify (clj->js compact)) "utf8")
+           256 (* n (+ budget 64)))))))
+
+(defn input-tokens! [lane body byte-count]
+  "Use the serving backend's chat template/tokenizer when explicitly enabled.
+  A failed or unsupported tokenizer retains the conservative byte upper bound.
+  Vision keeps its separately bounded image admission and never reaches this API."
+  (let [fallback #(js/Promise.resolve {:input-tokens (request-input-tokens lane body byte-count)
+                                      :source "byte-upper-bound"})
+        messages (:messages body)]
+    (if-not (and (= "llama-template" (:input-tokenizer lane)) (= "text" (:kind lane))
+                 (seq messages) (every? #(string? (:content %)) messages))
+      (fallback)
+      (let [post (fn [path value]
+                   (-> (ka/fetch (str (:backend lane) path)
+                                 #js {:method "POST" :signal (.timeout js/AbortSignal 5000)
+                                      :headers #js {"content-type" "application/json"}
+                                      :body (js/JSON.stringify (clj->js value))})
+                       (.then (fn [resp]
+                                (when-not (.-ok resp) (throw (js/Error. "tokenizer unavailable")))
+                                (.json resp)))))]
+        (-> (post "/apply-template" (assoc body :add_generation_prompt true))
+            (.then (fn [template]
+                     (when-not (and (string? (.-prompt template))
+                                    (<= (.byteLength js/Buffer (.-prompt template) "utf8") 4194304))
+                       (throw (js/Error. "invalid chat template")))
+                     (post "/tokenize" {:content (.-prompt template) :add_special false :parse_special true})))
+            (.then (fn [result]
+                     (when-not (and (js/Array.isArray (.-tokens result))
+                                    (<= (.-length (.-tokens result)) 2097152)
+                                    (.every (.-tokens result) js/Number.isSafeInteger))
+                       (throw (js/Error. "invalid tokenizer result")))
+                     ;; Small reserve for engine-specific generation-prefix differences.
+                     {:input-tokens (+ 128 (.-length (.-tokens result))) :source "backend-tokenizer"}))
+            (.catch (fn [_] (fallback))))))))
+
+(defn prefill-heartbeat! [res model id interval-ms]
+  "Keep an admitted SSE response live until its first backend byte only."
+  (.flushHeaders res)
+  (let [timer (js/setInterval
+               #(when-not (or (.-destroyed res) (.-writableEnded res))
+                  (.write res (str "data: " (js/JSON.stringify
+                    #js {:id id :object "chat.completion.chunk" :created (js/Math.floor (/ (js/Date.now) 1000))
+                         :model model :choices #js []}) "\n\n"))) interval-ms)
+        stop #(js/clearInterval timer)]
+    (.once res "close" stop) (.once res "finish" stop)
+    stop))
+
+(defn external-group-busy? [lanes lane]
+  (boolean (some #(and (= (:group lane) (:group %)) (:external-busy %)) (vals lanes))))
+
+(defn valid-output-budget? [body]
+  (let [n (:max_tokens body 1024)]
+    (and (number? n) (js/Number.isSafeInteger n) (<= 1 n 32768))))
+
+(defn admit [state lane id digest now ttl]
+  (cond
+    (get-in state [:jobs id])
+    (let [job (get-in state [:jobs id])]
+      {:status (if (= digest (:digest job)) 409 422) :reason :already-seen :state state})
+    (not (:ready lane)) {:status 503 :reason :not-ready :state state}
+    (>= (count (:jobs state)) (:max-jobs state 100000)) {:status 507 :reason :receipt-capacity :state state}
+    (get-in state [:groups (:group lane)]) {:status 429 :reason :busy :state state}
+    :else {:status 200 :state (-> state
+                                 (assoc-in [:groups (:group lane)] id)
+                                 (assoc-in [:jobs id] {:digest digest :group (:group lane)
+                                                      :status :running :deadline (+ now ttl)}))}))
+
+(defn finish [state id status]
+  (if-let [job (get-in state [:jobs id])]
+    (-> state
+        (update :groups dissoc (:group job))
+        (assoc-in [:jobs id :status] status))
+    state))
+
+(defn heal-eligible? [lane now]
+  (and (not (:ready lane)) (>= (:failures lane 0) 3)
+       (seq (:restart-argv lane))
+       (>= (- now (:last-heal lane 0)) (:cooldown-ms lane 1800000))))
+
+(defn json! [res status body]
+  (.writeHead res status #js {"content-type" "application/json" "cache-control" "no-store"})
+  (.end res (js/JSON.stringify (clj->js body))))
+
+(defn private-token [file]
+  (let [st (.lstatSync fs file)]
+    (when (or (.isSymbolicLink st) (not (.isFile st))
+              (not= 0 (bit-and (.-mode st) 63)))
+      (throw (js/Error. "token-file must be a private regular file (0600)")))
+    (let [token (str/trim (.readFileSync fs file "utf8"))]
+      (when (< (count token) 32) (throw (js/Error. "token-file is too short")))
+      token)))
+
+(defn authorized? [req token]
+  (let [a (js/Buffer.from (str "Bearer " token))
+        b (js/Buffer.from (or (aget (.-headers req) "authorization") ""))]
+    (and (= (.-length a) (.-length b)) (.timingSafeEqual crypto a b))))
+
+(defn read-body! [req limit]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [parts (atom []) size (atom 0)]
+       (.on req "data" (fn [chunk]
+                         (if (> (swap! size + (.-length chunk)) limit)
+                           (do (reject (js/Error. "body too large")) (.destroy req))
+                           (swap! parts conj chunk))))
+       (.on req "error" reject)
+       (.on req "end" #(resolve (.concat js/Buffer (clj->js @parts))))))))
+
+(defn persist! [file state]
+  ;; Receipts precede dispatch. Atomic replacement prevents partial JSON after crash.
+  ;; No prompts or generated content enter this ledger.
+  (let [tmp (str file "." (.randomUUID crypto) ".tmp")
+        fd (.openSync fs tmp "wx" 384)]
+    (try
+      (.writeFileSync fs fd (js/JSON.stringify (clj->js state)))
+      (.fsyncSync fs fd)
+      (finally (.closeSync fs fd)))
+    (.renameSync fs tmp file) (topo/sync-parent! file)))
+
+(defn backend-busy-error? [error]
+  ;; SCI keeps the thrown JS Error as cause; native JS exposes it directly.
+  (loop [e error depth 0]
+    (cond (= "BACKEND_BUSY" (some-> e .-code)) true
+          (or (nil? e) (>= depth 5)) false
+          :else (recur (.-cause e) (inc depth)))))
+
+(defn connection-refused? [error]
+  (loop [e error depth 0]
+    (cond (= "ECONNREFUSED" (some-> e .-code)) true
+          (or (nil? e) (>= depth 5)) false
+          :else (recur (.-cause e) (inc depth)))))
+
+(defn check-shared-images! [lanes lane]
+  ;; A cached health sample is insufficient for shared-memory admission.
+  ;; Missing/invalid queue observations fail closed before any execution.
+  (js/Promise.all
+   (clj->js
+    (for [image (cond-> (vec (vals lanes))
+                   (:external-image-queue-url lane)
+                   (conj {:kind "image" :group (:group lane)
+                          :readiness-url (:external-image-queue-url lane)
+                          :optional? (:external-image-queue-optional? lane)}))
+          :when (and (= "text" (:kind lane)) (= "image" (:kind image))
+                     (= (:group lane) (:group image)))]
+      (-> (ka/fetch (str (.-origin (js/URL. (:readiness-url image))) "/queue")
+                    #js {:signal (.timeout js/AbortSignal 3000)})
+          (.then (fn [r] (when-not (.-ok r) (throw (js/Error. "queue unavailable"))) (.json r)))
+          (.then (fn [q]
+                   (when-not (and (js/Array.isArray (.-queue_running q))
+                                  (js/Array.isArray (.-queue_pending q))
+                                  (zero? (.-length (.-queue_running q)))
+                                  (zero? (.-length (.-queue_pending q))))
+                     (throw (js/Error. "shared image queue occupied or unknown")))))
+          (.catch (fn [error]
+                    (if (and (:optional? image) (connection-refused? error))
+                      true
+                      (let [e (js/Error. "shared image capacity unavailable")]
+                        (set! (.-code e) "BACKEND_BUSY") (throw e))))))))))
+
+(defn probe! [lane]
+  (let [url (:backend lane)
+        signal (.timeout js/AbortSignal 15000)]
+    (if (= "text" (:kind lane))
+      ;; /slots must show no external job before a canary can occupy this model.
+      (-> (ka/fetch (str url "/slots") #js {:signal signal})
+          (.then (fn [r] (when-not (.-ok r) (throw (js/Error. "slots unavailable"))) (.json r)))
+          (.then (fn [slots]
+                   (when-not (js/Array.isArray slots) (throw (js/Error. "invalid slot inventory")))
+                   (when (some #(true? (:is_processing %)) (js->clj slots :keywordize-keys true))
+                     (let [e (js/Error. "backend occupied outside resident")]
+                       (set! (.-code e) "BACKEND_BUSY") (throw e)))
+                   (ka/fetch (str url "/v1/chat/completions")
+                             #js {:method "POST" :signal signal
+                                  :headers #js {"content-type" "application/json"}
+                                  :body (js/JSON.stringify
+                                         #js {:model (:model lane) :max_tokens 16 :temperature 0
+                                              :chat_template_kwargs #js {:enable_thinking false}
+                                              :messages #js [#js {:role "user" :content "2+3. What is the sum? Reply with ONLY a single digit. No formula, equation, punctuation, or explanation."}]})})))
+          (.then (fn [r] (when-not (.-ok r) (throw (js/Error. "canary failed"))) (.json r)))
+          (.then (fn [body]
+                   (let [s (str/trim (or (some-> body .-choices (aget 0) .-message .-content) ""))]
+                     (when-not (= "5" s) (throw (js/Error. "canary answer incorrect"))) true))))
+      ;; Image readiness is upstream dependency readiness, not the bridge's own 200.
+      (-> (ka/fetch (str (.-origin (js/URL. (:readiness-url lane))) "/queue") #js {:signal signal})
+          (.then (fn [r] (when-not (.-ok r) (throw (js/Error. "image queue unavailable"))) (.json r)))
+          (.then (fn [queue]
+                   (when-not (and (js/Array.isArray (.-queue_running queue)) (js/Array.isArray (.-queue_pending queue)))
+                     (throw (js/Error. "invalid image queue")))
+                   (when (or (pos? (.-length (.-queue_running queue))) (pos? (.-length (.-queue_pending queue))))
+                     (let [e (js/Error. "image backend occupied")]
+                       (set! (.-code e) "BACKEND_BUSY") (throw e)))
+                   (ka/fetch (:readiness-url lane) #js {:signal signal})))
+          (.then (fn [r] (when-not (.-ok r) (throw (js/Error. "image backend unavailable"))) (.json r)))
+          (.then (fn [body]
+                   (let [inventory (js->clj body :keywordize-keys true)
+                         names (first (get-in inventory [:CheckpointLoaderSimple :input :required :ckpt_name]))
+                         model (:model lane)
+                         checkpoint (if (str/ends-with? model ".safetensors") model (str model ".safetensors"))]
+                     (when-not (some #{checkpoint} names)
+                       (throw (js/Error. "image checkpoint unavailable")))
+                     (ka/fetch (str (:backend lane) "/readiness") #js {:signal signal}))))
+          (.then (fn [r] (when-not (.-ok r) (throw (js/Error. "image execution bridge unavailable"))) (.json r)))
+          (.then (fn [body]
+                   (let [report (js->clj body :keywordize-keys true)]
+                     (when-not (true? (get-in report [:models (keyword (:model lane)) :ready]))
+                       (throw (js/Error. "image execution dependency unavailable"))) true)))))))
+
+(defn qualified-lane [topology node lane]
+  (assoc lane :ready (boolean (and (:ready lane)
+                                  (= (:probe-topology-digest lane) (:digest (topo/summary topology)))
+                                  (topo/role-allowed? topology node lane)))))
+
+(defn service-watchdog! [config live?]
+  (if (and (aget (.-env js/process) "NOTIFY_SOCKET") (seq (:watchdog-argv config)))
+    (let [[bin & args] (:watchdog-argv config) sending? (atom false)
+          timer (js/setInterval
+                  (fn [] (when (and (live?) (compare-and-set! sending? false true))
+                           (.execFile cp bin (clj->js args) #js {:timeout 3000}
+                                      (fn [_ _ _] (reset! sending? false)))))
+                  (:watchdog-interval-ms config 10000))]
+      #(js/clearInterval timer))
+    (fn [] nil)))
+
+(defn start! [config]
+  (let [;; one drain file for admission, health and the self-update (P5a), even
+        ;; when the config does not name one
+        config (cond-> config
+                 (and (:state-file config) (not (:drain-file config)))
+                 (assoc :drain-file (str (:state-file config) ".draining")))
+        token (private-token (:token-file config))
+        file (:state-file config)
+        owner-file (:owner-id-file config (str file ".owner-id"))
+        existing-owner? (.existsSync fs owner-file)
+        owner-id (topo/owner-id! owner-file)
+        binding-file (str file ".bound-owner")
+        bound? (.existsSync fs binding-file)
+        _ (when (and bound? (not= owner-id (topo/owner-id! binding-file)))
+            (throw (js/Error. "receipt ledger owner binding mismatch")))
+        _ (when (and existing-owner? (not (.existsSync fs file))
+                     (or bound? (not= owner-id (:legacy-empty-ledger-owner-id config))))
+            (throw (js/Error. "receipt ledger missing for retained owner; restore its ledger or explicitly prepare a confirmed empty legacy owner")))
+        previous (if (.existsSync fs file)
+                   (js->clj (js/JSON.parse (.readFileSync fs file "utf8")) :keywordize-keys false) {"jobs" {}})
+        _ (when-not (map? (get previous "jobs"))
+            (throw (js/Error. "invalid receipt ledger; refusing to reuse the retained owner")))
+        topology (topo/start! config token)
+        job-service (try (jobs/start! config token topology)
+                         (catch :default e (when topology ((:close topology))) (throw e)))
+        ;; On restart, previous running jobs become unknown; never replay them.
+        state (atom {:groups {} :max-jobs (:max-receipts config 100000)
+                     :jobs (into {} (for [[id j] (get previous "jobs")
+                                         :let [job (js->clj (clj->js j) :keywordize-keys true)]]
+                                     [id (update job :status #(if (= % "running") :unknown (keyword %)))]))})
+        lanes (atom (into {} (for [[id lane] (:lanes config)]
+                              [(name id) (assoc lane :owner-id owner-id :ready false :failures 0 :probing false)])))
+        controllers (atom {})
+        ;; L2 (ADR-2610071730): this node's signed self-report, gossiped with peers
+        converger (atom nil)
+        roller (atom nil)
+        ;; token-free observation reads only on a private bind (loopback or tailnet)
+        private-bind? (boolean (re-matches #"127\.0\.0\.1|100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]+\.[0-9]+"
+                                           (str (:bind config "127.0.0.1"))))
+        observations (when-not (false? (:observations? config))
+                       (observation/start! config token topology #(deref lanes)
+                                           {:extra-fn #(cond-> {}
+                                                         @converger (assoc :converge ((:status @converger)))
+                                                         @roller (assoc :rollout ((:status @roller))))}))
+        ;; ADR-261010: node-signed usage receipts for completed text jobs, with the
+        ;; observation key (same did); off with {:poi-receipts? false}
+        poi-file (str file ".poi-receipts.jsonl")
+        poi-key (when-not (false? (:poi-receipts? config))
+                  (try (observation/node-key! (or (:node-key-file config) (str file ".node-key")))
+                       (catch :default _ nil)))
+        ;; P3a (ADR-2610071730): plan this node's share every interval; act only
+        ;; when the signed intent says enforce for this node (see converge ns)
+        ;; P3b: quorum leases on the same signed voters as the jobs (policies.job-voters)
+        lease-voters (get-in (topo/payload topology) [:policies :job-voters])
+        lease-acceptor (when (and topology (some #(= (:node config) (:node %)) lease-voters))
+                         (lease/start-acceptor! (or (:lease-directory config)
+                                                    (str (.dirname (js/require "node:path") (:state-file config)) "/leases"))
+                                                topology))
+        lease-client (when (seq lease-voters) (lease/http-client lease-voters token))
+        _ (when (and observations topology (not (false? (:converge? config))))
+            (reset! converger (converge/start! config topology observations lease-client)))
+        ;; P5a: follow the signed intent's resident release in waves (self-update)
+        _ (when (and observations topology (not (false? (:rollout? config))))
+            (reset! roller
+                    (rollout/start! config token topology
+                                    #(into {} (for [[n d] ((:all observations))]
+                                                [(topo/key-name n) (js->clj (js/JSON.parse (topo/encoded (:payload d))))]))
+                                    #(boolean (or (some some? (vals (:groups @state)))
+                                                  (and job-service (pos? (count @(:active job-service)))))))))
+        save! #(persist! file @state)
+        _ (when-not (.existsSync fs file) (save!))
+        _ (when-not bound?
+            (let [fd (.openSync fs binding-file "wx" 384)]
+              (try (.writeFileSync fs fd owner-id) (.fsyncSync fs fd) (finally (.closeSync fs fd)))
+              (topo/sync-parent! binding-file)))
+        tick! (fn []
+                (doseq [[id lane] (sort-by (fn [[_ l]] [(:last-probe l 0) (if (= "image" (:kind l)) 0 1)]) @lanes)
+                        :when (and (topo/role-allowed? topology (:node config) lane) (not (:probing lane)) (not (get-in @state [:groups (:group lane)]))
+                                   (not (and (= "text" (:kind lane))
+                                             (some #(and (= "image" (:kind %)) (= (:group lane) (:group %)) (:external-busy %))
+                                                   (vals @lanes)))))]
+                  ;; Reserve group for the probe too: canaries cannot race real jobs.
+                  (swap! state assoc-in [:groups (:group lane)] (str "probe:" id))
+                  (swap! lanes update id merge {:probing true :last-probe (js/Date.now)})
+                  (let [probe-digest (:digest (topo/summary topology))]
+                  (-> (check-shared-images! @lanes lane)
+                      (.then (fn [_] (probe! lane)))
+                      (.then (fn [_] (swap! lanes update id merge
+                                                {:ready (and (= probe-digest (:digest (topo/summary topology)))
+                                                             (topo/role-allowed? topology (:node config) lane))
+                                                 :probe-topology-digest probe-digest
+                                                 :failures 0 :external-busy false})))
+                      (.catch (fn [error]
+                                (let [busy? (backend-busy-error? error)]
+                                  (swap! lanes update id #(-> % (assoc :ready false :external-busy (or busy? (:external-busy %)))
+                                                             (assoc :failures (if busy? 0 (inc (:failures % 0)))))))
+                                (let [l (get @lanes id) now (js/Date.now)]
+                                  (when (and (not (backend-busy-error? error)) (not (:external-busy l)) (heal-eligible? l now))
+                                    (swap! lanes assoc-in [id :last-heal] now)
+                                    ;; Commands are manifest argv, never interpolated through a shell.
+                                    (let [[bin & args] (:restart-argv l)]
+                                      (js/Promise. (fn [resolve _]
+                                       (.execFile cp bin (clj->js args)
+                                                 #js {:timeout 30000}
+                                                 (fn [error _ _]
+                                                   (println (js/JSON.stringify
+                                                             (clj->js {:event "heal" :lane id :ok (nil? error) :at now})))
+                                                   (resolve nil))))))))))
+                      (.finally (fn []
+                                  (swap! lanes assoc-in [id :probing] false)
+                                  (swap! state update :groups dissoc (:group lane))))))))
+        execute! (fn [req res lane-id compatibility?]
+                   (-> (read-body! req (:max-body-bytes config 2097152))
+                       (.then (fn [bytes]
+                                (if (get-in @state [:jobs (aget (.-headers req) "x-murakumo-job-id")])
+                                  bytes
+                                  (-> (check-shared-images! @lanes (get @lanes lane-id))
+                                      (.then (fn [_] bytes))))))
+                       (.then (fn [bytes]
+                                (let [body (js->clj (js/JSON.parse (.toString bytes)) :keywordize-keys true)
+                                      lane (get @lanes lane-id)]
+                                  (-> (if (get-in @state [:jobs (aget (.-headers req) "x-murakumo-job-id")])
+                                        (js/Promise.resolve {})
+                                        (input-tokens! lane body (.-length bytes)))
+                                      (.then (fn [estimate] {:bytes bytes :input-tokens (:input-tokens estimate)}))))))
+                       (.then
+                        (fn [{:keys [bytes input-tokens]}]
+                          (let [raw-body (js->clj (js/JSON.parse (.toString bytes)) :keywordize-keys true)
+                                body (if (and compatibility? (contains? #{"mishima" "murakumo/free"} (:model raw-body)))
+                                       (assoc raw-body :model "mishima") raw-body)
+                                id (aget (.-headers req) "x-murakumo-job-id")
+                                digest (.digest (.update (.createHash crypto "sha256") bytes) "hex")
+                                lane (when-let [l (get @lanes lane-id)] (qualified-lane topology (:node config) l))
+                                request {:model (:model body) :input-tokens input-tokens
+                                         :max-tokens (output-reservation lane (or (:max_tokens body) 1024))}]
+                            (cond
+                              (.-destroyed res) nil
+                              (and (:drain-file config) (.existsSync fs (:drain-file config)))
+                              (json! res 503 {:error "resident_draining" :executed false})
+                              (and (= "text" (:kind lane)) (not (valid-output-budget? body)))
+                              (json! res 400 {:error "invalid_output_budget"})
+                              (or (nil? id) (not (re-matches #"[A-Za-z0-9_-]{8,128}" id)))
+                              (json! res 400 {:error "job_id_required"})
+                              (nil? lane) (json! res 404 {:error "lane_unknown"})
+                              (get-in @state [:jobs id])
+                              (let [seen (admit @state lane id digest (js/Date.now) 0)]
+                                (json! res (:status seen) {:error "already-seen" :job-id id :executed "unknown"}))
+                              (not (topo/role-allowed? topology (:node config) lane))
+                              (json! res 503 {:error "topology_role_unavailable" :executed false})
+                              (and (= "text" (:kind lane)) (not (eligible? lane request)))
+                              (json! res 422 {:error "model_or_context_mismatch"})
+                              (and (= "image" (:kind lane)) (not= (:model lane) (:model body)))
+                              (json! res 422 {:error "model_mismatch"})
+                              :else
+                              (let [ttl (:job-timeout-ms lane 480000)
+                                    admission (if (and (not (get-in @state [:jobs id])) (external-group-busy? @lanes lane))
+                                                {:status 429 :reason :busy :state @state}
+                                                (admit @state lane id digest (js/Date.now) ttl))]
+                                (if (not= 200 (:status admission))
+                                  (json! res (:status admission) {:error (name (:reason admission))
+                                                                 :job-id id
+                                                                 :executed (if (= :already-seen (:reason admission)) "unknown" false)})
+                                  (let [controller (js/AbortController.) settled (atom false)
+                                        settle! (fn [status]
+                                                  (when (compare-and-set! settled false true)
+                                                    (swap! state finish id status)
+                                                    (swap! controllers dissoc id)
+                                                    (save!)))
+                                        timer (js/setTimeout #(.abort controller) ttl)]
+                                    (reset! state (:state admission))
+                                    (save!)
+                                    (swap! controllers assoc id controller)
+                                    (.on res "close" #(when-not (.-writableEnded res) (.abort controller)))
+                                    (-> (ka/fetch (str (:backend lane) (:path lane))
+                                                  #js {:method "POST" :signal (.-signal controller)
+                                                       :headers #js {"content-type" "application/json"}
+                                                       :body (if (= "text" (:kind lane))
+                                                               (js/JSON.stringify (clj->js (assoc body :max_tokens (if (= "llama-template" (:input-tokenizer lane))
+                                                                                         (min (:max_tokens body 1024) (- (:context lane) input-tokens))
+                                                                                         (:max_tokens body 1024)))))
+                                                               bytes)})
+                                        (.then (fn [r]
+                                                 (.writeHead res (.-status r)
+                                                             #js {"content-type" (or (.get (.-headers r) "content-type") "application/json")
+                                                                  "x-murakumo-job-id" id
+                                                                  "x-murakumo-node" (:node config)})
+                                                 (let [stop-heartbeat! (if (and (= "text" (:kind lane)) (true? (:stream body))
+                                                                               (str/includes? (or (.get (.-headers r) "content-type") "") "text/event-stream")
+                                                                               (.-ok r))
+                                                                         (prefill-heartbeat! res (:model body) id (:heartbeat-ms config 15000))
+                                                                         (fn [] nil))
+                                                       reader (.getReader (.-body r))
+                                                       seen (atom "")
+                                                       record? (and poi-key (= "text" (:kind lane)))]
+                                                   (letfn [(pump []
+                                                             (-> (.read reader)
+                                                                 (.then (fn [chunk]
+                                                                          (stop-heartbeat!)
+                                                                          (if (.-done chunk)
+                                                                            (do (settle! (if (.-ok r) :completed :failed))
+                                                                                (.end res)
+                                                                                (when (and record? (.-ok r))
+                                                                                  (when-let [u (poi-receipt/usage-of @seen)]
+                                                                                    (poi-receipt/append! poi-file poi-key
+                                                                                                         (poi-receipt/receipt {:node (:node config) :did (:did poi-key)
+                                                                                                                               :job id :lane lane-id :model (:model body)
+                                                                                                                               :at (js/Date.now)}
+                                                                                                                              u)))))
+                                                                            (let [b (.from js/Buffer (.-value chunk))]
+                                                                              (when record? (swap! seen poi-receipt/tail (.toString b "utf8")))
+                                                                              (.write res b)
+                                                                              (pump)))))))]
+                                                     (pump)))))
+                                        (.catch (fn [_]
+                                                  (swap! lanes assoc-in [lane-id :ready] false)
+                                                  (settle! :unknown)
+                                                  (when-not (.-headersSent res)
+                                                    (json! res 502 {:error "execution_unknown" :job-id id :retryable false}))
+                                                  (when-not (.-writableEnded res) (.end res))))
+                                        (.finally #(js/clearTimeout timer))))))))))
+                       (.catch (fn [e] (when-not (.-headersSent res)
+                                        (if (backend-busy-error? e)
+                                          (json! res 429 {:error "busy" :executed false})
+                                          (json! res 400 {:error "request_failed"})))))))
+        server (ka/keep-alive! (.createServer http
+                              (fn [req res]
+                                (cond
+                                  ;; signed, health-only, on the tailnet bind: readable without the
+                                  ;; fleet token so any node / the operator CLI can read the fleet's L2
+                                  (and observations (= "GET" (.-method req)) (= "/observations" (.-url req))
+                                       (or private-bind? (authorized? req token)))
+                                  (json! res 200 ((:all observations)))
+                                  (and observations (= "GET" (.-method req)) (= "/observation" (.-url req))
+                                       (or private-bind? (authorized? req token)))
+                                  (json! res 200 (or ((:own observations)) {}))
+                                  ;; ADR-261010: node-signed usage receipts (no prompt, no output),
+                                  ;; for the Proof of Inference coordinator
+                                  (and poi-key (= "GET" (.-method req)) (str/starts-with? (.-url req) "/poi/receipts")
+                                       (or private-bind? (authorized? req token)))
+                                  (let [at (or (some->> (re-find #"[?&]since=(\d+)" (.-url req)) second (js/parseInt)) 0)]
+                                    (json! res 200 {:node (:node config) :did (:did poi-key)
+                                                    :receipts (poi-receipt/since poi-file at)}))
+                                  ;; P5a: release bytes for peers (public code, sha256-addressed)
+                                  (and (= "GET" (.-method req)) (str/starts-with? (.-url req) "/release/")
+                                       (or private-bind? (authorized? req token)))
+                                  (if-let [buf (rollout/serve-release config (subs (.-url req) 9))]
+                                    (do (.writeHead res 200 #js {"content-type" "text/javascript" "content-length" (.-length buf)})
+                                        (.end res buf))
+                                    (json! res 404 {:error "release_not_here"}))
+                                  (not (authorized? req token))
+                                  (json! res 401 {:error "unauthorized"})
+                                  :else
+                                  (cond
+                                    (and (= "POST" (.-method req)) (str/starts-with? (.-url req) "/estimate/"))
+                                    (let [lane-id (subs (.-url req) 10)
+                                          lane (when-let [l (get @lanes lane-id)] (qualified-lane topology (:node config) l))]
+                                      (if-not (and lane (= "llama-template" (:input-tokenizer lane))
+                                                   (topo/role-allowed? topology (:node config) lane))
+                                        (json! res 404 {:error "tokenizer_not_available"})
+                                        (-> (read-body! req (:max-body-bytes config 2097152))
+                                            (.then (fn [bytes]
+                                                     (let [body (js->clj (js/JSON.parse (.toString bytes)) :keywordize-keys true)]
+                                                       (when-not (= (:model lane) (:model body))
+                                                         (throw (js/Error. "model mismatch")))
+                                                       (-> (input-tokens! lane body (.-length bytes))
+                                                           (.then (fn [estimate]
+                                                                    (json! res 200 (assoc estimate :model (:model lane)
+                                                                      :digest (.digest (.update (.createHash crypto "sha256") bytes) "hex")))))))))
+                                            (.catch (fn [_] (json! res 400 {:error "invalid_tokenizer_request"}))))))
+                                    (and job-service (str/starts-with? (.-url req) "/jobs/"))
+                                    (let [[id op extra] (str/split (subs (.-url req) 6) #"/")]
+                                      (if (or extra (not (jobs/valid-id? id)))
+                                        (json! res 400 {:error "invalid_job_path"})
+                                        (-> (if (= "GET" (.-method req))
+                                              (if op (js/Promise.reject (js/Error. "invalid job operation"))
+                                                ((:read! job-service) id))
+                                              (if (= "POST" (.-method req))
+                                                (-> (read-body! req 16777216)
+                                                    (.then (fn [bytes]
+                                                             (let [body (js->clj (js/JSON.parse (.toString bytes)) :keywordize-keys true)]
+                                                               (if op ((:handle! job-service) id op body)
+                                                                 ((:submit! job-service) id body))))))
+                                                (js/Promise.reject (js/Error. "invalid job method"))))
+                                            (.then #(json! res (if (and (= "POST" (.-method req)) (nil? op)) 202 200) %))
+                                            (.catch (fn [_] (json! res 503 {:error "job_not_admitted" :retry "same-id-only"}))))))
+                                    (and (= "POST" (.-method req)) (= "/release" (.-url req)))
+                                    (-> (read-body! req rollout/max-release-bytes)
+                                        (.then (fn [bytes] (json! res 200 {:sha256 (rollout/accept-push! config bytes)})))
+                                        (.catch (fn [_] (json! res 400 {:error "invalid_release"}))))
+                                    (and lease-acceptor (= "GET" (.-method req)) (str/starts-with? (.-url req) "/leases/hint/"))
+                                    (json! res 200 {:epoch ((:hint lease-acceptor) (subs (.-url req) 13))})
+                                    (and lease-acceptor (= "POST" (.-method req)) (str/starts-with? (.-url req) "/leases/"))
+                                    (let [[id op extra] (str/split (subs (.-url req) 8) #"/")]
+                                      (if (or extra (nil? op))
+                                        (json! res 400 {:error "invalid_lease_path"})
+                                        (-> (read-body! req 65536)
+                                            (.then (fn [bytes]
+                                                     (json! res 200 ((:handle! lease-acceptor) id
+                                                                     (assoc (js->clj (js/JSON.parse (.toString bytes)) :keywordize-keys true) :op op)))))
+                                            (.catch (fn [_] (json! res 400 {:error "invalid_lease_request"}))))))
+                                    (and topology (= "GET" (.-method req)) (= "/topology" (.-url req)))
+                                    (json! res 200 (topo/document topology))
+                                    (and topology (= "POST" (.-method req)) (= "/topology" (.-url req)))
+                                    (-> (read-body! req 262144)
+                                        (.then (fn [bytes]
+                                                 ((:accept! topology) (js->clj (js/JSON.parse (.toString bytes)) :keywordize-keys true))
+                                                 (json! res 200 (topo/summary topology))))
+                                        (.catch (fn [_] (json! res 400 {:error "invalid_topology"}))))
+                                    (and (= "GET" (.-method req)) (= "/health" (.-url req)))
+                                    (json! res 200 {:node (:node config) :owner-id owner-id :topology (topo/summary topology)
+                                                   :jobs (when job-service {:membership (:membership job-service) :active (count @(:active job-service))})
+                                                   :lanes (into {} (for [[id l] @lanes]
+                                                                    [id (select-keys (assoc (qualified-lane topology (:node config) l) :ready (and (:ready (qualified-lane topology (:node config) l)) (not (and (:drain-file config) (.existsSync fs (:drain-file config))))) :busy (boolean (or (external-group-busy? @lanes l) (get-in @state [:groups (:group l)]))))
+                                                                                     [:model :kind :context :max-image-tokens :max-images :input-tokenizer :ready :busy :failures])]))})
+                                    (and (= "POST" (.-method req)) (str/starts-with? (.-url req) "/execute/"))
+                                    (execute! req res (subs (.-url req) 9) false)
+                                    :else (json! res 404 {:error "not_found"}))))))
+        compatibility-server
+        (when (:compat-port config)
+          (when-not (and (:compat-bind config)
+                         (or (= "127.0.0.1" (:compat-bind config))
+                             (re-matches #"100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]+\.[0-9]+" (:compat-bind config)))
+                         (get @lanes "text"))
+            (throw (js/Error. "compat-port requires explicit loopback or tailnet bind and a text lane")))
+          (ka/keep-alive! (.createServer http
+            (fn [req res]
+              (let [lane (get @lanes "text")
+                    lane (qualified-lane topology (:node config) lane)
+                    busy (boolean (or (external-group-busy? @lanes lane) (get-in @state [:groups (:group lane)])))]
+                (cond
+                  (and (= "GET" (.-method req)) (= "/health" (.-url req)))
+                  (json! res (if (or (:ready lane) busy) 200 503) {:status (if busy "busy" (if (:ready lane) "ok" "unavailable"))})
+                  (and (= "GET" (.-method req)) (= "/slots" (.-url req)))
+                  (json! res 200 [{:is_processing (or busy (not (:ready lane)))}])
+                  (and (= "POST" (.-method req)) (= "/v1/chat/completions" (.-url req)))
+                  (do
+                    (when-not (aget (.-headers req) "x-murakumo-job-id")
+                      (aset (.-headers req) "x-murakumo-job-id"
+                            (str (:node config) "_text_" (.toString (.randomBytes crypto 16) "hex"))))
+                    (execute! req res "text" true))
+                  :else (json! res 404 {:error "not_found"})))))))]
+    (doseq [[id l] @lanes]
+      (when-not (and (:group l) (:backend l) (:model l) (:path l))
+        (throw (js/Error. (str "incomplete lane " id)))))
+    (.listen server (:port config 8796) (:bind config "127.0.0.1"))
+    (when compatibility-server (.listen compatibility-server (:compat-port config) (:compat-bind config)))
+    (tick!)
+    (let [timer (js/setInterval tick! (:probe-interval-ms config 30000))
+          stop-watchdog! (service-watchdog! config #(.-listening server))]
+      {:server server :state state :lanes lanes
+       :close (fn [] (stop-watchdog!) (when @converger ((:close @converger))) (when @roller ((:close @roller))) (when observations ((:close observations)))
+                (when job-service ((:close job-service))) (when topology ((:close topology))) (js/clearInterval timer)
+                (doseq [[_ c] @controllers] (.abort c)) (.close server)
+                (when compatibility-server (.close compatibility-server)))})))
+
+(defn run-command [command args]
+  (case command
+    "serve" (let [[flag file] args]
+              (when-not (and (= flag "--config") file) (throw (js/Error. "resident serve --config FILE")))
+              (start! (js->clj (js/JSON.parse (.readFileSync fs file "utf8")) :keywordize-keys true)))
+    (println "murakumo resident serve --config FILE — node-owned admission, canary and local healing")))

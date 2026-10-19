@@ -1,0 +1,746 @@
+(ns murakumo.health
+  "Fleet health: probe, assess, record, and (narrowly) heal.
+
+  `murakumo bench` answers \"how fast was that node once\". This answers \"is the
+  fleet stable, and has it been\" — the question that was answered by hand on
+  2026-09-29 (ssh uptime x15, curl the gateway, read an ADR for throughput) and
+  came back with a paragraph instead of a number.
+
+  ## Shape
+
+    probe    ssh every node in fleet.edn IN PARALLEL (one local `sh`, one round
+             trip per node) + the public gateway (+ an optional tiny completion,
+             the canary, because /health 200 says nothing about tok/s)
+    assess   pure: rows -> per-node status (ok|warn|crit), fleet verdict and a
+             0-100 score. Thresholds are data (`default-thresholds`), not code.
+    record   append ONE json line per check to the health ledger, so stability
+             is a property of a series (availability, flapping, canary drift)
+             and not of one look. Append-only, like the bench ledger.
+    heal     plan -> (optionally) apply. See below.
+
+  ## What heal does, and refuses to do
+
+  Heal never guesses a command. Over ssh these nodes cannot use launchctl at all
+  (`Domain does not support specified action`, 2026-09-29), and several serve
+  without a LaunchAgent, so a hard-coded \"kickstart the mesh agent\" would be
+  wrong on exactly the nodes it targets. The only executable action is the
+  restart command a node's own fleet.edn entry DECLARES (`:health/restart-cmd`),
+  i.e. one the owner has verified for that node. Without it heal reports advice.
+
+  Restarting is only stability-positive if it cannot loop or stampede, so apply is
+  blocked by:
+    - cooldown: a node healed within `:heal-cooldown-s` (default 30 min) is not
+      touched again — a restart that did not help is a finding, not a retry
+    - correlation: when a third or more of the affected fleet is down at once the
+      cause is shared (network, gateway, a bad release); restarting each node
+      would destroy the evidence and the surviving capacity
+  and `apply` is never the default anywhere (CLI `--apply`, MCP `apply:true`).
+
+  ## Portability
+
+  Pure functions take and return plain maps and are what the test file pins. The
+  probes shell out through `murakumo.bench/sh` (no local shell for user data)."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.lang.edn :as edn]
+            [murakumo.bench :as bench]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+;; ── thresholds (data) ─────────────────────────────────────────────────────────
+
+(def default-thresholds
+  {:load-per-core-warn 0.9
+   :load-per-core-crit 1.5
+   :disk-pct-warn 85
+   :disk-pct-crit 95
+   :ports-pct-warn 50
+   :ports-pct-crit 90
+   :reboot-recent-s 600
+   :gateway-health-warn-s 2.0
+   :gateway-health-crit-s 5.0
+   :canary-drop-warn 0.75          ; tok/s below 75% of baseline
+   :canary-drop-crit 0.5
+   :canary-slow-warn 2.0           ; total latency above 2x baseline
+   :baseline-n 10
+   :flap-changes 4                 ; status changes inside the SLO window
+   :heal-cooldown-s 1800
+   :heal-correlated-fraction 0.34})
+
+;; ── small numeric helpers ─────────────────────────────────────────────────────
+
+(defn- num* [v] (let [n (js/parseFloat (str v))] (when-not (js/isNaN n) n)))
+
+(defn median [xs]
+  (let [v (vec (sort (keep identity xs)))
+        n (count v)]
+    (cond (zero? n) nil
+          (odd? n) (nth v (quot n 2))
+          :else (/ (+ (nth v (dec (quot n 2))) (nth v (quot n 2))) 2))))
+
+(defn- round1 [x] (/ (js/Math.round (* 10 x)) 10))
+
+;; ── ledger ────────────────────────────────────────────────────────────────────
+
+(defn ledger-path []
+  (or (aget js/process.env "MURAKUMO_HEALTH_LEDGER")
+      (.join path (.homedir os) ".local" "share" "murakumo" "health-ledger.jsonl")))
+
+(defn read-ledger
+  "{:rows [...] :bad n}. Unparseable lines are counted, never dropped silently."
+  [p]
+  (bench/read-rows p))
+
+(defn snapshots [rows] (filterv #(= "snapshot" (:health/kind %)) rows))
+(defn heals [rows] (filterv #(= "heal" (:health/kind %)) rows))
+
+;; ── fleet.edn ─────────────────────────────────────────────────────────────────
+
+(defn load-fleet
+  "fleet.edn from --fleet, $MURAKUMO_FLEET, or ./fleet.edn."
+  [p]
+  (let [p (or p (aget js/process.env "MURAKUMO_FLEET") "fleet.edn")]
+    (when-not (.existsSync fs p)
+      (throw (js/Error. (str "fleet inventory not found: " p
+                             " (pass --fleet PATH or set MURAKUMO_FLEET)"))))
+    (edn/read-string (.readFileSync fs p "utf8"))))
+
+(defn valid-host?
+  "A :host that starts with '-' would be parsed by ssh as an OPTION
+  (`-oProxyCommand=…` runs a local command). Whitespace/control chars have no
+  legitimate place in a host either."
+  [h]
+  (boolean (and (string? h) (seq h) (not (str/starts-with? h "-"))
+                (re-matches #"[A-Za-z0-9_.@:\[\]%-]+" h))))
+
+(defn select-nodes
+  "nil / \"all\" -> every node; \"a,b\" -> those (unknown names are an error, not a
+  silent no-op that would report a healthy empty fleet)."
+  [fleet sel]
+  (let [nodes (:nodes fleet)
+        want (when (and sel (not= sel "all")) (str/split (str sel) #","))
+        known (set (map :name nodes))
+        bad (remove known want)]
+    (when (seq bad) (throw (js/Error. (str "unknown node(s): " (str/join "," bad)))))
+    (when-let [n (first (remove #(valid-host? (:host %)) (if want (filter #(contains? (set want) (:name %)) nodes) nodes)))]
+      (throw (js/Error. (str "refusing node " (:name n) ": :host " (pr-str (:host n)) " is not a plain ssh host"))))
+    (vec (if want (filter #(contains? (set want) (:name %)) nodes) nodes))))
+
+(defn node-port [fleet node]
+  (or (:port node) (:fleet/port fleet) 8077))
+
+;; ── node probe ────────────────────────────────────────────────────────────────
+
+(defn node-probe-cmd
+  "POSIX (Darwin + Linux) KEY=VALUE lines. No single quotes inside: the caller
+  quotes the whole thing once. Every field degrades to empty rather than failing,
+  so one missing tool never masks the rest.
+
+  Two things are probed for what they ARE, not for what a service manager says:
+    MESH   kotoba-server /health on this node's mesh port
+    SERVE  the mishima llama-server on `serve-port` (default 8094; gad also runs
+           embedding and Qwen servers, so \"the first llama-server\" is wrong): its
+           listen address is read from the socket table (it binds the tailnet IP,
+           not loopback) and its own /health is asked. This is the thing the fleet exists to serve.
+  PLIST says whether a mesh LaunchAgent is installed — the only honest signal
+  that the mesh is EXPECTED here (launchctl is unusable over ssh on this fleet)."
+  [port serve-port]
+  (str "echo LOAD=$(uptime | sed \"s/.*load average[s]*: *//\" | awk \"{print \\$1}\" | tr -d ,);"
+       " echo NCPU=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null);"
+       " echo DISK=$(df -k / | awk \"NR==2{gsub(\\\"%\\\",\\\"\\\",\\$5);print \\$5}\");"
+       " echo DISK_AVAIL_GB=$(df -k / | awk \"NR==2{print int(\\$4/1048576)}\");"
+       " b=$(sysctl -n kern.boottime 2>/dev/null | sed \"s/.*sec = \\([0-9]*\\).*/\\1/\");"
+       " if [ -n \"$b\" ]; then echo UPTIME_S=$(( $(date +%s) - b ));"
+       " else echo UPTIME_S=$(cut -d. -f1 /proc/uptime 2>/dev/null); fi;"
+       " f=$(sysctl -n net.inet.ip.portrange.first 2>/dev/null); l=$(sysctl -n net.inet.ip.portrange.last 2>/dev/null);"
+       " if [ -n \"$f\" ] && [ -n \"$l\" ]; then"
+       "   echo PORTS_PCT=$(( 100 * $(netstat -an -p tcp 2>/dev/null | grep -c TIME_WAIT) / (l - f + 1) )); fi;"
+       " echo MESH=$(curl -s -m 3 -o /dev/null -w %{http_code} http://127.0.0.1:" port "/health);"
+       " echo PLIST=$(ls $HOME/Library/LaunchAgents 2>/dev/null | grep -c murakumo-mesh);"
+       " a=$( (lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk -v p=" serve-port " \"\\$9 ~ (\\\":\\\" p \\\"\\$\\\") {print \\$9; exit}\") );"
+       " [ -z \"$a\" ] && a=$(ss -ltn 2>/dev/null | awk -v p=" serve-port " \"\\$4 ~ (\\\":\\\" p \\\"\\$\\\") {print \\$4; exit}\");"
+       " a=$(echo \"$a\" | sed \"s/^\\*:/127.0.0.1:/; s/^0\\.0\\.0\\.0:/127.0.0.1:/; s/^\\[::\\]:/127.0.0.1:/\");"
+       " echo LLAMA_PROCS=$(pgrep -f \"[l]lama-server\" 2>/dev/null | wc -l | tr -d \" \");"
+       " if [ -n \"$a\" ]; then echo SERVE=$(curl -s -m 4 -o /dev/null -w %{http_code} http://$a/health); fi;"
+       " true"))
+
+(defn- sq [s] (str "'" (str/replace (str s) #"'" "'\\''") "'"))
+
+(defn fanout-script
+  "One local shell script: ssh every node in the background, tag each output line
+  with `N:<name>:`, wait. The remote command is passed through a quoted variable,
+  never interpolated into a command line."
+  [entries timeout-s]
+  (str "T=" (long timeout-s) "\n"
+       (str/join
+        "\n"
+        (for [{:keys [name host cmd]} entries]
+          (str "( R=" (sq cmd) "; "
+               "out=$(ssh -o BatchMode=yes -o ConnectTimeout=$T -o StrictHostKeyChecking=accept-new -- "
+               (sq host) " \"$R\" 2>&1); rc=$?; "
+               "printf '%s\\n' \"$out\" | sed " (sq (str "s/^/N:" name ":/")) "; "
+               "echo " (sq (str "N:" name ":RC=")) "$rc ) &")))
+       "\nwait\n"))
+
+(defn parse-fanout
+  "Tagged lines -> {name {:rc n :kv {..} :raw [non-kv lines]}}. Names may contain
+  '-' and digits; the tag is `N:<name>:` up to the FIRST colon after the name."
+  [text names]
+  (let [by (into {} (map (fn [n] [n {:rc nil :kv {} :raw []}]) names))]
+    (reduce
+     (fn [acc line]
+       (if-let [[_ nm body] (re-matches #"N:([^:]+):(.*)" (str/trim-newline line))]
+         (if (contains? acc nm)
+           (if-let [[_ k v] (re-matches #"([A-Z_][A-Z0-9_]*)=(.*)" (str/trim body))]
+             (if (= k "RC")
+               (assoc-in acc [nm :rc] (js/parseInt v 10))
+               (assoc-in acc [nm :kv (keyword (str/lower k))] (str/trim v)))
+             (if (str/blank? body) acc (update-in acc [nm :raw] conj (str/trim body))))
+           acc)
+         acc))
+     by
+     (str/split-lines (str text)))))
+
+(defn serves-mishima? [node]
+  (boolean (some #{"mishima"} (flatten [(:node/serves node)]))))
+
+(defn node-row
+  "Parsed fan-out entry + node config -> the row `assess-node` consumes."
+  [fleet node {:keys [rc kv raw]}]
+  (let [ok? (= 0 rc)]
+    {:name (:name node)
+     :reachable ok?
+     :error (when-not ok? (or (first (remove #(str/includes? % "Permanently added") raw))
+                              (str "ssh exit " rc)))
+     :serves (serves-mishima? node)
+     :mesh-expected (or (boolean (:health/expect-mesh node))
+                        (boolean (some-> (:plist kv) num* pos?)))
+     :restart-cmd (:health/restart-cmd node)
+     :load (num* (:load kv))
+     :ncpu (num* (:ncpu kv))
+     :disk-pct (num* (:disk kv))
+     :disk-avail-gb (num* (:disk_avail_gb kv))
+     :uptime-s (num* (:uptime_s kv))
+     :llama-procs (num* (:llama_procs kv))
+     :serve (:serve kv)
+     :ports-pct (num* (:ports_pct kv))
+     :mesh (:mesh kv)}))
+
+(defn probe-nodes!
+  "Parallel ssh to every selected node. Returns [row ...] in fleet order."
+  [fleet nodes {:keys [timeout-s] :or {timeout-s 8}}]
+  (let [entries (mapv (fn [n] {:name (:name n) :host (:host n)
+                               :cmd (node-probe-cmd (node-port fleet n) (or (:health/serve-port n) 8094))})
+                      nodes)
+        r (bench/sh ["sh" "-c" (fanout-script entries timeout-s)]
+                    {:timeout-ms (* 1000 (+ timeout-s 25))})
+        parsed (parse-fanout (:stdout r) (map :name nodes))]
+    (mapv (fn [n] (node-row fleet n (get parsed (:name n)))) nodes)))
+
+;; ── gateway probe ─────────────────────────────────────────────────────────────
+
+(defn gateway-base []
+  (or (aget js/process.env "MURAKUMO_LLM_URL") "https://api.murakumo.cloud"))
+
+(defn- curl [argv timeout-s]
+  (bench/sh (into ["curl" "-s" "-m" (str timeout-s)] argv) {:timeout-ms (* 1000 (+ timeout-s 5))}))
+
+(defn- timed-get [url]
+  (let [r (curl ["-o" "-" "-w" "\n%{http_code} %{time_total}" url] 15)
+        out (str (:stdout r))
+        i (str/last-index-of out "\n")
+        body (if i (subs out 0 i) "")
+        [code secs] (str/split (str/trim (if i (subs out (inc i)) out)) #" ")]
+    {:code (js/parseInt (or code "0") 10) :seconds (num* secs) :body body}))
+
+(defn parse-models
+  "OpenAI /v1/models body -> vector of ids (empty on any parse failure — an
+  unparseable catalog must read as 'no models', not as healthy)."
+  [body]
+  (try (->> (:data (js->clj (js/JSON.parse body) :keywordize-keys true)) (mapv :id))
+       (catch :default _ [])))
+
+(defn parse-canary
+  "chat/completions response (llama.cpp shape) + curl's trailer -> canary row."
+  [out]
+  (let [i (str/last-index-of out "\n")
+        body (if i (subs out 0 i) "")
+        [code secs] (str/split (str/trim (if i (subs out (inc i)) out)) #" ")
+        d (try (js->clj (js/JSON.parse body) :keywordize-keys true) (catch :default _ nil))
+        t (:timings d)]
+    {:ok (and (= 200 (js/parseInt (or code "0") 10))
+              (pos? (or (get-in d [:usage :completion_tokens]) 0)))
+     :code (js/parseInt (or code "0") 10)
+     :total-s (num* secs)
+     :tok-s (some-> (or (:predicted_per_second t)
+                        (let [n (get-in d [:usage :completion_tokens]) s (num* secs)]
+                          (when (and n s (pos? s)) (/ n s))))
+                    num* round1)
+     :prompt-tok-s (some-> (:prompt_per_second t) num* round1)
+     :error (get-in d [:error :message])}))
+
+(defn probe-gateway!
+  "/health, /v1/models and (opt-in) a tiny completion. The canary spends real
+  inference capacity, so it is a flag, not a default."
+  [{:keys [canary model base] :or {model "mishima"}}]
+  (let [base (or base (gateway-base))
+        h (timed-get (str base "/health"))
+        m (timed-get (str base "/v1/models"))
+        ids (parse-models (:body m))
+        c (when canary
+            (let [r (curl ["-H" "content-type: application/json"
+                           "-d" (js/JSON.stringify
+                                 (clj->js {:model model :max_tokens 16 :temperature 0
+                                           :messages [{:role "user"
+                                                       :content "Reply with the number only: 7 times 6?"}]}))
+                           "-w" "\n%{http_code} %{time_total}"
+                           (str base "/v1/chat/completions")] 90)]
+              (assoc (parse-canary (str (:stdout r))) :model model)))]
+    {:base base
+     :health-code (:code h) :health-s (:seconds h)
+     :models-code (:code m) :models-s (:seconds m)
+     :model-ids ids
+     :canary c}))
+
+;; ── assess (pure) ─────────────────────────────────────────────────────────────
+
+(def ^:private sev-rank {:ok 0 :warn 1 :crit 2})
+(defn- worst [sevs] (reduce (fn [a b] (if (> (sev-rank b) (sev-rank a)) b a)) :ok sevs))
+(defn- f [sev code msg] {:sev sev :code code :msg msg})
+
+(defn assess-node
+  "row -> {:node :status :findings}. An unreachable node reports ONLY that: every
+  other field is unknown, and inventing values for them would bury the one true
+  finding under noise."
+  ([row] (assess-node default-thresholds row))
+  ([th row]
+   (let [{:keys [name reachable serves mesh-expected load ncpu disk-pct disk-avail-gb uptime-s ports-pct mesh serve llama-procs error]} row
+         lpc (when (and load ncpu (pos? ncpu)) (/ load ncpu))
+         exhausted? (and ports-pct (>= ports-pct (:ports-pct-crit th)))
+         findings
+         (if-not reachable
+           [(f :crit :unreachable (str "ssh failed: " (or error "no answer")))]
+           (cond-> []
+             (and (nil? load) (nil? ncpu))
+             (conj (f :warn :probe-empty "ssh worked but the probe returned no data (non-POSIX login shell?) — this node is NOT verified healthy"))
+             (and lpc (>= lpc (:load-per-core-crit th)))
+             (conj (f :crit :load (str "load " load " on " ncpu " cores")))
+             (and lpc (< lpc (:load-per-core-crit th)) (>= lpc (:load-per-core-warn th)))
+             (conj (f :warn :load (str "load " load " on " ncpu " cores")))
+             (and disk-pct (>= disk-pct (:disk-pct-crit th)))
+             (conj (f :crit :disk (str "root filesystem " disk-pct "% full" (when disk-avail-gb (str ", " disk-avail-gb " GB free")))))
+             (and disk-pct (< disk-pct (:disk-pct-crit th)) (>= disk-pct (:disk-pct-warn th)))
+             (conj (f :warn :disk (str "root filesystem " disk-pct "% full")))
+             exhausted?
+             (conj (f :crit :port-exhausted
+                      (str "TIME_WAIT at " ports-pct "% of the ephemeral range: outbound is wedged; "
+                           "health failing here is this node's client side, not kotoba-server")))
+             (and ports-pct (not exhausted?) (>= ports-pct (:ports-pct-warn th)))
+             (conj (f :warn :ports (str "TIME_WAIT at " ports-pct "% of the ephemeral range")))
+             (and mesh-expected (not= mesh "200") (not exhausted?))
+             (conj (f :crit :mesh-down (str "kotoba-server /health answered " (or (not-empty mesh) "nothing")
+                                            " (a mesh LaunchAgent is installed here)")))
+             (and serves (not exhausted?) (or (nil? llama-procs) (zero? llama-procs)))
+             (conj (f :crit :serving-down "declared to serve mishima but no llama-server process is running"))
+             (and serves (not exhausted?) llama-procs (pos? llama-procs) (not= serve "200"))
+             (conj (f :crit :serving-down (str "llama-server is running but its /health answered "
+                                               (or (not-empty serve) "nothing"))))
+             (and uptime-s (< uptime-s (:reboot-recent-s th)))
+             (conj (f :warn :rebooted (str "up only " (long uptime-s) "s")))))]
+     {:node name
+      :status (worst (map :sev findings))
+      :findings findings})))
+
+(defn assess-gateway
+  "gateway probe + baseline (median canary tok/s and latency from history)."
+  ([g baseline] (assess-gateway default-thresholds g baseline))
+  ([th g baseline]
+   (let [{:keys [health-code health-s models-code model-ids canary]} g
+         c canary
+         findings
+         (cond-> []
+           (not= 200 health-code) (conj (f :crit :gateway-down (str "/health answered " health-code)))
+           (and (= 200 health-code) health-s (>= health-s (:gateway-health-crit-s th)))
+           (conj (f :crit :gateway-slow (str "/health took " health-s "s")))
+           (and (= 200 health-code) health-s (< health-s (:gateway-health-crit-s th))
+                (>= health-s (:gateway-health-warn-s th)))
+           (conj (f :warn :gateway-slow (str "/health took " health-s "s")))
+           (or (not= 200 models-code) (empty? model-ids))
+           (conj (f :crit :no-models (str "/v1/models answered " models-code " with " (count model-ids) " model(s)")))
+           (and c (not (:ok c)))
+           (conj (f :crit :canary-failed (str "completion failed (HTTP " (:code c) ") "
+                                              (or (:error c) ""))))
+           (and c (:ok c) (:tok-s c) (:tok-s baseline)
+                (< (:tok-s c) (* (:canary-drop-crit th) (:tok-s baseline))))
+           (conj (f :crit :canary-slow (str "canary " (:tok-s c) " tok/s vs baseline " (:tok-s baseline))))
+           (and c (:ok c) (:tok-s c) (:tok-s baseline)
+                (>= (:tok-s c) (* (:canary-drop-crit th) (:tok-s baseline)))
+                (< (:tok-s c) (* (:canary-drop-warn th) (:tok-s baseline))))
+           (conj (f :warn :canary-slow (str "canary " (:tok-s c) " tok/s vs baseline " (:tok-s baseline))))
+           (and c (:ok c) (:total-s c) (:total-s baseline)
+                (> (:total-s c) (* (:canary-slow-warn th) (:total-s baseline))))
+           (conj (f :warn :canary-latency (str "canary took " (:total-s c) "s vs baseline " (:total-s baseline) "s"))))]
+     {:status (worst (map :sev findings)) :findings findings})))
+
+(defn baseline
+  "Median canary tok/s and latency over the last `:baseline-n` snapshots that
+  carried a successful canary. nil fields until there is history to compare to —
+  no baseline means no regression verdict, not a made-up one."
+  ([snaps] (baseline default-thresholds snaps))
+  ([th snaps]
+   (let [cs (->> snaps
+                 (keep #(get-in % [:health/gateway :canary]))
+                 (filter :ok)
+                 (take-last (:baseline-n th)))]
+     {:tok-s (median (map :tok-s cs))
+      :total-s (median (map :total-s cs))
+      :n (count cs)})))
+
+(defn assess-fleet
+  "rows + gateway probe + snapshots history -> the verdict.
+
+  verdict  critical  gateway critical, or fewer than 60% of nodes reachable
+           degraded  any crit/warn finding
+           healthy   none
+  score    100 * (ok + 0.5 warn) / nodes, minus 25 for a critical gateway and 10
+           for a warning one; clamped to 0..100."
+  ([rows g history] (assess-fleet default-thresholds rows g history))
+  ([th rows g history]
+   (let [nodes (mapv #(assess-node th %) rows)
+         gw (when g (assess-gateway th g (baseline th history)))
+         n (count nodes)
+         cnt (fn [s] (count (filter #(= s (:status %)) nodes)))
+         reach (count (filter :reachable rows))
+         raw (if (zero? n) 0 (* 100 (/ (+ (cnt :ok) (* 0.5 (cnt :warn))) n)))
+         pen (case (:status gw) :crit 25 :warn 10 0)
+         score (max 0 (min 100 (js/Math.round (- raw pen))))
+         serving (filter :serves rows)
+         serving-ok (count (filter (fn [r] (let [a (first (filter #(= (:name r) (:node %)) nodes))]
+                                             (and (:reachable r)
+                                                  (not-any? #(contains? #{:serving-down :probe-empty} (:code %)) (:findings a)))))
+                                   serving))
+         verdict (cond
+                   (or (= :crit (:status gw)) (and (pos? n) (< (/ reach n) 0.6))
+                       (and (seq serving) (zero? serving-ok))) :critical
+                   (or (pos? (cnt :crit)) (pos? (cnt :warn)) (= :warn (:status gw))) :degraded
+                   :else :healthy)]
+     {:verdict verdict
+      :score score
+      :reachable (str reach "/" n)
+      :counts {:ok (cnt :ok) :warn (cnt :warn) :crit (cnt :crit)}
+      :gateway (when g (merge {:status (:status gw) :findings (:findings gw)}
+                              (select-keys g [:health-code :health-s :models-code :model-ids :canary])))
+      :nodes nodes})))
+
+;; ── SLO / stability from the series ───────────────────────────────────────────
+
+(defn slo
+  "Availability, flapping and canary drift over the last `window` snapshots.
+
+  A node is 'available' in a sample when its status is not crit. Flapping is
+  counted on transitions ACROSS the crit boundary (ok<->warn is not an outage): a node that is crit for ten samples in a row is
+  down (availability shows it); one that alternates ok/crit is unstable, and the
+  availability number alone would hide that as ~50%."
+  ([snaps window] (slo default-thresholds snaps window))
+  ([th snaps window]
+   (let [w (vec (take-last window snaps))
+         n (count w)
+         names (distinct (mapcat (comp keys :health/nodes) w))
+         per (mapv
+              (fn [nm]
+                (let [seq* (keep #(get-in % [:health/nodes nm]) w)
+                      sts (mapv keyword seq*)
+                      up (count (remove #{:crit} sts))
+                      changes (count (filter true? (map (fn [a b] (not= (= :crit a) (= :crit b))) sts (rest sts))))]
+                  {:node (name nm)
+                   :samples (count sts)
+                   :availability (when (pos? (count sts)) (round1 (* 100 (/ up (count sts)))))
+                   :status-changes changes
+                   :flapping (>= changes (:flap-changes th))
+                   :last (name (or (last sts) :ok))}))
+              names)
+         gw-ok (count (filter #(= "ok" (get-in % [:health/gateway :status])) w))
+         gw-avail (when (pos? n) (round1 (* 100 (/ (count (filter #(not= "crit" (get-in % [:health/gateway :status])) w)) n))))
+         scores (keep :health/score w)]
+     {:window n
+      :from (:health/at (first w))
+      :to (:health/at (last w))
+      :fleet-score-median (median scores)
+      :fleet-score-min (when (seq scores) (apply min scores))
+      :gateway-availability gw-avail
+      :gateway-ok-samples gw-ok
+      :canary-baseline (baseline th snaps)
+      :flapping (mapv :node (filter :flapping per))
+      :least-available (vec (take 5 (sort-by :availability per)))
+      :nodes per})))
+
+;; ── ledger rows ───────────────────────────────────────────────────────────────
+
+(defn snapshot-row
+  "Compact, joinable summary of one check. Node findings are NOT stored — the
+  series needs status per node, and the findings are re-derivable from the probe."
+  [at a]
+  {:health/kind "snapshot"
+   :health/at at
+   :health/verdict (name (:verdict a))
+   :health/score (:score a)
+   :health/nodes (into {} (map (fn [x] [(:node x) (name (:status x))]) (:nodes a)))
+   :health/gateway (when-let [g (:gateway a)]
+                     {:status (name (:status g))
+                      :health-s (:health-s g)
+                      :canary (:canary g)})})
+
+;; ── heal ──────────────────────────────────────────────────────────────────────
+
+(defn last-heal-s
+  "Seconds since `node` was last healed, or nil. `now-ms` is a parameter so the
+  cooldown is testable without a clock."
+  [heal-rows node now-ms]
+  (when-let [t (->> heal-rows (filter #(= node (:health/node %))) last :health/at)]
+    (/ (- now-ms (js/Date.parse t)) 1000)))
+
+(defn heal-plan
+  "assessment (with :rows) + ledger heal rows -> [{:node :action :reason :executable :blocked}].
+
+  A restart is offered only for :mesh-down / :serving-down on a node whose own
+  fleet.edn entry declares `:health/restart-cmd`; otherwise the same finding is
+  advice. `:blocked` is nil when the action may run. Advice entries have
+  :executable false and are never applied, whatever flags are passed."
+  ([a heal-rows now-ms] (heal-plan default-thresholds a heal-rows now-ms))
+  ([th a heal-rows now-ms]
+   (let [cmds (into {} (map (fn [r] [(:name r) (:restart-cmd r)]) (:rows a)))
+         fixable #{:mesh-down :serving-down}
+         wedged (filter (fn [x] (some #(contains? fixable (:code %)) (:findings x))) (:nodes a))
+         unreachable (filter (fn [x] (some #(= :unreachable (:code %)) (:findings x))) (:nodes a))
+         ;; unreachable nodes are affected too (their expectations are unknown),
+         ;; so 6 dark nodes + 2 wedged ones is a shared cause, not two local ones
+         affected (count (filter #(or (:mesh-expected %) (:serves %) (not (:reachable %))) (:rows a)))
+         down (+ (count wedged) (count unreachable))
+         correlated? (and (pos? affected) (> down 1)
+                          (>= (/ down affected) (:heal-correlated-fraction th)))]
+     (vec
+      (concat
+       (for [x wedged
+             :let [cmd (get cmds (:node x))
+                   since (last-heal-s heal-rows (:node x) now-ms)
+                   msg (->> (:findings x) (filter #(contains? fixable (:code %))) first :msg)]]
+         (if-not cmd
+           {:node (:node x) :action :advise :executable false :reason msg
+            :advice "no :health/restart-cmd declared for this node in fleet.edn — restart by hand, then record the verified command there so heal can do it next time"}
+           {:node (:node x) :action :restart :executable true :reason msg :command cmd
+            :blocked (cond
+                       correlated?
+                       (str down " of " affected " expected nodes are down together — a shared cause; "
+                            "restarting each would erase the evidence and the surviving capacity")
+                       (and since (< since (:heal-cooldown-s th)))
+                       (str "healed " (long since) "s ago (cooldown " (:heal-cooldown-s th) "s) — "
+                            "the restart did not hold; investigate instead of retrying"))}))
+       (for [x (:nodes a) fd (:findings x)
+             :let [advice (case (:code fd)
+                            :unreachable "check power/network/Tailscale; nothing can be done over ssh"
+                            :port-exhausted "drain TIME_WAIT / stop the client that leaks connections (ADR-260902-fleet-outbound-hygiene); do NOT restart the server"
+                            :load "find the resident job; the fleet is one slot per node, so a second workload is a placement bug"
+                            :disk "free space (model caches, evicted-by-murakumo/, logs, flash images) before the next model pull"
+                            nil)]
+             :when advice]
+         {:node (:node x) :action :advise :executable false :reason (:msg fd) :advice advice}))))))
+
+(defn apply-heal!
+  "Run each executable, unblocked action over ssh and append a heal row for it.
+  Returns the plan with :result filled in. Never throws for one node's failure."
+  [fleet plan {:keys [only ledger now]}]
+  (let [hosts (into {} (map (fn [n] [(:name n) (:host n)]) (:nodes fleet)))]
+    (mapv
+     (fn [p]
+       (if (and (:executable p) (nil? (:blocked p))
+                (valid-host? (get hosts (:node p)))
+                (or (nil? only) (= only (:node p))))
+         (let [r (bench/sh ["ssh" "-o" "BatchMode=yes" "-o" "ConnectTimeout=8" "--"
+                            (get hosts (:node p)) (:command p)]
+                           {:timeout-ms 40000})
+               ok? (zero? (:status r))]
+           (bench/append-row! ledger {:health/kind "heal"
+                                      :health/at (.toISOString (js/Date. now))
+                                      :health/node (:node p)
+                                      :health/action (name (:action p))
+                                      :health/command (:command p)
+                                      :health/ok ok?
+                                      :health/detail (str/trim (str (:stderr r)))})
+           (assoc p :result {:ok ok? :detail (str/trim (str (:stdout r) (:stderr r)))}))
+         (assoc p :result (cond (not (:executable p)) :advice-only
+                                (:blocked p) :blocked
+                                :else :not-selected))))
+     plan)))
+
+;; ── one check (shared by CLI and MCP) ─────────────────────────────────────────
+
+(defn run-check!
+  "Probe, assess, and (unless :record false) append a snapshot. Returns the
+  assessment with :at and :rows attached so heal can reuse it without re-probing."
+  [{:keys [fleet nodes canary record ledger model timeout-s thresholds]
+    :or {record true}}]
+  (let [th (merge default-thresholds thresholds)
+        fl (load-fleet fleet)
+        sel (select-nodes fl nodes)
+        rows (probe-nodes! fl sel {:timeout-s (or timeout-s 8)})
+        g (probe-gateway! {:canary canary :model (or model "mishima")})
+        p (or ledger (ledger-path))
+        history (snapshots (:rows (read-ledger p)))
+        a (assoc (assess-fleet th rows g history) :rows rows)
+        at (.toISOString (js/Date.))]
+    (when record (bench/append-row! p (snapshot-row at a)))
+    (assoc a :at at :ledger (when record p) :fleet-file fleet)))
+
+;; ── presentation ──────────────────────────────────────────────────────────────
+
+(defn- mark [s] (case s :ok "ok  " :warn "WARN" :crit "CRIT" "?   "))
+
+(defn print-check [a]
+  (println (str "fleet " (str/upper (name (:verdict a))) "  score " (:score a) "/100  reachable "
+                (:reachable a) "  ok/warn/crit " (get-in a [:counts :ok]) "/" (get-in a [:counts :warn])
+                "/" (get-in a [:counts :crit])))
+  (when-let [g (:gateway a)]
+    (println (str "gateway " (mark (:status g)) " health=" (:health-code g) " " (:health-s g) "s"
+                  " models=" (count (:model-ids g))
+                  (when-let [c (:canary g)]
+                    (str " canary=" (if (:ok c) (str (:tok-s c) "tok/s " (:total-s c) "s") "FAILED")))))
+    (doseq [x (:findings g)] (println (str "    - " (:msg x)))))
+  (doseq [x (:nodes a)]
+    (println (str (mark (:status x)) " " (:node x)
+                  (when (seq (:findings x)) (str "  " (str/join "; " (map :msg (:findings x)))))))))
+
+(defn print-slo [s]
+  (println (str "window " (:window s) " checks  " (:from s) " .. " (:to s)))
+  (println (str "fleet score median " (:fleet-score-median s) " min " (:fleet-score-min s)
+                "   gateway availability " (:gateway-availability s) "%"))
+  (let [b (:canary-baseline s)]
+    (println (str "canary baseline " (or (:tok-s b) "-") " tok/s " (or (:total-s b) "-") "s (n=" (:n b) ")")))
+  (when (seq (:flapping s)) (println (str "FLAPPING: " (str/join ", " (:flapping s)))))
+  (doseq [x (:nodes s)]
+    (println (str (:node x) "  " (:availability x) "%  changes=" (:status-changes x) "  last=" (:last x)))))
+
+(defn print-plan [plan]
+  (if (empty? plan)
+    (println "nothing to heal")
+    (doseq [p plan]
+      (println (str (:node p) "  " (name (:action p))
+                    (cond (:advice p) (str "  advice: " (:advice p))
+                          (:blocked p) (str "  BLOCKED: " (:blocked p))
+                          :else (str "  would run: " (:command p)))
+                    (when-let [r (:result p)] (str "  => " (pr-str r))))))))
+
+;; ── cli ───────────────────────────────────────────────────────────────────────
+
+(defn usage []
+  (println "Murakumo health — is the fleet stable, and has it been.
+
+  murakumo health check [--nodes a,b] [--canary] [--no-record] [--json] [--exit-code]
+  murakumo health slo [--window 50] [--json]
+  murakumo health history [--limit 20]
+  murakumo health heal [--node NAME] [--apply] [--json]
+  murakumo health watch [--interval 300] [--canary] [--heal]
+
+  --fleet PATH     fleet inventory (default $MURAKUMO_FLEET, then ./fleet.edn)
+  --canary         also send one tiny completion through the gateway (spends inference)
+  --exit-code      exit 0 healthy / 1 degraded / 2 critical (for cron and launchd)
+  --apply          heal: actually run declared restart commands. Without it heal only prints the plan.
+
+Every check appends one line to $MURAKUMO_HEALTH_LEDGER (default
+~/.local/share/murakumo/health-ledger.jsonl). Nothing there is ever rewritten.
+Heal runs only a node's own declared :health/restart-cmd from fleet.edn, and
+refuses during a correlated outage or inside a 30-minute per-node cooldown."))
+
+(defn parse-args [args]
+  (loop [xs (vec args) acc {}]
+    (if-let [x (first xs)]
+      (if (str/starts-with? (str x) "--")
+        (let [k (subs x 2)
+              bool? (contains? #{"canary" "no-record" "json" "exit-code" "apply" "heal"} k)]
+          (if (or bool? (nil? (second xs)) (str/starts-with? (str (second xs)) "--"))
+            (recur (rest xs) (assoc acc k true))
+            (recur (drop 2 xs) (assoc acc k (second xs)))))
+        (recur (rest xs) acc))
+      acc)))
+
+(defn- int* [v d]
+  (let [n (if (string? v) (js/parseInt v 10) v)]
+    (if (and (number? n) (not (js/isNaN n)) (pos? n)) n d)))
+
+(defn- check-opts [o]
+  {:fleet (get o "fleet") :nodes (get o "nodes") :canary (boolean (get o "canary"))
+   :record (not (get o "no-record")) :model (get o "model")})
+
+(defn- emit [o a printer]
+  (if (get o "json")
+    (println (js/JSON.stringify (clj->js (dissoc a :rows)) nil 2))
+    (printer a)))
+
+(defn- exit-of [o a]
+  (if (get o "exit-code") (case (:verdict a) :healthy 0 :degraded 1 2) 0))
+
+(defn cmd-check [o]
+  (let [a (run-check! (check-opts o))]
+    (emit o a print-check)
+    (exit-of o a)))
+
+(defn cmd-slo [o]
+  (let [snaps (snapshots (:rows (read-ledger (ledger-path))))]
+    (if (empty? snaps)
+      (do (println "no health checks recorded yet — run `murakumo health check` first") 1)
+      (do (emit o (slo snaps (int* (get o "window") 50)) print-slo) 0))))
+
+(defn cmd-history [o]
+  (let [{:keys [rows bad]} (read-ledger (ledger-path))
+        lim (int* (get o "limit") 20)]
+    (doseq [r (take-last lim rows)]
+      (println (if (= "heal" (:health/kind r))
+                 (str (:health/at r) "  HEAL " (:health/node r) " " (:health/action r) " ok=" (:health/ok r))
+                 (str (:health/at r) "  " (:health/verdict r) " score=" (:health/score r)
+                      " gateway=" (get-in r [:health/gateway :status])))))
+    (println (str "ledger " (ledger-path) " rows=" (count rows) " unparseable=" bad))
+    0))
+
+(defn cmd-heal [o]
+  ;; heal judges the WHOLE fleet: a subset probe would hide a correlated outage
+  (let [a (run-check! (assoc (check-opts o) :record true :nodes nil))
+        p (ledger-path)
+        plan (heal-plan (assoc a :rows (:rows a)) (heals (:rows (read-ledger p))) (js/Date.now))
+        plan (if (get o "apply")
+               (apply-heal! (load-fleet (get o "fleet")) plan
+                            {:only (get o "node") :ledger p :now (js/Date.now)})
+               plan)]
+    (if (get o "json")
+      (println (js/JSON.stringify (clj->js plan) nil 2))
+      (do (print-check a) (println) (print-plan plan)
+          (when-not (get o "apply")
+            (println "\n(plan only — pass --apply to run the unblocked restart actions)"))))
+    (exit-of o a)))
+
+(defn cmd-watch [o]
+  (let [every (* 1000 (int* (get o "interval") 300))
+        tick (fn []
+               (try
+                 (let [a (run-check! (check-opts o))]
+                   (println (str (:at a) "  " (name (:verdict a)) " score=" (:score a) " reachable=" (:reachable a)))
+                   (when (get o "heal")
+                     (let [p (ledger-path)
+                           plan (heal-plan a (heals (:rows (read-ledger p))) (js/Date.now))
+                           done (apply-heal! (load-fleet (get o "fleet")) plan
+                                             {:ledger p :now (js/Date.now)})]
+                       (doseq [x (filter #(map? (:result %)) done)]
+                         (println (str "  healed " (:node x) " " (pr-str (:result x))))))))
+                 (catch :default e (println (str "watch: check failed: " (.-message e))))))]
+    (tick)
+    (js/setInterval tick every)
+    nil))
+
+(defn run-command
+  "Entry point for `murakumo health <command> …`. Returns the exit code (or nil
+  for `watch`, which keeps the process alive)."
+  [command args]
+  (let [o (parse-args args)
+        commands {"check" cmd-check "slo" cmd-slo "history" cmd-history
+                  "heal" cmd-heal "watch" cmd-watch}]
+    (if-let [f (get commands command)]
+      (try (f o) (catch :default e (println (.-message e)) 1))
+      (do (usage) (if (contains? #{nil "help" "--help"} command) 0 1)))))

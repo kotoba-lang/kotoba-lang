@@ -1,0 +1,360 @@
+(ns kotoba.protocol.install
+  "Portable policy for installing and launching content-addressed L5 apps.
+
+  This namespace consumes a release descriptor only after the Awai/host adapter
+  has verified its signature, chain position, and manifest bytes. It does not
+  perform DNSSEC, signature, CID-byte, transport, or DNA validation. The
+  adapter supplies those verified facts; this namespace keeps install/update,
+  capability, cell-migration, and offline-launch decisions consistent across
+  hosts."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.protocol.app :as app]
+            [kotoba.protocol.cid :as cid]
+            [kotoba.protocol.vocab :as vocab]))
+
+(def install-lock-schema "kotoba.app.install-lock.v1")
+
+(defn canonical-domain?
+  "True for a lower-case, dot-separated DNS A-label hostname without a trailing
+  dot. IDNs must already be converted to their canonical xn-- form by the DNS
+  adapter."
+  [domain]
+  (boolean (and (string? domain)
+                (<= (count domain) 253)
+                (re-matches #"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+"
+                            domain))))
+
+(defn- ordered-distinct [xs]
+  (reduce (fn [out x] (if (some #{x} out) out (conj out x))) [] xs))
+
+(defn- cidv1? [value]
+  (boolean (and (vocab/cid? value)
+                (not (:error (cid/parse-cid value))))))
+
+(defn- install-manifest-problems [manifest]
+  (if-not (map? manifest)
+    [{:field :manifest :error :not-a-map}]
+    (let [caps (:kotoba.app/caps manifest [])
+          cells (:kotoba.app/cells manifest [])
+          safe-manifest (cond-> manifest
+                          (not (sequential? caps))
+                          (assoc :kotoba.app/caps [])
+                          (not (sequential? cells))
+                          (assoc :kotoba.app/cells []))
+          problems (cond-> (app/validate-manifest safe-manifest)
+                     (and (contains? manifest :kotoba.app/caps)
+                          (not (sequential? caps)))
+                     (conj {:field :kotoba.app/caps :error :invalid-capabilities})
+
+                     (and (contains? manifest :kotoba.app/cells)
+                          (not (sequential? cells)))
+                     (conj {:field :kotoba.app/cells :error :invalid-cells}))]
+      (cond-> problems
+        (not (cidv1? (:kotoba.app/bundle-cid manifest)))
+        (conj {:field :kotoba.app/bundle-cid
+               :error :immutable-bundle-required})
+
+        (and (sequential? caps) (not= (count caps) (count (set caps))))
+        (conj {:field :kotoba.app/caps :error :duplicate-capability})
+
+        (and (sequential? cells) (seq cells) (not (vocab/app-cells? cells)))
+        (conj {:field :kotoba.app/cells :error :invalid-cells})))))
+
+(defn verified-release-problems
+  "Validate the adapter's verified release descriptor. `:verified? true` is a
+  trusted-boundary assertion by the caller, not a cryptographic check here."
+  [release]
+  (let [manifest (:manifest release)]
+    (cond-> []
+      (not (map? release))
+      (conj {:field :release :error :not-a-map})
+
+      (not (true? (:verified? release)))
+      (conj {:field :verified? :error :release-not-verified})
+
+      (not (vocab/reverse-dns-id? (:app-id release)))
+      (conj {:field :app-id :error :invalid-app-id})
+
+      (not (and (string? (:channel release))
+                (not (str/blank? (:channel release)))))
+      (conj {:field :channel :error :invalid-channel})
+
+      (not (vocab/did-key? (:publisher-did release)))
+      (conj {:field :publisher-did :error :invalid-publisher})
+
+      (not (cidv1? (:release-cid release)))
+      (conj {:field :release-cid :error :invalid-cid})
+
+      (not (cidv1? (:manifest-cid release)))
+      (conj {:field :manifest-cid :error :invalid-cid})
+
+      (not (and (integer? (:sequence release)) (pos? (:sequence release))))
+      (conj {:field :sequence :error :invalid-sequence})
+
+      (not= (:app-id release) (:kotoba.app/id manifest))
+      (conj {:field :app-id :error :manifest-app-id-mismatch})
+
+      :always
+      (into (install-manifest-problems manifest)))))
+
+(defn- release->lock [release]
+  (let [manifest (:manifest release)]
+    {:schema install-lock-schema
+     :app-id (:kotoba.app/id manifest)
+     :version (:kotoba.app/version manifest)
+     :channel (:channel release)
+     :publisher-did (:publisher-did release)
+     :release-sequence (:sequence release)
+     :release-cid (:release-cid release)
+     :manifest-cid (:manifest-cid release)
+     :bundle-cid (:kotoba.app/bundle-cid manifest)
+     :cells (vec (:kotoba.app/cells manifest []))
+     :requested-caps (ordered-distinct (:kotoba.app/caps manifest []))}))
+
+(defn create-install-lock
+  "Create the portable immutable-identity portion of a local install lock.
+
+  `release` is the normalized output of a trusted adapter. Local user approvals,
+  domain bindings, and paths are intentionally not written into this lock."
+  [release]
+  (let [problems (verified-release-problems release)]
+    (if (seq problems)
+      {:error :invalid-release :problems problems}
+      {:ok (release->lock release)})))
+
+(defn resolve-entry
+  "Resolve a public DNS entry through independently verified facts.
+
+  `binding` is the latest verified Awai `:domain/bind` record and its entry CID;
+  `txt-proof` is a fresh DNS read of `awai-app=<binding CID>` for that domain;
+  `release` is the selected verified channel head with its manifest. The
+  domain-owner DID is authenticated by the Awai record validator, while the
+  TXT record proves control of the DNS name. This function does not query DNS,
+  validate signatures, or fetch bytes."
+  [domain binding txt-proof release now]
+  (let [release-problems (verified-release-problems release)
+        binding-owner (:domain-owner-did binding)]
+    (cond
+      (not (canonical-domain? domain))
+      {:decision :refuse :error :invalid-domain}
+
+      (not (map? binding))
+      {:decision :refuse :error :missing-binding}
+
+      (not (true? (:verified? binding)))
+      {:decision :refuse :error :binding-not-verified}
+
+      (not= domain (:domain binding))
+      {:decision :refuse :error :binding-domain-mismatch}
+
+      (not (cidv1? (:entry-cid binding)))
+      {:decision :refuse :error :invalid-binding-cid}
+
+      (not (and (nat-int? now) (nat-int? (:expires-at binding))))
+      {:decision :refuse :error :invalid-binding-clock}
+
+      (<= (:expires-at binding) now)
+      {:decision :refuse :error :binding-expired}
+
+      (not (map? txt-proof))
+      {:decision :refuse :error :missing-domain-proof}
+
+      (not (and (true? (:verified? txt-proof))
+                (true? (:fresh? txt-proof))))
+      {:decision :refuse :error :domain-proof-not-fresh}
+
+      (not= domain (:domain txt-proof))
+      {:decision :refuse :error :domain-proof-name-mismatch}
+
+      (not (cidv1? (:binding-cid txt-proof)))
+      {:decision :refuse :error :invalid-domain-proof-cid}
+
+      (not= (:entry-cid binding) (:binding-cid txt-proof))
+      {:decision :refuse :error :domain-proof-binding-mismatch}
+
+      (not (vocab/did-key? binding-owner))
+      {:decision :refuse :error :invalid-domain-owner}
+
+      (seq release-problems)
+      {:decision :refuse :error :invalid-release :problems release-problems}
+
+      (not= (:app-id binding) (:app-id release))
+      {:decision :refuse :error :binding-app-mismatch}
+
+      (not= (:publisher-did binding) (:publisher-did release))
+      {:decision :refuse :error :binding-publisher-mismatch}
+
+      (not= (:channel binding) (:channel release))
+      {:decision :refuse :error :binding-channel-mismatch}
+
+      :else
+      {:decision :resolved
+       :domain domain
+       :binding-cid (:entry-cid binding)
+       :binding-sequence (:sequence binding)
+       :binding-expires-at (:expires-at binding)
+       :app-id (:app-id release)
+       :publisher-did (:publisher-did release)
+       :channel (:channel release)
+       :release-sequence (:sequence release)
+       :release-cid (:release-cid release)
+       :manifest-cid (:manifest-cid release)
+       :install-lock (:ok (create-install-lock release))})))
+
+(defn install-lock-problems
+  "Return structural problems for a stored install lock. The host must also
+  authenticate/protect its local state; this is not an on-disk MAC."
+  [lock]
+  (let [cells (:cells lock)
+        caps (:requested-caps lock)]
+    (cond-> []
+      (not (map? lock))
+      (conj {:field :lock :error :not-a-map})
+
+      (not= install-lock-schema (:schema lock))
+      (conj {:field :schema :error :unsupported-schema})
+
+      (not (vocab/reverse-dns-id? (:app-id lock)))
+      (conj {:field :app-id :error :invalid-app-id})
+
+      (not (vocab/version? (:version lock)))
+      (conj {:field :version :error :invalid-version})
+
+      (not (and (string? (:channel lock))
+                (not (str/blank? (:channel lock)))))
+      (conj {:field :channel :error :invalid-channel})
+
+      (not (vocab/did-key? (:publisher-did lock)))
+      (conj {:field :publisher-did :error :invalid-publisher})
+
+      (not (and (integer? (:release-sequence lock))
+                (pos? (:release-sequence lock))))
+      (conj {:field :release-sequence :error :invalid-sequence})
+
+      (not (cidv1? (:release-cid lock)))
+      (conj {:field :release-cid :error :invalid-cid})
+
+      (not (cidv1? (:manifest-cid lock)))
+      (conj {:field :manifest-cid :error :invalid-cid})
+
+      (not (cidv1? (:bundle-cid lock)))
+      (conj {:field :bundle-cid :error :invalid-cid})
+
+      (not (and (vector? cells)
+                (or (empty? cells) (vocab/app-cells? cells))))
+      (conj {:field :cells :error :invalid-cells})
+
+      (not (and (vector? caps)
+                (= (count caps) (count (set caps)))
+                (empty? (app/unknown-caps caps))))
+      (conj {:field :requested-caps :error :invalid-capabilities}))))
+
+(defn- cell-map [cells]
+  (into {} (map (juxt :id :dna-cid)) cells))
+
+(defn- cell-changes [before after]
+  (let [old (cell-map before)
+        new (cell-map after)
+        ids (sort (into (set (keys old)) (keys new)))]
+    (into [] (keep (fn [id]
+                     (let [from (get old id) to (get new id)]
+                       (when (not= from to)
+                         {:cell-id id :from-dna-cid from :to-dna-cid to}))))
+          ids)))
+
+(defn- ordered-set-difference [left right]
+  (let [right (set right)]
+    (into [] (remove right) left)))
+
+(defn plan-update
+  "Compare a verified candidate release with an installed lock.
+
+  Updates by another publisher or a non-advancing chain sequence are refused.
+  New requested capabilities are reported for consent and never granted here.
+  Any cell addition, removal, or DNA CID change requires a runtime migration
+  receipt before the app host may commit the update."
+  [current release]
+  (let [lock-problems (install-lock-problems current)
+        release-problems (verified-release-problems release)]
+    (cond
+      (seq lock-problems)
+      {:decision :refuse :error :invalid-install-lock :problems lock-problems}
+
+      (seq release-problems)
+      {:decision :refuse :error :invalid-release :problems release-problems}
+
+      :else
+      (let [candidate (release->lock release)
+            changed-cells (cell-changes (:cells current) (:cells candidate))
+            new-caps (ordered-set-difference (:requested-caps candidate)
+                                             (:requested-caps current))]
+        (cond
+          (not= (:app-id current) (:app-id candidate))
+          {:decision :refuse :error :app-identity-changed}
+
+          (not= (:publisher-did current) (:publisher-did candidate))
+          {:decision :refuse :error :publisher-changed}
+
+          (not= (:channel current) (:channel candidate))
+          {:decision :refuse :error :channel-changed
+           :installed-channel (:channel current)
+           :candidate-channel (:channel candidate)}
+
+          (<= (:release-sequence candidate) (:release-sequence current))
+          {:decision :refuse :error :stale-release
+           :installed-sequence (:release-sequence current)
+           :candidate-sequence (:release-sequence candidate)}
+
+          :else
+          {:decision (if (seq changed-cells) :requires-cell-migration :ready)
+           :lock candidate
+           :changed-cells changed-cells
+           :consent-required-caps new-caps
+           :capability-expansion? (boolean (seq new-caps))})))))
+
+(defn effective-capabilities
+  "Exact, fail-closed intersection of signed requests, local user approvals,
+  and capabilities implemented by this host. Approved capabilities must be
+  exact names; wildcard or unknown strings never match."
+  [lock locally-approved host-supported]
+  (if (seq (install-lock-problems lock))
+    []
+    (let [approved (set locally-approved)
+          supported (set host-supported)]
+      (into [] (filter #(and (contains? approved %) (contains? supported %)))
+            (:requested-caps lock)))))
+
+(defn required-content-cids
+  "Immutable content identities a host must have verified before launch."
+  [lock]
+  (if (seq (install-lock-problems lock))
+    []
+    (ordered-distinct
+     (concat [(:release-cid lock) (:manifest-cid lock) (:bundle-cid lock)]
+             (map :dna-cid (:cells lock))))))
+
+(defn launch-decision
+  "Decide whether cached content can launch without contacting the domain or
+  registry. `:verified-cids` comes from the content adapter after byte/CID
+  verification. `:domain-status` is a separate display fact and never blocks an
+  installed offline launch. Local approvals and host support are independent
+  inputs, not authority carried by the manifest or lock."
+  [lock {:keys [verified-cids locally-approved host-supported domain-status]}]
+  (let [problems (install-lock-problems lock)
+        required (required-content-cids lock)
+        verified (set verified-cids)
+        missing (into [] (remove verified) required)]
+    (cond
+      (seq problems)
+      {:decision :refuse :error :invalid-install-lock :problems problems}
+
+      (seq missing)
+      {:decision :refuse :error :content-not-verified :missing-cids missing}
+
+      :else
+      {:decision :launch
+       :app-id (:app-id lock)
+       :release-cid (:release-cid lock)
+       :capabilities (effective-capabilities lock locally-approved host-supported)
+       :domain-status (or domain-status :unknown)
+       :requires-network? false})))

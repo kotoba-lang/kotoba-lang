@@ -1,0 +1,325 @@
+(ns murakumo.web.worker
+  "M1 of ADR-260929: `:web/fetch` and `:web/extract` with every host primitive
+  injected, so the same code runs under nbb on a fleet node and in tests.
+
+  env keys (all host-supplied):
+    :resolve!   (fn [host] -> [ip-string ...])              DNS
+    :http-get!  (fn [{:keys [url address max-bytes]}]       one hop, NO redirect
+                  -> {:status n :headers {lower-name value} :body bytes}
+                   | {:error kw})                            following; `address`
+                                                             is the vetted IP to pin
+    :put!       (fn [cid bytes] -> truthy)                  yataverse / IPFS put
+    :get-bytes! (fn [cid] -> bytes | nil)
+    :sign!      (fn [string] -> string)                     node key
+    :now-ms     (fn [] -> long)
+    :node-did   string
+  Nothing throws at the caller: every failure is a typed {:refused ...}."
+  (:require [kotoba.lang.text :as text]
+            [murakumo.canonical :as canonical]
+            [murakumo.web :as web]
+            [murakumo.web.url :as url]))
+
+(def default-max-bytes (* 5 1024 1024))
+(def max-redirects 5)
+
+;; --- host primitives ---------------------------------------------------------
+
+(defn utf8-bytes [s]
+  )
+
+(defn utf8-string [bs]
+  )
+
+(defn byte-count [bs]
+  )
+
+(defn sha256-digest
+  "bytes -> 32 unsigned ints."
+  [bs]
+  )
+
+(defn- hex [digest]
+  (apply str (map #(str (when (< % 16) "0") ( % 16))
+                  digest)))
+
+(def ^:private b32 "abcdefghijklmnopqrstuvwxyz234567")
+
+(defn- base32 [bs]
+  (let [bits (mapcat (fn [b] (map #(bit-and (bit-shift-right b %) 1) [7 6 5 4 3 2 1 0])) bs)]
+    (apply str (map (fn [chunk] (nth b32 (reduce #(+ (* %1 2) %2) 0 chunk)))
+                    (partition 5 5 (repeat 0) bits)))))
+
+(defn raw-cid
+  "CIDv1 / raw / sha2-256, base32lower — the same name kotobase stores by."
+  [bs]
+  (str "b" (base32 (into [0x01 0x55 0x12 0x20] (sha256-digest bs)))))
+
+(defn content-hash [bs] (str "sha256:" (hex (sha256-digest bs))))
+
+;; --- fetch --------------------------------------------------------------------
+
+(defn- refuse [reason & [detail]]
+  {:refused reason :detail detail})
+
+(defn- redirect? [status] (contains? #{301 302 303 307 308} status))
+
+(defn- resolve-location
+  "Any RFC 3986 reference (absolute, //host, /path, path, ../path, ?query) resolved against the
+  current URL; nil when it does not end up an http(s) URL."
+  [current location]
+  (url/resolve-url current location))
+
+(defn- hop
+  "Validate one URL and fetch it without following. Returns {:response r} or a refusal."
+  [{:keys [resolve! http-get!]} url max-bytes]
+  (let [checked (web/check-url url)]
+    (if (:refused checked)
+      (refuse (:refused checked) url)
+      (let [host (get-in checked [:ok :host])
+            ;; an IP literal needs no DNS (and dns.lookup rejects the bracketed form): the
+            ;; literal itself is the address, and check-url has already vetted it
+            literal? (or (text/starts-with? host "[") (boolean (re-matches #"\d{1,3}(\.\d{1,3}){3}" host)))
+            ips (if literal?
+                  [(text/replace host #"^\[|\]$" "")]
+                  (vec (resolve! host)))]
+        (cond
+          (empty? ips) (refuse :fetch/unresolved host)
+          ;; every answer must be public; a single private A record refuses the host
+          (some web/private-address? ips) (refuse :url/private-address host)
+          :else
+          ;; IPv4 first (many nodes have no IPv6 route); on a transport error try the
+          ;; next vetted address. Every address was checked public above.
+          (let [ordered (vec (concat (remove #(re-find #":" %) ips) (filter #(re-find #":" %) ips)))
+                attempt (reduce (fn [_ ip]
+                                  (let [r (http-get! {:url url :address ip :max-bytes max-bytes})]
+                                    (if (:error r) {:error (:error r)} (reduced {:response r}))))
+                                nil ordered)]
+            (if (:error attempt) (refuse :fetch/transport (:error attempt)) attempt)))))))
+
+(defn fetch!
+  "job {:job-id :url [:max-bytes] [:follow-redirects? true]} -> {:ok {:receipt :signature :output-cid}} | {:refused ..}
+  With :follow-redirects? false a 3xx is returned as an ordinary result whose
+  evidence carries the absolute :location, so a caller that owns policy (the crawl
+  coordinator: robots, scope, dedupe) decides whether to follow."
+  [{:keys [put! sign! now-ms node-did] :as env} {:keys [job-id url max-bytes] :as job}]
+  (let [valid (web/validate-job (assoc job :kind :web/fetch))
+        follow? (not (false? (:follow-redirects? job)))]
+    (if (:refused valid)
+      (refuse :job/invalid (:refused valid))
+      (let [started (now-ms)
+            cap (or max-bytes default-max-bytes)]
+        (loop [current url chain [] n 0]
+          (let [h (hop env current cap)]
+            (if (:refused h)
+              h
+              (let [{:keys [status headers body]} (:response h)
+                    location (when (redirect? status) (resolve-location current (get headers "location" "")))]
+                (cond
+                  (and (redirect? status) follow?)
+                  (cond
+                    (nil? location) (refuse :fetch/bad-redirect (get headers "location"))
+                    (>= n max-redirects) (refuse :fetch/too-many-redirects current)
+                    :else (recur location (conj chain current) (inc n)))
+
+                  (and (nil? body) (not (redirect? status))) (refuse :fetch/no-body status)
+                  (> (byte-count (or body (utf8-bytes ""))) cap) (refuse :fetch/too-large (byte-count body))
+
+                  :else
+                  (let [body (or body (utf8-bytes ""))
+                        cid (raw-cid body)]
+                    (if-not (put! cid body)
+                      (refuse :store/put-failed cid)
+                      (let [r (web/receipt
+                               {:job-id job-id :kind :web/fetch :input-cids []
+                                :output-cid cid :node-did node-did
+                                :started-at started :finished-at (max started (now-ms))
+                                :evidence (cond-> {:status status :final-url current
+                                                   :redirects chain
+                                                   :content-type (get headers "content-type")
+                                                   :bytes (byte-count body)
+                                                   :content-hash (content-hash body)}
+                                            (and (redirect? status) location) (assoc :location location))})]
+                        {:ok {:receipt r
+                              :signature (sign! (web/receipt-signing-string r))
+                              :output-cid cid}}))))))))))))
+
+;; --- extract ------------------------------------------------------------------
+;;
+;; A single forward scan, no lazy-regex-with-backreference over the whole page:
+;; the earlier regexes went quadratic on unclosed tags (a 5 MB page of "<h1>"
+;; hung extract for minutes). Every search below moves forward only.
+
+(def max-extract-chars
+  "Pages longer than this are cut before scanning (bounded work)."
+  (* 3 1024 1024))
+(def max-tag-chars 4096)
+
+(defn- js-int [s] )
+
+(defn- ascii-lower
+  "ASCII-only lower-casing: same length as the input (String.toLowerCase is not,
+  e.g. for U+0130), so indexes found in the copy are valid in the original."
+  [s]
+  (text/replace s #"[A-Z]" (fn [m] (text/lower m))))
+
+(def ^:private named-entities
+  {"amp" "&" "lt" "<" "gt" ">" "quot" "\"" "apos" "'" "nbsp" " "})
+
+(defn- code-point->str [n]
+  (if (and (pos? n) (<= n 0x10FFFF) (not (<= 0xD800 n 0xDFFF)))
+    
+    "�"))
+
+(defn decode-entities
+  "One pass: `&amp;lt;` becomes `&lt;` (text), never `<`."
+  [s]
+  (text/replace s #"&(#[xX][0-9a-fA-F]{1,6}|#[0-9]{1,7}|[a-zA-Z]{2,6});"
+                (fn [[whole body]]
+                  (cond
+                    (re-find #"^#[xX]" body) (code-point->str )
+                    (= \# (first body)) (code-point->str (js-int (subs body 1)))
+                    :else (get named-entities body whole)))))
+
+(def ^:private skip-elements #{"script" "style" "noscript" "template" "head"})
+
+(defn- tag-at
+  "At index i (a '<'), parse the tag. Returns {:name :close? :end :raw} or nil when
+  it is not a tag or is not closed within max-tag-chars (then it is plain text).
+  `next-gt` finds the next '>' at or after i (memoised by `scan`, so a page of '<' with one
+  distant '>' costs one search, not one per '<')."
+  [s i n next-gt]
+  (let [close-at (next-gt i)]
+    (when (and (pos? (inc close-at)) (<= (- close-at i) max-tag-chars) (< (inc i) n))
+      (let [raw (subs s (inc i) close-at)
+            closing? (text/starts-with? raw "/")
+            body (if closing? (subs raw 1) raw)
+            [_ tname] (re-find #"^([a-zA-Z][a-zA-Z0-9]*)" body)]
+        (when tname
+          {:name (text/lower tname) :close? closing? :end (inc close-at) :raw body})))))
+
+(defn- href-of [raw]
+  (when-let [[_ q1 q2 bare] (re-find #"(?i)\shref\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))" (str " " raw))]
+    (decode-entities (or q1 q2 bare))))
+
+(defn scan
+  "Walk the page once. Calls (emit-text s), (emit-open tag) and (emit-close tag).
+  Skips comments and script/style/noscript/template/head bodies."
+  [html emit-text emit-open emit-close]
+  (let [html (if (> (count html) max-extract-chars) (subs html 0 max-extract-chars) html)
+        lc (ascii-lower html)
+        n (count html)
+        ;; the next '>' at or after i; once one search finds it at g (or nowhere: -1), every
+        ;; later position up to g shares the answer
+        gt (atom nil)
+        next-gt (fn [i] (let [g @gt]
+                          (if (and g (or (neg? g) (>= g i)))
+                            g
+                            (reset! gt (.indexOf html ">" i)))))]
+    (loop [i 0]
+      (when (< i n)
+        (let [lt (.indexOf html "<" i)]
+          (if (neg? lt)
+            (emit-text (subs html i))
+            (do
+              (when (> lt i) (emit-text (subs html i lt)))
+              (cond
+                (text/starts-with? (subs lc lt (min n (+ lt 4))) "<!--")
+                (let [e (.indexOf html "-->" (+ lt 4))]
+                  (recur (if (neg? e) n (+ e 3))))
+
+                ;; <!doctype ...>, <![CDATA[...]]>, <?xml ...?> declarations: drop to the next '>'
+                (and (< (inc lt) n) (contains? #{"!" "?"} (subs html (inc lt) (+ lt 2))))
+                (let [e (.indexOf html ">" lt)]
+                  (recur (if (neg? e) n (inc e))))
+
+                :else
+                (if-let [{:keys [name close? end raw] :as tag} (tag-at html lt n next-gt)]
+                  (if (and (not close?) (skip-elements name))
+                    (let [e (.indexOf lc (str "</" name) end)
+                          gt (when-not (neg? e) (.indexOf html ">" e))]
+                      (recur (if (or (neg? e) (neg? gt)) n (inc gt))))
+                    (do (if close? (emit-close tag) (emit-open tag))
+                        (recur end)))
+                  (do (emit-text "<") (recur (inc lt))))))))))))
+
+(defn title-of [html]
+  (let [lc (ascii-lower html)
+        i (.indexOf lc "<title")]
+    (when-not (neg? i)
+      (let [gt (.indexOf html ">" i)
+            e (when-not (neg? gt) (.indexOf lc "</title" gt))]
+        (when (and e (not (neg? e)))
+          (text/trim (decode-entities (subs html (inc gt) e))))))))
+
+(defn html->markdown
+  "Best-effort, dependency-free, linear. Headings, paragraphs, list items, links."
+  [html]
+  (let [out (atom []) hrefs (atom [])
+        put (fn [x] (swap! out conj x))]
+    (scan html
+          (fn [t] (put (decode-entities t)))
+          (fn [{:keys [name raw]}]
+            (case name
+              ("h1" "h2" "h3" "h4" "h5" "h6")
+              (put (str "\n\n" (apply str (repeat (js-int (subs name 1)) "#")) " "))
+              "a" (do (swap! hrefs conj (href-of raw)) (put (if (peek @hrefs) "[" "")))
+              "li" (put "\n- ")
+              "br" (put "\n\n")
+              nil))
+          (fn [{:keys [name]}]
+            (case name
+              ("h1" "h2" "h3" "h4" "h5" "h6") (put "\n\n")
+              "a" (let [h (peek @hrefs)]
+                    (swap! hrefs #(if (seq %) (pop %) %))
+                    (when h (put (str "](" h ")"))))
+              ("p" "div" "tr") (put "\n\n")
+              nil)))
+    (-> (apply str @out)
+        (text/replace #"[ \t]+" " ")
+        (text/replace #"\n[ \t]+" "\n")
+        (text/replace #"\n{3,}" "\n\n")
+        text/trim)))
+
+(defn links-of
+  "Distinct raw href values of <a> tags, in document order, entities decoded."
+  [html]
+  (let [acc (atom [])]
+    (scan html (fn [_] nil)
+          (fn [{:keys [name raw]}] (when (= name "a") (when-let [h (href-of raw)] (swap! acc conj h))))
+          (fn [_] nil))
+    (vec (distinct @acc))))
+
+(defn extract!
+  "job {:job-id :fetch-cid :format} -> {:ok {:receipt :signature :output-cid}} | {:refused ..}
+  Refuses if the bytes the store returns do not hash to the requested CID."
+  [{:keys [get-bytes! put! sign! now-ms node-did]} {:keys [job-id fetch-cid format] :as job}]
+  (let [valid (web/validate-job (assoc job :kind :web/extract))]
+    (cond
+      (:refused valid) (refuse :job/invalid (:refused valid))
+      (= format :json-schema) (refuse :extract/unsupported-format :json-schema)
+      :else
+      (let [started (now-ms)
+            bs (get-bytes! fetch-cid)]
+        (cond
+          (nil? bs) (refuse :extract/input-missing fetch-cid)
+          (not= fetch-cid (raw-cid bs)) (refuse :extract/cid-mismatch fetch-cid)
+          :else
+          (let [html (utf8-string bs)
+                out (case format
+                      :markdown (html->markdown html)
+                      :edn (canonical/string {:title (title-of html)
+                                              :markdown (html->markdown html)
+                                              :links (links-of html)}))
+                out-bytes (utf8-bytes out)
+                cid (raw-cid out-bytes)]
+            (if-not (put! cid out-bytes)
+              (refuse :store/put-failed cid)
+              (let [r (web/receipt
+                       {:job-id job-id :kind :web/extract :input-cids [fetch-cid]
+                        :output-cid cid :node-did node-did
+                        :started-at started :finished-at (max started (now-ms))
+                        :evidence {:format format :bytes (byte-count out-bytes)
+                                   :content-hash (content-hash out-bytes)}})]
+                {:ok {:receipt r
+                      :signature (sign! (web/receipt-signing-string r))
+                      :output-cid cid}}))))))))

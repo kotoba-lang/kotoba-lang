@@ -1,0 +1,155 @@
+(ns arrangement.partitioned
+  "One queryable root, many independent writers.
+
+  `arrangement.core/commit!` gives one writer a content-addressed snapshot of
+  a whole db. Put many writers behind it and they contend: each has to read
+  the current root, rebuild, re-snapshot, and compare-and-set. When the CAS
+  loses, ALL of that work is thrown away — and the expensive part (four
+  prolly-trees, blinded and encrypted) happened INSIDE the contended window.
+
+  This namespace moves the payload out of that window. The root stops being a
+  snapshot and becomes a map of `partition-key -> snapshot-cid`. A writer owns
+  one partition, commits it with `arrangement.core/commit!` under no lock at
+  all (content-addressed writes never conflict), and only then swaps a single
+  pointer. What a lost CAS discards is now a pointer swap, not a re-encrypted
+  index.
+
+  **Query reach is deliberately preserved.** `restore-all` hydrates every
+  partition and merges them into one db, so a reader still sees a single
+  joinable plane. That merge is the whole guarantee. Reach follows
+  composition, not the number of refs: root ADR-2809040800 supersedes
+  ADR-260726's \"exactly one ref\", which was the ceiling of the day and not a
+  property of the model. This is the difference between partitioning and
+  sharding: a shard splits what you can ask *because nothing composes it back*,
+  a partition splits only who may write. Filecoin's state tree has the same shape (each actor's state is
+  its own IPLD subtree hanging off one root) but pays the other half of the
+  price — its actors cannot be queried across, only walked.
+
+  The cost is stated rather than discovered: a reader now pays O(partitions)
+  block reads to hydrate, and two writers asserting the SAME triple into
+  different partitions will both store it (the merge is a set union, so the
+  query answer is still correct, but the bytes are duplicated). Partition by
+  something that does not overlap — a chain id, an actor, a shard of address
+  space — not by an arbitrary hash of the payload."
+  (:require [arrangement.core :as arr]
+            [ipld.core :as ipld]))
+
+(def current-root-version
+  "Bumped when the root node's shape changes. Recorded IN the node for the
+  same reason `arrangement.core` records its schema version: a reader must
+  decode with the codec that wrote the bytes, never reinterpret them."
+  1)
+
+;; ── root node ────────────────────────────────────────────────────────
+
+(defn root-node
+  "The dag-cbor node for a root: `{root-version, partitions, prev}`.
+  `partitions` is `{partition-key snapshot-cid}`; keys are stringified and
+  SORTED so the same partition set always encodes to the same CID."
+  [partitions prev]
+  {"root-version" current-root-version
+   "partitions" (into (sorted-map)
+                      (map (fn [[k cid]] [(name k) (ipld/link cid)]))
+                      partitions)
+   "prev" (some-> prev ipld/link)})
+
+(defn put-root!
+  "Write a root node, returning its CID."
+  [put! partitions prev]
+  (ipld/put-node! put! (root-node partitions prev)))
+
+(defn read-root
+  "Decode a root CID into `{:root-version :partitions :prev}`. A nil CID is
+  the empty root (no partitions), not an error — that is the genesis case."
+  [get-fn root-cid]
+  (if (nil? root-cid)
+    {:root-version current-root-version :partitions {} :prev nil}
+    (let [m (ipld/decode (get-fn root-cid))
+          v (get m "root-version")]
+      (when-not (= v current-root-version)
+        (throw (ex-info "Unsupported partitioned-root version"
+                        {:problem :arrangement.partitioned/unsupported-root-version
+                         :supported current-root-version :actual v :root-cid root-cid})))
+      {:root-version v
+       :prev (some-> (get m "prev") ipld/link-cid)
+       :partitions (into {} (map (fn [[k l]] [k (ipld/link-cid l)]))
+                         (get m "partitions"))})))
+
+;; ── merging partitions back into one queryable db ────────────────────
+
+(defn db->quads
+  "Every `{:s :p :o}` in `db`, read off the `:eavt` covering index."
+  [db]
+  (for [[s pm] (:eavt db) [p os] pm o os] {:s s :p p :o o}))
+
+(defn merge-dbs
+  "Union of several dbs as one db. Set-valued indices make this associative
+  and idempotent, so the merge order does not change the answer."
+  [dbs]
+  (reduce (fn [acc db] (reduce arr/assert-quad acc (db->quads db)))
+          (arr/empty-db)
+          dbs))
+
+;; ── the two halves a writer performs ─────────────────────────────────
+
+(defn commit-partition!
+  "Snapshot ONE partition. Identical to `arrangement.core/commit!` — the point
+  is not what it does but where it happens: outside the contended window, so a
+  lost CAS never discards it. Content-addressed writes cannot conflict, which
+  is why this needs no lock even with every writer running at once."
+  [put! db prev schema-version blind-fn encrypt-fn]
+  (arr/commit! put! db prev schema-version blind-fn encrypt-fn))
+
+(defn advance-root!
+  "Point `pkey` at `partition-cid` in the root, retrying until the CAS lands.
+
+  `ops` is `{:read-current (fn [] root-cid-or-nil)
+             :cas! (fn [expected-cid new-cid] boolean)
+             :put! (fn [cid bytes]) :get-fn (fn [cid] bytes)}`.
+
+  Returns `{:root-cid :attempts}`. `:attempts` is reported rather than hidden
+  because it is the whole measurement: this loop is what remains contended
+  after the payload moved out of it, and a design claim about contention that
+  cannot be counted is an opinion."
+  [{:keys [read-current cas! put! get-fn]} pkey partition-cid]
+  (loop [attempts 1]
+    (let [cur (read-current)
+          {:keys [partitions]} (read-root get-fn cur)
+          next-cid (put-root! put! (assoc partitions (name pkey) partition-cid) cur)]
+      (if (cas! cur next-cid)
+        {:root-cid next-cid :attempts attempts}
+        (recur (inc attempts))))))
+
+(defn advance-root-batched!
+  "Apply MANY partition advances in one CAS.
+
+  A pointer swap is O(1) in the payload, so a root update can absorb an
+  arbitrary number of them for the same contention cost. This is what makes
+  the remaining serialization cheap rather than merely small: under load the
+  batch grows, and the number of contended operations stops tracking the
+  number of writes."
+  [{:keys [read-current cas! put! get-fn]} pkey->cid]
+  (loop [attempts 1]
+    (let [cur (read-current)
+          {:keys [partitions]} (read-root get-fn cur)
+          merged (reduce (fn [m [k v]] (assoc m (name k) v)) partitions pkey->cid)
+          next-cid (put-root! put! merged cur)]
+      (if (cas! cur next-cid)
+        {:root-cid next-cid :attempts attempts :applied (count pkey->cid)}
+        (recur (inc attempts))))))
+
+;; ── reading ──────────────────────────────────────────────────────────
+
+(defn restore-all
+  "Hydrate every partition under `root-cid` and merge them into ONE db.
+
+  This is the function that keeps the design honest. If it did not exist —
+  if callers queried partitions separately — this would be sharding. A split
+  is not what costs the reach; failing to compose it is (root
+  ADR-2809040800). `kotoba-lang/datom-source`'s `merged` is the same move one
+  layer down, for a caller that cannot afford to hydrate everything first.
+  Returns a db on clj and a
+  Promise of one on cljs, matching `arrangement.core/restore`."
+  [get-fn root-cid decrypt-fn]
+  (let [cids (vals (:partitions (read-root get-fn root-cid)))]
+    ))

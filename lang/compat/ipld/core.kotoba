@@ -1,0 +1,272 @@
+(ns ipld.core
+  "Canonical IPLD DAG-CBOR layer for kotoba-lang — the one place that turns
+  Clojure data + CID links into IPLD blocks and back.
+
+  Composes `kotoba-lang/multiformats` (CIDv1 sha2-256 assembly) and
+  `kotoba-lang/dag-cbor` (canonical definite-length CBOR + generic tags)
+  into the DAG-CBOR spec's link discipline:
+
+    - a link is CBOR **tag 42** wrapping a byte string of
+      `0x00 (identity multibase prefix) ++ <binary CID>` — the exact wire
+      form every generic IPLD/IPFS tool (go-ipld-prime, dag-cbor js,
+      `ipfs dag get`) expects, replacing the plain-CID-string convention
+      the first prolly-tree/quad-store/commit-dag landing used (their
+      READMEs carried this as an explicit honesty note, not a surprise);
+    - tag 42 is the ONLY tag allowed in a block (per the DAG-CBOR spec) —
+      `decode` throws on any other tag, `encode` throws on a raw
+      `cbor/tagged` (construct links with `link`, nothing else);
+    - map keys must be strings (DAG-CBOR spec) — enforced at `encode` and
+      after `decode`; host keywords are application values, not IPLD keys.
+
+  In application data a link is the explicit `Link` wrapper: construct
+  with `(link cid-string)`, read with `link-cid`, test with `link?`.
+  Access NEVER goes through representation fields at call sites — use the
+  narrow accessor so JVM, compiled ClojureScript, and SCI/nbb agree.
+
+  Storage stays injected exactly like prolly-tree/commit-dag:
+  `(put-node! put! node)` encodes, CIDs, stores, returns the CID string.
+  `links` deep-collects every Link's CID in a node — the one generic walk
+  hydrate loops and GC need (kotoba-client uses it instead of knowing any
+  node schema)."
+  {:kotoba/export [block->node cid cid-codec decode encode get-node get-verified-block link link->tag link-cid link? links node->block put-node! readdressable-codec? tag->link]}
+  (:require [multiformats.core :as mf]
+            [cbor.core :as cbor]
+            [ipld.dag-json :as dag-json]
+            [ipld.link :as link-value]
+            [ipld.data-model :as data-model]))
+
+;; Compatibility aliases keep the existing `ipld.core` API while allowing
+;; value-only consumers to load `ipld.link` without the hashing namespace.
+(def link link-value/link)
+(def link? link-value/link?)
+(def link-cid link-value/link-cid)
+(def link->tag link-value/link->tag)
+(def tag->link link-value/tag->link)
+
+;; ── data <-> cbor-with-tags transforms ────────────────────────────────────────
+(defn- ->cbor-data [x]
+  (cond
+    (link? x)        (link->tag x)
+    (cbor/tagged? x) (throw (ex-info "ipld: raw cbor tags are not IPLD data — construct links with ipld.core/link"
+                                     {:tag (cbor/tag-number x)}))
+    (map? x)         (into {}
+                           (map (fn [[k v]]
+                                  (when-not (string? k)
+                                    (throw (ex-info "ipld: DAG-CBOR map keys must be strings"
+                                                    {:key k})))
+                                  [k (->cbor-data v)]))
+                           x)
+    (sequential? x)  (mapv ->cbor-data x)
+    :else x))
+
+(defn- <-cbor-data [x]
+  (cond
+    (cbor/tagged? x) (if (= 42 (cbor/tag-number x))
+                       (tag->link x)
+                       (throw (ex-info "ipld: DAG-CBOR allows tag 42 only"
+                                       {:tag (cbor/tag-number x)})))
+    (map? x)         (into {} (map (fn [[k v]] [k (<-cbor-data v)])) x)
+    (sequential? x)  (mapv <-cbor-data x)
+    :else x))
+
+;; ── public codec surface ──────────────────────────────────────────────────────
+(defn encode
+  "Canonical DAG-CBOR bytes for `node` (Clojure data; `Link`s become tag 42)."
+  [node]
+  (data-model/validate! node)
+  (cbor/encode (->cbor-data node)))
+
+(defn- byte-vector [value] (mapv #(bit-and % 0xff) (seq value)))
+
+(defn- byte-count
+  "Length of a byte container, without materialising it as a vector."
+  [value]
+  (count value))
+
+(defn- same-bytes?
+  "Whether two byte containers hold the same unsigned bytes.
+
+  This is the predicate `decode`'s canonicality check needs, and it is
+  deliberately not `(= (byte-vector a) (byte-vector b))`. That form answered
+  the same question by allocating one PersistentVector per side and comparing
+  those: measured 2026-09-05 on a real 30 KB catalog-directory block, 6.5 ms
+  and two 30,155-element vectors per decode, on a path where nothing else
+  needs either vector (ADR-2609051700). Indexed containers take a single pass
+  with no allocation; anything else falls back to walking both seqs in step,
+  which still allocates nothing beyond the seqs the old form already built.
+
+  The invariant is unchanged -- see `decode`. This only stops paying for it
+  twice."
+  [a b]
+  (let [n (byte-count a)]
+    (and (= n (byte-count b))
+         )))
+
+(defn decode
+  "DAG-CBOR bytes → Clojure data; tag 42 becomes a `Link`, any other tag throws.
+
+  DAG-CBOR is a *canonical* codec: for any node there is exactly one valid
+  encoding. Decoding alone does not enforce that, and the ways it fails to are
+  not exotic -- `18 05` reads as the integer 5, out-of-order map keys read as a
+  map, and duplicate map keys read as the last one wins. Bytes the encoder
+  would never have produced would then be accepted as the node they merely
+  resemble, which is the one thing a content-addressed identity layer cannot
+  afford: two byte strings would denote one value while having different CIDs.
+
+  So the round trip is required to be an identity, not a coincidence. The cost
+  is one extra encode per decode, paid at the layer whose entire job is
+  canonical form."
+  [bytes]
+  (let [node (<-cbor-data (cbor/decode bytes))]
+    (data-model/validate! node)
+    (let [canonical (cbor/encode (->cbor-data node))]
+      (when-not (same-bytes? bytes canonical)
+        (throw (ex-info "ipld: bytes are not canonical DAG-CBOR"
+                        {:ipld/problem :non-canonical-dag-cbor
+                         :given-bytes (byte-count bytes)
+                         :canonical-bytes (byte-count canonical)}))))
+    node))
+
+(defn cid
+  "CIDv1 dag-cbor sha2-256 of already-encoded block bytes."
+  [bytes]
+  (mf/cidv1-dag-cbor bytes))
+
+(defn node->block
+  "Encode `node` and address it: `{:cid <string> :bytes <bytes>}`."
+  [node]
+  (let [bytes (encode node)]
+    {:cid (cid bytes) :bytes bytes}))
+
+(defn put-node!
+  "Encode `node`, CID it, `(put! cid bytes)`, return the CID string — the
+  same storage-port convention prolly-tree/quad-store/commit-dag use."
+  [put! node]
+  (let [{:keys [cid bytes]} (node->block node)]
+    (put! cid bytes)
+    cid))
+
+(defn cid-codec
+  "Codec number a CIDv1 string declares, or nil when it cannot be read.
+
+   Reading it is what lets a foreign codec be reported as a foreign codec.
+   Recomputing a dag-cbor CID over a raw block's bytes produces a different
+   string, so without this the traversal reports a CID mismatch -- which sends
+   whoever reads the error looking for a corrupt store, when the store was
+   right and the link simply pointed at something this codec cannot decode.
+
+   Delegates to `multiformats.core/cid->parts`. This used to parse the two
+   varint headers itself via a `defn-` `read-varint`, which accumulated with
+   `(bit-shift-left (bit-and b 0x7f) shift)` -- int32 on ClojureScript, so the
+   varint of 2^32 read as 4294967296 on the JVM and 0 on cljs. That is the same
+   defect `multiformats.core/varint` was fixed for on 2026-08-17; the copy here
+   was private and in another repo, so the two were never compared. Measured
+   and removed 2026-08-20.
+
+   Nothing reached it -- CID version 1 and the codecs in use are all one group
+   -- so this is the removal of a latent divergence, not a bug fix with a
+   symptom. The point is that there is now one decoder rather than two."
+  [cid]
+  (:codec (mf/cid->parts cid)))
+(defn readdressable-codec?
+  "Can a block under this CID be re-addressed from its own bytes here?
+
+  The old answer was raw and dag-cbor only, on the stated ground that another
+  codec might need a different hash construction. **Measured 2026-09-11 and
+  false.** A CIDv1 is `version ++ codec ++ multihash(block bytes)`: the codec
+  is a label in the prefix and the digest is over the bytes either way, so
+  re-addressing never depended on it. Recomputing a live dag-json
+  advertisement under its own declared codec reproduces its CID exactly, and
+  under dag-cbor it does not -- which is the control that makes the first
+  statement discriminating rather than vacuous.
+
+  What genuinely depends on the codec is DECODING, and the two were refused as
+  one. That conflation had a cost outside this namespace: `ipld.graph` could
+  not cross a link into a dag-json block, so the live IPQ surface answered a
+  Cloudflare HTML 500 for a selector that reached one, and the IPNI
+  advertisement chain could not be walked past its thirteenth block
+  (`com-junkawasaki/root` ADR-2609109900).
+
+  So the set is now the codecs this namespace can turn into a Data Model node:
+  raw is bytes, dag-cbor decodes, and dag-json decodes as of the same day.
+  dag-pb stays out for a reason of its own rather than by omission -- it is
+  routinely addressed as CIDv0, which carries no codec prefix to read, and the
+  UnixFS layer above it means the node it decodes to is not the whole answer."
+  [codec]
+  (contains? #{mf/codec-raw mf/codec-dag-cbor dag-json/codec} codec))
+
+(defn get-verified-block
+  "Fetch bytes at `expected-cid` and recompute their CID before returning them.
+  Missing blocks return nil; a storage adapter returning different bytes under
+  a CID fails closed. This is the only conforming read across a storage trust
+  boundary.
+
+  The recomputation follows the codec the CID ITSELF declares. It used to
+  assume dag-cbor and throw `block codec is not dag-cbor` for anything else,
+  which made a raw block unreadable through this function -- and a raw block is
+  the ordinary shape of a byte leaf, so that refusal was not a narrow one.
+  Measured 2026-09-08 on the live `ipfs.kotobase.net/ipq/v1` surface: a
+  selector reaching a Link to a raw leaf answered HTTP 500, while the same
+  selector aimed one position left or right at a string or a number in the same
+  vector answered 200. `ipld.graph` is the traversal core under both IPQ and
+  the GraphSync adapter, so both could only ever cross links inside an
+  all-dag-cbor DAG.
+
+  A codec this cannot re-address is still refused, and by name. That is not the
+  same refusal: `dag-pb` needs a different hash construction and a different
+  decoder, so verifying it here would be guessing."
+  [get-fn expected-cid]
+  (when-let [bytes (get-fn expected-cid)]
+    (let [codec (cid-codec expected-cid)]
+      (when-not (readdressable-codec? codec)
+        (throw (ex-info "ipld: block codec cannot be verified here"
+                        {:type :ipld/unsupported-codec
+                         :cid expected-cid
+                         :codec codec
+                         :supported #{mf/codec-raw mf/codec-dag-cbor}})))
+      ;; One line for every codec, because re-addressing is the same
+      ;; construction for all of them. The `if` this replaces named two codecs
+      ;; and would have had to name a third; naming the DECLARED codec instead
+      ;; is what the CID already says.
+      (let [actual (mf/cidv1 codec (mf/multihash-sha256 bytes))]
+        (when-not (= expected-cid actual)
+          (throw (ex-info "ipld: block CID mismatch"
+                          {:type :ipld/cid-mismatch
+                           :expected-cid expected-cid
+                           :actual-cid actual})))
+        bytes))))
+
+(defn block->node
+  "The Data Model node a verified block represents, by its CID's codec.
+
+  A raw block IS a Bytes node -- `:bytes` is one of the Data Model kinds, and
+  there is nothing inside one to explore. Decoding it as DAG-CBOR is a category
+  error rather than a missing feature, which is why this dispatches instead of
+  widening `decode`."
+  [cid-str bytes]
+  (let [codec (cid-codec cid-str)]
+    (cond
+      (= mf/codec-raw codec) bytes
+      (= dag-json/codec codec) (dag-json/decode bytes)
+      :else (decode bytes))))
+
+(defn get-node
+  "Fetch and decode the node at `cid-str` via `(get-fn cid) -> bytes`.
+  Returns nil when `get-fn` does (block not present). Bytes are rehashed before
+  decode; callers cannot accidentally treat a CID-keyed lookup as verification."
+  [get-fn cid-str]
+  (when-let [bytes (get-verified-block get-fn cid-str)]
+    (block->node cid-str bytes)))
+
+
+
+(defn links
+  "Every Link CID reachable inside `node` (deep, document order). This is
+  the generic block-graph walk: hydrate loops and GC traverse a DAG by
+  `links` alone, with zero knowledge of any node schema."
+  [node]
+  (cond
+    (link? node)       [(link-cid node)]
+    (map? node)        (vec (mapcat (comp links val) (sort-by key node)))
+    (sequential? node) (vec (mapcat links node))
+    :else              []))

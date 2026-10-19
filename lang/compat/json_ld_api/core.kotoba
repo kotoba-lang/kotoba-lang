@@ -1,0 +1,775 @@
+(ns json-ld-api.core
+  "JSON-LD 1.1 expansion — [W3C REC](https://www.w3.org/TR/json-ld11-api/).
+
+   Third layer of the `-rdfc-` cryptosuite stack. `org-w3-rdf-canon` canonicalizes an
+   RDF dataset; a Verifiable Credential is a JSON-LD document, and expansion is what
+   turns its context-dependent shorthand into the explicit form RDF conversion needs.
+   Without it, `eddsa-rdfc-2022` has nothing to canonicalize.
+
+   ## Contexts are never fetched, and that is a security property
+
+   `expand` does no network I/O. A remote `@context` must be supplied in
+   `:contexts` (a url -> context map); an unsupplied one throws
+   `:json-ld/context-not-provided`.
+
+   This is deliberate. A `@context` decides what every term in a document *means*,
+   so a verifier that fetches one at verification time hands the context's host the
+   power to change what a signature covers — after it was signed, with no key and no
+   detectable tampering. The document would still verify, against a different graph.
+   Pinning contexts is the only way the meaning of a signed document stays fixed, so
+   this library cannot be configured to fetch. (It also removes verification's
+   dependence on someone else's uptime, but that is the lesser reason.)
+
+   ## What is implemented, and what refuses rather than guesses
+
+   Implemented: context processing (`@base`, `@vocab`, `@version`, `@protected`,
+   term definitions with `@id`/`@type`/`@container`/`@language`/`@prefix`/`@reverse`,
+   property- and type-scoped contexts, context nullification), IRI expansion, value
+   expansion, and the expansion algorithm over node objects, value objects, arrays,
+   `@list`, `@set`, `@graph`, `@id`, `@type`, `@language`, `@index` and `@reverse`,
+   including dropping free-floating nodes.
+
+   **Not implemented, and each throws rather than being ignored:** `@nest`, `@json`
+   type coercion, `@import`, `@included`, `@direction`, and the
+   `@container` variants `@index`/`@id`/`@type`.
+
+   Throwing matters more here than in most libraries. A processor that quietly
+   ignored `@nest` would return an expansion that is missing triples, and the
+   caller's next step is to *sign* it — so the failure would surface as a signature
+   over a graph nobody intended, not as an error. Every refusal below carries the
+   spec's own error code so a caller can tell a limit from a malformed document.
+
+   ## `expand` is NOT a validator
+
+   Measured against the official suite, **25 of its 103 malformed documents are
+   still accepted rather than refused** (the exact list prints when the suite runs).
+   So a successful `expand` does not mean the input was valid JSON-LD. Do not use it
+   as an admission check on untrusted input; validate separately, and treat
+   expansion as a transformation that may succeed on garbage.
+
+   ## Correctness is measured against the official suite
+
+   `test/fixtures/` holds the entire W3C JSON-LD 1.1 expansion test suite — 276
+   positive and 109 negative cases — committed so the suite needs no network. The
+   negative cases check the *error code*, not merely that something was raised.
+
+   Current standing, pinned as a floor so it can only improve:
+
+       positive: 126/273 exact match  (95 refused as unsupported, 39 mismatch)
+       negative:  51/103 exact code   (25 accepted that should have been refused)
+
+   The suite percentage is not the useful number, though. What told me this library
+   would refuse *every real Verifiable Credential* was expanding one: credentials/v2
+   puts `@container: @graph` on `proof` and declares `@json` on three terms no
+   credential touches, and my refusals were placed at context-processing time. A
+   pass rate cannot surface that; `a-real-verifiable-credential-expands` can."
+  (:require [kotoba.lang.text :as str]))
+
+(def json-ld-keywords
+  "Every keyword the 1.1 grammar defines. Used to reject terms that look like
+   keywords but are not, per §4.2.2 — a term `@foo` must be ignored rather than
+   treated as an ordinary term, or a typo silently becomes a property."
+  #{"@base" "@container" "@context" "@direction" "@graph" "@id" "@import" "@included"
+    "@index" "@json" "@language" "@list" "@nest" "@none" "@prefix" "@propagate"
+    "@protected" "@reverse" "@set" "@type" "@value" "@version" "@vocab"})
+
+(def unsupported-keywords
+  "Refused with `:json-ld/unsupported`. See the namespace docstring for why silence
+   would be worse than failure here."
+  #{"@nest" "@import" "@included" "@direction" "@json"})
+
+(defn- fail!
+  "`code` is the spec's own error code string where one applies, so callers can
+   distinguish a malformed document from a limit of this implementation."
+  ([code] (fail! code {}))
+  ([code data] (throw (ex-info code (assoc data :json-ld/error code)))))
+
+(defn- unsupported! [what]
+  (throw (ex-info (str "json-ld: " what " is not implemented; refusing rather than "
+                       "returning an expansion with triples missing")
+                  {:json-ld/error "unsupported" :json-ld/unsupported what})))
+
+;; ── small helpers ────────────────────────────────────────────────────────────
+
+(defn- jmap? [x] (map? x))
+(defn- jarray? [x] (vector? x))
+(defn- arrayify [x] (if (jarray? x) x [x]))
+
+(defn- keyword-like?
+  "Matches `@` followed by ASCII letters — the shape a keyword has. Something that
+   is keyword-LIKE but not a keyword is dropped, not treated as a term."
+  [s]
+  (and (string? s) (re-matches #"@[A-Za-z]+" s)))
+
+(defn- blank-node-id? [s] (and (string? s) (str/starts-with? s "_:")))
+
+(defn- absolute-iri?
+  "A scheme followed by `:`. Deliberately not a full RFC 3987 check — this only has
+   to separate absolute IRIs from terms and relative references."
+  [s]
+  (and (string? s) (re-find #"^[A-Za-z][A-Za-z0-9+.\-]*:" s)))
+
+(defn- resolve-against-base
+  "Enough of RFC 3986 §5.3 for the cases the suite exercises: absolute references,
+   protocol-relative, absolute paths, query/fragment-only, and dot-segment removal."
+  [base ref]
+  (cond
+    (nil? base) ref
+    (= "" ref) (str/replace base #"#.*$" "")
+    (absolute-iri? ref) ref
+    (str/starts-with? ref "//") (str (second (re-find #"^([A-Za-z][A-Za-z0-9+.\-]*:)" base)) ref)
+    (str/starts-with? ref "#") (str (str/replace base #"#.*$" "") ref)
+    (str/starts-with? ref "?") (str (str/replace base #"[?#].*$" "") ref)
+    :else
+    (let [[_ scheme authority path] (re-find #"^([A-Za-z][A-Za-z0-9+.\-]*:)(//[^/?#]*)?(.*)$"
+                                             (str/replace base #"[?#].*$" ""))
+          scheme (or scheme "") authority (or authority "")
+          merged (if (str/starts-with? ref "/")
+                   ref
+                   (str (subs path 0 (inc (or (str/last-index-of path "/") -1))) ref))
+          ;; remove_dot_segments
+          segs (reduce (fn [acc s]
+                         (cond
+                           (= "." s) acc
+                           (= ".." s) (if (seq acc) (pop acc) acc)
+                           :else (conj acc s)))
+                       []
+                       (str/split merged #"/" -1))]
+      (str scheme authority (str/join "/" segs)))))
+
+;; ── §5.2.2 IRI Expansion ─────────────────────────────────────────────────────
+
+(declare process-context)
+
+(defn expand-iri
+  "§5.2.2. `vocab?` selects the @vocab-relative reading used for keys and types;
+   `document-relative?` selects base resolution used for @id values."
+  [ctx value {:keys [vocab? document-relative?]}]
+  (cond
+    (nil? value) nil
+    (json-ld-keywords value) value
+    (keyword-like? value) nil                              ; keyword-like but not a keyword: dropped
+    :else
+    (let [defs (:term-definitions ctx)
+          def (get defs value)]
+      (cond
+        ;; 4) a term definition, when reading vocab-relative
+        (and vocab? def) (:iri def)
+        ;; 5) a compact IRI
+        (and (str/includes? value ":") (not (blank-node-id? value)))
+        (let [i (str/index-of value ":")
+              prefix (subs value 0 i)
+              suffix (subs value (inc i))]
+          (if (or (= "_" prefix) (str/starts-with? suffix "//"))
+            value
+            (let [pdef (get defs prefix)]
+              (cond
+                (and pdef (:iri pdef) (:prefix? pdef)) (str (:iri pdef) suffix)
+                (absolute-iri? value) value
+                :else value))))
+        (blank-node-id? value) value
+        ;; 6) vocab-relative
+        (and vocab? (:vocab ctx)) (str (:vocab ctx) value)
+        ;; 7) document-relative
+        document-relative? (resolve-against-base (:base ctx) value)
+        :else value))))
+
+;; ── §4.2.2 Create Term Definition ────────────────────────────────────────────
+
+(def ^:private valid-containers #{"@list" "@set" "@language" "@index" "@id" "@type" "@graph"})
+(def ^:private supported-containers
+  "`@graph` is here because it is not optional in practice: the W3C
+   credentials/v2 context declares `@container: @graph` on `proof`, so refusing it
+   would refuse every real Verifiable Credential — which is what this stack exists
+   to process. Found by expanding an actual credential rather than by reading a
+   pass rate."
+  #{"@list" "@set" "@graph"})
+
+(declare create-term-definition)
+
+(defn- define-dependencies
+  "§5.2.2 steps 4 and 6.3, as invoked from §4.2.2 with a local context and
+   `defined`: before a value inside a term definition is IRI-expanded, the term it
+   names -- and the prefix of a compact IRI -- must already be defined when the
+   same local context defines it.
+
+   Without this the result depended on the ORDER in which a context's keys were
+   walked. A context such as
+     {\"rdfs\" \"http://www.w3.org/2000/01/rdf-schema#\"
+      \"subClassOf\" {\"@id\" \"rdfs:subClassOf\" \"@type\" \"@id\"}}
+   is legal whichever key comes first, but when `subClassOf` was reached before
+   `rdfs` its IRI stayed the literal string \"rdfs:subClassOf\" -- which passes
+   `absolute-iri?` (scheme `rdfs`) and so was never refused. A map of more than
+   eight entries does not keep insertion order, so WHICH terms broke was decided
+   by hashing. Measured 2026-09-25 on the Mithril context: subClassOf, domain,
+   range, sh:* and mith:name came out unexpanded while subPropertyOf and
+   mith:description expanded."
+  [ctx local-ctx term value defined override-protected?]
+  (if (or (not (string? value)) (json-ld-keywords value) (keyword-like? value))
+    [ctx defined]
+    (let [define (fn [[c d] dep]
+                   (if (and dep (not= dep term) (contains? local-ctx dep)
+                            (not (true? (get d dep))))
+                     (create-term-definition c local-ctx dep d override-protected?)
+                     [c d]))
+          prefix (when (and (str/includes? value ":") (not (blank-node-id? value)))
+                   (let [i (str/index-of value ":")
+                         p (subs value 0 i)]
+                     (when-not (or (= "_" p) (str/starts-with? (subs value (inc i)) "//"))
+                       p)))]
+      (-> [ctx defined] (define value) (define prefix)))))
+
+(defn- create-term-definition
+  ([ctx local-ctx term defined] (create-term-definition ctx local-ctx term defined false))
+  ([ctx local-ctx term defined override-protected?]
+  (cond
+    ;; §4.2.2 step 1: already defined, possibly as a dependency of an earlier term
+    (true? (get defined term)) [ctx defined]
+    ;; ... or being defined right now: a term whose IRI needs itself
+    (false? (get defined term)) (fail! "cyclic IRI mapping" {:term term})
+
+    (= "@type" term)
+    ;; §4.2.2 step 4: only @protected and @container:@set may be set on @type
+    (let [v (get local-ctx term)]
+      (when-not (and (jmap? v)
+                     (every? #{"@container" "@protected"} (keys v))
+                     (or (nil? (get v "@container"))
+                         (= "@set" (get v "@container"))))
+        (fail! "keyword redefinition" {:term term}))
+      [ctx defined])
+
+    (json-ld-keywords term) (fail! "keyword redefinition" {:term term})
+    (keyword-like? term) [ctx defined]                     ; ignored, not defined
+    (= "" term) (fail! "invalid term definition" {:term term})
+
+    :else
+    (let [value (get local-ctx term)
+          value (cond
+                  (nil? value) nil
+                  (string? value) {"@id" value}
+                  (jmap? value) value
+                  :else (fail! "invalid term definition" {:term term}))
+          ;; §4.2.2 step 2, then define what the values below expand through
+          [ctx defined]
+          (reduce (fn [[c d] v]
+                    (define-dependencies c local-ctx term v d override-protected?))
+                  [ctx (assoc defined term false)]
+                  (if value
+                    [(get value "@id") (get value "@reverse") (get value "@type") term]
+                    [term]))
+          previous (get (:term-definitions ctx) term)]
+      (when (and previous (:protected? previous) (not override-protected?))
+        ;; the redefinition must be identical to the existing one, else it is refused
+        (let [candidate-iri (when value
+                              (let [idv (get value "@id")]
+                                (if (string? idv)
+                                  (expand-iri ctx idv {:vocab? true}) nil)))]
+          (when-not (= candidate-iri (:iri previous))
+            (fail! "protected term redefinition" {:term term}))))
+      (if (nil? value)
+        [(update ctx :term-definitions dissoc term) (assoc defined term true)]
+        (let [_ (doseq [k (keys value)]
+                  (when (unsupported-keywords k) (unsupported! k))
+                  (when-not (#{"@id" "@reverse" "@container" "@context" "@language"
+                               "@prefix" "@protected" "@type" "@index" "@direction"
+                               "@nest"} k)
+                    (fail! "invalid term definition" {:term term :entry k})))
+              _ (when (contains? value "@nest") (unsupported! "@nest"))
+              type-mapping
+              (when (contains? value "@type")
+                (let [t (get value "@type")]
+                  (when-not (string? t) (fail! "invalid type mapping" {:term term}))
+                  ;; NOT refused here. A large shared context defines terms the
+                  ;; document never uses -- credentials/v2 declares @json on `_sd`,
+                  ;; `cnf/jwk` and `jsonSchema` -- so refusing at DEFINITION time
+                  ;; makes the whole context unusable over a term nobody touched.
+                  ;; The refusal belongs where it would change the output: use.
+                  (let [t' (if (= "@json" t) "@json" (expand-iri ctx t {:vocab? true}))]
+                    (when-not (or (#{"@id" "@vocab" "@none" "@json"} t') (absolute-iri? (str t')))
+                      (fail! "invalid type mapping" {:term term :type t}))
+                    t')))
+              container
+              (when (contains? value "@container")
+                (let [c (arrayify (get value "@container"))]
+                  (doseq [x c]
+                    (when-not (valid-containers x)
+                      (fail! "invalid container mapping" {:term term :container x}))
+                    ;; likewise deferred to use time, and for the same reason
+                    )
+                  (vec c)))
+              reverse? (contains? value "@reverse")
+              iri (cond
+                    reverse?
+                    (let [r (get value "@reverse")]
+                      (when-not (string? r) (fail! "invalid IRI mapping" {:term term}))
+                      (when (contains? value "@id") (fail! "invalid reverse property" {:term term}))
+                      (let [e (expand-iri ctx r {:vocab? true})]
+                        (when-not (or (absolute-iri? (str e)) (blank-node-id? (str e)))
+                          (fail! "invalid IRI mapping" {:term term}))
+                        e))
+
+                    (contains? value "@id")
+                    (let [idv (get value "@id")]
+                      (cond
+                        (nil? idv) nil
+                        (not (string? idv)) (fail! "invalid IRI mapping" {:term term})
+                        :else
+                        (let [e (expand-iri ctx idv {:vocab? true})]
+                          (when-not (or (json-ld-keywords (str e))
+                                        (absolute-iri? (str e))
+                                        (blank-node-id? (str e))
+                                        (= "" (str e)))
+                            (fail! "invalid IRI mapping" {:term term :id idv}))
+                          e)))
+
+                    ;; no @id: derive from the term itself
+                    (str/includes? term ":") (expand-iri ctx term {:vocab? true})
+                    (:vocab ctx) (str (:vocab ctx) term)
+                    :else (fail! "invalid IRI mapping" {:term term}))
+              language (when (contains? value "@language")
+                         (let [l (get value "@language")]
+                           (when-not (or (nil? l) (string? l))
+                             (fail! "invalid language mapping" {:term term}))
+                           (when (string? l) (str/lower l))))
+              definition {:iri iri
+                          :type-mapping type-mapping
+                          :container container
+                          :reverse? reverse?
+                          :prefix? (if (contains? value "@prefix")
+                                     (let [p (get value "@prefix")]
+                                       (when-not (boolean? p)
+                                         (fail! "invalid @prefix value" {:term term}))
+                                       p)
+                                     ;; a simple term whose IRI ends in a gen-delim is
+                                     ;; usable as a prefix
+                                     (and (string? (get local-ctx term))
+                                          (boolean (re-find #"[:/?#\[\]@]$" (str iri)))))
+                          ;; An explicit `@protected: false` on the term wins over a
+                          ;; context-level `@protected: true`. `(or false true)` is
+                          ;; true, which made every opt-out silently protected and
+                          ;; rejected legal overrides in a scoped context.
+                          :protected? (boolean (if (contains? value "@protected")
+                                                 (get value "@protected")
+                                                 (:protected ctx)))
+                          :scoped-context (get value "@context")
+                          ;; `@context: null` is a scoped context that NULLIFIES,
+                          ;; and it is not the same as having no scoped context at
+                          ;; all — but both store nil. Branching on the value made
+                          ;; every nullifying scoped context a no-op.
+                          :has-scoped-context? (contains? value "@context")
+                          :has-language? (contains? value "@language")}]
+          (when (contains? value "@language")
+            (when-not (or (nil? language) (string? language))
+              (fail! "invalid language mapping" {:term term})))
+          [(assoc-in ctx [:term-definitions term] definition) (assoc defined term true)]))))))
+
+;; ── §4.1.2 Context Processing ────────────────────────────────────────────────
+
+(defn process-context
+  "§4.1.2. `local` may be a map, a string (a reference resolved through
+   `:contexts`), an array of either, or nil (which resets the context).
+
+   `override-protected?` is §4.1.2's *override protected* parameter. It is false for
+   a document's own `@context` — where redefining a protected term, or nullifying a
+   context that contains one, is an error — and TRUE for a property- or type-scoped
+   context, which is allowed to do both. Without the distinction, the legal case and
+   the illegal one are indistinguishable and one of them has to be got wrong."
+  ([ctx local opts] (process-context ctx local opts false true))
+  ([ctx local opts override-protected?] (process-context ctx local opts override-protected? true))
+  ([ctx local opts override-protected? propagate?]
+  (reduce
+   (fn [acc c]
+     (cond
+       (nil? c)
+       ;; §4.1.2 step 5.1: null resets — but not through a protected term, unless
+       ;; this is a scoped context, which is permitted to clear one
+       (do (when (and (not override-protected?)
+                      (some :protected? (vals (:term-definitions acc))))
+             (fail! "invalid context nullification" {}))
+           (assoc acc :term-definitions {} :vocab nil :language nil
+                  :base (:original-base acc)))
+
+       (string? c)
+       (let [url (resolve-against-base (:base acc) c)
+             remote (or (get (:contexts opts) url) (get (:contexts opts) c))]
+         (when-not remote
+           (fail! "context-not-provided"
+                  {:json-ld/error "context-not-provided" :url url
+                   :note (str "remote contexts are never fetched: a fetched @context "
+                              "lets its host change what a signature covers. Supply "
+                              "it in :contexts.")}))
+         (process-context (assoc acc :base url) (get remote "@context" remote)
+                          (assoc opts :contexts (:contexts opts))))
+
+       (jmap? c)
+       (let [;; §4.1.2: "If propagate is false, and result does not have a previous
+             ;; context, set previous context in result to active context." Decided
+             ;; per context item, because an explicit @propagate applies wherever it
+             ;; is written — not only to the type-scoped default. Deciding it once
+             ;; from the caller's flag ignored `@propagate: false` on a
+             ;; property-scoped or embedded context.
+             item-propagate? (if (contains? c "@propagate")
+                               (get c "@propagate")
+                               propagate?)
+             acc (if (and (not item-propagate?) (not (:previous-context acc)))
+                   (assoc acc :previous-context (dissoc acc :previous-context))
+                   acc)
+             _ (doseq [k (keys c)] (when (unsupported-keywords k) (unsupported! k)))
+             version (get c "@version")
+             _ (when (and version (not= 1.1 version) (not= 1 (compare version 1.1)))
+                 (when-not (== 1.1 version) (fail! "invalid @version value" {:version version})))
+             _ (when (and (contains? c "@propagate")
+                          (not (boolean? (get c "@propagate"))))
+                 (fail! "invalid @propagate value" {:value (get c "@propagate")}))
+             protected (get c "@protected")
+             acc (cond-> acc protected (assoc :protected true))
+             acc (if (contains? c "@base")
+                   (let [b (get c "@base")]
+                     (cond (nil? b) (assoc acc :base nil)
+                           (not (string? b)) (fail! "invalid base IRI" {})
+                           (absolute-iri? b) (assoc acc :base b)
+                           :else (assoc acc :base (resolve-against-base (:base acc) b))))
+                   acc)
+             acc (if (contains? c "@vocab")
+                   (let [v (get c "@vocab")]
+                     (cond (nil? v) (assoc acc :vocab nil)
+                           (not (string? v)) (fail! "invalid vocab mapping" {})
+                           (or (absolute-iri? v) (blank-node-id? v)) (assoc acc :vocab v)
+                           (= "" v) (assoc acc :vocab (:base acc))
+                           :else (assoc acc :vocab (expand-iri acc v {:vocab? true
+                                                                      :document-relative? true}))))
+                   acc)
+             acc (if (contains? c "@language")
+                   (let [l (get c "@language")]
+                     (cond (nil? l) (assoc acc :language nil)
+                           (string? l) (assoc acc :language (str/lower l))
+                           :else (fail! "invalid default language" {})))
+                   acc)
+             terms (remove #{"@base" "@vocab" "@language" "@version" "@protected"
+                             "@direction" "@import" "@propagate"} (keys c))]
+         (first (reduce (fn [[a defined] t]
+                          (create-term-definition a c t defined override-protected?))
+                        [acc {}] terms)))
+
+       :else (fail! "invalid local context" {:context c})))
+   ctx
+   (if (jarray? local) local [local]))))
+
+;; ── §5.3.2 Value Expansion ───────────────────────────────────────────────────
+
+(defn- expand-value [ctx active-property value]
+  (let [def (get (:term-definitions ctx) active-property)
+        tm (:type-mapping def)]
+    (when (= "@json" tm) (unsupported! "@json"))
+    ;; steps 1 and 2 coerce a STRING only: a native number or boolean under
+    ;; @type @id / @vocab stays a value object (it is not a relative IRI)
+    (cond
+      (and (= "@id" tm) (string? value)) {"@id" (expand-iri ctx value {:document-relative? true})}
+      (and (= "@vocab" tm) (string? value)) {"@id" (expand-iri ctx value {:vocab? true :document-relative? true})}
+      :else
+      (cond-> {"@value" value}
+        (and tm (not (#{"@id" "@vocab" "@none"} tm))) (assoc "@type" tm)
+        (and (nil? tm) (string? value)
+             (or (:has-language? def) (:language ctx))
+             (or (:language def) (and (not (:has-language? def)) (:language ctx))))
+        (assoc "@language" (or (:language def)
+                               (when-not (:has-language? def) (:language ctx))))))))
+
+;; ── §5.1.2 Expansion ─────────────────────────────────────────────────────────
+
+(declare expand-element)
+
+(defn- usable-iri?
+  "An absolute IRI with nothing in it that makes it unusable as one. `absolute-iri?`
+   only checks for a scheme, so `http://example.com/baz z` passes it — and a datatype
+   with a space in it is not an IRI, it is a mistake that would be signed."
+  [s]
+  (and (absolute-iri? s)
+       (not (re-find #"[\s\u0000-\u0020<>\"{}|^`\\]" s))))
+
+(defn- expand-value-object [result]
+  ;; §5.1.2 step 13.4.7 validation of a value object
+  (let [v (get result "@value")
+        t (get result "@type")
+        l (get result "@language")]
+    (when-not (every? #{"@value" "@type" "@language" "@index" "@direction"} (keys result))
+      (fail! "invalid value object" {:keys (vec (keys result))}))
+    (when (and t l) (fail! "invalid value object" {:reason "@type with @language"}))
+    (when (and l (not (string? v)) (not (nil? v)))
+      (fail! "invalid language-tagged value" {}))
+    ;; §5.1.2 step 13.4.7: a value object takes ONE datatype, and it must be an IRI.
+    ;; A blank node datatype is only meaningful under generalized RDF, and a string
+    ;; with a space in it is not an IRI at all — both would otherwise be signed as
+    ;; though they meant something.
+    ;;
+    ;; NOTE the single-element array: expansion arrayifies @type for node objects and
+    ;; this function is what unwraps it again, so the check has to run on the
+    ;; NORMALISED value. Validating before unwrapping rejected every ordinary typed
+    ;; literal, including the suite's `basic` case.
+    (let [t1 (if (and (jarray? t) (= 1 (count t))) (first t) t)]
+      (when (some? t1)
+        ;; @json is refused as unsupported, not as a bad datatype: it IS a valid
+        ;; datatype, this library just does not implement JSON literals, and
+        ;; reporting the wrong reason would send a caller looking for a bug in
+        ;; their document.
+        (when (= "@json" t1) (unsupported! "@json"))
+        (when (jarray? t1)
+          (fail! "invalid typed value"
+                 {:reason "a value object takes one datatype" :type t1}))
+        (when-not (string? t1)
+          (fail! "invalid typed value" {:type t1}))
+        (when (blank-node-id? t1)
+          (fail! "invalid typed value" {:reason "a blank node is not a datatype"
+                                        :type t1}))
+        (when-not (usable-iri? t1)
+          (fail! "invalid typed value" {:reason "datatype is not a usable IRI"
+                                        :type t1}))))
+    (cond
+      (nil? v) nil                                          ; @value null: drop
+      :else
+      ;; inside a value object a single @type is a scalar IRI, not an array
+      (if (and (jarray? t) (= 1 (count t)))
+        (assoc result "@type" (first t))
+        result))))
+
+(defn- expand-element
+  [ctx active-property element opts]
+  (cond
+    (nil? element) nil
+
+    (or (string? element) (number? element) (boolean? element))
+    (if (nil? active-property)
+      nil                                                   ; free-floating scalar
+      (if (= "@type" active-property)
+        (expand-iri ctx element {:vocab? true :document-relative? true})
+        (expand-value ctx active-property element)))
+
+    (jarray? element)
+    ;; NOT wrapped in @list here: the property branch owns that decision, and doing
+    ;; it in both places double-wraps into {"@list" [{"@list" ...}]}.
+    (into []
+          (comp (map #(expand-element ctx active-property % opts))
+                (remove nil?)
+                (mapcat (fn [e] (if (jarray? e) e [e]))))
+          element)
+
+    (jmap? element)
+    (let [;; §5.1.2: "If active context has a previous context, the active context is
+          ;; not propagated. If element does not contain an @value entry, and element
+          ;; does not consist of a single @id entry, set active context to previous
+          ;; context." Entering a NEW node object is where a type-scoped context stops
+          ;; applying; a value object or a bare node reference is not a new node.
+          ctx (if (and (:previous-context ctx)
+                       (not (some #(= "@value" (expand-iri ctx % {:vocab? true}))
+                                  (keys element)))
+                       (not (and (= 1 (count element))
+                                 (= "@id" (expand-iri ctx (first (keys element))
+                                                      {:vocab? true})))))
+                (:previous-context ctx)
+                ctx)
+          ;; NOTE the property-scoped context is applied where the VALUE is
+          ;; recursed into (see the ordinary-property branch below), not here.
+          ;; Applying it only here meant a SCALAR value never saw it: the official
+          ;; eddsa-rdfc-2022 vector resolved `proofPurpose: "assertionMethod"` to
+          ;; the wrong IRI because of exactly that, and my own credential test had
+          ;; accepted a third wrong value for want of a reference.
+          ;; local @context
+          ctx (if (contains? element "@context")
+                (process-context ctx (get element "@context") opts)
+                ctx)
+          ;; type-scoped context, applied in lexicographic order of the type values
+          type-key (some (fn [k] (when (= "@type" (expand-iri ctx k {:vocab? true})) k))
+                         (sort (keys element)))
+          ctx (if type-key
+                (reduce (fn [a t]
+                          (let [d (get (:term-definitions a) t)]
+                            ;; A type-scoped context gets the DEFAULT, false. The
+                            ;; spec names "true for override protected" explicitly
+                            ;; where it applies — the property-scoped invocation —
+                            ;; and says nothing here, so the documented default
+                            ;; holds. Passing true made 4 negative cases stop
+                            ;; refusing, which is how the reading was checked.
+                            (if (:has-scoped-context? d)
+                              ;; a type-scoped context does not propagate: override
+                              ;; protected stays at its default too
+                              (process-context a (:scoped-context d) opts false
+                                               (if (and (jmap? (:scoped-context d))
+                                                        (contains? (:scoped-context d)
+                                                                   "@propagate"))
+                                                 (get (:scoped-context d) "@propagate")
+                                                 false))
+                              a)))
+                        ctx
+                        (sort (filter string? (arrayify (get element type-key)))))
+                ctx)
+          result
+          (reduce
+           (fn [res k]
+             (let [v (get element k)]
+               (cond
+                 (= "@context" k) res
+                 :else
+                 (let [ek (expand-iri ctx k {:vocab? true})]
+                   ;; §5.1.2 step 13.4: two different keys expanding to the SAME
+                   ;; keyword is ambiguous, and two processors could resolve it
+                   ;; differently. Refuse rather than let one of them win silently.
+                   (when (and ek (json-ld-keywords ek) (contains? res ek)
+                              (not= ek "@type"))
+                     (fail! "colliding keywords" {:keyword ek :key k}))
+                   (cond
+                     (nil? ek) res
+                     (unsupported-keywords ek) (unsupported! ek)
+
+                     (= "@id" ek)
+                     (if (string? v)
+                       (assoc res "@id" (expand-iri ctx v {:document-relative? true}))
+                       (fail! "invalid @id value" {:value v}))
+
+                     (= "@type" ek)
+                     (let [ts (into [] (comp (map (fn [x]
+                                                    (if (string? x)
+                                                      (expand-iri ctx x {:vocab? true
+                                                                         :document-relative? true})
+                                                      (fail! "invalid type value" {:value x}))))
+                                             (remove nil?))
+                                    (arrayify v))]
+                       ;; §5.1.2: on a NODE object @type is always an array in
+                       ;; expanded form, even from a scalar input. A value object
+                       ;; keeps it scalar, which expand-value-object restores.
+                       (assoc res "@type" ts))
+
+                     (= "@value" ek)
+                     (if (or (nil? v) (string? v) (number? v) (boolean? v))
+                       (assoc res "@value" v)
+                       (fail! "invalid value object value" {:value v}))
+
+                     (= "@language" ek)
+                     (if (string? v)
+                       (assoc res "@language" (str/lower v))
+                       (fail! "invalid language-tagged string" {:value v}))
+
+                     (= "@index" ek)
+                     (if (string? v) (assoc res "@index" v)
+                         (fail! "invalid @index value" {:value v}))
+
+                     (= "@list" ek)
+                     (if (nil? active-property)
+                       res                                  ; free-floating list: dropped
+                       (assoc res "@list" (arrayify (or (expand-element ctx active-property v opts)
+                                                        []))))
+
+                     (= "@set" ek)
+                     (let [e (expand-element ctx active-property v opts)]
+                       (assoc res "@set" e))
+
+                     (= "@graph" ek)
+                     (assoc res "@graph" (into [] (comp (map identity) (remove nil?))
+                                               (arrayify (expand-element ctx nil v opts))))
+
+                     (= "@reverse" ek)
+                     (if (jmap? v)
+                       (assoc res "@reverse"
+                              (reduce-kv (fn [m rk rv]
+                                           (let [erk (expand-iri ctx rk {:vocab? true})
+                                                 ev (expand-element ctx rk rv opts)]
+                                             (if (and erk ev)
+                                               (assoc m erk (arrayify ev)) m)))
+                                         {} v))
+                       (fail! "invalid @reverse value" {:value v}))
+
+                     ;; a key that expands to neither a keyword, an absolute IRI
+                     ;; nor a blank node identifier is DROPPED -- keeping it would
+                     ;; invent a property out of an undefined term
+                     (not (or (absolute-iri? ek) (blank-node-id? ek))) res
+
+                     ;; an ordinary property
+                     :else
+                     (let [def (get (:term-definitions ctx) k)
+                           ;; §5.1.2 step 13.9: a term's own @context governs its
+                           ;; values, whatever shape they have
+                           vctx (if (:has-scoped-context? def)
+                                  ;; a property-scoped context, processed with
+                                  ;; override protected TRUE (§4.1.2)
+                                  (process-context ctx (:scoped-context def) opts true)
+                                  ctx)
+                           ev (expand-element vctx k v opts)
+                           list-container? (and def (some #{"@list"} (:container def)))
+                           graph-container? (and def (some #{"@graph"} (:container def)))
+                           _ (doseq [c (:container def)]
+                               (when-not (supported-containers c)
+                                 (unsupported! (str "@container " c))))
+                           ;; a @json-typed property refuses whatever shape its value
+                           ;; has -- a map never reaches expand-value
+                           _ (when (= "@json" (:type-mapping def)) (unsupported! "@json"))
+                           ev (cond
+                                (nil? ev) (when list-container? [{"@list" []}])
+                                ;; an explicit {"@list" ...} is already wrapped
+                                (and list-container?
+                                     (not (and (jmap? ev) (contains? ev "@list"))))
+                                [{"@list" (arrayify ev)}]
+                                :else (arrayify ev))
+                           ;; §5.1.2 step 13.9: @container @graph wraps each value in
+                           ;; a graph object unless it already is one
+                           ev (if (and graph-container? ev)
+                                (mapv (fn [x]
+                                        (if (and (jmap? x) (contains? x "@graph"))
+                                          x
+                                          {"@graph" (arrayify x)}))
+                                      (arrayify ev))
+                                ev)]
+                       (cond
+                         (nil? ev) res
+                         (:reverse? def)
+                         (update res "@reverse" (fnil into {}) {ek ev})
+                         :else
+                         (update res ek (fnil into []) ev))))))))
+           {}
+           (sort (keys element)))]
+      (cond
+        (contains? result "@value") (expand-value-object result)
+        ;; §5.1.2: a list object carries @list (and at most @index); anything else
+        ;; in it — an @id especially — has no meaning and must not be dropped
+        (and (contains? result "@list")
+             (seq (remove #{"@list" "@index"} (keys result))))
+        (fail! "invalid set or list object"
+               {:keys (vec (remove #{"@list" "@index"} (keys result)))})
+        ;; a @set unwraps
+        (contains? result "@set") (get result "@set")
+        ;; §5.1.2 step 19: drop a free-floating node object
+        (and (nil? active-property)
+             (or (empty? result)
+                 (= #{"@id"} (set (keys result)))))
+        nil
+        (empty? result) nil
+        :else result))
+
+    :else (fail! "invalid element" {:element element})))
+
+(defn expand
+  "Expand a JSON-LD document.
+
+   `doc` is a JSON value as Clojure data: string-keyed maps, vectors, strings,
+   numbers, booleans, nil. Returns a vector of expanded node objects.
+
+   Options:
+   - `:contexts` — url -> context document map. REQUIRED for any document with a
+     remote `@context`; there is no fetching. See the namespace docstring.
+   - `:base` — the document's base IRI.
+   - `:expand-context` — a context applied before the document's own."
+  ([doc] (expand doc nil))
+  ([doc opts]
+   (let [base (:base opts)
+         ctx0 {:term-definitions {} :base base :original-base base :vocab nil :language nil}
+         ctx (if (:expand-context opts)
+               (process-context ctx0 (let [ec (:expand-context opts)]
+                                       (if (and (jmap? ec) (contains? ec "@context"))
+                                         (get ec "@context") ec))
+                                opts)
+               ctx0)
+         out (expand-element ctx nil doc opts)]
+     (cond
+       (nil? out) []
+       (jarray? out) (into [] (remove nil?) out)
+       ;; §5.1 step 3: a lone @graph at the top level is unwrapped
+       (and (jmap? out) (= #{"@graph"} (set (keys out)))) (get out "@graph")
+       :else [out]))))

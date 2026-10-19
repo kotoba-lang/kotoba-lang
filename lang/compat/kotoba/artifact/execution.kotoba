@@ -1,0 +1,142 @@
+(ns kotoba.artifact.execution
+  "Canonical v2 blocks; no policy decisions, runtime execution or host handles."
+  {:kotoba/export [block verify-block binding-block verify-binding intent-block lease-block complete-identity]}
+  (:require [ipld.core :as ipld]
+            [kotoba.value.codec :as value]
+            [kotoba.core.execution :as execution]
+            [kotoba.abi.target :as target]))
+
+(def ^:private kinds
+  #{:profile :binding :intent :identity :lease :input :outcome :receipt :interface
+    :runtime :artifact-envelope :policy :authority})
+(def ^:private max-block-bytes 65536)
+
+(defn- byte-count [bytes]
+  )
+
+(defn- reject! [reason]
+  (throw (ex-info "execution block rejected" {:phase :execution-block :reason reason})))
+
+(defn- validate! [kind descriptor]
+  (when-not (contains? kinds kind) (reject! :unknown-kind))
+  (when-not (case kind
+              :binding (target/valid-binding? descriptor)
+              :intent (execution/valid-execution-intent? descriptor)
+              :identity (execution/valid-execution-identity? descriptor)
+              :lease (execution/valid-capability-lease? descriptor)
+              :receipt (and (map? descriptor)
+                            (= #{:format :intent-cid :profile-binding-cid :artifact-cid
+                                 :runtime-identity :outcome-cid :status :sequence}
+                               (set (keys descriptor)))
+                            (= :kotoba.execution-receipt/v2 (:format descriptor))
+                            (every? execution/cid?
+                                    ((juxt :intent-cid :profile-binding-cid :artifact-cid
+                                           :runtime-identity :outcome-cid) descriptor))
+                            (contains? #{:ok :trap :denied} (:status descriptor))
+                            (nat-int? (:sequence descriptor)))
+              true)
+    (reject! :invalid-descriptor))
+  descriptor)
+
+(defn- links [descriptor]
+  (if (map? descriptor)
+    (into {} (keep (fn [[k v]]
+                    (cond
+                      (execution/cid? v) [(str k) (ipld/link v)]
+                      (and (vector? v) (seq v) (every? execution/cid? v))
+                      [(str k) (mapv ipld/link v)])) descriptor))
+    {}))
+
+(defn- node [kind descriptor]
+  {"format" "kotoba.execution.block.v2" "kind" (name kind)
+   "value" (value/value->form descriptor) "links" (links descriptor)})
+
+(defn block
+  "Closed canonical DAG-CBOR block. EDN/JSON renderings never define its CID."
+  [kind descriptor]
+  (validate! kind descriptor)
+  (let [result (ipld/node->block (node kind descriptor))]
+    (when (> (byte-count (:bytes result)) max-block-bytes) (reject! :block-too-large))
+    (select-keys result [:cid :bytes])))
+
+(defn verify-block
+  "Hash and canonicality check BEFORE decoding the descriptor; caller-supplied
+  :value/:node/:verified flags and wrong domain/codec are rejected."
+  [kind record]
+  (when-not (and (map? record) (= #{:cid :bytes} (set (keys record)))
+                 (execution/cid? (:cid record))
+                 (some? (byte-count (:bytes record)))
+                 (<= (byte-count (:bytes record)) max-block-bytes))
+    (reject! :invalid-block))
+  (let [verified-bytes (ipld/get-verified-block (fn [_] (:bytes record)) (:cid record))
+        decoded (ipld/block->node (:cid record) verified-bytes)]
+    (when-not (and (= #{"format" "kind" "value" "links"} (set (keys decoded)))
+                   (= "kotoba.execution.block.v2" (get decoded "format"))
+                   (= (name kind) (get decoded "kind")))
+      (reject! :wrong-domain))
+    (let [descriptor (value/form->value (get decoded "value"))
+          canonical (block kind descriptor)]
+      (when-not (= (:cid record) (:cid canonical)) (reject! :noncanonical-descriptor))
+      descriptor)))
+
+(defn binding-block [target-id profile artifact-cid interface-cid runtime-identity layout]
+  (let [contract (target/profile-contract target-id profile)]
+    (when-not contract (reject! :unknown-profile))
+    (block :binding
+           {:format :kotoba.target-binding/v2 :target target-id :profile profile
+            :profile-contract-cid (:cid (block :profile contract))
+            :artifact-cid artifact-cid :interface-cid interface-cid
+            :runtime-identity runtime-identity :layout layout})))
+
+(defn verify-binding
+  "Expected values come from the host's independently verified artifact,
+  semantic interface and measured runtime, never from the untrusted binding."
+  [record expected]
+  (when-not (and (map? expected)
+                 (= #{:target :profile :artifact-cid :interface-cid :runtime-identity :layout}
+                    (set (keys expected))))
+    (reject! :invalid-host-expectation))
+  (let [binding (verify-block :binding record)
+        contract (target/profile-contract (:target binding) (:profile binding))]
+    (when-not (and (= expected (select-keys binding (keys expected)))
+                   (= (:profile-contract-cid binding) (:cid (block :profile contract))))
+      (reject! :binding-mismatch))
+    binding))
+
+(defn intent-block [binding-record expected intent]
+  (verify-binding binding-record expected)
+  (when-not (and (= (:profile-binding-cid intent) (:cid binding-record))
+                 (= (:artifact-cid intent) (:artifact-cid expected))
+                 (= (:runtime-identity intent) (:runtime-identity expected)))
+    (reject! :intent-binding-mismatch))
+  (block :intent intent))
+
+(defn lease-block [intent-record lease]
+  (let [intent (verify-block :intent intent-record)]
+    (when-not (and (= (:execution-identity-cid lease) (:cid intent-record))
+                   (= (:artifact-cid lease) (:artifact-cid intent))
+                   (= (:profile-binding-cid lease) (:profile-binding-cid intent)))
+      (reject! :lease-binding-mismatch))
+    (block :lease lease)))
+
+(defn complete-identity
+  "A new completed identity addresses actual output and host receipts. Each
+  receipt must name this exact intent/binding/artifact/runtime and output."
+  [intent-record outcome-record receipt-records]
+  (let [intent (verify-block :intent intent-record)
+        _ (verify-block :outcome outcome-record)]
+    (when-not (and (vector? receipt-records) (seq receipt-records)
+                   (= (count receipt-records) (count (distinct (map :cid receipt-records)))))
+      (reject! :missing-or-duplicate-receipts))
+    (doseq [record receipt-records]
+      (let [receipt (verify-block :receipt record)]
+        (when-not (and (= (:intent-cid receipt) (:cid intent-record))
+                       (= (:profile-binding-cid receipt) (:profile-binding-cid intent))
+                       (= (:artifact-cid receipt) (:artifact-cid intent))
+                       (= (:runtime-identity receipt) (:runtime-identity intent))
+                       (= (:outcome-cid receipt) (:cid outcome-record)))
+          (reject! :receipt-binding-mismatch))))
+    (block :identity
+           (assoc (dissoc intent :invocation-cid) :format :kotoba.execution-identity/v2
+                  :outcome-cid (:cid outcome-record)
+                  :host-receipt-cids (mapv :cid receipt-records)))))

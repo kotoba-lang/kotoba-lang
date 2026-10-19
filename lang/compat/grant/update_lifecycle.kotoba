@@ -1,0 +1,96 @@
+(ns grant.update-lifecycle
+  "Pure OS update scheduling. Crypto, current owner authority, artifact checks,
+  durable CAS, fleet leases and boot recovery are evidence supplied by providers.
+  A deadline never turns missing evidence into permission.")
+
+(def default-policy
+  {:mode :automatic-stable :channel :stable
+   :semi-mandatory? true :high-grace-ms 259200000 :critical-grace-ms 86400000
+   :max-apply-risk :medium :max-concurrent 1})
+(def risk-rank {:low 0 :medium 1 :high 2 :critical 3})
+(defn decision [action reason extra]
+  (merge {:action action :reason reason} extra))
+(defn decide
+  "Release/evidence must be bound to the same signed manifest hash. noticed-at
+  is a durable first notice, never reset on reboot/retry. Owner policy comes
+  from current authenticated authority, never from the downloaded manifest."
+  [release policy evidence now]
+  (let [p (merge default-policy policy)
+        severity (:security-risk release)
+        mandatory? (and (:semi-mandatory? p) (#{:high :critical} severity))
+        grace (if (= severity :critical) (:critical-grace-ms p) (:high-grace-ms p))
+        noticed (:noticed-at evidence)
+        ;; Publisher may request an earlier deadline but cannot bypass local grace.
+        deadline (when (number? noticed)
+                   (max (+ noticed grace) (or (:required-by release) 0)))
+        due? (and mandatory? deadline (>= now deadline))
+        restriction (if due? :drain-and-refuse-new-jobs :none)
+        extra {:deadline (when mandatory? deadline) :fleet restriction}]
+    (cond
+      (not (and (integer? now) (>= now 0) (#{:manual :automatic-stable} (:mode p))
+                (contains? risk-rank severity)
+                (contains? risk-rank (:apply-risk release))
+                (contains? risk-rank (:max-apply-risk p))
+                (integer? grace) (>= grace 0)
+                (contains? #{true false} (:semi-mandatory? p))
+                (#{:stable :canary} (:channel p))
+                (integer? (:max-concurrent p)) (pos? (:max-concurrent p))
+                (integer? (:sequence release)) (integer? (:installed-sequence evidence))
+                (or (nil? (:required-by release)) (integer? (:required-by release)))))
+      (decision :refuse :invalid-policy-or-release {})
+      (not (and (true? (:signature-valid? evidence))
+                (true? (:owner-policy-current? evidence))
+                (true? (:compatible? evidence))
+                (true? (:fresh? evidence))
+                (true? (:time-trusted? evidence))
+                (true? (:rollout-admitted? evidence))))
+      ;; Untrusted metadata may never quarantine a Node or set its deadline.
+      (decision :refuse :release-not-admitted {:fleet :none})
+      (= (:sequence release) (:installed-sequence evidence))
+      (decision :none :already-installed {:fleet :none})
+      (not (and (integer? (:sequence release))
+                (integer? (:installed-sequence evidence))
+                (> (:sequence release) (:installed-sequence evidence))))
+      (decision :refuse :downgrade-or-invalid-sequence {:fleet :none})
+      (not (and (integer? noticed) (>= noticed 0) (<= noticed now)))
+      (decision :notify :record-first-notice {:fleet :none})
+      (not (true? (:closure-verified? evidence)))
+      (decision :stage :complete-verified-closure extra)
+      (not (and (true? (:previous-preserved? evidence))
+                (true? (:boot-recovery-qualified? evidence))
+                (true? (:space-ok? evidence))))
+      (decision :hold :recovery-not-ready extra)
+      (> (risk-rank (:apply-risk release)) (risk-rank (:max-apply-risk p)))
+      (decision :manual-review :application-risk extra)
+      (not= (:channel p) (:channel release))
+      (decision :hold :channel-not-authorized extra)
+      (>= (or (:owner-peers-updating evidence) (:max-concurrent p))
+          (:max-concurrent p))
+      (decision :hold :fleet-lease-unavailable extra)
+      (not (true? (:drained? evidence)))
+      (decision :drain :wait-for-jobs extra)
+      (and (not due?) (number? (:defer-until evidence)) (> (:defer-until evidence) now))
+      (decision :hold :owner-deferred extra)
+      (and (= :manual (:mode p)) (not due?) (not (true? (:apply-consent? evidence))))
+      (decision :hold :manual-policy extra)
+      (and (not due?) (not (true? (:maintenance-window? evidence)))
+           (not (true? (:apply-consent? evidence))))
+      (decision :hold :outside-maintenance-window extra)
+      :else (decision :trial-boot (if due? :security-deadline :scheduled) extra))))
+
+(defn trial-decision
+  "Only local health commits a generation. Internet/account outages do not
+  fail local health. Unknown health at timeout rolls back once, then blocks
+  this release hash until a new release or an explicit operator retry."
+  [{:keys [local-health elapsed-ms timeout-ms attempts max-attempts]}]
+  (cond
+    (not (and (number? elapsed-ms) (>= elapsed-ms 0)
+              (number? timeout-ms) (pos? timeout-ms)
+              (integer? attempts) (>= attempts 0)
+              (integer? max-attempts) (pos? max-attempts)))
+    {:action :refuse :reason :invalid-trial-evidence}
+    (or (= :fail local-health) (>= attempts max-attempts)
+        (and (not= :pass local-health) (>= elapsed-ms timeout-ms)))
+    {:action :rollback :block-release? true}
+    (= :pass local-health) {:action :commit}
+    :else {:action :wait}))

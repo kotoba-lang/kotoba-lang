@@ -1,0 +1,279 @@
+(ns murakumo.web.index
+  "M5 (Phase 2) of ADR-260929: a sharded, content-addressed LEXICAL index.
+
+  Honest scope: this is BM25 over tokens, not semantic (Exa-like) retrieval —
+  that needs an embedding model and is a later step. What is distributed here
+  is the index itself: terms hash to shards, every shard is an immutable EDN
+  document stored by CID, and a query touches only the shards its terms live in,
+  so shards can sit on different nodes (`shard-fetcher` is injected).
+
+  Tokenisation: ASCII/Latin words are lower-cased whole tokens; runs of CJK
+  (Hiragana, Katakana, Han) become overlapping character bigrams (a single
+  character stays a unigram), because there are no spaces to split on.
+
+  Everything is pure and deterministic: FNV-1a term hashing, integer scores
+  (BM25 x 1e6) and (score desc, url asc) ordering give the same CIDs on every host."
+  (:require [kotoba.lang.text :as text]
+            [murakumo.canonical :as canonical]
+            [murakumo.web :as web]
+            [murakumo.web.worker :as w]))
+
+(def default-shards 16)
+(def k1 1.2)
+(def b 0.75)
+(def score-scale 1000000)
+(def max-doc-tokens 20000)
+
+;; --- tokenisation --------------------------------------------------------------
+
+(defn- code-at [s i] )
+(defn- code [c] )
+
+(defn- cjk? [c]
+  (or (<= 0x3040 c 0x30FF) (<= 0x3400 c 0x4DBF) (<= 0x4E00 c 0x9FFF) (<= 0xF900 c 0xFAFF)))
+
+(defn- word-char? [c]
+  (or (<= 48 c 57) (<= 97 c 122) (<= 65 c 90)
+      (and (>= c 0xC0) (not (cjk? c))
+           (not (<= 0x2000 c 0x206F)) (not (<= 0x3000 c 0x303F)) (not (<= 0xFF00 c 0xFF0F))
+           (not (<= 0xFF1A c 0xFF20)) (not (<= 0xFE30 c 0xFE4F)))))
+
+(defn tokenize
+  "string -> vector of tokens (order preserved, duplicates kept)."
+  [s]
+  (let [s (text/lower (str s))
+        n (count s)]
+    (loop [i 0 word [] cjk [] out []]
+      (let [flush-word (fn [o] (if (seq word) (conj o (apply str word)) o))
+            flush-cjk (fn [o] (cond (empty? cjk) o
+                                    (= 1 (count cjk)) (conj o (first cjk))
+                                    :else (into o (map (fn [[a b]] (str a b)) (partition 2 1 cjk)))))]
+        (if (= i n)
+          (flush-cjk (flush-word out))
+          (let [ch (subs s i (inc i))
+                c (code (code-at s i))]
+            (cond
+              (cjk? c) (recur (inc i) [] (conj cjk ch) (flush-word out))
+              (word-char? c) (recur (inc i) (conj word ch) [] (flush-cjk out))
+              :else (recur (inc i) [] [] (flush-cjk (flush-word out))))))))))
+
+;; --- hashing / sharding ----------------------------------------------------------
+
+(defn fnv1a
+  "32-bit FNV-1a over UTF-8 bytes of s, unsigned, in plain arithmetic.
+  JS bit operators are signed 32-bit, so bit-and/bit-xor over a full 32-bit
+  value would disagree with the JVM and change the shard map between hosts:
+  only the low byte is xor-ed, and the multiply by the prime 2^24 + 403 is split
+  so no intermediate exceeds 2^53."
+  [s]
+  (reduce (fn [h byte]
+            (let [lo (mod h 256)
+                  x (+ (- h lo) (bit-xor lo (bit-and byte 0xff)))]
+              (mod (+ (* (mod x 256) 16777216) (* x 403)) 4294967296)))
+          2166136261
+          (seq (w/utf8-bytes s))))
+
+(defn shard-of [term n-shards] (mod (fnv1a term) n-shards))
+
+;; --- build -----------------------------------------------------------------------
+
+(defn build
+  "docs: [{:cid :url :title :text}] -> {:root {...} :shards [{:cid :doc}] :docs-doc}
+  `root` (the manifest) and every shard are plain data; `store!` turns them into CIDs."
+  ([docs] (build docs default-shards))
+  ([docs n-shards]
+   (let [docs (vec (sort-by :url docs))
+         tokenised (mapv (fn [d] (vec (take max-doc-tokens (tokenize (str (:title d) " " (:text d)))))) docs)
+         lens (mapv count tokenised)
+         postings (reduce (fn [acc [di toks]]
+                            (reduce (fn [acc [term tf]] (update-in acc [term] (fnil conj []) [di tf]))
+                                    acc (frequencies toks)))
+                          {} (map-indexed vector tokenised))
+         by-shard (reduce (fn [acc [term ps]] (assoc-in acc [(shard-of term n-shards) term] ps))
+                          {} postings)]
+     {:n-shards n-shards
+      :docs (mapv (fn [d len] {:cid (:cid d) :url (:url d) :title (:title d) :len len}) docs lens)
+      :avg-len (if (seq lens) (quot (* score-scale (reduce + lens)) (count lens)) 0)
+      :shards (mapv (fn [i] {:shard i :terms (into (sorted-map) (get by-shard i {}))}) (range n-shards))})))
+
+(defn- put-doc! [put! doc]
+  (let [bs (w/utf8-bytes (canonical/string doc))
+        cid (w/raw-cid bs)]
+    (when (put! cid bs) cid)))
+
+(defn store!
+  "Store shards then the root. Returns the root CID or nil if any put failed."
+  [put! {:keys [n-shards docs avg-len shards]}]
+  (let [shard-cids (mapv #(put-doc! put! %) shards)]
+    (when (every? some? shard-cids)
+      (put-doc! put! {:kind :web/index :version 1 :n-shards n-shards :n-docs (count docs)
+                      :avg-len avg-len :docs docs :shards shard-cids}))))
+
+;; --- query -----------------------------------------------------------------------
+
+(def ^:private ln2 0.6931471805599453)
+
+(defn ln
+  "Natural log from + - * / only. IEEE-754 basic operations are exactly rounded on
+  every host, so this returns bit-identical doubles everywhere, unlike Math.log /
+  Math/log whose last bit may differ between V8 and the JVM (and that would let a
+  score or a tie flip, changing shard-independent result order and CIDs)."
+  [x]
+  (loop [x (double x) e 0]
+    (cond
+      (>= x 1.5) (recur (/ x 2.0) (inc e))
+      (< x 0.75) (recur (* x 2.0) (dec e))
+      :else
+      (let [t (/ (- x 1.0) (+ x 1.0)) t2 (* t t)]
+        (+ (* e ln2)
+           (* 2.0 (loop [k 0 term t acc 0.0]
+                    (if (= k 40) acc
+                        (recur (inc k) (* term t2) (+ acc (/ term (+ (* 2.0 k) 1.0))))))))))))
+
+(defn- idf [n-docs df]
+  ;; BM25+ style non-negative idf: ln(1 + (N - df + 0.5)/(df + 0.5))
+  (ln (+ 1.0 (/ (+ (- n-docs df) 0.5) (+ df 0.5)))))
+
+(defn- bm25 [n-docs avg-len len df tf]
+  (let [avg (/ avg-len (double score-scale))
+        denom (+ tf (* k1 (+ (- 1 b) (* b (/ len (max avg 1.0))))))]
+    (* (idf n-docs df) (/ (* tf (+ k1 1)) denom))))
+
+(defn query
+  "root: index manifest map; shard-fetcher: (fn [shard-cid] -> shard map | nil);
+  returns {:results [{:url :title :cid :score}] :shards-touched n :missing-shards [i ...]}.
+  A shard that cannot be fetched is reported, never treated as 'no matches'."
+  [root shard-fetcher query-string k]
+  (let [terms (distinct (tokenize query-string))
+        {:keys [n-shards docs shards avg-len]} root
+        n-docs (count docs)
+        wanted (group-by #(shard-of % n-shards) terms)
+        fetched (into {} (map (fn [i] [i (shard-fetcher (nth shards i))]) (keys wanted)))
+        missing (vec (sort (keep (fn [[i sh]] (when (nil? sh) i)) fetched)))
+        scores (reduce
+                (fn [acc term]
+                  (let [ps (get-in fetched [(shard-of term n-shards) :terms term] [])
+                        df (count ps)]
+                    (reduce (fn [acc [di tf]]
+                              (update acc di (fnil + 0.0)
+                                      (bm25 n-docs avg-len (:len (nth docs di)) df tf)))
+                            acc ps)))
+                {} terms)
+        ranked (->> scores
+                    (map (fn [[di s]] (let [d (nth docs di)]
+                                        {:url (:url d) :title (:title d) :cid (:cid d)
+                                         :score (long (* s score-scale))})))
+                    (sort-by (fn [r] [(- (:score r)) (:url r)]))
+                    (take k) vec)]
+    {:results ranked :shards-touched (count wanted) :missing-shards missing}))
+
+;; --- evaluation --------------------------------------------------------------------
+
+(defn recall-at-k
+  "Fraction of `expected` urls found in the top k of `results` (nil if none expected).
+  For comparing this index with Phase 1 federated results on a FIXED query set."
+  [results expected k]
+  (when (seq expected)
+    (let [got (set (map :url (take k results)))]
+      (/ (count (filter got expected)) (double (count expected))))))
+
+;; --- jobs: build from a crawl, query the index ---------------------------------------
+
+(defn- read-edn [bs]
+  )
+
+(defn- html-content? [ct] (boolean (and ct (re-find #"(?i)html" ct))))
+
+(defn- page-authentic?
+  "A page enters the index only with a signed :web/fetch receipt from THIS node
+  that names exactly this page. A manifest handed in from elsewhere (for example
+  a fetched web page that happens to be EDN) carries no such receipts."
+  [receipt-valid? {:keys [url cid status receipt signature]}]
+  (let [ev (:evidence receipt)]
+    (boolean
+     (and (= :web/fetch (:kind receipt))
+          (= cid (:output-cid receipt))
+          (integer? status) (<= 200 status 299) (= status (:status ev))
+          (= url (:final-url ev))
+          (html-content? (:content-type ev))
+          (string? signature)
+          (receipt-valid? receipt signature)))))
+
+(defn index-crawl!
+  "job {:job-id :manifest-cid [:shards]} -> {:ok {:root-cid :docs n :receipt :signature}} | {:refused ..}
+  env needs :receipt-valid? (fn [receipt signature] -> bool), true only for receipts
+  this node signed. Reads a crawl manifest and its HTML pages from this node's
+  store. Pages that are missing, unauthentic or non-2xx are counted, and a build
+  that indexes nothing is a refusal, not an empty success."
+  [{:keys [get-bytes! put! sign! now-ms node-did receipt-valid?]} {:keys [job-id manifest-cid shards] :as job}]
+  (let [valid (web/validate-job (assoc job :kind :web/index))]
+    (if (:refused valid)
+      {:refused :job/invalid :detail (:refused valid)}
+      (let [started (now-ms)
+            mbs (get-bytes! manifest-cid)]
+        (cond
+          (nil? receipt-valid?) {:refused :index/no-receipt-verifier}
+          (nil? mbs) {:refused :index/manifest-missing :detail manifest-cid}
+          (not= manifest-cid (w/raw-cid mbs)) {:refused :index/manifest-cid-mismatch}
+          :else
+          (let [manifest (try (read-edn mbs) (catch  _ nil))]
+            (if-not (and (map? manifest) (string? (:crawl-id manifest)) (vector? (:pages manifest)))
+              {:refused :index/not-a-crawl-manifest}
+              (let [pages (:pages manifest)
+                    authentic (filterv #(page-authentic? receipt-valid? %) pages)
+                    loaded (into [] (keep (fn [{:keys [cid url]}]
+                                            (when-let [bs (get-bytes! cid)]
+                                              (when (= cid (w/raw-cid bs))
+                                                (let [html (w/utf8-string bs)]
+                                                  {:cid cid :url url :title (or (w/title-of html) "")
+                                                   :text (w/html->markdown html)})))))
+                                 authentic)
+                    counts {:pages (count pages) :rejected (- (count pages) (count authentic))
+                            :missing (- (count authentic) (count loaded))}]
+                (if (empty? loaded)
+                  {:refused :index/no-documents :detail counts}
+                  (let [root-cid (store! put! (build loaded (or shards default-shards)))]
+                    (if-not root-cid
+                      {:refused :store/put-failed}
+                      (let [r (web/receipt {:job-id job-id :kind :web/index
+                                            :input-cids (into [manifest-cid] (map :cid loaded))
+                                            :output-cid root-cid :node-did node-did
+                                            :started-at started :finished-at (max started (now-ms))
+                                            :evidence (assoc counts :docs (count loaded)
+                                                             :shards (or shards default-shards))})]
+                        {:ok {:root-cid root-cid :docs (count loaded) :counts counts :receipt r
+                              :signature (sign! (web/receipt-signing-string r))}}))))))))))))
+
+(defn search-index!
+  "job {:job-id :root-cid :query :k} against shards in this node's store."
+  [{:keys [get-bytes! put! sign! now-ms node-did]} {:keys [job-id root-cid k] :as job}]
+  (let [valid (web/validate-job (assoc job :kind :web/search))
+        query-string (:query job)
+        rbs (when (string? root-cid) (get-bytes! root-cid))]
+    (cond
+      (:refused valid) {:refused :job/invalid :detail (:refused valid)}
+      (empty? (tokenize (str query-string))) {:refused :job/invalid :detail [:job/query-no-tokens]}
+      (nil? rbs) {:refused :index/root-missing :detail root-cid}
+      (not= root-cid (w/raw-cid rbs)) {:refused :index/root-cid-mismatch}
+      :else
+      (let [started (now-ms)
+            root (read-edn rbs)
+            fetcher (fn [cid] (when-let [bs (get-bytes! cid)]
+                                (when (= cid (w/raw-cid bs)) (read-edn bs))))
+            q (query root fetcher query-string k)]
+        (if (seq (:missing-shards q))
+          {:refused :index/shards-unavailable :detail (:missing-shards q)}
+          (let [doc {:query query-string :k k :source :index :root-cid root-cid
+                     :results (mapv #(assoc % :untrusted true) (:results q))}
+                bs (w/utf8-bytes (canonical/string doc))
+                cid (w/raw-cid bs)]
+            (if-not (put! cid bs)
+              {:refused :store/put-failed}
+              (let [r (web/receipt {:job-id job-id :kind :web/search :input-cids [root-cid]
+                                    :output-cid cid :node-did node-did
+                                    :started-at started :finished-at (max started (now-ms))
+                                    :evidence {:source :index :results (count (:results q))
+                                               :shards-touched (:shards-touched q)
+                                               :query-hash (w/content-hash (w/utf8-bytes query-string))}})]
+                {:ok {:results-cid cid :results doc :receipt r
+                      :signature (sign! (web/receipt-signing-string r))}}))))))))

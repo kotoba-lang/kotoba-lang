@@ -1,0 +1,124 @@
+(ns inga-node.seams
+  "The four seams `inga.replica` takes, filled with `node:crypto`.
+
+  `hash-fn`, `sign-fn` and `verify-fn` are called from inside pure folds, so
+  they must be SYNCHRONOUS. On a Worker that ruled out `crypto.subtle` and
+  forced `@noble/*`; in a long-lived Node process `node:crypto` is
+  synchronous already and is the platform's own implementation.
+
+  ## The bytes match the Worker deployment on purpose
+
+  `canonical-block` is copied from `inga-replica.seams`, field for field. Two
+  implementations of one chain that hash blocks differently are two chains
+  that cannot see each other, and the migration off Durable Objects wants
+  both halves able to coexist while it happens. If this ever has to change,
+  it changes in both places in one commit or not at all."
+  (:require [kotoba.lang.text :as str]
+            ["node:crypto" :as nc]))
+
+(defn- canonical-block
+  "Field-per-line with names, so two different blocks cannot collide by
+  juxtaposition. `proposals` are joined with a separator that cannot occur
+  inside one: a canonical head record is JSON on a single line, so a newline
+  is safe and a comma is not."
+  [b]
+  (str "inga/block/v1\n"
+       "height=" (:inga.block/height b) "\n"
+       "parent=" (:inga.block/parent-hash b) "\n"
+       "proposer=" (:inga.block/proposer b) "\n"
+       "ts=" (:inga.block/ts b) "\n"
+       "justify=" (or (:inga.qc/block-hash (:inga.block/justify b)) "") "\n"
+       "proposals=" (count (:inga.block/proposals b)) "\n"
+       (str/join "" (map #(str "  " % "\n") (:inga.block/proposals b)))))
+
+(defn hash-fn [b]
+  (-> (nc/createHash "sha256")
+      (.update (canonical-block b) "utf8")
+      (.digest "hex")))
+
+(defn- der-private
+  "A raw 32-byte Ed25519 seed wrapped in the PKCS#8 DER `node:crypto` wants.
+  The prefix is fixed for Ed25519, so this is a splice rather than an
+  encoder — an ASN.1 library for one constant is a dependency that buys
+  nothing."
+  [seed-bytes]
+  (nc/createPrivateKey
+   #js {:key (js/Buffer.concat
+              #js [(js/Buffer.from #js [0x30 0x2e 0x02 0x01 0x00 0x30 0x05 0x06
+                                        0x03 0x2b 0x65 0x70 0x04 0x22 0x04 0x20])
+                   (js/Buffer.from seed-bytes)])
+        :format "der" :type "pkcs8"}))
+
+(defn- der-public [pub-bytes]
+  (nc/createPublicKey
+   #js {:key (js/Buffer.concat
+              #js [(js/Buffer.from #js [0x30 0x2a 0x30 0x05 0x06 0x03 0x2b 0x65
+                                        0x70 0x03 0x21 0x00])
+                   (js/Buffer.from pub-bytes)])
+        :format "der" :type "spki"}))
+
+(defn public-hex
+  "The 32-byte public key of `seed-hex`, as hex. This is the ONLY thing about
+  a witness's identity that ever leaves the machine that generated it."
+  [seed-hex]
+  (-> (der-private (js/Buffer.from seed-hex "hex"))
+      (as-> k (nc/createPublicKey k))
+      (.export #js {:format "der" :type "spki"})
+      (.subarray 12)
+      (.toString "hex")))
+
+(defn sign-fn [seed-hex]
+  (let [sk (der-private (js/Buffer.from seed-hex "hex"))]
+    (fn [payload]
+      (.toString (nc/sign nil (js/Buffer.from payload "utf8") sk) "base64"))))
+
+(defn verify-fn
+  "`[witness payload sig] -> boolean` over a `{witness -> hex-pubkey}` table.
+
+  A witness nobody has a key for verifies as FALSE, never as unknown — the
+  rule `inga.attest/lookup-verifier` states, for the reason it states: taking
+  'I was not asked' for acceptance turns a gap in bookkeeping into an
+  accepted signature."
+  [pubkeys]
+  (fn [w payload sig]
+    (if-let [hex (get pubkeys (name w))]
+      (try (nc/verify nil (js/Buffer.from payload "utf8")
+                      (der-public (js/Buffer.from hex "hex"))
+                      (js/Buffer.from sig "base64"))
+           (catch :default _ false))
+      false)))
+
+;; ── ref writers (inga.writer) ─────────────────────────────────────────────
+
+(def ^:private b58-alphabet "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+(defn- b58-decode
+  "base58btc text -> Buffer, or nil on a character outside the alphabet."
+  [text]
+  (let [digits (map #(.indexOf b58-alphabet %) text)]
+    (when (every? #(>= % 0) digits)
+      (let [n (reduce (fn [acc d] (+ (* acc (js/BigInt 58)) (js/BigInt d))) (js/BigInt 0) digits)
+            hex (if (= n (js/BigInt 0)) "" (.toString n 16))
+            hex (if (odd? (count hex)) (str "0" hex) hex)
+            zeros (count (take-while #(= "1" %) (map str text)))]
+        (js/Buffer.concat #js [(js/Buffer.alloc zeros) (js/Buffer.from hex "hex")])))))
+
+(defn did-key->ed25519-pub
+  "The 32 raw public-key bytes of an Ed25519 did:key, or nil for anything
+  else (another curve, a malformed key)."
+  [did]
+  (when (and (string? did) (str/starts-with? did "did:key:z"))
+    (when-let [raw (b58-decode (subs did (count "did:key:z")))]
+      (when (and (= 34 (.-length raw)) (= 0xed (aget raw 0)) (= 0x01 (aget raw 1)))
+        (.subarray raw 2)))))
+
+(defn writer-verify-fn
+  "`(fn [writer text sig])` for `inga.writer/admit`: `writer` is an Ed25519
+  did:key and `sig` the base64 signature over `text`, the same encoding
+  `sign-fn` produces. Anything unreadable verifies as false."
+  []
+  (fn [writer text sig]
+    (if-let [pub (did-key->ed25519-pub writer)]
+      (try (nc/verify nil (js/Buffer.from text "utf8") (der-public pub) (js/Buffer.from sig "base64"))
+           (catch :default _ false))
+      false)))

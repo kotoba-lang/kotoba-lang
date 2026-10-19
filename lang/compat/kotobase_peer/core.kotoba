@@ -1,0 +1,2609 @@
+;; kotobase-peer.core — the kotobase peer library (Datomic's own term for
+;; the transact/q/pull library an application embeds; this repo was named
+;; kotobase-engine until ADR-2607050700), assembled
+;; from the already-landed Wave 1-3 primitives (ADR-2607010930 Phase 6 +
+;; ADR-2607022600): arrangement (hot 4-covering-index Arrangement + query
+;; routing + per-commit snapshot -- formerly two repos, quad-store and kqe,
+;; merged into one per ADR-2607050700), chain (append-only chain/verify,
+;; renamed from commit-dag per ADR-2607050800). This is the piece
+;; that implements the `ai.gftd.apps.kotobase.datomic.*` surface
+;; (transact/datoms/q/pull) end to end, backed by content-addressed,
+;; verifiable persistence, in CLJC.
+;;
+;; ADR-2607032430 (log-structured write path): the original `commit!` snapshotted
+;; a full hot db into 4 fresh prolly-trees on EVERY write -- O(graph). Confirmed
+;; live 2026-07-03 as the root cause of a CF Worker CPU-limit collapse (error 1102)
+;; during a 321-actor mass write. `commit!` is now a novelty-log APPEND (O(tx)):
+;; chain's opaque `state` carries `{"indexed" <snapshot Link>|nil "novelty-front"
+;; <Link>|nil "novelty-back" <Link>|nil "novelty-count" <int>}` -- a two-list
+;; persistent-queue novelty log (kotoba-lang/kotobase-peer#16; front/back are
+;; cons-chains of small nodes, not a flat vector -- see the "persistence"
+;; section below for the full design and why the ORIGINAL D1 landing's flat-
+;; vector `"novelty"` [<tx-block Link> ...] was still O(n) per write despite
+;; this comment's O(tx) claim). A write puts one small tx block and pushes ONE
+;; new small cons node onto `novelty-back`, touching neither a prolly-tree,
+;; the graph itself, nor any EXISTING novelty entry. `fold!` compacts novelty
+;; into a fresh `indexed` snapshot (the same O(graph) work the old `commit!` always
+;; did, now amortized over however many writes accumulated first) and is content-
+;; addressed -- deterministic, safe for any writer (server cron, a browser at idle)
+;; to run redundantly. Reads go through `hot-datoms` (indexed snapshot, range-pruned,
+;; + novelty merged in memory) instead of `hydrate-db` + `datoms` wherever a full hot
+;; db value isn't actually needed.
+;;
+;; Composition decision (resolves the ADR-2607022600 "quad-store/commit! and
+;; commit-dag are two unmerged implementations" gap -- quoting that ADR's own
+;; wording verbatim; "quad-store" in the quote is arrangement post-ADR-2607050700
+;; rename, "commit-dag" in the quote is chain post-ADR-2607050800 rename):
+;; arrangement/commit! is called
+;; with `prev` always nil here — it is used ONLY to snapshot the 4 indexes into
+;; content-addressed prolly-trees and return one CID for that snapshot. Chain
+;; history, `:seq`, and tamper/gap verification are chain's job, wrapping
+;; the {indexed, novelty} state map as its opaque `state`. Neither library is
+;; modified; this namespace is the seam between them.
+(ns kotobase-peer.core
+  (:require    ; both expose read-string over EDN
+            [kotoba.lang.text :as str]
+            [ipld.core :as ipld]
+            [ipld.value :as ipld-value]
+            [kotobase.blockcodec.core :as bc]
+            [prolly-tree.core :as pt]
+            [arrangement.core :as qs]
+            [arrangement.query :as kqe]
+            [arrangement.datalog :as datalog]
+            [chain.core :as cd]
+            [datom.core :as dc]
+            [kotobase-peer.transactor :as transactor]
+            [kotobase-peer.statistics :as stats]))   ; canonical datom model (kotoba : kotobase = Clojure : Datomic)
+
+(defn- verified-node [get-fn expected-cid]
+  (when-let [bytes (get-fn expected-cid)]
+    (let [actual (ipld/cid bytes)]
+      (when-not (= expected-cid actual)
+        (throw (ex-info "kotobase-peer: block CID mismatch"
+                        {:type :ipld/cid-mismatch :expected-cid expected-cid
+                         :actual-cid actual})))
+      (ipld/decode bytes))))
+
+
+
+;; ── platform split for the crypto-touching functions below (ADR-2607051000
+;; Worker addendum): `blind-fn`/`encrypt-fn`/`decrypt-fn` are synchronous on
+;; JVM, `js/Promise`-returning on cljs (Web Crypto's `crypto.subtle` has no
+;; synchronous AEAD/HMAC primitive — see `arrangement.core`'s identical
+;; platform-contract note, which this repo's crypto-touching fns inherit).
+;; `put!`/`get-fn` stay synchronous, unchanged, on both platforms — only the
+;; crypto step is async, resolved before any (still-synchronous) tree/chain
+;; write. Every fn below that touches `blind-fn`/`encrypt-fn`/`decrypt-fn`
+;; therefore returns its result directly on JVM, a `js/Promise` of it on
+;; cljs — this file's own sibling of `arrangement.core`'s split.
+
+
+
+
+(defn empty-db [] (qs/empty-db))
+
+(defn- ->quad-value
+  "Coerce one quad position: an `ipld.core/Link` passes through unchanged (so
+   it survives to `assert-quad`'s `ref?` check as a genuine Link, ADR-2607050200);
+   anything else stringifies as before (general typed-value support beyond
+   Link -- int/bytes/bool/list/map -- remains a follow-up, ADR-2607023200 §6-5)."
+  [v] (if (ipld/link? v) v (str v)))
+
+(defn- ->quad
+  "Coerce one tx-data item to a `{:s :p :o}` quad (`:s`/`:p` always coerced to
+   strings; `:o` passes an `ipld.core/Link` through unchanged, see
+   `->quad-value`). Accepts a `{:s :p :o}` map, `[:db/add e a v]`, or a bare
+   `[e a v]` triple."
+  [item]
+  (cond
+    ;; entity-level retraction (ADR-2607071610): {:s .. :op :retract-entity}
+    ;; carries no :p/:o
+    (and (map? item) (= :retract-entity (:op item)) (contains? item :s))
+    {:s (str (:s item)) :op :retract-entity}
+
+    (and (map? item) (contains? item :s) (contains? item :p) (contains? item :o))
+    (cond-> {:s (str (:s item)) :p (str (:p item)) :o (->quad-value (:o item))}
+      (:op item) (assoc :op (:op item)))
+
+    (and (vector? item) (= 4 (count item)) (= :db/add (first item)))
+    (let [[_ e a v] item] {:s (str e) :p (str a) :o (->quad-value v)})
+
+    ;; attr-level retraction (ADR-2607071610)
+    (and (vector? item) (= 4 (count item)) (= :db/retract (first item)))
+    (let [[_ e a v] item] {:s (str e) :p (str a) :o (->quad-value v) :op :retract})
+
+    ;; entity-level retraction (ADR-2607071610)
+    (and (vector? item) (= 2 (count item)) (= :db/retractEntity (first item)))
+    {:s (str (second item)) :op :retract-entity}
+
+    (and (sequential? item) (= 3 (count item)))
+    (let [[e a v] item] {:s (str e) :p (str a) :o (->quad-value v)})
+
+    :else
+    (throw (ex-info "kotobase-peer: unrecognized tx-data item"
+                     {:item item}))))
+
+(defn- retract-entity*
+  "Retract every quad whose subject is `s` from the hot db (`:eavt` lookup —
+  O(|entity|), ADR-2607071610 :retract-entity)."
+  [db s ref?]
+  (reduce-kv (fn [db p os]
+               (reduce (fn [db o] (qs/retract-quad db {:s s :p p :o o} ref?)) db os))
+             db (get-in db [:eavt s] {})))
+
+(defn- apply-quad
+  "Apply one :op-tagged quad to the hot db (ADR-2607071610). Missing :op =
+  :assert — old novelty blocks and plain quads stay valid unchanged."
+  [db {:keys [op] :as q} ref?]
+  (case (or op :assert)
+    :assert         (qs/assert-quad db q ref?)
+    :retract        (qs/retract-quad db q ref?)
+    :retract-entity (retract-entity* db (:s q) ref?)))
+
+(defn- apply-quads
+  "Apply `quads` in order, batching consecutive ASSERTS through the bulk
+   accumulator and falling back to one persistent step per retract.
+
+   Same reason as `hydrate-db-cached`'s `build` (root ADR-2609100100): a
+   persistent assert allocates a fresh db across four indexes, so a run of K
+   asserts leaves K-1 of them as garbage, and this path runs where memory is
+   the binding constraint -- the folds that die sit near the 128 MB isolate
+   ceiling while the requests that answer use a tenth of it.
+
+   Order is preserved exactly, which is the property that matters: novelty is
+   chronological, and `bounded-fold-across-front-exhaustion-preserves-
+   chronological-retraction-order` is the test that says why. A run is flushed
+   before any retract, so assert-then-retract-then-assert of the same quad ends
+   asserted, as it did before.
+
+   Retracts stay one at a time. `retract-quad` and `:retract-entity` have no
+   bulk form, and inventing one here would be a second implementation of
+   semantics that already has one."
+  [db quads ref?]
+  (let [flush (fn [db run]
+                (if (seq run)
+                  (qs/persist-db (qs/assert-quads! (qs/mutable-db db) run ref?))
+                  db))]
+    (loop [db db, qs (seq quads), run []]
+      (if-let [q (first qs)]
+        (if (= :assert (or (:op q) :assert))
+          (recur db (next qs) (conj run q))
+          (recur (apply-quad (flush db run) q ref?) (next qs) []))
+        (flush db run)))))
+
+(defn- asserted? [db {:keys [s p o]}]
+  (contains? (get (qs/entity-attrs db s) p #{}) o))
+
+(defn transact-effective
+  "Apply raw TX-DATA and return only state-changing datom deltas. Duplicate
+  asserts and missing retracts emit nothing. `:retract-entity` expands the
+  entity's currently asserted triples in deterministic order."
+  ([db tx-data] (transact-effective db tx-data ipld/link?))
+  ([db tx-data ref?]
+   (reduce
+    (fn [{:keys [db-after] :as result} item]
+      (let [{:keys [s p o op] :as quad} (->quad item)
+            op (or op :assert)]
+        (case op
+          :assert
+          (if (asserted? db-after quad)
+            result
+            {:db-after (qs/assert-quad db-after quad ref?)
+             :effective-deltas (conj (:effective-deltas result)
+                                     {:e s :a p :v o :op :assert})})
+
+          :retract
+          (if-not (asserted? db-after quad)
+            result
+            {:db-after (qs/retract-quad db-after quad ref?)
+             :effective-deltas (conj (:effective-deltas result)
+                                     {:e s :a p :v o :op :retract})})
+
+          :retract-entity
+          (let [deltas (->> (qs/entity-attrs db-after s)
+                            (mapcat (fn [[attr values]]
+                                      (map (fn [value]
+                                             {:e s :a attr :v value :op :retract})
+                                           values)))
+                            (sort-by (juxt :a #(pr-str (:v %))))
+                            vec)]
+            {:db-after (retract-entity* db-after s ref?)
+             :effective-deltas (into (:effective-deltas result) deltas)}))))
+    {:db-after db :effective-deltas []}
+    tx-data)))
+
+(defn transact-with-statistics
+  "Normalize and apply TX-DATA, then refresh scoped query statistics at
+  NEW-EPOCH from the effective deltas only. Returns both immutable results."
+  ([db tx-data query-statistics new-epoch]
+   (transact-with-statistics db tx-data ipld/link? query-statistics new-epoch))
+  ([db tx-data ref? query-statistics new-epoch]
+   (let [{:keys [db-after effective-deltas]} (transact-effective db tx-data ref?)]
+     {:db-after db-after
+      :effective-deltas effective-deltas
+      :query-statistics (stats/refresh-query-statistics query-statistics
+                                                        effective-deltas new-epoch)})))
+
+(defn- retraction-filters
+  "Set-based snapshot-half cancellation for `hot-datoms` (ADR-2607071610):
+  which [s p o] triples / s entities do the novelty blocks retract? Order-
+  safe because re-asserts after a retract live in the novelty half, whose
+  ordered replay re-emits them."
+  [quads]
+  (reduce (fn [acc {:keys [s p o op]}]
+            (case op
+              :retract        (update acc :triples conj [s p o])
+              :retract-entity (update acc :entities conj s)
+              acc))
+          {:triples #{} :entities #{}} quads))
+
+(defn- remove-retracted
+  "Drop cold/snapshot rows cancelled by novelty retractions."
+  [{:keys [triples entities]} rows]
+  (if (and (empty? triples) (empty? entities))
+    rows
+    (remove (fn [{:keys [e a v_edn]}]
+              (or (contains? entities e)
+                  (contains? triples [e a (qs/edn->link (edn/read-string v_edn))])))
+            rows)))
+
+(defn transact
+  "Apply `tx-data` (a seq of `{:s :p :o}` quads, `[:db/add e a v]`, or `[e a v]`
+   triples) to `db`. Returns the new (immutable) db value. `ref?` is passed
+   through to `arrangement.core/assert-quad` for reverse-reference indexing
+   (default `ipld.core/link?`, ADR-2607050200 -- a value asserted as a Link is
+   automatically reverse-indexed, see `refs`).
+
+   A pure hot-db utility, independent of persistence strategy -- used
+   internally by `fold!` (via `hydrate-db`'s reduce, not this fn directly) and
+   available for anyone assembling/inspecting a hot db value directly (tests,
+   migration/backfill tooling). The write path proper is `commit!`, below."
+  ([db tx-data] (transact db tx-data ipld/link?))
+  ([db tx-data ref?]
+   (:db-after (transact-effective db tx-data ref?))))
+
+;; ── schema: Datomic-style "schema is just datoms too" ───────────────────────
+;; (one of the "3 pillars" this landing adds.) An attribute is a normal
+;; entity, using its own NAME as its entity id (Datomic's `:db/ident`
+;; pattern) -- `db/valueType`/`db/cardinality`/`db/unique` facts ABOUT it are
+;; ordinary datoms, queryable like anything else, not a side-channel config
+;; the db doesn't know about. `bootstrap-attrs` is the one fixed exception:
+;; describing an attribute's schema requires asserting `db/valueType`/etc.
+;; facts, which are themselves attributes -- Datomic solves this bootstrap
+;; problem with a small built-in meta-schema those specific attributes are
+;; exempt from needing a schema entry for; this landing does the same.
+
+(def bootstrap-attrs
+  "Meta-schema attributes describing OTHER attributes -- these never need a
+  schema entry of their own. Declaring them about some attribute name IS
+  how that attribute gets its first schema entry; a database with zero
+  schema installed can still bootstrap its first one. `db/tupleTypes`
+  (ADR-2607061200 value-type follow-up) declares a `:tuple` attribute's
+  fixed per-position value types."
+  #{"db/valueType" "db/cardinality" "db/unique" "db/doc" "db/tupleTypes"})
+
+(defn- raw-triple
+  "Like `->quad`, but the `:o`/`v` position is NOT coerced (Link-passthrough
+  or stringified) -- the caller's ORIGINAL value, for `transact-with-
+  schema`'s `:db/valueType` check to inspect before `->quad`'s
+  stringification would erase e.g. an int's actual type. Returns `[s p o]`,
+  not yet a quad map; storage still goes through the normal `->quad`
+  coercion afterward (schema validates the value's type at the API
+  boundary, it does not change the on-disk string-based representation
+  every other value already uses)."
+  [item]
+  (cond
+    (and (map? item) (contains? item :s) (contains? item :p) (contains? item :o))
+    [(str (:s item)) (str (:p item)) (:o item)]
+
+    (and (vector? item) (= 4 (count item)) (= :db/add (first item)))
+    (let [[_ e a v] item] [(str e) (str a) v])
+
+    (and (sequential? item) (= 3 (count item)))
+    (let [[e a v] item] [(str e) (str a) v])
+
+    :else
+    (throw (ex-info "kotobase-peer: unrecognized tx-data item" {:item item}))))
+
+(defn- schema-value->wire
+  "One `install-schema` declaration value -> its wire string. A keyword
+  stores by `name` (`:string` -> \"string\"); `db/tupleTypes`'s vector of
+  per-position types stores comma-joined (`[:string :long]` -> \"string,
+  long\") rather than a stringified EDN vector -- simpler to parse back
+  (`str/split`) than round-tripping through `edn/read-string`, and this
+  substrate's other schema fields are already single plain strings."
+  [v]
+  (cond
+    (vector? v) (str/join "," (map #(if (keyword? %) (name %) (str %)) v))
+    (keyword? v) (name v)
+    :else (str v)))
+
+(defn install-schema
+  "Assert schema declarations as ordinary datoms (see the ns section
+  comment above): `schema` is `{attr-name {:db/valueType t :db/cardinality
+  c :db/unique u :db/doc \"...\" :db/tupleTypes [t1 t2 ...]}}` (each key
+  optional; values may be keywords -- `:string`, `:one`, `:identity`,
+  etc. -- or plain strings; `:db/tupleTypes` is a vector of per-position
+  value-types, only meaningful when `:db/valueType` is `:tuple`).
+  `db/doc` is purely informational, never validated by `transact-with-
+  schema`."
+  ([db schema] (install-schema db schema ipld/link?))
+  ([db schema ref?]
+   (transact db
+             (for [[attr decl] schema
+                   [k v] decl
+                   :let [k-name (subs (str k) 1)]        ; :db/valueType -> "db/valueType"
+                   :when (contains? bootstrap-attrs k-name)]
+               [attr k-name (schema-value->wire v)])
+             ref?)))
+
+(defn schema-of
+  "Derive `{attr-name {:value-type _ :cardinality _ :unique _ :tuple-
+  types _}}` from whatever `db/valueType`/`db/cardinality`/`db/unique`/
+  `db/tupleTypes` datoms already exist in `db` (see `install-schema`) --
+  schema is just data the db already has, not a side-channel a caller
+  must separately track. `:cardinality` defaults to `\"many\"`
+  (arrangement's own native cardinality-agnostic behavior, ADR-2607061200
+  pillar note) when an attribute has SOME schema entry but no explicit
+  `db/cardinality`. `:tuple-types` is a vector of value-type strings
+  (parsed back from `db/tupleTypes`'s comma-joined wire string), or `nil`."
+  [db]
+  (into {}
+        (keep (fn [[ent attrs]]
+                (let [vt (first (get attrs "db/valueType"))
+                      card (first (get attrs "db/cardinality"))
+                      uniq (first (get attrs "db/unique"))
+                      tuple-types-str (first (get attrs "db/tupleTypes"))]
+                  (when (or vt card uniq tuple-types-str)
+                    [ent {:value-type vt :cardinality (or card "many") :unique uniq
+                          :tuple-types (some-> tuple-types-str (str/split #","))}]))))
+        (:eavt db)))
+
+(defn- validate-value-type!
+  "`value-type` -> the check run against the ORIGINAL value `v` (before
+  `->quad`'s string coercion -- see `raw-triple`). `tuple-types` (a
+  vector of per-position value-type strings, from `db/tupleTypes`) is
+  only consulted when `value-type` is `\"tuple\"`.
+
+  `\"bigdec\"`/`\"bigint\"` are deliberately NOT included: cljs/JS has no
+  true arbitrary-precision decimal/integer type, so a check that's
+  meaningful on JVM (`decimal?`) would ALWAYS fail on cljs/nbb -- a
+  cross-platform correctness mismatch this codebase avoids elsewhere
+  (see e.g. `avg`'s forced double division in `arrangement.datalog`),
+  not an oversight."
+  [attr value-type v tuple-types]
+  (case value-type
+    "string"  (when-not (string? v)
+                (throw (ex-info "kotobase-peer: schema violation -- expected a string" {:attr attr :value v})))
+    "long"    (when-not (integer? v)
+                (throw (ex-info "kotobase-peer: schema violation -- expected a long" {:attr attr :value v})))
+    "double"  (when-not (number? v)
+                (throw (ex-info "kotobase-peer: schema violation -- expected a double" {:attr attr :value v})))
+    "boolean" (when-not (boolean? v)
+                (throw (ex-info "kotobase-peer: schema violation -- expected a boolean" {:attr attr :value v})))
+    "ref"     (when-not (ipld/link? v)
+                (throw (ex-info "kotobase-peer: schema violation -- expected a ref (ipld/Link)" {:attr attr :value v})))
+    "uuid"    (when-not (uuid? v)
+                (throw (ex-info "kotobase-peer: schema violation -- expected a uuid" {:attr attr :value v})))
+    "instant" (when-not (inst? v)
+                (throw (ex-info "kotobase-peer: schema violation -- expected an instant" {:attr attr :value v})))
+    "keyword" (when-not (keyword? v)
+                (throw (ex-info "kotobase-peer: schema violation -- expected a keyword" {:attr attr :value v})))
+    "symbol"  (when-not (symbol? v)
+                (throw (ex-info "kotobase-peer: schema violation -- expected a symbol" {:attr attr :value v})))
+    "bytes"   (when-not 
+                (throw (ex-info "kotobase-peer: schema violation -- expected bytes" {:attr attr :value v})))
+    "tuple"   (do
+                (when-not (vector? v)
+                  (throw (ex-info "kotobase-peer: schema violation -- expected a tuple (vector)" {:attr attr :value v})))
+                (when-not (= (count tuple-types) (count v))
+                  (throw (ex-info "kotobase-peer: schema violation -- tuple arity mismatch"
+                                  {:attr attr :expected (count tuple-types) :got (count v)})))
+                (dorun (map (fn [t elem] (validate-value-type! attr t elem nil)) tuple-types v)))
+    nil))
+
+(defn- normalize-inline-schema
+  "Caller-passed inline schema declarations (`install-schema`'s own
+  `{:db/valueType t :db/cardinality c :db/unique u :db/tupleTypes
+  [t1 ...]}` shape) -> the SAME `{:value-type _ :cardinality _ :unique _
+  :tuple-types _}` shape `schema-of` derives from already-installed
+  datoms, so `transact-with-schema`'s `(merge (schema-of db) schema)`
+  actually reconciles the two instead of one shape silently shadowing
+  the other with mismatched keys.
+
+  This fixes a real bug: an inline `{:db/valueType :long}` passed
+  directly to `transact-with-schema` (never pre-installed via
+  `install-schema`) was previously a SILENT no-op for value-type
+  validation -- `effective-schema`'s entry for that attr ended up in the
+  caller's raw `:db/valueType`-keyed shape, and `(get-in ... [p
+  :value-type])` looked for a key (`:value-type`) that was never there,
+  returning `nil` and skipping the check entirely."
+  [schema]
+  (into {}
+        (map (fn [[attr decl]]
+               [attr {:value-type (some-> (:db/valueType decl) name)
+                      :cardinality (or (some-> (:db/cardinality decl) name) "many")
+                      :unique (some-> (:db/unique decl) name)
+                      :tuple-types (some->> (:db/tupleTypes decl)
+                                            (mapv #(if (keyword? %) (name %) (str %))))}]))
+        schema))
+
+(defn transact-with-schema
+  "Like `transact`, but OPT-IN schema enforcement (plain `transact` is
+  completely unchanged -- every existing caller keeps working exactly as
+  before): validates every tx-data item against `schema` (merged with
+  whatever `schema-of` already derives from `db`, so a caller can declare
+  brand-new attributes in the very same call that writes their first
+  data, Datomic's own \"schema is just a transaction too\" idiom) BEFORE
+  applying any of them.
+    - an attribute with no schema entry (and not `bootstrap-attrs`, which
+      describe schema itself and need none) throws -- Datomic's own
+      \"attribute must be installed before use\" discipline.
+    - a declared `:value-type` mismatch (checked against the ORIGINAL
+      value, before `->quad`'s string coercion -- see `raw-triple`)
+      throws.
+    - a declared `:cardinality \"one\"` attribute automatically retracts
+      any PRIOR value(s) for that `(s, p)` pair before asserting the new
+      one -- this fn's own job, NOT `arrangement.core/assert-quad`'s
+      (arrangement stays cardinality-agnostic per its own ns docstring;
+      cardinality is a POLICY layered on top here, the same way
+      `visible?`/`blind-fn`/`encrypt-fn` are layered rather than baked
+      into arrangement).
+    - a declared `:unique \"identity\"`/`\"value\"` attribute throws if
+      the `(attr, value)` pair already belongs to a DIFFERENT entity.
+  Applied in tx-data order against the RUNNING db, so a later item can
+  rely on an earlier item's cardinality-one retraction having already
+  happened."
+  ([db tx-data schema] (transact-with-schema db tx-data ipld/link? schema))
+  ([db tx-data ref? schema]
+   (let [effective-schema (merge (schema-of db) (normalize-inline-schema schema))]
+     (reduce
+      (fn [db item]
+        (let [[s p o] (raw-triple item)]
+          (when-not (or (contains? bootstrap-attrs p) (contains? effective-schema p))
+            (throw (ex-info "kotobase-peer: unknown attribute -- no schema declared (see install-schema)"
+                            {:attr p})))
+          (when-let [vt (get-in effective-schema [p :value-type])]
+            (validate-value-type! p vt o (get-in effective-schema [p :tuple-types])))
+          (when (contains? #{"identity" "value"}
+                           (get-in effective-schema [p :unique]))
+            (let [quad-o (->quad-value o)
+                  existing (qs/by-predicate-value db p quad-o)]
+              (when (and (seq existing) (not= existing #{s}))
+                (throw (ex-info "kotobase-peer: unique attribute violation -- value already belongs to a different entity"
+                                {:attr p :value quad-o :existing existing})))))
+          (let [db (if (= "one" (get-in effective-schema [p :cardinality] "many"))
+                     (reduce (fn [db old-o] (qs/retract-quad db {:s s :p p :o old-o} ref?))
+                             db
+                             (disj (get (qs/entity-attrs db s) p #{}) (->quad-value o)))
+                     db)]
+            (qs/assert-quad db {:s s :p p :o (->quad-value o)} ref?))))
+      db
+      tx-data))))
+
+(defn transact-with-report
+  "Like `transact`, but returns a Datomic-shaped tx-report --
+   `{:db-before :db-after :tx-data}` -- instead of the bare new db value.
+   No `:tempids` (see `commit-with-report!`'s docstring for why)."
+  ([db tx-data] (transact-with-report db tx-data ipld/link?))
+  ([db tx-data ref?]
+   {:db-before db :db-after (transact db tx-data ref?) :tx-data (mapv ->quad tx-data)}))
+
+(defn with
+  "Datomic's `with`: apply `tx-data` to `db` SPECULATIVELY and return the
+   tx-report -- a pure function, db value in, `{:db-before :db-after
+   :tx-data}` out, nothing persisted anywhere (no `put!`/`chain` touched
+   at all). This substrate's `transact`/`transact-with-report` already
+   ARE exactly this -- a hot db value in, a new hot db value out, no
+   persistence -- so `with` is simply that mechanism under Datomic's own
+   name, for a caller specifically looking for it."
+  ([db tx-data] (transact-with-report db tx-data))
+  ([db tx-data ref?] (transact-with-report db tx-data ref?)))
+
+;; ── datafication via the canonical datom model (datom-clj) ───────────────────
+;; kotoba : kotobase = Clojure : Datomic (ADR-2607032500). An entity tx-map is
+;; turned into `[e a v]` datoms by `datom.core/eavt` — kotoba's shared datom
+;; representation, the same `[e a v]` `kotoba.kgraph` (the language's in-mem view)
+;; speaks and the same shape `transact`/`->quad` already accept. The kotobase
+;; datom DATABASE thus consumes the language's datom model instead of a private
+;; entity→quad reimplementation.
+
+(defn tx-map->datoms
+  "Datafy one Datomic-style entity tx-map `{:db/id e :ns/a v …}` → `[e a v]`
+   datoms (`datom.core/eavt`)."
+  [ent]
+  (dc/eavt ent))
+
+(defn entities->datoms
+  "Flatten a seq of entity tx-maps into `[e a v]` datoms (`datom.core/eavt`)."
+  [entities]
+  (vec (mapcat dc/eavt entities)))
+
+(defn transact-tx
+  "Transact a seq of entity tx-maps into `db`: datafy through the canonical datom
+   model (`entities->datoms`), then `transact`. The peer library's entity-transaction
+   expressed in kotoba's datom representation."
+  ([db entities] (transact-tx db entities ipld/link?))
+  ([db entities ref?] (transact db (entities->datoms entities) ref?)))
+
+(defn- v->edn
+  "Serialize an arrangement value to the EDN string the kotobase wire uses -- a
+   Link renders as `qs/link->edn`'s `[\"ipld/link\" cid]` form (readable, no
+   custom reader needed), anything else pr-str's directly as before. Matches
+   the shape the pre-existing DataScript-backed `kotobase.engine` (app-aozora)
+   produced, for wire compatibility."
+  [v] (pr-str (qs/link->edn v)))
+
+(defn datoms
+  "`datomic.datoms`-shaped rows `{:e :a :v_edn :added}`, AppView-scan compatible
+   (same wire shape as the DataScript-backed `kotobase.engine` this replaces).
+
+   `visible?` is REQUIRED (ADR-2607050500: Query is a first-class effect all
+   the way up this stack, `q`'s own precedent -- no permissive default). It is
+   applied as a post-filter over each candidate ROW, i.e. `(visible? {:e :a
+   :v_edn :added})` -- the same `datomic.datoms`-shaped map this fn returns,
+   NOT `arrangement.query`'s `{:s :p :o}` quad shape (`:e`/`:a` name the same
+   positions as `:s`/`:p`, but `:v_edn` is already the wire-encoded EDN string,
+   not the raw decoded value, and `:added` is present too) -- a caller
+   filtering by entity/attribute (the common case: can this actor see this
+   entity, is this attribute public) needs no decoding to do so; a caller
+   that must decide on the raw value can `clojure.edn/read-string` `:v_edn`
+   itself. Pass `(constantly true)` to see everything, as an explicit choice.
+
+   2-arg (`[db visible?]`) → whole-db (:eavt full scan, unchanged). 3-arg
+   additionally honors an optional `{:index :components :limit}` SERVER-SIDE
+   via arrangement's index accessors, so a filtered read (e.g. getBackup by
+   entity, or by [attr value]) materialises ONLY the matching entity/attr
+   instead of the whole graph — the root fix for the deployed wasm worker
+   ignoring index/components_edn/limit and rehydrating the full graph per read
+   (ADR-2607022330 addendum 2).
+
+   `:index` ∈ #{:eavt :aevt :avet :vaet} (default :eavt); `:components` is an
+   ordered prefix in that index's key order (:eavt=[e a v], :aevt/:avet=
+   [a …], :vaet=[v a …] -- reverse-reference only, populated for ref-valued
+   quads, see the :vaet case below); values are the opaque strings
+   arrangement stores (the PDS's :db/id for e, `:ns/attr` for a, the stored
+   value string for v). `kotoba-lang/kotobase-client`'s own `datoms` has
+   always documented `:vaet` as a valid index (see its docstring) -- this
+   fn previously had no matching `case` clause AND no default, so any
+   caller actually sending `:vaet` (a documented, not hypothetical, request
+   shape) crashed with an unhandled-case exception instead of a graceful
+   error. Confirmed 2026-07-08, fixed here. `visible?` is applied BEFORE `:limit`
+   is taken, so `:limit` caps the row count the caller actually receives (all
+   of them visible), not the count of raw candidates scanned."
+  ([db visible?] (datoms db nil visible?))
+  ([db {:keys [index components limit]} visible?]
+   (let [[c0 c1] components
+         triples
+         (case (or index :eavt)
+           ;; EAVT — key order [e a v]
+           :eavt (cond
+                   (and c0 c1) (for [v (get (qs/entity-attrs db c0) c1 #{})] [c0 c1 v])
+                   c0          (for [[a vs] (qs/entity-attrs db c0), v vs]   [c0 a v])
+                   :else       (for [[e pm] (:eavt db), [a vs] pm, v vs]      [e a v]))
+           ;; AEVT — key order [a e v]
+           :aevt (cond
+                   c0    (for [[e vs] (qs/by-predicate db c0), v vs]   [e c0 v])
+                   :else (for [[a em] (:aevt db), [e vs] em, v vs]      [e a v]))
+           ;; AVET — key order [a v e]; [a v] is arrangement's point lookup
+           :avet (cond
+                   (and c0 c1) (for [e (qs/by-predicate-value db c0 c1)] [e c0 c1])
+                   c0          (for [[e vs] (qs/by-predicate db c0), v vs] [e c0 v])
+                   :else       (for [[a em] (:aevt db), [e vs] em, v vs]    [e a v]))
+           ;; VAET — key order [v a e]; [v a] is arrangement's point lookup
+           ;; (`refs-to`, reverse-reference). Populated ONLY for quads whose
+           ;; value was asserted as a truthy `ref?` (`transact`'s own default:
+           ;; `ipld.core/link?`) -- same scope `refs`/`entity-attr` already
+           ;; document. `:components` narrows first by value (`c0`), then by
+           ;; attribute (`c1`) -- reverse order from AEVT/AVET's own
+           ;; attribute-first components, matching Datomic's own VAET key
+           ;; order (value, then attribute, then entity).
+           :vaet (cond
+                   (and c0 c1) (for [e (get (qs/refs-to db c0) c1 #{})] [e c1 c0])
+                   c0          (for [[a es] (qs/refs-to db c0), e es]   [e a c0])
+                   :else       (for [[o pm] (:vaet db), [a es] pm, e es] [e a o])))
+         rows (for [[e a v] triples] {:e e :a a :v_edn (v->edn v) :added true})
+         rows (filter visible? rows)
+         rows (cond->> rows limit (take limit))]
+     (vec rows))))
+
+(defn q
+  "`datomic.q`-equivalent: `pattern` is `[s p o]` (nil = wildcard), routed to
+   the matching index via `arrangement.query`. Returns a set of `{:s :p :o}`
+   quads. NOTE: triple-pattern only, no join across clauses -- see `query`
+   below for that.
+
+   `visible?` is REQUIRED, cascaded straight from `arrangement.query/query`
+   (ADR-2607050500: Query is a first-class effect all the way up this
+   stack, not just at arrangement's layer) -- pass `(constantly true)` to
+   see everything, as an explicit choice."
+  [db pattern visible?]
+  (kqe/query db pattern visible?))
+
+(defn- datalog-var? [x]
+  (and (symbol? x) (str/starts-with? (name x) "?")))
+
+(defn- reorderable-triple? [clause]
+  (and (vector? clause) (= 3 (count clause))))
+
+(defn- supplied-cardinality [query-statistics statistics-scope query-epoch
+                             max-statistics-age pattern]
+  (let [scope (or (get query-statistics "visibility-scope")
+                  (:visibility-scope query-statistics))
+        statistics-epoch (or (get query-statistics "epoch")
+                             (:epoch query-statistics))
+        clauses (or (get query-statistics "clauses")
+                    (:clauses query-statistics))]
+    (when (and (= statistics-scope scope)
+               (stats/query-statistics-fresh? statistics-epoch query-epoch
+                                                max-statistics-age))
+      (some (fn [statistic]
+              (when (= pattern (or (get statistic "pattern") (:pattern statistic)))
+                (or (get statistic "rows") (:rows statistic))))
+            clauses))))
+
+(defn- relation-size
+  "The planner's estimate for `[nil attr nil]`: the number of SUBJECTS
+  holding `attr` -- `(count (get (:aevt db) attr))`, O(1) on the persistent
+  map -- not the number of datoms.
+
+  It used to be the exact datom count, cached per (attr, identity of the
+  attribute's `:aevt` inner map) so a plan did not pay a reduce over every
+  bucket (ayatori iteration 20: 9.2 ms of planning for a sub-millisecond
+  IC08). Under writes that cache is a storm: every insert touching the
+  attribute replaces the inner map, so the next plan recounts the whole
+  relation -- on the full SF1 that is 2-3M buckets, 80-100 ms, and it
+  showed as p95 spikes on exactly the reads whose queries carry an
+  all-open clause on an attribute the stream writes (IC08 and IS7 on
+  replyOf, IS2 on creationDate/content) while IC02, whose creationDate
+  clause is a fused range and not this shape, stayed at 0.6 ms (iteration
+  36, 2026-09-11). Subjects instead of datoms: identical for a
+  cardinality-one attribute, a lower bound for a multi-valued one, and the
+  only consumer is clause ORDERING plus a keep-the-keyed-path hint whose
+  threshold is single digits -- neither is moved by the difference."
+  [db attr]
+  (count (get (:aevt db) attr {})))
+
+(defn datalog-query-plan
+  "Compile a safe cost-ordered plan for a plain conjunctive Datalog query.
+   Positive triple clauses commute, so their visible cardinalities can drive
+   `plan-clause-order`. Queries containing negation, functions, rules, or `or`
+   retain source order because those forms have binding/safety semantics."
+  ([db query visible?] (datalog-query-plan db query visible? []))
+  ([db query visible? inputs]
+   (let [where (:where query)]
+     (if (every? reorderable-triple? where)
+       (let [input-vars (vec (remove #{'$} (or (:in query) [])))
+             input-bindings (into {} (map vector input-vars inputs))
+             query-statistics (:query-statistics query)
+             statistics-scope (:statistics-scope query)
+             query-epoch (:query-epoch query)
+             max-statistics-age (:max-statistics-age query 0)
+             clauses (mapv (fn [id clause]
+                             (let [pattern (mapv (fn [term]
+                                                   (cond
+                                                     (= term '_) nil
+                                                     (contains? input-bindings term) (get input-bindings term)
+                                                     (datalog-var? term) nil
+                                                     :else term))
+                                                 clause)
+                                   supplied (supplied-cardinality query-statistics
+                                                                  statistics-scope query-epoch
+                                                                  max-statistics-age pattern)]
+                               {:id id
+                                :clause clause
+                                :vars (into #{} (filter datalog-var?) clause)
+                                ;; Three versions of this line, each measured:
+                                ;;
+                                ;; `(count (kqe/query ...))` hashed 361,246 rows
+                                ;; into a set and discarded it -- 38% of an LDBC
+                                ;; IC09 query, every call
+                                ;; (bench/results/2026-08-02-scan-instrumentation.edn).
+                                ;;
+                                ;; `kqe/cardinality` removed the set but still
+                                ;; walks every candidate to apply `visible?`.
+                                ;; Measured 2026-08-13 on LDBC SF-0.1,
+                                ;; `[_ ":label" "Message"]` (286,744 rows):
+                                ;; 96.393 ms. In a harness with the same
+                                ;; fallback that made the PLAN cost 101 ms for a
+                                ;; query whose execution cost 2.3 ms.
+                                ;;
+                                ;; `kqe/estimate-cardinality` reads the covering
+                                ;; indexes directly: 0.0129 ms for the same
+                                ;; number, 7,470x. It ignores `visible?`, so
+                                ;; with authorization in play it is an UPPER
+                                ;; BOUND -- which is the safe direction in both
+                                ;; places this number is used. Ordering by an
+                                ;; overestimate can pick a worse order but never
+                                ;; a wrong answer, and the executor treats a
+                                ;; larger `:clause-cardinality` as a reason to
+                                ;; stay on the keyed path, which is already its
+                                ;; default when it has no hint at all.
+                                :estimated-rows (cond
+                                                  (some? supplied) supplied
+                                                  (and (nil? (nth pattern 0)) (some? (nth pattern 1)) (nil? (nth pattern 2)))
+                                                  (relation-size db (nth pattern 1))
+                                                  :else (kqe/estimate-cardinality db pattern))
+                                :estimate-source (if (some? supplied)
+                                                   :materialized-statistics
+                                                   :index-estimate)
+                                ;; What the executor's hash-join budget reads is
+                                ;; the size of the BROAD relation it would scan
+                                ;; (constants only, every variable open), not
+                                ;; the rows this clause matches once `:in`
+                                ;; inputs are substituted. The two coincide for
+                                ;; a clause without inputs; for one WITH an
+                                ;; input they differ by the whole relation.
+                                ;; Measured 2026-09-11 (ayatori iteration 17):
+                                ;; LDBC IC08's `[?msg "hasCreator" ?person]`
+                                ;; estimates 0 for a person with no message, the
+                                ;; budget read 0 <= 4 as "small relation", and
+                                ;; hash-joined a broad scan of 86,932 rows to
+                                ;; find nothing -- 60 ms for an empty answer
+                                ;; against 2.1 ms for a non-empty one. Estimating
+                                ;; the broad relation instead was measured too:
+                                ;; ~10 ms per clause on that relation, which made
+                                ;; every non-empty IC08 6x slower. So the hint
+                                ;; is WITHHELD for an input-narrowed clause, and
+                                ;; the executor takes its documented default --
+                                ;; the keyed path -- which is the right one when
+                                ;; one binding pins the key.
+                                :input-narrowed? (boolean (some #(contains? input-bindings %) clause))}))
+                           (range) where)
+             plan (stats/plan-clause-order clauses)]
+         {:query (assoc query
+                        :where (mapv :clause plan)
+                        ;; The same estimates that chose the order, handed to
+                        ;; the executor so it can also choose a STRATEGY per
+                        ;; clause: one broad scan plus a hash join when a
+                        ;; clause's relation is small relative to the number
+                        ;; of keyed scans a step would issue for it, keyed
+                        ;; scans otherwise (arrangement.datalog, ADR-2608021000
+                        ;; §6-4-1). These numbers were already computed and
+                        ;; then thrown away; the executor was left guessing at
+                        ;; something the planner had measured.
+                        :clause-cardinality
+                        (into {} (comp (remove :input-narrowed?) (map (juxt :clause :estimated-rows))) plan))
+          :plan plan
+          :optimized? true})
+       {:query query
+        :plan (mapv (fn [id clause] {:id id :clause clause :step id})
+                    (range) where)
+        :optimized? false}))))
+
+(def ^:private plan-cache
+  "query value -> {:query <the planned query> :uses n}. A plan is a clause
+  ORDER plus cardinality hints; any order answers the same rows, so a cached
+  plan is never wrong, only possibly stale against drifting statistics. It
+  is refreshed after `plan-cache-uses` uses. Keyed by the query's VALUE
+  (its shape), not its inputs, the way a prepared statement is: measured
+  2026-09-12 (ayatori iteration 41, JFR on IS3 at saturation on the full
+  SF1), planning was 12% of the request -- `plan-clause-order` over a
+  5-clause query on every call."
+  (atom {}))
+
+(def ^:private plan-cache-uses 1024)
+
+(defn- planned-query [db find+where visible? inputs]
+  (let [hit (get @plan-cache find+where)]
+    (if (and hit (< (:uses hit) plan-cache-uses))
+      (do (swap! plan-cache update-in [find+where :uses] inc)
+          (:query hit))
+      (let [{q :query} (datalog-query-plan db find+where visible? inputs)]
+        (swap! plan-cache assoc find+where {:query q :uses 1})
+        q))))
+
+(defn query
+  "`datomic.api/q`-equivalent: `{:find [?var ...] :in [?param ...] :where
+   [[e a v] ...] :rules [...]}` conjunctive multi-clause join over
+   `arrangement.datalog/q` (ADR-2607061200 staged Datalog roadmap + query-
+   language follow-up). `:where` clauses may be `(not [e a v])`,
+   `(rule-name ?arg ...)`, `[(fn-sym arg...)]` / `[(fn-sym arg...)
+   result-var]` (a whitelisted predicate/function call), or
+   `(or clause ...)` / `(or-join [?shared ...] clause ...)`. `:find`
+   elements may be `(count ?v)`/`(count-distinct ?v)`/`(sum ?v)`/
+   `(avg ?v)`/`(min ?v)`/`(max ?v)` alongside plain variables, and
+   `:rules` may define recursive relations (`[[(rule-name ?param ...)
+   clause ...] ...]`, evaluated to a least fixpoint via semi-naive
+   iteration). `inputs` (optional 4th arg, positional, matching `:in`'s
+   order) supplies extra query parameters. See `arrangement.datalog`'s
+   ns docstring for the full grammar and for why negation/recursion/
+   `or` are all safe against `visible?` (enforced in arrangement, this
+   fn is a straight passthrough). Returns a set of `:find`-ordered
+   vectors. `visible?` is REQUIRED, same convention as `q` above."
+  ([db find+where visible?] (query db find+where visible? []))
+  ([db find+where visible? inputs]
+   (datalog/q db (planned-query db find+where visible? inputs) visible? inputs)))
+
+;; ── pull: a Datomic-shaped pull-pattern language over entity-attrs/refs-to ──
+;; (one of the "3 pillars" this landing adds -- ADR-2607061200's own note
+;; that pull's flat `{p #{o...}}` was a deliberately minimal Stage-0 landing).
+
+(defn- pull-wildcard? [attr] (= attr '*))
+(defn- pull-map-spec? [attr] (map? attr))
+(defn- reverse-attr? [a] (str/starts-with? a "_"))
+(defn- reverse-attr-name [a] (subs a 1))
+
+(defn- pull1
+  "Pull entity `s` per pull-pattern `pattern` (a vector of pull-attrs, see
+  `pull`'s docstring). `seen` is the set of entity ids already being
+  expanded on this recursion path -- an entity already on the path is
+  returned as `{}` rather than re-expanded, so a cyclic graph can never
+  loop forever, REGARDLESS of whether the caller wrote an explicit `n`/
+  `'...` recursion limit or not (unconditional cycle safety, not just a
+  courtesy for well-behaved callers)."
+  [db s pattern seen]
+  (let [attrs (qs/entity-attrs db s)         ; {p #{o...}}
+        seen' (conj seen s)
+        expand (fn [ref sub-pattern]
+                 (if (contains? seen' ref) {} (pull1 db ref sub-pattern seen')))]
+    (reduce
+     (fn [acc attr]
+       (cond
+         (pull-wildcard? attr) (merge acc attrs)
+
+         (and (string? attr) (reverse-attr? attr))
+         (assoc acc attr (get (qs/refs-to db s) (reverse-attr-name attr) #{}))
+
+         (string? attr)
+         (assoc acc attr (get attrs attr #{}))
+
+         (pull-map-spec? attr)
+         (let [[a spec] (first attr)
+               reverse? (reverse-attr? a)
+               refs (if reverse? (get (qs/refs-to db s) (reverse-attr-name a) #{}) (get attrs a #{}))]
+           (assoc acc a
+                  (cond
+                    (vector? spec)
+                    (into #{} (map #(expand % spec)) refs)
+
+                    (or (integer? spec) (= spec '...))
+                    (if (and (integer? spec) (<= spec 0))
+                      refs
+                      (into #{} (map #(expand % ['* {a (if (integer? spec) (dec spec) '...)}])) refs))
+
+                    :else acc)))
+
+         :else acc))
+     {}
+     pattern)))
+
+(defn pull
+  "`datomic.pull`-equivalent for entity `s`. 2-arg form is unchanged: flat
+   `{p #{o...}}` (arrangement has no cardinality tracking, so every
+   attribute is multi-valued -- a caller expecting single-valued Datomic
+   pull semantics must pick e.g. `first`).
+
+   3-arg form takes a Datomic-shaped pull PATTERN, a vector of pull-attrs:
+     - a plain attr string        -> that attr's value set, flat (as above)
+     - `'*`                        -> every attr the entity has (wildcard)
+     - `\"_attr\"` (leading `_`)   -> reverse nav: every entity referencing
+                                      THIS one via `attr` (`refs`/VAET-style),
+                                      flat
+     - `{attr [sub-pattern ...]}`  -> nested pull: treat attr's value(s) (or,
+                                      for `\"_attr\"`, its referrers) as
+                                      entity ids and pull each with
+                                      sub-pattern
+     - `{attr n}` / `{attr '...}`  -> recursive wildcard pull through attr,
+                                      `n` levels deep or unlimited -- cycle-
+                                      safe either way (see `pull1`), so a
+                                      graph cycle can't loop forever even
+                                      with `'...`."
+  ([db s] (qs/entity-attrs db s))
+  ([db s pattern] (pull1 db s pattern #{})))
+
+;; ── entity: lazy navigational entity API (ADR-2607061200 follow-up) ────────
+;; Datomic's `entity` returns an object that behaves like a Clojure map but
+;; transparently navigates ref-valued attributes into further entity
+;; objects on access. Reimplementing that fully (a custom type overriding
+;; `get`/keyword-invoke to be lazy) would need per-platform protocol
+;; dispatch this codebase has ALREADY hit real portability limits on --
+;; nbb/SCI cannot dispatch a custom deftype's implementation of a built-in
+;; protocol at all (confirmed empirically, `io-ipld`/`org-ietf-cbor`'s own
+;; deftype->defrecord history), and a `defrecord`'s map/field behavior is
+;; fixed, not overridable to be lazy. So `entity` here is DELIBERATELY a
+;; plain map (identical to `pull`'s 2-arg flat form, under Datomic's own
+;; name) plus a separate, explicit `entity-attr` for the one thing that
+;; makes `entity` more than `pull` -- navigating INTO a ref value's own
+;; entity on demand, without needing a pull pattern known up front.
+
+(defn entity
+  "Datomic's `entity`: `pull`'s flat 2-arg form (`{p #{o...}}`) under
+   Datomic's own name, for a caller specifically looking for it. See the
+   ns section comment above for why this is a plain map, not a custom
+   lazy-navigating type -- use `entity-attr` to navigate a ref-valued
+   attribute's values into their own nested entities on demand."
+  [db s]
+  (qs/entity-attrs db s))
+
+(defn entity-attr
+  "Navigate FROM an already-`entity`/`pull`-ed map at `attr` INTO each of
+   its values as their OWN `entity` -- the explicit lazy-navigation step
+   `entity` itself doesn't take eagerly (see ns section comment). Returns
+   `#{{...} ...}`, one nested entity map per value; a value that was
+   never itself asserted as an entity's own subject simply resolves to
+   `{}` (harmless -- same convention `pull`'s nested-ref form uses)."
+  [db entity-map attr]
+  (into #{} (map #(entity db %)) (get entity-map attr #{})))
+
+(defn refs
+  "`{p #{s...}}`: every entity `s` that references `ref` via predicate `p`
+   (VAET-style reverse lookup, ADR-2607050200). Only populated for quads
+   whose value was asserted as an `ipld.core/Link` — see `transact`'s default
+   `ref?`. `ref` is the same Link value the referencing quad's `:o` was."
+  [db ref]
+  (qs/refs-to db ref))
+
+(defn entid
+  "Datomic's `entid`: resolve a caller-given id-or-ident to the entity id.
+   A plain (non-keyword) `id` passes through UNCHANGED -- this substrate's
+   entity ids are already caller-chosen strings (`:db/id \"e1\"`, a CID, …),
+   never Datomic's auto-assigned longs, so there is no numeric-id
+   resolution step to perform (unlike real Datomic, where a bare id is
+   already the thing `entid` returns and the interesting case is only the
+   ident branch below -- same shape here).
+
+   A keyword `id` is resolved via `:db/ident`, asserted on an entity via
+   ordinary `transact` (`{:db/id \"e1\" :db/ident :my.ns/thing}`) exactly
+   like any other attribute -- `:db/ident` needs no special engine support,
+   the same \"schema is just data the db already has\" posture
+   `install-schema`/`schema-of` (above) take for attribute schema. Finds
+   the entity `e` such that `[e :db/ident id]` is asserted via a plain
+   triple-pattern `q`. Nothing in this substrate enforces `:db/ident`
+   uniqueness (Datomic itself would via a `:db/unique :db.unique/identity`
+   schema declaration on `:db/ident`, which this substrate has no
+   ENFORCEMENT mechanism for yet, only the schema-as-data description) --
+   if more than one entity happens to assert the same ident, which one
+   `entid` returns is unspecified (`q`'s result is a set, iteration order
+   not guaranteed). Returns nil if no entity has that ident asserted."
+  [db id]
+  (if (keyword? id)
+    (some :s (q db [nil ":db/ident" (str id)] (constantly true)))
+    id))
+
+(defn ident
+  "Datomic's `ident`: the inverse of `entid` for keyword idents -- the
+   `:db/ident` keyword `s` has asserted on itself, or nil if it has none
+   (including if the value there isn't actually a keyword-shaped string,
+   e.g. someone asserted `:db/ident \"plain string\"` instead of a real
+   keyword -- treated as \"no ident\" rather than a partial/lossy result)."
+  [db s]
+  (let [v (first (get (entity db s) ":db/ident"))]
+    (when (and (string? v) (str/starts-with? v ":"))
+      (edn/read-string v))))
+
+;; ── persistence: content-addressed, chained, verifiable ─────────────────────
+;;
+;; state shape (opaque to chain; this peer library's own convention, encoded
+;; with STRING keys per the codebase's IPLD-node convention):
+;;   {"indexed" Link|nil        -- the last-folded arrangement snapshot CID
+;;    "novelty-front" Link|nil  -- oldest-first cons-chain of not-yet-folded
+;;                                 tx-block links (walking via "rest" gives
+;;                                 oldest-to-newest order)
+;;    "novelty-back" Link|nil   -- newest-first cons-chain (walking via
+;;                                 "rest" gives newest-to-oldest order) --
+;;                                 commit! pushes HERE, O(1): one new small
+;;                                 node; front and every EXISTING back node
+;;                                 are never touched/re-encoded (kotoba-lang/
+;;                                 kotobase-peer#16 -- the flat-vector
+;;                                 "novelty" this replaces required
+;;                                 decoding+re-encoding the WHOLE thing on
+;;                                 every single commit!, O(n) per write /
+;;                                 O(n^2) total for n writes)
+;;    "novelty-count" Int}      -- maintained alongside front/back so
+;;                                 novelty-size/should-fold? and the
+;;                                 per-commit delta walk in
+;;                                 newly-added-tx-cids stay O(1) without
+;;                                 walking either chain
+;;
+;; A "novelty node" (front's and back's element type) is {"e" Link "rest"
+;; Link|nil} -- e = the tx-block link, rest = the next node in THIS
+;; particular chain (front or back), or nil at that chain's end.
+;;
+;; Reading ALL novelty in chronological (oldest-first) order = walk front
+;; (already oldest-first) ++ reverse(walk back) (back is newest-first, so
+;; reversing it gives oldest-of-back-first) -- see novelty-cids, below.
+;;
+;; Classic two-list persistent-queue design (Okasaki, *Purely Functional
+;; Data Structures*): push (commit!) is O(1) (one new back node, see
+;; push-novelty!). Pop-oldest-N (fold!'s max-novelty, see take-oldest-
+;; novelty) is O(min(n, front-length)) in the common case; when front runs
+;; out before n is reached, back gets reversed into a fresh front (O(back-
+;; length), but only on that one call -- amortized against however many
+;; pushes built up back since front was last refreshed, NOT a flat per-call
+;; guarantee regardless of history).
+;;
+;; Pre-D1 chains store a BARE snapshot Link as `state` (the original commit!,
+;; now `snapshot!`) -- `normalize-state` reads that as the empty-novelty
+;; equivalent (new shape), zero migration step. Chains written by the
+;; ORIGINAL D1 landing (flat-vector `"novelty"`, no `"novelty-front"` key)
+;; are detected by `legacy-novelty-state?` and read correctly by every
+;; function below; `commit!`/`fold!` migrate them to the new shape on next
+;; write (one-time O(existing legacy novelty length) cost -- no worse than
+;; any other read of that legacy data would already pay, see push-novelty!/
+;; take-oldest-novelty's own docstrings).
+
+(defn snapshot!
+  "Full O(graph) commit: snapshot `db`'s 4 indexes into content-addressed
+   prolly-trees (`arrangement.core/commit!`, always with `prev` nil) and
+   append that snapshot CID (as a fresh empty-novelty state) onto the
+   chain rooted at `prev-chain-cid`. This is the SAME expensive
+   rebuild the pre-D1 `commit!` did on every write; it now exists only as a
+   primitive `fold!` calls internally, plus a one-shot cold-start entry point
+   for callers that already have a fully materialized hot `db` (backfill /
+   migration tooling, tests). Most write paths want `commit!`, below.
+
+   `blind-fn`/`encrypt-fn` (ADR-2607051000, accepted 2026-07-06) are REQUIRED
+   and threaded straight to `arrangement.core/commit!` -- see its docstring
+   for their contract, including the sync-JVM/Promise-cljs platform split
+   this fn inherits (`arrangement.core/commit!` is itself a `js/Promise` on
+   cljs; `cd/commit!` below is unaffected/synchronous on both platforms)."
+  [put! get-fn db prev-chain-cid blind-fn encrypt-fn]
+  )
+
+(defn- normalize-state [state]
+  (cond
+    (ipld/link? state) {"indexed" state "novelty-front" nil "novelty-back" nil "novelty-count" 0}
+    (map? state)       state
+    (nil? state)       {"indexed" nil "novelty-front" nil "novelty-back" nil "novelty-count" 0}
+    :else (throw (ex-info "kotobase-peer: unrecognized commit state shape"
+                          {:state state}))))
+
+(defn- legacy-novelty-state?
+  "True iff `state` uses the ORIGINAL flat-vector \"novelty\" shape (a chain
+  written before this landing, never yet migrated). Every state THIS build
+  writes always has \"novelty-front\"/\"novelty-back\" keys present (even
+  when both nil), so their absence reliably means 'not yet touched by
+  post-migration code' rather than 'empty via the new code path'."
+  [state]
+  (and (contains? state "novelty") (not (contains? state "novelty-front"))))
+
+(defn- state-at
+  "The normalized state at `chain-cid` (an O(1) head fetch since chain/head,
+   ADR-2607032430's other half -- and, since kotoba-lang/kotobase-peer#16's
+   fix, an O(1) STATE SIZE too: the state block itself only ever holds 4
+   small links/ints, never the full novelty backlog inline, unlike the flat
+   vector this replaced). nil chain-cid (no prior commit) → the empty state."
+  [get-fn chain-cid]
+  (if (nil? chain-cid)
+    {"indexed" nil "novelty-front" nil "novelty-back" nil "novelty-count" 0}
+    (normalize-state (:state (cd/head get-fn chain-cid)))))
+
+(defn- indexed-cid [state] (some-> (get state "indexed") ipld/link-cid))
+
+;; ── novelty cons-chains (front/back) ────────────────────────────────────────
+
+(def ^:private novelty-segment-size
+  "Entries per novelty chain node. 1 was the original shape: one block per
+  unfolded transaction, so ENUMERATING novelty cost one sequential block
+  fetch per transaction. Measured (bench/results/2026-08-01-dag-shape.edn,
+  ADR-2608021000): at the fold threshold of 64 that walk was 91-97% of a
+  hydrate's sequential round trips, against 2-3 for the whole prolly-tree,
+  and no prefetch can flatten it because each successor CID only exists
+  inside its predecessor. Batching k entries per node divides the hops by k.
+
+  16 matches `novelty-index-segment-size`, which already uses this exact
+  shape for the subject directory -- the pattern was in the codebase, just
+  not applied to the queue it was measured on. The trade is that a push into
+  a partly-filled head segment re-encodes that segment's <=16 entries
+  instead of writing one fresh node; that is a bounded constant on a small
+  block, paid on the write path, to remove a linear term from every read."
+  16)
+
+(defn- novelty-node-cid!
+  "Puts one {\"e\" tx-link \"rest\" rest-link|nil \"subjects\" [...]?} node, returns its cid
+  (string, NOT wrapped in a Link -- callers wrap when storing it as a
+  value). Single-entry shape, kept because live chains are full of these
+  nodes and `walk-novelty-entries` must keep reading them; new pushes write
+  the segment shape below."
+  ([put! tx-cid rest-link] (novelty-node-cid! put! tx-cid rest-link nil))
+  ([put! tx-cid rest-link subject-tokens]
+   (novelty-node-cid! put! tx-cid rest-link subject-tokens nil))
+  ([put! tx-cid rest-link subject-tokens attribute-tokens]
+   (ipld/put-node! put! (cond-> {"e" (ipld/link tx-cid) "rest" rest-link}
+                          (seq subject-tokens) (assoc "subjects" (vec subject-tokens))
+                          (seq attribute-tokens) (assoc "attributes" (vec attribute-tokens))))))
+
+(defn- entry->node-entry [{:keys [cid subjects attributes]}]
+  (cond-> {"e" (ipld/link cid)}
+    (seq subjects) (assoc "subjects" (vec subjects))
+    (seq attributes) (assoc "attributes" (vec attributes))))
+
+(defn- node-entry->entry [{:strs [e subjects attributes]}]
+  {:cid (ipld/link-cid e) :subjects subjects :attributes attributes})
+
+(defn- novelty-segment-cid!
+  "Puts one {\"es\" [entry ...] \"rest\" rest-link|nil} node. `entries` are in
+  WALK ORDER -- the order `walk-novelty-entries` should emit them for this
+  chain's direction -- so the same node shape serves the newest-first `back`
+  chain and the oldest-first `front` chain without either needing to know
+  about the other."
+  [put! entries rest-link]
+  (ipld/put-node! put! {"es" (mapv entry->node-entry entries) "rest" rest-link}))
+
+(defn- node-entries
+  "Entries of one novelty chain node, in walk order, for EITHER shape: the
+  single-entry `{\"e\" ..}` nodes every live chain is made of, and the
+  `{\"es\" [..]}` segments this build writes. A chain freely mixes both --
+  a graph that was written before this landing keeps its old nodes and grows
+  segments on top, with no migration step."
+  [node]
+  (if (contains? node "es")
+    (mapv node-entry->entry (get node "es"))
+    [(node-entry->entry node)]))
+
+(defn- walk-novelty-entries [get-fn head-cid]
+  (loop [cid head-cid acc []]
+    (if (nil? cid)
+      acc
+      (let [node (ipld/get-node get-fn cid)]
+        (recur (some-> (get node "rest") ipld/link-cid)
+               (into acc (node-entries node)))))))
+
+
+
+(defn- build-novelty-chain!
+  "Builds a new cons-chain from `cids` (a vector, in the order you want when
+  WALKING the result head-to-tail) and returns a Link to its head, or nil if
+  `cids` is empty. Shared by legacy-novelty migration and by 'reverse back
+  into a fresh front' (take-oldest-novelty) -- both are 'turn this in-order
+  vector into a walkable chain, cheaply'. O(count cids) puts -- the one-time
+  cost either of those two callers pays, never repeated per-entry on a later
+  unrelated push."
+  [put! entries]
+  (let [normalized (mapv (fn [entry] (if (map? entry) entry {:cid entry})) entries)]
+    (reduce (fn [rest-link segment]
+              (ipld/link (novelty-segment-cid! put! segment rest-link)))
+            nil
+            (reverse (partition-all novelty-segment-size normalized)))))
+
+(defn- novelty-entries [get-fn state]
+  (if (legacy-novelty-state? state)
+    (mapv (fn [link] {:cid (ipld/link-cid link) :subjects nil}) (get state "novelty" []))
+    (let [front (walk-novelty-entries get-fn (some-> (get state "novelty-front") ipld/link-cid))
+          back (walk-novelty-entries get-fn (some-> (get state "novelty-back") ipld/link-cid))]
+      (into front (rseq back)))))
+
+(def ^:private novelty-index-segment-size 16)
+
+(defn- append-novelty-index!
+  "Append one indexed novelty entry to a newest-first chain of bounded
+   metadata segments. Returns a state fragment, or {} when pre-existing
+   unindexed novelty makes the directory incomplete (the reader then uses the
+   conservative queue fallback)."
+  [put! get-fn state tx-cid subject-tokens attribute-tokens]
+  (let [root (some-> (get state "novelty-subject-index") ipld/link-cid)
+        eligible? (or root (zero? (get state "novelty-count" 0)))]
+    (if-not (and eligible? (seq subject-tokens))
+      {}
+      (let [entry (entry->node-entry {:cid tx-cid :subjects subject-tokens :attributes attribute-tokens})
+            current (when root (verified-node get-fn root))
+            entries (get current "entries" [])
+            node (if (< (count entries) novelty-index-segment-size)
+                   {"entries" (conj (vec entries) entry) "rest" (get current "rest")}
+                   {"entries" [entry] "rest" (ipld/link root)})]
+        {"novelty-subject-index" (ipld/link (ipld/put-node! put! node))}))))
+
+(defn- indexed-novelty-entries [get-fn state]
+  (when-let [root (some-> (get state "novelty-subject-index") ipld/link-cid)]
+    (loop [cid root segments []]
+      (if-not cid
+        (->> segments rseq (mapcat #(get % "entries"))
+             (mapv node-entry->entry))
+        (let [segment (verified-node get-fn cid)]
+          (recur (some-> (get segment "rest") ipld/link-cid)
+                 (conj segments segment)))))))
+
+
+
+(defn- build-novelty-index!
+  "Rebuild the bounded subject directory for chronological ENTRIES. Returns a
+   Link to the newest segment, or nil when empty/incomplete."
+  [put! entries]
+  (when (and (seq entries) (every? (comp seq :subjects) entries))
+    (reduce (fn [rest-link segment]
+              (ipld/link
+               (ipld/put-node!
+                put! {"entries" (mapv entry->node-entry segment)
+                      "rest" rest-link})))
+            nil (partition-all novelty-index-segment-size entries))))
+
+(defn- novelty-cids
+  "ALL not-yet-folded tx-block cids, oldest-first (chronological order).
+  O(current total novelty length) -- necessarily, since returning everything
+  means touching everything; see take-oldest-novelty for a genuinely bounded
+  alternative when only a prefix is needed."
+  [get-fn state]
+  (mapv :cid (novelty-entries get-fn state)))
+
+
+
+
+
+(defn- scan-selector
+  "Select a bound entity or attribute in the index's actual component order."
+  [{:keys [index components]}]
+  (let [[entity-position attribute-position]
+        (case (or index :eavt)
+          :eavt [0 1] :aevt [1 0] :avet [2 0] :vaet [2 1] [nil nil])
+        entity (when (some? entity-position) (nth components entity-position nil))
+        attribute (when (some? attribute-position) (nth components attribute-position nil))]
+    (cond (some? entity) [:subjects entity]
+          (some? attribute) [:attributes attribute])))
+
+(defn- matching-novelty-cids [entries axis token]
+  (mapv :cid
+        (filter (fn [entry]
+                  (let [tokens (get entry axis)]
+                    ;; Missing metadata (including entity-wide retractions on
+                    ;; the attribute axis) is never evidence of absence.
+                    (or (not (seq tokens)) (some #{token} tokens))))
+                entries)))
+
+(defn- prune-novelty-cids
+  "Use exact metadata when the selected index prefix binds an entity or
+   attribute. Mixed legacy backlogs retain unknown entries conservatively."
+  [get-fn state opts blind-fn]
+  (if-let [[axis value] (scan-selector opts)]
+    (let [entries (or (indexed-novelty-entries get-fn state)
+                      (novelty-entries get-fn state))]
+      )
+    (novelty-cids get-fn state)))
+
+
+
+(defn- newest-novelty-cid
+  "The single most-recently-pushed tx-cid, or nil if novelty is empty. O(1)
+  for a non-legacy state (peeks novelty-back's head node) -- never walks the
+  full backlog just to find its newest entry."
+  [get-fn state]
+  (if (legacy-novelty-state? state)
+    (some-> (peek (get state "novelty" [])) ipld/link-cid)
+    (when-let [back-cid (some-> (get state "novelty-back") ipld/link-cid)]
+      ;; `back` walks newest-first and a segment's entries are stored in that
+      ;; same walk order, so the newest push is the FIRST entry of the head
+      ;; node -- for a legacy single-entry node that is its only entry, which
+      ;; is why this reads through `node-entries` rather than "e" directly.
+      (:cid (first (node-entries (ipld/get-node get-fn back-cid)))))))
+
+(defn- push-novelty!
+  "Returns a NEW {\"novelty-front\" .. \"novelty-back\" .. \"novelty-count\"
+  ..} triple with `tx-cid` pushed onto the back. Migrates a legacy
+  flat-vector novelty into the new front chain the first time a push touches
+  it -- O(legacy length), paid once, never again for that chain.
+
+  Cost, and why it changed: this used to write ONE single-entry node per
+  push and touch nothing else, which was the fix for kotoba-lang/
+  kotobase-peer#16 (the flat vector it replaced was decoded and re-encoded
+  WHOLE on every push). It now appends into a bounded head SEGMENT of up to
+  `novelty-segment-size` entries, which means reading that head node and
+  re-encoding its <=16 entries. That is deliberately trading a bounded
+  constant on the WRITE path for a linear term on every READ path: measured
+  (ADR-2608021000), enumerating novelty was 91-97% of a hydrate's sequential
+  round trips at the fold threshold, because the successor CID of a
+  single-entry node only exists inside that node. It is NOT a return to
+  kotobase-peer#16 -- the re-encoded node is bounded at 16 entries and never
+  grows with the backlog, which is exactly the property the flat vector
+  lacked.
+
+  `get-fn` is required for that head read. A legacy single-entry head is
+  never rewritten -- the new entry starts a fresh segment pointing at it --
+  so an existing chain keeps its old nodes and grows segments on top, with
+  no migration step and no rewrite of history."
+  ([put! get-fn state tx-cid] (push-novelty! put! get-fn state tx-cid nil))
+  ([put! get-fn state tx-cid subject-tokens]
+   (push-novelty! put! get-fn state tx-cid subject-tokens nil))
+  ([put! get-fn state tx-cid subject-tokens attribute-tokens]
+  (if (legacy-novelty-state? state)
+    (let [legacy-cids (mapv ipld/link-cid (get state "novelty" []))]
+      {"novelty-front" (build-novelty-chain! put! legacy-cids)
+       "novelty-back" (ipld/link (novelty-node-cid! put! tx-cid nil subject-tokens attribute-tokens))
+       "novelty-count" (inc (count legacy-cids))})
+    (let [back-link (get state "novelty-back")
+          head (when back-link (ipld/get-node get-fn (ipld/link-cid back-link)))
+          head-entries (when (and head (contains? head "es")) (get head "es"))
+          entry (entry->node-entry {:cid tx-cid :subjects subject-tokens :attributes attribute-tokens})
+          ;; `back` walks newest-first, so a new entry goes at the FRONT of the
+          ;; head segment's walk-order vector. A full segment (or a legacy
+          ;; single-entry head, which is not a segment and is never rewritten)
+          ;; starts a fresh one pointing at the old head.
+          node (if (and head-entries (< (count head-entries) novelty-segment-size))
+                 (ipld/put-node! put! {"es" (into [entry] head-entries)
+                                       "rest" (get head "rest")})
+                 (ipld/put-node! put! {"es" [entry] "rest" back-link}))]
+      {"novelty-front" (get state "novelty-front")
+       "novelty-back" (ipld/link node)
+       "novelty-count" (inc (get state "novelty-count" 0))}))))
+
+(defn- take-oldest-novelty
+  "Returns {\"novelty-front\" .. \"novelty-back\" .. \"novelty-count\" ..
+  :taken [cids, oldest-first, up to n]} -- the n oldest not-yet-folded
+  entries, plus the novelty state with them removed (fewer than n taken if
+  that's all there was).
+
+  Cost: O(min(n, front-length)) in the common case -- taken directly off
+  `front`, which is already oldest-first; `back` untouched. If `front`
+  doesn't have n entries, ALSO pays O(back-length) to reverse `back` into a
+  fresh front and continue taking from there -- this only happens once
+  `front` is exhausted, amortized against however many pushes built up
+  `back` since front was last refreshed (classic persistent-queue amortized
+  accounting -- expensive on a single call sometimes, O(1) amortized over a
+  sequence of push/take calls, NOT a flat per-call guarantee regardless of
+  history; see kotoba-lang/kotobase-peer#16's own follow-up comment on
+  this).
+
+  A legacy flat-vector novelty is migrated to the new shape as part of this
+  call (same one-time-cost story as push-novelty!)."
+  [put! get-fn state n]
+  (let [legacy? (legacy-novelty-state? state)
+        front (if legacy?
+                (mapv (fn [link] {:cid (ipld/link-cid link) :subjects nil})
+                      (get state "novelty" []))
+                (walk-novelty-entries get-fn (some-> (get state "novelty-front") ipld/link-cid)))]
+    (if (>= (count front) n)
+      {:taken (mapv :cid (subvec front 0 n))
+       "novelty-front" (build-novelty-chain! put! (subvec front n))
+       "novelty-back" (if legacy? nil (get state "novelty-back"))
+       "novelty-count" (- (if legacy? (count front) (get state "novelty-count" 0)) n)
+       :remaining-entries (into (subvec front n)
+                                (when-not legacy?
+                                  (rseq (walk-novelty-entries
+                                         get-fn (some-> (get state "novelty-back") ipld/link-cid)))))}
+      (let [back-cid (if legacy? nil (some-> (get state "novelty-back") ipld/link-cid))
+            back-oldest-first (vec (rseq (walk-novelty-entries get-fn back-cid)))
+            combined (into front back-oldest-first)
+            k (min n (count combined))
+            total (if legacy? (count front) (get state "novelty-count" 0))]
+        {:taken (mapv :cid (subvec combined 0 k))
+         "novelty-front" (build-novelty-chain! put! (subvec combined k))
+         "novelty-back" nil
+         "novelty-count" (- total k)
+         :remaining-entries (subvec combined k)}))))
+
+
+
+(defn- quad->wire [{:keys [s p o op]}]
+  ;; "op" appears only on non-assert quads — asserts (and every pre-
+  ;; ADR-2607071610 block) keep the exact 3-key wire shape (backward compat)
+  (cond-> {"s" s "p" p "o" o}
+    (and op (not= :assert op)) (assoc "op" (name op))))
+(defn- wire->quad [{:strs [s p o op]}]
+  (cond-> {:s s :p p :o o}
+    op (assoc :op (keyword op))))
+
+(defn- framed-quad-payload
+  "The bytes `put-tx-block!` hands to `encrypt-fn`: the dag-cbor of
+  `{\"quads\" [...]}`, run through `kotobase-block-codec`.
+
+  Compression has to happen HERE — inside the AEAD, not under it. The bytes
+  the store actually holds are ciphertext, and ciphertext measures at DEFLATE
+  ratio 1.003: a provider or backend that compressed them would spend CPU to
+  store more. This payload is the one place a whole batch of quads exists as
+  plaintext at once, which is also the only reason it compresses: subjects and
+  predicates repeat across a transaction. Measured 0.10-0.37 depending on
+  batch size (ADR-2608060500).
+
+  `bc/frame` is unary and pure, so this stays a function of the quads alone."
+  [quads]
+  (bc/platform-bytes (bc/frame (ipld/encode {"quads" (mapv quad->wire quads)}))))
+
+(defn- decode-quad-payload
+  "Inverse of `framed-quad-payload`. `bc/unframe` is the identity on bytes
+  written before the frame existed, so this reads old and new blocks with one
+  path and no version flag — which is what let the read half of this change
+  ship ahead of the write half.
+
+  **A payload this cannot read throws. It does not return no quads.**
+
+  Those two answers used to be the same value. `get` returns nil for a node
+  that is not a `{\"quads\" [...]}` map at all, and `mapv` over nil is `[]` —
+  so a transaction the reader could not decode contributed exactly what an
+  empty transaction contributes, with no error anywhere above it. Measured in
+  production on 2026-08-18 (superproject ADR-2608182100): a deployment reading
+  blocks written by a build whose frame it did not have listed **one object out
+  of four** and returned HTTP 200. The three it could not decode were intact in
+  the store the whole time; nothing said so.
+
+  An empty transaction is still readable and still legal: it encodes
+  `{\"quads\" []}`, `get` finds the key, and the result is `[]`. The
+  distinction this makes is between *no quads* and *no answer*, which is the
+  only distinction that could have surfaced that incident."
+  [plaintext]
+  (let [node (ipld/decode (bc/platform-bytes (bc/unframe plaintext)))
+        quads (when (map? node) (get node "quads"))]
+    (when-not (sequential? quads)
+      (throw (ex-info "tx block payload is not a quad node"
+                      {:kotobase-peer/error :undecodable-tx-payload
+                       :node-type (cond (map? node) :map-without-quads
+                                        (number? node) :number
+                                        (string? node) :string
+                                        (sequential? node) :sequence
+                                        :else :other)
+                       :quads-type (cond (nil? quads) :absent
+                                         :else :not-sequential)})))
+    (mapv wire->quad quads)))
+
+(defn- put-tx-block!
+  "ADR-2607051000 (accepted 2026-07-06): the novelty tx block's whole quad
+  payload is encrypted as one opaque ciphertext blob (`encrypt-fn`, REQUIRED,
+  no silent default) -- `read-tx-block` is whole-block reads only, never a
+  keyed/prefix seek, so there's no blind-index concern here, just AEAD.
+  Synchronous on JVM, a `js/Promise` of the block CID on cljs (see the
+  platform-split note above).
+
+  The payload is compression-framed before encryption (ADR-2608060500); see
+  `framed-quad-payload` for why the seam is on this side of `encrypt-fn`."
+  [put! quads encrypt-fn]
+  )
+
+(defn- read-tx-block
+  "Inverse of `put-tx-block!`: decrypt the block's `\"ct\"` ciphertext
+  (`decrypt-fn`, REQUIRED), unframe it, and decode the dag-cbor
+  `{\"quads\" [...]}` node as before. Synchronous on JVM, a `js/Promise` of the
+  quads on cljs."
+  [get-fn tx-cid decrypt-fn]
+  )
+
+
+
+(defn commit!
+  "THE write path (ADR-2607032430 D1): append `tx-data` as one novelty tx
+   block. O(|tx-data|) — reads only the previous state's small {indexed,
+   novelty-front, novelty-back, novelty-count} LINKS/int (one O(1) head
+   fetch via chain, never the graph itself, and — since kotoba-lang/
+   kotobase-peer#16's fix — never the full novelty backlog either: pushing
+   the new tx-block link is one new small cons node, see push-novelty!,
+   NOT a re-encode of every not-yet-folded entry) and writes one new small
+   tx block plus one new chain entry. Touches no prolly-tree, rehydrates
+   nothing. `tx-data` accepts the same shapes `transact` does (quad maps,
+   `[:db/add e a v]`, bare `[e a v]` triples, and the retraction forms
+   `[:db/retract e a v]` / `[:db/retractEntity e]` — ADR-2607071610).
+
+   This REPLACES the pre-D1 `commit!` (now `snapshot!`), which took an
+   already-hydrated hot db and paid a full O(graph) rebuild on every call —
+   confirmed live 2026-07-03 as the root cause of a CF Worker CPU-limit
+   collapse (error 1102) partway through a 321-actor mass write. Call
+   `fold!` periodically (see `should-fold?`) to bound novelty size and keep
+   `hot-datoms` reads fast; correctness never depends on folding promptly.
+
+   `encrypt-fn` (ADR-2607051000, accepted 2026-07-06) is REQUIRED and
+   threaded straight to `put-tx-block!` -- see its docstring for the
+   contract, including the sync-JVM/Promise-cljs platform split (`put-tx-
+   block!` is itself a `js/Promise` of the tx CID on cljs; `push-novelty!`
+   itself is synchronous on BOTH platforms — it touches only cids/links,
+   no crypto). Optional `blind-fn` adds keyed subject and attribute tokens to the novelty
+   queue node so transaction-slice reads can skip unrelated encrypted blocks;
+   the original arity remains wire-compatible and emits an unindexed node."
+  ([put! get-fn tx-data prev-chain-cid encrypt-fn]
+   (commit! put! get-fn tx-data prev-chain-cid encrypt-fn nil))
+  ([put! get-fn tx-data prev-chain-cid encrypt-fn blind-fn]
+   (let [quads (mapv ->quad tx-data)
+         subjects (->> quads (map :s) distinct sort vec)
+         ;; Entity deletion can affect attributes absent from the submitted
+         ;; transaction. Omit this axis for the entire block in that case.
+         attributes (when-not (some #(= :retract-entity (:op %)) quads)
+                      (->> quads (map (comp str :p)) distinct sort vec))
+         state (state-at get-fn prev-chain-cid)]
+    )))
+
+(defn commit-with-report!
+  "Like `commit!`, but returns a Datomic-shaped tx-report --
+   `{:chain-cid-before prev-chain-cid :chain-cid-after new-chain-cid
+   :tx-data quads}` -- instead of a bare chain-cid. Datomic's own
+   `{:db-before :db-after :tx-data :tempids}`, adapted: this substrate's
+   \"db identity\" for a chain-append write IS the chain-cid (content-
+   addressed), not a hot db value, so `:chain-cid-before`/`-after` take
+   `:db-before`/`-after`'s role. No `:tempids` -- this substrate has no
+   temporary-id resolution step (callers pass real entity ids directly),
+   so it's omitted rather than faked. Synchronous on JVM; a `js/Promise`
+   of the report on cljs."
+  [put! get-fn tx-data prev-chain-cid encrypt-fn]
+  (let [quads (mapv ->quad tx-data)]
+    ))
+
+;; ── write ACID: commit-serialized! ──────────────────────────────────────────
+;; (one of the "3 pillars" this landing adds.) `chain.core/commit!`'s `:seq`
+;; computation is a plain read-then-write with no atomicity (confirmed by
+;; direct inspection): two concurrent writers can both derive the same
+;; `:seq` from the same `prev-cid` and silently FORK the chain -- there is no
+;; Transactor-equivalent single-writer serialization anywhere in this stack
+;; today. Fixing that PROPERLY requires an atomic primitive no storage
+;; backend already deployed here (R2, plain in-memory test stores) is
+;; guaranteed to support -- so this is deliberately an OPT-IN, ADDITIVE new
+;; function, not a change to `commit!`'s existing contract: a caller without
+;; (or not wanting) a CAS-capable head-store keeps calling plain `commit!`
+;; exactly as before, completely unaffected. `pds.aozora.app`'s already-
+;; deployed chains and storage contract need zero changes for this to exist.
+
+(def default-max-cas-retries
+  "How many times `commit-serialized!` retries after losing a `cas!` race
+  before giving up and throwing -- a defensive cap (persistent, unbounded
+  write contention on one head-key is a caller/deployment problem, not
+  something to retry forever for), not a tuned constant."
+  10)
+
+(defn commit-serialized!
+  "Like `commit!`, but coordinates through a caller-provided `cas!` --
+   `(cas! head-key expected-chain-cid new-chain-cid) -> actual-chain-cid`,
+   an ATOMIC compare-and-swap on `head-key` (a caller-chosen MUTABLE
+   pointer, e.g. a D1/DynamoDB row keyed by actor id -- NOT a chain-cid;
+   chain-cids are content-addressed and never change meaning). Contract:
+   if `head-key`'s CURRENT value equals `expected-chain-cid`, atomically
+   swap it to `new-chain-cid` and return `new-chain-cid`; otherwise leave
+   it untouched and return whatever its ACTUAL current value is (a
+   standard compare-and-exchange shape -- the caller can always tell
+   success from failure by comparing the return value to `new-chain-cid`,
+   and a failure directly hands back what to retry against, no separate
+   re-read needed) -- instead of blindly trusting a caller-passed
+   `prev-chain-cid`.
+
+   Re-derives `tx-data`'s tx-block against whatever the ACTUAL current
+   head turns out to be on every attempt, retrying (up to `max-retries`)
+   on a lost race, throwing if it never wins. True single-writer-per-
+   `head-key` serialization -- the ACID guarantee `commit!` alone cannot
+   make.
+
+   `head-key` identifies the mutable pointer. `expected-chain-cid` is the
+   chain-cid the CALLER currently believes is the head (`nil` means \"I
+   believe this chain doesn't exist yet\"). `cas!` is synchronous on JVM.
+   On cljs it may return either the value or a Promise of it, allowing direct
+   composition with R2/S3 conditional-head adapters; the result is always
+   awaited before success/retry is decided."
+  ([put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn]
+   (commit-serialized! put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn default-max-cas-retries))
+  ([put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn max-retries]
+   ))
+
+(defn commit-serialized-with-report!
+  "Like `commit-serialized!`, but returns a Datomic-shaped tx-report (see
+   `commit-with-report!`) -- `{:chain-cid-before :chain-cid-after
+   :tx-data}`, where `:chain-cid-before` is whichever chain-cid actually
+   won the CAS race and got committed against (NOT necessarily the
+   caller's original `expected-chain-cid`, if a retry happened)."
+  ([put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn]
+   (commit-serialized-with-report! put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn default-max-cas-retries))
+  ([put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn max-retries]
+   (let [quads (mapv ->quad tx-data)]
+     )))
+
+(defn commit-serialized-batch!
+  "Publish one `transactor/plan-head-batches` item as one chain commit and one
+  HeadCAS, then return acknowledgements for every coalesced logical request.
+  The batch must target HEAD-KEY; batching never crosses mutable heads. Like
+  `commit-serialized!`, TX-DATA must already be normalized. REQUEST-ID is an
+  acknowledgement correlation id, not a durable exactly-once ledger; an ingress
+  retry protocol must deduplicate before planning or use the effective path."
+  ([put! get-fn cas! head-key expected-chain-cid batch encrypt-fn]
+   (commit-serialized-batch! put! get-fn cas! head-key expected-chain-cid
+                             batch encrypt-fn default-max-cas-retries))
+  ([put! get-fn cas! head-key expected-chain-cid batch encrypt-fn max-retries]
+   (let [batch (transactor/validate-batch batch)]
+     (when-not (= head-key (:head-key batch))
+       (throw (ex-info "Transactor batch/head mismatch"
+                       {:head-key head-key :batch-head (:head-key batch)})))
+     )))
+
+(defn novelty-size
+  "How many not-yet-folded tx blocks sit on `chain-cid`'s current state —
+   the `fold!` trigger signal. O(1) once a chain has been touched by this
+   build's code (reads the maintained \"novelty-count\" field, never walks
+   front/back); O(legacy novelty length) for a chain still in the pre-
+   kotoba-lang/kotobase-peer#16-fix flat-vector shape — no worse than
+   `state-at` already pays to read such a chain's state at all."
+  [get-fn chain-cid]
+  (let [state (state-at get-fn chain-cid)]
+    (if (legacy-novelty-state? state)
+      (count (get state "novelty" []))
+      (get state "novelty-count" 0))))
+
+(def default-fold-threshold
+  "novelty length `should-fold?` flags for compaction at. Tunes the
+   amortization: a fold costs O(graph_shard) once every `default-fold-
+   threshold` writes, so write-heavy shards fold more often in absolute
+   time but pay the SAME amortized cost per write. A shard's own write
+   volume and latency budget should drive the real value in production;
+   this is a reasonable engine-level default, not a tuned constant."
+  64)
+
+(defn should-fold?
+  ([get-fn chain-cid] (should-fold? get-fn chain-cid default-fold-threshold))
+  ([get-fn chain-cid threshold]
+   (>= (novelty-size get-fn chain-cid) threshold)))
+
+(defn chain
+  "Full commit history rooted at `chain-cid`, oldest first. Each entry's
+   `:state` is the `{indexed novelty}` map (or, for a pre-D1 commit, the
+   bare snapshot Link `normalize-state` would expand — `chain`/`head` return
+   the RAW state as chain stored it; callers that need the normalized
+   shape go through `state-at` / `hot-datoms` / `latest-snapshot-cid`)."
+  [get-fn chain-cid]
+  (cd/chain get-fn chain-cid))
+
+(defn head
+  "The chain entry AT `chain-cid` (O(1) — see chain/head). Returns
+   the RAW `:state` (not normalize-state-expanded); see `chain`'s docstring."
+  [get-fn chain-cid]
+  (cd/head get-fn chain-cid))
+
+(defn latest-snapshot-cid
+  "The INDEXED arrangement snapshot CID as of `chain-cid`'s current state —
+   the last fold point, NOT including any pending novelty. nil when the
+   chain is empty OR when nothing has been folded yet (an all-novelty chain,
+   the common case for a fresh, low-write-volume shard between folds — this
+   is NOT the same as \"no data\"; use `hot-datoms`/`novelty-size` to check
+   for pending unfolded writes, not this fn alone, before deciding a graph
+   is empty)."
+  [get-fn chain-cid]
+  (when chain-cid (indexed-cid (state-at get-fn chain-cid))))
+
+;; ── time-travel: as-of / hydrate-chain ──────────────────────────────────────
+;; (one of the "3 pillars" this landing adds.) Keyed by commit `:seq`, NOT
+;; wall-clock time (design decision: `chain.core`'s commit envelope has no
+;; timestamp field, and adding one would change the CID of every future
+;; commit for chains ALREADY deployed live -- pds.aozora.app actors keep
+;; reading/writing with zero migration step, exactly as `normalize-state`'s
+;; own comment already promises elsewhere in this file). The raw capability
+;; already existed (`chain` walks the full history, `:state` included, for
+;; ANY commit along the way) -- `as-of`/`hydrate-chain` just make it
+;; ergonomic, without requiring a caller to hand-roll the walk.
+
+(defn as-of
+  "The chain-cid at-or-before `seq` (Datomic's `:as-of`, keyed by commit
+   :seq number here -- see ns section comment). Given `:seq`'s gaplessness
+   from 0 (`verify-chain`), this finds an exact match unless `seq` is
+   beyond the chain's own tip, in which case it clamps to the tip
+   (Datomic's own \"as-of the future just means now\" behavior). `nil` if
+   `chain-cid` itself is `nil` (no prior commit at all yet).
+
+   The result composes directly with every existing chain-cid-accepting
+   fn -- `(hot-datoms get-fn (as-of get-fn chain-cid 5) ...)` reads
+   \"hot-datoms as of seq 5\", no separate as-of-flavored sibling of each
+   read fn needed."
+  [get-fn chain-cid seq]
+  (when chain-cid
+    (let [entries (chain get-fn chain-cid)]
+      (:cid (or (some #(when (= seq (:seq %)) %) entries)
+                (last entries))))))
+
+;; ── cold read: filtered datoms straight from a persisted snapshot ───────────
+;; Closes the "nothing rehydrates a db from a snapshot CID" gap for the ONE case
+;; that matters for scale: a FILTERED read. Instead of rebuilding the whole 4-index
+;; db (the wasm worker's full-graph rehydrate that OOMs at 128MB), decode the
+;; snapshot's index-roots, pick the ONE index tree the query needs, and prefix-seek
+;; it by the components. arrangement persists each index as
+;; `(pr-str [blind(k1) blind(k2) blind(v)]) → encrypt([k1 k2 v])` leaves
+;; (index-root, ADR-2607051000 accepted 2026-07-06), so a components prefix
+;; is a blinded string prefix on that tree, and a matched leaf's value must
+;; be decrypted to recover the real triple (the key is one-way, unrecoverable).
+
+;; index → snapshot key + how its [k1 k2 v] maps back to a datom {:e :a :v}
+;;
+;; The cold path has always spoken :eavt/:aevt/:avet/:vaet on the outside and
+;; the spo/pso/pos/ocp wire names on the inside. As of 2026-08-20 the HOT path
+;; speaks the same four names (datalog a43dc1cf, arrangement a5d68dc8), so this
+;; table is no longer a translation between two layers -- it is the same
+;; keyword-to-wire-name mapping arrangement.core/index-names holds, for the
+;; read direction. The wire names stay put: they are hashed into the commit
+;; CID (see arrangement.core's ns docstring).
+(def ^:private index-spec
+  {:eavt {:root "spo" :->eav (fn [[s p o]] [s p o])}   ; spo: [s p o]
+   :aevt {:root "pso" :->eav (fn [[p s o]] [s p o])}   ; pso: [p s o]
+   :avet {:root "pos" :->eav (fn [[p o s]] [s p o])}   ; pos: [p o s]
+   ;; ocp (VAET, reverse-reference only) IS already persisted in every
+   ;; snapshot's index-roots (arrangement.core/commit! writes all 4 roots
+   ;; unconditionally) -- this entry was simply never added, so a cold
+   ;; :vaet read had no index-spec match at all (nil :root/:->eav ->
+   ;; `cold-datoms` would NPE on `(get-in snap ["index-roots" nil])`
+   ;; instead of scanning anything). Confirmed 2026-07-08, fixed here;
+   ;; no migration needed, existing snapshots already have this root.
+   :vaet {:root "ocp" :->eav (fn [[o p s]] [s p o])}}) ; ocp: [o p s]
+
+(defn- components-prefix
+  "String prefix into a `(pr-str [k1 k2 v])` leaf key for an ordered component
+  vector. `[\"a\" \"b\"]` → `[\"a\" \"b\" ` (up to the space before the next
+  slot), so it matches every key whose first components are exactly those.
+
+  ADR-2607051000 (accepted 2026-07-06): each component is run through
+  `link->edn` THEN `blind-fn` (REQUIRED, the SAME keyed MAC
+  `arrangement.core/index-root` used to build the key -- `index-root`'s own
+  key construction is `(blind-fn (link->edn component))` for every
+  position, see its docstring), so a caller who already knows the
+  plaintext component independently re-derives the identical blinded
+  prefix bytes to seek on.
+
+  The `link->edn` step was MISSING here until 2026-07-08 (\"an orthogonal,
+  pre-existing gap this ADR doesn't touch\", per this docstring's own prior
+  wording) -- harmless for every index THIS fn was actually exercised
+  against before then (`:eavt`/`:aevt`/`:avet` components are always
+  plain strings in practice: entity ids, attribute names, scalar values --
+  `link->edn` on a non-Link value is already a no-op passthrough, so
+  omitting the call never changed the result). `:vaet` (added 2026-07-08)
+  is the first index whose OWN seek components are genuinely Link-typed
+  by design (VAET's whole point is reverse-reference lookup on ref
+  values) -- for those, skipping `link->edn` produced a seek prefix
+  blinded from the wrong input, silently matching nothing. Confirmed live
+  via `cold-datoms`'s own `:vaet` test, fixed here rather than deferred
+  again now that a real caller (`:vaet`) actually needs it.
+
+  Synchronous on JVM (returns the prefix string, or nil for empty
+  `components`); a `js/Promise` of the same on cljs."
+  [components blind-fn]
+  )
+
+(defn- leaf-decoder
+  "Decode a persisted index leaf with the codec that WROTE it.
+
+  `arrangement` schema-version 2 (ADR-kotoba-canonical-value-codec) moved the
+  leaf value slot from the node codec to `kotoba.value.v1`, so a component
+  keeps its TYPE across the round-trip. A reader that assumes version 1
+  against a version-2 snapshot does not fail — it decodes the typed wrapper
+  as if it were the triple, and every row comes back shaped
+  `{:e 16 :a [[4 \"alice\"] ...] :v_edn \"nil\"}`. Silent and wrong, which is
+  why the version is READ from the snapshot rather than assumed.
+
+  Mirrors `arrangement.core/restore`'s own dispatch deliberately: two copies
+  of a codec choice that can disagree are how a format migration corrupts a
+  reader."
+  [snap]
+  (if (= 1 (get snap "schema-version"))
+    (fn [bytes] (mapv qs/edn->link (ipld/decode bytes)))
+    ipld-value/decode-value))
+
+(defn cold-datoms
+  "`datomic.datoms`-shaped rows read DIRECTLY from a persisted snapshot without
+  rehydrating the whole db. `snapshot-cid` is an arrangement commit CID
+  (`latest-snapshot-cid`). opts = `{:index :components :limit}` as in `datoms`.
+  Touches only the chosen index tree's blocks along the components prefix path
+  (range-pruned via `prolly-tree.core/scan-prefix`), never the other three
+  indexes — so a keyed read stays small regardless of graph size. `nil`
+  snapshot-cid → `[]` (nothing folded yet; see `hot-datoms` for the
+  novelty-inclusive read). get-fn: `(get-fn cid) -> bytes`.
+
+  `visible?` is REQUIRED, same contract as `datoms`'s (ADR-2607050500): a
+  post-filter over each candidate `{:e :a :v_edn :added}` row, applied BEFORE
+  `:limit` is taken (so `:limit` caps what the caller actually receives).
+  `:limit` is ALSO pushed into `scan-prefix` so the tree walk stops after
+  that many ciphertexts — taking limit after a full scan is what made
+  `datoms` `:limit 1` cost O(database) CPU on kotobase.net (2026-08-17,
+  relay-bsky ~35s/500). A dropping `visible?` may therefore return fewer
+  than `:limit` rows rather than keep walking; the public Worker path
+  passes `(constantly true)`.
+  Pass `(constantly true)` to see everything, as an explicit choice. See
+  `hydrate-db`, below, for the one internal caller that deliberately must NOT
+  narrow this.
+
+  `blind-fn`/`decrypt-fn` (ADR-2607051000, accepted 2026-07-06) are REQUIRED:
+  `blind-fn` re-derives the seek prefix from known `:components` (see
+  `components-prefix`); `decrypt-fn` opens each matched leaf's ENCRYPTED
+  VALUE to recover the real `[k1 k2 v]` triple -- the key is a one-way blind
+  token and can no longer be read back for the row's actual content (the
+  design correction ADR-2607061800/2607061900's addendum made to
+  ADR-2607051000's original, incorrect \"no separate value encryption
+  needed\" claim). Synchronous on JVM; a `js/Promise` of the rows on cljs
+  (since `components-prefix`/`decrypt-fn` are themselves Promise-returning
+  there — `get-fn`/`pt/scan-prefix` stay synchronous on both platforms)."
+  [get-fn snapshot-cid {:keys [index components limit]} visible? blind-fn decrypt-fn]
+  )
+
+
+
+(defn hydrate-db
+  "Rebuild the full hot 4-index `db` from a persisted snapshot. Reads ONE
+  index tree (the spo root, i.e. `:eavt`) in full and re-asserts every quad, so the reconstructed
+  db is ~1× graph size. This is `fold!`'s internal starting point (hydrate
+  the last-indexed snapshot, then re-assert novelty on top) — an O(graph_shard)
+  operation, now paid once per fold instead of once per write. get-fn:
+  `(get-fn cid) -> bytes`; nil snapshot → empty db.
+
+  Deliberately calls `cold-datoms` with `(constantly true)`, NOT a caller-
+  supplied `visible?`: this fn reconstructs the COMPLETE hot db for an
+  internal structural purpose (`fold!`'s re-assert-novelty-then-resnapshot
+  step), not a scoped read for an external caller. Any narrower `visible?`
+  here would silently drop rows out of the rebuilt db — and since `fold!`
+  then commits that db as the new persisted snapshot, a narrowed hydrate
+  would bake permanent, silent data loss into the graph. Visibility belongs
+  at the read surface (`datoms`/`cold-datoms`/`hot-datoms` called directly
+  for a caller-facing read), never at this internal rehydration step.
+
+  `blind-fn`/`decrypt-fn` (ADR-2607051000, accepted 2026-07-06) are REQUIRED
+  and threaded straight to `cold-datoms` -- see its docstring for their
+  contract, including the sync-JVM/Promise-cljs platform split (`cold-
+  datoms` is itself a `js/Promise` of the rows on cljs)."
+  [get-fn snapshot-cid blind-fn decrypt-fn]
+  (letfn [(build [rows]
+            (reduce (fn [db {:keys [e a v_edn]}]
+                      (qs/assert-quad db {:s e :p a :o (qs/edn->link (edn/read-string v_edn))}))
+                    (qs/empty-db)
+                    rows))]
+    ))
+
+(defn hydrate-cache-key
+  "The cache key `hydrate-db-cached` stores/looks up its memoized rows under
+   for a given `snapshot-cid`. Exposed so callers constructing a storage-
+   backed cache-get/cache-put! (e.g. an R2 adapter keyed by string) can share
+   the exact same derivation without duplicating the \"hydrate-cache/v1/\"
+   namespace prefix."
+  [snapshot-cid]
+  (str "hydrate-cache/v1/" snapshot-cid))
+
+(defn hydrate-db-cached
+  "Like `hydrate-db`, but memoizes the expensive `cold-datoms` decrypt-and-
+   scan result via `cache-get`/`cache-put!` (both optional; nil for either
+   disables caching, falling back to identical behavior to `hydrate-db`),
+   keyed by `snapshot-cid` (`hydrate-cache-key`) -- so a fold retried against
+   the SAME still-unfolded snapshot (the common case while a backlog is too
+   large to clear in one attempt: `snapshot-cid` doesn't change between
+   retries since no fold has succeeded yet) skips straight to a cache hit
+   instead of re-paying the O(graph_shard) decrypt-and-scan on every single
+   retry (ADR-2607120730 Part 1, \"memoized hydration\").
+
+   `cache-put!` is invoked as soon as the rows are computed -- BEFORE the
+   caller applies novelty/re-commits -- specifically so a fold attempt that
+   hydrates successfully but then exceeds its CPU budget LATER (applying
+   novelty, or `qs/commit!`'s tree rebuild) still leaves the cache populated
+   for the next attempt. This is why `cache-put!` must be a storage write
+   that lands immediately, NOT one threaded through a buffered end-of-request
+   flush (e.g. `kotobase-cljc-worker`'s `run-write-attempt` buffers `put!`
+   and only flushes to R2 after the whole call returns a response) -- a
+   cache write buffered that way would be lost on exactly the failure this
+   fn exists to survive.
+
+   `cache-get`/`cache-put!` are `(fn [key]) -> bytes|nil` / `(fn [key bytes])`
+   on JVM (synchronous, matching `get-fn`/`put!`'s own JVM contract); on cljs
+   they are Promise-returning (`(fn [key]) -> js/Promise<bytes|nil>` /
+   `(fn [key bytes]) -> js/Promise<_>`) since a real cache-put! is a direct
+   (unbuffered) R2 write, unlike the synchronous `get-fn`/`put!` block-store
+   trampoline.
+
+   Serialization deliberately does NOT `pr-str` a `cold-datoms` row
+   (`{:e :a :v_edn :added}`) as-is: `:v_edn` is already a safely-encoded EDN
+   string (`v->edn`'s `qs/link->edn` form, readable with no custom reader),
+   but `:e`/`:a` are raw decoded values that -- exactly like `:v` before
+   `v->edn` -- may themselves be `ipld.core` Links, which plain `pr-str`
+   shreds into a bare, untyped seq on read-back (the same regression
+   `v->edn`'s docstring/ADR-2607051000 follow-up already document for `:v`).
+   Each row is therefore re-encoded through the SAME `v->edn`/`qs/edn->link`
+   round-trip for `:e` and `:a` too before caching.
+
+   `async-get-fn` (optional, `:cljs` only, nil-safe -- absent falls back to
+   `cold-datoms`'s `with-blocks`-trampolined scan, identical to before this
+   param existed): a DIRECT Promise-returning `(fn [cid]) -> js/Promise
+   <bytes>`, routed to `cold-datoms-async` instead of `cold-datoms` --
+   confirmed live (ADR-2607120730 follow-up) to fix the actual dominant
+   cost of a stuck fold: `with-blocks`' one-miss-per-retry-from-root
+   trampoline re-walks/re-decodes every already-fetched node on every
+   retry, O(N^2) for a tree touching N distinct blocks, regardless of
+   `cache-get`/`cache-put!` (which only helps a SECOND attempt against an
+   already-hydrated snapshot -- if the FIRST hydrate itself never
+   completes, cache-put! never even fires). `cold-datoms-async`'s batched-
+   concurrent discovery is O(N)."
+  ([get-fn snapshot-cid blind-fn decrypt-fn cache-get cache-put!]
+   (hydrate-db-cached get-fn snapshot-cid blind-fn decrypt-fn cache-get cache-put! nil))
+  ([get-fn snapshot-cid blind-fn decrypt-fn cache-get cache-put! async-get-fn]
+   (letfn [(build [rows]
+            ;; Bulk-load, not one persistent assert per row. Every persistent
+            ;; assert allocates a fresh db across four indexes, so a hydrate of
+            ;; N rows leaves N-1 of them as garbage -- the allocation-churn
+            ;; signature, and this runs where memory is the binding constraint.
+            ;;
+            ;; Measured 2026-09-10 (root ADR-2609100100): the invocations killed
+            ;; on this path sit at memP50 89.9 MB against a 128 MB isolate while
+            ;; the ones that answer use 14.6 MB, and cpu_ms 300000 does not help
+            ;; because more CPU does not buy memory. At the production shape
+            ;; (1665 rows) the two builds cost 23.7 MB and 9.8 MB of heap growth
+            ;; respectively; the gap narrows by 15k rows, so this is a fix for
+            ;; the regime this graph is actually in, not a general win.
+            ;;
+            ;; Safe as a blanket substitution HERE and not elsewhere: these rows
+            ;; are a snapshot scan, so every one is an assert. `fold!`'s novelty
+            ;; reduce goes through `apply-quad`, which also handles :retract and
+            ;; :retract-entity, and must stay as it is.
+            ;; NOTE the return value. `assert-quads!` carries a bang but is not
+            ;; in-place: it RETURNS the accumulator, and discarding it persists
+            ;; an empty one. Doing that lost only the vaet index in the suite --
+            ;; three Link-value tests -- because the other three mutate through,
+            ;; so the failure looked like a Link bug rather than a dropped
+            ;; result.
+            (qs/persist-db
+             (qs/assert-quads! (qs/mutable-db (qs/empty-db))
+                               (map (fn [{:keys [e a v_edn]}]
+                                      {:s e :p a :o (qs/edn->link (edn/read-string v_edn))})
+                                    rows)
+                               ipld/link?)))
+          (encode-rows [rows]
+            (pr-str (mapv (fn [{:keys [e a v_edn added]}]
+                            [(v->edn e) (v->edn a) v_edn added])
+                          rows)))
+          (decode-rows [s]
+            (mapv (fn [[e_edn a_edn v_edn added]]
+                    {:e (qs/edn->link (edn/read-string e_edn))
+                     :a (qs/edn->link (edn/read-string a_edn))
+                     :v_edn v_edn
+                     :added added})
+                  (edn/read-string s)))]
+    )))
+
+(defn hydrate-chain
+  "Rebuild the full hot db AS OF `chain-cid` — the persisted `indexed`
+   snapshot PLUS any not-yet-folded `novelty` re-asserted on top, in append
+   order. Unlike `hydrate-db` (indexed snapshot only, `fold!`'s internal
+   building block), this matches exactly what `fold!` would commit if
+   called at this exact point: `(hydrate-chain get-fn (as-of get-fn
+   chain-cid seq) blind-fn decrypt-fn)` is a true database VALUE as of
+   that point in history, safe to `q`/`query`/`pull` against like any
+   other hot db.
+
+   `blind-fn`/`decrypt-fn` (ADR-2607051000) REQUIRED, same contract as
+   `hydrate-db`/`hot-datoms`. Synchronous on JVM; a `js/Promise` of the db
+   on cljs."
+  [get-fn chain-cid blind-fn decrypt-fn]
+  (let [state (state-at get-fn chain-cid)]
+    ))
+
+(defn- delta->quad [{:keys [e a v op]}]
+  {:s e :p a :o v :op op})
+
+(defn hydrate-transaction-slice
+  "Rebuild only the current subjects TX-DATA can change. The indexed half is
+   read as one EAVT prefix range per distinct subject; unfolded novelty blocks
+   are fetched once and only matching subjects are replayed. This preserves
+   `transact-effective` semantics (including retractEntity) without hydrating
+   unrelated graph rows. Sync on JVM, Promise on cljs. OPTS currently accepts
+   cljs-only `:async-get-fn` for direct bounded object-store reads."
+  ([get-fn chain-cid tx-data blind-fn decrypt-fn]
+   (hydrate-transaction-slice get-fn chain-cid tx-data blind-fn decrypt-fn {}))
+  ([get-fn chain-cid tx-data blind-fn decrypt-fn {:keys [async-get-fn]}]
+   (let [subjects (into #{} (map (comp :s ->quad)) tx-data)
+         state (state-at get-fn chain-cid)
+         snapshot-cid (indexed-cid state)
+         novelty (or (indexed-novelty-entries get-fn state)
+                     (novelty-entries get-fn state))
+         matching-entries (fn [subject-tokens]
+                            (filterv (fn [{entry-tokens :subjects}]
+                                       (or (nil? entry-tokens)
+                                           (some subject-tokens entry-tokens)))
+                                     novelty))
+         rows->db (fn [rows]
+                    (reduce (fn [db {:keys [e a v_edn]}]
+                              (qs/assert-quad db {:s e :p a
+                                                  :o (qs/edn->link (edn/read-string v_edn))}
+                                              ipld/link?))
+                            (qs/empty-db) rows))
+         replay (fn [rows novelty-per-cid]
+                  (let [base (rows->db (apply concat rows))
+                        relevant (filter #(contains? subjects (:s %))
+                                         (apply concat novelty-per-cid))]
+                    (reduce (fn [db q] (apply-quad db q ipld/link?)) base relevant)))]
+     )))
+
+(defn commit-serialized-effective!
+  "Correctness-first persisted transactor path. Hydrates the actual CAS head,
+   normalizes TX-DATA against that database value, and persists only effective
+   state transitions. A semantic no-op writes no blocks and does not call
+   `cas!`; a lost CAS race retries from (and re-normalizes against) the actual
+   winning head.
+
+   Returns a report containing `:committed?`, `:chain-cid-before`,
+   `:chain-cid-after`, and `:effective-deltas`. OPTS accepts `:max-retries`
+   (default `default-max-cas-retries`). This path intentionally pays the current
+   full-hydration cost. `commit-serialized!` remains the O(tx) append path for
+   callers which have already normalized their transaction. OPTS also forwards
+   cljs-only `:async-get-fn` to the transaction-slice reader."
+  ([put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn blind-fn decrypt-fn]
+   (commit-serialized-effective! put! get-fn cas! head-key expected-chain-cid tx-data
+                                 encrypt-fn blind-fn decrypt-fn {}))
+  ([put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn blind-fn decrypt-fn
+    {:keys [max-retries] :as opts
+     :or {max-retries default-max-cas-retries}}]
+   (let [report (fn [before after deltas committed? attempts]
+                  {:committed? committed?
+                   :chain-cid-before before
+                   :chain-cid-after after
+                   :effective-deltas deltas
+                   :attempts attempts})]
+     )))
+
+(defn hydrate-chain-cached
+  "`hydrate-chain`, with the SNAPSHOT portion memoized through
+   `hydrate-db-cached`'s encoded-rows cache -- `cache-get`/`cache-put!`
+   (both optional; nil for either falls back to plain `hydrate-db`
+   behavior for the snapshot), keyed by snapshot-cid via
+   `hydrate-cache-key`, plus `hydrate-db-cached`'s optional
+   `async-get-fn` (`:cljs` only) for `cold-datoms-async`'s
+   batched-concurrent block discovery. The NOVELTY portion is replayed
+   fresh every call, exactly as `hydrate-chain` does -- novelty is the
+   part that changes between commits, and (post-fold) the part that is
+   small; the snapshot is the part that is big and immutable per
+   snapshot-cid, hence the only part worth caching.
+
+   Motivation (net-kotobase/kotobase-cf-wasm, 2026-07-24): a serving
+   isolate's FIRST read of a graph re-pays the full snapshot
+   decrypt-and-scan even when a sibling isolate in the same colo hydrated
+   the same snapshot moments earlier; a colo-shared rows cache (e.g.
+   Cloudflare Cache API) behind `cache-get`/`cache-put!` turns that into
+   one blob fetch + decode. Same contract as `hydrate-db-cached` for the
+   cache fns: sync bytes|nil on JVM, Promise-returning on cljs.
+
+   Sound by immutability: the cache key is the snapshot-cid (content
+   address); a fold produces a NEW snapshot-cid. Rows land in the cache
+   DECRYPTED (encoded via `hydrate-db-cached`'s own codec) -- callers
+   whose cache medium is less trusted than their own runtime memory must
+   encrypt the blob themselves inside `cache-put!`/`cache-get`.
+
+   Synchronous on JVM; a `js/Promise` of the db on cljs."
+  ([get-fn chain-cid blind-fn decrypt-fn cache-get cache-put!]
+   (hydrate-chain-cached get-fn chain-cid blind-fn decrypt-fn cache-get cache-put! nil))
+  ([get-fn chain-cid blind-fn decrypt-fn cache-get cache-put! async-get-fn]
+   (let [state (state-at get-fn chain-cid)]
+     )))
+
+(defn- newly-added-transactions
+  "Walk `chain-cid`'s full history: for each commit whose OWN novelty list
+   grew by exactly one entry relative to the PREVIOUS commit (a plain
+   `commit!` append, not a `fold!` compaction/reset) AND whose `:seq` is
+   greater than `after-seq`, collect that commit's newest novelty tx-cid.
+   A `fold!` commit itself contributes nothing (folding restructures
+   already-seen data into an indexed snapshot, it doesn't add new user
+   data) -- but any ORIGINAL `commit!` this walk already passed still
+   counts regardless of a LATER fold, since this reads each commit's
+   HISTORICAL state as it was at that point in the chain, not just the
+   tip's current shape. Shared walk `since`/`history` both build on.
+
+   Per-commit cost: O(1) for a state already in the new front/back shape
+   (`novelty-count` read directly, `newest-novelty-cid` peeks novelty-back's
+   head node — never walks the full per-commit backlog just to size or
+   peek it); O(legacy novelty length) for a commit still in the pre-
+   kotoba-lang/kotobase-peer#16-fix flat-vector shape (unavoidable — that
+   shape has no cheaper way to answer either question)."
+  [get-fn chain-cid after-seq]
+  (loop [prev-count 0, remaining (chain get-fn chain-cid), acc []]
+    (if (empty? remaining)
+      acc
+      (let [{:keys [seq state]} (first remaining)
+            norm (normalize-state state)
+            cur-count (if (legacy-novelty-state? norm)
+                        (count (get norm "novelty" []))
+                        (get norm "novelty-count" 0))]
+        (recur cur-count
+               (rest remaining)
+               (if (and (> seq after-seq) (= cur-count (inc prev-count)))
+                 (conj acc {:t seq
+                            :tx-cid (newest-novelty-cid get-fn norm)})
+                 acc))))))
+
+(defn- newly-added-tx-cids [get-fn chain-cid after-seq]
+  (mapv :tx-cid
+        (newly-added-transactions get-fn chain-cid after-seq)))
+
+(defn tx-range
+  "Return committed transaction-log entries in `[start, end)`.
+
+  Each entry contains the immutable chain sequence `:t`, the encrypted
+  transaction block CID as `:tx-cid`, and raw operation-shaped `:data`.
+  Assertions/retractions carry Datomic-shaped `:added`; retractEntity is
+  retained as an explicit marker because the original transaction block does
+  not duplicate every affected datom. Synchronous on JVM and Promise-returning
+  on ClojureScript."
+  ([get-fn chain-cid decrypt-fn]
+   (tx-range get-fn chain-cid nil nil decrypt-fn))
+  ([get-fn chain-cid start end decrypt-fn]
+   (let [start (or start 0)
+         selected
+         (filterv
+          (fn [{:keys [t]}]
+            (and (<= start t) (or (nil? end) (< t end))))
+          (newly-added-transactions get-fn chain-cid (dec start)))
+         entry
+         (fn [{:keys [t tx-cid]} quads]
+           {:t t
+            :tx-cid tx-cid
+            :data
+            (mapv
+             (fn [{:keys [s p o op]}]
+               (if (= :retract-entity op)
+                 {:e s :retract-entity true :added false}
+                 {:e s :a p :v_edn (v->edn o)
+                  :added (not= :retract op)}))
+             quads)})]
+     )))
+
+(defn since
+  "A hot db containing ONLY the quads from commits with `:seq` greater
+   than `since-seq` -- Datomic's `since`, a view of what changed AFTER a
+   point (NOT merged with state as-of that point; for the merged
+   \"everything up to and including now\" view, use `hydrate-chain` on
+   the chain-cid itself). See `newly-added-tx-cids` for exactly which
+   commits this includes. `decrypt-fn` (ADR-2607051000) REQUIRED.
+   Synchronous on JVM; a `js/Promise` of the db on cljs."
+  [get-fn chain-cid since-seq decrypt-fn]
+  (let [tx-cids (newly-added-tx-cids get-fn chain-cid since-seq)]
+    ))
+
+(defn- eavt->quads [db]
+  (for [[e attrs] (:eavt db), [a vs] attrs, v vs] {:s e :p a :o v}))
+
+;; ── ADR-2607071610 Phase 2: history actually preserves retracted facts ──────
+;; `history` (below) has ALWAYS documented "a datom retracted later still
+;; appears here (that is the point of an audit view)" — but until this pass
+;; that was aspirational, not true: composing it from `since -1` reused
+;; `since`'s own `apply-quad`-based reduce, which CANCELS a retracted fact
+;; within that db before `history` ever saw it (confirmed by direct testing:
+;; commit an assert then `[:db/retract ...]` of the same value, and the
+;; pre-Phase-2 `history` returned `{}` for that entity, not the retracted
+;; fact). `since` itself is unchanged (its OWN contract -- "what changed
+;; after a point," Datomic-`since`-shaped -- is correctly cancelling; the
+;; bug was `history` reusing it for a job that needs the opposite). This
+;; replay is the actual fix: unlike `since`/`hot-datoms`, it NEVER retracts
+;; from the returned db -- a `:retract`/`:retract-entity` op's own (e,a,v)
+;; still gets `assert-quad`'d into the audit db, using a SEPARATE, real
+;; current-state replay only to know what a `:retract-entity` (which
+;; carries no attrs of its own) actually held at that moment -- the same
+;; information `retract-entity*` needs to apply the retraction for real
+;; elsewhere in this file.
+(defn- audit-replay
+  "[current-db audit-db] after replaying every quad in `quads` (in order).
+   `current-db` applies ops normally (assert/retract/retract-entity, same
+   as `apply-quad` -- used ONLY to know a `:retract-entity`'s prior attrs
+   when it's hit, never returned to callers). `audit-db` never retracts:
+   every (e,a,v) any op ever named is `assert-quad`'d in and stays."
+  [quads ref?]
+  (reduce
+   (fn [[cur audit] {:keys [s p o op] :as q}]
+     (case (or op :assert)
+       :assert
+       [(qs/assert-quad cur q ref?) (qs/assert-quad audit q ref?)]
+       :retract
+       [(qs/retract-quad cur q ref?) (qs/assert-quad audit q ref?)]
+       :retract-entity
+       (let [prior (get-in cur [:eavt s] {})
+             audit' (reduce (fn [a [p vs]]
+                              (reduce (fn [a v] (qs/assert-quad a {:s s :p p :o v} ref?)) a vs))
+                            audit prior)]
+         [(retract-entity* cur s ref?) audit'])))
+   [(qs/empty-db) (qs/empty-db)] quads))
+
+(defn history
+  "A hot db containing every quad EVER asserted via any commit rooted at
+   `chain-cid`, across its WHOLE history from genesis to tip -- Datomic's
+   `history`: every assertion that ever reached the chain, union'd across
+   fold compactions, INCLUDING facts later retracted (ADR-2607071610 Phase
+   2 -- see `audit-replay`'s docstring for the confirmed bug this fixes in
+   how this fn used to be composed; the promise below is now actually true).
+   Separately, two `commit!` calls asserting different values for the
+   same `(s, p)` pair both remain visible (`arrangement.core` has no
+   cardinality tracking of its own, ADR-2607061200 pillar note;
+   `transact-with-schema`'s cardinality `:one` retraction happens on hot
+   db values). What `history` gives: a complete, literal audit trail
+   across `fold!` compactions -- data folded away from `hot-datoms`'
+   novelty view remains fully reconstructable here.
+
+   Built from replaying `(newly-added-tx-cids get-fn chain-cid -1)` (every
+   novelty tx-block ever appended, across the whole chain -- `-1` because
+   every real commit's `:seq` is >= 0) via `audit-replay`, UNION the tip's
+   `indexed` snapshot (`hydrate-db`, which already subsumes everything
+   folded before it -- also the only source of any content a `snapshot!`-
+   seeded genesis contributed, see the HONEST LIMITATION below). Overlap
+   between the two (a commit whose novelty was later folded appears in
+   both) is harmless: `arrangement.core`'s indices are sets, re-asserting
+   an identical fact is a no-op.
+
+   HONEST LIMITATION: content seeded via `snapshot!` (the cold-start/
+   migration entry point, NOT the novelty-log `commit!` path) has no
+   individual assert history -- it was never transacted through the
+   novelty log, so there's no tx block recording how it came to exist.
+   The union with the tip snapshot means CURRENTLY-live seeded facts still
+   appear here, but a seeded fact that was LATER retracted would not (no
+   audit event for it ever existed) -- an honest gap from import-without-
+   a-log, not something this fn can paper over.
+
+   `blind-fn`/`decrypt-fn` (ADR-2607051000) REQUIRED, same contract as
+   `hydrate-db`/`since`. Synchronous on JVM; a `js/Promise` of the db on
+   cljs."
+  [get-fn chain-cid blind-fn decrypt-fn]
+  )
+
+(defn history-datoms
+  "Datomic `(d/datoms (d/history db) ...)`-shaped rows `{:e :a :v_edn
+   :added}` (ADR-2607071610 Phase 2's other half -- `history` above gives
+   a queryable hot-db VALUE with retracted facts folded back in
+   indistinguishably from live ones; this gives the actual EVENT LOG,
+   distinguishing an assert from a retract via `:added`).
+
+   Replays the same whole-chain walk `history` does (`audit-replay`, see
+   its docstring for the confirmed bug it fixes), but returns the ORDERED
+   ROW SEQUENCE instead of a db value: `:added true` for an assert,
+   `:added false` for a retract or (one row per attribute the entity held
+   at that moment) a `:retract-entity` -- the op itself carries no attrs,
+   so this asks the SAME running current-state the replay already tracks
+   internally to know what they were.
+
+   `entity` (optional, a `:db/id` string): when given, only that entity's
+   rows are emitted -- the single most common `(d/history db)` ask (\"what
+   happened to THIS entity\"). The full replay always runs regardless (an
+   unrelated entity's `:retract-entity` still needs correct running
+   state); only the emitted rows are narrowed. `nil` = whole-graph history
+   -- correct but O(all history) with no narrowing; prefer passing
+   `entity` on any graph with real write volume.
+
+   Does NOT union the tip's indexed snapshot the way `history` does: a
+   `snapshot!`-seeded fact has no assert EVENT to show (see `history`'s
+   own HONEST LIMITATION note) -- this fn stays honest about that instead
+   of synthesizing a fake `:added true` row with no real event behind it.
+
+   `visible?`/`decrypt-fn` REQUIRED, same convention as every other read
+   fn here. Synchronous on JVM; a `js/Promise` of the rows on cljs."
+  ([get-fn chain-cid visible? decrypt-fn]
+   (history-datoms get-fn chain-cid nil visible? decrypt-fn))
+  ([get-fn chain-cid entity visible? decrypt-fn]
+   (let [row (fn [s p v added] {:e s :a p :v_edn (v->edn v) :added added})
+         want? (fn [s] (or (nil? entity) (= entity s)))
+         step (fn [[cur rows] {:keys [s p o op] :as q}]
+                (case (or op :assert)
+                  :assert
+                  [(qs/assert-quad cur q ipld/link?)
+                   (cond-> rows (want? s) (conj (row s p o true)))]
+                  :retract
+                  [(qs/retract-quad cur q ipld/link?)
+                   (cond-> rows (want? s) (conj (row s p o false)))]
+                  :retract-entity
+                  (let [prior (get-in cur [:eavt s] {})
+                        new-rows (when (want? s)
+                                   (for [[p vs] prior v vs] (row s p v false)))]
+                    [(retract-entity* cur s ipld/link?)
+                     (into rows new-rows)])))]
+     )))
+
+(defn hot-datoms
+  "THE scale-safe read path (ADR-2607032430 D1): `datoms`-shaped rows as of
+  `chain-cid`'s current state, merging the indexed snapshot (`cold-datoms` —
+  range-pruned, untouched by graph size) with any not-yet-folded novelty
+  (small, bounded by the fold threshold). Novelty filtering reuses `datoms`'s
+  own index/components logic (build a throwaway hot db from just the
+  novelty quads, filter it the normal way) — exactly consistent with the
+  snapshot path's semantics, no separate filter implementation to drift.
+  Replaces `hydrate-db` + `datoms` for any caller that doesn't need a full
+  hot db value. `nil` chain-cid → `[]`.
+
+  `visible?` is REQUIRED (ADR-2607050500, same contract as `datoms`/
+  `cold-datoms`: a post-filter over each `{:e :a :v_edn :added}` row).
+  Forwarded UNCHANGED to both `cold-datoms` (for the snapshot half) and
+  `datoms` (for the novelty half) — each half is filtered exactly once, by
+  its own producer, before the two row seqs are concatenated, so nothing is
+  filtered twice and neither path (snapshot or novelty) is missed. Pass
+  `(constantly true)` to see everything, as an explicit choice.
+
+  `blind-fn`/`decrypt-fn` (ADR-2607051000, accepted 2026-07-06) are REQUIRED:
+  `blind-fn`/`decrypt-fn` go to `cold-datoms` (the snapshot half);
+  `decrypt-fn` also goes to `read-tx-block` (the novelty half, whole-block
+  decrypt, no blinding needed there). Synchronous on JVM; a `js/Promise` of
+  the rows on cljs (the snapshot and novelty halves resolve concurrently
+  there, via `js/Promise.all`, since they're independent).
+
+  `async-get-fn` (optional, `:cljs`-only effect, nil-safe — kotoba-lang/
+  kotobase-peer#21): a Promise-returning `(fn [cid]) -> js/Promise<bytes>`
+  that fetches DIRECTLY, bypassing a synchronous block-miss trampoline
+  (e.g. `with-blocks`) entirely — the exact same fix `fold!` already
+  applies to ITS OWN hydrate step (ADR-2607120730), now available for
+  every regular read too, not just the fold maintenance operation.
+  Without this, EVERY hot-datoms call (the read path `do-q`/`do-pull`/any
+  store bridge's `hydrate!` goes through) pays the sync trampoline's O(N²)
+  block-discovery cost on its cold-snapshot half — confirmed live
+  elsewhere in this org (gftdcojp/app-aozora#78): a 5130-leaf snapshot
+  exceeded a 300s CPU budget via that path vs 806ms via
+  `scan-prefix-async`. Routes the snapshot half through `cold-datoms-async`
+  and the novelty half through `read-tx-block-async` (both already used
+  internally by `fold!`); `nil` (the default, omitted arity) is IDENTICAL
+  to today's behavior — this is purely additive. `chain-cid`'s own head
+  walk (`state-at`) stays synchronous either way, same as `fold!`'s own
+  async-get-fn arity — it's a handful of small metadata blocks, not
+  proportional to graph size, so it isn't the O(N²) cost this closes."
+  ([get-fn chain-cid visible? blind-fn decrypt-fn]
+   (hot-datoms get-fn chain-cid nil visible? blind-fn decrypt-fn))
+  ([get-fn chain-cid opts visible? blind-fn decrypt-fn]
+   (hot-datoms get-fn chain-cid opts visible? blind-fn decrypt-fn nil))
+  ([get-fn chain-cid opts visible? blind-fn decrypt-fn async-get-fn]
+   ))
+
+
+;; ── materialized views (RisingWave-style IVM on IPLD, ADR-2607166600) ───────
+;; A view is a named, declaratively-specified projection of the graph's
+;; CURRENT STATE — today's spec language is {"attrs" [attr ...]}: the rows
+;; whose :a is in that set — materialized at fold time as ONE
+;; content-addressed dag-cbor block and linked from the chain state under
+;; "views". The RisingWave mapping: novelty tx-blocks are the stream, fold!
+;; is the barrier/checkpoint, the views block is the MV state in shared
+;; storage, and `view-rows` merges unfolded novelty on read (same hot/cold
+;; split as hot-datoms) so reads are always fresh without waiting for the
+;; next fold. Because the MV is content-addressed and reachable from the
+;; chain head, ANY peer that syncs the chain serves the identical view with
+;; one block read — no central cache. `commit!` (transact) carries "views"
+;; forward untouched (its new-state merges over the old state map); only
+;; fold! re-materializes. Rows are stored AEAD-encrypted as one opaque
+;; ciphertext, exactly like tx-blocks (whole-block reads, no keyed seek, so
+;; no blind-index concern — ADR-2607051000's put-tx-block! precedent).
+;;
+;; Phase 1 derives each view's rows from the fold's already-hydrated merged
+;; db (zero extra reads — fold! pays the full hydrate regardless). When fold
+;; itself goes incremental, view maintenance becomes O(novelty) delta
+;; application against the previous view block (RisingWave's actual IVM);
+;; the stored shape already supports that (spec travels with rows).
+
+(defn- put-views-block!
+  "Write the views node {\"views\" {name {\"spec\" .. \"rows\" [[e a v_edn]
+  ...]}}} as one AEAD-encrypted block; returns its CID (string). Sync on
+  JVM, js/Promise of the CID on cljs (encrypt-fn is a Promise there)."
+  [put! views encrypt-fn]
+  )
+
+(defn- read-views-block
+  "Inverse of put-views-block!: the decrypted {name {\"spec\" .. \"rows\"
+  ..}} map. Sync on JVM, js/Promise on cljs."
+  [get-fn views-cid decrypt-fn]
+  )
+
+(defn- derive-view-rows
+  "Current-state rows matching `spec` from an in-memory db, as compact
+  [e a v_edn] triples (assertions only — a view holds current state; the
+  read path re-applies unfolded novelty retractions on top)."
+  [db spec]
+  (let [attrs (set (get spec "attrs"))]
+    (->> (datoms db (constantly true))
+         (filter #(and (:added % true) (contains? attrs (:a %))))
+         (map (fn [{:keys [e a v_edn]}] [e a v_edn]))
+         (sort-by pr-str)
+         vec)))
+
+(defn- merge-view-specs
+  "The spec set to materialize this fold: the previously-stored specs,
+  overridden by `views-param` when the caller passed one (upsert per name;
+  an explicit nil spec removes that view)."
+  [old-views views-param]
+  (let [old-specs (into {} (map (fn [[k v]] [k (get v "spec")])) old-views)]
+    (if (nil? views-param)
+      old-specs
+      (reduce (fn [acc [k v]] (if (nil? v) (dissoc acc k) (assoc acc k v)))
+              old-specs views-param))))
+
+(defn- materialize-views!
+  "Materialize every view over the fold's merged `db` and write ONE views
+  block. Returns a Link to it, or nil when there are no views to keep.
+  Sync on JVM, js/Promise on cljs."
+  [put! get-fn state db views-param encrypt-fn decrypt-fn]
+  (let [views-cid (some-> (get state "views") ipld/link-cid)]
+    ))
+
+
+
+(defn view-rows
+  "Fresh materialized-view rows with chronological novelty applied. Optional
+   blind-fn and async-get-fn prune irrelevant update blocks and avoid cold
+   handler restarts. Missing legacy metadata and entity deletions are retained.
+   The flat stored view block remains a size-dependent read."
+  ([get-fn chain-cid view-name visible? decrypt-fn]
+   (view-rows get-fn chain-cid view-name visible? decrypt-fn nil nil))
+  ([get-fn chain-cid view-name visible? decrypt-fn blind-fn async-get-fn]
+   (let [state (state-at get-fn chain-cid)
+         views-cid (some-> (get state "views") ipld/link-cid)
+         finish (fn [views novelty-quads]
+                  (when-let [entry (get views view-name)]
+                    (let [spec (get entry "spec")
+                          attrs (set (get spec "attrs"))
+                          relevant (filter #(or (= :retract-entity (:op %)) (contains? attrs (:p %)))
+                                           novelty-quads)
+                          stored (map (fn [[e a v]] {:e e :a a :v_edn v :added true})
+                                      (get entry "rows"))
+                          snap-rows (filter visible?
+                                            (remove-retracted (retraction-filters relevant) stored))
+                          novelty-rows (->> (datoms (apply-quads (qs/empty-db) relevant ipld/link?) visible?)
+                                            (filter #(contains? attrs (:a %))))]
+                      {:spec spec :rows (vec (concat snap-rows novelty-rows))})))]
+     )))
+
+(defn fold-rebuild!
+  "Compact `chain-cid`'s novelty into a fresh indexed snapshot: hydrate the
+  current `indexed` snapshot, re-assert every novelty quad on top (append
+  order), `qs/commit!` that as the new `indexed`, and append ONE new
+  chain entry. Cost: O(graph_shard) — the same full rebuild `snapshot!`/the
+  pre-D1 `commit!` always paid, now amortized over however many `commit!`
+  writes accumulated the folded novelty instead of being paid on every
+  single one (`should-fold?`/`novelty-size` decide when to call this;
+  correctness never depends on it running promptly).
+
+  `max-novelty` (optional, default nil = unbounded/full fold, exactly
+  today's behavior): caps how many of the OLDEST not-yet-folded tx blocks
+  this call folds, leaving the rest as the new state's `novelty` tail
+  instead of always emptying it. Novelty is stored oldest-first (`commit!`
+  `conj`s each new tx-block link onto the END), so `take max-novelty`/
+  `drop max-novelty` folds strictly in chronological (append) order and the
+  remaining tail is exactly what a later `fold-rebuild!` call would still need to
+  process — correctness (retraction-vs-earlier-assertion resolution, which
+  `apply-quad`'s reduce already handles by walking `indexed` then novelty
+  in order) is identical whether one call folds everything or N calls each
+  fold a bounded slice, since each call's own `hydrate-db` picks up
+  whatever the PREVIOUS call already committed to `indexed`.
+
+  Motivation (found live, gftdcojp/app-aozora#78): bounding `pmap-async`'s
+  in-flight fetch count (see that fn's docstring) fixes the Workers
+  subrequest-concurrency collapse for a MODERATE novelty backlog, but a
+  backlog large enough that even batched-but-still-sequential processing
+  of the WHOLE thing exceeds one Worker invocation's CPU/wall-time budget
+  can leave `fold-rebuild!` itself unable to ever complete — a runaway: novelty
+  can only shrink via a successful fold, but the fold needed to shrink it
+  never finishes. `max-novelty` breaks that: a fold cron can call `fold-rebuild!`
+  with a small bounded budget every cycle and make guaranteed forward
+  progress (novelty strictly shrinks by up to `max-novelty` per successful
+  call) even against a backlog too large to clear in one invocation,
+  instead of repeatedly attempting (and losing all the work of) one
+  all-or-nothing fold that never finishes.
+
+  Since kotoba-lang/kotobase-peer#16's fix: reading which entries to fold
+  (unbounded: everything; bounded: the oldest `max-novelty`) no longer
+  requires decoding the WHOLE novelty backlog just to find them — see
+  `novelty-cids`/`take-oldest-novelty`'s own docstrings for the front/back
+  persistent-queue design and its (amortized, not flat-per-call) cost
+  story.
+
+  Deterministic FOR A GIVEN novelty-cids ordering and a given `max-novelty`
+  choice: prolly-tree/arrangement are content-addressed, so folding the
+  identical (indexed, to-fold-slice) pair — from ANY writer, a server cron
+  or a browser at idle — always produces the same snapshot CID. Concurrent
+  folds of the same state with the same `max-novelty` are safe, redundant,
+  and cheap (re-`put!`ing already-stored bytes is a no-op at the
+  block-store layer); this property does NOT require every caller to agree
+  on `max-novelty` for overall correctness (only for the 'redundant folds
+  converge to the identical intermediate CID' optimization — the sequence
+  of indexed snapshots still monotonically absorbs novelty in order either
+  way). NOTE (ADR-2607051000, accepted 2026-07-06): this determinism now
+  additionally depends on `encrypt-fn` deriving its nonce deterministically
+  from the plaintext rather than randomly -- a random-nonce `encrypt-fn`
+  would make even identical (indexed, novelty) pairs fold to DIFFERENT
+  snapshot CIDs, silently losing the \"cheap redundant fold\" property this
+  paragraph otherwise promises. Callers should supply a deterministic
+  `encrypt-fn` (e.g. nonce = HMAC(nonce-key, plaintext)) if this property
+  matters to them.
+
+  `blind-fn`/`encrypt-fn`/`decrypt-fn` are REQUIRED and threaded to
+  `hydrate-db` (blind-fn, decrypt-fn), `read-tx-block` (decrypt-fn), and
+  `arrangement.core/commit!` (blind-fn, encrypt-fn). Synchronous on JVM; a
+  `js/Promise` of the new chain CID on cljs (the novelty-quads read and the
+  snapshot hydrate resolve concurrently there, via `js/Promise.all`, since
+  they're independent).
+
+  `async-get-fn` (optional, `:cljs` only, nil-safe) now covers BOTH the
+  cold-snapshot hydrate (`cold-datoms-async`, ADR-2607120730's first
+  follow-up) AND the novelty tx-block reads (`read-tx-block-async`, this
+  addendum) -- confirmed live that routing ONLY the hydrate through it was
+  insufficient: a Worker's whole `h/handle` call is one `with-blocks`
+  retry loop, and a novelty-block miss restarts the ENTIRE call (redoing
+  the hydrate walk too, however fast it now is on its own). Routing BOTH
+  read paths through a direct async fetch removes `with-blocks` from
+  `fold-rebuild!`'s critical path entirely, not just from one half of it."
+  ([put! get-fn chain-cid blind-fn encrypt-fn decrypt-fn]
+   (fold-rebuild! put! get-fn chain-cid ipld/link? nil blind-fn encrypt-fn decrypt-fn))
+  ([put! get-fn chain-cid ref? blind-fn encrypt-fn decrypt-fn]
+   (fold-rebuild! put! get-fn chain-cid ref? nil blind-fn encrypt-fn decrypt-fn))
+  ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn]
+   (fold-rebuild! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn nil nil))
+  ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put!]
+   (fold-rebuild! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! nil))
+  ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn]
+   (fold-rebuild! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn nil))
+  ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn views]
+   (let [state (state-at get-fn chain-cid)
+         bounded? (some? max-novelty)
+         ;; The novelty STRUCTURE walk used to run here, synchronously, on
+         ;; both platforms -- outside the reader conditional and therefore
+         ;; outside every async path this fn already had. On a Worker that
+         ;; put `with-blocks` back on the critical path that `read-tx-block-
+         ;; async` / `cold-datoms-async` had just removed it from, and it is
+         ;; the term `max-novelty` never covered (root ADR-2609100100:
+         ;; 34.9s / 34.1s / 35.7s at bound 1 / 2 / 4 on yoro-social-v2).
+         ;; The :clj branch keeps the synchronous walk; :cljs takes the
+         ;; direct-fetch one whenever `async-get-fn` is supplied.
+         finish-novelty-state
+         (fn [take-result]
+           (if bounded?
+             (let [remaining-index (build-novelty-index! put! (:remaining-entries take-result))]
+               (cond-> (dissoc take-result :taken :remaining-entries)
+                 remaining-index (assoc "novelty-subject-index" remaining-index)))
+             {"novelty-front" nil "novelty-back" nil "novelty-count" 0}))]
+     )))
+
+
+
+
+(defn fold-changes
+  "Collapse chronological novelty into final triple operations. Indexed rows
+   are needed only for retract-entity; ordinary retracts name their own keys."
+  [quads indexed-entity-quads]
+  (let [by-subject (group-by :s indexed-entity-quads)
+        final (reduce
+               (fn [ops {:keys [s p o op]}]
+                 (case (or op :assert)
+                   :assert (assoc ops [s p o] :assert)
+                   :retract (assoc ops [s p o] :retract)
+                   :retract-entity
+                   (reduce #(assoc %1 %2 :retract) ops
+                           (concat (map (juxt :s :p :o) (get by-subject s))
+                                   (filter #(= s (first %)) (keys ops))))))
+               {} quads)
+        collect (fn [op]
+                  (into [] (keep (fn [[[s p o] action]]
+                                   (when (= action op) {:s s :p p :o o}))) final))]
+    {:assertions (collect :assert) :retractions (collect :retract)}))
+
+(defn- changed-view-rows [old-rows spec quads]
+  (let [attrs (set (get spec "attrs"))]
+    (->> (reduce
+          (fn [rows {:keys [s p o op]}]
+            (case (or op :assert)
+              :assert (if (contains? attrs p) (conj rows [s p (v->edn o)]) rows)
+              :retract (disj rows [s p (v->edn o)])
+              :retract-entity (into #{} (remove #(= s (first %))) rows)))
+          (set old-rows) quads)
+         (sort-by pr-str) vec)))
+
+
+
+
+
+(defn fold!
+  "Compact novelty by mutating only affected Prolly leaves on the asynchronous
+   edge path. Triple/entity retractions retain chronological semantics. Existing
+   view rows are updated from the same deltas; new specs scan only their attrs.
+   JVM and legacy schema migration retain fold-rebuild! as a compatibility path."
+  ([put! get-fn chain-cid blind-fn encrypt-fn decrypt-fn]
+   (fold! put! get-fn chain-cid ipld/link? nil blind-fn encrypt-fn decrypt-fn))
+  ([put! get-fn chain-cid ref? blind-fn encrypt-fn decrypt-fn]
+   (fold! put! get-fn chain-cid ref? nil blind-fn encrypt-fn decrypt-fn))
+  ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn]
+   (fold! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn nil nil))
+  ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put!]
+   (fold! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! nil))
+  ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn]
+   (fold! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn nil))
+  ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn views]
+   ))
+
+
+
+(defn fold-serialized-if-needed!
+  "CAS-safe scheduler primitive: fold only when the actual head's novelty is
+   at least `:threshold`, publish the fold through HeadCAS, and retry from the
+   winning head after contention. Below threshold it performs no block writes
+   and no CAS. OPTS: `:threshold` (default 64), `:max-novelty` (default the
+   threshold, bounding one invocation), `:max-retries` (default 10), and
+   `:views` (default nil — a map of `{view-name spec-or-nil}` materialized
+   view declarations, threaded straight to `fold!`'s own `views` param;
+   see its docstring/`materialize-views!`). A non-nil `:views` FORCES the
+   fold to run even when novelty is below `:threshold` — a caller declaring
+   or updating a view needs that declaration persisted regardless of
+   whether there happens to be unfolded novelty to compact right now;
+   without this the view would be silently dropped whenever the graph is
+   already caught up (the same fold-is-a-no-op-below-threshold path this
+   fn otherwise takes for its ordinary maintenance role).
+   Returns {:committed? :chain-cid-before :chain-cid-after :novelty-before
+   :novelty-after :attempts}. Sync JVM / Promise cljs."
+  ([put! get-fn cas! head-key expected-chain-cid blind-fn encrypt-fn decrypt-fn]
+   (fold-serialized-if-needed! put! get-fn cas! head-key expected-chain-cid
+                               blind-fn encrypt-fn decrypt-fn {}))
+  ([put! get-fn cas! head-key expected-chain-cid blind-fn encrypt-fn decrypt-fn
+    {:keys [threshold max-novelty max-retries views]
+     :or {threshold default-fold-threshold max-retries default-max-cas-retries}}]
+   (let [max-novelty (or max-novelty threshold)
+         force? (some? views)
+         report (fn [before after novelty-before attempts committed?]
+                  {:committed? committed?
+                   :chain-cid-before before :chain-cid-after after
+                   :novelty-before novelty-before
+                   :novelty-after (novelty-size get-fn after)
+                   :attempts attempts})]
+     )))
+
+(defn verify-chain
+  "True iff the chain rooted at `chain-cid` is untampered and its
+   `:seq` values are gapless from 0. Does NOT verify the prolly-tree
+   snapshots or tx blocks each commit's `:state` links to are themselves
+   intact (that would require walking every index/tx-block — a follow-up)."
+  [get-fn chain-cid]
+  (cd/verify-chain get-fn chain-cid))

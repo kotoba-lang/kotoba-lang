@@ -1,0 +1,564 @@
+(ns murakumo.infer.poll-worker
+  (:require [murakumo.infer.image-job :as img]
+            [kotoba.lang.text :as str]
+            [murakumo.infer.backoff :as backoff]
+            ["node:crypto" :as crypto]
+            ["node:os" :as os]))
+
+(def job-kind "host-large-model")
+
+(def ^:private trust-tiers
+  "The two production trust domains (docs/adr-secure-community-cloud.md in
+  network-awai/cloud-murakumo). There is no `:any`, and placement requires an
+  exact match with no Secure-to-Community fallback."
+  #{"awai-secure" "community"})
+
+(defn node-trust-tier
+  "The tier this node enrolls under.
+
+  **Defaults to community, and that default is the ADR's, not a convenience.**
+  `local-murakumo.control-plane` reads `(or (:node/trust-tier body) :community)`
+  precisely so that an unauthenticated provider cannot become Secure by
+  omitting a field. Opting into Secure has to be an explicit act by whoever
+  operates the hardware.
+
+  Until 2026-08-29 this worker sent NO tier at all, so every node it enrolled
+  became Community. Workloads normalize the other way -- a missing declaration
+  is `:awai-secure`, keeping upgrades on the safer pool. Both defaults are
+  individually correct and together they deadlock: the ten `fleet.edn` Mac
+  minis serving `murakumo-edge` were `live? true / ready? true / slots-free 1`
+  and an admission state of pending, so `murakumo-edge` had zero admitted backends and
+  the public route answered 503 while the fleet looked healthy."
+  [opts env]
+  (let [t (or (:trust-tier opts) (get env "MURAKUMO_TRUST_TIER") "community")
+        t (str/trim (str t))]
+    (when-not (contains? trust-tiers t)
+      (println (str "--trust-tier must be one of " (str/join ", " (sort trust-tiers))
+                    " (got " (pr-str t) ")"))
+      (js/process.exit 1))
+    t))
+
+(defn parse-args [args]
+  (loop [xs args, acc {}]
+    (if-let [a (first xs)]
+      (if (str/starts-with? a "--")
+        (recur (drop 2 xs) (assoc acc (keyword (subs a 2)) (second xs)))
+        (recur (rest xs) acc))
+      acc)))
+
+(defn local-auth-token
+  "Resolve the local inference-server credential without confusing it with
+   the Murakumo control-plane token. An explicit option is useful for manual
+   diagnostics; resident services should use a dedicated environment value or
+   the vLLM-standard VLLM_API_KEY."
+  [opts env]
+  (or (:local-token opts)
+      (get env "MURAKUMO_INFER_LOCAL_TOKEN")
+      (get env "VLLM_API_KEY")))
+
+(defn local-auth-headers [token]
+  (cond-> {"content-type" "application/json"}
+    (not (str/blank? (str token)))
+    (assoc "authorization" (str "Bearer " token))))
+
+(defn control-auth
+  "Resolve control-plane authentication without exposing the credential in
+  logs.  A device CACAO is preferred when explicitly supplied; the service
+  token remains supported for existing operator-managed residents."
+  [opts env]
+  (let [candidates [[:biscuit (:biscuit opts)]
+                    [:cacao (:cacao opts)]
+                    [:bearer (:token opts)]
+                    [:cacao (get env "MURAKUMO_NODE_CACAO")]
+                    [:bearer (get env "MURAKUMO_SERVICE_TOKEN")]]]
+    (some (fn [[kind credential]]
+            (when-not (str/blank? (str credential))
+              {:kind kind :credential credential}))
+          candidates)))
+
+(defn control-auth-headers [auth]
+  (cond-> {"content-type" "application/json"}
+    (= :biscuit (:kind auth))
+    (assoc "authorization" (str "Biscuit " (let [c (:credential auth)] (if (fn? c) (c) c))))
+    (= :bearer (:kind auth))
+    (assoc "authorization" (str "Bearer " (:credential auth)))
+    (= :cacao (:kind auth))
+    (assoc "authorization" (str "CACAO " (let [c (:credential auth)] (if (fn? c) (c) c))))))
+
+(defn valid-node-name? [node-name]
+  (boolean (and (string? node-name)
+                (re-matches #"[A-Za-z0-9._-]{1,128}" node-name))))
+
+(defn- sha256-hex [s]
+  (-> (.createHash crypto "sha256") (.update (str s)) (.digest "hex")))
+
+(defn node-did
+  "Use the device DID paired with a CACAO when one is configured.  The pending
+  name-derived identity is retained only for existing operator-token residents."
+  [opts env node-name]
+  (or (:did opts)
+      (get env "MURAKUMO_NODE_DID")
+      (str "did:key:pending-" (sha256-hex node-name))))
+
+(defn- full-keyword-name [k]
+  (if-let [ns (namespace k)] (str ns "/" (name k)) (name k)))
+
+(defn- json-body [body]
+  (js/JSON.stringify (clj->js body :keyword-fn full-keyword-name)))
+
+(defn- response-body [^js response]
+  (-> (.text response)
+      (.then (fn [text]
+               {:status (.-status response)
+                :body (try
+                        (js->clj (js/JSON.parse text) :keywordize-keys true)
+                        (catch :default _ text))}))))
+
+(defn- api-with-fetch! [fetch-fn base auth method path & [body]]
+  (-> (fetch-fn (str base path)
+                (clj->js
+                 (cond-> {:method (name method)
+                          :headers (control-auth-headers auth)
+                          :signal (js/AbortSignal.timeout 30000)}
+                   body (assoc :body (json-body body)))))
+      (.then response-body)))
+
+(defn- api! [base auth method path & [body]]
+  (api-with-fetch! js/fetch base auth method path body))
+
+(defn model-ready?
+  "True only when the local OpenAI-compatible model inventory names the model
+  this worker will actually execute.  HTTP reachability alone is not capacity."
+  [model body]
+  (let [rows (or (:data body) (:models body) [])
+        ids (keep #(or (:id %) (:name %) (:model %)) rows)]
+    (boolean (some #{model} ids))))
+
+(defn probe-readiness-with-fetch!
+  [fetch-fn local-url local-token model]
+  (-> (fetch-fn (str local-url "/models")
+                #js {:method "GET"
+                     :headers (clj->js (local-auth-headers local-token))
+                     :signal (js/AbortSignal.timeout 10000)})
+      (.then response-body)
+      (.then (fn [{:keys [status body]}]
+               {:ready? (and (<= 200 status 299) (model-ready? model body))
+                :status status}))
+      (.catch (fn [error]
+                {:ready? false :status 0 :error (str error)}))))
+
+(defn heartbeat-body
+  "Build one bounded liveness observation.  `ready?` is a fresh local model
+  probe; a busy single-slot worker remains live but advertises zero free slots.
+  `:node/planes` names the planes this process serves (root ADR-2610101900;
+  murakumo.plane-registry): a poll worker serves the inference plane unless its
+  config says otherwise."
+  [{:keys [did model engine slots busy? memory-bytes idle? planes]} ready? observed-at]
+  (let [total (max 1 (or slots 1))
+        used (if (and busy? @busy?) 1 0)
+        available? (and (or (nil? idle?) (try (boolean (idle?))
+                                              (catch :default _ false)))
+                        (< used total))]
+    {:did did
+     :node/ready? (boolean (and ready? available?))
+     :node/model model
+     :node/engine (or engine "openai-compatible")
+     :node/planes (vec (or (seq planes) ["inference"]))
+     :node/observed-at observed-at
+     :node/capacity {:slots-total total
+                     :slots-free (if available? (max 0 (- total used)) 0)
+                     :memory-bytes (max 0 (long (memory-bytes)))}}))
+
+(defn heartbeat-with-fetch!
+  [fetch-fn {:keys [base auth did node-name local-url local-token model]
+             :as config}]
+  (-> (probe-readiness-with-fetch! fetch-fn local-url local-token model)
+      (.then (fn [{:keys [ready?] :as probe}]
+               (-> (api-with-fetch! fetch-fn base auth :post
+                                    (str "/infer/nodes/" node-name "/heartbeat")
+                                    (heartbeat-body config ready? (js/Date.now)))
+                   (.then #(assoc % :probe probe)))))))
+
+(defn- heartbeat! [config]
+  (heartbeat-with-fetch! js/fetch config))
+
+(defn run-completion-with-fetch!
+  "Run one local OpenAI-compatible completion. Resolves to a structured
+   outcome for both HTTP and response-shape failures."
+  [fetch-fn local-url local-token model prompt max-tokens & [openai-request]]
+  (let [t0 (js/Date.now)]
+    (-> (fetch-fn (str local-url "/chat/completions")
+                  #js {:method "POST"
+                       :headers (clj->js (local-auth-headers local-token))
+                       :body (json-body
+                              (if (map? openai-request)
+                                (-> openai-request
+                                    (assoc :model model :stream false)
+                                    (update :max_tokens #(min 2048 (or % max-tokens 512))))
+                                {:model model
+                                 :messages [{:role "user" :content (str prompt)}]
+                                 :max_tokens (or max-tokens 512)}))})
+        (.then response-body)
+        (.then (fn [{:keys [status body]}]
+                 (let [text (get-in body [:choices 0 :message :content])]
+                   (cond
+                     (not (<= 200 status 299))
+                     {:ok false :error (str "local inference HTTP " status ": " (pr-str body)) :ms 0}
+
+                     (or text (seq (get-in body [:choices 0 :message :tool_calls])))
+                     {:ok true :text (or text "") :response body
+                      :ms (- (js/Date.now) t0)}
+
+                     :else
+                     {:ok false :error (str "no completion in response: " (pr-str body)) :ms 0})))))))
+
+(defn run-completion! [local-url local-token model prompt max-tokens & [openai-request]]
+  (run-completion-with-fetch! js/fetch local-url local-token model prompt max-tokens openai-request))
+
+(defn promise-finally
+  "nbb-compatible Promise cleanup. Some fleet nbb runtimes do not expose the
+   JavaScript `finally` method through CLJS interop, so spell out both arms."
+  [promise cleanup]
+  (.then promise
+         (fn [value]
+           (cleanup)
+           value)
+         (fn [error]
+           (cleanup)
+           (js/Promise.reject error))))
+
+(defn- report-result! [base auth did job-id outcome ms]
+  (api! base auth :post (str "/infer/queue/" job-id "/result")
+        {:did did
+         :output (if (:ok outcome)
+                   (cond-> {:text (:text outcome)}
+                     (:response outcome) (assoc :response (:response outcome))
+                     (:image outcome) (assoc :image (:image outcome)))
+                   {:error (:error outcome)})
+         :ms ms}))
+
+(defn- base64-of
+  "ArrayBuffer -> base64 string. Node's Buffer, because the worker runs on nbb
+  and `btoa` mangles bytes above 0xff."
+  [array-buffer]
+  (.toString (js/Buffer.from array-buffer) "base64"))
+
+(defn run-render-with-fetch!
+  "Execute one image job against this node's own ComfyUI.
+
+  Same contract as `run-completion-with-fetch!` -- returns `{:ok bool ...}` --
+  so `claim-and-run!` dispatches on the job's kind and nothing else changes.
+
+  Three failures this distinguishes, because each needs a different repair and
+  a single `render failed` sends an operator to the wrong one:
+
+    submit rejected    the graph or the checkpoint name is wrong
+    finished, no image the render ran and produced nothing
+    still running      keep waiting, up to the deadline"
+  [fetch-fn base-url input deadline-ms sleep-fn now-fn]
+  (let [wf (img/workflow input)]
+    (-> (fetch-fn (str base-url "/prompt")
+                  #js {:method "POST"
+                       :headers #js {"content-type" "application/json"}
+                       :body (js/JSON.stringify (clj->js {:prompt wf :client_id "hokusai"}))})
+        (.then (fn [r] (if (.-ok r)
+                         (.json r)
+                         (throw (ex-info "comfyui rejected the graph" {:status (.-status r)})))))
+        (.then (fn [j]
+                 (let [pid (.-prompt_id (js/Object.assign #js {} j))]
+                   (when-not (string? pid) (throw (ex-info "comfyui returned no prompt_id" {})))
+                   (letfn [(poll []
+                             (if (> (now-fn) deadline-ms)
+                               (js/Promise.resolve {:ok false :error "render timed out"})
+                               (-> (fetch-fn (str base-url "/history/" pid) #js {})
+                                   (.then (fn [r] (.json r)))
+                                   (.then (fn [h]
+                                            (let [hist (js->clj h :keywordize-keys true)]
+                                              (if-not (seq hist)
+                                                (.then (sleep-fn 3000) poll)
+                                                (if-let [f (img/image-from-history hist pid)]
+                                                  (-> (fetch-fn (str base-url (img/view-path f)) #js {})
+                                                      (.then (fn [r] (.arrayBuffer r)))
+                                                      (.then (fn [b]
+                                                               {:ok true
+                                                                :image {:filename (:filename f)
+                                                                        :b64 (base64-of b)}})))
+                                                  (js/Promise.resolve
+                                                   {:ok false
+                                                    :error "render finished with no image"})))))))))]
+                     (poll)))))
+        (.catch (fn [e] (js/Promise.resolve {:ok false :error (str e)}))))))
+
+(defn run-render! [base-url input deadline-ms]
+  (run-render-with-fetch! js/fetch base-url input deadline-ms
+                          (fn [ms] (js/Promise. (fn [res] (js/setTimeout res ms))))
+                          #(js/Date.now)))
+
+(defn- claim-and-run! [{:keys [base auth did local-url local-token model busy?]
+                        :as config} job]
+  (let [job-id (:job-id job)]
+    (-> (api! base auth :post (str "/infer/queue/" job-id "/claim") {:did did})
+        (.then
+         (fn [{:keys [status]}]
+           (if (not= 201 status)
+             (do
+               (println (str "[join] job " job-id " already claimed, trying next"))
+               false)
+             (do
+               (reset! busy? true)
+               (let [work (-> (heartbeat! config)
+                              (.catch (fn [error]
+                                        (println "[join] busy heartbeat error:" (str error))))
+                              (.then (fn [_]
+                                       ;; The queue already carried `:kind`;
+                                       ;; nothing read it. An image job runs
+                                       ;; against this node's own ComfyUI and
+                                       ;; returns the same {:ok ...} shape, so
+                                       ;; the reporting path below is untouched.
+                                       (if (= img/job-kind (:kind job))
+                                         (run-render! (str "http://127.0.0.1:" img/comfy-port)
+                                                      (:request (:input job))
+                                                      (+ (js/Date.now) 240000))
+                                         (run-completion! local-url local-token model
+                                                          (get-in job [:input :prompt])
+                                                          (get-in job [:input :max-tokens])
+                                                          (get-in job [:input :request])))))
+                              (.then
+                               (fn [outcome]
+                                 (.then
+                                  (report-result! base auth did job-id outcome (:ms outcome 0))
+                                  (fn [{:keys [status body]}]
+                                    (println (str "[join] job " job-id " -> "
+                                                  (if (:ok outcome) "ok" "error")
+                                                  " (result status " status ")"))
+                                    (when (= 201 status)
+                                      (println "[join]   settled:"
+                                               (pr-str (:shares body)))))))))]
+                 (-> (promise-finally
+                      work
+                      (fn []
+                        (reset! busy? false)
+                        (-> (heartbeat! config)
+                            (.catch (fn [error]
+                                      (println "[join] idle heartbeat error:"
+                                               (str error)))))))
+                     (.then (fn [_] true)))))))))))
+
+(defn claim-first-available!
+  "Try jobs in queue order until one claim succeeds.  A fleet poll returns the
+   same first job to many idle workers; stopping after its expected 409 would
+   serialize fan-out at one worker per poll interval."
+  [claim-fn jobs]
+  (letfn [(attempt [remaining]
+            (if-let [job (first remaining)]
+              (-> (claim-fn job)
+                  (.then (fn [claimed?]
+                           (cond
+                             (= :stop claimed?) false
+                             claimed? true
+                             :else (attempt (next remaining))))))
+              (js/Promise.resolve false)))]
+    (attempt jobs)))
+
+(defn claim-order
+  "Give each worker a stable, different queue permutation.  Atomic claims are
+   still authoritative; this only avoids making every idle worker begin with
+   the same CAS and then walk the same collision chain."
+  [did jobs]
+  (sort-by #(sha256-hex (str did "\u0000" (:job-id %))) jobs))
+
+(defn queue-path
+  "Request only jobs that this worker is currently eligible to claim.  The
+   control plane remains authoritative, but including the DID prevents a soft
+   cache-affinity job from being advertised to every edge worker first."
+  [model did]
+  (str "/infer/queue?model=" (js/encodeURIComponent model)
+       "&did=" (js/encodeURIComponent did)))
+
+(defn poll-once-with-fetch!
+  [fetch-fn {:keys [base auth model did idle?] :as config}]
+  ;; An idle-only node must not fetch or claim a new job while the buyer uses
+  ;; the machine. A job already claimed is allowed to finish and report.
+  (if (and idle? (not (try (boolean (idle?))
+                          (catch :default _ false))))
+    (js/Promise.resolve nil)
+    (-> (api-with-fetch! fetch-fn base auth :get (queue-path model did))
+        (.then (fn [{:keys [body]}]
+                 (if (and idle? (not (try (boolean (idle?))
+                                         (catch :default _ false))))
+                   nil
+                   (claim-first-available!
+                    #(if (and idle? (not (try (boolean (idle?))
+                                              (catch :default _ false))))
+                       (js/Promise.resolve :stop)
+                       (claim-and-run! config (select-keys % [:job-id :kind :input])))
+                    (claim-order (:did config) body))))))))
+
+(defn- poll-once! [config]
+  (poll-once-with-fetch! js/fetch config))
+
+(defn host-idle?
+  "Conservative, read-only host gate for voluntary Community participation.
+  Linux load average includes local CPU work; free memory avoids starting a
+  remote job while the buyer has most RAM occupied. This cannot observe every
+  GPU workload, so physical qualification still has to test coexistence."
+  [load-one cpu-count free-bytes total-bytes]
+  (and (number? load-one) (number? cpu-count)
+       (number? free-bytes) (number? total-bytes)
+       (pos? cpu-count) (pos? total-bytes)
+       (<= load-one (* 0.5 cpu-count))
+       (>= free-bytes (max 1073741824 (* 0.1 total-bytes)))))
+
+(defn local-host-idle? []
+  (host-idle? (aget (.loadavg os) 0) (.-length (.cpus os))
+              (.freemem os) (.totalmem os)))
+
+(defn- failure-facts
+  "What a fetch failure says about itself: undici hides the OS error under
+   `.cause.code`; an HTTP throw carries `:status`."
+  [error]
+  {:code (or (some-> error .-cause .-code) (some-> error .-code))
+   :message (str (or (some-> error .-message) error))
+   :status (some-> error ex-data :status)})
+
+(defn- schedule-after-failure!
+  "Classify, log, and wait. `failures` is the loop's consecutive-failure count.
+   A local-exhaustion failure (this node cannot open sockets) waits the whole
+   ceiling: retrying on cadence is exactly what kept benjamin's port range full
+   for 60 days (ADR-260902-fleet-outbound-hygiene)."
+  [label failures error base-ms next!]
+  (let [facts (failure-facts error)
+        kind (backoff/classify facts)
+        n (swap! failures inc)
+        policy (assoc backoff/default-policy :base-ms base-ms)
+        wait (backoff/delay-for policy kind n (js/Math.random))]
+    (println (str "[join] " label " error (" (name kind)
+                  (when-let [c (:code facts)] (str " " c))
+                  ", failure " n ", next in " (js/Math.round (/ wait 1000)) "s): "
+                  (:message facts)))
+    (js/setTimeout next! wait)))
+
+(defn- loop! [{:keys [poll-ms poll-failures] :as config}]
+  (-> (poll-once! config)
+      (.then (fn [_]
+               (reset! poll-failures 0)
+               (js/setTimeout #(loop! config) poll-ms)))
+      (.catch (fn [error]
+                (schedule-after-failure! "poll" poll-failures error poll-ms
+                                         #(loop! config))))))
+
+(defn heartbeat-accepted?
+  "Did the control plane ACCEPT this heartbeat? 201, and nothing else.
+
+  Public and pure because the loop below cannot be unit-tested (it drives
+  timers and schedules itself), and the decision it got wrong for months is
+  exactly this one: it treated every resolved response as an acceptance and
+  reset the backoff counter, so a gateway answering 500 was indistinguishable
+  from one answering 201 as far as the retry cadence was concerned.
+
+  200 is rejected too, deliberately. The contract is `201 Created` -- an
+  enrolment row was written -- and a 200 means something else happened. A
+  heartbeat loop that accepted 200 would keep a node enrolled in its own logs
+  while the registry had no record of it."
+  [status]
+  (= 201 status))
+
+(defn- heartbeat-loop!
+  "A heartbeat the gateway REJECTED is a failure, and has to back off like one.
+
+  Until 2026-09-10 this reset the consecutive-failure counter on any resolved
+  promise, including a non-201. The rejection was printed and then forgotten:
+  the next attempt started again at `failure 1`, so the wait never grew past
+  the base cadence no matter how long the gateway kept saying no.
+
+  Measured on benjamin the same day, while the gateway was 500ing its
+  heartbeat: `heartbeat rejected: 500` fifteen times, every retry logged
+  `failure 1`, and the node's free ephemeral ports fell 5,238 -> 3,524 ->
+  2,069 over a few hours -- a node walking back into the exhaustion
+  ADR-2609021500 was written to end, through the one path that still retried
+  on cadence.
+
+  This is the shape this workspace keeps meeting, in its own recovery code: a
+  request that was refused returned the same value as one that succeeded, so
+  nothing downstream could tell them apart."
+  [{:keys [heartbeat-ms heartbeat-failures] :as config}]
+  (-> (heartbeat! config)
+      (.then (fn [{:keys [status probe]}]
+               (if-not (heartbeat-accepted? status)
+                 ;; Rejected. `ex-info` with :status so `classify` reads it as
+                 ;; :http rather than :unknown -- the code already distinguishes
+                 ;; "the gateway answered no" from "nothing answered", and this
+                 ;; is the first caller that gives it the chance.
+                 (schedule-after-failure!
+                  "heartbeat" heartbeat-failures
+                  (ex-info (str "heartbeat rejected: " status) {:status status})
+                  heartbeat-ms #(heartbeat-loop! config))
+                 (do
+                   (reset! heartbeat-failures 0)
+                   (when-not (:ready? probe)
+                     (println "[join] local model not ready; advertised ready=false"))
+                   (js/setTimeout #(heartbeat-loop! config) heartbeat-ms)))))
+      (.catch (fn [error]
+                (schedule-after-failure! "heartbeat" heartbeat-failures error heartbeat-ms
+                                         #(heartbeat-loop! config))))))
+
+(defn -main [& args]
+  (let [opts (if (map? (first args)) (first args) (parse-args args))
+        env {"MURAKUMO_SERVICE_TOKEN" (aget js/process.env "MURAKUMO_SERVICE_TOKEN")
+             "MURAKUMO_NODE_CACAO" (aget js/process.env "MURAKUMO_NODE_CACAO")
+             "MURAKUMO_NODE_DID" (aget js/process.env "MURAKUMO_NODE_DID")
+             "MURAKUMO_INFER_LOCAL_TOKEN" (aget js/process.env "MURAKUMO_INFER_LOCAL_TOKEN")
+             "VLLM_API_KEY" (aget js/process.env "VLLM_API_KEY")
+             "MURAKUMO_TRUST_TIER" (aget js/process.env "MURAKUMO_TRUST_TIER")}
+        base (str/replace (or (:base opts) "https://api.murakumo.cloud") #"/+$" "")
+        model (:model opts)
+        node-name (or (:name opts) (some-> (.hostname os) (str/split #"\.") first) "murakumo-node")
+        local-url (str/replace (or (:local-url opts) "http://localhost:11434/v1") #"/+$" "")
+        poll-ms (or (some-> (:poll-ms opts) js/parseInt) 5000)
+        heartbeat-ms (or (some-> (:heartbeat-ms opts) js/parseInt) 30000)
+        slots (or (some-> (:slots opts) js/parseInt) 1)
+        auth (control-auth opts env)
+        local-token (local-auth-token opts env)
+        did (node-did opts env node-name)
+        config {:base base :auth auth :did did :node-name node-name :model model
+                :engine "openai-compatible" :slots slots :busy? (atom false)
+                :idle? (when (:idle-only opts) local-host-idle?)
+                :memory-bytes #(.freemem os)
+                :local-url local-url :local-token local-token
+                :poll-ms poll-ms :heartbeat-ms heartbeat-ms
+                :poll-failures (atom 0) :heartbeat-failures (atom 0)}]
+    (when (str/blank? (str model))
+      (println "usage: kbb --backend sci scripts/infer-join.cljk --model <id> [--base URL] [--name NODE] [--did DID] [--local-url URL] [--slots 1] [--poll-ms 5000] [--heartbeat-ms 30000] [--trust-tier awai-secure|community]")
+      (js/process.exit 1))
+    (when-not (valid-node-name? node-name)
+      (println "--name must contain only A-Z, a-z, 0-9, dot, underscore, or dash (max 128).")
+      (js/process.exit 1))
+    (when-not auth
+      (println "MURAKUMO_NODE_CACAO or MURAKUMO_SERVICE_TOKEN must be set (or --cacao/--token).")
+      (js/process.exit 1))
+    (when (and (= :cacao (:kind auth))
+               (str/starts-with? did "did:key:pending-"))
+      (println "MURAKUMO_NODE_DID (or --did) must name the CACAO issuer DID.")
+      (js/process.exit 1))
+    (println (str "[join] scope: own-fleet trust only -- no output verification for " job-kind " jobs."))
+    (-> (api! base auth :post "/infer/nodes"
+              {:node/did did :node/name node-name :node/tier "native"
+               :node/trust-tier (node-trust-tier opts env)
+               :node/caps {:engine "openai-compatible" :model model}
+               :node/can [job-kind "full-shard"]})
+        (.then (fn [{:keys [status body]}]
+                 (println (str "[join] registration " node-name " (" did ") as native/"
+                                    (node-trust-tier opts env)
+                                    " -> " base " -- status " status))
+                 (when-not (#{200 201} status)
+                   (println "[join] Enrollment refused; check identity, name and authorization.")
+                   (set! (.-exitCode js/process) 1))
+                 (when (#{200 201} status)
+                   (println "[join] admission:" (or (:node/admission body) (:admission body) "unknown") "; registration alone does not prove job eligibility.")
+                   (if (:check opts)
+                     (-> (heartbeat! (assoc config :busy? (atom true)))
+                         (.then (fn [{:keys [status probe]}]
+                                  (println "[check] heartbeat HTTP" status "; local model ready:" (:ready? probe))
+                                  (when-not (and (= 201 status) (:ready? probe))
+                                    (set! (.-exitCode js/process) 1)))))
+                     (do (heartbeat-loop! config) (loop! config)))))))))

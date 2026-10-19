@@ -1,0 +1,174 @@
+;; murakumo.reconcile — the wadm half of murakumo.
+;;
+;; `deploy` is imperative (compile → distribute → publish, once). This namespace
+;; is the DECLARATIVE control loop: you write a fleet manifest (`murakumo.app.edn`)
+;; that says *what should be running and with what spread*, and `reconcile` folds
+;; the live placement (from dash/collect) against it, computes the drift, and either
+;; reports it (--dry-run) or converges the fleet to it (--apply / --watch).
+;;
+;; This mirrors the kotoba mesh ADR (docs/ADR-kotoba-mesh-wasm-hosting.md, L5):
+;; desired state AND observed state are both datoms; the reconciler is just their
+;; diff. So the CORE of this file is PURE (desired/observed → plan) and unit-tested
+;; offline (test/murakumo/reconcile_test.cljk) — no SSH, no fleet, deterministic.
+;; The IMPURE shell (collect / deploy / persist) wraps that pure core.
+
+(ns murakumo.reconcile
+  (:require [babashka.process :as p]
+            [json.compat :as json]
+            [murakumo.config :as config]
+            [murakumo.connect :as connect]
+            [murakumo.dash :as dash]
+            [murakumo.deploy.plan :as deploy]
+            [murakumo.fleet :as fleet]
+            [murakumo.identity :as identity]
+            [murakumo.persist :as persist]
+            [murakumo.report :as report]
+            [murakumo.reconcile.plan :as plan]))
+
+;; ── PURE core (offline-testable) ─────────────────────────────────────────────
+
+(def eligible-nodes plan/eligible-nodes)
+(def eligible-report plan/eligible-report)
+(def observed-hosts plan/observed-hosts)
+(def reconcile-app plan/reconcile-app)
+(def reconcile-plan plan/reconcile-plan)
+(def plan-converged? plan/plan-converged?)
+
+(defn print-plan
+  "Render a reconcile plan as a fleet-operator table."
+  [plan]
+  (doseq [line (report/reconcile-lines plan)]
+    (println line)))
+
+;; ── persist (desired/observed/drift → Datom log, append-only as-of) ──────────
+;; Same graph as dash ('murakumo-fleet'), a distinct $type so reconcile history is
+;; queryable alongside the heartbeat snapshots.
+
+(def ^:private runtime
+  (config/current-runtime-context))
+
+(defn- operator-seed [fleet]
+  (config/current-operator-seed fleet))
+
+(defn- bin []
+  (:cli-kotoba runtime))
+
+(defn- did-for [seed]
+  (identity/did-from-command-result
+   (apply p/sh (identity/did-derive-argv (bin) seed))))
+
+(def ^:private rec-seq (atom 0))
+
+(def ^:private trust-warned? (atom false))
+
+(defn- internal-trust!
+  "Read the internal-trust secret for this write, announcing ONCE per process when
+   it is unconfigured. `persist-plan!` is best-effort and swallows its own
+   exceptions into `false`, so an unconfigured credential would otherwise vanish
+   without trace (ADR-2608124000)."
+  []
+  (let [trust (persist/internal-trust)]
+    (when (and (nil? trust) (compare-and-set! trust-warned? false true))
+      (binding [*out* *err*]
+        (println (str "WARN murakumo.reconcile: " persist/internal-trust-env
+                      " is unset — reconcile-plan writes carry NO "
+                      persist/internal-trust-header-name " header ("
+                      (name (persist/internal-trust-status trust))
+                      "). Harmless while kotoba-server's require_internal_trust"
+                      " gate is disabled fleet-wide (ADR-2608124000); the moment"
+                      " that gate is armed these writes fail into the catch below"
+                      " and return false."))))
+    trust))
+
+(defn persist-plan!
+  "Write the reconcile plan as an atproto record into 'murakumo-fleet' — one tx per
+   reconcile ⇒ the fleet's desired-vs-observed history is itself a queryable Datom
+   chain. Best-effort; returns true on a recorded tx."
+  [fleet token target plan]
+  (try
+    (let [n (swap! rec-seq inc)
+          write-plan (persist/reconcile-write-plan
+                      (System/currentTimeMillis)
+                      n
+                      plan
+                      (json/generate-string plan))
+          port (fleet/node-port fleet target)]
+      (p/sh "bash" "-c" (persist/write-forward-command write-plan port (:host target)))
+      (Thread/sleep persist/forward-settle-ms)
+      (let [body (json/generate-string (:envelope write-plan))
+            r (apply p/sh (persist/write-curl-argv write-plan token body (internal-trust!)))]
+        (persist/write-ok? (:out r))))
+    (catch Exception e
+      (binding [*out* *err*]
+        (println (report/reconcile-persist-error-line (.getMessage e))))
+      false)))
+
+;; ── apply (converge) ─────────────────────────────────────────────────────────
+;; No cross-node lattice auction is wired (ADR-2606271600 known gap; confirmed
+;; converging kenchi-valuation 2026-07-07, ADR-2607071500 追記3): publishing to
+;; one node and waiting for gossipsub to also place the app on the OTHER
+;; desired nodes never converges multi-replica apps. So murakumo imperatively
+;; deploys to EACH of the planner's `:targets` itself (`deploy/plan.cljc`'s
+;; `pick-targets`, least-loaded first already chose them) — the same
+;; `kbb -M:deploy <app.edn> <node>` path used manually before this was wired.
+
+(defn- apply-target!
+  "Converge one (app, target) pair by deploying to that node. `deploy-fn` is
+   injected so the pure->impure boundary stays testable."
+  [deploy-fn manifest-dir app target]
+  (println (report/apply-target-line app target))
+  (deploy-fn app manifest-dir target))
+
+;; ── command ──────────────────────────────────────────────────────────────────
+
+(defn- load-snapshot
+  "Observed state: a recorded snapshot file (offline/testing) or a live fleet poll."
+  [fleet snapshot-file]
+  (if snapshot-file
+    (config/read-edn-file snapshot-file)
+    (dash/collect fleet)))
+
+(defn cmd-reconcile
+  "Declarative fleet reconcile (murakumo's wadm). Usage:
+     reconcile <murakumo.app.edn> [--dry-run|--apply|--watch[=secs]] [--snapshot=f]
+   --dry-run (default) prints the desired-vs-observed plan and exits.
+   --apply imperatively deploys under-replicated apps to each of the planner's
+   target nodes (no cross-node auction — ADR-2606271600) until observed == desired.
+   --watch loops apply every N s and persists each plan to the Datom log.
+  Placement reach is honoured via connect.edn (the single connectivity SSoT)."
+  [fleet [_ & args] deploy-fn]
+  (let [{:keys [manifest dry-run apply watch snapshot] :as flags} (plan/parse-flags args)]
+    (when-let [error (plan/reconcile-command-error flags)]
+      (binding [*out* *err*]
+        (println (report/command-error-line :reconcile error)))
+      (System/exit 2))
+    (let [manifest-dir (deploy/manifest-dir manifest)
+          man (config/read-edn-file manifest)
+          conn (connect/load-connect)   ; single connectivity description (may be nil)
+          do-once (fn [ts]
+                    (let [fleet* (fleet/enrich fleet)
+                          snap (load-snapshot fleet* snapshot)
+                          plan (reconcile-plan fleet* snap conn man ts)]
+                      (print-plan plan)
+                      (when (and apply (not dry-run))
+                        (doseq [{:keys [app target]} (plan/apply-targets plan)]
+                          (apply-target! deploy-fn manifest-dir app target)))
+                      plan))]
+      (cond
+        watch
+        (let [seed (operator-seed fleet)
+              token (when seed (identity/op-token (did-for seed)))
+              target (fleet/node-named fleet "asher")]
+          (when-not token (println report/reconcile-no-persistence-line))
+          (println (report/watch-start-line watch))
+          (loop []
+            (let [plan (do-once (.toString (java.time.Instant/now)))]
+              (when (and token target) (persist-plan! fleet token target plan))
+              (when (plan-converged? plan) (println report/reconcile-converged-line)))
+            (Thread/sleep (plan/watch-sleep-ms watch))
+            (recur)))
+
+        :else
+        (do (do-once (.toString (java.time.Instant/now)))
+            (when-not apply
+              (println report/reconcile-dry-run-line)))))))

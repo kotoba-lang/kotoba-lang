@@ -1,0 +1,132 @@
+(ns murakumo.ci.finalizer
+  "Durable, idempotent delivery of side effects derived from canonical CI
+   verdicts. The broker remains authoritative; this service can be stopped or
+   restarted without losing a GitHub status or issuing it twice after success."
+  (:require [kotoba.lang.text :as str]
+            [murakumo.canonical :as canonical]
+            [murakumo.ci.quorum :as quorum]
+            [murakumo.identity :as identity]))
+
+(def outbox-stream "murakumo-ci-finalizer-outbox")
+(def delivery-bucket "murakumo-ci-finalizer-deliveries")
+
+(defn- action-id [action]
+  (identity/graph-cid (canonical/string action)))
+
+(defn- github-action [base-url run finalized]
+  (let [source (:ci.run/source run)
+        logical-id (:ci.run/logical-id run)]
+    (when (and (= :github (:source/type source)) (not (str/blank? base-url)))
+      {:ci.action/type :github/status
+       :ci.action/run-id logical-id
+       :ci.action/verdict-cid (:verdict-cid finalized)
+       :ci.action/status
+       {:repo (:source/repo source)
+        :sha (:source/revision source)
+        :result (:result finalized)
+        :run-id logical-id
+        :target-url (str (str/replace base-url #"/$" "")
+                         "/ci/v1/runs/" logical-id)
+        :description "Murakumo quorum reached"}})))
+
+(defn- deployment-action [deployment-policies run finalized]
+  (let [source (:ci.run/source run)
+        repo (:source/repo source)
+        policy (get deployment-policies repo)]
+    (when (and policy (= :passed (:result finalized))
+               (contains? (:deploy-refs policy) (:source/ref source)))
+      (let [bundles (->> (get-in finalized [:verdict :verdict/artifacts])
+                         (filter #(= :murakumo/release-bundle (:type %)))
+                         vec)]
+        (when-not (= 1 (count bundles))
+          (throw (ex-info "murakumo-ci: deployment requires exactly one release bundle"
+                          {:reason :ambiguous-release-bundle :repo repo
+                           :count (count bundles)})))
+        {:ci.action/type :cd/deploy
+         :ci.action/run-id (:ci.run/logical-id run)
+         :ci.action/deployment repo
+         :ci.action/verdict-cid (:verdict-cid finalized)
+         :ci.action/verdict (:verdict finalized)
+         :ci.action/bundle-cid (:cid (first bundles))
+         :ci.action/revision (:source/revision source)}))))
+
+(defn create
+  "Create a finalizer over an IStore-shaped store. `executors` maps action type
+   to a one-argument function. Delivery is recorded only after it returns."
+  [{:keys [store broker-state quorum-policy public-base-url deployment-policies
+           executors clock-ms]
+    :or {clock-ms #(System/currentTimeMillis)}}]
+  (let [enqueue! (fn [action]
+                   (let [id (action-id action)]
+                     ((:append! store) outbox-stream
+                      {:ci.event/id id :ci.outbox/action-id id
+                       :ci.outbox/action action
+                       :ci.outbox/enqueued-at (clock-ms)})))
+        scan! (fn []
+                (let [groups (->> (:murakumo.ci/runs @broker-state)
+                                  vals
+                                  (group-by :ci.run/logical-id))]
+                  (reduce-kv
+                   (fn [ids logical-id runs]
+                     (let [finalized (quorum/evaluate quorum-policy logical-id runs)]
+                       (if (= :canonical (:state finalized))
+                         (reduce (fn [out action]
+                                   (if action
+                                     (conj out (:ci.outbox/action-id
+                                                (enqueue! action)))
+                                     out))
+                                 ids
+                                 [(github-action public-base-url
+                                                 (first runs) finalized)
+                                  (deployment-action deployment-policies
+                                                     (first runs) finalized)])
+                         ids)))
+                   [] groups)))
+        drain! (fn []
+                 (reduce
+                  (fn [results item]
+                    (let [id (:ci.outbox/action-id item)
+                          action (:ci.outbox/action item)
+                          delivered ((:get store) delivery-bucket id)]
+                      (if (= :delivered (:ci.delivery/state delivered))
+                        results
+                        (let [attempt (inc (long (or (:ci.delivery/attempt delivered) 0)))
+                              executor (get executors (:ci.action/type action))]
+                          (try
+                            (when-not executor
+                              (throw (ex-info "murakumo-ci: finalizer executor unavailable"
+                                              {:reason :missing-finalizer-executor
+                                               :type (:ci.action/type action)})))
+                            (let [result (executor action)
+                                  record {:ci.delivery/state :delivered
+                                          :ci.delivery/attempt attempt
+                                          :ci.delivery/delivered-at (clock-ms)
+                                          :ci.delivery/result result}]
+                              ((:put! store) delivery-bucket id record)
+                              (conj results (assoc record :ci.action/id id)))
+                            (catch Throwable t
+                              (let [record {:ci.delivery/state :pending
+                                            :ci.delivery/attempt attempt
+                                            :ci.delivery/last-at (clock-ms)
+                                            :ci.delivery/error (or (ex-message t)
+                                                                   (.getName (class t)))}]
+                                ((:put! store) delivery-bucket id record)
+                                (conj results (assoc record :ci.action/id id)))))))))
+                  [] ((:read store) outbox-stream 0)))]
+    {:scan! scan! :drain! drain!
+     :status! (fn [run-id]
+                (->> ((:read store) outbox-stream 0)
+                     (filter #(= run-id
+                                 (get-in % [:ci.outbox/action :ci.action/run-id])))
+                     (mapv (fn [item]
+                             (let [id (:ci.outbox/action-id item)]
+                               {:action-id id
+                                :type (get-in item [:ci.outbox/action
+                                                    :ci.action/type])
+                                :delivery ((:get store) delivery-bucket id)})))))
+     :tick! (fn [] (scan!) (drain!))}))
+
+(defn start!
+  "Start periodic scanning and delivery. Returns a zero-argument stop function."
+  [finalizer interval-ms]
+  )

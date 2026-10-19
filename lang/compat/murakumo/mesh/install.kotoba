@@ -1,0 +1,274 @@
+(ns murakumo.mesh.install
+  "Linux/systemd installer plans for the 802.11s mesh: a seed that hosts the
+  enrol endpoint, and a joiner that enrols itself.
+
+  Pure: `plan` returns the files, the units and one shell script. Running it
+  over SSH is `murakumo.mesh.install-cli`'s job. `edge_install` is macOS-only
+  (LaunchDaemons); this is its Linux counterpart for the mesh, and like it, it
+  does not set a trust tier -- admission is the ledger's decision
+  (`murakumo.mesh/admit`), not something an installer grants.
+
+  ## The passphrase
+
+  Generated on the seed (`openssl rand -hex 16`), written to a 0600 file there,
+  and substituted into the wpa_supplicant config on the node. It is never in a
+  plan, a log, or the ledger. The seed prints a join token once; a joiner is
+  installed with that token. This is the one step a human carries between
+  machines -- a radio that has not been given the passphrase cannot even reach
+  the endpoint that would admit it.
+
+  ## Every interpolated value is validated
+
+  Plans are rendered into shell. A node name or token that reached a heredoc
+  unchecked would be a command injection on a root-owned installer, so every
+  value is matched against a strict pattern first and refused otherwise."
+  (:require [kotoba.bytes :as kbytes]
+            [kotoba.lang.text :as str]
+            [murakumo.mesh :as mesh]))
+
+(def etc-dir "/etc/murakumo")
+(def lib-dir "/usr/local/lib/murakumo")
+(def state-dir "/var/lib/murakumo")
+(def src-dir "/opt/murakumo")
+(def classpath (str src-dir "/src:" src-dir "/resources"))
+(def ledger-path (str state-dir "/kekkai-tailnet.edn"))
+(def admin-socket
+  "Operator operations (`ledger-cli`) reach the seed server here, not on the mesh.
+  The directory is 0700 and the socket 0600: only root on the seed can open it."
+  "/run/murakumo/enroll-admin.sock")
+(def address-file (str state-dir "/mesh-address"))
+
+(def ^:private heredoc-delimiter "MURAKUMO_EOF")
+
+(defn- matches? [re v] (and (string? v) (boolean (re-matches re v))))
+
+(def ^:private patterns
+  {:mesh-id #"[A-Za-z0-9-]{1,32}"
+   :node-name #"[a-z0-9][a-z0-9-]{0,62}"
+   :address #"(\d{1,3})(\.\d{1,3}){3}"
+   :phy #"phy\d{1,2}"
+   :iface #"[a-z][a-z0-9]{0,14}"
+   :frequency #"\d{4}"
+   :country #"[A-Z]{2}"})
+
+(defn- check! [k v]
+  (when-not (matches? (patterns k) (str v))
+    (throw (ex-info (str "refusing to render: bad " (name k)) {:field k :reason :invalid-value}))))
+
+;; ── join token ─────────────────────────────────────────────────────────────
+
+(defn format-token
+  [{:keys [mesh-id passphrase seed-address port frequency]
+    :or {mesh-id mesh/default-mesh-id seed-address mesh/seed-address
+         port mesh/enroll-port frequency mesh/default-frequency}}]
+  (check! :mesh-id mesh-id)
+  (check! :address seed-address)
+  (check! :frequency frequency)
+  (when-not (mesh/valid-passphrase? passphrase)
+    (throw (ex-info "bad passphrase" {:reason :weak-passphrase})))
+  (str "murakumo-mesh:v1:" mesh-id ":" passphrase ":" seed-address ":" port ":" frequency))
+
+(defn- parse-int [s]
+  )
+
+(defn- valid-address? [s]
+  (and (matches? (patterns :address) s)
+       (every? #(<= 0 (parse-int %) 255) (str/split s #"\."))))
+
+(defn parse-token
+  "Token -> map, or nil. nil for anything malformed: the caller is about to put
+  these fields in a root shell script."
+  [token]
+  (when (string? token)
+    (let [[tag ver mesh-id passphrase addr port freq & more] (str/split (str/trim token) #":")]
+      (when (and (= "murakumo-mesh" tag) (= "v1" ver) (empty? more)
+                 (matches? (patterns :mesh-id) mesh-id)
+                 (mesh/valid-passphrase? passphrase)
+                 (valid-address? addr)
+                 (matches? #"\d{2,5}" port)
+                 (<= 1 (parse-int port) 65535)
+                 (matches? (patterns :frequency) freq))
+        {:mesh-id mesh-id :passphrase passphrase :seed-address addr
+           :port (parse-int port) :frequency (parse-int freq)}))))
+
+;; ── file and unit rendering ────────────────────────────────────────────────
+
+(defn- file [path mode content]
+  (when (str/includes? content heredoc-delimiter)
+    (throw (ex-info "content contains the heredoc delimiter" {:path path})))
+  {:path path :mode mode :content content})
+
+(defn- addr-script
+  "Sets the mesh address. A seed has a fixed one. A joiner uses the address the
+  seed allocated (persisted by the enrol client) and until then a throwaway one
+  in 10.77.1.0/24, so it can reach the seed without holding a ledger slot."
+  [role {:keys [iface]}]
+  (str "#!/bin/sh\nset -eu\n"
+       (if (= :seed role)
+         (str "ip addr replace " mesh/seed-address "/16 dev " iface "\n")
+         (str "A=\"$(cat " address-file " 2>/dev/null || true)\"\n"
+              "[ -n \"$A\" ] || A=\"10.77.1.$(( $(od -An -N1 -tu1 /dev/urandom) % 253 + 2 ))\"\n"
+              "ip -4 addr flush dev " iface "\n"
+              "ip addr replace \"$A/16\" dev " iface "\n"))))
+
+(defn- unit [description {:keys [requires after] :as _deps} service install]
+  (str "[Unit]\nDescription=" description "\n"
+       (when requires (str "Requires=" requires "\n"))
+       (when after (str "After=" after "\n"))
+       "\n[Service]\n" service "\n"
+       (when install (str "\n[Install]\nWantedBy=multi-user.target\n"))))
+
+(defn units
+  [role {:keys [iface] :as opts}]
+  (let [iface-unit "murakumo-mesh-iface.service"
+        wpa-unit "murakumo-mesh-wpa.service"]
+    (cond-> [(file (str "/etc/systemd/system/" iface-unit) "0644"
+                   (unit "Murakumo mesh point interface" {}
+                         (str "Type=oneshot\nRemainAfterExit=yes\n"
+                              "ExecStart=/bin/sh " lib-dir "/mesh-iface.sh\n"
+                              "ExecStop=/sbin/ip link set " iface " down")
+                         true))
+             (file (str "/etc/systemd/system/" wpa-unit) "0644"
+                   (unit "Murakumo mesh (wpa_supplicant SAE)"
+                         {:requires iface-unit :after iface-unit}
+                         (str "ExecStart=/sbin/wpa_supplicant -i " iface " -c " etc-dir "/wpa-mesh.conf -D nl80211\n"
+                              "ExecStartPost=/bin/sh " lib-dir "/mesh-addr.sh\n"
+                              "Restart=always\nRestartSec=5")
+                         true))]
+      (= :seed role)
+      (conj (file "/etc/systemd/system/murakumo-enroll-seed.service" "0644"
+                  (unit "Murakumo mesh enrol endpoint"
+                        {:requires wpa-unit :after wpa-unit}
+                        (str "WorkingDirectory=" src-dir "\n"
+                             "RuntimeDirectory=murakumo\nRuntimeDirectoryMode=0700\n"
+                             "ExecStart=/usr/bin/env kbb -cp " classpath " -m murakumo.mesh.seed-server"
+                             " --bind " mesh/seed-address " --port " mesh/enroll-port
+                             " --ledger " ledger-path " --admin-socket " admin-socket "\n"
+                             "Restart=always\nRestartSec=5")
+                        true)))
+      (= :joiner role)
+      (conj (file "/etc/systemd/system/murakumo-mesh-enroll.service" "0644"
+                  (unit "Murakumo mesh self-enrol"
+                        {:requires wpa-unit :after wpa-unit}
+                        (str "Type=oneshot\nWorkingDirectory=" src-dir "\n"
+                             "ExecStart=/usr/bin/env kbb -cp " classpath " -m murakumo.mesh.client"
+                             " --seed http://" (:seed-address opts) ":" (:port opts)
+                             " --node-name " (:node-name opts)
+                             " --state " state-dir " --iface " iface "\n"
+                             "Restart=on-failure\nRestartSec=15")
+                        true))))))
+
+(defn files
+  [role {:keys [iface phy mesh-id frequency country] :as opts}]
+  (into [(file (str etc-dir "/wpa-mesh.conf.tpl") "0600"
+               (mesh/wpa-supplicant-template (select-keys opts [:mesh-id :frequency :country])))
+         (file (str lib-dir "/mesh-iface.sh") "0755"
+               (mesh/mesh-iface-script {:phy phy :iface iface}))
+         (file (str lib-dir "/mesh-addr.sh") "0755" (addr-script role opts))]
+        (units role opts)))
+
+;; ── the script ─────────────────────────────────────────────────────────────
+
+(def read-passphrase-snippet
+  "Shell that takes the passphrase from stdin and refuses anything that is not a
+  valid one. The passphrase never appears in the script or in an argument, so it
+  is not in the remote process list; the validation is repeated here because this
+  runs as root on a node and must not trust what the caller piped in."
+  (str "IFS= read -r MESH_PASSPHRASE || { echo 'no passphrase on stdin' >&2; exit 2; }\n"
+       "case \"$MESH_PASSPHRASE\" in ''|*[!0-9A-Za-z]*) echo 'bad passphrase on stdin' >&2; exit 2;; esac\n"
+       "[ \"${#MESH_PASSPHRASE}\" -ge " mesh/min-passphrase-length " ] && [ \"${#MESH_PASSPHRASE}\" -le 63 ] "
+       "|| { echo 'bad passphrase length on stdin' >&2; exit 2; }\n"))
+
+(defn- write-file [{:keys [path mode content]}]
+  (str "install -d -m 0755 \"$(dirname " path ")\"\n"
+       "cat > " path ".tmp <<'" heredoc-delimiter "'\n"
+       content
+       (when-not (str/ends-with? content "\n") "\n")
+       heredoc-delimiter "\n"
+       "chmod " mode " " path ".tmp && mv " path ".tmp " path "\n"))
+
+(defn- unit-names [fs]
+  (keep #(second (re-matches #"/etc/systemd/system/(.+\.service)" (:path %))) fs))
+
+(defn plan
+  "Render an install. `role` is :seed or :joiner.
+
+  Seed opts: {:node-name}. Joiner opts: {:node-name :token}.
+  Common, all defaulted: :phy :iface :mesh-id :frequency :country."
+  [role {:keys [node-name token phy iface country]
+         :or {phy "phy0" iface "mesh0" country mesh/default-country} :as opts}]
+  (let [parsed (when (= :joiner role) (or (parse-token token)
+                                          (throw (ex-info "bad join token" {:reason :bad-token}))))
+        opts (merge {:mesh-id mesh/default-mesh-id :frequency mesh/default-frequency}
+                    (select-keys opts [:mesh-id :frequency])
+                    (when parsed (select-keys parsed [:mesh-id :frequency :seed-address :port]))
+                    {:phy phy :iface iface :country country :node-name node-name})
+        _ (doseq [k [:phy :iface :country :mesh-id :frequency :node-name]] (check! k (get opts k)))
+        fs (files role opts)
+        names (unit-names fs)
+        enroll-unit (if (= :seed role) "murakumo-enroll-seed.service" "murakumo-mesh-enroll.service")
+        script
+        (str "set -eu\n"
+             "[ \"$(id -u)\" = 0 ] || { echo 'must run as root' >&2; exit 2; }\n"
+             "for c in wpa_supplicant iw ip od"
+             (when (= :seed role) " openssl curl") "; do command -v \"$c\" >/dev/null || { echo \"missing $c\" >&2; exit 2; }; done\n"
+             "command -v kbb >/dev/null || { echo 'missing kbb (the enrol "
+             (if (= :seed role) "endpoint" "client") " runs on the kbb engine)' >&2; exit 2; }\n"
+             "install -d -m 0700 " etc-dir "\ninstall -d -m 0755 " state-dir "\n"
+             (if (= :seed role)
+               (str "if [ ! -s " etc-dir "/mesh.env ]; then\n"
+                    "  ( umask 077; printf 'MESH_PASSPHRASE=%s\\n' \"$(openssl rand -hex 16)\" > " etc-dir "/mesh.env )\n"
+                    "fi\n"
+                    "[ -s " ledger-path " ] || printf '{:admit :auto-on-mesh :nodes {}}\\n' > " ledger-path "\n")
+               (str read-passphrase-snippet
+                    "( umask 077; printf 'MESH_PASSPHRASE=%s\\n' \"$MESH_PASSPHRASE\" > " etc-dir "/mesh.env )\n"))
+             ". " etc-dir "/mesh.env\n"
+             (str/join (map write-file fs))
+             "( umask 077; sed \"s/" mesh/passphrase-placeholder "/$MESH_PASSPHRASE/\" " etc-dir "/wpa-mesh.conf.tpl > " etc-dir "/wpa-mesh.conf )\n"
+             "chmod 600 " etc-dir "/wpa-mesh.conf\n"
+             (when (= :seed role)
+               (str "( umask 077; printf 'murakumo-mesh:v1:" (:mesh-id opts) ":%s:" mesh/seed-address ":" mesh/enroll-port ":" (:frequency opts)
+                    "\\n' \"$MESH_PASSPHRASE\" > " etc-dir "/mesh-join-token )\n"))
+             "systemctl daemon-reload\n"
+             "systemctl enable " (str/join " " names) " >/dev/null\n"
+             "systemctl restart murakumo-mesh-iface.service murakumo-mesh-wpa.service\n"
+             (if (= :seed role)
+               (str "systemctl restart " enroll-unit "\n")
+               (str "systemctl restart --no-block " enroll-unit "\n"))
+             ;; Verified against systemd, not against the files just written.
+             "for u in murakumo-mesh-iface.service murakumo-mesh-wpa.service"
+             (when (= :seed role) (str " " enroll-unit)) "; do\n"
+             "  ok=0; for i in $(seq 1 30); do systemctl is-active --quiet \"$u\" && ok=1 && break; sleep 1; done\n"
+             "  [ \"$ok\" = 1 ] || { echo \"FAILED: $u not active\" >&2; journalctl -u \"$u\" -n 20 --no-pager >&2; exit 1; }\n"
+             "done\n"
+             (when (= :seed role)
+               (str "ok=0; for i in $(seq 1 30); do ss -ltn | grep -q '" mesh/seed-address ":" mesh/enroll-port "' && ok=1 && break; sleep 1; done\n"
+                    "[ \"$ok\" = 1 ] || { echo 'FAILED: enrol endpoint not listening' >&2; exit 1; }\n"
+                    "ok=0; for i in $(seq 1 30); do [ -S " admin-socket " ] && ok=1 && break; sleep 1; done\n"
+                    "[ \"$ok\" = 1 ] || { echo 'FAILED: admin socket missing' >&2; exit 1; }\n"
+                    "echo \"JOIN_TOKEN=$(cat " etc-dir "/mesh-join-token)\"\n")))]
+    {:role role :files fs :units names :script script
+     ;; The joiner's passphrase travels on stdin, never in the script or an argument.
+     :stdin (when parsed (str (:passphrase parsed) "\n"))}))
+
+;; ── running a plan ─────────────────────────────────────────────────────────
+
+(defn remote-command
+  "The script as one ssh command. Carried as base64, so no character of it can
+  interact with the quoting of the transport, and run as `sudo -n bash -c` so
+  that a missing sudo rule fails at once instead of prompting a session that has
+  no terminal.
+
+  The script is an argument, not the shell's stdin, precisely so stdin is free to
+  carry a secret (see `read-passphrase-snippet`)."
+  [script]
+  (str "sudo -n bash -c \"$(echo " (kbytes/base64-encode (vec (kbytes/utf8-bytes script))) " | base64 -d)\""))
+
+(defn join-token-from-output
+  "The token a seed install printed, or nil. Parsed, not trusted: it is checked
+  by `parse-token` before anyone is handed it."
+  [out]
+  (some (fn [line]
+          (when-let [t (second (re-matches #"JOIN_TOKEN=(\S+)" (str/trim line)))]
+            (when (parse-token t) t)))
+        (str/split-lines (str out))))

@@ -1,0 +1,256 @@
+(ns didwebvh.log
+  "Verify a whole DID log, which is what resolving a `did:webvh` DID is.
+
+   Nothing here fetches. The log and the witness file arrive as parsed JSON
+   values and `now` arrives as a number, so verification runs with no ambient
+   authority at all -- the property that lets the same code run in a resolver,
+   in a gate, and inside a guest that has no network.
+
+   `verify` returns a map and never throws for a bad log: a log that fails is
+   an answer. It returns `{:ok? false :error <keyword> :index n :version-id s}`
+   naming the FIRST entry that failed, because a resolver that reports the last
+   failure invites the reader to fix the wrong entry.
+
+   What it checks, per entry, in this order: shape, versionId format and
+   sequence, entry hash, versionTime, parameters (including pre-rotation),
+   the entry proof against the ACTIVE updateKeys, the SCID (first entry),
+   `state.id` and portability, and the witness threshold."
+  (:require [data-integrity.bytes :as b]
+            [didwebvh.did :as did]
+            [didwebvh.entry :as entry]
+            [didwebvh.hash :as h]
+            [didwebvh.params :as params]
+            [didwebvh.proof :as proof]
+            [didwebvh.time :as t]
+            [didwebvh.witness :as witness]))
+
+(def default-clock-skew-seconds
+  "How far ahead of `now` a versionTime may be dated. The method's own wording
+   is \"a few minutes\"; five is what implementations settled on."
+  300)
+
+(defn- bad [index version-id error message & [extra]]
+  (merge {:ok? false :index index :version-id version-id
+          :error error :message message}
+         extra))
+
+(defn- verify-scid
+  "Recompute the SCID from the first entry and compare. Undoing the
+   substitution is the whole check: put `{SCID}` back everywhere the SCID
+   appears, put `{SCID}` in versionId, drop the proof, and the hash of what
+   remains must be the SCID again."
+  [first-entry scid]
+  (let [preliminary (-> first-entry
+                        (dissoc "proof")
+                        (assoc "versionId" scid)
+                        (entry/substitute scid h/scid-placeholder))]
+    (= scid (h/hash-json preliminary))))
+
+(defn- location-of [did-string]
+  (let [{:keys [domain port path]} (did/parse did-string)]
+    {:domain domain :port port :path path}))
+
+(defn verify
+  "Verify `entries` (the parsed lines of `did.jsonl`, in order).
+
+   Options:
+     :witness-file  parsed `did-witness.json` (a JSON array), when the DID
+                    uses witnesses. Absent means \"none published\", which
+                    fails any non-zero threshold -- as it should.
+     :now           seconds since the epoch. Omitted skips the
+                    not-dated-too-far-ahead check and says so in the result
+                    (`:checked-future-dating? false`) rather than reporting a
+                    pass it did not measure.
+     :clock-skew-seconds  defaults to `default-clock-skew-seconds`.
+     :expect-did    the DID that was resolved. Given, the last entry's
+                    `state.id` must equal it.
+     :verify-signature  replaces the Ed25519 check (see `didwebvh.proof/verify`).
+                    Everything else here is arithmetic on the document, so this
+                    is the one seam a platform verifier needs. `verify-async`
+                    below is what drives an asynchronous one.
+
+   On success returns `{:ok? true :did :scid :state :parameters :versions
+   :deactivated? :portable? :log-url :witness-url :checked-future-dating?}`.
+   `:state` is nil for a deactivated DID -- DID-CORE says a resolver must not
+   return the document, and returning it beside a boolean invites a caller to
+   use it anyway."
+  ([entries] (verify entries {}))
+  ([entries {:keys [witness-file now expect-did clock-skew-seconds verify-signature]}]
+   (let [skew (or clock-skew-seconds default-clock-skew-seconds)
+         ;; Built rather than passed straight through: a literal
+         ;; `:verify-signature nil` would shadow `proof/verify`'s own default
+         ;; and call nil as a function.
+         proof-opts (if verify-signature {:verify-signature verify-signature} {})]
+     (if-not (and (sequential? entries) (seq entries))
+       {:ok? false :error :didwebvh/empty-log :message "a DID log has at least one entry"}
+       (loop [index 0
+              remaining (seq entries)
+              active nil
+              previous-version-id nil
+              previous-time nil
+              genesis-location nil
+              versions []]
+         (if-not remaining
+           (let [last-version (peek versions)]
+             (cond
+               (and expect-did (not= expect-did (:did last-version)))
+               (bad (dec index) (:version-id last-version) :didwebvh/did-mismatch
+                    "the log's current state.id is not the DID that was resolved"
+                    {:expected expect-did :actual (:did last-version)})
+
+               :else
+               {:ok? true
+                :did (:did last-version)
+                :scid (:scid active)
+                :state (when-not (:deactivated? active) (:state last-version))
+                :parameters active
+                :versions versions
+                :deactivated? (boolean (:deactivated? active))
+                :portable? (boolean (:portable? active))
+                :log-url (did/log-url (:did last-version))
+                :witness-url (did/witness-url (:did last-version))
+                :checked-future-dating? (some? now)}))
+
+           (let [e (first remaining)
+                 version-id (get e "versionId")
+                 expected-number (inc index)
+                 first? (zero? index)]
+             (cond
+               (not (map? e))
+               (bad index nil :didwebvh/bad-entry "a log entry must be a JSON object")
+
+               (not (every? #(contains? e %) ["versionId" "versionTime" "parameters" "state"]))
+               (bad index version-id :didwebvh/incomplete-entry
+                    "an entry needs versionId, versionTime, parameters and state")
+
+               (not= expected-number (entry/version-number version-id))
+               (bad index version-id :didwebvh/bad-version-number
+                    (str "versionId must begin " expected-number "-"))
+
+               (not (h/sha256-multihash? (entry/version-hash version-id)))
+               (bad index version-id :didwebvh/bad-entry-hash-format
+                    "the entry hash is not a base58btc sha2-256 multihash")
+
+               :else
+               (let [params* (get e "parameters")
+                     state (get e "state")
+                     proofs (get e "proof")
+                     scid (if first? (get params* "scid") (:scid active))
+                     chain-to (if first? scid previous-version-id)
+                     recomputed (entry/entry-hash e chain-to)
+                     version-time (t/parse (get e "versionTime"))]
+                 (cond
+                   (not= recomputed (entry/version-hash version-id))
+                   (bad index version-id :didwebvh/entry-hash-mismatch
+                        "the entry hash does not match the entry"
+                        {:expected recomputed})
+
+                   (nil? version-time)
+                   (bad index version-id :didwebvh/bad-version-time
+                        "versionTime must be an ISO8601 UTC timestamp")
+
+                   (and previous-time (<= version-time previous-time))
+                   (bad index version-id :didwebvh/non-monotonic-version-time
+                        "versionTime must be strictly later than the previous entry's")
+
+                   (and now (> version-time (+ now skew)))
+                   (bad index version-id :didwebvh/future-version-time
+                        "versionTime is dated too far in the future")
+
+                   (not (and (sequential? proofs) (seq proofs)))
+                   (bad index version-id :didwebvh/missing-proof
+                        "an entry must carry at least one Data Integrity proof")
+
+                   :else
+                   (let [active*
+                         (try (if first? (params/initial params*) (params/advance active params*))
+                              (catch  ex ex))]
+                     (if (instance?  active*)
+                       (bad index version-id
+                            (:didwebvh/error (ex-data active*) :didwebvh/bad-parameters)
+                            (ex-message active*) {:data (ex-data active*)})
+                       (let [signed (entry/proof-input e)
+                             verdicts (mapv #(proof/verify signed % (assoc proof-opts :allowed
+                                                                        (:authorized-keys active*)))
+                                            proofs)
+                             effective-witness (if (witness/configured? (:witness active*))
+                                                 (:witness active*)
+                                                 (or (:witness active) {}))
+                             witness-result (witness/verify effective-witness version-id witness-file
+                                                           proof-opts)
+                             did-string (get state "id")
+                             parsed (try (did/parse did-string)
+                                         (catch  _ nil))
+                             location (when parsed (select-keys parsed [:domain :port :path]))]
+                         (cond
+                           (not (some :ok? verdicts))
+                           (bad index version-id :didwebvh/unauthorized-entry
+                                "no proof on this entry verifies under a key authorized to sign it"
+                                {:verdicts verdicts})
+
+                           (and first? (not (verify-scid e scid)))
+                           (bad index version-id :didwebvh/scid-mismatch
+                                "the SCID is not the hash of the first entry")
+
+                           (nil? parsed)
+                           (bad index version-id :didwebvh/bad-state-id
+                                "state.id is not a did:webvh DID" {:id did-string})
+
+                           (not= scid (:scid parsed))
+                           (bad index version-id :didwebvh/state-scid-mismatch
+                                "state.id names a different SCID than the log"
+                                {:id did-string :scid scid})
+
+                           (and (not first?)
+                                (not (:portable? active*))
+                                (not= location genesis-location))
+                           (bad index version-id :didwebvh/not-portable
+                                "the DID moved but portability was never enabled"
+                                {:from genesis-location :to location})
+
+                           (not (:ok? witness-result))
+                           (bad index version-id :didwebvh/witness-threshold-unmet
+                                (str "witness approval was " (:weight witness-result)
+                                     " of the " (:threshold witness-result) " required")
+                                {:witness witness-result})
+
+                           :else
+                           (recur (inc index)
+                                  (next remaining)
+                                  active*
+                                  version-id
+                                  version-time
+                                  (or genesis-location location)
+                                  (conj versions
+                                        {:version-id version-id
+                                         :version-time (get e "versionTime")
+                                         :did did-string
+                                         :state state
+                                         :witness witness-result
+                                         :signed-by (->> verdicts (filter :ok?) (mapv :multikey))}))))))))))))))))
+
+(defn resolve-version
+  "The state at a particular versionId from a verified result, or nil."
+  [verified version-id]
+  (some #(when (= version-id (:version-id %)) (:state %)) (:versions verified)))
+
+;; ── driving an asynchronous verifier ─────────────────────────────────────────
+;;
+;; `verify` is a loop that must decide each entry before it can know which keys
+;; are authorized for the next one, so it cannot await anything. What it CAN do
+;; is answer the same questions twice: once optimistically, to find out which
+;; signatures matter, and once for real.
+;;
+;; The optimistic pass says `true` to every signature, which can only let the
+;; loop travel FURTHER than the real answers would -- every check that consumes
+;; a verdict either continues or stops, and `true` is the continuing side. So
+;; the questions it asks are a superset of the questions the real pass asks,
+;; and running the identical code path both times is what keeps the two from
+;; drifting apart. The price is one extra pass of JCS canonicalization and
+;; SHA-256, which is microseconds beside the Ed25519 it removes.
+
+
+
+
+
+

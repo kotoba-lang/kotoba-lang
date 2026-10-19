@@ -1,0 +1,288 @@
+(ns kotoba.security.key-status
+  "Key-register evaluation for R-002 (signer revocation / key expiry).
+
+  A key may only authorize NEW package artifacts when its `:key/status` is
+  `:active`. Historical verification of past receipts can use `:retired`
+  keys elsewhere; admission of new locks must not.
+
+  Pure lifecycle helpers (`promote-to-active`, `revoke-key`, `retire-key`,
+  `status-transition-ok?`) mutate only the EDN key map. They never invent
+  private key material — secrets are provisioned out-of-band.
+
+  Rotation sequence (operator, pure register updates only — see
+  docs/key-ops-production.md):
+  1. Provision new private material out-of-band (kagi / HSM / keychain).
+  2. Register public material only as `:pre-active`.
+  3. `(promote-to-active new-key now active-until)`.
+  4. `(retire-key old-key now verify-until)` so historical verify still works.
+  5. `check-key-register --require-active` then consumers use
+     `package verify --key-register`."
+  {:kotoba/export [active-key? active-signer-ids allowed-for-new-artifacts allowed-transitions blocked-for-new-artifacts blocked-key? blocked-signer-ids evaluate-key-register key-id known-statuses non-empty-string? promote-to-active retire-key revoke-key rotate-signing-key snapshot-for-evidence status-transition-ok?]}
+  (:require [kotoba.lang.text :as str]))
+
+(def allowed-for-new-artifacts
+  #{:active})
+
+(def blocked-for-new-artifacts
+  #{:revoked :expired :compromised :retired :pre-active})
+
+(def known-statuses
+  "Statuses recognized by the key-register evaluator and lifecycle helpers."
+  (into #{:suspended :destroyed}
+        (concat allowed-for-new-artifacts blocked-for-new-artifacts)))
+
+(def allowed-transitions
+  "Directed graph of legal pure status transitions.
+
+  Not every lifecycle edge is open: private material destruction
+  (`:destroyed`) is terminal; promotion to `:active` only from
+  `:pre-active` or re-activation from `:suspended`."
+  {:pre-active #{:active :revoked :destroyed}
+   :active     #{:retired :revoked :expired :suspended :compromised}
+   :suspended  #{:active :revoked :compromised :retired}
+   :retired    #{:destroyed :revoked}
+   :expired    #{:destroyed :revoked}
+   :compromised #{:destroyed :revoked}
+   :revoked    #{:destroyed}
+   :destroyed  #{}})
+
+(defn non-empty-string?
+  [x]
+  (and (string? x) (not (str/blank? x))))
+
+(defn key-id
+  [k]
+  (or (:key/id k) (:key/signer k)))
+
+(defn blocked-key?
+  [k]
+  (contains? blocked-for-new-artifacts (:key/status k)))
+
+(defn active-key?
+  [k]
+  (contains? allowed-for-new-artifacts (:key/status k)))
+
+(defn status-transition-ok?
+  "True when transitioning FROM -> TO is an allowed lifecycle edge.
+
+  Unknown `from`/`to` statuses are never ok. `from` may be nil only when
+  seeding a brand-new record as `:pre-active`."
+  [from to]
+  (boolean
+   (cond
+     (nil? from) (= to :pre-active)
+     (not (contains? known-statuses to)) false
+     :else (contains? (get allowed-transitions from #{}) to))))
+
+(defn- append-note
+  [existing addition]
+  (let [base (or existing "")]
+    (if (str/blank? base)
+      addition
+      (str base " " addition))))
+
+(defn promote-to-active
+  "Return KEY with `:key/status :active` and `:key/active-from` set to NOW
+  (ISO date string). Optional ACTIVE-UNTIL sets `:key/active-until`.
+
+  Pure function over the EDN key map. Does **not** invent private key
+  material — real secrets must be provisioned out-of-band (HSM, kagi,
+  OS keychain, etc.) and must never be committed to this repository.
+
+  When the current status cannot transition to `:active`, returns the
+  original key unchanged with `:key/transition-error` explaining why."
+  ([key now]
+   (promote-to-active key now nil))
+  ([key now active-until]
+   (let [from (:key/status key)]
+     (if-not (status-transition-ok? from :active)
+       (assoc key
+              :key/transition-error
+              {:problem :illegal-status-transition
+               :from from
+               :to :active})
+       (cond-> (-> key
+                   (dissoc :key/transition-error :key/revoke-reason :key/revoked-at)
+                   (assoc :key/status :active
+                          :key/active-from now
+                          :key/notes
+                          (append-note
+                           (:key/notes key)
+                           (str "Promoted to :active at " now
+                                ". Private material must be provisioned "
+                                "out-of-band (not stored in-repo)."))))
+         (non-empty-string? active-until)
+         (assoc :key/active-until active-until))))))
+
+(defn revoke-key
+  "Return KEY with `:key/status :revoked`. Optional REASON is recorded on
+  `:key/revoke-reason`. NOW (ISO date) is recorded on `:key/revoked-at`
+  when provided.
+
+  Pure function — does not destroy private material (that is an operator
+  step outside this register)."
+  ([key]
+   (revoke-key key nil nil))
+  ([key reason]
+   (revoke-key key reason nil))
+  ([key reason now]
+   (let [from (:key/status key)]
+     (if-not (status-transition-ok? from :revoked)
+       (assoc key
+              :key/transition-error
+              {:problem :illegal-status-transition
+               :from from
+               :to :revoked})
+       (cond-> (-> key
+                   (dissoc :key/transition-error)
+                   (assoc :key/status :revoked
+                          :key/notes
+                          (append-note
+                           (:key/notes key)
+                           (str "Revoked"
+                                (when (non-empty-string? now)
+                                  (str " at " now))
+                                (when (non-empty-string? reason)
+                                  (str ": " reason))
+                                "."))))
+         (non-empty-string? reason) (assoc :key/revoke-reason reason)
+         (non-empty-string? now) (assoc :key/revoked-at now))))))
+
+(defn retire-key
+  "Return KEY with `:key/status :retired` for planned rotation (not incident
+  revocation). Historical artifacts may still verify until VERIFY-UNTIL
+  (ISO date, optional). NOW records `:key/retired-at` when provided.
+
+  Retired keys are blocked for NEW package artifacts (see
+  `blocked-for-new-artifacts`) but remain distinguishable from `:revoked`
+  (incident) in the register.
+
+  Pure function — does not destroy private material."
+  ([key]
+   (retire-key key nil nil))
+  ([key now]
+   (retire-key key now nil))
+  ([key now verify-until]
+   (let [from (:key/status key)]
+     (if-not (status-transition-ok? from :retired)
+       (assoc key
+              :key/transition-error
+              {:problem :illegal-status-transition
+               :from from
+               :to :retired})
+       (cond-> (-> key
+                   (dissoc :key/transition-error)
+                   (assoc :key/status :retired
+                          :key/notes
+                          (append-note
+                           (:key/notes key)
+                           (str "Retired"
+                                (when (non-empty-string? now)
+                                  (str " at " now))
+                                (when (non-empty-string? verify-until)
+                                  (str "; verify-until " verify-until))
+                                ". Blocked for new artifacts; historical verify may continue until verify-until."))))
+         (non-empty-string? now) (assoc :key/retired-at now)
+         (non-empty-string? verify-until) (assoc :key/verify-until verify-until)
+         (non-empty-string? now) (assoc :key/active-until
+                                        (or (:key/active-until key) now)))))))
+
+(defn rotate-signing-key
+  "Pure rotation helper: promote NEW-KEY to active and retire OLD-KEY with
+  VERIFY-UNTIL for historical verification.
+
+  Returns
+  {:new <promoted key map>
+   :old <retired key map>
+   :ok? bool
+   :problems [..]}
+
+  Does not touch private material. Operator must provision NEW-KEY secrets
+  out-of-band before promote, then persist both maps into the key-register."
+  [old-key new-key now verify-until]
+  (let [promoted (promote-to-active new-key now)
+        retired (retire-key old-key now verify-until)
+        problems (cond-> []
+                   (:key/transition-error promoted)
+                   (conj {:problem :promote-failed
+                          :error (:key/transition-error promoted)
+                          :key/id (key-id new-key)})
+                   (:key/transition-error retired)
+                   (conj {:problem :retire-failed
+                          :error (:key/transition-error retired)
+                          :key/id (key-id old-key)}))]
+    {:new promoted
+     :old retired
+     :ok? (empty? problems)
+     :problems problems}))
+
+(defn blocked-signer-ids
+  "Set of key/signer ids that must not sign new artifacts."
+  [key-register]
+  (into #{}
+        (keep (fn [k]
+                (when (blocked-key? k)
+                  (key-id k))))
+        (or (:keys key-register) [])))
+
+(defn active-signer-ids
+  [key-register]
+  (into #{}
+        (keep (fn [k]
+                (when (active-key? k)
+                  (key-id k))))
+        (or (:keys key-register) [])))
+
+(defn evaluate-key-register
+  "Summarize a key-register for release evidence / admission.
+
+  Returns
+  {:kotoba.key/ok? bool  ;; true when every key has a known status and
+                         ;; at least one :active key exists when keys are present
+   :kotoba.key/blocked [id ...]
+   :kotoba.key/active [id ...]
+   :kotoba.key/problems [{:problem ..} ...]}"
+  [key-register]
+  (let [keys (or (:keys key-register) [])
+        problems (cond-> []
+                   (and (map? key-register)
+                        (not= :kotoba.security/key-register
+                              (:register/type key-register))
+                        (some? (:register/type key-register)))
+                   (conj {:problem :key-register-type-mismatch
+                          :actual (:register/type key-register)}))
+        unknown (into []
+                      (keep (fn [k]
+                              (when-not (or (active-key? k) (blocked-key? k)
+                                            (contains? known-statuses
+                                                       (:key/status k)))
+                                {:problem :unknown-key-status
+                                 :key/id (key-id k)
+                                 :key/status (:key/status k)})))
+                      keys)
+        ;; :suspended / :destroyed are known but still blocked for new artifacts
+        blocked (vec (blocked-signer-ids key-register))
+        suspended-or-destroyed
+        (into []
+              (keep (fn [k]
+                      (when (#{:suspended :destroyed} (:key/status k))
+                        (key-id k))))
+              keys)
+        blocked (into blocked suspended-or-destroyed)
+        active (vec (active-signer-ids key-register))
+        problems (into problems unknown)
+        problems (cond-> problems
+                   (and (seq keys) (empty? active))
+                   (conj {:problem :no-active-signing-key}))]
+    {:kotoba.key/ok? (empty? problems)
+     :kotoba.key/blocked blocked
+     :kotoba.key/active active
+     :kotoba.key/problems problems}))
+
+(defn snapshot-for-evidence
+  "Machine-readable key-status snapshot map suitable for evidence packets."
+  [key-register now]
+  (let [eval (evaluate-key-register key-register)]
+    (merge eval
+           {:kotoba.key/checked-at now
+            :kotoba.key/register-version (:register/version key-register)})))

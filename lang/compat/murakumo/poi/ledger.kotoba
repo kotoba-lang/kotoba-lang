@@ -1,0 +1,170 @@
+(ns murakumo.poi.ledger
+  "Proof of Inference, phase 1 ledger (ADR-261010b §3, §9; ADR-261010c §4).
+
+  The coordinator signs every receipt and verdict with its own ed25519 key and
+  appends them to receipts.jsonl. `seal!` closes a settlement block keyed to the
+  current Bitcoin tip height: it takes every receipt and verdict not yet sealed,
+  commits them under one Merkle root, records the Bitcoin tip hash it was sealed
+  against, and chains to the previous block. Season 0 points are a fold over
+  sealed blocks: a job earns its producer points only once a verdict for that
+  job has passed.
+
+  Files live under one directory (default ~/.local/share/murakumo/poi):
+    coordinator.key   ed25519 PKCS8, 0600
+    receipts.jsonl    one signed document per line
+    blocks.jsonl      one signed block per line"
+  (:require [clojure.string :as str]
+            [murakumo.poi.core :as poi]
+            [murakumo.infer.observation :as obs]
+            [murakumo.infer.replicated-topology :as topo]
+            ["node:fs" :as fs] ["node:path" :as path] ["node:os" :as os]
+            ["node:crypto" :as crypto]))
+
+(defn default-dir []
+  (.join path (.homedir os) ".local" "share" "murakumo" "poi"))
+
+(defn- file [dir name] (.join path dir name))
+
+(defn ensure-dir! [dir]
+  (.mkdirSync fs dir #js {:recursive true :mode 448})
+  dir)
+
+(defn coordinator [dir]
+  (obs/node-key! (file (ensure-dir! dir) "coordinator.key")))
+
+;; ------------------------------------------------------------------ jsonl
+
+(defn- read-jsonl [f]
+  (if (.existsSync fs f)
+    (->> (str/split-lines (.readFileSync fs f "utf8"))
+         (remove str/blank?)
+         (mapv #(js->clj (js/JSON.parse %) :keywordize-keys true)))
+    []))
+
+(defn- append-jsonl! [f doc]
+  (.appendFileSync fs f (str (js/JSON.stringify (clj->js doc)) "\n") #js {:mode 384}))
+
+(defn receipts [dir] (read-jsonl (file dir "receipts.jsonl")))
+(defn blocks [dir] (read-jsonl (file dir "blocks.jsonl")))
+
+(defn signed? [doc]
+  (try
+    (let [payload (:payload doc)
+          k (obs/did->public (:issuer payload))]
+      (boolean (and k (.verify crypto nil (js/Buffer.from (topo/encoded payload)) k
+                               (js/Buffer.from (str (:signature doc)) "base64url")))))
+    (catch :default _ false)))
+
+(defn- sign-as [key payload]
+  (obs/sign key (assoc payload :issuer (:did key))))
+
+(defn append-receipt!
+  "Sign `payload` (a :receipt or :verdict) as the coordinator, chained to the
+  previous document, and append it."
+  [dir key payload]
+  (let [prev (some-> (peek (receipts dir)) :payload topo/digest)
+        doc (sign-as key (assoc payload :prev prev :at (js/Date.now)))]
+    (append-jsonl! (file dir "receipts.jsonl") doc)
+    doc))
+
+(defn doc-digest [doc] (topo/digest (:payload doc)))
+
+(defn- customer-receipts [dir]
+  (filter #(= "customer" (get-in % [:payload :kind])) (receipts dir)))
+
+(defn node-dids
+  "First did seen per node among recorded customer receipts (pinned)."
+  [dir]
+  (reduce (fn [m d] (let [{:keys [node did]} (:payload d)] (if (contains? m node) m (assoc m node did))))
+          {} (customer-receipts dir)))
+
+(defn node-receipt-digests [dir]
+  (into #{} (keep #(some-> % :payload :node-doc doc-digest)) (customer-receipts dir)))
+
+(defn last-node-receipt-at [dir node]
+  (reduce max 0 (keep #(when (= node (get-in % [:payload :node])) (get-in % [:payload :node-at]))
+                      (customer-receipts dir))))
+
+;; ----------------------------------------------------------------- merkle
+
+(defn- sha256-hex [s] (.digest (.update (.createHash crypto "sha256") s) "hex"))
+
+(defn merkle-root
+  "Bitcoin-style root over hex leaves (an odd last leaf pairs with itself).
+  The empty set's root is the hash of the empty string."
+  [leaves]
+  (loop [level (vec leaves)]
+    (cond (empty? level) (sha256-hex "")
+          (= 1 (count level)) (first level)
+          :else (recur (mapv (fn [[a b]] (sha256-hex (str a (or b a))))
+                             (partition-all 2 level))))))
+
+;; ----------------------------------------------------------------- blocks
+
+(defn sealed-digests [dir]
+  (into #{} (mapcat :leaves) (map :payload (blocks dir))))
+
+(defn unsealed [dir]
+  (let [done (sealed-digests dir)]
+    (filterv #(not (done (topo/digest (:payload %)))) (receipts dir))))
+
+(defn seal!
+  "Close one settlement block at Bitcoin height `btc-height` (tip hash
+  `btc-hash`). Refuses a height at or below the last sealed one, since a
+  settlement block is one per Bitcoin block."
+  [dir key {:keys [btc-height btc-hash]}]
+  (let [prior (map :payload (blocks dir))
+        last-height (or (:height (last prior)) 0)]
+    (when (<= btc-height last-height)
+      (throw (ex-info "a block is already sealed at or above this Bitcoin height"
+                      {:height btc-height :last last-height})))
+    (let [docs (unsealed dir)
+          leaves (mapv (comp topo/digest :payload) docs)
+          payload {:v 1
+                   :height btc-height
+                   :btc-hash btc-hash
+                   :prev (some-> (last prior) topo/digest)
+                   :root (merkle-root leaves)
+                   :leaves leaves
+                   :receipts (count (filter #(= "receipt" (get-in % [:payload :type])) docs))
+                   :verdicts (count (filter #(= "verdict" (get-in % [:payload :type])) docs))
+                   :sealed-at (js/Date.now)}
+          doc (sign-as key payload)]
+      (append-jsonl! (file dir "blocks.jsonl") doc)
+      doc)))
+
+;; ----------------------------------------------------------------- points
+
+(defn season0-points
+  "Season 0 genesis points per node over sealed blocks (ADR-261010c §4).
+  `proven` is the set of node names with a Bitcoin hashrate proof (1.5×)."
+  ([dir] (season0-points dir #{}))
+  ([dir proven]
+   (let [sealed (sealed-digests dir)
+         docs (filter #(and (signed? %) (sealed (topo/digest (:payload %)))) (receipts dir))
+         by-type (group-by #(get-in % [:payload :type]) docs)
+         decided (filter #(not (get-in % [:payload :inconclusive])) (get by-type "verdict"))
+         passed (into #{} (comp (map :payload) (filter :pass) (map :job))
+                      decided)
+         failed (into #{} (comp (map :payload) (remove :pass) (map :job))
+                      decided)
+         standing (reduce (fn [m {{:keys [node pass]} :payload}] (assoc m node (boolean pass)))
+                          {} decided)]
+     (reduce (fn [acc {{:keys [job node uvcu kind]} :payload}]
+               (cond (= "customer" kind)
+                     ;; customer jobs cannot be replayed without the prompt, so they
+                     ;; count while the node's latest sealed capacity verdict passed
+                     (if (get standing node)
+                       (-> acc
+                           (update-in [node :points] (fnil + 0)
+                                      (poi/season0-points {:uvcu uvcu :btc-proven (if (proven node) 1 0)}))
+                           (update-in [node :customer] (fnil inc 0)))
+                       (update-in acc [node :held] (fnil inc 0)))
+                     (failed job) (update-in acc [node :failed] (fnil inc 0))
+                     (passed job) (-> acc
+                                      (update-in [node :points] (fnil + 0)
+                                                 (poi/season0-points {:uvcu uvcu
+                                                                      :btc-proven (if (proven node) 1 0)}))
+                                      (update-in [node :jobs] (fnil inc 0)))
+                     :else (update-in acc [node :pending] (fnil inc 0))))
+             {} (get by-type "receipt")))))

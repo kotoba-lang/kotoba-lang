@@ -1,0 +1,75 @@
+(ns kototama.native.lease-transport
+  "Bounded POSIX Node synchronous RPC mechanism. The worker owns only process
+  IO and deadlines; the caller thread alone runs the trusted lease callback.
+  No closure, scope or bearer authority is sent to the worker or guest."
+  {:kotoba/export [run!]}
+  (:require ["node:worker_threads" :as threads]))
+
+(def ^:private worker-source
+  "const {workerData:d}=require('node:worker_threads');\nconst {spawn}=require('node:child_process');\nconst h=new Int32Array(d.shared,0,4), b=new Uint8Array(d.shared,16);\nlet child, out='', err='', pending='', calls=0, waiting=false, timed=false, exceeded=false, failed=false, finished=false;\nfunction put(state,text){ const x=Buffer.from(text); if(x.length>b.length)throw Error('transport overflow');b.set(x,state===3?496:0);Atomics.store(h,state===3?3:1,x.length);Atomics.store(h,0,state);Atomics.notify(h,0); }\nfunction kill(){if(child&&child.pid){try{process.kill(-child.pid,'SIGKILL');}catch{} try{child.kill('SIGKILL');}catch{}}}\nfunction fail(){failed=true;kill();}\ntry{\n child=spawn(d.command[0],d.command.slice(1),{env:d.env,detached:true,stdio:['ignore','pipe','pipe','pipe','pipe']});\n child.on('error',fail);\n for(const [pipe,key] of [[child.stdout,'out'],[child.stderr,'err']])pipe.on('data',x=>{\n   const text=x.toString('utf8');if(key==='out')out+=text;else err+=text;\n   if(Buffer.byteLength(out)+Buffer.byteLength(err)>d.limit){exceeded=true;out='';err='';kill();}\n });\n child.stdio[4].on('error',fail);\n child.stdio[3].on('data',x=>{\n   if(failed||finished||timed)return;if(x.some(v=>v>127)){fail();return;}pending+=x.toString('ascii');\n   if(Buffer.byteLength(pending)>96||waiting){fail();return;}\n   const end=pending.indexOf('\\n');if(end<0)return;\n   if(end!==pending.length-1||++calls>4096){fail();return;}\n   const frame=pending;pending='';waiting=true;put(1,frame);\n });\n child.on('close',(code,signal)=>{\n   finished=true;clearInterval(poll);clearTimeout(deadline);\n   // Child EOF may arrive while a provider is running: publish final state so\n   // a late answer cannot revive it. Uses already reserved are never refunded.\n   if(pending)failed=true;\n   const signals={SIGKILL:9,SIGTERM:15,SIGABRT:6,SIGSEGV:11,SIGILL:4,SIGTRAP:5,SIGBUS:10,SIGFPE:8};\n   put(3,JSON.stringify({exit:code??(signals[signal]?128+signals[signal]:70),stdout:out,stderr:err,timedOut:timed,outputExceeded:exceeded,transportFailed:failed}));\n });\n const deadline=setTimeout(()=>{timed=true;kill();},d.timeout);\n const poll=setInterval(()=>{\n   const state=Atomics.load(h,0);\n   if(state===4){fail();return;}\n   if(state===2&&waiting){\n     const n=Atomics.load(h,2);const reply=Buffer.from(b.slice(240,240+n));\n     waiting=false;Atomics.store(h,0,0);child.stdio[4].write(reply);\n   }\n },1);\n}catch(e){kill();put(3,JSON.stringify({exit:70,stdout:'',stderr:'',transportFailed:true}));}\n")
+
+(defn- reject! [reason]
+  (throw (ex-info "native lease transport refused" {:phase :native-lease-transport :reason reason})))
+
+(defn run!
+  "Run a measured POSIX loader. CALL! receives the wire id and signed i64.
+  It must authenticate the immutable scope and reserve use before its effect.
+  This is a trusted bounded synchronous provider contract, not async hosting."
+  [command env {:keys [timeout-ms output-limit call!]
+                :or {timeout-ms 5000 output-limit 65536}}]
+  (when-not (and (contains? #{"linux" "darwin"} (.-platform js/process))
+                 (fn? call!) (pos-int? timeout-ms) (<= timeout-ms 5000)
+                 (pos-int? output-limit) (<= output-limit 65536))
+    (reject! :unsupported-contract))
+  (let [shared (js/SharedArrayBuffer. 524800)
+        header (js/Int32Array. shared 0 4)
+        bytes (js/Uint8Array. shared 16)
+        worker (threads/Worker. worker-source
+                  #js {:eval true :workerData #js {:shared shared :command (clj->js command)
+                         :env (clj->js env) :timeout timeout-ms :limit output-limit}})
+        end (+ (.now js/Date) timeout-ms 2000)]
+    (try
+      (loop [sequence 0]
+        (when (> (.now js/Date) end) (reject! :supervisor-unresponsive))
+        (let [state (js/Atomics.load header 0)]
+          (case state
+            1 (let [length (js/Atomics.load header 1)
+                    _ (when-not (<= 1 length 96) (reject! :invalid-frame-size))
+                    line (.toString (js/Buffer.from (.slice bytes 0 length)) "ascii")
+                    [_ seq-token id-token value-token] (re-matches #"Q ([1-9][0-9]*) ([1-9][0-9]*) (-?(?:0|[1-9][0-9]*))\n" line)
+                    serial (when seq-token (js/Number seq-token))
+                    id (when id-token (js/Number id-token))
+                    request (when value-token (js/BigInt value-token))]
+                (when-not (and (= (inc sequence) serial) (<= serial 4096)
+                               (js/Number.isSafeInteger id) (<= 1 id 65535)
+                               (<= (js/BigInt "-9223372036854775808") request (js/BigInt "9223372036854775807")))
+                  (reject! :invalid-request))
+                (let [reply (try
+                              (let [answer (call! id request)]
+                                (when-not (and (some? answer) (= js/BigInt (.-constructor answer))
+                                               (<= (js/BigInt "-9223372036854775808") answer (js/BigInt "9223372036854775807")))
+                                  (reject! :invalid-provider-result))
+                                (str "R " serial " " answer "\n"))
+                              (catch :default _ (str "D " serial "\n")))
+                      data (js/Buffer.from reply "ascii")]
+                  ;; Worker may have killed the child during a bounded callback.
+                  ;; Never overwrite its terminal state with a late response.
+                  (when (= 1 (js/Atomics.load header 0))
+                    (.set bytes data 240)
+                    (js/Atomics.store header 2 (.-length data))
+                    (js/Atomics.compareExchange header 0 1 2)
+                    (js/Atomics.notify header 0))
+                  (recur serial)))
+            3 (let [length (js/Atomics.load header 3)
+                    _ (when-not (<= 1 length 524288) (reject! :invalid-completion-size))
+                    result (js/JSON.parse (.toString (js/Buffer.from (.slice bytes 496 (+ 496 length))) "utf8"))]
+                (when (.-transportFailed result) (reject! :transport-failed))
+                {:exit (.-exit result) :stdout (.-stdout result) :stderr (.-stderr result)
+                 :timed-out? (boolean (.-timedOut result)) :output-exceeded? (boolean (.-outputExceeded result))})
+            (do (js/Atomics.wait header 0 state 20) (recur sequence)))))
+      (finally
+        ;; A cancellation is consumed by the independent worker, which kills
+        ;; the POSIX process group before closing; terminating it early would
+        ;; strand the supervisor's guest child.
+        (when-not (= 3 (js/Atomics.load header 0)) (js/Atomics.store header 0 4))
+        (.unref worker)))))

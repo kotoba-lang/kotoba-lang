@@ -1,0 +1,83 @@
+(ns murakumo.onboard-audio
+  "Sound for a box that has no screen (ADR-0243): ggwave encode/decode and the two commands
+  that move raw PCM to and from the speaker and microphone.
+
+  The audio devices are reached through commands, not a native binding: `aplay` and
+  `arecord` by default, anything that reads or writes raw 32-bit float little-endian mono
+  PCM at 48 kHz on stdin/stdout otherwise (`pw-cat`, `sox`, a file, a FIFO). That keeps
+  this namespace free of platform code and lets the whole loop be tested without a sound
+  card. Commands are argument vectors; no shell is involved."
+  (:require ["ggwave" :as ggwave-factory]
+            ["node:child_process" :as child-process]))
+
+(def sample-rate 48000)
+(def frame-samples 4096)
+
+(def default-play-cmd ["aplay" "-q" "-t" "raw" "-f" "FLOAT_LE" "-r" "48000" "-c" "1"])
+(def default-record-cmd ["arecord" "-q" "-t" "raw" "-f" "FLOAT_LE" "-r" "48000" "-c" "1"])
+
+(defn init!
+  "Promise of `{:encode (fn [data mode]) :decode (fn [Float32Array])}`.
+  `encode` returns a Float32Array of PCM for a string or byte array; `mode` is
+  `:quiet` (ultrasound) or `:soft` (audible, low volume). `decode` returns the bytes
+  heard in one frame of PCM as a Uint8Array, or nil."
+  []
+  (let [factory (or (.-default ggwave-factory) ggwave-factory)]
+    (-> (factory)
+        (.then (fn [g]
+                 (let [params (.getDefaultParameters g)
+                       _ (set! (.-sampleRateInp params) sample-rate)
+                       _ (set! (.-sampleRateOut params) sample-rate)
+                       instance (.init g params)
+                       proto (.-ProtocolId g)]
+                   {:encode (fn [data mode]
+                              (let [quiet? (= :quiet mode)
+                                    pid (if quiet? (.-GGWAVE_PROTOCOL_ULTRASOUND_FAST proto)
+                                            (.-GGWAVE_PROTOCOL_AUDIBLE_NORMAL proto))
+                                    w (.encode g instance data pid (if quiet? 55 18))
+                                    f (js/Float32Array. (.slice (.-buffer w) (.-byteOffset w)
+                                                                (+ (.-byteOffset w) (.-byteLength w))))
+                                    fade (js/Math.floor (* sample-rate 0.04))]
+                                (dotimes [i fade]
+                                  (let [k (/ i fade)]
+                                    (aset f i (* (aget f i) k))
+                                    (aset f (- (.-length f) 1 i) (* (aget f (- (.-length f) 1 i)) k))))
+                                f))
+                    :decode (fn [^js pcm]
+                              (let [out (.decode g instance
+                                                 (js/Int8Array. (.-buffer pcm) (.-byteOffset pcm) (.-byteLength pcm)))]
+                                (when (and out (pos? (.-length out))) (js/Uint8Array. out))))}))))))
+
+(defn play!
+  "Send PCM (a Float32Array) to the speaker command. Promise resolved when it exits."
+  [cmd ^js pcm]
+  (js/Promise.
+   (fn [resolve _]
+     (let [p (.spawn child-process (first cmd) (clj->js (rest cmd)) #js {:stdio #js ["pipe" "ignore" "inherit"]})]
+       (.on p "error" (fn [_] (resolve :error)))
+       (.on p "exit" (fn [_] (resolve :done)))
+       (.on (.-stdin p) "error" (fn [_] nil))
+       (.end (.-stdin p) (js/Buffer.from (.-buffer pcm) (.-byteOffset pcm) (.-byteLength pcm)))))))
+
+(defn record!
+  "Run the microphone command and call `on-frame` with each `frame-samples` of PCM as a
+  Float32Array. Returns `{:stop fn :done <Promise>}`; `done` resolves when it exits."
+  [cmd on-frame]
+  (let [p (.spawn child-process (first cmd) (clj->js (rest cmd)) #js {:stdio #js ["ignore" "pipe" "inherit"]})
+        bytes-per-frame (* 4 frame-samples)
+        pending (atom (js/Buffer.alloc 0))
+        done (js/Promise. (fn [resolve _]
+                            (.on p "error" (fn [_] (resolve :error)))
+                            (.on p "exit" (fn [_] (resolve :done)))))]
+    (.on (.-stdout p) "data"
+         (fn [chunk]
+           (reset! pending (js/Buffer.concat #js [@pending chunk]))
+           (loop []
+             (when (>= (.-length @pending) bytes-per-frame)
+               (let [frame (.subarray @pending 0 bytes-per-frame)
+                     pcm (js/Float32Array. (.slice (.-buffer frame) (.-byteOffset frame)
+                                                   (+ (.-byteOffset frame) bytes-per-frame)))]
+                 (reset! pending (.subarray @pending bytes-per-frame))
+                 (on-frame pcm)
+                 (recur))))))
+    {:stop (fn [] (.kill p)) :done done}))

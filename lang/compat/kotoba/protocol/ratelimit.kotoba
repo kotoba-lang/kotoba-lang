@@ -1,0 +1,188 @@
+(ns kotoba.protocol.ratelimit
+  "Anonymous rate-limit tokens (ADR-2610081200 R2, mechanism M3).
+
+  A holder shows that it is within a budget without showing who it is.
+  Roles follow the Privacy Pass architecture (RFC 9576):
+
+    attester  vouches that a client may receive tokens (e.g. one per epoch)
+    issuer    blind-signs; sees the attestation, never the token
+    origin    redeems; sees the token, never the attestation
+
+  Unlinkability rests on two things this ns pins down as data:
+
+    1. the issuer and the origin are different parties
+    2. an issuance record and a redemption record share no field except
+       the epoch and the key id
+
+  This ns does not blind, sign or verify. Cryptography is injected as
+  `verify-fn`; a nil `verify-fn` is a deny, not an allow. Token types
+  are named after RFC 9578 (type 1 VOPRF P-384, type 2 blind RSA).
+
+  Fails closed:
+
+    malformed token / challenge        → :malformed
+    challenge digest differs           → :challenge-mismatch
+    epoch outside the window           → :epoch-out-of-window
+    nonce already seen this window     → :double-spend
+    verify-fn nil                      → :verifier-required
+    verify-fn false                    → :bad-authenticator
+    issuer and origin are one party    → :issuer-origin-not-separated"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.protocol.vocab :as vocab]))
+
+(def version 1)
+
+(def token-types
+  {:blind-rsa {:wire-type 2 :public-verifiable? true}
+   :voprf {:wire-type 1 :public-verifiable? false}})
+
+(def nonce-length-hex 64)
+(def digest-length-hex 64)
+(def key-id-length-hex 64)
+
+(defn- hex? [s n]
+  (boolean (and (string? s) (= n (count s)) (re-matches #"[0-9a-f]+" s))))
+
+(defn- non-blank? [s] (and (string? s) (not (str/blank? s))))
+
+;; ── challenge and token ─────────────────────────────────────────────────────
+
+(def challenge-keys #{:issuer :origin :context :epoch :type :scope})
+
+(defn challenge-errors
+  "A challenge names who issues, who redeems, the epoch, required token
+  type, and bounded scope of what the token may be spent on. The scope is
+  the token's blast radius (ADR M6): a token cannot be spent outside it."
+  [c]
+  (if-not (map? c)
+    [{:error :malformed}]
+    (vec
+     (remove nil?
+             [(when-let [extra (seq (remove challenge-keys (keys c)))]
+                {:error :malformed :keys (vec extra)})
+              (when-not (vocab/did-key? (:issuer c)) {:error :not-a-key :key :issuer})
+              (when-not (vocab/did-key? (:origin c)) {:error :not-a-key :key :origin})
+              (when-not (nat-int? (:epoch c)) {:error :malformed :key :epoch})
+              (when-not (contains? token-types (:type c))
+                {:error :unknown-token-type :value (:type c)})
+              (when-not (and (map? (:scope c)) (seq (:operations (:scope c))))
+                {:error :scope-required})]))))
+
+(defn token-errors
+  [t]
+  (if-not (map? t)
+    [{:error :malformed}]
+    (vec
+     (remove nil?
+             [(when-not (contains? token-types (:type t)) {:error :unknown-token-type :value (:type t)})
+              (when-not (hex? (:nonce t) nonce-length-hex) {:error :malformed :key :nonce})
+              (when-not (hex? (:challenge-digest t) digest-length-hex)
+                {:error :malformed :key :challenge-digest})
+              (when-not (hex? (:key-id t) key-id-length-hex) {:error :malformed :key :key-id})
+              (when-not (non-blank? (:authenticator t)) {:error :malformed :key :authenticator})]))))
+
+;; ── role separation ─────────────────────────────────────────────────────────
+
+(defn separation-errors
+  "Parties are {:did :org}. A supplied attester must have a valid DID. The
+  origin must be neither the issuer nor the attester; an origin that is also
+  the issuer sees both ends and the token no longer unlinks. The issuer and
+  the attester may be one party."
+  [{:keys [attester issuer origin]}]
+  (vec
+   (remove nil?
+           (concat
+            (for [[role p] [[:issuer issuer] [:attester attester]]
+                  :when p]
+              (when (or (= (:did p) (:did origin))
+                        (and (:org p) (= (:org p) (:org origin))))
+                {:error :issuer-origin-not-separated :role role}))
+            [(when-not (and (vocab/did-key? (:did origin)) (vocab/did-key? (:did issuer)))
+               {:error :not-a-key})
+             (when (and attester (not (vocab/did-key? (:did attester))))
+               {:error :not-a-key :key :attester})]))))
+
+;; ── issuance budget ─────────────────────────────────────────────────────────
+
+(defn may-issue
+  "How many of `requested` tokens may be issued now. The count is kept
+  per attester-supplied epoch pseudonym, not per identity. → {:grant n}
+  | {:deny …}. A budget that is not a non-negative integer grants none."
+  [{:keys [budget issued requested]}]
+  (cond
+    (not (and (nat-int? budget) (nat-int? issued) (pos-int? requested)))
+    {:deny :malformed}
+    (>= issued budget) {:deny :budget-exhausted :budget budget}
+    :else {:grant (min requested (- budget issued))}))
+
+;; ── redemption ──────────────────────────────────────────────────────────────
+
+(def default-grace
+  "Epochs behind the current one in which a token is still accepted."
+  1)
+
+(defn spent-set [] {:epochs {}})
+
+(defn- in-window? [epoch current grace]
+  (and (nat-int? epoch) (nat-int? current)
+       (<= epoch current)
+       (<= (- current epoch) grace)))
+
+(defn prune
+  "Forget expired nonces but retain spent entries from future epochs."
+  [spent current-epoch grace]
+  (update spent :epochs
+          (fn [m]
+            (if-not (and (nat-int? current-epoch) (nat-int? grace))
+              m
+              (into {}
+                    (filter (fn [[e _]]
+                              (and (nat-int? e)
+                                   (or (> e current-epoch)
+                                       (in-window? e current-epoch grace))))
+                            m))))))
+
+(defn redeem
+  "Admit one token. The caller computed the challenge it issued and
+  passes `:challenge-digest`, `:challenge-type`, and `:challenge-epoch`;
+  `:epoch` is the current epoch. The type must match the token, and the
+  digest must bind that type. `verify-fn` takes the token and returns true
+  only for a valid authenticator. On success the nonce joins the spent set
+  for the challenge epoch. → {:allow true :spent s'} | {:deny …, :spent s}.
+  A denial never records the nonce."
+  [spent token context]
+  (let [{:keys [challenge-digest challenge-type challenge-epoch epoch grace verify-fn]} context
+        grace (if (contains? context :grace) grace default-grace)
+        deny (fn [reason] {:deny reason :spent spent})
+        nonce-key [(:key-id token) (:nonce token)]]
+    (cond
+      (seq (token-errors token)) (deny :malformed)
+      (not (contains? token-types challenge-type)) (deny :malformed)
+      (not= challenge-type (:type token)) (deny :challenge-mismatch)
+      (not (hex? challenge-digest digest-length-hex)) (deny :malformed)
+      (not= challenge-digest (:challenge-digest token)) (deny :challenge-mismatch)
+      (not (nat-int? grace)) (deny :malformed)
+      (not (in-window? challenge-epoch epoch grace)) (deny :epoch-out-of-window)
+      (contains? (get-in spent [:epochs challenge-epoch] #{}) nonce-key) (deny :double-spend)
+      (not (ifn? verify-fn)) (deny :verifier-required)
+      (not (true? (verify-fn token))) (deny :bad-authenticator)
+      :else {:allow true
+             :spent (update-in (prune spent epoch grace)
+                               [:epochs challenge-epoch] (fnil conj #{}) nonce-key)})))
+
+;; ── unlinkability audit ─────────────────────────────────────────────────────
+
+(def linkable-fields-allowed
+  "The only fields an issuance record and a redemption record may share."
+  #{:epoch :key-id})
+
+(defn linkage-errors
+  "[] when the two log records cannot be joined on anything but the epoch
+  and the key id. A shared nonce, token, attestation or client field
+  lets whoever holds both logs link issuance to redemption."
+  [issuance-record redemption-record]
+  (let [redeemed (set (keys redemption-record))
+        shared (filter redeemed (keys issuance-record))
+        bad (remove linkable-fields-allowed shared)]
+    (vec (when (seq bad)
+           [{:error :linkable :fields (vec (sort bad))}]))))

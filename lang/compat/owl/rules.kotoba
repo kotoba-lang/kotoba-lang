@@ -1,0 +1,581 @@
+(ns owl.rules
+  "RDFS and OWL 2 RL entailment written as DATALOG RULES, for a query engine
+  that evaluates recursion to a least fixpoint.
+
+  ## Why this exists next to `owl.reason`
+
+  `owl.reason` computes three closures IN MEMORY, over an `owl.model`
+  ontology, in a single non-iterated pass. That is the right shape when you
+  hold the whole ontology as a value. It is the wrong shape when the
+  ontology is a stored graph too large to hold, because it requires
+  materialising every asserted fact before answering anything.
+
+  These rules move the same semantics to the query. They are plain EDN --
+  `[[(head ?a ?b) body-clause ...] ...]`, the shape kotobase's `:rules`
+  takes -- so the engine runs the fixpoint against its own indexes and only
+  the predicates a rule names are ever read. Nothing here evaluates
+  anything; this namespace emits rules, exactly as the rest of this library
+  emits data.
+
+  ## Two rulesets, and the difference is a full scan
+
+  `hierarchy-rules` names its predicates LITERALLY, so an engine that plans
+  reads per predicate touches three ranges. It covers what an ontology is
+  usually asked -- transitive `rdfs:subClassOf`, transitive
+  `rdfs:subPropertyOf`, and `rdf:type` closed over the class hierarchy
+  (RDFS rules 9 and 11, and 5).
+
+  `triple-rules` derives triples whose PREDICATE is a variable --
+  `rdfs:subPropertyOf` propagation, `rdfs:domain`/`rdfs:range` typing,
+  `owl:TransitiveProperty`, `owl:SymmetricProperty`, `owl:inverseOf`. That
+  is strictly more entailment and it costs an unbounded scan: its base case
+  is `[?s ?p ?o]`, which no predicate index can narrow. Both are offered
+  rather than one merged ruleset because the choice is a cost decision the
+  caller has to make with the number in front of them, and a merged ruleset
+  would hide it -- the narrow one would silently become the wide one.
+
+  ## What this is not
+
+  Not a description-logic reasoner: the two Datalog rulesets
+  (`hierarchy-rules`, `triple-rules`) are the RDFS core and nothing else --
+  no `owl:someValuesFrom`, `owl:unionOf`, cardinality or inconsistency
+  detection. The complete OWL 2 RL/RDF rule table, which does cover the
+  RL-admitted forms of those, is `owl2-rl-rules` at the end of this
+  namespace, evaluated by `owl.rl`. Beyond RL (existential introduction,
+  disjunction in superclass position, unrestricted cardinality) is out of
+  both.
+
+  Also out of the Datalog rulesets, deliberately: `owl:sameAs`. Its rules
+  multiply the derived set by the square of each equivalence class. The
+  complete table has them (eq-*), and a caller who wants equality asks for
+  that table.
+
+  ## Vocabulary
+
+  A rule can only match the term a graph actually stored. Two conventions
+  are supported and neither is guessed: `keyword-vocabulary` (the natural
+  form when the writer used Clojure keywords, which is what kotobase's
+  write path stringifies) and `iri-vocabulary` (full W3C IRIs, the form an
+  RDF import produces). Pass your own map to match anything else -- the
+  keys are this namespace's, the values are yours.
+
+      (require '[owl.rules :as rules])
+
+      (rules/hierarchy-rules)                    ;; keyword vocabulary
+      (rules/triple-rules rules/iri-vocabulary)  ;; imported RDF
+
+      ;; every class Felix belongs to, however deep the hierarchy
+      {:find  '[?class]
+       :where '[(owl-type \"Felix\" ?class)]
+       :rules (rules/hierarchy-rules)}")
+
+(def keyword-vocabulary
+  "RDFS/OWL terms as Clojure keywords -- the form a graph written natively
+  in this stack holds. `:rdf/type` rather than the IRI it abbreviates."
+  {:type                :rdf/type
+   :sub-class-of        :rdfs/subClassOf
+   :sub-property-of     :rdfs/subPropertyOf
+   :domain              :rdfs/domain
+   :range               :rdfs/range
+   :equivalent-class    :owl/equivalentClass
+   :inverse-of          :owl/inverseOf
+   :transitive-property :owl/TransitiveProperty
+   :symmetric-property  :owl/SymmetricProperty})
+
+(def iri-vocabulary
+  "The same terms as the full IRIs an RDF import carries. `rdf:`, `rdfs:`
+  and `owl:` expanded per their W3C namespace documents."
+  {:type                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+   :sub-class-of        "http://www.w3.org/2000/01/rdf-schema#subClassOf"
+   :sub-property-of     "http://www.w3.org/2000/01/rdf-schema#subPropertyOf"
+   :domain              "http://www.w3.org/2000/01/rdf-schema#domain"
+   :range               "http://www.w3.org/2000/01/rdf-schema#range"
+   :equivalent-class    "http://www.w3.org/2002/07/owl#equivalentClass"
+   :inverse-of          "http://www.w3.org/2002/07/owl#inverseOf"
+   :transitive-property "http://www.w3.org/2002/07/owl#TransitiveProperty"
+   :symmetric-property  "http://www.w3.org/2002/07/owl#SymmetricProperty"})
+
+(defn- terms
+  "`vocabulary` with every key this namespace uses present, or a throw
+  naming the ones that are not.
+
+  A missing term must not default. A rule whose predicate position silently
+  became `nil` matches no stored triple, so the rule contributes nothing and
+  the query returns a smaller answer -- which is indistinguishable from an
+  ontology that simply had no such axioms."
+  [vocabulary]
+  (let [required (set (keys keyword-vocabulary))
+        missing (remove #(contains? vocabulary %) required)]
+    (when (seq missing)
+      (throw (ex-info "owl.rules: vocabulary is missing terms; a nil predicate would match nothing and read as an ontology without those axioms"
+                      {:missing (vec (sort missing))})))
+    vocabulary))
+
+(defn hierarchy-rules
+  "The class/property hierarchy closures, with every predicate a literal.
+
+  | rule | RDFS | meaning |
+  |------|------|---------|
+  | `(owl-subclass ?a ?b)`    | rdfs11 | `?a` is a `?b`, transitively |
+  | `(owl-subproperty ?a ?b)` | rdfs5  | property `?a` implies `?b`, transitively |
+  | `(owl-type ?i ?c)`        | rdfs9  | `?i` is a `?c`, following the class hierarchy |
+
+  `owl:equivalentClass` is folded in as subsumption in both directions,
+  which is exactly what it means and is the only OWL term here that is not
+  RDFS. It is included because an ontology that declares two classes
+  equivalent and then finds a query answering for only one of them is
+  reporting a wrong answer, not a narrow one.
+
+  `owl-type` recurses through ITSELF rather than through the asserted
+  `rdf:type` triple. The difference only shows when a type came from
+  somewhere other than an assertion -- `triple-rules` adds `rdfs:domain`
+  and `rdfs:range`, and a class hierarchy that could not be climbed from an
+  inferred type would answer a strict subset without saying so.
+
+  An engine that plans reads per predicate touches four ranges for these:
+  `type`, `subClassOf`, `subPropertyOf`, `equivalentClass`."
+  ([] (hierarchy-rules keyword-vocabulary))
+  ([vocabulary]
+   (let [{:keys [type sub-class-of sub-property-of equivalent-class]} (terms vocabulary)]
+     [;; rdfs11 -- subClassOf is transitive
+      ['(owl-subclass ?a ?b) ['?a sub-class-of '?b]]
+      ['(owl-subclass ?a ?b) ['?a equivalent-class '?b]]
+      ['(owl-subclass ?a ?b) ['?b equivalent-class '?a]]
+      ['(owl-subclass ?a ?b) ['?a sub-class-of '?z] '(owl-subclass ?z ?b)]
+      ;; rdfs5 -- subPropertyOf is transitive
+      ['(owl-subproperty ?a ?b) ['?a sub-property-of '?b]]
+      ['(owl-subproperty ?a ?b) ['?a sub-property-of '?z] '(owl-subproperty ?z ?b)]
+      ;; rdfs9 -- type follows the class hierarchy, from wherever the type came
+      ['(owl-type ?i ?c) ['?i type '?c]]
+      ['(owl-type ?i ?c) '(owl-type ?i ?d) '(owl-subclass ?d ?c)]])))
+
+(defn triple-rules
+  "Generalized-triple entailment. `(owl-triple ?s ?p ?o)` holds for every
+  asserted triple and every one the property-level RDFS/OWL RL rules derive
+  from it; class membership stays on `(owl-type ?i ?c)`, which these rules
+  extend with `rdfs:domain` and `rdfs:range`.
+
+  | rule | source | |
+  |------|--------|--|
+  | base     | | every asserted `[?s ?p ?o]` |
+  | rdfs7    | `rdfs:subPropertyOf` | a sub-property's triples are the super-property's |
+  | rdfs2    | `rdfs:domain` | the subject of a domain-typed property gets that type |
+  | rdfs3    | `rdfs:range`  | so does the object |
+  | prp-trp  | `owl:TransitiveProperty` | the property's own transitive closure |
+  | prp-symp | `owl:SymmetricProperty`  | the property read backwards |
+  | prp-inv  | `owl:inverseOf` | the other property read backwards, both ways |
+
+  **This ruleset reads the whole graph.** Its base case is `[?s ?p ?o]`
+  with the predicate unbound, so no predicate index applies. That is not an
+  implementation shortfall to be optimised away later -- deriving triples
+  whose predicate is a variable is what these entailments MEAN, and the
+  scan is the cost of the meaning. Use `hierarchy-rules` when the question
+  is about classes, which is most of the time.
+
+  Two entailments compose here that cannot compose in a single pass, which
+  is the reason this is a fixpoint and not a materialisation step: the
+  transitive-property rule derives through DERIVED triples, so the inverse
+  of a transitive property closes correctly; and `rdfs:domain` feeds
+  `owl-type`, which then climbs the class hierarchy.
+
+  One deliberate gap: a triple whose predicate is a SUB-PROPERTY of
+  `rdf:type` does not become an `owl-type` fact. Writing that rule needs
+  `rdf:type` itself in a rule HEAD, where this engine takes only logic
+  variables. Declaring a sub-property of `rdf:type` is disallowed in OWL 2
+  DL and vanishingly rare elsewhere, so this is recorded rather than
+  worked around -- an unstated gap is the failure; a stated one is a
+  boundary."
+  ([] (triple-rules keyword-vocabulary))
+  ([vocabulary]
+   (let [{:keys [type domain range inverse-of
+                 transitive-property symmetric-property]} (terms vocabulary)]
+     (into
+      (hierarchy-rules vocabulary)
+      [;; every asserted triple
+       '[(owl-triple ?s ?p ?o) [?s ?p ?o]]
+       ;; rdfs7 -- p rdfs:subPropertyOf q, s p o  =>  s q o
+       ['(owl-triple ?s ?q ?o) '(owl-subproperty ?p ?q) '(owl-triple ?s ?p ?o)]
+       ;; rdfs2 / rdfs3 -- domain and range induce class membership
+       ['(owl-type ?s ?c) ['?p domain '?c] '(owl-triple ?s ?p ?o)]
+       ['(owl-type ?o ?c) ['?p range '?c] '(owl-triple ?s ?p ?o)]
+       ;; prp-trp -- a transitive property closes over the DERIVED triples
+       ['(owl-triple ?x ?p ?z) ['?p type transitive-property]
+        '(owl-triple ?x ?p ?y) '(owl-triple ?y ?p ?z)]
+       ;; prp-symp -- a symmetric property reads backwards
+       ['(owl-triple ?y ?p ?x) ['?p type symmetric-property] '(owl-triple ?x ?p ?y)]
+       ;; prp-inv -- inverseOf, in both directions, because the axiom is
+       ;; symmetric and an ontology states it once
+       ['(owl-triple ?y ?q ?x) ['?p inverse-of '?q] '(owl-triple ?x ?p ?y)]
+       ['(owl-triple ?y ?p ?x) ['?p inverse-of '?q] '(owl-triple ?x ?q ?y)]]))))
+
+;; ════════════════════════════════════════════════════════════════════════
+;; The complete OWL 2 RL/RDF rule table (OWL 2 Profiles, 2nd ed., §4.3,
+;; Tables 4-9), as data.
+;;
+;; `hierarchy-rules` / `triple-rules` above are unchanged and remain the
+;; Datalog rendering of the RDFS core. What follows is the WHOLE RL/RDF
+;; ruleset, one row per rule id of the W3C document, evaluated by `owl.rl`.
+;; It is not rendered as Datalog because the evaluator this library tests
+;; against (kotoba-lang/datalog) takes only logic variables in a rule head
+;; and has no stratified negation: every axiomatic rule (cls-thing, prp-ap,
+;; dt-type1), every rule that concludes `false`, and every rule quantified
+;; over an RDF list would need a per-rule encoding that hides the table's
+;; shape. `owl.rl` reads these rows directly instead, and the rows stay the
+;; single statement of what is implemented.
+;; ════════════════════════════════════════════════════════════════════════
+
+(def namespaces
+  "Prefix -> namespace IRI for every canonical term below."
+  {"rdf"  "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+   "rdfs" "http://www.w3.org/2000/01/rdf-schema#"
+   "owl"  "http://www.w3.org/2002/07/owl#"
+   "xsd"  "http://www.w3.org/2001/XMLSchema#"})
+
+(defn term-iri
+  "The full IRI of a canonical keyword term, e.g. :owl/sameAs."
+  [k]
+  (if-let [ns (get namespaces (namespace k))]
+    (str ns (name k))
+    (throw (ex-info "owl.rules: not a canonical rdf/rdfs/owl/xsd term" {:term k}))))
+
+(def rl-datatypes
+  "The datatypes whose value spaces `owl.rl` decides (dt-type1/2, dt-eq,
+  dt-diff, dt-not-type). Every other datatype of the OWL 2 RL datatype map
+  (xsd:double, xsd:float, owl:real, owl:rational, rdf:PlainLiteral, binary,
+  anyURI, the string subtypes, ...) is left undecided and says so in
+  `rule-status`."
+  [:rdfs/Literal :xsd/string :xsd/boolean :xsd/decimal :xsd/integer
+   :xsd/nonNegativeInteger :xsd/positiveInteger :xsd/nonPositiveInteger
+   :xsd/negativeInteger :xsd/long :xsd/int :xsd/short :xsd/byte
+   :xsd/unsignedLong :xsd/unsignedInt :xsd/unsignedShort :xsd/unsignedByte
+   :xsd/dateTime :xsd/dateTimeStamp])
+
+(def annotation-properties
+  "The annotation properties prp-ap declares."
+  [:rdfs/label :rdfs/comment :rdfs/seeAlso :rdfs/isDefinedBy
+   :owl/deprecated :owl/versionInfo :owl/priorVersion
+   :owl/backwardCompatibleWith :owl/incompatibleWith])
+
+(def rl-terms
+  "Every canonical term the RL rule table reads or writes."
+  (vec
+   (distinct
+    (concat
+     [:rdf/type :rdf/first :rdf/rest :rdf/nil
+      :rdfs/subClassOf :rdfs/subPropertyOf :rdfs/domain :rdfs/range :rdfs/Datatype
+      :owl/sameAs :owl/differentFrom :owl/AllDifferent :owl/members :owl/distinctMembers
+      :owl/FunctionalProperty :owl/InverseFunctionalProperty :owl/IrreflexiveProperty
+      :owl/SymmetricProperty :owl/AsymmetricProperty :owl/TransitiveProperty
+      :owl/propertyChainAxiom :owl/equivalentProperty :owl/propertyDisjointWith
+      :owl/AllDisjointProperties :owl/inverseOf :owl/hasKey
+      :owl/sourceIndividual :owl/assertionProperty :owl/targetIndividual :owl/targetValue
+      :owl/AnnotationProperty :owl/Thing :owl/Nothing :owl/Class
+      :owl/ObjectProperty :owl/DatatypeProperty
+      :owl/intersectionOf :owl/unionOf :owl/complementOf :owl/someValuesFrom
+      :owl/allValuesFrom :owl/onProperty :owl/hasValue :owl/maxCardinality
+      :owl/maxQualifiedCardinality :owl/onClass :owl/oneOf
+      :owl/equivalentClass :owl/disjointWith :owl/AllDisjointClasses]
+     annotation-properties
+     rl-datatypes))))
+
+(def rl-keyword-vocabulary
+  "Canonical term -> itself: a graph written with Clojure keywords."
+  (zipmap rl-terms rl-terms))
+
+(def rl-iri-vocabulary
+  "Canonical term -> full W3C IRI: a graph imported from RDF."
+  (zipmap rl-terms (map term-iri rl-terms)))
+
+(def owl2-rl-rules
+  "One row per rule of OWL 2 Profiles §4.3 Tables 4-9, in table order.
+
+  Keys: `:id` (the W3C rule name), `:table` (4-9), `:status`
+  (`:implemented` / `:partial` / `:omitted`), and either
+
+  - `:if` / `:then` -- triple patterns (`?x` symbols are variables,
+    keywords are canonical terms). `:then :false` marks an inconsistency
+    rule: its match is REPORTED by `owl.rl`, never dropped and never
+    thrown. `:if []` is an axiomatic rule. `:card [?n k]` requires `?n` to be the
+    non-negative integer literal `k`.
+  - `:kind` -- `:list` (quantified over an RDF list read from
+    rdf:first/rdf:rest) or `:datatype` (a value-space decision); `owl.rl`
+    implements these by id, and `:doc` states the rule.
+
+  `:reason` explains every status other than `:implemented`."
+  [;; ── Table 4: equality ───────────────────────────────────────────────
+   {:id :eq-ref :table 4 :status :omitted
+    :doc "x sameAs x for every term of every triple"
+    :reason "Not materialized, and no rule derives a reflexive owl:sameAs either (eq-rep-s/o, eq-trans, prp-fp, ... would otherwise re-derive it for every term they touch). It adds three reflexive owl:sameAs triples per term and nothing else: eq-rep-* over a reflexive sameAs re-derives the triple it started from. Its one observable consequence -- a reflexive sameAs meeting owl:differentFrom -- is checked directly by eq-diff1/2/3 (x differentFrom x, and a repeated AllDifferent member, are reported). The W3C document itself notes this rule is usually omitted."}
+   {:id :eq-sym :table 4 :status :implemented
+    :if '[[?x :owl/sameAs ?y]] :then '[[?y :owl/sameAs ?x]]}
+   {:id :eq-trans :table 4 :status :implemented
+    :if '[[?x :owl/sameAs ?y] [?y :owl/sameAs ?z]] :then '[[?x :owl/sameAs ?z]]}
+   {:id :eq-rep-s :table 4 :status :implemented
+    :if '[[?s :owl/sameAs ?s2] [?s ?p ?o]] :then '[[?s2 ?p ?o]]}
+   {:id :eq-rep-p :table 4 :status :implemented
+    :if '[[?p :owl/sameAs ?p2] [?s ?p ?o]] :then '[[?s ?p2 ?o]]}
+   {:id :eq-rep-o :table 4 :status :implemented
+    :if '[[?o :owl/sameAs ?o2] [?s ?p ?o]] :then '[[?s ?p ?o2]]}
+   {:id :eq-diff1 :table 4 :status :implemented
+    :if '[[?x :owl/sameAs ?y] [?x :owl/differentFrom ?y]] :then :false}
+   {:id :eq-diff2 :table 4 :status :implemented :kind :list
+    :doc "x type AllDifferent, x members (y1..yn), yi sameAs yj (i != j) => false; a member listed twice is the same violation"}
+   {:id :eq-diff3 :table 4 :status :implemented :kind :list
+    :doc "as eq-diff2, through owl:distinctMembers"}
+   ;; ── Table 5: properties ─────────────────────────────────────────────
+   {:id :prp-ap :table 5 :status :implemented
+    :if [] :then (mapv (fn [ap] [ap :rdf/type :owl/AnnotationProperty]) annotation-properties)}
+   {:id :prp-dom :table 5 :status :implemented
+    :if '[[?p :rdfs/domain ?c] [?x ?p ?y]] :then '[[?x :rdf/type ?c]]}
+   {:id :prp-rng :table 5 :status :implemented
+    :if '[[?p :rdfs/range ?c] [?x ?p ?y]] :then '[[?y :rdf/type ?c]]}
+   {:id :prp-fp :table 5 :status :implemented
+    :if '[[?p :rdf/type :owl/FunctionalProperty] [?x ?p ?y1] [?x ?p ?y2]]
+    :then '[[?y1 :owl/sameAs ?y2]]}
+   {:id :prp-ifp :table 5 :status :implemented
+    :if '[[?p :rdf/type :owl/InverseFunctionalProperty] [?x1 ?p ?y] [?x2 ?p ?y]]
+    :then '[[?x1 :owl/sameAs ?x2]]}
+   {:id :prp-irp :table 5 :status :implemented
+    :if '[[?p :rdf/type :owl/IrreflexiveProperty] [?x ?p ?x]] :then :false}
+   {:id :prp-symp :table 5 :status :implemented
+    :if '[[?p :rdf/type :owl/SymmetricProperty] [?x ?p ?y]] :then '[[?y ?p ?x]]}
+   {:id :prp-asyp :table 5 :status :implemented
+    :if '[[?p :rdf/type :owl/AsymmetricProperty] [?x ?p ?y] [?y ?p ?x]] :then :false}
+   {:id :prp-trp :table 5 :status :implemented
+    :if '[[?p :rdf/type :owl/TransitiveProperty] [?x ?p ?y] [?y ?p ?z]] :then '[[?x ?p ?z]]}
+   {:id :prp-spo1 :table 5 :status :implemented
+    :if '[[?p1 :rdfs/subPropertyOf ?p2] [?x ?p1 ?y]] :then '[[?x ?p2 ?y]]}
+   {:id :prp-spo2 :table 5 :status :implemented :kind :list
+    :doc "p propertyChainAxiom (p1..pn), u1 p1 u2 ... un pn un+1 => u1 p un+1"}
+   {:id :prp-eqp1 :table 5 :status :implemented
+    :if '[[?p1 :owl/equivalentProperty ?p2] [?x ?p1 ?y]] :then '[[?x ?p2 ?y]]}
+   {:id :prp-eqp2 :table 5 :status :implemented
+    :if '[[?p1 :owl/equivalentProperty ?p2] [?x ?p2 ?y]] :then '[[?x ?p1 ?y]]}
+   {:id :prp-pdw :table 5 :status :implemented
+    :if '[[?p1 :owl/propertyDisjointWith ?p2] [?x ?p1 ?y] [?x ?p2 ?y]] :then :false}
+   {:id :prp-adp :table 5 :status :implemented :kind :list
+    :doc "x type AllDisjointProperties, x members (p1..pn), u pi v, u pj v (i != j) => false"}
+   {:id :prp-inv1 :table 5 :status :implemented
+    :if '[[?p1 :owl/inverseOf ?p2] [?x ?p1 ?y]] :then '[[?y ?p2 ?x]]}
+   {:id :prp-inv2 :table 5 :status :implemented
+    :if '[[?p1 :owl/inverseOf ?p2] [?x ?p2 ?y]] :then '[[?y ?p1 ?x]]}
+   {:id :prp-key :table 5 :status :implemented :kind :list
+    :doc "c hasKey (p1..pn), x and y typed c sharing a value zi for every pi => x sameAs y"}
+   {:id :prp-npa1 :table 5 :status :implemented
+    :if '[[?x :owl/sourceIndividual ?i1] [?x :owl/assertionProperty ?p]
+          [?x :owl/targetIndividual ?i2] [?i1 ?p ?i2]] :then :false}
+   {:id :prp-npa2 :table 5 :status :implemented
+    :if '[[?x :owl/sourceIndividual ?i] [?x :owl/assertionProperty ?p]
+          [?x :owl/targetValue ?lt] [?i ?p ?lt]] :then :false}
+   ;; ── Table 6: classes ────────────────────────────────────────────────
+   {:id :cls-thing :table 6 :status :implemented :if [] :then [[:owl/Thing :rdf/type :owl/Class]]}
+   {:id :cls-nothing1 :table 6 :status :implemented :if [] :then [[:owl/Nothing :rdf/type :owl/Class]]}
+   {:id :cls-nothing2 :table 6 :status :implemented
+    :if '[[?x :rdf/type :owl/Nothing]] :then :false}
+   {:id :cls-int1 :table 6 :status :implemented :kind :list
+    :doc "c intersectionOf (c1..cn), y type ci for every i => y type c"}
+   {:id :cls-int2 :table 6 :status :implemented :kind :list
+    :doc "c intersectionOf (c1..cn), y type c => y type ci for every i"}
+   {:id :cls-uni :table 6 :status :implemented :kind :list
+    :doc "c unionOf (c1..cn), y type ci for some i => y type c"}
+   {:id :cls-com :table 6 :status :implemented
+    :if '[[?c1 :owl/complementOf ?c2] [?x :rdf/type ?c1] [?x :rdf/type ?c2]] :then :false}
+   {:id :cls-svf1 :table 6 :status :implemented
+    :if '[[?x :owl/someValuesFrom ?y] [?x :owl/onProperty ?p] [?u ?p ?v] [?v :rdf/type ?y]]
+    :then '[[?u :rdf/type ?x]]}
+   {:id :cls-svf2 :table 6 :status :implemented
+    :if '[[?x :owl/someValuesFrom :owl/Thing] [?x :owl/onProperty ?p] [?u ?p ?v]]
+    :then '[[?u :rdf/type ?x]]}
+   {:id :cls-avf :table 6 :status :implemented
+    :if '[[?x :owl/allValuesFrom ?y] [?x :owl/onProperty ?p] [?u :rdf/type ?x] [?u ?p ?v]]
+    :then '[[?v :rdf/type ?y]]}
+   {:id :cls-hv1 :table 6 :status :implemented
+    :if '[[?x :owl/hasValue ?y] [?x :owl/onProperty ?p] [?u :rdf/type ?x]]
+    :then '[[?u ?p ?y]]}
+   {:id :cls-hv2 :table 6 :status :implemented
+    :if '[[?x :owl/hasValue ?y] [?x :owl/onProperty ?p] [?u ?p ?y]]
+    :then '[[?u :rdf/type ?x]]}
+   {:id :cls-maxc1 :table 6 :status :implemented :card '[?n 0]
+    :if '[[?x :owl/maxCardinality ?n] [?x :owl/onProperty ?p] [?u :rdf/type ?x] [?u ?p ?y]]
+    :then :false}
+   {:id :cls-maxc2 :table 6 :status :implemented :card '[?n 1]
+    :if '[[?x :owl/maxCardinality ?n] [?x :owl/onProperty ?p] [?u :rdf/type ?x]
+          [?u ?p ?y1] [?u ?p ?y2]]
+    :then '[[?y1 :owl/sameAs ?y2]]}
+   {:id :cls-maxqc1 :table 6 :status :implemented :card '[?n 0]
+    :if '[[?x :owl/maxQualifiedCardinality ?n] [?x :owl/onProperty ?p] [?x :owl/onClass ?c]
+          [?u :rdf/type ?x] [?u ?p ?y] [?y :rdf/type ?c]]
+    :then :false}
+   {:id :cls-maxqc2 :table 6 :status :implemented :card '[?n 0]
+    :if '[[?x :owl/maxQualifiedCardinality ?n] [?x :owl/onProperty ?p] [?x :owl/onClass :owl/Thing]
+          [?u :rdf/type ?x] [?u ?p ?y]]
+    :then :false}
+   {:id :cls-maxqc3 :table 6 :status :implemented :card '[?n 1]
+    :if '[[?x :owl/maxQualifiedCardinality ?n] [?x :owl/onProperty ?p] [?x :owl/onClass ?c]
+          [?u :rdf/type ?x] [?u ?p ?y1] [?y1 :rdf/type ?c] [?u ?p ?y2] [?y2 :rdf/type ?c]]
+    :then '[[?y1 :owl/sameAs ?y2]]}
+   {:id :cls-maxqc4 :table 6 :status :implemented :card '[?n 1]
+    :if '[[?x :owl/maxQualifiedCardinality ?n] [?x :owl/onProperty ?p] [?x :owl/onClass :owl/Thing]
+          [?u :rdf/type ?x] [?u ?p ?y1] [?u ?p ?y2]]
+    :then '[[?y1 :owl/sameAs ?y2]]}
+   {:id :cls-oo :table 6 :status :implemented :kind :list
+    :doc "c oneOf (y1..yn) => yi type c for every i"}
+   ;; ── Table 7: class axioms ───────────────────────────────────────────
+   {:id :cax-sco :table 7 :status :implemented
+    :if '[[?c1 :rdfs/subClassOf ?c2] [?x :rdf/type ?c1]] :then '[[?x :rdf/type ?c2]]}
+   {:id :cax-eqc1 :table 7 :status :implemented
+    :if '[[?c1 :owl/equivalentClass ?c2] [?x :rdf/type ?c1]] :then '[[?x :rdf/type ?c2]]}
+   {:id :cax-eqc2 :table 7 :status :implemented
+    :if '[[?c1 :owl/equivalentClass ?c2] [?x :rdf/type ?c2]] :then '[[?x :rdf/type ?c1]]}
+   {:id :cax-dw :table 7 :status :implemented
+    :if '[[?c1 :owl/disjointWith ?c2] [?x :rdf/type ?c1] [?x :rdf/type ?c2]] :then :false}
+   {:id :cax-adc :table 7 :status :implemented :kind :list
+    :doc "x type AllDisjointClasses, x members (c1..cn), z type ci, z type cj (i != j) => false"}
+   ;; ── Table 8: datatypes ──────────────────────────────────────────────
+   {:id :dt-type1 :table 8 :status :partial :kind :datatype
+    :doc "DT type rdfs:Datatype for every supported datatype DT"
+    :reason "Emitted for the datatypes in `rl-datatypes` only; the rest of the OWL 2 RL datatype map (xsd:double/float, owl:real/rational, rdf:PlainLiteral, binary, anyURI, string subtypes, ...) is not decided."}
+   {:id :dt-type2 :table 8 :status :partial :kind :datatype
+    :doc "lt type DT for every literal lt in the graph and every supported DT whose value space contains lt's value"
+    :reason "Decided for `rl-datatypes`. A literal is a map {:literal lexical :datatype DT} (DT a canonical keyword or its IRI; a :language key makes it an rdf:langString and it is left undecided) or a native integer/decimal/boolean; a bare string is a term, never a literal."}
+   {:id :dt-eq :table 8 :status :partial :kind :datatype
+    :doc "lt1 sameAs lt2 for literals with the same data value (e.g. \"01\"^^xsd:integer and 1)"
+    :reason "Same datatype scope as dt-type2; A dateTime with a timezone and one without are different data values (an XSD 1.1 dateTime value carries its timezone offset, so the two are never identical), so they are never equated and an owl:sameAs between them is dt-diff."}
+   {:id :dt-diff :table 8 :status :partial :kind :datatype
+    :doc "lt1 differentFrom lt2 for literals with different data values"
+    :reason "Not materialized -- it is one owl:differentFrom triple per PAIR of literals in the graph. Its only consequence in RL is eq-diff1, so an owl:sameAs between two decided literals with different values is reported as the inconsistency :dt-diff instead."}
+   {:id :dt-not-type :table 8 :status :partial :kind :datatype
+    :doc "lt type DT where lt's value is not in DT's value space => false"
+    :reason "Decided for `rl-datatypes` (an ill-typed lexical form, e.g. \"abc\"^^xsd:integer, or a range/type assertion outside the value space). Undecided datatypes are never reported."}
+   ;; ── Table 9: schema vocabulary ──────────────────────────────────────
+   {:id :scm-cls :table 9 :status :implemented
+    :if '[[?c :rdf/type :owl/Class]]
+    :then '[[?c :rdfs/subClassOf ?c] [?c :owl/equivalentClass ?c]
+            [?c :rdfs/subClassOf :owl/Thing] [:owl/Nothing :rdfs/subClassOf ?c]]}
+   {:id :scm-sco :table 9 :status :implemented
+    :if '[[?c1 :rdfs/subClassOf ?c2] [?c2 :rdfs/subClassOf ?c3]] :then '[[?c1 :rdfs/subClassOf ?c3]]}
+   {:id :scm-eqc1 :table 9 :status :implemented
+    :if '[[?c1 :owl/equivalentClass ?c2]]
+    :then '[[?c1 :rdfs/subClassOf ?c2] [?c2 :rdfs/subClassOf ?c1]]}
+   {:id :scm-eqc2 :table 9 :status :implemented
+    :if '[[?c1 :rdfs/subClassOf ?c2] [?c2 :rdfs/subClassOf ?c1]] :then '[[?c1 :owl/equivalentClass ?c2]]}
+   {:id :scm-op :table 9 :status :implemented
+    :if '[[?p :rdf/type :owl/ObjectProperty]]
+    :then '[[?p :rdfs/subPropertyOf ?p] [?p :owl/equivalentProperty ?p]]}
+   {:id :scm-dp :table 9 :status :implemented
+    :if '[[?p :rdf/type :owl/DatatypeProperty]]
+    :then '[[?p :rdfs/subPropertyOf ?p] [?p :owl/equivalentProperty ?p]]}
+   {:id :scm-spo :table 9 :status :implemented
+    :if '[[?p1 :rdfs/subPropertyOf ?p2] [?p2 :rdfs/subPropertyOf ?p3]] :then '[[?p1 :rdfs/subPropertyOf ?p3]]}
+   {:id :scm-eqp1 :table 9 :status :implemented
+    :if '[[?p1 :owl/equivalentProperty ?p2]]
+    :then '[[?p1 :rdfs/subPropertyOf ?p2] [?p2 :rdfs/subPropertyOf ?p1]]}
+   {:id :scm-eqp2 :table 9 :status :implemented
+    :if '[[?p1 :rdfs/subPropertyOf ?p2] [?p2 :rdfs/subPropertyOf ?p1]] :then '[[?p1 :owl/equivalentProperty ?p2]]}
+   {:id :scm-dom1 :table 9 :status :implemented
+    :if '[[?p :rdfs/domain ?c1] [?c1 :rdfs/subClassOf ?c2]] :then '[[?p :rdfs/domain ?c2]]}
+   {:id :scm-dom2 :table 9 :status :implemented
+    :if '[[?p2 :rdfs/domain ?c] [?p1 :rdfs/subPropertyOf ?p2]] :then '[[?p1 :rdfs/domain ?c]]}
+   {:id :scm-rng1 :table 9 :status :implemented
+    :if '[[?p :rdfs/range ?c1] [?c1 :rdfs/subClassOf ?c2]] :then '[[?p :rdfs/range ?c2]]}
+   {:id :scm-rng2 :table 9 :status :implemented
+    :if '[[?p2 :rdfs/range ?c] [?p1 :rdfs/subPropertyOf ?p2]] :then '[[?p1 :rdfs/range ?c]]}
+   {:id :scm-hv :table 9 :status :implemented
+    :if '[[?c1 :owl/hasValue ?i] [?c1 :owl/onProperty ?p1] [?c2 :owl/hasValue ?i]
+          [?c2 :owl/onProperty ?p2] [?p1 :rdfs/subPropertyOf ?p2]]
+    :then '[[?c1 :rdfs/subClassOf ?c2]]}
+   {:id :scm-svf1 :table 9 :status :implemented
+    :if '[[?c1 :owl/someValuesFrom ?y1] [?c1 :owl/onProperty ?p] [?c2 :owl/someValuesFrom ?y2]
+          [?c2 :owl/onProperty ?p] [?y1 :rdfs/subClassOf ?y2]]
+    :then '[[?c1 :rdfs/subClassOf ?c2]]}
+   {:id :scm-svf2 :table 9 :status :implemented
+    :if '[[?c1 :owl/someValuesFrom ?y] [?c1 :owl/onProperty ?p1] [?c2 :owl/someValuesFrom ?y]
+          [?c2 :owl/onProperty ?p2] [?p1 :rdfs/subPropertyOf ?p2]]
+    :then '[[?c1 :rdfs/subClassOf ?c2]]}
+   {:id :scm-avf1 :table 9 :status :implemented
+    :if '[[?c1 :owl/allValuesFrom ?y1] [?c1 :owl/onProperty ?p] [?c2 :owl/allValuesFrom ?y2]
+          [?c2 :owl/onProperty ?p] [?y1 :rdfs/subClassOf ?y2]]
+    :then '[[?c1 :rdfs/subClassOf ?c2]]}
+   {:id :scm-avf2 :table 9 :status :implemented
+    :if '[[?c1 :owl/allValuesFrom ?y] [?c1 :owl/onProperty ?p1] [?c2 :owl/allValuesFrom ?y]
+          [?c2 :owl/onProperty ?p2] [?p1 :rdfs/subPropertyOf ?p2]]
+    :then '[[?c2 :rdfs/subClassOf ?c1]]}
+   {:id :scm-int :table 9 :status :implemented :kind :list
+    :doc "c intersectionOf (c1..cn) => c subClassOf ci for every i"}
+   {:id :scm-uni :table 9 :status :implemented :kind :list
+    :doc "c unionOf (c1..cn) => ci subClassOf c for every i"}])
+
+(def rule-status
+  "rule id -> {:status :table :reason} for every rule of Tables 4-9."
+  (into {} (map (fn [r] [(:id r) (select-keys r [:status :table :reason])]) owl2-rl-rules)))
+
+(def supported-rules
+  "Rule ids `owl.rl` evaluates (status :implemented or :partial). A caller
+  that needs a rule outside this set must refuse the axiom, not ignore it."
+  (set (keep (fn [r] (when (not= :omitted (:status r)) (:id r))) owl2-rl-rules)))
+
+(def inconsistency-rules
+  "Rule ids whose conclusion is `false`."
+  (conj (set (keep (fn [r] (when (= :false (:then r)) (:id r))) owl2-rl-rules))
+        :eq-diff2 :eq-diff3 :prp-adp :cax-adc :dt-diff :dt-not-type))
+
+(def vocabulary-status
+  "Full IRI -> what `owl.rl` does with it.
+
+  `:supported`   -- a rule of `supported-rules` gives it its RL semantics.
+  `:inert`       -- declaration / annotation / ontology-header vocabulary
+                    with no entailment in OWL 2 RL beyond prp-ap / scm-cls:
+                    safe to carry, nothing is lost by it.
+  `{:partial r}` -- honoured only in the form RL admits (reason `r`).
+  `{:unsupported r}` -- no OWL 2 RL rule exists for it; a graph that USES it
+                    is not reasoned about completely. Refuse, do not ignore.
+
+  An IRI absent from this map is not RDF/RDFS/OWL vocabulary this library
+  knows at all; treat it the same as :unsupported if it is in those
+  namespaces."
+  (merge
+   (zipmap (map term-iri rl-terms) (repeat :supported))
+   {(term-iri :owl/maxCardinality)
+    {:partial "cls-maxc1/2: only the values 0 and 1 have RL rules; any other value derives nothing"}
+    (term-iri :owl/maxQualifiedCardinality)
+    {:partial "cls-maxqc1-4: only the values 0 and 1 have RL rules; any other value derives nothing"}}
+   (zipmap (map term-iri [:owl/Ontology :owl/imports :owl/versionIRI :owl/NamedIndividual
+                          :owl/Annotation :owl/annotatedSource :owl/annotatedProperty
+                          :owl/annotatedTarget :owl/Axiom :owl/OntologyProperty
+                          :owl/Restriction :rdfs/Class :rdf/Property :rdf/List
+                          :owl/DeprecatedClass :owl/DeprecatedProperty
+                          :owl/NegativePropertyAssertion])
+           (repeat :inert))
+   (into {}
+         (map (fn [[k r]] [(term-iri k) {:unsupported r}]))
+         {:owl/minCardinality "no RL rule (existential; outside the RL profile)"
+          :owl/cardinality "no RL rule (existential; outside the RL profile)"
+          :owl/minQualifiedCardinality "no RL rule (existential; outside the RL profile)"
+          :owl/qualifiedCardinality "no RL rule (existential; outside the RL profile)"
+          :owl/hasSelf "no RL rule (ObjectHasSelf is not in OWL 2 RL)"
+          :owl/ReflexiveProperty "no RL rule (ReflexiveObjectProperty is not in OWL 2 RL)"
+          :owl/disjointUnionOf "no RL rule (DisjointUnion is not in OWL 2 RL)"
+          :owl/datatypeComplementOf "no RL rule"
+          :owl/onDatatype "no RL rule (datatype restrictions are not in OWL 2 RL)"
+          :owl/withRestrictions "no RL rule (datatype restrictions are not in OWL 2 RL)"
+          :owl/onProperties "no RL rule (n-ary data ranges are not in OWL 2 RL)"
+          :owl/onDataRange "no RL rule"
+          :owl/bottomObjectProperty "no RL rule"
+          :owl/topObjectProperty "no RL rule"
+          :owl/bottomDataProperty "no RL rule"
+          :owl/topDataProperty "no RL rule"})))
+
+(def supported-vocabulary
+  "The owl:/rdf:/rdfs:/xsd: IRIs whose OWL 2 RL semantics `owl.rl`
+  implements (fully or in the RL-admitted form), as a set."
+  (set (keep (fn [[iri s]] (when (or (= s :supported) (:partial s)) iri)) vocabulary-status)))
+
+(def triple-rules-coverage
+  "What the LEGACY Datalog rulesets (`hierarchy-rules` / `triple-rules`)
+  implement, in the same terms, so a caller of those can refuse the rest."
+  {:rules #{:rdfs11 :rdfs5 :rdfs9 :rdfs7 :rdfs2 :rdfs3 :prp-trp :prp-symp :prp-inv1 :prp-inv2
+            :cax-sco :cax-eqc1 :cax-eqc2 :prp-spo1 :prp-dom :prp-rng}
+   :vocabulary (set (map term-iri [:rdf/type :rdfs/subClassOf :rdfs/subPropertyOf :rdfs/domain
+                                   :rdfs/range :owl/equivalentClass :owl/inverseOf
+                                   :owl/TransitiveProperty :owl/SymmetricProperty]))
+   :emits-schema-closure? false})

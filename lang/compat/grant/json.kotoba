@@ -1,0 +1,379 @@
+(ns grant.json
+  "JSON, narrowly, because the two cloud authorities answer in it.
+
+  `grant.cloud` judges responses; something has to turn the bytes into values
+  first. This plane is dependency-minimal on purpose — `deps.edn` carries
+  `security` and `abi` and nothing else, and it says why: a decision plane
+  behind a third-party parser is a decision plane behind whatever that parser
+  decides. Adding a JSON library to read one alias entry would also enlarge the
+  TCB `aiueos`'s inventory pins on the other side of the split. So this follows
+  the precedent `grant.cloud` set with its inlined base32/CID decoder: the one
+  shape that is actually needed, and a refusal for everything else.
+
+  ## It refuses rather than guesses
+
+  Every hazard below is a place a lenient parser silently produces a value,
+  and a value is what a decision gets made on:
+
+  - **duplicate object keys** — two answers to the same question, and which
+    one survives is the parser's opinion. Refused;
+  - **trailing bytes** — `{\"ok\":true} garbage` is not one document, and
+    reading the prefix is agreeing with an attacker about where it ended;
+  - **`NaN`, `Infinity`, `+1`, `.5`, `01`** — none are JSON. They are refused
+    by grammar, not stripped;
+  - **an integer past the range this runtime represents exactly** — refused as
+    `:number-out-of-range` rather than rounded, because a rounded identifier
+    still compares equal to nothing and unequal to everything;
+  - **depth and input ceilings** — a bounded document cannot make an unbounded
+    parser spend this machine's stack or memory.
+
+  ## Failure is a value, not an exception
+
+  `read-json` returns the parsed value, or a map carrying
+  `:grant.json/error`. A parsed JSON object has **string** keys, so it can
+  never contain that keyword: `failed?` is unambiguous rather than a
+  convention. This matters for the same reason
+  `aiueos.provider.cloud`'s faults are a different key from
+  `grant.cloud`'s deny reasons — \"there was nothing to decide about\" and
+  \"the decision was no\" must not arrive looking alike.
+
+  Object keys stay strings. Interning them as keywords would let a remote
+  authority decide what keywords this machine holds, and would silently merge
+  `\"a\"` with `:a`."
+  (:require [kotoba.lang.text :as str]))
+
+(def default-limits
+  "`:max-input-chars` is well under `aiueos.provider.cloud`'s body ceiling: a
+  JSON document from either authority is an alias entry or a completion, not a
+  block. `:max-depth` bounds nesting, which is the recursion this parser does."
+  {:max-input-chars 1048576
+   :max-depth 64})
+
+(def errors
+  "Every reason this namespace can produce. Declared so a caller can enumerate
+  them, and so a new one cannot arrive undeclared."
+  #{:input-not-a-string :input-too-large
+    :unexpected-end :unexpected-character :trailing-bytes
+    :depth-exceeded :duplicate-key
+    :number-malformed :number-out-of-range :number-not-finite
+    :string-unterminated :string-control-character :string-bad-escape
+    :object-key-not-a-string :value-not-encodable :key-not-encodable})
+
+(defn failed?
+  "Whether VALUE is this namespace's failure value rather than a parsed
+  document. Safe on any value: a parsed JSON object has string keys only."
+  [value]
+  (boolean (and (map? value) (contains? value :grant.json/error))))
+
+(defn error-of
+  "The reason inside a failure value, or nil."
+  [value]
+  (when (failed? value) (:grant.json/error value)))
+
+(defn- fail [reason at]
+  {:grant.json/error reason :grant.json/at at})
+
+;; ── reading ────────────────────────────────────────────────────────────────
+
+(defn- ch
+  "The one-character string at I, or nil past the end. A string rather than a
+  character because `.charAt` returns different things on the two runtimes and
+  this namespace is `.cljc`."
+  [s i]
+  (when (< i (count s)) (subs s i (inc i))))
+
+(defn- code-at [s i]
+  )
+
+(def ^:private whitespace #{" " "\t" "\n" "\r"})
+
+(defn- skip-ws [s i]
+  (loop [i i]
+    (if (and (< i (count s)) (contains? whitespace (subs s i (inc i))))
+      (recur (inc i))
+      i)))
+
+(defn- literal-at? [s i word]
+  (and (<= (+ i (count word)) (count s))
+       (= word (subs s i (+ i (count word))))))
+
+(defn- from-code [code]
+  )
+
+(defn- parse-hex [text]
+  )
+
+(defn- parse-string
+  "S[I] is the opening quote. Returns the decoded string and the index after
+  the closing quote."
+  [s i]
+  (loop [i (inc i), out []]
+    (let [c (ch s i)]
+      (cond
+        (nil? c) (fail :string-unterminated i)
+        (= c "\"") {:grant.json/v (str/join out) :grant.json/i (inc i)}
+        (= c "\\")
+        (let [e (ch s (inc i))]
+          (case e
+            "\"" (recur (+ i 2) (conj out "\""))
+            "\\" (recur (+ i 2) (conj out "\\"))
+            "/" (recur (+ i 2) (conj out "/"))
+            "b" (recur (+ i 2) (conj out "\b"))
+            "f" (recur (+ i 2) (conj out "\f"))
+            "n" (recur (+ i 2) (conj out "\n"))
+            "r" (recur (+ i 2) (conj out "\r"))
+            "t" (recur (+ i 2) (conj out "\t"))
+            "u" (let [hex (when (<= (+ i 6) (count s)) (subs s (+ i 2) (+ i 6)))]
+                  (if (and hex (re-matches #"[0-9a-fA-F]{4}" hex))
+                    (recur (+ i 6) (conj out (from-code (parse-hex hex))))
+                    (fail :string-bad-escape i)))
+            (fail :string-bad-escape i)))
+        ;; A raw control character inside a string is not JSON. Carrying it
+        ;; through would put a newline or a NUL into a value that later gets
+        ;; compared, logged or joined.
+        (< (code-at s i) 0x20) (fail :string-control-character i)
+        :else (recur (inc i) (conj out c))))))
+
+(def ^:private number-chars (set (map str "-+0123456789.eE")))
+
+(def ^:private number-grammar
+  ;; RFC 8259 §6, exactly. No leading `+`, no leading zeros, no bare `.5` or
+  ;; `5.`, and no `NaN`/`Infinity` — those are not numbers here, they are
+  ;; unknown literals.
+  #"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?")
+
+(defn- parse-integer [text]
+  )
+
+(defn- parse-real [text]
+  (let [n ]
+    ;; `1e999` parses without complaint and is infinite. An infinity that came
+    ;; from a document is a number the document did not contain.
+    (if 
+      n
+      ::not-finite)))
+
+(defn- parse-number [s i]
+  (let [end (loop [j i]
+              (if (and (< j (count s)) (contains? number-chars (subs s j (inc j))))
+                (recur (inc j))
+                j))
+        text (subs s i end)]
+    (cond
+      (not (re-matches number-grammar text)) (fail :number-malformed i)
+
+      (re-find #"[.eE]" text)
+      (let [n (parse-real text)]
+        (if (= ::not-finite n)
+          (fail :number-not-finite i)
+          {:grant.json/v n :grant.json/i end}))
+
+      :else
+      (let [n (parse-integer text)]
+        (if (= ::out-of-range n)
+          (fail :number-out-of-range i)
+          {:grant.json/v n :grant.json/i end})))))
+
+(declare parse-value)
+
+(defn- parse-array [s i limits depth]
+  (if (> depth (:max-depth limits))
+    (fail :depth-exceeded i)
+    (let [start (skip-ws s (inc i))]
+      (if (= "]" (ch s start))
+        {:grant.json/v [] :grant.json/i (inc start)}
+        (loop [j start, out []]
+          (let [r (parse-value s j limits depth)]
+            (if (failed? r)
+              r
+              (let [k (skip-ws s (:grant.json/i r))
+                    c (ch s k)
+                    out (conj out (:grant.json/v r))]
+                (cond
+                  (= c ",") (recur (skip-ws s (inc k)) out)
+                  (= c "]") {:grant.json/v out :grant.json/i (inc k)}
+                  (nil? c) (fail :unexpected-end k)
+                  :else (fail :unexpected-character k))))))))))
+
+(defn- parse-object [s i limits depth]
+  (if (> depth (:max-depth limits))
+    (fail :depth-exceeded i)
+    (let [start (skip-ws s (inc i))]
+      (if (= "}" (ch s start))
+        {:grant.json/v {} :grant.json/i (inc start)}
+        (loop [j start, out {}]
+          (let [j (skip-ws s j)]
+            (if-not (= "\"" (ch s j))
+              (fail :object-key-not-a-string j)
+              (let [k (parse-string s j)]
+                (if (failed? k)
+                  k
+                  (let [key (:grant.json/v k)
+                        colon (skip-ws s (:grant.json/i k))]
+                    (cond
+                      (contains? out key)
+                      ;; Two answers to the same question. Which one a lenient
+                      ;; parser keeps is its opinion, and a decision would be
+                      ;; made on it.
+                      (fail :duplicate-key j)
+
+                      (not= ":" (ch s colon)) (fail :unexpected-character colon)
+
+                      :else
+                      (let [r (parse-value s (inc colon) limits depth)]
+                        (if (failed? r)
+                          r
+                          (let [after (skip-ws s (:grant.json/i r))
+                                c (ch s after)
+                                out (assoc out key (:grant.json/v r))]
+                            (cond
+                              (= c ",") (recur (inc after) out)
+                              (= c "}") {:grant.json/v out :grant.json/i (inc after)}
+                              (nil? c) (fail :unexpected-end after)
+                              :else (fail :unexpected-character after))))))))))))))))
+
+(defn- parse-value [s i limits depth]
+  (let [i (skip-ws s i)
+        c (ch s i)]
+    (cond
+      (nil? c) (fail :unexpected-end i)
+      (= c "{") (parse-object s i limits (inc depth))
+      (= c "[") (parse-array s i limits (inc depth))
+      (= c "\"") (parse-string s i)
+      (literal-at? s i "true") {:grant.json/v true :grant.json/i (+ i 4)}
+      (literal-at? s i "false") {:grant.json/v false :grant.json/i (+ i 5)}
+      (literal-at? s i "null") {:grant.json/v nil :grant.json/i (+ i 4)}
+      (contains? number-chars c) (parse-number s i)
+      :else (fail :unexpected-character i))))
+
+(defn read-json
+  "Parse TEXT. Returns the value, or a failure value `failed?` recognises.
+
+  Objects become maps with string keys, arrays become vectors, `null` becomes
+  nil. A document that does not end where its top-level value ends is refused:
+  reading the prefix would be agreeing with whoever sent the rest."
+  ([text] (read-json text {}))
+  ([text opts]
+   (let [limits (merge default-limits opts)]
+     (cond
+       (not (string? text)) (fail :input-not-a-string 0)
+
+       (> (count text) (:max-input-chars limits)) (fail :input-too-large 0)
+
+       :else
+       (let [r (parse-value text 0 limits 0)]
+         (if (failed? r)
+           r
+           (let [end (skip-ws text (:grant.json/i r))]
+             (if (< end (count text))
+               (fail :trailing-bytes end)
+               (:grant.json/v r)))))))))
+
+;; ── writing ────────────────────────────────────────────────────────────────
+
+(def ^:private hex-digits "0123456789abcdef")
+
+(defn- hex4 [code]
+  (str/join (map (fn [shift]
+                   (nth hex-digits (bit-and (bit-shift-right code shift) 0xf)))
+                 [12 8 4 0])))
+
+(defn- escape [s]
+  (str/join
+   (map (fn [i]
+          (let [c (subs s i (inc i))
+                code (code-at s i)]
+            (cond
+              (= c "\"") "\\\""
+              (= c "\\") "\\\\"
+              (= c "\n") "\\n"
+              (= c "\r") "\\r"
+              (= c "\t") "\\t"
+              (= c "\b") "\\b"
+              (= c "\f") "\\f"
+              (< code 0x20) (str "\\u" (hex4 code))
+              :else c)))
+        (range (count s)))))
+
+(defn- integer-encodable?
+  "Whether V is an integer this runtime -- and therefore `read-json` -- can
+  carry exactly. Writing one it could not read back would make the two halves
+  of this namespace disagree about the same document."
+  [v]
+  (and (integer? v)
+       ))
+
+(defn- integer-string [v]
+  )
+
+(defn- finite-real? [v]
+  (and (float? v)
+       ))
+
+(defn- write-number [v]
+  (cond
+    (integer-encodable? v) (integer-string v)
+    (integer? v) (fail :number-out-of-range 0)
+    (finite-real? v) (str v)
+    (float? v) (fail :number-not-finite 0)
+    ;; A ratio is a number with no JSON meaning. Rendering 1/3 as 0.333... is
+    ;; a decision about precision that nothing here is entitled to make.
+    :else (fail :value-not-encodable 0)))
+
+(declare write-value)
+
+(defn- write-seq [values limits depth]
+  (let [encoded (map #(write-value % limits depth) values)]
+    (if-let [bad (first (filter failed? encoded))]
+      bad
+      (str "[" (str/join "," encoded) "]"))))
+
+(defn- key-name [k]
+  (cond (string? k) k
+        (keyword? k) (name k)
+        :else ::bad))
+
+(defn- write-map [m limits depth]
+  (let [named (map (fn [[k v]] [(key-name k) v]) m)]
+    (cond
+      (some #(= ::bad (first %)) named) (fail :key-not-encodable 0)
+
+      ;; `:a` and `"a"` in one map would produce a document with a duplicate
+      ;; key, which `read-json` refuses. Refuse to write what we refuse to read.
+      (not= (count named) (count (set (map first named)))) (fail :duplicate-key 0)
+
+      :else
+      ;; Sorted, so the same value always produces the same bytes: a receipt
+      ;; that changes shape between runs is not evidence of anything.
+      (let [pairs (sort-by first named)
+            encoded (map (fn [[k v]] [k (write-value v limits depth)]) pairs)]
+        (if-let [bad (first (filter (comp failed? second) encoded))]
+          (second bad)
+          (str "{"
+               (str/join "," (map (fn [[k v]] (str "\"" (escape k) "\":" v)) encoded))
+               "}"))))))
+
+(defn- write-value [v limits depth]
+  (cond
+    (> depth (:max-depth limits)) (fail :depth-exceeded 0)
+    (nil? v) "null"
+    (true? v) "true"
+    (false? v) "false"
+    (string? v) (str "\"" (escape v) "\"")
+    (keyword? v) (str "\"" (escape (name v)) "\"")
+    (number? v) (write-number v)
+    (map? v) (write-map v limits (inc depth))
+    (sequential? v) (write-seq v limits (inc depth))
+    ;; Sets have no order, so encoding one would invent one. Everything else
+    ;; -- ratios, dates, records, functions -- has no JSON meaning this
+    ;; namespace is entitled to pick.
+    :else (fail :value-not-encodable 0)))
+
+(defn write-json
+  "Serialise V. Returns a string, or a failure value `failed?` recognises.
+
+  Keywords become strings and map keys are sorted, so the same value always
+  produces the same bytes. Nothing is coerced: a value with no JSON meaning is
+  refused rather than stringified."
+  ([v] (write-json v {}))
+  ([v opts] (write-value v (merge default-limits opts) 1)))

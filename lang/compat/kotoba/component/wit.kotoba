@@ -1,0 +1,416 @@
+(ns kotoba.component.wit
+  "Deterministic WIT package/world generation from checked KIR.
+
+  Portable (.cljc). Of 344 lines, exactly two were JVM-bound — loading the
+  pinned contract, and SHA-256 — and both now have a ClojureScript branch. The
+  other 340 lines are the part that actually matters here: WIT identifier
+  canonicalization and the Kotoba-type to WIT-type mapping. Those are where two
+  implementations could silently disagree and emit different worlds from the
+  same KIR, which is what CI6 exists to rule out. Keeping this namespace
+  JVM-only made that comparison impossible rather than merely unmeasured.
+
+  The ClojureScript branch targets Node (the kbb engine) for SHA-256
+  (node:crypto), so it is a compiler-side tool namespace, not browser code.
+  The contract is compile-time text (kotoba.component.embedded-resources)
+  on both hosts since 2026-09-25."
+  {:kotoba/export [contract contract-resource emit host-binding-contract required-host-guard type-text]}
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [kotoba.abi.contract :as abi]
+            [kotoba.component.embedded-resources :as embedded-resources]
+            )
+  )
+
+(def contract-resource "kotoba/lang/component-model-v1.edn")
+
+(defn- contract-text
+  "The contract text: compile-time data since 2026-09-25 (superproject
+  adr-2609242330 S3, decision (b')). `kotoba.component.embedded-resources`
+  holds the bytes of `resources/kotoba/lang/component-model-v1.edn`, written
+  by scripts/gen_embedded_resources.cljk and held equal to the resource by
+  kotoba.component.embedded-resources-portable-test. Reading it needs no
+  classpath and no ability, so neither a consumer's classpath nor its cwd
+  can change what this answers.
+
+  History, because each step failed a consumer that ran from its own root:
+  until 2026-09-11 the Node branch read `resources/<resource>` relative to
+  the working directory -- this repository's root and nothing else's (amu
+  and cloud-itonami-isic-3812 died with ENOENT). From then until 2026-09-24
+  it probed the classpath but kept that cwd path as a FALLBACK, so a
+  consumer whose classpath lacked this repository's resources/ silently read
+  whatever file of the same name sat under its own cwd. From then until
+  2026-09-25 it read the classpath only, and a consumer whose classpath
+  lacked resources/ got a named error; the text is now part of this code."
+  []
+  (or (embedded-resources/resource-text contract-resource)
+      (throw (ex-info "component contract resource is not embedded"
+                      {:phase :component-wit :resource contract-resource}))))
+
+(def contract (edn/read-string (contract-text)))
+
+(defn- reject [message data]
+  (throw (ex-info message (assoc data :phase :component-wit))))
+
+(defn- text-sha256 [text]
+  )
+
+(defn- wit-name [value]
+  (let [source (cond (keyword? value) (subs (str value) 1)
+                     (symbol? value) (str value)
+                     :else (str value))
+        result (-> source str/lower
+                   (str/replace #"[^a-z0-9-]+" "-")
+                   (str/replace #"-+" "-")
+                   (str/replace #"(^-|-$)" ""))]
+    (when (or (empty? result) (not (re-matches #"[a-z][a-z0-9-]*" result)))
+      (reject "value has no canonical WIT identifier" {:value value}))
+    result))
+
+(declare type-text)
+
+(defn type-text
+  "Return the canonical WIT spelling for an admitted Kotoba descriptor.
+  Public so provider packaging derives its side of an interface from the
+  same renderer as the application world."
+  [descriptor]
+  (cond
+    (= descriptor :i64) "s64"
+    (= descriptor :f32) "f32"
+    (= descriptor :f64) "f64"
+    (= descriptor :bool) "bool"
+    (contains? #{:string :keyword} descriptor) "string"
+    (= descriptor :vector-i64) "list<s64>"
+    (= descriptor :vector-f64) "list<f64>"
+    (and (vector? descriptor) (= :ref (first descriptor))) (wit-name (second descriptor))
+    (and (vector? descriptor) (= :record (first descriptor))) (wit-name (second descriptor))
+    (and (vector? descriptor) (= :option (first descriptor)))
+    (str "option<" (type-text (second descriptor)) ">")
+    (and (vector? descriptor) (= :result (first descriptor)))
+    (str "result<" (type-text (second descriptor)) ", " (type-text (nth descriptor 2)) ">")
+    (and (vector? descriptor) (= :list (first descriptor)))
+    (str "list<" (type-text (second descriptor)) ">")
+    (and (vector? descriptor) (= :vector (first descriptor)))
+    (str "tuple<" (str/join ", " (map type-text (second descriptor))) ">")
+    (and (vector? descriptor) (= :set (first descriptor)))
+    (str "list<" (type-text (second descriptor)) ">")
+    (and (vector? descriptor) (= :map (first descriptor)))
+    (str "list<tuple<" (type-text (second descriptor)) ", "
+         (type-text (nth descriptor 2)) ">>")
+    :else (reject "descriptor is not representable as a WIT value type"
+                  {:descriptor descriptor})))
+
+(defn- schema-text [[schema-name descriptor]]
+  (let [name (wit-name schema-name)]
+    (case (first descriptor)
+      :record
+      (let [[_ nominal fields] descriptor]
+        (when-not (= schema-name nominal)
+          (reject "schema key and record identity differ" {:schema schema-name :identity nominal}))
+        (str "  record " name " {\n"
+             (apply str (map (fn [[field type]]
+                               (str "    " (wit-name field) ": " (type-text type) ",\n")) fields))
+             "  }\n"))
+      :variant
+      (let [[_ nominal cases] descriptor]
+        (when-not (= schema-name nominal)
+          (reject "schema key and variant identity differ" {:schema schema-name :identity nominal}))
+        (str "  variant " name " {\n"
+             (apply str (map (fn [[tag type]]
+                               (str "    " (wit-name tag)
+                                    "(" (type-text type) ")"
+                                    ",\n")) cases))
+             "  }\n"))
+      (str "  type " name " = " (type-text descriptor) ";\n"))))
+
+(defn- referenced-schema-names [descriptor]
+  (cond
+    (and (vector? descriptor) (= :ref (first descriptor))) #{(second descriptor)}
+    (and (vector? descriptor) (= :record (first descriptor))) #{(second descriptor)}
+    (coll? descriptor) (reduce into #{} (map referenced-schema-names descriptor))
+    :else #{}))
+
+(defn- schema-payload
+  "Record/variant payloads only — excludes the nominal identity slot so a
+  bare record does not look self-referential."
+  [descriptor]
+  (if (and (vector? descriptor)
+           (contains? #{:record :variant} (first descriptor))
+           (= 3 (count descriptor)))
+    (nth descriptor 2)
+    descriptor))
+
+(defn- wit-surface-schemas
+  "Schemas reachable from WIT-facing descriptors (export params/results and
+  capability request/result types). Guest-internal recursive ADTs used only
+  to build `:string` EDN (W4 record-kv) never appear here."
+  [schemas root-descriptors]
+  (loop [acc {}
+         todo (set (mapcat referenced-schema-names root-descriptors))]
+    (if-let [n (first todo)]
+      (if (contains? acc n)
+        (recur acc (disj todo n))
+        (if-let [descriptor (get schemas n)]
+          (recur (assoc acc n descriptor)
+                 (into (disj todo n)
+                       (referenced-schema-names (schema-payload descriptor))))
+          (recur acc (disj todo n))))
+      acc)))
+
+(defn- reject-recursive-schemas!
+  "`:recursive-schema :reject-v1` in the Component baseline: a schema whose
+  type graph reaches itself has no WIT representation, because a WIT record is
+  sized and cannot contain itself.
+
+  Applied only to **WIT-surface** schemas (export/import types). Guest-internal
+  recursive ADTs that never cross the Canonical ABI (string-encoded EDN
+  packages, W4 record-kv) are omitted from WIT and are not rejected here.
+
+  This was not enforced historically. `type-text` renders `[:ref :ns/name]` as
+  the bare type name, so a self-referential schema emitted
+
+    record t-n {
+      v: s64,
+      next: t-n,
+    }
+
+  which wasm-tools rejects outright:
+
+    error: type `t-n` depends on itself
+      --> next: t-n,
+
+  Emitting WIT that the official tooling refuses is worse than refusing it here:
+  the failure surfaces later, in another tool, with no connection to the schema
+  that caused it. Reject at the boundary that owns the rule, and name the cycle."
+  [schemas]
+  ;; Edges come from a schema's PAYLOAD, not from the descriptor as a whole.
+  ;; `referenced-schema-names` includes a record's own nominal identity -- it
+  ;; feeds the `use types.{…}` line, where that is correct -- so using it
+  ;; directly makes every record look self-referential.
+  (let [edges (into {} (map (fn [[name descriptor]]
+                              [name (referenced-schema-names (schema-payload descriptor))]))
+                    schemas)
+        reaches (fn reaches [start]
+                  (loop [seen #{} todo [start]]
+                    (if-let [n (first todo)]
+                      (if (seen n)
+                        (recur seen (rest todo))
+                        (recur (conj seen n)
+                               (concat (rest todo) (get edges n))))
+                      seen)))]
+    (doseq [[name _] (sort-by (comp str key) schemas)]
+      (let [from (disj (reaches name) name)
+            cyclic (or (contains? (get edges name #{}) name)
+                       (some #(contains? (reaches %) name) from))]
+        (when cyclic
+          (reject "recursive schema has no WIT representation"
+                  {:schema name
+                   :cycle (vec (sort-by str (conj (filter #(contains? (reaches %) name) from)
+                                                  name)))}))))))
+(defn- type-uses [descriptors]
+  (->> descriptors (mapcat referenced-schema-names) distinct (sort-by str) vec))
+
+(defn- use-line [names]
+  (when (seq names)
+    (str "  use types.{" (str/join ", " (map wit-name names)) "};\n")))
+
+(defn- capability-index []
+  (into {} (map (juxt :id identity) (:capabilities contract))))
+
+(defn- host-id
+  "A capability id as an integer this namespace can order, deduplicate and look
+  up with.
+
+  On ClojureScript an i64 is a BigInt, and a capability id arrives from KIR as
+  one -- `kotoba.compiler.frontend/effect-capability-id` produces it. cljs.core
+  cannot handle a BigInt in any of the three ways this file needs: `sort-by`
+  answers `Cannot compare 6 to 5`, and `distinct` and a map lookup keyed by the
+  id both answer `Cannot create property closure_uid_... on bigint`, because a
+  primitive cannot carry the hash property they attach. Measured 2026-09-09
+  against `lang/wit-vectors.edn`: all four vectors that carry a capability emit
+  cleanly with Number ids and throw with BigInt ids -- one of the two messages
+  each, depending on whether the vector has one capability or several.
+
+  Nothing fed this file a BigInt until now, which is why the cross-
+  implementation verifier passes: `verify_wit_cljs.cljs` reads its vectors with
+  `cljs.reader`, and an integer token in EDN is a Number. The vectors were
+  right about the WIT and silent about the ids.
+
+  The id is narrowed once, here, where it enters from KIR -- so `distinct`,
+  the `sort-by` below, `capability-index`'s lookup and `abi/capability-import-
+  name` all see the same integer. It is a wire id in [0,255], so the
+  conversion is exact; one that is not exactly representable is refused rather
+  than truncated into a different capability. On the JVM this is `identity`,
+  so no emitted byte moves."
+  [id]
+  )
+
+(defn- capability-contracts [kir]
+  (->> (:functions kir)
+       (mapcat #(tree-seq coll? seq (:body %)))
+       (keep (fn [form]
+               (when (and (seq? form) (= 'typed-cap-call (first form)))
+                 (let [[_ id request-type result-type] form]
+                   {:id (host-id id)
+                    :request-type request-type :result-type result-type}))))
+       distinct
+       (sort-by (juxt :id (comp pr-str :request-type) (comp pr-str :result-type)))
+       vec))
+
+(defn- linear-resource-interface-text [[interface entries]]
+  (let [descriptors (mapcat (juxt :request-type :result-type) entries)]
+    (str "interface " interface " {\n"
+         (use-line (type-uses descriptors))
+         (apply str
+                (map (fn [{:keys [function request-type result-type]}]
+                       (let [resource (str function "-capability")]
+                         (str "  resource " resource ";\n"
+                              "  issue-" function ": func() -> own<" resource ">;\n"
+                              "  execute-" function ": func(cap: own<" resource
+                              ">, request: " (type-text request-type)
+                              ") -> " (type-text result-type) ";\n")))
+                     entries))
+         "}\n\n")))
+
+(defn- capability-interface-text [[interface entries]]
+  (let [descriptors (mapcat (juxt :request-type :result-type) entries)]
+    (str "interface " interface " {\n"
+         (use-line (type-uses descriptors))
+         (apply str
+                (map (fn [{:keys [function request-type result-type]}]
+                       (str "  " function ": func(request: " (type-text request-type)
+                            ") -> " (type-text result-type) ";\n")) entries))
+         "}\n\n")))
+
+(defn- export-text [function]
+  (str "  export " (wit-name (:name function)) ": func("
+       (str/join ", " (map (fn [name type]
+                              (str (wit-name name) ": " (type-text type)))
+                            (:params function) (:param-types function)))
+       ") -> " (type-text (:result function)) ";\n"))
+
+(def host-binding-contract
+  "Identifies the shape of the `:host-binding` receipt field below."
+  :kotoba.component.host-binding/v1)
+
+(def required-host-guard
+  "The only host entry point admissible for a component's effectful import.
+
+  The weaker guards on the host ladder (`guard-call`, `guard-ability-call`)
+  remain public because non-component hosts legitimately use them, so what
+  keeps them out of a component's import path cannot be their absence. It has
+  to be a statement the host can check — which is what this declares."
+  :guard-component-ability-call)
+
+(defn- host-binding
+  "CI5: declare, per effectful import, the host entry point that must bind it.
+
+  Without this the host binder can only *assume* which guard an import
+  requires. An assumption cannot be violated, so it also cannot be detected:
+  a host that bound a component import through `guard-ability-call` — skipping
+  component admission, and for a non-capability request skipping the effect
+  gate too — would produce a working program and no diagnostic. Declaring the
+  requirement turns that silent weakening into a checkable mismatch."
+  [import-names]
+  {:contract host-binding-contract
+   :required-guard required-host-guard
+   :imports (into (sorted-map) (map (fn [name] [name required-host-guard])) import-names)})
+
+(defn emit
+  "Return a deterministic WIT v1 package and receipt for checked KIR."
+  ([kir] (emit kir {}))
+  ([kir {:keys [capability-mode typed-capability-v3?]
+         :or {capability-mode :function}}]
+  (when-not (contains? #{:kotoba.kir/v3 :kotoba.kir/v4} (:format kir))
+    (reject "WIT generation requires checked KIR" {:format (:format kir)}))
+  (if typed-capability-v3?
+    ;; The v3 profile serves the authoritative WIT bytes from the pinned ABI
+    ;; dependency. That accessor was `:clj`-only when this branch was written
+    ;; (it read the WIT off the classpath), so this profile refused on Node;
+    ;; kotoba-lang/abi has embedded the bytes since (`kotoba.abi.wit-data`)
+    ;; and serves both hosts. The refusal here outlived its reason until
+    ;; 2026-09-11, when the first Node run of the encoder hit it.
+    (let [source (abi/typed-capability-wit-v3)
+          profile (get-in contract [:profiles :typed-capability-v3])]
+      (when-not (= {:target abi/component-target-v2
+                    :world abi/typed-capability-world-v3}
+                   (select-keys profile [:target :world]))
+        (reject "typed capability profile diverges from the shared ABI"
+                {:profile (select-keys profile [:target :world])
+                 :abi {:target abi/component-target-v2
+                       :world abi/typed-capability-world-v3}}))
+      {:format :kotoba.wit-package/v1
+       :target (:target profile)
+       :world (:world profile)
+       :wasi-version abi/wasi-version
+       :source source
+       :sha256 (text-sha256 source)
+       :imports (mapv abi/capability-import-name
+                      (sort (map :id (capability-contracts kir))))
+       :host-binding (host-binding (mapv abi/capability-import-name
+                                         (sort (map :id (capability-contracts kir)))))
+       :capability-mode :linear-resource
+       :capability-transport (:capability-transport profile)})
+    (let [schemas (or (:schemas kir) {})
+        schema-names (keys schemas)
+        canonical-names (map wit-name schema-names)]
+    (when-not (= (count canonical-names) (count (distinct canonical-names)))
+      (reject "schema names collide after WIT canonicalization" {}))
+    (let [by-id (capability-index)
+          capabilities
+          (mapv (fn [{:keys [id request-type result-type]}]
+                  (let [entry (or (get by-id id)
+                                  (reject "typed capability has no WIT contract" {:id id}))]
+                    (assoc entry :request-type request-type :result-type result-type)))
+                (capability-contracts kir))
+          interfaces (->> capabilities (group-by :interface) (into (sorted-map)))
+          exports (->> (:functions kir)
+                       (filter (comp (set (:exports kir)) :name))
+                       (sort-by (comp str :name)))
+          canonical-export-names (mapv (comp wit-name :name) exports)
+          _export-collision
+          (when-not (= (count canonical-export-names)
+                       (count (distinct canonical-export-names)))
+            (reject "export names collide after WIT canonicalization"
+                    {:exports (mapv :name exports)}))
+          _parameter-collision
+          (doseq [function exports
+                  :let [parameter-names (mapv wit-name (:params function))]
+                  :when (not= (count parameter-names)
+                              (count (distinct parameter-names)))]
+            (reject "parameter names collide after WIT canonicalization"
+                    {:export (:name function) :parameters (:params function)}))
+          export-types (mapcat (fn [f] (conj (vec (:param-types f)) (:result f))) exports)
+          capability-types (mapcat (juxt :request-type :result-type) capabilities)
+          ;; WIT surface only: internal recursive ADTs (W4 record-kv) stay guest-private.
+          surface-schemas (wit-surface-schemas schemas
+                                               (concat export-types capability-types))
+          _ (reject-recursive-schemas! surface-schemas)
+          _ (doseq [descriptor (mapcat #(tree-seq coll? seq %) export-types)
+                    :when (and (vector? descriptor) (= :record (first descriptor)))]
+              (let [identity (second descriptor)]
+                (when-not (= descriptor (get schemas identity))
+                  (reject "inline record differs from sealed schema identity"
+                          {:descriptor descriptor :schema (get schemas identity)}))))
+          text (str "package kotoba:application@1.0.0;\n\n"
+                    (when (seq surface-schemas)
+                      (str "interface types {\n"
+                           (apply str (map schema-text (sort-by (comp str key) surface-schemas)))
+                           "}\n\n"))
+                    (apply str (map (if (= capability-mode :linear-resource)
+                                      linear-resource-interface-text
+                                      capability-interface-text)
+                                    interfaces))
+                    "world application {\n"
+                    (use-line (type-uses export-types))
+                    (apply str (map #(str "  import " % ";\n") (keys interfaces)))
+                    (apply str (map export-text exports))
+                    "}\n")]
+      {:format :kotoba.wit-package/v1
+       :target :wasm-component-kotoba-v1
+       :wasi-version "0.3.0"
+       :source text
+       :sha256 (text-sha256 text)
+       :imports (mapv :name capabilities)
+       :host-binding (host-binding (mapv :name capabilities))
+       :capability-mode capability-mode
+       :exports (mapv :name exports)})))))
