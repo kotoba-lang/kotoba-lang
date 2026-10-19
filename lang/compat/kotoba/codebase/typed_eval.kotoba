@@ -1,0 +1,382 @@
+(ns kotoba.codebase.typed-eval
+  "Execute a typed definition by hydrating its KIR closure from the store.
+
+  `evaluator` interprets `semantic-code`'s own IR. This runs the compiler's
+  KIR through `kotoba.kir/execute` -- the executable language oracle the AOT
+  and JIT backends qualify against -- so what the codebase runs and what a
+  target compiles are the same representation rather than two implementations
+  of an idea.
+
+  Assembly is where the content-addressing shows: the module handed to the
+  interpreter has no source names in it at all. Every function is named by its
+  own CID, and every call was rewritten to a CID reference at authoring time,
+  so the assembled module is a pure function of the hashes that were reachable.
+
+  Effects are not implemented here and not silently permitted either. A
+  `typed-cap-call` dispatcher may be injected by a caller that has a provider
+  registry and a policy; without one, a definition that performs a capability
+  call traps rather than proceeding."
+  (:require [clojure.string :as str]
+            [kotoba.codebase.ir :as ir]
+            [kotoba.codebase.semantic-code :as semantic]
+            [kotoba.codebase.store :as store]
+            [kotoba.codebase.typed-code :as typed]
+            [kotoba.kir :as kir]))
+
+(def default-fuel 100000)
+(def max-admitted-fuel 10000000)
+(def default-eval-depth 1)
+(def max-eval-depth 16)
+(def max-closure-blocks 4096)
+(def admission-schema "kotoba.typed-eval-admission.v1")
+(def result-schema "kotoba.typed-eval-result.v1")
+
+(defn- fail! [problem data]
+  (throw (ex-info (name problem) (assoc data :problem problem))))
+
+;; ---------------------------------------------------------------------------
+;; Decoding
+
+(defn- decode-keyword [s]
+  (if-let [index (str/index-of s "/")]
+    (keyword (subs s 0 index) (subs s (inc index)))
+    (keyword s)))
+
+(declare decode-form)
+
+;; ---------------------------------------------------------------------------
+;; Scalar decoding across the platform split
+;;
+;; The canonical form carries a float as the INTEGER BIT PATTERN, so decoding
+;; is a reinterpretation rather than a conversion and every step has to be
+;; exact. `Float/intBitsToFloat` and `Double/longBitsToDouble` have no cljs
+;; equivalent, but `DataView` is exactly the same operation: write the bits,
+;; read the float.
+;;
+;; `kotoba.kir` has `f64-from-bits`, and it is NOT reusable here -- it is a KIR
+;; OPCODE name the interpreter dispatches on, not a function this namespace can
+;; call. Worth stating because reaching for it is the obvious first move.
+;;
+;; An integer becomes a `bigint` on the JVM and a `js/BigInt` on cljs, which is
+;; what `kotoba.kir` itself uses for i64 on that side -- its `cljs-i64`
+;; docstring records why (plain cljs numbers are doubles and lose precision
+;; above 2^53; cljs bitwise ops truncate to int32).
+
+(defn- ->i64 [payload]
+  )
+
+(defn- f32-from-bits [payload]
+  )
+
+(defn- f64-from-bits [payload]
+  )
+
+(defn- decode-tagged [[tag payload] resolve-reference]
+  (case tag
+    "nil" nil
+    "bool" payload
+    "int" (->i64 payload)
+    "f32" (f32-from-bits payload)
+    "f64" (f64-from-bits payload)
+    "str" payload
+    "kw" (decode-keyword payload)
+    "sym" (symbol payload)
+    "vec" (mapv #(decode-form % resolve-reference) payload)
+    "list" (apply list (map #(decode-form % resolve-reference) payload))
+    "set" (into #{} (map #(decode-form % resolve-reference)) payload)
+    "map" (into {} (map (fn [[k v]] [(decode-form k resolve-reference)
+                                     (decode-form v resolve-reference)]))
+                payload)
+    (fail! :typed-eval/unknown-canonical-tag {:tag tag})))
+
+(defn- decode-form [form resolve-reference]
+  (cond
+    (and (map? form) (= "reference" (get form "op")))
+    (resolve-reference {:kind :definition :cid (ir/link->cid (get form "cid"))})
+
+    (and (map? form) (= "recursive-reference" (get form "op")))
+    (resolve-reference {:kind :group-member :index (get form "index")})
+
+    (vector? form) (decode-tagged form resolve-reference)
+
+    :else (fail! :typed-eval/malformed-canonical-form {:form form})))
+
+;; ---------------------------------------------------------------------------
+;; Names
+;;
+;; Deterministic and derived only from hashes: two independently assembled
+;; modules over the same closure produce byte-identical function names.
+
+(defn decode-view-form
+  "Decode a canonical body for READING rather than for execution.
+
+  Execution resolves a reference by emitting the callee as another function in
+  the assembled module; a reader wants the name it knows instead. Same decoder,
+  different resolver -- which is only possible because the reference is a link
+  in the data rather than a name baked into it."
+  [form {:keys [name-of member-name]}]
+  (decode-form form
+               (fn [{:keys [kind cid index]}]
+                 (case kind
+                   :definition (name-of cid)
+                   :group-member (member-name index)))))
+
+(defn definition-symbol [cid] (symbol (str "kotoba_def_" cid)))
+(defn member-symbol [group-cid index] (symbol (str "kotoba_grp_" group-cid "_" index)))
+
+;; ---------------------------------------------------------------------------
+;; Interface
+
+(defn- interface-of [root cid]
+  (let [block (store/get-block root cid)]
+    (when-not (= "kotoba.typed-interface.v1" (get block "schema"))
+      (fail! :typed-eval/not-an-interface {:cid cid}))
+    {:arity (get block "arity")
+     :param-types (mapv #(decode-form % (fn [_] (fail! :typed-eval/reference-in-type {})))
+                        (get block "paramTypes"))
+     :result (decode-form (get block "result")
+                          (fn [_] (fail! :typed-eval/reference-in-type {})))
+     :effects (into #{} (map keyword) (get block "effects"))
+     :schemas (into {} (map (fn [[name definition]]
+                              [(decode-form name (fn [_] (fail! :typed-eval/reference-in-type {})))
+                               (decode-form definition (fn [_] (fail! :typed-eval/reference-in-type {})))]))
+                    (get block "schemas"))}))
+
+(defn- params-for [arity]
+  (mapv #(symbol (str "k" %)) (range arity)))
+
+;; ---------------------------------------------------------------------------
+;; Assembly
+
+(defn assemble
+  "Hydrate the closure rooted at CID and build one KIR module for it.
+
+  Returns `{:kir :entry :interface}`. Every reachable definition becomes a
+  function; nothing outside the closure can be reached, because there is no
+  name left in the module that could name it."
+  [root cid]
+  (let [functions (volatile! [])
+        schemas (volatile! {})
+        formats (volatile! #{})
+        seen (volatile! #{})
+        entry (volatile! nil)]
+    (letfn [(emit-definition [cid]
+              (when-not (contains? @seen cid)
+                (vswap! seen conj cid)
+                (when (> (count @seen) max-closure-blocks)
+                  (fail! :typed-eval/closure-too-large {:limit max-closure-blocks}))
+                (let [block (store/get-block root cid)]
+                  (condp = (get block "schema")
+                    typed/schema
+                    (let [interface (interface-of root (ir/link->cid (get block "interface")))
+                          name (definition-symbol cid)]
+                      (vswap! formats conj (get block "irFormat"))
+                      (vswap! schemas into (:schemas interface))
+                      ;; Reserve the slot before decoding: a self-referential
+                      ;; closure would otherwise recurse forever through
+                      ;; `emit-definition` while resolving its own body.
+                      (let [body (decode-form (get block "body") resolve-reference)]
+                        (vswap! functions conj
+                                {:name name
+                                 :params (params-for (:arity interface))
+                                 :param-types (:param-types interface)
+                                 :result (:result interface)
+                                 :effects (:effects interface)
+                                 :body body}))
+                      {:name name :interface interface})
+
+                    typed/member-schema
+                    (emit-group (ir/link->cid (get block "group")))
+
+                    (fail! :typed-eval/not-a-typed-definition
+                           {:cid cid :schema (get block "schema")})))))
+
+            (emit-group [group-cid]
+              (when-not (contains? @seen group-cid)
+                (vswap! seen conj group-cid)
+                (let [block (store/get-block root group-cid)]
+                  (when-not (= typed/group-schema (get block "schema"))
+                    (fail! :typed-eval/not-a-typed-group {:cid group-cid}))
+                  (vswap! formats conj (get block "irFormat"))
+                  (let [members (get block "members")]
+                    (doseq [[index member] (map-indexed vector members)]
+                      (let [interface (interface-of root (ir/link->cid (get member "interface")))
+                            body (decode-form (get member "body")
+                                              (group-resolver group-cid))]
+                        (vswap! schemas into (:schemas interface))
+                        (vswap! functions conj
+                                {:name (member-symbol group-cid index)
+                                 :params (params-for (:arity interface))
+                                 :param-types (:param-types interface)
+                                 :result (:result interface)
+                                 :effects (:effects interface)
+                                 :body body})))))))
+
+            (group-resolver [group-cid]
+              (fn [{:keys [kind cid index]}]
+                (case kind
+                  :definition (do (emit-definition cid) (definition-symbol cid))
+                  :group-member (member-symbol group-cid index))))
+
+            (resolve-reference [{:keys [kind cid]}]
+              (case kind
+                :definition (do (emit-definition cid) (definition-symbol cid))
+                (fail! :typed-eval/recursive-reference-outside-group {})))]
+
+      (let [block (store/get-block root cid)
+            member? (= typed/member-schema (get block "schema"))
+            entry-name (if member?
+                         (member-symbol (ir/link->cid (get block "group")) (get block "index"))
+                         (definition-symbol cid))
+            interface (interface-of root (ir/link->cid (get block "interface")))]
+        (if member?
+          (emit-group (ir/link->cid (get block "group")))
+          (emit-definition cid))
+        (vreset! entry entry-name)
+        (when-not (= 1 (count @formats))
+          (fail! :typed-eval/mixed-ir-formats {:formats (vec @formats)}))
+        {:entry entry-name
+         :interface interface
+         :kir {:format (keyword (subs (first @formats) 1))
+               :entry entry-name
+               :exports [entry-name]
+               :schemas @schemas
+               :functions (vec @functions)}}))))
+
+;; ---------------------------------------------------------------------------
+;; Execution
+
+(defn invoke
+  "Execute the definition at CID with ARGS.
+
+  Fuel is bounded by the KIR interpreter itself; a capability call without an
+  injected dispatcher traps as denied rather than being skipped."
+  ([root cid args] (invoke root cid args {}))
+  ([root cid args {:keys [fuel typed-cap-call cap-call]
+                   :or {fuel default-fuel}}]
+   (let [{:keys [kir entry interface]} (assemble root cid)]
+     (when-not (= (count args) (:arity interface))
+       (fail! :typed-eval/arity-mismatch
+              {:expected (:arity interface) :actual (count args)}))
+     {:cid cid
+      :entry entry
+      :effects (:effects interface)
+      :value (kir/execute kir entry (vec args)
+                          (cond-> {:fuel fuel}
+                            typed-cap-call (assoc :typed-cap-call typed-cap-call)
+                            cap-call (assoc :cap-call cap-call)))})))
+
+;; ---------------------------------------------------------------------------
+;; Public typed-eval admission
+
+(defn- qualified-effect? [effect]
+  (and (keyword? effect) (namespace effect)))
+
+(defn- positive-bound! [problem value upper]
+  (when-not (and (integer? value) (pos? value) (<= value upper))
+    (fail! problem {:value value :maximum upper}))
+  value)
+
+(defn- interface-block [{:keys [arity param-types result effects schemas]}]
+  {"arity" arity
+   "params" (mapv typed/canonical-form param-types)
+   "result" (typed/canonical-form result)
+   "effects" (vec (sort (map str effects)))
+   "schemas" (typed/canonical-form schemas)})
+
+(defn admit
+  "Create the immutable admission capsule for evaluating definition CID.
+
+  A CID proves which checked definition was selected; this function separately
+  proves that its typed interface, complete effect row, fuel, and nested-eval
+  depth fit the caller's current authority. `allowed-effects` defaults to the
+  empty set. Content identity therefore never turns into authority by itself."
+  ([root cid] (admit root cid {}))
+  ([root cid {:keys [allowed-effects expected-result fuel max-depth]
+              :or {allowed-effects #{}
+                   fuel default-fuel
+                   max-depth default-eval-depth}}]
+   (positive-bound! :typed-eval/fuel-invalid fuel max-admitted-fuel)
+   (positive-bound! :typed-eval/depth-invalid max-depth max-eval-depth)
+   (when-not (and (set? allowed-effects)
+                  (every? qualified-effect? allowed-effects))
+     (fail! :typed-eval/allowed-effects-invalid
+            {:allowed-effects allowed-effects}))
+   (let [{:keys [interface]} (assemble root cid)
+         effects (:effects interface)
+         denied (set (remove allowed-effects effects))]
+     (when (seq denied)
+       (fail! :typed-eval/effect-not-admitted
+              {:cid cid :effects effects :denied denied
+               :allowed-effects allowed-effects}))
+     (when (and expected-result (not= expected-result (:result interface)))
+       (fail! :typed-eval/result-type-mismatch
+              {:cid cid :expected expected-result :actual (:result interface)}))
+     (let [block {"schema" admission-schema
+                  "version" 1
+                  "definition" (semantic/cid-link cid)
+                  "interface" (interface-block interface)
+                  "allowedEffects" (vec (sort (map str allowed-effects)))
+                  "fuel" fuel
+                  "maxDepth" max-depth}
+           admission-cid (semantic/block-cid block)]
+       {:format :kotoba.typed-eval/admission-v1
+        :cid cid
+        :admission-cid admission-cid
+        :block block
+        :interface interface
+        :effects effects
+        :allowed-effects allowed-effects
+        :fuel fuel
+        :max-depth max-depth}))))
+
+(defn- value-block [admission value]
+  {"schema" result-schema
+   "version" 1
+   "admission" (semantic/cid-link (:admission-cid admission))
+   "definition" (semantic/cid-link (:cid admission))
+   "resultType" (typed/canonical-form (get-in admission [:interface :result]))
+   "value" (typed/canonical-form value)})
+
+(defn invoke-admitted
+  "Execute an ADMISSION produced by `admit` and bind the output to a CID.
+
+  The admission block is rehashed before execution. Effects still require the
+  injected dispatcher; a result CID is integrity evidence after execution, not
+  permission to perform an effect."
+  ([root admission args] (invoke-admitted root admission args {}))
+  ([root admission args {:keys [typed-cap-call cap-call receipt-sink]}]
+   (when-not (and (= :kotoba.typed-eval/admission-v1 (:format admission))
+                  (= (:admission-cid admission)
+                     (semantic/block-cid (:block admission))))
+     (fail! :typed-eval/admission-invalid {}))
+   (let [fresh (admit root (:cid admission)
+                      {:allowed-effects (:allowed-effects admission)
+                       :expected-result (get-in admission [:interface :result])
+                       :fuel (:fuel admission)
+                       :max-depth (:max-depth admission)})]
+     (when-not (= (:admission-cid admission) (:admission-cid fresh))
+       (fail! :typed-eval/admission-drift
+              {:expected (:admission-cid admission)
+               :actual (:admission-cid fresh)}))
+     (when (and (seq (:effects admission)) (nil? receipt-sink))
+       (fail! :typed-eval/receipt-required
+              {:effects (:effects admission)}))
+     ;; The capsule is a real store block, not merely a digest printed by the
+     ;; caller. A failed execution can therefore still be explained by the
+     ;; exact admission that preceded it.
+     (store/put-block! root (:admission-cid admission) (:block admission))
+     (let [result (invoke root (:cid admission) args
+                          (cond-> {:fuel (:fuel admission)}
+                            typed-cap-call (assoc :typed-cap-call typed-cap-call)
+                            cap-call (assoc :cap-call cap-call)))
+           block (value-block admission (:value result))
+           value-cid (semantic/block-cid block)
+           _ (store/put-block! root value-cid block)
+           completed (assoc result
+                            :admission-cid (:admission-cid admission)
+                            :value-cid value-cid)]
+       (when receipt-sink
+         (receipt-sink (select-keys completed
+                                    [:cid :admission-cid :value-cid :effects])))
+       completed))))

@@ -1,0 +1,384 @@
+(ns kotoba.compiler.value
+  )
+
+(def string-literal-byte-limit 4096)
+(def string-value-byte-limit 65536)
+(def keyword-value-byte-limit 512)
+(def map-entry-limit 128)
+(def vector-item-limit 128)
+(def adt-depth-limit 8)
+(def adt-node-limit 64)
+(def variant-case-limit 32)
+(def heterogeneous-vector-item-limit 32)
+(def typed-set-item-limit 32)
+(def typed-map-entry-limit 31)
+(def record-field-limit 32)
+
+(defn utf8-byte-count!
+  "Return the exact UTF-8 byte count without normalizing or replacing malformed
+  UTF-16. Unpaired surrogates fail closed on both JVM and JavaScript hosts."
+  [value]
+  (when-not (string? value)
+    (throw (ex-info "value is not a string" {:phase :value :value value})))
+  (loop [index 0 total 0]
+    (if (= index (count value))
+      total
+      (let [unit ]
+        (cond
+          (<= unit 0x7f) (recur (inc index) (inc total))
+          (<= unit 0x7ff) (recur (inc index) (+ total 2))
+          (<= 0xd800 unit 0xdbff)
+          (if (< (inc index) (count value))
+            (let [next-unit ]
+              (if (<= 0xdc00 next-unit 0xdfff)
+                (recur (+ index 2) (+ total 4))
+                (throw (ex-info "string contains an unpaired high surrogate"
+                                {:phase :value :index index}))))
+            (throw (ex-info "string contains an unpaired high surrogate"
+                            {:phase :value :index index})))
+          (<= 0xdc00 unit 0xdfff)
+          (throw (ex-info "string contains an unpaired low surrogate"
+                          {:phase :value :index index}))
+          :else (recur (inc index) (+ total 3)))))))
+
+(defn bounded-string!
+  [value limit]
+  (let [bytes (utf8-byte-count! value)]
+    (when (> bytes limit)
+      (throw (ex-info "string exceeds UTF-8 byte limit"
+                      {:phase :value :bytes bytes :limit limit})))
+    value))
+
+(defn bounded-keyword!
+  [value limit]
+  (when-not (keyword? value)
+    (throw (ex-info "value is not a keyword" {:phase :value :value value})))
+  (let [text (str value)
+        bytes (utf8-byte-count! text)]
+    (when (> bytes limit)
+      (throw (ex-info "keyword exceeds UTF-8 byte limit"
+                      {:phase :value :bytes bytes :limit limit})))
+    value))
+
+(defn bounded-map!
+  "Validate the first bounded map profile: canonical keyword keys and i64
+  values only. The representation is immutable host data, never a pointer or
+  integer sentinel in the Kotoba value domain."
+  [value]
+  (when-not (map? value)
+    (throw (ex-info "value is not a map" {:phase :value :value value})))
+  (when (> (count value) map-entry-limit)
+    (throw (ex-info "map exceeds entry limit"
+                    {:phase :value :entries (count value) :limit map-entry-limit})))
+  (doseq [[key item] value]
+    (bounded-keyword! key keyword-value-byte-limit)
+    (when-not 
+      (throw (ex-info "map value is not a signed i64"
+                      {:phase :value :key key}))))
+  value)
+
+(defn bounded-option-i64!
+  "Validate the first option profile. None is `[false]`; some i64 is
+  `[true value]`. Nil, host null/undefined, and integer sentinels are never
+  members of the runtime value domain. Return a canonical immutable value."
+  [value]
+  (when-not (and (vector? value)
+                 (or (= [false] value)
+                     (and (= 2 (count value)) (true? (first value)))))
+    (throw (ex-info "value is not a tagged option-i64"
+                    {:phase :value :value value})))
+  (if (false? (first value))
+    [false]
+    (let [item (second value)]
+      (when-not 
+        (throw (ex-info "option payload is not a signed i64" {:phase :value})))
+      [true item])))
+
+(defn bounded-result-i64!
+  "Validate the first algebraic-result profile. `[true value]` is ok and
+  `[false error]` is err; both variants carry exactly one signed-i64 payload."
+  [value]
+  (when-not (and (vector? value) (= 2 (count value)) (boolean? (first value)))
+    (throw (ex-info "value is not a tagged result-i64"
+                    {:phase :value :value value})))
+  (let [item (second value)]
+    (when-not 
+      (throw (ex-info "result payload is not a signed i64" {:phase :value})))
+    [(first value) item]))
+
+(defn bounded-vector-i64!
+  "Validate and return the first bounded sequential collection profile."
+  [value]
+  (when-not (vector? value)
+    (throw (ex-info "value is not a vector-i64" {:phase :value :value value})))
+  (when (> (count value) vector-item-limit)
+    (throw (ex-info "vector exceeds item limit"
+                    {:phase :value :items (count value) :limit vector-item-limit})))
+  (doseq [item value]
+    (when-not 
+      (throw (ex-info "vector item is not a signed i64" {:phase :value}))))
+  value)
+
+(def ^:private leaf-value-types
+  #{:i64 :string :keyword :map :bool :option-i64 :result-i64 :vector-i64})
+
+(defn validate-value-type!
+  ([type] (validate-value-type! type 0 (volatile! 0)))
+  ([type depth nodes]
+   (vswap! nodes inc)
+   (when (> @nodes adt-node-limit)
+     (throw (ex-info "value type exceeds node limit" {:phase :value :limit adt-node-limit})))
+   (when (> depth adt-depth-limit)
+     (throw (ex-info "value type exceeds depth limit" {:phase :value :limit adt-depth-limit})))
+   (cond
+     (contains? leaf-value-types type) type
+     (and (vector? type) (= 3 (count type)) (= :result (first type)))
+     (do (validate-value-type! (second type) (inc depth) nodes)
+         (validate-value-type! (nth type 2) (inc depth) nodes)
+         type)
+     (and (vector? type) (= 2 (count type)) (= :option (first type)))
+     (do (validate-value-type! (second type) (inc depth) nodes)
+         type)
+     (and (vector? type) (= 2 (count type)) (= :vector (first type)))
+     (let [item-types (second type)]
+       (when-not (and (vector? item-types)
+                      (<= (count item-types) heterogeneous-vector-item-limit))
+         (throw (ex-info "heterogeneous vector types are invalid"
+                         {:phase :value :limit heterogeneous-vector-item-limit})))
+       (vswap! nodes inc)
+       (when (> @nodes adt-node-limit)
+         (throw (ex-info "value type exceeds node limit"
+                         {:phase :value :limit adt-node-limit})))
+       (doseq [item-type item-types]
+         (validate-value-type! item-type (inc depth) nodes))
+       type)
+     (and (vector? type) (= 2 (count type)) (= :set (first type)))
+     (do (validate-value-type! (second type) (inc depth) nodes)
+         type)
+     (and (vector? type) (= 3 (count type)) (= :map (first type)))
+     (do (validate-value-type! (second type) (inc depth) nodes)
+         (validate-value-type! (nth type 2) (inc depth) nodes)
+         type)
+     (and (vector? type) (= 3 (count type)) (= :record (first type)))
+     (let [[_ type-id fields] type]
+       (when-not (and (keyword? type-id) (namespace type-id))
+         (throw (ex-info "record type id must be a qualified keyword" {:phase :value})))
+       (when-not (and (vector? fields) (seq fields) (<= (count fields) record-field-limit)
+                      (every? #(and (vector? %) (= 2 (count %)) (keyword? (first %))) fields)
+                      (= (count fields) (count (distinct (map first fields)))))
+         (throw (ex-info "record fields are invalid" {:phase :value})))
+       (vswap! nodes + (+ 2 (* 2 (count fields))))
+       (when (> @nodes adt-node-limit)
+         (throw (ex-info "value type exceeds node limit" {:phase :value :limit adt-node-limit})))
+       (doseq [[_ field-type] fields]
+         (validate-value-type! field-type (inc depth) nodes))
+       type)
+     (and (vector? type) (= 3 (count type)) (= :variant (first type)))
+     (let [[_ type-id cases] type]
+       (when-not (and (keyword? type-id) (namespace type-id))
+         (throw (ex-info "variant type id must be a qualified keyword" {:phase :value})))
+       (when-not (and (vector? cases) (seq cases) (<= (count cases) variant-case-limit)
+                      (every? #(and (vector? %) (= 2 (count %)) (keyword? (first %))) cases)
+                      (= (count cases) (count (distinct (map first cases)))))
+         (throw (ex-info "variant cases are invalid" {:phase :value})))
+       (vswap! nodes + (+ 2 (* 2 (count cases))))
+       (when (> @nodes adt-node-limit)
+         (throw (ex-info "value type exceeds node limit" {:phase :value :limit adt-node-limit})))
+       (doseq [[_ payload-type] cases]
+         (validate-value-type! payload-type (inc depth) nodes))
+       type)
+     :else (throw (ex-info "value type is outside the safe profile"
+                           {:phase :value :type type})))))
+
+(declare compare-typed-values)
+
+(defn- compare-sequences [types left right]
+  (loop [remaining-types (seq types) left-items (seq left) right-items (seq right)]
+    (cond
+      (and (nil? left-items) (nil? right-items)) 0
+      (nil? left-items) -1
+      (nil? right-items) 1
+      :else (let [comparison (compare-typed-values (first remaining-types)
+                                                   (first left-items) (first right-items))]
+              (if (zero? comparison)
+                (recur (next remaining-types) (next left-items) (next right-items))
+                comparison)))))
+
+(defn compare-typed-values
+  "Language-owned total order for already validated values of one type."
+  [type left right]
+  (case type
+    :i64 (compare left right)
+    :string (compare left right)
+    :keyword (compare (str left) (str right))
+    :bool (compare left right)
+    :option-i64 (if (= (first left) (first right))
+                  (if (first left) (compare (second left) (second right)) 0)
+                  (if (first left) 1 -1))
+    :result-i64 (if (= (first left) (first right))
+                  (compare (second left) (second right))
+                  (if (first left) 1 -1))
+    :vector-i64 (compare-sequences (repeat (max (count left) (count right)) :i64)
+                                   left right)
+    :map (let [left-items (mapcat identity left)
+               right-items (mapcat identity right)
+               types (cycle [:keyword :i64])]
+           (compare-sequences types left-items right-items))
+    (cond
+      (= :option (first type))
+      (if (= (second left) (second right))
+        (if (second left)
+          (compare-typed-values (second type) (nth left 2) (nth right 2)) 0)
+        (if (second left) 1 -1))
+
+      (= :result (first type))
+      (if (= (first left) (first right))
+        (compare-typed-values (if (first left) (second type) (nth type 2))
+                              (second left) (second right))
+        (if (first left) 1 -1))
+
+      (= :variant (first type))
+      (let [cases (nth type 2)
+            indexes (zipmap (map first cases) (range))
+            left-index (get indexes (second left))
+            right-index (get indexes (second right))]
+        (if (= left-index right-index)
+          (compare-typed-values (second (nth cases left-index))
+                                (nth left 2) (nth right 2))
+          (compare left-index right-index)))
+
+      (= :vector (first type))
+      (compare-sequences (second type) (rest left) (rest right))
+
+      (= :set (first type))
+      (compare-sequences (repeat (max (count (second left)) (count (second right)))
+                                 (second type))
+                         (second left) (second right))
+
+      (= :map (first type))
+      (let [entry-type [:vector [(second type) (nth type 2)]]]
+        (compare-sequences (repeat (max (count (second left)) (count (second right)))
+                                   entry-type)
+                           (mapv #(into [entry-type] %) (second left))
+                           (mapv #(into [entry-type] %) (second right))))
+
+      (= :record (first type))
+      (compare-sequences (map second (nth type 2)) (rest left) (rest right))
+
+      :else (throw (ex-info "value type has no canonical order"
+                            {:phase :value :type type})))))
+
+(defn bounded-typed-value!
+  "Validate a value under a canonical possibly-parametric type descriptor.
+  Recursive values share one fixed depth and node budget."
+  ([type value]
+   (validate-value-type! type)
+   (bounded-typed-value! type value 0 (volatile! 0)))
+  ([type value depth nodes]
+   (vswap! nodes inc)
+   (when (> @nodes adt-node-limit)
+     (throw (ex-info "ADT value exceeds node limit" {:phase :value :limit adt-node-limit})))
+   (when (> depth adt-depth-limit)
+     (throw (ex-info "ADT value exceeds depth limit" {:phase :value :limit adt-depth-limit})))
+   (case type
+     :i64 (do (when-not 
+                (throw (ex-info "value is not a signed i64" {:phase :value}))) value)
+     :string (bounded-string! value string-value-byte-limit)
+     :keyword (bounded-keyword! value keyword-value-byte-limit)
+     :map (bounded-map! value)
+     :bool (do (when-not (boolean? value)
+                 (throw (ex-info "value is not a boolean" {:phase :value}))) value)
+     :option-i64 (bounded-option-i64! value)
+     :result-i64 (bounded-result-i64! value)
+     :vector-i64 (bounded-vector-i64! value)
+     (cond
+       (= :result (first type))
+       (do
+         (when-not (and (vector? value) (= 2 (count value)) (boolean? (first value)))
+           (throw (ex-info "value is not a parametric result" {:phase :value})))
+         (let [payload-type (if (first value) (second type) (nth type 2))]
+           [(first value) (bounded-typed-value! payload-type (second value) (inc depth) nodes)]))
+
+       (= :variant (first type))
+       (do
+         (when-not (and (vector? value) (= 3 (count value)) (= type (first value))
+                        (keyword? (second value)))
+           (throw (ex-info "value is not the declared variant type" {:phase :value})))
+         (let [tag (second value)
+               payload-type (some (fn [[case-tag case-type]]
+                                    (when (= case-tag tag) case-type))
+                                  (nth type 2))]
+           (when-not payload-type
+             (throw (ex-info "variant case is not declared" {:phase :value :tag tag})))
+           [type tag (bounded-typed-value! payload-type (nth value 2) (inc depth) nodes)]))
+
+       (= :option (first type))
+       (do
+         (when-not (and (vector? value) (= type (first value))
+                        (or (and (= 2 (count value)) (false? (second value)))
+                            (and (= 3 (count value)) (true? (second value)))))
+           (throw (ex-info "value is not the declared generic option type" {:phase :value})))
+         (if (false? (second value))
+           [type false]
+           [type true (bounded-typed-value! (second type) (nth value 2) (inc depth) nodes)]))
+
+       (= :vector (first type))
+       (let [item-types (second type)]
+         (when-not (and (vector? value) (= type (first value))
+                        (= (count value) (inc (count item-types))))
+           (throw (ex-info "value is not the declared heterogeneous vector type"
+                           {:phase :value})))
+         (into [type]
+               (map (fn [item-type item]
+                      (bounded-typed-value! item-type item (inc depth) nodes))
+                    item-types (rest value))))
+
+       (= :set (first type))
+       (let [item-type (second type)]
+         (when-not (and (vector? value) (= 2 (count value)) (= type (first value))
+                        (vector? (second value))
+                        (<= (count (second value)) typed-set-item-limit))
+           (throw (ex-info "value is not the declared typed set"
+                           {:phase :value :limit typed-set-item-limit})))
+         (let [items (mapv #(bounded-typed-value! item-type % (inc depth) nodes)
+                           (second value))
+               sorted-items (vec (sort #(compare-typed-values item-type %1 %2) items))]
+           (when (some (fn [[left right]]
+                         (zero? (compare-typed-values item-type left right)))
+                       (partition 2 1 sorted-items))
+             (throw (ex-info "typed set contains a duplicate item" {:phase :value})))
+           [type sorted-items]))
+
+       (= :map (first type))
+       (let [key-type (second type)
+             value-type (nth type 2)]
+         (when-not (and (vector? value) (= 2 (count value)) (= type (first value))
+                        (vector? (second value))
+                        (<= (count (second value)) typed-map-entry-limit)
+                        (every? #(and (vector? %) (= 2 (count %))) (second value)))
+           (throw (ex-info "value is not the declared typed map"
+                           {:phase :value :limit typed-map-entry-limit})))
+         (let [entries (mapv (fn [[key item]]
+                               [(bounded-typed-value! key-type key (inc depth) nodes)
+                                (bounded-typed-value! value-type item (inc depth) nodes)])
+                             (second value))
+               sorted-entries (vec (sort #(compare-typed-values key-type
+                                                                 (first %1) (first %2))
+                                         entries))]
+           (when (some (fn [[[left _] [right _]]]
+                         (zero? (compare-typed-values key-type left right)))
+                       (partition 2 1 sorted-entries))
+             (throw (ex-info "typed map contains a duplicate key" {:phase :value})))
+           [type sorted-entries]))
+
+       (= :record (first type))
+       (let [fields (nth type 2)]
+         (when-not (and (vector? value) (= type (first value))
+                        (= (count value) (inc (count fields))))
+           (throw (ex-info "value is not the declared record type" {:phase :value})))
+         (into [type]
+               (map (fn [[_ field-type] field-value]
+                      (bounded-typed-value! field-type field-value (inc depth) nodes))
+                    fields (rest value))))
+
+       :else (throw (ex-info "value type is outside the safe profile" {:phase :value}))))))

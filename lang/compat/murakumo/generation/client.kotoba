@@ -1,0 +1,165 @@
+(ns murakumo.generation.client
+  "The submit → poll → fetch → verify loop for murakumo.cloud generation,
+  with the transport injected.
+
+  Every trap this integration has lives in one place: which host to talk to,
+  rebasing the advertised artifact URL, verifying the declared digest,
+  retrying a cold fleet instead of degrading, and the poll schedule. Those are
+  what cost round trips to discover (see murakumo.generation), and they are
+  identical whether the caller is a JVM production executor or an nbb operator
+  script — so they are here, and only the four host primitives differ.
+
+  Consumers pass:
+    :request!    (fn [method url body-or-nil token] -> {:status int :body map})
+                 -- body is a Clojure map; the impl encodes/decodes JSON.
+                    Any transport failure should come back as {:status 0}.
+    :download!   (fn [url out token] -> truthy on success)
+    :sha256-hex  (fn [path] -> lowercase hex of the file's bytes)
+    :sleep!      (fn [ms] -> nil)   -- may be a no-op in an async host
+    :delete!     (fn [path] -> nil) -- discard a corrupt download (optional)
+
+  Nothing here throws at the caller: an unreachable fleet, a missing token, a
+  failed job, a digest mismatch all return nil after saying which on stderr,
+  so a scheduled producer degrades to its own fallback instead of losing the
+  night's work. What it will NOT do is degrade quietly — every nil is warned
+  with the reason, because a fallback that reads as success is how a pipeline
+  ships placeholders for two weeks without anyone noticing."
+  (:require [clojure.string :as str]
+            [murakumo.generation :as gen]))
+
+(defn- warn [& xs]
+  (binding [
+            ]
+    (apply println "[murakumo]" xs)))
+
+(def cold-start-retries
+  "Attempts after the first before a cold-fleet failure becomes a degrade. A
+  worker takes tens of seconds to boot; two more spaced by cold-start-wait-ms
+  covers it without turning a genuinely broken job into a multi-minute stall."
+  2)
+
+(def cold-start-wait-ms 45000)
+
+(defn submit!
+  "Job body -> {:id job-id} | {:cold msg} | {:dead msg}.
+
+  A failed submit is never silent about WHY: the fleet states its constraints
+  in the 400 body (`params.width must be a multiple of 32 in 256..1280`,
+  `params.locale is unsupported`), and dropping that body — as an earlier
+  version of this did — turns a one-line fix into a bisect against a live GPU
+  fleet. It is logged and classified."
+  [body {:keys [request! base token]}]
+  (let [{:keys [status body] :as resp} (request! "POST" base body token)]
+    (cond
+      (and (<= 200 status 299) (gen/submitted-id body)) {:id (gen/submitted-id body)}
+      (<= 200 status 299) {:dead "accepted but returned no jobId"}
+      :else
+      (let [why (str status " " (or (:message body) (:error body)
+                                    (some-> body pr-str) (:error resp) ""))
+            why (if (= 401 status)
+                  (str why " (token missing, or not generation-scope)") why)]
+        (if (gen/transient-submit? status body)
+          {:cold (str "submit " why)}
+          {:dead (str "submit " why)})))))
+
+(defn await-job!
+  "Poll a job to a terminal state. Returns the terminal status body, or nil on
+  timeout. `:now-ms` lets a caller supply its own clock; the default reads the
+  host's. `:timeout-ms` bounds one job so a stuck one cannot hold a whole
+  production."
+  [job-id {:keys [request! base token sleep! now-ms timeout-ms]}]
+  ;; (or timeout-ms default), not destructuring's :or — a caller merging an
+  ;; opts map that carries :timeout-ms nil would otherwise reach (long nil).
+  (let [timeout-ms (or timeout-ms 600000)
+        now (or now-ms #())
+        url (gen/job-url base job-id)
+        deadline (+ (now) (long timeout-ms))]
+    (loop [attempt 0]
+      (let [{:keys [status body]} (request! "GET" url nil token)
+            body (when (<= 200 status 299) body)]
+        (cond
+          (and body (gen/terminal? body)) body
+          (> (now) deadline)
+          (do (warn "job" job-id "still" (some-> body gen/job-status)
+                    "after" (quot timeout-ms 1000) "s — giving up")
+              nil)
+          :else (do (sleep! (gen/poll-backoff-ms attempt)) (recur (inc attempt))))))))
+
+(defn- attempt!
+  "One full round trip. Returns {:ok result} | {:cold msg} | {:dead reason} so
+  the caller can tell 'not up yet' from 'will never work'."
+  [body out {:keys [download! sha256-hex delete! base token] :as opts}]
+  (let [{:keys [id] :as sub} (submit! body opts)]
+    (if-not id
+      (select-keys sub [:cold :dead])
+      (let [status (await-job! id opts)]
+        (cond
+        (nil? status) {:dead "no terminal status"}
+        (gen/failed? status)
+        (let [msg (gen/job-error status)]
+          (if (gen/cold-start? msg) {:cold (str "job " id ": " msg)}
+              {:dead (str "job " id " failed: " msg)}))
+        :else
+        (if-let [url (gen/artifact-url base status)]
+          (if-not (download! url out token)
+            {:dead (str "job " id ": artifact download failed")}
+            (let [want (gen/artifact-sha256 status)
+                  got (when (and want sha256-hex) (sha256-hex out))]
+              (if (and want got (not= want got))
+                (do (when delete! (delete! out))
+                    {:dead (str "job " id ": digest mismatch — discarded")})
+                {:ok {:file (str out) :cid (gen/artifact-cid status) :job-id id}})))
+          {:dead (str "job " id " done but produced no artifact")}))))))
+
+(defn generate!
+  "Body -> {:file :cid :job-id}, or nil (warned).
+
+  `:label` names the step in warnings, so a degraded production says WHICH
+  shot lost its image rather than just that something did."
+  [body out {:keys [label sleep! token] :as opts}]
+  (let [label (or label "job")]
+   (cond
+    (str/blank? (str token)) (do (warn label "skipped — no generation token") nil)
+    :else
+    (loop [tries-left cold-start-retries]
+      (let [r (attempt! body out opts)]
+        (cond
+          (:ok r) (:ok r)
+          (and (:cold r) (pos? tries-left))
+          (do (warn label (:cold r) "— fleet is still waking, retrying in"
+                    (quot cold-start-wait-ms 1000) "s")
+              (sleep! cold-start-wait-ms)
+              (recur (dec tries-left)))
+          :else (do (warn label (or (:dead r) (:cold r))) nil)))))))
+
+;; ── the four production steps ───────────────────────────────────────────────
+
+(defn video!
+  "Art direction -> a moving clip. :seconds is what the caller wants on
+  screen; the fleet caps one job near 5s, so a longer shot has to hold or
+  loop on the consumer's side."
+  [{:keys [prompt seconds width height seed model image-url]} out opts]
+  (generate! (gen/video-body {:prompt prompt :seconds seconds :width width
+                              :height height :seed seed :model model
+                              :image-url image-url})
+             out (merge {:label (str "video " (or seed "")) :timeout-ms 900000} opts)))
+
+(defn narration!
+  "A line -> spoken audio, cast by the caller's role hint."
+  [{:keys [text voice locale model]} out opts]
+  (generate! (gen/voice-body {:text text :voice voice :locale locale :model model})
+             out (merge {:label "narration" :timeout-ms 300000} opts)))
+
+(defn music!
+  "A mood line -> a bed, long enough to sit under the whole piece."
+  [{:keys [prompt seconds model]} out opts]
+  (generate! (gen/sound-body {:prompt prompt :kind :music :seconds seconds
+                              :loop? true :model model})
+             out (merge {:label "bgm" :timeout-ms 600000} opts)))
+
+(defn sfx!
+  "A cue description -> a one-shot effect."
+  [{:keys [prompt seconds model]} out opts]
+  (generate! (gen/sound-body {:prompt prompt :kind :sfx :seconds (or seconds 2.0)
+                              :model model})
+             out (merge {:label "sfx" :timeout-ms 300000} opts)))

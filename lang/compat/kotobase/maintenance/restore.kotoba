@@ -1,0 +1,230 @@
+(ns kotobase.maintenance.restore
+  "Pure crash-recovery state for page-bounded database restore.
+
+  Immutable inventory pages remain the work source. The host persists each
+  returned checkpoint by CID and advances only a small ETag-CAS pointer after
+  create-only object writes have completed. Replaying a page is therefore safe:
+  equal destination CIDs are idempotent and different bytes fail closed."
+  (:require [ipld.core :as ipld]))
+
+(def format-version 1)
+(def statuses
+  #{:running :verifying :ready-to-publish :completed :failed :cancelled})
+
+(defn- encoded [node]
+  (let [bytes (ipld/encode node)]
+    {:node node :bytes bytes :cid (ipld/cid bytes)}))
+
+(defn restore-task
+  "Build deterministic identity for restoring one immutable inventory into one
+  target database. Tokens, attempts, owners, and clocks are excluded."
+  [{:keys [inventory-cid target-db-id head-cid entry-count page-count]}]
+  (when-not (and inventory-cid head-cid
+                 (string? target-db-id) (seq target-db-id)
+                 (pos-int? entry-count) (pos-int? page-count))
+    (throw (ex-info "Invalid database restore task"
+                    {:inventory-cid inventory-cid
+                     :target-db-id target-db-id
+                     :head-cid head-cid
+                     :entry-count entry-count
+                     :page-count page-count})))
+  (encoded
+   {"format" "kotobase/database-restore-task"
+    "version" format-version
+    "inventory" (ipld/link inventory-cid)
+    "target-db-id" target-db-id
+    "head" (ipld/link head-cid)
+    "entry-count" entry-count
+    "page-count" page-count}))
+
+(defn initial-checkpoint
+  [{:keys [task token attempt]}]
+  (when-not (and (:cid task) (string? token) (seq token) (pos-int? attempt))
+    (throw (ex-info "Invalid database restore attempt"
+                    {:task (:cid task) :token token :attempt attempt})))
+  (encoded
+   {"format" "kotobase/database-restore-checkpoint"
+    "version" format-version
+    "task" (ipld/link (:cid task))
+    "inventory" (get-in task [:node "inventory"])
+    "target-db-id" (get-in task [:node "target-db-id"])
+    "head" (get-in task [:node "head"])
+    "token" token
+    "attempt" attempt
+    "status" "running"
+    "next-page" 0
+    "processed-entries" 0
+    "restored" 0
+    "already-present" 0}))
+
+(defn validate-checkpoint [task checkpoint token attempt]
+  (let [node (if (:node checkpoint) (:node checkpoint) checkpoint)]
+    (when-not
+     (and (= "kotobase/database-restore-checkpoint" (get node "format"))
+          (= format-version (get node "version"))
+          (= (:cid task) (ipld/link-cid (get node "task")))
+          (= (get-in task [:node "inventory"]) (get node "inventory"))
+          (= (get-in task [:node "target-db-id"]) (get node "target-db-id"))
+          (= (get-in task [:node "head"]) (get node "head"))
+          (= token (get node "token"))
+          (= attempt (get node "attempt"))
+          (contains? (set (map name statuses)) (get node "status"))
+          (nat-int? (get node "next-page"))
+          (nat-int? (get node "processed-entries"))
+          (nat-int? (get node "restored"))
+          (nat-int? (get node "already-present")))
+      (throw (ex-info "Malformed or fenced database restore checkpoint"
+                      {:task (:cid task) :checkpoint node
+                       :token token :attempt attempt})))
+    node))
+
+(defn reclaim-checkpoint
+  "Move an expired non-terminal attempt to a fresh token/attempt without
+  discarding its durable page cursor. The host must ETag-CAS the pointer from
+  the old checkpoint to this CID, so the old owner is fenced."
+  [{:keys [task checkpoint old-token old-attempt new-token new-attempt]}]
+  (let [current (validate-checkpoint
+                 task checkpoint old-token old-attempt)]
+    (when-not
+     (and (contains? #{"running" "verifying" "ready-to-publish"}
+                     (get current "status"))
+          (string? new-token) (seq new-token)
+          (= (inc old-attempt) new-attempt))
+      (throw (ex-info "Invalid database restore reclaim"
+                      {:status (get current "status")
+                       :old-attempt old-attempt
+                       :new-attempt new-attempt})))
+    (encoded
+     (assoc current "token" new-token "attempt" new-attempt))))
+
+(defn advance-page
+  "Commit the outcome of exactly the next inventory page. The host must perform
+  CID verification and create-only writes before publishing this checkpoint."
+  [{:keys [task checkpoint token attempt page-ordinal page-cid
+           entry-count restored already-present first-entry last-entry]}]
+  (let [current (validate-checkpoint task checkpoint token attempt)
+        total (+ restored already-present)
+        next-processed (+ (get current "processed-entries") entry-count)
+        expected-entries (get-in task [:node "entry-count"])
+        expected-pages (get-in task [:node "page-count"])]
+    (when-not
+     (and (= "running" (get current "status"))
+          (= page-ordinal (get current "next-page"))
+          (< page-ordinal expected-pages)
+          page-cid
+          (pos-int? entry-count)
+          (nat-int? restored)
+          (nat-int? already-present)
+          (= entry-count total)
+          (<= next-processed expected-entries)
+          (vector? first-entry)
+          (vector? last-entry)
+          (not (pos? (compare first-entry last-entry)))
+          (or (nil? (get current "last-entry"))
+              (neg? (compare (get current "last-entry") first-entry))))
+      (throw (ex-info "Invalid database restore page advance"
+                      {:page-ordinal page-ordinal
+                       :expected-page (get current "next-page")
+                       :entry-count entry-count
+                       :restored restored
+                       :already-present already-present
+                       :first-entry first-entry
+                       :last-entry last-entry})))
+    (encoded
+     (-> current
+         (assoc "next-page" (inc page-ordinal)
+                "processed-entries" next-processed
+                "last-page" (ipld/link page-cid)
+                "last-entry" last-entry)
+         (update "restored" + restored)
+         (update "already-present" + already-present)))))
+
+(defn begin-verification
+  "Move a fully restored page cursor into an external verification scan. The
+  host seeds the expected head marker before publishing this checkpoint."
+  [{:keys [task checkpoint token attempt]}]
+  (let [current (validate-checkpoint task checkpoint token attempt)]
+    (when-not
+     (and (= "running" (get current "status"))
+          (= (get-in task [:node "page-count"]) (get current "next-page"))
+          (= (get-in task [:node "entry-count"])
+             (get current "processed-entries")))
+      (throw (ex-info "Database restore pages are not ready for verification"
+                      {:checkpoint current})))
+    (encoded
+     (assoc current
+            "status" "verifying"
+            "verification-scan-count" 0
+            "verification-pass" 0))))
+
+(defn advance-verification-scan
+  "Persist one bounded R2 marker listing page. Processing a pending marker
+  resets the count/cursor because the discovered marker set may have grown."
+  [{:keys [task checkpoint token attempt processed-marker?
+           page-count next-cursor]}]
+  (let [current (validate-checkpoint task checkpoint token attempt)
+        next-count (+ (get current "verification-scan-count" 0)
+                      page-count)]
+    (when-not
+     (and (= "verifying" (get current "status"))
+          (boolean? processed-marker?)
+          (nat-int? page-count)
+          (<= next-count (get-in task [:node "entry-count"]))
+          (or (not processed-marker?)
+              (and (zero? page-count) (nil? next-cursor)))
+          (or (nil? next-cursor)
+              (and (string? next-cursor) (seq next-cursor))))
+      (throw (ex-info "Invalid database restore verification scan advance"
+                      {:checkpoint current
+                       :processed-marker? processed-marker?
+                       :page-count page-count
+                       :next-cursor next-cursor})))
+    (encoded
+     (if processed-marker?
+       (-> current
+           (assoc "verification-scan-count" 0)
+           (update "verification-pass" (fnil inc 0))
+           (dissoc "verification-cursor"))
+       (cond-> (update current "verification-scan-count"
+                       (fnil + 0) page-count)
+         next-cursor (assoc "verification-cursor" next-cursor)
+         (nil? next-cursor) (dissoc "verification-cursor"))))))
+
+(defn ready-to-publish
+  "Fence page processing after every declared page and entry is durable. Head
+  publication happens only after this immutable checkpoint is pointer-visible."
+  [{:keys [task checkpoint token attempt verified-reachable
+           verification-page-count]
+    :or {verification-page-count 0}}]
+  (let [current (validate-checkpoint task checkpoint token attempt)]
+    (when-not
+     (and (contains? #{"running" "verifying"}
+                     (get current "status"))
+          (= (get-in task [:node "page-count"]) (get current "next-page"))
+          (= (get-in task [:node "entry-count"])
+             (get current "processed-entries"))
+          (or (= "running" (get current "status"))
+              (= verified-reachable
+                 (+ (get current "verification-scan-count")
+                    verification-page-count)))
+          (= (get-in task [:node "entry-count"]) verified-reachable))
+      (throw (ex-info "Database restore is not ready to publish"
+                      {:checkpoint current
+                       :verified-reachable verified-reachable})))
+    (encoded
+     (assoc current
+            "status" "ready-to-publish"
+            "verified-reachable" verified-reachable))))
+
+(defn complete
+  "Record terminal completion after target HeadCAS. A crash after HeadCAS can
+  safely call this again when the observed target head equals task.head."
+  [{:keys [task checkpoint token attempt observed-head]}]
+  (let [current (validate-checkpoint task checkpoint token attempt)
+        expected-head (ipld/link-cid (get-in task [:node "head"]))]
+    (when-not (and (= "ready-to-publish" (get current "status"))
+                   (= expected-head observed-head))
+      (throw (ex-info "Database restore head publication is not verified"
+                      {:expected expected-head :observed observed-head
+                       :status (get current "status")})))
+    (encoded (assoc current "status" "completed"))))

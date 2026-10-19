@@ -1,0 +1,186 @@
+(ns kotoba.lang.fs-host
+  "A real, root-confined `kotoba.lang.fs/IFilesystem` for hosts that have an OS
+  filesystem: `#?(:clj java.nio/java.io, :cljs node:fs)`.
+
+  ## Why this is a separate namespace
+
+  `kotoba.lang.fs` is pure: path ops, the `IFilesystem` protocol, and an
+  in-memory implementation. Requiring it must stay free of any JVM or Node
+  filesystem dependency, because a kotoba-WASM cell requires it too. So the
+  host binding lives here, in its own namespace, exactly the way
+  `provider.http-transport` sits beside `provider.http` and
+  `provider.scoped-fs-transport` sits beside `provider.scoped-fs` (ADR 0066 /
+  0117 / 0147). A reviewer can check the separation mechanically: nothing in
+  `fs.cljc` mentions `java.nio`, `js/require`, or this namespace.
+
+  This namespace does NOT change `kotoba.lang.fs` and does NOT add a
+  `slurp`/`spit` convenience. Ambient filesystem authority is the thing the
+  protocol exists to remove; a helper that reads any path the caller names
+  would put it straight back.
+
+  ## No ambient authority: `:root` is required
+
+  There is no default root -- not CWD, not `$HOME`, not `/tmp`. The host must
+  pass `:root` as an absolute path to an existing directory. Every guest path
+  is resolved against it and REFUSED, never silently clamped, when it tries to
+  leave: `..`, absolute paths, `~`, null bytes, backslashes, empty segments,
+  over-long paths. The refusal codes are taken verbatim from
+  `provider.scoped-fs/resolve-path` rather than invented here, so a caller that
+  already branches on that vocabulary keeps working:
+
+  | code                | refused                                        |
+  |---------------------|------------------------------------------------|
+  | `:fs/empty-path`    | `\"\"`, `\"/\"`-only, all-blank segments             |
+  | `:fs/null-byte`     | any NUL in the path                            |
+  | `:fs/backslash`     | any `\\` (a separator on some hosts)            |
+  | `:fs/absolute`      | leading `/`                                    |
+  | `:fs/home-escape`   | leading `~`                                    |
+  | `:fs/path-too-long` | over `max-path-bytes` (1024) UTF-8 bytes       |
+  | `:fs/escape`        | any `.` or `..` segment; symlink out of root   |
+
+  Symlinks are resolved (canonical path on the JVM, `realpathSync` on Node)
+  and re-checked against the canonical root, so a symlink planted inside the
+  root pointing outside it is refused with `:fs/escape` too.
+
+  ## Bounded reads
+
+  `:max-bytes` (default 1 MiB) bounds a single `read`. The size is taken from
+  `stat` and refused BEFORE any bytes are loaded, so a huge file costs a stat,
+  not a heap. The same bound applies to `write`, so this handle cannot create a
+  file it would then refuse to read back.
+
+  ## Errors are data
+
+  Every failure is an `ex-info` carrying a stable `:type` from `error-types`.
+  Callers branch on that keyword; they never name `java.io.IOException` (which
+  cannot cross to cljs) or match on a message. This is the same move
+  `kotoba.lang.json`'s `:type :json/parse-error` made, for the same reason.
+  Host exceptions are caught and retyped as `:fs/io` with the original message
+  under `:fs/message`.
+
+  ## One deliberate divergence from `mem-filesystem`
+
+  `mem-filesystem` returns `nil` for a missing `read`. This implementation
+  THROWS `:fs/not-found` instead. A missing file and an empty file are
+  different events on a real filesystem, and `nil` conflates them; a bare
+  `nil` also tends to surface far from the read as a NullPointerException.
+  Code written against the mem impl that relies on nil-punning a missing read
+  will see an exception here -- that is the one behavioural difference to
+  check when swapping the handle. `delete` of a missing path stays a no-op
+  `nil`, matching the mem impl.
+
+  Zero third-party deps."
+  (:require [clojure.string :as str]
+            [kotoba.lang.fs :as fs])
+  )
+
+;; ---------------------------------------------------------------------------
+;; constants + error vocabulary
+;; ---------------------------------------------------------------------------
+
+(def max-path-bytes
+  "Longest guest path accepted, in UTF-8 bytes. Same value as
+  `provider.scoped-fs/max-path-bytes`."
+  1024)
+
+(def default-max-bytes
+  "Default `:max-bytes` bound for a single read/write when the host does not
+  set one. 1 MiB."
+  1048576)
+
+(def error-types
+  "Every `:type` this namespace throws. A caller can branch on these without
+  naming a host exception class."
+  #{:fs/empty-path :fs/null-byte :fs/backslash :fs/absolute :fs/home-escape
+    :fs/path-too-long :fs/escape
+    :fs/not-found :fs/too-large :fs/is-directory :fs/not-a-directory
+    :fs/io :fs/bad-root})
+
+(defn- refuse!
+  "Throw a typed refusal. `type` must be in `error-types`."
+  ([type message] (refuse! type message {}))
+  ([type message data]
+   (throw (ex-info message (assoc data :type type)))))
+
+(defn- utf8-byte-count [s]
+  )
+
+;; ---------------------------------------------------------------------------
+;; pure path policy (no OS)
+;; ---------------------------------------------------------------------------
+
+(defn resolve-relative
+  "Pure path policy: `{:ok normalized-relative}` or `{:error <code>}`.
+
+  Deliberately identical in behaviour to `provider.scoped-fs/resolve-path`
+  (that namespace lives in another repo, which this one cannot depend on --
+  `fs` has zero third-party deps by design). Keep the two in step."
+  [relative]
+  (let [s (str relative)]
+    (cond
+      (str/blank? s)                {:error :fs/empty-path}
+      (str/includes? s "\0")        {:error :fs/null-byte}
+      (str/includes? s "\\")        {:error :fs/backslash}
+      (str/starts-with? s "/")      {:error :fs/absolute}
+      (str/starts-with? s "~")      {:error :fs/home-escape}
+      (> (utf8-byte-count s)
+         max-path-bytes)            {:error :fs/path-too-long}
+      :else
+      (let [segs (vec (remove str/blank? (str/split s #"/")))]
+        (cond
+          (empty? segs)                  {:error :fs/empty-path}
+          (some #{".." "."} segs)        {:error :fs/escape}
+          :else {:ok (str/join "/" segs)})))))
+
+(defn- checked-relative
+  "`resolve-relative` or throw the typed refusal."
+  [relative]
+  (let [r (resolve-relative relative)]
+    (if-let [err (:error r)]
+      (refuse! err (str "path refused: " (name err)) {:fs/path (str relative)})
+      (:ok r))))
+
+(defn under-root?
+  "True when `canonical-child` is `canonical-root` itself or strictly under it.
+  Pure string test on two already-canonical absolute paths (same shape as
+  `provider.scoped-fs-transport/under-root?`)."
+  [canonical-root canonical-child]
+  (let [r (str canonical-root)
+        c (str canonical-child)]
+    (or (= r c)
+        (and (str/starts-with? c r)
+             (or (str/ends-with? r "/")
+                 (str/starts-with? (subs c (count r)) "/"))))))
+
+(defn- bounded! [n max-bytes what path]
+  (when (> n max-bytes)
+    (refuse! :fs/too-large (str what " exceeds :max-bytes")
+             {:fs/path path :fs/size n :fs/max-bytes max-bytes})))
+
+;; ---------------------------------------------------------------------------
+;; JVM
+;; ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+;; ---------------------------------------------------------------------------
+;; Node (nbb / ClojureScript on Node)
+;; ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+

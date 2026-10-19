@@ -1,0 +1,629 @@
+(ns presentationml.parse
+  "Small PresentationML package XML to EDN projection helpers."
+  (:require [clojure.string :as str]
+            [drawingml.parse :as dml]
+            [xml.parse :as xp]))
+
+(def default-width 10.0)
+(def default-height 5.625)
+
+(defn parse-long-safe [x]
+  (when (and x (re-matches #"-?\d+" (str x)))
+    ))
+
+(defn slide-size [xml]
+  (if-let [sld (re-find #"<p:sldSz\b[^>]*>" (or xml ""))]
+    {:presentationml/width (dml/emu->inch (dml/xml-attr sld "cx") default-width)
+     :presentationml/height (dml/emu->inch (dml/xml-attr sld "cy") default-height)}
+    {:presentationml/width default-width
+     :presentationml/height default-height}))
+
+(defn slide-number [name]
+  (or (some-> (second (re-find #"slide(\d+)\.xml$" (str name))) parse-long-safe)
+      0))
+
+(defn rels-path [part-path]
+  (let [path (str part-path)
+        idx (str/last-index-of path "/")]
+    (if idx
+      (str (subs path 0 idx) "/_rels/" (subs path (inc idx)) ".rels")
+      (str "_rels/" path ".rels"))))
+
+(defn- dirname [path]
+  (if-let [idx (str/last-index-of (str path) "/")]
+    (subs (str path) 0 idx)
+    ""))
+
+(defn- normalize-path [path]
+  (let [absolute? (str/starts-with? path "/")]
+    (->> (str/split (str/replace-first path #"^/" "") #"/")
+         (reduce (fn [parts part]
+                   (case part
+                     "" parts
+                     "." parts
+                     ".." (vec (butlast parts))
+                     (conj parts part)))
+                 [])
+         (str/join "/")
+         (#(if absolute? % %)))))
+
+(defn resolve-target [source-part target]
+  (let [target (str target)]
+    (cond
+      (str/blank? target) target
+      (str/starts-with? target "/") (normalize-path target)
+      (re-find #"^[A-Za-z][A-Za-z0-9+.-]*:" target) target
+      :else (normalize-path (str (dirname source-part) "/" target)))))
+
+(defn relationships [entries part-path]
+  (let [rels-xml (entries (rels-path part-path))]
+    (into {}
+          (keep (fn [match]
+                  (let [tag (if (string? match) match (first match))
+                        id (dml/xml-attr tag "Id")
+                        target (dml/xml-attr tag "Target")
+                        target-mode (dml/xml-attr tag "TargetMode")]
+                    (when id
+                      [id (cond-> {:id id
+                                   :type (dml/xml-attr tag "Type")
+                                   :target target}
+                            target (assoc :target-path (resolve-target part-path target))
+                            target-mode (assoc :target-mode target-mode))]))))
+          (re-seq #"<Relationship\b[^>]*/?>" (or rels-xml "")))))
+
+(defn- workbook-path [entries chart-part]
+  (some (fn [{:keys [target-path target type]}]
+          (when (or (some-> target-path (str/ends-with? ".xlsx"))
+                    (some-> target (str/ends-with? ".xlsx"))
+                    (some-> type (str/includes? "/package")))
+            target-path))
+        (vals (relationships entries chart-part))))
+
+(defn slide-relationships [entries slide-path]
+  (into {}
+        (map (fn [[id rel]]
+               [id (cond-> rel
+                     (some-> (:target-path rel) (str/includes? "/charts/"))
+                     (assoc :workbook-path (workbook-path entries (:target-path rel))))]))
+        (relationships entries slide-path)))
+
+(defn theme-colors [theme-xml]
+  (let [roles ["dk1" "lt1" "dk2" "lt2" "accent1" "accent2" "accent3" "accent4" "accent5" "accent6" "hlink" "folHlink"]]
+    (into {}
+          (keep (fn [role]
+                  (when-let [[_ block] (re-find (re-pattern (str "<a:" role "\\b[^>]*>([\\s\\S]*?)</a:" role ">"))
+                                                (or theme-xml ""))]
+                    (when-let [color (dml/first-color block)]
+                      [(keyword "presentationml.color" role) color]))))
+          roles)))
+
+(defn theme-color-roles
+  "Plain-keyword {:accent1 \"RRGGBB\" ...} theme colors, for drawingml's
+  <a:schemeClr> resolution (drawingml stays decoupled from presentationml's
+  namespaced keyword convention)."
+  [theme-xml]
+  (into {} (map (fn [[k v]] [(keyword (name k)) v])) (theme-colors theme-xml)))
+
+(defn- rel-target-by-type-suffix [entries part-path type-suffix]
+  (some (fn [{:keys [type target-path]}]
+          (when (and target-path (str/ends-with? (or type "") type-suffix))
+            target-path))
+        (vals (relationships entries part-path))))
+
+(defn layout-path
+  "The slideLayout part path referenced by a slide, via its .rels."
+  [entries slide-path]
+  (rel-target-by-type-suffix entries slide-path "/slideLayout"))
+
+(defn master-path
+  "The slideMaster part path referenced by a slideLayout, via its .rels."
+  [entries layout-path]
+  (when layout-path
+    (rel-target-by-type-suffix entries layout-path "/slideMaster")))
+
+;; The OOXML default <p:clrMap>: used per-role whenever the master's own
+;; clrMap tag doesn't specify that role explicitly.
+(def ^:private default-clr-map
+  {"bg1" "lt1" "tx1" "dk1" "bg2" "lt2" "tx2" "dk2"
+   "accent1" "accent1" "accent2" "accent2" "accent3" "accent3"
+   "accent4" "accent4" "accent5" "accent5" "accent6" "accent6"
+   "hlink" "hlink" "folHlink" "folHlink"})
+
+(defn clr-map-aliases
+  "The slide's effective clrMap ({:bg1 :lt1 :tx1 :dk1 ...} alias->theme-slot),
+  read from its slideMaster's own <p:clrMap .../> attributes when present,
+  falling back to the OOXML default map per-role otherwise. A deck whose
+  master swaps the usual dk/lt assignment (e.g. some dark-theme masters)
+  previously always resolved schemeClr through the default map regardless,
+  silently picking the wrong color."
+  [entries slide-path]
+  (let [layout (layout-path entries slide-path)
+        master (master-path entries layout)
+        master-xml (some-> master entries)
+        clr-map-tag (some-> master-xml (->> (re-find #"<p:clrMap\b[^>]*/?>")))]
+    (into {}
+          (map (fn [[role default-slot]]
+                 [(keyword role)
+                  (keyword (or (some-> clr-map-tag (dml/xml-attr role)) default-slot))]))
+          default-clr-map)))
+
+(def ^:private clr-map-roles
+  ["bg1" "tx1" "bg2" "tx2" "accent1" "accent2" "accent3" "accent4" "accent5" "accent6" "hlink" "folHlink"])
+
+(defn clr-map-override
+  "A part's OWN <p:clrMapOvr><a:overrideClrMapping .../></p:clrMapOvr>, as
+  an alias->theme-slot map (same shape as clr-map-aliases), or nil when it
+  just inherits its parent's clrMap via <a:masterClrMapping/> (the common
+  case -- every slide/layout this package's own writer emits uses that,
+  and most real decks never override per-slide either). A slide/layout
+  that DOES remap colors differently from its master previously always
+  collapsed to the master's mapping regardless."
+  [part-xml]
+  (when-let [ovr-tag (some->> (re-find #"<p:clrMapOvr\b[^>]*>([\s\S]*?)</p:clrMapOvr>" (or part-xml ""))
+                              second
+                              (re-find #"<a:overrideClrMapping\b[^>]*/?>"))]
+    (into {}
+          (keep (fn [role]
+                  (when-let [slot (dml/xml-attr ovr-tag role)]
+                    [(keyword role) (keyword slot)])))
+          clr-map-roles)))
+
+(defn- gradient-fill->background
+  "dml/gradient-fill's {:stops [{:position .. :color ..} ...] :angle ..}
+  into slides.pptx/background-fill-xml's own gradient shape, {:stops
+  [[pos hex] ...] :angle ..} -- a DIFFERENT stop representation (tuples,
+  not maps) than the shape-level gradient uses, predating gradient-fill
+  and kept as-is rather than migrated, since background-fill-xml (the one
+  and only consumer) already round-trips it correctly."
+  [{:keys [stops angle]}]
+  (cond-> {:stops (mapv (fn [{:keys [position color]}] [(or position 0) color]) stops)}
+    angle (assoc :angle angle)))
+
+(defn- bg-fill
+  "The literal <p:bg>...</p:bg> fill (if any) inside `xml`, whether that's a
+  slideMaster's own or a slide's own -- both use the exact same schema shape
+  (a literal solidFill/gradFill, or a theme-referenced bgRef), so one reader
+  covers both (see master-background/slide-background)."
+  [xml theme-colors]
+  (let [bg-block (some-> (re-find #"<p:bg\b[^>]*>([\s\S]*?)</p:bg>" (or xml "")) second)]
+    (or (some-> bg-block (dml/gradient-fill theme-colors) gradient-fill->background)
+        (some-> bg-block (dml/solid-fill theme-colors))
+        (some-> (re-find #"<p:bgRef\b[^>]*>([\s\S]*?)</p:bgRef>" (or bg-block "")) second
+                (dml/first-color theme-colors)))))
+
+(defn master-background
+  "A slideMaster's own background fill: either a literal <p:bg><p:bgPr>
+  <a:solidFill>/<a:gradFill>.../<p:bgPr></p:bg> (what this package's OWN
+  writer emits) or a theme-referenced <p:bg><p:bgRef idx=\"...\">
+  <a:schemeClr val=\"...\"/></p:bgRef></p:bg> (the common form in real
+  PowerPoint-authored masters), resolved through the SAME theme-colors map
+  used for shape schemeClr resolution. A gradient background now carries
+  its FULL multi-stop fidelity (via dml/gradient-fill, tried before the
+  first-stop-only solid-fill fallback) -- previously always collapsed to
+  a single flat color, even though slides.pptx's own writer has supported
+  a real multi-stop gradient background since before this. nil when the
+  master has no <p:bg> at all."
+  [master-xml theme-colors]
+  (bg-fill master-xml theme-colors))
+
+(defn slide-background
+  "A slide's OWN <p:bg> override, same schema shape as master-background --
+  when present, PowerPoint gives it precedence over the slideMaster's own
+  background for THAT one slide (a common real-deck pattern: a
+  differently-colored title/section-divider slide). Previously entirely
+  unhandled -- master-background only ever looked at the slideMaster's own
+  XML, so a slide with its own background override always round-tripped
+  as if it were using the plain master background instead. nil when the
+  slide has no <p:bg> of its own at all, the overwhelming common case
+  (most slides simply inherit the master's background)."
+  [slide-xml theme-colors]
+  (bg-fill slide-xml theme-colors))
+
+(defn- effective-clr-map-aliases
+  "clr-map-aliases (the master's own clrMap), overridden by the LAYOUT's own
+  <p:clrMapOvr> if it has a real one, overridden again by the SLIDE's own
+  <p:clrMapOvr> if IT has a real one -- matching OOXML's actual precedence
+  (slide > layout > master), instead of always collapsing to the master's
+  mapping regardless of what the slide/layout themselves declare."
+  [entries slide-path]
+  (let [layout (layout-path entries slide-path)
+        layout-ovr (some-> layout entries clr-map-override)
+        slide-ovr (some-> slide-path entries clr-map-override)]
+    (merge (clr-map-aliases entries slide-path) layout-ovr slide-ovr)))
+
+(defn theme-color-map-for-slide
+  "theme-color-roles (the real :dk1/:lt1/:accent1... theme slots) PLUS the
+  slide's effective clrMap aliases (:bg1/:tx1/:bg2/:tx2/...) resolved to
+  those slots -- <a:schemeClr val=\"...\"> in shape XML references the
+  ALIASES, not the raw theme slots, so both need to be in the map drawingml
+  looks color references up against (see drawingml.parse/first-color, which
+  checks for a pre-resolved alias entry before falling back to the default
+  bg/tx->dk/lt translation)."
+  [entries slide-path theme-xml]
+  (let [slots (theme-color-roles theme-xml)
+        aliases (effective-clr-map-aliases entries slide-path)]
+    (merge slots
+           (into {}
+                 (keep (fn [[alias slot]]
+                         (when-let [hex (get slots slot)]
+                           [alias hex])))
+                 aliases))))
+
+(defn placeholder-geometry
+  "Placeholder geometry index for a slide: its slideLayout's placeholder
+  positions, falling back to its slideMaster's. Feeds drawingml's
+  :placeholder-geometry opt so shapes that omit <a:xfrm> inherit the same
+  position PowerPoint itself would apply."
+  [entries slide-path]
+  (let [layout (layout-path entries slide-path)
+        master (master-path entries layout)]
+    (dml/merge-placeholder-geometry-indexes
+     (some-> layout entries dml/placeholder-geometry-index)
+     (some-> master entries dml/placeholder-geometry-index))))
+
+(defn- font-scheme-block [theme-xml tag]
+  (second (re-find (re-pattern (str "<a:" tag ">([\\s\\S]*?)</a:" tag ">")) (or theme-xml ""))))
+
+(defn- font-scheme-typeface [block tag]
+  (some-> (second (re-find (re-pattern (str "<a:" tag "\\b[^>]*typeface=\"([^\"]*)\"")) (or block "")))
+          dml/xml-unescape
+          not-empty))
+
+(defn theme-fonts
+  "Theme fonts by role and script slot. :majorFont/:minorFont are the Latin
+  typefaces (the only ones this package read before); :majorFont-ea/
+  :minorFont-ea and :majorFont-cs/:minorFont-cs are the East Asian and
+  Complex Script typefaces PowerPoint's Font dialog exposes separately --
+  without these a CJK deck's theme font is silently incomplete even though
+  the Latin typeface round-trips fine."
+  [theme-xml]
+  (let [major-block (font-scheme-block theme-xml "majorFont")
+        minor-block (font-scheme-block theme-xml "minorFont")]
+    (cond-> {:presentationml.font/majorFont (or (font-scheme-typeface major-block "latin") "Aptos Display")
+             :presentationml.font/minorFont (or (font-scheme-typeface minor-block "latin") "Aptos")}
+      (font-scheme-typeface major-block "ea") (assoc :presentationml.font/majorFont-ea (font-scheme-typeface major-block "ea"))
+      (font-scheme-typeface minor-block "ea") (assoc :presentationml.font/minorFont-ea (font-scheme-typeface minor-block "ea"))
+      (font-scheme-typeface major-block "cs") (assoc :presentationml.font/majorFont-cs (font-scheme-typeface major-block "cs"))
+      (font-scheme-typeface minor-block "cs") (assoc :presentationml.font/minorFont-cs (font-scheme-typeface minor-block "cs")))))
+
+(defn theme [entries]
+  (let [theme-xml (entries "ppt/theme/theme1.xml")
+        colors (theme-colors theme-xml)
+        fonts (theme-fonts theme-xml)]
+    (if theme-xml
+      (cond-> {:presentationml/source "ppt/theme/theme1.xml"}
+        (seq colors) (assoc :presentationml/colors colors)
+        (seq fonts) (assoc :presentationml/fonts fonts))
+      {})))
+
+(defn slide-title [shapes idx]
+  (or (some :drawingml/text shapes)
+      (str "Slide " (inc idx))))
+
+(defn- notes-slide-path
+  "The ppt/notesSlides/notesSlideN.xml part path a slide's speaker notes
+  live in, via the slide's own .rels (relationship type .../notesSlide)."
+  [entries slide-path]
+  (some (fn [{:keys [type target-path]}]
+          (when (and target-path (str/ends-with? (or type "") "/notesSlide"))
+            target-path))
+        (vals (relationships entries slide-path))))
+
+(defn notes-text
+  "A slide's speaker notes text, or nil. The notesSlide part is structurally
+  a small slide of its own (a slide-image placeholder + a body placeholder
+  holding the actual note text), so this reuses dml/shapes rather than a
+  bespoke notes-only parser, and picks out the body placeholder's text."
+  [entries slide-path]
+  (when-let [notes-path (notes-slide-path entries slide-path)]
+    (when-let [notes-xml (entries notes-path)]
+      (some (fn [shape]
+              (when (= "body" (:type (:drawingml/placeholder shape)))
+                (:drawingml/text shape)))
+            (dml/shapes notes-xml)))))
+
+(defn comment-authors
+  "ppt/commentAuthors.xml's own author list (legacy <p:cmLst> comment
+  format's shared, package-wide author table -- every comment references
+  an author by id, never carrying the name inline), as {authorId-string ->
+  author-name}, or {} when the deck has no commentAuthors part at all."
+  [comment-authors-xml]
+  (into {}
+        (map (fn [tag] [(dml/xml-attr tag "id") (dml/xml-attr tag "name")]))
+        (re-seq #"<p:cmAuthor\b[^>]*/?>" (or comment-authors-xml ""))))
+
+(defn- comments-slide-path
+  "The ppt/comments/commentN.xml part path a slide's own review comments
+  live in, via the slide's own .rels (relationship type .../comments)."
+  [entries slide-path]
+  (some (fn [{:keys [type target-path]}]
+          (when (and target-path (str/ends-with? (or type "") "/comments"))
+            target-path))
+        (vals (relationships entries slide-path))))
+
+(defn slide-comments
+  "A slide's own PowerPoint review comments (legacy <p:cmLst> format --
+  <p:cm authorId=\"...\" dt=\"...\"><p:pos x=\"...\" y=\"...\"/><p:text>...
+  </p:text></p:cm>, via the slide's own .rels), as a vector of {:author
+  ... :text ... :date ...} (plus :x/:y in inches when the comment's own
+  <p:pos> is present), in document order, or nil when the slide has no
+  comments at all (the overwhelming common case). `authors` is
+  comment-authors' id->name map, resolved once per deck and passed in
+  rather than re-read per slide. Previously entirely unhandled --
+  PowerPoint review comments (a natural fit for this package's
+  collaborative-editing focus) always round-tripped losing every comment
+  completely."
+  [entries slide-path authors]
+  (when-let [comments-path (comments-slide-path entries slide-path)]
+    (when-let [comments-xml (entries comments-path)]
+      (not-empty
+       (vec (for [cm-block (dml/xml-elements comments-xml "p:cm")
+                  :let [open-tag (or (re-find #"<p:cm\b[^>]*>" cm-block) "")
+                        author-id (dml/xml-attr open-tag "authorId")
+                        date (dml/xml-attr open-tag "dt")
+                        pos-tag (re-find #"<p:pos\b[^>]*/?>" cm-block)
+                        text (dml/first-xml-text cm-block "p:text")]]
+              (cond-> {:author (get authors author-id) :text text}
+                date (assoc :date date)
+                (dml/xml-attr pos-tag "x") (assoc :x (dml/emu->inch (dml/xml-attr pos-tag "x") 0))
+                (dml/xml-attr pos-tag "y") (assoc :y (dml/emu->inch (dml/xml-attr pos-tag "y") 0)))))))))
+
+(defn transition
+  "A slide's own <p:transition> (a sibling of <p:cSld>, not one of its
+  descendants -- CT_Slide's own child, timing/advance metadata plus AT MOST
+  one transition-effect element from OOXML's ~40-odd choice group: fade,
+  wipe, push, cover, split, etc.). Rather than hardcoding a case per effect
+  type, the effect element's own tag/attrs are captured verbatim as :type/
+  :attrs -- faithfully round-tripping any of them (including the ones this
+  package doesn't specifically know about) without an exhaustive schema.
+  nil for the overwhelming common case, no <p:transition> at all (no visual
+  transition configured, PowerPoint's default 'none')."
+  [sld-xml]
+  (when-let [transition-xml (re-find #"<p:transition\b[^>]*/>|<p:transition\b[^>]*>[\s\S]*?</p:transition>"
+                                      (or sld-xml ""))]
+    (let [node (xp/parse transition-xml)
+          effect (first (xp/el-elements node))]
+      (cond-> {}
+        (xp/el-attr node "spd") (assoc :speed (xp/el-attr node "spd"))
+        (= "0" (xp/el-attr node "advClick")) (assoc :advance-on-click false)
+        (xp/el-attr node "advTm") (assoc :advance-after-time (parse-long-safe (xp/el-attr node "advTm")))
+        effect (assoc :type (name (xp/el-tag effect)))
+        (and effect (seq (xp/el-attrs effect))) (assoc :attrs (xp/el-attrs effect))))))
+
+(defn slide
+  ([idx path xml] (slide idx path xml {}))
+  ([idx path xml opts]
+  (let [shapes (dml/shapes xml {:part path
+                                :rels (:rels opts)
+                                :placeholder-geometry (:placeholder-geometry opts)
+                                :theme-colors (:theme-colors opts)})]
+    (cond-> {:presentationml/id (str "slide-" (inc idx))
+             :presentationml/title (slide-title shapes idx)
+             :presentationml/source path
+             :presentationml/shapes shapes}
+      (transition xml) (assoc :presentationml/transition (transition xml))
+      (:notes opts) (assoc :presentationml/notes (:notes opts))
+      (seq (:comments opts)) (assoc :presentationml/comments (:comments opts))
+      (slide-background xml (:theme-colors opts)) (assoc :presentationml/background (slide-background xml (:theme-colors opts)))))))
+
+(defn- slide-master-path [entries slide-path]
+  (master-path entries (layout-path entries slide-path)))
+
+(defn- master-id-from-path [path]
+  (some-> path (str/replace #"^.*/" "") (str/replace #"\.xml$" "")))
+
+(defn masters-info
+  "Distinct slideMaster parts referenced across `slide-paths`, each as
+  {:presentationml/id ... :presentationml/path ... :presentationml/background
+  ...}, in order of first appearance -- ONLY populated for decks that
+  actually use MORE than one distinct master. A single-master deck (the
+  overwhelming common case) gets nil here, so deck's output is completely
+  unchanged for it -- multi-master EDN only appears when the source PPTX
+  actually has sections with visually distinct masters."
+  [entries slide-paths theme-xml]
+  (let [distinct-paths (distinct (keep #(slide-master-path entries %) slide-paths))]
+    (when (> (count distinct-paths) 1)
+      (let [theme-colors (theme-color-roles theme-xml)]
+        (mapv (fn [path]
+                (let [bg (master-background (entries path) theme-colors)]
+                  (cond-> {:presentationml/id (master-id-from-path path) :presentationml/path path}
+                    bg (assoc :presentationml/background bg))))
+              distinct-paths)))))
+
+(defn- layout-type-from-xml [layout-xml]
+  (dml/xml-attr (or (re-find #"<p:sldLayout\b[^>]*>" (or layout-xml "")) "") "type"))
+
+(defn layouts-info
+  "Distinct slideLayout parts referenced across `slide-paths`, each as
+  {:presentationml/id ... :presentationml/path ... :presentationml/layout-type
+  ...}, same ONLY-when-more-than-one convention as masters-info -- a single-
+  layout deck (the overwhelming common case) gets nil here, unchanged output.
+  Previously a slide's specific layout assignment was read NOWHERE: the
+  write side (slides.pptx) already supported multiple layouts per master
+  (deck-layout-entries/slide-layout), but a slide re-exported after an
+  import round-trip always fell back to each master's IMPLICIT default
+  (nil/blank) layout, silently losing which named layout it actually used."
+  [entries slide-paths]
+  (let [distinct-paths (distinct (keep #(layout-path entries %) slide-paths))]
+    (when (> (count distinct-paths) 1)
+      (mapv (fn [path]
+              (cond-> {:presentationml/id (master-id-from-path path) :presentationml/path path}
+                (layout-type-from-xml (entries path))
+                (assoc :presentationml/layout-type (layout-type-from-xml (entries path)))))
+            distinct-paths))))
+
+(defn doc-properties
+  "The deck-level metadata fields OOXML carries in docProps/core.xml
+  (Dublin Core author/subject/keywords/category/lastModifiedBy/created/
+  modified) and docProps/app.xml (company/manager) -- previously only
+  dc:title was read anywhere; every other field was silently dropped on
+  import even when the source file had them (e.g. a deck re-exported by
+  this package after an import round-trip would lose its original
+  author/company/timestamps). Each field is present only when the source
+  XML actually has it -- {} for a deck with no extended metadata at all."
+  [core app]
+  (cond-> {}
+    (dml/first-xml-text core "dc:creator") (assoc :presentationml/author (dml/first-xml-text core "dc:creator"))
+    (dml/first-xml-text core "dc:subject") (assoc :presentationml/subject (dml/first-xml-text core "dc:subject"))
+    (dml/first-xml-text core "cp:keywords") (assoc :presentationml/keywords (dml/first-xml-text core "cp:keywords"))
+    (dml/first-xml-text core "cp:category") (assoc :presentationml/category (dml/first-xml-text core "cp:category"))
+    (dml/first-xml-text core "cp:lastModifiedBy") (assoc :presentationml/last-modified-by (dml/first-xml-text core "cp:lastModifiedBy"))
+    (dml/first-xml-text core "dcterms:created") (assoc :presentationml/created (dml/first-xml-text core "dcterms:created"))
+    (dml/first-xml-text core "dcterms:modified") (assoc :presentationml/modified (dml/first-xml-text core "dcterms:modified"))
+    (dml/first-xml-text app "Company") (assoc :presentationml/company (dml/first-xml-text app "Company"))
+    (dml/first-xml-text app "Manager") (assoc :presentationml/manager (dml/first-xml-text app "Manager"))))
+
+(defn- sld-id-positions
+  "The presentation's own <p:sldIdLst>'s id attributes, as {\"256\" 0,
+  \"257\" 1, ...} (sldId STRING -> 0-based position in the list) --
+  sections reference slides by this same sldId, never by path/rId, so
+  resolving a section's own <p14:sldId>s back to slide positions needs
+  this same document-order mapping."
+  [presentation-xml]
+  (into {} (map-indexed (fn [idx tag] [(dml/xml-attr tag "id") idx]))
+        (re-seq #"<p:sldId\b[^>]*/?>" (or presentation-xml ""))))
+
+(defn sections
+  "The presentation's own slide sections (Insert > Section in PowerPoint's
+  UI -- a common organizational/navigation aid for longer decks), from
+  <p:extLst>'s PowerPoint-2010 <p14:sectionLst> extension, as a vector of
+  {:name ... :slide-indices [...]} (0-based positions within the deck's
+  own slide order, resolved through <p:sldIdLst>'s own id -> position
+  mapping), or nil when the deck has no sections at all (the common
+  case). Previously entirely unhandled -- a sectioned deck always round-
+  tripped losing that organization completely."
+  [presentation-xml]
+  (when-let [section-lst-body (second (re-find #"<p14:sectionLst\b[^>]*>([\s\S]*?)</p14:sectionLst>" (or presentation-xml "")))]
+    (let [positions (sld-id-positions presentation-xml)]
+      (not-empty
+       (vec (for [section-block (dml/xml-elements section-lst-body "p14:section")
+                  :let [open-tag (or (re-find #"<p14:section\b[^>]*>" section-block) "")
+                        section-name (dml/xml-attr open-tag "name")
+                        sld-ids (map second (re-seq #"<p14:sldId\b[^>]*\bid=\"(\d+)\"" section-block))
+                        indices (vec (keep #(get positions %) sld-ids))]]
+              (cond-> {:slide-indices indices}
+                section-name (assoc :name section-name))))))))
+
+(defn handout-master?
+  "Whether the deck has a handout master part at all (Print Handouts'
+  layout, via ppt/presentation.xml's own .rels, relationship type
+  .../handoutMaster). A print-layout template with no meaningful per-deck
+  DATA to extract (unlike notes, which carry actual per-slide text) --
+  this only captures its presence, not any content. false for the
+  overwhelming common case of a deck with no handout master at all."
+  [entries]
+  (boolean (some (fn [{:keys [type]}] (str/ends-with? (or type "") "/handoutMaster"))
+                 (vals (relationships entries "ppt/presentation.xml")))))
+
+(defn custom-xml-parts
+  "Every custom XML part pair (customXml/itemN.xml + its own itemPropsN.xml,
+  cross-referenced via customXml/_rels/itemN.xml.rels rather than assumed
+  from matching N -- real files don't always number them in step), as a
+  vector of {:content \"...\" :props-content \"...\"}, in item-number
+  order, preserved as opaque raw XML strings. Custom XML parts hold
+  arbitrary, tool/add-in-specific data with no fixed schema this package
+  could meaningfully interpret -- round-tripping the exact source text is
+  the only faithful option, same rationale as this session's other
+  \"preserve raw, don't reinterpret\" fields (custom-geometry, shape-
+  adjustments). nil when the deck has none at all (the overwhelming
+  common case)."
+  [entries]
+  (let [item-paths (->> (keys entries)
+                        (filter #(re-matches #"customXml/item\d+\.xml" %))
+                        (sort-by (fn [p] (some-> (re-find #"\d+" p) parse-long-safe))))]
+    (not-empty
+     (vec (for [item-path item-paths
+                :let [props-path (some (fn [{:keys [type target-path]}]
+                                          (when (and target-path (str/ends-with? (or type "") "/customXmlProps"))
+                                            target-path))
+                                        (vals (relationships entries item-path)))]]
+            (cond-> {:content (entries item-path)}
+              props-path (assoc :props-content (entries props-path))))))))
+
+(defn- embedded-font-style [font-block style-tag rels]
+  (when-let [rid (dml/xml-attr (or (re-find (re-pattern (str "<p:" style-tag "\\b[^>]*/?>")) font-block) "")
+                               "r:id")]
+    (when-let [target-path (:target-path (get rels rid))]
+      {:rel-id rid :target-path target-path})))
+
+(defn embedded-fonts
+  "Every font declared in presentation.xml's own <p:embeddedFontLst> (an
+  explicit per-file opt-in -- PowerPoint only writes this when the author
+  turns on \"Embed fonts in the file\") -- typeface name + each present
+  style variant's (regular/bold/italic/boldItalic) resolved rel-id and
+  target-path, via presentation.xml's own .rels. Reference-metadata only,
+  same pattern as this package's other embedded-binary references (chart
+  workbooks, images) -- raw font BYTES are out of scope for this XML-text
+  parser. nil when the deck embeds no fonts at all, the overwhelming
+  common case."
+  [entries presentation-xml]
+  (let [rels (relationships entries "ppt/presentation.xml")]
+    (not-empty
+     (vec (for [font-block (dml/xml-elements (or presentation-xml "") "p:embeddedFont")
+                :let [typeface (dml/xml-attr (or (re-find #"<p:font\b[^>]*/?>" font-block) "") "typeface")]
+                :when typeface]
+            (cond-> {:typeface typeface}
+              (embedded-font-style font-block "regular" rels) (assoc :regular (embedded-font-style font-block "regular" rels))
+              (embedded-font-style font-block "bold" rels) (assoc :bold (embedded-font-style font-block "bold" rels))
+              (embedded-font-style font-block "italic" rels) (assoc :italic (embedded-font-style font-block "italic" rels))
+              (embedded-font-style font-block "boldItalic" rels) (assoc :bold-italic (embedded-font-style font-block "boldItalic" rels))))))))
+
+(defn deck
+  ([entries] (deck entries {}))
+  ([entries opts]
+   (let [presentation (entries "ppt/presentation.xml")
+         core (entries "docProps/core.xml")
+         app (entries "docProps/app.xml")
+         size (slide-size presentation)
+         theme-xml (entries "ppt/theme/theme1.xml")
+         slide-paths (->> (keys entries)
+                          (filter #(re-matches #"ppt/slides/slide\d+\.xml" %))
+                          (sort-by slide-number))
+         masters (masters-info entries slide-paths theme-xml)
+         master-ref-by-path (into {} (map (juxt :presentationml/path :presentationml/id)) masters)
+         layouts (layouts-info entries slide-paths)
+         layout-ref-by-path (into {} (map (juxt :presentationml/path :presentationml/id)) layouts)
+         authors (comment-authors (entries "ppt/commentAuthors.xml"))
+         slides (vec (map-indexed (fn [idx path]
+                                     (cond-> (slide idx path (entries path)
+                                                    {:rels (slide-relationships entries path)
+                                                     :placeholder-geometry (placeholder-geometry entries path)
+                                                     :theme-colors (theme-color-map-for-slide entries path theme-xml)
+                                                     :notes (notes-text entries path)
+                                                     :comments (slide-comments entries path authors)})
+                                       (seq masters)
+                                       (assoc :presentationml/master-ref
+                                              (get master-ref-by-path (slide-master-path entries path)))
+                                       (seq layouts)
+                                       (assoc :presentationml/layout-ref
+                                              (get layout-ref-by-path (layout-path entries path)))))
+                                   slide-paths))
+         title (or (:title opts)
+                   (:presentationml/title opts)
+                   (dml/first-xml-text core "dc:title")
+                   "Imported deck")
+         theme (theme entries)]
+     (merge {:presentationml/id "imported-pptx"
+             :presentationml/title title
+             :presentationml/import {:presentationml/format :pptx
+                                     :presentationml/text-extraction :drawingml-xml}
+             :presentationml/slides (if (seq slides)
+                                      slides
+                                      [{:presentationml/id "slide-1"
+                                        :presentationml/title title
+                                        :presentationml/shapes []}])}
+            size
+            (when (seq theme) {:presentationml/theme theme})
+            (when (seq masters) {:presentationml/masters masters})
+            (when (seq layouts) {:presentationml/layouts layouts})
+            (when-let [s (sections presentation)] {:presentationml/sections s})
+            (when (handout-master? entries) {:presentationml/handout-master? true})
+            (when-let [cxp (custom-xml-parts entries)] {:presentationml/custom-xml-parts cxp})
+            (when-let [ef (embedded-fonts entries presentation)] {:presentationml/embedded-fonts ef})
+            (doc-properties core app)))))
+
+(defn valid-deck? [deck]
+  (and (map? deck)
+       (string? (:presentationml/id deck))
+       (sequential? (:presentationml/slides deck))
+       (every? #(sequential? (:presentationml/shapes %)) (:presentationml/slides deck))))

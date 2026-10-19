@@ -1,0 +1,233 @@
+(ns pay.core
+  "On-chain creator-payment rail primitives — pure Clojure/ClojureScript.
+
+  Re-homed from `@etzhayyim/sdk`'s payment surface (`pay.ts`: pay /
+  payStream / splitDistribute / escrow) as a vendor-neutral kotoba-lang
+  common library (superproject ADR-2607092700), so that vendor apps
+  (jk-luxury club-shinshi / net-babiniku, gftdcojp apps, …) can settle
+  creator payments (tip / subscribe / PPV) without depending on the
+  etzhayyim substrate — whose payment-purpose doctrine prohibits external
+  `tip`/`subscription`/`purchase` and therefore was never a valid home for
+  this surface.
+
+  Layer contract (same as kotoba-lang/base-l2 / treasury):
+  - **zero network I/O** — this namespace never talks to a chain, an RPC,
+    or a PDS. Every on-chain effect goes through the `PayRail` protocol,
+    which a host backs with real adapters (kotoba-lang/base-l2 for
+    RPC/ERC-4337, kotoba-lang/treasury for on-chain verification,
+    kotoba-lang/wallet for signing).
+  - **zero key custody** — no private key ever enters this library.
+    Signing happens on the payer's device (non-custodial), mirroring the
+    no-server-key invariant the original SDK stated.
+  - **honest default** — `unprovisioned-rail` HOLDs every operation with
+    `:pay/unprovisioned-capability` instead of pretending to settle,
+    mirroring net-babiniku's `UnprovisionedCapability` (ADR-2607062200).
+
+  Amount representation: USDC base units (micros, 6 decimals) as an
+  integer. In ClojureScript this is a JS number — safe below 2^53 micros
+  (≈ 9.0e9 USDC), far above any realistic creator payment; wire records
+  should carry amounts as strings (see `->receipt`)."
+  (:require [clojure.string :as str]))
+
+;; ─── USDC units ─────────────────────────────────────────────────────
+
+(def micros-per-usdc 1000000)
+
+(defn- parse-int
+  [s]
+  )
+
+(defn parse-usdc
+  "Human-readable USDC amount string (\"10.00\") → base units (10000000).
+  Fractional digits beyond 6 are truncated (matches the original
+  parseUsdc). Throws ex-info {:pay/error :invalid-amount} on bad input."
+  [human]
+  (let [[m whole frac] (re-matches #"(\d+)(?:\.(\d*))?" (str human))]
+    (when-not m
+      (throw (ex-info "invalid USDC amount"
+                      {:pay/error :invalid-amount :input human})))
+    (+ (* (parse-int whole) micros-per-usdc)
+       (parse-int (subs (str (or frac "") "000000") 0 6)))))
+
+(defn format-usdc
+  "USDC base units → human string. (format-usdc 10500000) => \"10.5\"."
+  [micros]
+  (let [whole (quot micros micros-per-usdc)
+        frac  (-> (rem micros micros-per-usdc)
+                  str
+                  (as-> s (str (apply str (repeat (- 6 (count s)) "0")) s))
+                  (str/replace #"0+$" ""))]
+    (if (seq frac) (str whole "." frac) (str whole))))
+
+;; ─── Streaming flow rate (Superfluid-shaped, adapter-agnostic) ──────
+
+(def ^:private period-seconds
+  {"second" 1 "minute" 60 "hour" 3600 "day" 86400
+   "week" 604800 "month" 2592000 "year" 31536000})
+
+(defn flow-rate-per-second
+  "\"10.00 / month\" → USDC micros per second (integer division).
+  Throws ex-info {:pay/error :invalid-flow-rate} on bad input."
+  [per-period]
+  (let [[m amount period] (re-matches #"([\d.]+)\s*/\s*(second|minute|hour|day|week|month|year)"
+                                      (str/trim (str per-period)))]
+    (when-not m
+      (throw (ex-info "invalid flow rate (expected '<amount> / <period>')"
+                      {:pay/error :invalid-flow-rate :input per-period})))
+    (quot (parse-usdc amount) (period-seconds period))))
+
+;; ─── Revenue splits (0xSplits-shaped, computed here, settled by rail) ─
+
+(defn split-allocations
+  "Allocate `amount-micros` across `splits` [{:to <addr-or-did> :bps <int>} …].
+  Basis points must sum to 10000. Rounding dust goes to the FIRST split —
+  by convention the creator (the 80 in the 80/20 creator/platform split).
+  Returns splits with :amount-micros added; total always equals input."
+  [amount-micros splits]
+  (let [total-bps (reduce + 0 (map :bps splits))]
+    (when (not= total-bps 10000)
+      (throw (ex-info "split bps must sum to 10000"
+                      {:pay/error :invalid-split :total-bps total-bps})))
+    (let [alloc (mapv #(assoc % :amount-micros
+                              (quot (* amount-micros (:bps %)) 10000))
+                      splits)
+          dust  (- amount-micros (reduce + 0 (map :amount-micros alloc)))]
+      (update-in alloc [0 :amount-micros] + dust))))
+
+(defn creator-platform-split
+  "The standard 80/20 creator/platform split (club-shinshi / net-babiniku
+  creator take, ADR-2607062200)."
+  [amount-micros creator platform]
+  (split-allocations amount-micros [{:to creator :bps 8000}
+                                    {:to platform :bps 2000}]))
+
+;; ─── Monetization capability ────────────────────────────────────────
+;; Signed / scoped / expiring / revocable payment authorization — the
+;; `net.babiniku.monetization.capability` lexicon shape (ADR-2607071000),
+;; generalized so any vendor app can use it. Timestamps are ISO-8601 UTC
+;; strings (lexicographic compare == chronological compare).
+
+(def purposes #{:tip :subscribe :ppv :purchase :refund :split :donation})
+(def assets #{"USDC" "EURC" "JPYC"})
+
+(defn capability-errors
+  "Validation errors for a monetization capability, [] when valid."
+  [{:keys [payer-did payee-did purpose amount issued-at expires-at
+           recurrence] :as _cap}]
+  (cond-> []
+    (not (string? payer-did))            (conj :pay/missing-payer-did)
+    (not (string? payee-did))            (conj :pay/missing-payee-did)
+    (not (contains? purposes purpose))   (conj :pay/invalid-purpose)
+    (not (contains? assets (:asset amount))) (conj :pay/invalid-asset)
+    (not (string? (:value amount)))      (conj :pay/amount-not-string)
+    (not (string? issued-at))            (conj :pay/missing-issued-at)
+    (not (string? expires-at))           (conj :pay/missing-expires-at)
+    (and (= purpose :subscribe)
+         (not (pos-int? (:interval-days recurrence))))
+    (conj :pay/subscribe-needs-recurrence)))
+
+(defn valid-capability? [cap] (empty? (capability-errors cap)))
+
+(defn expired?
+  "True when the capability's :expires-at is at/before `now-iso`
+  (ISO-8601 UTC string)."
+  [{:keys [expires-at]} now-iso]
+  (<= (compare expires-at now-iso) 0))
+
+;; ─── Receipts + entitlement ─────────────────────────────────────────
+
+(defn ->receipt
+  "Settlement receipt shape (mirrors the SDK's PaymentReceipt).
+  :amount is a STRING of micros — bigint-safe on the wire."
+  [{:keys [tx-hash block-number record-uri from to amount-micros]}]
+  {:tx-hash tx-hash
+   :block-number block-number
+   :record-uri (or record-uri "")
+   :from from
+   :to to
+   :amount (str amount-micros)})
+
+(defn entitle
+  "The verify-before-honor decision (pure). An entitlement is granted only
+  when (1) the capability is valid and unexpired at `now-iso`, and (2) the
+  host-supplied `verification` — e.g. kotoba-lang/treasury's on-chain
+  check of the receipt — confirms inclusion and the settled amount covers
+  the authorized amount. Anything else HOLDs with a reason; never grant on
+  an unverified claim (the exact gap that kept the original SDK's
+  monetization HARD-held: verify() did not exist)."
+  [cap receipt verification now-iso]
+  (let [errors (capability-errors cap)]
+    (cond
+      (seq errors)
+      {:grant? false :hold :pay/invalid-capability :errors errors}
+
+      (expired? cap now-iso)
+      {:grant? false :hold :pay/capability-expired}
+
+      (not (:included verification))
+      {:grant? false :hold :pay/unverified-settlement
+       :reason (:reason verification)}
+
+      (< (parse-int (:amount receipt))
+         (parse-usdc (get-in cap [:amount :value])))
+      {:grant? false :hold :pay/underpaid
+       :settled (:amount receipt)
+       :authorized (get-in cap [:amount :value])}
+
+      :else
+      {:grant? true
+       :purpose (:purpose cap)
+       :payer-did (:payer-did cap)
+       :payee-did (:payee-did cap)
+       :scope (:scope cap)
+       :tx-hash (:tx-hash receipt)
+       :record-uri (:record-uri receipt)})))
+
+(defn verification<-treasury
+  "Adapt a kotoba-lang/treasury `verify-payment` result ({:ok? bool
+  :reason kw :entry …}) into the `verification` input `entitle` expects
+  ({:included bool :reason …}). Pure data mapping — pay does not depend
+  on treasury; the consumer composes both:
+
+    (-> (treasury/verify-payment pending onchain opts)
+        pay/verification<-treasury
+        (as-> v (pay/entitle cap receipt v now-iso)))"
+  [{:keys [ok? reason entry]}]
+  {:included (boolean ok?)
+   :reason reason
+   :entry entry})
+
+;; ─── Rail protocol (the injected on-chain seam) ─────────────────────
+
+(defprotocol PayRail
+  "Every on-chain effect seat. Hosts back this with real adapters:
+  one-shot transfer + ERC-4337 sponsorship via kotoba-lang/base-l2,
+  streaming (Superfluid) / splits (0xSplits) / escrow (Safe) adapters as
+  they land. All methods return data (a receipt map or a hold map) —
+  never throw for unprovisioned capability."
+  (-pay! [rail opts] "One-shot transfer. opts {:to :amount-micros :purpose :for-uri :memo}.")
+  (-pay-stream! [rail opts] "Open a streaming flow. opts {:to :flow-rate :purpose}.")
+  (-pay-stream-stop! [rail stream-id] "Stop a streaming flow.")
+  (-split-distribute! [rail opts] "Distribute to a split. opts {:split-address :amount-micros}.")
+  (-escrow-open! [rail opts] "Open escrow. opts {:to :amount-micros :arbiter :due-date}.")
+  (-escrow-release! [rail escrow-id to] "Release escrow to :recipient or :payer."))
+
+(defn- hold [op opts]
+  {:status :hold
+   :reason :pay/unprovisioned-capability
+   :op op
+   :opts opts})
+
+(defrecord UnprovisionedRail []
+  PayRail
+  (-pay! [_ opts] (hold :pay opts))
+  (-pay-stream! [_ opts] (hold :pay-stream opts))
+  (-pay-stream-stop! [_ stream-id] (hold :pay-stream-stop {:stream-id stream-id}))
+  (-split-distribute! [_ opts] (hold :split-distribute opts))
+  (-escrow-open! [_ opts] (hold :escrow-open opts))
+  (-escrow-release! [_ escrow-id to] (hold :escrow-release {:escrow-id escrow-id :to to})))
+
+(def unprovisioned-rail
+  "The honest default: every operation HOLDs. Swap in a real adapter to
+  provision — never fake a settlement."
+  (->UnprovisionedRail))

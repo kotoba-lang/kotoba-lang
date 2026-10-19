@@ -1,0 +1,180 @@
+(ns kagi.crypto
+  "★ kagi の対量子(PQC)暗号コア。
+
+  方針(ADR-2606272330): 古典を捨てず PQC を **加法的(hybrid)** に重ねる。両方が破られない
+  限り安全。プリミティブは `Provider` プロトコル越しにのみ呼び、実装を差し替えてもコアは
+  不変に保つ(`:db-api` seam と同型)。
+
+  **この ns は `.cljc`**: `Provider` プロトコルと provider 越しの可搬ヘルパ(封緘/wrap/
+  share)は JVM と ClojureScript の両方で読める。`jvm-provider` を含む JCA 実装だけが
+  `#?(:clj ...)` の内側にある。ブラウザ側の実装は `kagi.crypto.noble`(`.cljs`) が同じ
+  `Provider` を **同期のまま** reify する — Web Crypto ではなく `@noble/*` の純 JS 実装を
+  使うので、`kotoba-lang/org-signal` が JVM/CLJS を分けた理由(「Web Crypto に同期 API が
+  無い」)がここには当たらない。Rust/WASM も要らない。
+
+  jvm-provider の実装基盤(probe で確認):
+    - ML-KEM-768 : **JDK 24 標準**(JEP 496, FIPS 203)。`KeyPairGenerator/KEM \"ML-KEM-768\"`。
+    - ML-DSA-65  : **JDK 24 標準**(JEP 497, FIPS 204)。`Signature \"ML-DSA-65\"`。
+    - Ed25519 / X25519 / AES-256-GCM / HMAC : JDK 標準。
+    - Argon2id   : BouncyCastle の実 Argon2id。利用不能なら fail closed。
+
+  hybrid 構成:
+    - KEM     : X25519(ECDH) + ML-KEM-768。combiner = HKDF-SHA256(ss_x ‖ ss_pq, transcript)。
+    - 署名     : Ed25519 + ML-DSA-65。連結し **両方 verify** で有効。
+    - 対称     : AES-256-GCM(AAD=item-cid)。Grover 後も 128-bit 相当。
+    - unlock  : Argon2id + passkey PRF(WebAuthn hmac-secret)。"
+  )
+
+;; ───────── Provider seam ─────────
+
+(defprotocol Provider
+  "暗号プリミティブの差し替え境界。古典+PQC の両系統を 1 つの実装が束ねる。
+  鍵/暗号文/署名は `{:x <bytes> :pq <bytes> ...}` の map(各値は encoded bytes)で授受し、
+  graph へはそのまま base64 で publish できる。"
+  (kem-keypair [p] "→ {:public {:x :pq} :secret {:x :pq :x-pub :pq-pub}}")
+  (kem-encap [p hybrid-pk] "→ {:ciphertext {:x :pq} :shared <32B>}")
+  (kem-decap [p hybrid-sk kem-ct] "→ shared <32B>")
+  (sign-keypair [p] "→ {:public {:ed :mldsa} :secret {:ed :mldsa}}")
+  (sign* [p sign-sk msg] "→ {:ed <sig> :mldsa <sig>} 連結署名")
+  (verify* [p sign-pk msg hybrid-sig] "両方 verify した時のみ true")
+  (aead-seal [p key nonce plaintext aad] "→ ciphertext(GCM)")
+  (aead-open [p key nonce ciphertext aad] "→ plaintext")
+  (hkdf [p ikm salt info len] "→ derived key bytes")
+  (argon2id [p pass salt params] "→ KEK(32B)。params {:m-kb :t :p}")
+  (rand-bytes [p n] "→ CSPRNG n bytes"))
+
+(defprotocol SigningHandle
+  "Opaque signing capability. Implementations may delegate to a non-exportable
+  OS/HSM key and must never expose private-key encoding through this protocol."
+  (sign-hybrid [signer provider message] "Return {:ed :mldsa} signatures.")
+  (sign-ed25519 [signer message] "Return an Ed25519 signature for CACAO."))
+
+(defprotocol DecapsulationHandle
+  "Opaque hybrid KEM decapsulation capability backed by non-exportable keys."
+  (decapsulate-hybrid [recipient provider ciphertext] "Return the combined 32-byte secret."))
+
+(defn sign-with
+  "Sign with either an opaque SigningHandle or the legacy encoded secret bundle.
+  The latter remains a compatibility path for migration and tests."
+  [provider signer message]
+  (if (satisfies? SigningHandle signer)
+    (sign-hybrid signer provider message)
+    (sign* provider signer message)))
+
+(defn kem-decap-with
+  "Decapsulate through an opaque handle or a legacy encoded secret bundle."
+  [provider recipient ciphertext]
+  (if (satisfies? DecapsulationHandle recipient)
+    (decapsulate-hybrid recipient provider ciphertext)
+    (kem-decap provider recipient ciphertext)))
+
+;; ───────── host バイト列(JVM byte[] / JS Uint8Array) ─────────
+;;
+;; provider 越しのヘルパは鍵素材を「読む」ことはせず、host のバイト列を作る・
+;; 詰める・消すだけをする。その3つだけをここで吸収すれば、封緘/wrap/share の
+;; ロジック自体は両 runtime で 1 本のまま保てる。
+
+(defn empty-bytes
+  "空のバイト列(salt/AAD 無しを表す)。JVM は `byte[]`、JS は `Uint8Array`。"
+  []
+  )
+
+(defn utf8-bytes
+  "文字列を UTF-8 バイト列へ。HKDF の `info` ラベル用。"
+  [s]
+  )
+
+(defn burn!
+  "共有秘密をその場でゼロ埋めする。`finally` からのみ呼ぶ。"
+  [b]
+  
+  nil)
+
+(defn concat-bytes
+  "バイト列の列を 1 本に連結する。transcript / ikm の組み立て用。"
+  [xs]
+  )
+
+;; ───────── 可搬ヘルパ(provider 越し) ─────────
+
+(def ^:const kem-info "kagi/kem/v1")
+(def ^:const dek-info "kagi/dek/v1")
+
+(defn compartment-key
+  "VMK から compartment-id 用の鍵を HKDF 導出。"
+  [p vmk compartment-id]
+  (hkdf p vmk (empty-bytes)
+        (utf8-bytes (str "kagi/compartment/" compartment-id)) 32))
+
+;; ───────── item 封緘 / 開封 ─────────
+
+(defn combine-kem-shared
+  "kagi/kem/v1 の hybrid KEM combiner(可搬)。
+
+  X25519 と ML-KEM の共有秘密を、**両者の公開鍵と PQ 暗号文を綴じた transcript** に
+  bind して 1 本の 32B へ畳む。transcript に入る公開鍵は *host が符号化したそのままの
+  バイト列*(JVM なら X.509/PKCS#8 DER)なので、runtime を跨いで同じ秘密を得るには
+  符号化も一致していなければならない — `kagi.crypto.noble` はそれを満たすために
+  DER prefix を付け外しする。
+
+  `sha256-fn`/`hkdf-fn` は host 実装を注入する(`hkdf-fn` は `[ikm salt info len]`)。
+  入力の共有秘密は呼び出し側の所有のまま。ここで作った一時連結だけを消す。"
+  [sha256-fn hkdf-fn ss-x ss-pq recipient-x-public ephemeral-x-public
+   recipient-pq-public pq-ciphertext]
+  (let [transcript (sha256-fn (concat-bytes [recipient-x-public ephemeral-x-public
+                                             recipient-pq-public pq-ciphertext]))
+        ikm (concat-bytes [ss-x ss-pq])]
+    (try
+      (hkdf-fn ikm (empty-bytes)
+               (concat-bytes [(utf8-bytes kem-info) transcript]) 32)
+      (finally
+        (burn! ikm)))))
+
+(defn seal-item
+  "item 平文を新規 DEK で封緘 → {:dek :nonce :ciphertext}。"
+  [p plaintext aad]
+  (let [dek   (rand-bytes p 32)
+        nonce (rand-bytes p 12)]
+    {:dek dek :nonce nonce :ciphertext (aead-seal p dek nonce plaintext aad)}))
+
+(defn open-item
+  [p dek nonce ciphertext aad]
+  (aead-open p dek nonce ciphertext aad))
+
+(defn wrap-dek
+  "DEK を KEK(compartment/VMK 由来)で AES-256-GCM key-wrap。"
+  [p kek dek]
+  (let [nonce (rand-bytes p 12)]
+    {:nonce nonce :wrapped (aead-seal p kek nonce dek (empty-bytes))}))
+
+(defn unwrap-dek
+  [p kek {:keys [nonce wrapped]}]
+  (aead-open p kek nonce wrapped (empty-bytes)))
+
+(defn share-dek
+  "共有: 受信者 hybrid 公開鍵へ DEK を encapsulate(PQC) → grant envelope。"
+  [p recipient-hybrid-pk dek]
+  (let [{:keys [ciphertext shared]} (kem-encap p recipient-hybrid-pk)
+        nonce (rand-bytes p 12)]
+    (try
+      {:kem-ct ciphertext :nonce nonce
+       :wrapped (aead-seal p shared nonce dek (empty-bytes))}
+      (finally
+        (burn! shared)))))
+
+(defn accept-share
+  "受信者が自分の hybrid 秘密鍵で decapsulate → DEK 復元。"
+  [p hybrid-sk {:keys [kem-ct nonce wrapped]}]
+  (let [shared (kem-decap-with p hybrid-sk kem-ct)]
+    (try
+      (aead-open p shared nonce wrapped (empty-bytes))
+      (finally
+        (burn! shared)))))
+
+;; ───────── 以降は JVM 専用(JCA + BouncyCastle) ─────────
+;;
+;; ここから下は 1 つの `#?(:clj (do ...))` に包まれている。ClojureScript から
+;; この ns を読むと、上の Provider プロトコルと可搬ヘルパだけが見え、JCA 実装は
+;; 存在しない。ブラウザ側の実装は `kagi.crypto.noble` にある。
+
+

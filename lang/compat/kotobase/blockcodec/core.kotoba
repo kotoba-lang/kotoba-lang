@@ -1,0 +1,202 @@
+(ns kotobase.blockcodec.core
+  "Deterministic compression frame for the bytes that go *inside* a kotobase
+  block, above the CID and below the AEAD.
+
+  ## Why the seam is here and nowhere else
+
+  A kotobase block's CID is the sha2-256 of exactly the bytes handed to the
+  block store (`ipld/put-node!`), and `ipld/get-verified-block` rehashes them
+  on the way back. That fixes two things at once:
+
+  - **Compressing below the CID is invisible and worthless.** The stored bytes
+    are AEAD ciphertext (`kotobase-peer.core/put-tx-block!` encrypts the whole
+    quad payload; `arrangement.core/index-root` encrypts each leaf value).
+    Measured: random bytes deflate to ratio 1.003 — they *grow*. A provider
+    that compressed its BLOBs would spend CPU to store more.
+  - **Compressing above the CID changes the CID.** That is not a bug to work
+    around, it is the constraint that makes this namespace's API shape
+    inevitable: two writers that disagree by one byte produce two blocks,
+    breaking dedup and `kotobase-engine-prolly`'s \"CID-identical to a full
+    rebuild\" property.
+
+  So the frame sits on the **plaintext payload, before `encrypt-fn`**, and
+
+      frame  ::  bytes -> bytes
+
+  is a *unary total pure function*. It takes no options — not a level, not a
+  threshold, not an injected codec. Every knob is a constant of the format,
+  because a knob is a way for two writers to disagree.
+
+  This is deliberately the OPPOSITE of the injected-`encrypt-fn` discipline
+  (ADR-2607051000), and the difference is exactly the CID: an AEAD's output is
+  not required to be reproducible — that ADR chose a random nonce and said so —
+  while this codec's output is *inside* the content address and must be
+  byte-identical on every runtime, forever.
+
+  Corollary, stated because it is the tempting mistake: **a host codec
+  (`java.util.zip`, node `zlib`, `CompressionStream`) may not be substituted as
+  a fast path.** DEFLATE output is not unique; a host encoder yields a valid
+  stream with different bytes, hence a different CID, hence a silent fork of
+  the block graph. `org-ietf-deflate` being portable `.cljc` is what makes one
+  answer possible on JVM and Worker alike, and `golden-test` pins the bytes so
+  an upstream change to its match heuristics fails the build instead of
+  forking CIDs in production.
+
+  ## The frame
+
+      0x01 ++ <RFC 1950 zlib stream>   compressed
+      0x00 ++ <payload>                identity, escaped
+      <payload>                        identity, bare
+
+  Identity is normally written **bare**, so a payload the codec cannot shrink
+  is byte-identical to what the same writer produced before this namespace
+  existed: enabling compression re-CIDs only the blocks it actually shrinks,
+  and pre-existing history keeps its structural sharing. The `0x00` escape
+  exists only for a payload that would otherwise start with a tag byte.
+
+  `unframe` therefore assumes an untagged payload is legacy data. That is
+  sound wherever the payload is DAG-CBOR node bytes — a node is a map, so its
+  first byte is 0xA0–0xBB — and `legacy-safe?` is the assertion to run before
+  wiring this into a seam whose payloads are something else.
+
+  ## Byte conventions
+
+  Arguments may be a JVM `byte[]` (signed), a JS `Uint8Array`, or a seq of
+  unsigned bytes. Results are always a **vector of unsigned bytes (0–255)**,
+  matching `org-ietf-deflate`. `platform-bytes` converts back to the
+  `byte[]`/`Uint8Array` a crypto provider wants."
+  (:require [deflate.core :as deflate]))
+
+;; ── format constants ─────────────────────────────────────────────────────────
+;; Every one of these is part of the content address. Changing a value here
+;; changes the CID of every block it applies to, so a change is a NEW codec
+;; id and a new tag byte — never an edit to an existing one.
+
+(def format-version
+  "Bumped only for a change that alters what `unframe` accepts."
+  1)
+
+(def identity-tag 0x00)
+
+(def zlib-1-tag
+  "RFC 1950 zlib, DEFLATE level 1, as produced by `org-ietf-deflate` at the
+  SHA this repo pins. Level 1 rather than 6 on measurement, not taste: on
+  kotobase quad payloads level 6 buys ~13% more shrink for ~4x the CPU
+  (61 KB: 1050 ms -> 268 ms, ratio 0.089 -> 0.101), and the CPU is spent on a
+  Cloudflare Worker's write path."
+  0x01)
+
+(def min-payload-bytes
+  "Below this, don't even try. The zlib wrapper alone is 6 bytes and a payload
+  this small has no window to exploit; the `never expand` rule would catch it
+  anyway, so this constant exists purely to not spend the CPU."
+  128)
+
+(def deflate-level
+  "Not an argument. See `zlib-1-tag`."
+  1)
+
+;; ── byte normalisation ───────────────────────────────────────────────────────
+
+(defn ubytes
+  "Any byte-like → vector of unsigned bytes (0–255).
+
+  A JVM `byte[]` is signed and a seq of ints is not, which is a real hazard
+  rather than a pedantic one: 200 reads back as -56, and -56 is not a byte
+  value any of this code can use."
+  [x]
+  (cond
+    (vector? x) x
+    
+    :else (mapv #(bit-and (long %) 0xff) x)))
+
+(defn byte-length
+  "How many bytes, without allocating a copy. `count` is not portable here:
+  it works on a JVM `byte[]` and throws `ICounted` on a `js/Uint8Array`."
+  [x]
+  (cond
+    (vector? x) (count x)
+    
+    :else (count x)))
+
+(defn platform-bytes
+  "Vector of unsigned bytes → the platform's native byte container: `byte[]`
+  on the JVM (values above 127 wrap to negative, as `byte[]` requires),
+  `Uint8Array` on ClojureScript."
+  [uv]
+  )
+
+;; ── the frame ────────────────────────────────────────────────────────────────
+
+(defn legacy-safe?
+  "Can an untagged `payload` be told apart from a framed one?
+
+  True iff its first byte is neither tag. Assert this over a seam's real
+  payloads before wiring `frame` into it: DAG-CBOR node bytes always pass
+  (major type 5 → 0xA0–0xBB), arbitrary byte strings do not."
+  [payload]
+  (let [u (ubytes payload)
+        b (first u)]
+    (or (nil? b) (and (not= b identity-tag) (not= b zlib-1-tag)))))
+
+(defn- escaped [u]
+  (if (legacy-safe? u) u (into [identity-tag] u)))
+
+(defn frame
+  "Payload bytes → framed bytes. Unary, total, pure, deterministic.
+
+  Compresses only when compression actually wins — a payload that deflates to
+  the same size or larger is stored as itself, so the frame can never expand
+  a block by more than the one escape byte, and normally by nothing."
+  [payload]
+  (let [u (ubytes payload)]
+    (if (< (count u) min-payload-bytes)
+      (escaped u)
+      (let [c (deflate/deflate u {:level deflate-level})]
+        (if (< (inc (count c)) (count u))
+          (into [zlib-1-tag] c)
+          (escaped u))))))
+
+(defn frame-codec
+  "Which codec `bytes` carries: `:zlib-1`, `:identity` (escaped) or `:legacy`
+  (bare — either an identity frame or data written before this format)."
+  [bytes]
+  (let [b (first (ubytes bytes))]
+    (condp = b
+      zlib-1-tag    :zlib-1
+      identity-tag  :identity
+      :legacy)))
+
+(defn unframe
+  "Framed bytes → payload bytes. Inverse of `frame`; the identity on legacy
+  payloads, which is what lets a fleet deploy the read path first."
+  [bytes]
+  (let [u (ubytes bytes)]
+    (condp = (first u)
+      zlib-1-tag   (vec (deflate/inflate (subvec u 1)))
+      identity-tag (subvec u 1)
+      u)))
+
+;; ── honest reporting ─────────────────────────────────────────────────────────
+
+(defn measure
+  "What this format actually costs on `payloads` — a real sample, because a
+  ratio is not derivable from sizes the way `kotobase-storage-kura`'s
+  multiplier is. Quoting 0.10 to a consumer whose payloads are ciphertext
+  would be a lie about what they are buying; that workload's number is 1.00.
+
+  → `{:payloads :raw-bytes :framed-bytes :ratio :compressed :stored-identity}`"
+  [payloads]
+  (let [rows (mapv (fn [p]
+                     (let [u (ubytes p) f (frame u)]
+                       [(count u) (count f) (= :zlib-1 (frame-codec f))]))
+                   payloads)
+        raw (reduce + 0 (map first rows))
+        out (reduce + 0 (map second rows))
+        zc  (count (filter #(nth % 2) rows))]
+    {:payloads (count rows)
+     :raw-bytes raw
+     :framed-bytes out
+     :ratio (if (pos? raw) (/ (double out) raw) 1.0)
+     :compressed zc
+     :stored-identity (- (count rows) zc)}))

@@ -1,0 +1,147 @@
+(ns smtp.protocol
+  "Pure SMTP (RFC 5321) command construction and response parsing -- no
+  I/O here. `smtp.transport` is the wire, `smtp.client` drives the
+  request/response loop; this namespace only turns data into command
+  strings and turns response lines back into data."
+  (:require [clojure.string :as str])
+  )
+
+(defn response-line
+  "Parse one SMTP response line (\"<code>-<text>\" mid-multiline or
+  \"<code> <text>\" final line, RFC 5321 4.2) into {:code int :final? bool
+  :text str}, or nil if `line` isn't a well-formed response line."
+  [line]
+  (when-let [[_ code sep text] (re-matches #"(\d{3})([ -])(.*)" (str line))]
+    {:code (parse-long code) :final? (= sep " ") :text text}))
+
+(defn positive?
+  "True for 2xx/3xx (success or positive-intermediate, e.g. DATA's 354).
+  4xx/5xx are transient/permanent failures."
+  [code]
+  (boolean (and code (< code 400))))
+
+(defn command
+  "One CRLF-terminated command line, e.g. (command \"EHLO\" domain) ->
+  \"EHLO example.com\\r\\n\", (command \"QUIT\") -> \"QUIT\\r\\n\"."
+  [& parts]
+  (str (str/join " " (remove nil? parts)) "\r\n"))
+
+(defn dot-stuff
+  "RFC 5321 4.5.2 transparency: double any line in `text` that begins with
+  a '.', then append the DATA terminator (\"\\r\\n.\\r\\n\"). `text` may
+  use \\n or \\r\\n line endings; the result always uses \\r\\n."
+  [text]
+  (let [lines (str/split (str/replace (str text) "\r\n" "\n") #"\n" -1)
+        stuffed (map #(if (str/starts-with? % ".") (str "." %) %) lines)]
+    (str (str/join "\r\n" stuffed) "\r\n.\r\n")))
+
+(defn- header-list
+  "One address or many -> the comma-separated form a header takes.
+
+  `Bcc` is deliberately never rendered by `mime-message`: a blind carbon
+  copy is blind because the address appears in RCPT TO and *not* in the
+  message, and writing it into a header hands every recipient the list of
+  people who were meant not to be visible."
+  [v]
+  (cond
+    (nil? v) nil
+    (string? v) v
+    (sequential? v) (not-empty (str/join ", " (remove nil? v)))
+    :else (str v)))
+
+(defn mime-message
+  "A minimal RFC 2822 plain-text message (headers + body), CRLF-terminated
+  headers, ready for `dot-stuff`.
+
+  `:to` and `:cc` take one address or many. `:bcc` is accepted by
+  `client/send-mail!` as a recipient and never appears here."
+  [{:keys [from to cc subject body in-reply-to]}]
+  (str "From: " from "\r\n"
+       "To: " (header-list to) "\r\n"
+       (when-let [cc (header-list cc)] (str "Cc: " cc "\r\n"))
+       "Subject: " subject "\r\n"
+       (when (not-empty in-reply-to) (str "In-Reply-To: " in-reply-to "\r\n"))
+       "Content-Type: text/plain; charset=UTF-8\r\n"
+       "MIME-Version: 1.0\r\n"
+       "\r\n" (str body)))
+
+(defn base64
+  "Base64 for AUTH payloads.
+
+  Cross-platform rather than `#?(:clj …)`-only: everything else in this
+  namespace is pure and runs on both hosts, and a JVM-only function here
+  made the whole of SASL unreachable from ClojureScript for no reason
+  other than that nobody had needed it yet."
+  [s]
+  )
+
+;; ------------------------------------------------------ ESMTP (RFC 1869)
+
+(defn parse-extensions
+  "An EHLO response's lines -> `{\"AUTH\" \"PLAIN LOGIN\" \"SIZE\" \"35882577\"}`.
+
+  The first line is the greeting (the server's own domain) and carries no
+  extension, so it is dropped. Keywords are upper-cased because RFC 1869
+  §4.5 makes them case-insensitive and a client that compares them
+  literally works against one server and not the next."
+  [lines]
+  (into {}
+        (keep (fn [line]
+                (let [line (str/trim (str line))]
+                  (when (seq line)
+                    (let [[k v] (str/split line #"\s+" 2)]
+                      [(str/upper-case k) (or v "")])))))
+        (rest lines)))
+
+(defn auth-mechanisms
+  "The SASL mechanisms an EHLO response advertised, upper-cased."
+  [extensions]
+  (->> (str/split (or (get extensions "AUTH") "") #"\s+")
+       (remove str/blank?)
+       (map str/upper-case)
+       set))
+
+(defn max-size
+  "The SIZE extension's declared maximum (RFC 1870), or nil.
+
+  Worth reading before sending rather than after: a message over the limit
+  is rejected at MAIL FROM or at end-of-DATA, and the second is after the
+  whole body has been pushed up a slow link."
+  [extensions]
+  (some-> (get extensions "SIZE") str/trim parse-long))
+
+;; ------------------------------------------------------------------ SASL
+
+(def ^:private nul "\u0000")
+
+(defn plain-credentials
+  "SASL PLAIN (RFC 4616): `NUL user NUL pass`, for the caller to base64.
+
+  The leading NUL is the authorization identity, empty because a client
+  authenticating as itself does not assume another one."
+  [user pass]
+  (str nul user nul pass))
+
+(defn xoauth2-credentials
+  "The XOAUTH2 SASL payload, for the caller to base64.
+
+  Google's mechanism, which Microsoft also accepts. It is how an OAuth
+  grant reaches SMTP submission — without it, an account this application
+  already holds a send-capable OAuth token for still has to be given an
+  app password before it can send anything."
+  [user access-token]
+  (str "user=" user nul "auth=Bearer " access-token nul nul))
+
+;; ------------------------------------------- enhanced status (RFC 3463)
+
+(defn enhanced-status
+  "The `class.subject.detail` code RFC 3463 puts at the front of the text,
+  or nil.
+
+  `550` says a message was rejected; `5.1.1` says the mailbox does not
+  exist and `5.7.1` says delivery was refused on policy grounds. Those are
+  different conversations to have with whoever sent it, and the three-digit
+  code alone cannot tell them apart."
+  [text]
+  (when-let [[_ code] (re-find #"^\s*([245]\.\d{1,3}\.\d{1,3})\b" (str text))]
+    code))

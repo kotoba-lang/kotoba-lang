@@ -1,0 +1,514 @@
+(ns aiueos.hvt
+  "`aiueos.hvt` -- the self-owned VMM (\"hvt tender\") V0 spike, ADR-0014 option C.
+
+  Where `aiueos.vm` *launches QEMU* and `aiueos.vfio` gives the tender raw
+  access to a device QEMU exposes, this namespace is the monitor side itself:
+  it creates a VM through the host hypervisor facility (Linux **KVM**,
+  `/dev/kvm`), maps guest RAM, loads a guest image, runs the vcpu, and services
+  its exits -- the Solo5 `hvt` shape ADR-2607022400 named and ADR-0011 Phase 1
+  deferred. Every syscall (`open`/`close`/`ioctl`/`mmap`) goes through
+  `java.lang.foreign` (FFM), exactly like `aiueos.vfio` -- \"clj on clj,\" no new
+  Rust/C (ADR-0014 honors the 2026-07-10 owner rule without a waiver).
+
+  V0 scope (this file): boot a minimal in-repo test guest that writes bytes to
+  an MMIO address (trapping to this VMM, which reconstructs the serial string)
+  and then writes to a poweroff MMIO port (a sentinel this VMM treats as a
+  controlled halt). The `spike` fn returns a plan-as-data **run receipt**
+  (`:serial`/`:exits`/`:shutdown?`/`:halt`), the audit-shaped evidence ADR-0013
+  demands (no file-shaped or screenshot-only proof). A real PSCI SYSTEM_OFF
+  clean shutdown, direct-loading the ADR-0013 kernel image, and a virtio device
+  model reusing `aiueos.virtio`'s ported protocol logic are V1 (tracked in
+  #110); a macOS/HVF backend is V2 (deferred behind the
+  `com.apple.security.hypervisor` entitlement question).
+
+  Arch: the ARM64 guest program + core-register ids below target an **aarch64**
+  KVM host (the actual dev substrate: Apple M4 -> Lima vz nested-virt ->
+  aarch64 Linux `/dev/kvm`). x86_64 long-mode is the analogous V1+ target; its
+  guest stub and `KVM_SET_REGS` path are not in this pass.
+
+  Honesty about what's verified: the pure parts below (ioctl-number encoding,
+  struct-field offsets, and the fixed ARM64 guest program words) are unit
+  tested on any JVM host. The live `open`/`ioctl(KVM_RUN)` sequence needs a
+  real `/dev/kvm`; running it is `spike`/`-main`, gated exactly like
+  `aiueos.vfio`'s hardware note. Treat the FFM boot loop as new, unverified
+  systems code until exercised against real KVM (see #110's smoke gate)."
+  (:require [aiueos.virtio :as vio]))
+
+;; ---------------------------------------------------------------------------
+;; ioctl number encoding (Linux `_IO`/`_IOW`/`_IOR` macros) -- pure,
+;; unit-tested without a hypervisor. Same scheme as `aiueos.vfio/ioc`.
+
+(def ^:private ioc-nrbits 8)
+(def ^:private ioc-typebits 8)
+(def ^:private ioc-sizebits 14)
+(def ^:private ioc-nrshift 0)
+(def ^:private ioc-typeshift (+ ioc-nrshift ioc-nrbits))
+(def ^:private ioc-sizeshift (+ ioc-typeshift ioc-typebits))
+(def ^:private ioc-dirshift (+ ioc-sizeshift ioc-sizebits))
+(def ^:private ioc-none 0)
+(def ^:private ioc-write 1)
+(def ^:private ioc-read 2)
+
+(defn ioc
+  "Encode a Linux ioctl request number: `_IOC(dir, type, nr, size)`."
+  [dir type nr size]
+  (bit-or (bit-shift-left dir ioc-dirshift)
+          (bit-shift-left type ioc-typeshift)
+          (bit-shift-left nr ioc-nrshift)
+          (bit-shift-left size ioc-sizeshift)))
+
+(defn io- [type nr] (ioc ioc-none type nr 0))
+(defn iow [type nr size] (ioc ioc-write type nr size))
+(defn ior [type nr size] (ioc ioc-read type nr size))
+
+;; KVMIO == 0xAE. The main ioctls are arch-independent; the ARM ones (0xae/
+;; 0xaf/0xac) are aarch64-relevant here.
+(def kvm-type 0xAE)
+
+;; struct sizes (bytes) for the _IOW/_IOR-sized ioctls.
+(def kvm-userspace-memory-region-size 32) ; slot,flags,gpa,size,uaddr
+(def kvm-vcpu-init-size 32)               ; target(u32) + features[7](u32)
+(def kvm-one-reg-size 16)                 ; id(u64) + addr(u64)
+
+(def kvm-mp-state-size 4)                 ; struct kvm_mp_state { __u32 mp_state; }
+
+(def get-api-version       (io-  kvm-type 0x00))
+(def create-vm             (io-  kvm-type 0x01))
+(def get-vcpu-mmap-size    (io-  kvm-type 0x04))
+(def create-vcpu           (io-  kvm-type 0x41))
+(def run                   (io-  kvm-type 0x80))
+(def set-user-memory-region (iow kvm-type 0x46 kvm-userspace-memory-region-size))
+(def get-mp-state          (ior  kvm-type 0x98 kvm-mp-state-size))
+(def set-mp-state          (iow  kvm-type 0x99 kvm-mp-state-size))
+(def set-one-reg           (iow  kvm-type 0xac kvm-one-reg-size))
+(def arm-vcpu-init         (iow  kvm-type 0xae kvm-vcpu-init-size))
+(def arm-preferred-target  (ior  kvm-type 0xaf kvm-vcpu-init-size))
+
+(def mp-state {:runnable 0 :stopped 5})   ; KVM_MP_STATE_RUNNABLE / _STOPPED
+
+;; ---------------------------------------------------------------------------
+;; struct layouts (byte offsets), pure.
+
+;; struct kvm_userspace_memory_region
+(def mem-region-layout {:slot 0 :flags 4 :guest-phys-addr 8 :memory-size 16 :userspace-addr 24})
+
+;; struct kvm_run (the fields V0 reads). exit_reason @8; the trailing union @32.
+;;   KVM_EXIT_MMIO:         phys_addr@32 data[8]@40 len@48 is_write@52
+;;   KVM_EXIT_SYSTEM_EVENT: type@32 ndata@36 data[16]@40
+(def kvm-run-layout {:exit-reason 8
+                     :mmio-phys-addr 32 :mmio-data 40 :mmio-len 48 :mmio-is-write 52
+                     :sysevent-type 32})
+
+(def exit-reason {:unknown 0 :mmio 6 :fail-entry 9 :internal-error 17 :system-event 24})
+(def system-event-type {:shutdown 1 :reset 2 :crash 3})
+
+;; struct kvm_vcpu_init { __u32 target; __u32 features[7]; } -- features[0] is
+;; at byte offset 4. KVM_ARM_VCPU_PSCI_0_2 is feature bit 0 -> set bit 0 of
+;; features[0] to move the guest off legacy PSCI 0.1 (no SYSTEM_OFF) onto PSCI
+;; 0.2+ (SYSTEM_OFF = 0x84000008 honored). See spike's use site.
+(def vcpu-init-features0-offset 4)
+(def vcpu-feature-psci-0-2 (bit-shift-left 1 0))   ; KVM_ARM_VCPU_PSCI_0_2 == 0
+(def psci-system-off-fid 0x84000008)               ; PSCI 0.2 SYSTEM_OFF function id
+
+;; ---------------------------------------------------------------------------
+;; aarch64 core-register id for PC (KVM_SET_ONE_REG), pure.
+;;   KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (offsetof(pc)/4)
+;;   pc is at byte 256 in struct kvm_regs -> index 0x40.
+(def ^:private kvm-reg-arm64      0x6000000000000000)
+(def ^:private kvm-reg-size-u64   0x0030000000000000)
+(def ^:private kvm-reg-arm-core   0x0000000000100000)
+(def ^:private kvm-reg-core-pc-idx 0x40)
+(def arm64-core-reg-pc
+  (bit-or kvm-reg-arm64 kvm-reg-size-u64 kvm-reg-arm-core kvm-reg-core-pc-idx))
+;; The guest boots at EL1h (SPSel=1), so it uses **SP_EL1** -- the `sp_el1` field
+;; of struct kvm_regs (byte 272, after the 272-byte user_pt_regs) -> core-reg
+;; index 0x44. Setting `user_pt_regs.sp` (SP_EL0, index 0x3E) does NOT set the
+;; stack the guest actually uses; a stack-using guest would then fault on the
+;; first push. (Latent until a guest touched the stack: the earlier asm/C
+;; guests were leaf functions with no frame; a compiled `.kotoba` guest's
+;; prologue pushes fp/lr immediately.)
+(def ^:private kvm-reg-core-sp-idx 0x44)
+(def arm64-core-reg-sp
+  (bit-or kvm-reg-arm64 kvm-reg-size-u64 kvm-reg-arm-core kvm-reg-core-sp-idx))
+
+;; ---------------------------------------------------------------------------
+;; The V0 guest program: fixed aarch64 machine code, pure data. Writes "HI\n"
+;; one byte at a time to MMIO base 0x09000000 (unbacked by RAM -> each strb
+;; traps out as KVM_EXIT_MMIO, which this VMM reconstructs into the serial
+;; string), then writes 0x01 to the poweroff MMIO port at base+8 (0x09000008)
+;; -- a sentinel this VMM treats as a controlled halt -- and parks in `b .`.
+;;
+;; Why an MMIO poweroff port and not PSCI SYSTEM_OFF (hvc #0 with 0x84000008):
+;; the PSCI path was observed on the aarch64 KVM host to *not* raise a
+;; KVM_EXIT_SYSTEM_EVENT for this bare (no vector table, MMU-off) guest -- the
+;; hvc returned into the guest, which then spun. An MMIO write to a poweroff
+;; port is the same shape kvmtool/QEMU's `sysreset`/test-devices use and gives
+;; a deterministic halt via the exit path already proven working (3 MMIO
+;; serial writes land first). Wiring a real PSCI SYSTEM_OFF clean shutdown is
+;; a V1 refinement (#110). See the ns docstring for per-instruction encodings.
+(def guest-mmio-base 0x09000000)
+(def guest-poweroff-addr 0x09000008)   ; base + 8; a write here halts the VMM
+(def guest-serial-expected "HI\n")
+
+(def guest-program-words
+  [0xD2A12001   ; movz x1, #0x0900, lsl #16   ; x1 = 0x09000000 (MMIO base)
+   0x52800900   ; movz w0, #0x48 ('H')
+   0x39000020   ; strb w0, [x1]
+   0x52800920   ; movz w0, #0x49 ('I')
+   0x39000020   ; strb w0, [x1]
+   0x52800140   ; movz w0, #0x0A ('\n')
+   0x39000020   ; strb w0, [x1]
+   0x52800020   ; movz w0, #0x01
+   0x39002020   ; strb w0, [x1, #8]           ; write 1 -> 0x09000008 (poweroff)
+   0x14000000]) ; b .  (park; the VMM has already halted on the poweroff write)
+
+;; PSCI variant (V1 diagnostic + real clean-shutdown path): write "HI\n" to the
+;; serial port, then `hvc #0` with x0 = PSCI SYSTEM_OFF (0x84000008). If KVM's
+;; in-kernel PSCI honors it, this exits as KVM_EXIT_SYSTEM_EVENT/SHUTDOWN and
+;; the receipt's `:halt` is `:psci-system-event`. If PSCI does NOT fire (returns
+;; NOT_SUPPORTED and resumes the guest), execution falls through to a poweroff
+;; MMIO write -- so `:halt :mmio-poweroff` in the receipt is the unambiguous
+;; signal that PSCI did not take. Either way the VMM halts deterministically.
+(def guest-program-psci
+  [0xD2A12001   ; movz x1, #0x0900, lsl #16   ; x1 = 0x09000000 (MMIO base)
+   0x52800900   ; movz w0, #0x48 ('H')
+   0x39000020   ; strb w0, [x1]
+   0x52800920   ; movz w0, #0x49 ('I')
+   0x39000020   ; strb w0, [x1]
+   0x52800140   ; movz w0, #0x0A ('\n')
+   0x39000020   ; strb w0, [x1]
+   0x52800100   ; movz w0, #0x0008
+   0x72B08000   ; movk w0, #0x8400, lsl #16   ; w0 = 0x84000008 (PSCI SYSTEM_OFF)
+   0xD4000002   ; hvc #0   -> PSCI SYSTEM_OFF (exits here if honored)
+   ;; fall-through (only reached if PSCI did NOT fire): poweroff diagnostic
+   0x52800020   ; movz w0, #0x01
+   0x39002020   ; strb w0, [x1, #8]           ; write 1 -> 0x09000008 (poweroff)
+   0x14000000]) ; b .
+
+(def guest-load-gpa 0x0)          ; guest-physical load address == initial PC
+(def guest-ram-size 0x200000)     ; 2 MiB backing RAM at GPA 0 (page-aligned)
+
+;; ---------------------------------------------------------------------------
+;; ELF64 loader -- pure parsing (host-testable). Lets the tender direct-load a
+;; real ELF image instead of a hand-packed word array: the arch-independent
+;; half of #110's "direct-load the ADR-0013 kernel image" (that kernel is
+;; x86_64, so its live boot waits on x86 KVM hardware, but the loader is
+;; arch-neutral and is exercised end-to-end here by the checked-in aarch64
+;; fixture `resources/hvt/guest-aarch64.elf`).
+
+(def elf-magic [0x7F 0x45 0x4C 0x46])       ; "\x7FELF"
+(def elf-class-64 2)                         ; EI_CLASS = ELFCLASS64
+(def elf-data-lsb 1)                         ; EI_DATA  = ELFDATA2LSB (little-endian)
+(def elf-machine {:aarch64 0xB7 :x86-64 0x3E})
+(def pt-load 1)                              ; p_type PT_LOAD
+
+;; ELF64 header field byte offsets.
+(def elf64-header {:ei-class 4 :ei-data 5 :e-machine 18 :e-entry 24
+                   :e-phoff 32 :e-phentsize 54 :e-phnum 56})
+;; ELF64 program-header field byte offsets (e_phentsize is usually 56).
+(def elf64-phdr {:p-type 0 :p-offset 8 :p-vaddr 16 :p-filesz 32 :p-memsz 40})
+
+(defn rd-le
+  "Read `n` bytes little-endian from accessor `rd` (a fn: offset -> unsigned
+  byte 0-255) at `off`, into a long."
+  [rd off n]
+  (loop [i 0 acc 0]
+    (if (= i n)
+      acc
+      (recur (inc i) (bit-or acc (bit-shift-left (long (rd (+ off i))) (* 8 i)))))))
+
+(defn parse-elf64
+  "Parse an ELF64 image via byte accessor `rd`. Returns
+  `{:class :data :machine :entry :phoff :phentsize :phnum :segments [...]}`
+  where `:segments` are the PT_LOAD program headers as
+  `{:type :offset :vaddr :filesz :memsz}`. Throws with a specific reason on a
+  non-ELF / non-ELF64 / big-endian image."
+  [rd]
+  (when-not (= elf-magic (mapv rd (range 4)))
+    (throw (ex-info "not an ELF image (bad magic)" {:magic (mapv rd (range 4))})))
+  (let [class (rd (:ei-class elf64-header))
+        data (rd (:ei-data elf64-header))]
+    (when-not (= class elf-class-64) (throw (ex-info "not ELF64 (EI_CLASS)" {:class class})))
+    (when-not (= data elf-data-lsb) (throw (ex-info "not little-endian (EI_DATA)" {:data data})))
+    (let [phoff (rd-le rd (:e-phoff elf64-header) 8)
+          phentsize (rd-le rd (:e-phentsize elf64-header) 2)
+          phnum (rd-le rd (:e-phnum elf64-header) 2)]
+      {:class class :data data
+       :machine (rd-le rd (:e-machine elf64-header) 2)
+       :entry (rd-le rd (:e-entry elf64-header) 8)
+       :phoff phoff :phentsize phentsize :phnum phnum
+       :segments (vec (for [i (range phnum)
+                            :let [base (+ phoff (* i phentsize))]
+                            :when (= pt-load (rd-le rd (+ base (:p-type elf64-phdr)) 4))]
+                        {:type pt-load
+                         :offset (rd-le rd (+ base (:p-offset elf64-phdr)) 8)
+                         :vaddr (rd-le rd (+ base (:p-vaddr elf64-phdr)) 8)
+                         :filesz (rd-le rd (+ base (:p-filesz elf64-phdr)) 8)
+                         :memsz (rd-le rd (+ base (:p-memsz elf64-phdr)) 8)}))})))
+
+(defn elf-load-range
+  "`[lo hi)` spanning every PT_LOAD segment's `vaddr..vaddr+memsz`, with `lo`
+  rounded down and `hi` up to a `page` boundary -- the guest-physical window
+  the tender must back with RAM."
+  [segments page]
+  (let [lo (reduce min (map :vaddr segments))
+        hi (reduce max (map #(+ (:vaddr %) (:memsz %)) segments))]
+    [(* page (quot lo page))
+     (* page (quot (+ hi (dec page)) page))]))
+
+;; ---------------------------------------------------------------------------
+;; virtio-mmio device model (host/tender side) -- pure, host-testable. The
+;; guest driver programs a virtio-mmio register block via load/store to an
+;; unbacked MMIO window; each access traps to this tender as KVM_EXIT_MMIO,
+;; and this model answers as the *device* would. It reuses `aiueos.virtio`'s
+;; register map + magic/version/status/feature constants (the "host side of the
+;; same registers" ADR-0011 ported), presenting a virtio-console (device-id 3).
+;;
+;; V1 scope: the virtio-mmio *transport* -- magic/version/device-id probe,
+;; feature offer/accept, and the ACKNOWLEDGE->DRIVER->FEATURES_OK->DRIVER_OK
+;; status handshake. The virtqueue data path (avail/used rings + descriptor DMA,
+;; where `aiueos.virtio/split-queue-layout`/`*-ring`/`validate-descriptor-chain`
+;; come in) is the next milestone (#110); queue-config writes are tracked but
+;; not yet acted on.
+
+(def virtio-mmio-base 0x0a000000)   ; the guest's virtio-mmio register window
+(def virtio-mmio-size 0x200)
+(def virtio-console-vendor 0x61697565)          ; "aiue" -- arbitrary non-zero
+(def virtio-console-queue-num-max 128)
+(def virtio-console-device-features vio/features-version-1)  ; VIRTIO_F_VERSION_1
+;; virtio-console port-0 queue layout: queue 0 = receiveq (device -> guest),
+;; queue 1 = transmitq (guest -> device). On a receiveq notify the device
+;; delivers this fixed "console input" into the driver's writable buffers.
+(def virtio-console-rx-queue 0)
+(def virtio-console-tx-queue 1)
+(def virtio-console-rx-input "HI\n")
+
+(defn virtio-window? [addr]
+  (and (<= virtio-mmio-base addr) (< addr (+ virtio-mmio-base virtio-mmio-size))))
+
+(defn virtio-console-read
+  "Device-side read of the virtio-mmio register at word offset `off`. `state`
+  carries the driver-written selectors/status. Returns the u32 the device
+  presents (unimplemented registers read as 0)."
+  [state off]
+  (condp = off
+    (:magic-value vio/mmio-reg)   vio/mmio-magic
+    (:version vio/mmio-reg)       vio/mmio-version-2
+    (:device-id vio/mmio-reg)     (:console vio/device-type-id)   ; 3
+    (:vendor-id vio/mmio-reg)     virtio-console-vendor
+    (:queue-num-max vio/mmio-reg) virtio-console-queue-num-max
+    (:device-features vio/mmio-reg)
+    (let [f virtio-console-device-features]
+      (if (zero? (:device-features-sel state 0))
+        (bit-and f 0xffffffff)
+        (bit-and (unsigned-bit-shift-right f 32) 0xffffffff)))
+    (:status vio/mmio-reg)           (:status state 0)
+    (:interrupt-status vio/mmio-reg)  0
+    0))
+
+(defn virtio-console-write
+  "Device-side write of `value` to the virtio-mmio register at word offset
+  `off`. Returns the updated device `state`. Feature/status selectors are
+  tracked; queue-config registers are routed into the currently-selected
+  queue's sub-map (`[:queues sel ...]`), keyed by `queue-sel`, so the tender
+  can service that queue on notify. A `queue-notify` is recorded for the loop
+  to act on (it reads/writes guest RAM, which this pure fn cannot)."
+  [state off value]
+  (let [sel (:queue-sel state 0)
+        set-q (fn [k] (assoc-in state [:queues sel k] value))]
+    (condp = off
+      (:device-features-sel vio/mmio-reg) (assoc state :device-features-sel value)
+      (:driver-features-sel vio/mmio-reg) (assoc state :driver-features-sel value)
+      (:driver-features vio/mmio-reg)
+      (assoc-in state [:driver-features (:driver-features-sel state 0)] value)
+      (:status vio/mmio-reg)              (assoc state :status value)
+      (:queue-sel vio/mmio-reg)           (assoc state :queue-sel value)
+      (:queue-num vio/mmio-reg)           (set-q :num)
+      (:queue-ready vio/mmio-reg)         (set-q :ready)
+      (:queue-desc-low vio/mmio-reg)      (set-q :desc-low)
+      (:queue-desc-high vio/mmio-reg)     (set-q :desc-high)
+      (:queue-driver-low vio/mmio-reg)    (set-q :driver-low)
+      (:queue-driver-high vio/mmio-reg)   (set-q :driver-high)
+      (:queue-device-low vio/mmio-reg)    (set-q :device-low)
+      (:queue-device-high vio/mmio-reg)   (set-q :device-high)
+      (:queue-notify vio/mmio-reg)        (assoc state :pending-notify value)
+      state)))
+
+(defn queue-config
+  "Resolve queue `sel`'s programmed 64-bit ring addresses + size from device
+  `state` into `{:desc :driver :device :num}` guest-physical addresses (the
+  descriptor table, available ring, used ring)."
+  [state sel]
+  (let [q (get-in state [:queues sel])
+        u64 (fn [lo hi] (bit-or (bit-and (get q lo 0) 0xffffffff)
+                                (bit-shift-left (bit-and (get q hi 0) 0xffffffff) 32)))]
+    {:desc   (u64 :desc-low :desc-high)
+     :driver (u64 :driver-low :driver-high)
+     :device (u64 :device-low :device-high)
+     :num    (get q :num 0)}))
+
+;; ---------------------------------------------------------------------------
+;; Split-virtqueue servicing (pure) -- the host/device side of the same rings
+;; `aiueos.virtio` models. `rd` is a byte accessor (gpa -> unsigned byte); it
+;; reads the driver's descriptor table, available ring, and buffers out of
+;; guest RAM. Layouts are the standard virtio split queue:
+;;   descriptor (16B): addr u64@0, len u32@8, flags u16@12, next u16@14
+;;   avail ring:       flags u16@0, idx u16@2, ring[qsize] u16 @4
+;;   used ring:        flags u16@0, idx u16@2, ring[qsize] {id u32, len u32} @4
+
+(defn read-descriptor
+  "Read the split-virtqueue descriptor at index `d` in the table at `desc-gpa`."
+  [rd desc-gpa d]
+  (let [g (+ desc-gpa (* d 16))]
+    {:addr (rd-le rd g 8) :len (rd-le rd (+ g 8) 4)
+     :flags (rd-le rd (+ g 12) 2) :next (rd-le rd (+ g 14) 2)}))
+
+(defn assert-descriptor-index!
+  "A descriptor index has to be inside the `num`-entry table.
+
+  `:next` is a 16-bit field the guest writes, and `read-descriptor` turns it
+  into `desc-gpa + d*16` with no check, so a chain could step to any of 65536
+  slots -- roughly a megabyte past the table -- and read whatever guest RAM
+  is there as if it were a descriptor. The 256-hop guard bounded how far that
+  went, not where it went.
+
+  `aiueos.virtio/validate-descriptor-chain-with-features` has done this, and
+  more, all along: index bounds, an exact `seen` set instead of a hop count,
+  zero-length rejection, and an indirect-flag check against negotiated
+  features. This V0 walk reads descriptors straight out of guest RAM rather
+  than from a table vector, so it cannot call that function as it stands --
+  but reusing `aiueos.virtio`'s protocol logic is already what this
+  namespace's docstring says V1 is for, and this check is the one gap with
+  teeth in the meantime."
+  [d num]
+  (when (or (neg? d) (>= d num))
+    (throw (ex-info "descriptor index outside the queue"
+                    {:descriptor d :queue-size num}))))
+
+(def max-chain-bytes
+  "Ceiling on the bytes one descriptor -- or one chain -- may ask this VMM to
+  collect.
+
+  `:len` is a 32-bit field the guest writes, and `walk-descriptor-chain`
+  turned it straight into `(range len)`, so a single descriptor claiming
+  0xffffffff asked the monitor for a four-billion-element vector. The chain
+  guard bounded how MANY descriptors were followed and said nothing about how
+  BIG each one was.
+
+  `guest-ram-size` is the bound rather than a number chosen here: a buffer
+  cannot be larger than the RAM it lives in, so anything above it is
+  malformed by construction and stays right if the RAM size changes."
+  guest-ram-size)
+
+(defn walk-descriptor-chain
+  "Walk the chain from descriptor `head`, collecting device-readable bytes
+  (those WITHOUT the WRITE flag -- driver->device buffers). Returns
+  `{:bytes [..] :len total}`. Guards against cyclic/over-long chains, and
+  against a single descriptor or a chain claiming more bytes than guest RAM
+  holds (see `max-chain-bytes`), and against an index outside the `num`-entry
+  descriptor table (see `assert-descriptor-index!`)."
+  [rd desc-gpa num head]
+  (loop [d head, out [], total 0, guard 0]
+    (when (> guard 256)
+      (throw (ex-info "descriptor chain too long or cyclic" {:head head :guard guard})))
+    (assert-descriptor-index! d num)
+    (let [{:keys [addr len flags next]} (read-descriptor rd desc-gpa d)
+          _ (when (or (> len max-chain-bytes) (> (+ total len) max-chain-bytes))
+              (throw (ex-info "descriptor length exceeds guest RAM"
+                              {:head head :descriptor d :len len :total total
+                               :max max-chain-bytes})))
+          readable? (zero? (bit-and flags (:write vio/desc-flag)))
+          out' (if readable? (into out (mapv #(rd (+ addr %)) (range len))) out)]
+      (if (zero? (bit-and flags (:next vio/desc-flag)))
+        {:bytes out' :len (+ total len)}
+        (recur next out' (+ total len) (inc guard))))))
+
+(defn virtqueue-plan
+  "Pure plan for servicing a virtio split-queue notify. `rd` reads guest RAM.
+  `config` = `{:desc :driver :device :num}`. `avail-seen` is the last avail idx
+  the device processed. Returns `{:emitted <String> :used [{:slot :id :len}]
+  :used-idx <new used idx> :seen <new avail idx>}` -- the FFM caller applies the
+  used-ring writes back to guest RAM. Bounds work at `num` iterations."
+  [rd config avail-seen]
+  (let [{:keys [desc driver device num]} config
+        avail-idx (rd-le rd (+ driver 2) 2)
+        used-idx0 (rd-le rd (+ device 2) 2)]
+    (loop [seen avail-seen, emitted [], used [], added 0]
+      (if (or (= seen avail-idx) (>= added (max 1 num)))
+        {:emitted (apply str (map char emitted))
+         :used used
+         :used-idx (bit-and (+ used-idx0 added) 0xffff)
+         :seen seen}
+        (let [slot (mod seen num)
+              head (rd-le rd (+ driver 4 (* slot 2)) 2)
+              {:keys [bytes len]} (walk-descriptor-chain rd desc num head)
+              used-slot (mod (+ used-idx0 added) num)]
+          (recur (bit-and (inc seen) 0xffff)
+                 (into emitted bytes)
+                 (conj used {:slot used-slot :id head :len len})
+                 (inc added)))))))
+
+;; Receive-queue servicing (device -> guest): the mirror of `virtqueue-plan`.
+;; The driver posts device-*writable* buffers on the receiveq; the device fills
+;; them with input (here, a fixed "console input" string) and completes them.
+
+(defn walk-writable-chain
+  "Walk the chain from descriptor `head`, collecting the device-WRITABLE buffer
+  segments `{:addr :len}` (those WITH the WRITE flag) -- the receive targets.
+  Bounds the index the same way `walk-descriptor-chain` does."
+  [rd desc-gpa num head]
+  (loop [d head, out [], guard 0]
+    (when (> guard 256)
+      (throw (ex-info "descriptor chain too long or cyclic" {:head head :guard guard})))
+    (assert-descriptor-index! d num)
+    (let [{:keys [addr len flags next]} (read-descriptor rd desc-gpa d)
+          out' (if (pos? (bit-and flags (:write vio/desc-flag)))
+                 (conj out {:addr addr :len len}) out)]
+      (if (zero? (bit-and flags (:next vio/desc-flag)))
+        out'
+        (recur next out' (inc guard))))))
+
+(defn fill-targets
+  "Write `input` (a seq of bytes) into `targets` (each `{:addr :len}`) in order,
+  up to each target's capacity. Returns `[writes remaining-input total-written]`
+  where `writes` are `{:gpa :byte}`."
+  [targets input]
+  (loop [targets targets, input (vec input), writes [], written 0]
+    (if (or (empty? targets) (empty? input))
+      [writes input written]
+      (let [{:keys [addr len]} (first targets)
+            n (min len (count input))]
+        (recur (rest targets) (subvec input n)
+               (into writes (map-indexed (fn [i b] {:gpa (+ addr i) :byte b}) (take n input)))
+               (+ written n))))))
+
+(defn virtqueue-rx-plan
+  "Pure plan for servicing a receive-queue notify: for each available descriptor
+  chain, fill its device-writable buffer(s) with `input` bytes (up to capacity)
+  and push a used-ring completion carrying the byte count written. `rd` reads
+  guest RAM; `config` = `{:desc :driver :device :num}`; `avail-seen` is the last
+  processed avail idx. Returns `{:writes [{:gpa :byte}] :used [{:slot :id :len}]
+  :used-idx <new used idx> :seen <new avail idx>}` for the FFM caller to apply."
+  [rd config avail-seen input]
+  (let [{:keys [desc driver device num]} config
+        avail-idx (rd-le rd (+ driver 2) 2)
+        used-idx0 (rd-le rd (+ device 2) 2)]
+    (loop [seen avail-seen, writes [], used [], added 0, input (vec input)]
+      (if (or (= seen avail-idx) (>= added (max 1 num)) (empty? input))
+        {:writes writes :used used
+         :used-idx (bit-and (+ used-idx0 added) 0xffff) :seen seen}
+        (let [slot (mod seen num)
+              head (rd-le rd (+ driver 4 (* slot 2)) 2)
+              targets (walk-writable-chain rd desc num head)
+              [ws remaining written] (fill-targets targets input)
+              used-slot (mod (+ used-idx0 added) num)]
+          (recur (bit-and (inc seen) 0xffff)
+                 (into writes ws)
+                 (conj used {:slot used-slot :id head :len written})
+                 (inc added)
+                 remaining))))))
+
+;; ---------------------------------------------------------------------------
+;; FFM (java.lang.foreign) KVM bindings -- JVM-only, needs a live /dev/kvm.
+
+

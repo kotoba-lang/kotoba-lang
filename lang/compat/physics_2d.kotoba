@@ -1,0 +1,209 @@
+(ns physics-2d
+  "Zero-dep portable CLJC 2D physics engine.
+
+  Restored from the legacy `kami-engine/kami-physics-2d` Rust crate
+  (`kami-physics-2d/src/lib.rs`, 209 lines), deleted from kotoba-lang/kami-engine
+  in PR #82 (\"Remove Rust workspace from kami-engine\"), as part of the clj-wgsl
+  migration (ADR-2607010930, com-junkawasaki/root).
+
+  Ledger class `:port-to-WGSL-compute` — the original was slated for eventual
+  WGSL compute-shader authoring, but per owner decision this restoration is a
+  plain interim CLJC port of the pure logic (data + pure functions only, no
+  IO/GPU), matching the pattern used across the other restored kami-* crates.
+
+  Purpose: AABB + circle colliders, brute-force O(n^2) broadphase/narrowphase
+  collision detection, and impulse-based collision resolution with positional
+  correction for a simple 2D rigid-body world.
+
+  Mutation in the original (`&mut self` on `World2D`) is modeled here as pure
+  functions returning updated world state, e.g. `(world-step world dt) => world'`.")
+
+;; ---------------------------------------------------------------------------
+;; Platform shims
+;; ---------------------------------------------------------------------------
+
+(defn- sqrt*
+  [x]
+  )
+
+(defn- abs*
+  [x]
+  (if (neg? x) (- x) x))
+
+(defn- signum*
+  "Rust f32::signum: -1.0 for negative, 1.0 for positive/zero. Zero is treated
+  as positive, matching Rust's `0.0f32.signum() == 1.0`."
+  [x]
+  (if (neg? x) -1.0 1.0))
+
+;; ---------------------------------------------------------------------------
+;; Vec2 math (plain [x y] CLJC vectors, replacing glam::Vec2)
+;; ---------------------------------------------------------------------------
+
+(defn v2 [x y] [x y])
+
+(def v2-zero [0.0 0.0])
+(def v2-x [1.0 0.0])
+
+(defn v2-add [[ax ay] [bx by]] [(+ ax bx) (+ ay by)])
+(defn v2-sub [[ax ay] [bx by]] [(- ax bx) (- ay by)])
+(defn v2-scale [[x y] s] [(* x s) (* y s)])
+(defn v2-dot [[ax ay] [bx by]] (+ (* ax bx) (* ay by)))
+(defn v2-length [v] (sqrt* (v2-dot v v)))
+
+(defn v2-normalize
+  "Returns the unit vector, or the zero vector if `v` has zero length."
+  [v]
+  (let [d (v2-length v)]
+    (if (pos? d)
+      (v2-scale v (/ 1.0 d))
+      v2-zero)))
+
+;; ---------------------------------------------------------------------------
+;; Data: Body2D / Collider2D / Contact2D / World2D
+;; ---------------------------------------------------------------------------
+
+(defn make-circle-collider [radius] {:shape :circle :radius radius})
+(defn make-aabb-collider [half-w half-h] {:shape :aabb :half-w half-w :half-h half-h})
+
+(defn make-body
+  "Builds a Body2D map. `mass` 0 means static (never integrated / never resolved)."
+  [{:keys [position velocity mass restitution friction collider is-trigger user-data]
+    :or   {position [0.0 0.0] velocity [0.0 0.0] mass 0.0 restitution 0.0
+           friction 0.0 is-trigger false user-data 0}}]
+  {:position position
+   :velocity velocity
+   :mass mass
+   :restitution restitution
+   :friction friction
+   :collider collider
+   :is-trigger is-trigger
+   :user-data user-data})
+
+(defn world-new
+  [gravity]
+  {:bodies [] :gravity gravity :contacts []})
+
+(defn world-add
+  "Adds `body` to `world`, returning `[world' id]` (id = index of the new body)."
+  [world body]
+  (let [id (count (:bodies world))]
+    [(update world :bodies conj body) id]))
+
+(defn world-contacts
+  [world]
+  (:contacts world))
+
+;; ---------------------------------------------------------------------------
+;; Collision detection (narrowphase)
+;; ---------------------------------------------------------------------------
+
+(defn- test-circle-circle
+  [ia ib a b ra rb]
+  (let [diff (v2-sub (:position b) (:position a))
+        dist (v2-length diff)
+        overlap (- (+ ra rb) dist)]
+    (when (pos? overlap)
+      (let [normal (if (> dist 0.001) (v2-scale diff (/ 1.0 dist)) v2-x)]
+        {:body-a ia
+         :body-b ib
+         :normal normal
+         :depth overlap
+         :point (v2-add (:position a) (v2-scale normal ra))}))))
+
+(defn- test-aabb-aabb
+  [ia ib a b hw-a hh-a hw-b hh-b]
+  (let [[ax ay] (:position a)
+        [bx by] (:position b)
+        dx (- (abs* (- bx ax)) (+ hw-a hw-b))
+        dy (- (abs* (- by ay)) (+ hh-a hh-b))]
+    (when-not (or (pos? dx) (pos? dy))
+      (let [[normal depth]
+            (if (> dx dy)
+              [[(signum* (- bx ax)) 0.0] (- dx)]
+              [[0.0 (signum* (- by ay))] (- dy)])]
+        {:body-a ia
+         :body-b ib
+         :normal normal
+         :depth depth
+         :point (v2-scale (v2-add (:position a) (:position b)) 0.5)}))))
+
+(defn test-collision
+  "Narrowphase test between bodies `a` (index `ia`) and `b` (index `ib`).
+  Returns a Contact2D map, or nil if not colliding. Mixed AABB/Circle pairs
+  are unsupported (TODO in the original Rust) and always return nil."
+  [ia ib a b]
+  (let [ca (:collider a) cb (:collider b)]
+    (cond
+      (and (= :circle (:shape ca)) (= :circle (:shape cb)))
+      (test-circle-circle ia ib a b (:radius ca) (:radius cb))
+
+      (and (= :aabb (:shape ca)) (= :aabb (:shape cb)))
+      (test-aabb-aabb ia ib a b (:half-w ca) (:half-h ca) (:half-w cb) (:half-h cb))
+
+      :else nil)))
+
+;; ---------------------------------------------------------------------------
+;; Simulation step
+;; ---------------------------------------------------------------------------
+
+(defn- integrate-body
+  [gravity dt body]
+  (if (pos? (:mass body))
+    (let [v' (v2-add (:velocity body) (v2-scale gravity dt))
+          p' (v2-add (:position body) (v2-scale v' dt))]
+      (assoc body :velocity v' :position p'))
+    body))
+
+(defn- find-contacts
+  "Brute-force O(n^2) broadphase + narrowphase over `bodies` (fine for <500 bodies,
+  per the original)."
+  [bodies]
+  (let [n (count bodies)]
+    (vec (for [i (range n)
+               j (range (inc i) n)
+               :let [c (test-collision i j (nth bodies i) (nth bodies j))]
+               :when c]
+           c))))
+
+(defn- resolve-contact
+  "Applies positional correction + impulse resolution for one contact,
+  returning updated `bodies`. Mirrors World2D::step's per-contact resolution
+  loop, including that positional correction is applied even when the impulse
+  itself is skipped (separating velocity, i.e. `vel_along > 0`)."
+  [bodies contact]
+  (let [ia (:body-a contact)
+        ib (:body-b contact)
+        a (nth bodies ia)
+        b (nth bodies ib)]
+    (if (or (:is-trigger a) (:is-trigger b))
+      bodies
+      (let [inv-mass-a (if (pos? (:mass a)) (/ 1.0 (:mass a)) 0.0)
+            inv-mass-b (if (pos? (:mass b)) (/ 1.0 (:mass b)) 0.0)
+            inv-total (+ inv-mass-a inv-mass-b)]
+        (if (zero? inv-total)
+          bodies
+          (let [correction (v2-scale (:normal contact) (* (/ (:depth contact) inv-total) 0.8))
+                a1 (update a :position v2-sub (v2-scale correction inv-mass-a))
+                b1 (update b :position v2-add (v2-scale correction inv-mass-b))
+                rel-vel (v2-sub (:velocity b1) (:velocity a1))
+                vel-along (v2-dot rel-vel (:normal contact))]
+            (if (pos? vel-along)
+              (-> bodies (assoc ia a1) (assoc ib b1))
+              (let [e (sqrt* (* (:restitution a1) (:restitution b1)))
+                    j (/ (* (- (+ 1.0 e)) vel-along) inv-total)
+                    impulse (v2-scale (:normal contact) j)
+                    a2 (update a1 :velocity v2-sub (v2-scale impulse inv-mass-a))
+                    b2 (update b1 :velocity v2-add (v2-scale impulse inv-mass-b))]
+                (-> bodies (assoc ia a2) (assoc ib b2))))))))))
+
+(defn world-step
+  "Steps the simulation by `dt` seconds: integrates velocity/gravity, runs
+  brute-force broad+narrowphase collision detection, then resolves contacts
+  (positional correction + impulse). Returns the updated world."
+  [world dt]
+  (let [gravity (:gravity world)
+        integrated (mapv #(integrate-body gravity dt %) (:bodies world))
+        contacts (find-contacts integrated)
+        resolved (reduce resolve-contact integrated contacts)]
+    (assoc world :bodies resolved :contacts contacts)))

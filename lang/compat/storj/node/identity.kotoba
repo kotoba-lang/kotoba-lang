@@ -1,0 +1,338 @@
+(ns storj.node.identity
+  "Peer identity: what a Storj certificate chain says, and whether to believe
+  it.
+
+  A Storj peer presents two certificates — a leaf it signs with, and the CA
+  that signed the leaf and signed itself. The **CA's public key is the node's
+  name**:
+
+      node-id = sha256(sha256(DER SubjectPublicKeyInfo)) , last byte := version
+
+  which is why a node cannot choose its id, and why the trailing zero bits of
+  that hash are the proof of work `storj.node.id/difficulty` counts.
+
+  ## What is decided here and what is not
+
+  This namespace decides. It reads the chain, derives the id, checks the
+  relationships and reports what is wrong. It does not do TLS and does not
+  contain a signature primitive: `-verify` on `IVerifier` is the one thing the
+  host must supply, and the host also owns the socket and the handshake.
+
+  That split is not arbitrary. TLS termination differs on every runtime, but
+  *which bytes were signed by which key* is the part that must not differ, and
+  a host that answers it for itself can answer it differently.
+
+  ## The extension that says how to hash, and does not
+
+  `2.999.2.2` is documented in `peertls/extensions` as specifying \"how many
+  times to hash the CA public key to calculate the node ID\". Nothing reads
+  it — a search of `storj/common` finds only its declaration — so a node id is
+  two rounds of SHA-256 today. `admit-chain` refuses a chain that carries it
+  rather than ignoring it: a certificate asking for a different derivation is
+  either from a future this build does not implement or an attempt to be
+  hashed differently by different peers, and both are reasons to stop."
+  (:require [storj.node.bytes :as b]
+            [storj.node.der :as der]
+            [storj.node.id :as id]
+            [storj.node.pem :as pem]
+            [storj.node.protocols :as p]))
+
+(def leaf-index
+  "Where the leaf sits in a presented chain — `peertls.LeafIndex`."
+  0)
+
+(def ca-index
+  "Where the CA sits — `peertls.CAIndex`. The node id comes from this one, not
+  from the leaf."
+  1)
+
+(def identity-version-ext "2.999.2.1")
+(def identity-pow-counter-ext "2.999.2.2")
+(def revocation-ext "2.999.1.2")
+
+(def signature-algorithms
+  "The signature OIDs a Storj chain uses. ECDSA with SHA-256 is what
+  `pkcrypto.GeneratePrivateKey` produces; RSA appears in older identities.
+
+  `sha256WithRSAEncryption` is PKCS#1 v1.5, and is named so here because
+  Storj signs *messages* with the same keys under PSS. The two are not
+  interchangeable and a verifier has to be told which one it is being asked
+  about — see `storj.node.host.verify`. Certificates signed with RSASSA-PSS
+  (`1.2.840.113549.1.1.10`) are deliberately absent: they would arrive with
+  parameters this does not read, and `admit-chain` refusing an algorithm it
+  cannot name is the safe half of that."
+  {"1.2.840.10045.4.3.2"   :ecdsa-sha256
+   "1.2.840.113549.1.1.11" :rsa-pkcs1-sha256})
+
+(defn- fail [msg data]
+  (throw (ex-info (str "storj.node.identity: " msg) data)))
+
+;; ── reading a certificate ────────────────────────────────────────────────────
+
+(defn- extensions-of
+  "The extensions of a tbsCertificate, as OID string → value bytes.
+
+  Extensions live in the `[3]` context tag, which is the only optional field
+  this needs, so it is found by tag rather than by counting."
+  [tbs-children]
+  (if-let [ext-holder (first (filter #(and (= :context (:class %)) (= 3 (:tag %)))
+                                     tbs-children))]
+    (let [seq-el (first (der/children ext-holder))
+          items  (der/children seq-el)]
+      (reduce (fn [acc item]
+                (let [parts (der/children item)
+                      oid   (der/oid (first parts))
+                      value (:contents (last parts))]
+                  (when (contains? acc oid)
+                    ;; `ErrUniqueExtensions` — a chain with two extensions of
+                    ;; the same id lets a reader that takes the first and a
+                    ;; reader that takes the last disagree about what it says
+                    (fail "duplicate extension" {:oid oid}))
+                  (assoc acc oid value)))
+              {} items))
+    {}))
+
+(defn certificate
+  "Read a DER certificate into the pieces the decisions need.
+
+      {:tbs-der    the bytes that were signed
+       :spki-der   the subject's public key, as DER SubjectPublicKeyInfo
+       :signature  the signature over :tbs-der
+       :algorithm  :ecdsa-sha256 | :rsa-sha256 | [:unknown oid]
+       :extensions {oid-string value-bytes}}"
+  [der-bytes]
+  (let [cert   (der/parse der-bytes)
+        [tbs alg sig] (der/children cert)
+        tbs-kids (der/children tbs)
+        ;; version is an optional [0]; everything after it is positional
+        after-version (if (and (= :context (:class (first tbs-kids)))
+                               (= 0 (:tag (first tbs-kids))))
+                        (rest tbs-kids)
+                        tbs-kids)
+        ;; serial, signature-alg, issuer, validity, subject, then the key
+        spki (nth (vec after-version) 5 nil)]
+    (when (nil? spki)
+      (fail "certificate has no subjectPublicKeyInfo" {}))
+    (when-not (der/tag? spki :sequence)
+      (fail "subjectPublicKeyInfo is not a SEQUENCE" {:tag (:tag spki)}))
+    (let [alg-oid (der/oid (first (der/children alg)))]
+      {:tbs-der    (:der tbs)
+       :spki-der   (:der spki)
+       :signature  (der/bit-string-bytes sig)
+       :algorithm  (get signature-algorithms alg-oid [:unknown alg-oid])
+       :extensions (extensions-of tbs-kids)})))
+
+;; ── the node id ──────────────────────────────────────────────────────────────
+
+(defn version
+  "The identity version a certificate declares.
+
+  `IDVersionFromCert` reads the first byte of the extension's value — not an
+  ASN.1 integer, the raw byte — and treats a certificate without the extension
+  as V0, for compatibility with identities minted before the extension
+  existed."
+  [{:keys [extensions]}]
+  (if-let [v (get extensions identity-version-ext)]
+    (if (seq v) (first v) id/version-0)
+    id/version-0))
+
+(defn node-id-from-public-key
+  "The node id a DER SubjectPublicKeyInfo names, at a given identity version.
+
+  Split out from `node-id` because minting runs this in a loop over keys that
+  have no certificate yet — `identity.GenerateKey` derives the id from the key
+  and builds the certificate around whichever one wins.
+
+  Refuses an empty key. Hashing nothing succeeds — SHA-256 of the empty input
+  is a perfectly good digest — so without this, a missing key produces an id of
+  the right length, carrying a valid version byte, reporting a difficulty of
+  10, and identical for every caller who arrives here the same way. That is not
+  a hypothetical: reading Storj's own shipped test identities, the CA was
+  passed as unparsed DER, `:spki-der` was nil, and three distinct identities
+  all came back as one convincing node id. An id is the wrong place to be
+  plausible when you are wrong."
+  [spki-der version]
+  (when (empty? spki-der)
+    (throw (ex-info "storj.node.identity: no public key to derive a node id from"
+                    {:spki-der spki-der})))
+  (let [digest (b/sha256d spki-der)]
+    (conj (subvec digest 0 (dec id/id-length)) version)))
+
+(defn node-id
+  "The node id a CA certificate names.
+
+  Two rounds of SHA-256 over the DER SubjectPublicKeyInfo, with the last byte
+  replaced by the identity version — `peertls.DoubleSHA256PublicKey` followed
+  by `storj.NewVersionedID`. Give it the **CA** certificate; the leaf's key is
+  a different key and produces a different, meaningless id."
+  [ca-cert]
+  (node-id-from-public-key (:spki-der ca-cert) (version ca-cert)))
+
+;; ── admission ────────────────────────────────────────────────────────────────
+
+(defn signed-by?
+  "Whether `cert` carries a valid signature from `signer`'s key.
+
+  Public because the CA whitelist in `storj.node.tls` asks the same question
+  of a different pair — did *this* authority sign that peer's CA — and a
+  second implementation of it would be a second chance to pair the algorithm
+  with the wrong key.
+
+  The algorithm travels with the signed certificate, and the key with the
+  signer — which is the pairing `verifyCertSignature` uses, and the reason
+  this takes two certificates rather than a key and some bytes."
+  [verifier signer cert]
+  (boolean (p/-verify verifier (:algorithm cert) (:spki-der signer)
+                      (:tbs-der cert) (:signature cert))))
+
+(defn- chain-signed?
+  "Each certificate is signed by the next; the last signs itself.
+
+  That is `verifyChainSignatures`, and the self-signed tail is the part worth
+  not dropping: without it a chain can end in a certificate nobody vouched
+  for, and the node id — which is derived from a key in that chain — would be
+  whatever the presenter wanted it to be."
+  [verifier certs]
+  (every? true?
+          (map-indexed (fn [i cert]
+                         (let [signer (if (< (inc i) (count certs))
+                                        (nth certs (inc i))
+                                        cert)]
+                           (signed-by? verifier signer cert)))
+                       certs)))
+
+(defn admit-chain
+  "Decide whether a presented certificate chain is an acceptable Storj peer.
+
+  `chain` is a vector of DER certificates, leaf first, exactly as TLS presents
+  them — or of maps already read by `certificate`, for a host that has parsed
+  them anyway. Returns `{:ok? bool :reasons [...] :node-id bytes :difficulty n}`.
+
+  `opts`: `:verifier` (required to check anything), `:expected-node-id` (the
+  node you meant to reach), `:minimum-difficulty`, and `:allowed-versions`.
+
+  Every reason is reported rather than the first, and the signature checks run
+  last so a malformed chain costs no asymmetric crypto — the same ordering
+  `storj.node.orders/admit` uses, for the same reason."
+  [chain {:keys [verifier expected-node-id minimum-difficulty allowed-versions]
+          :or   {allowed-versions #{id/version-0}}}]
+  (let [certs (mapv #(if (map? %) % (certificate %)) chain)
+        ca    (get certs ca-index)
+        nid   (when ca (node-id ca))
+        diff  (when nid (try (id/difficulty nid)
+                             (catch  _ nil)))
+        structural
+        (cond-> []
+          (< (count certs) 2)
+          (conj {:reason :chain-too-short :length (count certs)})
+
+          (and ca (not (contains? allowed-versions (version ca))))
+          (conj {:reason :unsupported-identity-version :version (version ca)})
+
+          (and ca (contains? (:extensions ca) identity-pow-counter-ext))
+          (conj {:reason :pow-counter-extension-present
+                 :note "2.999.2.2 changes how the node id is derived; nothing
+                        in storj/common implements it and this build does not"})
+
+          (and nid expected-node-id (not (b/equal? nid expected-node-id)))
+          (conj {:reason :node-id-mismatch
+                 :expected (b/hex expected-node-id) :found (b/hex nid)})
+
+          (and diff minimum-difficulty (< diff minimum-difficulty))
+          (conj {:reason :insufficient-difficulty
+                 :difficulty diff :minimum minimum-difficulty})
+
+          (and ca (nil? diff))
+          (conj {:reason :node-id-has-no-difficulty})
+
+          (some #(vector? (:algorithm %)) certs)
+          (conj {:reason :unsupported-signature-algorithm
+                 :algorithms (into #{} (map :algorithm) certs)}))
+
+        problems
+        (if (seq structural)
+          structural
+          (cond-> []
+            (nil? verifier)
+            (conj {:reason :no-verifier-configured})
+
+            (and verifier (not (chain-signed? verifier certs)))
+            (conj {:reason :chain-signature-invalid})))]
+    {:ok?        (empty? problems)
+     :reasons    problems
+     :node-id    nid
+     :difficulty diff
+     ;; the **leaf's** public key, which is what this peer signs messages
+     ;; with. Not the CA's: the node id comes from the CA and every signature
+     ;; comes from the leaf — `SignerFromFullIdentity` uses `identity.Key`
+     ;; and `SigneeFromPeerIdentity` uses `identity.Leaf.PublicKey`. Handing
+     ;; back the CA key here produced a signature that was present, a key that
+     ;; was present, and a verification that failed for no visible reason.
+     ;;
+     ;; Here because this function has already parsed the chain; a caller
+     ;; hunting for the key would be parsing it a second time and choosing
+     ;; between the same two certificates with less context.
+     :signing-key (:spki-der (get certs leaf-index))}))
+
+;; ── identity files ──────────────────────────────────────────────────────────
+
+(def certificate-label "CERTIFICATE")
+
+(def private-key-label
+  "What Go writes: PEM-enveloped PKCS#8. `pkcrypto.WritePrivateKeyPEM`."
+  "PRIVATE KEY")
+
+(def ec-private-key-label
+  "What older identities carry: SEC1, the `openssl ecparam` shape.
+  `PrivateKeyFromPEM` still accepts it, so reading one is not optional."
+  "EC PRIVATE KEY")
+
+(defn chain-pem
+  "A certificate chain as the text of an `identity.cert` file.
+
+  Leaf first, then the CA — `FullIdentity.Chain()` order, which is also the
+  order TLS presents them and the order `admit-chain` expects. A file written
+  the other way round parses fine and names a different node, because the id
+  comes from whichever certificate sits at `ca-index`."
+  [chain]
+  (pem/encode-all (map (fn [der] {:label certificate-label :der der}) chain)))
+
+(defn parse-chain-pem
+  "The certificates in an `identity.cert` or `ca.cert` file, in file order.
+
+  Refuses a file with a non-certificate block rather than filtering it out: a
+  key sitting in a chain file is a mistake worth reporting, not one to route
+  around."
+  [text]
+  (let [blocks (pem/decode-all text)]
+    (when (empty? blocks)
+      (throw (ex-info "storj.node.identity: no PEM blocks in the chain file" {})))
+    (doseq [{:keys [label]} blocks]
+      (when (not= certificate-label label)
+        (throw (ex-info "storj.node.identity: a chain file may only hold certificates"
+                        {:label label}))))
+    (mapv :der blocks)))
+
+(defn parse-private-key-pem
+  "The DER of a private key file, with which encoding it turned out to be.
+
+  Returns `{:der bytes :encoding :pkcs8 | :sec1}`. The caller has to know:
+  a runtime's key importer takes one or the other and will not tell them
+  apart, so silently returning bare bytes here would move the mistake to
+  wherever the key is finally used."
+  [text]
+  (let [blocks (pem/decode-all text)]
+    (when (not= 1 (count blocks))
+      (throw (ex-info "storj.node.identity: expected exactly one key in the file"
+                      {:found (count blocks) :labels (mapv :label blocks)})))
+    (let [{:keys [label der]} (first blocks)]
+      (condp = label
+        private-key-label    {:der der :encoding :pkcs8}
+        ec-private-key-label {:der der :encoding :sec1}
+        (throw (ex-info "storj.node.identity: not a private key block"
+                        {:label label}))))))
+
+(defn private-key-pem
+  "A PKCS#8 private key as the text of an `identity.key` file."
+  [pkcs8-der]
+  (pem/encode private-key-label pkcs8-der))

@@ -1,0 +1,225 @@
+(ns smtp.client
+  "SMTP (RFC 5321) session driver: connect!/ehlo!/auth-login!/send-mail!/
+  quit! over an `smtp.transport/Transport`. `smtp.protocol` supplies the
+  pure command/response functions; this namespace reads (possibly
+  multi-line) responses until the final line and checks status codes."
+  (:require [clojure.string :as str]
+            [smtp.protocol :as p]
+            [smtp.transport :as t]))
+
+(defn- read-response!
+  "Read lines until the final (non-hyphen) line of a possibly multi-line
+  SMTP response; returns {:code int :text \"line1\\nline2...\"}."
+  [transport]
+  (loop [texts []]
+    (let [line (t/read-line! transport)]
+      (when (nil? line) (throw (ex-info "SMTP connection closed mid-response" {:texts texts})))
+      (let [{:keys [code final? text] :as parsed} (p/response-line line)]
+        (when-not parsed (throw (ex-info "unparseable SMTP response line" {:line line})))
+        (if final?
+          {:code code :text (str/join "\n" (conj texts text))}
+          (recur (conj texts text)))))))
+
+
+
+(defn- send-line!
+  "Write `line` (already CRLF-terminated) and read its response."
+  [{:keys [transport]} line]
+  (t/write! transport line)
+  (read-response! transport))
+
+(defn- assert-positive! [{:keys [code] :as resp} verb]
+  (when-not (p/positive? code)
+    (throw (ex-info (str "SMTP " verb " failed: " (:text resp)) (assoc resp :verb verb))))
+  resp)
+
+(defn ehlo!
+  "EHLO `domain`. Returns `session` with the server's advertised ESMTP
+  extensions attached.
+
+  `:capabilities` is the raw line list, as before. `:extensions` is those
+  lines parsed into `{\"AUTH\" \"PLAIN LOGIN\" \"SIZE\" \"35882577\"}`,
+  `:auth-mechanisms` the SASL set, `:max-size` the SIZE limit — the three
+  things a client actually decides on, which callers previously had to
+  re-derive by scanning strings themselves."
+  [session domain]
+  (let [resp (assert-positive! (send-line! session (p/command "EHLO" domain)) "EHLO")
+        lines (str/split-lines (:text resp))
+        extensions (p/parse-extensions lines)]
+    (assoc session
+           :capabilities lines
+           :extensions extensions
+           :auth-mechanisms (p/auth-mechanisms extensions)
+           :max-size (p/max-size extensions))))
+
+(defn supports?
+  "Whether the server advertised an ESMTP extension (case-insensitive)."
+  [session extension]
+  (contains? (:extensions session {}) (str/upper-case (str extension))))
+
+
+
+(defn auth-login!
+  "AUTH LOGIN with a plaintext user/pass (an app password for Gmail-style
+  accounts, per this library's TLS-only transport). Returns `session`."
+  [session user pass]
+  (assert-positive! (send-line! session (p/command "AUTH" "LOGIN")) "AUTH LOGIN")
+  (assert-positive! (send-line! session (str (p/base64 user) "\r\n")) "AUTH LOGIN (username)")
+  (assert-positive! (send-line! session (str (p/base64 pass) "\r\n")) "AUTH LOGIN (password)")
+  session)
+
+(defn auth-plain!
+  "AUTH PLAIN (RFC 4616) with the credentials on the command line.
+
+  One round trip where LOGIN takes three, and the mechanism LOGIN should
+  have been. Sent as an initial response because RFC 4954 §4 permits it
+  for PLAIN and every server that advertises PLAIN accepts it."
+  [session user pass]
+  (assert-positive!
+   (send-line! session (p/command "AUTH" "PLAIN"
+                                  (p/base64 (p/plain-credentials user pass))))
+   "AUTH PLAIN")
+  session)
+
+(defn auth-xoauth2!
+  "AUTH XOAUTH2 with an OAuth2 access token.
+
+  What lets an account this application already holds a send-capable OAuth
+  grant for actually send, instead of being asked for an app password
+  covering exactly what the grant covers.
+
+  A rejected token answers `334` with a base64 JSON error rather than a
+  failure code, and the protocol requires an empty line to finish the
+  exchange before the real status arrives — a client that treats the 334
+  as success reports a send that never happened."
+  [session user access-token]
+  (let [resp (send-line! session
+                         (p/command "AUTH" "XOAUTH2"
+                                    (p/base64 (p/xoauth2-credentials user access-token))))]
+    (if (= 334 (:code resp))
+      (let [final (send-line! session "\r\n")]
+        (assert-positive! final "AUTH XOAUTH2")
+        session)
+      (do (assert-positive! resp "AUTH XOAUTH2")
+          session))))
+
+(defn authenticate!
+  "Pick the strongest mechanism the server advertised and use it.
+
+  Order: XOAUTH2 when a token was given, then PLAIN, then LOGIN. A caller
+  that knows which one it wants can still call it directly; this exists so
+  the ordinary case does not require every caller to re-derive the same
+  preference from `:auth-mechanisms`."
+  [session {:keys [user password access-token]}]
+  (let [mechanisms (:auth-mechanisms session #{})]
+    (cond
+      (and access-token (contains? mechanisms "XOAUTH2"))
+      (auth-xoauth2! session user access-token)
+
+      (and password (contains? mechanisms "PLAIN")) (auth-plain! session user password)
+      (and password (contains? mechanisms "LOGIN")) (auth-login! session user password)
+
+      ;; No AUTH line at all: some submission servers authenticate by IP or
+      ;; by client certificate, and refusing to proceed would break them.
+      (empty? mechanisms) session
+
+      :else
+      (throw (ex-info "この SMTP サーバーが受け付ける認証方式に対応していません。"
+                      {:type :smtp/no-supported-mechanism
+                       :offered mechanisms})))))
+
+(defn- recipients-of [msg]
+  (let [as-list (fn [v] (cond (nil? v) []
+                              (string? v) [v]
+                              (sequential? v) (vec (remove nil? v))
+                              :else [v]))]
+    (vec (distinct (concat (as-list (:to msg))
+                           (as-list (:cc msg))
+                           (as-list (:bcc msg)))))))
+
+(defn send-mail!
+  "Send one message: MAIL FROM / RCPT TO… / DATA / dot-stuffed payload.
+
+  `msg`: `{:to :cc :bcc :subject :body :in-reply-to}`. `:to`/`:cc`/`:bcc`
+  each take one address or many. `from` comes from `session`'s `:from`,
+  set by the caller, since it is the same across every send on one
+  connection.
+
+  **Every recipient goes in one transaction.** This used to take a single
+  `:to` and send once, which meant a caller with three recipients either
+  dropped two or opened three transactions — and three transactions is
+  three separate messages, each with only its own recipient in the header,
+  so nobody can see who else received it and a reply-all goes to one
+  person. RFC 5321 §3.3 is explicit that a mail transaction has one MAIL
+  FROM and *one or more* RCPT TO.
+
+  `:raw` sends a prebuilt RFC 5322 message instead of `mime-message`'s
+  minimal one — for a caller that has already composed headers this
+  library does not model (MIME parts, Content-Transfer-Encoding, RFC 2047
+  encoded-words in the subject).
+
+  A recipient the server refuses does not abort the send: RFC 5321 §3.3
+  allows some RCPT TO commands to fail while others succeed, and the
+  message is delivered to those that were accepted. Returns `session` with
+  `:accepted` and `:rejected` so the caller can tell which happened —
+  throwing on the first refusal would turn a partial success into a total
+  failure and lose the mail that did go out. All recipients refused is a
+  genuine failure and does throw."
+  [{:keys [from] :as session} msg]
+  (let [recipients (recipients-of msg)
+        _ (when (empty? recipients)
+            (throw (ex-info "SMTP send with no recipient" {:msg (dissoc msg :body)})))
+        size-hint (when (supports? session "SIZE") nil)
+        _ (assert-positive! (send-line! session (p/command "MAIL" (str "FROM:<" from ">")
+                                                           size-hint))
+                            "MAIL FROM")
+        results (reduce (fn [acc recipient]
+                          (let [resp (send-line! session
+                                                 (p/command "RCPT" (str "TO:<" recipient ">")))]
+                            (if (p/positive? (:code resp))
+                              (update acc :accepted conj recipient)
+                              (update acc :rejected conj
+                                      {:recipient recipient
+                                       :code (:code resp)
+                                       :status (p/enhanced-status (:text resp))
+                                       :text (:text resp)}))))
+                        {:accepted [] :rejected []}
+                        recipients)]
+    (when (empty? (:accepted results))
+      (throw (ex-info (str "SMTP RCPT TO failed for every recipient: "
+                           (str/join "; " (map :text (:rejected results))))
+                      (assoc results :verb "RCPT TO"))))
+    (assert-positive! (send-line! session (p/command "DATA")) "DATA")
+    (assert-positive! (send-line! session
+                                  (p/dot-stuff (or (:raw msg)
+                                                   (p/mime-message (assoc msg :from from)))))
+                      "DATA payload")
+    (merge session results)))
+
+(defn rset!
+  "RSET — abandon the current transaction (RFC 5321 §4.1.1.5).
+
+  Named for the command rather than as `reset!`, which would shadow
+  `clojure.core/reset!` in every namespace that refers this one.
+
+  What to send after a failed one before reusing the connection: a session
+  left mid-transaction rejects the next MAIL FROM, and the error names
+  sequencing rather than whatever actually went wrong."
+  [session]
+  (assert-positive! (send-line! session (p/command "RSET")) "RSET")
+  session)
+
+(defn noop!
+  "NOOP — is this connection still alive (RFC 5321 §4.1.1.9)."
+  [session]
+  (assert-positive! (send-line! session (p/command "NOOP")) "NOOP")
+  session)
+
+(defn quit!
+  "QUIT and close the transport. Swallows a failed QUIT response (the
+  transport is closed either way) but not a transport-level exception
+  raised before that point."
+  [{:keys [transport] :as session}]
+  (try (send-line! session (p/command "QUIT")) (catch  _ nil))
+  (t/close! transport)
+  nil)

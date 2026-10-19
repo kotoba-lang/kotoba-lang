@@ -1,0 +1,192 @@
+(ns vrm.convert
+  "Conversions between kami-vrm data and vertex/index buffers ready for GPU
+  upload (the kami-render analogue). Restored from `kami-vrm/src/convert.rs`
+  (kotoba-lang/kami-engine, deleted PR #82) as part of the clj-wgsl migration
+  (ADR-2607010930, com-junkawasaki/root)."
+  (:require [vrm.gltf-types :as gt]))
+
+(defn- read-f32-le [bin o]
+  ;; `bit-or`/`bit-shift-left` operate on Clojure `long`s, so a set top bit
+  ;; (any negative float, or a huge-magnitude one) produces a value > Integer/
+  ;; MAX_VALUE; `Float/intBitsToFloat` requires a genuine 32-bit `int`, and
+  ;; Clojure's auto-narrowing throws ArithmeticException instead of wrapping.
+  ;; `unchecked-int` does the two's-complement truncation Rust's `f32::from_bits`
+  ;; gets for free from `u32` — this is a real bug fix (any negative vertex
+  ;; coordinate crashes `read-accessor-f32` on JVM without it), not a port
+  ;; deviation: the CLJS branch below was already correct via DataView.
+  )
+
+(defn- read-u16-le [bin o]
+  (bit-or (bit-and (nth bin o) 0xFF) (bit-shift-left (bit-and (nth bin (+ o 1)) 0xFF) 8)))
+
+(defn- read-u32-le [bin o]
+  (bit-or (bit-and (nth bin o) 0xFF)
+          (bit-shift-left (bit-and (nth bin (+ o 1)) 0xFF) 8)
+          (bit-shift-left (bit-and (nth bin (+ o 2)) 0xFF) 16)
+          (bit-shift-left (bit-and (nth bin (+ o 3)) 0xFF) 24)))
+
+(defn- elem-size-of [component-type]
+  (cond
+    (= component-type gt/component-type-float) 4
+    (= component-type gt/component-type-unsigned-short) 2
+    (= component-type gt/component-type-unsigned-byte) 1
+    (= component-type gt/component-type-unsigned-int) 4
+    :else 4))
+
+(defn- read-component-f64
+  "Read one scalar component of `component-type` at byte offset `o` in `bin`,
+  as a double (the shared per-type read this fn's callers all need)."
+  [bin o component-type]
+  (let [sz (elem-size-of component-type)]
+    (when (> (+ o sz) (count bin)) (throw (ex-info "invalid GLB: accessor data truncated" {})))
+    (cond
+      (= component-type gt/component-type-float) (double (read-f32-le bin o))
+      (= component-type gt/component-type-unsigned-short) (double (read-u16-le bin o))
+      (= component-type gt/component-type-unsigned-byte) (double (bit-and (nth bin o) 0xFF))
+      (= component-type gt/component-type-unsigned-int) (double (bit-and (read-u32-le bin o) 0xFFFFFFFF))
+      :else 0.0)))
+
+(defn- read-uint
+  "Read one unsigned integer of `component-type` at byte offset `o` -- for
+  sparse-accessor `indices` (always UNSIGNED_BYTE/SHORT/INT per the glTF
+  spec, never FLOAT), so this returns a plain `long`, not a double."
+  [bin o component-type]
+  (cond
+    (= component-type gt/component-type-unsigned-byte) (bit-and (nth bin o) 0xFF)
+    (= component-type gt/component-type-unsigned-short) (read-u16-le bin o)
+    (= component-type gt/component-type-unsigned-int) (bit-and (read-u32-le bin o) 0xFFFFFFFF)
+    :else (throw (ex-info "invalid sparse accessor: indices componentType must be unsigned byte/short/int"
+                           {:component-type component-type}))))
+
+(defn- read-dense-accessor-f32
+  "The original (pre-sparse-accessor-support) dense read: every one of
+  `count` elements stored contiguously (respecting `byteStride`) starting at
+  `bufferView.byteOffset + accessor.byteOffset`. Returns a flat vector,
+  `count * components` doubles long."
+  [bin bv acc components elem-size]
+  (let [default-stride (* components elem-size)
+        stride (or (:byteStride bv) default-stride)
+        base (+ (or (:byteOffset bv) 0) (or (:byteOffset acc) 0))]
+    (vec
+     (for [i (range (:count acc)) c (range components)]
+       (read-component-f64 bin (+ base (* i stride) (* c elem-size)) (:componentType acc))))))
+
+(defn read-accessor-f32
+  "Read typed data from a glTF accessor in the BIN chunk as a flat f32 vector.
+  Supports FLOAT, UNSIGNED_SHORT, UNSIGNED_INT, UNSIGNED_BYTE component types.
+
+  Supports glTF **sparse accessors** (`accessor.sparse`) -- VRoid Studio's
+  standard compact blend-shape encoding, where only the vertices a morph
+  target actually moves are stored (e.g. `count: 500` out of a 4332-vertex
+  mesh), overlaid on a base array. Per the glTF 2.0 spec: the base is either
+  the accessor's own dense `:bufferView` data if present, or an implicit
+  all-zero array of `count * components` if the accessor has no
+  `:bufferView` of its own (sparse-only, the common VRoid case). Then
+  `sparse.count` (index, value) pairs -- `sparse.indices` (element index,
+  read as `sparse.indices.componentType`: UNSIGNED_BYTE/SHORT/INT) and
+  `sparse.values` (the replacement element, `components` scalars of the
+  accessor's OWN componentType) -- overwrite that element's full value in
+  the base array. A real bug fix (/loop maturity pass, ADR-2607031200):
+  calling this on a sparse accessor used to throw \"accessor out of range\"
+  (a bufferView-less accessor was treated as malformed), which silently
+  broke every real-world VRoid-authored morph target."
+  [doc accessor-idx]
+  (let [gltf (:gltf doc)
+        acc (get (:accessors gltf) accessor-idx)]
+    (when-not acc (throw (ex-info "accessor out of range" {:index accessor-idx})))
+    (let [bv-idx (:bufferView acc)
+          sparse (:sparse acc)]
+      (when (and (not bv-idx) (not sparse))
+        (throw (ex-info "accessor out of range" {:index accessor-idx})))
+      (let [bin (:bin doc)
+            components (case (:type acc) "SCALAR" 1 "VEC2" 2 "VEC3" 3 "VEC4" 4 "MAT4" 16 1)
+            elem-size (elem-size-of (:componentType acc))
+            base-values
+            (if bv-idx
+              (let [bv (get (:bufferViews gltf) bv-idx)]
+                (when-not bv (throw (ex-info "buffer view out of range" {:index bv-idx})))
+                (read-dense-accessor-f32 bin bv acc components elem-size))
+              (vec (repeat (* (:count acc) components) 0.0)))]
+        (if-not sparse
+          base-values
+          (let [{:keys [count indices values]} sparse
+                idx-bv (get (:bufferViews gltf) (:bufferView indices))
+                val-bv (get (:bufferViews gltf) (:bufferView values))]
+            (when-not idx-bv (throw (ex-info "buffer view out of range" {:index (:bufferView indices)})))
+            (when-not val-bv (throw (ex-info "buffer view out of range" {:index (:bufferView values)})))
+            (let [idx-comp-type (:componentType indices)
+                  idx-elem-size (elem-size-of idx-comp-type)
+                  idx-base (+ (or (:byteOffset idx-bv) 0) (or (:byteOffset indices) 0))
+                  val-base (+ (or (:byteOffset val-bv) 0) (or (:byteOffset values) 0))]
+              (reduce
+               (fn [out i]
+                 (let [elem-idx (read-uint bin (+ idx-base (* i idx-elem-size)) idx-comp-type)
+                       elem-off (* i components elem-size)]
+                   (reduce
+                    (fn [out c]
+                      (let [v (read-component-f64 bin (+ val-base elem-off (* c elem-size)) (:componentType acc))]
+                        (assoc out (+ (* elem-idx components) c) v)))
+                    out (range components))))
+               base-values (range count)))))))))
+
+(defn extract-primitive-mesh
+  "Extract interleaved vertex data (pos3+norm3+uv2 = 8 floats/vertex) from a
+  VRM mesh primitive. Returns `{:vertices [f32 ...] :indices [u32 ...]}`
+  ready for kami-render upload."
+  [doc mesh-idx prim-idx]
+  (let [mesh (get (:meshes (:gltf doc)) mesh-idx)]
+    (when-not mesh (throw (ex-info "part error: mesh not found" {:mesh mesh-idx})))
+    (let [prim (get (:primitives mesh) prim-idx)]
+      (when-not prim (throw (ex-info "part error: primitive not found" {:primitive prim-idx})))
+      (let [pos-acc (get-in prim [:attributes :POSITION])]
+        (when-not pos-acc (throw (ex-info "part error: missing POSITION attribute" {})))
+        (let [positions (read-accessor-f32 doc pos-acc)
+              normals (if-let [norm-acc (get-in prim [:attributes :NORMAL])]
+                        (read-accessor-f32 doc norm-acc)
+                        (vec (mapcat identity (repeat (/ (count positions) 3) [0.0 1.0 0.0]))))
+              uvs (if-let [uv-acc (get-in prim [:attributes :TEXCOORD_0])]
+                    (read-accessor-f32 doc uv-acc)
+                    (vec (repeat (* (/ (count positions) 3) 2) 0.0)))
+              vertex-count (/ (count positions) 3)
+              vertices (vec (mapcat (fn [i]
+                                       [(nth positions (* i 3)) (nth positions (+ (* i 3) 1)) (nth positions (+ (* i 3) 2))
+                                        (nth normals (* i 3)) (nth normals (+ (* i 3) 1)) (nth normals (+ (* i 3) 2))
+                                        (nth uvs (* i 2)) (nth uvs (+ (* i 2) 1))])
+                                     (range vertex-count)))
+              indices (if-let [idx-acc (:indices prim)]
+                        (mapv long (read-accessor-f32 doc idx-acc))
+                        (vec (range vertex-count)))]
+          {:vertices vertices :indices indices})))))
+
+(defn read-base-color-texture
+  "`material-idx` -> `{:bytes [u8 ...] :mime-type \"image/png\"}` for that
+  material's base glTF `pbrMetallicRoughness.baseColorTexture` (not any
+  VRMC_materials_mtoon extension texture — this is the plain glTF PBR path,
+  which every VRM 1.0 file has as a fallback even when it also carries MToon
+  extension data). `nil` if the material has no baseColorTexture, or the
+  resolved image is `:uri`-referenced (an external file, not embedded in
+  this GLB's binary chunk) rather than `:bufferView`-embedded — GLB-embedded
+  is the common case for a self-contained .vrm and the only one this reads;
+  loading an external URI is a caller concern (`fetch`, filesystem, ...), out
+  of scope for this pure accessor-shaped fn.
+
+  Real glTF material->texture->image chain: `materials[i].pbrMetallicRoughness
+  .baseColorTexture.index` -> a TEXTURE index (not an accessor) ->
+  `textures[j].source` -> an IMAGE index -> `images[k]` is either
+  `{:mimeType :bufferView}` (embedded, this fn's supported case) or
+  `{:uri ...}` (external, returns nil)."
+  [doc material-idx]
+  (let [gltf (:gltf doc)
+        material (get (:materials gltf) material-idx)
+        tex-idx (get-in material [:pbrMetallicRoughness :baseColorTexture :index])]
+    (when tex-idx
+      (let [texture (get (:textures gltf) tex-idx)
+            image-idx (:source texture)
+            image (get (:images gltf) image-idx)]
+        (when (and image (:bufferView image))
+          (let [bv (get (:bufferViews gltf) (:bufferView image))
+                start (or (:byteOffset bv) 0)
+                len (:byteLength bv)
+                bin (:bin doc)]
+            {:bytes (vec (subvec (vec bin) start (+ start len)))
+             :mime-type (or (:mimeType image) "image/png")}))))))

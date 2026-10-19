@@ -1,0 +1,168 @@
+(ns provider.http-ingress
+  "HTTP ingress lifecycle reference provider (W5 family-3).
+
+  Host owns listen/socket acceptance. The guest never receives a server socket,
+  connection, or ambient network. Instead:
+
+  - host injects bounded incoming requests via `enqueue!`
+  - guest polls with `:http/accept` (option of request)
+  - guest completes with `:http/reply` (bool accepted)
+
+  Pairing remains accept-then-reply (one pending unreplied request). The
+  host-owned queue is multi-inflight: default depth 8 (parametric). Status
+  is canonical i64 (bigint on cljs)."
+  (:require [kotoba.kir.value :as value]
+            ))
+
+(def accept-capability-id 17)
+(def reply-capability-id 18)
+(def max-headers 32)
+(def max-path-bytes 4096)
+(def max-body-bytes 65536)
+(def default-max-queue-depth 8)
+
+(def header-type
+  [:record :kotoba.http/header [[:name :keyword] [:value :string]]])
+(def header-set-type [:set header-type])
+
+(def accept-request-type
+  [:record :kotoba.http/accept-request [[:slot :i64]]])
+
+(def incoming-request-type
+  [:record :kotoba.http/incoming-request
+   [[:method :keyword] [:path :string]
+    [:headers header-set-type] [:body :string]]])
+
+(def accept-result-type [:option incoming-request-type])
+
+(def reply-request-type
+  [:record :kotoba.http/response
+   [[:status :i64] [:headers header-set-type] [:body :string]]])
+
+(def reply-result-type :bool)
+
+(def schemas
+  {:kotoba.http/header header-type
+   :kotoba.http/accept-request accept-request-type
+   :kotoba.http/incoming-request incoming-request-type
+   :kotoba.http/response reply-request-type})
+
+(defn- i64-zero []
+  )
+
+(defn- i64= [a b]
+  )
+
+(defn- valid-status?
+  "HTTP status is a whole number in [100, 599] as canonical i64."
+  [status]
+  )
+
+(defn- canonical-status [status]
+  )
+
+(defn- validate-headers! [headers]
+  (when (> (count headers) max-headers)
+    (throw (ex-info "HTTP ingress header limit reached"
+                    {:phase :http-ingress-provider})))
+  (let [names (mapv second headers)]
+    (when-not (= (count names) (count (set names)))
+      (throw (ex-info "HTTP ingress header names must be unique"
+                      {:phase :http-ingress-provider})))
+    (doseq [[_ name text] headers]
+      (value/bounded-keyword! name value/keyword-value-byte-limit)
+      (value/bounded-string! text value/string-value-byte-limit)))
+  headers)
+
+(defn- typed-incoming [method path headers body]
+  (value/bounded-keyword! method value/keyword-value-byte-limit)
+  (value/bounded-string! path max-path-bytes)
+  (when (zero? (value/utf8-byte-count! path))
+    (throw (ex-info "HTTP ingress path must be non-empty"
+                    {:phase :http-ingress-provider})))
+  (value/bounded-string! body max-body-bytes)
+  (let [header-items
+        (cond
+          (and (vector? headers) (= header-set-type (first headers)))
+          (second headers)
+          (vector? headers) headers
+          (map? headers)
+          (mapv (fn [[n t]] [header-type n t]) headers)
+          :else
+          (throw (ex-info "HTTP ingress headers must be a set or map"
+                          {:phase :http-ingress-provider})))
+        validated (validate-headers! header-items)]
+    [incoming-request-type method path [header-set-type validated] body]))
+
+(defn create-provider
+  "Build accept + reply providers sharing one host-owned ingress queue.
+
+  Options:
+    :max-queue-depth — positive integer, default `default-max-queue-depth` (8).
+
+  Host may enqueue while a request is pending reply. Accept still requires
+  reply before the next accept (single pending). Returns
+  `{:providers {17 accept 18 reply} :enqueue! f :snapshot f}`."
+  ([] (create-provider {}))
+  ([{:keys [max-queue-depth] :or {max-queue-depth default-max-queue-depth}}]
+   (when-not (and (integer? max-queue-depth) (pos? max-queue-depth)
+                  (<= max-queue-depth 256))
+     (throw (ex-info "HTTP ingress max-queue-depth must be in [1,256]"
+                     {:phase :http-ingress-provider
+                      :max-queue-depth max-queue-depth})))
+   (let [queue (atom [])
+         pending (atom nil)
+         enqueue!
+         (fn [method path headers body]
+           (when (>= (count @queue) max-queue-depth)
+             (throw (ex-info "HTTP ingress queue is full"
+                             {:phase :http-ingress-provider
+                              :max-queue-depth max-queue-depth})))
+           (let [req (typed-incoming method path headers body)]
+             (swap! queue conj req)
+             true))]
+     {:providers
+      {accept-capability-id
+       {:request-type accept-request-type
+        :result-type accept-result-type
+        :invoke
+        (fn [[actual-type slot]]
+          (when-not (= actual-type accept-request-type)
+            (throw (ex-info "HTTP accept contract mismatch"
+                            {:phase :http-ingress-provider})))
+          (when-not (i64= slot (i64-zero))
+            (throw (ex-info "HTTP accept slot must be 0 in v1"
+                            {:phase :http-ingress-provider :slot slot})))
+          (when (some? @pending)
+            (throw (ex-info "HTTP accept requires reply before next accept"
+                            {:phase :http-ingress-provider})))
+          (if-let [req (first @queue)]
+            (do (swap! queue (fn [q] (vec (rest q))))
+                (reset! pending req)
+                [accept-result-type true req])
+            [accept-result-type false]))}
+
+       reply-capability-id
+       {:request-type reply-request-type
+        :result-type reply-result-type
+        :invoke
+        (fn [[actual-type status [_ headers] body]]
+          (when-not (= actual-type reply-request-type)
+            (throw (ex-info "HTTP reply contract mismatch"
+                            {:phase :http-ingress-provider})))
+          (when (nil? @pending)
+            (throw (ex-info "HTTP reply requires a prior accept"
+                            {:phase :http-ingress-provider})))
+          (let [st (canonical-status status)]
+            (when-not (valid-status? st)
+              (throw (ex-info "HTTP reply status is outside the admitted range"
+                              {:phase :http-ingress-provider :status status})))
+            (validate-headers! headers)
+            (value/bounded-string! body max-body-bytes)
+            (reset! pending nil)
+            true))}}
+      :enqueue! enqueue!
+      :max-queue-depth max-queue-depth
+      :snapshot (fn [] {:queued (count @queue)
+                        :pending? (some? @pending)
+                        :max-queue-depth max-queue-depth})})))

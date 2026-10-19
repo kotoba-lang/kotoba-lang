@@ -1,0 +1,404 @@
+(ns kekkai.store
+  "SSoT for the kekkai tailnet control plane, behind a `Store` protocol so the
+  backend is a swap (MemStore default ‖ DatomicStore via langchain.db, itself
+  swappable to real Datomic Local / kotoba-server).
+
+  Domain = a zero-trust mesh overlay (a Tailscale-equivalent control plane).
+  The actor is the COORDINATION/CONTROL plane only — it publishes a netmap
+  (who-can-reach-whom); the WireGuard data plane lives in the nodes, which pull
+  the netmap and open their own tunnels. The actor never carries packets.
+
+    tailnet  — ONE ORGANIZATION's isolated overlay: id (e.g. \"gftd/root\"),
+               org, name, status. The org boundary is a first-class entity
+               rather than a naming convention inside the ACL, because a
+               convention inside the ACL is one a grant can talk its way past.
+    node     — a machine in a tailnet: did (node key did:key), user (owner),
+               tailnet, tags, os, key-expiry (epoch s), status (pending/
+               authorized/expired/revoked). A node IS its key (Tailscale
+               node-key model).
+    user     — a tailnet member (login, role, tailnet)
+    policy   — the ACL, ONE PER TAILNET: tag-owners {tag [users]} +
+               deny-by-default grants
+               [{:src [tag|user] :dst [tag|user] :ports [int|\"*\"]}]
+    peering  — the only way an edge crosses two tailnets: a record naming both,
+               carrying its own directional grants, valid only once BOTH orgs
+               approved it (kekkai.acl/peering-active?)
+    route    — a subnet/exit route a node advertises (cidr, kind, approved?)
+    heartbeat— digital-twin liveness events (last-seen epoch s, endpoint)
+    netmap   — the committed access assessment for a node (reachable peers)
+
+  Tenancy is a property of the *plane*, not of a deployment: one kekkai
+  control plane serves many organizations, and `plane` projects the pure
+  {:policies :peerings} data that kekkai.acl decides over.
+
+  Charter: integers, not floats (epoch seconds, ports); EAVT ground datoms are
+  canonical; the append-only **ledger is the tailnet's membership & access
+  genealogy** — an immutable zero-trust audit trail (who joined, who could
+  reach whom, on whose authority, when keys rotated), the property a mutable
+  admin console can't give you. There is intentionally **no :traffic/* or
+  :user/activity namespace** — the control plane authorizes reachability, it
+  never logs what flows through the tunnels (anti-surveillance, Wellbecoming
+  §1.13)."
+  (:require 
+            [clojure.string :as str]
+            [kekkai.acl :as acl]
+            [langchain.db :as d]))
+
+(defprotocol Store
+  (node [s id])
+  (all-nodes [s])
+  (user [s id])
+  (tailnet [s id]          "one organization's tailnet record, or nil")
+  (all-tailnets [s]        "every tailnet this control plane serves")
+  (policy-of [s tailnet-id] "the published ACL policy for ONE tailnet, or nil")
+  (all-policies [s]        "{tailnet-id policy} for every tailnet that published one")
+  (policy [s]              "the default tailnet's ACL policy (single-tenant shorthand)")
+  (all-peerings [s]        "every cross-tailnet peering record")
+  (heartbeats-of [s id]    "liveness events for a node, oldest→newest")
+  (routes-of [s id]        "routes advertised by a node")
+  (all-routes [s]          "every advertised route across every tailnet")
+  (assessment-of [s id]    "committed netmap/membership/route assessment for a node, or nil")
+  (ledger [s])
+  (record-datom! [s record] "append/merge a tailnet ground fact to the SSoT")
+  (append-ledger! [s fact]  "append one immutable genealogy fact")
+  (seed! [s data]           "bulk-seed entity collections (idempotent upsert)"))
+
+(defn policy-key
+  "Normalize a policy id to a tailnet id.
+
+  Before the tenant plane there was exactly one policy, stored under the
+  literal id \"the\". That id is mapped onto `acl/default-tailnet` rather than
+  left as a distinct key, so an existing deployment's published policy keeps
+  governing the nodes it always governed instead of quietly becoming an
+  orphaned record that no node resolves to."
+  [id]
+  (if (or (nil? id) (= "the" id)) acl/default-tailnet id))
+
+(defn plane
+  "The pure {:policies {tailnet-id policy} :peerings [...]} value
+  `kekkai.acl/edge-decision` decides over.
+
+  Projected here, in the store, so the ACL stays free of I/O and every caller
+  — governor and coord-LLM alike — decides over the same snapshot rather than
+  each assembling its own view of who is peered with whom.
+
+  Built from the published policies, NOT by walking registered tailnets: a
+  deployment that predates the tenant plane has a policy and no tailnet
+  records at all, and enumerating tailnets there would hand the ACL an empty
+  policy set and deny every edge it used to allow."
+  [s]
+  {:policies (into {} (all-policies s))
+   :peerings (vec (all-peerings s))})
+
+(defn netmap-inputs
+  "The pure snapshot `kekkai.netmap/publish` projects into a wire netmap.
+
+  Assembled here for the same reason `plane` is: the projector stays free of
+  I/O, and every node's netmap is cut from one snapshot rather than from a
+  store re-read per peer, which would let a node appear in one node's netmap
+  and not in another's from the same publish.
+
+  `relays` and `version` are the caller's. Relays are still deployment
+  configuration rather than governed control-plane records — an honest gap,
+  named here rather than papered over with an empty default that would publish
+  a relay-less netmap and strand every node behind a NAT."
+  [s {:keys [relays version]}]
+  (let [nodes (vec (all-nodes s))]
+    {:nodes nodes
+     :plane (plane s)
+     :heartbeats (into {} (map (juxt :id #(vec (heartbeats-of s (:id %))))) nodes)
+     :relays (vec relays)
+     :version version}))
+
+;; ───────────────────────── demo data ─────────────────────────
+;; A fixed clock so key-expiry checks are deterministic and offline-verifiable.
+(def demo-now 1750000000) ; ~2025-06-15Z, epoch seconds
+
+(defn demo-data
+  "Two organizations on ONE control plane.
+
+  `default` is alice's original tailnet: n-pending is a clean device awaiting
+  machine approval; n-rogue (mallory) claims a tag it doesn't own AND has an
+  expired key → the TailnetGovernor must hold its admission, un-overridably.
+
+  `acme` is a second organization that independently named a tag `tag:server`
+  and independently uses `10.0.0.0/24` — both collisions are what happens by
+  default, not contrivances (RFC1918 space and obvious tag names are finite).
+  Under one flat policy, alice's `tag:laptop → tag:server` grant would have
+  matched acme's server, and acme's approved 10.0.0.0/24 would have blocked
+  alice's identical subnet as a 'hijack'. The tenant plane exists so neither
+  happens, and the demo carries the collisions so a regression shows up here."
+  []
+  {:tailnets
+   {"default" {:id "default" :org "alice-co" :name "alice's tailnet" :status "active"}
+    "acme"    {:id "acme"    :org "acme"     :name "acme corp"       :status "active"}}
+   :users
+   {"alice"   {:id "alice"   :login "alice@example.com"   :role "admin"  :tailnet "default"}
+    "mallory" {:id "mallory" :login "mallory@example.com" :role "member" :tailnet "default"}
+    "bob"     {:id "bob"     :login "bob@acme.example"    :role "admin"  :tailnet "acme"}}
+   :policies
+   {"default"
+    {:tag-owners {"tag:server" ["alice"] "tag:laptop" ["alice"] "tag:exit" ["alice"]}
+     ;; :capabilities is opt-in per grant (kekkai.acl/default-capabilities is
+     ;; [:overlay] alone). The laptop→server grant names :ssh because that is
+     ;; what it is for; the broad alice grant does NOT, so widening a port list
+     ;; never quietly widens what may be done through it.
+     :grants [{:src ["tag:laptop"] :dst ["tag:server"] :ports [22 443]
+               :capabilities [:overlay :ssh]}
+              {:src ["alice"]      :dst ["tag:server" "tag:exit"] :ports ["*"]}]}
+    "acme"
+    {:tag-owners {"tag:server" ["bob"] "tag:cache" ["bob"]}
+     :grants [{:src ["bob"] :dst ["tag:server" "tag:cache"] :ports ["*"]}]}}
+   ;; Proposed, not active: acme has approved, alice has not. A peering one
+   ;; side signed is exactly the state that must NOT carry traffic.
+   :peerings
+   {"p-alice-acme"
+    {:id "p-alice-acme" :a "default" :b "acme" :status "active"
+     :approved-by ["acme"]
+     :grants [{:from "default" :src ["tag:laptop"] :dst ["tag:cache"] :ports [443]}]}}
+   ;; :static-pub and :overlay-ip are DATA-PLANE facts: the control plane admits
+   ;; a device by its did:key, but a peer is dialled by its Noise X25519 static
+   ;; key at an overlay address. They are separate fields because they are
+   ;; separate keys — reusing the did's Ed25519 material as an X25519 static
+   ;; would tie session compromise to identity compromise. Demo values are
+   ;; well-formed 32-byte hex and obviously synthetic.
+   :nodes
+   {"n-laptop"  {:id "n-laptop"  :hostname "alice-mbp" :os "macos" :did "did:key:zLaptop"
+                 :user "alice" :tailnet "default" :tags ["tag:laptop"]
+                 :static-pub "1111111111111111111111111111111111111111111111111111111111111111"
+                 :overlay-ip "100.64.0.1"
+                 :key-expiry (+ demo-now 7776000) :status "authorized"}
+    "n-server"  {:id "n-server"  :hostname "prod-db"   :os "linux" :did "did:key:zServer"
+                 :user "alice" :tailnet "default" :tags ["tag:server"]
+                 :static-pub "2222222222222222222222222222222222222222222222222222222222222222"
+                 :overlay-ip "100.64.0.2"
+                 :key-expiry (+ demo-now 7776000) :status "authorized"}
+    "n-gw"      {:id "n-gw"      :hostname "edge-gw"   :os "linux" :did "did:key:zGateway"
+                 :user "alice" :tailnet "default" :tags ["tag:exit"]
+                 :static-pub "3333333333333333333333333333333333333333333333333333333333333333"
+                 :overlay-ip "100.64.0.3"
+                 :key-expiry (+ demo-now 7776000) :status "authorized"}
+    "n-pending" {:id "n-pending" :hostname "alice-phone" :os "ios" :did "did:key:zPhone"
+                 :user "alice" :tailnet "default" :tags ["tag:laptop"]
+                 :static-pub "4444444444444444444444444444444444444444444444444444444444444444"
+                 :overlay-ip "100.64.0.4"
+                 :key-expiry (+ demo-now 7776000) :status "pending"}
+    "n-rogue"   {:id "n-rogue"   :hostname "evil-box"  :os "linux" :did "did:key:zRogue"
+                 :user "mallory" :tailnet "default" :tags ["tag:server"]
+                 :static-pub "5555555555555555555555555555555555555555555555555555555555555555"
+                 :overlay-ip "100.64.0.5"
+                 :key-expiry (- demo-now 3600) :status "pending"}
+    ;; acme's node: same tag name, different organization.
+    "a-server"  {:id "a-server"  :hostname "acme-db"   :os "linux" :did "did:key:zAcmeDb"
+                 :user "bob" :tailnet "acme" :tags ["tag:server"]
+                 :static-pub "6666666666666666666666666666666666666666666666666666666666666666"
+                 :overlay-ip "100.64.1.1"
+                 :key-expiry (+ demo-now 7776000) :status "authorized"}
+    "a-cache"   {:id "a-cache"   :hostname "acme-cache" :os "linux" :did "did:key:zAcmeCache"
+                 :user "bob" :tailnet "acme" :tags ["tag:cache"]
+                 :static-pub "7777777777777777777777777777777777777777777777777777777777777777"
+                 :overlay-ip "100.64.1.2"
+                 :key-expiry (+ demo-now 7776000) :status "authorized"}}
+   :routes
+   {"r-subnet"  {:id "r-subnet"  :node "n-server" :cidr "10.0.0.0/24" :kind "subnet" :approved? false}
+    "r-exit"    {:id "r-exit"    :node "n-gw"     :cidr "0.0.0.0/0"   :kind "exit"   :approved? false}
+    ;; acme already runs the same private range, approved. Scoping the hijack
+    ;; check per-tailnet is what keeps this from blocking r-subnet above.
+    "ra-subnet" {:id "ra-subnet" :node "a-server" :cidr "10.0.0.0/24" :kind "subnet" :approved? true}}
+   :heartbeats
+   {"n-laptop" [{:last-seen demo-now :endpoint "203.0.113.7:41641"}]}})
+
+;; ───────────────────────── MemStore (default) ─────────────────────────
+
+(defrecord MemStore [a]
+  Store
+  (node [_ id] (get-in @a [:nodes id]))
+  (all-nodes [_] (sort-by :id (vals (:nodes @a))))
+  (user [_ id] (get-in @a [:users id]))
+  (tailnet [_ id] (get-in @a [:tailnets id]))
+  (all-tailnets [_] (sort-by :id (vals (:tailnets @a))))
+  ;; The legacy singular :policy key is read as the default tailnet's policy
+  ;; whenever :policies has nothing for it. A MemStore is routinely built
+  ;; straight from an atom rather than through `seed!` (tests, fixtures, an
+  ;; existing deployment's persisted state), and without this fallback such a
+  ;; store reports NO policies at all — which is not a visible error, it is
+  ;; every edge silently denied.
+  (policy-of [_ tailnet-id]
+    (let [k (policy-key tailnet-id)]
+      (or (get-in @a [:policies k])
+          (when (= acl/default-tailnet k) (:policy @a)))))
+  (all-policies [_]
+    (let [ps (:policies @a)]
+      (cond-> ps
+        (and (:policy @a) (not (contains? ps acl/default-tailnet)))
+        (assoc acl/default-tailnet (:policy @a)))))
+  (policy [s] (policy-of s acl/default-tailnet))
+  (all-peerings [_] (sort-by :id (vals (:peerings @a))))
+  (heartbeats-of [_ id] (get-in @a [:heartbeats id] []))
+  (routes-of [_ id] (filterv #(= id (:node %)) (vals (:routes @a))))
+  (all-routes [_] (sort-by :id (vals (:routes @a))))
+  (assessment-of [_ id] (get-in @a [:assessments id]))
+  (ledger [_] (:ledger @a))
+  ;; `:tailnet` and `:peering` get `:id` stamped into the stored VALUE, not
+  ;; just used as the map key. `all-tailnets`/`all-peerings` return values, and
+  ;; every consumer that then looks a record up — governor/peering-violations,
+  ;; acl/active-peering, query/peerings-of — matches on `(:id record)`. A
+  ;; caller who passes the id as the record key but omits it from the value
+  ;; (the natural thing to do, since the key already says it) produces a record
+  ;; that is stored correctly and found by nobody: the peering exists, and
+  ;; every approval of it is rejected as `:no-peering`. Caught by
+  ;; cloud-itonami's round-trip test against a real store, not by any test
+  ;; that constructed its own fixtures — those all happened to include `:id`.
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :user       (swap! a update-in [:users id] merge value)
+      :node       (swap! a update-in [:nodes id] merge value)
+      :tailnet    (swap! a update-in [:tailnets id] #(assoc (merge % value) :id id))
+      ;; A policy is REPLACED, never merged: an ACL is a whole document, and
+      ;; merging a new one over the old leaves revoked grants in place.
+      :policy     (swap! a assoc-in [:policies (policy-key id)] value)
+      ;; A peering IS merged, because the two approvals arrive in separate
+      ;; ops from two different organizations; replacing would drop whichever
+      ;; approval landed first.
+      :peering    (swap! a update-in [:peerings id] #(assoc (merge % value) :id id))
+      :route      (swap! a assoc-in [:routes id] value)
+      :heartbeat  (swap! a update-in [:heartbeats id] (fnil conj []) value)
+      :assessment (swap! a assoc-in [:assessments id] value)
+      nil)
+    s)
+  (append-ledger! [_ fact] (swap! a update :ledger conj fact) fact)
+  (seed! [s data]
+    (swap! a (fn [cur]
+               (cond-> (merge cur (select-keys data [:tailnets :users :nodes :policies
+                                                     :peerings :routes :heartbeats]))
+                 ;; single-tenant shorthand: a bare :policy seeds the default
+                 ;; tailnet, so pre-tenant seed maps still load unchanged.
+                 (:policy data)
+                 (assoc-in [:policies acl/default-tailnet] (:policy data)))))
+    s))
+
+(defn seed-db []
+  (->MemStore (atom (assoc (demo-data) :assessments {} :ledger []))))
+
+;; ───────────────────────── DatomicStore (langchain.db) ─────────────────────────
+
+(def ^:private schema
+  {:node/id       {:db/unique :db.unique/identity}
+   :user/id       {:db/unique :db.unique/identity}
+   :tailnet/id    {:db/unique :db.unique/identity}
+   :peering/id    {:db/unique :db.unique/identity}
+   :route/id      {:db/unique :db.unique/identity}
+   ;; :policy/id is now the TAILNET id, not the literal "the" — one ACL
+   ;; document per organization. `policy-key` maps the historical "the" onto
+   ;; the default tailnet so an existing store keeps resolving.
+   :policy/id     {:db/unique :db.unique/identity}
+   :assessment/id {:db/unique :db.unique/identity}})
+
+(defn- enc [v] (pr-str v))
+(defn- dec* [s] (when s (edn/read-string s)))
+
+;; The store talks to its backend ONLY through the langchain.db `:db-api` map
+;; {:q :transact! :db :pull :entid}. langchain.db/api (in-process EAVT) and
+;; langchain.kotoba-db/kotoba-api (kotoba-server XRPC, e.g. kotobase.net) both
+;; implement it, so the same record runs on either by construction.
+
+(defn- q* [{:keys [api conn]} query & inputs]
+  (apply (:q api) query ((:db api) conn) inputs))
+(defn- pull* [{:keys [api conn]} pattern eid] ((:pull api) ((:db api) conn) pattern eid))
+(defn- tx* [{:keys [api conn]} txd] ((:transact! api) conn txd))
+
+(defrecord DatomicStore [api conn]
+  Store
+  (node [this id]
+    (-> (pull* this [:node/edn] [:node/id id]) :node/edn dec*))
+  (all-nodes [this]
+    (->> (q* this '[:find [?id ...] :where [?e :node/id ?id]])
+         (map #(node this %)) (sort-by :id)))
+  (user [this id]
+    (-> (pull* this [:user/edn] [:user/id id]) :user/edn dec*))
+  (tailnet [this id]
+    (-> (pull* this [:tailnet/edn] [:tailnet/id id]) :tailnet/edn dec*))
+  (all-tailnets [this]
+    (->> (q* this '[:find [?v ...] :where [?t :tailnet/id _] [?t :tailnet/edn ?v]])
+         (mapv dec*) (sort-by :id)))
+  (policy-of [this tailnet-id]
+    (-> (pull* this [:policy/edn] [:policy/id (policy-key tailnet-id)])
+        :policy/edn dec*))
+  (all-policies [this]
+    (->> (q* this '[:find ?id ?v :where [?p :policy/id ?id] [?p :policy/edn ?v]])
+         (reduce (fn [m [id v]] (assoc m (policy-key id) (dec* v))) {})))
+  (policy [this] (policy-of this acl/default-tailnet))
+  (all-peerings [this]
+    (->> (q* this '[:find [?v ...] :where [?p :peering/id _] [?p :peering/edn ?v]])
+         (mapv dec*) (sort-by :id)))
+  (heartbeats-of [this id]
+    (->> (q* this '[:find [?v ...] :in $ ?nid :where
+                    [?r :hb/node ?nid] [?r :hb/edn ?v]] id)
+         (mapv dec*)))
+  (routes-of [this id] (filterv #(= id (:node %)) (all-routes this)))
+  (all-routes [this]
+    (->> (q* this '[:find [?v ...] :where [?r :route/id _] [?r :route/edn ?v]])
+         (mapv dec*) (sort-by :id)))
+  (assessment-of [this id]
+    (-> (pull* this [:assessment/edn] [:assessment/id id]) :assessment/edn dec*))
+  (ledger [this]
+    ;; ordered by entity id (?e), never a client-precomputed :ledger/seq -- a
+    ;; caller-side `(count (ledger s))` read followed by a separate `tx*` write
+    ;; is a non-atomic read-modify-write; two concurrent append-ledger! calls
+    ;; can compute the SAME seq, and since :ledger/seq was a :db.unique/identity
+    ;; attr, the second transact! silently upserted onto (retracted +
+    ;; replaced) the first call's entity -- verified data loss against the
+    ;; real langchain.db transact! semantics. :db/id is allocated fresh per
+    ;; entity map with no unique attr to collide on, so ordering by it can
+    ;; never lose a fact this way.
+    (->> (q* this '[:find ?e ?f :where [?e :ledger/fact ?f]])
+         (sort-by first) (mapv (comp dec* second))))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :user       (tx* s [{:user/id id :user/edn (enc (merge (user s id) value))}])
+      :node       (tx* s [{:node/id id :node/edn (enc (merge (node s id) value))}])
+      :tailnet    (tx* s [{:tailnet/id id
+                           :tailnet/edn (enc (assoc (merge (tailnet s id) value) :id id))}])
+      ;; replaced, not merged — an ACL is a whole document (see MemStore).
+      :policy     (tx* s [{:policy/id (policy-key id) :policy/edn (enc value)}])
+      ;; merged — the two orgs' approvals arrive as separate ops (see MemStore).
+      :peering    (tx* s [{:peering/id id
+                           :peering/edn (enc (assoc (merge (first (filter #(= id (:id %))
+                                                                          (all-peerings s)))
+                                                           value)
+                                                    :id id))}])
+      :route      (tx* s [{:route/id id :route/edn (enc value)}])
+      :heartbeat  (tx* s [{:hb/node id :hb/edn (enc value)}])
+      :assessment (tx* s [{:assessment/id id :assessment/edn (enc value)}])
+      nil)
+    s)
+  (append-ledger! [s fact]
+    (tx* s [{:ledger/fact (enc fact)}]) fact)
+  (seed! [s data]
+    (doseq [[id t] (:tailnets data)] (record-datom! s {:kind :tailnet :id id :value t}))
+    (doseq [[id u] (:users data)]  (record-datom! s {:kind :user :id id :value u}))
+    (doseq [[id n] (:nodes data)]  (record-datom! s {:kind :node :id id :value n}))
+    (doseq [[id p] (:policies data)] (record-datom! s {:kind :policy :id id :value p}))
+    ;; single-tenant shorthand: a bare :policy seeds the default tailnet.
+    (when-let [p (:policy data)]   (record-datom! s {:kind :policy :id acl/default-tailnet :value p}))
+    (doseq [[id p] (:peerings data)] (record-datom! s {:kind :peering :id id :value p}))
+    (doseq [[id r] (:routes data)] (record-datom! s {:kind :route :id id :value r}))
+    (doseq [[id hbs] (:heartbeats data) hb hbs]
+      (record-datom! s {:kind :heartbeat :id id :value hb}))
+    s))
+
+(defn datomic-store
+  "DatomicStore on the in-process langchain.db EAVT backend (default Datomic-
+  shaped store; verifiable offline). For the kotoba-server pod (kotobase.net),
+  see kekkai.kotoba/kotoba-store — same record, different :db-api."
+  ([] (datomic-store nil))
+  ([data] (let [s (->DatomicStore d/api (d/create-conn schema))]
+            (when data (seed! s data)) s)))
+
+(defn datomic-seed-db [] (datomic-store (demo-data)))
+
+;; ───────────────────────── ledger formatting ─────────────────────────
+
+(defn ledger-line [{:keys [op subject node disposition basis]}]
+  (str/join " · " [(name (or disposition :record)) (str "op=" op)
+                   (str "node=" (or subject node)) (str "basis=" (pr-str basis))]))

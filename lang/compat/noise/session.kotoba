@@ -1,0 +1,188 @@
+(ns noise.session
+  "The transport phase: what happens after the handshake, for the next few
+  hundred million packets. Pure — the caller owns the clock and the socket.
+
+  Noise itself says almost nothing about this: it hands you two CipherStates and
+  assumes an in-order, reliable, lossless stream. A datagram overlay has none of
+  those, so this namespace adds the three things WireGuard adds, and no more:
+
+  1. **An explicit counter on the wire.** Each transport frame is
+     `[counter:8 little-endian][ciphertext]`. Without it, one dropped UDP packet
+     desynchronizes the nonces and every subsequent packet fails to
+     authenticate.
+  2. **A replay window.** A counter that was already accepted, or that is older
+     than the window, is rejected. Accepting a replay of an authenticated packet
+     is still an attack even though the attacker cannot forge new content.
+  3. **Rekey and expiry policy on time and volume**, so a session's keys have a
+     bounded lifetime and a bounded amount of traffic under them.
+
+  We do NOT claim WireGuard wire compatibility: the handshake framing, the
+  cookie/DoS-mitigation messages and the exact 4-byte type/index header are
+  WireGuard's, and this is a different overlay whose identities come from the
+  kekkai netmap. What is shared is the cryptographic design (Noise IK, X25519,
+  ChaCha20-Poly1305) and the session semantics in this file."
+  (:require [noise.cipher-state :as cs]))
+
+(def default-policy
+  "WireGuard's timer constants, with the two volume limits lowered to what a
+   portable integer counter can express (see `noise.cipher-state/max-nonce`).
+   Seconds; the caller supplies `now` in seconds."
+  {:rekey-after-time 120
+   :reject-after-time 180
+   :rekey-timeout 5
+   :keepalive-timeout 10
+   :handshake-give-up-after 90
+   :rekey-after-messages 281474976710656          ; 2^48
+   :reject-after-messages (dec cs/max-nonce)
+   :replay-window 2048})
+
+(defn session
+  "Wrap a completed `noise.handshake-state` as a transport session."
+  [{:keys [send-cs recv-cs handshake-hash rs initiator?]} {:keys [now peer-id policy]}]
+  {:peer-id peer-id
+   :initiator? initiator?
+   :remote-static rs
+   :handshake-hash handshake-hash
+   :send-cs send-cs
+   :recv-cs recv-cs
+   :policy (merge default-policy policy)
+   :established-at now
+   :last-send nil
+   :last-recv nil
+   :sent 0
+   :received 0
+   :recv-max -1
+   :recv-seen #{}})
+
+(defn- counter->bytes [n]
+  (loop [i 0 acc [] n n]
+    (if (= i 8) acc (recur (inc i) (conj acc (bit-and n 0xff)) (quot n 256)))))
+
+(defn- bytes->counter [bs]
+  (loop [i 7 acc 0]
+    (if (neg? i) acc (recur (dec i) (+ (* acc 256) (nth bs i))))))
+
+(defn encrypt
+  "-> [session' frame].
+
+   `opts`:
+     :ad   extra associated data bound into the tag. The counter header is
+           always included in it, so a rewritten counter fails authentication
+           rather than being silently accepted at a different nonce.
+     :now  current time in seconds; records `:last-send` for the keepalive and
+           rekey policy. Omit it and the session simply carries no send time."
+  ([sess plaintext] (encrypt sess plaintext nil))
+  ([sess plaintext {:keys [ad now]}]
+   (let [ad (or ad [])
+         n (get-in sess [:send-cs :n])
+         hdr (counter->bytes n)
+         [cs' ct] (cs/encrypt-with-ad (:send-cs sess) (into (vec ad) hdr) plaintext)]
+     [(cond-> (assoc sess :send-cs cs')
+        true (update :sent inc)
+        now (assoc :last-send now))
+      (into hdr ct)])))
+
+(defn- replay-ok?
+  "Sliding-window replay check. The window is a set of accepted counters rather
+   than a bitmap: 64-bit bitmap arithmetic is not portable to ClojureScript, and
+   at the default 2048 entries the set costs a few tens of kilobytes per peer —
+   a deliberate space-for-portability trade, called out here so nobody
+   'optimizes' it into platform-specific bit twiddling by accident."
+  [{:keys [recv-max recv-seen policy]} n]
+  (let [w (:replay-window policy)]
+    (and (not (contains? recv-seen n))
+         (or (> n recv-max) (> n (- recv-max w))))))
+
+(defn decrypt
+  "-> [session' plaintext]. Throws `:noise/replay` for a replayed or too-old
+   counter and `:noise/auth-failed` for a forged frame. Out-of-order delivery
+   inside the window is accepted, because dropping it would make the overlay
+   unusable over real UDP."
+  ([sess frame] (decrypt sess frame nil))
+  ([sess frame {:keys [ad now]}]
+   (when (< (count frame) 8)
+     (throw (ex-info "truncated noise transport frame" {:type :noise/truncated})))
+   (let [ad (or ad [])
+         hdr (vec (take 8 frame))
+         n (bytes->counter hdr)
+         ct (vec (drop 8 frame))]
+     (when-not (replay-ok? sess n)
+       (throw (ex-info "noise transport frame replayed or outside the replay window"
+                       {:type :noise/replay :counter n :recv-max (:recv-max sess)})))
+     (let [[cs' pt] (try
+                      (cs/decrypt-with-ad (cs/set-nonce (:recv-cs sess) n)
+                                          (into (vec ad) hdr) ct)
+                      (catch  e
+                        (throw (ex-info "noise transport frame failed authentication"
+                                        {:type :noise/auth-failed :counter n}
+                                        e))))
+           w (:replay-window (:policy sess))
+           recv-max (max (:recv-max sess) n)
+           ;; Prune amortized, not per packet. Rebuilding the window set on every
+           ;; datagram is O(window) — measured at ~10 ms per packet once the set
+           ;; held a few thousand counters, which is the difference between an
+           ;; overlay that carries traffic and one that does not. Pruning when the
+           ;; set exceeds twice the window keeps it bounded at O(1) amortized and
+           ;; never accepts a counter it should reject: entries below the window
+           ;; are still rejected by the `(> n (- recv-max w))` test above, whether
+           ;; or not they have been pruned yet.
+           seen0 (conj (:recv-seen sess) n)
+           seen (if (> (count seen0) (* 2 w))
+                  (into #{} (filter #(> % (- recv-max w))) seen0)
+                  seen0)]
+       [(cond-> (assoc sess
+                       ;; keep the CipherState's key, discard its nonce: the
+                       ;; counter comes off the wire per frame, so a stale :n
+                       ;; here would be meaningless (and misleading).
+                       :recv-cs (assoc (:recv-cs sess) :k (:k cs'))
+                       :recv-max recv-max
+                       :recv-seen seen)
+          true (update :received inc)
+          now (assoc :last-recv now))
+        pt]))))
+
+;; ── lifetime policy ─────────────────────────────────────────────────────────
+
+(defn expired?
+  [{:keys [established-at sent received policy]} now]
+  (or (>= (- now established-at) (:reject-after-time policy))
+      (>= (max sent received) (:reject-after-messages policy))))
+
+(defn needs-rekey?
+  "True once the session should be *replaced* by a fresh handshake. The
+   initiator acts on this; the responder waits, so both sides do not
+   simultaneously start handshakes."
+  [{:keys [established-at sent policy initiator?] :as sess} now]
+  (and initiator?
+       (not (expired? sess now))
+       (or (>= (- now established-at) (:rekey-after-time policy))
+           (>= sent (:rekey-after-messages policy)))))
+
+(defn needs-keepalive?
+  "WireGuard's passive keepalive: if we received data and have not sent anything
+   for keepalive-timeout, send an empty frame so the peer (and every NAT on the
+   path) knows the session and the mapping are still alive."
+  [{:keys [last-recv last-send policy]} now]
+  (boolean (and last-recv
+                (>= (- now (or last-send 0)) (:keepalive-timeout policy)))))
+
+(defn advice
+  "The set of actions the caller should take for this session at `now`. Pure, so
+   the agent's tick loop is testable without a clock or a socket."
+  [sess now]
+  (cond-> #{}
+    (expired? sess now) (conj :expire)
+    (needs-rekey? sess now) (conj :rekey)
+    (needs-keepalive? sess now) (conj :keepalive)))
+
+(defn handshake-plan
+  "Initiator-side handshake retry decision. `attempt` is
+   `{:attempts n :last-at t :started-at t}` (or nil for a fresh start).
+   -> `:send` | `:wait` | `:give-up`."
+  [attempt now policy]
+  (let [{:keys [rekey-timeout handshake-give-up-after]} (merge default-policy policy)]
+    (cond
+      (nil? attempt) :send
+      (>= (- now (:started-at attempt)) handshake-give-up-after) :give-up
+      (>= (- now (:last-at attempt)) rekey-timeout) :send
+      :else :wait)))

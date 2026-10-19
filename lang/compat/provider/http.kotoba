@@ -1,0 +1,235 @@
+(ns provider.http
+  "Bounded HTTPS reference providers. Network authority remains host-owned.
+
+  POST (:http/post id 4) and GET-stream (:http/get-stream id 13, ADR 0122).
+
+  `:timeout-ms` and response `:status` are `:i64` ABI fields. On `:cljs` the
+  canonical representation is JS `bigint` (same rule ADR 0073 applied to
+  clock and ADR 0079 / provider#2 applied to log sequence). Plain cljs
+  numbers fail `typed-cap-call` result validation and make range checks
+  unreliable when mixed with bigint."
+  (:require [clojure.string :as string]
+            [kotoba.kir.value :as value]
+            ))
+
+(def capability-id 4)
+(def max-headers 32)
+(def max-timeout-ms 30000)
+(def max-url-bytes 4096)
+
+(def header-type
+  [:record :kotoba.http/header [[:name :keyword] [:value :string]]])
+(def header-set-type [:set header-type])
+(def request-type
+  [:record :kotoba.http/post-request
+   [[:url :string] [:headers header-set-type] [:body :string] [:timeout-ms :i64]]])
+(def response-type
+  [:record :kotoba.http/response
+   [[:status :i64] [:headers header-set-type] [:body :string]]])
+(def error-type
+  [:record :kotoba.http/error
+   [[:code :keyword] [:message :string] [:retryable :bool]]])
+(def result-type
+  [:variant :kotoba.http/result [[:ok response-type] [:error error-type]]])
+
+(def get-stream-capability-id 13)
+(def max-pull-bytes 65536)
+
+(def get-stream-request-type
+  [:record :kotoba.http/get-stream-request
+   [[:url :string] [:headers header-set-type]]])
+
+(def get-stream-result-type [:task [:stream :bytes]])
+
+(def schemas
+  {:kotoba.http/header header-type
+   :kotoba.http/post-request request-type
+   :kotoba.http/response response-type
+   :kotoba.http/error error-type
+   :kotoba.http/result result-type
+   :kotoba.http/get-stream-request get-stream-request-type})
+
+(defn- https-origin [url]
+  (value/bounded-string! url max-url-bytes)
+  (when (string/includes? url "#")
+    (throw (ex-info "HTTP URL fragments are not admitted" {:phase :http-provider})))
+  (if-let [[_ host port]
+           (re-matches #"https://([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::([0-9]+))?(?:/[^ ]*)?"
+                       url)]
+    (str "https://" (string/lower-case host) (when port (str ":" port)))
+    (throw (ex-info "HTTP URL must be an absolute HTTPS URL"
+                    {:phase :http-provider :url url}))))
+
+(defn- validate-headers! [headers]
+  (when (> (count headers) max-headers)
+    (throw (ex-info "HTTP header limit reached" {:phase :http-provider})))
+  (let [names (mapv second headers)]
+    (when-not (= (count names) (count (set names)))
+      (throw (ex-info "HTTP header names must be unique" {:phase :http-provider})))
+    (doseq [[_ name text] headers]
+      (value/bounded-keyword! name value/keyword-value-byte-limit)
+      (value/bounded-string! text value/string-value-byte-limit)))
+  headers)
+
+(defn- header-map [headers]
+  (into {} (map (fn [[_ name text]] [name text])) headers))
+
+(defn- typed-headers [headers]
+  (when-not (map? headers)
+    (throw (ex-info "HTTP transport headers must be a map" {:phase :http-provider})))
+  (let [items (mapv (fn [[name text]] [header-type name text]) headers)]
+    (validate-headers! items)
+    [header-set-type items]))
+
+(defn- error [code message retryable]
+  (value/bounded-keyword! code value/keyword-value-byte-limit)
+  (value/bounded-string! message value/string-value-byte-limit)
+  [result-type :error [error-type code message retryable]])
+
+(defn- invoke-transport [transport request]
+  (try
+    (transport request)
+    (catch  _
+      {:error {:code :http/transport
+               :message "transport failed"
+               :retryable false}})))
+
+(defn- timeout-in-range?
+  "Admitted when 1 ≤ timeout-ms ≤ max-timeout-ms in the host's canonical
+  i64 representation. On `:cljs` the guest supplies a bigint; comparing a
+  bigint against plain numbers with `<=` works in modern JS but we normalize
+  through `i64/->bigint` so both bounds and the value are the same type."
+  [timeout-ms]
+  )
+
+(defn- canonical-status
+  "Ensure response status is a canonical i64 for the ABI boundary."
+  [status]
+  )
+
+(defn- host-timeout-ms
+  "Transport receives a host-native number for APIs that need it (JVM
+  Duration, etc.). On cljs the guest value is bigint."
+  [timeout-ms]
+  )
+
+(defn provider
+  "Creates an HTTPS POST provider around a host-supplied synchronous transport.
+  `allowed-origins` is an exact, closed set such as #{\"https://api.example\"}.
+  The transport receives a plain host map and must return either
+  {:status i64 :headers {keyword string} :body string} or
+  {:error {:code keyword :message string :retryable bool}}."
+  [{:keys [allowed-origins transport]}]
+  (when-not (and (set? allowed-origins) (every? string? allowed-origins))
+    (throw (ex-info "HTTP allowed-origins must be a set of strings"
+                    {:phase :http-provider})))
+  (doseq [origin allowed-origins]
+    (when-not (= origin (https-origin origin))
+      (throw (ex-info "HTTP allowed origin must be canonical"
+                      {:phase :http-provider :origin origin}))))
+  (when-not (fn? transport)
+    (throw (ex-info "HTTP transport must be a function" {:phase :http-provider})))
+  {:request-type request-type
+   :result-type result-type
+   :invoke
+   (fn [[actual-type url [_ headers] body timeout-ms]]
+     (when-not (= actual-type request-type)
+       (throw (ex-info "HTTP request contract mismatch" {:phase :http-provider})))
+     (let [origin (https-origin url)]
+       (when-not (contains? allowed-origins origin)
+         (throw (ex-info "HTTP origin is not allowed"
+                         {:phase :http-provider :origin origin}))))
+     (validate-headers! headers)
+     (value/bounded-string! body value/string-value-byte-limit)
+     (when-not (timeout-in-range? timeout-ms)
+       (throw (ex-info "HTTP timeout is outside the admitted range"
+                       {:phase :http-provider :timeout-ms timeout-ms})))
+     (let [reply (invoke-transport
+                  transport {:url url :headers (header-map headers)
+                             :body body :timeout-ms (host-timeout-ms timeout-ms)})]
+       (if-let [{:keys [code message retryable]} (:error reply)]
+         (error code message retryable)
+         (let [{:keys [status headers body]} reply
+               status* (canonical-status status)]
+           (value/bounded-string! body value/string-value-byte-limit)
+           [result-type :ok [response-type status* (typed-headers headers) body]]))))})
+
+
+(defn- invoke-get-stream-transport [transport request]
+  (try
+    (transport request)
+    (catch  _
+      (throw (ex-info "http get-stream transport failed"
+                      {:phase :http-provider})))))
+
+(defn- as-bytes-task!
+  "Transport returns host `:bytes`, `{:bytes ...}`, `{:pending true}`,
+  `{:chunks [...]}` (join-before-ready, ADR 0123),
+  `{:chunk-queue [...]}` (true multi-chunk yield, ADR 0125), or
+  `{:open-stream true}` (progressive live push, ADR 0126)."
+  [reply]
+  (cond
+    (and (map? reply) (true? (:pending reply)))
+    (value/make-pending-bytes-task)
+
+    (and (map? reply) (true? (:open-stream reply)))
+    (value/make-ready-open-chunk-queue-task)
+
+    (and (map? reply) (sequential? (:chunk-queue reply)) (seq (:chunk-queue reply)))
+    (let [chunks (mapv #(value/bounded-bytes! % max-pull-bytes) (:chunk-queue reply))
+          total (reduce + 0 (map value/bytes-byte-count chunks))]
+      (when (> total max-pull-bytes)
+        (throw (ex-info "http get-stream chunk-queue exceeds max-pull-bytes"
+                        {:phase :http-provider})))
+      (value/make-ready-bytes-task-from-chunk-queue chunks))
+
+    (and (map? reply) (sequential? (:chunks reply)) (seq (:chunks reply)))
+    (let [joined (value/concat-bytes
+                  (mapv #(value/bounded-bytes! % max-pull-bytes) (:chunks reply)))]
+      (when (> (value/bytes-byte-count joined) max-pull-bytes)
+        (throw (ex-info "http get-stream chunks exceed max-pull-bytes"
+                        {:phase :http-provider})))
+      (value/make-ready-bytes-task joined))
+
+    :else
+    (let [payload (cond
+                    (value/bytes-value? reply) reply
+                    (and (map? reply) (value/bytes-value? (:bytes reply))) (:bytes reply)
+                    :else (throw (ex-info "http get-stream transport must return bytes or pending"
+                                          {:phase :http-provider})))]
+      (when (> (value/bytes-byte-count payload) max-pull-bytes)
+        (throw (ex-info "http get-stream payload exceeds max-pull-bytes"
+                        {:phase :http-provider})))
+      (value/make-ready-bytes-task (value/bounded-bytes! payload max-pull-bytes)))))
+
+(defn get-stream-provider
+  "Typed provider for `:http/get-stream` (id 13).
+  `allowed-origins` is the same exact-origin allowlist as POST.
+  Transport receives `{:operation :get-stream :url :headers}` and returns
+  host `:bytes` or `{:bytes <bytes>}`. Result is ready or pending bytes-task (fulfill via value/task-fulfill!)."
+  [{:keys [allowed-origins transport]}]
+  (when-not (and (set? allowed-origins) (every? string? allowed-origins))
+    (throw (ex-info "HTTP allowed-origins must be a set of strings"
+                    {:phase :http-provider})))
+  (doseq [origin allowed-origins]
+    (when-not (= origin (https-origin origin))
+      (throw (ex-info "HTTP allowed origin must be canonical"
+                      {:phase :http-provider :origin origin}))))
+  (when-not (fn? transport)
+    (throw (ex-info "HTTP transport must be a function" {:phase :http-provider})))
+  {:request-type get-stream-request-type
+   :result-type get-stream-result-type
+   :invoke
+   (fn [[actual-type url [_ headers]]]
+     (when-not (= actual-type get-stream-request-type)
+       (throw (ex-info "HTTP get-stream contract mismatch" {:phase :http-provider})))
+     (let [origin (https-origin url)]
+       (when-not (contains? allowed-origins origin)
+         (throw (ex-info "HTTP origin is not allowed"
+                         {:phase :http-provider :origin origin}))))
+     (validate-headers! headers)
+     (as-bytes-task!
+      (invoke-get-stream-transport
+       transport {:operation :get-stream
+                  :url url
+                  :headers (header-map headers)})))})

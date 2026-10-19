@@ -1,0 +1,256 @@
+(ns provider.object
+  "Bounded object-store reference providers for stream-object-v1.
+
+  Write path: `:object/put-block` + `:object/compare-and-set-ref` (bool).
+  Read path (ADR 0121): `:object/get-stream` returns a host affine
+  `[:task [:stream :bytes]]` (ready task with one payload chunk). Linear
+  Component v0.3 handle ABI remains on the Wasm path; this namespace is the
+  reference dual-runtime semantic vector.
+
+  Kit `:bytes` is a first-class runtime leaf (JVM byte-array, cljs
+  Uint8Array) via kotoba.kir.value (ADR 0120). Payload length is bounded by
+  max-pull-bytes (65536).
+
+  Bindings are host-owned allowlist keywords. No ambient object store or
+  network.
+
+  ADR 0272: pure `validate-*` deny fixtures (stable error keywords)."
+  (:require [clojure.string :as str]
+            [kotoba.kir.value :as value]))
+
+(def get-stream-capability-id 14)
+(def put-block-capability-id 15)
+(def cas-capability-id 16)
+(def max-pull-bytes 65536)
+
+(def expected-etag-type [:option :string])
+
+(def get-stream-request-type
+  [:record :kotoba.object/get-stream-request
+   [[:binding :keyword] [:key :string]]])
+
+(def get-stream-result-type [:task [:stream :bytes]])
+
+(def put-block-request-type
+  [:record :kotoba.object/put-block-request
+   [[:binding :keyword] [:digest :string] [:bytes :bytes]]])
+
+(def cas-request-type
+  [:record :kotoba.object/compare-and-set-ref-request
+   [[:binding :keyword] [:key :string]
+    [:expected expected-etag-type] [:next :string]]])
+
+(def put-block-result-type :bool)
+(def cas-result-type :bool)
+
+(def schemas
+  {:kotoba.object/get-stream-request get-stream-request-type
+   :kotoba.object/put-block-request put-block-request-type
+   :kotoba.object/compare-and-set-ref-request cas-request-type})
+
+(defn- bounded-payload!
+  "Validate the reference-runtime host representation of kit `:bytes`."
+  [payload]
+  (value/bounded-bytes! payload max-pull-bytes))
+
+(defn- string-policy
+  "Pure string gate. Returns nil when ok, else an error keyword."
+  [s empty-code]
+  (cond
+    (not (string? s)) :object/bad-string
+    (str/blank? s) empty-code
+    :else
+    (try
+      (value/bounded-string! s value/string-value-byte-limit)
+      nil
+      (catch  _
+        :object/string-too-large))))
+
+(defn validate-get-stream
+  "Pure get-stream policy. Returns nil when ok, else an error keyword."
+  [allowed-bindings binding key]
+  (cond
+    (not (contains? allowed-bindings binding)) :object/binding-not-allowed
+    :else (string-policy key :object/empty-key)))
+
+(defn validate-put-block
+  "Pure put-block policy. Returns nil when ok, else an error keyword."
+  [allowed-bindings binding digest payload]
+  (cond
+    (not (contains? allowed-bindings binding)) :object/binding-not-allowed
+    :else
+    (or (string-policy digest :object/empty-digest)
+        (try
+          (bounded-payload! payload)
+          nil
+          (catch  _
+            :object/bad-payload)))))
+
+(defn validate-cas
+  "Pure compare-and-set-ref policy. Returns nil when ok, else an error keyword.
+  `expected` is already decoded (nil or string)."
+  [allowed-bindings binding key expected next-etag]
+  (cond
+    (not (contains? allowed-bindings binding)) :object/binding-not-allowed
+    :else
+    (or (string-policy key :object/empty-key)
+        (when (some? expected)
+          (string-policy expected :object/empty-expected-etag))
+        (string-policy next-etag :object/empty-next-etag))))
+
+(defn- deny! [code context]
+  (throw (ex-info "object request denied"
+                  (merge {:phase :object-provider :code code} context))))
+
+(defn- expected-etag
+  "Decode `[:option :string]` into nil or a bounded string."
+  [[actual-type present? etag]]
+  (when-not (= actual-type expected-etag-type)
+    (throw (ex-info "object expected-etag contract mismatch"
+                    {:phase :object-provider})))
+  (when present?
+    (value/bounded-string! etag value/string-value-byte-limit)
+    etag))
+
+(defn- invoke-transport [transport request]
+  (try
+    (transport request)
+    (catch  _
+      (throw (ex-info "object provider failed"
+                      {:phase :object-provider})))))
+
+(defn- as-bool! [reply context]
+  (when-not (boolean? reply)
+    (throw (ex-info "object transport result must be a bool"
+                    {:phase :object-provider :context context})))
+  reply)
+
+(defn- as-bytes-task!
+  "Transport returns:
+   - host `:bytes` or `{:bytes <bytes>}` → ready task
+   - `{:pending true}` → pending task (host later `value/task-fulfill!`)
+   - `{:chunks [...]}` → ready task over concatenated chunks (ADR 0123)
+   - `{:chunk-queue [...]}` → ready task with true multi-chunk stream (ADR 0125;
+     each stream-read! yields one producer chunk, no pre-join)
+   - `{:open-stream true}` → ready task with open progressive stream (ADR 0126;
+     host `stream-enqueue!` / `stream-close!`)"
+  [reply]
+  (cond
+    (and (map? reply) (true? (:pending reply)))
+    (value/make-pending-bytes-task)
+
+    (and (map? reply) (true? (:open-stream reply)))
+    (value/make-ready-open-chunk-queue-task)
+
+    (and (map? reply) (sequential? (:chunk-queue reply)) (seq (:chunk-queue reply)))
+    (value/make-ready-bytes-task-from-chunk-queue
+     (mapv bounded-payload! (:chunk-queue reply)))
+
+    (and (map? reply) (sequential? (:chunks reply)) (seq (:chunks reply)))
+    (value/make-ready-bytes-task
+     (value/concat-bytes (mapv bounded-payload! (:chunks reply))))
+
+    :else
+    (let [payload (cond
+                    (value/bytes-value? reply) reply
+                    (and (map? reply) (value/bytes-value? (:bytes reply))) (:bytes reply)
+                    :else (throw (ex-info "object get-stream transport must return bytes or pending"
+                                          {:phase :object-provider})))]
+      (value/make-ready-bytes-task (bounded-payload! payload)))))
+
+(defn get-stream-provider
+  "Typed provider for `:object/get-stream` (id 14).
+  Transport receives `{:operation :get-stream :binding :key}` and returns
+  either a host `:bytes` payload or `{:bytes <bytes>}`. Result is always a
+  ready or pending bytes-task (pending→ready via value/task-fulfill!, ADR 0123)."
+  [{:keys [allowed-bindings transport]}]
+  (when-not (and (set? allowed-bindings)
+                 (every? qualified-keyword? allowed-bindings)
+                 (fn? transport))
+    (throw (ex-info "object get-stream requires allowed-bindings and transport"
+                    {:phase :object-provider})))
+  (doseq [b allowed-bindings]
+    (value/bounded-keyword! b value/keyword-value-byte-limit))
+  {:request-type get-stream-request-type
+   :result-type get-stream-result-type
+   :invoke
+   (fn [[actual-type binding key]]
+     (when-not (= actual-type get-stream-request-type)
+       (throw (ex-info "object get-stream contract mismatch"
+                       {:phase :object-provider})))
+     (when-let [code (validate-get-stream allowed-bindings binding key)]
+       (deny! code {:operation :get-stream :binding binding}))
+     (as-bytes-task!
+      (invoke-transport transport
+                        {:operation :get-stream
+                         :binding binding
+                         :key key})))})
+
+(defn put-block-provider
+  "Typed provider for `:object/put-block` (id 15).
+  `allowed-bindings` is a closed set of qualified binding keywords.
+  Transport receives `{:binding :digest :bytes}` and returns a bool."
+  [{:keys [allowed-bindings transport]}]
+  (when-not (and (set? allowed-bindings)
+                 (every? qualified-keyword? allowed-bindings)
+                 (fn? transport))
+    (throw (ex-info "object put-block requires allowed-bindings and transport"
+                    {:phase :object-provider})))
+  (doseq [b allowed-bindings]
+    (value/bounded-keyword! b value/keyword-value-byte-limit))
+  {:request-type put-block-request-type
+   :result-type put-block-result-type
+   :invoke
+   (fn [[actual-type binding digest payload]]
+     (when-not (= actual-type put-block-request-type)
+       (throw (ex-info "object put-block contract mismatch"
+                       {:phase :object-provider})))
+     (when-let [code (validate-put-block allowed-bindings binding digest payload)]
+       (deny! code {:operation :put-block :binding binding}))
+     (as-bool!
+      (invoke-transport transport
+                        {:operation :put-block
+                         :binding binding
+                         :digest digest
+                         :bytes payload})
+      :put-block))})
+
+(defn cas-provider
+  "Typed provider for `:object/compare-and-set-ref` (id 16).
+  Transport receives `{:binding :key :expected :next}` (`:expected` may be
+  nil for unconditional set) and returns a bool (won?)."
+  [{:keys [allowed-bindings transport]}]
+  (when-not (and (set? allowed-bindings)
+                 (every? qualified-keyword? allowed-bindings)
+                 (fn? transport))
+    (throw (ex-info "object CAS requires allowed-bindings and transport"
+                    {:phase :object-provider})))
+  (doseq [b allowed-bindings]
+    (value/bounded-keyword! b value/keyword-value-byte-limit))
+  {:request-type cas-request-type
+   :result-type cas-result-type
+   :invoke
+   (fn [[actual-type binding key expected-option next-etag]]
+     (when-not (= actual-type cas-request-type)
+       (throw (ex-info "object CAS contract mismatch"
+                       {:phase :object-provider})))
+     (let [expected (expected-etag expected-option)]
+       (when-let [code (validate-cas allowed-bindings binding key expected next-etag)]
+         (deny! code {:operation :compare-and-set-ref :binding binding}))
+       (as-bool!
+        (invoke-transport transport
+                          {:operation :compare-and-set-ref
+                           :binding binding
+                           :key key
+                           :expected expected
+                           :next next-etag})
+        :compare-and-set-ref)))})
+
+(defn create-providers
+  "Build write + get-stream providers sharing one binding allowlist and transport.
+  Returns `{:providers {14 get-stream 15 put 16 cas}}` for reference-runtime."
+  [{:keys [allowed-bindings transport] :as opts}]
+  {:providers
+   {get-stream-capability-id (get-stream-provider opts)
+    put-block-capability-id (put-block-provider opts)
+    cas-capability-id (cas-provider opts)}})

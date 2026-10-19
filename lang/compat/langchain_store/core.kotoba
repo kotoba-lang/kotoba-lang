@@ -1,0 +1,184 @@
+(ns langchain-store.core
+  "Shared machinery for `langchain.db`-backed actor stores — the seam
+  ~190 cloud-itonami actors currently hand-roll identically (the exact
+  two-liner `enc`/`dec*` codec appears verbatim in 190 store.cljc
+  files, ADR-2607141600).
+
+  It centralizes the genuinely-common parts:
+    - the EDN-blob codec (`enc`/`dec*`): compound values are stored as
+      EDN strings so `langchain.db` doesn't expand them into
+      sub-entities — the convention every DatomicStore uses;
+    - `identity-schema`: build the `:db.unique/identity` schema map;
+    - `read-stream` / `append-blob!`: the seq-keyed EDN-blob event-log
+      read/append pattern (event-sourced stores).
+
+  The DOMAIN keeps its own field/pull shaping and its `Store`
+  protocol — this lib is the reusable substrate underneath, not a
+  framework. Portable `.cljc` (JVM/CLJS/kotoba-WASM); the pure parts
+  (`enc`/`dec*`/`identity-schema`) have zero deps, the event helpers
+  use `langchain.db` (itself the Datomic-API seam, swappable to a
+  kotoba-server pod)."
+  (:require 
+            [langchain.db :as d]))
+
+;; ------------------------------- codec -------------------------------
+
+(defn enc
+  "Encode a compound value as an EDN string blob (stored so langchain.db
+  doesn't expand it into sub-entities). The identical codec 190 stores
+  reimplement."
+  [v]
+  (pr-str v))
+
+(defn dec*
+  "Decode an EDN-string blob; nil-safe."
+  [s]
+  (when s (edn/read-string s)))
+
+;; ------------------------------ schema -------------------------------
+
+(defn identity-schema
+  "Build a langchain.db/DataScript schema marking each attr in `attrs`
+  as `:db.unique/identity` (an accidental re-put of the same key
+  upserts instead of forking history)."
+  [attrs]
+  (reduce (fn [m a] (assoc m a {:db/unique :db.unique/identity})) {} attrs))
+
+;; ------------------------------- clock -------------------------------
+
+(defn now-ms
+  "Wall-clock milliseconds, portable across JVM/CLJS. Measured 2026-08-05:
+  85 cloud-itonami repos hand-roll this exact reader conditional inside
+  `src/`, 5 of them as a private `now-ms` in `store.cljc` itself. It is
+  here so a store's ledger stamp does not need a platform branch.
+
+  This is a real clock read, not injectable time — a store that needs a
+  deterministic clock for tests should take the timestamp as an argument
+  (see `stamp`, which does exactly that)."
+  []
+  )
+
+;; --------------------------- keyed blob entity ------------------------
+;; The single most duplicated shape left in the fleet. Measured 2026-08-05
+;; across the 316 repos that depend on this library: **222 `store.cljc`
+;; files hand-roll `(ls/dec* (d/q ...))` to read one EDN-blob payload by a
+;; unique id attribute.** Only 9 of them give it a name (`blob-lookup`);
+;; the rest inline the query, so the duplication does not show up in a
+;; name-based grep. That is why this pair belongs here and not in each
+;; domain: it is not domain shaping, it is the same two-attribute lookup
+;; every keyed blob store performs.
+
+(defn blob-lookup
+  "Read the EDN-blob payload of the entity uniquely identified by
+  `id-attr` = `id`, stored under `payload-attr`. Returns nil when `id` is
+  nil or no such entity exists — a missing entity is nil, not a throw,
+  because every hand-rolled copy of this shape behaves that way and the
+  callers branch on nil."
+  [conn id-attr payload-attr id]
+  (when (some? id)
+    (dec* (d/q {:find '[?p .] :in '[$ ?id]
+                :where [['?e id-attr '?id] ['?e payload-attr '?p]]}
+               (d/db conn) id))))
+
+(defn put-blob!
+  "Write `value` as the EDN-blob payload of the entity keyed by
+  `id-attr` = `id`. The write counterpart of `blob-lookup`. `id-attr`
+  must be `:db.unique/identity` (see `identity-schema`) so a re-put
+  upserts instead of forking history."
+  [conn id-attr payload-attr id value]
+  (d/transact! conn [{id-attr id payload-attr (enc value)}]))
+
+;; --------------------------- event streams ---------------------------
+
+(defn read-stream
+  "Read a seq-keyed EDN-blob event stream: every entity carrying
+  `seq-attr` + `edn-attr`, sorted by seq, blobs decoded → a vector.
+  The event-log read the event-sourced stores share."
+  [conn seq-attr edn-attr]
+  (->> (d/q [:find '?s '?v
+             :where ['?e seq-attr '?s] ['?e edn-attr '?v]]
+            (d/db conn))
+       (sort-by first)
+       (mapv (comp dec* second))))
+
+(defn append-blob!
+  "Append one seq-keyed EDN-blob entity (`{seq-attr seq, edn-attr
+  (enc value)}`). Because `seq-attr` is `:db.unique/identity`, a
+  duplicate seq upserts rather than forking the log."
+  [conn seq-attr edn-attr seq value]
+  (d/transact! conn [{seq-attr seq edn-attr (enc value)}]))
+
+;; ---------------------------- ledger record ---------------------------
+;; The append-only audit ledger every actor's `add-record!` implements:
+;; stamp the payload with its record type and a timestamp, then append it
+;; at the next sequence number. Measured 2026-08-05: 177 of the 316
+;; consumers already call `append-blob!`, and each still re-implements the
+;; stamping and the "next seq is (count (records s))" step around it.
+
+(defn stamp
+  "Stamp a ledger record with its `:type` and `:timestamp`.
+
+  `ts` is an explicit argument rather than an internal `(now-ms)` call so
+  a test can pin it; pass `(now-ms)` for the real clock. The stamped keys
+  overwrite anything already under `:type`/`:timestamp` in `record-data`
+  — the ledger's own stamp wins over a caller-supplied one, which is what
+  every hand-rolled copy does."
+  [record-type record-data ts]
+  (assoc record-data :type record-type :timestamp ts))
+
+(defn append-record!
+  "Append one stamped record to a seq-keyed EDN-blob ledger, at the next
+  sequence number. Reads the current stream to find that number, which is
+  the same read-then-append the hand-rolled `add-record!` bodies perform;
+  it is NOT atomic against a concurrent appender, exactly like the code it
+  replaces. A store with concurrent writers needs a single writer or an
+  externally-supplied seq — use `append-blob!` directly for that."
+  ([conn seq-attr edn-attr record-type record-data]
+   (append-record! conn seq-attr edn-attr record-type record-data (now-ms)))
+  ([conn seq-attr edn-attr record-type record-data ts]
+   (let [next-seq (count (read-stream conn seq-attr edn-attr))]
+     (append-blob! conn seq-attr edn-attr next-seq (stamp record-type record-data ts)))))
+
+;; --------------------------- entity field-spec -----------------------
+;; The entity stores (application/party/... in ~190 actors) map a
+;; logical map to/from a langchain.db entity through hand-written
+;; `x->tx` / `pull->x` / `x-pull` triples. A field-spec drives all
+;; three from data (ADR-2607141600 increment 2):
+;;
+;;   {logical-key {:attr :ns/attr        ; the datom attribute
+;;                 :blob? bool           ; store as an EDN string blob
+;;                 :default any          ; blob decode fallback (nil -> default)
+;;                 :coerce fn}}          ; non-blob read transform (e.g. boolean)
+;;
+;; Semantics preserved from the hand-written stores: `map->tx` includes
+;; only present (some?) keys (cond-> semantics; a false boolean IS
+;; present); `pull->map` returns nil when the identity attr is absent,
+;; decodes blobs with the default, and applies :coerce on read.
+
+(defn pull-pattern
+  "The langchain.db pull pattern (attr vector) for a field spec."
+  [spec]
+  (mapv :attr (vals spec)))
+
+(defn map->tx
+  "Logical map -> langchain.db tx-map via `spec`. Only present (some?)
+  keys are included; :blob? fields are `enc`'d."
+  [spec m]
+  (reduce-kv (fn [tx lk {:keys [attr blob?]}]
+               (let [v (get m lk)]
+                 (if (some? v) (assoc tx attr (if blob? (enc v) v)) tx)))
+             {} spec))
+
+(defn pull->map
+  "langchain.db pulled entity -> logical map via `spec`. Returns nil
+  when the identity field's attr is absent. :blob? fields are `dec*`'d
+  (nil -> :default); other fields pass through, with :coerce applied on
+  read if given. `id-key` is the spec's identity logical key."
+  [spec id-key pulled]
+  (when (some? (get pulled (get-in spec [id-key :attr])))
+    (reduce-kv (fn [m lk {:keys [attr blob? default coerce]}]
+                 (assoc m lk (let [v (get pulled attr)]
+                               (cond blob? (or (dec* v) default)
+                                     coerce (coerce v)
+                                     :else v))))
+               {} spec)))

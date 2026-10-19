@@ -1,0 +1,575 @@
+(ns nfs.v3
+  "NFS version 3 (RFC 1813) as a pure `.cljc` program over an injected
+  filesystem, in the shape `oncrpc.core/dispatch` expects.
+
+  ## Why NFS and not something newer
+
+  Measured on macOS 26.4: `/sbin/mount_nfs` accepts `port=` and
+  `mountport=`, so the whole protocol runs on unprivileged ports; `-P` is
+  the flag that *asks for* reserved ports rather than the one that avoids
+  them; and `/System/Library/Filesystems/NetFSPlugins/nfs.bundle` exists,
+  which is what lets Finder's Connect to Server mount `nfs://` as the
+  logged-in user. No kernel extension, no third-party install, no code
+  signing, no root. Nothing else on that list is true of FUSE, SMB or a
+  File Provider extension.
+
+  ## The filesystem is injected
+
+  `IFilesystem` is the whole seam. This namespace knows XDR, procedure
+  numbers and the status codes a client acts on; it knows nothing about
+  where bytes live. A Drive, a directory, an object store and a test double
+  are all the same to it.
+
+  ## Four details that decide whether a mount works at all
+
+  - **`FSINFO` is asked before anything else is trusted.** Its `rtmax`,
+    `wtmax` and `dtpref` are what the client sizes every later READ, WRITE
+    and READDIR by. Answer with zeroes and the client will ask for
+    zero-byte reads forever.
+  - **`ACCESS` is not advisory.** macOS calls it and believes it. A server
+    that returns success with an empty access mask produces a volume that
+    mounts, lists, and refuses to open anything.
+  - **A cookie is the client's place in a directory, and it must survive
+    the reply.** `READDIR` hands back a cookie per entry and the client
+    sends the last one back to continue. Cookies derived from a position in
+    a list that can be reordered will silently skip or repeat entries.
+  - **Every error is a status *in a reply*, never a dropped call.** RPC
+    already said this; NFS says it again because the failure mode is the
+    same and worse: a filesystem call that never answers is a beachball,
+    not an error message."
+  (:require [oncrpc.core :as rpc]
+            [xdr.core :as xdr]))
+
+;; ── program identity ──────────────────────────────────────────────────────
+
+(def ^:const program 100003)
+(def ^:const version 3)
+
+;; ── status (RFC 1813 §2.6) ────────────────────────────────────────────────
+
+(def ^:const NFS3_OK 0)
+(def ^:const NFS3ERR_PERM 1)
+(def ^:const NFS3ERR_NOENT 2)
+(def ^:const NFS3ERR_IO 5)
+(def ^:const NFS3ERR_ACCES 13)
+(def ^:const NFS3ERR_EXIST 17)
+(def ^:const NFS3ERR_NOTDIR 20)
+(def ^:const NFS3ERR_ISDIR 21)
+(def ^:const NFS3ERR_INVAL 22)
+(def ^:const NFS3ERR_FBIG 27)
+(def ^:const NFS3ERR_NOSPC 28)
+(def ^:const NFS3ERR_ROFS 30)
+(def ^:const NFS3ERR_NOTEMPTY 66)
+(def ^:const NFS3ERR_SERVERFAULT 10006)
+(def ^:const NFS3ERR_NOTSUPP 10004)
+
+;; ── file types ────────────────────────────────────────────────────────────
+
+(def ^:const NF3REG 1)
+(def ^:const NF3DIR 2)
+(def ^:const NF3LNK 5)
+
+;; ── the seam ──────────────────────────────────────────────────────────────
+
+(defprotocol IFilesystem
+  "What NFS needs a filesystem to be able to answer.
+
+  A handle is opaque bytes of the implementation's choosing, at most 64 of
+  them, and it must keep meaning the same file for as long as a client
+  might hold it — which is across server restarts, because a client does
+  not know the server restarted. An implementation that hands out array
+  indices produces `NFS3ERR_STALE` on Monday for a file opened on Friday.
+
+  Every method returns either a value or `{:error <nfsstat3>}`. Throwing is
+  reserved for a broken implementation, not for a missing file."
+  (-root [fs] "Handle of the export root.")
+  (-attrs [fs handle] "→ attribute map, or {:error …}.")
+  (-lookup [fs dir-handle name] "→ handle, or {:error …}.")
+  (-readdir [fs dir-handle cookie max-entries]
+    "→ {:entries [{:name :fileid :cookie :handle}] :eof? bool}, or {:error …}.")
+  (-read [fs handle offset count] "→ {:bytes b :eof? bool}, or {:error …}.")
+  (-write [fs handle offset bytes] "→ {:count n}, or {:error …}.")
+  (-create [fs dir-handle name attrs] "→ handle, or {:error …}.")
+  (-mkdir [fs dir-handle name attrs] "→ handle, or {:error …}.")
+  (-remove [fs dir-handle name] "→ true, or {:error …}.")
+  (-rmdir [fs dir-handle name] "→ true, or {:error …}.")
+  (-rename [fs from-dir from-name to-dir to-name] "→ true, or {:error …}.")
+  (-setattr [fs handle attrs] "→ attribute map, or {:error …}.")
+  (-fsstat [fs handle] "→ {:tbytes :fbytes :abytes :tfiles :ffiles :afiles}."))
+
+(defn- err? [x] (and (map? x) (contains? x :error)))
+
+;; ── common types (RFC 1813 §2.5) ──────────────────────────────────────────
+
+(def nfs-fh3 [:opaque* 64])
+(def filename3 [:string])
+(def nfspath3 [:string])
+
+(def nfstime3 [:struct [:seconds [:uint]] [:nseconds [:uint]]])
+(def specdata3 [:struct [:specdata1 [:uint]] [:specdata2 [:uint]]])
+
+(def fattr3
+  [:struct
+   [:type [:enum]] [:mode [:uint]] [:nlink [:uint]]
+   [:uid [:uint]] [:gid [:uint]]
+   [:size [:uhyper]] [:used [:uhyper]]
+   [:rdev specdata3]
+   [:fsid [:uhyper]] [:fileid [:uhyper]]
+   [:atime nfstime3] [:mtime nfstime3] [:ctime nfstime3]])
+
+(def post-op-attr [:optional fattr3])
+
+(def wcc-attr
+  [:struct [:size [:uhyper]] [:mtime nfstime3] [:ctime nfstime3]])
+
+(def pre-op-attr [:optional wcc-attr])
+(def wcc-data [:struct [:before pre-op-attr] [:after post-op-attr]])
+(def post-op-fh3 [:optional nfs-fh3])
+
+(def ^:const DONT-CHANGE 0)
+(def ^:const SET-TO-SERVER-TIME 1)
+(def ^:const SET-TO-CLIENT-TIME 2)
+
+(def sattr3
+  "Every field is optional-data, and the two times are unions rather than
+  optionals because `SET_TO_SERVER_TIME` carries no value but is still a
+  request to change."
+  [:struct
+   [:mode [:optional [:uint]]]
+   [:uid [:optional [:uint]]]
+   [:gid [:optional [:uint]]]
+   [:size [:optional [:uhyper]]]
+   [:atime [:union [:enum] {SET-TO-CLIENT-TIME nfstime3 :default :void}]]
+   [:mtime [:union [:enum] {SET-TO-CLIENT-TIME nfstime3 :default :void}]]])
+
+(def diropargs3 [:struct [:dir nfs-fh3] [:name filename3]])
+
+;; ── attribute mapping ─────────────────────────────────────────────────────
+
+(def ^:private default-mode
+  {NF3DIR 0755 NF3REG 0644 NF3LNK 0777})
+
+(defn- ->time [ms]
+  (let [ms (or ms 0)]
+    {:seconds (quot ms 1000) :nseconds (* 1000000 (mod ms 1000))}))
+
+(defn fattr
+  "An implementation's attribute map → `fattr3`.
+
+  Defaults are supplied for everything a content store has no opinion
+  about. `:fileid` is not one of them: it is what the client uses to tell
+  two files apart, and inventing one per reply makes every file look new."
+  [{:keys [type size mode nlink uid gid fileid fsid atime mtime ctime used]}]
+  (let [type (or type NF3REG)]
+    {:type type
+     :mode (or mode (get default-mode type 0644))
+     :nlink (or nlink (if (= type NF3DIR) 2 1))
+     :uid (or uid 0) :gid (or gid 0)
+     :size (or size 0)
+     :used (or used (or size 0))
+     :rdev {:specdata1 0 :specdata2 0}
+     :fsid (or fsid 0)
+     :fileid (or fileid 0)
+     :atime (->time (or atime mtime 0))
+     :mtime (->time (or mtime 0))
+     :ctime (->time (or ctime mtime 0))}))
+
+(defn- post-op [fs handle]
+  (let [a (-attrs fs handle)]
+    (if (err? a) nil (fattr a))))
+
+(defn- wcc [fs handle]
+  {:before nil :after (post-op fs handle)})
+
+;; ── results (RFC 1813 §3) ─────────────────────────────────────────────────
+
+(def getattr-res
+  [:union [:enum] {NFS3_OK [:struct [:attrs fattr3]] :default :void}])
+
+(def lookup-res
+  [:union [:enum]
+   {NFS3_OK [:struct [:object nfs-fh3] [:obj-attrs post-op-attr]
+             [:dir-attrs post-op-attr]]
+    :default [:struct [:dir-attrs post-op-attr]]}])
+
+(def access-res
+  [:union [:enum]
+   {NFS3_OK [:struct [:obj-attrs post-op-attr] [:access [:uint]]]
+    :default [:struct [:obj-attrs post-op-attr]]}])
+
+(def read-res
+  [:union [:enum]
+   {NFS3_OK [:struct [:file-attrs post-op-attr] [:count [:uint]]
+             [:eof [:bool]] [:data [:opaque*]]]
+    :default [:struct [:file-attrs post-op-attr]]}])
+
+(def ^:const UNSTABLE 0)
+(def ^:const FILE-SYNC 2)
+
+(def write-res
+  [:union [:enum]
+   {NFS3_OK [:struct [:file-wcc wcc-data] [:count [:uint]]
+             [:committed [:enum]] [:verf [:opaque 8]]]
+    :default [:struct [:file-wcc wcc-data]]}])
+
+(def create-res
+  [:union [:enum]
+   {NFS3_OK [:struct [:obj post-op-fh3] [:obj-attrs post-op-attr]
+             [:dir-wcc wcc-data]]
+    :default [:struct [:dir-wcc wcc-data]]}])
+
+(def remove-res
+  [:union [:enum] {:default [:struct [:dir-wcc wcc-data]]}])
+
+(def rename-res
+  [:union [:enum] {:default [:struct [:fromdir-wcc wcc-data]
+                             [:todir-wcc wcc-data]]}])
+
+(def entry3
+  [:struct [:fileid [:uhyper]] [:name filename3] [:cookie [:uhyper]]])
+
+(def fsstat-res
+  [:union [:enum]
+   {NFS3_OK [:struct [:obj-attrs post-op-attr]
+             [:tbytes [:uhyper]] [:fbytes [:uhyper]] [:abytes [:uhyper]]
+             [:tfiles [:uhyper]] [:ffiles [:uhyper]] [:afiles [:uhyper]]
+             [:invarsec [:uint]]]
+    :default [:struct [:obj-attrs post-op-attr]]}])
+
+(def fsinfo-res
+  [:union [:enum]
+   {NFS3_OK [:struct [:obj-attrs post-op-attr]
+             [:rtmax [:uint]] [:rtpref [:uint]] [:rtmult [:uint]]
+             [:wtmax [:uint]] [:wtpref [:uint]] [:wtmult [:uint]]
+             [:dtpref [:uint]] [:maxfilesize [:uhyper]]
+             [:time-delta nfstime3] [:properties [:uint]]]
+    :default [:struct [:obj-attrs post-op-attr]]}])
+
+(def pathconf-res
+  [:union [:enum]
+   {NFS3_OK [:struct [:obj-attrs post-op-attr]
+             [:linkmax [:uint]] [:name-max [:uint]]
+             [:no-trunc [:bool]] [:chown-restricted [:bool]]
+             [:case-insensitive [:bool]] [:case-preserving [:bool]]]
+    :default [:struct [:obj-attrs post-op-attr]]}])
+
+(def commit-res
+  [:union [:enum]
+   {NFS3_OK [:struct [:file-wcc wcc-data] [:verf [:opaque 8]]]
+    :default [:struct [:file-wcc wcc-data]]}])
+
+(def setattr-res
+  [:union [:enum] {:default [:struct [:obj-wcc wcc-data]]}])
+
+;; ── access bits (RFC 1813 §3.4) ───────────────────────────────────────────
+
+(def ^:const ACCESS3_READ 0x0001)
+(def ^:const ACCESS3_LOOKUP 0x0002)
+(def ^:const ACCESS3_MODIFY 0x0004)
+(def ^:const ACCESS3_EXTEND 0x0008)
+(def ^:const ACCESS3_DELETE 0x0010)
+(def ^:const ACCESS3_EXECUTE 0x0020)
+
+(def ^:private all-file-access
+  (bit-or ACCESS3_READ ACCESS3_MODIFY ACCESS3_EXTEND))
+(def ^:private all-dir-access
+  (bit-or ACCESS3_READ ACCESS3_LOOKUP ACCESS3_MODIFY ACCESS3_EXTEND
+          ACCESS3_DELETE ACCESS3_EXECUTE))
+
+;; ── the write verifier ────────────────────────────────────────────────────
+
+(defn- verifier
+  "Eight bytes that must stay the same for the life of a server instance
+  and differ across restarts. A client compares them to decide whether the
+  writes it has not yet committed survived; a constant verifier tells it
+  they did when they did not."
+  [boot-id]
+  (xdr/encode [:array [:uint] 2]
+              [(bit-and (or boot-id 0) 0xffffffff)
+               (bit-and (unsigned-bit-shift-right (or boot-id 0) 32) 0xffffffff)]))
+
+;; ── procedures ────────────────────────────────────────────────────────────
+
+(declare readdir-reply)
+
+(defn- decode-args [schema bs at] (xdr/decode-value schema bs at))
+
+(defn- fail [schema status extra]
+  (xdr/encode schema {:disc status :value extra}))
+
+(defn handlers
+  "The NFSv3 procedure table over `fs`.
+
+  `opts` may carry `:boot-id` (the write verifier), `:fsid`, and the
+  transfer sizes. The defaults are the ones macOS negotiates comfortably:
+  64 KiB reads and writes, 32 KiB directory reads."
+  ([fs] (handlers fs {}))
+  ([fs {:keys [boot-id rtmax wtmax dtpref maxfilesize]
+        :or {rtmax 65536 wtmax 65536 dtpref 32768
+             maxfilesize 0x7fffffffffff}}]
+   (let [verf (verifier boot-id)
+         attrs-of #(post-op fs %)]
+     {0 (fn [_ _ _] (xdr/->bytes []))
+
+      1 (fn [_ bs at]                                     ; GETATTR
+          (let [h (decode-args nfs-fh3 bs at)
+                a (-attrs fs h)]
+            (if (err? a)
+              (xdr/encode getattr-res {:disc (:error a) :value nil})
+              (xdr/encode getattr-res {:disc NFS3_OK :value {:attrs (fattr a)}}))))
+
+      2 (fn [_ bs at]                                     ; SETATTR
+          (let [{:keys [object new-attrs]}
+                (decode-args [:struct [:object nfs-fh3] [:new-attrs sattr3]
+                              [:guard [:optional nfstime3]]]
+                             bs at)
+                r (-setattr fs object new-attrs)]
+            (xdr/encode setattr-res
+                        {:disc (if (err? r) (:error r) NFS3_OK)
+                         :value {:obj-wcc (wcc fs object)}})))
+
+      3 (fn [_ bs at]                                     ; LOOKUP
+          (let [{:keys [dir name]} (decode-args diropargs3 bs at)
+                h (-lookup fs dir name)]
+            (if (err? h)
+              (fail lookup-res (:error h) {:dir-attrs (attrs-of dir)})
+              (xdr/encode lookup-res
+                          {:disc NFS3_OK
+                           :value {:object h
+                                   :obj-attrs (attrs-of h)
+                                   :dir-attrs (attrs-of dir)}}))))
+
+      4 (fn [_ bs at]                                     ; ACCESS
+          (let [{:keys [object access]}
+                (decode-args [:struct [:object nfs-fh3] [:access [:uint]]] bs at)
+                a (-attrs fs object)]
+            (if (err? a)
+              (fail access-res (:error a) {:obj-attrs nil})
+              (xdr/encode access-res
+                          {:disc NFS3_OK
+                           :value {:obj-attrs (fattr a)
+                                   ;; Only the bits that were asked for, and
+                                   ;; only the ones this file can support.
+                                   ;; Returning everything is what makes a
+                                   ;; read-only export look writable until
+                                   ;; the first write fails.
+                                   :access (bit-and access
+                                                    (if (= NF3DIR (:type a))
+                                                      all-dir-access
+                                                      all-file-access))}}))))
+
+      ;; Not implemented, and answered rather than omitted. A procedure
+      ;; absent from this table becomes RPC `PROC_UNAVAIL`, which a
+      ;; filesystem client does not recover from — measured 2026-08-17 as
+      ;; `ls: Bad procedure for program` on a mounted volume. `NFS3ERR_NOTSUPP`
+      ;; is a status the same client handles without complaint.
+      5 (fn [_ bs at]                                     ; READLINK
+          (let [h (decode-args nfs-fh3 bs at)]
+            (fail [:union [:enum] {:default [:struct [:attrs post-op-attr]]}]
+                  NFS3ERR_NOTSUPP {:attrs (attrs-of h)})))
+
+      10 (fn [_ _ _] (fail create-res NFS3ERR_NOTSUPP     ; SYMLINK
+                          {:dir-wcc {:before nil :after nil}}))
+      11 (fn [_ _ _] (fail create-res NFS3ERR_NOTSUPP     ; MKNOD
+                          {:dir-wcc {:before nil :after nil}}))
+      15 (fn [_ _ _] (fail [:union [:enum]                ; LINK
+                            {:default [:struct [:attrs post-op-attr]
+                                       [:dir-wcc wcc-data]]}]
+                          NFS3ERR_NOTSUPP
+                          {:attrs nil :dir-wcc {:before nil :after nil}}))
+
+      6 (fn [_ bs at]                                     ; READ
+          (let [{:keys [file offset count]}
+                (decode-args [:struct [:file nfs-fh3] [:offset [:uhyper]]
+                              [:count [:uint]]]
+                             bs at)
+                r (-read fs file offset (min count rtmax))]
+            (if (err? r)
+              (fail read-res (:error r) {:file-attrs (attrs-of file)})
+              (let [data (xdr/->bytes (:bytes r))
+                    n ]
+                (xdr/encode read-res
+                            {:disc NFS3_OK
+                             :value {:file-attrs (attrs-of file)
+                                     :count n :eof (boolean (:eof? r))
+                                     :data data}})))))
+
+      7 (fn [_ bs at]                                     ; WRITE
+          (let [{:keys [file offset data]}
+                (decode-args [:struct [:file nfs-fh3] [:offset [:uhyper]]
+                              [:count [:uint]] [:stable [:enum]]
+                              [:data [:opaque*]]]
+                             bs at)
+                r (-write fs file offset data)]
+            (if (err? r)
+              (fail write-res (:error r) {:file-wcc (wcc fs file)})
+              (xdr/encode write-res
+                          {:disc NFS3_OK
+                           :value {:file-wcc (wcc fs file)
+                                   :count (:count r)
+                                   ;; FILE_SYNC: the bytes are durable before
+                                   ;; this reply. Claiming it while buffering
+                                   ;; is how an unmount loses a file.
+                                   :committed FILE-SYNC
+                                   :verf verf}}))))
+
+      8 (fn [_ bs at]                                     ; CREATE
+          (let [{:keys [where how]}
+                (decode-args [:struct [:where diropargs3]
+                              [:how [:union [:enum]
+                                     {0 sattr3 1 sattr3 :default [:opaque 8]}]]]
+                             bs at)
+                h (-create fs (:dir where) (:name where) (:value how))]
+            (if (err? h)
+              (fail create-res (:error h) {:dir-wcc (wcc fs (:dir where))})
+              (xdr/encode create-res
+                          {:disc NFS3_OK
+                           :value {:obj h :obj-attrs (attrs-of h)
+                                   :dir-wcc (wcc fs (:dir where))}}))))
+
+      9 (fn [_ bs at]                                     ; MKDIR
+          (let [{:keys [where attrs]}
+                (decode-args [:struct [:where diropargs3] [:attrs sattr3]] bs at)
+                h (-mkdir fs (:dir where) (:name where) attrs)]
+            (if (err? h)
+              (fail create-res (:error h) {:dir-wcc (wcc fs (:dir where))})
+              (xdr/encode create-res
+                          {:disc NFS3_OK
+                           :value {:obj h :obj-attrs (attrs-of h)
+                                   :dir-wcc (wcc fs (:dir where))}}))))
+
+      12 (fn [_ bs at]                                    ; REMOVE
+           (let [{:keys [dir name]} (decode-args diropargs3 bs at)
+                 r (-remove fs dir name)]
+             (xdr/encode remove-res
+                         {:disc (if (err? r) (:error r) NFS3_OK)
+                          :value {:dir-wcc (wcc fs dir)}})))
+
+      13 (fn [_ bs at]                                    ; RMDIR
+           (let [{:keys [dir name]} (decode-args diropargs3 bs at)
+                 r (-rmdir fs dir name)]
+             (xdr/encode remove-res
+                         {:disc (if (err? r) (:error r) NFS3_OK)
+                          :value {:dir-wcc (wcc fs dir)}})))
+
+      14 (fn [_ bs at]                                    ; RENAME
+           (let [{:keys [from to]}
+                 (decode-args [:struct [:from diropargs3] [:to diropargs3]] bs at)
+                 r (-rename fs (:dir from) (:name from) (:dir to) (:name to))]
+             (xdr/encode rename-res
+                         {:disc (if (err? r) (:error r) NFS3_OK)
+                          :value {:fromdir-wcc (wcc fs (:dir from))
+                                  :todir-wcc (wcc fs (:dir to))}})))
+
+      16 (fn [_ bs at]                                    ; READDIR
+           (let [{:keys [dir cookie count]}
+                 (decode-args [:struct [:dir nfs-fh3] [:cookie [:uhyper]]
+                               [:cookieverf [:opaque 8]] [:count [:uint]]]
+                              bs at)
+                 r (-readdir fs dir cookie (max 1 (quot count 64)))]
+             (if (err? r)
+               (xdr/encode [:union [:enum]
+                            {:default [:struct [:dir-attrs post-op-attr]]}]
+                           {:disc (:error r) :value {:dir-attrs nil}})
+               (readdir-reply (attrs-of dir) r))))
+
+      17 (fn [_ bs at]                                    ; READDIRPLUS
+           ;; macOS asks for this one, not READDIR. Measured 2026-08-17: a
+           ;; server implementing only procedure 16 mounts successfully and
+           ;; then answers `ls` with `Bad procedure for program`, because
+           ;; the client's first listing call is 17 and RPC PROC_UNAVAIL is
+           ;; not something a filesystem client recovers from.
+           (let [{:keys [dir cookie maxcount]}
+                 (decode-args [:struct [:dir nfs-fh3] [:cookie [:uhyper]]
+                               [:cookieverf [:opaque 8]] [:dircount [:uint]]
+                               [:maxcount [:uint]]]
+                              bs at)
+                 r (-readdir fs dir cookie (max 1 (quot maxcount 128)))]
+             (if (err? r)
+               (xdr/encode [:union [:enum]
+                            {:default [:struct [:dir-attrs post-op-attr]]}]
+                           {:disc (:error r) :value {:dir-attrs nil}})
+               (readdir-reply (attrs-of dir) r {:plus? true :attrs-of attrs-of}))))
+
+      18 (fn [_ bs at]                                    ; FSSTAT
+           (let [h (decode-args nfs-fh3 bs at)
+                 s (-fsstat fs h)]
+             (if (err? s)
+               (fail fsstat-res (:error s) {:obj-attrs nil})
+               (xdr/encode fsstat-res
+                           {:disc NFS3_OK
+                            :value (merge {:obj-attrs (attrs-of h) :invarsec 0}
+                                          s)}))))
+
+      19 (fn [_ bs at]                                    ; FSINFO
+           (let [h (decode-args nfs-fh3 bs at)]
+             (xdr/encode fsinfo-res
+                         {:disc NFS3_OK
+                          :value {:obj-attrs (attrs-of h)
+                                  :rtmax rtmax :rtpref rtmax :rtmult 4096
+                                  :wtmax wtmax :wtpref wtmax :wtmult 4096
+                                  :dtpref dtpref
+                                  :maxfilesize maxfilesize
+                                  :time-delta {:seconds 0 :nseconds 1000000}
+                                  ;; LINK and SYMLINK are not implemented, and
+                                  ;; the properties word is where a client is
+                                  ;; told that rather than finding out.
+                                  :properties 0x0000001a}})))
+
+      20 (fn [_ bs at]                                    ; PATHCONF
+           (let [h (decode-args nfs-fh3 bs at)]
+             (xdr/encode pathconf-res
+                         {:disc NFS3_OK
+                          :value {:obj-attrs (attrs-of h)
+                                  :linkmax 1 :name-max 255
+                                  :no-trunc true :chown-restricted true
+                                  :case-insensitive false :case-preserving true}})))
+
+      21 (fn [_ bs at]                                    ; COMMIT
+           (let [{:keys [file]}
+                 (decode-args [:struct [:file nfs-fh3] [:offset [:uhyper]]
+                               [:count [:uint]]]
+                              bs at)]
+             (xdr/encode commit-res
+                         {:disc NFS3_OK
+                          :value {:file-wcc (wcc fs file) :verf verf}})))})))
+
+(defn- readdir-reply
+  "READDIR's reply is a linked list on the wire, not an array: each entry is
+  preceded by a boolean saying another follows. XDR calls that optional
+  data; NFS uses it to let a server stop mid-directory without knowing in
+  advance how many entries will fit.
+
+  READDIRPLUS is the same list with two more optional fields per entry —
+  the attributes and the handle the client would otherwise have to LOOKUP
+  one at a time. That is the entire difference, and it is why one function
+  writes both."
+  ([dir-attrs listing] (readdir-reply dir-attrs listing {}))
+  ([dir-attrs {:keys [entries eof?]} {:keys [plus? attrs-of]}]
+   (let [head (xdr/encode [:struct [:status [:enum]] [:dir-attrs post-op-attr]
+                           [:cookieverf [:opaque 8]]]
+                          {:status NFS3_OK :dir-attrs dir-attrs
+                           :cookieverf (xdr/->bytes (repeat 8 0))})
+        body (reduce (fn [acc e]
+                       (cond-> (conj acc
+                                     (xdr/encode [:struct [:present [:bool]]]
+                                                 {:present true})
+                                     (xdr/encode entry3
+                                                 (select-keys e [:fileid :name :cookie])))
+                         plus?
+                         (conj (xdr/encode [:struct [:attrs post-op-attr]
+                                            [:handle post-op-fh3]]
+                                           {:attrs (when (:handle e)
+                                                     (attrs-of (:handle e)))
+                                            :handle (:handle e)}))))
+                     [] entries)
+        tail (xdr/encode [:struct [:present [:bool]] [:eof [:bool]]]
+                          {:present false :eof (boolean eof?)})]
+     (xdr/->bytes
+      (mapcat (fn [part] (map #(bit-and (int %) 0xff) (seq part)))
+              (concat [head] body [tail]))))))
+
+(defn program-map
+  "`{100003 {3 <procedures>}}` — ready for `oncrpc.core/dispatch`."
+  ([fs] (program-map fs {}))
+  ([fs opts] {program {version (handlers fs opts)}}))

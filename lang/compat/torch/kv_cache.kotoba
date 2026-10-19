@@ -1,0 +1,207 @@
+(ns torch.kv-cache
+  "Pure paged KV-cache ownership and continuous-batch scheduling.
+
+  Physical block contents belong to the runtime (CPU, Metal, etc.). This
+  namespace owns block tables and refcounts and emits copy-on-write commands
+  when a shared partial prefix must be split before the next token is written.")
+
+(defn pool
+  "Create a pool of `block-count` physical blocks, each holding `block-size`
+  token positions. Allocation is deterministic (lowest free block first)."
+  [block-count block-size]
+  (when-not (and (pos-int? block-count) (pos-int? block-size))
+    (throw (ex-info "KV block count and size must be positive integers"
+                    {:block-count block-count :block-size block-size})))
+  {:block-count block-count
+   :block-size block-size
+   :free (into (sorted-set) (range block-count))
+   :refcounts (vec (repeat block-count 0))
+   :sequences {}})
+
+(defn- sequence-entry [pool* sequence-id]
+  (or (get-in pool* [:sequences sequence-id])
+      (throw (ex-info "unknown KV-cache sequence"
+                      {:sequence-id sequence-id :reason :unknown-sequence}))))
+
+(defn allocate-sequence
+  "Register an empty logical sequence. Physical blocks are allocated lazily."
+  [pool* sequence-id]
+  (when (contains? (:sequences pool*) sequence-id)
+    (throw (ex-info "KV-cache sequence already exists"
+                    {:sequence-id sequence-id :reason :duplicate-sequence})))
+  (assoc-in pool* [:sequences sequence-id] {:length 0 :blocks []}))
+
+(defn- retain-block [pool* block]
+  (-> pool*
+      (update-in [:refcounts block] inc)
+      (update :free disj block)))
+
+(defn- release-block [pool* block]
+  (let [refs (get-in pool* [:refcounts block])]
+    (when-not (pos? refs)
+      (throw (ex-info "KV-cache block refcount underflow" {:block block})))
+    (let [pool* (update-in pool* [:refcounts block] dec)]
+      (if (= 1 refs) (update pool* :free conj block) pool*))))
+
+(defn- take-block [pool*]
+  (if-let [block (first (:free pool*))]
+    [(retain-block pool* block) block]
+    (throw (ex-info "paged KV cache is out of physical blocks"
+                    {:reason :out-of-blocks
+                     :block-count (:block-count pool*)
+                     :active-sequences (count (:sequences pool*))}))))
+
+(defn append-token
+  "Reserve the next physical `[block,offset]` for `sequence-id`.
+
+  Returns `{:pool updated :block id :offset n}`. If a forked sequence shares a
+  partially filled final block, also returns
+  `:copy {:from old :to new :tokens used}`; the storage runtime must perform
+  that block-prefix copy before writing the returned slot."
+  [pool* sequence-id]
+  (let [{:keys [length blocks]} (sequence-entry pool* sequence-id)
+        block-size (:block-size pool*)
+        offset (mod length block-size)
+        new-block? (zero? offset)]
+    (if new-block?
+      (let [[pool* block] (take-block pool*)]
+        {:pool (-> pool*
+                   (update-in [:sequences sequence-id :blocks] conj block)
+                   (update-in [:sequences sequence-id :length] inc))
+         :block block :offset 0})
+      (let [old-block (peek blocks)
+            shared? (> (get-in pool* [:refcounts old-block]) 1)]
+        (if shared?
+          (let [[pool* new-block] (take-block pool*)
+                pool* (release-block pool* old-block)]
+            {:pool (-> pool*
+                       (assoc-in [:sequences sequence-id :blocks (dec (count blocks))]
+                                 new-block)
+                       (update-in [:sequences sequence-id :length] inc))
+             :block new-block :offset offset
+             :copy {:from old-block :to new-block :tokens offset}})
+          {:pool (update-in pool* [:sequences sequence-id :length] inc)
+           :block old-block :offset offset})))))
+
+(defn append-tokens
+  "Reserve `count` positions and return all placements/copy commands."
+  [pool* sequence-id count]
+  (when-not (and (int? count) (not (neg? count)))
+    (throw (ex-info "token count must be a non-negative integer" {:count count})))
+  (loop [pool* pool* remaining count placements []]
+    (if (zero? remaining)
+      {:pool pool* :placements placements}
+      (let [placement (append-token pool* sequence-id)]
+        (recur (:pool placement) (dec remaining)
+               (conj placements (dissoc placement :pool)))))))
+
+(defn fork-sequence
+  "Create `child-id` as a zero-copy prefix fork of `parent-id`. All existing
+  blocks are shared until either sequence appends into a partial final block."
+  [pool* parent-id child-id]
+  (when (contains? (:sequences pool*) child-id)
+    (throw (ex-info "KV-cache sequence already exists"
+                    {:sequence-id child-id :reason :duplicate-sequence})))
+  (let [parent (sequence-entry pool* parent-id)]
+    (reduce retain-block
+            (assoc-in pool* [:sequences child-id] parent)
+            (:blocks parent))))
+
+(defn release-sequence
+  "Release a logical sequence and return blocks whose last reference ended to
+  the free pool."
+  [pool* sequence-id]
+  (let [entry (sequence-entry pool* sequence-id)]
+    (reduce release-block
+            (update pool* :sequences dissoc sequence-id)
+            (:blocks entry))))
+
+(defn block-table [pool* sequence-id]
+  (sequence-entry pool* sequence-id))
+
+(defn valid?
+  "Check allocator ownership invariants. Intended for assertions/monitoring."
+  [pool*]
+  (let [block-count (:block-count pool*)
+        referenced (frequencies (mapcat :blocks (vals (:sequences pool*))))
+        expected (mapv #(get referenced % 0) (range block-count))
+        free-expected (into (sorted-set)
+                            (keep #(when (zero? (nth expected %)) %) (range block-count)))]
+    (and (= block-count (count (:refcounts pool*)))
+         (= expected (:refcounts pool*))
+         (= free-expected (:free pool*))
+         (every? (fn [{:keys [length blocks]}]
+                   (= (count blocks)
+                      (if (zero? length) 0
+                          (quot (+ length (:block-size pool*) -1)
+                                (:block-size pool*)))))
+                 (vals (:sequences pool*))))))
+
+(defn scheduler
+  "Create a FIFO continuous-batch scheduler backed by `pool*`."
+  [pool* max-running]
+  (when-not (pos-int? max-running)
+    (throw (ex-info "max-running must be a positive integer"
+                    {:max-running max-running})))
+  {:pool pool* :max-running max-running
+   :waiting 
+   :running {} :order []})
+
+(defn enqueue
+  "Queue a request. `prompt-tokens` are reserved when the request is admitted."
+  [scheduler* request-id prompt-tokens]
+  (when (or (contains? (:running scheduler*) request-id)
+            (some #(= request-id (:id %)) (:waiting scheduler*)))
+    (throw (ex-info "generation request already exists" {:request-id request-id})))
+  (update scheduler* :waiting conj
+          {:id request-id :prompt-tokens (vec prompt-tokens)}))
+
+(defn- try-admit-one [scheduler* request]
+  (try
+    (let [pool* (allocate-sequence (:pool scheduler*) (:id request))
+          reserved (append-tokens pool* (:id request)
+                                  (count (:prompt-tokens request)))]
+      (-> scheduler*
+          (assoc :pool (:pool reserved))
+          (assoc-in [:running (:id request)]
+                    (assoc request :placements (:placements reserved)))
+          (update :order conj (:id request))))
+    (catch  error
+      (if (= :out-of-blocks (:reason (ex-data error))) nil (throw error)))))
+
+(defn admit
+  "Admit queued requests FIFO while both batch slots and KV blocks permit.
+  The first request that cannot fit remains queued; later requests cannot jump
+  ahead of it."
+  [scheduler*]
+  (loop [scheduler* scheduler*]
+    (if (or (empty? (:waiting scheduler*))
+            (>= (count (:running scheduler*)) (:max-running scheduler*)))
+      scheduler*
+      (let [request (peek (:waiting scheduler*))]
+        (if-let [admitted (try-admit-one scheduler* request)]
+          (recur (update admitted :waiting pop))
+          scheduler*)))))
+
+(defn advance
+  "Reserve one decode position for every running request, in stable batch
+  order. Returns updated `:pool` and per-request `:decode-placement`."
+  [scheduler*]
+  (reduce (fn [state request-id]
+            (let [placement (append-token (:pool state) request-id)]
+              (-> state
+                  (assoc :pool (:pool placement))
+                  (assoc-in [:running request-id :decode-placement]
+                            (dissoc placement :pool)))))
+          scheduler* (:order scheduler*)))
+
+(defn finish
+  "Evict a completed request, release its blocks, then admit queued work."
+  [scheduler* request-id]
+  (when-not (contains? (:running scheduler*) request-id)
+    (throw (ex-info "generation request is not running" {:request-id request-id})))
+  (-> scheduler*
+      (assoc :pool (release-sequence (:pool scheduler*) request-id))
+      (update :running dissoc request-id)
+      (update :order #(vec (remove #{request-id} %)))
+      admit))

@@ -1,0 +1,196 @@
+(ns provider.object-transport
+  "Production transport for stream-object-v1 (`provider.object`), backed by a
+  host-configured durable object service over fixed-path JSON-on-HTTPS.
+
+  Does NOT define a new capability and does NOT modify `object.cljc`. The
+  reference providers already enforce binding allow-lists, non-empty keys,
+  and max-pull-bytes before this transport runs. This namespace supplies the
+  real synchronous `(fn [request] -> reply)` the host injects as `:transport`.
+
+  ## No ambient object store (kit `:ambient-object-store false`)
+
+  Like `storage-transport` (ADR 0071) and unlike a naive local filesystem
+  blob root, this namespace never invents a default backend. The host MUST
+  pass `:endpoint` (or `KOTOBA_OBJECT_ENDPOINT`). There is no baked-in
+  default destination.
+
+  ## Fixed path, guest data only in the JSON body
+
+  POST to a single host-configured path (default `/object/v1/transact`).
+  Binding keywords, keys, digests, and bytes never appear in the URL path
+  (avoids path-traversal / percent-encoding hazards on guest-controlled
+  strings — same rationale as storage-transport).
+
+  ## Operations
+
+  | request `:operation` | wire success | provider reply |
+  |---|---|---|
+  | `:get-stream` | `{\"tag\":\"found\",\"bytes_base64\":\"...\"}` | `{:bytes <host :bytes>}` |
+  | `:put-block` | `{\"tag\":\"ok\",\"won\":true}` | `true`/`false` |
+  | `:compare-and-set-ref` | `{\"tag\":\"ok\",\"won\":true|false}` | `true`/`false` |
+
+  Missing get-stream → throw (redacted by `object.cljc` invoke-transport).
+  Non-2xx / malformed wire → throw similarly. Network exceptions propagate
+  uncaught for the same redaction path (ADR 0064/0066/0071 pattern).
+
+  ## `:cljs` / nbb (ADR 0129)
+
+  spawnSync Node hop (same pattern as ADR 0117/0119). Required `:endpoint`,
+  fixed path, base64 bytes, fail-closed wire parsing match the `:clj` path."
+  (:require [clojure.string :as string]
+            [provider.object :as object]
+            [kotoba.kir.value :as value]
+            )
+  )
+
+(def default-path "/object/v1/transact")
+(def default-connect-timeout-ms 5000)
+(def default-request-timeout-ms 10000)
+(def env-endpoint-var "KOTOBA_OBJECT_ENDPOINT")
+(def env-api-key-var "KOTOBA_OBJECT_API_KEY")
+(def response-byte-limit (+ object/max-pull-bytes 8192))
+
+
+
+
+
+(defn mem-transport
+  "In-memory object transport for tests + audit-hook demos (ADR 0271).
+
+  Not durable. Optional `:on-call` receives
+  `{:kit :object :operation :binding :key :reply-tag}` after each op
+  (same optional audit surface as `production-transport`). Exceptions
+  from on-call are swallowed.
+
+  Blocks are keyed by digest string; refs by key → etag string."
+  ([] (mem-transport {}))
+  ([{:keys [initial-blocks initial-refs on-call]
+     :or {initial-blocks {} initial-refs {} on-call (fn [_])}}]
+   (let [blocks (atom (into {} initial-blocks))
+         refs (atom (into {} initial-refs))
+         audit! (fn [e]
+                  (try (on-call e)
+                       (catch  _ nil)))]
+     (fn [{:keys [operation binding key digest bytes expected next] :as _req}]
+       (let [reply
+             (case operation
+               :get-stream
+               (if-let [b (or (get @blocks key) (get @blocks digest))]
+                 {:bytes b}
+                 (throw (ex-info "object mem not found"
+                                 {:phase :object-transport})))
+               :put-block
+               (do (swap! blocks assoc (str digest) bytes)
+                   true)
+               :compare-and-set-ref
+               (let [cur (get @refs key)]
+                 (if (= cur expected)
+                   (do (swap! refs assoc key next) true)
+                   false))
+               (throw (ex-info "object mem unknown op"
+                               {:phase :object-transport :operation operation})))]
+         (audit! {:kit :object
+                  :operation operation
+                  :binding binding
+                  :key key
+                  :reply-tag (if (boolean? reply)
+                               (if reply :ok :lost)
+                               :bytes)})
+         reply)))))
+
+(defn resolve-endpoint
+  "Resolve host-configured object-store origin: `:endpoint` option, else
+  `KOTOBA_OBJECT_ENDPOINT`, else throw. No ambient default."
+  [opts]
+  (or (:endpoint opts)
+      (getenv env-endpoint-var)
+      (throw (ex-info
+              (str "object-transport requires an :endpoint construction option (or "
+                   env-endpoint-var
+                   " env var) — no ambient object store")
+              {:phase :object-transport}))))
+
+(defn- kw->wire [kw]
+  (if-let [ns (namespace kw)]
+    (str ns "/" (name kw))
+    (name kw)))
+
+
+
+
+
+
+
+
+
+(defn- request-body
+  [{:keys [operation binding key digest bytes expected next]}]
+  (cond-> {"operation" (name operation)
+           "binding" (kw->wire binding)}
+    (contains? #{:get-stream :compare-and-set-ref} operation)
+    (assoc "key" key)
+    (= operation :put-block)
+    (assoc "digest" digest
+           "bytes_base64" (bytes->base64 bytes))
+    (= operation :compare-and-set-ref)
+    (assoc "expected" expected
+           "next" next)))
+
+
+
+(defn- truncate-to-byte-limit [s limit]
+  (loop [s (str s)]
+    (if (<= (value/utf8-byte-count! s) limit)
+      s
+      (recur (subs s 0 (max 0 (dec (count s))))))))
+
+
+
+(defn- wire->transport-reply
+  "Map upstream JSON to the shape `provider.object` transports expect."
+  [operation parsed]
+  (let [tag (keyword (str (:tag parsed)))]
+    (case tag
+      :found
+      (let [b64 (:bytes_base64 parsed)]
+        (when-not (string? b64)
+          (throw (ex-info "object-transport found without bytes_base64"
+                          {:phase :object-transport})))
+        (let [payload (base64->bytes b64)]
+          (when (> (value/bytes-byte-count payload) object/max-pull-bytes)
+            (throw (ex-info "object-transport payload exceeds max-pull-bytes"
+                            {:phase :object-transport})))
+          {:bytes payload}))
+
+      :ok
+      (let [won (:won parsed)]
+        (when-not (boolean? won)
+          (throw (ex-info "object-transport ok without boolean won"
+                          {:phase :object-transport})))
+        (when-not (contains? #{:put-block :compare-and-set-ref} operation)
+          (throw (ex-info "object-transport ok tag for non-write operation"
+                          {:phase :object-transport :operation operation})))
+        won)
+
+      :missing
+      (throw (ex-info "object-transport object missing"
+                      {:phase :object-transport :operation operation}))
+
+      :error
+      (throw (ex-info "object-transport upstream error"
+                      {:phase :object-transport
+                       :code (get-in parsed [:error :code])
+                       :message (get-in parsed [:error :message])}))
+
+      (throw (ex-info "object-transport unknown wire tag"
+                      {:phase :object-transport :tag tag})))))
+
+
+
+
+
+
+
+
+
+

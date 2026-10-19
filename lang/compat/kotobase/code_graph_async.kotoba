@@ -1,0 +1,135 @@
+(ns kotobase.code-graph-async
+  "Promise/completion-aware facade over the complete synchronous code-graph API.
+
+  `run!` materializes the code graph through an IStore whose methods may return
+  host async values, runs any existing `kotobase.code-graph` operation against a
+  LocalStore, then flushes only its document and append deltas. Thus callers do
+  not need an async duplicate of every code-graph function and the admission,
+  verification, disclosure, merge, retention, and execution logic keeps one
+  implementation.
+
+  Use `promise-runtime` in ClojureScript. Tests and synchronous hosts can use
+  `immediate-runtime`; other hosts may inject the same resolve/then/all algebra."
+  (:refer-clojure :exclude [run!])
+  (:require [kotobase.code-graph :as code]
+            [kotobase.local :as local]
+            [kotobase.store :as store]))
+
+(def collections
+  [code/definitions code/types code/artifacts code/analysis-cache
+   code/namespace-commits code/execution-receipts code/identity-migrations
+   code/retention-pins])
+
+(def streams [code/datom-stream code/retention-stream])
+
+(def immediate-runtime
+  {:resolve identity
+   :then (fn [value f] (f value))
+   :all vec})
+
+
+
+(defn- resolve* [runtime value] ((:resolve runtime) value))
+(defn- then* [runtime value f] ((:then runtime) value f))
+(defn- all* [runtime values] ((:all runtime) values))
+
+(defn- load-collection [runtime remote coll]
+  (then* runtime (resolve* runtime (store/-list remote coll))
+         (fn [keys]
+           (then* runtime
+                  (all* runtime
+                        (mapv (fn [key]
+                                (then* runtime
+                                       (resolve* runtime (store/-get remote coll key))
+                                       (fn [value] [key value])))
+                              keys))
+                  (fn [entries] [coll (into {} entries)])))))
+
+(defn- load-stream [runtime remote stream]
+  (then* runtime (resolve* runtime (store/-read remote stream 0))
+         (fn [events] [stream (vec events)])))
+
+(defn materialize
+  "Return an async value resolving to a LocalStore snapshot of every code-graph
+  collection and stream."
+  [runtime remote]
+  (if (store/transactional-store? remote)
+    (then* runtime
+           (resolve* runtime
+                     (store/-snapshot remote {:collections collections
+                                              :streams streams}))
+           (fn [{:keys [revision docs streams]}]
+             (local/local-store
+              {:docs docs :streams streams :revision revision
+               :seq (reduce max 0 (map :seq (mapcat val streams)))})))
+    (then* runtime
+           (all* runtime
+                 (concat (mapv #(load-collection runtime remote %) collections)
+                         (mapv #(load-stream runtime remote %) streams)))
+           (fn [parts]
+             (let [part-map (into {} parts)
+                   stream-map (select-keys part-map streams)
+                   max-seq (reduce max 0 (map :seq (mapcat val stream-map)))]
+               (local/local-store
+                {:docs (select-keys part-map collections)
+                 :streams stream-map
+                 :seq max-seq}))))))
+
+(defn- changed-docs [before after]
+  (for [coll collections
+        [key value] (get-in after [:docs coll])
+        :when (not= value (get-in before [:docs coll key]))]
+    [coll key value]))
+
+(defn- appended-events [before after]
+  (mapcat
+   (fn [stream]
+     (let [old-count (count (get-in before [:streams stream]))]
+       (map (fn [event] [stream (dissoc event :seq)])
+            (drop old-count (get-in after [:streams stream])))))
+   streams))
+
+(defn- flush! [runtime remote before after]
+  (if (store/transactional-store? remote)
+    (resolve* runtime
+              (store/-transact
+               remote
+               {:tx-id (str (random-uuid))
+                :expected-revision (:revision before)
+                :puts (vec (changed-docs before after))
+                :deletes []
+                :appends (vec (appended-events before after))}))
+    (then* runtime
+         (all* runtime
+               (mapv (fn [[coll key value]]
+                       (resolve* runtime (store/-put remote coll key value)))
+                     (changed-docs before after)))
+         (fn [_]
+           ;; Preserve append order: the remote sequencer is authoritative and
+           ;; assigns fresh cursors, so stream writes must not be fired in a
+           ;; Promise.all race.
+           (reduce
+            (fn [completion [stream event]]
+              (then* runtime completion
+                     (fn [_] (resolve* runtime
+                                      (store/-append remote stream event)))))
+            (resolve* runtime nil)
+            (appended-events before after))))))
+
+(defn run!
+  "Run `(operation local-store)` after asynchronously materializing REMOTE,
+  flush its deltas, and resolve to OPERATION's result. All existing code-graph
+  functions can be passed without async-specific variants.
+
+  ClojureScript:
+    (-> (run! promise-runtime remote
+              #(code/put-definition! % verify record))
+        (.then ...))"
+  [runtime remote operation]
+  (then* runtime (materialize runtime remote)
+         (fn [local-store]
+           (let [before (local/snapshot local-store)
+                 result (operation local-store)
+                 after (local/snapshot local-store)]
+             (then* runtime (flush! runtime remote before after)
+                    (fn [_] result))))))

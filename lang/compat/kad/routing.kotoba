@@ -1,0 +1,549 @@
+(ns kad.routing
+  "**HTTP delegated routing** (specs.ipfs.tech/routing/http-routing-v1) — how
+  something that is not a libp2p node reads and writes the real DHT.
+
+  ## Read this before believing anything about decentralization
+
+  A delegated router is an HTTP endpoint that *is* a DHT node and answers on
+  your behalf. Using one means:
+
+  - **the records are real.** A record published through `/routing/v1/ipns/…`
+    is the same signed IPNS record, at the same DHT key, that any Kubo node
+    would fetch. It is stored in the actual DHT and any peer can resolve it.
+  - **you are not a DHT node.** You do not hold a routing table, you answer
+    nobody's queries, and you see the network only through whichever endpoints
+    you ask.
+
+  So this is a genuine improvement over a single proprietary registry — the
+  records become interoperable and the routers are replaceable, plural, and run
+  by different people — and it is **not** the same thing as joining the DHT.
+  Saying otherwise would be the kind of claim this workspace exists to avoid.
+  What full participation still needs is named in the README: multiaddr, a TCP
+  or QUIC transport, multistream-select, a stream muxer, and the
+  `/ipfs/kad/1.0.0` RPC over it. `kad.message` and `kad.lookup` are already the
+  protocol half of that; the transport is the gap.
+
+  ## Why more than one router
+
+  A single endpoint is a single point of failure and a single point of lying.
+  `resolve` queries several concurrently-supplied routers and requires
+  `quorum` agreeing valid records before it answers. One router that returns a
+  stale-but-validly-signed record cannot win against two that return the
+  current one, because `ipns.record/select` prefers the higher sequence number
+  and the records are *validated by the caller* before they are counted.
+
+  That is the property that makes this meaningfully different from asking one
+  server: no single router is trusted, and the trust that remains is
+  cryptographic rather than positional.
+
+  ## Transport is injected
+
+  `http-fn` is `(fn [{:keys [method url headers body]}] -> {:status :headers :body})`
+  with `body` as octets (IPNS) or a parsed map (providers tests). No HTTP
+  client and no JSON parser are imported: the caller owns the network, the
+  timeouts, the TLS, and JSON. A library that owned them would be untestable
+  without one.
+
+  IPNS is a signed record (`get-ipns` / `resolve`). Providers are an index
+  (`get-providers` / `find-providers`). Both are delegated routing. Neither
+  makes this process a DHT node."
+  (:refer-clojure :exclude [resolve])
+  (:require [clojure.string :as str]))
+
+(def default-routers
+  "Public delegated routing endpoints. Listed as a *default*, not a
+  recommendation: an operator serious about not depending on anyone else runs
+  their own (Kubo exposes `/routing/v1` directly) and passes it here. These
+  exist so the first call works rather than requiring infrastructure before the
+  first experiment."
+  ["https://delegated-ipfs.dev/routing/v1"])
+
+(def ^:const ipns-record-content-type
+  "The media type an IPNS record is fetched and published as. Asking for
+  `application/json` from the same path returns a *different* thing — a JSON
+  summary — and a client that does not set this header gets something it cannot
+  verify a signature over."
+  "application/vnd.ipfs.ipns-record")
+
+(defn- ->octets [b]
+  (cond
+    (nil? b) nil
+    (vector? b) b
+    (string? b) (mapv #(bit-and (int %) 0xFF) (seq b))
+    :else (mapv #(bit-and % 0xFF) (vec (seq )))))
+
+(defn get-ipns
+  "Fetch the raw IPNS record for `name` from one router.
+
+  Returns `{:ok? true :record <octets> :router url}` or
+  `{:ok? false :reason … :router url}`. Never throws: a resolver asking several
+  routers must be able to score them all, and one refusing connections is an
+  ordinary outcome rather than an exception."
+  [http-fn router name]
+  (try
+    (let [{:keys [status body]} (http-fn {:method :get
+                                          :url (str router "/ipns/" name)
+                                          :headers {"Accept" ipns-record-content-type}})]
+      (cond
+        (= 404 status) {:ok? false :reason :not-found :router router}
+        (not= 200 status) {:ok? false :reason :http-error :status status :router router}
+        (nil? body) {:ok? false :reason :empty-body :router router}
+        :else {:ok? true :record (->octets body) :router router}))
+    (catch  e
+      {:ok? false :reason :transport-error :router router
+       :detail })))
+
+(defn put-ipns
+  "Publish a serialized IPNS record for `name` through one router.
+
+  The router validates the record before accepting it — which is the useful
+  part: a 400 here means the record is malformed or badly signed, and finding
+  that out at publish time is much better than discovering later that nothing
+  resolves."
+  [http-fn router name record-octets]
+  (try
+    (let [{:keys [status body]} (http-fn {:method :put
+                                          :url (str router "/ipns/" name)
+                                          :headers {"Content-Type" ipns-record-content-type}
+                                          :body record-octets})]
+      (if (<= 200 status 299)
+        {:ok? true :router router :status status}
+        {:ok? false :reason :rejected :status status :router router
+         :detail (when body (apply str (map char (take 200 (->octets body)))))}))
+    (catch  e
+      {:ok? false :reason :transport-error :router router
+       :detail })))
+
+;; ── multi-router resolution ───────────────────────────────────────────────
+
+(defn score
+  "The pure half of `resolve`: given per-router responses **already fetched**,
+  validate each and pick the best.
+
+  Split out because a synchronous `http-fn` is not universal. A JVM job can
+  call one; a Cloudflare Worker cannot — `fetch` there is a Promise, and there
+  is no way to await it inside a synchronous function. A Worker therefore does
+  its own concurrent fetches, builds the same `{:ok? :record :router}` maps
+  `get-ipns` produces, and calls this.
+
+  Keeping the scoring pure also means the interesting logic — quorum,
+  validation, selection, and telling `:not-found` from `:all-routers-failed` —
+  is testable with no transport at all."
+  [responses {:keys [quorum validate-fn select-fn] :or {quorum 1}}]
+  (let [validated (keep (fn [r]
+                          (when (:ok? r)
+                            (when-let [v (validate-fn (:record r))]
+                              (assoc r :validated v))))
+                        responses)]
+    (if (>= (count validated) quorum)
+      {:ok? true
+       :record (if select-fn
+                 (select-fn (mapv :validated validated))
+                 (:validated (first validated)))
+       :agreed (count validated)
+       :routers (mapv :router validated)
+       :responses responses}
+      {:ok? false
+       ;; Order matters and the obvious spelling is wrong: asking whether every
+       ;; *failed* response was :not-found returns true when there were no
+       ;; failures at all, so a case where every router answered and nothing
+       ;; validated would be reported as "nobody has this name". The three
+       ;; outcomes a caller needs to tell apart are: nobody has it, nobody
+       ;; answered, and the answers were not usable.
+       :reason (let [ok (filter :ok? responses)]
+                 (cond
+                   (and (empty? ok) (seq responses)
+                        (every? #(= :not-found (:reason %)) responses)) :not-found
+                   (empty? ok) :all-routers-failed
+                   :else :no-valid-record))
+       :agreed (count validated)
+       :quorum quorum
+       :responses responses})))
+
+(defn resolve
+  "Resolve `name` through several routers and return the best **validated**
+  record.
+
+  Requires a **synchronous** `http-fn`, so it suits a JVM job and not a
+  Cloudflare Worker; see `score` for the pure half a Worker composes with its
+  own async fetches.
+
+  `validate-fn` is `(fn [record-octets] -> validated-record-or-nil)` — the
+  caller wires it to `ipns.record/parse` + `ipns.record/validate` with its own
+  clock and verifier. This namespace deliberately cannot validate anything
+  itself: it holds no crypto, so it cannot be the place that decides a record
+  is genuine, and a router's answer is never trusted on the strength of having
+  answered.
+
+  `select-fn` picks among validated records — `ipns.record/select`, which
+  prefers the higher sequence number.
+
+  Returns `{:ok? true :record … :agreed n :routers [...]}` when at least
+  `quorum` routers returned a record that validated, else `{:ok? false …}` with
+  every router's outcome, so a caller can tell \"nobody has this name\" from
+  \"every router was down\"."
+  [http-fn name {:keys [routers quorum validate-fn select-fn]
+                 :or {routers default-routers quorum 1}}]
+  (score (mapv #(get-ipns http-fn % name) routers)
+         {:quorum quorum :validate-fn validate-fn :select-fn select-fn}))
+
+(defn publish
+  "Publish through every router, and report per-router outcomes.
+
+  Succeeds if **any** router accepted: the record is in the DHT once one node
+  has it, and the others will learn it by ordinary replication. Requiring all
+  of them would make one unreachable endpoint a publishing failure when the
+  publish actually worked."
+  [http-fn name record-octets {:keys [routers] :or {routers default-routers}}]
+  (let [results (mapv #(put-ipns http-fn % name record-octets) routers)
+        ok (filterv :ok? results)]
+    {:ok? (boolean (seq ok))
+     :accepted (mapv :router ok)
+     :rejected (filterv (complement :ok?) results)}))
+
+(defn router-summary
+  "One line per router — for an operator who needs to know *which* endpoint is
+  answering, not just that resolution worked."
+  [{:keys [responses]}]
+  (str/join "\n"
+            (for [r responses]
+              (str (:router r) " → "
+                   (if (:ok? r)
+                     (str "ok, " (count (:record r)) " octets")
+                     (str (name (:reason r))
+                          (when (:status r) (str " " (:status r)))))))))
+
+;; ── providers (HTTP routing v1 GET /providers/{cid}) ──────────────────────
+
+(def ^:const providers-accept
+  "Providers are a JSON index, not a signed record. Asking for the IPNS
+  media type here returns something you cannot parse as Providers."
+  "application/json")
+
+(defn- provider-id [p]
+  (or (:ID p) (:id p) (get p "ID") (get p "id")))
+
+(defn- provider-addrs [p]
+  (or (:Addrs p) (:addrs p) (get p "Addrs") (get p "addrs") []))
+
+(defn- providers-of [body]
+  (or (:Providers body) (:providers body)
+      (get body "Providers") (get body "providers") []))
+
+(defn- provider-record
+  "Same shape as `kotoba.protocol.discover/record`, by convention not by
+  require. This library must not depend on kotoba-protocol."
+  [cid p]
+  (let [id (provider-id p)]
+    (when (string? id)
+      {:plane :discovery
+       :cid cid
+       :peer id
+       :addrs (vec (provider-addrs p))
+       :mutates-cid? false})))
+
+(defn- body->map
+  "Tests pass already-parsed maps. Production injects `parse-fn` for JSON
+  octets. No JSON parser lives here."
+  [body parse-fn]
+  (cond
+    (map? body) body
+    (nil? body) nil
+    (and parse-fn (or (string? body) (sequential? body)))
+    (try (parse-fn body)
+         (catch  _ :parse-failed))
+    :else :unparsed))
+
+(defn get-providers
+  "Fetch who serves `cid` from one delegated router.
+
+  GET `{router}/providers/{cid}`. Never throws. Never rewrites `cid`.
+  A 404 and a 200 with an empty Providers list are the same discovery
+  answer: this router knows nobody. Transport failure is a different
+  answer — we could not ask.
+
+  `parse-fn` is `(fn [body] map)` and is required when `body` is not
+  already a map. Tests pass maps. Production wires `clojure.data.json`
+  or `js/JSON.parse`. This namespace does not import a JSON library."
+  ([http-fn router cid]
+   (get-providers http-fn router cid {}))
+  ([http-fn router cid {:keys [parse-fn]}]
+   (if-not (string? cid)
+     {:ok? false :reason :invalid-cid :value cid :router router}
+     (try
+       (let [{:keys [status body]} (http-fn {:method :get
+                                             :url (str router "/providers/" cid)
+                                             :headers {"Accept" providers-accept}})
+             parsed (body->map body parse-fn)]
+         (cond
+           (= 404 status)
+           {:ok? true :providers [] :router router :cid cid :empty? true}
+           (not= 200 status)
+           {:ok? false :reason :http-error :status status :router router :cid cid}
+           (nil? parsed)
+           {:ok? false :reason :empty-body :router router :cid cid}
+           (#{:unparsed :parse-failed} parsed)
+           {:ok? false :reason :body-not-map :router router :cid cid}
+           (not (map? parsed))
+           {:ok? false :reason :body-not-map :router router :cid cid}
+           :else
+           {:ok? true
+            :providers (vec (keep #(provider-record cid %) (providers-of parsed)))
+            :router router
+            :cid cid}))
+       (catch  e
+         {:ok? false :reason :transport-error :router router :cid cid
+          :detail })))))
+
+(defn score-providers
+  "The pure half of `find-providers`: union by `:peer` across responses
+  already fetched. Quorum counts routers that **answered** (200 or 404),
+  not peers found. Empty union with quorum met is success — we asked,
+  nobody provides. All transport failures are `:all-routers-failed`.
+
+  Does not rewrite `cid`. A Worker that cannot supply a synchronous
+  `http-fn` fetches on its own and calls this."
+  [cid responses {:keys [quorum] :or {quorum 1}}]
+  (let [ok (filterv :ok? responses)
+        by-peer (reduce (fn [m p]
+                          (if (string? (:peer p))
+                            (assoc m (:peer p) p)
+                            m))
+                        {}
+                        (mapcat :providers ok))]
+    (if (>= (count ok) quorum)
+      {:ok? true
+       :cid cid
+       :providers (vec (vals by-peer))
+       :answered (count ok)
+       :routers (mapv :router ok)
+       :responses responses
+       :mutates-cid? false}
+      {:ok? false
+       :cid cid
+       :reason (cond
+                 (empty? ok) :all-routers-failed
+                 :else :quorum-unmet)
+       :answered (count ok)
+       :quorum quorum
+       :responses responses})))
+
+(defn find-providers
+  "Ask several delegated routers who serves `cid`, and union the answers.
+
+  Requires a synchronous `http-fn`. See `score-providers` for the pure
+  half a Worker composes with its own async fetches.
+
+  This process is still not a DHT node. The records are real provider
+  advertisements; you see them only through the endpoints you ask.
+
+  Production wiring into kotoba-protocol:
+
+      (fn [cid]
+        (kad.routing/find-providers http-fn cid opts))
+
+  then `kotoba.protocol.discover/lookup-live`. This namespace does not
+  require kotoba-protocol."
+  [http-fn cid {:keys [routers quorum]
+                :or {routers default-routers quorum 1}
+                :as opts}]
+  (score-providers cid
+                   (mapv #(get-providers http-fn % cid opts) routers)
+                   {:quorum quorum}))
+
+;; ── peers (HTTP routing v1 GET /peers/{peer-id}) ──────────────────────────
+
+(defn- peers-of [body]
+  (or (:Peers body) (:peers body)
+      (get body "Peers") (get body "peers") []))
+
+(defn- peer-protocols [p]
+  (or (:Protocols p) (:protocols p)
+      (get p "Protocols") (get p "protocols") []))
+
+(defn- routing-peer
+  "Same shape as `kotoba.protocol.route/record`, by convention not by
+  require. This library must not depend on kotoba-protocol."
+  [asked p]
+  (let [id (provider-id p)]
+    (when (string? id)
+      {:plane :routing
+       :peer id
+       :asked asked
+       :addrs (vec (provider-addrs p))
+       :protocols (vec (peer-protocols p))})))
+
+(defn get-peer
+  "Fetch where `peer-id` is reachable from one delegated router.
+
+  GET `{router}/peers/{peer-id}`. Spec: 404 MUST be read as 200 with 0
+  results. Never throws. Never rewrites `peer-id`. A different `ID` in
+  the body is still returned — the caller checks `:peer` against
+  `:asked`. This is routing, not discovery: no CID is involved.
+
+  `parse-fn` is required when `body` is not already a map."
+  ([http-fn router peer-id]
+   (get-peer http-fn router peer-id {}))
+  ([http-fn router peer-id {:keys [parse-fn]}]
+   (if-not (and (string? peer-id) (pos? (count peer-id)))
+     {:ok? false :reason :invalid-peer :value peer-id :router router}
+     (try
+       (let [{:keys [status body]} (http-fn {:method :get
+                                             :url (str router "/peers/" peer-id)
+                                             :headers {"Accept" providers-accept}})
+             parsed (body->map body parse-fn)]
+         (cond
+           (= 404 status)
+           {:ok? true :peers [] :router router :asked peer-id :empty? true}
+           (not= 200 status)
+           {:ok? false :reason :http-error :status status :router router :asked peer-id}
+           (nil? parsed)
+           {:ok? false :reason :empty-body :router router :asked peer-id}
+           (#{:unparsed :parse-failed} parsed)
+           {:ok? false :reason :body-not-map :router router :asked peer-id}
+           (not (map? parsed))
+           {:ok? false :reason :body-not-map :router router :asked peer-id}
+           :else
+           {:ok? true
+            :peers (vec (keep #(routing-peer peer-id %) (peers-of parsed)))
+            :router router
+            :asked peer-id}))
+       (catch  e
+         {:ok? false :reason :transport-error :router router :asked peer-id
+          :detail })))))
+
+(defn score-peers
+  "Pure half of `find-peers`: union by `:peer`. Quorum counts routers
+  that answered. Empty union with quorum met is success — we asked,
+  nobody knows this peer. All transport failures are `:all-routers-failed`."
+  [peer-id responses {:keys [quorum] :or {quorum 1}}]
+  (let [ok (filterv :ok? responses)
+        by-id (reduce (fn [m p]
+                        (if (string? (:peer p))
+                          (assoc m (:peer p) p)
+                          m))
+                      {}
+                      (mapcat :peers ok))]
+    (if (>= (count ok) quorum)
+      {:ok? true
+       :asked peer-id
+       :peers (vec (vals by-id))
+       :answered (count ok)
+       :routers (mapv :router ok)
+       :responses responses}
+      {:ok? false
+       :asked peer-id
+       :reason (if (empty? ok) :all-routers-failed :quorum-unmet)
+       :answered (count ok)
+       :quorum quorum
+       :responses responses})))
+
+(defn find-peers
+  "Ask several delegated routers where `peer-id` is reachable.
+
+  This process is still not a DHT node. Production:
+
+      (fn [peer]
+        (kad.routing/find-peers http-fn peer opts))
+
+  then `kotoba.protocol.route/lookup-live`."
+  [http-fn peer-id {:keys [routers quorum]
+                    :or {routers default-routers quorum 1}
+                    :as opts}]
+  (score-peers peer-id
+               (mapv #(get-peer http-fn % peer-id opts) routers)
+               {:quorum quorum}))
+
+;; ── provide (historic PUT /providers — not in routing v1) ─────────────────
+
+(defn provider-envelope
+  "The JSON body of the historic `PUT /routing/v1/providers` endpoint
+  (index-provider / IPNI, IPIP-0526). The current HTTP routing v1 spec
+  documents GET providers and PUT IPNS. It does **not** document a
+  vendor-agnostic provide. IPIP-378 (POST) closed without landing.
+
+  CID lives in `Payload.Keys`, not in the URL. This library does not
+  sign and does not invent a clock: `sign-fn` and `timestamp-ms` are
+  injected or omitted. Omitting them is not a pass on authenticity —
+  a router that requires a signature will 400, which is the useful
+  answer.
+
+  There is no default `sign-fn` here. IPIP-0526 is historic and
+  untested; the bytes to sign (DAG-JSON vs DAG-CBOR) were never
+  settled (IPIP-378 closed). Shipping a kad-owned signer would be
+  forging a protocol. Callers that already have Kubo's signed record
+  may pass `sign-fn`; this namespace will not invent one."
+  [{:keys [cid peer addrs timestamp-ms advisory-ttl sign-fn]}]
+  (cond
+    (not (string? cid)) {:ok? false :reason :invalid-cid :value cid}
+    (not (string? peer)) {:ok? false :reason :invalid-peer :value peer}
+    :else
+    (let [payload (cond-> {:Keys [cid] :ID peer :Addrs (vec (or addrs []))}
+                    timestamp-ms (assoc :Timestamp timestamp-ms)
+                    advisory-ttl (assoc :AdvisoryTTL advisory-ttl))
+          rec (cond-> {:Schema "bitswap"
+                       :Protocol "transport-bitswap"
+                       :Payload payload}
+                sign-fn (assoc :Signature (sign-fn payload)))]
+      {:ok? true
+       :cid cid
+       :envelope {:Providers [rec]}
+       :mutates-cid? false})))
+
+(defn put-providers
+  "PUT `{router}/providers` with a historic bitswap envelope.
+
+  Never throws. Never rewrites `cid`. Never signs unless `sign-fn` is
+  given. `encode-fn` is `(fn [envelope] body)` — tests pass the map;
+  production wires JSON. This namespace does not import a JSON library.
+
+  A 2xx means this router accepted the advertisement. That is not the
+  same thing as the CID being in the DHT, and it is not this process
+  becoming a DHT node."
+  ([http-fn router rec]
+   (put-providers http-fn router rec {}))
+  ([http-fn router rec {:keys [encode-fn sign-fn timestamp-ms advisory-ttl]}]
+   (let [env (provider-envelope (assoc rec :sign-fn sign-fn
+                                       :timestamp-ms timestamp-ms
+                                       :advisory-ttl advisory-ttl))]
+     (if-not (:ok? env)
+       (assoc env :router router)
+       (try
+         (let [body (if encode-fn (encode-fn (:envelope env)) (:envelope env))
+               {:keys [status body]} (http-fn {:method :put
+                                               :url (str router "/providers")
+                                               :headers {"Content-Type" providers-accept}
+                                               :body body})]
+           (if (<= 200 status 299)
+             {:ok? true :router router :status status
+              :cid (:cid env) :mutates-cid? false}
+             {:ok? false :reason :rejected :status status :router router
+              :cid (:cid env)
+              :detail (when (and body (not (map? body)))
+                        (apply str (map char (take 200 (->octets body)))))}))
+         (catch  e
+           {:ok? false :reason :transport-error :router router :cid (:cid env)
+            :detail }))))))
+
+(defn provide
+  "Advertise through every router. Succeeds if **any** accepted, same
+  rule as `publish` for IPNS: one node having the record is enough.
+
+  Historic endpoint. Does not rewrite cid. Does not sign. This process
+  is still not a DHT node.
+
+  Production wiring into kotoba-protocol:
+
+      (fn [rec]
+        (kad.routing/provide http-fn rec opts))
+
+  then `kotoba.protocol.discover/advertise-live`."
+  [http-fn rec {:keys [routers] :or {routers default-routers} :as opts}]
+  (let [results (mapv #(put-providers http-fn % rec opts) routers)
+        ok (filterv :ok? results)
+        cid (:cid rec)]
+    {:ok? (boolean (seq ok))
+     :cid cid
+     :mutates-cid? false
+     :accepted (mapv :router ok)
+     :rejected (filterv (complement :ok?) results)}))

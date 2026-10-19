@@ -1,0 +1,176 @@
+(ns storj.node.id
+  "Storj node identifiers.
+
+  Every peer on the Storj network — satellite, storage node, uplink — is named
+  by a 32-byte `NodeID` derived from its certificate authority's public key.
+  On the wire it travels as raw bytes; everywhere a human or a config file
+  sees it, it is base58check with a version byte:
+
+      version(1) || id(32) || first-4-bytes-of-sha256d(version||id)
+
+  base58-encoded. That is the same construction Bitcoin addresses use, and the
+  same one `btc-crypto` implements for that purpose — Storj's `base58` package
+  is a vendored fork of the btcutil one.
+
+  ## The last byte is not part of the identity
+
+  Byte 32 holds the **identity version**, and it survives none of the
+  round trips one would expect. `NodeID.String()` zeroes it and moves it into
+  the base58check version field; `NodeIDFromString` writes the version back
+  into it. So `parse` of an encoded ID normalises that byte, and two IDs
+  differing only there are the same node. This library reproduces that
+  faithfully, including the part that looks like a bug: encoding a 32-byte
+  value whose last byte is, say, `0x2f` and decoding it back does **not**
+  return the same bytes. Storj behaves the same way, verified against its own
+  encoder in `testdata/gen_vectors.go`.
+
+  V0 is the only version that exists, and its number is 0.
+
+  ## Difficulty
+
+  A node ID is not free to choose. `difficulty` counts the trailing zero bits
+  of the ID **excluding the version byte**, and the network requires a
+  minimum, so generating an identity costs proof of work. That is what stops
+  an attacker minting identities until some land next to a piece they want to
+  attack.
+
+  Skipping the version byte is not a detail: `Difficulty()` starts its scan at
+  byte 31 and adds a byte's worth of bits for the one it skipped, so the
+  smallest value it can report is 8. Counting all 32 bytes gives the same
+  answer for every V0 identity — their version byte is zero, so it counts as
+  eight trailing zeros either way — and a different answer the moment a
+  version 1 ever exists.
+
+  This is the one part of Storj's identity system that can be checked without
+  the network, which makes it the one part that has real reference vectors
+  here: the published satellite node IDs. `test/storj/node/id_test.cljc`
+  decodes all four, and the checksums, lengths and difficulties in it were
+  measured from the real strings rather than assumed.
+
+  ## What this namespace does not do
+
+  It does not *generate* identities and it does not verify that an ID actually
+  belongs to a certificate chain. Both need the CA key and the peer TLS
+  handshake, which live behind `IVerifier` and the transport this library
+  does not own. See the README's scope section."
+  (:refer-clojure :exclude [format])
+  (:require [storj.node.bytes :as b]))
+
+(def id-length
+  "Node IDs are 32 bytes — the width of the SHA-256 the CA key is hashed to."
+  32)
+
+(def version-0
+  "The only identity version that exists. Its number is 0, and it is what
+  every published satellite ID decodes to."
+  0)
+
+(def known-versions #{version-0})
+
+(def checksum-length 4)
+
+(defn- fail [msg data]
+  (throw (ex-info (str "storj.node.id: " msg) data)))
+
+(defn version
+  "The identity version an ID declares — its last byte, or V0 if that byte
+  names a version this build does not know.
+
+  Falling back rather than failing is Storj's behaviour (`Version()` says
+  \"when in doubt, use V0\"), and it matters: a node that refused IDs carrying
+  a future version number would stop talking to the network the day one is
+  introduced."
+  [id]
+  (let [b (last (b/->ints id))]
+    (if (contains? known-versions b) b version-0)))
+
+(defn- unversioned
+  "The ID with its version byte cleared — what actually gets base58-encoded."
+  [id]
+  (conj (subvec (b/->ints id) 0 (dec id-length)) 0))
+
+(defn format
+  "32-byte ID → its base58check string.
+
+  The version travels in base58check's version field, and the ID's own last
+  byte is zeroed before encoding — see the namespace docstring. Named `format`
+  to read well at a call site; shadowing `clojure.core/format` is deliberate
+  and this namespace does not use it."
+  [id]
+  (let [id (b/->ints id)]
+    (when-not (= id-length (count id))
+      (fail "a node ID is 32 bytes" {:length (count id)}))
+    (let [body (into [(version id)] (unversioned id))]
+      (b/base58-encode (into body (take checksum-length (b/sha256d body)))))))
+
+(defn parse
+  "base58check string → `{:version v :bytes id}`.
+
+  Throws if the string contains a character outside the base58 alphabet, is
+  the wrong length, or fails its checksum. The checksum is not decoration: a
+  node ID that has picked up a transcription error otherwise names a different
+  peer, and the operations it authorises would be attributed to whoever that
+  turns out to be."
+  [s]
+  (when-not (string? s)
+    (fail "expected a string" {:input s}))
+  (let [raw (b/base58-decode s)
+        n   (count raw)]
+    (when-not (= n (+ 1 id-length checksum-length))
+      (fail "wrong length for a node ID"
+            {:decoded-bytes n :expected (+ 1 id-length checksum-length)}))
+    (let [body     (subvec raw 0 (- n checksum-length))
+          checksum (subvec raw (- n checksum-length))
+          expected (vec (take checksum-length (b/sha256d body)))]
+      (when-not (= checksum expected)
+        (fail "checksum mismatch — this is not a valid node ID"
+              {:found (b/hex checksum) :expected (b/hex expected)}))
+      (let [v (first body)]
+        {:version v
+         ;; `NodeIDFromString` writes the version back into the last byte
+         ;; (`NewVersionedID`), so the bytes a caller compares against a wire
+         ;; `storage_node_id` are the versioned ones, not what base58 carried.
+         :bytes   (conj (subvec body 1 (dec (count body))) v)}))))
+
+(defn valid?
+  "Whether `s` parses as a node ID. For deciding, not for reporting — `parse`
+  says what is wrong."
+  [s]
+  (try (some? (parse s)) (catch  _ false)))
+
+(defn- trailing-zeros [byte]
+  (loop [k 0]
+    (if (zero? (bit-and byte (bit-shift-left 1 k))) (recur (inc k)) k)))
+
+(defn difficulty
+  "Trailing zero bits of a node ID, not counting the version byte.
+
+  A transcription of `NodeID.Difficulty()`: the scan starts one byte in from
+  the end and credits a full byte for the version byte it skipped, so the
+  smallest value it can return is 8. The published satellites sit between 30
+  and 36.
+
+  An ID whose first 31 bytes are all zero has no difficulty to report and
+  throws, as Storj's does — it is not a real identity, and answering 256 would
+  make it look like the strongest one ever generated."
+  [id]
+  (let [v (b/->ints id)]
+    (when-not (= id-length (count v))
+      (fail "a node ID is 32 bytes" {:length (count v)}))
+    (loop [i 2]
+      (if (> i id-length)
+        (fail "no difficulty: every byte before the version byte is zero"
+              {:id (b/hex v)})
+        (let [byte (nth v (- id-length i))]
+          (if (zero? byte)
+            (recur (inc i))
+            (+ (* 8 (dec i)) (trailing-zeros byte))))))))
+
+(defn meets-difficulty?
+  "Whether `id` was minted with at least `minimum` bits of work.
+
+  The minimum is a satellite's policy, not a property of the format, so it is
+  a parameter here rather than a constant. A node whose ID is below the
+  satellite's threshold is refused at check-in."
+  [id minimum]
+  (>= (difficulty id) minimum))

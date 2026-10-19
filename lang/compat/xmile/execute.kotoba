@@ -1,0 +1,448 @@
+(ns xmile.execute
+  "A pure fixed-step simulator for xmile.model stock-and-flow models: Euler
+  or classical RK4 integration of the stock ODE system defined by the
+  model's flow/aux network (sec 3.1, 3.7.1). Assumes the model has already
+  passed xmile.validate/validate with no :error problems -- a model with
+  algebraic loops or dangling refs will throw here rather than silently
+  produce wrong numbers.
+
+  Scope (see README Follow-ups for the v2 list): scalar (non-array) stocks
+  of :xmile/stock-type :stock only -- conveyor/queue transport is not
+  simulated. Only :xmile/method :euler/:rk4 are implemented. Sec 3.5.3
+  DELAY1/DELAY3/SMTH1/SMTH3/TREND ARE implemented, via `desugar-delays`
+  below (`run` calls it once up front) -- see that function's docstring for
+  the exact construction and spec/Vensim citations."
+  (:require [clojure.set :as set]
+            [clojure.string :as str]
+            [xmile.model :as m]
+            [xmile.expr :as expr]))
+
+(defn- m-round [x] )
+
+;; --- dependency ordering among flow/aux (same construction as
+;;     xmile.validate/non-stock-deps, kept local and cycle-fatal here) ---
+
+(defn- non-stock-names [model]
+  (into #{} (map :xmile/name (concat (m/flows model) (m/auxs model)))))
+
+(defn- parsed-eqn
+  "`:xmile/eqn` is normally a raw XMILE equation string (xmile.model's
+  invariant) -- but a hidden variable synthesized by `desugar-delays` below
+  carries an already-parsed expr TREE instead (an execute-internal-only
+  representation; never true of a model built via xmile.model's own
+  builders, and never returned to callers). Accept either, parsing lazily
+  only for the string case."
+  [v]
+  (let [eqn (:xmile/eqn v)]
+    (if (string? eqn) (expr/parse eqn) eqn)))
+
+(defn- deps-of [nsn v]
+  (set/intersection nsn (expr/free-vars (parsed-eqn v))))
+
+(defn topo-order
+  "Names of all :flow/:aux variables, dependency-first. Throws if the
+  flow/aux subgraph has a cycle (an illegal algebraic loop -- xmile.validate
+  should have already caught this; execute never guesses an order)."
+  [model]
+  (let [nsn (non-stock-names model)
+        deps (into {} (for [v (concat (m/flows model) (m/auxs model))]
+                         [(:xmile/name v) (deps-of nsn v)]))
+        order (atom [])
+        color (atom {})]
+    (letfn [(visit [n]
+              (case (get @color n :white)
+                :black nil
+                :gray (throw (ex-info "xmile.execute: algebraic loop" {:at n}))
+                :white (do (swap! color assoc n :gray)
+                           (doseq [d (get deps n)] (visit d))
+                           (swap! color assoc n :black)
+                           (swap! order conj n))))]
+      (doseq [n (keys deps)] (visit n))
+      @order)))
+
+;; --- per-step evaluation ---
+
+(defn- clamp-non-negative [v value] (if (:xmile/non-negative? v) (max 0.0 value) value))
+
+(defn eval-non-stocks
+  "{name -> value} for every :flow/:aux, evaluated in dependency order
+  `order`, given current `stock-vals` ({name -> value}), sim time `t`, and
+  step size `dt`. `extra-env` merges in on top of TIME/DT (reserved for
+  future host-injected values; unused in v1)."
+  ([model order stock-vals t dt] (eval-non-stocks model order stock-vals t dt {}))
+  ([model order stock-vals t dt extra-env]
+   (reduce
+    (fn [env nm]
+      (let [v (m/lookup model nm)
+            raw (expr/eval-expr (parsed-eqn v) env)
+            val (clamp-non-negative v raw)]
+        (assoc env nm val)))
+    (merge {"TIME" t "DT" dt} extra-env stock-vals)
+    order)))
+
+(defn derivatives
+  "{stock-name -> d(stock)/dt} at (t, stock-vals): sum of inflow values
+  minus sum of outflow values, each already flow-non-negative-clamped by
+  eval-non-stocks. `extra-env` is passed straight through (see `run`, which
+  uses it to carry the once-per-run constant sub-environment)."
+  ([model order stock-vals t dt] (derivatives model order stock-vals t dt {}))
+  ([model order stock-vals t dt extra-env]
+   (let [env (eval-non-stocks model order stock-vals t dt extra-env)]
+     (into {}
+           (for [s (m/stocks model)]
+             [(:xmile/name s)
+              (- (reduce + 0.0 (map #(get env %) (:xmile/inflows s)))
+                 (reduce + 0.0 (map #(get env %) (:xmile/outflows s))))])))))
+
+;; --- constant sub-environment (sec 3.1.3 "converters" that are parameters) ---
+;;
+;; Real XMILE models declare every model parameter as an <aux> with a literal
+;; equation -- that is how Stella/Vensim surface a slider -- so a mid-size model
+;; is mostly constants: 87 of the 177 variables in the money/power/status model
+;; that motivated this. Re-deriving them inside `eval-non-stocks` costs one
+;; evaluation per variable per RK4 sub-step (4 per step), which is pure waste:
+;; their value cannot change during a run. `run` evaluates them once and passes
+;; the result down as `extra-env`.
+
+(defn- call-free-and-ref-in?
+  "True when `e` names no identifier outside `known` and contains no call.
+  Both exclusions are load-bearing and neither is conservatism for its own sake:
+  TIME/DT are ordinary :ref nodes (xmile.expr/free-vars filters them out of its
+  result, but the evaluator still resolves them from env), and the sec 3.5.4
+  test-input built-ins PULSE/STEP/RAMP read TIME out of `env` without taking it
+  as an argument -- so a tree holding either is time-varying even though it
+  mentions no variable."
+  [e known]
+  (case (first e)
+    :num  true
+    :ref  (contains? known (second e))
+    :call false
+    (every? #(call-free-and-ref-in? % known) (rest e))))
+
+(defn constant-names
+  "The subset of `order` (which is already dependency-first) whose value is
+  fixed for the whole run: a variable-free literal, or an expression over
+  variables that are themselves in that subset. Stocks are never included --
+  they are not in `order` -- so anything reading a stock falls out, and so
+  does anything reading TIME/DT or calling a built-in."
+  [model order]
+  (reduce (fn [known nm]
+            (cond-> known
+              (call-free-and-ref-in? (parsed-eqn (m/lookup model nm)) known)
+              (conj nm)))
+          #{}
+          order))
+
+(defn constant-env
+  "{name -> value} for `names`, evaluated once. `order` supplies the
+  dependency-first sequence; a constant may read another constant."
+  [model order names]
+  (reduce (fn [env nm]
+            (let [v (m/lookup model nm)]
+              (assoc env nm (clamp-non-negative v (expr/eval-expr (parsed-eqn v) env)))))
+          {}
+          (filter names order)))
+
+;; --- sec 3.5.3 DELAY1/DELAY3/SMTH1/SMTH3/TREND, via hidden-stock desugaring ---
+;;
+;; The OASIS XMILE v1.0 spec HTML text for sec 3.5.3 gives argument lists
+;; and default-initial-value semantics for these built-ins but -- verified
+;; by fetching the actual spec text -- no explicit differential equation;
+;; real tools (Stella, Vensim) all implement them as hidden stocks
+;; internally. The exact construction below is verified against the Vensim
+;; Reference Manual's "equivalent equations" for each function:
+;;   DELAY1 / DELAY1I  -- https://vensim.com/documentation/fn_delay1.html
+;;     LV = INTEG(input - DELAY1, initial*delay_time), DELAY1 = LV/delay_time
+;;   DELAY3 / DELAY3I  -- https://www.vensim.com/documentation/fn_delay3.html
+;;     3 stages of the DELAY1 shape chained, each with delay_time/3, all 3
+;;     stages sharing the SAME initial condition (steady-state consistent).
+;;   SMOOTH3 / SMOOTH3I (XMILE's SMTH3) --
+;;     https://vensim.com/documentation/fn_smooth3.html -- same 3-stage
+;;     construction as DELAY3 but directly in output units (no LV/delay_time
+;;     rescaling needed).
+;;   TREND -- https://vensim.com/documentation/fn_trend.html
+;;     avval = INTEG((input-avval)/average_time, input/(1+ini*average_time))
+;;     TREND = (input-avval)/(average_time*avval)
+;;
+;; Vensim's DELAY1/DELAY3 track a material-in-transit level LV = H*delay_time
+;; (so LV's own INTEG is in "amount-in-the-pipe" units, useful for materal
+;; conveyance); H below is that same LV rescaled by delay_time, i.e.
+;; H = LV/delay_time, directly in the output's own units. Since
+;; d(LV)/dt = input - DELAY1 = input - H and H = LV/delay_time,
+;; d(H)/dt = (1/delay_time) d(LV)/dt = (input-H)/delay_time -- algebraically
+;; identical dynamics to Vensim's, just carried directly in output units
+;; (simpler here since xmile.execute only ever needs the ratio H, never LV
+;; itself). SMTH1's hidden stock is that exact same construction (SMTH1 and
+;; DELAY1 are structurally identical -- only the conventional SD-modeling
+;; use/naming differs, not the math): dH/dt = (input-H)/smoothing_time.
+;;
+;; DELAY3/SMTH3's 3 stages all sharing ONE shared initial condition (rather
+;; than e.g. stages 2/3 starting at 0) is exactly Vensim's own construction
+;; (LV1/LV2's initial conditions are literally "= LV3" in the Vensim
+;; equations, i.e. all 3 stages start at the same value as the overall
+;; initial/DELAY3 value) -- this is what makes the whole chain already in
+;; steady state at t=start if `input` has been at its initial value forever
+;; before the simulation starts, rather than showing a spurious startup
+;; transient.
+;;
+;; TREND's default `initial-trend` is 0 per spec (sec 3.5.3); its hidden
+;; smoothed-level stock's initial value is solved BACKWARDS from that
+;; initial trend and input(t=start) via Vensim's own formula above, so that
+;; evaluating the TREND expression at t=start reproduces the given
+;; initial-trend exactly (verified algebraically: Level0*(1+g*T) = input0 =>
+;; (input0-Level0)/(T*Level0) = g).
+
+(defn- assert-call-arity!
+  [fn-name args]
+  (when-not (contains? #{2 3} (count args))
+    (throw (ex-info (str "xmile.execute: " fn-name
+                          " takes 2 or 3 arguments (input, delay/smoothing/averaging-time[, initial]), got "
+                          (count args))
+                     {:fn fn-name :args args}))))
+
+(defn- rewrite-tree
+  "Recursively rewrite expr tree `e`, replacing every nested DELAY1/DELAY3/
+  SMTH1/SMTH3/TREND :call with a :ref to a freshly-created hidden variable
+  (via `register!`, a fn of [fn-name desugared-arg-trees] -> replacement
+  tree node, responsible for actually building + collecting the hidden
+  stock/flow/aux var maps the call needs -- see `desugar-delays`). Bottom-up:
+  a call's own arguments are rewritten first, so e.g. DELAY1 nested inside
+  another DELAY1's input works (the inner call becomes a :ref before the
+  outer call ever sees it)."
+  [e register!]
+  (case (first e)
+    (:num :ref) e
+    (:neg :not) [(first e) (rewrite-tree (nth e 1) register!)]
+    (:add :sub :mul :div :mod :pow :lt :le :gt :ge :eq :ne :and :or)
+    [(first e) (rewrite-tree (nth e 1) register!) (rewrite-tree (nth e 2) register!)]
+    :if [:if (rewrite-tree (nth e 1) register!) (rewrite-tree (nth e 2) register!)
+         (rewrite-tree (nth e 3) register!)]
+    :call (let [fn-name (second e)
+                args (mapv #(rewrite-tree % register!) (nth e 2))]
+            (if (contains? expr/hidden-stock-builtins fn-name)
+              (register! fn-name args)
+              [:call fn-name args]))
+    (throw (ex-info "xmile.execute: unknown expr node" {:expr e}))))
+
+(defn desugar-delays
+  "Rewrite `model` so every sec 3.5.3 DELAY1/DELAY3/SMTH1/SMTH3/TREND call
+  anywhere in ANY variable's equation (however deeply nested) is replaced
+  by a reference to one or more freshly-added HIDDEN stock/flow/aux
+  variables that implement it (see the big comment above this function for
+  the exact construction + spec/Vensim citations). Returns
+  `{:xmile/model model' :xmile/hidden-names #{...}}`: `model'` is a new
+  model value with the hidden variables added and every variable's
+  `:xmile/eqn` replaced by its (possibly-unchanged) rewritten expr TREE --
+  the input `model` itself is not mutated (plain Clojure data). Called once,
+  up front, by `run`; `hidden-names` lets `run` exclude the synthetic
+  variables from the public `:xmile/series` it returns.
+
+  Only the CALL SITE's textual/tree shape changes -- the original model's
+  own variables keep their own names and kind; only brand-new synthetic
+  names (`__delay1_<n>`, `__delay3_<n>_1/_2/_3`, `__smth1_<n>`,
+  `__smth3_<n>_1/_2/_3`, `__trend_<n>` + `__trend_<n>_level`, plus each
+  hidden stock's own driving flow named `<stock>_flow`) are added. Throws
+  (rather than silently colliding) if a generated hidden name somehow
+  already names a variable in `model` -- vanishingly unlikely given the
+  `__`-prefixed convention, but checked defensively.
+
+  DELAY1(input, delay-time[, initial]) / SMTH1(input, smoothing-time[, initial]):
+  H(0) = initial or, if omitted, `input` evaluated at t=start; dH/dt =
+  (input-H)/time; the call site becomes a :ref to H.
+  DELAY3/SMTH3: as above but 3 stages in series, each with time/3, all 3
+  sharing the same initial condition; the call site becomes a :ref to the
+  3rd (last) stage.
+  TREND(input, average-time[, initial-trend]): a hidden Level stock per
+  the Vensim formula above; the call site becomes a :ref to a hidden AUX
+  computing (input-Level)/(average-time*Level) each step, ZIDZ-guarded
+  (0.0 if the denominator is exactly 0, matching Vensim's own
+  `TREND=ZIDZ(input-avval,average_time*ABS(avval))`) -- Level legitimately
+  starts at/near 0 whenever `input` itself starts at 0 (a common case, e.g.
+  TREND of a STEP/RAMP test input), and JVM Clojure's `/` throws
+  ArithmeticException on an exact-zero divisor rather than producing
+  IEEE-754 Infinity/NaN (verified directly: `clojure.lang.Numbers/divide`
+  special-cases isZero before dividing) -- without the guard this would
+  crash, not just numerically misbehave. Away from an EXACT zero
+  denominator, no epsilon-guard is applied (same as Vensim's own
+  documented caveat: TREND only makes sense for inputs that stay
+  meaningfully away from zero -- near-zero, not exactly-zero, denominators
+  can still legitimately blow up to a very large value).
+
+  A DELAY1/etc.'s default (omitted) `initial`/`initial-trend` is resolved by
+  evaluating its `input` (or the TREND initial-value formula) at t=start via
+  the SAME restricted stock-only-dependency pass `xmile.execute/initial-stocks`
+  already uses for every ordinary stock's own initial-value equation (sec
+  3.1.1) -- i.e. it must reduce to other stocks/constants/TIME/DT-based test
+  inputs (PULSE/STEP/RAMP), not to a :flow/:aux. If it doesn't,
+  `initial-stocks` throws the same `xmile.expr: unknown identifier` an
+  ordinary stock referencing a flow/aux in ITS OWN initial-value equation
+  would already throw (a pre-existing v1 limitation, not one introduced
+  here) -- supply an explicit `initial`/`initial-trend` argument in that
+  case."
+  [model]
+  (let [counter (atom 0)
+        hidden (atom [])
+        known-names (atom (m/variable-names model))
+        add! (fn [v]
+               (let [nm (:xmile/name v)]
+                 (when (contains? @known-names nm)
+                   (throw (ex-info (str "xmile.execute: hidden-stock name collision: " nm)
+                                    {:name nm})))
+                 (swap! known-names conj nm)
+                 (swap! hidden conj v)))
+        register!
+        (fn [fn-name args]
+          (assert-call-arity! fn-name args)
+          (let [id (swap! counter inc)]
+            (case fn-name
+              ("DELAY1" "SMTH1")
+              (let [[input time-arg init-arg] args
+                    nm (str "__" (str/lower-case fn-name) "_" id)
+                    flow-nm (str nm "_flow")
+                    init-tree (or init-arg input)]
+                (add! (m/stock nm init-tree {:xmile/inflows #{flow-nm}}))
+                (add! (m/flow flow-nm [:div [:sub input [:ref nm]] time-arg]))
+                [:ref nm])
+
+              ("DELAY3" "SMTH3")
+              (let [[input time-arg init-arg] args
+                    base (str "__" (str/lower-case fn-name) "_" id)
+                    dl [:div time-arg [:num 3.0]]
+                    init-tree (or init-arg input)
+                    s1 (str base "_1") s2 (str base "_2") s3 (str base "_3")
+                    f1 (str s1 "_flow") f2 (str s2 "_flow") f3 (str s3 "_flow")]
+                (add! (m/stock s1 init-tree {:xmile/inflows #{f1}}))
+                (add! (m/flow f1 [:div [:sub input [:ref s1]] dl]))
+                (add! (m/stock s2 init-tree {:xmile/inflows #{f2}}))
+                (add! (m/flow f2 [:div [:sub [:ref s1] [:ref s2]] dl]))
+                (add! (m/stock s3 init-tree {:xmile/inflows #{f3}}))
+                (add! (m/flow f3 [:div [:sub [:ref s2] [:ref s3]] dl]))
+                [:ref s3])
+
+              "TREND"
+              (let [[input avg-time init-trend] args
+                    init-trend (or init-trend [:num 0.0])
+                    base (str "__trend_" id)
+                    level-nm (str base "_level") level-flow (str level-nm "_flow")
+                    level-init [:div input [:add [:num 1.0] [:mul init-trend avg-time]]]
+                    numer [:sub input [:ref level-nm]]
+                    denom [:mul avg-time [:ref level-nm]]]
+                (add! (m/stock level-nm level-init {:xmile/inflows #{level-flow}}))
+                (add! (m/flow level-flow [:div [:sub input [:ref level-nm]] avg-time]))
+                ;; ZIDZ (zero-if-divide-by-zero), same as Vensim's own TREND=ZIDZ(input-avval,
+                ;; average_time*ABS(avval)): Level legitimately starts at/near 0 whenever `input`
+                ;; itself starts at 0 (e.g. TREND of a STEP/RAMP test input, or of any variable at
+                ;; rest before a model "wakes up") -- built with :if/:eq rather than a new expr node
+                ;; kind so every existing tree-walker (free-vars/called-fns/rewrite-tree/...)
+                ;; already handles it correctly with no further changes.
+                (add! (m/aux base [:if [:eq denom [:num 0.0]] [:num 0.0] [:div numer denom]]))
+                [:ref base]))))
+        model' (reduce
+                (fn [acc v]
+                  (let [tree (rewrite-tree (expr/parse (:xmile/eqn v)) register!)]
+                    (m/add-variable acc (assoc v :xmile/eqn tree))))
+                model
+                (m/variables model))
+        model'' (reduce m/add-variable model' @hidden)]
+    {:xmile/model model'' :xmile/hidden-names (into #{} (map :xmile/name @hidden))}))
+
+;; --- initial stock values (sec 3.1.1: a stock's <eqn> is its initial value) ---
+
+(defn initial-stocks
+  "{stock-name -> initial value}, evaluating each stock's :xmile/eqn once at
+  t = sim-specs :xmile/start, in dependency order among stocks themselves
+  (a stock's initial-value equation may reference another stock's initial
+  value or a constant, but not a flow/aux -- flows aren't meaningfully
+  defined before stocks exist)."
+  [model]
+  (let [ss (:xmile/sim-specs model)
+        t (:xmile/start ss) dt (:xmile/dt ss 1.0)
+        stock-names (into #{} (map :xmile/name (m/stocks model)))
+        deps (into {} (for [s (m/stocks model)]
+                        [(:xmile/name s) (set/intersection stock-names (expr/free-vars (parsed-eqn s)))]))
+        order (atom []) color (atom {})]
+    (letfn [(visit [n]
+              (case (get @color n :white)
+                :black nil
+                :gray (throw (ex-info "xmile.execute: cyclic stock initial values" {:at n}))
+                :white (do (swap! color assoc n :gray)
+                           (doseq [d (get deps n)] (visit d))
+                           (swap! color assoc n :black)
+                           (swap! order conj n))))]
+      (doseq [n (keys deps)] (visit n)))
+    (reduce (fn [env nm]
+              (let [s (m/lookup model nm)
+                    raw (expr/eval-expr (parsed-eqn s) (merge {"TIME" t "DT" dt} env))]
+                (assoc env nm (clamp-non-negative s raw))))
+            {}
+            @order)))
+
+;; --- integration ---
+
+(defn- vec+ [a b scale] (into {} (for [[k v] a] [k (+ v (* scale (get b k 0.0)))])))
+
+(defn- euler-step [model order stock-vals t dt cenv]
+  (let [d (derivatives model order stock-vals t dt cenv)]
+    (vec+ stock-vals d dt)))
+
+(defn- rk4-step [model order stock-vals t dt cenv]
+  (let [k1 (derivatives model order stock-vals t dt cenv)
+        y2 (vec+ stock-vals k1 (/ dt 2.0))
+        k2 (derivatives model order y2 (+ t (/ dt 2.0)) dt cenv)
+        y3 (vec+ stock-vals k2 (/ dt 2.0))
+        k3 (derivatives model order y3 (+ t (/ dt 2.0)) dt cenv)
+        y4 (vec+ stock-vals k3 dt)
+        k4 (derivatives model order y4 (+ t dt) dt cenv)]
+    (into {} (for [[nm y] stock-vals]
+               [nm (+ y (* (/ dt 6.0)
+                           (+ (get k1 nm 0.0) (* 2 (get k2 nm 0.0))
+                              (* 2 (get k3 nm 0.0)) (get k4 nm 0.0))))]))))
+
+(defn- clamp-stocks [model stock-vals]
+  (into {} (for [[nm v] stock-vals] [nm (clamp-non-negative (m/lookup model nm) v)])))
+
+(defn- assert-executable! [model]
+  (doseq [s (m/stocks model)]
+    (when (m/special-stock? s)
+      (throw (ex-info (str "xmile.execute: " (:xmile/name s) " is a "
+                            (name (:xmile/stock-type s)) " stock -- not yet simulated")
+                       {:stock (:xmile/name s)}))))
+  (doseq [v (m/variables model)]
+    (when (m/dimensioned? v)
+      (throw (ex-info (str "xmile.execute: " (:xmile/name v) " is array-dimensioned -- not yet simulated")
+                       {:variable (:xmile/name v)}))))
+  (let [method (get-in model [:xmile/sim-specs :xmile/method] :euler)]
+    (when-not (contains? #{:euler :rk4} method)
+      (throw (ex-info (str "xmile.execute: unsupported :xmile/method " method) {:method method})))))
+
+(defn run
+  "Simulate `model` from :xmile/start to :xmile/stop by :xmile/dt.
+  Returns {:xmile/times [t0 t1 ...] :xmile/series {name -> [v0 v1 ...]}}
+  covering every stock/flow/aux `model` itself declares, one row per
+  recorded time (inclusive of both endpoints) -- this includes DELAY1/
+  DELAY3/SMTH1/SMTH3/TREND call sites (under their OWN variable's name,
+  same as any other aux/flow), via `desugar-delays` below, but never the
+  hidden synthetic stock/flow/aux variables that internally implement them."
+  [model]
+  (assert-executable! model)
+  (let [{desugared :xmile/model} (desugar-delays model)
+        ss (:xmile/sim-specs desugared)
+        start (:xmile/start ss) stop (:xmile/stop ss) dt (:xmile/dt ss 1.0)
+        method (:xmile/method ss :euler)
+        order (topo-order desugared)
+        cnames (constant-names desugared order)
+        cenv (constant-env desugared order cnames)
+        dyn-order (vec (remove cnames order))
+        n (long (m-round (/ (- stop start) dt)))
+        var-names (m/variable-names model)
+        step-fn (case method :euler euler-step :rk4 rk4-step)]
+    (loop [i 0 stock-vals (initial-stocks desugared) times [] rows []]
+      (let [t (+ start (* i dt))
+            env (eval-non-stocks desugared dyn-order stock-vals t dt cenv)]
+        (if (= i n)
+          {:xmile/times (conj times t)
+           :xmile/series (into {}
+                                (for [nm var-names]
+                                  [nm (mapv #(get % nm) (conj rows env))]))}
+          (let [next-vals (clamp-stocks desugared (step-fn desugared dyn-order stock-vals t dt cenv))]
+            (recur (inc i) next-vals (conj times t) (conj rows env))))))))

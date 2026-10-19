@@ -1,0 +1,499 @@
+(ns kotobase.datomic.client
+  "Public surface matching `datomic.client.api` over Kotobase.
+
+  Call sites can treat this namespace as a drop-in for
+  `datomic.client.api`: same var names, same arg-map shapes, same
+  return maps (`:db-before` / `:db-after` / `:tempids`, datoms as
+  `{:e :a :v :tx :added}`).
+
+  ## Server types
+
+  * `:kotobase-local` / `:dev-local` — in-process engine (memory or
+    injected storage). Used by unit tests and embedded hosts.
+  * `:kotobase` — HTTP client against a Worker that speaks the Client
+    API paths under `/api/*` (EDN). **Not** XRPC. Content-Type is
+    `application/edn`. Auth is `Authorization: CACAO …` or
+    `Authorization: Bearer <token>` for read-only session paths.
+
+  ## Honest boundary
+
+  This is **API compatibility** with the published Client API, not a
+  claim that Cognitect's proprietary Cloud wire (AWS SigV4 + private
+  Transit envelopes) is reverse-engineered. Point
+  `com.datomic/client-cloud` at Kotobase only after a captured golden
+  protocol is implemented; until then require this namespace (or an
+  alias) instead of `datomic.client.api`.
+
+  See ADR-2607265000 (grammar) and ADR-2607279000 (client API maturity)."
+  (:refer-clojure :exclude [sync])
+  (:require 
+            [clojure.string :as str]
+            [kotobase.datomic :as d]
+            [kotobase.engine :as engine]
+            [kotobase.storage.memory :as memory]))
+
+;; ---------------------------------------------------------------------------
+;; Anomalies (cognitect.anomalies-shaped)
+;; ---------------------------------------------------------------------------
+
+(defn- anomaly!
+  ([category message]
+   (anomaly! category message nil))
+  ([category message data]
+   (throw
+    (ex-info message
+             (merge {:cognitect.anomalies/category category
+                     :cognitect.anomalies/message message}
+                    data)))))
+
+(defn- incorrect!
+  ([message] (incorrect! message nil))
+  ([message data]
+   (anomaly! :cognitect.anomalies/incorrect message data)))
+
+(defn- unsupported!
+  ([message] (unsupported! message nil))
+  ([message data]
+   (anomaly! :cognitect.anomalies/unsupported message data)))
+
+;; ---------------------------------------------------------------------------
+;; Value / datom adaptation (engine wire → Client API)
+;; ---------------------------------------------------------------------------
+
+(defn- decode-attr [a]
+  (cond
+    (keyword? a) a
+    (string? a)
+    (try
+      (let [v (edn/read-string a)]
+        (if (keyword? v)
+          v
+          (keyword (if (str/starts-with? a ":") (subs a 1) a))))
+      (catch  _
+        (keyword (if (str/starts-with? a ":") (subs a 1) a))))
+    :else a))
+
+(defn- decode-value [v]
+  (cond
+    (nil? v) nil
+    (string? v)
+    (try
+      (edn/read-string v)
+      (catch  _ v))
+    :else v))
+
+(defn client-datom
+  "Normalize an engine datom row to Client API `{:e :a :v :tx :added}`."
+  [{:keys [e a v v_edn tx t added] :as row}]
+  (let [value (if (contains? row :v) v (decode-value v_edn))
+        attr (decode-attr a)
+        tx-id (or tx t 0)
+        added? (if (nil? added) true added)]
+    {:e e :a attr :v value :tx tx-id :added added?}))
+
+(defn- client-datoms [rows]
+  (mapv client-datom rows))
+
+(defn- keywordize-pull [value]
+  (cond
+    (map? value)
+    (into {}
+          (map (fn [[k v]]
+                 [(if (string? k)
+                    (try
+                      (edn/read-string k)
+                      (catch  _
+                        (keyword (if (str/starts-with? k ":")
+                                   (subs k 1)
+                                   k))))
+                    k)
+                  (keywordize-pull v)]))
+          value)
+    (vector? value) (mapv keywordize-pull value)
+    ;; Engine stores attribute values as sets. Client API pull returns a
+    ;; bare scalar for the common single-value case (cardinality-one).
+    (set? value)
+    (let [xs (into #{} (map keywordize-pull) value)]
+      (if (= 1 (count xs)) (first xs) xs))
+    :else value))
+
+(defn- apply-window [xs {:keys [offset limit]}]
+  (let [offset (or offset 0)
+        xs (if (pos? offset) (drop offset xs) xs)
+        limit (or limit -1)]
+    (if (and (number? limit) (not= -1 limit) (not (neg? limit)))
+      (vec (take limit xs))
+      (vec xs))))
+
+;; ---------------------------------------------------------------------------
+;; Local client / connection / db handles
+;; ---------------------------------------------------------------------------
+
+(defn- open-database [storage]
+  (engine/open
+   {:storage storage
+    :encrypt-fn identity
+    :decrypt-fn identity
+    :blind-fn pr-str
+    :visible? (constantly true)}))
+
+(defrecord LocalClient [system storage dbs])
+(defrecord LocalConnection [client db-name database])
+(defrecord LocalDb [connection database t as-of-t since-t history?])
+
+(defn- ensure-local-client! [client]
+  (when-not (instance? LocalClient client)
+    (incorrect! "Expected a Kotobase local client"
+                {:client (type client)})))
+
+(defn- ensure-connection! [conn]
+  (when-not (instance? LocalConnection conn)
+    (incorrect! "Expected a Kotobase connection"
+                {:conn (type conn)})))
+
+(defn- unwrap-db [db]
+  (if (instance? LocalDb db)
+    (:database db)
+    db))
+
+(defn- wrap-db [connection database]
+  (let [t (try
+            (d/basis-t database)
+            (catch  _ nil))]
+    (->LocalDb connection database t nil nil false)))
+
+;; ---------------------------------------------------------------------------
+;; Lifecycle — client / connect / databases
+;; ---------------------------------------------------------------------------
+
+(defn client
+  "Create a client. Does not communicate with a server for local types.
+
+  arg-map:
+    :server-type   :kotobase-local | :dev-local | :kotobase
+    :system        system name (local registry key)
+    :storage       optional IBlockStore+IRefStore (local only)
+    :endpoint      base URL for :kotobase HTTP
+    :access-key    optional access key (HTTP)
+    :secret        optional secret (HTTP)
+    :token         optional CACAO / bearer token supplier (fn or string)"
+  [arg-map]
+  (when-not (map? arg-map)
+    (incorrect! "client requires an arg-map"))
+  (let [server-type (:server-type arg-map)]
+    (case server-type
+      (:kotobase-local :dev-local)
+      (->LocalClient
+       (or (:system arg-map) "kotobase")
+       (or (:storage arg-map) (memory/memory-store))
+       (atom {}))
+
+      :kotobase
+      (do
+        (when-not (string? (:endpoint arg-map))
+          (incorrect! ":kotobase client requires :endpoint"))
+        (assoc arg-map ::remote true))
+
+      (incorrect! (str "Unsupported :server-type " server-type)
+                  {:server-type server-type
+                   :supported #{:kotobase-local :dev-local :kotobase}}))))
+
+(defn create-database
+  "Creates a database named by `:db-name`. Returns true."
+  [client arg-map]
+  (when-not (map? arg-map)
+    (incorrect! "create-database requires an arg-map with :db-name"))
+  (let [db-name (:db-name arg-map)]
+    (when-not (and (string? db-name) (seq db-name))
+      (incorrect! ":db-name must be a non-empty string"))
+    (if (::remote client)
+      (unsupported! "Use remote HTTP /api/create-database for :kotobase clients")
+      (do
+        (ensure-local-client! client)
+        (let [dbs (:dbs client)]
+          (when (contains? @dbs db-name)
+            (incorrect! (str "Database already exists: " db-name)
+                        {:db-name db-name}))
+          (swap! dbs assoc db-name (open-database (:storage client)))
+          true)))))
+
+(defn delete-database
+  "Tombstones a database name in the local registry. Returns true."
+  [client arg-map]
+  (when-not (map? arg-map)
+    (incorrect! "delete-database requires an arg-map with :db-name"))
+  (let [db-name (:db-name arg-map)]
+    (ensure-local-client! client)
+    (swap! (:dbs client) dissoc db-name)
+    true))
+
+(defn list-databases
+  "Returns a collection of database names."
+  [client _arg-map]
+  (ensure-local-client! client)
+  (vec (sort (keys @(:dbs client)))))
+
+(defn connect
+  "Connects to `:db-name`. Auto-creates the local database if missing."
+  [client arg-map]
+  (when-not (map? arg-map)
+    (incorrect! "connect requires an arg-map with :db-name"))
+  (let [db-name (:db-name arg-map)]
+    (when-not (and (string? db-name) (seq db-name))
+      (incorrect! ":db-name must be a non-empty string"))
+    (ensure-local-client! client)
+    (let [dbs (:dbs client)
+          database (or (get @dbs db-name)
+                       (let [opened (open-database (:storage client))]
+                         (swap! dbs assoc db-name opened)
+                         opened))]
+      (->LocalConnection client db-name database))))
+
+;; ---------------------------------------------------------------------------
+;; Database values
+;; ---------------------------------------------------------------------------
+
+(defn db
+  "Returns the current database value for a connection."
+  [conn]
+  (ensure-connection! conn)
+  (wrap-db conn (d/db (:database conn))))
+
+(defn as-of
+  "Returns the value of the database as of time-point."
+  [db time-point]
+  (let [connection (:connection db)
+        base (unwrap-db db)
+        filtered (d/as-of base time-point)]
+    (->LocalDb connection filtered (or time-point (:t db)) time-point nil false)))
+
+(defn since
+  "Returns the value of the database since time-point."
+  [db time-point]
+  (let [connection (:connection db)
+        base (unwrap-db db)
+        filtered (d/since base time-point)]
+    (->LocalDb connection filtered (:t db) nil time-point false)))
+
+(defn history
+  "Returns a history database value."
+  [db]
+  (let [connection (:connection db)
+        base (unwrap-db db)
+        filtered (d/history base)]
+    (->LocalDb connection filtered (:t db) nil nil true)))
+
+(defn sync
+  "Coordinate with other clients. Returns a database value with basis
+  `:t` >= t. Local implementation returns the current head."
+  [conn _t]
+  (db conn))
+
+(defn with-db
+  "Returns a with-db value suitable for passing to `with`."
+  [conn]
+  (db conn))
+
+;; ---------------------------------------------------------------------------
+;; Reads
+;; ---------------------------------------------------------------------------
+
+(defn q
+  "Client API `q`. Supports `(q arg-map)` and `(q query & args)`."
+  ([arg-map]
+   (when-not (map? arg-map)
+     (incorrect! "q arity-1 requires an arg-map with :query and :args"))
+   (let [query (:query arg-map)
+         args (or (:args arg-map) [])
+         result (apply q query args)
+         windowed
+         (if (or (:offset arg-map) (:limit arg-map))
+           (if (or (set? result) (sequential? result))
+             (let [coll (vec result)
+                   w (apply-window coll arg-map)]
+               (if (set? result) (set w) w))
+             result)
+           result)]
+     (cond
+       (:io-context arg-map)
+       {:ret windowed
+        :io-stats {:io-context (:io-context arg-map)
+                   :api :q
+                   :api-ms 0
+                   :reads {}}}
+       (:query-stats arg-map)
+       {:ret windowed :query-stats {}}
+       :else windowed)))
+  ([query & args]
+   (let [database (unwrap-db (first args))
+         inputs (rest args)]
+     (when-not database
+       (incorrect! "q requires a database as the first input"))
+     (apply d/q query database inputs))))
+
+(defn qseq
+  "Like `q`, returning a seq."
+  ([arg-map]
+   (seq (q arg-map)))
+  ([query & args]
+   (seq (apply q query args))))
+
+(defn pull
+  "Client API `pull`. Supports map and multi-arity forms."
+  ([db arg-map]
+   (when-not (map? arg-map)
+     (incorrect! "pull arity-2 map form requires :selector and :eid"))
+   (let [result (pull db (:selector arg-map) (:eid arg-map))]
+     (if (:io-context arg-map)
+       {:ret result
+        :io-stats {:io-context (:io-context arg-map)
+                   :api :pull
+                   :api-ms 0
+                   :reads {}}}
+       result)))
+  ([db selector eid]
+   (keywordize-pull (d/pull (unwrap-db db) selector eid))))
+
+(defn datoms
+  "Client API `datoms`. arg-map: `:index`, `:components`, optional window."
+  [db arg-map]
+  (when-not (map? arg-map)
+    (incorrect! "datoms requires an arg-map with :index"))
+  (let [rows (d/datoms (unwrap-db db)
+                       (cond-> {:index (:index arg-map)}
+                         (contains? arg-map :components)
+                         (assoc :components (:components arg-map))
+                         (contains? arg-map :limit)
+                         (assoc :limit (:limit arg-map))))
+        shaped (client-datoms rows)]
+    (apply-window shaped (select-keys arg-map [:offset :limit]))))
+
+(defn seek-datoms
+  "Client API `seek-datoms` (arg-map form)."
+  [db arg-map]
+  (when-not (map? arg-map)
+    (incorrect! "seek-datoms requires an arg-map with :index"))
+  (let [components (or (:components arg-map) [])
+        rows (apply d/seek-datoms (unwrap-db db) (:index arg-map) components)]
+    (apply-window (client-datoms rows) (select-keys arg-map [:offset :limit]))))
+
+(defn rseek-datoms
+  "Reverse seek. Local implementation reverses a seek-datoms result."
+  [db arg-map]
+  (vec (rseq (vec (seek-datoms db arg-map)))))
+
+(defn index-range
+  "Client API `index-range`. arg-map: `:attrid`, optional `:start`/`:end`."
+  [db arg-map]
+  (when-not (map? arg-map)
+    (incorrect! "index-range requires an arg-map with :attrid"))
+  (let [attr (:attrid arg-map)
+        start (:start arg-map)
+        end (:end arg-map)
+        rows (d/index-range (unwrap-db db) attr start end)]
+    (apply-window (client-datoms rows) (select-keys arg-map [:offset :limit]))))
+
+(defn index-pull
+  "Walks an index, pulling entities. Supports `:avet` and `:aevt`."
+  [db arg-map]
+  (when-not (map? arg-map)
+    (incorrect! "index-pull requires an arg-map"))
+  (let [index (:index arg-map)
+        selector (:selector arg-map)
+        start (or (:start arg-map) [])
+        reverse? (:reverse arg-map)
+        rows (seek-datoms db {:index index :components start})
+        rows (if reverse? (rseq (vec rows)) rows)
+        eids (case index
+               :avet (mapv :e rows)
+               :aevt (mapv :v rows)
+               (incorrect! "index-pull :index must be :avet or :aevt"
+                           {:index index}))
+        seen (atom #{})
+        unique (reduce
+                (fn [acc eid]
+                  (if (contains? @seen eid)
+                    acc
+                    (do (swap! seen conj eid)
+                        (conj acc eid))))
+                []
+                eids)]
+    (mapv #(pull db selector %) unique)))
+
+(defn db-stats
+  "Returns at least `{:datoms n}`."
+  [db]
+  (let [stats (d/db-stats (unwrap-db db))]
+    (if (map? stats) stats {:datoms stats})))
+
+(defn tx-range
+  "Client API `tx-range` on a connection."
+  [conn arg-map]
+  (ensure-connection! conn)
+  (let [start (:start arg-map)
+        end (:end arg-map)
+        txs (d/tx-range (:database conn) start end)]
+    (apply-window (vec txs) (select-keys arg-map [:offset :limit]))))
+
+;; ---------------------------------------------------------------------------
+;; Writes
+;; ---------------------------------------------------------------------------
+
+(defn- client-tx-report [report connection]
+  (let [after-raw (:db-after report)
+        before-raw (:db-before report)
+        after-db (cond
+                   (instance? LocalDb after-raw) after-raw
+                   (string? after-raw)
+                   (wrap-db connection (d/db (:database connection)))
+                   after-raw (wrap-db connection after-raw)
+                   :else (wrap-db connection (d/db (:database connection))))
+        before-db (cond
+                    (instance? LocalDb before-raw) before-raw
+                    (string? before-raw)
+                    (wrap-db connection
+                             (d/as-of (d/db (:database connection)) before-raw))
+                    before-raw (wrap-db connection before-raw)
+                    :else (wrap-db connection (d/db (:database connection))))]
+    {:db-before before-db
+     :db-after after-db
+     :tx-data (or (:tx-data report) [])
+     :tempids (or (:tempids report) {})}))
+
+(defn transact
+  "Client API `transact`. arg-map requires `:tx-data`."
+  [conn arg-map]
+  (ensure-connection! conn)
+  (when-not (map? arg-map)
+    (incorrect! "transact requires an arg-map with :tx-data"))
+  (when-not (contains? arg-map :tx-data)
+    (incorrect! "transact requires :tx-data"))
+  (let [report (d/transact (:database conn) (select-keys arg-map [:tx-data]))
+        shaped (client-tx-report report conn)]
+    (if (:io-context arg-map)
+      (assoc shaped
+             :io-stats {:io-context (:io-context arg-map)
+                        :api :tx-with
+                        :api-ms 0
+                        :reads {}})
+      shaped)))
+
+(defn with
+  "Speculative transaction against a with-db value."
+  [db arg-map]
+  (when-not (map? arg-map)
+    (incorrect! "with requires an arg-map with :tx-data"))
+  (let [report (d/with (unwrap-db db) (select-keys arg-map [:tx-data]))
+        connection (:connection db)]
+    (client-tx-report
+     (assoc report
+            :db-before db
+            :db-after (wrap-db connection
+                               (or (:db-after report) (unwrap-db db))))
+     connection)))
+
+(defn administer-system
+  "Cloud-only control plane. Intentionally unsupported on Kotobase."
+  [_client _arg-map]
+  (unsupported!
+   "administer-system is not part of the Kotobase Client API surface"))

@@ -1,0 +1,803 @@
+(ns kotoba.lang.http.wire
+  "HTTP/1.1 wire layer (RFC 9112) over an INJECTED byte transport.
+
+  This namespace knows nothing about TLS, sockets, or DNS. It is handed two
+  functions -- write and read -- and speaks HTTP/1.1 through them. The same
+  code therefore runs on a plaintext socket, on a TLS 1.3 record layer, or on
+  a kotoba-WASM host capability, and `http` acquires no dependency on any of
+  them. That is the same seam `kotoba.lang.http/IHttp` establishes one level
+  up; this is its first real implementation.
+
+  Two rules hold everywhere in here:
+
+  * **Errors are values, never thrown.** Every fallible entry point returns
+    `[:ok value]` or `[:error reason detail]`, where `reason` is a keyword and
+    `detail` is a map. `.kotoba` has no try/catch, so a thrown parse error
+    could never become a decision core; a returned one can.
+
+  * **Every length is attacker-controlled.** A `Content-Length`, a chunk size,
+    a header line and a header count all arrive from a stranger. Each is
+    bounded by a caller-supplied ceiling, and the parser refuses rather than
+    normalises when the framing is ambiguous -- an ambiguous frame is a
+    request-smuggling primitive, not a formatting quirk.
+
+  Bytes are represented portably as a vector of ints in 0..255 (\"octets\"),
+  so nothing here depends on a host byte-array type. Zero third-party deps."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.lang.http :as http]))
+
+;; ---------------------------------------------------------------------------
+;; result values
+;; ---------------------------------------------------------------------------
+
+(defn ok
+  "Wrap `v` as a success value."
+  [v] [:ok v])
+
+(defn err
+  "Wrap a failure as `[:error reason detail]`. `reason` is a keyword naming
+  exactly one refusal; `detail` is a map for humans and logs."
+  ([reason] [:error reason {}])
+  ([reason detail] [:error reason detail]))
+
+(defn ok? [r] (and (vector? r) (= :ok (nth r 0 nil))))
+(defn error? [r] (and (vector? r) (= :error (nth r 0 nil))))
+(defn value "Payload of an `[:ok v]`." [r] (nth r 1 nil))
+(defn reason "Reason keyword of an `[:error reason detail]`." [r] (nth r 1 nil))
+(defn detail "Detail map of an `[:error reason detail]`." [r] (nth r 2 nil))
+
+;; ---------------------------------------------------------------------------
+;; octets -- a portable byte string
+;; ---------------------------------------------------------------------------
+
+(def ^:private CR 13)
+(def ^:private LF 10)
+(def ^:private SP 32)
+(def ^:private HTAB 9)
+(def ^:private NUL 0)
+
+(defn- char-code [^String s i]
+  )
+
+(defn utf8-encode
+  "Encode a string to octets as UTF-8. Pure and portable: it walks UTF-16 code
+  units and pairs surrogates itself rather than calling a host encoder."
+  [s]
+  (let [s (str s) n (count s)]
+    (loop [i 0 out (transient [])]
+      (if (>= i n)
+        (persistent! out)
+        (let [c (char-code s i)]
+          (cond
+            (< c 0x80) (recur (inc i) (conj! out c))
+            (< c 0x800) (recur (inc i) (-> out
+                                           (conj! (bit-or 0xC0 (bit-shift-right c 6)))
+                                           (conj! (bit-or 0x80 (bit-and c 0x3F)))))
+            ;; high surrogate followed by a low surrogate -> one code point
+            (and (<= 0xD800 c 0xDBFF) (< (inc i) n)
+                 (<= 0xDC00 (char-code s (inc i)) 0xDFFF))
+            (let [lo (char-code s (inc i))
+                  cp (+ 0x10000 (bit-shift-left (- c 0xD800) 10) (- lo 0xDC00))]
+              (recur (+ i 2) (-> out
+                                 (conj! (bit-or 0xF0 (bit-shift-right cp 18)))
+                                 (conj! (bit-or 0x80 (bit-and (bit-shift-right cp 12) 0x3F)))
+                                 (conj! (bit-or 0x80 (bit-and (bit-shift-right cp 6) 0x3F)))
+                                 (conj! (bit-or 0x80 (bit-and cp 0x3F))))))
+            :else (recur (inc i) (-> out
+                                     (conj! (bit-or 0xE0 (bit-shift-right c 12)))
+                                     (conj! (bit-or 0x80 (bit-and (bit-shift-right c 6) 0x3F)))
+                                     (conj! (bit-or 0x80 (bit-and c 0x3F)))))))))))
+
+(defn latin1-encode
+  "Encode a string to octets one code unit per octet. Returns
+  `[:error :not-latin1 …]` if any code unit exceeds 0xFF -- the protocol head
+  is octets, and silently transcoding it would change what goes on the wire."
+  [s]
+  (let [s (str s) n (count s)]
+    (loop [i 0 out (transient [])]
+      (if (>= i n)
+        (ok (persistent! out))
+        (let [c (char-code s i)]
+          (if (> c 0xFF)
+            (err :not-latin1 {:index i :code c})
+            (recur (inc i) (conj! out c))))))))
+
+(defn latin1-decode
+  "Decode octets to a string one octet per code unit. Always succeeds and is
+  exactly reversible, which is what makes it the right decoding for field
+  values: it never loses a byte the sender actually sent."
+  [octets]
+  (apply str (map char octets)))
+
+(defn utf8-decode
+  "Strictly decode octets as UTF-8. Returns `[:ok string]` or
+  `[:error :invalid-utf8 …]`; it does not substitute replacement characters,
+  because a body that is not what it claims to be should be visible as such."
+  [octets]
+  (let [v (vec octets) n (count v)]
+    (loop [i 0 out []]
+      (if (>= i n)
+        (ok (apply str out))
+        (let [b (nth v i)]
+          (cond
+            (< b 0x80) (recur (inc i) (conj out (char b)))
+            (< b 0xC2) (err :invalid-utf8 {:index i :byte b})
+            :else
+            (let [len (cond (< b 0xE0) 2 (< b 0xF0) 3 (< b 0xF5) 4 :else 0)]
+              (if (or (zero? len) (> (+ i len) n))
+                (err :invalid-utf8 {:index i :byte b})
+                (let [conts (subvec v (inc i) (+ i len))]
+                  (if-not (every? #(<= 0x80 % 0xBF) conts)
+                    (err :invalid-utf8 {:index i :byte b})
+                    (let [cp (reduce (fn [acc c] (bit-or (bit-shift-left acc 6) (bit-and c 0x3F)))
+                                     (bit-and b (case len 2 0x1F 3 0x0F 0x07))
+                                     conts)]
+                      (cond
+                        (or (and (= len 3) (< cp 0x800))
+                            (and (= len 4) (< cp 0x10000))
+                            (<= 0xD800 cp 0xDFFF)
+                            (> cp 0x10FFFF))
+                        (err :invalid-utf8 {:index i :code-point cp})
+
+                        (< cp 0x10000) (recur (+ i len) (conj out (char cp)))
+                        :else
+                        (let [cp' (- cp 0x10000)]
+                          (recur (+ i len)
+                                 (conj out (char (+ 0xD800 (bit-shift-right cp' 10)))
+                                       (char (+ 0xDC00 (bit-and cp' 0x3FF)))))))))))))))))) 
+
+(defn ->octets
+  "Coerce `x` to octets. Accepts a vector/seq of ints, a string (UTF-8), and on
+  the JVM a byte-array / in ClojureScript a Uint8Array, so a host transport can
+  hand its native buffer straight in."
+  [x]
+  (cond
+    (nil? x) []
+    (string? x) (utf8-encode x)
+    
+    (vector? x) x
+    (sequential? x) (vec x)
+    :else (vec x)))
+
+(defn octets->hex
+  "Lowercase hex of octets. For digests and transcripts."
+  [octets]
+  (apply str (map (fn [b]
+                    (let [h ]
+                      (if (= 1 (count h)) (str "0" h) h)))
+                  octets)))
+
+;; ---------------------------------------------------------------------------
+;; limits -- the caller decides how much memory a stranger may spend
+;; ---------------------------------------------------------------------------
+
+(def default-limits
+  "Ceilings applied to everything a peer controls. Every one of these is
+  overridable per exchange; the defaults are a starting point, not a policy."
+  {:max-body-bytes    (* 8 1024 1024)
+   :max-line-bytes    8192
+   :max-headers       100
+   :max-chunks        10000
+   :max-informational 8
+   :max-read-calls    100000})
+
+(defn- limits-of [opts]
+  (merge default-limits (:limits opts)))
+
+;; ---------------------------------------------------------------------------
+;; token / field validation (RFC 9110 §5.1, §5.5)
+;; ---------------------------------------------------------------------------
+
+(def ^:private tchar-extra
+  ;; ! # $ % & ' * + - . ^ _ ` | ~  -- as codes, because ClojureScript's `int`
+  ;; on a character is not the JVM's: (int \!) is 0 there, which would have
+  ;; made this set #{0} and every real token name invalid on the second runtime.
+  #{33 35 36 37 38 39 42 43 45 46 94 95 96 124 126})
+
+(defn- tchar? [c]
+  (or (<= 0x30 c 0x39) (<= 0x41 c 0x5A) (<= 0x61 c 0x7A) (contains? tchar-extra c)))
+
+(defn- token? [s]
+  (and (string? s) (pos? (count s))
+       (every? tchar? (map #(char-code s %) (range (count s))))))
+
+(defn- control-injection
+  "CR, LF or NUL anywhere in a protocol element is request smuggling. Returns
+  the offending code or nil."
+  [s]
+  (first (filter #{CR LF NUL} (map #(char-code s %) (range (count s))))))
+
+(defn- valid-field-value?
+  "Field values are octets: VCHAR, SP, HTAB and obs-text (0x80-0xFF). Other
+  CTLs and DEL are refused."
+  [s]
+  (every? (fn [c] (or (= c HTAB) (<= 0x20 c 0x7E) (<= 0x80 c 0xFF)))
+          (map #(char-code s %) (range (count s)))))
+
+;; ---------------------------------------------------------------------------
+;; request serialisation (RFC 9112 §3)
+;; ---------------------------------------------------------------------------
+
+(defn- check-header [n v]
+  (let [n (str n) v (str v)]
+    (cond
+      (empty? n) (err :empty-header-name {})
+      (control-injection n) (err :header-name-contains-control
+                                 {:name n :code (control-injection n)})
+      (control-injection v) (err :header-value-contains-control
+                                 {:name n :code (control-injection v)})
+      (not (token? n)) (err :invalid-header-name {:name n})
+      (some (fn [i] (> (char-code v i) 0xFF)) (range (count v)))
+      (err :header-value-not-latin1 {:name n})
+      (not (valid-field-value? v)) (err :invalid-header-value {:name n})
+      :else (ok [n v]))))
+
+(defn- request-target
+  "`origin-form` target: path plus query, defaulting to `/`."
+  [url]
+  (let [parsed (try (http/parse-url url)
+                    (catch  _ nil))]
+    (if (nil? parsed)
+      (err :invalid-request-target {:url url})
+      (let [path (or (:path parsed) "/")
+            path (if (empty? path) "/" path)
+            target (if (:query parsed) (str path "?" (:query parsed)) path)]
+        (cond
+          (control-injection target) (err :invalid-request-target {:target target})
+          (some #(= SP (char-code target %)) (range (count target)))
+          (err :invalid-request-target {:target target})
+          :else (ok {:target target :parsed parsed}))))))
+
+(defn serialize-request
+  "Serialise a `kotoba.lang.http/request` map to octets, or refuse.
+
+  Refuses rather than emits when the request could not be sent unambiguously:
+  a header name or value carrying CR, LF or NUL is a smuggling attempt and the
+  correct answer is to never put it on the wire. `Host` is supplied from the
+  URL when absent (HTTP/1.1 requires it) and `Content-Length` from the body
+  when the caller framed neither.
+
+  Returns `[:ok octets]` or `[:error reason detail]`."
+  ([req] (serialize-request req nil))
+  ([req opts]
+   (let [lim (limits-of opts)
+         method (-> (or (:http/method req) :get) name str/upper)
+         body (->octets (:http/body req))]
+     (cond
+       (not (token? method)) (err :invalid-method {:method method})
+
+       (> (count body) (:max-body-bytes lim))
+       (err :body-too-large {:limit (:max-body-bytes lim) :length (count body)})
+
+       :else
+       (let [tr (request-target (:http/url req))]
+         (if (error? tr)
+           tr
+           (let [{:keys [target parsed]} (value tr)
+                 supplied (vec (:http/headers req))
+                 checked (reduce (fn [acc [n v]]
+                                   (if (error? acc)
+                                     acc
+                                     (let [c (check-header n v)]
+                                       (if (error? c) c (conj acc (value c))))))
+                                 [] supplied)]
+             (if (error? checked)
+               checked
+               (let [has? (fn [nm] (some #(= (str/lower (first %)) nm) checked))
+                     host (when-let [h (:host parsed)]
+                            (if (:port parsed) (str h ":" (:port parsed)) h))
+                     lines (cond-> checked
+                             (and (not (has? "host")) host) (->> (into [["Host" host]]))
+                             (and (seq body) (not (has? "content-length"))
+                                  (not (has? "transfer-encoding")))
+                             (conj ["Content-Length" (str (count body))]))]
+                 (if (and (not (has? "host")) (nil? host))
+                   (err :missing-host {:url (:http/url req)})
+                   (let [head (str method " " target " HTTP/1.1\r\n"
+                                   (apply str (map (fn [[n v]] (str n ": " v "\r\n")) lines))
+                                   "\r\n")
+                         enc (latin1-encode head)]
+                     (if (error? enc)
+                       (err :header-value-not-latin1 (detail enc))
+                       (ok (into (value enc) body))))))))))))))
+
+;; ---------------------------------------------------------------------------
+;; response parsing (RFC 9112 §4-§6) -- resumable, byte-boundary independent
+;; ---------------------------------------------------------------------------
+
+(defn recv-init
+  "Start a response parser. `opts` may carry `:method` (so a HEAD response is
+  correctly framed as bodyless) and `:limits`.
+
+  The parser is a state value: `recv-feed` and `recv-eof` are the only ways to
+  advance it, and neither mutates anything. Feeding the same bytes in any
+  chunking produces the same result, because the state carries the position it
+  had reached rather than assuming a read boundary means anything."
+  ([] (recv-init nil))
+  ([opts]
+   {:phase :status
+    :buf [] :off 0 :scan 0
+    :limits (limits-of opts)
+    :method (keyword (str/lower (name (or (:method opts) :get))))
+    :status nil :version nil :http-reason nil
+    :header-lines [] :trailer-lines []
+    :body [] :need 0 :chunks 0 :informational 0}))
+
+(defn- compact [st]
+  (if (pos? (:off st))
+    (assoc st :buf (into [] (subvec (:buf st) (:off st)))
+           :scan (max 0 (- (:scan st) (:off st)))
+           :off 0)
+    st))
+
+(defn- take-line
+  "Scan for a CRLF-terminated line. Returns `[:line octets st']`,
+  `[:need st']`, or `[:error reason detail]`.
+
+  A bare LF is refused rather than accepted as a terminator: accepting it is
+  precisely how two intermediaries come to disagree about where a message ends."
+  [st]
+  (let [buf (:buf st) n (count buf) maxl (get-in st [:limits :max-line-bytes])]
+    (loop [i (:scan st)]
+      (cond
+        (>= i n)
+        (if (> (- n (:off st)) maxl)
+          (err :line-too-long {:limit maxl :buffered (- n (:off st))})
+          [:need (assoc st :scan i)])
+
+        (= LF (nth buf i))
+        (if (or (= i (:off st)) (not= CR (nth buf (dec i))))
+          (err :bare-lf-line-terminator {:index i})
+          (let [line (subvec buf (:off st) (dec i))]
+            (if (> (count line) maxl)
+              (err :line-too-long {:limit maxl :length (count line)})
+              [:line line (assoc st :off (inc i) :scan (inc i))])))
+
+        :else (recur (inc i))))))
+
+(defn- parse-status-line [line]
+  (let [s (latin1-decode line)]
+    (cond
+      (< (count s) 12) (err :malformed-status-line {:line s})
+      (not (str/starts-with? s "HTTP/")) (err :malformed-status-line {:line s})
+      :else
+      (let [version (subs s 0 8)]
+        (cond
+          (not (contains? #{"HTTP/1.0" "HTTP/1.1"} version))
+          (err :unsupported-http-version {:version version})
+
+          (not= SP (char-code s 8)) (err :malformed-status-line {:line s})
+
+          :else
+          (let [code (subs s 9 12)]
+            (if-not (every? #(<= 0x30 (char-code code %) 0x39) (range 3))
+              (err :malformed-status-code {:code code})
+              (let [rest' (subs s 12)]
+                (cond
+                  (and (pos? (count rest')) (not= SP (char-code rest' 0)))
+                  (err :malformed-status-line {:line s})
+                  :else
+                  (ok {:version version
+                       :status 
+                       :http-reason (if (pos? (count rest')) (subs rest' 1) "")}))))))))))
+
+(defn- parse-field-line [line]
+  (let [s (latin1-decode line)]
+    (cond
+      (empty? s) (err :empty-field-line {})
+
+      (or (= SP (char-code s 0)) (= HTAB (char-code s 0)))
+      (err :obs-fold {:line s})
+
+      :else
+      (let [idx (str/index-of s ":")]
+        (cond
+          (nil? idx) (err :header-missing-colon {:line s})
+          (zero? idx) (err :empty-header-name {:line s})
+
+          (let [p (char-code s (dec idx))] (or (= p SP) (= p HTAB)))
+          (err :whitespace-before-colon {:line s})
+
+          :else
+          (let [n (subs s 0 idx)
+                v (str/trim (subs s (inc idx)))]
+            (cond
+              (control-injection n) (err :header-name-contains-control {:name n})
+              (control-injection v) (err :header-value-contains-control {:name n})
+              (not (token? n)) (err :invalid-header-name {:name n})
+              (not (valid-field-value? v)) (err :invalid-header-value {:name n})
+              :else (ok [n v]))))))))
+
+(defn- field-values [lines nm]
+  (->> lines (filter #(= nm (str/lower (first %)))) (mapv second)))
+
+(defn- parse-content-length
+  "Collect every Content-Length token across every field line. Identical
+  duplicates collapse to one value (RFC 9112 §6.3 permits it, and refusing a
+  server that merely repeats itself would break real traffic); any
+  disagreement is a desync and is refused."
+  [vals' lim]
+  (let [tokens (mapcat #(map str/trim (str/split % #"," -1)) vals')]
+    (cond
+      (empty? tokens) (ok nil)
+      (not (every? (fn [t] (and (pos? (count t)) (<= (count t) 19)
+                                (every? #(<= 0x30 (char-code t %) 0x39) (range (count t)))))
+                   tokens))
+      (err :malformed-content-length {:values (vec tokens)})
+
+      (> (count (set tokens)) 1)
+      (err :conflicting-content-length {:values (vec tokens)})
+
+      :else
+      (let [n ]
+        (if (> n (:max-body-bytes lim))
+          (err :body-too-large {:limit (:max-body-bytes lim) :content-length n})
+          (ok n))))))
+
+(defn- parse-transfer-encoding [vals']
+  (let [codings (->> vals'
+                     (mapcat #(str/split % #"," -1))
+                     (map (comp str/lower str/trim))
+                     (remove empty?)
+                     vec)]
+    (cond
+      (empty? codings) (ok nil)
+      (> (count (filter #(= "chunked" %) codings)) 1)
+      (err :chunked-repeated {:codings codings})
+
+      (and (some #(= "chunked" %) codings) (not= "chunked" (peek codings)))
+      (err :chunked-not-final-coding {:codings codings})
+
+      (not= ["chunked"] codings)
+      (err :unsupported-transfer-encoding {:codings codings})
+
+      :else (ok :chunked))))
+
+(defn- bodyless? [status method]
+  (or (< status 200) (= status 204) (= status 304) (= method :head)))
+
+(defn- decide-framing [st]
+  (let [lines (:header-lines st)
+        lim (:limits st)
+        cl (parse-content-length (field-values lines "content-length") lim)
+        te (parse-transfer-encoding (field-values lines "transfer-encoding"))]
+    (cond
+      ;; The classic desync: two framings in one message. Refuse before either
+      ;; is believed, and before deciding the message is bodyless -- a message
+      ;; that carries both is an attack whatever its status code says.
+      (and (seq (field-values lines "content-length"))
+           (seq (field-values lines "transfer-encoding")))
+      (err :content-length-with-transfer-encoding
+           {:content-length (field-values lines "content-length")
+            :transfer-encoding (field-values lines "transfer-encoding")})
+
+      (error? cl) cl
+      (error? te) te
+
+      (bodyless? (:status st) (:method st))
+      (ok (assoc st :phase :done))
+
+      (= :chunked (value te)) (ok (assoc st :phase :chunk-size))
+
+      (some? (value cl))
+      (if (zero? (value cl))
+        (ok (assoc st :phase :done))
+        (ok (assoc st :phase :body-length :need (value cl))))
+
+      ;; No framing header at all: the body is what arrives before the peer
+      ;; closes. Still bounded -- "until close" is not "until out of memory".
+      :else (ok (assoc st :phase :until-close)))))
+
+(defn- parse-chunk-size [line]
+  (let [s (latin1-decode line)
+        semi (str/index-of s ";")
+        sz (if semi (subs s 0 semi) s)]
+    (cond
+      (empty? sz) (err :invalid-chunk-size {:line s})
+      (> (count sz) 16) (err :chunk-size-too-large {:line s})
+      (not (every? (fn [i] (let [c (char-code sz i)]
+                             (or (<= 0x30 c 0x39) (<= 0x41 c 0x46) (<= 0x61 c 0x66))))
+                   (range (count sz))))
+      (err :invalid-chunk-size {:line s})
+      :else (ok ))))
+
+(defn- available [st] (- (count (:buf st)) (:off st)))
+
+(defn- step
+  "One state transition. Returns `[:again st]` (progress made, run me again),
+  `[:need st]` (blocked on more bytes), `[:done st]`, or `[:error r d]`."
+  [st]
+  (case (:phase st)
+    :status
+    (let [r (take-line st)]
+      (cond
+        (error? r) r
+        (= :need (first r)) r
+        :else
+        (let [[_ line st'] r
+              p (parse-status-line line)]
+          (if (error? p)
+            p
+            (let [{:keys [version status http-reason]} (value p)]
+              (if (< status 200)
+                ;; Interim (1xx). RFC 9110 §15.2: a client discards it and
+                ;; keeps reading for the real response.
+                (let [n (inc (:informational st'))]
+                  (if (> n (get-in st' [:limits :max-informational]))
+                    (err :too-many-informational-responses
+                         {:limit (get-in st' [:limits :max-informational])})
+                    [:again (assoc st' :phase :informational-headers :informational n)]))
+                [:again (assoc st' :phase :headers :version version
+                               :status status :http-reason http-reason)]))))))
+
+    :informational-headers
+    (let [r (take-line st)]
+      (cond
+        (error? r) r
+        (= :need (first r)) r
+        :else
+        (let [[_ line st'] r]
+          (if (zero? (count line))
+            [:again (assoc st' :phase :status)]
+            [:again st']))))
+
+    :headers
+    (let [r (take-line st)]
+      (cond
+        (error? r) r
+        (= :need (first r)) r
+        :else
+        (let [[_ line st'] r]
+          (if (zero? (count line))
+            (let [d (decide-framing st')]
+              (if (error? d) d [:again (value d)]))
+            (let [p (parse-field-line line)]
+              (cond
+                (error? p) p
+                (>= (count (:header-lines st')) (get-in st' [:limits :max-headers]))
+                (err :too-many-headers {:limit (get-in st' [:limits :max-headers])})
+                :else [:again (update st' :header-lines conj (value p))]))))))
+
+    :body-length
+    (let [av (available st) need (:need st)]
+      (if (zero? need)
+        [:again (assoc st :phase :done)]
+        (let [take' (min av need)]
+          (if (zero? take')
+            [:need st]
+            (let [st' (-> st
+                          (update :body into (subvec (:buf st) (:off st) (+ (:off st) take')))
+                          (update :off + take')
+                          (update :need - take'))]
+              (recur (assoc st' :scan (max (:scan st') (:off st')))))))))
+
+    :chunk-size
+    (let [r (take-line st)]
+      (cond
+        (error? r) r
+        (= :need (first r)) r
+        :else
+        (let [[_ line st'] r
+              p (parse-chunk-size line)]
+          (cond
+            (error? p) p
+            :else
+            (let [sz (value p)
+                  lim (:limits st')]
+              (cond
+                (> (inc (:chunks st')) (:max-chunks lim))
+                (err :too-many-chunks {:limit (:max-chunks lim)})
+
+                (> (+ (count (:body st')) sz) (:max-body-bytes lim))
+                (err :body-too-large {:limit (:max-body-bytes lim)
+                                      :length (+ (count (:body st')) sz)})
+
+                (zero? sz) [:again (assoc st' :phase :trailers)]
+                :else [:again (assoc st' :phase :chunk-data :need sz
+                                     :chunks (inc (:chunks st')))]))))))
+
+    :chunk-data
+    (let [av (available st) need (:need st)]
+      (if (zero? need)
+        [:again (assoc st :phase :chunk-crlf)]
+        (let [take' (min av need)]
+          (if (zero? take')
+            [:need st]
+            (let [st' (-> st
+                          (update :body into (subvec (:buf st) (:off st) (+ (:off st) take')))
+                          (update :off + take')
+                          (update :need - take'))]
+              (recur (assoc st' :scan (max (:scan st') (:off st')))))))))
+
+    :chunk-crlf
+    (if (< (available st) 2)
+      [:need st]
+      (let [b (:buf st) o (:off st)]
+        (if (and (= CR (nth b o)) (= LF (nth b (inc o))))
+          [:again (assoc st :phase :chunk-size :off (+ o 2) :scan (+ o 2))]
+          (err :missing-chunk-crlf {:got [(nth b o) (nth b (inc o))]}))))
+
+    :trailers
+    (let [r (take-line st)]
+      (cond
+        (error? r) r
+        (= :need (first r)) r
+        :else
+        (let [[_ line st'] r]
+          (if (zero? (count line))
+            [:done (assoc st' :phase :done)]
+            (let [p (parse-field-line line)]
+              (cond
+                (error? p) p
+                (>= (count (:trailer-lines st')) (get-in st' [:limits :max-headers]))
+                (err :too-many-headers {:limit (get-in st' [:limits :max-headers]) :section :trailers})
+                :else [:again (update st' :trailer-lines conj (value p))]))))))
+
+    :until-close
+    (let [av (available st)
+          lim (get-in st [:limits :max-body-bytes])]
+      (if (zero? av)
+        [:need st]
+        (let [st' (-> st
+                      (update :body into (subvec (:buf st) (:off st)))
+                      (assoc :off (count (:buf st))))]
+          (if (> (count (:body st')) lim)
+            (err :body-too-large {:limit lim :length (count (:body st'))})
+            [:need (assoc st' :scan (:off st'))]))))
+
+    :done [:done st]
+
+    (err :internal-unknown-phase {:phase (:phase st)})))
+
+(defn- run [st]
+  (loop [st st guard 0]
+    (if (> guard 1000000)
+      (err :internal-step-limit {})
+      (let [r (step st)]
+        (case (first r)
+          :again (recur (nth r 1) (inc guard))
+          r)))))
+
+(defn- headers-map
+  "Lowercased name -> value, duplicates joined with `, ` (RFC 9110 §5.3). The
+  raw ordered lines are kept alongside so nothing is lost."
+  [lines]
+  (reduce (fn [m [n v]]
+            (let [k (str/lower n)]
+              (assoc m k (if-let [prev (get m k)] (str prev ", " v) v))))
+          {} lines))
+
+(defn- finish [st]
+  (ok (cond-> {:http/status (:status st)
+               :http/version (:version st)
+               :http/reason-phrase (:http-reason st)
+               :http/headers (headers-map (:header-lines st))
+               :http/header-lines (:header-lines st)
+               :http/body (:body st)}
+        (seq (:trailer-lines st))
+        (assoc :http/trailers (headers-map (:trailer-lines st))
+               :http/trailer-lines (:trailer-lines st)))))
+
+(defn recv-feed
+  "Feed `octets` into the parser. Returns `[:ok response]` when the message is
+  complete, `[:continue state]` when more bytes are needed, or
+  `[:error reason detail]`.
+
+  Feeding one byte at a time and feeding the whole response at once must give
+  the same result; that equivalence is what the byte-boundary tests assert."
+  [st octets]
+  (let [os (->octets octets)
+        st (-> st compact (update :buf into os))
+        r (run st)]
+    (case (first r)
+      :done (finish (nth r 1))
+      :need [:continue (nth r 1)]
+      r)))
+
+(defn recv-eof
+  "Signal that the peer closed. Completes a connection-framed body; otherwise
+  names exactly which truncation happened, because 'the connection closed' is
+  a different fact from 'the framing was wrong'."
+  [st]
+  (case (:phase st)
+    :done (finish st)
+    :until-close (finish st)
+    :status (if (and (zero? (available st)) (zero? (:informational st)))
+              (err :empty-response {})
+              (err :truncated-response-head {:phase :status}))
+    :informational-headers (err :truncated-response-head {:phase :informational-headers})
+    :headers (err :truncated-response-head {:phase :headers})
+    :body-length (err :truncated-body {:missing (:need st)})
+    :chunk-data (err :truncated-chunk-data {:missing (:need st)})
+    :chunk-crlf (err :truncated-chunk-data {:missing 2})
+    :chunk-size (err :missing-last-chunk {:phase :chunk-size})
+    :trailers (err :missing-last-chunk {:phase :trailers})
+    (err :internal-unknown-phase {:phase (:phase st)})))
+
+(defn parse-response
+  "Parse a complete response from `octets` in one call. Convenience over
+  `recv-init` / `recv-feed` / `recv-eof`; `:eof? true` in `opts` says the bytes
+  are everything the peer will ever send, which is what makes
+  connection-framed and truncated bodies distinguishable."
+  ([octets] (parse-response octets nil))
+  ([octets opts]
+   (let [r (recv-feed (recv-init opts) octets)]
+     (if (= :continue (first r))
+       (if (:eof? opts) (recv-eof (nth r 1)) r)
+       r))))
+
+;; ---------------------------------------------------------------------------
+;; exchange over an injected transport
+;; ---------------------------------------------------------------------------
+
+(defn- transport-write [transport octets]
+  (let [w (:write transport)]
+    (if-not (fn? w)
+      (err :transport-missing-write {})
+      (let [r (w octets)]
+        (cond (nil? r) (ok (count octets))
+              (error? r) r
+              (ok? r) r
+              :else (ok (count octets)))))))
+
+(defn exchange
+  "Perform one HTTP/1.1 request/response exchange over `transport`.
+
+  `transport` is `{:write (fn [octets] -> [:ok n] | [:error r d] | nil)
+                   :read  (fn [] -> [:ok octets] | [:eof] | [:error r d])}`
+  and optionally `:close`. It is the whole of what this namespace knows about
+  the outside world: no host, no port, no certificate, no cipher. Anything
+  that can move bytes both ways satisfies it.
+
+  Returns `[:ok response]` or `[:error reason detail]`."
+  ([transport req] (exchange transport req nil))
+  ([transport req opts]
+   (let [ser (serialize-request req opts)]
+     (if (error? ser)
+       ser
+       (let [w (transport-write transport (value ser))]
+         (if (error? w)
+           w
+           (let [rd (:read transport)
+                 lim (limits-of opts)
+                 opts' (assoc opts :method (or (:http/method req) :get) :limits lim)]
+             (if-not (fn? rd)
+               (err :transport-missing-read {})
+               (loop [st (recv-init opts') calls 0]
+                 (if (> calls (:max-read-calls lim))
+                   (err :transport-stalled {:limit (:max-read-calls lim)})
+                   (let [r (rd)]
+                     (cond
+                       (and (vector? r) (= :eof (first r))) (recv-eof st)
+                       (nil? r) (recv-eof st)
+                       (error? r) r
+                       :else
+                       (let [os (->octets (if (ok? r) (value r) r))]
+                         (if (zero? (count os))
+                           (recur st (inc calls))
+                           (let [f (recv-feed st os)]
+                             (case (first f)
+                               :continue (recur (nth f 1) (inc calls))
+                               f))))))))))))))))
+
+(defn error-response
+  "A response-shaped failure value: status 0 (never a real status) plus
+  `:http/error`. `IHttp/send` must return a response map, and this layer must
+  not throw, so a failure is reported as a response the caller can branch on."
+  [reason detail]
+  {:http/status 0 :http/headers {} :http/body []
+   :http/error reason :http/error-detail detail})
+
+(defn transport-http
+  "An `IHttp` over `transport`, so existing `kotoba.lang.http` callers get a
+  real client by handing over a transport instead of a mock.
+
+  `send` returns the parsed response map on success and `error-response` on
+  failure -- it never throws. New code should prefer `exchange`, which returns
+  the `[:ok …]` / `[:error …]` value directly."
+  ([transport] (transport-http transport nil))
+  ([transport opts]
+   (reify http/IHttp
+     (send [_ req]
+       (let [r (exchange transport req opts)]
+         (if (ok? r) (value r) (error-response (reason r) (detail r))))))))

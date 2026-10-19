@@ -1,0 +1,408 @@
+(ns nameserver.wire
+  "RFC 1035 §4 DNS message wire format ⇄ EDN, portable .cljc (JVM/CLJS),
+  zero third-party deps.
+
+  A message is a plain map:
+
+    {:dns/id 1 :dns/qr :query :dns/opcode 0
+     :dns/aa? false :dns/tc? false :dns/rd? true :dns/ra? false
+     :dns/rcode :noerror
+     :dns/questions  [{:dns/qname \"example.com.\" :dns/qtype \"A\" :dns/qclass \"IN\"}]
+     :dns/answers    [<record>] :dns/authority [<record>] :dns/additional [<record>]}
+
+  A `<record>` reuses zone.model's `:zone/*` shape verbatim (`:zone/name` here
+  is an absolute FQDN, not zone-relative) — a wire RR *is* a zone-file record
+  with an absolute owner name, so `zone.model`/`zone.zone` data flows straight
+  onto the wire with no extra translation layer.
+
+  Scope (documented, not silently missing): ASCII labels only (IDN's punycode
+  ASCII-safe encoding covers real-world non-ASCII names, so this is not a
+  practical restriction); TXT/CAA values ≤ 255 octets (single wire
+  character-string, no multi-string TXT splitting); no DNSSEC RR types.
+
+  EDNS0 (RFC 6891) is *not* interpreted here: an OPT pseudo-RR round-trips as
+  opaque `:zone/raw` rdata with a `CLASSn`/`TYPE41` label, and
+  `nameserver.edns` reads those fields as what they actually mean. That split
+  is deliberate — OPT overloads CLASS and TTL to mean payload size and flags,
+  and teaching this codec about it would put protocol semantics in a byte
+  layer.
+
+  Unknown RR types are carried both ways per RFC 3597 §5: `read-rdata` yields
+  `:zone/raw` and `write-rdata` puts it back. Before that the round trip was
+  broken in exactly one direction — a message could be decoded and then not
+  re-encoded, which is precisely what a forwarder, a zone transfer, or an OPT
+  pseudo-RR has to do with every type it does not itself understand."
+  (:require [clojure.string :as str]
+            [nameserver.names :as names]))
+
+;; ── portable byte/char primitives ────────────────────────────────────────
+
+(defn- char-code [c]
+  )
+
+(defn- str->ascii-bytes [s]
+  (mapv char-code (seq s)))
+
+(defn- ascii-bytes->str [ints]
+  (apply str (map char ints)))
+
+(def ^:private hex-alphabet "0123456789abcdef")
+
+(defn- hex->int [s]
+  (reduce (fn [n c]
+            (let [d (str/index-of hex-alphabet (str/lower-case (str c)))]
+              (when-not d (throw (ex-info "bad hex digit" {:char c})))
+              (+ (* n 16) d)))
+          0 (seq s)))
+
+(defn- int->hex [n]
+  (if (zero? n)
+    "0"
+    (loop [n n digits []]
+      (if (zero? n)
+        (apply str (reverse digits))
+        (recur (quot n 16) (conj digits (nth hex-alphabet (mod n 16))))))))
+
+;; ── u16 / u32 big-endian ──────────────────────────────────────────────────
+
+(defn- u16 [n] [(bit-and (bit-shift-right n 8) 0xFF) (bit-and n 0xFF)])
+
+(defn- u32 [n]
+  [(bit-and (bit-shift-right n 24) 0xFF) (bit-and (bit-shift-right n 16) 0xFF)
+   (bit-and (bit-shift-right n 8) 0xFF)  (bit-and n 0xFF)])
+
+(defn- read-u16 [bytes off]
+  (bit-or (bit-shift-left (nth bytes off) 8) (nth bytes (inc off))))
+
+(defn- read-u32 [bytes off]
+  (bit-or (bit-shift-left (nth bytes off) 24)
+          (bit-shift-left (nth bytes (+ off 1)) 16)
+          (bit-shift-left (nth bytes (+ off 2)) 8)
+          (nth bytes (+ off 3))))
+
+;; ── IPv4 / IPv6 text ⇄ bytes ──────────────────────────────────────────────
+
+;; portable decimal parse (no java.lang.Long / js/parseInt cross-dependency)
+(defn- dec->int [s]
+  (reduce (fn [n c]
+            (let [d (- (char-code c) (char-code \0))]
+              (when (or (< d 0) (> d 9)) (throw (ex-info "bad decimal digit" {:char c})))
+              (+ (* n 10) d)))
+          0 (seq s)))
+
+(defn- ipv4->bytes* [addr]
+  (let [parts (str/split addr #"\.")]
+    (when (not= 4 (count parts)) (throw (ex-info "invalid IPv4 address" {:address addr})))
+    (mapv dec->int parts)))
+
+(defn- bytes->ipv4 [bs] (str/join "." bs))
+
+(defn- split-groups [s] (if (str/blank? s) [] (str/split s #":")))
+
+(defn- ipv6->bytes [addr]
+  (let [dbl-idx (str/index-of addr "::")
+        [left right double?] (if dbl-idx
+                                [(subs addr 0 dbl-idx) (subs addr (+ dbl-idx 2)) true]
+                                [addr nil false])
+        left-groups  (split-groups left)
+        right-groups (if double? (split-groups right) [])
+        missing (- 8 (+ (count left-groups) (count right-groups)))
+        groups (if double?
+                 (concat left-groups (repeat missing "0") right-groups)
+                 left-groups)]
+    (when (not= 8 (count groups))
+      (throw (ex-info "invalid IPv6 address" {:address addr})))
+    (vec (mapcat (fn [g] (let [n (hex->int (if (str/blank? g) "0" g))]
+                           [(bit-and (bit-shift-right n 8) 0xFF) (bit-and n 0xFF)]))
+                 groups))))
+
+(defn- zero-runs [groups]
+  (->> (map-indexed vector groups)
+       (partition-by (fn [[_ g]] (zero? g)))
+       (filter (fn [part] (zero? (second (first part)))))
+       (map (fn [part] [(ffirst part) (count part)]))))
+
+(defn- best-zero-run [groups]
+  (let [runs (filter (fn [[_ len]] (>= len 2)) (zero-runs groups))]
+    (when (seq runs) (apply max-key second runs))))
+
+(defn- bytes->ipv6 [bs]
+  (let [groups (mapv (fn [i] (bit-or (bit-shift-left (nth bs (* 2 i)) 8) (nth bs (inc (* 2 i)))))
+                     (range 8))]
+    (if-let [[start len] (best-zero-run groups)]
+      (let [before (subvec groups 0 start)
+            after  (subvec groups (+ start len))]
+        (str (str/join ":" (map int->hex before)) "::" (str/join ":" (map int->hex after))))
+      (str/join ":" (map int->hex groups)))))
+
+;; ── RR type / class int ⇄ string maps (RFC 3597 §5 "TYPEn"/"CLASSn"
+;;    fallback for anything this library doesn't know, so decode never
+;;    throws on an unrecognized-but-well-formed RR, e.g. an EDNS0 OPT(41)) ──
+
+(def ^:private type->int-map
+  {"A" 1 "NS" 2 "CNAME" 5 "SOA" 6 "PTR" 12 "MX" 15 "TXT" 16 "AAAA" 28 "SRV" 33 "CAA" 257 "ANY" 255})
+(def ^:private int->type-map (into {} (map (fn [[k v]] [v k]) type->int-map)))
+(defn- generic-n
+  "RFC 3597 §5 generic spelling: \"TYPE41\" / \"CLASS4096\" → the number.
+  Also accepts a bare integer, which is what a caller building an OPT
+  pseudo-RR naturally has."
+  [prefix v]
+  (cond
+    (integer? v) v
+    (and (string? v) (str/starts-with? v prefix))
+    (let [d (subs v (count prefix))]
+      (when (re-matches #"\d+" d)
+        ))))
+
+(defn- rr-type->int [t]
+  (or (get type->int-map t)
+      (generic-n "TYPE" t)
+      (throw (ex-info "unknown RR type" {:type t}))))
+(defn- int->rr-type [n] (or (get int->type-map n) (str "TYPE" n)))
+
+(def ^:private class->int-map {"IN" 1 "CH" 3 "HS" 4 "ANY" 255})
+(def ^:private int->class-map (into {} (map (fn [[k v]] [v k]) class->int-map)))
+(defn- rr-class->int [c]
+  (or (get class->int-map c)
+      (generic-n "CLASS" c)
+      (throw (ex-info "unknown RR class" {:class c}))))
+(defn- int->rr-class [n] (or (get int->class-map n) (str "CLASS" n)))
+
+(def ^:private rcode->int-map
+  {:noerror 0 :formerr 1 :servfail 2 :nxdomain 3 :notimp 4 :refused 5})
+(def ^:private int->rcode-map (into {} (map (fn [[k v]] [v k]) rcode->int-map)))
+(defn- rcode->int [r] (or (get rcode->int-map r) (throw (ex-info "unknown RCODE" {:rcode r}))))
+(defn- int->rcode [n] (or (get int->rcode-map n) (keyword (str "rcode-" n))))
+
+;; ── builder: threads {:bytes [.. growing ..] :offsets {suffix->offset} :pos n}
+;;    through encoding so RDATA-embedded names (CNAME/NS/MX/SOA/SRV/PTR) can
+;;    compress against any name already written earlier in the message. ──
+
+(defn- b-append [builder bs]
+  (-> builder (update :bytes into bs) (update :pos + (count bs))))
+
+(defn- encode-name-at [name offsets pos]
+  (let [labels (names/split-labels name)]
+    (loop [labs labels bytes [] offs offsets cur-pos pos]
+      (if (empty? labs)
+        {:bytes (conj bytes 0) :offsets offs}
+        (let [suffix (names/join-labels labs)]
+          (if-let [ptr (get offs suffix)]
+            {:bytes (into bytes [(bit-or 0xC0 (bit-shift-right ptr 8)) (bit-and ptr 0xFF)])
+             :offsets offs}
+            (let [lbl (first labs)
+                  lbl-bytes (str->ascii-bytes lbl)]
+              (when (> (count lbl-bytes) 63)
+                (throw (ex-info "DNS label too long (max 63 octets)" {:label lbl})))
+              (let [seg (into [(count lbl-bytes)] lbl-bytes)
+                    offs' (if (<= cur-pos 0x3FFF) (assoc offs suffix cur-pos) offs)]
+                (recur (rest labs) (into bytes seg) offs' (+ cur-pos (count seg)))))))))))
+
+(defn- b-name [builder name]
+  (let [{:keys [bytes offsets]} (encode-name-at name (:offsets builder) (:pos builder))]
+    (-> builder (update :bytes into bytes) (assoc :offsets offsets) (update :pos + (count bytes)))))
+
+(defn- b-u16 [builder n] (b-append builder (u16 n)))
+(defn- b-u32 [builder n] (b-append builder (u32 n)))
+
+(defn- b-char-string [builder s]
+  (let [bs (str->ascii-bytes s)]
+    (when (> (count bs) 255) (throw (ex-info "character-string too long (max 255 octets)" {:value s})))
+    (b-append builder (into [(count bs)] bs))))
+
+(defn- with-rdlength [builder write-fn]
+  (let [start-pos (:pos builder)
+        placeholder (b-append builder [0 0])
+        after (write-fn placeholder)
+        rdlen (- (:pos after) (:pos placeholder))
+        patched (assoc (:bytes after)
+                       start-pos (bit-and (bit-shift-right rdlen 8) 0xFF)
+                       (inc start-pos) (bit-and rdlen 0xFF))]
+    (assoc after :bytes patched)))
+
+(defn- write-rdata [builder type rdata]
+  (case type
+    "A"     (b-append builder (ipv4->bytes* (:zone/address rdata)))
+    "AAAA"  (b-append builder (ipv6->bytes (:zone/address rdata)))
+    "CNAME" (b-name builder (:zone/target rdata))
+    "NS"    (b-name builder (:zone/target rdata))
+    "PTR"   (b-name builder (:zone/target rdata))
+    "MX"    (-> builder (b-u16 (:zone/pref rdata)) (b-name (:zone/exchange rdata)))
+    "TXT"   (b-char-string builder (:zone/text rdata))
+    "SOA"   (-> builder (b-name (:zone/mname rdata)) (b-name (:zone/rname rdata))
+                (b-u32 (:zone/serial rdata)) (b-u32 (:zone/refresh rdata))
+                (b-u32 (:zone/retry rdata)) (b-u32 (:zone/expire rdata))
+                (b-u32 (:zone/minimum rdata)))
+    "SRV"   (-> builder (b-u16 (:zone/pri rdata)) (b-u16 (:zone/weight rdata))
+                (b-u16 (:zone/port rdata)) (b-name (:zone/target rdata)))
+    "CAA"   (let [tag-bytes (str->ascii-bytes (:zone/tag rdata))
+                  val-bytes (str->ascii-bytes (str (:zone/value rdata)))]
+              (b-append builder (into [(:zone/flags rdata) (count tag-bytes)]
+                                       (into tag-bytes val-bytes))))
+    ;; RFC 3597 §5: an RR this library does not model is carried as opaque
+    ;; rdata. `read-rdata`'s fallback already produces `:zone/raw`, so without
+    ;; this the round trip was broken in exactly one direction — a message
+    ;; could be decoded and then not re-encoded, which is precisely what a
+    ;; forwarder, a zone transfer, or an EDNS0 OPT pseudo-RR has to do with
+    ;; every type it does not itself understand.
+    (if-let [raw (:zone/raw rdata)]
+      (b-append builder (vec raw))
+      (throw (ex-info "unsupported RR type for wire encoding" {:type type})))))
+
+(defn- encode-question [builder {:dns/keys [qname qtype qclass]}]
+  (-> builder (b-name qname) (b-u16 (rr-type->int qtype)) (b-u16 (rr-class->int (or qclass "IN")))))
+
+(defn- encode-rr [builder {:zone/keys [name ttl class type rdata]}]
+  (-> builder
+      (b-name name)
+      (b-u16 (rr-type->int type))
+      (b-u16 (rr-class->int (or class "IN")))
+      (b-u32 ttl)
+      (with-rdlength (fn [b] (write-rdata b type rdata)))))
+
+(defn- encode-flags [{:keys [qr opcode aa? tc? rd? ra? rcode]}]
+  (let [b1 (bit-or (bit-shift-left (if (= qr :response) 1 0) 7)
+                    (bit-shift-left (bit-and opcode 0xF) 3)
+                    (bit-shift-left (if aa? 1 0) 2)
+                    (bit-shift-left (if tc? 1 0) 1)
+                    (if rd? 1 0))
+        b2 (bit-or (bit-shift-left (if ra? 1 0) 7)
+                    (bit-and (rcode->int rcode) 0xF))]
+    [b1 b2]))
+
+(defn encode-message
+  "Encode a DNS message EDN map (see ns docstring) to wire bytes — a vector
+  of 0..255 ints (JVM callers convert to `byte[]` before sending; see
+  `nameserver.server`)."
+  [{:dns/keys [id qr opcode aa? tc? rd? ra? rcode questions answers authority additional]
+    :or {opcode 0 aa? false tc? false rd? true ra? false rcode :noerror
+         questions [] answers [] authority [] additional []}}]
+  (let [[f1 f2] (encode-flags {:qr qr :opcode opcode :aa? aa? :tc? tc? :rd? rd? :ra? ra? :rcode rcode})
+        b0 (-> {:bytes [] :offsets {} :pos 0}
+               (b-u16 id)
+               (b-append [f1 f2])
+               (b-u16 (count questions))
+               (b-u16 (count answers))
+               (b-u16 (count authority))
+               (b-u16 (count additional)))
+        b1 (reduce encode-question b0 questions)
+        b2 (reduce encode-rr b1 answers)
+        b3 (reduce encode-rr b2 authority)
+        b4 (reduce encode-rr b3 additional)]
+    (:bytes b4)))
+
+;; ── decode ────────────────────────────────────────────────────────────────
+
+(defn- decode-name
+  "[bytes start] -> [name end-offset]. `end-offset` is the position right
+  after this name's own encoding in the original stream (i.e. *not* inside
+  any followed pointer) — the caller resumes parsing there."
+  [bytes start]
+  (loop [pos start labels [] jumps 0 end nil]
+    (when (> jumps 128) (throw (ex-info "DNS name compression pointer loop" {:start start})))
+    (let [b (get bytes pos)]
+      (when (nil? b) (throw (ex-info "truncated DNS message (name)" {:offset pos})))
+      (cond
+        (zero? b)
+        [(names/join-labels labels) (or end (inc pos))]
+
+        (= 0xC0 (bit-and b 0xC0))
+        (let [b2 (get bytes (inc pos))]
+          (when (nil? b2) (throw (ex-info "truncated DNS message (name pointer)" {:offset pos})))
+          (let [ptr (bit-or (bit-shift-left (bit-and b 0x3F) 8) b2)
+                end' (or end (+ pos 2))]
+            (recur ptr labels (inc jumps) end')))
+
+        :else
+        (let [len b
+              lbl-start (inc pos)
+              lbl-end (+ lbl-start len)]
+          (when (> lbl-end (count bytes)) (throw (ex-info "truncated DNS message (label)" {:offset pos})))
+          (recur lbl-end (conj labels (ascii-bytes->str (subvec bytes lbl-start lbl-end))) jumps end))))))
+
+(defn- decode-header [bytes]
+  (let [f1 (nth bytes 2) f2 (nth bytes 3)]
+    {:id (read-u16 bytes 0)
+     :qr (if (bit-test f1 7) :response :query)
+     :opcode (bit-and (bit-shift-right f1 3) 0xF)
+     :aa? (bit-test f1 2)
+     :tc? (bit-test f1 1)
+     :rd? (bit-test f1 0)
+     :ra? (bit-test f2 7)
+     :rcode (int->rcode (bit-and f2 0xF))
+     :qdcount (read-u16 bytes 4)
+     :ancount (read-u16 bytes 6)
+     :nscount (read-u16 bytes 8)
+     :arcount (read-u16 bytes 10)}))
+
+(defn- decode-question [bytes offset]
+  (let [[qname end] (decode-name bytes offset)]
+    [{:dns/qname qname
+      :dns/qtype (int->rr-type (read-u16 bytes end))
+      :dns/qclass (int->rr-class (read-u16 bytes (+ end 2)))}
+     (+ end 4)]))
+
+(defn- read-rdata [bytes type start end]
+  (case type
+    "A"     {:zone/address (bytes->ipv4 (subvec bytes start (+ start 4)))}
+    "AAAA"  {:zone/address (bytes->ipv6 (subvec bytes start (+ start 16)))}
+    "CNAME" {:zone/target (first (decode-name bytes start))}
+    "NS"    {:zone/target (first (decode-name bytes start))}
+    "PTR"   {:zone/target (first (decode-name bytes start))}
+    "MX"    (let [pref (read-u16 bytes start)
+                  [exch] (decode-name bytes (+ start 2))]
+              {:zone/pref pref :zone/exchange exch})
+    "TXT"   (let [len (nth bytes start)]
+              {:zone/text (ascii-bytes->str (subvec bytes (inc start) (+ start 1 len)))})
+    "SOA"   (let [[mname e1] (decode-name bytes start)
+                  [rname e2] (decode-name bytes e1)]
+              {:zone/mname mname :zone/rname rname
+               :zone/serial (read-u32 bytes e2) :zone/refresh (read-u32 bytes (+ e2 4))
+               :zone/retry (read-u32 bytes (+ e2 8)) :zone/expire (read-u32 bytes (+ e2 12))
+               :zone/minimum (read-u32 bytes (+ e2 16))})
+    "SRV"   (let [pri (read-u16 bytes start) weight (read-u16 bytes (+ start 2)) port (read-u16 bytes (+ start 4))
+                  [target] (decode-name bytes (+ start 6))]
+              {:zone/pri pri :zone/weight weight :zone/port port :zone/target target})
+    "CAA"   (let [flags (nth bytes start) taglen (nth bytes (inc start))
+                  tag (ascii-bytes->str (subvec bytes (+ start 2) (+ start 2 taglen)))
+                  value (ascii-bytes->str (subvec bytes (+ start 2 taglen) end))]
+              {:zone/flags flags :zone/tag tag :zone/value value})
+    {:zone/raw (vec (subvec bytes start end))}))
+
+(defn- decode-rr [bytes offset]
+  (let [[name end1] (decode-name bytes offset)
+        type (int->rr-type (read-u16 bytes end1))
+        class (int->rr-class (read-u16 bytes (+ end1 2)))
+        ttl (read-u32 bytes (+ end1 4))
+        rdlen (read-u16 bytes (+ end1 8))
+        rdata-start (+ end1 10)
+        rdata-end (+ rdata-start rdlen)]
+    (when (> rdata-end (count bytes)) (throw (ex-info "truncated DNS message (rdata)" {:offset rdata-start})))
+    [{:zone/name name :zone/ttl ttl :zone/class class :zone/type type
+      :zone/rdata (read-rdata bytes type rdata-start rdata-end)}
+     rdata-end]))
+
+(defn- decode-n [bytes offset n decode-one]
+  (loop [i 0 off offset acc []]
+    (if (= i n)
+      [acc off]
+      (let [[v off'] (decode-one bytes off)]
+        (recur (inc i) off' (conj acc v))))))
+
+(defn decode-message
+  "Decode wire bytes (a vector, or any seq coercible via `vec`, of 0..255
+  ints) into a DNS message EDN map. Throws `ex-info` on truncated or
+  malformed input — callers (e.g. a UDP server loop) should catch this and
+  drop the packet or reply FORMERR rather than crash."
+  [bytes]
+  (let [bytes (vec bytes)
+        h (decode-header bytes)
+        [questions off1]  (decode-n bytes 12 (:qdcount h) decode-question)
+        [answers off2]    (decode-n bytes off1 (:ancount h) decode-rr)
+        [authority off3]  (decode-n bytes off2 (:nscount h) decode-rr)
+        [additional _off] (decode-n bytes off3 (:arcount h) decode-rr)]
+    {:dns/id (:id h) :dns/qr (:qr h) :dns/opcode (:opcode h)
+     :dns/aa? (:aa? h) :dns/tc? (:tc? h) :dns/rd? (:rd? h) :dns/ra? (:ra? h)
+     :dns/rcode (:rcode h)
+     :dns/questions questions :dns/answers answers
+     :dns/authority authority :dns/additional additional}))

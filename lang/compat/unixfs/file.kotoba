@@ -1,0 +1,195 @@
+(ns unixfs.file
+  "UnixFS files — the balanced DAG `ipfs add` builds, in portable `.cljc`.
+
+  `multiformats.core/cidv1-raw` has always addressed a single block
+  correctly, and said so: *byte-identical to `ipfs add --cid-version=1
+  --raw-leaves` for single-block (≤256 KiB) inputs*. `cid-of-file` threw
+  above that with `a multi-block dag-pb CID is out of scope`. This is that
+  scope — the chunker, the tree, and the UnixFS file header that make a
+  256 KiB limit into no limit.
+
+  ## The shape, which is not the obvious one
+
+  Bytes are split into 256 KiB chunks stored as **raw** blocks. A file of
+  one chunk is that raw block: no wrapper, no dag-pb node, and the CID
+  starts `bafkrei…`. Only from the second chunk does a dag-pb root appear.
+  Getting this wrong produces a valid-looking DAG that no `ipfs get` will
+  ever agree with, because the reference implementation special-cases it.
+
+  Above the leaves, nodes take up to 174 children — `DefaultLinksPerBlock`,
+  which go-unixfs derives from an 8 KiB target block and a ~47-byte link,
+  and which is therefore a constant of the format rather than a tuning
+  knob. Levels are filled left to right: 175 chunks is a root of two
+  children, the first covering a full 174 and the second covering one. The
+  single remaining chunk is still wrapped in its own dag-pb node — a bare
+  raw leaf as the second child would be a smaller, reasonable, different
+  DAG.
+
+  ## Tsize is the subtree, not the block
+
+  A link's `Tsize` is the total encoded size of everything under it: a raw
+  leaf's own length, or a dag-pb node's block length plus the `Tsize` of
+  each of its children. `blocksizes` in the file header is the other
+  measure — the *logical* bytes each child contributes to the file. Both
+  are in every node and they are not the same number.
+
+  ## What this is checked against
+
+  Real CIDs from kubo 0.41, pinned in `unixfs.file-test`, across the
+  boundaries that matter: empty, one byte, exactly one chunk, one chunk
+  plus one byte, a full 174-link node, 175, and a file deep enough to need
+  three levels above the leaves."
+  (:require [ipld.dag-pb :as dag-pb]
+            [multiformats.core :as mf]
+            [protobuf.wire :as pb]))
+
+(def ^:const default-chunk-size
+  "The `ipfs add` default (`--chunker=size-262144`)."
+  262144)
+
+(def ^:const default-max-links
+  "go-unixfs `DefaultLinksPerBlock`: an 8 KiB target block over a ~47-byte
+  link. A constant of the format — a file chunked with a different value
+  is a different CID, not a differently tuned one."
+  174)
+
+(def ^:const type-file 2)
+
+(def data-schema
+  "UnixFS `Data`. Ascending field numbers and no default-valued fields, so
+  unlike the DAG-PB node around it this message is exactly what a
+  deterministic protobuf encoder emits."
+  {1 {:name :type :type :enum}
+   2 {:name :data :type :bytes}
+   3 {:name :filesize :type :uint64}
+   4 {:name :blocksizes :type :uint64 :repeated true}})
+
+(defn- octets [b]
+  (mapv #(bit-and (int %) 0xff) (seq b)))
+
+(defn- ->bytes [os]
+  )
+
+(defn- file-header [filesize blocksizes]
+  (pb/encode data-schema {:type type-file
+                          :filesize filesize
+                          :blocksizes (vec blocksizes)}))
+
+(defn- chunk-seq [bs chunk-size]
+  (let [os (octets bs)
+        n (count os)]
+    (if (zero? n)
+      ;; An empty file is one empty chunk, not zero chunks: `ipfs add` of
+      ;; /dev/null is the raw CID of no bytes, and a file with no leaves
+      ;; would have no CID at all.
+      [[]]
+      (mapv vec (partition-all chunk-size os)))))
+
+(defn- leaf [chunk]
+  (let [bytes (->bytes chunk)]
+    {:cid (mf/cidv1-raw bytes)
+     :bytes bytes
+     :size (count chunk)                                   ; logical bytes
+     :tsize (count chunk)}))                               ; encoded subtree
+
+(defn- parent [children]
+  (let [filesize (reduce + 0 (map :size children))
+        data (file-header filesize (map :size children))
+        links (mapv (fn [c] {:hash (:cid c) :name "" :tsize (:tsize c)}) children)
+        {:keys [cid bytes]} (dag-pb/node->block {:links links :data data})]
+    {:cid cid
+     :bytes bytes
+     :size filesize
+     :tsize (+ (count (octets bytes)) (reduce + 0 (map :tsize children)))}))
+
+(defn build
+  "Bytes → `{:cid <root> :blocks [{:cid :bytes}] :size <logical bytes>}`.
+
+  `:blocks` is leaves first and the root last, which is the order a writer
+  must store them in: a root advertised before its children exist is a CID
+  that resolves to a hole."
+  ([bs] (build bs nil))
+  ([bs {:keys [chunk-size max-links]
+        :or {chunk-size default-chunk-size max-links default-max-links}}]
+   (when-not (pos? chunk-size)
+     (throw (ex-info "unixfs: chunk-size must be positive"
+                     {:type :unixfs/invalid-options :chunk-size chunk-size})))
+   (when (< max-links 2)
+     (throw (ex-info "unixfs: max-links must be at least 2"
+                     {:type :unixfs/invalid-options :max-links max-links})))
+   (let [leaves (mapv leaf (chunk-seq bs chunk-size))
+         published (fn [nodes] (mapv #(select-keys % [:cid :bytes]) nodes))]
+     (loop [level leaves
+            blocks (published leaves)]
+       (if (= 1 (count level))
+         {:cid (:cid (first level))
+          :blocks blocks
+          :size (:size (first level))}
+         (let [next-level (mapv parent (partition-all max-links level))]
+           (recur next-level (into blocks (published next-level)))))))))
+
+(defn cid
+  "The root CID alone. Byte-identical to
+  `ipfs add -Q --cid-version=1 --raw-leaves` for any size."
+  ([bs] (cid bs nil))
+  ([bs opts] (:cid (build bs opts))))
+
+;; ── reading ───────────────────────────────────────────────────────────────
+
+(defn- codec-of [c]
+  (let [bs (mf/cid->bytes c)]
+    (when (= 0x01 (int (nth bs 0)))
+      (bit-and (int (nth bs 1)) 0xff))))
+
+(def ^:const default-max-blocks
+  "A ceiling on how many blocks one read may touch. Traversal is driven by
+  bytes fetched from somewhere else; a cycle or a hostile DAG must end in a
+  refusal rather than in memory exhaustion."
+  1000000)
+
+(defn read-file
+  "Reassemble a file from `get-block`, a `cid → bytes | nil` function.
+
+  Every block is verified against the CID it was asked for before it is
+  used, so a store that returns different bytes fails closed instead of
+  producing a file that never existed. A missing block throws rather than
+  yielding a short read: a truncated file that reports success is the one
+  outcome worth ruling out.
+
+  Returns platform bytes."
+  ([get-block root] (read-file get-block root nil))
+  ([get-block root {:keys [max-blocks] :or {max-blocks default-max-blocks}}]
+   (let [seen (atom 0)
+         fetch (fn [c expect-codec]
+                 (when (> (swap! seen inc) max-blocks)
+                   (throw (ex-info "unixfs: block budget exhausted"
+                                   {:type :unixfs/block-budget
+                                    :root root :max-blocks max-blocks})))
+                 (let [bytes (or (get-block c)
+                                 (throw (ex-info "unixfs: missing block"
+                                                 {:type :unixfs/missing-block
+                                                  :root root :cid c})))
+                       actual (if (= 0x55 expect-codec)
+                                (mf/cidv1-raw bytes)
+                                (dag-pb/cid bytes))]
+                   (when-not (= c actual)
+                     (throw (ex-info "unixfs: block does not hash to its cid"
+                                     {:type :unixfs/cid-mismatch
+                                      :asked c :got actual})))
+                   bytes))
+         walk (fn walk [c]
+                (case (codec-of c)
+                  0x55 (octets (fetch c 0x55))
+                  0x70 (let [node (dag-pb/decode (fetch c 0x70))
+                             data (pb/decode data-schema (:data node))]
+                         (when-not (= type-file (:type data))
+                           (throw (ex-info "unixfs: not a file node"
+                                           {:type :unixfs/not-a-file
+                                            :cid c :unixfs-type (:type data)})))
+                         (into (vec (or (:data data) []))
+                               (mapcat (comp walk :cid))
+                               (:links node)))
+                  (throw (ex-info "unixfs: unsupported codec for a file"
+                                  {:type :unixfs/unsupported-codec
+                                   :cid c :codec (codec-of c)}))))]
+     (->bytes (walk root)))))

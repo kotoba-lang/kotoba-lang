@@ -1,0 +1,185 @@
+(ns kotoba.lang.pqh.pq
+  "Post-quantum hybrid layer (suite \"pqh-v1\") -- port of pqh's
+   src/pq.ts. Per ADR-2606111300 (etzhayyim/root):
+
+     KEM: X25519 + ML-KEM-768 (FIPS 203) -> HKDF-SHA256 combiner.
+     SIG: ML-DSA-65 (FIPS 204) half of the Ed25519+ML-DSA-65 dual signature
+          (the Ed25519 half lives in kotoba.lang.pqh.did-signal, via the
+          kotoba-lang/ed25519 library).
+
+   The raw primitives -- X25519, ML-KEM-768, HKDF-SHA256, ML-DSA-65 -- are an
+   injected `IPq` capability: bind `*pq*` to a host impl (JVM BouncyCastle in
+   the test fixture `kotoba.lang.pqh.pq-bc`; a future cljs impl would use
+   @noble/curves + @noble/post-quantum + @noble/hashes). This namespace imports
+   no vendor SDK; only the KEM combiner orchestration, transcript hashing
+   (via kotoba.lang.pqh.util/sha256), suite bookkeeping, and byte-size
+   constants live here. Each primitive was independently cross-verified
+   byte-for-byte against this repo's own npm deps in this port's test suite
+   (kotoba.lang.pqh.pq-test) -- see the README \"Clojure/CLJC port\" section for
+   exactly what was verified and one documented, deliberate divergence (below).
+
+   .cljc, genuinely dual :clj/:cljs (ADR-2607012200, \"no unguarded
+   java.*/js.* in core\"): pure KEM-combiner orchestration, transcript
+   hashing, and suite bookkeeping over the injected IPq seam. The two
+   platform-specific spots (the KEM-combiner salt's UTF-8 bytes, and
+   ml-dsa-verify's catch-all) go through util.cljc/utf8-bytes and a `#?()`
+   exception-class conditional respectively. No raw X25519/ML-KEM/ML-DSA/
+   HKDF math lives here -- ML-KEM-768/ML-DSA-65 have no Web Crypto browser
+   primitive at all, so a real cljs IPq host impl needs @noble/curves +
+   @noble/post-quantum + @noble/hashes regardless of what this namespace
+   does."
+  (:require [kotoba.lang.pqh.util :as u]))
+
+(def PQ-SUITE "pqh-v1")
+
+(def X25519-PUBLIC-BYTES 32)
+(def MLKEM768-PUBLIC-BYTES 1184)
+(def MLKEM768-CIPHERTEXT-BYTES 1088)
+(def MLDSA65-PUBLIC-BYTES 1952)
+(def HYBRID-SHARED-SECRET-BYTES 32)
+
+(def ^:private KEM-COMBINER-SALT (u/utf8-bytes "etzhayyim/pqh-v1/kem"))
+
+;; ── PQ capability seam ────────────────────────────────────────────────────
+;; The pure core never imports a vendor crypto SDK; the raw post-quantum +
+;; asymmetric primitives are supplied by the host via IPq. Bind `*pq*` before
+;; any PQ call.
+
+(defprotocol IPq
+  "Raw post-quantum + asymmetric primitives. Host supplies a vetted impl
+   (JVM BouncyCastle; the cljs impl uses the Noble curves, post-quantum,
+   and hashes packages)."
+  (-x25519-generate [this])
+  (-x25519-dh [this secret-bytes public-bytes])
+  (-mlkem-generate [this])
+  (-mlkem-encapsulate [this public-bytes])
+  (-mlkem-decapsulate [this secret-bytes ciphertext-bytes])
+  (-hkdf-sha256 [this ikm salt info length])
+  (-mldsa-keygen-from-seed [this seed])
+  (-mldsa-sign [this secret-seed message])
+  (-mldsa-verify [this public-key message signature]))
+
+(def ^:dynamic *pq*
+  "Current IPq impl. Bind via `(binding [pq/*pq* impl] ...)` before any PQ call;
+   nil by default (calling unbound throws).")
+
+(defn- assert-pq []
+  (or *pq*
+      (throw (ex-info
+               "[kotoba.lang.pqh/pq] *pq* not bound -- bind an IPq impl (e.g. kotoba.lang.pqh.pq-bc/bc-pq) before PQ calls"
+               {}))))
+
+(defn- assert-suite [suite]
+  (when (not= suite PQ-SUITE)
+    (throw (ex-info (str "[kotoba.lang.pqh/pq] unsupported suite: " suite) {:suite suite}))))
+
+;; ── X25519 + ML-KEM-768 hybrid KEM ───────────────────────────────────────
+
+(defn generate-hybrid-kem-key-pair
+  "Fresh hybrid (X25519 + ML-KEM-768) KEM key pair:
+   {:public-bundle {:suite :x25519-public-key :mlkem-public-key}
+    :secret-bundle {:suite :x25519-secret-key :mlkem-secret-key}}"
+  []
+  (let [pq (assert-pq)
+        [x-secret x-public] (-x25519-generate pq)
+        [kem-secret kem-public] (-mlkem-generate pq)]
+    {:public-bundle {:suite PQ-SUITE :x25519-public-key x-public :mlkem-public-key kem-public}
+     :secret-bundle {:suite PQ-SUITE :x25519-secret-key x-secret :mlkem-secret-key kem-secret}}))
+
+(defn- combine-shared-secrets
+  "KEM combiner: HKDF-SHA256 over the concatenated classical + PQ shared
+   secrets, with the full handshake transcript hash bound into `info`
+   (X-Wing pattern)."
+  ^bytes [{:keys [ss-classical ss-pq transcript info]}]
+  (let [pq (assert-pq)
+        transcript-hash (u/sha256 (apply u/concat-bytes transcript))
+        info-bytes (u/concat-bytes transcript-hash (or info (u/new-bytes 0)))
+        ikm (u/concat-bytes ss-classical ss-pq)]
+    (-hkdf-sha256 pq ikm KEM-COMBINER-SALT info-bytes HYBRID-SHARED-SECRET-BYTES)))
+
+(defn hybrid-encapsulate
+  "Initiator side: encapsulate to a recipient's published bundle.
+   Returns {:shared-secret bytes :handshake {:suite :x25519-ephemeral :mlkem-ciphertext}}."
+  ([recipient] (hybrid-encapsulate recipient nil))
+  ([recipient info]
+   (assert-suite (:suite recipient))
+   (let [pq (assert-pq)
+         [eph-secret eph-public] (-x25519-generate pq)
+         ss-classical (-x25519-dh pq eph-secret (:x25519-public-key recipient))
+         [cipher-text ss-pq] (-mlkem-encapsulate pq (:mlkem-public-key recipient))
+         shared-secret (combine-shared-secrets
+                         {:ss-classical ss-classical :ss-pq ss-pq
+                          :transcript [eph-public cipher-text
+                                       (:x25519-public-key recipient) (:mlkem-public-key recipient)]
+                          :info info})]
+     {:shared-secret shared-secret
+      :handshake {:suite PQ-SUITE :x25519-ephemeral eph-public :mlkem-ciphertext cipher-text}})))
+
+(defn hybrid-decapsulate
+  "Responder side: derive the same shared secret from a received handshake.
+   ML-KEM implicit rejection means a tampered ciphertext yields a *different*
+   secret rather than an error; downstream AEAD authentication catches it."
+  ([handshake secret recipient-public] (hybrid-decapsulate handshake secret recipient-public nil))
+  ([handshake secret recipient-public info]
+   (assert-suite (:suite handshake))
+   (assert-suite (:suite secret))
+   (let [pq (assert-pq)
+         ss-classical (-x25519-dh pq (:x25519-secret-key secret) (:x25519-ephemeral handshake))
+         ss-pq (-mlkem-decapsulate pq (:mlkem-secret-key secret) (:mlkem-ciphertext handshake))]
+     (combine-shared-secrets
+       {:ss-classical ss-classical :ss-pq ss-pq
+        :transcript [(:x25519-ephemeral handshake) (:mlkem-ciphertext handshake)
+                     (:x25519-public-key recipient-public) (:mlkem-public-key recipient-public)]
+        :info info}))))
+
+;; ── ML-DSA-65 (FIPS 204) signature component ─────────────────────────────
+;;
+;; IMPORTANT DIVERGENCE FROM THE TS API (documented, deliberate -- see
+;; README "Clojure/CLJC port" section for the full writeup):
+;;
+;; pq.ts's generateMlDsaKeyPair returns {publicKey, secretKey} where
+;; secretKey is @noble/post-quantum's FIPS 204 *expanded* encoding (4032
+;; bytes for ML-DSA-65). This port's generate-ml-dsa-key-pair instead
+;; returns :secret-key as the 32-byte FIPS 204 *seed* -- verified to derive
+;; a BYTE-IDENTICAL public key AND expanded-secret-key encoding to noble's
+;; keygen(seed) for the same seed, and it is the only representation Bouncy
+;; Castle 1.79's public API reliably reconstructs a signing-capable private
+;; key from: independently re-verified in this port's test suite that even
+;; BC's OWN freshly-generated expanded secret key, round-tripped through
+;; `getEncoded()` and back through `(MLDSAPrivateKeyParameters. params
+;; bytes)`, produces a signer that fails to verify -- i.e. that single-byte-
+;; array constructor is not a general expanded-key decoder. The seed
+;; representation is also FIPS 204's own NIST-recommended canonical storage
+;; form. Consequence: a secretKey generated by this namespace is 32 bytes,
+;; not 4032, and is NOT wire-compatible with a TS-side secretKey byte layout
+;; -- but publicKey and every signature ARE fully cross-verified with noble.
+;; This namespace's own generate+sign pair is internally consistent either
+;; way, and secret keys never cross the wire in pq.ts's actual protocol.
+
+(defn generate-ml-dsa-key-pair
+  "Generate an ML-DSA-65 key pair. A 32-byte seed may be supplied for
+   deterministic derivation; omit it for a random pair (a random 32-byte
+   seed is generated either way -- see the namespace docstring for why
+   :secret-key is that seed, not noble's 4032-byte expanded encoding)."
+  ([] (generate-ml-dsa-key-pair nil))
+  ([seed]
+   (let [s (or seed (u/random-bytes 32))]
+     (when (not= 32 (alength ^bytes s))
+       (throw (ex-info "[kotoba.lang.pqh/pq] ML-DSA seed must be 32 bytes" {})))
+     {:public-key (-mldsa-keygen-from-seed (assert-pq) s)
+      :secret-key s})))
+
+(defn ml-dsa-sign
+  "Sign a message with ML-DSA-65. secret-key is the 32-byte seed returned by
+   generate-ml-dsa-key-pair (see namespace docstring)."
+  ^bytes [^bytes secret-key ^bytes message]
+  (-mldsa-sign (assert-pq) secret-key message))
+
+(defn ml-dsa-verify
+  "Verify an ML-DSA-65 signature. public-key is the standard FIPS 204
+   1952-byte encoding (fully cross-compatible with @noble/post-quantum).
+   Returns false (never throws) on mismatch."
+  [^bytes public-key ^bytes message ^bytes signature]
+  (try
+    (boolean (-mldsa-verify (assert-pq) public-key message signature))
+    (catch  _ false)))

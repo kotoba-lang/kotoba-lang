@@ -1,0 +1,211 @@
+(ns sigv4.core
+  "AWS Signature Version 4 — the **pure** half, shared across this workspace.
+
+  Every function here is a total function from data to data: no clock, no
+  randomness, no network, no crypto primitives, no host interop beyond UTF-8
+  byte extraction. That is deliberate. SigV4 is famously easy to get wrong in
+  the *string* layer (encoding rules, sort order, trailing newlines), and that
+  layer is exactly the part that can be pinned by the published AWS reference
+  vectors — see `test/sigv4/core_test.cljc`, which asserts the documented
+  canonical-request / string-to-sign / signature values byte for byte.
+
+  The two impure ingredients SigV4 needs — SHA-256 and HMAC-SHA-256 — are NOT
+  here. The host supplies them (`sigv4.crypto`, or its own `ICrypto`), because
+  their shape differs per runtime: `javax.crypto` is synchronous on the JVM
+  while `crypto.subtle` returns Promises in a browser or Worker. Keeping them
+  out means this namespace is identical on every runtime in the kotoba-lang
+  ladder, and testable without a crypto provider.
+
+  `signing-key-chain` is the seam: it returns the *ordered HMAC inputs* for the
+  key-derivation ladder, so the host folds its own HMAC over them — sync or
+  async, its choice — without this namespace ever touching a cipher.
+
+  Spec: https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-authenticating-requests.html"
+  (:require [clojure.string :as str]))
+
+(def algorithm "AWS4-HMAC-SHA256")
+
+(def terminator "aws4_request")
+
+(def default-service
+  "Most callers in this workspace sign against S3-compatible object stores
+  (Storj Gateway-MT, Backblaze B2, kotobase's own S3 surface). Other AWS
+  services pass `:service` explicitly."
+  "s3")
+
+(def unsigned-payload
+  "Payload-hash sentinel for presigned URLs and streaming bodies, where the
+  content hash is not known (or not wanted) at signing time."
+  "UNSIGNED-PAYLOAD")
+
+(def empty-payload-sha256
+  "SHA-256 of the empty string — the payload hash of every GET/HEAD/DELETE.
+  Hardcoded rather than computed so the pure layer needs no digest provider."
+  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+
+;; ── RFC 3986 percent-encoding ────────────────────────────────────────────────
+;;
+;; S3 requires strict RFC 3986 encoding with uppercase hex, and unlike
+;; `encodeURIComponent` it does NOT exempt ! ' ( ) *. Rather than call
+;; `encodeURIComponent` and patch the exceptions back (the usual JS recipe, and
+;; a recurring source of signature mismatches), encode from UTF-8 bytes
+;; directly — one implementation, identical output on every runtime.
+;;
+;; Encoding from bytes rather than characters also fixes a real defect in the
+;; implementations this library replaces: a `charCodeAt`-based encoder emits
+;; UTF-16 code units, so any non-ASCII key or query value signs differently
+;; from what AWS and every S3 SDK compute. `kotoba/pct_encode.kotoba` is a
+;; second, independent implementation of this exact function, held to
+;; byte-equality with it over all 256 byte values.
+
+(def ^:private unreserved
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~")
+
+(def ^:private hex-digits "0123456789ABCDEF")
+
+(defn- utf8-bytes
+  "→ seq of unsigned byte values (0-255) for `s`."
+  [s]
+  )
+
+(defn- pct [b]
+  (str "%" (nth hex-digits (bit-shift-right b 4)) (nth hex-digits (bit-and b 0xf))))
+
+(defn uri-encode
+  "Percent-encode `s` per RFC 3986 with uppercase hex — S3's canonicalization
+  rule. Only A-Z a-z 0-9 - _ . ~ survive unencoded; `/` IS encoded (callers that
+  need path separators preserved split first — see `object-path`)."
+  [s]
+  (let [s (str s)]
+    (apply str
+           (for [b (utf8-bytes s)
+                 :let [c (char b)]]
+             (if (and (< b 128) (str/includes? unreserved (str c)))
+               (str c)
+               (pct b))))))
+
+;; ── canonical URI / query ────────────────────────────────────────────────────
+
+(defn bucket-path
+  "Path-style canonical URI for a bucket itself: `/<bucket>`."
+  [bucket]
+  (str "/" (uri-encode bucket)))
+
+(defn object-path
+  "Path-style canonical URI for `key` in `bucket`: `/<bucket>/<key>`, with each
+  `/`-separated key segment encoded independently so the separators survive.
+  An empty/blank `key` degrades to `bucket-path`."
+  [bucket key]
+  (if (str/blank? (str key))
+    (bucket-path bucket)
+    (str (bucket-path bucket) "/"
+         (str/join "/" (map uri-encode (str/split (str key) #"/" -1))))))
+
+(defn canonical-query
+  "Canonical query string from a map of string→string: each key and value
+  percent-encoded, then sorted by encoded key (ties broken by encoded value) and
+  joined with `&`. Returns `\"\"` for an empty/nil map."
+  [params]
+  (->> params
+       (map (fn [[k v]] [(uri-encode (name k)) (uri-encode (str v))]))
+       (sort)
+       (map (fn [[k v]] (str k "=" v)))
+       (str/join "&")))
+
+;; ── timestamps ───────────────────────────────────────────────────────────────
+
+(defn amz-dates
+  "ISO-8601 instant → `{:long \"20130524T000000Z\" :short \"20130524\"}`.
+
+  Pure string surgery on an instant the *caller* supplies (`(.toISOString
+  (js/Date.))` / `(str (java.time.Instant/now))`) — this namespace never reads a
+  clock, which is what makes the reference vectors reproducible."
+  [iso]
+  (let [long-form (-> (str iso)
+                      (str/replace #"\.\d+" "")
+                      (str/replace #"[:-]" ""))]
+    {:long long-form :short (subs long-form 0 8)}))
+
+;; ── canonical request / string to sign ───────────────────────────────────────
+
+(defn canonical-headers
+  "The canonical header block for `signed-headers` (already lowercase, sorted):
+  `name:trimmed-value\\n` per line. Split out because the verification side
+  reconstructs it from a header list rather than a map."
+  [headers signed-headers]
+  (apply str (for [h signed-headers]
+               (str h ":" (str/trim (str (get headers h))) "\n"))))
+
+(defn canonical-request
+  "→ `{:canonical-request <str> :signed-headers <str>}`.
+
+  `headers` is a map of name→value; names are lowercased and values trimmed and
+  sorted, per spec. `payload-hash` is the hex SHA-256 of the body (or
+  `unsigned-payload`) and must match the `x-amz-content-sha256` header you send."
+  [{:keys [method path query headers payload-hash]}]
+  (let [hs     (->> headers
+                    (map (fn [[k v]] [(str/lower-case (name k)) (str/trim (str v))]))
+                    (sort-by first))
+        signed (mapv first hs)]
+    {:signed-headers (str/join ";" signed)
+     :canonical-request
+     (str/join "\n" [(str/upper-case (name method))
+                     path
+                     (or query "")
+                     ;; each canonical header line ends in \n, so joining with
+                     ;; \n yields the blank line the spec requires before
+                     ;; SignedHeaders.
+                     (canonical-headers (into {} hs) signed)
+                     (str/join ";" signed)
+                     payload-hash])}))
+
+(defn credential-scope
+  "`<yyyymmdd>/<region>/<service>/aws4_request`."
+  ([short-date region] (credential-scope short-date region default-service))
+  ([short-date region service]
+   (str/join "/" [short-date region service terminator])))
+
+(defn string-to-sign
+  "The four-line string whose HMAC under the derived signing key is the
+  signature. `canonical-request-hash` is the hex SHA-256 of `:canonical-request`."
+  [long-date scope canonical-request-hash]
+  (str/join "\n" [algorithm long-date scope canonical-request-hash]))
+
+(defn signing-key-chain
+  "Ordered inputs for the SigV4 key-derivation ladder:
+
+      kDate    = HMAC(\"AWS4\" + secret, short-date)
+      kRegion  = HMAC(kDate,    region)
+      kService = HMAC(kRegion,  service)
+      kSigning = HMAC(kService, \"aws4_request\")
+
+  → `{:seed \"AWS4<secret>\" :steps [short-date region service \"aws4_request\"]}`.
+  The host folds its own HMAC over `:steps` starting from `:seed`, which is how
+  this namespace derives keys without owning a crypto primitive. `:seed` is
+  named for what it is — the prefixed secret, not the secret."
+  ([secret short-date region] (signing-key-chain secret short-date region default-service))
+  ([secret short-date region service]
+   {:seed  (str "AWS4" secret)
+    :steps [short-date region service terminator]}))
+
+(defn authorization-header
+  "The `Authorization` header value for a signed (non-presigned) request."
+  [key-id scope signed-headers signature]
+  (str algorithm " Credential=" key-id "/" scope
+       ", SignedHeaders=" signed-headers
+       ", Signature=" signature))
+
+;; ── presigned URLs ───────────────────────────────────────────────────────────
+
+(defn presign-params
+  "The `X-Amz-*` query parameters of a presigned URL, *before* the signature is
+  appended. Merge with any operation parameters, feed through `canonical-query`,
+  sign, then add `X-Amz-Signature`.
+
+  `expires-seconds` is capped by S3 at 604800 (7 days)."
+  [{:keys [key-id scope long-date expires-seconds signed-headers]}]
+  {"X-Amz-Algorithm"     algorithm
+   "X-Amz-Credential"    (str key-id "/" scope)
+   "X-Amz-Date"          long-date
+   "X-Amz-Expires"       (str expires-seconds)
+   "X-Amz-SignedHeaders" signed-headers})

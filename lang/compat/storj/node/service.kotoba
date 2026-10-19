@@ -1,0 +1,156 @@
+(ns storj.node.service
+  "What a node answers when it is asked.
+
+  Everything before this was the node speaking. A storage node spends most of
+  its life being spoken to — a satellite pings it, asks which pieces it has
+  lost, hands it a bloom filter, tells it to delete things — and until there
+  was a `drpc.server` there was nowhere to put any of that.
+
+  ## The unary surface, and what is missing from it
+
+  `Upload`, `Download` and `RetainBig` are streaming rpcs and are not here.
+  What is here is what a satellite asks between transfers:
+
+  | rpc | what it means |
+  |---|---|
+  | `/contact.Contact/PingNode` | are you reachable at the address you claimed |
+  | `/piecestore.Piecestore/Exists` | which of these have you lost |
+  | `/piecestore.Piecestore/Retain` | keep these, the rest is garbage |
+  | `/piecestore.Piecestore/DeletePieces` | delete these |
+  | `/piecestore.Piecestore/RestoreTrash` | put back what you were about to lose |
+
+  A node that serves only these is not useful to an uplink and *is* useful to
+  a satellite, which is the half that decides whether it stays on the network.
+
+  ## PingNode is empty and that is the point
+
+  `ContactPingRequest` and `ContactPingResponse` have no fields. The satellite
+  is not asking anything; it is checking that the address in the check-in
+  reaches a process that can complete a Storj handshake and answer. So the
+  work is all in the layers underneath, and the handler is one line.
+
+  ## An unknown rpc is an error, not silence
+
+  A satellite calling something this build does not serve gets `Unimplemented`
+  back. A server that ignored it would leave the satellite waiting for a reply
+  that is never coming, and the timeout it eventually reports would say
+  nothing about why."
+  (:require [proto.wire :as w]
+            [storj.node.pb :as pb]
+            [storj.node.protocols :as p]
+            [storj.node.retain :as retain]))
+
+(def ping-rpc     "/contact.Contact/PingNode")
+(def exists-rpc   "/piecestore.Piecestore/Exists")
+(def retain-rpc   "/piecestore.Piecestore/Retain")
+(def delete-rpc   "/piecestore.Piecestore/DeletePieces")
+(def restore-rpc  "/piecestore.Piecestore/RestoreTrash")
+
+(def unimplemented-code
+  "`drpcerr` has no named constant for this; the code travels as an opaque
+  uint64 and a satellite reads the message. Zero is what an error with no code
+  carries, so an unknown rpc uses one that is not zero and says so in words."
+  12)
+
+;; ── the handlers ────────────────────────────────────────────────────────────
+
+(defn ping
+  "`PingNode`. Both messages are empty, so the answer is no bytes at all —
+  which is a valid protobuf message and not the same as sending nothing."
+  [_state _request]
+  {:response []})
+
+(defn exists
+  "`Exists`. Answers with the **indices** of the pieces this node does not
+  have, not their ids.
+
+  A node answering with ids would be answering a different question, and the
+  satellite would read the first varint of an id as an index — a piece id
+  beginning 0x08 would be reported as index 8. The two encodings are not
+  distinguishable on the wire."
+  [{:keys [blobs paths]} request]
+  (let [msg (w/decode request)
+        ids (mapv w/bytes-value (w/fields msg 1))
+        missing (keep-indexed (fn [i id]
+                                (when-not (p/-exists? blobs (paths id)) i))
+                              ids)]
+    {:response (w/encode (mapv #(w/varint-field 1 %) missing))
+     :checked (count ids)
+     :missing (vec missing)}))
+
+(defn retain
+  "`Retain`. Decides what may go and — deliberately — does not delete it.
+
+  `storj.node.retain/partition-pieces` answers the question; carrying it out
+  means walking every piece this node holds for that satellite, which is
+  hours of disk on a real node and is the caller's to schedule. The response
+  is empty either way: `RetainResponse` has no fields, so a satellite learns
+  nothing from it and is not waiting to."
+  [{:keys [pieces created-at-of on-retain]} request]
+  (let [msg    (w/decode request)
+        filter-bytes (pb/get-bytes msg pb/retain-request :filter)
+        created (pb/timestamp-seconds (pb/get-field msg pb/retain-request :creation-date))
+        bloom  (retain/parse filter-bytes)
+        result (retain/partition-pieces bloom (or pieces [])
+                                        {:filter-created-at created
+                                         :created-at-of created-at-of})]
+    (when on-retain (on-retain (assoc result :filter bloom :created-at created)))
+    {:response [] :keep (count (:keep result)) :delete (count (:delete result))}))
+
+(defn delete-pieces
+  "`DeletePieces`. This one does delete: the satellite named them.
+
+  `unhandled_count` is how many were *not* dealt with, which is the opposite
+  of the obvious reading. A node reporting its successes there tells a
+  satellite that everything failed."
+  [{:keys [blobs paths]} request]
+  (let [msg (w/decode request)
+        ids (mapv w/bytes-value (w/fields msg 1))
+        unhandled (reduce (fn [n id]
+                            (try (p/-delete blobs (paths id)) n
+                                 (catch  _ (inc n))))
+                          0 ids)]
+    {:response (w/encode (if (zero? unhandled) [] [(w/varint-field 1 unhandled)]))
+     :deleted (- (count ids) unhandled)
+     :unhandled unhandled}))
+
+(defn restore-trash
+  "`RestoreTrash`. Both messages are empty; whether anything is restorable is
+  the blob store's business and this node has no trash."
+  [{:keys [on-restore]} _request]
+  (when on-restore (on-restore))
+  {:response []})
+
+;; ── routing ─────────────────────────────────────────────────────────────────
+
+(def handlers
+  {ping-rpc    ping
+   exists-rpc  exists
+   retain-rpc  retain
+   delete-rpc  delete-pieces
+   restore-rpc restore-trash})
+
+(defn handle
+  "Answer one call.
+
+  Returns `{:response bytes}` or `{:error {:code n :message s}}`. Never
+  throws for anything a peer can send: this side is reachable by whoever
+  completed a handshake, and a handler that throws takes the connection with
+  it."
+  [state {:keys [rpc request]}]
+  (if-let [f (get handlers rpc)]
+    (try
+      (f state request)
+      (catch  e
+        {:error {:code 2
+                 :message (str "storj.node.service: " rpc " failed: "
+                               (or 
+                                   "unknown"))}}))
+    {:error {:code unimplemented-code
+             :message (str "unimplemented rpc: " rpc)}}))
+
+(defn served
+  "The rpcs this build answers. A satellite asking for anything else is told
+  so rather than left waiting."
+  []
+  (set (keys handlers)))

@@ -1,0 +1,286 @@
+(ns status-list.core
+  "W3C Bitstring Status List v1.0 — revocation and suspension for Verifiable
+   Credentials.
+
+   A credential carries a `credentialStatus` entry pointing at a status list
+   credential and an index into it. The list is a bitstring of at least 131,072
+   bits, GZIP-compressed and multibase base64url-encoded, so one fetch answers
+   \"is it still valid?\" for 131,072 credentials without revealing which one the
+   verifier cares about. That herd-privacy property is the reason for the minimum
+   size, and `generate` therefore refuses to go below it.
+
+     (require '[status-list.core :as sl])
+
+     ;; issuer: credential #7 revoked, #9 revoked
+     (def encoded (sl/generate {7 1, 9 1}))
+
+     ;; verifier: given the (already proof-verified) status list credential
+     (sl/check-status entry status-list-credential)
+     ;=> {:status 1 :valid? false :purpose \"revocation\" :index 7}
+
+   Reference: https://www.w3.org/TR/vc-bitstring-status-list/ §3.1-3.4"
+  (:require [clojure.string :as str]
+            [deflate.core :as deflate]
+            [multiformats.core :as mf]))
+
+;; §3.2 step 2: the floor is 131,072 ENTRIES, which at statusSize 1 is a 16 KiB
+;; bitstring. Below it, the set of credentials sharing a list is small enough
+;; that fetching the list starts to identify which credential is being checked.
+(def minimum-number-of-entries 131072)
+(def default-status-size 1)
+
+(def status-purposes
+  "§ \"statusPurpose\" — the defined values. `message` requires statusSize > 1."
+  #{"revocation" "suspension" "refresh" "message"})
+
+(defn- fail! [code msg data]
+  (throw (ex-info msg (assoc data :status-list/error code))))
+
+;; ── bit addressing (§3.1 note) ───────────────────────────────────────────────
+;; "the first index, with a value of zero, is located at the LEFT-MOST bit" — so
+;; index 0 is the most significant bit of byte 0, not the least. Getting this
+;; backwards produces a list that decodes without error and reports the wrong
+;; credential as revoked, which is the worst possible failure mode here.
+(defn- bit-address [pos] [(quot pos 8) (- 7 (mod pos 8))])
+
+(defn- set-bits
+  "Write `value` into `size` bits starting at bit position `pos`, MSB-first."
+  [bytes-vec pos size value]
+  (reduce
+   (fn [bv i]
+     (let [bit (bit-and (bit-shift-right value (- size 1 i)) 1)
+           [bi off] (bit-address (+ pos i))]
+       (when (>= bi (count bv))
+         (fail! :status-list/index-out-of-range
+                "status index falls outside the bitstring"
+                {:bit-position (+ pos i) :bitstring-bytes (count bv)}))
+       (assoc bv bi (bit-and 0xff
+                             (if (= 1 bit)
+                               (bit-or (nth bv bi) (bit-shift-left 1 off))
+                               (bit-and (nth bv bi) (bit-not (bit-shift-left 1 off))))))))
+   bytes-vec
+   (range size)))
+
+(defn- get-bits
+  "Read `size` bits starting at bit position `pos`, MSB-first, as an integer."
+  [bytes-vec pos size]
+  (reduce
+   (fn [acc i]
+     (let [[bi off] (bit-address (+ pos i))]
+       (when (>= bi (count bytes-vec))
+         (fail! :status-list/index-out-of-range
+                "status index falls outside the bitstring"
+                {:bit-position (+ pos i) :bitstring-bytes (count bytes-vec)}))
+       (bit-or (bit-shift-left acc 1)
+               (bit-and (bit-shift-right (nth bytes-vec bi) off) 1))))
+   0
+   (range size)))
+
+;; ── §3.1 Generate ────────────────────────────────────────────────────────────
+(defn generate
+  "§3.1. Build an `encodedList` from a map of `{status-list-index -> status-value}`.
+
+   A collection of indices is also accepted and means \"set each of these to 1\",
+   which is the common revocation case.
+
+   Options:
+     :status-size  bits per entry, default 1
+     :entries      how many entries the list holds, default 131,072
+
+   Deterministic: `deflate.core/gzip` fixes MTIME to 0 and OS to 255, so the same
+   input always yields the same `encodedList`. That matters because this value
+   goes inside a signed credential — a timestamp in the gzip header would change
+   the signature on every regeneration of an unchanged list."
+  ([statuses] (generate statuses {}))
+  ([statuses {:keys [status-size entries]
+              :or {status-size default-status-size
+                   entries minimum-number-of-entries}}]
+   (when-not (and (integer? status-size) (pos? status-size))
+     (fail! :status-list/bad-status-size "statusSize must be a positive integer"
+            {:status-size status-size}))
+   (when (< entries minimum-number-of-entries)
+     ;; Refusing rather than padding silently: a caller asking for a small list
+     ;; is asking for something the spec forbids, and the reason is privacy, not
+     ;; bookkeeping.
+     (fail! :status-list/too-few-entries
+            (str "a status list must hold at least " minimum-number-of-entries
+                 " entries; a shorter list narrows the set of credentials sharing "
+                 "it enough to identify which one a verifier is checking")
+            {:entries entries :minimum minimum-number-of-entries}))
+   (let [statuses (if (map? statuses)
+                    statuses
+                    (into {} (map (fn [i] [i 1])) statuses))
+         total-bits (* entries status-size)
+         nbytes (quot (+ total-bits 7) 8)
+         max-value (dec (bit-shift-left 1 status-size))
+         bitstring (reduce
+                    (fn [bv [idx value]]
+                      (when-not (and (integer? idx) (nat-int? idx))
+                        (fail! :status-list/bad-index
+                               "statusListIndex must be a non-negative integer"
+                               {:index idx}))
+                      (when-not (and (integer? value) (<= 0 value max-value))
+                        (fail! :status-list/bad-status-value
+                               (str "status value must be between 0 and " max-value
+                                    " for statusSize " status-size)
+                               {:index idx :value value}))
+                      (when (>= idx entries)
+                        (fail! :status-list/index-out-of-range
+                               "statusListIndex is beyond the list's entry count"
+                               {:index idx :entries entries}))
+                      ;; §3.1 step 3: the position is index * statusSize.
+                      (set-bits bv (* idx status-size) status-size value))
+                    (vec (repeat nbytes 0))
+                    statuses)]
+     ;; §3.1 step 4: GZIP, then multibase base64url with no padding (prefix `u`).
+     (str "u" (mf/base64url (deflate/gzip bitstring))))))
+
+;; ── §3.4 Bitstring Expansion ─────────────────────────────────────────────────
+(defn expand
+  "§3.4. `encodedList` -> a vector of unsigned bytes (the uncompressed bitstring)."
+  [encoded-list]
+  (when-not (string? encoded-list)
+    (fail! :status-list/bad-encoded-list "encodedList must be a string"
+           {:got (type encoded-list)}))
+  (when-not (str/starts-with? encoded-list "u")
+    ;; Multibase is self-describing; guessing the base would let a value encoded
+    ;; some other way decode into a plausible-looking but wrong bitstring.
+    (fail! :status-list/bad-multibase
+           "encodedList must be multibase base64url with no padding (prefix `u`)"
+           {:prefix (when (seq encoded-list) (subs encoded-list 0 1))}))
+  ;; Mask to unsigned BEFORE gunzip, not after. `base64url-decode` returns a
+  ;; byte-array on :clj (the documented convention it shares with
+  ;; base32-decode/base58btc-decode) whose bytes are SIGNED, so the gzip magic
+  ;; 0x8b arrives as -117 and the header check rejects a perfectly good member
+  ;; with "bad magic". On :cljs it returns unsigned ints already, so without this
+  ;; the two hosts disagree.
+  (let [gz (mapv #(bit-and % 0xff) (seq (mf/base64url-decode (subs encoded-list 1))))]
+    (mapv #(bit-and % 0xff) (deflate/gunzip gz))))
+
+;; ── documents ────────────────────────────────────────────────────────────────
+(defn entry
+  "A `BitstringStatusListEntry` for a credential's `credentialStatus` field.
+
+   `statusListIndex` is a base-10 STRING per the spec, not a number — it is an
+   arbitrary-size integer and JSON numbers cannot carry one faithfully."
+  [{:keys [id purpose index status-list-credential status-size status-message]
+    :or {purpose "revocation" status-size default-status-size}}]
+  (when-not (contains? status-purposes purpose)
+    (fail! :status-list/bad-purpose
+           (str "statusPurpose must be one of " (str/join ", " (sort status-purposes)))
+           {:purpose purpose}))
+  (when-not (nat-int? index)
+    (fail! :status-list/bad-index "index must be a non-negative integer" {:index index}))
+  (when-not (string? status-list-credential)
+    (fail! :status-list/missing-status-list-credential
+           "statusListCredential must be a URL string" {}))
+  (when (and (> status-size 1) (not (seq status-message)))
+    ;; The spec requires statusMessage when statusSize > 1, and without it a
+    ;; multi-bit status is an opaque integer no verifier can interpret.
+    (fail! :status-list/status-message-required
+           "statusMessage is required when statusSize > 1"
+           {:status-size status-size}))
+  (when (seq status-message)
+    (let [expected (bit-shift-left 1 status-size)]
+      (when-not (= expected (count status-message))
+        (fail! :status-list/bad-status-message
+               (str "statusMessage must have exactly " expected
+                    " entries for statusSize " status-size)
+               {:got (count status-message) :expected expected}))))
+  (cond-> {"type" "BitstringStatusListEntry"
+           "statusPurpose" purpose
+           "statusListIndex" (str index)
+           "statusListCredential" status-list-credential}
+    id (assoc "id" id)
+    (> status-size 1) (assoc "statusSize" status-size)
+    (seq status-message) (assoc "statusMessage" (vec status-message))))
+
+(defn status-list-credential
+  "A `BitstringStatusListCredential` — the document whose `credentialSubject`
+   carries the `encodedList`. Returned unsigned; pass it to
+   `data-integrity.core/issue-credential` to add the issuer's proof."
+  [{:keys [id issuer purpose encoded-list valid-from status-size ttl]
+    :or {purpose "revocation"}}]
+  (when-not (contains? status-purposes purpose)
+    (fail! :status-list/bad-purpose "unknown statusPurpose" {:purpose purpose}))
+  (cond-> {"@context" ["https://www.w3.org/ns/credentials/v2"]
+           "id" id
+           "type" ["VerifiableCredential" "BitstringStatusListCredential"]
+           "issuer" issuer
+           "credentialSubject"
+           (cond-> {"id" (str id "#list")
+                    "type" "BitstringStatusList"
+                    "statusPurpose" purpose
+                    "encodedList" encoded-list}
+             (and status-size (> status-size 1)) (assoc "statusSize" status-size)
+             ttl (assoc "ttl" ttl))}
+    valid-from (assoc "validFrom" valid-from)))
+
+;; ── §3.2 Validate ────────────────────────────────────────────────────────────
+(defn check-status
+  "§3.2. Resolve a `BitstringStatusListEntry` against its status list credential.
+
+   Returns `{:status <int> :valid? <bool> :purpose <string> :index <int>}`, plus
+   `:message` when a `statusMessage` names the value.
+
+   `:valid?` is `(zero? status)` — for `revocation` and `suspension` a set bit
+   means the credential is no longer usable.
+
+   IMPORTANT: `status-list-cred` must ALREADY have had its own Data Integrity
+   proof verified (see `kotoba-lang/org-w3-vc-data-integrity`). This function
+   does not fetch `statusListCredential` and does not check its signature: a
+   status check that fetched a URL out of credential content would give every
+   verifier an SSRF surface driven by attacker-supplied data, and one that
+   trusted an unverified list would let anyone un-revoke their own credential by
+   serving a list of zeros. Both decisions belong to the caller, explicitly."
+  ([entry-map status-list-cred] (check-status entry-map status-list-cred {}))
+  ([entry-map status-list-cred {:keys [expected-purpose]}]
+   (let [purpose (get entry-map "statusPurpose")
+         idx-str (get entry-map "statusListIndex")
+         subject (get status-list-cred "credentialSubject")
+         list-purpose (get subject "statusPurpose")
+         ;; statusSize may be declared on the entry or on the list; the entry's
+         ;; wins, and 1 is the default when neither says.
+         status-size (or (get entry-map "statusSize")
+                         (get subject "statusSize")
+                         default-status-size)]
+     (when-not (= "BitstringStatusListEntry" (get entry-map "type"))
+       (fail! :status-list/bad-entry-type
+              "credentialStatus type must be BitstringStatusListEntry"
+              {:got (get entry-map "type")}))
+     (when-not (string? idx-str)
+       (fail! :status-list/bad-index
+              "statusListIndex must be a base-10 string" {:got idx-str}))
+     ;; §3.2 step 3: the entry's purpose must match the list's, or the answer
+     ;; would come from a list that tracks something else entirely.
+     (when-not (= purpose list-purpose)
+       (fail! :status-list/purpose-mismatch
+              "entry statusPurpose does not match the status list's statusPurpose"
+              {:entry-purpose purpose :list-purpose list-purpose}))
+     (when (and expected-purpose (not= expected-purpose purpose))
+       (fail! :status-list/purpose-mismatch
+              "statusPurpose is not the one the verifier asked about"
+              {:expected expected-purpose :actual purpose}))
+     (let [index 
+           bitstring (expand (get subject "encodedList"))
+           total-bits (* 8 (count bitstring))]
+       ;; §3.2 step 8: STATUS_LIST_LENGTH_ERROR.
+       (when (< (quot total-bits status-size) minimum-number-of-entries)
+         (fail! :status-list/status-list-length-error
+                (str "status list holds " (quot total-bits status-size)
+                     " entries, fewer than the required " minimum-number-of-entries)
+                {:entries (quot total-bits status-size)
+                 :minimum minimum-number-of-entries}))
+       ;; §3.2 step 9: position = credentialIndex * statusSize.
+       (let [status (get-bits bitstring (* index status-size) status-size)
+             message (when-let [ms (get entry-map "statusMessage")]
+                       (->> ms
+                            (filter #(= status
+                                        ))
+                            first
+                            (#(get % "message"))))]
+         (cond-> {:status status
+                  :valid? (zero? status)
+                  :purpose purpose
+                  :index index}
+           message (assoc :message message)))))))

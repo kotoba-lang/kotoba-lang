@@ -1,0 +1,173 @@
+;; jcs.core — RFC 8785 JSON Canonicalization Scheme.
+;;
+;; Canonicalizes a Clojure value into the single byte sequence RFC 8785 defines
+;; for it, so that two parties who hold the same logical document produce the
+;; same bytes and therefore the same signature. This is the transformation step
+;; of the `eddsa-jcs-2022` cryptosuite (W3C vc-di-eddsa); nothing here signs.
+;;
+;; The four rules that actually matter, all from RFC 8785 §3.2:
+;;
+;;   1. Object members are sorted by property name, compared as arrays of UTF-16
+;;      code units treated as unsigned integers (§3.2.3). Both hosts' native
+;;      string compare already does exactly this, so `sort-by` on the raw name
+;;      is the rule, not an approximation of it.
+;;   2. No whitespace anywhere (§3.2.1).
+;;   3. Strings escape ONLY `"` and `\`, plus C0 controls — U+0008/09/0A/0C/0D as
+;;      \b \t \n \f \r and every other control as LOWERCASE \uhhhh (§3.2.2.2).
+;;      Everything else, including `/` and all non-ASCII, is emitted literally
+;;      as UTF-8.
+;;   4. Numbers serialize as ECMAScript Number::toString (§3.2.2.3, ECMA-262
+;;      7.1.12.1). NaN and Infinity MUST terminate with an error (§3.2.2.3).
+;;
+;; PORTABLE (.cljc). :cljs delegates number serialization to the host, because
+;; in JavaScript `Number.prototype.toString` IS the algorithm the RFC cites.
+;; :clj must reconstruct it: see `shortest-digits` for why Double/toString is
+;; not usable directly.
+;;
+;;   (require '[jcs.core :as jcs])
+;;   (jcs/canonicalize {:b 1 :a 2})          ;=> "{\"a\":2,\"b\":1}"
+;;   (jcs/canonicalize-bytes {"a" 1})        ;=> UTF-8 bytes, ready to hash
+(ns jcs.core
+  (:require [clojure.string :as str])
+  )
+
+;; ── errors ────────────────────────────────────────────────────────────────────
+;; Every failure is fail-closed and carries the offending value: a canonicalizer
+;; that silently coerces is worse than one that refuses, because the caller signs
+;; the result.
+(defn- fail! [code msg data]
+  (throw (ex-info msg (assoc data :jcs/error code))))
+
+;; ── numbers ───────────────────────────────────────────────────────────────────
+;; ECMA-262 7.1.12.1 needs (s, k, n): the shortest decimal digit string s of
+;; length k, with n placing the decimal point, such that s x 10^(n-k) == x.
+;;
+;; On the JVM, Double/toString is NOT a usable source of s. Even with the JDK 19
+;; shortest-repr fix (JDK-4511638) it is specified to produce *a* round-tripping
+;; representation, and for Double/MIN_VALUE it yields "4.9E-324" where ECMAScript
+;; — and RFC 8785's own Appendix B sample — require "5e-324". Trusting it would
+;; make the canonical form host-dependent, which defeats the entire point.
+;;
+;; So derive s directly: `new BigDecimal(double)` is the EXACT binary value, and
+;; rounding it to p significant digits and checking the result still parses back
+;; to x finds the true shortest p. HALF_UP on a positive value implements
+;; ECMA-262's tie rule ("if there are two such possible values of s, choose the
+;; larger s") because the magnitude is always positive here — the sign is split
+;; off by `number->str` before this is called.
+
+
+
+
+(defn- number->str
+  "Serialize a JSON number per RFC 8785 §3.2.2.3 (= ECMAScript Number::toString)."
+  [x]
+  )
+
+;; ── strings ───────────────────────────────────────────────────────────────────
+;; RFC 8785 3.2.2.2: exactly these five controls take their short form, and
+;; only `"` and `\` are escaped outside the control range. U+007F (DEL) is
+;; deliberately absent -- the rule is "U+0000 through U+001F", not "controls".
+(def ^:private short-escapes
+  {\backspace "\\b"
+   \tab       "\\t"
+   \newline   "\\n"
+   \formfeed  "\\f"
+   \return    "\\r"
+   \"         "\\\""
+   \\         "\\\\"})
+
+(defn- hex4 [n]
+  (let [s ]
+    ;; RFC 8785 §3.2.2.2: LOWERCASE hexadecimal, four digits.
+    (str "\\u" (str/join (repeat (- 4 (count s)) \0)) (str/lower-case s))))
+
+;; No host string builder: JVM StringBuilder and goog.string.StringBuffer have
+;; no common surface, and a JSON string in a credential is short enough that
+;; reducing into a seq of pieces costs nothing measurable. Iterating a string
+;; yields Characters on :clj and single-character strings on :cljs; both compare
+;; equal to the char-literal keys of `short-escapes`, and both are accepted by
+;; `str`, so this one body serves both hosts.
+(defn- escape [s]
+  (str \"
+       (apply str
+              (map (fn [ch]
+                     (let [code ]
+                       (cond
+                         (contains? short-escapes ch) (short-escapes ch)
+                         ;; C0 controls with no short form. U+007F (DEL) is NOT
+                         ;; escaped: the rule is "U+0000 through U+001F", not
+                         ;; "control characters".
+                         (< code 0x20) (hex4 code)
+                         :else ch)))
+                   s))
+       \"))
+
+;; ── keys ──────────────────────────────────────────────────────────────────────
+(defn- key->name
+  "JSON property names are strings. Keywords are accepted as a Clojure-side
+   convenience and reduced to their name, which is what a JSON serializer would
+   have emitted anyway. Anything else is refused: silently calling `str` on, say,
+   a number key would invent a property name the caller never wrote."
+  [k]
+  (cond
+    (string? k) k
+    (keyword? k) (if-let [ns' (namespace k)] (str ns' "/" (name k)) (name k))
+    :else (fail! :jcs/invalid-key
+                 (str "object property names must be strings or keywords, got " (type k))
+                 {:key k})))
+
+;; ── walk ──────────────────────────────────────────────────────────────────────
+(declare ^:private emit)
+
+(defn- emit-object [m]
+  (let [pairs (->> m
+                   (map (fn [[k v]] [(key->name k) v]))
+                   ;; §3.2.3 sorting is on the property name as UTF-16 code
+                   ;; units; both hosts' string compare is exactly that.
+                   (sort-by first))]
+    ;; Two distinct Clojure keys can collapse to one JSON name (:a and "a", or
+    ;; :x/a and "x/a"). Emitting both would produce a duplicate member, which is
+    ;; not a canonical JSON object at all.
+    (let [names (map first pairs)
+          dupes (->> names frequencies (keep (fn [[n c]] (when (> c 1) n))) seq)]
+      (when dupes
+        (fail! :jcs/duplicate-key
+               (str "distinct map keys collapse to the same JSON property name: "
+                    (str/join ", " dupes))
+               {:names dupes})))
+    (str "{" (str/join "," (map (fn [[n v]] (str (escape n) ":" (emit v))) pairs)) "}")))
+
+(defn- emit [v]
+  (cond
+    (nil? v) "null"
+    (boolean? v) (if v "true" "false")
+    (string? v) (escape v)
+    (number? v) (number->str v)
+    (map? v) (emit-object v)
+    (sequential? v) (str "[" (str/join "," (map emit v)) "]")
+    ;; A set has no JSON counterpart and no defined order; canonicalizing one
+    ;; would mean inventing an order the caller did not specify.
+    (set? v) (fail! :jcs/unsupported-type
+                    "sets have no JSON representation; convert to a vector in a defined order"
+                    {:value v})
+    (keyword? v) (escape (key->name v))
+    :else (fail! :jcs/unsupported-type
+                 (str "cannot canonicalize a value of type " (type v))
+                 {:value v})))
+
+;; ── public ────────────────────────────────────────────────────────────────────
+(defn canonicalize
+  "Canonical RFC 8785 JSON text for `data`.
+
+   Accepts maps (string or keyword keys), sequentials, strings, keywords,
+   booleans, nil, and numbers. Throws ex-info with a :jcs/error key on NaN,
+   Infinity, integers outside +/-(2^53-1), non-string property names, duplicate
+   property names, sets, and unsupported types."
+  [data]
+  (emit data))
+
+(defn canonicalize-bytes
+  "`canonicalize` encoded as UTF-8 bytes — the form a hash function consumes.
+   RFC 8785 §3.3 defines the canonical form as UTF-8 with no BOM."
+  [data]
+  )

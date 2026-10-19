@@ -1,0 +1,783 @@
+(ns tls.cert
+  "[RFC 8446](https://www.rfc-editor.org/rfc/rfc8446.html) §4.4 — the
+  certificate half of a TLS 1.3 client: the `Certificate` message, the
+  `CertificateVerify` signed content, and the decision about whether the peer
+  on the other end is the one we meant to reach.
+
+  ## Three things this is, and one it is not
+
+  1. **A parser for bytes that arrived from the network.** Every length prefix
+     in `Certificate` and `CertificateVerify` is attacker-controlled, and a
+     length that runs past the buffer is the oldest bug in the protocol. Each
+     prefix is bounds-checked against the enclosing structure's end rather than
+     against the end of the array, so an inner length cannot borrow octets from
+     an outer field. A refusal names the field it happened in.
+
+  2. **A dispatcher, by name and never by default.** A `SignatureScheme` this
+     does not accept is refused with the scheme's registry name, and the ones
+     TLS 1.3 forbids in `CertificateVerify` — the RSASSA-PKCS1-v1_5 family — are
+     refused with their own reason rather than with \"unsupported\". A verifier
+     that falls through to a default on an unknown code verifies something
+     other than what the peer claimed to sign.
+
+  3. **A decision, returned as a value.** `authenticate-peer` answers
+     `[:ok {…}]` or `[:error {:reason …}]`. Nothing here throws: errors are
+     values, per this workspace's language rules, and a refusal a caller cannot
+     name is a refusal an operator cannot act on.
+
+  What it is **not** is a path validator. `authenticate-peer` does not build or
+  check a chain to a trust anchor — see its docstring, which says so in those
+  words, and the `:tls/not-checked` set it returns, which says so in data.
+
+  ## The parser is `kotoba-lang/org-ietf-x509`
+
+  Certificate bytes go to `x509.core`, which is the same parser the CMS,
+  RFC 3161 and PAdES paths in this workspace use. A TLS client with its own
+  X.509 parser would be a second answer to \"whose key is this\", and only one
+  of the two would get fixed.
+
+  ## The pin is SHA-256 of the SubjectPublicKeyInfo
+
+  `spki-sha256-hex` is the format the rest of this workspace already pins with:
+  `aiueos.provider.cloud/spki-sha256-hex` computes `sha256(PublicKey.getEncoded())`,
+  and `PublicKey.getEncoded` is exactly the SubjectPublicKeyInfo DER. Over the
+  key rather than the certificate, so renewal with the same key is not an event
+  and a key change is."
+  (:require [asn1.core :as asn1]
+            [asn1.oid :as oid]
+            [clojure.string :as str]
+            [x509.core :as x509]))
+
+;; ── refusals ─────────────────────────────────────────────────────────────────
+
+(def refusals
+  "Every reason this namespace can return, and why it exists.
+
+  A map rather than a set because a reason keyword is only useful if the person
+  reading the log can find out what it meant. `refusals-test` asserts that
+  every reason the code produces is in here — a refusal that is not documented
+  is a refusal nobody can act on."
+  {;; framing
+   :message-too-short            "fewer octets than the fixed part of the message needs"
+   :length-past-end              "a length prefix asks for more octets than its enclosing structure has left"
+   :trailing-bytes               "octets remain after the structure ended; what was parsed is not what arrived"
+   :not-a-certificate-message    "handshake msg_type is not 11 (certificate)"
+   :not-a-certificate-verify     "handshake msg_type is not 15 (certificate_verify)"
+   :handshake-length-mismatch    "the handshake header's length is not the number of body octets present"
+   :empty-certificate-list       "a server's certificate_list must contain at least the end-entity certificate"
+   :empty-certificate            "cert_data is <1..2^24-1>; a zero-length entry is not a certificate"
+   :certificate-unparseable      "the entry's octets are not a DER Certificate"
+   :empty-signature              "CertificateVerify carried a zero-length signature"
+
+   ;; signature schemes
+   :signature-scheme-unknown     "the SignatureScheme code is not in the RFC 8446 registry this knows"
+   :signature-scheme-unsupported "a registered scheme the provider seam does not accept"
+   :signature-scheme-retired     "a registered scheme built on a broken digest"
+   :rsa-pkcs1-forbidden-in-certificate-verify
+   "RFC 8446 §4.4.3: RSASSA-PKCS1-v1_5 MUST NOT appear in CertificateVerify"
+   :public-key-algorithm-unsupported "the leaf's SubjectPublicKeyInfo algorithm has no accepted scheme"
+   :signature-scheme-key-mismatch "the scheme the peer signed with cannot be produced by the key it presented"
+
+   ;; the signed content
+   :empty-transcript-hash        "a CertificateVerify over a zero-length transcript hash binds nothing"
+   :unknown-side                 "the context string is either the server's or the client's; there is no third"
+
+   ;; the provider seam
+   :provider-missing-signature-verify "no fn at [:signature :verify] in the injected provider"
+   :provider-missing-digest      "no fn at [:hash :sha256] in the injected provider"
+   :provider-threw               "the injected provider threw; a thrown verifier is not a verified signature"
+   :provider-refused             "the provider declined for a reason of its own (see :provider-reason)"
+   :provider-answer-unrecognised "the provider returned something its contract does not allow"
+   :signature-invalid            "the provider verified the content and said no"
+
+   ;; the decision
+   :empty-certificate-chain      "there is no end-entity certificate to decide about"
+   :leaf-unusable                "x509.core refused the leaf (see :detail for its reasons)"
+   :no-spki-pins-configured      "pin mode with an empty pin set would admit everyone"
+   :peer-not-pinned              "the leaf's SPKI digest is not in the configured pin set"
+   :certificate-not-yet-valid    "notBefore is after the time given"
+   :certificate-expired          "notAfter is before the time given"
+   :validity-unmeasured          "validity was to be checked and no time was given; unmeasured is not valid"
+   :no-subject-alt-name          "no subjectAltName, and commonName is not a fallback (RFC 6125 §6.4.4)"
+   :server-name-mismatch         "no dNSName in the leaf matches the name asked for"
+   :server-name-is-ip-address    "an IP literal needs SAN iPAddress, which is not implemented"
+   :leaf-is-ca                   "the end-entity certificate asserts basicConstraints cA"})
+
+(defn- refuse
+  "`[:error {:reason … }]`, and an assert-free guard that the reason is one of
+  ours. A reason invented at a call site is a reason `refusals` cannot explain."
+  [reason detail]
+  [:error (merge {:reason reason
+                  :why (get refusals reason "UNDOCUMENTED REFUSAL — see tls.cert/refusals")}
+                 detail)])
+
+(defn error?  [result] (= :error (first result)))
+(defn ok?     [result] (= :ok (first result)))
+(defn reason  "The reason keyword of an `[:error …]`, or nil." [result]
+  (when (error? result) (:reason (second result))))
+
+;; ── reading bytes that arrived from somewhere else ───────────────────────────
+
+(defn- uint
+  "`n` big-endian octets at `pos`. The caller has already bounds-checked."
+  [ints pos n]
+  (reduce (fn [acc i] (+ (* acc 256) (nth ints i))) 0 (range pos (+ pos n))))
+
+(defn- past-end?
+  "nil when `n` octets are available from `pos` before `limit`, else the detail
+  map for a `:length-past-end` refusal.
+
+  `limit` is the end of the ENCLOSING structure, not the end of the buffer. A
+  certificate entry whose length runs past the certificate_list but not past
+  the record is still an overrun — checking against the array would let an
+  inner field eat an outer one's octets."
+  [pos n limit field]
+  (when (or (neg? n) (> (+ pos n) limit))
+    {:field field :at pos :wanted n :available (max 0 (- limit pos))}))
+
+(defn- read-opaque
+  "A `<0..2^(8*len-octets)-1>` vector: its length prefix, then its body.
+
+  `{:value [ints] :pos next-pos}` or `[:error …]`."
+  [ints pos limit len-octets field]
+  (if-let [d (past-end? pos len-octets limit (str field " length"))]
+    (refuse :length-past-end d)
+    (let [n (uint ints pos len-octets)
+          body (+ pos len-octets)]
+      (if-let [d (past-end? body n limit field)]
+        (refuse :length-past-end d)
+        {:value (subvec ints body (+ body n)) :pos (+ body n)}))))
+
+;; ── the Certificate message (§4.4.2) ─────────────────────────────────────────
+
+(def ^:const handshake-type-certificate 11)
+(def ^:const handshake-type-certificate-verify 15)
+
+(defn- parse-entry-extensions
+  "`Extension extensions<0..2^16-1>` inside a CertificateEntry.
+
+  Parsed rather than kept as octets because an entry extension is how OCSP
+  stapling and SCTs arrive, and a caller that has to re-derive the framing to
+  find one is a caller with a second parser."
+  [ints]
+  (let [limit (count ints)]
+    (loop [pos 0 acc []]
+      (if (= pos limit)
+        [:ok acc]
+        (if-let [d (past-end? pos 2 limit "extension_type")]
+          (refuse :length-past-end d)
+          (let [etype (uint ints pos 2)
+                r (read-opaque ints (+ pos 2) limit 2 "extension_data")]
+            (if (error? r)
+              r
+              (recur (:pos r) (conj acc {:tls/extension-type etype
+                                         :tls/extension-data (:value r)})))))))))
+
+(defn parse-certificate-message
+  "The BODY of a `Certificate` handshake message (§4.4.2) → `[:ok {…}]`.
+
+  ```
+  struct {
+      opaque certificate_request_context<0..2^8-1>;
+      CertificateEntry certificate_list<0..2^24-1>;
+  } Certificate;
+  ```
+
+  The body, not the handshake-framed message — `parse-certificate-handshake`
+  takes that. Answers
+
+  ```clojure
+  {:tls/certificate-request-context [ints]
+   :tls/entries [{:tls/cert-der [ints] :tls/certificate {…x509…}
+                  :tls/extensions [{:tls/extension-type n :tls/extension-data [ints]}]}]
+   :tls/leaf {…x509…}}
+  ```
+
+  and refuses, by name: `:message-too-short`, `:length-past-end` (with the
+  field, the offset, what it wanted and what was there), `:trailing-bytes`,
+  `:empty-certificate-list`, `:empty-certificate`, `:certificate-unparseable`.
+
+  The empty list is a refusal rather than an `[:ok]` with nothing in it. A
+  server that authenticates itself must send its end-entity certificate, and a
+  caller handed `[:ok {:tls/entries []}]` has to remember to check — which is
+  the check this is here to do."
+  [data]
+  (let [ints (asn1/->ints data)
+        limit (count ints)]
+    (if (< limit 4)
+      (refuse :message-too-short
+              {:field "certificate_request_context length + certificate_list length"
+               :available limit :wanted 4})
+      (let [ctx (read-opaque ints 0 limit 1 "certificate_request_context")]
+        (if (error? ctx)
+          ctx
+          (let [lst (read-opaque ints (:pos ctx) limit 3 "certificate_list")]
+            (if (error? lst)
+              lst
+              (cond
+                (not= (:pos lst) limit)
+                (refuse :trailing-bytes {:field "Certificate"
+                                         :consumed (:pos lst) :available limit})
+
+                (zero? (count (:value lst)))
+                (refuse :empty-certificate-list {:field "certificate_list"})
+
+                :else
+                (let [entries (:value lst)
+                      end (count entries)]
+                  (loop [pos 0 idx 0 acc []]
+                    (if (= pos end)
+                      [:ok {:tls/certificate-request-context (:value ctx)
+                            :tls/entries acc
+                            :tls/leaf (:tls/certificate (first acc))}]
+                      (let [c (read-opaque entries pos end 3 (str "cert_data[" idx "]"))]
+                        (if (error? c)
+                          c
+                          (if (zero? (count (:value c)))
+                            (refuse :empty-certificate {:index idx})
+                            (let [x (read-opaque entries (:pos c) end 2
+                                                 (str "extensions[" idx "]"))]
+                              (if (error? x)
+                                x
+                                (let [exts (parse-entry-extensions (:value x))]
+                                  (if (error? exts)
+                                    exts
+                                    (let [parsed (try [:ok (x509/parse (:value c))]
+                                                      (catch  e
+                                                        [:error e]))]
+                                      (if (error? parsed)
+                                        (refuse :certificate-unparseable
+                                                {:index idx
+                                                 :detail 
+                                                 :octets (count (:value c))})
+                                        (recur (:pos x) (inc idx)
+                                               (conj acc {:tls/cert-der (:value c)
+                                                          :tls/certificate (second parsed)
+                                                          :tls/extensions (second exts)}))))))))))))))))))))))
+
+(defn- parse-handshake
+  "Strip the 4-octet handshake header (§4) and check it against what arrived.
+
+  A convenience so a fixture captured off the wire can be used unedited — the
+  handshake layer proper is `tls.handshake`, and when it lands this should call
+  it rather than repeat it. Slicing a fixture by hand is how a fixture becomes
+  wrong."
+  [data expected-type not-this-type]
+  (let [ints (asn1/->ints data)]
+    (cond
+      (< (count ints) 4)
+      (refuse :message-too-short {:field "handshake header"
+                                  :available (count ints) :wanted 4})
+
+      (not= expected-type (nth ints 0))
+      (refuse not-this-type {:field "msg_type" :got (nth ints 0)
+                             :expected expected-type})
+
+      :else
+      (let [n (uint ints 1 3)
+            body (subvec ints 4)]
+        (if (not= n (count body))
+          (refuse :handshake-length-mismatch
+                  {:field "length" :header-says n :body-has (count body)})
+          [:ok body])))))
+
+(defn parse-certificate-handshake
+  "A whole `Certificate` handshake message, header and all, → the same value
+  `parse-certificate-message` returns."
+  [data]
+  (let [b (parse-handshake data handshake-type-certificate :not-a-certificate-message)]
+    (if (error? b) b (parse-certificate-message (second b)))))
+
+;; ── the SubjectPublicKeyInfo and its pin ─────────────────────────────────────
+
+(defn spki-der
+  "The leaf's SubjectPublicKeyInfo, as the exact DER octets that appeared in
+  the certificate. Taken from the parsed element, never re-encoded — a pin over
+  re-encoded bytes is a pin over this library's opinion of them."
+  [certificate]
+  (get-in certificate [:x509/public-key :spki-der]))
+
+(defn spki-sha256-hex
+  "SHA-256 of `spki-der`, lowercase hex → `[:ok \"50602ad3…\"]`.
+
+  The workspace's existing pin format: `aiueos.provider.cloud/spki-sha256-hex`
+  computes `sha256(PublicKey.getEncoded())` and `getEncoded` on a `PublicKey`
+  is the SubjectPublicKeyInfo DER. `kotobase.net` answers
+  `50602ad366823fcf5274a7c917baa4fd24b9de4fd15635ff501177c83d05473e`, which is
+  what the live gate has been pinning it at, and `cert_test` asserts it.
+
+  The digest comes from the injected provider at `[:hash :sha256]`
+  (`tls.provider/contract`). A missing one is `:provider-missing-digest` rather
+  than a nil that hashes to something, and an answer that is not 32 octets is
+  `:provider-answer-unrecognised` rather than a shorter pin -- the seam is
+  allowed to return `[:error :hash/bad-input]`, and hexing that vector would
+  produce a plausible-looking string."
+  [provider certificate]
+  (let [sha256 (get-in provider [:hash :sha256])
+        der (spki-der certificate)]
+    (cond
+      (not (ifn? sha256)) (refuse :provider-missing-digest {:path [:hash :sha256]})
+      (empty? der) (refuse :certificate-unparseable
+                           {:field "subjectPublicKeyInfo" :detail "no SPKI DER on the parsed certificate"})
+      :else
+      (let [d (try [:ok (sha256 (asn1/ints->bytes der))]
+                   (catch  e [:error e]))]
+        (cond
+          (error? d)
+          (refuse :provider-threw {:op [:hash :sha256]
+                                   :detail })
+
+          (and (vector? (second d)) (= :error (first (second d))))
+          (refuse :provider-refused {:op [:hash :sha256]
+                                     :provider-reason (second (second d))})
+
+          (not= 32 (count (asn1/->ints (second d))))
+          (refuse :provider-answer-unrecognised
+                  {:op [:hash :sha256] :expected-octets 32
+                   :got-octets (count (asn1/->ints (second d)))})
+
+          :else [:ok (asn1/hex (second d))])))))
+
+;; ── signature schemes (§4.2.3) ───────────────────────────────────────────────
+
+(def signature-scheme-registry
+  "`SignatureScheme` code → what it is and what happens to it here.
+
+  `:scheme` is the keyword the provider seam accepts; when it is nil the entry
+  carries `:refusal` and `:why` instead. Written out rather than derived so
+  that adding a scheme is adding a row a human read, and so a refusal can name
+  the code the peer actually sent."
+  {0x0201 {:name :rsa-pkcs1-sha1
+           :refusal :rsa-pkcs1-forbidden-in-certificate-verify
+           :why "PKCS#1 v1.5 is forbidden in CertificateVerify (§4.4.3), and SHA-1 is broken besides"}
+   0x0203 {:name :ecdsa-sha1 :refusal :signature-scheme-retired
+           :why "SHA-1 collisions are demonstrated (SHAttered, 2017)"}
+   0x0401 {:name :rsa-pkcs1-sha256
+           :refusal :rsa-pkcs1-forbidden-in-certificate-verify
+           :why "RFC 8446 §4.4.3: PKCS#1 v1.5 codepoints appear only for certificate signatures"}
+   0x0501 {:name :rsa-pkcs1-sha384
+           :refusal :rsa-pkcs1-forbidden-in-certificate-verify
+           :why "RFC 8446 §4.4.3: PKCS#1 v1.5 codepoints appear only for certificate signatures"}
+   0x0601 {:name :rsa-pkcs1-sha512
+           :refusal :rsa-pkcs1-forbidden-in-certificate-verify
+           :why "RFC 8446 §4.4.3: PKCS#1 v1.5 codepoints appear only for certificate signatures"}
+   0x0403 {:name :ecdsa-secp256r1-sha256 :scheme :ecdsa-secp256r1-sha256}
+   0x0503 {:name :ecdsa-secp384r1-sha384 :refusal :signature-scheme-unsupported
+           :why "P-384 is not in the set the provider seam accepts"}
+   0x0603 {:name :ecdsa-secp521r1-sha512 :refusal :signature-scheme-unsupported
+           :why "P-521 is not in the set the provider seam accepts"}
+   0x0804 {:name :rsa-pss-rsae-sha256 :scheme :rsa-pss-rsae-sha256}
+   0x0805 {:name :rsa-pss-rsae-sha384 :scheme :rsa-pss-rsae-sha384}
+   0x0806 {:name :rsa-pss-rsae-sha512 :refusal :signature-scheme-unsupported
+           :why "SHA-512 PSS is not in the set the provider seam accepts"}
+   0x0807 {:name :ed25519 :scheme :ed25519}
+   0x0808 {:name :ed448 :refusal :signature-scheme-unsupported
+           :why "Ed448 is not in the set the provider seam accepts"}
+   0x0809 {:name :rsa-pss-pss-sha256 :refusal :signature-scheme-unsupported
+           :why "rsa_pss_pss_* needs an id-RSASSA-PSS key; the seam accepts the rsae family"}
+   0x080a {:name :rsa-pss-pss-sha384 :refusal :signature-scheme-unsupported
+           :why "rsa_pss_pss_* needs an id-RSASSA-PSS key; the seam accepts the rsae family"}
+   0x080b {:name :rsa-pss-pss-sha512 :refusal :signature-scheme-unsupported
+           :why "rsa_pss_pss_* needs an id-RSASSA-PSS key; the seam accepts the rsae family"}})
+
+(def accepted-schemes
+  "The keywords the provider seam accepts. Derived from the registry so the two
+  cannot disagree."
+  (into #{} (keep :scheme) (vals signature-scheme-registry)))
+
+(defn- hex4 [code]
+  (str "0x" (asn1/hex [(bit-and (bit-shift-right code 8) 0xff) (bit-and code 0xff)])))
+
+(defn scheme-from-wire
+  "A `SignatureScheme` code from the wire → `[:ok :ed25519]` or a refusal that
+  names it.
+
+  An unrecognised code is `:signature-scheme-unknown` and never a default. The
+  RSASSA-PKCS1-v1_5 family gets `:rsa-pkcs1-forbidden-in-certificate-verify`
+  rather than \"unsupported\", because those codepoints are legal in
+  `signature_algorithms` for CERTIFICATE signatures and illegal here (§4.4.3) —
+  reporting that as a gap in this library sends the operator looking in the
+  wrong place."
+  [code]
+  (if-let [{:keys [name scheme refusal why]} (get signature-scheme-registry code)]
+    (if scheme
+      [:ok scheme]
+      (refuse refusal {:code (hex4 code) :scheme-name name :detail why}))
+    (refuse :signature-scheme-unknown {:code (hex4 code)})))
+
+(defn key-signature-schemes
+  "Which schemes the leaf's key could possibly have produced → `[:ok #{…}]`.
+
+  A set because an RSA key can sign with more than one PSS digest, and the
+  question this answers is \"could this key have made that signature\" rather
+  than \"which one did it make\". EC keys are keyed on the named curve: an
+  X9.62 key on P-384 cannot make an `ecdsa_secp256r1_sha256` signature, and
+  reading `id-ecPublicKey` alone would say it could."
+  [certificate]
+  (let [alg (get-in certificate [:x509/public-key :algorithm])
+        curve (try (asn1/oid-value (get-in certificate [:x509/public-key :parameters]))
+                   (catch  _ nil))]
+    (cond
+      (= alg (oid/dotted :ed25519)) [:ok #{:ed25519}]
+
+      (= alg (oid/dotted :rsa-encryption))
+      [:ok #{:rsa-pss-rsae-sha256 :rsa-pss-rsae-sha384}]
+
+      (= alg (oid/dotted :ec-public-key))
+      (if (= curve (oid/dotted :prime256v1))
+        [:ok #{:ecdsa-secp256r1-sha256}]
+        (refuse :public-key-algorithm-unsupported
+                {:algorithm (oid/describe alg)
+                 :curve (if curve (oid/describe curve) "absent")
+                 :detail "only prime256v1 (P-256) is in the accepted set"}))
+
+      :else
+      (refuse :public-key-algorithm-unsupported
+              {:algorithm (oid/describe alg)
+               :detail (if (= alg (oid/dotted :rsassa-pss))
+                         "an id-RSASSA-PSS key signs with rsa_pss_pss_*, which the seam does not accept"
+                         "no accepted SignatureScheme uses this key algorithm")}))))
+
+(defn select-signature-scheme
+  "The scheme to verify with, given the leaf and the code the peer sent →
+  `[:ok :ecdsa-secp256r1-sha256]`.
+
+  Both halves have to agree. A peer that presents a P-256 certificate and signs
+  with `ed25519` is refused as `:signature-scheme-key-mismatch` rather than
+  handed to a provider that would fail obscurely — the mismatch is the
+  interesting fact, and it is lost once it becomes \"signature invalid\"."
+  [certificate code]
+  (let [w (scheme-from-wire code)]
+    (if (error? w)
+      w
+      (let [k (key-signature-schemes certificate)]
+        (if (error? k)
+          k
+          (if (contains? (second k) (second w))
+            w
+            (refuse :signature-scheme-key-mismatch
+                    {:signed-with (second w)
+                     :key-can-produce (second k)
+                     :code (hex4 code)})))))))
+
+;; ── the CertificateVerify signed content (§4.4.3) ────────────────────────────
+
+(def context-strings
+  "The two context strings, exactly as §4.4.3 spells them. A byte wrong here is
+  a client that verifies its own construction and nothing else."
+  {:server "TLS 1.3, server CertificateVerify"
+   :client "TLS 1.3, client CertificateVerify"})
+
+(defn- ascii-bytes [s]
+  (mapv  s))
+
+(defn certificate-verify-content
+  "The octets a `CertificateVerify` signature is computed over (§4.4.3) →
+  `[:ok [ints]]`.
+
+  ```
+  64 octets of 0x20
+  the context string
+  a single 0x00
+  the transcript hash
+  ```
+
+  The 64 spaces and the separator are not decoration: they make the content
+  begin with something that cannot be a TLS 1.2 `ServerKeyExchange`, so a
+  signature made for one protocol version cannot be replayed into the other.
+  The zero byte terminates the context string, which is what keeps
+  `\"…server CertificateVerify\"` from being a prefix of anything else.
+
+  Verified against RFC 8448 §3: over the transcript of that trace's
+  ClientHello‥Certificate, the server's `rsa_pss_rsae_sha256` signature
+  verifies against this construction. See `cert_test/rfc8448-known-answer`.
+
+  An empty transcript hash is refused. A CertificateVerify over nothing binds
+  nothing, and \"the transcript was not measured\" must not produce the same
+  bytes as \"the transcript was measured and is this\"."
+  ([transcript-hash] (certificate-verify-content :server transcript-hash))
+  ([side transcript-hash]
+   (let [h (asn1/->ints transcript-hash)]
+     (cond
+       (not (contains? context-strings side))
+       (refuse :unknown-side {:got side :known (set (keys context-strings))})
+
+       (empty? h)
+       (refuse :empty-transcript-hash {:field "transcript hash"})
+
+       :else
+       [:ok (into [] cat [(repeat 64 0x20)
+                          (ascii-bytes (get context-strings side))
+                          [0x00]
+                          h])]))))
+
+(defn parse-certificate-verify
+  "The BODY of a `CertificateVerify` handshake message (§4.4.3) → `[:ok {…}]`.
+
+  ```
+  struct {
+      SignatureScheme algorithm;
+      opaque signature<0..2^16-1>;
+  } CertificateVerify;
+  ```
+
+  Answers `{:tls/signature-scheme-code n :tls/signature [ints]}`. The code is
+  left as a number here and turned into a keyword by `select-signature-scheme`,
+  which is the only place that also sees the key it has to agree with."
+  [data]
+  (let [ints (asn1/->ints data)
+        limit (count ints)]
+    (if (< limit 4)
+      (refuse :message-too-short {:field "CertificateVerify"
+                                  :available limit :wanted 4})
+      (let [code (uint ints 0 2)
+            sig (read-opaque ints 2 limit 2 "signature")]
+        (cond
+          (error? sig) sig
+          (not= (:pos sig) limit)
+          (refuse :trailing-bytes {:field "CertificateVerify"
+                                   :consumed (:pos sig) :available limit})
+          (empty? (:value sig)) (refuse :empty-signature {:code (hex4 code)})
+          :else [:ok {:tls/signature-scheme-code code
+                      :tls/signature (:value sig)}])))))
+
+(defn parse-certificate-verify-handshake
+  "A whole `CertificateVerify` handshake message, header and all."
+  [data]
+  (let [b (parse-handshake data handshake-type-certificate-verify
+                           :not-a-certificate-verify)]
+    (if (error? b) b (parse-certificate-verify (second b)))))
+
+(defn verify-certificate-verify
+  "Whether the peer's `CertificateVerify` was made by the key in the leaf, over
+  the transcript we measured → `[:ok {:tls/signature-scheme …}]`.
+
+  `provider` supplies the verification at `[:signature :verify]`, which
+  `tls.provider/contract` defines as
+
+      (fn [scheme spki-der message signature]) -> [:ok true] | [:error reason]
+
+  with byte arrays for the three byte arguments. Nothing else in this namespace
+  touches a key.
+
+  **The answer is matched, not tested for truth.** That seam has no `[:ok
+  false]` on purpose -- a rejected signature is `[:error
+  :signature/bad-signature]` -- so a caller that asks whether the return value
+  is truthy reads every rejection as an acceptance, because `[:error ...]` is a
+  non-empty vector. Anything that is neither `[:ok true]` nor `[:error ...]` is
+  `:provider-answer-unrecognised`, and never a pass.
+
+  Three outcomes that look alike are kept apart. `:signature-invalid` says the
+  peer is an impostor; `:provider-refused` says the provider declined for a
+  reason of its own (an SPKI it could not read, a scheme it does not know);
+  `:provider-threw` says we did not find out at all. Collapsing them is how a
+  broken verifier reads as an attack, or worse, how an absent one reads as a
+  pass."
+  [provider {:keys [certificate transcript-hash message side]}]
+  (let [verify (get-in provider [:signature :verify])
+        parsed (if (map? message) [:ok message] (parse-certificate-verify message))]
+    (cond
+      (not (ifn? verify))
+      (refuse :provider-missing-signature-verify {:path [:signature :verify]})
+
+      (error? parsed) parsed
+
+      :else
+      (let [{:tls/keys [signature-scheme-code signature]} (second parsed)
+            scheme (select-signature-scheme certificate signature-scheme-code)]
+        (if (error? scheme)
+          scheme
+          (let [content (certificate-verify-content (or side :server) transcript-hash)]
+            (if (error? content)
+              content
+              (let [r (try [:ok (verify (second scheme)
+                                        (asn1/ints->bytes (spki-der certificate))
+                                        (asn1/ints->bytes (second content))
+                                        (asn1/ints->bytes signature))]
+                           (catch  e [:error e]))
+                    answer (second r)]
+                (cond
+                  (error? r)
+                  (refuse :provider-threw
+                          {:op [:signature :verify] :scheme (second scheme)
+                           :detail })
+
+                  (= [:ok true] answer)
+                  [:ok {:tls/signature-scheme (second scheme)
+                        :tls/signed-octets (count (second content))}]
+
+                  (and (vector? answer) (= :error (first answer))
+                       (= :signature/bad-signature (second answer)))
+                  (refuse :signature-invalid
+                          {:scheme (second scheme)
+                           :signature-octets (count signature)
+                           :detail "the leaf's key did not sign this transcript"})
+
+                  (and (vector? answer) (= :error (first answer)))
+                  (refuse :provider-refused
+                          {:op [:signature :verify] :scheme (second scheme)
+                           :provider-reason (second answer)})
+
+                  :else
+                  (refuse :provider-answer-unrecognised
+                          {:op [:signature :verify] :scheme (second scheme)
+                           :contract "[:ok true] | [:error reason]"
+                           :got (pr-str answer)}))))))))))
+
+;; ── names ────────────────────────────────────────────────────────────────────
+
+(defn- strip-root-dot [s]
+  (if (and (> (count s) 1) (str/ends-with? s ".")) (subs s 0 (dec (count s))) s))
+
+(defn- ip-literal? [s]
+  (boolean (or (re-matches #"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}" s)
+               (str/includes? s ":"))))
+
+(defn server-name-matches?
+  "Whether `presented` (one dNSName) matches `wanted` (the name we asked for),
+  by RFC 6125 §6.4.
+
+  A wildcard is allowed only as the ENTIRE leftmost label of a name with at
+  least three labels, and it matches exactly one label. So
+  `*.ipni.kotobase.net` matches `a.ipni.kotobase.net`, and does not match
+  `ipni.kotobase.net` (no label to consume) or `b.a.ipni.kotobase.net` (two).
+  Partial wildcards (`w*.example.com`) match nothing: they were never
+  interoperable and a client that honours them turns one compromised label into
+  a range."
+  [presented wanted]
+  (let [p (strip-root-dot (str/lower-case (str presented)))
+        w (strip-root-dot (str/lower-case (str wanted)))
+        pl (str/split p #"\." -1)
+        wl (str/split w #"\." -1)]
+    (cond
+      (or (str/blank? p) (str/blank? w)) false
+      (= p w) true
+      (not= "*" (first pl)) false
+      (< (count pl) 3) false
+      (not= (count pl) (count wl)) false
+      :else (= (rest pl) (rest wl)))))
+
+;; ── the decision ─────────────────────────────────────────────────────────────
+
+(def ^:private not-checked
+  "What an `[:ok …]` from `authenticate-peer` does NOT mean. Returned in the
+  value, not only written in the docstring, because a caller logging the map
+  should be logging this too."
+  #{:chain-to-trust-anchor :revocation :name-constraints
+    :certificate-transparency :issuer-signature})
+
+(defn authenticate-peer
+  "Decide whether to talk to this peer → `[:ok {…}]` or `[:error {:reason …}]`.
+
+  **Chain validation to a trust anchor is not implemented.** An `[:ok …]` from
+  this function does not mean the certificate chains to a root this workspace
+  trusts, and it does not mean the leaf's issuer signature was checked, and it
+  does not mean the certificate has not been revoked. It means the checks named
+  in `:tls/checked` passed; `:tls/not-checked` names the rest, in the value, so
+  a caller that logs the decision logs the limit with it.
+
+  **Pin mode is the mode.** The pin is SHA-256 of the leaf's
+  SubjectPublicKeyInfo, which is what the rest of this workspace already does
+  (`aiueos.provider.cloud/spki-sha256-hex`, `grant.cloud/admit-peer`), and it
+  needs no root store — which is the reason it is first: a cloud-premised OS
+  with no filesystem has nowhere to put one. An empty pin set is refused rather
+  than treated as \"no constraint\".
+
+  ```clojure
+  (authenticate-peer provider
+    {:tls/chain      (:tls/entries parsed)      ; or a vector of x509 maps
+     :tls/expect     {:tls/spki-pins #{\"50602ad3…\"}
+                      :tls/server-name \"kotobase.net\"
+                      :tls/check-validity? true    ; default true
+                      :tls/require-leaf-not-ca? true}
+     :tls/now        \"2026-08-22T00:00:00Z\"})
+  ```
+
+  Each check has its own refusal, so an operator can tell which one fired:
+  `:peer-not-pinned` (with `:observed`, the digest that was actually there),
+  `:certificate-expired` / `:certificate-not-yet-valid`, `:validity-unmeasured`,
+  `:server-name-mismatch` (with `:presented`), `:no-subject-alt-name`,
+  `:server-name-is-ip-address`, `:leaf-is-ca`, `:leaf-unusable`,
+  `:empty-certificate-chain`.
+
+  A `commonName` is never a fallback for a missing subjectAltName. RFC 6125
+  §6.4.4 deprecated it and the CA/Browser Forum forbade issuing on it; a client
+  that still reads it accepts certificates no CA has been allowed to issue
+  since 2017."
+  [provider {:tls/keys [chain expect now]}]
+  (let [certs (mapv #(or (:tls/certificate %) %) chain)
+        leaf (first certs)
+        {:tls/keys [spki-pins server-name check-validity? require-leaf-not-ca?]
+         :or {check-validity? true require-leaf-not-ca? true}} expect]
+    (if (nil? leaf)
+      (refuse :empty-certificate-chain {:entries (count chain)})
+      (let [usable (x509/usable? leaf)]
+        (if-not (:usable? usable)
+          (refuse :leaf-unusable {:detail (:reasons usable)
+                                  :subject (:text (:x509/subject leaf))})
+          (let [digest (spki-sha256-hex provider leaf)]
+            (cond
+              (error? digest) digest
+
+              (empty? spki-pins)
+              (refuse :no-spki-pins-configured
+                      {:observed (second digest)
+                       :detail "chain-to-anchor is not implemented, so an empty pin set has nothing left to check"})
+
+              (not (contains? (set spki-pins) (second digest)))
+              (refuse :peer-not-pinned
+                      {:observed (second digest)
+                       :pins (vec (sort spki-pins))
+                       :subject (:text (:x509/subject leaf))})
+
+              (and check-validity? (nil? now))
+              (refuse :validity-unmeasured {:detail "check-validity? is true and :tls/now is nil"})
+
+              (and check-validity?
+                   (pos? (compare (:x509/not-before leaf) now)))
+              (refuse :certificate-not-yet-valid
+                      {:not-before (:x509/not-before leaf) :now now})
+
+              (and check-validity?
+                   (pos? (compare now (:x509/not-after leaf))))
+              (refuse :certificate-expired
+                      {:not-after (:x509/not-after leaf) :now now})
+
+              (and require-leaf-not-ca? (x509/ca? leaf))
+              (refuse :leaf-is-ca {:subject (:text (:x509/subject leaf))
+                                   :basic-constraints (x509/basic-constraints leaf)})
+
+              (and server-name (ip-literal? server-name))
+              (refuse :server-name-is-ip-address
+                      {:server-name server-name
+                       :detail "matching an IP needs SAN iPAddress; only dNSName is implemented"})
+
+              ;; `x509/dns-names` answers nil for "no subjectAltName extension at
+              ;; all" and [] for "a subjectAltName that names no host" (an
+              ;; otherName-only certificate). They are different facts about the
+              ;; certificate and they keep different refusals: `nil` is
+              ;; :no-subject-alt-name, `[]` falls through to
+              ;; :server-name-mismatch with an empty `:presented`. A reader that
+              ;; collapsed them would still pass a test that only ever fed it
+              ;; one of the two, which is why both are asserted in cert-test.
+              (and server-name (nil? (x509/dns-names leaf)))
+              (refuse :no-subject-alt-name
+                      {:server-name server-name
+                       :subject (:text (:x509/subject leaf))})
+
+              (and server-name
+                   (not (some #(server-name-matches? % server-name) (x509/dns-names leaf))))
+              (refuse :server-name-mismatch
+                      {:server-name server-name
+                       :presented (vec (x509/dns-names leaf))})
+
+              :else
+              [:ok {:tls/authenticated-by :spki-pin
+                    :tls/spki-sha256 (second digest)
+                    :tls/subject (:text (:x509/subject leaf))
+                    :tls/chain-length (count certs)
+                    :tls/checked (cond-> #{:spki-pin :leaf-usable}
+                                   check-validity? (conj :validity)
+                                   require-leaf-not-ca? (conj :basic-constraints)
+                                   server-name (conj :server-name))
+                    :tls/not-checked not-checked}])))))))

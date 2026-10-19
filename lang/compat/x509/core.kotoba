@@ -1,0 +1,403 @@
+(ns x509.core
+  "[RFC 5280](https://www.rfc-editor.org/rfc/rfc5280.html) certificate parsing —
+  the subset a signature verifier actually needs, portable `.cljc`.
+
+  ## What this is for, and the line it will not cross
+
+  Enough of a certificate to answer: whose key is this, what is it allowed to
+  sign, over what period, and does its issuer's key vouch for it. That is what
+  CMS, RFC 3161 and PAdES need.
+
+  What it is **not** is a path validation engine, and the gap is deliberate
+  rather than pending. Full RFC 5280 §6 validation includes name constraints,
+  policy mapping, CRL and OCSP freshness — and every one of those turns on
+  fetching something. A library that fetched would hand every caller an SSRF
+  surface driven by attacker-supplied certificate contents, which is the reason
+  `org-w3-vc-data-integrity` requires an injected `:resolve-key` rather than
+  resolving `did:web` itself. So: `verify-signature` takes the issuer's parsed
+  certificate as an argument and an injected `verify-fn`, and `valid-at?` takes
+  the time. Nothing here reaches out, and nothing here holds a key.
+
+  ## The three refusals that are not optional
+
+  1. **The outer `signatureAlgorithm` must equal `tbsCertificate.signature`**
+     (§4.1.1.2). They are the same fact written twice, and only the inner one is
+     covered by the signature. A verifier that reads the outer one and verifies
+     with the inner — or reports the outer to a human — can be shown a
+     certificate that says one algorithm and is checked as another.
+
+  2. **An unrecognised CRITICAL extension makes the certificate unusable**
+     (§4.2). `critical` means the issuer said \"reject this certificate if you do
+     not understand this\". Parsing on and ignoring it inverts the one bit whose
+     entire purpose is to be un-ignorable. `unhandled-critical-extensions`
+     reports them and `usable?` refuses.
+
+  3. **A `BasicConstraints` `cA` of false means it may not sign certificates**,
+     and an absent extension is not permission. `ca?` answers false for both, so
+     a caller cannot read \"no opinion\" as \"allowed\"."
+  (:require [asn1.core :as asn1]
+            [asn1.oid :as oid]
+            [clojure.string :as str]))
+
+(def ^:private handled-extensions
+  "Extensions this library understands well enough to honour when critical.
+
+  A critical extension outside this set makes the certificate unusable, so the
+  set is deliberately short and adding to it means adding the code that acts on
+  it — not just the OID."
+  #{:basic-constraints :key-usage :extended-key-usage
+    :subject-key-identifier :authority-key-identifier :subject-alt-name})
+
+(def key-usage-bits
+  "`KeyUsage` bit positions, in the order RFC 5280 §4.2.1.3 defines them. Bit 0
+  is the most significant bit of the first octet — the same left-most-bit rule
+  that `org-w3-vc-bitstring-status-list` records, and the same way to get it
+  wrong."
+  [:digital-signature :non-repudiation :key-encipherment :data-encipherment
+   :key-agreement :key-cert-sign :crl-sign :encipher-only :decipher-only])
+
+;; ── names ────────────────────────────────────────────────────────────────────
+
+(defn- attribute-type-and-value [element]
+  (let [type-oid (asn1/oid-value (asn1/nth-element element 0))
+        value (asn1/nth-element element 1)]
+    {:oid type-oid
+     :name (oid/named type-oid)
+     :value (try (asn1/string-value value)
+                 ;; A name attribute whose value is not a string type is legal
+                 ;; and rare. Rendering its hex is better than throwing, because
+                 ;; the certificate may still be perfectly usable for signing.
+                 (catch  _
+                   (str "#" (asn1/hex (:asn1/content value)))))}))
+
+(defn parse-name
+  "`Name` → `{:rdns [[{...attr}] …] :attributes {…} :text \"CN=…,O=…\"}`.
+
+  The RDN sequence is kept as a vector of vectors because order is semantically
+  part of a distinguished name — `attributes` is a convenience for reading a
+  `CN` and must not be used to compare two names. Comparison is
+  `issuer-der`/`subject-der` byte equality, which is what CMS's
+  `IssuerAndSerialNumber` means and the only comparison that does not need
+  RFC 4518 string preparation."
+  [element]
+  (let [rdns (mapv (fn [rdn] (mapv attribute-type-and-value (:asn1/elements rdn)))
+                   (:asn1/elements element))
+        attrs (into {} (for [rdn rdns attr rdn :when (:name attr)]
+                         [(:name attr) (:value attr)]))]
+    {:rdns rdns
+     :attributes attrs
+     :der (:asn1/der element)
+     ;; RFC 2253-ish, most specific first, for logs and error messages only.
+     :text (str/join ","
+                     (for [rdn (reverse rdns) attr rdn]
+                       (str (if-let [n (:name attr)]
+                              (str/upper-case
+                               (case n
+                                 :common-name "cn" :country-name "c"
+                                 :organization-name "o"
+                                 :organizational-unit-name "ou"
+                                 :state-or-province-name "st"
+                                 :locality-name "l" :serial-number "serialnumber"
+                                 (str/replace (str n) #"^:" "")))
+                              (:oid attr))
+                            "=" (:value attr))))}))
+
+;; ── extensions ───────────────────────────────────────────────────────────────
+
+(defn- parse-extension [element]
+  (let [children (:asn1/elements element)
+        ext-oid (asn1/oid-value (first children))
+        critical? (if (= :boolean (:asn1/type (second children)))
+                    (asn1/boolean-value (second children))
+                    false)
+        value-octets (last children)]
+    {:oid ext-oid
+     :name (oid/named ext-oid)
+     :critical? critical?
+     ;; extnValue is an OCTET STRING wrapping the extension's own DER.
+     :der (:asn1/content value-octets)}))
+
+(defn extension
+  "The extension named `name-kw`, or nil."
+  [certificate name-kw]
+  (first (filter #(= name-kw (:name %)) (:x509/extensions certificate))))
+
+(defn unhandled-critical-extensions
+  "Critical extensions this library does not act on.
+
+  Non-empty means the certificate MUST NOT be used (§4.2). Returned rather than
+  thrown at parse time so a caller can inspect and report a certificate it will
+  then refuse — a parse that threw would make the certificate unreadable rather
+  than unusable, and those are different things to a human debugging one."
+  [certificate]
+  (->> (:x509/extensions certificate)
+       (filter :critical?)
+       (remove #(contains? handled-extensions (:name %)))
+       vec))
+
+(defn basic-constraints
+  "`{:ca? bool :path-len n|nil}`. Absent extension answers `{:ca? false}` —
+  absence is not permission."
+  [certificate]
+  (if-let [ext (extension certificate :basic-constraints)]
+    (let [seq* (asn1/decode (:der ext))
+          children (:asn1/elements seq*)
+          ca-element (first (filter #(= :boolean (:asn1/type %)) children))
+          path-element (first (filter #(= :integer (:asn1/type %)) children))]
+      {:ca? (boolean (and ca-element (asn1/boolean-value ca-element)))
+       :path-len (when path-element (asn1/integer-value path-element))})
+    {:ca? false :path-len nil}))
+
+(defn ca? [certificate] (boolean (:ca? (basic-constraints certificate))))
+
+(defn key-usage
+  "The set of asserted key usages, or nil when the extension is absent.
+
+  nil and `#{}` are different answers and both are meaningful: absent means the
+  issuer expressed no restriction, and empty means it asserted none. A caller
+  gating on `:digital-signature` must decide which it accepts rather than have
+  this collapse them."
+  [certificate]
+  (when-let [ext (extension certificate :key-usage)]
+    (let [{:keys [unused-bits ints]} (asn1/bit-string-value (asn1/decode (:der ext)))
+          total-bits (- (* 8 (count ints)) unused-bits)]
+      (into #{}
+            (keep (fn [i]
+                    (when (and (< i total-bits)
+                               (pos? (bit-and (nth ints (quot i 8))
+                                              (bit-shift-left 1 (- 7 (mod i 8))))))
+                      (nth key-usage-bits i)))
+                  (range (count key-usage-bits)))))))
+
+(defn extended-key-usage
+  "The set of EKU OIDs as dotted strings, or nil when absent.
+
+  Dotted strings rather than names because an unknown EKU still matters: a
+  caller checking for `id-kp-timeStamping` needs to know the certificate also
+  claims three purposes this library has no name for."
+  [certificate]
+  (when-let [ext (extension certificate :extended-key-usage)]
+    (into #{} (map asn1/oid-value) (:asn1/elements (asn1/decode (:der ext))))))
+
+(defn has-extended-key-usage?
+  "Whether the certificate asserts `name-kw` as an extended key usage.
+
+  **Absent EKU answers false.** RFC 5280 treats an absent EKU as unrestricted,
+  and for most purposes that is right — but the callers here are asking \"is this
+  a timestamping certificate\", and answering yes for a certificate that never
+  said so is how a TLS server key ends up honoured as a TSA. A caller that
+  genuinely wants the unrestricted reading can test `(nil? (extended-key-usage
+  c))` and say so out loud."
+  [certificate name-kw]
+  (boolean (some-> (extended-key-usage certificate)
+                   (contains? (oid/dotted name-kw)))))
+
+(defn subject-key-identifier [certificate]
+  (when-let [ext (extension certificate :subject-key-identifier)]
+    (:asn1/content (asn1/decode (:der ext)))))
+
+(defn authority-key-identifier [certificate]
+  (when-let [ext (extension certificate :authority-key-identifier)]
+    (some-> (asn1/find-context (asn1/decode (:der ext)) 0) :asn1/content)))
+
+(defn dns-names
+  "`subjectAltName` `dNSName` entries, lowercased, in the order they appear —
+  or nil when there is no `subjectAltName` extension.
+
+  nil and `[]` are different answers and both happen: absent means the
+  certificate names no host, and empty means it has a `subjectAltName` that
+  names hosts nowhere in it (an `otherName`-only certificate, which JPKI's
+  are). A caller matching a hostname must refuse both, and refuse them by
+  different names, so `nil` is not collapsed into `[]` here.
+
+  Lowercased because DNS labels are case-insensitive (RFC 4343) and a caller
+  that compares them without knowing that gets the answer wrong for exactly the
+  certificates that spell a name in mixed case. The ORDER is kept: it is the
+  issuer's, and an audit that reports \"which name did this match\" wants it.
+
+  **The matching is not here.** Wildcard rules — one label, leftmost only, no
+  partial labels — are RFC 6125, which is a question about a protocol using a
+  certificate rather than about the certificate. `kotoba-lang/org-ietf-tls`
+  asks it. This answers only what the certificate says."
+  [certificate]
+  (when-let [ext (extension certificate :subject-alt-name)]
+    (->> (:asn1/elements (asn1/decode (:der ext)))
+         (filter #(asn1/context-tag? % 2))
+         ;; [2] IMPLICIT IA5String: the content octets are the name, and each
+         ;; is one octet per character by definition of IA5.
+         (mapv #(str/lower-case (str/join (map char (asn1/->ints (:asn1/content %)))))))))
+
+(defn other-names
+  "`subjectAltName` `otherName` entries as `{oid → [inner-elements]}`.
+
+  Exists for one caller: JPKI's 署名用電子証明書 carries the holder's 基本4情報
+  (name, birth date, sex, address) in `otherName` entries under
+  `1.2.392.200149.8.5`. Returning the elements rather than strings keeps the
+  decision about reading personal data at the call site — see `kotoba-lang/org-jpki`,
+  which requires it to be asked for by name."
+  [certificate]
+  (when-let [ext (extension certificate :subject-alt-name)]
+    (->> (:asn1/elements (asn1/decode (:der ext)))
+         (filter #(asn1/context-tag? % 0))
+         (reduce (fn [acc entry]
+                   (let [children (:asn1/elements entry)
+                         type-oid (asn1/oid-value (first children))
+                         value (asn1/unwrap-explicit (second children))]
+                     (update acc type-oid (fnil conj []) value)))
+                 {}))))
+
+;; ── parsing ──────────────────────────────────────────────────────────────────
+
+(defn parse
+  "DER `Certificate` → a map.
+
+  `:x509/tbs-der` is the exact bytes the signature covers — taken from the
+  parsed element rather than re-encoded, which is the whole reason
+  `asn1.core` retains `:asn1/der`."
+  [data]
+  (let [certificate (asn1/decode data)
+        [tbs alg-outer signature] (:asn1/elements certificate)
+        children (:asn1/elements tbs)
+        ;; version is [0] EXPLICIT and DEFAULT v1, so its absence means v1 and
+        ;; shifts every following field by one. Read by tag, not by index.
+        version-element (asn1/find-context tbs 0)
+        version (if version-element
+                  (inc (asn1/integer-value (asn1/unwrap-explicit version-element)))
+                  1)
+        offset (if version-element 1 0)
+        field (fn [i] (nth children (+ i offset)))
+        alg-inner (field 1)
+        validity (field 3)
+        extensions-element (asn1/find-context tbs 3)
+        spki (field 5)]
+    {:x509/der (:asn1/der certificate)
+     :x509/tbs-der (:asn1/der tbs)
+     :x509/version version
+     ;; HEX, not a number. A serial is up to 20 octets — above what a double
+     ;; represents exactly — and it is an identifier rather than a quantity.
+     ;; `openssl x509 -serial` prints hex for the same reason.
+     :x509/serial-number (asn1/integer-hex (field 0))
+     :x509/serial-der (:asn1/der (field 0))
+     :x509/signature-algorithm (asn1/oid-value (asn1/nth-element alg-outer 0))
+     :x509/tbs-signature-algorithm (asn1/oid-value (asn1/nth-element alg-inner 0))
+     :x509/issuer (parse-name (field 2))
+     :x509/subject (parse-name (field 4))
+     :x509/not-before (asn1/time-value (asn1/nth-element validity 0))
+     :x509/not-after (asn1/time-value (asn1/nth-element validity 1))
+     :x509/public-key
+     {:algorithm (asn1/oid-value (asn1/path spki 0 0))
+      ;; Named curve for EC, absent for Ed25519, NULL for RSA. Kept as an
+      ;; element so a caller can hand it to a platform key factory unchanged.
+      :parameters (asn1/path spki 0 1)
+      :spki-der (:asn1/der spki)
+      :key (asn1/bit-string-value (asn1/nth-element spki 1))}
+     :x509/extensions (if extensions-element
+                        (mapv parse-extension
+                              (:asn1/elements (asn1/unwrap-explicit extensions-element)))
+                        [])
+     :x509/signature (asn1/bit-string-value signature)}))
+
+;; ── the checks ───────────────────────────────────────────────────────────────
+
+(defn algorithm-consistent?
+  "Whether the outer `signatureAlgorithm` matches `tbsCertificate.signature`.
+
+  §4.1.1.2 requires it, and only the inner one is inside the signature. A
+  mismatch is a certificate presenting one algorithm and verifiable as another."
+  [certificate]
+  (= (:x509/signature-algorithm certificate)
+     (:x509/tbs-signature-algorithm certificate)))
+
+(defn valid-at?
+  "Whether `iso-instant` is within the validity period.
+
+  A STRING comparison, which is correct for `not-before`/`not-after` because
+  `asn1/time-value` normalises both to `YYYY-MM-DDTHH:MM:SSZ` and ISO 8601 in
+  UTC sorts lexicographically. The time is an argument because this library has
+  no clock; a caller that wants \"now\" has to say which now, and can therefore
+  also ask \"was it valid when it signed\", which is the question an evidence
+  record actually needs."
+  [{:x509/keys [not-before not-after]} iso-instant]
+  (boolean (and not-before not-after iso-instant
+                (<= (compare not-before iso-instant) 0)
+                (<= (compare iso-instant not-after) 0))))
+
+(defn usable?
+  "`{:usable? bool :reasons [...]}` — every reason this certificate must not be
+  relied on, without consulting a clock or a network.
+
+  A seq of reasons and not a boolean for the reason `credential-assurance` gives
+  in the app: a caller told only \"refused\" has no way to act."
+  [certificate]
+  (let [unhandled (unhandled-critical-extensions certificate)
+        reasons (cond-> []
+                  (not (algorithm-consistent? certificate))
+                  (conj {:reason :algorithm-mismatch
+                         :detail (str "signatureAlgorithm "
+                                      (oid/describe (:x509/signature-algorithm certificate))
+                                      " ≠ tbsCertificate.signature "
+                                      (oid/describe (:x509/tbs-signature-algorithm certificate)))})
+
+                  (seq unhandled)
+                  (conj {:reason :unhandled-critical-extension
+                         :detail (str "critical and unrecognised: "
+                                      (str/join ", " (map (comp oid/describe :oid) unhandled)))})
+
+                  (nil? (:x509/not-before certificate))
+                  (conj {:reason :unreadable-validity
+                         :detail "validity は解釈できる時刻形式ではありません"}))]
+    {:usable? (empty? reasons) :reasons reasons}))
+
+(defn issued-by?
+  "Whether `certificate`'s issuer name is byte-identical to `issuer`'s subject.
+
+  Byte equality of the encoded names, not string comparison of the rendered
+  text. RFC 4518 name preparation makes textual comparison of distinguished
+  names a specification of its own, and CMS's `IssuerAndSerialNumber` means the
+  bytes anyway."
+  [certificate issuer]
+  (= (vec (:der (:x509/issuer certificate)))
+     (vec (:der (:x509/subject issuer)))))
+
+(defn verify-signature
+  "Whether `issuer`'s public key signs `certificate`'s `tbsCertificate`.
+
+  `verify-fn` receives `{:algorithm :public-key :signed :signature}` and returns
+  a boolean — the key never enters this library, matching
+  `data-integrity.core`'s `:sign` and `:resolve-key`. `:algorithm` is the OID
+  NAME when known so a `verify-fn` can refuse an algorithm by name rather than
+  by digits, and nil when it is not, which a `verify-fn` must treat as
+  unsupported rather than as a default.
+
+  Returns `{:verified bool :reason kw}` and never throws for a bad signature.
+  The name check is part of it: a signature that verifies under a key from a
+  certificate whose subject is not this certificate's issuer verifies nothing
+  about the chain."
+  [certificate issuer verify-fn]
+  (cond
+    (not (algorithm-consistent? certificate))
+    {:verified false :reason :algorithm-mismatch}
+
+    (not (issued-by? certificate issuer))
+    {:verified false :reason :issuer-name-mismatch}
+
+    :else
+    (let [algorithm (:x509/tbs-signature-algorithm certificate)
+          ok? (try
+                (boolean
+                 (verify-fn {:algorithm (oid/named algorithm)
+                             :algorithm-oid algorithm
+                             :public-key (:x509/public-key issuer)
+                             :signed (:x509/tbs-der certificate)
+                             :signature (:ints (:x509/signature certificate))}))
+                (catch  _ false))]
+      (if ok?
+        {:verified true}
+        {:verified false :reason :signature-invalid}))))
+
+(defn self-signed?
+  "Whether subject equals issuer by bytes. Says nothing about the signature —
+  `verify-signature` with the certificate as its own issuer does that."
+  [certificate]
+  (= (vec (:der (:x509/subject certificate)))
+     (vec (:der (:x509/issuer certificate)))))

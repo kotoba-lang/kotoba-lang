@@ -1,0 +1,567 @@
+(ns kotoba.swift
+  "SWIFT BIC identification and real SWIFT MT wire-format construction /
+  parsing — pure data + string contracts, no network, no I/O.
+
+  A kotoba-lang capability library for the cloud-itonami-6419 (community
+  monetary intermediation) open business. Covers:
+
+  - BIC (ISO 9362 / SWIFT-BIC) shape validation and decomposition.
+  - The REAL SWIFT FIN wire format for two message types: MT103 (Single
+    Customer Credit Transfer) and MT202 (General Financial Institution
+    Transfer) -- the actual `{1:...}{2:...}{3:...}{4:...}{5:...}` brace-block
+    structure and `:TAG:value` field tags, generated and parsed losslessly
+    (see mt->wire / parse-mt-wire), not a simplified EDN stand-in.
+
+  Scope, stated honestly: only MT103 and MT202 are modeled, out of SWIFT's
+  full MT category catalogue. Within those two types, only the field subset
+  documented on each builder is modeled (the mandatory fields plus the most
+  common optional ones) -- see the mt103 / mt202 docstrings for exactly
+  which tags. Field 50/59 party fields support only the plain name+address
+  line form (options K / no-letter), not the BIC-only (A) or structured (F)
+  option variants. Block 2 is generated/parsed in Input direction only
+  (a message this actor sends), not Output (received). Block 5's CHK value
+  is treated as an opaque trailer subfield -- this library does not
+  implement SWIFT's proprietary checksum algorithm. Field constraints are
+  validated only where independently verified against public field-tag
+  references (cited in README.md / docs/adr); this is not a substitute for
+  the licensed SWIFT Standards MT documentation.
+
+  ISO 20022 XML (pain.001 / pacs.008) lives in kotoba.swift.iso20022.
+
+  Portable (.cljc) across JVM / ClojureScript / SCI / GraalVM."
+  (:require [clojure.string :as str]))
+
+;; ---------------------------------------------------------------------------
+;; BIC — Bank Identifier Code (ISO 9362 / SWIFT-BIC)
+;;   shape: BBBBCCLL[bbb]  bank(4) country(2 ISO-3166) location(2) branch?(3)
+;; ---------------------------------------------------------------------------
+
+(def ^:private bic-pattern #"[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?")
+
+(defn bic-valid?
+  "True when s is an 8- or 11-character alphanumeric string in SWIFT BIC shape
+  (bank letters, country letters, location alnum, optional branch alnum)."
+  [s]
+  (and (string? s)
+       (contains? #{8 11} (count s))
+       (boolean (re-matches bic-pattern s))))
+
+(defn parse-bic
+  "Decompose a BIC into {:swift/bank :swift/country :swift/location
+  :swift/branch :swift/primary}. Returns nil when malformed."
+  [s]
+  (when (bic-valid? s)
+    {:swift/bank     (subs s 0 4)
+     :swift/country  (subs s 4 6)
+     :swift/location (subs s 6 8)
+     :swift/branch   (when (= 11 (count s)) (subs s 8 11))
+     :swift/primary  (subs s 0 8)}))
+
+(defn bic-primary
+  "Return the 8-character primary BIC (bank + country + location), dropping
+  any branch code. Returns nil when malformed."
+  [s]
+  (when (bic-valid? s) (subs s 0 8)))
+
+(defn validate-bic
+  "Return a validation result for a candidate BIC."
+  [s]
+  (cond
+    (not (string? s))    {:swift/valid? false :swift/error :not-a-string}
+    (not (bic-valid? s)) {:swift/valid? false :swift/error :malformed-bic}
+    :else                {:swift/valid? true :swift/parsed (parse-bic s)}))
+
+;; ---------------------------------------------------------------------------
+;; Portable numeric helpers (no Long/Integer/Math interop — kept .cljc-safe)
+;; ---------------------------------------------------------------------------
+
+(defn- parse-int [s]
+  )
+
+(defn- ipow10 [n] (reduce * 1 (repeat n 10)))
+
+(defn- pad-left [n width c]
+  (let [s (str n)]
+    (if (>= (count s) width) s (str (apply str (repeat (- width (count s)) c)) s))))
+
+;; ---------------------------------------------------------------------------
+;; MT category classification (general, not wire-format-specific)
+;; ---------------------------------------------------------------------------
+
+(def mt-categories
+  "SWIFT MT category groups relevant to a community bank, keyed by the first
+  digit of the 3-digit MT type."
+  {"1" "Customer Payments & Cheques"
+   "2" "Financial Institution Transfers"
+   "9" "Cash Management & Customer Status"})
+
+(defn mt-type-valid?
+  "True when mt is a 3-digit string whose first digit is a known category.
+  This is a coarse classification check only — it does NOT mean this
+  library can generate/parse the real wire format for that type; see
+  mt-supported-types."
+  [mt]
+  (and (string? mt)
+       (= 3 (count mt))
+       (contains? mt-categories (subs mt 0 1))))
+
+(def mt-supported-types
+  "MT types for which this library generates and parses the real wire
+  format (mt103 / mt202 / mt->wire / parse-mt-wire / validate-mt)."
+  #{"103" "202"})
+
+;; ---------------------------------------------------------------------------
+;; Field-format code lists and validators
+;;
+;; Verified against public field-tag references (Standards MT field
+;; catalogues, iotafinance.com MT103/MT202 detail pages, SWIFT usage-rule
+;; error-code T26 documentation) — see README.md "Verified against" for the
+;; full source list. Not re-derived from memory.
+;; ---------------------------------------------------------------------------
+
+(def mt-23b-codes
+  "Field 23B (Bank Operation Code) — verified valid values for MT103.
+  CRTS (test-purposes credit transfer) is documented as not for use on the
+  live FIN network but is included here as a structurally valid code."
+  #{"CRED" "CRTS" "SPAY" "SPRI" "SSTD"})
+
+(def mt-71a-codes
+  "Field 71A (Details of Charges) — the three verified values: OUR (sender
+  bears all charges), SHA (shared), BEN (beneficiary bears all charges)."
+  #{"OUR" "SHA" "BEN"})
+
+(def ^:private mt-bic-field-tags
+  "Field tags where this library models only the BIC (option A) form of an
+  institution party field."
+  #{"52A" "53A" "54A" "56A" "57A" "58A"})
+
+(defn mt-date-valid?
+  "True for a 6!n YYMMDD date with a plausible calendar month/day
+  (01-12 / 01-31). Field-SHAPE validation only — does not implement a full
+  Gregorian calendar check (e.g. does not reject 30 February or non-leap 29
+  February); that is out of scope for a wire-format structural check."
+  [s]
+  (boolean (and (string? s) (re-matches #"\d{6}" s)
+                (let [mm (parse-int (subs s 2 4))
+                      dd (parse-int (subs s 4 6))]
+                  (and (<= 1 mm 12) (<= 1 dd 31))))))
+
+(defn mt-amount-valid?
+  "True for a SWIFT decimal-comma amount matching the 15d format used by
+  fields 32A/33B/71F/71G: one or more digits, a MANDATORY comma (SWIFT's
+  decimal mark is ',' not '.'), then zero or more digits, total length
+  (comma included) at most 15 characters — per the verified field-32A
+  format rule (\"a decimal comma is mandatory and is included in the
+  maximum length\")."
+  [s]
+  (boolean (and (string? s) (<= (count s) 15) (re-matches #"\d+,\d*" s))))
+
+(defn mt-field-32a-valid?
+  "True for a well-formed field 32A value: 6!n3!a15d = YYMMDD + ISO 4217
+  currency + SWIFT decimal-comma amount (e.g. \"230501EUR123456,78\")."
+  [s]
+  (boolean (when (string? s)
+             (when-let [[_ date _ccy amt] (re-matches #"(\d{6})([A-Z]{3})(\d+,\d*)" s)]
+               (and (mt-date-valid? date) (mt-amount-valid? amt))))))
+
+(defn mt-reference-valid?
+  "True for a non-empty string of at most 16 characters matching the 16x
+  shape of field 20 (Transaction Reference) / field 21 (Related Reference),
+  including the verified SWIFT usage rule (error code T26): must not start
+  or end with '/' and must not contain '//'."
+  [s]
+  (boolean (and (string? s) (<= 1 (count s) 16)
+                (not (str/starts-with? s "/"))
+                (not (str/ends-with? s "/"))
+                (not (str/includes? s "//")))))
+
+;; ---------------------------------------------------------------------------
+;; Amount formatting — amounts are integers in the currency's minor unit
+;; (e.g. cents), matching kotoba-lang/banking's convention: no BigDecimal
+;; assumption, keeps this library portable and avoids float-precision bugs.
+;; `decimals` defaults to 2 and is NOT derived from a full ISO 4217
+;; minor-unit-per-currency table (that table is a documented, explicit
+;; scope limit — callers of a 0-decimal currency like JPY must pass
+;; :decimals 0 themselves).
+;; ---------------------------------------------------------------------------
+
+(defn format-mt-amount
+  "Render minor units as a SWIFT decimal-comma amount string. Per the
+  verified field-32A rule, the comma is always present even when
+  `decimals` is 0 (e.g. (format-mt-amount 1000 0) => \"1000,\")."
+  ([minor] (format-mt-amount minor 2))
+  ([minor decimals]
+   (when (integer? minor)
+     (let [neg?* (neg? minor)
+           m     (if neg?* (- minor) minor)
+           factor (ipow10 decimals)
+           whole  (quot m factor)
+           frac   (rem m factor)]
+       (str (when neg?* "-") whole "," (when (pos? decimals) (pad-left frac decimals \0)))))))
+
+(defn parse-mt-amount
+  "Parse a SWIFT decimal-comma amount string into {:swift/minor <integer>
+  :swift/decimals <int>}, minor units scaled to the digit count actually
+  present after the comma. Returns nil when malformed."
+  [s]
+  (when (mt-amount-valid? s)
+    (let [[whole frac] (str/split s #"," 2)
+          decimals (count frac)]
+      {:swift/minor    (+ (* (parse-int whole) (ipow10 decimals))
+                           (if (seq frac) (parse-int frac) 0))
+       :swift/decimals decimals})))
+
+;; ---------------------------------------------------------------------------
+;; Block 1 — Basic Header. Fixed-length, no delimiters.
+;;   {1:F01CITIFRPPAXXX0070970817}
+;;   = AppID(1) + ServiceID(2) + LT-address(12) + Session(4) + Sequence(6)
+;;   LT-address(12) = primary BIC(8) + terminal code(1) + branch code(3)
+;; ---------------------------------------------------------------------------
+
+(defn mt-lt-address
+  "Synthesize a 12-character SWIFT Logical Terminal address (8-char primary
+  BIC + 1-char terminal code + 3-char branch code) from a BIC. Defaults the
+  terminal code to \"X\" and the branch code to the BIC's own branch code
+  when the BIC is 11 characters, else \"XXX\" — both overridable. For exact
+  control callers may instead pass a full 12-char :lt-address / :destination
+  directly to mt103 / mt202."
+  [bic & {:keys [terminal branch]}]
+  (when-let [b8 (bic-primary bic)]
+    (str b8
+         (or terminal "X")
+         (or branch (if (= 11 (count bic)) (subs bic 8 11) "XXX")))))
+
+(defn render-block-1
+  [{:swift/keys [application-id service-id lt-address session-number sequence-number]}]
+  (str "{1:" application-id service-id lt-address session-number sequence-number "}"))
+
+(defn parse-block-1
+  "Parse a `{1:...}` basic header block string (braces included)."
+  [block-str]
+  (let [inner (subs block-str 3 (dec (count block-str)))]
+    {:swift/application-id  (subs inner 0 1)
+     :swift/service-id      (subs inner 1 3)
+     :swift/lt-address      (subs inner 3 15)
+     :swift/session-number  (subs inner 15 19)
+     :swift/sequence-number (subs inner 19 25)}))
+
+;; ---------------------------------------------------------------------------
+;; Block 2 — Application Header, Input direction (a message this actor
+;; sends). {2:I103NDEANOKKBXXXU3003}
+;;   = "I" + MsgType(3) + Destination-address(12) + Priority(1)
+;;     + [DeliveryMonitoring(1) + ObsolescencePeriod(3)]
+;; Output direction (a received message) is not generated; parse-block-2
+;; records it as :swift/direction :output without decoding its fields.
+;; ---------------------------------------------------------------------------
+
+(defn render-block-2-input
+  [{:swift/keys [message-type destination-address priority delivery-monitoring obsolescence-period]}]
+  (str "{2:I" message-type destination-address priority
+       (or delivery-monitoring "") (or obsolescence-period "") "}"))
+
+(defn parse-block-2
+  "Parse a `{2:...}` application header block string (braces included)."
+  [block-str]
+  (let [inner (subs block-str 3 (dec (count block-str)))
+        dir   (subs inner 0 1)]
+    (if (= "I" dir)
+      (let [rest* (subs inner 17)]
+        {:swift/direction           :input
+         :swift/message-type        (subs inner 1 4)
+         :swift/destination-address (subs inner 4 16)
+         :swift/priority            (subs inner 16 17)
+         :swift/delivery-monitoring (when (seq rest*) (subs rest* 0 1))
+         :swift/obsolescence-period (when (>= (count rest*) 4) (subs rest* 1 4))})
+      {:swift/direction :output :swift/raw inner})))
+
+;; ---------------------------------------------------------------------------
+;; Block 3 — User Header (optional). {3:{108:MUR-REF}}
+;; Block 5 — Trailer (optional). {5:{CHK:D628FE016232}}
+;; Both share the same "{TAG:value}{TAG2:value2}" sub-block shape.
+;; ---------------------------------------------------------------------------
+
+(defn- render-subblocks [block-id tags]
+  (when (seq tags)
+    (str "{" block-id ":" (apply str (for [[k v] tags] (str "{" (name k) ":" v "}"))) "}")))
+
+(defn- parse-subblocks [block-str]
+  (let [inner (subs block-str 3 (dec (count block-str)))]
+    (into {} (for [[_ k v] (re-seq #"\{([A-Za-z0-9]+):([^{}]*)\}" inner)] [(keyword k) v]))))
+
+(defn render-block-3 [tags] (render-subblocks "3" tags))
+(defn parse-block-3 [block-str] (parse-subblocks block-str))
+(defn render-block-5 [tags] (render-subblocks "5" tags))
+(defn parse-block-5 [block-str] (parse-subblocks block-str))
+
+;; ---------------------------------------------------------------------------
+;; Block 4 — Text Block. {4:\r\n:20:...\r\n:23B:...\r\n...\r\n-}
+;;   Each field is ":TAG:value" on its own line (CRLF-terminated);
+;;   continuation lines of a multi-line field value carry no ":TAG:" prefix.
+;;   The block is terminated by a line containing only "-" immediately
+;;   followed by the closing brace ("-}") — verified against a raw MT103
+;;   example ending "... :71A:SHA -}".
+;;   A field's multi-line value is represented internally with "\n" between
+;;   lines and rendered to real CRLF only at wire time (and vice versa when
+;;   parsing), so mt103/mt202/validate-mt work with plain "\n" strings.
+;; ---------------------------------------------------------------------------
+
+(defn render-block-4 [fields]
+  (str "{4:\r\n"
+       (apply str (for [{:swift/keys [tag value]} fields]
+                    (str ":" tag ":" (str/replace (str value) "\n" "\r\n") "\r\n")))
+       "-}"))
+
+(defn parse-block-4
+  "Parse a `{4:...}` text block string (braces included) into an ordered
+  vector of {:swift/tag :swift/value}. Scoped to this library's own
+  generated CRLF line convention — not a general-purpose FIN parser."
+  [block-str]
+  (let [inner (subs block-str 3 (dec (count block-str)))
+        inner (-> inner (str/replace #"^\r\n" "") (str/replace #"\r\n-$" ""))
+        lines (if (seq inner) (str/split inner #"\r\n") [])]
+    (reduce (fn [acc line]
+              (if-let [[_ tag val] (re-matches #":([0-9]{2}[A-Za-z]?):(.*)" line)]
+                (conj acc {:swift/tag (str/upper-case tag) :swift/value val})
+                (if (seq acc)
+                  (update acc (dec (count acc)) update :swift/value str "\n" line)
+                  acc)))
+            [] lines)))
+
+;; ---------------------------------------------------------------------------
+;; Whole-message wire assembly / disassembly
+;; ---------------------------------------------------------------------------
+
+(defn mt->wire
+  "Render a message record (as built by mt103 / mt202) to the real
+  brace-delimited SWIFT FIN wire string."
+  [{:swift/keys [block-1 block-2 block-3 block-4 block-5]}]
+  (str (render-block-1 block-1)
+       (render-block-2-input block-2)
+       (or (render-block-3 block-3) "")
+       (render-block-4 block-4)
+       (or (render-block-5 block-5) "")))
+
+(defn- split-top-level-blocks
+  "Split a wire string into its top-level `{N:...}` block substrings,
+  brace-depth aware (blocks 3 and 5 nest sub-blocks in braces)."
+  [s]
+  (let [n (count s)]
+    (loop [i 0 depth 0 start nil blocks []]
+      (if (>= i n)
+        blocks
+        (let [c (nth s i)]
+          (cond
+            (and (= c \{) (zero? depth)) (recur (inc i) 1 i blocks)
+            (= c \{)                     (recur (inc i) (inc depth) start blocks)
+            (and (= c \}) (= depth 1))    (recur (inc i) 0 nil (conj blocks (subs s start (inc i))))
+            (= c \})                     (recur (inc i) (dec depth) start blocks)
+            :else                        (recur (inc i) depth start blocks)))))))
+
+(defn parse-mt-wire
+  "Parse a full SWIFT FIN wire string into {:swift/mt ... :swift/block-1 ...
+  :swift/block-2 ... :swift/block-3 ... :swift/block-4 ... :swift/block-5
+  ...}. :swift/mt is read off block 2's message-type (mirroring the
+  top-level :swift/mt key mt103/mt202 set at build time). Blocks 3 and 5
+  default to {} when absent from the wire, matching mt103/mt202's own
+  default so parse-mt-wire(mt->wire(m)) round-trips structurally."
+  [wire]
+  (let [by-id  (into {} (for [b (split-top-level-blocks wire)] [(subs b 1 2) b]))
+        block-2 (some-> (get by-id "2") parse-block-2)]
+    {:swift/mt      (:swift/message-type block-2)
+     :swift/block-1 (some-> (get by-id "1") parse-block-1)
+     :swift/block-2 block-2
+     :swift/block-3 (if-let [b (get by-id "3")] (parse-block-3 b) {})
+     :swift/block-4 (some-> (get by-id "4") parse-block-4)
+     :swift/block-5 (if-let [b (get by-id "5")] (parse-block-5 b) {})}))
+
+;; ---------------------------------------------------------------------------
+;; Friendly builders — MT103 (Single Customer Credit Transfer)
+;;   Mandatory tags modeled: 20, 23B, 32A, 50K, 59, 71A
+;;   Optional tags modeled:  33B, 52A, 57A, 70, 72
+;;   NOT modeled (real MT103 has more): 13C, 23E, 26T, 36, 50A/50F, 51A,
+;;   53a-56a, 59A/59F, 71F, 71G, 77B, block-3 sub-fields beyond generic
+;;   pass-through, block-5 checksum computation.
+;; ---------------------------------------------------------------------------
+
+(defn mt103
+  [{:keys [sender-bic sender-lt-address session-number sequence-number
+            receiver-bic receiver-lt-address priority delivery-monitoring obsolescence-period
+            transaction-reference bank-operation-code
+            value-date currency amount-minor decimals
+            instructed-currency instructed-amount-minor instructed-decimals
+            ordering-customer-account ordering-customer-name-address
+            ordering-institution-bic account-with-institution-bic
+            beneficiary-account beneficiary-name-address
+            remittance-information details-of-charges
+            sender-to-receiver-information]
+     :or   {priority "N" session-number "0001" sequence-number "000001" decimals 2}}]
+  (when (and (bic-valid? sender-bic)
+             (bic-valid? receiver-bic)
+             (mt-reference-valid? transaction-reference)
+             (contains? mt-23b-codes bank-operation-code)
+             (mt-date-valid? value-date)
+             (re-matches #"[A-Z]{3}" (or currency ""))
+             (integer? amount-minor) (pos? amount-minor)
+             (seq ordering-customer-name-address)
+             (seq beneficiary-name-address)
+             (contains? mt-71a-codes details-of-charges))
+    {:swift/mt      "103"
+     :swift/block-1 {:swift/application-id  "F"
+                      :swift/service-id      "01"
+                      :swift/lt-address      (or sender-lt-address (mt-lt-address sender-bic))
+                      :swift/session-number  session-number
+                      :swift/sequence-number sequence-number}
+     :swift/block-2 {:swift/direction           :input
+                      :swift/message-type        "103"
+                      :swift/destination-address (or receiver-lt-address (mt-lt-address receiver-bic))
+                      :swift/priority            priority
+                      :swift/delivery-monitoring delivery-monitoring
+                      :swift/obsolescence-period obsolescence-period}
+     :swift/block-3 {}
+     :swift/block-4 (cond-> []
+                      true
+                      (conj {:swift/tag "20" :swift/value transaction-reference})
+                      true
+                      (conj {:swift/tag "23B" :swift/value bank-operation-code})
+                      true
+                      (conj {:swift/tag "32A"
+                             :swift/value (str value-date currency (format-mt-amount amount-minor decimals))})
+                      instructed-currency
+                      (conj {:swift/tag "33B"
+                             :swift/value (str instructed-currency
+                                                (format-mt-amount instructed-amount-minor (or instructed-decimals decimals)))})
+                      true
+                      (conj {:swift/tag "50K"
+                             :swift/value (str (when ordering-customer-account (str "/" ordering-customer-account "\n"))
+                                                ordering-customer-name-address)})
+                      ordering-institution-bic
+                      (conj {:swift/tag "52A" :swift/value ordering-institution-bic})
+                      account-with-institution-bic
+                      (conj {:swift/tag "57A" :swift/value account-with-institution-bic})
+                      true
+                      (conj {:swift/tag "59"
+                             :swift/value (str (when beneficiary-account (str "/" beneficiary-account "\n"))
+                                                beneficiary-name-address)})
+                      remittance-information
+                      (conj {:swift/tag "70" :swift/value remittance-information})
+                      true
+                      (conj {:swift/tag "71A" :swift/value details-of-charges})
+                      sender-to-receiver-information
+                      (conj {:swift/tag "72" :swift/value sender-to-receiver-information}))
+     :swift/block-5 {}}))
+
+;; ---------------------------------------------------------------------------
+;; Friendly builders — MT202 (General Financial Institution Transfer)
+;;   Mandatory tags modeled: 20, 21, 32A, 58A
+;;   Optional tags modeled:  52A, 53A, 54A, 56A, 57A, 72
+;;   NOT modeled: 13C, 55a, block-3/5 sub-fields beyond generic pass-through.
+;; ---------------------------------------------------------------------------
+
+(defn mt202
+  [{:keys [sender-bic sender-lt-address session-number sequence-number
+            receiver-bic receiver-lt-address priority delivery-monitoring obsolescence-period
+            transaction-reference related-reference value-date currency amount-minor decimals
+            ordering-institution-bic senders-correspondent-bic receivers-correspondent-bic
+            intermediary-bic account-with-institution-bic beneficiary-institution-bic
+            sender-to-receiver-information]
+     :or   {priority "N" session-number "0001" sequence-number "000001" decimals 2}}]
+  (when (and (bic-valid? sender-bic)
+             (bic-valid? receiver-bic)
+             (mt-reference-valid? transaction-reference)
+             (mt-reference-valid? related-reference)
+             (mt-date-valid? value-date)
+             (re-matches #"[A-Z]{3}" (or currency ""))
+             (integer? amount-minor) (pos? amount-minor)
+             (bic-valid? beneficiary-institution-bic))
+    {:swift/mt      "202"
+     :swift/block-1 {:swift/application-id  "F"
+                      :swift/service-id      "01"
+                      :swift/lt-address      (or sender-lt-address (mt-lt-address sender-bic))
+                      :swift/session-number  session-number
+                      :swift/sequence-number sequence-number}
+     :swift/block-2 {:swift/direction           :input
+                      :swift/message-type        "202"
+                      :swift/destination-address (or receiver-lt-address (mt-lt-address receiver-bic))
+                      :swift/priority            priority
+                      :swift/delivery-monitoring delivery-monitoring
+                      :swift/obsolescence-period obsolescence-period}
+     :swift/block-3 {}
+     :swift/block-4 (cond-> []
+                      true
+                      (conj {:swift/tag "20" :swift/value transaction-reference})
+                      true
+                      (conj {:swift/tag "21" :swift/value related-reference})
+                      true
+                      (conj {:swift/tag "32A"
+                             :swift/value (str value-date currency (format-mt-amount amount-minor decimals))})
+                      ordering-institution-bic
+                      (conj {:swift/tag "52A" :swift/value ordering-institution-bic})
+                      senders-correspondent-bic
+                      (conj {:swift/tag "53A" :swift/value senders-correspondent-bic})
+                      receivers-correspondent-bic
+                      (conj {:swift/tag "54A" :swift/value receivers-correspondent-bic})
+                      intermediary-bic
+                      (conj {:swift/tag "56A" :swift/value intermediary-bic})
+                      account-with-institution-bic
+                      (conj {:swift/tag "57A" :swift/value account-with-institution-bic})
+                      true
+                      (conj {:swift/tag "58A" :swift/value beneficiary-institution-bic})
+                      sender-to-receiver-information
+                      (conj {:swift/tag "72" :swift/value sender-to-receiver-information}))
+     :swift/block-5 {}}))
+
+;; ---------------------------------------------------------------------------
+;; Validation
+;; ---------------------------------------------------------------------------
+
+(defn mt-field
+  "The value of the first field with the given tag in a block-4 field
+  vector, or nil."
+  [fields tag]
+  (:swift/value (first (filter #(= tag (:swift/tag %)) fields))))
+
+(defn validate-mt
+  "Structural + field-format validation of a message record (self-built by
+  mt103/mt202, or parsed off the wire by parse-mt-wire). Returns
+  {:swift/valid? true :swift/mt \"103\"} or
+  {:swift/valid? false :swift/errors [...]}."
+  [m]
+  (cond
+    (not (map? m)) {:swift/valid? false :swift/error :not-a-map}
+    :else
+    (let [mt      (get-in m [:swift/block-2 :swift/message-type])
+          fields  (:swift/block-4 m)]
+      (cond
+        (not (contains? mt-supported-types mt))
+        {:swift/valid? false :swift/error :unsupported-mt-type}
+
+        (not (get-in m [:swift/block-1 :swift/lt-address]))
+        {:swift/valid? false :swift/error :missing-block-1}
+
+        (not (vector? fields))
+        {:swift/valid? false :swift/error :missing-block-4}
+
+        :else
+        (let [bic-errors (for [{:swift/keys [tag value]} fields
+                                :when (contains? mt-bic-field-tags tag)
+                                :when (not (bic-valid? value))]
+                            (keyword (str "bad-field-" (str/lower-case tag))))
+              type-errors
+              (case mt
+                "103" (cond-> []
+                        (not (mt-reference-valid? (mt-field fields "20")))      (conj :bad-field-20)
+                        (not (contains? mt-23b-codes (mt-field fields "23B")))  (conj :bad-field-23b)
+                        (not (mt-field-32a-valid? (mt-field fields "32A")))     (conj :bad-field-32a)
+                        (not (or (mt-field fields "50K") (mt-field fields "50A"))) (conj :missing-field-50)
+                        (not (or (mt-field fields "59") (mt-field fields "59A")))  (conj :missing-field-59)
+                        (not (contains? mt-71a-codes (mt-field fields "71A")))  (conj :bad-field-71a))
+                "202" (cond-> []
+                        (not (mt-reference-valid? (mt-field fields "20")))  (conj :bad-field-20)
+                        (not (mt-reference-valid? (mt-field fields "21")))  (conj :bad-field-21)
+                        (not (mt-field-32a-valid? (mt-field fields "32A"))) (conj :bad-field-32a)
+                        (not (bic-valid? (mt-field fields "58A")))          (conj :bad-field-58a))
+                [])
+              errors (into (vec type-errors) bic-errors)]
+          (if (seq errors)
+            {:swift/valid? false :swift/errors (vec errors)}
+            {:swift/valid? true :swift/mt mt}))))))

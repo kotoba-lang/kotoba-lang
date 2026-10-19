@@ -1,0 +1,307 @@
+(ns num.array
+  "NDArray — the value users hold. It is just `{:backend :handle :shape}`: a shape
+  plus an opaque device buffer on some backend. Because it is a value, a whole
+  computation is checkpointable/serializable at the host boundary (copy to a
+  vector), matching the audit-ledger ethos of the rest of com-junkawasaki.
+
+  Construct with `from-vec` / `zeros` / `from-fn`; read back with `->vec` /
+  `->scalar`. Ops live in `num.core`."
+  (:refer-clojure :exclude [cast])
+  (:require [num.dtype :as dtype]
+            [num.protocol :as p]))
+
+(defrecord NDArray [backend handle shape])
+
+(defn nelems
+  "Element count of a shape vector."
+  [shape]
+  (reduce * 1 shape))
+
+(defn from-vec
+  "Upload host data `xs` (row-major) as an NDArray of `shape` on `backend`."
+  ([backend xs shape] (from-vec backend xs shape :f32))
+  ([backend xs shape dtype*]
+   (dtype/check dtype*)
+   (when-not (= (count xs) (nelems shape))
+     (throw (ex-info "data length does not match shape"
+                     {:count (count xs) :shape shape})))
+   (if (= dtype* :f32)
+     (assoc (->NDArray backend (p/-copy-from-host backend xs) shape) :dtype :f32)
+     (do
+       (when-not (satisfies? p/IDTypeStorage backend)
+         (throw (ex-info "backend does not support typed storage"
+                         {:backend (p/-backend-name backend) :dtype dtype*})))
+       (assoc (->NDArray backend (p/-copy-from-host-dtype backend xs dtype*) shape)
+              :dtype dtype*)))))
+
+(defn zeros
+  "An NDArray of `shape` on `backend` (backend buffers are zero-initialized for the
+  CPU reference; GPU backends clear on alloc)."
+  ([backend shape] (zeros backend shape :f32))
+  ([backend shape dtype*]
+   (dtype/check dtype*)
+   (if (= dtype* :f32)
+     (assoc (->NDArray backend (p/-alloc backend (nelems shape)) shape) :dtype :f32)
+     (do
+       (when-not (satisfies? p/IDTypeStorage backend)
+         (throw (ex-info "backend does not support typed storage" {:dtype dtype*})))
+       (assoc (->NDArray backend (p/-alloc-dtype backend (nelems shape) dtype*) shape)
+              :dtype dtype*)))))
+
+(defn from-fn
+  "Build a `shape` NDArray on `backend` from `(f linear-index)`."
+  [backend shape f]
+  (from-vec backend (mapv f (range (nelems shape))) shape))
+
+(defn ->vec
+  "Copy an NDArray back to a host vector of doubles (row-major)."
+  [a]
+  (let [dtype* (or (:dtype a) :f32)]
+    (if (= dtype* :f32)
+      (p/-copy-to-host (:backend a) (:handle a) (nelems (:shape a)))
+      (p/-copy-to-host-dtype (:backend a) (:handle a) (nelems (:shape a)) dtype*))))
+
+(defn cast
+  "Materialize `a` in physical `target-dtype` storage on the same backend."
+  [a target-dtype]
+  (let [source-dtype (or (:dtype a) :f32)
+        backend (:backend a)]
+    (cond
+      (= source-dtype target-dtype) a
+      (satisfies? p/ICastOps backend)
+      (assoc (->NDArray backend
+                        (p/-cast-dtype backend (:handle a) (nelems (:shape a))
+                                       source-dtype target-dtype)
+                        (:shape a))
+             :dtype target-dtype)
+      :else (from-vec backend (->vec a) (:shape a) target-dtype))))
+
+(defn ->scalar
+  "Read a 1-element NDArray as a host double."
+  [a]
+  (first (->vec a)))
+
+(defn argmax-rows
+  "Return one maximum-value column index per row without materializing logits
+  on the host. The array must be contiguous f32 `[rows,cols]`, and its backend
+  must implement `IDeviceSelection`. Async GPU backends return a Promise."
+  [a]
+  (let [[rows cols :as shape] (:shape a)
+        backend (:backend a)]
+    (when-not (and (= 2 (count shape)) (pos-int? rows) (pos-int? cols)
+                   (= :f32 (or (:dtype a) :f32)))
+      (throw (ex-info "argmax-rows requires a non-empty f32 matrix"
+                      {:shape shape :dtype (:dtype a)})))
+    (when-not (satisfies? p/IDeviceSelection backend)
+      (throw (ex-info "backend does not support device row argmax"
+                      {:backend (p/-backend-name backend)})))
+    (p/-argmax-rows backend (:handle a) rows cols)))
+
+(defn top-k-row
+  "Return the best `k` `[token logit]` pairs for one row without materializing
+  the logits matrix on the host. Repetition penalty is applied once per unique
+  previous token. The device may mutate that row, so call this only for logits
+  that are no longer needed by model compute. Async GPU backends return a
+  Promise."
+  ([a row k] (top-k-row a row k [] 1.0))
+  ([a row k previous-tokens repetition-penalty]
+   (let [[rows cols :as shape] (:shape a)
+         backend (:backend a)
+         previous-tokens (vec (distinct previous-tokens))]
+     (when-not (and (= 2 (count shape)) (pos-int? rows) (pos-int? cols)
+                    (= :f32 (or (:dtype a) :f32))
+                    (int? row) (<= 0 row) (< row rows)
+                    (pos-int? k) (<= k cols) (<= k 256)
+                    (number? repetition-penalty) (<= 1.0 repetition-penalty)
+                    (every? #(and (int? %) (<= 0 %) (< % cols)) previous-tokens))
+       (throw (ex-info "top-k-row requires a valid f32 matrix row and k <= 256"
+                       {:shape shape :dtype (:dtype a) :row row :k k
+                        :repetition-penalty repetition-penalty})))
+     (when-not (satisfies? p/IDeviceSelection backend)
+       (throw (ex-info "backend does not support device row top-k"
+                       {:backend (p/-backend-name backend)})))
+     (p/-top-k-row backend (:handle a) rows cols row k previous-tokens
+                   repetition-penalty))))
+
+(defn sample-top-k-row
+  "Apply repetition penalty and exact top-k to one disposable logits row, then
+  perform temperature/top-p sampling on device. Returns only a token index;
+  async GPU backends return a Promise."
+  [a row {:keys [top-k previous-tokens repetition-penalty temperature top-p
+                 random-value]
+          :or {previous-tokens [] repetition-penalty 1.0 temperature 1.0
+               top-p 1.0 random-value 0.5}}]
+  (let [[rows cols :as shape] (:shape a)
+        backend (:backend a)
+        previous-tokens (vec (distinct previous-tokens))]
+    (when-not (and (= 2 (count shape)) (pos-int? rows) (pos-int? cols)
+                   (= :f32 (or (:dtype a) :f32))
+                   (int? row) (<= 0 row) (< row rows)
+                   (pos-int? top-k) (<= top-k cols) (<= top-k 256)
+                   (number? repetition-penalty) (<= 1.0 repetition-penalty)
+                   (number? temperature) (<= 0.0 temperature)
+                   (number? top-p) (< 0.0 top-p) (<= top-p 1.0)
+                   (number? random-value) (<= 0.0 random-value)
+                   (< random-value 1.0)
+                   (every? #(and (int? %) (<= 0 %) (< % cols)) previous-tokens))
+      (throw (ex-info "sample-top-k-row requires valid bounded sampling options"
+                      {:shape shape :dtype (:dtype a) :row row :top-k top-k
+                       :temperature temperature :top-p top-p
+                       :repetition-penalty repetition-penalty
+                       :random-value random-value})))
+    (when-not (satisfies? p/IDeviceSelection backend)
+      (throw (ex-info "backend does not support device top-k sampling"
+                      {:backend (p/-backend-name backend)})))
+    (p/-sample-top-k-row backend (:handle a) rows cols row top-k
+                         previous-tokens repetition-penalty temperature top-p
+                         random-value)))
+
+(defn speculative-rejection-row
+  "Verify one speculative token from target/draft logits using temperature
+  softmax. Returns `{:accepted? boolean :token int}`; a rejection samples the
+  positive target-minus-draft residual entirely on device."
+  [target draft row draft-token
+   {:keys [temperature acceptance-random residual-random]
+    :or {temperature 1.0 acceptance-random 0.5 residual-random 0.5}}]
+  (let [[rows cols :as shape] (:shape target)
+        backend (:backend target)]
+    (when-not (and (= shape (:shape draft))
+                   (= (:backend target) (:backend draft))
+                   (= 2 (count shape)) (pos-int? rows) (pos-int? cols)
+                   (= :f32 (or (:dtype target) :f32))
+                   (= :f32 (or (:dtype draft) :f32))
+                   (int? row) (<= 0 row) (< row rows)
+                   (int? draft-token) (<= 0 draft-token) (< draft-token cols)
+                   (number? temperature) (pos? temperature)
+                   (number? acceptance-random) (<= 0.0 acceptance-random)
+                   (< acceptance-random 1.0)
+                   (number? residual-random) (<= 0.0 residual-random)
+                   (< residual-random 1.0))
+      (throw (ex-info "speculative rejection requires compatible f32 logits"
+                      {:target-shape shape :draft-shape (:shape draft)
+                       :row row :draft-token draft-token
+                       :temperature temperature})))
+    (when-not (satisfies? p/IDeviceSelection backend)
+      (throw (ex-info "backend does not support device speculative rejection"
+                      {:backend (p/-backend-name backend)})))
+    (p/-speculative-rejection-row
+     backend (:handle target) (:handle draft) rows cols row draft-token
+     temperature acceptance-random residual-random)))
+
+(defn speculative-rejection-rows
+  "Verify a bounded MTP proposal against aligned target/draft logit rows.
+
+  Verification stops at the first rejection and returns that row's target-minus-
+  draft residual token as the correction. Each attempted row remains device
+  resident and transfers only the existing 8-byte `{accepted?, token}` result.
+  `options` may be one shared sampling map or one map per proposal row.
+
+  Async device backends return a Promise; synchronous backends return the result
+  map directly. `:drafted` counts the complete proposal produced by the MTP head,
+  while `:accepted` counts its verified prefix."
+  [target draft draft-tokens options]
+  (let [[rows _ :as shape] (:shape target)
+        draft-tokens (vec draft-tokens)
+        drafted (count draft-tokens)
+        options* (if (map? options)
+                   (vec (repeat drafted options))
+                   (vec options))]
+    (when-not (and (= shape (:shape draft))
+                   (= 2 (count shape))
+                   (pos-int? rows)
+                   (pos? drafted)
+                   (<= drafted rows)
+                   (= drafted (count options*)))
+      (throw (ex-info "MTP rejection requires one option and logit row per draft token"
+                      {:target-shape shape :draft-shape (:shape draft)
+                       :drafted drafted :option-count (count options*)})))
+    ))
+
+(defn sample-softmax-row
+  "Apply repetition penalty and sample one disposable logits row from its full
+  temperature-softmax distribution on device. This is the exact untruncated
+  categorical policy (`top-k=nil`, `top-p=1`); async backends return a Promise."
+  [a row {:keys [previous-tokens repetition-penalty temperature random-value]
+          :or {previous-tokens [] repetition-penalty 1.0 temperature 1.0
+               random-value 0.5}}]
+  (let [[rows cols :as shape] (:shape a)
+        backend (:backend a)
+        previous-tokens (vec (distinct previous-tokens))]
+    (when-not (and (= 2 (count shape)) (pos-int? rows) (pos-int? cols)
+                   (= :f32 (or (:dtype a) :f32))
+                   (int? row) (<= 0 row) (< row rows)
+                   (number? repetition-penalty) (<= 1.0 repetition-penalty)
+                   (number? temperature) (pos? temperature)
+                   (number? random-value) (<= 0.0 random-value)
+                   (< random-value 1.0)
+                   (every? #(and (int? %) (<= 0 %) (< % cols)) previous-tokens))
+      (throw (ex-info "sample-softmax-row requires valid full-softmax options"
+                      {:shape shape :dtype (:dtype a) :row row
+                       :temperature temperature
+                       :repetition-penalty repetition-penalty
+                       :random-value random-value})))
+    (when-not (satisfies? p/IDeviceSelection backend)
+      (throw (ex-info "backend does not support device softmax sampling"
+                      {:backend (p/-backend-name backend)})))
+    (p/-sample-softmax-row backend (:handle a) rows cols row previous-tokens
+                           repetition-penalty temperature random-value)))
+
+(defn sample-nucleus-row
+  "Apply repetition penalty, stable full-vocabulary logit ordering, and exact
+  nucleus sampling to one disposable row. This implements `top-k=nil` with
+  `0 < top-p < 1` for vocabularies up to 1,048,576; async backends return a
+  Promise."
+  [a row {:keys [previous-tokens repetition-penalty temperature top-p
+                 random-value]
+          :or {previous-tokens [] repetition-penalty 1.0 temperature 1.0
+               top-p 0.9 random-value 0.5}}]
+  (let [[rows cols :as shape] (:shape a)
+        backend (:backend a)
+        previous-tokens (vec (distinct previous-tokens))]
+    (when-not (and (= 2 (count shape)) (pos-int? rows) (pos-int? cols)
+                   (<= cols 1048576)
+                   (= :f32 (or (:dtype a) :f32))
+                   (int? row) (<= 0 row) (< row rows)
+                   (number? repetition-penalty) (<= 1.0 repetition-penalty)
+                   (number? temperature) (pos? temperature)
+                   (number? top-p) (< 0.0 top-p) (< top-p 1.0)
+                   (number? random-value) (<= 0.0 random-value)
+                   (< random-value 1.0)
+                   (every? #(and (int? %) (<= 0 %) (< % cols)) previous-tokens))
+      (throw (ex-info "sample-nucleus-row requires valid exact nucleus options"
+                      {:shape shape :dtype (:dtype a) :row row
+                       :temperature temperature :top-p top-p
+                       :repetition-penalty repetition-penalty
+                       :random-value random-value})))
+    (when-not (satisfies? p/IDeviceSelection backend)
+      (throw (ex-info "backend does not support exact device nucleus sampling"
+                      {:backend (p/-backend-name backend)})))
+    (p/-sample-nucleus-row backend (:handle a) rows cols row previous-tokens
+                           repetition-penalty temperature top-p random-value)))
+
+(defn like
+  "An uninitialized NDArray with the same backend/shape as `a`."
+  [a]
+  (zeros (:backend a) (:shape a) (or (:dtype a) :f32)))
+
+(defn release!
+  "Explicitly release an NDArray's backing storage. Required for predictable
+  GPU memory use in long-running workloads; CPU/GC backends may treat it as a
+  no-op. The NDArray must not be used after this call."
+  [a]
+  (when a
+    (p/-free (:backend a) (:handle a)))
+  nil)
+
+(defn release-all!
+  "Release each distinct backing handle in `arrays` once. This is safe for
+  reshape/transpose aliases that share a handle. All arrays become invalid."
+  [arrays]
+  (loop [remaining (seq arrays) seen #{}]
+    (when-let [a (first remaining)]
+      (let [handle (:handle a)]
+        (if (contains? seen handle)
+          (recur (next remaining) seen)
+          (do (release! a)
+              (recur (next remaining) (conj seen handle)))))))
+  nil)

@@ -1,0 +1,569 @@
+(ns kotoba.semantic-code
+  "C1 semantic definition identities (ADR-kotoba-content-addressed-codebase).
+
+  Source names are deliberately absent from the hashed definition block.  A
+  checked definition is lowered to a small, canonical data IR; local binders
+  become de Bruijn indices and resolved global dependencies become IPLD links.
+  The canonical DAG-CBOR bytes are the definition block and their CIDv1 is the
+  stable definition identity.
+
+  This first slice accepts non-recursive terms.  A dependency-order fixed point
+  makes ordinary forward references deterministic; a remaining local cycle is
+  rejected closed until the recursive-group/SCC codec is implemented."
+  (:require [cbor.core :as cbor]
+            [multiformats.core :as mf]))
+
+(def contract-version 1)
+(def schema "kotoba.semantic-definition.v1")
+
+(def default-intrinsics
+  "Stable intrinsic vocabulary for the currently executable Kotoba subset.
+  Intrinsics are semantic identities owned by the language profile, not source
+  names looked up in a mutable namespace."
+  '#{+ - * / = not= < <= > >= inc dec zero? pos? neg?
+     str keyword name namespace count empty? first rest next nth get assoc
+     dissoc conj cons into vector hash-map set contains? keys vals
+     true? false? nil? some? identity constantly apply map reduce filter
+     has-capability? cap-acquire})
+
+(def special-ops
+  '#{if do let let* fn fn* quote and or when case def})
+
+(def semantic-meta-keys
+  "Metadata that changes checked meaning and therefore participates in identity."
+  [:effects :tag :cap :i64 :f32])
+
+(def non-semantic-meta-keys
+  #{:line :column :end-line :end-column :file})
+
+(defn- stable-name [x]
+  (cond
+    (keyword? x) (if-let [n (namespace x)] (str n "/" (name x)) (name x))
+    (symbol? x)  (str x)
+    :else (str x)))
+
+(defn- semantic-meta [x]
+  (let [all (meta x)
+        unknown (apply dissoc all (concat semantic-meta-keys non-semantic-meta-keys))
+        m (select-keys all semantic-meta-keys)]
+    (when (seq unknown)
+      (throw (ex-info "unknown semantic metadata"
+                      {:problem :semantic/unknown-metadata
+                       :metadata (set (keys unknown))})))
+    (when (seq m)
+      (into (sorted-map)
+            (map (fn [[k v]] [(stable-name k)
+                              (cond
+                                (set? v) (vec (sort (map stable-name v)))
+                                (or (keyword? v) (symbol? v)) (stable-name v)
+                                :else v)]))
+            m))))
+
+(defn cid-link
+  "Encode CID as an IPLD DAG-CBOR link (tag 42, 0x00 + binary CID)."
+  [cid]
+  (let [raw (seq (mf/cid->bytes cid))]
+    (cbor/tagged 42 )))
+
+(defn- local-index [locals sym]
+  (first (keep-indexed (fn [i candidate] (when (= sym candidate) i))
+                       (reverse locals))))
+
+(declare normalize-expr block-cid source-cid)
+
+(defn- normalize-literal [value env]
+  (cond
+    (nil? value)     {"op" "literal" "type" "nil"}
+    (true? value)    {"op" "literal" "type" "boolean" "value" true}
+    (false? value)   {"op" "literal" "type" "boolean" "value" false}
+    (integer? value) {"op" "literal" "type" "integer" "value" value}
+    (string? value)  {"op" "literal" "type" "string" "value" value}
+    (keyword? value) {"op" "literal" "type" "keyword" "value" (stable-name value)}
+    (symbol? value)  {"op" "literal" "type" "symbol" "value" (stable-name value)}
+    (vector? value)  {"op" "vector" "items" (mapv #(normalize-expr % env) value)}
+    (set? value)     (let [items (map #(normalize-expr % env) value)]
+                       {"op" "set"
+                        "items" (vec (sort-by #(vec (cbor/encode %)) items))})
+    (map? value)     (let [entries (map (fn [[k v]] [(normalize-expr k env)
+                                                       (normalize-expr v env)]) value)]
+                       {"op" "map"
+                        "entries" (vec (sort-by #(vec (cbor/encode (first %))) entries))})
+    :else (throw (ex-info "unsupported semantic literal"
+                          {:problem :semantic/unsupported-literal
+                           :value value :type (type value)}))))
+
+(defn- resolve-symbol [sym {:keys [locals definitions local-definition-names
+                                   group-indices intrinsics dependencies]}]
+  (if-let [idx (local-index locals sym)]
+    {"op" "local" "index" idx}
+    (if-let [idx (get group-indices sym)]
+      {"op" "recursive-reference" "index" idx}
+      (if-let [cid (get definitions sym)]
+        (do (swap! dependencies conj cid)
+            {"op" "reference" "cid" (cid-link cid)})
+        (cond
+        (contains? intrinsics sym)
+        {"op" "intrinsic" "id" (str "kotoba.intrinsic/v1/" (stable-name sym))}
+
+        (contains? local-definition-names sym)
+        (throw (ex-info "definition dependency not ready"
+                        {:problem :semantic/dependency-not-ready :symbol sym}))
+
+        :else
+        (throw (ex-info "unresolved semantic reference"
+                        {:problem :semantic/unresolved-reference :symbol sym})))))))
+
+(defn- normalize-bindings [bindings body env]
+  (when-not (and (vector? bindings) (even? (count bindings)))
+    (throw (ex-info "let bindings must be an even vector"
+                    {:problem :semantic/invalid-let :bindings bindings})))
+  (loop [pairs (partition 2 bindings) env env out []]
+    (if-let [[binding value] (first pairs)]
+      (do
+        (when-not (symbol? binding)
+          (throw (ex-info "destructuring is not in semantic contract v1"
+                          {:problem :semantic/unsupported-binding :binding binding})))
+        (let [normalized (normalize-expr value env)]
+          (recur (next pairs)
+                 (update env :locals conj binding)
+                 (conj out {"value" normalized
+                            "meta" (or (semantic-meta binding) {})}))))
+      {"op" "let" "bindings" out
+       "body" (mapv #(normalize-expr % env) body)})))
+
+(defn- normalize-fn [params body env]
+  (when-not (vector? params)
+    (throw (ex-info "function parameters must be a vector"
+                    {:problem :semantic/invalid-params :params params})))
+  (when-not (every? symbol? params)
+    (throw (ex-info "destructuring is not in semantic contract v1"
+                    {:problem :semantic/unsupported-binding :params params})))
+  {"op" "fn"
+   "params" (mapv #(or (semantic-meta %) {}) params)
+   "body" (mapv #(normalize-expr % (update env :locals into params)) body)})
+
+(defn normalize-expr
+  "Normalize one checked Kotoba expression under ENV.  The output contains only
+  canonical DAG-CBOR values and IPLD links."
+  [form env]
+  (cond
+    (symbol? form) (resolve-symbol form env)
+
+    (seq? form)
+    (let [[op & args] form]
+      (case op
+        quote (do
+                (when-not (= 1 (count args))
+                  (throw (ex-info "quote requires one argument"
+                                  {:problem :semantic/invalid-quote})))
+                (normalize-literal (first args) env))
+        if {"op" "if" "args" (mapv #(normalize-expr % env) args)}
+        do {"op" "do" "body" (mapv #(normalize-expr % env) args)}
+        and {"op" "and" "args" (mapv #(normalize-expr % env) args)}
+        or {"op" "or" "args" (mapv #(normalize-expr % env) args)}
+        when {"op" "when" "test" (normalize-expr (first args) env)
+              "body" (mapv #(normalize-expr % env) (rest args))}
+        let (normalize-bindings (first args) (rest args) env)
+        let* (normalize-bindings (first args) (rest args) env)
+        fn (normalize-fn (first args) (rest args) env)
+        fn* (normalize-fn (first args) (rest args) env)
+        {"op" "call"
+         "callee" (normalize-expr op env)
+         "args" (mapv #(normalize-expr % env) args)}))
+
+    :else (normalize-literal form env)))
+
+(defn top-definition
+  "Parse a supported top-level def/defn. Returns a source-name-bearing staging
+  record; the name is never copied into the hashed semantic block."
+  [form]
+  (when (seq? form)
+    (case (first form)
+      defn (let [[_ name params & body] form]
+             {:name name :kind "term"
+              :meta (or (semantic-meta name) {})
+              :params (vec params)
+              :expr (list* 'fn params body)})
+      def (let [[_ name value] form]
+            {:name name :kind "term"
+             :meta (or (semantic-meta name) {}) :expr value})
+      nil)))
+
+(defn semantic-type-block
+  "C1 type identity for the currently implemented Kotoba/Wasm type slice.
+  Kotoba does not yet expose algebraic user type declarations, so this block
+  commits to term arity, Wasm value annotations, capability parameter kinds,
+  and the declared effect row."
+  [definition]
+  (let [value-type (fn [m]
+                     (cond (:cap m) (str "cap:" (stable-name (:cap m)))
+                           (:i64 m) "i64"
+                           (:f32 m) "f32"
+                           :else "dynamic"))
+        fn-meta (meta (:name definition))
+        params (:params definition)]
+    {"schema" "kotoba.semantic-type.v1" "version" 1
+     "kind" (if params "function" "value")
+     "params" (mapv #(value-type (meta %)) (or params []))
+     "result" (value-type fn-meta)
+     "effects" (vec (sort (map stable-name (:effects fn-meta #{}))))}))
+
+(defn semantic-type [definition]
+  (let [block (semantic-type-block definition)]
+    {:cid (block-cid block) :block block}))
+
+(defn definition-block
+  "Create a canonical semantic block for one staged definition."
+  [definition env {:keys [profile-cid hash-contract-cid type-cid]}]
+  (let [dependencies (:dependencies env)
+        ir (normalize-expr (:expr definition) env)]
+    {"schema" schema
+     "version" contract-version
+     "kind" (:kind definition)
+     "ir" ir
+     "meta" (:meta definition)
+     "type" (cid-link type-cid)
+     "dependencies" (mapv cid-link (sort @dependencies))
+     "profile" (cid-link profile-cid)
+     "hashContract" (cid-link hash-contract-cid)}))
+
+(defn block-cid [block]
+  (mf/cidv1-dag-cbor (cbor/encode block)))
+
+(defn verify-block
+  "Recompute CID for BLOCK. Returns a fail-closed verification result."
+  [expected-cid block]
+  (let [actual (block-cid block)]
+    {:ok? (= expected-cid actual)
+     :expected-cid expected-cid
+     :actual-cid actual
+     :problem (when-not (= expected-cid actual) :semantic/cid-mismatch)}))
+
+(defn default-contract-cid []
+  (source-cid
+   "kotoba.semantic-definition.v1|debruijn|dag-cbor|sha2-256|recursive-scc-v1"))
+
+(defn default-profile-cid []
+  (source-cid "kotoba.lang.profile.v3"))
+
+(defn source-cid
+  "Exact source-byte identity, deliberately separate from semantic identity."
+  [source]
+  (mf/cidv1-raw
+   (if (string? source)
+     
+     source)))
+
+(defn- definition-references
+  "Top-level definition names referenced by EXPR, respecting the lexical
+  binders supported by semantic contract v1. Used only to partition recursive
+  SCCs; normalize-expr remains the authority for the final references."
+  [expr definition-names]
+  (letfn [(refs [form locals]
+            (cond
+              (symbol? form)
+              (if (and (contains? definition-names form)
+                       (not (contains? locals form))) #{form} #{})
+
+              (seq? form)
+              (let [[op & args] form]
+                (case op
+                  quote #{}
+                  let (let [bindings (first args) body (rest args)]
+                        (loop [pairs (partition 2 bindings) locals locals out #{}]
+                          (if-let [[binding value] (first pairs)]
+                            (recur (next pairs) (conj locals binding)
+                                   (into out (refs value locals)))
+                            (into out (mapcat #(refs % locals) body)))))
+                  let* (refs (cons 'let args) locals)
+                  fn (let [[params & body] args]
+                       (into #{} (mapcat #(refs % (into locals params))) body))
+                  fn* (refs (cons 'fn args) locals)
+                  (into #{} (mapcat #(refs % locals)) form)))
+
+              (map? form) (into #{} (mapcat (fn [[k v]]
+                                               (concat (refs k locals)
+                                                       (refs v locals)))) form)
+              (coll? form) (into #{} (mapcat #(refs % locals)) form)
+              :else #{}))]
+    (refs expr #{})))
+
+(defn- reachable [graph start]
+  (loop [todo [start] seen #{}]
+    (if-let [node (peek todo)]
+      (if (contains? seen node)
+        (recur (pop todo) seen)
+        (recur (into (pop todo) (get graph node #{})) (conj seen node)))
+      seen)))
+
+(defn- strongly-connected-components
+  "Small deterministic SCC partition without a library dependency."
+  [graph]
+  (loop [remaining (set (keys graph)) out []]
+    (if-let [node (first (sort-by str remaining))]
+      (let [forward (reachable graph node)
+            component (set (filter #(contains? (reachable graph %) node) forward))]
+        (recur (set (remove component remaining)) (conj out component)))
+      out)))
+
+(defn- permutations [xs]
+  (if (empty? xs)
+    [[]]
+    (mapcat (fn [x]
+              (map #(cons x %) (permutations (remove #{x} xs))))
+            xs)))
+
+(defn- recursive-group-candidate
+  [ordered resolved all-names intrinsics profile-cid hash-contract-cid]
+  (let [indices (zipmap (map :name ordered) (range))
+        deps (atom #{})
+        members
+        (mapv (fn [definition]
+                (let [type (semantic-type definition)]
+                  {"kind" (:kind definition)
+                   "meta" (:meta definition)
+                   "type" (cid-link (:cid type))
+                   "ir" (normalize-expr
+                         (:expr definition)
+                         {:locals [] :definitions resolved
+                          :local-definition-names all-names
+                          :group-indices indices :intrinsics intrinsics
+                          :dependencies deps})}))
+              ordered)
+        block {"schema" "kotoba.recursive-group.v1" "version" 1
+               "members" members
+               "dependencies" (mapv cid-link (sort @deps))
+               "profile" (cid-link profile-cid)
+               "hashContract" (cid-link hash-contract-cid)}]
+    {:ordered ordered :block block :bytes (vec (cbor/encode block))
+     :dependency-cids (vec (sort @deps))}))
+
+(defn- compile-recursive-group
+  [component staged resolved all-names intrinsics profile-cid hash-contract-cid]
+  (when (> (count component) 8)
+    (throw (ex-info "recursive group exceeds canonical permutation limit"
+                    {:problem :semantic/recursive-group-too-large
+                     :size (count component)})))
+  (let [definitions (select-keys (into {} (map (juxt :name identity)) staged)
+                                 component)
+        candidates
+        (map #(recursive-group-candidate
+               (mapv definitions %) resolved all-names intrinsics
+               profile-cid hash-contract-cid)
+             (permutations (sort-by str component)))
+        chosen (first (sort-by :bytes candidates))
+        group-cid (block-cid (:block chosen))
+        results
+        (map-indexed
+         (fn [idx definition]
+           (let [type (semantic-type definition)
+                 member-block {"schema" "kotoba.recursive-member.v1"
+                               "version" 1 "group" (cid-link group-cid)
+                               "index" idx "type" (cid-link (:cid type))}
+                 cid (block-cid member-block)]
+             [(:name definition)
+              {:name (:name definition) :cid cid :block member-block
+               :type-cid (:cid type) :type-block (:block type)
+               :group-cid group-cid :group-block (:block chosen)
+               :dependency-cids (:dependency-cids chosen)
+               :effects (vec (get (:meta definition) "effects" []))}]))
+         (:ordered chosen))]
+    {:group-cid group-cid :group-block (:block chosen)
+     :definitions (into {} results)}))
+
+(defn compile-definitions
+  "Compile supported top-level definitions into semantic blocks.
+
+  Options:
+  - :definitions external symbol->definition-CID bindings
+  - :intrinsics stable intrinsic symbols (defaults to `default-intrinsics`)
+  - :profile-cid and :hash-contract-cid derivation identities
+
+  Ordinary forward references are resolved by a deterministic fixed point.
+  Remaining self/mutual recursion fails closed with
+  :semantic/recursive-group-required."
+  ([forms] (compile-definitions forms {}))
+  ([forms {:keys [definitions intrinsics profile-cid hash-contract-cid source-cid]
+           :or {definitions {}
+                intrinsics default-intrinsics}}]
+   (let [staged (vec (keep top-definition forms))
+         unsupported (keep (fn [form]
+                             (when (and (seq? form)
+                                        (#{'defmacro 'deftype 'defrecord 'defprotocol}
+                                         (first form)))
+                               (first form))) forms)
+         names (set (map :name staged))
+         graph (into {} (map (fn [{:keys [name expr]}]
+                               [name (definition-references expr names)])) staged)
+         duplicates (->> staged (map :name) frequencies
+                         (keep (fn [[name n]] (when (> n 1) name))) vec)]
+     (when (seq unsupported)
+       (throw (ex-info "unsupported top-level semantic definition"
+                       {:problem :semantic/unsupported-definition-kind
+                        :kinds (vec unsupported)})))
+     (when (seq duplicates)
+       (throw (ex-info "duplicate top-level definitions"
+                       {:problem :semantic/duplicate-definition
+                        :symbols duplicates})))
+     (loop [pending (sort-by (comp str :name) staged)
+            resolved definitions
+            output {}]
+       (if (empty? pending)
+         {:schema "kotoba.semantic-codebase.v1"
+          :source-cid source-cid
+          :profile-cid (or profile-cid (default-profile-cid))
+          :hash-contract-cid (or hash-contract-cid (default-contract-cid))
+          :definitions output}
+         (let [attempts
+               (mapv
+                (fn [definition]
+                  (try
+                    (let [deps (atom #{})
+                          type (semantic-type definition)
+                          block (definition-block
+                                 definition
+                                 {:locals [] :definitions resolved
+                                  :local-definition-names names
+                                  :intrinsics intrinsics :dependencies deps}
+                                 {:profile-cid (or profile-cid (default-profile-cid))
+                                  :hash-contract-cid (or hash-contract-cid
+                                                         (default-contract-cid))
+                                  :type-cid (:cid type)})
+                          cid (block-cid block)]
+                      {:definition definition :block block :cid cid
+                       :type-cid (:cid type) :type-block (:block type)
+                       :dependency-cids (vec (sort @deps))})
+                    (catch  e
+                      (if (= :semantic/dependency-not-ready (:problem (ex-data e)))
+                        {:definition definition :pending? true}
+                        (throw e)))))
+                pending)
+               ready (remove :pending? attempts)]
+           (if (seq ready)
+             (let [ready-names (set (map (comp :name :definition) ready))]
+               (recur (remove #(contains? ready-names (:name %)) pending)
+                      (into resolved (map (juxt (comp :name :definition) :cid) ready))
+                      (into output
+                          (map (fn [{:keys [definition block cid dependency-cids
+                                           type-cid type-block]}]
+                                   [(:name definition)
+                                    {:name (:name definition)
+                                   :cid cid :block block
+                                   :type-cid type-cid :type-block type-block
+                                   :dependency-cids dependency-cids
+                                   :source-cid source-cid
+                                   :effects (vec (get (:meta definition) "effects" []))}]))
+                            ready)))
+             (let [pending-names (set (map :name pending))
+                   pending-graph (into {} (map (fn [name]
+                                                 [name (set (filter pending-names
+                                                                    (get graph name)))])
+                                               pending-names))
+                   components (strongly-connected-components pending-graph)
+                   component
+                   (first
+                    (filter
+                     (fn [members]
+                       (and (or (> (count members) 1)
+                                (contains? (get graph (first members)) (first members)))
+                            (every? #(or (contains? members %)
+                                         (contains? resolved %))
+                                    (mapcat graph members))))
+                     components))]
+               (when-not component
+                 (throw (ex-info "recursive dependency graph is not admissible"
+                                 {:problem :semantic/recursive-group-required
+                                  :symbols (mapv :name pending)})))
+               (let [compiled (compile-recursive-group
+                               component pending resolved names intrinsics
+                               (or profile-cid (default-profile-cid))
+                               (or hash-contract-cid (default-contract-cid)))
+                     group-defs (into {} (map (fn [[name value]]
+                                                [name (assoc value :source-cid source-cid)]))
+                                      (:definitions compiled))]
+                 (recur (remove #(contains? component (:name %)) pending)
+                        (into resolved (map (fn [[name value]] [name (:cid value)]))
+                              group-defs)
+                        (into output group-defs)))))))))))
+
+(defn attach-to-ir
+  "Attach semantic identities to the existing runtime EDN IR without changing
+  its v0 execution fields."
+  [ir semantic-codebase]
+  (assoc ir
+         :kotoba.runtime/semantic-schema (:schema semantic-codebase)
+         :kotoba.runtime/source-cid (:source-cid semantic-codebase)
+         :kotoba.runtime/profile-cid (:profile-cid semantic-codebase)
+         :kotoba.runtime/hash-contract-cid (:hash-contract-cid semantic-codebase)
+         :kotoba.runtime/definition-cids
+         (into (sorted-map)
+               (map (fn [[name {:keys [cid]}]] [(str name) cid]))
+               (:definitions semantic-codebase))))
+
+(defn namespace-block
+  "C3 immutable namespace mapping. A rename changes the namespace CID while
+  leaving every bound definition CID untouched."
+  [{:keys [parents bindings]}]
+  (when-not (and (vector? parents) (map? bindings)
+                 (every? string? (keys bindings))
+                 (every? string? (vals bindings)))
+    (throw (ex-info "invalid namespace commit"
+                    {:problem :namespace/invalid-commit})))
+  {"schema" "kotoba.namespace.v1"
+   "version" 1
+   "parents" (mapv cid-link parents)
+   "bindings" (into (sorted-map)
+                     (map (fn [[name cid]] [name (cid-link cid)]))
+                     bindings)})
+
+(defn namespace-commit
+  "Build the content-addressed record consumed by kotobase.code-graph."
+  [{:keys [parents bindings] :as namespace}]
+  (let [block (namespace-block namespace)]
+    {:cid (block-cid block) :block block :parents (vec parents)
+     :bindings (into (sorted-map) bindings)}))
+
+(defn closure-block
+  "Commit to the exact reachable definition/type graph independently of its
+  transfer order."
+  [definition-cids]
+  {"schema" "kotoba.code-closure.v1" "version" 1
+   "definitions" (mapv cid-link (sort (set definition-cids)))})
+
+(defn closure-cid [definition-cids]
+  (block-cid (closure-block definition-cids)))
+
+(defn execution-block
+  "C4 canonical execution provenance. Every identity field is an IPLD link;
+  capability grants remain evidence links and never become authority by CID
+  possession."
+  [{:keys [code-root-cid code-closure-cid artifact-cid compiler-contract-cid
+           input-root-cids output-root-cids package-lock-cid policy-cid
+           grant-cids host-receipt-cids granted-effects outcome]}]
+  (let [required [code-root-cid code-closure-cid artifact-cid compiler-contract-cid
+                  package-lock-cid policy-cid]]
+    (when-not (and (every? string? required)
+                   (every? vector? [input-root-cids output-root-cids grant-cids
+                                    host-receipt-cids])
+                   (every? string? (concat input-root-cids output-root-cids
+                                           grant-cids host-receipt-cids))
+                   (keyword? outcome))
+      (throw (ex-info "invalid execution receipt"
+                      {:problem :execution/invalid-receipt})))
+    {"schema" "kotoba.execution.v1" "version" 1
+     "codeRoot" (cid-link code-root-cid)
+     "codeClosure" (cid-link code-closure-cid)
+     "artifact" (cid-link artifact-cid)
+     "compilerContract" (cid-link compiler-contract-cid)
+     "inputs" (mapv cid-link input-root-cids)
+     "outputs" (mapv cid-link output-root-cids)
+     "packageLock" (cid-link package-lock-cid)
+     "policy" (cid-link policy-cid)
+     "grants" (mapv cid-link grant-cids)
+     "hostReceipts" (mapv cid-link host-receipt-cids)
+     "grantedEffects" (vec (sort (map stable-name granted-effects)))
+     "outcome" (stable-name outcome)}))
+
+(defn execution-receipt [execution]
+  (let [block (execution-block execution)]
+    (assoc execution :cid (block-cid block) :block block)))

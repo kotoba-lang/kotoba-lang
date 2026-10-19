@@ -1,0 +1,134 @@
+(ns storj.node.mint
+  "Minting an identity: the proof of work, and the certificates it names.
+
+  A node cannot choose its name. Its id is two rounds of SHA-256 over its CA
+  public key, so the only way to get an id with a given number of trailing
+  zero bits is to keep generating keys until one lands — which is what
+  `difficulty` measures and what the network charges for admission.
+
+  ## The loop is over keys, not certificates
+
+  `identity.GenerateKey` derives the id from the key itself and only builds a
+  certificate around the winner. Minting a certificate per attempt would be
+  the obvious shape and would be enormously slower for no benefit: the
+  certificate does not affect the id.
+
+  ## Difficulty
+
+  `Difficulty()` skips the version byte and credits a whole byte for it, so
+  **8 is the smallest value the network can report and almost every key meets
+  it on the first try** — the count only exceeds 8 once the byte before the
+  version byte is zero, which is one attempt in 256. Each further 8 bits is
+  another factor of 256, so a storage node's 36 is roughly 2^36 attempts and
+  is why `identity create` runs for hours.
+
+  Asking for 8 therefore proves nothing about this loop. The tests ask for 16.
+
+  Nothing here parallelises: concurrency is the host's to add, and a portable
+  library that spawned threads would only run where it was written.
+
+  ## What is minted, and what is a decision
+
+  Two key pairs and two certificates. The CA signs itself and signs the leaf;
+  the leaf's key is the one that signs messages afterwards
+  (`SigneeFromPeerIdentity` uses `Leaf.PublicKey`, while the id comes from the
+  CA — an asymmetry worth not getting backwards). The shapes come from
+  `storj.node.certificate`, the crypto from `IKeyMaterial`, and the decision
+  about when to stop hashing is here."
+  (:require [storj.node.bytes :as b]
+            [storj.node.certificate :as cert]
+            [storj.node.id :as id]
+            [storj.node.identity :as ident]
+            [storj.node.protocols :as p]))
+
+(def minimum-difficulty
+  "The smallest difficulty the network's own accounting can report."
+  8)
+
+(def storagenode-difficulty
+  "What a satellite requires of a storage node. Recorded rather than used as a
+  default: minting at this difficulty takes hours, and a default that silently
+  did so would be a worse surprise than having to ask for it."
+  36)
+
+(defn- difficulty-of [node-id]
+  (try (id/difficulty node-id)
+       (catch  _
+         ;; an all-zero id has no highest set byte to measure from; it is not
+         ;; reachable in practice and is not a reason to stop the loop
+         nil)))
+
+(defn find-key
+  "Generate key pairs until one names a node id of at least `difficulty`.
+
+  Returns `{:private :public-spki :node-id :difficulty :attempts}`, or throws
+  after `max-attempts`. The cap exists so a caller who asks for difficulty 36
+  in a test finds out by failing rather than by never returning."
+  [key-material {:keys [difficulty version max-attempts]
+                 :or   {difficulty   minimum-difficulty
+                        version      id/version-0
+                        max-attempts 1000000}}]
+  (loop [attempt 1]
+    (when (> attempt max-attempts)
+      (throw (ex-info "storj.node.mint: no key met the difficulty within the attempt limit"
+                      {:difficulty difficulty :max-attempts max-attempts})))
+    (let [{:keys [private public-spki]} (p/-generate-keypair key-material)
+          nid (ident/node-id-from-public-key public-spki version)
+          d   (difficulty-of nid)]
+      (if (and d (>= d difficulty))
+        {:private private :public-spki public-spki
+         :node-id nid :difficulty d :attempts attempt}
+        (recur (inc attempt))))))
+
+(defn- serial [key-material]
+  (p/-random-bytes key-material cert/serial-number-bytes))
+
+(defn mint
+  "Mint a full identity — a CA meeting `difficulty`, and a leaf it signs.
+
+  Returns the chain in the order TLS presents it, leaf first, so the result
+  can be handed straight to `storj.node.identity/admit-chain`.
+
+      {:node-id    bytes
+       :difficulty n
+       :attempts   n
+       :ca         {:der bytes :private <opaque> :public-spki bytes}
+       :leaf       {:der bytes :private <opaque> :public-spki bytes}
+       :chain      [leaf-der ca-der]}
+
+  The private halves are whatever the host's `IKeyMaterial` returned and are
+  never inspected here. Persisting them is the host's problem too, and a
+  deliberate omission: a library that wrote key files would be choosing a
+  format, a location and a permission mode on the caller's behalf."
+  [key-material {:keys [difficulty version max-attempts]
+                 :or   {difficulty   minimum-difficulty
+                        version      id/version-0
+                        max-attempts 1000000}
+                 :as   opts}]
+  (let [ca (find-key key-material (assoc opts
+                                         :difficulty difficulty
+                                         :version version
+                                         :max-attempts max-attempts))
+        ca-tbs (cert/ca-tbs
+                {:serial (serial key-material)
+                 :spki-der (:public-spki ca)
+                 :subject-key-id (b/sha1 (cert/public-key-bits (:public-spki ca)))
+                 :version version})
+        ca-der (cert/certificate
+                ca-tbs
+                (p/-sign key-material (:private ca) :ecdsa-sha256 ca-tbs))
+        leaf (p/-generate-keypair key-material)
+        leaf-tbs (cert/leaf-tbs {:serial (serial key-material)
+                                 :spki-der (:public-spki leaf)})
+        ;; signed by the CA's key, not the leaf's — the leaf vouches for
+        ;; nothing on its own
+        leaf-der (cert/certificate
+                  leaf-tbs
+                  (p/-sign key-material (:private ca) :ecdsa-sha256 leaf-tbs))]
+    {:node-id    (:node-id ca)
+     :difficulty (:difficulty ca)
+     :attempts   (:attempts ca)
+     :ca         {:der ca-der :private (:private ca) :public-spki (:public-spki ca)}
+     :leaf       {:der leaf-der :private (:private leaf)
+                  :public-spki (:public-spki leaf)}
+     :chain      [leaf-der ca-der]}))

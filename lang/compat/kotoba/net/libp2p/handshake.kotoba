@@ -1,0 +1,146 @@
+(ns kotoba.net.libp2p.handshake
+  "libp2p's identity binding on top of a Noise XX handshake.
+
+  Noise XX authenticates two *static X25519 keys* to each other. libp2p peers
+  are identified by a *different* key — usually Ed25519 — and a peer id is a
+  multihash of that one. Nothing in Noise connects the two, so libp2p adds the
+  connection: each side sends, inside the handshake, its identity public key and
+  a signature by that identity key over
+
+      \"noise-libp2p-static-key:\" || <its own Noise static public key>
+
+  Without this a peer authenticates a Noise key belonging to nobody in
+  particular, and the peer id it thinks it dialed is unverified. With it, a
+  successful XX handshake plus a valid signature says: *the party holding this
+  Noise static key is the holder of that identity key*, which is what makes the
+  peer id in a multiaddr mean anything.
+
+  The signature is over the static key, not over the transcript, and that is
+  deliberate in the spec: it can be produced offline and reused across
+  connections, so the identity key need not be online for every dial."
+  (:require [protobuf.wire :as pb]))
+
+(def signature-prefix
+  "The domain separator. A signature without it could be replayed from any
+  other context where the same key signs 32 arbitrary bytes."
+  "noise-libp2p-static-key:")
+
+(def payload-schema
+  "`NoiseHandshakePayload` (libp2p noise spec)."
+  {1 {:name :identity-key :type :bytes}
+   2 {:name :identity-sig :type :bytes}
+   3 {:name :extensions :type :bytes}})
+
+(def public-key-schema
+  "libp2p `PublicKey`: a key type and the raw key."
+  {1 {:name :type :type :uint64}
+   2 {:name :data :type :bytes}})
+
+(def key-types
+  {:rsa 0 :ed25519 1 :secp256k1 2 :ecdsa 3})
+
+(def code->key-type (into {} (map (fn [[k v]] [v k])) key-types))
+
+(defn- ->octets [x]
+  (cond
+    (nil? x) nil
+    (vector? x) x
+    (string? x) (mapv #(bit-and (int %) 0xFF) (seq x))
+    :else (mapv #(bit-and % 0xFF) (vec (seq x)))))
+
+(defn public-key-protobuf
+  "Wrap a raw Ed25519 public key as the libp2p `PublicKey` protobuf.
+
+  This, not the raw key, is what a peer id hashes and what travels in the
+  handshake — a peer that hashes the raw key computes an id no one else agrees
+  with."
+  [raw-public-key]
+  (pb/encode public-key-schema
+             {:type (:ed25519 key-types) :data (->octets raw-public-key)}))
+
+(def identity-multihash-limit
+  "libp2p inlines a public key into the peer id when the key protobuf is at
+  most 42 octets -- which is every Ed25519 key and no RSA key. Above it the id
+  is a SHA-256 multihash instead."
+  42)
+
+(defn peer-id
+  "The libp2p peer id for an identity key protobuf.
+
+  Not the raw key and not the protobuf: the id is a MULTIHASH of the protobuf,
+  and which multihash depends on its size. Using the raw key gives an id nobody
+  else computes, and the mistake is invisible until something keys on it --
+  a provider record filed under the wrong id is stored, returned, and simply
+  never matches."
+  [sha256-fn key-protobuf]
+  (let [pb (vec key-protobuf)]
+    (if (<= (count pb) identity-multihash-limit)
+      ;; identity multihash: code 0x00, then the length, then the bytes
+      (vec (concat [0x00 (count pb)] pb))
+      (vec (concat [0x12 0x20]
+                   (map #(bit-and % 0xFF)
+                        (vec (seq (sha256-fn )))))))))
+
+(defn signing-input
+  "The exact bytes an identity key signs: the prefix, then our Noise static
+  public key."
+  [noise-static-public-key]
+  (into (->octets signature-prefix) (->octets noise-static-public-key)))
+
+(defn payload
+  "Our handshake payload: identity key plus its signature over our static key.
+
+  `sign-fn` is `(fn [octets] -> signature-octets)`, bound to the identity
+  private key by the caller. This namespace holds no crypto for the same reason
+  the layers below it hold no socket."
+  [{:keys [identity-public-key noise-static-public-key sign-fn]}]
+  (pb/encode payload-schema
+             {:identity-key (public-key-protobuf identity-public-key)
+              :identity-sig (->octets (sign-fn (signing-input noise-static-public-key)))}))
+
+(defn verify
+  "Check a received payload against the static key the handshake authenticated.
+
+  Returns `{:ok? true :identity-key <raw> :key-type :ed25519}` or
+  `{:ok? false :reason …}` — a value, because a dialer talking to several peers
+  must be able to reject one without unwinding everything.
+
+  The static key is supplied by the *handshake*, never taken from the payload:
+  a payload that could name the key it is bound to could name any key, and the
+  binding would prove nothing."
+  [payload-octets remote-static-public-key verify-fn]
+  (let [parsed (try (pb/decode payload-schema payload-octets)
+                    (catch  _ nil))]
+    (cond
+      (nil? parsed) {:ok? false :reason :unparseable-payload}
+
+      (or (nil? (:identity-key parsed)) (nil? (:identity-sig parsed)))
+      {:ok? false :reason :payload-incomplete}
+
+      :else
+      (let [key (try (pb/decode public-key-schema (:identity-key parsed))
+                     (catch  _ nil))]
+        (cond
+          (nil? key) {:ok? false :reason :unparseable-identity-key}
+
+          (nil? (get code->key-type (:type key)))
+          {:ok? false :reason :unknown-key-type :type (:type key)}
+
+          ;; The key TYPE is handed to the verifier rather than filtered here.
+          ;; Most peers on the network today still have RSA identities, and a
+          ;; library that admitted only the type its author happened to use
+          ;; would refuse most of libp2p while looking like a security check.
+          ;; Which types are acceptable is the caller's policy; whether the
+          ;; signature is valid is the verifier's answer.
+          (not (try (verify-fn {:key-type (get code->key-type (:type key))
+                                :key (:data key)}
+                               (signing-input remote-static-public-key)
+                               (:identity-sig parsed))
+                    (catch  _ false)))
+          {:ok? false :reason :signature-invalid :key-type (get code->key-type (:type key))}
+
+          :else {:ok? true
+                 :key-type (get code->key-type (:type key))
+                 :identity-key (:data key)
+                 :identity-key-protobuf (:identity-key parsed)
+                 :extensions (:extensions parsed)})))))

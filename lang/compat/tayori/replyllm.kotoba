@@ -1,0 +1,145 @@
+(ns tayori.replyllm
+  "reply-LLM — the contained intelligence node. It reads a thread's/document's
+  ground facts (participants, prior messages, prior drafts/revisions) and
+  returns a PROPOSAL: a reply draft, a document revision, or (for the
+  send/publish ops) a pass-through recommendation over the already-stored
+  draft/revision. It NEVER sends a message or publishes a document — every
+  output is censored by `tayori.governor` before anything is recorded, and
+  sending/publishing always routes to a human (charter: propose→draft/revise
+  only, no actuation).
+
+  Advisor is injected (mock | real LLM via langchain.model), same as
+  kekkai.coordllm/gijiroku's scribe-LLM.
+
+  Proposal shape:
+    {:recommendation kw   ; :draft | :revise | :send | :publish
+     :text str            ; for :reply/draft | :reply/send
+     :diff str            ; for :document/revise | :document/publish
+     :summary str :rationale str :cites [kw ..] :redactions [kw ..]
+     :effect kw           ; :draft | :revision | :sent | :published
+     :confidence 0..1}"
+  (:require 
+            [clojure.string :as str]
+            [langchain.model :as model]
+            [tayori.store :as store]))
+
+;; ───────────────────────── deterministic mock ─────────────────────────
+
+(defn- draft-thread
+  "Compose a plain, non-committal acknowledgement referencing the last
+  inbound message — the mock never invents facts, so a clean thread yields a
+  confident draft and an unknown thread yields a low-confidence noop."
+  [st {:keys [thread]}]
+  (let [th   (store/thread st thread)
+        msgs (store/messages-of st thread)
+        last-in (last (filter #(= :inbound (:direction %)) msgs))]
+    (if th
+      {:recommendation :draft
+       :text (str "ご連絡ありがとうございます。" (:body last-in) " の件、確認のうえ折り返します。")
+       :summary (str thread " への返信案")
+       :rationale (str "直近の受信メッセージに基づく確認応答: " (pr-str (:body last-in)))
+       :cites [:thread :message] :redactions []
+       :effect :draft :confidence 0.9}
+      {:recommendation :draft :text "" :summary "未登録スレッド" :rationale (str thread)
+       :cites [] :redactions [] :effect :draft :confidence 0.0})))
+
+(defn- send-thread
+  "For :reply/send there is nothing new to generate — the recommendation is
+  simply 'send the already-committed draft', carrying its confidence/cites/
+  redactions forward so the governor evaluates the SAME facts twice
+  (draft-time and send-time)."
+  [st {:keys [thread]}]
+  (let [d (store/draft-of st thread)]
+    (if d
+      {:recommendation :send :text (:text d)
+       :summary (str thread " のドラフトを送信") :rationale "承認済みドラフトの送信"
+       :cites (:cites d []) :redactions (:redactions d []) :effect :sent
+       :confidence (:confidence d 0.0)}
+      {:recommendation :send :text nil :summary "ドラフト未作成" :rationale (str thread)
+       :cites [] :redactions [] :effect :sent :confidence 0.0})))
+
+(defn- revise-document
+  [st {:keys [document]}]
+  (let [doc (store/document st document)]
+    (if doc
+      {:recommendation :revise
+       :diff (str "# " (:path doc) "\n\n（更新案 — 承認後に " (name (:target doc)) " へ publish）")
+       :summary (str document " の改訂案") :rationale (str (:path doc) " への提案編集")
+       :cites [:document] :redactions [] :effect :revision :confidence 0.85}
+      {:recommendation :revise :diff "" :summary "未登録文書" :rationale (str document)
+       :cites [] :redactions [] :effect :revision :confidence 0.0})))
+
+(defn- publish-document
+  [st {:keys [document]}]
+  (let [r (store/revision-of st document)]
+    (if r
+      {:recommendation :publish :diff (:diff r)
+       :summary (str document " の改訂を publish") :rationale "承認済み改訂の publish"
+       :cites (:cites r []) :redactions (:redactions r []) :effect :published
+       :confidence (:confidence r 0.0)}
+      {:recommendation :publish :diff nil :summary "改訂未作成" :rationale (str document)
+       :cites [] :redactions [] :effect :published :confidence 0.0})))
+
+(defn infer [st {:keys [op] :as req}]
+  (case op
+    :reply/draft      (draft-thread st req)
+    :reply/send       (send-thread st req)
+    :document/revise  (revise-document st req)
+    :document/publish (publish-document st req)
+    {:recommendation :unknown :summary "未対応" :rationale (str op)
+     :cites [] :redactions [] :effect :noop :confidence 0.0}))
+
+;; ───────────────────────── Advisor protocol ─────────────────────────
+
+(defprotocol Advisor
+  (-advise [advisor store request]))
+
+(defn mock-advisor [] (reify Advisor (-advise [_ st req] (infer st req))))
+
+(def ^:private system-prompt
+  (str "あなたは通信文(email/Slack/WhatsApp)の返信・文書改訂の下書き助言者です。"
+       "与えられた事実(スレッド/メッセージ/文書/既存ドラフト)のみに基づき、提案を1つ EDN "
+       "マップで返します。EDN だけを出力。\n"
+       "キー: :recommendation(:draft|:revise|:send|:publish) :text :diff :summary :rationale "
+       ":cites :redactions :effect(:draft|:revision 固定 — :sent/:published は自称しない) "
+       ":confidence(0..1)。\n"
+       "重要: あなたは送信も publish もしない(propose→draft/revise のみ)。機微情報"
+       "(health/legal/financial)を引用するときは必ず :redactions に列挙する。"))
+
+(defn- facts-for [st {:keys [thread document]}]
+  (cond
+    thread   {:thread (store/thread st thread) :messages (store/messages-of st thread)
+              :draft (store/draft-of st thread)}
+    document {:document (store/document st document) :revision (store/revision-of st document)}
+    :else    {}))
+
+(defn- parse-proposal [content]
+  (let [p (try (edn/read-string (str/trim (str content)))
+               (catch  _ nil))]
+    (if (map? p)
+      (-> p (update :cites #(vec (or % [])))
+            (update :redactions #(vec (or % [])))
+            (update :confidence #(if (number? %) (double %) 0.0))
+            (update :effect #(or % :noop)))
+      {:recommendation :unknown :summary "LLM応答を解釈できません" :rationale (str content)
+       :cites [] :redactions [] :effect :noop :confidence 0.0})))
+
+(defn llm-advisor
+  "Advisor backed by a langchain.model/ChatModel (Anthropic / OpenAI-compatible
+  / mock-model). Output is parsed defensively → an unparseable response is a
+  confidence-0 noop the governor will hold/escalate."
+  ([chat-model] (llm-advisor chat-model {}))
+  ([chat-model gen-opts]
+   (reify Advisor
+     (-advise [_ st req]
+       (let [resp (model/-generate chat-model
+                    [{:role :system :content system-prompt}
+                     {:role :user :content (str "操作:" (:op req)
+                                                "\n事実:" (pr-str (facts-for st req)))}]
+                    gen-opts)]
+         (parse-proposal (:content resp)))))))
+
+(defn trace [request proposal]
+  {:t :replyllm-proposal :op (:op request) :subject (or (:thread request) (:document request))
+   :recommendation (:recommendation proposal) :summary (:summary proposal)
+   :rationale (:rationale proposal) :cites (:cites proposal) :confidence (:confidence proposal)})

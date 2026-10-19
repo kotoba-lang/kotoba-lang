@@ -1,0 +1,307 @@
+(ns num.cpu
+  "The CPU REFERENCE backend — pure `.cljc` over flat `double-array`s, zero deps.
+
+  It is deliberately simple and obviously-correct: scalar triple loops, no SIMD,
+  no threads. Its job is not speed but to be the ORACLE — the contract test
+  (`num.contract`) runs the identical suite against this and against every GPU
+  backend, asserting `GpuBackend ≡ CpuBackend` to ~f32 tolerance, the same way the
+  actors guarantee `MemStore ≡ DatomicStore`. A handle here is just a
+  `double-array`; CSR arrays travel as host `int-array`/`double-array`."
+  (:require [num.dtype :as dtype]
+            [num.protocol :as p]))
+
+(defn- ^double aget* [^doubles a ^long i] (aget a i))
+
+(defn- typed-values [handle]
+  (let [data (:data handle)
+        decode (case (:dtype handle)
+                 :f16 dtype/f16-bits->f32
+                 :bf16 dtype/bf16-bits->f32)]
+    (mapv #(decode (aget data %)) (range (alength data)))))
+
+(defn- typed-handle [dtype* values]
+  (let [encode (case dtype*
+                 :f16 dtype/f32->f16-bits
+                 :bf16 dtype/f32->bf16-bits)
+        encoded (mapv encode values)]
+    {:dtype dtype*
+     :data }))
+
+(defn- erf-approx [x]
+  ;; Abramowitz-Stegun 7.1.26, max absolute error about 1.5e-7. Portable
+  ;; arithmetic keeps the JVM and JavaScript reference backends identical.
+  (let [sign (if (neg? x) -1.0 1.0)
+        a (Math/abs (double x))
+        t (/ 1.0 (+ 1.0 (* 0.3275911 a)))
+        h1 (+ -1.453152027 (* t 1.061405429))
+        h2 (+ 1.421413741 (* t h1))
+        h3 (+ -0.284496736 (* t h2))
+        h4 (+ 0.254829592 (* t h3))
+        poly (* t h4)]
+    (* sign (- 1.0 (* poly (Math/exp (- (* a a))))))))
+
+(defn- gelu-value [x]
+  (* 0.5 x (+ 1.0 (erf-approx (/ x 1.4142135623730951)))))
+
+(defn- gelu-gradient-value [x]
+  (+ (* 0.5 (+ 1.0 (erf-approx (/ x 1.4142135623730951))))
+     (* x 0.3989422804014327 (Math/exp (* -0.5 x x)))))
+
+(defn- packed-u16 [bytes offset]
+  (bit-or (nth bytes offset) (bit-shift-left (nth bytes (inc offset)) 8)))
+
+(defn- q4-k-scale-min [bytes block-offset index]
+  (let [q #(+ block-offset 4 %)]
+    (if (< index 4)
+      [(bit-and (nth bytes (q index)) 0x3f)
+       (bit-and (nth bytes (q (+ index 4))) 0x3f)]
+      [(bit-or (bit-and (nth bytes (q (+ index 4))) 0x0f)
+               (bit-shift-left (bit-shift-right (nth bytes (q (- index 4))) 6) 4))
+       (bit-or (bit-shift-right (nth bytes (q (+ index 4))) 4)
+               (bit-shift-left (bit-shift-right (nth bytes (q index)) 6) 4))])))
+
+(defn- q4-k-value [bytes row cols column]
+  (let [block-index (+ (* row (quot cols 256)) (quot column 256))
+        block-offset (* block-index 144)
+        local (mod column 256) subblock (quot local 32)
+        [scale minimum] (q4-k-scale-min bytes block-offset subblock)
+        quant-byte (nth bytes (+ block-offset 16 (* (quot subblock 2) 32)
+                                 (mod local 32)))
+        quant (if (even? subblock) (bit-and quant-byte 0x0f)
+                  (bit-shift-right quant-byte 4))
+        d (dtype/f16-bits->f32 (packed-u16 bytes block-offset))
+        dmin (dtype/f16-bits->f32 (packed-u16 bytes (+ block-offset 2)))]
+    (- (* d scale quant) (* dmin minimum))))
+
+(defn- signed-byte [value]
+  (if (< value 128) value (- value 256)))
+
+(defn- q6-k-value [bytes row cols column]
+  (let [block-index (+ (* row (quot cols 256)) (quot column 256))
+        block-offset (* block-index 210)
+        local (mod column 256) half (quot local 128) position (mod local 128)
+        group (quot position 32) lane (mod position 32)
+        low-index (+ block-offset (* half 64) lane (if (odd? group) 32 0))
+        low-byte (nth bytes low-index)
+        high-byte (nth bytes (+ block-offset 128 (* half 32) lane))
+        low-bits (if (< group 2) (bit-and low-byte 0x0f)
+                     (bit-shift-right low-byte 4))
+        high-bits (bit-and (bit-shift-right high-byte (* group 2)) 0x03)
+        quant (- (bit-or low-bits (bit-shift-left high-bits 4)) 32)
+        scale-index (+ block-offset 192 (* half 8) (quot lane 16) (* group 2))
+        scale (signed-byte (nth bytes scale-index))
+        d (dtype/f16-bits->f32 (packed-u16 bytes (+ block-offset 208)))]
+    (* d scale quant)))
+
+(defn- q8-0-value [bytes row cols column]
+  (let [block-index (+ (* row (quot cols 32)) (quot column 32))
+        block-offset (* block-index 34)
+        d (dtype/f16-bits->f32 (packed-u16 bytes block-offset))
+        quant (signed-byte (nth bytes (+ block-offset 2 (mod column 32))))]
+    (* d quant)))
+
+(defn- q5-0-value [bytes row cols column]
+  (let [linear (+ (* row cols) column)
+        block-index (quot linear 32)
+        block-offset (* block-index 22)
+        local (mod linear 32)
+        d (dtype/f16-bits->f32 (packed-u16 bytes block-offset))
+        high-word (reduce (fn [value index]
+                            (bit-or value
+                                    (bit-shift-left
+                                     (nth bytes (+ block-offset 2 index))
+                                     (* index 8))))
+                          0 (range 4))
+        packed (nth bytes (+ block-offset 6 (mod local 16)))
+        low (if (< local 16) (bit-and packed 0x0f)
+                (bit-shift-right packed 4))
+        high (bit-and (unsigned-bit-shift-right high-word local) 1)]
+    (* d (- (bit-or low (bit-shift-left high 4)) 16))))
+
+(deftype CpuBackend []
+  p/IBackend
+  (-backend-name [_] :cpu)
+  (-alloc [_ n] (double-array (long n)))
+  (-free [_ _] nil)
+  (-copy-to-host [_ h n] (let [^doubles a h n (long n)]
+                           (vec (for [i (range n)] (aget a i)))))
+  (-copy-from-host [_ xs] (double-array (map double xs)))
+
+  (-axpy [_ alpha xh yh n]
+    (let [^doubles x xh ^doubles y yh a (double alpha) n (long n)]
+      (dotimes [i n] (aset y i (+ (aget y i) (* a (aget x i)))))
+      y))
+
+  (-scal [_ alpha xh n]
+    (let [^doubles x xh a (double alpha) n (long n)]
+      (dotimes [i n] (aset x i (* a (aget x i))))
+      x))
+
+  (-dot [_ xh yh n]
+    (let [^doubles x xh ^doubles y yh n (long n)]
+      (loop [i 0 s 0.0] (if (< i n) (recur (inc i) (+ s (* (aget x i) (aget y i)))) s))))
+
+  (-nrm2 [b xh n] (Math/sqrt (p/-dot b xh xh n)))
+
+  (-ewise [_ op xh yh n]
+    (let [^doubles x xh ^doubles y yh n (long n) z (double-array n)
+          f (case op :add + :sub - :mul * :div /)]
+      (dotimes [i n] (aset z i (double (f (aget x i) (aget y i)))))
+      z))
+
+  (-ewise1 [_ op xh n]
+    (let [^doubles x xh n (long n) z (double-array n)
+          f (case op
+              :exp #(Math/exp %)
+              :relu #(max % 0.0)
+              :neg -
+              :silu (fn [v] (/ v (+ 1.0 (Math/exp (- v)))))
+              :sigmoid (fn [v] (/ 1.0 (+ 1.0 (Math/exp (- v)))))
+              :tanh #(Math/tanh %)
+              :gelu gelu-value
+              :sigmoid-gradient (fn [y] (* y (- 1.0 y)))
+              :tanh-gradient (fn [y] (- 1.0 (* y y)))
+              :gelu-gradient gelu-gradient-value)]
+      (dotimes [i n] (aset z i (double (f (aget x i)))))
+      z))
+
+  (-reduce [_ op xh n]
+    (let [^doubles x xh n (long n)]
+      (case op
+        :sum (loop [i 0 s 0.0] (if (< i n) (recur (inc i) (+ s (aget x i))) s))
+        :max (loop [i 1 m (aget x 0)] (if (< i n) (recur (inc i) (max m (aget x i))) m))
+        :min (loop [i 1 m (aget x 0)] (if (< i n) (recur (inc i) (min m (aget x i))) m)))))
+
+  (-gemv [_ alpha Ah m n xh beta yh]
+    (let [^doubles A Ah ^doubles x xh ^doubles y yh
+          a (double alpha) bt (double beta) m (long m) n (long n)]
+      (dotimes [i m]
+        (let [row (* i n)
+              s (loop [j 0 s 0.0] (if (< j n) (recur (inc j) (+ s (* (aget A (+ row j)) (aget x j)))) s))]
+          (aset y i (+ (* a s) (* bt (aget y i))))))
+      y))
+
+  (-gemm [_ alpha Ah m k Bh n beta Ch]
+    (let [^doubles A Ah ^doubles B Bh ^doubles C Ch
+          a (double alpha) bt (double beta) m (long m) k (long k) n (long n)]
+      (dotimes [i m]
+        (dotimes [j n]
+          (let [s (loop [l 0 s 0.0]
+                    (if (< l k)
+                      (recur (inc l) (+ s (* (aget A (+ (* i k) l)) (aget B (+ (* l n) j)))))
+                      s))]
+            (aset C (+ (* i n) j) (+ (* a s) (* bt (aget C (+ (* i n) j))))))))
+      C))
+
+  (-spmv [_ csr xh]
+    (let [^doubles x xh
+          ^ints rp (:row-ptr csr) ^ints ci (:col-idx csr) ^doubles v (:vals csr)
+          m (long (:n-rows csr)) y (double-array m)]
+      (dotimes [i m]
+        (let [a (aget rp i) z (aget rp (inc i))]
+          (aset y i (loop [p a s 0.0]
+                      (if (< p z) (recur (inc p) (+ s (* (aget v p) (aget x (aget ci p))))) s)))))
+      y))
+
+  p/IMutableBufferOps
+  (-copy-into! [_ destination source offset n dtype*]
+    (let [destination (if (= dtype* :f32) destination (:data destination))
+          source (if (= dtype* :f32) source (:data source))
+          offset (long offset) n (long n)]
+      
+      destination))
+
+  p/IQuantizedOps
+  (-quantized-from-host [_ bytes params]
+    {:bytes (mapv #(bit-and 0xff %) bytes) :params params})
+  (-quantized-matmul [_ input weight {:keys [quant-type m k n]}]
+    (when-not (#{:q5-0 :q4-k :q6-k :q8-0} quant-type)
+      (throw (ex-info "unsupported CPU quantized matmul" {:quant-type quant-type})))
+    (let [^doubles input input bytes (:bytes weight) output (double-array (* m n))
+          value-at (case quant-type
+                     :q5-0 q5-0-value :q4-k q4-k-value
+                     :q6-k q6-k-value :q8-0 q8-0-value)]
+      (dotimes [row m]
+        (dotimes [column n]
+          (aset output (+ (* row n) column)
+                (loop [inner 0 sum 0.0]
+                  (if (< inner k)
+                    (recur (inc inner)
+                           (+ sum (* (aget input (+ (* row k) inner))
+                                     (value-at bytes column k inner))))
+                    sum)))))
+      output))
+  (-quantized-embedding [_ indices table {:keys [quant-type rows dim count]}]
+    (let [^doubles indices indices bytes (:bytes table)
+          value-at (case quant-type
+                     :q5-0 q5-0-value :q4-k q4-k-value
+                     :q6-k q6-k-value :q8-0 q8-0-value)
+          output (double-array (* count dim))]
+      (dotimes [position count]
+        (let [raw (aget indices position) row (long raw)]
+          (when-not (and (= raw (double row)) (<= 0 row) (< row rows))
+            (throw (ex-info "quantized embedding index out of range"
+                            {:index raw :rows rows :position position})))
+          (dotimes [feature dim]
+            (aset output (+ (* position dim) feature)
+                  (value-at bytes row dim feature)))))
+      output))
+
+  p/IDTypeStorage
+  (-alloc-dtype [_ n dtype*]
+    {:dtype dtype*
+     :data })
+  (-copy-from-host-dtype [_ xs dtype*]
+    (let [encoded (mapv (case dtype*
+                          :f16 dtype/f32->f16-bits
+                          :bf16 dtype/f32->bf16-bits)
+                        xs)]
+      {:dtype dtype*
+       :data }))
+  (-copy-to-host-dtype [_ h n dtype*]
+    (when-not (= dtype* (:dtype h))
+      (throw (ex-info "typed handle dtype mismatch"
+                      {:expected dtype* :actual (:dtype h)})))
+    (let [data (:data h)
+          decode (case dtype*
+                   :f16 dtype/f16-bits->f32
+                   :bf16 dtype/bf16-bits->f32)]
+      (mapv #(decode (aget data %)) (range (long n)))))
+
+  p/IDTypeOps
+  (-ewise-dtype [_ op xh yh n dtype*]
+    (let [xs (typed-values xh) ys (typed-values yh)
+          f (case op :add + :sub - :mul * :div /)]
+      (typed-handle dtype* (mapv f (take n xs) (take n ys)))))
+  (-ewise1-dtype [_ op xh n dtype*]
+    (let [f (case op
+              :exp #(Math/exp %)
+              :relu #(max % 0.0)
+              :neg -
+              :silu (fn [v] (/ v (+ 1.0 (Math/exp (- v)))))
+              :sigmoid (fn [v] (/ 1.0 (+ 1.0 (Math/exp (- v)))))
+              :tanh #(Math/tanh %)
+              :gelu gelu-value
+              :sigmoid-gradient (fn [y] (* y (- 1.0 y)))
+              :tanh-gradient (fn [y] (- 1.0 (* y y)))
+              :gelu-gradient gelu-gradient-value)]
+      (typed-handle dtype* (mapv f (take n (typed-values xh))))))
+  (-scale-dtype [_ alpha xh n dtype*]
+    (typed-handle dtype*
+                  (mapv #(* (double alpha) %) (take n (typed-values xh)))))
+  (-gemm-dtype [_ Ah m k Bh n dtype*]
+    (let [A (typed-values Ah) B (typed-values Bh)]
+      (typed-handle
+       dtype*
+       (vec
+        (for [i (range m) j (range n)]
+          (reduce + 0.0
+                  (map (fn [l]
+                         (* (nth A (+ (* i k) l))
+                            (nth B (+ (* l n) j))))
+                       (range k)))))))))
+
+(defn cpu-backend
+  "Construct the pure-Clojure CPU reference backend."
+  []
+  (->CpuBackend))

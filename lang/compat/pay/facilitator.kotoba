@@ -1,0 +1,723 @@
+(ns pay.facilitator
+  "x402 facilitator core — the payment-GATEWAY logic as pure Clojure/
+  ClojureScript. This is the reusable brain of gftdcojp/nexus-x402 (the
+  deployable, edge-hosted x402 facilitator service) and of any seller worker
+  that delegates verification instead of vendoring the whole gate.
+
+  Cloudflare's Monetization Gateway is a CENTRAL facilitator: sellers register
+  pricing rules and the facilitator verifies payments at the edge. nexus-x402
+  is our self-hosted equivalent, and this namespace is its rules engine + the
+  standard x402 facilitator decisions (`/verify`, `/settle`) — all pure,
+  matching kotoba-lang/pay's invariants (zero-dep, zero network I/O, zero key
+  custody). The on-chain settlement/verification I/O is injected by the host
+  (nexus-x402 backs it with kotoba-lang/treasury + base-l2); this layer is
+  unit-testable without a chain.
+
+  Three pieces:
+  1. Rules engine — a seller registry mapping (seller, method, path) to a
+     price + pay-to treasury + scheme; first match wins. Lets many sellers
+     (shinshi / murakumo / kotobase, each with its OWN treasury) share one
+     facilitator without the facilitator holding any keys.
+  2. `verify` — the x402 facilitator `/verify` decision: is this payment valid
+     for these requirements (pure shape/economic checks + the host's on-chain
+     verdict)? Returns {:isValid :invalidReason :payer}.
+  3. `settle` / `gate` — the `/settle` decision and the end-to-end gateway
+     decision (no X-PAYMENT -> 402 challenge; X-PAYMENT -> verify -> serve or
+     hold), reusing pay.x402's challenge/authorize/entitle philosophy."
+  (:require [clojure.string :as str]
+            [pay.x402 :as x402]))
+
+;; ── rules engine / seller registry ──────────────────────────────────
+;; A rule:
+;;   {:seller "shinshi"            ; nil = matches any seller
+;;    :method "GET"                ; nil = any method
+;;    :path-prefix "/premium/"     ; required
+;;    :usd "0.50"
+;;    :pay-to "0x…"                ; the seller's OWN treasury (no key custody)
+;;    :scheme "transaction"        ; or "exact"
+;;    :chain "base"
+;;    :description "…"}            ; optional
+;; Rules are an ordered vector; the first structural match wins.
+
+(defn rule-errors
+  "Validation errors for one rule, [] when usable."
+  [{:keys [path-prefix usd pay-to]}]
+  (cond-> []
+    (not (string? path-prefix)) (conj :facilitator/missing-path-prefix)
+    (not (string? usd))         (conj :facilitator/missing-usd)
+    (not (string? pay-to))      (conj :facilitator/missing-pay-to)))
+
+(defn valid-rule? [rule] (empty? (rule-errors rule)))
+
+(defn match-rule
+  "First rule in `rules` matching the request {:seller :method :path}, or nil."
+  [rules {:keys [seller method path]}]
+  (some (fn [r]
+          (when (and (or (nil? (:seller r)) (= (:seller r) seller))
+                     (or (nil? (:method r))
+                         (= (str/upper-case (:method r))
+                            (str/upper-case (or method "GET"))))
+                     (string? (:path-prefix r))
+                     (str/starts-with? (or path "") (:path-prefix r)))
+            r))
+        rules))
+
+(defn rule->requirements
+  "Turn a matched rule + the concrete resource path into x402 payment
+  requirements (pay.x402/payment-requirements)."
+  [rule resource]
+  (x402/payment-requirements
+   {:pay-to (:pay-to rule)
+    :usd (:usd rule)
+    :scheme (:scheme rule "transaction")
+    :network (:chain rule "base")
+    :resource resource
+    :description (:description rule (str (:seller rule) " " resource))}))
+
+;; ── opening the registry to third-party sellers ─────────────────────
+;;
+;; Everything above works today with ONE seller: the operator. Opening the same
+;; registry to third parties is what turns the operator from the counterparty
+;; on every flow into the market those flows run through -- the structural
+;; change a system-dynamics pass over kotoba-lang/dynamics' archetype catalog
+;; ranked third of six for the three-sphere economy (com-junkawasaki/root
+;; adr-ledger seq 66, 2026-07-25), grounded in the observation that Visa earns
+;; on $17T of OTHER PEOPLE'S transactions and that ERC-20's real leverage was
+;; making every subsequent token project free demand surface for Ethereum.
+;;
+;; Two things have to be true before that is safe, and one of them is a live
+;; hijack vector in the code above:
+;;
+;; 1. `match-rule` treats `:seller nil` as "matches ANY seller". That is a
+;;    convenience in a single-tenant registry and an authorization hole the
+;;    moment anyone else can add a rule: nexus-x402 routes
+;;    `/gateway/<seller>/<path>`, so one wildcard rule would collect payment
+;;    for every seller's namespace. `open-registry-errors` rejects it.
+;; 2. Within a seller's own namespace, two rules whose prefixes shadow each
+;;    other silently make the second unreachable (first match wins). That is a
+;;    seller's own problem, but it should be reported at registration rather
+;;    than discovered as missing revenue.
+;;
+;; What this section does NOT do, stated plainly: it does not collect a
+;; protocol fee on-chain. It cannot. This facilitator holds zero keys by
+;; design, payment goes buyer -> seller's own treasury directly, and x402's
+;; requirements carry ONE `pay-to`. Splitting a payment atomically would need a
+;; splitter contract that is not deployed and whose deployment is a separate,
+;; higher-stakes decision. So the fee is COMPUTED AND RECORDED here, and
+;; collection is left explicitly unbuilt -- the same record / custody /
+;; governance separation ADR-2607995000 §2 already applies to the treasury
+;; (the ledger records, the custodian holds, governance authorizes; no layer
+;; does another layer's job).
+
+(def reserved-seller-names
+  "Seller ids a third party may not claim: they either name the operator's own
+  surfaces or would read as one in a catalog."
+  #{"operator" "facilitator" "nexus" "admin" "system" "x402" "well-known"})
+
+(defn- seller-id-errors [seller]
+  (cond-> []
+    (not (string? seller))                    (conj :facilitator/missing-seller)
+    (and (string? seller) (str/blank? seller)) (conj :facilitator/blank-seller)
+    (and (string? seller)
+         (contains? reserved-seller-names (str/lower-case seller)))
+    (conj :facilitator/reserved-seller)
+    (and (string? seller) (not (re-matches #"[a-z0-9][a-z0-9-]{0,62}" seller)))
+    (conj :facilitator/malformed-seller)))
+
+;; ── credits as a second payment option (ADR-2607995000 amend, seq 73) ──
+;;
+;; A seller may price a resource in USDC, in murakumo credits, or in both. The
+;; membrane amend that made this legal adds exactly one row -- credits ->
+;; third-party seller, credits-denominated -- and changes nothing else:
+;; credits->fiat/USDC stays forbidden in both directions, as does credits<->EN.
+;; Transferability is not redeemability, so §1's structural non-speculation
+;; proof survives: a credit paid to a seller still cannot leave the economy.
+;;
+;; Why it is worth the code: a non-redeemable unit's value is bounded by the
+;; number of distinct things it buys, and before this the only acceptor was the
+;; operator's own inference fleet -- an acceptance density of exactly 1, which
+;; the system-dynamics pass (com-junkawasaki/root adr-ledger seq 66) named as
+;; the binding constraint on the whole credits sphere.
+;;
+;; This layer stays pure and custody-free for credits exactly as it is for
+;; USDC. It decides WHAT is owed; whether the payer's credits balance covers it
+;; is a ledger question the host answers (murakumo.infer.credits/balances +
+;; ledger-violations) and injects, the same shape as `onchain-verdict`.
+
+(def credits-network
+  "The `network` string a credits-denominated requirement carries. Not a chain:
+  credits settle in murakumo's append-only ledger, never on-chain, and the
+  distinct value is what stops a caller routing one to an EVM verifier."
+  "murakumo")
+
+(def credits-scheme "credits")
+
+(defn credits-requirements
+  "A credits-denominated payment option, in the same x402 requirement shape as
+  `pay.x402/payment-requirements` so a 402 body can offer it inside `accepts`
+  alongside the USDC option and an x402 client needs no new parser.
+
+  `payTo` is the seller's CREDITS ACCOUNT NAME, not an address -- credits have
+  no chain and no key custody. `maxAmountRequired` is a credits amount as a
+  decimal string, matching x402's bigint-safe string convention."
+  [{:keys [credits-to credits resource description max-timeout-seconds]
+    :or {max-timeout-seconds 60}}]
+  {:scheme credits-scheme
+   :network credits-network
+   :maxAmountRequired (str credits)
+   :resource resource
+   :description (or description "")
+   :mimeType "application/json"
+   :payTo credits-to
+   :maxTimeoutSeconds max-timeout-seconds
+   :asset {:symbol "CREDITS"
+           :network credits-network
+           :redeemable false
+           :note "murakumo memory x time credits: labor-issued, transferable
+                  between holders, NON-redeemable for fiat/USDC/EN by design
+                  (ADR-2607995000 §1 membrane rules). Receiving these is not
+                  receiving money and must not be accounted as such."}})
+
+(defn payment-option-errors
+  "Errors for a rule's PRICING, [] when usable. A rule must offer at least one
+  complete payment option; each option it does offer must be complete.
+
+  Deliberately not folded into `rule-errors`: that fn predates credits, is
+  still correct for a USDC-only rule, and existing single-tenant callers depend
+  on its exact output. This is the open-registry rule."
+  [{:keys [usd pay-to credits credits-to]}]
+  (let [usdc? (or usd pay-to)
+        cr?   (or credits credits-to)]
+    (cond-> []
+      (and (not usdc?) (not cr?))          (conj :facilitator/no-payment-option)
+      (and usdc? (not (string? usd)))      (conj :facilitator/missing-usd)
+      (and usdc? (not (string? pay-to)))   (conj :facilitator/missing-pay-to)
+      (and cr? (not (string? credits)))    (conj :facilitator/missing-credits-price)
+      (and cr? (not (string? credits-to))) (conj :facilitator/missing-credits-to))))
+
+(defn rule->accepts
+  "Every payment option a matched rule offers, as an x402 `accepts` vector.
+  USDC first when present (it is the option that settles outside this economy,
+  so a buyer with no credits account is never stuck reading past it)."
+  [rule resource]
+  (cond-> []
+    (:usd rule) (conj (rule->requirements rule resource))
+    (:credits rule) (conj (credits-requirements (assoc rule :resource resource)))))
+
+(defn accepts-credits?
+  "Does this rule take credits? Answering it from the registry is what makes
+  acceptance density -- the count of sellers who accept credits -- a query
+  rather than an assertion."
+  [rule]
+  (boolean (and (:credits rule) (:credits-to rule))))
+
+(defn credits-accepting-sellers
+  "Distinct sellers in `rules` that accept credits. 1 today (the operator's own
+  fleet, once it registers a credits price); the growth analysis named that 1
+  as the binding constraint on the credits sphere."
+  [rules]
+  (into #{} (comp (filter accepts-credits?) (keep :seller)) rules))
+
+(defn open-registry-rule-errors
+  "Validation errors for a rule submitted by a THIRD PARTY, [] when usable.
+
+  Covers the constraints that only matter once the registry is open, plus
+  `payment-option-errors` (which supersedes `rule-errors`'s USDC-only pricing
+  checks so that a credits-only seller is expressible). `rule-errors` itself is
+  unchanged and existing single-tenant callers are unaffected."
+  [{:keys [seller path-prefix] :as rule}]
+  (into (into [] (payment-option-errors rule))
+        (cond-> (seller-id-errors seller)
+          (not (string? path-prefix))
+          (conj :facilitator/missing-path-prefix)
+          ;; the hijack vector: a nil seller matches every namespace
+          (nil? seller)
+          (conj :facilitator/wildcard-seller-forbidden)
+
+          (and (string? path-prefix) (not (str/starts-with? path-prefix "/")))
+          (conj :facilitator/path-prefix-must-be-absolute)
+
+          ;; "/" would swallow the seller's whole namespace including any future
+          ;; rule; almost always a mistake, never necessary
+          (= path-prefix "/")
+          (conj :facilitator/path-prefix-too-broad))))
+
+(defn shadowed-rules
+  "Rules in `rules` that can never match because an EARLIER rule for the same
+  seller (or a wildcard-seller rule) already covers their prefix and method.
+  Returns [{:index i :rule r :shadowed-by-index j}], empty when clean.
+
+  First-match-wins is the intended semantics, not a bug -- but a seller who
+  registers a specific price after a general one gets silently underpaid, and
+  that is worth reporting at registration time rather than at reconciliation."
+  [rules]
+  (let [v (vec rules)
+        covers? (fn [a b]
+                  (and (or (nil? (:seller a)) (= (:seller a) (:seller b)))
+                       (or (nil? (:method a))
+                           (= (str/upper-case (or (:method a) ""))
+                              (str/upper-case (or (:method b) "GET"))))
+                       (string? (:path-prefix a)) (string? (:path-prefix b))
+                       (str/starts-with? (:path-prefix b) (:path-prefix a))))]
+    (vec (for [j (range (count v))
+               :let [earlier (first (keep-indexed
+                                     (fn [i a] (when (and (< i j) (covers? a (nth v j))) i))
+                                     v))]
+               :when earlier]
+           {:index j :rule (nth v j) :shadowed-by-index earlier}))))
+
+(defn register-seller
+  "Admit `new-rules` from one third-party seller into `rules`, or refuse.
+
+  Returns {:admitted? true  :rules <new registry> :warnings [...]}
+       or {:admitted? false :errors [...]}.
+
+  Refusal (hard, never partial -- a half-registered seller is worse than an
+  unregistered one):
+    - any rule fails `open-registry-rule-errors`
+    - a rule names a seller other than `seller` (no registering on someone
+      else's behalf)
+    - a rule's prefix is already covered by an EXISTING rule belonging to a
+      DIFFERENT seller (cross-seller collision -- would route this seller's
+      traffic to someone else's treasury, or vice versa)
+
+  Warnings (admitted, but reported): rules shadowed within this seller's own
+  set. Appended at the END of the registry: an existing seller's rules always
+  keep priority over a newcomer's, so registration can never re-route traffic
+  that already had a home."
+  [rules seller new-rules]
+  (let [errs (into [] (mapcat #(open-registry-rule-errors (assoc % :seller (:seller % seller)))) new-rules)
+        wrong-seller (remove #(= seller (:seller % seller)) new-rules)
+        combined (into (vec rules) (map #(assoc % :seller (:seller % seller))) new-rules)
+        n-existing (count rules)
+        cross (->> (shadowed-rules combined)
+                   (filter (fn [{:keys [index shadowed-by-index]}]
+                             (and (>= index n-existing)
+                                  (< shadowed-by-index n-existing)
+                                  (not= seller (:seller (nth combined shadowed-by-index))))))
+                   vec)
+        all-errors (cond-> (vec (distinct errs))
+                     (seq wrong-seller) (conj :facilitator/seller-mismatch)
+                     (seq cross) (conj :facilitator/cross-seller-collision))]
+    (if (seq all-errors)
+      {:admitted? false :errors all-errors :collisions cross}
+      {:admitted? true
+       :rules combined
+       :warnings (->> (shadowed-rules combined)
+                      (filter #(>= (:index %) n-existing))
+                      vec)})))
+
+;; ── protocol fee: computed and recorded, NOT collected ───────────────
+
+(def default-protocol-fee-bps
+  "Basis points the facilitator records against a third-party settlement.
+  500 bps = 5%, matching the cut ADR-2607995000's membrane table already
+  applies to fiat/USDC -> credits mint, so the economy has ONE fee number
+  rather than a second one invented here."
+  500)
+
+(defn- parse-micros
+  "`:maxAmountRequired` is USDC micros as a decimal STRING (pay.x402's
+  bigint-safe wire convention). Parsed as an integer -- never a float, so fee
+  arithmetic stays exact at the unit the chain actually settles in."
+  [raw]
+  (when (and (string? raw) (re-matches #"\d+" raw))
+    ))
+
+(defn protocol-fee
+  "Fee accounting for one settled payment, in USDC MICROS -- exact integer
+  arithmetic on `:maxAmountRequired`, floored, never floating point. Returns
+  :amount-micros nil (not 0) when the requirements carry no parseable amount,
+  so an unparseable price can never be recorded as a zero fee.
+
+  `:collectible?` is ALWAYS false and carries its reason in-band. This
+  facilitator holds no keys, x402 requirements carry exactly one `payTo`, and
+  no splitter contract is deployed -- so this is a RECORD of what is owed, not
+  a transfer. Treating a non-nil :amount-micros as revenue received would be
+  wrong, which is why the flag is a value rather than a comment."
+  ([requirements] (protocol-fee requirements default-protocol-fee-bps))
+  ([requirements bps]
+   (let [micros (parse-micros (:maxAmountRequired requirements))]
+     {:bps bps
+      :gross-micros micros
+      :amount-micros (when micros (quot (* micros bps) 10000))
+      :collectible? false
+      :why "facilitator holds no keys and x402 requirements carry a single
+            payTo; collection needs a splitter contract that is not deployed.
+            Recorded per ADR-2607995000 §2's record/custody/governance split --
+            this is the record layer only."})))
+
+(defn settlement-record
+  "What a host appends to its ledger for one settled third-party payment.
+  Carries the seller deliberately: it makes ACCEPTANCE DENSITY -- how many
+  distinct sellers have ever settled -- answerable from the ledger instead of
+  by assertion. That count is 1 today (the operator), and the three-sphere
+  growth analysis identified it as the binding constraint on the whole
+  economy."
+  [{:keys [seller settlement requirements payer now-epoch]}]
+  {:seller seller
+   :payer payer
+   :settlement settlement
+   :resource (:resource requirements)
+   :amount-micros (parse-micros (:maxAmountRequired requirements))
+   :pay-to (:payTo requirements)
+   :fee (protocol-fee requirements)
+   :at now-epoch})
+
+;; ── /verify (x402 facilitator interface) ────────────────────────────
+;; `onchain-verdict` is host-supplied: {:included bool :reason … :payer …} —
+;; nexus backs it with treasury/verify-payment (transaction scheme) or an
+;; EIP-3009 submission result (exact scheme). Pure decision here.
+
+(defn verify
+  "The x402 `/verify` response for a decoded payment against requirements at
+  `now-epoch`, given the host's on-chain verdict. Shape/economic checks run
+  first (no chain call needed to reject a malformed/underpaid payment)."
+  [payment requirements onchain-verdict now-epoch]
+  (let [errs (x402/payload-errors payment requirements now-epoch)]
+    (cond
+      (seq errs)
+      {:isValid false :invalidReason (subs (str (first errs)) 1) :errors errs}
+
+      (not (:included onchain-verdict))
+      {:isValid false
+       :invalidReason (str "unsettled: " (some-> (:reason onchain-verdict) name))}
+
+      :else
+      {:isValid true
+       :payer (or (:payer onchain-verdict)
+                  (get-in payment [:payload :from])
+                  (get-in payment [:payload :authorization :from]))})))
+
+;; ── /settle (x402 facilitator interface) ────────────────────────────
+
+(defn settle
+  "The x402 `/settle` decision — reuses pay.x402/authorize. Returns the
+  authorize map ({:authorized? …} with :settlement or :status 402)."
+  [payment requirements onchain-verdict now-epoch]
+  (x402/authorize payment requirements onchain-verdict now-epoch))
+
+;; ── gate (end-to-end gateway decision) ──────────────────────────────
+;; The full facilitator/gateway step, independent of transport. The host:
+;;  - resolves the seller + path,
+;;  - if there is a matching rule and NO decoded payment -> emit :challenge,
+;;  - if a payment is present -> the host must have run its on-chain verdict,
+;;    then this returns :serve (authorized) or :hold (402), or :pass (no rule).
+
+(defn gate
+  "Resolve a gateway decision. Args:
+    rules   — the seller registry (ordered vector)
+    req     — {:seller :method :path}
+    payment — decoded X-PAYMENT payload map, or nil
+    onchain-verdict — host verdict map, or nil when payment is nil
+    now-epoch
+  Returns one of:
+    {:decision :pass}                                  ; no rule → not gated
+    {:decision :challenge :status 402 :requirements r} ; needs payment
+    {:decision :serve :settlement s :requirements r}   ; paid & verified
+    {:decision :hold :status 402 :reason kw :requirements r}
+
+  A rule with NO USDC price (credits-only, which `payment-option-errors` and
+  `register-seller` both admit) has no `:requirements` — only `:accepts`. It
+  used to have neither: `rule->requirements` prices through
+  `pay.core/parse-usdc`, which THROWS on a missing amount, so this fn threw on
+  the first unpaid request to any credits-only resource and the gateway
+  answered 500. `rule->accepts` had the `(:usd rule)` guard from the day it was
+  written; this one did not, and nothing exercised the combination because the
+  only registry in production was USDC-only."
+  [rules {:keys [path] :as req} payment onchain-verdict now-epoch]
+  (if-let [rule (match-rule rules req)]
+    (let [reqs (when (:usd rule) (rule->requirements rule path))
+          accepts (rule->accepts rule path)]
+      (cond
+        (nil? payment)
+        ;; :requirements stays the USDC option so pre-credits callers are
+        ;; byte-for-byte unaffected; :accepts carries every option the rule
+        ;; offers, which is what x402's own `accepts` array is for.
+        (cond-> {:decision :challenge :status 402}
+          reqs (assoc :requirements reqs)
+          (seq accepts) (assoc :accepts accepts))
+
+        ;; An on-chain payment presented against a rule that never advertised
+        ;; an on-chain price. Refusing is the only honest answer: there is no
+        ;; payTo to have paid, so there is nothing to verify the payload
+        ;; against, and inventing requirements here would mean checking a real
+        ;; transfer against a price nobody published.
+        (nil? reqs)
+        (cond-> {:decision :hold :status 402
+                 :reason :facilitator/seller-does-not-accept-onchain-payment}
+          (seq accepts) (assoc :accepts accepts))
+
+        :else
+        (let [d (settle payment reqs onchain-verdict now-epoch)]
+          (if (:authorized? d)
+            {:decision :serve :settlement (:settlement d) :requirements reqs}
+            {:decision :hold :status 402 :reason (:reason d) :requirements reqs}))))
+    {:decision :pass}))
+
+(defn credits-gate
+  "The credits-denominated analogue of `gate`'s paid branch, for a payment whose
+  scheme is `credits`.
+
+  Kept SEPARATE from `gate` rather than branching inside it, on purpose: `gate`
+  routes to `pay.x402/authorize`, whose entire job is validating an on-chain
+  payload (asset, network, payTo address, EIP-3009 authorization). A credits
+  payment has none of those and must never be handed to that validator, because
+  a validator that has to accept two unrelated payload shapes is one refactor
+  away from accepting an on-chain payload with a credits verdict attached.
+
+  `credits-verdict` is host-injected, exactly like `onchain-verdict`:
+    {:sufficient? bool :payer \"account\" :balance n :reason kw}
+  The host computes it from murakumo.infer.credits (`balances` +
+  `ledger-violations`) -- this layer holds no ledger and no keys, and it
+  deliberately CANNOT decide affordability on its own.
+
+  Returns {:decision :serve :transfer {...}} with the ledger event the host
+  should append, or {:decision :hold :status 402 :reason kw}. Note it returns
+  the transfer to be RECORDED; this fn does not and cannot move anything."
+  [rule {:keys [path]} {:keys [payer amount] :as _payment} credits-verdict]
+  (let [reqs (credits-requirements (assoc rule :resource path))
+        owed (:maxAmountRequired reqs)]
+    (cond
+      (not (accepts-credits? rule))
+      {:decision :hold :status 402 :reason :facilitator/seller-does-not-accept-credits
+       :requirements reqs}
+
+      (not= (str amount) (str owed))
+      {:decision :hold :status 402 :reason :facilitator/credits-amount-mismatch
+       :requirements reqs :owed owed :offered (str amount)}
+
+      (not (:sufficient? credits-verdict))
+      {:decision :hold :status 402
+       :reason (or (:reason credits-verdict) :facilitator/insufficient-credits)
+       :requirements reqs}
+
+      :else
+      {:decision :serve
+       :requirements reqs
+       :transfer {:from payer :to (:credits-to rule) :credits owed
+                  :for (:resource reqs)}})))
+
+;; ── facilitator discovery (/.well-known/x402) ───────────────────────
+
+(defn discovery
+  "A facilitator discovery document listing the schemes/networks this
+  facilitator supports and its endpoints. Served at /.well-known/x402.
+
+  `schemes` and `networks` are REQUIRED and come from the host, because only
+  the host knows what it can actually produce a verdict for. They used to be
+  the literals `[\"transaction\" \"exact\"]` and `[\"base\"]`, and both had
+  drifted from the deployment by 2026-08-31:
+
+  - `exact` was announced by a facilitator that HOLDS NO KEYS. Settling an
+    EIP-3009 authorization means submitting it on-chain, and nothing here can:
+    the on-chain verdict path reads a receipt for a `txHash` a buyer already
+    broadcast. A buyer that believed the announcement and built an
+    authorization had nobody to give it to.
+  - `base-sepolia` was NOT announced, while `nexus.apply/settleable-networks`
+    accepted it and `treasury/chains` could verify it — so a seller reading
+    this document concluded that proving a paid path without moving value was
+    impossible, when it was already supported.
+
+  Announcing more than you can do and less than you can do are the same defect
+  with the sign flipped, and a literal in a builder cannot be either right or
+  wrong about a deployment it never sees. Missing arguments throw rather than
+  defaulting: a document that quietly describes some other facilitator is worse
+  than no document, and this is called once at startup-shaped code.
+
+  `testnets` is optional and marks which of `networks` carry no value, so a
+  client does not have to infer it from the name."
+  [{:keys [verify-url settle-url schemes networks testnets]}]
+  (when-not (and (seq schemes) (seq networks))
+    (throw (ex-info "pay.facilitator/discovery: :schemes and :networks are required — a discovery document must describe THIS deployment, and the literals it used to default to had drifted from it in both directions"
+                    {:schemes schemes :networks networks})))
+  (cond-> {:x402Version x402/x402-version
+           :facilitator {:verify verify-url :settle settle-url}
+           :schemes (vec schemes)
+           :networks (vec networks)
+           :asset {:symbol "USDC" :address x402/usdc-base :network "base" :decimals 6}}
+    (seq testnets) (assoc :testnets (vec testnets))))
+
+;; ── receivables: the protocol fee as an INVOICE, not an on-chain split ──
+;;
+;; com-junkawasaki/root ADR-2607320500 §3. Owner requirement (2026-07-31):
+;; "資産預かりたくないけど、手数料は欲しい" — do not custody assets, but do
+;; collect the fee. Those two are only simultaneously satisfiable one way.
+;;
+;; `protocol-fee` reports :collectible? false because THIS facilitator cannot
+;; take a cut on-chain: it holds no keys and an x402 requirement carries a
+;; single `payTo`. Taking a cut atomically needs a splitter contract, and
+;; deploying a contract that holds a third party's money is the single decision
+;; that was also blocking witness bonds (ADR-2607319800).
+;;
+;; So the fee is collected the ordinary way instead: the seller receives 100%
+;; into their own treasury, and the operator BILLS them. Nothing is ever held
+;; on anyone else's behalf, so the money-transmission surface never opens. The
+;; cost is credit risk in place of regulatory risk — an ordinary B2B receivable.
+;;
+;; The non-custodial enforcement lever is service, not funds: a delinquent
+;; seller is suspended from the registry (losing discovery/routing), never
+;; deprived of money the facilitator does not hold. See `suspension-set`.
+
+(defn- record-fee-micros
+  "Fee owed for one settlement record, or nil when it was never computable.
+  Reads the fee RECORDED ON THE RECORD -- never re-applies a current rate."
+  [rec]
+  (get-in rec [:fee :amount-micros]))
+
+(defn invoice
+  "Aggregate settled records for ONE seller into a receivable (USDC micros).
+
+  Bills what the records SAY, never what the current rate is. Each record
+  carries the `:bps` in force when it settled, so changing
+  `default-protocol-fee-bps` later cannot retroactively re-price a past
+  period -- an invoice is a statement about history.
+
+  Records whose fee was never computable (`protocol-fee` returns
+  :amount-micros nil for an unparseable price, deliberately not 0) are
+  reported under :unbillable and EXCLUDED from the total. Billing them as
+  zero would silently under-invoice; dropping them silently would lose them.
+
+  Records belonging to another seller are not billed and are reported under
+  :foreign -- returned as data rather than thrown, matching the
+  `rule-errors`/`ledger-violations` discipline in this codebase.
+
+  → {:seller :period :lines :gross-micros :amount-micros :currency
+     :issued-at :due-at :basis :custody :unbillable :foreign}"
+  [{:keys [seller records issued-at due-epoch]}]
+  (let [foreign (into [] (remove #(= seller (:seller %))) records)
+        mine (into [] (filter #(= seller (:seller %))) records)
+        billable (into [] (filter record-fee-micros) mine)
+        unbillable (into [] (remove record-fee-micros) mine)]
+    {:seller seller
+     :lines (mapv (fn [r]
+                    {:at (:at r)
+                     :resource (:resource r)
+                     :gross-micros (:amount-micros r)
+                     :bps (get-in r [:fee :bps])
+                     :fee-micros (record-fee-micros r)})
+                  billable)
+     :gross-micros (reduce + 0 (keep :amount-micros billable))
+     :amount-micros (reduce + 0 (map record-fee-micros billable))
+     :currency "USDC"
+     :issued-at issued-at
+     :due-at due-epoch
+     ;; in-band so a reader cannot mistake this for an on-chain settlement
+     :basis :invoice
+     :custody :none
+     :unbillable (mapv #(select-keys % [:at :resource :amount-micros]) unbillable)
+     :foreign (mapv :seller foreign)}))
+
+(defn outstanding-micros
+  "What is still owed on `inv` after `paid-micros`. Never negative: an
+  overpayment is reported as 0 owed plus :overpaid-micros, because a negative
+  receivable would fold into a total as a credit against OTHER invoices and
+  quietly cancel real debt."
+  [inv paid-micros]
+  (let [owed (:amount-micros inv)
+        paid (or paid-micros 0)]
+    {:owed-micros (max 0 (- owed paid))
+     :overpaid-micros (max 0 (- paid owed))}))
+
+(defn delinquent?
+  "Is `inv` past due and still (partly) unpaid at `now-epoch`?
+  Requires an explicit :due-at -- an invoice with no due date is NOT
+  delinquent, because 'never billed a due date' must not read as 'overdue'."
+  [inv paid-micros now-epoch]
+  (boolean
+   (and (:due-at inv)
+        (> now-epoch (:due-at inv))
+        (pos? (:owed-micros (outstanding-micros inv paid-micros))))))
+
+(defn suspension-set
+  "Sellers to suspend from the registry — the NON-CUSTODIAL enforcement lever.
+
+  Suspension withholds SERVICE (discovery and routing through this
+  facilitator), never funds: this facilitator holds no keys and could not
+  seize anything if it wanted to. That is the point — the leverage is
+  reachability to buyers, not custody of their money.
+
+  `paid-by-seller` maps seller -> micros received. A seller absent from it is
+  treated as having paid nothing.
+
+  Returns a set; the registry operation itself (removing rules) belongs to the
+  host, exactly as `settle`'s :serve is a record of what SHOULD happen rather
+  than something this layer performs."
+  [invoices paid-by-seller now-epoch]
+  (into #{}
+        (comp (filter #(delinquent? % (get paid-by-seller (:seller %) 0) now-epoch))
+              (map :seller))
+        invoices))
+
+;; ── replay protection: one settlement, bounded service ──────────────
+;;
+;; An x402 `transaction`-scheme payment is proof that a transfer happened. It
+;; is NOT proof that the transfer has not already been redeemed: the payload
+;; carries a txHash, the chain says that tx is real forever, and nothing in
+;; verification is stateful. So without a spent-record, one payment buys
+;; unlimited requests. Measured on murakumo.cloud 2026-07-31: the same txHash
+;; was presented twice and served twice.
+;;
+;; The obvious fix -- mark the txHash "spent" on first use -- is wrong here,
+;; because it CONFISCATES overpayment. A buyer who sent $0.10 against a $0.01
+;; price is owed ten requests, not one; burning the tx on first use would keep
+;; $0.09 of their money for nothing. x402 has no change output, so the seller
+;; is the only party who can honour the remainder.
+;;
+;; So the spent-record is an AMOUNT, not a flag: each served request consumes
+;; `price` micros of the settled total, and the payment is exhausted when the
+;; next request would exceed it. A flag is the degenerate case where price ==
+;; paid, and this generalises it without a separate code path.
+
+(defn spend-verdict
+  "May this already-verified settlement pay for ONE more request?
+
+     paid-micros     what the transaction actually transferred (from the
+                     verified on-chain record -- NOT from the payload, which
+                     the payer controls)
+     consumed-micros what has already been served against it (0 / nil = never
+                     seen, i.e. first use)
+     price-micros    the price of THIS request
+
+   → {:allow? bool :reason kw :consumed-micros n :remaining-micros n}
+
+   `:consumed-micros` is what the caller should PERSIST. On denial it is
+   returned unchanged: a refused request must never consume budget, or a buyer
+   could be drained by requests they were never served.
+
+   Integer micros throughout -- the unit the chain settles in. Non-integer or
+   negative inputs deny rather than coerce, because a silently coerced amount
+   is how a rounding bug becomes free inference."
+  [{:keys [paid-micros consumed-micros price-micros]}]
+  (let [paid paid-micros
+        consumed (or consumed-micros 0)
+        price price-micros
+        ints? (every? #(and (number? %) (not (neg? %)) (== % (Math/floor %)))
+                      [paid consumed price])]
+    (cond
+      (not ints?)
+      {:allow? false :reason :malformed-amounts
+       :consumed-micros (if (and (number? consumed) (not (neg? consumed))) consumed 0)
+       :remaining-micros 0}
+
+      ;; a zero-priced request would consume nothing and could be replayed
+      ;; forever; that is a pricing bug, not a payment the buyer authorised
+      (zero? price)
+      {:allow? false :reason :zero-price
+       :consumed-micros consumed :remaining-micros (max 0 (- paid consumed))}
+
+      (> (+ consumed price) paid)
+      {:allow? false :reason :payment-exhausted
+       :consumed-micros consumed :remaining-micros (max 0 (- paid consumed))}
+
+      :else
+      {:allow? true :reason :within-settled-amount
+       :consumed-micros (+ consumed price)
+       :remaining-micros (- paid (+ consumed price))})))
+
+(defn spend-key
+  "Storage key for a settlement's consumed-amount record. Namespaced by chain
+  and network so the same hash on two chains is two records -- tx hashes are
+  not globally unique across chains."
+  [{:keys [network tx-hash]}]
+  (str "x402:spent:" (or network "unknown") ":" (some-> tx-hash str/lower-case)))

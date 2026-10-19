@@ -1,0 +1,149 @@
+(ns kotoba.net.gossip
+  "Gossip/GossipSub-equivalent semantics as pure, transport-independent
+   functions: peer/topic bookkeeping, content-hash based dedup via a
+   bounded seen-cache, and deterministic fanout selection.
+
+   Scope: this namespace implements *only* the routing/dedup semantics.
+   It does not open sockets, dial peers, or perform any cryptographic
+   handshake — see docs/ADR-kotoba-net-p2p-semantics.md."
+  ;; Real ClojureScript needs these goog modules REQUIRED, not just
+  ;; name-referenced -- under shadow-cljs the bare `goog.crypt.Sha256.` call
+  ;; threw "Cannot read properties of undefined (reading 'Sha256')".
+  
+  )
+
+;; ---------------------------------------------------------------------------
+;; content-hash
+;; ---------------------------------------------------------------------------
+
+(defn- bytes->hex [bs]
+  ;; `format` is :clj-only -- under real ClojureScript the old
+  ;; (format "%02x" ...) version threw only when the lazy seq was realized,
+  ;; deep inside apply/str. Manual zero-padded hex is portable.
+  (apply str (map (fn [b]
+                    (let [v (bit-and b 0xff)
+                          h ]
+                      (if (= 1 (count h)) (str "0" h) h)))
+                  bs)))
+
+(defn content-hash
+  "SHA-256 hex digest of `payload` (string or byte sequence). Used as the
+   dedup key for gossip messages — content-addressed, so the same payload
+   always produces the same seen-cache key regardless of which peer relayed it."
+  [payload]
+  (let [s (if (string? payload) payload (pr-str payload))]
+    ))
+
+;; ---------------------------------------------------------------------------
+;; Peer state
+;; ---------------------------------------------------------------------------
+
+(defn empty-peer-state
+  "Pure data structure: {:peers {peer-id #{topic ...}}}"
+  []
+  {:peers {}})
+
+(defn add-peer
+  ([state peer-id] (add-peer state peer-id #{}))
+  ([state peer-id topics]
+   (update-in state [:peers peer-id] (fnil into #{}) topics)))
+
+(defn remove-peer [state peer-id]
+  (update state :peers dissoc peer-id))
+
+(defn subscribe [state peer-id topic]
+  (update-in state [:peers peer-id] (fnil conj #{}) topic))
+
+(defn unsubscribe [state peer-id topic]
+  (update-in state [:peers peer-id] (fnil disj #{}) topic))
+
+(defn peers-for-topic
+  "All peer-ids subscribed to `topic`, sorted for determinism."
+  [state topic]
+  (->> (:peers state)
+       (filter (fn [[_ topics]] (contains? topics topic)))
+       (map key)
+       sort
+       vec))
+
+;; ---------------------------------------------------------------------------
+;; seen-cache: bounded FIFO set of content-hashes
+;; ---------------------------------------------------------------------------
+
+(defn empty-seen-cache
+  "`cap` bounds the number of remembered hashes; oldest is evicted FIFO."
+  [cap]
+  {:cap cap :order [] :set #{}})
+
+(defn seen?
+  [cache msg-hash]
+  (contains? (:set cache) msg-hash))
+
+(defn mark-seen
+  "Records `msg-hash` as seen. If already present, cache is unchanged
+   (no reordering — first-seen order is preserved for FIFO eviction)."
+  [cache msg-hash]
+  (if (seen? cache msg-hash)
+    cache
+    (let [order' (conj (:order cache) msg-hash)
+          cap (:cap cache)
+          overflow (- (count order') cap)]
+      (if (pos? overflow)
+        (let [evicted (subvec order' 0 overflow)
+              order'' (subvec order' overflow)]
+          {:cap cap
+           :order order''
+           :set (apply disj (conj (:set cache) msg-hash) evicted)})
+        {:cap cap :order order' :set (conj (:set cache) msg-hash)}))))
+
+;; ---------------------------------------------------------------------------
+;; fanout selection
+;; ---------------------------------------------------------------------------
+
+(defn gossip-fanout
+  "Deterministic fanout: candidate peers subscribed to `topic`, excluding
+   `exclude` (self + the peer we received the message from), sorted for
+   stable ordering, and capped at degree `d` (mesh degree D from GossipSub).
+
+   Deterministic instead of random so tests can assert exact peer sets;
+   a production adapter can layer randomized/weighted selection on top by
+   pre-shuffling the peer list with a keyed seed before calling this fn."
+  [state topic exclude d]
+  (let [excluded (set exclude)]
+    (->> (peers-for-topic state topic)
+         (remove excluded)
+         (take d)
+         vec)))
+
+;; ---------------------------------------------------------------------------
+;; route-message
+;; ---------------------------------------------------------------------------
+
+(defn route-message
+  "Given peer `state`, `seen-cache`, and an incoming message
+   `{:topic t :payload p :from peer-id :self peer-id}`, returns
+   {:seen-cache cache' :forward [{:to peer-id :payload p} ...]}.
+
+   If the message's content-hash is already in the seen-cache, it is
+   dropped (forward is empty, cache is unchanged). Otherwise the hash is
+   marked seen and the message is forwarded to gossip-fanout peers
+   (excluding self and the sender).
+
+   The exclude set is built with `(hash-set from self)` rather than the
+   literal `#{from self}` syntax: `#{...}` compiles to a CHECKED set
+   constructor that throws `Duplicate key` whenever two evaluated elements
+   turn out equal at runtime -- which happens on every self-originated
+   message, where `:from` and `:self` are naturally the same peer-id
+   (there is no previous hop to exclude). `hash-set` (like `set`/`conj`)
+   silently dedupes instead, which is the correct behavior here: the
+   exclude set's logical membership is unchanged either way, only the
+   crash is avoided."
+  [state seen-cache {:keys [topic payload from self d]
+                      :or {d 6}}]
+  (let [h (content-hash payload)]
+    (if (seen? seen-cache h)
+      {:seen-cache seen-cache :forward []}
+      (let [cache' (mark-seen seen-cache h)
+            targets (gossip-fanout state topic (hash-set from self) d)]
+        {:seen-cache cache'
+         :forward (mapv (fn [to] {:to to :payload payload}) targets)}))))

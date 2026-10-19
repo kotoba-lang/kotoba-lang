@@ -1,0 +1,143 @@
+(ns kotoba.codebase.actor
+  "Actor code, run from its hash.
+
+  This namespace is the binding between a content-addressed codebase and a
+  state machine that stores an actor's `code` as a CID: superproject
+  ADR-2608059000 makes the actor tree the base of committed state, with
+  `address -> {code, state, nonce, balance}` and `code` \"the CID of a checked
+  definition\". `evaluator/invoke` already runs a definition from its hash
+  alone, hydrating every dependency by CID and consulting no file, namespace or
+  name — which is exactly what an actor code loader is, so the loader is a
+  binding rather than an implementation.
+
+  ## The contract is a function shape, not a dependency
+
+  `inga.state`'s `:invoke-fn` seam takes
+  `{:keys [address caller code state method args fuel]}` and answers
+  `{:state cid-or-nil}` or `{:refused reason}`. `invoke-fn` here returns
+  exactly that. **Neither repository depends on the other**: inga injects
+  crypto, quorum and hashing the same way, for the same reason — a consensus
+  layer that imports one application becomes that application's consensus
+  layer, and a codebase that imports a consensus layer stops being usable
+  without one.
+
+  ## What the actor sees
+
+  The definition is applied to `[state message]`, where `state` is the value
+  its own state CID decodes to (nil for an actor that has never written one)
+  and `message` is `{:method :args :caller :address}`. Its return value is the
+  next state: encoded with `kotoba.value.v1`, addressed, written through
+  `put!`, and it is that CID the machine stores.
+
+  Nothing else about the actor is reachable from inside. `evaluator` rejects
+  the capability intrinsics rather than dispatching them, so a stored
+  definition cannot acquire authority by being reachable, and this namespace
+  adds no ambient argument that would hand it any.
+
+  ## Refusal, not failure
+
+  A replica that throws while applying a committed block has left the protocol
+  while its peers produce a state and a root, so the seam must be TOTAL —
+  running untrusted code is exactly where a throw is easiest to provoke. Every
+  problem the evaluator or the value codec NAMES becomes a `{:refused reason}`
+  from the closed set inga records.
+
+  What is deliberately not caught is everything else. A block whose bytes do
+  not hash to the CID they were fetched under (`:ipld/cid-mismatch`) is a
+  storage fault, not an actor's misbehaviour, and laundering it into a refusal
+  would report a corrupt store as a badly-written actor.
+
+  ## Determinism, and where it comes from
+
+  Two replicas must compute the same next state from the same block. That
+  holds here because the definition graph is content-addressed (the same CID
+  is the same code), evaluation consults nothing outside it, and
+  `kotoba.value.v1` is canonical — the same value encodes to the same bytes,
+  hence the same CID. It does NOT hold if a deployment points two replicas at
+  stores holding different bytes under one CID, which is why the read is
+  verified rather than trusted."
+  (:require [ipld.core :as ipld]
+            [ipld.value :as value]
+            [kotoba.codebase.evaluator :as evaluator]))
+
+(def refusal-by-problem
+  "Evaluator and codec problems, mapped onto the reasons `inga.state` admits.
+
+  The target set is closed on purpose (see `inga.state/refusal-reasons`): a
+  refusal is folded into state that is hashed into a root, so a reason chosen
+  by the code being run would be attacker-chosen data in that state. Anything
+  absent from this table is reported as `:call-failed`, which loses detail and
+  not safety."
+  {:codebase/fuel-exhausted      :fuel-exhausted
+   :codebase/max-call-depth      :call-failed
+   :codebase/not-callable        :not-callable
+   :codebase/effect-not-permitted :not-callable
+   :codebase/block-not-found     :no-code
+   :codebase/not-evaluable-block :no-code
+   :codebase/not-initialized     :no-code})
+
+(defn- refusal-for
+  "The reason an evaluation problem refuses with.
+
+  A `:value/*` problem is the actor's RESULT failing to encode, which is a
+  different thing from its code failing to run: it produced something the
+  canonical codec will not store, so there is no next state to write."
+  [problem]
+  (or (get refusal-by-problem problem)
+      (when (= "value" (namespace problem)) :invalid-result)
+      :call-failed))
+
+(defn- put-value!
+  "Encode a value canonically, address it, store it, return the CID."
+  [put! v]
+  (let [bytes (value/encode-value v)
+        cid (ipld/cid bytes)]
+    (put! cid bytes)
+    cid))
+
+(defn- get-value
+  "Decode the value at `cid`, re-hashing the bytes first.
+
+  `get-verified-block` rather than a bare `get-fn`: the state root a replica
+  agrees to is only as good as the blocks it was rebuilt from, and a store
+  that answers a CID with other bytes must fail closed rather than feed an
+  actor someone else's state."
+  [get-fn cid]
+  (some-> (ipld/get-verified-block get-fn cid) value/decode-value))
+
+(defn invoke-fn
+  "An `inga.state`-shaped `:invoke-fn` over a codebase and a block store.
+
+  - `:codebase` — the store root `evaluator/invoke` reads definitions from.
+  - `:get-fn` / `:put!` — the block store the actor's OWN state lives in,
+    `(fn [cid] bytes)` and `(fn [cid bytes])`, the storage-port convention
+    prolly-tree and ipld already use. It is the same store the actor tree is
+    built in; definitions live in the codebase because that is where a
+    definition's type block and dependency closure are.
+  - `:max-call-depth` — optional, passed through.
+
+  `:fuel` arrives per call from the machine and is the block's price for that
+  op. **The deployment's `cost-fn` for `:actor-call` is therefore denominated
+  in EVALUATION STEPS**, because that is what the budget buys here; a schedule
+  priced in some other unit will refuse every call that does real work, and
+  will do it deterministically enough to look like a rule."
+  [{:keys [codebase get-fn put! max-call-depth]}]
+  (when-not (and (some? codebase) (ifn? get-fn) (ifn? put!))
+    (throw (ex-info "kotoba.codebase.actor/invoke-fn needs :codebase, :get-fn and :put!"
+                    {:problem :codebase/invalid-actor-seam})))
+  (fn [{:keys [address caller code state method args fuel]}]
+    (try
+      (let [prev (when state (get-value get-fn state))
+            message {:method method :args (vec args) :caller caller :address address}
+            opts (cond-> {}
+                   fuel (assoc :fuel fuel)
+                   max-call-depth (assoc :max-call-depth max-call-depth))
+            {:keys [value]} (evaluator/invoke codebase code [prev message] opts)]
+        {:state (put-value! put! value)})
+      (catch  e
+        (if-let [problem (:problem (ex-data e))]
+          {:refused (refusal-for problem)}
+          ;; Not ours to interpret. A storage fault, a bug in this namespace,
+          ;; or anything else that does not name a problem is re-thrown rather
+          ;; than reported as an actor that misbehaved.
+          (throw e))))))

@@ -1,0 +1,182 @@
+(ns kami.ipc
+  "L1 — render-IR → KAMI IPC columnar buffer (zero-copy transport to the GPU).
+
+  Reuses the engine's existing columnar format (`../kami-core/src/ipc.rs`:
+  Column / Dtype / KamiFrame). Dtype already has Mat4 and Quat, so an instance
+  `model` array is ONE Dtype/Mat4 column that DMAs straight into a wgpu instance
+  buffer — 'all transitions zero-copy or single memcpy' per the format's contract
+  (ARCHITECTURE.md §9).
+
+  Buffer layout produced by `pack` (little-endian, matches the Rust reader):
+
+    [KamiFrame header]                16 bytes  : magic 'KAMI' u32 | version u16 |
+                                                  ncols u16 | frame_n u32 | pad u32
+    [Column header] × ncols           16 bytes  : dtype u8 | stride u8 | pad u16 |
+                                                  len u32 | offset u32 | pad u32
+    [payload, 16-byte aligned] × ncols          : raw element bytes
+
+  All offsets are relative to the start of the buffer and 16-byte aligned so a
+  host can wrap each column as a GPU-aligned slice with no realignment copy.")
+
+;; ---------------------------------------------------------------------------
+;; Dtype table — mirrors kami-core/src/ipc.rs::Dtype
+;; ---------------------------------------------------------------------------
+
+(def dtype
+  "KAMI Dtype tag → {:enum byte :elsize bytes}. Mat4 = 16×f32 = 64B;
+  Quat = smallest-3 4×f16 = 8B."
+  {:f32  {:enum 0 :elsize 4}
+   :f16  {:enum 1 :elsize 2}
+   :u32  {:enum 2 :elsize 4}
+   :u16  {:enum 3 :elsize 2}
+   :u8   {:enum 4 :elsize 1}
+   :i16  {:enum 5 :elsize 2}
+   :mat4 {:enum 6 :elsize 64}
+   :quat {:enum 7 :elsize 8}})
+
+(def ^:const magic
+  "ASCII 'KAMI' as a little-endian u32 (K=0x4B A=0x41 M=0x4D I=0x49)."
+  0x494D414B)
+
+(def ^:const version 1)
+(def ^:const header-bytes 16)
+(def ^:const column-header-bytes 16)
+
+(defn- align16 ^long [^long n]
+  (bit-and (+ n 15) (bit-not 15)))
+
+(defn byte-len
+  "Payload bytes for a column of `n` items of `dt` with `stride` elements/item
+  (NOT including the 16-byte column header). Use `align16` when laying out."
+  [dt n stride]
+  (let [{:keys [elsize]} (dtype dt)]
+    (when-not elsize (throw (ex-info "unknown dtype" {:dtype dt})))
+    (* (long elsize) (long n) (long stride))))
+
+(defn column
+  "Build one column descriptor.
+  `data` is a seq/vector of raw element numbers already flattened
+  (e.g. 320 mat4 → 320×16 = 5120 f32s). `stride` is elements-per-item."
+  [dt stride data]
+  (when-not (dtype dt) (throw (ex-info "unknown dtype" {:dtype dt})))
+  (let [v (vec data)
+        per (case dt :mat4 16 :quat 4 1)            ; sub-elements per item slot
+        items (long (/ (count v) (* per stride)))]
+    {:dtype dt :stride stride :len items :data v
+     ;; element count actually written (flattened)
+     :flat-count (count v)}))
+
+;; ---------------------------------------------------------------------------
+;; Byte writers (platform-neutral; produce a vector of unsigned bytes 0-255)
+;; ---------------------------------------------------------------------------
+
+(defn- u8s-of-u32 [^long x]
+  [(bit-and x 0xff) (bit-and (bit-shift-right x 8) 0xff)
+   (bit-and (bit-shift-right x 16) 0xff) (bit-and (bit-shift-right x 24) 0xff)])
+
+(defn- u8s-of-u16 [^long x]
+  [(bit-and x 0xff) (bit-and (bit-shift-right x 8) 0xff)])
+
+(defn- f32-bits ^long [x]
+  )
+
+(defn- u8s-of-element [dt x]
+  (case dt
+    (:f32 :mat4) (u8s-of-u32 (f32-bits x))   ; mat4 payload is a stream of f32
+    :u32         (u8s-of-u32 (long x))
+    (:u16 :i16)  (u8s-of-u16 (long x))
+    :u8          [(bit-and (long x) 0xff)]
+    ;; f16 / quat smallest-3 packing TODO — see ADR; placeholder raw f16-less path
+    (throw (ex-info "u8s-of-element: unsupported dtype for byte emit" {:dtype dt}))))
+
+(defn- pad-to [bytes ^long target]
+  (into bytes (repeat (- target (count bytes)) 0)))
+
+;; ---------------------------------------------------------------------------
+;; pack — render-IR frame → KamiFrame columnar byte vector
+;; ---------------------------------------------------------------------------
+
+(defn frame->columns
+  "Flatten a render-IR frame (`kami.render/frame`) into ordered columns:
+  one Mat4 column for the camera (view++proj packed as 2 mat4), then per draw a
+  Mat4 instance-model column (and any extra attribute columns)."
+  [frame]
+  (let [{:keys [view proj]} (:frame/camera frame)
+        cam-col (column :mat4 1 (into (vec view) proj)) ; stride-1, len 2 (view, proj)
+        draw-cols
+        (for [pass (:frame/passes frame)
+              draw (:pass/draws pass)
+              :let [inst (:draw/instances draw)]
+              :when inst]
+          (column :mat4 1 (:model inst)))]
+    (into [cam-col] draw-cols)))
+
+(defn frame->meta
+  "The small, JSON-able draw-table sidecar that travels alongside the columnar
+  buffer (ARCHITECTURE.md §9). The heavy per-instance matrices stay in the
+  zero-copy buffer; this carries only the retained-by-id references the host needs
+  to resolve handles + pick a pipeline, in the SAME order as the draw columns
+  (column 0 is always the camera; columns 1..n map to :draws 0..n-1)."
+  [frame]
+  {:n     (:frame/n frame 0)
+   :clear (:frame/clear frame)
+   :draws (vec (for [pass (:frame/passes frame)
+                     draw (:pass/draws pass)
+                     :when (:draw/instances draw)]
+                 (cond-> {:pipeline (:draw/pipeline draw)
+                          :mesh     (:draw/mesh draw)
+                          :material (:draw/material draw)
+                          :count    (:count (:draw/instances draw))}
+                   (:draw/texture draw) (assoc :texture (:draw/texture draw)))))})
+
+(defn pack
+  "Serialize a render-IR frame into a KamiFrame columnar buffer + draw-table meta.
+  Returns {:buffer <vector of u8> :len n :ncols c :columns [descriptor…]
+           :layout [{:dtype .. :len .. :offset ..} …] :meta {…}}.
+  Pure and platform-neutral; the browser backend memcpys :buffer into WASM memory
+  and passes :meta (as JSON) to submit-frame."
+  [frame]
+  (let [cols      (frame->columns frame)
+        ncols     (count cols)
+        ;; header + column headers, then 16-aligned payloads
+        hdr-end   (+ header-bytes (* ncols column-header-bytes))
+        ;; compute payload offsets
+        [layout payload-end]
+        (reduce (fn [[acc off] c]
+                  (let [pbytes (byte-len (:dtype c) (:len c) (:stride c))
+                        start  (align16 off)]
+                    [(conj acc {:dtype (:dtype c) :len (:len c)
+                                :stride (:stride c) :offset start})
+                     (+ start pbytes)]))
+                [[] hdr-end]
+                cols)
+        total (align16 payload-end)
+        ;; --- emit bytes ---
+        frame-hdr (-> []
+                      (into (u8s-of-u32 magic))
+                      (into (u8s-of-u16 version))
+                      (into (u8s-of-u16 ncols))
+                      (into (u8s-of-u32 (long (:frame/n frame 0))))
+                      (into (u8s-of-u32 0)))            ; pad → 16 bytes
+        col-hdrs  (reduce
+                   (fn [acc {:keys [dtype len stride offset]}]
+                     (-> acc
+                         (conj (:enum (kami.ipc/dtype dtype)))
+                         (conj (bit-and (long stride) 0xff))
+                         (into (u8s-of-u16 0))           ; pad
+                         (into (u8s-of-u32 (long len)))
+                         (into (u8s-of-u32 (long offset)))
+                         (into (u8s-of-u32 0))))         ; pad → 16 bytes
+                   []
+                   (map #(assoc %2 :dtype (:dtype %1)) cols layout))
+        buf0 (pad-to (into frame-hdr col-hdrs) hdr-end)
+        ;; write each column payload at its aligned offset
+        buf  (reduce
+              (fn [b [c {:keys [offset]}]]
+                (let [b1   (pad-to b offset)
+                      data (mapcat #(u8s-of-element (:dtype c) %) (:data c))]
+                  (into b1 data)))
+              buf0
+              (map vector cols layout))]
+    {:buffer (pad-to buf total) :len total :ncols ncols
+     :columns cols :layout layout :meta (frame->meta frame)}))

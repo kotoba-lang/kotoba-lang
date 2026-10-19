@@ -1,0 +1,203 @@
+(ns vrm.part
+  "VRM part decomposition: VrmDocument -> `[VrmPart ...]`. Restored from
+  `kami-vrm/src/part.rs` (kotoba-lang/kami-engine, deleted PR #82) as part of
+  the clj-wgsl migration (ADR-2607010930, com-junkawasaki/root)."
+  (:require [clojure.string]
+            [vrm.convert :as conv]))
+
+(defn- round-to-long [v]
+  )
+
+(defn- mesh-node-referenced-joints
+  "Node-ids genuinely referenced by `node`'s own JOINTS_0 vertex data -- NOT a
+  skin's whole declared `:joints` palette (see `decompose`'s `skin-joint-seeds`
+  for why that distinction matters)."
+  [doc gltf meshes node]
+  (if-let [skin-joints (:joints (get (:skins gltf) (:skin node)))]
+    (distinct
+     (mapcat (fn [prim]
+               (when-let [joints-acc-idx (get-in prim [:attributes :JOINTS_0])]
+                 (let [raw (conv/read-accessor-f32 doc joints-acc-idx)]
+                   (keep #(nth skin-joints (round-to-long %) nil) raw))))
+             (:primitives (get meshes (:mesh node)))))
+    []))
+
+;; Category tag for avatar parts.
+(def part-categories #{:body :hair :face :outfit :accessory :other})
+
+;; Category -> keyword set, checked in this priority order (hair before
+;; face: a "hair_tail" mesh with no face-ish material must not fall through
+;; to a later, broader bucket; face before body/outfit: a "head" mesh's own
+;; materials are legitimately named things like "eye"/"brow").
+(def ^:private category-keywords
+  [[:hair ["hair" "bangs"]]
+   [:face ["face" "head" "eye" "mouth" "brow"]]
+   [:body ["body" "skin"]]
+   [:outfit ["cloth" "outfit" "wear" "shirt" "pants" "dress" "shoe" "tops" "bottoms"]]
+   [:accessory ["accessory" "hat" "glass" "ribbon" "earring" "necklace"]]])
+
+(defn- match-category [s category-keywords]
+  (some (fn [[category kws]] (when (some #(clojure.string/includes? s %) kws) category))
+        category-keywords))
+
+(defn classify-mesh
+  "Classify a mesh node into a category keyword by name heuristics (VRoid
+  Studio naming: \"Body\", \"Hair\", \"Face\", \"FaceEyeline\", ...; generic:
+  material name keywords).
+
+  Real bug fix (/loop maturity pass, ADR-2607031200): checks `mesh-name`
+  ALONE first, before falling back to the combined mesh+node+material blob.
+  Confirmed against a real production VRM (not committed; a hand-built
+  synthetic fixture reproduces the same shape) that the old combined-blob-
+  first approach mis-classified a mesh literally named \"wear\" (clothing) as
+  `:face`, because ONE of its many attached materials happened to be named
+  \"robo_face\" (a visor/faceplate texture -- coincidental substring, not a
+  facial feature) -- a false positive from a keyword match on unrelated
+  material soup outranking the mesh's own, much stronger, direct name. A
+  mesh's own name is VRoid Studio's most reliable signal (it consistently
+  names meshes \"Hair\"/\"Body\"/\"Face\"/\"Wear\" directly); material/node
+  names are only consulted as a fallback when the mesh name alone gives no
+  match (e.g. a generic mesh name with descriptive material names)."
+  [mesh-name material-names node-name]
+  (let [lower (fn [s] (clojure.string/lower-case (or s "")))
+        mesh-name-lower (lower mesh-name)]
+    (or (match-category mesh-name-lower category-keywords)
+        (let [combined (clojure.string/lower-case
+                        (str mesh-name " " node-name " " (clojure.string/join " " material-names)))]
+          (match-category combined category-keywords))
+        :other)))
+
+(defn- collect-material-textures
+  "Collect texture indices referenced by a glTF material map into `textures`
+  (a vector), appending new ones, returning the updated vector."
+  [mat textures]
+  (let [pbr (:pbrMetallicRoughness mat)
+        add (fn [textures idx] (if (some #{idx} textures) textures (conj textures idx)))]
+    (cond-> textures
+      (get-in pbr [:baseColorTexture :index]) (add (get-in pbr [:baseColorTexture :index]))
+      (get-in pbr [:metallicRoughnessTexture :index]) (add (get-in pbr [:metallicRoughnessTexture :index])))))
+
+(defn decompose
+  "Decompose a VrmDocument into swappable parts.
+
+  Strategy: 1) walk the node tree, identify mesh-bearing nodes; 2) classify
+  each by name heuristics; 3) for each part, collect transitive closure of
+  materials/textures/images; 4) identify spring bone chains referencing
+  nodes in this part's subtree; 5) identify expressions that bind to this
+  part's meshes."
+  [doc]
+  (let [gltf (:gltf doc)
+        nodes (:nodes gltf)
+        meshes (:meshes gltf)
+        materials (:materials gltf)
+        textures-doc (:textures gltf)
+        ;; Group mesh nodes by category, preserving first-encounter order
+        ;; (mirrors the original Rust's `Vec` + `iter_mut().find()` scan).
+        {:keys [order groups]}
+        (reduce
+         (fn [{:keys [order groups] :as acc} [node-idx node]]
+           (if-let [mesh-idx (:mesh node)]
+             (let [mesh (get meshes mesh-idx)]
+               (when-not mesh (throw (ex-info "part error: node references missing mesh"
+                                               {:node node-idx :mesh mesh-idx})))
+               (let [mesh-name (or (:name mesh) "")
+                     node-name (or (:name node) "")
+                     mat-names (keep (fn [prim] (some-> (:material prim) materials :name))
+                                      (:primitives mesh))
+                     category (classify-mesh mesh-name mat-names node-name)]
+                 (if (contains? groups category)
+                   (update-in acc [:groups category]
+                              (fn [g] (-> g
+                                          (update :mesh-indices conj mesh-idx)
+                                          (update :node-indices conj node-idx))))
+                   (-> acc
+                       (update :order conj category)
+                       (assoc-in [:groups category]
+                                 {:name (if (seq mesh-name) mesh-name (name category))
+                                  :mesh-indices [mesh-idx]
+                                  :node-indices [node-idx]})))))
+             acc))
+         {:order [] :groups {}}
+         (map-indexed vector nodes))]
+    (vec
+     (for [category order
+           :let [{:keys [name mesh-indices node-indices]} (get groups category)]]
+       (let [material-indices
+             (vec (distinct
+                   (mapcat (fn [mi]
+                             (keep :material (:primitives (get meshes mi))))
+                           mesh-indices)))
+             texture-indices
+             (reduce (fn [ts mat-idx] (collect-material-textures (get materials mat-idx) ts))
+                     [] material-indices)
+             image-indices
+             (vec (distinct
+                   (keep (fn [tex-idx] (:source (get textures-doc tex-idx))) texture-indices)))
+             ;; Real content found composing net-babiniku's real avatar pair (VRM
+             ;; Consortium's VRM1_Constraint_Twist_Sample): a mesh's own SKIN can
+             ;; reference joints that are NOT descendants of the mesh's own node at
+             ;; all -- a common, legitimate VRM authoring pattern for secondary/
+             ;; spring-bone physics (a hair-sway bone chain is typically rigged as a
+             ;; child of whichever HUMANOID bone it hangs off of -- e.g. under Head,
+             ;; for correct base-pose inheritance -- not under the hair mesh's own
+             ;; node). Without seeding those joints too, such a bone has no place in
+             ;; a composed skeleton at all (org-vrmc-vrm/vrm.compose correctly THROWS
+             ;; rather than silently mis-binding a real, weighted skinning influence
+             ;; to the wrong joint). The fix belongs HERE, in decompose -- this is
+             ;; what defines "what nodes does this part touch" -- not in compose,
+             ;; which only ever consumes whatever decompose already decided.
+             ;;
+             ;; Seed only joints the mesh's OWN JOINTS_0 vertex data actually
+             ;; references -- NOT a skin's whole declared `:joints` palette. A skin
+             ;; is a shared glTF object; several meshes (or a mesh with sparse
+             ;; per-vertex usage) can point at the same skin while each only ever
+             ;; addresses a subset of its joint array. Seeding the entire palette
+             ;; unconditionally pulled in joints this mesh never actually binds to
+             ;; (e.g. a shared skin's Root entry with zero referencing vertices),
+             ;; over-growing the unified skeleton with nodes that have no real
+             ;; skinning purpose for this part. Reading the actual JOINTS_0 values
+             ;; (same decode `vrm.compose/remap-joints-accessor!` uses) targets
+             ;; exactly the nodes this mesh's vertices are bound to.
+             mesh-idx-set (set mesh-indices)
+             skin-joint-seeds
+             (vec (distinct
+                   (mapcat (fn [node]
+                             (when (contains? mesh-idx-set (:mesh node))
+                               (mesh-node-referenced-joints doc gltf meshes node)))
+                           nodes)))
+             all-nodes
+             (loop [all-nodes (vec (distinct (into node-indices skin-joint-seeds))) i 0]
+               (if (>= i (count all-nodes))
+                 all-nodes
+                 (let [ni (nth all-nodes i)
+                       node (get nodes ni)
+                       new-children (remove (set all-nodes) (:children node))]
+                   (recur (into all-nodes new-children) (inc i)))))
+             node-set (set all-nodes)
+             spring-bone-indices
+             (vec (keep-indexed
+                   (fn [i chain] (when (some #(node-set (:node %)) (:joints chain)) i))
+                   (:spring-bones doc)))
+             collider-indices
+             (vec (keep-indexed
+                   (fn [i c] (when (node-set (:node c)) i))
+                   (:spring-bone-colliders doc)))
+             mesh-set (set mesh-indices)
+             mat-idx-set (set material-indices)
+             expression-indices
+             (vec (keep-indexed
+                   (fn [i expr]
+                     (when (or (some #(mesh-set (:mesh-index %)) (:morph-target-binds expr))
+                               (some #(mat-idx-set (:material-index %)) (:material-color-binds expr)))
+                       i))
+                   (:expressions doc)))]
+         {:category category
+          :name name
+          :mesh-indices mesh-indices
+          :material-indices material-indices
+          :texture-indices texture-indices
+          :image-indices image-indices
+          :node-indices all-nodes
+          :spring-bone-indices spring-bone-indices
+          :collider-indices collider-indices
+          :expression-indices expression-indices})))))

@@ -1,0 +1,353 @@
+(ns kekkai.node.relay
+  "The relay — this overlay's DERP equivalent — as a **pure** protocol core for
+  both ends. `relay_server.cljs` / `relay_client.cljs` are thin sockets over
+  these functions: everything that decides anything is here, so the routing,
+  roaming and expiry rules are unit-testable without a network.
+
+  Why a relay exists at all: two peers behind NATs that cannot be punched (both
+  symmetric, or a firewall that drops unsolicited UDP outright) still have to
+  talk. The relay is also the **signalling channel** hole punching needs — a peer
+  cannot tell another peer 'try me at this address' over a path that does not yet
+  exist.
+
+  Three properties worth being explicit about:
+
+  1. **The relay cannot read the traffic it forwards.** A forwarded payload is
+     already sealed by the peer-to-peer Noise session; the relay only ever sees
+     the destination's public key. Compromising a relay costs you metadata —
+     who talks to whom, when, how much — and nothing else. Say that out loud
+     rather than describing the relay as 'trusted infrastructure'.
+  2. **Clients authenticate to the relay with the same Noise IK handshake** used
+     between peers, against the relay's static key from the netmap. So
+     registration is implicit and cannot be spoofed: the relay routes to the key
+     the handshake *proved*, never to a self-asserted one. The cost is that a
+     forwarded packet is sealed twice (peer session inside relay session); that
+     is the same trade DERP makes running its own protocol inside TLS.
+  3. **Roaming is allowed but must be authenticated.** A client's source address
+     changes constantly (NAT rebind, wifi→LTE). The relay updates a client's
+     address on any frame that *decrypts* under that client's session, which the
+     replay window then keeps an attacker from replaying from a forged address.
+     An unauthenticated address update would be a trivial traffic-hijack."
+  (:require [kotoba.bytes :as b]
+            [noise.core :as noise]))
+
+(def ^:const magic 0x6b)   ; 'k'
+(def ^:const version 1)
+
+(def frame-types
+  {:handshake-init 0x10
+   :handshake-resp 0x11
+   :session 0x20})
+
+(def inner-types
+  {:send 0x01          ; client -> relay: forward this to dst
+   :recv 0x02          ; relay -> client: this came from src
+   :not-here 0x03      ; relay -> client: dst is not registered here
+   :ping 0x04
+   :pong 0x05
+   :signal 0x06})      ; client -> relay -> client: call-me-maybe etc.
+
+(def ^:private inner-type->kw (into {} (map (fn [[k v]] [v k])) inner-types))
+(def ^:private frame-type->kw (into {} (map (fn [[k v]] [v k])) frame-types))
+
+(def defaults
+  {:client-idle-timeout-ms 90000
+   :max-frame-bytes 65535
+   :keepalive-ms 25000       ; under the 30s a typical NAT UDP mapping survives
+   :hello-retry-ms 2000})    ; see client-hello-due?
+
+;; ── framing ─────────────────────────────────────────────────────────────────
+
+(defn encode-frame [type payload]
+  (into [magic version (get frame-types type)] payload))
+
+(defn decode-frame
+  "-> {:type … :payload …} or {:error …}. Never throws: this parses hostile input
+   straight off a socket."
+  [bytes]
+  (let [bs (vec bytes)]
+    (cond
+      (< (count bs) 3) {:error :short-frame}
+      (not= magic (nth bs 0)) {:error :bad-magic}
+      (not= version (nth bs 1)) {:error :bad-version :got (nth bs 1)}
+      :else (if-let [t (frame-type->kw (nth bs 2))]
+              {:type t :payload (subvec bs 3)}
+              {:error :unknown-frame-type :got (nth bs 2)}))))
+
+(defn encode-inner
+  "In-session frame: [type:1][key:32 when addressed][payload…]."
+  [type {:keys [key payload]}]
+  (into (into [(get inner-types type)] (vec (or key (repeat 32 0))))
+        (vec payload)))
+
+(defn decode-inner [bytes]
+  (let [bs (vec bytes)]
+    (if (< (count bs) 33)
+      {:error :short-inner}
+      (if-let [t (inner-type->kw (nth bs 0))]
+        {:type t :key (subvec bs 1 33) :payload (subvec bs 33)}
+        {:error :unknown-inner-type :got (nth bs 0)}))))
+
+;; ── server ──────────────────────────────────────────────────────────────────
+
+(defn server
+  "`static` is the relay's own X25519 keypair (its netmap identity)."
+  [{:keys [suite static region prologue config]}]
+  {:suite suite :static static :region region :prologue (vec prologue)
+   :config (merge defaults config)
+   :pending {}      ; addr -> handshake state (responder, mid-handshake)
+   :clients {}      ; key-hex -> {:addr :session :registered-at :last-seen}
+   :addrs {}})      ; addr -> key-hex
+
+(defn- ->hex [k] (b/hex (vec k)))
+
+(defn- deliver-to
+  "Wrap `inner` in the destination client's relay session. Returns
+   [state datagram-or-nil]."
+  [state dst-hex inner now]
+  (if-let [c (get-in state [:clients dst-hex])]
+    (let [[sess frame] (noise/encrypt (:session c) inner {:now (quot now 1000)})]
+      [(assoc-in state [:clients dst-hex :session] sess)
+       {:to (:addr c) :bytes (encode-frame :session frame)}])
+    [state nil]))
+
+(defn server-on-datagram
+  "Handle one datagram. -> {:state … :send [{:to addr :bytes …}] :events […]}
+
+   Pure, including the handshake: the Noise responder state for a
+   still-handshaking address lives in `:pending`, keyed by source address, and is
+   discarded the moment the handshake completes or the frame fails to parse."
+  [{:keys [suite static prologue config] :as state} {:keys [from bytes now]}]
+  (let [{:keys [type payload error]} (decode-frame bytes)]
+    (cond
+      error {:state state :send [] :events [{:event :dropped :from from :reason error}]}
+
+      (> (count bytes) (:max-frame-bytes config))
+      {:state state :send [] :events [{:event :dropped :from from :reason :oversize}]}
+
+      (= :handshake-init type)
+      (let [r (noise/responder {:suite suite :s static :prologue prologue})]
+        (try
+          (let [[r _] (noise/read-message r payload)
+                [r msg2] (noise/write-message r [])
+                key-hex (->hex (noise/remote-static r))
+                sess (noise/session r {:now (quot now 1000) :peer-id key-hex})
+                ;; a re-registering client (restart, roam) replaces its old entry
+                old-addr (get-in state [:clients key-hex :addr])]
+            {:state (-> state
+                        (update :addrs dissoc old-addr)
+                        (assoc-in [:clients key-hex] {:addr from :session sess
+                                                      :registered-at now :last-seen now})
+                        (assoc-in [:addrs from] key-hex))
+             :send [{:to from :bytes (encode-frame :handshake-resp msg2)}]
+             :events [{:event :registered :key key-hex :addr from
+                       :replaced old-addr}]})
+          (catch  e
+            ;; An unauthenticated client cannot register. This is the check that
+            ;; makes the relay's routing table trustworthy.
+            {:state state :send []
+             :events [{:event :handshake-rejected :from from
+                       :reason (ex-message e)}]})))
+
+      (= :session type)
+      (if-let [key-hex (get-in state [:addrs from])]
+        (let [c (get-in state [:clients key-hex])]
+          (try
+            (let [[sess inner-bytes] (noise/decrypt (:session c) payload {:now (quot now 1000)})
+                  state (-> state
+                            (assoc-in [:clients key-hex :session] sess)
+                            (assoc-in [:clients key-hex :last-seen] now))
+                  {:keys [type key payload error]} (decode-inner inner-bytes)]
+              (cond
+                error {:state state :send []
+                       :events [{:event :dropped :from from :reason error}]}
+
+                (= :ping type)
+                (let [[state dg] (deliver-to state key-hex
+                                             (encode-inner :pong {:payload payload}) now)]
+                  {:state state :send (remove nil? [dg]) :events []})
+
+                (contains? #{:send :signal} type)
+                (let [dst (->hex key)
+                      inner (encode-inner (if (= :signal type) :signal :recv)
+                                          {:key (vec (b/unhex key-hex)) :payload payload})
+                      [state dg] (deliver-to state dst inner now)]
+                  (if dg
+                    {:state state :send [dg]
+                     :events [{:event :forwarded :src key-hex :dst dst
+                               :bytes (count payload)}]}
+                    (let [[state dg] (deliver-to state key-hex
+                                                 (encode-inner :not-here {:key key}) now)]
+                      {:state state :send (remove nil? [dg])
+                       :events [{:event :dst-not-here :src key-hex :dst dst}]})))
+
+                :else {:state state :send [] :events []}))
+            (catch  e
+              {:state state :send []
+               :events [{:event :dropped :from from :reason :auth-failed
+                         :detail (ex-message e)}]})))
+        ;; A session frame from an address we do not know: could be a roamed
+        ;; client, but we cannot tell which one without trying every session, so
+        ;; the client is expected to re-handshake. Cheap and unambiguous.
+        {:state state :send []
+         :events [{:event :dropped :from from :reason :unregistered-address}]})
+
+      :else {:state state :send [] :events []})))
+
+(defn server-tick
+  "Expire idle clients. -> {:state … :events […]}"
+  [{:keys [config] :as state} now]
+  (let [dead (into {} (filter (fn [[_ c]]
+                                (>= (- now (:last-seen c)) (:client-idle-timeout-ms config))))
+                   (:clients state))]
+    {:state (reduce (fn [st [k c]]
+                      (-> st (update :clients dissoc k) (update :addrs dissoc (:addr c))))
+                    state dead)
+     :events (mapv (fn [[k _]] {:event :expired :key k}) dead)}))
+
+(defn registered-keys [state] (set (keys (:clients state))))
+
+;; ── client ──────────────────────────────────────────────────────────────────
+
+(defn client
+  [{:keys [suite static relay-key relay-addr region prologue config]}]
+  {:suite suite :static static :relay-key (vec relay-key) :relay-addr relay-addr
+   :region region :prologue (vec prologue) :config (merge defaults config)
+   ;; Newest first, same reason as kekkai.node.peer's :handshakes — a retry must
+   ;; not invalidate the response to the previous attempt. Each attempt carries a
+   ;; monotonic id, and a response is adopted only if its id is at least the one
+   ;; the current session came from: responses can arrive out of order, and
+   ;; without the id the client can end up on an older session than the one the
+   ;; relay kept, after which every frame fails to authenticate. (Found by the
+   ;; E2E, which is exactly the sort of thing a unit test with one handshake in
+   ;; flight cannot see.)
+   :handshakes [] :hello-seq 0 :session-id nil :hello-at nil
+   :session nil :last-send nil})
+
+(defn client-hello
+  "Start (or retry) the relay handshake. -> [state datagram]"
+  [{:keys [suite static relay-key relay-addr prologue] :as state} now]
+  (let [i (noise/initiator {:suite suite :s static :rs relay-key :prologue prologue})
+        [i msg1] (noise/write-message i [])
+        id (inc (:hello-seq state))]
+    [(assoc state
+            :handshakes (vec (take 3 (cons {:id id :hs i} (:handshakes state))))
+            :hello-seq id
+            :hello-at now
+            :last-send now)
+     {:to relay-addr :bytes (encode-frame :handshake-init msg1)}]))
+
+(defn client-hello-due?
+  "Throttles reconnection. Without it, a caller with a fast tick loop re-registers
+   on every tick while the first response is still in flight — which on the relay
+   side looks like a client roaming to the same address over and over."
+  [{:keys [session hello-at config]} now]
+  (and (nil? session)
+       (>= (- now (or hello-at 0)) (:hello-retry-ms config))))
+
+(defn connected? [state] (some? (:session state)))
+
+(defn client-on-datagram
+  "-> {:state … :send […] :events […]}. Events the agent cares about:
+   `:connected`, `:packet` ({:src :payload}), `:signal`, `:not-here`."
+  [{:keys [handshakes] :as state} {:keys [bytes now]}]
+  (let [{:keys [type payload error]} (decode-frame bytes)]
+    (cond
+      error {:state state :send [] :events [{:event :dropped :reason error}]}
+
+      (= :handshake-resp type)
+      (if (empty? handshakes)
+        {:state state :send [] :events [{:event :dropped :reason :unexpected-handshake-resp}]}
+        (loop [hs handshakes errs []]
+          (if (empty? hs)
+            ;; every in-flight attempt rejected it: the relay does not hold the
+            ;; private key for the :relay/key the netmap published
+            {:state state :send []
+             :events [{:event :relay-authentication-failed :reason (first errs)}]}
+            (let [{:keys [id]} (first hs)
+                  r (try (first (noise/read-message (:hs (first hs)) payload))
+                         (catch  e {:error (ex-message e)}))]
+              (cond
+                (:error r) (recur (rest hs) (conj errs (:error r)))
+
+                ;; a valid response to an attempt older than the session we are
+                ;; already on: ignore it, or we would move to a session the relay
+                ;; has already replaced
+                (and (:session-id state) (< id (:session-id state)))
+                {:state state :send []
+                 :events [{:event :stale-handshake-resp :id id
+                           :current (:session-id state)}]}
+
+                :else
+                ;; `:handshakes` deliberately kept — see kekkai.node.peer
+                {:state (assoc state
+                               :session-id id
+                               :session (noise/session r {:now (quot now 1000)
+                                                          :peer-id "relay"}))
+                 :send []
+                 :events [{:event :connected :region (:region state) :attempt id}]})))))
+
+      (and (= :session type) (:session state))
+      (try
+        (let [[sess inner-bytes] (noise/decrypt (:session state) payload {:now (quot now 1000)})
+              state (assoc state :session sess)
+              {:keys [type key payload error]} (decode-inner inner-bytes)]
+          (if error
+            {:state state :send [] :events [{:event :dropped :reason error}]}
+            {:state state :send []
+             :events [(case type
+                        :recv {:event :packet :src (->hex key) :payload payload}
+                        :signal {:event :signal :src (->hex key) :payload payload}
+                        :not-here {:event :not-here :dst (->hex key)}
+                        :pong {:event :pong :payload payload}
+                        :ping {:event :ping :payload payload}
+                        {:event :ignored :type type})]}))
+        (catch  e
+          {:state state :send [] :events [{:event :dropped :reason :auth-failed
+                                           :detail (ex-message e)}]}))
+
+      :else {:state state :send [] :events [{:event :dropped :reason :not-connected}]})))
+
+(defn- client-emit [state inner now]
+  (if-not (:session state)
+    (throw (ex-info "relay client is not connected" {}))
+    (let [[sess frame] (noise/encrypt (:session state) inner {:now (quot now 1000)})]
+      [(assoc state :session sess :last-send now)
+       {:to (:relay-addr state) :bytes (encode-frame :session frame)}])))
+
+(defn client-send
+  "Forward `payload` (already sealed for the peer) to `dst-key`. -> [state datagram]"
+  [state dst-key payload now]
+  (client-emit state (encode-inner :send {:key (vec dst-key) :payload payload}) now))
+
+(defn client-signal
+  "Out-of-band control to a peer through the relay — this is how a
+   `call-me-maybe` (a candidate list for hole punching) reaches a peer we have no
+   direct path to yet."
+  [state dst-key payload now]
+  (client-emit state (encode-inner :signal {:key (vec dst-key) :payload payload}) now))
+
+(defn client-keepalive-due? [{:keys [config last-send]} now]
+  (>= (- now (or last-send 0)) (:keepalive-ms config)))
+
+(defn client-ping [state payload now]
+  (client-emit state (encode-inner :ping {:payload payload}) now))
+
+;; ── home relay selection ────────────────────────────────────────────────────
+
+(defn home
+  "Pick the home relay from measured latencies. `relays` are netmap relay records
+   (`{:relay/name :relay/region :relay/host :relay/port :relay/key}`),
+   `latencies` is `{relay-name ms}`.
+
+   Unmeasured relays are not guessed at: they sort last, and a same-region relay
+   only wins when nothing has been measured at all. That keeps the choice
+   deterministic (two nodes with the same measurements pick the same home) and
+   keeps a node from parking on a relay it never probed."
+  [relays latencies & [{:keys [prefer-region]}]]
+  (let [measured (filter #(get latencies (:relay/name %)) relays)]
+    (or (first (sort-by #(get latencies (:relay/name %)) measured))
+        (first (filter #(= prefer-region (:relay/region %)) relays))
+        (first relays))))
+
+(defn relay-addr [{:keys [relay/host relay/port]}] (str host ":" port))

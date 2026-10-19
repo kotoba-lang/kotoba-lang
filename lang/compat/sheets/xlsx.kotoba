@@ -1,0 +1,617 @@
+(ns sheets.xlsx
+  "A workbook as a .xlsx.
+
+  ## Where this lives, and why not in a library of its own
+
+  `slides` writes .pptx in `slides.pptx` on top of `ooxml`, which supplies
+  the OPC vocabulary — content types, relationships, the package — and
+  nothing about presentations. The same division works here, and `ooxml`
+  already anticipated it: `package-kind` returns `:xlsx` for an `xl/` prefix
+  and `part-sort-key` knows how to order `xl/worksheets/sheetN.xml`. A
+  `spreadsheetml` repository to hold what turned out to be one namespace
+  would have been a repository for the symmetry of it.
+
+  ## Every cell is written as text
+
+  `<c t=\"inlineStr\">`, including one whose value looks like a number.
+  `sheets.csv` refuses to guess on the way in for a stated reason — guessing
+  is how a part number becomes a float — and writing is the same claim in
+  the other direction. A workbook here holds strings because that is what it
+  was given; deciding on its behalf that `0042` is forty-two, at the moment
+  it leaves for Excel, would be the guess arriving late rather than not at
+  all.
+
+  Inline strings also mean no `sharedStrings.xml`: one part fewer, no string
+  table to keep in step with the cells that index it, and a file Excel opens
+  either way. A workbook large enough for the table to pay for itself is
+  larger than anything this Drive produces.
+
+  A formula cell writes `<f>` and no `<v>`. There is no evaluator in this
+  library, so a cached value is not something it could write — Excel
+  recalculates on open, which is the correct outcome and not a workaround.
+
+  ## Reading meets more shapes than writing chose
+
+  A .xlsx from Excel is not the one this namespace produces: its strings are
+  in a shared table, its numbers carry no `t` at all, and its formulas come
+  with the value Excel last calculated. The reader handles all of them and
+  keeps the formula rather than the cached value — see `cell-value`.
+
+  It also reads dates, which are not a type in Excel but a number under a
+  format that says so. That means reading `xl/styles.xml`, and it is the one
+  place this namespace converts rather than passing text through: `45000` is
+  a number until the document says it is a day, and then it is
+  `2023-03-15`. See the dates section.
+
+  What it still does not read is anything about appearance — fonts, fills,
+  widths, merges — because nothing in this model can hold them. A workbook
+  that goes out through `xlsx-files` and comes back is the cells and the
+  sheet names, and says so.
+
+  ## Both hosts, actually run
+
+  This is `.cljc`, and `clojure -M:test` exercises one host. `scripts/
+  test-cljs.cljs` runs the same namespaces under nbb, because the first two
+  bugs found here — `column-name` emitting control characters and
+  `column-number` reading every column as 1 — existed only under
+  ClojureScript and passed every JVM test."
+  (:require [clojure.string :as str]
+            [ooxml.core :as ooxml]
+            [sheets.csv :as csv]
+            [sheets.model :as model]
+            [xml.parse :as xml])
+  )
+
+(def ^:private main-ns
+  "http://schemas.openxmlformats.org/spreadsheetml/2006/main")
+(def ^:private rels-ns
+  "http://schemas.openxmlformats.org/officeDocument/2006/relationships")
+
+(defn column-name
+  "1 → A, 26 → Z, 27 → AA. `sheets.model` owns this now — addressing is not a
+  fact about a file format, and keeping a copy here is how the same
+  host-portability bug got written twice."
+  [col]
+  (model/column-name col))
+
+(defn cell-ref [row col]
+  (str (column-name col) row))
+
+(defn- cell-xml [row col cell]
+  (let [ref (cell-ref row col)]
+    (cond
+      (contains? cell :sheets/formula)
+      (str "<c r=\"" ref "\"><f>" (ooxml/xml-esc (:sheets/formula cell)) "</f></c>")
+
+      (some? (:sheets/value cell))
+      (str "<c r=\"" ref "\" t=\"inlineStr\"><is><t xml:space=\"preserve\">"
+           (ooxml/xml-esc (:sheets/value cell))
+           "</t></is></c>")
+
+      :else nil)))
+
+(defn sheet-xml
+  "One worksheet part.
+
+  Rows and cells are emitted in order and only where there is something to
+  say: a sparse tab stays sparse, because a row of empty `<c>` elements is
+  bytes that mean the same as their absence."
+  [tab]
+  (let [[rows cols] (csv/tab-bounds tab)]
+    (str "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+         "<worksheet xmlns=\"" main-ns "\"><sheetData>"
+         (apply str
+                (for [row (range 1 (inc rows))
+                      :let [cells (str/join (keep #(cell-xml row % (model/get-cell tab row %))
+                                                  (range 1 (inc cols))))]
+                      :when (seq cells)]
+                  (str "<row r=\"" row "\">" cells "</row>")))
+         "</sheetData></worksheet>")))
+
+(defn- ordered-tabs
+  "The workbook's tabs in a stable order.
+
+  `:sheets/tabs` is a map, so without this the sheet order — and therefore
+  which one Excel opens on — would depend on hash order and change between
+  runs for no reason a reader could see."
+  [workbook]
+  (mapv #(get (:sheets/tabs workbook) %) (sort (keys (:sheets/tabs workbook)))))
+
+(defn- absolute-ref
+  "`A1` → `$A$1`.
+
+  A defined name is written absolute because it does not move when a formula
+  referring to it is copied — which is the whole difference between a name
+  and an address. Built rather than substituted: a `$` in a regex
+  replacement is a group reference, and writing it as one produced an
+  `Illegal group reference` instead of a workbook."
+  [ref]
+  (if-let [[_ letters digits] (re-matches #"\$?([A-Za-z]+)\$?(\d+)" (str ref))]
+    (str "$" letters "$" digits)
+    (str ref)))
+
+(defn- defined-names-xml
+  "`<definedNames>` — the workbook's named ranges.
+
+  A name is written as the reference a formula would use: `'売上表'!$A$1:$A$3`.
+  The sheet name is quoted always rather than only when it needs to be,
+  because the rule for when it needs to be is about spaces and punctuation
+  and getting it wrong produces a file Excel refuses to open.
+
+  A name whose tab is not in this workbook is dropped: writing a reference
+  to a sheet that is not there is a file that opens with a broken name in
+  it, which is worse than a file without the name."
+  [workbook tabs]
+  (let [titles (into #{} (map #(or (:sheets/title %) (:sheets/id %))) tabs)
+        usable (->> (:sheets/named-ranges workbook)
+                    (filter (fn [[_ range]]
+                              (and (:sheets/tab range) (:sheets/range range)
+                                   (contains? titles (:sheets/tab range))))))]
+    (when (seq usable)
+      (str "<definedNames>"
+           (apply str
+                  (for [[name range] usable]
+                    (str "<definedName name=\"" (ooxml/xml-esc (str name)) "\">"
+                         "'" (ooxml/xml-esc (str (:sheets/tab range))) "'!"
+                         (->> (str/split (str (:sheets/range range)) #":")
+                              (map absolute-ref)
+                              (str/join ":")
+                              ooxml/xml-esc)
+                         "</definedName>")))
+           "</definedNames>"))))
+
+(defn- workbook-xml [workbook tabs]
+  (str "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+       "<workbook xmlns=\"" main-ns "\" xmlns:r=\"" rels-ns "\"><sheets>"
+       (apply str
+              (map-indexed
+               (fn [index tab]
+                 (str "<sheet name=\""
+                      (ooxml/xml-esc (or (:sheets/title tab) (:sheets/id tab)
+                                         (str "Sheet" (inc index))))
+                      "\" sheetId=\"" (inc index)
+                      "\" r:id=\"rId" (inc index) "\"/>"))
+               tabs))
+       "</sheets>"
+       ;; After `<sheets>`: the schema fixes the order of these elements and
+       ;; Excel refuses a file that gets it wrong.
+       (defined-names-xml workbook tabs)
+       "</workbook>"))
+
+(defn xlsx-files
+  "Every part of the .xlsx, as path → text.
+
+  Separate from the zipping so the package can be inspected and asserted
+  without a host that has one."
+  [workbook]
+  (let [tabs (ordered-tabs workbook)
+        tabs (if (seq tabs) tabs [(model/tab "Sheet1")])
+        sheet-path (fn [n] (str "xl/worksheets/sheet" n ".xml"))]
+    (into
+     {"[Content_Types].xml"
+      (ooxml/content-types-xml
+       (concat [(ooxml/default-content-type "rels" (str rels-ns "+xml"))
+                (ooxml/default-content-type "xml" "application/xml")
+                (ooxml/override-content-type
+                 "/xl/workbook.xml"
+                 (str "application/vnd.openxmlformats-officedocument."
+                      "spreadsheetml.sheet.main+xml"))]
+               (map-indexed (fn [index _]
+                              (ooxml/override-content-type
+                               (str "/" (sheet-path (inc index)))
+                               (str "application/vnd.openxmlformats-officedocument."
+                                    "spreadsheetml.worksheet+xml")))
+                            tabs)))
+
+      "_rels/.rels"
+      (ooxml/relationships-xml
+       [(ooxml/relationship {:id "rId1"
+                             :type (str rels-ns "/officeDocument")
+                             :target "xl/workbook.xml"})])
+
+      "xl/workbook.xml" (workbook-xml workbook tabs)
+
+      "xl/_rels/workbook.xml.rels"
+      (ooxml/relationships-xml
+       (map-indexed (fn [index _]
+                      (ooxml/relationship
+                       {:id (str "rId" (inc index))
+                        :type (str rels-ns "/worksheet")
+                        :target (str "worksheets/sheet" (inc index) ".xml")}))
+                    tabs))}
+     (map-indexed (fn [index tab] [(sheet-path (inc index)) (sheet-xml tab)]) tabs))))
+
+(defn package
+  "The parts as an `ooxml/package`, for a caller that wants to look before
+  it writes."
+  [workbook]
+  (ooxml/package (xlsx-files workbook)))
+
+
+
+;; ── what a .xlsx cannot carry ────────────────────────────────────────────────
+
+(defn unexpressed
+  "What `xlsx-files` will drop from this workbook, one entry per thing.
+
+  Shaped like `sheets.validate/problems` — severity, code, id, message — so
+  a caller that already renders problems can render these without learning a
+  second shape. All of them are `:info`: a format not carrying something is
+  a property of the format, not a fault in the workbook.
+
+  The point is that a workbook can be asked what it will lose *before*
+  somebody exports it rather than after. Three things this writer does not
+  write, each of which the model holds:
+
+  `:sheets/style` on a cell — colours, weight, number formats. Writing them
+  would mean a `styles.xml` with a `cellXfs` entry per distinct style and a
+  style index on every cell, which is a real piece of work and not one this
+  Drive has needed. The reader already parses that part, for dates.
+
+  `:sheets/named-ranges` — `definedName` entries in the workbook part.
+
+  `:sheets/charts` — a chart part per chart, each with its own
+  relationships and cached data.
+
+  What is *not* here, because it is not a loss: a formula is written and not
+  evaluated, which is correct — Excel recalculates on open. And every value
+  is written as text, which is what the model holds."
+  [workbook]
+  (let [entry (fn [code id msg]
+                {:sheets/severity :info :sheets/code code :sheets/id id
+                 :sheets/msg msg})
+        tabs (vals (:sheets/tabs workbook))]
+    (vec
+     (concat
+      ;; Once per tab rather than once per cell: the answer is the same for
+      ;; every one of them, and a workbook with a styled header row would
+      ;; otherwise report a column's worth of identical warnings.
+      (for [tab tabs
+            :when (some :sheets/style (vals (:sheets/cells tab)))]
+        (entry :xlsx/cell-styles-dropped (:sheets/id tab)
+               "セルの書式（色・太字・表示形式）は書き出されません。"))
+      ;; Named ranges are written now, so only the ones that cannot be are
+      ;; reported: a name pointing at a tab this workbook does not have
+      ;; would become a reference to a sheet that is not there, which is a
+      ;; file that opens with a broken name in it.
+      (let [titles (into #{} (map #(or (:sheets/title %) (:sheets/id %))) tabs)
+            orphans (remove (fn [[_ range]] (contains? titles (:sheets/tab range)))
+                            (:sheets/named-ranges workbook))]
+        (when (seq orphans)
+          [(entry :xlsx/named-ranges-dropped (:sheets/id workbook)
+                  (str (count orphans)
+                       " 件の名前付き範囲は、存在しないタブを指しているため"
+                       "書き出されません。"))]))
+      (when (seq (:sheets/charts workbook))
+        [(entry :xlsx/charts-dropped (:sheets/id workbook)
+                (str (count (:sheets/charts workbook))
+                     " 件のグラフは書き出されません。"))])))))
+
+;; ── dates, which are numbers wearing a format ───────────────────────────────
+;;
+;; Excel has no date type. A date is a number counting days from an epoch,
+;; and what makes it a date is the *format* the cell's style points at. So
+;; reading one back means reading `xl/styles.xml`, and a reader that skips
+;; styles reports 45000 for a cell every human involved calls a date.
+;;
+;; This is not the guess `sheets.csv` and `cell-value` refuse. Nothing in a
+;; CSV field says it is a number, so calling it one is a guess. Here the
+;; document says so, in a part written for the purpose — converting is
+;; reading what it says, and declining to would be ignoring it.
+
+(defn- parse-int-safe [x]
+  (when x
+    ))
+
+(defn- pad
+  "`7` at width 2 is `07`. Written out because `format` is JVM-only and this
+  namespace is not."
+  [n width]
+  (let [s (str n)]
+    (str (apply str (repeat (max 0 (- width (count s))) "0")) s)))
+
+(def builtin-date-formats
+  "The `numFmtId`s that mean a date or a time without saying so.
+
+  14-17 dates, 18-21 times, 22 date and time, 45-47 elapsed time. These are
+  fixed by the spec and never written into the file, which is why a reader
+  has to carry the list rather than look it up."
+  (into #{} (concat (range 14 23) (range 45 48))))
+
+(defn date-format-code?
+  "Whether a custom format code formats a date or a time.
+
+  Quoted literals are skipped, because `\"month\"` is a word and not four
+  format tokens; `[Red]`-style conditions are skipped for the same reason;
+  and a backslash escapes whatever follows. `m` is months or minutes
+  depending on what precedes it, but either way the cell is temporal, so
+  this does not have to tell them apart."
+  [code]
+  (let [code (str code)
+        n (count code)]
+    (loop [i 0]
+      (if (>= i n)
+        false
+        (let [ch (nth code i)]
+          (cond
+            (= ch \\) (recur (+ i 2))
+            (= ch \") (recur (inc (or (str/index-of code "\"" (inc i)) (dec n))))
+            (= ch \[) (recur (inc (or (str/index-of code "]" (inc i)) (dec n))))
+            (contains? #{\y \Y \d \D \h \H \s \S \m \M} ch) true
+            :else (recur (inc i))))))))
+
+(defn styles
+  "`{:formats [numFmtId …] :custom {id code}}` from `xl/styles.xml`.
+
+  `:formats` is indexed by a cell's `s` attribute, which is a *position* in
+  `cellXfs` and not a format id. Reading it as an id gives every cell the
+  format of whichever style happens to sit at that number — wrong in the way
+  that still produces plausible dates."
+  [files]
+  (if-let [xml-str (get files "xl/styles.xml")]
+    (let [root (xml/parse xml-str)
+          custom (into {}
+                       (keep (fn [el]
+                               (when-let [id (xml/el-attr el "numFmtId")]
+                                 [id (xml/el-attr el "formatCode")])))
+                       (xml/find-all root :numFmt))
+          xfs (some-> (first (xml/find-all root :cellXfs)) (xml/find-all :xf))]
+      {:formats (mapv #(xml/el-attr % "numFmtId") (or xfs []))
+       :custom custom})
+    {:formats [] :custom {}}))
+
+(defn date-style?
+  "Whether the cell style at index `s` formats a date."
+  [{:keys [formats custom]} s]
+  (boolean
+   (when-let [id (get formats (or (parse-int-safe s) -1))]
+     (or (contains? builtin-date-formats (parse-int-safe id))
+         (some-> (get custom id) date-format-code?)))))
+
+(defn date1904?
+  "Whether the workbook counts from 1904 rather than 1900.
+
+  Declared by `<workbookPr date1904=\"1\"/>`, and asked rather than assumed:
+  a file written on one system and read as the other is off by 1462 days —
+  four years and a day, which looks like a plausible date rather than an
+  obvious error."
+  [files]
+  (boolean
+   (when-let [xml-str (get files "xl/workbook.xml")]
+     (some #(contains? #{"1" "true"} (xml/el-attr % "date1904"))
+           (xml/find-all (xml/parse xml-str) :workbookPr)))))
+
+(defn civil-from-days
+  "`[y m d]` from a count of days since 1970-01-01.
+
+  Howard Hinnant's algorithm, written out rather than delegated: this is a
+  `.cljc` namespace and `java.time` is half of the hosts it runs on. Exact
+  for every proleptic Gregorian date, which matters because the alternative
+  — approximating with 365.25 — drifts by a day somewhere every century."
+  [z]
+  (let [z (+ (long z) 719468)
+        era (quot (if (>= z 0) z (- z 146096)) 146097)
+        doe (- z (* era 146097))
+        yoe (quot (- doe (quot doe 1460) (- (quot doe 36524)) (quot doe 146096)) 365)
+        y (+ yoe (* era 400))
+        doy (- doe (+ (* 365 yoe) (quot yoe 4) (- (quot yoe 100))))
+        mp (quot (+ (* 5 doy) 2) 153)
+        d (inc (- doy (quot (+ (* 153 mp) 2) 5)))
+        m (+ mp (if (< mp 10) 3 -9))]
+    [(if (<= m 2) (inc y) y) m d]))
+
+(def ^:private serial-epoch-days
+  "Days from 1970-01-01 back to each system's serial 0.
+
+  1900: -25568 puts serial 1 at 1900-01-01. 1904: -24107 puts serial 0 at
+  1904-01-01."
+  {:1900 -25568 :1904 -24107})
+
+(defn serial->date-time
+  "An Excel serial as `[YYYY-MM-DD HH:MM:SS-or-nil]`.
+
+  The 1900 leap bug: Excel believes 1900 was a leap year, so serial 60 is a
+  29th of February that did not happen and everything above it is one day
+  further along than the arithmetic says. Below 60 the sheet and the
+  calendar agree. Getting this wrong is a silent off-by-one for the first
+  eight weeks of 1900 or for every date after it, depending which way."
+  [serial date1904?]
+  (let [serial (double serial)
+        whole (long (Math/floor serial))
+        fraction (- serial whole)
+        epoch (get serial-epoch-days (if date1904? :1904 :1900))
+        ;; Serial 60 does not exist; 61 onwards needs the extra day removed.
+        adjusted (if (or date1904? (< whole 60)) whole (dec whole))
+        [y m d] (civil-from-days (+ epoch adjusted))
+        seconds (long (Math/round (* fraction 86400.0)))]
+    [(str (pad y 4) "-" (pad m 2) "-" (pad d 2))
+     (when (pos? seconds)
+       (str (pad (quot seconds 3600) 2) ":"
+            (pad (quot (mod seconds 3600) 60) 2) ":"
+            (pad (mod seconds 60) 2)))]))
+
+(defn serial->text
+  "An Excel serial as the text a person would recognise: `2023-03-15`, or
+  `2023-03-15T09:30:00` when there is a time in it.
+
+  Text because that is the only thing this model holds. A date read here is
+  still a string in a cell — what changed is that it is the string somebody
+  would have written."
+  [serial date1904?]
+  (let [[date time] (serial->date-time serial date1904?)]
+    (if time (str date "T" time) date)))
+
+(defn- serial-of
+  "The number in a cell's text, or nil when it is not one.
+
+  Nil rather than zero: a style can say `date` over a cell holding a word,
+  and 1899-12-30 for it would be an invention."
+  [text]
+  (when text
+    ))
+
+;; ── reading one back ────────────────────────────────────────────────────────
+;;
+;; Writing got to choose one representation for everything. Reading meets all
+;; of them, because a .xlsx from Excel is not the .xlsx this namespace
+;; produces: its strings live in a shared table, its numbers have no `t` at
+;; all, and its formulas carry the value Excel last calculated.
+
+(defn column-number
+  "`A` → 1, `AA` → 27. See `sheets.model/column-number`."
+  [letters]
+  (model/column-number letters))
+
+(defn parse-ref
+  "`B12` → `[12 2]`. Nil for anything that is not a cell reference, so a
+  malformed one is dropped rather than becoming cell `[0 0]`."
+  [ref]
+  (when-let [[_ letters digits] (re-matches #"([A-Za-z]+)(\d+)" (str ref))]
+    (when-let [col (column-number letters)]
+      [ col])))
+
+(defn- all-text
+  "Every `<t>` under `el`, concatenated.
+
+  A shared string can be a single `<t>` or a run of `<r><t>` fragments that
+  differ only in formatting; a reader that took the first would silently
+  truncate every styled string to its first run."
+  [el]
+  (apply str (map xml/el-text (xml/find-all el :t))))
+
+(defn shared-strings
+  "The string table, or an empty vector when the package has none.
+
+  `xlsx-files` never writes one — inline strings need no table — so a
+  package produced here reads back through the same code path as one from
+  Excel, with the table simply empty."
+  [files]
+  (if-let [xml-str (get files "xl/sharedStrings.xml")]
+    (mapv all-text (xml/find-all (xml/parse xml-str) :si))
+    []))
+
+(defn- cell-value
+  "One `<c>` as a cell map, or nil when it holds nothing.
+
+  Four shapes, and the `t` attribute names three of them:
+
+    t=\"s\"          `<v>` is an index into the shared string table
+    t=\"inlineStr\"  `<is><t>` is the text
+    t=\"str\"        `<v>` is a formula's cached string result
+    absent          `<v>` is a number, written as its literal text
+
+  The number is kept as text on purpose. This model has no number type —
+  `sheets.csv` reads every field as a string for a stated reason — and
+  turning `1200` into a long here would be that guess arriving from the
+  other side of the same document.
+
+  The one number that does change is a dated one, and only because the
+  workbook says it is dated. See the dates section above."
+  [cell {:keys [strings styles date1904?]}]
+  (let [t (xml/el-attr cell "t")
+        formula (first (xml/find-all cell :f))
+        v (first (xml/find-all cell :v))
+        text (cond
+               (= t "inlineStr") (all-text cell)
+               (= t "s") (let [i (some-> v xml/el-text str/trim)]
+                           (get strings
+                                ))
+               :else (some-> v xml/el-text))
+        ;; Only an untyped cell — the number case — can be a date. A shared
+        ;; string under a date format is still a string, whatever the style
+        ;; claims.
+        serial (when (and (nil? t) styles (date-style? styles (xml/el-attr cell "s")))
+                 (serial-of text))]
+    (cond
+      ;; A formula wins over its cached value: the formula is what the
+      ;; document says and the value is what Excel last thought. Keeping the
+      ;; value instead would turn a spreadsheet into a printout of one.
+      formula {:sheets/formula (xml/el-text formula)}
+      serial {:sheets/value (serial->text serial date1904?)}
+      (not (str/blank? (str text))) {:sheets/value (str text)}
+      :else nil)))
+
+(defn reading-context
+  "What reading a worksheet needs from the rest of the package: the string
+  table, the style table, and which epoch the workbook counts from.
+
+  Gathered once per workbook rather than per sheet, because `xl/styles.xml`
+  is one part for the whole file and parsing it per worksheet would be the
+  same work multiplied by the tab count."
+  [files]
+  {:strings (shared-strings files)
+   :styles (styles files)
+   :date1904? (date1904? files)})
+
+(defn sheet->tab
+  "One worksheet part as a tab.
+
+  The third argument is a `reading-context`. A vector is accepted there too
+  and read as the string table alone — the shape this took before styles
+  were read, kept working because a caller with no styles to offer is asking
+  the honest question."
+  ([xml-str id] (sheet->tab xml-str id {} {}))
+  ([xml-str id ctx attrs]
+   (let [ctx (if (map? ctx) ctx {:strings ctx})
+         root (xml/parse xml-str)]
+     (reduce (fn [tab cell]
+               (let [[row col] (parse-ref (xml/el-attr cell "r"))
+                     value (when row (cell-value cell ctx))]
+                 (if value
+                   (assoc-in tab [:sheets/cells [row col]] value)
+                   tab)))
+             (model/tab id attrs)
+             (xml/find-all root :c)))))
+
+(defn- sheet-order
+  "Worksheet part paths in the order the workbook declares, resolved through
+  its relationships.
+
+  Not `sheet1, sheet2, …` by name: a workbook may relate rId1 to
+  `worksheets/sheet3.xml`, and the order Excel shows is the order in
+  `<sheets>`, not the order the files happen to be numbered."
+  [files]
+  (let [rels (when-let [x (get files "xl/_rels/workbook.xml.rels")]
+               (into {} (map (juxt #(xml/el-attr % "Id")
+                                   #(xml/el-attr % "Target")))
+                     (xml/find-all (xml/parse x) :Relationship)))
+        sheets (some-> (get files "xl/workbook.xml") xml/parse (xml/find-all :sheet))]
+    (vec
+     (keep (fn [sheet]
+             (let [target (get rels (or (xml/el-attr sheet "r:id")
+                                        (xml/el-attr sheet "id")))
+                   path (when target
+                          (if (str/starts-with? target "/")
+                            (subs target 1)
+                            (str "xl/" target)))]
+               (when (contains? files path)
+                 {:path path :name (xml/el-attr sheet "name")})))
+           sheets))))
+
+(defn workbook-from-files
+  "A workbook from the parts of a .xlsx.
+
+  Tabs are keyed by their sheet name, which is what a reader sees and what
+  `workbook->csv` takes. A workbook whose `<sheets>` cannot be resolved
+  falls back to every worksheet part in `part-sort-key` order, so a package
+  missing its relationships still comes in rather than coming in empty."
+  ([files] (workbook-from-files files "wb"))
+  ([files id]
+   (let [ctx (reading-context files)
+         declared (sheet-order files)
+         sheets (if (seq declared)
+                  declared
+                  (->> (keys files)
+                       (filter #(str/starts-with? % "xl/worksheets/"))
+                       (sort-by ooxml/part-sort-key)
+                       (map-indexed (fn [i path]
+                                      {:path path :name (str "Sheet" (inc i))}))))]
+     (reduce (fn [wb {:keys [path name]}]
+               (model/add-tab wb (sheet->tab (get files path) name ctx
+                                             {:sheets/title name})))
+             (model/workbook id)
+             sheets))))
+
+
+
+

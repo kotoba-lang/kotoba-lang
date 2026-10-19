@@ -1,0 +1,194 @@
+(ns kotoba.net.libp2p.store
+  "What a DHT node keeps for other people.
+
+  Two stores with different rules, and the difference is the whole design.
+
+  A **record** is a value someone asked us to hold under a key. Holding one is
+  a claim that anybody who asks us for that key gets a correct answer, so a
+  node that accepts records it cannot check is worse than one that accepts
+  none: it becomes a confident source of whatever it was handed. Validation is
+  therefore **injected and deny-by-default** -- the DHT has no universal notion
+  of a valid record, only per-namespace rules (`/ipns/…` is a signed record,
+  `/pk/…` is a key that must hash to its own key), and a store that guessed
+  would be guessing about correctness.
+
+  A **provider** is a claim that a peer has a block. Nobody can verify that
+  from here and it is not supposed to be verifiable -- the claim is checked by
+  going and asking. What matters instead is that it EXPIRES: a provider record
+  that outlives the peer's interest sends every future requester to a node that
+  no longer has the block, and the network's answer quality degrades quietly.
+
+  Both are bounded. An unbounded store is a memory-exhaustion vector reachable
+  by anyone who can send us a message.")
+
+(def default-record-limit 8192)
+(def default-provider-limit 8192)
+(def default-providers-per-key 20)
+
+(def default-provider-ttl-ms
+  "48 hours, go-libp2p's value. Long enough that a provider need not re-announce
+  constantly, short enough that a departed one stops being advertised."
+  (* 48 60 60 1000))
+
+(defn deny-all
+  "The default validator. A node that accepts nothing is useless; a node that
+  accepts anything is harmful, and only the caller knows which namespaces it
+  can actually check."
+  [_key _value]
+  false)
+
+(defn accept-newer
+  "The default supersede rule: any validated record replaces what is held.
+
+  Correct only for namespaces where the newest write wins. `/ipns/` is not one
+  of them -- records carry a sequence number, and a node that overwrote
+  unconditionally would let a replayed older record win by arriving second."
+  [_held _candidate]
+  true)
+
+(defn store
+  [{:keys [validator supersede? record-limit provider-limit providers-per-key provider-ttl-ms]
+    :or {validator deny-all
+         supersede? accept-newer
+         record-limit default-record-limit
+         provider-limit default-provider-limit
+         providers-per-key default-providers-per-key
+         provider-ttl-ms default-provider-ttl-ms}}]
+  {:store/validator validator
+   :store/supersede? supersede?
+   :store/record-limit record-limit
+   :store/provider-limit provider-limit
+   :store/providers-per-key providers-per-key
+   :store/provider-ttl-ms provider-ttl-ms
+   :store/records {}
+   :store/providers {}})
+
+(defn- key-of [key] (vec key))
+
+(defn put-record
+  "Store a record if the validator accepts it.
+
+  Returns `{:store s :stored? bool :reason …}`. A refusal is a value rather
+  than an exception because refusing is the normal case for a node that only
+  validates one namespace."
+  [store key value now-ms]
+  (let [k (key-of key)]
+    (cond
+      (not ((:store/validator store) k (vec value)))
+      {:store store :stored? false :reason :not-validated}
+
+      (and (>= (count (:store/records store)) (:store/record-limit store))
+           (not (contains? (:store/records store) k)))
+      {:store store :stored? false :reason :record-limit}
+
+      (when-let [held (get-in store [:store/records k])]
+        (not ((:store/supersede? store) (:value held) (vec value))))
+      {:store store :stored? false :reason :not-newer}
+
+      :else
+      {:store (assoc-in store [:store/records k]
+                        {:value (vec value) :received-at now-ms})
+       :stored? true})))
+
+(defn get-record
+  "The record held for a key, or nil."
+  [store key]
+  (get-in store [:store/records (key-of key)]))
+
+(defn add-provider
+  "Record that a peer claims to provide a key.
+
+  Re-announcing refreshes the expiry rather than adding a second entry, which
+  is what makes a long-lived provider cheap and a churning one self-limiting."
+  [store key peer-id addrs now-ms]
+  (let [k (key-of key)
+        id (vec peer-id)
+        existing (get-in store [:store/providers k] {})]
+    (cond
+      (and (>= (count (:store/providers store)) (:store/provider-limit store))
+           (not (contains? (:store/providers store) k)))
+      {:store store :stored? false :reason :provider-limit}
+
+      (and (>= (count existing) (:store/providers-per-key store))
+           (not (contains? existing id)))
+      {:store store :stored? false :reason :providers-per-key}
+
+      :else
+      {:store (assoc-in store [:store/providers k id]
+                        {:addrs (vec addrs) :announced-at now-ms})
+       :stored? true})))
+
+(defn providers
+  "Unexpired providers for a key.
+
+  Expiry is applied on READ rather than by a sweep: a record nobody asks for
+  costs nothing to keep, and a sweep is one more thing that must be scheduled
+  correctly to be correct at all."
+  [store key now-ms]
+  (let [ttl (:store/provider-ttl-ms store)]
+    (->> (get-in store [:store/providers (key-of key)] {})
+         (keep (fn [[id record]]
+                 (when (< (- now-ms (:announced-at record)) ttl)
+                   {:id id :addrs (:addrs record)})))
+         vec)))
+
+(defn expire
+  "Drop expired providers. Optional -- `providers` already ignores them -- and
+  worth calling when the store is large enough that the memory matters."
+  [store now-ms]
+  (let [ttl (:store/provider-ttl-ms store)]
+    (update store :store/providers
+            (fn [by-key]
+              (into {}
+                    (keep (fn [[k peers]]
+                            (let [live (into {} (filter (fn [[_ r]]
+                                                          (< (- now-ms (:announced-at r)) ttl)))
+                                             peers)]
+                              (when (seq live) [k live]))))
+                    by-key)))))
+
+;; ---------------------------------------------------------------------------
+;; Validators
+
+(def ^:private pk-prefix
+  "`/pk/` as bytes.
+
+  Not `(mapv int \"/pk/\")`: iterating a string gives Characters on the JVM and
+  one-character strings in ClojureScript, where `(int \"/\")` is 0. Measured
+  2026-08-19 under nbb, that made this validator do both wrong things at once
+  -- a real `/pk/` record was rejected, and any key whose first four bytes were
+  zero was accepted as a public-key record and checked against the hash. This
+  namespace's own docstring says a node that accepts records it cannot check
+  \"becomes a confident source of whatever it was handed\"; on that runtime it
+  was one.
+
+  The tests here are `.clj`, which is why nobody saw it. `png.encode` and
+  `kotoba.render.splat-loader` were the same bug on the same day."
+  (mapv  "/pk/"))
+
+(defn public-key-validator
+  "`/pk/<multihash>` -> the key must hash to the multihash in its own key.
+
+  Self-validating, which is why it is the one namespace a node can accept
+  without knowing anything about who published it."
+  [hash-fn]
+  (fn [key value]
+    (let [k (vec key)
+          prefix pk-prefix]
+      (and (= prefix (vec (take 4 k)))
+           (= (vec (drop 4 k)) (vec (hash-fn (vec value))))))))
+
+(defn namespace-of
+  "The `/<ns>/` a DHT key begins with, as a string, or nil."
+  [key]
+  (let [text (apply str (map char (take 64 key)))]
+    (second (re-find #"^/([^/]+)/" text))))
+
+(defn by-namespace
+  "Dispatch validation on the key's namespace. Anything unlisted is refused,
+  which keeps adding a namespace an explicit act."
+  [validators]
+  (fn [key value]
+    (if-let [validator (get validators (namespace-of key))]
+      (boolean (validator key value))
+      false)))

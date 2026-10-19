@@ -1,0 +1,268 @@
+(ns murakumo.generation
+  "Pure contract for murakumo.cloud's public generation API — request bodies,
+  the ranges the fleet actually accepts, response parsing, and the retry
+  classification. No HTTP, no clock, no filesystem; murakumo.generation.client
+  is the IO side.
+
+  Every constraint here was measured against the live service on 2026-07-29,
+  not read off a spec. Written from the documented shape alone, a caller fails
+  on first contact in four separate ways, and each one costs a round trip to
+  discover:
+
+    1. Wrong host. `api.murakumo.cloud` 401s a generation-scope token; the
+       gate that accepts it is `generation.murakumo.cloud`. They are different
+       Workers with different signing secrets, so the hostnames are not
+       interchangeable.
+    2. The API advertises artifact and status URLs on `murakumo.cloud`
+       regardless of which host accepted the job — following them verbatim
+       401s on every fetch. See rebase-host.
+    3. Geometry and frame counts are constrained (multiples of 32; 8n+1), and
+       a vertical short's own 720 is a 400. See snap-dimension / snap-frames.
+    4. `params.locale` wants BCP-47: \"ja\" and \"ja_JP\" are both rejected.
+
+  Model ids are deliberately NOT pinned by default: an omitted `model` lets
+  murakumo resolve the function's own `:default` from murakumo.edn, so a
+  fleet-side model swap reaches every consumer without a release here
+  (the murakumo-main rule, ADR-2607173100, applied to generation)."
+  (:require [clojure.string :as str]
+            [murakumo.generation.digest :as digest]))
+
+(def default-endpoint
+  "The scoped generation proxy. Not interchangeable with the other murakumo
+  hostnames — see this namespace's docstring."
+  "https://generation.murakumo.cloud/api/v1/generation")
+
+(defn endpoint
+  "Base generation endpoint. `override` (env/opt) wins so a staging fleet can
+  be pointed at without touching callers."
+  [override]
+  (let [s (str/trim (str (or override "")))]
+    (if (str/blank? s) default-endpoint (str/replace s #"/+$" ""))))
+
+(defn job-url
+  "Status URL for a submitted job id, on the host we are authenticated to."
+  [base job-id]
+  (str (str/replace (str base) #"/+$" "") "/jobs/" job-id))
+
+(defn- ms [seconds]
+  )
+
+(defn- ceil* [x]
+  )
+
+(defn- round* [x]
+  )
+
+(defn- prune [m] (into {} (remove (comp nil? val)) m))
+
+;; ── the ranges the fleet actually accepts (it states them in its 400s) ──────
+
+(def dimension-step 32)
+(def dimension-min 256)
+(def dimension-max 1280)
+
+(defn snap-dimension
+  "px -> the nearest accepted size: a multiple of 32 within 256..1280.
+  `params.width must be a multiple of 32 in 256..1280`. A vertical short's
+  720 is not a multiple of 32, so asking for the project's own geometry is a
+  400. Rounds to the NEAREST step (720 -> 736), which means generating
+  slightly larger than the frame and scaling down rather than upscaling."
+  [px]
+  (let [v (* dimension-step (round* (/ (double (or px dimension-min)) dimension-step)))]
+    (max dimension-min (min dimension-max v))))
+
+(def frames-min 9)
+(def frames-max 121)
+
+(defn snap-frames
+  "n -> the nearest accepted frame count: 8n+1 within 9..121.
+  `params.frames must be 8n+1 in 9..121`. At generation-fps that caps one
+  clip near 5 seconds — a longer shot has to hold or loop, it cannot be
+  generated end to end in one job."
+  [n]
+  (let [n (long (max frames-min (min frames-max (long (or n frames-min)))))
+        k (round* (/ (double (dec n)) 8.0))]
+    (max frames-min (min frames-max (inc (* 8 k))))))
+
+(def generation-fps
+  "The frame rate the fleet's video models emit (ltx-2.3 measured at 24fps,
+  ADR-2607171100). Used only to turn seconds into a frame request; consumers
+  re-time whatever comes back to their own project fps."
+  24)
+
+(def default-locale
+  "BCP-47. Measured: \"ja\" and \"ja_JP\" are both rejected as unsupported."
+  "ja-JP")
+
+;; ── request bodies ──────────────────────────────────────────────────────────
+
+(defn video-body
+  "Text-to-video, or image-to-video when :image-url is given.
+
+  :seconds is what the caller wants on screen; it becomes a snapped frame
+  count. :width/:height are optional — omitted means the fleet picks, given
+  means snapped to the accepted grid."
+  [{:keys [prompt seconds width height seed model image-url]}]
+  (prune
+   {:type "video"
+    :model model
+    :input (prune {:prompt prompt :image image-url})
+    :params (prune {:width (when width (snap-dimension width))
+                    :height (when height (snap-dimension height))
+                    :frames (when seconds
+                              (snap-frames (ceil* (* generation-fps (double seconds)))))
+                    :seed seed})}))
+
+(defn voice-body
+  "A line of narration or dialogue. :voice carries the caller's role hint so a
+  cast stays distinguishable; an unmapped role sends no voice at all rather
+  than guessing one."
+  [{:keys [text voice locale model]}]
+  (prune
+   {:type "voice"
+    :model model
+    :input {:text text}
+    ;; `(or locale default-locale)`, NOT destructuring's :or — :or only fires
+    ;; when the key is ABSENT, and a caller that forwards an optional argument
+    ;; (`{:locale locale}` with locale nil) supplies the key with a nil value.
+    ;; The default would then be skipped, prune would drop the field, and the
+    ;; fleet answers `params.locale is unsupported` for a MISSING locale. That
+    ;; is exactly how narration silently fell back to local TTS for two runs.
+    :params (prune {:locale (or locale default-locale) :voice voice})}))
+
+(defn sound-body
+  "A music bed or a one-shot effect. `kind` is :music or :sfx — the API
+  discriminates on `sound_kind` and only \"music\" selects the music
+  function, so anything else is dispatched as sfx by the server."
+  [{:keys [prompt kind seconds loop? model]}]
+  (prune
+   {:type "sound"
+    :model model
+    :input {:prompt prompt}
+    ;; `(or kind :sfx)` rather than destructuring's :or — see voice-body: a
+    ;; caller forwarding an absent optional argument supplies the key as nil,
+    ;; :or does not fire, and (name nil) would throw instead of defaulting.
+    :params (prune {:sound_kind (name (or kind :sfx))
+                    :duration_ms (when seconds (ms seconds))
+                    :loop (boolean loop?)})}))
+
+;; ── responses ───────────────────────────────────────────────────────────────
+
+(defn- getv [m k] (or (get m k) (get m (name k))))
+
+(defn submitted-id
+  "Submit response -> job id, or nil. Fail closed: a body with no jobId is not
+  a job, however 200 it looked."
+  [body]
+  (let [id (str (or (getv body :jobId) ""))]
+    (when-not (str/blank? id) id)))
+
+(def terminal-statuses #{"done" "failed"})
+
+(defn job-status [body] (str (or (getv body :status) "")))
+(defn done? [body] (= "done" (job-status body)))
+(defn failed? [body] (= "failed" (job-status body)))
+(defn terminal? [body] (contains? terminal-statuses (job-status body)))
+
+(defn- artifact-record [body]
+  (or (first (or (getv body :artifacts) []))
+      (when-let [u (getv body :artifactUrl)] {:url u})))
+
+(defn rebase-host
+  "Put `url`'s path onto `base`'s scheme+host.
+
+  The fleet advertises artifact and status URLs on murakumo.cloud whichever
+  host accepted the job, and that host is gated by a different signing
+  secret, so following them verbatim 401s. Keep the path (it carries the job
+  id), speak to the host we are authenticated to."
+  [base url]
+  (let [u (str (or url ""))]
+    (when-not (str/blank? u)
+      (let [origin (second (re-find #"^(https?://[^/]+)" (str base)))
+            path (or (second (re-find #"^https?://[^/]+(/.*)$" u)) u)]
+        (if (and origin (str/starts-with? path "/")) (str origin path) u)))))
+
+(defn artifact-url
+  "Status response -> the artifact's fetchable URL rebased onto `base`, or nil."
+  [base body]
+  (let [a (artifact-record body)]
+    (rebase-host base (or (:url a) (getv a :url)))))
+
+(defn artifact-sha256
+  "Status response -> the artifact's declared sha2-256 hex, or nil. Having it
+  lets a download be verified rather than trusted."
+  [body]
+  (let [a (artifact-record body)
+        h (str (or (:contentHash a) (getv a :contentHash) ""))]
+    (when-let [hex (second (re-find #"(?i)^sha256:([0-9a-f]{64})$" h))]
+      (str/lower-case hex))))
+
+(defn artifact-cid
+  "Status response -> the artifact's raw CIDv1, derived from its declared
+  digest (or taken verbatim if the API ever returns one directly). This is
+  also the name the artifact will have in kotobase storage."
+  [body]
+  (let [a (artifact-record body)
+        cid (or (:cid a) (getv a :cid))]
+    (if-not (str/blank? (str cid))
+      (str cid)
+      (digest/sha256-hex->cid (artifact-sha256 body)))))
+
+(defn job-error
+  "Status response -> a human-readable failure reason, for the log line that
+  explains a degrade so a placeholder never reads as success."
+  [body]
+  (let [e (getv body :error)]
+    (cond
+      (string? e) e
+      (map? e) (str (or (getv e :message) e))
+      :else (when (failed? body) "generation failed without a message"))))
+
+;; ── retry classification ────────────────────────────────────────────────────
+
+(def cold-start-signatures
+  "Fleet-side failures that mean 'the GPU worker is not up YET', not 'this job
+  is impossible'. Generation functions scale from zero (murakumo.edn
+  `:scale {:min 0 ...}`), so the first job after an idle period races the
+  worker's boot and the generation service cannot reach its backend.
+  Measured 2026-07-29: `[Errno 111] Connection refused` on a cold fleet,
+  `[Errno 104] Connection reset by peer` mid-boot — and the very next job ran
+  to completion both times. Degrading scheduled work to a fallback because it
+  happened to be the job that woke the fleet is a bug."
+  ["connection refused" "connection reset" "errno 111" "errno 104"
+   "timed out" "temporarily unavailable" "502" "503" "504"])
+
+(defn cold-start?
+  "Should this failure be retried rather than degraded? A real refusal (bad
+  params, out of vram) must answer false so it fails fast instead of stalling."
+  [message]
+  (let [m (str/lower-case (str (or message "")))]
+    (boolean (some #(str/includes? m %) cold-start-signatures))))
+
+(def transient-statuses
+  "HTTP statuses at submit time that mean 'try again', not 'this request is
+  wrong': the fleet is rate limiting or a hop is down."
+  #{0 408 425 429 500 502 503 504})
+
+(defn transient-submit?
+  "A non-2xx submit -> should it be retried rather than degraded?
+
+  Status alone is not enough: the fleet answers 400 both for a genuinely
+  malformed request (bad geometry, unsupported locale — never retry, the next
+  attempt is identical) and, occasionally, for a capacity condition it
+  describes in the body. So look at both, and default a 4xx to NOT retryable
+  so a broken request fails fast."
+  [status body]
+  (boolean
+   (or (contains? transient-statuses (long (or status 0)))
+       (cold-start? (str (or (getv body :message)
+                             (getv body :error)
+                             body))))))
+
+
+(defn poll-backoff-ms
+  "Attempt index -> wait before the next status read. Video jobs run tens of
+  seconds to minutes (94.6s for a 49-frame ltx-2.3 clip, ADR-2607171100), so
+  a flat fast poll is waste; ramps 2s -> 15s and holds."
+  [attempt]
+  (min 15000 (+ 2000 (* 1000 (long (or attempt 0))))))

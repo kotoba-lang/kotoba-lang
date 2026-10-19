@@ -1,0 +1,247 @@
+(ns filecoin.cloud.piece
+  "PieceCID v2 — the name a piece of data has to Filecoin Onchain Cloud.
+
+  Specified by FRC-0069. A PieceCID is a CIDv1 with the **raw** codec
+  (`0x55`) and the multihash `fr32-sha2-256-trunc254-padded-binary-tree`
+  (`0x1011`), whose digest is not a hash of the bytes but a small structure:
+
+      [padding varint][height 1 byte][root 32 bytes]
+
+  so the CID carries the piece's exact size as well as its commitment. That
+  is what distinguishes v2 from the old PieceCID (`fil-commitment-unsealed`,
+  `0xf101`, multihash `0x1012`), which held only the root and left the size
+  to be carried alongside — and lost.
+
+  The pipeline, and why each step exists:
+
+  1. **Zero-pad** the payload up to `127 × 2^n` source bytes. The tree has to
+     be complete, and a quad is 127 bytes.
+  2. **FR32 expand**: every 127 source bytes become 128, by inserting two
+     zero bits every 254 bits. 254 is the number of bits of a BLS12-381 field
+     element that can hold arbitrary data; the two zero bits keep each 32-byte
+     leaf below the field modulus, so a leaf is always a valid `Fr`.
+  3. **Merkle** over 32-byte leaves, where a parent is
+     `SHA-256(left ‖ right)` **with the top two bits of the last byte
+     cleared**. Same reason: a node has to be a field element too. Plain
+     SHA-256 gives a different root about half the time, which is the shape
+     of bug that produces a piece nobody can prove.
+
+  `padding` is then `127 × 2^(height-2) − payload-size`: the count of zero
+  bytes step 1 added. It is stored so the original size can be recovered from
+  the CID alone.
+
+  This is byte arithmetic in Clojure over vectors, so it is not fast. It is
+  intended for pieces of the size a test or a manifest has, not for hashing a
+  32 GiB sector — see the README."
+  (:require [multiformats.core :as mf]))
+
+(def ^:const codec-raw 0x55)
+(def ^:const multihash-code
+  "fr32-sha2-256-trunc254-padded-binary-tree"
+  0x1011)
+
+(def ^:const node-size 32)
+(def ^:const in-bytes-per-quad
+  "4 field elements × 254 bits. What 128 output bytes are made from."
+  127)
+(def ^:const out-bytes-per-quad 128)
+
+(def ^:const min-payload-size
+  "2 nodes and one byte. Below this, FR32 expansion has no defined result:
+  silently promoting two leaves to four would break the symmetry the tree
+  depends on, so the floor is explicit."
+  65)
+
+(def ^:const max-height 255)
+
+(defn- ->ints
+  "Payload bytes. A string is taken as UTF-8, not as hex — guessing between
+  the two would make `\"beef\"` mean one thing and `\"deadbeef\"` another."
+  [data]
+  (cond (nil? data) []
+        (vector? data) data
+        (string? data) 
+        :else (mapv #(bit-and (int %) 0xff) (seq data))))
+
+(defn- ->bytes [ints]
+  )
+
+(defn- highest-bit
+  "floor(log2 n), by shifting rather than by `Math/log`. A float log of a
+  power of two is not reliably exact, and being one off here changes the
+  padded size and therefore the CID."
+  [n]
+  (loop [v n b -1]
+    (if (zero? v) b (recur (quot v 2) (inc b)))))
+
+(defn zero-padded-size
+  "Source bytes after zero-padding: the next `127 × 2^n` at or above the
+  payload, with `min-payload-size` as a floor."
+  [payload-size]
+  (let [size (max payload-size min-payload-size)
+        b (highest-bit size)
+        ;; ceil(127/128 × 2^(b+1)) — exact, since 2^(b+1) is a multiple of
+        ;; 128 for any size at or above the 65-byte floor
+        bound (quot (* in-bytes-per-quad (bit-shift-left 1 (inc b))) out-bytes-per-quad)]
+    (if (<= size bound)
+      bound
+      (quot (* in-bytes-per-quad (bit-shift-left 1 (+ b 2))) out-bytes-per-quad))))
+
+(defn piece-size
+  "FR32-expanded size — the number of bytes the tree's leaves cover."
+  [payload-size]
+  (quot (* (zero-padded-size payload-size) out-bytes-per-quad) in-bytes-per-quad))
+
+(defn height-for
+  "Tree height for a payload size. `2^height` leaves."
+  [payload-size]
+  (highest-bit (quot (piece-size payload-size) node-size)))
+
+(defn padded-size
+  "The source-byte capacity of a tree of this height: `127 × 2^(height-2)`.
+  Subtracting the payload size from it gives the `padding` field."
+  [height]
+  (* in-bytes-per-quad (bit-shift-left 1 (- height 2))))
+
+(defn expanded-size
+  "The tree's own size in bytes: `2^height × 32`. This is the number
+  Filecoin calls the *padded piece size*, and it is not `padded-size` — the
+  two differ by the FR32 ratio and confusing them is a 1/128 error that looks
+  like a rounding bug."
+  [height]
+  (* node-size (bit-shift-left 1 height)))
+
+;; ── FR32 ─────────────────────────────────────────────────────────────────────
+
+(defn expand
+  "FR32 expansion of `source` (zero-padded first). 127 bytes in, 128 out,
+  per quad."
+  [source]
+  (let [src (->ints source)
+        padded (zero-padded-size (count src))
+        at (fn [i] (if (< i (count src)) (nth src i) 0))
+        quads (quot padded in-bytes-per-quad)]
+    (persistent!
+     (reduce
+      (fn [out n]
+        (let [r (* n in-bytes-per-quad)
+              out (reduce (fn [o i] (conj! o (at (+ r i)))) out (range 0 31))
+              ;; the 32nd byte keeps only its low 6 bits: the first field
+              ;; element is 254 bits, not 256
+              out (conj! out (bit-and (at (+ r 31)) 0x3f))
+              shift (fn [o lo hi sh]
+                      (reduce (fn [o i]
+                                (conj! o (bit-and
+                                          (bit-or (bit-shift-left (at (+ r i)) sh)
+                                                  (bit-shift-right (at (+ r i -1)) (- 8 sh)))
+                                          0xff)))
+                              o (range lo hi)))
+              out (shift out 32 63 2)
+              out (conj! out (bit-and (bit-or (bit-shift-left (at (+ r 63)) 2)
+                                              (bit-shift-right (at (+ r 62)) 6))
+                                      0x3f))
+              out (shift out 64 95 4)
+              out (conj! out (bit-and (bit-or (bit-shift-left (at (+ r 95)) 4)
+                                              (bit-shift-right (at (+ r 94)) 4))
+                                      0x3f))
+              out (shift out 96 127 6)
+              out (conj! out (bit-and (bit-shift-right (at (+ r 126)) 2) 0x3f))]
+          out))
+      (transient [])
+      (range quads)))))
+
+;; ── the tree ─────────────────────────────────────────────────────────────────
+
+(defn truncate
+  "Clear the top two bits of a 32-byte node, so it is below the BLS12-381
+  modulus and therefore a valid field element."
+  [node]
+  (assoc (vec node) 31 (bit-and (nth node 31) 0x3f)))
+
+(defn compute-node
+  "`truncate(SHA-256(left ‖ right))`. The truncation is not optional; plain
+  SHA-256 gives a different root roughly half the time."
+  [left right]
+  (truncate (->ints (mf/sha256 (->bytes (into (vec left) right))))))
+
+(defn merkle-root
+  "Fold 32-byte leaves pairwise to a single root."
+  [leaves]
+  (loop [level (vec leaves)]
+    (if (= 1 (count level))
+      (first level)
+      (recur (mapv (fn [[l r]] (compute-node l r)) (partition 2 level))))))
+
+(defn leaves
+  "Split expanded bytes into 32-byte nodes."
+  [expanded]
+  (mapv vec (partition node-size expanded)))
+
+;; ── the digest and the CID ───────────────────────────────────────────────────
+
+(defn digest-bytes
+  "The multihash: code, length, then `[padding varint][height][root]`."
+  [{:keys [padding height root]}]
+  (let [inner (into (into (vec (->ints (mf/varint padding))) [height]) root)]
+    (into (into (vec (->ints (mf/varint multihash-code)))
+                (->ints (mf/varint (count inner))))
+          inner)))
+
+(defn cid-bytes [d]
+  (into (into (vec (->ints (mf/varint 1))) (->ints (mf/varint codec-raw)))
+        (digest-bytes d)))
+
+(defn cid-string [d]
+  (str "b" (mf/base32 (->bytes (cid-bytes d)))))
+
+(defn calculate
+  "Payload bytes → the piece: its root, height, padding, sizes and CID.
+
+      (:cid (calculate (range 100)))
+      ;; => \"bafkzcibcdmbmhxp7o3q5ntjp4triphpezgi4gaonnueaqnvfzmeohbk3atjlcpy\""
+  [payload]
+  (let [src (->ints payload)
+        n (count src)
+        height (height-for n)]
+    (when (> height max-height)
+      (throw (ex-info "piece: payload larger than one byte of height can name"
+                      {:size n :height height})))
+    (let [root (merkle-root (leaves (expand src)))
+          d {:root root
+             :height height
+             :padding (- (padded-size height) n)
+             :size n
+             :padded-size (expanded-size height)}]
+      (assoc d :cid (cid-string d)))))
+
+(defn parse
+  "A PieceCID string → its fields. Refuses anything that is not a v1 raw CID
+  with this multihash: a plain sha2-256 CID over the same bytes is a
+  different, equally well-formed CID, and treating one as the other names a
+  piece that does not exist."
+  [s]
+  (let [bs (mapv #(bit-and (int %) 0xff) (mf/cid->bytes s))
+        [version codec] bs]
+    (when-not (= 1 version)
+      (throw (ex-info "piece: PieceCID must be CIDv1" {:version version})))
+    (when-not (= codec-raw codec)
+      (throw (ex-info "piece: PieceCID must use the raw codec" {:codec codec})))
+    ;; 0x1011 as a varint is two bytes, 0x91 0x20
+    (when-not (= [0x91 0x20] (subvec bs 2 4))
+      (throw (ex-info "piece: not an fr32 padded-binary-tree multihash"
+                      {:multihash (subvec bs 2 4)})))
+    (let [inner (subvec bs 5)                      ; skip the digest length
+          ;; padding is a varint; for every size a single CID can name it is
+          ;; one byte below 0x80, but a large piece needs more
+          [padding padding-len] (loop [i 0 acc 0 shift 1]
+                                  (let [b (nth inner i)
+                                        acc (+ acc (* (bit-and b 0x7f) shift))]
+                                    (if (zero? (bit-and b 0x80))
+                                      [acc (inc i)]
+                                      (recur (inc i) acc (* shift 128)))))
+          height (nth inner padding-len)
+          root (subvec inner (inc padding-len) (+ padding-len 1 node-size))]
+      {:root root :height height :padding padding
+       :size (- (padded-size height) padding)
+       :padded-size (expanded-size height)
+       :cid s})))

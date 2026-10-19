@@ -1,0 +1,151 @@
+(ns drpc.session
+  "Several calls on one connection.
+
+  `drpc.client` describes one call. A connection carries many, and the packets
+  come back interleaved on a single byte stream — so something has to decide
+  which arriving packet belongs to which waiting call. That decision is here,
+  as a value: bytes in, completed calls out, no socket and no concurrency.
+
+  ## Why the rules are not obvious
+
+  Stream ids only ever increase (`drpc.wire`'s reader refuses a regression),
+  and `Manager.NewClientStream` allocates `last + 1`. Both facts are load
+  bearing:
+
+  - **A call cannot reuse a stream id.** Two calls sharing one would each
+    accept the other's answer, and neither would ever know.
+  - **A stream that has already been answered will not be heard from again**,
+    which is why a completed call is removed rather than kept around. Keeping
+    it would grow without bound on a long-lived connection, which is what a
+    node's satellite connection is.
+  - **A packet for a stream nobody is waiting on is reported, not dropped.**
+    On a healthy connection it cannot happen; when it does, silently
+    discarding it turns a protocol violation into a call that hangs.
+
+  ## Streams
+
+  `begin` opens a unary call and says everything at once. `begin-stream`
+  opens one and leaves it open: the caller then writes with `send-on` as many
+  times as it likes and ends with `end-send`.
+
+  The session keeps the outgoing message id per stream because that is the
+  only place that can. Ids advance per packet within a stream, and a caller
+  tracking them itself gets one call's numbering wrong the first time two
+  streams are open at once.
+
+  A streaming call is also finished by a different rule — `CloseSend` from the
+  peer rather than its first message — so the session records which kind each
+  call is rather than making every caller remember.
+
+  ## What is still not here
+
+  Concurrency. A caller feeding this from two threads at once has two
+  sequences of `feed` applied to one value and will lose one of them — that
+  is the host's problem, and `storj.node.host.rpc` is where it is solved for
+  a real socket."
+  (:require [drpc.client :as c]
+            [drpc.wire :as w]))
+
+(defn- fail [msg data]
+  (throw (ex-info (str "drpc.session: " msg) data)))
+
+(defn session
+  "A fresh session. `opts` are passed to `drpc.wire/reader`."
+  ([] (session {}))
+  ([opts]
+   {:reader      (if (seq opts) (w/reader opts) (w/reader))
+    :calls       {}
+    :next-stream c/first-stream
+    :orphaned    []}))
+
+(defn- new-call [streaming?]
+  (assoc c/empty-result :streaming? streaming? :next-message 1))
+
+(defn begin
+  "Start a call.
+
+  Returns `[state {:stream n :bytes [...]}]` — the caller writes `:bytes` and
+  remembers `:stream`. The stream id comes from the session rather than the
+  caller because it is the session that knows which are in flight."
+  [state opts]
+  (let [stream (:next-stream state)]
+    [(-> state
+         (assoc :next-stream (inc stream))
+         (assoc-in [:calls stream] (new-call false)))
+     {:stream stream
+      :bytes  (c/request (assoc opts :stream stream))}]))
+
+(defn begin-stream
+  "Open a stream and leave it open.
+
+  Returns `[state {:stream n :bytes [...]}]`, where the bytes are the invoke
+  and nothing more. Write messages with `send-on` and finish with `end-send`."
+  [state opts]
+  (let [stream  (:next-stream state)
+        packets (c/open (assoc opts :stream stream))]
+    [(-> state
+         (assoc :next-stream (inc stream))
+         (assoc-in [:calls stream] (assoc (new-call true)
+                                          :next-message (inc (count packets)))))
+     {:stream stream
+      :bytes  (vec (mapcat w/encode-packet packets))}]))
+
+(defn- advance [state stream packet]
+  [(update-in state [:calls stream :next-message] inc)
+   (vec (w/encode-packet packet))])
+
+(defn send-on
+  "One more message on an open stream. Returns `[state bytes]`."
+  [state stream data]
+  (let [call (or (get-in state [:calls stream])
+                 (fail "no such stream" {:stream stream}))]
+    (advance state stream (c/message stream (:next-message call) data))))
+
+(defn end-send
+  "Stop sending on a stream. Returns `[state bytes]`.
+
+  The peer is still free to answer afterwards, which is the whole shape of an
+  upload: the client stops talking and then finds out whether the piece was
+  accepted."
+  [state stream]
+  (let [call (or (get-in state [:calls stream])
+                 (fail "no such stream" {:stream stream}))]
+    (advance state stream (c/close-send stream (:next-message call)))))
+
+(defn- absorb
+  "Fold one packet into the call it belongs to."
+  [state {:keys [stream] :as packet}]
+  (if-let [call (get-in state [:calls stream])]
+    (assoc-in state [:calls stream] (c/collect [packet] stream call))
+    ;; a stream nobody is waiting on. On a healthy connection this cannot
+    ;; happen — a server does not invent streams — so it is worth reporting
+    ;; rather than discarding, which would turn this into a call that hangs.
+    (update state :orphaned conj packet)))
+
+(defn- finished? [call]
+  (if (:streaming? call)
+    (c/stream-complete? call)
+    (c/complete? call)))
+
+(defn feed
+  "Feed received bytes.
+
+  Returns `{:state s :completed [{:stream n :result {...}}]}`. A completed
+  call is removed from the session: its stream will never be spoken on again,
+  and a connection that keeps every finished call grows without bound."
+  [state bs]
+  (let [{r :state packets :packets} (w/feed (:reader state) bs)
+        state (reduce absorb (assoc state :reader r) packets)
+        done  (filterv (fn [[_ call]] (finished? call)) (:calls state))]
+    {:state (update state :calls #(apply dissoc % (map first done)))
+     :completed (mapv (fn [[stream call]] {:stream stream :result call}) done)}))
+
+(defn pending
+  "The streams still waiting for an answer."
+  [state]
+  (set (keys (:calls state))))
+
+(defn orphaned
+  "Packets that arrived for streams nobody was waiting on."
+  [state]
+  (:orphaned state))

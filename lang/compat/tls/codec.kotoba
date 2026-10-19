@@ -1,0 +1,179 @@
+(ns tls.codec
+  "The TLS presentation language -- RFC 8446 section 3 -- over byte vectors.
+
+  Bytes here are `vector<int 0..255>`, the same representation
+  `kotoba-lang/bytes`, `kotoba-lang/noise` and `kotoba-lang/org-ietf-asn1` use,
+  so nothing in this library needs a reader conditional and the same code runs
+  on the JVM, in ClojureScript and under nbb.
+
+  ## Reading is a cursor, not a sequence of `drop`s
+
+  Every parse in TLS is `read n bytes, then read what they said`. A parser that
+  does that with `take`/`drop` over a lazy sequence silently succeeds on
+  truncated input, because `(take 4 [1 2])` is `[1 2]`. Here a cursor knows
+  how many bytes are left and `need` refuses before reading, so truncation is
+  a `:decode_error`, not a short value that flows on into a length field.
+
+  ## Vectors carry their bound
+
+  RFC 8446 writes `opaque legacy_session_id<0..32>`, and those bounds are not
+  documentation: `legacy_session_id` is length-prefixed with one byte, so a
+  33-byte session id is *encodable* and only the declared bound rejects it.
+  `read-vector` and `write-vector` both take the bound and enforce it."
+  (:require [tls.result :as r :refer [ok error]]
+            [clojure.string :as str]))
+
+;; ---------------------------------------------------------------- integers
+
+(defn u8 [n] [(bit-and n 0xff)])
+(defn u16 [n] [(bit-and (bit-shift-right n 8) 0xff) (bit-and n 0xff)])
+(defn u24 [n] [(bit-and (bit-shift-right n 16) 0xff)
+               (bit-and (bit-shift-right n 8) 0xff)
+               (bit-and n 0xff)])
+(defn u32 [n] [(bit-and (bit-shift-right n 24) 0xff)
+               (bit-and (bit-shift-right n 16) 0xff)
+               (bit-and (bit-shift-right n 8) 0xff)
+               (bit-and n 0xff)])
+
+(defn u64
+  "Eight bytes, big-endian.
+
+   Written with division rather than `bit-shift-right` on purpose: sequence
+   numbers are 64-bit, and in ClojureScript `bit-shift-right` coerces to 32
+   bits. A shift-based version is correct for the first four billion records of
+   a connection and then silently produces the wrong nonce -- which is
+   catastrophic rather than merely wrong, since a repeated nonce under a
+   reused key is a total loss of confidentiality for both records."
+  [n]
+  (loop [i 7, n n, acc (vec (repeat 8 0))]
+    (if (neg? i)
+      acc
+      (recur (dec i) (quot n 256) (assoc acc i (mod n 256))))))
+
+(def max-exact-integer
+  "2^53 - 1. Above this a ClojureScript number is no longer an exact integer,
+   so a 64-bit sequence number would round -- and a rounded sequence number is
+   a repeated AEAD nonce. `tls.record` refuses rather than pretending, and
+   says so; RFC 8446 section 5.3 requires terminating the connection before
+   the sequence wraps anyway, so refusing early is inside the spec."
+  9007199254740991)
+
+;; --------------------------------------------------------------- the cursor
+
+(defn cursor
+  "A read position over `bytes`."
+  [bytes] {:bytes (vec bytes) :pos 0})
+
+(defn remaining [c] (- (count (:bytes c)) (:pos c)))
+(defn exhausted? [c] (zero? (remaining c)))
+
+(defn need
+  "`[:ok nil]` if `n` bytes are available, else a `:decode_error`. Called
+   before every read, so a truncated message is refused where it is short
+   rather than where the short value is later used."
+  [c n what]
+  (if (>= (remaining c) n)
+    (ok nil)
+    (error :decode_error :truncated {:tls/expected n :tls/available (remaining c) :tls/field what})))
+
+(defn read-bytes
+  "-> [:ok [taken cursor']]"
+  [c n what]
+  (let [chk (need c n what)]
+    (if (r/error? chk)
+      chk
+      (ok [(subvec (:bytes c) (:pos c) (+ (:pos c) n))
+           (update c :pos + n)]))))
+
+(defn- read-int [c n what]
+  (r/let-ok [[bs c'] (read-bytes c n what)]
+    (ok [(reduce (fn [acc b] (+ (* acc 256) b)) 0 bs) c'])))
+
+(defn read-u8  [c what] (read-int c 1 what))
+(defn read-u16 [c what] (read-int c 2 what))
+(defn read-u24 [c what] (read-int c 3 what))
+(defn read-u32 [c what] (read-int c 4 what))
+
+(def ^:private length-prefix {1 read-u8, 2 read-u16, 3 read-u24})
+(def ^:private length-writer {1 u8, 2 u16, 3 u24})
+
+(defn read-vector
+  "An RFC 8446 `opaque x<lo..hi>`: a `prefix`-byte length then that many bytes,
+   with the declared bounds enforced.
+
+   `hi` is not optional and there is no default. A vector whose bound is not
+   stated is a vector whose bound is whatever the length prefix happens to
+   allow, and the difference between `<0..32>` and `<0..255>` for
+   `legacy_session_id` is the difference between rejecting a hostile
+   ClientHello and parsing it."
+  [c prefix lo hi what]
+  (if-let [rd (length-prefix prefix)]
+    (r/let-ok [[n c'] (rd c what)]
+      (cond
+        (< n lo) (error :decode_error :vector-underflow {:tls/field what :tls/length n :tls/min lo})
+        (> n hi) (error :decode_error :vector-overflow {:tls/field what :tls/length n :tls/max hi})
+        :else (read-bytes c' n what)))
+    (error :internal_error :bad-length-prefix {:tls/prefix prefix})))
+
+(defn write-vector
+  "The encoding side of `read-vector`, with the same bounds. An encoder that
+   does not check produces a message its own parser refuses -- which is how a
+   bug becomes an interop mystery instead of a test failure."
+  [prefix lo hi what bytes]
+  (let [n (count bytes)]
+    (cond
+      (< n lo) (error :internal_error :vector-underflow {:tls/field what :tls/length n :tls/min lo})
+      (> n hi) (error :internal_error :vector-overflow {:tls/field what :tls/length n :tls/max hi})
+      (not (length-writer prefix)) (error :internal_error :bad-length-prefix {:tls/prefix prefix})
+      :else (ok (into ((length-writer prefix) n) (vec bytes))))))
+
+(defn end
+  "Assert the cursor is spent. RFC 8446 messages are exactly as long as they
+   say; trailing bytes are not slack, they are an attacker's channel, and
+   section 4.1.2's `decode_error` is the stated answer."
+  [c what]
+  (if (exhausted? c)
+    (ok nil)
+    (error :decode_error :trailing-data {:tls/field what :tls/trailing (remaining c)})))
+
+(defn sub-cursor
+  "Parse a length-delimited region as its own cursor, so a nested structure
+   cannot read past its own bound into its parent's bytes."
+  [bytes] (cursor bytes))
+
+;; --------------------------------------------------------------------- hex
+
+(def ^:private hex-digits "0123456789abcdef")
+
+(defn hex [bytes]
+  (apply str (mapcat (fn [b] [(nth hex-digits (bit-shift-right (bit-and b 0xff) 4))
+                              (nth hex-digits (bit-and b 0xf))]) bytes)))
+
+(defn- parse-hex-byte [s]
+  )
+
+(defn unhex
+  "Hex to bytes, ignoring any non-hex separator. The RFC prints its vectors as
+   space-and-newline separated hex, so this is what a test reads them with."
+  [s]
+  (let [s (str/replace (str s) #"[^0-9a-fA-F]" "")]
+    (when (odd? (count s)) (throw (ex-info "odd-length hex" {:length (count s)})))
+    (mapv #(parse-hex-byte (subs s % (+ % 2))) (range 0 (count s) 2))))
+
+(defn ascii
+  "UTF-8 bytes of an ASCII string. TLS labels (`tls13 key`, `tls13 finished`)
+   are ASCII by definition, so this refuses anything above 0x7f rather than
+   quietly emitting multi-byte UTF-8 into a length-critical field."
+  [s]
+  (mapv (fn [ch]
+          (let [c ]
+            (when (> c 0x7f) (throw (ex-info "non-ASCII in a TLS label" {:string s})))
+            c))
+        (seq s)))
+
+(defn constant-time-eq?
+  "Fixed-time comparison for tags and verify_data. Length is not secret, so a
+   length mismatch may return early; content comparison must not."
+  [a b]
+  (and (= (count a) (count b))
+       (zero? (reduce (fn [acc [x y]] (bit-or acc (bit-xor x y))) 0 (map vector a b)))))

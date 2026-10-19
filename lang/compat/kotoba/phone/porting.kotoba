@@ -1,0 +1,195 @@
+(ns kotoba.phone.porting
+  "Number portability (MNP) requests and their deterministic pre-check.
+
+  A port moves a number between operators while the subject keeps it. Two
+  directions, and they are not mirror images of each other:
+
+  - PORT-OUT is the dangerous one. It is the number-plane equivalent of an eSIM
+    ownership transfer, and it is the mechanism of the port-out scam: an
+    attacker with enough of a victim's details asks the recipient operator to
+    import the victim's line, and every one-time code follows. Everything in
+    this namespace that looks paranoid is aimed at that.
+
+  - PORT-IN is the arriving side. The risk there is not losing the line, it is
+    ACCEPTING a stolen one and treating it, immediately, as a settled identity
+    anchor.
+
+  This namespace decides: shape, subject agreement, reachability of the state
+  the number is in, and whether a number has changed hands too recently to
+  change hands again. It does NOT decide whether the donor really holds the
+  number, whether the recipient is licensed, or whether the requester is who
+  they say -- an operator's own verification (and the governor's admission) sit
+  above this, and nothing here should be read as having verified a person.
+
+  Portable (.cljc) across JVM / ClojureScript / SCI / GraalVM."
+  (:require [clojure.string :as str]
+            [kotoba.phone :as phone]
+            [kotoba.phone.lifecycle :as lifecycle]))
+
+(def directions
+  "`:out` = this operator is the donor, `:in` = this operator is the recipient."
+  #{:in :out})
+
+(def default-change-freeze-days
+  "How long after a number changes hands it may not change hands again.
+
+  Sixty days is a CHOSEN default, not a quoted regulation. What it buys is the
+  time an attacker's port would otherwise use: a line moved twice in quick
+  succession is a line whose real holder has not yet had a chance to notice the
+  first move, and the second move is what puts it beyond recovery. An operator
+  with a rule of their own passes it."
+  60)
+
+(def ^:private ms-per-day (* 24 60 60 1000))
+
+(defn freeze-ms
+  "The change-freeze window in milliseconds. Accepts nil for the default."
+  ([] (freeze-ms nil))
+  ([days] (* (long (or days default-change-freeze-days)) ms-per-day)))
+
+(defn port-request
+  "Construct a port request record, or nil when the shape is wrong.
+
+  Returns nil rather than throwing, matching kotoba.phone/cdr. The reasons a
+  request is refused are data, not exceptions -- see `request-issues`, which is
+  what a pre-check should call when it needs to tell a human WHY."
+  [id msisdn direction donor recipient subject & {:keys [requested-at-ms window-ms]}]
+  (let [m (phone/normalize-e164 msisdn)]
+    (when (and m (contains? directions direction)
+               (not (str/blank? (str donor)))
+               (not (str/blank? (str recipient)))
+               (not= (str donor) (str recipient))
+               (not (str/blank? (str subject))))
+      {:phone/port-id       id
+       :phone/msisdn        m
+       :phone/direction     direction
+       :phone/donor         donor
+       :phone/recipient     recipient
+       :phone/subject       subject
+       :phone/requested-at-ms requested-at-ms
+       :phone/window-ms     window-ms})))
+
+(defn request-issues
+  "Why this request is not a well-formed port request. Empty when it is.
+
+  Separate from `port-request` because a constructor that returns nil is a fine
+  guard and a terrible explanation, and every refusal a human sees should say
+  which of these it was."
+  [{:phone/keys [msisdn direction donor recipient subject]}]
+  (cond-> []
+    (nil? (phone/normalize-e164 msisdn))
+    (conj {:phone/issue :porting/msisdn-invalid :phone/msisdn msisdn})
+
+    (not (contains? directions direction))
+    (conj {:phone/issue :porting/direction-invalid :phone/direction direction})
+
+    (str/blank? (str donor))
+    (conj {:phone/issue :porting/donor-missing})
+
+    (str/blank? (str recipient))
+    (conj {:phone/issue :porting/recipient-missing})
+
+    ;; A port between the same two parties is not a port. Admitting it would put
+    ;; a record on the ledger that reads like a transfer and moved nothing,
+    ;; which is worse than refusing: a posture reading `takeover-signals` would
+    ;; restrict a subject over an event that never happened.
+    (and (not (str/blank? (str donor)))
+         (= (str donor) (str recipient)))
+    (conj {:phone/issue :porting/donor-is-recipient})
+
+    (str/blank? (str subject))
+    (conj {:phone/issue :porting/subject-missing})))
+
+(defn- recently-changed-issue
+  "The change-freeze refusal, or nil.
+
+  A record with NO `:phone/changed-at-ms` is treated as NOT frozen, which is the
+  opposite direction from the quarantine window in kotoba.phone.numbering, and
+  the difference is deliberate. There, an unknown history could hand a stranger
+  somebody's account recovery, so unknown must refuse. Here, an unknown history
+  would freeze a subject out of moving their own number to another operator --
+  refusing on absent data would turn a fraud control into a lock-in, and the
+  fraud it would prevent is already covered by the subject check above."
+  [{:phone/keys [changed-at-ms]} now-ms days]
+  (let [window (freeze-ms days)]
+    (when (and (number? changed-at-ms) (number? now-ms)
+               (< (- now-ms changed-at-ms) window))
+      {:phone/issue :porting/recently-changed
+       :phone/remaining-ms (- window (- now-ms changed-at-ms))})))
+
+(defn port-out-issues
+  "Return a seq of reasons this number may not be ported out right now, empty
+  when it may. Pure and total. Every fact is passed in.
+
+    :records          what this operator knows about its numbers
+    :request          the port request (see `port-request`)
+    :now-ms           the instant to judge the freeze window against
+    :freeze-days      the operator's window, or nil for the default
+
+  THE SUBJECT CHECK IS THE POINT. A port-out request naming a subject other
+  than the one on record is the port-out scam in its plain form, and it is
+  refused here -- before a human is asked -- rather than being left to whoever
+  reads the request later. Everything else in this function is bookkeeping by
+  comparison."
+  [{:keys [records request now-ms freeze-days]}]
+  (let [shape (request-issues request)]
+    (if (seq shape)
+      (vec shape)
+      (let [m (phone/normalize-e164 (:phone/msisdn request))
+            r (first (filter #(= m (:phone/msisdn %)) records))]
+        (cond
+          (not= :out (:phone/direction request))
+          [{:phone/issue :porting/direction-mismatch
+            :phone/direction (:phone/direction request)}]
+
+          (nil? r)
+          [{:phone/issue :number/not-found :phone/msisdn m}]
+
+          (not= (str (:phone/subject request)) (str (:phone/subject r)))
+          [{:phone/issue :porting/subject-mismatch :phone/msisdn m}]
+
+          (seq (lifecycle/transition-issues (:phone/state r) :port-out-request))
+          (vec (lifecycle/transition-issues (:phone/state r) :port-out-request))
+
+          :else
+          (vec (keep identity [(recently-changed-issue r now-ms freeze-days)])))))))
+
+(defn port-in-issues
+  "Return a seq of reasons this number may not be ported in right now, empty
+  when it may.
+
+  The refusal that matters here is `:porting/already-present`: a number this
+  operator already has a live record for cannot arrive from somewhere else, and
+  accepting it would create two records that both believe they own a line."
+  [{:keys [records request]}]
+  (let [shape (request-issues request)]
+    (if (seq shape)
+      (vec shape)
+      (let [m (phone/normalize-e164 (:phone/msisdn request))
+            r (first (filter #(= m (:phone/msisdn %)) records))]
+        (cond
+          (not= :in (:phone/direction request))
+          [{:phone/issue :porting/direction-mismatch
+            :phone/direction (:phone/direction request)}]
+
+          (and r (not (contains? #{:foreign :ported-out} (:phone/state r))))
+          [{:phone/issue :porting/already-present
+            :phone/msisdn m
+            :phone/state (:phone/state r)}]
+
+          :else [])))))
+
+(defn control-change-event
+  "The cross-domain signal a port produces, in the shared vocabulary
+  kotoba.phone.lifecycle/takeover-signals names.
+
+  Emitted as DATA rather than acted on, because the thing that must react to it
+  lives in another domain entirely: a card authority lowering the same subject's
+  spend posture (ADR-2607300300 D4). A library that tried to enforce that would
+  need to know about cards; a library that emits the fact does not."
+  [{:phone/keys [msisdn subject direction]} at-ms]
+  {:phone/signal   (if (= :in direction) :number/port-in :number/port-out)
+   :phone/msisdn   (phone/normalize-e164 msisdn)
+   :phone/subject  subject
+   :phone/at-ms    at-ms
+   :phone/takeover? (= :out direction)})

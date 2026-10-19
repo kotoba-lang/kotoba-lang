@@ -1,0 +1,436 @@
+(ns kotobase.projection.datalog
+  "Differential maintenance for Datalog-backed IPLD materialized views."
+  (:require [clojure.set :as set]
+            [clojure.string :as str]
+            [ipld.core :as ipld]
+            [kotobase.projection.publication :as publication]
+            [kotobase.projection :as view]
+            [kotobase.projection.statistics :as statistics]
+            [merkle-lsm.core :as lsm]))
+
+(def frontier-work-format "kotobase/join-frontier-work")
+(def frontier-work-version 1)
+
+(defn- encoded-node [node]
+  (let [bytes (ipld/encode node)]
+    {:node node :bytes bytes :cid (ipld/cid bytes)}))
+
+(defn datalog-var? [value]
+  (and (symbol? value) (str/starts-with? (name value) "?")))
+
+(defn positive-conjunctive-query? [query]
+  (and (not (:rules query))
+       (every? #(and (vector? %) (= 3 (count %))) (:where query))
+       (every? datalog-var? (:find query))))
+
+(defn bounded-single-clause-query?
+  "True when a host can maintain QUERY from a touched-entity MVCC slice.
+  Multi-clause queries need an arrangement/frontier loader and must not use
+  this shortcut merely because their final result is small."
+  [query]
+  (and (positive-conjunctive-query? query) (= 1 (count (:where query)))))
+
+(defn change-bindings
+  "Unify one effective datom delta with a positive triple clause."
+  [clause {:keys [e a v]}]
+  (reduce
+   (fn [bindings [term actual]]
+     (cond
+       (= term '_) bindings
+       (datalog-var? term)
+       (if (and (contains? bindings term) (not= (get bindings term) actual))
+         (reduced nil)
+         (assoc bindings term actual))
+       (= term actual) bindings
+       :else (reduced nil)))
+   {}
+   (map vector clause [e a v])))
+
+(defn change-frontier-seeds
+  "Return distinct bindings produced by anchoring CHANGES to QUERY clauses."
+  [query changes]
+  (when-not (positive-conjunctive-query? query)
+    (throw (ex-info "Join frontier requires positive conjunctive Datalog" {})))
+  (->> changes
+       (mapcat (fn [change]
+                 (keep #(change-bindings % change) (:where query))))
+       distinct vec))
+
+(defn- resolved-term [bindings term]
+  (cond
+    (= term '_) ::unbound
+    (datalog-var? term) (if (contains? bindings term)
+                          (get bindings term) ::unbound)
+    :else term))
+
+(defn clause-lookup
+  "Choose an index/component prefix for CLAUSE under BINDINGS. Nil means the
+  clause cannot be read without an unbounded all-datom scan."
+  [clause bindings]
+  (let [[e-term a-term v-term] clause
+        e (resolved-term bindings e-term)
+        a (resolved-term bindings a-term)
+        v (resolved-term bindings v-term)
+        bound? #(not= ::unbound %)]
+    (cond
+      (bound? e)
+      {:index :eavt
+       :components (cond-> [e] (bound? a) (conj a) (and (bound? a) (bound? v)) (conj v))}
+
+      (and (bound? a) (bound? v))
+      {:index :avet
+       :components (cond-> [a v] (bound? e) (conj e))}
+
+      (bound? a)
+      {:index :aevt :components [a]}
+
+      :else nil)))
+
+(defn unify-datom
+  "Extend BINDINGS when EAV matches CLAUSE, otherwise return nil."
+  [clause bindings [e a v]]
+  (reduce
+   (fn [result [term actual]]
+     (cond
+       (= term '_) result
+       (datalog-var? term)
+       (if (and (contains? result term) (not= (get result term) actual))
+         (reduced nil) (assoc result term actual))
+       (= term actual) result
+       :else (reduced nil)))
+   bindings (map vector clause [e a v])))
+
+(defn frontier-next-bindings
+  "Join one frontier state against already MVCC-visible EAV datoms."
+  [clause bindings datoms]
+  (->> datoms (keep #(unify-datom clause bindings %)) distinct vec))
+
+(defn binding->wire
+  "Canonical IPLD representation of one Datalog binding. Variable map keys are
+  encoded as sorted strings because DAG-CBOR maps cannot portably use symbols."
+  [binding]
+  (->> binding
+       (sort-by (comp name key))
+       (mapv (fn [[variable value]] [(name variable) value]))))
+
+(defn wire->binding
+  "Decode one canonical binding produced by `binding->wire`."
+  [wire]
+  (into {} (map (fn [[variable value]] [(symbol variable) value])) wire))
+
+(defn- valid-block-remainder? [remainder]
+  (and (vector? remainder)
+       (every? (fn [entry]
+                 (and (map? entry)
+                      (string? (:cid entry))
+                      (seq (:cid entry))
+                      (map? (:block entry))))
+               remainder)))
+
+(defn- valid-wire-block-remainder? [remainder]
+  (and (vector? remainder)
+       (every? (fn [entry]
+                 (and (map? entry)
+                      (ipld/link? (get entry "cid"))
+                      (map? (get entry "block"))))
+               remainder)))
+
+(defn decode-frontier-work
+  "Validate and decode a join-frontier work node. The returned `:next-work` is
+  a CID or nil; bindings are ordinary symbol-keyed maps again."
+  [node]
+  (when-not (and (= frontier-work-format (get node "format"))
+                 (= frontier-work-version (get node "version"))
+                 (contains? #{"before" "after"} (get node "snapshot"))
+                 (vector? (get node "remaining"))
+                 (every? nat-int? (get node "remaining"))
+                 (vector? (get node "bindings"))
+                 (let [scan (get node "scan")]
+                   (or (nil? scan)
+                       (and (map? scan)
+                            (nat-int? (get scan "clause-index"))
+                            (contains? #{"eavt" "aevt" "avet" "vaet"}
+                                       (get scan "index"))
+                            (string? (get scan "after"))
+                            (seq (get scan "after"))
+                            (or (nil? (get scan "block-remainder"))
+                                (valid-wire-block-remainder?
+                                 (get scan "block-remainder")))
+                            (some #{(get scan "clause-index")}
+                                  (get node "remaining"))))))
+    (throw (ex-info "Malformed join frontier work node" {:node node})))
+  {:snapshot (keyword (get node "snapshot"))
+   :remaining (get node "remaining")
+   :bindings (mapv wire->binding (get node "bindings"))
+   :scan (when-let [scan (get node "scan")]
+           {:clause-index (get scan "clause-index")
+            :index (keyword (get scan "index"))
+            :after (get scan "after")
+            :block-remainder
+            (mapv (fn [entry]
+                    {:cid (str (ipld/link-cid (get entry "cid")))
+                     :block (get entry "block")})
+                  (or (get scan "block-remainder") []))})
+   :next-work (some-> (get node "next-work") ipld/link-cid)})
+
+(defn build-frontier-work-chain
+  "Encode BINDINGS as a deterministic linked work chain whose every node is at
+  most MAX-BYTES. NEXT-WORK may point at an existing pending chain, allowing a
+  host to prepend the next join wave without rewriting old work. One binding
+  that cannot fit fails closed. Returns nodes in traversal/write order plus the
+  new head CID."
+  [{:keys [snapshot remaining bindings scan next-work max-bytes]}]
+  (when-not (and (contains? #{:before :after} snapshot)
+                 (vector? remaining) (every? nat-int? remaining)
+                 (vector? bindings) (pos-int? max-bytes)
+                 (or (nil? scan)
+                     (and (nat-int? (:clause-index scan))
+                          (some #{(:clause-index scan)} remaining)
+                          (contains? lsm/indexes (:index scan))
+                          (string? (:after scan))
+                          (seq (:after scan))
+                          (valid-block-remainder?
+                           (or (:block-remainder scan) [])))))
+    (throw (ex-info "Invalid join frontier work chain input"
+                    {:snapshot snapshot :remaining remaining
+                     :bindings-type (type bindings) :max-bytes max-bytes})))
+  (letfn [(build [bindings next-work]
+            (let [node (encoded-node
+                        (cond-> {"format" frontier-work-format
+                                 "version" frontier-work-version
+                                 "snapshot" (name snapshot)
+                                 "remaining" remaining
+                                 "bindings" (mapv binding->wire bindings)}
+                          scan (assoc "scan"
+                                      (cond->
+                                       {"clause-index" (:clause-index scan)
+                                        "index" (name (:index scan))
+                                        "after" (:after scan)}
+                                        (seq (:block-remainder scan))
+                                        (assoc
+                                         "block-remainder"
+                                         (mapv (fn [{:keys [cid block]}]
+                                                 {"cid" (ipld/link cid)
+                                                  "block" block})
+                                               (:block-remainder scan)))))
+                          next-work (assoc "next-work" (ipld/link next-work))))]
+              (cond
+                (<= 
+                    max-bytes)
+                {:nodes [node] :head (:cid node)}
+
+                (= 1 (count bindings))
+                (throw (ex-info "Join frontier binding exceeds work byte budget"
+                                {:type :frontier-binding-too-large
+                                 :binding (first bindings)
+                                 :max-bytes max-bytes}))
+
+                :else
+                (let [middle (quot (count bindings) 2)
+                      right (build (subvec bindings middle) next-work)
+                      left (build (subvec bindings 0 middle) (:head right))]
+                  {:nodes (into (:nodes left) (:nodes right))
+                   :head (:head left)}))))]
+    (if (seq bindings)
+      (build bindings next-work)
+      {:nodes [] :head next-work})))
+
+(defn frontier-step-plan
+  "Choose the most selective lookupable remaining clause for every current
+  binding. Returns nil when the frontier would require an all-datom scan."
+  [query remaining-clause-indexes bindings]
+  (let [clauses (vec (:where query))
+        rank {:eavt 0 :avet 1 :aevt 2}
+        candidates
+        (keep
+         (fn [clause-index]
+           (let [clause (nth clauses clause-index)
+                 lookups (mapv #(clause-lookup clause %) bindings)]
+             (when (every? some? lookups)
+               {:clause-index clause-index :clause clause
+                :lookups (mapv (fn [binding lookup]
+                                 {:bindings binding :lookup lookup})
+                               bindings lookups)
+                :score [(apply max (map #(get rank (:index %) 9) lookups))
+                        (- (apply min (map #(count (:components %)) lookups)))
+                        clause-index]})))
+         remaining-clause-indexes)]
+    (when-let [selected (first (sort-by :score candidates))]
+      (assoc selected :remaining
+             (vec (remove #{(:clause-index selected)}
+                          remaining-clause-indexes))))))
+
+(defn- query-with-bindings
+  [query-fn db query visible? inputs bindings]
+  (let [input-vars (vec (remove #{'$} (or (:in query) [])))
+        supplied (zipmap input-vars inputs)]
+    (if (some (fn [[variable value]]
+                (and (contains? supplied variable)
+                     (not= (get supplied variable) value)))
+              bindings)
+      #{}
+      (let [additional (->> (keys bindings)
+                            (remove (set input-vars))
+                            (sort-by name)
+                            vec)
+            bound-query (assoc query :in (vec (concat input-vars additional)))
+            bound-inputs (vec (concat inputs (map bindings additional)))]
+        (query-fn db bound-query visible? bound-inputs)))))
+
+(defn- anchored-results
+  [query-fn db query visible? inputs changes]
+  (into #{}
+        (mapcat
+         (fn [change]
+           (mapcat (fn [clause]
+                     (if-let [bindings (change-bindings clause change)]
+                       (query-with-bindings query-fn db query visible? inputs bindings)
+                       []))
+                   (:where query))))
+        changes))
+
+(defn affected-query-results
+  "Return only result tuples whose membership can change because of effective
+  datom DELTAS. DB-BEFORE/DB-AFTER may be a correctness-complete query slice;
+  they do not need to contain unrelated entities."
+  [{:keys [query-fn db-before db-after query visible? inputs effective-deltas]
+    :or {inputs []}}]
+  (when-not (and (fn? query-fn) (positive-conjunctive-query? query)
+                 (fn? visible?))
+    (throw (ex-info "Affected results require query-fn, a positive conjunctive query, and visible?"
+                    {})))
+  (let [assertions (filterv #(= :assert (:op %)) effective-deltas)
+        retractions (filterv #(= :retract (:op %)) effective-deltas)]
+    (set/union
+     (anchored-results query-fn db-after query visible? inputs assertions)
+     (anchored-results query-fn db-before query visible? inputs retractions))))
+
+(defn- result-exists?
+  [query-fn db query visible? inputs result]
+  (contains? (query-with-bindings query-fn db query visible? inputs
+                                  (zipmap (:find query) result))
+             result))
+
+(defn- result-changes [current next]
+  (vec
+   (concat
+    (map (fn [result] {:result result :op :retract})
+         (sort-by pr-str (set/difference current next)))
+    (map (fn [result] {:result result :op :assert})
+         (sort-by pr-str (set/difference next current))))))
+
+(defn maintain-query-delta
+  "Maintain one set-valued Datalog result after EFFECTIVE-DELTAS.
+
+  Plain positive conjunctive queries use a differential path: each changed
+  datom anchors every compatible clause, and only affected result tuples are
+  checked against the after snapshot. Full Datalog grammar remains correct via
+  deterministic recomputation for negation, aggregation, functions, or rules."
+  [{:keys [query-fn db-before db-after query visible? inputs current-result
+           current-result-complete? effective-deltas]
+    :or {inputs [] current-result-complete? true}}]
+  (when-not (and (fn? query-fn) (fn? visible?))
+    (throw (ex-info "Materialized query requires query-fn and visible?" {})))
+  (let [current (set current-result)]
+    (if (positive-conjunctive-query? query)
+      (let [candidates (affected-query-results
+                        {:query-fn query-fn
+                         :db-before db-before :db-after db-after :query query
+                         :visible? visible? :inputs inputs
+                         :effective-deltas effective-deltas})
+            next (reduce (fn [result candidate]
+                           (if (result-exists? query-fn db-after query visible? inputs candidate)
+                             (conj result candidate)
+                             (disj result candidate)))
+                         current candidates)]
+        {:mode :differential
+         :candidate-count (count candidates)
+         :result (when current-result-complete? next)
+         :changes (result-changes current next)})
+      (let [next (set (query-fn db-after query visible? inputs))]
+        {:mode :recompute
+         :candidate-count (count next)
+         :result next
+         :changes (result-changes current next)}))))
+
+(defn- result->entry [{:keys [result op]}]
+  {:key (view/view-key result) :value result :op op})
+
+(defn refresh-plan
+  "Apply TX-DATA and atomically publish its base flush, refreshed statistics,
+  and every registered Datalog view delta at NEW-EPOCH.
+
+  VIEW-SPECS require :view-id, :query, :visible?, :current-result,
+  :previous-epoch, and :previous-bundle. REGISTERED-VIEW-IDS is the complete
+  registry at the expected head; all registered views are refreshed together."
+  [{:keys [query-fn transact-effective-fn db-before tx-data db-id tenant
+           new-epoch safe-epoch expected-head
+           previous-base-manifest base-statistics query-statistics view-specs
+           registered-view-ids target-run-rows block-rows max-block-bytes]
+    :or {safe-epoch 0 target-run-rows 4096
+         block-rows lsm/default-run-block-rows
+         max-block-bytes lsm/default-run-block-bytes}}]
+  (when-not (and (fn? query-fn) (fn? transact-effective-fn))
+    (throw (ex-info "Refresh requires injected query-fn and transact-effective-fn" {})))
+  (let [view-ids (mapv (comp str :view-id) view-specs)]
+    (when-not (and (integer? new-epoch) (not (neg? new-epoch))
+                   (seq registered-view-ids)
+                   (= (set (map str registered-view-ids)) (set view-ids))
+                   (= (count view-ids) (count (set view-ids))))
+      (throw (ex-info "Refresh must include every registered view exactly once"
+                      {:new-epoch new-epoch
+                       :registered (set (map str registered-view-ids))
+                       :supplied view-ids}))))
+  (let [{:keys [db-after effective-deltas]}
+        (transact-effective-fn db-before tx-data)]
+    (when (empty? effective-deltas)
+      (throw (ex-info "No effective transaction delta to publish" {})))
+    (let [base-plan (lsm/flush-plan
+                     {:db-id db-id :tenant tenant :epoch new-epoch
+                      :safe-epoch safe-epoch :previous previous-base-manifest
+                      :expected expected-head :datoms effective-deltas
+                      :statistics (or base-statistics {})
+                      :target-run-rows target-run-rows
+                      :block-rows block-rows
+                      :max-block-bytes max-block-bytes})
+          base-cid (get-in base-plan [:manifest :cid])
+          refreshed-statistics
+          (statistics/refresh-query-statistics query-statistics
+                                               effective-deltas new-epoch)
+          maintained
+                  (mapv (fn [{:keys [view-id query visible? inputs current-result
+                             current-result-complete? previous-bundle
+                             previous-epoch block-rows max-block-bytes plan-cid]
+                      :as spec}]
+                  (when-not (and (seq (str view-id)) previous-bundle
+                                 (integer? previous-epoch)
+                                 (< previous-epoch new-epoch))
+                    (throw (ex-info "Each refresh view needs an older pinned bundle"
+                                    {:view spec})))
+                  (let [delta (maintain-query-delta
+                               {:query-fn query-fn
+                                :db-before db-before :db-after db-after
+                                :query query :visible? visible? :inputs inputs
+                                :current-result current-result
+                                :current-result-complete?
+                                (if (nil? current-result-complete?)
+                                  true current-result-complete?)
+                                :effective-deltas effective-deltas})
+                        built (view/build-view-delta
+                               {:view-id view-id :epoch new-epoch
+                                :changes (mapv result->entry (:changes delta))
+                                :previous-bundle previous-bundle
+                                :source-manifest base-cid :plan-cid plan-cid
+                                :block-rows (or block-rows 512)
+                                :max-block-bytes max-block-bytes})]
+                    {:view-id view-id :maintenance delta :view built}))
+                view-specs)
+          atomic (publication/build-plan
+                  {:db-id db-id :expected expected-head :base-plan base-plan
+                   :statistics refreshed-statistics
+                   :views (mapv :view maintained)})]
+      {:db-after db-after
+       :effective-deltas effective-deltas
+       :query-statistics refreshed-statistics
+       :views maintained
+       :plan atomic})))

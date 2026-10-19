@@ -1,0 +1,327 @@
+(ns kekkai.node.peer
+  "One peer, end to end: the Noise IK session, the disco path state, and the
+  routing decision that ties them together — pure, so the whole data plane is
+  testable without a socket.
+
+  Design points that took a decision rather than falling out:
+
+  - **The session survives a path change.** A Noise session is bound to the two
+    static keys, not to an address, so roaming from relay to a punched direct
+    path (or between networks) does not re-handshake. `:route` is just where the
+    next datagram goes.
+  - **Disco pings ride inside the encrypted session**, as a framed inner type,
+    not as cleartext next to it. An unauthenticated pong would let anyone move a
+    peer's active path, which is a traffic-hijack primitive; requiring the pong
+    to decrypt under the session means only the real peer can.
+  - **Handshake retries are the initiator's job only**, per
+    `noise.session/handshake-plan`. If both sides retried on the same trigger
+    they would collide indefinitely; the responder answers and waits.
+  - **Every datagram is tagged with its inner type before encryption**, so a data
+    frame can never be mistaken for a disco frame by a peer running a different
+    version — it fails to parse instead of being misinterpreted."
+  (:require [clojure.edn :as edn]
+            [kekkai.node.disco :as disco]
+            [kekkai.node.endpoint :as ep]
+            [kotoba.bytes :as b]
+            [noise.core :as noise]
+            [noise.session :as noise-session]))
+
+(def ^:const magic 0x6b)
+(def ^:const version 1)
+
+(def frame-types {:handshake-init 0x30 :handshake-resp 0x31 :transport 0x32})
+(def ^:private frame-type->kw (into {} (map (fn [[k v]] [v k])) frame-types))
+
+(def inner-types {:data 0x01 :ping 0x02 :pong 0x03 :call-me-maybe 0x04 :keepalive 0x05})
+(def ^:private inner-type->kw (into {} (map (fn [[k v]] [v k])) inner-types))
+
+(defn encode-frame [type payload] (into [magic version (get frame-types type)] (vec payload)))
+
+(defn decode-frame [bytes]
+  (let [bs (vec bytes)]
+    (cond
+      (< (count bs) 3) {:error :short-frame}
+      (not= magic (nth bs 0)) {:error :bad-magic}
+      (not= version (nth bs 1)) {:error :bad-version}
+      :else (if-let [t (frame-type->kw (nth bs 2))]
+              {:type t :payload (subvec bs 3)}
+              {:error :unknown-frame-type :got (nth bs 2)}))))
+
+(defn- encode-inner [type payload] (into [(get inner-types type)] (vec payload)))
+
+(defn- decode-inner [bytes]
+  (let [bs (vec bytes)]
+    (if (empty? bs)
+      {:error :empty-inner}
+      (if-let [t (inner-type->kw (nth bs 0))]
+        {:type t :payload (subvec bs 1)}
+        {:error :unknown-inner-type :got (nth bs 0)}))))
+
+(defn peer
+  "`peer-key` is the peer's static X25519 public key (bytes). `initiator?` decides
+   who dials; the agent sets it from a deterministic rule (lower node id dials)
+   so two nodes do not both initiate."
+  [{:keys [suite static peer-key peer-id prologue relay-region candidates now
+           initiator? disco-config policy]}]
+  {:suite suite
+   :static static
+   :peer-key (vec peer-key)
+   :peer-id peer-id
+   :prologue (vec prologue)
+   :initiator? (boolean initiator?)
+   ;; A *list* of in-flight handshakes, newest first, not a single one. Found by
+   ;; the E2E: a retry that replaces the pending handshake state invalidates the
+   ;; response to the previous attempt, so the peer answers correctly and the
+   ;; initiator rejects it with an authentication failure — indistinguishable, in
+   ;; the log, from a real attack. Whenever the retry interval is shorter than the
+   ;; round trip (a slow link, a busy relay, or a coarse clock) that is the steady
+   ;; state, not a rare race. Keeping the last few lets a late-but-valid response
+   ;; complete.
+   :handshakes []
+   :handshake-seq 0
+   :session-id nil
+   :session nil
+   :attempt nil
+   ;; policy governs both the handshake retry schedule (before there is a
+   ;; session to carry it) and the session's own rekey/keepalive timers
+   :policy (merge noise-session/default-policy policy)
+   :route :relay
+   :endpoint nil
+   :disco (disco/new-peer {:peer-id peer-id :relay-region relay-region
+                           :candidates candidates :now now :config disco-config})
+   :established-at nil})
+
+(defn established? [st] (some? (:session st)))
+
+(defn- route-for [st]
+  (let [active (get-in st [:disco :active])]
+    (if (= :relay active)
+      {:route :relay}
+      {:route :direct :endpoint (get-in st [:disco :paths active :endpoint])})))
+
+(defn- outgoing [st bytes]
+  (merge {:bytes bytes :peer-id (:peer-id st) :peer-key (:peer-key st)} (route-for st)))
+
+(defn dial
+  "Start (or retry) the IK handshake. -> [state datagram] — the datagram is
+   routed by the current path, so a first dial normally goes through the relay
+   and later retries may go direct once a path is live."
+  [{:keys [suite static peer-key prologue] :as st} now-s]
+  (let [i (noise/initiator {:suite suite :s static :rs peer-key :prologue prologue})
+        [i msg1] (noise/write-message i [])
+        id (inc (:handshake-seq st))]
+    [(assoc st
+            :handshakes (vec (take 3 (cons {:id id :hs i} (:handshakes st))))
+            :handshake-seq id
+            :attempt (let [a (:attempt st)]
+                       {:attempts (inc (:attempts a 0))
+                        :last-at now-s
+                        :started-at (:started-at a now-s)}))
+     (outgoing st (encode-frame :handshake-init msg1))]))
+
+(defn- inner-event [st {:keys [type payload]} now-ms from-endpoint]
+  (case type
+    :data {:event :data :payload payload}
+    :ping {:event :ping :tx-id (apply str (map char payload)) :endpoint from-endpoint}
+    :pong {:event :pong :tx-id (apply str (map char payload)) :endpoint from-endpoint}
+    :call-me-maybe {:event :call-me-maybe
+                    :candidates (try (edn/read-string (apply str (map char payload)))
+                                     (catch  _ nil))}
+    :keepalive {:event :keepalive}
+    {:event :ignored :type type :at now-ms}))
+
+(defn on-datagram
+  "-> {:state … :send […] :events […]}. `from-endpoint` is the socket address the
+   datagram arrived from (nil when it came via the relay), used to learn that a
+   candidate works: a *ping that decrypts* from an address is proof of a working
+   inbound path, which is how a hole punch is detected."
+  [{:keys [suite static prologue] :as st} {:keys [bytes now-s now-ms from-endpoint]}]
+  (let [{:keys [type payload error]} (decode-frame bytes)]
+    (cond
+      error {:state st :send [] :events [{:event :dropped :reason error}]}
+
+      (= :handshake-init type)
+      ;; A peer dialling us. We answer even if we also have a session in flight;
+      ;; the last completed handshake wins, which is WireGuard's rule and avoids
+      ;; a deadlock when both sides dial at once.
+      (try
+        (let [r (noise/responder {:suite suite :s static :prologue prologue})
+              [r _] (noise/read-message r payload)
+              [r msg2] (noise/write-message r [])]
+          (if-not (= (vec (noise/remote-static r)) (:peer-key st))
+            ;; The handshake authenticated a key that is not the one the netmap
+            ;; assigned to this peer id. Refuse: this is the check that keeps an
+            ;; authorized node from impersonating another node's name.
+            {:state st :send []
+             :events [{:event :wrong-static-key :expected (b/hex (:peer-key st))
+                       :got (b/hex (vec (noise/remote-static r)))}]}
+            {:state (assoc st
+                           :session (noise/session r {:now now-s :peer-id (:peer-id st) :policy (:policy st)})
+                           :handshakes [] :attempt nil :established-at now-s)
+             :send [(outgoing st (encode-frame :handshake-resp msg2))]
+             :events [{:event :established :role :responder}]}))
+        (catch  e
+          {:state st :send [] :events [{:event :handshake-failed :reason (ex-message e)}]}))
+
+      (= :handshake-resp type)
+      (if (empty? (:handshakes st))
+        {:state st :send [] :events [{:event :dropped :reason :unexpected-handshake-resp}]}
+        ;; try every in-flight attempt: the response may belong to an earlier one
+        (loop [hs (:handshakes st) errs []]
+          (if (empty? hs)
+            {:state st :send []
+             :events [{:event :handshake-failed :reason (first errs)
+                       :attempts-tried (count (:handshakes st))}]}
+            (let [{:keys [id]} (first hs)
+                  r (try (first (noise/read-message (:hs (first hs)) payload))
+                         (catch  e
+                           {:error (ex-message e)}))]
+              (cond
+                (:error r) (recur (rest hs) (conj errs (:error r)))
+
+                ;; valid, but for an attempt older than the session we already
+                ;; hold — responses can arrive out of order
+                (and (:session-id st) (< id (:session-id st)))
+                {:state st :send [] :events [{:event :stale-handshake-resp :id id
+                                              :current (:session-id st)}]}
+
+                :else
+                ;; Note what is NOT cleared: `:handshakes`. Keeping the attempts
+                ;; after establishing is what lets a late response be *verified*
+                ;; and then reported as stale, instead of arriving as an
+                ;; unidentifiable "unexpected handshake response" — the
+                ;; difference between a log line that explains a race and one that
+                ;; looks like an attack. They are dropped when the session ends.
+                {:state (assoc st
+                               :session (noise/session r {:now now-s :peer-id (:peer-id st)
+                                                          :policy (:policy st)})
+                               :session-id id
+                               :attempt nil :established-at now-s)
+                 :send [] :events [{:event :established :role :initiator :attempt id}]})))))
+
+      (and (= :transport type) (:session st))
+      (try
+        (let [[sess inner] (noise/decrypt (:session st) payload {:now now-s})
+              decoded (decode-inner inner)
+              st (assoc st :session sess)]
+          (if (:error decoded)
+            {:state st :send [] :events [{:event :dropped :reason (:error decoded)}]}
+            (let [ev (inner-event st decoded now-ms from-endpoint)
+                  ;; a decrypted ping/pong from an address proves that path works
+                  st (cond-> st
+                       (and from-endpoint (#{:ping :pong} (:type decoded)))
+                       (update :disco disco/on-pong from-endpoint now-ms
+                               {:tx-id (:tx-id ev)}))]
+              {:state st :send [] :events [ev]})))
+        (catch  e
+          {:state st :send [] :events [{:event :dropped :reason :auth-failed
+                                        :detail (ex-message e)}]}))
+
+      :else {:state st :send [] :events [{:event :dropped :reason :no-session}]})))
+
+(defn- emit [st inner now-s]
+  (let [[sess frame] (noise/encrypt (:session st) inner {:now now-s})]
+    [(assoc st :session sess) (outgoing st (encode-frame :transport frame))]))
+
+(defn send-data [st payload now-s]
+  (when-not (established? st)
+    (throw (ex-info "peer session not established" {:peer (:peer-id st)})))
+  (emit st (encode-inner :data payload) now-s))
+
+(defn send-ping
+  "A disco ping to one specific endpoint — bypasses the active route, because the
+   whole point is probing a path that is not active yet."
+  [st endpoint tx-id now-s]
+  (let [[st dg] (emit st (encode-inner :ping (b/utf8-encode tx-id)) now-s)]
+    [st (assoc dg :route :direct :endpoint endpoint)]))
+
+(defn send-pong [st endpoint tx-id now-s]
+  (let [[st dg] (emit st (encode-inner :pong (b/utf8-encode tx-id)) now-s)]
+    [st (assoc dg :route :direct :endpoint endpoint)]))
+
+(defn send-call-me-maybe
+  "Our candidate list, over the relay (the only path that exists yet)."
+  [st candidates now-s]
+  (let [[st dg] (emit st (encode-inner :call-me-maybe
+                                       (b/utf8-encode (pr-str (vec candidates))))
+                      now-s)]
+    [st (assoc dg :route :relay :endpoint nil)]))
+
+(defn send-keepalive [st now-s]
+  (emit st (encode-inner :keepalive []) now-s))
+
+(defn note-call-me-maybe [st candidates now-ms]
+  (update st :disco disco/on-call-me-maybe candidates now-ms))
+
+(defn tick
+  "Everything due for this peer. -> {:state … :send […] :events […]}
+
+   Ordering matters: the session's own advice (`:expire` / `:rekey`) is applied
+   before disco's, so a session that must die is not first handed a keepalive."
+  [st {:keys [now-s now-ms local-candidates]}]
+  (let [sess (:session st)
+        advice (when sess (noise/advice sess now-s))]
+    (cond
+      ;; dead session: drop it and let the next tick redial
+      (and sess (contains? advice :expire))
+      {:state (assoc st :session nil :session-id nil :handshakes []
+                     :established-at nil)
+       :send [] :events [{:event :expired :peer (:peer-id st)}]}
+
+      ;; no session: dial on the initiator side, on the retry schedule
+      (nil? sess)
+      (if-not (:initiator? st)
+        {:state st :send [] :events []}
+        (case (noise/handshake-plan (:attempt st) now-s (:policy st))
+          :send (let [[st dg] (dial st now-s)]
+                  {:state st :send [dg] :events [{:event :dialing :peer (:peer-id st)}]})
+          :give-up {:state (assoc st :attempt nil) :send []
+                    :events [{:event :handshake-gave-up :peer (:peer-id st)}]}
+          {:state st :send [] :events []}))
+
+      :else
+      (let [{disco' :state :keys [pings switch-to call-me-maybe?]}
+            (disco/advice (:disco st) now-ms)
+            st (assoc st :disco disco')
+            ;; disco pings
+            [st sends] (reduce (fn [[st out] {:keys [endpoint tx-id]}]
+                                 (let [[st dg] (send-ping st endpoint tx-id now-s)]
+                                   [st (conj out dg)]))
+                               [st []] pings)
+            st (update st :disco disco/record-pings pings now-ms)
+            ;; candidate signalling for the hole punch
+            [st sends] (if (and call-me-maybe? (seq local-candidates))
+                         (let [[st dg] (send-call-me-maybe st local-candidates now-s)]
+                           [(update st :disco disco/record-call-me-maybe now-ms)
+                            (conj sends dg)])
+                         [st sends])
+            ;; path change
+            st (cond-> st switch-to (update :disco disco/activate switch-to))
+            ;; keepalive / rekey
+            [st sends] (if (contains? advice :keepalive)
+                         (let [[st dg] (send-keepalive st now-s)] [st (conj sends dg)])
+                         [st sends])]
+        {:state st
+         :send sends
+         :events (cond-> []
+                   switch-to (conj {:event :path-changed :peer (:peer-id st) :to switch-to})
+                   (contains? advice :rekey) (conj {:event :rekey-due :peer (:peer-id st)}))}))))
+
+(defn summary [st now-ms]
+  {:peer (:peer-id st)
+   :established? (established? st)
+   :route (:route (route-for st))
+   :path (get-in st [:disco :active])
+   :latency-ms (get-in st [:disco :paths (get-in st [:disco :active]) :latency-ms])
+   :sent (get-in st [:session :sent])
+   :received (get-in st [:session :received])
+   :report (first (disco/path-report [(:disco st)] now-ms))})
+
+(defn should-initiate?
+  "Deterministic tie-break so two peers do not dial each other simultaneously:
+   the lexicographically smaller node id initiates. Cheap, stable, and it means a
+   handshake collision is a transient rather than a steady state."
+  [self-id peer-id]
+  (neg? (compare (str self-id) (str peer-id))))
+
+(def default-policy noise-session/default-policy)

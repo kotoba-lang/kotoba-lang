@@ -1,0 +1,240 @@
+(ns filecoin.signer.eth
+  "The delegated (FEVM) sender path — signing as an `f410f` account.
+
+  A message *from* an Ethereum-style account is not a Filecoin message that
+  happens to be signed differently. It is an **Ethereum transaction**, and the
+  Filecoin message is a re-encoding of it that the node reconstructs and
+  checks byte-for-byte. `consensus.AuthenticateMessage` does exactly this:
+
+      EthTransactionFromSignedFilecoinMessage(msg)   ; message  -> tx
+      tx.ToUnsignedFilecoinMessage(msg.From)         ; tx -> message
+      msg.Message.Equals(that)                       ; must be identical
+      verify(signature, over tx.ToRlpUnsignedMsg())  ; only then
+
+  So there are two ways to fail and they report differently: a mapping that
+  does not round-trip gives `Ethereum transaction roundtrip mismatch`, and a
+  bad signature gives `signature verification failed`. The live probe uses
+  that difference as its evidence.
+
+  ## The three things that are easy to get backwards
+
+  **RLP field order is not the message's field order.** The transaction is
+
+      0x02 ‖ RLP[ chainId, nonce, maxPriorityFeePerGas, maxFeePerGas,
+                  gasLimit, to, value, input, [] ]
+
+  — **priority fee before max fee**. The Filecoin message carries
+  `GasFeeCap` before `GasPremium`, which is the other way round. Swapping
+  them yields a perfectly well-formed transaction that signs for different
+  gas terms, and the node reports it as a roundtrip mismatch rather than as
+  what it is.
+
+  **RLP integers are minimal.** Leading zero bytes are stripped, so zero
+  encodes as the *empty* byte string, not as `0x00`. `removeLeadingZeros` in
+  lotus; `minimal` here.
+
+  **Empty input means empty params, not empty CBOR.** `getFilecoinMethodInfo`
+  wraps the calldata in a CBOR byte string only `if len(input) > 0`. A
+  zero-length input gives a zero-length `Params` — writing `0x40` (CBOR empty
+  byte string) there breaks the round-trip.
+
+  ## What this does not do
+
+  Only EIP-1559 (type 2). Legacy EIP-155 delegated messages exist on chain —
+  this repo's vectors contain one — and carry a different signature shape
+  (`0x02` prefix, multi-byte `v`, 67 bytes). Reading them is `filecoin.signer`'s
+  refusal; producing them is not implemented."
+  (:require [eth-crypto.core :as eth]
+            [filecoin.address :as addr]
+            [filecoin.method :as method]
+            [filecoin.signature :as sig]))
+
+(def ^:const eip-1559-tx-type 0x02)
+
+(def chain-ids
+  "`buildconstants.Eip155ChainId`. Part of the signed payload, so a mainnet
+  signature is not replayable on calibration and vice versa."
+  {:mainnet 314 :calibration 314159})
+
+(def address-network
+  "Which of the two *address* networks a chain uses.
+
+  There are three chains and only two address prefixes: an address says
+  mainnet (`f`) or testnet (`t`) and nothing more, while the chain id — the
+  thing that actually stops a calibration signature being replayed on
+  mainnet — lives in the signed transaction. `filecoin.address` therefore
+  rejects `:calibration`, correctly; it is a testnet as far as an address is
+  concerned."
+  {:mainnet :mainnet :calibration :testnet :testnet :testnet})
+
+(defn- ->ints [x]
+  (cond (nil? x) []
+        (vector? x) (mapv #(bit-and (int %) 0xff) x)
+        (string? x) (->ints (eth/hex->bytes x))
+        :else (mapv #(bit-and (int %) 0xff) (seq x))))
+
+(defn- ->platform-bytes [ints]
+  )
+
+(defn- ->rlp-bytes
+  "A byte string as RLP wants it, which is **not** the same shape as
+  `->platform-bytes` under ClojureScript.
+
+  `eth-crypto`'s cljs RLP tells a byte string from a list by JS type: a JS
+  array is a byte string, a cljs vector is a list. Passing a cljs vector of
+  ints therefore encodes each byte as its own nested item and then fails
+  trying to count a number. On the JVM the distinction is free, because a
+  byte-array and a seq are different types anyway — so this is a fault that
+  can only appear on one runtime, and only at the RLP boundary."
+  [ints]
+  )
+
+(defn- big->bytes
+  "A non-negative decimal string as big-endian bytes, no leading zeros."
+  [v]
+  (let [n 
+        h 
+        h (if (odd? (count h)) (str "0" h) h)]
+    (if (= "00" h) [] (->ints (eth/hex->bytes h)))))
+
+(defn minimal
+  "RLP wants integers minimal: no leading zero bytes, and zero is the **empty**
+  byte string. `0x00` would be a one-byte string with a different encoding."
+  [bs]
+  (vec (drop-while zero? (->ints bs))))
+
+;; ── the account ──────────────────────────────────────────────────────────────
+
+(defn eth-address
+  "The `0x…` address a private key controls — keccak-256 of the 64-byte public
+  key, last 20 bytes. Lowercase, because this goes into RLP as bytes and a
+  checksum is a display concern."
+  [privkey]
+  (str "0x" (eth/bytes->hex
+             (->platform-bytes
+              (vec (drop 12 (->ints (eth/keccak256
+                                     (->platform-bytes
+                                      (->ints (eth/private->public
+                                               (->platform-bytes (->ints privkey)))))))))))))
+
+(defn address
+  "The `f410f…` address for the same key — an `f4` in the EAM namespace over
+  those same 20 bytes. This is the message's `From`."
+  ([privkey] (address privkey :mainnet))
+  ([privkey network]
+   (addr/from-eth-address (eth-address privkey)
+                          (get address-network network network))))
+
+(defn address-string [privkey & [network]]
+  (addr/to-string (address privkey (or network :mainnet))))
+
+;; ── the transaction ──────────────────────────────────────────────────────────
+
+(defn transaction
+  "Normalise an EIP-1559 transaction.
+
+      (transaction {:chain-id 314159 :nonce 0 :to \"0x…\" :value \"0\"
+                    :max-fee-per-gas \"100000\" :max-priority-fee-per-gas \"1000\"
+                    :gas-limit 1000000 :input calldata})
+
+  `:to` may be an `0x…` or an `f410f…`; it is carried as 20 raw bytes."
+  [m]
+  (let [to (:to m)
+        to-hex (cond (nil? to) nil
+                     (and (string? to) (or (= "f4" (subs to 0 2))
+                                           (= "t4" (subs to 0 2))))
+                     (addr/to-eth-address (addr/from-string to))
+                     (map? to) (addr/to-eth-address to)
+                     :else to)]
+    {:chain-id (:chain-id m)
+     :nonce (:nonce m 0)
+     :to (when to-hex (->ints to-hex))
+     :value (str (:value m "0"))
+     :max-fee-per-gas (str (:max-fee-per-gas m "0"))
+     :max-priority-fee-per-gas (str (:max-priority-fee-per-gas m "0"))
+     :gas-limit (:gas-limit m 0)
+     :input (->ints (:input m))}))
+
+(defn rlp-fields
+  "`packTxFields`. The order is EIP-1559's, **not** the Filecoin message's:
+  priority fee comes before max fee."
+  [tx]
+  [(->rlp-bytes (minimal (big->bytes (str (:chain-id tx)))))
+   (->rlp-bytes (minimal (big->bytes (str (:nonce tx)))))
+   (->rlp-bytes (minimal (big->bytes (:max-priority-fee-per-gas tx))))
+   (->rlp-bytes (minimal (big->bytes (:max-fee-per-gas tx))))
+   (->rlp-bytes (minimal (big->bytes (str (:gas-limit tx)))))
+   (->rlp-bytes (or (:to tx) []))
+   (->rlp-bytes (minimal (big->bytes (:value tx))))
+   (->rlp-bytes (:input tx))
+   []])   ; access list — a cljs VECTOR here, i.e. an RLP list, not a byte string
+
+(defn rlp-unsigned
+  "`ToRlpUnsignedMsg`: the type byte then the RLP. This is what gets hashed."
+  [tx]
+  (into [eip-1559-tx-type] (->ints (eth/rlp-encode (rlp-fields tx)))))
+
+(defn signing-digest
+  "keccak-256 of the unsigned RLP — the 32 bytes an ECDSA signer operates on.
+
+  Note this is keccak, not BLAKE2b, and it is over the transaction, not over
+  the message CID. That is the whole difference between this path and
+  `filecoin.signer`."
+  [tx]
+  (->ints (eth/keccak256 (->platform-bytes (rlp-unsigned tx)))))
+
+;; ── the message ──────────────────────────────────────────────────────────────
+
+(defn ->message
+  "`ToUnsignedFilecoinMessage`. The node rebuilds this from the transaction
+  and requires it byte-identical, so every field here is load-bearing."
+  [tx from]
+  {:version 0
+   :to (addr/from-eth-address
+        (str "0x" (eth/bytes->hex (->platform-bytes (:to tx))))
+        (get address-network (:network from :mainnet) :mainnet))
+   :from from
+   :nonce (:nonce tx)
+   :value (:value tx)
+   :gas-limit (:gas-limit tx)
+   :gas-fee-cap (:max-fee-per-gas tx)
+   :gas-premium (:max-priority-fee-per-gas tx)
+   :method method/invoke-contract
+   ;; CBOR byte string ONLY when there is input. `getFilecoinMethodInfo`
+   ;; guards on `len(input) > 0`, so an empty input gives empty params —
+   ;; writing 0x40 here breaks the round-trip.
+   :params (if (seq (:input tx))
+             (let [n (count (:input tx))
+                   header (cond (< n 24) [(bit-or 0x40 n)]
+                                (< n 256) [0x58 n]
+                                :else [0x59 (quot n 256) (mod n 256)])]
+               (into (vec header) (:input tx)))
+             [])})
+
+(defn signature
+  "The delegated signature: `pad32(r) ‖ pad32(s) ‖ v`, 65 bytes, `v` ∈ {0,1}."
+  [privkey tx]
+  (let [{:keys [r s recovery-id]}
+        (eth/secp256k1-sign (->platform-bytes (->ints privkey))
+                            (->platform-bytes (signing-digest tx)))
+        pad32 (fn [n]
+                (let [h 
+                      h (str (apply str (repeat (- 64 (count h)) "0")) h)]
+                  (->ints (eth/hex->bytes h))))]
+    (sig/signature sig/delegated
+                   (conj (into (pad32 r) (pad32 s)) recovery-id))))
+
+(defn sign-message
+  "The whole delegated path: transaction → message + type-3 signature.
+
+      (sign-message priv {:chain-id 314159 :to contract :input calldata
+                          :nonce 0 :gas-limit 1000000
+                          :max-fee-per-gas \"100000\"
+                          :max-priority-fee-per-gas \"1000\"}
+                    :calibration)"
+  ([privkey tx-map] (sign-message privkey tx-map :mainnet))
+  ([privkey tx-map network]
+   (let [tx (transaction (assoc tx-map :chain-id
+                                (or (:chain-id tx-map) (get chain-ids network))))
+         from (address privkey network)]
+     (sig/signed-message (->message tx from) (signature privkey tx)))))

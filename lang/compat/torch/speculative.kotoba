@@ -1,0 +1,142 @@
+(ns torch.speculative
+  "Speculative decoding and multi-token-prediction (MTP) verification."
+  (:require [num.array :as arr]
+            [torch.generate :as generate]))
+
+(defn argmax [xs]
+  (first (apply max-key second (map-indexed vector xs))))
+
+(defn probabilities [logits]
+  (let [m (apply max logits)
+        es (mapv #(Math/exp (- % m)) logits)
+        z (reduce + es)]
+    (mapv #(/ % z) es)))
+
+(defn mtp-draft
+  "Select one proposal from each MTP head."
+  [head-logits]
+  (mapv argmax head-logits))
+
+(defn mtp-draft-candidates
+  "Select one proposal from each bounded device candidate set. `options` may be
+  one shared sampling map or one map per MTP head. This keeps MTP logits on the
+  device when each head has already produced exact top-k candidates."
+  [head-candidates options]
+  (let [options (if (map? options) (repeat options) options)]
+    (mapv generate/sample-candidates head-candidates options)))
+
+(defn verify-greedy-tokens
+  "Verify a draft against target argmax token IDs. Target runtimes can produce
+  these IDs with device row argmax, without materializing target logits."
+  [draft-tokens target-tokens]
+  (let [target-tokens (vec target-tokens)
+        accepted (count (take-while true? (map = draft-tokens target-tokens)))
+        all-accepted? (= accepted (count draft-tokens))
+        correction (nth target-tokens accepted nil)]
+    {:tokens (cond-> (subvec (vec draft-tokens) 0 accepted)
+               correction (conj correction))
+     :drafted (count draft-tokens) :accepted accepted
+     :all-accepted? all-accepted?}))
+
+(defn verify-greedy [draft-tokens target-logits]
+  (verify-greedy-tokens draft-tokens (mapv argmax target-logits)))
+
+(defn- sample-index [probs random-value]
+  (loop [i 0 cumulative 0.0]
+    (let [next (+ cumulative (nth probs i))]
+      (if (or (<= random-value next) (= i (dec (count probs)))) i
+          (recur (inc i) next)))))
+
+(defn verify-stochastic
+  "Leviathan rejection sampling. target/draft distributions correspond to
+  each draft token; random-values contains acceptance draws plus one residual
+  sampling draw when rejection occurs."
+  [draft-tokens draft-probs target-probs random-values]
+  (loop [i 0 accepted [] draws random-values]
+    (if (= i (count draft-tokens))
+      {:tokens accepted :drafted i :accepted i :all-accepted? true}
+      (let [token (nth draft-tokens i)
+            p (double (get-in target-probs [i token] 0.0))
+            q (double (get-in draft-probs [i token] 0.0))
+            accept-prob (min 1.0 (/ p (max q 1.0e-30)))
+            draw (double (first draws))]
+        (if (<= draw accept-prob)
+          (recur (inc i) (conj accepted token) (rest draws))
+          (let [residual (mapv #(max 0.0 (- %1 %2))
+                               (nth target-probs i) (nth draft-probs i))
+                z (reduce + residual)
+                residual (if (pos? z) (mapv #(/ % z) residual)
+                             (nth target-probs i))]
+            {:tokens (conj accepted (sample-index residual (double (second draws))))
+             :drafted (count draft-tokens) :accepted i
+             :all-accepted? false}))))))
+
+(defn verify-stochastic-device
+  "Verify one speculative proposal directly from device-resident target and
+  draft logits. The backend performs full-distribution temperature softmax,
+  acceptance, and positive-residual sampling and returns only 8 bytes. This
+  intentionally does not approximate top-k/top-p filtered distributions."
+  [target-logits draft-logits row draft-token options]
+  (let [result (arr/speculative-rejection-row
+                target-logits draft-logits row draft-token options)
+        finish (fn [{:keys [accepted? token]}]
+                 {:tokens [token] :drafted 1
+                  :accepted (if accepted? 1 0)
+                  :all-accepted? accepted?})]
+    ))
+
+(defn make-mtp-step-fn
+  "Build a `torch.continuous` compatible MTP step from injected model forwards.
+
+  `draft-fn` receives `[request runtimes request-id draft-limit]` and returns
+  `{:tokens [...], :logits draft-logits}`. `target-fn` receives
+  `[request runtimes request-id draft-tokens]` and returns aligned
+  `{:logits target-logits, :next-logits logits, :runtimes committed-runtimes}`.
+  The target forward owns KV commit/rollback and must return runtimes containing
+  exactly the verified prefix plus correction token.
+
+  Target and draft distributions stay on their num backend. Verification uses
+  `num.array/speculative-rejection-rows`, transferring only one 8-byte decision
+  per attempted draft token. Both injected forwards may be synchronous on the
+  JVM or Promise-returning on a CLJS/WebGPU host."
+  [{:keys [draft-fn target-fn draft-token-count verify-options]
+    :or {draft-token-count 4 verify-options {:temperature 1.0}}}]
+  (when-not (and (fn? draft-fn) (fn? target-fn)
+                 (pos-int? draft-token-count))
+    (throw (ex-info "MTP execution requires draft/target forwards and a positive draft count"
+                    {:draft-fn? (fn? draft-fn) :target-fn? (fn? target-fn)
+                     :draft-token-count draft-token-count})))
+  (fn [request runtimes request-id max-tokens]
+    (let [limit (min draft-token-count max-tokens)
+          verify-result
+          (fn [draft-result target-result]
+            (let [draft-tokens (vec (:tokens draft-result))]
+              (when-not (and (pos? (count draft-tokens))
+                             (<= (count draft-tokens) limit)
+                             (:logits draft-result)
+                             (:logits target-result)
+                             (:next-logits target-result)
+                             (vector? (:runtimes target-result)))
+                (throw (ex-info "invalid MTP forward result"
+                                {:draft-limit limit
+                                 :draft-token-count (count draft-tokens)
+                                 :draft-logits? (boolean (:logits draft-result))
+                                 :target-logits? (boolean (:logits target-result))
+                                 :next-logits? (boolean (:next-logits target-result))
+                                 :target-runtimes? (vector? (:runtimes target-result))})))
+              (let [verified (arr/speculative-rejection-rows
+                              (:logits target-result) (:logits draft-result)
+                              draft-tokens verify-options)
+                    finish (fn [result]
+                             (assoc result
+                                    :logits (:next-logits target-result)
+                                    :runtimes (:runtimes target-result)))]
+                )))
+          draft-result (draft-fn request runtimes request-id limit)]
+      )))
+
+(defn metrics [results]
+  (let [drafted (reduce + 0 (map :drafted results))
+        accepted (reduce + 0 (map :accepted results))]
+    {:steps (count results) :drafted drafted :accepted accepted
+     :acceptance-rate (if (zero? drafted) 0.0 (/ (double accepted) drafted))}))

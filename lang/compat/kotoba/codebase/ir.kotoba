@@ -1,0 +1,194 @@
+(ns kotoba.codebase.ir
+  "Structural access to the canonical semantic IR.
+
+  `semantic-code` owns how a checked definition BECOMES canonical bytes. This
+  namespace owns reading those bytes back: decoding IPLD links to CID strings,
+  enumerating the definition CIDs a block depends on, and rewriting one
+  dependency CID to another.
+
+  Rewriting is what makes a Unison-style update propagate. A definition's
+  dependencies are CIDs, so changing a dependency necessarily changes every
+  dependent identity; the alternative -- re-parsing dependent SOURCE -- would
+  reintroduce exactly the name-based resolution the semantic layer removed."
+  (:require [cbor.core :as cbor]
+            [kotoba.codebase.semantic-code :as semantic]
+            [multiformats.core :as mf]))
+
+(defn cid-link?
+  "Whether VALUE is a DAG-CBOR tag-42 IPLD link."
+  [value]
+  (and (map? value) (= 42 (:n value)) (some? (:value value))))
+
+(defn link->cid
+  "Decode a tag-42 IPLD link to its base32 CIDv1 string.
+
+  The leading 0x00 multibase-identity prefix is required by DAG-CBOR; a link
+  without it is malformed rather than a differently-encoded CID."
+  [link]
+  (when-not (cid-link? link)
+    (throw (ex-info "value is not an IPLD CID link"
+                    {:problem :codebase/invalid-cid-link :value link})))
+  (let [bytes (:value link)]
+    (when-not (and (pos? )
+                   (zero? ))
+      (throw (ex-info "IPLD CID link is missing its identity prefix"
+                      {:problem :codebase/invalid-cid-link})))
+    (str "b" (mf/base32
+              ))))
+
+(defn cid->link
+  "Encode a CID string as the canonical tag-42 IPLD link."
+  [cid]
+  (semantic/cid-link cid))
+
+;; ---------------------------------------------------------------------------
+;; Reference traversal
+
+(defn- expression-map? [node]
+  (and (map? node) (string? (get node "op"))))
+
+(defn expression-references
+  "Every definition CID referenced by an IR expression, in traversal order."
+  [node]
+  (letfn [(walk [node acc]
+            (cond
+              (cbor/tagged? node) acc
+
+              (expression-map? node)
+              (let [acc (if (= "reference" (get node "op"))
+                          (conj acc (link->cid (get node "cid")))
+                          acc)]
+                (reduce (fn [acc [k v]]
+                          (if (= "cid" k) acc (walk v acc)))
+                        acc
+                        node))
+
+              (map? node) (reduce (fn [acc [_ v]] (walk v acc)) acc node)
+              (sequential? node) (reduce (fn [acc v] (walk v acc)) acc node)
+              :else acc))]
+    (vec (distinct (walk node [])))))
+
+(defn block-kind
+  "Schema tag of a stored block."
+  [block]
+  (get block "schema"))
+
+(defn declared-dependencies
+  "The `dependencies` field of a definition or recursive-group block."
+  [block]
+  (mapv link->cid (get block "dependencies" [])))
+
+(def derived-identity-fields
+  "Fields whose links are CIDs of contract STRINGS, not of stored blocks.
+
+  A traversal that follows them reports two blocks missing on every hydration,
+  forever, because they were never meant to exist."
+  #{"profile" "hashContract"})
+
+(defn block-links
+  "Every CID a block links to that could be a stored block.
+
+  Deliberately structural rather than schema-aware. The schema-aware version
+  this replaces had to be taught each block kind, and was wrong twice at once:
+  it did not know a namespace commit links its parents and bindings -- so
+  hydrating from a head fetched exactly one block and stopped -- and it looked
+  for a recursive group's members under a field name the group does not have.
+  Enumerating the links that are actually present cannot fall behind a new
+  block kind."
+  [block]
+  (letfn [(walk [node acc]
+            (cond
+              (cid-link? node) (conj acc (link->cid node))
+              (map? node) (reduce (fn [acc [key value]]
+                                    (if (contains? derived-identity-fields key)
+                                      acc
+                                      (walk value acc)))
+                                  acc node)
+              (sequential? node) (reduce (fn [acc value] (walk value acc)) acc node)
+              :else acc))]
+    (vec (distinct (walk block [])))))
+
+(defn outbound-cids
+  "Every CID this block depends on for its MEANING.
+
+  A recursive member carries no dependency list of its own -- its group holds
+  them -- so the group link is part of this set."
+  [block]
+  (vec (distinct (concat (declared-dependencies block)
+                         (when-let [group (get block "group")]
+                           [(link->cid group)])))))
+
+(defn- rewrite-node
+  "Replace every `reference` link found in SUBSTITUTIONS.
+
+  `cbor/tagged?` is tested before `map?` on purpose: a CBOR tag is a record, so
+  it answers `map?` and a naive `(into {} ...)` rebuild would silently turn
+  every IPLD link in the block into a plain map and change its bytes."
+  [node substitutions]
+  (cond
+    (cbor/tagged? node) node
+
+    (and (expression-map? node) (= "reference" (get node "op")))
+    (let [cid (link->cid (get node "cid"))]
+      (if-let [replacement (get substitutions cid)]
+        (assoc node "cid" (cid->link replacement))
+        node))
+
+    (map? node)
+    (into {} (map (fn [[k v]] [k (rewrite-node v substitutions)])) node)
+
+    (sequential? node) (mapv #(rewrite-node % substitutions) node)
+    :else node))
+
+(defn- rewrite-dependency-list [block substitutions]
+  (if-let [declared (get block "dependencies")]
+    (assoc block "dependencies"
+           (->> declared
+                (map link->cid)
+                (map #(get substitutions % %))
+                sort
+                distinct
+                (mapv cid->link)))
+    block))
+
+(defn- rewrite-group-link [block substitutions]
+  (if-let [group (get block "group")]
+    (let [cid (link->cid group)]
+      (if-let [replacement (get substitutions cid)]
+        (assoc block "group" (cid->link replacement))
+        block))
+    block))
+
+(defn substitute-dependencies
+  "Rewrite BLOCK so every dependency CID in SUBSTITUTIONS points at its
+  replacement, returning `{:block :cid :changed?}`.
+
+  The IR reference links, the declared dependency list, and a recursive
+  member's group link are all rewritten. Leaving any of them behind would
+  produce a block whose stated dependencies disagree with the ones it actually
+  calls -- and a recursive member whose group moved but whose link did not
+  would still evaluate the OLD group."
+  [block substitutions]
+  (let [rewritten (-> block
+                      (cond-> (contains? block "ir")
+                        (update "ir" rewrite-node substitutions))
+                      ;; `body` is the KIR-derived block's expression field, as
+                      ;; `ir` is the surface one. Both identity layers put
+                      ;; their reference links inside their own field, and a
+                      ;; substitution that rewrote only one of them would
+                      ;; leave the other pointing at a superseded definition.
+                      (cond-> (contains? block "body")
+                        (update "body" rewrite-node substitutions))
+                      (cond-> (contains? block "members")
+                        (update "members" rewrite-node substitutions))
+                      (rewrite-dependency-list substitutions)
+                      (rewrite-group-link substitutions))
+        changed? (not= (vec (cbor/encode block)) (vec (cbor/encode rewritten)))]
+    {:block rewritten
+     :cid (if changed? (semantic/block-cid rewritten) nil)
+     :changed? changed?}))
+
+(defn definition-block?
+  "Whether BLOCK is a directly evaluable definition (not a recursive member)."
+  [block]
+  (= semantic/schema (block-kind block)))

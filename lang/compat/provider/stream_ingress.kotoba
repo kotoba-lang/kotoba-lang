@@ -1,0 +1,185 @@
+(ns provider.stream-ingress
+  "Bidirectional frame-stream reference provider (root ADR-2608150900).
+
+  `provider.http-ingress` is one request paired to one reply. A telephone call's
+  media, a websocket, a pipe are none of those: frames arrive continuously and
+  leave continuously, unpaired, and what ends a turn is silence rather than a
+  response.
+
+  Host owns the listen. The guest never receives a socket:
+
+  - host opens a stream with `open!` and injects frames with `deliver!`
+  - guest polls with `:stream/accept` (option of opened | frame | closed)
+  - guest speaks with `:stream/send`
+
+  ## Two capabilities, because they are two authorities
+
+  A guest allowed to HEAR a stream has not thereby been allowed to SPEAK into
+  it. A single `:stream/transact` would have made a listening receptionist and a
+  talking one the same grant.
+
+  ## Overflow closes the stream; it never drops a frame
+
+  A dropped audio frame is a glitch that looks like nothing happened — inaudible
+  to the program, audible only to the person on the other end. When the queue is
+  full the stream is CLOSED with `:queue-overflow`, which is a fact the guest can
+  act on. The sequence number exists for the same reason: a gap is how a guest
+  learns frames were lost, and without it a lossy stream and a quiet one are the
+  same observation.
+
+  ## Payloads are text
+
+  Binary transports base64 their frames and the guest decodes them. That decode
+  has to be writable in the language for this provider to be usable rather than
+  merely declared, which is what the `:base64-kit` conformance case establishes."
+  (:require [kotoba.kir.value :as value]
+            ))
+
+(def accept-capability-id 25)
+(def send-capability-id 26)
+
+(def default-max-queue-depth 64)
+(def default-max-open-streams 4)
+(def max-payload-bytes 65536)
+
+(def accept-request-type
+  [:record :kotoba.stream/accept-request [[:slot :i64]]])
+
+(def opened-type
+  [:record :kotoba.stream/opened [[:stream :i64] [:kind :keyword]]])
+
+(def frame-type
+  [:record :kotoba.stream/frame
+   [[:stream :i64] [:payload :string] [:sequence :i64]]])
+
+(def closed-type
+  [:record :kotoba.stream/closed [[:stream :i64] [:reason :keyword]]])
+
+(def event-type
+  [:variant :kotoba.stream/event
+   [[:opened opened-type] [:frame frame-type] [:closed closed-type]]])
+
+(def accept-result-type [:option event-type])
+
+(def send-request-type
+  [:record :kotoba.stream/outbound
+   [[:stream :i64] [:payload :string] [:final :bool]]])
+
+(def send-result-type :bool)
+
+(def schemas
+  {:kotoba.stream/accept-request accept-request-type
+   :kotoba.stream/opened opened-type
+   :kotoba.stream/frame frame-type
+   :kotoba.stream/closed closed-type
+   :kotoba.stream/event event-type
+   :kotoba.stream/outbound send-request-type})
+
+(defn- i64-zero [] )
+(defn- i64= [a b] )
+(defn- ->i64 [n] )
+(defn- i64->long [n] )
+
+(defn create-provider
+  "Build accept + send providers over one host-owned stream table.
+
+  Options:
+    :max-queue-depth   positive integer, default 64 (1.28s at 20ms framing)
+    :max-open-streams  positive integer, default 4
+
+  Returns `{:providers {25 accept 26 send} :open! :deliver! :close! :sent
+            :snapshot}`."
+  ([] (create-provider {}))
+  ([{:keys [max-queue-depth max-open-streams]
+     :or {max-queue-depth default-max-queue-depth
+          max-open-streams default-max-open-streams}}]
+   (when-not (and (integer? max-queue-depth) (<= 1 max-queue-depth 1024))
+     (throw (ex-info "stream ingress max-queue-depth must be in [1,1024]"
+                     {:phase :stream-ingress-provider :max-queue-depth max-queue-depth})))
+   (when-not (and (integer? max-open-streams) (<= 1 max-open-streams 64))
+     (throw (ex-info "stream ingress max-open-streams must be in [1,64]"
+                     {:phase :stream-ingress-provider :max-open-streams max-open-streams})))
+   (let [events (atom [])
+         streams (atom {})
+         next-id (atom 1)
+         sent (atom [])
+         push! (fn [event] (swap! events conj event))
+         close!*
+         (fn [id reason]
+           (when (get-in @streams [id :open?])
+             (swap! streams assoc-in [id :open?] false)
+             (push! [event-type :closed [closed-type (->i64 id) reason]])
+             true))
+         open!
+         (fn [kind]
+           (let [live (count (filter :open? (vals @streams)))]
+             (when (>= live max-open-streams)
+               (throw (ex-info "stream ingress has no free stream"
+                               {:phase :stream-ingress-provider
+                                :max-open-streams max-open-streams})))
+             (let [id (swap! next-id inc)]
+               (swap! streams assoc id {:open? true :next-seq 0})
+               (push! [event-type :opened [opened-type (->i64 id) kind]])
+               id)))
+         deliver!
+         (fn [id payload]
+           (cond
+             (not (get-in @streams [id :open?]))
+             (throw (ex-info "stream is not open"
+                             {:phase :stream-ingress-provider :stream id}))
+
+             ;; Full queue closes the stream rather than dropping the frame.
+             (>= (count @events) max-queue-depth)
+             (do (close!* id :queue-overflow) false)
+
+             :else
+             (let [seq-n (get-in @streams [id :next-seq])]
+               (value/bounded-string! payload max-payload-bytes)
+               (swap! streams assoc-in [id :next-seq] (inc seq-n))
+               (push! [event-type :frame
+                       [frame-type (->i64 id) payload (->i64 seq-n)]])
+               true)))]
+     {:providers
+      {accept-capability-id
+       {:request-type accept-request-type
+        :result-type accept-result-type
+        :invoke
+        (fn [[actual-type slot]]
+          (when-not (= actual-type accept-request-type)
+            (throw (ex-info "stream accept contract mismatch"
+                            {:phase :stream-ingress-provider})))
+          (when-not (i64= slot (i64-zero))
+            (throw (ex-info "stream accept slot must be 0 in v1"
+                            {:phase :stream-ingress-provider :slot slot})))
+          (if-let [event (first @events)]
+            (do (swap! events (fn [q] (vec (rest q))))
+                [accept-result-type true event])
+            [accept-result-type false]))}
+
+       send-capability-id
+       {:request-type send-request-type
+        :result-type send-result-type
+        :invoke
+        (fn [[actual-type stream payload final]]
+          (when-not (= actual-type send-request-type)
+            (throw (ex-info "stream send contract mismatch"
+                            {:phase :stream-ingress-provider})))
+          (let [id (i64->long stream)]
+            (when-not (get-in @streams [id :open?])
+              (throw (ex-info "stream send requires an open stream"
+                              {:phase :stream-ingress-provider :stream id})))
+            (value/bounded-string! payload max-payload-bytes)
+            (swap! sent conj {:stream id :payload payload :final (true? final)})
+            (when (true? final) (close!* id :sent-final))
+            true))}}
+      :open! open!
+      :deliver! deliver!
+      :close! (fn [id reason] (close!* id reason))
+      :sent (fn [] @sent)
+      :max-queue-depth max-queue-depth
+      :max-open-streams max-open-streams
+      :snapshot (fn [] {:queued (count @events)
+                        :open (count (filter :open? (vals @streams)))
+                        :sent (count @sent)
+                        :max-queue-depth max-queue-depth
+                        :max-open-streams max-open-streams})})))

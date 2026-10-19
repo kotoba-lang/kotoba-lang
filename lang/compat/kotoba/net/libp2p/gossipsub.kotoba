@@ -1,0 +1,418 @@
+(ns kotoba.net.libp2p.gossipsub
+  "Pure GossipSub v1.1 routing and security state.
+
+  The socket host executes returned `:send`, `:deliver`, and
+  `:peer-subscribed` effects.  Keeping heartbeat/mesh/scoring transitions pure
+  makes attack and recovery cases reproducible rather than timer-dependent."
+  (:require [clojure.set :as set]
+            )
+  )
+
+(def default-params
+  {:d 6 :d-low 4 :d-high 12 :d-out 2 :d-score 4 :d-lazy 6
+   :gossip-factor 0.25 :flood-publish? true
+   :opportunistic-graft-peers 2 :opportunistic-graft-ticks 60
+   :backoff-ms 60000 :fanout-ttl-ms 60000
+   :seen-ttl-ms 120000 :idontwant-ttl-ms 120000
+   :mcache-length 5 :mcache-gossip 3
+   :max-ihave-ids 5000 :max-iwant-ids 500
+   :score {:topic-weight 1.0 :topic-cap 1000.0
+           :time-weight 0.01 :time-quantum-ms 1000 :time-cap 10.0
+           :first-weight 1.0 :first-cap 100.0 :first-decay 0.9
+           :mesh-weight -1.0 :mesh-threshold 1.0 :mesh-cap 100.0
+           :mesh-activation-ms 10000 :mesh-decay 0.9
+           :failure-weight -1.0 :failure-decay 0.9
+           :invalid-weight -10.0 :invalid-decay 0.9
+           :application-weight 1.0
+           :ip-colocation-weight -1.0 :ip-colocation-threshold 5
+           :behaviour-weight -1.0
+           :behaviour-decay 0.9 :decay-to-zero 0.01}
+   :thresholds {:gossip -10.0 :publish -20.0 :graylist -50.0
+                :accept-px 10.0 :opportunistic-graft 1.0}})
+
+(defn init
+  ([] (init {}))
+  ([params]
+   (let [params (merge default-params params)
+         params (update params :score merge (:score default-params) (:score params))
+         params (update params :thresholds merge (:thresholds default-params)
+                        (:thresholds params))]
+     {:params params :subscriptions #{} :peers {} :mesh {} :fanout {}
+      :fanout-last {} :seen {} :mcache (vec (repeat (:mcache-length params) {}))
+      :scores {} :backoff {} :idontwant {} :heartbeat-ticks 0})))
+
+(defn message-id
+  "StrictNoSign message id: SHA-256 of the application payload bytes."
+  [{:keys [data]}]
+  )
+
+(defn- score-topic [params now-ms topic-score]
+  (let [{:keys [time-weight time-quantum-ms time-cap first-weight mesh-weight
+                mesh-threshold mesh-activation-ms failure-weight invalid-weight]}
+        (:score params)
+        mesh-ms (if-let [since (:mesh-since topic-score)] (- now-ms since) 0)
+        p1 (min time-cap (/ mesh-ms time-quantum-ms))
+        p2 (:first topic-score 0.0)
+        p3 (if (and (> mesh-ms mesh-activation-ms)
+                    (< (:mesh-deliveries topic-score 0.0) mesh-threshold))
+             (let [d (- mesh-threshold (:mesh-deliveries topic-score 0.0))] (* d d))
+             0.0)
+        p3b (:mesh-failures topic-score 0.0)
+        p4 (let [n (:invalid topic-score 0.0)] (* n n))]
+    (+ (* time-weight p1) (* first-weight p2) (* mesh-weight p3)
+       (* failure-weight p3b) (* invalid-weight p4))))
+
+(defn peer-score [state peer now-ms]
+  (let [params (:params state)
+        score-state (get-in state [:scores peer] {})
+        {:keys [topic-weight topic-cap application-weight ip-colocation-weight
+                ip-colocation-threshold behaviour-weight]}
+        (:score params)
+        topic-sum (reduce + 0.0 (map #(score-topic params now-ms %)
+                                     (vals (:topics score-state))))
+        ip (get-in state [:peers peer :ip])
+        colocated (if ip (count (filter #(= ip (:ip %)) (vals (:peers state)))) 0)
+        surplus (max 0 (- colocated ip-colocation-threshold))]
+    (+ (min topic-cap (* topic-weight topic-sum))
+       (* application-weight (:application score-state 0.0))
+       (* ip-colocation-weight surplus surplus)
+       (* behaviour-weight (let [p (:behaviour score-state 0.0)] (* p p))))))
+
+(defn add-peer
+  [state peer {:keys [outbound? explicit? ip]}]
+  (let [current (get-in state [:peers peer] {})]
+    (-> state
+      ;; Inbound and outbound GossipSub streams are negotiated independently.
+      ;; Opening the second direction must not erase subscriptions learned on
+      ;; the first one; both streams represent the same authenticated peer.
+      (assoc-in [:peers peer] {:topics (or (:topics current) #{})
+                               :outbound? (or (:outbound? current) (boolean outbound?))
+                               :explicit? (or (:explicit? current) (boolean explicit?))
+                               :ip (or ip (:ip current))})
+      (update :scores #(if (contains? % peer) % (assoc % peer {:topics {}}))))))
+
+(defn remove-peer [state peer]
+  (-> state
+      (update :peers dissoc peer)
+      (update :mesh #(into {} (map (fn [[topic peers]] [topic (disj peers peer)]) %)))
+      ;; Scores deliberately survive disconnects; v1.1 prevents score reset by reconnect.
+      ))
+
+(defn set-application-score [state peer value]
+  (assoc-in state [:scores peer :application] (double value)))
+
+(defn- eligible? [state topic peer now-ms]
+  (and (contains? (get-in state [:peers peer :topics] #{}) topic)
+       (not (get-in state [:peers peer :explicit?]))
+       (>= (peer-score state peer now-ms) 0.0)
+       (<= (get-in state [:backoff [topic peer]] 0) now-ms)))
+
+(defn- ranked [state peers now-ms]
+  (sort-by (fn [peer] [(- (peer-score state peer now-ms)) (pr-str peer)]) peers))
+
+(defn- candidates [state topic now-ms]
+  (ranked state (filter #(eligible? state topic % now-ms) (keys (:peers state))) now-ms))
+
+(defn- send-effect [peer rpc] {:op :send :peer peer :rpc rpc})
+
+(defn subscribe [state topic now-ms]
+  (let [selected (set (take (get-in state [:params :d]) (candidates state topic now-ms)))
+        peers (keys (:peers state))
+        state (-> state (update :subscriptions conj topic) (assoc-in [:mesh topic] selected))
+        state (reduce #(assoc-in %1 [:scores %2 :topics topic :mesh-since] now-ms)
+                      state selected)]
+    {:state state
+     :effects (vec (concat
+                    (map #(send-effect % {:subscriptions [{:topic topic :subscribe? true}]}) peers)
+                    (map #(send-effect % {:control {:graft [{:topic topic}]}}) selected)))}))
+
+(defn unsubscribe [state topic now-ms]
+  (let [mesh (get-in state [:mesh topic] #{})
+        peers (keys (:peers state))
+        backoff (get-in state [:params :backoff-ms])]
+    {:state (-> state
+                (update :subscriptions disj topic)
+                (update :mesh dissoc topic)
+                (update :backoff into (map (fn [peer] [[topic peer] (+ now-ms backoff)]) mesh)))
+     :effects (vec (concat
+                    (map #(send-effect % {:subscriptions [{:topic topic :subscribe? false}]}) peers)
+                    (map #(send-effect % {:control {:prune [{:topic topic
+                                                             :backoff-seconds (quot backoff 1000)}]}})
+                         mesh)))}))
+
+(defn- cache-put [state id message]
+  (assoc-in state [:mcache 0 id] message))
+
+(defn- cached [state id]
+  (some #(get % id) (:mcache state)))
+
+(defn- send-message-effects [state sender message id]
+  (let [topic (:topic message)
+        mesh (get-in state [:mesh topic] #{})
+        direct (for [[peer info] (:peers state)
+                     :when (and (:explicit? info) (contains? (:topics info) topic))] peer)
+        targets (disj (set (concat mesh direct)) sender)]
+    (mapv #(send-effect % {:messages [message]})
+          (remove (fn [peer] (> (get-in state [:idontwant [peer id]] 0) 0)) targets))))
+
+(defn publish [state message now-ms]
+  (let [id (message-id message)]
+    (if (contains? (:seen state) id)
+      {:state state :effects [] :duplicate? true}
+      (let [topic (:topic message)
+            state (-> state (assoc-in [:seen id] now-ms) (cache-put id message))
+            subscribed? (contains? (:subscriptions state) topic)
+            flood? (get-in state [:params :flood-publish?] true)
+            targets (if (and subscribed? (not flood?))
+                      (get-in state [:mesh topic] #{})
+                      (if flood?
+                        (set (for [[peer info] (:peers state)
+                                   :when (and (contains? (:topics info) topic)
+                                              (>= (peer-score state peer now-ms)
+                                                  (get-in state [:params :thresholds :publish])))]
+                               peer))
+                      (let [current (get-in state [:fanout topic] #{})
+                            chosen (if (seq current) current
+                                     (set (take (get-in state [:params :d])
+                                                (candidates state topic now-ms))))]
+                        chosen)))
+            state (if subscribed? state (-> state
+                                            (assoc-in [:fanout topic] targets)
+                                            (assoc-in [:fanout-last topic] now-ms)))]
+        {:state state :message-id id
+         :effects (mapv #(send-effect % {:messages [message]}) targets)}))))
+
+(defn- validator-decision [validator peer message]
+  (let [v (validator peer message)]
+    (cond (= v :accept) :accept (= v :reject) :reject (= v :ignore) :ignore
+          (true? v) :accept :else :reject)))
+
+(defn- note-invalid [state peer topic]
+  (update-in state [:scores peer :topics topic :invalid] (fnil inc 0.0)))
+
+(defn- process-message [result peer message now-ms validator]
+  (let [state (:state result)
+        id (message-id message)
+        topic (:topic message)]
+    (if (contains? (:seen state) id)
+      result
+      (case (validator-decision validator peer message)
+        :ignore (update result :effects conj {:op :ignored :peer peer :message-id id})
+        :reject (-> result
+                    (assoc :state (note-invalid state peer topic))
+                    (update :effects conj {:op :rejected :peer peer :message-id id}))
+        :accept
+        (let [mesh? (contains? (get-in state [:mesh topic] #{}) peer)
+              state (-> state
+                        (assoc-in [:seen id] now-ms)
+                        (cache-put id message)
+                        (update-in [:scores peer :topics topic :first] (fnil inc 0.0))
+                        (cond-> mesh?
+                          (update-in [:scores peer :topics topic :mesh-deliveries]
+                                     (fnil inc 0.0))))]
+          {:state state
+           :effects (into (:effects result)
+                          (concat [{:op :deliver :peer peer :message message :message-id id}]
+                                  (send-message-effects state peer message id)))})))))
+
+(defn- prune-rpc [state topic]
+  {:control {:prune [{:topic topic
+                      :backoff-seconds (quot (get-in state [:params :backoff-ms]) 1000)}]}})
+
+(defn- process-graft [result peer {:keys [topic]} now-ms]
+  (let [state (:state result)
+        reject? (or (get-in state [:peers peer :explicit?])
+                    (not (contains? (:subscriptions state) topic))
+                    (> (get-in state [:backoff [topic peer]] 0) now-ms)
+                    (neg? (peer-score state peer now-ms)))]
+    (if reject?
+      (-> result
+          (assoc :state (update-in state [:scores peer :behaviour] (fnil inc 0.0)))
+          (update :effects conj (send-effect peer (prune-rpc state topic))))
+      (assoc result :state (-> state
+                               (update-in [:mesh topic] (fnil conj #{}) peer)
+                               (assoc-in [:scores peer :topics topic :mesh-since] now-ms))))))
+
+(defn- process-prune [result peer {:keys [topic backoff-seconds peers]} now-ms]
+  (let [state (:state result)
+        backoff (* 1000 (or backoff-seconds
+                            (quot (get-in state [:params :backoff-ms]) 1000)))
+        accept-px? (>= (peer-score state peer now-ms)
+                       (get-in state [:params :thresholds :accept-px]))]
+    (-> result
+        (assoc :state (-> state
+                          (update-in [:mesh topic] disj peer)
+                          (assoc-in [:backoff [topic peer]] (+ now-ms backoff))))
+        (update :effects into
+                (if accept-px?
+                  (mapv #(hash-map :op :peer-exchange :from peer :peer-info %) peers)
+                  [])))))
+
+(defn- process-ihave [result peer {:keys [message-ids]}]
+  (let [state (:state result)
+        limit (get-in state [:params :max-ihave-ids])
+        want-limit (get-in state [:params :max-iwant-ids])
+        wanted (->> message-ids (take limit) (remove #(contains? (:seen state) %))
+                    (take want-limit) vec)]
+    (if (seq wanted)
+      (update result :effects conj
+              (send-effect peer {:control {:iwant [{:message-ids wanted}]}}))
+      result)))
+
+(defn- process-iwant [result peer {:keys [message-ids]}]
+  (let [state (:state result)
+        messages (keep #(cached state %) (take (get-in state [:params :max-iwant-ids]) message-ids))]
+    (if (seq messages)
+      (update result :effects conj (send-effect peer {:messages (vec messages)}))
+      result)))
+
+(defn- process-idontwant [result peer {:keys [message-ids]} now-ms]
+  (let [expires (+ now-ms (get-in result [:state :params :idontwant-ttl-ms]))]
+    (update result :state
+            #(reduce (fn [s id] (assoc-in s [:idontwant [peer id]] expires)) % message-ids))))
+
+(defn receive
+  "Process one decoded RPC from authenticated PEER."
+  [state peer rpc now-ms validator]
+  (if (and (not (get-in state [:peers peer :explicit?]))
+           (< (peer-score state peer now-ms) (get-in state [:params :thresholds :graylist])))
+    {:state state :effects [] :graylisted? true}
+    (let [subscriptions (:subscriptions rpc)
+          state (reduce (fn [s {:keys [topic subscribe?]}]
+                          (update-in s [:peers peer :topics]
+                                     (fnil (if subscribe? conj disj) #{}) topic))
+                        state subscriptions)
+          result {:state state
+                  :effects (mapv (fn [{:keys [topic subscribe?]}]
+                                   {:op (if subscribe? :peer-subscribed :peer-unsubscribed)
+                                    :peer peer :topic topic}) subscriptions)}
+          result (reduce #(process-message %1 peer %2 now-ms validator) result (:messages rpc))
+          control (:control rpc)
+          result (reduce #(process-graft %1 peer %2 now-ms) result (:graft control))
+          result (reduce #(process-prune %1 peer %2 now-ms) result (:prune control))
+          result (reduce #(process-ihave %1 peer %2) result (:ihave control))
+          result (reduce #(process-iwant %1 peer %2) result (:iwant control))]
+      (reduce #(process-idontwant %1 peer %2 now-ms) result (:idontwant control)))))
+
+(defn- decay-value [value factor zero]
+  (let [v (* (or value 0.0) factor)] (if (< v zero) 0.0 v)))
+
+(defn- decay-scores [state]
+  (let [{:keys [first-decay mesh-decay failure-decay invalid-decay behaviour-decay decay-to-zero]}
+        (get-in state [:params :score])]
+    (update state :scores
+            (fn [scores]
+              (into {}
+                    (for [[peer score] scores]
+                      [peer (-> score
+                                (update :behaviour decay-value behaviour-decay decay-to-zero)
+                                (update :topics
+                                        (fn [topics]
+                                          (into {}
+                                                (for [[topic ts] topics]
+                                                  [topic (-> ts
+                                                             (update :first decay-value first-decay decay-to-zero)
+                                                             (update :mesh-deliveries decay-value mesh-decay decay-to-zero)
+                                                             (update :mesh-failures decay-value failure-decay decay-to-zero)
+                                                             (update :invalid decay-value invalid-decay decay-to-zero))])))))]))))))
+
+(defn- note-mesh-failure [state peer topic now-ms]
+  (let [topic-score (get-in state [:scores peer :topics topic] {})
+        {:keys [mesh-threshold mesh-activation-ms]} (get-in state [:params :score])
+        mesh-ms (if-let [since (:mesh-since topic-score)] (- now-ms since) 0)
+        delivered (:mesh-deliveries topic-score 0.0)]
+    (if (and (> mesh-ms mesh-activation-ms) (< delivered mesh-threshold))
+      (let [deficit (- mesh-threshold delivered)]
+        (update-in state [:scores peer :topics topic :mesh-failures]
+                   (fnil + 0.0) (* deficit deficit)))
+      state)))
+
+(defn heartbeat
+  "Maintain degree/outbound quota, emit gossip, decay scores, and expire caches."
+  [state now-ms]
+  (let [state (-> state decay-scores (update :heartbeat-ticks inc))
+        params (:params state)
+        result
+        (reduce
+         (fn [{:keys [state effects]} topic]
+           (let [mesh (get-in state [:mesh topic] #{})
+                 nonnegative (set (filter #(not (neg? (peer-score state % now-ms))) mesh))
+                 desired (:d params)
+                 ranked-mesh (vec (ranked state nonnegative now-ms))
+                 outbound? #(get-in state [:peers % :outbound?])
+                 oversubscribed? (> (count ranked-mesh) (:d-high params))
+                 top-scored (if oversubscribed?
+                              (vec (take (:d-score params) ranked-mesh)) ranked-mesh)
+                 outbound-base (if oversubscribed?
+                                 (take (max 0 (- (:d-out params)
+                                                 (count (filter outbound? top-scored))))
+                                       (filter outbound? (remove (set top-scored) ranked-mesh)))
+                                 [])
+                 survivors0 (set (concat top-scored outbound-base))
+                 survivors (if oversubscribed?
+                             (set (take desired
+                                        (concat top-scored outbound-base
+                                                (remove survivors0 ranked-mesh))))
+                             nonnegative)
+                 all-candidates (vec (remove survivors (candidates state topic now-ms)))
+                 outbound-need (max 0 (- (:d-out params)
+                                         (count (filter outbound? survivors))))
+                 outbound-additions (take outbound-need (filter outbound? all-candidates))
+                 after-outbound (into survivors outbound-additions)
+                 need (max 0 (- desired (count after-outbound)))
+                 additions (set (concat outbound-additions
+                                        (take need (remove after-outbound all-candidates))))
+                 next-mesh (into survivors additions)
+                 removed (set/difference mesh next-mesh)
+                 state (reduce #(note-mesh-failure %1 %2 topic now-ms)
+                               state (filter #(neg? (peer-score state % now-ms)) removed))
+                 state (assoc-in state [:mesh topic] next-mesh)
+                 effects (into effects
+                               (concat (map #(send-effect % {:control {:graft [{:topic topic}]}}) additions)
+                                       (map #(send-effect % (prune-rpc state topic)) removed)))]
+             {:state state :effects effects}))
+         {:state state :effects []} (:subscriptions state))
+        result
+        (if (zero? (mod (:heartbeat-ticks (:state result))
+                        (:opportunistic-graft-ticks params)))
+          (reduce
+           (fn [{:keys [state effects]} topic]
+             (let [mesh (get-in state [:mesh topic] #{})
+                   scores (sort (map #(peer-score state % now-ms) mesh))
+                   median (if (seq scores) (nth scores (quot (count scores) 2)) 0.0)
+                   candidates (filter #(> (peer-score state % now-ms) median)
+                                      (remove mesh (candidates state topic now-ms)))
+                   additions (set (take (:opportunistic-graft-peers params) candidates))]
+               (if (< median (get-in params [:thresholds :opportunistic-graft]))
+                 {:state (update-in state [:mesh topic] into additions)
+                  :effects (into effects
+                                 (map #(send-effect % {:control {:graft [{:topic topic}]}})
+                                      additions))}
+                 {:state state :effects effects})))
+           result (:subscriptions (:state result)))
+          result)
+        state (:state result)
+        gossip-windows (take (:mcache-gossip params) (:mcache state))
+        by-topic (reduce (fn [m window]
+                           (reduce (fn [m [id msg]] (update m (:topic msg) (fnil conj []) id)) m window))
+                         {} gossip-windows)
+        gossip-effects
+        (mapcat (fn [[topic ids]]
+                  (let [mesh (get-in state [:mesh topic] #{})
+                        eligible (remove mesh (candidates state topic now-ms))
+                        n (max (:d-lazy params)
+                               (long (
+                                      (* (:gossip-factor params) (count eligible)))))]
+                    (map #(send-effect % {:control {:ihave [{:topic topic :message-ids (vec ids)}]}})
+                         (take n eligible))))
+                by-topic)
+        state (-> state
+                  (assoc :mcache (vec (cons {} (butlast (:mcache state)))))
+                  (update :seen #(into {} (filter (fn [[_ at]] (< (- now-ms at) (:seen-ttl-ms params))) %)))
+                  (update :backoff #(into {} (filter (fn [[_ until]] (> until now-ms)) %)))
+                  (update :idontwant #(into {} (filter (fn [[_ until]] (> until now-ms)) %)))
+                  (update :fanout
+                          #(into {} (filter (fn [[topic _]]
+                                             (< (- now-ms (get-in state [:fanout-last topic] 0))
+                                                (:fanout-ttl-ms params))) %))))]
+    {:state state :effects (into (:effects result) gossip-effects)}))

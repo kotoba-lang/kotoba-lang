@@ -1,0 +1,298 @@
+(ns kotoba.lang.base-l2.abi
+  "Narrow, hand-rolled Ethereum ABI encode/decode -- NOT a general ABI
+  library. Ported from what `l2.ts` / `paymaster.ts` actually touch via
+  viem's `encodeFunctionData` / `readContract` / `decodeFunctionResult`:
+  simple flat argument lists for a handful of concrete function
+  signatures, never nested structs or arrays.
+
+  Supported Solidity types:
+    uint8..uint256 (step 8), int8..int256 (step 8), address, bool,
+    bytes1..bytes32 (fixed-size), bytes (dynamic), string.
+
+  Explicitly OUT OF SCOPE (throws on encode/decode):
+    arrays (`T[]` / `T[k]`), tuples/structs, fixed-point types.
+  A caller that needs an array/tuple argument must pre-encode it to raw
+  calldata bytes at a lower level, or this namespace can be extended (the
+  head/tail offset-encoding scheme below generalizes to arrays/tuples in
+  the standard way; it just isn't implemented here because nothing in
+  this SDK's own surface needs it).
+
+  All known-answer vectors this namespace is tested against were
+  generated with viem itself -- see test/resources/base_l2/abi-vectors.json
+  and its generator note in the test namespace.
+
+  PORTABLE (`.cljc`, :clj + :cljs). It was `.clj`-only until now, and the
+  docstring that justified that said `eth-crypto.core` is JVM-only
+  \"despite its own `.cljc` extension: inspected directly, it carries
+  ZERO `#?()` reader conditionals\". That was TRUE of the revision this
+  repo pinned (`eebb35b`, 2026-06-30 -- 0 reader conditionals, genuinely
+  JVM-only) and has been FALSE upstream since `1253e01` (2026-07-26,
+  \"real ClojureScript crypto -- the whole API now runs in a browser\"):
+  Keccak-f[1600] on js/BigInt lanes, pure-cljs HMAC-SHA256, hand-written
+  modInverse/modPow. The blocker was a stale pin, not a missing
+  primitive. `deps.edn` now pins `2b0e56d`, and `keccak256` /
+  `eip55-checksum` / `hex->bytes` / `bytes->hex` / `utf8` -- everything
+  this namespace needs -- are dual-platform there.
+
+  BYTE REPRESENTATION: internally this codec works in ONE representation,
+  a vector of unsigned 0..255 ints, and converts only at the public
+  boundary. `encode-abi-params` returns a real byte-array under :clj and
+  that same int vector under :cljs -- exactly the convention
+  `eth-crypto.core/hex->bytes` already established (ClojureScript has no
+  `byte-array`). Every decode entry point normalizes its input through
+  `->byte-vec`, so a :clj byte-array, a :cljs int vector, and a 0x-hex
+  string are all accepted on both platforms."
+  (:require [eth-crypto.core :as eth]))
+
+;; ─── 256-bit constants ───────────────────────────────────────────────
+
+(def ^:private TWO-256
+  )
+
+(def ^:private TWO-255
+  )
+
+(def ^:private BIG-ZERO )
+
+;; ─── byte-vector helpers (the one internal representation) ───────────
+
+(defn- ->byte-vec
+  "Normalize bytes-ish input to a vector of unsigned 0..255 ints. Accepts
+  a 0x-hex string, a :clj byte-array (whose elements are SIGNED, hence
+  the `bit-and`), or the :cljs int vector `eth-crypto` returns."
+  [v]
+  (cond
+    (string? v) (mapv #(bit-and % 0xff) (seq (eth/hex->bytes v)))
+    (or (sequential? v) )
+    (mapv #(bit-and % 0xff) (seq v))
+    :else (throw (ex-info "[kotoba.lang.base-l2.abi] expected bytes or 0x-hex string"
+                          {:value v}))))
+
+(defn- pad-hex-64
+  "Left-pad (or left-truncate) a hex string to exactly 64 chars -- one
+  32-byte ABI word."
+  [h]
+  (let [n (count h)]
+    (cond
+      (= n 64) h
+      (< n 64) (str (apply str (repeat (- 64 n) \0)) h)
+      :else (subs h (- n 64)))))
+
+(defn- ->big [v]
+  )
+
+(defn- hex->big [h]
+  )
+
+(defn- int->word
+  "Any integer (signed or unsigned, positive or negative; a decimal
+  string is also accepted so callers can stay portable past 2^53) -> its
+  32-byte two's-complement big-endian ABI word, as a vector of 32
+  unsigned ints. Exact `mod 2^256` for every input, so uintN and intN
+  encode through the same path.
+
+  Uses only `-`, `<`, `.toString` and a hex parse -- deliberately NO
+  division or `%`. Each arithmetic result is re-coerced through `->big`
+  because Clojure's numeric tower promotes `(- BigInteger BigInteger)` to
+  `clojure.lang.BigInt`, which has no radix `.toString`. `js-mod` is unavailable under nbb/SCI, and cljs's
+  `rem`/`quot` go through `Math.trunc`, which is wrong for js/BigInt.
+  Left-truncating a hex string to its last 64 chars IS `mod 2^256`, and
+  a negative value is folded as `2^256 - (|v| mod 2^256)`."
+  [v]
+  (->byte-vec
+   (let [b (->big v)
+         neg? (< b BIG-ZERO)
+         mag-hex (pad-hex-64 (.toString (->big (if neg? (- BIG-ZERO b) b)) 16))]
+     (if (or (not neg?) (every? #(= \0 %) mag-hex))
+       mag-hex
+       (pad-hex-64 (.toString (->big (- TWO-256 (hex->big mag-hex))) 16))))))
+
+(defn- word->uint
+  "32-byte ABI word (int vector) -> its unsigned big integer value."
+  [word]
+  (hex->big (eth/bytes->hex word)))
+
+(defn- word->int
+  "32-byte ABI word -> its SIGNED two's-complement big integer value."
+  [word]
+  (let [u (word->uint word)]
+    (if (>= u TWO-255) (- u TWO-256) u)))
+
+(defn- word->offset
+  "32-byte ABI word -> a plain integer, for head/tail offsets and dynamic
+  lengths (always far below 2^53 in any calldata this codec handles)."
+  [word]
+  )
+
+(defn- slice-padded
+  "`data[from,to)` as a 0..255 int vector, ZERO-PADDED past the end of
+  `data`. This reproduces `java.util.Arrays/copyOfRange`, which the JVM
+  implementation this was ported from relied on, so the port is
+  behaviour-identical.
+
+  Consequence, preserved deliberately rather than fixed inside a port:
+  TRUNCATED calldata decodes as trailing zeros instead of erroring --
+  `(decode-function-result [\"uint256\"] \"0x00\")` answers 0, it does not
+  refuse. That is a latent fail-open, and it is out of scope here; see
+  this repo's follow-up note."
+  [data from to]
+  (let [n (count data)]
+    (mapv #(if (and (>= % 0) (< % n)) (nth data %) 0) (range from to))))
+
+(defn- byte-vec->utf8 [bv]
+  )
+
+;; ─── per-type static/dynamic classification + word-level codecs ──────
+
+(defn dynamic-type?
+  "true for the two dynamic ABI types this namespace supports (`bytes`,
+  `string`); everything else here is a fixed 32-byte head word."
+  [type]
+  (contains? #{"bytes" "string"} type))
+
+(defn- fixed-bytes-width
+  "For \"bytesN\" (N 1..32) return N, else nil."
+  [type]
+  (when-let [[_ n] (re-matches #"bytes(\d{1,2})" type)]
+    (let [n (parse-long n)]
+      (when (<= 1 n 32) n))))
+
+(defn- uint-type? [type] (boolean (re-matches #"uint(8|16|24|32|40|48|56|64|72|80|88|96|104|112|120|128|136|144|152|160|168|176|184|192|200|208|216|224|232|240|248|256)?" type)))
+(defn- int-type?  [type] (boolean (re-matches #"int(8|16|24|32|40|48|56|64|72|80|88|96|104|112|120|128|136|144|152|160|168|176|184|192|200|208|216|224|232|240|248|256)?" type)))
+
+(defn- encode-static-word
+  "Encode one static-type value into its 32-byte ABI head word."
+  [type value]
+  (cond
+    (uint-type? type) (int->word value)
+    (int-type? type)  (int->word value)
+    (= type "address")
+    (let [b (->byte-vec value)
+          n (count b)]
+      (if (>= n 32)
+        (vec (take-last 32 b))
+        (into (vec (repeat (- 32 n) 0)) b)))
+    (= type "bool") (int->word (if value 1 0))
+    (fixed-bytes-width type)
+    (let [b (->byte-vec value)
+          n (count b)]
+      ;; bytesN is RIGHT-padded (value at the left), unlike numbers.
+      (when (> n 32)
+        (throw (ex-info (str "[kotoba.lang.base-l2.abi] value too wide for " type
+                             ": " n " bytes")
+                        {:type type :byte-count n})))
+      (into (vec b) (repeat (- 32 n) 0)))
+    :else (throw (ex-info (str "[kotoba.lang.base-l2.abi] unsupported ABI type: " type
+                               " (arrays/tuples are out of scope -- see namespace docstring)")
+                          {:type type}))))
+
+(defn- decode-static-word
+  "Decode one static-type value from its 32-byte ABI head word."
+  [type word]
+  (if-let [n (fixed-bytes-width type)]
+    (str "0x" (eth/bytes->hex (subvec word 0 n)))
+    (cond
+      (uint-type? type) (word->uint word)
+      (int-type? type)  (word->int word)
+      (= type "address") (eth/eip55-checksum (subvec word 12 32))
+      (= type "bool") (not (every? zero? word))
+      :else (throw (ex-info (str "[kotoba.lang.base-l2.abi] unsupported ABI type: " type)
+                            {:type type})))))
+
+(defn- encode-dynamic-tail
+  "Encode one dynamic-type value's tail contribution: length word ++
+  right-padded data."
+  [type value]
+  (let [data (case type
+               "bytes"  (->byte-vec value)
+               "string" (->byte-vec (eth/utf8 value)))
+        n (count data)
+        pad (mod (- 32 (mod n 32)) 32)]
+    (-> (int->word n)
+        (into data)
+        (into (repeat pad 0)))))
+
+(defn- decode-dynamic-at
+  "Decode one dynamic-type value living at byte offset `offset` within
+  `data` (length word followed by the data itself)."
+  [type data offset]
+  (let [len (word->offset (slice-padded data offset (+ offset 32)))
+        start (+ offset 32)
+        raw (slice-padded data start (+ start len))]
+    (case type
+      "bytes" (str "0x" (eth/bytes->hex raw))
+      "string" (byte-vec->utf8 raw))))
+
+;; ─── head/tail ABI parameter encode/decode (flat arg lists only) ─────
+
+(defn encode-abi-params
+  "Encode a flat argument list per Solidity ABI head/tail rules. `types`
+  is a seq of type-name strings (see namespace docstring for the
+  supported subset); `values` is the matching seq of Clojure values
+  (bytes/hex-string for byte types, any integral -- or a decimal string --
+  for uint/int, boolean for bool, hex-string/bytes for address).
+
+  Returns the concatenation of the fixed-size head words (or, for dynamic
+  types, an offset pointer) followed by the tail: a real byte-array under
+  :clj, a vector of unsigned 0..255 ints under :cljs. Both are accepted by
+  `eth-crypto.core/bytes->hex`, which is representation-agnostic."
+  [types values]
+  (let [n (count types)
+        head-size (* 32 n)
+        tails (mapv (fn [type value]
+                      (when (dynamic-type? type) (encode-dynamic-tail type value)))
+                    types values)
+        offsets (loop [i 0 running head-size acc (transient [])]
+                  (if (= i n)
+                    (persistent! acc)
+                    (let [tail (nth tails i)]
+                      (recur (inc i)
+                             (if tail (+ running (count tail)) running)
+                             (conj! acc running)))))
+        head (mapv (fn [type value offset]
+                     (if (dynamic-type? type)
+                       (int->word offset)
+                       (encode-static-word type value)))
+                   types values offsets)
+        out (into [] cat (concat head (remove nil? tails)))]
+    ))
+
+(defn decode-abi-params
+  "Inverse of `encode-abi-params`: decode a flat argument list out of
+  `data` (a byte-array, a :cljs int vector, or a 0x-hex string) per
+  `types`. Returns a vector of decoded values (a big integer -- BigInteger
+  under :clj, js/BigInt under :cljs -- for uint/int, an EIP-55 string for
+  address, boolean for bool, `0x…` hex string for bytesN/bytes, String for
+  string)."
+  [types data]
+  (let [data (->byte-vec data)]
+    (into []
+          (map-indexed
+           (fn [i type]
+             (let [word (slice-padded data (* i 32) (+ 32 (* i 32)))]
+               (if (dynamic-type? type)
+                 (decode-dynamic-at type data (word->offset word))
+                 (decode-static-word type word)))))
+          types)))
+
+;; ─── function selectors / whole-call encode+decode ───────────────────
+
+(defn function-selector
+  "keccak256(signature)[0:4] as a `0x…` string, e.g.
+  `(function-selector \"anchor(bytes32,bytes,uint64)\")` =>
+  \"0x4698c11d\"."
+  [signature]
+  (str "0x" (eth/bytes->hex (take 4 (seq (eth/keccak256 (eth/utf8 signature)))))))
+
+(defn encode-function-call
+  "`signature` (the `function name(type,type,...)` string) + ABI-encoded
+  `values` (per `encode-abi-params`), concatenated into full calldata as a
+  `0x…` hex string."
+  [signature types values]
+  (str (function-selector signature) (eth/bytes->hex (encode-abi-params types values))))
+
+(defn decode-function-result
+  "Decode a `0x…` return-data hex string per `types` -- see
+  `decode-abi-params`."
+  [types data]
+  (decode-abi-params types (eth/hex->bytes data)))
