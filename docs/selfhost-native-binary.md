@@ -308,6 +308,18 @@ topological sort over the require graph, restricted to the host-bound nodes.
 `scripts/measure-host-port-order.cljk` computes it; `lang/host-port-order.edn`
 is the result.
 
+*(Not regenerable as of 2026-10-19.)* The script matches source files with
+`\.clj[cs]?$`, which the 2026-09-11 `.cljk` rename (ADR-2609111500) left
+matching nothing: `kotoba-verifier/src` holds 4 `.cljk` files and amu `src`
+holds 96, none of them `.clj`/`.cljc`/`.cljs`. A re-run today answers
+`reachable: 3, blockers: 0, waves: 0` with `:escapes {}` — an empty sweep, not
+a clean bill of health. The waves below are therefore a pre-rename snapshot.
+Regenerating takes two decisions, not one patch: a matcher that reads
+`.cljk`, and a replacement for the `:clj-only` predicate, whose definition
+("a `.clj` file with no `.cljc`/`.cljs` twin") was built on the extensions the
+rename removed — `cljk-origin.edn` records the pre-rename extension if that
+is what the predicate should consult.
+
 **Two hosts leave, not one.** `node:crypto` is not a smaller problem than
 `java.security` — it is the same problem with a different owner, and
 Kotoba-only means neither. Four escape kinds are read off the source:
