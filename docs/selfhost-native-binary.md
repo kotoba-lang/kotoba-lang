@@ -329,8 +329,9 @@ is the remaining step.
 **Two hosts leave, not one.** `node:crypto` is not a smaller problem than
 `java.security` — it is the same problem with a different owner, and
 Kotoba-only means neither. Four escape kinds are read off the source:
-`:clj-only` (a `.clj` with no `.cljc`/`.cljs` twin), `:java-interop`,
-`:node-require`, `:js-interop`.
+`:clj-only` (no `.cljs` twin and no `:cljs` branch in a reader conditional,
+so it loads on no other host), `:java-interop`, `:node-require`,
+`:js-interop`.
 
 ⚠ **The first version of this section asked one question where there are
 two, and got the answer wrong.** It counted any host escape as a JVM blocker,
@@ -341,55 +342,48 @@ branch, which is what portable code looks like. Two predicates, two orders:
 
 | question | blocker | reachable | blockers | waves |
 |---|---|---:|---:|---|
-| **stop depending on the JVM** | `:clj-only` — a `.clj` with no `.cljc`/`.cljs` twin, so it runs on no other host | 100 | **18** | **6, no cycle** |
-| **be Kotoba only** | any host escape, including a `:cljs` branch naming `js/` | 100 | **52** | 8 + a cycle of 9 |
+| **stop depending on the JVM** | `:clj-only` — no `.cljs` twin and no `:cljs` reader-conditional branch | 125 | **34** | **4, no cycle** |
+| **be Kotoba only** | any host escape, including a `:cljs` branch naming `js/` | 125 | **86** | 6 + a cycle of 10 |
+
+Re-measured 2026-10-19 over 60 source trees — `kotoba-verifier/src`, amu
+`src` at `c4064497`, and the 58 `:pins` gitlibs checkouts named in
+`lang/selfhost-distance.edn` — 125 reachable namespaces, up from 100 at the
+pre-rename measurement the first table recorded.
 
 ### To stop depending on the JVM
 
-```
-wave 0  compiler.atomic-output, bounded-edn, coverage, ipld-adl-source,
-        project-files, component.admission, verifier.signing, wasm.tools
-wave 1  compiler.cache, coverage-evidence, module-lock, receipt, release,
-        component.core
-wave 2  component.artifact
-wave 3  compiler.core
-wave 4  compiler.test-profile
-wave 5  compiler.cli
-```
-
-**`kotoba.verifier.signing` is in wave 0.** Everything it requires is already
-`.cljc`; the only thing binding it to the JVM is that it is a `.clj` file.
-The trust gap measured above is therefore not blocked behind four waves of
-other work, which is what the conflated ordering implied — it can be started
-now.
+34 namespaces in 4 waves (0–3), no cycle. `lang/host-port-order.edn` carries
+the full wave list. `kotoba.verifier.signing` is **not** among them any more:
+the port to `.cljk` with a `:cljs` branch moved it out of `:clj-only` (its
+escapes now read `[:java-interop :js-interop :node-require]`). In the
+pre-rename snapshot it sat in wave 0, and "it can be started now" was the
+right read then — that rung is climbed, and the trust-chain measurement
+above is what came of it.
 
 ### To be Kotoba only
 
 From the same three roots — `kotoba.verifier.signing`,
-`kotoba.compiler.cli`, `kotoba.compiler.nbb.output-attestation`: **52
-host-bound namespaces, 8 waves and one cycle.**
-
-| wave | namespaces |
-|---:|---|
-| 0 | `cbor.core`, `json.core`, `compiler.atomic-output`, `bounded-edn`, `coverage`, `ipld-adl-source`, `kotoba-reader`, `project-files`, `component.admission`, `component.wit`, `gmir`, `hir`, `kir.cljs-i64`, `kir.descriptor`, `native.interrupt-abi`, `script`, `wasm.tools` |
-| 1 | `artifact.core`, `capability-names`, `kir.value`, `mir`, `wasm.typed` |
-| 2 | `backend.evm`, `nbb.output-attestation`, `kir.decimal`, `kir.xml`, `native.elf64`, `native.machine-ir`, `wasm.core` |
-| 3 | `component.core`, `kir`, `native.aarch64`, `native.x86-64` |
-| 4 | `compiler.frontend`, `reference-runtime`, `component.artifact`, `verifier` |
-| 5 | `backend.cljs`, `ios-aot`, `verifier.signing` |
-| 6 | `coverage-evidence`, `receipt`, `release` |
-| **cycle** | `cli`, `core`, `cache`, `definition-identity`, `module-lock`, `provenance`, `test-profile`, `kir.definition-identity`, `multiformats.core` |
+`kotoba.compiler.cli`, `kotoba.compiler.nbb.output-attestation`: **86
+host-bound namespaces, 6 waves and one cycle of 10.** Full wave lists are in
+`lang/host-port-order.edn`; the shape to know is that waves 0–2 are the face
+that can be started (leaves and near-leaves: the cbor/json/multiformats
+shims, the mechanism layer, `component.wit`, `verifier.signing`), and the
+names after that wait on what they require.
 
 Two things to read from it.
 
 **Wave 0 is the only face that can be started.** Everything after it waits on
 what it requires. It is what can begin, not what is easy.
 
-**The tail is a cycle, and nine namespaces sit in it.** `cli`, `core`,
-`cache`, `definition-identity`, `module-lock`, `provenance`, `test-profile`,
-`kir.definition-identity` and `multiformats.core` require each other, so no
-one of them comes out alone. Whether to break the cycle or move all nine at
-once is a design decision; it is not an ordering question, and the sort
+**The tail is a cycle, and ten namespaces sit in it:** `ipld.core`,
+`ipld.dag-json`, `kotoba.compiler.backend.kototama`, `cli`, `core`,
+`manifest-native`, `module-lock`, `test-cli`, `test-profile` and
+`multiformats.core` require each other, so no one of them comes out alone.
+(Compared to the pre-rename snapshot's nine: `backend.kototama`,
+`manifest-native`, `test-cli`, `ipld.core` and `ipld.dag-json` joined; `cache`,
+`definition-identity`, `provenance` and `kir.definition-identity` left.)
+Whether to break the cycle or move all ten
+at once is a design decision; it is not an ordering question, and the sort
 cannot answer it.
 
 `kotoba.artifact.core` carries `:java-interop`, `:node-require` **and**
