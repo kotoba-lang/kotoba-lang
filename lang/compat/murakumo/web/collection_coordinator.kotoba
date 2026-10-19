@@ -1,0 +1,59 @@
+(ns murakumo.web.collection-coordinator
+  "One durable campaign coordinator, hosted by a Murakumo operator. Persist
+  assignment/start before I/O, then custody, common index and KUMO finality.
+  Adapters are host code; a profile cannot replace them."
+  (:require [murakumo.web.collection :as c]
+            [murakumo.web.collection-runtime :as runtime]))
+
+(defn tick!
+  "One bounded hosted assignment. transact! serializes durable state updates;
+  snapshot! reads that same authority. run-host! executes the already pinned
+  profile on the admitted host (web_node :collection-run). The accepted result
+  and index are persisted before attempting the final KUMO payment.
+  If a host call fails, the running lease is intentionally left for explicit
+  reconciliation; this function never retries an ambiguous origin request."
+  [{:keys [snapshot! transact! now-ms run-host! verify-result! shared-get! shared-put!
+           settle-finalized!] :as env} campaign-key participant ceiling]
+  (c/require! (every? fn? [snapshot! transact! now-ms run-host! verify-result!]) :collection/coordinator-adapters)
+  (let [chosen (atom nil)]
+    (transact! (fn [state]
+                 (let [[next lease] (c/claim state campaign-key participant (now-ms) 900000 ceiling)]
+                   (reset! chosen lease) next)))
+    (if-let [lease @chosen]
+      (do
+        (transact! #(c/start % (:id lease) (:host-id lease) (now-ms)))
+        (let [result (run-host! participant lease)]
+          (transact! #(c/accept % (:id lease) result verify-result!))
+          (transact! #(runtime/update-index! {:shared-get! shared-get! :shared-put! shared-put!} % campaign-key))
+          (if settle-finalized!
+            (transact! #(runtime/settle! % (:id lease) settle-finalized!))
+            ;; An indexed contribution remains pending payment, never reported paid.
+            nil)
+          {:state (if (get-in (snapshot!) [:paid (:id lease)]) :paid :indexed-awaiting-settlement)
+           :assignment-id (:id lease)
+           :root-cid (get-in (snapshot!) [:roots campaign-key :cid])}))
+      {:state :no-work})))
+
+(defn resume-settlements!
+  "Recovery after an index commit or ambiguous KUMO response. Same run IDs are
+  submitted; the KUMO authority must return the prior finalized CID on replay."
+  [{:keys [snapshot! transact! settle-finalized!]}]
+  (c/require! settle-finalized! :collection/no-kumo-authority)
+  (doseq [id (sort (keys (:accepted (snapshot!))))
+          :let [state (snapshot!) l (get-in state [:leases id]) k [(:campaign-id l) (:epoch l)]]
+          :when (and (not (get-in state [:paid id])) (some #{id} (get-in state [:roots k :included])))]
+    (transact! #(runtime/settle! % id settle-finalized!))))
+
+(defn recover!
+  "An accepted contribution may have crashed before index publication. Rebuild
+  from shared immutable blocks, then retry deterministic pending settlements.
+  Never reruns a bot turn, crawl or inference."
+  [{:keys [snapshot! transact! shared-get! shared-put! settle-finalized!] :as env}]
+  (doseq [k (sort (keys (:campaigns (snapshot!))))
+          :let [state (snapshot!) accepted (set (for [[id l] (:leases state)
+                                                    :when (and (= k ((juxt :campaign-id :epoch) l))
+                                                               (get-in state [:accepted id]))] id))
+                included (set (get-in state [:roots k :included]))]
+          :when (seq (remove included accepted))]
+    (transact! #(runtime/update-index! {:shared-get! shared-get! :shared-put! shared-put!} % k)))
+  (when settle-finalized! (resume-settlements! env)))

@@ -1,0 +1,391 @@
+(ns grant.manifest
+  "The manifest normalizer, ported from the retired `aiueos/src/manifest.rs`
+  Rust module to CLJC per ADR-2607022200.
+
+  `grant.contract/validate-manifest` is the pure SHAPE authority: it checks
+  that a raw `:aiueos/*` EDN map has the right keys with the right coarse
+  types (e.g. `:aiueos/limits` has positive-integer `:memory-pages`/`:fuel`).
+  This namespace is the *normalizer*: given a manifest map that is already
+  shape-valid, fill in every default, derive every computed field, and hand
+  back a fully-explicit manifest — no more implicit defaults for
+  `grant.policy/verify-component` or `grant.broker` to guess at.
+
+  Concretely, `normalize`:
+
+  - Defaults `:aiueos/trust` by `:aiueos/kind` (`:agent` -> `:ai-generated`,
+    `:kernel-extension` -> `:trusted`, everything else -> `:untrusted`) —
+    strictly more refined than `grant.policy/verify-component`'s own
+    unconditional `:untrusted` fallback for a missing `:aiueos/trust`.
+    Calling `normalize` before `grant.policy/verify-component` makes that
+    coarser fallback correct (trust is already explicit by then).
+  - Defaults and range-checks `:aiueos/limits` and `:aiueos/quota`
+    (ADR-0006) — the one thing `grant.contract/validate-manifest`
+    intentionally leaves to this namespace, since it only checks *type*
+    (positive integer), not the semantic ceiling (e.g. wasm32's 65536-page /
+    4 GiB memory ceiling).
+  - Derives `:aiueos/schedule` from raw millisecond fields to cycle counts
+    (ADR-0006's cooperative scheduler has no wall clock).
+  - Derives `:aiueos/publishes` / `:aiueos/subscribes` from
+    `:aiueos/exports` / `:aiueos/imports` + `:aiueos/topics` when not given
+    explicitly.
+
+  `signed-message` and `with-trust` are the small ADR-0003 signing helpers
+  the retired `Manifest` struct carried as methods.
+
+  `verify-wasm-integrity` is the ADR-0003 artifact-integrity check
+  (\"Phase-0 gives integrity: a manifest may declare `:aiueos/wasm-sha256`
+  and the broker rejects the component if the loaded bytes don't match\")
+  -- a pure string comparison against an already-computed hash, so it stays
+  host-neutral even though the SHA-256 computation itself (over the actual
+  loaded wasm bytes) is necessarily a JVM/host-adapter concern (see
+  `grant.signing/sha256-hex`, consumed by `aiueos.execute`)."
+  (:require [kotoba.lang.text :as str]))
+
+;; -----------------------------------------------------------------------
+;; error shape (reused from grant.contract's `{:path [...] :message "..."}`)
+;; -----------------------------------------------------------------------
+
+(defn- err [path message]
+  {:path path :message message})
+
+(defn- fail!
+  "Fail loud on a semantically invalid field, mirroring the retired Rust
+  `read_limit`-style helpers (`AiueosError::Schema`): throw `ex-info` whose
+  `ex-data` is the same `{:path [...] :message \"...\"}` shape
+  `grant.contract`'s validators collect, so callers can handle both
+  uniformly."
+  [path message]
+  (throw (ex-info message (err path message))))
+
+(defn- int-in-range? [v lo hi]
+  (and (int? v) (<= lo v hi)))
+
+;; Upper bound for otherwise-unbounded 64-bit counters (fuel, quota). The
+;; retired Rust used `u64`/`i64`; on the JVM `Long/MAX_VALUE` is the closest
+;; analogue, on ClojureScript every number is an IEEE double so
+;; `Number.MAX_SAFE_INTEGER` is the honest ceiling (cannot represent the
+;; full i64/u64 range exactly).
+(def ^:private max-u64
+  )
+
+(defn- as-kw-set
+  "Coerce a keyword collection field (`nil`, a set, or a vector, per
+  `grant.contract`'s `kw-coll?`) to a set."
+  [x]
+  (cond
+    (nil? x) #{}
+    (set? x) x
+    (coll? x) (set x)
+    :else #{x}))
+
+;; -----------------------------------------------------------------------
+;; trust (ADR-2607022200 refinement of grant.policy's coarse fallback)
+;; -----------------------------------------------------------------------
+
+(defn default-trust
+  "The trust level a manifest gets when `:aiueos/trust` is absent, refined by
+  `:aiueos/kind`:
+
+  - `:agent` -> `:ai-generated` (LLM-authored code starts at the locked-down
+    tier, never silently `:untrusted`-and-nothing-more).
+  - `:kernel-extension` -> `:trusted` (presumed part of the trusted base).
+  - anything else -> `:untrusted`."
+  [kind]
+  (case kind
+    :agent :ai-generated
+    :kernel-extension :trusted
+    :untrusted))
+
+(defn resolve-trust
+  "The effective `:aiueos/trust` for manifest `m`: the declared value if
+  present, else `default-trust` of its `:aiueos/kind`."
+  [m]
+  (or (:aiueos/trust m) (default-trust (:aiueos/kind m))))
+
+;; -----------------------------------------------------------------------
+;; limits (ADR-0001 fuel/memory ceilings)
+;; -----------------------------------------------------------------------
+
+(def default-memory-pages 16)
+
+(def min-memory-pages 1)
+
+;; wasm32 linear memory: 65536 pages x 64 KiB/page = 4 GiB, the hard ceiling
+;; a 32-bit component's address space can ever reach.
+(def max-memory-pages 65536)
+
+(def default-fuel 10000000)
+
+(def min-fuel 1)
+
+(defn normalize-limits
+  "`:aiueos/limits {:memory-pages N :fuel N}`, defaulted (16 pages / 10M
+  fuel) and range-checked: `:memory-pages` in `[1, 65536]` (the wasm32 4 GiB
+  ceiling), `:fuel` in `[1, i64-max]`. Throws `ex-info` (see `fail!`) if a
+  present value is non-integer or out of range — `grant.contract`'s shape
+  check only confirms \"positive integer\", not this semantic ceiling."
+  [m]
+  (let [limits (or (:aiueos/limits m) {})
+        memory-pages (get limits :memory-pages default-memory-pages)
+        fuel (get limits :fuel default-fuel)]
+    (when-not (int-in-range? memory-pages min-memory-pages max-memory-pages)
+      (fail! [:aiueos/limits :memory-pages]
+             (str ":memory-pages must be an integer in [" min-memory-pages ", " max-memory-pages "]")))
+    (when-not (int-in-range? fuel min-fuel max-u64)
+      (fail! [:aiueos/limits :fuel]
+             (str ":fuel must be an integer in [" min-fuel ", " max-u64 "]")))
+    {:memory-pages memory-pages :fuel fuel}))
+
+;; -----------------------------------------------------------------------
+;; quota (ADR-0006 per-cycle host-call rate caps)
+;; -----------------------------------------------------------------------
+
+(def default-host-calls 1024)
+
+(def min-host-calls 1)
+
+(def default-quota-publishes
+  "Default `:aiueos/quota :publishes` — the per-cycle `publish` call budget.
+  Distinct from `:aiueos/publishes` (the topic-id allow-set); both happen to
+  share the English word \"publishes\" but count different things."
+  256)
+
+(def min-quota-publishes 0)
+
+(defn normalize-quota
+  "`:aiueos/quota {:host-calls N :publishes N}` (ADR-0006), defaulted (1024
+  host-calls / 256 publishes per cycle) and range-checked: `:host-calls` in
+  `[1, i64-max]`, `:publishes` in `[0, i64-max]`. Generous defaults so a
+  manifest with no `:aiueos/quota` is unaffected — deny-by-default applies to
+  *capabilities*, not to call counts."
+  [m]
+  (let [quota (or (:aiueos/quota m) {})
+        host-calls (get quota :host-calls default-host-calls)
+        publishes (get quota :publishes default-quota-publishes)]
+    (when-not (int-in-range? host-calls min-host-calls max-u64)
+      (fail! [:aiueos/quota :host-calls]
+             (str ":host-calls must be an integer in [" min-host-calls ", " max-u64 "]")))
+    (when-not (int-in-range? publishes min-quota-publishes max-u64)
+      (fail! [:aiueos/quota :publishes]
+             (str ":publishes must be an integer in [" min-quota-publishes ", " max-u64 "]")))
+    {:host-calls host-calls :publishes publishes}))
+
+;; -----------------------------------------------------------------------
+;; schedule (ADR-0006 cycle derivation; no wall clock in the control loop)
+;; -----------------------------------------------------------------------
+
+(def default-cycle-ms 1)
+(def default-priority 100)
+(def default-wall-deadline-ms 30000)
+(def max-wall-deadline-ms 30000)
+
+(defn normalize-schedule
+  "Derive `:aiueos/schedule {:period-ms :deadline-ms :priority :cycle-ms}`
+  to cycles (ADR-0006 — the control loop's `clock()` is a cycle counter, not
+  a wall clock, so scheduling is enforced in cycles via the declared
+  `:cycle-ms` ratio).
+
+  - `:cycle-ms` defaults to 1 (min 1) — this system's cycle->ms ratio.
+  - `:period-ms` defaults to `:cycle-ms` (min 1) — run every cycle.
+  - `:deadline-ms` defaults to `:period-ms` (min 1) — implicit-deadline, the
+    common real-time case.
+  - `:priority` defaults to 100 (min 0) — a low-urgency middle; lower value
+    is more urgent.
+  - `period-cycles`/`deadline-cycles` are `ceil(ms / cycle-ms)`, at least 1,
+    computed with exact integer division (`quot`, never float — a `float`
+    ceil would risk rounding drift across hosts).
+
+  Returns `{:aiueos.manifest/period-cycles N
+  :aiueos.manifest/deadline-cycles N :aiueos.manifest/deadline-ms N
+  :aiueos.manifest/priority N}`. Exact deadline milliseconds are retained for
+  the host watchdog; `:cycle-ms` itself is dropped."
+  [m]
+  (let [sched (or (:aiueos/schedule m) {})
+        cycle-ms (max 1 (or (:cycle-ms sched) default-cycle-ms))
+        period-ms (max 1 (or (:period-ms sched) cycle-ms))
+        deadline-ms (max 1 (or (:deadline-ms sched) period-ms))
+        wall-deadline-ms (if (contains? m :aiueos/schedule)
+                           deadline-ms
+                           default-wall-deadline-ms)
+        priority (max 0 (or (:priority sched) default-priority))
+        ceil-cycles (fn [ms] (max 1 (quot (+ ms cycle-ms -1) cycle-ms)))]
+    (when (> wall-deadline-ms max-wall-deadline-ms)
+      (fail! [:aiueos/schedule :deadline-ms]
+             (str ":deadline-ms must be at most " max-wall-deadline-ms)))
+    {:aiueos.manifest/period-cycles (ceil-cycles period-ms)
+     :aiueos.manifest/deadline-cycles (ceil-cycles deadline-ms)
+     :aiueos.manifest/deadline-ms wall-deadline-ms
+     :aiueos.manifest/priority priority}))
+
+(defn due-this-cycle?
+  "Whether a component whose normalized `:aiueos/schedule` is SCHEDULE (the
+  `{:aiueos.manifest/period-cycles ...}` map `normalize-schedule` produces)
+  is due to run at CYCLE (a non-negative cycle counter -- ADR-0006's
+  cycle-based control loop, not wall-clock time). Cycle 0 is due for every
+  period (a component always runs at least once, at boot); afterward a
+  component with `:period-cycles N` is due every Nth cycle.
+
+  This pure predicate only decides release timing. Once released,
+  `aiueos.execute` enforces the normalized millisecond deadline through an
+  interrupting host watchdog and confirms worker termination."
+  [schedule cycle]
+  (zero? (mod cycle (:aiueos.manifest/period-cycles schedule))))
+
+;; -----------------------------------------------------------------------
+;; topics + publish/subscribe derivation
+;; -----------------------------------------------------------------------
+
+(defn topic-name-map
+  "`:aiueos/topics {name-kw id-int ...}` — the name->numeric-topic-id map a
+  manifest declares. Absent -> `{}`."
+  [m]
+  (or (:aiueos/topics m) {}))
+
+(defn derive-topic-ids
+  "Map named topic capabilities (`:topic/<name>`) present in `caps` to their
+  numeric ids via `topics` (a name-keyword -> id-int map, e.g. from
+  `topic-name-map`). `:topic/publish` and `:topic/subscribe` are the two
+  coarse gate capabilities (ADR-0002's kernel primitives) — never data-topic
+  names — and are always excluded, even if present in `caps`.
+
+  Returns `nil`, not `#{}`, when no capability resolves: an empty set would
+  mean \"restricted to publish/subscribe on nothing\", while `nil` means
+  \"unrestricted\" (the caller leaves the access unrestricted rather than
+  wrongly declaring an empty allow-set). Collapsing that distinction would
+  silently over-restrict every component that doesn't use named topics."
+  [caps topics]
+  (let [ids (into (sorted-set)
+                   (comp (filter #(and (keyword? %) (= "topic" (namespace %))))
+                         (remove #{:topic/publish :topic/subscribe})
+                         (keep #(get topics (keyword (name %)))))
+                   (as-kw-set caps))]
+    (when (seq ids) ids)))
+
+(defn- explicit-topic-ids
+  "If `m` has an explicit `k` (`:aiueos/publishes` or `:aiueos/subscribes`),
+  the set of numeric topic ids it declares (validated as a collection of
+  ints; an empty explicit collection is preserved as `#{}`, not treated as
+  absent). `nil` if `k` is not present at all, so the caller falls back to
+  `derive-topic-ids`."
+  [m k]
+  (when (contains? m k)
+    (let [v (get m k)]
+      (when-not (and (coll? v) (every? int? v))
+        (fail! [k] (str k " must be a collection of integer topic ids")))
+      (into (sorted-set) v))))
+
+;; -----------------------------------------------------------------------
+;; signing (ADR-0003)
+;; -----------------------------------------------------------------------
+
+(defn- id->str
+  "Render a component id (keyword or string, per `grant.contract`'s
+  `component-id?`) as the plain string the retired Rust `Manifest.id: String`
+  used — notably *without* a keyword's leading `:`, since the canonical
+  signed message (`\"<id>\\n<wasm-sha256>\"`, e.g. `driver/sensor\\n3b1f…`)
+  binds to the bare id text, not its EDN literal spelling."
+  [id]
+  (if (keyword? id)
+    (if-let [ns (namespace id)] (str ns "/" (name id)) (name id))
+    (str id)))
+
+(defn signed-message
+  "The canonical message a signature covers (ADR-0003):
+  `\"<id>\\n<wasm-sha256>\"`. `nil` if the manifest has no
+  `:aiueos/wasm-sha256` — nothing to bind, so it cannot be signed."
+  [m]
+  (when-let [hash (:aiueos/wasm-sha256 m)]
+    (str (id->str (:aiueos/component m)) "\n" hash)))
+
+(defn with-trust
+  "A copy of manifest `m` with `:aiueos/trust` replaced by `trust` — used
+  when a valid signature elevates a component to `:verified` (ADR-0003).
+  Purely a data update; the caller decides whether elevation applies."
+  [m trust]
+  (assoc m :aiueos/trust trust))
+
+;; -----------------------------------------------------------------------
+;; artifact integrity (ADR-0003's other half: `:aiueos/wasm-sha256`
+;; actually checked, not just carried as an opaque signing input)
+;; -----------------------------------------------------------------------
+
+(defn verify-wasm-integrity
+  "Compare manifest `m`'s declared `:aiueos/wasm-sha256` against
+  ACTUAL-SHA256-HEX -- a hex SHA-256 digest the CALLER already computed
+  from the actual loaded wasm bytes (e.g. `grant.signing/sha256-hex`,
+  JVM-only; this function itself is pure string comparison, portable to
+  every CLJC host, matching the `signed-message`/`hex-encode` split
+  elsewhere in this repo between 'pure comparison/formatting' and
+  'host-specific crypto primitive').
+
+  Returns `nil` when `m` declares no `:aiueos/wasm-sha256` (nothing to
+  check -- integrity pinning is opt-in per manifest, same as signing has
+  nothing to bind without a declared hash, see `signed-message`) or when
+  the hashes match (case-insensitive hex compare). Returns a violation map
+  (the same `{:aiueos/component :aiueos/kind :aiueos/message}` shape
+  `grant.policy`'s violations and `grant.signing`'s bad-signature
+  violations use, so a caller can fold it into the same
+  `:aiueos/violations` vector) on mismatch, tagged `:artifact-mismatch` --
+  this is the enforcement side of ADR-0003's 'Phase-0 gives integrity: ...
+  the broker rejects the component if the loaded bytes don't match' claim,
+  which previously had no code actually performing this comparison
+  anywhere in the execution path (`:aiueos/wasm-sha256` was used only as
+  an input string to `signed-message`, never recomputed from or compared
+  against the bytes that actually got executed)."
+  [m actual-sha256-hex]
+  (when-let [declared (:aiueos/wasm-sha256 m)]
+    (when-not (= (str/lower declared) (str/lower (str actual-sha256-hex)))
+      {:aiueos/component (:aiueos/component m)
+       :aiueos/kind :artifact-mismatch
+       :aiueos/message (str "wasm bytes do not match declared :aiueos/wasm-sha256 (declared "
+                             declared ", actual " actual-sha256-hex ")")})))
+
+;; -----------------------------------------------------------------------
+;; normalize — the main entry point
+;; -----------------------------------------------------------------------
+
+(defn normalize
+  "Take a manifest map already validated for SHAPE by
+  `grant.contract/validate-manifest`, and return a fully-defaulted,
+  normalized copy:
+
+  - `:aiueos/trust` -- defaulted by kind (see `resolve-trust`).
+  - `:aiueos/limits` -- defaulted + range-checked (see `normalize-limits`).
+  - `:aiueos/quota` -- defaulted + range-checked (see `normalize-quota`).
+  - `:aiueos/schedule` -- replaced with its cycle-derived form (see
+    `normalize-schedule`) — `:period-ms`/`:deadline-ms`/`:cycle-ms` are
+    consumed, not carried forward.
+  - `:aiueos/topics` -- defaulted to `{}`.
+  - `:aiueos/publishes` / `:aiueos/subscribes` -- the manifest's explicit
+    value if given (even if an empty collection), else derived from
+    `:aiueos/exports` / `:aiueos/imports` + `:aiueos/topics` via
+    `derive-topic-ids` (`nil` if nothing resolves — unrestricted).
+
+  Everything else on `m` (`:aiueos/component`, `:aiueos/kind`,
+  `:aiueos/device`, ...) passes through unchanged. This is what
+  `grant.policy/verify-component` and `grant.broker` should call before
+  reasoning over a manifest, so every consumer sees the same fully-explicit
+  data instead of re-deriving defaults independently.
+
+  Throws `ex-info` (see `fail!`) if a limits/quota field is present but
+  semantically out of range."
+  [m]
+  (let [trust (resolve-trust m)
+        limits (normalize-limits m)
+        quota (normalize-quota m)
+        schedule (normalize-schedule m)
+        topics (topic-name-map m)
+        exports (as-kw-set (:aiueos/exports m))
+        imports (as-kw-set (:aiueos/imports m))
+        publishes (or (explicit-topic-ids m :aiueos/publishes)
+                      (derive-topic-ids exports topics))
+        subscribes (or (explicit-topic-ids m :aiueos/subscribes)
+                       (derive-topic-ids imports topics))]
+    (assoc m
+           :aiueos/trust trust
+           :aiueos/limits limits
+           :aiueos/quota quota
+           :aiueos/schedule schedule
+           :aiueos/topics topics
+           :aiueos/publishes publishes
+           :aiueos/subscribes subscribes)))

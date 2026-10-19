@@ -1,0 +1,152 @@
+(ns murakumo.infer.image-native
+  "Pinned Qwen Image 2.1 GGUF execution through sd.cpp. No shell sees prompts."
+  (:require ["node:fs" :as fs] ["node:path" :as path] ["node:child_process" :as cp] ["node:os" :as os]))
+
+(def model-id "qwen-image-2.1-uncensored")
+(def runtime-revision "3f8527a46c54ecf4cb4ed6003da8e8982283c73c")
+(def artifacts
+  [{:file "qwen-image-2.1-UC-Q4_K_M.gguf"
+    :repo "abenzerps/Qwen-Image-2.1-Uncensored-GGUF" :revision "6b34e59458d3eb7ba6a6f86a116aed5253dc02c3"
+    :sha256 "e79c8a009f2ecbdb6c70fd663d9aea9ee304a0d91f347e4169a756b8ad141b41"}
+   {:file "Qwen3VL-8B-Instruct-Q4_K_M.gguf"
+    :repo "Qwen/Qwen3-VL-8B-Instruct-GGUF" :revision "f982a07559d4a2f6c8744d840bf6fccab30eea96"
+    :sha256 "67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2"}
+   {:file "qwen_image_2.1_vae_bf16.safetensors" :remote-file "vae/qwen_image_2.1_vae_bf16.safetensors"
+    :repo "abenzerps/Qwen-Image-2.1-Uncensored-GGUF" :revision "6b34e59458d3eb7ba6a6f86a116aed5253dc02c3"
+    :sha256 "bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9"}])
+
+(def memory-sample (atom {:at 0 :value 0 :pending nil}))
+(defn memory-available! []
+  (if (= "darwin" (.-platform js/process))
+    (let [{:keys [at value pending]} @memory-sample]
+      (cond pending pending
+            (< (- (js/Date.now) at) 3000) (js/Promise.resolve value)
+            :else (let [p (-> (js/Promise.
+                                (fn [resolve reject]
+                                  (cp/execFile "/usr/bin/memory_pressure" #js ["-Q"] #js {:encoding "utf8" :timeout 5000}
+                                    (fn [error report]
+                                      (if error (reject error)
+                                        (let [pct (js/parseInt (second (re-find #"free percentage: (\d+)%" report)) 10)]
+                                          (if (<= 0 pct 100) (resolve (* (.totalmem os) (/ pct 100)))
+                                            (reject (js/Error. "Memory observation unavailable")))))))))
+                              (.then (fn [n] (reset! memory-sample {:at (js/Date.now) :value n :pending nil}) n))
+                              (.catch (fn [e] (swap! memory-sample assoc :pending nil) (throw e))))]
+                    (swap! memory-sample assoc :pending p) p)))
+    (js/Promise.resolve (* 1024 (js/parseInt (or (second (re-find #"MemAvailable:\s+(\d+)" (fs/readFileSync "/proc/meminfo" "utf8"))) "0") 10)))))
+(defn qualified? [cfg]
+  (try
+    (let [marker (js->clj (js/JSON.parse (fs/readFileSync (path/join (:native-root cfg) "qualified.json") "utf8")) :keywordize-keys true)]
+      (and (= model-id (:model marker)) (= runtime-revision (:runtime marker)) (= (or (:backend cfg) "cpu") (:backend marker))
+           (= (mapv :sha256 artifacts) (:sha256 marker))
+           (fs/existsSync (:sd-cli cfg))
+           (every? #(fs/existsSync (path/join (:native-root cfg) "models" (:file %))) artifacts)))
+    (catch :default _ false)))
+(defn optional-local! [url idle?]
+  (-> (js/fetch url #js {:signal (js/AbortSignal.timeout 5000)})
+      (.then (fn [r] (when-not (.-ok r) (throw (js/Error. "GPU occupancy unavailable"))) (.json r)))
+      (.then idle?)
+      (.catch (fn [e]
+                (if (= "ECONNREFUSED" (some-> e .-cause .-code)) true
+                  (do (println "[image] local GPU observation unavailable" url (.-name e)) (throw e)))))))
+(defn text-process-idle! []
+  (js/Promise.
+   (fn [resolve reject]
+     (cp/execFile "/usr/bin/pgrep" #js ["-x" "llama-server"] #js {:timeout 5000}
+                  (fn [error _]
+                    (if (and error (not= 1 (.-code error)))
+                      (do (println "[image] local GPU process observation unavailable" (.-code error)) (reject error))
+                      (resolve (boolean error))))))))
+(defn gpu-idle! [cfg]
+  (if-not (= "metal" (:backend cfg)) (js/Promise.resolve true)
+      (-> (js/Promise.all
+           #js [(text-process-idle!)
+                (optional-local! "http://127.0.0.1:11434/api/ps"
+                                #(and (js/Array.isArray (.-models %)) (zero? (.-length (.-models %)))))
+                (optional-local! "http://127.0.0.1:8188/queue"
+                                #(and (js/Array.isArray (.-queue_running %)) (js/Array.isArray (.-queue_pending %))
+                                      (zero? (.-length (.-queue_running %))) (zero? (.-length (.-queue_pending %)))))])
+          (.then (fn [idle] (every? true? idle))))))
+(defn probe! [cfg]
+  (let [qualified (qualified? cfg)]
+    (-> (js/Promise.all #js [(if @(:busy cfg) (js/Promise.resolve false) (gpu-idle! cfg)) (memory-available!)])
+        (.then (fn [[idle? free]]
+                 {:name (:name cfg) :models (if qualified [model-id] []) :running (if @(:busy cfg) 1 0) :pending 0
+                  :memory-bytes free :ready (boolean (and idle? qualified (not @(:busy cfg)) (>= free (:min-free cfg))))})))))
+
+(defn arguments [cfg {:keys [model input]} output]
+  (let [{:keys [prompt width height steps seed]} input
+        backend (or (:backend cfg) "cpu")
+        assignment (case backend "cpu" "cpu" "metal" "diffusion=MTL0,te=cpu,vae=cpu"
+                         (throw (js/Error. "Unsupported native backend")))
+        model-path #(path/join (:native-root cfg) "models" %)]
+    (when-not (and (= model-id model) (string? prompt) (<= 1 (count prompt) 2000)
+                   (= 512 width height) (= 25 steps) (int? seed) (<= 0 seed 2147483647))
+      (throw (js/Error. "Invalid native image profile")))
+    ["--diffusion-model" (model-path (:file (first artifacts)))
+     "--llm" (model-path (:file (second artifacts)))
+     "--vae" (model-path (:file (last artifacts)))
+     "-p" prompt "-W" (str width) "-H" (str height) "--steps" (str steps)
+     "--seed" (str seed) "--cfg-scale" "1" "--sampling-method" "euler"
+     ;; The K16's resident text service owns Vulkan exclusively. Explicit CPU
+     ;; assignments and disabled auto-fit prevent even an idle-GPU race.
+     "--backend" assignment "--params-backend" assignment "--auto-fit" "off" "--fa" "-t" "4" "-o" output]))
+
+(defn execute! [cfg claim lost?]
+  (let [dir (fs/mkdtempSync (path/join (:native-root cfg) "job-")) output (path/join dir "image.png")]
+    (-> (js/Promise.
+         (fn [resolve reject]
+           (try
+             (let [child (cp/spawn (:sd-cli cfg) (clj->js (arguments cfg claim output))
+                                  #js {:stdio #js ["ignore" "ignore" "pipe"] :shell false})
+                   stderr (atom (js/Buffer.alloc 0)) reason (atom nil)
+                   cancelled? (atom false) kill-timer (atom nil)
+                   gpu-checking? (atom false) observed-at (atom (js/Date.now))
+                   timer (js/setInterval
+                          (fn []
+                            (when (and (= "metal" (:backend cfg)) (not @gpu-checking?))
+                              (reset! gpu-checking? true)
+                              (-> ((or (:gpu-idle-fn cfg) gpu-idle!) cfg)
+                                  (.then (fn [idle?]
+                                           (if (not idle?) (do (reset! reason "gpu-occupied") (reset! lost? true))
+                                             (-> (memory-available!) (.then (fn [free]
+                                                                             (reset! observed-at (js/Date.now))
+                                                                           (when (< free (* 2 1024 1024 1024))
+                                                                             (reset! reason "memory-headroom") (reset! lost? true))))))))
+                                  ;; Heavy GPU loads can briefly delay pgrep or local
+                                  ;; occupancy endpoints. Preserve the last observation
+                                  ;; for at most 20s; real competition still cancels now.
+                                  (.catch (fn [_]
+                                            (when (>= (- (js/Date.now) @observed-at) 20000)
+                                              (reset! reason "gpu-observation-failed") (reset! lost? true))))
+                                  (.finally #(reset! gpu-checking? false))))
+                            (when (and (not @cancelled?) (or @lost? (>= (js/Date.now) (:deadline claim))))
+                              (reset! cancelled? true) (.kill child "SIGTERM")
+                              (reset! kill-timer (js/setTimeout #(.kill child "SIGKILL") 3000)))) 1000)]
+               (.on (.-stderr child) "data" (fn [bytes]
+                                              (let [b (js/Buffer.concat #js [@stderr bytes])]
+                                                (reset! stderr (.subarray b (max 0 (- (.-length b) 16384)))))))
+               (.once child "error" (fn [_] (js/clearInterval timer) (reject (js/Error. "Native image runtime unavailable"))))
+               (.once child "close"
+                      (fn [code signal]
+                        (js/clearInterval timer) (when @kill-timer (js/clearTimeout @kill-timer))
+                        (try
+                          (when (or @cancelled? @lost? (not= 0 code))
+                            (fs/writeFileSync (path/join (:native-root cfg) "last-render-error.log") @stderr #js {:mode 384})
+                            (throw (js/Error. (str "Native image execution failed or lease expired: exit=" code " signal=" signal " reason=" (or @reason (if @lost? "lease" "runtime"))))))
+                          (let [bytes (fs/readFileSync output)]
+                            (when-not (and (<= 24 (.-length bytes) 8388608)
+                                           (= "89504e470d0a1a0a" (.toString (.subarray bytes 0 8) "hex"))
+                                           (= 512 (.readUInt32BE bytes 16) (.readUInt32BE bytes 20)))
+                              (throw (js/Error. "Invalid native image artifact")))
+                            (resolve (.toString bytes "base64")))
+                          (catch :default e (reject e))))))
+             (catch :default e (reject e)))))
+        (.finally #(fs/rmSync dir #js {:recursive true :force true})))))
+
+(defn render! [cfg claim lost?]
+  (-> ((or (:gpu-idle-fn cfg) gpu-idle!) cfg)
+      (.then (fn [idle?]
+               (when-not idle? (throw (js/Error. "GPU occupied before image execution")))
+               (when (or @lost? (>= (js/Date.now) (:deadline claim)))
+                 (throw (js/Error. "Native image lease expired before execution")))
+               (execute! cfg claim lost?)))))

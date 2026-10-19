@@ -1,0 +1,440 @@
+(ns kototama.transport-provider
+  "Opt-in JVM socket/TLS bindings for the bounded Kotoba transport ABI.
+
+  Socket objects never cross the Wasm boundary. Guests receive affine opaque
+  i64 handles, and every endpoint, byte count, connection count, and connect
+  timeout is checked against HostCaps before native I/O."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            [kotoba.security.abac :as abac]
+            [kotoba.security.approval :as approval]
+            [kotoba.security.crypto-policy :as crypto]
+            [kotoba.security.hardware :as hardware]
+            [kotoba.security.information-flow :as flow]
+            [kototama.contract :as contract]
+            [kototama.tender :as tender])
+  (:import (com.dylibso.chicory.runtime HostFunction)
+           (com.dylibso.chicory.wasm.types ValType)
+           (java.security MessageDigest)
+           (java.security.cert X509Certificate)
+           (java.net IDN InetAddress InetSocketAddress Socket)
+           (javax.net.ssl SNIHostName SSLParameters SSLSocket SSLSocketFactory)))
+
+(defn- tls-server-end-point-digest [^SSLSocket socket]
+  (let [^X509Certificate certificate
+        (first (.getPeerCertificates (.getSession socket)))
+        signature (str/upper (.getSigAlgName certificate))
+        algorithm (cond
+                    (str/includes? signature "SHA512") "SHA-512"
+                    (str/includes? signature "SHA384") "SHA-384"
+                    ;; RFC 5929: MD5/SHA-1 certificate signatures use SHA-256.
+                    :else "SHA-256")]
+    (.digest (MessageDigest/getInstance algorithm) (.getEncoded certificate))))
+
+(defn- read-bytes [instance ptr len]
+  (.readBytes (.memory instance) (int ptr) (int len)))
+
+(defn- read-utf8 [instance ptr len]
+  (kbytes/utf8-string ^bytes (read-bytes instance ptr len)))
+
+(defn- write-bytes [instance ptr cap bs]
+  (let [n (count bs)]
+    (if (> n cap)
+      -1
+      (do (.write (.memory instance) (int ptr) (byte-array bs) 0 n) n))))
+
+(defn- granted! [caps id]
+  (when-not (contains? (:grants caps) id)
+    (tender/denied! id :grant/missing {:granted (:grants caps)})))
+
+(defn- ip-literal? [host]
+  (or (str/includes? host ":")
+      (boolean (re-matches #"[0-9]+(?:\.[0-9]+){3}" host))))
+
+(defn- canonical-host [host]
+  (try
+    (when (and (string? host) (seq host) (= host (str/trim host))
+               (not (str/includes? host "\u0000")))
+      (let [unbracketed (if (and (str/starts-with? host "[")
+                                 (str/ends-with? host "]"))
+                          (subs host 1 (dec (count host)))
+                          host)]
+        (if (ip-literal? unbracketed)
+          (str/lower (.getHostAddress (InetAddress/getByName unbracketed)))
+          (let [without-root-dot (if (str/ends-with? unbracketed ".")
+                                   (subs unbracketed 0 (dec (count unbracketed)))
+                                   unbracketed)
+                ascii (IDN/toASCII without-root-dot IDN/USE_STD3_ASCII_RULES)]
+            (when (seq ascii) (str/lower ascii))))))
+    (catch Exception _ nil)))
+
+(defn- exact-endpoint [host port]
+  (when-let [canonical (canonical-host host)]
+    (str (if (str/includes? canonical ":")
+           (str "[" canonical "]")
+           canonical)
+         ":" port)))
+
+(defn transport-decision
+  "Evaluate the shared four-axis policy for one canonical endpoint. Repository-
+  specific code only supplies transport attributes; policy semantics live in
+  kotoba-lang/security."
+  [policy attributes host port]
+  (abac/evaluate
+   (-> attributes
+       (assoc :resource (merge {:id (exact-endpoint host port)}
+                               (:resource attributes)))
+       (assoc :action (merge {:id :transport/connect
+                              :capabilities #{:transport-connect}}
+                             (:action attributes))))
+   policy))
+
+(defn egress-decision
+  "Evaluate classification flow immediately before bytes leave the guest."
+  [context]
+  (flow/evaluate-egress context))
+
+(defn crypto-decision [policy envelope]
+  (crypto/check-production-envelope policy envelope))
+
+(defn hardware-signing-decision [required? evidence]
+  (assoc (hardware/evaluate-signing evidence)
+         :hardware-signing/required? (boolean required?)))
+
+(defn enforce-hardware-signing! [required? evidence]
+  (let [decision (hardware-signing-decision required? evidence)]
+    (when (and required? (not (:hardware-signing/qualified? decision)))
+      (throw (ex-info "hardware signing policy denies transport"
+                      {:type :kototama/hardware-signing-denied
+                       :hardware-signing decision})))
+    decision))
+
+(defn approval-decision
+  [approvals context endpoint endpoint-digest-fn]
+  (approval/evaluate
+   approvals
+   (assoc context
+          :request-digest
+          (when (ifn? endpoint-digest-fn)
+            (endpoint-digest-fn endpoint)))))
+
+(defn enforce-approval!
+  [required? approvals context endpoint endpoint-digest-fn]
+  (let [decision (approval-decision approvals context endpoint
+                                    endpoint-digest-fn)]
+    (when (and required? (not (:approval/allowed? decision)))
+      (throw (ex-info "approval quorum denies transport"
+                      {:type :kototama/approval-denied
+                       :endpoint endpoint :approval decision})))
+    decision))
+
+(defn- endpoint-allowed? [allowlist host port]
+  (and (set? allowlist)
+       (contains? allowlist (exact-endpoint host port))))
+
+(defn- close-quietly! [x]
+  (when x
+    (try (.close x) (catch Exception _ nil))))
+
+(defn- take-handle! [handles handle]
+  (let [entry (get @handles handle)]
+    (when entry (swap! handles dissoc handle))
+    entry))
+
+(defn- allocate-handle! [handles next-handle entry]
+  (let [handle (swap! next-handle inc)]
+    (swap! handles assoc handle entry)
+    handle))
+
+(defn- reserve! [usage key limit amount]
+  (let [accepted? (atom false)]
+    (swap! usage
+           (fn [state]
+             (let [current (get state key 0)]
+               (if (<= (+ current amount) limit)
+                 (do (reset! accepted? true) (assoc state key (+ current amount)))
+                 state))))
+    @accepted?))
+
+(defn- i32-be [value]
+  (byte-array
+   (map unchecked-byte
+        [(bit-and 255 (unsigned-bit-shift-right (long value) 24))
+         (bit-and 255 (unsigned-bit-shift-right (long value) 16))
+         (bit-and 255 (unsigned-bit-shift-right (long value) 8))
+         (bit-and 255 (long value))])))
+
+(defn- cancel-request-bytes [pid secret]
+  (byte-array (concat (i32-be 16) (i32-be 80877102)
+                      (i32-be pid) (i32-be secret))))
+
+(defn native-provider
+  "Creates one isolated native provider and its Chicory HostFunction map.
+
+  Return value also exposes `:close!` for tender/process shutdown and `:state`
+  for receipts/tests. The caller passes `:host-functions` to
+  `tender/open-session` as `:provider-host-functions`."
+  ([host-caps] (native-provider host-caps {}))
+  ([host-caps {:keys [ssl-socket-factory ssl-socket-factory-fn
+                      abac-policy abac-attributes information-flow-context
+                      crypto-required? crypto-policy crypto-envelope
+                      hardware-signing-required? hardware-signing-evidence
+                      approval-required? approvals-fn approval-context
+                      endpoint-digest-fn
+                      require-client-certificate?
+                      resolve-addresses trace-read! trace-write!]
+               :or {ssl-socket-factory (SSLSocketFactory/getDefault)
+                    trace-read! (fn [_] nil)
+                    trace-write! (fn [_] nil)
+                    resolve-addresses (fn [host]
+                                        (seq (InetAddress/getAllByName host)))}}]
+  (let [caps (contract/host-caps host-caps)
+        limits (:limits caps)
+        allowlist (:transport-endpoint-allowlist limits)
+        resolved-allowlist (:transport-resolved-address-allowlist limits)
+        factory-resolver (or ssl-socket-factory-fn (fn [] ssl-socket-factory))
+        handles (atom {})
+        next-handle (atom 0)
+        usage (atom {:connections 0 :read-bytes 0 :write-bytes 0})
+        last-abac-decision (atom nil)
+        last-information-flow-decision (atom nil)
+        last-tls-decision (atom nil)
+        last-approval-decision (atom nil)
+        crypto-decision (when (or crypto-required? crypto-envelope)
+                          (crypto-decision crypto-policy crypto-envelope))
+        hardware-signing-decision*
+        (when (or hardware-signing-required? hardware-signing-evidence)
+          (hardware-signing-decision hardware-signing-required?
+                                     hardware-signing-evidence))
+        connect
+        (tender/host-fn
+         "transport_connect" [ValType/I32 ValType/I32 ValType/I32] ValType/I64
+         (fn [instance args]
+           (granted! caps :transport-connect)
+           (enforce-hardware-signing! hardware-signing-required?
+                                      hardware-signing-evidence)
+           (when (and crypto-required? (not (:valid? crypto-decision)))
+             (throw (ex-info "hybrid PQC policy denies transport"
+                             {:type :kototama/crypto-denied
+                              :crypto crypto-decision})))
+           (let [raw-host (read-utf8 instance (aget args 0) (aget args 1))
+                 host (canonical-host raw-host)
+                 port (long (aget args 2))
+                 endpoint (when host (exact-endpoint host port))
+                 approvals (when (and endpoint (ifn? approvals-fn))
+                             (approvals-fn endpoint))
+                 approval-decision*
+                 (when (and endpoint (or approval-required? approvals-fn))
+                   (enforce-approval! approval-required? approvals
+                                      approval-context endpoint
+                                      endpoint-digest-fn))
+                 decision (when host
+                            (transport-decision abac-policy abac-attributes host port))]
+             (reset! last-approval-decision approval-decision*)
+             (reset! last-abac-decision decision)
+             (if (and host (<= 1 port 65535)
+                      (:abac/allowed? decision)
+                      (endpoint-allowed? allowlist host port)
+                      (reserve! usage :connections
+                                (:max-transport-connections limits) 1))
+               (let [addresses (try (vec (resolve-addresses host))
+                                    (catch Exception _ []))
+                     address (first
+                              (filter
+                               (fn [^InetAddress candidate]
+                                 (or (nil? resolved-allowlist)
+                                     (contains? resolved-allowlist
+                                                (.getHostAddress candidate))))
+                               addresses))
+                     socket (Socket.)]
+                 (try
+                   (if address
+                     (do
+                       (.connect socket (InetSocketAddress. ^InetAddress address (int port))
+                                 (int (:max-transport-connect-ms limits)))
+                       (.setSoTimeout socket (int (:max-transport-read-ms limits)))
+                       (allocate-handle! handles next-handle
+                                         {:kind :tcp :socket socket :host host :port port
+                                          :resolved-address (.getHostAddress ^InetAddress address)}))
+                     (do (close-quietly! socket) 0))
+                   (catch Exception _
+                     (close-quietly! socket)
+                     0)))
+               0))))
+        tls-open
+        (tender/host-fn
+         "tls_open" [ValType/I64 ValType/I32 ValType/I32] ValType/I64
+         (fn [instance args]
+           (granted! caps :tls-open)
+           (let [handle (aget args 0)
+                 server-name (canonical-host
+                              (read-utf8 instance (aget args 1) (aget args 2)))
+                 entry (take-handle! handles handle)]
+             (if (and (= :tcp (:kind entry))
+                      server-name
+                      (= server-name (:host entry)))
+               (let [socket (:socket entry)]
+                 (try
+                   (let [^SSLSocketFactory factory (factory-resolver)
+                         ^SSLSocket tls (.createSocket
+                                         factory ^Socket socket server-name
+                                         (int (:port entry)) true)
+                         params (doto (SSLParameters.)
+                                  (.setEndpointIdentificationAlgorithm "HTTPS"))
+                         _ (when-not (ip-literal? server-name)
+                             (.setServerNames params [(SNIHostName. server-name)]))]
+                     (.setSSLParameters tls params)
+                     (.setSoTimeout tls (int (:max-transport-read-ms limits)))
+                     (.startHandshake tls)
+                     (let [local-certificates
+                           (seq (.getLocalCertificates (.getSession tls)))
+                           accepted? (or (not require-client-certificate?)
+                                         (boolean local-certificates))]
+                       (reset! last-tls-decision
+                               {:tls/accepted? accepted?
+                                :tls/mutual-auth-required?
+                                (boolean require-client-certificate?)
+                                :tls/client-certificate-present?
+                                (boolean local-certificates)})
+                       (if accepted?
+                         (allocate-handle! handles next-handle
+                                           (assoc entry :kind :tls :socket tls))
+                         (do (close-quietly! tls) 0))))
+                   (catch Exception _
+                     (reset! last-tls-decision
+                             {:tls/accepted? false
+                              :tls/mutual-auth-required?
+                              (boolean require-client-certificate?)})
+                     (close-quietly! socket)
+                     0)))
+               (do (close-quietly! (:socket entry)) 0)))))
+        tls-server-end-point
+        (tender/host-fn
+         "tls_server_end_point" [ValType/I64 ValType/I32 ValType/I32] ValType/I32
+         (fn [instance args]
+           (granted! caps :tls-server-end-point)
+           (let [entry (get @handles (aget args 0))
+                 cap (long (aget args 2))]
+             (if (and (= :tls (:kind entry)) (<= 32 cap 64))
+               (try
+                 (write-bytes instance (aget args 1) cap
+                              (tls-server-end-point-digest (:socket entry)))
+                 (catch Exception _ -1))
+               -1))))
+        pg-cancel-register
+        (tender/host-fn
+         "pg_cancel_register" [ValType/I64 ValType/I32 ValType/I32] ValType/I32
+         (fn [_instance args]
+           (granted! caps :pg-cancel-register)
+           (let [entry (get @handles (aget args 0))]
+             (if (and (= :tls (:kind entry))
+                      (reserve! usage :cancel-handles
+                                (:max-pg-cancel-handles limits) 1))
+               (allocate-handle!
+                handles next-handle
+                {:kind :pg-cancel
+                 :host (:host entry) :port (:port entry)
+                 :resolved-address (:resolved-address entry)
+                 :pid (aget args 1) :secret (aget args 2)})
+               0))))
+        pg-cancel
+        (tender/host-fn
+         "pg_cancel" [ValType/I32] ValType/I32
+         (fn [_instance args]
+           (granted! caps :pg-cancel)
+           (let [entry (take-handle! handles (aget args 0))]
+             (if (and (= :pg-cancel (:kind entry))
+                      (reserve! usage :cancel-requests
+                                (:max-pg-cancel-requests limits) 1))
+               (let [socket (Socket.)]
+                 (try
+                   (.connect socket
+                             (InetSocketAddress.
+                              (InetAddress/getByName (:resolved-address entry))
+                              (int (:port entry)))
+                             (int (:max-transport-connect-ms limits)))
+                   (let [request (cancel-request-bytes (:pid entry) (:secret entry))
+                         out (.getOutputStream socket)]
+                     (.write out request)
+                     (.flush out)
+                     (close-quietly! socket)
+                     0)
+                   (catch Exception _
+                     (close-quietly! socket)
+                     -1)))
+               -1))))
+        write
+        (tender/host-fn
+         "transport_write" [ValType/I64 ValType/I32 ValType/I32] ValType/I32
+         (fn [instance args]
+           (granted! caps :transport-write)
+           (let [entry (get @handles (aget args 0))
+                 len (long (aget args 2))
+                 flow-decision (when information-flow-context
+                                 (egress-decision information-flow-context))]
+             (reset! last-information-flow-decision flow-decision)
+             (if (and entry (<= 0 len)
+                      (or (nil? flow-decision)
+                          (:information-flow/allowed? flow-decision))
+                      (reserve! usage :write-bytes
+                                (:max-transport-write-bytes limits) len))
+               (try
+                 (let [bs (read-bytes instance (aget args 1) len)
+                       out (.getOutputStream ^Socket (:socket entry))]
+                   (trace-write! bs)
+                   (.write out bs)
+                   (.flush out)
+                   len)
+                 (catch Exception _ -1))
+               -1))))
+        read
+        (tender/host-fn
+         "transport_read" [ValType/I64 ValType/I32 ValType/I32] ValType/I32
+         (fn [instance args]
+           (granted! caps :transport-read)
+           (let [entry (get @handles (aget args 0))
+                 cap (long (aget args 2))
+                 remaining (- (:max-transport-read-bytes limits)
+                              (:read-bytes @usage))
+                 requested (min cap remaining)]
+             (if (and entry (pos? requested))
+               (try
+                 (let [buf (byte-array (int requested))
+                       n (.read (.getInputStream ^Socket (:socket entry)) buf)]
+                   (cond
+                     (neg? n) 0
+                     (reserve! usage :read-bytes
+                               (:max-transport-read-bytes limits) n)
+                     (let [bytes (java.util.Arrays/copyOf buf n)]
+                       (trace-read! bytes)
+                       (write-bytes instance (aget args 1) cap bytes))
+                     :else -1))
+                 (catch Exception _ -1))
+               -1))))
+        close
+        (tender/host-fn
+         "transport_close" [ValType/I64] ValType/I32
+         (fn [_instance args]
+           (granted! caps :transport-close)
+           (if-let [entry (take-handle! handles (aget args 0))]
+             (do (close-quietly! (:socket entry)) 0)
+             -1)))
+        close-all! (fn []
+                     (doseq [[_ entry] (swap! handles (constantly {}))]
+                       (close-quietly! (:socket entry))))]
+    {:host-functions
+     {:transport-connect connect
+      :tls-open tls-open
+      :tls-server-end-point tls-server-end-point
+      :pg-cancel-register pg-cancel-register
+      :pg-cancel pg-cancel
+      :transport-write write
+      :transport-read read
+      :transport-close close}
+     :state {:handles handles :usage usage
+             :last-abac-decision last-abac-decision
+             :last-information-flow-decision last-information-flow-decision
+             :last-tls-decision last-tls-decision
+             :last-approval-decision last-approval-decision
+             :crypto-decision crypto-decision
+             :hardware-signing-decision hardware-signing-decision*}
+     :close! close-all!})))

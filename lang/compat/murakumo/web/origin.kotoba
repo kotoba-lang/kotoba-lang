@@ -1,0 +1,162 @@
+(ns murakumo.web.origin
+  "The public web plane's origin (ADR-260929, owner decisions 2026-10-10;
+  root ADR-2610101900). Pure.
+
+  `web.murakumo.cloud` is a stateless Worker: it checks the caller's token
+  (scope `web`) and forwards over the gad Tunnel to this origin, which holds the
+  queue and the per-token quota on the fleet (no Cloudflare state store:
+  root ADR-2609132007, owner direction 2026-10-07). The origin runs jobs on the
+  nodes listed in its own config, one at a time, through the same node ops the
+  operator uses (`web_node.cljs`).
+
+  What this namespace decides:
+  - which public requests are accepted, after the full URL policy of
+    `murakumo.web/check-url` and tighter public ceilings than an operator plan;
+  - the job record and its state machine (queued -> running -> done | failed);
+  - the per-token daily quota;
+  - the public JSON view of a record (no store paths, no node keys).
+  Fetched content is untrusted data and is returned as data only."
+  (:require [kotoba.lang.text :as text]
+            [murakumo.web :as web]))
+
+(def public-limits
+  "Ceilings for a token holder. Lower than `web/plan-limits`, which bound an operator plan."
+  {:max-pages 20 :max-depth 3 :min-delay-ms 1000 :max-seeds 5 :max-k 20
+   :max-url-chars 2048 :max-query-chars 512 :max-queue 100})
+
+(def default-quota {:jobs-per-day 200 :crawls-per-day 10})
+
+(def kinds #{"scrape" "crawl" "search"})
+
+(defn- int-in? [x lo hi] (and (integer? x) (<= lo x hi)))
+
+(defn- url-reason [url]
+  (cond
+    (not (string? url)) :url/not-a-string
+    (> (count url) (:max-url-chars public-limits)) :url/too-long
+    :else (:refused (web/check-url url))))
+
+(defn parse-request
+  "A public request (JSON object, string keys) -> {:ok spec} | {:refused [reason ...]}.
+  spec is {:kind :scrape :url ..} | {:kind :crawl :plan ..} | {:kind :search :query .. :k ..}."
+  [body]
+  (if-not (map? body)
+    {:refused [:request/not-an-object]}
+    (let [kind (get body "kind")]
+      (case kind
+        "scrape"
+        (let [url (get body "url")
+              r (url-reason url)]
+          (if r {:refused [r]} {:ok {:kind :scrape :url url}}))
+
+        "crawl"
+        (let [seeds (get body "seeds")
+              plan {:seeds (if (sequential? seeds) (vec seeds) seeds)
+                    :max-pages (get body "max_pages" 10)
+                    :max-depth (get body "max_depth" 1)
+                    :delay-ms (get body "delay_ms" 1000)
+                    :scope (case (get body "scope" "same-host")
+                             "same-host" :same-host
+                             "same-domain" :same-domain
+                             ::bad)}
+              reasons (cond-> []
+                        (not (and (sequential? seeds) (int-in? (count seeds) 1 (:max-seeds public-limits))))
+                        (conj :crawl/seeds)
+                        (and (sequential? seeds) (some (comp some? url-reason) seeds))
+                        (into (keep url-reason seeds))
+                        (not (int-in? (:max-pages plan) 1 (:max-pages public-limits))) (conj :crawl/max-pages)
+                        (not (int-in? (:max-depth plan) 0 (:max-depth public-limits))) (conj :crawl/max-depth)
+                        (not (and (integer? (:delay-ms plan)) (>= (:delay-ms plan) (:min-delay-ms public-limits))))
+                        (conj :crawl/delay-below-floor)
+                        (= ::bad (:scope plan)) (conj :crawl/scope))]
+          (if (seq reasons)
+            {:refused (vec (distinct reasons))}
+            (let [v (web/validate-plan plan)]
+              (if (:refused v) {:refused (:refused v)} {:ok {:kind :crawl :plan plan}}))))
+
+        "search"
+        (let [q (get body "query")
+              k (get body "k" 10)
+              reasons (cond-> []
+                        (not (and (string? q) (seq (text/trim q)))) (conj :search/query)
+                        (and (string? q) (> (count q) (:max-query-chars public-limits))) (conj :search/query-too-long)
+                        (not (int-in? k 1 (:max-k public-limits))) (conj :search/k))]
+          (if (seq reasons) {:refused reasons} {:ok {:kind :search :query (text/trim q) :k k}}))
+
+        {:refused [:request/unknown-kind]}))))
+
+;; --- quota ------------------------------------------------------------------
+
+(defn day-of
+  "UTC day `yyyy-mm-dd` of epoch millis."
+  [now-ms]
+  )
+
+(defn charge-quota
+  "state {:day d :used {sub {:jobs n :crawls n}}}. Returns {:ok new-state} or
+  {:refused reason}. A new UTC day starts from zero; older days are dropped."
+  [state sub kind now-ms quota]
+  (let [day (day-of now-ms)
+        used (if (= day (:day state)) (:used state) {})
+        {:keys [jobs crawls] :or {jobs 0 crawls 0}} (get used sub)]
+    (cond
+      (not (and (string? sub) (seq sub))) {:refused :quota/no-subject}
+      (>= jobs (:jobs-per-day quota)) {:refused :quota/jobs-per-day}
+      (and (= kind :crawl) (>= crawls (:crawls-per-day quota))) {:refused :quota/crawls-per-day}
+      :else {:ok {:day day
+                  :used (assoc used sub {:jobs (inc jobs)
+                                         :crawls (cond-> crawls (= kind :crawl) inc)})}})))
+
+;; --- records ----------------------------------------------------------------
+
+(def id-re #"[0-9a-f]{32}")
+
+(defn valid-id? [s] (boolean (and (string? s) (re-matches id-re s))))
+
+(defn new-record [id sub spec now-ms]
+  {:id id :sub sub :spec spec :status :queued :created-ms now-ms})
+
+(defn start [record now-ms] (assoc record :status :running :started-ms now-ms))
+
+(defn finish [record result now-ms]
+  (assoc record :status :done :finished-ms now-ms :result result))
+
+(defn fail [record reason detail now-ms]
+  (assoc record :status :failed :finished-ms now-ms
+         :error {:reason reason :detail detail}))
+
+(defn recover
+  "After a restart: queued jobs stay queued. A job that was running is FAILED,
+  never re-run: it touched third parties (an origin site, search engines) and
+  repeating it is the caller's decision, as with ssh dispatch (`idempotent-ops`)."
+  [record now-ms]
+  (if (= :running (:status record))
+    (fail record :origin/restarted-while-running nil now-ms)
+    record))
+
+(defn- kw-name [k] (when (keyword? k) (str (when-let [n (namespace k)] (str n "/")) (name k))))
+
+(defn- plain
+  "EDN -> JSON-able data: keywords become strings, everything else as is."
+  [x]
+  (cond
+    (keyword? x) (kw-name x)
+    (map? x) (into {} (map (fn [[k v]] [(if (keyword? k) (text/replace (kw-name k) "-" "_") (str k)) (plain v)])) x)
+    (sequential? x) (mapv plain x)
+    (set? x) (mapv plain (sort-by str x))
+    :else x))
+
+(defn public-view
+  "What a caller sees. `:sub` is not echoed back to other callers (records are
+  only returned to their own subject, see `owner?`)."
+  [{:keys [id spec status created-ms started-ms finished-ms result error]}]
+  (plain (cond-> {:id id :kind (:kind spec) :status status :created_ms created-ms}
+           started-ms (assoc :started_ms started-ms)
+           finished-ms (assoc :finished_ms finished-ms)
+           result (assoc :result result)
+           error (assoc :error error))))
+
+(defn owner?
+  "Only the subject that created a job may read it."
+  [record sub]
+  (and (string? sub) (= sub (:sub record))))

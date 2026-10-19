@@ -1,0 +1,187 @@
+#!/usr/bin/env kbb
+;; murakumo.ops — the fleet read surface, ported to nbb.
+;;
+;;   kbb --backend sci src/murakumo/ops.cljk status [all|node,node] [--format edn]
+;;
+;; Why this exists: ADR-2607173000 Wave 3 removed bb.edn and carried over only
+;; three shell-out tasks, so `murakumo nodes` and `murakumo status` — the
+;; operator's read loop — have had NO runnable entrypoint since (ADR-2607256000
+;; finding 3). This restores that surface on the supported script host, folding
+;; both old commands into ONE per-node round trip:
+;;
+;;   nodes  -> tailscale reachability, ssh reachability, mesh binary + agent
+;;   status -> /health, wasm_executor, peer links, hosted component CIDs
+;;
+;; The bb version needed 3-4 sequential ssh calls per node for that; this issues
+;; one, over the multiplexed connection murakumo.tunnel sets up.
+;;
+;; Decision logic is NOT re-implemented here: the probe command, the H:/L:/P:
+;; line parsing and the snapshot row shape all come from the portable
+;; murakumo.dash.state core the bb dashboard already used.
+
+(ns murakumo.ops
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [murakumo.kotoba.oracle :as oracle]))
+
+;; T6.4 preload guarantee: cache shipped KIR *before* product-shell requires so
+;; hosts that deleted cljs mirrors (and future deletes) load against oracle only.
+;; resources/ is resolved relative to process.cwd() (run nbb from repo root).
+(oracle/preload! [:dash-state :fleet-inventory :task-plan])
+
+(require '[murakumo.dash.state :as state]
+         '[murakumo.fleet.inventory :as inv]
+         '[murakumo.task.exec :as exec]
+         '[murakumo.task.plan :as plan])
+
+;; --- probing ----------------------------------------------------------------
+
+(defn probe-command
+  "state/probe-command (health + links + placed CIDs) plus the two presence
+   checks `murakumo nodes` reported: is the mesh binary installed, is the
+   LaunchAgent loaded."
+  [port]
+  (str (state/probe-command port)
+       "; echo \"B:$(test -x ~/.murakumo/bin/kotoba-server && echo yes || echo no)\""
+       "; echo \"A:$(launchctl list 2>/dev/null | grep -c com.murakumo.kotoba-mesh || echo 0)\""
+       ;; Ephemeral-port pressure: TIME_WAIT sockets over the usable range.
+       ;; A node at 100% cannot open ANY outbound connection — its own
+       ;; health probe fails while kotoba-server is fine (2026-09-02,
+       ;; ADR-260902-fleet-outbound-hygiene). This is the column that tells a
+       ;; wedged server from an exhausted node.
+       "; echo \"T:$(netstat -an -p tcp 2>/dev/null | grep -c TIME_WAIT)/$(( $(sysctl -n net.inet.ip.portrange.last 2>/dev/null || echo 65535) - $(sysctl -n net.inet.ip.portrange.first 2>/dev/null || echo 49152) + 1 ))\""))
+
+(defn port-pressure
+  "\"<time-wait>/<range>\" → {:time-wait n :range n :percent n} or nil."
+  [text]
+  (when-let [[_ tw rg] (re-find #"^\s*(\d+)/(\d+)\s*$" (str text))]
+    (let [tw (js/parseInt tw) rg (js/parseInt rg)]
+      (when (pos? rg)
+        {:time-wait tw :range rg :percent (js/Math.round (* 100 (/ tw rg)))}))))
+
+(defn- decode-health [text]
+  (state/parse-health (fn [t] (js->clj (.parse js/JSON t) :keywordize-keys true))
+                      (when (seq (str text)) text)))
+
+(defn probe-node!
+  "One round trip per node. Returns a Promise of a snapshot row (state/probe-node
+   shape) plus the presence flags."
+  [fleet node opts]
+  (let [port (inv/node-port fleet node)
+        p2p (or (:p2p-port node) (:fleet/p2p-port fleet))]
+    (-> (exec/run-one {:task {:id (str "status-" (:name node)) :cmd (probe-command port)}
+                       :node (:name node) :host (:host node)}
+                      (assoc opts :timeout-ms (or (:probe-timeout-ms opts) 20000)))
+        (.then (fn [r]
+                 (if-not (= 0 (:exit r))
+                   (assoc (state/down-node node)
+                          :host (:host node) :p2p p2p
+                          :error (or (:error r)
+                                     (when (:timeout? r) "timeout")
+                                     (not-empty (:stderr r))
+                                     (str "exit " (:exit r))))
+                   (let [lines (state/probe-lines (:stdout r))
+                         health (decode-health (get lines "H"))]
+                     (merge (state/probe-node (assoc node :online? true) health lines p2p)
+                            {:binary (get lines "B" "?")
+                             :agent (if (= "0" (str/trim (get lines "A" "0"))) "no" "yes")
+                             :ports (port-pressure (get lines "T"))}))))))))
+
+;; --- printing ---------------------------------------------------------------
+
+(defn- pad [s n] (let [s (str s)] (str s (apply str (repeat (max 0 (- n (count s))) " ")))))
+
+(defn print-rows [headers rows]
+  (let [widths (mapv (fn [[k label]]
+                       (apply max (count (str label)) (map #(count (str (get % k ""))) rows)))
+                     headers)]
+    (println (str/join "  " (map (fn [[_ label] w] (pad label w)) headers widths)))
+    (doseq [r rows]
+      (println (str/join "  " (map (fn [[k _] w] (pad (get r k "") w)) headers widths))))))
+
+(defn- status-rows [snap]
+  (mapv (fn [n]
+          {:name (:name n)
+           :ssh (if (:online n) "up" "DOWN")
+           :health (:health n)
+           :wasm (or (:wasm n) "-")
+           :links (if (:online n) (:links n) "-")
+           :p2p (or (:p2p n) "-")
+           :binary (or (:binary n) "-")
+           :agent (or (:agent n) "-")
+           :ports (if-let [{:keys [time-wait range percent]} (:ports n)]
+                    (str time-wait "/" range " " percent "%")
+                    "-")
+           :hosted (let [h (:hosted n)]
+                     (if (seq h) (str (count h) ": " (str/join "," (map #(subs % 0 (min 12 (count %))) (take 2 h))))
+                         "-"))
+           :note (let [err (some-> (:error n) (str/replace #"\s+" " ") (subs 0 (min 48 (count (:error n)))))
+                       pct (get-in n [:ports :percent])]
+                   (cond-> (or err "")
+                     (and pct (>= pct 90)) (str (when err " ") "PORT-EXHAUSTED: health=down is this node's client side, not kotoba-server")))})
+        snap))
+
+(defn print-status [snap]
+  (print-rows [[:name "NODE"] [:ssh "SSH"] [:health "HEALTH"] [:ports "PORTS"] [:wasm "WASM-EXEC"]
+               [:links "LINKS"] [:p2p "P2P"] [:binary "BINARY"] [:agent "AGENT"]
+               [:hosted "HOSTED"] [:note "NOTE"]]
+              (status-rows snap))
+  (let [up (filter :online snap)
+        ok (filter #(= "ok" (:health %)) snap)
+        linked (filter #(pos? (or (:links %) 0)) snap)]
+    (println)
+    (println (str (count up) "/" (count snap) " reachable, "
+                  (count ok) " kotoba-server up, "
+                  (count linked) " peered into the lattice, "
+                  (count (filter #(= "yes" (:agent %)) snap)) " with the LaunchAgent loaded"))
+    (when (and (seq ok) (empty? linked))
+      (println "note: nodes are serving /health but none report a mesh peer — `mesh` has not been re-run since their last restart"))))
+
+;; --- cli --------------------------------------------------------------------
+
+(defn- parse-flags [args]
+  (loop [xs (vec args) acc {:_ []}]
+    (if-let [x (first xs)]
+      (if (str/starts-with? (str x) "--")
+        (let [body (subs x 2) i (str/index-of body "=")]
+          (cond
+            i (recur (rest xs) (assoc acc (subs body 0 i) (subs body (inc i))))
+            (and (second xs) (not (str/starts-with? (str (second xs)) "--")))
+            (recur (drop 2 xs) (assoc acc body (second xs)))
+            :else (recur (rest xs) (assoc acc body "true"))))
+        (recur (rest xs) (update acc :_ conj x)))
+      acc)))
+
+(defn cmd-status [f]
+  (let [fleet (edn/read-string (.readFileSync fs (get f "fleet" "fleet.edn") "utf8"))
+        nodes (inv/select fleet (first (:_ f)))
+        opts (assoc plan/default-opts :multiplex? (not (get f "no-multiplex")))
+        dir (exec/control-dir! opts)
+        opts (assoc opts :control-path (exec/control-path dir))]
+    (-> (js/Promise.all (to-array (mapv #(probe-node! fleet % opts) nodes)))
+        (.then (fn [rs]
+                 (let [snap (vec (array-seq rs))]
+                   (if (= "edn" (get f "format"))
+                     (println (pr-str snap))
+                     (print-status snap))
+                   (exec/close-masters! dir (map :host nodes))))))))
+
+(def usage
+  (str/join "\n"
+            ["murakumo ops — the fleet read surface (nbb port of `nodes` + `status`)"
+             ""
+             "  status [all|a,b] [--format edn] [--fleet fleet.edn] [--no-multiplex]"
+             ""
+             "One ssh round trip per node: /health, wasm_executor, peer links, hosted"
+             "component CIDs, mesh binary presence, LaunchAgent state."]))
+
+(defn -main [& args]
+  (let [[cmd & rest] args
+        f (parse-flags rest)]
+    (case cmd
+      "status" (cmd-status f)
+      (do (println usage) (js/Promise.resolve nil)))))
+
+(apply -main *command-line-args*)

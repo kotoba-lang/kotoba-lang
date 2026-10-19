@@ -1,0 +1,129 @@
+(ns murakumo.mesh.ledger
+  "Pure ledger operations for the mesh: parse and validate, revoke, and the
+  two-way sync between the seed's ledger and the operator's `kekkai-tailnet.edn`.
+
+  Two ledgers exist because two parties write them. The seed writes admissions
+  (auto-admit) as joiners arrive; the operator owns hand-authored entries and
+  decides revocations. Sync reconciles them under three rules, in this order of
+  precedence, and each exists because the opposite is a hole:
+
+  1. **Revoked is sticky, in both directions.** A revocation on either side wins
+     over any other state on the other. A sync that could un-revoke a node would
+     let a stale copy of the ledger restore a node the owner removed.
+  2. **The operator's `:admit` opt-in is the operator's.** The seed's copy of the
+     flag is never imported: a ledger fetched from a node must not be able to
+     switch auto-admit on for the operator's machine.
+  3. **An authorized name never changes key through a sync.** If the two sides
+     disagree about which DID holds an authorized name, the local entry is kept
+     and the disagreement is reported, not resolved.
+
+  Nothing here does I/O; `murakumo.mesh.ledger-cli` moves the bytes."
+  (:require [kotoba.lang.edn :as edn]
+            [murakumo.mesh :as mesh]))
+
+(def statuses #{"authorized" "pending" "revoked"})
+
+(defn valid?
+  "Is `l` a ledger: a map whose :nodes (if any) maps names to entries with a known
+  status."
+  [l]
+  (and (map? l)
+       (map? (or (:nodes l) {}))
+       (every? (fn [[k v]] (and (string? k) (map? v) (contains? statuses (:status v))))
+               (:nodes l))))
+
+(defn parse
+  "Text -> {:ledger l} or {:error kw}. A ledger that does not have the expected
+  shape is an error, never an empty ledger: treating a corrupt file as empty is
+  how a revocation list gets silently forgotten."
+  [text]
+  (let [l (try (edn/read-string (str text)) (catch  _ ::unreadable))]
+    (cond
+      (= ::unreadable l) {:error :unreadable}
+      (not (valid? l)) {:error :bad-shape}
+      :else {:ledger (update l :nodes #(or % {}))})))
+
+(defn serialize [ledger] (str (pr-str ledger) "\n"))
+
+(defn- matching-names
+  "Names whose entry is `selector` -- by name, or by DID."
+  [ledger selector]
+  (vec (keep (fn [[n e]] (when (or (= n selector) (= selector (:did e))) n)) (:nodes ledger))))
+
+(defn revoke
+  "Revoke by node name or DID. Returns {:ledger :revoked [names]} or
+  {:error :not-found} / {:error :already-revoked}. Idempotent in effect: the
+  second call changes nothing and says so."
+  [ledger selector {:keys [now-ms reason]}]
+  (let [selected (matching-names ledger selector)
+        dids (set (keep #(get-in ledger [:nodes % :did]) selected))
+        names (vec (distinct (concat selected (keep (fn [[n e]] (when (dids (:did e)) n)) (:nodes ledger)))))
+        live (remove #(= "revoked" (get-in ledger [:nodes % :status])) names)]
+    (cond
+      (empty? names) {:error :not-found}
+      (empty? live) {:error :already-revoked :ledger ledger}
+      :else
+      {:revoked (vec live)
+       :ledger (reduce (fn [l n]
+                         (-> (mesh/revoke l n)
+                             (update-in [:nodes n] merge
+                                        (cond-> {:revoked-ms now-ms}
+                                          reason (assoc :revoked-reason reason)))))
+                       ledger live)})))
+
+(defn- revoked? [e] (= "revoked" (:status e)))
+
+(defn- revocation-closure [local remote]
+  ;; A revoked name or key on either side revokes all aliases on both sides.
+  ;; Keep each entry's DID: replacing a tombstone can forget a revoked key.
+  (loop [a local b remote]
+    (let [revoked (filter revoked? (concat (vals (:nodes a)) (vals (:nodes b))))
+          dids (set (keep :did revoked))
+          names (set (keep (fn [[n e]] (when (revoked? e) n))
+                           (concat (:nodes a) (:nodes b))))
+          close (fn [l] (update l :nodes
+                               (fn [nodes] (into {} (map (fn [[n e]]
+                                                         [n (if (or (names n) (and (:did e) (dids (:did e))))
+                                                              (assoc e :status "revoked") e)]) nodes)))))
+          a' (close a) b' (close b)]
+      (if (and (= a a') (= b b')) [a' b'] (recur a' b')))))
+
+(defn sync-plan
+  "Reconcile. Returns {:local new-local :remote new-remote :report {...}}; the
+  caller writes whichever changed. Run twice it reports no changes."
+  [local remote]
+  (let [[local' remote-revoked] (revocation-closure local remote)
+        remote' (update remote-revoked :nodes
+                        (fn [nodes] (into {} (map (fn [[n re]]
+                                                  (let [le (get-in local' [:nodes n])]
+                                                    [n (if (and (= (:did le) (:did re))
+                                                                (= "authorized" (:status le))
+                                                                (= "pending" (:status re)))
+                                                         (merge re le) re)])) nodes))))
+        changed-names (fn [a b] (vec (keep (fn [[n e]] (when (not= e (get-in a [:nodes n])) n)) (:nodes b))))
+        report (atom {:added [] :updated (changed-names local local') :conflicts [] :kept-revoked []
+                      :authorized-on-seed (changed-names remote-revoked remote')
+                      :revoked-on-seed (changed-names remote remote-revoked)})
+        merged
+        (reduce
+         (fn [nodes [n re]]
+           (let [le (get nodes n)]
+             (cond
+               (nil? le) (do (swap! report update :added conj n) (assoc nodes n re))
+               (revoked? le) (do (when-not (revoked? re) (swap! report update :kept-revoked conj n))
+                                 nodes)
+               (revoked? re) (do (swap! report update :updated conj n) (assoc nodes n (assoc le :status "revoked")))
+               (and (= "authorized" (:status le)) (not= (:did le) (:did re)))
+               (do (swap! report update :conflicts conj n) nodes)
+               (= le re) nodes
+               (and (= (:did le) (:did re)) (= "authorized" (:status le))
+                    (= "pending" (:status re))) nodes
+               :else (do (swap! report update :updated conj n) (assoc nodes n (merge le re))))))
+         (:nodes local') (:nodes remote'))]
+    {:local (assoc local :nodes merged)
+     :remote remote'
+     :report @report}))
+
+(defn changed?
+  [{:keys [added updated revoked-on-seed authorized-on-seed]}]
+  (boolean (or (seq added) (seq updated) (seq revoked-on-seed) (seq authorized-on-seed))))

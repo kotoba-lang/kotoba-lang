@@ -1,0 +1,167 @@
+(ns murakumo.ci.artifact-upload
+  "Lease-authorized runner uploads into the coordinator CAS. The lease bearer
+   only grants staging while its run is active; content identity is still
+   independently verified by the CAS at commit."
+  (:require [kotoba.bytes :as kbytes] [kotoba.io :as kio]
+            [murakumo.ci.protocol :as protocol]))
+
+(def default-chunk-bytes (* 48 1024))
+(def default-max-object-bytes (* 512 1024 1024))
+(def default-max-chunk-bytes (* 48 1024))
+(def default-transfer-ttl-ms (* 10 60 1000))
+
+(def operations #{:ci/artifact-begin :ci/artifact-chunk
+                  :ci/artifact-commit :ci/artifact-abort})
+
+(defn- response [operation result]
+  (protocol/message :ci/artifact-response
+                    {:operation operation :result result}))
+
+(defn- lease-authorized? [state now lease]
+  (let [run (get-in state [:murakumo.ci/runs (:ci.lease/run-id lease)])
+        current (:ci.run/lease run)]
+    (and (= :running (:ci.run/state run))
+         (= (:ci.lease/run-id current) (:ci.lease/run-id lease))
+         (= (:ci.lease/runner-id current) (:ci.lease/runner-id lease))
+         (= (:ci.lease/token current) (:ci.lease/token lease))
+         (< now (:ci.lease/expires-at current)))))
+
+(defn handler
+  [{:keys [broker-state clock-ms temp-dir put! get-bytes max-object-bytes
+           max-chunk-bytes transfer-ttl-ms]
+    :or {max-object-bytes default-max-object-bytes
+         max-chunk-bytes default-max-chunk-bytes
+         transfer-ttl-ms default-transfer-ttl-ms}}]
+  (let [transfers (atom {})
+        root (kio/file temp-dir)
+        _ (kio/mkdirs root)
+        ;; staging left by a crash is not resumable: drop it
+        _ (doseq [file (or (kio/list-files root) [])
+                  :when (and (kio/file? file)
+                             (re-matches #"ci-artifact-.*\.part" (kio/file-name file)))]
+            (kio/delete file))
+        cleanup! (fn [id]
+                   (when-let [{:keys [file]} (get @transfers id)]
+                     (swap! transfers dissoc id)
+                     (kio/delete file)))]
+    (fn [message]
+      (let [operation (:murakumo.ci/type message)
+            body (:murakumo.ci/body message)
+            lease (:lease body)
+            id (:transfer-id body)
+            cid (:object-cid body)
+            deny #(response operation {:ok? false :reason %})]
+        (try
+          (doseq [[transfer-id transfer] @transfers
+                  :when (>= (- (long (clock-ms))
+                               (long (:created-at transfer)))
+                            transfer-ttl-ms)]
+            (cleanup! transfer-id))
+          (cond
+            (not (contains? operations operation)) (deny :unsupported-operation)
+            (not (and (string? id) (re-matches #"[A-Za-z0-9_-]{16,128}" id)))
+            (deny :invalid-transfer-id)
+            (not (and (string? cid) (re-matches #"baf[a-z2-7]+" cid)))
+            (deny :invalid-object-cid)
+            (not (lease-authorized? @broker-state (clock-ms) lease))
+            (deny :unauthorized-lease)
+            :else
+            (case operation
+              :ci/artifact-begin
+              (let [size (:size body)]
+                (cond
+                  (get-bytes cid) (response operation {:ok? true :status :present})
+                  (not (and (integer? size) (<= 0 size max-object-bytes)))
+                  (deny :invalid-object-size)
+                  (contains? @transfers id) (deny :transfer-exists)
+                  :else
+                  (let [file (kio/temp-file root "ci-artifact-" ".part")
+                        transfer {:file file :size size :received 0 :next-seq 0
+                                  :object-cid cid
+                                  :created-at (clock-ms)
+                                  :run-id (:ci.lease/run-id lease)
+                                  :runner-id (:ci.lease/runner-id lease)
+                                  :token (:ci.lease/token lease)}]
+                    (locking transfers
+                      (if (contains? @transfers id)
+                        (do (kio/delete file) (deny :transfer-exists))
+                        (do (swap! transfers assoc id transfer)
+                            (response operation {:ok? true :status :ready})))))))
+
+              :ci/artifact-chunk
+              (if-let [{:keys [file size received next-seq object-cid
+                               run-id runner-id token]} (get @transfers id)]
+                (let [sequence (:sequence body)
+                      encoded (:data body)
+                      bytes (when (and (string? encoded)
+                                       (<= (count encoded)
+                                           (+ 4 (* 4 (long (Math/ceil
+                                                           (/ max-chunk-bytes 3.0)))))))
+                              (kbytes/base64-decode-bytes ^String encoded))]
+                  (if-not (and (= object-cid cid)
+                               (= run-id (:ci.lease/run-id lease))
+                               (= runner-id (:ci.lease/runner-id lease))
+                               (= token (:ci.lease/token lease))
+                               (= next-seq sequence) bytes
+                               (<= (alength bytes) max-chunk-bytes)
+                               (<= (+ received (alength bytes)) size))
+                    (do (cleanup! id) (deny :invalid-chunk))
+                    (do (kio/write-bytes file bytes #{:append :create :write})
+                        (swap! transfers update id
+                               #(-> % (update :received + (alength bytes))
+                                    (update :next-seq inc)))
+                        (response operation {:ok? true :status :continued}))))
+                (deny :unknown-transfer))
+
+              :ci/artifact-commit
+              (if-let [{:keys [file size received object-cid run-id runner-id token]}
+                       (get @transfers id)]
+                (if-not (and (= object-cid cid) (= size received)
+                             (= run-id (:ci.lease/run-id lease))
+                             (= runner-id (:ci.lease/runner-id lease))
+                             (= token (:ci.lease/token lease)))
+                  (do (cleanup! id) (deny :incomplete-transfer))
+                  (let [bytes (kio/read-all-bytes file)]
+                    (put! cid bytes)
+                    (cleanup! id)
+                    (response operation {:ok? true :status :stored :cid cid})))
+                (deny :unknown-transfer))
+
+              :ci/artifact-abort
+              (do (cleanup! id) (response operation {:ok? true :status :aborted}))))
+          (catch Throwable t
+            (cleanup! id)
+            (response operation {:ok? false :reason :upload-failed
+                                 :message (ex-message t)})))))))
+
+(defn uploader
+  "Return a CAS-compatible `(put! cid bytes)` function backed by broker RPC."
+  [{:keys [rpc lease-fn chunk-bytes]
+    :or {chunk-bytes default-chunk-bytes}}]
+  (fn [cid bytes]
+    (let [id (.replace (str (random-uuid)) "-" "")
+          call (fn [operation fields]
+                 (let [reply (rpc (protocol/message
+                                   operation
+                                   (merge {:lease (lease-fn) :transfer-id id
+                                           :object-cid cid}
+                                          fields)))
+                       result (get-in reply [:murakumo.ci/body :result])]
+                   (when-not (and (= :ci/artifact-response
+                                     (:murakumo.ci/type reply))
+                                  (:ok? result))
+                     (throw (ex-info "murakumo-ci: artifact upload rejected"
+                                     (merge {:reason :artifact-upload-rejected}
+                                            result))))
+                   result))
+          begin (call :ci/artifact-begin {:size (alength bytes)})]
+      (when-not (= :present (:status begin))
+        (doseq [[sequence offset] (map-indexed vector
+                                               (range 0 (alength bytes) chunk-bytes))]
+          (let [end (min (alength bytes) (+ offset chunk-bytes))
+                chunk (.slice bytes offset end)]   ; a copy, as Arrays/copyOfRange was
+            (call :ci/artifact-chunk
+                  {:sequence sequence
+                   :data (kbytes/base64-encode chunk)})))
+        (call :ci/artifact-commit {}))
+      cid)))

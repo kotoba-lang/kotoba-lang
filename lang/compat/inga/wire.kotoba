@@ -1,0 +1,378 @@
+(ns inga.wire
+  "What replicas say to each other, as data a transport can carry.
+
+  `inga.pacemaker` decides what to do and `inga.sync` decides what may be
+  believed. Neither can say anything, because consensus messages had no
+  encoding. This is that encoding, and deliberately nothing else: no sockets,
+  no framing, no reconnect policy. A driver turns these maps into bytes.
+
+  ## Decoding is total
+
+  A replica takes messages from peers, and a peer may be Byzantine, broken, or
+  a different version. `decode` therefore NEVER THROWS: it returns either a
+  message or a rejection reason. A codec that throws on malformed input hands
+  every peer a way to kill the replica by sending nonsense, which is a cheaper
+  attack than anything the consensus rules defend against.
+
+  This is the same rule `torihiki.api` arrived at for transactions, for the
+  same reason and after the same bug.
+
+  ## The wire is strings, and that is where a signature can be lost
+
+  JSON has no keywords, so `:inga.block/height` travels as `\"height\"`. The
+  conversion has to happen at a stated point, because anything that hashes or
+  signs a message must hash the same representation on both sides. torihiki
+  lost a whole afternoon to normalising AFTER computing a signing payload:
+  every signature failed for a reason that looked like cryptography and was
+  not. Here the rule is that `decode` produces the internal shape and nothing
+  downstream re-encodes.
+
+  ## Bounds are part of the protocol
+
+  Every message carries a size limit, because a peer that sends an enormous
+  but well-formed message needs no invalid data to exhaust a replica. This is
+  the same argument `inga.sync` makes for bounding a segment.")
+
+(def default-limits
+  {:max-proposals 4096      ; transfer CIDs in one block
+   :max-witnesses 1024      ; signatures in one certificate
+   :max-blocks 256          ; blocks in one sync response — matches inga.sync
+   :max-string 512})        ; any single identifier
+
+(def message-types
+  "Closed set. An unknown type is refused rather than ignored: silently
+  dropping what you do not understand is how two versions of a protocol run
+  side by side believing they agree."
+  #{"proposal" "vote" "new-view" "sync-request" "sync-response" "evidence"})
+
+(def reasons
+  #{:not-a-map :unknown-type :missing-field :bad-type :too-large :bad-shape})
+
+;; ── primitives ──────────────────────────────────────────────────────────────
+
+(defn- str-ok? [x limits]
+  (and (string? x) (<= (count x) (:max-string limits))))
+
+(defn- nat? [x] (and (integer? x) (>= x 0)))
+
+(defn wire-id
+  "An identifier as it travels. `str` is the obvious choice and it is wrong:
+  `(str :w1)` is `\":w1\"`, so a keyword witness comes back from the wire as a
+  DIFFERENT identifier than it left as — and `inga.consensus/qc` counts
+  distinct witnesses, so a certificate assembled from wire messages and one
+  assembled locally would disagree about who signed it.
+
+  Dropping the leading colon rather than calling `name` keeps a namespaced
+  keyword whole: `name` would turn `:org/w1` and `:other/w1` into the same
+  string, which is worse than the bug this replaces.
+
+  Public because a replica has to normalise its own ids the same way. This
+  docstring already named the failure — 'a certificate assembled from wire
+  messages and one assembled locally would disagree about who signed it' —
+  and that is exactly what happened the first time four replicas were run
+  over real sockets: a replica recorded its own vote under ':w1' and its
+  peers' under 'w1', so one physical witness counted as two and a quorum of
+  three could be two replicas. Encoding correctly is only half of it; the
+  local side has to speak the same language."
+  [x]
+  (if (keyword? x) (subs (str x) 1) (str x)))
+
+(defn admits
+  "A membership predicate over `witnesses`, compared through `wire-id`.
+
+  `inga.head/verify-cert` and `inga.attest/verify-certificate` both take an
+  `admitted?` predicate, and the obvious `(set witnesses)` is wrong here for
+  exactly the reason `wire-id` exists: the configured set is held as `:w1`
+  while a certificate that crossed the wire names `\"w1\"`, so a raw set
+  rejects every genuine witness. `inga.sync` already recorded that failure
+  once — a proposer check compared with `str`, refused EVERY segment
+  including the honest ones, and looked like a successful fix because the
+  thing being measured was a forgery no longer getting in.
+
+  A check that rejects everything and a check that rejects the right thing
+  are indistinguishable from the attacker's side. Normalising here is what
+  keeps them apart."
+  [witnesses]
+  (let [ids (into #{} (map wire-id) witnesses)]
+    (fn [w] (contains? ids (wire-id w)))))
+
+(defn- enc-qc [qc]
+  (when qc
+    (cond-> {"block-hash" (:inga.qc/block-hash qc)
+             "height" (:inga.qc/height qc)
+             "witnesses" (vec (sort (map wire-id (:inga.qc/witnesses qc))))}
+      (:inga.qc/view qc) (assoc "view" (:inga.qc/view qc))
+      ;; The view each signature was made in. Without it a certificate that
+      ;; crosses the wire loses the only thing that lets its signatures be
+      ;; reconstructed, and every one of them fails to verify.
+      (:inga.qc/views qc) (assoc "views" (into {} (map (fn [[w v]] [(wire-id w) v]))
+                                               (:inga.qc/views qc)))
+      ;; a stake-weighted certificate that arrives without its stake is a
+      ;; certificate the receiver must re-derive or refuse
+      (:inga.qc/stake qc) (assoc "stake" (:inga.qc/stake qc))
+      ;; signatures travel with the certificate — a certificate that arrives
+      ;; without them cannot be checked by the peer that receives it, which is
+      ;; the whole reason inga.attest exists
+      (seq (:inga.qc/sigs qc))
+      (assoc "sigs" (into {} (map (fn [[w s]] [(wire-id w) (str s)]))
+                          (:inga.qc/sigs qc))))))
+
+(defn- dec-qc [m limits]
+  (when (map? m)
+    (let [ws (get m "witnesses")]
+      (when (and (str-ok? (get m "block-hash") limits)
+                 (nat? (get m "height"))
+                 (vector? ws)
+                 (<= (count ws) (:max-witnesses limits))
+                 (every? #(str-ok? % limits) ws)
+                 (let [sg (get m "views")]
+                   (or (nil? sg)
+                       (and (map? sg)
+                            (<= (count sg) (:max-witnesses limits))
+                            (every? #(str-ok? % limits) (keys sg))
+                            (every? nat? (vals sg)))))
+                 (let [sg (get m "sigs")]
+                   (or (nil? sg)
+                       (and (map? sg)
+                            (<= (count sg) (:max-witnesses limits))
+                            (every? #(str-ok? % limits) (keys sg))
+                            (every? #(str-ok? % limits) (vals sg))))))
+        (cond-> {:inga.qc/block-hash (get m "block-hash")
+                 :inga.qc/height (get m "height")
+                 :inga.qc/witnesses (set ws)
+                 :inga.qc/vote-count (count (set ws))}
+          (nat? (get m "view")) (assoc :inga.qc/view (get m "view"))
+          (nat? (get m "stake")) (assoc :inga.qc/stake (get m "stake"))
+          (map? (get m "sigs")) (assoc :inga.qc/sigs (get m "sigs"))
+          (map? (get m "views")) (assoc :inga.qc/views (get m "views")))))))
+
+(defn- enc-block [b]
+  {"height" (:inga.block/height b)
+   "parent-hash" (:inga.block/parent-hash b)
+   "proposals" (vec (:inga.block/proposals b))
+   "proposer" (wire-id (:inga.block/proposer b))
+   "ts" (:inga.block/ts b)
+   ;; The round is IN the canonical block, so a block that crosses the wire
+   ;; without it hashes differently on arrival and every remote block is
+   ;; refused — with a green unit suite, because a fold never serialises.
+   ;; `wire-carries-every-field-the-hash-covers` is the check that this list
+   ;; and `inga.consensus/canonical-block` cannot drift apart again.
+   "round" (:inga.block/round b)
+   "justify" (enc-qc (:inga.block/justify b))})
+
+(defn- dec-block [m limits]
+  (when (map? m)
+    (let [ps (get m "proposals")
+          j (get m "justify")
+          justify (when j (dec-qc j limits))]
+      (when (and (nat? (get m "height"))
+                 (str-ok? (get m "parent-hash") limits)
+                 (vector? ps)
+                 (<= (count ps) (:max-proposals limits))
+                 (every? #(str-ok? % limits) ps)
+                 (str-ok? (get m "proposer") limits)
+                 (nat? (get m "ts"))
+                 (nat? (get m "round"))
+                 ;; a justify that was present but did not decode is a
+                 ;; malformed block, not a block without one — genesis is the
+                 ;; only block allowed no certificate
+                 (or (nil? j) (some? justify)))
+        {:inga.block/height (get m "height")
+         :inga.block/parent-hash (get m "parent-hash")
+         :inga.block/proposals ps
+         :inga.block/proposer (get m "proposer")
+         :inga.block/ts (get m "ts")
+         :inga.block/round (get m "round")
+         :inga.block/justify justify}))))
+
+;; ── encode ──────────────────────────────────────────────────────────────────
+
+(defn encode
+  "An internal message to a JSON-safe map. Throws on a message this replica
+  itself built wrong — that is a caller bug, unlike a malformed message from a
+  peer, which `decode` refuses without throwing."
+  [msg]
+  (case (:type msg)
+    :proposal {"t" "proposal" "block" (enc-block (:block msg))}
+    ;; A vote carries its signature. Without it a vote crossing the wire is an
+    ;; unauthenticated claim, and since a replica assembles certificates FROM
+    ;; wire votes, one connected peer could forge a vote from every other
+    ;; witness and manufacture a quorum alone. Certificates carried signatures
+    ;; from the start; the votes they are built out of did not.
+    :vote (cond-> {"t" "vote" "witness" (wire-id (:witness msg))
+                   "block-hash" (:block-hash msg) "height" (:height msg)
+                   "view" (:view msg)}
+            (:sig msg) (assoc "sig" (str (:sig msg))))
+    ;; Signed for the same reason a vote is, and more urgently: a timeout
+    ;; certificate is folded out of these messages' high QCs, so whoever
+    ;; controls them controls what every replica locks onto.
+    :new-view (cond-> {"t" "new-view" "witness" (wire-id (:witness msg))
+                       "view" (:view msg) "high-qc" (enc-qc (:high-qc msg))}
+                (:sig msg) (assoc "sig" (str (:sig msg))))
+    ;; Equivocation evidence, carried whole. Both votes travel with their
+    ;; signatures because the proof has to be checkable by a replica that
+    ;; never saw either vote -- that is the entire point of forwarding it.
+    :evidence (let [e (:evidence msg)
+                    enc-vote (fn [v] (cond-> {"witness" (wire-id (:inga.vote/witness v))
+                                              "block-hash" (:inga.vote/block-hash v)
+                                              "height" (:inga.vote/height v)
+                                              "view" (or (:inga.vote/view v) 0)}
+                                       (:inga.vote/sig v) (assoc "sig" (str (:inga.vote/sig v)))))]
+                {"t" "evidence"
+                 "witness" (wire-id (:inga.evidence/witness e))
+                 "height" (:inga.evidence/height e)
+                 ;; The view the two votes share. Decorative for verification
+                 ;; -- `verify-equivocation-evidence` reads the views off the
+                 ;; VOTES, which is the authoritative place and the one a
+                 ;; forger cannot make disagree with itself -- but carried so
+                 ;; that evidence which has crossed the wire has the same
+                 ;; shape as evidence produced locally. An asymmetry there is
+                 ;; a field that is present in tests and absent in production.
+                 "view" (or (:inga.evidence/view e)
+                            (:inga.vote/view (:inga.evidence/vote-a e)) 0)
+                 "vote-a" (enc-vote (:inga.evidence/vote-a e))
+                 "vote-b" (enc-vote (:inga.evidence/vote-b e))})
+    :sync-request (cond-> {"t" "sync-request" "from" (:from msg) "to" (:to msg)}
+                    (:witness msg) (assoc "w" (:witness msg))
+                    (:target-hash msg) (assoc "target-hash" (:target-hash msg)))
+    :sync-response (cond-> {"t" "sync-response" "blocks" (mapv enc-block (:blocks msg))}
+                     (:target-hash msg) (assoc "target-hash" (:target-hash msg)))
+    (throw (ex-info "inga.wire: cannot encode unknown message type"
+                    {:type (:type msg)}))))
+
+;; ── decode ──────────────────────────────────────────────────────────────────
+
+(defn decode
+  "`[msg nil]` or `[nil reason]`. Never throws — see the namespace docstring."
+  ([m] (decode m default-limits))
+  ([m limits]
+   (cond
+     (not (map? m)) [nil :not-a-map]
+     (not (contains? message-types (get m "t"))) [nil :unknown-type]
+     :else
+     (case (get m "t")
+       "proposal"
+       (if-let [b (dec-block (get m "block") limits)]
+         [{:type :proposal :block b} nil]
+         [nil :bad-shape])
+
+       "vote"
+       ;; The signature is optional HERE and refused by `inga.replica`. This
+       ;; namespace decides what a message is; whether an unsigned one may be
+       ;; believed is a consensus rule, and putting it here would mean a
+       ;; replica replaying its own already-checked history had to re-sign it.
+       (if (and (str-ok? (get m "witness") limits)
+                (str-ok? (get m "block-hash") limits)
+                (nat? (get m "height"))
+                (nat? (get m "view"))
+                (or (nil? (get m "sig")) (str-ok? (get m "sig") limits)))
+         [(cond-> {:type :vote :witness (get m "witness")
+                   :block-hash (get m "block-hash") :height (get m "height")
+                   :view (get m "view")}
+            (get m "sig") (assoc :sig (get m "sig"))) nil]
+         [nil :bad-shape])
+
+       "new-view"
+       (let [q (get m "high-qc")
+             high (when q (dec-qc q limits))]
+         (if (and (str-ok? (get m "witness") limits)
+                  (nat? (get m "view"))
+                  (or (nil? (get m "sig")) (str-ok? (get m "sig") limits))
+                  ;; a replica that has never seen a certificate legitimately
+                  ;; reports none; one that reports a broken certificate does
+                  ;; not get to have it read as none
+                  (or (nil? q) (some? high)))
+           [(cond-> {:type :new-view :witness (get m "witness")
+                     :view (get m "view") :high-qc high}
+              (get m "sig") (assoc :sig (get m "sig"))) nil]
+           [nil :bad-shape]))
+
+       "evidence"
+       (let [dec-vote (fn [v]
+                        (when (and (map? v)
+                                   (str-ok? (get v "witness") limits)
+                                   (str-ok? (get v "block-hash") limits)
+                                   (nat? (get v "height"))
+                                   (nat? (get v "view"))
+                                   (or (nil? (get v "sig")) (str-ok? (get v "sig") limits)))
+                          (cond-> {:inga.vote/witness (get v "witness")
+                                   :inga.vote/block-hash (get v "block-hash")
+                                   :inga.vote/height (get v "height")
+                                   :inga.vote/view (get v "view")}
+                            (get v "sig") (assoc :inga.vote/sig (get v "sig")))))
+             a (dec-vote (get m "vote-a"))
+             b (dec-vote (get m "vote-b"))]
+         ;; Shape only. Whether this is a REAL equivocation -- same witness,
+         ;; same height, different blocks, both signatures valid -- is
+         ;; `inga.stake/verify-equivocation-evidence`'s call, and a replica
+         ;; that recorded it on shape alone would let anyone frame anyone.
+         (if (and (str-ok? (get m "witness") limits) (nat? (get m "height")) a b)
+           [{:type :evidence
+             :evidence {:inga.evidence/view (or (get m "view") (:inga.vote/view a))
+                        :inga.evidence/witness (get m "witness")
+                        :inga.evidence/height (get m "height")
+                        :inga.evidence/vote-a a
+                        :inga.evidence/vote-b b}} nil]
+           [nil :bad-shape]))
+
+       "sync-request"
+       ;; `w` is optional: a node running the previous version does not send
+       ;; it, and refusing its requests mid-deploy would stop the network for
+       ;; the length of the rollout. Present, it must still be a sane string —
+       ;; it is echoed as a destination, so an unbounded one is a way to make
+       ;; this replica carry somebody else's payload.
+       (if (and (nat? (get m "from")) (nat? (get m "to"))
+                (<= (get m "from") (get m "to"))
+                (or (nil? (get m "w")) (str-ok? (get m "w") limits))
+                (or (nil? (get m "target-hash"))
+                    (str-ok? (get m "target-hash") limits)))
+         [(cond-> {:type :sync-request :from (get m "from") :to (get m "to")}
+            (get m "w") (assoc :witness (get m "w"))
+            (get m "target-hash") (assoc :target-hash (get m "target-hash"))) nil]
+         [nil :bad-shape])
+
+       "sync-response"
+       (let [bs (get m "blocks")]
+         (cond
+           (not (vector? bs)) [nil :bad-shape]
+           (and (some? (get m "target-hash"))
+                (not (str-ok? (get m "target-hash") limits))) [nil :bad-shape]
+           (> (count bs) (:max-blocks limits)) [nil :too-large]
+           :else
+           (let [decoded (mapv #(dec-block % limits) bs)]
+             (if (some nil? decoded)
+               [nil :bad-shape]
+               [(cond-> {:type :sync-response :blocks decoded}
+                  (get m "target-hash") (assoc :target-hash (get m "target-hash")))
+                nil]))))))))
+
+(defn json-safe?
+  "Is `x` made only of things JSON carries — strings, numbers, booleans, nil,
+  vectors, and maps with string keys?
+
+  Checked rather than assumed, because the failure is silent. A keyword that
+  slips into an encoded message survives `encode`/`decode` in memory and turns
+  into the string `\":inga.block/height\"` only once a real transport
+  serialises it — so the codec's own tests pass and the first real peer sees
+  something else. Asserting this property is what makes an in-memory round
+  trip evidence about the wire.
+
+  Deliberately does not require a JSON library: the property is structural,
+  and adding a dependency per runtime to check it would be a worse trade than
+  checking it directly."
+  [x]
+  (cond
+    (nil? x) true
+    (string? x) true
+    (number? x) true
+    (boolean? x) true
+    (vector? x) (every? json-safe? x)
+    (map? x) (and (every? string? (keys x)) (every? json-safe? (vals x)))
+    :else false))
+
+(defn round-trip?
+  "Does `msg` survive encode/decode unchanged? Used by tests, and worth having
+  as a function because a codec whose two halves disagree is worse than no
+  codec: it fails only on the messages nobody thought to try."
+  [msg]
+  (= [msg nil] (decode (encode msg))))

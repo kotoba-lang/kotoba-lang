@@ -1,0 +1,554 @@
+(ns murakumo.edge-install
+  "Install the resident edge jobs on fleet nodes as system LaunchDaemons.
+
+  `murakumo.infer.edge` renders the plists. Until 2026-09-09 nothing installed
+  them: a workspace-wide grep for `edge-join` outside that namespace and its
+  test returned zero hits, while ten minis were running plists somebody had
+  placed by hand. A module with no reader is not a mechanism, and the fleet was
+  proving it -- the rendered plan said LaunchAgent, the nodes ran LaunchAgent,
+  and neither could survive a reboot, so the three exhausted nodes could not be
+  repaired by the one action that would have repaired them.
+
+  This namespace is that reader.
+
+  Two things it deliberately does NOT do:
+
+  - It does not reboot. The exhausted nodes need one, and `murakumo.cluster.cosci`
+    ranks guarded self-reboot into the winning design, but a reboot is only safe
+    once supervision survives it -- which is what this installs. Sequencing the
+    repair is the operator's call and the ADR records why.
+  - It does not enroll. Trust tier belongs to `fleet.edn` and the join worker
+    reads it; installing a daemon must not be a second place a tier can be set."
+  (:require [kotoba.lang.error :as kerror] [kotoba.io :as kio] [kotodama.inference.edge :as artifacts]
+            [kotoba.lang.text :as str]
+            [murakumo.fleet.one-model :as one]
+            [murakumo.fleet.topology :as topo]
+            [murakumo.infer.edge :as edge]
+            [murakumo.provision.plan :as plan]
+            [murakumo.ssh :as ssh]))
+
+(def ^:private probe
+  "One round trip that answers everything the plans need.
+
+  Values are printed one per line in a fixed order rather than parsed out of
+  free-form output, because a missing tool has to be distinguishable from a
+  tool at an unexpected path, and an empty line says which."
+  (str "echo \"$HOME\"; "
+       ;; nbb on these nodes is a vendored tree launched through node, not a
+       ;; binary on PATH -- measured 2026-09-09, the running worker's argv is
+       ;; `node $HOME/.murakumo/edge/nbb/lib/nbb_main.js`. A probe that only
+       ;; looked for `command -v nbb` reported every node unmeasurable, which
+       ;; was the right refusal and the wrong question.
+       "if [ -f \"$HOME/.murakumo/edge/nbb/lib/nbb_main.js\" ] && command -v node >/dev/null; "
+       "then echo \"$(command -v node) $HOME/.murakumo/edge/nbb/lib/nbb_main.js\"; "
+       "else command -v nbb || echo ''; fi; "
+       "ls \"$HOME/.murakumo/bin9334/llama-server\" 2>/dev/null "
+       "|| command -v llama-server || echo ''; "
+       "sysctl -n hw.memsize 2>/dev/null || echo ''"))
+
+(defn- parse-probe [out]
+  (let [[home nbb llama mem] (map str/trim (str/split (str out) #"\n"))]
+    {:home (when-not (str/blank? home) home)
+     :nbb (when-not (str/blank? nbb) nbb)
+     :llama-server (when-not (str/blank? llama) llama)
+     :memory-bytes (when-not (str/blank? mem)
+                     (try (Long/parseLong (str/trim mem))
+                          (catch Exception _ nil)))}))
+
+(defn node-facts
+  "Probe one node. Returns {:ok? …} — a node that cannot be measured is
+  reported as unmeasured rather than defaulted, because a default home or a
+  guessed llama-server path installs a daemon that fails at boot on a machine
+  nobody is watching."
+  [host]
+  (let [{:keys [exit out err]} (ssh/sh host probe)]
+    (if-not (zero? exit)
+      {:ok? false :reason :unreachable :detail (str/trim (str err))}
+      (let [f (parse-probe out)
+            missing (vec (keep (fn [k] (when (nil? (get f k)) k))
+                               [:home :nbb :llama-server :memory-bytes]))]
+        (if (seq missing)
+          {:ok? false :reason :incomplete :missing missing :facts f}
+          (assoc f :ok? true))))))
+
+(defn plans-for
+  "Both rendered plans for one probed node, or the reason there are none.
+
+  `server-plan` throws when murakumo-edge does not fit the node's memory; that
+  is a real answer for a 8 GB machine and is returned rather than raised, so a
+  fleet sweep reports it beside the nodes that installed."
+  [node-name facts]
+  (try
+    {:ok? true
+     :plans [(edge/server-plan (select-keys facts [:home :llama-server :memory-bytes]))
+             (edge/join-plan (assoc (select-keys facts [:home :nbb])
+                                    :node-name node-name))]}
+    (catch kerror/ExceptionInfo e
+      {:ok? false :reason :does-not-fit :detail (ex-message e) :data (ex-data e)})))
+
+(def ^:private process-list-command
+  ;; Full command lines, because the plane a process serves is in its
+  ;; arguments and not in its name -- `llama-server` is this node's model and
+  ;; `rpc-server` is a shard of another node's.
+  "ps -Ao command")
+
+(defn model-hosts-node!
+  "How many model planes one node hosts, measured rather than declared."
+  [{:keys [name host] :as _node}]
+  (let [{:keys [exit out]} (ssh/sh host process-list-command)]
+    (if-not (zero? exit)
+      {:node name :verdict :unmeasured}
+      (assoc (one/verdict (str/split (str out) #"\n")) :node name))))
+
+(defn model-hosts!
+  "Check the whole fleet against the one-model rule."
+  [{:keys [nodes]} selector]
+  (let [targets (if (or (nil? selector) (= "all" selector))
+                  nodes
+                  (filter #(= selector (:name %)) nodes))]
+    (when (empty? targets)
+      (throw (ex-info "no fleet node matched" {:selector selector})))
+    (mapv model-hosts-node! targets)))
+
+(defn model-hosts-report [results]
+  (str/join
+   "\n"
+   (map (fn [{:keys [node verdict] :as r}]
+          (if (= :unmeasured verdict)
+            (format "[%-10s] unmeasured -- unreachable, which is not the same as hosting nothing" node)
+            (one/report-line node r)))
+        results)))
+
+(defn one-model-gate
+  "Refuse to add a model plane to a node that already hosts a different one.
+
+  Owner instruction 2026-09-10: one node, one model. Without a gate that is a
+  sentence in a document; with one it is a thing the fleet cannot do by
+  accident. Measured that day, every reachable node already broke it — five
+  minis hosting four planes each — so this gate refuses on the fleet as it
+  stands, which is the point. `:evict` is the operator saying which plane the
+  node is for.
+
+  Unmeasurable is a refusal, not a pass. A node whose process list could not
+  be read has an unknown number of models on it, and installing onto unknown
+  is how the fleet arrived at four."
+  [node wanted {:keys [evict?]}]
+  (let [{:keys [verdict] :as m} (model-hosts-node! node)]
+    (cond
+      (= :unmeasured verdict)
+      {:ok? false :reason :hosts-unmeasured
+       :detail "could not read the node's process list; installing onto an unknown node is how this fleet came to run four models on one mini"}
+
+      :else
+      (let [{:keys [evict]} (one/keeps (map :what (:hosts m)) wanted)
+            others (remove #(= wanted (:plane %)) (:hosts m))]
+        (cond
+          (empty? others) {:ok? true :hosts (:hosts m)}
+          evict? {:ok? true :hosts (:hosts m) :evicting (vec others)}
+          :else
+          {:ok? false :reason :already-hosts-another-model
+           :hosts (:hosts m)
+           :detail (str "hosts " (str/join ", " (map #(name (:plane %)) others))
+                        "; pass --evict to say this node is for " (name wanted)
+                        " instead")})))))
+
+(defn install-node!
+  "Render and install both daemons on one node.
+
+  `dry-run?` prints the script instead of running it. The verification is
+  inside `edge/install-script` (it greps `launchctl print`, not the file it
+  wrote), so a non-zero exit here means the daemon is NOT loaded — this
+  function never reports success on an unverified install."
+  [{:keys [name host] :as _node} {:keys [dry-run?]}]
+  (let [facts (node-facts host)]
+    (if-not (:ok? facts)
+      (assoc facts :node name)
+      (let [{:keys [ok? plans] :as p} (plans-for name facts)]
+        (if-not ok?
+          (assoc p :node name)
+          (let [results
+                (mapv (fn [plan]
+                        (let [script (edge/install-script plan)]
+                          (if dry-run?
+                            {:label (:label plan) :dry-run true :script script}
+                            (let [{:keys [exit err]} (ssh/sh host script)]
+                              {:label (:label plan)
+                               :ok? (zero? exit)
+                               :exit exit
+                               :err (str/trim (str err))}))))
+                      plans)]
+            {:node name :ok? (or (boolean dry-run?) (every? :ok? results))
+             :results results}))))))
+
+(defn install!
+  "Install on every selected node. Returns one result per node, never throws for
+  a single node's failure: a fleet sweep that aborts on the first unreachable
+  machine leaves the reachable ones in an unknown state."
+  [{:keys [nodes]} selector opts]
+  (let [targets (if (or (nil? selector) (= "all" selector))
+                  nodes
+                  (filter #(= selector (:name %)) nodes))]
+    (when (empty? targets)
+      (throw (ex-info "no fleet node matched" {:selector selector})))
+    (mapv #(install-node! % opts) targets)))
+
+;; ── kernel network baseline ────────────────────────────────────────────────
+;;
+;; The edge worker's health is not durable without it, and it was not there.
+;; Measured 2026-09-09: `com.murakumo.sysctl-baseline` is present on benjamin
+;; and simeon and ABSENT on dan, judah, levi and joseph -- exactly the two-node
+;; manual rollout ADR-2609021500 recorded, with its follow-up ("run provision
+;; across every macOS node") never done. joseph was still on the macOS default
+;; range of 16,384 ports and had 15,763 of them stuck in TIME_WAIT.
+;;
+;; It lives beside `install!` rather than inside `murakumo provision` because
+;; provision needs MURAKUMO_OPERATOR_SEED and pushes binaries and the mesh
+;; daemons -- a much larger action than "make this node able to open sockets".
+;; Nothing here is new mechanism: `murakumo.provision.plan` already renders the
+;; plist and already knows the load-or-reload dance.
+
+(defn baseline-node!
+  "Install the root sysctl LaunchDaemon on one node, or say why not.
+
+  `dry-run?` prints the commands. The reprovision kickstarts the daemon, so
+  the widened range applies immediately rather than at the next boot -- which
+  matters on precisely the nodes that cannot currently be rebooted."
+  [tmpl {:keys [name host] :as _node} {:keys [dry-run?]}]
+  (let [facts (node-facts host)]
+    (if-not (:ok? facts)
+      (assoc facts :node name)
+      (let [plist (plan/render-sysctl-baseline-plist tmpl {:home (:home facts)})
+            script (str (plan/write-sysctl-baseline-plist-command plist) "\n"
+                        (plan/sysctl-baseline-reprovision-command))]
+        (if dry-run?
+          {:node name :ok? true :results [{:label plan/sysctl-baseline-label
+                                           :dry-run true :script script}]}
+          (let [{:keys [exit err]} (ssh/sh host script)]
+            {:node name :ok? (zero? exit)
+             :results [{:label plan/sysctl-baseline-label
+                        :ok? (zero? exit) :exit exit :err (str/trim (str err))}]}))))))
+
+(defn baseline!
+  "Install the kernel network baseline on every selected node."
+  [{:keys [nodes]} selector opts]
+  ;; Same literal `murakumo.core` already slurps for this daemon. Not routed
+  ;; through `config/launchd-template-path`, which resolves the MESH template.
+  (let [tmpl (slurp "deploy/com.murakumo.sysctl-baseline.plist.tmpl")
+        targets (if (or (nil? selector) (= "all" selector))
+                  nodes
+                  (filter #(= selector (:name %)) nodes))]
+    (when (empty? targets)
+      (throw (ex-info "no fleet node matched" {:selector selector})))
+    (mapv #(baseline-node! tmpl % opts) targets)))
+
+(def worker-source-files
+  "Everything the resident join worker needs, and nothing else.
+
+  The node's `~/.murakumo/edge/murakumo` is not a checkout — it is a copied
+  subtree, and until 2026-09-10 nothing copied into it. Measured that day, the
+  five reachable macOS nodes carried TWO versions of the worker and neither was
+  current:
+
+    ba491d13  368 lines, no backoff   dan, judah, joseph
+    a45f78e7  401 lines, with backoff simeon, benjamin
+
+  The second pair is exactly the two nodes ADR-2609021500 says were provisioned
+  by hand; its own follow-up, to run provision across every macOS node, was
+  never done. So the fleet-wide backoff contract that ADR declared was live on
+  two nodes out of five, and every fix since has been stranded the same way.
+
+  `kotoba/lang/text.cljc` is vendored INTO `<root>/src` rather than added to a
+  classpath: the worker moved off `clojure.string` and the nodes have no
+  library path, so a worker copied without it does not start. Putting it under
+  the path the plist already names keeps the plist out of this change. It is a
+  single self-contained file with no requires of its own."
+  [{:src "scripts/infer-join.cljk" :dest "scripts/infer-join.cljk"}
+   {:src "src/murakumo/infer/poll_worker.cljk" :dest "src/murakumo/infer/poll_worker.cljk"}
+   {:src "src/murakumo/infer/backoff.cljk" :dest "src/murakumo/infer/backoff.cljk"}
+   {:src "../text/src/kotoba/lang/text.cljc" :dest "src/kotoba/lang/text.cljc"}])
+
+(defn- sha256-of [path]
+  (-> (java.security.MessageDigest/getInstance "SHA-256")
+      (.digest (kio/read-all-bytes (kio/file path)))
+      ;; `bit-and 0xff` because a JVM byte is signed: without it a byte over
+      ;; 0x7f formats as `ffffffab` and no digest ever matches, so every sync
+      ;; would report a failure it did not have.
+      (->> (map #(format "%02x" (bit-and % 0xff))) (apply str))))
+
+(defn sync-source-node!
+  "Copy the worker's source onto one node and verify it arrived byte-identical.
+
+  Verification is a digest comparison, not a successful scp: scp reports its
+  own transfer, and a node that silently kept an older file would look the same
+  as one that took the new one — which is how five nodes came to run two
+  versions without anybody noticing."
+  [{:keys [name host] :as _node} {:keys [dry-run?]}]
+  (let [facts (node-facts host)]
+    (if-not (:ok? facts)
+      (assoc facts :node name)
+      (let [root (str (:home facts) "/.murakumo/edge/murakumo")
+            results
+            (vec (for [{:keys [src dest]} worker-source-files]
+                   (let [want (sha256-of src)]
+                     (if dry-run?
+                       {:file dest :dry-run true :sha want}
+                       (let [_ (ssh/sh host (str "mkdir -p " root "/" (str/join "/" (butlast (str/split dest #"/")))))
+                             cp (ssh/scp host src (str root "/" dest))
+                             got (str/trim (str (:out (ssh/sh host (str "shasum -a 256 " root "/" dest " | cut -d' ' -f1")))))]
+                         {:file dest :ok? (and (zero? (:exit cp 1)) (= want got))
+                          :sha want :got got})))))]
+        {:node name :ok? (or (boolean dry-run?) (every? :ok? results)) :results results
+         :root root}))))
+
+(defn sync-source!
+  "Sync every selected node, then restart the join worker so the new source runs.
+
+  Restart is part of the operation, not a follow-up: a node holding new source
+  and running the old process is the state this whole function exists to end,
+  and it is invisible from the registry."
+  [{:keys [nodes]} selector opts]
+  (let [targets (if (or (nil? selector) (= "all" selector))
+                  nodes
+                  (filter #(= selector (:name %)) nodes))]
+    (when (empty? targets)
+      (throw (ex-info "no fleet node matched" {:selector selector})))
+    (mapv (fn [n]
+            (let [r (sync-source-node! n opts)]
+              (if (and (:ok? r) (not (:dry-run? opts)))
+                (let [k (ssh/sh (:host n)
+                                (str "sudo -n /bin/launchctl kickstart -k system/"
+                                     edge/join-label))]
+                  (assoc r :restarted (zero? (:exit k 1))))
+                r)))
+          targets)))
+
+(defn report [results]
+  (str/join
+   "\n"
+   (map (fn [{:keys [node ok? reason missing detail results]}]
+          (cond
+            (= reason :unreachable) (format "[%-10s] unreachable %s" node (or detail ""))
+            (= reason :incomplete) (format "[%-10s] not measured: missing %s"
+                                           node (pr-str missing))
+            (= reason :does-not-fit) (format "[%-10s] murakumo-edge does not fit: %s"
+                                             node detail)
+            (:dry-run (first results)) (format "[%-10s] dry-run, %d daemons"
+                                               node (count results))
+            ok? (format "[%-10s] installed + verified: %s" node
+                        (str/join ", " (map :label results)))
+            :else (format "[%-10s] FAILED: %s" node
+                          (str/join "; " (map (fn [r] (str (:label r) " exit=" (:exit r)
+                                                           " " (:err r)))
+                                              (remove :ok? results))))))
+        results)))
+
+;; ── dedicating a node to one model ─────────────────────────────────────────
+;;
+;; Owner instruction 2026-09-10, two of them, and they are the same
+;; instruction: "1 台を 27B 専用機にして待てる用途に使う" and "murakumo cloud
+;; fleet で, 基本的に1台当たり1つの model しか host しないように設計して".
+;; A 27B on a 16 GiB mini is not a node that happens to host one model; it is a
+;; node that CANNOT host two, and the conversion is therefore an eviction, not
+;; an addition.
+;;
+;; Four steps in this order, and the order is the content:
+;;
+;;   1. gate    -- refuse unless the operator said which plane the node is for
+;;   2. evict   -- durably, plists parked, not `pkill`
+;;   3. wire    -- raise iogpu.wired_limit_mb as a resident daemon
+;;   4. install -- server, then the queue worker enrolled for THIS model
+;;
+;; Wiring before installing because the limit is what makes the model fit on
+;; the GPU, and a server started under the old limit runs on the CPU and says
+;; it is healthy. Evicting before wiring because the limit is only meaningful
+;; once the memory it governs is not being spent by three other planes.
+
+(defn dedicate-node!
+  "Convert one node into a dedicated host for `model`.
+
+  Returns a step-by-step result. Stops at the first failed step rather than
+  continuing: a node that was evicted and then failed to install is a node
+  serving nothing, and reporting the later steps as skipped is how the operator
+  learns that from the output instead of from the fleet board."
+  [{:keys [name host] :as node} model {:keys [dry-run? evict?]}]
+  (let [artifact (artifacts/artifact model)
+        wired-mb (:wired-limit-mb artifact)
+        facts (node-facts host)]
+    (if-not (:ok? facts)
+      (assoc facts :node name :model model)
+      (let [gate (one-model-gate node :text {:evict? evict?})]
+        (if-not (:ok? gate)
+          {:node name :model model :ok? false :step :gate :gate gate}
+          (let [;; The gate's :evicting names the OTHER planes. It cannot name
+                ;; the text plane the node already runs, because that is the
+                ;; plane we are installing -- and on a conversion that plane is
+                ;; a different model under a different pair of labels. Left
+                ;; alone, murakumo-edge keeps its daemons, comes back at the
+                ;; next boot, and the "dedicated" node hosts two text models.
+                mine (set (vals (edge/labels-for model)))
+                stale-text (->> one/planes
+                                (filter #(= :text (:plane %)))
+                                (mapcat :daemons)
+                                (remove mine)
+                                vec)
+                evicting (update (one/evict-plan (:evicting gate)) :daemons
+                                 #(vec (distinct (concat % stale-text))))
+                steps (cond-> []
+                        (seq (:daemons evicting))
+                        (conj {:step :evict :script (edge/evict-script (:daemons evicting))})
+                        wired-mb
+                        (conj {:step :wired-limit :script (edge/wired-limit-script wired-mb)}))
+                plans [(edge/model-server-plan model (select-keys facts [:home :llama-server :memory-bytes]))
+                       (edge/model-join-plan model (assoc (select-keys facts [:home :nbb])
+                                                          :node-name name
+                                                          :local-port (:serve-port artifact)))]
+                steps (into steps (for [p plans]
+                                    {:step :install :label (:label p)
+                                     :script (edge/install-script p)}))]
+            (if dry-run?
+              {:node name :model model :ok? true :dry-run true :steps steps
+               :evicting (:daemons evicting) :unnamed (:unnamed evicting)}
+              (loop [[s & more] steps acc []]
+                (if-not s
+                  {:node name :model model :ok? true :steps acc
+                   :evicting (:daemons evicting) :unnamed (:unnamed evicting)}
+                  (let [{:keys [exit out err]} (ssh/sh host (:script s))
+                        r (assoc (dissoc s :script) :ok? (zero? exit) :exit exit
+                                 :out (str/trim (str out)) :err (str/trim (str err)))]
+                    (if (zero? exit)
+                      (recur more (conj acc r))
+                      {:node name :model model :ok? false :step (:step s)
+                       :steps (conj acc r)})))))))))))
+
+(defn dedicate-report [{:keys [node model ok? step gate steps unnamed dry-run]}]
+  (str/join
+   "\n"
+   (concat
+    [(format "[%-10s] %s %s" node model
+             (cond dry-run "dry-run"
+                   ok? "dedicated"
+                   :else (str "FAILED at " (clojure.core/name (or step :?)))))]
+    (when gate [(str "  refused: " (:detail gate))])
+    (for [s (or steps [])]
+      (format "  %-12s %s%s" (clojure.core/name (:step s)) (or (:label s) "")
+              (cond dry-run "" (:ok? s) "  ok"
+                    :else (str "  FAILED exit=" (:exit s) " " (:err s)))))
+    ;; A plane nothing can name a launchd job for was not evicted durably, and
+    ;; saying so here is the difference between an eviction and a restart.
+    (when (seq unnamed)
+      [(str "  WARNING: no launchd job known for "
+            (str/join ", " (map #(clojure.core/name (:plane %)) unnamed))
+            " -- stopped, but not kept stopped across a boot")]))))
+
+(defn dedicate!
+  [{:keys [nodes]} selector model opts]
+  (let [targets (filter #(= selector (:name %)) nodes)]
+    (when (empty? targets)
+      (throw (ex-info "dedicating a node needs one node by name" {:selector selector})))
+    (mapv #(dedicate-node! % model opts) targets)))
+
+;; ── the fleet's topology: declared, measured, reconciled ───────────────────
+;;
+;; Owner instruction 2026-09-10: tidy the topology so the cluster runs
+;; efficiently and stably. Three functions, in the order an operator uses them:
+;; `topology-report!` says where the fleet is, `topology-plan` says what would
+;; change, and `topology-apply!` changes it. The plan is a value, so the thing
+;; that gets reviewed is the thing that runs.
+
+(defn discover-labels!
+  "Ask one node which launchd job starts each model plane.
+
+  Returns `{}` when the node cannot be read, and the caller must not treat that
+  as `nothing to evict` -- `one/evict-labels` marks the planes discovery did
+  not see, which is the difference between a node with no extras and a node
+  nobody could ask."
+  [{:keys [host]}]
+  (let [{:keys [exit out]} (ssh/sh host one/discover-script)]
+    (if (zero? exit) (one/labels-from-discovery out) {})))
+
+(defn topology-node!
+  "Declared vs measured for one node, with the labels a repair would need."
+  [{:keys [name] :as node}]
+  ;; The field is `:node/serves` in fleet.edn and survives the loader
+  ;; namespaced. Reading `:serves` here would find nil on every node and read
+  ;; the whole fleet as :unstated -- a confident answer, wrong about all of it.
+  (let [serves (:node/serves node)
+        m (model-hosts-node! node)
+        v (topo/verdict {:serves serves} m)]
+    (cond-> {:node name :measured m :verdict v :serves serves}
+      (= :drift (:verdict v))
+      (assoc :labels (one/evict-labels (discover-labels! node) (:plane v)
+                                       (map :plane (:hosts m)))))))
+
+(defn topology!
+  [{:keys [nodes]} selector]
+  (let [targets (if (or (nil? selector) (= "all" selector))
+                  nodes
+                  (filter #(= selector (:name %)) nodes))]
+    (when (empty? targets)
+      (throw (ex-info "no fleet node matched" {:selector selector})))
+    (mapv topology-node! targets)))
+
+(defn topology-report [results]
+  (let [summary (topo/fleet-summary (map :verdict results))]
+    (str/join
+     "\n"
+     (concat
+      (map (fn [{:keys [node serves measured verdict labels]}]
+             (str (topo/report-line node {:serves serves} measured)
+                  (when (seq (:guessed labels))
+                    (str "\n" (format "%-12s" "") "⚠ could not read "
+                         (str/join ", " (map clojure.core/name (:planes-not-discovered labels)))
+                         " from launchd; those labels are a guess, not a reading"))))
+           results)
+      [""
+       (str "fleet: "
+            (str/join "  "
+                      (for [k [:conformant :drift :unstated :unmeasured :invalid]
+                            :when (get summary k)]
+                        (str (clojure.core/name k) "=" (get summary k))))
+            ;; A fleet of :unstated nodes has zero drift and no topology. Say
+            ;; the second thing, because the first reads as health.
+            (when-let [u (:unstated summary)]
+              (str "  -- " u " node(s) have no :node/serves; that is not health, it is silence")))]))))
+
+(defn topology-plan
+  "What reconciling one node's drift would DO, as data.
+
+  Only ever proposes evictions. Starting a missing plane needs a model, a
+  checkpoint and (for text) an admission check, which `dedicate-node!` already
+  owns -- so a missing plane is reported and left, rather than half-started by
+  a function whose job is tidying."
+  [{:keys [node verdict labels] :as r}]
+  (let [{:keys [evict missing?]} verdict]
+    (cond-> {:node node :verdict (:verdict verdict)}
+      (seq evict) (assoc :evict-planes evict :evict-labels (:labels labels))
+      missing?    (assoc :missing-plane (:plane verdict)
+                         :note "start it with `murakumo edge dedicate` -- tidying does not start models")
+      (seq (:guessed labels))
+      (assoc :unreadable (:planes-not-discovered labels)))))
+
+(defn topology-apply!
+  "Evict the planes a node is not for. Refuses when the labels are a guess.
+
+  A node whose plists could not be read has an unknown set of jobs, and
+  evicting a guessed label there is how a fleet loses a service nobody
+  intended to touch."
+  [{:keys [nodes]} selector {:keys [dry-run?]}]
+  (let [results (topology! {:nodes nodes} selector)]
+    (mapv (fn [{:keys [node labels verdict] :as r}]
+            (let [plan (topology-plan r)
+                  host (:host (first (filter #(= node (:name %)) nodes)))]
+              (cond
+                (not= :drift (:verdict verdict)) (assoc plan :applied :nothing-to-do)
+                (seq (:guessed labels))
+                (assoc plan :applied :refused
+                       :why "launchd could not be read for some planes; evicting a guessed label is how a fleet loses a service nobody meant to touch")
+                (empty? (:evict-labels plan)) (assoc plan :applied :nothing-to-evict)
+                dry-run? (assoc plan :applied :dry-run
+                                :script (edge/evict-script (:evict-labels plan)))
+                :else
+                (let [{:keys [exit out err]} (ssh/sh host (edge/evict-script (:evict-labels plan)))]
+                  (assoc plan :applied (if (zero? exit) :evicted :failed)
+                         :exit exit :out (str/trim (str out)) :err (str/trim (str err)))))))
+          results)))

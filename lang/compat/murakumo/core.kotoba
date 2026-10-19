@@ -1,0 +1,593 @@
+;; murakumo.core — control plane for the kotoba WASM lattice/mesh across the
+;; Tailscale Mac-mini fleet. One terminal drives provisioning, residence (launchd),
+;; fleet-wide status aggregation, and WASM-component deployment.
+;;
+;; Why this exists: kotoba ships a single-node `kotoba lattice ps` and no
+;; fleet-facing control surface. murakumo is that surface — a thin bb/clj operator
+;; that SSHes the fleet (no agent to install on nodes beyond the kotoba binaries),
+;; renders a resident LaunchAgent per node, and folds every node's /health +
+;; lattice participation into one view.
+
+(ns murakumo.core
+  (:require [kotoba.io :as kio] [babashka.process :as p]
+            [json.compat :as json]
+            [kotoba.lang.text :as str]
+            [murakumo.config :as config]
+            [murakumo.connect :as connect]
+            [murakumo.dash.state :as state]
+            [murakumo.deploy.plan :as deploy]
+            [murakumo.fleet :as fleet]
+            [murakumo.identity :as identity]
+            [murakumo.provision.plan :as provision]
+            [murakumo.token :as token]
+            [murakumo.secret :as secret]
+            [murakumo.report :as report]
+            [murakumo.reconcile :as reconcile]
+            [murakumo.ssh :as ssh]
+            [murakumo.tunnel :as tunnel]))
+
+;; Binary resolution (raced-checkout safety): murakumo deploys a PINNED binary
+;; set it owns (./bin/, gitignored) so a concurrent rebuild of the shared kotoba
+;; checkout can't swap the CLI/server protocol out from under a live fleet.
+;; Fallbacks: $MURAKUMO_BIN, then the kotoba checkout's target/.
+(def ^:private runtime
+  (config/current-runtime-context))
+
+(def ^:private kotoba-dir (:kotoba-dir runtime))
+(def ^:private local-bin (:local-bin runtime))
+(def ^:private user-dir (:user-dir runtime))
+
+;; ── identity ──────────────────────────────────────────────────────────────
+;; Derive a deterministic per-node Ed25519 seed from the shared operator seed +
+;; node name, so node identities are stable + reproducible without storing a
+;; secret per node. The operator seed comes from MURAKUMO_OPERATOR_SEED, else
+;; the shared kotoba store (${XDG_DATA_HOME:-$HOME/.local/share}/kotoba/operator.seed). Never committed,
+;; never echoed.
+
+(defn- operator-seed [fleet]
+  (config/current-operator-seed fleet))
+
+(defn- did-for [node-seed-hex]
+  ;; ask the local kotoba CLI to derive the did:key for this seed.
+  (identity/did-from-command-result
+   (apply p/sh (identity/did-derive-argv (:kotoba runtime) node-seed-hex))))
+
+;; ── commands ────────────────────────────────────────────────────────────────
+
+(defn cmd-nodes
+  "List the fleet with Tailscale reachability + whether the mesh binary/agent is
+  present. Read-only — the at-a-glance fleet map."
+  [fleet _]
+  (let [fleet (fleet/enrich fleet)]
+    (println (report/nodes-header))
+    (doseq [{:keys [action node]}
+            (state/collect-node-plans (:nodes fleet) #(ssh/reachable? (:host %)))]
+      (case action
+        :down (println (report/nodes-row node false "-"))
+        :probe (let [b (:out (ssh/sh (:host node) (provision/mesh-binary-status-command)))
+                     up (:out (ssh/sh (:host node) (provision/launch-status-command)))]
+                 (println (report/nodes-row node true (report/mesh-status b up))))))))
+
+(def ^:private peers-file (config/peers-path user-dir))  ; node-name → libp2p PeerId (control-plane state)
+
+(defn- node-port [fleet n] (fleet/node-port fleet n))
+(defn- node-p2p-port [fleet n] (provision/node-p2p-port fleet n))
+
+(defn- node-p2p-seed [fleet n] (identity/node-p2p-seed (operator-seed fleet) n))
+
+(defn- provision-node
+  "rsync the binaries + render & load the LaunchDaemon for one (enriched) node.
+   `peers` is the name→PeerId map (for KOTOBA_BOOTSTRAP_PEERS; may be empty)."
+  [fleet connect-spec tmpl peers n]
+  (let [host (:host n)]
+    (print (report/node-prefix n)) (flush)
+    (if-not (ssh/reachable? host)
+      (println report/unreachable-skipped-line)
+      (let [op-seed (operator-seed fleet)
+            user (:out (ssh/sh host "whoami"))
+            home (:out (ssh/sh host "echo $HOME"))
+            plist (provision/render-plist
+                   tmpl fleet connect-spec peers n
+                   {:user user
+                    :home home
+                    :operator-seed op-seed
+                    :x25519-seed (identity/x25519-seed op-seed)
+                    :did (did-for op-seed)
+                    :p2p-seed (node-p2p-seed fleet n)})]
+        (ssh/sh host (provision/remote-store-command))
+        (print "rsync… ") (flush)
+        (doseq [bin deploy/pinned-binaries]
+          (apply p/sh (provision/rsync-binary-argv local-bin host bin)))
+        (do
+          (ssh/sh host (provision/write-plist-command plist))
+          ;; RE-provision safety: on a node already running the service, an immediate
+          ;; bootstrap after bootout races launchd and leaves the service UNLOADED
+          ;; (caught by the asher canary). Settle after bootout, tolerate a re-bootstrap
+          ;; of an already-loaded label, then kickstart to force the (re)start.
+          (ssh/sh host (provision/reprovision-command)))
+        ;; sibling watchdog: kotoba-server can wedge its HTTP surface without
+        ;; exiting (KeepAlive can't heal that) — probe /health, kill on 2 strikes.
+        (let [wd (provision/render-watchdog-plist
+                  (slurp "deploy/com.murakumo.kotoba-mesh-watchdog.plist.tmpl")
+                  fleet n {:user user :home home})]
+          (ssh/sh host (provision/write-watchdog-plist-command wd))
+          (ssh/sh host (provision/watchdog-reprovision-command)))
+        ;; kernel network baseline: widen the ephemeral port range so one
+        ;; misbehaving poller cannot take every outbound socket on the node
+        ;; with it (ADR-260902-fleet-outbound-hygiene).
+        (let [sb (provision/render-sysctl-baseline-plist
+                  (slurp "deploy/com.murakumo.sysctl-baseline.plist.tmpl")
+                  {:home home})]
+          (ssh/sh host (provision/write-sysctl-baseline-plist-command sb))
+          (ssh/sh host (provision/sysctl-baseline-reprovision-command)))
+        (println (report/provision-result-line (seq (provision/bootstrap-str fleet peers n))))))))
+
+(defn- load-peers [] (config/read-edn-file-or peers-file {}))
+
+(defn- build-manifest []
+  (config/read-edn-file-or (:build-manifest runtime) nil))
+
+(defn- ensure-pinned!
+  "BUILD.edn (tracked in git) pins the fleet's expected kotoba version; the binary
+   itself is distributed out-of-band (built + `murakumo pin`). Refuse to roll out
+   if a version is pinned but ./bin is empty — so the fleet always gets the exact
+   version the repo declares. Returns the manifest (or nil if none)."
+  []
+  (let [bm (build-manifest)]
+    (when (deploy/missing-pinned-binaries?
+           bm
+           (kio/exists? (kio/file (config/kotoba-server-bin local-bin))))
+      (binding [*out* *err*]
+        (doseq [line (report/missing-pinned-binaries-lines bm)]
+          (println line)))
+      (System/exit 2))
+    bm))
+
+(defn cmd-provision
+  "Push binaries + a resident LaunchDaemon to selected node(s). Idempotent.
+   Uses any known PeerIds (.murakumo-peers.edn) for bootstrap. Requires
+   MURAKUMO_OPERATOR_SEED."
+  [fleet [sel]]
+  (when-let [error (provision/provision-command-error (operator-seed fleet))]
+    (binding [*out* *err*]
+      (println (report/command-error-line :provision error)))
+    (System/exit 2))
+  (when-let [bm (ensure-pinned!)]
+    (println (report/rollout-line bm)))
+  (let [tmpl (slurp (config/launchd-template-path user-dir))
+        connect-spec (connect/load-connect)
+        fleet (fleet/enrich fleet)
+        peers (load-peers)]
+    (doseq [n (fleet/select fleet sel)] (provision-node fleet connect-spec tmpl peers n))))
+
+(defn- node-peer-id
+  "Read a node's stable libp2p PeerId from its mesh.log (net_actor logs it as
+   `node_did=did:key:<peerid>` on lattice startup)."
+  [host]
+  (let [out (:out (ssh/sh host (provision/peer-id-log-command)))]
+    (provision/peer-id-from-log out)))
+
+(defn cmd-mesh
+  "Form ONE gossipsub lattice across the fleet (2-pass): provision every node
+   with a fixed P2P port + stable PeerId, collect the PeerIds, then re-provision
+  with each node's KOTOBA_BOOTSTRAP_PEERS = all the others. After this, nodes
+   dial each other over Tailscale and a component placed anywhere can run anywhere."
+  [fleet [sel]]
+  (when-let [error (provision/mesh-command-error (operator-seed fleet))]
+    (binding [*out* *err*]
+      (println (report/command-error-line :mesh error)))
+    (System/exit 2))
+  (ensure-pinned!)
+  (let [tmpl (slurp (config/launchd-template-path user-dir))
+        connect-spec (connect/load-connect)
+        fleet (fleet/enrich fleet)
+        nodes (fleet/select fleet sel)]
+    (println report/mesh-pass1-line)
+    (doseq [n nodes] (provision-node fleet connect-spec tmpl {} n))
+    (println report/mesh-wait-peerid-line)
+    (Thread/sleep provision/peer-advertise-wait-ms)
+    (let [peers (provision/collected-peers-from-results
+                 (provision/peer-probe-results
+                  nodes
+                  #(ssh/reachable? (:host %))
+                  node-peer-id))]
+      (config/write-edn-file peers-file peers)
+      (println (report/collected-peers-line (count peers) peers-file))
+      (println report/mesh-pass2-line)
+      (doseq [n nodes] (provision-node fleet connect-spec tmpl peers n))
+      (println report/mesh-forming-line))))
+
+(defn cmd-up
+  [fleet [sel]]
+  (doseq [[n result] (provision/launch-results
+                      (fleet/select fleet sel)
+                      :up
+                      ssh/sh)]
+    (println (report/launch-result-line n result))))
+
+(defn cmd-down
+  [fleet [sel]]
+  (doseq [[n result] (provision/launch-results
+                      (fleet/select fleet sel)
+                      :down
+                      ssh/sh)]
+    (println (report/launch-result-line n result))))
+
+(defn- node-links
+  "Distinct libp2p peers this node has connected to (from its mesh.log — the real
+   lattice connectivity signal; the /health peer_count is the KDHT neighborhood,
+   not the live link set)."
+  [host]
+  (let [out (:out (ssh/sh host (provision/live-link-count-command)))]
+    (provision/live-link-count-output out)))
+
+(defn cmd-status
+  "Fold every node's /health into one view — the management read. LINKS is the
+  number of distinct mesh peers the node has connected to (>0 once `mesh` ran)."
+  [fleet [sel]]
+  (println (report/status-header))
+  (let [fleet (fleet/enrich fleet)]
+    (doseq [{:keys [action node]}
+            (state/collect-node-plans
+             (fleet/select fleet sel)
+             #(ssh/reachable? (:host %)))]
+      (case action
+        :down (println (report/status-down-row node))
+        :probe (let [h (ssh/curl-local (:host node) (fleet/node-health-url fleet node))
+                     j (state/parse-health #(json/parse-string % true) h)
+                     row (state/status-row-input node j (node-links (:host node)) (node-p2p-port fleet node))]
+                 (println (report/status-row* row)))))))
+
+(defn- pinned-wit []
+  (:wit runtime))
+
+(defn- fwd [host port lport]
+  (p/sh "bash" "-c" (tunnel/replace-forward-command lport port host))
+  (Thread/sleep deploy/forward-settle-ms))
+
+(defn- distribute-artifact
+  "Block-put the WASM artifact to EVERY reachable node so the lattice can place
+   the component anywhere and the winner always has the bytes (no IPFS/bitswap
+   dependency). Operator-authed."
+  [fleet token wasm nodes]
+  (print "  distributing artifact →") (flush)
+  (doseq [{:keys [node host remote-port local-port]}
+          (deploy/reachable-artifact-distribution-plan fleet nodes ssh/reachable?)]
+    (fwd host remote-port local-port)
+    (let [r (apply p/sh (deploy/block-put-argv (:kotoba runtime) token wasm local-port))]
+      (print (report/artifact-node-status node r)) (flush)))
+  (p/sh "bash" "-c" (deploy/stop-forward-command deploy/artifact-forward-port))
+  (println))
+
+(defn- placed-on
+  "Which nodes have executed the component CID (from their logs) — i.e. where the
+   lattice actually placed + ran it."
+  [fleet cid nodes]
+  (deploy/observed-nodes
+   (deploy/placement-probe-results
+    cid nodes
+    (fn [host command] (:out (ssh/sh host command))))))
+
+(defn cmd-deploy
+  "Deploy a kotoba app manifest to the FLEET: resolve its component CID, distribute
+   the artifact to every node, publish its triggers/routes to one node's lattice,
+   and report which node the lattice PLACED it on (honouring the manifest's
+  :placement constraints over node labels). Usage: deploy <app.edn> [publish-node]."
+  [fleet [manifest pubsel]]
+  (when-let [error (deploy/deploy-command-error manifest (operator-seed fleet))]
+    (binding [*out* *err*]
+      (println (report/command-error-line :deploy error)))
+    (System/exit 2))
+  (let [fleet (fleet/enrich fleet)
+        kotoba (:kotoba runtime)
+        wit (pinned-wit)
+        token (identity/op-token (did-for (operator-seed fleet)))
+        input (deploy/deployment-input manifest (slurp manifest))
+        dplan (deploy/deployment-plan (:manifest input) (:manifest-text input))
+        src (:src dplan)
+        wasm (:wasm dplan)
+        ;; compile :src → wasm+CID, or use an explicit :cid (artifact must already be on nodes).
+        build-output (when src
+                       ;; `component build` writes the wasm AND prints its CID (last line).
+                       (:out (apply p/sh (deploy/component-build-argv kotoba (:src-path dplan) wit wasm))))
+        cid (deploy/deployment-cid dplan build-output)
+        pub (first (fleet/select fleet (deploy/publish-selector pubsel)))]
+    (println (report/deploy-start-line manifest cid))
+    (when src (distribute-artifact fleet token wasm (:nodes fleet)))
+    ;; publish PutApp+PutRoutes from one node → gossiped fleet-wide → lattice auctions + places.
+    (fwd (:host pub) (node-port fleet pub) deploy/publish-forward-port)
+    (let [{:keys [out err]} (apply p/sh (deploy/app-deploy-argv kotoba manifest wit deploy/publish-forward-port))]
+      (println (report/deploy-command-output out err)))
+    (p/sh "bash" "-c" (deploy/stop-forward-command deploy/publish-forward-port))
+    ;; let the auction close + first trigger fire, then report placement.
+    (println report/deploy-wait-placement-line)
+    (Thread/sleep deploy/placement-wait-ms)
+    (let [where (placed-on fleet cid (:nodes fleet))]
+      (println (report/deploy-observed-row where pub)))))
+
+(defn cmd-pin
+  "Copy a consistent kotoba binary set into murakumo's own ./bin (gitignored) and
+   record its provenance, so the fleet always gets the SAME cli+server the control
+   plane drives — independent of the shared kotoba checkout. Usage: pin <src-dir>
+  (defaults to the kotoba checkout's release target)."
+  [_ [src]]
+  (let [src (deploy/pin-source src kotoba-dir)
+        dest (config/pinned-bin-dir user-dir)
+        pin (deploy/pin-copy-plan src dest)]
+    (kio/mkdirs (kio/file dest))
+    (doseq [{:keys [src]} (deploy/missing-pin-binaries pin #(kio/exists? (kio/file %)))]
+      (binding [*out* *err*] (println (report/missing-binary-line src)))
+      (System/exit 2))
+    (doseq [argv (deploy/pin-binary-copy-argvs pin)]
+      (apply p/sh argv))
+    ;; pin the WIT alongside the binary (a release dir is target/<triple>/release,
+    ;; so its WIT is ../../../crates/kotoba-runtime/wit) — deploy compiles against
+    ;; the SAME WIT version the binary expects (avoids world-name skew).
+    (doseq [argv (deploy/pin-wit-argvs pin (kio/exists? (kio/file (get-in pin [:wit :src]))))]
+      (apply p/sh argv))
+    (let [git-bin (deploy/resolve-git-bin
+                   {:git-bin (config/git-bin-override)})
+          _ (when-not git-bin
+              (binding [*out* *err*]
+                (println "error: no absolute git binary (set MURAKUMO_GIT_BIN or install /usr/bin/git)"))
+              (System/exit 2))
+          sha (deploy/command-output
+               (:out (apply p/sh (deploy/git-short-sha-argv src git-bin))))
+          ver (deploy/command-output (:out (apply p/sh (deploy/version-argv dest))))]
+      ;; webrtc: the fleet's browser-Live transport (connect.edn :native :live ⊇
+      ;; :webrtc). Build kotoba with `--features p2p,realtime-wasm,webrtc` so the
+      ;; KOTOBA_WEBRTC /webrtc-direct listen actually binds.
+      (config/write-edn-file (:build-manifest runtime) (deploy/build-manifest src sha ver))
+      (println (report/pin-success-line src sha ver)))))
+
+(defn cmd-dash
+  "Web dashboard + Datom-log snapshotter. Args: [port=8899] [interval-s=15]."
+  [_ args]
+  (require 'murakumo.dash)
+  (apply (resolve 'murakumo.dash/-main) args))
+
+(defn cmd-cloud
+  "Plan murakumo.cloud overlay records. Args: [plan|records] [--cloud=cloud.edn] [--fleet=fleet.edn]."
+  [_ args]
+  (require 'murakumo.cloud)
+  (apply (resolve 'murakumo.cloud/-main) args))
+
+(defn cmd-reconcile
+  "Declarative fleet reconcile (murakumo's wadm). Folds a desired-state manifest
+   (murakumo.app.edn) against live placement and reports/converges the drift.
+   Placement is imperative — deploys to each planner-chosen target node
+   directly (`cmd-deploy`'s publish-selector); no cross-node lattice auction
+   is wired (ADR-2606271600). See murakumo.reconcile."
+  [fleet args]
+  (let [deploy-fn (fn [a manifest-dir target]
+                    (cmd-deploy fleet [(deploy/app-manifest-path manifest-dir a) target]))]
+    (reconcile/cmd-reconcile fleet (cons "reconcile" args) deploy-fn)))
+
+(defn cmd-fleet
+  "Coordination-plane view: fold a kotoba-fleet Datom log into one snapshot
+   (per-work holders, active leases, pending proposals). Args: [datom-log.edn] [now-ms].
+   See murakumo.fleet-view / kotoba.fleet.view."
+  [_ args]
+  (require 'murakumo.fleet-view)
+  (apply (resolve 'murakumo.fleet-view/-main) args))
+
+(defn cmd-infer
+  "Distributed inference across the fleet, exo-style (memory-weighted layer
+   sharding, llama.cpp RPC / MLX ring engines). See murakumo.infer."
+  [_ args]
+  (require 'murakumo.infer)
+  (apply (resolve 'murakumo.infer/-main) args))
+
+(defn cmd-edge
+  "Install the resident murakumo-edge daemons (server + join) on fleet nodes.
+
+     murakumo edge install [<node>|all] [--dry-run]
+
+  System LaunchDaemons, not LaunchAgents: measured 2026-09-09, no mini has a
+  login session, so the agents never loaded and the running workers were
+  hand-started orphans. See murakumo.edge-install."
+  [fleet [sub selector & flags]]
+  (require 'murakumo.edge-install)
+  (let [install! (resolve 'murakumo.edge-install/install!)
+        report (resolve 'murakumo.edge-install/report)
+        dry? (boolean (some #{"--dry-run"} (cons selector flags)))
+        selector (when (and selector (not= "--dry-run" selector)) selector)]
+    (case (str sub)
+      "install" (println (report (install! fleet selector {:dry-run? dry?})))
+      "baseline" (println (report ((resolve 'murakumo.edge-install/baseline!)
+                                   fleet selector {:dry-run? dry?})))
+      ;; One node, one model (owner instruction 2026-09-10). Measured from the
+      ;; node's own process list, not from fleet.edn: what a node declares and
+      ;; what it is running are different facts, and only one of them consumes
+      ;; the RAM.
+      "models" (println ((resolve 'murakumo.edge-install/model-hosts-report)
+                         ((resolve 'murakumo.edge-install/model-hosts!) fleet selector)))
+      ;; Push the worker's own source and restart it. It had no caller until
+      ;; now, which is how five nodes came to run two different versions of it.
+      "sync" (println (report ((resolve 'murakumo.edge-install/sync-source!)
+                               fleet selector {:dry-run? dry?})))
+      ;; Convert one node into a dedicated host for one model: gate, evict,
+      ;; raise the wired-memory limit as a resident daemon, install.
+      ;; --evict is the operator saying which plane the node is FOR; without it
+      ;; the gate refuses on any node that already hosts something else.
+      "dedicate"
+      (let [model (first (remove #(str/starts-with? (str %) "--") flags))]
+        (if-not model
+          (println "usage: murakumo edge dedicate <node> <model> [--evict] [--dry-run]")
+          (println (str/join "\n"
+                             (map (resolve 'murakumo.edge-install/dedicate-report)
+                                  ((resolve 'murakumo.edge-install/dedicate!)
+                                   fleet selector model
+                                   {:dry-run? dry?
+                                    :evict? (boolean (some #{"--evict"} flags))}))))))
+      ;; Declared vs measured, for the whole fleet. `topology` reports;
+      ;; `topology --apply` evicts what a node is not for. It never STARTS a
+      ;; model -- that needs an admission check and a checkpoint, which
+      ;; `dedicate` owns.
+      "topology"
+      (let [apply? (boolean (some #{"--apply"} flags))
+            results ((resolve (quote murakumo.edge-install/topology!)) fleet selector)]
+        (println ((resolve (quote murakumo.edge-install/topology-report)) results))
+        (when apply?
+          (println "\n-- reconciling --")
+          (doseq [r ((resolve (quote murakumo.edge-install/topology-apply!))
+                     fleet selector {:dry-run? dry?})]
+            (println (format "  [%-10s] %s%s" (:node r) (name (:applied r))
+                             (cond (:why r) (str " -- " (:why r))
+                                   (seq (:evict-planes r))
+                                   (str " " (str/join ", " (map name (:evict-planes r))))
+                                   :else ""))))))
+      (println (str "usage: murakumo edge (install|baseline|models|sync|topology) [<node>|all] [--dry-run]\n"
+                    "       murakumo edge topology [<node>|all] [--apply] [--dry-run]\n"
+                    "       murakumo edge dedicate <node> <model> [--evict] [--dry-run]")))))
+
+(defn cmd-access
+  "Whether each node has more than one way in.
+
+     murakumo access verify [<node>|all]
+     murakumo access repair [<node>|all]
+
+  `verify` OPENS the fallback connection rather than grepping authorized_keys:
+  a key can be present and still ignored, because sshd refuses the file when
+  the home directory is group-writable, and it refuses silently. See
+  murakumo.access."
+  [fleet [sub selector]]
+  (require 'murakumo.access)
+  (let [check! (resolve 'murakumo.access/check!)
+        repair! (resolve 'murakumo.access/repair!)
+        report (resolve 'murakumo.access/report)
+        risk? (resolve 'murakumo.access/stranded-risk?)]
+    (case (str sub)
+      "verify" (let [rs (check! fleet selector {})
+                     at-risk (filter #(risk? (:verdict %)) rs)]
+                 (println (report rs))
+                 (when (seq at-risk)
+                   (println (format "%d node(s) have exactly one way in: %s"
+                                    (count at-risk)
+                                    (clojure.string/join ", " (map :node at-risk))))))
+      "repair" (doseq [{:keys [node ok? count err]} (repair! fleet selector {})]
+                 (println (format "[%-10s] %s %s" node
+                                  (if ok? "key present" "FAILED")
+                                  (if ok? (str "(" count " match)") err))))
+      (println "usage: murakumo access (verify|repair) [<node>|all]"))))
+
+(defn cmd-model
+  "Plan/download/inspect Hugging Face model caches on fleet nodes."
+  [_ args]
+  (if (= "add-image" (first args))
+    (do (require 'murakumo.image-model)
+        (apply (resolve 'murakumo.image-model/-main) (rest args)))
+    (do (require 'murakumo.model-setup)
+        (apply (resolve 'murakumo.model-setup/-main) args))))
+
+(defn cmd-revive
+  "Wake offline Mac fleet nodes by sending Wake-on-LAN from a live LAN peer."
+  [fleet [selector]]
+  (let [nodes (:nodes fleet)
+        live (first (filter #(ssh/reachable? (:host %)) nodes))
+        targets (if (and selector (not= selector "all"))
+                  (filter #(= selector (:name %)) nodes)
+                  (remove #(ssh/reachable? (:host %)) nodes))]
+    (when-not live
+      (throw (ex-info "no live LAN fleet peer available to relay Wake-on-LAN" {})))
+    (doseq [{:keys [name mac]} targets]
+      (if-not mac
+        (println (format "[%-10s] skipped — no :mac in fleet.edn" name))
+        (let [py (str "import socket; m=bytes.fromhex('" (str/replace mac ":" "")
+                      "'); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); "
+                      "s.setsockopt(socket.SOL_SOCKET,socket.SO_BROADCAST,1); "
+                      "s.sendto(b'\\xff'*6+m*16,('255.255.255.255',9)); print('sent')")
+              result (ssh/sh (:host live) (str "python3 -c " (pr-str py)))]
+          (println (format "[%-10s] wake=%s via=%s" name
+                           (str/trim (:out result)) (:name live))))))))
+
+(defn- parse-flags
+  "['--sub' 'x' '--scope' 'chat'] or ['--sub=x'] -> {\"sub\" \"x\" ...}."
+  [args]
+  (loop [xs args, acc {}]
+    (if-let [a (first xs)]
+      (if (str/starts-with? (str a) "--")
+        (let [body (subs a 2)]
+          (if-let [i (str/index-of body "=")]
+            (recur (rest xs) (assoc acc (subs body 0 i) (subs body (inc i))))
+            (recur (drop 2 xs) (assoc acc body (second xs)))))
+        (recur (rest xs) acc))
+      acc)))
+
+(defn- cmd-token
+  "Mint / inspect murakumo inference access tokens (HMAC, stateless — the
+  gateway verifies without any shared state). Resolves the signing secret
+  via murakumo.secret (named `murakumo-token` → exact $MURAKUMO_TOKEN_SECRET;
+  no ambient env dump). Hosts may inject a kit-shaped :fetch later.
+
+    murakumo token issue [--sub <label>] [--scope chat|image|all] [--ttl <secs>]
+    murakumo token verify <token>
+
+  The SAME secret must be set on the verifying gateway (cloud-murakumo):
+    npx wrangler secret put MURAKUMO_TOKEN_SECRET"
+  [_ args]
+  (let [[sub & rest] args
+        signing-secret (secret/resolve-token-secret)
+        now (quot (System/currentTimeMillis) 1000)]
+    (cond
+      (str/blank? signing-secret)
+      (println "error: $MURAKUMO_TOKEN_SECRET is not set — export it (the same value the gateway verifies with).")
+
+      (= sub "issue")
+      (let [f (parse-flags rest)
+            ttl (some-> (get f "ttl") Long/parseLong)
+            t (token/sign signing-secret {:sub (get f "sub" "client")
+                                          :scope (get f "scope" "all")
+                                          :now now
+                                          :ttl (or ttl 2592000)})]
+        (println t)
+        (binding [*out* *err*]
+          (println)
+          (println "# configure the client to send this token, e.g. shinshi companion chat:")
+          (println "#   npx wrangler secret put MURAKUMO_PROXY_TOKEN   # paste the token above")
+          (println "# the gateway (cloud-murakumo) verifies it with MURAKUMO_TOKEN_SECRET.")))
+
+      (= sub "verify")
+      (let [t (first rest)
+            cl (and t (token/verify signing-secret t now))]
+        (if cl
+          (println (json/generate-string (assoc cl :valid true)))
+          (println (json/generate-string {:valid false}))))
+
+      :else
+      (println "usage: murakumo token issue [--sub L] [--scope chat|image|all] [--ttl secs] | verify <token>"))))
+
+(defn cmd-identity
+  "Print the fleet operator DID. The seed is never echoed.
+
+   Resolution: MURAKUMO_OPERATOR_SEED (env wins), else
+   ${XDG_DATA_HOME:-$HOME/.local/share}/kotoba/operator.seed.
+   Missing both is the existing missing-seed error."
+  [fleet _]
+  (let [result (identity/identity-command-result (operator-seed fleet))]
+    (if (:ok? result)
+      (println (:did result))
+      (do
+        (binding [*out* *err*]
+          (println (report/command-error-line :provision (:error result))))
+        (System/exit 2)))))
+
+(def ^:private commands
+  {"nodes" cmd-nodes "provision" cmd-provision "up" cmd-up "down" cmd-down
+   "status" cmd-status "deploy" cmd-deploy "mesh" cmd-mesh "pin" cmd-pin
+   "dash" cmd-dash "reconcile" cmd-reconcile "fleet" cmd-fleet
+   "cloud" cmd-cloud "infer" cmd-infer "edge" cmd-edge "access" cmd-access "model" cmd-model "revive" cmd-revive
+   "token" cmd-token "identity" cmd-identity})
+
+(defn -main [& args]
+  (let [[cmd & rest] args
+        fleet (fleet/load-fleet)]
+    (try
+      (if-let [f (get commands cmd)]
+        (f fleet rest)
+        (println (report/command-help)))
+      (finally
+        ;; probe/plan use pmap and HTTP clients. Their executor threads kept a
+        ;; completed CLI alive after it had printed its answer, which made the
+        ;; restored task entrypoint unusable from automation.
+        (shutdown-agents)))))

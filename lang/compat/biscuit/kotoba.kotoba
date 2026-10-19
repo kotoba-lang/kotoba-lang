@@ -1,0 +1,299 @@
+(ns biscuit.kotoba
+  "A verified biscuit as the **delegated** term of Kotoba's effective scope.
+
+  `kotoba-lang/kotoba-lang`'s `lang/capability-semantics.edn` already defines
+  the shape of an answer:
+
+      :effective-scope  :requested-intersect-delegated-intersect-local-policy
+      :scope-attenuation-only  true
+      :unknown-kind  :deny
+      :missing-grant :deny
+
+  Three of those four terms already have owners — `requested` is what the
+  guarded call asks for, `local-policy` is the host's, and the rules are the
+  language's. **`delegated` had no wire.** This namespace is that wire, and
+  it is the concrete meaning of \"biscuit is the delegation centre\": not
+  that biscuit replaces the semantics, but that it is what fills the one slot
+  the semantics left open.
+
+  ## It maps into `:grant/*`, not into `:cap/*`
+
+  A capability (`:cap/kind`, `:cap/resource`, `:cap/holder`) is authority a
+  handler receives *after* intersection. A grant (`:grant/kind`,
+  `:grant/resources`, `:grant/expires`, `:grant/id`) is what a delegation
+  confers *before* it. A token that produced capabilities directly would be a
+  token that skipped the intersection — which is the one step the semantics
+  says is not optional.
+
+  ## Unknown kinds deny, and that is the interesting direction
+
+  `:kinds` in the semantics is a **closed set**. A biscuit fact naming a kind
+  outside it is not ignored (which would silently drop a restriction the
+  issuer intended) and does not throw (a token from a newer fleet is an
+  ordinary event). It lands in `:grant/rejected`, and a rejected kind confers
+  nothing — so the failure is toward less authority, and it is visible."
+  (:require [authority.chain :as chain]
+            [authority.grant :as grant]
+            [authority.scope :as scope]
+            [clojure.set :as set]
+            [kotoba.lang.text :as str]))
+
+(defn- fact->kind [v]
+  (when (string? v)
+    (if (str/starts-with? v ":") (keyword (subs v 1)) (keyword v))))
+
+(defn- narrow
+  "The resources both blocks confer — scopes met in the lattice, opaque names
+  intersected.
+
+  ## Why this is not `set/intersection`
+
+  It was, and that made the ordinary act of attenuating a wildcard produce a
+  token reaching nothing:
+
+      block 0   cap graph-read kotoba://graph/*
+      block 1   cap graph-read kotoba://graph/g1
+
+  Those two strings intersect to the EMPTY SET, so narrowing a namespace
+  grant down to one member — the operation Biscuit is chosen for — silently
+  destroyed the grant instead of narrowing it. Measured 2026-08-31 by a
+  consumer (`network-awai/app-hyakka`), which had to fold per block against
+  `authority.chain` to get a correct answer out of this namespace.
+
+  `biscuit.authority/->grant`, ten lines away in this same library, has
+  always folded with `authority.grant/meet`. So the library held **two**
+  answers to *what do two blocks jointly confer* and only one of them was
+  the lattice. That is exactly what `authority` exists to prevent, and its
+  own docstring here says adding biscuits must add no new answer to *does
+  this cover that*. This removes the second answer rather than adding a
+  third.
+
+  ## Why string identity survives for the rest
+
+  `:cap/resource` is not always a scope. `[cap \"infer\" \"murakumo-main\"]`
+  names a model alias, and an opaque name has exactly one relation available
+  to it — identity. Parsing partitions the set, so the two rules never apply
+  to the same member: a resource the lattice can read is met, one it cannot
+  is intersected, and one that parses on only ONE side relates to nothing
+  and is therefore dropped. Every branch narrows; none can widen."
+  [earlier later]
+  (let [split (fn [rs] (let [{:keys [scopes rejected]} (scope/parse-all rs)]
+                         [scopes (set rejected)]))
+        [ea eo] (split earlier)
+        [la lo] (split later)]
+    (into (set (keep scope/render (scope/meet-sets ea la)))
+          (set/intersection eo lo))))
+
+(defn- holder-binding
+  "Who the token is addressed to, folded across blocks the way every other
+  fact is: **a later block may only narrow.**
+
+  -> `{:holder did-or-nil}` or `{:refused :holder-ambiguous|:holder-readdressed}`.
+
+  | earlier | later block says | result |
+  |---|---|---|
+  | nobody (bearer) | `holder(b)` | bound to b -- addressing a bearer token narrows it |
+  | a | `holder(a)` | still a |
+  | a | `holder(b)`, b ≠ a | **refused** `:holder-readdressed` |
+  | any | two different holders in one block | **refused** `:holder-ambiguous` |
+
+  Until 2026-09-24 only the authority block was read. Both directions of that
+  were wrong: a bearer token its holder addressed to a delegate stayed a
+  bearer token, and a token addressed to alice that a later block re-addressed
+  to mallory stayed alice's -- so the parent kept using what it had handed on
+  (superproject adr-2608220100: not reading the address widens authority).
+
+  A re-addressed token is refused rather than resolved either way. Taking the
+  later holder would let whoever holds the proof secret move someone else's
+  token to themselves; keeping the earlier one is the defect above. Neither is
+  narrowing, so the token confers nothing and says why."
+  [blocks]
+  (reduce (fn [{:keys [holder] :as acc} b]
+            (let [hs (into #{} (keep (fn [[p v]] (when (= 'holder p) v))) (:block/facts b))]
+              (cond
+                (empty? hs) acc
+                (< 1 (count hs)) (reduced {:holder nil :refused :holder-ambiguous})
+                (nil? holder) {:holder (first hs)}
+                (= holder (first hs)) acc
+                :else (reduced {:holder nil :refused :holder-readdressed}))))
+          {:holder nil}
+          blocks))
+
+(defn ->delegated
+  "Verified token + the semantics' `:kinds` set -> Kotoba grants.
+
+  -> `{:grants [{:grant/kind :grant/resources :grant/expires :grant/id} …]
+       :grant/holder did-or-nil :grant/rejected [...]
+       :grant/refused :holder-readdressed|:holder-ambiguous  ; only when refused}`
+
+  `holder` folds across blocks like everything else (see `holder-binding`):
+  a later block may address a bearer token, may repeat the holder, and may
+  never re-address it. A token whose holder facts conflict has `:grants []`
+  and names the conflict in `:grant/refused`.
+
+  Facts read: `[cap <kind> <resource>]` and `[before <instant>]`. Everything
+  else stays available to checks and policies and confers nothing — the same
+  one-directional ignorance `biscuit.authority` documents, for the same
+  reason: **an unread fact cannot widen a grant.**
+
+  Blocks fold in order and later blocks may only narrow — never add a kind,
+  never widen a resource. `:scope-attenuation-only true` is not a convention
+  this honours, it is the only thing this function can express.
+
+  **Narrowing is `authority`'s, not string identity's** (see `narrow`). A
+  later block naming `kotoba://graph/g1` under `kotoba://graph/*` yields
+  `kotoba://graph/g1`, which is what attenuating a namespace grant is FOR;
+  until 2026-08-31 those two strings intersected to nothing and the ordinary
+  act of narrowing destroyed the grant instead."
+  [t kinds]
+  (let [blocks (:biscuit/blocks t)
+        rejected (atom [])
+        per-block
+        (for [b blocks]
+          (let [caps (keep (fn [[p k r]] (when (= 'cap p) [(fact->kind k) r]))
+                           (:block/facts b))
+                grouped (reduce (fn [acc [k r]]
+                                  (if (contains? kinds k)
+                                    (update acc k (fnil conj #{}) r)
+                                    (do (swap! rejected conj {:kind k :resource r}) acc)))
+                                {} caps)]
+            grouped))
+        folded (reduce (fn [acc block]
+                         (if (empty? block)
+                           acc
+                           (if (empty? acc)
+                             block
+                             ;; A later block narrows: kinds it does not
+                             ;; mention are dropped, resources it does mention
+                             ;; are narrowed. It can never introduce a kind.
+                             ;; A kind that narrows to NOTHING is dropped, not
+                             ;; carried as a grant with an empty resource set.
+                             ;; Both confer nothing, but only one of them lets
+                             ;; `missing-grant?` tell the truth -- and
+                             ;; `:missing-grant :deny` is supposed to reach
+                             ;; every token that delegates nothing, through the
+                             ;; ordinary path rather than a special case.
+                             (into {} (keep (fn [[k rs]]
+                                              (when-let [later (get block k)]
+                                                (let [n (narrow rs later)]
+                                                  (when (seq n) [k n])))))
+                                   acc))))
+                       {} per-block)
+        {:keys [holder refused]} (holder-binding blocks)
+        befores (keep (fn [[p v]] (when (= 'before p) v))
+                      (mapcat :block/facts blocks))
+        expires (when (seq befores) (reduce (fn [a b] (if (neg? (compare a b)) a b)) befores))]
+    (cond-> {:grants (if refused
+                       []
+                       (vec (for [[k rs] folded]
+                              (cond-> {:grant/kind k
+                                       :grant/resources (vec (sort rs))
+                                       :grant/id (str "biscuit:" (hash [k (sort rs)]))}
+                                expires (assoc :grant/expires expires)))))
+             :grant/holder holder
+             :grant/rejected @rejected}
+      refused (assoc :grant/refused refused))))
+
+(defn missing-grant?
+  "`:missing-grant :deny` — a token that delegates nothing denies everything,
+  through the ordinary path rather than a sentinel."
+  [{:keys [grants]}]
+  (empty? grants))
+
+;; ── the scope decision, once ─────────────────────────────────────────────────
+
+(defn- block-resources
+  "The resources one block asserts for `kinds`, or nil if it asserts none."
+  [block kinds]
+  (let [d (->delegated {:biscuit/blocks [block]} kinds)]
+    (when-not (missing-grant? d)
+      (vec (mapcat :grant/resources (:grants d))))))
+
+(defn ->chain
+  "A token model -> one `authority.grant` link PER BLOCK, for
+  `authority.chain` to fold.
+
+  Not `->delegated`'s folded result, because the DECISION is the lattice's.
+  `->delegated` does what only it can do — read facts, close the kind set,
+  report rejects — and `authority.chain/fold` does what only it can do: meet
+  the links and record, in `:authority/attempts`, every over-claim a block
+  made. A decision whose basis is not recorded cannot be audited later.
+
+  `expires` is threaded from the whole-token read because `before` is a
+  property of the token rather than of one block, and `meet` takes the
+  earlier of two bounds anyway."
+  [token-model kinds expires]
+  (into []
+        (keep (fn [b]
+                (when-let [rs (block-resources b kinds)]
+                  (grant/grant {:scopes rs :expires expires}))))
+        (:biscuit/blocks token-model)))
+
+(defn authorize
+  "A **verified** token + what is being asked -> the decision.
+
+  This is the whole `does this token reach that resource` question, in one
+  place, so that two consumers cannot answer it two ways. It was written
+  twice before it was written here: `network-awai/app-hyakka` had it for the
+  metered wiki walk and `net-kotobase` was about to need the same thing for
+  its paid graph reads, and a second copy of a covering decision is exactly
+  what `kotoba-lang/authority` exists to prevent.
+
+  `:verified?` is REQUIRED and is not defaulted. `biscuit.wire/token->model`
+  hands back a model whether or not a signature was checked, and its own
+  docstring says a caller that converts without verifying has decoded an
+  attacker's facts. Refusing here rather than trusting every caller to
+  remember means a deployment with no root key configured answers
+  `:pass/unverified` — a value that is neither a grant nor an ordinary
+  denial, so `could not check` and `checked and denied` cannot print the
+  same (superproject ADR-2608136000).
+
+  The holder is deliberately NOT passed to `authority.chain`. Nothing in a
+  bearer presentation proves the presenter is the principal a `holder` fact
+  names, and a holder check against an unauthenticated presenter would
+  report `:wrong-holder` for a mismatch while reporting `:granted` for a
+  stolen token — an assertion that discriminates in one direction only. The
+  binding a holder actually has is attenuation."
+  [{:keys [token-model kinds verified? requested now]}]
+  (if-not (true? verified?)
+    {:pass/allowed? false :pass/reason :pass/unverified :pass/grants []}
+    (let [delegated (->delegated token-model kinds)]
+      (cond
+        (:grant/refused delegated)
+        {:pass/allowed? false
+         :pass/reason (:grant/refused delegated)
+         :pass/grants []
+         :pass/rejected (:grant/rejected delegated)}
+
+        (missing-grant? delegated)
+        {:pass/allowed? false
+         :pass/reason :pass/no-grant
+         :pass/grants []
+         :pass/rejected (:grant/rejected delegated)}
+
+        :else
+        (let [expires (:grant/expires (first (:grants delegated)))
+              decision (chain/authorize {:chain (->chain token-model kinds expires)
+                                         :requested requested
+                                         :now now})]
+          {:pass/allowed? (:authority/allowed? decision)
+           :pass/reason (if (:authority/allowed? decision)
+                          :pass/granted
+                          (:authority/reason decision))
+           :pass/grants (:grants delegated)
+           :pass/rejected (:grant/rejected delegated)
+           :pass/holder (:grant/holder delegated)
+           :pass/expires (:grant/expires (:authority/effective decision))
+           :pass/depth (:authority/depth decision)})))))
+
+(defn retry-with-payment?
+  "Is this refusal one a fresh grant would fix?
+
+  Expired or out-of-scope means the presenter holds a real token that does
+  not reach this question, and the useful answer is how to get one that
+  does. Malformed, unrooted or grant-less is NOT — telling someone to obtain
+  a new token when what they sent was never yours takes their effort for a
+  problem it does not solve. On a paid surface the difference is a 402
+  against a 403."
+  [reason]
+  (contains? #{:expired-or-no-trusted-time :out-of-scope :empty-chain} reason))

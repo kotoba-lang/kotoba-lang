@@ -1,0 +1,301 @@
+(ns kototama.evm-tender
+  "An EVM tender: the tender role, discharged over EVM bytecode.
+
+  `kototama.tender`'s own docstring says the role is not the engine -- that
+  namespace is *one* implementation, JVM/Chicory over Wasm. This is a second
+  one, over `kotoba.vm.evm`. The spec has said so since it was written:
+  `:evm/v1` sits beside `:core/v1` in `spec/kototama-vm-v1.edn`, and
+  `:core-is-not-automatically-evm-compatible true` means the profile has to be
+  discharged by something, not inherited.
+
+  ## Three things this plane gets for free that the Wasm plane works for
+
+  **1. No ambient authority, by construction.** EVM bytecode has no import
+  section. There is no `actor:host` field for it to name, so there is nothing
+  to deny -- a contract cannot reach a clock, a socket or a key because the
+  instruction set has no opcode that does. `kototama.contract` is still the
+  authority vocabulary here (reused verbatim, never forked), but for a pure
+  EVM execution the granted set is empty and that is the *default*, not a
+  configuration. Host reach, when it is eventually wanted, must arrive as an
+  explicitly granted capability rather than be subtracted from an ambient one.
+
+  **2. Resource exhaustion is already a value.** The spec says
+  `:resource-exhaustion {:outcome :value :must-not :uncatchable-host-trap}`.
+  `kototama.tender` satisfies this only at the `run-report` boundary -- its
+  fuel listener throws from inside execution and the outer catch converts it.
+  The EVM machine returns `{:status :invalid :invalid-reason \"out of gas\"}`
+  as an ordinary value; there is no throw to convert.
+
+  **3. It is portable.** This namespace is `.cljc` with no host imports, so
+  the plane runs wherever `kotoba.vm.evm` runs -- JVM and nbb both.
+  `kototama.tender` is `.clj`, pinned to Chicory and therefore to the JVM.
+
+  ## What this deliberately does NOT claim
+
+  `:floating-evm-claim-forbidden true`. This namespace discharges the
+  *tender role* over EVM bytecode; it does not by itself earn any `:evm/v1`
+  level. Levels are earned by the suites the spec names
+  (`:ethereum-general-state-tests`, `:differential-execution`), and the
+  standing declaration in `qualification/` is what states the current status.
+  See `qualification/implementation-declaration-kototama-evm-tender.edn`."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            [kototama.contract :as contract]
+            [kototama.denial :as denial]
+            [kotoba.vm.evm.core :as evm]
+            [kotoba.vm.fvm.mapping :as fvm]
+            [multiformats.core :as mf]))
+
+;; ---------------------------------------------------------------------------
+;; Budget
+
+(def gas-mapping
+  "How this tender relates the spec's `budget` to the EVM's `gas`.
+
+  `:fevm/v1` requires `{:gas {:meter :filecoin :ethereum-gas-equality false
+  :mapping-version-required true}}` -- a mapping must be *named and
+  versioned*, not implied. The same discipline is applied at `:evm/v1`,
+  because the confusion it guards against is present here too:
+  `kototama.tender`'s `:fuel` counts Wasm *instructions* and the EVM's gas is
+  a priced schedule. They are different quantities that both answer to the
+  word budget, and silently treating one as the other is how a budget stops
+  meaning anything.
+
+  This mapping is deliberately the identity: a caller's budget IS EVM gas,
+  charged on the Paris schedule. That is a claim, so it is versioned and can
+  be superseded rather than drifted."
+  {:mapping/id :kototama.evm/gas-is-budget-v1
+   :mapping/version 1
+   :mapping/meter :ethereum-paris
+   :mapping/relation :identity
+   :mapping/ethereum-gas-equality false
+   :mapping/note (str "Budget units are EVM gas on the Paris schedule. This is "
+                      "NOT equal to Ethereum mainnet gas accounting: "
+                      "kotoba.vm.evm charges EXP's dynamic per-byte cost flat, "
+                      "and implements neither EIP-2929 access costs nor the "
+                      "63/64 call rule.")})
+
+(def default-gas
+  "Budget for a run whose caller named none.
+
+  Not borrowed from `kototama.tender/default-fuel-limit` (5000000): that
+  number is a Wasm instruction count and this one is priced gas. Sharing the
+  constant would be the exact conflation `gas-mapping` exists to prevent."
+  30000000)
+
+;; ---------------------------------------------------------------------------
+;; Identity
+
+(defn- utf8-bytes [^String s]
+  )
+
+(defn- cid-of
+  "CIDv1-raw over a canonical string, the same construction
+  `kototama.execution/execution-cid` uses."
+  [^String s]
+  (str (mf/cidv1-raw (utf8-bytes s))))
+
+(defn- byte-hex
+  "Two lowercase hex digits for one program byte, on either host.
+
+  This was `(format \"%02x\" (int b))`, and `clojure.core/format` does not exist
+  on ClojureScript -- so `kototama.evm-tender` could not LOAD there at all
+  (`Unable to resolve symbol: format`, measured 2026-09-08 by requiring the
+  namespace under nbb). An EVM program's identity was therefore not computable
+  on the runtime this workspace is migrating to.
+
+  It refuses out of range rather than formatting anything. `%02x` of a NEGATIVE
+  int on the JVM produces EIGHT hex digits, not two, so a `code` carrying a
+  signed byte silently produced a different -- and much longer -- program
+  identity instead of an error. Nothing in this repository constructs `code`
+  that way (every caller builds a vector of 0-255 ints, and `evm-tender` has no
+  callers outside its own tests), so the refusal costs no existing program and
+  closes a shape that would otherwise be a silent identity change."
+  [b]
+  (let [n ]
+    (when-not (and (integer? n) (<= 0 n) (<= n 255))
+      (throw (ex-info "evm-tender: program byte outside 0-255"
+                      {:kotoba.evm/byte b})))
+    (let [h ]
+      (if (= 1 (count h)) (str "0" h) h))))
+
+(defn program-cid
+  "Identity of the deployed bytecode."
+  [code]
+  (cid-of (str/join "," (map byte-hex code))))
+
+(defn message-cid
+  "Identity of the invocation: calldata, value, caller, budget.
+
+  Two invocations that differ in any of these are different messages, and a
+  receipt that cited only the program could not tell them apart."
+  [{:keys [calldata caller callvalue gas]}]
+  (cid-of (pr-str {:calldata (vec calldata) :caller caller
+                   :callvalue callvalue :gas gas})))
+
+(defn state-cid
+  "Identity of a storage overlay.
+
+  `kotoba.vm.evm.storage` keeps the store sparse and keyed by canonical
+  64-digit hex, so sorting the pairs gives one string per logical state.
+  This is NOT an Ethereum trie root and must not be reported as one --
+  `:state [:canonical-ethereum-receipt :trie-root]` stays unclaimed."
+  [storage]
+  (cid-of (pr-str (sort (map (fn [[k v]] [(str k) (str v)]) (or storage {}))))))
+
+;; ---------------------------------------------------------------------------
+;; Session
+
+(defn open-session
+  "Validate authority and budget before any bytecode runs.
+
+  Mirrors `kototama.tender/open-session`'s ordering deliberately: the
+  contract check happens first and fails closed, so an ungranted request
+  never reaches the machine. `tender_test.clj`'s
+  `ungranted-import-is-rejected-pre-flight-before-any-wasm-runs` is the
+  behaviour being matched."
+  ([code] (open-session code {}))
+  ([code {:keys [grants limits gas calldata caller callvalue storage env
+                 profile policy-id world epoch manifest-cid]
+          :or {gas default-gas calldata [] caller "0x0" callvalue 0
+               profile :development}}]
+   (let [requested-grants (set (or grants #{}))
+         ;; `contract/host-caps` maps each grant through `import-id`, which
+         ;; answers nil for a name that is not in the actor:host surface, and
+         ;; the nil is then dropped from the set. In the Wasm plane a typo is
+         ;; caught downstream, because the import it was meant to authorise is
+         ;; still requested and now ungranted. Here the requested surface is
+         ;; empty, so nothing downstream would notice and a misspelled grant
+         ;; would be silently indistinguishable from granting nothing.
+         ;; Measured 2026-09-06: #{:no-such-capability} normalises to #{} and
+         ;; validate-import-surface returns {:ok? true :errors []}.
+         unknown-grants (into #{} (remove contract/import-id) requested-grants)
+         ;; One denial shape across hosts (kototama.denial, koto-h6); the
+         ;; `:kototama.evm-tender/*` keys stay beside it for their readers.
+         _ (when (seq unknown-grants)
+             (denial/deny! :evm :grants/unknown (vec (sort (map str unknown-grants)))
+                           {:kototama.evm-tender/errors
+                            [{:error :grants/unknown
+                              :grants (vec (sort (map str unknown-grants)))}]}))
+         caps (contract/host-caps {:grants requested-grants
+                                   :limits (contract/runtime-limits (or limits {}))})
+         ;; EVM bytecode names no imports, so the requested surface is empty.
+         ;; Running the real validator over it anyway is the point: the
+         ;; authority vocabulary is shared with the Wasm plane rather than
+         ;; re-invented, and a caller who DOES pass grants gets them checked
+         ;; by the same code that checks them there.
+         validation (contract/validate-import-surface
+                     {:abi/namespace contract/actor-host-namespace
+                      :abi/version contract/actor-host-version
+                      :abi/imports []}
+                     caps)]
+     (when-not (:ok? validation)
+       (denial/deny! :evm :import-surface-rejected requested-grants
+                     {:kototama.evm-tender/errors (:errors validation)}))
+     (when-not (and (integer? gas) (pos? gas))
+       (denial/deny! :evm :invalid-budget gas
+                     {:kototama.evm-tender/problem :invalid-budget
+                      :kototama.evm-tender/gas gas}))
+     {:code (vec code)
+      :gas gas
+      :calldata (vec calldata)
+      :caller caller
+      :callvalue callvalue
+      :storage (or storage {})
+      :env env
+      :caps caps
+      :validation validation
+      :profile profile
+      :authority {:manifest-cid manifest-cid
+                  :grant-ids (vec (sort (map name (:granted validation))))
+                  :policy-id policy-id
+                  :world world
+                  :epoch epoch}})))
+
+;; ---------------------------------------------------------------------------
+;; Outcome and receipt
+
+(def ^:private terminal->outcome
+  {:stopped :ok :halted :ok :reverted :revert :invalid :invalid})
+
+(defn- commits?
+  "Only a normally-terminating run publishes its overlay.
+
+  `:success {:state :commit-overlay}`, `:revert {:state :discard-overlay}`,
+  `:resource-exhaustion {:state :discard-overlay}`. Out-of-gas surfaces as
+  `:invalid`, which lands in the discard branch with revert -- that is the
+  spec's grouping, not an approximation of it."
+  [status]
+  (contains? #{:stopped :halted} status))
+
+(defn receipt
+  "A `:kototama.vm/receipt-v1`.
+
+  Every one of the eleven `:required` keys is present, `:authority-decision`
+  carries its five, and none of `:forbidden` is emitted -- asserted by
+  `receipt-omits-forbidden-keys` rather than left to review.
+
+  `:attempt-always-receipted true`: this is produced for reverted and invalid
+  runs too, which is why `:outcome` is a value and not an exception."
+  [session machine]
+  (let [status (:status machine)
+        committed? (commits? status)
+        before (state-cid (:storage session))
+        after (if committed? (state-cid (:storage machine)) before)]
+    (cond->
+     {:schema :kototama.vm/receipt-v1
+      :machine-spec {:spec :kototama.vm/spec-v1 :version 1}
+      :implementation {:name :kototama.evm-tender
+                       :engine :kotoba.vm.evm
+                       :gas-mapping (:mapping/id gas-mapping)
+                       :gas-mapping-version (:mapping/version gas-mapping)}
+      :profile :evm/v1
+      :message-cid (message-cid {:calldata (:calldata session)
+                                 :caller (:caller session)
+                                 :callvalue (:callvalue session)
+                                 :gas (:gas session)})
+      :program-cid (program-cid (:code session))
+      :state-before before
+      :state-after after
+      :outcome {:status (get terminal->outcome status :invalid)
+                :evm-status status
+                :exit-code (fvm/status->exit-code machine)
+                :overlay (if committed? :committed :discarded)}
+      ;; Gas CONSUMED, not gas remaining: `:fuel-used` is a spend.
+      :fuel-used (- (:gas session) (or (:gas machine) 0))
+      :events (vec (:logs machine))
+      :authority-decision (:authority session)}
+      (seq (:output machine))
+      (assoc (if (= :reverted status) :revert-data :return) (vec (:output machine)))
+      (:invalid-reason machine)
+      (assoc-in [:outcome :reason] (:invalid-reason machine)))))
+
+(defn run-report
+  "Run EVM bytecode under a session and answer with a value.
+
+  Never throws for anything the machine can express: exhaustion, revert and
+  invalid opcodes are all outcomes. A throw from here means the tender itself
+  is broken, which is a different claim and should look different."
+  ([session] (run-report session {}))
+  ([session {:keys [step-limit]}]
+   (let [env (merge (or (:env session) {})
+                    {:caller (:caller session) :callvalue (:callvalue session)})
+         m0 (evm/make-machine (:code session) (:gas session) (:calldata session)
+                              (:storage session) env)
+         m (if step-limit (evm/run m0 step-limit) (evm/run m0))
+         committed? (commits? (:status m))]
+     {:ok? (= :ok (get terminal->outcome (:status m)))
+      :status (:status m)
+      :gas-used (- (:gas session) (or (:gas m) 0))
+      :gas-limit (:gas session)
+      :output (vec (:output m))
+      :logs (vec (:logs m))
+      ;; The overlay the caller may publish. On revert or exhaustion this is
+      ;; the state they came in with, so a caller that writes back
+      ;; unconditionally still cannot commit a discarded overlay.
+      :storage (if committed? (:storage m) (:storage session))
+      :receipt (receipt session m)})))
+
+(defn run
+  "open-session + run-report, for the common case."
+  ([code] (run code {}))
+  ([code opts] (run-report (open-session code opts) opts)))

@@ -1,0 +1,163 @@
+(ns inga-node.archive
+  "Bounded finalized-prefix bundles on the existing Kotobase /ipld plane.
+  Bytes and tip QC are durable there; a process only caches verified data.
+  A caller retains the returned immutable checkpoint CID in its graph/journal.
+  No mutable head, local-file authority, or implicit latest-checkpoint lookup.
+  This O(history) qualification path is not production-scale compaction."
+  (:require [kotoba.lang.edn :as edn]
+            [inga.prefix :as prefix]
+            [kotobase.blocks :as blocks]
+            [kotobase.cid :as cid]
+            [sha2.core :as sha2]))
+
+(def version "inga.finalized-prefix/v1")
+(def max-ipld-bytes (* 8 1024 1024))
+
+(defn- refuse! [reason]
+  (throw (ex-info "finalized-prefix refused" {:type ::refused :reason reason})))
+
+(defn refusal-reason
+  "Find the domain refusal through host/runtime exception wrappers."
+  [error]
+  (loop [e error remaining 8]
+    (let [data (ex-data e)]
+      (cond
+        (:reason data) (:reason data)
+        (and (pos? remaining) (ex-cause e)) (recur (ex-cause e) (dec remaining))
+        :else (or (:type data) :invalid-proof)))))
+
+(defn raw-cid [bytes]
+  (let [digest (sha2/sha256 (vec (js/Array.from bytes)))
+        encoded (js/Uint8Array.from (clj->js (into [1 0x55 0x12 32] digest)))]
+    (str "b" (cid/base32-lower-no-pad encoded))))
+
+(defn open
+  "Build an archive using kotobase.blocks/client. Production origin is fixed
+  to https://kotobase.net/ipld/. :authorization must be a fresh-per-PUT thunk.
+  :fetch-fn is a host test/transport seam, never a fallback provider.
+  :max-bytes is mandatory, at most 8 MiB. Prefix bounds live in :context.
+  All operations return Promises and reject on errors, including absence."
+  [{:keys [context authorization fetch-fn max-bytes]}]
+  (when-not (and (prefix/context-valid? context)
+                 (pos-int? max-bytes) (<= max-bytes max-ipld-bytes)
+                 (or (nil? authorization) (fn? authorization)))
+    (refuse! :invalid-config))
+  {:context context :max-bytes max-bytes
+   :client (blocks/client {:endpoint "https://kotobase.net" :path-prefix "/ipld/"
+                           :authorization authorization :fetch-fn fetch-fn})})
+
+(defn- validate! [{:keys [context]} envelope]
+  (when-not (= version (:version envelope)) (refuse! :wrong-version))
+  (when-not (= (:chain-id context) (:chain-id envelope)) (refuse! :wrong-chain))
+  (when-not (= ((:hash-fn context) (:genesis context)) (:genesis-hash envelope))
+    (refuse! :wrong-genesis))
+  (let [verified (prefix/verify (:proof envelope) context)]
+    (when-not (= :finalized (:status verified)) (refuse! (:reason verified)))
+  envelope))
+
+(defn- check-bytes! [{:keys [max-bytes]} bytes]
+  (when (> (.-length bytes) max-bytes) (refuse! :max-bytes-exceeded))
+  bytes)
+
+(defn- descriptor [archive checkpoint envelope]
+  (let [result (prefix/verify (:proof envelope) (:context archive))]
+    {:cid checkpoint :chain-id (:chain-id envelope) :genesis-hash (:genesis-hash envelope)
+     :tip-hash (:tip-hash result) :finalized-height (:height result)
+     :block-count (count (get-in envelope [:proof :blocks]))}))
+
+(defn read!
+  "Reconstruct and verify the complete proof from an explicit immutable CID.
+  No local state survives or is needed. Wrong bytes, missing objects, bounds,
+  signatures, chain, genesis, ordering and finality all fail closed."
+  [archive checkpoint]
+  (-> (js/Promise.resolve nil)
+      (.then (fn [_] ((get-in archive [:client :get-block]) checkpoint)))
+      (.then (fn [bytes]
+               (when-not bytes (refuse! :missing-checkpoint))
+               (check-bytes! archive bytes)
+               ;; Require the canonical raw CID, not just an equal digest
+               ;; under an unexpected codec/multibase representation.
+               (when-not (= checkpoint (raw-cid bytes)) (refuse! :wrong-checkpoint))
+               (let [envelope (try (edn/read-string (.decode (js/TextDecoder. "utf-8" #js {:fatal true}) bytes))
+                                   (catch :default _ (refuse! :malformed-bundle)))]
+                 (validate! archive envelope)
+                 {:checkpoint (descriptor archive checkpoint envelope) :proof (:proof envelope)})))))
+
+(defn publish!
+  "Persist a complete validated prefix and read it back before returning its
+  immutable checkpoint descriptor. Unknown PUT/readback outcomes reject;
+  retries address the same bytes and never announce a new mutable head."
+  [archive proof]
+  (-> (js/Promise.resolve nil)
+      (.then (fn [_]
+               (let [context (:context archive)
+                     envelope {:version version :chain-id (:chain-id context)
+                               :genesis-hash ((:hash-fn context) (:genesis context)) :proof proof}
+                     _ (validate! archive envelope)
+                     bytes (check-bytes! archive (cid/text->bytes (pr-str envelope)))
+                     checkpoint (raw-cid bytes)]
+                 (-> ((get-in archive [:client :put-block!]) checkpoint bytes)
+                     (.then (fn [written]
+                              (when-not (= checkpoint written) (refuse! :wrong-checkpoint))
+                              (read! archive checkpoint)))
+                     (.then (fn [result] (:checkpoint result)))))))))
+
+(defn extend!
+  "Append/replace the uncertified tail using a new replica segment, after
+  restoring the previous immutable checkpoint. No finalized block may change
+  or disappear. A bounded replica snapshot alone is never called a prefix.
+  Returns a new descriptor; it does not change which checkpoint a caller uses."
+  [archive checkpoint {:keys [blocks tip-qc]}]
+  (-> (read! archive checkpoint)
+      (.then (fn [{old-proof :proof old-checkpoint :checkpoint}]
+               (let [old (:blocks old-proof) start (:inga.block/height (first blocks))
+                     max-blocks (get-in archive [:context :max-blocks])]
+                 (when-not (and (vector? blocks) (seq blocks) (nat-int? start)
+                                (<= start (count old))) (refuse! :missing-segment))
+                 (when (> (+ start (count blocks)) max-blocks) (refuse! :max-blocks-exceeded))
+                 (let [combined (into (subvec old 0 start) blocks)
+                       final-count (inc (:finalized-height old-checkpoint))]
+                   (when (or (< (count combined) (+ final-count 2))
+                             (not= (subvec old 0 final-count) (subvec combined 0 final-count)))
+                     (refuse! :finalized-prefix-conflict))
+                   (publish! archive {:blocks combined :tip-qc tip-qc})))))))
+
+(defn response!
+  "HTTP-independent GET response for /finalized-prefix?checkpoint=<CID>.
+  The host fixes the chain/context. Every 200 contains the requested CID,
+  complete proof and derived finality metadata, encoded as EDN (sets and
+  qualified keywords preserved). No 200 on missing/invalid/oversized data."
+  [archive {:keys [method checkpoint]}]
+  (if (not= method "GET")
+    (js/Promise.resolve {:status 405 :body "method not allowed"})
+    (-> (read! archive checkpoint)
+        (.then (fn [result]
+                 {:status 200
+                  :headers {"content-type" "application/edn; charset=utf-8"
+                            "cache-control" "public, max-age=31536000, immutable"}
+                  :body (pr-str result)}))
+        (.catch (fn [e]
+                  {:status 422 :headers {"content-type" "application/edn; charset=utf-8"}
+                   :body (pr-str {:status :rejected
+                                  :reason (refusal-reason e)})})))))
+
+(defn capture!
+  "Archive a real replica's highest certified prefix. Pass the last returned
+  checkpoint CID after restart: the replica's bounded chain is then joined
+  to the restored archive. No certificate/progress means explicit refusal.
+  The host must await this operation before announcing archive durability;
+  this is separate from witness vote-snapshot durability and sends no votes."
+  [archive checkpoint state]
+  (-> (js/Promise.resolve nil)
+      (.then (fn [_]
+               (when-not (= (get-in archive [:context :chain-id]) (:chain-id state))
+                 (refuse! :wrong-chain))
+               (let [chain (vec (:chain state)) hf (get-in archive [:context :hash-fn])
+                     certified-index (last (keep-indexed
+                                            (fn [i b] (when (get (:qcs state) (hf b)) i)) chain))]
+                 (when-not certified-index (refuse! :unfinalized))
+                 (let [bs (subvec chain 0 (inc certified-index))
+                       proof {:blocks bs :tip-qc (get (:qcs state) (hf (peek bs)))}]
+                   (if checkpoint
+                     (extend! archive checkpoint proof)
+                     (publish! archive proof))))))))

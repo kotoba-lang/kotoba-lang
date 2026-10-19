@@ -1,0 +1,249 @@
+(ns dango.chain
+  "Minting, attenuating and deciding a dango token.
+
+  A TOKEN — what a holder keeps — is
+  `{:blocks [{:bytes <block> :sig <64 bytes>} …] :proof <32 bytes>}`. Each
+  block's bytes are one canonical `kotoba.value.v1` value
+  (`{:prev :grant :caveats :next-key}`), its CID is the CIDv1 dag-cbor of
+  those bytes, and its signature is by the PARENT block's `:next-key` — the
+  root's by an issuer key the verifier trusts. `:proof` is the seed of the
+  last block's `:next-key`: holding it is what lets the holder append a block.
+
+  A PRESENTATION — what a verifier sees — is `{:blocks … :seal <64 bytes>}`
+  (`present`): the proof never leaves the holder. The seal is the last
+  `:next-key`'s signature over the last block's bytes, and checking it is what
+  stops a presenter from dropping the blocks that narrowed their authority:
+  a truncated chain ends in a block whose `:next-key` the presenter cannot
+  sign for. (Biscuit's sealed token. Checking a seed instead would need the
+  verifier to derive a public key from it, which a verifier that only
+  VERIFIES — the native guest, whose one crypto capability is
+  `identity/verify` — cannot do.)
+
+  ## Deciding (adr-2609242100-capability-chain-is-ipld-sexpr-biscuit-is-an-adapter §3), in this order
+
+  1. every block decodes canonically and is well-formed; its CID is taken
+     from the bytes received, never from a re-encoding;
+  2. every `:prev` links the previous CID, every signature verifies under
+     the parent's `:next-key` (the root under a trusted root key), and the
+     seal verifies under the last `:next-key`;
+  3. no block CID is revoked;
+  4. effective authority = `authority.chain/fold` — the meet over blocks;
+  5. the request is covered, live and in the right hands;
+  6. every caveat of every block holds.
+
+  The first failure is the answer, with its reason. There is no Datalog.
+
+  ## How a capability becomes an authority scope
+
+  `[:data/read \"kotoba://storage/<did>/ds\"]` → `[\"data\" \"read\" \"kotoba\"
+  \"storage\" \"<did>\" \"ds\"]`: the kind is the first TWO segments
+  (namespace, name), so two kinds never cover each other and
+  `authority.scope` needs no second lattice. Two segments, not one joined
+  `ns.name`: a keyword's namespace and name cannot contain `/`, but they can
+  contain `.`, and `:a.b/c` and `:a/b.c` must not be one kind. A kind or
+  resource that does not make a valid scope (a `*` segment, an empty one) is
+  refused as malformed, never silently dropped.
+
+  ## Time
+
+  `authority.grant` compares instants as strings. dango's `:before` and
+  `:req/now` are epoch seconds, rendered as 12-digit zero-padded decimals, for
+  which string order IS numeric order. A value that does not fit — negative,
+  or 10^12 and above — is refused: `:before` as a malformed block (it used to
+  fall through to \"no expiry\"), `:req/now` as a malformed request."
+  (:require [authority.chain :as achain]
+            [authority.grant :as grant]
+            [authority.scope :as scope]
+            [dango.bytes :as b]
+            [dango.caveat :as caveat]
+            [dango.shape :as shape]
+            [ed25519.sign :as ed]
+            [ipld.link :as link]
+            [kotoba.value.codec :as codec]
+            [multiformats.core :as mf]))
+
+(def max-blocks 16)
+
+;; ── conversions ──────────────────────────────────────────────────────────────
+
+(defn- instant [n]
+  (when (and (integer? n) (not (neg? n)))
+    (let [s (str n)]
+      (when (<= (count s) 12)
+        (str (apply str (repeat (- 12 (count s)) "0")) s)))))
+
+(defn cap->scope
+  "`[kind resource]` → an authority scope, or nil when it would not be a
+  valid one (unqualified kind, unparseable resource, a `*` or empty segment)."
+  [[kind resource]]
+  (when (qualified-keyword? kind)
+    (when-let [s (scope/parse resource)]
+      (let [sc (into [(namespace kind) (name kind)] s)]
+        (when (scope/valid? sc) sc)))))
+
+;; ── minting ──────────────────────────────────────────────────────────────────
+
+(defn- refuse! [reason detail]
+  (throw (ex-info (str "dango: " (name reason)) {:dango/reason reason :dango/detail detail})))
+
+(defn- block-value [prev-cid {:keys [caps holder before]} caveats next-key]
+  (let [blk {:prev (when prev-cid (link/link prev-cid))
+             :grant (cond-> {:caps (set caps)}
+                      holder (assoc :holder holder)
+                      before (assoc :before before))
+             :caveats (vec caveats)
+             :next-key (b/->bytes next-key)}
+        problems (concat (shape/findings blk)
+                         (mapcat caveat/problems (:caveats blk))
+                         (keep #(when-not (cap->scope %) [:dango/malformed-block [:resource-not-a-scope (second %)]])
+                               (:caps (:grant blk))))]
+    (when (seq problems) (refuse! :dango/malformed-block (vec problems)))
+    blk))
+
+(defn- signed [sk blk]
+  (let [bs (codec/encode-value blk)]
+    {:bytes bs :sig (b/->bytes (ed/sign sk bs))}))
+
+(defn root
+  "Mint a one-block token. ISSUER-SEED is the 32-byte seed of a key the
+  verifier lists in `:roots`; NEXT-SEED becomes the bearer's proof."
+  [{:keys [issuer-seed grant caveats next-seed]}]
+  (let [next-pub (ed/public-key next-seed)]
+    {:blocks [(signed (ed/secret-key! issuer-seed)
+                      (block-value nil grant caveats next-pub))]
+     :proof (b/->bytes next-seed)}))
+
+(defn attenuate
+  "Append one block, signed with the token's proof, and hand the new proof
+  to whoever receives the result. The grant may only narrow — a wider one is
+  not refused here, it simply contributes nothing at verification."
+  [{:keys [blocks proof]} {:keys [grant caveats next-seed]}]
+  (let [prev-cid (mf/cidv1-dag-cbor (:bytes (peek blocks)))]
+    {:blocks (conj blocks (signed (ed/secret-key! (b/->vec proof))
+                                  (block-value prev-cid grant caveats
+                                               (ed/public-key next-seed))))
+     :proof (b/->bytes next-seed)}))
+
+(defn present
+  "The presentation of TOKEN: its blocks and a seal — the proof key's
+  signature over the last block's bytes — instead of the proof itself."
+  [{:keys [blocks proof]}]
+  {:blocks blocks
+   :seal (b/->bytes (ed/sign (ed/secret-key! (b/->vec proof)) (:bytes (peek blocks))))})
+
+(defn encode-token [token] (codec/encode-value token))
+(defn decode-token [bs] (codec/decode-value bs))
+
+;; ── deciding ─────────────────────────────────────────────────────────────────
+
+(defn- refusal [reason index detail]
+  (cond-> {:dango/allowed? false :dango/reason reason}
+    (some? index) (assoc :dango/index index)
+    (some? detail) (assoc :dango/detail detail)))
+
+(defn- decode-block [{:keys [bytes]}]
+  (try
+    (if (b/bytes? bytes)
+      {:value (codec/decode-value bytes) :cid (mf/cidv1-dag-cbor bytes)}
+      {:problem [:dango/malformed-block :block-bytes-not-bytes]})
+    (catch  e
+      {:problem [:dango/malformed-block [:not-canonical (ex-message e)]]})))
+
+(defn- check-blocks
+  "Stages 1–3. Returns {:blocks [...] :cids [...]} or a refusal."
+  [{:keys [blocks seal]} {:keys [roots revoked root-verifier]}]
+  (cond
+    (not (and (vector? blocks) (seq blocks))) (refusal :dango/empty-chain nil nil)
+    (> (count blocks) max-blocks) (refusal :dango/chain-too-long nil (count blocks))
+    :else
+    (loop [i 0 out [] cids [] holder nil]
+      (if (= i (count blocks))
+        (if (and (b/bytes? seal) (= 64 (b/size seal))
+                 (ed/verify (b/->vec (:next-key (peek out))) (:bytes (peek blocks)) seal))
+          {:blocks out :cids cids}
+          (refusal :dango/bad-seal (dec i) nil))
+        (let [env (nth blocks i)
+              {:keys [value cid problem]} (decode-block env)
+              found (when-not problem
+                      (seq (concat (shape/findings value)
+                                   (mapcat caveat/problems
+                                           (when (vector? (:caveats value)) (:caveats value)))
+                                   (keep #(when-not (cap->scope %)
+                                            [:dango/malformed-block [:resource-not-a-scope (second %)]])
+                                         (get-in value [:grant :caps])))))
+              h (get-in value [:grant :holder])
+              signer (if (zero? i) nil (b/->vec (:next-key (peek out))))]
+          (cond
+            problem (refusal (first problem) i (second problem))
+            found (refusal (first (first found)) i (second (first found)))
+            (not= (:prev value) (when (pos? i) (link/link (peek cids))))
+            (refusal :dango/broken-link i nil)
+            (not (and (b/bytes? (:sig env))
+                      (if (zero? i)
+                        (if root-verifier
+                          ;; Trusted host adapter, never a field in the presentation.
+                          ;; Only literal true qualifies: an unresolved Promise cannot
+                          ;; become authority. The adapter binds the exact CID/bytes to
+                          ;; a user-root signature already checked against current chain
+                          ;; state. All later links, attenuation and seals remain local.
+                          (try (true? (root-verifier {:bytes (:bytes env) :cid cid :signature (:sig env)}))
+                               (catch  _ false))
+                          (boolean (some #(ed/verify % (:bytes env) (:sig env)) roots)))
+                        (ed/verify signer (:bytes env) (:sig env)))))
+            (refusal :dango/bad-signature i nil)
+            (and holder h (not= holder h)) (refusal :dango/holder-readdressed i h)
+            (contains? (set revoked) cid) (refusal :dango/revoked i cid)
+            :else (recur (inc i) (conj out value) (conj cids cid) (or holder h))))))))
+
+(defn- as-grant [blk holder]
+  (let [before (get-in blk [:grant :before])]
+    {:grant/scopes (scope/normalize (keep cap->scope (get-in blk [:grant :caps])))
+     :grant/holder holder
+     :grant/expires (when before (instant before))
+     :grant/rejected []}))
+
+(defn verify
+  "Decide REQUEST against a PRESENTATION (`present`).
+
+  OPTS: `:roots` — the trusted root public keys (32-int vectors);
+  alternatively `:root-verifier` — a trusted host function of exact root bytes,
+  CID and signature returning literal true only after user-root verification.
+  Never resolve this adapter from client input; asynchronous verification must
+  finish before calling verify. With an adapter present, legacy roots are ignored.
+  `:revoked` — revoked block CIDs; `:request` — a map of `dango.caveat/facts`
+  keys, of which `:req/kind`, `:req/resource` and `:req/now` are required.
+
+  Returns `{:dango/allowed? bool :dango/reason kw …}`; on success also the
+  block CIDs and the effective grant, so the decision can be audited."
+  [token {:keys [request] :as opts}]
+  (let [{:req/keys [kind resource now holder]} request
+        requested (when (and (qualified-keyword? kind) (string? resource))
+                    (cap->scope [kind resource]))
+        now* (instant now)
+        checked (check-blocks token opts)]
+    (cond
+      (false? (:dango/allowed? checked)) checked
+      (nil? requested) (refusal :dango/malformed-request nil [:kind-resource kind resource])
+      (nil? now*) (refusal :dango/malformed-request nil [:now now])
+      :else
+      (let [{:keys [blocks cids]} checked
+            holders (reductions (fn [h blk] (or h (get-in blk [:grant :holder]))) nil blocks)
+            grants (map as-grant blocks (rest holders))
+            decision (achain/authorize {:chain grants :requested requested
+                                        :now now* :holder holder})
+            failed (first (keep-indexed
+                           (fn [i blk]
+                             (when-let [c (first (remove #(caveat/holds? % request) (:caveats blk)))]
+                               [i c]))
+                           blocks))]
+        (cond
+          (not (:authority/allowed? decision))
+          (refusal (case (:authority/reason decision)
+                     :expired-or-no-trusted-time :dango/expired
+                     :wrong-holder :dango/wrong-holder
+                     :dango/not-covered)
+                   nil (:authority/reason decision))
+          failed (refusal :dango/caveat-false (first failed) (second failed))
+          :else {:dango/allowed? true :dango/reason :granted
+                 :dango/cids cids
+                 :dango/effective (:authority/effective decision)})))))

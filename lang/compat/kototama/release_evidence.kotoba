@@ -1,0 +1,179 @@
+(ns kototama.release-evidence
+  "Deterministic release artifact, SBOM, provenance, signing, and verification."
+  (:require [kotoba.bytes :as kbytes] [kotoba.io :as kio] [json.data-json :as json]
+            [kotoba.lang.edn :as edn]
+            [clojure.java.io :as io]
+            [kotoba.lang.text :as str]
+            [ed25519.core :as ed])
+  (:import [java.io FileOutputStream]
+           [java.security MessageDigest]
+           [java.util.jar JarEntry JarOutputStream]))
+
+(def fixed-entry-time-ms 0)
+
+(defn hex [bytes]
+  (apply str (map #(format "%02x" (bit-and (int %) 0xff)) bytes)))
+
+(defn unhex [value]
+  (when (and (string? value) (even? (count value))
+             (re-matches #"[0-9a-fA-F]*" value))
+    (byte-array
+     (map (fn [[a b]]
+            (unchecked-byte (Integer/parseInt (str a b) 16)))
+          (partition 2 value)))))
+
+(defn sha256-bytes [bytes]
+  (hex (.digest (MessageDigest/getInstance "SHA-256") ^bytes bytes)))
+
+(defn sha256-file [file]
+  (sha256-bytes (kio/read-all-bytes (io/file file))))
+
+(defn release-files
+  "Stable release input set. Build output, VCS metadata, tests, and mutable
+   runtime state are intentionally excluded."
+  []
+  (let [roots ["src" "qualification" "docs"]
+        tree-files (for [root roots
+                         :let [f (io/file root)]
+                         :when (.exists f)
+                         child (file-seq f)
+                         :when (.isFile child)]
+                     child)
+        top (keep #(let [f (io/file %)] (when (.isFile f) f))
+                  ["deps.edn" "README.md"])]
+    (->> (concat tree-files top)
+         (map #(.getPath %))
+         distinct sort vec)))
+
+(defn source-manifest []
+  (mapv (fn [path] {:path path :sha256 (sha256-file path)})
+        (release-files)))
+
+(defn source-root-digest [manifest]
+  (sha256-bytes
+   (kbytes/utf8-bytes (pr-str (sort-by :path manifest)))))
+
+(defn write-deterministic-jar!
+  [output files]
+  (.mkdirs (.getParentFile (io/file output)))
+  (with-open [stream (JarOutputStream. (FileOutputStream. (io/file output)))]
+    (doseq [path (sort files)]
+      (let [entry (JarEntry. (str/replace path "\\" "/"))
+            bytes (kio/read-all-bytes (io/file path))]
+        (.setTime entry fixed-entry-time-ms)
+        (.putNextEntry stream entry)
+        (.write stream bytes)
+        (.closeEntry stream))))
+  output)
+
+(defn dependency-components []
+  (let [deps (:deps (edn/read-string (slurp "deps.edn")))]
+    (->> deps
+         (map (fn [[coordinate spec]]
+                (cond-> {"type" "library" "name" (str coordinate)}
+                  (:mvn/version spec)
+                  (assoc "version" (:mvn/version spec)
+                         "purl" (str "pkg:maven/" coordinate "@"
+                                     (:mvn/version spec)))
+                  (:git/sha spec)
+                  (assoc "version" (:git/sha spec)
+                         "properties"
+                         [{"name" "vcs_url" "value" (:git/url spec)}
+                          {"name" "vcs_commit" "value" (:git/sha spec)}]))))
+         (sort-by #(get % "name"))
+         vec)))
+
+(defn git-value [& args]
+  (let [process (-> (ProcessBuilder. (into-array String (cons "git" args)))
+                    (.redirectErrorStream true)
+                    .start)
+        output (slurp (.getInputStream process))
+        exit (.waitFor process)]
+    (when (zero? exit) (str/trim output))))
+
+(defn build-evidence!
+  "Build deterministic JAR, CycloneDX SBOM, SLSA-shaped provenance, and an
+   Ed25519 signature envelope under OUTPUT-DIR. SEED is a 32-byte release key."
+  [output-dir seed]
+  (when-not (= 32 (count seed))
+    (throw (ex-info "release signing seed must be 32 bytes"
+                    {:kototama.release/code :invalid-signing-key})))
+  (let [files (release-files)
+        manifest (source-manifest)
+        root-digest (source-root-digest manifest)
+        jar (str output-dir "/kototama.jar")
+        _ (write-deterministic-jar! jar files)
+        artifact-digest (sha256-file jar)
+        sbom {"bomFormat" "CycloneDX" "specVersion" "1.5" "version" 1
+              "metadata" {"component" {"type" "application"
+                                        "name" "kototama"
+                                        "version" artifact-digest}}
+              "components" (dependency-components)}
+        provenance {"_type" "https://in-toto.io/Statement/v1"
+                    "subject" [{"name" "kototama.jar"
+                                "digest" {"sha256" artifact-digest}}]
+                    "predicateType" "https://slsa.dev/provenance/v1"
+                    "predicate"
+                    {"buildDefinition"
+                     {"buildType" "kototama/deterministic-jar-v1"
+                      "externalParameters" {}
+                      "resolvedDependencies"
+                      [{"uri" "git+workspace"
+                        "digest" {"gitCommit" (or (git-value "rev-parse" "HEAD")
+                                                  "unknown")
+                                  "sourceRoot" root-digest}}]}
+                     "runDetails"
+                     {"builder" {"id" "kototama.release-evidence/v1"}
+                      "metadata" {"invocationId" artifact-digest}}}}
+        sbom-path (str output-dir "/kototama.cdx.json")
+        provenance-path (str output-dir "/kototama.intoto.json")
+        signature (ed/sign seed (kbytes/utf8-bytes artifact-digest))
+        envelope {:signature/version 1 :algorithm :ed25519
+                  :artifact "kototama.jar" :sha256 artifact-digest
+                  :public-key (hex (ed/pubkey-from-seed seed))
+                  :signature (hex signature)}
+        signature-path (str output-dir "/kototama.signature.edn")]
+    (spit sbom-path (json/write-str sbom :escape-slash false))
+    (spit provenance-path (json/write-str provenance :escape-slash false))
+    (spit signature-path (pr-str envelope))
+    {:artifact jar :sbom sbom-path :provenance provenance-path
+     :signature signature-path :sha256 artifact-digest
+     :source-root root-digest :files (count files)}))
+
+(defn verify-evidence
+  "Verify artifact digest, signature, SBOM identity, and provenance subject."
+  [{:keys [artifact sbom provenance signature]}]
+  (try
+    (let [envelope (edn/read-string (slurp signature))
+          digest (sha256-file artifact)
+          sbom-data (json/read-str (slurp sbom))
+          provenance-data (json/read-str (slurp provenance))
+          public-key (unhex (:public-key envelope))
+          signature-bytes (unhex (:signature envelope))
+          checks {:digest (= digest (:sha256 envelope))
+                  :signature (and public-key signature-bytes
+                                  (ed/verify public-key
+                                             (kbytes/utf8-bytes digest)
+                                             signature-bytes))
+                  :sbom (= digest
+                           (get-in sbom-data
+                                   ["metadata" "component" "version"]))
+                  :provenance (= digest
+                                 (get-in provenance-data
+                                         ["subject" 0 "digest" "sha256"]))}]
+      {:valid? (every? true? (vals checks)) :checks checks :sha256 digest})
+    (catch Exception e
+      {:valid? false :checks {:parse false} :message (.getMessage e)})))
+
+(defn -main [& [output-dir]]
+  (let [output-dir (or output-dir "dist/release-evidence")
+        seed (unhex (System/getenv "KOTOTAMA_RELEASE_SIGNING_SEED_HEX"))]
+    (when-not (= 32 (count seed))
+      (binding [*out* *err*]
+        (println "KOTOTAMA_RELEASE_SIGNING_SEED_HEX must contain 64 hex chars"))
+      (System/exit 2))
+    (let [evidence (build-evidence! output-dir seed)
+          verification (verify-evidence evidence)]
+      (prn (assoc evidence :verification verification))
+      (when-not (:valid? verification)
+        (System/exit 1)))))

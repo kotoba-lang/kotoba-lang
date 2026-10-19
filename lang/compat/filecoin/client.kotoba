@@ -1,0 +1,202 @@
+(ns filecoin.client
+  "Calls that actually reach a node, and the order they have to go in.
+
+  `filecoin.rpc` builds request bodies and `filecoin.transport` sends them.
+  What is here is the third thing — the *sequence*, which is where a client
+  goes wrong in ways no single request reveals:
+
+  - **Gas is estimated on a message that already has its nonce.** The
+    estimate depends on the serialised message, and the nonce is part of it.
+    Estimating first and filling the nonce in after gives a limit for a
+    different message.
+  - **`GasEstimateMessageGas` returns a whole message, not three numbers.**
+    Lotus fills the fields in and hands the message back; taking only
+    `GasLimit` from it and keeping your own fee cap is how a message ends up
+    priced below the base fee and sits in the pool.
+  - **The signature is taken over the message *after* gas.** Sign first and
+    the CID changes underneath you.
+
+  So `prepare` exists as one function rather than three, and `send-message`
+  is prepare-then-sign-then-push in that order.
+
+  ## Two runtimes, one sequence
+
+  `IHttp` returns a map on `:clj` and a Promise on `:cljs`. `then` and `all`
+  hide that so a sequence is written once; on the JVM they are function
+  application, and nothing here blocks a thread that a synchronous call was
+  not already blocking.
+
+  ## What is read-only
+
+  Everything except `push` and `send-message`. A node needs no authorisation
+  to be asked a question, so all of the reads below work against a public
+  endpoint with no key and no funds — which is what the live suite uses."
+  (:require [kotoba.lang.text :as str]
+            [ethereum.abi :as abi]
+            [filecoin.message :as msg]
+            [filecoin.protocols :as p]
+            [filecoin.rpc :as rpc]
+            [filecoin.signature :as sig]
+            [filecoin.signer :as signer]))
+
+;; ── the two shapes ───────────────────────────────────────────────────────────
+
+(defn then
+  "Apply `f` to a value or to a Promise of one."
+  [x f]
+  )
+
+(defn all
+  "Collect values or Promises of them."
+  [xs]
+  )
+
+(defn resolved [x]
+  )
+
+;; ── one call ─────────────────────────────────────────────────────────────────
+
+(defn- first-document
+  "Glif's public endpoint answers with the response repeated, newline
+  separated — two identical JSON documents in one body, which every JSON
+  parser rejects. Take the first line.
+
+  Here rather than in `filecoin.transport` because a transport's job is to
+  return the body it was given; this is a property of one proxy, not of
+  HTTP."
+  [body]
+  (or (first (remove str/blank? (str/split-lines (str body)))) ""))
+
+(defn call
+  "One JSON-RPC call. `endpoint` is a URL; `body` is what `filecoin.rpc`
+  builds. Throws on a JSON-RPC error, which arrives with HTTP 200 — a caller
+  that only checks the status reads `nil` as an answer."
+  ([http endpoint body] (call http endpoint body nil))
+  ([http endpoint body auth-token]
+   (then (p/request http (rpc/http-request endpoint body auth-token))
+         (fn [{:keys [status body]}]
+           (when-not (<= 200 status 299)
+             (throw (ex-info "filecoin: node returned an error status"
+                             {:status status :body (str body)})))
+           (rpc/parse-response (first-document body))))))
+
+;; ── reads ────────────────────────────────────────────────────────────────────
+
+(defn chain-head [http endpoint]
+  (call http endpoint (rpc/chain-head)))
+
+(defn height [http endpoint]
+  (then (chain-head http endpoint) #(get % "Height")))
+
+(defn network-name [http endpoint]
+  (call http endpoint (rpc/state-network-name)))
+
+(defn nonce
+  "The next nonce for an address. `MpoolGetNonce` counts pending messages as
+  well as landed ones, which is what makes it the right question rather than
+  reading the actor's nonce from state."
+  [http endpoint address]
+  (call http endpoint (rpc/mpool-get-nonce address)))
+
+(defn balance [http endpoint address]
+  (call http endpoint (rpc/wallet-balance address)))
+
+(defn estimate-gas
+  "`GasEstimateMessageGas` — returns the **whole message** with its three gas
+  fields filled in, not three numbers. Keep the message it gives back."
+  [http endpoint message]
+  (then (call http endpoint (rpc/gas-estimate-message-gas message))
+        rpc/json->message))
+
+(defn prepare
+  "A message with its nonce and gas filled in, in that order.
+
+  Two calls, and they are not commutable: gas is estimated from the
+  serialised message and the nonce is part of it."
+  [http endpoint message]
+  (then (nonce http endpoint (:from message))
+        (fn [n] (estimate-gas http endpoint (assoc message :nonce n)))))
+
+;; ── contract reads ───────────────────────────────────────────────────────────
+
+(defn state-call
+  "`StateCall` executes a message against the current state and returns its
+  receipt **without** putting anything on chain. No signature, no gas, no
+  funds — the message is never sent, only run.
+
+  This is how an FEVM contract is read from the Filecoin side: build the
+  `InvokeContract` message, run it here, and decode `Return`."
+  [http endpoint message]
+  (call http endpoint (rpc/request "Filecoin.StateCall" [(rpc/message->json message) nil])))
+
+(defn- return-bytes
+  "The `Return` of a receipt: base64 of the **CBOR byte string** an FEVM
+  actor returns, so it is unwrapped twice. Returning the CBOR as if it were
+  the ABI data leaves two bytes of header on the front and shifts every
+  word."
+  [receipt]
+  (let [b64 (get-in receipt ["MsgRct" "Return"])]
+    (when (seq b64)
+      (let [cbor (rpc/base64-decode b64)
+            n (bit-and (int (first cbor)) 0xff)]
+        ;; major type 2; 0x40-0x57 inline length, 0x58 one byte, 0x59 two
+        (cond
+          (<= 0x40 n 0x57) (vec (drop 1 cbor))
+          (= 0x58 n) (vec (drop 2 cbor))
+          (= 0x59 n) (vec (drop 3 cbor))
+          :else (throw (ex-info "client: Return is not a CBOR byte string"
+                                {:first-byte n})))))))
+
+(defn read-contract
+  "Call an FEVM contract read-only and decode its result.
+
+  `message` is what `filecoin.cloud.evm/invoke` builds; `return-types` are
+  the ABI types of what the function returns.
+
+      (read-contract http endpoint m [\"uint256\"])   ;; => [\"150\"]
+
+  The exit code is checked first: a reverting call still returns HTTP 200
+  with a non-zero `ExitCode`, and decoding its empty `Return` gives an empty
+  vector rather than an error."
+  [http endpoint message return-types]
+  (then (state-call http endpoint message)
+        (fn [receipt]
+          (let [exit (get-in receipt ["MsgRct" "ExitCode"])]
+            (when-not (= 0 exit)
+              (throw (ex-info "client: contract call reverted"
+                              {:exit-code exit
+                               :error (get receipt "Error")})))
+            (abi/decode return-types (or (return-bytes receipt) []))))))
+
+;; ── writes ───────────────────────────────────────────────────────────────────
+
+(defn push
+  "Submit a signed message. The only call here that changes anything."
+  [http endpoint signed]
+  (call http endpoint (rpc/mpool-push signed)))
+
+(defn send-message
+  "prepare → sign → push, in that order, because each step's input is the
+  previous step's output.
+
+  `sign` is anything implementing `filecoin.protocols/ISigner`;
+  `filecoin.signer/signer` is one over a private key."
+  [http endpoint isigner message]
+  (then (prepare http endpoint message)
+        (fn [m]
+          (let [signature (p/sign isigner (:from m) (msg/digest-for-secp256k1 m))]
+            (push http endpoint (sig/signed-message m signature))))))
+
+(defn send-message-with-key
+  "The same, holding the key directly. A convenience over
+  `filecoin.signer/signer` — a caller who would rather the key stayed in a
+  KMS should pass their own `ISigner` to `send-message` instead."
+  [http endpoint privkey message]
+  (send-message http endpoint (signer/signer privkey) message))
+
+(defn wait
+  "`StateWaitMsg` — block until a message lands, or the node gives up.
+  `confidence` is how many epochs of finality to wait beyond it."
+  ([http endpoint cid] (wait http endpoint cid 1))
+  ([http endpoint cid confidence]
+   (call http endpoint (rpc/state-wait-msg cid confidence))))

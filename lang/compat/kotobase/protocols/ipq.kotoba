@@ -1,0 +1,450 @@
+(ns kotobase.protocols.ipq
+  "IPQ/1 — bounded, verifiable selection over HTTP.
+
+  A trustless gateway answers *give me this CID*. This surface answers *run
+  this traversal and give me the blocks that prove the result*, which is the
+  operation kotobase's query plane actually performs and the one it had no way
+  to offer or to advertise.
+
+  ## What a 200 from here means, exactly
+
+  The body is a CARv1 containing the blocks a bounded IPLD selector touched,
+  root first. Every one of them was rehashed before it was decoded, and the
+  caller can replay the same selector against the archive alone
+  (`ipld.car.trustless/replay-selection`) and reach the same matches without
+  trusting this server.
+
+  It does NOT mean the answer is complete. Replay proves that a named traversal
+  ran over verified bytes; proving that a database range or a Datalog answer
+  omits nothing needs authenticated index boundaries, which do not exist yet
+  (kotobase ADR-2609060000). The profile number in the descriptor is where that
+  distinction is recorded, and it is why this is IPQ/1 and not IPQ.
+
+  ## Why a separate path, not `?selector=` on /ipfs/
+
+  kotobase ADR-2609060000: *An arbitrary `?selector=` endpoint returning CARv2
+  is a custom protocol, not automatically a standard trustless gateway.
+  Negotiate supported forms and versions explicitly.* Overloading `/ipfs/`
+  would make a non-standard response indistinguishable from a standard one to
+  a client that guessed wrong. `/ipq/v1/` says which protocol answered.
+
+  The rest of that sentence is `accepts-car?` and `ipni`: a form this surface
+  cannot produce is refused rather than answered with a CAR, and the descriptor
+  states the protocol identifier an index handed the client, so arriving at the
+  right address and arriving at the right protocol stop being two separate
+  acts of faith.
+
+  ## Surface
+
+      GET  /ipq/v1                         profile, limits, encodings, identity
+      GET  /ipq/v1/selection/{root-cid}?selector=<base64url dag-cbor>
+      HEAD likewise
+
+  Handlers are pure: `(handle ctx req) -> resp`, over the block port injected
+  in `ctx` as `:blocks {:get (fn [cid] -> block | nil)}` — required, see
+  `block-port`. No network I/O, no host JSON, no crypto dependency."
+  (:require [kotoba.lang.text :as str]
+            [ipld.car.bytes :as b]
+            [ipld.car.trustless :as trustless]
+            [ipld.dag-json :as dag-json]
+            [ipld.selector :as selector]
+            [kotobase.protocols.http :as http]
+            [kotobase.protocols.json :as json]))
+
+(def ^:const profile
+  "IPQ/1: a replayable traversal over CID-verified blocks. Not completeness."
+  1)
+
+(def limits
+  "Every budget `ipld.graph/select-blocks` requires, fixed and published.
+
+  Published rather than merely enforced: a client that cannot read the budget
+  before it builds a selector can only discover it by being refused, and a
+  refusal it did not anticipate is indistinguishable from a server fault. The
+  descriptor at `/ipq/v1` carries these numbers.
+
+  WHICH OF THESE IS MEASURED. `:max-blocks` is: see `unpacked-limits` below
+  for the 2026-09-11 numbers that chose 256 and 32, and for why a wider one
+  would be the absence of a ceiling rather than a larger one.
+
+  `:max-bytes` is NOT. It shipped in the first IPQ/1 commit and no
+  measurement has been attached to it since, which is worth saying out loud
+  because it sits in the same map as a number that was argued for, and a
+  reader has no way to tell them apart. What would settle it: the answer is
+  assembled whole — `ipld.car/encode` ends in a concat, and the deploy shell
+  caches every block before the handler runs — so the ceiling that matters is
+  peak memory in the Worker isolate against the concurrency it serves, and
+  nobody has measured that.
+
+  It is also not the number that bounds a TREE. A filesystem snapshot that
+  inlined its files was bounded by this budget; one that names them by CID is
+  not (`kotobase.protocols.ipq.fs`, snapshot version 2)."
+  {:max-blocks 256
+   :max-bytes 4194304
+   :max-depth 32
+   :max-matches 256})
+
+(def unpacked-limits
+  "The budget for a traversal whose root has no pack behind it.
+
+  Measured 2026-09-11 on the live surface with a 256-block graph, same root
+  both ways (com-junkawasaki/root ADR-2609109900 Q3e): with a CARv2 pack the
+  full 256 answered in 338 ms with one fetch; without one it answered in
+  36.3 s p50 and 46.0 s p90, one fetch per block, 98% of it waiting on the
+  block plane. Both completed. So `limits` above is DELIVERABLE at 256 and
+  usable only through a pack -- and a ceiling that admits a 46-second request
+  on the other path is not a ceiling, it is the absence of one.
+
+  32 is the widest measured width under five seconds on that path (4.2 s p50,
+  6.6 s p90), and it is also the width the one real graph on this origin has
+  (the IPNI advertisement chain, every link, 32 blocks). Everything else is
+  `limits`: bytes, depth and matches are bounded by the same numbers, because
+  it is the block COUNT that costs a round trip each.
+
+  The pure handler does not know what a pack is; the deploy shell does, and
+  it passes these as `:limits` in the ctx after the first miss comes back
+  without one. Published in the descriptor as `maxBlocksWithoutPack`, for the
+  same reason `limits` is published: a client that cannot read the budget
+  can only discover it by being refused."
+  (assoc limits :max-blocks 32))
+
+(def ipni
+  "The IPNI identity of this protocol, restated on the surface it identifies.
+
+  An index hands a client two things — a multicodec protocol identifier and an
+  address — and no promise that they belong together. Before this block a
+  client could decode `transport-ipq-selection-http` out of an advertisement,
+  follow the address, and find nothing at the other end that named the protocol
+  back; the only confirmation available was to send a selection and see whether
+  the answer looked like one. The descriptor now says which identifier this
+  surface answers for, which is the half of that handshake the surface owns.
+
+  The code looks unregistered because it is. `0x300940` sits in the multicodec
+  PRIVATE USE AREA (`0x300000`-`0x3FFFFF`, \"reserved for internal use by
+  applications\"), offset by `0x0940` — the next free slot in the registered
+  transport family (`0x0900` bitswap, `0x0910` graphsync, `0x0920`
+  ipfs-gateway-http, `0x0930` filecoin-piece-http) and therefore the code a
+  registration would ask for. Announcing an unregistered code OUTSIDE that
+  range would be squatting on a registry we do not own; announcing one inside
+  it is what the range is for, and a reader who does not know the code learns
+  that it is application-private rather than that the advertisement is
+  malformed. Both numbers are published because only one of them is on the
+  wire, and a client that saw `0x300940` and no explanation would have to guess
+  which registry it came from.
+
+  `metadata` is hex, and it is the framing an advertisement carries:
+  `uvarint(protocol) ++ uvarint(payload-length) ++ payload`. `ipq` is this
+  protocol's entry alone — length one, payload the profile number.
+  `advertised` is the whole Metadata field kotobase publishes, the trustless
+  gateway entry `a01200` first because `0x0920 < 0x300940` and the spec asks
+  for increasing protocol order.
+
+  AUTHORITY: `ipni.metadata` in kotoba-lang/io-ipni-specs — `ipq-selection-http`,
+  `ipq-selection-http-registration-request`, `ipq-selection-http-bytes` and
+  `kotobase-metadata-bytes`, where that framing was measured against go-libipni
+  v0.8.2 rather than read off IPNI.md's prose (the prose omits the length, and
+  the reference rejects what the prose describes). io-ipni-specs is NOT a
+  dependency here and must not become one: this is a pure handler with three
+  deps, and it advertises nothing — publishing is the deploy shell's business.
+  Two independent statements of one wire constant is the intended arrangement.
+  An undeclared drift between them is not, which is what `ipq_test.cljc` pins."
+  {"protocol" 0x300940
+   "name" "transport-ipq-selection-http"
+   "privateUseArea" {"from" 0x300000 "to" 0x3FFFFF}
+   "registrationRequest" 0x0940
+   "metadata" {"ipq" "c092c0010101"
+               "advertised" "a01200c092c0010101"}})
+
+(def descriptor
+  {"protocol" "ipq"
+   "profile" profile
+   "selector" {"encoding" "dag-cbor" "transfer" "base64url"
+               "parameter" "selector"}
+   "response" {"content-type" trustless/content-type "car-version" 1}
+   "limits" {"maxBlocks" (:max-blocks limits)
+             "maxBlocksWithoutPack" (:max-blocks unpacked-limits)
+             "maxBytes" (:max-bytes limits)
+             "maxDepth" (:max-depth limits)
+             "maxMatches" (:max-matches limits)}
+   "ipni" ipni
+   "proves" "that this traversal ran over blocks that hash to their CIDs"
+   "doesNotProve" "that a database range or Datalog answer is complete"})
+
+;; ── selector transfer ────────────────────────────────────────────────────────
+
+(defn base64url->bytes
+  "Decode a base64url query parameter.
+
+  `ipld.dag-json/base64-decode` is standard-alphabet and throws on any
+  character outside it, which is the behaviour we want and the reason the
+  translation happens HERE rather than by handing it the raw parameter: `-`
+  and `_` are legal base64url and illegal base64, so passing them straight
+  through would reject a correctly-encoded selector, and stripping unknown
+  characters instead would decode a corrupted one into different bytes without
+  saying so.
+
+  Returns this runtime's byte container, or `{:error reason}`. Padding is
+  optional; base64url normally omits it and both forms mean the same thing.
+
+  The `as-bytes` at the end is not tidying. `base64-decode` returns a Clojure
+  VECTOR of numbers, and the CBOR reader downstream measures its input with
+  `.length` -- which on a vector is `undefined`, so the decoder sees zero bytes
+  and reports `cbor: unexpected end of input`. The bytes were correct and the
+  container was not, and the two are indistinguishable from a value comparison:
+  measured while writing this, a round-trip test comparing `(vec decoded)` to
+  the original passed while every request through the handler failed."
+  [s]
+  (cond
+    (str/blank? s) {:error :empty}
+    (re-find #"[^A-Za-z0-9\-_=]" s) {:error :not-base64url}
+    :else
+    (let [standard (-> s (str/replace "-" "+") (str/replace "_" "/")
+                       (str/replace "=" ""))]
+      (try (b/as-bytes (dag-json/base64-decode standard))
+           (catch  _ {:error :not-base64url})))))
+
+;; ── content negotiation ──────────────────────────────────────────────────────
+
+(defn- media-range
+  "One element of an `Accept` field, as a lower-cased type and its parameters.
+  Quotes are stripped, so `version=\"1\"` and `version=1` are one value."
+  [element]
+  (let [[head & params] (str/split element #";")]
+    {:type (str/lower (str/trim (or head "")))
+     :params (into {} (keep (fn [kv]
+                              (let [[k v] (str/split kv #"=" 2)]
+                                (when v
+                                  [(str/lower (str/trim k))
+                                   (str/lower (str/replace (str/trim v) "\"" ""))])))
+                            params))}))
+
+(defn- covers-car?
+  "Whether one parsed range covers the representation this surface makes.
+
+  `version` is the only parameter that can take it out of range, and it counts
+  because the descriptor publishes `response.car-version` — `version=2` is a
+  client asking, specifically, for something this surface does not build.
+  `order` and `dups` are the trustless gateway's parameters and are ignored
+  rather than refused: this is not a gateway, and turning every parameter that
+  registry grows into a 406 would be a surface that stops working on somebody
+  else's schedule."
+  [{:keys [type params]}]
+  (or (contains? #{"*/*" "application/*"} type)
+      (and (= trustless/content-type type)
+           (contains? #{nil "1"} (get params "version")))))
+
+(defn- specificity [{:keys [type]}]
+  (cond (= "*/*" type) 0
+        (str/ends-with? type "/*") 1
+        :else 2))
+
+(defn- excluded?
+  "A quality of zero. The only qvalue that changes the answer here: quality
+  ranks alternatives, and there is exactly one representation to rank, but
+  `q=0` is an exclusion rather than a ranking."
+  [{:keys [params]}]
+  (boolean (re-matches #"0(?:\.0*)?" (get params "q" "1"))))
+
+(defn accepts-car?
+  "Whether an `Accept` field admits the one representation this surface makes.
+
+  Until this existed the handler read no request headers at all: a client that
+  asked for JSON got a CAR, and the only thing that said so was a content type
+  on a body it had already decided it could not read. kotobase ADR-2609060000
+  asks for supported forms *and versions* to be negotiated explicitly, and a
+  concrete type we cannot produce is now a 406.
+
+  Absent or empty is served. RFC 9110 gives a request with no `Accept` the
+  whole space of representations, and a field that is present and empty ranks
+  nothing — there is no type in it to refuse.
+
+  Specificity is honoured rather than any-match, and that is the whole reason
+  this is a fold and not a `some`. `application/vnd.ipld.car;q=0, */*` means
+  *anything but a CAR*; an any-match reading finds `*/*`, serves the CAR, and
+  gets the client's one instruction exactly backwards. RFC 9110 ranks an exact
+  type above `type/*` above `*/*`, so the qvalue that decides is the one on the
+  most specific range that covers us — which also keeps
+  `application/json;q=0, */*` served, because the excluded range is not one
+  that covered us in the first place."
+  [accept]
+  (if (or (nil? accept) (str/blank? accept))
+    true
+    (let [covering (filter covers-car? (map media-range (str/split accept #",")))
+          best (when (seq covering) (apply max (map specificity covering)))]
+      (boolean (some #(and (= best (specificity %)) (not (excluded? %)))
+                     covering)))))
+
+(defn block-port
+  "The `:blocks` port from `ctx`, or nil.
+
+  This surface takes the port directly rather than going through
+  `kotobase.protocols.blocks`, and the reason is the operation, not the
+  dependency: that namespace falls back to an `IStore` document collection when
+  `ctx` carries no port, and a document collection stores a block's bytes AS A
+  DOCUMENT VALUE — which on the worker route becomes datoms (ADR-2608039970,
+  and the measured 4 MiB ceiling that came with it). A selector engine reading
+  blocks back out of the datom plane would work and would be the wrong shape,
+  so the port is required here and its absence is refused rather than
+  substituted for."
+  [ctx]
+  (get-in ctx [:blocks :get]))
+
+(defn- block-bytes
+  "`get-fn` for the traversal, over the injected block port.
+
+  A block stored with `:encoding \"base64\"` is a transport encoding of binary
+  content and is decoded back; one stored with any OTHER encoding is refused
+  rather than passed through, because handing a selector the base64 TEXT of a
+  DAG-CBOR node produces a CID mismatch several frames later, and the error a
+  caller would see would name the wrong thing."
+  [ctx]
+  (let [get-block (block-port ctx)]
+    (fn [cid]
+      (when-let [{:keys [bytes encoding]} (get-block cid)]
+        (cond
+          (nil? encoding) bytes
+          (= "base64" encoding) (b/as-bytes (dag-json/base64-decode bytes))
+          :else (throw (ex-info "ipq: block has an encoding this surface cannot decode"
+                                {:type :ipq/unsupported-block-encoding
+                                 :cid cid :encoding encoding})))))))
+
+;; ── responses ────────────────────────────────────────────────────────────────
+
+(defn- json-resp [status body]
+  (http/response status
+                 {"content-type" "application/json; charset=utf-8"}
+                 (json/encode body)))
+
+(defn- refuse [status reason detail]
+  (json-resp status (cond-> {"error" (name reason)}
+                      detail (assoc "detail" detail))))
+
+(defn- car-resp [req car-bytes]
+  (http/response
+   200
+   {"content-type" trustless/content-type
+    "cache-control" "public, max-age=29030400, immutable"
+    "x-ipq-profile" (str profile)}
+   (when (= :get (:method req)) (dag-json/base64-encode car-bytes))))
+
+(defn- selection
+  "Run one selection and map every failure onto a status that means something
+  different from the others.
+
+  `:ipld/missing-block` is 404 and not 502: this server holds a content-
+  addressed store, and a traversal that reaches a CID we do not have is a
+  question about content we do not hold, not a fault. `:ipld/resource-limit`
+  is 413 and never a truncated 200 — a budget exhausted mid-traversal is an
+  incomplete retrieval, and an incomplete retrieval that returns 200 is the
+  failure this whole surface exists to avoid.
+
+  `:ipld/unsupported-codec` is 501, added 2026-09-11 after the live surface
+  answered a Cloudflare HTML 500 for it (error 1101, Worker threw exception).
+  It is not 4xx: the CID is well formed and the block is held — the same CID
+  is served by `/ipni/v1/ad/`. It is not 502 either, which this file uses for
+  a store that handed back something undecodable. The block is fine and this
+  PROFILE does not implement verification for its codec, which is what 501
+  says. `ipld.core/get-verified-block` owns which codecs those are and puts
+  the set in its ex-data, so the detail below quotes it rather than restating
+  it here — a second list would be a second source of truth for a fact one
+  library already owns, which is the drift this file avoids elsewhere.
+
+  **The default branch no longer re-throws, and that was the defect.** The
+  sentence this docstring opens with — map EVERY failure onto a status — was
+  false for exactly one branch, and inside a Worker a re-throw is not an
+  unhandled exception a caller can read: it is an HTML page from the edge with
+  none of this surface's named refusals in it. An unknown failure now gets its
+  own status and its own name, so a caller can still tell it apart from every
+  other answer, and the ex-data type travels with it so it stays diagnosable.
+  What does NOT travel is the exception message: every other refusal here
+  quotes a message this file raised itself, and an unknown exception is the one
+  case where nothing has vetted what that string contains."
+  [ctx req root selector-data]
+  (try
+    (let [result (trustless/selection-car (block-bytes ctx) root selector-data
+                                          (get ctx :limits limits))]
+      (-> (car-resp req (get-in result [:car :bytes]))
+          (assoc :body-encoding :base64)
+          (update :headers assoc
+                  "x-ipq-matches" (str (count (:matches result)))
+                  "x-ipq-blocks" (str (count (:blocks result))))))
+    (catch  e
+      (let [t (:type (ex-data e))]
+        (case t
+          :ipld/missing-block (refuse 404 :missing-block (str (:cid (ex-data e))))
+          :ipld/cid-mismatch (refuse 502 :cid-mismatch (str (:cid (ex-data e))))
+          :ipld/resource-limit (refuse 413 :resource-limit (str (:limit (ex-data e))))
+          :ipld/invalid-selector (refuse 400 :invalid-selector (ex-message e))
+          :ipq/unsupported-block-encoding
+          (refuse 502 :unsupported-block-encoding (str (:encoding (ex-data e))))
+          :ipld/unsupported-codec
+          (let [{:keys [cid codec supported]} (ex-data e)]
+            (refuse 501 :codec-not-supported
+                    (str cid " declares codec " codec
+                         "; this profile verifies " (pr-str (sort supported)))))
+          (refuse 500 :unhandled (str "ex-data type: " (pr-str t))))))))
+
+(defn handle
+  "IPQ/1 handler. `GET /ipq/v1` describes the profile; `GET|HEAD
+  /ipq/v1/selection/{root}?selector=<base64url>` runs one bounded traversal."
+  [ctx req]
+  (let [segs (http/segments (:path req))]
+    (cond
+      (not (#{:get :head} (:method req)))
+      (http/method-not-allowed)
+
+      (nil? (block-port ctx))
+      ;; Refused rather than degraded. A deployment that forgot the port would
+      ;; otherwise answer every selection with `root-not-held`, which is a
+      ;; sentence about the graph and not about the deployment.
+      (refuse 501 :block-port-required
+              "ctx must carry :blocks {:get (fn [cid] -> block | nil)}")
+
+      (= ["ipq" "v1"] segs)
+      ;; Not negotiated, deliberately. The descriptor is how a client learns
+      ;; what to ask for, so refusing to describe the surface because the
+      ;; client's `Accept` named the surface's own media type would close the
+      ;; only way back out of a wrong guess. RFC 9110 lets a server disregard
+      ;; the field and answer anyway, and that is the reading taken.
+      (json-resp 200 descriptor)
+
+      (and (= 4 (count segs))
+           (= "ipq" (first segs))
+           (= "v1" (second segs))
+           (= "selection" (nth segs 2)))
+      (let [root (nth segs 3)
+            raw (http/query-param req "selector")]
+        (cond
+          (not (accepts-car? (http/header req "accept")))
+          ;; Ahead of the selector, and it decides the whole request: a client
+          ;; that cannot read the representation gains nothing from having its
+          ;; selector validated, and answering `selector-required` first would
+          ;; send it away to fix the smaller of its two problems.
+          (refuse 406 :accept-not-satisfiable
+                  (str "this surface produces " trustless/content-type
+                       " (CARv1) and nothing else; see GET /ipq/v1"))
+
+          (nil? raw)
+          (refuse 400 :selector-required
+                  "pass ?selector=<base64url dag-cbor>; see GET /ipq/v1")
+
+          :else
+          (let [decoded (base64url->bytes raw)]
+            (if (:error decoded)
+              (refuse 400 :selector-not-base64url (name (:error decoded)))
+              (let [parsed (try {:ok (selector/decode decoded)}
+                                (catch  e
+                                  {:err e}))]
+                (if-let [e (:err parsed)]
+                  (if (= :ipld/invalid-selector (:type (ex-data e)))
+                    (refuse 400 :invalid-selector (ex-message e))
+                    (refuse 400 :selector-not-dag-cbor (ex-message e)))
+                  (if (nil? ((block-port ctx) root))
+                    (refuse 404 :root-not-held root)
+                    (selection ctx req root (:ok parsed)))))))))
+
+      (= "ipq" (first segs))
+      (refuse 404 :unknown-ipq-path
+              "this deployment serves /ipq/v1 and /ipq/v1/selection/{cid}")
+
+      :else (http/not-found))))

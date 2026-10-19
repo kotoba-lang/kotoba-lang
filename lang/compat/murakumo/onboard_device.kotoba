@@ -1,0 +1,153 @@
+(ns murakumo.onboard-device
+  "`murakumo node onboard`: the box side of the Wi-Fi handoff by sound (ADR-0243).
+
+  A box with a speaker and a microphone but no screen announces itself with a beacon, a
+  sender (a phone page or `murakumo node wifi-share`) plays back a sealed Wi-Fi profile,
+  and the box opens it, stores the encrypted message, hands the profile to NetworkManager,
+  and answers with an acknowledgement.
+
+  The rules live elsewhere and are tested there: the bytes in `grant.acoustic-onboard`,
+  the crypto in `murakumo.onboard`, when the window is open in `murakumo.onboard-window`,
+  the keyfile text in `murakumo.nm-keyfile`. This namespace is the shell that listens,
+  plays and writes files, and everything in it that touches the world is passed in or
+  confined to the state directory."
+  (:require [murakumo.onboard :as onboard]
+            [murakumo.onboard-state :as state]
+            [murakumo.onboard-window :as window]
+            [murakumo.onboard-audio :as audio]
+            [murakumo.nm-keyfile :as nm]
+            [grant.acoustic-onboard :as ao]
+            ["node:fs" :as fs] ["node:path" :as path] ["node:crypto" :as crypto]
+            ["node:child_process" :as child-process]))
+
+(def default-keyfile-dir "/etc/NetworkManager/system-connections")
+(def beacon-interval-ms 16000)
+(def ack-delay-ms 900)
+(def online-wait-ms 90000)
+
+;; ── applying the profile ──────────────────────────────────────────────────
+
+(defn apply-profile!
+  "Hand a profile to NetworkManager as a keyfile (mode 0600), not as `nmcli ... password`
+  arguments, which every user could read in the process list. Returns `{:applied? bool}`."
+  [{:keys [profile keyfile-dir reload? run-nmcli]}]
+  (let [text (nm/keyfile profile (.randomUUID crypto))]
+    (if (:error text)
+      {:applied? false :reason (:error text)}
+      (let [p (.join path keyfile-dir "murakumo-onboard.nmconnection")
+            tmp (str p ".tmp-" (.randomUUID crypto))
+            run-nmcli (or run-nmcli (fn [args] (.-status (.spawnSync child-process "nmcli" (clj->js args) #js {:stdio "ignore"}))))]
+        (.mkdirSync fs keyfile-dir #js {:recursive true :mode 448})
+        (.writeFileSync fs tmp text #js {:mode 384 :flag "wx"})
+        (.renameSync fs tmp p)
+        (cond
+          (and reload? (not= 0 (run-nmcli ["connection" "reload"])))
+          {:applied? false :reason :nm-reload-failed}
+          (and reload? (not= 0 (run-nmcli ["connection" "up" "murakumo-onboard"])))
+          {:applied? false :reason :nm-activation-failed}
+          :else {:applied? true})))))
+
+;; ── the loop ──────────────────────────────────────────────────────────────
+
+(def ^:private code-alphabet ao/code-alphabet)
+
+(defn random-code []
+  (apply str (map #(nth code-alphabet (mod % (count code-alphabet)))
+                  (js/Array.from (.randomBytes crypto 6)))))
+
+(defn- sleep [ms] (js/Promise. (fn [resolve _] (js/setTimeout resolve ms))))
+
+(defn- wait-online!
+  "Poll `online?` for up to `online-wait-ms`; true if it came up."
+  [online? timeout-ms]
+  (let [deadline (+ (js/Date.now) timeout-ms)]
+    (letfn [(poll [] (-> (online?)
+                         (.then (fn [up?]
+                                  (cond up? true
+                                        (>= (js/Date.now) deadline) false
+                                        :else (-> (sleep 3000) (.then poll)))))))]
+      (poll))))
+
+(defn- listen-and-answer!
+  "The loop proper. Returns a Promise of `{:outcome ...}`."
+  [{:keys [state-dir did-fingerprint mode ttl-ms max-attempts play-cmd record-cmd
+           apply? keyfile-dir reload? online? log]} ls {:keys [encode decode]}]
+  (js/Promise.
+   (fn [resolve _]
+     (let [dk (state/load-device-key! state-dir)
+           pub (onboard/public-key-b64url dk)
+           session (atom nil)
+           speaking (atom (js/Promise.resolve nil))
+           recorder (atom nil)
+           timers (atom [])
+           finish! (fn [result]
+                     (doseq [t @timers] (js/clearInterval t))
+                     (when @recorder ((:stop @recorder)))
+                     (resolve result))
+           say! (fn [data]
+                  (swap! speaking (fn [p] (.then p #(audio/play! play-cmd (encode data mode))))))
+           beacon! (fn []
+                     (when (window/open? @session)
+                       (say! (ao/beacon {:code (:code @session) :fp did-fingerprint :key pub}))))
+           open-window! (fn []
+                          (reset! session (window/start {:now-ms (js/Date.now) :ttl-ms ttl-ms
+                                                         :max-attempts max-attempts :rand-code random-code}))
+                          (log (str "window open, code " (:code @session)))
+                          (beacon!))
+           received! (fn [s message]
+                       (state/store-envelope! state-dir {:code (:code s) :fp did-fingerprint :message message})
+                       (log (str "profile received for \"" (get-in s [:profile :ssid]) "\""))
+                       (when apply?
+                         (let [r (apply-profile! {:profile (:profile s) :keyfile-dir keyfile-dir :reload? reload?})]
+                           (log (if (:applied? r) "profile handed to NetworkManager"
+                                    (str "profile not applied: " (name (:reason r)))))))
+                       ;; the acknowledgement is sent twice: the sender may have missed the first
+                       (-> (sleep ack-delay-ms) (.then #(say! (ao/ack (:code s))))
+                           (.then #(sleep 4000)) (.then #(say! (ao/ack (:code s)))))
+                       (-> (wait-online! online? online-wait-ms)
+                           (.then (fn [up?]
+                                    (if up?
+                                      (finish! {:outcome :online})
+                                      (do (log "still offline; opening a new window")
+                                          (open-window!)))))))
+           on-bytes (fn [bs]
+                      (log (str "heard " (.-length bs) " bytes"))
+                      (let [s @session]
+                        (when (and (window/open? s) (= ao/message-magic (aget bs 0)))
+                          (let [message (vec (js/Array.from bs))
+                                result (onboard/open {:private-key dk :code (:code s) :fp did-fingerprint
+                                                      :label-secret (:label-secret ls) :message message})
+                                {next :session effect :effect} (window/heard s result random-code)]
+                            (reset! session next)
+                            (case effect
+                              :received (received! next message)
+                              :rotated (do (log "a message did not open; code rotated") (beacon!))
+                              :closed (finish! {:outcome :closed :reason :too-many-attempts})
+                              nil)))))]
+       (open-window!)
+       (reset! recorder (audio/record! record-cmd (fn [pcm] (when-let [bs (decode pcm)] (on-bytes bs)))))
+       (.then (:done @recorder) (fn [_] (finish! {:outcome :closed :reason :microphone-ended})))
+       (swap! timers conj (js/setInterval beacon! beacon-interval-ms))
+       (swap! timers conj (js/setInterval
+                           (fn []
+                             (swap! session window/tick (js/Date.now))
+                             (when (= :closed (:state @session))
+                               (finish! {:outcome :closed :reason (:reason @session)})))
+                           1000))))))
+
+(defn run!
+  "Run the box side until it is online, the window closes, or the microphone ends. Returns
+  a Promise of `{:outcome :online|:closed :reason ...}`.
+
+  `opts`: `:state-dir :did-fingerprint :mode :ttl-ms :max-attempts :play-cmd :record-cmd
+  :apply? :keyfile-dir :reload? :online? :log`. `:online?` returns a Promise of a boolean."
+  [{:keys [state-dir online?] :as opts}]
+  (let [ls (state/label-secret state-dir)]
+    (if (:error ls)
+      (js/Promise.resolve {:outcome :closed :reason (:error ls)})
+      (-> (online?)
+          (.then (fn [up?]
+                   (if up?
+                     {:outcome :online :reason :already-online}
+                     (-> (audio/init!)
+                         (.then (fn [codec] (listen-and-answer! opts ls codec)))))))))))

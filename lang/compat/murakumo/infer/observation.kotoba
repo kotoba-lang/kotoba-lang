@@ -1,0 +1,281 @@
+(ns murakumo.infer.observation
+  "L2 of ADR-2610071730: each node's signed self-report, gossiped.
+
+  Every resident observes ITSELF (lanes, host memory pressure / swap /
+  TIME_WAIT, launchd state of the allowed workload units, model files named by
+  the intent, its own release) every probe interval, signs the document with
+  its own ed25519 node key (did:key), and exchanges documents with a few
+  peers per gossip tick along the same peer list the signed topology uses.
+  Any resident therefore answers for the whole fleet.
+
+  Single writer per entry: a document is accepted only when its signature
+  verifies, the did it names is the key that signed it, and the did is the
+  one first seen for that node (pinned; a different key for a known node is
+  refused, never overwritten). Newer `at` wins; documents older than the TTL
+  are dropped (stale = unknown) and ones dated in the future are refused.
+
+  Read-only on the host: probes run with execFile asynchronously, no shell,
+  fixed argv. GET /observations is served without the fleet token (signed,
+  health-only, on the resident's tailnet bind); everything else on the
+  resident still requires it."
+  (:require [clojure.string :as str]
+            [murakumo.infer.keepalive :as ka]
+            [murakumo.infer.jobs :as jobs]
+            [murakumo.infer.replicated-topology :as topo]
+            ["node:fs" :as fs] ["node:path" :as path] ["node:os" :as os]
+            ["node:crypto" :as crypto] ["node:child_process" :as cp]))
+
+(def ttl-ms (* 15 60 1000))
+(def process-started (js/Date.now))
+(def future-skew-ms (* 2 60 1000))
+
+(def workload-units
+  "The launchd labels the intent's templates render (murakumo.fleet.spec/templates)."
+  ["com.murakumo.mishima" "com.murakumo.comfy" "cloud.itonami.agent.peer"
+   "com.murakumo.resident" "com.murakumo.kotoba-mesh"])
+
+;; ---------------------------------------------------------------- did:key
+
+(def ^:private b58 "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+(defn base58 [bytes]
+  (let [digits (reduce (fn [digits b]
+                         (loop [[d & more] digits carry b out []]
+                           (if (nil? d)
+                             (loop [c carry out out] (if (pos? c) (recur (quot c 58) (conj out (mod c 58))) out))
+                             (let [x (+ (* d 256) carry)] (recur more (quot x 58) (conj out (mod x 58)))))))
+                       [] (array-seq bytes))
+        zeros (count (take-while zero? (array-seq bytes)))]
+    (str (apply str (repeat zeros "1")) (apply str (map #(.charAt b58 %) (reverse digits))))))
+
+(defn unbase58 [s]
+  (let [big58 (js/BigInt 58)
+        n (reduce (fn [acc c] (+ (* acc big58) (js/BigInt (.indexOf b58 c)))) (js/BigInt 0) s)
+        hex (.toString n 16)
+        hex (if (odd? (count hex)) (str "0" hex) hex)]
+    (js/Buffer.concat #js [(js/Buffer.alloc (count (take-while #(= % \1) s)))
+                           (if (= n (js/BigInt 0)) (js/Buffer.alloc 0) (js/Buffer.from hex "hex"))])))
+
+(def ^:private spki-prefix "302a300506032b6570032100")
+
+(defn public->did [public-key]
+  (let [der (.export public-key #js {:type "spki" :format "der"})]
+    (str "did:key:z" (base58 (js/Buffer.concat #js [(js/Buffer.from #js [0xed 0x01]) (.subarray der (- (.-length der) 32))])))))
+
+(defn did->public [did]
+  (when-let [[_ z] (re-matches #"^did:key:z([1-9A-HJ-NP-Za-km-z]+)$" (str did))]
+    (let [b (unbase58 z)]
+      (when (and (= 34 (.-length b)) (= 0xed (aget b 0)) (= 0x01 (aget b 1)))
+        (.createPublicKey crypto #js {:key (js/Buffer.concat #js [(js/Buffer.from spki-prefix "hex") (.subarray b 2)])
+                                      :format "der" :type "spki"})))))
+
+(defn node-key!
+  "Load or create this node's private ed25519 key (0600, never leaves the node)."
+  [file]
+  (when-not (.existsSync fs file)
+    (let [kp (.generateKeyPairSync crypto "ed25519")
+          fd (.openSync fs file "wx" 384)]
+      (try (.writeFileSync fs fd (.export (.-privateKey kp) #js {:type "pkcs8" :format "pem"})) (.fsyncSync fs fd)
+           (finally (.closeSync fs fd)))))
+  (let [st (.lstatSync fs file)]
+    (when (or (.isSymbolicLink st) (not (.isFile st)) (not= 0 (bit-and (.-mode st) 63)))
+      (throw (js/Error. "node-key-file must be a private regular file (0600)"))))
+  (let [private (.createPrivateKey crypto (.readFileSync fs file "utf8"))]
+    {:private private :did (public->did (.createPublicKey crypto private))}))
+
+(defn sign [{:keys [private]} payload]
+  {:payload payload
+   :signature (.toString (.sign crypto nil (js/Buffer.from (topo/encoded payload)) private) "base64url")})
+
+(defn verified-payload
+  "payload of a signed observation document, or nil."
+  [doc]
+  (try
+    (let [payload (:payload doc)
+          k (did->public (:did payload))]
+      (when (and k (string? (:node payload)) (number? (:at payload))
+                 (.verify crypto nil (js/Buffer.from (topo/encoded payload)) k (js/Buffer.from (str (:signature doc)) "base64url")))
+        payload))
+    (catch :default _ nil)))
+
+;; ---------------------------------------------------------------- host probes
+
+(defn- exec [argv timeout-ms]
+  (js/Promise. (fn [resolve]
+                 (.execFile cp (first argv) (clj->js (rest argv)) #js {:timeout timeout-ms :maxBuffer 67108864}
+                            (fn [err stdout _] (resolve (when-not err (str stdout))))))))
+
+(defn- int-of [s] (when s (let [n (js/parseInt (str/trim (str s)) 10)] (when-not (js/isNaN n) n))))
+
+(defn host-facts []
+  (if (= "darwin" (.-platform js/process))
+    (-> (js/Promise.all #js [(exec ["sysctl" "-n" "kern.memorystatus_vm_pressure_level"] 3000)
+                             (exec ["memory_pressure"] 5000)
+                             (exec ["sysctl" "-n" "vm.swapusage"] 3000)
+                             (exec ["sysctl" "-n" "net.inet.ip.portrange.first"] 3000)
+                             (exec ["netstat" "-an" "-p" "tcp"] 15000)])
+        (.then (fn [[level mp swap pfirst ns]]
+                 {:pressure (int-of level)
+                  :free-pct (some->> mp (re-find #"free percentage:\s*(\d+)") second int-of)
+                  :swap-used-mb (some->> swap (re-find #"used = ([0-9.]+)M") second js/parseFloat js/Math.round)
+                  :ephemeral-first (int-of pfirst)
+                  :tcp-time-wait (when ns (count (re-seq #"TIME_WAIT" ns)))
+                  :memory-gb (js/Math.round (/ (.totalmem os) 1073741824))
+                  :loadavg (vec (map #(/ (js/Math.round (* 100 %)) 100) (array-seq (.loadavg os))))
+                  :uptime-s (js/Math.floor (.uptime os))})))
+    (js/Promise.resolve
+     {:memory-gb (js/Math.round (/ (.totalmem os) 1073741824))
+      :free-pct (js/Math.round (* 100 (/ (.freemem os) (.totalmem os))))
+      :loadavg (vec (array-seq (.loadavg os))) :uptime-s (js/Math.floor (.uptime os))})))
+
+(defn- systemd-units
+  "Linux: murakumo / itonami systemd services -> running | <active state>.
+  Names differ per host (murakumo-k16-mishima, murakumo-b70-bonsai-native …),
+  so they are reported as they are; classes are matched by lanes instead."
+  []
+  (-> (exec ["systemctl" "list-units" "--type=service" "--all" "--no-legend" "--plain" "--no-pager"
+             "murakumo-*" "itonami-*" "cloud-itonami*"] 8000)
+      (.then (fn [out]
+               (into (sorted-map)
+                     (for [line (str/split-lines (or out ""))
+                           :let [[unit _load active sub] (str/split (str/trim line) #"\s+")]
+                           :when (and unit (str/ends-with? unit ".service"))]
+                       [(subs unit 0 (- (count unit) 8)) (if (= "running" sub) "running" (str active "/" sub))]))))))
+
+(defn unit-states
+  "label -> running | loaded | not-loaded | absent (launchd system domain), or
+  on Linux the murakumo/itonami systemd services."
+  []
+  (if-not (= "darwin" (.-platform js/process))
+    (systemd-units)
+    (-> (js/Promise.all
+         (clj->js (for [l workload-units]
+                    (-> (exec ["launchctl" "print" (str "system/" l)] 4000)
+                        (.then (fn [out]
+                                 [l (cond (nil? out) (if (.existsSync fs (str "/Library/LaunchDaemons/" l ".plist")) "not-loaded" "absent")
+                                          (re-find #"(?m)^\s+state = running" out) "running"
+                                          :else "loaded")]))))))
+        (.then (fn [rows] (into (sorted-map) (array-seq rows)))))))
+
+(defn model-files
+  "model id -> {:present bool :bytes n} for the models the intent names."
+  [topology-payload model-root]
+  (into (sorted-map)
+        (for [[m spec] (:models topology-payload)
+              :let [f (:file spec)]
+              :when (and (string? f) (not (str/includes? f "..")) (not (str/starts-with? f "/")))
+              :let [p (.join path model-root f)
+                    st (try (.statSync fs p) (catch :default _ nil))]]
+          [(topo/key-name m) (cond-> {:present (boolean st)}
+                               st (assoc :bytes (.-size st)
+                                         :size-matches (or (nil? (:bytes spec)) (= (:bytes spec) (.-size st)))))])))
+
+(def ^:private release-ids (atom {}))
+(defn- release-id
+  "First 16 hex of the release file's sha256 (config :release-file, else the
+  script this process runs) — the same file P5a self-update replaces."
+  [config]
+  (let [f (or (:release-file config) (aget (.-argv js/process) 1))]
+    (or (get @release-ids f)
+        (let [id (try (subs (.digest (.update (.createHash crypto "sha256") (.readFileSync fs f)) "hex") 0 16) (catch :default _ nil))]
+          (swap! release-ids assoc f id) id))))
+
+;; ---------------------------------------------------------------- store + gossip
+
+(defn- pins-file [config] (str (:state-file config) ".observation-pins.json"))
+
+(defn- read-pins [config]
+  (try (js->clj (js/JSON.parse (.readFileSync fs (pins-file config) "utf8"))) (catch :default _ {})))
+
+(defn accept
+  "Pure merge decision. Returns [store' pins' accepted? reason].
+  may-pin: the nodes whose key this call may pin for the first time — only a
+  node's OWN document, fetched from that node's topology URL (or this node's
+  own). A relayed document for a node not yet pinned is refused, so a peer
+  cannot claim another node's identity by getting there first."
+  [store pins doc now & [{:keys [may-pin]}]]
+  (let [p (verified-payload doc)
+        node (:node p)]
+    (cond
+      (nil? p) [store pins false "bad signature"]
+      (> (:at p) (+ now future-skew-ms)) [store pins false "dated in the future"]
+      (< (:at p) (- now ttl-ms)) [store pins false "stale"]
+      (and (get pins node) (not= (get pins node) (:did p))) [store pins false (str "key for " node " differs from the pinned did")]
+      (and (nil? (get pins node)) (not (contains? (set may-pin) node))) [store pins false (str node " is not pinned yet; only its own URL may introduce its key")]
+      (and (get store node) (<= (:at p) (get-in store [node :payload :at]))) [store pins false "not newer"]
+      :else [(assoc store node doc) (assoc pins node (:did p)) true "accepted"])))
+
+(defn fresh [store now]
+  (into (sorted-map) (filter (fn [[_ d]] (>= (get-in d [:payload :at]) (- now ttl-ms))) store)))
+
+(defn start!
+  "Begin observing and gossiping. lanes-fn returns the resident's current lane
+  map (id -> lane). Returns {:own :all :accept! :close}."
+  [config token topology lanes-fn & [{:keys [extra-fn]}]]
+  (let [key (node-key! (or (:node-key-file config) (str (:state-file config) ".node-key")))
+        store (atom {}) pins (atom (read-pins config))
+        ;; macOS fleet nodes keep models under /Users/Shared/murakumo; elsewhere
+        ;; an unset root means "unknown", not "missing" (no :models reported)
+        model-root (or (:model-root config) (when (= "darwin" (.-platform js/process)) "/Users/Shared/murakumo"))
+        accept! (fn [doc & [may-pin]]
+                  (let [[s p ok? _] (accept @store @pins doc (js/Date.now) {:may-pin may-pin})]
+                    (when ok?
+                      ;; a new pin must be durable BEFORE it is used: a pin held only
+                      ;; in memory would be gone after a restart, letting another key in
+                      (if (= p @pins)
+                        (reset! store s)
+                        (when (try (topo/persist! (pins-file config) p) true (catch :default _ false))
+                          (reset! store s) (reset! pins p))))
+                    ok?))
+        observe! (fn []
+                   (-> (js/Promise.all #js [(host-facts) (unit-states)])
+                       (.then (fn [[host units]]
+                                (let [payload (topo/payload topology)
+                                      doc (sign key {:node (:node config)
+                                                     :did (:did key)
+                                                     :at (js/Date.now)
+                                                     :release (release-id config)
+                                                     :topology (topo/summary topology)
+                                                     :lanes (into (sorted-map)
+                                                                  (for [[id l] (lanes-fn)]
+                                                                    [id (select-keys l [:model :kind :context :ready :failures])]))
+                                                     :host host
+                                                     :units units
+                                                     :models (if model-root (model-files payload model-root) {})})
+                                      doc (sign key (merge (:payload doc)
+                                                           {:started-at process-started}
+                                                           ;; e.g. the convergence plan (P3a), the rollout (P5a)
+                                                           (when extra-fn (try (extra-fn) (catch :default _ nil)))))]
+                                  ;; our own entry goes through the same gate as a peer's
+                                  (accept! doc #{(:node config)}))))
+                       (.catch (fn [_] nil))))
+        cursor (atom 0) polling (atom false)
+        gossip! (fn []
+                  (when (compare-and-set! polling false true)
+                    (let [payload (topo/payload topology)
+                          urls (vec (distinct (keep :url (concat (:nodes payload)))))
+                          node-at (into {} (for [n (:nodes payload)] [(:url n) (:node n)]))
+                          offset (mod (swap! cursor inc) (max 1 (count urls)))
+                          picked (take (:observation-fanout config 3) (concat (subvec urls offset) (subvec urls 0 offset)))]
+                      (-> (js/Promise.allSettled
+                           (clj->js (for [u picked]
+                                      (-> (ka/fetch (str (str/replace u #"/$" "") "/observations")
+                                                    #js {:headers #js {"authorization" (str "Bearer " token)}
+                                                         :redirect "error" :signal (.timeout js/AbortSignal 4000)})
+                                          ;; bounded like the topology exchange: a faulty peer must not
+                                          ;; exhaust memory through gossip
+                                          (.then (fn [r] (when-not (.-ok r) (throw (js/Error. "unavailable")))
+                                                   (jobs/bounded-json! r (:observation-max-bytes config 4194304))))
+                                          ;; the peer at u may introduce only its own key
+                                          (.then (fn [m] (doseq [[_ d] m] (accept! d #{(node-at u)}))))))))
+                          (.finally #(reset! polling false))))))
+        ;; its own interval (not the lane probe's): host probes such as netstat
+        ;; are not free, and a fast canary must not make them fast too
+        t1 (js/setInterval observe! (:observation-interval-ms config 30000))
+        t2 (js/setInterval gossip! (:observation-poll-ms config 10000))]
+    (observe!)
+    {:own #(get @store (:node config))
+     :all #(fresh @store (js/Date.now))
+     :did (:did key)
+     :accept! accept!
+     :close (fn [] (js/clearInterval t1) (js/clearInterval t2))}))

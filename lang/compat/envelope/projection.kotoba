@@ -1,0 +1,141 @@
+(ns envelope.projection
+  "The other half of the envelope: the rules for the plane that is **not**
+  sealed.
+
+  `envelope.model` owns what a sealed object looks like. This owns what may
+  be written next to it — the queryable facet a server can read and index,
+  which exists precisely because ciphertext cannot be joined.
+
+  ## Why this needs a guard at all
+
+  Splitting a record into a sealed envelope and a queryable projection is the
+  established shape in this workspace (`cloud-itonami-rirekisho`,
+  `kotoba-lang/kagi`, `etzhayyim/com-etzhayyim-talent`). Superproject
+  ADR-2608070400 D2 makes it the default, and its Consequences name the
+  failure mode this namespace exists for:
+
+  > 射影面の非識別性は client の責任であり、server は検査しない。射影の設計を
+  > 誤れば、暗号は無傷のまま PII が平文で出る。これは構造上 server 側では防げない。
+
+  The crypto cannot fail here and still lose the data. The projection leaks it
+  in plaintext, correctly encrypted, through the front door.
+
+  ## Two lessons carried from the three prior implementations
+
+  **1. Check the shape, not the prefix.** `com-etzhayyim-talent` enforces
+  \"identifying fields must be `signal:v1:` ciphertext\" by testing the string
+  prefix, so `\"signal:v1:\" + plaintext` satisfies it. `rirekisho` fixed this
+  by asking whether the value *is* what sealing produces. `sealed?` here is
+  structural for the same reason: a rule a caller can satisfy by writing a
+  string is not a rule.
+
+  **2. Walk to any depth.** `rirekisho/leaks` inspects only top-level keys.
+  That is sufficient there because a closed allowlist rejects unknown keys
+  anyway — but a cohort/projection facet has *open* keys by design, so the
+  same check on it would miss `{:cohort/skills [{:name \"…\"}]}`. `leaks` here
+  walks maps, vectors, sets and seqs.
+
+  ## What this cannot do, stated so it is not mistaken for coverage
+
+  It finds identifying **attributes**. It cannot find an identifying **value**
+  under an innocuous key — `{:cohort/note \"山田太郎 in Osaka\"}` passes, because
+  deciding that a string is a name is domain knowledge this namespace does not
+  and should not have. The guard raises the floor; it is not a PII detector.
+  A projection whose free-text fields carry identity is still a leak, and the
+  only thing that catches it is choosing not to project free text."
+  (:require [kotoba.lang.coll :as set]))
+
+;; ── sealed? ──────────────────────────────────────────────────────────────
+;;
+;; What sealing produces, as a shape. Callers supply their own key set because
+;; the envelope shape differs per store (this repo's `envelope.model`, kagi's
+;; sealed item, rirekisho's `:envelope/*`), and hardcoding one would make the
+;; other two unable to use this.
+
+(defn sealed?
+  "True when `v` is exactly a sealed value: a map whose keys all come from
+  `required+optional`, carrying every key in `required`.
+
+  **Unknown keys make this false.** Letting them through means the gate
+  loosens every time a schema grows a field — which is how a guard becomes
+  decoration. If a new key belongs in the envelope, add it to the key set on
+  purpose."
+  [{:keys [required optional]} v]
+  (let [allowed (set/union (set required) (set optional))]
+    (and (map? v)
+         (seq required)
+         (every? #(contains? v %) required)
+         (every? allowed (keys v)))))
+
+;; ── leaks ────────────────────────────────────────────────────────────────
+
+(defn- walk-keys
+  "Every map key appearing anywhere in `v`, at any depth."
+  [v]
+  (cond
+    (map? v) (into (set (keys v)) (mapcat walk-keys) (vals v))
+    (or (vector? v) (set? v) (seq? v) (list? v)) (into #{} (mapcat walk-keys) v)
+    :else #{}))
+
+(defn leaks
+  "The identifying attributes present in `v`, at any depth. Empty means no
+  identifying *attribute* is there — see the namespace docstring for what
+  that does not cover.
+
+  `identifying?` is a predicate over attribute keys (a set works). It is the
+  caller's because which attributes identify a person is domain knowledge:
+  `:person/name` here, `:permit/holder` there."
+  [identifying? v]
+  (into #{} (filter identifying?) (walk-keys v)))
+
+;; ── the gate ─────────────────────────────────────────────────────────────
+
+(defn persistable?
+  "True when `v` may be written to the queryable plane.
+
+  Two independent conditions, both required:
+  - no identifying attribute anywhere in it (`leaks` is empty);
+  - if `:sealed-shape` is given, `v` must satisfy `sealed?` — used when the
+    value being written is supposed to BE an envelope rather than a
+    projection of one."
+  [{:keys [identifying? sealed-shape]} v]
+  (and (empty? (leaks (or identifying? (constantly false)) v))
+       (or (nil? sealed-shape) (sealed? sealed-shape v))))
+
+(defn ensure-persistable!
+  "`v` if it may be persisted; otherwise throw with what was wrong.
+
+  The thrown data names the offending attributes rather than saying
+  \"invalid\" — a guard that does not tell you which field it caught gets
+  worked around instead of fixed."
+  [{:keys [identifying? sealed-shape] :as opts} v]
+  (when-not (persistable? opts v)
+    (throw (ex-info "value is not persistable to the queryable plane"
+                    (cond-> {:leaks (leaks (or identifying? (constantly false)) v)}
+                      sealed-shape
+                      (assoc :sealed? (sealed? sealed-shape v)
+                             :unexpected-keys
+                             (when (map? v)
+                               (into #{} (remove (set/union (set (:required sealed-shape))
+                                                            (set (:optional sealed-shape))))
+                                     (keys v))))))))
+  v)
+
+;; ── declaring a split ────────────────────────────────────────────────────
+
+(defn split
+  "Partition `entity` into the two planes by attribute.
+
+  Returns `{:envelope {...} :projection {...}}`. Attributes matching
+  `identifying?` go to the envelope side (to be sealed by the caller);
+  everything else is the projection.
+
+  This is a convenience, not the guard — the caller still seals the envelope
+  half and still runs `ensure-persistable!` on the projection half. Splitting
+  and enforcing are separate so that a caller who builds the projection some
+  other way is still checked."
+  [identifying? entity]
+  (reduce-kv (fn [acc k v]
+               (assoc-in acc [(if (identifying? k) :envelope :projection) k] v))
+             {:envelope {} :projection {}}
+             entity))

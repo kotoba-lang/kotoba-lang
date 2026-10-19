@@ -1,0 +1,312 @@
+(ns murakumo.mcp
+  "murakumo's MCP surface: issue and inspect API keys from an MCP client.
+
+  Same implementation as the `token` CLI (murakumo.apikey), so the two surfaces
+  cannot drift. Two tools, deliberately no more:
+
+    murakumo.issue_api_key   — mint an mk1 capability token
+    murakumo.verify_api_key  — decode + verify one
+
+  ## What this does and does not expose
+
+  It mints from `$MURAKUMO_TOKEN_SECRET` in the server's own environment. It
+  never reads, returns or logs that secret — only tokens derived from it — and it
+  refuses outright when it is unset rather than emitting something that would fail
+  at the gateway with an indistinguishable 401.
+
+  The issued token IS a credential. Two properties keep that bounded, both
+  enforced in murakumo.apikey rather than here:
+
+    - scope must be one the gateway actually understands (chat | image | all);
+      an unknown scope is refused at issue time instead of becoming a confusing
+      401 later
+    - ttl is capped at 90 days. mk1 is stateless by design — the gateway verifies
+      with no KV or DB round-trip, which also means there is no revocation list.
+      Expiry is the entire revocation story, so an unbounded key would be a
+      permanent one. Re-issue instead.
+
+  Running this server therefore grants its client the ability to mint keys up to
+  those bounds, for as long as the secret is in the environment. That is the same
+  authority the CLI has always had; MCP just makes it callable by an agent."
+  (:require [mcp.model :as m]
+            [mcp.ports :as ports]
+            [kotoba.lang.text :as str]
+            [murakumo.bench :as bench]
+            [murakumo.health :as health]
+            [murakumo.apikey :as apikey]
+            [murakumo.image-model :as image-model]))
+
+(defn- secret []
+  )
+
+(defn- now-s []
+  )
+
+(defn issue-tool
+  "args: sub, scope, ttl_seconds. Returns the token plus its claims, or a
+  refusal — never throws, so a bad request is an answer the model can act on."
+  [args]
+  (let [ttl (some-> (get args "ttl_seconds") long)
+        r (apikey/issue {:secret (secret)
+                         :sub (get args "sub" "mcp-client")
+                         :scope (get args "scope" "all")
+                         :ttl (or ttl apikey/default-ttl)
+                         :now (now-s)})]
+    (if (:ok r)
+      (cond-> {:token (:token r)
+       :sub (get-in r [:claims :sub])
+       :scope (get-in r [:claims :scope])
+       :expires_at (get-in r [:claims :exp])
+       :usage "send as `x-api-key: <token>` or `Authorization: Bearer <token>`"
+       :note "stateless capability token — it cannot be revoked, only expire"}
+        (:warning r) (assoc :warning (:warning r)))
+      {:error (:error r)})))
+
+(defn verify-tool
+  [args]
+  (apikey/inspect {:secret (secret) :token (get args "token") :now (now-s)}))
+
+(defn- kw-opts
+  "MCP arguments arrive as a JSON object with string keys. Underscores become
+  hyphens so `timeout_s` and `bin_name` reach the same option names the CLI uses."
+  [args]
+  (->> args
+       (map (fn [[k v]] [(keyword (str/replace (str k) "_" "-")) v]))
+       (into {})))
+
+(defn bench-run-tool
+  "args: node, engine, model, bin, bin_name, user, prompt, n, p, r, t, steps, temp,
+  ngl, timeout_s, record.
+
+  Calls the same `murakumo.bench/measure` the CLI calls, so an agent measurement
+  and an operator measurement are the same measurement. It records to the
+  append-only ledger by default (that is the point — a number that is not written
+  down cannot be compared); `record: false` is for a dry run. It never enrols a
+  node, registers a model or publishes anything."
+  [args]
+  (try
+    (let [opts (kw-opts args)
+          record? (not (false? (get opts :record true)))
+          m (bench/measure (assoc opts :no-record (not record?)))
+          e (:entry m)]
+      (when record? (bench/append-row! (bench/ledger-path) e))
+      {:ok (= 0 (:status m))
+       :node (:bench/node e)
+       :node_ip (:bench/node-ip e)
+       :engine (:bench/engine e)
+       :model (:bench/model e)
+       :model_bytes (:bench/model-bytes e)
+       :model_sha8 (:bench/model-sha8 e)
+       :host (:bench/host e)
+       :metrics (:bench/metrics e)
+       :argv (:bench/argv e)
+       :warning (:warning m)
+       :ledger (when record? (bench/ledger-path))})
+    (catch :default e {:error (.-message e)})))
+
+(defn bench-nodes-tool [_args]
+  (let [nodes (bench/tailnet-nodes)]
+    (if (:error nodes)
+      (let [m (re-find #"status failed: ([0-9]+)" (str (:error nodes)))]
+        (when m (println "bench: tailscale status failed with" (second m)))
+        {:error (:error nodes)})
+      {:nodes (mapv #(select-keys % [:name :ip :online :os]) nodes)})))
+
+(defn bench-ledger-tool [args]
+  (let [p (bench/ledger-path)
+        {:keys [rows bad]} (bench/read-rows p)
+        limit (or (some-> (get args "limit") js/parseInt) 20)]
+    {:ledger p
+     :rows (count rows)
+     :unparseable bad
+     :recent (mapv #(select-keys % [:bench/at :bench/node :bench/engine :bench/model
+                                    :bench/model-sha8 :bench/metrics])
+                   (take-last limit rows))}))
+
+;; ── fleet health ──────────────────────────────────────────────────────────────
+;; Same `murakumo.health` the `murakumo health` CLI calls, so an agent's verdict
+;; and an operator's are the same verdict, appended to the same ledger.
+
+(defn- check-args [args]
+  ;; No `fleet` argument on purpose: the inventory names the hosts ssh connects to
+  ;; and the restart commands heal may run, so an agent must not choose the file.
+  ;; It comes from $MURAKUMO_FLEET or ./fleet.edn, i.e. from the operator.
+  {:fleet nil :nodes (get args "nodes")
+   :canary (true? (get args "canary"))
+   :record (not (false? (get args "record")))
+   :model (get args "model")})
+
+(defn fleet-health-tool
+  "args: nodes, canary, record. Probes every node in parallel over ssh and
+  the public gateway, and returns the verdict, 0-100 score and per-node findings.
+  Records one ledger row unless `record: false`."
+  [args]
+  (try (dissoc (health/run-check! (check-args args)) :rows)
+       (catch :default e {:error (.-message e)})))
+
+(defn fleet-slo-tool
+  "args: window (checks, default 50). Availability per node, flapping nodes,
+  gateway availability and the canary baseline, all from the ledger."
+  [args]
+  (try
+    (let [snaps (health/snapshots (:rows (health/read-ledger (health/ledger-path))))]
+      (if (empty? snaps)
+        {:error "no health checks recorded yet — call murakumo.fleet_health first"}
+        (health/slo snaps (or (some-> (get args "window") js/parseInt) 50))))
+    (catch :default e {:error (.-message e)})))
+
+(defn fleet-heal-tool
+  "args: node, apply. Re-checks the WHOLE fleet (a subset would hide a correlated outage), then plans. Re-checks the fleet, then plans. With
+  `apply: true` it runs ONLY restart commands a node declares as
+  `:health/restart-cmd` in fleet.edn, and never inside a cooldown or a correlated
+  outage. Everything else comes back as advice."
+  [args]
+  (try
+    (let [a (health/run-check! (assoc (check-args args) :nodes nil))
+          p (health/ledger-path)
+          now (js/Date.now)
+          plan (health/heal-plan a (health/heals (:rows (health/read-ledger p))) now)
+          apply? (true? (get args "apply"))
+          plan (if apply?
+                 (health/apply-heal! (health/load-fleet nil) plan
+                                     {:only (get args "node") :ledger p :now now})
+                 plan)]
+      {:verdict (:verdict a) :score (:score a) :applied apply? :plan plan})
+    (catch :default e {:error (.-message e)})))
+
+(def ^:private tool-fns
+  {"murakumo.image_model_add" image-model/tool
+   "murakumo.issue_api_key" issue-tool
+   "murakumo.verify_api_key" verify-tool
+   "murakumo.bench_nodes" bench-nodes-tool
+   "murakumo.bench_run" bench-run-tool
+   "murakumo.bench_ledger" bench-ledger-tool
+   "murakumo.fleet_health" fleet-health-tool
+   "murakumo.fleet_slo" fleet-slo-tool
+   "murakumo.fleet_heal" fleet-heal-tool})
+
+(defrecord MurakumoTools []
+  ports/ITool
+  (invoke [_ tool-name args]
+    (if-let [f (get tool-fns tool-name)]
+      (f (or args {}))
+      {:error (str "tool not implemented: " tool-name)})))
+
+(defn tool-port [] (->MurakumoTools))
+
+(defn manifest []
+  (-> (m/server "murakumo" "0.1.0")
+      (m/add-tool "murakumo.image_model_add"
+                  {:description "Register a prepared compatible image model, verify two independent live GPU render proofs, and publish it to murakumo.cloud and oppai.fans through their shared catalog. apply=false returns a plan. Requires operator credentials in the server environment; weights must already be installed and qualified on two workers."
+                   :input-schema {:type "object" :properties
+                     {"manifest" {:type "object"} "apply" {:type "boolean"}
+                      "proof_jobs" {:type "array" :items {:type "string"}}}
+                     :required ["manifest"]}})
+      (m/add-tool "murakumo.issue_api_key"
+                  {:description
+                   (str "Issue a murakumo API key (mk1 capability token) for api.murakumo.cloud. "
+                        "Requires MURAKUMO_TOKEN_SECRET in this server's environment; refuses if unset. "
+                        "The key cannot be revoked — it can only expire — so prefer a short ttl and "
+                        "the narrowest scope that works. Returns the token once.")
+                   :input-schema
+                   {:type "object"
+                    :properties
+                    {"sub" {:type "string"
+                            :description "label for who/what this key is for (appears in the token claims, e.g. \"laptop\", \"ci\")"}
+                     "scope" {:type "string" :enum ["chat" "image" "all"]
+                              :description "what the key may reach; narrower is better"}
+                     "ttl_seconds" {:type "integer"
+                                    :description "lifetime in seconds (default 2592000 = 30d, maximum 7776000 = 90d)"}}}})
+      (m/add-tool "murakumo.verify_api_key"
+                  {:description
+                   (str "Decode and verify a murakumo API key against MURAKUMO_TOKEN_SECRET. "
+                        "Answers {valid, sub, scope, exp} — an invalid key is an answer, not an error. "
+                        "Use it to check whether a key is expired or was signed with a different secret.")
+                   :input-schema
+                   {:type "object"
+                    :properties {"token" {:type "string" :description "the mk1.… token to check"}}
+                    :required ["token"]}})
+      (m/add-tool "murakumo.bench_nodes"
+                  {:description
+                   (str "List the tailnet nodes a measurement can target: name, tailnet IP, "
+                        "online, OS. Reads `tailscale status --json`; MagicDNS names are not "
+                        "used because they did not resolve in this fleet.")
+                   :input-schema {:type "object" :properties {}}})
+      (m/add-tool "murakumo.bench_run"
+                  {:description
+                   (str "Measure inference speed on a node and append one row to the "
+                        "append-only bench ledger. engine=llama runs llama-bench on a GGUF "
+                        "(returns pp512/tg128); engine=diffuse runs diffuse-cli on a LLaDA/Dream "
+                        "block-diffusion GGUF (returns tok/s, tokens per denoising step, peak RSS, "
+                        "major faults). The row records argv, the binary, the model's byte count "
+                        "and sha256 prefix, and the host's threads/memory, so two runs can be "
+                        "compared later without re-deriving what was measured. Rows are never "
+                        "rewritten. This does NOT enrol the node or register the model.")
+                   :input-schema
+                   {:type "object"
+                    :properties
+                    {"node" {:type "string" :description "tailnet node name or IP"}
+                     "engine" {:type "string" :enum ["llama" "diffuse"]}
+                     "model" {:type "string" :description "model path ON THAT NODE"}
+                     "bin" {:type "string" :description "directory holding the runtime binary on that node"}
+                     "bin_name" {:type "string" :description "binary name if not the engine default"}
+                     "user" {:type "string" :description "ssh user (default root)"}
+                     "prompt" {:type "string" :description "diffuse only; identical prompts across runs are the point"}
+                     "n" {:type "integer" :description "tokens (diffuse, default 96) or tg128 length (llama, default 128)"}
+                     "p" {:type "integer" :description "llama prefill length (default 512)"}
+                     "r" {:type "integer" :description "llama repetitions (default 3)"}
+                     "t" {:type "integer" :description "threads (default: the node's core count)"}
+                     "steps" {:type "integer" :description "diffuse denoising steps per block (default 32)"}
+                     "temp" {:type "number" :description "diffuse sampling temperature (default 0 = argmax)"}
+                     "ngl" {:type "integer" :description "llama GPU layers (0 = CPU)"}
+                     "timeout_s" {:type "integer" :description "kill the remote run after this many seconds"}
+                     "record" {:type "boolean" :description "append to the ledger (default true)"}}
+                    :required ["node" "engine" "model"]}})
+      (m/add-tool "murakumo.bench_ledger"
+                  {:description
+                   (str "Read back the bench ledger: total rows, unparseable lines, and the most "
+                        "recent rows. Comparator for a new measurement; unparseable is reported "
+                        "rather than dropped, because a ledger that skips silently lies about "
+                        "its length.")
+                   :input-schema
+                   {:type "object"
+                    :properties {"limit" {:type "integer" :description "rows to return (default 20)"}}}})
+      (m/add-tool "murakumo.fleet_health"
+                  {:description
+                   (str "Check the whole murakumo fleet right now: ssh every node in fleet.edn in "
+                        "parallel (load per core, disk, ephemeral-port pressure, the mesh, and the "
+                        "resident mishima llama-server's own /health) plus the public gateway. "
+                        "Returns verdict healthy|degraded|critical, a 0-100 score, and findings per "
+                        "node. `canary: true` also sends one tiny completion through the gateway to "
+                        "measure tok/s against the ledger's median baseline; it spends real inference "
+                        "capacity, so it is opt-in. Appends one row to the append-only health ledger "
+                        "unless `record: false`. Read-only on the nodes.")
+                   :input-schema
+                   {:type "object"
+                    :properties
+                    {"nodes" {:type "string" :description "comma-separated node names, or \"all\" (default)"}
+                     "canary" {:type "boolean" :description "send one tiny completion through the gateway (default false)"}
+                     "record" {:type "boolean" :description "append to the health ledger (default true)"}
+                     "model" {:type "string" :description "canary model (default mishima)"}}}})
+      (m/add-tool "murakumo.fleet_slo"
+                  {:description
+                   (str "Stability over time, from the health ledger: per-node availability, nodes "
+                        "that FLAP (alternate ok/crit — a steady outage is not flapping), gateway "
+                        "availability, fleet score median/min and the canary tok/s baseline. Use it "
+                        "to judge whether the fleet is stable; one fleet_health call cannot.")
+                   :input-schema
+                   {:type "object"
+                    :properties {"window" {:type "integer" :description "most recent N checks (default 50)"}}}})
+      (m/add-tool "murakumo.fleet_heal"
+                  {:description
+                   (str "Re-check the fleet and plan self-healing. Default is plan only. With "
+                        "`apply: true` it runs ONLY a restart command that a node's own fleet.edn "
+                        "entry declares as :health/restart-cmd; it never guesses one, refuses inside "
+                        "a 30-minute per-node cooldown, and refuses when a third or more of the "
+                        "expected nodes are down together (a shared cause). Unreachable nodes, port "
+                        "exhaustion, load and disk come back as advice and are never acted on.")
+                   :input-schema
+                   {:type "object"
+                    :properties
+                    {"apply" {:type "boolean" :description "run the unblocked declared restarts (default false = plan only)"}
+                     "node" {:type "string" :description "with apply, restrict to this one node"}}}})))

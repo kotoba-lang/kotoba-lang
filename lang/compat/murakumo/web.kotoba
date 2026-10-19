@@ -1,0 +1,272 @@
+(ns murakumo.web
+  "Pure spec for the distributed web plane (ADR-260929): job kinds, URL policy,
+  crawl-plan bounds, the receipt shape and the bot permission decision.
+
+  Everything here is data in, data out. It performs no network I/O, so DNS
+  resolution is NOT covered: a worker must re-check the resolved address
+  against `private-address?` before connecting (SSRF via DNS rebinding).
+  Refusals are typed values, never empty results (fail closed)."
+  (:require [kotoba.lang.text :as text]
+            [murakumo.canonical :as canonical]))
+
+(def job-kinds #{:web/fetch :web/extract :web/crawl :web/search :web/index})
+
+(def max-fetch-bytes (* 5 1024 1024))
+
+(def extract-formats #{:markdown :edn :json-schema})
+
+;; --- URL policy -------------------------------------------------------------
+
+(defn- parse-int [s]
+  )
+
+(def ^:private url-re
+  ;; scheme://[userinfo@]host[:port][/...]  — host is a bracketed IPv6 literal
+  ;; or a run of non-delimiter characters.
+  #"^([a-zA-Z][a-zA-Z0-9+.-]*)://(?:([^/?#@]*)@)?(\[[0-9a-fA-F:.]+\]|[^/?#:@\[\]]*)(?::(\d*))?(?:[/?#].*)?$")
+
+(defn- ipv4
+  "Strict dotted quad. Leading-zero octets (0177 = octal to some resolvers) are
+  NOT parsed as decimal: they return nil so obfuscated-numeric-host? refuses them."
+  [host]
+  (when-let [m (re-matches #"(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})" host)]
+    (when (every? #(or (= % "0") (not (text/starts-with? % "0"))) (rest m))
+      (let [octets (mapv parse-int (rest m))]
+        (when (every? #(<= 0 % 255) octets) octets)))))
+
+(defn- public-ipv4? [[a b c]]
+  (not (or (= a 0) (= a 10) (= a 127)
+           (and (= a 100) (<= 64 b 127))                 ; CGNAT
+           (and (= a 169) (= b 254))                     ; link-local / metadata
+           (and (= a 172) (<= 16 b 31))
+           (and (= a 192) (= b 0) (#{0 2} c))            ; 192.0.0.0/24 IETF, 192.0.2.0/24 TEST-NET-1
+           (and (= a 192) (= b 168))
+           (and (= a 198) (<= 18 b 19))                  ; benchmarking
+           (and (= a 198) (= b 51) (= c 100))            ; TEST-NET-2
+           (and (= a 203) (= b 0) (= c 113))             ; TEST-NET-3
+           (>= a 224))))                                 ; multicast, reserved, broadcast
+
+(defn- hex-int [s] )
+
+(defn- parse-ipv6
+  "Bare or bracketed IPv6 text -> vector of 8 ints (0..65535), or nil if it is
+  not a well-formed IPv6 address. Handles `::` and a trailing dotted IPv4."
+  [host]
+  (let [h (-> (str host) (text/replace #"^\[|\]$" "") (text/replace #"%.*$" ""))
+        [_ head-str v4] (or (re-matches #"(.*:)(\d{1,3}(?:\.\d{1,3}){3})" h) [nil h nil])
+        v4-groups (when v4
+                    (when-let [o (ipv4 v4)]
+                      [(+ (* 256 (o 0)) (o 1)) (+ (* 256 (o 2)) (o 3))]))
+        h2 (if v4 (str head-str "0:0") h)]
+    (when (and (re-matches #"[0-9a-fA-F:]+" h2) (or (nil? v4) v4-groups)
+               (<= (count (re-seq #"::" h2)) 1))
+      (let [[l r] (let [i (.indexOf h2 "::")]
+                    (if (neg? i) [h2 nil] [(subs h2 0 i) (subs h2 (+ i 2))]))
+            grp (fn [x] (if (or (nil? x) (empty? x)) [] (text/split x #":")))
+            lg (grp l) rg (grp r)
+            groups (if r
+                     (let [fill (- 8 (count lg) (count rg))]
+                       (when (>= fill 1) (vec (concat lg (repeat fill "0") rg))))
+                     (vec lg))]
+        (when (and groups (= 8 (count groups)) (every? #(<= 1 (count %) 4) groups))
+          (let [ints (mapv hex-int groups)
+                ints (if v4-groups (vec (concat (subvec ints 0 6) v4-groups)) ints)]
+            ints))))))
+
+(defn- public-ipv6?
+  "Allow-list: only global unicast 2000::/3, minus documentation, Teredo, and
+  6to4 / IPv4-embedding forms whose embedded IPv4 is itself not public. Loopback,
+  unspecified, mapped, NAT64, ULA, link-local, multicast are all outside 2000::/3."
+  [g]
+  (let [[a b] g
+        v4-of (fn [hi lo] [(bit-shift-right hi 8) (bit-and hi 255) (bit-shift-right lo 8) (bit-and lo 255)])]
+    (and (<= 0x2000 a 0x3fff)
+         (not (and (= a 0x2001) (= b 0x0db8)))           ; 2001:db8::/32 documentation
+         (not (and (= a 0x2001) (= b 0)))                ; 2001::/32 Teredo
+         (or (not= a 0x2002) (public-ipv4? (v4-of b (g 2)))))))  ; 2002::/16 6to4
+
+(defn private-address?
+  "True for anything that is not a public unicast address, for IPv4 and IPv6 in
+  bare or bracketed form. Workers apply this to every RESOLVED address."
+  [host]
+  (let [h (str host)]
+    (if (or (text/includes? h ":") (text/starts-with? h "["))
+      (if-let [g (parse-ipv6 h)] (not (public-ipv6? g)) true)   ; unparsable -> refuse
+      (if-let [o (ipv4 h)] (not (public-ipv4? o)) false))))
+
+(defn- internal-name? [host]
+  (let [h (text/replace (.toLowerCase (str host)) #"\.+$" "")]
+    (boolean
+     (or (= h "localhost")
+         (re-find #"\.(localhost|local|internal|lan|home|corp|intranet|arpa)$" h)
+         (not (re-find #"\." h))))))
+
+(defn- obfuscated-numeric-host?
+  "Decimal (2130706433), hex (0x7f000001), octal-looking or short-dotted forms that
+  some resolvers read as an IPv4 address but the strict `ipv4` does not."
+  [host]
+  (boolean (and (not (ipv4 host))
+                (or (re-matches #"(0x[0-9a-fA-F]+|\d+)" host)
+                    (re-matches #"[0-9.x]+" (.toLowerCase host))))))
+
+(defn- bad-hostname?
+  "Hostnames that can never be valid and, if passed to a child process, could be
+  read as options (a leading '-')."
+  [host]
+  (or (text/starts-with? host "-")
+      (boolean (re-find #"[\s\u0000-\u001f\u007f]" host))
+      (boolean (re-find #"\.\." host))))
+
+(defn check-url
+  "Returns {:ok {:url :scheme :host :port}} or {:refused reason-keyword}."
+  [url]
+  (if-not (string? url)
+    {:refused :url/not-a-string}
+    (if-let [[_ scheme userinfo host port] (re-matches url-re url)]
+      (let [scheme (.toLowerCase scheme)]
+        (cond
+          (not (#{"http" "https"} scheme)) {:refused :url/scheme}
+          userinfo {:refused :url/userinfo}
+          (empty? host) {:refused :url/no-host}
+          (bad-hostname? host) {:refused :url/bad-host}
+          (obfuscated-numeric-host? host) {:refused :url/obfuscated-host}
+          (private-address? host) {:refused :url/private-address}
+          (and (not (ipv4 host)) (not (text/starts-with? host "["))
+               (internal-name? host)) {:refused :url/internal-name}
+          :else {:ok {:url url
+                      :scheme scheme
+                      :host (.toLowerCase host)
+                      :port (if (seq port)
+                              (parse-int port)
+                              (if (= scheme "https") 443 80))}}))
+      {:refused :url/malformed})))
+
+;; --- Crawl plan (what a bot may emit) ---------------------------------------
+
+(def plan-limits
+  "Hard ceilings. A bot cannot raise these; only the operator's config can."
+  {:max-pages 10000 :max-depth 8 :min-delay-ms 1000 :max-seeds 100})
+
+(defn validate-plan
+  "A crawl plan is {:seeds [url ...] :max-pages n :max-depth n :delay-ms n
+  :scope :same-host | :same-domain}. Returns {:ok plan} or {:refused [reason ...]}."
+  ([plan] (validate-plan plan plan-limits))
+  ([{:keys [seeds max-pages max-depth delay-ms scope] :as plan} limits]
+   (let [seed-checks (mapv check-url (if (sequential? seeds) seeds []))
+         reasons
+         (cond-> []
+           (not (and (sequential? seeds) (seq seeds))) (conj :plan/no-seeds)
+           (and (sequential? seeds) (> (count seeds) (:max-seeds limits))) (conj :plan/too-many-seeds)
+           (some :refused seed-checks) (into (keep :refused seed-checks))
+           (not (and (integer? max-pages) (<= 1 max-pages (:max-pages limits)))) (conj :plan/max-pages)
+           (not (and (integer? max-depth) (<= 0 max-depth (:max-depth limits)))) (conj :plan/max-depth)
+           (not (and (integer? delay-ms) (>= delay-ms (:min-delay-ms limits)))) (conj :plan/delay-below-floor)
+           (not (#{:same-host :same-domain} scope)) (conj :plan/scope))]
+     (if (empty? reasons)
+       {:ok plan}
+       {:refused (vec (distinct reasons))}))))
+
+;; --- Jobs -------------------------------------------------------------------
+
+(defn validate-job
+  "Returns {:ok job} or {:refused [reason ...]}."
+  [{:keys [kind] :as job}]
+  (let [reasons
+        (if-not (job-kinds kind)
+          [:job/unknown-kind]
+          (case kind
+            :web/fetch
+            (cond-> []
+              (:refused (check-url (:url job))) (conj (:refused (check-url (:url job))))
+              (and (contains? job :verify-replicas)
+                   (not (<= 1 (or (:verify-replicas job) 0) 3))) (conj :job/verify-replicas)
+              (and (contains? job :max-bytes)
+                   (not (and (integer? (:max-bytes job)) (<= 1 (:max-bytes job) max-fetch-bytes)))) (conj :job/max-bytes))
+
+            :web/extract
+            (cond-> []
+              (not (string? (:fetch-cid job))) (conj :job/fetch-cid)
+              (not (extract-formats (:format job))) (conj :job/format))
+
+            :web/crawl
+            (if-let [r (:refused (validate-plan (:plan job)))] r [])
+
+            :web/index
+            (cond-> []
+              (not (string? (:manifest-cid job))) (conj :job/manifest-cid)
+              (and (contains? job :shards)
+                   (not (and (integer? (:shards job)) (<= 1 (:shards job) 256)))) (conj :job/shards))
+
+            :web/search
+            (cond-> []
+              (not (and (string? (:query job)) (seq (:query job)))) (conj :job/query)
+              (not (and (integer? (:k job)) (<= 1 (:k job) 100))) (conj :job/k))))]
+    (if (empty? reasons)
+      {:ok job}
+      {:refused (vec reasons)})))
+
+;; --- Receipt ----------------------------------------------------------------
+
+(def receipt-keys
+  #{:job-id :kind :input-cids :output-cid :node-did :started-at :finished-at :evidence})
+
+(defn receipt
+  "Unsigned receipt. `evidence` for :web/fetch carries the observed
+  {:status :final-url :content-hash}; it attests what the node returned, not
+  that the origin served it honestly (ADR-260929, trust section)."
+  [{:keys [job-id kind input-cids output-cid node-did started-at finished-at evidence]}]
+  {:job-id job-id
+   :kind kind
+   :input-cids (vec (sort input-cids))
+   :output-cid output-cid
+   :node-did node-did
+   :started-at started-at
+   :finished-at finished-at
+   :evidence evidence})
+
+(defn receipt-signing-string
+  "The exact string a node signs: canonical EDN of the receipt."
+  [r]
+  (canonical/string (select-keys r receipt-keys)))
+
+(defn validate-receipt [r]
+  (let [reasons (cond-> []
+                  (not (job-kinds (:kind r))) (conj :receipt/kind)
+                  (not (string? (:output-cid r))) (conj :receipt/output-cid)
+                  (not (string? (:node-did r))) (conj :receipt/node-did)
+                  (not (string? (:job-id r))) (conj :receipt/job-id)
+                  (not (and (integer? (:started-at r)) (integer? (:finished-at r))
+                            (<= (:started-at r) (:finished-at r)))) (conj :receipt/times))]
+    (if (empty? reasons) {:ok r} {:refused reasons})))
+
+;; --- Dual-zone fetch comparison --------------------------------------------
+
+(defn compare-replicas
+  "Given receipts from independent nodes for one :web/fetch, report agreement.
+  Disagreement is returned as data, never silently resolved."
+  [receipts]
+  (let [hashes (mapv #(get-in % [:evidence :content-hash]) receipts)]
+    (cond
+      (< (count receipts) 2) {:status :insufficient-replicas}
+      (some nil? hashes) {:status :unmeasured}
+      (apply = hashes) {:status :agree :content-hash (first hashes)}
+      :else {:status :disagree
+             :by-node (into (sorted-map)
+                            (map (juxt :node-did #(get-in % [:evidence :content-hash])))
+                            receipts)})))
+
+;; --- Bot permission decision ------------------------------------------------
+
+(defn decide
+  "Decision for a bot capability against a yakuwari table. Unlisted, or any
+  value other than autonomous/approval-required (or their legacy web aliases),
+  is :blocked. Preserve the old web decision result vocabulary for callers."
+  [table capability]
+  (let [d (some (fn [row] (when (= capability (:capability row)) (:decision row)))
+                (:yakuwari/capabilities table))]
+    (case d
+      :autonomous :ok
+      :approval-required :owner-approval
+      :ok :ok
+      :owner-approval :owner-approval
+      :blocked)))

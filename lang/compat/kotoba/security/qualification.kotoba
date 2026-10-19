@@ -1,0 +1,402 @@
+(ns kotoba.security.qualification
+  "Evidence gates for production cryptography and resilience qualifications.
+
+  Receipts are accepted only when bound to an expected environment, authority,
+  immutable artifact digest and verifier-supplied signature check."
+  {:kotoba/export [required-boundaries verify-detection-containment-e4 verify-governance-e4 verify-hardware-e4 verify-hsm-deployment verify-pqc-deployment verify-pqc-e4 verify-recovery-e4 verify-resilience-deployment verify-runtime-resilience-e4 verify-signed-receipt verify-supply-chain-e4 verify-transport-e4]}
+  (:require [kotoba.lang.coll :as set]
+            [kotoba.security.abac :as abac]
+            [kotoba.security.approval :as approval]
+            [kotoba.security.capability :as capability]
+            [kotoba.security.crypto-policy :as crypto]
+            [kotoba.security.detection :as detection]
+            [kotoba.security.evidence-plane :as evidence-plane]
+            [kotoba.security.hardware :as hardware]
+            [kotoba.security.resilience :as resilience]
+            [kotoba.security.release-gate :as release-gate]
+            [kotoba.security.runtime-resilience :as runtime-resilience]
+            [kotoba.security.supply-chain :as supply-chain]
+            [kotoba.security.transport :as transport]))
+
+(def required-boundaries
+  #{:package-admission :compiler-artifact :deployment :transport :secret-store})
+
+(defn- fail [violations]
+  {:qualification/accepted? false :qualification/violations (vec violations)})
+
+(defn verify-signed-receipt
+  [receipt {:keys [environment authority-id now-ms max-age-ms verify-signature-fn]}]
+  (let [violations
+        (cond-> []
+          (not= 1 (:receipt/version receipt)) (conj :receipt-version)
+          (not= environment (:receipt/environment receipt)) (conj :environment)
+          (not= authority-id (:receipt/authority-id receipt)) (conj :authority)
+          (not (string? (:receipt/artifact-digest receipt))) (conj :artifact-digest)
+          (not (integer? (:receipt/issued-at-ms receipt))) (conj :issued-at)
+          (or (not (integer? (:receipt/issued-at-ms receipt)))
+              (> (- now-ms (:receipt/issued-at-ms receipt 0)) max-age-ms)
+              (> (:receipt/issued-at-ms receipt 0) now-ms)) (conj :freshness)
+          (not (ifn? verify-signature-fn)) (conj :signature-verifier)
+          (and (ifn? verify-signature-fn)
+               (not (true? (verify-signature-fn
+                            (dissoc receipt :receipt/signature)
+                            (:receipt/signature receipt))))) (conj :signature))]
+    (if (seq violations) (fail violations)
+        {:qualification/accepted? true
+         :qualification/artifact-digest (:receipt/artifact-digest receipt)})))
+
+(defn verify-pqc-deployment
+  [{:keys [boundaries current-envelope next-envelope downgrade-rejected?
+           rollback-rejected? rotation-receipt]} policy receipt-context]
+  (let [boundary-set (set boundaries)
+        current-check (crypto/check-envelope policy current-envelope)
+        rotation-check (crypto/rotate-envelope policy current-envelope next-envelope)
+        receipt-check (verify-signed-receipt rotation-receipt receipt-context)
+        violations (cond-> []
+                     (not (set/subset? required-boundaries boundary-set))
+                     (conj :production-boundaries)
+                     (not (:valid? current-check)) (conj :current-envelope)
+                     (not (:valid? rotation-check)) (conj :rotation)
+                     (not= true downgrade-rejected?) (conj :downgrade)
+                     (not= true rollback-rejected?) (conj :rollback)
+                     (not (:qualification/accepted? receipt-check))
+                     (conj :rotation-receipt))]
+    (if (seq violations) (fail violations)
+        {:qualification/accepted? true
+         :qualification/control :pqc
+         :qualification/boundaries boundary-set
+         :qualification/current-epoch (:envelope/epoch next-envelope)})))
+
+(defn verify-hsm-deployment
+  [{:keys [hardware-evidence outage-receipt]} receipt-context]
+  (let [hardware-check (hardware/evaluate hardware-evidence)
+        receipt-check (verify-signed-receipt outage-receipt receipt-context)
+        violations (cond-> []
+                     (not (:hardware/qualified? hardware-check))
+                     (into (:hardware/violations hardware-check))
+                     (not (:qualification/accepted? receipt-check))
+                     (conj :outage-receipt))]
+    (if (seq violations) (fail violations)
+        {:qualification/accepted? true
+         :qualification/control :hsm
+         :qualification/provider-id (:hardware/provider-id hardware-check)})))
+
+(defn verify-resilience-deployment
+  [{:keys [telemetry-remote? telemetry-immutable? containment-live?
+           backup-regions restore-destructive? restore-digest-verified?
+           rto-ms rpo-ms rto-limit-ms rpo-limit-ms operation-receipt]}
+   receipt-context]
+  (let [regions (set backup-regions)
+        receipt-check (verify-signed-receipt operation-receipt receipt-context)
+        violations (cond-> []
+                     (not= true telemetry-remote?) (conj :remote-telemetry)
+                     (not= true telemetry-immutable?) (conj :immutable-telemetry)
+                     (not= true containment-live?) (conj :live-containment)
+                     (< (count regions) 2) (conj :independent-regions)
+                     (not= true restore-destructive?) (conj :destructive-restore)
+                     (not= true restore-digest-verified?) (conj :restore-digest)
+                     (or (not (number? rto-ms)) (> rto-ms rto-limit-ms))
+                     (conj :rto)
+                     (or (not (number? rpo-ms)) (> rpo-ms rpo-limit-ms))
+                     (conj :rpo)
+                     (not (:qualification/accepted? receipt-check))
+                     (conj :operation-receipt))]
+    (if (seq violations) (fail violations)
+        {:qualification/accepted? true
+         :qualification/control :resilience
+         :qualification/regions regions
+         :qualification/rto-ms rto-ms
+         :qualification/rpo-ms rpo-ms})))
+
+(defn verify-hardware-e4
+  "Combine provider semantics with the shared production evidence plane."
+  [{:keys [hardware-evidence evidence-log]} evidence-context]
+  (let [hardware-check (hardware/evaluate hardware-evidence)
+        evidence-check (evidence-plane/verify-log
+                        evidence-log (assoc evidence-context :control :hsm))
+        violations (cond-> []
+                     (not (:hardware/qualified? hardware-check))
+                     (into (:hardware/violations hardware-check))
+                     (not (:evidence/accepted? evidence-check))
+                     (conj :production-evidence))]
+    (if (seq violations) (fail violations)
+        {:qualification/accepted? true
+         :qualification/control :hsm
+         :qualification/evidence-level :E4
+         :qualification/provider-id (:hardware/provider-id hardware-check)
+         :qualification/evidence-head (:evidence/head-digest evidence-check)})))
+
+(defn verify-pqc-e4
+  "Combine deployed-provider, boundary, rotation, and E4 evidence checks."
+  [{:keys [provider-evidence boundaries current-envelope next-envelope
+           downgrade-rejected? rollback-rejected? rotation-drill-passed?
+           evidence-log]}
+   policy
+   {:keys [artifact-digest] :as evidence-context}]
+  (let [provider-check (crypto/evaluate-pq-provider
+                        provider-evidence artifact-digest)
+        provider-id (:pq-provider/id provider-check)
+        boundary-set (set boundaries)
+        current-check (crypto/check-production-envelope policy current-envelope)
+        next-check (crypto/check-production-envelope policy next-envelope)
+        rotation-check (crypto/rotate-envelope policy current-envelope next-envelope)
+        provider-bound? (and (= provider-id
+                                (get-in current-envelope
+                                        [:envelope/provider :provider/id]))
+                             (= provider-id
+                                (get-in next-envelope
+                                        [:envelope/provider :provider/id]))
+                             (= artifact-digest
+                                (get-in current-envelope
+                                        [:envelope/provider :provider/module-digest]))
+                             (= artifact-digest
+                                (get-in next-envelope
+                                        [:envelope/provider :provider/module-digest])))
+        evidence-check (evidence-plane/verify-log
+                        evidence-log (assoc evidence-context :control :pqc))
+        violations
+        (cond-> []
+          (not (:pq-provider/qualified? provider-check))
+          (into (:pq-provider/violations provider-check))
+          (not provider-bound?) (conj :provider-substitution)
+          (not (set/subset? required-boundaries boundary-set))
+          (conj :production-boundaries)
+          (not (:valid? current-check)) (conj :current-envelope)
+          (not (:valid? next-check)) (conj :next-envelope)
+          (not (:valid? rotation-check)) (conj :rotation)
+          (not= true downgrade-rejected?) (conj :downgrade)
+          (not= true rollback-rejected?) (conj :rollback)
+          (not= true rotation-drill-passed?) (conj :rotation-drill)
+          (not (:evidence/accepted? evidence-check))
+          (conj :production-evidence))]
+    (if (seq violations) (fail violations)
+        {:qualification/accepted? true
+         :qualification/control :pqc
+         :qualification/evidence-level :E4
+         :qualification/provider-id provider-id
+         :qualification/module-digest artifact-digest
+         :qualification/boundaries boundary-set
+         :qualification/current-epoch (:envelope/epoch next-envelope)
+         :qualification/evidence-head (:evidence/head-digest evidence-check)})))
+
+(defn verify-recovery-e4
+  "Combine destructive restore, threshold custody, and production evidence."
+  [{:keys [restore-receipt threshold-recovery evidence-log]}
+   {:keys [artifact-digest] :as evidence-context}]
+  (let [restore-check (resilience/evaluate-restore-receipt
+                       restore-receipt artifact-digest)
+        threshold-check (resilience/evaluate-threshold-recovery
+                         threshold-recovery)
+        evidence-check (evidence-plane/verify-log
+                        evidence-log
+                        (assoc evidence-context :control :unrecoverable-loss))
+        violations (cond-> []
+                     (not (:restore-drill/qualified? restore-check))
+                     (into (:restore-drill/violations restore-check))
+                     (not (:threshold-recovery/qualified? threshold-check))
+                     (into (:threshold-recovery/violations threshold-check))
+                     (not (:evidence/accepted? evidence-check))
+                     (conj :production-evidence))]
+    (if (seq violations) (fail violations)
+        {:qualification/accepted? true
+         :qualification/control :unrecoverable-loss
+         :qualification/evidence-level :E4
+         :qualification/regions
+         (set/set-union (:restore-drill/sites restore-check)
+                    (:threshold-recovery/regions threshold-check))
+         :qualification/threshold (:threshold-recovery/threshold threshold-check)
+         :qualification/rto-ms (:restore-drill/rto-ms restore-check)
+         :qualification/rpo-ms (:restore-drill/rpo-ms restore-check)
+         :qualification/evidence-head (:evidence/head-digest evidence-check)})))
+
+(defn verify-transport-e4
+  "Combine mTLS, workload identity, CA custody, rotation, and E4 evidence."
+  [{:keys [transport-profile workload-identity ca-custody rotation-receipt
+           evidence-log]}
+   evidence-context]
+  (let [transport-check (transport/evaluate transport-profile)
+        identity-check (transport/evaluate-workload-identity workload-identity)
+        ca-check (transport/evaluate-ca-custody ca-custody)
+        rotation-check (transport/evaluate-rotation-receipt
+                        rotation-receipt
+                        (:transport/certificate-fingerprint transport-check))
+        evidence-check (evidence-plane/verify-log
+                        evidence-log
+                        (assoc evidence-context
+                               :control :transport-confidentiality-integrity))
+        violations
+        (cond-> []
+          (not (:transport/allowed? transport-check))
+          (into (map :transport/control (:transport/violations transport-check)))
+          (not (:workload-identity/qualified? identity-check))
+          (into (:workload-identity/violations identity-check))
+          (not (:ca-custody/qualified? ca-check))
+          (into (:ca-custody/violations ca-check))
+          (not (:rotation-drill/qualified? rotation-check))
+          (into (:rotation-drill/violations rotation-check))
+          (not (:evidence/accepted? evidence-check))
+          (conj :production-evidence))]
+    (if (seq violations) (fail violations)
+        {:qualification/accepted? true
+         :qualification/control :transport-confidentiality-integrity
+         :qualification/evidence-level :E4
+         :qualification/peer-id (:transport/peer-id transport-check)
+         :qualification/workload-id (:workload-identity/id identity-check)
+         :qualification/ca-id (:ca-custody/ca-id ca-check)
+         :qualification/evidence-head (:evidence/head-digest evidence-check)})))
+
+(defn verify-governance-e4
+  "Compose operation capability, four-axis ABAC, independent approvals,
+  break-glass post-review, and production evidence."
+  [{:keys [capability-token attributes abac-policy approvals
+           break-glass-receipt evidence-log]}
+   {:keys [capability-context approval-context break-glass-context
+           evidence-context]}]
+  (let [capability-check (capability/evaluate capability-token capability-context)
+        abac-check (abac/evaluate attributes abac-policy)
+        approval-check (approval/evaluate approvals approval-context)
+        break-glass-check (approval/evaluate-break-glass
+                           break-glass-receipt break-glass-context)
+        evidence-check (evidence-plane/verify-log
+                        evidence-log
+                        (assoc evidence-context
+                               :control :authorized-process-abuse))
+        violations
+        (cond-> []
+          (not (:capability/allowed? capability-check))
+          (into (:capability/violations capability-check))
+          (not (:abac/allowed? abac-check))
+          (into (map :abac/control (:abac/violations abac-check)))
+          (not (:approval/allowed? approval-check))
+          (into (:approval/violations approval-check))
+          (not (:break-glass/qualified? break-glass-check))
+          (into (:break-glass/violations break-glass-check))
+          (not (:evidence/accepted? evidence-check))
+          (conj :production-evidence))]
+    (if (seq violations) (fail violations)
+        {:qualification/accepted? true
+         :qualification/control :authorized-process-abuse
+         :qualification/evidence-level :E4
+         :qualification/subject (:capability/subject capability-check)
+         :qualification/action (:capability/action capability-check)
+         :qualification/resource (:capability/resource capability-check)
+         :qualification/approvers (:approval/approvers approval-check)
+         :qualification/break-glass-reviewer
+         (:break-glass/reviewer break-glass-check)
+         :qualification/evidence-head (:evidence/head-digest evidence-check)})))
+
+(defn verify-supply-chain-e4
+  "Compose regulated release, reproducibility, signed attestations,
+  two-party promotion, and production evidence."
+  [{:keys [release-input reproducibility attestations promotion-approvals
+           evidence-log]}
+   {:keys [attestation-context promotion-context evidence-context]}]
+  (let [release-check (release-gate/evaluate-release
+                       (assoc release-input :profile :regulated))
+        reproducibility-check
+        (supply-chain/evaluate-reproducibility reproducibility)
+        artifact-digest (:reproducibility/artifact-digest reproducibility-check)
+        source-commit (:reproducibility/source-commit reproducibility-check)
+        attestation-check
+        (supply-chain/evaluate-attestations
+         attestations (assoc attestation-context
+                             :artifact-digest artifact-digest
+                             :source-commit source-commit))
+        promotion-check (approval/evaluate promotion-approvals promotion-context)
+        evidence-check (evidence-plane/verify-log
+                        evidence-log
+                        (assoc evidence-context :artifact-digest artifact-digest
+                               :control :software-tamper))
+        violations
+        (cond-> []
+          (not (:kotoba.release/ok? release-check)) (conj :regulated-release)
+          (not (:reproducibility/qualified? reproducibility-check))
+          (into (:reproducibility/violations reproducibility-check))
+          (not (:attestation/qualified? attestation-check))
+          (into (:attestation/violations attestation-check))
+          (not (:approval/allowed? promotion-check))
+          (into (:approval/violations promotion-check))
+          (not= artifact-digest (:request-digest promotion-context))
+          (conj :promotion-artifact-binding)
+          (not (:evidence/accepted? evidence-check))
+          (conj :production-evidence))]
+    (if (seq violations) (fail violations)
+        {:qualification/accepted? true
+         :qualification/control :software-tamper
+         :qualification/evidence-level :E4
+         :qualification/artifact-digest artifact-digest
+         :qualification/source-commit source-commit
+         :qualification/promoters (:approval/approvers promotion-check)
+         :qualification/evidence-head (:evidence/head-digest evidence-check)})))
+
+(defn verify-runtime-resilience-e4
+  "Compose resource limits, verification campaigns, chaos/load drills, and
+  separate production evidence for memory-corruption and DoS controls."
+  [{:keys [runtime-profile runtime-policy verification
+           memory-evidence-log dos-evidence-log]}
+   {:keys [memory-evidence-context dos-evidence-context]}]
+  (let [limits-check (runtime-resilience/evaluate-limits
+                      runtime-profile runtime-policy)
+        verification-check (runtime-resilience/evaluate-verification verification)
+        memory-check (evidence-plane/verify-log
+                      memory-evidence-log
+                      (assoc memory-evidence-context :control :memory-corruption))
+        dos-check (evidence-plane/verify-log
+                   dos-evidence-log (assoc dos-evidence-context :control :dos))
+        violations
+        (cond-> []
+          (not (:runtime-limits/qualified? limits-check))
+          (into (:runtime-limits/violations limits-check))
+          (not (:runtime-verification/qualified? verification-check))
+          (into (:runtime-verification/violations verification-check))
+          (not (:evidence/accepted? memory-check))
+          (conj :memory-production-evidence)
+          (not (:evidence/accepted? dos-check))
+          (conj :dos-production-evidence))]
+    (if (seq violations) (fail violations)
+        {:qualification/accepted? true
+         :qualification/controls #{:memory-corruption :dos}
+         :qualification/evidence-level :E4
+         :qualification/memory-evidence-head (:evidence/head-digest memory-check)
+         :qualification/dos-evidence-head (:evidence/head-digest dos-check)})))
+
+(defn verify-detection-containment-e4
+  "Compose live monitoring, human paging, automated containment, known-clean
+  restore, independent retest, and production evidence."
+  [{:keys [monitoring pager containment restore-receipt red-team-receipt
+           evidence-log]}
+   {:keys [artifact-digest red-team-context evidence-context]}]
+  (let [monitoring-check (detection/evaluate-monitoring monitoring)
+        pager-check (detection/evaluate-pager pager)
+        containment-check (detection/evaluate-containment
+                           (assoc containment
+                                  :expected-artifact-digest artifact-digest))
+        restore-check (resilience/evaluate-restore-receipt
+                       restore-receipt artifact-digest)
+        red-team-check (detection/evaluate-red-team
+                        red-team-receipt red-team-context)
+        evidence-check (evidence-plane/verify-log
+                        evidence-log
+                        (assoc evidence-context :artifact-digest artifact-digest
+                               :control :unknown-compromise))
+        violations
+        (cond-> []
+          (not (:monitoring/qualified? monitoring-check))
+          (into (:monitoring/violations monitoring-check))
+          (not (:pager/qualified? pager-check))
+          (into (:pager/violations pager-check))
+          (not (:containment/qualified? containment-check))
+          (into (:containment/violations containment-check))
+          (not (:restore-drill/qualified? restore-check))
+          (into (:restore-drill/violations restore-check))
+          (not (:red-team/qualified? red-team-check))
+          (into (:red-team/violations red-team-check))
+          (not (:evidence/accepted? evidence-check))
+          (conj :production-evidence))]
+    (if (seq violations) (fail violations)
+        {:qualification/accepted? true
+         :qualification/control :unknown-compromise
+         :qualification/evidence-level :E4
+         :qualification/rto-ms (:restore-drill/rto-ms restore-check)
+         :qualification/rpo-ms (:restore-drill/rpo-ms restore-check)
+         :qualification/evidence-head (:evidence/head-digest evidence-check)})))

@@ -1,0 +1,273 @@
+(ns kotoba.http.form-urlencoded
+  "application/x-www-form-urlencoded, byte for byte what java.net.URLEncoder /
+  URLDecoder answer with UTF-8 -- so a `.cljk` source can drop the java.net
+  classes without changing one output string (JDK 21 was the oracle).
+
+    (form-encode \"a b&c=ü\")   ;=> \"a+b%26c%3D%C3%BC\"
+    (form-decode \"a+b%26c\")   ;=> \"a b&c\"
+
+  form-encode  == (URLEncoder/encode s StandardCharsets/UTF_8)
+    [A-Za-z0-9.-*_] stay, a space becomes `+`, every other UTF-16 code unit
+    run is UTF-8 encoded and written %XX (uppercase hex). A valid surrogate
+    pair is one code point (4 bytes); a LONE surrogate becomes `?` (%3F), as
+    String.getBytes(UTF_8) replaces it.
+
+  form-decode  == (URLDecoder/decode s StandardCharsets/UTF_8)
+    `+` becomes a space; each run of consecutive %xy escapes is collected into
+    bytes and decoded as UTF-8 with the JDK's replacement rules (a port of
+    java.lang.String#decodeUTF8_UTF16 with doReplace: how many bytes one
+    U+FFFD swallows is the JDK's answer, not the Unicode 'maximal subpart'
+    one -- ED A0 80, an encoded surrogate, is ONE U+FFFD). Every other
+    character, a lone surrogate included, is copied through.
+    The two hex characters are read by Integer.parseInt(s, i+1, i+3, 16), so
+    what the JDK accepts is accepted here too: a leading `+` (`%+F` is 0x0F),
+    `-0` (`%-0` is 0x00), and the non-ASCII digits Character.digit takes
+    (the 36 Unicode Nd blocks of the BMP and the fullwidth A-F / a-f; table
+    generated from JDK 21).
+    Where the JDK throws IllegalArgumentException this throws ex-info with
+    the JDK's message and {:kotoba.http.form-urlencoded/error <kw>}:
+      :illegal-hex        a character that is not a hex digit (`%4g`, `%++`)
+      :negative-value     `%-1` .. `%-F`
+      :incomplete-escape  a `%` with fewer than two characters after it
+
+  Either function throws ex-info {::error :not-a-string} for a non-string
+  (the JDK throws NullPointerException for nil)."
+  )
+
+(defn- not-a-string! [f x]
+  (throw (ex-info (str f ": not a string: " (pr-str x))
+                  {::error :not-a-string :value x})))
+
+(defn- unit
+  "The UTF-16 code unit at i."
+  [s i]
+  )
+
+(defn- units->str [units]
+  (apply str (map char units)))
+
+;; ---------------------------------------------------------------------------
+;; encode
+;; ---------------------------------------------------------------------------
+
+(def ^:private hex-upper "0123456789ABCDEF")
+
+(defn- safe-unit?
+  "URLEncoder's DONT_NEED_ENCODING minus the space: a-z A-Z 0-9 - _ . *"
+  [c]
+  (or (<= 97 c 122) (<= 65 c 90) (<= 48 c 57)
+      (== c 45) (== c 95) (== c 46) (== c 42)))
+
+(defn- pct [out b]
+  (conj! out (str "%" (nth hex-upper (bit-shift-right b 4)) (nth hex-upper (bit-and b 15)))))
+
+(defn- pct-utf8 [out cp]
+  (cond
+    (< cp 0x80) (pct out cp)
+    (< cp 0x800) (-> out
+                     (pct (bit-or 0xC0 (bit-shift-right cp 6)))
+                     (pct (bit-or 0x80 (bit-and cp 0x3F))))
+    (< cp 0x10000) (-> out
+                       (pct (bit-or 0xE0 (bit-shift-right cp 12)))
+                       (pct (bit-or 0x80 (bit-and (bit-shift-right cp 6) 0x3F)))
+                       (pct (bit-or 0x80 (bit-and cp 0x3F))))
+    :else (-> out
+              (pct (bit-or 0xF0 (bit-shift-right cp 18)))
+              (pct (bit-or 0x80 (bit-and (bit-shift-right cp 12) 0x3F)))
+              (pct (bit-or 0x80 (bit-and (bit-shift-right cp 6) 0x3F)))
+              (pct (bit-or 0x80 (bit-and cp 0x3F))))))
+
+(defn- high? [c] (<= 0xD800 c 0xDBFF))
+(defn- low? [c] (<= 0xDC00 c 0xDFFF))
+
+(defn form-encode
+  "`s` as application/x-www-form-urlencoded UTF-8 -- the string
+  (java.net.URLEncoder/encode s \"UTF-8\") gives. See the namespace doc."
+  [s]
+  (when-not (string? s) (not-a-string! "form-encode" s))
+  (let [n (count s)]
+    (loop [i 0 out (transient [])]
+      (if (>= i n)
+        (apply str (persistent! out))
+        (let [c (unit s i)]
+          (cond
+            (safe-unit? c) (recur (inc i) (conj! out (char c)))
+            (== c 32) (recur (inc i) (conj! out "+"))
+            (and (high? c) (< (inc i) n) (low? (unit s (inc i))))
+            (let [d (unit s (inc i))
+                  cp (+ 0x10000 (bit-shift-left (- c 0xD800) 10) (- d 0xDC00))]
+              (recur (+ i 2) (pct-utf8 out cp)))
+            ;; a lone surrogate: String.getBytes(UTF_8) writes '?'
+            (or (high? c) (low? c)) (recur (inc i) (pct out 0x3F))
+            :else (recur (inc i) (pct-utf8 out c))))))))
+
+;; ---------------------------------------------------------------------------
+;; decode: UTF-8 bytes -> UTF-16 code units, java.lang.String#decodeUTF8_UTF16
+;; with doReplace = true. Bytes are ints 0..255.
+;; ---------------------------------------------------------------------------
+
+(def ^:private repl 0xFFFD)
+
+(defn- not-cont? [b] (not= 0x80 (bit-and b 0xC0)))
+
+(defn- malformed3? [b1 b2 b3]
+  (or (and (== b1 0xE0) (== 0x80 (bit-and b2 0xE0))) (not-cont? b2) (not-cont? b3)))
+
+(defn- malformed3-2? [b1 b2]
+  (or (and (== b1 0xE0) (== 0x80 (bit-and b2 0xE0))) (not-cont? b2)))
+
+(defn- malformed4? [b2 b3 b4] (or (not-cont? b2) (not-cont? b3) (not-cont? b4)))
+
+(defn- malformed4-2? [b1 b2]
+  (or (and (== b1 0xF0) (or (< b2 0x90) (> b2 0xBF)))
+      (and (== b1 0xF4) (not= 0x80 (bit-and b2 0xF0)))
+      (not-cont? b2)))
+
+(defn- malformed3-len [b1 b2]
+  (if (or (and (== b1 0xE0) (== 0x80 (bit-and b2 0xE0))) (not-cont? b2)) 1 2))
+
+(defn- malformed4-len [b1 b2 b3]
+  (cond
+    (or (> b1 0xF4)
+        (and (== b1 0xF0) (or (< b2 0x90) (> b2 0xBF)))
+        (and (== b1 0xF4) (not= 0x80 (bit-and b2 0xF0)))
+        (not-cont? b2)) 1
+    (not-cont? b3) 2
+    :else 3))
+
+(defn- utf8->units
+  "Append to transient `out` the UTF-16 code units the JDK decodes `bs` to."
+  [out bs]
+  (let [sl (count bs)
+        b (fn [k] (nth bs k))]
+    (loop [sp 0 out out]
+      (if (>= sp sl)
+        out
+        (let [b1 (b sp) sp (inc sp)]
+          (cond
+            (< b1 0x80) (recur sp (conj! out b1))
+
+            (and (== 0xC0 (bit-and b1 0xE0)) (not= 0 (bit-and b1 0x1E)))
+            (if (< sp sl)
+              (let [b2 (b sp)]
+                (if (not-cont? b2)
+                  (recur sp (conj! out repl))
+                  (recur (inc sp) (conj! out (bit-or (bit-shift-left (bit-and b1 0x1F) 6)
+                                                     (bit-and b2 0x3F))))))
+              (conj! out repl))
+
+            (== 0xE0 (bit-and b1 0xF0))
+            (cond
+              (< (inc sp) sl)
+              (let [b2 (b sp) b3 (b (inc sp))]
+                (if (malformed3? b1 b2 b3)
+                  (recur (+ (dec sp) (malformed3-len b1 b2)) (conj! out repl))
+                  (let [c (bit-or (bit-shift-left (bit-and b1 0x0F) 12)
+                                  (bit-shift-left (bit-and b2 0x3F) 6)
+                                  (bit-and b3 0x3F))]
+                    (recur (+ sp 2) (conj! out (if (<= 0xD800 c 0xDFFF) repl c))))))
+              (and (< sp sl) (malformed3-2? b1 (b sp))) (recur sp (conj! out repl))
+              :else (conj! out repl))
+
+            (== 0xF0 (bit-and b1 0xF8))
+            (if (< (+ sp 2) sl)
+              (let [b2 (b sp) b3 (b (inc sp)) b4 (b (+ sp 2))
+                    uc (bit-or (bit-shift-left (bit-and b1 0x07) 18)
+                               (bit-shift-left (bit-and b2 0x3F) 12)
+                               (bit-shift-left (bit-and b3 0x3F) 6)
+                               (bit-and b4 0x3F))]
+                (if (or (malformed4? b2 b3 b4) (not (<= 0x10000 uc 0x10FFFF)))
+                  (recur (+ (dec sp) (malformed4-len b1 b2 b3)) (conj! out repl))
+                  (let [u (- uc 0x10000)]
+                    (recur (+ sp 3) (-> out
+                                        (conj! (+ 0xD800 (bit-shift-right u 10)))
+                                        (conj! (+ 0xDC00 (bit-and u 0x3FF))))))))
+              (cond
+                (or (> b1 0xF4) (and (< sp sl) (malformed4-2? b1 (b sp))))
+                (recur sp (conj! out repl))
+                :else
+                (let [sp (inc sp) out (conj! out repl)]
+                  (if (and (< sp sl) (not-cont? (b sp)))
+                    (recur sp out)
+                    out))))
+
+            :else (recur sp (conj! out repl))))))))
+
+;; ---------------------------------------------------------------------------
+;; decode: the %xy reader -- Integer.parseInt(s, i+1, i+3, 16)
+;; ---------------------------------------------------------------------------
+
+(def ^:private digit-runs
+  "[first-char first-value length]: every BMP char >= 128 that
+  Character.digit(c, 16) answers for on JDK 21 (372 chars, 38 runs)."
+  [[0x0660 0 10] [0x06F0 0 10] [0x07C0 0 10] [0x0966 0 10] [0x09E6 0 10]
+   [0x0A66 0 10] [0x0AE6 0 10] [0x0B66 0 10] [0x0BE6 0 10] [0x0C66 0 10]
+   [0x0CE6 0 10] [0x0D66 0 10] [0x0DE6 0 10] [0x0E50 0 10] [0x0ED0 0 10]
+   [0x0F20 0 10] [0x1040 0 10] [0x1090 0 10] [0x17E0 0 10] [0x1810 0 10]
+   [0x1946 0 10] [0x19D0 0 10] [0x1A80 0 10] [0x1A90 0 10] [0x1B50 0 10]
+   [0x1BB0 0 10] [0x1C40 0 10] [0x1C50 0 10] [0xA620 0 10] [0xA8D0 0 10]
+   [0xA900 0 10] [0xA9D0 0 10] [0xA9F0 0 10] [0xAA50 0 10] [0xABF0 0 10]
+   [0xFF10 0 10] [0xFF21 10 6] [0xFF41 10 6]])
+
+(defn- hex-digit
+  "Character.digit(c, 16), or -1."
+  [c]
+  (cond
+    (<= 48 c 57) (- c 48)
+    (<= 97 c 102) (- c 87)
+    (<= 65 c 70) (- c 55)
+    (< c 128) -1
+    :else (or (some (fn [[f v len]] (when (and (<= f c) (< c (+ f len))) (+ v (- c f)))) digit-runs)
+              -1)))
+
+(defn- illegal-arg! [kind msg]
+  (throw (ex-info msg {::error kind})))
+
+(defn- nfe-message [s b e err]
+  (str "URLDecoder: Illegal hex characters in escape (%) pattern - Error at index "
+       (- err b) " in: \"" (subs s b e) "\""))
+
+(defn- parse-escape
+  "Integer.parseInt(s, b, b+2, 16) for the two characters after a `%`."
+  [s b]
+  (let [e (+ b 2)
+        c0 (unit s b)
+        [negative? i] (if (< c0 48)
+                   (cond (== c0 45) [true (inc b)]
+                         (== c0 43) [false (inc b)]
+                         :else (illegal-arg! :illegal-hex (nfe-message s b e b)))
+                   [false b])
+        v (loop [i i acc 0]
+            (if (>= i e)
+              acc
+              (let [d (hex-digit (unit s i))]
+                (if (neg? d)
+                  (illegal-arg! :illegal-hex (nfe-message s b e i))
+                  (recur (inc i) (+ (* acc 16) d))))))]
+    (if negative? (- v) v)))
+
+(defn form-decode
+  "The string (java.net.URLDecoder/decode s \"UTF-8\") gives, or ex-info
+  where it throws IllegalArgumentException. See the namespace doc."
+  [s]
+  (when-not (string? s) (not-a-string! "form-decode" s))
+  (let [n (count s)]
+    (loop [i 0 out (transient [])]
+      (if (>= i n)
+        (units->str (persistent! out))
+        (let [c (unit s i)]
+          (cond
+            (== c 43) (recur (inc i) (conj! out 32))
+            (== c 37)
+            (let [[i bs] (loop [i i bs (transient [])]
+                           (if (and (< (+ i 2) n) (== 37 (unit s i)))
+                             (let [v (parse-escape s (inc i))]
+                               (when (neg? v)
+                                 (illegal-arg! :negative-value
+                                               "URLDecoder: Illegal hex characters in escape (%) pattern - negative value"))
+                               (recur (+ i 3) (conj! bs (bit-and v 0xFF))))
+                             [i (persistent! bs)]))]
+              (when (and (< i n) (== 37 (unit s i)))
+                (illegal-arg! :incomplete-escape "URLDecoder: Incomplete trailing escape (%) pattern"))
+              (recur i (utf8->units out bs)))
+            :else (recur (inc i) (conj! out c))))))))

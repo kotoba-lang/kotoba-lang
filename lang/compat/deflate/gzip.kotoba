@@ -1,0 +1,182 @@
+(ns deflate.gzip
+  "The gzip file format (RFC 1952): a variable-length header with optional
+   filename/comment/extra fields, a raw DEFLATE stream, then a CRC-32 and the
+   input size mod 2^32, both little-endian.
+
+   Two details that are easy to get wrong and are handled here: a gzip *file*
+   may be the concatenation of several members (`gzip -d` joins them, and
+   `.tar.gz` produced by some tools relies on it), and the optional FHCRC field
+   is the low 16 bits of the CRC-32 of the header — not of the payload.
+
+   Written members are deterministic: MTIME is 0 and OS is 255 (unknown) unless
+   given, so the same input compresses to the same bytes. Content-addressing a
+   gzip member is otherwise not reproducible."
+  (:require [deflate.bits :as bits]
+            [deflate.checksum :as checksum]
+            [deflate.inflate :as inflate]
+            [deflate.compress :as compress]))
+
+(def ^:private magic1 0x1f)
+(def ^:private magic2 0x8b)
+(def ^:private deflate-method 8)
+
+(def ^:private fhcrc  0x02)
+(def ^:private fextra 0x04)
+(def ^:private fname  0x08)
+(def ^:private fcomment 0x10)
+
+(defn- u16-le [v off] (+ (nth v off) (* 256 (nth v (+ off 1)))))
+(defn- u32-le [v off]
+  (+ (nth v off) (* 256 (nth v (+ off 1)))
+     (* 65536 (nth v (+ off 2))) (* 16777216 (nth v (+ off 3)))))
+
+(defn- char-code [c]
+  )
+
+(defn- utf8-bytes
+  "Encode a header string as UTF-8. RFC 1952 §2.3.1.2 specifies ISO-8859-1, but
+   every implementation in practice writes UTF-8. Code points outside the BMP
+   are encoded per UTF-16 code unit (CESU-8), which is the same compromise the
+   ZIP writers in this workspace make."
+  [s]
+  (loop [cs (seq s) out []]
+    (if-not cs
+      out
+      (let [c (char-code (first cs))]
+        (recur (next cs)
+               (cond
+                 (< c 0x80) (conj out c)
+                 (< c 0x800) (conj out (bit-or 0xc0 (unsigned-bit-shift-right c 6))
+                                   (bit-or 0x80 (bit-and c 0x3f)))
+                 :else (conj out (bit-or 0xe0 (unsigned-bit-shift-right c 12))
+                             (bit-or 0x80 (bit-and (unsigned-bit-shift-right c 6) 0x3f))
+                             (bit-or 0x80 (bit-and c 0x3f)))))))))
+
+(defn- utf8-str [bs]
+  (loop [bs (seq bs) out ""]
+    (if-not bs
+      out
+      (let [b (first bs)]
+        (cond
+          (< b 0x80) (recur (next bs) (str out (char b)))
+          (< b 0xe0) (recur (nnext bs)
+                            (str out (char (bit-or (bit-shift-left (bit-and b 0x1f) 6)
+                                                   (bit-and (or (second bs) 0) 0x3f)))))
+          :else (let [[_ b1 b2] (take 3 bs)]
+                  (recur (nthnext bs 3)
+                         (str out (char (bit-or (bit-shift-left (bit-and b 0x0f) 12)
+                                                (bit-shift-left (bit-and (or b1 0) 0x3f) 6)
+                                                (bit-and (or b2 0) 0x3f)))))))))))
+
+(defn wrap
+  "gzip-compress `data` into a single member (RFC 1952).
+
+   Options: `:filename`, `:comment`, `:mtime` (Unix seconds, default 0),
+   `:os` (default 255 = unknown), plus anything `deflate.compress/raw` accepts."
+  ([data] (wrap data nil))
+  ([data {:keys [filename comment mtime os] :or {mtime 0 os 255} :as opts}]
+   (let [w    (bits/writer)
+         flg  (bit-or (if filename fname 0) (if comment fcomment 0))]
+     (bits/write-byte! w magic1)
+     (bits/write-byte! w magic2)
+     (bits/write-byte! w deflate-method)
+     (bits/write-byte! w flg)
+     (bits/write-u32-le! w mtime)
+     (bits/write-byte! w 0)                                  ; XFL
+     (bits/write-byte! w os)
+     (when filename
+       (doseq [b (utf8-bytes filename)] (bits/write-byte! w b))
+       (bits/write-byte! w 0))
+     (when comment
+       (doseq [b (utf8-bytes comment)] (bits/write-byte! w b))
+       (bits/write-byte! w 0))
+     (doseq [b (compress/raw data opts)] (bits/write-byte! w b))
+     (bits/write-u32-le! w (checksum/crc32 data))
+     (bits/write-u32-le! w (mod (count (vec data)) 4294967296))
+     (bits/finish! w))))
+
+(defn- read-cstring [v off]
+  (loop [i off]
+    (cond
+      (>= i (count v)) (throw (ex-info "gzip: unterminated header string"
+                                       {:reason :truncated :offset off}))
+      (zero? (nth v i)) [(utf8-str (subvec v off i)) (inc i)]
+      :else (recur (inc i)))))
+
+(defn- read-member
+  [v start {:keys [verify-checksum] :or {verify-checksum true} :as opts}]
+  (when (< (- (count v) start) 18)
+    (throw (ex-info "gzip: member shorter than the minimum header + trailer"
+                    {:reason :truncated :offset start})))
+  (when-not (and (= (nth v start) magic1) (= (nth v (+ start 1)) magic2))
+    (throw (ex-info "gzip: bad magic" {:reason :bad-header :offset start})))
+  (let [cm (nth v (+ start 2))]
+    (when-not (= cm deflate-method)
+      (throw (ex-info "gzip: unsupported compression method"
+                      {:reason :bad-header :cm cm}))))
+  (let [flg   (nth v (+ start 3))
+        mtime (u32-le v (+ start 4))
+        os    (nth v (+ start 9))
+        off   (+ start 10)
+        [extra off] (if (pos? (bit-and flg fextra))
+                      (let [xlen (u16-le v off)]
+                        [(subvec v (+ off 2) (+ off 2 xlen)) (+ off 2 xlen)])
+                      [nil off])
+        [nm off]    (if (pos? (bit-and flg fname)) (read-cstring v off) [nil off])
+        [cmt off]   (if (pos? (bit-and flg fcomment)) (read-cstring v off) [nil off])
+        off         (if (pos? (bit-and flg fhcrc))
+                      (let [want (u16-le v off)
+                            got  (bit-and (checksum/crc32 (subvec v start off)) 0xffff)]
+                        (when (and verify-checksum (not= want got))
+                          (throw (ex-info "gzip: header CRC-16 mismatch"
+                                          {:reason :checksum-mismatch :expected want :actual got})))
+                        (+ off 2))
+                      off)
+        {:keys [bytes end]} (inflate/raw* (subvec v off) opts)
+        end   (+ off end)]
+    (when (< (- (count v) end) 8)
+      (throw (ex-info "gzip: member ends before its CRC-32/ISIZE trailer"
+                      {:reason :truncated :offset end})))
+    (let [crc   (u32-le v end)
+          isize (u32-le v (+ end 4))]
+      (when verify-checksum
+        (let [actual (checksum/crc32 bytes)]
+          (when-not (= crc actual)
+            (throw (ex-info "gzip: CRC-32 mismatch"
+                            {:reason :checksum-mismatch :expected crc :actual actual}))))
+        (let [actual (mod (count bytes) 4294967296)]
+          (when-not (= isize actual)
+            (throw (ex-info "gzip: ISIZE mismatch"
+                            {:reason :size-mismatch :expected isize :actual actual})))))
+      {:bytes bytes :filename nm :comment cmt :extra extra
+       :mtime mtime :os os :crc32 crc :isize isize :end (+ end 8)})))
+
+(defn members
+  "Every member of a gzip file, in order. Trailing zero padding (some writers
+   pad to a block boundary) is ignored."
+  ([data] (members data nil))
+  ([data opts]
+   (let [v (vec data)]
+     (loop [off 0 out []]
+       (if (or (>= off (count v))
+               (every? zero? (subvec v off (min (count v) (+ off 2)))))
+         out
+         (let [m (read-member v off opts)]
+           (recur (:end m) (conj out m))))))))
+
+(defn unwrap*
+  "Decompress a gzip file, returning the concatenation of its members plus the
+   member metadata."
+  ([data] (unwrap* data nil))
+  ([data opts]
+   (let [ms (members data opts)]
+     (when (empty? ms)
+       (throw (ex-info "gzip: no members" {:reason :bad-header})))
+     {:bytes (into [] (mapcat :bytes) ms)
+      :members (mapv #(dissoc % :bytes) ms)
+      :end (:end (last ms))})))
+
+(defn unwrap
+  "Decompress a gzip file (RFC 1952) → vector of unsigned bytes."
+  ([data] (:bytes (unwrap* data nil)))
+  ([data opts] (:bytes (unwrap* data opts))))

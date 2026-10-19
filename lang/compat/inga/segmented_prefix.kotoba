@@ -1,0 +1,225 @@
+(ns inga.segmented-prefix
+  "Bounded, complete-history segment candidate. Pure: no fetch, PUT, clock or
+  trusted state-root. All segments from genesis are rechecked for each call.
+  Input is materialized; sequential decoding avoids a second full block vector.
+  Signature and byte work remain O(history), not succinct checkpoint verification."
+  (:require [kotoba.lang.edn :as edn]
+            [inga.prefix :as prefix]
+            [inga.sync :as sync]
+            [inga.attest :as att]
+            [inga.head :as head]))
+
+(def version "inga.segmented-prefix/v1-candidate")
+(def hard-limits
+  "Finite ceilings, caller may only LOWER them. Bytes mean UTF-8. Work bounds
+  count all QC signer slots conservatively, including duplicate boundary QCs.
+  Runtime/allocator overhead and caller allocation are not a byte-exact heap cap."
+  {:max-segments 64 :max-segment-blocks 128 :max-total-blocks 8192
+   :max-segment-bytes 1048576 :max-total-bytes 33554432
+   :max-proposals-per-block 64 :max-total-proposals 32768
+   :max-proposal-bytes 8192 :max-output-bytes 16384
+   :max-witnesses 32 :max-signature-checks 65536 :max-edn-depth 64})
+
+(defn- refuse! [reason] (throw (ex-info "segmented prefix refused" {:reason reason})))
+(defn- check! [ok reason] (when-not ok (refuse! reason)))
+(defn- text? [s n] (and (string? s) (pos? (count s)) (<= (count s) n)))
+(defn- cid? [s] (and (string? s) (boolean (re-matches #"b[a-z2-7]{58}" s))))
+(defn- safe-nat? [n] (and (integer? n) (<= 0 n 9007199254740991)))
+
+(defn- limits! [context]
+  (let [supplied (:limits context {}) l (merge hard-limits supplied)]
+    (check! (and (map? supplied) (every? (set (keys hard-limits)) (keys supplied))
+                 (every? (fn [[k cap]] (and (pos-int? (get l k)) (<= (get l k) cap))) hard-limits))
+            :invalid-limits)
+    l))
+
+(defn- scan-edn!
+  "Bound recursive parsing before invoking the EDN reader. The candidate wire
+  profile has maps/vectors/sets/scalars, but no tags, discard or char literals."
+  [s cap]
+  (loop [i 0 depth 0 quoted? false escaped? false comment? false]
+    (when (< i (count s))
+      (let [ch (subs s i (inc i))]
+        (cond
+          comment? (recur (inc i) depth false false (not= ch "\n"))
+          quoted? (recur (inc i) depth (or escaped? (not= ch "\""))
+                         (and (not escaped?) (= ch "\\")) false)
+          (= ch ";") (recur (inc i) depth false false true)
+          (= ch "\"") (recur (inc i) depth true false false)
+          (#{"(" "[" "{"} ch)
+          (do (check! (< depth cap) :edn-depth-exceeded)
+              (recur (inc i) (inc depth) false false false))
+          (#{")" "]" "}"} ch)
+          (do (check! (pos? depth) :malformed-segment)
+              (recur (inc i) (dec depth) false false false))
+          (= ch "#")
+          (do (check! (and (< (inc i) (count s)) (#{"{" ":"} (subs s (inc i) (+ i 2)))) :unsupported-edn)
+              (recur (inc i) depth false false false))
+          (= ch "\\") (refuse! :unsupported-edn)
+          :else (recur (inc i) depth false false false))))))
+
+(defn- valid-record? [r]
+  ;; Same record contract as inga.reservation; parity tests cover this fold.
+  (and (map? r) (= head/head-version (get r "v"))
+       (string? (get r "ref")) (seq (get r "ref"))
+       (nat-int? (get r "seq")) (string? (get r "cid")) (seq (get r "cid"))
+       (if (zero? (get r "seq")) (nil? (get r "prev")) (string? (get r "prev")))))
+
+(defn- qc-work! [qc limit]
+  (check! (and (map? qc) (set? (:inga.qc/witnesses qc))
+               (<= (count (:inga.qc/witnesses qc)) limit)
+               (every? #(text? % 128) (:inga.qc/witnesses qc))
+               (or (nil? (:inga.qc/sigs qc))
+                   (and (map? (:inga.qc/sigs qc)) (<= (count (:inga.qc/sigs qc)) limit)
+                        (every? #(text? % 256) (vals (:inga.qc/sigs qc)))))
+               (or (nil? (:inga.qc/views qc))
+                   (and (map? (:inga.qc/views qc)) (<= (count (:inga.qc/views qc)) limit)
+                        (every? safe-nat? (vals (:inga.qc/views qc)))))
+               (or (nil? (:inga.qc/view qc)) (safe-nat? (:inga.qc/view qc)))
+               (safe-nat? (:inga.qc/height qc)) (text? (:inga.qc/block-hash qc) 128))
+          :malformed-certificate)
+  (count (:inga.qc/witnesses qc)))
+
+(defn- block-work! [b l byte-count]
+  (let [ps (:inga.block/proposals b)]
+    (check! (and (map? b) (safe-nat? (:inga.block/height b))
+                 (safe-nat? (:inga.block/round b)) (safe-nat? (:inga.block/ts b))
+                 (text? (:inga.block/parent-hash b) 128) (text? (:inga.block/proposer b) 128)
+                 (vector? ps) (<= (count ps) (:max-proposals-per-block l))
+                 (every? #(and (string? %) (<= (count %) (:max-proposal-bytes l))
+                                (<= (byte-count %) (:max-proposal-bytes l))) ps))
+            :block-bounds-exceeded)
+    {:proposals (count ps)
+     :signatures (if (zero? (:inga.block/height b)) 0
+                     (qc-work! (:inga.block/justify b) (:max-witnesses l)))}))
+
+(defn- commit-block [state block record context]
+  (reduce
+   (fn [s proposal]
+     (let [r ((:decode-proposal context) proposal)]
+       (if (= (get record "ref") (get r "ref"))
+         (do (check! (valid-record? r) :malformed-ref-history)
+             (if (and (nil? (:winner s)) (zero? (get r "seq")))
+               (assoc s :winner r :winner-block-hash ((:hash-fn context) block)) s))
+         s)))
+   (assoc state :finalized-height (:inga.block/height block))
+   (:inga.block/proposals block)))
+
+(defn- fold-block [state b record context]
+  (let [pending (conj (:pending state) b)]
+    ;; Every adjacent direct extension was already checked by sync. Just as
+    ;; three-chain-commits, only the first of three blocks is committed.
+    (if (= 3 (count pending))
+      (assoc (commit-block state (first pending) record context) :pending (vec (rest pending)))
+      (assoc state :pending pending))))
+
+(defn- verify-all!
+  [record checkpoint segments {:keys [genesis chain-id witnesses quorum hash-fn verify-fn
+                                      segment-cid-fn text-byte-count] :as context} l]
+  (check! (and (vector? segments) (seq segments) (<= (count segments) (:max-segments l))) :segment-count-exceeded)
+  (check! (and (map? checkpoint)
+               (= #{:version :chain-id :genesis-hash :last-cid :segment-count :block-count}
+                  (set (keys checkpoint)))
+               (= version (:version checkpoint)) (= chain-id (:chain-id checkpoint))
+               (= (hash-fn genesis) (:genesis-hash checkpoint))
+               (cid? (:last-cid checkpoint)) (= (count segments) (:segment-count checkpoint))
+               (pos-int? (:block-count checkpoint)) (<= (:block-count checkpoint) (:max-total-blocks l)))
+          :invalid-checkpoint)
+  ;; Reject total input overflow before parsing or signature work. Caller input
+  ;; allocation precedes this pure API; a network adapter must cap download too.
+  (let [total-bytes
+        (reduce (fn [n {:keys [cid data] :as item}]
+                  (check! (and (= #{:cid :data} (set (keys item))) (cid? cid)
+                               (string? data) (<= (count data) (:max-segment-bytes l))) :segment-bytes-exceeded)
+                  (let [size (text-byte-count data) total (+ n size)]
+                    (check! (and (safe-nat? size) (<= size (:max-segment-bytes l))) :segment-bytes-exceeded)
+                    (check! (<= total (:max-total-bytes l)) :total-bytes-exceeded)
+                    total)) 0 segments)]
+    (loop [index 0 state {:pending [] :blocks 0 :proposals 0 :signatures 0 :finalized-height -1} prev-cid nil last-block nil]
+      (if (= index (count segments))
+        (do (check! (= prev-cid (:last-cid checkpoint)) :checkpoint-cid-mismatch)
+            (check! (= (:blocks state) (:block-count checkpoint)) :checkpoint-height-mismatch)
+            (assoc state :bytes total-bytes :tip-hash (hash-fn last-block)))
+        (let [{:keys [cid data]} (nth segments index)
+              _ (check! (= cid (segment-cid-fn data)) :segment-cid-mismatch)
+              _ (scan-edn! data (:max-edn-depth l))
+              segment (edn/read-string data)
+              bs (:blocks segment)
+              _ (check! (and (map? segment)
+                             (= #{:version :chain-id :genesis-hash :index :prev-cid :from-height :to-height :blocks :tip-qc}
+                                (set (keys segment)))
+                             (= version (:version segment)) (= chain-id (:chain-id segment))
+                             (= (:genesis-hash checkpoint) (:genesis-hash segment))
+                             (= index (:index segment)) (= prev-cid (:prev-cid segment))) :segment-link-mismatch)
+              _ (check! (and (vector? bs) (seq bs) (<= (count bs) (:max-segment-blocks l))) :segment-blocks-exceeded)
+              from (:blocks state) to (+ from (dec (count bs)))
+              _ (check! (and (= from (:from-height segment)) (= to (:to-height segment))
+                             (= from (:inga.block/height (first bs))) (= to (:inga.block/height (peek bs)))) :segment-height-mismatch)
+              _ (check! (< to (:max-total-blocks l)) :total-blocks-exceeded)
+              _ (when (zero? index) (check! (= genesis (first bs)) :wrong-genesis))
+              work (mapv #(block-work! % l text-byte-count) bs)
+              proposals (+ (:proposals state) (reduce + 0 (map :proposals work)))
+              signatures (+ (:signatures state) (reduce + 0 (map :signatures work))
+                            (qc-work! (:tip-qc segment) (:max-witnesses l)))
+              _ (check! (<= proposals (:max-total-proposals l)) :proposal-work-exceeded)
+              _ (check! (<= signatures (:max-signature-checks l)) :signature-work-exceeded)
+              check-blocks (if (zero? index) (subvec bs 1) bs)
+              reason (when (seq check-blocks)
+                       (sync/validate-segment hash-fn quorum (or last-block genesis) check-blocks
+                         {:max-batch (:max-segment-blocks l) :witnesses witnesses}
+                         chain-id verify-fn (set witnesses)))
+              _ (when reason (refuse! reason))
+              tip (peek bs) qc (:tip-qc segment)
+              _ (check! (and (= (hash-fn tip) (:inga.qc/block-hash qc))
+                             (= (:inga.block/height tip) (:inga.qc/height qc))
+                             (or (zero? (:inga.block/height tip))
+                                 (nil? (att/verify-certificate qc chain-id quorum verify-fn (set witnesses)))))
+                        :invalid-tip-certificate)
+              ;; Height-zero QC is only a locator for the already trusted
+              ;; empty genesis, as in sync. It never grants a reservation.
+              next-state (reduce #(fold-block %1 %2 record context)
+                                 (assoc state :blocks (inc to) :proposals proposals :signatures signatures) bs)]
+          (recur (inc index) next-state cid tip))))))
+
+(defn verify-acquisition
+  "Same one-shot result shape as inga.reservation/verify-acquisition, using a
+  segmented COMPLETE history. checkpoint binds the final segment CID; all
+  previous CIDs, heights, context, direct extensions and signed QCs are checked.
+  No partial result escapes on later failure. Never accepts a supplied state-root.
+
+  segments is a vector of {:cid <raw CIDv1 sha2-256 base32> :data <UTF-8 EDN text>}.
+  context has the existing prefix trust fields and decode-proposal plus pure
+  segment-cid-fn (real raw CID of UTF-8 text), text-byte-count (UTF-8), and optional
+  lowered :limits. Crypto and decoding seams must be total deterministic trusted
+  implementations; a fake CID/signature function destroys the guarantee.
+
+  At most 32 MiB input text, one 1 MiB decoded segment plus two tail blocks and
+  one winning record; no accumulated full history/projection. Output <=16 KiB.
+  No streaming downloader/heap/CPU-time bound is claimed; logical work is capped
+  by input bytes, 8192 blocks, 32768 proposals and 65536 QC signer checks."
+  [record checkpoint segments context]
+  (try
+    (let [l (limits! context) byte-count (:text-byte-count context)]
+      (check! (and (prefix/context-valid? context) (fn? (:segment-cid-fn context)) (fn? byte-count)
+                   (fn? (:decode-proposal context))
+                   (<= (count (:witnesses context)) (:max-witnesses l))
+                   (every? #(text? % 128) (:witnesses context)) (text? (:chain-id context) 256)) :invalid-context)
+      (check! (and (valid-record? record) (zero? (get record "seq"))) :not-one-shot)
+      (check! (<= (byte-count (pr-str record)) (:max-proposal-bytes l)) :record-bytes-exceeded)
+      (let [s (verify-all! record checkpoint segments context l)
+            winner (:winner s)
+            result (cond
+                     (< (:blocks s) 4) {:status :unresolved :reason :incomplete-prefix}
+                     (nil? winner) {:status :unresolved :reason :not-finalized}
+                     (not= (head/canonical-bytes winner) (head/canonical-bytes record))
+                     {:status :rejected :reason :lost :winner-cid (get winner "cid")}
+                     :else {:status :reserved :record winner :block-hash (:winner-block-hash s)})]
+        (check! (<= (byte-count (pr-str result)) (:max-output-bytes l)) :output-bytes-exceeded)
+        result))
+    (catch  e
+      ;; SCI may wrap ex-info; walk a bounded cause chain without exposing data.
+      (loop [error e n 0]
+        (if-let [reason (:reason (ex-data error))]
+          {:status :rejected :reason reason}
+          (if (and (< n 8) (ex-cause error)) (recur (ex-cause error) (inc n))
+              {:status :rejected :reason :malformed-proof}))))))

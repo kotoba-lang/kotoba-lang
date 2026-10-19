@@ -1,0 +1,246 @@
+(ns kotoba.security.adoption
+  "Fail-closed verifier for organization-wide use of the shared controls."
+  {:kotoba/export [-main full-sha-pattern inventory-violations security-coordinate security-url sensitive-name-pattern sensitive-operation-violations source-file? source-security-inventory source-sensitive-inventory verify! violations]}
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.lang.coll :as set]
+            [kotoba.lang.text :as str])
+  (:import [clojure.lang ReaderConditional]
+           [java.io PushbackReader]
+           [java.time LocalDate]))
+
+(def security-coordinate 'io.github.kotoba-lang/security)
+(def security-url "https://github.com/kotoba-lang/security.git")
+(def full-sha-pattern #"[0-9a-f]{40}")
+(def sensitive-name-pattern
+  #"(?i)(encrypt|decrypt|authorize|authenticate|credential|private-key|secret|revoke|rotate-key|restore-backup|verify-signature|sign-artifact)")
+
+(defn source-file?
+  "True when FILE-NAME is a Clojure-family source file: .clj, .cljs, .cljc or
+  .cljk. The 2026-09-11 rename (adr-2609111500) turned every .clj/.cljs/.cljc
+  path in the tree into .cljk, and a scan that only knows the pre-rename
+  extensions inventories an empty tree while looking like it ran. All four
+  spellings match so the inventory survives either naming."
+  [file-name]
+  (boolean (re-find #"\.clj[csk]?$" (str file-name))))
+
+(defn- non-empty-string? [value]
+  (and (string? value) (not (str/blank? value))))
+
+(defn- active-exception? [today {:keys [owner reason expires]}]
+  (and (non-empty-string? owner)
+       (non-empty-string? reason)
+       (non-empty-string? expires)
+       (not (.isBefore (LocalDate/parse expires) today))))
+
+(defn violations
+  "Return contract violations without loading namespaces."
+  [config deps today]
+  (let [dependency (get-in deps [:deps security-coordinate])
+        required-sha (:security/git-sha config)
+        controls (:required-control-namespaces config)
+        entrypoints (:security-sensitive-entrypoints config)
+        sensitive-operations (:sensitive-operations config)
+        exceptions (:exceptions config)]
+    (cond-> []
+      (not= 3 (:adoption/version config))
+      (conj :unsupported-adoption-version)
+
+      (not (keyword? (:consumer/id config)))
+      (conj :missing-consumer-id)
+
+      (not= security-url (:git/url dependency))
+      (conj :wrong-security-repository)
+
+      (not (and (string? required-sha)
+                (re-matches full-sha-pattern required-sha)
+                (= required-sha (:git/sha dependency))))
+      (conj :security-pin-mismatch)
+
+      (not (and (seq controls)
+                (every? #(str/starts-with? (str %) "kotoba.security.") controls)))
+      (conj :missing-central-control-namespaces)
+
+      (not (and (map? entrypoints)
+                (seq entrypoints)
+                (every? symbol? (keys entrypoints))
+                (every? seq (vals entrypoints))
+                (every? (fn [required]
+                          (contains? (set controls) required))
+                        (mapcat identity (vals entrypoints)))))
+      (conj :missing-security-sensitive-entrypoints)
+
+      (not (and (map? sensitive-operations)
+                (every? symbol? (keys sensitive-operations))
+                (every? seq (vals sensitive-operations))))
+      (conj :missing-sensitive-operation-inventory)
+
+      (not (every? #(active-exception? today %) exceptions))
+      (conj :invalid-or-expired-exception))))
+
+(defn- namespace-dependencies [namespace]
+  (let [loaded (the-ns namespace)]
+    (set (concat (map (comp ns-name val) (ns-aliases loaded))
+                 (keep (fn [[_ referred-var]]
+                         (some-> referred-var meta :ns ns-name))
+                       (ns-refers loaded))))))
+
+(defn- dependency-edge-violations [entrypoints]
+  (into []
+        (comp
+         (mapcat (fn [[entrypoint required-controls]]
+                   (let [dependencies (namespace-dependencies entrypoint)]
+                     (for [control required-controls
+                           :when (not (contains? dependencies control))]
+                       {:problem :missing-control-dependency-edge
+                        :entrypoint entrypoint
+                        :control control})))))
+        entrypoints))
+
+(defn- security-symbol? [value]
+  (and (symbol? value)
+       (str/starts-with? (str value) "kotoba.security.")))
+
+(defn- read-children [value]
+  (if (instance? ReaderConditional value)
+    [(.form ^ReaderConditional value)]
+    (seq value)))
+
+(defn- all-nodes [form]
+  (tree-seq #(or (coll? %) (instance? ReaderConditional %))
+            read-children form))
+
+(defn- ns-form [file]
+  (with-open [reader (PushbackReader. (io/reader file))]
+    (binding [*default-data-reader-fn* (fn [_tag value] value)]
+      (loop []
+        (let [form (read {:read-cond :preserve :eof nil} reader)]
+          (cond
+            (nil? form) nil
+            (and (seq? form) (= 'ns (first form))) form
+            :else (recur)))))))
+
+(defn- source-forms [file]
+  (with-open [reader (PushbackReader. (io/reader file))]
+    (binding [*default-data-reader-fn* (fn [_tag value] value)]
+      (loop [forms []]
+        (let [form (read {:read-cond :preserve :eof nil} reader)]
+          (if (nil? form) forms (recur (conj forms form))))))))
+
+(defn source-sensitive-inventory
+  "Discover high-confidence sensitive def/defn operations under ROOT/src."
+  [root]
+  (into #{}
+        (for [file (filter (fn [candidate]
+                            (and (io/file? candidate)
+                                 (source-file? (io/file-name candidate))))
+                          (io/file-seq (io/file root "src")))
+              :let [forms (source-forms file)
+                    namespace (some #(when (and (seq? %) (= 'ns (first %)))
+                                       (second %)) forms)]
+              form (mapcat all-nodes forms)
+              :when (and namespace (seq? form)
+                         (#{'def 'defn 'defn- 'defmacro} (first form))
+                         (symbol? (second form))
+                         (re-find sensitive-name-pattern (name (second form))))]
+          (symbol (str namespace) (name (second form))))))
+
+(defn sensitive-operation-violations [config discovered]
+  (let [declared (:sensitive-operations config)
+        entrypoints (:security-sensitive-entrypoints config)
+        missing (sort (remove (set (keys declared)) discovered))
+        stale (sort (remove discovered (keys declared)))
+        invalid-bindings
+        (into []
+              (keep (fn [[operation controls]]
+                      (let [namespace (symbol (namespace operation))
+                            entrypoint-controls (set (get entrypoints namespace))]
+                        (when-not (and (seq entrypoint-controls)
+                                       (every? entrypoint-controls controls))
+                          {:operation operation :controls controls}))))
+              declared)]
+    (cond-> []
+      (seq missing) (conj {:problem :undeclared-sensitive-operations
+                           :operations missing})
+      (seq stale) (conj {:problem :stale-sensitive-operations
+                         :operations stale})
+      (seq invalid-bindings) (conj {:problem :unprotected-sensitive-operations
+                                    :operations invalid-bindings}))))
+
+(defn source-security-inventory
+  "Discover the union of CLJ and CLJS control-import edges under ROOT/src."
+  [root]
+  (reduce
+   (fn [inventory [namespace controls]]
+     (update inventory namespace (fnil set/set-union #{}) controls))
+   {}
+   (for [file (filter (fn [candidate]
+                       (and (io/file? candidate)
+                            (source-file? (io/file-name candidate))))
+                     (io/file-seq (io/file root "src")))
+         :let [form (ns-form file)
+               namespace (second form)
+               controls (into #{} (filter security-symbol?)
+                              (all-nodes (drop 2 form)))]
+         :when (seq controls)]
+     [namespace controls])))
+
+(defn inventory-violations
+  "Compare declared entrypoint edges with imports discovered under src/."
+  [config discovered]
+  (let [declared (update-vals (:security-sensitive-entrypoints config) set)
+        missing (sort (remove (set (keys declared)) (keys discovered)))
+        stale (sort (remove (set (keys discovered)) (keys declared)))
+        mismatched
+        (into []
+              (keep (fn [namespace]
+                      (when (not= (get declared namespace)
+                                  (get discovered namespace))
+                        {:namespace namespace
+                         :declared (get declared namespace)
+                         :discovered (get discovered namespace)})))
+              (sort (set/set-intersection (set (keys declared))
+                                      (set (keys discovered)))))]
+    (cond-> []
+      (seq missing) (conj {:problem :unregistered-security-importers
+                           :namespaces missing})
+      (seq stale) (conj {:problem :stale-security-entrypoints
+                         :namespaces stale})
+      (seq mismatched) (conj {:problem :source-control-edge-mismatch
+                              :edges mismatched}))))
+
+(defn verify!
+  "Verify files, load declarations, and prove entrypoint-to-control edges."
+  ([] (verify! "."))
+  ([root]
+   (let [config (edn/read-string (slurp (str root "/security-adoption.edn")))
+         deps (edn/read-string (slurp (str root "/deps.edn")))
+         problems (violations config deps (LocalDate/now))]
+     (when (seq problems)
+       (throw (ex-info "shared security adoption denied"
+                       {:security.adoption/violations problems})))
+     (let [inventory-problems
+           (inventory-violations config (source-security-inventory root))]
+       (when (seq inventory-problems)
+         (throw (ex-info "shared security source inventory denied"
+                         {:security.adoption/violations inventory-problems}))))
+     (let [sensitive-problems
+           (sensitive-operation-violations
+            config (source-sensitive-inventory root))]
+       (when (seq sensitive-problems)
+         (throw (ex-info "sensitive operation inventory denied"
+                         {:security.adoption/violations sensitive-problems}))))
+     (doseq [namespace (concat (:required-control-namespaces config)
+                               (keys (:security-sensitive-entrypoints config)))]
+       (require namespace))
+     (let [edge-problems
+           (dependency-edge-violations (:security-sensitive-entrypoints config))]
+       (when (seq edge-problems)
+         (throw (ex-info "shared security dependency edge denied"
+                         {:security.adoption/violations edge-problems}))))
+     {:security.adoption/status :pass
+      :consumer/id (:consumer/id config)
+      :security/git-sha (:security/git-sha config)})))
+
+(defn -main [& [root]]
+  (prn (verify! (or root "."))))

@@ -1,0 +1,141 @@
+(ns kotobase.storage.observed-ref
+  "Durable rollback/equivocation guard for verified, sequenced refs.
+
+  The wrapped ref store remains responsible for authenticating its head. The
+  observation store is a separate, trusted local authority that remembers the
+  greatest accepted sequence with CAS, so an untrusted pointer cannot replay a
+  previously valid head after restart."
+  (:require [kotobase.storage.core :as storage]))
+
+(defprotocol IObservationStore
+  (-read-observation [store ref-name]
+    "Return nil or the trusted {:cid string :version non-negative-integer}.")
+  (-compare-and-set-observation! [store ref-name expected next]
+    "CAS EXPECTED to NEXT. Return {:stored? boolean :current observation}."))
+
+(defn- reject! [problem message data]
+  (throw (ex-info message
+                  (assoc data :type :kotobase.storage/ref-observation-rejected
+                              :problem problem))))
+
+(defn- observation [value]
+  (when value
+    (when-not (and (map? value)
+                   (string? (:cid value)) (not= "" (:cid value))
+                   (integer? (:version value)) (not (neg? (:version value))))
+      (reject! :invalid-observation
+               "observed ref requires a CID and non-negative integer version"
+               {:observation value}))
+    (select-keys value [:cid :version])))
+
+(defn classify
+  "Classify CANDIDATE relative to trusted LAST-SEEN, or reject it.
+
+  This guard intentionally covers sequenced physical discovery. Higher
+  sequence acceptance still relies on the wrapped store authenticating the
+  issuer. Logical commit ancestry is the separate engine-frontier contract."
+  [last-seen candidate]
+  (let [last-seen (observation last-seen)
+        candidate (observation candidate)]
+    (cond
+      (and (nil? last-seen) (nil? candidate))
+      {:status :absent :observation nil}
+
+      (nil? candidate)
+      (reject! :rollback "a previously observed ref disappeared"
+               {:last-seen last-seen})
+
+      (nil? last-seen)
+      {:status :initialized :observation candidate}
+
+      (< (:version candidate) (:version last-seen))
+      (reject! :rollback "ref sequence precedes the durable observation"
+               {:last-seen last-seen :candidate candidate})
+
+      (= (:version candidate) (:version last-seen))
+      (if (= (:cid candidate) (:cid last-seen))
+        {:status :unchanged :observation last-seen}
+        (reject! :equivocation "different CIDs claim the observed ref sequence"
+                 {:last-seen last-seen :candidate candidate}))
+
+      :else
+      {:status :advanced :observation candidate})))
+
+(defrecord MemoryObservationStore [state]
+  IObservationStore
+  (-read-observation [_ ref-name] (get @state ref-name))
+  (-compare-and-set-observation! [_ ref-name expected next]
+    (loop []
+      (let [before @state
+            current (get before ref-name)]
+        (if (not= expected current)
+          {:stored? false :current current}
+          (let [after (assoc before ref-name next)]
+            (if (compare-and-set! state before after)
+              {:stored? true :current next}
+              (recur))))))))
+
+(defn memory-observation-store
+  "Process-local oracle for tests. Production callers inject durable secure
+  storage; memory cannot protect across restart."
+  []
+  (->MemoryObservationStore (atom {})))
+
+(defn- validate-ports! [inner observations]
+  (when-not (and (storage/ref-store? inner)
+                 (satisfies? storage/IBackendCapabilities inner))
+    (throw (ex-info "observed ref requires a ref store with capabilities"
+                    {:type :kotobase.storage/invalid-ref-store})))
+  (when-not (satisfies? IObservationStore observations)
+    (throw (ex-info "observed ref requires a trusted observation store"
+                    {:type :kotobase.storage/invalid-observation-store}))))
+
+(defn- observe! [observations ref-name candidate]
+  (loop [attempt 0]
+    (when (>= attempt 32)
+      (reject! :observation-contention
+               "durable observation CAS did not converge"
+               {:ref-name ref-name :attempts attempt}))
+    (let [last-seen (-read-observation observations ref-name)
+          {:keys [status observation]} (classify last-seen candidate)]
+      (if (contains? #{:absent :unchanged} status)
+        observation
+        (let [{:keys [stored?]}
+              (-compare-and-set-observation! observations ref-name
+                                             last-seen observation)]
+          (if stored? observation (recur (inc attempt))))))))
+
+(defrecord ObservedRefStore [inner observations]
+  storage/IRefStore
+  (-read-ref [_ ref-name]
+    (observe! observations ref-name (storage/-read-ref inner ref-name)))
+  (-compare-and-set-ref! [this ref-name expected next]
+    ;; Guard BEFORE mutation. A replayed head can carry the expected CID at an
+    ;; older sequence; delegating first would publish onto the rollback fork
+    ;; and only then discover the violation.
+    (let [before (storage/-read-ref this ref-name)]
+      (if (not= expected (:cid before))
+        {:published? false :current (:cid before) :version (:version before)}
+        (let [result (storage/-compare-and-set-ref! inner ref-name expected next)
+              current (when (or (:current result) (some? (:version result)))
+                        {:cid (:current result) :version (:version result)})]
+          (when current (observe! observations ref-name current))
+          result))))
+  storage/IBackendCapabilities
+  (-capabilities [_] (storage/-capabilities inner)))
+
+(defn open
+  "Guard synchronous verified/sequenced refs with trusted durable observation.
+
+  OBSERVATIONS must implement atomic compare-and-set. Wrapping an unsigned ref
+  merely makes attacker-chosen high versions sticky; authenticate first, then
+  apply this rollback guard."
+  [{:keys [inner observations]}]
+  (validate-ports! inner observations)
+  (->ObservedRefStore inner observations))
+
+
+
+
+
+

@@ -1,0 +1,225 @@
+(ns ipld.fbl
+  "A Flexible Byte Layout: one logical byte sequence spread over many blocks.
+
+  A large object -- an Arrow file, a Parquet footer, a video -- does not fit
+  in one block and should not be read as one. FBL is the IPLD layout that lets
+  a reader ask for `[start, end)` of the logical bytes and fetch only the
+  leaves that overlap it. That is the whole value: reading a 200-byte footer
+  out of a gigabyte must cost the path plus one leaf, not the gigabyte.
+
+  A node is either a leaf holding bytes, or a list of parts:
+
+      {\"bytes\" <bytes>}
+      {\"parts\" [{\"length\" n \"part\" <link|node>} ...]}
+
+  This is a specified SUBSET, not a claim of full FBL conformance: parts are
+  links or inline nodes, lengths are declared, and nothing here negotiates an
+  ADL version. Versioned signalling is separate work and is not implied by
+  reading a layout that happens to have this shape.
+
+  ## The failure this is built around
+
+  `-read-range` in every byte-source contract in this workspace means exactly
+  `[start, end)`. A layout reader that returns FEWER bytes than that -- because
+  a block was missing, or a declared length disagreed with the bytes behind it
+  -- hands its caller a short buffer, and the caller does not re-check: Arrow
+  reads a column at a computed offset, and a short read shifts every field
+  after it. The bytes parse. The values are wrong.
+
+  So a short read is refused here rather than returned. Declared lengths are
+  checked against actual bytes at the moment a leaf is read, missing blocks
+  throw, and the assembled result is asserted to be exactly the requested
+  width before it is handed back.
+
+  ## Borrowing across a boundary is not possible
+
+  A range inside one leaf can be a view of that leaf's bytes. A range spanning
+  two leaves cannot: the bytes are not contiguous anywhere, so producing them
+  means allocating. `read-range` therefore reports `:copy-boundary` --
+  `:borrowed-leaf` or `:assembled` -- the same way `arrow.source` reports its
+  own. A layout that claimed zero-copy unconditionally would be claiming it
+  for the case that provably cannot have it."
+  {:kotoba/export [build leaf read-all read-range size]}
+  (:require [ipld.core :as ipld]
+            [ipld.link :as link]))
+
+(defn- leaf? [node] (contains? node "bytes"))
+
+(defn- native-bytes?
+  "Is `b` this runtime's byte container rather than a sequence of numbers?
+
+  Both are reachable here: `ipld.core` round-trips a native container back as
+  one (a real CBOR byte string) and a vector back as a vector (a CBOR array of
+  integers). A reader that assumed either shape would be right about half the
+  values it meets."
+  [b]
+  )
+
+(defn- byte-count [b]
+  (if (native-bytes? b)
+    
+    (count b)))
+
+(defn- byte-at
+  "Unsigned value of byte `i`.
+
+  Measured 2026-09-06: `aget` on a Clojure vector under ClojureScript returns
+  `undefined`, and `(bit-and undefined 0xff)` is 0 -- so a reader written for
+  typed arrays alone does not fail on a vector, it silently returns zeros. In
+  this layout that made every leaf identical, which made every leaf's CID
+  identical, which made a missing-block test pass for the wrong reason."
+  [b i]
+  (bit-and (if (native-bytes? b)
+             
+             (nth b i))
+           0xff))
+
+(defn- byte-seq [b]
+  (mapv #(byte-at b %) (range (byte-count b))))
+
+(defn- ->native
+  "A sequence of unsigned byte values as this runtime's byte container.
+
+  Leaves are built native so that they encode as a CBOR byte string rather
+  than an array of integers. Both decode, but only one of them is Bytes."
+  [xs]
+  )
+
+;; ── building ─────────────────────────────────────────────────────────────────
+
+(defn leaf
+  "A leaf node holding `bytes`."
+  [bytes]
+  {"bytes" bytes})
+
+(defn build
+  "Chunk `bytes` into leaves of `chunk-size` and return `{:root :blocks}`.
+
+  `:blocks` is `[{:cid :bytes} ...]` root-last, ready for a CAR writer or a
+  block store. A single chunk still produces a parts node rather than a bare
+  leaf, so that the root's shape does not depend on the size of its input --
+  a reader that special-cased one shape would work until the day a file grew."
+  [bytes chunk-size]
+  (when-not (and (integer? chunk-size) (pos? chunk-size))
+    (throw (ex-info "ipld: FBL chunk size must be a positive integer"
+                    {:type :ipld/invalid-fbl-chunk-size :chunk-size chunk-size})))
+  (let [all (byte-seq bytes)
+        chunks (if (seq all) (partition-all chunk-size all) [[]])
+        leaves (mapv (fn [c] (ipld/node->block (leaf (->native c)))) chunks)
+        parts (mapv (fn [{:keys [cid]} c]
+                      {"length" (count c) "part" (link/link cid)})
+                    leaves chunks)
+        root (ipld/node->block {"parts" parts})]
+    {:root (:cid root)
+     :length (count all)
+     :blocks (conj (vec leaves) root)}))
+
+;; ── reading ──────────────────────────────────────────────────────────────────
+
+(defn- resolve-part
+  "The node for one part, fetched and CID-verified when it is a link."
+  [get-fn part]
+  (let [p (get part "part")]
+    (if (link/link? p)
+      (let [cid (link/link-cid p)]
+        (or (ipld/get-node get-fn cid)
+            (throw (ex-info "ipld: FBL part block is missing"
+                            {:type :ipld/missing-block :cid cid}))))
+      p)))
+
+(defn- node-length
+  "Declared logical length of `node`, checked against the bytes it actually has.
+
+  A leaf whose declared length disagrees with its bytes is the layout bug that
+  does not announce itself: every offset after it shifts, and the reader still
+  returns the number of bytes it was asked for. Checked here, once, where both
+  numbers are in hand."
+  [node declared]
+  (if (leaf? node)
+    (let [actual (byte-count (get node "bytes"))]
+      (when (and (some? declared) (not= declared actual))
+        (throw (ex-info "ipld: FBL leaf length disagrees with its bytes"
+                        {:type :ipld/fbl-length-mismatch
+                         :declared declared :actual actual})))
+      actual)
+    (reduce + 0 (map #(get % "length") (get node "parts")))))
+
+(defn size
+  "Logical byte length of the FBL rooted at `root-cid`.
+
+  Reads the root only. The declared part lengths are the sum; a leaf's
+  declaration is not checked until that leaf is actually read, because
+  checking every leaf would make `size` cost the whole object -- which is the
+  thing this layout exists to avoid."
+  [get-fn root-cid]
+  (let [root (or (ipld/get-node get-fn root-cid)
+                 (throw (ex-info "ipld: FBL root block is missing"
+                                 {:type :ipld/missing-block :cid root-cid})))]
+    (node-length root nil)))
+
+(defn- read-node
+  "Bytes of `[start end)` within `node`, whose logical span is `len`."
+  [get-fn node len start end]
+  (if (leaf? node)
+    (let [b (get node "bytes")]
+      (node-length node len)
+      (mapv #(byte-at b %) (range start end)))
+    (loop [parts (get node "parts") at 0 acc []]
+      (if-let [{:strs [length] :as part} (first parts)]
+        (let [part-end (+ at length)]
+          (cond
+            ;; entirely before the window: skip WITHOUT fetching it. This is
+            ;; the pruning the layout exists for.
+            (<= part-end start) (recur (next parts) part-end acc)
+            ;; entirely after: nothing left to read.
+            (>= at end) acc
+            :else
+            (let [child (resolve-part get-fn part)
+                  lo (max 0 (- start at))
+                  hi (min length (- end at))]
+              (recur (next parts) part-end
+                     (into acc (read-node get-fn child length lo hi))))))
+        acc))))
+
+(defn read-range
+  "Bytes of the logical range `[start, end)`, as `{:bytes :copy-boundary}`.
+
+  `end` is exclusive, matching every other range contract here. A range
+  outside the object is refused rather than clamped: clamping turns a caller's
+  arithmetic error into a short buffer, which is the failure this namespace
+  exists to prevent.
+
+  `:copy-boundary` is `:borrowed-leaf` when the whole range came from inside
+  one leaf and `:assembled` when it spanned more than one. Only leaves that
+  overlap the range are fetched."
+  [get-fn root-cid start end]
+  (when-not (and (integer? start) (integer? end) (<= 0 start) (<= start end))
+    (throw (ex-info "ipld: FBL range must be 0 <= start <= end"
+                    {:type :ipld/invalid-fbl-range :start start :end end})))
+  (let [root (or (ipld/get-node get-fn root-cid)
+                 (throw (ex-info "ipld: FBL root block is missing"
+                                 {:type :ipld/missing-block :cid root-cid})))
+        len (node-length root nil)]
+    (when (> end len)
+      (throw (ex-info "ipld: FBL range extends past the end of the object"
+                      {:type :ipld/fbl-range-out-of-bounds
+                       :start start :end end :length len})))
+    (let [touched (atom 0)
+          counting (fn [cid] (swap! touched inc) (get-fn cid))
+          bytes (read-node counting root len start end)]
+      ;; The assertion that makes a short read impossible to return. Every
+      ;; refusal above is a specific cause; this is the floor under all of
+      ;; them, including causes not yet thought of.
+      (when-not (= (- end start) (count bytes))
+        (throw (ex-info "ipld: FBL assembled range is not the requested width"
+                        {:type :ipld/fbl-short-read
+                         :requested (- end start) :assembled (count bytes)
+                         :start start :end end})))
+      {:bytes bytes
+       :copy-boundary (if (<= @touched 1) :borrowed-leaf :assembled)
+       :leaves-read @touched})))
+
+(defn read-all
+  "The whole logical byte sequence. Convenience over `read-range`."
+  [get-fn root-cid]
+  (:bytes (read-range get-fn root-cid 0 (size get-fn root-cid))))

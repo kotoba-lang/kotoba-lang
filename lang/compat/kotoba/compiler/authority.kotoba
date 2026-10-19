@@ -1,0 +1,177 @@
+(ns kotoba.compiler.authority
+  "Dynamic authority admission for typed capability calls. Identity proof and
+  delegation verification stay at the host boundary; this module validates
+  their sealed result and intersects it with local runtime policy."
+  {:kotoba/export [context-format decision-format grant-format intersect! max-authority-entries policy-format principal-format validate-decision! validate-scope!]}
+  (:require [kotoba.lang.text :as str]))
+
+(def context-format :kotoba.authority-context/v1)
+(def principal-format :kotoba.principal/v1)
+(def grant-format :kotoba.authority-grant/v1)
+(def policy-format :kotoba.authority-policy/v1)
+(def decision-format :kotoba.authority-decision/v1)
+(def max-authority-entries 256)
+
+(def ^:private context-fields
+  #{:format :principal :grant :local-policy :audience :now})
+(def ^:private principal-fields #{:format :id :proof-sha256})
+(def ^:private grant-fields
+  #{:format :id :subject :audience :not-before :expires :capabilities
+    :evidence-sha256})
+(def ^:private policy-fields
+  #{:format :id :audience :principals :capabilities})
+(def ^:private scope-fields #{:capability :action :resource})
+(def ^:private decision-fields
+  #{:format :principal :audience :capability :action :resource :grant-id
+    :policy-id :grant-evidence-sha256 :principal-proof-sha256})
+
+(defn- fail! [message data]
+  (throw (ex-info message (assoc data :phase :authority))))
+
+(defn- exact-map? [value fields]
+  (and (map? value) (= fields (set (keys value)))))
+
+;; Character classes are spelled as scans over one-character substrings, not
+;; host regex literals: a `#"..."` is host data and the Kotoba project route
+;; refuses it (kotoba.error/host-regex-literal). Each predicate accepts exactly
+;; the language of the regex it replaced (named beside it).
+
+(defn- all-in? [value start alphabet]
+  (loop [i start]
+    (cond (= i (count value)) true
+          (str/includes? alphabet (subs value i (inc i))) (recur (inc i))
+          :else false)))
+
+;; was (re-find #"[\u0000-\u001f\u007f]" value): a code unit below U+0020
+;; compares below " ", and DEL is named.
+(defn- control-free? [value]
+  (loop [i 0]
+    (cond (= i (count value)) true
+          (let [c (subs value i (inc i))]
+            (or (neg? (compare c " ")) (= c "\u007f"))) false
+          :else (recur (inc i)))))
+
+(defn- bounded-string? [value limit]
+  (and (string? value)
+       (not (str/blank? value))
+       (<= (count value) limit)
+       (control-free? value)))
+
+;; was (re-matches #"[0-9a-f]{64}" value)
+(defn- sha256? [value]
+  (and (string? value) (= 64 (count value)) (all-in? value 0 "0123456789abcdef")))
+
+;; was (re-matches #"[a-z][a-z0-9+.-]*:.+" value). `.` is any code unit but a
+;; line terminator; bounded-string? has already refused \n and \r, and
+;; U+2028 / U+2029 are refused here by name. (U+0085 was a terminator for
+;; java.util.regex and not for JavaScript; it is now accepted on both.)
+(defn- principal-id? [value]
+  (and (bounded-string? value 512)
+       (let [colon (str/index-of value ":")]
+         (and (some? colon)
+              (<= 1 colon)
+              (< (inc colon) (count value))
+              (str/includes? "abcdefghijklmnopqrstuvwxyz" (subs value 0 1))
+              (all-in? (subs value 0 colon) 1 "abcdefghijklmnopqrstuvwxyz0123456789+.-")
+              (not (str/includes? value "\u2028"))
+              (not (str/includes? value "\u2029"))))))
+
+(defn- capability-id? [value]
+  (and (integer? value) (<= 0 value 255)))
+
+(defn validate-scope! [scope]
+  (when-not (and (exact-map? scope scope-fields)
+                 (capability-id? (:capability scope))
+                 (qualified-keyword? (:action scope))
+                 (bounded-string? (:resource scope) 2048))
+    (fail! "authority capability scope rejected" {:scope scope}))
+  scope)
+
+(defn validate-decision! [decision]
+  (when-not (and (exact-map? decision decision-fields)
+                 (= decision-format (:format decision))
+                 (principal-id? (:principal decision))
+                 (bounded-string? (:audience decision) 512)
+                 (capability-id? (:capability decision))
+                 (qualified-keyword? (:action decision))
+                 (bounded-string? (:resource decision) 2048)
+                 (bounded-string? (:grant-id decision) 512)
+                 (bounded-string? (:policy-id decision) 512)
+                 (sha256? (:grant-evidence-sha256 decision))
+                 (sha256? (:principal-proof-sha256 decision)))
+    (fail! "authority decision rejected" {}))
+  decision)
+
+(defn- validate-principal! [principal]
+  (when-not (and (exact-map? principal principal-fields)
+                 (= principal-format (:format principal))
+                 (principal-id? (:id principal))
+                 (sha256? (:proof-sha256 principal)))
+    (fail! "verified principal rejected" {}))
+  principal)
+
+(defn- scope-set? [value]
+  (and (set? value)
+       (<= (count value) max-authority-entries)
+       (every? #(try (do (validate-scope! %) true)
+                     (catch  _ false))
+               value)))
+
+(defn- validate-context! [context]
+  (when-not (and (exact-map? context context-fields)
+                 (= context-format (:format context))
+                 (bounded-string? (:audience context) 512)
+                 (integer? (:now context)))
+    (fail! "authority context rejected" {}))
+  (let [{:keys [principal grant local-policy audience now]} context]
+    (validate-principal! principal)
+    (when-not (and (exact-map? grant grant-fields)
+                   (= grant-format (:format grant))
+                   (bounded-string? (:id grant) 512)
+                   (= (:subject grant) (:id principal))
+                   (= (:audience grant) audience)
+                   (integer? (:not-before grant))
+                   (integer? (:expires grant))
+                   (<= (:not-before grant) now)
+                   (< now (:expires grant))
+                   (scope-set? (:capabilities grant))
+                   (sha256? (:evidence-sha256 grant)))
+      (fail! "delegated authority grant rejected" {}))
+    (when-not (and (exact-map? local-policy policy-fields)
+                   (= policy-format (:format local-policy))
+                   (bounded-string? (:id local-policy) 512)
+                   (= (:audience local-policy) audience)
+                   (set? (:principals local-policy))
+                   (<= (count (:principals local-policy)) max-authority-entries)
+                   (every? principal-id? (:principals local-policy))
+                   (contains? (:principals local-policy) (:id principal))
+                   (scope-set? (:capabilities local-policy)))
+      (fail! "local authority policy rejected" {}))
+    context))
+
+(defn intersect!
+  "Returns a sealed decision only when the exact dynamic scope is admitted by
+  the checked program, delegated grant and local policy."
+  [context static-allow scope]
+  (validate-context! context)
+  (validate-scope! scope)
+  (let [{:keys [principal grant local-policy audience]} context
+        capability (:capability scope)]
+    (when-not (contains? static-allow capability)
+      (fail! "capability is outside the checked program authority"
+             {:capability capability}))
+    (when-not (contains? (:capabilities grant) scope)
+      (fail! "capability is outside delegated authority" {:scope scope}))
+    (when-not (contains? (:capabilities local-policy) scope)
+      (fail! "capability is outside local authority policy" {:scope scope}))
+    (validate-decision!
+     {:format decision-format
+      :principal (:id principal)
+      :audience audience
+      :capability capability
+      :action (:action scope)
+      :resource (:resource scope)
+      :grant-id (:id grant)
+      :policy-id (:id local-policy)
+      :grant-evidence-sha256 (:evidence-sha256 grant)
+      :principal-proof-sha256 (:proof-sha256 principal)})))

@@ -1,0 +1,216 @@
+(ns murakumo.infer.image-worker
+  "Single-slot, outbound-only owned image worker. ComfyUI queue occupancy is
+   observed before claiming; existing GPU work is never interrupted."
+  (:require ["node:os" :as os] ["node:child_process" :as cp]))
+(defn json! [url method headers body timeout-ms]
+  (-> (.fetch js/globalThis url
+              (clj->js (cond-> {:method method :headers headers :signal (js/AbortSignal.timeout timeout-ms)}
+                         body (assoc :body (js/JSON.stringify (clj->js body))))))
+      (.then (fn [r] (-> (.json r) (.then #(hash-map :status (.-status r) :body (js->clj % :keywordize-keys true))))))))
+(defn api! [cfg method suffix body]
+  (json! (str (:base cfg) suffix) method
+         {"content-type" "application/json" "authorization" (str "Bearer " (:token cfg))} body 20000))
+(defn local! [cfg method suffix body]
+  (json! (str (:comfy cfg) suffix) method {"content-type" "application/json"} body 10000))
+(defn ok? [r] (<= 200 (:status r 0) 299))
+(defn wait! [ms] (js/Promise. (fn [resolve] (js/setTimeout resolve ms))))
+(def model-files {"animagine-xl-4.0" "animagine-xl-4.0.safetensors" "waiREALMIX_v11" "waiREALMIX_v11.safetensors"})
+(defn available-memory []
+  (if (= "darwin" (.-platform js/process))
+    (try
+      (let [report (cp/execFileSync "/usr/bin/vm_stat" #js [] #js {:encoding "utf8" :timeout 2000})
+            page-size (js/parseInt (second (re-find #"page size of ([0-9]+)" report)) 10)
+            pages (reduce + (map (fn [label]
+                                  (js/parseInt (or (second (re-find (js/RegExp. (str "Pages " label ": +([0-9]+)")) report)) "0") 10))
+                                ["free" "inactive" "speculative"]))]
+        (* page-size pages))
+      (catch :default _ (.freemem os)))
+    (.freemem os)))
+(defn readiness [cfg object-info queue]
+  (let [files (set (get-in object-info [:CheckpointLoaderSimple :input :required :ckpt_name 0]))
+        models (vec (keep (fn [[id file]] (when (contains? files file) id)) (or (some-> (:model-files cfg) deref) model-files)))
+        running (count (:queue_running queue)) pending (count (:queue_pending queue))
+        free (available-memory)]
+    {:name (:name cfg) :models models :running running :pending pending :memory-bytes free
+     :ready (boolean (and (seq models) (zero? running) (zero? pending) (not @(:busy cfg))
+                          (>= free (:min-free cfg))))}))
+(defn release-idle! [cfg]
+  (-> (local! cfg "GET" "/queue" nil)
+      (.then (fn [r]
+               (when (and (ok? r) (empty? (get-in r [:body :queue_running]))
+                          (empty? (get-in r [:body :queue_pending])))
+                 (local! cfg "POST" "/free" {:unload_models true :free_memory true}))))
+      (.catch (fn [_] nil))))
+(defn probe! [cfg]
+  (if-let [probe-fn (:probe-fn cfg)]
+    (probe-fn cfg)
+  (-> (js/Promise.all #js [(local! cfg "GET" "/object_info/CheckpointLoaderSimple" nil)
+                         (local! cfg "GET" "/queue" nil)])
+      (.then (fn [[objects queue]]
+               (when-not (and (ok? objects) (ok? queue)) (throw (js/Error. "ComfyUI probe unavailable")))
+               (let [probe (readiness cfg (:body objects) (:body queue))
+                     last-cleanup (:last-cleanup cfg)]
+                 (if (and last-cleanup (not @(:busy cfg))
+                          (zero? (:running probe)) (zero? (:pending probe))
+                          (< (:memory-bytes probe) (:min-free cfg))
+                          (> (- (js/Date.now) @last-cleanup) 60000))
+                   (do (reset! last-cleanup (js/Date.now))
+                       (-> (release-idle! cfg) (.then (fn [_] probe))))
+                   probe)))))))
+(defn refresh-profiles! [cfg]
+  (if (or (:probe-fn cfg) (not (:model-files cfg)))
+    (js/Promise.resolve nil)
+    (-> (api! cfg "GET" "/infer/image-models/profiles" nil)
+        (.then (fn [r]
+                 (when (ok? r)
+                   (reset! (:model-files cfg)
+                           (merge model-files
+                                  (into {} (keep (fn [[id p]]
+                                                   (when (and (= "comfy-sdxl" (:renderer p)) (:checkpoint p))
+                                                     [(name id) (:checkpoint p)]))
+                                                 (get-in r [:body :profiles]))))))))
+        (.catch (fn [_] nil)))))
+(defn heartbeat! [cfg]
+  (-> (refresh-profiles! cfg)
+      (.then #(probe! cfg))
+      (.catch (fn [_] {:name (:name cfg) :models [] :ready false :running 0 :pending 0 :memory-bytes 0}))
+      (.then (fn [probe]
+               (-> (api! cfg "POST" "/infer/image-workers/heartbeat" probe)
+                   (.then (fn [r] (when-not (= 201 (:status r)) (throw (js/Error. (str "Heartbeat rejected HTTP " (:status r))))) probe)))))))
+(defn workflow [{:keys [checkpoint prompt width height steps seed]}]
+  {"3" {:class_type "KSampler" :inputs {:seed seed :steps steps :cfg 6.5 :sampler_name "euler_ancestral" :scheduler "normal" :denoise 1.0
+                                           :model ["4" 0] :positive ["6" 0] :negative ["7" 0] :latent_image ["5" 0]}}
+   "4" {:class_type "CheckpointLoaderSimple" :inputs {:ckpt_name checkpoint}}
+   "5" {:class_type "EmptyLatentImage" :inputs {:width width :height height :batch_size 1}}
+   "6" {:class_type "CLIPTextEncode" :inputs {:text prompt :clip ["4" 1]}}
+   "7" {:class_type "CLIPTextEncode" :inputs {:text "lowres, bad anatomy, worst quality" :clip ["4" 1]}}
+   "8" {:class_type "VAEDecode" :inputs {:samples ["3" 0] :vae ["4" 2]}}
+   "9" {:class_type "SaveImage" :inputs {:filename_prefix "murakumo-fleet-image" :images ["8" 0]}}})
+(defn fence [cfg claim]
+  (assoc (select-keys claim [:attempt :lease-token]) :worker (:name cfg)))
+(defn image-file [history id]
+  (let [entry (or (get history (keyword id)) (get history id))]
+    (first (mapcat :images (vals (:outputs entry))))))
+(defn comfy-render! [cfg claim lost?]
+  (let [id (:id claim)]
+    (-> (local! cfg "POST" "/prompt" {:prompt (workflow (:input claim))
+                                       :client_id (str "murakumo-image:" id ":" (:attempt claim))})
+        (.then (fn [r]
+                 (let [pid (get-in r [:body :prompt_id])]
+                   (when-not (and (ok? r) (string? pid)) (throw (js/Error. "ComfyUI rejected image job")))
+                   (letfn [(poll! []
+                             (when (or @lost? (>= (js/Date.now) (:deadline claim)))
+                               (throw (js/Error. "Image lease or deadline expired")))
+                             (-> (local! cfg "GET" (str "/history/" (js/encodeURIComponent pid)) nil)
+                                 (.then (fn [h]
+                                          (when-not (ok? h) (throw (js/Error. "ComfyUI history unavailable")))
+                                          (if-let [file (image-file (:body h) pid)]
+                                            (-> (.fetch js/globalThis
+                                                 (str (:comfy cfg) "/view?filename=" (js/encodeURIComponent (:filename file))
+                                                      "&subfolder=" (js/encodeURIComponent (or (:subfolder file) ""))
+                                                      "&type=" (js/encodeURIComponent (or (:type file) "output")))
+                                                 #js {:signal (js/AbortSignal.timeout 10000)})
+                                                (.then (fn [r]
+                                                         (when-not (.-ok r) (throw (js/Error. "Image artifact unavailable")))
+                                                         (.arrayBuffer r)))
+                                                (.then (fn [bytes]
+                                                         (when (> (.-byteLength bytes) 8388608) (throw (js/Error. "Image artifact too large")))
+                                                         (.toString (js/Buffer.from bytes) "base64"))))
+                                            (let [entry (get (:body h) (keyword pid))]
+                                              (if entry (throw (js/Error. "ComfyUI finished without image"))
+                                                (-> (wait! 3000) (.then poll!)))))))))]
+                     (poll!))))))))
+(defn render! [cfg claim lost?]
+  (if-let [render-fn (:render-fn cfg)]
+    (render-fn cfg claim lost?)
+    (comfy-render! cfg claim lost?)))
+(defn acknowledge! [cfg claim b64 lost?]
+  (letfn [(receipt! []
+            (-> (api! cfg "POST" (str "/infer/image-jobs/" (:id claim) "/receipt") (fence cfg claim))
+                (.then (fn [r] (when (and (ok? r) (true? (get-in r [:body :accepted]))) r)))
+                (.catch (fn [_] nil))))
+          (send! [n]
+            (if (or @lost? (>= (js/Date.now) (:deadline claim)))
+              (-> (receipt!) (.then (fn [r] (or r (throw (js/Error. "Result lease expired"))))))
+              (-> (api! cfg "POST" (str "/infer/image-jobs/" (:id claim) "/done") (assoc (fence cfg claim) :b64 b64))
+                  (.then (fn [r]
+                           (cond (ok? r) r
+                                 (>= (:status r) 500) (throw (js/Error. "Transient result store failure"))
+                                 :else (do (reset! lost? true) (throw (js/Error. "Result fenced"))))))
+                  (.catch (fn [e]
+                            ;; A committed done event can make renew return409
+                            ;; while its upload reply is lost. Confirm our exact
+                            ;; fence before reporting failure or uploading again.
+                            (-> (receipt!)
+                                (.then (fn [r]
+                                         (cond r r
+                                               (or @lost? (>= n 5)) (throw e)
+                                               :else (-> (wait! (* 2000 n)) (.then #(send! (inc n)))))))))))))]
+    (send! 1)))
+(defn run! [cfg claim]
+  (let [id (:id claim) lost? (atom (boolean (some-> (:stopping cfg) deref))) completed? (atom false) renewing? (atom false) last-renew (atom (js/Date.now))
+        renew (fn []
+                (when (>= (- (js/Date.now) @last-renew) 85000) (reset! lost? true))
+                (when-not (or @renewing? @lost?)
+                  (reset! renewing? true)
+                  (-> (api! cfg "POST" (str "/infer/image-jobs/" id "/renew") (fence cfg claim))
+                      (.then (fn [r]
+                               (cond (ok? r) (reset! last-renew (js/Date.now))
+                                     :else (do (println "[image] lease update rejected" id "attempt" (:attempt claim)
+                                                        "http" (:status r) "code" (get-in r [:body :error :code]))
+                                               (when (= 409 (:status r)) (reset! lost? true))))))
+                      (.catch (fn [e] (println "[image] lease update unavailable" id "attempt" (:attempt claim) "reason" (.-name e))))
+                      (.finally #(reset! renewing? false)))))
+        timer (js/setInterval renew 20000)]
+    (reset! (:busy cfg) true)
+    (when-let [current (:current-lost cfg)] (reset! current lost?))
+    (println "[image] claimed" id "attempt" (:attempt claim) "model" (:model claim))
+    (-> (render! cfg claim lost?)
+        (.then (fn [b64]
+                 (-> (acknowledge! cfg claim b64 lost?)
+                     (.then (fn [r]
+                              (when-not (ok? r) (throw (js/Error. "Result rejected")))
+                              (reset! completed? true)
+                              (println "[image] completed" id "attempt" (:attempt claim)))))))
+        (.catch (fn [e]
+                  (println "[image] incomplete" id "attempt" (:attempt claim) "reason" (.-name e) (.-message e))
+                  (-> (api! cfg "POST" (str "/infer/image-jobs/" id "/failed") (fence cfg claim))
+                      (.catch (fn [_] nil)))))
+        (.finally (fn [] (js/clearInterval timer) (reset! (:busy cfg) false)
+                    (when-let [current (:current-lost cfg)] (reset! current nil))
+                    (when (and @completed? (:comfy cfg)) (release-idle! cfg)))))))
+(defn poll! [cfg]
+  ;; The independent heartbeat loop publishes once per interval. Polling must
+  ;; only probe locally, otherwise idle nodes continuously contend on head CAS.
+  (-> (probe! cfg)
+      (.then (fn [probe]
+               (when (and (:ready probe) (not (some-> (:stopping cfg) deref)))
+                 (-> (api! cfg "GET" (str "/infer/image-jobs?worker=" (js/encodeURIComponent (:name cfg))) nil)
+                     (.then (fn [r]
+                                  (when-not (ok? r) (throw (js/Error. (str "Image queue unavailable HTTP " (:status r)))))
+                              (letfn [(claim-next! [jobs]
+                                        (when-let [job (first jobs)]
+                                          (-> (api! cfg "POST" (str "/infer/image-jobs/" (:id job) "/claim") {:worker (:name cfg)})
+                                              (.then (fn [r]
+                                                       (cond (= 201 (:status r)) (run! cfg (:body r))
+                                                             (= 409 (:status r)) (claim-next! (rest jobs))
+                                                             :else (throw (js/Error. "Claim rejected"))))))))]
+                                (claim-next! (:body r)))))))))))
+(defn start! [cfg]
+  (let [stopping? (atom false)
+        cfg (assoc cfg :busy (atom false) :model-files (atom model-files) :last-cleanup (atom 0) :current-lost (atom nil) :stopping stopping?) failures (atom 0)
+        stop! (fn [] (reset! stopping? true)
+                (when-let [lost @(:current-lost cfg)] (reset! lost true))
+                (js/setTimeout #(js/process.exit 0) 5000))]
+    (.once js/process "SIGTERM" stop!)
+    (.once js/process "SIGINT" stop!)
+    (letfn [(heartbeat-loop! []
+              (-> (heartbeat! cfg) (.catch (fn [_] nil))
+                  (.finally #(when-not @stopping? (js/setTimeout heartbeat-loop! 15000)))))
+            (loop! []
+              (-> (poll! cfg)
+                  (.then #(reset! failures 0))
+                  (.catch (fn [e] (swap! failures inc) (println "[image] queue connection retry" @failures "reason" (.-name e) (.-message e))))
+                  (.finally #(when-not @stopping? (js/setTimeout loop! (+ 3000 (min 60000 (* 2000 @failures)) (rand-int 2000)))))))]
+      (println "[image] outbound pool worker" (:name cfg))
+      (heartbeat-loop!) (loop!))))

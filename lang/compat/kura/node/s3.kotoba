@@ -1,0 +1,199 @@
+(ns kura.node.s3
+  "An S3-compatible shard store — Backblaze B2, Cloudflare R2, AWS S3, or
+  Storj's Gateway-MT.
+
+  These are the pseudo-nodes Phase 0 runs on (ADR-2607299200 section 8): you
+  cannot pick a storage multiplier without a measured node-loss rate, and you
+  cannot measure one without running the coding, placement, audit and order
+  planes against something real. Rented backends are that something.
+
+  **Read the `:independence` declaration before believing a durability
+  number.** `open` requires it and offers no default. Twenty-six of these on
+  one account are one failure domain, and `kura.node.store/audit` will say so.
+  That is not a flaw in Phase 0 — it is the fact Phase 0 exists to make
+  visible.
+
+  **Zero I/O and zero crypto here.** `IHttp` puts a fully signed request on the
+  wire; `ICrypto` supplies SHA-256 and HMAC. Both are injected, so this
+  namespace stays portable `.cljc` and testable without a network — which is
+  what lets the request-shaping be checked against known-good vectors rather
+  than against whatever a live bucket happens to accept today. The seam is
+  lifted from `storj.protocols`, and the signing from `kotoba-lang/sigv4`."
+  (:require [kotoba.lang.text :as str]
+            [kura.node.store :as store]
+            [sigv4.core :as sigv4]))
+
+(defprotocol IHttp
+  (-request [this req]
+    "`req` is `{:method :url :headers :body}`. Returns
+     `{:status :headers :body}`. Implementors must not follow redirects
+     silently — a redirect invalidates the signature."))
+
+(defprotocol ICrypto
+  (-sha256-hex [this bytes] "Hex SHA-256 of a byte buffer.")
+  (-hmac-sha256 [this key-bytes message] "HMAC-SHA-256, returning raw bytes.")
+  (-hex [this bytes] "Hex-encode raw bytes.")
+  (-utf8 [this s] "UTF-8 encode a string to bytes."))
+
+;; --- signing ---------------------------------------------------------------
+
+(defn signing-key
+  "Fold the host's HMAC over `sigv4/signing-key-chain`'s ladder.
+
+  sigv4 returns the ladder as data rather than deriving it, precisely so that
+  the key derivation happens in whatever the host's audited crypto is and not
+  in a library that would have to ship its own."
+  [crypto secret short-date region service]
+  (let [{:keys [seed steps]} (sigv4/signing-key-chain secret short-date region service)]
+    (reduce (fn [k step] (-hmac-sha256 crypto k (-utf8 crypto step)))
+            (-utf8 crypto seed)
+            steps)))
+
+(defn sign
+  "Produce the headers for a signed S3 request.
+
+  `now-iso` is supplied by the caller — sigv4 never reads a clock, which is
+  what makes its reference vectors reproducible, and inheriting that here
+  means a signing test is a pure function of its inputs."
+  [{:keys [crypto key-id secret region service host method path query body now-iso]
+    :or {service "s3"}}]
+  (let [{:keys [long short]} (sigv4/amz-dates now-iso)
+        payload-hash (-sha256-hex crypto body)
+        headers {"host" host
+                 "x-amz-content-sha256" payload-hash
+                 "x-amz-date" long}
+        {:keys [canonical-request signed-headers]}
+        (sigv4/canonical-request {:method method :path path :query query
+                                  :headers headers :payload-hash payload-hash})
+        scope (sigv4/credential-scope short region service)
+        sts (sigv4/string-to-sign long scope (-sha256-hex crypto (-utf8 crypto canonical-request)))
+        sig (-hex crypto (-hmac-sha256 crypto
+                                       (signing-key crypto secret short region service)
+                                       (-utf8 crypto sts)))]
+    (assoc headers "authorization"
+           (sigv4/authorization-header key-id scope signed-headers sig))))
+
+(defn object-path
+  "Canonical path for `key` in `bucket`. Re-exported so a host adapter can
+  shape a request without reaching around this namespace into sigv4 — the
+  path encoding is part of what gets signed, and two places deriving it
+  independently is how a signature silently stops matching its own URL."
+  [bucket key]
+  (sigv4/object-path bucket key))
+
+(defn canonical-query
+  "Canonical query string. Re-exported for the same reason as `object-path`."
+  [params]
+  (sigv4/canonical-query params))
+
+;; --- request shaping -------------------------------------------------------
+
+(defn- shard-key [prefix shard-id]
+  (str (when (seq prefix) (str (str/replace prefix #"/+$" "") "/")) shard-id))
+
+(defn- url [endpoint path query]
+  (str endpoint path (when (seq query) (str "?" query))))
+
+(defn- send!
+  [{:keys [http crypto key-id secret region service endpoint host bucket now-fn]}
+   method key & {:keys [body headers query]}]
+  (let [body (or body ( 0))
+        path (sigv4/object-path bucket key)
+        q (sigv4/canonical-query query)
+        signed (sign {:crypto crypto :key-id key-id :secret secret
+                      :region region :service (or service "s3") :host host
+                      :method method :path path :query q :body body
+                      :now-iso (now-fn)})]
+    (-request http {:method method
+                    :url (url endpoint path q)
+                    :headers (merge signed headers)
+                    :body body})))
+
+;; --- the store -------------------------------------------------------------
+
+(defn- ok? [{:keys [status]}] (and status (<= 200 status 299)))
+
+(defrecord S3Store [cfg desc]
+  store/IShardStore
+  (-put-shard! [_ shard-id bytes]
+    (assert (store/valid-shard-id? shard-id) (str "bad shard id: " shard-id))
+    (let [resp (send! cfg :put (shard-key (:prefix cfg) shard-id) :body bytes)]
+      (when-not (ok? resp)
+        (throw (ex-info "shard put failed" {:shard-id shard-id :status (:status resp)})))
+      {:shard-id shard-id
+       :bytes-written }))
+
+  (-get-shard [_ shard-id]
+    (let [resp (send! cfg :get (shard-key (:prefix cfg) shard-id))]
+      (when (ok? resp) (:body resp))))
+
+  (-get-range [_ shard-id offset length]
+    ;; A real HTTP Range header, not a whole-object read and a slice — the
+    ;; systematic layout's entire benefit is that a range costs a range
+    ;; (ADR-2607299200 section 7), and a backend that quietly reads 4 MiB to
+    ;; return 1 KiB gives the amplification back.
+    (let [resp (send! cfg :get (shard-key (:prefix cfg) shard-id)
+                      :headers {"range" (str "bytes=" offset "-" (+ offset length -1))})]
+      (when (ok? resp) (:body resp))))
+
+  (-delete-shard! [_ shard-id]
+    (ok? (send! cfg :delete (shard-key (:prefix cfg) shard-id))))
+
+  (-list-shards [_ prefix]
+    ;; ListObjectsV2 against the bucket root; the caller's prefix is joined to
+    ;; the configured one. Parsing is the caller's XML parser via :parse-list,
+    ;; injected for the same reason the transport is.
+    (let [full (shard-key (:prefix cfg) (or prefix ""))
+          resp (send! cfg :get "" :query {"list-type" "2" "prefix" full})]
+      (if (ok? resp)
+        ;; Filtered again on this side. The `prefix` parameter is what S3 is
+        ;; for, but "S3-compatible" is a claim rather than a conformance
+        ;; result, and a backend that accepts the parameter and ignores it
+        ;; would hand back the whole bucket — which the audit tree would then
+        ;; commit to as shards this node holds. Re-filtering costs nothing and
+        ;; turns a silent wrong commitment into a correct one.
+        (->> ((:parse-list cfg) (:body resp))
+             (filter #(str/starts-with? % (or prefix "")))
+             sort
+             vec)
+        [])))
+
+  (-shard-size [_ shard-id]
+    (let [resp (send! cfg :head (shard-key (:prefix cfg) shard-id))]
+      (when (ok? resp)
+        (some-> (get-in resp [:headers "content-length"]) str
+                ))))
+
+  store/INodeIdentity
+  (-descriptor [_] desc))
+
+(defn open
+  "Open an S3-compatible shard store.
+
+  `:independence` and `:failure-domain` are REQUIRED and have no default. The
+  flattering answer is the one that voids the durability argument, so the
+  library refuses to pick it for you (`kura.node.store/independence-profiles`).
+
+  `:now-fn` supplies the current instant as an ISO-8601 string; `:parse-list`
+  turns a ListObjectsV2 body into a sequence of keys. Both injected so this
+  namespace does no I/O and reads no clock."
+  [{:keys [node-id independence availability failure-domain endpoint host bucket region
+           key-id secret prefix http crypto now-fn parse-list service]
+    :or {prefix "kura" region "us-east-1" service "s3"}}]
+  (assert (and http crypto) "http and crypto must be injected")
+  (assert (and now-fn parse-list) "now-fn and parse-list must be injected")
+  (assert (and endpoint host bucket) "endpoint, host and bucket are required")
+  (->S3Store
+   {:http http :crypto crypto :key-id key-id :secret secret
+    :region region :service service :endpoint endpoint :host host
+    :bucket bucket :prefix prefix :now-fn now-fn :parse-list parse-list}
+   (store/descriptor
+    {:node-id node-id
+     :failure-domain failure-domain
+     :independence independence
+     ;; NOT baked in. S3 is a protocol, not a provider: B2 and AWS are
+     ;; always-on because that is what the bill buys, but MinIO on somebody's
+     ;; laptop speaks the same interface and is not. Assuming the rented case
+     ;; would silently promise reachability for the self-hosted one.
+     :availability availability
+     :capabilities #{:range-read :list :delete :size-without-read :durable-put}})))

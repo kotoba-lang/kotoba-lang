@@ -1,0 +1,149 @@
+(ns ipld.dag-pb
+  "DAG-PB — the IPLD codec UnixFS is written in, encoded byte-exactly.
+
+  `ipld.core` owns DAG-CBOR, which is a clean codec: canonical, ordered,
+  no history. DAG-PB is the opposite and that is the whole reason this
+  namespace exists rather than a protobuf schema at the call site. Two of
+  its rules are not derivable from the `.proto` and break any encoder that
+  assumes protobuf's own canonical form:
+
+  - **`Links` is field 2 and `Data` is field 1, and `Links` is written
+    first.** Field order on the wire is descending, not ascending. An
+    encoder that emits fields in numeric order — which is what a
+    deterministic protobuf library correctly does — produces a different
+    block, and therefore a different CID, for the same node.
+  - **`Name` is written even when it is the empty string.** Protobuf omits
+    default-valued optional fields; go-merkledag sets `Name` explicitly on
+    every file chunk link, so the two bytes `12 00` are part of the block
+    every real implementation hashes.
+
+  `protobuf.wire` gets both of these right for its own purpose and wrong
+  for this one: it emits ascending field numbers and never emits a
+  default. That is the correct choice for a signed IPNS record and it
+  cannot produce a DAG-PB block. So encoding here is explicit, and only
+  decoding delegates — a decoder may read fields in any order, and the
+  unknown-field preservation `protobuf.wire` provides is exactly right for
+  a codec whose blocks are written by other implementations.
+
+  ## What this is checked against
+
+  Real blocks from `ipfs add --cid-version=1 --raw-leaves` (kubo 0.41),
+  pinned as hex in `ipld.dag-pb-test`. A codec whose only fixtures come
+  from its own encoder is self-consistent and says nothing about whether
+  anyone else can read it — the failure that shipped in this workspace's
+  first UnixFS implementation, where `Links` and `Data` were transposed
+  and every test still passed because every fixture was self-generated.
+
+  ## Bytes
+
+  Block bytes in and out are platform bytes (`byte[]` on the JVM,
+  `Uint8Array` on ClojureScript), matching `multiformats.core` and
+  `ipld.core`. Link hashes and `Data` payloads are vectors of unsigned
+  ints, matching what `protobuf.wire` reads and writes."
+  {:kotoba/export [cid codec decode encode link-schema node->block node-schema]}
+  (:require [kotoba.bytes :as kbytes] [multiformats.core :as mf]
+            [protobuf.wire :as pb]))
+
+(def ^:const codec
+  "The DAG-PB multicodec. `multiformats.core` names raw (0x55) and
+  dag-cbor (0x71); this is the third."
+  0x70)
+
+;; ── bytes ─────────────────────────────────────────────────────────────────
+
+(defn- ->octets
+  "Anything byte-shaped → a vector of unsigned ints."
+  [b]
+  (cond
+    (nil? b) []
+    (string? b) 
+    :else (mapv #(bit-and (int %) 0xff) (seq b))))
+
+(defn- ->bytes
+  "A vector of unsigned ints → platform bytes."
+  [octets]
+  )
+
+;; ── protobuf wire, written out ────────────────────────────────────────────
+
+(defn- varint [n]
+  (loop [v (long n) out []]
+    (if (< v 0x80)
+      (conj out (int v))
+      (recur (unsigned-bit-shift-right v 7)
+             (conj out (int (bit-or 0x80 (bit-and v 0x7f))))))))
+
+(defn- tag [field wire-type]
+  (varint (bit-or (bit-shift-left field 3) wire-type)))
+
+(defn- length-delimited [field octets]
+  (into (into (tag field 2) (varint (count octets))) octets))
+
+;; ── encode ────────────────────────────────────────────────────────────────
+
+(defn- encode-link
+  "One PBLink. `:hash` is required — a link with no target is not a link.
+
+  `:name` is emitted whenever the key is present, including `\"\"`, because
+  that is what the reference implementation writes and the block is hashed
+  as written. Omitting it is not a smaller encoding of the same node; it is
+  a different node with a different CID."
+  [{:keys [hash name tsize]}]
+  (when (nil? hash)
+    (throw (ex-info "dag-pb: a link needs a :hash" {:link {:name name :tsize tsize}})))
+  (cond-> (length-delimited 1 (->octets (if (string? hash) (mf/cid->bytes hash) hash)))
+    (some? name) (into (length-delimited 2 (->octets name)))
+    (some? tsize) (into (into (tag 3 0) (varint tsize)))))
+
+(defn encode
+  "A node `{:links [{:hash :name :tsize}] :data <octets>}` → block bytes.
+
+  Links keep the order given. For a UnixFS file that order is the file's
+  own byte order and reordering corrupts it; for a directory the caller
+  sorts by name, because that is a UnixFS rule and not a DAG-PB one."
+  [{:keys [links data]}]
+  (->bytes
+   (cond-> (into [] (mapcat #(length-delimited 2 (encode-link %))) links)
+     (seq data) (into (length-delimited 1 (->octets data))))))
+
+(defn cid
+  "CIDv1/dag-pb/sha2-256 of already-encoded block bytes."
+  [block-bytes]
+  (mf/cidv1 codec (mf/multihash-sha256 block-bytes)))
+
+(defn node->block
+  "Encode and address in one step: `{:cid <string> :bytes <block bytes>}`.
+  Mirrors `ipld.core/node->block`."
+  [node]
+  (let [bytes (encode node)]
+    {:cid (cid bytes) :bytes bytes}))
+
+;; ── decode ────────────────────────────────────────────────────────────────
+
+(def link-schema
+  "PBLink. Field numbers are the spec's; the wire order they arrive in is
+  not this map's business."
+  {1 {:name :hash :type :bytes}
+   2 {:name :name :type :string}
+   3 {:name :tsize :type :uint64}})
+
+(def node-schema
+  "PBNode. `Data` is 1 and `Links` is 2 — the pair that is transposed in
+  every implementation that guessed."
+  {1 {:name :data :type :bytes}
+   2 {:name :links :type :message :schema link-schema :repeated true}})
+
+(defn decode
+  "Block bytes → `{:links [{:cid :hash :name :tsize}] :data <octets>}`.
+
+  Each link carries both its raw `:hash` octets and the `:cid` string they
+  spell, so a caller can fetch the child without re-deriving multibase."
+  [block-bytes]
+  (let [node (pb/decode node-schema (->octets block-bytes))]
+    {:data (vec (or (:data node) []))
+     :links (mapv (fn [l]
+                    {:hash (vec (:hash l))
+                     :cid (str "b" (mf/base32 (:hash l)))
+                     :name (:name l)
+                     :tsize (:tsize l)})
+                  (or (:links node) []))}))

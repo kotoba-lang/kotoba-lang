@@ -1,0 +1,211 @@
+(ns kotoba.compiler.nbb.host.fs
+  "MECHANISM LAYER -- the nbb/Node handler of the fs/app-data (catalog wire
+  35) and fs/browse (wire 34) abilities (superproject adr-2609242330 S5,
+  section 1 (c)). Not Kotoba source: a compiler module writes
+  `(fs/app-data request)` / `(fs/browse dir)` and requires this namespace
+  only under `#?(:cljs ...)`.
+
+  The request grammar is the wire's (kotoba-lang lang/capability-catalog.edn
+  `:fs/app-data :forms`), with the same token precedence as the kexe loader:
+  a content form (WRITE, APPEND) is taken by its EARLIEST token, since its
+  content may hold any text; every other form by its one token.
+
+    \"<path>WRITE_SEP<content>\"   create/truncate, O_NOFOLLOW, 0644; answers the content
+    \"<path>APPEND_SEP<content>\"  append to an EXISTING file, O_NOFOLLOW; answers the content
+    \"<path>EXISTS_SEP\"           \"1\" / \"0\" (a regular file)
+    \"<path>RANGE_SEP<off>:<len>\" exactly those bytes of a regular file (O_NOFOLLOW)
+    \"<path>STAT_SEP\"             \"<mode> <size> <blocks> <isdir>\" or \"\"
+    \"<path>MTIME_SEP\"            seconds since the epoch, or \"\"
+    \"<path>CHMOD_SEP<octal>\"     \"1\" / \"0\"; 1..6 octal digits, permission bits only
+    \"<path>MKDIR_SEP\"            \"1\" / \"0\"
+    \"<path>UNLINK_SEP\"           \"1\" / \"0\"
+    \"<path>RMDIR_SEP\"            \"1\" / \"0\"
+    \"<from>RENAME_SEP<to>\"       \"1\" / \"0\"
+    \"<path>FSYNC_SEP\"            \"1\" once fsync returned, \"0\" otherwise
+    \"<dir>MKTEMP_SEP<prefix>\"    a NEW 0700 directory <dir>/<prefix>XXXXXX, or \"\"
+    \"<path>NOFOLLOW_SEP\"         \"<mode> <size> <blocks> <kind>\" of the final
+                                  component itself (kind 0 file, 1 dir,
+                                  2 symlink, 3 other), or \"\"
+    \"<path>OWNER_SEP\"            \"<owner uid> <process euid>\" of the final
+                                  component itself, or \"\" (proposed; nbb only)
+    \"<path>\"                     read, answers the file's text
+
+  `app-data-bytes` is the same wire with a BYTES payload -- the answer of
+  READ and RANGE, the content of WRITE and APPEND. The catalog lists that as
+  the proposed `:bytes` answer kind of wire 35: Kotoba's `typed-cap-call`
+  admits `[:string :string]` and no bytes pair yet, so a Kotoba module cannot
+  name it (superproject adr-2609242330 S5).
+
+  What this profile does NOT do, and says so: it holds no fs-scope. nbb runs
+  with the authority of the Node process, as the compiler's node:fs calls
+  always have; a scope is what the native profiles seal into the image. STAT
+  and READ follow a final symlink here (statSync / readFileSync, the calls the
+  compiler made before this layer); NOFOLLOW, RANGE, WRITE and APPEND do not.
+  The handler parses the wire and makes one Node call per form -- no path
+  containment, no cache or ownership decision. A malformed request, and a
+  RANGE outside the file, throw by name (the static image traps). See
+  kotoba.compiler.nbb.host.io for the layer's contract."
+  {:kotoba/export []}
+  (:require ["node:fs" :as fs]))
+
+(defn- split-at-token [request token]
+  (let [at (.indexOf request token)]
+    (when (>= at 0)
+      [(subs request 0 at) (subs request (+ at (count token))) at])))
+
+(defn- answer [f]
+  (try (if (f) "1" "0") (catch :default _ "0")))
+
+(defn- decode [buffer]
+  (try
+    (.decode (js/TextDecoder. "utf-8" #js {:fatal true}) buffer)
+    (catch :default _
+      (throw (ex-info "fs/app-data answer is not valid UTF-8"
+                      {:phase :host :reason :fs/invalid-utf8})))))
+
+(defn- constants [] (.-constants fs))
+
+(defn- no-follow [] (or (.-O_NOFOLLOW (constants)) 0))
+
+(defn- stat-answer [path]
+  (try
+    (let [s (.statSync fs path)]
+      (str (bit-and (.-mode s) 511) " " (.-size s) " " (.-blocks s) " "
+           (if (.isDirectory s) 1 0)))
+    (catch :default _ "")))
+
+(defn- nofollow-answer [path]
+  (try
+    (let [s (.lstatSync fs path)]
+      (str (bit-and (.-mode s) 511) " " (.-size s) " " (.-blocks s) " "
+           (cond (.isFile s) 0 (.isDirectory s) 1 (.isSymbolicLink s) 2 :else 3)))
+    (catch :default _ "")))
+
+(defn- owner-answer [path]
+  (try
+    (let [s (.lstatSync fs path)]
+      (str (.-uid s) " " (if (.-geteuid js/process) (.geteuid js/process) -1)))
+    (catch :default _ "")))
+
+(defn- write! [path content flags]
+  (let [fd (.openSync fs path flags 420)
+        bytes (if (string? content) (.from js/Buffer content "utf8") content)]
+    (try
+      (loop [offset 0]
+        (when (< offset (.-length bytes))
+          (recur (+ offset (.writeSync fs fd bytes offset (- (.-length bytes) offset))))))
+      (finally (.closeSync fs fd)))
+    content))
+
+(defn- range-bytes [path spec]
+  (let [[_ offset length] (re-matches #"([0-9]{1,19}):([0-9]{1,19})" spec)]
+    (when-not offset
+      (throw (ex-info "fs/app-data RANGE spec must be <offset>:<length>"
+                      {:phase :host :form :range :spec spec})))
+    (let [offset (js/Number offset)
+          length (js/Number length)
+          fd (.openSync fs path (bit-or (.-O_RDONLY (constants)) (no-follow)))]
+      (try
+        (let [info (.fstatSync fs fd)]
+          (when-not (and (.isFile info) (<= (+ offset length) (.-size info)))
+            (throw (ex-info "fs/app-data RANGE window is outside the regular file"
+                            {:phase :host :form :range :reason :fs/range-outside})))
+          (let [buffer (.alloc js/Buffer length)]
+            (loop [done 0]
+              (if (< done length)
+                (let [n (.readSync fs fd buffer done (- length done) (+ offset done))]
+                  (if (zero? n)
+                    (throw (ex-info "fs/app-data RANGE window is outside the regular file"
+                                    {:phase :host :form :range :reason :fs/range-outside}))
+                    (recur (+ done n))))
+                buffer))))
+        (finally (.closeSync fs fd))))))
+
+(defn- chmod-answer [path digits]
+  (when-not (re-matches #"[0-7]{1,6}" digits)
+    (throw (ex-info "fs/app-data CHMOD takes 1..6 octal digits"
+                    {:phase :host :form :chmod :mode digits})))
+  (answer #(do (.chmodSync fs path (bit-and (js/parseInt digits 8) 511)) true)))
+
+(defn- fsync-answer [path]
+  ;; A regular file is opened read-write: Windows' FlushFileBuffers needs a
+  ;; writable handle (fsync of a read-only one answers EPERM there, measured
+  ;; on the windows-arm64 CI job 2026-09-25); a directory can only be opened
+  ;; read-only.
+  (answer #(let [fd (.openSync fs path (if (.isDirectory (.statSync fs path))
+                                          (.-O_RDONLY (constants))
+                                          (.-O_RDWR (constants))))]
+             (try (.fsyncSync fs fd) true
+                  (finally (.closeSync fs fd))))))
+
+(defn- mktemp-answer [dir prefix]
+  (when (or (.includes prefix "/") (.includes prefix "\u0000"))
+    (throw (ex-info "fs/app-data MKTEMP prefix must not hold / or NUL"
+                    {:phase :host :form :make-temp-dir})))
+  (try (.mkdtempSync fs (str dir "/" prefix))
+       (catch :default _ "")))
+
+(defn- content-form
+  "The WRITE / APPEND split of REQUEST, taken by the EARLIEST token."
+  [request]
+  (let [write (split-at-token request "WRITE_SEP")
+        append (split-at-token request "APPEND_SEP")]
+    (cond
+      (and write (or (nil? append) (< (nth write 2) (nth append 2)))) [:write write]
+      append [:append append])))
+
+(defn- write-flags []
+  (let [c (constants)]
+    (bit-or (.-O_WRONLY c) (.-O_CREAT c) (.-O_TRUNC c) (no-follow))))
+
+(defn- append-flags []
+  (let [c (constants)]
+    (bit-or (.-O_WRONLY c) (.-O_APPEND c) (no-follow))))
+
+(defn- dispatch [request content-override read-answer]
+  (if-let [[kind [path content]] (content-form request)]
+    (let [content (if (some? content-override) content-override content)]
+      (case kind
+        :write (write! path content (write-flags))
+        :append (write! path content (append-flags))))
+    (condp (fn [token request] (split-at-token request token)) request
+      "EXISTS_SEP" :>> (fn [[path]] (answer #(.isFile (.statSync fs path))))
+      "RANGE_SEP" :>> (fn [[path spec]] (read-answer (range-bytes path spec)))
+      "STAT_SEP" :>> (fn [[path]] (stat-answer path))
+      "MTIME_SEP" :>> (fn [[path]]
+                        (try (str (js/Math.floor (/ (.-mtimeMs (.statSync fs path)) 1000)))
+                             (catch :default _ "")))
+      "CHMOD_SEP" :>> (fn [[path digits]] (chmod-answer path digits))
+      "MKDIR_SEP" :>> (fn [[path]] (answer #(do (.mkdirSync fs path) true)))
+      "UNLINK_SEP" :>> (fn [[path]] (answer #(do (.unlinkSync fs path) true)))
+      "RMDIR_SEP" :>> (fn [[path]] (answer #(do (.rmdirSync fs path) true)))
+      "RENAME_SEP" :>> (fn [[from to]] (answer #(do (.renameSync fs from to) true)))
+      "FSYNC_SEP" :>> (fn [[path]] (fsync-answer path))
+      "MKTEMP_SEP" :>> (fn [[dir prefix]] (mktemp-answer dir prefix))
+      "NOFOLLOW_SEP" :>> (fn [[path]] (nofollow-answer path))
+      "OWNER_SEP" :>> (fn [[path]] (owner-answer path))
+      (read-answer (.readFileSync fs request)))))
+
+(defn app-data
+  "fs/app-data 35, text answers."
+  [request]
+  (dispatch request nil decode))
+
+(defn app-data-bytes
+  "fs/app-data 35 with a bytes payload: READ and RANGE answer a byte buffer;
+  with CONTENT, the WRITE / APPEND request `<path>WRITE_SEP` writes those
+  bytes. Every other form answers as `app-data` does."
+  ([request] (dispatch request nil identity))
+  ([request content] (dispatch request content identity)))
+
+(defn browse
+  "fs/browse 34: DIR's entries as NAME<TAB>D lines (D 1 for a directory),
+  sorted bytewise by name, joined by a single newline; \".\" and \"..\" are
+  never listed."
+  [dir]
+  (let [entries (.readdirSync fs dir #js {:withFileTypes true})
+        rows (map (fn [e] [(.-name e) (if (.isDirectory e) "1" "0")]) entries)
+        sorted (sort-by first (fn [a b] (js/Buffer.compare (js/Buffer.from a "utf8")
+                                                          (js/Buffer.from b "utf8")))
+                        rows)]
+    (apply str (interpose "\n" (map (fn [[n d]] (str n "\t" d)) sorted)))))

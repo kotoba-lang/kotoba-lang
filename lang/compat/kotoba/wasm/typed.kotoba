@@ -1,0 +1,486 @@
+(ns kotoba.wasm.typed
+  "Wasm-specific typed metadata: the custom section, its ABI versions, and the
+  wasm type mapping.
+
+  The structural descriptor language and its byte encoding used to live here
+  and now live in `kotoba.kir.descriptor` (T0), because the native capability
+  boundary needs the same encoding and there must be exactly one of it. The
+  names are re-exported below so every caller of this namespace is unchanged;
+  what moved is where they are defined, not what they mean."
+  {:kotoba/export [abi-version boolean-result-ops bounded-map-descriptor bounded-map-option-descriptor bounded-map-wasm-entry-limit bytes-abi-version capability-contracts compact-graph-abi-version custom-section-name descriptor-indices descriptor-table descriptor? document-abi-version encode-descriptor hetero-item-type host-index infer-type keyword-text list-abi-version literal-indices literal-table lower-bounded-maps metadata-bytes primitive-tags reference-type? requires-host-runtime? scalar-adt-aliases schema-abi-version symbol-abi-version text-bytes uleb utf8 wasm-type]}
+  )
+
+;; Re-exported from kotoba.kir.descriptor. Vars rather than aliases so that
+;; `kotoba.wasm.typed/encode-descriptor` keeps resolving for existing callers
+;; in this repo and in the compiler.
+(def primitive-tags descriptor/primitive-tags)
+(def scalar-adt-aliases descriptor/scalar-adt-aliases)
+(def boolean-result-ops descriptor/boolean-result-ops)
+(def descriptor? descriptor/descriptor?)
+(def uleb descriptor/uleb)
+(def utf8 descriptor/utf8)
+(def text-bytes descriptor/text-bytes)
+(def keyword-text descriptor/keyword-text)
+(def encode-descriptor descriptor/encode-descriptor)
+(def descriptor-table descriptor/descriptor-table)
+(def descriptor-indices descriptor/descriptor-indices)
+(def capability-contracts descriptor/capability-contracts)
+
+(def abi-version 8)
+(def schema-abi-version 9)
+(def compact-graph-abi-version 10)
+(def document-abi-version 11)
+(def symbol-abi-version 12)
+(def list-abi-version 13)
+(def bytes-abi-version 14)
+(def custom-section-name "kotoba.typed")
+
+
+(declare literal-table reference-type?)
+
+;; --- the bounded `:map` value type ------------------------------------------
+;;
+;; KIR carries two map vocabularies. `typed-map-*` is the canonical parametric
+;; map: it names its own `[:map K V]` descriptor at every use, and this backend
+;; has emitted it since the typed value ABI landed. `map-new` / `map-get` /
+;; `map-assoc` are the BOUNDED map -- what a bare `{:k 1}` literal desugars to
+;; -- and its descriptor is not written down anywhere, because the frontend
+;; fixes it: `kotoba.compiler.frontend` checks every key as `:keyword` and
+;; every value as `:i64`, so the bounded map IS `[:map :keyword :i64]` and
+;; nothing else can be spelled.
+;;
+;; That descriptor was the whole of the gap. Before this, a bounded map
+;; refused in two different places with two different messages, and closing
+;; either one alone left the other standing:
+;;
+;;   (get {:value 9} :value)          -> emit*'s fallthrough in
+;;                                       kotoba.wasm.core, "typed Wasm
+;;                                       operation is not qualified": `map-get`
+;;                                       is neither an emitter case nor a
+;;                                       function in the module.
+;;   (let [m {:value 9}] ...)         -> `infer-type` below, "unsupported
+;;                                       typed Wasm expression": a `let` needs
+;;                                       the STATIC type of its init, and
+;;                                       `map-new` had no inference case.
+;;
+;; Which message a program got depended on whether it bound the map to a
+;; local, not on anything about maps. Rewriting the three operations onto the
+;; canonical vocabulary here -- before inference, emission, the descriptor
+;; table, the literal table and the custom section see the module -- closes
+;; both, and it does so by reusing machinery those two tables already carry
+;; rather than by adding a third map representation to this backend.
+(def bounded-map-descriptor
+  "The bounded `:map` value type, written as the descriptor it already is."
+  [:map :keyword :i64])
+
+(def bounded-map-option-descriptor
+  "What `typed-map-get` answers for a `[:map :keyword :i64]`."
+  [:option :i64])
+
+(def bounded-map-wasm-entry-limit
+  "Entries a bounded map may hold once it is a typed map on this backend.
+
+  The typed value runtime rejects a 32nd entry (`typed map entry budget
+  exceeded`), while `kotoba.kir.value/map-entry-limit` admits 128 for the
+  bounded map on the KIR oracle. The two numbers are real and they differ, so
+  a literal over the smaller one is refused HERE, by name, at compile time --
+  rather than emitted into a module that traps when the entry is added. A
+  computed `map-assoc` can still cross it at runtime; that one the runtime
+  owns."
+  31)
+
+(defn- bounded-map-call [op args form]
+  (case op
+    map-new
+    (do (when (> (quot (count args) 2) bounded-map-wasm-entry-limit)
+          (throw (ex-info "bounded map exceeds the typed map entry budget"
+                          {:phase :wasm-typed-lowering
+                           :entries (quot (count args) 2)
+                           :limit bounded-map-wasm-entry-limit
+                           :form form})))
+        (apply list 'typed-map-new bounded-map-descriptor args))
+    ;; `map-get`'s default is evaluated only when the key is absent, which is
+    ;; exactly `option-value-of`'s else branch -- so the laziness the KIR
+    ;; oracle gives it survives the rewrite instead of being restored by hand.
+    map-get
+    (let [[value key fallback] args]
+      (list 'option-value-of bounded-map-option-descriptor
+            (list 'typed-map-get bounded-map-descriptor value key)
+            fallback))
+    map-assoc
+    (reduce (fn [current [key item]]
+              (list 'typed-map-assoc bounded-map-descriptor current key item))
+            (first args)
+            (partition 2 (rest args)))))
+
+(defn- lower-bounded-map-form [form]
+  (cond
+    (and (seq? form) (seq form))
+    (let [op (first form)
+          args (mapv lower-bounded-map-form (rest form))]
+      (if (contains? '#{map-new map-get map-assoc} op)
+        (bounded-map-call op args form)
+        (apply list op args)))
+    ;; Descriptor vectors survive this unchanged (they hold only keywords and
+    ;; nested descriptors), and `let` binding vectors need walking, so both go
+    ;; through the same branch.
+    (vector? form) (mapv lower-bounded-map-form form)
+    :else form))
+
+(defn- lower-bounded-map-type [type]
+  (if (= :map type) bounded-map-descriptor type))
+
+(defn lower-bounded-maps
+  "Rewrite the bounded map onto the canonical typed map, everywhere in KIR.
+
+  Idempotent: a module with no bounded map is returned structurally equal to
+  its input, so applying this twice -- `requires-host-runtime?` and `emit` each
+  apply it, because each is reached independently -- is the same as applying
+  it once."
+  [kir]
+  (-> kir
+      (update :functions
+              (fn [functions]
+                (mapv (fn [function]
+                        (cond-> (update function :body lower-bounded-map-form)
+                          (:param-types function)
+                          (update :param-types #(mapv lower-bounded-map-type %))
+                          (:result function)
+                          (update :result lower-bounded-map-type)))
+                      functions)))
+      (cond->
+       (:signature kir)
+       (update :signature
+               (fn [signature]
+                 (cond-> signature
+                   (:params signature) (update :params #(mapv lower-bounded-map-type %))
+                   (:result signature) (update :result lower-bounded-map-type)))))))
+
+
+(defn requires-host-runtime?
+  ([kir] (requires-host-runtime? kir {}))
+  ([kir {:keys [native-bool?]}]
+   ;; i64, f32, and f64 are native Wasm scalars. Canonical Component adapters
+   ;; may additionally opt into bool=i32; ordinary KIR v4 deliberately keeps
+   ;; bool as a sealed externref.
+   ;; The bounded map is rewritten before the question is asked. An empty
+   ;; `(map-new)` carries no keyword literal and no descriptor of its own, so
+   ;; asking the raw KIR would answer "no host value" for a module that, once
+   ;; emitted, imports `kotoba:typed` -- the module would then declare no
+   ;; reference-types feature for imports it actually has.
+   (let [kir (lower-bounded-maps kir)
+         native-types (cond-> #{:i64 :f32 :f64} native-bool? (conj :bool))
+         signature-types (mapcat (fn [{:keys [param-types result]}]
+                                   (conj (vec param-types) result))
+                                 (:functions kir))
+         ;; `descriptor-table` walks the sealed KIR map and therefore also
+         ;; observes the map's own keyword-valued metadata as `:keyword`.
+         ;; Actual guest keyword literals are independently present in the
+         ;; body-only literal table, so discard only that metadata artefact.
+         body-descriptors (disj (set (descriptor-table kir)) :keyword)
+         literals (if native-bool?
+                    (remove #(= :bool (first %)) (literal-table kir))
+                    (literal-table kir))]
+     (or (some #(not (contains? native-types %)) signature-types)
+         (some #(not (contains? native-types %)) body-descriptors)
+         (seq literals)))))
+
+(defn- literal-walk [form found]
+  (cond
+    ;; `typed-cap-call`'s two TYPE positions are syntax, not values: they are
+    ;; the sealed capability contract `capability-contracts` above reads, and
+    ;; the guest never computes with them. Every other bare keyword stays a
+    ;; literal (a scalar type keyword such as `:bool` is also a perfectly good
+    ;; executable keyword value), so this is a positional exception, not a
+    ;; blanket "keywords in call position are syntax" rule.
+    ;;
+    ;; Counting them made `requires-host-runtime?` true for a program whose
+    ;; every value is a scalar, so the emitted component core module imported
+    ;; the `kotoba:typed` intrinsics -- imports that no WIT interface binds.
+    ;; `wasm-tools component new` then rejected the module with `failed to
+    ;; resolve import kotoba:typed::literal`, which made every source-level
+    ;; `(typed-cap-call <id> :i64 :i64 x)` unrepresentable as a Component even
+    ;; though ADR 0076 increment 1's `:scalar-with-capabilities` lowering
+    ;; exists precisely to admit it. The four hand-written capability shapes
+    ;; never hit this because they emit WAT directly instead of going through
+    ;; `emit-component-core`.
+    (and (seq? form) (= 'typed-cap-call (first form)) (= 5 (count form)))
+    (literal-walk (nth form 4) (literal-walk (nth form 1) found))
+    ;; Scalar type keywords (for example :bool) are also valid executable
+    ;; keyword literals. Only structured vector descriptors are syntax-only.
+    (and (vector? form) (descriptor? form)) found
+    (string? form) (conj found [:string form])
+    (keyword? form) (conj found [:keyword (str form)])
+    (boolean? form) (conj found [:bool form])
+    (coll? form) (reduce (fn [result item] (literal-walk item result)) found form)
+    :else found))
+
+(defn literal-table [kir]
+  (->> (:functions kir)
+       (reduce (fn [found function]
+                 (literal-walk (:body function) found)) #{})
+       (sort-by pr-str)
+       vec))
+
+(defn literal-indices [kir]
+  (into {} (map-indexed (fn [index literal] [literal index]) (literal-table kir))))
+
+(defn- encode-literal [[kind value]]
+  (case kind
+    :string (into [0] (text-bytes value))
+    :keyword (into [1] (text-bytes value))
+    :bool [(if value 3 2)]
+    (throw (ex-info "unsupported Wasm typed literal"
+                    {:phase :wasm-typed-metadata :literal [kind value]}))))
+
+(defn metadata-bytes [kir]
+  (let [descriptors (descriptor-table kir)
+        literals (literal-table kir)
+        schemas (:schemas kir)
+        identities (:schema-identities kir)
+        contracts (capability-contracts kir)
+        document? (some #(= :document %) descriptors)
+        symbol? (some #(= :symbol %) descriptors)
+        list? (some #(and (vector? %) (= :list (first %))) descriptors)
+        bytes? (some #(= :bytes %) descriptors)
+        compact-graph?
+        (some #(or (= :string-index %) (= :disjoint-set-i64 %)) descriptors)
+        schema? (or (seq schemas) (seq contracts))
+        extended-schema? (or schema? compact-graph? document? symbol? list? bytes?)
+        indices (descriptor-indices kir)]
+    (vec (concat [(cond bytes? bytes-abi-version
+                        list? list-abi-version
+                        symbol? symbol-abi-version
+                        document? document-abi-version
+                        compact-graph? compact-graph-abi-version
+                        schema? schema-abi-version
+                        :else abi-version)]
+                 (uleb (count descriptors))
+                 (mapcat encode-descriptor descriptors)
+                 (uleb (count literals))
+                 (mapcat encode-literal literals)
+                 (when extended-schema?
+                   (concat
+                    (uleb (count schemas))
+                    (mapcat (fn [[schema-name descriptor]]
+                              (concat (text-bytes (keyword-text schema-name))
+                                      (text-bytes (get identities schema-name))
+                                      (encode-descriptor descriptor)))
+                            (sort-by (comp str key) schemas))
+                    (uleb (count contracts))
+                    (mapcat (fn [{:keys [id request-type result-type]}]
+                              (concat (uleb id)
+                                      (uleb (get indices request-type))
+                                      (uleb (get indices result-type))))
+                            contracts)))))))
+
+(defn reference-type? [type]
+  ;; Profile-5 :bool is a 0/1 i64 word inside modules, not a sealed ref.
+  (not (contains? #{:i64 :f32 :f64 :bool} type)))
+
+(defn wasm-type [type]
+  ;; :bool is the 0/1 i64 word. Export ABI boxing to host boolean is the
+  ;; emitter's job at function boundaries, not a different local type.
+  (case type :i64 0x7e :f32 0x7d :f64 0x7c :bool 0x7e 0x6f))
+
+(defn host-index
+  "A STRUCTURAL position inside a heterogeneous value, as a host integer.
+
+  KIR carries such a position as an ordinary i64 literal, and an i64 literal
+  is a `Long` on the JVM but a JavaScript `BigInt` under cljs/nbb. `nth`
+  accepts only a host number, so every emitter site that uses the position to
+  select a MEMBER TYPE has to convert first; on the JVM the conversion is a
+  no-op, which is why a JVM-only test cannot see the difference. The KIR
+  reference interpreter performs the same conversion for the same operations
+  (`kotoba.kir`'s `hetero-vector-at`/`hetero-vector-assoc`); this is that
+  conversion for the Wasm backend.
+
+  Refuses anything that is not an integer literal with a named phase rather
+  than letting `nth` raise a host-level error the CLI can only report as an
+  internal compiler error."
+  [index form]
+  (let [n ]
+    (when-not (nat-int? n)
+      (throw (ex-info "heterogeneous position must be a non-negative integer literal"
+                      {:phase :wasm-typed-lowering :index index :form form})))
+    n))
+
+(defn hetero-item-type
+  "The member type at a structural position of `[:vector [t0 t1 ...]]`."
+  [type index form]
+  (let [items (second type)
+        position (host-index index form)]
+    (when-not (< position (count items))
+      (throw (ex-info "heterogeneous position is out of range"
+                      {:phase :wasm-typed-lowering :index position
+                       :arity (count items) :form form})))
+    (nth items position)))
+
+(declare infer-type)
+
+(defn infer-type [form env signatures]
+  (cond
+     :i64
+     :f32
+     :f64
+    (string? form) :string
+    (keyword? form) :keyword
+    (boolean? form) :bool
+    (symbol? form) (or (get env form)
+                       (throw (ex-info "unbound typed Wasm symbol"
+                                       {:phase :wasm-typed-lowering :symbol form})))
+    :else
+    (let [[op & args] form]
+      (cond
+        (= op 'let)
+        (let [[bindings body] args
+              env' (reduce (fn [current [name value]]
+                             (assoc current name (infer-type value current signatures)))
+                           env (partition 2 bindings))]
+          (infer-type body env' signatures))
+        (= op 'if) (infer-type (second args) env signatures)
+        (= op 'do) (infer-type (last args) env signatures)
+        (= op 'typed-cap-call) (nth args 2)
+        (= op 'component-assert-bool) :bool
+        (= op 'component-i64-to-i32) :bool
+        (= op 'component-i32-to-f32) :f32
+        (= op 'component-i64-to-f32) :f32
+        (= op 'component-i64-to-f64) :f64
+        (= op 'component-string-byte-length) :i64
+        (= op 'component-list-count) :i64
+        (= op 'component-list-at-i64) :i64
+        (= op 'component-list-at-f64) :f64
+        (= op 'component-list-get-i64) :i64
+        (= op 'component-list-get-f64) :f64
+        (= op 'component-option-list-capability-count) :i64
+        (= op 'component-result-list-capability-count) :i64
+        (contains?
+         '{component-option-record-capability-project-i64 :i64
+           component-option-record-capability-project-f32 :f32
+           component-option-record-capability-project-f64 :f64
+           component-option-record-capability-project-bool :bool}
+         op)
+        ('{component-option-record-capability-project-i64 :i64
+           component-option-record-capability-project-f32 :f32
+           component-option-record-capability-project-f64 :f64
+           component-option-record-capability-project-bool :bool}
+         op)
+        (contains? '#{+ - * quot bit-xor bit-and bit-or bit-not
+                             min max
+                             cap-call pair pair-first pair-second
+                      i32-wrap u32-wrap i32-wrapping-add i32-wrapping-mul i32-xor
+                      i32-shift-left i32-shift-right u32-shift-right xorshift32
+                      i64-shift-left i64-shift-right u64-shift-right
+                      i64-extend-i32-u
+                      string-byte-length string-code-point-at map-get vector-count vector-get vector-f64-count
+                      vector-at hetero-vector-count typed-set-count
+                      typed-map-count xml-path-count xml-name-count string-index-count
+                      disjoint-set-i64-count document-count} op) :i64
+        (= op 'f64-to-bits) :i64
+        (= op 'f64-from-bits) :f64
+        (contains? '#{i64-to-f64-checked i64-to-f64-rounded} op) :f64
+        (contains? '#{f64-to-i64-checked f64-to-i64-truncating} op) :i64
+        (contains? '#{f64-add f64-sub f64-mul f64-div f64-min f64-max f64-neg f64-abs f64-sqrt
+                      f64-sin-quarter-turn f64-cos-quarter-turn
+                      f64-sin-bounded f64-cos-bounded
+                      f64-exp-near-zero f64-log-near-one f64-atan2-bounded
+                      f64-exp-bounded f64-log-bounded} op) :f64
+        (contains? '#{f64-eq f64-lt f64-le f64-gt f64-ge f64-unordered} op) :bool
+        (= op 'f32-to-bits) :i64
+        (= op 'f32-from-bits) :f32
+        (= op 'f64-to-f32-rounded) :f32
+        (= op 'f32-to-f64-exact) :f64
+        (contains? '#{i64-to-f32-checked i64-to-f32-rounded} op) :f32
+        (contains? '#{f32-to-i64-checked f32-to-i64-truncating} op) :i64
+        (contains? '#{f32-add f32-sub f32-mul f32-div f32-min f32-max f32-neg f32-abs f32-sqrt} op) :f32
+        (contains? '#{f32-eq f32-lt f32-le f32-gt f32-ge f32-unordered} op) :bool
+        (contains? '#{= < > <= >= hetero-vector-equal typed-set-equal
+                      typed-map-equal record-equal} op) :i64
+        (= op 'string=?) :bool
+        (= op 'string-contains?) :bool
+        (= op 'string-split-count) :i64
+        (contains? '#{string-index-of bytes-count bytes-at} op) :i64
+        (contains? '#{bytes-slice bytes-concat} op) :bytes
+        ;; 2026-09-25 (superproject adr-2609242330): the bytes constructor,
+        ;; its inverse and the string constructor -- host intrinsics like the
+        ;; four reads above.
+        (= op 'bytes-from-vector-i64) :bytes
+        (= op 'vector-i64-from-bytes) :vector-i64
+        (= op 'string-from-utf8) :string
+        (contains? '#{bool-not option-some? result-ok?
+                      result-ok?-of option-some?-of typed-set-contains
+                      typed-map-contains string-index-contains} op) :bool
+        (contains? '#{document-contains document-equal? document-set-contains?} op) :bool
+        (contains? '#{string-concat string-substring string-replace-all string-fold-case string-upper keyword-name} op) :string
+        (contains? '#{keyword-from-string document-kind} op) :keyword
+        (= op 'symbol) :symbol
+        (contains? '#{xml-name-text xml-path-text xml-path-attr} op) [:option :string]
+        (= op 'decimal-f64-parse) [:option :f64]
+        (= op 'decimal-f64x3-parse) [:option [:vector [:f64 :f64 :f64]]]
+        (= op 'vector-new) :vector-i64
+        (= op 'bytes-empty) :bytes
+        (= op 'vector-f64-new) :vector-f64
+        (= op 'string-index-new) :string-index
+        (= op 'string-index-get) [:option :i64]
+        (= op 'string-index-assoc) :string-index
+        (= op 'disjoint-set-i64-new) :disjoint-set-i64
+        (= op 'disjoint-set-i64-union) [:option :disjoint-set-i64]
+        (contains? '#{document-null document-bool document-i64 document-f64
+                      document-string document-keyword document-symbol document-vector document-list document-set document-map
+                      document-vector-assoc document-vector-conj document-vector-drop
+                      document-vector-remove document-vector-sort document-map-entry-at
+                      document-assoc document-dissoc document-merge} op) :document
+        (contains? '#{document-get document-vector-at document-list-at document-map-entry-at} op) [:option :document]
+        (= op 'document-sha256) :string
+        (= op 'document-print) :string
+        (= op 'document-read) :document
+        (= op 'document-edn-print) :string
+        (= op 'document-edn-read) :document
+        (= op 'document-string-value) [:option :string]
+        (= op 'document-keyword-value) [:option :keyword]
+        (= op 'document-symbol-value) [:option :symbol]
+        (= op 'document-bool-value) [:option :bool]
+        (= op 'document-i64-value) [:option :i64]
+        (= op 'document-f64-value) [:option :f64]
+        ;; :bytes and :link documents (root ADR-2610092310 S3)
+        (= op 'document-bytes) :document
+        (= op 'document-link) [:option :document]
+        (contains? '#{document-bytes-value document-link-value} op) [:option :bytes]
+        (contains? '#{vector-f64-get vector-f64-at} op) :f64
+        (contains? '#{vector-f64-drop vector-f64-assoc vector-f64-conj} op) :vector-f64
+        (contains? '#{vector-drop vector-assoc vector-assoc! vector-conj vector-alloc} op) :vector-i64
+        (= op 'variant-new) (first args)
+        (contains? '#{option-some-of option-none-of result-ok-of result-err-of
+                      typed-list-new hetero-vector-new typed-set-new typed-map-new record-new} op) (first args)
+        (= op 'result-match-of)
+        (let [[type _ ok-name ok-body] args]
+          (infer-type ok-body (assoc env ok-name (second type)) signatures))
+        (= op 'variant-match)
+        (let [[type _ branches] args
+              [[_ binder body]] branches
+              payload-type (second (first (nth type 2)))]
+          (infer-type body (assoc env binder payload-type) signatures))
+        (= op 'option-match)
+        (let [[type _ _ some-name some-body] args]
+          (infer-type some-body (assoc env some-name (second type)) signatures))
+        (contains? '#{result-value-of result-error-of} op)
+        (if (= op 'result-value-of) (second (first args)) (nth (first args) 2))
+        (= op 'option-value-of) (second (first args))
+        (= op 'typed-map-get) [:option (nth (first args) 2)]
+        (= op 'typed-map-entry-at)
+        [:option [:vector [(second (first args)) (nth (first args) 2)]]]
+        ;; `typed-list-nth` is the list accessor sema has rewritten `nth` to
+        ;; since 2026-09-03; its result type is the item type, exactly as
+        ;; `typed-set-nth`'s is.
+        (contains? '#{typed-set-nth typed-list-nth} op) (second (first args))
+        (= op 'hetero-vector-at)
+        (hetero-item-type (first args) (nth args 2) form)
+        (= op 'record-get)
+        (let [[type _ field] args]
+          (second (some #(when (= field (first %)) %) (nth type 2))))
+        (contains? '#{hetero-vector-assoc typed-set-conj typed-set-disj typed-list-conj
+                      typed-map-assoc typed-map-dissoc record-assoc} op)
+        (first args)
+        :else (or (:result (get signatures op))
+                  (throw (ex-info "unsupported typed Wasm expression"
+                                  {:phase :wasm-typed-lowering :operation op :form form})))))))

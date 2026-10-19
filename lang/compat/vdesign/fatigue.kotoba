@@ -1,0 +1,150 @@
+(ns vdesign.fatigue
+  "Vibration-fatigue screening for a design's structural load paths — the
+  vehicle-plane answer to *how much of this path's fatigue life does a
+  given duty-cycle load spectrum consume*.
+
+  System boundary advanced: `:vibration-fatigue-and-safety` design domain
+  (scripts/hermes-magnesium-systems-bots/system-scope.edn on origin/main).
+  The workspace has endurance/energy/structural-verifier contracts but NO
+  contract anywhere accumulates cycle fatigue damage; this is that
+  smallest upstream step. It composes BY DATA ONLY — nothing from any
+  unlanded dependency, no new material constant.
+
+  Inputs (all caller-supplied, provenance-bearing, fail-closed):
+    - `:sn-curve` — a measured S-N curve for the specific material/
+      condition of the checked path: a non-empty vector of
+      `{:stress-mpa <> :cycles <>}` points, same stress convention
+      (amplitude) as `:load-spectrum`, from any cyclic testing basis the
+      caller declares. MUST carry `:sn-source` (non-blank provenance,
+      e.g. a handbook entry, a test report, or an explicitly synthetic
+      fixture). The curve is used only INSIDE its own stress range —
+      log-log piecewise-linear interpolation between points; NO
+      extrapolation (a bin outside the curve's stress range is a
+      refusal, because real S-N curves have knees and endurances this
+      contract does not model).
+    - `:load-spectrum` — a non-empty vector of rainflow-reduced bins
+      `{:stress-amp-mpa <positive> :cycles <positive>}`, on the same
+      amplitude convention as the S-N curve, plus `:spectrum-source`.
+      A natural upstream is the caller's duty cycle (e.g.
+      `vdesign.dutycycle`) evaluated against the path's section
+      properties; this contract converts no geometry and assumes none.
+
+  Physics (Miner linear damage rule, exact arithmetic, SI):
+      N-fail(S) = exp( lin-in-lnS( ln N vs ln S ) )   ; inside curve range
+      D-bin     = cycles / N-fail(S-amp)
+      D-total   = Σ D-bin
+      verdict   = :exceeded if D > 1, :at-limit if D = 1 (±1e-12),
+                  :ok if D < 1
+
+  Miner's rule is a screening hypothesis, not a life prediction: mean
+  stress, temperature, sequence effects, scatter and surface condition
+  are NOT modeled here. Every result carries `:unmeasured` with exactly
+  those factors so downstream consumers cannot read :ok as a life
+  guarantee. Refusals (fail-closed): blank provenance, empty curve or
+  spectrum, non-finite or non-positive quantities, duplicate curve
+  stresses, bins outside the curve's stress range, non-increasing
+  curve order."
+  (:require [kotoba.lang.text :as str]))
+
+(def ^:private at-limit-eps 1e-9)
+
+(defn- finite? [x]
+  (and (number? x)
+       (not (or 
+                ))))
+
+(defn- pos-num? [x] (and (finite? x) (pos? x)))
+
+(defn- require-nonblank! [m k]
+  (let [v (get m k)]
+    (when (or (not (string? v)) (str/blank? v))
+      (throw (ex-info (str "fatigue: missing/blank provenance field " k)
+                      {:field k :value v})))))
+
+(defn- require-curve!
+  [m k]
+  (let [pts (get m k)]
+    (when (or (not (vector? pts)) (empty? pts))
+      (throw (ex-info (str "fatigue: " k " must be a non-empty vector") {:field k})))
+    (doseq [p pts]
+      (when-not (and (pos-num? (:stress-mpa p)) (pos-num? (:cycles p)))
+        (throw (ex-info "fatigue: curve point needs positive finite :stress-mpa/:cycles"
+                        {:point p}))))
+    ;; strictly increasing in stress, no duplicates
+    (let [ss (mapv :stress-mpa pts)]
+      (when-not (apply < ss)
+        (throw (ex-info "fatigue: :sn-curve must be strictly increasing in :stress-mpa (no duplicate stresses)"
+                        {:stresses ss}))))
+    pts))
+
+(defn- require-spectrum! [m k]
+  (let [bins (get m k)]
+    (when (or (not (vector? bins)) (empty? bins))
+      (throw (ex-info (str "fatigue: " k " must be a non-empty vector") {:field k})))
+    (doseq [b bins]
+      (when-not (and (pos-num? (:stress-amp-mpa b)) (pos-num? (:cycles b)))
+        (throw (ex-info "fatigue: spectrum bin needs positive finite :stress-amp-mpa/:cycles"
+                        {:bin b}))))
+    bins))
+
+(defn- cycles-to-fail
+  "Log-log piecewise-linear interpolation of the S-N curve at stress S.
+  `pts` is strictly increasing in :stress-mpa. Returns nil when S is
+  outside the curve's stress range (never extrapolated)."
+  [pts s]
+  (let [s0 (:stress-mpa (first pts)) sN (:stress-mpa (peek pts))]
+    (when (and (>= s s0) (<= s sN))
+      ;; exact measured-point hit → return the MEASURED cycles verbatim
+      (or (some #(when (= (:stress-mpa %) s) (:cycles %)) pts)
+      (loop [[a & rest-pts] pts]
+        (let [b (first rest-pts)]
+          (cond
+            (nil? b)    (:cycles a)
+            (<= (:stress-mpa a) s (:stress-mpa b))
+            (let [l1 (Math/log (:stress-mpa a)) l2 (Math/log (:stress-mpa b))
+                  m1 (Math/log (double (:cycles a)))  m2 (Math/log (double (:cycles b)))
+                  t  (/ (- (Math/log s) l1) (- l2 l1))
+                  lm (+ m1 (* t (- m2 m1)))]
+              (Math/exp lm))
+            :else (recur rest-pts))))))))
+
+(defn fatigue-screen
+  "Miner-rule fatigue damage screening. See namespace docstring for the
+  full input contract. Returns a map with :bins (per-bin N-fail and
+  damage), :damage-total, :verdict, :sn-source, :spectrum-source, and
+  :unmeasured (the list of fatigue effects this screening does NOT
+  model). Throws on any refusal above."
+  [{:keys [sn-curve sn-source load-spectrum spectrum-source]}]
+  (require-nonblank! {:sn-source sn-source} :sn-source)
+  (require-nonblank! {:spectrum-source spectrum-source} :spectrum-source)
+  (let [curve (require-curve! {:sn-curve sn-curve} :sn-curve)
+        bins  (require-spectrum! {:load-spectrum load-spectrum} :load-spectrum)
+        s0    (:stress-mpa (first curve))
+        sN    (:stress-mpa (peek curve))
+        out-bins
+        (mapv (fn [b]
+                (let [s    (:stress-amp-mpa b)
+                      n    (:cycles b)
+                      nf   (or (cycles-to-fail curve s)
+                               (throw (ex-info
+                                        (str "fatigue: bin stress " s
+                                             " outside S-N curve range [" s0 "," sN
+                                             "] — no extrapolation; extend the curve with a MEASURED point")
+                                        {:bin b :curve-range [s0 sN]})))
+                      d    (/ (double n) nf)]
+                  {:stress-amp-mpa s :cycles n :cycles-to-failure nf :damage d}))
+              bins)
+        d-total (reduce + (map :damage out-bins))
+        verdict (cond
+                  (> d-total 1.0)                    :exceeded
+                  (< (Math/abs (- d-total 1.0)) at-limit-eps) :at-limit
+                  :else                              :ok)]
+    {:bins out-bins
+     :damage-total d-total
+     :verdict verdict
+     :sn-source sn-source
+     :spectrum-source spectrum-source
+     :sn-stress-range-mpa [s0 sN]
+     :unmeasured [:mean-stress-effects :temperature-effects
+                  :load-sequence-effects :scatter/life-factor
+                  :surface-and-notch-effects :creep-corrosion-effects]}))

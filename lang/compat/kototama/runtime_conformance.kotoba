@@ -1,0 +1,189 @@
+(ns kototama.runtime-conformance
+  "Differential execution against Chicory and independent Wasmtime/Node
+   engines. This is qualification code; it never participates in admission.
+
+   Every engine result is one of three shapes, and the comparison keeps them
+   apart:
+
+     {:ok? true  :result n}                         ran to completion
+     {:ok? false :trap-kind <pinned kind> ...}      the engine trapped, and
+                                                    the trap is one we recognise
+     {:ok? false :trap-kind :tool-failure ...}      the engine could not be
+                                                    asked (binary missing, bad
+                                                    flag, unparseable output)
+     {:ok? false :trap-kind :unclassified-trap ...} it trapped, but not with a
+                                                    literal pinned below
+
+   Before 2026-09-07 `compare-main` called it a shared :trap whenever all
+   three engines returned :ok? false FOR ANY REASON, so a `wasmtime` invoked
+   with a bad flag (exit 2, \"unexpected argument\") passed the division-trap
+   case as green. Measured on this tree: {:ok? true :mode :trap}. A trap is
+   now only agreed when every engine reports the SAME pinned :trap-kind; any
+   :tool-failure or :unclassified-trap makes the run :unmeasured, which is
+   :ok? false -- \"could not compare\" is not \"compared and agreed\".
+
+   The literals are pinned on purpose: an engine renaming its trap message
+   turns this red, and that red is the assertion working (the same shape
+   root AGENTS.md records for the :spki-pin-mismatch -> :peer-not-pinned
+   rename)."
+  (:require [kotoba.io :as kio] [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kototama.contract :as contract]
+            [kototama.tender :as tender]))
+
+;; ── trap classification ─────────────────────────────────────────────────────
+
+(def chicory-trap-class
+  "The exception class Chicory raises for a Wasm trap. Measured 2026-09-07
+   with Chicory 1.4.0 on an i64.div_s by zero."
+  "com.dylibso.chicory.runtime.WasmRuntimeException")
+
+(def trap-literals
+  "trap-kind -> the substring each engine prints for it. Measured 2026-09-07
+   (Chicory 1.4.0 / wasmtime 42.0.1 / node v26.0.0). Add a kind only after
+   measuring all three; a kind measured in fewer engines cannot be agreed."
+  {:integer-divide-by-zero {:chicory "integer divide by zero"
+                            :wasmtime "wasm trap: integer divide by zero"
+                            :node "RuntimeError: divide by zero"}})
+
+(defn- pinned-kind [engine text]
+  (some (fn [[kind literals]]
+          (when (str/includes? (or text "") (get literals engine)) kind))
+        trap-literals))
+
+(defn classify-chicory
+  "Exception -> engine result. WasmRuntimeException is a trap (kind by
+   message); every other class is a tool failure -- the tender itself, not
+   the guest, refused."
+  [^Throwable e]
+  (let [cls (.getName (class e))
+        msg (.getMessage e)]
+    (if (= chicory-trap-class cls)
+      {:ok? false :error-class cls :message msg
+       :trap-kind (or (pinned-kind :chicory msg) :unclassified-trap)}
+      {:ok? false :error-class cls :message msg :trap-kind :tool-failure})))
+
+(defn- parse-result [out]
+  (try (Long/parseLong (str/trim (or out "")))
+       (catch NumberFormatException _ nil)))
+
+(defn classify-wasmtime
+  "`wasmtime run --invoke main` outcome -> engine result. A non-zero exit
+   whose stderr carries `wasm trap:` is a trap; anything else non-zero
+   (bad flag, missing file, missing binary) is :tool-failure. Exit 0 whose
+   stdout is not an integer is :tool-failure too -- a result we cannot read
+   is not a result."
+  [{:keys [exit out err]}]
+  (let [err (str/trim (or err ""))]
+    (cond
+      (and (zero? exit) (some? (parse-result out)))
+      {:ok? true :result (parse-result out)}
+
+      (zero? exit)
+      {:ok? false :exit exit :message (str "unparseable stdout: " (pr-str out))
+       :trap-kind :tool-failure}
+
+      (pinned-kind :wasmtime err)
+      {:ok? false :exit exit :message err :trap-kind (pinned-kind :wasmtime err)}
+
+      (str/includes? err "wasm trap:")
+      {:ok? false :exit exit :message err :trap-kind :unclassified-trap}
+
+      :else
+      {:ok? false :exit exit :message err :trap-kind :tool-failure})))
+
+(defn classify-node
+  "`node -e <program>` outcome -> engine result. The program prints
+   `<Name>: <message>` on the trap path and exits 1; node itself prints
+   `node: bad option` / module errors on the tool-failure path."
+  [{:keys [exit out err]}]
+  (let [err (str/trim (or err ""))]
+    (cond
+      (and (zero? exit) (some? (parse-result out)))
+      {:ok? true :result (parse-result out)}
+
+      (zero? exit)
+      {:ok? false :exit exit :message (str "unparseable stdout: " (pr-str out))
+       :trap-kind :tool-failure}
+
+      (pinned-kind :node err)
+      {:ok? false :exit exit :message err :trap-kind (pinned-kind :node err)}
+
+      (str/starts-with? err "RuntimeError:")
+      {:ok? false :exit exit :message err :trap-kind :unclassified-trap}
+
+      :else
+      {:ok? false :exit exit :message err :trap-kind :tool-failure})))
+
+;; ── engines ─────────────────────────────────────────────────────────────────
+
+(defn chicory-main [wasm-bytes]
+  (try
+    {:ok? true
+     :result (tender/run-main wasm-bytes [] (contract/host-caps {}))}
+    (catch Exception e
+      (classify-chicory e))))
+
+(defn- sh
+  "shell/sh that turns a missing binary into a tool-failure-shaped map
+   instead of an IOException."
+  [& args]
+  (try (apply shell/sh args)
+       (catch java.io.IOException e
+         {:exit -1 :out "" :err (str "cannot invoke " (first args) ": " (.getMessage e))})))
+
+(defn wasmtime-main [path]
+  (classify-wasmtime (sh "wasmtime" "run" "--invoke" "main" (str path))))
+
+(def node-program
+  "const fs=require('fs'); WebAssembly.instantiate(fs.readFileSync(process.argv[1]),{}).then(x=>{console.log(String(x.instance.exports.main()));}).catch(e=>{console.error(e.name+': '+e.message);process.exit(1);});")
+
+(defn node-main [path]
+  (classify-node (sh "node" "-e" node-program (str path))))
+
+;; ── comparison ──────────────────────────────────────────────────────────────
+
+(def unmeasured-kinds #{:tool-failure :unclassified-trap})
+
+(defn compare-results
+  "Pure comparison of {engine -> engine result}.
+
+   :mode :result      all ran, one value
+         :trap        all trapped with one pinned :trap-kind (in :trap-kind)
+         :unmeasured  some engine could not be asked, or trapped in a way
+                      not pinned -- :ok? false, no verdict on the guest
+         :divergence  measured, and they disagree"
+  [results]
+  (let [rs (vals results)
+        kinds (set (keep :trap-kind rs))
+        unmeasured? (boolean (some unmeasured-kinds kinds))
+        success? (every? :ok? rs)
+        values (set (map :result rs))
+        agreed-result? (and success? (= 1 (count values)))
+        traps? (and (not unmeasured?)
+                    (every? (complement :ok?) rs)
+                    (= 1 (count kinds)))]
+    {:ok? (boolean (or agreed-result? traps?))
+     ;; :result only when the values AGREE -- two engines that both ran and
+     ;; returned different numbers are a measured divergence, not a result.
+     :mode (cond unmeasured? :unmeasured
+                 agreed-result? :result
+                 traps? :trap
+                 :else :divergence)
+     :trap-kind (when traps? (first kinds))
+     :unmeasured (vec (keep (fn [[engine r]]
+                              (when (unmeasured-kinds (:trap-kind r))
+                                {:engine engine :trap-kind (:trap-kind r)
+                                 :message (:message r)}))
+                            results))
+     :results results}))
+
+(defn compare-main
+  "Run one host-free module in all three engines and compare success/result or
+   common trap behavior. See `compare-results` for the verdict shape."
+  [path]
+  (let [bytes (kio/read-all-bytes
+               (java.io.File. (str path)))]
+    (compare-results {:chicory (chicory-main bytes)
+                      :wasmtime (wasmtime-main path)
+                      :node (node-main path)})))

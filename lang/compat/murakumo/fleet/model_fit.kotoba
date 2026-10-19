@@ -1,0 +1,322 @@
+(ns murakumo.fleet.model-fit
+  "Does this model, at this context, run STABLY on this node?
+
+  Owner instruction 2026-09-10: find out which models run stably on 16 GiB,
+  and write it down. This namespace is the `stably` part -- the rule that turns
+  a probe's samples into a verdict -- because the interesting failures measured
+  that day were not the model refusing to load.
+
+  ## Three ways a model can be `running` and the node still be useless
+
+  1. **It loads and the machine swaps.** The weights are mmap'd, so a model
+     that does not fit does not fail: it pages. Throughput collapses and
+     nothing reports an error.
+
+  2. **It loads, does not swap, and the node goes dark.** This is the one
+     nothing was measuring. A node earns its place in the pool by sending a
+     heartbeat that ARRIVES; if inference starves the machine's network stack,
+     the heartbeat misses its deadline and the gateway drops the node while
+     llama-server sits there answering /health. Measured 2026-09-10: one
+     transient miss put issachar's heartbeat into a 60-75 s backoff against a
+     60 s freshness line, and it went stale for seven minutes while healthy.
+     A 27B at ctx 32768 took levi off the network entirely the day before.
+
+  3. **It loads, does not swap, stays reachable, and has no room left.** A
+     config admitted with single-digit-percent free memory has no margin for
+     the next thing the machine is asked to do.
+
+  So a verdict needs all three, and the thresholds are not invented here: they
+  come from the gateway's own constants (see `heartbeat-deadline-ms`)."
+  (:require [kotoba.lang.text :as str]))
+
+(def heartbeat-deadline-ms
+  "The gateway's freshness line, from `local-murakumo.readiness/default-stale-ms`.
+
+  ⚠ The control plane carries a SECOND constant, `node-heartbeat-stale-ms`
+  (120 s). The two disagree, and this takes the tighter one: a node that
+  satisfies 60 s satisfies both, and a rule built on the looser number would
+  call a config stable that the stricter check drops."
+  60000)
+
+(def outbound-budget-ms
+  "How long one outbound request may take, while inference runs, before this
+  calls the node at risk of going dark.
+
+  A quarter of the deadline. The heartbeat is one request in a loop that also
+  polls and posts results, so spending the whole window on a single call is
+  already failure; and the backoff measured on 2026-09-10 means ONE miss costs
+  60-75 s, not one interval. The quarter is a judgement, and it is stated here
+  as a number rather than buried in a comparison so it can be argued with."
+  (quot heartbeat-deadline-ms 4))
+
+(def swap-growth-floor-mb
+  "Swap growth below this is noise, not paging.
+
+  Measured on issachar 2026-09-10 with the 27B resident and serving: swap moved
+  from 425 MB idle to 417 MB under load -- it went DOWN by 8. Anything inside
+  that band says nothing."
+  32)
+
+(def headroom-floor-fraction
+  "Free memory, as a fraction of the machine, below which a config is admitted
+  but has nothing left. The 27B at ctx 8192 measured 4.8%."
+  0.08)
+
+(defn- missing-fields [sample]
+  (vec (remove #(contains? sample %)
+               [:model-bytes :base-wired :base-swap-mb :peak-wired :peak-swap-mb
+                :memory-bytes :idle-outbound-s :load-outbound-s :tok-s])))
+
+(defn swap-growth-mb [{:keys [base-swap-mb peak-swap-mb]}]
+  (when (and (number? base-swap-mb) (number? peak-swap-mb))
+    (- peak-swap-mb base-swap-mb)))
+
+(defn free-fraction
+  "Fraction of the machine still free at peak. Wired + active + compressed is
+  what the model and the OS are holding between them."
+  [{:keys [memory-bytes peak-wired peak-active peak-compressed]}]
+  (when (and (number? memory-bytes) (pos? memory-bytes) (number? peak-wired))
+    (let [held (+ peak-wired (or peak-active 0) (or peak-compressed 0))]
+      (max 0.0 (double (/ (- memory-bytes held) memory-bytes))))))
+
+(defn outbound-ms
+  "Outbound latency while inference runs, in ms, or nil when it timed out or
+  was never taken. `:timeout` is NOT nil: a request that did not come back is
+  the strongest form of the failure this measures."
+  [{:keys [load-outbound-s]}]
+  (cond
+    (number? load-outbound-s) (long (* 1000 load-outbound-s))
+    (= :timeout load-outbound-s) :timeout
+    :else nil))
+
+(defn median-tok-s [{:keys [tok-s]}]
+  (when-let [xs (seq (sort (filter number? tok-s)))]
+    (nth (vec xs) (quot (count xs) 2))))
+
+(defn verdict
+  "One config's verdict, with the reason named.
+
+    :did-not-load   llama-server never answered /health
+    :unmeasured     a field the rule needs is absent -- NOT a pass
+    :goes-dark      outbound requests exceed the budget while inferring
+    :swapping       swap grew past the noise floor
+    :no-headroom    admitted, but with less than the headroom floor free
+    :stable         all three hold
+
+  Ordered so the most dangerous answer wins: a config that both swaps and goes
+  dark is reported as going dark, because that is the one that takes the node
+  out of the pool while looking healthy."
+  [{:keys [loaded?] :as sample}]
+  (let [missing (missing-fields sample)
+        ob (outbound-ms sample)
+        growth (swap-growth-mb sample)
+        free (free-fraction sample)]
+    (cond
+      (false? loaded?)
+      {:verdict :did-not-load :reason (:load-err sample)}
+
+      (seq missing)
+      {:verdict :unmeasured :missing missing
+       :reason "a rule that cannot run must not return the value of a rule that ran"}
+
+      (= :timeout ob)
+      {:verdict :goes-dark :outbound :timeout
+       :reason "an outbound request did not return while this model was inferring"}
+
+      (and (number? ob) (> ob outbound-budget-ms))
+      {:verdict :goes-dark :outbound-ms ob :budget-ms outbound-budget-ms
+       :reason (str "outbound took " ob " ms against a " outbound-budget-ms
+                    " ms budget; the heartbeat shares this path")}
+
+      (and (number? growth) (> growth swap-growth-floor-mb))
+      {:verdict :swapping :swap-growth-mb growth
+       :reason "the weights are mmap'd, so a model that does not fit pages instead of failing"}
+
+      (and (number? free) (< free headroom-floor-fraction))
+      {:verdict :no-headroom :free-fraction free
+       :reason (str "admitted with " (format "%.1f" (* 100 free)) "% free")}
+
+      :else
+      {:verdict :stable :free-fraction free :swap-growth-mb growth
+       :outbound-ms ob :tok-s (median-tok-s sample)})))
+
+(defn report-line [{:keys [label ctx] :as sample}]
+  (let [{:keys [verdict] :as v} (verdict sample)
+        tok (median-tok-s sample)
+        free (free-fraction sample)]
+    (str (format "%-18s ctx=%-7s %-13s" (str label) (str ctx) (name verdict))
+         (when tok (format " %5.1f tok/s" (double tok)))
+         (when free (format "  free=%4.1f%%" (* 100 free)))
+         (when-let [ob (outbound-ms sample)]
+           (if (= :timeout ob) "  outbound=TIMEOUT" (format "  outbound=%dms" ob)))
+         (when-let [g (swap-growth-mb sample)] (format "  swap%+dMB" (long g)))
+         (when (= :unmeasured verdict) (str "  missing=" (pr-str (:missing v)))))))
+
+(defn largest-stable-ctx
+  "The biggest context that came back `:stable` for one model.
+
+  Returns nil when none did -- which is a real answer for a model that fits
+  the machine at no useful context, and must not be confused with 'not tried'."
+  [samples]
+  (->> samples
+       (filter #(= :stable (:verdict (verdict %))))
+       (map :ctx)
+       (filter number?)
+       (reduce max 0)
+       (#(when (pos? %) %))))
+
+;; ── reading what the probe printed ─────────────────────────────────────────
+;;
+;; The probe emits KEY=VALUE lines and nothing else, one block per config
+;; separated by `===CONFIG`. Parsing here rather than in the shell keeps the
+;; measurement dumb and the interpretation testable: the shell's job is to
+;; take readings, and every judgement about them lives above.
+
+(def ^:private numeric-keys
+  {"CTX" :ctx "MODEL_BYTES" :model-bytes "MMPROJ_BYTES" :mmproj-bytes
+   "BASE_WIRED" :base-wired "BASE_ACTIVE" :base-active "BASE_COMPRESSED" :base-compressed
+   "BASE_SWAP_MB" :base-swap-mb "LOAD_S" :load-s
+   "LOADED_WIRED" :loaded-wired "LOADED_ACTIVE" :loaded-active
+   "LOADED_COMPRESSED" :loaded-compressed "LOADED_SWAP_MB" :loaded-swap-mb
+   "PEAK_WIRED" :peak-wired "PEAK_ACTIVE" :peak-active
+   "PEAK_COMPRESSED" :peak-compressed "PEAK_SWAP_MB" :peak-swap-mb})
+
+(defn- parse-num [s]
+  (let [t (str/trim (str s))]
+    (when-not (str/blank? t)
+      )))
+
+(defn- as-long [x] (when (number? x) (long x)))
+
+(defn- seconds
+  "A `%{time_total}` reading. `TIMEOUT` is a value, not a missing one -- curl
+  printed it because the request never came back, and that is the strongest
+  form of the failure this probe exists to catch."
+  [s]
+  (let [t (str/trim (str s))]
+    (cond (= "TIMEOUT" t) :timeout
+          (= "NOTMEASURED" t) nil
+          :else (parse-num t))))
+
+(defn parse-block
+  "One `===CONFIG` block's lines -> a sample map."
+  [lines]
+  (reduce
+   (fn [acc line]
+     (let [i (str/index-of (str line) "=")]
+       (if-not i
+         acc
+         (let [k (subs (str line) 0 i) v (subs (str line) (inc i))]
+           (cond
+             (= "LABEL" k) (assoc acc :label v)
+             (= "VERDICT" k) (assoc acc :loaded? false)
+             (= "LOAD_ERR" k) (assoc acc :load-err v)
+             (= "IDLE_OUTBOUND_S" k) (assoc acc :idle-outbound-s (seconds v))
+             (contains? #{"IDLE_OUTBOUND2_S" "IDLE_OUTBOUND3_S"} k)
+             (update acc :idle-outbound-extra (fnil conj []) (seconds v))
+             (= "LOAD_OUTBOUND_S" k) (assoc acc :load-outbound-s (seconds v))
+             (str/starts-with? k "REQ") (update acc :tok-s (fnil conj []) (parse-num v))
+             (contains? numeric-keys k)
+             (let [kw (get numeric-keys k)
+                   n (parse-num v)]
+               (assoc acc kw (if (contains? #{:base-swap-mb :loaded-swap-mb :peak-swap-mb} kw)
+                               n (as-long n))))
+             :else acc)))))
+   {:loaded? true}
+   lines))
+
+(defn parse-results
+  "The probe's whole output -> samples, in the order they were taken.
+
+  `memory-bytes` is the node's, not the probe's: the probe reports what it
+  measured on the machine and this is told which machine that was, so a rule
+  about headroom cannot silently use the wrong denominator."
+  [text memory-bytes]
+  (->> (str/split (str text) #"\n")
+       (reduce (fn [acc line]
+                 (if (str/starts-with? (str/trim (str line)) "===CONFIG")
+                   (conj acc [])
+                   (if (seq acc) (update acc (dec (count acc)) conj line) acc)))
+               [])
+       (remove empty?)
+       (map #(assoc (parse-block %) :memory-bytes memory-bytes))
+       (filter :label)
+       vec))
+
+;; ── the probe ──────────────────────────────────────────────────────────────
+;;
+;; Rendered from here rather than kept as a `.sh` in the tree, for the same
+;; reason `murakumo.infer.edge/install-script` is: the shell that runs on a
+;; node is an artifact of a decision made here, and a loose script drifts from
+;; the rule that reads its output. It prints KEY=VALUE and nothing else --
+;; every judgement about the readings lives in `verdict`.
+
+(def probe-port
+  "Not 8092 (murakumo-edge) and not 8093 (a dedicated model): a study must not
+  answer on a port the fleet routes to, or a half-loaded probe becomes a
+  replica."
+  8099)
+
+(defn probe-script
+  "Shell that measures one (model, ctx) config on a node.
+
+  Two readings carry the weight, and both were learned the hard way on
+  2026-09-10:
+
+  - `IDLE_OUTBOUND_S` / `LOAD_OUTBOUND_S` hit `/ready`, NOT `/infer/nodes`.
+    Measured from issachar, `/infer/nodes` takes 14.7 s and `/ready` 0.6 s, so
+    the heavy endpoint reports every config as going dark and reports it at
+    idle too. A probe whose control is already over budget cannot discriminate.
+
+  - The background sample is WAITED FOR, not slept on. The first version slept
+    six seconds for a reading that took nineteen and recorded an empty string,
+    which `parse-block` would have read as a missing field -- the honest
+    outcome, but only because nothing downstream treats blank as fast."
+  [{:keys [model ctx batch ubatch label mmproj llama-server]}]
+  (let [bin (or llama-server "$HOME/.murakumo/bin9334/llama-server")]
+    (str
+     "set -u\n"
+     "PORT=" probe-port "; PS=16384\n"
+     "mem() { vm_stat | awk -v ps=$PS '/Pages wired down/{w=$4} /Pages active/{a=$3} "
+     "/Pages occupied by compressor/{c=$5} END{gsub(/\\./,\"\",w);gsub(/\\./,\"\",a);"
+     "gsub(/\\./,\"\",c); printf \"%d %d %d\", w*ps, a*ps, c*ps}'; }\n"
+     "swap() { sysctl -n vm.swapusage | sed -n 's/.*used = \\([0-9.]*\\)M.*/\\1/p'; }\n"
+     "out() { curl -s -o /dev/null -m 25 -w \"%{time_total}\" "
+     "https://api.murakumo.cloud/ready 2>/dev/null || echo TIMEOUT; }\n"
+     "pkill -f 'alias fit-probe' >/dev/null 2>&1; sleep 3\n"
+     "echo LABEL=" label "\necho CTX=" ctx "\n"
+     "echo MODEL_BYTES=$(stat -f %z " model " 2>/dev/null || echo 0)\n"
+     "echo MMPROJ_BYTES=" (if mmproj (str "$(stat -f %z " mmproj " 2>/dev/null || echo 0)") "0") "\n"
+     "read BW BA BC <<<\"$(mem)\"\n"
+     "echo BASE_WIRED=$BW; echo BASE_ACTIVE=$BA; echo BASE_COMPRESSED=$BC; echo BASE_SWAP_MB=$(swap)\n"
+     "echo IDLE_OUTBOUND_S=$(out)\n"
+     "nohup " bin " -m " model " --alias fit-probe --host 127.0.0.1 --port $PORT"
+     " --ctx-size " ctx " --parallel 1 --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0"
+     " --jinja --no-webui"
+     (when mmproj (str " --mmproj " mmproj))
+     (when batch (str " --batch-size " batch " --ubatch-size " ubatch))
+     " > /tmp/fit-" label ".log 2>&1 &\n"
+     "SRV=$!; T0=$(date +%s)\n"
+     "for i in $(seq 1 180); do curl -sf -m 3 http://127.0.0.1:$PORT/health >/dev/null 2>&1 && break; "
+     "kill -0 $SRV 2>/dev/null || break; sleep 2; done\n"
+     "if ! curl -sf -m 5 http://127.0.0.1:$PORT/health >/dev/null 2>&1; then\n"
+     "  echo VERDICT=did-not-load; echo LOAD_S=$(( $(date +%s) - T0 ))\n"
+     "  echo \"LOAD_ERR=$(grep -iE 'error|failed|cannot|unable|out of memory' /tmp/fit-" label ".log "
+     "| tail -2 | tr '\\n' ' ' | cut -c1-220)\"\n"
+     "  kill $SRV 2>/dev/null; echo DONE=" label "; exit 0\nfi\n"
+     "echo LOAD_S=$(( $(date +%s) - T0 ))\n"
+     "read LW LA LC <<<\"$(mem)\"\n"
+     "echo LOADED_WIRED=$LW; echo LOADED_ACTIVE=$LA; echo LOADED_COMPRESSED=$LC; echo LOADED_SWAP_MB=$(swap)\n"
+     "for n in 1 2 3; do\n"
+     "  rm -f /tmp/fit-out-" label "\n"
+     "  [ $n = 2 ] && ( sleep 4; out > /tmp/fit-out-" label " ) &\n"
+     "  R=$(curl -s -m 300 http://127.0.0.1:$PORT/v1/chat/completions -H 'content-type: application/json'"
+     " -d '{\"messages\":[{\"role\":\"user\",\"content\":\"Explain a work queue in exactly three sentences.\"}],"
+     "\"max_tokens\":160,\"temperature\":0}')\n"
+     "  echo REQ${n}_TOKPS=$(echo \"$R\" | sed -n 's/.*\"predicted_per_second\":\\([0-9.]*\\).*/\\1/p')\n"
+     "  if [ $n = 2 ]; then for w in $(seq 1 40); do [ -s /tmp/fit-out-" label " ] && break; sleep 2; done\n"
+     "    echo \"LOAD_OUTBOUND_S=$(cat /tmp/fit-out-" label " 2>/dev/null || echo NOTMEASURED)\"; fi\n"
+     "done\n"
+     "read PW PA PC <<<\"$(mem)\"\n"
+     "echo PEAK_WIRED=$PW; echo PEAK_ACTIVE=$PA; echo PEAK_COMPRESSED=$PC; echo PEAK_SWAP_MB=$(swap)\n"
+     "kill $SRV 2>/dev/null; sleep 4\necho DONE=" label "\n")))

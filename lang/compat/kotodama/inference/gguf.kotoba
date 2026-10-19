@@ -1,0 +1,183 @@
+(ns kotodama.inference.gguf
+  "Portable GGUF tensor block helpers for kotodama direct inference.
+
+  File IO is host-specific. This namespace owns the byte-level quantized block
+  layouts that must be shared by browser, terminal, and verifier code before
+  weights can be lowered into num-clj tensors."
+  (:require [num.array :as arr]))
+
+(def q4-k-block-bytes 144)
+(def q6-k-block-bytes 210)
+(def qk-k 256)
+
+(defn u8 [b]
+  (bit-and 0xff b))
+
+(defn i8 [b]
+  (let [x (u8 b)]
+    (if (> x 127) (- x 256) x)))
+
+(defn le-u16 [bytes offset]
+  (+ (u8 (nth bytes offset))
+     (bit-shift-left (u8 (nth bytes (inc offset))) 8)))
+
+(defn fp16->double [h]
+  (let [sign (if (zero? (bit-and h 0x8000)) 1.0 -1.0)
+        exp (bit-and (bit-shift-right h 10) 0x1f)
+        frac (bit-and h 0x03ff)]
+    (cond
+      (zero? exp)
+      (if (zero? frac)
+        (* sign 0.0)
+        (* sign 
+           (/ frac 1024.0)))
+
+      (= 31 exp)
+      (* sign (if (zero? frac)
+                
+                ))
+
+      :else
+      (* sign 
+         (+ 1.0 (/ frac 1024.0))))))
+
+(defn q4-k-scale-min [scales j]
+  (if (< j 4)
+    {:scale (bit-and (nth scales j) 63)
+     :min (bit-and (nth scales (+ j 4)) 63)}
+    {:scale (bit-or (bit-and (nth scales (+ j 4)) 0x0f)
+                    (bit-shift-left (bit-shift-right (nth scales (- j 4)) 6) 4))
+     :min (bit-or (bit-shift-right (nth scales (+ j 4)) 4)
+                  (bit-shift-left (bit-shift-right (nth scales j) 6) 4))}))
+
+(defn q4-k-block->values
+  "Decode one GGML Q4_K block into 256 row-major doubles.
+
+  Layout matches ggml `block_q4_K` and `dequantize_row_q4_K`: d/dmin half,
+  12 packed scale/min bytes, then 128 4-bit quant bytes."
+  [bytes]
+  (when-not (= q4-k-block-bytes (count bytes))
+    (throw (ex-info "Q4_K block must be 144 bytes"
+                    {:expected q4-k-block-bytes :actual (count bytes)})))
+  (let [d (fp16->double (le-u16 bytes 0))
+        dmin (fp16->double (le-u16 bytes 2))
+        scales (mapv u8 (subvec (vec bytes) 4 16))
+        qs (mapv u8 (subvec (vec bytes) 16 144))
+        out (double-array qk-k)]
+    (loop [group 0
+           is 0]
+      (when (< group 4)
+        (let [{s1 :scale m1 :min} (q4-k-scale-min scales is)
+              {s2 :scale m2 :min} (q4-k-scale-min scales (inc is))
+              d1 (* d s1)
+              d2 (* d s2)
+              min1 (* dmin m1)
+              min2 (* dmin m2)
+              base (* group 64)
+              q-base (* group 32)]
+          (dotimes [l 32]
+            (let [q (nth qs (+ q-base l))]
+              (aset out (+ base l) (- (* d1 (bit-and q 0x0f)) min1))
+              (aset out (+ base l 32) (- (* d2 (bit-shift-right q 4)) min2))))
+          (recur (inc group) (+ is 2)))))
+    (vec out)))
+
+(defn q4-k-blocks->values
+  "Decode a contiguous sequence of Q4_K blocks."
+  [bytes]
+  (when-not (zero? (mod (count bytes) q4-k-block-bytes))
+    (throw (ex-info "Q4_K byte range must contain whole blocks"
+                    {:block-bytes q4-k-block-bytes
+                     :actual (count bytes)})))
+  (into [] (mapcat q4-k-block->values) (partition q4-k-block-bytes bytes)))
+
+(defn q4-k-row-byte-offset
+  "Return the byte offset for a contiguous row in a Q4_K tensor.
+
+  GGUF/GGML tensor dim 0 is contiguous. For projection weights this means row
+  index selects one output channel and `row-width` is the input hidden size."
+  [row-index row-width]
+  (when-not (zero? (mod row-width qk-k))
+    (throw (ex-info "Q4_K row width must be a multiple of 256"
+                    {:row-width row-width
+                     :qk-k qk-k})))
+  (* row-index (/ row-width qk-k) q4-k-block-bytes))
+
+(defn q4-k-row-byte-count [row-width]
+  (when-not (zero? (mod row-width qk-k))
+    (throw (ex-info "Q4_K row width must be a multiple of 256"
+                    {:row-width row-width
+                     :qk-k qk-k})))
+  (* (/ row-width qk-k) q4-k-block-bytes))
+
+(defn q6-k-block->values
+  "Decode one GGML Q6_K block into 256 row-major doubles.
+
+  Layout matches ggml `block_q6_K` and `dequantize_row_q6_K`: 128 low-nibble
+  bytes, 64 high-bit bytes, 16 signed scales, then one half scale."
+  [bytes]
+  (when-not (= q6-k-block-bytes (count bytes))
+    (throw (ex-info "Q6_K block must be 210 bytes"
+                    {:expected q6-k-block-bytes :actual (count bytes)})))
+  (let [d (fp16->double (le-u16 bytes 208))
+        out (double-array qk-k)]
+    (dotimes [group 2]
+      (let [base (* group 128)
+            ql-base (* group 64)
+            qh-base (+ 128 (* group 32))]
+        (dotimes [l 32]
+          (let [is (quot l 16)
+                ql0 (u8 (nth bytes (+ ql-base l)))
+                ql32 (u8 (nth bytes (+ ql-base 32 l)))
+                qh (u8 (nth bytes (+ qh-base l)))
+                q1 (- (bit-or (bit-and ql0 0x0f)
+                              (bit-shift-left (bit-and (bit-shift-right qh 0) 0x03) 4))
+                      32)
+                q2 (- (bit-or (bit-and ql32 0x0f)
+                              (bit-shift-left (bit-and (bit-shift-right qh 2) 0x03) 4))
+                      32)
+                q3 (- (bit-or (bit-shift-right ql0 4)
+                              (bit-shift-left (bit-and (bit-shift-right qh 4) 0x03) 4))
+                      32)
+                q4 (- (bit-or (bit-shift-right ql32 4)
+                              (bit-shift-left (bit-and (bit-shift-right qh 6) 0x03) 4))
+                      32)]
+            (aset out (+ base l) (* d (i8 (nth bytes (+ 192 is 0))) q1))
+            (aset out (+ base l 32) (* d (i8 (nth bytes (+ 192 is 2))) q2))
+            (aset out (+ base l 64) (* d (i8 (nth bytes (+ 192 is 4))) q3))
+            (aset out (+ base l 96) (* d (i8 (nth bytes (+ 192 is 6))) q4))))))
+    (vec out)))
+
+(defn q6-k-blocks->values
+  "Decode a contiguous sequence of Q6_K blocks."
+  [bytes]
+  (when-not (zero? (mod (count bytes) q6-k-block-bytes))
+    (throw (ex-info "Q6_K byte range must contain whole blocks"
+                    {:block-bytes q6-k-block-bytes
+                     :actual (count bytes)})))
+  (into [] (mapcat q6-k-block->values) (partition q6-k-block-bytes bytes)))
+
+(defn q6-k-row-byte-offset
+  "Return the byte offset for a contiguous row in a Q6_K tensor.
+
+  GGUF/GGML tensor dim 0 is contiguous. For `token_embd.weight` this means each
+  token id owns one contiguous embedding row of hidden-size values."
+  [row-index row-width]
+  (when-not (zero? (mod row-width qk-k))
+    (throw (ex-info "Q6_K row width must be a multiple of 256"
+                    {:row-width row-width
+                     :qk-k qk-k})))
+  (* row-index (/ row-width qk-k) q6-k-block-bytes))
+
+(defn q6-k-row-byte-count [row-width]
+  (when-not (zero? (mod row-width qk-k))
+    (throw (ex-info "Q6_K row width must be a multiple of 256"
+                    {:row-width row-width
+                     :qk-k qk-k})))
+  (* (/ row-width qk-k) q6-k-block-bytes))
+
+(defn values->num
+  "Upload decoded block values to a num-clj backend as an NDArray."
+  ([backend values] (values->num backend values [qk-k]))
+  ([backend values shape]
+   (arr/from-vec backend values shape)))

@@ -1,0 +1,148 @@
+(ns nekko.biscuit-delegate
+  "Journal-free push delegation as a Biscuit rooted at the repo owner's
+   did:key, decided by `kotoba-lang/authority`.
+
+   The alternative to nekko.delegate's append-only journal: the owner signs a
+   token granting push scopes; the holder carries it and presents it with a
+   sigref, and the verifier needs only the owner's did -- no journal fetch, no
+   secret. Until 2026-09-24 this was a CACAO chain checked with
+   `cacao.core/verify-chain` (`nekko.cacao-delegate`). Superproject
+   adr-2609241800 retires that form: CACAO is accepted only where Authn
+   exchanges it for a session, and new delegation is never written in it. A
+   CACAO presented here is refused by name (`:cacao-not-accepted`).
+
+   ## Shape
+
+       block 0  signed by the owner seed (root = owner did)
+                scope(kotoba-rad://<rid>/push/…)…  [holder(d)]  [before(t)]
+                next key: the delegate's did -- only they may append
+       block n  signed by the key block n-1 named
+                narrower scopes, an earlier before, a holder if none yet
+
+   ## The rules, and whose they are
+
+   - Scopes meet in the `authority.scope` lattice (`authority.chain`), with
+     `:strict? true`: a block claiming a scope its parent did not confer
+     refuses the token (`:escalation-attempted`) rather than being quietly
+     narrowed -- on a push gate an over-claim is an attack, not a typo.
+   - The holder folds by `biscuit.kotoba/->delegated`: a later block may
+     address a bearer token or repeat its holder, and may never name another
+     one (`:holder-readdressed`). So sub-delegation is: the owner grants a
+     token un-addressed to A's key; A narrows it and addresses it to B. Once a
+     token names a holder, that holder is final.
+   - A token that names no holder at all is refused (`:holder-absent`): the
+     sigref's signer must be the party the token was addressed to, so a
+     leaked bearer token pushes nothing.
+   - `:now` is required. `authority` treats a missing clock as a denial, not
+     a pass; the CACAO predicate skipped expiry when it was omitted.
+
+   Scopes are `[scope …]` facts (the kind-free mapping `biscuit.authority`
+   documents): `lang/capability-semantics.edn` has no push kind, so the `cap`
+   mapping `->delegated` reads would reject every grant here.
+
+   Signatures are hex strings, so a token is plain EDN on both runtimes."
+  (:require [authority.chain :as chain]
+            [authority.grant :as grant]
+            [biscuit.kotoba :as bk]
+            [biscuit.token :as token]
+            [ed25519.core :as ed]
+            [nekko.bytes :as nb]))
+
+(defn push-resource
+  "The scope authorizing a push to ref-name under rid."
+  [rid ref-name]
+  (str "kotoba-rad://" rid "/push/" ref-name))
+
+(defn push-resource-wildcard
+  "The scope authorizing a push to every ref under rid -- `:*` in the
+   `authority.scope` lattice, not a string prefix."
+  [rid]
+  (str "kotoba-rad://" rid "/push/*"))
+
+(defn- sign-fn [seed payload]
+  (nb/hexify (ed/sign seed (nb/utf8 payload))))
+
+(defn- verify-fn [did payload sig]
+  (try (boolean (and (string? sig)
+                     (ed/verify-did did (nb/utf8 payload) (nb/unhex sig))))
+       (catch  _ false)))
+
+(defn- block-facts [{:keys [resources holder expires]}]
+  (cond-> (mapv (fn [r] ['scope r]) resources)
+    holder (conj ['holder holder])
+    expires (conj ['before expires])))
+
+(defn grant
+  "The owner's token: `resources` (push scopes), appendable only by
+   `next-did`'s key. `holder` addresses it now; leave it nil to let
+   `next-did` address it (to itself or to a sub-delegate) by attenuating."
+  [owner-seed {:keys [resources next-did holder expires] :as opts}]
+  (token/authority {:facts (block-facts opts)
+                    :rules [] :checks []
+                    :next-public-key next-did
+                    :root-private-key owner-seed
+                    :sign-fn sign-fn}))
+
+(defn attenuate
+  "Append a block signed with `seed` -- the key the previous block named.
+   The block may narrow `resources` and `expires` and may address a bearer
+   token (`holder`). `next-did` defaults to `seed`'s own did."
+  [t seed {:keys [next-did] :as opts}]
+  (token/append t {:facts (block-facts opts)
+                   :rules [] :checks []
+                   :next-public-key (or next-did (ed/did-key-from-seed seed))
+                   :private-key seed
+                   :sign-fn sign-fn}))
+
+(defn- cacao-shaped?
+  "A CACAO as the old API took it: a base64 string, a chain of them, or a
+   minted map."
+  [t]
+  (or (string? t)
+      (and (sequential? t) (seq t) (every? string? t))
+      (and (map? t) (contains? t :cacao-b64))))
+
+(defn- chain-of [t holder]
+  (let [blocks (:biscuit/blocks t)
+        befores (keep (fn [[p v]] (when (= 'before p) v)) (mapcat :block/facts blocks))
+        expires (when (seq befores)
+                  (reduce (fn [a b] (if (neg? (compare a b)) a b)) befores))]
+    (into []
+          (keep (fn [b]
+                  (let [ss (keep (fn [[p v]] (when (= 'scope p) v)) (:block/facts b))]
+                    (when (seq ss)
+                      (grant/grant {:scopes (vec ss) :holder holder :expires expires})))))
+          blocks)))
+
+(defn authorize-push
+  "Does `t`, rooted at owner-did, let signer-did push ref-name under rid at
+   `now` (ISO-8601 UTC)?
+
+   -> `{:allowed? true :holder did}` or `{:allowed? false :reason kw}`."
+  [t owner-did rid ref-name signer-did {:keys [now]}]
+  (cond
+    (nil? t) {:allowed? false :reason :absent}
+    (cacao-shaped? t) {:allowed? false :reason :cacao-not-accepted}
+    (not (and (map? t) (contains? t :biscuit/blocks))) {:allowed? false :reason :not-a-biscuit}
+    :else
+    (let [checked (token/verify t owner-did verify-fn)]
+      (if-not (:ok? checked)
+        {:allowed? false :reason :unverified :detail (:reason checked)}
+        (let [{bound :grant/holder refused :grant/refused} (bk/->delegated t #{})]
+          (cond
+            refused {:allowed? false :reason refused}
+            (nil? bound) {:allowed? false :reason :holder-absent}
+            :else
+            (let [decision (chain/authorize {:chain (chain-of t bound)
+                                             :requested (push-resource rid ref-name)
+                                             :now now
+                                             :holder signer-did
+                                             :strict? true})]
+              (if (:authority/allowed? decision)
+                {:allowed? true :holder bound}
+                {:allowed? false :reason (:authority/reason decision)}))))))))
+
+(defn authorized?
+  "Boolean form of `authorize-push`."
+  [t owner-did rid ref-name signer-did opts]
+  (true? (:allowed? (authorize-push t owner-did rid ref-name signer-did opts))))

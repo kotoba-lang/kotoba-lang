@@ -1,0 +1,267 @@
+(ns inga.power
+  "F3 — the power table as COMMITTED STATE, and a `:storage` role.
+
+  ## What changes, and what deliberately does not
+
+  `inga.stake` (which arrived here from engi in the same extraction) already
+  implements permissionless admission by external
+  collateral, stake-weighted quorum, equivocation-only slashing, and a
+  role-tagged single bond market (`:ordering` for block-consensus voting,
+  `:recompute` for proof-of-compute sampling). None of that economics is
+  reimplemented here, and this namespace must not grow a second copy of it —
+  superproject ADR-2608031200 named that failure mode the same week.
+
+  The one thing `inga.stake` cannot do by itself is the thing F3 is about:
+  **it is HANDED the bond map from outside.** `{witness-did -> {:amount
+  :roles}}` arrives already assembled, so who is a witness is decided
+  somewhere the consensus does not order. Two replicas reading the escrow at
+  slightly different moments have different validator sets, and a validator
+  set is not a thing peers may disagree about — it is what quorum is counted
+  against.
+
+  Filecoin's Storage Power Consensus puts the power table IN chain state, so
+  a change in power is ordered by the same consensus that orders everything
+  else. This namespace is that: a table plus a transition function the
+  machine applies, so the table at height h is a function of the committed
+  prefix and nothing else.
+
+  ## `:storage` — the new role
+
+  SPC's deeper idea is that the Sybil-resistant resource should be the useful
+  work the network exists to do (storage, proved). For this stack that work
+  is retaining and serving datom blocks, so `:storage` joins the existing
+  role set on the existing market — a role added to one rulebook, not a
+  second economy.
+
+  What this does NOT do: replace external collateral. `inga.stake`'s reason
+  for bonding USDC rather than EN holds unchanged (EN nets to zero across all
+  agents, so bonding it disincentivises nothing), and ADR-2608038000 F3 says
+  so explicitly. And `:storage` power here is credited by attested retrieval
+  sampling — the shape `:recompute` already uses — **not** by PoRep/PoSt.
+  This library does not implement a storage proof and no deployment using it
+  may claim Filecoin-equivalent storage guarantees."
+  (:require [kotoba.lang.coll :as set]
+            [inga.stake :as stake]))
+
+(def roles
+  "Closed on purpose. An unknown role that silently counts toward nothing is
+  indistinguishable from a typo, and an unknown role that silently counts
+  toward everything is a privilege escalation."
+  #{:ordering :recompute :storage})
+
+(def empty-table
+  {:bonds {} :height 0})
+
+;; ── transitions ─────────────────────────────────────────────────────────────
+;;
+;; Every one is `(table, event) -> table`. Pure, total, and ORDER-DEPENDENT by
+;; construction: that is the point — the committed sequence decides the table,
+;; so peers cannot hold different validator sets while agreeing on blocks.
+
+(defmulti apply-event
+  "Apply one power event. Unknown event types throw rather than no-op: a
+  silently ignored event is a state divergence between a replica that knows
+  the type and one that does not, which is exactly the failure the table
+  moved into committed state to avoid.
+
+  `opts` carries the injected seams a transition needs — today only
+  `:verify-sig-fn`, for `:slash`. It is an argument rather than a field on the
+  table because the table is DATA: two replicas compare theirs, serialize
+  them, and hash them into a state root, and a function in there makes all
+  three meaningless."
+  (fn [_table event _opts] (:event event)))
+
+(defmethod apply-event :default
+  [_table event _opts]
+  (throw (ex-info "inga.power: unknown power event"
+                  {:type :inga.power/unknown-event :event (:event event)})))
+
+(defmethod apply-event :bond
+  [table {:keys [witness amount roles] :as e} _opts]
+  (when-not (and (string? witness) (nat-int? amount))
+    (throw (ex-info "inga.power: :bond needs a witness and a non-negative amount"
+                    {:type :inga.power/invalid-event :event e})))
+  (let [rs (set roles)
+        unknown (set/difference rs inga.power/roles)]
+    (when (seq unknown)
+      (throw (ex-info "inga.power: unknown role in :bond"
+                      {:type :inga.power/unknown-role :roles unknown})))
+    (update-in table [:bonds witness]
+               (fn [b] (-> (or b {:amount 0 :roles #{}})
+                           (update :amount + amount)
+                           (update :roles into rs))))))
+
+(defmethod apply-event :set-roles
+  [table {:keys [witness roles] :as e} _opts]
+  (let [rs (set roles)
+        unknown (set/difference rs inga.power/roles)]
+    (when (seq unknown)
+      (throw (ex-info "inga.power: unknown role in :set-roles"
+                      {:type :inga.power/unknown-role :roles unknown})))
+    (if-not (get-in table [:bonds witness])
+      (throw (ex-info "inga.power: :set-roles for a witness with no bond"
+                      {:type :inga.power/invalid-event :event e}))
+      (assoc-in table [:bonds witness :roles] rs))))
+
+(defmethod apply-event :unbond-request
+  [table {:keys [witness available-at] :as e} _opts]
+  (if-not (get-in table [:bonds witness])
+    (throw (ex-info "inga.power: :unbond-request for a witness with no bond"
+                    {:type :inga.power/invalid-event :event e}))
+    ;; Requesting takes the witness out of the active set IMMEDIATELY while
+    ;; leaving the collateral in place until `available-at`. A witness that
+    ;; kept voting through its notice period could equivocate and then walk
+    ;; the bond out; a witness whose bond left immediately could equivocate
+    ;; with nothing at risk. Both halves are needed and they are not
+    ;; symmetric.
+    (-> table
+        (assoc-in [:bonds witness :unbonding-at] available-at)
+        (assoc-in [:bonds witness :roles] #{}))))
+
+(defmethod apply-event :unbond-complete
+  [table {:keys [witness height] :as e} _opts]
+  (let [b (get-in table [:bonds witness])
+        at (:unbonding-at b)]
+    (cond
+      (nil? b) (throw (ex-info "inga.power: :unbond-complete for a witness with no bond"
+                               {:type :inga.power/invalid-event :event e}))
+      (nil? at) (throw (ex-info "inga.power: :unbond-complete without a request"
+                                {:type :inga.power/invalid-event :event e}))
+      (< height at) (throw (ex-info "inga.power: :unbond-complete before the notice period elapsed"
+                                    {:type :inga.power/too-early :height height :available-at at}))
+      :else (update table :bonds dissoc witness))))
+
+(defn- reject-slash
+  "Record a refused `:slash` in the table and change nothing else.
+
+  Refusing rather than throwing is deliberate, and it is NOT the same call the
+  `:default` method makes. Whether an event type is `unknown` depends on the
+  replica's code version, so no-op-ing that would diverge. Whether a piece of
+  evidence verifies does NOT: every replica folds the same committed bytes
+  through the same Ed25519 check and reaches the same verdict, so refusing is
+  deterministic.
+
+  And throwing here would hand any proposer a halt: put one bogus `:slash` in
+  a block and every replica dies applying it. A slash is the one event ANYONE
+  may submit ABOUT ANYONE — it is adversarial input by construction, and
+  adversarial input must not be able to stop the chain. Refusals go into the
+  table instead of being dropped, so a flood of forged accusations is
+  attributable rather than invisible.
+
+  **Counted, not listed.** The first version of this appended a map to a
+  vector, and that was wrong for the same reason the throw was: this is
+  ATTACKER-CHOSEN data in state that is folded across the whole chain and
+  hashed into a state root. A proposer could grow it without bound, forever,
+  at the cost of block space alone. `{witness {reason count}}` is bounded by
+  the witness set times the fixed reason set, and answers the question the
+  list was there for — who was accused, how, and how often. `:slashes` keeps
+  its vector because only a SUCCESSFUL slash appends to it, and each one
+  costs the offender their entire bond; the attacker does not choose that."
+  [table witness reason]
+  (update-in table [:rejected-slashes witness reason] (fnil inc 0)))
+
+(defmethod apply-event :slash
+  [table {:keys [witness evidence terms]} {:keys [verify-sig-fn]}]
+  ;; A slash MUST carry the proof that justifies it, and this fold MUST check
+  ;; it. Before 2026-08-05 this method validated only that the witness had a
+  ;; bond, on the strength of a comment saying evidence "is checked before an
+  ;; event gets here" — nothing enforced that, and the evidence never travelled
+  ;; in the committed event, so no replica could have checked it even in
+  ;; principle. Whoever composed the block decided who lost their collateral
+  ;; and every replica applied it deterministically. That is a delegated
+  ;; adjudicator wearing the costume of consensus (superproject
+  ;; ADR-2608055000 G2, invariant I4: no adjudicator exists).
+  ;;
+  ;; The check itself is `inga.stake`'s, not a second copy: this namespace owns
+  ;; only that the consequence lands at a DECIDED POINT in the sequence.
+  (cond
+    ;; No verifier configured is a DEPLOYMENT error, not adversarial input, so
+    ;; unlike everything below it throws. A replica that cannot check evidence
+    ;; must never apply a slash, and it must not quietly record refusals while
+    ;; its correctly-configured peers apply the same slash for real -- that is
+    ;; divergence. Same discipline as the machine's `:hash-fn`: every replica
+    ;; is configured identically or none of this holds.
+    (nil? verify-sig-fn)
+    (throw (ex-info "inga.power: :slash needs a :verify-sig-fn to check its evidence"
+                    {:type :inga.power/no-verifier :witness witness}))
+
+    (nil? evidence) (reject-slash table witness :no-evidence)
+
+    ;; Evidence naming someone else is how you launder a real proof about A
+    ;; into a confiscation from B.
+    (not= witness (:inga.evidence/witness evidence))
+    (reject-slash table witness :evidence-names-another-witness)
+
+    ;; `verify-equivocation-evidence` re-checks the whole claim -- same witness,
+    ;; same height, different blocks, BOTH signatures -- which is what stops
+    ;; evidence from being a way to accuse anyone of anything.
+    (not (stake/verify-equivocation-evidence evidence verify-sig-fn))
+    (reject-slash table witness :evidence-did-not-verify)
+
+    ;; Evidence for height H stays valid forever. Without this, a witness that
+    ;; was slashed, re-bonded, and has behaved since could be punished again
+    ;; for the same past act, indefinitely, by anyone holding the old proof.
+    (contains? (:punished table) [witness (:inga.evidence/height evidence)])
+    (reject-slash table witness :already-punished)
+
+    (nil? (get-in table [:bonds witness]))
+    (reject-slash table witness :not-bonded)
+
+    :else
+    ;; The economics are `inga.stake/slash`'s (burn fraction, whistleblower
+    ;; share, where the remainder is credited). `stake/slash` returns
+    ;; `{:bonds :burned :rewarded}` and removes the offender's ENTIRE record.
+    ;; Writing the roles back afterwards -- which the first version of this did
+    ;; -- resurrects a ghost `{:roles #{}}` entry that `bonds` then hands to
+    ;; stake as a zero-stake witness. The test that caught it is
+    ;; `slashing-lands-at-a-decided-height`.
+    (let [height (:inga.evidence/height evidence)
+          {:keys [bonds burned rewarded]} (stake/slash (:bonds table) witness
+                                                       (or terms {}))]
+      (-> table
+          (assoc :bonds bonds)
+          ;; The numbers go into the table too: a slash whose consequence is
+          ;; ordered but whose magnitude is not is only half committed. So does
+          ;; WHICH double-vote was punished -- that is what makes the entry
+          ;; auditable and what `:punished` is keyed on.
+          (update :slashes (fnil conj [])
+                  {:witness witness :burned burned :rewarded rewarded
+                   :for-height height})
+          (update :punished (fnil conj #{}) [witness height])))))
+
+(defn apply-events
+  "Fold a block's power events at `height`. `:height` is recorded so a reader
+  can say WHICH committed prefix a table is the function of — a power table
+  without its height is a claim with no way to check it.
+
+  `opts` is threaded to every transition. `:verify-sig-fn` (`(fn [vote]
+  boolean)`, the same seam `inga.replica/vote-verifier` builds) is REQUIRED
+  before a `:slash` can apply — folding without it throws rather than applying
+  an unchecked confiscation. Every replica must pass the same one, exactly as
+  they must share `:hash-fn`.
+
+  The 3-arity is kept for the transitions that need no seam; it folds with no
+  opts and therefore cannot apply a `:slash`."
+  ([table height events] (apply-events table height events {}))
+  ([table height events opts]
+   (assoc (reduce (fn [t e] (apply-event t e opts)) table events) :height height)))
+
+;; ── reading the table: DELEGATED ────────────────────────────────────────────
+;;
+;; `eligible` / `stake-for` / `quorum-met?` used to live here as simplified
+;; reimplementations, written before `inga.stake` was in this repo. They are
+;; gone. `inga.stake` already owns admission, stake weighting and the quorum
+;; rule, and two implementations of a quorum rule is not a redundancy — it is
+;; two answers to "did this block commit". ADR-2608031200 named this failure
+;; mode the same week.
+;;
+;; What is left here is the part `inga.stake` genuinely cannot do: it is HANDED
+;; a bonds map, so `bonds` below is the seam that makes that map a function of
+;; the committed prefix instead of of whenever someone read the escrow.
+
+(defn bonds
+  "The `{witness -> {:amount :roles}}` map `inga.stake` consumes, as of this
+  table's height. Witnesses in their unbonding notice period are excluded:
+  their collateral is still at risk but their vote is not counted."
+  [table]
+  (into {} (remove (comp :unbonding-at val)) (:bonds table)))

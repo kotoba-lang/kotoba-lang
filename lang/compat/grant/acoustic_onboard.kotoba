@@ -1,0 +1,250 @@
+(ns grant.acoustic-onboard
+  "The wire rules for handing a headless box its Wi-Fi by sound (ADR-0243).
+
+  Three runtimes have to agree on these bytes: the box that decrypts, the phone
+  page that seals in a browser, and the PC helper that seals on a desktop. A
+  disagreement does not fail loudly -- it produces an envelope that opens
+  nowhere and a box that never gets online -- so what is decided here is pinned
+  by golden vectors (`test/vectors/acoustic-onboard.edn`) and each runtime is
+  checked against the same bytes, not against a shared implementation.
+
+  Pure: strings and byte vectors in, a value or `{:error <reason>}` out. No
+  I/O and no crypto. The caller does X25519, HKDF-SHA256 and AES-256-GCM; this
+  decides what is fed to them and what comes out of them.
+
+  ## What binds an envelope
+
+  Not the code the box broadcasts. Anyone within earshot hears that, so an
+  envelope bound only to it lets a bystander point the box at a Wi-Fi of their
+  choosing. The HKDF salt is the per-device **label secret**, which exists on the
+  box's label and in the box's factory state and nowhere in the air. The
+  broadcast `code` and `fp` still go into the AAD, so an envelope made for one
+  session or one device does not open for another.
+
+  ## Why the IV is not on the wire
+
+  The whole message must fit ggwave's 140-byte payload. A fresh ephemeral X25519
+  key is made for every message, so the (key, IV) pair is never reused and the IV
+  can be taken from the same HKDF output (44 bytes: 32 key, 12 IV) instead of
+  being sent. That makes this a different suite from ADR-0113's, which sends its
+  IV, and the two are not interchangeable -- hence `suite` carries its own name."
+  (:require [kotoba.bytes :as kbytes]
+            [kotoba.lang.text :as str]))
+
+(def suite
+  "Not interchangeable with ADR-0113's `x25519-hkdf-sha256-aes-256-gcm-v1`."
+  "x25519-hkdf-sha256-aes-256-gcm-v1-acoustic")
+
+(def aad-domain "aiueos-wifi-profile-v1-acoustic")
+
+(def beacon-tag "mk1")
+
+(def message-magic
+  "First byte of a profile message. Anything else heard is not one."
+  0x57)
+
+(def max-message-bytes "ggwave's payload limit." 140)
+
+(def max-body-bytes
+  "`ssid` + one NUL + `passphrase`. Chosen so the whole message stays within
+  `max-message-bytes`: 1 magic + 32 key + (1 security + 88 body + 16 tag) = 138."
+  88)
+
+(def hkdf-output-bytes "32 key + 12 IV." 44)
+
+(def code-alphabet
+  "No 0/O, 1/I/L: the code is read aloud and compared by a person."
+  "ABCDEFGHJKMNPQRSTUVWXYZ23456789")
+
+(def security-codes {:open 0 :wpa2-personal 1 :wpa3-personal 2})
+
+(def ^:private security-by-code {0 :open, 1 :wpa2-personal, 2 :wpa3-personal})
+
+(def ^:private code-re #"[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{6}")
+(def ^:private fp-re #"[0-9a-f]{8}")
+(def ^:private b64url-re #"[A-Za-z0-9_-]+")
+
+;; Unpadded base64url leaves unused low bits in the last character. 32 bytes are 256
+;; bits in 43 characters (258 bits): the last character carries 4 data bits and 2
+;; zero bits, so its value is a multiple of 4. 16 bytes are 128 bits in 22
+;; characters (132 bits): the last carries 2 data bits and 4 zero bits, a multiple
+;; of 16. A string whose last character breaks that is not the encoding of any
+;; such key. (Getting this the wrong way round rejected about three in four real
+;; X25519 keys; a generated key in the murakumo tests is what caught it.)
+(def ^:private last-of-32-bytes "AEIMQUYcgkosw048")
+(def ^:private last-of-16-bytes "AQgw")
+
+(defn- string-of-length? [s n] (and (string? s) (= n (count s))))
+
+(defn- canonical-b64url? [s n last-chars]
+  (and (string-of-length? s n)
+       (boolean (re-matches b64url-re s))
+       (boolean (str/includes? last-chars (subs s (dec n))))))
+
+(defn code-problem [code]
+  (when-not (and (string? code) (re-matches code-re code)) :bad-code))
+
+(defn fp-problem [fp]
+  (when-not (and (string? fp) (re-matches fp-re fp)) :bad-fingerprint))
+
+(defn label-secret-problem
+  "A label secret is 16 bytes as unpadded base64url (22 characters)."
+  [ls]
+  (when-not (canonical-b64url? ls 22 last-of-16-bytes) :bad-label-secret))
+
+(defn device-key-problem
+  "An X25519 public key is 32 bytes as unpadded base64url (43 characters)."
+  [k]
+  (when-not (canonical-b64url? k 43 last-of-32-bytes) :bad-device-key))
+
+;; ── beacon and acknowledgement (box -> listener) ──────────────────────────
+
+(defn beacon
+  "`mk1|<code>|<fp>|<key>`, or `{:error reason}`. `code` is a session label
+  regenerated every boot and every attempt window, not a credential."
+  [{:keys [code fp key]}]
+  (if-let [problem (or (code-problem code) (fp-problem fp) (device-key-problem key))]
+    {:error problem}
+    (str beacon-tag "|" code "|" fp "|" key)))
+
+(defn parse-beacon
+  "What a listener makes of a heard string: `{:code :fp :key}` or `{:error reason}`.
+  Anything that is not exactly a beacon is `:not-a-beacon`; a beacon with a bad
+  field names that field."
+  [text]
+  (if-not (string? text)
+    {:error :not-a-beacon}
+    (let [parts (str/split text #"\|")]
+      (if-not (and (= 4 (count parts)) (= beacon-tag (first parts)))
+        {:error :not-a-beacon}
+        (let [[_ code fp key] parts]
+          (if-let [problem (or (code-problem code) (fp-problem fp) (device-key-problem key))]
+            {:error problem}
+            {:code code :fp fp :key key}))))))
+
+(defn ack
+  "`ack|<code>`: the box says it opened and stored a profile for this session."
+  [code]
+  (if-let [problem (code-problem code)]
+    {:error problem}
+    (str "ack|" code)))
+
+(defn parse-ack
+  "The code a heard string acknowledges, or `{:error reason}`."
+  [text]
+  (if-not (and (string? text) (str/starts-with? text "ack|"))
+    {:error :not-an-ack}
+    (let [code (subs text 4)]
+      (if-let [problem (code-problem code)]
+        {:error problem}
+        {:code code}))))
+
+;; ── what is fed to HKDF and AES-GCM ───────────────────────────────────────
+
+(defn binding
+  "`{:aad :salt}` as strings (UTF-8 by the caller), or `{:error reason}`.
+
+      aad  = aiueos-wifi-profile-v1-acoustic\\n<code>\\n<fp>
+      salt = <label secret, base64url as printed>
+
+  `code` and `fp` are validated rather than escaped, so neither can contain the
+  newline that would let two different pairs frame to the same bytes."
+  [{:keys [code fp label-secret]}]
+  (if-let [problem (or (code-problem code) (fp-problem fp) (label-secret-problem label-secret))]
+    {:error problem}
+    {:aad (str aad-domain "\n" code "\n" fp)
+     :salt label-secret}))
+
+(defn split-okm
+  "The 44 HKDF bytes as `{:key <32> :iv <12>}`, or `{:error :bad-okm-length}`."
+  [okm]
+  (if (= hkdf-output-bytes (count okm))
+    {:key (vec (subvec (vec okm) 0 32)) :iv (vec (subvec (vec okm) 32 44))}
+    {:error :bad-okm-length}))
+
+;; ── the profile ───────────────────────────────────────────────────────────
+
+(defn profile-problem
+  "Why a profile cannot be sent by sound, or nil. Named individually: a refusal
+  that said only \"invalid\" would send the person to the wrong field.
+
+  `:security` is `:open`, `:wpa2-personal` or `:wpa3-personal`; an open network
+  has no passphrase."
+  [{:keys [ssid security passphrase]}]
+  (let [ssid-bytes (when (string? ssid) (kbytes/utf8-encode ssid))
+        pass-bytes (when (string? passphrase) (kbytes/utf8-encode passphrase))
+        open? (= :open security)]
+    (cond
+      (not (contains? security-codes security)) :unknown-security
+      (not (string? ssid)) :ssid-not-a-string
+      (not (<= 1 (count ssid-bytes) 32)) :ssid-length
+      (some zero? ssid-bytes) :ssid-contains-nul
+      (and open? (some? passphrase) (not (str/blank? passphrase))) :passphrase-on-open-network
+      open? nil
+      (not (string? passphrase)) :passphrase-missing
+      (not (<= 8 (count pass-bytes) 63)) :passphrase-length
+      (some zero? pass-bytes) :passphrase-contains-nul
+      (> (+ (count ssid-bytes) 1 (count pass-bytes)) max-body-bytes) :too-long-for-sound
+      :else nil)))
+
+(defn encode-plaintext
+  "`security(1) | ssid | 0x00 | passphrase` as a byte vector, or `{:error reason}`."
+  [{:keys [ssid security passphrase] :as profile}]
+  (if-let [problem (profile-problem profile)]
+    {:error problem}
+    (vec (concat [(get security-codes security)]
+                 (kbytes/utf8-encode ssid)
+                 [0]
+                 (when (not= :open security) (kbytes/utf8-encode passphrase))))))
+
+(defn decode-plaintext
+  "The inverse of `encode-plaintext`, validated with the same rules, or
+  `{:error reason}`. A box must not apply a profile it would not have accepted."
+  [bs]
+  (let [bs (vec bs)
+        security (get security-by-code (first bs))
+        body (when (> (count bs) 1) (subvec bs 1))
+        nul (when body (first (keep-indexed (fn [i b] (when (zero? b) i)) body)))]
+    (cond
+      (nil? security) {:error :unknown-security}
+      (nil? nul) {:error :malformed-plaintext}
+      :else
+      (let [ssid (kbytes/utf8-decode (subvec body 0 nul))
+            pass (kbytes/utf8-decode (subvec body (inc nul)))]
+        (if (or (nil? ssid) (nil? pass))
+          {:error :not-utf8}
+          (let [profile (cond-> {:ssid ssid :security security}
+                          (not= :open security) (assoc :passphrase pass))]
+            (or (when-let [problem (profile-problem profile)] {:error problem})
+                profile)))))))
+
+;; ── the message (listener -> box) ─────────────────────────────────────────
+
+(def ^:private key-bytes 32)
+(def ^:private tag-bytes 16)
+
+(defn frame
+  "`0x57 | ephemeral public key(32) | ciphertext || tag(16)` as a byte vector, or
+  `{:error reason}`. The ciphertext includes its tag, as AES-GCM libraries
+  return it."
+  [{:keys [ephemeral-public-key ciphertext]}]
+  (let [k (vec ephemeral-public-key) c (vec ciphertext)]
+    (cond
+      (not= key-bytes (count k)) {:error :bad-ephemeral-key-length}
+      ;; at least one plaintext byte (security) plus the tag
+      (< (count c) (+ 1 tag-bytes)) {:error :ciphertext-too-short}
+      (> (+ 1 key-bytes (count c)) max-message-bytes) {:error :too-long-for-sound}
+      :else (vec (concat [message-magic] k c)))))
+
+(defn parse-frame
+  "`{:ephemeral-public-key :ciphertext}` (both byte vectors) or `{:error reason}`.
+  `:not-a-profile` is what a listener should answer for anything that is not
+  one, including a beacon heard back from its own speaker."
+  [bs]
+  (let [bs (vec bs)]
+    (cond
+      (not= message-magic (first bs)) {:error :not-a-profile}
+      (> (count bs) max-message-bytes) {:error :too-long-for-sound}
+      (< (count bs) (+ 1 key-bytes 1 tag-bytes)) {:error :not-a-profile}
+      :else {:ephemeral-public-key (subvec bs 1 (+ 1 key-bytes))
+             :ciphertext (subvec bs (+ 1 key-bytes))})))

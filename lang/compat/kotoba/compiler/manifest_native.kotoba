@@ -1,0 +1,224 @@
+(ns kotoba.compiler.manifest-native
+  "The native backends of `amu test --manifest` (root ADR-2610092330 step
+  C1): `:native-aarch64` / `:native-x86_64`, driven on the host's own ISA
+  only, with a measured runtime the caller supplies.
+
+  The route is the one measured by hand on 2026-10-09 (ADR-2610092330 §3,
+  S0's six steps), automated:
+
+    amu compile <entry> --target <host native target> --output x.kexe
+    amu sign x.kexe --key key.edn --expires <now+86400> --output x.signed.kexe
+    amu run x.signed.kexe --entry <function> --trust pinned-trust.edn
+        --runtime runtime.edn --loader kotoba-loader --policy {:allow #{}}
+        --input {:args [...]} --executor-key key.edn
+
+  and the value compared is the run's `[:result :result]`.
+
+  WHY A CHILD `bin/amu` AND NOT IN-PROCESS CALLS. The three commands live on
+  three different routes: `compile` on the per-ISA native driver, `sign` on
+  the trust plane, `run` on the executor route, whose `:native-run` alias
+  closure (kototama-native) `bin/amu` puts on that command's classpath and on
+  no other -- `amu test`'s classpath does not have the executor. Spawning
+  `bin/amu` runs each command exactly as a user would, refusals included.
+
+  All of a manifest's native jobs go to ONE child node (through
+  `test-profile/node-run`, the probe route the js/wasm targets already use),
+  which runs `bin/amu` for each case with bounded parallelism and answers
+  JSON. That child, not this process, captures each command's stderr: a
+  compile refusal is the information a native row carries (the native
+  target refuses many typed operations by name, e.g. `document-sha256`).
+
+  The runtime directory holds `key.edn`, `pinned-trust.edn` (or
+  `trust.edn`), `runtime.edn` and `kotoba-loader` -- what `prepare!` writes.
+  Whatever runtime it is given is used: the pin between amu's loader source
+  and the native artifact's runtime_identity is not checked here (ADR §5)."
+  {:kotoba/export [host-backend prepare! run-jobs runtime-files]}
+  (:require [json.data-json :as json]
+            [kotoba.compiler.bounded-edn :as bounded-edn]
+            [kotoba.compiler.test-profile :as test-profile]
+            ))
+
+(def runtime-files
+  "What a measured native runtime directory must hold, in the order `run`
+  takes them. `:trust` accepts either name; the pinned one is preferred."
+  {:key ["key.edn"]
+   :trust ["pinned-trust.edn" "trust.edn"]
+   :runtime ["runtime.edn"]
+   :loader ["kotoba-loader"]})
+
+(defn host-backend
+  "The manifest backend id of this host's native ISA, or nil. Only the host's
+  own ISA is driven: a kexe runs under the measured loader of the machine it
+  was compiled on."
+  []
+  (let [arch ]
+    (case arch
+      ("arm64" "aarch64") :native-aarch64
+      ("x64" "x86_64" "amd64") :native-x86_64
+      nil)))
+
+(defn- getenv [name]
+  (let [v ]
+    (when (seq v) v)))
+
+(defn- child-env
+  "Variables the `bin/amu` children need that the process/spawn grant does
+  not pass (kotoba.compiler.nbb.host.process/env): the nbb engine of a
+  checkout without node_modules, and the reviewed loader source directory
+  `measure-runtime` reads."
+  [extra]
+  (merge (into {} (keep (fn [k] (when-let [v (getenv k)] [k v])))
+               ["KBB_ENGINE" "KOTOBA_LOADER_SOURCE_DIR"])
+         extra))
+
+;; The child program. `cfg` is the JSON the caller embeds; `bin/amu` is run
+;; with the running node binary, its stdout and stderr captured per command.
+(def ^:private program-head
+  (str "import {spawn} from 'node:child_process';"
+       "import fs from 'node:fs';import os from 'node:os';import path from 'node:path';"
+       "import {createRequire} from 'node:module';"
+       "const amu=path.resolve(cfg.amu);"
+       "const env={...process.env,...cfg.env};"
+       "const cap=s=>s.length>20000?s.slice(0,20000):s;"
+       "const amuRun=args=>new Promise(res=>{"
+       "const c=spawn(process.execPath,[amu,...args],{env,stdio:['ignore','pipe','pipe']});"
+       "let out='',err='';c.stdout.on('data',d=>out+=d);c.stderr.on('data',d=>err+=d);"
+       "c.on('error',e=>res({status:-1,out,err:String(e)}));"
+       "c.on('close',s=>res({status:s===null?-1:s,out:cap(out),err:cap(err)}));});"))
+
+(def ^:private jobs-program
+  (str program-head
+       "const host=createRequire(amu)(amu).hostNativeTarget();"
+       "if(!host.target){console.log(JSON.stringify({fatal:host.reason}));process.exit(0);}"
+       "const rd=path.resolve(cfg.runtimeDir),rt={};"
+       "for(const [k,names] of Object.entries(cfg.runtimeFiles)){"
+       "const hit=names.map(n=>path.join(rd,n)).find(p=>fs.existsSync(p));"
+       "if(!hit){console.log(JSON.stringify({fatal:'--native-runtime '+rd+' holds no '+names.join(' (nor ')+(names.length>1?')':'')"
+       "+'; a measured runtime directory holds key.edn, pinned-trust.edn (or trust.edn), runtime.edn and kotoba-loader'"
+       "+' (amu test --manifest M --native-prepare <dir> writes one)'}));process.exit(0);}"
+       "rt[k]=hit;}"
+       "const work=fs.mkdtempSync(path.join(os.tmpdir(),'amu-manifest-native-'));"
+       "const policy=path.join(work,'policy.edn');fs.writeFileSync(policy,'{:allow #{}}\\n');"
+       "const one=async(job,i)=>{const d=path.join(work,String(i));fs.mkdirSync(d);"
+       "let entry=job.entry;"
+       "if(job.source!=null){entry=path.join(d,'case.kotoba');fs.writeFileSync(entry,job.source);}"
+       "const kexe=path.join(d,'x.kexe'),signed=path.join(d,'x.signed.kexe');"
+       "const ca=['compile',entry,'--target',host.target,'--output',kexe];"
+       "for(const r of job.sourcePaths)ca.push('--source-path',r);"
+       "if(job.sourcePaths.length)ca.push('--unpinned');"
+       "let r=await amuRun(ca);if(r.status!==0)return{id:job.id,phase:'compile',...r};"
+       "r=await amuRun(['sign',kexe,'--key',rt.key,'--expires',String(Math.floor(Date.now()/1000)+86400),'--output',signed]);"
+       "if(r.status!==0)return{id:job.id,phase:'sign',...r};"
+       "const input=path.join(d,'input.edn');fs.writeFileSync(input,'{:args ['+job.args.join(' ')+']}\\n');"
+       "r=await amuRun(['run',signed,'--entry',job.function,'--trust',rt.trust,'--runtime',rt.runtime,"
+       "'--loader',rt.loader,'--policy',policy,'--input',input,'--executor-key',rt.key,"
+       "'--output',path.join(d,'receipt.edn'),'--result-output',path.join(d,'result.edn')]);"
+       "return{id:job.id,phase:'run',...r};};"
+       "const results=new Array(cfg.jobs.length);let next=0;"
+       "const worker=async()=>{while(next<cfg.jobs.length){const i=next++;"
+       "try{results[i]=await one(cfg.jobs[i],i);}"
+       "catch(e){results[i]={id:cfg.jobs[i].id,phase:'harness',status:-1,out:'',err:String(e&&e.message||e)};}}};"
+       "try{await Promise.all(Array.from({length:Math.max(1,Math.min(cfg.parallel,cfg.jobs.length))},worker));}"
+       "finally{fs.rmSync(work,{recursive:true,force:true});}"
+       "console.log(JSON.stringify({target:host.target,results}));"))
+
+(def ^:private prepare-program
+  (str program-head
+       "const d=path.resolve(cfg.dir);fs.mkdirSync(d,{recursive:true});"
+       "const p=n=>path.join(d,n);"
+       "const steps=[['keygen','--output',p('key.edn')],"
+       "['public-key',p('key.edn'),'--output',p('vk.edn')],"
+       "['trust-key',p('vk.edn'),'--output',p('trust.edn')],"
+       "['measure-runtime','--output',p('runtime.edn'),'--loader-output',p('kotoba-loader')],"
+       "['trust-runtime',p('runtime.edn'),'--trust',p('trust.edn'),'--output',p('pinned-trust.edn')]];"
+       "let failed=null;"
+       "for(const s of steps){const r=await amuRun(s);if(r.status!==0){failed={step:s[0],...r};break;}}"
+       "console.log(JSON.stringify(failed?{failed}:{ok:true,dir:d}));"))
+
+(defn- run-program [cfg program]
+  (test-profile/node-run :native (str "const cfg=" (json/write-str cfg) ";" program)))
+
+(defn- read-edn [text]
+  (try (bounded-edn/read-string (str text))
+       (catch  _ nil)))
+
+(defn- message
+  "The `:message` of a CLI refusal EDN on TEXT, or TEXT trimmed."
+  [text]
+  (let [value (read-edn text)]
+    (or (when (map? value) (:message value))
+        (let [t (str text)] (if (> (count t) 600) (subs t 0 600) t)))))
+
+(defn prepare!
+  "Write a measured native runtime into DIR: a fresh executor key, its trust
+  set, `amu measure-runtime` (which builds the reviewed loader with the host
+  C compiler), and the trust set pinned to that runtime. LOADER-SOURCE-DIR,
+  when given, is the directory holding the reviewed `kexe_loader.c`
+  (`KOTOBA_LOADER_SOURCE_DIR`; otherwise that variable, then amu's
+  `tools/`). Throws with the failing step's refusal."
+  [dir {:keys [loader-source-dir]}]
+  (let [answer (run-program {:amu "bin/amu" :dir dir
+                             :env (child-env (cond-> {}
+                                               loader-source-dir
+                                               (assoc "KOTOBA_LOADER_SOURCE_DIR" loader-source-dir)))}
+                            prepare-program)]
+    (when-let [{:keys [step err out]} (:failed answer)]
+      (let [why (message (str err out))]
+        (throw (ex-info (str "--native-prepare: amu " step " failed: " why
+                             (when (re-find #"loader source identity mismatch" why)
+                               (str " (the kexe_loader.c measured is not the one the pinned native"
+                                    " artifact's runtime_identity names; point --loader-source-dir or"
+                                    " KOTOBA_LOADER_SOURCE_DIR at a directory holding the reviewed one)")))
+                        {:phase :runtime-identity :step step}))))
+    dir))
+
+(defn run-jobs
+  "Run JOBS natively with the measured runtime in RUNTIME-DIR; each job
+  `{:id kw :entry path|nil :source text|nil :source-paths [dir] :function
+  name :args [int]}`. Answers `{:target \"aarch64-macos\" :results {id
+  answer}}`, an answer being `{:value v}`, `{:refused message :phase
+  :compile|:sign|:run|:harness}` or `{:trap message}`. Throws when the runtime
+  directory lacks a file or the host has no native target."
+  [jobs runtime-dir {:keys [parallel]}]
+  (if (empty? jobs)
+    {:results {}}
+    (let [answer (run-program {:amu "bin/amu"
+                               :env (child-env {})
+                               :runtimeDir runtime-dir
+                               :runtimeFiles (into {} (for [[k v] runtime-files] [(name k) v]))
+                               :parallel (or parallel 4)
+                               :jobs (mapv (fn [j]
+                                             {:id (name (:id j))
+                                              :entry (:entry j)
+                                              :source (:source j)
+                                              :sourcePaths (vec (:source-paths j))
+                                              :function (:function j)
+                                              :args (mapv str (:args j))})
+                                           jobs)}
+                              jobs-program)]
+      (when-let [why (:fatal answer)]
+        (throw (ex-info why {:phase :usage})))
+      {:target (:target answer)
+       :results
+       (into {}
+             (for [{:keys [id phase status out err]} (:results answer)]
+               [(keyword id)
+                (let [phase (keyword phase)]
+                  (cond
+                    (not= :run phase)
+                    {:refused (message (if (seq err) err out)) :phase phase}
+
+                    :else
+                    (let [value (read-edn out)]
+                      (cond
+                        (and (zero? status) (map? value) (contains? (:result value) :result))
+                        {:value (get-in value [:result :result])}
+
+                        (and (map? value) (contains? value :status))
+                        {:trap (str "status " (pr-str (:status value))
+                                    (when-let [e (or (get-in value [:result :error])
+                                                     (get-in value [:result :trap]))]
+                                      (str ": " (pr-str e))))}
+
+                        :else
+                        {:refused (message (if (seq err) err out)) :phase :run}))))]))})))

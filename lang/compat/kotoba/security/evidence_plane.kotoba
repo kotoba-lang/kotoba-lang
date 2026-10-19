@@ -1,0 +1,125 @@
+(ns kotoba.security.evidence-plane
+  "Fail-closed verification for append-only production evidence.
+
+  Cryptography and storage are injected at the trust boundary. This namespace
+  verifies their receipts; it does not claim that a local file is remote or E4."
+  {:kotoba/export [entry-problems required-entry-fields unsigned-entry verify-log]}
+  (:require [kotoba.lang.coll :as set]))
+
+(def required-entry-fields
+  #{:evidence/version :evidence/id :evidence/sequence
+    :evidence/previous-digest :evidence/entry-digest
+    :evidence/artifact-digest :evidence/control :evidence/environment
+    :evidence/authority-id :evidence/log-id :evidence/issued-at-ms
+    :evidence/nonce :evidence/signature})
+
+(defn unsigned-entry [entry]
+  (dissoc entry :evidence/signature))
+
+(defn- safe-call [f & args]
+  (try
+    (apply f args)
+    (catch  _ ::verification-failed)))
+
+(defn entry-problems
+  [entry {:keys [environment authority-id log-id artifact-digest control
+                 now-ms max-age-ms verify-signature-fn digest-entry-fn]}]
+  (let [missing (set/set-difference required-entry-fields (set (keys entry)))
+        issued (:evidence/issued-at-ms entry)
+        computed (when (ifn? digest-entry-fn)
+                   (safe-call digest-entry-fn
+                              (dissoc entry :evidence/signature
+                                      :evidence/entry-digest)))]
+    (cond-> []
+      (seq missing) (conj [:missing missing])
+      (not= 1 (:evidence/version entry)) (conj :version)
+      (not (pos-int? (:evidence/sequence entry))) (conj :sequence)
+      (not= environment (:evidence/environment entry)) (conj :environment)
+      (not= authority-id (:evidence/authority-id entry)) (conj :authority)
+      (not= log-id (:evidence/log-id entry)) (conj :log)
+      (not= artifact-digest (:evidence/artifact-digest entry)) (conj :artifact-binding)
+      (not= control (:evidence/control entry)) (conj :control-binding)
+      (not (and (integer? issued) (integer? now-ms) (integer? max-age-ms)
+                (<= 0 (- now-ms issued) max-age-ms))) (conj :freshness)
+      (not (ifn? digest-entry-fn)) (conj :digest-verifier)
+      (and (ifn? digest-entry-fn)
+           (not= computed (:evidence/entry-digest entry))) (conj :entry-digest)
+      (not (ifn? verify-signature-fn)) (conj :signature-verifier)
+      (and (ifn? verify-signature-fn)
+           (not (true? (safe-call verify-signature-fn
+                                  (unsigned-entry entry)
+                                  (:evidence/signature entry)))))
+      (conj :signature))))
+
+(defn verify-log
+  "Verify ordered, signed, hash-linked entries and an independently signed head.
+
+  `seen-nonces` must come from durable verifier state, not from the submitted
+  batch. `remote?` and `immutable?` must be asserted by the configured storage
+  adapter after provider qualification."
+  [{:keys [entries head remote? immutable? seen-nonces]}
+   {:keys [verify-head-signature-fn storage-provider-id
+           storage-provider-qualified? head-authority-id authority-id]
+    :as context}]
+  (let [entries (vec entries)
+        nonces (map :evidence/nonce entries)
+        last-entry (peek entries)
+        entry-violations
+        (mapcat (fn [[index entry]]
+                  (map (fn [problem] [:entry index problem])
+                       (entry-problems entry context)))
+                (map-indexed vector entries))
+        chain-violations
+        (mapcat (fn [[previous current]]
+                  (let [previous-sequence (:evidence/sequence previous)
+                        current-sequence (:evidence/sequence current)]
+                    (cond-> []
+                      (not (and (integer? previous-sequence)
+                                (integer? current-sequence)
+                                (= (inc previous-sequence) current-sequence)))
+                      (conj :sequence-discontinuity)
+                      (not= (:evidence/entry-digest previous)
+                            (:evidence/previous-digest current))
+                      (conj :hash-chain))))
+                (partition 2 1 entries))
+        violations
+        (vec
+         (concat
+          (cond-> []
+            (not= true remote?) (conj :remote-storage)
+            (not= true immutable?) (conj :immutable-storage)
+            (not= true storage-provider-qualified?)
+            (conj :storage-provider-qualification)
+            (not= storage-provider-id (:storage/provider-id head))
+            (conj :storage-provider)
+            (empty? entries) (conj :empty-log))
+          entry-violations chain-violations
+          (cond-> []
+            (not= (count nonces) (count (set nonces))) (conj :duplicate-nonce)
+            (seq (set/set-intersection (set seen-nonces) (set nonces)))
+            (conj :replayed-nonce)
+            (not= (:head/log-id head) (:evidence/log-id last-entry))
+            (conj :head-log)
+            (not= head-authority-id (:head/authority-id head))
+            (conj :head-authority)
+            (= authority-id head-authority-id)
+            (conj :independent-head-authority)
+            (not= (:head/sequence head) (:evidence/sequence last-entry))
+            (conj :head-sequence)
+            (not= (:head/entry-digest head) (:evidence/entry-digest last-entry))
+            (conj :head-digest)
+            (not (ifn? verify-head-signature-fn))
+            (conj :head-signature-verifier)
+            (and (ifn? verify-head-signature-fn)
+                 (not (true? (safe-call verify-head-signature-fn
+                                        (dissoc head :head/signature)
+                                        (:head/signature head)))))
+            (conj :head-signature))))]
+    (if (seq violations)
+      {:evidence/accepted? false :evidence/violations violations}
+      {:evidence/accepted? true
+       :evidence/level :E4
+       :evidence/log-id (:head/log-id head)
+       :evidence/head-digest (:head/entry-digest head)
+       :evidence/sequence (:head/sequence head)
+       :evidence/consumed-nonces (set nonces)})))

@@ -1,0 +1,166 @@
+(ns kotoba.native.typed-map
+  "Native lowering for `[:map K V]` of one-word keys and values (amu ADR 0353
+  floor :native-hiccup-node).
+
+  A typed map lives in the context-owned vector arena `[:list T]` and
+  `[:set T]` already use, keys and values interleaved:
+
+      [key value key value ...]
+
+  the representation `kotoba.native.string-index` chose for the same reason:
+  it needs neither a new host callback nor a context ABI bump, and the lookup
+  is emitted Kotoba machine code. The key is a scalar whose equality native
+  code already has -- `string=?` for a string or keyword (a keyword is the
+  same pair handle over its printed text), the word compare for an i64 or a
+  bool -- and osaho's native gate admits no other key type.
+
+  Entry order is the reference's: `typed-map-assoc` of a present key drops
+  the old entry and appends the new one, as `kotoba.kir` does. Nothing native
+  reads it today (`typed-map-entry-at`, `keys`, `vals` and `typed-map-equal`
+  are not qualified), but a map handed to another target must not be a
+  different map.
+
+  The reference limit, `kotoba.kir.value/typed-map-entry-limit` (31 entries),
+  is re-derived: an insertion past it traps through an intentionally
+  out-of-range `vector-at`, the native trap `string-index` uses, where the
+  reference traps `:map-too-large`."
+  {:kotoba/export [augment-functions find-text-name find-word-name lower without-name]})
+
+(def find-text-name 'kotoba$typed-map-find-text)
+(def find-word-name 'kotoba$typed-map-find-word)
+(def without-name 'kotoba$typed-map-without)
+
+(def ^:private map-symbol 'kotoba$typed-map-value)
+(def ^:private key-symbol 'kotoba$typed-map-key)
+(def ^:private item-symbol 'kotoba$typed-map-item)
+(def ^:private position-symbol 'kotoba$typed-map-position)
+
+(def ^:private entry-limit 31)
+
+(defn- find-function [name key-type equal]
+  {:name name
+   :params '[m key position]
+   :param-types [:vector-i64 key-type :i64]
+   :result :i64
+   :body
+   (list 'if
+         (list '>= 'position (list 'vector-count 'm))
+         -1
+         (list 'if
+               (list equal (list 'vector-at 'm 'position) 'key)
+               'position
+               (list name 'm 'key (list '+ 'position 2))))})
+
+;; M without the entry whose key sits at word P, appended onto ACC in order.
+(def ^:private without-function
+  {:name without-name
+   :params '[m p position acc]
+   :param-types [:vector-i64 :i64 :i64 :vector-i64]
+   :result :vector-i64
+   :body
+   (list 'if
+         (list '>= 'position (list 'vector-count 'm))
+         'acc
+         (list 'if
+               (list '= 'position 'p)
+               (list without-name 'm 'p (list '+ 'position 2) 'acc)
+               (list without-name 'm 'p (list '+ 'position 2)
+                     (list 'vector-conj
+                           (list 'vector-conj 'acc (list 'vector-at 'm 'position))
+                           (list 'vector-at 'm (list '+ 'position 1))))))})
+
+(def ^:private helpers
+  [(find-function find-text-name :string 'string=?)
+   (find-function find-word-name :i64 '=)
+   without-function])
+
+(def operations
+  '{typed-map-new nil typed-map-count 2 typed-map-contains 3 typed-map-get 3
+    typed-map-assoc 4 typed-map-dissoc 3})
+
+(defn- find-of [type]
+  (if (contains? #{:string :keyword} (second type)) find-text-name find-word-name))
+
+(defn- without [m p]
+  (list without-name m p 0 (list 'vector-new-empty)))
+
+(defn lower
+  "Rewrite one typed-map operation into existing vector/string/pair ops."
+  [op args]
+  (let [[type & operands] args]
+    (case op
+      typed-map-new
+      (reduce (fn [items item] (list 'vector-conj items item))
+              (list 'vector-new-empty) operands)
+
+      typed-map-count
+      (list 'quot (list 'vector-count (first operands)) 2)
+
+      typed-map-contains
+      (let [[m key] operands]
+        (list 'if (list '< (list (find-of type) m key 0) 0) 0 1))
+
+      typed-map-get
+      (let [[m key] operands
+            option-type [:option (nth type 2)]]
+        (list 'let [map-symbol m key-symbol key
+                    position-symbol (list (find-of type) map-symbol key-symbol 0)]
+              (list 'if (list '< position-symbol 0)
+                    (list 'option-none-of option-type)
+                    (list 'option-some-of option-type
+                          (list 'vector-at map-symbol (list '+ position-symbol 1))))))
+
+      typed-map-assoc
+      (let [[m key item] operands]
+        (list 'let [map-symbol m key-symbol key item-symbol item
+                    position-symbol (list (find-of type) map-symbol key-symbol 0)]
+              (list 'if (list '>= position-symbol 0)
+                    (list 'vector-conj
+                          (list 'vector-conj (without map-symbol position-symbol) key-symbol)
+                          item-symbol)
+                    (list 'if (list '>= (list 'vector-count map-symbol) (* 2 entry-limit))
+                          ;; Guaranteed out of range, hence a native trap.
+                          (list 'vector-at map-symbol (list 'vector-count map-symbol))
+                          (list 'vector-conj
+                                (list 'vector-conj map-symbol key-symbol)
+                                item-symbol)))))
+
+      typed-map-dissoc
+      (let [[m key] operands]
+        (list 'let [map-symbol m key-symbol key
+                    position-symbol (list (find-of type) map-symbol key-symbol 0)]
+              (list 'if (list '< position-symbol 0)
+                    map-symbol
+                    (without map-symbol position-symbol))))
+
+      (throw (ex-info "unknown native typed-map operation"
+                      {:phase :native :operation op})))))
+
+(defn- uses? [form]
+  (cond
+    (seq? form) (or (contains? operations (first form))
+                    (boolean (some uses? (rest form))))
+    (vector? form) (boolean (some uses? form))
+    :else false))
+
+(defn augment-functions
+  "Append the private helpers exactly when a declared body uses a typed map.
+
+  A program that does not is returned unchanged, byte for byte. Helpers are
+  never exported because each backend captures the declared export set before
+  calling this function. Idempotent, and a source-level collision is refused
+  rather than silently redirecting the lowered calls."
+  [functions]
+  (if-not (some #(uses? (:body %)) functions)
+    functions
+    (let [declared (into {} (map (juxt :name identity)) functions)
+          clashes (filter (fn [helper]
+                            (when-let [existing (get declared (:name helper))]
+                              (not= existing helper)))
+                          helpers)]
+      (when (seq clashes)
+        (throw (ex-info
+                "a program function collides with a native typed-map helper"
+                {:phase :native :functions (mapv :name clashes)})))
+      (vec (concat functions
+                   (remove #(contains? declared (:name %)) helpers))))))

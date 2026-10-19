@@ -1,0 +1,180 @@
+(ns vmm.tee
+  "Whether a confidential-VM launch may proceed, and what a TEE exit means.
+
+  Every decision here is made by `kotoba/tee_core.kotoba`, executed from
+  the shipped KIR. This namespace threads values between the admissions
+  and names the result; it decides nothing itself, so there is no second
+  implementation to drift from the first.
+
+  Two profiles answer here:
+
+    * TDX (Intel) -- launch admission needs KVM_TDX_CAPABILITIES, the TDVF
+      firmware image, and the two CPUID virtualisations (leaf 0x21 and the
+      indirect-adapter bit) the guest's own detection depends on.
+    * SEV-SNP (AMD) -- launch admission needs KVM SNP capability, the
+      AmdSev OVMF image, the SEV/SNP CPUID bits, and a legal
+      SNP_LAUNCH_START policy word.
+
+  After boot, a confidential guest reaches the monitor only through
+  hypercalls (TDG.VP.VMCALL on TDX, VMGEXIT on SNP). Which hypercall it
+  is, whether a page-state change is legal, and whether a port-I/O is a
+  device this monitor models are the decisions here; reading kvm_run and
+  moving bytes stay in aiueos.hvt."
+  (:require [vmm.oracle :as oracle]))
+
+(defn- c [f args] (oracle/call :tee f args))
+(defn- r [f args] (oracle/call-result :tee f args))
+
+(defn- n
+  "Normalise a KIR i64 to a host number. Under kbb values arrive as JS
+  BigInt, under the JVM as plain integers; decode maps keyed by small
+  integers must not care which runtime is calling. (Same JS/JVM number
+  identity trap the exit tests pin; normalised once, here.)"
+  [v]
+  )
+
+;; ---------------------------------------------------------------------------
+;; Constants -- built from the core's own values rather than restated.
+
+(def tdx-cpu-leaf (delay (c :tdx-cpu-leaf [])))
+(def snp-cpu-leaf (delay (c :snp-cpu-leaf [])))
+(def quote-min-bytes (delay (c :quote-min-bytes [])))
+(def tdx-report-min-bytes (delay (c :tdx-report-min-bytes [])))
+(def snp-secrets-gpa (delay (c :snp-secrets-gpa [])))
+(def snp-cpuid-gpa (delay (c :snp-cpuid-gpa [])))
+(def tdvf-range-base (delay (c :tdvf-range-base [])))
+(def tdvf-range-size (delay (c :tdvf-range-size [])))
+
+(defn- verdict-name
+  "The admit functions return packed bit values; the monitor reads them
+  as named verdicts. A bit field this function has no name for is an
+  error, not a fresh verdict. Values arrive as JS BigInt under kbb and
+  plain integers under the JVM, so both are normalised to numbers."
+  [packed]
+  (let [v (n packed)]
+    (cond
+      (= 0 (bit-and v 1)) {:ok? true :admit? false}
+      (= 1 (bit-and v 1)) {:ok? true :admit? true :tdvf? (= 2 (bit-and v 2))
+                           :ovmf? (= 2 (bit-and v 2))}
+      :else {:ok? false :reason "tee/unknown-verdict-shape"})))
+
+;; ---------------------------------------------------------------------------
+;; Launch admission
+
+(defn tdx-launch
+  "Decide a TDX launch. `kvm-tdx-ok` is 1 when KVM_TDX_CAPABILITIES said
+  the module is present and usable; `tdvf-present` is 1 when the mapped
+  firmware image verified as TDVF; the two CPUID flags say whether the
+  monitor's leaf-0x21 and indirect-adapter virtualisations are wired.
+  Returns {:ok? true :admit? bool :tdvf? bool} or {:ok? false :reason s}."
+  [{:keys [kvm-tdx-ok tdvf-present cpu-leaf-21 adapter-bit]}]
+  (let [d (r :admit-tdx-guest [kvm-tdx-ok tdvf-present cpu-leaf-21 adapter-bit])]
+    (if-not (:ok? d) d (verdict-name (:value d)))))
+
+(defn snp-launch
+  "Decide an SEV-SNP launch. `policy` is the SNP_LAUNCH_START policy word;
+  a word with bits outside the documented mask is refused by name before
+  the mechanism ever issues the ioctl."
+  [{:keys [kvm-snp-ok ovmf-present cpu-sev-bit snp-bit policy]}]
+  (let [d (r :admit-snp-guest [kvm-snp-ok ovmf-present cpu-sev-bit snp-bit policy])]
+    (if-not (:ok? d) d (verdict-name (:value d)))))
+
+(defn launch-variant
+  "Which confidential profile a booted guest self-reports as. 1 = TDX,
+  2 = SEV-SNP; anything else is refused by name."
+  [profile]
+  (let [d (r :launch-variant [profile])]
+    (if (and (:ok? d) (= (n (:value d)) 1))
+      {:ok? true :variant :tdx}
+      (if (:ok? d)
+        {:ok? true :variant :snp}
+        d))))
+
+;; ---------------------------------------------------------------------------
+;; Post-boot hypercalls
+
+(defn tdvmcall
+  "Map a TDX TDG.VP.VMCALL reason to the action the mechanism should
+  take: 1 map-gpa, 2 io, 3 get-quote, 4 setup-event-notify."
+  [reason]
+  (let [d (r :tdvmcall-action [reason])]
+    (if-not (:ok? d) d
+      {:ok? true :action ({1 :map-gpa 2 :io 3 :get-quote 4 :setup-event-notify}
+                          (n (:value d)))})))
+
+(defn map-gpa
+  "A TDVMCALL<MAP_GPA> request: is the conversion legal, and which half
+  (private 1 / shared 2) does the monitor act on?"
+  [gpa size]
+  (r :tdx-tdvmcall-map-gpa [gpa size]))
+
+(defn psc-err
+  "An SNP page-state-change error code from the GHCB, refused by name.
+  The KIR answers 0 for \"no error\" and names every other code as a
+  refuse-result; both shapes land here as one {:ok? _ :err _} contract."
+  [err]
+  (let [d (r :psc-err-name [err])]
+    (cond
+      (and (:ok? d) (= (n (:value d)) 0))
+      {:ok? true :err :none}
+
+      (:ok? d)
+      {:ok? true :err (keyword "snp" (name (n (:value d))))}
+
+      :else
+      {:ok? false :err (if (keyword? (:reason d))
+                         (:reason d)
+                         (keyword (str (:reason d))))})))
+
+(defn portio
+  "A TDX/SNP guest port-I/O: is the port a device this monitor models?
+  1 = serial, 2 = virtio; anything else is refused by name and the
+  mechanism must inject a fault, not a zero."
+  [port len]
+  (let [d (r :portio-verdict [port len])]
+    (if-not (:ok? d) d
+      {:ok? true :device ({1 :serial 2 :virtio} (n (:value d)))})))
+
+(defn in-tdvf-range?
+  "Is a guest-physical address inside the TDVF flash window? The core
+  answers 1/0; this normalises it to a host boolean."
+  [gpa]
+  (= 1 (n (c :in-tdvf-range? [gpa]))))
+(defn- page-aligned-i64
+  "Is the GPA 4K-aligned? The core answers 1/0 for runtime-parity reasons;
+  the wrapper normalises to a boolean once, here."
+  [gpa]
+  (= 1 (n (c :page-aligned? [gpa]))))
+
+(defn page-aligned?
+  "A GPA the monitor maps at a 4K page edge (the S-EPT / RMP page size).
+  0 is aligned: page 0 is a real page, not the absence of one."
+  [gpa] (page-aligned-i64 gpa))
+
+(defn align-4k
+  "Round a GPA up to the next 4K page edge. The boundary cases matter:
+  0 stays 0, 4095 rounds to 4096, 4096 stays 4096, 4097 rounds to 8192."
+  [gpa] (n (c :align-4k [gpa])))
+
+(defn snp-report-request
+  "An SNP guest-request for an attestation report: the declared message
+  size must cover the fixed report body or the request is refused."
+  [declared-size]
+  (r :snp-get-report-req [declared-size]))
+
+(defn page-type
+  "A TDH.MEM.* GPCM page kind from the TDX module: 1 = private
+  (encrypted), 2 = shared. A kind this monitor does not model is
+  refused by name and the mechanism must not act on it."
+  [kind]
+  (let [d (r :tdx-page-type [kind])]
+    (if-not (:ok? d) d
+      {:ok? true :page-kind ({1 :private 2 :shared} (n (:value d)))})))
+
+(defn tdx-quote-floor
+  "The quote buffer the monitor stages for a TDVMCALL<GET_QUOTE> must be
+  at least the core's floor; a smaller buffer is refused."
+  [buf-size]
+  (if (>= buf-size (n @quote-min-bytes))
+    {:ok? true :size buf-size}
+    {:ok? false :reason "tdx/quote-buffer-below-minimum"}))

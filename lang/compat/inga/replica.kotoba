@@ -1,0 +1,2051 @@
+(ns inga.replica
+  "A replica: the thing that actually runs consensus.
+
+  Everything else in this repo is a correct piece of a protocol nobody had
+  assembled. `inga.consensus` builds blocks, votes and certificates;
+  `inga.pacemaker` decides when a view has failed; `inga.sync` decides what a
+  lagging replica may believe; `inga.attest` signs and verifies; `inga.net`
+  decides who to spend bandwidth on; `inga.wire` says what a message is. All
+  of them are tested. **None of them had ever been composed into something
+  that proposes a block, collects votes, forms a certificate, and commits.**
+
+  That gap is not visible from a test suite. It is the same shape as a
+  terminal whose client was compiled, deployed, and never referenced from the
+  page: every part green, the whole thing never executed.
+
+  ## A block's clock is logical, so the same block is the same block
+
+  `:ts` came from the wall clock, which makes a block a function of WHEN it
+  was built. A leader that restarts and proposes again for the same height,
+  on the same parent, with the same transactions, produces a DIFFERENT block —
+  different timestamp, different hash — and the votes for the two split. Four
+  validators on Cloudflare sat at height one with three votes across three
+  hashes for exactly this reason, and persistence only narrows the window
+  rather than closing it: the write still has to win a race against eviction.
+
+  So the timestamp is derived from the parent. Proposing is now a pure
+  function of the chain, and a restarted leader re-proposes the byte-identical
+  block. Nothing has to win a race.
+
+  This is the rule `torihiki.state` already imposes on itself — the block
+  header IS the clock and nothing below it may consult a real one — applied
+  one level up, where the header is made. The cost is that time advances per
+  block rather than per second, so anything measured in it (funding, timeouts
+  inside the machine) counts blocks. That is a real difference and it is the
+  side that can be agreed on.
+
+  ## Committed blocks execute, which is the entire point of ordering them
+
+  A consensus protocol that agrees on an order and applies nothing has agreed
+  on nothing anybody wanted. Until this existed, `:committed` was a list of
+  blocks the replicas concurred about and no replica did anything with, and
+  the property being demonstrated — four processes agreeing on a sequence —
+  was weaker than it looked, because agreeing on the ORDER is easy to get
+  right by accident when nothing depends on the result.
+
+  The machine is injected as `{:init-fn ... :apply-fn ... :root-fn ...}`:
+  init-fn takes nothing and returns a starting state, apply-fn takes a state
+  and a block and returns the next state, and root-fn takes a state and
+  returns a string.
+
+  The initial state is PRODUCED rather than handed over, because a state
+  machine may own mutable structure and four replicas sharing one value is
+  four replicas sharing one state. `torihiki`'s order book is a struct of
+  typed arrays — its whole speed argument rests on that — so a machine map
+  holding a ready-made exchange gave every replica the same book, and they
+  agreed on the committed blocks while disagreeing about the resting order
+  count by two hundred. A thunk makes that unrepresentable rather than
+  documented. `engi` does not know what a transaction is
+  and must not — that is `torihiki.state` for a trading chain and
+  `engi.core` for transfers, and a consensus layer that imported either would
+  be a consensus layer for exactly one application.
+
+  Only COMMITTED blocks are applied, and exactly once each, in order. Applying
+  an adopted-but-uncommitted block would be applying a block that can still be
+  replaced, and undoing it afterwards is the thing the 3-chain rule exists to
+  make unnecessary.
+
+  With a machine configured, `state-root` is what a replica actually agrees to
+  — and two replicas that committed the same blocks and derived different
+  roots have found a determinism bug, which is the failure the root exists to
+  surface and the reason it is worth computing at all.
+
+  ## Equivocation is recorded, because it is the one crime that proves itself
+
+  Two votes from one witness at one height for different blocks, both signed
+  and both verifying, cannot both be honest. Nothing else in this protocol has
+  that property: a slow replica and a censoring one look identical, a leader
+  that skips its turn looks like a leader that crashed. This one is decidable
+  from the two messages alone, by anybody, without trusting whoever reported
+  it — which is exactly what makes it the only thing worth slashing for.
+
+  A replica keeps the first signed vote it accepted per `[witness height]`. A
+  second one for a different block is refused AND kept as evidence, in the
+  shape `inga.stake/detect-equivocation` produces, so `slash` and
+  `verify-equivocation-evidence` take it unchanged.
+
+  Refusing it is not the interesting part — quorum already stops a Byzantine
+  minority from certifying two blocks at one height. Keeping the proof is. An
+  equivocating validator that is merely ignored pays nothing and can do it
+  again next height, forever, for free.
+
+  ## Catching up goes through `inga.sync`, which it did not
+
+  `inga.sync` exists to decide what a lagging replica may believe from a
+  stranger: that a segment attaches to a block already held, that heights are
+  contiguous, that every block is justified by a certificate for its own
+  parent, that the certificate carries a quorum of signatures that actually
+  verify, and that the whole thing is bounded. All of it tested. None of it
+  reached — `handle-sync-response` walked the blocks itself and checked only
+  that each linked to the one before.
+
+  So the third instance of the same defect: a careful namespace nothing
+  called. A peer could hand over an unbounded segment whose certificates named
+  witnesses who never voted, and it would be adopted as history.
+
+  ## Views have to converge, or the safety rule deadlocks the chain
+
+  Replicas time out independently, so their views drift — 16, 16, 21 and 51 on
+  a deployed chain — and `pm/timeout-certificate` only bundles new-views that
+  share a view. Once they have drifted, no certificate can form and nothing
+  brings them back.
+
+  That is not merely a liveness nuisance. Locks carry the view they were
+  formed in, and `safe-to-vote?` compares them: a replica locked in view 51
+  will not vote for a block justified in view 16, correctly, and the chain
+  stops with three replicas holding a block two votes short of quorum.
+
+  So a replica jumps when f+1 distinct witnesses report being at or past a
+  higher view. f+1 rather than a quorum because the job is different: a quorum
+  decides what is agreed, this decides what is BELIEVABLE, and f+1 contains at
+  least one honest replica that really is there. One Byzantine replica
+  claiming view nine thousand moves nobody.
+
+  ## And a new-view nobody signed is worse than an unsigned vote
+
+  A timeout certificate is folded out of the high QCs carried by new-view
+  messages, and `on-timeout-certificate` feeds that QC straight into the lock.
+  So an unsigned new-view is not merely a liveness nuisance: whoever can send
+  quorum-many of them decides what every replica locks onto, and a lock on a
+  block that never existed either stops the chain or moves it onto a fork.
+
+  New-views are signed over the view AND the identity of the certificate they
+  carry, so a genuine one cannot have its certificate swapped. The certificate
+  inside is itself re-verified — a signed message asserting an unverified
+  certificate would just move the forgery one level in.
+
+  ## A vote nobody signed is a claim, not a vote
+
+  A replica assembles certificates out of the votes it receives. So an
+  unsigned vote is not a small gap: one connected peer sends
+  `{witness: w2, ...}`, `{witness: w3, ...}`, `{witness: w4, ...}` and has
+  manufactured a quorum by itself, without holding a single key. Certificates
+  carried signatures from the start; the votes they are built out of did not,
+  which made the certificate signatures decorative — an attacker fabricates
+  the votes and lets the honest replica sign the certificate for it.
+
+  `verify-fn` is injected, like every other cryptographic seam here, and when
+  one is configured a vote without a verifying signature is dropped. When none
+  is configured nothing is checked, which is right for replaying a history
+  this replica already agreed to and wrong for anything else — so `replica`
+  says so rather than defaulting quietly.
+
+  ## Every witness id is normalised to its wire form
+
+  `inga.wire` sends the keyword :w1 as the string w1, so a replica that
+  recorded its own vote
+  under the keyword and its peers' under the string counted one physical
+  witness as two — and a quorum of three could be two replicas plus one of
+  them twice. Every id entering this namespace goes through `wire/wire-id`,
+  including the replica's own, so there is exactly one spelling of a witness.
+
+  ## Pure, and message-driven
+
+  `on-message` and `on-tick` take a state and return `[state' outbox]`, where
+  the outbox is a vector of `{:to :all|<witness> :msg m}`. Nothing here opens
+  a socket, reads a clock, or hashes anything: `hash-fn` and the signing seam
+  are injected, for the same reason they are everywhere else — a browser that
+  cannot import a JVM crypto library still has to be able to check a chain.
+
+  That also makes a four-replica network an ordinary unit test with a map for
+  a transport, so the properties below are asserted deterministically rather
+  than observed once in a lucky run.
+
+  ## Votes are broadcast, not sent to the leader
+
+  Classic HotStuff routes votes to the next leader, who alone forms the
+  certificate. Here every replica sees every vote and forms the certificate
+  itself. It costs O(n²) messages instead of O(n), which for a validator set
+  of this size is nothing, and it buys two things worth more: a replica's
+  progress no longer depends on the leader being honest enough to relay a
+  certificate it could have withheld, and every replica can be asked what it
+  has committed without asking the leader.
+
+  ## One vote per HEIGHT
+
+  A replica records the heights it has voted at and never votes twice at one.
+  Equivocation is the thing certificates exist to prevent, and a replica that
+  can be talked into voting twice by a proposer that sends two blocks is a
+  Byzantine replica written by accident.
+
+  Per height rather than per view, which is what this tried first and is a
+  bug that only a running network shows. Views advance on TIMEOUT; heights
+  advance on progress. So a replica that voted at view 0 for height 1 could
+  not vote for height 2, or 3, or ever again, until something timed out — and
+  the thing that would have timed out was the chain it had just refused to
+  extend. It stalled at height two with every replica holding enough votes to
+  go on.
+
+  The property worth having is that a replica never votes twice AT A HEIGHT,
+  and that is the one stated here."
+  (:require [inga.consensus :as c]
+            [inga.pacemaker :as pm]
+            [inga.quorum :as q]
+            [inga.attest :as att]
+            [inga.stake :as stake]
+            [inga.sync :as sync]
+            [inga.wire :as wire]))
+
+(def default-params
+  (merge pm/default-params
+         {;; A leader that has just certified a block does not propose the
+          ;; next one instantly — the interval is what stops a fast network
+          ;; from producing blocks faster than anything downstream reads them.
+          :block-interval 100}))
+
+(defn replica
+  "Initial state.
+
+  `quorum` is anything `inga.quorum/->predicate` accepts. An integer means a
+  head count and is right for a managed set; under permissionless admission
+  pass `inga.quorum/stake-weighted`, because head-counting is what a Sybil
+  defeats.
+
+  The resulting state carries `:quorum-profile` (`inga.quorum/profiles`), so
+  what a deployment actually resists is a value it can be asked for rather
+  than something inferred from how the argument was built. Omitting `quorum`
+  still defaults to counting this replica's own witness list — the default is
+  kept because every managed deployment wants it, and it is RECORDED as
+  `:head-count` because a deployment that believes it has Sybil resistance
+  while counting heads has the belief and not the property."
+  [{:keys [witness witnesses quorum genesis hash-fn params commit-rule vote-routing
+           chain-id sign-fn verify-fn machine]}]
+  (let [params (merge default-params params)
+        witness (wire/wire-id witness)
+        witnesses (mapv wire/wire-id witnesses)
+        g (or genesis (c/make-block {:height 0 :parent-hash "genesis"
+                                     :proposals [] :proposer (first witnesses)
+                                     :ts 0 :justify nil}))]
+    {:witness witness
+     :witnesses (vec witnesses)
+     :quorum (or quorum (count witnesses))
+     :quorum-profile (q/profile (or quorum (count witnesses)))
+     :hash-fn hash-fn
+     ;; `:three-chain` (default) or `:two-chain`. See `commits`.
+     :commit-rule (or commit-rule :three-chain)
+     ;; `:broadcast` (default) or `:leader`. See `vote-to`.
+     :vote-routing (or vote-routing :broadcast)
+     :params params
+     ;; The signing seam. `chain-id` is domain separation: a vote signed on a
+     ;; testnet must not authorise the same block on another chain, and the
+     ;; only thing that stops it is the signature covering which chain it was
+     ;; for — the same reason `torihiki.auth` puts it in its payload.
+     :chain-id (or chain-id "engi-devnet-1")
+     :sign-fn sign-fn
+     ;; nil means "verify nothing", which is correct only for replaying an
+     ;; already-agreed history. Live, it means every vote is believed.
+     :verify-fn verify-fn
+     :pm (pm/initial witness)
+     :chain [g]
+     :by-hash {(hash-fn g) g}
+     ;; votes seen, grouped by [view block-hash]; new-views by view
+     :votes {}
+     :new-views {}
+     ;; the heights this replica has voted at — never two votes at one height
+     :voted #{}
+     ;; Watermark for the heights a `resume` dropped. -1 means "nothing is
+     ;; implied", which is what a replica starting at genesis should say.
+     :voted-below -1
+     :qcs {}
+     ;; first accepted vote per [witness height], and the proofs of anyone who
+     ;; sent a second one for a different block
+     :first-vote {}
+     :equivocations []
+     ;; The state machine committed blocks are applied to. nil means the
+     ;; replica orders blocks and executes nothing, which is a legitimate role
+     ;; (an ordering service) and a misleading default for anything else — so
+     ;; `state-root` returns nil rather than a plausible-looking constant.
+     :machine machine
+     :machine-state (when-let [f (:init-fn machine)] (f))
+     :committed []
+     :pending []
+     :last-proposed-at 0}))
+
+;; ── the chain ───────────────────────────────────────────────────────────────
+
+(declare adopt-own fold-vote cast-vote vote-to propose handle-new-view tip
+         committed-height)
+
+(defn tip [state] (peek (:chain state)))
+
+;; ── the deadlock this rule causes, and what fixing it needs ─────────────────
+;;
+;; One vote per HEIGHT is stricter than HotStuff, which votes once per VIEW and
+;; leaves safety to the lock rule (`pacemaker/safe-to-vote?`, already here and
+;; already correct). The extra strictness costs liveness in one specific way,
+;; and it is the way two deployments keep failing:
+;;
+;;   two blocks at one height, the votes split between them, and every replica
+;;   has spent its vote at that height. Nobody can move. In HotStuff the next
+;;   view produces a proposal on the highest QC and the fork resolves; here the
+;;   fork is permanent.
+;;
+;; Measured, repeatedly, on both deployed chains — most recently a chain reset
+;; to genesis that reached height 1927 and stopped with two replicas on one
+;; tip, one on another, and one behind. Every replica reported
+;; `no-certificate-for-the-tip`; every one of them had already voted.
+;;
+;; `:voted-view` is now part of the durable snapshot. The final signing gate
+;; rejects a spent view even after sync replaces the tip or restart evicts
+;; the in-memory vote cache. Every fresh vote also checks the pacemaker lock.
+
+(defn voted-view
+  "The highest view this replica has voted in, or -1.
+
+  **A host must make this durable before it releases the vote.** That is the
+  whole safety contract of one-vote-per-view: a replica that votes in view V,
+  crashes, comes back not knowing it did, and votes again in V for a different
+  block has equivocated — the one thing this system slashes for, committed by
+  accident against itself.
+
+  `on-message` and `on-tick` return `[state outbox]`. A host that sends the
+  outbox before persisting `(voted-view state)` has a window exactly one crash
+  wide. Persist first, then send. `snapshot` carries it so a `resume` starts
+  from the truth rather than from -1."
+  [state]
+  (:voted-view state -1))
+
+(defn with-voted-view
+  "Put the durable watermark back after a `replay`.
+
+  `snapshot` carries it, so `resume` needs nothing. A host that rebuilds from
+  the LOG instead — `replay` over persisted blocks — has to restore it itself,
+  because the log records what this replica adopted and not what it voted for.
+
+  Monotone: a watermark can only move forward. Restoring an older value than
+  the running state already has would re-open a view this replica has already
+  voted in, which is the whole thing it exists to prevent."
+  [state v]
+  (cond-> state (and (integer? v) (> v (voted-view state))) (assoc :voted-view v)))
+
+(defn voted?
+  "Has this replica already voted at `h`?
+
+  `:voted` holds the heights it voted at in this process. `:voted-below` is
+  the watermark a `resume` leaves behind: every height at or under it counts
+  as voted whether or not the set still names it.
+
+  The height watermark is conservative after resume. It cannot replace
+  `:voted-view`: votes at one height in different views are legitimate when
+  the pacemaker's lock rule permits them."
+  [state h]
+  (or (<= h (:voted-below state -1))
+      (contains? (:voted state) h)))
+
+(defn height [state] (:inga.block/height (tip state)))
+
+(defn- ancestor?
+  "Is the block named by `hash` an ancestor of (or equal to) `block`?
+
+  Walks parent links through what this replica actually holds. A replica that
+  answered from the proposer's claims instead would be letting the proposer
+  decide whether its own block was safe to vote for."
+  [state hash block]
+  (loop [b block n 0]
+    (cond
+      (nil? b) false
+      (> n 1024) false                    ; a cycle is a hostile chain, not a long one
+      (= hash ((:hash-fn state) b)) true
+      :else (recur (get (:by-hash state) (:inga.block/parent-hash b)) (inc n)))))
+
+(defn- commits
+  "Blocks newly committed by the 3-chain rule, in order.
+
+  Compared by HEIGHT, not by how many are already recorded. Counting assumed
+  both `:chain` and `:committed` run unbroken from genesis, which stopped
+  being true the moment `resume` started handing a replica a bounded tail:
+  `three-chain-commits` over a short chain returns fewer entries than
+  `(count :committed)`, `drop` returns nothing, and the replica commits
+  nothing ever again while every other number about it looks healthy.
+
+  Height comparison needs no such assumption and is the correct formulation
+  with or without a tail."
+  [state]
+  (let [h (committed-height state)
+        ;; Bounded by the committed height, which is the same set of windows
+        ;; the filter below keeps — and NOT the same amount of hashing. See
+        ;; `three-chain-commits`: unbounded, this was quadratic, and it is
+        ;; what stopped a deployed validator from ever finishing a catch-up.
+        ;; Which rule, chosen by the caller and defaulting to the one that
+        ;; needs no assumption about the view change.
+        ;;
+        ;; `:two-chain` is safe HERE because a proposal may only claim the
+        ;; round after its parent's unless the proposer shows a quorum of
+        ;; new-views for the round it skipped — see `can-justify-skip?` and
+        ;; `two-chain-commits`. A deployment that ever relaxed that check must
+        ;; move back, and the default is what it moves back to.
+        all (if (= :two-chain (:commit-rule state))
+              (c/two-chain-commits (:hash-fn state) (:chain state) h)
+              (c/three-chain-commits (:hash-fn state) (:chain state) h))]
+    (vec (filter #(> (:inga.block/height %) h) all))))
+
+(defn- absorb-commits
+  "Record newly committed blocks and run them through the machine.
+
+  Exactly once each, in order, and only once COMMITTED — applying a block that
+  is merely adopted would be applying one that can still be replaced, and
+  undoing it afterwards is what the 3-chain rule exists to make unnecessary."
+  [state]
+  (let [new (commits state)
+        apply-fn (:apply-fn (:machine state))]
+    (cond-> (update state :committed into new)
+      (and apply-fn (seq new))
+      (update :machine-state #(reduce apply-fn % new)))))
+
+;; ── proposing ───────────────────────────────────────────────────────────────
+
+(defn- can-justify-skip?
+  "Whether this replica has seen, itself, that round `(dec round)` failed:
+  a quorum of new-views for it.
+
+  The evidence is not carried in the block. It does not have to be — a block
+  that reaches a replica with a certificate was already checked by the quorum
+  that certified it, and one that arrives as a live proposal is checked
+  against evidence the proposer broadcast to everyone including this replica.
+  A replica that has not yet seen the new-views refuses, and the proposer
+  re-proposes; the retransmission path already exists because a lost vote
+  needed it. That costs a round trip in the worst case and keeps a fabricated
+  timeout certificate out of the block format entirely."
+  [state round]
+  (fn [_]
+    (boolean (pm/timeout-certificate (vec (vals (get-in state [:new-views (dec round)])))
+                                     (:quorum state)))))
+
+(defn- round-after
+  "The round a proposal extending `justify` is entitled to.
+
+  One past the round that certified the parent. This is the whole reason the
+  round can be checked at all: `justify` is a quorum certificate, so every
+  replica holding the block holds the same one and derives the same number —
+  **exactly agreed, not eventually agreed** (superproject ADR-2608680000).
+  The local view is not consulted and must not be.
+
+  Skipping further ahead is what a departed leader requires and needs a
+  timeout certificate to justify; it is refused until that is carried, so
+  **with no timeouts the round equals the height and leadership behaves
+  exactly as it did when it was keyed by height.** That is deliberate: this
+  step moves the key onto something carried and checkable without changing
+  what any healthy network does, and the fault-tolerance gap closes in the
+  step that adds the skip."
+  [parent]
+  (c/entitled-round parent))
+
+(defn- my-turn?
+  "Whose turn it is, keyed by HEIGHT.
+
+  This is the wrong key and it is the one that works today. Keyed by height, a
+  dead leader holds its turn forever: the height does not advance while its
+  leader is down, so the turn never moves, and four deployed validators with a
+  quorum of three out of four stopped at the height the one wiped replica was
+  due to lead. A protocol that tolerates one failure in four, not tolerating
+  one failure in four.
+
+  `inga.pacemaker/leader-for-view` is the right key and says so in its own
+  docstring. Deploying it stopped the chain at height one instead, because
+  view-keyed leadership needs the replicas to AGREE about the view, and view
+  synchronisation here is a timeout certificate that forms only when enough
+  replicas happen to time out into the same view. They do not, reliably; each
+  ends up the leader of its own view and nobody is the leader of the chain.
+
+  ## Re-verified 2026-08-10, and one sentence above was already wrong
+
+  **View synchronisation IS written.** `sync-view` jumps to a higher view when
+  f+1 distinct witnesses are at or past it, counted across every view at or
+  above the candidate rather than only messages naming it exactly — which is
+  the drift this paragraph used to say had no answer. Measured on a seven
+  process devnet: after a witness departs, all six survivors sit on the SAME
+  view and rotate leadership through it correctly. Views converge.
+
+  So the remaining gap is not convergence. It is that everything around this
+  function assumes the height key. Swapping the body for
+  `(pm/leader-for-view (:witnesses state) (:view (:pm state)))` and changing
+  nothing else takes the suite from 0 failures to **44 failures and 1 error
+  across 20 tests** — including `a-block-is-proposed-voted-certified-and-
+  committed`, so the chain does not reach height one, exactly as this
+  paragraph warned. The cheap fix is closed off; it was tried again against
+  the code as it stands today, not as it stood when this was written.
+
+  What a real change has to answer, and this note does not: a view produces at
+  most one block, so height and view have to advance together or the leader of
+  a view has nothing to propose; `propose` asks `my-turn?` for the height it
+  is about to build, and a view-keyed answer makes that question the wrong
+  one; and `resume` restores a view from a snapshot, so a restarted replica
+  would re-enter a view whose leader has moved on.
+
+  ## The constraint both experiments found: leadership must be keyed by state
+  ## every replica agrees on EXACTLY, not eventually
+
+  A second attempt keyed leadership by `(+ h view)` — the classic round
+  number, and an apparently safe one because `sync-view` makes the view
+  converge and the height is the tip. It is better and still wrong:
+  **21 failures and 1 error**, with the chain again not reaching height one.
+
+  The reason is the difference between the two quantities. **Height is agreed
+  exactly**: it is read off a committed chain every replica holds the same
+  prefix of. **The view is agreed eventually**: `sync-view` pulls drifted
+  replicas up to it, `on-progress` bumps it when a QC arrives, and between
+  those moments two correct replicas can hold different views for perfectly
+  legitimate reasons. Leadership computed from eventually-agreed state means
+  two replicas disagree about who may propose — so either nobody proposes or
+  two do, and both are indistinguishable from the stall this was meant to fix.
+
+  So a real fix cannot read the round out of local pacemaker state at all. The
+  round has to become part of what the quorum certifies — carried in the block
+  and in the QC, so that agreeing on the chain IS agreeing on the round —
+  which is a wire-format change and a `resume` change, not a change to this
+  function.
+
+  So: height, with a stated fault-tolerance gap, over view with a measured
+  liveness failure. Choosing the running one is not the same as thinking it is
+  correct — and `inga.departure-test/stalls-when-the-height-leader-departs`
+  now pins the gap as an executable fact rather than a paragraph."
+  [state round]
+  (= (:witness state) (c/leader-for (:witnesses state) round)))
+
+(defn- proposable-round
+  "The highest round this replica may claim over `parent`.
+
+  `parent.round + 1` always. Higher only when the pacemaker has moved past it
+  AND this replica holds a quorum of new-views for the round below — which is
+  the evidence that the intervening leaders did not produce a block.
+
+  **This is the half that closes the fault-tolerance gap.** Accepting a
+  skipped round (see `proposed-by-its-leader?`) does nothing on its own if no
+  proposer ever claims one: leadership would still sit on the round a
+  departed witness leads, which is the stall `departure-test` pins."
+  [state parent]
+  (let [base (round-after parent)
+        reached (:view (:pm state) base)]
+    (if (and (> reached base) ((can-justify-skip? state reached) reached))
+      reached
+      base)))
+
+(defn- propose
+  "Build the next block on the tip, if this replica leads that height and
+  holds a certificate for the tip. Returns `[state' outbox]`.
+
+  The QC requirement is the whole point: a proposal carries the certificate
+  for its parent, so a replica receiving it can check that the parent was
+  certified rather than merely named. Proposing without one would be
+  proposing a chain nobody agreed to."
+  [state now]
+  (let [t (tip state)
+        h (inc (:inga.block/height t))
+        parent-hash ((:hash-fn state) t)
+        justify (get (:qcs state) parent-hash)]
+    (if (and justify
+             (my-turn? state (proposable-round state t))
+             (>= now (+ (:last-proposed-at state) (:block-interval (:params state)))))
+      (let [b (c/make-block {:height h :parent-hash parent-hash
+                             :proposals (:pending state)
+                             :proposer (:witness state)
+                             :round (proposable-round state t)
+                             ;; From the parent, not from the clock. See the
+                             ;; namespace docstring: a block that depends on
+                             ;; when it was built is a block a restart cannot
+                             ;; reproduce.
+                             :ts (+ (:inga.block/ts t)
+                                    (:block-interval (:params state)))
+                             :justify justify})
+            [state' out] (adopt-own state b now)
+            state' (assoc state' :propose-refusal nil)]
+        [(assoc state' :pending [] :last-proposed-at now)
+         (into [{:to :all :msg {:type :proposal :block b}}] out)])
+      ;; Silence with three reasons behind it.
+      ;;
+      ;; This returned `[state []]` and said nothing, so a chain that had
+      ;; stopped looked exactly like a chain with nothing to do. The Worker
+      ;; built its own answer from the outside and got it wrong: it decided
+      ;; whose turn it was by HEIGHT, while this decides by ROUND, and once
+      ;; the view had run ahead of the height the two named different
+      ;; replicas. The deployed instrument then read `blocked-by nothing,
+      ;; would-propose true` on a replica that was not proposing — a wrong
+      ;; answer with evidence attached, which is worse than no answer.
+      ;;
+      ;; The three conditions, and which of them said no.
+      [(assoc state :propose-refusal
+              (let [pr (proposable-round state t)]
+                {:reason (cond (nil? justify) :no-certificate-for-the-tip
+                               (not (my-turn? state pr)) :not-my-round
+                               :else :too-soon)
+                 :height h
+                 :round pr
+                 :leads-that-round (c/led-by (:witnesses state) pr)
+                 :me (:witness state)
+                 :view (:view (:pm state))
+                 :ms-early (max 0 (- (+ (:last-proposed-at state)
+                                        (:block-interval (:params state)))
+                                     now))}))
+       []])))
+
+;; ── incoming ────────────────────────────────────────────────────────────────
+
+(defn- remember-block [state b]
+  (update state :by-hash assoc ((:hash-fn state) b) b))
+
+(defn- extend-chain
+  "Append `b` when it directly extends the tip. Returns state.
+
+  A block that does not extend the tip is kept in `:by-hash` but not adopted:
+  it may be a fork, or it may be the future arriving before the past, and
+  either way the chain a replica votes on must be one it can walk."
+  [state b]
+  (if (c/direct-extends? (:hash-fn state) (tip state) b)
+    (-> state (update :chain conj b) absorb-commits)
+    state))
+
+(defn- note-proposal
+  "What happened to the last proposal, and why.
+
+  Four of this function's five outcomes produce no message, which is correct
+  and leaves nothing to read: a replica that refuses a block says so to
+  nobody. Every stall in this system has been an absence, and the absences
+  that took longest to find were the ones inside a `cond` whose branches all
+  return the same silence."
+  [state block outcome]
+  (assoc state :last-proposal
+         {:height (:inga.block/height block)
+          :hash ((:hash-fn state) block)
+          :outcome outcome}))
+
+(defn- committed-hash-at
+  "The final block at height h, or nil when it is outside the retained tail."
+  [state h]
+  (some (fn [block]
+          (when (= h (:inga.block/height block))
+            ((:hash-fn state) block)))
+        (concat (:committed state) (:chain state))))
+
+(defn- conflicts-with-commit?
+  "A finalized height cannot acquire another block in a later view."
+  [state h block-hash]
+  (let [final-height (if-let [b (peek (:committed state))]
+                       (:inga.block/height b) -1)]
+    (and (<= h final-height)
+         (not= block-hash (committed-hash-at state h)))))
+
+(declare handle-proposal*)
+
+(defn- gap-sync-request
+  "A sync request when `parent` is known but sits above this replica's tip.
+
+  `handle-proposal` asked for history only when a proposal's parent was
+  UNKNOWN. A replica that restarted behind the chain learns the next few
+  blocks from proposals, so after the first one every later proposal has a
+  parent it holds: the parent is in `:by-hash`, never on `:chain`, because
+  the blocks between the tip and it never arrived. Nothing asked again. The
+  replica kept voting -- its lock and view tracked the quorum -- while its
+  adopted chain stayed where the one bounded answer left it. Measured on the
+  v5 score chain (2026-10-06): joseph voted in view 427 with its lock at
+  height 358 and its chain at 278, for as long as it was watched; v4's w2
+  (xavier) showed the same counters after its 2026-09-28 restart, and v4
+  stopped that day.
+
+  Asks for a bounded window anchored on the tip, not for the certified
+  branch. The certified request names the NEWEST certificate as its target,
+  and that block is not committed yet: a peer's archive serves committed
+  blocks only, its live tail is a few blocks deep, so neither can end a
+  segment at that target and the request went unanswered on every proposal
+  (v5, 2026-10-06: joseph asked from 277 to 463 while the archive ended at
+  461 and the tail began at 456). A window from tip+1 is what the archive can
+  answer up to its committed height; the last blocks arrive on the next
+  proposal, inside the live tail. `inga.sync` still checks every certificate
+  inside the segment and that it attaches to the tip."
+  [state parent block]
+  (let [tip-height (height state)
+        parent-height (:inga.block/height parent)]
+    (when (and (integer? parent-height) (> parent-height tip-height)
+               (not= ((:hash-fn state) parent) ((:hash-fn state) (tip state))))
+      (when-let [r (sync/request tip-height parent-height sync/default-params)]
+        (assoc r :type :sync-request :witness (:witness state))))))
+
+(defn- handle-proposal
+  [state {:keys [block] :as msg} now]
+  (let [state (remember-block state block)
+        parent (get (:by-hash state) (:inga.block/parent-hash block))
+        ask (when parent (gap-sync-request state parent block))
+        [state' out] (handle-proposal* state msg now)]
+    [state' (cond-> (vec out) ask (conj {:to :all :msg ask}))]))
+
+(defn- past-spent-view
+  "Leave the view this replica has already voted in, once it holds a
+  certificate that makes a new vote useful.
+
+  `pm/on-progress` anchors the view to the certified block's ROUND, which is
+  right while every block is certified in the view it was proposed in. It is
+  not right after one timeout. Then `vote-on-tip` re-votes for the tip in the
+  NEXT view, those votes certify it, and the counter lands on round + 1 — the
+  very view the replica just spent. The next proposal carries that round, the
+  replica answers `:already-voted-in-this-view`, and the only way on is another
+  timeout, which re-votes the tip in the next view again. One timeout puts the
+  chain in a loop of one base timeout per block that it never leaves.
+
+  Measured on torihiki-node's standalone validator, four processes on one
+  machine: p50 1,020 ms per block, every block certified by tip re-votes one
+  view late, every proposal refused `:already-voted-in-this-view`.
+
+  ## Why the target is local
+
+  HotStuff moves a replica to `qc-view + 1`, and the first version of this did
+  that. But a certificate's view is the MAX of its votes' views, and a vote's
+  view is whatever its signer chose: one Byzantine witness signing a vote at
+  view 2^53 pushed every honest replica there, where `inc` stops moving and
+  `voted-view` pins the replica forever. The only number that has to be
+  passed is this replica's own spent view, and it needs nobody's word for it."
+  [state]
+  (update state :pm pm/enter-at-least (inc (voted-view state))))
+
+(defn- absorb-justify
+  "Fold the certificate a proposal carries for its parent, before deciding
+  whether to vote for it.
+
+  A replica that did not fold the quorum itself — votes routed to the leader,
+  or one vote lost — learns the parent's certificate only from the next
+  proposal. Without this it stays in its spent view and refuses the proposal
+  that would have told it to move: the same one-timeout-per-block loop, for
+  that replica alone.
+
+  Verified exactly as a new-view's high QC is (admitted witnesses, a quorum of
+  verifying signatures). One that does not verify is ignored rather than
+  refused: every check below still runs, so this can only let a replica vote
+  sooner, never vote for something it would otherwise refuse."
+  [state parent block now]
+  (let [hf (:hash-fn state)
+        j (:inga.block/justify block)
+        parent-hash (hf parent)
+        verify (:verify-fn state)
+        held? (contains? (:qcs state) parent-hash)]
+    (cond
+      held? (past-spent-view state)
+
+      (and j (= parent-hash (:inga.qc/block-hash j))
+           (pos? (:inga.qc/height j 0))
+           (or (nil? verify)
+               (nil? (att/verify-certificate j (:chain-id state) (:quorum state) verify
+                                             (wire/admits (:witnesses state))))))
+      (-> state
+          (assoc-in [:qcs parent-hash] (assoc j :inga.qc/origin :justify))
+          (update :pm pm/on-qc j)
+          (update :pm pm/on-progress (:inga.block/round parent 0) now (:params state))
+          past-spent-view
+          absorb-commits)
+
+      :else state)))
+
+(defn- handle-proposal*
+  [state {:keys [block]} now]
+  (let [state (remember-block state block)
+        hf (:hash-fn state)
+        parent (get (:by-hash state) (:inga.block/parent-hash block))
+        state (cond-> state
+                (and parent (c/direct-extends? hf parent block))
+                (absorb-justify parent block now))
+        h (:inga.block/height block)]
+    (cond
+      (conflicts-with-commit? state h (hf block))
+      [(note-proposal state block :conflicts-with-committed) []]
+
+      ;; nothing to check it against — ask for what is missing rather than
+      ;; voting on a block whose parent this replica has never seen
+      (nil? parent)
+      [(note-proposal state block :no-parent)
+       [{:to :all :msg {:type :sync-request
+                              :witness (:witness state)
+                              :from (inc (height state))
+                              :to (:inga.block/height block)}}]]
+
+      (not (c/direct-extends? hf parent block))
+      [(note-proposal state block :does-not-extend-its-parent) []]
+
+      ;; The proposer has to be the replica whose turn it is.
+      ;;
+      ;; Nothing checked this, so a block was accepted from ANYBODY that
+      ;; extended a known parent and passed `safe-to-vote?`. The harness
+      ;; forger is not a validator and its block was adopted as the tip by
+      ;; three of four replicas once delivery was delayed twenty
+      ;; milliseconds — at zero delay the legitimate proposal reached
+      ;; everyone first and the forged one hit `already-voted-at-this-height`,
+      ;; so the check that appeared to refuse forgeries was the ordering.
+      ;;
+      ;; This is `my-turn?` read from the other side, and it inherits the
+      ;; fault-tolerance gap named there: keyed by height, a dead leader
+      ;; holds its turn and now nobody may take it. Refusing the wrong
+      ;; proposer is still right — a protocol that votes for whoever asks has
+      ;; no leader at all — and the gap belongs to the key, not to here.
+      ;; The round the block CLAIMS has to be the one its own certificate
+      ;; entitles it to. Checking the claim against the block's justify rather
+      ;; than against this replica's view is what makes the answer the same
+      ;; everywhere (ADR-2608680000 D1).
+      (not (c/proposed-by-its-leader? (:witnesses state) parent block
+                                      (can-justify-skip? state (:inga.block/round block))))
+      [(note-proposal state block :not-the-leader) []]
+
+      ;; Already voted at this height. Re-send the vote rather than saying
+      ;; nothing.
+      ;;
+      ;; Nothing here is ever retransmitted, and over a transport with no
+      ;; acknowledgements a lost vote is lost forever. The leader re-proposes
+      ;; the same block — it is a pure function of its parent, so it is the
+      ;; same block byte for byte — and every receiver stayed silent because
+      ;; it had already voted. The height could never certify. A deployed
+      ;; chain sat at height one for as long as it was watched.
+      ;;
+      ;; Re-sending is safe and is not equivocation: it is the SAME vote, for
+      ;; the same block, recovered from what this replica already recorded. A
+      ;; second vote for a DIFFERENT block at this height is still refused,
+      ;; which is the property that matters.
+      ;; One vote per VIEW, not per height.
+      ;;
+      ;; Per height is stricter than HotStuff and the strictness is what turns
+      ;; a transient fork into a permanent deadlock: two blocks at one height,
+      ;; the votes split, and every replica has already spent its vote there.
+      ;; Measured on both deployed chains, repeatedly — most recently a chain
+      ;; reset to genesis that reached 1927 and stopped with two replicas on
+      ;; one tip, one on another, and one behind.
+      ;;
+      ;; Safety across views is `pm/safe-to-vote?` below, which was always
+      ;; here and always correct: a replica may not vote for a block
+      ;; conflicting with its lock unless a quorum has demonstrably moved past
+      ;; that lock. Per-height was an extra gate in front of a rule that
+      ;; already did the work.
+      ;;
+      ;; Within a view nothing has changed: the same block re-sends the same
+      ;; vote, a different one gets nothing. The view only increases, so `<=`
+      ;; covers this view and every view already left.
+      (<= (:view (:pm state)) (voted-view state))
+      (let [state (note-proposal (extend-chain state block) block
+                                 :already-voted-in-this-view)
+            mine (get-in state [:votes (hf block) (:witness state)])]
+        (cond
+          mine
+          [state [{:to (vote-to state block)
+                   :msg (cond-> {:type :vote
+                                          :witness (:witness state)
+                                          :block-hash (hf block)
+                                          :height h
+                                          :view (:inga.vote/view mine 0)}
+                                   (:inga.vote/sig mine)
+                                   (assoc :sig (:inga.vote/sig mine)))}]]
+
+          ;; A snapshot preserves the spent view, not the signed block.
+          ;; Sync may have replaced the tip; without the cached vote there is
+          ;; nothing safe to resend in this view.
+          :else [state []]))
+
+      ;; Refused, and NOT adopted.
+      ;;
+      ;; This adopted the block and declined to vote for it, which puts the
+      ;; replica on a chain it will not support: the block is its tip, nothing
+      ;; can certify it because its own vote is missing, and every later
+      ;; proposal extends something it never agreed to. Three deployed
+      ;; validators sat at a tip with zero votes recorded for it — not even
+      ;; their own — while receiving three thousand proposals each.
+      ;;
+      ;; A replica's chain is what it voted for. Keeping the block in
+      ;; `:by-hash` is right, because a later proposal may need it as a
+      ;; parent to check against; making it the tip is not.
+      (not (pm/safe-to-vote? (:pm state) block #(ancestor? state %1 %2)))
+      [(note-proposal state block :locked-elsewhere) []]
+
+      :else
+      (cast-vote (note-proposal (extend-chain state block) block :voted)
+                 block now))))
+
+(defn- known-evidence?
+  "Have we already recorded an equivocation by this witness at this height?
+
+  Keyed by `[witness height]` rather than by the whole proof: two different
+  pairs of conflicting votes at one height are the same crime, and treating
+  them as two would let an equivocator inflate the record — and, worse, keep
+  re-triggering a forward."
+  [state {:inga.evidence/keys [witness height]}]
+  (some #(and (= witness (:inga.evidence/witness %))
+              (= height (:inga.evidence/height %)))
+        (:equivocations state)))
+
+(defn- record-evidence [state e]
+  (update state :equivocations conj e))
+
+(defn- fold-vote
+  "Collect a vote and, on quorum, form the certificate.
+
+  Votes are grouped by BLOCK HASH, and deliberately not by [view block-hash].
+
+  Keying by view as well was the first thing this got wrong, and it does not
+  show up until the network is real. The worry it was written for — two views
+  certifying blocks at the same height — is answered by the hash itself: the
+  hash covers the height, parent, proposals, proposer and timestamp, so two
+  views cannot produce one hash, and every vote carrying a given hash is a
+  vote for the same decision by construction.
+
+  What keying by view actually did was split those votes by the VOTER's local
+  view. Replicas time out at slightly different moments, so their views drift
+  apart by one, and then three votes for the same block sit in three different
+  buckets and quorum is never reached by anyone. The chain stalled at height
+  two while every replica held enough votes to certify it.
+
+  Nothing in the deterministic test could see this: with no timeouts firing,
+  every replica stayed in view 0 and the two keyings are the same key.
+
+  The certificate takes the HIGHEST view among its votes, which is what the
+  pacemaker orders locks by — taking the lowest would let a certificate formed
+  late lose to one formed earlier for a block it supersedes.
+
+  A replica folds its OWN vote through here too. Recording only what arrives
+  over the network would mean every replica was one vote short of what it
+  actually knows, and with a four-witness set that is the difference between
+  reaching quorum and never reaching it — a transport detail silently setting
+  the quorum threshold."
+  [state {:keys [witness block-hash height view sig]} now]
+  (let [witness (wire/wire-id witness)
+        verify (:verify-fn state)
+        ;; The verifier decides, including when there is no signature.
+        ;;
+        ;; This required a signature before consulting the verifier, and that
+        ;; rejected the replica's OWN vote everywhere signing is
+        ;; asynchronous — a Worker signs with WebCrypto after the vote has
+        ;; been produced, so the copy folded locally has no signature yet. Its
+        ;; own vote never counted, every replica was exactly one short of a
+        ;; quorum of three, and each one recorded two hundred of its own votes
+        ;; as `unsigned` while the chain sat there.
+        ;;
+        ;; Nothing is loosened. A verifier that does not know the witness, or
+        ;; is handed a nil signature for one it does not trust, still says
+        ;; false — and a replica does not have to be convinced of a vote it
+        ;; produced itself.
+        ok? (or (nil? verify)
+                (verify witness
+                        (att/vote-payload (:chain-id state) view height
+                                          block-hash witness)
+                        sig))
+        finality-conflict? (conflicts-with-commit? state height block-hash)]
+   (if (or (not ok?) finality-conflict?)
+    ;; Dropped, not counted and not answered. A replica that replied would be
+    ;; telling a forger which of its guesses were closer — and that silence is
+    ;; also why a chain whose votes are being dropped looks exactly like a
+    ;; chain whose votes are not being sent. Counted, so the two can be told
+    ;; apart without asking the sender.
+    [(-> state
+         (update-in [:dropped-votes (if-not ok?
+                                     (if sig :did-not-verify :unsigned)
+                                     :conflicts-with-committed)]
+                    (fnil inc 0))
+         (assoc :last-dropped-vote
+                (cond-> {:witness witness :height height :view view
+                         :block-hash block-hash :had-sig (boolean sig)}
+                  (and ok? finality-conflict?)
+                  (assoc :reason :conflicts-with-committed))))
+     []]
+    (let [vote (cond-> (assoc (c/make-vote witness block-hash height)
+                              :inga.vote/view view)
+                 sig (assoc :inga.vote/sig sig))
+          ;; Keyed by VIEW as well as height, because that is what the voting
+          ;; rule is keyed by. A replica may vote at one height in several
+          ;; views — that is a view change, and it is how a stalled chain
+          ;; recovers — so `[witness height]` called every recovering replica
+          ;; an equivocator and broadcast a signed proof of it. See
+          ;; `inga.stake/detect-equivocation` for the measurement.
+          prior (get-in state [:first-vote [witness height view]])]
+     (if (and prior (not= (:inga.vote/block-hash prior) block-hash))
+       ;; Both signed, both verifying, both from this witness at this height
+       ;; IN THIS VIEW, for different blocks. Refused, and kept: an
+       ;; equivocator that is merely ignored pays nothing and can do it again
+       ;; next height.
+       (let [e {:inga.evidence/witness witness
+                :inga.evidence/height height
+                :inga.evidence/view view
+                :inga.evidence/vote-a prior
+                :inga.evidence/vote-b vote}]
+         ;; Broadcast, not just kept. Evidence that stays in the replica that
+         ;; happened to receive both votes punishes nobody: the equivocator
+         ;; only has to make sure no single peer sees both, which is a routing
+         ;; property it can influence. Forwarding is what makes the proof a
+         ;; network fact instead of one node's private opinion.
+         [(record-evidence state e)
+          [{:to :all :msg {:type :evidence :evidence e}}]])
+    (let [state (assoc-in state [:first-vote [witness height view]]
+                          (or prior vote))
+          state (update-in state [:votes block-hash] (fnil assoc {}) witness
+                         vote)
+        votes (vals (get-in state [:votes block-hash]))
+        view (apply max (map #(:inga.vote/view % 0) votes))]
+    (if (and (q/met? (:quorum state) (set (map :inga.vote/witness votes)))
+             (not (get-in state [:qcs block-hash])))
+      (let [cert (some-> (c/qc (vec votes) (count (:witnesses state)) view)
+                         (att/certify votes)
+                         ;; Where a certificate was made. Two paths put one
+                         ;; into `:qcs` and they are indistinguishable
+                         ;; afterwards, which is why a certificate arriving
+                         ;; without per-witness views could not be traced to
+                         ;; the place that built it. Not part of the
+                         ;; certificate proper — `inga.wire` does not carry
+                         ;; it, so it says where THIS replica got it, which
+                         ;; is the question being asked.
+                         (assoc :inga.qc/origin :fold-vote))]
+        (if cert
+          (let [state (-> state
+                          (assoc-in [:qcs block-hash] cert)
+                          (update :pm pm/on-qc cert)
+                          ;; The certified block's round, not the QC's view —
+                          ;; the counter is anchored to the chain (ADR-2608680000).
+                          (update :pm pm/on-progress
+                                  (:inga.block/round (get (:by-hash state) block-hash) 0)
+                                  now (:params state))
+                          past-spent-view
+                          absorb-commits)]
+            (propose state now))
+          [state []]))
+      [state []])))))))
+
+(defn- vote-to
+  "Who a vote for `block` is addressed to.
+
+  `:broadcast` (default) sends it to everyone: every replica folds votes into
+  certificates itself, which is why `/head` can report a `fold-vote` origin
+  for its tip certificate.
+
+  `:leader` sends it to the replica that will build on the block — the leader
+  of the next round — which is what HotStuff does and is n times fewer
+  messages per round. It is sound because the certificate only has to exist
+  where it is USED: the next proposer needs it to justify its block, and
+  everyone else receives it inside that proposal.
+
+  What it costs is the thing broadcast was quietly buying: a replica that is
+  not the next leader stops being able to certify the tip on its own, so a
+  proposer that misses the votes has to ask for them rather than having heard
+  them already.
+
+  ## Measured, and the saving does not pay for that cost
+
+  `script/network.cljk`, NET_DELAY=20, real sockets:
+
+      n=4   broadcast  126 heights   4425 msgs in
+            leader     127           4405
+
+      n=7   broadcast  100 heights   7471 msgs in
+            leader      94           7333
+
+  **Votes are not what this transport spends its messages on.** Cutting them
+  to one recipient moved the count by half a percent, and at seven witnesses
+  the round trip a proposer now needs to fetch the votes it did not hear cost
+  more than the messages saved — six fewer heights in the same wall clock.
+
+  So the default stays `:broadcast`. This is kept, opt-in, because the
+  measurement is worth being able to repeat: the balance could turn at a
+  larger validator set, and the way to find out is to run it rather than to
+  reason about message counts."
+  [state block]
+  (if (= :leader (:vote-routing state))
+    (c/leader-for (:witnesses state)
+                  (inc (:inga.block/round block (:inga.block/height block 0))))
+    :all))
+
+(defn- cast-vote
+  "Vote for `block` at the current view after the spent-view and lock checks:
+  record it locally and emit it.
+
+  Returns `[state' outbox]`. The local record is not an optimisation — see
+  `fold-vote`."
+  [state block now]
+  (if (or (<= (:view (:pm state)) (voted-view state))
+          (not (pm/safe-to-vote? (:pm state) block
+                                 #(ancestor? state %1 %2))))
+    [state []]
+  (let [hf (:hash-fn state)
+        view (:view (:pm state))
+        bh (hf block)
+        ht (:inga.block/height block)
+        sig (when-let [f (:sign-fn state)]
+              (f (att/vote-payload (:chain-id state) view ht bh (:witness state))))]
+    ;; An unsigned vote on a signing chain is not a vote, and casting one must
+    ;; not spend the height.
+    ;;
+    ;; This built the vote, marked the height voted, and handed it to
+    ;; `fold-vote` -- which drops an unsigned vote when a `verify-fn` is
+    ;; configured, INCLUDING this replica's own. The vote went nowhere and the
+    ;; height was spent anyway: `voted?` answers yes from then on, so the
+    ;; replica never votes there again, and the tip it holds can never be
+    ;; certified. The chain sits on that tip forever.
+    ;;
+    ;; It fires on restart, which is why every deploy needed a hand-reset. A
+    ;; Durable Object derives its signing key asynchronously and ticks before
+    ;; the key is there, so the first vote after a restart is unsigned. From
+    ;; the deployed v2, all four replicas stuck at height 6793 with
+    ;; `votes-for-tip 0`:
+    ;;
+    ;;   dropped-votes    {unsigned 1}
+    ;;   last-dropped-vote {witness w1, height 6793, block-hash <its own tip>}
+    ;;   voted-at-tip?    true
+    ;;
+    ;; One unsigned vote, one burned height, and a chain that only `/reset`
+    ;; could restart -- because reset is what clears `:voted`.
+    ;;
+    ;; Refusing to vote costs one round; the replica votes at that height on a
+    ;; later tick, once signing works. `vote-on-tip` is already the path that
+    ;; retries.
+    ;; A signing FAILURE, not the absence of signing.
+    ;;
+    ;; The first cut refused whenever there was no signature, and that broke
+    ;; the deployment it was written for. A Cloudflare Worker cannot sign
+    ;; synchronously — WebCrypto is async — so it runs with NO `sign-fn` on
+    ;; purpose: the replica emits the vote unsigned, dispatch signs it, and
+    ;; folds the signed copy back as a message. Refusing to emit left dispatch
+    ;; with nothing to sign, so `could-not-sign` climbed on every tick and the
+    ;; chain stopped harder than before. Measured on v2 within a minute of
+    ;; the deploy.
+    ;;
+    ;; So: a replica that HAS a signing function and got nothing from it has
+    ;; failed to sign, and must not spend the height. A replica with no
+    ;; signing function is not failing — it signs somewhere else.
+    (if (and (:sign-fn state) (:verify-fn state) (nil? sig))
+      [(update-in state [:dropped-votes :could-not-sign] (fnil inc 0)) []]
+      (let [vote (cond-> {:witness (:witness state) :block-hash bh
+                          :height ht :view view}
+                   sig (assoc :sig sig))
+            [state' out] (fold-vote (-> state
+                                        (update :voted conj ht)
+                                        ;; The view this vote was cast in.
+                                        ;; Equivocation is defined against it,
+                                        ;; and `voted-view` is what a host must
+                                        ;; make durable before the vote leaves.
+                                        (with-voted-view view))
+                                    vote now)]
+        [state' (into [{:to (vote-to state block) :msg (assoc vote :type :vote)}] out)])))))
+
+(defn- adopt-own
+  "A proposer adopts and votes for its own block.
+
+  Leaving this out made the leader the only replica that could certify
+  anything — it was the only one holding every other replica's vote — and it
+  never advanced its own chain, so it re-proposed the same height forever
+  while the rest of the network waited for a proposal that already existed."
+  [state b now]
+  (let [state (-> state (remember-block b) (extend-chain b))]
+    (if (voted? state (:inga.block/height b))
+      [state []]
+      (cast-vote state b now))))
+
+(defn- sync-view
+  "Jump to a higher view when f+1 distinct witnesses are at or past it.
+
+  Without this the views drift apart and never come back, because a timeout
+  certificate needs new-views that agree on a view and drifted replicas never
+  produce any. The deployed chain reached 16, 16, 21 and 51.
+
+  Counted across ALL views at or above the candidate, not just messages naming
+  it exactly: a replica at view 51 has also passed 21, and requiring it to say
+  so again would make convergence depend on everybody timing out at the same
+  moment, which is the thing that is not happening."
+  [state now]
+  (let [n (count (:witnesses state))
+        threshold (q/one-honest n)
+        mine (:view (:pm state))
+        nvs (:new-views state)
+        best (->> (keys nvs)
+                  (filter #(> % mine))
+                  (sort >)
+                  (some (fn [v]
+                          (let [ws (into #{} (mapcat (fn [[vv m]]
+                                                       (when (>= vv v) (keys m)))
+                                                     nvs))]
+                            (when (>= (count ws) threshold) v)))))]
+    (if best
+      (-> state
+          (assoc-in [:pm :view] best)
+          (assoc-in [:pm :failures] 0)
+          (assoc-in [:pm :deadline]
+                    (+ now (pm/timeout-for 0 (:params state)))))
+      state)))
+
+(defn- new-view-refusal
+  "Why a new-view was not accepted, or nil if it was.
+
+  A refused new-view produced NO record at all — the same silence that
+  `note-proposal` exists to break for proposals, and the one this system's
+  stalls keep hiding in. Measured on testnet: `new-view-groups` sat at zero
+  while views advanced, which says every new-view was refused and says nothing
+  about why. Four hypotheses were ruled out one at a time before anyone could
+  ask the replica.
+
+  The reasons are separated rather than folded into one boolean, because
+  `:unsigned`, `:bad-signature` and `:bad-certificate` have three different
+  fixes and one of them is not a bug at all."
+  [state {:keys [witness view high-qc sig]}]
+  (let [verify (:verify-fn state)]
+    (cond
+      (nil? verify) nil                      ; replaying an agreed history
+      (nil? sig) :unsigned
+      (not (verify witness
+                   (att/new-view-payload (:chain-id state) view witness high-qc)
+                   sig))
+      :bad-signature
+
+      ;; The certificate it carries has to hold up on its own — a signed
+      ;; message asserting an unverified certificate moves the forgery one
+      ;; level in, it does not stop it.
+      ;;
+      ;; ...except at genesis. `start` fabricates a certificate for the
+      ;; genesis block so the first proposal has something to justify, and
+      ;; nobody signed it because nobody voted: genesis is the one block every
+      ;; replica has by construction. Requiring signatures on it refused every
+      ;; new-view whose high QC was still the bootstrap one, so replicas that
+      ;; had not yet certified anything could not tell each other they had
+      ;; timed out. Their views drifted apart, no two new-views shared a view,
+      ;; no timeout certificate could form, and four validators sat exchanging
+      ;; new-views forever at views 5, 6, 6, 6.
+      (and (some? high-qc)
+           (not (zero? (:inga.qc/height high-qc -1)))
+           (some? (att/verify-certificate high-qc (:chain-id state)
+                                          (:quorum state) verify
+                                          (wire/admits (:witnesses state)))))
+      :bad-certificate
+
+      :else nil)))
+
+(defn- note-new-view
+  "What happened to the last new-view, and why. The counterpart of
+  `note-proposal`, and added for the same reason: an outcome that produces no
+  message leaves nothing to read."
+  [state witness view outcome]
+  (assoc state :last-new-view {:witness witness :view view :outcome outcome}))
+
+(defn- certified-sync-request
+  "Ask for the whole certified uncommitted branch when it fits one bounded
+  response. Starting above the local tip cannot repair a fork below that tip.
+
+  A fork is any certified block that is not the block this replica's chain
+  holds at that height -- at the tip's height OR BELOW it. This compared only
+  against the tip, so a certified rival one block under an uncertified tip
+  was never asked for. Measured 2026-10-07 on isekai-score-20261006-v5: all
+  seven witnesses held 16154 -> e326 -> 7c9a while the quorum had certified a
+  different 16155 (50f5), their high-qc and lock. The tip could not be
+  certified (it extends what the lock forbids), so nobody proposed, and
+  nothing asked for 50f5. Committed height stood at 16154 for four hours.
+
+  The ordinary case -- the certified block IS the chain's block at that height,
+  the tip's own parent in chained HotStuff -- is not a fork and asks nothing."
+  [state qc]
+  (let [hf (:hash-fn state)
+        to (:inga.qc/height qc)
+        from (max 1 (inc (committed-height state)))
+        local-height (height state)
+        local-at (some (fn [b] (when (= to (:inga.block/height b)) (hf b))) (:chain state))
+        different? (and (integer? to) (<= to local-height)
+                        (not= (:inga.qc/block-hash qc) local-at))]
+    (when (and qc (integer? to)
+               (or (> to local-height) different?)
+               (<= from to)
+               (< (- to from) (:max-batch sync/default-params)))
+      {:type :sync-request
+       :witness (:witness state)
+       :from from :to to
+       :target-hash (:inga.qc/block-hash qc)})))
+
+(defn- handle-new-view
+  [state {:keys [witness view high-qc sig] :as msg} now]
+  (let [witness (wire/wire-id witness)
+        refusal (new-view-refusal state (assoc msg :witness witness))
+        ok? (nil? refusal)]
+    (if-not ok?
+      [(note-new-view state witness view refusal) []]
+      (let [state (note-new-view state witness view :accepted)
+            state (update-in state [:new-views view] (fnil assoc {}) witness
+                             {:inga.nv/witness witness :inga.nv/view view
+                              :inga.nv/high-qc high-qc})
+            ;; KEEP the certificate. It arrived verified — the guard above ran
+            ;; `att/verify-certificate` on it — and it was being thrown away.
+            ;;
+            ;; A replica that is evicted keeps its BLOCKS, because those are
+            ;; persisted, and loses every vote and every certificate, because
+            ;; those are memory. `replay` rebuilds a certificate for each block
+            ;; whose child it holds, since a block carries its parent's QC —
+            ;; which is every block EXCEPT the tip. So the rebuilt replica sits
+            ;; on a tip it cannot certify, and `propose` needs exactly that
+            ;; certificate. Deployed, `why-not-proposing` says `no certificate
+            ;; for the tip` in those words.
+            ;;
+            ;; It cannot ask for it either: `behind` is zero, because it is not
+            ;; behind — it has the block, it is missing the proof. Nothing in
+            ;; the protocol requests a certificate for a block you already
+            ;; hold, and every new-view arriving carried the answer.
+            ;;
+            ;; Leadership is keyed by height, so when that replica's turn comes
+            ;; the height stops moving and no other replica may take it. Every
+            ;; stall measured — deployed at 225 and here at 28 — is a replica
+            ;; that was evicted while leading the next height.
+            state (if (and high-qc
+                           (not (get-in state [:qcs (:inga.qc/block-hash high-qc)])))
+                    (assoc-in state [:qcs (:inga.qc/block-hash high-qc)]
+                              (assoc high-qc :inga.qc/origin :new-view))
+                    state)
+            msgs (vals (get-in state [:new-views view]))
+            ;; A new-view carries the sender's highest certificate, so it says
+            ;; how far ahead that replica is. A replica behind it asks for what
+            ;; it missed.
+            ;;
+            ;; This is the only way a laggard can learn a block exists.
+            ;; Retransmission of a proposal is conditioned on the sender still
+            ;; needing votes for it, so it stops exactly when a replica that
+            ;; missed the block still needs it — and a proposal is what would
+            ;; have made it ask. One replica sat at height one while the other
+            ;; three went to two and stopped there, because three is the
+            ;; quorum and there was no margin left for a single lost message.
+            behind (- (:inga.qc/height high-qc -1) (height state))
+            target-request (certified-sync-request state high-qc)
+            ask (cond
+                  target-request
+                  [{:to :all :msg target-request}]
+                  (pos? behind)
+                  (when-let [r (sync/request (height state)
+                                             (:inga.qc/height high-qc)
+                                             sync/default-params)]
+                    [{:to :all :msg (assoc r :type :sync-request
+                                             :witness (:witness state))}]))]
+        (if-let [tc (pm/timeout-certificate (vec msgs) (:quorum state))]
+          (let [state (update state :pm pm/on-timeout-certificate tc now (:params state))
+                [state out] (propose state now)]
+            [state (into (vec ask) out)])
+          (let [state (sync-view state now)]
+            [state (vec ask)]))))))
+
+(defn- target-segment
+  "Walk a known certified branch back to the requested height. A current
+  chain-only answer cannot repair a same-height fork. Missing ancestry gets
+  no answer; the requester must try another peer."
+  [state target-hash from to cap]
+  (loop [hash target-hash blocks []]
+    (let [b (get (:by-hash state) hash)
+          h (:inga.block/height b)]
+      (cond
+        (or (nil? b) (not= hash ((:hash-fn state) b))
+            (not (integer? h)) (> h to) (< h from)
+            (>= (count blocks) cap)) nil
+        (= h from) (vec (reverse (conj blocks b)))
+        :else (recur (:inga.block/parent-hash b) (conj blocks b))))))
+
+(defn- handle-sync-request
+  "Answer with at most `:max-batch` blocks.
+
+  Unclamped, `{from 1, to 999999}` makes every replica serialise its whole
+  chain — one small message costing the network everything it holds, from a
+  peer that has to be neither a witness nor even correct. `inga.sync/request`
+  already asks in windows for the replica's own sake; this is the same bound
+  applied where it is a defence rather than a convenience.
+
+  ## A host that uses `resume` MUST answer this itself
+
+  This serves `(:chain state)` — what the replica holds in MEMORY. `resume`
+  bounds that chain to `resume-tail` blocks, so **a replica booted from a
+  snapshot can serve almost nothing**, and it answers a request for old blocks
+  with an empty segment rather than with an error.
+
+  ## The answer is addressed to whoever asked
+
+  Broadcasting it looks harmless — everybody drops what does not attach — but
+  a replica far behind receives mostly ANSWERS TO OTHER REPLICAS' QUESTIONS,
+  each starting at a height it cannot reach, and refuses them one after
+  another. Measured on the devnet: a validator at height 0 was offered a
+  segment beginning at 1276, which was the range a caught-up peer had asked
+  about, and reported `:does-not-attach` — a correct refusal of an answer
+  that was never meant for it. `:witness` is what makes the reply go back.
+
+  A request without a witness still gets a broadcast answer, because both
+  versions of a node run side by side across a deploy and refusing the older
+  form would make the upgrade itself the outage.
+
+  That combination is silent and it deadlocks a network. Measured on a
+  deployed devnet: a replica reset to genesis sent 49 sync requests, its peers
+  returned 115 sync responses, and it stayed at height 0 — every response was
+  empty, and nothing anywhere said so. **A replica that cannot serve history
+  cannot heal its peers**, and the bounded resume that makes restarts cheap is
+  exactly what takes that away.
+
+  The blocks are not lost; they are in whatever durable store the host wrote
+  them to. But consensus here is a pure library and cannot read it. So a host
+  that calls `resume` has to intercept `:sync-request` before `on-message`
+  sees it and answer from storage — `torihiki-node`'s validator does this in
+  `answerSyncRequests`. A host that keeps the whole chain in memory can leave
+  this alone."
+  [state {:keys [from to witness target-hash]}]
+  (let [cap (:max-batch sync/default-params)
+        blocks (if target-hash
+                 (target-segment state target-hash from to cap)
+                 (->> (:chain state)
+                      (filter #(<= from (:inga.block/height %) to))
+                      (take cap)
+                      vec))]
+    [state (if (seq blocks)
+             [{:to (or witness :all)
+               :msg (cond-> {:type :sync-response :blocks blocks}
+                      target-hash (assoc :target-hash target-hash))}]
+             [])]))
+
+(defn- vote-on-tip
+  "Resend a cached tip vote, or ask the central signing gate for a fresh vote.
+
+  A synced or replayed tip does not prove which block this witness signed.
+  Without a cached vote, the durable watermark must permit a later view."
+  [state now]
+  (let [t (tip state)
+        h (:inga.block/height t)
+        hf (:hash-fn state)
+        mine (get-in state [:votes (hf t) (:witness state)])]
+    (cond
+      (zero? h) [state []]
+
+      ;; A new view permits a fresh vote even when this height was voted in
+      ;; an earlier view. Keeping only the cached old-view vote can prevent
+      ;; synchronized replicas from collecting votes after recovery.
+      (> (:view (:pm state)) (voted-view state)) (cast-vote state t now)
+
+      ;; Voted, and still holding the vote: re-send it rather than re-signing.
+      mine
+      [state [{:to (vote-to state t)
+               :msg (cond-> {:type :vote
+                                      :witness (:witness state)
+                                      :block-hash (hf t)
+                                      :height h
+                                      :view (:inga.vote/view mine 0)}
+                               (:inga.vote/sig mine)
+                               (assoc :sig (:inga.vote/sig mine)))}]]
+
+      ;; Without a cached vote, cast-vote must enforce the durable watermark.
+      :else (cast-vote state t now))))
+
+(defn- handle-sync-response
+  "Adopt a segment through `inga.sync`, or refuse it whole, and vote for what
+  it leaves us on.
+
+  Whole, because adopting the valid prefix of a bad segment lets a peer choose
+  where this replica's history ends by appending garbage to a good answer —
+  which is `inga.sync`'s reasoning, and the reason to call it rather than to
+  re-implement a weaker version of it here."
+  [state {:keys [blocks target-hash]} now]
+  (let [segment (vec (sort-by :inga.block/height blocks))
+        target-qc (when target-hash
+                    (or (get-in state [:qcs target-hash])
+                        (when (= target-hash (get-in state [:pm :high-qc :inga.qc/block-hash]))
+                          (get-in state [:pm :high-qc]))))
+        target-refusal (when target-hash
+                         (cond
+                           (empty? segment) :empty-target-segment
+                           (not= target-hash ((:hash-fn state) (peek segment)))
+                           :wrong-certified-target
+                           (not= (:inga.qc/height target-qc)
+                                 (:inga.block/height (peek segment)))
+                           :missing-target-certificate
+                           (some? (att/verify-certificate
+                                   target-qc (:chain-id state) (:quorum state)
+                                   (:verify-fn state)
+                                   (wire/admits (:witnesses state))))
+                           :invalid-target-certificate))
+        {:keys [chain adopted reason]}
+        (if target-refusal
+          {:chain (:chain state) :adopted 0 :reason target-refusal}
+          (sync/sync-step (:hash-fn state) (:quorum state) (:chain state) segment
+                        ;; The witness set travels with the params so that
+                        ;; `validate-segment` can refuse a block whose
+                        ;; proposer does not lead its height. Without it a
+                        ;; sync response was the one way into a replica that
+                        ;; nothing checked.
+                        (assoc sync/default-params
+                               :witnesses (:witnesses state)
+                               ;; Nothing at or below the commit line may be
+                               ;; replaced. Passing it explicitly is what turns
+                               ;; `sync-step`'s rewind from "trust the peer" into
+                               ;; "trust the peer above the point a quorum has
+                               ;; already finalised" — and `:below-commit` names
+                               ;; the refusal so a real safety alarm can never be
+                               ;; read as ordinary sync noise.
+                               :floor (committed-height state))
+                        (:chain-id state) (:verify-fn state)))
+        ;; Refusing a segment says nothing to anybody, correctly — and a
+        ;; replica that cannot catch up looks exactly like a replica nobody is
+        ;; answering. `inga.sync` has a closed set of reasons; this records
+        ;; which one, so the difference is one reading rather than a guess.
+        ;; `inga.sync` returns one keyword for four different refusals, and
+        ;; `:below-quorum` is the one that hides the most: a certificate can
+        ;; be unsigned, missing a signature, carrying a bad one, or simply
+        ;; short. Reading which — and which witness — is the difference
+        ;; between a diagnosis and a third guess.
+        detail (when (and (= :below-quorum reason) (seq segment))
+                 ;; The block that ACTUALLY failed, not the first one.
+                 ;;
+                 ;; The first block's justify is the genesis certificate,
+                 ;; which `sync/quorum-ok?` exempts — so reporting it always
+                 ;; showed a passing certificate and sent the reader looking
+                 ;; for a missing genesis exception that was already there.
+                 (let [bad (or (sync/first-uncertified
+                                (:quorum state) segment
+                                (:chain-id state) (:verify-fn state))
+                               (first segment))
+                       j (:inga.block/justify bad)
+                       v (:verify-fn state)]
+                   {:witnesses (vec (sort (:inga.qc/witnesses j #{})))
+                    :sigs (vec (sort (keys (:inga.qc/sigs j))))
+                    :views (:inga.qc/views j)
+                    :at-height (:inga.block/height bad)
+                    :qc-view (:inga.qc/view j)
+                    :qc-height (:inga.qc/height j)
+                    :attest-says (att/verify-certificate j (:chain-id state)
+                                                         (:quorum state) v
+                                                         (wire/admits (:witnesses state)))
+                    :per-witness
+                    (when v
+                      (into {}
+                            (for [[w payload sig] (att/pending-checks
+                                                   j (:chain-id state))]
+                              [w (boolean (v w payload sig))])))}))
+        state (assoc state :last-sync
+                     (cond-> {:offered (count segment)
+                              :from (:inga.block/height (first segment))
+                              :to (:inga.block/height (last segment))
+                              :adopted adopted
+                              :reason reason}
+                       detail (assoc :detail detail)))
+]
+    (if (pos? adopted)
+      (-> state
+          (assoc :chain chain)
+          (as-> s (reduce remember-block s segment))
+          ;; sync-step verified the adopted blocks and their parent QCs. Keep
+          ;; those QCs before committing: the durable sink needs the record
+          ;; block's QC to write its proof sidecar after an offline catch-up.
+          (as-> s (reduce (fn [s block]
+                           (if-let [qc (:inga.block/justify block)]
+                             (update-in s [:qcs (:inga.qc/block-hash qc)]
+                                        pm/higher-qc qc)
+                             s))
+                         s (take-last adopted chain)))
+          absorb-commits
+          (vote-on-tip now))
+      [state []])))
+
+(def ^:private linking-refusals
+  "Sync refusals that say the disagreement is BELOW where we have been asking.
+
+  Both are the append path reporting that the segment's first block does not
+  sit on our tip. A replica that is merely behind never sees them -- what it
+  gets is blocks that attach. Seeing one means our tip is not on the branch
+  the peer is offering, and no segment above our tip can ever say more."
+  #{:does-not-link :does-not-attach})
+
+(defn- sync-ask-from
+  "The height to ask a peer to start from.
+
+  `(inc (height state))` -- ask for what is above us -- is right for a replica
+  that is BEHIND, and it is the only thing this asked for. It cannot resolve a
+  fork: `sync-step` consults `conflicts-with-chain?` only when the incoming
+  segment starts at or below our tip, so a segment that begins at `tip + 1`
+  goes to the append path, where a fork below the tip is invisible.
+
+  Measured 2026-08-31 on `torihiki-validator-v3`, sixteen days into a stall.
+  w1 held a different block at 5616 from the branch a quorum had certified,
+  and its committed height was 5614:
+
+      /block?height=5615   identical on both branches
+      /block?height=5616   DIFFERENT
+
+  It asked from 5617 once per view for roughly 900,000 views, was answered
+  5617-5634 every time, and refused every one `:does-not-link`. The rewind
+  path that exists for exactly this was never reached.
+
+  So after a linking refusal, ask from `committed + 1` instead. That is the
+  LOWEST USEFUL point rather than a guess: `sync-step` passes the committed
+  height as `:floor` and `rewind-target` refuses to replace a committed block,
+  so nothing below it could be adopted whatever a peer sent.
+
+  It is what a refusal buys and a success spends -- a replica that is helped
+  goes back to asking above its tip, because asking from `committed + 1` every
+  time would re-fetch the uncommitted suffix on every request forever.
+
+  ADR-2608150200 removed a `sync-from` on the grounds that no scenario
+  executed it. The scenario existed; the harness did not."
+  [state]
+  (let [above (inc (height state))]
+    (if (contains? linking-refusals (:reason (:last-sync state)))
+      (min above (inc (committed-height state)))
+      above)))
+
+(defn- vote-verifier
+  "A `(fn [vote] boolean)` for `inga.stake/verify-equivocation-evidence`,
+  built from the seams this replica already has.
+
+  When no `verify-fn` is configured this accepts everything, exactly as vote
+  folding does. That is right for replaying a history this replica already
+  agreed to and wrong for anything else — and for evidence it is wronger than
+  for votes, because unverifiable evidence is how one node frames another. The
+  structural checks in `verify-equivocation-evidence` still apply, so an
+  unconfigured replica cannot be told that a witness equivocated with itself,
+  but it CAN be handed forged signatures. Configure a verifier."
+  [state]
+  (let [verify (:verify-fn state)]
+    (fn [v]
+      (or (nil? verify)
+          (boolean
+           (verify (:inga.vote/witness v)
+                   (att/vote-payload (:chain-id state)
+                                     (or (:inga.vote/view v) 0)
+                                     (:inga.vote/height v)
+                                     (:inga.vote/block-hash v)
+                                     (:inga.vote/witness v))
+                   (:inga.vote/sig v)))))))
+
+(defn handle-evidence
+  "Fold equivocation evidence from a peer.
+
+  Three things have to hold, and each one is a way this could otherwise be
+  abused:
+
+  1. **Verify before recording.** `inga.stake/verify-equivocation-evidence`
+     re-checks the whole claim — same witness, same height, different blocks,
+     both signatures valid — rather than trusting that the sender ran
+     detection. Without this, evidence is a way to accuse anyone of anything.
+  2. **Record once per `[witness height]`.** See `known-evidence?`.
+  3. **Forward only on FIRST sight.** A replica that re-broadcasts everything
+     it receives turns one proof into a permanent storm between peers. First
+     sight forwards; every copy after is absorbed."
+  [state {:keys [evidence]}]
+  (cond
+    (nil? evidence) [state []]
+    (known-evidence? state evidence) [state []]
+    (not (stake/verify-equivocation-evidence evidence (vote-verifier state)))
+    [(update-in state [:dropped-evidence :did-not-verify] (fnil inc 0)) []]
+    :else
+    [(record-evidence state evidence)
+     [{:to :all :msg {:type :evidence :evidence evidence}}]]))
+
+(defn on-message
+  "Fold one decoded message. Returns `[state' outbox]`.
+
+  Total: an unknown type is ignored rather than thrown from. A replica that
+  can be stopped by a message is a replica anybody can stop."
+  [state msg now]
+  (case (:type msg)
+    :proposal (handle-proposal state msg now)
+    :vote (fold-vote state msg now)
+    :new-view (handle-new-view state msg now)
+    :sync-request (handle-sync-request state msg)
+    :sync-response (handle-sync-response state msg now)
+    :evidence (handle-evidence state msg)
+    [state []]))
+
+(def ^:const sync-ask-ms
+  "The floor between two sync-requests from one replica. **1000.**
+
+  A second is long next to a block and short next to an outage, which is the
+  range this is for. It is a floor and not a period: the view gate still
+  applies, so a healthy replica that never times out never asks at all."
+  1000)
+
+(defn on-tick
+  "Time passed. Times the view out when the deadline has gone by, and
+  proposes when this replica leads and holds a certificate for the tip.
+
+  Starts the clock when there is none. `pm/initial` leaves the deadline at 0
+  and it was read as 'no clock yet, do not time out' — so a replica that never
+  saw a certificate never got a deadline, never timed out, never sent a
+  new-view, and therefore never got a certificate. A deadlock at startup with
+  nothing on the wire and no error anywhere.
+
+  In one process it never showed: every vote arrives within a millisecond and
+  the first certificate forms before anything could time out. Deployed over
+  HTTP, one lost vote at genesis is a chain that sits at height one forever —
+  which is exactly what four validators did, and the tail showed the symptom
+  as an absence, zero messages sent, rather than as a failure."
+  [state now]
+  (let [pmst (:pm state)]
+    (if (zero? (:deadline pmst 0))
+      [(assoc-in state [:pm :deadline]
+                 (+ now (pm/timeout-for 0 (:params state))))
+       []]
+    (if (and (pos? (:deadline pmst)) (pm/expired? pmst now))
+      (let [[pm' nv] (pm/on-timeout pmst now (:failures pmst 0) (:params state))]
+        (let [w (:witness state)
+              v (:inga.nv/view nv)
+              hq (:inga.nv/high-qc nv)
+              sig (when-let [f (:sign-fn state)]
+                    (f (att/new-view-payload (:chain-id state) v w hq)))
+              msg (cond-> {:type :new-view :witness w :view v :high-qc hq}
+                    sig (assoc :sig sig))
+              [state' out] (handle-new-view (assoc state :pm pm') msg now)
+              ;; Ask for what we might be missing, because a view that timed
+              ;; out is the only evidence a lonely replica ever gets.
+              ;;
+              ;; A sync request used to leave on two paths only: a proposal
+              ;; whose parent we do not hold, and a new-view carrying a higher
+              ;; high-qc. Neither fires in a stall — nobody proposes, and the
+              ;; replica that is behind receives almost nothing precisely
+              ;; because it is behind. Measured in production: w4 three blocks
+              ;; back, 8 messages in against 1,527 out, and
+              ;; `last-sync-request: null` on all four replicas at once.
+              ;; **Falling behind isolates a replica, and being isolated is
+              ;; what keeps it behind.** Resetting it to genesis did not help;
+              ;; it still never asked.
+              ;;
+              ;; Asking costs one message and is answerable by anyone. A peer
+              ;; that is not ahead simply has nothing to send.
+              ;;
+              ;; Once per view, for the same reason the tip re-vote is: a
+              ;; condition that never clears turns any tick-driven sender into
+              ;; a flood, which is a mistake this file has already made once.
+              ;; Once per view AND at most once per `sync-ask-ms`.
+              ;;
+              ;; "Once per view" was the whole limit, and it stops being one
+              ;; when the view runs away from the height: a stalled chain times
+              ;; out continuously, so once-per-view becomes once-per-timeout.
+              ;; Measured on the deployed chain, stuck at height 40853 with
+              ;; view 43403 — two and a half thousand views ahead:
+              ;;
+              ;;   sync-response 8238   sync-request 4611
+              ;;   proposal      3324   vote           991
+              ;;
+              ;; Every timed-out view asked three peers, each answered with a
+              ;; segment, and the votes that would have certified the tip were
+              ;; one message in nine. **The recovery was eating the transport
+              ;; it needed.** A replica that has asked and not been helped
+              ;; should ask LESS often, not more.
+              high (get-in state' [:pm :high-qc])
+              target-request (certified-sync-request state' high)
+              from (sync-ask-from state')
+              ask (when-not (or (= (:view (:pm state')) (:last-sync-ask state))
+                                (< now (+ (:last-sync-ask-at state 0) sync-ask-ms)))
+                    [{:to :all
+                      :msg (or target-request
+                               {:type :sync-request
+                                :witness (:witness state')
+                                :from from
+                                :to (+ (height state') (:max-batch sync/default-params))})}])
+              state' (cond-> state'
+                       ask (assoc :last-sync-ask (:view (:pm state'))
+                                  :last-sync-ask-at now))]
+          [state' (into (into [{:to :all :msg msg}] (vec ask)) out)]))
+      ;; An uncertified tip is the one state a tick can fix and used not to.
+      ;;
+      ;; `vote-on-tip` was reachable only from `handle-sync-response`, and only
+      ;; when that response ADOPTED something. Once every replica sits on the
+      ;; same tip there is nothing left to adopt, so the one function written
+      ;; to rescue an uncertified tip stopped being called at exactly the
+      ;; moment it was needed — and `propose` cannot help, because proposing
+      ;; requires the certificate that is missing.
+      ;;
+      ;; Gated on the tip being uncertified rather than run every tick: when
+      ;; the chain is healthy this costs one map lookup, and re-broadcasting a
+      ;; vote five times a second would be noise on a transport that is
+      ;; already the bottleneck.
+      (let [t (tip state)
+            hf (:hash-fn state)
+            certified? (contains? (:qcs state) (hf t))
+            ;; ONCE per (height, view), not once per tick.
+            ;;
+            ;; Gating only on "the tip is uncertified" looked sufficient and is
+            ;; not: a replica that has fallen BEHIND holds a tip nobody else
+            ;; will ever vote for, so the condition never clears and it
+            ;; re-broadcasts forever. Measured on the deployed devnet within
+            ;; minutes of shipping the gate: w4, three blocks behind, had sent
+            ;; **1,348 votes** for its own tip while receiving 15 messages.
+            ;; The fix for a stall became a sender that drowns the transport it
+            ;; needs in order to stop being stalled.
+            ;;
+            ;; A view change is the only thing that makes re-casting useful
+            ;; again, so that is the clock it runs on.
+            stamp [(:inga.block/height t) (:view (:pm state))]
+            asked? (= stamp (:last-tip-vote state))]
+        (if (or certified? (zero? (:inga.block/height t)) asked?)
+          (propose state now)
+          (let [[state' out] (vote-on-tip (assoc state :last-tip-vote stamp) now)
+                [state'' out'] (propose state' now)]
+            [state'' (into (vec out) out')])))))))
+
+(defn start
+  "The first proposal.
+
+  Bootstrap is view 0's business and nobody else's. Keying it by view like
+  every other proposal looked consistent and was not: replicas time out at
+  different moments, so as their views drift each one in turn becomes the
+  leader of ITS view, proposes its own genesis child, and the votes split
+  across as many height-one blocks as there are replicas. The deployed chain
+  went from running at height a hundred to stuck at height one.
+
+  Genesis has no certificate to extend, so there is nothing for a later view
+  to build on and no reason for a later view to try. Genesis has no certificate, so the height-1 leader
+  cannot reach `propose`'s QC requirement — this is the one place a block is
+  proposed without one, and it is the same exception `three-chain-commits`
+  makes for genesis."
+  [state now]
+  (let [g (tip state)
+        h 1]
+    (if (my-turn? state h)
+      (let [b (c/make-block {:height h :parent-hash ((:hash-fn state) g)
+                             :proposals (:pending state)
+                             :proposer (:witness state)
+                             :ts (+ (:inga.block/ts g)
+                                    (:block-interval (:params state)))
+                             :justify (c/qc [(c/make-vote (:witness state)
+                                                          ((:hash-fn state) g) 0)]
+                                            1 0)})
+            [state' out] (adopt-own state b now)]
+        [(assoc state' :pending [] :last-proposed-at now)
+         (into [{:to :all :msg {:type :proposal :block b}}] out)])
+      [state []])))
+
+(defn- catch-up-view
+  "Come back at the view the chain says the network had reached.
+
+  `replay` restores the chain, the certificates and the voted heights, and
+  left the VIEW at whatever a fresh pacemaker starts with. A certificate
+  inside a block only says which view certified the block's PARENT, and
+  `pm/on-qc` does not move the view at all — so a replica came back behind the
+  round its own tip was proposed in.
+
+  Leadership rotates by round. Being behind it is not a small lag: the round
+  entitled to extend the tip is `(inc (round tip))`, one replica leads it, and
+  every other replica answers `not-my-round` and waits. If the one that leads
+  it is also the one that is behind, nobody proposes at all.
+
+  Measured on the deployed v2 after a restart, with `propose` finally saying
+  why it declined:
+
+    w1  not-my-round               height 6800  round 7530  leads w3  view 6703
+    w2  not-my-round               height 6800  round 7530  leads w3  view 6703
+    w3  no-certificate-for-the-tip height 6794  round 6795  leads w4  view 6703
+
+  Every replica agreed the next round was 7530 and that w3 led it; every
+  replica was eight hundred views short of it; and w3, the one that had to
+  propose, was six blocks behind. The chain sat there. `/reset` cleared it
+  because reset puts the rounds back to zero along with everything else —
+  which is why the recovery looked like magic and was really just the view and
+  the rounds agreeing again.
+
+  A block's round is evidence the same way a certificate is: the replica
+  adopted and voted for that block, so a quorum was at that view. Raising to
+  it is the same forward jump `pm/on-timeout-certificate` makes, from a
+  different piece of evidence."
+  [state]
+  (let [r (:inga.block/round (tip state))]
+    (cond-> state
+      (integer? r) (update :pm pm/enter-at-least (inc r)))))
+
+(defn replay
+  "Adopt blocks this replica already accepted, without re-verifying them.
+
+  A replica that keeps its state in memory and is restarted comes back at
+  genesis, and a leader that comes back at genesis proposes a FRESH block for
+  a height it already proposed. Every restart adds another incompatible
+  candidate, no two votes are for the same decision, and quorum can never
+  form. Four validators on Cloudflare did exactly that: three votes, three
+  block hashes, one height. In one process it cannot happen because nothing
+  restarts, which is why the harness ran to a hundred blocks while the
+  deployment could not pass one.
+
+  So a deployment persists what it adopted and replays it here. Not
+  re-verified, for the same reason `torihiki.state/apply-block` has a replay
+  mode and `inga.sync` takes its verifier as an option: re-checking is
+  re-litigating a decision this replica already made and recorded.
+
+  Three things are restored and each of them matters:
+
+  - the chain and the machine, by folding — that is what `extend-chain` does
+  - the certificates, so a leader can propose on the tip again instead of
+    sitting on a chain it cannot extend
+  - **the heights this replica has already voted at.** Without that, a
+    restart votes a second time at a height it already voted at, which is
+    equivocation — the one crime this system slashes for, committed by
+    accident, against itself."
+  [state blocks]
+  (catch-up-view
+   (reduce (fn [s b]
+            (let [s (-> s (remember-block b) (extend-chain b))
+                  j (:inga.block/justify b)]
+              (cond-> (update s :voted conj (:inga.block/height b))
+                j (-> (assoc-in [:qcs (:inga.qc/block-hash j)]
+                                (assoc j :inga.qc/origin :replay))
+                      (update :pm pm/on-qc j)))))
+          state
+          (sort-by :inga.block/height blocks))))
+
+(def ^:const resume-tail
+  "How many blocks a snapshot keeps.
+
+  The 3-chain rule needs three to derive a commit and `ancestor?` walks parent
+  links, so anything under four is a replica that cannot certify its own tip.
+  Eight is that with room, and the number is small on purpose: the reason
+  `resume` exists is that O(chain) is what took the deployment down."
+  8)
+
+(def ^:const snapshot-version 1)
+
+(defn snapshot
+  "The replica as plain data, bounded, for storage.
+
+  ## What it drops, and why that is safe
+
+  `replay` restores `:voted` by folding every block. A bounded snapshot cannot
+  — that is the whole point — so it leaves a height watermark instead:
+  `:voted-below` = the tip height. `voted?` answers true at every height at or
+  under it. The separate durable `:voted-view` is the signing fence.
+
+  `:votes`, `:new-views` and `:first-vote` are dropped outright. They are
+  per-view working state, and the one place `:votes` is load-bearing across a
+  restart — re-sending this replica's own vote when a proposal for an
+  already-voted height arrives again — degrades to sending nothing, which is
+  what a replica that has genuinely never seen the block would do anyway.
+  **Dropping `:first-vote` also drops the equivocation evidence this replica
+  had collected about others below the tail**, which is a real loss and is
+  stated rather than hidden: evidence already broadcast is held by peers, and
+  evidence not yet broadcast is gone.
+
+  The injected seams (`:hash-fn`, `:sign-fn`, `:verify-fn`, `:machine`) are
+  not here because they are functions. `resume` takes the same options map
+  `replica` does and puts them back.
+
+  `:machine-state` IS here. A replica that resumed with a fresh machine would
+  agree on the order and disagree on the result, which is the failure that is
+  hardest to see: every block certifies, every root differs."
+  [state]
+  (let [chain (vec (take-last resume-tail (:chain state)))
+        hf (:hash-fn state)
+        high-hash (get-in state [:pm :high-qc :inga.qc/block-hash])
+        ;; A certified rival can be at the SAME height as our uncertified
+        ;; tip. Dropping it from :by-hash on restart leaves a valid high QC
+        ;; pointing to bytes that no witness can serve. Keep its uncommitted
+        ;; ancestry as well as the chosen chain's bounded tail.
+        rival-ancestry (loop [hash high-hash kept #{} steps 0]
+                         (let [b (get (:by-hash state) hash)]
+                           (if (or (nil? b) (not= hash (hf b))
+                                   (<= (:inga.block/height b) (committed-height state))
+                                   (>= steps resume-tail))
+                             kept
+                             (recur (:inga.block/parent-hash b)
+                                    (conj kept hash) (inc steps)))))
+        kept (into rival-ancestry (map hf) chain)]
+    {:inga.snapshot/version snapshot-version
+     :witness (:witness state)
+     :chain chain
+     :by-hash (select-keys (:by-hash state) kept)
+     ;; Only certificates naming retained blocks. The high QC itself is also
+     ;; restored from :pm by resume, including when its block is still being
+     ;; requested from another witness.
+     :qcs (into {} (filter (fn [[bh _]] (contains? kept bh)) (:qcs state)))
+     :pm (:pm state)
+     :voted-below (:inga.block/height (peek chain))
+     ;; The view watermark. Without it a resumed replica starts at -1 and may
+     ;; vote a second time in a view it has already voted in.
+     :voted-view (:voted-view state -1)
+     :committed (vec (take-last 1 (:committed state)))
+     :machine-state (:machine-state state)
+     :equivocations (vec (:equivocations state))
+     :pending (vec (:pending state))
+     :last-proposed-at (:last-proposed-at state)}))
+
+(defn resume
+  "Rebuild a replica from `opts` (what `replica` takes) and a `snapshot`.
+
+  The inverse of `snapshot`, and deliberately NOT the inverse of `replay`:
+  replay folds a history and this adopts a conclusion. A caller with the whole
+  log and time to spend should still use `replay` — it reconstructs strictly
+  more. `resume` is for the caller that does not have the time, which on a
+  Durable Object is every caller past a few hundred blocks."
+  [opts snapshot]
+  (let [base (replica opts)
+        v (:inga.snapshot/version snapshot)
+        high (get-in snapshot [:pm :high-qc])
+        verify (:verify-fn base)]
+    (when-not (= v snapshot-version)
+      (throw (ex-info "inga.replica: unknown snapshot version"
+                      {:found v :expected snapshot-version})))
+    (when (and high verify
+               (not (zero? (:inga.qc/height high -1)))
+               (some? (att/verify-certificate high (:chain-id base)
+                                              (:quorum base) verify
+                                              (wire/admits (:witnesses base)))))
+      (throw (ex-info "inga.replica: invalid snapshot high QC" {})))
+    (merge base
+           {:chain (vec (:chain snapshot))
+            :by-hash (:by-hash snapshot)
+            :qcs (cond-> (:qcs snapshot)
+                   high (update (:inga.qc/block-hash high) pm/higher-qc high))
+            :pm (:pm snapshot)
+            :voted #{}
+            :voted-below (:voted-below snapshot)
+            ;; -1 only for a snapshot written before this field existed. Such
+            ;; a replica has to re-earn its watermark by voting, which is the
+            ;; same position a fresh one is in.
+            :voted-view (:voted-view snapshot -1)
+            :committed (vec (:committed snapshot))
+            :machine-state (:machine-state snapshot)
+            :equivocations (vec (:equivocations snapshot))
+            :pending (vec (:pending snapshot))
+            :last-proposed-at (:last-proposed-at snapshot)})))
+
+(defn submit
+  "Queue a proposal (a TransferBody CID) for the next block this replica
+  leads. Bounded, because an unbounded mempool is a memory attack that needs
+  no invalid data."
+  ([state cid] (submit state cid 4096))
+  ([state cid cap]
+   (if (>= (count (:pending state)) cap)
+     state
+     (update state :pending conj cid))))
+
+(defn equivocators
+  "Every witness this replica holds a proof against.
+
+  The proofs are self-contained — `inga.stake/verify-equivocation-evidence`
+  re-checks the pair rather than trusting that detection ran — so this can be
+  handed to somebody who did not see the votes arrive."
+  [state]
+  (into (sorted-set) (map :inga.evidence/witness (:equivocations state))))
+
+(defn verified-equivocations
+  "The proofs that hold up under `verify-sig-fn`. Kept separate from
+  `:equivocations` so a caller slashes on what it re-verified, not on what
+  this replica happened to record."
+  [state verify-sig-fn]
+  (vec (filter #(stake/verify-equivocation-evidence % verify-sig-fn)
+               (:equivocations state))))
+
+(defn tip-certificate
+  "The certificate this replica holds for its own tip, if any, with the origin
+  tag that says which path produced it."
+  [state]
+  (let [h ((:hash-fn state) (tip state))]
+    (when-let [q (get (:qcs state) h)]
+      {:origin (:inga.qc/origin q)
+       :view (:inga.qc/view q)
+       :witnesses (count (:inga.qc/witnesses q #{}))
+       :sigs (count (:inga.qc/sigs q))
+       :views (:inga.qc/views q)})))
+
+(defn state-root
+  "What this replica has actually agreed to, or nil when it runs no machine.
+
+  nil rather than a constant: a replica that orders blocks and executes
+  nothing has no state to root, and returning a plausible-looking zero would
+  make every such replica agree with every other for the wrong reason."
+  [state]
+  (when-let [f (:root-fn (:machine state))]
+    (f (:machine-state state))))
+
+(defn committed-height [state]
+  (if-let [b (peek (:committed state))] (:inga.block/height b) -1))

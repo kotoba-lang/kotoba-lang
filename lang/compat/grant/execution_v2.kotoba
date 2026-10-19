@@ -1,0 +1,110 @@
+(ns grant.execution-v2
+  "Pure, target-independent lease issuance after a basis-bound permit. Hosts
+  authenticate this result and own durable consumption/revocation enforcement."
+  {:kotoba/export [instant-ms issue-invocation verify-invocation issue-leases decide-and-issue]}
+  (:require [kotoba.core.execution :as execution]
+            [kotoba.artifact.execution :as blocks]
+            [grant.execution-decision :as decision]))
+
+(defn- reject! [reason]
+  (throw (ex-info "v2 lease issuance denied" {:phase :execution-lease :reason reason})))
+
+(defn instant-ms [text]
+  (when (and (string? text)
+             (re-matches #"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z" text))
+    (try
+      
+      (catch  _ nil))))
+
+(defn issue-invocation
+  "Authority-selected fresh 256-bit entropy, not a guest nonce or credential.
+  The authority persists this immutable block and binds its CID in the signed
+  intent. Reauthorization reuses the intent; a new execution gets a new nonce."
+  [nonce]
+  (when-not (and (string? nonce) (re-matches #"[0-9a-f]{64}" nonce))
+    (reject! :invalid-invocation-entropy))
+  (blocks/block :authority {:format :kotoba.execution-invocation/v2 :nonce nonce}))
+
+(defn verify-invocation [record]
+  (let [value (blocks/verify-block :authority record)]
+    (when-not (and (= #{:format :nonce} (set (keys value)))
+                   (= :kotoba.execution-invocation/v2 (:format value))
+                   (= (:cid record) (:cid (issue-invocation (:nonce value)))))
+      (reject! :invalid-invocation))
+    value))
+
+(def ^:private request-keys
+  #{:capability-cid :resource-cid :purpose :expires-at :uses :transfer :delegation-depth})
+(def ^:private permission-keys
+  #{:grant-cid :resource-cid :purpose :expires-at :max-uses :transfer :max-delegation-depth})
+
+(defn issue-leases
+  "PERMISSIONS is authority-owned policy data, never a guest-supplied ceiling.
+  REQUESTED may only narrow it. The caller signs the returned blocks for an
+  exact audience/epoch/window; a descriptor alone never authorizes effects."
+  [{:keys [intent invocation plan decision permissions requested now-iso] :as input}]
+  (when-not (and (= #{:intent :invocation :plan :decision :permissions :requested :now-iso}
+                    (set (keys input)))
+                 (execution/valid-plan? plan)
+                 (execution/valid-policy-decision? decision)
+                 (map? permissions) (vector? requested) (<= (count requested) 256))
+    (reject! :invalid-input))
+  (let [identity (blocks/verify-block :intent intent)
+        _ (verify-invocation invocation)
+        now (instant-ms now-iso) issued (instant-ms (:issued-at decision))
+        expires (instant-ms (:expires-at decision))]
+    (when-not (and (= (:invocation-cid identity) (:cid invocation))
+                   (= :permit (:result decision))
+                   (= (:plan-cid identity) (:plan-cid plan) (:plan-cid decision))
+                   (= (:artifact-cid identity) (:artifact-cid plan))
+                   (= (:code-closure-cid identity) (:code-closure-cid plan))
+                   (= (:compiler-contract identity) (:compiler-contract plan))
+                   (= (:input-cid identity) (:input-cid plan))
+                   (= (:policy-cid identity) (:policy-cid decision))
+                   (= (:policy-decision-cid identity) (:decision-cid decision))
+                   (= (:db-basis identity) (:db-basis decision))
+                   now issued expires (<= issued now) (< now expires)
+                   (= (count requested)
+                      (count (distinct (map (juxt :capability-cid :resource-cid :purpose) requested)))))
+      (reject! :decision-or-intent-mismatch))
+    (mapv
+     (fn [request]
+       (let [cap (:capability-cid request) ceiling (get permissions cap)
+             requested-expiry (instant-ms (:expires-at request))
+             ceiling-expiry (instant-ms (:expires-at ceiling))
+             lease (merge request {:format :kotoba.capability-lease/v2
+                                   :execution-identity-cid (:cid intent)
+                                   :artifact-cid (:artifact-cid identity)
+                                   :profile-binding-cid (:profile-binding-cid identity)})]
+         (when-not (and (= request-keys (set (keys request)))
+                        (map? ceiling) (= permission-keys (set (keys ceiling)))
+                        (execution/valid-capability-lease? lease)
+                        (execution/cid? (:grant-cid ceiling))
+                        (some #{(:grant-cid ceiling)} (:grant-cids identity))
+                        (= (:resource-cid request) (:resource-cid ceiling))
+                        (= (:purpose request) (:purpose ceiling))
+                        (contains? (:requested-effects plan) (:purpose request))
+                        (contains? (:requested-resources plan) (:resource-cid request))
+                        requested-expiry ceiling-expiry
+                        (< now requested-expiry) (<= requested-expiry ceiling-expiry expires)
+                        (pos-int? (:max-uses ceiling))
+                        (<= (:uses request) (:max-uses ceiling))
+                        (= (:transfer request) (:transfer ceiling))
+                        (nat-int? (:max-delegation-depth ceiling))
+                        (<= (:delegation-depth request) (:max-delegation-depth ceiling)))
+           (reject! :scope-or-budget-widening))
+         (blocks/lease-block intent lease)))
+     requested)))
+
+(defn decide-and-issue
+  "Trusted authority entry point: derive the decision through the existing
+  deny-by-default broker. Guests cannot supply :permit or permission ceilings.
+  Immutable plan/policy/basis selection and ceiling resolution belong to the
+  authority's fact store. Returned blocks still require audience-bound signing."
+  [{:keys [decision-input intent invocation permissions requested now-iso] :as input}]
+  (when-not (= #{:decision-input :intent :invocation :permissions :requested :now-iso} (set (keys input)))
+    (reject! :invalid-authority-input))
+  (let [decision (decision/decide-plan! decision-input)
+        leases (issue-leases {:intent intent :invocation invocation :plan (:plan decision-input) :decision decision
+                              :permissions permissions :requested requested :now-iso now-iso})]
+    {:decision decision :intent intent :leases leases}))

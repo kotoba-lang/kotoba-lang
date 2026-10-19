@@ -1,0 +1,663 @@
+(ns kotoba.kir.definition-identity
+  "Canonical identity for typed Kotoba definitions (CI1).
+
+  This is deliberately not a source, package, or Wasm hash.  It identifies a
+  closed checked definition's canonical typed KIR and direct definition
+  identity closure.  Authority is still supplied exclusively by package policy
+  and the capability runtime.
+
+  ## Scope: every checked definition, effectful or not
+
+  The scope is `:closed-deterministic-checked-definition`
+  (`lang/code-identity.edn`, owner decision 2026-09-02).  An effectful
+  definition is in scope: its effect row is one of the sealed inputs, so a
+  definition requiring `#{:host/http}` has an identity, and it is a different
+  identity from the same KIR with an empty row.  The frozen vectors
+  `:effect-row-http` and `:effect-row-two` in `lang/code-identity-vectors.edn`
+  have said so since payload version 2; only the prose said \"pure\".  A CID is
+  still never authority — `lang/typed-eval.edn` requires a receipt to
+  *evaluate* an effectful definition by CID, and that receipt is the
+  capability runtime's, not this namespace's.
+
+  ## Effect-row vocabulary: named operations as keywords (bridged 2026-09-02)
+
+  `effect-row-problem` admits a set of keywords and nothing else.  The
+  compiler's `infer-effects` (kotoba-sema `frontend.cljc`, `direct-facts` /
+  `normalize-effect-ceiling`) produces rows whose members are the wire form
+  `[:cap/call <id>]` — vectors, not keywords — so a row taken straight from
+  the compiler is refused here with \"definition effect row members must be
+  keywords\" and gets no CID.  That refusal is deliberate and stays: the
+  sealed row carries the SEMANTIC vocabulary — the named operations
+  (`:state/transact`, `:clock/now`, `:host/http`) — because the numeric id is
+  wire ABI, not source vocabulary (`lang/code-identity.edn` `:ability
+  :source-model`: \"numeric IDs and portable envelopes are elaboration
+  targets\"; `lang/capability-catalog.edn`: `:numeric-id :not-user-facing`).
+  A catalog renumbering must not move a definition's identity, and a
+  definition's identity must not depend on which wire ABI a backend speaks.
+
+  Control effects are the exception, and they are the exception because there
+  is nothing to translate.  `:abort` (the typed abort ability, kotoba-lang
+  `lang/abort-ability.edn`) has no capability and no wire id: the compiler
+  emits the bare keyword, which is already the sealed vocabulary, so the
+  bridge passes it through unchanged.  It must reach the sealed row — a
+  function that can abort has interface `[:result T E]` where one that cannot
+  has `T`, and two definitions that differ in that must not share an identity.
+  The set of such keywords is closed (`control-effects`); any other keyword is
+  still refused as not a wire capability call.
+
+  The bridge is `effect-row-from-hir`: it takes what the compiler reports —
+  `{:effects #{[:cap/call 8] :abort ...} :named-operations #{:state/transact ...}}` —
+  and the catalog's `id->name` (kotoba-sema owns the catalog and depends on
+  this repository, so the mapping is an argument, never a lookup made here),
+  and returns the keyword row.  A wire id the catalog cannot name is refused
+  with the exact message \"effect row wire id has no catalog name: [:cap/call
+  N]\" — never guessed, never carried through as a vector.  The encoding of
+  keyword rows is untouched: every frozen vector in
+  `lang/code-identity-vectors.edn` hashes to the same bytes it did before the
+  bridge, which the test suite asserts vector by vector.
+
+  ## What the identity seals
+
+  `lang/code-identity.edn` names the canonical input:
+
+      [:typed-kir :profile-version :desugar-contract-version
+       :effect-row :interface :direct-definition-dependencies]
+
+  All six participate.  Two of them are the reason this namespace exists at
+  version 2:
+
+  - **`:definition/effect-row`** is the authority the definition requires.  A
+    payload that omits it gives two definitions with *different* effect rows
+    the same identity, so a lock pinning the pure one would admit the
+    effectful one.  The effect row is part of the semantic contract, not
+    metadata about it.
+  - **`:definition/desugar-contract-version`** is sealed because the ADR
+    requires that \"a definition CID must never claim semantic equivalence
+    across profile, type-rule, or canonical-KIR-version changes\".  Desugaring
+    is what produces the KIR being hashed; if its contract moves, identical
+    KIR no longer means identical meaning.
+
+  ## Why the bytes are real DAG-CBOR
+
+  Version 1 hashed `(pr-str canonical-edn)` and labelled the CID `dag-cbor`.
+  Both halves were wrong.  The block did not decode as dag-cbor, and `pr-str`
+  is not byte-identical across Clojure and ClojureScript, so the same
+  definition could hash differently per implementation — which CI1's admission
+  rule (\"byte-for-byte deterministic identity\") and CI6's cross-implementation
+  conformance both forbid.
+
+  Version 2 normalizes to a closed, injective, tagged form and encodes it with
+  a deterministic CBOR encoder.  Every value carries its type tag, so a
+  keyword can never collide with the string of the same name.  Numbers are
+  carried as exact decimal/hex *text* rather than CBOR integers because a
+  64-bit KIR literal exceeds the JavaScript exact-integer range: text keeps
+  `:clj` and `:cljs` on the same bytes.
+
+  Identity payloads are versioned, and version 2 CIDs are deliberately not
+  version 1 CIDs."
+  {:kotoba/export [admit-build canonical-bytes canonical-hex check-case cid? control-effects definition-cid definition-error definition-required effect-row-from-hir f64 i64 identity-payload normalize payload-version verify-locked-definitions]}
+  (:require [kotoba.lang.text :as str]
+            [cbor.core :as cbor]
+            [multiformats.core :as mf]))
+
+(def payload-version
+  "Bumped whenever the sealed inputs or the canonical encoding change. Old
+  identities are not claimed to be equal to new ones — that is the point."
+  2)
+
+(def definition-required
+  [:definition/profile-version
+   :definition/desugar-contract-version
+   :definition/kir
+   :definition/effect-row
+   :definition/interface
+   :definition/dependencies])
+
+(defn cid?
+  "True for a structurally decodable CIDv1.  Definition identity always uses
+  CIDv1, so older opaque identifiers cannot enter its closure."
+  [x]
+  (and (string? x)
+       (not (str/blank? x))
+       (str/starts-with? x "b")
+       (try
+         (let [bs (mf/cid->bytes x)]
+           ;; CIDv1's first varint is encoded as the one byte 0x01.
+           (= 1 (bit-and (nth bs 0) 0xff)))
+         (catch  _ false))))
+
+;; ---------------------------------------------------------------------------
+;; canonical normalization — a closed, injective, tagged value domain
+;; ---------------------------------------------------------------------------
+
+(def ^:private hex-digits "0123456789abcdef")
+
+(defn- byte->hex [b]
+  (let [v (bit-and b 0xff)]
+    (str (nth hex-digits (bit-shift-right v 4))
+         (nth hex-digits (bit-and v 0x0f)))))
+
+(defn- bytes->hex [bs]
+  (apply str (map byte->hex (seq bs))))
+
+(defn- f64-bits-hex
+  "IEEE-754 bits of a double as 16 lowercase hex characters. Hex text rather
+  than a CBOR integer: the bit pattern routinely exceeds JavaScript's exact
+  integer range, and an inexact identity is not an identity."
+  [d]
+  )
+
+(defn- stable-name [x]
+  (if-let [n (namespace x)] (str n "/" (name x)) (name x)))
+
+(defn- byte-array? [x]
+  )
+
+(def ^:private max-exact-integer
+  "2^53 - 1: the largest integer a ClojureScript number represents exactly."
+  9007199254740991)
+
+;; These keys are part of payload-v2's admitted source representation. They
+;; deliberately retain the namespace of the pre-extraction authority: changing
+;; them to auto-resolved ::f64/::i64 under this namespace would reinterpret old
+;; frozen definitions as ordinary maps and therefore move their DefCIDs.
+(def ^:private f64-wrapper-key :kotoba.lang.code-identity/f64)
+(def ^:private i64-wrapper-key :kotoba.lang.code-identity/i64)
+
+(defn f64
+  "The admitted representation of an f64 literal inside typed KIR: a map
+  carrying the exact IEEE-754 bits as 16 hex characters. Use this rather than
+  a platform float — see `normalize`."
+  [d]
+  {f64-wrapper-key (f64-bits-hex d)})
+
+(defn i64
+  "The admitted representation of an i64 literal outside ±(2^53-1): a map
+  carrying the exact value as decimal text.
+
+  A plain integer literal is fine inside that range and hashes identically on
+  both implementations. Beyond it, a ClojureScript reader silently rounds —
+  9007199254740993 is read back as 9007199254740992 — so the value is already
+  wrong before any encoder sees it. Encoding integers as text does not help if
+  the text was produced from a corrupted number, so the large case must be
+  carried explicitly instead.
+
+  `(i64 5)` and `5` denote the same value and therefore share one identity."
+  [n]
+  {i64-wrapper-key (str n)})
+
+(defn- f64-literal? [x]
+  (and (map? x)
+       (= 1 (count x))
+       (string? (get x f64-wrapper-key))
+       (= 16 (count (get x f64-wrapper-key)))
+       (every? (fn [c] (str/includes? "0123456789abcdefABCDEF" (str c)))
+               (get x f64-wrapper-key))))
+
+(defn- i64-literal? [x]
+  (and (map? x)
+       (= 1 (count x))
+       (string? (get x i64-wrapper-key))
+       (re-matches #"-?(0|[1-9][0-9]*)" (get x i64-wrapper-key))))
+
+(declare normalize)
+
+(defn- normalize-members [coll]
+  (mapv normalize coll))
+
+;; A total order over the normalized domain, so sets and map keys have one
+;; canonical sequence on every implementation. Deliberately not `compare` over
+;; the source values: Clojure cannot compare a keyword with a string, and
+;; `pr-str` ordering differs by platform.
+(defn- rank [x]
+  (cond (nil? x) 0 (boolean? x) 1 (string? x) 2 (vector? x) 3 :else 4))
+
+(defn- cmp [a b]
+  (let [ra (rank a) rb (rank b)]
+    (if (not= ra rb)
+      (compare ra rb)
+      (cond
+        (nil? a) 0
+        (boolean? a) (compare a b)
+        (string? a) (compare a b)
+        (vector? a) (let [n (min (count a) (count b))]
+                      (loop [i 0]
+                        (if (= i n)
+                          (compare (count a) (count b))
+                          (let [c (cmp (nth a i) (nth b i))]
+                            (if (zero? c) (recur (inc i)) c)))))
+        :else 0))))
+
+(defn normalize
+  "EDN value -> closed tagged form. Every branch is explicit and anything
+  outside the admitted domain throws rather than being coerced: an identity
+  function that silently accepts an unknown type is an identity function that
+  can be made to collide."
+  [value]
+  (cond
+    (nil? value)       ["nil"]
+    (boolean? value)   ["bool" value]
+
+    ;; Exact-range integers hash identically on both implementations. Beyond
+    ;; ±(2^53-1) a ClojureScript reader has already rounded the literal, so the
+    ;; explicit `i64` form is the only representation that can be trusted --
+    ;; refusing here is what makes that failure loud instead of silent.
+    (integer? value)
+    (if (<= (- max-exact-integer) value max-exact-integer)
+      ["int" (str value)]
+      (throw (ex-info "integer outside the exactly-representable range; carry it as (kotoba.kir.definition-identity/i64 n)"
+                      {:problem :definition/inexact-integer})))
+
+    (string? value)    ["str" value]
+    (keyword? value)   ["kw" (stable-name value)]
+    (symbol? value)    ["sym" (stable-name value)]
+    (byte-array? value) ["bytes" (bytes->hex value)]
+
+    ;; An f64 literal is carried as its exact IEEE-754 bits, never as a
+    ;; platform float. JavaScript has a single number type, so `2.0` is
+    ;; `integer?` there and a `double` here: hashing raw platform floats would
+    ;; make the same KIR encode differently per implementation. The explicit
+    ;; form is the only admitted representation, and `f64-bits-hex` exists so
+    ;; a frontend can produce it.
+    (f64-literal? value) ["f64" (str/lower (get value f64-wrapper-key))]
+
+    ;; Same tag as a plain integer: `(i64 5)` and `5` denote one value, so they
+    ;; must share one identity. The wrapper is about how the value survives a
+    ;; reader, not about what it means.
+    (i64-literal? value) ["int" (get value i64-wrapper-key)]
+
+    (number? value)
+    (throw (ex-info "raw platform float is outside the canonical identity domain; carry f64 as {:kotoba.kir.definition-identity/f64 \"<16 hex>\"}"
+                    {:problem :definition/unencodable-float}))
+
+    (map? value)
+    ["map" (vec (sort-by first cmp
+                         (mapv (fn [[k v]] [(normalize k) (normalize v)]) value)))]
+
+    (set? value)
+    ["set" (vec (sort cmp (normalize-members value)))]
+
+    (vector? value) ["vec" (normalize-members value)]
+    (or (list? value) (seq? value)) ["list" (normalize-members value)]
+
+    :else
+    (throw (ex-info "value outside the canonical identity domain"
+                    {:problem :definition/uncanonical-value
+                     :type (str (type value))}))))
+
+;; ---------------------------------------------------------------------------
+;; effect-row bridge: compiler wire row -> sealed named-operation row
+;; ---------------------------------------------------------------------------
+
+(defn- wire-id
+  "A capability wire id as a host integer, or nil when X is not one.
+
+  Under nbb the compiler carries ids as JavaScript BigInt (typed Wasm metadata
+  indices must survive ULEB encoding past the safe-integer range), and a
+  BigInt is not `=` to the plain number the catalog keys on, so a lookup
+  without this normalisation silently finds nothing -- the shape of failure
+  where a check that could not measure returns what a passing check returns."
+  [x]
+  )
+
+(defn- wire-call? [member]
+  (and (vector? member)
+       (= 2 (count member))
+       (= :cap/call (first member))
+       (some? (wire-id (second member)))))
+
+(def control-effects
+  "The CLOSED set of effect-row members the compiler emits as keywords rather
+  than as `[:cap/call <id>]`: control effects, which have no capability and no
+  wire id to name them by.
+
+  `:abort` is the typed abort ability (kotoba-lang `lang/abort-ability.edn`).
+  A function that can leave its caller by aborting carries it; one that cannot
+  does not.  That difference is semantic -- the two have different interfaces,
+  `[:result T E]` against `T` -- so it must reach the sealed row, or two
+  definitions that differ in whether they can abort would share one identity.
+
+  These pass through the bridge UNCHANGED: they are already the sealed
+  vocabulary.  There is nothing to translate, because there is no numeric ABI
+  behind them to translate from -- which is exactly why they are listed here
+  rather than looked up in the catalog.  The set is closed on purpose: a
+  keyword the compiler did not mean as a control effect is still refused with
+  `effect row member is not a wire capability call`, so widening it is a
+  contract change and not something a stray keyword can do by arriving.
+
+  PUBLIC SO IT CAN BE COMPARED, NOT SO IT CAN BE IMPORTED (ADR-0266).  amu's
+  `kotoba.compiler.definition-identity-test/the-sealed-control-effect-vocabulary-agrees-across-the-pin`
+  derives its OWN expectation and asserts equality with this set across its
+  `deps.edn` pin.  A consumer that imported this instead would agree by
+  construction and prove nothing.  The comparison exists because the absence
+  of one cost a day: on 2026-09-02 this commit and amu ADR-0300 section 4
+  decided the same question in opposite directions, and amu's pin sat one
+  commit short of here until kotoba-lang adjudicated
+  (`docs/adr/ADR-abort-reaches-the-sealed-effect-row.md`, in this repository's
+  favour).
+
+  `:state` is the pure ability state (kotoba-lang `lang/state-ability.edn`,
+  slice 1): a function that performs get/put, answered by a handler written
+  in the language and lowered by the frontend to state passing, carries it.
+  It is a TYPE, not an authority -- there is no host behind it -- and it must
+  reach the sealed row for the same reason `:abort` must: a specialization
+  that performs state and one that does not have different interfaces (the
+  state pair against a plain value), so they must not share an identity."
+  #{:abort :state})
+
+(defn- bridgeable-member? [member]
+  (or (wire-call? member) (contains? control-effects member)))
+
+(defn- refuse-bridge! [message data]
+  (throw (ex-info message (assoc data :problem :definition/effect-row-unbridged))))
+
+(defn effect-row-from-hir
+  "The compiler's inferred effect row, translated to the vocabulary the
+  definition identity seals: named operations as keywords.
+
+  HIR is anything carrying the compiler's report -- a checked module or one of
+  its functions -- and only two of its keys are read:
+
+    :effects           #{[:cap/call 8] :abort} the wire row `infer-effects` emits,
+                                              control effects included
+    :named-operations  #{:state/transact ...} what ability elaboration recorded
+                                              (optional; provenance, see below)
+
+  OPTS must carry `:id->name`, the catalog's wire id -> operation keyword
+  (`kotoba.sema/capability-id->name`).  kotoba-sema owns that catalog and
+  depends on this repository, so it is an argument here and never a lookup.
+
+  Returns the keyword row, ready to be `:definition/effect-row`.  Every
+  member of the returned set satisfies `effect-row-problem`, so the sealed
+  bytes for a bridged row are exactly the bytes a caller who resolved the
+  names by hand would have produced -- the bridge adds no encoding.
+
+  Fail-closed, with the reason in the message and `:problem
+  :definition/effect-row-unbridged` in the ex-data:
+
+  - a member that is neither `[:cap/call <integer>]` nor a member of the
+    closed `control-effects` set is refused: the compiler never produces
+    anything else, so anything else is not a compiler row;
+  - a member of `control-effects` (today `:abort`) passes through unchanged:
+    it carries no wire id, so there is no catalog lookup to make and nothing
+    a lookup could get wrong;
+  - a wire id the catalog does not name is refused with
+    \"effect row wire id has no catalog name: [:cap/call N]\" -- the only
+    way to reach such an id is a literal `(cap-call N x)` in source, and a
+    name invented for it would be a lie sealed into an identity;
+  - a catalog that maps two wire ids to one keyword is refused: the
+    translation would seal two different wire rows as one identity;
+  - a `:named-operations` member the catalog does not know is refused (the
+    same closed world the compiler applies to a `cap-call` keyword).  A named
+    operation absent from `:effects` is not an error -- a per-function row is
+    a subset of the module row that `:named-operations` was recorded against,
+    and the translation never depends on `:named-operations`: it is
+    provenance the catalog must be able to account for, not a second source
+    of names."
+  [hir {:keys [id->name] :as opts}]
+  (when-not (map? hir)
+    (refuse-bridge! "effect row bridge requires the compiler's HIR map" {:hir hir}))
+  (when-not (map? id->name)
+    (refuse-bridge! "effect row bridge requires :id->name (the catalog's wire id -> operation keyword)"
+                    {:opts (dissoc opts :id->name)}))
+  (let [row (:effects hir)
+        named (:named-operations hir)
+        catalog (into {} (keep (fn [[id kw]]
+                                 (when-let [n (wire-id id)] [n kw])))
+                      id->name)
+        known-names (set (vals catalog))]
+    (when-not (set? row)
+      (refuse-bridge! "effect row bridge requires :effects to be a set" {:effects row}))
+    (when-not (every? keyword? (vals catalog))
+      (refuse-bridge! ":id->name must map wire ids to keywords" {:id->name id->name}))
+    (when-not (= (count catalog) (count known-names))
+      (refuse-bridge! "catalog maps two wire ids to one operation name; the sealed row would conflate them"
+                      {:duplicates (into {} (filter (fn [[_ n]] (> n 1)))
+                                         (frequencies (vals catalog)))}))
+    (when-not (every? bridgeable-member? row)
+      (refuse-bridge! (str "effect row member is not a wire capability call: "
+                           (pr-str (first (remove bridgeable-member? row))))
+                      {:member (first (remove bridgeable-member? row)) :effects row}))
+    (when (and (some? named) (not (and (set? named) (every? keyword? named))))
+      (refuse-bridge! ":named-operations must be a set of keywords" {:named-operations named}))
+    (let [translated
+          (into #{}
+                (map (fn [member]
+                       (if (contains? control-effects member)
+                         ;; Already the sealed vocabulary; see `control-effects`.
+                         member
+                         (let [id (wire-id (second member))]
+                           (or (get catalog id)
+                               (refuse-bridge!
+                                (str "effect row wire id has no catalog name: [:cap/call " id "]")
+                                {:wire-id id :effects row}))))))
+                row)]
+      (doseq [op (or named #{})]
+        (when-not (contains? known-names op)
+          (refuse-bridge! (str "named operation has no catalog id: " (pr-str op))
+                          {:named-operation op})))
+      translated)))
+
+;; ---------------------------------------------------------------------------
+;; definition shape
+;; ---------------------------------------------------------------------------
+
+;; Keyword members only. The compiler's inferred rows carry `[:cap/call id]`
+;; vectors (see the namespace docstring, "Effect-row vocabulary"); they are
+;; refused here on purpose -- the sealed vocabulary is the named operation,
+;; and `effect-row-from-hir` is the one route from a wire row to it.
+;; Widening this predicate is a contract change, not a bug fix.
+(defn- effect-row-problem [row]
+  (cond
+    (not (set? row))
+    {:valid? false :message "definition effect row must be a set"}
+    (not (every? keyword? row))
+    {:valid? false :message "definition effect row members must be keywords"}))
+
+(defn definition-error
+  "Checks the closed checked-definition shape before identity is calculated.
+  Effectful definitions are in scope; their `:definition/effect-row` must be a
+  set of keywords (an empty set for a pure definition).
+  `:definition/name` is deliberately ignored: it is an author-facing alias,
+  never semantic identity."
+  [definition]
+  (or
+   (when-not (map? definition)
+     {:valid? false :message "definition map required"})
+   (some (fn [k]
+           (when-not (contains? definition k)
+             {:valid? false :message "definition missing required field" :data {:missing k}}))
+         definition-required)
+   (when-not (pos-int? (:definition/profile-version definition))
+     {:valid? false :message "definition profile version must be positive integer"})
+   (when-not (pos-int? (:definition/desugar-contract-version definition))
+     {:valid? false :message "definition desugar contract version must be positive integer"})
+   ;; `map?` alone let ANY map through, which is not a small looseness: the
+   ;; identity's whole claim is that it addresses typed KIR, and a caller that
+   ;; handed it something else — a compiler function record, an interface map,
+   ;; a bag of metadata — got a CID back that looks canonical and seals a shape
+   ;; no other implementation produces. Measured 2026-08-10: passing a
+   ;; compiler function map was accepted here, and the compiler's KIR keeps
+   ;; bodies as source forms rather than IR nodes, so that was the likely
+   ;; mistake rather than a hypothetical one.
+   ;;
+   ;; An IR node is a map with an `:op`. Every frozen vector and every
+   ;; conformance fixture already satisfies this; nothing that was admitted
+   ;; before is rejected now, and nothing that was rejected is admitted. The
+   ;; encoding is untouched, so no existing CID moves.
+   (when-not (map? (:definition/kir definition))
+     {:valid? false :message "definition typed KIR map required"})
+   (when-not (contains? (:definition/kir definition) :op)
+     {:valid? false
+      :message "definition typed KIR must be an IR node with :op, not an arbitrary map"})
+   (effect-row-problem (:definition/effect-row definition))
+   (when-not (map? (:definition/interface definition))
+     {:valid? false :message "definition interface map required"})
+   (when-not (vector? (:definition/dependencies definition))
+     {:valid? false :message "definition dependencies vector required"})
+   (when-not (every? cid? (:definition/dependencies definition))
+     {:valid? false :message "definition dependency CID required"})
+   (when-not (= (count (:definition/dependencies definition))
+                (count (set (:definition/dependencies definition))))
+     {:valid? false :message "definition dependencies must be unique"})))
+
+(defn identity-payload
+  "The exact, versioned payload addressed by `definition-cid`, as ordinary EDN.
+  Diagnostic: `canonical-bytes` is what is actually hashed."
+  [definition]
+  {:kotoba.definition-identity/version payload-version
+   :profile-version (:definition/profile-version definition)
+   :desugar-contract-version (:definition/desugar-contract-version definition)
+   :typed-kir (:definition/kir definition)
+   :effect-row (:definition/effect-row definition)
+   :interface (:definition/interface definition)
+   ;; Dependency order is not semantic; canonical sort also makes separately
+   ;; compiled frontends converge on an identical closure.
+   :dependencies (vec (sort (:definition/dependencies definition)))})
+
+(defn canonical-bytes
+  "The canonical DAG-CBOR block for DEFINITION. These bytes — not any printed
+  representation of them — are the thing the CID addresses."
+  [definition]
+  (if-let [error (definition-error definition)]
+    (throw (ex-info (:message error) error))
+    (cbor/encode (normalize (identity-payload definition)))))
+
+(defn canonical-hex
+  "Hex of `canonical-bytes`, for fixtures and cross-implementation diffing."
+  [definition]
+  (bytes->hex (canonical-bytes definition)))
+
+(defn definition-cid
+  "Returns the CIDv1 dag-cbor identity of DEFINITION's canonical typed KIR.
+  Throws for a malformed definition rather than silently hashing a partial
+  semantic contract."
+  [definition]
+  (mf/cidv1-dag-cbor (canonical-bytes definition)))
+
+(defn verify-locked-definitions
+  "Verifies resolved checked definitions — effectful ones included, since
+  their effect row is part of the identity being verified — against a package
+  lock.
+
+  LOCK is a normal `:kotoba.lock/version 1` map whose dependency entries may
+  contain `:dep/definition-cids`. RESOLVED is a sequence of
+  `{:dep/name string :definition definition-map :definition-cid cid}`. Every
+  resolved identity must equal the canonical calculation and be explicitly
+  listed by its dependency; aliases and versions cannot substitute code.
+  Returns `{:ok? true}` or a fail-closed diagnostic."
+  [lock resolved]
+  (let [allowed (into {}
+                      (map (fn [dep] [(:dep/name dep)
+                                      (set (:dep/definition-cids dep))]))
+                      (:deps lock))]
+    (or
+     (some (fn [{definition :definition
+                 expected-cid :definition-cid
+                 name :dep/name
+                 :as entry}]
+             (cond
+               (not (contains? allowed name))
+               {:ok? false :reason :definition/unknown-dependency :entry entry}
+
+               (not (cid? expected-cid))
+               {:ok? false :reason :definition/cid-invalid :entry entry}
+
+               :else
+               (let [actual (try (definition-cid definition)
+                                 (catch  _ nil))]
+                 (cond
+                   (nil? actual)
+                   {:ok? false :reason :definition/invalid :entry entry}
+
+                   (not= actual expected-cid)
+                   {:ok? false :reason :definition/hash-mismatch
+                    :expected expected-cid :actual actual :entry entry}
+
+                   (not (contains? (get allowed name #{}) expected-cid))
+                   {:ok? false :reason :definition/not-locked :entry entry}))))
+           resolved)
+     {:ok? true})))
+
+(defn admit-build
+  "CI4: the safe-build gate. Returns `{:ok? true}` or a fail-closed diagnostic.
+
+  `verify-locked-definitions` alone is not a gate. It answers \"is everything
+  presented consistent with the lock?\", and a build that presents *nothing*
+  gets `{:ok? true}` — which is the mutable-name/version fallback the delivery
+  rule forbids, reached by omission rather than by intent. This function adds
+  the other half of the invariant:
+
+  - every dependency whose lock entry pins `:dep/definition-cids` must actually
+    resolve, and
+  - every CID that entry pins must be accounted for by a resolved definition.
+
+  So a lock that says \"this dependency is these definitions\" cannot be
+  satisfied by linking a name."
+  [lock resolved]
+  (let [resolved (vec resolved)
+        by-name (group-by :dep/name resolved)
+        pinned (filter (comp seq :dep/definition-cids) (:deps lock))
+        ;; Per-entry verification runs FIRST. Coverage is the weaker, less
+        ;; specific rule: if a presented definition is itself invalid, unlocked,
+        ;; or hashes to something else, saying so beats reporting that some
+        ;; pinned CID went unresolved -- which is merely that failure's shadow.
+        verified (verify-locked-definitions lock resolved)]
+    (if-not (:ok? verified)
+      verified
+      (or
+       (some (fn [dep]
+               (let [name (:dep/name dep)
+                     want (set (:dep/definition-cids dep))
+                     got (set (keep :definition-cid (get by-name name)))]
+                 (cond
+                   (empty? (get by-name name))
+                   {:ok? false :reason :definition/unresolved-dependency
+                    :dep/name name :expected (vec (sort want))}
+
+                   (seq (remove got want))
+                   {:ok? false :reason :definition/unresolved-definition
+                    :dep/name name :missing (vec (sort (remove got want)))})))
+             pinned)
+       {:ok? true}))))
+
+;; ---------------------------------------------------------------------------
+;; conformance (CI2 positive / CI3 negative fixtures)
+;; ---------------------------------------------------------------------------
+
+(defn check-case
+  "Runs one `lang/code-identity-conformance` case. Same shape as the capability
+  conformance checkers: `{:ok? true}` or `{:ok? false :actual ...}` so the
+  manifest, not the test body, is the list of things that must hold."
+  [tc data]
+  (case (:type tc)
+    :identity
+    (let [outcome (try {:cid (definition-cid data)}
+                       (catch  e
+                         {:problem (or (:problem (ex-data e)) :definition/invalid)
+                          ;; 2026-09-12, adr-2609111900: the `:default` clause below exists so the
+                          ;; Kotoba reader, whose only feature is `:kotoba`, reads this file. A
+                          ;; `#?(:clj a :cljs b)` with no matching feature reads as NOTHING, which in a
+                          ;; map-value position leaves the map with an odd number of forms, so the whole
+                          ;; file was refused at read time ("map literal must contain an even number of
+                          ;; forms") -- in a dependency, so every dependant stopped here. With `:default`
+                          ;; the reader reads the file and refuses the `:cljs` form by NAME later, in the
+                          ;; module that uses it. It changes nothing on clj/cljs: Clojure still picks
+                          ;; `:clj`, ClojureScript/nbb still picks `:cljs` (first match).
+                          :message (.-message e)}))]
+      (if (= :accept (:kind tc))
+        {:ok? (= (:expected-cid tc) (:cid outcome)) :actual outcome}
+        {:ok? (and (contains? outcome :problem)
+                   (or (nil? (:expected-problem tc))
+                       (= (:expected-problem tc) (:problem outcome))))
+         :actual outcome}))
+
+    :admission
+    (let [outcome (admit-build (:lock data) (:resolved data))]
+      (if (= :accept (:kind tc))
+        {:ok? (true? (:ok? outcome)) :actual outcome}
+        {:ok? (and (false? (:ok? outcome))
+                   (= (:expected-reason tc) (:reason outcome)))
+         :actual outcome}))
+
+    {:ok? false :actual {:problem :conformance/unknown-case-type :type (:type tc)}}))

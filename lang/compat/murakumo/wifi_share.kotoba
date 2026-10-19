@@ -1,0 +1,149 @@
+(ns murakumo.wifi-share
+  "`murakumo node wifi-share`: hand this PC's Wi-Fi profile to a headless box by sound
+  (ADR-0243).
+
+  The passphrase is read from the OS into this process, sealed here
+  (`murakumo.onboard`), and never printed, logged, put in a URL or sent to the
+  browser. The local page only hears the box and plays the sealed bytes it is
+  given. It is bound to the box's label secret, so a bystander who merely heard
+  the beacon cannot make the box join a network of their choosing, and a person
+  has to confirm the heard code before anything is sealed."
+  (:require [murakumo.onboard :as onboard]
+            [murakumo.wifi-share-page :as page]
+            [grant.acoustic-onboard :as ao]
+            [kotoba.lang.text :as str]
+            ["node:http" :as http] ["node:crypto" :as crypto]
+            ["node:fs" :as fs] ["node:path" :as path]
+            ["node:child_process" :as cp] ["node:os" :as os]))
+
+(defn parse-label
+  "What a person gives for the box's label: the payload `aiueos:1;did=…;ls=…`, or the
+  `https://…/#claim?q=…` URL that carries it percent-encoded. Returns
+  `{:did … :label-secret …}` with whichever fields were present, or `{:error
+  :no-label-secret}` when there is no usable `ls`."
+  [text]
+  (let [raw (str/trim (str text))
+        decoded (try (js/decodeURIComponent raw) (catch :default _ raw))
+        payload (or (second (re-find #"q=(.*)$" decoded)) decoded)
+        fields (into {} (keep (fn [part]
+                                (let [i (str/index-of part "=")]
+                                  (when (and i (pos? i))
+                                    [(subs part 0 i) (subs part (inc i))]))))
+                     (str/split payload #";"))
+        ls (get fields "ls")]
+    (if-not (and ls (nil? (ao/label-secret-problem ls)))
+      {:error :no-label-secret}
+      (cond-> {:label-secret ls}
+        (get fields "did") (assoc :did (get fields "did"))))))
+
+(defn seal-request
+  "The helper's answer to the page's request to seal for a heard beacon, as
+  `{:status :body}`. Pure but for the sealing itself.
+
+  `state` holds the profile and label: `:ssid :security :passphrase :label-secret`
+  and optionally `:did`. When the label names a DID, the heard fingerprint must be
+  that DID's, so a different box in the room is refused instead of provisioned."
+  [{:keys [did label-secret ssid security passphrase fingerprint-of]} request]
+  (let [text (ao/beacon {:code (:code request) :fp (:fp request) :key (:key request)})
+        heard (if (map? text) text (ao/parse-beacon text))]
+    (cond
+      (:error heard) {:status 400 :body {:error (name (:error heard))}}
+      (and did (not= (:fp heard) (fingerprint-of did)))
+      {:status 409 :body {:error "different-box"}}
+      :else
+      (let [message (onboard/seal {:device-key (:key heard) :code (:code heard) :fp (:fp heard)
+                                   :label-secret label-secret
+                                   :profile (cond-> {:ssid ssid :security security}
+                                              (not= :open security) (assoc :passphrase passphrase))})]
+        (if (:error message)
+          {:status 400 :body {:error (name (:error message))}}
+          {:status 200 :body {:payload (.toString (js/Buffer.from (clj->js message)) "base64")}})))))
+
+(defn- run [cmd args]
+  (let [r (.spawnSync cp cmd (clj->js args) #js {:encoding "utf8"})]
+    (when (and r (= 0 (.-status r))) (.-stdout r))))
+
+(defn- wifi-device []
+  (when-let [out (run "networksetup" ["-listallhardwareports"])]
+    (second (re-find #"Hardware Port: Wi-Fi\nDevice: (\S+)" out))))
+
+(defn saved-networks
+  "macOS hides the connected SSID from command-line tools, so the person chooses
+  from the saved networks. Other platforms detect the current one."
+  []
+  (when-let [dev (wifi-device)]
+    (some->> (run "networksetup" ["-listpreferredwirelessnetworks" dev])
+             str/split-lines rest (map str/trim) (remove str/blank?) vec)))
+
+(defn current-ssid []
+  (case (.platform os)
+    "linux" (some->> (run "nmcli" ["-t" "-f" "active,ssid" "dev" "wifi"])
+                     str/split-lines (filter #(str/starts-with? % "yes:")) first (#(subs % 4)))
+    "win32" (some-> (run "netsh" ["wlan" "show" "interfaces"])
+                    (->> (re-find #"(?m)^\s*SSID\s*:\s*(.+)$")) second str/trim)
+    "darwin" (when-let [dev (wifi-device)]
+               (some-> (run "networksetup" ["-getairportnetwork" dev])
+                       (->> (re-find #"Network: (.+)")) second str/trim))
+    nil))
+
+(defn read-passphrase
+  "The passphrase of a saved network, from the OS, or nil. macOS shows its own
+  permission prompt; nothing is cached or written."
+  [ssid]
+  (some-> (case (.platform os)
+            "darwin" (run "security" ["find-generic-password" "-D" "AirPort network password" "-wa" ssid])
+            "linux" (run "nmcli" ["-s" "-g" "802-11-wireless-security.psk" "connection" "show" "id" ssid])
+            "win32" (some-> (run "netsh" ["wlan" "show" "profile" (str "name=" ssid) "key=clear"])
+                            (->> (re-find #"Key Content\s*:\s*(.+)")) second)
+            nil)
+          (str/replace #"\r?\n$" "")))
+
+(defn- ggwave-path []
+  (let [candidates [(.join path (.dirname path (aget js/process.argv 1)) "node_modules" "ggwave" "ggwave.js")
+                    (.join path (.cwd js/process) "node_modules" "ggwave" "ggwave.js")]]
+    (first (filter #(.existsSync fs %) candidates))))
+
+(defn- read-body [req respond!]
+  (let [chunks (atom "")]
+    (.on req "data" (fn [c] (swap! chunks str c)))
+    (.on req "end" #(respond! @chunks))))
+
+(defn serve!
+  "Start the loopback server for one run and return it. Bound to 127.0.0.1 only;
+  every route but the decoder script needs the random run token; at most five
+  distinct codes are sealed per run."
+  [{:keys [ssid port token ggwave] :as state}]
+  (let [sealed (atom #{})
+        send! (fn [res status ctype body]
+                (set! (.-statusCode res) status)
+                (.setHeader res "content-type" ctype)
+                (.end res body))
+        json! (fn [res status m] (send! res status "application/json" (js/JSON.stringify (clj->js m))))]
+    (doto (.createServer http
+                         (fn [req res]
+                           (let [u (js/URL. (.-url req) "http://localhost")
+                                 route (.-pathname u)
+                                 authed? (= token (.get (.-searchParams u) "t"))]
+                             (cond
+                               (and (= route "/ggwave.js") ggwave)
+                               (send! res 200 "text/javascript" (.readFileSync fs ggwave))
+                               (not authed?) (send! res 403 "text/plain" "forbidden")
+                               (= route "/") (send! res 200 "text/html;charset=utf-8" (page/page ssid))
+                               (and (= route "/seal") (= "POST" (.-method req)))
+                               (read-body req
+                                          (fn [body]
+                                            (let [request (try (js->clj (js/JSON.parse body) :keywordize-keys true)
+                                                               (catch :default _ nil))]
+                                              (cond
+                                                (nil? request) (json! res 400 {:error "bad-request"})
+                                                (and (>= (count @sealed) 5) (not (contains? @sealed (:code request))))
+                                                (json! res 429 {:error "too-many-codes"})
+                                                :else
+                                                (let [{:keys [status body]} (seal-request state request)]
+                                                  (when (= 200 status) (swap! sealed conj (:code request)))
+                                                  (json! res status body))))))
+                               :else (send! res 404 "text/plain" "not found")))))
+      (.listen port "127.0.0.1"))))
+
+(defn token [] (.toString (.randomBytes crypto 16) "hex"))
+(defn available-ggwave [] (ggwave-path))

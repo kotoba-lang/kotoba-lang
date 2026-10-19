@@ -1,0 +1,277 @@
+(ns murakumo.infer.replicated-topology
+  "Operator-signed desired topology, replicated without a mandatory controller."
+  (:require [clojure.string :as str]
+            [murakumo.infer.keepalive :as ka]
+            ["node:fs" :as fs] ["node:path" :as path] ["node:crypto" :as crypto]))
+
+(defn key-name [x]
+  (if (keyword? x) (if-let [n (namespace x)] (str n "/" (name x)) (name x)) x))
+
+(defn canonical [x]
+  (cond (map? x) (into (sorted-map) (map (fn [[k v]] [(key-name k) (canonical v)]) x))
+        (sequential? x) (mapv canonical x)
+        :else x))
+
+(defn encoded [payload] (js/JSON.stringify (clj->js (canonical payload))))
+(defn digest [payload] (.digest (.update (.createHash crypto "sha256") (encoded payload)) "hex"))
+
+(defn endpoint? [url allow-loopback?]
+  (try
+    (let [u (js/URL. url) host (.-hostname u) octets (str/split host #"\.")
+          ip (mapv js/Number octets)]
+      (and (= "http:" (.-protocol u)) (= "" (.-username u)) (= "" (.-password u))
+           (= "/" (.-pathname u)) (= "" (.-search u)) (= "" (.-hash u))
+           (or (contains? #{"8796" "8797"} (.-port u))
+               (and allow-loopback? (= "127.0.0.1" host) (<= 1 (js/Number (.-port u)) 65535)))
+           (or (and allow-loopback? (= "127.0.0.1" host))
+               (and (= 4 (count ip)) (= 100 (first ip)) (<= 64 (second ip) 127)
+                    (every? #(and (js/Number.isInteger %) (<= 0 % 255)) ip)))))
+    (catch :default _ false)))
+
+(defn validate! [payload allow-loopback?]
+  (when-not (and (= 1 (:schema payload)) (js/Number.isSafeInteger (:revision payload))
+                 (pos? (:revision payload))
+                 (vector? (:nodes payload)) (<= 1 (count (:nodes payload)) 256)
+                 (vector? (:gateways payload)) (<= 1 (count (:gateways payload)) 16))
+    (throw (js/Error. "invalid topology structure")))
+  (doseq [entries [(:nodes payload) (:gateways payload)]]
+    (when-not (= (count entries) (count (set (map :node entries))))
+      (throw (js/Error. "duplicate topology identity")))
+    (doseq [entry entries]
+      (when-not (and (string? (:node entry)) (re-matches #"[A-Za-z0-9-]+" (:node entry))
+                     (endpoint? (:url entry) allow-loopback?) (boolean? (:enabled entry)))
+        (throw (js/Error. "invalid topology endpoint")))))
+  (doseq [node (:nodes payload)]
+    (when-not (and (string? (:owner-id node)) (re-matches #"[a-f0-9-]{36}" (:owner-id node))
+                   (vector? (:roles node)) (<= (count (:roles node)) 8)
+                   (every? #(and (contains? #{"text" "image"} (:kind %))
+                                 (string? (:model %)) (<= 1 (count (:model %)) 128)) (:roles node)))
+      (throw (js/Error. "invalid topology roles"))))
+  (when-not (and (map? (get-in payload [:policies :minimum-replicas]))
+                 (every? (fn [[model n]] (and (<= 1 (count (key-name model)) 128)
+                                              (js/Number.isSafeInteger n) (<= 1 n 256)))
+                         (get-in payload [:policies :minimum-replicas])))
+    (throw (js/Error. "invalid topology resilience policy")))
+  payload)
+
+(defn read-document! [response]
+  (let [reader (.getReader (.-body response)) parts (atom []) size (atom 0)]
+    (letfn [(pump []
+              (-> (.read reader)
+                  (.then (fn [chunk]
+                           (if (.-done chunk)
+                             (js->clj (js/JSON.parse (.toString (.concat js/Buffer (clj->js @parts)))) :keywordize-keys true)
+                             (if (> (swap! size + (.-byteLength (.-value chunk))) 262144)
+                               (do (.cancel reader) (throw (js/Error. "topology document too large")))
+                               (do (swap! parts conj (.from js/Buffer (.-value chunk))) (pump))))))))]
+      (pump))))
+
+(defn bounded! [document]
+  (when (> (.byteLength js/Buffer (js/JSON.stringify (clj->js (canonical document)))) 262144)
+    (throw (js/Error. "topology document too large")))
+  document)
+
+(defn- sig-ok? [payload public-key sig]
+  (and (string? sig)
+       (try (.verify crypto nil (js/Buffer.from (encoded payload)) public-key (js/Buffer.from sig "base64url"))
+            (catch :default _ false))))
+
+(defn quorum-signers
+  "Distinct key ids whose signature over payload verifies (ADR-2610071730
+  P5b). keys: {id pem}. A legacy single :signature counts for whichever
+  configured key it verifies against."
+  [document payload keys]
+  (set (concat
+        (for [{:keys [key signature]} (:signatures document)
+              :let [pem (get keys (key-name key))]
+              :when (and pem (sig-ok? payload pem signature))]
+          (key-name key))
+        (for [[id pem] keys :when (sig-ok? payload pem (:signature document))] id))))
+
+(defn verify!
+  "trust is either one public key (PEM, the historical single operator key)
+  or {:keys {id pem} :threshold k}: then at least k DISTINCT configured keys
+  must have signed the payload — no single operator key can change the fleet's
+  intent alone."
+  [document trust allow-loopback?]
+  (bounded! document)
+  (let [payload (validate! (:payload document) allow-loopback?)]
+    (if (map? trust)
+      (let [signers (quorum-signers document payload (:keys trust))]
+        (when (< (count signers) (:threshold trust))
+          (throw (js/Error. (str "topology needs " (:threshold trust) " operator signatures, has " (count signers))))))
+      (when-not (sig-ok? payload trust (:signature document))
+        (throw (js/Error. "invalid topology signature"))))
+    document))
+
+(defn trust-of
+  "The configured signature trust: a key quorum when topology-public-keys and
+  topology-threshold are set (threshold must be at least 1 and at most the
+  number of keys), else the single topology-public-key-file."
+  [config]
+  (if-let [ks (:topology-public-keys config)]
+    (let [keys (into {} (for [[id f] ks] [(key-name id) (.readFileSync fs f "utf8")]))
+          k (:topology-threshold config)]
+      (when-not (and (js/Number.isSafeInteger k) (<= 1 k (count keys)))
+        (throw (js/Error. "topology-threshold must be between 1 and the number of topology-public-keys")))
+      ;; k-of-n means n different operators: the same key under two ids would
+      ;; let one private key count twice
+      (let [fps (for [[_ pem] keys]
+                  (.digest (.update (.createHash crypto "sha256")
+                                    (.export (.createPublicKey crypto pem) #js {:type "spki" :format "der"})) "hex"))]
+        (when-not (= (count fps) (count (set fps)))
+          (throw (js/Error. "topology-public-keys must be distinct keys"))))
+      {:keys keys :threshold k})
+    (.readFileSync fs (:topology-public-key-file config) "utf8")))
+
+(defn sync-parent! [file]
+  (let [fd (.openSync fs (.dirname path file) "r")]
+    (try (.fsyncSync fs fd) (finally (.closeSync fs fd)))))
+
+(defn persist! [file document]
+  (let [tmp (str file "." (.randomUUID crypto) ".tmp") fd (.openSync fs tmp "wx" 384)]
+    (try (.writeFileSync fs fd (js/JSON.stringify (clj->js (canonical document)))) (.fsyncSync fs fd)
+         (finally (.closeSync fs fd)))
+    (.renameSync fs tmp file) (sync-parent! file)))
+
+(defn start! [config token]
+  (when-let [file (:topology-file config)]
+    (let [public-key (trust-of config)
+          allow? (:allow-loopback-topology? config false)
+          state (atom (verify! (js->clj (js/JSON.parse (.readFileSync fs file "utf8")) :keywordize-keys true) public-key allow?))
+          polling (atom false) conflict-file (str file ".conflict")
+          conflict (atom (if (.existsSync fs conflict-file)
+                           (try (>= (:revision (js->clj (js/JSON.parse (.readFileSync fs conflict-file "utf8")) :keywordize-keys true))
+                                    (get-in @state [:payload :revision]))
+                                (catch :default _ true)) false)) cursor (atom 0)
+          seeds (:topology-seeds config [])
+          accept! (fn [document]
+                    (let [document (verify! document public-key allow?)
+                          current (:payload @state) incoming (:payload document)
+                          incoming-nodes (into {} (map (juxt :node identity) (:nodes incoming)))]
+                      ;; Owner names remain bound to the same receipt identity forever.
+                      ;; Retirement keeps a disabled entry; replacement needs a new name.
+                      (when (> (:revision incoming) (:revision current))
+                        (doseq [old (:nodes current)]
+                          (when-not (= (:owner-id old) (:owner-id (get incoming-nodes (:node old))))
+                            (throw (js/Error. "receipt owner cannot be removed or replaced; retire it and use a new node name")))))
+                      (cond
+                        (> (:revision incoming) (:revision current))
+                        (do (persist! file document) (reset! state document) (reset! conflict false)
+                            (when (.existsSync fs conflict-file) (.unlinkSync fs conflict-file) (sync-parent! conflict-file)) true)
+                        (and (= (:revision incoming) (:revision current)) (not= (digest incoming) (digest current)))
+                        (do (persist! conflict-file {:revision (:revision incoming)})
+                            (reset! conflict true) (throw (js/Error. "conflicting signed topology revision")))
+                        :else false)))
+          tick! (fn []
+                  (when (compare-and-set! polling false true)
+                    (let [payload (:payload @state)
+                          all-urls (vec (distinct (concat seeds (map :url (concat (:gateways payload) (:nodes payload))))))
+                          offset (mod (swap! cursor inc) (max 1 (count all-urls)))
+                          urls (take (:topology-fanout config 3) (concat (subvec all-urls offset) (subvec all-urls 0 offset)))]
+                      (-> (js/Promise.allSettled
+                           (clj->js (for [url urls]
+                             (-> (ka/fetch (str (str/replace url #"/$" "") "/topology")
+                                           #js {:headers #js {"authorization" (str "Bearer " token)}
+                                                :redirect "error" :signal (.timeout js/AbortSignal 3000)})
+                                 (.then (fn [r] (when-not (.-ok r) (throw (js/Error. "topology peer unavailable"))) (read-document! r)))
+                                 (.then accept!)))))
+                          (.finally #(reset! polling false))))))]
+      (doseq [url seeds] (when-not (endpoint? url allow?) (throw (js/Error. "invalid topology seed"))))
+      (let [timer (js/setInterval tick! (:topology-poll-ms config 10000))]
+        {:state state :conflict conflict :accept! accept! :tick! tick!
+         :close #(js/clearInterval timer)}))))
+
+(defn document [replica] (when replica (canonical @(:state replica))))
+(defn payload [replica] (when replica (:payload @(:state replica))))
+(defn summary [replica]
+  (when replica {:revision (:revision (payload replica)) :digest (digest (payload replica))
+                 :conflict @(:conflict replica) :source "signed-replicated"}))
+
+(defn nodes [replica] (filterv :enabled (:nodes (payload replica))))
+(defn node-entry [replica node] (some #(when (= node (:node %)) %) (:nodes (payload replica))))
+(defn role-allowed? [replica node lane]
+  (if-not replica true
+    (let [entry (node-entry replica node)]
+      (and (not @(:conflict replica)) (:enabled entry) (= (:owner-id entry) (:owner-id lane))
+           (some #(and (= (:model lane) (:model %)) (= (:kind lane) (:kind %))
+                       (or (not= "text" (:kind lane)) (>= (:context lane 0) (:context % 0)))) (:roles entry))))))
+
+(defn gateway-allowed? [replica node]
+  (or (nil? replica)
+      (and (not @(:conflict replica))
+           (some #(and (= node (:node %)) (:enabled %)) (:gateways (payload replica))))))
+
+(defn resilience [replica reports]
+  (when replica
+    (let [minimum (get-in (payload replica) [:policies :minimum-replicas])
+          lanes (mapcat #(vals (:lanes %)) (vals reports))]
+      {:models (into {} (for [[model required] minimum
+                             :let [matching (filter #(= (key-name model) (:model %)) lanes)
+                                   ready (count (filter :ready matching))
+                                   free (count (filter #(and (:ready %) (not (:busy %))) matching))]]
+                         [(key-name model) {:ready ready :free free :minimum required :degraded (< ready required)}]))})))
+
+(defn conformant-report? [replica node report]
+  (if-not replica true
+    (let [entry (node-entry replica node)
+          roles (set (map #(select-keys % [:kind :model]) (:roles entry)))
+          observed (set (map #(select-keys % [:kind :model]) (vals (:lanes report))))]
+      (and (not @(:conflict replica)) (:enabled entry) (= roles observed)
+           (= (:owner-id entry) (:owner-id report))
+           (= (:revision (payload replica)) (get-in report [:topology :revision]))
+           (= (digest (payload replica)) (get-in report [:topology :digest]))))))
+
+(defn owner-id! [file]
+  (when-not (.existsSync fs file)
+    (let [fd (.openSync fs file "wx" 384)]
+      (try (.writeFileSync fs fd (.randomUUID crypto)) (.fsyncSync fs fd)
+           (finally (.closeSync fs fd))))
+    (sync-parent! file))
+  (let [stat (.lstatSync fs file) id (str/trim (.readFileSync fs file "utf8"))]
+    (when-not (and (.isFile stat) (not (.isSymbolicLink stat))
+                   (zero? (bit-and (.-mode stat) 63)) (re-matches #"[a-f0-9-]{36}" id))
+      (throw (js/Error. "invalid private receipt owner identity")))
+    id))
+
+(defn run-command [command args]
+  (let [opts (into {} (map vec (partition 2 args)))]
+    (case command
+      "sign" (let [key-file (get opts "--private-key-file")
+                   stat (.lstatSync fs key-file) mode (.-mode stat)
+                   _ (when-not (and (.isFile stat) (not (.isSymbolicLink stat)) (zero? (bit-and mode 63))) (throw (js/Error. "private signing key must be 0600")))
+                   input (js->clj (js/JSON.parse (.readFileSync fs (get opts "--input") "utf8")) :keywordize-keys true)
+                   payload (validate! input (= "true" (get opts "--allow-loopback")))
+                   _ (when (.existsSync fs (get opts "--output"))
+                       (let [old (js->clj (js/JSON.parse (.readFileSync fs (get opts "--output") "utf8")) :keywordize-keys true)]
+                         (when-not (> (:revision payload) (get-in old [:payload :revision] 0))
+                           (throw (js/Error. "signed revision must advance")))
+                         (let [incoming (into {} (map (juxt :node identity) (:nodes payload)))]
+                           (doseq [node (get-in old [:payload :nodes])]
+                             (when-not (= (:owner-id node) (:owner-id (get incoming (:node node))))
+                               (throw (js/Error. "receipt owner bindings must be retained")))))))
+                   key (.readFileSync fs key-file "utf8")
+                   sig (.toString (.sign crypto nil (js/Buffer.from (encoded payload)) key) "base64url")
+                   key-id (get opts "--key-id")
+                   document (if key-id
+                              ;; P5b: a quorum document collects one signature per operator key
+                              {:payload payload :signatures [{:key key-id :signature sig}]}
+                              {:payload payload :signature sig})]
+               (bounded! document)
+               (persist! (get opts "--output") document)
+               (println (js/JSON.stringify (clj->js {:revision (:revision payload) :digest (digest payload)}))))
+      "cosign" (let [key-file (get opts "--private-key-file")
+                     stat (.lstatSync fs key-file)
+                     _ (when-not (and (.isFile stat) (not (.isSymbolicLink stat)) (zero? (bit-and (.-mode stat) 63)))
+                         (throw (js/Error. "private signing key must be 0600")))
+                     key-id (or (get opts "--key-id") (throw (js/Error. "cosign needs --key-id")))
+                     doc (js->clj (js/JSON.parse (.readFileSync fs (get opts "--document") "utf8")) :keywordize-keys true)
+                     payload (validate! (:payload doc) (= "true" (get opts "--allow-loopback")))
+                     sig (.toString (.sign crypto nil (js/Buffer.from (encoded payload)) (.readFileSync fs key-file "utf8")) "base64url")
+                     doc (assoc doc :signatures (conj (vec (remove #(= key-id (key-name (:key %))) (:signatures doc)))
+                                                      {:key key-id :signature sig}))]
+                 (bounded! doc)
+                 (persist! (get opts "--document") doc)
+                 (println (js/JSON.stringify (clj->js {:revision (:revision payload) :digest (digest payload)
+                                                       :signers (mapv :key (:signatures doc))}))))
+      (println "murakumo topology sign --input FILE --private-key-file FILE --output FILE [--key-id ID]\n  murakumo topology cosign --document FILE --private-key-file FILE --key-id ID"))))

@@ -1,0 +1,174 @@
+(ns murakumo.ci.coordinator
+  "Production HTTP ingress + persistent QUIC broker composition."
+  (:require [clojure.edn :as edn]
+            [kotoba.lang.text :as str]
+            
+            [ed25519.core :as ed]
+            [murakumo.artifact-store :as artifact-store]
+            [murakumo.cd.automation :as cd-automation]
+            [murakumo.ci.broker-service :as broker-service]
+            [murakumo.ci.file-store :as file-store]
+            [murakumo.ci.finalizer :as finalizer]
+            [murakumo.ci.github-status :as github-status]
+            [murakumo.ci.quorum :as quorum]
+            [murakumo.ci.radicle-verifier :as radicle-verifier]
+            [murakumo.ci.webhook :as webhook]))
+
+(def version 1)
+
+
+(def ^:private status-post
+  "Outbound POST for GitHub commit statuses. The synchronous client is the
+   babashka/JVM one; node's client is Promise-based, so on kbb publishing a
+   status is refused rather than faked."
+  )
+(defn valid-config? [config]
+  (let [overlay (:ci.coordinator/overlay-request config)
+        status-token-env (:ci.coordinator/github-status-token-env config)
+        public-base-url (:ci.coordinator/public-base-url config)
+        deployments (or (:ci.coordinator/deployments config) {})]
+    (and (= version (:ci.coordinator/version config))
+         (every? #(and (string? %) (not (str/blank? %)))
+                 [(:ci.coordinator/store-root config)
+                  (:ci.coordinator/pipeline-digest config)
+                  (:ci.coordinator/github-secret-env config)
+                  (:ci.coordinator/rid config)
+                  (:ci.coordinator/artifact-root config)
+                  (:ci.coordinator/artifact-transfer-temp config)])
+         (pos-int? (:ci.coordinator/http-port config))
+         (pos-int? (:ci.coordinator/replicas config))
+         (pos-int? (:ci.coordinator/threshold config))
+         (<= (:ci.coordinator/threshold config) (:ci.coordinator/replicas config))
+         (set? (:ci.coordinator/runner-signers config))
+         (<= (:ci.coordinator/replicas config)
+             (count (:ci.coordinator/runner-signers config)))
+         (map? (:ci.coordinator/radicle-signers config))
+         (every? set? (vals (:ci.coordinator/radicle-signers config)))
+         (= (some? status-token-env) (some? public-base-url))
+         (or (nil? status-token-env)
+             (and (string? status-token-env) (not (str/blank? status-token-env))
+                  (string? public-base-url)
+                  (re-matches #"https://[^\s/]+(?:/[^\s]*)?" public-base-url)))
+         (or (nil? (:ci.coordinator/finalizer-interval-ms config))
+             (pos-int? (:ci.coordinator/finalizer-interval-ms config)))
+         (map? deployments)
+         (every? (fn [[repo policy]]
+                   (and (string? repo) (not (str/blank? repo))
+                        (cd-automation/valid-policy? policy)
+                        (string? (:issuer-seed-env policy))
+                        (not (str/blank? (:issuer-seed-env policy)))))
+                 deployments)
+         (= "murakumo.overlay.adapter-request" (:type overlay))
+         (contains? #{:quic :tcp} (:transport overlay))
+         (pos-int? (get-in overlay [:connect :port])))))
+
+(defn load-config [path]
+  (let [config (edn/read-string (slurp path))]
+    (when-not (valid-config? config)
+      (throw (ex-info "murakumo-ci: invalid coordinator config"
+                      {:reason :invalid-coordinator-config})))
+    config))
+
+(defn build
+  ([config] (build config #(System/getenv %)))
+  ([config getenv]
+   (when-not (valid-config? config)
+     (throw (ex-info "murakumo-ci: invalid coordinator config"
+                     {:reason :invalid-coordinator-config})))
+   (let [secret (getenv (:ci.coordinator/github-secret-env config))
+         status-token-env (:ci.coordinator/github-status-token-env config)
+         status-token (when status-token-env (getenv status-token-env))]
+     (when (str/blank? secret)
+       (throw (ex-info "murakumo-ci: GitHub webhook secret unavailable"
+                       {:reason :missing-github-secret})))
+     (let [persistent (file-store/create (:ci.coordinator/store-root config))
+           coordinator-cas (artifact-store/adapter
+                            (:ci.coordinator/artifact-root config))
+           deployments (or (:ci.coordinator/deployments config) {})
+           issuer-seeds
+           (into {}
+                 (for [[deployment policy] deployments
+                       :let [seed (try
+                                    (some-> (getenv (:issuer-seed-env policy)) ed/unhex)
+                                    (catch Throwable _ nil))]]
+                   (do
+                     (when-not (= 32 (some-> seed alength))
+                       (throw (ex-info "murakumo-cd: deployment issuer seed unavailable"
+                                       {:reason :missing-deployment-issuer-seed
+                                        :deployment deployment})))
+                     [deployment seed])))
+           quorum-policy {:rid (:ci.coordinator/rid config)
+                          :delegates (:ci.coordinator/runner-signers config)
+                          :threshold (:ci.coordinator/threshold config)}
+           broker (broker-service/create
+                   {:store persistent
+                    :lease-ttl-ms (or (:ci.coordinator/lease-ttl-ms config) 60000)
+                    :replicas (:ci.coordinator/replicas config)
+                    :rid (:ci.coordinator/rid config)
+                    :authorized-runners (:ci.coordinator/runner-signers config)
+                    :require-attestation? true
+                    :artifact-exists? #(some? ((:get coordinator-cas) %))
+                    :artifact-upload-opts
+                    {:temp-dir (:ci.coordinator/artifact-transfer-temp config)
+                     :put! (:put! coordinator-cas)
+                     :get-bytes (:get coordinator-cas)}})
+           verify-radicle (radicle-verifier/create
+                            {:authorized-signers (:ci.coordinator/radicle-signers config)})]
+       (when (and status-token-env (str/blank? status-token))
+         (throw (ex-info "murakumo-ci: GitHub status token unavailable"
+                         {:reason :missing-github-status-token})))
+       (let [finalize! (fn [logical-id]
+                         (let [runs (->> (:murakumo.ci/runs @(:state broker))
+                                         vals
+                                         (filter #(= logical-id (:ci.run/logical-id %)))
+                                         vec)]
+                           (quorum/evaluate quorum-policy logical-id runs)))
+             cd-executor (when (seq deployments)
+                           (cd-automation/create-executor
+                            {:store persistent :source-get (:get coordinator-cas)
+                             :store-artifact! (:put! coordinator-cas)
+                             :rid (:ci.coordinator/rid config)
+                             :policies deployments :issuer-seeds issuer-seeds}))
+             finalizer (finalizer/create
+                        {:store persistent :broker-state (:state broker)
+                         :quorum-policy quorum-policy
+                         :public-base-url (:ci.coordinator/public-base-url config)
+                         :deployment-policies deployments
+                         :executors
+                         (cond-> {}
+                           status-token
+                           (assoc :github/status
+                                  (fn [action]
+                                    (github-status/publish!
+                                     status-post
+                                     (:ci.action/status action)
+                                     status-token)))
+                           cd-executor (assoc :cd/deploy cd-executor))})
+             status! (fn [logical-id]
+                       (assoc (finalize! logical-id)
+                              :actions ((:status! finalizer) logical-id)))]
+       {:broker broker
+        :quorum-policy quorum-policy
+        :finalize! finalize!
+        :finalizer finalizer
+        :overlay-request (:ci.coordinator/overlay-request config)
+        :http-port (:ci.coordinator/http-port config)
+        :http-options {:github-secret secret
+                       :pipeline-digest (:ci.coordinator/pipeline-digest config)
+                       :submit! (:submit! broker)
+                       :verify-radicle verify-radicle
+                       :status! status!}})))))
+
+(defn serve! [config]
+  (let [{:keys [broker finalizer overlay-request http-port http-options]} (build config)
+        stop-http (webhook/serve! http-options http-port)
+        stop-finalizer (finalizer/start!
+                        finalizer (or (:ci.coordinator/finalizer-interval-ms config) 5000))]
+    (println (str "murakumo CI ingress on http://0.0.0.0:" http-port))
+    ))
+
+(defn -main [& [config-path]]
+  (when (str/blank? config-path)
+    (throw (ex-info "usage: kbb -M:ci-coordinator <config.edn>"
+                    {:reason :missing-config-path})))
+  (serve! (load-config config-path)))

@@ -1,0 +1,235 @@
+(ns murakumo.mesh
+  "802.11s mesh for edge nodes, and the auto-admit decision that lets a second
+  machine join without a human in the loop.
+
+  Pure on purpose: every function here takes data and returns data. The shell
+  that writes the files, runs `iw`, and reads the ledger lives in the seed
+  installer, because the part of this that can be wrong on a given box -- does
+  the radio support mesh point at all -- is only knowable there, while the part
+  that decides who is let in must be testable without a radio.
+
+  ## The admission rule, and why it is here and not in kekkai
+
+  kekkai's governor routes `:node/admit` to a human. The owner changed that for
+  mesh joins on 2026-10-01: a machine that reaches the mesh and proves it holds
+  its device key is admitted. kekkai's own flow is untouched; the ledger
+  (`kekkai-tailnet.edn`) is the ground-fact snapshot murakumo consults, so the
+  auto-admit writes an `authorized` entry there directly.
+
+  It is opt-in per ledger (`:admit :auto-on-mesh`), the same shape as the gate
+  itself: no key, no change in behaviour. A ledger that has not said so keeps
+  the old rule and a mesh join stays `pending`.
+
+  ## What the gates are, now that there is no human
+
+  1. The SAE passphrase. Link-layer: a radio without it never reaches the
+     enroll endpoint. It is generated on the seed, never written to the ledger,
+     and is the only thing standing between a neighbour's laptop and the fleet.
+  2. Possession of the device key, verified by the caller and reduced to
+     `:proof-valid?`. A claimed DID the device cannot sign for is refused.
+  3. The ledger refuses a DID it has revoked, and refuses to reuse a node name
+     for a different key. Without that, 'auto' would mean any joiner can take
+     over a name the fleet already trusts."
+  (:require [kotoba.lang.text :as str]))
+
+;; ── mesh radio configuration ───────────────────────────────────────────────
+
+(def default-mesh-id "murakumo-mesh")
+
+(def default-frequency
+  "5180 MHz, channel 36. Non-DFS, so a mesh point may start on it without a
+  radar-detection wait. W52 is indoor-only in Japan; an outdoor node needs a
+  different channel and says so with `:frequency`."
+  5180)
+
+(def default-country "JP")
+
+(def mesh-subnet-prefix
+  "Allocated hosts live in 10.77.0.0/24 inside a /16 mesh. A joiner that has not
+  been admitted yet picks a throwaway address in 10.77.1.0/24, so it can reach
+  the seed (10.77.0.1) without taking a slot in the ledger."
+  "10.77.0.")
+
+(def seed-address "10.77.0.1")
+
+(def enroll-port 7077)
+
+(def min-passphrase-length
+  "SAE has no offline dictionary attack, but it still falls to guessing online,
+  and the passphrase is generated rather than chosen. 32 is what
+  `openssl rand -hex 16` yields, so the shell has no reason to go shorter."
+  32)
+
+(defn valid-passphrase?
+  [s]
+  (and (string? s)
+       (>= (count s) min-passphrase-length)
+       (<= (count s) 63)
+       (boolean (re-matches #"[0-9A-Za-z]+" s))))
+
+(defn- require-passphrase! [s]
+  (when-not (valid-passphrase? s)
+    (throw (ex-info "mesh passphrase must be 32-63 alphanumeric characters"
+                    {:reason :weak-passphrase}))))
+
+(def passphrase-placeholder
+  "Stands in for the passphrase in a rendered template. The installer replaces it
+  on the node, so the secret is generated there and never travels in a plan."
+  "@MESH_PASSPHRASE@")
+
+(defn wpa-supplicant-template
+  "wpa_supplicant config for one mesh point, passphrase left as
+  `passphrase-placeholder`. `ieee80211w=2` (management frame protection) is
+  required by SAE on a mesh, not an option."
+  [{:keys [mesh-id frequency country]
+    :or {mesh-id default-mesh-id frequency default-frequency country default-country}}]
+  (str "ctrl_interface=/run/wpa_supplicant\n"
+       "update_config=0\n"
+       "country=" country "\n"
+       "sae_pwe=2\n"
+       "network={\n"
+       "    ssid=\"" mesh-id "\"\n"
+       "    mode=5\n"
+       "    frequency=" frequency "\n"
+       "    key_mgmt=SAE\n"
+       "    psk=\"" passphrase-placeholder "\"\n"
+       "    ieee80211w=2\n"
+       "    mesh_fwding=1\n"
+       "}\n"))
+
+(defn wpa-supplicant-conf
+  "The template with a real passphrase substituted; refuses a weak one."
+  [{:keys [passphrase] :as opts}]
+  (require-passphrase! passphrase)
+  (str/replace (wpa-supplicant-template opts) passphrase-placeholder passphrase))
+
+(defn mesh-iface-script
+  "Create the mesh-point interface from the station radio, or refuse.
+
+  The `iw phy ... info` grep is the whole capability test: an Intel AX200/AX210
+  (iwlwifi) does not list `mesh point`, and the right answer there is to stop
+  with a message, not to write a config that never associates."
+  [{:keys [phy iface] :or {phy "phy0" iface "mesh0"}}]
+  (str "set -eu\n"
+       "iw phy " phy " info | grep -q '^\\s*\\* mesh point' || {\n"
+       "  echo 'radio on " phy " does not support mesh point (iwlwifi?); use mt7921/mt7922 or a USB mt76 dongle' >&2\n"
+       "  exit 3\n"
+       "}\n"
+       "iw dev " iface " info >/dev/null 2>&1 || iw phy " phy " interface add " iface " type mp\n"
+       "ip link set " iface " up\n"))
+
+;; ── ledger and admission ───────────────────────────────────────────────────
+
+(def admit-auto-on-mesh :auto-on-mesh)
+
+(defn auto-admit-enabled?
+  [ledger]
+  (= admit-auto-on-mesh (:admit ledger)))
+
+(defn next-address
+  "First free host in the mesh /24 above the seed (.1). nil when the subnet is
+  full, which is a refusal and not a wraparound onto a taken address."
+  [ledger]
+  (let [taken (set (keep :address (vals (:nodes ledger))))]
+    (some (fn [n] (let [a (str mesh-subnet-prefix n)] (when-not (taken a) a)))
+          (range 2 255))))
+
+(defn allocated-address? [address]
+  (boolean
+   (when (string? address)
+     (when-let [[_ host] (re-matches #"10\.77\.0\.(\d{1,3})" address)]
+       (let [n ]
+         (and (<= 1 n 254) (= address (str mesh-subnet-prefix n))))))))
+
+(defn mesh-member? [entry]
+  (or (true? (:mesh? entry))
+      (= :auto-on-mesh (:admitted-by entry))
+      (allocated-address? (:address entry))))
+
+(defn admit
+  "Decide a mesh join. Returns {:decision :grant|:pending|:deny :reason kw
+  :ledger new-ledger} -- the ledger is returned rather than written so the
+  caller persists it once and a refused join cannot leave a half entry.
+
+  `req` -- {:did :node-name :now-ms :proof-valid?}.
+
+  Order matters: a revoked DID is refused before anything else, so a revoked
+  node cannot come back by presenting a valid proof."
+  [ledger {:keys [did node-name now-ms proof-valid?]}]
+  (let [matching (filter #(= did (:did %)) (vals (:nodes ledger)))
+        existing (first (filter #(= "authorized" (:status %)) matching))
+        by-name (get-in ledger [:nodes node-name])
+        deny (fn [reason] {:decision :deny :reason reason :ledger ledger})]
+    (cond
+      (or (not (string? did)) (not (string? node-name)) (empty? node-name))
+      (deny :malformed-request)
+
+      (some #(= "revoked" (:status %)) matching)
+      (deny :did-revoked)
+
+      (not proof-valid?)
+      (deny :no-proof-of-possession)
+
+      (and by-name (not= did (:did by-name)))
+      (deny :node-name-taken-by-another-key)
+
+      (and existing (= "authorized" (:status existing)))
+      (if-let [addr (or (when (allocated-address? (:address by-name)) (:address by-name))
+                       (some #(when (and (= "authorized" (:status %))
+                                         (allocated-address? (:address %))) (:address %)) matching)
+                       (next-address ledger))]
+        {:decision :grant :reason :already-authorized
+         :ledger (assoc-in ledger [:nodes node-name]
+                           (merge existing by-name {:id node-name :did did :status "authorized"
+                                                    :mesh? true :address addr}))}
+        (deny :mesh-subnet-full))
+
+      (not (auto-admit-enabled? ledger))
+      {:decision :pending :reason :human-admission-required
+       :ledger (assoc-in ledger [:nodes node-name]
+                         {:id node-name :status "pending" :did did
+                          :first-seen-ms now-ms})}
+
+      :else
+      (if-let [addr (next-address ledger)]
+        {:decision :grant :reason :auto-on-mesh
+         :ledger (assoc-in ledger [:nodes node-name]
+                           {:id node-name :status "authorized" :did did
+                            :mesh? true :address addr :admitted-ms now-ms
+                            :admitted-by :auto-on-mesh})}
+        (deny :mesh-subnet-full)))))
+
+(defn revoke
+  "Mark a node revoked. The entry stays so its DID is remembered as revoked."
+  [ledger node-name]
+  (if (get-in ledger [:nodes node-name])
+    (assoc-in ledger [:nodes node-name :status] "revoked")
+    ledger))
+
+;; ── possession proof ───────────────────────────────────────────────────────
+;;
+;; The proof is an Ed25519 signature over `proof-message`, checked against the
+;; public key INSIDE the claimed did:key. There is no separate key field to
+;; disagree with the name, so a joiner cannot enrol under a DID it does not
+;; hold: the DID is the key.
+;;
+;; This is deliberately not `aiueos.provider.device`'s proof. That one is
+;; JVM-only (JDK Ed25519 plus a canonicaliser), and edge nodes run the JVM-free
+;; kbb engine. The message here is a plain domain-separated string -- no
+;; canonicaliser, so no second canonicaliser to drift from aiueos's.
+
+(def proof-domain "murakumo-mesh-enroll/v1")
+
+(def did-key-pattern
+  "did:key for Ed25519 (multicodec 0xed01 always encodes to z6Mk...)."
+  #"did:key:z6Mk[1-9A-HJ-NP-Za-km-z]{44}")
+
+(defn did-key? [s] (and (string? s) (boolean (re-matches did-key-pattern s))))
+
+(defn proof-message
+  "What the joiner signs. Every field is something the seed already holds, so
+  nothing the joiner says is trusted: the nonce is single-use and expires, the
+  endpoint stops a proof being replayed to a different seed, the DID and name
+  stop it being re-bound after the seed has looked at it."
+  [{:keys [nonce endpoint did node-name]}]
+  (str proof-domain "\n" nonce "\n" endpoint "\n" did "\n" node-name))

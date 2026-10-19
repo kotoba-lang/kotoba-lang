@@ -1,0 +1,170 @@
+(ns murakumo.web.collection
+  "Profile-bound collection work. Host grants and prices are operator inputs,
+  never model outputs. One durable coordinator owns a campaign's leases."
+  (:require [murakumo.canonical :as canonical]
+            [murakumo.web :as web]
+            [murakumo.web.crawl :as crawl]
+            [murakumo.web.worker :as w]))
+
+(def schema :web/collection-v1)
+(def units #{:inference-input-tokens :inference-output-tokens :tool-pages :index-documents})
+(def max-int 9007199254740991)
+(defn natural? [x] (and (integer? x) (<= 0 x max-int)))
+(defn positive? [x] (and (natural? x) (pos? x)))
+(defn cid [value] (w/raw-cid (w/utf8-bytes (canonical/string value))))
+(defn cid? [x] (and (string? x) (boolean (re-matches #"b[a-z2-7]{20,120}" x))))
+(defn did? [x] (and (string? x) (boolean (re-matches #"did:key:[A-Za-z0-9]+" x))))
+(defn initial-state [] {:schema schema :campaigns {} :leases {} :accepted {} :origins {} :roots {} :paid {}})
+
+(defn require! [predicate reason]
+  (when-not predicate (throw (ex-info (name reason) {:type reason}))))
+
+(defn campaign
+  "Validate an owner-approved epoch. No rates or targets can be changed by a bot.
+  Rates are integer KUMO per unit; no implicit price defaults are supplied."
+  [{:keys [id epoch sponsor-did profile-cids seeds max-pages max-depth delay-ms
+           budget-kumo rates allowed-hosts] :as c}]
+  (require! (and (string? id) (re-matches #"[A-Za-z0-9_-]{1,64}" id)
+                 (natural? epoch) (did? sponsor-did) (set? profile-cids)
+                 (seq profile-cids) (every? cid? profile-cids)) :collection/identity)
+  (require! (and (vector? seeds) (<= 1 (count seeds) 64)
+                 (every? #(and (string? %) (:ok (web/check-url %))) seeds)) :collection/seeds)
+  (require! (and (positive? max-pages) (<= max-pages 20)
+                 (natural? max-depth) (<= max-depth 3)
+                 (natural? delay-ms) (<= 1000 delay-ms 60000)
+                 (positive? budget-kumo)) :collection/bounds)
+  (require! (and (map? rates) (= units (set (keys rates)))
+                 (every? natural? (vals rates))) :collection/rates)
+  (require! (and (set? allowed-hosts) (seq allowed-hosts)
+                 (every? string? allowed-hosts)) :collection/allowed-hosts)
+  (assoc c :schema schema))
+
+(defn assignments
+  "Group seeds by origin host. A host is never split across competing workers.
+  The epoch is an explicit refresh; retrying an epoch never creates more work."
+  [c]
+  (let [c (campaign c)
+        by-host (group-by #(get-in (web/check-url %) [:ok :host])
+                          (distinct (map crawl/normalize-url (:seeds c))))]
+    (mapv (fn [[host seeds]]
+            (let [body {:schema schema :campaign-id (:id c) :epoch (:epoch c)
+                        :profile-set-cid (cid (:profile-cids c)) :origin-host host
+                        :plan {:seeds (vec (sort seeds)) :scope :same-host
+                               :max-pages (:max-pages c) :max-depth (:max-depth c)
+                               :delay-ms (:delay-ms c)}}]
+              (assoc body :id (cid body))))
+          (sort-by key by-host))))
+
+(defn add-campaign [state c]
+  (let [c (campaign c) k [(:id c) (:epoch c)] prior (get-in state [:campaigns k])]
+    (require! (or (nil? prior) (= c (:spec prior))) :collection/campaign-conflict)
+    (if prior state
+      (assoc-in state [:campaigns k] {:spec c :reserved 0 :spent 0 :work (assignments c)}))))
+
+(defn claim
+  "A trusted host admission binds supplier, node, bot owner and immutable profile.
+  Host approval must be checked by the I/O boundary before calling this fold.
+  No automatic retry after start: origin requests may already have happened."
+  [state campaign-key participant now-ms lease-ms ceiling]
+  (let [{:keys [host-id node-did supplier-did bot-id owner-did profile-cid public-egress?]} participant
+        c (get-in state [:campaigns campaign-key :spec])]
+    (require! c :collection/unknown-campaign)
+    (require! (and (contains? (:allowed-hosts c) host-id) (true? public-egress?)
+                   (did? node-did) (did? supplier-did) (did? owner-did)
+                   (string? bot-id) (seq bot-id)
+                   (not= supplier-did (:sponsor-did c))
+                   (contains? (:profile-cids c) profile-cid)) :collection/host-not-admitted)
+    (require! (and (natural? now-ms) (positive? lease-ms) (<= lease-ms 900000)
+                   (positive? ceiling)) :collection/lease-bounds)
+    (require! (<= (+ now-ms lease-ms) max-int) :collection/overflow)
+    (let [work (first (filter #(and (nil? (get-in state [:leases (:id %)]))
+                                   (nil? (get-in state [:origins (:origin-host %)])))
+                             (get-in state [:campaigns campaign-key :work])))]
+      (if-not work [state nil]
+        (let [used (+ (get-in state [:campaigns campaign-key :reserved])
+                      (get-in state [:campaigns campaign-key :spent]))]
+          (require! (<= (+ used ceiling) (:budget-kumo c)) :collection/budget)
+          (let [lease (merge work (select-keys participant [:host-id :node-did :supplier-did :bot-id :owner-did :profile-cid])
+                             {:state :offered :expires-at (+ now-ms lease-ms) :ceiling ceiling})]
+            [(-> state (assoc-in [:leases (:id work)] lease)
+                 (assoc-in [:origins (:origin-host work)] (:id work))
+                 (update-in [:campaigns campaign-key :reserved] + ceiling)) lease]))))))
+
+(defn start [state id host-id now-ms]
+  (let [l (get-in state [:leases id])]
+    (require! (and (= :offered (:state l)) (= host-id (:host-id l))
+                   (natural? now-ms) (< now-ms (:expires-at l))) :collection/lease-not-startable)
+    (assoc-in state [:leases id :state] :running)))
+
+(defn release-offer [state id now-ms]
+  (let [l (get-in state [:leases id]) k [(:campaign-id l) (:epoch l)]]
+    (require! (and (= :offered (:state l)) (natural? now-ms)
+                   (>= now-ms (:expires-at l))) :collection/retry-needs-reconciliation)
+    (-> state (update :leases dissoc id) (update :origins dissoc (:origin-host l))
+        (update-in [:campaigns k :reserved] - (:ceiling l)))))
+
+(defn cost [rates usage]
+  (require! (and (= units (set (keys rates))) (= units (set (keys usage)))) :collection/usage-units)
+  (require! (and (every? natural? (vals rates)) (every? natural? (vals usage))) :collection/usage-values)
+  (reduce (fn [n u] (let [next (+ n (* (get rates u) (get usage u)))]
+                     (require! (natural? next) :collection/overflow) next)) 0 units))
+
+(defn accept
+  "Admission only after the boundary verifies signed receipt, meter and shared
+  block readbacks. Bind every identity and output to the durable assignment.
+  Never accepts a model's 'verified' boolean as cryptographic verification."
+  [state id result verify-result!]
+  (if-let [prior (get-in state [:accepted id])]
+    (do (require! (= prior result) :collection/result-conflict) state)
+    (let [l (get-in state [:leases id]) k [(:campaign-id l) (:epoch l)]
+          c (get-in state [:campaigns k :spec]) r (:receipt result)
+          usage (:usage r) charge (cost (:rates c) usage)]
+      (require! (= :running (:state l)) :collection/not-running)
+      (require! (and (= :web/collection (:kind r)) (= id (:assignment-id r))
+                     (= (:profile-cid l) (:profile-cid r))
+                     (= (:bot-id l) (:bot-id r)) (= (:owner-did l) (:owner-did r))
+                     (= (:node-did l) (:node-did r)) (= (:supplier-did l) (:supplier-did r))
+                     (cid? (:manifest-cid r)) (cid? (:index-cid r))
+                     (positive? (:tool-pages usage)) (positive? (:index-documents usage))
+                     (<= (:index-documents usage) (:tool-pages usage) (get-in l [:plan :max-pages]))
+                     (positive? charge) (<= charge (:ceiling l))) :collection/result-binding)
+      (require! (and verify-result! (true? (verify-result! l result))) :collection/unverified-result)
+      (-> state (assoc-in [:accepted id] result) (assoc-in [:leases id :state] :accepted)
+          (assoc-in [:leases id :charge] charge)
+          (update :origins dissoc (:origin-host l))
+          (update-in [:campaigns k :reserved] - (:ceiling l))
+          (update-in [:campaigns k :spent] + charge)))))
+
+(defn publish-root [state campaign-key previous-cid root-cid included-ids]
+  (require! (= previous-cid (get-in state [:roots campaign-key :cid])) :collection/index-conflict)
+  (require! (and (cid? root-cid) (seq included-ids)
+                 (= (count included-ids) (count (set included-ids)))
+                 (every? #(and (get-in state [:accepted %])
+                               (= campaign-key ((juxt :campaign-id :epoch) (get-in state [:leases %]))))
+                         included-ids)) :collection/index-inputs)
+  (require! (every? (set included-ids) (get-in state [:roots campaign-key :included])) :collection/index-regression)
+  (reduce (fn [st id]
+            ;; Freeze each contribution's first index inclusion. Later root
+            ;; updates must not change the event body on a payment retry.
+            (if (get-in st [:leases id :settlement-root]) st
+              (assoc-in st [:leases id :settlement-root] root-cid)))
+          (assoc-in state [:roots campaign-key] {:cid root-cid :included (vec (sort included-ids))})
+          included-ids))
+
+(defn settlement [state id]
+  (let [l (get-in state [:leases id]) k [(:campaign-id l) (:epoch l)]
+        r (get-in state [:accepted id :receipt])]
+    (require! (and r (some #{id} (get-in state [:roots k :included]))) :collection/not-indexed)
+    {:schema schema :run-id (str "collection/" id) :assignment-id id
+     :campaign-id (:campaign-id l) :epoch (:epoch l)
+     :sponsor-did (get-in state [:campaigns k :spec :sponsor-did])
+     :supplier-did (:supplier-did l) :profile-cid (:profile-cid l)
+     :receipt-cid (cid r) :root-cid (:settlement-root l)
+     :usage (:usage r) :amount-kumo (:charge l)}))
+
+(defn mark-paid [state id finalized-event-cid]
+  (require! (cid? finalized-event-cid) :collection/finality-cid)
+  (settlement state id)
+  (let [prior (get-in state [:paid id])]
+    (require! (or (nil? prior) (= prior finalized-event-cid)) :collection/payment-conflict)
+    (assoc-in state [:paid id] finalized-event-cid)))

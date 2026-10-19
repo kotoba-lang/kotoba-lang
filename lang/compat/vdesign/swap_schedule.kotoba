@@ -1,0 +1,366 @@
+(ns vdesign.swap-schedule
+  "CARTRIDGE SWAP SCHEDULING over a multi-cartridge mission — the answer
+  to \"after this drive cycle, how many replaceable Mg/MgH2 cartridges
+  does the vehicle go through, and WHEN does each swap happen?\" on the
+  vehicle energy-flow plane.
+
+  System boundary advanced: `:replaceable-mg-or-mgh2-cartridge` +
+  `:controlled-hydrogen-reactor` (scripts/hermes-magnesium-systems-bots/
+  system-scope.edn on origin/main).
+
+  What existed before this contract:
+
+    - `vdesign.hydrogen/consumption-profile` converts a fuel-cell
+      profile into per-interval H2/MgH2 draw and depletion of ONE store
+      (single `:store-h2-kg`), reporting shortfall when it runs dry.
+    - `vdesign.endurance/endurance` answers endurance/range for ONE
+      inventory.
+    - Neither represents the defining property of the cartridge from
+      the system scope: it is REPLACEABLE. A mission longer than one
+      cartridge can only be represented as \"one store + a big reported
+      shortfall\" — the swap count and the swap timing (which determine
+      the cartridge-dry-inert-handling logistics the scope lists as a
+      manufacturing cell) had no contract.
+
+  This namespace closes that gap by composition ONLY, on the landed
+  plane:
+
+    per interval:  m-h2[k]  = E[k] / (eta-fc · LHV-H2)     (same LHV basis
+                                                            as the landed
+                                                            consumption
+                                                            contract)
+    store states:  a FULL cartridge at inventory `:cartridge-h2-kg` is
+                   installed at interval 0; when the active store cannot
+                   cover an interval's draw, the remainder is drawn from
+                   a fresh FULL cartridge installed AT THAT INTERVAL (a
+                   swap), and the partially-used cartridge's remaining
+                   H2 is carried as `:residual-h2-kg` (reported, never
+                   discarded — an MgH2 bed's residual hydrogen is real
+                   inventory, not waste).
+
+  Deterministic policy (disclosed, not hidden):
+    - `:swap-policy :draw-down` (the only policy implemented): each
+      cartridge is drawn to exhaustion before the next is installed.
+      One swap per depletion event; if one interval's draw exceeds
+      what a fresh full cartridge covers, additional swaps happen
+      WITHIN that interval (`:swaps` > 1 for that interval).
+    - `:spare-cartridges` bounds how many FULL cartridges the vehicle
+      actually carries beyond the initial one. When a swap needs a
+      spare and none remains, the interval becomes a REPORTED
+      shortfall (mirroring the deficit discipline of `vdesign.dc-bus`
+      and `vdesign.hydrogen`) — never a silent success.
+
+  What is deliberately NOT modeled (carried as :unmeasured, per the
+  system rule that unknown measurements remain explicitly unmeasured):
+    - desorption kinetics / heat of desorption / plateau pressure (the
+      reactor is not simulated — same honesty as `vdesign.hydrogen`);
+    - the TIME a swap takes and any hydrogen vented during it (swap
+      transients are unmeasured; the schedule is an idealized
+      instantaneous exchange);
+    - whether a partially-used cartridge is recharged or replaced —
+      both are representable by the caller reading `:residual-h2-kg`;
+    - return-to-base vs on-vehicle-rack swap logistics.
+  No Mg/MgH2, PEM, or vehicle performance constant is invented here:
+  the only physics is the SAME exact LHV conversion the landed
+  contracts use, re-exported from `vdesign.powertrain/LHV-H2-J`, and
+  the exact stoichiometric mass fraction of H2 in MgH2 from the IUPAC
+  2021 atomic weights in `vdesign.cartridge/molar-masses-g-per-mol`.
+
+  Fails closed: non-positive `:cartridge-h2-kg`, efficiency outside
+  (0, 1], non-positive dt, negative power, empty profile, non-integer
+  or negative `:spare-cartridges`, or (when `:speeds-mps` is given)
+  a sample count ≠ (intervals + 1), a negative speed, or a non-finite
+  speed. A mission that exhausts all spares is NOT an exception — it is
+  a reported shortfall with the exact interval it first occurs."
+  (:require [vdesign.powertrain :as pt]))
+
+(def LHV-H2-J pt/LHV-H2-J)   ; J/kg, LHV — re-export, single provenance point
+
+(defn- finite? [x]
+  (and (number? x) (not (or 
+                            ))))
+
+(defn- require-kw-list [xs]
+  (when-not (and (sequential? xs) (seq xs))
+    (throw (ex-info "swap-schedule: empty or non-sequential fc profile"
+                    {:profile xs})))
+  (doseq [[i p] (map-indexed vector xs)]
+    (when-not (and (finite? p) (not (neg? (double p))))
+      (throw (ex-info "swap-schedule: fc power must be a non-negative number"
+                      {:index i :power-kw p})))))
+
+(defn swap-schedule
+  "Schedule cartridge swaps for a fuel-cell electrical output profile
+  served by replaceable Mg/MgH2 cartridges.
+
+  Case keys:
+    :fc-profile-kw       per-interval fc electrical output, kW (≥ 0), n ≥ 1
+    :dt-s                uniform interval seconds (positive)
+    :fc-elec-eff         H2(LHV)→electric efficiency, caller-supplied
+                         operating-point claim in (0, 1]; echoed in
+                         provenance; no default
+    :eff-source          provenance string for the efficiency (mandatory
+                         non-blank, fail-closed)
+    :cartridge-h2-kg     usable H2 capacity of ONE replaceable cartridge
+                         (positive; e.g. the :h2-kg a size-cartridge
+                         result was sized for, or a measured bed figure
+                         — the caller carries that provenance)
+    :cartridge-source    provenance string for the cartridge capacity
+                         (mandatory non-blank, fail-closed)
+    :spare-cartridges    optional non-negative integer count of full
+                         spares carried (default 0 — one cartridge
+                         installed, no spares)
+    :speeds-mps          optional speed-vs-time grid, (n+1) samples, each
+                         ≥ 0, on the SAME :dt-s (e.g. the :speeds-mps of
+                         a vdesign.dutycycle cycle). Present ⇒ :range-km
+                         reports the distance covered while H2 was
+                         actually delivered: intervals up to (but not
+                         including) the first unmet interval are
+                         credited — from the first shortfall on the
+                         vehicle is out of H2 and earns NO distance, the
+                         same rule `vdesign.endurance` applies. Absent ⇒
+                         :range-km is :unmeasured — never a fabricated
+                         distance.
+    :label / :case/id    optional echo for the datom log
+
+  Returns
+    {:kind :cartridge-swap-schedule
+     :intervals [{:i :fc-kw :e-kwh :h2-kg :mgh2-kg
+                  :active-cartridge-index :active-remaining-kg
+                  :swaps :unmet-h2-kg} ...]
+     :h2  {:total-kg             ; H2 REQUIRED by the profile
+                                 ; = served + unmet
+           :total-mgh2-kg :total-e-kwh :total-unmet-kg
+           :delivered-kg}
+     :swaps {:count :first-at-interval   ; interval index of the FIRST
+                                         ; swap (intra-interval swaps count
+                                         ; at their own interval)
+             :total-cartridges-consumed
+             :spares-exhausted? :residual-h2-kg}
+     :range-km <number | :unmeasured>
+     :residual [{:cartridge-index :installed-at-interval
+                 :residual-h2-kg :exhausted-at-interval-or-nil} ...]
+     :provenance {:fc-elec-eff .. :eff-source .. :cartridge-h2-kg ..
+                  :cartridge-source .. :lhv-h2-j-per-kg .. :dt-s ..
+                  :w-h2-mgh2 .. :swap-policy :draw-down
+                  :spare-cartridges ..}
+     :unmeasured {:fc-eff-operating-point true
+                  :desorption-kinetics true
+                  :heat-of-desorption true
+                  :plateau-pressure true
+                  :swap-duration true
+                  :swap-vent-losses true
+                  :partial-cartridge-refurbishment true
+                  :speed-grid-interpolation true}}
+
+  `:total-cartridges-consumed` counts every cartridge that actually
+  delivered H2 — each appears in `:residual` exactly once (exhausted
+  mid-mission, or partial at mission end). The placeholder active
+  cartridge created after spares are exhausted never delivers, so it
+  never appears in either count."
+  [{:keys [fc-profile-kw dt-s fc-elec-eff eff-source cartridge-h2-kg
+           cartridge-source spare-cartridges speeds-mps label case/id]}]
+  (require-kw-list fc-profile-kw)
+  (when-not (and (finite? dt-s) (pos? (double dt-s)))
+    (throw (ex-info "swap-schedule: :dt-s must be a positive number"
+                    {:dt-s dt-s})))
+  (when-not (and (string? eff-source) (re-find #"\S" eff-source))
+    (throw (ex-info "swap-schedule: :eff-source must be a non-blank provenance string"
+                    {:eff-source eff-source})))
+  (when-not (and (string? cartridge-source) (re-find #"\S" cartridge-source))
+    (throw (ex-info "swap-schedule: :cartridge-source must be a non-blank provenance string"
+                    {:cartridge-source cartridge-source})))
+  (when-not (and (finite? fc-elec-eff) (pos? (double fc-elec-eff))
+                 (<= (double fc-elec-eff) 1.0))
+    (throw (ex-info "swap-schedule: :fc-elec-eff must be in (0, 1]"
+                    {:fc-elec-eff fc-elec-eff})))
+  (when-not (and (finite? cartridge-h2-kg) (pos? (double cartridge-h2-kg)))
+    (throw (ex-info "swap-schedule: :cartridge-h2-kg must be a positive number"
+                    {:cartridge-h2-kg cartridge-h2-kg})))
+  (when spare-cartridges
+    (when-not (and (number? spare-cartridges)
+                   (not (neg? spare-cartridges))
+                   (zero? (mod spare-cartridges 1)))
+      (throw (ex-info "swap-schedule: :spare-cartridges must be a non-negative integer"
+                      {:spare-cartridges spare-cartridges}))))
+  (when speeds-mps
+    (when-not (sequential? speeds-mps)
+      (throw (ex-info "swap-schedule: :speeds-mps must be a sequence of speeds"
+                      {:speeds-mps speeds-mps})))
+    (when-not (= (count speeds-mps) (inc (count fc-profile-kw)))
+      (throw (ex-info "swap-schedule: :speeds-mps must have (count fc-profile + 1) samples on the same :dt-s grid"
+                      {:speeds-count (count speeds-mps)
+                       :intervals (count fc-profile-kw)})))
+    (doseq [[i v] (map-indexed vector speeds-mps)]
+      (when-not (and (finite? v) (not (neg? (double v))))
+        (throw (ex-info "swap-schedule: speeds must be non-negative finite numbers"
+                        {:index i :speed-mps v})))))
+  (let [wh2  (/ (* 2.0 1.008) (+ 24.305 (* 2.0 1.008)))  ; exact stoichiometry, IUPAC 2021 (see cartridge ns provenance table)
+        lhv  LHV-H2-J
+        jpk  pt/J-per-kWh
+        cap  (double cartridge-h2-kg)
+        spares-avail (long (or spare-cartridges 0))
+        ;; single reduce over the profile: active cartridge state, spares
+        ;; left, per-interval rows, totals, and the residual ledger
+        step (fn [{:keys [active spares-left h2-total mgh2-total
+                          unmet total-swaps residuals] :as acc}
+                  [i p-kw]]
+               (let [e-kwh     (* (double p-kw) (double dt-s) (/ 3600.0))
+                     h2-demand (* e-kwh jpk (/ (double fc-elec-eff)) (/ lhv))]
+                 (loop [need    h2-demand
+                        active  active
+                        spares  spares-left
+                        swaps   0
+                        res     residuals
+                        h2      h2-total
+                        mgh2    mgh2-total
+                        unmet   unmet
+                        tswaps  total-swaps]
+                   (if (<= need 0.0)
+                     ;; this interval's demand is fully served (or was
+                     ;; zero): record the row, hand state back
+                     (let [row {:i i
+                                :fc-kw p-kw
+                                :e-kwh e-kwh
+                                :h2-kg h2-demand
+                                :mgh2-kg (/ h2-demand wh2)
+                                :active-cartridge-index (:index active)
+                                :active-remaining-kg (:remaining active)
+                                :swaps swaps
+                                :unmet-h2-kg 0.0}]
+                       (-> acc
+                           (assoc :active active :spares-left spares
+                                  :total-swaps tswaps :residuals res)
+                           (update :rows conj row)
+                           (assoc :h2-total (+ h2 h2-demand)
+                                  :mgh2-total (+ mgh2 (/ h2-demand wh2))
+                                  :e-total (+ (get acc :e-total) e-kwh)
+                                  :unmet unmet)))
+                     (if (pos? (:remaining active))
+                       ;; draw from the active cartridge
+                       (let [draw    (min need (:remaining active))
+                             active' {:index (:index active)
+                                      :installed-at (:installed-at active)
+                                      :remaining (- (:remaining active) draw)}]
+                         (recur (- need draw) active' spares swaps res
+                                h2 mgh2 unmet tswaps))
+                       ;; active cartridge empty → close it out (it
+                       ;; delivered H2 this mission), install a fresh
+                       ;; full one if a spare exists
+                       (let [res' (conj res
+                                        {:cartridge-index (:index active)
+                                         :installed-at-interval (:installed-at active)
+                                         :residual-h2-kg (:remaining active)
+                                         :exhausted-at-interval i})]
+                         (if (pos? spares)
+                           (recur need
+                                  {:index (inc (:index active))
+                                   :installed-at i
+                                   :remaining cap}
+                                  (dec spares) (inc swaps) res'
+                                  h2 mgh2 unmet (inc tswaps))
+                           ;; no spare left: report unmet and move on —
+                           ;; the deficit discipline, not an exception.
+                           ;; The placeholder active cartridge (remaining
+                           ;; 0) never delivers, so it is NOT closed into
+                           ;; the ledger and NOT counted as consumed.
+                           (let [row {:i i
+                                      :fc-kw p-kw
+                                      :e-kwh e-kwh
+                                      :h2-kg h2-demand
+                                      :mgh2-kg (/ h2-demand wh2)
+                                      :active-cartridge-index (:index active)
+                                      :active-remaining-kg 0.0
+                                      :swaps swaps
+                                      :unmet-h2-kg need}]
+                             (-> acc
+                                 (assoc :active {:index (inc (:index active))
+                                                 :installed-at i
+                                                 :remaining 0.0}
+                                        :spares-left 0
+                                        :total-swaps tswaps
+                                        :residuals res')
+                                 (update :rows conj row)
+                                 (assoc :h2-total (+ h2 h2-demand)
+                                        :mgh2-total (+ mgh2 (/ h2-demand wh2))
+                                        :e-total (+ (get acc :e-total) e-kwh)
+                                        :unmet (+ unmet need)))))))))))
+        init {:active {:index 0 :installed-at 0 :remaining cap}
+              :spares-left spares-avail
+              :rows [] :h2-total 0.0 :mgh2-total 0.0 :e-total 0.0
+              :unmet 0.0 :total-swaps 0 :residuals []}
+        out  (reduce step init (map-indexed vector fc-profile-kw))
+        rows (:rows out)
+        residuals (if (and (pos? (:remaining (:active out)))
+                           (< (:remaining (:active out)) cap))
+                    ;; the cartridge still active at mission end carries
+                    ;; real residual inventory
+                    (conj (:residuals out)
+                          {:cartridge-index (:index (:active out))
+                           :installed-at-interval (:installed-at (:active out))
+                           :residual-h2-kg (:remaining (:active out))
+                           :exhausted-at-interval-or-nil nil})
+                    (:residuals out))
+        residuals (vec residuals)
+        first-swap (some (fn [{:keys [swaps i]}]
+                           (when (pos? swaps) i))
+                         rows)
+        ;; every cartridge that delivered H2 appears in the residual
+        ;; ledger exactly once (exhausted mid-mission, or partial at
+        ;; mission end); the post-shortfall placeholder never delivers,
+        ;; never enters it
+        consumed (count residuals)
+        ;; ── optional range (composition with the caller's speed grid) ──
+        ;; Trapezoid midpoint speeds on the same :dt-s, the exact rule
+        ;; `vdesign.endurance` uses: credit intervals [0, first-unmet),
+        ;; i.e. everything up to but NOT including the first shortfall.
+        ;; From the first unmet interval on, the vehicle is out of H2
+        ;; and no distance is earned. A zero-draw interval has no
+        ;; shortfall, so it IS credited (the vehicle coasts).
+        first-unmet (some (fn [{:keys [i unmet-h2-kg]}]
+                            (when (pos? unmet-h2-kg) i))
+                          rows)
+        credited    (or first-unmet (count rows))
+        v-mids   (when speeds-mps
+                   (mapv (fn [[a b]] (/ (+ (double a) (double b)) 2.0))
+                         (partition 2 1 speeds-mps)))
+        range-m  (when v-mids
+                   (reduce + 0.0 (map (fn [v] (* v (double dt-s)))
+                                      (take credited v-mids))))]
+    (cond-> {:kind :cartridge-swap-schedule
+             :intervals rows
+             :h2 {:total-kg (:h2-total out)
+                  :total-mgh2-kg (:mgh2-total out)
+                  :total-e-kwh (:e-total out)
+                  :total-unmet-kg (:unmet out)
+                  :delivered-kg (- (:h2-total out) (:unmet out))}
+             :swaps {:count (:total-swaps out)
+                     :first-at-interval first-swap
+                     :total-cartridges-consumed consumed
+                     :spares-exhausted? (and (pos? (:unmet out))
+                                             (zero? (:spares-left out)))
+                     :residual-h2-kg (reduce + 0.0 (map :residual-h2-kg residuals))}
+             :range-km (if (some? range-m) (/ range-m 1000.0) :unmeasured)
+             :residual residuals
+             :provenance {:fc-elec-eff fc-elec-eff
+                          :eff-source eff-source
+                          :cartridge-h2-kg cartridge-h2-kg
+                          :cartridge-source cartridge-source
+                          :lhv-h2-j-per-kg lhv
+                          :j-per-kwh jpk
+                          :dt-s dt-s
+                          :w-h2-mgh2 wh2
+                          :swap-policy :draw-down
+                          :spare-cartridges (or spare-cartridges 0)}
+             :unmeasured {:fc-eff-operating-point true
+                          :desorption-kinetics true
+                          :heat-of-desorption true
+                          :plateau-pressure true
+                          :swap-duration true
+                          :swap-vent-losses true
+                          :partial-cartridge-refurbishment true
+                          ;; the speed grid is a caller-provided sample,
+                          ;; not a measurement this contract makes
+                          :speed-grid-interpolation true}}
+      label (assoc :label label)
+      id (assoc :case/id id))))

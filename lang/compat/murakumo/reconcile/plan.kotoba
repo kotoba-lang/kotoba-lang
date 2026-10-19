@@ -1,0 +1,320 @@
+;; murakumo.reconcile.plan — portable desired/observed -> reconcile plan core.
+;;
+;; W6 product-shell + T6.4: pure scalar + flag/action tokens + classifiers +
+;; reconcile-record-type require the shipped `:reconcile-plan` KIR on **every**
+;; platform. Host pure mirrors are gone — cljs/nbb must preload shipped KIR
+;; before requiring this ns (ADR-260731-w6-t64-task-reconcile-mirror-delete).
+;; Host remains: eligible-nodes / observed-hosts set algebra, variable-length
+;; pick-targets sort, reason strings, parse-flags reduce fold.
+
+(ns murakumo.reconcile.plan
+  (:require [kotoba.lang.coll :as set]
+            [kotoba.lang.text :as str]
+            [murakumo.connect :as connect]
+            [murakumo.kotoba.oracle :as oracle]))
+
+(def ^:private oid :reconcile-plan)
+
+(defn- o
+  "Call a pure export. Requires the shipped oracle on every platform (T6.4)."
+  [export args]
+  (oracle/require-ready! oid)
+  (oracle/call oid export args))
+
+(defn- o-record
+  "T5.2: structural host map → call-record (requires shipped oracle)."
+  [export host-map field-specs]
+  (oracle/require-ready! oid)
+  (oracle/call-record oid export host-map field-specs))
+
+(def flag-dry-run
+  "CLI token for dry-run. Kotoba SSoT."
+  (o 'flag-dry-run []))
+
+(def flag-apply
+  (o 'flag-apply []))
+
+(def flag-watch
+  (o 'flag-watch []))
+
+(def flag-watch-eq-prefix
+  (o 'flag-watch-eq-prefix []))
+
+(def flag-snapshot-prefix
+  (o 'flag-snapshot-prefix []))
+
+(def flag-dash-prefix
+  (o 'flag-dash-prefix []))
+
+(def action-satisfied
+  (o 'action-satisfied []))
+
+(def action-place
+  (o 'action-place []))
+
+(def action-over
+  (o 'action-over []))
+
+(def action-blocked
+  (o 'action-blocked []))
+
+(def action-needs-build
+  (o 'action-needs-build []))
+
+(def reconcile-record-type
+  "Atproto $type / collection NSID for fleet reconcile records. Kotoba SSoT."
+  (o 'reconcile-record-type []))
+
+(defn eligible-report
+  "Node names whose labels/roles/reach satisfy an app's `:placement` constraint,
+   together with whether the reach requirement was actually evaluated.
+
+   Reach degrades rather than blocks: with no connect declaration to evaluate
+   against, every node passes. That is a deliberate availability choice, but on
+   its own it makes two different outcomes look identical -- \"these nodes
+   satisfy the requirement\" and \"nobody checked\" both come back as a list of
+   names. A caller that cares which one it got had no way to ask.
+
+   `:reach-evaluated?` is that way. It is false exactly when a reach constraint
+   was requested and skipped, so an operator placing browser-live work can tell
+   whether the nodes were chosen or merely not excluded.
+
+   ADR-2608170400 P3-5 wants placement to fail closed when the declaration and
+   the observed listener inventory disagree. That needs an observed inventory,
+   which does not exist yet; this is the half that can be true beforehand."
+  ([fleet placement] (eligible-report fleet placement nil))
+  ([fleet {:keys [labels roles reach] :as _placement} connect-spec]
+   (let [reach-requested? (boolean (seq reach))
+         evaluated? (and reach-requested? (some? connect-spec))]
+     {:nodes (->> (:nodes fleet)
+                  (filter (fn [n]
+                            (and (every? (fn [[k v]] (= v (get (:labels n) k))) labels)
+                                 (every? (set (:roles n)) roles)
+                                 (or (not reach-requested?)
+                                     (nil? connect-spec)
+                                     (connect/serves-all? connect-spec n reach)))))
+                  (mapv :name))
+      :reach-requested? reach-requested?
+      :reach-evaluated? (boolean (or (not reach-requested?) evaluated?))})))
+
+(defn eligible-nodes
+  "Node names whose labels/roles/reach satisfy an app's `:placement` constraint.
+
+   See `eligible-report` when the caller needs to know whether a reach
+   requirement was evaluated or skipped."
+  ([fleet placement] (eligible-nodes fleet placement nil))
+  ([fleet placement connect-spec]
+   (:nodes (eligible-report fleet placement connect-spec))))
+
+(defn observed-hosts
+  "From a dash snapshot, build `cid -> #{node-name ...}` for hosted components."
+  [snapshot]
+  (reduce (fn [m n]
+            (reduce (fn [m cid] (update m cid (fnil conj #{}) (:name n)))
+                    m (:hosted n)))
+          {} (:nodes snapshot)))
+
+(defn- pick-targets
+  "Choose `n` placement targets, preferring least-loaded nodes, then name."
+  [candidates n load-by-node]
+  (->> candidates
+       (sort-by (juxt #(get load-by-node % 0) identity))
+       (take (max 0 n))
+       vec))
+
+(defn- desired-n
+  "Replica desired count — kotoba `desired` with Product Value ABI optional i64.
+   T5.2: structural map → call-record."
+  [replicas]
+  (oracle/i64->host
+   (o-record 'desired
+             {:replicas replicas}
+             [[:replicas :option-i64]])))
+
+(def ^:private deficit-schema
+  [:record :reconcile/deficit [[:desired :i64] [:running :i64]]])
+
+(defn- deficit-n
+  "T5.2: native guest record wire."
+  [desired running-count]
+  (oracle/i64->host
+   (o-record 'deficit
+             {:d (oracle/record deficit-schema
+                                {:desired desired :running running-count})}
+             [[:d :raw]])))
+
+(defn- action-kw
+  "Project reconcile-app inputs to kotoba `action-name` then keywordize.
+   T5.2 native guest record wire: single :reconcile/action-in argument."
+  [cid running-count desired free-candidates]
+  (keyword
+   (o-record 'action-name
+             {:x (oracle/record
+                  [:record :reconcile/action-in
+                   [[:cid [:option :string]]
+                    [:running :i64]
+                    [:desired-n :i64]
+                    [:free-candidates :i64]]]
+                  {:cid cid
+                   :running running-count
+                   :desired-n desired
+                   :free-candidates free-candidates})}
+             [[:x :raw]])))
+
+(defn reconcile-app
+  "Pure per-app reconciliation.
+
+   action in #{:needs-build :satisfied :place :over :blocked}"
+  [fleet snapshot connect-spec {:keys [name cid replicas placement] :as app}]
+  (let [desired   (desired-n replicas)
+        eligible  (set (eligible-nodes fleet placement connect-spec))
+        hosts     (get (observed-hosts snapshot) cid #{})
+        running   (set/intersection hosts eligible)
+        misplaced (set/difference hosts eligible)
+        deficit   (deficit-n desired (count running))
+        load      (into {} (map (fn [n] [(:name n) (count (:hosted n))]) (:nodes snapshot)))
+        candidates (vec (sort (set/difference eligible running)))
+        base      {:app name :cid cid :desired desired :manifest (:manifest app)
+                   :reach (vec (:reach placement))
+                   :eligible (vec (sort eligible))
+                   :running (vec (sort running))
+                   :misplaced (vec (sort misplaced))
+                   :deficit deficit}
+        action (action-kw cid
+                          (count running)
+                          desired
+                          (count candidates))]
+    (case action
+      :needs-build
+      (assoc base :action :needs-build
+             :reason "no :cid — compile :manifest (clj→wasm) to resolve a CID first")
+
+      :over
+      (assoc base :action :over
+             :reason (str (count running) " running > " desired
+                          " desired (no auto-evict; lower :replicas or stop a node)"))
+
+      :satisfied
+      (assoc base :action :satisfied)
+
+      :blocked
+      (assoc base :action :blocked
+             :reason (str "need " deficit " more but no eligible node free"
+                          " (eligible=" (count eligible)
+                          ", running=" (count running) ")"))
+
+      :place
+      (let [targets (pick-targets candidates deficit load)]
+        (if (empty? targets)
+          (assoc base :action :blocked
+                 :reason (str "need " deficit " more but no eligible node free"
+                              " (eligible=" (count eligible)
+                              ", running=" (count running) ")"))
+          (assoc base :action :place :targets targets)))
+
+      (assoc base :action :satisfied))))
+
+(defn reconcile-plan
+  "Pure whole-fleet plan. `ts` is caller-supplied so this namespace has no clock."
+  [fleet snapshot connect-spec manifest ts]
+  {:ts ts
+   :fleet (:fleet/name fleet)
+   :apps (mapv #(reconcile-app fleet snapshot connect-spec %) (:apps manifest))})
+
+(defn- action-is-satisfied?
+  "Kotoba `action-is-satisfied?`. Profile 5: guest :bool."
+  [action]
+  (oracle/bool->host
+   (o-record 'action-is-satisfied? {:action_is_satisfied (name action)} [[:action_is_satisfied :string]])))
+
+(defn- action-is-place?
+  "Kotoba `action-is-place?`. Profile 5: guest :bool."
+  [action]
+  (oracle/bool->host
+   (o-record 'action-is-place? {:action_is_place (name action)} [[:action_is_place :string]])))
+
+(defn plan-converged?
+  "True when every app is satisfied."
+  [plan]
+  (every? #(action-is-satisfied? (:action %)) (:apps plan)))
+
+(defn apply-apps
+  "Apps that require an apply pass."
+  [plan]
+  (filterv #(action-is-place? (:action %)) (:apps plan)))
+
+(defn apply-targets
+  "Flatten :place apps into one (app, target) deploy pair PER target node."
+  [plan]
+  (vec (for [a (apply-apps plan) target (:targets a)]
+         {:app a :target target})))
+
+(defn watch-sleep-ms
+  "Milliseconds to sleep between reconcile watch iterations."
+  [seconds]
+  (oracle/i64->host (o-record 'watch-sleep-ms {:seconds seconds} [[:seconds :i64]])))
+
+(defn- watch-seconds
+  "Seconds for --watch / --watch=N."
+  [a]
+  (oracle/i64->host (o-record 'watch-seconds {:a a} [[:a :string]])))
+
+(defn- snapshot-value
+  "Path after --snapshot=."
+  [a]
+  (o-record 'snapshot-value {:a a} [[:a :string]]))
+
+(defn- flag-is-dry-run? [a]
+  (oracle/bool->host (o-record 'flag-is-dry-run? {:a a} [[:a :string]])))
+
+(defn- flag-is-apply? [a]
+  (oracle/bool->host (o-record 'flag-is-apply? {:a a} [[:a :string]])))
+
+(defn- flag-is-watch? [a]
+  (oracle/bool->host (o-record 'flag-is-watch? {:a a} [[:a :string]])))
+
+(defn- flag-is-snapshot? [a]
+  (oracle/bool->host (o-record 'flag-is-snapshot? {:a a} [[:a :string]])))
+
+(defn- flag-is-dash? [a]
+  (oracle/bool->host (o-record 'flag-is-dash? {:a a} [[:a :string]])))
+
+(defn parse-flags
+  "Parse reconcile CLI flags into data. Reduce fold stays host."
+  [args]
+  (reduce (fn [m a]
+            (cond
+              (flag-is-dry-run? a) (assoc m :dry-run true)
+              (flag-is-apply? a) (assoc m :apply true)
+              (flag-is-watch? a) (assoc m :watch (watch-seconds a))
+              (flag-is-snapshot? a) (assoc m :snapshot (snapshot-value a))
+              (flag-is-dash? a) m
+              :else (assoc m :manifest a)))
+          {} args))
+
+(defn reconcile-command-error
+  "Validation error keyword for reconcile command flags, or nil."
+  [{:keys [manifest]}]
+  (when (oracle/bool->host
+         (o-record 'missing-manifest? {:manifest manifest} [[:manifest :string]]))
+    :missing-manifest))
+
+(defn reconcile-app-record
+  "Compact per-app summary stored in reconcile history records."
+  [app]
+  {:app (:app app)
+   :cid (:cid app)
+   :desired (:desired app)
+   :running (count (:running app))
+   :action (name (:action app))
+   :targets (vec (:targets app))})
+
+(defn reconcile-record
+  "Build the atproto record payload for a reconcile plan."
+  [plan plan-json]
+  {:$type reconcile-record-type
+   :ts (:ts plan)
+   :fleet (:fleet plan)
+   :converged (plan-converged? plan)
+   :apps (mapv reconcile-app-record (:apps plan))
+   :plan plan-json})

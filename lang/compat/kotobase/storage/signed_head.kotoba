@@ -1,0 +1,192 @@
+(ns kotobase.storage.signed-head
+  "A ref plane that needs no conditional write from its host.
+
+  `:linearizable-ref` backends enforce the compare-and-set themselves, which
+  is the strongest thing to have and the least available: Backblaze B2 has no
+  conditional put on either API, IPNS publishes unconditionally, and a
+  content-addressed or erasure-coded network has nothing to be conditional
+  about at all. Requiring one shuts those hosts out of the ref plane entirely.
+
+  This makes the head a SIGNED, SEQUENCED record stored as an ordinary
+  immutable block, with a dumb unconditional pointer naming the newest one:
+
+      head/v1 = {ref-name, seq, cid, prev, issuer, sig}
+
+  What that buys, precisely:
+
+  1. **Fork detection.** Two heads at the same `seq` are two heads, and a
+     reader can see it. A plain overwritten pointer loses an update with no
+     evidence that anything happened.
+  2. **Untrusted hosting.** A reader verifies the issuer's signature and the
+     sequence itself, so a mirror, CDN or storage node it does not trust can
+     serve the ref. This is what lets the block plane and the ref plane live
+     on the same untrusted infrastructure.
+  3. **The loser learns it lost.** After publishing, the writer re-reads the
+     pointer; if the newest head is not its own, it reports `:published?
+     false` rather than believing it won.
+
+  What it does NOT buy, and the profile says so: **agreement**. A signature
+  proves who issued a head, not that no one else issued another. Two writers
+  racing still fork; this makes the fork visible instead of silent. So the
+  declared profile is `:single-writer-ref`, and a correct deployment still
+  puts one writer in front of it — a Durable Object, an actor, a lease.
+  Declaring `:linearizable-ref` here would be exactly the silent-success
+  failure `ref-profiles` exists to prevent."
+  (:require [kotobase.storage.core :as storage]))
+
+(def head-version "kotobase.head/v1")
+
+(defn head-record
+  "The canonical map a signer signs and a verifier checks. Kept as one
+  function so both sides cannot drift."
+  [{:keys [ref-name seq cid prev issuer]}]
+  {"v" head-version
+   "ref" ref-name
+   "seq" seq
+   "cid" cid
+   "prev" prev
+   "issuer" issuer})
+
+(defn- addressed-to?
+  "Is this head the head OF `ref-name`, issued by someone this store accepts?
+
+  Both halves are the difference between checking a signature and checking
+  authority, and both were missing until 2026-08-04:
+
+  **The ref name.** `read-head!` is documented as reading from a host that is
+  not trusted — that is the whole premise. `\"ref\"` is inside the signed
+  record, but nothing compared it to the name actually being read, so the same
+  host could answer a read for ref B with ref A's genuinely-signed head and it
+  verified. A reader then gets ref A's CID under ref B: not corruption the
+  signature can catch, because nothing was forged.
+
+  **The issuer.** `verify-fn` is called with the issuer the record NAMES, so
+  the check was \"somebody signed this\", which any keypair satisfies. An
+  untrusted host substituting a head signed by its own key passed. Verifying a
+  signature by an unconstrained issuer is not evidence about an untrusted
+  host, and untrusted hosting is precisely what this namespace claims to buy."
+  [head ref-name accept-issuer?]
+  (and (= ref-name (get head "ref"))
+       (accept-issuer? (get head "issuer"))))
+
+(defn- verify-chain
+  "Verified head map, or nil. A head that fails verification is treated as
+  absent rather than as an error: an untrusted host is expected to be able to
+  serve rubbish, and the caller's job is to not believe it."
+  [head ref-name accept-issuer? verify-fn]
+  (when (and (map? head)
+             (= head-version (get head "v"))
+             (integer? (get head "seq"))
+             (addressed-to? head ref-name accept-issuer?)
+             (verify-fn (head-record {:ref-name (get head "ref")
+                                      :seq (get head "seq")
+                                      :cid (get head "cid")
+                                      :prev (get head "prev")
+                                      :issuer (get head "issuer")})
+                        (get head "sig")
+                        (get head "issuer")))
+    head))
+
+(defrecord SignedHeadRefStore [read-head! write-head! sign-fn verify-fn issuer
+                               accept-issuer?]
+  storage/IRefStore
+  (-read-ref [_ ref-name]
+    (when-let [head (verify-chain (read-head! ref-name) ref-name accept-issuer? verify-fn)]
+      {:cid (get head "cid")
+       :version (get head "seq")}))
+
+  (-compare-and-set-ref! [this ref-name expected next-cid]
+    (let [current (storage/-read-ref this ref-name)]
+      (if (not= expected (:cid current))
+        {:published? false :current (:cid current) :version (:version current)}
+        (let [seq' (inc (or (:version current) -1))
+              record (head-record {:ref-name ref-name :seq seq' :cid next-cid
+                                   :prev (:cid current) :issuer issuer})
+              head (assoc record "sig" (sign-fn record))]
+          (write-head! ref-name head)
+          ;; The write was unconditional, so winning is not assumed: re-read
+          ;; and check whose head is actually there. Without this a losing
+          ;; writer returns published? true and the caller proceeds on a head
+          ;; that no longer exists.
+          (let [after (verify-chain (read-head! ref-name) ref-name accept-issuer? verify-fn)]
+            (if (and after (= seq' (get after "seq")) (= next-cid (get after "cid")))
+              {:published? true :current next-cid :version seq'}
+              {:published? false
+               :current (get after "cid")
+               :version (get after "seq")}))))))
+
+  storage/IBackendCapabilities
+  (-capabilities [_]
+    ;; NOT :linearizable-ref. See the namespace docstring: a signature proves
+    ;; authorship, not exclusivity.
+    #{:conditional-ref :single-writer-ref}))
+
+(defn open
+  "A ref store over an unconditional pointer.
+
+  `:read-head!`  (fn [ref-name]) -> head map or nil
+  `:write-head!` (fn [ref-name head]) -> ignored; may overwrite unconditionally
+  `:sign-fn`     (fn [record]) -> signature
+  `:verify-fn`   (fn [record signature issuer]) -> truthy
+  `:issuer`      identifier recorded in every head this store publishes
+  `:accept-issuer?` (fn [issuer]) -> truthy; OPTIONAL, defaults to accepting
+                 only `:issuer` itself
+
+  The pointer can be anything that stores bytes under a name without
+  conditions: an S3 PUT, an IPNS publish, a file. That is the point — the host
+  is not being asked for a guarantee it cannot give.
+
+  **`:accept-issuer?` defaults to strict, and that is a behaviour change as of
+  2026-08-04.** Reads previously accepted a head signed by ANY issuer the
+  record happened to name, which makes the signature check say only \"somebody
+  signed this\" — no evidence at all against the untrusted host this namespace
+  is built for. The documented deployment model is one writer per ref, so its
+  own `:issuer` is the right default. A deployment that rotated signing
+  identities, or hands a ref between issuers on purpose, passes its own
+  predicate (e.g. `#(contains? known-issuers %)`) — which is then a stated
+  decision rather than the absence of one."
+  [{:keys [read-head! write-head! sign-fn verify-fn issuer accept-issuer?]}]
+  (doseq [[k v] {:read-head! read-head! :write-head! write-head!
+                 :sign-fn sign-fn :verify-fn verify-fn}]
+    (when-not (ifn? v)
+      (throw (ex-info "signed-head ref store is missing a port"
+                      {:type :kotobase.storage/invalid-configuration
+                       :missing k}))))
+  (when (nil? issuer)
+    (throw (ex-info "signed-head ref store requires an issuer"
+                    {:type :kotobase.storage/invalid-configuration
+                     :missing :issuer})))
+  (->SignedHeadRefStore read-head! write-head! sign-fn verify-fn issuer
+                        (or accept-issuer? #(= issuer %))))
+
+(defn forked?
+  "True when `a` and `b` are different heads claiming the same sequence — the
+  evidence a plain overwritten pointer cannot produce."
+  [a b]
+  (boolean (and a b
+                (= (get a "seq") (get b "seq"))
+                (not= (get a "cid") (get b "cid")))))
+
+;; ── the same ref plane, for a pointer that answers with a Promise ───────────
+;;
+;; Not a convenience. Everything above is synchronous, and the hosts this
+;; namespace exists FOR are not: B2, IPNS, S3, a content-addressed network.
+;; Each of those is reached over the network, and on the runtime that ships
+;; the Worker that means a Promise. So the sync store could not be attached to
+;; a single host it was designed for -- the same asymmetry prolly-tree has,
+;; where `scan-prefix` grew an async variant and the write path never did.
+;;
+;; `sign-fn`/`verify-fn` are Promise-returning here too, because Web Crypto has
+;; no synchronous signature primitive; that is the same platform split
+;; `arrangement`'s `blind-fn`/`encrypt-fn` already carry.
+;;
+;; The one thing that must not be lost in translation: the write is AWAITED
+;; before the re-read. The sync version's correctness rests on reading back
+;; what is actually there after publishing, and a `write-head!` whose Promise
+;; is dropped would be re-read before it landed -- turning the loser-detects-
+;; loss check into a coin flip.
+
+
+
+
+

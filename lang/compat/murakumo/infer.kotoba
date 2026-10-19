@@ -1,0 +1,1149 @@
+;; murakumo.infer — fleet distributed inference, exo-style (kbb -M:command layer).
+;;
+;; The pure planning/engine core lives in murakumo.infer.plan / .engine (cljc —
+;; portable into the JVM tests, cloud-murakumo, and kotoba WASM). This namespace
+;; is the terminal operator: probe the fleet's live memory over SSH, cut the
+;; memory-weighted shard plan, push binaries, run the ring, talk to the model.
+;;
+;;   npm run task -- infer probe                 live mem/disk/GPU map of the fleet
+;;   npm run task -- infer plan  <model>         shard plan table + go/no-go gate
+;;   npm run task -- infer provision [sel]       rsync rpc-server + raise GPU wired limit
+;;   npm run task -- infer up|down|ps [sel]      start/stop/inspect the worker ring
+;;   npm run task -- infer serve <model> <gguf>  run the head (llama-server, OpenAI API)
+;;   npm run task -- infer generate "<prompt>"   one completion via the head's /v1 API
+;;   npm run task -- infer relay [port]          run a work-dispatch relay (murakumo.infer.relay-server)
+;;   npm run task -- infer join [url] --model m  join a relay as a :native worker, earn
+;;                                            credits for served completions (see
+;;                                            murakumo.infer.relay-worker)
+;;
+;; A model whose registry entry carries `:model/engine :mlx-moe` (mu-hashmi/
+;; mlx-moe) skips the fleet-wide ring entirely: `plan`/`provision`/`serve` cut
+;; over to murakumo.infer.moe's single-node planner instead of
+;; murakumo.infer.plan's layer partition — see cmd-plan-moe / cmd-serve-moe.
+;;
+;; `:model/engine :waste` (sqliteai/waste) is the same single-node cut-over
+;; with the constraint inverted: mlx-moe is gated on RAM, waste on DISK. A
+;; K3-class container is ~1 TB and the experts are read from it every token,
+;; so cmd-plan-waste ranks candidates by free disk BEFORE memory and reports
+;; the disk-bound throughput ceiling — see murakumo.infer.waste.
+
+(ns murakumo.infer
+  (:require [babashka.process :as p]
+            [json.compat :as json]
+            [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [murakumo.fleet :as fleet]
+            [murakumo.infer.engine :as engine]
+            [murakumo.infer.expert-stream :as expert-stream]
+            [murakumo.infer.moe :as moe]
+            [murakumo.infer.plan :as plan]
+            [murakumo.infer.waste :as waste]
+            [murakumo.ssh :as ssh]))
+
+(def ^:private plan-file ".murakumo-infer-plan.edn")  ; last cut plan (control-plane state)
+(def ^:private remote-bin "$HOME/.murakumo/bin")
+(def ^:private remote-env (str "DYLD_LIBRARY_PATH=" remote-bin ":$DYLD_LIBRARY_PATH "))
+
+(defn- load-config [] (edn/read-string (slurp "infer.edn")))
+
+(defn- api-host
+  "Host name for HTTP clients. SSH hosts may be written user@host."
+  [node]
+  (or (:api-host node)
+      (some-> (:host node) (str/split #"@") last)))
+
+(defn- gib [x] (long (* x plan/GiB)))
+
+(defn- infer-nodes
+  "Mesh fleet ∪ :infer/extra-nodes, Tailscale-enriched."
+  [cfg]
+  (let [f (fleet/enrich (fleet/load-fleet))
+        extra (:infer/extra-nodes cfg)]
+    (concat (:nodes f) extra)))
+
+(defn same-physical-node?
+  "True when an inventory row is the configured inference head.
+
+   The fleet may name a machine (for example `gad`) while :infer/head reaches
+   the same machine as `root@100.x.y.z`.  Comparing :host strings alone counted
+   that physical host twice: once as an RPC worker and once as the conductor.
+   Prefer the explicit :node-name identity, then match the head's host (without
+   its SSH user) against the inventory host/IP surfaces."
+  [head node]
+  (let [host-only #(some-> % str (str/split #"@") last)
+        head-host (host-only (:host head))]
+    (or (and (:node-name head) (= (:node-name head) (:name node)))
+        (and head-host
+             (or (= head-host (host-only (:host node)))
+                 (= head-host (:ip node))
+                 (= head-host (:rpc-ip node)))))))
+
+(defn worker-nodes
+  "Inventory rows eligible for probing, with the physical head removed once."
+  [cfg nodes]
+  (remove #(same-physical-node? (:infer/head cfg) %) nodes))
+
+(defn- probe-node
+  "SSH one node for its live memory/disk/GPU facts → plan-ready node map (nil if
+   unreachable). One retry — a fleet-wide parallel sweep can transiently drop an
+   SSH handshake, and losing a node silently shrinks the plan."
+  [cfg n]
+  (let [probe #(ssh/sh (:host n)
+                       "if sysctl -n hw.memsize >/dev/null 2>&1; then sysctl -n hw.memsize; else awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo; fi; df -k / | tail -1 | awk '{print $4}'; sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0")
+        r (probe)
+        {:keys [exit out]} (if (zero? (:exit r)) r (probe))]
+    (when (zero? exit)
+      (let [[mem disk-k wired] (str/split-lines out)
+            wired-mb (parse-long (str/trim wired))]
+        (assoc n
+               :mem-bytes (parse-long (str/trim mem))
+               :disk-free-bytes (* 1024 (parse-long (str/trim disk-k)))
+               :os-reserve-bytes (gib (:infer/node-os-reserve-gib cfg 5/2))
+               :headroom-bytes (gib (:infer/node-headroom-gib cfg 5/4))
+               ;; 0 = macOS default cap (~70 %); only an explicit raise is credited.
+               :wired-limit-bytes (when (pos? wired-mb) (* 1024 1024 wired-mb))
+               :rpc-cache? (>= (* 1024 (parse-long (str/trim disk-k)))
+                               (gib (:infer/cache-min-free-gib cfg 20))))))))
+
+(defn- probe-fleet
+  "All inference workers probed in parallel + the head (local operator machine,
+   or a fleet node when the head is :remote? — the operator being off the fleet
+   LAN would otherwise put a WAN hop inside every token)."
+  [cfg]
+  (let [head-cfg (:infer/head cfg)
+        workers (->> (worker-nodes cfg (infer-nodes cfg))
+                     (pmap #(probe-node cfg %))
+                     (filter some?)
+                     vec)
+        head (if (:remote? head-cfg)
+               (probe-node cfg head-cfg)
+               (let [mem (-> (p/sh "sysctl" "-n" "hw.memsize") :out str str/trim parse-long)
+                     disk-k (-> (p/sh "sh" "-c" "df -k / | tail -1 | awk '{print $4}'")
+                                :out str str/trim parse-long)
+                     wired-mb (-> (p/sh "sh" "-c" "sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0")
+                                  :out str str/trim parse-long)]
+                 (assoc head-cfg
+                        :mem-bytes mem
+                        :disk-free-bytes (* 1024 disk-k)
+                        :headroom-bytes (gib (:infer/head-headroom-gib cfg
+                                               (:infer/node-headroom-gib cfg 5/4)))
+                        :wired-limit-bytes (when (pos? wired-mb) (* 1024 1024 wired-mb))
+                        :rpc-cache? (>= (* 1024 disk-k)
+                                        (gib (:infer/cache-min-free-gib cfg 20))))))]
+    {:workers workers
+     :head (assoc head
+                  :head? true
+                  :os-reserve-bytes (gib (:os-reserve-gib head-cfg 12))
+                  :headroom-bytes (gib (:infer/head-headroom-gib cfg
+                                         (:infer/node-headroom-gib cfg 5/4))))}))
+
+(defn- model-or-die [cfg id]
+  (or (get (:models cfg) id)
+      (do (println (str "unknown model " (pr-str id) " — known: "
+                        (str/join ", " (keys (:models cfg)))))
+          (System/exit 1))))
+
+(defn- model-dir
+  "The on-disk directory holding `model`'s GGUF on the head. :infer/head
+   :model-dir is a single global path (currently GLM's) — only correct for
+   whichever model it was last pointed at. A registry entry's own :model/dir
+   (when present) always wins, so serving any other model doesn't silently
+   build a path into the wrong model's directory (verified failure mode,
+   2026-07-15: qwen-agentworld-35b-a3b resolved into GLM-5.2-REAP50-Q2_K-GGUF/
+   and llama-server exited immediately)."
+  [head-cfg model]
+  (or (:model/dir model) (:model-dir head-cfg)))
+
+(defn- standalone-unit
+  "systemd unit text for the head's standalone llama-server. serve-standalone
+   が /etc/systemd/system/murakumo-standalone.service へ書く — nohup 起動
+   (旧実装)は Restart 無しで、プロセスが死ぬと infer.murakumo.cloud ごと
+   落ちたままになる(実障害 2026-07-15: club-shinshi chat の 502 の根本原因。
+   cloudflared は生きているのに origin :8090 が不在)。systemd 化で
+   crash/再起動を跨いで自己復旧する。User=gad は既存 llama-server.service
+   (gemma :11434)と同じ運用。"
+  [cmd]
+  (str "[Unit]\n"
+       "Description=murakumo standalone llama-server (managed by `npm run task -- infer serve-standalone`)\n"
+       "After=network-online.target\n"
+       "Wants=network-online.target\n"
+       "\n"
+       "[Service]\n"
+       "Type=simple\n"
+       "User=gad\n"
+       "ExecStart=" cmd "\n"
+       "Restart=always\n"
+       "RestartSec=5\n"
+       "\n"
+       "[Install]\n"
+       "WantedBy=multi-user.target\n"))
+
+(defn- endpoint-wait-command
+  "systemd ExecStartPre body: never start a partial ring. Every configured RPC
+   worker must accept TCP before llama-server snapshots its device list."
+  [endpoints]
+  (str "i=0; while :; do missing=0; "
+       (apply str
+              (for [{:keys [ip port]} endpoints]
+                (str "/usr/bin/nc -z -w 2 " ip " " port " || missing=1; ")))
+       "[ \"$missing\" -eq 0 ] && break; i=$((i + 1)); "
+       "[ \"$i\" -ge 60 ] && exit 1; sleep 2; done; "
+       ;; rpc-server opens LISTEN before Metal/device initialization is fully
+       ;; ready to answer the first protocol exchange. A head launched in that
+       ;; gap can segfault or silently omit the rank despite a green TCP probe.
+       "sleep 5; "))
+
+(defn- ring-unit
+  "Boot-persistent distributed llama.cpp RPC head. The workers are deliberately
+   not managed by this unit: cmd-up owns them, while the head restarts without
+   killing unrelated llama-server instances (standalone fallback and embed).
+   ExecStartPre prevents llama.cpp from silently accepting a partial rank set."
+  [cmd endpoints]
+  (str "[Unit]\n"
+       "Description=murakumo distributed llama.cpp RPC head\n"
+       "After=network-online.target\n"
+       "Wants=network-online.target\n"
+       "\n"
+       "[Service]\n"
+       "Type=simple\n"
+       "User=gad\n"
+       "ExecStartPre=/bin/sh -ec '" (endpoint-wait-command endpoints) "'\n"
+       "ExecStart=" cmd "\n"
+       "Restart=always\n"
+       "RestartSec=5\n"
+       "\n"
+       "[Install]\n"
+       "WantedBy=multi-user.target\n"))
+
+(def ^:private ring-watchdog-grace-seconds 420)
+(def ^:private ring-watchdog-event-log "/var/lib/murakumo/ring-watchdog-events.log")
+(def ^:private rpc-worker-label "com.murakumo.rpc-worker")
+(def ^:private rpc-ha-key "/etc/murakumo/rpc-ha-key")
+
+(def ^:private tailscaled-label
+  "The daemon whose loss makes a node unreachable.
+
+  Measured 2026-09-09 on dan and judah: homebrew installs tailscaled as
+  `/Library/LaunchDaemons/homebrew.mxcl.tailscale.plist`. Not
+  `com.tailscale.tailscaled` — `launchctl print` on that name reports nothing,
+  and a recovery command aimed at a label that does not exist fails in exactly
+  the way a recovery command aimed at a healthy node does."
+  "homebrew.mxcl.tailscale")
+
+(defn- rpc-ha-authorized-key
+  "The constrained recovery entry: a forced command, no shell, no arguments.
+
+  It kickstarts TWO daemons now, tailscaled first. Until 2026-09-09 it
+  kickstarted only the RPC worker, which meant the one key that exists for
+  recovering a node could not recover the one failure that makes a node
+  unrecoverable. levi proved it that day: swap death killed tailscaled, macOS
+  sshd kept answering on 22, no key authenticated, and this key — present and
+  working, verified the same hour against judah — could only have restarted a
+  daemon nobody needed.
+
+  Order is load-bearing. tailscaled restores the way in; if the second command
+  fails the first has already run. There is still no argument and still no
+  choice for the caller: connecting with this key runs exactly these two
+  kickstarts, which is the whole capability it grants."
+  [pub]
+  (str "restrict,command=\"sudo -n /bin/launchctl kickstart -k system/"
+       tailscaled-label
+       "; sudo -n /bin/launchctl kickstart -k system/"
+       rpc-worker-label "\" " (str/trim pub)))
+
+(defn- rpc-ha-legacy-authorized-key
+  "The entry this fleet installed before 2026-09-09, so a re-provision can
+  remove it rather than leave two forced commands for one key."
+  [pub]
+  (str "restrict,command=\"sudo -n /bin/launchctl kickstart -k system/"
+       rpc-worker-label "\" " (str/trim pub)))
+
+(defn- worker-user
+  [node]
+  (let [host (str (:host node))]
+    (if (str/includes? host "@")
+      (first (str/split host #"@" 2))
+      (str (:name node)))))
+
+(defn- worker-specs
+  [pl cfg]
+  (let [default-port (:infer/rpc-port cfg engine/default-rpc-port)]
+    (mapv (fn [{:keys [node]}]
+            (let [ip (or (:rpc-ip node) (:ip node))
+                  port (or (:rpc-port node) default-port)]
+              {:name (:name node)
+               :host (:host node)
+               :user (worker-user node)
+               :ip ip
+               :port port
+               :target (str (worker-user node) "@" ip)}))
+          (engine/workers pl))))
+
+(defn- rpc-worker-plist
+  "Boot-persistent worker process. launchd owns crash/reboot recovery; the head
+   watchdog's constrained SSH key owns wedge recovery."
+  [user home port device cache?]
+  (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+       "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+       "<plist version=\"1.0\"><dict>\n"
+       "<key>Label</key><string>" rpc-worker-label "</string>\n"
+       "<key>UserName</key><string>" user "</string>\n"
+       "<key>ProgramArguments</key><array>\n"
+       "<string>" home "/.murakumo/bin/rpc-server</string>\n"
+       "<string>-H</string><string>0.0.0.0</string>\n"
+       "<string>-p</string><string>" port "</string>\n"
+       "<string>-d</string><string>" device "</string>\n"
+       (when cache? "<string>-c</string>\n")
+       "</array>\n"
+       "<key>EnvironmentVariables</key><dict><key>DYLD_LIBRARY_PATH</key><string>"
+       home "/.murakumo/bin</string></dict>\n"
+       "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n"
+       "<key>ThrottleInterval</key><integer>5</integer>\n"
+       "<key>StandardOutPath</key><string>/tmp/murakumo-rpc.log</string>\n"
+       "<key>StandardErrorPath</key><string>/tmp/murakumo-rpc.log</string>\n"
+       "</dict></plist>\n"))
+
+(defn- ring-watchdog-script
+  "Recover the whole failure domain, in order: stop the head so stale RPC
+   sessions close, force-restart every worker through a command-restricted SSH
+   key, wait for every endpoint, then start a full-rank head.
+
+   llama.cpp can serialize /slots behind an active decode.  Treat established
+   client connections as busy, not wedged, and re-check them after each failed
+   probe to close the arrival race.  A genuinely idle wedge must fail two
+   probes separated by five seconds before recovery.  Every decision is
+   appended to a bounded, logrotate-managed soak ledger."
+  [port specs]
+  (let [targets (str/join " " (map :target specs))
+        waits (endpoint-wait-command specs)]
+    (str "#!/bin/sh\n"
+         "set -eu\n"
+         "event_log=" ring-watchdog-event-log "\n"
+         "/usr/bin/install -d -m 0755 /var/lib/murakumo\n"
+         "started_us=$(/usr/bin/systemctl show murakumo-ring.service -p ActiveEnterTimestampMonotonic --value)\n"
+         "pid=$(/usr/bin/systemctl show murakumo-ring.service -p MainPID --value)\n"
+         "now_s=$(/usr/bin/cut -d. -f1 /proc/uptime)\n"
+         "started_s=$((started_us / 1000000))\n"
+         "if [ $((now_s - started_s)) -lt " ring-watchdog-grace-seconds " ]; then exit 0; fi\n"
+         "record() { /usr/bin/printf 'ts=%s event=%s pid=%s started_us=%s clients=%s\\n' \"$(/usr/bin/date -u +%s)\" \"$1\" \"$pid\" \"$started_us\" \"${2:-0}\" >> \"$event_log\"; }\n"
+         "clients() { /usr/bin/ss -Htn state established '( sport = :" port " )' | /usr/bin/wc -l; }\n"
+         "active=$(clients)\n"
+         "if [ \"$active\" -gt 0 ]; then record busy \"$active\"; exit 0; fi\n"
+         "if /usr/bin/curl -fsS --max-time 10 http://127.0.0.1:" port "/slots >/dev/null; then record healthy; exit 0; fi\n"
+         "active=$(clients)\n"
+         "if [ \"$active\" -gt 0 ]; then record busy-after-probe \"$active\"; exit 0; fi\n"
+         "/usr/bin/sleep 5\n"
+         "if /usr/bin/curl -fsS --max-time 10 http://127.0.0.1:" port "/slots >/dev/null; then record recovered-probe; exit 0; fi\n"
+         "active=$(clients)\n"
+         "if [ \"$active\" -gt 0 ]; then record busy-after-confirmation \"$active\"; exit 0; fi\n"
+         "record rebuilding\n"
+         "/usr/bin/logger -t murakumo-ring-watchdog 'two idle slot probes failed; rebuilding all RPC sessions'\n"
+         "/usr/bin/systemctl stop murakumo-ring.service\n"
+         "failed=0\n"
+         "for target in " targets "; do\n"
+         "  /usr/bin/ssh -i " rpc-ha-key " -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \"$target\" restart || failed=1\n"
+         "done\n"
+         "[ \"$failed\" -eq 0 ] || exit 1\n"
+         waits "\n"
+         "/usr/bin/systemctl start murakumo-ring.service\n"
+         "pid=$(/usr/bin/systemctl show murakumo-ring.service -p MainPID --value)\n"
+         "started_us=$(/usr/bin/systemctl show murakumo-ring.service -p ActiveEnterTimestampMonotonic --value)\n"
+         "record rebuilt\n")))
+
+(defn- ring-watchdog-logrotate []
+  (str ring-watchdog-event-log " {\n"
+       "  weekly\n"
+       "  rotate 12\n"
+       "  compress\n"
+       "  missingok\n"
+       "  notifempty\n"
+       "  create 0644 root root\n"
+       "}\n"))
+
+(defn- ring-watchdog-unit
+  "Probe the slot scheduler, not merely the process. The RPC head can remain
+   systemd-active while every request and /slots hangs after a cancelled RPC
+   decode. Skip the cold-load window, then restart that wedged head."
+  [_port]
+  (str "[Unit]\n"
+       "Description=murakumo distributed ring liveness watchdog\n"
+       "After=murakumo-ring.service\n"
+       "\n"
+       "[Service]\n"
+       "Type=oneshot\n"
+       "ExecStart=/usr/local/sbin/murakumo-ring-watchdog\n"))
+
+(defn- ring-watchdog-timer []
+  (str "[Unit]\n"
+       "Description=periodically verify murakumo distributed ring slots\n"
+       "\n"
+       "[Timer]\n"
+       "OnBootSec=30s\n"
+       "OnUnitActiveSec=30s\n"
+       "AccuracySec=5s\n"
+       "Unit=murakumo-ring-watchdog.service\n"
+       "\n"
+       "[Install]\n"
+       "WantedBy=timers.target\n"))
+
+(defn- moe? [model] (= :mlx-moe (:model/engine model)))
+
+(defn- waste? [model] (= :waste (:model/engine model)))
+
+(defn- expert-stream? [model]
+  (= :expert-aware-nvme (:model/engine model)))
+
+(defn- moe-opt
+  [cfg model k]
+  (or (get model (keyword "model" (name k)))
+      (get-in cfg [:infer/mlx-moe k])))
+
+(defn- probe-and-plan
+  "Probe the fleet + :infer/extra-nodes and hand every candidate to `plan-fn`
+   (murakumo.infer.plan/plan or murakumo.infer.moe/plan — same 2-arg shape,
+   [model nodes])."
+  [cfg model plan-fn]
+  (let [{:keys [workers head]} (probe-fleet cfg)]
+    (plan-fn model (conj workers head))))
+
+(defn- cut-plan
+  "Probe + partition: workers in fleet order, the head as the LAST ring member
+   (llama.cpp device order = RPC workers first, local GPU last)."
+  [cfg model]
+  (probe-and-plan cfg model plan/plan))
+
+(defn- cut-plan-moe
+  "Probe the fleet + :infer/extra-nodes and hand every candidate to
+   murakumo.infer.moe/plan — it alone picks the single best-memory node (no
+   ring, so the :infer/head config doesn't apply here)."
+  [cfg model]
+  (probe-and-plan cfg model moe/plan))
+
+(defn- cut-plan-waste
+  "Same probe, murakumo.infer.waste/plan. The probe already collects
+   :disk-free-bytes (cmd-probe has printed it since the media-model gate);
+   this is the first planner that decides on it."
+  [cfg model]
+  (probe-and-plan cfg model
+                  (fn [m nodes]
+                    (waste/plan m nodes
+                                (cond-> {}
+                                  (:infer/ctx cfg) (assoc :ctx (:infer/ctx cfg))
+                                  (:model/waste-disk-mb-s m)
+                                  (assoc :disk-mb-s (:model/waste-disk-mb-s m)))))))
+
+(defn- cut-plan-expert-stream [cfg model]
+  (let [{:keys [workers head]} (probe-fleet cfg)
+        dir (:model/dir model)
+        with-artifact
+        (fn [node]
+          (let [result (when (and (:host node) dir)
+                         (ssh/sh (:host node)
+                                 (str "if test -d " dir "; then find " dir
+                                      " -type f -name '*.gguf' -exec stat -f %z {} \\; "
+                                      "| awk '{s+=$1} END {print s+0}'; else echo 0; fi")))
+                present (if (and result (zero? (:exit result)))
+                          (or (some-> (:out result) str/trim parse-long) 0)
+                          0)]
+            (assoc node :model-present-bytes present)))]
+    (expert-stream/plan model (mapv with-artifact (conj workers head)))))
+
+(defn cmd-probe [_cfg-args]
+  (let [cfg (load-config)
+        {:keys [workers head]} (probe-fleet cfg)]
+    (println (format "%-10s %8s %10s %10s %8s" "NODE" "MEM-GIB" "USABLE-GIB" "DISK-FREE" "CACHE"))
+    (doseq [n (conj workers head)]
+      (println (format "%-10s %8.1f %10.2f %9.0fG %8s"
+                       (:name n)
+                       (/ (double (:mem-bytes n)) plan/GiB)
+                       (/ (double (plan/usable-bytes n)) plan/GiB)
+                       (/ (double (:disk-free-bytes n 0)) 1e9)
+                       (str (boolean (:rpc-cache? n))))))))
+
+(defn- cmd-plan-moe
+  "mlx-moe plan report: one candidate node, its mlx-moe capacity, and the
+   README's honest 'does this model benefit' verdict — no per-layer table,
+   there is no ring to lay out."
+  [cfg model]
+  (let [pl (cut-plan-moe cfg model)
+        {:keys [node] :as asg} (first (:assignments pl))
+        {:keys [verdict why]} (:verdict pl)]
+    (println (format "model %s  engine mlx-moe (single-node, SSD-paged experts)"
+                     (:model/id model)))
+    (if node
+      (println (format "candidate %-10s usable %.1f GiB  capacity %s  est-resident %.1f GiB  %s"
+                       (:name node)
+                       (/ (double (:total-usable-bytes pl)) plan/GiB)
+                       (or (:capacity pl) "-")
+                       (/ (double (:est-bytes asg 0)) plan/GiB)
+                       (if (:fits? pl) "FITS ✓" "DOES NOT FIT ✗")))
+      (println "no candidate node — probe found nothing"))
+    (println (str "verdict: " (name verdict) " — " why))
+    (spit plan-file (pr-str pl))
+    (println (str "plan → " plan-file))
+    (when-not (:fits? pl) (System/exit 2))))
+
+(defn- cmd-plan-waste
+  "waste plan report: one candidate node, what the engine will actually spend,
+   and the two numbers that decide whether this is usable — free disk against
+   the container, and the disk-bound throughput ceiling.
+
+   The recommended --budget is the point of running this rather than `waste
+   run` by hand. waste sizes itself to floor + 3 working sets and stops; on a
+   model smaller than the machine that leaves most of RAM idle while the
+   engine keeps reading experts off disk every token."
+  [cfg model]
+  (let [pl (cut-plan-waste cfg model)
+        {:keys [node] :as asg} (first (:assignments pl))
+        mp (:memplan pl)
+        b (:budget pl)
+        tp (:throughput pl)
+        {:keys [verdict why]} (:verdict pl)
+        gb #(/ (double (or % 0)) 1e9)]
+    (println (format "model %s  engine waste (single-node, disk-streamed experts)"
+                     (:model/id model)))
+    (println (format "container %.1f GB  floor %.2f GB  expert set %.1f GB  working set %.2f GB/token"
+                     (gb (:container-bytes pl)) (gb (:floor-bytes mp))
+                     (gb (:routed-disk-bytes mp)) (gb (:working-set-bytes mp))))
+    (if node
+      (do
+        (println (format "candidate %-10s usable %.1f GiB  disk-free %.0f GB  budget %.2f GB (cache %.2f GB)  %s"
+                         (:name node)
+                         (/ (double (:total-usable-bytes pl)) plan/GiB)
+                         (gb (:disk-free-bytes asg))
+                         (gb (:budget-bytes b)) (gb (:cache-bytes b))
+                         (if (:fits? pl) "FITS ✓" "DOES NOT FIT ✗")))
+        (println (format "default budget caches %.1f%% of the expert set → %.0f%% hits → %s"
+                         (/ (:cache-frac-milli tp 0) 10.0)
+                         (/ (:hit-rate-milli tp 0) 10.0)
+                         (if-let [t (:disk-bound-tok-s tp)]
+                           (format "%.2f tok/s disk-bound ceiling" t)
+                           "disk out of the decode loop")))
+        (if (pos? (:saturating-budget-bytes b 0))
+          (println (format "--budget %d caches the whole expert set (disk leaves the decode loop)"
+                           (:saturating-budget-bytes b)))
+          (println "the whole expert set cannot be cached under this node's OS cap — disk stays in the loop")))
+      (println "no candidate node — probe found nothing"))
+    (println (str "verdict: " (name verdict) " — " why))
+    (spit plan-file (pr-str pl))
+    (println (str "plan → " plan-file))
+    (when-not (:fits? pl) (System/exit 2))))
+
+(defn- cmd-plan-expert-stream [cfg model]
+  (let [pl (cut-plan-expert-stream cfg model)
+        node (:node pl)]
+    (println (format "model %s  engine expert-aware NVMe (lossless Qwen4Exp)"
+                     (:model/id model)))
+    (if node
+      (println (format "candidate %-10s memory %.1f GiB  disk-free %.1f GB  cache %d MiB  io %d  FITS ✓"
+                       (:name node) (/ (double (:mem-bytes node)) plan/GiB)
+                       (/ (double (:disk-free-bytes node)) 1e9)
+                       (:cache-mib pl) (:io-threads pl)))
+      (println (format "no node has model + %.0f GiB disk reserve and 16 GiB RAM — DOES NOT FIT ✗"
+                       (/ (double expert-stream/disk-reserve-bytes) plan/GiB))))
+    (println "lossless: top-10 unchanged, cold-drop=0, prefetch=0, MTP=off")
+    (println "macOS page-cache bypass: false (F_NOCACHE/O_DIRECT not active)")
+    (spit plan-file (pr-str pl))
+    (println (str "plan → " plan-file))
+    (when-not (:fits? pl) (System/exit 2))))
+
+(defn cmd-plan [[model-id]]
+  (let [cfg (load-config)
+        model (model-or-die cfg (or model-id "glm-5.2-reap50-q2k"))]
+    (cond
+      (expert-stream? model)
+      (cmd-plan-expert-stream cfg model)
+
+      (waste? model)
+      (cmd-plan-waste cfg model)
+
+      (moe? model)
+      (cmd-plan-moe cfg model)
+
+      :else
+      (let [pl (cut-plan cfg model)]
+        (println (format "model %s  weights %.1f GiB  layers %d"
+                         (:model/id model)
+                         (/ (double (:model/weight-bytes model)) plan/GiB)
+                         (:model/layers model)))
+        (println (format "%-10s %8s %10s %9s %8s %4s" "NODE" "MEM-GIB" "USABLE-GIB" "LAYERS" "EST-GIB" "OK"))
+        (doseq [{:keys [name mem-gib usable-gib layers est-gib ok]} (plan/report pl)]
+          (println (format "%-10s %8.1f %10.2f %4d-%-4d %8.2f %4s"
+                           name mem-gib usable-gib (first layers) (second layers) est-gib ok)))
+        (println (format "total usable %.1f GiB — %s"
+                         (/ (double (:total-usable-bytes pl)) plan/GiB)
+                         (if (:fits? pl) "FITS ✓" "DOES NOT FIT ✗")))
+        (spit plan-file (pr-str pl))
+        (println (str "plan → " plan-file))
+        (when-not (:fits? pl) (System/exit 2))))))
+
+(defn- load-plan []
+  (or (try (edn/read-string (slurp plan-file)) (catch Exception _ nil))
+      (do (println "no plan — run `npm run task -- infer plan <model>` first")
+          (System/exit 1))))
+
+(defn- serving-workers
+  "Plan assignments that serve layers, minus the head (it runs locally)."
+  [pl]
+  (engine/workers pl))
+
+(defn- single-node
+  "The one node a single-node plan (mlx-moe, waste) assigned everything to."
+  [pl]
+  (:node (first (:assignments pl))))
+
+(def ^:private moe-node single-node)
+
+(defn- cmd-provision-moe
+  "mlx-moe has no rpc-server/llama-server binary to push — it's a pip package.
+   Install/upgrade it on the plan's chosen node over SSH and prove `mlx-moe`
+   resolves on PATH before `serve` tries to nohup it."
+  [pl]
+  (if-let [node (moe-node pl)]
+    (let [host (:host node)]
+      (print (format "[%s] " (:name node))) (flush)
+      (if-not (ssh/reachable? host)
+        (println "unreachable — skipped")
+        (do (ssh/sh host "pip3 install -q -U mlx-moe")
+            (let [check (ssh/sh host "mlx-moe --help >/dev/null 2>&1 && echo ok || echo FAILED")]
+              (println (str "mlx-moe " (:out check)))))))
+    (println "no candidate node in the plan — run `npm run task -- infer plan <moe-model>` first")))
+
+(defn- install-rpc-worker-service!
+  [cfg node]
+  (let [user (worker-user node)
+        home (str "/Users/" user)
+        port (or (:rpc-port node) (:infer/rpc-port cfg engine/default-rpc-port))
+        device (or (:rpc-device node) (:infer/rpc-device cfg "MTL0"))
+        plist (rpc-worker-plist user home port device (boolean (:rpc-cache? node)))
+        script (str "sudo -n /usr/bin/tee /Library/LaunchDaemons/" rpc-worker-label ".plist >/dev/null <<'MURAKUMO_RPC_PLIST'\n"
+                    plist
+                    "MURAKUMO_RPC_PLIST\n"
+                    "sudo -n /usr/sbin/chown root:wheel /Library/LaunchDaemons/" rpc-worker-label ".plist; "
+                    "sudo -n /bin/chmod 644 /Library/LaunchDaemons/" rpc-worker-label ".plist; "
+                    "sudo -n /bin/launchctl bootout system/" rpc-worker-label " >/dev/null 2>&1 || true; "
+                    "pkill -f '.murakumo/bin/rpc-server' >/dev/null 2>&1 || true; sleep 1; "
+                    "sudo -n /bin/launchctl bootstrap system /Library/LaunchDaemons/" rpc-worker-label ".plist; "
+                    "sudo -n /bin/launchctl kickstart -k system/" rpc-worker-label)]
+    (ssh/sh (:host node) script)))
+
+(defn- provision-rpc-ha-key!
+  "Create one head-only recovery key and install only a forced launchctl
+   kickstart capability on workers. It cannot obtain a shell, forward ports,
+   or execute caller-selected commands."
+  [head-host specs]
+  (let [make-key (str "install -d -m 700 /etc/murakumo; "
+                      "test -f " rpc-ha-key " || /usr/bin/ssh-keygen -q -t ed25519 -N '' -f " rpc-ha-key "; "
+                      "chmod 600 " rpc-ha-key "; cat " rpc-ha-key ".pub")
+        {:keys [exit out err]} (ssh/sh head-host make-key)]
+    (when-not (zero? exit)
+      (throw (ex-info "could not provision RPC recovery key on head" {:stderr err})))
+    (let [entry (rpc-ha-authorized-key out)]
+      (doseq [{:keys [host name]} specs]
+        (let [legacy (rpc-ha-legacy-authorized-key out)
+              {:keys [exit err]}
+              (ssh/sh host
+                      (str "mkdir -p ~/.ssh; chmod 700 ~/.ssh; touch ~/.ssh/authorized_keys; "
+                           "chmod 600 ~/.ssh/authorized_keys; "
+                           ;; Drop the pre-2026-09-09 entry for this same key
+                           ;; first. Exact-line removal, so no other key in the
+                           ;; file can be caught by it: leaving both would give
+                           ;; one public key two forced commands, and sshd uses
+                           ;; whichever it reads first.
+                           "if grep -Fqx '" legacy "' ~/.ssh/authorized_keys; then "
+                           "grep -Fvx '" legacy "' ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.new "
+                           "&& mv ~/.ssh/authorized_keys.new ~/.ssh/authorized_keys "
+                           "&& chmod 600 ~/.ssh/authorized_keys; fi; "
+                           "grep -Fqx '" entry "' ~/.ssh/authorized_keys || "
+                           "printf '%s\\n' '" entry "' >> ~/.ssh/authorized_keys"))]
+          (when-not (zero? exit)
+            (throw (ex-info "could not install constrained RPC recovery key"
+                            {:node name :stderr err}))))))))
+
+(defn cmd-provision
+  "Push rpc-server to each serving worker + raise the GPU wired limit (needs the
+   fleet's passwordless sudo; best-effort — a refusal only costs capacity).
+   For an mlx-moe plan (:engine :mlx-moe) this instead pip-installs mlx-moe on
+   the plan's single chosen node — see cmd-provision-moe."
+  [[sel]]
+  (let [pl (load-plan)]
+    (if (= :mlx-moe (:engine pl))
+      (cmd-provision-moe pl)
+      (let [cfg (load-config)
+            want (when (and sel (not= sel "all")) (set (str/split sel #",")))
+            wired (:infer/wired-limit-mb cfg)]
+        (doseq [{:keys [node]} (serving-workers pl)
+                :when (or (nil? want) (want (:name node)))]
+          (print (format "[%s] " (:name node))) (flush)
+          (let [host (:host node)]
+            (if-not (ssh/reachable? host)
+              (println "unreachable — skipped")
+              (do (ssh/sh host (str "mkdir -p " remote-bin))
+                  (let [{:keys [exit err]} (ssh/scp host "bin/rpc-server" ".murakumo/bin/rpc-server")]
+                    (if-not (zero? exit)
+                      (println (str "scp failed: " err))
+                      (let [_ (doseq [lib (->> (io/file-seq (io/file "bin"))
+                                               (map #(io/file-name %))
+                                               (filter #(str/ends-with? % ".dylib")))]
+                                (ssh/scp host (str "bin/" lib) (str ".murakumo/bin/" lib)))
+                            _ (ssh/sh host "chmod +x .murakumo/bin/rpc-server")
+                            w (ssh/sh host (format "sudo -n sysctl iogpu.wired_limit_mb=%d 2>&1 || echo no-sudo" wired))
+                            svc (install-rpc-worker-service! cfg node)]
+                        (if (zero? (:exit svc))
+                          (println (str "rpc-server + LaunchDaemon ✓  wired-limit: " (:out w)))
+                          (throw (ex-info "RPC worker LaunchDaemon install failed"
+                                          {:node (:name node) :stderr (:err svc)}))))))))))
+        (provision-rpc-ha-key! (get-in cfg [:infer/head :host]) (worker-specs pl cfg))
+        ;; a remote head serves llama-server from its own .murakumo/bin
+        (let [{:keys [remote? host]} (:infer/head cfg)]
+          (when remote?
+            (print (format "[%s] " host)) (flush)
+            (ssh/sh host (str "mkdir -p " remote-bin))
+            (let [{:keys [exit err]} (ssh/scp host "bin/llama-server" ".murakumo/bin/llama-server")]
+              (if (zero? exit)
+                (do (ssh/sh host "chmod +x .murakumo/bin/llama-server")
+                    (println "llama-server ✓ (head)"))
+                (println (str "scp failed: " err))))))))))
+
+(defn cmd-ha-provision
+  "Adopt already-provisioned RPC binaries into the resident HA control plane.
+   Unlike `provision`, this does not require a local bin/rpc-server build: it
+   verifies each remote binary, installs/kickstarts the LaunchDaemon, and grants
+   the head only the forced restart capability."
+  [[sel]]
+  (let [cfg (load-config)
+        pl (load-plan)
+        want (when (and sel (not= sel "all")) (set (str/split sel #",")))
+        assignments (filter (fn [{:keys [node]}]
+                              (or (nil? want) (want (:name node))))
+                            (serving-workers pl))]
+    (doseq [{:keys [node]} assignments]
+      (let [host (:host node)
+            check (ssh/sh host "test -x ~/.murakumo/bin/rpc-server")]
+        (when-not (zero? (:exit check))
+          (throw (ex-info "remote RPC binary is absent; run infer provision"
+                          {:node (:name node)})))
+        (let [svc (install-rpc-worker-service! cfg node)]
+          (when-not (zero? (:exit svc))
+            (throw (ex-info "RPC worker LaunchDaemon install failed"
+                            {:node (:name node) :stderr (:err svc)})))
+          (println (format "[%s] RPC LaunchDaemon managed" (:name node))))))
+    ;; Recovery must cover the complete plan even when a selector was used to
+    ;; repair one service; installing an idempotent authorized_keys line is cheap.
+    (provision-rpc-ha-key! (get-in cfg [:infer/head :host]) (worker-specs pl cfg))
+    (println "head recovery key constrained to RPC worker kickstart")))
+
+(defn cmd-up [[sel]]
+  (let [cfg (load-config)
+        pl (load-plan)
+        port (:infer/rpc-port cfg engine/default-rpc-port)
+        want (when (and sel (not= sel "all")) (set (str/split sel #",")))]
+    (doseq [{:keys [node]} (serving-workers pl)
+            :when (or (nil? want) (want (:name node)))]
+      (let [node-port (or (:rpc-port node) port)
+            cache (if (:rpc-cache? node) " -c" "")
+            dev (or (:rpc-device node) (:infer/rpc-device cfg "MTL0"))
+            legacy (format "pkill -f '%s/rpc-server' 2>/dev/null; sleep 0.2; nohup env %s%s/rpc-server -H 0.0.0.0 -p %d -d %s%s >/tmp/murakumo-rpc.log 2>&1 & sleep 0.3"
+                           remote-bin remote-env remote-bin node-port dev cache)
+            cmd (str "if sudo -n /bin/launchctl print system/" rpc-worker-label " >/dev/null 2>&1; then "
+                     "sudo -n /bin/launchctl kickstart -k system/" rpc-worker-label "; "
+                     "else " legacy "; fi; "
+                     "pgrep -f rpc-server >/dev/null && echo up || echo FAILED")]
+        (println (format "[%s] %s" (:name node) (:out (ssh/sh (:host node) cmd))))))))
+
+(defn cmd-down [[sel]]
+  (let [pl (load-plan)
+        want (when (and sel (not= sel "all")) (set (str/split sel #",")))]
+    (doseq [{:keys [node]} (serving-workers pl)
+            :when (or (nil? want) (want (:name node)))]
+      (ssh/sh (:host node)
+              (str "sudo -n /bin/launchctl bootout system/" rpc-worker-label
+                   " >/dev/null 2>&1 || true; pkill -f '.murakumo/bin/rpc-server'"))
+      (println (format "[%s] down" (:name node))))))
+
+(defn cmd-ps [_]
+  (let [pl (load-plan)]
+    (doseq [{:keys [node layers]} (serving-workers pl)]
+      (let [{:keys [out]} (ssh/sh (:host node)
+                                  (str "pgrep -f '.murakumo/bin/rpc-server' >/dev/null && "
+                                       "{ sudo -n /bin/launchctl print system/" rpc-worker-label
+                                       " >/dev/null 2>&1 && echo managed || echo legacy; } || echo stopped"))]
+        (println (format "[%-10s] %-8s layers %d-%d" (:name node) out (first layers) (second layers)))))))
+
+(defn- cmd-serve-moe
+  "Start mlx-moe on the plan's chosen node over SSH (always remote — the node
+   is whichever fleet/extra-node the planner picked, not the operator's own
+   machine, so there is no local-foreground path the way llama-server has)."
+  [cfg model pl]
+  (cond
+    (not= :mlx-moe (:engine pl))
+    (println (str "stale/mismatched plan (last `plan` was not for an mlx-moe model) — "
+                  "run `npm run task -- infer plan " (:model/id model) "` first"))
+
+    (not (moe-node pl))
+    (println "no candidate node in the plan — run `npm run task -- infer plan <moe-model>` first")
+
+    :else
+    (let [node (moe-node pl)
+          moe-cfg (:infer/mlx-moe cfg)
+          opts {:model-repo (or (:model/mlx-repo model) (:hf/repo model))
+                :port (:infer/api-port cfg 8080)
+                :capacity (or (:model/capacity model) (:capacity moe-cfg) (:capacity pl))
+                :pin-top-k (moe-opt cfg model :pin-top-k)
+                :kv-bits (or (moe-opt cfg model :kv-bits) (:infer/kv-bits cfg))
+                :profile (or (:model/mlx-moe-profile model) (:profile moe-cfg))
+                :warmup (moe-opt cfg model :warmup)
+                :extra-args (or (:model/mlx-moe-extra-args model) (:extra-args moe-cfg))}
+          cmd (engine/mlx-moe-cmd opts)
+          {:keys [verdict why]} (:verdict pl)
+          host (:host node)]
+      (println cmd)
+      (println (str "verdict: " (name verdict) " — " why))
+      (let [{:keys [out]} (ssh/sh host
+                                  (format "pkill -f 'mlx-moe serve' 2>/dev/null; sleep 0.3; nohup %s >/tmp/murakumo-moe.log 2>&1 & sleep 1; pgrep -f 'mlx-moe serve' >/dev/null && echo serving || echo FAILED" cmd))]
+        (println (format "[%s] %s — http://%s:%s/v1 (first launch downloads the model; watch /tmp/murakumo-moe.log)"
+                         host out (api-host node) (:infer/api-port cfg 8080)))))))
+
+(defn- cmd-serve-waste
+  "Start waste's OpenAI-compatible server on the plan's chosen node.
+
+   Unlike mlx-moe there IS a local path: the container is a file tree on some
+   machine's NVMe, and when that machine is the operator's own there is no SSH
+   hop to make. The budget passed is the planner's saturating figure when the
+   whole expert set fits under the node's OS cap — the engine's own default
+   would leave that RAM idle and keep reading experts off disk every token."
+  [cfg model pl]
+  (cond
+    (not= :waste (:engine pl))
+    (println (str "stale/mismatched plan (last `plan` was not for a waste model) — "
+                  "run `npm run task -- infer plan " (:model/id model) "` first"))
+
+    (not (single-node pl))
+    (println "no candidate node in the plan — run `npm run task -- infer plan <waste-model>` first")
+
+    :else
+    (let [node (single-node pl)
+          wcfg (:infer/waste cfg)
+          port (:infer/api-port cfg 8080)
+          b (:budget pl)
+          budget (or (:model/waste-budget-bytes model)
+                     (when (pos? (:saturating-budget-bytes b 0))
+                       (:saturating-budget-bytes b)))
+          opts {:python (or (:model/waste-python model) (:python wcfg) "python3")
+                :container (or (:model/waste-container model) (:container wcfg))
+                :port port
+                :budget budget
+                :ctx (:infer/ctx cfg)
+                :threads (or (:model/waste-threads model) (:threads wcfg))
+                :verify? (:verify? wcfg)
+                :extra-args (:model/waste-extra-args model)}
+          cmd (engine/waste-serve-cmd opts)
+          ;; `python3 -m serve` resolves the module from waste's own checkout,
+          ;; and libwaste.dylib is built there too — so the command runs from
+          ;; that directory or not at all
+          dir (or (:model/waste-dir model) (:dir wcfg))
+          full (str (when dir (str "cd " dir " && ")) cmd)
+          {:keys [verdict why]} (:verdict pl)
+          host (:host node)]
+      (println full)
+      (println (str "verdict: " (name verdict) " — " why))
+      (if host
+        (let [{:keys [out]} (ssh/sh host
+                                    (format "pkill -f 'python3 -m serve' 2>/dev/null; sleep 0.3; nohup %s >/tmp/murakumo-waste.log 2>&1 & sleep 1; pgrep -f 'python3 -m serve' >/dev/null && echo serving || echo FAILED" full))]
+          (println (format "[%s] %s — http://%s:%s/v1 (cold open mmaps the trunk; watch /tmp/murakumo-waste.log)"
+                           host out (api-host node) port)))
+        (p/shell full)))))
+
+(defn- cmd-serve-ring
+  "Run the distributed llama.cpp RPC head. A remote head is installed as a
+   boot-persistent systemd unit. Only explicitly configured services that own
+   the same API port are stopped; unrelated llama-server processes remain up.
+   If the ring cannot become active, the compatibility proxy is restored."
+  [cfg model pl gguf-path]
+  (let [head-cfg (:infer/head cfg)
+        remote? (:remote? head-cfg)
+        opts {:bin-dir (if remote? (:bin-dir head-cfg ".murakumo/bin") "bin")
+              :model-path (or gguf-path
+                              (if remote?
+                                (str (model-dir head-cfg model) "/" (:model/gguf model))
+                                (:model/gguf model)))
+              :rpc-port (:infer/rpc-port cfg engine/default-rpc-port)
+              :port (:infer/api-port cfg 8080)
+              :ctx (:infer/ctx cfg 4096)
+              :parallel (:infer/parallel cfg 1)
+              :flash-attn (:infer/flash-attn cfg)
+              :api-key-file (:infer/api-key-file cfg)
+              :extra-args (:model/llama-extra-args model)}
+        cmd (engine/head-cmd pl opts)]
+    (println cmd)
+    (if remote?
+      (let [specs (worker-specs pl cfg)
+            endpoints (mapv #(select-keys % [:ip :port]) specs)
+            unit (ring-unit cmd endpoints)
+            watchdog (ring-watchdog-unit (:infer/api-port cfg 8080))
+            watchdog-script (ring-watchdog-script (:infer/api-port cfg 8080) specs)
+            watchdog-timer (ring-watchdog-timer)
+            watchdog-logrotate (ring-watchdog-logrotate)
+            conflicts (or (:conflicting-units head-cfg) [])
+            stop-conflicts (apply str
+                                  (map #(str "systemctl disable --now " % " >/dev/null 2>&1 || true; ")
+                                       conflicts))
+            restore-unit (or (:fallback-unit head-cfg) "murakumo-infer-compat.socket")
+            script (str stop-conflicts
+                        "cat > /etc/systemd/system/murakumo-ring.service <<'MURAKUMO_UNIT'\n"
+                        unit
+                        "MURAKUMO_UNIT\n"
+                        "cat > /etc/systemd/system/murakumo-ring-watchdog.service <<'MURAKUMO_WATCHDOG'\n"
+                        watchdog
+                        "MURAKUMO_WATCHDOG\n"
+                        "cat > /usr/local/sbin/murakumo-ring-watchdog <<'MURAKUMO_WATCHDOG_SCRIPT'\n"
+                        watchdog-script
+                        "MURAKUMO_WATCHDOG_SCRIPT\n"
+                        "chmod 755 /usr/local/sbin/murakumo-ring-watchdog; "
+                        "cat > /etc/logrotate.d/murakumo-ring-watchdog <<'MURAKUMO_WATCHDOG_LOGROTATE'\n"
+                        watchdog-logrotate
+                        "MURAKUMO_WATCHDOG_LOGROTATE\n"
+                        "cat > /etc/systemd/system/murakumo-ring-watchdog.timer <<'MURAKUMO_WATCHDOG_TIMER'\n"
+                        watchdog-timer
+                        "MURAKUMO_WATCHDOG_TIMER\n"
+                        "systemctl daemon-reload; "
+                        "systemctl enable --now murakumo-ring-watchdog.timer >/dev/null 2>&1; "
+                        "systemctl enable murakumo-ring.service >/dev/null 2>&1; "
+                        "systemctl restart murakumo-ring.service; sleep 3; "
+                        "if systemctl is-active --quiet murakumo-ring.service; then "
+                        "echo active; "
+                        "else systemctl stop murakumo-ring.service >/dev/null 2>&1 || true; "
+                        "systemctl enable --now " restore-unit " >/dev/null 2>&1 || true; "
+                        "echo FAILED-restored-" restore-unit "; exit 1; fi")
+            {:keys [exit out err]} (ssh/sh (:host head-cfg) script)]
+        (println (format "[%s] ring unit %s — http://%s:%s/v1 (systemd: Restart=on-failure; fallback=%s)"
+                         (:host head-cfg) (str/trim (str out)) (api-host head-cfg)
+                         (:infer/api-port cfg 8080) restore-unit))
+        (when-not (zero? exit)
+          (throw (ex-info "distributed ring failed to start; fallback restored"
+                          {:host (:host head-cfg) :stderr err}))))
+      (p/shell cmd))))
+
+(defn cmd-serve
+  "Run the head: llama-server ring (default), or — for a single-node engine
+   (:model/engine :mlx-moe | :waste) — that engine on the plan's chosen node."
+  [[model-id gguf-path]]
+  (let [cfg (load-config)
+        model (model-or-die cfg (or model-id "glm-5.2-reap50-q2k"))
+        pl (load-plan)]
+    (cond
+      (waste? model) (cmd-serve-waste cfg model pl)
+      (moe? model) (cmd-serve-moe cfg model pl)
+      :else (cmd-serve-ring cfg model pl gguf-path))))
+
+(defn cmd-serve-standalone
+  "Single-node serving on the head ONLY — no RPC ring, no `plan` needed. Use
+   when the model fits entirely in the head's own memory AND a GPU-backend
+   llama-server build is available there — this fleet's head is an AMD Strix
+   Halo APU (Ryzen AI MAX+ 395, Radeon 8060S iGPU); the RPC-ring binary at
+   :infer/head :bin-dir is a CPU-only build with no GPU backend linked, so
+   the head's ring-share (~40% of layers) was running on CPU alone.
+
+   Verified 2026-07-05: qwen-agentworld-35b-a3b (22GB) standalone via the
+   official llama.cpp Vulkan release binary on the head → 61.5 tok/s, vs.
+   12.7 tok/s for the same model spread across the 7-node CPU RPC ring — a
+   real GPU beats network-distributed CPU by ~5x on this hardware. (The
+   ROCm 7.2 release build detects no device — gfx1151/Strix Halo isn't in
+   ROCm's supported list yet; Vulkan/RADV is the working path.)
+
+   `parallel` (default 1 — was briefly 2, reverted 2026-07-05, see below) sets
+   llama-server's concurrent slot count — this is an AGGREGATE-throughput
+   knob, not a single-stream speedup: each slot gets ctx/parallel tokens of
+   context, and multiple slots let continuous batching amortize weight reads
+   across concurrent requests. Measured 2026-07-05 (65536 total ctx,
+   `Count 1..40` prompts, wall-clock completion_tokens/sec across N
+   concurrent requests): N=1 53.8, N=2 77.1, N=4 107.8, N=6 121.2 (peak),
+   N=8 74.6 (regressed). A single Claude Code session only has one request
+   in flight at a time, so this never raises the ~60 tok/s ceiling any one
+   conversation sees.
+
+   History: briefly moved to `parallel 2` after an incident where a second
+   request queued 113s behind an abandoned (client-`pkill`'d but
+   server-undetected) 105K-token conversation under `parallel 1`. Reverted
+   back to 1 the same day after live production evidence that 2 slots don't
+   actually fix the problem for genuine concurrent load — they share ONE
+   physical GPU, and llama-server doesn't time-slice fairly between a slot
+   doing heavy prompt processing and another trying to decode: watched a
+   real second Claude Code session's generation crawl to 0.24-0.38 tok/s
+   (tg_3s) while another slot churned through repeated 14-28K-token
+   reprocessing. `parallel 1` is more PREDICTABLE for this hardware's actual
+   usage pattern (rarely more than one active claude-murakumo session): a
+   second request queues and waits, but gets the FULL ~60 tok/s the moment
+   its turn comes, rather than both requests limping along together. This
+   doesn't fix the underlying issue (llama-server not promptly detecting a
+   dead client connection) — that would need a request/idle timeout on the
+   server side, not attempted here — it just accepts the queueing failure
+   mode as preferable to the degraded-throughput-for-everyone one.
+
+   Superseded for the current dense Qwen3.8 27B service on 2026-08-24: with
+   total ctx 524288 and parallel 2, each slot retained n_ctx 262144, a single
+   request changed only 13.12 -> 12.82 tok/s, and two simultaneous public
+   requests completed in 3.559s and 4.993s. The historical result above still
+   warns against assuming that more slots always help; four remains rejected.
+
+   :infer/head :standalone-bin-dir must point at that GPU-backend build on
+   the head (get one: github.com/ggml-org/llama.cpp releases,
+   `*-ubuntu-vulkan-x64.tar.gz` for this hardware). :infer/flash-attn
+   ('on'/'off'/'auto') is passed through as `-fa`; measured no speed
+   difference for this model on Vulkan/RADV (mostly-linear-attention hybrid
+   architecture limits how much FA has to do), kept explicit anyway."
+  [[model-id gguf-path parallel]]
+  (let [cfg (load-config)
+        model (model-or-die cfg model-id)
+        head-cfg (:infer/head cfg)
+        bin-dir (:standalone-bin-dir head-cfg)
+        model-path (or gguf-path (str (model-dir head-cfg model) "/" (:model/gguf model)))
+        ;; :model/mmproj (e.g. qwen3.6-35b-a3b) is a llama.cpp-native CLIP-in-GGUF
+        ;; vision projector co-located with the text tower — pass it through
+        ;; unconditionally when the registry entry declares one, so a model
+        ;; without :model/mmproj (every other entry today, incl. the currently
+        ;; -serving qwen-agentworld-35b-a3b) builds the exact same command line
+        ;; as before this was added.
+        mmproj-path (when-let [mmproj (:model/mmproj model)]
+                      (let [dir (if-let [i (str/last-index-of model-path "/")]
+                                  (subs model-path 0 i)
+                                  (model-dir head-cfg model))]
+                        (str dir "/" mmproj)))
+        ctx (:infer/ctx cfg 4096)
+        port (:infer/api-port cfg 8080)
+        parallel (or (some-> parallel parse-long) 1)
+        fa (:infer/flash-attn cfg)
+        cmd (str bin-dir "/llama-server -m " model-path
+                 (when mmproj-path (str " --mmproj " mmproj-path))
+                 " -ngl 999 -c " ctx " --parallel " parallel
+                 (when fa (str " -fa " fa))
+                 " --host 0.0.0.0 --port " port
+                 (when-let [key-file (:infer/api-key-file cfg)]
+                   (str " --api-key-file " (pr-str key-file))))]
+    (if-not bin-dir
+      (println "no :infer/head :standalone-bin-dir configured in infer.edn — nothing to run")
+      (do
+        (println cmd)
+        (let [unit (standalone-unit cmd)
+              ;; 旧経路の掃除: transient systemd-run unit(2026-07-15 の応急復旧)と、
+              ;; unit 外で nohup 起動された旧 llama-server(このコマンドの旧実装)を
+              ;; 止める。gemma 等 OTHER unit の llama-server は殺さない —
+              ;; `pgrep -x llama-server` の全殺しは llama-server.service
+              ;; (gemma :11434) まで巻き込む雑さだったので、serve する port の
+              ;; listener だけ fuser で狙い撃ちする。unit 本文は heredoc で書く
+              ;; (printf '%s' + pr-str は \n をリテラルのまま吐く罠がある)。
+              script (str "systemctl stop murakumo-qwen-standalone.service 2>/dev/null || true; "
+                          "fuser -k " port "/tcp 2>/dev/null || true; "
+                          "cat > /etc/systemd/system/murakumo-standalone.service <<'MURAKUMO_UNIT'\n"
+                          unit
+                          "MURAKUMO_UNIT\n"
+                          "systemctl daemon-reload; "
+                          "systemctl enable murakumo-standalone.service >/dev/null 2>&1; "
+                          "systemctl restart murakumo-standalone.service; sleep 2; "
+                          "systemctl is-active murakumo-standalone.service")
+              {:keys [out]} (ssh/sh (:host head-cfg) script)]
+          (println (format "[%s] unit murakumo-standalone %s — http://%s:%s/v1 (systemd: Restart=on-failure, boot-persistent; `systemctl status murakumo-standalone` on the head; no RPC workers needed)"
+                           (:host head-cfg) (str/trim (str out)) (api-host head-cfg) port)))))))
+
+(defn cmd-serve-embed
+  "Single-node llama.cpp embedding server (ADR-2607192200 2026-07-19
+   addendum) — no `plan`/ring needed, same single-node posture as
+   cmd-serve-moe above but for the dedicated :llamacpp-embed engine. Runs on
+   :infer/embed-port (default 8091), separate from the chat head's
+   :infer/api-port (8090) — the pkill pattern below matches ONLY processes
+   whose command line contains `--embedding`, so it can never touch the
+   chat head's own `llama-server` process (cmd-serve/cmd-serve-standalone),
+   which never passes that flag."
+  [[model-id]]
+  (let [cfg (load-config)
+        ;; ⚠ NO DEFAULT MODEL HERE ANY MORE. This defaulted to
+        ;; "bge-m3-embed-gguf" until 2026-09-10, when that model was removed
+        ;; from infer.edn on owner instruction and no other :llamacpp-embed
+        ;; model was left to point at. A default naming a removed model is
+        ;; worse than none: `model-or-die` would System/exit 1 with "unknown
+        ;; model", which reads as a typo by the caller rather than as a fleet
+        ;; that declares no embedding model at all. Say the real thing.
+        model (if model-id
+                (model-or-die cfg model-id)
+                (do (println (str "infer serve-embed needs a model id: infer.edn "
+                                  "declares no embedding model to default to "
+                                  "(bge-m3-embed-gguf was removed 2026-09-10). "
+                                  "Declare one, or name a model explicitly."))
+                    (System/exit 2)))
+        head-cfg (:infer/head cfg)
+        remote? (:remote? head-cfg)
+        bin-dir (if remote?
+                  (or (:standalone-bin-dir head-cfg) (:bin-dir head-cfg ".murakumo/bin"))
+                  "bin")
+        model-path (if remote?
+                     (str (model-dir head-cfg model) "/" (:model/gguf model))
+                     (:model/gguf model))
+        opts {:bin-dir bin-dir
+              :model-path model-path
+              :port (:infer/embed-port cfg 8091)
+              :ctx (:model/context model 8192)
+              :pooling (:model/pooling model "mean")
+              :api-key-file (:infer/api-key-file cfg)
+              :extra-args (:model/llama-extra-args model)}
+        cmd (engine/embed-head-cmd opts)]
+    (println cmd)
+    (if remote?
+      (let [{:keys [out]} (ssh/sh (:host head-cfg)
+                                  (format "pkill -f 'llama-server .*--embedding' 2>/dev/null || true; sleep 0.3; nohup %s >/tmp/murakumo-embed.log 2>&1 & sleep 1; pgrep -f 'llama-server .*--embedding' >/dev/null && echo serving || echo FAILED" cmd))]
+        (println (format "[%s] %s — http://%s:%s/v1 (first launch downloads-free — model must already be on disk via `kbb -M:murakumo model setup`; watch /tmp/murakumo-embed.log)"
+                         (:host head-cfg) out (api-host head-cfg) (:infer/embed-port cfg 8091))))
+      (p/shell cmd))))
+
+(defn cmd-generate
+  "One completion via the head's /v1 API. Targets whichever host actually
+   served the last `plan` — the mlx-moe node when the saved plan is
+   :engine :mlx-moe, else the configured llama-server head."
+  [[prompt]]
+  (let [cfg (load-config)
+        last-plan (try (edn/read-string (slurp plan-file)) (catch Exception _ nil))
+        moe-node* (when (= :mlx-moe (:engine last-plan)) (moe-node last-plan))
+        head-host (if moe-node*
+                    (api-host moe-node*)
+                    (let [h (:infer/head cfg)] (if (:remote? h) (api-host h) "localhost")))
+        body (json/generate-string
+              {:messages [{:role "user" :content (or prompt "Name three Japanese cities.")}]
+               :max_tokens 256})
+        {:keys [out]} (p/sh "curl" "-s" "-m" "600"
+                            (str "http://" head-host ":" (:infer/api-port cfg 8080) "/v1/chat/completions")
+                            "-H" "Content-Type: application/json" "-d" body)]
+    (let [r (json/parse-string (str out) true)]
+      (println (or (get-in r [:choices 0 :message :content]) out))
+      (when-let [t (:timings r)]
+        (println (format "-- %.2f tok/s prefill, %.2f tok/s gen"
+                         (double (:prompt_per_second t 0.0))
+                         (double (:predicted_per_second t 0.0))))))))
+
+(defn -main [& [cmd & args]]
+  (case cmd
+    "media" (do (require 'murakumo.infer.media)
+                (apply (resolve 'murakumo.infer.media/-main) args))
+    "gc" (do (require 'murakumo.infer.gc-op)
+             (apply (resolve 'murakumo.infer.gc-op/-main) args))
+    "bench" (do (require 'murakumo.infer.bench)
+                (apply (resolve 'murakumo.infer.bench/-main) args))
+    "profile" (do (require 'murakumo.infer.profile)
+                  (apply (resolve 'murakumo.infer.profile/-main) args))
+    "relay" (do (require 'murakumo.infer.relay-server)
+                (apply (resolve 'murakumo.infer.relay-server/-main) args))
+    "join" (do (require 'murakumo.infer.relay-worker)
+               (apply (resolve 'murakumo.infer.relay-worker/-main) args))
+    "gateway" (do (require 'murakumo.infer.gateway)
+                  (apply (resolve 'murakumo.infer.gateway/-main) args))
+    "probe" (cmd-probe args)
+    "plan" (cmd-plan args)
+    "provision" (cmd-provision args)
+    "ha-provision" (cmd-ha-provision args)
+    "up" (cmd-up args)
+    "down" (cmd-down args)
+    "ps" (cmd-ps args)
+    "serve" (cmd-serve args)
+    "serve-standalone" (cmd-serve-standalone args)
+    "serve-embed" (cmd-serve-embed args)
+    "generate" (cmd-generate args)
+    (println "usage: npm run task -- infer probe|profile [b70|gad|xavier]|plan <model>|provision [sel]|ha-provision [sel]|up|down|ps|serve <model> [gguf]|serve-standalone <model> [gguf] [parallel]|serve-embed [model]|generate \"<prompt>\"|media …|gc [--apply]|relay [port]|join [relay-url] --model <id> [--name <node>]|gateway [port]")))

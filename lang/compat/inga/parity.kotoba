@@ -1,0 +1,222 @@
+(ns inga.parity
+  "One scenario over the pure namespaces, run on both runtimes, printing one
+  digest.
+
+      kbb -M:parity
+      kbb --backend sci --classpath src -e \"(require '[inga.parity :as p]) (p/report)\"
+
+  Both must print the same line.
+
+  ## Why this exists
+
+  A JVM suite is not evidence about ClojureScript, and ClojureScript is the
+  runtime that matters here — kotobase deploys on Cloudflare Workers. engi
+  wrote the same namespace for the same reason and its docstring names the
+  incident: a JVM-side optimisation broke torihiki's cljs path completely
+  while every test stayed green.
+
+  ## What it covers, and the one thing it cannot
+
+  Covered: `inga.head` (canonical bytes, certificate counting and
+  distinctness), `inga.fuel` (metering and the exhaustion point),
+  `inga.power` (the table as a function of an event sequence), and
+  `inga.ref`'s CAS decision over an in-memory head store. All pure, all
+  synchronous on both runtimes.
+
+  Also covered, lifted verbatim from `engi.parity` when those namespaces moved
+  here: `inga.consensus`, `inga.pacemaker`, `inga.quorum`, `inga.sync` and a
+  real `inga.wire` encode/decode round trip. Merged into ONE digest rather than
+  kept as a second entry point — two parity commands is one command someone
+  forgets.
+
+  NOT covered: `inga.state`. `arrangement/commit!` returns a CID on the JVM
+  and a `js/Promise` on cljs, so there is no single synchronous digest to
+  compare — the platform split is real and is documented in
+  `inga.state`'s docstring rather than papered over here. Verifying the cljs
+  path of `inga.state` needs arrangement's own cljs deps and is a separate
+  piece of work, named in the README as open."
+  (:require [inga.consensus :as c]
+            [inga.fuel :as fuel]
+            [inga.head :as head]
+            [inga.pacemaker :as pm]
+            [inga.power :as power]
+            [inga.quorum :as q]
+            [inga.ref :as iref]
+            [inga.stake :as stake]
+            [inga.sync :as sync]
+            [inga.wire :as w]
+            [kotobase.storage.core :as storage]))
+
+;; ── the consensus scenario, lifted verbatim from engi.parity ─────────────────
+;;
+;; engi wrote this first and for the same reason; it moved here with the
+;; namespaces it exercises. Merged into one digest rather than kept as a second
+;; entry point, because two parity commands is one command someone forgets.
+
+(defn- h [b] (str "H" (:inga.block/height b) "/" (:inga.block/proposer b)))
+
+(defn- blk [height parent proposer justify]
+  {:inga.block/height height :inga.block/parent-hash parent
+   :inga.block/proposals [] :inga.block/proposer proposer
+   :inga.block/ts (* height 10) :inga.block/justify justify})
+
+(defn- chain-of [n]
+  (loop [i 1 prev (blk 0 "genesis" :w1 nil) acc [(blk 0 "genesis" :w1 nil)]]
+    (if (> i n)
+      acc
+      (let [votes (mapv #(c/make-vote % (h prev) (:inga.block/height prev))
+                        [:w1 :w2 :w3])
+            b (blk i (h prev) :w1 (c/qc votes 4 (:inga.block/height prev)))]
+        (recur (inc i) b (conj acc b))))))
+
+
+
+(defn- sig-for [w r] (str w "|" (head/canonical-bytes r)))
+(defn- verify-fn [bytes sig w] (= sig (str w "|" bytes)))
+
+(def ^:private validators #{"w1" "w2" "w3"})
+
+(defn- head-digest []
+  (let [r (head/head-record {:ref-name "main" :seq 3 :cid "cid-3" :prev "cid-2" :height 9})
+        ok (head/verify-cert r {:sigs (mapv (fn [w] {:witness w :sig (sig-for w r)})
+                                            ["w1" "w2" "w3"])} 3 verify-fn validators)
+        dup (head/verify-cert r {:sigs (repeat 5 {:witness "w1" :sig (sig-for "w1" r)})}
+                              3 verify-fn validators)
+        cross (head/verify-cert r {:sigs (mapv (fn [w]
+                                                 {:witness w
+                                                  :sig (sig-for w (assoc r "ref" "other"))})
+                                               ["w1" "w2" "w3"])} 3 verify-fn validators)
+        ;; Three keys nobody admitted, each signing correctly. Before
+        ;; 2026-08-05 this VERIFIED -- minting keys is free, so the
+        ;; certificate was self-certifying. In the parity digest because a
+        ;; security property that holds on one runtime and not the other is
+        ;; not a security property.
+        outsider (head/verify-cert r {:sigs (mapv (fn [w] {:witness w :sig (sig-for w r)})
+                                                  ["x1" "x2" "x3"])} 3 verify-fn validators)]
+    (str "head:" (count (head/canonical-bytes r))
+         "/" (count (:verified-signers ok))
+         "/" (some? dup) "/" (some? cross) "/" (some? outsider))))
+
+(defn- fuel-digest []
+  (let [ops (mapv (fn [i] {:op :assert :i i}) (range 10))
+        step (fn [s op] (conj s (:i op)))
+        run (fn [budget cost]
+              (fuel/apply-metered {:state [] :ops ops :budget budget
+                                   :cost-fn (fuel/fixed-cost cost) :step step}))
+        a (run 100 1) b (run 7 2) c (run 2 3)]
+    (str "fuel:" (:applied a) "," (:exhausted-at a)
+         "/" (:applied b) "," (:exhausted-at b) "," (:spent b)
+         "/" (:applied c) "," (:exhausted-at c))))
+
+(defn- equivocation-fixture
+  "A well-formed double-vote by `w` at `h` — same shape
+  `inga.stake/detect-equivocation` emits. Signatures are strings and the
+  verifier below is injected, so this stays a pure cross-runtime fixture with
+  no crypto in it."
+  [w h]
+  (letfn [(vote [block-hash]
+            {:inga.vote/witness w :inga.vote/height h
+             :inga.vote/block-hash block-hash
+             ;; SAME view on both, which is what makes this a crime rather
+             ;; than a view change. Without it the fixture stopped verifying
+             ;; and the digest quietly lost its APPLYING slash — both slashes
+             ;; refused, agreed on by both runtimes, and covering half of what
+             ;; the comment under `power-digest` says it covers.
+             :inga.vote/view 3
+             :inga.vote/sig (str "sig:" w ":" h ":" block-hash)})]
+    {:inga.evidence/witness w :inga.evidence/height h :inga.evidence/view 3
+     :inga.evidence/vote-a (vote "block-a")
+     :inga.evidence/vote-b (vote "block-b")}))
+
+(defn- power-digest []
+  ;; Both a slash that APPLIES and one that is REFUSED, so the digest covers
+  ;; the verification path added in ADR-2608055000 G2 rather than only the
+  ;; happy one: a runtime that skipped the check would agree on the first and
+  ;; disagree on the second.
+  (let [t (power/apply-events
+           power/empty-table 4
+           [{:event :bond :witness "w1" :amount 200 :roles [:ordering]}
+            {:event :bond :witness "w2" :amount 100 :roles [:ordering :storage]}
+            {:event :bond :witness "w3" :amount 100 :roles [:recompute]}
+            {:event :slash :witness "w1" :terms {}
+             :evidence (equivocation-fixture "w1" 3)}
+            ;; evidence naming someone else: refused, nobody loses anything
+            {:event :slash :witness "w2" :terms {}
+             :evidence (equivocation-fixture "w3" 3)}]
+           {:verify-sig-fn (constantly true)})]
+    (str "power:" (count (power/bonds t))
+         "/" (count (stake/eligible-witnesses (power/bonds t) 1 :ordering))
+         "/" (count (stake/eligible-witnesses (power/bonds t) 1 :storage))
+         "/" (count (:rejected-slashes t))
+         "/" (:height t))))
+
+(defn- ref-digest []
+  (let [heads (atom {}) decided (atom {})
+        propose! (fn [record]
+                   (let [k [(get record "ref") (get record "seq")]
+                         winner (get (swap! decided #(if (contains? % k) % (assoc % k record))) k)]
+                     (if (= winner record)
+                       {:certified? true
+                        :cert {:sigs (mapv (fn [w] {:witness w :sig (sig-for w record)})
+                                           ["w1" "w2" "w3"])}}
+                       {:certified? false :current (get winner "cid")})))
+        refs (iref/ref-store {:read-head! (fn [n] (get @heads n))
+                              :write-head! (fn [n h] (swap! heads assoc n h))
+                              :propose! propose! :verify-fn verify-fn
+                              :admitted? validators :quorum 3})
+        a (storage/-compare-and-set-ref! refs "main" nil "cid-1")
+        b (storage/-compare-and-set-ref! refs "main" nil "cid-other")
+        c (storage/-compare-and-set-ref! refs "main" "cid-1" "cid-2")]
+    (str "ref:" (:published? a) "/" (:published? b) "," (:current b)
+         "/" (:published? c) "," (:version c)
+         "/" (:cid (storage/-read-ref refs "main")))))
+
+(defn- consensus-digest []
+(let [chain (chain-of 6)
+        commits (c/three-chain-commits h chain)
+        votes (mapv #(c/make-vote % "tip" 6) [:w1 :w2 :w3])
+        real-qc (c/qc votes 4 6)
+        st (pm/on-qc (pm/initial :w1) real-qc)
+        nv (fn [w q] {:inga.nv/witness w :inga.nv/view 9 :inga.nv/high-qc q})
+        tc (pm/timeout-certificate [(nv :w1 real-qc) (nv :w2 nil) (nv :w3 nil)] 3)
+        entered (pm/on-timeout-certificate st tc 0 pm/default-params)
+        seg-ok (sync/validate-segment h 3 (nth chain 3) (subvec chain 4)
+                                      sync/default-params)
+        ;; the wire, through an actual encode/decode, so parity covers it too
+        wire-msg {:type :new-view :witness :w1 :view 9 :high-qc real-qc}
+        [back _] (w/decode (w/encode wire-msg))
+        ;; The quorum rule itself, because it is the part where a runtime
+        ;; difference is a security difference rather than a wrong number:
+        ;; integer division and `count` over a set are exactly the places JVM
+        ;; and JS have disagreed before.
+        holders (into {} (map (fn [i] [(str "holder-" i) {:amount 4000}]))
+                      (range 4))
+        sybil (into {} (map (fn [i] [(str "dust-" i) {:amount 1}])) (range 40))
+        bonds (merge holders sybil)
+        wset (set (keys bonds))
+        stake-q (q/stake-weighted bonds wset)
+        sybil-set (set (keys sybil))
+        digest (str "commits=" (count commits)
+                    ";qsizes=" (mapv c/quorum-size (range 1 13))
+                    ";sybil-heads=" (q/met? (q/for-set-size (count wset)) sybil-set)
+                    ";sybil-stake=" (q/met? stake-q sybil-set)
+                    ";honest-stake=" (q/met? stake-q (set (keys holders)))
+                    ";locked=" (pm/qc-view (:locked-qc st))
+                    ";tcview=" (:inga.tc/view tc)
+                    ";entered=" (:view entered)
+                    ";timeouts=" (mapv #(pm/timeout-for % pm/default-params) (range 4))
+                    ";seg=" (pr-str seg-ok)
+                    ";req=" (pr-str (sync/request 0 999999 sync/default-params))
+                    ";wire=" (pr-str (sort (:inga.qc/witnesses (:high-qc back))))
+                    ";jsonsafe=" (w/json-safe? (w/encode wire-msg)))]
+    digest))
+
+(defn digest []
+  (str (head-digest) " " (fuel-digest) " " (power-digest) " " (ref-digest)
+       "\n" (consensus-digest)))
+
+(defn report []
+  (println (digest))
+  (digest))
+
+(defn -main [& _] (report))

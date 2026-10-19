@@ -1,0 +1,248 @@
+(ns biscuit.kotoba-logic
+  "Kotoba's five-origin authorization join.
+
+  Amu proves static possibility, the VM supplies one concrete intent,
+  Biscuit supplies only an attenuated grant, local policy supplies permission,
+  and the runtime supplies current availability. Only their bounded Datalog
+  join can produce a concrete capability. Token facts are deliberately hidden
+  from policy saturation; only the verified `grant:` projection enters it."
+  (:require [biscuit.authorizer :as authorizer]
+            [biscuit.datalog :as datalog]
+            [biscuit.kotoba :as kotoba]
+            [biscuit.token :as token]
+            [kotoba.lang.text :as str]))
+
+(def compiler-facts-format :kotoba.compiler-facts/v1)
+(def max-facts 4096)
+(def max-policy-entries 1024)
+
+(def ^:private compiler-evidence-fields
+  #{:format :manifest-cid :manifest-sha256 :facts})
+(def ^:private request-fields
+  #{:actor :definition-cid :kind :resource})
+(def ^:private policy-fields
+  #{:policy/id :policy/allow})
+(def ^:private runtime-fields
+  #{:runtime/world :runtime/epoch :runtime/available})
+
+(def receipt-keys
+  [:receipt/cap :receipt/at :receipt/call :receipt/outcome])
+
+(defn- exact-map? [value fields]
+  (and (map? value) (= fields (set (keys value)))))
+
+(defn- bounded-string? [value limit]
+  (and (string? value) (not (str/blank? value)) (<= (count value) limit)))
+
+(defn- sha256? [value]
+  (and (string? value) (boolean (re-matches #"[0-9a-f]{64}" value))))
+
+(defn- cid-shaped? [value]
+  ;; Full CID byte verification belongs to the IPLD host. This boundary still
+  ;; refuses paths, aliases, and empty values instead of treating them as IDs.
+  (and (bounded-string? value 512) (str/starts-with? value "b")))
+
+(defn- fact? [value]
+  (and (vector? value)
+       (<= 2 (count value) 8)
+       (bounded-string? (first value) 128)))
+
+(defn- compiler-evidence? [value]
+  (and (exact-map? value compiler-evidence-fields)
+       (= compiler-facts-format (:format value))
+       (cid-shaped? (:manifest-cid value))
+       (sha256? (:manifest-sha256 value))
+       (vector? (:facts value))
+       (<= (count (:facts value)) max-facts)
+       (every? #(and (fact? %)
+                     (str/starts-with? (first %) "amu:"))
+               (:facts value))))
+
+(defn- scope-entry? [value]
+  (and (vector? value) (= 3 (count value))
+       (bounded-string? (nth value 0) 512)
+       (qualified-keyword? (nth value 1))
+       (bounded-string? (nth value 2) 2048)))
+
+(defn- request? [value]
+  (and (exact-map? value request-fields)
+       (bounded-string? (:actor value) 512)
+       (cid-shaped? (:definition-cid value))
+       (qualified-keyword? (:kind value))
+       (bounded-string? (:resource value) 2048)))
+
+(defn- policy? [value]
+  (and (exact-map? value policy-fields)
+       (bounded-string? (:policy/id value) 512)
+       (set? (:policy/allow value))
+       (<= (count (:policy/allow value)) max-policy-entries)
+       (every? scope-entry? (:policy/allow value))))
+
+(defn- runtime? [value]
+  (and (exact-map? value runtime-fields)
+       (cid-shaped? (:runtime/world value))
+       (integer? (:runtime/epoch value))
+       (<= 0 (:runtime/epoch value))
+       (set? (:runtime/available value))
+       (<= (count (:runtime/available value)) max-policy-entries)
+       (every? (fn [entry]
+                 (and (vector? entry) (= 2 (count entry))
+                      (qualified-keyword? (first entry))
+                      (bounded-string? (second entry) 2048)))
+               (:runtime/available value))))
+
+(defn- receipt [{:keys [now call cap outcome reason compiler-evidence
+                        local-policy runtime grant-ids]}]
+  {:receipt/at now
+   :receipt/call call
+   :receipt/cap cap
+   :receipt/outcome outcome
+   :receipt/reason reason
+   :receipt/compiler-manifest (:manifest-cid compiler-evidence)
+   :receipt/grants (vec grant-ids)
+   :receipt/policy (:policy/id local-policy)
+   :receipt/world (:runtime/world runtime)
+   :receipt/epoch (:runtime/epoch runtime)})
+
+(defn- denial [reason context]
+  {:allowed? false
+   :reason reason
+   :capability nil
+   :receipt (receipt (assoc context :outcome :denied :reason reason))})
+
+(def ^:private eligibility-rule
+  {:head ["kotoba:eligible" '?actor '?kind '?resource]
+   :body [["vm:runs" '?actor '?definition]
+          ["amu:requires" '?definition '?kind]
+          ["amu:world" '?definition '?world]
+          ["vm:requests" '?actor '?kind '?resource]
+          ["grant:right" '?actor '?kind '?resource]
+          ["policy:allows" '?actor '?kind '?resource]
+          ["runtime:world" '?world]
+          ["runtime:available" '?kind '?resource]]})
+
+(defn authorize
+  "Authorize one effect boundary.
+
+  Required inputs are `:semantics`, a verified Biscuit token and root public
+  key, Amu `:compiler-evidence`, a concrete `:request`, host-owned
+  `:local-policy`, and current `:runtime`. The compiler evidence envelope is a
+  sealed host assertion: this namespace validates its shape but the host must
+  verify the referenced IPLD block and compiler proof before calling."
+  [{:keys [semantics token root-public-key verify-fn compiler-evidence request
+           local-policy runtime now call budget]}]
+  (let [base {:now now :call call :cap request :compiler-evidence compiler-evidence
+              :local-policy local-policy :runtime runtime :grant-ids []}]
+    (cond
+      (not (compiler-evidence? compiler-evidence))
+      (denial :invalid-compiler-evidence base)
+
+      (not (request? request))
+      (denial :invalid-request base)
+
+      (not (policy? local-policy))
+      (denial :invalid-local-policy base)
+
+      (not (runtime? runtime))
+      (denial :invalid-runtime-state base)
+
+      (not (and (map? semantics) (set? (:kinds semantics))
+                (some? root-public-key) (ifn? verify-fn)
+                (bounded-string? now 128) (bounded-string? call 512)))
+      (denial :invalid-runtime-context base)
+
+      :else
+      (let [{:keys [actor definition-cid kind resource]} request
+            verified (token/verify token root-public-key verify-fn)]
+        (if-not (:ok? verified)
+          (denial (:reason verified) base)
+          (let [;; The manifest is the authority for Amu effect names. Adding
+                ;; this one name to the legacy kind set only lets the adapter
+                ;; decode the matching grant; the mandatory static fact,
+                ;; policy, and runtime joins still gate it.
+                delegated (kotoba/->delegated token (conj (set (:kinds semantics)) kind))
+                holder (:grant/holder delegated)
+                matching (filter #(= kind (:grant/kind %)) (:grants delegated))
+                static? (contains? (set (:facts compiler-evidence))
+                                   ["amu:requires" definition-cid kind])
+                world? (contains? (set (:facts compiler-evidence))
+                                  ["amu:world" definition-cid (:runtime/world runtime)])
+                policy-entry [actor kind resource]
+                runtime-entry [kind resource]
+                live (filter (fn [grant]
+                               (let [expires (:grant/expires grant)]
+                                 (or (nil? expires)
+                                     (and now (neg? (compare now expires))))))
+                             matching)
+                decision-base (assoc base :grant-ids (mapv :grant/id live))]
+            (cond
+              (not static?)
+              (denial :missing-static-effect decision-base)
+
+              ;; holder facts that conflict across blocks confer nothing;
+              ;; name the conflict instead of reporting :wrong-holder
+              (:grant/refused delegated)
+              (denial (:grant/refused delegated) decision-base)
+
+              (not world?)
+              (denial :runtime-unavailable decision-base)
+
+              (not= actor holder)
+              (denial :wrong-holder decision-base)
+
+              (empty? matching)
+              (denial :missing-grant decision-base)
+
+              (empty? live)
+              (denial :expired-grant decision-base)
+
+              (not (contains? (:policy/allow local-policy) policy-entry))
+              (denial :empty-intersection decision-base)
+
+              (not (contains? (:runtime/available runtime) runtime-entry))
+              (denial :runtime-unavailable decision-base)
+
+              :else
+              (let [grant-facts
+                    (vec (for [{grant-kind :grant/kind resources :grant/resources}
+                               live
+                               delegated-resource resources]
+                           ["grant:right" holder grant-kind delegated-resource]))
+                    policy-facts
+                    (mapv (fn [[allowed-actor allowed-kind allowed-resource]]
+                            ["policy:allows" allowed-actor allowed-kind allowed-resource])
+                          (:policy/allow local-policy))
+                    runtime-facts
+                    (into [["runtime:world" (:runtime/world runtime)]]
+                          (map (fn [[available-kind available-resource]]
+                                 ["runtime:available" available-kind available-resource]))
+                          (:runtime/available runtime))
+                    vm-facts [["vm:runs" actor definition-cid]
+                              ["vm:requests" actor kind resource]]
+                    facts (vec (concat (:facts compiler-evidence) vm-facts grant-facts
+                                       policy-facts runtime-facts))
+                    result (authorizer/authorize
+                            token
+                            {:root-public-key root-public-key
+                             :verify-fn verify-fn
+                             :facts facts
+                             :rules [eligibility-rule]
+                             :policies [{:kind :allow
+                                         :body [["kotoba:eligible" actor kind resource]]}]
+                             :policy-token-facts? false
+                             :budget (or budget datalog/default-budget)})]
+                (if (:allowed? result)
+                  (let [expires (some->> live (keep :grant/expires) seq
+                                         (reduce #(if (neg? (compare %1 %2)) %1 %2)))
+                        cap (cond-> {:cap/kind kind
+                                     :cap/resource resource
+                                     :cap/holder actor
+                                     :cap/provenance :amu+biscuit+local-policy+runtime}
+                              expires (assoc :cap/expires expires))
+                        allowed-base (assoc decision-base :cap cap)]
+                    {:allowed? true
+                     :reason :granted
+                     :capability cap
+                     :receipt (receipt (assoc allowed-base :outcome :allowed
+                                                           :reason :granted))})
+                  (denial (:reason result) decision-base))))))))))

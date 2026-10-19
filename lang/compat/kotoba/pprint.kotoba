@@ -1,0 +1,503 @@
+(ns kotoba.pprint
+  "`clojure.pprint/pprint`, byte for byte as the kbb engine prints it.
+
+  The workspace's `.cljk` sources run on kbb (SCI on Node), where
+  `clojure.pprint` IS cljs.pprint's `simple-dispatch` behind SCI. That output
+  is what every caller of `(pprint x)` in the fleet has been reading, writing
+  into files and comparing against. So this namespace is not a new pretty
+  printer: it is cljs.pprint's pretty-writer (Waters' XP algorithm, the
+  column writer, the token buffer, the linear / fill / miser newline
+  decisions) and its simple-dispatch table, transcribed into portable
+  clojure.core with the state held in atoms instead of a Writer object.
+
+  Transcribed with its quirks ON PURPOSE, because they are in the bytes the
+  callers already have:
+
+    * a line that the final flush breaks keeps the blank before the newline
+      (`\"value-7\", \\n` -- cljs.pprint writes the buffered tail with
+      force-trailing-whitespace);
+    * once the first conditional newline is buffered, the writer never
+      returns to :writing mode (cljs sets `:buffering`, not `:mode`);
+    * the output always ends in exactly one newline (the pretty writer has
+      no `:cur`, so the `(= 0 (get-column *out*))` guard never holds);
+    * namespace maps are never lifted to `#:ns{...}`: the host's
+      `*print-namespace-maps*` is false under kbb even though SCI's is true,
+      measured 2026-09-24;
+    * records print as plain maps, queues / derefables / symbols / anything
+      else print as `pr-str`.
+
+  Scope: `pprint` (one argument, printed through `print`), and the two
+  dynamic vars it reads, `*print-right-margin*` (72) and
+  `*print-miser-width*` (40). `*print-length*`, `*print-level*`,
+  `*print-namespace-maps*`, `*print-meta*` and `*print-readably*` are held at
+  the host defaults for the whole call, because that is what kbb's
+  clojure.pprint does (the host never sees SCI's bindings) -- on the JVM this
+  is a deliberate difference from clojure.pprint. Not here: the writer arity,
+  `cl-format`, `code-dispatch`, `print-table`, `with-pprint-dispatch`.
+
+  Oracle: test/kotoba/pprint_test.cljk compares against kbb's own
+  clojure.pprint over a generated corpus (both directions: equal bytes on
+  every value, and a different printer detected as different).
+
+  Transcribed from ClojureScript's cljs/pprint.cljs (1.12.42): Copyright (c)
+  Rich Hickey, Eclipse Public License 1.0 -- see LICENSE.")
+
+(def ^:dynamic *print-right-margin*
+  "Pretty printing will try to avoid anything going beyond this column. nil
+  lets a line be arbitrarily long."
+  72)
+
+(def ^:dynamic *print-miser-width*
+  "The column at which to enter miser style."
+  40)
+
+;; ---------------------------------------------------------------------------
+;; small portable helpers
+;; ---------------------------------------------------------------------------
+
+(defn- last-newline [s]
+  (loop [i (dec (count s))]
+    (cond (neg? i) -1
+          (= \newline (nth s i)) i
+          :else (recur (dec i)))))
+
+(defn- split-lines-keep
+  "(string/split s \"\\n\" -1): every line, trailing empty ones included."
+  [s]
+  (loop [i 0 start 0 acc []]
+    (cond (= i (count s)) (conj acc (subs s start))
+          (= \newline (nth s i)) (recur (inc i) (inc i) (conj acc (subs s start i)))
+          :else (recur (inc i) start acc))))
+
+(def ^:private js-whitespace
+  ;; the JavaScript \s class, which cljs.pprint's #"\s+$" is evaluated with
+  #{\space \tab \newline \return \formfeed \u000b \u00a0 \u1680 \u2000 \u2001 \u2002
+    \u2003 \u2004 \u2005 \u2006 \u2007 \u2008 \u2009 \u200a \u2028 \u2029 \u202f
+    \u205f \u3000 \ufeff})
+
+(defn- rtrim-ws [s]
+  (loop [e (count s)]
+    (if (and (pos? e) (contains? js-whitespace (nth s (dec e))))
+      (recur (dec e))
+      (subs s 0 e))))
+
+;; ---------------------------------------------------------------------------
+;; column writer
+;; ---------------------------------------------------------------------------
+
+(defn- column-writer [max-columns]
+  (atom {:max max-columns :cur 0 :line 0 :out []}))
+
+(defn- cw-write [cw s]
+  (let [nl (last-newline s)]
+    (if (neg? nl)
+      (swap! cw update :cur + (count s))
+      (swap! cw assoc
+             :cur (- (count s) nl 1)
+             :line (+ (:line @cw) (count (filter #(= % \newline) s)))))
+    (swap! cw update :out conj s)
+    nil))
+
+(defn- get-column [cw] (:cur @cw))
+
+;; ---------------------------------------------------------------------------
+;; pretty writer (cljs.pprint pretty_writer, transcribed)
+;; ---------------------------------------------------------------------------
+
+(def ^:private ^:dynamic *pw* nil)
+
+(defn- getf [k] (get @*pw* k))
+(defn- setf [k v] (swap! *pw* assoc k v) nil)
+(defn- base [] (getf :base))
+(defn- bwrite [s] (cw-write (base) s))
+
+(defn- logical-block [parent prefix per-line-prefix suffix]
+  {:parent parent :start-col (atom 0) :indent (atom 0)
+   :done-nl (atom false) :intra-block-nl (atom false)
+   :prefix prefix :per-line-prefix per-line-prefix :suffix suffix})
+
+(defn- ancestor? [parent child]
+  (loop [child (:parent child)]
+    (cond
+      (nil? child) false
+      (identical? parent child) true
+      :else (recur (:parent child)))))
+
+(defn- buffer-length [l]
+  (let [l (seq l)]
+    (if l
+      (- (:end-pos (last l)) (:start-pos (first l)))
+      0)))
+
+(defn- nl-t? [t] (= :nl-t (:type-tag t)))
+
+(declare emit-nl)
+
+(defn- write-token [token]
+  (case (:type-tag token)
+    :start-block-t
+    (let [lb (:logical-block token)]
+      (when-let [prefix (:prefix lb)] (bwrite prefix))
+      (let [col (get-column (base))]
+        (reset! (:start-col lb) col)
+        (reset! (:indent lb) col)))
+    :end-block-t
+    (when-let [suffix (:suffix (:logical-block token))] (bwrite suffix))
+    :buffer-blob
+    (bwrite (:data token))
+    :nl-t
+    (do (if (or (= (:type token) :mandatory)
+                (and (not (= (:type token) :fill))
+                     @(:done-nl (:logical-block token))))
+          (emit-nl token)
+          (when-let [tws (getf :trailing-white-space)] (bwrite tws)))
+        (setf :trailing-white-space nil))))
+
+(defn- write-tokens [tokens force-trailing-whitespace]
+  (doseq [token tokens]
+    (when-not (= (:type-tag token) :nl-t)
+      (when-let [tws (getf :trailing-white-space)] (bwrite tws)))
+    (write-token token)
+    (setf :trailing-white-space (:trailing-white-space token))
+    (let [tws (getf :trailing-white-space)]
+      (when (and force-trailing-whitespace tws)
+        (bwrite tws)
+        (setf :trailing-white-space nil)))))
+
+(defn- tokens-fit? [tokens]
+  (let [maxcol (:max @(base))]
+    (or (nil? maxcol)
+        (< (+ (get-column (base)) (buffer-length tokens)) maxcol))))
+
+(defn- linear-nl? [lb section]
+  (or @(:done-nl lb) (not (tokens-fit? section))))
+
+(defn- miser-nl? [lb section]
+  (let [miser-width (getf :miser-width)
+        maxcol (:max @(base))]
+    (and miser-width maxcol
+         (>= @(:start-col lb) (- maxcol miser-width))
+         (linear-nl? lb section))))
+
+(defn- emit-nl? [newl section subsection]
+  (let [lb (:logical-block newl)]
+    (case (:type newl)
+      :linear (linear-nl? lb section)
+      :miser (miser-nl? lb section)
+      :fill (or @(:intra-block-nl lb)
+                (not (tokens-fit? subsection))
+                (miser-nl? lb section))
+      :mandatory true)))
+
+(defn- get-section [buffer]
+  (let [nl (first buffer)
+        lb (:logical-block nl)
+        section (seq (take-while #(not (and (nl-t? %) (ancestor? (:logical-block %) lb)))
+                                 (next buffer)))]
+    [section (seq (drop (inc (count section)) buffer))]))
+
+(defn- get-sub-section [buffer]
+  (let [nl (first buffer)
+        lb (:logical-block nl)]
+    (seq (take-while #(let [nl-lb (:logical-block %)]
+                        (not (and (nl-t? %) (or (identical? nl-lb lb) (ancestor? nl-lb lb)))))
+                     (next buffer)))))
+
+(defn- update-nl-state [lb]
+  (reset! (:intra-block-nl lb) true)
+  (reset! (:done-nl lb) true)
+  (loop [lb (:parent lb)]
+    (when lb
+      (reset! (:done-nl lb) true)
+      (reset! (:intra-block-nl lb) true)
+      (recur (:parent lb)))))
+
+(defn- emit-nl [nl]
+  (bwrite "\n")
+  (setf :trailing-white-space nil)
+  (let [lb (:logical-block nl)
+        prefix (:per-line-prefix lb)]
+    (when prefix (bwrite prefix))
+    (bwrite (apply str (repeat (- @(:indent lb) (count prefix)) \space)))
+    (update-nl-state lb)))
+
+(defn- split-at-newline [tokens]
+  (let [pre (seq (take-while #(not (nl-t? %)) tokens))]
+    [pre (seq (drop (count pre) tokens))]))
+
+(defn- write-token-string [tokens]
+  (let [[a b] (split-at-newline tokens)]
+    (when a (write-tokens a false))
+    (when b
+      (let [[section remainder] (get-section b)
+            newl (first b)
+            do-nl (emit-nl? newl section (get-sub-section b))
+            result (if do-nl
+                     (do (emit-nl newl) (next b))
+                     b)
+            long-section (not (tokens-fit? result))]
+        (if long-section
+          (let [rem2 (write-token-string section)]
+            (if (= rem2 section)
+              (do (write-tokens section false) remainder)
+              (into [] (concat rem2 remainder))))
+          result)))))
+
+(defn- write-line []
+  (loop [buffer (getf :buffer)]
+    (setf :buffer (into [] buffer))
+    (when-not (tokens-fit? buffer)
+      (let [new-buffer (write-token-string buffer)]
+        (when-not (identical? buffer new-buffer)
+          (recur new-buffer))))))
+
+(defn- add-to-buffer [token]
+  (setf :buffer (conj (getf :buffer) token))
+  (when-not (tokens-fit? (getf :buffer))
+    (write-line)))
+
+(defn- write-buffered-output []
+  (write-line)
+  (when-let [buf (getf :buffer)]
+    (write-tokens buf true)
+    (setf :buffer [])))
+
+(defn- write-white-space []
+  (when-let [tws (getf :trailing-white-space)]
+    (bwrite tws)
+    (setf :trailing-white-space nil)))
+
+(defn- blob [data tws start end]
+  {:type-tag :buffer-blob :data data :trailing-white-space tws :start-pos start :end-pos end})
+
+(defn- write-initial-lines [s]
+  (let [lines (split-lines-keep s)]
+    (if (= (count lines) 1)
+      s
+      (let [prefix nil ; cljs reads (:per-line-prefix (first lb)) -- a map entry, so nil
+            l (first lines)]
+        (if (= :buffering (getf :mode))
+          (let [oldpos (getf :pos)
+                newpos (+ oldpos (count l))]
+            (setf :pos newpos)
+            (add-to-buffer (blob l nil oldpos newpos))
+            (write-buffered-output))
+          (do (write-white-space)
+              (bwrite l)))
+        (bwrite "\n")
+        (doseq [l (next (butlast lines))]
+          (bwrite l)
+          (bwrite "\n")
+          (when prefix (bwrite prefix)))
+        ;; cljs.pprint: (setf :buffering :writing) -- the mode is NOT reset
+        (last lines)))))
+
+(defn- pw-write [x]
+  (let [s0 (write-initial-lines x)
+        s (rtrim-ws s0)
+        white-space (subs s0 (count s))
+        mode (getf :mode)]
+    (if (= mode :writing)
+      (do (write-white-space)
+          (bwrite s)
+          (setf :trailing-white-space white-space))
+      (let [oldpos (getf :pos)
+            newpos (+ oldpos (count s0))]
+        (setf :pos newpos)
+        (add-to-buffer (blob s white-space oldpos newpos))))))
+
+(defn- ppflush []
+  (if (= (getf :mode) :buffering)
+    (do (write-tokens (getf :buffer) true)
+        (setf :buffer []))
+    (write-white-space)))
+
+(defn- start-block [prefix per-line-prefix suffix]
+  (let [lb (logical-block (getf :logical-blocks) prefix per-line-prefix suffix)]
+    (setf :logical-blocks lb)
+    (if (= (getf :mode) :writing)
+      (do (write-white-space)
+          (when prefix (bwrite prefix))
+          (let [col (get-column (base))]
+            (reset! (:start-col lb) col)
+            (reset! (:indent lb) col)))
+      (let [oldpos (getf :pos)
+            newpos (+ oldpos (if prefix (count prefix) 0))]
+        (setf :pos newpos)
+        (add-to-buffer {:type-tag :start-block-t :logical-block lb :start-pos oldpos :end-pos newpos})))))
+
+(defn- end-block []
+  (let [lb (getf :logical-blocks)
+        suffix (:suffix lb)]
+    (if (= (getf :mode) :writing)
+      (do (write-white-space)
+          (when suffix (bwrite suffix)))
+      (let [oldpos (getf :pos)
+            newpos (+ oldpos (if suffix (count suffix) 0))]
+        (setf :pos newpos)
+        (add-to-buffer {:type-tag :end-block-t :logical-block lb :start-pos oldpos :end-pos newpos})))
+    (setf :logical-blocks (:parent lb))))
+
+(defn- nl [kind]
+  (setf :mode :buffering)
+  (let [pos (getf :pos)]
+    (add-to-buffer {:type-tag :nl-t :type kind :logical-block (getf :logical-blocks) :start-pos pos :end-pos pos})))
+
+(defn- pretty-writer [max-columns miser-width]
+  (atom {:base (column-writer max-columns)
+         :logical-blocks (logical-block nil nil nil nil)
+         :mode :writing
+         :buffer []
+         :miser-width miser-width
+         :trailing-white-space nil
+         :pos 0}))
+
+;; ---------------------------------------------------------------------------
+;; pprint_base + simple-dispatch
+;; ---------------------------------------------------------------------------
+
+(def ^:private ^:dynamic *current-level* 0)
+;; nil outside any block; inside, an atom (cljs.pprint set!s a dynamic var)
+(def ^:private ^:dynamic *current-length* nil)
+
+(declare dispatch)
+
+(defn- write-out [object]
+  (let [len *current-length*
+        length-reached (and len *print-length* (>= @len *print-length*))]
+    (if length-reached
+      (pw-write "...")
+      (do (when len (swap! len inc))
+          (dispatch object)))
+    length-reached))
+
+(defn- level-exceeded? []
+  (and *print-level* (>= *current-level* *print-level*)))
+
+(defn- pprint-logical-block [prefix suffix body]
+  (if (level-exceeded?)
+    (pw-write "#")
+    (binding [*current-level* (inc *current-level*)
+              *current-length* (atom 0)]
+      (start-block prefix nil suffix)
+      (body)
+      (end-block)))
+  nil)
+
+(defn- print-length-loop
+  "cljs.pprint's print-length-loop over `xs`: `step` gets the remaining seq
+  and returns the next one to recur on (nil stops)."
+  [xs step]
+  (loop [n 0 xs xs]
+    (if (or (not *print-length*) (< n *print-length*))
+      (when-let [nxt (step xs)] (recur (inc n) nxt))
+      (pw-write "..."))))
+
+(def ^:private reader-macros
+  {'quote "'" 'var "#'"
+   'clojure.core/deref "@" 'clojure.core/unquote "~"
+   'cljs.core/deref "@" 'cljs.core/unquote "~"})
+
+(defn- pprint-reader-macro [alis]
+  (let [macro-char (reader-macros (first alis))]
+    (when (and macro-char (= 2 (count alis)))
+      (pw-write macro-char)
+      (write-out (second alis))
+      true)))
+
+(defn- pprint-seq-block [prefix suffix xs]
+  (pprint-logical-block prefix suffix
+    (fn []
+      (print-length-loop (seq xs)
+        (fn [xs]
+          (when xs
+            (write-out (first xs))
+            (when (next xs)
+              (pw-write " ")
+              (nl :linear)
+              (next xs))))))))
+
+(defn- pprint-list [alis]
+  (when-not (pprint-reader-macro alis)
+    (pprint-seq-block "(" ")" alis)))
+
+(defn- pprint-map [amap]
+  (pprint-logical-block "{" "}"
+    (fn []
+      (print-length-loop (seq amap)
+        (fn [aseq]
+          (when aseq
+            (pprint-logical-block nil nil
+              (fn []
+                (write-out (ffirst aseq))
+                (pw-write " ")
+                (nl :linear)
+                (reset! *current-length* 0)
+                (write-out (fnext (first aseq)))))
+            (when (next aseq)
+              (pw-write ", ")
+              (nl :linear)
+              (next aseq))))))))
+
+(defn- pprint-set
+  "cl-format \"~<#{~;~@{~w~^ ~:_~}~;}~:>\": fill newlines, and the length
+  limit is write-out's (\"...\" then stop), not print-length-loop's."
+  [aset]
+  (pprint-logical-block "#{" "}"
+    (fn []
+      (loop [xs (seq aset)]
+        (when xs
+          (when-not (write-out (first xs))
+            (when (next xs)
+              (pw-write " ")
+              (nl :fill)
+              (recur (next xs)))))))))
+
+(defn- queue? [x]
+  )
+
+(defn- derefable? [x]
+  )
+
+(defn- dispatch
+  "cljs.pprint/type-dispatcher + simple-dispatch. :queue, :deref and
+  :symbol have no simple-dispatch method, so they print as `pr-str`."
+  [obj]
+  (cond
+    (queue? obj) (pw-write (pr-str obj))
+    (derefable? obj) (pw-write (pr-str obj))
+    (symbol? obj) (pw-write (pr-str obj))
+    (seq? obj) (pprint-list obj)
+    (map? obj) (pprint-map obj)
+    (vector? obj) (pprint-seq-block "[" "]" obj)
+    (set? obj) (pprint-set obj)
+    (nil? obj) (pw-write (pr-str nil))
+    :else (pw-write (pr-str obj))))
+
+(defn pprint-str
+  "The exact text `pprint` prints for `object`, trailing newline included."
+  [object]
+  ;; kbb's clojure.pprint is the HOST cljs.pprint: the printer variables a
+  ;; script binds are SCI's, which the host never sees, so it prints as if
+  ;; they were at the host defaults (measured 2026-09-24: *print-length* 2,
+  ;; *print-level* 1 and SCI's *print-namespace-maps* true change nothing,
+  ;; including inside an atom's pr-str). Pinned here, so the bytes match.
+  (binding [*pw* (pretty-writer *print-right-margin* *print-miser-width*)
+            *print-length* nil
+            *print-level* nil
+            *print-namespace-maps* false
+            *print-meta* false
+            *print-readably* true]
+    (write-out object)
+    ;; cljs.pprint/pprint: (if (not (= 0 (get-column *out*))) (-write *out* \newline))
+    ;; -- *out* is the pretty writer there, which has no :cur, so always
+    (pw-write "\n")
+    (ppflush)
+    (apply str (:out @(base)))))
+
+(defn pprint
+  "Pretty print `object` the way clojure.pprint/pprint does on kbb
+  (cljs.pprint simple-dispatch), through `print`, so `with-out-str` captures
+  it."
+  [object]
+  (clojure.core/print (pprint-str object)))

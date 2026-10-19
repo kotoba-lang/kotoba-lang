@@ -1,0 +1,473 @@
+(ns murakumo.web.host
+  "Node/nbb host primitives for murakumo.web.worker (ADR-260929 M1).
+
+  Synchronous on purpose — the worker is written against sync primitives. HTTP
+  is `curl` with the vetted address pinned via --resolve, redirects OFF and a
+  size cap; DNS is Node's resolver in a child process. The store is a local
+  content-addressed directory: the yataverse/IPFS put is a later transport
+  (ADR-2607023100) and is NOT claimed here."
+  (:require [murakumo.web.backends :as backends]
+            [murakumo.web.worker :as w]))
+
+(def ^:private cp (js/require "child_process"))
+(def ^:private fs (js/require "fs"))
+(def ^:private path (js/require "path"))
+(def ^:private crypto (js/require "crypto"))
+
+(defn- run [cmd args opts]
+  (try
+    (let [r (.spawnSync cp cmd (clj->js args) (clj->js (merge {:maxBuffer (* 64 1024 1024)} opts)))]
+      {:status (.-status r) :stdout (.-stdout r) :stderr (some-> (.-stderr r) .toString)})
+    (catch :default e {:status -1 :stderr (str e)})))
+
+(defn resolve!
+  "host -> [ip ...] (all A/AAAA answers), [] on failure. The name goes in the
+  child's ENVIRONMENT, never argv: a host beginning with '-' must not be able to
+  become a node option."
+  [host]
+  (if (or (not (string? host)) (empty? host) (= \- (first host)))
+    []
+    (let [r (run "node" ["-e" "require('dns').promises.lookup(process.env.MW_HOST,{all:true}).then(a=>console.log(a.map(x=>x.address).join('\\n'))).catch(()=>{})"]
+                 {:timeout 10000
+                  ;; a plain JS object: process.env is exotic and js->clj leaves it as-is
+                  :env (js/Object.assign #js {} (.-env js/process) #js {"MW_HOST" host})})]
+      (if (zero? (:status r))
+        (vec (remove empty? (.split (.toString (:stdout r)) "\n")))
+        []))))
+
+(defn- parse-headers [raw]
+  (into {} (keep (fn [line]
+                   (when-let [i (.indexOf line ":")]
+                     (when (pos? i)
+                       [(.toLowerCase (subs line 0 i)) (.trim (subs line (inc i)))])))
+                 (.split raw "\r\n"))))
+
+(defn http-get!
+  "One hop, no redirect following, connect pinned to `address`."
+  [{:keys [url address max-bytes]}]
+  (let [[_ scheme host port] (re-find #"^(https?)://(\[[^\]]+\]|[^/:?#]+)(?::(\d+))?" url)
+        port (or port (if (= scheme "https") "443" "80"))
+        ;; an IP literal is connected to directly; --resolve pins names only
+        literal? (or (.startsWith host "[") (boolean (re-matches #"\d{1,3}(\.\d{1,3}){3}" host)))
+        hdr (str (.tmpdir (js/require "os")) "/murakumo-web-" (.toString (.randomBytes crypto 6) "hex") ".hdr")
+        ;; -g: no URL globbing ([1-1000] would fan out). --noproxy '*': a proxy from the
+        ;; environment would resolve the name itself and bypass the vetted address.
+        r (run "curl" (-> ["-sS" "-g" "--noproxy" "*" "--max-time" "30" "--max-filesize" (str max-bytes)
+                           "--proto" "=http,https" "--max-redirs" "0"]
+                          (into (when-not literal? ["--resolve" (str host ":" port ":" address)]))
+                          (into ["-A" "murakumo-web/0 (+https://murakumo.cloud)" "-D" hdr "-o" "-" url]))
+               {})]
+    (try
+      (if (and (zero? (:status r)) (.existsSync fs hdr))
+        (let [raw (.readFileSync fs hdr "utf8")
+              blocks (remove empty? (.split raw "\r\n\r\n"))
+              last-block (last blocks)
+              status (js/parseInt (second (re-find #"^HTTP/\S+ (\d+)" last-block)) 10)]
+          {:status status :headers (parse-headers last-block) :body (js/Uint8Array. (:stdout r))})
+        {:error (keyword "curl" (str "exit-" (:status r)))})
+      (finally (when (.existsSync fs hdr) (.unlinkSync fs hdr))))))
+
+(defn valid-cid?
+  "A CIDv1 base32 name: 'b' + lowercase base32. Anything else (path separators,
+  '..', absolute paths) is never a store key."
+  [cid]
+  (boolean (and (string? cid) (re-matches #"b[a-z2-7]{20,120}" cid))))
+
+(defn dir-store
+  "Content-addressed directory store. Keys must be CIDs (`valid-cid?`); any other
+  key is refused, so a request can never name a path outside the store."
+  [dir]
+  (.mkdirSync fs dir #js {:recursive true})
+  {:put! (fn [cid bs]
+           (when-not (valid-cid? cid) (throw (ex-info "invalid store key" {:key (str cid)})))
+           (.writeFileSync fs (.join path dir cid) (js/Buffer.from bs)) true)
+   :get-bytes! (fn [cid]
+                 (when (valid-cid? cid)
+                   (let [p (.join path dir cid)]
+                     (when (.existsSync fs p) (js/Uint8Array. (.readFileSync fs p))))))})
+
+(def ^:private pkcs8-ed25519-prefix "302e020100300506032b657004220420")
+
+(defn- private-key [seed-hex]
+  (.createPrivateKey crypto #js {:key (js/Buffer.from (str pkcs8-ed25519-prefix seed-hex) "hex")
+                                 :format "der" :type "pkcs8"}))
+
+(defn signer
+  "seed-hex (32 bytes) -> {:sign! (fn [string] -> hex sig) :public-key-hex}."
+  [seed-hex]
+  (let [k (private-key seed-hex)
+        pub (.createPublicKey crypto k)]
+    {:sign! (fn [s] (.toString (.sign crypto nil (js/Buffer.from s "utf8") k) "hex"))
+     :public-key-hex (.toString (.export pub #js {:format "der" :type "spki"}) "hex")}))
+
+(defn verify?
+  "Check a receipt signature against the signer's public key (spki hex)."
+  [public-key-hex signing-string signature-hex]
+  (let [pub (.createPublicKey crypto #js {:key (js/Buffer.from public-key-hex "hex")
+                                          :format "der" :type "spki"})]
+    (.verify crypto nil (js/Buffer.from signing-string "utf8") pub (js/Buffer.from signature-hex "hex"))))
+
+(defn env
+  "Worker env for this host. opts: {:store-dir :seed-hex :node-did}."
+  [{:keys [store-dir seed-hex node-did]}]
+  (merge {:resolve! resolve! :http-get! http-get!
+          :now-ms (fn [] (js/Date.now)) :node-did node-did
+          :sign! (:sign! (signer seed-hex))}
+         (dir-store store-dir)))
+
+(defn searxng
+  "Backend over a SearXNG `/search?format=json` endpoint. `base-url` is OPERATOR
+  config (it may be an internal host) and must never come from a job. The query
+  is sent to that instance, and through it to third-party engines."
+  [{:keys [name base-url max-time-s] :or {max-time-s 15}}]
+  {:name name
+   :search!
+   (fn [{:keys [query k]}]
+     (if-not (re-find #"^https?://" (str base-url))
+       {:error :backend/bad-base-url}
+       (let [r (run "curl" ["-sS" "-g" "--noproxy" "*" "-G" "--max-time" (str max-time-s) "--max-filesize" "2097152"
+                            "--proto" "=http,https" "--max-redirs" "0"
+                            "-w" "\n%{http_code}"
+                            "--data-urlencode" (str "q=" query) "--data-urlencode" "format=json"
+                            (str (.replace base-url #"/+$" "") "/search")]
+                    {})]
+         (if-not (zero? (:status r))
+           {:error (keyword "curl" (str "exit-" (:status r)))}
+           (let [out (.toString (:stdout r))
+                 i (.lastIndexOf out "\n")
+                 code (js/parseInt (subs out (inc i)) 10)]
+             (if (not= 200 code)
+               {:error (keyword "backend" (str "http-" code))}
+               (try
+                 (let [doc (js->clj (js/JSON.parse (subs out 0 i)) :keywordize-keys true)]
+                   {:results (into [] (comp (take k)
+                                            (map (fn [x] {:url (:url x) :title (:title x) :snippet (:content x)})))
+                                   (:results doc))})
+                 (catch :default _ {:error :backend/bad-json})))))))) })
+
+;; --- identity -----------------------------------------------------------------
+
+(def ^:private b58 "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+(defn- base58btc
+  "Digit-array conversion (no BigInt literals: the stock nbb reader rejects them)."
+  [^js buf]
+  (let [bs (vec (array-seq buf))
+        zeros (count (take-while zero? bs))
+        digits (reduce (fn [ds b]
+                         (let [[ds carry] (reduce (fn [[out carry] d]
+                                                    (let [x (+ (* d 256) carry)]
+                                                      [(conj out (rem x 58)) (quot x 58)]))
+                                                  [[] b] ds)]
+                           (loop [ds ds carry carry]
+                             (if (pos? carry) (recur (conj ds (rem carry 58)) (quot carry 58)) ds))))
+                       [] bs)]
+    (str (apply str (repeat zeros "1")) (apply str (map #(nth b58 %) (reverse digits))))))
+
+(defn did-key
+  "did:key for an ed25519 public key given as SPKI hex (multicodec 0xed01)."
+  [public-key-hex]
+  (let [spki (js/Buffer.from public-key-hex "hex")
+        raw (.subarray spki (- (.-length spki) 32))]
+    (str "did:key:z" (base58btc (js/Buffer.concat #js [(js/Buffer.from #js [0xed 0x01]) raw])))))
+
+(defn load-or-create-seed!
+  "Node key: 32 random bytes as hex in `path`, mode 0600, created once. Never logged."
+  [path-str]
+  (if (.existsSync fs path-str)
+    (let [s (.trim (.readFileSync fs path-str "utf8"))]
+      (when-not (re-matches #"[0-9a-f]{64}" s)
+        (throw (ex-info "node key file is not 64 hex chars" {:path path-str})))
+      s)
+    (let [seed (.toString (.randomBytes crypto 32) "hex")]
+      (.mkdirSync fs (.dirname path path-str) #js {:recursive true :mode 0700})
+      (try
+        (.writeFileSync fs path-str (str seed "\n") #js {:mode 0600 :flag "wx"})
+        seed
+        ;; two first-run processes raced: the winner's key is the node's key
+        (catch :default e
+          (if (= "EEXIST" (.-code e))
+            (.trim (.readFileSync fs path-str "utf8"))
+            (throw e)))))))
+
+;; --- store housekeeping -------------------------------------------------------
+
+(defn store-usage
+  "{:files n :bytes n} of a dir store."
+  [dir]
+  (if-not (.existsSync fs dir)
+    {:files 0 :bytes 0}
+    (reduce (fn [acc f] (-> acc (update :files inc)
+                            (update :bytes + (.-size (.statSync fs (.join path dir f))))))
+            {:files 0 :bytes 0}
+            (array-seq (.readdirSync fs dir)))))
+
+(defn store-gc!
+  "Delete oldest files until the store is <= max-bytes. Explicit operator action:
+  nothing is pinned elsewhere until the yataverse put lands, so this loses data."
+  [dir max-bytes]
+  (let [entries (->> (array-seq (.readdirSync fs dir))
+                     (map (fn [f] (let [st (.statSync fs (.join path dir f))]
+                                    {:f f :size (.-size st) :t (.-mtimeMs st)})))
+                     (sort-by :t))
+        total (reduce + (map :size entries))]
+    (loop [es entries total total removed 0]
+      (if (or (<= total max-bytes) (empty? es))
+        {:removed removed :bytes-after total}
+        (let [{:keys [f size]} (first es)]
+          (.unlinkSync fs (.join path dir f))
+          (recur (rest es) (- total size) (inc removed)))))))
+
+(defn free-bytes
+  "Free bytes on the volume holding `dir` (via `df -k`), or nil."
+  [dir]
+  (let [r (run "df" ["-k" dir] {})]
+    (when (zero? (:status r))
+      (some-> (.toString (:stdout r)) (.split "\n") (aget 1) (.split #"\s+") (aget 3)
+              (js/parseInt 10) (* 1024)))))
+
+;; --- yataverse / kotobase block put ---------------------------------------------
+
+(defn- curl-config-line [k v]
+  ;; curl --config syntax; values are quoted, `\\` and `"` escaped, newlines rejected
+  (when (re-find #"[\r\n]" (str v)) (throw (ex-info "control character in curl config value" {:key k})))
+  (str k " = \"" (.replace (.replace (str v) "\\" "\\\\") "\"" "\\\"") "\"\n"))
+
+(defn auth-from-command
+  "Run the operator's minter (argv vector, NO shell) and return its stdout as the
+  Authorization value, or nil. kotobase authorizations are short-lived CACAOs with
+  single-use nonces, so a value must be minted per write, never cached in a file."
+  [argv]
+  (when (and (vector? argv) (seq argv) (every? string? argv))
+    (let [r (run (first argv) (vec (rest argv)) {:timeout 30000 :encoding "utf8"})
+          out (some-> (:stdout r) .toString .trim)]
+      (when (and (zero? (:status r)) (seq out) (not (re-find #"[\r\n]" out))) out))))
+
+(defn- host-of [url] (some-> (re-find #"^https?://([^/:?#]+)" (str url)) second .toLowerCase))
+
+(defn- parent-domain
+  "Registrable-ish parent: last two labels of a hostname; an IP literal or a
+  single-label host is its own parent (so a redirect must stay on that host)."
+  [host]
+  (let [labels (.split host ".")]
+    (if (or (re-matches #"[0-9.]+" host) (< (.-length labels) 3)) host
+        (.join (.slice labels -2) "."))))
+
+(defn- readback!
+  "GET the block back for verification. The gateway may redirect to a per-CID
+  subdomain (ipfs.<domain>/ipfs/<cid> -> <cid>.ipfs.<domain>), so redirects are
+  followed here (https only after the first hop, at most 3) but the FINAL host
+  must share the base host's parent domain. Never used for the authenticated PUT.
+  Returns {:bytes u8} | {:error kw}."
+  [url base-url out-file max-time-s]
+  (let [r (run "curl" ["-sS" "-g" "--noproxy" "*" "--max-time" (str max-time-s)
+                       "--proto" "=http,https" "--proto-redir" "=https,http"
+                       "-L" "--max-redirs" "3" "-o" out-file "-w" "%{http_code} %{url_effective}" url] {})
+        [_ code eff] (re-find #"^(\d+) (.*)$" (str (some-> (:stdout r) .toString)))]
+    (cond
+      (not (zero? (:status r))) {:error :put/verify-unreachable}
+      (not= "200" code) {:error (keyword "put" (str "verify-http-" code))}
+      (not= (parent-domain (or (host-of eff) ""))
+            (parent-domain (or (host-of base-url) "")))
+      {:error :put/verify-redirected-off-domain}
+      :else {:bytes (js/Uint8Array. (.readFileSync fs out-file))})))
+
+(def authn-hosts
+  "The only hosts a service-account secret may be sent to (kotobase.authn does the
+  same). Tests extend it explicitly through :authn-hosts."
+  #{"auth.kotoba.cloud"})
+
+(defn biscuit-from-service-account
+  "Exchange a tenant service-account secret (`kb_sa_...`, issued by a tenant admin)
+  for a short-lived Biscuit at Authn: POST <endpoint>/v1/biscuit/token with
+  `Authorization: Bearer <secret>` (kotobase.authn, superproject ADR-2609241800).
+  The secret goes on curl's stdin config, never in argv, and only to `authn-hosts`.
+  cfg: {:endpoint :tenant-id :storage :permissions :sa-token :authn-hosts :max-time-s}.
+  Returns the Authorization value (\"Biscuit ...\") or nil. Mints no credential of
+  its own: without a tenant admin's secret there is nothing to exchange."
+  [{:keys [endpoint tenant-id storage permissions sa-token max-time-s insecure-http-for-tests]
+    hosts :authn-hosts
+    :or {endpoint "https://auth.kotoba.cloud" max-time-s 30}}]
+  (let [host (host-of endpoint)
+        ;; plain http exists ONLY for the test fake; web_node never passes the flag
+        proto (if insecure-http-for-tests "=http,https" "=https")]
+    (when (and (re-find (if insecure-http-for-tests #"^https?://" #"^https://") (str endpoint)) host
+               (contains? (or hosts authn-hosts) host)
+               (re-matches #"kb_sa_[A-Za-z0-9._-]+" (str sa-token))
+               (re-matches #"t_[A-Za-z0-9_-]+" (str tenant-id)))
+      (let [body (js/JSON.stringify
+                  (clj->js (cond-> {:tenantId tenant-id}
+                             storage (assoc :storage storage)
+                             (seq permissions) (assoc :permissions permissions))))
+            cfg (str (curl-config-line "header" (str "Authorization: Bearer " sa-token))
+                     (curl-config-line "header" "Content-Type: application/json"))
+            r (run "curl" ["-sS" "-g" "--noproxy" "*" "--max-time" (str max-time-s) "--proto" proto
+                           "--max-redirs" "0" "-X" "POST" "--data" body "-w" "\n%{http_code}"
+                           "--config" "-" (str (.replace endpoint #"/+$" "") "/v1/biscuit/token")]
+                   {:input cfg})]
+        (when (zero? (:status r))
+          (let [out (.toString (:stdout r))
+                i (.lastIndexOf out "\n")]
+            (when (= 201 (js/parseInt (subs out (inc i)) 10))
+              (try
+                (let [j (js->clj (js/JSON.parse (subs out 0 i)) :keywordize-keys true)
+                      a (or (:authorization j) (when (:token j) (str "Biscuit " (:token j))))]
+                  (when (and (string? a) (not (re-find #"[\r\n]" a))) a))
+                (catch :default _ nil)))))))))
+
+(defn put-block!
+  "PUT bytes at `<base-url><path-prefix><cid>` (default prefix /ipfs/) then GET them
+  back and re-derive the CID. Authorization is `:authorization` (a string) or
+  `:authorization-fn` (0-arg, called per attempt: the form CACAOs need). It travels
+  on curl's stdin config, never in argv (ps). Returns {:ok true} | {:error kw};
+  never throws. This code mints no credentials."
+  [{:keys [base-url authorization authorization-fn path-prefix max-time-s]
+    :or {max-time-s 60 path-prefix "/ipfs/"}} cid bs]
+  (let [auth (if authorization-fn (authorization-fn) authorization)]
+    (cond
+      (not (valid-cid? cid)) {:error :put/bad-cid}
+      (not (re-find #"^https?://" (str base-url))) {:error :put/bad-base-url}
+      (or (not (re-matches #"/[A-Za-z0-9._/-]*/" (str path-prefix)))
+          (re-find #"\.\." (str path-prefix))) {:error :put/bad-path-prefix}
+      (empty? (str auth)) {:error :put/no-authorization}
+      :else
+      (let [url (str (.replace base-url #"/+$" "") path-prefix cid)
+            tmp (str (.tmpdir (js/require "os")) "/murakumo-put-" (.toString (.randomBytes crypto 6) "hex"))
+            tmp2 (str tmp ".rb")
+            curl (fn [args opts] (run "curl" (into ["-sS" "-g" "--noproxy" "*" "--max-time" (str max-time-s)
+                                                    "--proto" "=http,https" "--max-redirs" "0"] args) opts))]
+        (try
+          (.writeFileSync fs tmp (js/Buffer.from bs) #js {:mode 0600})
+          (let [cfg (str (curl-config-line "header" (str "Authorization: " auth))
+                         (curl-config-line "header" "Content-Type: application/vnd.ipld.raw"))
+                put (curl ["-X" "PUT" "--data-binary" (str "@" tmp) "-o" "/dev/null" "-w" "%{http_code}"
+                           "--config" "-" url]
+                          {:input cfg})]
+            (if-not (zero? (:status put))
+              {:error (keyword "curl" (str "exit-" (:status put)))}
+              (let [code (js/parseInt (.toString (:stdout put)) 10)]
+                (if-not (<= 200 code 299)
+                  {:error (keyword "put" (str "http-" code))}
+                  (let [rb (readback! url base-url tmp2 max-time-s)]
+                    (cond
+                      (:error rb) rb
+                      (not= cid (w/raw-cid (:bytes rb))) {:error :put/verify-mismatch}
+                      :else {:ok true}))))))
+          (catch :default _ {:error :put/local-failure})
+          (finally (doseq [f [tmp tmp2]] (when (.existsSync fs f) (.unlinkSync fs f)))))))))
+
+(defn tee-store
+  "Local dir store first (durable, authoritative for the job), then a remote put.
+  A failed remote put never fails the job: the CID is appended to `pending-file`
+  for `sync-pending!` to retry. `remote` is nil when no put is configured."
+  [dir pending-file remote]
+  (let [{:keys [put! get-bytes!]} (dir-store dir)]
+    {:get-bytes! get-bytes!
+     :put! (fn [cid bs]
+             (put! cid bs)
+             (when remote
+               (when-not (:ok (put-block! remote cid bs))
+                 (.appendFileSync fs pending-file (str cid "\n"))))
+             true)}))
+
+(defn- read-pending [pending-file]
+  (if (.existsSync fs pending-file)
+    (vec (distinct (remove empty? (.split (.readFileSync fs pending-file "utf8") "\n"))))
+    []))
+
+(defn sync-pending!
+  "Retry queued CIDs. Returns {:synced n :remaining n :errors {kw n}}. The queue is
+  re-read after the (slow) puts and only the synced CIDs are removed, so a CID a
+  concurrent job appended meanwhile is kept."
+  [dir pending-file remote]
+  (let [{:keys [get-bytes!]} (dir-store dir)
+        cids (read-pending pending-file)
+        results (mapv (fn [cid]
+                        (if-let [bs (get-bytes! cid)]
+                          [cid (put-block! remote cid bs)]
+                          [cid {:error :local/missing}]))
+                      cids)
+        done (set (map first (remove #(:error (second %)) results)))
+        failed (filter #(:error (second %)) results)
+        keep (remove done (read-pending pending-file))]
+    (.writeFileSync fs pending-file (apply str (map #(str % "\n") keep)))
+    {:synced (count done) :remaining (count keep)
+     :errors (frequencies (map #(:error (second %)) failed))}))
+
+;; --- real backends with fixed public endpoints ---------------------------------
+
+(defn- get-json!
+  "GET `url` with query params (curl -G, url-encoded), decoded JSON or {:error kw}."
+  [url params max-time-s]
+  (let [r (run "curl" (into ["-sS" "-g" "--noproxy" "*" "-G" "--max-time" (str max-time-s)
+                             "--max-filesize" "2097152" "--proto" "=https" "--max-redirs" "0"
+                             "-A" "murakumo-web/0 (+https://murakumo.cloud)" "-w" "\n%{http_code}"]
+                            (into (vec (mapcat (fn [[k v]] ["--data-urlencode" (str k "=" v)]) params))
+                                  [url]))
+               {})]
+    (if-not (zero? (:status r))
+      {:error (keyword "curl" (str "exit-" (:status r)))}
+      (let [out (.toString (:stdout r))
+            i (.lastIndexOf out "\n")
+            code (js/parseInt (subs out (inc i)) 10)]
+        (if (not= 200 code)
+          {:error (keyword "backend" (str "http-" code))}
+          (try {:doc (js->clj (js/JSON.parse (subs out 0 i)) :keywordize-keys true)}
+               (catch :default _ {:error :backend/bad-json})))))))
+
+(defn wikipedia
+  "MediaWiki search on `<lang>.wikipedia.org` (a real, keyless search index)."
+  [{:keys [name lang] :or {lang "en"}}]
+  {:name name
+   :search! (fn [{:keys [query k]}]
+              (if-not (re-matches #"[a-z]{2,3}" (str lang))
+                {:error :backend/bad-lang}
+                (let [r (get-json! (str "https://" lang ".wikipedia.org/w/api.php")
+                                   {"action" "query" "list" "search" "srsearch" query
+                                    "srlimit" (str (min k 50)) "format" "json" "utf8" "1"} 15)]
+                  (if (:error r) r {:results (backends/wikipedia-results (:doc r) lang)}))))})
+
+(defn hn-algolia
+  "Hacker News full-text search via Algolia (keyless)."
+  [{:keys [name]}]
+  {:name name
+   :search! (fn [{:keys [query k]}]
+              (let [r (get-json! "https://hn.algolia.com/api/v1/search"
+                                 {"query" query "hitsPerPage" (str (min k 50)) "tags" "story"} 15)]
+                (if (:error r) r {:results (backends/hn-results (:doc r))})))})
+
+(defn modal-searxng
+  "A private SearXNG on Modal (deploy/modal/searxng.py), called through Modal's
+  authenticated API by the operator's coordinator — nodes have no Modal credentials,
+  so this backend is for coordinator-side runs. No public URL exists."
+  [{:keys [name app fn-name] :or {app "murakumo-searxng" fn-name "search"}}]
+  {:name name
+   :search!
+   (fn [{:keys [query k]}]
+     (let [sh (run "sh" ["-c" "head -1 \"$(command -v modal)\""] {:encoding "utf8"})
+           line (some-> (:stdout sh) .toString .trim)
+           py (or (.. js/process -env -MURAKUMO_MODAL_PYTHON) (when (and line (.startsWith line "#!")) (subs line 2)))
+           script (.join path (or (.. js/process -env -MURAKUMO_REPO) ".") "scripts" "modal_call.py")]
+       (if-not py
+         {:error :backend/no-modal-python}
+         (let [r (run py [script app fn-name]
+                      {:input (js/JSON.stringify #js {:q query :k k}) :timeout 180000 :encoding "utf8"})]
+           (if-not (zero? (:status r))
+             {:error :backend/modal-failed}
+             (try
+               (let [doc (js->clj (js/JSON.parse (last (remove empty? (.split (.toString (:stdout r)) "\n"))))
+                                  :keywordize-keys true)]
+                 (if (:error doc)
+                   {:error (keyword "backend" (str (:error doc)))}
+                   {:results (mapv (fn [x] {:url (:url x) :title (:title x) :snippet (:content x)}) (:results doc))}))
+               (catch :default _ {:error :backend/bad-json})))))))})
+
+(defn backend-from-config
+  "backends.edn entry -> backend. :kind :searxng (default, needs :base-url), :wikipedia, :hn."
+  [{:keys [kind] :as cfg}]
+  (case (or kind :searxng)
+    :searxng (searxng cfg)
+    :wikipedia (wikipedia cfg)
+    :hn (hn-algolia cfg)
+    :modal-searxng (modal-searxng cfg)
+    {:name (:name cfg) :search! (fn [_] {:error :backend/unknown-kind})}))

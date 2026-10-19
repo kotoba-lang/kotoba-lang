@@ -1,0 +1,306 @@
+(ns kotoba.vm.fvm.mapping
+  "FVM↔EVM status mapping and address shapes for the fevm-mapping slice
+  (FIP-0054 / FIP-0055, shapes only — no real network, no real gas).
+
+  Exit codes (FIP-0054 §\"New general exit codes\", cross-checked against
+  builtin-actors `actors/evm/src/lib.rs`, the executable truth):
+
+    33 EVM_CONTRACT_REVERTED             contract REVERTed
+    34 EVM_CONTRACT_INVALID_INSTRUCTION  the INVALID opcode (0xfe) executed
+    35 EVM_CONTRACT_UNDEFINED_INSTRUCTION any opcode absent from dispatch
+    36 EVM_CONTRACT_STACK_UNDERFLOW
+    37 EVM_CONTRACT_STACK_OVERFLOW
+    38 EVM_CONTRACT_ILLEGAL_MEMORY_ACCESS
+    39 EVM_CONTRACT_BAD_JUMPDEST         JUMP/JUMPI to a non-JUMPDEST offset
+    40 EVM_CONTRACT_SELFDESTRUCT_FAILED  (no counterpart in this VM yet)
+
+  Note: FIP-0054's `CALLCODE` section says \"exit code 36\" while the
+  implementation puts undefined instructions at 35 (36 is STACK_UNDERFLOW).
+  The implementation wins: CALLCODE is just another undefined instruction.
+
+  Mapping rides kotoba.vm.evm.core's terminal statuses:
+
+    :stopped/:halted → 0  (success; FVM exit 0)
+    :reverted        → 33
+    :invalid         → by :invalid-reason, defaulting to 34
+
+  f410 addresses (FIP-0055): an Ethereum address IS the f4 subaddress
+  under EAM namespace 10. Text form: \"f410f\" ++ base32-lower (RFC-4648
+  alphabet, no padding) of protocol-byte 0x04 ++ uvarint(10) ++ the 20
+  address bytes ++ blake2b-512 checksum truncated to 4 bytes. BLAKE2b
+  rides blake2.core (a leaf dependency, both runtimes).
+
+  Masked ID addresses (FIP-0054 §Addressing): 0xff || 11×0x00 ||
+  uint64 big-endian packed into a 20-byte eth-shaped address.
+
+  InvokeContract (FIP-0054): method number 3844450837 =
+  FRC-0042(\"InvokeEVM\") — blake2b-512(\"1|InvokeEVM\"), first 4-byte
+  slice ≥ 2^24, big-endian. The Solidity-side selector of
+  handle_filecoin_method is 0x868e10c4 (keccak-256 of the signature,
+  via kotoba.vm.keccak)."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            [blake2.core :as blake2]
+            [kotoba.vm.keccak :as keccak]
+            [kotoba.vm.evm.u256 :as u256]))
+
+;; ---- FIP-0054 / builtin-actors exit codes ---------------------------------
+
+(def evm-contract-reverted 33)
+(def evm-contract-invalid-instruction 34)
+(def evm-contract-undefined-instruction 35)
+(def evm-contract-stack-underflow 36)
+(def evm-contract-stack-overflow 37)
+(def evm-contract-illegal-memory-access 38)
+(def evm-contract-bad-jumpdest 39)
+(def evm-contract-selfdestruct-failed 40)
+
+(def ^:private invalid-reason->code
+  {"INVALID opcode" evm-contract-invalid-instruction
+   "invalid instruction" evm-contract-invalid-instruction
+   "undefined instruction" evm-contract-undefined-instruction
+   "invalid opcode 0xf2" evm-contract-undefined-instruction
+   ;; generic "invalid opcode 0xNN" from the dispatcher: an opcode that
+   ;; parsed but has no handler → undefined instruction
+   "invalid opcode" evm-contract-undefined-instruction
+   "stack underflow" evm-contract-stack-underflow
+   "stack overflow" evm-contract-stack-overflow
+   "out of gas (memory expansion)" evm-contract-illegal-memory-access
+   "out of gas (keccak)" evm-contract-illegal-memory-access
+   "out of gas (sstore)" evm-contract-illegal-memory-access
+   "out of gas (log)" evm-contract-illegal-memory-access
+   "out of gas" evm-contract-illegal-memory-access
+   "invalid jump destination" evm-contract-bad-jumpdest})
+
+(defn status->exit-code
+  "FVM exit code for a terminal kotoba.vm.evm.core machine, or a bare
+  terminal status keyword. Success (:stopped / :halted) is 0, :reverted
+  is 33, :invalid is classified through :invalid-reason (defaulting to
+  34). Reasons like \"invalid opcode 0xNN\" / \"invalid opcode 0xf2\"
+  classify as 35 (undefined instruction): an opcode that has no
+  handler IS undefined, per FIP-0054's CALLCODE ruling. Any
+  non-terminal / unknown shape maps to 34: a non-successful invoke
+  with no better information fails as INVALID."
+  [m]
+  (let [status (if (keyword? m) m (:status m))
+        reason (:invalid-reason m)]
+    (cond
+      (#{:stopped :halted} status) 0
+      (= :reverted status) evm-contract-reverted
+      (= :invalid status)
+      (or (when reason
+            (or (get invalid-reason->code reason)
+                (when (re-find #"^invalid opcode 0x" reason)
+                  evm-contract-undefined-instruction)))
+          evm-contract-invalid-instruction)
+      :else evm-contract-invalid-instruction)))
+
+(def exit-code-names
+  "Exit code → FIP-0054 name (diagnostics / tooling surface)."
+  {33 "EVM_CONTRACT_REVERTED"
+   34 "EVM_CONTRACT_INVALID_INSTRUCTION"
+   35 "EVM_CONTRACT_UNDEFINED_INSTRUCTION"
+   36 "EVM_CONTRACT_STACK_UNDERFLOW"
+   37 "EVM_CONTRACT_STACK_OVERFLOW"
+   38 "EVM_CONTRACT_ILLEGAL_MEMORY_ACCESS"
+   39 "EVM_CONTRACT_BAD_JUMPDEST"
+   40 "EVM_CONTRACT_SELFDESTRUCT_FAILED"})
+
+;; ---- byte / hex helpers -----------------------------------------------------
+
+(defn- hex-byte
+  [b]
+  (let [b (bit-and (int b) 0xff)]
+    ))
+
+(defn- normalize-eth-hex
+  "20-byte eth address as lowercase hex, from 0x-hex / bare hex / bytes.
+  Throws on any other shape."
+  [addr]
+  (let [hx (str/lower
+            (cond
+              (string? addr) (if (str/starts-with? addr "0x") (subs addr 2) addr)
+              (sequential? addr) (apply str (map hex-byte addr))
+              :else (throw (ex-info "eth address must be hex string or bytes"
+                                    {:addr addr}))))]
+    (when (or (empty? hx) (odd? (count hx))
+              (not (re-find #"^[0-9a-f]+$" hx)))
+      (throw (ex-info "invalid eth address hex" {:addr addr})))
+    hx))
+
+(defn eth-address-bytes
+  "20-byte vector for an eth address given as hex string or bytes."
+  [addr]
+  (mapv 
+        (re-seq #".." (normalize-eth-hex addr))))
+
+(defn eth-address-word
+  "The 20-byte eth address as a u256 word (the EVM-side shape of an
+  f410 address; ADDRESS/BALANCE operands use this)."
+  [addr]
+  (let [hx (normalize-eth-hex addr)]
+    (u256/from-hex-string
+     (str (apply str (repeat (- 64 (count hx)) "0")) hx))))
+
+;; ---- f410 address shape (FIP-0055) -----------------------------------------
+
+(def eam-namespace
+  "f4 delegated namespace managed by the Ethereum Address Manager."
+  10)
+
+(def eth-address->f410-string
+  "Human form used by explorers: f410f ++ lowercase-hex subaddress."
+  (fn [addr] (str "f410f" (normalize-eth-hex addr))))
+
+(defn f410-string->eth-address
+  "Parse \"f410f<hex>\" back to the 20 address bytes."
+  [s]
+  (when-not (and (string? s) (str/starts-with? s "f410f"))
+    (throw (ex-info "not an f410 address string" {:s s})))
+  (eth-address-bytes (subs s 5)))
+
+(defn- uvarint
+  "LEB128 bytes of a non-negative integer (Filecoin unsigned varint)."
+  [n]
+  (when (or (not (integer? n)) (neg? n))
+    (throw (ex-info "uvarint needs a non-negative integer" {:n n})))
+  (loop [n n acc []]
+    (if (< n 0x80)
+      (conj acc n)
+      (recur (bit-shift-right n 7)
+             (conj acc (bit-or 0x80 (bit-and 0x7f n)))))))
+
+(def ^:private base32-alphabet "abcdefghijklmnopqrstuvwxyz234567")
+
+(defn- base32-lower
+  "RFC-4648 base32, lowercase, no padding — the Filecoin address
+  encoding (ref-fvm `ADDRESS_ENCODER`). Byte-seq in, string out."
+  [bs]
+  (let [bits (vec (mapcat (fn [b]
+                            (for [i (range 7 -1 -1)]
+                              (bit-and 1 (bit-shift-right (int b) i))))
+                          bs))
+        n (count bits)
+        ;; final 5-bit group is zero-padded; no '=' padding characters
+        groups (for [g (range (quot (+ n 4) 5))]
+                 (reduce (fn [acc bit] (+ (* 2 acc) bit))
+                         0
+                         (take 5 (drop (* 5 g) (concat bits (repeat 0))))))]
+    (apply str (map #(nth base32-alphabet %) groups))))
+
+(defn f410-checksum
+  "4-byte address checksum (ref-fvm: blake2b-512 over
+  [protocol-byte ++ uvarint(namespace) ++ subaddress], truncated to 4)."
+  [subaddress]
+  (vec (take 4 (blake2/blake2b
+                (concat [0x04] (uvarint eam-namespace) (vec subaddress))
+                {:digest-size 64}))))
+
+(defn f410-address-string
+  "Full Filecoin text form of an f410 address:
+  f410f ++ base32-lower(0x04 ++ uvarint(10) ++ 20 bytes ++ 4-byte checksum)."
+  [addr]
+  (let [sub (eth-address-bytes addr)
+        payload (concat [0x04] (uvarint eam-namespace) sub)]
+    (str "f410f"
+         (base32-lower (concat payload (f410-checksum sub))))))
+
+;; ---- masked ID addresses (FIP-0054 §Addressing) -----------------------------
+
+(defn masked-id-word
+  "EVM word holding Filecoin actor `id` in the masked-ID form (FIP-0054
+  §Addressing): the LOW 20 bytes are 0xff || 11×0x00 || uint64
+  big-endian; the top 12 bytes are zero padding (an eth-shaped
+  160-bit address)."
+  [id]
+  (when (or (not (integer? id)) (neg? id) (> id 0xFFFFFFFFFFFFFFFF))
+    (throw (ex-info "actor id out of uint64 range" {:id id})))
+  (let [hx 
+        hx (str (apply str (repeat (- 16 (count hx)) "0")) hx)]
+    (u256/from-hex-string
+     (str "000000000000000000000000ff0000000000000000000000" hx))))
+
+(defn id-address-word
+  "FIP wording alias for masked-id-word."
+  [id] (masked-id-word id))
+
+(defn as-id-address
+  "u256 word → actor ID (number on :clj, BigInt on :cljs — it can hold
+  2^53+) when the word is a masked ID address (byte 12 == 0xff and
+  bytes 13..23 all zero — i.e. the low-20-byte eth form), else nil."
+  [w]
+  (let [hx (u256/to-hex-string w)]
+    (when (and (= "ff" (subs hx 24 26))
+               (= "0000000000000000000000" (subs hx 26 48)))
+      )))
+
+(defn is-id-address?
+  "True when the word is a masked Filecoin ID address."
+  [w]
+  (some? (as-id-address w)))
+
+;; ---- InvokeContract method plumbing (FIP-0054) ------------------------------
+
+(def invoke-contract-method-num
+  "FRC-0042 hash of \"InvokeEVM\": blake2b-512(\"1|InvokeEVM\"), take
+  the first 4-byte slice whose big-endian u32 is ≥ 2^24 (rejection
+  sampling). 3844450837 per FIP-0054 and builtin-actors."
+  3844450837)
+
+(defn- utf8-bytes
+  "ASCII signature string → byte vector (both runtimes)."
+  [s]
+  )
+
+(def native-method-selector
+  "keccak-256(\"handle_filecoin_method(uint64,uint64,bytes)\")[0..4]
+  = 0x868e10c4 — verified against FIP-0054 and builtin-actors at build
+  time of this slice, computed here via kotoba.vm.keccak."
+  (vec (take 4 (keccak/keccak256 (utf8-bytes
+                                  "handle_filecoin_method(uint64,uint64,bytes)")))))
+
+(defn- word-bytes
+  "Non-negative integer → 32 big-endian bytes (a Solidity ABI word)."
+  [v]
+  (let [hx 
+        hx (str (apply str (repeat (- 64 (count hx)) "0")) hx)]
+    (mapv  (re-seq #".." hx))))
+
+(defn native-method-input
+  "ABI input for `handle_filecoin_method(uint64,uint64,bytes)` (the
+  entrypoint behind HandleFilecoinMethod / method ≥ 1024):
+  4-byte selector ++ method ++ codec ++ params-offset word (0x60) ++
+  params-length word ++ params ++ zero padding to a word boundary."
+  [method codec params]
+  (let [params (vec params)
+        n (count params)]
+    (when-not (and (integer? method) (<= 0 method 0xFFFFFFFFFFFFFFFF)
+                   (integer? codec) (<= 0 codec 0xFFFFFFFFFFFFFFFF))
+      (throw (ex-info "method/codec must be uint64" {:method method :codec codec})))
+    (when (neg? n)
+      (throw (ex-info "params must be a byte seq" {:params params})))
+    (vec (concat native-method-selector
+                 (word-bytes method)
+                 (word-bytes codec)
+                 (word-bytes 96)          ;; offset of the params bytes
+                 (word-bytes n)
+                 params
+                 (repeat (mod (- 32 (mod n 32)) 32) 0)))))
+
+(defn native-method-output
+  "ABI-decode `handle_filecoin_method`'s return into
+  {:exit-code (u32) :codec (u64) :return-data (bytes)}. This is the
+  shape HandleFilecoinMethod feeds to `fvm::exit`."
+  [out]
+  (let [out (vec out)
+        word-at (fn [i] (subvec out (* 32 i) (+ 32 (* 32 i))))
+        word->int (fn [w]
+                    )
+        exit-code (word->int (word-at 0))
+        codec (word->int (word-at 1))
+        offset (word->int (word-at 2))
+        len (word->int (word-at (quot offset 32)))
+        data-start (+ offset 32)
+        data (subvec out data-start (min (count out) (+ data-start len)))]
+    {:exit-code exit-code
+     :codec codec
+     :return-data (vec data)}))

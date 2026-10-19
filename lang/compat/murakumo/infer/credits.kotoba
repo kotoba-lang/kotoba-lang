@@ -1,0 +1,933 @@
+;; murakumo.infer.credits — the inference economy as pure ledger math (cljc).
+;;
+;; What is scarce on this fleet is MEMORY×TIME: a node that holds 11 GB of a
+;; model resident for an hour cannot host anything else with that memory. So a
+;; run's credits flow to nodes ∝ (resident shard bytes × run duration) — the
+;; same quantity the planner partitions by, which makes the economy and the
+;; placement one system: the plan IS the cap table of the run.
+;;
+;; Design stance (ADR-2607022000):
+;; - settle/1 and balances/1 are PURE folds — they run identically in bb, the
+;;   JVM, the CF Worker (cloud-murakumo /infer/credits) and a kotoba WASM
+;;   component reading the same Datom log.
+;; - The ledger is kotoba-style: an append-only, per-actor-signed event feed
+;;   (cloud-murakumo /infer/runs, kqe-assert! datoms on the mesh). That is
+;;   tamper-EVIDENT, not a consensus blockchain — no global ordering war, one
+;;   graph per key-derived IPNS name, CACAO-signed writes (kotoba.cacao).
+;;   Cross-actor disputes settle by replaying both signed feeds.
+;; - Prices are per-model in the registry (:credit/per-token). The head (API
+;;   terminator) earns :credit/head-frac for conducting + its own layers; a
+;;   :credit/protocol-frac accrues to the fleet treasury (upgrade fund — the
+;;   "investment" loop: treasury buys RAM/Thunderbolt, which raises the
+;;   fleet's servable model class, which raises demand for credits).
+
+(ns murakumo.infer.credits
+  "Inference economy pure ledger math.
+
+  W6 product-shell + T6.4: defaults + memory-time weights + charge-allow? gate
+  require the shipped `:infer-credits` KIR on **every** platform. Host pure
+  mirrors are gone — cljs/nbb must preload shipped KIR (resources/ via nbb cwd,
+  register-kir!, or set-resource-loader!) before requiring this ns
+  (ADR-260731-w6-t64-infer-plan-credits-mirror-delete).
+  Float settle folds, transfer, balances remain host."
+  (:require [murakumo.kotoba.oracle :as oracle]
+            ;; capability provenance lives with the enrollment record it
+            ;; qualifies (join owns /infer/nodes); credits consumes it.
+            ;; One-way -- join does not know about credits.
+            [murakumo.infer.join :as join]))
+
+(def ^:private oid :infer-credits)
+
+(defn- o
+  "Call a pure export. Requires the shipped oracle on every platform (T6.4)."
+  [export args]
+  (oracle/require-ready! oid)
+  (oracle/call oid export args))
+
+(defn- o-record
+  "T5.2: structural host map → call-record (requires shipped oracle)."
+  [export host-map field-specs]
+  (oracle/require-ready! oid)
+  (oracle/call-record oid export host-map field-specs))
+
+(def ^:private mt-work-schema
+  "Guest :credits/mt-work — T5.2 native record for memory-time-weight."
+  [:record :credits/mt-work
+   [[:est-bytes :i64] [:duration-ms :i64] [:span :i64]]])
+
+(def ^:private charge-schema
+  "Guest :credits/charge — T5.2 native record for charge-allow? / balance-after-spend."
+  [:record :credits/charge
+   [[:balance :i64] [:cost :i64]]])
+
+(def default-per-token
+  ;; credits per generated token
+  (oracle/i64->host (o 'default-per-token [])))
+;; NOT ratio literals (1/10, 1/20): clojure.lang.Ratio is not a valid
+;; ClojureScript compile-time constant ("failed compiling constant: 1/10")
+;; -- this file's own docstring promises "runs identically in bb, the JVM,
+;; the CF Worker (cloud-murakumo /infer/credits) and a kotoba WASM
+;; component", so cljs portability is a real requirement here, not
+;; optional. (/ num den) from kotoba head-num/head-den and protocol-num/
+;; protocol-den (required oracle).
+(def default-head-frac
+  ;; conductor's cut
+  (/ (oracle/i64->host (o 'head-num []))
+     (oracle/i64->host (o 'head-den []))))
+(def default-protocol-frac
+  ;; fleet treasury (upgrade fund)
+  (/ (oracle/i64->host (o 'protocol-num []))
+     (oracle/i64->host (o 'protocol-den []))))
+
+(defn- memory-time
+  "node → shard-bytes × duration-ms, the contribution weight of one run.
+   Kotoba memory-time-weight (required; span < 1 → 0).
+   T5.2: structural map → call-record."
+  [assignments duration-ms]
+  (into {}
+        (for [{:keys [node est-bytes span]} assignments
+              :let [w (oracle/i64->host
+                       (o-record 'memory-time-weight
+                                 {:work (oracle/record
+                                         mt-work-schema
+                                         {:est-bytes (or est-bytes 0)
+                                          :duration-ms (or duration-ms 0)
+                                          :span (or span 0)})}
+                                 [[:work :raw]]))]
+              :when (pos? w)]
+          [(:name node) (double w)])))
+
+(def unit-prices
+  "Media-first pricing keys (Civitai-Buzz-style per-job units) alongside
+   per-token text. A model's registry entry carries whichever apply."
+  {:tokens :credit/per-token
+   ;; ADR-2608026500: text の課金単位は :mtokens（100万トークン）。:tokens は
+   ;; 整数で表現できず、kotoba oracle の i64 経由で最小値 1 がそのまま価格に
+   ;; なる事故（$10,000/Mtok = 実勢の 20,000 倍）を起こした。新規は :mtokens。
+   :mtokens-in :credit/per-mtoken-in
+   :mtokens-out :credit/per-mtoken-out
+   :ktext :credit/per-ktext
+   :assets :credit/per-asset
+   :images :credit/per-image
+   :video-seconds :credit/per-video-second
+   :audio-seconds :credit/per-audio-second
+   ;; ADR-2608036900: ベンダが分単位・切り上げで課金する経路（fal の
+   ;; elevenlabs-music は "rounded up to the closest minute"）を、秒割りに
+   ;; 潰さないための単位。秒で値付けすると 60 秒ちょうど以外は必ずずれ、
+   ;; 短いジョブほど原価割れする。**課金する側の次元に合わせる。**
+   :audio-minutes :credit/per-audio-minute
+   :training-steps :credit/per-training-step
+   :gb-months :credit/per-gb-month})
+
+(defn job-cost
+  "Σ units×price for a media/text job. `units` e.g. {:images 4} or
+   {:mtokens-out 1.2} or {:video-seconds 5}. Unknown unit keys are an error --
+   silence would mean free inference. That same guard applies to a KNOWN unit
+   whose price key is absent from this model's registry entry: EVERY unit,
+   :tokens included, must be configured explicitly or error.
+
+   :tokens used to be exempt, on the reasoning that per-token pricing is 'sane
+   to default'. That reasoning was wrong in a way that only measurement showed.
+   The default came from the kotoba oracle as `(defn default-per-token [] :i64 1)`
+   -- 1 credit/token, i.e. $10,000 per million tokens, roughly 20,000x market.
+   Nobody chose that number: 1 is simply the smallest positive i64, and it
+   became the price of every model onboarded before its pricing was backfilled.
+   A default nobody picked is not a default; it is an accident with a fallback's
+   syntax. Prices now come from `murakumo.infer.prices` (resources/murakumo/
+   prices.edn), and text bills in :mtokens-in/:mtokens-out -- a unit whose
+   natural magnitude cannot be produced by an integer floor.
+
+   `default-per-token` is retained for the kotoba-oracle parity suite, which
+   asserts cljc/guest agreement on the exported constant. It is no longer a
+   price."
+  [model units]
+  (reduce (fn [acc [u n]]
+            (let [price-key (or (unit-prices u)
+                                (throw (ex-info "unknown billing unit" {:unit u})))
+                  ;; `(get model price-key default)` eagerly evaluates
+                  ;; `default` even when price-key IS present -- so a bare
+                  ;; `(get model price-key (if ... (throw ...)))` would throw
+                  ;; unconditionally regardless of whether the key exists.
+                  ;; `contains?` short-circuits that.
+                  price     (if (contains? model price-key)
+                              (get model price-key)
+                              (throw (ex-info "model missing price for billing unit"
+                                              {:unit u :price-key price-key
+                                               :model (:model/id model)})))]
+              (+ acc (* (double price) (double n)))))
+          0.0 units))
+
+
+;; ---------------------------------------------------------------------------
+;; Capability policy (ADR-2607319500 D3)
+;;
+;; memory-time weights come from what a node ADVERTISES. Measured 2026-07-31,
+;; 44 of the 45 enrolled nodes advertised a byte-identical 32 GiB, which makes
+;; every weight equal and quietly turns "the plan IS the cap table of the run"
+;; into a flat split. :measured-only lets a caller settle against probed
+;; capability only.
+;;
+;; DEFAULT IS :permissive, i.e. exactly the historical behaviour. `settle` is
+;; a pure fold that stored feeds replay through, so changing its default would
+;; retroactively rewrite what past runs mean -- the same reason `balances` was
+;; left permissive and `ledger-violations` added beside it rather than folded
+;; in (see the transfer/non-negative-balance work).
+;; ---------------------------------------------------------------------------
+
+(def capability-policies
+  "#{:permissive :measured-only}. :permissive weights every assignment
+   (historical behaviour). :measured-only weights only assignments whose node
+   declares :capability/source :measured."
+  #{:permissive :measured-only})
+
+(defn capability-exclusions
+  "Which assignments :measured-only would drop, and why. Pure; returns DATA so
+   a caller can report the gap without changing what anyone gets paid.
+
+   → [{:node name :provenance :declared}]"
+  [assignments]
+  (->> assignments
+       (remove #(join/measured-capability? (:node %)))
+       (mapv (fn [{:keys [node]}]
+               {:node (:name node)
+                :provenance (join/capability-provenance node)}))))
+
+(defn settle
+  "One run → its credit distribution (pure).
+   run: {:model {…prices…} (:tokens n | :units {:images 1 …}) :duration-ms ms
+         :plan {:assignments [...]}}
+   opts: {:capability-policy :permissive|:measured-only} (default :permissive)
+   → {:run/total t :run/treasury x :run/head y :run/head-name n
+      :run/shares {node credits} :run/unallocated u}
+
+   `:run/unallocated` closes the accounting identity in every case:
+     total = treasury + head + Σshares + unallocated
+   It is 0.0 whenever anything was distributable. It is the whole pool when
+   NO assignment carries measured capability under :measured-only -- that pool
+   is :uncomputable, not zero and not the head's. Handing it to the head (what
+   the mt-sum=0 fallback does) would pay the one node whose share is least
+   justified by measurement, so :measured-only declines to allocate instead.
+   Shares are proportional to memory-time; the head's OWN layer share rides
+   the same rule, PLUS it earns head-frac off the top for terminating the API
+   — credited under :run/head-name, WHATEVER the :head? node's real :name is
+   (an mlx-moe plan's sole node keeps its own fleet name, e.g. \"asher\", not
+   the literal \"head\" the llama.cpp/mlx-ring head is conventionally aliased
+   to — balances/1 must credit the SAME name settle reports here, not assume
+   the literal string \"head\").
+   Total is Σ units×price (job-cost) — text (:tokens) and media (:units) alike."
+  ([run] (settle run nil))
+  ([{:keys [model tokens units duration-ms plan] :as _run}
+    {:keys [capability-policy] :or {capability-policy :permissive}}]
+   (let [head-frac (:credit/head-frac model default-head-frac)
+         proto-frac (:credit/protocol-frac model default-protocol-frac)
+         units (or units (when tokens {:tokens tokens}))
+         total (job-cost model units)
+         treasury (* total (double proto-frac))
+         head-cut (* total (double head-frac))
+         pool (- total treasury head-cut)
+         assignments (:assignments plan)
+         measured-only? (= :measured-only capability-policy)
+         weighted (if measured-only?
+                    (filter #(join/measured-capability? (:node %)) assignments)
+                    assignments)
+         mt (memory-time weighted (or duration-ms 1))
+         mt-sum (reduce + (vals mt))
+         head-name (or (some #(when (get-in % [:node :head?]) (get-in % [:node :name]))
+                             assignments)
+                       "head")
+         ;; mt-sum = 0 has two different meanings and they must not be merged.
+         ;; :permissive -> nobody carried weight (zero span/bytes); the head
+         ;; conducted the run, so it keeps the pool. Historical behaviour.
+         ;; :measured-only -> nobody's capability was ever measured, so the
+         ;; weights are UNKNOWN, not zero. Nothing here justifies giving the
+         ;; pool to the head, so it goes unallocated and says so.
+         distributable? (pos? mt-sum)]
+     (cond-> {:run/total total
+              :run/treasury treasury
+              :run/head head-cut
+              :run/head-name head-name
+              :run/shares (cond
+                            distributable?
+                            (into {} (map (fn [[n w]] [n (* pool (/ w mt-sum))]) mt))
+                            measured-only? {}
+                            :else {head-name pool})
+              :run/unallocated (if (or distributable? (not measured-only?)) 0.0 pool)}
+       measured-only?
+       (assoc :run/capability-policy :measured-only
+              :run/capability-excluded (capability-exclusions assignments))))))
+
+(defn spend
+  "A demand-side ledger entry: `who` redeems `credits` for inference. Same
+   append-only feed as settlements — balances/1 folds both, so the account
+   is one number. Pure; the caller appends it to the signed feed.
+
+   Credits are a NON-redeemable prepaid usage claim, not a deposit or a
+   claim on fiat/USDC (ADR-2607995000, the credits<->fiat membrane is
+   one-way: fiat/USDC mints credits, never the reverse). There is
+   deliberately no fiat-payout path anywhere in this codebase — do not add
+   one without revisiting that ADR first."
+  [who credits {:keys [for] :as _meta}]
+  {:run/spend {(name who) (double credits)}
+   :run/spend-for for})
+
+(defn refund
+  "`spend` の反転。失敗したジョブに払われた credits を口座へ戻す。
+
+  ── なぜ transfer ではなく専用の事象なのか ──
+
+  『treasury から payer へ transfer する』でも数字は合うが、意味が違う。返金は
+  **第三者からの支払いではなく、起きなかった消費の取り消し**で、原資も要らない
+  （fal は自社エラーを課金しないので、murakumo は最初から払っていない）。
+  transfer で表すと、原資を持つ口座が必要になり、その口座が枯れた日に
+  『返金できない』が起きる —— 会計の形が運用の可用性に化ける。
+
+  ── mint ではないことを、どう保証するか ──
+
+  この関数は純粋な構成子なので、額の正しさは検査できない。**返金額が元の
+  spend を超えないことと、同じジョブが二度返金されないことは
+  `refundable` が台帳を畳んで判定する。** ここで額を自由に取れる以上、
+  呼び出し側が `refundable` を通さずに使えば、これは credits の mint 経路に
+  なる —— `transfer` の docstring が『ledger-violations を通さない呼び出しは
+  窃盗経路』と書いているのと同じ構図。"
+  [who credits {:keys [for reason] :as _meta}]
+  (when-not (pos? credits)
+    (throw (ex-info "refund amount must be positive" {:who (name who) :credits credits})))
+  {:run/refund {(name who) (double credits)}
+   :run/refund-for for
+   :run/refund-reason reason})
+
+(defn refundable
+  "台帳 + ジョブ id → `{:ok? true :who a :credits n}` か `{:ok? false :error kw ...}`。
+
+  **返金が mint にならない唯一の場所。** 3 つを台帳から確かめる:
+
+  1. そのジョブの spend が実在するか（`:run/spend-for` の `:job`）
+  2. 既に返金されていないか（`:run/refund-for` の `:job`）—— 冪等性はここ。
+     呼び出し側（Worker）は再試行するし、状態ポーリングは何度でも来るので、
+     『2 回目は拒否』を台帳側に置かないと、ポーリングの回数だけ credits が湧く
+  3. 額は **台帳が持っている spend そのもの**。呼び出し側に額を渡させない ——
+     渡させた瞬間、過大返金が API の引数になる"
+  [feed job-id]
+  (let [job-id (str job-id)
+        spend-of (fn [r] (or (:run/spend r) (get r "run/spend")))
+        for-of (fn [r k] (let [m (or (get r k) (get r (subs (str k) 1)))]
+                           (str (or (:job m) (get m "job")))))
+        spends (filter #(and (spend-of %) (= job-id (for-of % :run/spend-for))) feed)
+        refunds (filter #(and (or (:run/refund %) (get % "run/refund"))
+                              (= job-id (for-of % :run/refund-for)))
+                        feed)]
+    (cond
+      (empty? spends)
+      {:ok? false :error :no-such-spend :job job-id}
+
+      (seq refunds)
+      {:ok? false :error :already-refunded :job job-id
+       :refunded (reduce + 0.0 (mapcat vals (map #(or (:run/refund %) (get % "run/refund")) refunds)))}
+
+      :else
+      (let [entries (mapcat seq (map spend-of spends))
+            who (name (ffirst entries))
+            total (reduce + 0.0 (map second entries))]
+        (if (pos? total)
+          {:ok? true :who who :credits total}
+          {:ok? false :error :nothing-to-refund :job job-id})))))
+
+(defn refund?
+  "この台帳事象は返金か。"
+  [event]
+  (boolean (:run/refund event)))
+
+(defn balance-of [balances who]
+  (get balances (name who) 0.0))
+
+;; ── credits transfer between holders (ADR-2607995000 amend, adr-ledger seq 73)
+;;
+;; Until 2026-07-25 the only thing anyone could do with credits was burn them on
+;; this fleet's inference, which made the ACCEPTANCE DENSITY of the unit exactly
+;; 1 -- the operator's own fleet was the sole acceptor. A non-redeemable unit's
+;; value is bounded by the number of distinct things it buys, so that 1 was the
+;; binding constraint on the whole credits sphere, and ADR-2607995000's own
+;; Consequences section already conceded it ("witness 報酬が credits 建てである
+;; 限り外部第三者の参加誘因は弱い").
+;;
+;; The membrane table in that ADR is EXHAUSTIVE ("ここに無い流れは禁止"), and
+;; holder-to-holder transfer was not in it. adr-ledger seq 73 adds exactly one
+;; row -- credits -> third-party seller, credits-denominated -- and changes
+;; nothing else. Specifically still forbidden, and NOT touched here:
+;; credits->fiat/USDC (both directions of redemption), credits<->EN, EN<->USDC.
+;;
+;; Transferability is not redeemability. A transferred credit still cannot leave
+;; the economy, so §1's structural non-speculation proof (neither internal unit
+;; is redeemable, therefore neither can be an investment) survives intact.
+;;
+;; Two invariants the amend requires, both enforced here:
+;;   1. CONSERVATION -- a transfer moves value, it never creates or destroys it.
+;;      Issuance stays labor-only (settled runs and settled witness duty).
+;;   2. NON-NEGATIVE BALANCES -- credits are a PREPAID usage claim, not a credit
+;;      line. This is exactly where credits must NOT behave like EN: EN is
+;;      net-zero mutual credit with a declared negative credit-limit, and if
+;;      credits acquired an overdraft they would quietly become a second mutual
+;;      credit system, collapsing the credits<->EN separation §1 draws.
+
+(defn transfer
+  "A holder-to-holder ledger entry: `from` pays `credits` to `to`, both inside
+   the credits sphere. Pure; the caller appends it to the signed feed, exactly
+   like `spend` and `settle`.
+
+   Conserving by construction -- one map, one amount, applied as a debit and a
+   credit by `balances`. There is deliberately no fee: the 10% protocol cut is
+   taken at MINT (fiat/USDC -> credits) and taking a second one here would give
+   the economy two fee numbers for one economy.
+
+   This does NOT check the sender's balance, because a pure event constructor
+   has no ledger to check against -- `ledger-violations` does that over the
+   folded feed. Callers admitting a transfer must run it; see its docstring for
+   why silence here would be a real theft path rather than a rounding issue."
+  [from to credits {:keys [for] :as _meta}]
+  (when-not (pos? credits)
+    (throw (ex-info "transfer amount must be positive"
+                    {:from (name from) :to (name to) :credits credits})))
+  (when (= (name from) (name to))
+    (throw (ex-info "self-transfer is not a transfer" {:who (name from)})))
+  {:run/transfer {:from (name from) :to (name to) :credits (double credits)}
+   :run/transfer-for for})
+
+(defn transfer?
+  "Is this ledger event a holder-to-holder transfer?"
+  [event]
+  (boolean (:run/transfer event)))
+
+
+;; ── credits hold / capture / release (ADR-2608291009 実装順 2)
+;;
+;; ここまでの需要側は `spend` 1 つで、失敗したら `refund` で戻す形だった。
+;; ADR-2608026100 がその形を名指しで否定している —— 60〜900 秒かかって失敗し
+;; うる非同期ジョブに対して「submit 時に引き落として、失敗したら返す」は
+;; authorize→capture より確実に悪い。理由は 3 つあり、どれも運用で刺さる:
+;;
+;;   1. 取り消しが「返金イベントが書かれること」に依存する。返金を書く経路が
+;;      落ちれば、使われなかった credits は口座に戻らない。hold なら
+;;      **capture が来ないこと自体が「消費されなかった」を意味する**
+;;   2. 実消費が見積より小さいときの差額が、返金という別種の事象になる。
+;;      capture なら同じ 1 事象の中で閉じる
+;;   3. 返金は `refundable` を通さないと mint 経路になる（その docstring が
+;;      自分でそう書いている）。hold は debit が先に立つので、過大な capture は
+;;      **構成子の時点で拒否でき**、台帳の上で起こせない
+;;
+;; ── `balances` の戻り値の形は変えない ──
+;;
+;; hold は **`spend` と同じ向きに debit する**。折り畳んだ数は今までどおり
+;; 「いま使える credits」を意味し、`ledger-violations` の overdraft 検査が
+;; hold にもそのまま効く。別に :held 面を足して戻り値の形を変えることはしない
+;; —— `ledger-violations` の docstring が「既に書かれた feed を遡って
+;; 読み替えることになる」として禁じているのと同じ理由。
+;;
+;; ── capture が 1 事象で完結する理由 ──
+;;
+;; `:run/capture` は held と captured の両方を 1 つの map に持つ。
+;; `:run/transfer` が from/to/credits を 1 map に持つのと同じ理由で、
+;; **途中で切れた feed に対しても fold が価値を失わず、発明もしない**。
+;; 差額 (held - captured) はその場で口座に戻る。
+
+(defn- event-job
+  "イベントの `<verb>-for` から job id を文字列で取り出す。feed は EDN でも
+   JSON 由来でも来るので、keyword キーと文字列キーの両方を見る
+   （`refundable` が既にやっている読み方をそのまま共有する）。"
+  [event k]
+  (let [m (or (get event k) (get event (subs (str k) 1)))]
+    (str (or (:job m) (get m "job")))))
+
+(defn- event-body
+  "`:run/hold` 等の内側 map を、keyword / 文字列どちらのキーでも読む。"
+  [event k]
+  (let [m (or (get event k) (get event (subs (str k) 1)))]
+    (when m
+      {:who (str (or (:who m) (get m "who")))
+       :credits (some-> (or (:credits m) (get m "credits")) double)
+       :held (some-> (or (:held m) (get m "held")) double)
+       :captured (some-> (or (:captured m) (get m "captured")) double)})))
+
+(defn hold
+  "非同期ジョブの見積額を **予約する**（authorize）。`spend` と同じ向きに口座を
+   引き落とすので、hold 中の credits は他のジョブから使えない。
+
+   これは消費ではない。消費が確定するのは `capture` で、その時に実消費との
+   差額が口座へ戻る。ジョブが失敗したら `release` で全額戻す。
+
+   純粋な構成子。呼び出し側が署名付き feed に追記する。残高は見ない ——
+   `transfer` と同じく、足りるかどうかは `ledger-violations` が畳んだ feed に
+   対して判定する。admission 経路はそれを必ず通すこと。"
+  [who credits {:keys [for] :as _meta}]
+  (when-not (pos? credits)
+    (throw (ex-info "hold amount must be positive"
+                    {:who (name who) :credits credits})))
+  {:run/hold {:who (name who) :credits (double credits)}
+   :run/hold-for for})
+
+(defn hold?
+  "この台帳事象は hold か。"
+  [event]
+  (boolean (:run/hold event)))
+
+(defn- holds-for [feed job-id k]
+  (filter #(and (or (get % k) (get % (subs (str k) 1)))
+                (= job-id (event-job % (keyword (str (subs (str k) 1) "-for")))))
+          feed))
+
+(defn outstanding-hold
+  "台帳 + ジョブ id → `{:ok? true :who w :held h}` か `{:ok? false :error kw}`。
+
+  **hold が二度消費されない唯一の場所。** `refundable` と同じ 3 つを確かめる:
+
+  1. そのジョブの hold が実在するか（`:run/hold-for` の `:job`）
+  2. 既に capture / release されていないか —— 冪等性はここ。呼び出し側は
+     再試行するし、ジョブの状態ポーリングは何度でも来るので、『2 回目は拒否』を
+     台帳側に置かないと、ポーリングの回数だけ credits が湧く
+  3. 額は **台帳が持っている hold そのもの**。呼び出し側に held を渡させない"
+  [feed job-id]
+  (let [job-id (str job-id)
+        holds (holds-for feed job-id :run/hold)
+        captures (holds-for feed job-id :run/capture)
+        releases (holds-for feed job-id :run/release)]
+    (cond
+      (empty? holds) {:ok? false :error :no-such-hold :job job-id}
+      (seq captures) {:ok? false :error :already-captured :job job-id}
+      (seq releases) {:ok? false :error :already-released :job job-id}
+      :else
+      (let [bodies (keep #(event-body % :run/hold) holds)
+            who (:who (first bodies))
+            total (reduce + 0.0 (keep :credits bodies))]
+        (if (pos? total)
+          {:ok? true :who who :held total :job job-id}
+          {:ok? false :error :nothing-to-capture :job job-id})))))
+
+(defn capture
+  "hold を実消費に確定させる。`held` は `outstanding-hold` が台帳から返した額、
+   `captured` は実際に使った額。差額 (held - captured) はこの 1 事象の中で
+   口座に戻る。
+
+   **`captured > held` はここで拒否する。** `refund` は額の正しさを検査できない
+   （台帳を持たない純関数だから）が、capture は held を同じ引数で受け取っている
+   ので、過大 capture は構成子の時点で構造的に不可能にできる。"
+  [who {:keys [for held captured] :as _meta}]
+  (let [held (double held) captured (double captured)]
+    (when-not (pos? held)
+      (throw (ex-info "capture requires a positive held amount"
+                      {:who (name who) :held held})))
+    (when (neg? captured)
+      (throw (ex-info "captured amount cannot be negative"
+                      {:who (name who) :captured captured})))
+    (when (> captured held)
+      (throw (ex-info "captured amount exceeds the hold"
+                      {:who (name who) :held held :captured captured})))
+    {:run/capture {:who (name who) :held held :captured captured}
+     :run/capture-for for}))
+
+(defn capture?
+  "この台帳事象は capture か。"
+  [event]
+  (boolean (:run/capture event)))
+
+(defn funded-capture
+  "One atomic ledger event: consume a buyer's held credits and distribute the
+  same amount to a provider and protocol treasury. The caller must verify the
+  buyer's acceptance and the outstanding hold against the latest ledger feed
+  before appending this event."
+  [buyer provider {:keys [job-id funding-id held treasury]}]
+  (let [held (double held)
+        treasury (double treasury)
+        provider-share (- held treasury)]
+    (when-not (and (string? job-id) (seq job-id)
+                   (string? funding-id) (seq funding-id)
+                   (not= (name buyer) (name provider))
+                   (pos? held) (<= 0.0 treasury held))
+      (throw (ex-info "invalid funded capture" {:job-id job-id
+                                                   :funding-id funding-id
+                                                   :held held :treasury treasury})))
+    {:model "native-relay-funded"
+     :run/capture {:who (name buyer) :held held :captured held}
+     :run/capture-for {:job funding-id}
+     :run/shares {(name provider) provider-share}
+     :run/treasury treasury
+     :run/total held
+     :run/funding-id funding-id
+     :run/job-id job-id
+     :run/proof :buyer-accepted}))
+
+(defn release
+  "hold を取り消して全額を口座へ戻す。ジョブが失敗した / 実行されなかった場合。
+
+   `refund` との違いは原資ではなく時点である。release は **まだ消費されて
+   いない予約**を解くだけなので、返す原資を持つ口座を必要としない。"
+  [who {:keys [for held reason] :as _meta}]
+  (let [held (double held)]
+    (when-not (pos? held)
+      (throw (ex-info "release requires a positive held amount"
+                      {:who (name who) :held held})))
+    {:run/release {:who (name who) :held held}
+     :run/release-for for
+     :run/release-reason reason}))
+
+(defn release?
+  "この台帳事象は release か。"
+  [event]
+  (boolean (:run/release event)))
+
+(defn accepting-sellers
+  "The distinct accounts that have ever RECEIVED a credits transfer, i.e. the
+   sellers who actually accept credits as payment.
+
+   This is the acceptance-density measurement, answerable from the ledger
+   instead of by assertion. It was 1 by construction before transfers existed
+   (only the fleet could be paid), and the system-dynamics pass named that 1 as
+   the binding constraint on the credits sphere -- so it is worth being able to
+   count without a second system."
+  [runs]
+  (into #{} (comp (filter transfer?) (map (comp :to :run/transfer))) runs))
+
+(defn- availability-proof-ok?
+  "Every verdict in `verdicts` carries :kotobase.availability/verdict :ok --
+   the exact keyword kotobase-peer's audit-outcome standardizes on. A nil or
+   empty seq is NOT proof (an :sla job asserting nothing was checked must
+   fail closed, same stance job-cost takes on silently-missing prices)."
+  [verdicts]
+  (and (seq verdicts)
+       (every? #(= :ok (:kotobase.availability/verdict %)) verdicts)))
+
+(defn charge
+  "Demand-side admission: can `who` afford this job of `model` at its registry
+   prices, given folded `balances`? → {:allow? bool :cost c :entry spend-entry}
+   on success; on refusal either {:allow? false :cost c :balance b} (can't
+   afford it) or {:allow? false :cost c :reason :availability-proof-failed}
+   (SLA proof gate below). Text passes {:tokens n}; media passes {:images n} /
+   {:video-seconds s} / {:audio-seconds s} — Civitai's Buzz shape, one ledger.
+   Storage passes {:gb-months g}.
+
+   `:tier` is one of :volatile/:standard/:sla, mirroring kotobase-peer's
+   redundancy-tiers as plain data (this ns does not import kotobase-peer).
+   It's optional; when absent, or :volatile/:standard, behavior is IDENTICAL
+   to before this key existed -- no availability check at all, admission is
+   a pure balance check. Only :sla additionally gates the charge on proof:
+   the job must carry `:availability-verdicts`, a seq of
+   {:kotobase.availability/node n :kotobase.availability/cid c
+    :kotobase.availability/epoch e :kotobase.availability/verdict v}, and
+   EVERY entry's :kotobase.availability/verdict must be :ok. A missing,
+   empty, or partially-failed verdict seq is a hard gate -- charge denies
+   with :reason :availability-proof-failed even when the balance would
+   otherwise cover the job (the balance is never consulted in that case);
+   an unprovable SLA-tier job is refused before affordability is asked."
+  [balances who {:keys [model tokens units tier availability-verdicts]}]
+  (let [units (or units (when tokens {:tokens tokens}))
+        cost (job-cost model units)
+        bal (balance-of balances who)
+        ;; integer gate for whole balances/costs when possible; float compare otherwise
+        allow? (if (and (== (double (long bal)) (double bal))
+                        (== (double (long cost)) (double cost)))
+                 (oracle/bool->host
+                  (o-record 'charge-allow?
+                            {:charge (oracle/record
+                                      charge-schema
+                                      {:balance (long bal)
+                                       :cost (long cost)})}
+                            [[:charge :raw]]))
+                 (>= bal cost))]
+    (cond
+      (and (= tier :sla) (not (availability-proof-ok? availability-verdicts)))
+      {:allow? false :cost cost :reason :availability-proof-failed}
+
+      allow?
+      {:allow? true :cost cost
+       :entry (spend who cost {:for {:model (:model/id model) :units units}})}
+
+      :else
+      {:allow? false :cost cost :balance bal})))
+
+(defn receipt
+  "A verifiable inference receipt — the blockchain-facing artifact. Pure data:
+   the settled run + the shard-verification reports (kotodama.inference.shard
+   rank reports: owned bytes, contract tensors byte-checked) + the previous
+   receipt's hash, SIGNED by the acting node's kotoba key. No consensus here:
+   tamper-evidence comes from the hash chain + the actor signature, disputes
+   replay the feed.
+
+   :sign-fn and :signer are REQUIRED (ADR-2607995000 §7: receipts carry an
+   actor signature in addition to the hash chain — an unsigned receipt is not
+   a receipt). :signer (the actor's did) sits INSIDE the hashed body, so the
+   hash chain covers who claims the run; :receipt/sig is sign-fn over the
+   pr-str of the hashed body, so the signature covers hash + chain position
+   too. Fail-closed, same stance as ledger.witness/witness-run's :quorum-fn:
+   a missing signer never silently degrades to the old unsigned v1 shape."
+  [{:keys [settled shard-reports prev-hash hash-fn sign-fn signer]}]
+  (when-not (and sign-fn signer)
+    (throw (ex-info "receipt: :sign-fn and :signer are required — receipts must be actor-signed in addition to hash-chained (ADR-2607995000 §7)"
+                    {:signer signer :sign-fn? (some? sign-fn)})))
+  (let [body {:receipt/v 2
+              :receipt/run (select-keys settled [:run/total :run/shares
+                                                 :run/head :run/treasury])
+              :receipt/shards (mapv #(select-keys % [:shard/rank :shard/owned-bytes
+                                                     :shard/owned-tensors :shard/host
+                                                     :shard/ok])
+                                    shard-reports)
+              :receipt/signer (name signer)
+              :receipt/prev (or prev-hash "genesis")}
+        hashed (assoc body :receipt/hash
+                      (if hash-fn (hash-fn (pr-str body)) :receipt.hash/host-injected))]
+    (assoc hashed :receipt/sig (sign-fn (pr-str hashed)))))
+
+(defn balances-step
+  "Apply ONE ledger event to a balances map. Extracted from `balances` so that
+   `ledger-violations` replays with byte-identical semantics rather than a
+   second implementation that could drift from it."
+  [acc run]
+  (cond
+    ;; holder-to-holder transfer: debit and credit in the same step, so the fold
+    ;; cannot lose or invent value even on a truncated feed
+    (:run/transfer run)
+    (let [{:keys [from to credits]} (:run/transfer run)]
+      (-> acc
+          (update from (fnil - 0.0) credits)
+          (update to (fnil + 0.0) credits)))
+
+    (:run/spend run)
+    (reduce (fn [a [n c]] (update a (name n) (fnil - 0.0) c)) acc (:run/spend run))
+
+    ;; 返金は spend の符号違い。同じ形にしてあるのは、fold が 2 つの別々の
+    ;; 解釈を持たないようにするため（`ledger-violations` はこの step を
+    ;; そのまま再生する）。
+    (:run/refund run)
+    (reduce (fn [a [n c]] (update a (name n) (fnil + 0.0) c)) acc (:run/refund run))
+
+    ;; hold は spend と同じ向きの debit。予約された credits は「使える残高」から
+    ;; 外れるので、`ledger-violations` の overdraft 検査がそのまま効く。
+    (:run/hold run)
+    (let [{:keys [who credits]} (event-body run :run/hold)]
+      (update acc who (fnil - 0.0) credits))
+
+    ;; capture は差額だけを戻す。held と captured が同じ 1 事象に入っているので、
+    ;; 切り詰められた feed でも fold が価値を失わず、発明もしない
+    ;; （`:run/transfer` が借方と貸方を 1 事象に収めているのと同じ理由）。
+    (and (:run/capture run) (:run/funding-id run) (:run/shares run))
+    (let [{:keys [who held captured]} (event-body run :run/capture)
+          shares (:run/shares run)
+          treasury (double (or (:run/treasury run) 0.0))]
+      (when-not (and (== held captured)
+                     (< (
+                         (- captured (+ treasury (reduce + 0.0 (vals shares))))) 1.0e-8))
+        (throw (ex-info "funded capture is not conserved" {:run run})))
+      (cond-> (reduce (fn [a [provider amount]]
+                        (update a (name provider) (fnil + 0.0) amount))
+                      (update acc who (fnil + 0.0) (- held captured))
+                      shares)
+        (pos? treasury) (update :treasury (fnil + 0.0) treasury)))
+
+    (:run/capture run)
+    (let [{:keys [who held captured]} (event-body run :run/capture)]
+      (update acc who (fnil + 0.0) (- held captured)))
+
+    (:run/release run)
+    (let [{:keys [who held]} (event-body run :run/release)]
+      (update acc who (fnil + 0.0) held))
+
+    ;; Delivery is proof of a reported result, not an accepted charge.
+    ;; An expired-job marker can likewise accompany a release without minting.
+    (or (:run/funded-result run) (:run/funded-dispute run)
+        (:run/expired-job-id run)) acc
+
+    :else
+    ;; A PRE-SETTLED run carries whatever the writer put in it, and a feed
+    ;; written before head/treasury were split out (or by any producer that
+    ;; only records shares) has neither. `settle` always emits all three, so
+    ;; this only bites on the `(:run/shares run)` branch -- which is exactly
+    ;; the branch a stored feed takes. Unguarded it NPEs on `(+ 0.0 nil)` and
+    ;; takes the whole balances endpoint down with it.
+    ;;
+    ;; `cond->` and NOT `(or ... 0)`: defaulting to 0 would ADD a "head" 0.0
+    ;; row to every balances map that has no head, changing the shape of
+    ;; /infer/credits for every existing feed. local-murakumo's copy of this
+    ;; fold used cond-> for exactly that reason and its routes-test pins it.
+    ;; The divergence between the two copies is how the NPE stayed invisible;
+    ;; converging on the copy that was already right is the fix.
+    (let [s (if (:run/shares run) run (settle run))]
+      (cond-> (reduce (fn [a [n c]] (update a n (fnil + 0.0) c)) acc (:run/shares s))
+        (:run/head s) (update (:run/head-name s "head") (fnil + 0.0) (:run/head s))
+        (:run/treasury s) (update :treasury (fnil + 0.0) (:run/treasury s))))))
+
+(defn balances
+  "Fold a run ledger (seq of settled runs or raw runs) → account balances.
+   Accepts either pre-settled maps (with :run/shares) or raw runs (settled
+   here), so the CF Worker can fold whatever the feed contains.
+
+   Permissive by design: it reports what the feed says, including a negative
+   balance. `ledger-violations` is the fn that judges — see its docstring for
+   why the check is beside this fold rather than inside it."
+  [runs]
+  (reduce balances-step {} runs))
+
+
+;; ── 公開 feed（/infer/runs）を読む —— この ns の fold は自分の API を読めなかった
+;;
+;; 実測 2026-08-31、`api.murakumo.cloud/infer/runs` の 764 事象に対して:
+;;
+;;   (balances feed)            → 口座 2 つ
+;;   GET /infer/credits         → 口座 48 つ
+;;   食い違う口座               → 48 中 44
+;;
+;; 原因は綴りである。台帳の内部表現は `:run/spend` / `:run/transfer` / `:run/shares`
+;; だが、**公開 feed は `"spend"` / `"transfer"` / `"topup"` / `"grant"` / `"shares"`
+;; という接頭辞の無い文字列キー**で出る。`balances-step` の cond は全部外れ、
+;; 事象は `:else` に落ちて **settle 済み run として読み替えられる**。
+;;
+;; **これは 0 を返す検査ではない。もっともらしい数を返す検査である。**
+;; `cloud-murakumo.credits-admission/acceptance-density` の docstring が
+;; 「0 paid / 0 registered today」と書いているのは、まさにこの読めなさの結果で、
+;; 実際の台帳には transfer が 1 件在る（宛先残高 1 をサーバ自身が返す）。
+;;
+;; ── なぜ `balances` を直さず、変換を足すのか ──
+;;
+;; `ledger-violations` の docstring が「`balances` の戻り値を変えると、既に
+;; 書かれた feed を遡って読み替えることになる」として禁じている。だから
+;; `balances` の意味は 1 バイトも変えず、**wire 形を正準形に写す関数**を足す。
+;; 呼び出し側は `(balances (map from-wire feed))` と書ける。
+;;
+;; ── 読めなかったものを黙って捨てない ──
+;;
+;; `from-wire` は **total** で、知らない形には `::unreadable` を返す。
+;; `balances-of-wire` はその件数と形を数えて一緒に返す —— 読めた 0 件と
+;; 読めなかった 764 件が同じ `{}` にならないようにするための床である。
+
+(def unreadable
+  "`from-wire` が形を認識できなかったことを表す番兵。**nil でも {} でもない** ——
+   どちらも『空の台帳』と区別が付かないから。"
+  ::unreadable)
+
+(def no-op
+  "**知っているが残高を動かさない**形を表す番兵。`unreadable` と分ける理由は、
+   『8 件読めなかった』と『8 件は残高に効かない種類だった』が呼び出し側にとって
+   別の意味だから —— 前者は読み手の穴、後者は台帳の性質である。
+
+   現在ここに入るのは `pending-topup` だけ。**根拠は推測ではなく突き合わせ**:
+   これを除いて畳んだ 756 事象が、サーバ自身の `/infer/credits` 48 口座と
+   1e-6 以内で全一致した（実測 2026-08-31）。"
+  ::no-op)
+
+(defn- wire-amounts
+  "文字列キーの `{account credits}` を double 化して返す。"
+  [m]
+  (into {} (map (fn [[k v]] [(name k) (double v)])) m))
+
+(defn from-wire
+  "`/infer/runs` が公開する JSON 形の 1 事象を、この ns の正準 EDN 形へ写す。
+   認識できない形には `unreadable` を返す（例外は投げない —— 1 件の未知の形で
+   feed 全体を落とさないため。件数は `balances-of-wire` が数える）。
+
+   写像は実測した wire 語彙に対して閉じている（2026-08-31、764 事象）:
+   `transfer` / `spend` / `refund` / `hold` / `capture` / `release` /
+   `topup` / `grant` / `shares`。
+
+   **`topup` と `grant` を `:run/shares` に写す理由**: どちらも受け手の残高を
+   増やす一方向の発行で、fold の向きが settle 済み run の shares と同じである。
+   別の分岐を `balances-step` に足すと、その分だけ `balances` の意味が変わる。"
+  [e]
+  (let [g #(get e %)]
+    (cond
+      (map? (g "transfer"))
+      (let [t (g "transfer")]
+        {:run/transfer {:from (name (get t "from"))
+                        :to (name (get t "to"))
+                        :credits (double (get t "credits"))}
+         :run/transfer-for (g "transfer-for")})
+
+      (map? (g "spend"))
+      {:run/spend (wire-amounts (g "spend")) :run/spend-for (g "spend-for")}
+
+      (map? (g "refund"))
+      {:run/refund (wire-amounts (g "refund")) :run/refund-for (g "refund-for")}
+
+      (map? (g "hold"))
+      {:run/hold {:who (name (get (g "hold") "who"))
+                  :credits (double (get (g "hold") "credits"))}
+       :run/hold-for (g "hold-for")}
+
+      (map? (g "capture"))
+      {:run/capture {:who (name (get (g "capture") "who"))
+                     :held (double (get (g "capture") "held"))
+                     :captured (double (get (g "capture") "captured"))}
+       :run/capture-for (g "capture-for")}
+
+      (map? (g "release"))
+      {:run/release {:who (name (get (g "release") "who"))
+                     :held (double (get (g "release") "held"))}
+       :run/release-for (g "release-for")}
+
+      (map? (g "topup"))
+      (cond-> {:run/shares (wire-amounts (g "topup"))}
+        (number? (g "treasury")) (assoc :run/treasury (double (g "treasury"))))
+
+      (map? (g "grant"))
+      (cond-> {:run/shares (wire-amounts (g "grant"))}
+        (number? (g "treasury")) (assoc :run/treasury (double (g "treasury"))))
+
+      (map? (g "shares"))
+      (cond-> {:run/shares (wire-amounts (g "shares"))}
+        (number? (g "treasury")) (assoc :run/treasury (double (g "treasury"))))
+
+      (map? (g "pending-topup")) no-op
+
+      :else unreadable)))
+
+(defn balances-of-wire
+  "公開 feed をそのまま畳む。**読めた件数と読めなかった件数を必ず一緒に返す。**
+
+   返すのは
+   `{:balances {..} :read n :skipped k :unreadable m :unreadable-keys #{..}}`。
+
+   `:unreadable` が 0 でない結果の `:balances` を残高として引用しないこと ——
+   それは『台帳がそう言っている』ではなく『この読み手にはそこまでしか見えな
+   かった』である。この関数が数を隣に置くのは、その区別を呼び出し側から
+   奪わないためだけにある。"
+  [wire-feed]
+  (let [mapped (map (fn [e] [e (from-wire e)]) wire-feed)
+        ok (keep (fn [[_ v]] (when-not (or (= unreadable v) (= no-op v)) v)) mapped)
+        skipped (filter (fn [[_ v]] (= no-op v)) mapped)
+        bad (keep (fn [[e v]] (when (= unreadable v) e)) mapped)]
+    {:balances (balances ok)
+     :read (count ok)
+     :skipped (count skipped)
+     :unreadable (count bad)
+     :unreadable-keys (into (sorted-set) (mapcat keys) bad)}))
+
+(defn ledger-violations
+  "Replay `runs` in order and report every point where an account went NEGATIVE,
+   as data -- never throwing, the same discipline `engi.core/fold-balance` holds
+   for the EN side.
+
+   Why this is a separate fn rather than a check inside `balances`: `balances`
+   is the historical fold that existing feeds and the CF Worker already run, and
+   changing what it returns would retroactively reinterpret feeds already
+   written. So the invariant is added alongside it, not inside it.
+
+   Why it matters more than it did yesterday, stated plainly: `spend` has never
+   checked that the spender could afford the spend. While the only payee was the
+   operator's own fleet, an overdraft cost the operator and nobody else. Once a
+   THIRD-PARTY seller can be paid in credits (adr-ledger seq 73), an unchecked
+   overdraft is a path to taking real goods and services from a stranger with
+   credits that were never earned. Any admission path for a transfer must run
+   this and refuse on a non-empty result.
+
+   Returns [{:index i :account a :balance b :event e}], empty when clean.
+   `:treasury` is exempt: it is an accrual bucket that only ever receives."
+  [runs]
+  (:violations
+   (reduce
+    (fn [{:keys [bal violations] :as acc} [i run]]
+      (let [next-bal (balances-step bal run)
+            newly-negative (for [[a b] next-bal
+                                 :when (and (not= a :treasury)
+                                            (neg? b)
+                                            (not (neg? (get bal a 0.0))))]
+                             {:index i :account a :balance b :event run})]
+        (assoc acc
+               :bal next-bal
+               :violations (into violations newly-negative))))
+    {:bal {} :violations []}
+    (map-indexed vector runs))))

@@ -1,0 +1,246 @@
+(ns murakumo.infer.jobs
+  "Durable single-decree job ownership. Fixed voter membership; no ambiguous replay.
+  A resident owns execution. Gateways and Itonami only submit or observe jobs."
+  (:require [clojure.string :as str]
+            [murakumo.infer.replicated-topology :as topo]
+            ["node:fs" :as fs] ["node:path" :as path] ["node:crypto" :as crypto]))
+
+(defn valid-id? [id] (boolean (and (string? id) (re-matches #"[A-Za-z0-9_-]{8,128}" id))))
+(defn majority [n] (inc (quot n 2)))
+(defn newer? [a b] (pos? (compare a (or b [0 ""]))))
+(defn vote
+  "Pure Paxos acceptor transition. Persist the returned state BEFORE responding."
+  [state {:keys [op ballot value]}]
+  (cond
+    (not (and (vector? ballot) (= 2 (count ballot))
+              (js/Number.isSafeInteger (first ballot)) (pos? (first ballot))
+              (string? (second ballot)) (<= 1 (count (second ballot)) 128)))
+    {:ok false :state state}
+    (= op "prepare")
+    (if (or (= ballot (:promised state)) (newer? ballot (:promised state)))
+      {:ok true :state (assoc state :promised ballot)} {:ok false :state state})
+    (= op "accept")
+    (if (and value (or (= ballot (:promised state)) (newer? ballot (:promised state)))
+             ;; A ballot cannot be reused for a different value, even after restart.
+             (or (not= ballot (:accepted-ballot state)) (= value (:accepted state))))
+      {:ok true :state (assoc state :promised ballot :accepted-ballot ballot :accepted value)}
+      {:ok false :state state})
+    :else {:ok false :state state}))
+
+(defn adopted [responses fallback]
+  (or (:accepted (last (sort-by :accepted-ballot (filter :accepted responses)))) fallback))
+
+(defn bounded-json! [response limit]
+  (let [reader (.getReader (.-body response)) size (atom 0) parts (atom [])]
+    (letfn [(pump [] (-> (.read reader)
+                        (.then (fn [chunk]
+                                 (if (.-done chunk)
+                                   (js->clj (js/JSON.parse (.toString (.concat js/Buffer (clj->js @parts)))) :keywordize-keys true)
+                                   (if (> (swap! size + (.-byteLength (.-value chunk))) limit)
+                                     (do (.cancel reader) (throw (js/Error. "job response exceeds bound")))
+                                     (do (swap! parts conj (.from js/Buffer (.-value chunk))) (pump))))))))]
+      (pump))))
+
+(defn request! [url token method body timeout]
+  (-> (js/fetch url #js {:method method :redirect "error"
+                        :signal (.timeout js/AbortSignal timeout)
+                        :headers #js {"authorization" (str "Bearer " token) "content-type" "application/json"}
+                        :body (when body (topo/encoded body))})
+      (.then (fn [r] (if (.-ok r) (bounded-json! r 16777216)
+                        (throw (js/Error. (str "job endpoint returned " (.-status r)))))))))
+
+(defn start! [config token topology]
+  (when-let [cfg (:jobs config)]
+    (let [voters (:voters cfg) voter-ids (set (map :node voters))
+          membership (topo/digest voters) node (:node config)
+          dir (:directory cfg) owner-file (str dir "/owner")
+          _ (when-not (and (<= 3 (count voters) 9) (odd? (count voters))
+                           (= (count voters) (count voter-ids)) (string? dir) (.isAbsolute path dir)
+                           (= voters (get-in (topo/payload topology) [:policies :job-voters]))
+                           topology (every? #(and (topo/endpoint? (:url %) (:allow-loopback? cfg false))
+                                                 (some (fn [n] (= % (select-keys n [:node :url])))
+                                                       (:nodes (topo/payload topology)))) voters))
+              (throw (js/Error. "jobs require operator-signed fixed voters and a private absolute directory")))
+          retained? (.existsSync fs owner-file)
+          _ (.mkdirSync fs dir #js {:recursive true :mode 448})
+          owner (topo/owner-id! owner-file)
+          index-file (str dir "/index.json")
+          _ (when (and retained? (not (.existsSync fs index-file)))
+              (throw (js/Error. "job index missing; restore durable state before serving")))
+          index (atom (if retained? (js->clj (js/JSON.parse (.readFileSync fs index-file "utf8")) :keywordize-keys true)
+                         {:membership membership :owner owner :ids []}))
+          _ (when-not (and (= membership (:membership @index)) (= owner (:owner @index))
+                           (vector? (:ids @index))
+                           (or (not retained?) (= (:index-digest @index) (topo/digest (dissoc @index :index-digest)))))
+              (throw (js/Error. "job voter membership changed; explicit migration required")))
+          _ (when-not retained?
+              (swap! index assoc :index-digest (topo/digest @index)) (topo/persist! index-file @index))
+          records (atom {}) active (atom #{}) stopped? (atom false) repair-cursor (atom 0)
+          job-file #(str dir "/" % ".json")
+          stored-bytes (atom (reduce + 0 (for [id (:ids @index) :when (.existsSync fs (job-file id))]
+                                           (.-size (.statSync fs (job-file id))))))
+          save! (fn [id state]
+                  (when-not (valid-id? id) (throw (js/Error. "invalid job id")))
+                  (when-not (some #{id} (:ids @index))
+                    (when (>= (count (:ids @index)) (:max-jobs cfg 10000))
+                      (throw (js/Error. "job ledger full")))
+                    ;; Index first: a crash before the record fails closed on restart.
+                    (swap! index update :ids conj id)
+                    (swap! index assoc :index-digest (topo/digest (dissoc @index :index-digest)))
+                    (topo/persist! index-file @index))
+                  (let [state (assoc state :record-digest (topo/digest (dissoc state :record-digest)))]
+                    (let [size (.byteLength js/Buffer (topo/encoded state))
+                          previous (if (.existsSync fs (job-file id)) (.-size (.statSync fs (job-file id))) 0)
+                          next-size (+ @stored-bytes (- size previous))]
+                      (when (> next-size (:max-storage-bytes cfg 268435456))
+                        (throw (js/Error. "job storage budget exhausted; restore capacity without discarding history")))
+                      (topo/persist! (job-file id) state) (reset! stored-bytes next-size)
+                      (swap! records assoc id state) state)))
+          _ (doseq [id (:ids @index)]
+              (when-not (and (valid-id? id) (.existsSync fs (job-file id)))
+                (throw (js/Error. "job record missing; refusing replay")))
+              (let [s (js->clj (js/JSON.parse (.readFileSync fs (job-file id) "utf8")) :keywordize-keys true)]
+                (when-not (and (map? s) (= membership (:membership s))
+                               (= (:record-digest s) (topo/digest (dissoc s :record-digest))))
+                  (throw (js/Error. "invalid job ledger")))
+                (save! id (if (= "running" (get-in s [:execution :status]))
+                            (assoc-in s [:execution :status] "unknown") s))))
+          call-voters! (fn [id op body]
+                         (-> (js/Promise.allSettled
+                              (clj->js (map #(request! (str (:url %) "/jobs/" id "/" op) token "POST"
+                                                       (assoc body :membership membership) 5000) voters)))
+                             (.then (fn [rs] (vec (for [r (array-seq rs) :when (= "fulfilled" (.-status r))] (.-value r)))))))
+          read! (fn [id]
+                  (-> (call-voters! id "read" {})
+                      (.then (fn [rs]
+                               (when (< (count rs) (majority (count voters)))
+                                 (throw (js/Error. "job quorum unavailable")))
+                               (let [votes (for [r rs :when (:accepted r)] [(:accepted-ballot r) (:accepted r)])
+                                     counts (frequencies votes)
+                                     chosen (first (for [[pair n] counts :when (>= n (majority (count voters)))] (second pair)))
+                                     receipts (frequencies (keep :receipt rs))
+                                     receipt (first (for [[receipt n] receipts :when (>= n (majority (count voters)))] receipt))]
+                                 {:id id :assignment chosen :receipt receipt
+                                  :status (if receipt (:status receipt) (if chosen "assigned" "unassigned"))
+                                  :quorum (count rs) :membership membership})))) )
+          publish! (fn [id receipt]
+                     (-> (call-voters! id "receipt" {:receipt receipt})
+                         (.then (fn [rs]
+                                  (when (= (count voters) (count (filter :ok rs)))
+                                    (save! id (assoc (get @records id) :replica-complete true)))
+                                  (>= (count (filter :ok rs)) (majority (count voters)))))))
+          execute! (fn [id assignment]
+                     (when-not (or @stopped? (contains? @active id) (:execution (get @records id)))
+                       (let [s (get @records id {:membership membership})
+                             running {:status "running" :owner node :digest (:digest assignment)}]
+                         (save! id (assoc s :assignment assignment :execution running))
+                         (swap! active conj id)
+                         (let [backend (str "http://" (:bind config "127.0.0.1") ":" (:port config 8796) "/execute/" (:lane assignment))
+                               timeout (:timeout-ms cfg 600000)]
+                           (-> (js/fetch backend #js {:method "POST" :redirect "error" :signal (.timeout js/AbortSignal timeout)
+                                                     :headers #js {"authorization" (str "Bearer " token)
+                                                                   "content-type" "application/json" "x-murakumo-job-id" id}
+                                                     :body (topo/encoded (:request assignment))})
+                               (.then (fn [r]
+                                        (-> (bounded-json! r 8388608)
+                                            (.then (fn [result]
+                                                     (let [receipt (assoc running :status (if (.-ok r) "completed" "failed")
+                                                                          :http-status (.-status r) :result result)]
+                                                       (save! id (assoc (get @records id) :execution receipt))
+                                                       (-> (publish! id receipt) (.catch (fn [_] nil)))))))))
+                               (.catch (fn [_]
+                                         (let [receipt (assoc running :status "unknown")]
+                                           (save! id (assoc (get @records id) :execution receipt))
+                                           (publish! id receipt))))
+                               (.finally #(swap! active disj id)))))))
+          choose! (fn [id input]
+                    (-> (js/Promise.allSettled
+                         (clj->js (for [p (topo/nodes topology)]
+                                   (-> (request! (str (:url p) "/health") token "GET" nil 5000)
+                                       (.then #(assoc % :url (:url p)))))))
+                        (.then (fn [rs]
+                                 (let [candidates (for [r (array-seq rs) :when (= "fulfilled" (.-status r))
+                                                        :let [h (.-value r)]
+                                                        :when (and (topo/conformant-report? topology (:node h) h)
+                                                                   (= membership (get-in h [:jobs :membership])))
+                                                        [lane l] (:lanes h)
+                                                        :when (and (:ready l) (not (:busy l)) (= (:kind input) (:kind l))
+                                                                   (= (get-in input [:request :model]) (:model l)))]
+                                                    {:owner (:node h) :url (:url h) :lane (name lane)})
+                                       selected (first (sort-by #(topo/digest [id (:owner %) (:lane %)]) candidates))]
+                                   (when-not selected (throw (js/Error. "no measured ready capacity")))
+                                   (assoc selected :digest (topo/digest input) :kind (:kind input) :request (:request input)))))))
+          reserve! (fn [id fallback]
+                     (let [ballot [(js/Date.now) (.randomUUID crypto)]]
+                       (-> (call-voters! id "vote" {:op "prepare" :ballot ballot})
+                           (.then (fn [prepared]
+                                    (let [ok (filter :ok prepared)]
+                                      (when (< (count ok) (majority (count voters)))
+                                        (throw (js/Error. "job prepare quorum unavailable")))
+                                      (adopted ok fallback))))
+                           (.then (fn [value]
+                                    (when-not (= (:digest fallback) (:digest value))
+                                      (throw (js/Error. "job input conflicts with reservation")))
+                                    (-> (call-voters! id "vote" {:op "accept" :ballot ballot :value value})
+                                        (.then (fn [accepted]
+                                                 (when (< (count (filter :ok accepted)) (majority (count voters)))
+                                                   (throw (js/Error. "job accept quorum unavailable")))
+                                                 {:id id :assignment value :membership membership}))))))))
+          submit! (fn [id input]
+                    (when-not (and (valid-id? id) (contains? #{"text" "image"} (:kind input))
+                                   (map? (:request input)) (string? (get-in input [:request :model]))
+                                   (not (get-in input [:request :stream]))
+                                   (<= (.byteLength js/Buffer (topo/encoded input)) 2097152))
+                      (throw (js/Error. "invalid job envelope; async jobs require non-streaming requests")))
+                    (let [digest (topo/digest input)]
+                      (-> (read! id)
+                          (.then (fn [known]
+                                   (if (:assignment known)
+                                     (do (when-not (= digest (get-in known [:assignment :digest]))
+                                           (throw (js/Error. "job id has different input"))) known)
+                                     (-> (choose! id input) (.then #(reserve! id %))))))
+                          (.then (fn [job]
+                                   (if (:receipt job) job
+                                     (-> (request! (str (get-in job [:assignment :url]) "/jobs/" id "/run") token "POST"
+                                                   {:membership membership :digest digest} 15000)
+                                         (.then (fn [_] (read! id))))))))))
+          repair! (fn []
+                    (let [pending (vec (sort-by first (filter (fn [[id s]] (and (:execution s) (not (:replica-complete s))
+                                                                                               (not (contains? @active id)))) @records)))]
+                    (when-let [[id s] (when (seq pending) (nth pending (mod (swap! repair-cursor inc) (count pending))))]
+                      (swap! active conj id)
+                      (-> (reserve! id (:assignment s))
+                          (.then (fn [_] (publish! id (:execution s)))) (.catch (fn [_] nil))
+                          (.finally #(swap! active disj id))))))
+          timer (js/setInterval repair! (:repair-ms cfg 10000))]
+      {:membership membership :read! read! :submit! submit! :active active
+       :close #(do (reset! stopped? true) (js/clearInterval timer))
+       :handle! (fn [id op body]
+                  (when-not (and (valid-id? id) (= membership (:membership body)))
+                    (throw (js/Error. "job membership or id mismatch")))
+                  (let [s (get @records id {:membership membership})]
+                    (case op
+                      "read" (select-keys s [:accepted :accepted-ballot :receipt])
+                      "vote" (do (when-not (contains? voter-ids node) (throw (js/Error. "not a job voter")))
+                                 (when-let [v (:value body)]
+                                   (when-not (some #(and (= (:owner v) (:node %)) (= (:url v) (:url %))) (topo/nodes topology))
+                                     (throw (js/Error. "job owner outside signed topology"))))
+                                 (let [v (vote s body)]
+                                   (when (:ok v) (save! id (:state v)))
+                                   (assoc (select-keys (:state v) [:accepted :accepted-ballot]) :ok (:ok v))))
+                      "receipt" (let [receipt (:receipt body)]
+                                  (when-not (and (contains? voter-ids node) (:accepted s)
+                                                 (= (:owner receipt) (get-in s [:accepted :owner]))
+                                                 (= (:digest receipt) (get-in s [:accepted :digest]))
+                                                 (contains? #{"completed" "failed" "unknown"} (:status receipt))
+                                                 (or (nil? (:receipt s)) (= (:receipt s) receipt)))
+                                    (throw (js/Error. "receipt conflicts with accepted execution")))
+                                  (save! id (assoc s :receipt receipt)) {:ok true})
+                      "run" (-> (read! id)
+                                (.then (fn [job]
+                                         (when-not (and (= node (get-in job [:assignment :owner]))
+                                                        (= (:digest body) (get-in job [:assignment :digest])))
+                                           (throw (js/Error. "job has no quorum-owned local assignment")))
+                                         (execute! id (:assignment job))
+                                         {:id id :status (get-in @records [id :execution :status] "pending")})))
+                      (throw (js/Error. "unknown job operation")))))})))

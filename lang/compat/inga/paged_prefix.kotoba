@@ -1,0 +1,132 @@
+(ns inga.paged-prefix
+  "Incremental verification of a complete finalized history from trusted
+  genesis through a fixed certified checkpoint. The caller fetches and bounds
+  each EDN response before decoding; this pure verifier retains only the last
+  block and two-block finality window. No server claim is trusted by itself."
+  (:require [inga.attest :as att]
+            [inga.consensus :as c]
+            [inga.prefix :as prefix]
+            [inga.sync :as sync]))
+
+(def max-page-blocks 128)
+
+(defn- safe-height? [n]
+  (and (integer? n) (<= 0 n 9007199254740991)))
+
+(defn- reject [reason]
+  {:status :rejected :reason reason})
+
+(defn begin
+  "Start from a caller-owned trust context. `:max-blocks` is required by the
+  existing context contract but is NOT a total-history limit here. State is
+  process-local and must never be restored from an untrusted peer."
+  [context]
+  (if (prefix/context-valid? context)
+    {:status :collecting :context context :next-height 0 :anchor nil
+     :pending [] :finalized-height -1 :pages 0}
+    (reject :invalid-context)))
+
+(defn- fold-block [state block]
+  (let [pending (conj (:pending state) block)]
+    (if (= 3 (count pending))
+      (let [hash-fn (get-in state [:context :hash-fn])
+            committed (c/three-chain-commits hash-fn pending)]
+        (if (= 1 (count committed))
+          (assoc state :pending (vec (rest pending))
+                 :finalized-height (:inga.block/height (first committed)))
+          (reject :not-finalized)))
+      (assoc state :pending pending))))
+
+(defn- append-blocks [state blocks]
+  (reduce (fn [s block]
+            (if (= :rejected (:status s)) s (fold-block s block)))
+          state blocks))
+
+(defn append-page
+  "Verify one bounded `/local-finalized-range` EDN value. The next call must
+  begin exactly at `:next-height`; the full history is never accumulated.
+  A rejected state remains rejected."
+  [state page]
+  (try
+    (if (not= :collecting (:status state))
+      (reject :invalid-state)
+      (let [{:keys [genesis chain-id hash-fn quorum witnesses verify-fn]} (:context state)
+            bs (:blocks page) from (:next-height state)]
+        (cond
+          (not (and (map? page)
+                    (= #{:chain-id :from :to :blocks} (set (keys page)))
+                    (= chain-id (:chain-id page))
+                    (vector? bs) (<= 1 (count bs) max-page-blocks)
+                    (safe-height? (:from page)) (safe-height? (:to page))
+                    (= from (:from page))
+                    (<= (+ from (count bs)) 9007199254740991)
+                    (= (+ from (dec (count bs))) (:to page))))
+          (reject :invalid-page)
+
+          (and (zero? from) (not= genesis (first bs)))
+          (reject :wrong-genesis)
+
+          :else
+          (let [anchor (or (:anchor state) genesis)
+                to-check (if (zero? from) (subvec bs 1) bs)
+                reason (when (seq to-check)
+                         (sync/validate-segment hash-fn quorum anchor to-check
+                                                {:max-batch max-page-blocks
+                                                 :witnesses witnesses}
+                                                chain-id verify-fn (set witnesses)))]
+            (if reason
+              (reject reason)
+              (let [verified (append-blocks state bs)]
+                (if (= :rejected (:status verified))
+                  verified
+                  (-> verified
+                      (assoc :anchor (peek bs) :next-height (+ from (count bs)))
+                      (update :pages inc)))))))))
+    (catch  _
+      (reject :malformed-page))))
+
+(defn finish
+  "Check that every archived height through the checkpoint was supplied,
+  verify its two descendants and signed tip QC, and apply three-chain
+  finality. Only this result can be treated as an authenticated prefix."
+  [state checkpoint]
+  (try
+    (if (not= :collecting (:status state))
+      (reject :invalid-state)
+      (let [{:keys [chain-id hash-fn quorum witnesses verify-fn]} (:context state)
+            h (dec (:next-height state))
+            bs (:blocks checkpoint)
+            qc (:tip-qc checkpoint)]
+        (cond
+          (not (and (map? checkpoint)
+                    (= #{:chain-id :committed-height :blocks :tip-qc}
+                       (set (keys checkpoint)))
+                    (= chain-id (:chain-id checkpoint))
+                    (safe-height? h)
+                    (= h (:committed-height checkpoint))
+                    (vector? bs) (= 3 (count bs))
+                    (= (:anchor state) (first bs))))
+          (reject :checkpoint-anchor-mismatch)
+
+          :else
+          (let [reason (sync/validate-segment
+                        hash-fn quorum (first bs) (subvec bs 1)
+                        {:max-batch 2 :witnesses witnesses}
+                        chain-id verify-fn (set witnesses))
+                tip (peek bs)]
+            (cond
+              reason (reject reason)
+              (or (not= (hash-fn tip) (:inga.qc/block-hash qc))
+                  (not= (:inga.block/height tip) (:inga.qc/height qc))
+                  (att/verify-certificate qc chain-id quorum verify-fn (set witnesses)))
+              (reject :invalid-tip-certificate)
+
+              :else
+              (let [verified (append-blocks state (subvec bs 1))]
+                (if (and (= :collecting (:status verified))
+                         (= h (:finalized-height verified)))
+                  {:status :finalized :height h :tip-hash (hash-fn tip)
+                   :pages (:pages state)}
+                  (reject :not-finalized))))))))
+    (catch  _
+      (reject :malformed-checkpoint))))

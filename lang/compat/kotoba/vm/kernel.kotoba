@@ -1,0 +1,358 @@
+(ns kotoba.vm.kernel
+  "Invocation-local handles, a message-local block overlay, and the IPLD
+  syscalls a guest is allowed to issue.
+
+  This is the FVM Kernel analogue (FIP-0030's syscall surface) without
+  Filecoin's HAMT, EVM opcodes, or Unix-shaped calls. A guest that wants
+  to touch state goes through these functions. There is no ambient
+  Clojure, no `get-fn` on the object the guest sees, and no path that
+  writes the store until the Machine flushes a successful message.
+
+  ## Overlay vs store
+
+  Reads consult the overlay first, then the injected `:get-fn`. A miss
+  in the overlay that hits the store is one boundary crossing and one
+  byte copy (ADR-2608590000 Boundary A). Writes land in the overlay
+  only. `flush!` is the Machine's job on success; revert is dropping
+  the overlay.
+
+  ## Handles
+
+  Integer ids, invocation-local, discarded when the invocation returns.
+  A nested `:actor/call` starts a child with an empty handle table.
+  The child's overlay starts as a snapshot of the parent's; on child
+  failure the parent's overlay is restored to that snapshot (the
+  caller's writes from before the call stay, the callee's do not).
+
+  ## Fuel
+
+  Every syscall charges before it acts. If the charge would pass the
+  budget the context becomes `:exhausted?` and the effect does not
+  run. Nested spent is kept even when the child's writes are dropped —
+  work happened, state did not move."
+  (:require [ipld.core :as ipld]
+            [kotoba.vm.syscall :as sc]))
+
+(def max-call-depth 8)
+
+(defn byte-len
+  [b]
+  (cond
+    (nil? b) 0
+     
+    
+    
+    (counted? b) (count b)
+    :else 0))
+
+(defn copy-bytes
+  "A real copy on both runtimes. Sharing the store's array with a guest
+  handle would make the guest a writer of committed bytes."
+  [b]
+  (when b
+    ))
+
+(defn- halted? [ctx]
+  (or (:exhausted? ctx) (:aborted? ctx)))
+
+(defn charge
+  "Pay `n` from the remaining budget. If the payment would pass the
+  budget, mark exhausted and do not pretend the op ran."
+  [ctx n]
+  (if (halted? ctx)
+    ctx
+    (let [spent (+ (long (:spent ctx 0)) (long n))
+          budget (long (:budget ctx))]
+      (if (> spent budget)
+        (assoc ctx :spent spent :exhausted? true :result nil)
+        (assoc ctx :spent spent)))))
+
+(defn- note-copy
+  [ctx n]
+  (-> ctx
+      (update :copied-bytes #(+ (long (or % 0)) (long n)))))
+
+(defn- note-crossing
+  [ctx]
+  (update ctx :crossings #(inc (long (or % 0)))))
+
+(defn- overlay-get
+  "Overlay first, then extern. Extern hits are copies and crossings."
+  [ctx cid]
+  (if-let [b (get (:overlay ctx) cid)]
+    [ctx b]
+    (if-let [b ((:get-fn ctx) cid)]
+      (let [n (byte-len b)
+            ctx (-> ctx note-crossing (note-copy n))]
+        [ctx b])
+      [ctx nil])))
+
+(defn- next-handle [ctx]
+  (let [h (:next-handle ctx 1)]
+    [h (assoc ctx :next-handle (inc h))]))
+
+(defn- put-handle [ctx h m]
+  (assoc-in ctx [:handles h] m))
+
+(defn- handle [ctx h]
+  (get-in ctx [:handles h]))
+
+(defn abort [ctx reason]
+  (assoc ctx :aborted? true :last-error reason :result nil))
+
+(defn- cid-of [x]
+  (cond
+    (nil? x) nil
+    (string? x) x
+    (ipld/link? x) (ipld/link-cid x)
+    :else x))
+
+(defn ipld-open
+  "Open a CID into a new handle. Missing blocks abort the invocation
+  (a replica must not invent state). A CID mismatch in the store
+  throws — that is a storage fault, not an actor refusal."
+  [ctx cid]
+  (let [ctx (charge ctx (sc/costs :ipld/open))]
+    (if (halted? ctx)
+      ctx
+      (let [cid (cid-of cid)]
+        (if (nil? cid)
+          (abort ctx :block-not-found)
+          (let [[ctx bytes] (overlay-get ctx cid)]
+            (if (nil? bytes)
+              (abort ctx :block-not-found)
+              (let [verified (ipld/get-verified-block (fn [_] bytes) cid)
+                    copied (copy-bytes verified)
+                    ctx (note-copy ctx (byte-len copied))
+                    [h ctx] (next-handle ctx)]
+                (-> ctx
+                    (put-handle h {:bytes copied :cid cid})
+                    (assoc :result h))))))))))
+
+(defn ipld-read
+  "Copy a slice of a handle's bytes out to the caller. The copy is the
+  Boundary B cost: guest memory is not the store's array."
+  [ctx h offset len]
+  (let [rec (handle ctx h)
+        available (if rec
+                    (max 0 (- (byte-len (:bytes rec)) (long (or offset 0))))
+                    0)
+        n (min (long (or len available)) available)
+        ctx (charge ctx (sc/read-cost n))]
+    (if (halted? ctx)
+      ctx
+      (if (nil? rec)
+        (abort ctx :bad-handle)
+        (let [offset (long (or offset 0))
+              src (:bytes rec)
+              out ]
+          (-> ctx (note-copy n) (assoc :result out)))))))
+
+(defn ipld-write
+  "Stage guest bytes as a new unlinked handle. Not in the overlay until
+  `ipld-link`."
+  [ctx bytes]
+  (let [copied (copy-bytes bytes)
+        n (byte-len copied)
+        ctx (charge ctx (sc/write-cost n))]
+    (if (halted? ctx)
+      ctx
+      (let [[h ctx] (next-handle ctx)]
+        (-> ctx
+            (note-copy n)
+            (put-handle h {:bytes copied :cid nil})
+            (assoc :result h))))))
+
+(defn ipld-link
+  "Address a handle and put it on the overlay. The CID is computed from
+  the handle's bytes; a handle that was opened from a CID already has
+  one and is not rewritten."
+  [ctx h]
+  (let [ctx (charge ctx (sc/costs :ipld/link))]
+    (if (halted? ctx)
+      ctx
+      (let [rec (handle ctx h)]
+        (if (nil? rec)
+          (abort ctx :bad-handle)
+          (let [cid (or (:cid rec) (ipld/cid (:bytes rec)))]
+            (-> ctx
+                (assoc-in [:handles h :cid] cid)
+                (assoc-in [:overlay cid] (:bytes rec))
+                (assoc :result cid))))))))
+
+(defn ipld-stat
+  [ctx h]
+  (let [ctx (charge ctx (sc/costs :ipld/stat))]
+    (if (halted? ctx)
+      ctx
+      (let [rec (handle ctx h)]
+        (if (nil? rec)
+          (abort ctx :bad-handle)
+          (assoc ctx :result {:size (byte-len (:bytes rec)) :cid (:cid rec)}))))))
+
+(defn ipld-node
+  "Decode a handle's bytes. No extra store copy — open already paid it."
+  [ctx h]
+  (let [ctx (charge ctx (sc/costs :guest/op))]
+    (if (halted? ctx)
+      ctx
+      (let [rec (handle ctx h)]
+        (if (nil? rec)
+          (abort ctx :bad-handle)
+          (assoc ctx :result (ipld/decode (:bytes rec))))))))
+
+(defn write-node
+  "Encode a DAG-CBOR node, stage it, link it, return the CID."
+  [ctx node]
+  (let [bytes (ipld/encode node)
+        ctx (ipld-write ctx bytes)]
+    (if (halted? ctx)
+      ctx
+      (ipld-link ctx (:result ctx)))))
+
+(defn self-root
+  [ctx]
+  (let [ctx (charge ctx (sc/costs :self/root))]
+    (if (halted? ctx)
+      ctx
+      (assoc ctx :result (:self-state ctx)))))
+
+(defn set-state
+  "The callee's pending own-state CID. Must already be a CID this
+  invocation has linked (or the CID it started with). Inventing a CID
+  the overlay and the store have never seen is aborted."
+  [ctx cid]
+  (let [ctx (charge ctx (sc/costs :self/set-state))
+        cid (cid-of cid)]
+    (if (halted? ctx)
+      ctx
+      (cond
+        (nil? cid) (abort ctx :invalid-result)
+        (or (contains? (:overlay ctx) cid)
+            (= cid (:self-state ctx))
+            (some? ((:get-fn ctx) cid)))
+        (assoc ctx :self-state cid :result cid)
+        :else (abort ctx :invalid-result)))))
+
+(defn actor-call
+  "Synchronous nested send. Child shares the overlay snapshot; on
+  failure the snapshot is restored and spent is kept. `:invoke-actor`
+  is injected by the Machine so this namespace does not import a guest."
+  [ctx {:keys [to method args]}]
+  (let [ctx (charge ctx (sc/costs :actor/call))]
+    (cond
+      (halted? ctx) ctx
+
+      (>= (long (:depth ctx 0)) (long (:max-depth ctx max-call-depth)))
+      (abort ctx :call-depth)
+
+      (nil? (get-in ctx [:actors to]))
+      (assoc ctx :last-error :no-actor :result nil)
+
+      (nil? (get-in ctx [:actors to :code]))
+      (assoc ctx :last-error :no-code :result nil)
+
+      (nil? (:invoke-actor ctx))
+      (throw (ex-info "kotoba.vm.kernel: nested call needs :invoke-actor"
+                      {:type :kotoba.vm/no-invoke-actor :to to}))
+
+      :else
+      (let [callee (get-in ctx [:actors to])
+            snap-overlay (:overlay ctx)
+            snap-actors (:actors ctx)
+            child {:get-fn (:get-fn ctx)
+                   :put! (:put! ctx)
+                   :overlay snap-overlay
+                   :handles {}
+                   :next-handle 1
+                   :spent (:spent ctx)
+                   :budget (:budget ctx)
+                   :exhausted? false
+                   :aborted? false
+                   :crossings (:crossings ctx)
+                   :copied-bytes (:copied-bytes ctx)
+                   :actors snap-actors
+                   :from (:to ctx)
+                   :to to
+                   :method method
+                   :args args
+                   :depth (inc (long (:depth ctx 0)))
+                   :max-depth (:max-depth ctx max-call-depth)
+                   :host-guests (:host-guests ctx)
+                   :self-state (:state callee)
+                   :return nil
+                   :invoke-actor (:invoke-actor ctx)
+                   :last-error nil
+                   :result nil}
+            child ((:invoke-actor ctx) child)
+            failed? (or (:exhausted? child) (:aborted? child) (:last-error child))]
+        (if failed?
+          ;; Child writes revert to the snapshot. Spent stays — the work
+          ;; happened. Exhaustion of the SHARED budget stops the parent;
+          ;; any other child failure is a value the parent can ignore.
+          (-> ctx
+              (assoc :overlay snap-overlay
+                     :actors snap-actors
+                     :spent (:spent child)
+                     :crossings (:crossings child)
+                     :copied-bytes (:copied-bytes child)
+                     :exhausted? (boolean (:exhausted? child))
+                     :aborted? false
+                     :result nil
+                     :call-error (or (:last-error child)
+                                     (when (:exhausted? child) :fuel-exhausted)
+                                     (when (:aborted? child) :aborted))
+                     :last-error (when (:exhausted? child) :fuel-exhausted)))
+          (let [next-callee (assoc callee :state (:self-state child))]
+            (-> ctx
+                (assoc :overlay (:overlay child)
+                       :actors (assoc (:actors child) to next-callee)
+                       :spent (:spent child)
+                       :crossings (:crossings child)
+                       :copied-bytes (:copied-bytes child)
+                       :exhausted? false
+                       :last-error nil
+                       :call-error nil
+                       :result (:return child)))))))))
+
+(defn flush!
+  "Persist the overlay through `:put!`. Called only on a successful
+  top-level message. Each put is a Boundary A persist."
+  [ctx]
+  (doseq [[cid bytes] (:overlay ctx)]
+    ((:put! ctx) cid bytes))
+  (let [n (count (:overlay ctx))
+        copied (reduce + 0 (map byte-len (vals (:overlay ctx))))]
+    (-> ctx
+        (update :crossings #(+ (long (or % 0)) n))
+        (note-copy copied))))
+
+(defn syscalls
+  "The object a host-fn guest is allowed to hold. It closes over a
+  context atom and does not expose `:get-fn` / `:put!` / `:overlay`."
+  [ctx*]
+  (letfn [(run [f & args]
+            (let [ctx (apply f @ctx* args)]
+              (reset! ctx* ctx)
+              (:result ctx)))]
+    {:self-root (fn [] (run self-root))
+     :open (fn [cid] (run ipld-open cid))
+     :read (fn [h offset len] (run ipld-read h offset len))
+     :write (fn [bytes] (run ipld-write bytes))
+     :link (fn [h] (run ipld-link h))
+     :stat (fn [h] (run ipld-stat h))
+     :node (fn [h] (run ipld-node h))
+     :write-node (fn [node] (run write-node node))
+     :set-state (fn [cid] (run set-state cid))
+     :call (fn [to method args] (run actor-call {:to to :method method :args args}))
+     :return (fn [v]
+               (swap! ctx* assoc :return v)
+               v)
+     :exhausted? (fn [] (boolean (:exhausted? @ctx*)))
+     :aborted? (fn [] (boolean (:aborted? @ctx*)))
+     :error (fn [] (:last-error @ctx*))
+     :state (fn [] (:self-state @ctx*))
+     :caller (fn [] (:from @ctx*))
+     :address (fn [] (:to @ctx*))
+     :method (fn [] (:method @ctx*))
+     :args (fn [] (:args @ctx*))}))

@@ -1,0 +1,106 @@
+(ns murakumo.web.search
+  "M3 (Phase 1) of ADR-260929: `:web/search` as federated meta-search.
+
+  A node fans one query out to its configured backends (SearXNG-style), drops
+  results that fail the URL policy, dedupes by normalised URL, merges with
+  reciprocal-rank fusion and stores the ranked list by CID with a signed
+  receipt. This is federation of third-party engines, NOT an own index: quality
+  is whatever the backends give, and the QUERY IS SENT TO THEM.
+
+  Result text (title/snippet) is untrusted page-derived data. It is length-
+  capped, stripped of control characters and marked `:untrusted true`; a bot
+  must quote it as evidence, never read it as instructions.
+
+  env = {:backends [{:name kw :search! (fn [{:keys [query k]}] ->
+                                          {:results [{:url :title :snippet}]} | {:error kw})}]
+         :put! :sign! :now-ms :node-did}   (backends are OPERATOR config, never job input)"
+  (:require [kotoba.lang.text :as text]
+            [murakumo.canonical :as canonical]
+            [murakumo.web :as web]
+            [murakumo.web.crawl :as crawl]
+            [murakumo.web.worker :as w]))
+
+(def max-query-chars 512)
+(def max-title-chars 300)
+(def max-snippet-chars 1000)
+(def rrf-k 60)
+(def score-scale 1000000)
+
+(defn- clean-text [s max-chars]
+  (let [s (-> (str (or s ""))
+              (text/replace #"[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]" "")
+              (text/replace #"\s+" " ")
+              text/trim)]
+    (if (> (count s) max-chars) (subs s 0 max-chars) s)))
+
+(defn- clean-result [{:keys [url title snippet]}]
+  (when-let [n (some-> url crawl/normalize-url)]
+    (when (:ok (web/check-url n))
+      {:url n
+       :title (clean-text title max-title-chars)
+       :snippet (clean-text snippet max-snippet-chars)})))
+
+(defn- dedupe-by-url
+  "Keep the first (best-ranked) occurrence of each normalised URL. Without this a backend that lists
+  one URL at several ranks would earn several reciprocal-rank contributions and outweigh other
+  engines."
+  [results]
+  (:out (reduce (fn [{:keys [seen out] :as acc} r]
+                  (if (contains? seen (:url r)) acc {:seen (conj seen (:url r)) :out (conj out r)}))
+                {:seen #{} :out []} results)))
+
+(defn- run-backend [{:keys [name search!]} query k]
+  (let [r (try (search! {:query query :k k})
+               (catch  _ {:error :backend/exception}))]
+    (if (or (:error r) (not (sequential? (:results r))))
+      {:name name :error (or (:error r) :backend/bad-response) :results []}
+      {:name name :results (dedupe-by-url (keep clean-result (:results r)))})))
+
+(defn fuse
+  "Reciprocal-rank fusion over per-backend ranked lists. Deterministic: integer
+  scores, ties broken by first appearance."
+  [ranked-lists]
+  (let [order (atom []) scores (atom {}) info (atom {})]
+    (doseq [{:keys [name results]} ranked-lists
+            [i r] (map-indexed vector results)]
+      (let [u (:url r)]
+        (when-not (contains? @scores u) (swap! order conj u) (swap! info assoc u r))
+        (swap! scores update u (fnil + 0) (quot score-scale (+ rrf-k i 1)))
+        (swap! info update-in [u :sources] (fnil conj []) name)))
+    (->> @order
+         (map-indexed (fn [pos u] [pos u]))
+         (sort-by (fn [[pos u]] [(- (get @scores u)) pos]))
+         (mapv (fn [[_ u]] (assoc (get @info u) :score (get @scores u) :untrusted true))))))
+
+(defn search!
+  "job {:job-id :query :k} -> {:ok {:results-cid :results :receipt :signature}} | {:refused ..}"
+  [{:keys [backends put! sign! now-ms node-did]} {:keys [job-id query k] :as job}]
+  (let [valid (web/validate-job (assoc job :kind :web/search))]
+    (cond
+      (:refused valid) {:refused :job/invalid :detail (:refused valid)}
+      (> (count query) max-query-chars) {:refused :job/invalid :detail [:job/query-too-long]}
+      (empty? backends) {:refused :search/no-backends}
+      :else
+      (let [started (now-ms)
+            runs (mapv #(run-backend % query k) backends)]
+        (if (every? :error runs)
+          {:refused :search/all-backends-failed
+           :detail (mapv #(select-keys % [:name :error]) runs)}
+          (let [ranked (vec (take k (fuse runs)))
+                doc {:query query :k k :results ranked
+                     :backends (mapv (fn [{:keys [name error results]}]
+                                       (cond-> {:name name :count (count results)}
+                                         error (assoc :error error)))
+                                     runs)}
+                bs (w/utf8-bytes (canonical/string doc))
+                cid (w/raw-cid bs)]
+            (if-not (put! cid bs)
+              {:refused :store/put-failed :detail cid}
+              (let [r (web/receipt
+                       {:job-id job-id :kind :web/search :input-cids []
+                        :output-cid cid :node-did node-did
+                        :started-at started :finished-at (max started (now-ms))
+                        :evidence {:backends (:backends doc) :results (count ranked)
+                                   :query-hash (w/content-hash (w/utf8-bytes query))}})]
+                {:ok {:results-cid cid :results doc :receipt r
+                      :signature (sign! (web/receipt-signing-string r))}}))))))))

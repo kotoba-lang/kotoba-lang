@@ -1,0 +1,150 @@
+(ns murakumo.web.collection-runtime
+  "Execution and verified sharing for profile-hosted collectors. I/O is injected
+  at the host boundary; existing web workers retain robots/DNS/SSRF enforcement."
+  (:require [murakumo.canonical :as canonical]
+            [murakumo.web :as web]
+            [murakumo.web.collection :as c]
+            [murakumo.web.crawl :as crawl]
+            [murakumo.web.index :as index]
+            [murakumo.web.worker :as w]
+            ))
+
+(defn read-block! [get! cid]
+  (let [bs (get! cid)]
+    (c/require! (and bs (= cid (w/raw-cid bs))) :collection/block-missing-or-corrupt)
+    bs))
+(defn read-doc! [get! cid] (edn/read-string (w/utf8-string (read-block! get! cid))))
+
+(defn profile
+  "Portable, content-addressed profile. A snapshot grants no authority itself."
+  [p]
+  (c/require! (and (= :web/collector-profile-v1 (:schema p))
+                   (c/did? (:owner-did p)) (string? (:bot-id p)) (seq (:bot-id p))
+                   (string? (:soul p)) (<= 1 (count (:soul p)) 12000)
+                   (= #{:web/crawl :web/index} (set (:tools p)))) :collection/profile)
+  p)
+
+(defn run!
+  "One hosted bot turn and bounded tool pass. run-bot! is a host-owned inference
+  adapter, not an executable supplied by a job. It returns measured token counts
+  and a boolean collect decision; the model cannot change the assigned plan.
+  Every referenced result remains in the node's existing CID store."
+  [{:keys [get-bytes! sign! node-did run-bot!] :as env} lease]
+  (let [p (profile (read-doc! get-bytes! (:profile-cid lease)))]
+    (c/require! (and (= node-did (:node-did lease)) (= (:owner-did p) (:owner-did lease))
+                     (= (:bot-id p) (:bot-id lease))) :collection/profile-owner)
+    (c/require! run-bot! :collection/no-host-inference)
+    (let [decision (run-bot! p (select-keys lease [:id :plan :campaign-id :epoch]))
+          meter (select-keys decision [:inference-input-tokens :inference-output-tokens])]
+      (c/require! (and (every? c/natural? (vals meter)) (= 2 (count meter))
+                       (true? (:collect? decision))) :collection/bot-held)
+      (let [cr (crawl/crawl! env {:job-id (:id lease) :plan (:plan lease)})]
+        (c/require! (:ok cr) :collection/crawl-failed)
+        (let [manifest-cid (get-in cr [:ok :manifest-cid])
+              ir (index/index-crawl! env {:job-id (:id lease) :manifest-cid manifest-cid})]
+          (c/require! (:ok ir) :collection/index-failed)
+          (let [receipt {:kind :web/collection :assignment-id (:id lease)
+                         :bot-id (:bot-id lease) :owner-did (:owner-did lease)
+                         :node-did node-did :supplier-did (:supplier-did lease)
+                         :profile-cid (:profile-cid lease) :manifest-cid manifest-cid
+                         :index-cid (get-in ir [:ok :root-cid])
+                         :crawl-receipt (get-in cr [:ok :receipt])
+                         :crawl-signature (get-in cr [:ok :signature])
+                         :index-receipt (get-in ir [:ok :receipt])
+                         :index-signature (get-in ir [:ok :signature])
+                         :inference-receipt (:inference-receipt decision)
+                         :usage (merge meter {:tool-pages (count (get-in cr [:ok :manifest :pages]))
+                                              :index-documents (get-in ir [:ok :docs])})}]
+            {:receipt receipt :signature (sign! (canonical/string receipt))}))))))
+
+(defn verify-and-share!
+  "Validate receipts against the admitted node key and compare meter against
+  host-side usage evidence. Then copy every block to shared storage with a CID
+  readback. Returning true means actual verified custody, not a queued put."
+  [{:keys [node-get! shared-put! shared-get! verify-signature! verify-inference!]} lease result]
+  (let [r (:receipt result) cr (:crawl-receipt r) ir (:index-receipt r)
+        verify (fn [body signature] (true? (verify-signature! (:node-did lease) body signature)))
+        get! #(read-block! node-get! %)
+        manifest (read-doc! get! (:manifest-cid r))
+        root (read-doc! get! (:index-cid r))
+        pages (:pages manifest)
+        inputs (vec (sort (map :cid pages)))]
+    (c/require! (and (verify (canonical/string r) (:signature result))
+                     (= :web/crawl (:kind cr)) (= :web/index (:kind ir))
+                     (= (:id lease) (:job-id cr) (:job-id ir) (:crawl-id manifest))
+                     (= (:node-did lease) (:node-did cr) (:node-did ir))
+                     (= (:manifest-cid r) (:output-cid cr))
+                     (= (:index-cid r) (:output-cid ir))
+                     (= inputs (:input-cids cr))
+                     (= (:plan lease) (:plan manifest))
+                     (vector? pages) (seq pages)
+                     (= (count pages) (count (set (map :url pages))))
+                     (verify (web/receipt-signing-string cr) (:crawl-signature r))
+                     (verify (web/receipt-signing-string ir) (:index-signature r))) :collection/receipt-invalid)
+    (c/require! (and verify-inference! (true? (verify-inference! lease r))) :collection/meter-unverified)
+    (let [docs (mapv (fn [page]
+                      (let [pr (:receipt page) ev (:evidence pr)
+                            html (w/utf8-string (get! (:cid page)))]
+                        (c/require! (and (= :web/fetch (:kind pr))
+                                         (= (:node-did lease) (:node-did pr))
+                                         (= (:cid page) (:output-cid pr))
+                                         (= (:url page) (:final-url ev))
+                                         (= (:origin-host lease) (get-in (web/check-url (:url page)) [:ok :host]))
+                                         (integer? (:status ev)) (<= 200 (:status ev) 299)
+                                         (= (:status page) (:status ev))
+                                         (verify (web/receipt-signing-string pr) (:signature page)))
+                                    :collection/page-invalid)
+                        (when (re-find #"(?i)html" (str (:content-type ev)))
+                          {:cid (:cid page) :url (:url page) :title (or (w/title-of html) "")
+                           :text (w/html->markdown html)}))) pages)
+          docs (filterv some? docs)
+          rebuilt (atom {})
+          expected (index/store! (fn [cid bs] (swap! rebuilt assoc cid bs) true) (index/build docs))
+          usage (:usage r)]
+      (c/require! (and (= expected (:index-cid r))
+                       (= (count pages) (:tool-pages usage))
+                       (= (count docs) (:index-documents usage))
+                       (= :web/index (:kind root))) :collection/index-invalid)
+      (doseq [block-cid (distinct (concat [(:profile-cid lease) (:manifest-cid r) (:index-cid r)]
+                                         (when-let [meter-cid (get-in r [:inference-receipt :response-cid])] [meter-cid])
+                                         (map :cid pages) (:shards root)))]
+        (let [bs (get! block-cid)]
+          (c/require! (true? (shared-put! block-cid bs)) :collection/share-put-failed)
+          (read-block! shared-get! block-cid)))
+      (let [bs (w/utf8-bytes (canonical/string r)) receipt-cid (w/raw-cid bs)]
+        (c/require! (true? (shared-put! receipt-cid bs)) :collection/share-put-failed)
+        (read-block! shared-get! receipt-cid))
+      true)))
+
+(defn update-index!
+  "Rebuild the campaign's common index from all accepted output. Identical URLs
+  have one deterministic winner; repeated publication is content-idempotent.
+  Caller must serialize this operation with acceptance and persist the new state."
+  [{:keys [shared-get! shared-put!]} state campaign-key]
+  (let [ids (sort (for [[id l] (:leases state)
+                       :when (and (= campaign-key ((juxt :campaign-id :epoch) l))
+                                  (get-in state [:accepted id]))] id))
+        _ (c/require! (seq ids) :collection/no-results)
+        pages (mapcat (fn [id]
+                        (:pages (read-doc! shared-get! (get-in state [:accepted id :receipt :manifest-cid])))) ids)
+        unique (filter #(re-find #"(?i)html" (str (get-in % [:receipt :evidence :content-type])))
+                       (vals (reduce (fn [m p] (assoc m (:url p) p)) (sorted-map) pages)))
+        docs (mapv (fn [p]
+                     (let [html (w/utf8-string (read-block! shared-get! (:cid p)))]
+                       {:cid (:cid p) :url (:url p) :title (or (w/title-of html) "")
+                        :text (w/html->markdown html)})) unique)
+        put! (fn [cid bs]
+               (and (true? (shared-put! cid bs)) (read-block! shared-get! cid) true))
+        root-cid (index/store! put! (index/build docs))]
+    (c/require! root-cid :collection/index-put-failed)
+    (c/publish-root state campaign-key (get-in state [:roots campaign-key :cid]) root-cid ids)))
+
+(defn settle!
+  "settle-finalized! is the existing KUMO authority adapter. A proposal is not a
+  payment: mark-paid only after its verified finalized event CID is returned.
+  Deterministic run-id lets a crash after finalization safely retry this call."
+  [state id settle-finalized!]
+  (if (get-in state [:paid id]) state
+    (let [proposal (c/settlement state id)]
+      (c/require! settle-finalized! :collection/no-kumo-authority)
+      (c/mark-paid state id (settle-finalized! proposal)))))

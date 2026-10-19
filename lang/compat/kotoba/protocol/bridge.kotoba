@@ -1,0 +1,124 @@
+(ns kotoba.protocol.bridge
+  "host ↔ embed app の capability bridge 契約 (ADR-2607071500 L5)。
+
+  wasm の同期 ABI ではブラウザで `http-post` 系が実装できない
+  (ADR-2607062400) ため、ネットワーク/graph/LLM 系 capability は embed app
+  から直接ではなく **host が代行**する。搬送は host 実装詳細 (Web では
+  postMessage) — この ns は message の形と検証だけを定義する。
+
+  Matrix widget-api の capability 交渉に相当するが、grant は app manifest
+  (:kotoba.app/caps、actor 署名済み) ∩ host 対応 に限られ、鍵も token も
+  app には渡らない。
+
+  flow:
+    host → app  hello   {granted caps, host info}   (mount 直後)
+    app  → host request {id, cap, args}
+    host → app  result  {id, ok, data|error}"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.protocol.app :as app]))
+
+(def protocol-version 1)
+
+(def message-types #{"hello" "request" "result"})
+
+(defn hello
+  "host → app。granted は manifest の要求 caps ∩ host 対応 caps。"
+  [granted & [{:keys [host]}]]
+  (cond-> {:kotoba/bridge "hello"
+           :v protocol-version
+           :granted (vec granted)}
+    host (assoc :host host)))
+
+(defn request
+  "app → host。"
+  [id cap args]
+  {:kotoba/bridge "request" :v protocol-version
+   :id id :cap cap :args (or args {})})
+
+(defn result-ok [id data]
+  {:kotoba/bridge "result" :v protocol-version :id id :ok true :data data})
+
+(defn result-error [id error]
+  {:kotoba/bridge "result" :v protocol-version :id id :ok false
+   :error (str error)})
+
+(defn message-type
+  "message → \"hello\" | \"request\" | \"result\" | nil。
+  (JSON 経由で keyword が失われても読めるよう文字列キーも許す。)"
+  [m]
+  (let [t (or (:kotoba/bridge m) (get m "kotoba/bridge"))]
+    (when (contains? message-types t) t)))
+
+(defn validate-request
+  "app からの request を検証。granted は hello で渡した grant 集合。
+  → problems ([] = ok)。cap が registry 外/未 grant はここで落ちる —
+  fail-closed (kototama validate-import-surface と同じ姿勢)。"
+  [m granted]
+  (let [{:keys [id cap]} m
+        granted (set granted)]
+    (cond-> []
+      (not= "request" (message-type m)) (conj {:error :not-a-request})
+      (not (and (string? id) (not (str/blank? id)))) (conj {:error :missing-id})
+      (not (string? cap)) (conj {:error :missing-cap})
+      (and (string? cap) (not (contains? app/known-caps cap)))
+      (conj {:error :unknown-cap :cap cap})
+      (and (string? cap) (contains? app/known-caps cap)
+           (not (contains? granted cap)))
+      (conj {:error :cap-not-granted :cap cap}))))
+
+(defn grant
+  "manifest の要求 caps → host が実際に許可する集合 (要求 ∩ 対応)。
+  順序は要求順を保つ。"
+  [requested-caps host-supported]
+  (let [supported (set host-supported)]
+    (vec (filter supported (or requested-caps [])))))
+
+;; ── labeler trust (ADR-2607182600 d5/P3) ─────────────────────────────────────
+;;
+;; grant (above) only intersects requested ∩ host-supported — it doesn't ask
+;; "should this UNVERIFIED manifest get this cap at all". risky-caps closes
+;; that gap: caps that hand the guest either write reach (graph/transact,
+;; awai.cell.write) or a real off-host credential (llm/complete の応答 /
+;; oauth/graph.write の CACAO) default to deny unless a labeler the HOST
+;; subscribes to (never the manifest's own claim — a malicious manifest can't
+;; self-attest) has issued a non-negated "verified" label for the manifest's
+;; own atproto record uri.
+;;
+;; labels are com.atproto.label.defs#label shaped maps (aozora.pds.label's
+;; existing atproto-compliant signing/verification/storage — this ns does
+;; NOT re-verify signatures, it trusts whatever labels the HOST already
+;; fetched via a verified com.atproto.label.queryLabels call and is handing
+;; in here; that verification happened upstream, once, at the labeler-
+;; ingestion boundary — not per grant-with-trust call).
+
+(def risky-caps
+  "caps that hand the guest write reach or a real off-host credential —
+  default-deny for an unlabeled/untrusted manifest."
+  #{"graph/transact" "llm/complete" "oauth/graph.write" "awai.cell.write"})
+
+(defn verified?
+  "labels (seq of {:src :val :neg? …} atproto label maps for the manifest's
+  own record uri) + trusted-labelers (set of labeler DIDs the HOST
+  subscribes to — never derived from the manifest itself) → true iff a
+  trusted, non-negated \"verified\" label exists. Absence of a matching
+  label (no labels at all, wrong val, negated, or src not in
+  trusted-labelers) → false — fail-closed by construction, not by an
+  explicit deny-list."
+  [labels trusted-labelers]
+  (boolean (some (fn [l] (and (contains? (set trusted-labelers) (:src l))
+                             (= "verified" (:val l))
+                             (not (:neg l))))
+                 labels)))
+
+(defn grant-with-trust
+  "grant, further narrowed: risky-caps only pass through when verified?.
+  Non-risky caps (graph/query) are unaffected. An unverified manifest
+  requesting a risky cap simply doesn't get it in the result — same silent-
+  drop UX as requesting a cap the host doesn't support at all (grant's
+  existing semantics), not a distinguishable error (a labeler subscription
+  list is host policy, not something to leak cap-by-cap to an unverified
+  guest)."
+  [requested-caps host-supported labels trusted-labelers]
+  (let [trusted? (verified? labels trusted-labelers)]
+    (vec (remove #(and (contains? risky-caps %) (not trusted?))
+                 (grant requested-caps host-supported)))))

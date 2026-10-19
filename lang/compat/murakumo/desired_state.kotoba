@@ -1,0 +1,295 @@
+(ns murakumo.desired-state
+  "Signed desired-state publication and node-local reconciliation.
+
+  The operator publishes immutable assignments to independent mirrors. Nodes
+  pull and verify them against a pinned authority, apply only their own apps to
+  a local Kotoba endpoint, and publish a node-signed receipt. No SSH or hosted
+  control-plane request exists in the node path."
+  (:require [kotoba.bytes :as kbytes] [babashka.process :as process]
+            [kotoba.lang.edn :as edn]
+            [clojure.java.io :as io]
+            [kotoba.lang.text :as str]
+            [kekkai.cacao :as cacao]
+            [kekkai.desired-state :as desired])
+  (:import [java.nio.file Files StandardCopyOption]
+           [java.security MessageDigest]))
+
+(def schema "murakumo.desired-apps/v1")
+(def kind :murakumo/apps)
+(def default-subject "murakumo/fleet/apps")
+
+(defn- hex [^bytes bs]
+  (apply str (map #(format "%02x" (bit-and (int %) 0xff)) bs)))
+
+(defn- score [cid node]
+  (hex (.digest (MessageDigest/getInstance "SHA-256")
+                (kbytes/utf8-bytes (str cid "\u0000" node)))))
+
+(defn eligible?
+  [node {:keys [labels roles reach]}]
+  (and (empty? reach)
+       (every? (fn [[k v]] (= v (get (:labels node) k))) labels)
+       (every? (set (:roles node)) roles)))
+
+(defn assignments
+  "Stable rendezvous-style placement from immutable CID and node name."
+  [nodes {:keys [cid replicas placement name]}]
+  (when-not (and (string? cid) (re-matches #"b[a-z2-7]+" cid))
+    (throw (ex-info "distributed desired state requires an immutable app CID"
+                    {:type :murakumo/missing-app-cid :app name})))
+  (when (seq (:reach placement))
+    (throw (ex-info "distributed placement cannot claim an unobserved reach constraint"
+                    {:type :murakumo/unverified-reach :app name
+                     :reach (:reach placement)})))
+  (let [n (or replicas 1)
+        candidates (->> nodes
+                        (filter #(eligible? % placement))
+                        (sort-by #(score cid (:name %)))
+                        (mapv :name))]
+    (when (> n (count candidates))
+      (throw (ex-info "not enough eligible nodes for desired replicas"
+                      {:type :murakumo/insufficient-eligible-nodes
+                       :app name :replicas n :eligible candidates})))
+    (subvec candidates 0 n)))
+
+(defn- contains-src? [value]
+  (boolean
+   (some #(and (map? %) (contains? % :src))
+         (tree-seq coll? seq value))))
+
+(defn prepare-payload
+  "Resolve all app manifests into the signed payload. A pull agent never reads
+  the publisher's checkout and never compiles source."
+  [fleet manifest-path read-text]
+  (let [manifest (edn/read-string (read-text manifest-path))
+        parent (.getParentFile (.getAbsoluteFile (io/file manifest-path)))
+        apps (mapv
+              (fn [app]
+                (let [path (io/file parent (:manifest app))
+                      text (read-text (.getPath path))
+                      parsed (edn/read-string text)]
+                  (when (contains-src? parsed)
+                    (throw (ex-info "node-local reconcile refuses source builds"
+                                    {:type :murakumo/source-build-not-distributed
+                                     :app (:name app) :manifest (.getPath path)})))
+                  (assoc (select-keys app [:name :cid :replicas :placement :probe])
+                         :assignments (assignments (:nodes fleet) app)
+                         :manifest/text text)))
+              (:apps manifest))]
+    {:murakumo/schema schema
+     :fleet/name (:fleet/name fleet)
+     :apps apps}))
+
+(defn publish!
+  [{:keys [fleet manifest roots min-copies identity-path subject epoch previous-cid]
+    :or {subject default-subject}}]
+  (let [identity (cacao/load-or-create-identity! identity-path)
+        payload (prepare-payload fleet manifest slurp)
+        envelope (desired/seal {:kind kind :subject subject :epoch epoch
+                                :previous-cid previous-cid :payload payload}
+                               identity)]
+    (assoc (desired/publish! roots min-copies envelope
+                             (desired/authority-spki-b64 identity))
+           :desired/authority-spki-b64 (desired/authority-spki-b64 identity))))
+
+(defn pull!
+  [{:keys [roots subject authority-spki-b64 min-epoch]
+    :or {subject default-subject}}]
+  (desired/pull roots subject authority-spki-b64
+                (cond-> {:kind kind}
+                  min-epoch (assoc :min-epoch min-epoch))))
+
+(defn node-plan [verified node]
+  (let [payload (:desired/payload verified)]
+    (when-not (= schema (:murakumo/schema payload))
+      (throw (ex-info "unsupported Murakumo desired-state schema"
+                      {:type :murakumo/desired-schema-mismatch})))
+    {:node node
+     :desired-cid (:desired/cid verified)
+     :epoch (:desired/epoch verified)
+     :apps (filterv #(some #{node} (:assignments %)) (:apps payload))}))
+
+(defn assert-extension!
+  "Accept the current CID idempotently, or a strictly newer statement whose
+  previous CID is exactly the node's last applied CID."
+  [old verified]
+  (when old
+    (let [old-cid (:desired-cid old)
+          old-epoch (:epoch old)
+          new-cid (:desired/cid verified)
+          new-epoch (:desired/epoch verified)]
+      (if (= old-cid new-cid)
+        (when-not (= old-epoch new-epoch)
+          (throw (ex-info "desired CID changed epoch"
+                          {:type :murakumo/desired-epoch-inconsistent})))
+        (when-not (and (> new-epoch old-epoch)
+                       (= old-cid (:desired/previous-cid verified)))
+          (throw (ex-info "desired state does not extend the locally applied head"
+                          {:type :murakumo/desired-chain-mismatch
+                           :old old :new-cid new-cid :new-epoch new-epoch
+                           :previous-cid (:desired/previous-cid verified)}))))))
+  verified)
+
+(defn- atomic-edn! [file value]
+  (let [parent (.getParentFile (.getAbsoluteFile (io/file file)))
+        _ (.mkdirs parent)
+        tmp (java.io.File/createTempFile ".murakumo-" ".tmp" parent)]
+    (spit tmp (pr-str value))
+    (try
+      (Files/move (.toPath tmp) (.toPath (io/file file))
+                  (into-array StandardCopyOption
+                              [StandardCopyOption/ATOMIC_MOVE
+                               StandardCopyOption/REPLACE_EXISTING]))
+      (catch java.nio.file.AtomicMoveNotSupportedException _
+        (Files/move (.toPath tmp) (.toPath (io/file file))
+                    (into-array StandardCopyOption
+                                [StandardCopyOption/REPLACE_EXISTING]))))))
+
+(defn- read-state [file]
+  (try (edn/read-string (slurp file))
+       (catch java.io.FileNotFoundException _ {})))
+
+(defn app-argv [{:keys [kotoba wit-dir url]} manifest-file]
+  [kotoba "app" "deploy" manifest-file "--wit-dir" wit-dir "--publish" "--url" url])
+
+(defn probe-argv
+  "A bounded node-local post-apply probe. Desired state may request GET or
+  POST to the configured local Kotoba endpoint; arbitrary URLs and headers are
+  not accepted."
+  [url {:keys [method path body]}]
+  (let [method (str/upper (or method "GET"))]
+    (when-not (and (#{"GET" "POST"} method)
+                   (string? path) (str/starts-with? path "/")
+                   (not (str/starts-with? path "//")))
+      (throw (ex-info "invalid desired-state runtime probe"
+                      {:type :murakumo/invalid-runtime-probe})))
+    (cond-> ["curl" "-sS" "-o" "/dev/null" "-w" "%{http_code}"
+             "--max-time" "15" "-X" method
+             (str (str/replace url #"/+$" "") path)]
+      (and (= method "POST") (string? body))
+      (into ["-H" "content-type: application/json" "--data" body]))))
+
+(defn reconcile!
+  "Pull, locally apply this node's assignment, and mirror a node-signed receipt.
+  run-fn is injectable; its result must carry :exit, :out, and :err."
+  [{:keys [roots subject authority-spki-b64 node state-dir node-identity-path
+           min-copies kotoba wit-dir url run-fn now]
+    :or {subject default-subject run-fn #(apply process/sh %) now #(.toString (java.time.Instant/now))}}]
+  (let [state-file (io/file state-dir "state.edn")
+        state (read-state state-file)
+        old (get state subject)
+        verified (assert-extension!
+                  old
+                  (pull! {:roots roots :subject subject
+                          :authority-spki-b64 authority-spki-b64
+                          :min-epoch (:epoch old)}))
+        plan (node-plan verified node)]
+    (if (= (:desired-cid old) (:desired-cid plan))
+      (assoc plan :status :unchanged)
+      (let [manifest-dir (io/file state-dir "manifests")
+            _ (.mkdirs manifest-dir)
+            results (mapv
+                     (fn [app]
+                       (let [file (io/file manifest-dir (str (:cid app) ".edn"))]
+                         (spit file (:manifest/text app))
+                         (let [result (run-fn (app-argv {:kotoba kotoba :wit-dir wit-dir :url url}
+                                                       (.getPath file)))
+                               probe (:probe app)
+                               probe-result (when (and (zero? (:exit result)) probe)
+                                              (let [observed (run-fn (probe-argv url probe))
+                                                    expected (str (or (:expect-status probe) 200))]
+                                                {:exit (:exit observed)
+                                                 :status (str/trim (str (:out observed)))
+                                                 :expected expected
+                                                 :ok? (and (zero? (:exit observed))
+                                                           (= expected (str/trim (str (:out observed)))))}))]
+                           {:app (:name app) :cid (:cid app) :exit (:exit result)
+                            :out (:out result) :err (:err result)
+                            :probe probe-result})))
+                     (:apps plan))
+            deploy-ok? (every? #(zero? (:exit %)) results)
+            probes-ok? (every? #(or (nil? (:probe %)) (get-in % [:probe :ok?])) results)
+            runtime-verified? (and (seq results) (every? :probe results) probes-ok?)
+            ok? (and deploy-ok? probes-ok?)]
+        (when-not ok?
+          (throw (ex-info "one or more local app deployments failed"
+                          {:type :murakumo/local-reconcile-failed
+                           :plan plan :results results})))
+        (let [node-id (cacao/load-or-create-identity! node-identity-path)
+              observed-at (now)
+              receipt (desired/receipt
+                       {:node node :desired-cid (:desired-cid plan)
+                        :epoch (:epoch plan) :status (if runtime-verified? :applied :accepted)
+                        :observed-at observed-at
+                        :detail {:apps (mapv #(select-keys % [:app :cid :exit]) results)}}
+                       node-id)
+              receipt-result (desired/publish! roots min-copies receipt
+                                               (desired/authority-spki-b64 node-id))]
+          (atomic-edn! state-file
+                       (assoc state subject {:epoch (:epoch plan)
+                                             :desired-cid (:desired-cid plan)
+                                             :receipt-cid (:desired/cid receipt)}))
+          (assoc plan :status (if runtime-verified? :applied :accepted) :results results
+                 :receipt receipt-result
+                 :receipt-authority-spki-b64 (desired/authority-spki-b64 node-id)))))))
+
+(defn- options [args]
+  (reduce (fn [m arg]
+            (if-let [[_ k v] (re-matches #"--([^=]+)=(.*)" arg)]
+              (assoc m (keyword k) v)
+              (update m :positionals (fnil conj []) arg)))
+          {} args))
+
+(defn- roots [csv]
+  (->> (str/split (or csv "") #",") (remove str/blank?) vec))
+
+(defn- require-options! [opts ks]
+  (doseq [k ks]
+    (when (str/blank? (get opts k))
+      (throw (ex-info (str "missing --" (name k))
+                      {:type :murakumo/missing-option :option k}))))
+  opts)
+
+(defn -main [& args]
+  (let [[command & more] args
+        opts (options more)]
+    (case command
+      "publish"
+      (let [manifest (first (:positionals opts))
+            _ (require-options! (assoc opts :manifest manifest)
+                                [:manifest :fleet :roots :identity :epoch])
+            rs (roots (:roots opts))]
+        (println (pr-str
+                  (publish! {:fleet (edn/read-string (slurp (:fleet opts)))
+                             :manifest manifest :roots rs
+                             :min-copies (if-let [n (:min-copies opts)] (parse-long n) (count rs))
+                             :identity-path (:identity opts) :subject (or (:subject opts) default-subject)
+                             :epoch (parse-long (:epoch opts)) :previous-cid (:previous opts)}))))
+
+      "pull"
+      (do
+        (require-options! opts [:roots :authority :node])
+        (let [verified (pull! {:roots (roots (:roots opts))
+                               :subject (or (:subject opts) default-subject)
+                               :authority-spki-b64 (:authority opts)
+                               :min-epoch (some-> (:min-epoch opts) parse-long)})]
+          (println (pr-str (node-plan verified (:node opts))))))
+
+      "reconcile"
+      (do
+        (require-options! opts [:roots :authority :node :state-dir :node-identity
+                                :kotoba :wit-dir :url])
+        (let [rs (roots (:roots opts))]
+          (println (pr-str
+                    (reconcile! {:roots rs :subject (or (:subject opts) default-subject)
+                                 :authority-spki-b64 (:authority opts) :node (:node opts)
+                                 :state-dir (:state-dir opts)
+                                 :node-identity-path (:node-identity opts)
+                                 :min-copies (if-let [n (:min-copies opts)] (parse-long n) (count rs))
+                                 :kotoba (:kotoba opts) :wit-dir (:wit-dir opts) :url (:url opts)})))))
+
+      (println (str "usage: kotoba run kotoba/desired.kotoba\n"
+                    "  kotoba run kotoba/desired.kotoba --function run --arg '\"publish\"'\n"
+                    "  kotoba run kotoba/desired.kotoba --function run --arg '\"pull\"'\n"
+                    "  kotoba run kotoba/desired.kotoba --function run --arg '\"reconcile\"'\n"
+                    "kekkai seal, mirror I/O, local apply, and runtime probe are host-listen HOLD.")))))

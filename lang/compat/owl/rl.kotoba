@@ -1,0 +1,619 @@
+(ns owl.rl
+  "The OWL 2 RL/RDF rules of `owl.rules/owl2-rl-rules`, evaluated to a
+  least fixpoint over a set of triples.
+
+      (require '[owl.rl :as rl])
+
+      (rl/entail #{{:s \"Felix\" :p :rdf/type :o \"Cat\"}
+                   {:s \"Cat\" :p :rdfs/subClassOf :o \"Animal\"}}
+                 {})
+      ;; => {:graph #{... {:s \"Felix\" :p :rdf/type :o \"Animal\"} ...}
+      ;;     :inferred #{...} :inconsistencies [] :consistent? true ...}
+
+  ## Why an evaluator here, next to rules-as-data
+
+  `owl.rules/hierarchy-rules` and `triple-rules` are Datalog and stay so. The
+  complete RL table does not fit that engine without hiding its shape (see
+  the note above `owl.rules/owl2-rl-rules`): axiomatic rules, rules that
+  conclude `false`, and rules quantified over RDF lists. This namespace reads
+  the table's rows directly -- a row with `:if`/`:then` patterns is joined
+  generically, a `:kind :list` / `:kind :datatype` row is implemented below
+  under its own id -- so the table remains the one statement of coverage.
+
+  Evaluation is semi-naive: each round joins every rule with at least one
+  premise drawn from the previous round's NEW triples, until a round derives
+  nothing. OWL 2 RL introduces no new terms, so the fixpoint is finite.
+
+  ## Inconsistency is a result, not an exception
+
+  Rules that conclude `false` run once over the closed graph. Every match is
+  returned as `{:rule id :table n :triples [premise triples]}` under
+  `:inconsistencies`, and `:consistent?` is false. Nothing is thrown and
+  nothing is dropped: an inconsistent graph still returns its closure, and
+  the caller decides what an inconsistency means for it.
+
+  ## Terms
+
+  A term is any value. Literals are `{:literal lexical :datatype DT}` maps
+  (optionally `:language`), or native integers / decimals / booleans; a bare
+  string is a term, never a literal. Vocabulary is explicit, as in
+  `owl.rules`: `:vocabulary` maps each canonical keyword (`:owl/sameAs`) to
+  the term your graph stores; the default is `owl.rules/rl-keyword-vocabulary`,
+  `owl.rules/rl-iri-vocabulary` matches imported RDF, and a merge of the two
+  matches a mixed graph. The output uses the same vocabulary as the input."
+  (:require [owl.rules :as rules]))
+
+;; ── terms ────────────────────────────────────────────────────────────────
+
+(defn- lvar? [x] (and (symbol? x) (= "?" (subs (name x) 0 1))))
+
+(defn literal?
+  "A literal: a `{:literal ...}` map, or a native number / boolean."
+  [t]
+  (or (and (map? t) (contains? t :literal)) (number? t) (boolean? t)))
+
+(def ^:private iri->datatype
+  (into {} (map (fn [k] [(rules/term-iri k) k]) (conj rules/rl-datatypes :rdf/langString :rdf/PlainLiteral))))
+
+(def ^:private decided-datatypes (set rules/rl-datatypes))
+
+(defn- datatype-of
+  "The canonical datatype keyword of literal `t` (or its raw datatype if
+  this namespace does not know it)."
+  [t]
+  (cond
+    (boolean? t) :xsd/boolean
+    (number? t) (if (integer? t) :xsd/integer :xsd/decimal)
+    (:language t) :rdf/langString
+    :else (let [d (or (:datatype t) :xsd/string)]
+            (if (keyword? d) d (get iri->datatype d d)))))
+
+(defn- lexical-of [t]
+  (cond (boolean? t) (str t)
+        (number? t) (str t)
+        :else (str (:literal t))))
+
+;; ── value spaces ─────────────────────────────────────────────────────────
+;; A decided value is [space canonical-form]: two literals denote the same
+;; data value exactly when these are equal. `::invalid` is a lexical form
+;; outside its datatype's lexical space; nil is a datatype not decided here.
+
+(defn- strip-leading-zeros [s]
+  (let [s (loop [s s] (if (and (> (count s) 1) (= "0" (subs s 0 1))) (recur (subs s 1)) s))]
+    (if (= "" s) "0" s)))
+
+(defn- strip-trailing-zeros [s]
+  (loop [s s] (if (and (pos? (count s)) (= "0" (subs s (dec (count s))))) (recur (subs s 0 (dec (count s)))) s)))
+
+(defn- decimal-value [lex]
+  (if-let [[_ sign ip fp] (re-matches #"([+-]?)([0-9]*)(?:\.([0-9]*))?" lex)]
+    (if (and (= "" ip) (or (nil? fp) (= "" fp)))
+      ::invalid
+      (let [ip (strip-leading-zeros (if (= "" ip) "0" ip))
+            fp (strip-trailing-zeros (or fp ""))
+            mag (if (= "" fp) ip (str ip "." fp))]
+        [:number (if (and (= "-" sign) (not= "0" mag)) (str "-" mag) mag)]))
+    ::invalid))
+
+(defn- integer-value [lex]
+  (if-let [[_ sign digits] (re-matches #"([+-]?)([0-9]+)" lex)]
+    (let [mag (strip-leading-zeros digits)]
+      [:number (if (and (= "-" sign) (not= "0" mag)) (str "-" mag) mag)])
+    ::invalid))
+
+(defn- boolean-value [lex]
+  (case lex ("true" "1") [:boolean true] ("false" "0") [:boolean false] ::invalid))
+
+(defn- leap? [y] (and (zero? (mod y 4)) (or (pos? (mod y 100)) (zero? (mod y 400)))))
+
+(defn- days-in-month [y m]
+  (case m 2 (if (leap? y) 29 28) (4 6 9 11) 30 31))
+
+(defn- parse-int [s] )
+
+(defn- days-from-civil
+  "Days since 1970-01-01 of a proleptic Gregorian date (H. Hinnant)."
+  [y m d]
+  (let [y (if (<= m 2) (dec y) y)
+        era (quot (if (>= y 0) y (- y 399)) 400)
+        yoe (- y (* era 400))
+        mp (mod (+ m 9) 12)
+        doy (+ (quot (+ (* 153 mp) 2) 5) (dec d))
+        doe (+ (* yoe 365) (quot yoe 4) (- (quot yoe 100)) doy)]
+    (+ (* era 146097) doe -719468)))
+
+(defn- datetime-value [lex]
+  (if-let [[_ ys ms ds hs mis ss fs tz]
+           (re-matches #"(-?[0-9]{4,})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})?" lex)]
+    (let [y (parse-int ys) m (parse-int ms) d (parse-int ds)
+          h (parse-int hs) mi (parse-int mis) s (parse-int ss)
+          frac (strip-trailing-zeros (if fs (subs fs 1) ""))]
+      (if (or (< m 1) (> m 12) (< d 1) (> d (days-in-month y m))
+              (> mi 59) (> s 59) (> h 24)
+              (and (= h 24) (or (pos? mi) (pos? s) (not= "" frac))))
+        ::invalid
+        (let [secs (+ (* 86400 (days-from-civil y m d)) (* 3600 h) (* 60 mi) s)
+              suffix (if (= "" frac) "" (str "." frac))]
+          (if tz
+            (let [off (if (= "Z" tz) 0
+                          (let [[_ sg th tm] (re-matches #"([+-])([0-9]{2}):([0-9]{2})" tz)
+                                v (+ (* 3600 (parse-int th)) (* 60 (parse-int tm)))]
+                            (if (= "-" sg) (- v) v)))]
+              [:datetime-tz (str (- secs off) suffix)])
+            [:datetime-local (str secs suffix)]))))
+    ::invalid))
+
+(declare in-integer-range?)
+
+(defn- value
+  "The decided data value of literal `t`, `::invalid`, or nil (undecided)."
+  [t]
+  (let [dt (datatype-of t) lex (lexical-of t)]
+    (case dt
+      :xsd/string [:string lex]
+      :xsd/boolean (if (boolean? t) [:boolean t] (boolean-value lex))
+      :xsd/decimal (if (and (number? t) (not (integer? t)))
+                     (let [s (str t)] (if (re-find #"[eE]" s) nil (decimal-value s)))
+                     (decimal-value lex))
+      (:xsd/integer :xsd/nonNegativeInteger :xsd/positiveInteger :xsd/nonPositiveInteger
+       :xsd/negativeInteger :xsd/long :xsd/int :xsd/short :xsd/byte :xsd/unsignedLong
+       :xsd/unsignedInt :xsd/unsignedShort :xsd/unsignedByte)
+      (let [v (integer-value lex)]
+        (if (and (vector? v) (not (in-integer-range? dt (second v)))) ::invalid v))
+      (:xsd/dateTime :xsd/dateTimeStamp)
+      (let [v (datetime-value lex)]
+        (if (and (= dt :xsd/dateTimeStamp) (vector? v) (not= :datetime-tz (first v))) ::invalid v))
+      nil)))
+
+(defn- cmp-int
+  "Compare two canonical integer strings numerically."
+  [a b]
+  (let [na (= "-" (subs a 0 1)) nb (= "-" (subs b 0 1))]
+    (cond
+      (and na (not nb)) -1
+      (and nb (not na)) 1
+      :else (let [ma (if na (subs a 1) a) mb (if nb (subs b 1) b)
+                  c (if (= (count ma) (count mb)) (compare ma mb) (compare (count ma) (count mb)))
+                  c (cond (neg? c) -1 (pos? c) 1 :else 0)]
+              (if na (- c) c)))))
+
+(def ^:private integer-ranges
+  {:xsd/integer [nil nil]
+   :xsd/nonNegativeInteger ["0" nil]
+   :xsd/positiveInteger ["1" nil]
+   :xsd/nonPositiveInteger [nil "0"]
+   :xsd/negativeInteger [nil "-1"]
+   :xsd/long ["-9223372036854775808" "9223372036854775807"]
+   :xsd/int ["-2147483648" "2147483647"]
+   :xsd/short ["-32768" "32767"]
+   :xsd/byte ["-128" "127"]
+   :xsd/unsignedLong ["0" "18446744073709551615"]
+   :xsd/unsignedInt ["0" "4294967295"]
+   :xsd/unsignedShort ["0" "65535"]
+   :xsd/unsignedByte ["0" "255"]})
+
+(defn- in-integer-range? [dt n]
+  (let [[lo hi] (get integer-ranges dt)]
+    (and (or (nil? lo) (>= (cmp-int n lo) 0))
+         (or (nil? hi) (<= (cmp-int n hi) 0)))))
+
+(defn- in-value-space?
+  "Is decided value `v` in the value space of datatype `dt`? nil when `dt`
+  is not decided here."
+  [v dt]
+  (cond
+    (= dt :rdfs/Literal) true
+    (not (contains? decided-datatypes dt)) nil
+    :else
+    (let [[space x] v]
+      (case dt
+        :xsd/string (= space :string)
+        :xsd/boolean (= space :boolean)
+        :xsd/decimal (= space :number)
+        (:xsd/dateTime) (contains? #{:datetime-tz :datetime-local} space)
+        :xsd/dateTimeStamp (= space :datetime-tz)
+        (and (= space :number) (not (re-find #"\." x)) (in-integer-range? dt x))))))
+
+(defn- card?
+  "Is term `t` the non-negative integer literal `k`?"
+  [t k]
+  (and (literal? t)
+       (let [v (value t)]
+         (and (vector? v) (= :number (first v)) (= (str k) (second v))))))
+
+;; ── the index ────────────────────────────────────────────────────────────
+;; {:sp {s {p #{o}}} :po {p {o #{s}}} :os {o #{[s p]}}}. Absent is nil; a
+;; term is never nil, so nil means "unbound" in a scan and `false` (a
+;; boolean literal) is an ordinary term.
+
+(defn- index-add [idx [s p o]]
+  (-> idx
+      (update :sp update s update p (fnil conj #{}) o)
+      (update :po update p update o (fnil conj #{}) s)
+      (update :os update o (fnil conj #{}) [s p])))
+
+(defn- index-of [triples] (reduce index-add {} triples))
+
+(defn- scan [idx s p o]
+  (cond
+    (some? s)
+    (if (some? p)
+      (let [os (get-in idx [:sp s p])]
+        (if (some? o) (when (contains? os o) [[s p o]]) (map (fn [o] [s p o]) os)))
+      (if (some? o)
+        (keep (fn [[p os]] (when (contains? os o) [s p o])) (get-in idx [:sp s]))
+        (for [[p os] (get-in idx [:sp s]) o os] [s p o])))
+    (some? p)
+    (if (some? o)
+      (map (fn [s] [s p o]) (get-in idx [:po p o]))
+      (for [[o ss] (get-in idx [:po p]) s ss] [s p o]))
+    (some? o) (map (fn [[s p]] [s p o]) (get-in idx [:os o]))
+    :else (for [[s pm] (:sp idx) [p os] pm o os] [s p o])))
+
+(defn- objects [idx s p] (get-in idx [:sp s p]))
+(defn- subjects [idx p o] (get-in idx [:po p o]))
+(defn- has? [idx [s p o]] (contains? (get-in idx [:sp s p]) o))
+
+;; ── pattern rules ────────────────────────────────────────────────────────
+
+(defn- term [b t] (if (lvar? t) (get b t) t))
+
+(defn- bind [b pat t]
+  (loop [i 0 b b]
+    (if (= i 3)
+      b
+      (let [pt (nth pat i) v (nth t i)]
+        (if (lvar? pt)
+          (let [cur (get b pt ::none)]
+            (cond (= cur ::none) (recur (inc i) (assoc b pt v))
+                  (= cur v) (recur (inc i) b)
+                  :else nil))
+          (when (= pt v) (recur (inc i) b)))))))
+
+(defn- score [pat bound delta?]
+  (let [known (fn [t] (or (not (lvar? t)) (contains? bound t)))]
+    (+ (* 2 (count (filter known pat)))
+       (if (known (nth pat 1)) 1 0)
+       (if delta? 1 0))))
+
+(defn- plan
+  "Join order for `premises` when premise `delta-i` (or none) reads the
+  delta: greedily the premise with the most known positions."
+  [premises delta-i]
+  (loop [bound #{} remaining (set (range (count premises))) order []]
+    (if (empty? remaining)
+      order
+      (let [j (apply max-key (fn [j] (+ (* 10 (score (nth premises j) bound (= j delta-i))) (- j)))
+                     (sort remaining))]
+        (recur (into bound (filter lvar? (nth premises j))) (disj remaining j) (conj order j))))))
+
+(defn- guard-ok? [rule b]
+  (let [[cv k] (:card rule)]
+    (or (nil? cv)
+        (let [t (get b cv)] (or (nil? t) (card? t k))))))
+
+(defn- run-plan [idx didx rule premises order delta-i]
+  (reduce (fn [bs j]
+            (let [pat (nth premises j)
+                  src (if (= j delta-i) didx idx)]
+              (into []
+                    (comp (mapcat (fn [b] (keep #(bind b pat %)
+                                                (scan src (term b (nth pat 0)) (term b (nth pat 1)) (term b (nth pat 2))))))
+                          (filter #(guard-ok? rule %)))
+                    bs)))
+          [{}] order))
+
+(defn- conclude [rule b]
+  (map (fn [pat] (mapv #(term b %) pat)) (:then rule)))
+
+(defn- reflexive-same-as?
+  "x owl:sameAs x. Never derived: eq-ref is omitted (see its row), and
+  eq-rep-s/o, eq-trans, prp-fp/ifp/key and cls-maxc2/maxqc3/4 would
+  otherwise re-derive it for every term they touch."
+  [[s p o]]
+  (and (= p :owl/sameAs) (= s o)))
+
+(defn- compile-rule [rule]
+  (let [ps (:if rule)]
+    (assoc rule :plans (mapv (fn [i] (plan ps i)) (range (count ps)))
+           :full-plan (plan ps nil))))
+
+;; ── RDF lists ────────────────────────────────────────────────────────────
+
+(defn- one-of
+  "The single value of a functional list edge. Equality (eq-rep-o) can make
+  a list node carry several equal values; any one of them is then correct,
+  and the smallest printed form keeps the choice deterministic."
+  [xs]
+  (when (seq xs) (if (= 1 (count xs)) (first xs) (first (sort-by pr-str xs)))))
+
+(defn- read-list
+  "Members of the RDF list at `head`, or nil when it is not a well-formed
+  list (a missing rdf:first/rdf:rest, or a cycle)."
+  [idx head]
+  (loop [node head acc [] seen #{}]
+    (cond
+      (= node :rdf/nil) acc
+      (contains? seen node) nil
+      :else (let [f (one-of (objects idx node :rdf/first))
+                  r (one-of (objects idx node :rdf/rest))]
+              (when (and (some? f) (some? r))
+                (recur r (conj acc f) (conj seen node)))))))
+
+(defn- lists-of
+  "[[subject members] ...] for every `s p l` whose `l` is a well-formed list;
+  malformed heads are reported through `bad!`."
+  [idx p rule bad!]
+  (keep (fn [[s _ l]]
+          (if-let [ms (read-list idx l)]
+            [s ms]
+            (do (bad! {:rule rule :subject s :property p :list l}) nil)))
+        (scan idx nil p nil)))
+
+(defn- ext [idx c] (subjects idx :rdf/type c))
+
+(defn- list-rule
+  "Conclusions of the `:kind :list` rule `id` over the whole graph."
+  [id idx bad!]
+  (case id
+    :cls-int1 (for [[c ms] (lists-of idx :owl/intersectionOf id bad!)
+                    :when (seq ms)
+                    :let [exts (sort-by count (map #(ext idx %) ms))]
+                    y (first exts)
+                    :when (every? #(contains? % y) (rest exts))]
+                [y :rdf/type c])
+    :cls-int2 (for [[c ms] (lists-of idx :owl/intersectionOf id bad!)
+                    y (ext idx c) ci ms]
+                [y :rdf/type ci])
+    :cls-uni (for [[c ms] (lists-of idx :owl/unionOf id bad!)
+                   ci ms y (ext idx ci)]
+               [y :rdf/type c])
+    :cls-oo (for [[c ms] (lists-of idx :owl/oneOf id bad!) y ms] [y :rdf/type c])
+    :scm-int (for [[c ms] (lists-of idx :owl/intersectionOf id bad!) ci ms] [c :rdfs/subClassOf ci])
+    :scm-uni (for [[c ms] (lists-of idx :owl/unionOf id bad!) ci ms] [ci :rdfs/subClassOf c])
+    :prp-spo2 (for [[p ms] (lists-of idx :owl/propertyChainAxiom id bad!)
+                    :when (seq ms)
+                    [u v] (reduce (fn [pairs pk]
+                                    (set (for [[u x] pairs y (objects idx x pk)] [u y])))
+                                  (set (map (fn [[s _ o]] [s o]) (scan idx nil (first ms) nil)))
+                                  (rest ms))]
+                [u p v])
+    :prp-key (for [[c ps] (lists-of idx :owl/hasKey id bad!)
+                   :when (seq ps)
+                   :let [xs (ext idx c)
+                         groups (reduce (fn [g x] (reduce #(update %1 %2 (fnil conj #{}) x)
+                                                          g (objects idx x (first ps))))
+                                        {} xs)
+                         pairs (set (for [[_ members] groups x members y members :when (not= x y)] [x y]))]
+                   [x y] pairs
+                   :when (every? (fn [p] (let [a (objects idx x p) b (objects idx y p)]
+                                           (some #(contains? b %) a)))
+                                 (rest ps))]
+               [x :owl/sameAs y])
+    nil))
+
+(defn- list-inconsistencies [id idx bad!]
+  (case id
+    :prp-adp
+    (for [[x ms] (lists-of idx :owl/members id bad!)
+          :when (has? idx [x :rdf/type :owl/AllDisjointProperties])
+          :let [ms (vec ms)]
+          i (range (count ms)) j (range (inc i) (count ms))
+          :let [pi (nth ms i) pj (nth ms j)]
+          [u _ v] (scan idx nil pi nil)
+          :when (has? idx [u pj v])]
+      {:rule id :triples [[x :rdf/type :owl/AllDisjointProperties] [u pi v] [u pj v]]})
+    :cax-adc
+    (for [[x ms] (lists-of idx :owl/members id bad!)
+          :when (has? idx [x :rdf/type :owl/AllDisjointClasses])
+          :let [ms (vec ms)]
+          i (range (count ms)) j (range (inc i) (count ms))
+          :let [ci (nth ms i) cj (nth ms j)]
+          z (ext idx ci)
+          :when (has? idx [z :rdf/type cj])]
+      {:rule id :triples [[x :rdf/type :owl/AllDisjointClasses] [z :rdf/type ci] [z :rdf/type cj]]})
+    nil))
+
+;; eq-diff2/3 read the member list of each owl:AllDifferent node.
+(defn- all-different-lists [idx id bad!]
+  (let [p (if (= id :eq-diff2) :owl/members :owl/distinctMembers)]
+    (for [x (ext idx :owl/AllDifferent)
+          l (objects idx x p)
+          :let [ms (read-list idx l)]
+          :when (or ms (do (bad! {:rule id :subject x :property p :list l}) false))]
+      [x (vec ms)])))
+
+(defn- eq-diff-inconsistencies [id idx bad!]
+  (for [[x ms] (all-different-lists idx id bad!)
+        i (range (count ms)) j (range (inc i) (count ms))
+        :let [a (nth ms i) b (nth ms j)]
+        :when (or (= a b) (has? idx [a :owl/sameAs b]))]
+    {:rule id :triples (cond-> [[x :rdf/type :owl/AllDifferent]]
+                         (not= a b) (conj [a :owl/sameAs b]))}))
+
+;; ── datatypes ────────────────────────────────────────────────────────────
+
+(defn- literal-terms [triples]
+  (into #{} (comp (mapcat (fn [[s _ o]] [s o])) (filter literal?)) triples))
+
+(defn- dt-type2 [lits]
+  (for [lt lits
+        :let [v (value lt)]
+        dt (if (vector? v) rules/rl-datatypes [:rdfs/Literal])
+        :when (or (= dt :rdfs/Literal) (in-value-space? v dt))]
+    [lt :rdf/type dt]))
+
+(defn- dt-eq [lits groups]
+  ;; groups: value -> #{literal}; returns [conclusions groups']
+  (reduce (fn [[out g] lt]
+            (let [v (value lt)]
+              (if (vector? v)
+                (let [peers (get g v #{})]
+                  [(into out (mapcat (fn [q] [[lt :owl/sameAs q] [q :owl/sameAs lt]])) (disj peers lt))
+                   (assoc g v (conj peers lt))])
+                [out g])))
+          [[] groups] lits))
+
+(defn- datatype-inconsistencies [idx lits]
+  (concat
+   ;; dt-not-type: a decided literal typed outside its value space, or an
+   ;; ill-typed lexical form of a decided datatype (its own datatype is the
+   ;; type it asserts).
+   (for [lt lits
+         :let [v (value lt) own (datatype-of lt)]
+         :when (= ::invalid v)]
+     {:rule :dt-not-type :triples [[lt :rdf/type own]] :lexical (lexical-of lt)})
+   (for [lt lits
+         :let [v (value lt)]
+         :when (vector? v)
+         dt (objects idx lt :rdf/type)
+         :when (false? (in-value-space? v dt))]
+     {:rule :dt-not-type :triples [[lt :rdf/type dt]]})
+   ;; dt-diff (as eq-diff1): an owl:sameAs between literals of different value
+   (for [lt lits
+         :let [v (value lt)]
+         :when (vector? v)
+         q (objects idx lt :owl/sameAs)
+         :when (literal? q)
+         :let [w (value q)]
+         :when (and (vector? w) (not= v w))]
+     {:rule :dt-diff :triples [[lt :owl/sameAs q]]})))
+
+;; ── the fixpoint ─────────────────────────────────────────────────────────
+
+(def ^:private rule-by-id (into {} (map (juxt :id identity) rules/owl2-rl-rules)))
+
+(defn- select-rules [{:keys [rules schema?] :or {schema? true}}]
+  (let [ids (or rules rules/supported-rules)
+        unknown (remove rules/supported-rules ids)]
+    (when (seq unknown)
+      (throw (ex-info "owl.rl: rules requested that this evaluator does not implement"
+                      {:unknown (vec (sort unknown)) :supported rules/supported-rules})))
+    (set (remove #(and (not schema?) (= 9 (:table (rule-by-id %)))) ids))))
+
+(defn- translate-in [vocab]
+  (let [inv (reduce-kv (fn [m k v]
+                         (when (and (contains? m v) (not= (get m v) k))
+                           (throw (ex-info "owl.rl: vocabulary maps two canonical terms to one stored term"
+                                           {:term v :canonical [(get m v) k]})))
+                         (assoc m v k))
+                       {} vocab)]
+    (fn [[s p o]] [(get inv s s) (get inv p p) (get inv o o)])))
+
+(defn- translate-out [vocab]
+  (fn [[s p o]] {:s (get vocab s s) :p (get vocab p p) :o (get vocab o o)}))
+
+(defn- as-vec [t] (if (map? t) [(:s t) (:p t) (:o t)] (vec t)))
+
+(defn entail
+  "The OWL 2 RL closure of `triples` (a collection of {:s :p :o} maps), with
+  every inconsistency found.
+
+  opts:
+    :vocabulary  canonical term -> stored term (default
+                 `owl.rules/rl-keyword-vocabulary`)
+    :schema?     evaluate Table 9 (scm-*) and so EMIT schema entailments --
+                 the subClassOf / subPropertyOf closures, equivalences,
+                 propagated domains and ranges (default true)
+    :rules       a subset of `owl.rules/supported-rules` to evaluate
+                 (default: all of them); asking for an unsupported id throws
+
+  Returns
+    {:graph #{triple}           asserted plus derived
+     :inferred #{triple}        derived and not asserted
+     :inconsistencies [{:rule id :table n :triples [triple ...]} ...]
+     :consistent? boolean
+     :rules [id ...]            the rules that were evaluated
+     :diagnostics {:malformed-lists [...]}
+     :counts {:asserted :entailed :inferred :rounds :inconsistencies}}"
+  ([triples] (entail triples {}))
+  ([triples opts]
+   (let [vocab (or (:vocabulary opts) rules/rl-keyword-vocabulary)
+         in (translate-in vocab)
+         out (translate-out vocab)
+         selected (select-rules opts)
+         rows (keep rule-by-id (sort selected))
+         pattern-rules (mapv compile-rule (filter #(and (vector? (:then %)) (seq (:if %))) rows))
+         false-rules (mapv compile-rule (filter #(= :false (:then %)) rows))
+         axioms (mapcat :then (filter #(and (vector? (:then %)) (empty? (:if %))) rows))
+         list-ids (filter #(and (= :list (:kind (rule-by-id %)))
+                                (not (contains? rules/inconsistency-rules %)))
+                          (sort selected))
+         dt? (fn [id] (contains? selected id))
+         bad (volatile! #{})
+         bad! (fn [x] (vswap! bad conj x))
+         asserted (into #{} (map (comp in as-vec)) triples)
+         seed (cond-> (into asserted axioms)
+                (dt? :dt-type1) (into (map (fn [d] [d :rdf/type :rdfs/Datatype]) rules/rl-datatypes)))]
+     (loop [graph seed
+            idx (index-of seed)
+            delta seed
+            groups {}
+            rounds 0]
+       (let [didx (index-of delta)
+             from-patterns (for [rule pattern-rules
+                                 i (range (count (:if rule)))
+                                 :let [pat (nth (:if rule) i)]
+                                 ;; skip premises the delta cannot match
+                                 :when (or (lvar? (nth pat 1)) (contains? (:po didx) (nth pat 1)))
+                                 b (run-plan idx didx rule (:if rule) (nth (:plans rule) i) i)
+                                 t (conclude rule b)]
+                             t)
+             from-lists (mapcat #(list-rule % idx bad!) list-ids)
+             lits (literal-terms delta)
+             from-dt2 (when (dt? :dt-type2) (dt-type2 lits))
+             [from-eq groups] (if (dt? :dt-eq) (dt-eq lits groups) [nil groups])
+             new (into #{} (remove #(or (contains? graph %) (reflexive-same-as? %)))
+                       (concat from-patterns from-lists from-dt2 from-eq))]
+         (if (empty? new)
+           (let [all-lits (literal-terms graph)
+                 found (concat
+                        (for [rule false-rules
+                              b (run-plan idx nil rule (:if rule) (:full-plan rule) nil)]
+                          {:rule (:id rule) :triples (mapv (fn [pat] (mapv #(term b %) pat)) (:if rule))})
+                        (when (selected :eq-diff1)
+                          (for [x (keys (:sp idx))
+                                :when (has? idx [x :owl/differentFrom x])]
+                            {:rule :eq-diff1 :triples [[x :owl/differentFrom x]]}))
+                        (mapcat #(eq-diff-inconsistencies % idx bad!)
+                                (filter selected [:eq-diff2 :eq-diff3]))
+                        (mapcat #(list-inconsistencies % idx bad!)
+                                (filter selected [:prp-adp :cax-adc]))
+                        (when (or (selected :dt-not-type) (selected :dt-diff))
+                          (filter #(selected (:rule %)) (datatype-inconsistencies idx all-lits))))
+                 incons (->> found
+                             (map (fn [f] (-> f
+                                              (assoc :table (:table (rule-by-id (:rule f))))
+                                              (update :triples #(mapv out %)))))
+                             distinct
+                             (sort-by (fn [f] [(name (:rule f)) (pr-str (:triples f))]))
+                             vec)
+                 graph-out (into #{} (map out) graph)
+                 asserted-out (into #{} (map out) asserted)
+                 inferred (into #{} (remove asserted-out) graph-out)]
+             {:graph graph-out
+              :inferred inferred
+              :inconsistencies incons
+              :consistent? (empty? incons)
+              :rules (vec (sort selected))
+              :diagnostics {:malformed-lists (vec (sort-by pr-str @bad))}
+              :counts {:asserted (count asserted-out)
+                       :entailed (count graph-out)
+                       :inferred (count inferred)
+                       :rounds rounds
+                       :inconsistencies (count incons)}})
+           (recur (into graph new) (reduce index-add idx new) new groups (inc rounds))))))))
+
+(defn materialize
+  "The closure alone, as a set of {:s :p :o}. Inconsistencies are NOT
+  dropped silently: an inconsistent graph throws `ex-info` with
+  `:owl.rl/inconsistent` and the structured list; use `entail` to get the
+  closure of an inconsistent graph as data."
+  ([triples] (materialize triples {}))
+  ([triples opts]
+   (let [r (entail triples opts)]
+     (when-not (:consistent? r)
+       (throw (ex-info "owl.rl: the graph is inconsistent under OWL 2 RL"
+                       {:owl.rl/inconsistent true
+                        :inconsistencies (:inconsistencies r)})))
+     (:graph r))))

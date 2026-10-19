@@ -1,0 +1,185 @@
+(ns kototama.execution-v2
+  "Host-owned v2 admission. Mechanisms are supplied by the trusted launcher,
+  never by the guest packet. No descriptor or serialized handle grants access."
+  {:kotoba/export [attest verify-attestation! admit! run! verify-completion!]}
+  (:require [kotoba.artifact.execution :as blocks]
+            [kotoba.core.execution :as core]
+            [kotoba.verifier.signing :as signing]
+            [grant.execution-v2 :as grant]))
+
+(defn- reject! [reason]
+  (throw (ex-info "v2 execution denied" {:phase :execution-admission :reason reason})))
+
+(def ^:private attestation-keys
+  #{:format :kind :cid :signer :public-key :audience :not-before :expires :epoch :signature})
+(def ^:private roles #{:intent :lease :receipt :identity})
+(defn- message [a]
+  [:kotoba.execution-attestation/v2 (:kind a) (:cid a) (:signer a)
+   (:audience a) (:not-before a) (:expires a) (:epoch a)])
+(defn- window? [{:keys [audience not-before expires epoch]}]
+  (and (string? audience) (<= 1 (count audience) 4096)
+       (nat-int? not-before) (nat-int? expires) (< not-before expires)
+       (nat-int? epoch)))
+
+(defn attest [kind block key window]
+  (blocks/verify-block kind block)
+  (when-not (and (contains? roles kind)
+                 (= #{:audience :not-before :expires :epoch} (set (keys window)))
+                 (window? window) (signing/valid-key? key))
+    (reject! :invalid-signing-context))
+  (let [a (merge window {:format :kotoba.execution-attestation/v2 :kind kind
+                         :cid (:cid block) :signer (:signer key) :public-key (:public-key key)})]
+    (assoc a :signature (signing/sign-value key (message a)))))
+
+(defn verify-attestation!
+  "Trust is selected independently for authority and executor roles. Revoked
+  content CIDs and epoch are host state, not attestation assertions."
+  [kind block a {:keys [trust audience now epoch revoked-cids] :as context}]
+  (signing/validate-trust! trust)
+  (blocks/verify-block kind block)
+  (when-not (and (= #{:trust :audience :now :epoch :revoked-cids} (set (keys context)))
+                 (nat-int? now) (nat-int? epoch) (set? revoked-cids)
+                 (map? a) (= attestation-keys (set (keys a))) (window? a)
+                 (= :kotoba.execution-attestation/v2 (:format a))
+                 (contains? roles kind) (= kind (:kind a)) (= (:cid block) (:cid a))
+                 (= audience (:audience a)) (= epoch (:epoch a))
+                 (<= (:not-before a) now) (< now (:expires a))
+                 (not (contains? revoked-cids (:cid block)))
+                 (= (:signer a) (signing/signer-id (:public-key a)))
+                 (contains? (:trusted-signers trust) (:signer a))
+                 (not (contains? (:revoked-signers trust) (:signer a)))
+                 (signing/verify-value (:public-key a) (message a) (:signature a)))
+    (reject! :invalid-attestation))
+  a)
+
+(def ^:private host-keys
+  #{:inspect! :execute! :providers :ledger! :epoch! :clock! :audience
+    :authority-trust :executor-trust :executor-key :revoked-cids!})
+(defn- host! [host]
+  (when-not (and (map? host) (= host-keys (set (keys host)))
+                 (every? fn? ((juxt :inspect! :execute! :ledger! :epoch! :clock! :revoked-cids!) host))
+                 (map? (:providers host)) (every? fn? (vals (:providers host)))
+                 (signing/valid-key? (:executor-key host)))
+    (reject! :invalid-host))
+  (signing/validate-trust! (:authority-trust host))
+  (signing/validate-trust! (:executor-trust host))
+  (let [key (:executor-key host) trust (:executor-trust host)]
+    (when-not (and (contains? (:trusted-signers trust) (:signer key))
+                   (not (contains? (:revoked-signers trust) (:signer key))))
+      (reject! :untrusted-executor)))
+  host)
+(defn- context [host role]
+  {:trust (get host role) :audience (:audience host) :now ((:clock! host))
+   :epoch ((:epoch! host)) :revoked-cids ((:revoked-cids! host))})
+(defn- live-references! [host descriptor]
+  (let [revoked ((:revoked-cids! host))
+        references (filter core/cid? (tree-seq coll? seq descriptor))]
+    (when (some revoked references) (reject! :revoked-dependency))))
+(defn- authorized! [host kind block attestation]
+  (verify-attestation! kind block attestation (context host :authority-trust))
+  (live-references! host (blocks/verify-block kind block)))
+
+(defn admit!
+  "Inspect actual artifact/runtime before registration. The ledger commits a
+  one-shot intent registration and each use BEFORE calling a scoped provider.
+  A successful admission returns process-local closures, never a bearer token."
+  [host {:keys [artifact runtime binding intent invocation authorization leases input] :as packet}]
+  (host! host)
+  (when-not (and (= #{:artifact :runtime :binding :intent :invocation :authorization :leases :input}
+                    (set (keys packet))) (vector? leases) (<= (count leases) 256))
+    (reject! :invalid-packet))
+  (let [expected ((:inspect! host) artifact runtime)
+        descriptor (blocks/verify-block :intent intent)
+        _ (grant/verify-invocation invocation)
+        _ (when-not (= (:invocation-cid descriptor) (:cid invocation)) (reject! :invocation-mismatch))
+        _ (blocks/intent-block binding expected descriptor)
+        _ (live-references! host (blocks/verify-block :binding binding))
+        _ (blocks/verify-block :input input)
+        _ (when-not (= (:input-cid descriptor) (:cid input)) (reject! :input-mismatch))
+        _ (authorized! host :intent intent authorization)
+        grants (mapv (fn [{:keys [block attestation] :as signed}]
+                       (when-not (= #{:block :attestation} (set (keys signed)))
+                         (reject! :invalid-signed-lease))
+                       (let [lease (blocks/verify-block :lease block)
+                             expiry (grant/instant-ms (:expires-at lease))
+                             scope ((juxt :capability-cid :resource-cid :purpose) lease)]
+                         (blocks/lease-block intent lease)
+                         (authorized! host :lease block attestation)
+                         (when-not (and expiry (< ((:clock! host)) expiry)
+                                        (fn? (get (:providers host) scope)))
+                           (reject! :expired-or-unbound-provider))
+                         {:cid (:cid block) :scope scope :uses (:uses lease)
+                          :expires (min expiry (:expires attestation)) :signed signed})) leases)
+        _ (when-not (= (count grants) (count (distinct (map :scope grants))))
+            (reject! :duplicate-scope))
+        epoch ((:epoch! host))
+        ticket ((:ledger! host) :begin
+                {:intent-cid (:cid intent) :invocation-cid (:cid invocation) :epoch epoch :now ((:clock! host))
+                 :expires (:expires authorization)
+                 :leases (mapv #(dissoc % :signed) grants)})
+        by-scope (into {} (map (juxt :scope identity) grants))
+        live? (atom true)
+        call! (fn [scope args]
+                (when-not @live? (reject! :closed-admission))
+                (let [{:keys [cid signed] :as lease} (get by-scope scope)]
+                  (when-not lease (reject! :ungranted-scope))
+                  ;; Refresh live state on EVERY effect, including revocation.
+                  (authorized! host :intent intent authorization)
+                  (live-references! host (blocks/verify-block :binding binding))
+                  (authorized! host :lease (:block signed) (:attestation signed))
+                  ((:ledger! host) :reserve
+                   {:ticket ticket :intent-cid (:cid intent) :lease-cid cid
+                    :epoch ((:epoch! host)) :now ((:clock! host))})
+                  ((get (:providers host) scope) args)))]
+    {:intent intent :binding binding :context expected :call! call! :close! #(reset! live? false) :ticket ticket}))
+
+(declare verify-completion!)
+
+(defn run!
+  "Execute only after admission. Outcomes are observed, then executor-signed;
+  the lease names the pre-execution intent, never a fabricated future outcome."
+  [host packet]
+  (when-not (= :sync (:profile (blocks/verify-block :binding (:binding packet))))
+    (reject! :async-run-requires-bounded-task-host))
+  (let [admission (admit! host packet)
+        observed (try {:status :ok :value ((:execute! host)
+                                           {:artifact (:artifact packet) :runtime (:runtime packet)
+                                            :input (blocks/verify-block :input (:input packet))
+                                            :context (:context admission) :call! (:call! admission)})}
+                      (catch  error
+                        (let [observed (:execution-outcome (ex-data error))]
+                          (if (and (map? observed) (= #{:status :value} (set (keys observed)))
+                                   (= :trap (:status observed)))
+                            observed {:status :trap :value {:error :execution-trapped}})))
+                      (finally ((:close! admission))))
+        intent (:intent admission) d (blocks/verify-block :intent intent)
+        outcome (blocks/block :outcome observed)
+        receipt (blocks/block :receipt
+                  {:format :kotoba.execution-receipt/v2 :intent-cid (:cid intent)
+                   :profile-binding-cid (:profile-binding-cid d) :artifact-cid (:artifact-cid d)
+                   :runtime-identity (:runtime-identity d) :outcome-cid (:cid outcome)
+                   :status (:status observed) :sequence 0})
+        identity (blocks/complete-identity intent outcome [receipt])
+        authority (:authorization packet)
+        window {:audience (:audience host) :not-before ((:clock! host))
+                :expires (:expires authority) :epoch ((:epoch! host))}
+        result {:outcome outcome :receipts [{:block receipt
+                                            :attestation (attest :receipt receipt (:executor-key host) window)}]
+                :identity identity :attestation (attest :identity identity (:executor-key host) window)}]
+    (verify-completion! host intent result)))
+
+(defn verify-completion! [host intent {:keys [outcome receipts identity attestation] :as result}]
+  (host! host)
+  (when-not (and (= #{:outcome :receipts :identity :attestation} (set (keys result)))
+                 (vector? receipts) (<= 1 (count receipts) 256))
+    (reject! :invalid-completion))
+  (live-references! host (blocks/verify-block :intent intent))
+  (doseq [signed receipts]
+    (when-not (= #{:block :attestation} (set (keys signed))) (reject! :invalid-receipt))
+    (verify-attestation! :receipt (:block signed) (:attestation signed)
+                         (context host :executor-trust)))
+  (verify-attestation! :identity identity attestation (context host :executor-trust))
+  (when-not (= (:cid identity)
+               (:cid (blocks/complete-identity intent outcome (mapv :block receipts))))
+    (reject! :completion-mismatch))
+  result)

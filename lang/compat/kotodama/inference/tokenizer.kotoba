@@ -1,0 +1,127 @@
+(ns kotodama.inference.tokenizer
+  "Portable byte-level BPE tokenizer over materialized GGUF vocab data.
+
+  This namespace never touches a file. Hosts read `tokenizer.ggml.tokens`,
+  `tokenizer.ggml.merges`, and the special-token ids directly out of a GGUF
+  artifact (see `kotodama.verify.gemma4-e4b-generate-smoke/read-gguf!` for a
+  JVM reader) and hand the materialized vectors to `build`. Everything from
+  there — merge-rank BPE, byte fallback, detokenize — is host-agnostic .cljc.
+  `tokenizer.ggml.scores` (SPM-unigram log-probabilities) is not read: the
+  real Gemma4 GGUF also carries a full rank-ordered merges table, so this v1
+  implements GPT2-style rank-BPE rather than SPM unigram Viterbi.
+
+  This is a pragmatic/adequate BPE implementation, not a byte-perfect port of
+  every llama.cpp edge case: it is proven correct for round-tripping plain
+  ASCII prompts through the real Gemma4 GGUF vocab (SentencePiece-style `▁`
+  word-boundary marker + GPT2-style rank-ordered merges), which is the stated
+  v1 bar."
+  (:require [kotoba.lang.text :as str]))
+
+(def space-marker "▁")
+
+(defn- byte-fallback-token [s]
+  ;; llama.cpp byte-fallback tokens are spelled "<0xAB>" (uppercase hex).
+  (when-let [[_ hex] (re-matches #"<0x([0-9A-Fa-f]{2})>" s)]
+    ;; Integer/parseInt is JVM-only, and this file is .cljc precisely so the
+    ;; tokenizer can run where inference runs. Under SCI the unqualified host
+    ;; call does not resolve at all, so the whole namespace failed to load.
+    ))
+
+(defn build
+  "Build an immutable tokenizer map from materialized GGUF vocab arrays.
+
+  `vocab-data` keys:
+    :tokens             vector of token strings, indexed by token id
+    :merges             vector of \"left right\" merge-rule strings, in rank order
+    :bos-token-id       int, prepended when `:add-bos-token?` is true
+    :eos-token-id       int
+    :add-bos-token?     bool
+    :add-space-prefix?  bool — SentencePiece `add_dummy_prefix`: prepend a
+                         leading `space-marker` to the whole text so the first
+                         word is tokenized the same as a mid-sentence word
+                         (Gemma/Llama SPM require this; default false only for
+                         backward compatibility — real GGUF hosts pass true)"
+  [{:keys [tokens merges bos-token-id eos-token-id add-bos-token? add-space-prefix? unknown-token-id]
+    :or {add-bos-token? true add-space-prefix? false unknown-token-id 3}}]
+  (let [token->id (into {} (map-indexed (fn [id tok] [tok id])) tokens)
+        merge-rank (into {}
+                         (map-indexed
+                          (fn [rank rule]
+                            (let [sp (str/index-of rule " ")]
+                              (when sp
+                                [[(subs rule 0 sp) (subs rule (inc sp))] rank])))
+                          merges))
+        byte-fallback (into {}
+                            (keep (fn [[tok id]]
+                                    (when-let [b (byte-fallback-token tok)]
+                                      [b id])))
+                            token->id)]
+    {:kotodama.tokenizer/tokens tokens
+     :kotodama.tokenizer/token->id token->id
+     :kotodama.tokenizer/merge-rank (dissoc merge-rank nil)
+     :kotodama.tokenizer/byte-fallback byte-fallback
+     :kotodama.tokenizer/bos-token-id bos-token-id
+     :kotodama.tokenizer/eos-token-id eos-token-id
+     :kotodama.tokenizer/add-bos-token? add-bos-token?
+     :kotodama.tokenizer/add-space-prefix? add-space-prefix?
+     :kotodama.tokenizer/unknown-token-id unknown-token-id}))
+
+
+
+(defn- symbols-of [text add-space-prefix?]
+  ;; SentencePiece translates spaces to the word-boundary marker. With
+  ;; `add_dummy_prefix`, a synthetic leading space is prepended first so the
+  ;; first word carries the marker just like any other word.
+  (codepoint-seq (str/replace (if add-space-prefix? (str " " text) text)
+                              " " space-marker)))
+
+(defn- best-merge [merge-rank symbols]
+  (let [pairs (map vector symbols (rest symbols))]
+    (when (seq pairs)
+      (let [ranked (keep (fn [pair] (when-let [r (get merge-rank pair)] [r pair])) pairs)]
+        (when (seq ranked)
+          (second (apply min-key first ranked)))))))
+
+(defn- apply-merge [symbols [left right :as pair]]
+  (loop [out (transient []) xs symbols]
+    (cond
+      (empty? xs) (persistent! out)
+      (and (next xs) (= left (first xs)) (= right (second xs)))
+      (recur (conj! out (str left right)) (nnext xs))
+      :else
+      (recur (conj! out (first xs)) (next xs)))))
+
+(defn- bpe-merge [merge-rank symbols]
+  (loop [symbols symbols]
+    (if-let [pair (best-merge merge-rank symbols)]
+      (recur (apply-merge symbols pair))
+      symbols)))
+
+(defn- symbol->ids
+  "Resolve one merged symbol string to one or more token ids, falling back to
+  per-UTF8-byte `<0xXX>` tokens, then to the unknown-token id."
+  [{:kotodama.tokenizer/keys [token->id byte-fallback unknown-token-id]} symbol]
+  (if-let [id (get token->id symbol)]
+    [id]
+    ))
+
+(defn encode
+  "Text -> vector of token ids. Prepends BOS when the tokenizer was built with
+  `:add-bos-token? true`. Empty/blank text still yields `[bos]` in that case."
+  [tokenizer text]
+  (let [symbols (symbols-of (or text "")
+                            (:kotodama.tokenizer/add-space-prefix? tokenizer))
+        merged (bpe-merge (:kotodama.tokenizer/merge-rank tokenizer) symbols)
+        ids (into [] (mapcat #(symbol->ids tokenizer %)) merged)]
+    (if (:kotodama.tokenizer/add-bos-token? tokenizer)
+      (into [(:kotodama.tokenizer/bos-token-id tokenizer)] ids)
+      ids)))
+
+(defn- token-str [tokenizer id]
+  (nth (:kotodama.tokenizer/tokens tokenizer) id ""))
+
+(defn decode
+  "Vector of token ids -> text. Recombines `space-marker` back into literal
+  spaces and reassembles `<0xXX>` byte-fallback runs as UTF-8."
+  [tokenizer ids]
+  )

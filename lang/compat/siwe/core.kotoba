@@ -1,0 +1,205 @@
+(ns siwe.core
+  "Strict, dependency-free EIP-4361 message grammar and policy helpers.
+
+  This namespace deliberately owns the SIWE wire contract instead of wrapping
+  a JavaScript SIWE package. Cryptographic recovery is in `siwe.edge`; keeping
+  parsing and expected-value checks pure makes the security boundary testable
+  on both the JVM and ClojureScript.
+
+  The accepted language is the EIP-4361 ABNF with bounded fields. The bounds
+  are a relying-party DoS policy, which the EIP explicitly leaves to
+  implementers. Messages use LF exactly; CRLF and trailing newlines reject so
+  there is one byte representation for one parsed value."
+  (:require [kotoba.lang.text :as str]))
+
+(def max-message-length 8192)
+(def max-domain-length 255)
+(def max-uri-length 2048)
+(def max-statement-length 512)
+(def max-request-id-length 256)
+(def max-resources 16)
+
+(def ^:private header-suffix " wants you to sign in with your Ethereum account:")
+(def ^:private scheme-re #"^[A-Za-z][A-Za-z0-9+.-]*$")
+(def ^:private authority-re #"^[^\s/?#\\]{1,255}$")
+(def ^:private address-re #"^0x[0-9A-Fa-f]{40}$")
+(def ^:private uri-re #"^[A-Za-z][A-Za-z0-9+.-]*:[^\s\u0000-\u001F\u007F]{1,2040}$")
+(def ^:private statement-re #"^[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=% -]*$")
+(def ^:private nonce-re #"^[A-Za-z0-9]{8,}$")
+(def ^:private chain-id-re #"^(?:0|[1-9][0-9]*)$")
+(def ^:private rfc3339-re
+  #"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$")
+
+(defn ethereum-address? [value]
+  (boolean (and (string? value) (re-matches address-re value))))
+
+(defn absolute-uri? [value]
+  (boolean (and (string? value)
+                (<= (count value) max-uri-length)
+                (re-matches uri-re value))))
+
+(defn authority? [value]
+  (boolean (and (string? value)
+                (<= (count value) max-domain-length)
+                (re-matches authority-re value))))
+
+(defn rfc3339? [value]
+  (boolean (and (string? value) (re-matches rfc3339-re value))))
+
+(defn- ascii? [value]
+  (every? #(<= (int %) 0x7f) value))
+
+(defn- fields-problem
+  [{:keys [scheme domain address statement uri version chain-id nonce issued-at
+           expiration-time not-before request-id resources]}]
+  (cond
+    (and scheme (not (re-matches scheme-re scheme))) :invalid-scheme
+    (not (authority? domain)) :invalid-domain
+    (not (ethereum-address? address)) :invalid-address
+    (and statement
+         (or (> (count statement) max-statement-length)
+             (not (re-matches statement-re statement)))) :invalid-statement
+    (not (absolute-uri? uri)) :invalid-uri
+    (not= "1" version) :invalid-version
+    (not (and (string? chain-id) (re-matches chain-id-re chain-id))) :invalid-chain-id
+    (not (and (string? nonce) (re-matches nonce-re nonce))) :invalid-nonce
+    (not (rfc3339? issued-at)) :invalid-issued-at
+    (and expiration-time (not (rfc3339? expiration-time))) :invalid-expiration-time
+    (and not-before (not (rfc3339? not-before))) :invalid-not-before
+    (and request-id
+         (or (> (count request-id) max-request-id-length)
+             (not (re-matches #"^[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$" request-id))))
+    :invalid-request-id
+    (or (> (count resources) max-resources)
+        (some #(not (absolute-uri? %)) resources)) :invalid-resources
+    :else nil))
+
+(defn format-message
+  "Render one canonical EIP-4361 plaintext message, or throw ex-info for an
+  invalid field map. Callers should construct maps from trusted policy plus a
+  wallet address; parsers for untrusted text should use `parse-message`."
+  [fields]
+  (let [fields (-> fields
+                   (update :version #(or % "1"))
+                   (update :resources #(vec (or % []))))]
+    (when-let [problem (fields-problem fields)]
+      (throw (ex-info "invalid EIP-4361 fields" {:problem problem})))
+    (let [{:keys [scheme domain address statement uri version chain-id nonce issued-at
+                  expiration-time not-before request-id resources]} fields
+          lines (cond-> [(str (when scheme (str scheme "://")) domain header-suffix)
+                         address ""]
+                  statement (conj statement)
+                  true (conj ""
+                             (str "URI: " uri)
+                             (str "Version: " version)
+                             (str "Chain ID: " chain-id)
+                             (str "Nonce: " nonce)
+                             (str "Issued At: " issued-at))
+                  expiration-time (conj (str "Expiration Time: " expiration-time))
+                  not-before (conj (str "Not Before: " not-before))
+                  request-id (conj (str "Request ID: " request-id))
+                  (seq resources) (conj "Resources:"))]
+      (str/join "\n" (into lines (map #(str "- " %) resources))))))
+
+(defn- fail [problem] {:ok? false :problem problem})
+
+(defn- finish-parsed [message]
+  (let [message (update message :resources #(vec (or % [])))]
+    (if-let [problem (fields-problem message)]
+      (fail problem)
+      {:ok? true :message message})))
+
+(defn- parse-optionals [lines start message]
+  (loop [i start m message stage 0]
+    (if (= i (count lines))
+      (finish-parsed m)
+      (let [line (get lines i)]
+        (cond
+          (and (<= stage 0) (str/starts-with? line "Expiration Time: "))
+          (recur (inc i) (assoc m :expiration-time (subs line 17)) 1)
+
+          (and (<= stage 1) (str/starts-with? line "Not Before: "))
+          (recur (inc i) (assoc m :not-before (subs line 12)) 2)
+
+          (and (<= stage 2) (str/starts-with? line "Request ID: "))
+          (recur (inc i) (assoc m :request-id (subs line 12)) 3)
+
+          (and (<= stage 3) (= line "Resources:"))
+          (let [resource-lines (subvec (vec lines) (inc i))]
+            (if (and (seq resource-lines)
+                     (every? #(str/starts-with? % "- ") resource-lines))
+              (finish-parsed
+               (assoc m :resources (mapv #(subs % 2) resource-lines)))
+              (fail :invalid-resources)))
+
+          :else (fail :invalid-optional-fields))))))
+
+(defn parse-message
+  "Parse an untrusted SIWE plaintext without throwing.
+
+  Success is `{:ok? true :message fields}`. Failure is a stable keyword in
+  `:problem`; no partially parsed fields escape on failure."
+  [text]
+  (try
+    (cond
+      (not (string? text)) (fail :not-a-string)
+      (or (zero? (count text)) (> (count text) max-message-length))
+      (fail :invalid-length)
+      (or (str/includes? text "\r") (str/ends-with? text "\n") (not (ascii? text)))
+      (fail :non-canonical-bytes)
+      :else
+      (let [lines (str/split text #"\n" -1)
+            header (first lines)
+            [_ scheme domain] (re-matches
+                               (re-pattern
+                                "^(?:([A-Za-z][A-Za-z0-9+.-]*)://)?(.{1,255}) wants you to sign in with your Ethereum account:$")
+                               header)
+            address (get lines 1)]
+        (if-not (and domain (= "" (get lines 2)))
+          (fail :invalid-header)
+          (let [statement? (not (str/starts-with? (or (get lines 3) "") "URI: "))
+                statement (when statement? (get lines 3))
+                base (if statement? 5 3)]
+            (if (and statement? (not= "" (get lines 4)))
+              (fail :invalid-statement-separator)
+              (let [required [["URI: " :uri]
+                              ["Version: " :version]
+                              ["Chain ID: " :chain-id]
+                              ["Nonce: " :nonce]
+                              ["Issued At: " :issued-at]]
+                    parsed (reduce
+                            (fn [m [offset [prefix key]]]
+                              (let [line (get lines (+ base offset))]
+                                (if (and m (string? line) (str/starts-with? line prefix))
+                                  (assoc m key (subs line (count prefix)))
+                                  (reduced nil))))
+                            (cond-> {:domain domain :address address
+                                     :statement statement}
+                              scheme (assoc :scheme scheme))
+                            (map-indexed vector required))
+                    start (+ base (count required))]
+                (if-not parsed
+                  (fail :invalid-required-fields)
+                  (parse-optionals lines start parsed))))))))
+    (catch  _
+      (fail :malformed-message))))
+
+(defn expected-problem
+  "Return nil when parsed `message` is bound to the relying party's expected
+  values, otherwise a stable keyword. Time and signature checks are performed
+  by the runtime verifier because they require an instant parser and
+  secp256k1/Keccak respectively."
+  [message {:keys [scheme domain uri nonce chain-ids]}]
+  (cond
+    (and scheme (not= scheme (or (:scheme message) "https"))) :scheme-mismatch
+    (and domain (not= domain (:domain message))) :domain-mismatch
+    (and uri (not= uri (:uri message))) :uri-mismatch
+    (and nonce (not= nonce (:nonce message))) :nonce-mismatch
+    (and chain-ids (not (contains? (set (map str chain-ids)) (:chain-id message))))
+    :chain-id-mismatch
+    :else nil))
+
+(defn principal-did
+  "CAIP-10-backed DID for the Ethereum account a valid SIWE session proves."
+  [{:keys [chain-id address]}]
+  (str "did:pkh:eip155:" chain-id ":" (str/lower address)))

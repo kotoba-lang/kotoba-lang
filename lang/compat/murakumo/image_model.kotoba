@@ -1,0 +1,101 @@
+(ns murakumo.image-model
+  "Register, qualify and publish a prepared image model through the fleet API.
+   Credentials come only from the operator's environment."
+  (:require [kotoba.lang.text :as str] ["fs" :as fs] ["child_process" :as child] ["node:crypto" :as crypto]))
+(def api "https://api.murakumo.cloud")
+(defn plan [manifest]
+  {:id (:id manifest) :sites (:sites manifest) :applied false
+   :steps ["register immutable model profile" "require two ready replicas"
+           "render canaries or verify supplied completed jobs" "publish to shared site catalog"]
+   :prerequisite "Install and qualify pinned weights on two compatible GPU workers before applying."})
+(defn sleep! [ms] (js/Promise. (fn [resolve _] (js/setTimeout resolve ms))))
+(defn request!
+  ([token method path body] (request! token method path body 0))
+  ([token method path body attempt]
+  (-> (.fetch js/globalThis (str api path)
+        (clj->js (cond-> {:method method :signal (js/AbortSignal.timeout 30000)
+                         :headers {"authorization" (str "Bearer " token) "content-type" "application/json"}}
+                   body (assoc :body (js/JSON.stringify (clj->js body))))))
+      (.then (fn [r]
+               (-> (.json r)
+                   (.then (fn [b]
+                            (let [b (js->clj b :keywordize-keys true)]
+                              (if (.-ok r) b
+                                (throw (ex-info (or (get-in b [:error :code]) "image_model_request_failed") {:status (.-status r)})))))))))
+      (.catch (fn [e]
+                ;; Registration, publication and UUID submissions are idempotent.
+                ;; Preserve the exact request when retrying a transient failure.
+                (if (and (< attempt 2)
+                         (or (contains? #{408 429 500 502 503 504}
+                                        (or (:status (ex-data e)) (:status (ex-data (ex-cause e)))))
+                             (contains? #{"TypeError" "TimeoutError" "AbortError"} (.-name e))))
+                  (-> (sleep! (* 1000 (inc attempt)))
+                      (.then #(request! token method path body (inc attempt))))
+                  (throw e)))))))
+(defn await-job! [token id network deadline]
+  (-> (request! token "GET" (str "/infer/image-jobs/" id "?network=" network) nil)
+      (.then (fn [job]
+               (cond (= "done" (:status job)) id
+                     (= "failed" (:status job)) (throw (js/Error. "image_canary_failed"))
+                     (> (js/Date.now) deadline) (throw (js/Error. "image_canary_timeout"))
+                     :else (-> (sleep! 10000) (.then #(await-job! token id network deadline))))))))
+(defn canary! [token model index network]
+  (let [id (crypto/randomUUID)]
+    (-> (request! token "POST" "/infer/image-jobs"
+          {:id id :network network :lane "go" :model model
+           :prompt (str "Studio photograph of a " (if (zero? index) "blue ceramic bowl" "red ceramic vase") " on a wooden table, soft daylight, no text")
+           :publication_consent "public-examples-v1"})
+        (.then #(await-job! token id network (+ (js/Date.now) 5400000))))))
+(defn publish-ready! [token id sites proofs deadline]
+  (-> (request! token "POST" (str "/infer/image-models/" (js/encodeURIComponent id) "/publish")
+                {:sites sites :proof_jobs proofs})
+      (.catch (fn [e]
+                ;; A completed upload can precede the next 15-second heartbeat.
+                ;; Retry this readiness race with the same proofs, never rerender.
+                (if (and (= "proof_workers_not_ready" (.-message e)) (< (js/Date.now) deadline))
+                  (-> (sleep! 5000) (.then #(publish-ready! token id sites proofs deadline)))
+                  (throw e))))))
+(defn apply! [manifest proofs]
+  (let [token (or (aget js/process.env "MURAKUMO_SERVICE_TOKEN") (aget js/process.env "MURAKUMO_OPERATOR_TOKEN"))
+        id (:id manifest)]
+    (if (str/blank? token)
+      (js/Promise.reject (js/Error. "operator_credential_missing"))
+      (-> (request! token "POST" (str "/infer/image-models/" (js/encodeURIComponent id)) manifest)
+          (.then #(request! token "GET" "/infer/image-jobs/capacity" nil))
+          (.then (fn [capacity]
+                   (when-not (>= (:ready (first (filter #(= id (:model %)) (:models capacity))) 0) 2)
+                     (throw (js/Error. "two_ready_image_replicas_required")))
+                   (if (seq proofs) proofs
+                     (let [network (apply str (repeat 2 (str/replace (crypto/randomUUID) "-" "")))]
+                       (-> (js/Promise.all (clj->js (map #(canary! token id % network) (range 2))))
+                           (.then vec))))))
+          (.then #(publish-ready! token id (:sites manifest) % (+ (js/Date.now) 180000)))
+          (.then (fn [published]
+                   (-> (js/Promise.all (clj->js (map (fn [site] (request! token "GET" (str "/infer/image-models?site=" site) nil)) (:sites manifest))))
+                       (.then (fn [catalogs]
+                                (when-not (every? #(some (fn [m] (= id (:id m))) (:models %)) catalogs)
+                                  (throw (js/Error. "site_catalog_verification_failed")))
+                                (assoc published :applied true))))))))))
+(defn tool [args]
+  ;; The stdio MCP dispatcher is synchronous. Run the same asynchronous workflow
+  ;; in a child, with credentials inherited through env rather than arguments.
+  (let [r (.spawnSync child (or (aget js/process.env "MURAKUMO_KBB") "kbb")
+                      #js ["--backend" "sci" "scripts/image-model.cljk" "--stdin"]
+                      #js {:encoding "utf8" :input (js/JSON.stringify (clj->js args)) :timeout 6000000 :maxBuffer 1048576})]
+    (if (.-error r) {:error "image_model_runner_unavailable"}
+      (try (js->clj (js/JSON.parse (.-stdout r)) :keywordize-keys true)
+           (catch :default _ {:error "image_model_runner_failed"})))))
+(defn -main [& args]
+  (try
+    (let [opts (if (= "--stdin" (first args))
+                 (js->clj (js/JSON.parse (.readFileSync fs 0 "utf8")) :keywordize-keys true)
+                 {:manifest (js->clj (js/JSON.parse (.readFileSync fs (first args) "utf8")) :keywordize-keys true)
+                  :apply (boolean (some #{"--apply"} args))
+                  :proof_jobs (when-let [i (first (keep-indexed #(when (= "--proof-jobs" %2) %1) args))]
+                                (str/split (nth args (inc i)) #","))})
+          done #(println (js/JSON.stringify (clj->js %)))]
+      (if (:apply opts)
+        (-> (apply! (:manifest opts) (:proof_jobs opts)) (.then done)
+            (.catch (fn [e] (done {:error (.-message e) :applied false}) (set! (.-exitCode js/process) 1))))
+        (done (plan (:manifest opts)))))
+    (catch :default _ (println "{\"error\":\"invalid_image_model_arguments\",\"applied\":false}") (set! (.-exitCode js/process) 1))))

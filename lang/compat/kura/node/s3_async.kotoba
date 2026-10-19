@@ -1,0 +1,154 @@
+(ns kura.node.s3-async
+  "The S3-compatible shard store, on the async contract.
+
+  `kura.node.s3` shapes and signs requests — that part is pure `.cljc` and
+  correct. What was wrong was its *store*: it implemented the synchronous
+  `IShardStore` and therefore only worked with a synchronous transport, which
+  no real host has. That store is left in place for a genuinely blocking
+  transport and for the request-shaping tests; **this is the one to use.**
+
+  It matters more than it sounds. R2 through a Worker binding needs no HTTP at
+  all, so `kura.node.r2` covers a single-provider fleet. But a single provider
+  is a single failure domain, and the whole durability argument
+  (ADR-2607299200 section 1) needs shards spread across providers that fail
+  independently. Reaching another provider means HTTP, HTTP means async, and
+  async means this namespace. **Without it there is no multi-provider fleet,
+  and without a multi-provider fleet the storage multiplier buys nothing.**
+
+  Transport and crypto stay injected, as in `kura.node.s3` — this adds the
+  promise chaining and the response handling, nothing else."
+  (:require [kotoba.lang.text :as str]
+            [kura.node.async :as async]
+            [kura.node.s3 :as s3]
+            [kura.node.store :as store]))
+
+(defn- shard-key [prefix shard-id]
+  (str (when (seq prefix) (str (str/replace prefix #"/+$" "") "/")) shard-id))
+
+(defn- ok? [{:keys [status]}] (and status (<= 200 status 299)))
+
+(defn- send>
+  "Sign and send, returning a promise of the response map."
+  [{:keys [http crypto key-id secret region service endpoint host bucket now-fn]}
+   method key {:keys [body headers query]}]
+  (let [body (or body (js/Uint8Array. 0))
+        path (s3/object-path bucket key)
+        q (s3/canonical-query query)
+        signed (s3/sign {:crypto crypto :key-id key-id :secret secret
+                         :region region :service (or service "s3") :host host
+                         :method method :path path :query q :body body
+                         :now-iso (now-fn)})]
+    (js/Promise.resolve
+     (s3/-request http {:method method
+                        :url (str endpoint path (when (seq q) (str "?" q)))
+                        :headers (merge signed headers)
+                        :body body}))))
+
+(defn- parse-keys
+  "Keys out of a ListObjectsV2 body, without an XML parser.
+
+  A Worker has no DOMParser and pulling one in for `<Key>` would be a
+  dependency to carry forever. The regex is enough because the shape is fixed
+  by the S3 API and the values are our own shard ids, which
+  `store/valid-shard-id?` already constrains to a character set with no XML
+  metacharacters in it — so there is nothing here for an entity or a CDATA
+  section to hide in."
+  [u8]
+  (let [txt (.decode (js/TextDecoder.) u8)]
+    (mapv second (re-seq #"<Key>([^<]+)</Key>" txt))))
+
+(defrecord AsyncS3Store [cfg desc]
+  async/IAsyncShardStore
+  (-put-shard!> [_ shard-id bytes]
+    (if-not (store/valid-shard-id? shard-id)
+      (js/Promise.reject (js/Error. (str "bad shard id: " shard-id)))
+      (-> (send> cfg :put (shard-key (:prefix cfg) shard-id) {:body bytes})
+          (.then (fn [resp]
+                   (if (ok? resp)
+                     {:shard-id shard-id :bytes-written (.-length ^js bytes)}
+                     (throw (js/Error. (str "put failed: " (:status resp))))))))))
+
+  (-get-shard> [_ shard-id]
+    (-> (send> cfg :get (shard-key (:prefix cfg) shard-id) {})
+        (.then (fn [resp] (when (ok? resp) (:body resp))))))
+
+  (-get-range> [_ shard-id offset length]
+    ;; A real Range header. A backend that reads the whole shard and slices
+    ;; gives back the entire benefit of the systematic layout (section 7).
+    (-> (send> cfg :get (shard-key (:prefix cfg) shard-id)
+               {:headers {"range" (str "bytes=" offset "-" (+ offset length -1))}})
+        (.then (fn [resp]
+                 ;; 206 for a served range, 200 when the service ignored the
+                 ;; header and sent everything — which some S3-compatible
+                 ;; services do. Clipping here keeps the contract honest even
+                 ;; then, and `:range-read` in the descriptor stays a claim the
+                 ;; conformance run checks rather than one we assume.
+                 (when (ok? resp)
+                   (let [b (:body resp)]
+                     (if (= 200 (:status resp))
+                       (.slice ^js b offset (+ offset length))
+                       b)))))))
+
+  (-delete-shard!> [_ shard-id]
+    (let [k (shard-key (:prefix cfg) shard-id)]
+      ;; S3 DELETE is 204 whether or not the key existed, so "did this remove
+      ;; something" needs a prior HEAD — a repair scheduler that cannot tell a
+      ;; deleted shard from an absent one cannot tell a drain from a no-op.
+      (-> (send> cfg :head k {})
+          (.then (fn [h]
+                   (if (ok? h)
+                     (-> (send> cfg :delete k {}) (.then (fn [_] true)))
+                     false))))))
+
+  (-list-shards> [_ p]
+    (let [full (shard-key (:prefix cfg) (or p ""))]
+      (-> (send> cfg :get "" {:query {"list-type" "2" "prefix" full}})
+          (.then (fn [resp]
+                   (if (ok? resp)
+                     (->> (parse-keys (:body resp))
+                          (map #(str/replace % (re-pattern (str "^" (:prefix cfg) "/")) ""))
+                          ;; Re-filtered on this side: "S3-compatible" is a
+                          ;; claim, not a conformance result, and a service
+                          ;; that accepts `prefix` and ignores it would have
+                          ;; the audit tree commit to shards this node does
+                          ;; not hold.
+                          (filter #(str/starts-with? % (or p "")))
+                          sort
+                          vec)
+                     []))))))
+
+  (-shard-size> [_ shard-id]
+    (-> (send> cfg :head (shard-key (:prefix cfg) shard-id) {})
+        (.then (fn [resp]
+                 (when (ok? resp)
+                   (some-> (get-in resp [:headers "content-length"]) js/parseInt))))))
+
+  store/INodeIdentity
+  (-descriptor [_] desc))
+
+(defn open
+  "Open an async S3-compatible shard store.
+
+  `:independence` and `:failure-domain` are required and have no default —
+  and here they carry the weight, because this is the namespace that exists to
+  put shards somewhere the other provider's outage does not reach."
+  [{:keys [node-id independence availability failure-domain endpoint host bucket region
+           key-id secret prefix http crypto now-fn service]
+    :or {prefix "kura" region "us-east-1" service "s3"}}]
+  (assert (and http crypto) "http and crypto must be injected")
+  (assert now-fn "now-fn must be injected")
+  (assert (and endpoint host bucket) "endpoint, host and bucket are required")
+  (->AsyncS3Store
+   {:http http :crypto crypto :key-id key-id :secret secret
+    :region region :service service :endpoint endpoint :host host
+    :bucket bucket :prefix prefix :now-fn now-fn}
+   (store/descriptor
+    {:node-id node-id
+     :failure-domain failure-domain
+     :independence independence
+     ;; NOT baked in. S3 is a protocol, not a provider: B2 and AWS are
+     ;; always-on because that is what the bill buys, but MinIO on somebody's
+     ;; laptop speaks the same interface and is not. Assuming the rented case
+     ;; would silently promise reachability for the self-hosted one.
+     :availability availability
+     :capabilities #{:range-read :list :delete :size-without-read :durable-put}})))

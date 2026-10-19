@@ -1,0 +1,153 @@
+(ns kotoba.security.key-lifecycle
+  "Key-register shape checks and signer trust decisions (R-002).
+
+  Production public keys may be recorded; private material must never appear
+  in the register or evidence tree (docs/key-lifecycle.md, docs/key-ops-kagi.md)."
+  {:kotoba/export [check-register check-signer-for-new-artifact emit-alert find-key key-entry-error known-intents known-statuses known-storage register-error required-key-fields signer-trust-error untrusted-for-new-artifacts]}
+  (:require [kotoba.lang.text :as str]
+            [kotoba.security.crypto-policy :as policy]))
+
+;; clojure.core/some, spelled as the loop it is. In Kotoba `some` is the
+;; option constructor and a two-argument `(some pred coll)` is refused as a
+;; name collision (kotoba-sema frontend); this is the same definition as
+;; clojure.core/some -- the first logical-true (pred x), in order, stopping
+;; there -- so the host answer is unchanged on nbb and the JVM.
+(defn- first-truthy [pred coll]
+  (loop [s (seq coll)]
+    (when s
+      (or (pred (first s)) (recur (next s))))))
+
+(def known-statuses
+  #{:pre-active :active :suspended :retired :destroyed :compromised :revoked})
+
+(def known-intents
+  #{:research-demo :production :staging})
+
+(def known-storage
+  #{:placeholder :kagi :hsm :kms :file-dev-only})
+
+(def required-key-fields
+  [:key/id :key/class :key/algorithm :key/status :key/owner :key/created-at
+   :key/storage :key/pq-status])
+
+(defn- pem-private-block?
+  [s]
+  (let [header #(str "BEGIN " % "PRIVATE KEY")]
+    (and (string? s)
+         (first-truthy #(str/includes? s (header %))
+               ["" "OPENSSH " "EC " "RSA "]))))
+
+(defn key-entry-error
+  [entry]
+  (or
+   (policy/missing-key entry required-key-fields "missing required key-register field")
+   (when-not (string? (:key/id entry))
+     (policy/invalid "key id string required" {:value (:key/id entry)}))
+   (when-not (keyword? (:key/class entry))
+     (policy/invalid "key class keyword required" {:value (:key/class entry)}))
+   (when-not (contains? known-statuses (:key/status entry))
+     (policy/invalid "unknown key status"
+                     {:value (:key/status entry) :allowed known-statuses}))
+   (when-not (contains? known-storage (:key/storage entry))
+     (policy/invalid "unknown key storage"
+                     {:value (:key/storage entry) :allowed known-storage}))
+   (when (and (contains? entry :key/intent)
+              (not (contains? known-intents (:key/intent entry))))
+     (policy/invalid "unknown key intent"
+                     {:value (:key/intent entry) :allowed known-intents}))
+   (when (and (= :production (:key/intent entry))
+              (= :active (:key/status entry))
+              (nil? (:key/public entry))
+              (nil? (:key/did entry)))
+     (policy/invalid "active production key requires :key/public or :key/did"
+                     {:id (:key/id entry)}))
+   (when (and (= :kagi (:key/storage entry))
+              (not (string? (:key/kagi-name entry))))
+     (policy/invalid "kagi storage requires :key/kagi-name" {:id (:key/id entry)}))
+   (when (or (pem-private-block? (:key/public entry))
+             (pem-private-block? (:key/notes entry))
+             (pem-private-block? (:key/material entry)))
+     (policy/invalid "private key material forbidden in key-register"
+                     {:id (:key/id entry)}))))
+
+(defn register-error
+  [register]
+  (or
+   (when-not (= :kotoba.security/key-register (:register/type register))
+     (policy/invalid "key register type required"
+                     {:value (:register/type register)}))
+   (when-not (= 1 (:register/version register))
+     (policy/invalid "key register version 1 required"
+                     {:value (:register/version register)}))
+   (when-not (seq (:keys register))
+     (policy/invalid "key register entries required" {}))
+   (when-not (apply distinct? (map :key/id (:keys register)))
+     (policy/invalid "key ids must be distinct"
+                     {:ids (mapv :key/id (:keys register))}))
+   (first-truthy key-entry-error (:keys register))))
+
+(defn check-register
+  "Structural + safety validation of registers/key-register.edn.
+  Returns {:valid? true} or {:valid? false :message .. :data ..}."
+  [register]
+  (if-let [error (register-error register)]
+    error
+    {:valid? true}))
+
+(defn find-key
+  [register key-id]
+  (first-truthy #(when (= key-id (:key/id %)) %) (:keys register)))
+
+(def untrusted-for-new-artifacts
+  "Statuses that must not sign/wrap new artifacts (docs/key-lifecycle.md)."
+  #{:pre-active :suspended :retired :destroyed :compromised :revoked})
+
+(defn signer-trust-error
+  "Reject new-artifact use of untrusted keys (R-002 technical gate)."
+  [register key-id]
+  (let [entry (find-key register key-id)]
+    (cond
+      (nil? entry)
+      (policy/invalid "signer key not in register" {:key/id key-id})
+
+      (contains? untrusted-for-new-artifacts (:key/status entry))
+      (policy/invalid "signer key not trusted for new artifacts"
+                      {:key/id key-id
+                       :key/status (:key/status entry)
+                       :key/class (:key/class entry)})
+
+      (not= :active (:key/status entry))
+      (policy/invalid "signer key not active"
+                      {:key/id key-id :key/status (:key/status entry)})
+
+      :else nil)))
+
+(defn check-signer-for-new-artifact
+  "Returns {:valid? true} when key-id may sign a new artifact."
+  [register key-id]
+  (if-let [error (signer-trust-error register key-id)]
+    error
+    {:valid? true}))
+
+(defn emit-alert
+  "Build a continuous-monitoring.md structured alert map (EDN-friendly)."
+  [{:keys [alert severity signal source run-id component package key-id
+           reason policy decision evidence-id observed-at extra]
+    :or {extra {}}}]
+  (merge
+   {:alert/id (str alert "-" (or run-id "local"))
+    :alert/name alert
+    :alert/severity severity
+    :alert/signal signal
+    :alert/source source
+    :alert/observed-at observed-at
+    :alert/run-id run-id
+    :alert/component component
+    :alert/package package
+    :alert/key-id key-id
+    :alert/reason reason
+    :alert/policy policy
+    :alert/decision decision
+    :alert/evidence-id evidence-id
+    :alert/schema "kotoba.security.continuous-monitoring/v1"}
+   extra))

@@ -1,0 +1,164 @@
+(ns kotoba.verifier.linux-static
+  "Verify a loader-less Linux static ELF (superproject adr-2609251400 C2):
+  the same code bytes the verifier already re-derives for a kexe, plus a
+  prelude re-derived from the same data.
+
+  A static ELF is two things glued together, and each half is checked by
+  re-deriving it rather than by reading what the image says about itself:
+
+    code     `kotoba.verifier/verify-artifact!` re-emits the artifact's code
+             from its closed program and compares bytes -- unchanged from the
+             kexe path. The image must then carry exactly those bytes, at the
+             offset the re-derived layout puts them.
+    prelude  kotoba-native `kotoba.native.linux-static/package` is a pure
+             function of the sealed artifact and the native profile of
+             kotoba-lang lang/limits.edn. It is run again here and the image
+             must be byte-identical to its answer. A prelude that differs in
+             one byte -- a budget, a slot pointer, an exit code, a syscall --
+             is refused, and the first differing offset is named.
+
+  Independently of the packager, the ELF is parsed here and held to the
+  properties the target promises: ET_EXEC for the target's machine, no
+  PT_INTERP, no PT_DYNAMIC, exactly two PT_LOADs, no segment both writable
+  and executable, the entry inside the executable segment, and the context's
+  version and fuel words equal to what the artifact seals. Those do not
+  depend on the packager being right, which is the point of stating them."
+  {:kotoba/export [image-facts verify-image!]}
+  (:require [kotoba.verifier :as verifier]
+            [kotoba.native.linux-static :as linux-static]))
+
+(defn- num [n] )
+
+(defn- u
+  "Unsigned little-endian integer of `width` bytes at `offset`. Exact below
+  2^53 on both hosts, which covers every address, size and fuel word an
+  admitted image holds (fuel is bounded at 2^53-1)."
+  [bytes offset width]
+  (reduce (fn [acc i] (+ (* acc 256) (nth bytes (+ offset i))))
+          0 (range (dec width) -1 -1)))
+
+(defn image-facts
+  "The ELF header and program headers of `bytes`, parsed without the
+  packager's help."
+  [bytes]
+  (when-not (and (>= (count bytes) 64)
+                 (= [0x7f 0x45 0x4c 0x46 2 1 1] (subvec bytes 0 7)))
+    (throw (ex-info "not a little-endian ELF64 image"
+                    {:phase :verify :reason :not-elf64})))
+  (let [phoff (u bytes 32 8) phnum (u bytes 56 2) phentsize (u bytes 54 2)]
+    (when-not (= 56 phentsize)
+      (throw (ex-info "ELF64 program header size is not 56"
+                      {:phase :verify :reason :phentsize :phentsize phentsize})))
+    {:type (u bytes 16 2) :machine (u bytes 18 2) :entry (u bytes 24 8)
+     :segments (mapv (fn [i]
+                       (let [o (+ phoff (* 56 i))]
+                         {:type (u bytes o 4) :flags (u bytes (+ o 4) 4)
+                          :offset (u bytes (+ o 8) 8) :address (u bytes (+ o 16) 8)
+                          :file-size (u bytes (+ o 32) 8) :memory-size (u bytes (+ o 40) 8)}))
+                     (range phnum))}))
+
+(def ^:private machines {:x86_64-linux-static-kotoba-v1 0x3e
+                         :aarch64-linux-static-kotoba-v1 0xb7})
+
+(defn- refuse [message data]
+  (throw (ex-info message (assoc data :phase :verify))))
+
+(defn- first-difference [a b]
+  (or (first (filter #(not= (nth a %) (nth b %)) (range (min (count a) (count b)))))
+      (min (count a) (count b))))
+
+(defn- granted-ids
+  "The wire ids whose bits are set in the 256-bit allow mask at `offset`."
+  [bytes offset]
+  (set (for [i (range 32) b (range 8)
+             :when (odd? (quot (nth bytes (+ offset i)) (nth [1 2 4 8 16 32 64 128] b)))]
+         (+ (* 8 i) b))))
+
+(defn verify-image!
+  "Verify `image` (the bytes `amu compile --target *-linux-static` wrote) as
+  the static ELF of `artifact` under `profile` (`(:profile/native
+  limits-table)`) and `options` -- what it was packaged with: the sealed
+  handler-decision artifacts, and the grant, fs scope and :process/spawn
+  grant the compile policy named (superproject adr-2609251400 C3; the spawn
+  grant since its second half -- its programs are sealed into the text, so
+  the byte-for-byte re-derivation below holds them too). Returns a report; refuses with
+  `:phase :verify` and a `:reason`.
+
+  With capability effects, three more things are re-derived rather than
+  read: each handler artifact's code from ITS closed program
+  (`verify-artifact!`, as for the guest), and the image must carry exactly
+  those bytes where the layout puts them; and the grant sealed in the
+  context's allow mask must be a subset of the effects the artifact declares
+  (the compile policy admitted each of those), independently of the packager
+  that wrote it."
+  ([artifact image profile] (verify-image! artifact image profile {}))
+  ([artifact image profile options]
+  (verifier/verify-artifact! artifact)
+  (doseq [[which handler] (:handlers options)]
+    (try (verifier/verify-artifact! handler)
+         (catch :default e
+           (refuse "a linux-static handler artifact does not verify"
+                   {:reason :handler-artifact :handler which :cause (ex-message e)}))))
+  (let [target (:target artifact)
+        machine (get machines target)
+        _ (when-not machine
+            (refuse "not a linux-static artifact" {:reason :not-linux-static :target target}))
+        image (mapv #(bit-and (num %) 0xff) image)
+        expected (linux-static/package artifact profile options)
+        want (:bytes expected)]
+    (when-not (= want image)
+      (refuse "static ELF does not re-derive from its artifact and the native profile"
+              {:reason :image-not-rederived :offset (first-difference want image)
+               :expected-size (count want) :actual-size (count image)}))
+    (let [{:keys [type entry segments] found-machine :machine} (image-facts image)
+          loads (filter #(= 1 (:type %)) segments)
+          text (first (filter #(= 5 (:flags %)) loads))
+          data (first (filter #(= 6 (:flags %)) loads))
+          code (mapv #(bit-and (num %) 0xff) (:code artifact))
+          code-offset (:code-offset expected)
+          context-offset (:data-offset expected)
+          fuel-offset (num (get-in artifact [:context-abi :fuel-offset]))]
+      (when-not (= 2 type) (refuse "static ELF is not ET_EXEC" {:reason :not-executable :type type}))
+      (when-not (= machine found-machine)
+        (refuse "static ELF machine does not match the target" {:reason :machine :machine found-machine}))
+      (when-let [bad (seq (filter #(contains? #{2 3} (:type %)) segments))]
+        (refuse "static ELF carries an interpreter or a dynamic section"
+                {:reason :dynamic-image :segments (vec bad)}))
+      (when-not (= 2 (count loads))
+        (refuse "static ELF must have exactly two loadable segments" {:reason :segments :loads (count loads)}))
+      (when (some #(= 3 (bit-and (:flags %) 3)) loads)
+        (refuse "static ELF has a writable and executable segment" {:reason :write-execute}))
+      (when-not (and text data)
+        (refuse "static ELF segments are not one R+X text and one RW data" {:reason :segment-permissions}))
+      (when-not (and (<= (:address text) entry) (< entry (+ (:address text) (:file-size text))))
+        (refuse "static ELF entry is outside its text" {:reason :entry-outside-text :entry entry}))
+      (when-not (= code (subvec image code-offset (+ code-offset (count code))))
+        (refuse "static ELF does not carry the artifact's code bytes" {:reason :code-bytes}))
+      (when-not (= 11 (u image context-offset 8))
+        (refuse "static ELF context is not ABI v11" {:reason :context-version}))
+      (when-not (= (num (get-in artifact [:fuel-abi :initial])) (u image (+ context-offset fuel-offset) 8))
+        (refuse "static ELF fuel word is not the artifact's" {:reason :fuel-word}))
+      ;; The capability calls only: a pure ability (:state, :abort) is a row
+      ;; member with no wire id and no grant bit (kotoba-native linux-static
+      ;; `pure-ability-effects`; gap 4 of the selfhost foundation, 2026-09-26
+      ;; -- `(num (second :abort))` was a host TypeError here).
+      (let [effects (into #{} (keep (fn [e] (when (and (vector? e) (= :cap/call (first e)))
+                                               (num (second e)))))
+                          (:effects artifact))
+            granted (granted-ids image (+ context-offset
+                                          (num (get-in artifact [:context-abi :allow-bitmap-offset]))))]
+        (when-let [wider (seq (remove effects granted))]
+          (refuse "static ELF grants a capability its artifact does not declare"
+                  {:reason :grant-widens-effects :wire-ids (vec (sort wider))})))
+      (doseq [{:keys [which address size]} (:decision-code expected)]
+        (let [code (mapv #(bit-and (num %) 0xff) (:code (get (:handlers options) which)))]
+          (when-not (and (= size (count code)) (= code (subvec image address (+ address size))))
+            (refuse "static ELF does not carry the handler decision code" {:reason :handler-code-bytes
+                                                                          :handler which}))))
+      {:ok true :target target :bytes (count image)
+       :code-offset code-offset :code-bytes (count code)
+       :prelude-bytes (:prelude-size expected)
+       :budgets (:budgets expected) :fuel (:fuel expected) :slots (:slots expected)
+       :grant (:grant expected) :fs-scope (:fs-scope expected)
+       :spawn (:spawn expected)
+       :decision-code (:decision-code expected)}))))

@@ -1,0 +1,168 @@
+(ns kotoba.security.resilience
+  "Portable compromise telemetry and destructive-restore drill primitives."
+  {:kotoba/export [append-remote-telemetry! append-telemetry contain! containment-order destructive-restore-drill! evaluate-restore-receipt evaluate-threshold-recovery qualify-backup-sites telemetry-valid?]})
+
+(defn append-telemetry
+  "Append one hash-linked immutable event. DIGEST-FN hashes canonical caller
+  bytes; ENCODE-FN must deterministically encode plain EDN."
+  [events event encode-fn digest-fn]
+  (let [previous (:telemetry/hash (peek events))
+        entry (assoc event :telemetry/index (count events)
+                     :telemetry/previous-hash previous)
+        hash (digest-fn (encode-fn entry))]
+    (conj (vec events) (assoc entry :telemetry/hash hash))))
+
+(defn telemetry-valid? [events encode-fn digest-fn]
+  (loop [remaining events index 0 previous nil]
+    (if-let [entry (first remaining)]
+      (let [plain (dissoc entry :telemetry/hash)]
+        (and (= index (:telemetry/index entry))
+             (= previous (:telemetry/previous-hash entry))
+             (= (:telemetry/hash entry) (digest-fn (encode-fn plain)))
+             (recur (next remaining) (inc index) (:telemetry/hash entry))))
+      true)))
+
+(defn append-remote-telemetry!
+  [{:keys [events event encode-fn digest-fn append-fn verify-ack-fn]}]
+  (let [next-events (append-telemetry events event encode-fn digest-fn)
+        entry (peek next-events)
+        ack (append-fn entry)
+        accepted? (and (= (:telemetry/hash entry) (:telemetry/hash ack))
+                       (= true (:telemetry/immutable? ack))
+                       (= true (:telemetry/remote? ack))
+                       (true? (verify-ack-fn ack)))]
+    (when-not accepted?
+      (throw (ex-info "remote immutable telemetry acknowledgement required"
+                      {:acknowledgement ack})))
+    {:telemetry/events next-events :telemetry/acknowledgement ack}))
+
+(def containment-order
+  [:isolate-workload :revoke-credentials :freeze-writes
+   :capture-evidence :restore-known-clean :verify])
+
+(defn contain! [actions]
+  (loop [remaining containment-order receipts []]
+    (if-let [step (first remaining)]
+      (let [action (get actions step)
+            receipt (when (ifn? action) (action))]
+        (if (= :passed (:status receipt))
+          (recur (next remaining) (conj receipts (assoc receipt :step step)))
+          {:containment/status :failed :containment/failed-step step
+           :containment/receipts receipts}))
+      {:containment/status :passed :containment/receipts receipts})))
+
+(defn qualify-backup-sites [backups]
+  (let [regions (set (map :backup/region backups))
+        failures (cond-> []
+                   (< (count regions) 2) (conj :independent-regions)
+                   (some #(not= true (:backup/encrypted? %)) backups)
+                   (conj :encryption)
+                   (some #(not= true (:backup/immutable? %)) backups)
+                   (conj :immutability)
+                   (some #(not (string? (:backup/artifact-digest %))) backups)
+                   (conj :artifact-digest))]
+    {:backup/qualified? (empty? failures)
+     :backup/regions regions :backup/violations failures}))
+
+(defn evaluate-threshold-recovery
+  "Validate distinct-custodian threshold recovery across failure domains.
+
+  Share material is never accepted here; callers provide only public operation
+  results and identifiers. Duplicate custodians cannot satisfy the threshold."
+  [{:keys [threshold shares]}]
+  (let [successful (filter #(= true (:share/unwrap-verified? %)) shares)
+        member-ids (map :share/member-id successful)
+        regions (set (map :share/region successful))
+        violations
+        (cond-> []
+          (not (pos-int? threshold)) (conj :threshold)
+          (some nil? member-ids) (conj :member-id)
+          (not= (count member-ids) (count (set member-ids)))
+          (conj :duplicate-member)
+          (or (not (pos-int? threshold)) (< (count successful) threshold))
+          (conj :insufficient-shares)
+          (< (count regions) 2) (conj :independent-regions)
+          (some #(not= true (:share/hardware-protected? %)) successful)
+          (conj :hardware-protection))]
+    {:threshold-recovery/qualified? (empty? violations)
+     :threshold-recovery/threshold threshold
+     :threshold-recovery/members (set member-ids)
+     :threshold-recovery/regions regions
+     :threshold-recovery/violations violations}))
+
+(defn destructive-restore-drill!
+  "Destroy TARGET, restore from independently located encrypted backups and
+  verify the recovered digest. Times are injected monotonic milliseconds.
+  RESTORE-FN decrypts one selected backup; DIGEST-FN hashes restored data."
+  [{:keys [target backups restore-fn digest-fn clock-ms failure-at-ms
+           checkpoint-at-ms rto-limit-ms rpo-limit-ms]}]
+  (let [sites (set (map :backup/site backups))
+        eligible (filter #(and (:backup/encrypted? %)
+                               (:backup/immutable? %)
+                               (:backup/artifact %)
+                               (:backup/digest %)) backups)
+        expected-digests (set (map :backup/digest eligible))]
+    (when-not (and (>= (count sites) 2) (= (count backups) (count eligible))
+                   (= 1 (count expected-digests)))
+      (throw (ex-info "independent encrypted backups required"
+                      {:sites sites :backup-count (count backups)})))
+    (let [started (clock-ms)
+          _ (reset! target {})
+          destroyed? (empty? @target)
+          restored (restore-fn (first eligible))
+          _ (reset! target restored)
+          ended (clock-ms)
+          rto-ms (- ended started)
+          rpo-ms (- failure-at-ms checkpoint-at-ms)
+          digest-ok? (= (first expected-digests) (digest-fn @target))
+          passed? (and destroyed? digest-ok?
+                       (<= rto-ms rto-limit-ms) (<= rpo-ms rpo-limit-ms))]
+      {:restore-drill/status (if passed? :passed :failed)
+       :restore-drill/destructive? destroyed?
+       :restore-drill/sites sites
+       :restore-drill/backups-encrypted? true
+       :restore-drill/backups-immutable? true
+       :restore-drill/artifact-digest (first expected-digests)
+       :restore-drill/digest-verified? digest-ok?
+       :restore-drill/rto-ms rto-ms :restore-drill/rpo-ms rpo-ms
+       :restore-drill/rto-limit-ms rto-limit-ms
+       :restore-drill/rpo-limit-ms rpo-limit-ms})))
+
+(defn evaluate-restore-receipt
+  "Validate operational restore evidence before a release or promotion gate.
+
+  Signature, authority, freshness, and environment are deliberately verified
+  by qualification/verify-signed-receipt; this function validates the drill's
+  recovery semantics and artifact binding."
+  [receipt expected-artifact-digest]
+  (let [rto (:restore-drill/rto-ms receipt)
+        rpo (:restore-drill/rpo-ms receipt)
+        rto-limit (:restore-drill/rto-limit-ms receipt)
+        rpo-limit (:restore-drill/rpo-limit-ms receipt)
+        violations
+        (cond-> []
+          (not= :passed (:restore-drill/status receipt)) (conj :status)
+          (not= true (:restore-drill/destructive? receipt)) (conj :destructive)
+          (< (count (set (:restore-drill/sites receipt))) 2)
+          (conj :independent-sites)
+          (not= true (:restore-drill/backups-encrypted? receipt))
+          (conj :encrypted-backups)
+          (not= true (:restore-drill/backups-immutable? receipt))
+          (conj :immutable-backups)
+          (not= true (:restore-drill/digest-verified? receipt))
+          (conj :digest-verification)
+          (not= expected-artifact-digest
+                (:restore-drill/artifact-digest receipt))
+          (conj :artifact-binding)
+          (not (and (number? rto) (number? rto-limit)
+                    (<= 0 rto rto-limit)))
+          (conj :rto)
+          (not (and (number? rpo) (number? rpo-limit)
+                    (<= 0 rpo rpo-limit)))
+          (conj :rpo))]
+    {:restore-drill/qualified? (empty? violations)
+     :restore-drill/violations violations
+     :restore-drill/artifact-digest (:restore-drill/artifact-digest receipt)
+     :restore-drill/sites (set (:restore-drill/sites receipt))
+     :restore-drill/rto-ms rto
+     :restore-drill/rpo-ms rpo}))

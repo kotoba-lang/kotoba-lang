@@ -1,0 +1,208 @@
+;; murakumo.infer.relay-worker — a native fleet node's client for the WSS work
+;; relay (murakumo.infer.relay-server). The counterpart to the browser tier's
+;; mobile_worker.cljs (cloud-murakumo), for the :native tier already described
+;; in murakumo.infer.join: this process dials OUT to a relay, advertises
+;; itself, and serves real local-model completions for queued jobs -- earning
+;; credits through the SAME ledger relay-server already settles browser-swarm
+;; jobs through (murakumo.infer.credits). No new token, no minting: this
+;; spends/earns the existing non-redeemable inference-credit ledger only.
+;;
+;;   bb murakumo infer join [relay-url=ws://localhost:8091/ws] --model <id> [--name <node>]
+;;
+;; Requires a local OpenAI-compatible /v1/chat/completions server already
+;; serving `--model`. WHAT IT REQUIRES IS THE PROTOCOL, NOT A PARTICULAR
+;; SERVER, and until 2026-09-09 this file said otherwise -- it named Ollama as
+;; the default and told the operator to `ollama pull`, and worse, it reported
+;; `engine: ollama` to the control plane no matter what was actually serving.
+;; A node running `kotoba-lang/inference`'s own Ollama-compatible surface, whose
+;; policy is Kotoba, enrolled as an Ollama node.
+;;
+;; The engine identity now comes from MURAKUMO_INFER_ENGINE and defaults to
+;; `openai-compatible`, which is the true requirement. This worker does not
+;; download models itself; use `kbb -M:murakumo model setup` (fleet/HF).
+;;
+;; SCOPE / KNOWN GAP (2026-07, own-fleet only): unlike media-postproc's
+;; proof-of-compute check in relay-server.clj, there is NO output verification
+;; for the `host-large-model` job kind this worker serves -- an adversarial
+;; worker could return garbage and still get credited. This worker is meant
+;; to be pointed at a relay YOU run, whose only other workers are also your
+;; own trusted fleet nodes. Do not point it at an open/public relay with
+;; untrusted peers without adding verification first.
+;;
+;; Identity: tries the fleet's real did:key derivation (MURAKUMO_OPERATOR_SEED
+;; + the kotoba binary + fleet.edn, same path core.clj uses for fleet nodes)
+;; first; falls back to a local unsigned placeholder (matching
+;; cloud-murakumo's mobile_worker.cljs `did:key:pending-<id>` convention,
+;; honestly, not pretending to be real crypto) when any of those aren't
+;; available -- so this also works standalone, off a machine that isn't in
+;; fleet.edn.
+
+(ns murakumo.infer.relay-worker
+  (:require [kotoba.lang.http.host.babashka :as http]
+            [babashka.http-client.websocket :as ws]
+            [babashka.process :as p]
+            [json.compat :as json]
+            [kotoba.lang.text :as str]
+            [murakumo.config :as config]
+            [murakumo.fleet :as fleet]
+            [murakumo.identity :as identity]
+            [murakumo.infer.join :as join]))
+
+(def ^:private default-relay-url "ws://localhost:8091/ws")
+(def ^:private default-local-url "http://localhost:11434/v1")
+(def job-kind
+  "The job :kind this worker serves -- matches :native tier's declared
+   :host-large-model capability in murakumo.infer.join/tiers."
+  "host-large-model")
+
+(defn parse-args
+  "['url' '--model' 'x' '--name' 'y'] -> {:relay-url 'url' :model 'x' :name 'y'}. Pure."
+  [args]
+  (loop [xs args, acc {}]
+    (if-let [a (first xs)]
+      (if (str/starts-with? a "--")
+        (recur (drop 2 xs) (assoc acc (keyword (subs a 2)) (second xs)))
+        (recur (rest xs) (assoc acc :relay-url a)))
+      acc)))
+
+(defn placeholder-did
+  "An honest unsigned placeholder identity (same convention as
+   cloud-murakumo's mobile_worker.cljs `did:key:pending-<id>` -- not real
+   Ed25519 crypto, deterministic per node-name). Pure."
+  [node-name]
+  (str "did:key:pending-" (identity/sha256-hex node-name)))
+
+(defn- real-did [node-name]
+  (try
+    (let [f (fleet/load-fleet)
+          seed (config/current-operator-seed f)
+          node-seed (identity/node-seed seed {:name node-name})
+          kotoba (config/kotoba-cli-bin)
+          {:keys [exit] :as result} (apply p/sh (identity/did-derive-argv kotoba node-seed))]
+      (when (zero? exit)
+        (not-empty (identity/did-from-command-result result))))
+    (catch Exception _ nil)))
+
+(defn- resolve-did
+  "Real fleet did:key when the operator seed + kotoba binary + fleet.edn are
+   all available; an honest unsigned placeholder otherwise (see ns docstring)."
+  [node-name]
+  (or (real-did node-name) (placeholder-did node-name)))
+
+(defn- local-hostname []
+  (-> (p/sh "hostname" "-s") :out str str/trim not-empty (or "murakumo-node")))
+
+(defn- local-mem-bytes
+  "macOS: sysctl hw.memsize. Linux fallback: /proc/meminfo. nil if neither works."
+  []
+  (or (let [{:keys [exit out]} (p/sh "sysctl" "-n" "hw.memsize")]
+        (when (zero? exit) (parse-long (str/trim out))))
+      (let [{:keys [exit out]} (p/sh "bash" "-c"
+                                     "awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo")]
+        (when (zero? exit) (parse-long (str/trim out))))))
+
+(defn- run-completion!
+  "One OpenAI-compatible /v1/chat/completions call against `local-url`.
+   Returns {:text :ms}, throws on transport/HTTP failure."
+  [local-url model prompt max-tokens]
+  (let [t0 (System/currentTimeMillis)
+        body (json/generate-string
+              {:model model
+               :messages [{:role "user" :content (str prompt)}]
+               :max_tokens (or max-tokens 512)})
+        resp (http/post (str local-url "/chat/completions")
+                        {:headers {"content-type" "application/json"}
+                         :body body
+                         :timeout 600000})
+        parsed (json/parse-string (:body resp) true)
+        text (get-in parsed [:choices 0 :message :content])]
+    (when-not text
+      (throw (ex-info "no completion in response" {:status (:status resp) :body (:body resp)})))
+    {:text text :ms (- (System/currentTimeMillis) t0)}))
+
+(defn handle-job
+  "job: {:job-id :kind :input}. Returns the :result reply map (never throws --
+   a failed job reports :output {:error ...} so the relay frees the lease
+   instead of leaking it to lease-expiry). Only the unsupported-:kind branch
+   is pure/unit-testable without a live local-url; the job-kind branch does
+   real HTTP I/O via run-completion!."
+  [local-url {:keys [job-id kind input]}]
+  (if (= kind job-kind)
+    (let [{:keys [model prompt max-tokens]} input]
+      (try
+        (let [{:keys [text ms]} (run-completion! local-url model prompt max-tokens)]
+          {:msg "result" :job-id job-id :output {:text text} :ms ms})
+        (catch Exception e
+          {:msg "result" :job-id job-id :output {:error (str (.getMessage e))} :ms 0})))
+    {:msg "result" :job-id job-id :output {:error (str "unsupported job kind: " kind)} :ms 0}))
+
+(defn -main [& args]
+  (let [{:keys [relay-url model], arg-name :name} (parse-args args)
+        relay-url (or relay-url default-relay-url)
+        local-url (config/infer-local-url)
+        node-name (or arg-name (config/infer-node-name) (local-hostname))]
+    (when (str/blank? (str model))
+      (println "usage: bb murakumo infer join [relay-url] --model <local-model-id> [--name <node>]")
+      (println "  local-model-id must already be served at" (str local-url "/chat/completions")
+               "by any OpenAI-compatible server (MURAKUMO_INFER_LOCAL_URL to override).")
+      (System/exit 1))
+    (let [did (resolve-did node-name)
+          mem-bytes (local-mem-bytes)
+          ;; What the control plane is told, and it used to be the literal
+          ;; `ollama` in both places -- an enrolment that described the
+          ;; operator's software rather than reporting it. `join/enrollment`
+          ;; takes `(or engine (:runtime t))`, so nothing here was validating
+          ;; the string; it was simply asserted.
+          engine (or (config/config-string-or-nil "MURAKUMO_INFER_ENGINE")
+                     "openai-compatible")
+          enroll (join/enrollment {:name node-name :did did :tier :native
+                                   :mem-bytes mem-bytes :engine (keyword engine)})
+          caps {:can (mapv name (:node/can enroll))
+                :mem-bytes mem-bytes
+                :max-resident-bytes (get-in enroll [:node/caps :max-resident-bytes])
+                :engine engine :model model}
+          settled-total (atom 0.0)]
+      (println (format "[join] %s (%s) — %s serving %s -> %s"
+                       node-name did
+                       (if mem-bytes (format "%.1fGB" (/ mem-bytes 1e9)) "unknown mem")
+                       model relay-url))
+      (println "[join] scope: own-fleet trust only -- no output verification for" job-kind "jobs, see ns docstring.")
+      (ws/websocket
+       {:uri relay-url
+        :on-open (fn [conn]
+                   (ws/send! conn (json/generate-string
+                                   {:msg "hello" :did did :tier "native" :caps caps})))
+        :on-message
+        (fn [conn data _last]
+          (let [{:keys [msg] :as m} (json/parse-string (str data) true)]
+            (case msg
+              "welcome"
+              (do (println "[join] connected, worker-id" (:worker-id m))
+                  (ws/send! conn (json/generate-string {:msg "ready"})))
+
+              "job"
+              (let [job {:job-id (:job-id m) :kind (:kind m) :input (:input m)}
+                    reply (handle-job local-url job)]
+                (println (format "[join] job %s (%s) -> %s"
+                                 (:job-id job) (:kind job)
+                                 (if (get-in reply [:output :error]) "error" "ok")))
+                (ws/send! conn (json/generate-string reply)))
+
+              "idle"
+              (do (Thread/sleep 3000)
+                  (ws/send! conn (json/generate-string {:msg "ready"})))
+
+              "settled"
+              (do (swap! settled-total + (double (or (:credits m) 0)))
+                  (println (format "[join] settled job %s: +%.3f credits (session total %.3f)"
+                                   (:job-id m) (double (or (:credits m) 0)) @settled-total))
+                  (ws/send! conn (json/generate-string {:msg "ready"})))
+
+              "rejected"
+              (do (println "[join] job rejected:" (:reason m))
+                  (ws/send! conn (json/generate-string {:msg "ready"})))
+
+              nil)))
+        :on-close (fn [_conn status reason] (println "[join] relay closed:" status reason))
+        :on-error (fn [_conn err] (println "[join] connection error:" (str err)))})
+      @(promise))))

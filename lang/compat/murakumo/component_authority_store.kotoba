@@ -1,0 +1,161 @@
+(ns murakumo.component-authority-store
+  "Durable append-only outbox for signed Component authority envelopes."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.edn :as edn]
+            [clojure.java.io :as io]
+            [kotoba.abi.component :as abi]
+            [murakumo.component-authority :as authority])
+  (:import [java.nio ByteBuffer]
+           [java.nio.channels FileChannel]
+           [java.nio.file Files LinkOption Path StandardOpenOption]
+           [java.nio.file.attribute PosixFilePermissions]))
+
+(def max-record-bytes (* 1024 1024))
+
+(defn envelope-id [envelope]
+  [(:issuer envelope)
+   (:audience envelope)
+   (get-in envelope [:event :murakumo.component/sequence])])
+
+(defn- reject [reason message data]
+  (throw (ex-info message
+                  (assoc data :murakumo.component-store/reason reason))))
+
+(defn- ensure-parent! [^Path path]
+  (when-let [parent (.getParent path)]
+    (Files/createDirectories parent
+                             (make-array java.nio.file.attribute.FileAttribute 0))))
+
+(defn- restrict-file! [^Path path]
+  (try
+    (Files/setPosixFilePermissions
+     path (PosixFilePermissions/fromString "rw-------"))
+    (catch UnsupportedOperationException _ nil))
+  path)
+
+(defn append-record!
+  "Append one EDN record and force it to stable storage before returning."
+  [path record]
+  (let [path (.toPath (io/file path))
+        bytes (kbytes/utf8-bytes (str (pr-str record) "\n"))]
+    (when (> (count bytes) max-record-bytes)
+      (reject :oversize-record "Component authority journal record is too large"
+              {:bytes (count bytes)}))
+    (ensure-parent! path)
+    (with-open [channel (FileChannel/open
+                         path
+                         (into-array
+                          StandardOpenOption
+                          [StandardOpenOption/CREATE
+                           StandardOpenOption/WRITE
+                           StandardOpenOption/APPEND
+                           StandardOpenOption/DSYNC]))]
+      (let [buffer (ByteBuffer/wrap bytes)]
+        (while (.hasRemaining buffer)
+          (.write channel buffer))
+        (.force channel true)))
+    (restrict-file! path)
+    record))
+
+(defn enqueue! [path envelope]
+  (when-not (abi/valid-component-authority-envelope? envelope)
+    (reject :invalid-envelope "Only valid signed authority envelopes enter the outbox" {}))
+  (append-record! path {:op :enqueue :id (envelope-id envelope)
+                        :envelope envelope}))
+
+(defn acknowledge! [path envelope]
+  (append-record! path {:op :ack :id (envelope-id envelope)}))
+
+(defn journal-records
+  "Read the bounded journal. Malformed/truncated records fail closed."
+  [path]
+  (let [file (io/file path)]
+    (if-not (.exists file)
+      []
+      (with-open [reader (io/reader file)]
+        (mapv
+         (fn [line]
+           (when (> (count (kbytes/utf8-bytes ^String line))
+                    max-record-bytes)
+             (reject :oversize-record "Component authority journal record is too large" {}))
+           (let [record (try
+                          (edn/read-string line)
+                          (catch Exception cause
+                            (throw (ex-info "Malformed Component authority journal"
+                                            {:murakumo.component-store/reason
+                                             :malformed-journal}
+                                            cause))))]
+             (when-not (and (map? record)
+                            (contains? #{:enqueue :ack} (:op record))
+                            (vector? (:id record))
+                            (if (= :enqueue (:op record))
+                              (and (= #{:op :id :envelope} (set (keys record)))
+                                   (abi/valid-component-authority-envelope?
+                                    (:envelope record)))
+                              (= #{:op :id} (set (keys record)))))
+               (reject :malformed-journal
+                       "Component authority journal record is not exact"
+                       {:record record}))
+             record))
+         (line-seq reader))))))
+
+(defn pending
+  "Return unacknowledged envelopes in original authority sequence order."
+  [path]
+  (->> (journal-records path)
+       (reduce
+        (fn [outbox {:keys [op id envelope]}]
+          (case op
+            :enqueue (assoc outbox id envelope)
+            :ack (dissoc outbox id)))
+        {})
+       vals
+       (sort-by #(get-in % [:event :murakumo.component/sequence]))
+       vec))
+
+(defn recover-state
+  "Rebuild Component epochs and placements from every durably enqueued event,
+  including already acknowledged delivery. This closes the crash window
+  between fsync and the in-memory state update."
+  [path]
+  (reduce
+   (fn [state {:keys [op envelope]}]
+     (if-not (= :enqueue op)
+       state
+       (let [event (:event envelope)
+             cid (:murakumo.component/component-cid event)
+             epoch (:murakumo.component/epoch event)
+             sequence (:murakumo.component/sequence event)
+             state' (-> state
+                        (assoc-in [:epochs cid] epoch)
+                        (assoc :sequence (max (:sequence state) sequence)))]
+         (if (= :placed (:murakumo.component/event event))
+           (update-in state' [:placements cid] (fnil conj #{})
+                      (:murakumo.component/node event))
+           (update state' :placements dissoc cid)))))
+   (authority/initial-state)
+   (journal-records path)))
+
+(defn deliver-pending!
+  "Publish and acknowledge pending envelopes one by one. A publisher failure
+  stops delivery and leaves that envelope and all later ones pending."
+  [path publish!]
+  (reduce
+   (fn [delivered envelope]
+     (publish! envelope)
+     (acknowledge! path envelope)
+     (inc delivered))
+   0
+   (pending path)))
+
+(defn apply-durable-command!
+  "Durably enqueue a signed transition before advancing in-memory authority.
+  Delivery is then attempted; failure leaves the envelope for retry."
+  [state-atom path publish! command signing]
+  (locking state-atom
+    (let [[state' event] (authority/transition @state-atom command)
+          envelope (authority/sign-event event signing)]
+      (enqueue! path envelope)
+      (reset! state-atom state')
+      (publish! envelope)
+      (acknowledge! path envelope)
+      envelope)))

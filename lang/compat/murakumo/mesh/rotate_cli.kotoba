@@ -1,0 +1,142 @@
+(ns murakumo.mesh.rotate-cli
+  "Rotate the mesh SAE passphrase across every remaining node.
+
+    kbb -cp src:resources -m murakumo.mesh.rotate-cli --seed-host root@seed [--seed-name seed]
+        [--ledger kekkai-tailnet.edn] [--fleet fleet.edn] [--host-map node=host ...]
+        [--state ~/.murakumo/mesh-rotation.edn] [--dry-run] [--restart]
+
+  Run `ledger-cli sync` first: the targets are the authorized, non-revoked nodes
+  of the operator's ledger, so a node you have just revoked is left behind -- that
+  is the cutoff. See `murakumo.mesh.rotate` for who is rotated and why.
+
+  Progress is saved after every node in a 0600 state file that holds the new
+  passphrase. Re-running resumes with the SAME passphrase, so a node that was
+  unreachable is retried rather than rotated to a second, different secret. A node
+  that cannot be rotated is fixed and retried, or revoked (then re-run). The state
+  file is deleted when the rotation completes; `--restart` abandons one and
+  starts over with a new passphrase.
+
+  The passphrase is piped to each node on stdin, so it is in no argument and not
+  in the node's process list.
+
+  Exit: 0 rotated and every node sees a peer, 1 failed or incomplete (state kept),
+  2 bad usage, 3 rotated but a node sees no peer afterwards (see the report)."
+  (:require ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:crypto" :as crypto]
+            ["node:path" :as node-path]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [murakumo.mesh.install :as install]
+            [murakumo.mesh.ledger-cli :as ledger-cli]
+            [murakumo.mesh.rotate :as rotate]
+            [murakumo.ssh :as ssh]))
+
+(defn default-state-path [] (str (.homedir os) "/.murakumo/mesh-rotation.edn"))
+
+(defn load-state [path]
+  (when (.existsSync fs path)
+    (try (let [s (edn/read-string (str (.readFileSync fs path "utf8")))]
+           (when (and (map? s) (string? (:passphrase s))) s))
+         (catch :default _ nil))))
+
+(defn save-state!
+  "0600 from creation, then renamed into place: the file holds the new secret."
+  [path state]
+  (let [tmp (str path ".tmp-" (.randomUUID crypto))]
+    (.mkdirSync fs (.dirname node-path path) #js {:recursive true})
+    (.writeFileSync fs tmp (str (pr-str state) "\n") #js {:mode 0600 :flag "wx"})
+    (.renameSync fs tmp path)))
+
+(defn clear-state! [path] (when (.existsSync fs path) (.unlinkSync fs path)))
+
+(defn- run-node!
+  ([node script] (run-node! node script ""))
+  ([{:keys [host]} script stdin]
+  (let [{:keys [exit out err]} (ssh/sh-in host (install/remote-command script) stdin)]
+    {:ok? (zero? exit) :out (str out) :err (str/trim (str err))})))
+
+(defn- read-fleet [path]
+  (try (edn/read-string (str (.readFileSync fs path "utf8"))) (catch :default _ {})))
+
+(defn rotate!
+  [{:keys [seed-host seed-name ledger fleet host-pairs state dry-run? restart?]
+    :or {ledger "kekkai-tailnet.edn" fleet "fleet.edn" seed-name rotate/default-seed-name}}]
+  (let [state-path (or state (default-state-path))
+        l (ledger-cli/local-read ledger)]
+    (if (:error l)
+      {:ok? false :msg (str "local ledger: " (name (:error l)))}
+      (let [hm (rotate/host-map (read-fleet fleet) host-pairs)
+            t (rotate/targets (:ledger l) {:host-map hm :seed-host seed-host :seed-name seed-name})
+            saved (when-not restart? (load-state state-path))
+            existing (when (and saved (not (rotate/restart-required? saved (:ledger l) (:nodes t)))) saved)
+            st (or existing (rotate/new-state (rotate/generate-passphrase (.toString (.randomBytes crypto 16) "hex"))
+                                              (.now js/Date)))
+            todo (rotate/remaining st (:nodes t))
+            header (str (if existing "resuming" "new") " rotation: " (count (:nodes t)) " node(s), "
+                        (count todo) " to do"
+                        (when (seq (get-in t [:skipped :revoked])) (str "; left behind (revoked) " (pr-str (get-in t [:skipped :revoked]))))
+                        (when (seq (get-in t [:skipped :pending])) (str "; skipped (pending) " (pr-str (get-in t [:skipped :pending]))))
+                        (when (seq (:unresolved t)) (str "; NO HOST for " (pr-str (:unresolved t)))))]
+        (if dry-run?
+          {:ok? true :msg (str "dry run: " header "\n  would rotate, in order: " (pr-str (mapv :name todo)))}
+          (do
+            (when-not existing (save-state! state-path st))
+            (println header)
+            (let [{st :state failures :failures}
+                  (reduce (fn [{:keys [state failures] :as acc} n]
+                            (let [state (rotate/expose state n)
+                                  _ (save-state! state-path state)
+                                  acc (assoc acc :state state)
+                                  r (run-node! n (rotate/rotate-script {:role (:role n)}) (rotate/stdin-for (:passphrase state)))]
+                              (if (:ok? r)
+                                (let [token (when (= :seed (:role n)) (install/join-token-from-output (:out r)))
+                                      s' (rotate/mark-done state (:name n) token)]
+                                  (save-state! state-path s')
+                                  (println "  rotated" (:name n))
+                                  {:state s' :failures failures})
+                                (do (println "  FAILED " (:name n) (:err r))
+                                    (update acc :failures conj (:name n))))))
+                          {:state st :failures []} todo)]
+              (if-not (rotate/complete? st (:nodes t) (:unresolved t))
+                {:ok? false
+                 :msg (str "incomplete -- state kept at " state-path
+                           (when (seq failures) (str "\n  failed: " (pr-str failures)))
+                           (when (seq (:unresolved t)) (str "\n  no host: " (pr-str (:unresolved t)) " (add --host-map name=host)"))
+                           "\n  fix and re-run (same passphrase), or `ledger-cli revoke` a node you give up on, then re-run")}
+                (let [peers (when (> (count (:nodes t)) 1)
+                              (mapv (fn [n] [(:name n) (rotate/peers-from-output (:out (run-node! n (rotate/peers-script {}))))])
+                                    (:nodes t)))
+                      lonely (vec (keep (fn [[n c]] (when (or (nil? c) (zero? c)) n)) peers))]
+                  (clear-state! state-path)
+                  {:ok? true :lonely lonely
+                   :msg (str "rotated " (count (:nodes t)) " node(s)."
+                             (when (seq lonely) (str "\n  WARNING: no mesh peer seen on " (pr-str lonely)
+                                                     " -- they may not have re-formed on the new passphrase"))
+                             "\n  new join token (for any node installed from now on):\n  " (:join-token st))})))))))))
+
+(defn- parse-args [args]
+  (loop [m {:host-pairs {}} [k v & more :as as] args]
+    (if (empty? as)
+      m
+      (case k
+        "--dry-run" (recur (assoc m :dry-run? true) (rest as))
+        "--restart" (recur (assoc m :restart? true) (rest as))
+        "--seed-host" (recur (assoc m :seed-host v) more)
+        "--seed-name" (recur (assoc m :seed-name v) more)
+        "--ledger" (recur (assoc m :ledger v) more)
+        "--fleet" (recur (assoc m :fleet v) more)
+        "--state" (recur (assoc m :state v) more)
+        "--host-map" (let [[n h] (rotate/parse-pair v)]
+                       (when-not n (throw (ex-info (str "bad --host-map " v) {})))
+                       (recur (assoc-in m [:host-pairs n] h) more))
+        (throw (ex-info (str "unknown argument " k) {:arg k}))))))
+
+(defn -main [& args]
+  (let [o (try (parse-args args) (catch :default e (println (ex-message e)) nil))]
+    (when-not (and o (re-matches #"[A-Za-z0-9@._:-]{1,200}" (str (:seed-host o))))
+      (println "usage: rotate-cli --seed-host H [--ledger P] [--fleet P] [--host-map node=host ...] [--dry-run] [--restart]")
+      (js/process.exit 2))
+    (let [r (rotate! o)]
+      (println (:msg r))
+      (js/process.exit (cond (not (:ok? r)) 1 (seq (:lonely r)) 3 :else 0)))))

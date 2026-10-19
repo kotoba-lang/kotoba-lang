@@ -1,0 +1,111 @@
+(ns kotoba.compiler.run-cli
+  "`amu measure-runtime` and `amu run` -- the two commands that execute
+  something: build and measure the reviewed kexe loader, and run one export
+  of a signed native artifact under it and write the receipt.
+
+  One implementation on both hosts (ADR 0348 iteration 8). The executor is
+  `kototama.native.executor`, portable since 2026-09-11, and it is a
+  RUNTIME, not a compiler leaf: the entrypoints hand its two functions in
+  (see `executor-fn`) and it lives under the `:native-run` alias of deps.edn
+  (recorded in deps-lock.edn; `bin/amu` puts that closure on the classpath
+  for exactly these two commands), so a compile never carries the loader
+  builder and a toolchain walk in its dependency closure. Absent, the
+  refusal names the alias.
+
+  `run` RETURNS `{:value ... :exit 120}` for a trapped execution rather
+  than exiting: the entrypoint decides the process, the command decides the
+  answer. `:now` and the receipt's integers follow the trust plane's rules
+  (`kotoba.compiler.trust-cli`)."
+  {:kotoba/export [commands dispatch!]}
+  (:require [kotoba.artifact.runtime-identity :as runtime-identity]
+            [kotoba.compiler.atomic-output :as atomic-output]
+            [kotoba.compiler.bounded-edn :as bounded-edn]
+            [kotoba.compiler.receipt :as receipt]
+            [kotoba.compiler.trust-cli :as trust-cli]))
+
+(def commands #{"measure-runtime" "run"})
+
+(defn- option [args flag] (second (drop-while #(not= flag %) args)))
+
+(defn- required [args flag]
+  (or (option args flag)
+      (throw (ex-info (str "missing " flag) {:phase :usage}))))
+
+(defn- executor-fn
+  "The executor's OPERATION out of the map the entrypoint hands in. The
+  executor is required by the entrypoint, not here: on nbb a `require` inside
+  a function returns a promise and `resolve` right after it answers nil
+  (measured 2026-09-12), so the only place a namespace can be loaded for a
+  synchronous call is a namespace form. The JVM entrypoint fills the map with
+  `requiring-resolve`; the Node entrypoint with a static `:require`. Absent,
+  the refusal names the alias."
+  [executor operation]
+  (or (get executor operation)
+      (throw (ex-info
+              "native execution requires the kotoba-lang/kototama-native plugin"
+              {:phase :native-executor :operation operation
+               :dependency 'io.github.kotoba-lang/kototama-native
+               :alias :native-run}))))
+
+(defn- long-option [args flag fallback]
+  (let [text (option args flag)]
+    (cond
+      (nil? text) fallback
+      :else (or (parse-long text)
+                (throw (ex-info (str flag " must be a decimal integer") {:phase :usage}))))))
+
+(defn dispatch!
+  "Run one command with EXECUTOR, a map `{:measure-runtime f :execute g}` (or
+  empty when the plugin is absent). Returns `{:value <printed> :exit <status>}`."
+  [executor args]
+  (case (first args)
+    "measure-runtime"
+    (let [{:keys [runtime loader-bytes]} ((executor-fn executor :measure-runtime))
+          output (or (option args "--output") "kotoba-runtime.edn")
+          loader-output (or (option args "--loader-output") "kotoba-loader")]
+      (atomic-output/write-bytes! loader-output loader-bytes {:executable? true})
+      (atomic-output/write-edn! output {:format :kotoba.runtime-measurement/v1
+                                        :runtime runtime})
+      {:exit 0
+       :value {:ok true :output output :loader-output loader-output
+               :runtime-sha256 (runtime-identity/identity-sha256 runtime)}})
+
+    "run"
+    (let [envelope (bounded-edn/read-file (second args))
+          trust (bounded-edn/read-file (required args "--trust"))
+          policy (bounded-edn/read-file (required args "--policy"))
+          input (bounded-edn/read-file (required args "--input"))
+          executor-key (bounded-edn/read-file (required args "--executor-key"))
+          now (long-option args "--now" (trust-cli/now-seconds))
+          parent-path (option args "--parent")
+          parent (when parent-path (bounded-edn/read-file parent-path))
+          entry (symbol (or (option args "--entry") "main"))
+          runtime-measurement (bounded-edn/read-file (required args "--runtime"))
+          _ (runtime-identity/validate-measurement! runtime-measurement)
+          execution ((executor-fn executor :execute)
+                     envelope trust policy input
+                     {:now now :entry entry
+                      :runtime (:runtime runtime-measurement)
+                      :loader-path (option args "--loader")})
+          report (:report execution)
+          evidence (:evidence execution)
+          value (receipt/create
+                 envelope trust policy input evidence
+                 {:now now :started-at (:started-at execution)
+                  :finished-at (:finished-at execution)
+                  :status (:status evidence) :target (:target execution)
+                  :entry entry :fuel-initial (get-in report [:fuel :initial])
+                  :fuel-remaining (get-in report [:fuel :remaining])
+                  :parent parent :executor-key executor-key})
+          result-path (or (option args "--result-output") "run.result.edn")
+          receipt-path (or (option args "--output") "run.receipt.edn")
+          ok? (= :ok (:status evidence))]
+      (atomic-output/write-edn! result-path evidence)
+      (atomic-output/write-edn! receipt-path value)
+      {:exit (if ok? 0 120)
+       :value {:ok ok?
+               :status (:status evidence) :result evidence
+               :result-output result-path :output receipt-path
+               :receipt-sha256 (:receipt-sha256 value)}})
+
+    (throw (ex-info (str "not an execution command: " (pr-str (first args))) {:phase :usage}))))

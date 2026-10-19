@@ -1,0 +1,245 @@
+(ns kotobase.storage.ordered-map
+  "The OrderedMap contract: what a substrate must SAY before its ranges mean
+  the same thing as another's, and the oracle that checks they do.
+
+  An IPLD Map has string keys and no ordered-range API. Prolly trees and
+  Merkle-LSM can both present an ordered view over the same logical rows, but
+  only once five things are stated, and they are stated differently today:
+
+      comparator   how two encoded keys order
+      bounds       whether the upper bound is included
+      snapshot     what pins the version being read
+      duplicates   which of several versions of one key wins
+      tombstones   whether a deletion is absent or present-and-suppressing
+
+  None of these has a default here. That is the same refusal
+  `kotobase.storage.core` makes for ref profiles, for the same reason: an
+  undeclared profile is an unanswered question, and answering it by guessing
+  is wrong silently. A substrate that has not declared cannot be compared,
+  and this namespace says so rather than comparing anyway.
+
+  ## The bound disagreement is real, not hypothetical
+
+  Measured 2026-09-06 in this workspace:
+
+      prolly-tree.core/scan-range     (neg? (compare k hi))          k < hi
+      kotobase.projection/decode-range (not (pos? (compare k upper))) k <= upper
+
+  Two range APIs over ordered string keys, disagreeing on exactly one row: the
+  one whose key equals the upper bound. Handed to an OrderedMap facade that
+  took either as \"range\", the boundary row would appear or vanish depending on
+  which substrate answered, and nothing in the result would say which had.
+
+  So the canonical logical form here is half-open `[lower, upper)` and an
+  inclusive-upper substrate is ADAPTED, explicitly. The adaptation is a filter
+  rather than a bound rewrite on purpose: turning `[lo, hi)` into an inclusive
+  query needs the predecessor of `hi`, and turning an inclusive `hi` into a
+  half-open one needs its successor -- neither exists for arbitrary strings.
+  Asking an inclusive substrate for `[lower, upper]` and dropping keys equal
+  to `upper` is exact, needs no successor, and costs at most one extra row.
+
+  ## What this namespace does not do
+
+  It does not implement a substrate, and it holds no dependency on one: an
+  adapter is a value the caller supplies, so prolly-tree and Merkle-LSM depend
+  on this contract and never the reverse. It does not make physical roots
+  representation-independent either -- LSM compaction or a rebuilt Prolly tree
+  can change index roots while every visible row is identical, so agreement
+  found here is agreement about ROWS and is not a claim about CIDs."
+  (:refer-clojure :exclude [range])
+  (:require [kotoba.lang.coll :as set]))
+
+;; ── the five declarations ────────────────────────────────────────────────────
+
+(def comparators
+  "How two encoded keys order.
+
+  `:lexicographic-utf8` is byte-order over the encoded key. It is the only one
+  both current substrates implement, and naming it is the point: a composite
+  or binary database key reaching an ordered substrate has been encoded into a
+  string, and the encoding must be order-preserving AND reversible. Where it is
+  not -- an HMAC-blinded key is the case in this workspace -- lexical order of
+  the encoding is not the database's order, and a range over it is not the
+  database's range. Declaring `:opaque-unordered` says so, and range queries
+  against such a substrate are refused rather than answered wrongly."
+  #{:lexicographic-utf8 :opaque-unordered})
+
+(def bound-modes
+  "Whether the substrate's own range API includes its upper bound.
+
+  `:half-open` is `[lower, upper)`. `:inclusive-upper` is `[lower, upper]`."
+  #{:half-open :inclusive-upper})
+
+(def snapshots
+  "What pins the version a read sees.
+
+  `:root-cid` -- the root IS the snapshot; there is no separate epoch, and a
+  read of one root cannot see another's writes (Prolly).
+  `:query-epoch` -- rows carry epochs and the reader names one; versions after
+  it are invisible (Merkle-LSM MVCC)."
+  #{:root-cid :query-epoch})
+
+(def duplicate-precedence
+  "Which of several versions of one logical key is visible.
+
+  `:unique-key` -- at most one, structurally. `:newest-epoch-wins` -- the
+  greatest epoch at or before the query epoch."
+  #{:unique-key :newest-epoch-wins})
+
+(def tombstones
+  "How a deletion appears.
+
+  `:absent` -- the key is simply gone. `:suppress-key` -- a row exists, marks
+  the key deleted, and must hide older versions of it rather than being
+  returned as a row."
+  #{:absent :suppress-key})
+
+(def ^:private declared-dimensions
+  {:comparator comparators
+   :bounds bound-modes
+   :snapshot snapshots
+   :duplicates duplicate-precedence
+   :tombstones tombstones})
+
+(defn validate-profile!
+  "Check that `profile` declares all five dimensions with known values.
+
+  Returns the profile. Throws `:kotobase.storage/undeclared-ordered-map` for a
+  missing dimension and `:kotobase.storage/unknown-ordered-map-declaration` for
+  an unrecognised value -- apart, because the first says the substrate has not
+  been asked and the second says it answered something this contract cannot
+  interpret. Collapsing them would make an unfinished adapter and a
+  misconfigured one look the same."
+  [profile]
+  (when-not (map? profile)
+    (throw (ex-info "kotobase: OrderedMap profile must be a map"
+                    {:type :kotobase.storage/undeclared-ordered-map
+                     :profile profile})))
+  (doseq [[dimension allowed] declared-dimensions]
+    (when-not (contains? profile dimension)
+      (throw (ex-info (str "kotobase: OrderedMap profile does not declare "
+                           dimension " -- undeclared is an unanswered question,"
+                           " not a default")
+                      {:type :kotobase.storage/undeclared-ordered-map
+                       :dimension dimension :expected allowed
+                       :declared (set (keys profile))})))
+    (when-not (contains? allowed (get profile dimension))
+      (throw (ex-info (str "kotobase: unknown OrderedMap " dimension
+                           " declaration")
+                      {:type :kotobase.storage/unknown-ordered-map-declaration
+                       :dimension dimension :expected allowed
+                       :value (get profile dimension)}))))
+  profile)
+
+;; ── ranges ───────────────────────────────────────────────────────────────────
+
+(defn range
+  "A canonical half-open logical range `[lower, upper)`. A nil bound is
+  unbounded.
+
+  Refused when `lower` and `upper` are both present and `lower` is not less
+  than `upper`: `[k, k)` selects nothing, and a caller that meant the single
+  key `k` has written the one range that cannot contain it. Returning empty
+  would be a correct answer to a question nobody asked."
+  [lower upper]
+  (when (and (some? lower) (some? upper) (not (neg? (compare lower upper))))
+    (throw (ex-info "kotobase: half-open range lower bound must precede upper"
+                    {:type :kotobase.storage/empty-ordered-map-range
+                     :lower lower :upper upper})))
+  {:lower lower :upper upper})
+
+(defn- half-open? [k {:keys [lower upper]}]
+  (and (or (nil? lower) (not (neg? (compare k lower))))
+       (or (nil? upper) (neg? (compare k upper)))))
+
+(defn scan
+  "Read `rng` from `adapter` as a half-open range, whatever its native bounds.
+
+  `adapter` is `{:profile <profile> :scan (fn [lower upper] -> [[k v] ...])}`,
+  where `:scan` uses the substrate's OWN bound semantics as declared. An
+  `:inclusive-upper` substrate is given the same bounds and its result is
+  filtered to drop keys equal to `upper` -- the explicit adaptation, rather
+  than a bound rewrite that would need a string successor that does not exist.
+
+  A substrate declaring `:opaque-unordered` is refused: its encoded keys do
+  not order the way the database's keys do, so a range over them is not the
+  range that was asked for. Prefix-then-decrypt-then-filter is the path for
+  those, and it is not this one."
+  [adapter rng]
+  (let [{:keys [profile scan]} adapter
+        {:keys [comparator bounds]} (validate-profile! profile)]
+    (when (= :opaque-unordered comparator)
+      (throw (ex-info (str "kotobase: refusing a range over an "
+                           ":opaque-unordered substrate -- lexical order of "
+                           "its encoded keys is not the database's order")
+                      {:type :kotobase.storage/unordered-range-refused
+                       :range rng})))
+    (let [rows (vec (scan (:lower rng) (:upper rng)))]
+      (case bounds
+        :half-open rows
+        ;; The one row the two APIs disagree about.
+        :inclusive-upper (filterv #(half-open? (first %) rng) rows)))))
+
+;; ── the cross-substrate oracle ───────────────────────────────────────────────
+
+(defn- reconcilable!
+  "Refuse to compare two substrates whose declarations make a difference
+  meaningless.
+
+  An oracle that runs anyway produces two useless verdicts: a disagreement
+  that says only that the substrates were asked different questions, and an
+  agreement that says only that the difference happened not to show on this
+  data. Both read exactly like a real result."
+  [a b]
+  (let [pa (validate-profile! (:profile a))
+        pb (validate-profile! (:profile b))]
+    (doseq [dimension [:comparator :duplicates :tombstones]]
+      (when-not (= (get pa dimension) (get pb dimension))
+        (throw (ex-info (str "kotobase: substrates declare different "
+                             dimension " -- their rows are not comparable")
+                        {:type :kotobase.storage/incomparable-substrates
+                         :dimension dimension
+                         :a (get pa dimension) :b (get pb dimension)}))))
+    ;; :bounds may differ. Adapting it is this namespace's job, and two
+    ;; substrates disagreeing there is the case the oracle exists for.
+    [pa pb]))
+
+(defn range-oracle
+  "Run the same logical half-open range against two adapters and report.
+
+  Returns `{:agree? :compared :only-in-a :only-in-b :vacuous?}`. `:compared`
+  is how many distinct keys were seen across both; `:vacuous?` is true when
+  that is zero.
+
+  `:vacuous?` exists because agreement on no rows is the cheapest possible
+  green. Two substrates that both failed to load, both pointed at an empty
+  root, or were both handed a range outside their data agree perfectly and
+  prove nothing -- and a caller asserting only on `:agree?` cannot tell that
+  case from a real one. It is reported rather than thrown because an empty
+  range is a legitimate thing to check; what must not happen is that it counts
+  as evidence without saying so.
+
+  Throws `:kotobase.storage/incomparable-substrates` when the declarations
+  make a difference meaningless. Refusing is the point: the substrates would
+  otherwise be asked different questions and their answers compared anyway."
+  [a b rng]
+  (reconcilable! a b)
+  (let [rows-a (scan a rng)
+        rows-b (scan b rng)
+        map-a (into {} rows-a)
+        map-b (into {} rows-b)
+        keys-a (set (keys map-a))
+        keys-b (set (keys map-b))
+        differing (filterv #(not= (get map-a %) (get map-b %))
+                           (sort (set/intersection keys-a keys-b)))
+        only-a (vec (sort (set/difference keys-a keys-b)))
+        only-b (vec (sort (set/difference keys-b keys-a)))
+        compared (count (set/union keys-a keys-b))]
+    {:agree? (and (empty? only-a) (empty? only-b) (empty? differing)
+                  (= (mapv first rows-a) (mapv first rows-b)))
+     :compared compared
+     :vacuous? (zero? compared)
+     :only-in-a only-a
+     :only-in-b only-b
+     :differing-values differing
+     :order-agrees? (= (mapv first rows-a) (mapv first rows-b))}))

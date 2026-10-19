@@ -1,0 +1,1934 @@
+(ns kototama.tender
+  "The kototama tender: the host-side ROLE that runs/mediates the
+  `actor:host` ABI for a `.kotoba` Wasm guest, named by ADR-2607022400
+  after Solo5's tender/guest split (kototama = tender, the Wasm
+  component it hosts = guest). 'Tender' names WHO plays this part
+  (validate the guest's requested import surface, wire each granted
+  host-fn, execute the guest) -- it is host-language-independent by
+  design, NOT a synonym for any one implementation language.
+
+  THIS namespace is one implementation of the tender role, not the role
+  itself: ADR-2607022900 decided THIS PARTICULAR tender is JVM/Clojure
+  via `com.dylibso.chicory` (a pure-JVM WebAssembly runtime — no native
+  toolchain, no wasmtime/wasmer process), not Rust/wasmtime. Other
+  tenders for the same role, in other host languages, already exist or
+  are expected -- see `kotoba-lang/aiueos`'s own ADR-0014
+  (`90-docs/adr/0014-self-owned-vmm-hvt-tender.md`), a JVM-FFM
+  (non-Chicory) tender for that repo's guest, which is concrete proof
+  the 'tender' name itself carries no JVM/Chicory assumption. See the
+  outer monorepo's ADR-2607183010 for the fuller writeup of this
+  role-vs-implementation distinction (it also keeps the 'tender'
+  vocabulary rather than renaming it away).
+
+  `kototama.contract` is pure data validation with no execution anywhere
+  in it (`validate-import-surface` decides yes/no, it does not run
+  anything). This namespace is what makes that decision load-bearing:
+  every guest import here is wired to actually perform the effect ONLY
+  when `contract/validate-import-surface` says the caller's `HostCaps`
+  grant it, checked BOTH before `instantiate` (fail fast, no Instance
+  built for a disallowed surface) and again at each call (defense in
+  depth — no path bypasses the grant check just because pre-flight
+  already passed).
+
+  The generic Chicory wiring below (host-fn/instantiate/call-main/
+  run-main/fuel-listener/memory ptr-len helpers) is written fresh here,
+  not vendored from `kotoba-lang/kotoba`'s `wasm_exec.clj` — that
+  namespace is tightly coupled to kotoba's OWN kgraph/capability
+  vocabulary (`kotoba.runtime/capability-contract`, `kotoba.kgraph`),
+  and pulling it in as a dependency would run a second, incompatible
+  capability model next to kototama's own `actor:host` ABI (the
+  'semantic authority duplication' ADR-2607022700 rules out). The
+  Chicory API calls themselves are the same shape because there is only
+  one sane way to wire a HostFunction — proof-of-pattern, not shared
+  code.
+
+  Host module name is `\"kotoba\"`, matching `kotoba wasm emit`'s own
+  hardcoded import-module convention (`kotoba.runtime`'s WASM encoder) --
+  a real compiled `.kotoba` guest can only ever import from that exact
+  module name, so this MUST match it or Chicory's `.build` fails to link
+  any guest actually emitted by the compiler (an earlier draft used
+  `\"kototama\"` here and only ever linked against this namespace's own
+  hand-written WAT test fixtures, which happened to agree with it --
+  never against a real compiled guest). Field names (gen_keypair, sign,
+  verify, sha256_hex, http_post, log_read, log_write, clock_monotonic,
+  llm_infer) don't collide with `kotoba.wasm-exec`'s own fields
+  (kgraph_assert, has_capability, ...) under the same module, so both
+  host surfaces can coexist for a guest that needs imports from each.
+
+  `:log-write`/`:clock-monotonic` (not `:log-append!`/`:now`, an earlier
+  draft's names) match field-for-field the `log-write`/`clock-monotonic`
+  entries `kotoba-core-contracts`' `capability_contract.edn` registers
+  for `kotoba wasm emit` (landed independently, for aiueos's own kernel-
+  capability vocabulary) -- same operation, so this ABI reuses that name
+  instead of registering a second one a `.kotoba` author would have to
+  pick between for no real difference.
+
+  `:llm-infer` (`llm_infer`, capability id 225 in `kotoba-core-contracts`'
+  `capability_contract.edn`) is the one host function here that talks to
+  a THIRD party (the Anthropic Messages API), not just this JVM process
+  or its injected store -- so, unlike every other host-fn above, it is
+  built with an injectable `llm-client` (`{:infer-fn (fn [prompt] text-
+  or-nil)}`, same DI shape `log-read-host-fn`/`log-write-host-fn` already
+  use for `store`) instead of calling `HttpClient` inline. `default-llm-
+  client` is the production implementation; tests inject a fake
+  `:infer-fn` instead of hitting the real network.
+
+  Second wave (com-junkawasaki/root ADR-2607230943, field names
+  http_fetch, cbor_encode, json_encode, json_extract_field): GET-only
+  HTTP fetch + CBOR/JSON wire-format encoding for a future news-
+  collecting fleet actor (kawaraban/cloud-itonami) that needs to build
+  CACAO token bytes and XRPC request/response bodies from within a
+  `.kotoba` guest. `http-fetch-host-fn` reuses `http-post-host-fn`'s own
+  `blocked-http-post-destination?`/`contract/url-allowed?`/timeout
+  hardening verbatim (same SSRF/DoS threat model -- a guest-controlled
+  URL, synchronous call blocking the host thread). `cbor-encode-host-fn`
+  ports cloud-itonami's proven `cacao.clj` cbor-head/cbor-val encoder
+  (itself traced to kawaraban.cacao/tashikame.cacao/kotoba.cacao -- 52
+  real published records against pds.aozora.app as of ADR-2607110200).
+  `cbor-encode-host-fn`/`json-encode-host-fn`/`json-extract-field-host-
+  fn` are pure computation (`#{}` effects, no RuntimeLimits count) --
+  see `parse-flat-pairs`'s docstring for the guest-facing wire format.
+
+  Third wave (com-junkawasaki/root, this ADR -- the second wave's own
+  ADR-2607230943 flagged both of these as explicit follow-ups, closed
+  here): `http_post_headers` (a SEPARATE host-import from `http_post`,
+  reusing `http-post-host-fn`'s SSRF/DoS hardening and `:max-http-posts`
+  budget -- a Wasm import's arity is part of the compiled guest's own
+  import section, so `http_post` itself cannot grow a headers parameter
+  without breaking every already-compiled guest that imports it) closes
+  finding 5 of `com-etzhayyim-kawaraban`'s wasm/README.md (no way to send
+  `Authorization: Bearer <jwt>`); `build-nested-tree`'s dotted-path
+  extension to `cbor-encode`/`json-encode`'s existing flat-pairs wire
+  format (NO new capability id or host-import needed -- only the
+  interpretation of the SAME (ptr,len) input bytes grew) closes finding 4
+  (no nested-map support), enabling a byte-faithful CACAO wire token and
+  a real `com.atproto.repo.createRecord` body from a `.kotoba` guest."
+  (:require [kotoba.bytes :as kbytes] [json.data-json :as json]
+            [kotoba.lang.text :as str]
+            [kotoba.security.effect :as effect]
+            [kototama.browser :as browser]
+            [kototama.compatibility :as compatibility]
+            [kototama.contract :as contract]
+            [kototama.denial :as denial]
+            [kototama.network-authority :as network]
+            [kototama.signer-lifecycle :as signer]
+            [kotoba.abi.component :as abi]
+            [ed25519.core :as ed])
+  (:import (com.dylibso.chicory.runtime ExecutionListener HostFunction ImportFunction
+                                        ImportValues Instance WasmFunctionHandle)
+           (com.dylibso.chicory.wasm Parser)
+           (com.dylibso.chicory.wasm.types FunctionType MemoryLimits ValType)
+           (java.io ByteArrayOutputStream)
+           (java.security MessageDigest SecureRandom)
+           (javax.crypto Mac SecretKeyFactory)
+           (javax.crypto.spec PBEKeySpec SecretKeySpec)
+           (java.net InetAddress Inet6Address URI)
+           (java.net.http HttpClient HttpRequest HttpRequest$Builder HttpRequest$BodyPublishers HttpResponse$BodyHandlers)
+           (java.time Duration Instant)
+           (java.util.concurrent Executors Semaphore TimeUnit TimeoutException)))
+
+;; ── memory ABI: (ptr,len) in / (out-ptr,out-cap) out, same convention
+;; `kotoba.wasm-exec`'s read-str/write-bytes! establish ─────────────────────
+
+(defn- read-bytes! [instance ptr len]
+  (.readBytes (.memory instance) (int ptr) (int len)))
+
+(defn- write-bytes! [instance ptr cap bs]
+  (let [n (count bs)]
+    (if (> n cap)
+      -1
+      (do (.write (.memory instance) (int ptr) (byte-array bs) 0 n)
+          n))))
+
+(defn host-fn
+  "One host import: FIELD under MODULE (default \"kotoba\"), param/result
+  ValTypes, and a Clojure fn [instance long-args] -> long (the single
+  i32/i64 result).
+
+  Actor:host guests compiled by the legacy `kotoba wasm emit` import
+  module \"kotoba\". Guests amu weaves for word-typed `typed-cap-call`
+  import `kotoba:cap`/`call` (i64 capability id, i64 request)->i64."
+  ([field params result f]
+   (host-fn "kotoba" field params result f))
+  ([module field params result f]
+   (HostFunction. module field
+                  (FunctionType/of params [result])
+                  (reify WasmFunctionHandle
+                    (apply [_ instance args]
+                      (long-array [(f instance args)]))))))
+
+(def ^:private valtype {:i32 ValType/I32 :i64 ValType/I64})
+
+;; ── fail-closed denial (same shape as kotoba.wasm-exec's guard pattern) ───
+
+(defn deny!
+  "Throw a JVM-tender denial of REASON for VALUE -- the one denial shape
+  (`kototama.denial/shape-keys`, koto-h6) every refusal in this namespace
+  goes through. DETAIL is merged beside the shape keys."
+  ([reason value] (denial/deny! :jvm reason value {} nil))
+  ([reason value detail] (denial/deny! :jvm reason value detail nil))
+  ([reason value detail cause] (denial/deny! :jvm reason value detail cause)))
+
+(defn denied!
+  "Throws the standard kototama tender denial for a structural authority
+  violation -- `:grant/missing`, the import id isn't in HostCaps'
+  :grants (checked both pre-flight and per-call; a guest was never
+  supposed to reach this at all, so this aborts the call, it does not
+  hand the guest an in-band error to react to).
+
+  Same shape as every other denial (`deny!`); `:kototama.tender/denied`
+  is kept beside `:kototama.tender/value` for the readers that pin it."
+  [import-id reason info]
+  (deny! reason import-id
+         (merge {:kototama.tender/denied import-id} info)))
+
+;; ── RuntimeLimits enforcement (Chicory has no native notion of "N calls
+;; of category X" — this is kototama's own responsibility, per-instance
+;; mutable counters closed over by each HostFunction below).
+;;
+;; Unlike `denied!` (a structural violation, hard throw), running out of
+;; quota is an ordinary, recoverable condition -- signaled IN-BAND as -1,
+;; the same convention `write-bytes!`'s overflow case already uses, so a
+;; well-behaved guest can see it and back off instead of the whole `main`
+;; call crashing on a Java exception it never gets a chance to handle. ──
+
+(defn- new-limits-state []
+  (atom {:http-posts 0 :http-fetches 0 :llm-infers 0 :kagi-signs 0 :scram-proofs 0
+         :log-read-bytes 0 :log-write-bytes 0 :random-bytes 0}))
+
+(defn- within-count-limit? [state-key limit-key caps limits-state]
+  (< (get @limits-state state-key) (get (:limits caps) limit-key)))
+
+(defn- try-add-bytes!
+  "true and records N against STATE-KEY iff doing so would stay within
+  LIMIT-KEY; false (no state change) otherwise."
+  [state-key limit-key caps limits-state n]
+  (let [limit (get (:limits caps) limit-key)
+        current (get @limits-state state-key)]
+    (if (> (+ current n) limit)
+      false
+      (do (swap! limits-state update state-key + n) true))))
+
+;; ── per-call grant re-check (defense in depth — pre-flight already ran in
+;; `instantiate`, but no HostFunction body trusts that alone) ───────────────
+
+(defn- ensure-granted!
+  "Common call-time authority chokepoint for all nine host functions.
+   When a session authority-state is present, verification and use accounting
+   are one atomic swap so revoke/drop cannot race between check and consume."
+  [caps id]
+  (if-let [authority-state (:authority-state caps)]
+    (let [decision (volatile! nil)]
+      (swap! authority-state
+             (fn [state]
+               (let [lease (get (:capability-leases caps) id)
+                     now-source (or (:lease-now-ms caps) #(System/currentTimeMillis))
+                     now-ms (long (if (ifn? now-source) (now-source) now-source))
+                     lease-live? (or (nil? lease)
+                                     (< now-ms (.toEpochMilli (Instant/parse (:expires-at lease)))))
+                     active? (and (contains? (:active state) id) lease-live?)
+                     remaining (get-in state [:remaining id])
+                     usable? (and active? (or (nil? remaining) (pos? remaining)))]
+                 (vreset! decision usable?)
+                 (cond
+                   usable?
+                   (let [next-state (update-in state [:uses id] (fnil inc 0))]
+                     (if (nil? remaining)
+                       next-state
+                       (let [left (dec remaining)]
+                         (cond-> (assoc-in next-state [:remaining id] left)
+                           (zero? left) (-> (update :active disj id)
+                                            (update :consumed (fnil conj #{}) id))))))
+
+                   lease-live? state
+
+                   :else
+                   (-> state
+                       (update :active disj id)
+                       (update :expired (fnil conj #{}) id))))))
+      (when-not @decision
+        (denied! id :grant/inactive
+                 {:granted (:grants caps)
+                  :authority @authority-state})))
+    (when-not (contains? (:grants caps) id)
+      (denied! id :grant/missing {:granted (:grants caps)}))))
+
+(defn- lease-live? [lease now-ms]
+  (try
+    (< (long now-ms) (.toEpochMilli (Instant/parse (:expires-at lease))))
+    (catch Exception _ false)))
+
+(defn- validate-capability-leases!
+  "Optional portable ABI leases narrow an already granted session import.
+  A lease is an audit descriptor, never the handle itself; the live handle and
+  its remaining-use counter stay inside this session's authority atom."
+  [requested leases execution-identity execution-identity-cid now-ms]
+  (cond
+    (nil? leases) {}
+    (not (map? leases))
+    (deny! :invalid-capability-leases leases)
+    (not= (set requested) (set (keys leases)))
+    (deny! :lease-import-mismatch (vec (keys leases))
+           {:kototama.tender/requested (vec requested)})
+    :else
+    (do (when-not (and (abi/valid-execution-identity? execution-identity)
+                       (string? execution-identity-cid)
+                       (re-matches #"b.+" execution-identity-cid))
+          (deny! :missing-execution-identity execution-identity-cid
+                 {:kototama.tender/execution-identity execution-identity}))
+        (doseq [[id lease] leases]
+          (when-not (and (contract/import-id id) (abi/valid-capability-lease? lease)
+                         (= execution-identity-cid (:execution-identity-cid lease))
+                         (= (:component-cid execution-identity) (:component-cid lease))
+                         (lease-live? lease now-ms))
+            (deny! :invalid-capability-lease id
+                   {:kototama.tender/import id
+                    :kototama.tender/lease lease})))
+        leases)))
+
+;; ── the 9 kototama.contract/import-surface host functions ──────────────────
+
+(defn- gen-keypair-host-fn
+  "`(out-ptr out-cap) -> bytes-written|-1`. Writes a fresh random 32-byte
+  Ed25519 seed followed by its 32-byte derived public key (64 bytes total)
+  into guest memory. `#{:crypto :secret}` -- gated by `:allow-secret-imports?`."
+  [caps _limits-state]
+  (host-fn "gen_keypair" [ValType/I32 ValType/I32] ValType/I32
+           (fn [instance args]
+             (ensure-granted! caps :gen-keypair)
+             (let [seed (byte-array 32)]
+               (.nextBytes (SecureRandom.) seed)
+               (let [pub (ed/pubkey-from-seed seed)]
+                 (write-bytes! instance (aget args 0) (aget args 1)
+                              (byte-array (concat seed pub))))))))
+
+(defn- sign-host-fn
+  "`(seed-ptr msg-ptr msg-len out-ptr out-cap) -> bytes-written|-1`. Signs
+  MSG with the raw 32-byte seed at SEED-PTR, writes the 64-byte signature.
+  `#{:crypto :secret}`."
+  [caps _limits-state]
+  (host-fn "sign" [ValType/I32 ValType/I32 ValType/I32 ValType/I32 ValType/I32] ValType/I32
+           (fn [instance args]
+             (ensure-granted! caps :sign)
+             (let [seed (read-bytes! instance (aget args 0) 32)
+                   msg (read-bytes! instance (aget args 1) (aget args 2))
+                   sig (ed/sign seed msg)]
+               (write-bytes! instance (aget args 3) (aget args 4) sig)))))
+
+(defn- verify-host-fn
+  "`(pub-ptr pub-len msg-ptr msg-len sig-ptr sig-len) -> 1|0`. `#{:crypto}`."
+  [caps _limits-state]
+  (host-fn "verify" (mapv valtype [:i32 :i32 :i32 :i32 :i32 :i32]) ValType/I32
+           (fn [instance args]
+             (ensure-granted! caps :verify)
+             (let [pub (read-bytes! instance (aget args 0) (aget args 1))
+                   msg (read-bytes! instance (aget args 2) (aget args 3))
+                   sig (read-bytes! instance (aget args 4) (aget args 5))]
+               (if (ed/verify pub msg sig) 1 0)))))
+
+(defn- sha256-hex-host-fn
+  "`(ptr len out-ptr out-cap) -> bytes-written|-1`. Writes the lowercase
+  hex SHA-256 digest of the input bytes. `#{:crypto}`."
+  [caps _limits-state]
+  (host-fn "sha256_hex" (mapv valtype [:i32 :i32 :i32 :i32]) ValType/I32
+           (fn [instance args]
+             (ensure-granted! caps :sha256-hex)
+             (let [bs (read-bytes! instance (aget args 0) (aget args 1))
+                   digest (.digest (MessageDigest/getInstance "SHA-256") bs)
+                   hex (apply str (map #(format "%02x" (bit-and (int %) 0xff)) digest))]
+               (write-bytes! instance (aget args 2) (aget args 3) (kbytes/utf8-bytes hex))))))
+
+;; ── outbound-HTTP hardening (guest-triggered network calls only) ──────────
+;;
+;; `http-post-host-fn`'s URL is entirely guest-controlled (read straight out
+;; of guest linear memory) and lease/tick execution
+;; (`fleet.core`/`fleet.exec`'s `run-loop-step`/`run-daemon!`/
+;; `recovery-pass!`) is fully synchronous and single-threaded per tick -- a
+;; guest granted `:http-post` that points the POST at a slow-loris /
+;; non-responding endpoint could otherwise block the host thread
+;; indefinitely, stalling the whole daemon process for every other tenant
+;; sharing it (a DoS, not just an SSRF concern). Both `http-post-host-fn`
+;; and `anthropic-infer` below share the same connect/request timeouts so a
+;; non-responding endpoint fails fast (in-band -1 / nil) instead of hanging.
+;; This part -- the DoS fix -- is complete and unconditional.
+;;
+;; `blocked-http-post-destination?` below is a SEPARATE, weaker mitigation:
+;; best-effort SSRF hardening against literal/naive targets (a guest that
+;; hardcodes "http://127.0.0.1/..." or "http://169.254.169.254/...", the
+;; overwhelmingly common real-world shape of this bug class), NOT a proof
+;; against a determined adversary who controls DNS for their own domain
+;; (DNS rebinding: resolve to a public IP when checked, then to
+;; 127.0.0.1/an internal address at the ACTUAL connection time a moment
+;; later, since `java.net.http.HttpClient` re-resolves the hostname
+;; independently and there is no supported per-request hook in its public
+;; API (`HttpClient.Builder`, JDK 24) to pin the connection to a
+;; specific, pre-validated `InetAddress` -- confirmed absent by inspecting
+;; the Builder's method set). A same-process fix exists in principle
+;; (rewrite the connection URI to the validated IP literal, preserve TLS
+;; SNI to the original host via `SSLParameters.setServerNames`) but was
+;; deliberately NOT implemented here: doing that correctly requires also
+;; controlling what hostname the JDK's TLS endpoint-identification
+;; algorithm validates the peer certificate against, which is
+;; implementation-detail-sensitive territory -- getting it subtly wrong
+;; would silently weaken certificate hostname verification for every
+;; legitimate HTTPS call this function makes, trading a narrower SSRF gap
+;; for a broader MITM one. That tradeoff was judged worse than shipping
+;; an honestly-scoped, narrower mitigation. Closing the DNS-rebind gap
+;; for real needs either an HTTP client with a pluggable resolver/
+;; connector (e.g. OkHttp's `Dns`/`EventListener`) or a vetted, tested
+;; SNI-preserving IP-pinning implementation as a dedicated follow-up --
+;; not a rushed addition here.
+
+(def ^:private default-http-timeout-ms
+  "Byte-identical to the previous hardcoded `(Duration/ofSeconds 5)`
+  constants this replaces -- every caller that never configures
+  `:http-connect-timeout-ms`/`:http-request-timeout-ms` on its HostCaps
+  (via `caps-timeout-ms` below) behaves exactly as before."
+  5000)
+
+(defn- caps-timeout-ms
+  "[com-junkawasaki/root, 2026-07-23] Reads LIMIT-KEY off CAPS' `:limits`,
+  falling back to `default-http-timeout-ms` -- added because a real
+  go-live deployment (kawaraban/cloud-itonami media actors posting to
+  the live pds.aozora.app) found the fixed 5s ceiling too aggressive for
+  that server's occasional latency (a real createRecord call that DID
+  eventually succeed, confirmed via a 30s raw HttpClient retry, still
+  timed out at the old hardcoded 5s default). Per-caller opt-in via
+  HostCaps, same shape `:allowed-url-prefixes` already established --
+  never a blanket widening of the default (which would weaken every
+  OTHER kototama consumer's fast-fail DoS guarantee for a problem
+  specific to one slow peer)."
+  [caps limit-key]
+  (or (get (:limits caps) limit-key) default-http-timeout-ms))
+
+(defn- timed-http-client
+  "A fresh `HttpClient` with a connect timeout wired in (same shape
+  `fleet.store/http-client` already establishes for the B2 native
+  API calls elsewhere in this repo, `.connectTimeout` on the builder).
+  CONNECT-TIMEOUT-MS defaults to `default-http-timeout-ms` (the previous
+  hardcoded behavior) when omitted."
+  ([] (timed-http-client default-http-timeout-ms))
+  ([connect-timeout-ms]
+   (-> (HttpClient/newBuilder)
+       (.connectTimeout (Duration/ofMillis connect-timeout-ms))
+       .build)))
+
+(defn- ipv6-unique-local?
+  "True when ADDR is an IPv6 Unique Local Address (RFC 4193, fc00::/7) --
+  the modern private-addressing scheme Docker/Kubernetes/most private
+  cloud networks actually assign today. `Inet6Address.isSiteLocalAddress`
+  only recognizes the legacy, deprecated fec0::/10 prefix, not fc00::/7,
+  so without this explicit check a real internal fc00::/fd00::-range
+  target would sail through unblocked."
+  [^InetAddress addr]
+  (and (instance? Inet6Address addr)
+       (let [b (.getAddress addr)]
+         (= 0xfc (bit-and (aget b 0) 0xfe)))))
+
+(defn- blocked-network-address?
+  "True when ADDR (a resolved `java.net.InetAddress`) is loopback /
+  link-local / site-local (RFC1918) / IPv6 unique-local (RFC4193,
+  fc00::/7) / multicast / any-local, or the well-known cloud-metadata
+  address 169.254.169.254 -- checked explicitly as defense-in-depth even
+  though `isLinkLocalAddress` already covers the 169.254.0.0/16 block
+  that address lives in."
+  [^InetAddress addr]
+  (or (.isLoopbackAddress addr)
+      (.isLinkLocalAddress addr)
+      (.isSiteLocalAddress addr)
+      (ipv6-unique-local? addr)
+      (.isMulticastAddress addr)
+      (.isAnyLocalAddress addr)
+      (= "169.254.169.254" (.getHostAddress addr))))
+
+(defn- blocked-http-post-destination?
+  "True when URL's host is missing/unparseable, or resolves to ANY address
+  `blocked-network-address?` flags -- fail CLOSED (an unresolvable host, or
+  any exception while resolving, is treated as blocked, never allowed
+  through). Best-effort hardening against LITERAL/naive SSRF targets (a
+  guest hardcoding a loopback/private/metadata address), run BEFORE any
+  real connection is attempted -- NOT a defense against DNS rebinding (a
+  host resolving to a public address here, then to an internal one at
+  actual connect time); see the namespace-level comment above for why
+  that gap is not closed in this function.
+
+  Despite the `-post-` in its name (kept for history/test-name stability
+  -- `tender_test.clj` already references it by this exact symbol), this
+  check is destination-classification only, agnostic of HTTP method:
+  `http-fetch-host-fn` (GET) below shares it verbatim with
+  `http-post-host-fn`, same as `contract/url-allowed?`."
+  [^String url]
+  (try
+    (let [host (.getHost (URI/create url))]
+      (boolean
+       (or (nil? host)
+           (str/blank? host)
+           (some blocked-network-address? (InetAddress/getAllByName host)))))
+    (catch Exception _ true)))
+
+(defn- http-post-host-fn
+  "`(url-ptr url-len body-ptr body-len out-ptr out-cap) -> bytes-written|-1`.
+  Synchronous POST (guest calls block on it -- Chicory host functions have
+  no async contract); writes the response body. `#{:network}`, metered
+  against `:max-http-posts` (default 0 -- fully denied unless a caller's
+  HostCaps explicitly raises the limit AND grants the import, matching
+  `kototama.contract/default-runtime-limits`).
+
+  A slow/non-responding destination fails fast (`http-connect-timeout`/
+  `http-request-timeout`) instead of hanging the host thread -- this is a
+  complete, unconditional fix for the DoS this was built to close. A
+  destination that resolves to a LITERAL loopback/private/link-local/
+  metadata address is refused (-1, the same in-band fail-closed
+  convention every other quota/overflow case here uses -- never an
+  exception) BEFORE any connection is attempted; this is best-effort SSRF
+  hardening, not a DNS-rebinding-proof one (see
+  `blocked-http-post-destination?`'s docstring).
+
+  `contract/url-allowed?` layers an OPT-IN, caller-specified positive list
+  on top (`:allowed-url-prefixes`, nil/unrestricted by default -- every
+  existing caller that never set it behaves exactly as before): a caller
+  wiring a guest that should only ever reach its own approved API
+  endpoint can restrict it further than the unconditional denylist above,
+  which only blocks internal/metadata destinations, not \"any public
+  host\"."
+  [caps limits-state network-context]
+  (host-fn "http_post" (mapv valtype [:i32 :i32 :i32 :i32 :i32 :i32]) ValType/I32
+           (fn [instance args]
+             (ensure-granted! caps :http-post)
+             (if-not (within-count-limit? :http-posts :max-http-posts caps limits-state)
+               -1
+               (let [url (kbytes/utf8-string ^bytes (read-bytes! instance (aget args 0) (aget args 1)))]
+                 (if (or (blocked-http-post-destination? url)
+                         (not (contract/url-allowed? (:limits caps) url)))
+                   -1
+                   (let [body (read-bytes! instance (aget args 2) (aget args 3))
+                         authority
+                         (try
+                           (when network-context
+                             (network/authorize-request!
+                              network-context url :post (count body)
+                              (inc (:http-posts @limits-state))))
+                           (catch Exception _ ::denied))]
+                     (if (= ::denied authority)
+                       -1
+                       (let [builder (-> (HttpRequest/newBuilder (URI/create url))
+                                         (.timeout (Duration/ofMillis (caps-timeout-ms caps :http-request-timeout-ms)))
+                                         (.POST (HttpRequest$BodyPublishers/ofByteArray body)))
+                             _ (doseq [[header value] (:headers authority)]
+                                 (.header builder header value))
+                             req (.build builder)
+                             resp (.send (timed-http-client (caps-timeout-ms caps :http-connect-timeout-ms)) req
+                                         (HttpResponse$BodyHandlers/ofByteArray))
+                             response ^bytes (.body resp)
+                             response-limit (or (:max-response-bytes authority)
+                                                (aget args 5))]
+                         (swap! limits-state update :http-posts inc)
+                         (if (> (alength response) response-limit)
+                           -1
+                           (write-bytes! instance (aget args 4) (aget args 5)
+                                         response)))))))))))
+
+(defn- http-fetch-host-fn
+  "`(url-ptr url-len out-ptr out-cap) -> bytes-written|-1`. Synchronous
+  GET (guest calls block on it, same as `http-post-host-fn`); writes the
+  response body. `#{:network}`, metered against `:max-http-fetches`
+  (default 0 -- fully denied unless a caller's HostCaps explicitly
+  raises the limit AND grants the import, same convention
+  `:max-http-posts` uses).
+
+  Deliberately reuses `kotoba-core-contracts`' PRE-EXISTING \"http/fetch\"
+  capability (id 205) rather than registering a new one: `kotoba wasm
+  emit`'s own kernel-capability vocabulary already contracts this exact
+  (url-ptr url-len out-ptr out-cap) -> bytes-written|-1 GET shape
+  (`kotoba.wasm-exec/real-host-functions`' `http-fetch`) -- kototama
+  becomes a SECOND host implementing the SAME shared ABI entry, not a
+  differently-shaped sibling a guest would have to pick between.
+
+  Same SSRF/DoS hardening as `http-post-host-fn`, applied verbatim: the
+  unconditional `blocked-http-post-destination?` denylist (loopback/
+  private/link-local/metadata, best-effort against literal targets, not
+  DNS-rebinding-proof) ANDed with the opt-in `contract/url-allowed?`
+  positive list, both checked BEFORE any connection is attempted, and
+  the same `http-connect-timeout`/`http-request-timeout` so a slow/non-
+  responding peer fails fast instead of hanging the host thread."
+  [caps limits-state]
+  (host-fn "http_fetch" (mapv valtype [:i32 :i32 :i32 :i32]) ValType/I32
+           (fn [instance args]
+             (ensure-granted! caps :http-fetch)
+             (if-not (within-count-limit? :http-fetches :max-http-fetches caps limits-state)
+               -1
+               (let [url (kbytes/utf8-string ^bytes (read-bytes! instance (aget args 0) (aget args 1)))]
+                 (if (or (blocked-http-post-destination? url)
+                         (not (contract/url-allowed? (:limits caps) url)))
+                   -1
+                   (let [req (-> (HttpRequest/newBuilder (URI/create url))
+                                (.timeout (Duration/ofMillis (caps-timeout-ms caps :http-request-timeout-ms)))
+                                .GET
+                                .build)
+                         resp (.send (timed-http-client (caps-timeout-ms caps :http-connect-timeout-ms))
+                                     req (HttpResponse$BodyHandlers/ofByteArray))]
+                     (swap! limits-state update :http-fetches inc)
+                     (write-bytes! instance (aget args 2) (aget args 3) (.body resp)))))))))
+
+;; ── CBOR/JSON wire-format encoding (com-junkawasaki/root ADR-2607230943)
+;; -- pure computation, no network/secret/write effect. A `.kotoba` guest
+;; can only build byte buffers by string concatenation (no map/vector
+;; literals), so `parse-flat-pairs` defines ONE simple, guest-buildable
+;; wire format (key<TAB>value, one pair per LF-separated line, guest's
+;; own order preserved) that both `cbor-encode-host-fn` and
+;; `json-encode-host-fn` share, rather than each inventing its own. This
+;; is deliberately NOT a general encoder: only flat string->string maps
+;; are representable, matching the narrow use case (CACAO token bytes,
+;; XRPC request bodies) this wave was built for. ──────────────────────────
+
+(defn- parse-flat-pairs
+  "Parses kototama's guest-facing flat wire format: one `key<TAB>value`
+  pair per LF-separated line, in the guest's own order (preserved, not
+  resorted -- CBOR/JSON map key order has no semantic meaning, but
+  preserving it keeps encode output deterministic and easy to test).
+  Blank lines are skipped; a non-blank line with no TAB is fail-soft
+  dropped (contributes no pair) rather than aborting the whole encode --
+  a malformed line is a guest bug, not a reason to trap the host call."
+  [^String s]
+  (->> (str/split-lines s)
+       (remove str/blank?)
+       (keep (fn [line]
+               (when-let [i (str/index-of line "\t")]
+                 [(subs line 0 i) (subs line (inc i))])))
+       vec))
+
+;; ── dotted-path nesting extension (com-junkawasaki/root, third wave --
+;; Phase A's ADR-2607230943 flagged this as an explicit follow-up, closed
+;; here). `parse-flat-pairs` above is UNCHANGED; this is a second parsing
+;; pass over its output. A `.kotoba` guest still only ever builds ONE
+;; flat `key<TAB>value` pairs buffer (no map/vector literals, same
+;; constraint as before) -- but a key MAY now be a dot-separated PATH
+;; ("s.t", "s.s", "resources.0", "resources.1", "p.resources.0"), which
+;; `build-nested-tree` interprets as one level of OBJECT/ARRAY nesting: a
+;; segment that is a bare non-negative integer ("0", "1", ...) selects an
+;; ARRAY position, any other segment selects an OBJECT field. A key with
+;; NO dot is a single-segment path, i.e. byte-for-byte the pre-extension
+;; flat behavior -- this is a strict SUPERSET of the old wire format, not
+;; a replacement, so every existing flat/dot-free caller (kawaraban/
+;; cloud-itonami's Phase B/C fixtures, every test below that predates this
+;; wave) is unaffected.
+;;
+;; The tree is built and rendered as plain vectors of `[key val]` pairs in
+;; first-occurrence order -- deliberately NEVER promoted through a real
+;; Clojure map for an object level, so output byte order is fully
+;; guest-controlled, not subject to `clojure.lang.PersistentArrayMap`'s
+;; undocumented-to-a-`.kotoba`-author promotion to a hash-map (and its
+;; then JVM-hashing-defined, non-insertion-order iteration) past some
+;; entry count. `tree-node->cbor`/`tree-node->json` below render this tree
+;; directly, calling back into `cbor-val`/`json-escape` only for leaf
+;; strings.
+
+(defn- numeric-key? [^String s] (boolean (re-matches #"\d+" s)))
+
+(defn- array-entries?
+  "True iff ENTRIES (a vector of `[key val]` pairs) has EXACTLY the keys
+  \"0\" .. (str (dec (count entries))), in any occurrence order -- i.e. a
+  guest-declared ARRAY (\"resources.0\"/\"resources.1\", contiguous from
+  0), not an object whose field names merely happen to be digit strings."
+  [entries]
+  (let [ks (mapv first entries)]
+    (and (seq ks)
+         (every? numeric-key? ks)
+         (= (set (map #(Integer/parseInt ^String %) ks))
+            (set (range (count ks)))))))
+
+(defn- object-entries-assoc
+  "Sets `[SEG VALUE]` into ENTRIES (a vector of `[key val]` pairs in
+  first-occurrence order): replaces an existing SEG's value in place
+  (same position -- repeating a key is last-write-wins, never a
+  duplicate-key output), or appends a new pair at the end."
+  [entries seg value]
+  (let [idx (first (keep-indexed (fn [i [k _]] (when (= k seg) i)) entries))]
+    (if idx
+      (assoc entries idx [seg value])
+      (conj entries [seg value]))))
+
+(defn- assoc-path!
+  "Inserts VALUE at PATH (a non-empty vector of dot-separated key
+  segments, e.g. `[\"p\" \"resources\" \"0\"]`) into ENTRIES (a vector of
+  `[key subtree-or-leaf]` pairs), creating intermediate object-shaped
+  subtrees (themselves vectors of pairs) as needed. A leaf (PATH
+  exhausted) sets VALUE directly -- always a plain string, since
+  `parse-flat-pairs`' values are never anything else."
+  [entries [seg & more] value]
+  (if (seq more)
+    (let [idx (first (keep-indexed (fn [i [k _]] (when (= k seg) i)) entries))
+          existing (when idx (second (nth entries idx)))
+          child (if (vector? existing) existing [])]
+      (object-entries-assoc entries seg (assoc-path! child more value)))
+    (object-entries-assoc entries seg value)))
+
+(defn- build-nested-tree
+  "Builds an ordered tree from PAIRS (`parse-flat-pairs`' output): each
+  `[dotted-key value]` pair is inserted via `assoc-path!` after splitting
+  the key on `.` (`\"s.t\"` -> `[\"s\" \"t\"]`). A key with no dot is a
+  single-segment path -- unchanged from the pre-extension flat behavior.
+  Returns a vector of `[key subtree-or-leaf]` pairs (the top-level
+  object)."
+  [pairs]
+  (reduce (fn [entries [k v]] (assoc-path! entries (str/split k #"\.") v))
+          []
+          pairs))
+
+;; ── minimal CBOR (definite-length; 1:1 port of cloud-itonami's proven
+;; cacao.clj cbor-head/cbor-val, itself traced to kawaraban.cacao/
+;; tashikame.cacao/kotoba.cacao -- 52 real published records against
+;; pds.aozora.app as of ADR-2607110200). `cbor-val` stays general
+;; (map/string/sequential, matching the reference) even though
+;; `cbor-encode-host-fn` below only ever feeds it a flat string->string
+;; map -- a future JVM-side caller with real nested Clojure data can
+;; still call it directly. ──────────────────────────────────────────────
+
+(defn- cbor-head [^ByteArrayOutputStream o major n]
+  (cond (< n 24)    (.write o (int (+ (bit-shift-left major 5) n)))
+        (< n 256)   (do (.write o (int (+ (bit-shift-left major 5) 24))) (.write o (int n)))
+        (< n 65536) (do (.write o (int (+ (bit-shift-left major 5) 25)))
+                        (.write o (int (bit-and (unsigned-bit-shift-right n 8) 0xff)))
+                        (.write o (int (bit-and n 0xff))))
+        :else (throw (ex-info "cbor len too big" {:n n}))))
+
+(defn- cbor-val [^ByteArrayOutputStream o v]
+  (cond
+    (string? v)     (let [b (kbytes/utf8-bytes ^String v)] (cbor-head o 3 (alength b)) (.write o b 0 (alength b)))
+    (map? v)        (do (cbor-head o 5 (count v)) (doseq [[k vv] v] (cbor-val o (name k)) (cbor-val o vv)))
+    (sequential? v) (do (cbor-head o 4 (count v)) (doseq [x v] (cbor-val o x)))
+    :else           (cbor-val o (str v))))
+
+(defn- tree-node->cbor
+  "Writes one `build-nested-tree` NODE into O: a plain string leaf via
+  `cbor-val`; an ARRAY-shaped node (`array-entries?`) as a definite-
+  length CBOR array (major type 4) in ascending numeric-key order; any
+  other node as a definite-length CBOR map (major type 5) in the guest's
+  own first-occurrence key order. TOP-LEVEL? forces map rendering even
+  when every (dot-free, hence never guest-intended-as-index) key happens
+  to look numeric -- `cbor-encode`'s ABI has always been \"a map of
+  pairs\", never an array, so the outermost call must never reinterpret a
+  flat set of pairs as an array just because of what its keys look like;
+  this is what makes the nesting extension a strict superset of the
+  pre-extension flat-only behavior (see `cbor-pairs-bytes`'s docstring)."
+  [^ByteArrayOutputStream o node top-level?]
+  (cond
+    (string? node) (cbor-val o node)
+    (and (not top-level?) (array-entries? node))
+    (let [items (->> node (sort-by (comp #(Integer/parseInt ^String %) first)) (mapv second))]
+      (cbor-head o 4 (count items))
+      (doseq [item items] (tree-node->cbor o item false)))
+    :else
+    (do (cbor-head o 5 (count node))
+        (doseq [[k v] node] (cbor-val o k) (tree-node->cbor o v false)))))
+
+(defn- cbor-pairs-bytes
+  "CBOR-encodes PAIRS (a vector of `[key value]` string pairs, as
+  `parse-flat-pairs` returns) via `build-nested-tree` + `tree-node->cbor`.
+  Byte-for-byte identical to this function's pre-nesting-extension output
+  for any PAIRS with no dotted keys: `build-nested-tree` then creates no
+  subtree (every value stays a plain string leaf) and `tree-node->cbor`'s
+  TOP-LEVEL? flag forces the SAME definite-length CBOR map (major type 5,
+  count = (count pairs)) this function has always produced, in the
+  guest's own pair order -- not via an intermediate Clojure map, so
+  guest-specified order is preserved exactly (a Clojure hash-map would
+  not guarantee that past its array-map->hash-map promotion threshold)."
+  ^bytes [pairs]
+  (let [o (ByteArrayOutputStream.)]
+    (tree-node->cbor o (build-nested-tree pairs) true)
+    (.toByteArray o)))
+
+(defn- cbor-encode-host-fn
+  "`(pairs-ptr pairs-len out-ptr out-cap) -> bytes-written|-1`. Parses
+  PAIRS via `parse-flat-pairs` and writes the definite-length CBOR map
+  `cbor-pairs-bytes` produces. `#{}` -- pure computation, not gated by
+  any RuntimeLimits count (same as `sha256-hex-host-fn`)."
+  [caps _limits-state]
+  (host-fn "cbor_encode" (mapv valtype [:i32 :i32 :i32 :i32]) ValType/I32
+           (fn [instance args]
+             (ensure-granted! caps :cbor-encode)
+             (let [pairs (parse-flat-pairs (kbytes/utf8-string ^bytes (read-bytes! instance (aget args 0) (aget args 1))))]
+               (write-bytes! instance (aget args 2) (aget args 3) (cbor-pairs-bytes pairs))))))
+
+;; ── minimal JSON object encode + bounded string-field scan. Neither is
+;; a general JSON codec (see each fn's own docstring for the narrow
+;; scope) -- `json.data-json` (already a dep, used by `anthropic-
+;; infer` below) is deliberately NOT reused for the ENCODE direction:
+;; it doesn't preserve `parse-flat-pairs`' guest-specified key order
+;; past 8 entries (`PersistentArrayMap` converts to a hash-map beyond
+;; that), which would make the CBOR/JSON encode outputs diverge for no
+;; guest-visible reason. ──────────────────────────────────────────────────
+
+(defn- json-escape
+  "Escapes S for embedding as a JSON string body (between the quotes):
+  `\"`/`\\`/newline/return/tab get their standard short escapes, every
+  other C0 control character gets `\\uXXXX`, everything else passes
+  through as-is (this repo's guest strings are UTF-8; JSON strings are
+  UTF-16-code-unit text but every valid UTF-8 byte sequence Java decodes
+  to `String` round-trips through `.getBytes \"UTF-8\"` unescaped)."
+  ^String [^String s]
+  (let [sb (StringBuilder.)]
+    (doseq [c s]
+      (case c
+        \" (.append sb "\\\"")
+        \\ (.append sb "\\\\")
+        \newline (.append sb "\\n")
+        \return (.append sb "\\r")
+        \tab (.append sb "\\t")
+        (if (< (int c) 0x20)
+          (.append sb (format "\\u%04x" (int c)))
+          (.append sb c))))
+    (.toString sb)))
+
+(defn- tree-node->json
+  "Same tree-shaped rendering `tree-node->cbor` performs, for JSON: a
+  string leaf (`json-escape`d and quoted), an ARRAY-shaped node as a JSON
+  array in ascending numeric-key order, any other node (or the forced
+  TOP-LEVEL? case) as a JSON object in the guest's own first-occurrence
+  key order. See `tree-node->cbor`'s docstring for why TOP-LEVEL? forces
+  object rendering."
+  ^String [node top-level?]
+  (cond
+    (string? node) (str "\"" (json-escape node) "\"")
+    (and (not top-level?) (array-entries? node))
+    (let [items (->> node (sort-by (comp #(Integer/parseInt ^String %) first)) (mapv second))]
+      (str "[" (str/join "," (map #(tree-node->json % false) items)) "]"))
+    :else
+    (str "{" (str/join "," (map (fn [[k v]] (str "\"" (json-escape k) "\":" (tree-node->json v false))) node)) "}")))
+
+(defn- json-pairs-bytes
+  "JSON-encodes PAIRS (a vector of `[key value]` string pairs, as
+  `parse-flat-pairs` returns) via `build-nested-tree` + `tree-node->json`,
+  e.g. an XRPC request body -- NOT a general JSON codec (no numbers/
+  booleans/null; every leaf is a JSON string). Byte-for-byte identical to
+  this function's pre-nesting-extension output for any PAIRS with no
+  dotted keys (same reasoning as `cbor-pairs-bytes`'s docstring)."
+  ^bytes [pairs]
+  (kbytes/utf8-bytes (tree-node->json (build-nested-tree pairs) true)))
+
+(defn- json-encode-host-fn
+  "`(pairs-ptr pairs-len out-ptr out-cap) -> bytes-written|-1`. Same
+  flat pairs wire format as `cbor-encode-host-fn`; writes the JSON
+  object `json-pairs-bytes` produces. `#{}` -- pure computation, not
+  gated by any RuntimeLimits count."
+  [caps _limits-state]
+  (host-fn "json_encode" (mapv valtype [:i32 :i32 :i32 :i32]) ValType/I32
+           (fn [instance args]
+             (ensure-granted! caps :json-encode)
+             (let [pairs (parse-flat-pairs (kbytes/utf8-string ^bytes (read-bytes! instance (aget args 0) (aget args 1))))]
+               (write-bytes! instance (aget args 2) (aget args 3) (json-pairs-bytes pairs))))))
+
+(defn- json-string-field-value
+  "Bounded string scan (deliberately NOT a JSON parser) for a
+  `\"FIELD\":\"...\"` occurrence in JSON-TEXT: finds the literal
+  `\"FIELD\"` key, the next `:`, skips ASCII whitespace, requires an
+  opening `\"`, then reads the string value up to the next un-escaped
+  `\"` (un-escaping `\\\"`/`\\\\`/`\\n`/`\\r`/`\\t`, passing any other
+  `\\X` escape through as literal `X`). Returns the extracted value, or
+  nil when FIELD isn't present as a string-valued key (missing key,
+  non-string value, or malformed/truncated JSON). Scope is intentionally
+  narrow: kototama.tender never parses arbitrary JSON -- this exists
+  only to pull one known field (e.g. `accessJwt`/`uri`/`cid`) out of an
+  XRPC response body."
+  [^String json-text ^String field]
+  (let [needle (str "\"" field "\"")
+        key-idx (str/index-of json-text needle)]
+    (when key-idx
+      (let [colon-idx (str/index-of json-text ":" (+ key-idx (count needle)))]
+        (when colon-idx
+          (let [n (count json-text)
+                value-start (loop [i (inc colon-idx)]
+                              (cond
+                                (>= i n) nil
+                                (Character/isWhitespace (.charAt json-text i)) (recur (inc i))
+                                (= \" (.charAt json-text i)) (inc i)
+                                :else nil))]
+            (when value-start
+              (loop [i value-start sb (StringBuilder.)]
+                (cond
+                  (>= i n) nil
+                  (= \\ (.charAt json-text i))
+                  (when (< (inc i) n)
+                    (let [esc (.charAt json-text (inc i))
+                          unescaped (case esc \" \" \\ \\ \n \newline \r \return \t \tab esc)]
+                      (recur (+ i 2) (.append sb unescaped))))
+                  (= \" (.charAt json-text i)) (.toString sb)
+                  :else (recur (inc i) (.append sb (.charAt json-text i))))))))))))
+
+(defn- json-extract-field-host-fn
+  "`(json-ptr json-len field-ptr field-len out-ptr out-cap) ->
+  bytes-written|-1`. See `json-string-field-value`'s docstring for the
+  exact bounded scan performed -- NOT a general JSON parser. `#{}` --
+  pure computation, not gated by any RuntimeLimits count."
+  [caps _limits-state]
+  (host-fn "json_extract_field" (mapv valtype [:i32 :i32 :i32 :i32 :i32 :i32]) ValType/I32
+           (fn [instance args]
+             (ensure-granted! caps :json-extract-field)
+             (let [json-text (kbytes/utf8-string ^bytes (read-bytes! instance (aget args 0) (aget args 1)))
+                   field (kbytes/utf8-string ^bytes (read-bytes! instance (aget args 2) (aget args 3)))
+                   value (json-string-field-value json-text field)]
+               (if (nil? value)
+                 -1
+                 (write-bytes! instance (aget args 4) (aget args 5) (kbytes/utf8-bytes ^String value)))))))
+
+;; ── http-post-headers (com-junkawasaki/root, third wave -- Phase A's
+;; ADR-2607230943 flagged this as an explicit follow-up, closed here).
+;; Placed here (after the CBOR/JSON section, not up next to
+;; `http-post-host-fn`/`http-fetch-host-fn` above) because it reuses
+;; `parse-flat-pairs`, defined earlier in that section -- it is otherwise
+;; an HTTP capability, not a codec one. ─────────────────────────────────
+
+(defn- post-request-with-headers
+  "Builds (does NOT send) an `HttpRequest`: POST to URL with BODY bytes,
+  REQUEST-TIMEOUT-MS applied (defaults to `default-http-timeout-ms` when
+  the 3-arg arity is used, preserving every existing caller's behavior),
+  and every `[name value]` pair in HEADERS (as `parse-flat-pairs`
+  returns) added via `.header` in order. Split out from
+  `http-post-headers-host-fn` so a test can exercise the actual
+  header-application code path directly against a real local server
+  (the SSRF denylist makes every reachable local server loopback, so
+  `http-post-headers-host-fn` itself can only be tested for REFUSAL --
+  see the http-post/http-fetch WAT test sections' own header comment for
+  this same structural reason)."
+  (^HttpRequest [url body headers] (post-request-with-headers url body headers default-http-timeout-ms))
+  (^HttpRequest [^String url ^bytes body headers request-timeout-ms]
+   (-> (reduce (fn [^HttpRequest$Builder b [k v]] (.header b ^String k ^String v))
+               (-> (HttpRequest/newBuilder (URI/create url))
+                   (.timeout (Duration/ofMillis request-timeout-ms)))
+               headers)
+       (.POST (HttpRequest$BodyPublishers/ofByteArray body))
+       .build)))
+
+(defn- http-post-headers-host-fn
+  "`(url-ptr url-len body-ptr body-len headers-ptr headers-len out-ptr
+  out-cap) -> bytes-written|-1`. Same synchronous POST semantics,
+  SSRF/DoS hardening (`blocked-http-post-destination?`/
+  `contract/url-allowed?`/connect+request timeouts), and `:max-http-posts`
+  metering as `http-post-host-fn` -- this is the SAME operation with one
+  added guest-supplied input (custom request headers, e.g.
+  `Authorization: Bearer <token>` for `com.atproto.repo.createRecord`,
+  which `http-post` alone cannot express), so it is gated by its OWN
+  `:http-post-headers` import id (a caller must grant it explicitly,
+  same as any other import) but shares `:http-post`'s `:max-http-posts`
+  RuntimeLimits counter -- one network-egress budget, not two (see
+  `kototama.contract`'s `:http-post-headers` comment).
+
+  HEADERS uses the SAME flat `key<TAB>value`, LF-separated pairs wire
+  format `cbor-encode`/`json-encode` already use (`parse-flat-pairs`,
+  reused as-is here -- a header block is inherently flat, so it never
+  needed the dotted-path nesting extension those two capabilities
+  gained). Header order is preserved (some servers care); a malformed
+  line (no TAB) is fail-soft dropped, same as every other `parse-flat-
+  pairs` caller."
+  [caps limits-state]
+  (host-fn "http_post_headers" (mapv valtype [:i32 :i32 :i32 :i32 :i32 :i32 :i32 :i32]) ValType/I32
+           (fn [instance args]
+             (ensure-granted! caps :http-post-headers)
+             (if-not (within-count-limit? :http-posts :max-http-posts caps limits-state)
+               -1
+               (let [url (kbytes/utf8-string ^bytes (read-bytes! instance (aget args 0) (aget args 1)))]
+                 (if (or (blocked-http-post-destination? url)
+                         (not (contract/url-allowed? (:limits caps) url)))
+                   -1
+                   (let [body (read-bytes! instance (aget args 2) (aget args 3))
+                         header-text (kbytes/utf8-string ^bytes (read-bytes! instance (aget args 4) (aget args 5)))
+                         headers (parse-flat-pairs header-text)
+                         req (post-request-with-headers url body headers (caps-timeout-ms caps :http-request-timeout-ms))
+                         resp (.send (timed-http-client (caps-timeout-ms caps :http-connect-timeout-ms))
+                                     req (HttpResponse$BodyHandlers/ofByteArray))]
+                     (swap! limits-state update :http-posts inc)
+                     (write-bytes! instance (aget args 6) (aget args 7) (.body resp)))))))))
+
+;; ── llm-infer's injected client: real Anthropic call in production,
+;; fake `:infer-fn` in tests (same DI shape as `store` below) ──────────────
+
+(def ^:private anthropic-messages-url "https://api.anthropic.com/v1/messages")
+(def ^:private default-llm-model "claude-opus-4-8")
+(def ^:private default-llm-max-tokens 1024)
+
+(def ^:private llm-api-key-env-vars
+  "Same resolution order `cloud_itonami.runtime/model-config` uses --
+  ITO_MODEL_API_KEY takes precedence over the more generic provider-
+  specific vars, ANTHROPIC_API_KEY is the last resort."
+  ["ITO_MODEL_API_KEY" "OPENAI_API_KEY" "OPENCLAW_API_KEY" "HERMES_API_KEY" "ANTHROPIC_API_KEY"])
+
+(defn resolve-llm-api-key
+  "First non-blank value among `llm-api-key-env-vars`, or nil if every one
+  of them is unset/blank -- callers treat nil as \"no key configured\",
+  never throw."
+  []
+  (some (fn [env-var]
+          (let [v (System/getenv env-var)]
+            (when-not (str/blank? v) v)))
+        llm-api-key-env-vars))
+
+(defn- anthropic-infer
+  "Calls the real Anthropic Messages API with PROMPT as a single user
+  message, authenticated with API-KEY; returns the assistant's text
+  reply, or nil on ANY failure (non-2xx status, network error, malformed
+  JSON) -- never throws, so a caller can treat nil uniformly with \"no
+  key configured\" and fail closed.
+
+  `anthropic-messages-url` is a fixed constant (not guest-controlled), so
+  no destination check is needed here the way `http-post-host-fn` needs
+  one -- but the same `http-connect-timeout`/`http-request-timeout` apply
+  so a non-responding/slow endpoint still fails fast (in-band nil, via the
+  existing catch) instead of hanging the host thread for every tenant
+  sharing this tick."
+  [api-key prompt]
+  (try
+    (let [body (json/write-str {:model default-llm-model
+                                :max_tokens default-llm-max-tokens
+                                :messages [{:role "user" :content prompt}]})
+          req (-> (HttpRequest/newBuilder (URI/create anthropic-messages-url))
+                 (.header "content-type" "application/json")
+                 (.header "x-api-key" api-key)
+                 (.header "anthropic-version" "2023-06-01")
+                 (.timeout (Duration/ofMillis default-http-timeout-ms))
+                 (.POST (HttpRequest$BodyPublishers/ofString body))
+                 .build)
+          resp (.send (timed-http-client) req (HttpResponse$BodyHandlers/ofString))]
+      (when (<= 200 (.statusCode resp) 299)
+        (let [resp-body (json/read-str (.body resp) :key-fn keyword)
+              text (apply str (keep #(when (= "text" (:type %)) (:text %))
+                                    (:content resp-body)))]
+          (when-not (str/blank? text) text))))
+    (catch Exception _ nil)))
+
+(defn default-llm-client
+  "Production `{:infer-fn}` backing `llm-infer-host-fn`: resolves the API
+  key fresh on every call (env can change between calls in a long-lived
+  tender process) and calls the real Anthropic Messages API, or returns
+  nil (fail-closed) with no network call at all when no key is
+  configured."
+  []
+  {:infer-fn (fn [prompt]
+              (when-let [api-key (resolve-llm-api-key)]
+                (anthropic-infer api-key prompt)))})
+
+(defn- llm-infer-host-fn
+  "`(prompt-ptr prompt-len out-ptr out-cap) -> bytes-written|-1`. Reads
+  PROMPT out of guest memory, sends it to the injected LLM-CLIENT's
+  `:infer-fn` as a single user message, and writes the text reply.
+  `#{:network}`, metered against `:max-llm-infers` (default 0 -- fully
+  denied unless a caller's HostCaps explicitly raises the limit AND
+  grants the import, same convention `http-post-host-fn` uses).
+
+  Fail-closed like every quota/overflow case here (-1, never an
+  exception): `:infer-fn` returning nil (no API key configured, or the
+  underlying call failed) is indistinguishable in-band from a metering
+  denial or an oversized reply -- a well-behaved guest sees -1 either
+  way and can't tell which, which is the point (it never gets to probe
+  the host's credential state)."
+  [caps limits-state llm-client]
+  (host-fn "llm_infer" (mapv valtype [:i32 :i32 :i32 :i32]) ValType/I32
+           (fn [instance args]
+             (ensure-granted! caps :llm-infer)
+             (if-not (within-count-limit? :llm-infers :max-llm-infers caps limits-state)
+               -1
+               (let [prompt (kbytes/utf8-string ^bytes (read-bytes! instance (aget args 0) (aget args 1)))
+                     text ((:infer-fn llm-client) prompt)]
+                 (if (nil? text)
+                   -1
+                   (do (swap! limits-state update :llm-infers inc)
+                       (write-bytes! instance (aget args 2) (aget args 3) (kbytes/utf8-bytes ^String text)))))))))
+
+(defn- kagi-sign-host-fn
+  "`(ref-ptr ref-len msg-ptr msg-len out-ptr out-cap) -> written|-1`.
+  Decision-aware trusted adapter for kagi Keychain signing. The guest
+  never sees the key — only an opaque ref string and message bytes.
+  `#{:crypto}`, metered against `:max-kagi-signs` (default 0).
+
+  Requires inject: `:kagi-client` with `:authorized-sign-fn`
+  `(fn [decisions ref-str msg-bytes] -> bytes|nil)` and a non-empty
+  `:kagi-decisions` vector of maps each carrying at least `:ref`.
+  Without both, every call returns -1 (fail-closed; never throws)."
+  [caps limits-state kagi-client kagi-decisions]
+  (host-fn "kagi_sign" (mapv valtype [:i32 :i32 :i32 :i32 :i32 :i32]) ValType/I32
+           (fn [instance args]
+             (ensure-granted! caps :kagi-sign)
+             (let [ref-len (int (aget args 1))
+                   msg-len (int (aget args 3))
+                   sign-fn (:authorized-sign-fn kagi-client)]
+               (cond
+                 (or (nil? sign-fn)
+                     (not (sequential? kagi-decisions))
+                     (empty? kagi-decisions))
+                 -1
+                 (or (<= ref-len 0) (> ref-len 255)
+                     (neg? msg-len) (> msg-len 65536))
+                 -1
+                 (not (within-count-limit? :kagi-signs :max-kagi-signs
+                                           caps limits-state))
+                 -1
+                 :else
+                 (try
+                   (let [ref (kbytes/utf8-string ^bytes (read-bytes! instance (aget args 0) ref-len))
+                         msg (read-bytes! instance (aget args 2) msg-len)
+                         sig (sign-fn kagi-decisions ref msg)]
+                     (if (or (nil? sig) (not (bytes? sig)))
+                       -1
+                       (let [n (write-bytes! instance (aget args 4) (aget args 5) sig)]
+                         (when (not (neg? n))
+                           (swap! limits-state update :kagi-signs inc))
+                         n)))
+                   (catch Exception _ -1)))))))
+
+(defn- log-read-host-fn
+  "`(out-ptr out-cap) -> bytes-written|-1`. Reads the injected store's
+  `:read-fn` (no args -> bytes) and writes it. `#{:storage}`, metered
+  against `:max-log-read-bytes` (bytes actually read, not just requested)."
+  [caps limits-state store]
+  (host-fn "log_read" [ValType/I32 ValType/I32] ValType/I32
+           (fn [instance args]
+             (ensure-granted! caps :log-read)
+             (let [bs ((:read-fn store))]
+               (if (try-add-bytes! :log-read-bytes :max-log-read-bytes caps limits-state (count bs))
+                 (write-bytes! instance (aget args 0) (aget args 1) bs)
+                 -1)))))
+
+(defn- log-write-host-fn
+  "`(ptr len) -> 0|-1`. Appends the input bytes via the injected store's
+  `:append-fn`. `#{:storage :write}` -- gated by `:allow-write-imports?`
+  AND metered against `:max-log-write-bytes` (cumulative across this
+  Instance's lifetime)."
+  [caps limits-state store]
+  (host-fn "log_write" [ValType/I32 ValType/I32] ValType/I32
+           (fn [instance args]
+             (ensure-granted! caps :log-write)
+             (let [bs (read-bytes! instance (aget args 0) (aget args 1))]
+               (if (try-add-bytes! :log-write-bytes :max-log-write-bytes caps limits-state (count bs))
+                 (do ((:append-fn store) bs) 0)
+                 -1)))))
+
+(defn- clock-monotonic-host-fn [caps _limits-state]
+  (host-fn "clock_monotonic" [] ValType/I64
+           (fn [_instance _args]
+             (ensure-granted! caps :clock-monotonic)
+             (System/currentTimeMillis))))
+
+(def ^:private clock-now-capability-id 7)
+
+(defn- cap-call-host-fn
+  "Amu's wasm32-kotoba-v1 backend lowers `(typed-cap-call id :i64 :i64 x)`
+  to import `kotoba:cap`/`call`. Capability 7 is `clock/now` (the i64 seed
+  ABI the compiler actually elaborates, not the variant kit schema). The
+  grant remains `:clock-monotonic` — same host clock the legacy
+  `clock_monotonic` import already uses."
+  [caps _limits-state]
+  (host-fn "kotoba:cap" "call" [ValType/I64 ValType/I64] ValType/I64
+           (fn [_instance args]
+             (let [id (aget args 0)]
+               (cond
+                 (= id clock-now-capability-id)
+                 (do (ensure-granted! caps :clock-monotonic)
+                     (System/currentTimeMillis))
+                 :else
+                 (denied! :cap-call :grant/unknown-capability
+                          {:capability-id id}))))))
+
+
+(defn- hmac-sha256 [key data]
+  (let [mac (Mac/getInstance "HmacSHA256")]
+    (.init mac (SecretKeySpec. ^bytes key "HmacSHA256"))
+    (.doFinal mac ^bytes data)))
+
+(defn- scram-sha256-host-fn
+  "Purpose-bound credential operation. The named password stays in the host;
+  the guest supplies PostgreSQL's salt, iteration count and SCRAM auth message,
+  and receives client-proof || server-signature (64 bytes)."
+  [caps limits-state credentials]
+  (host-fn "scram_sha256" (mapv valtype [:i32 :i32 :i32 :i32 :i32 :i32 :i32 :i32 :i32]) ValType/I32
+           (fn [instance args]
+             (ensure-granted! caps :scram-sha256)
+             (if-not (within-count-limit? :scram-proofs :max-scram-proofs caps limits-state)
+               -1
+               (try
+                 (let [ref-len (aget args 1)
+                       salt-len (aget args 3)
+                       iterations (aget args 4)
+                       auth-len (aget args 6)
+                       ref (when (and (pos? ref-len) (<= ref-len 255))
+                             (kbytes/utf8-string ^bytes (read-bytes! instance (aget args 0) ref-len)))
+                       allowlist (get-in caps [:limits :scram-credential-allowlist])
+                       credential-map (cond
+                                        (fn? credentials) (credentials)
+                                        (instance? clojure.lang.IDeref credentials)
+                                        @credentials
+                                        :else credentials)
+                       secret (get credential-map ref)]
+                   (if-not (and ref secret (set? allowlist) (contains? allowlist ref)
+                                (pos? salt-len) (<= salt-len 1024)
+                                (<= 4096 iterations 1000000)
+                                (pos? auth-len) (<= auth-len 8192)
+                                (>= (aget args 8) 64))
+                     -1
+                     (let [password (if (string? secret)
+                                      (.toCharArray ^String secret)
+                                      (char-array secret))
+                           salt (read-bytes! instance (aget args 2) salt-len)
+                           auth-message (read-bytes! instance (aget args 5) auth-len)
+                           spec (PBEKeySpec. password salt (int iterations) 256)]
+                       (try
+                         (let [salted (.getEncoded (.generateSecret
+                                                   (SecretKeyFactory/getInstance "PBKDF2WithHmacSHA256")
+                                                   spec))
+                               client-key (hmac-sha256 salted (kbytes/utf8-bytes "Client Key"))
+                               stored-key (.digest (MessageDigest/getInstance "SHA-256") client-key)
+                               client-signature (hmac-sha256 stored-key auth-message)
+                               proof (byte-array 32)
+                               _ (dotimes [i 32]
+                                   (aset-byte proof i
+                                              (unchecked-byte
+                                               (bit-xor (bit-and 255 (aget client-key i))
+                                                        (bit-and 255 (aget client-signature i))))))
+                               server-key (hmac-sha256 salted (kbytes/utf8-bytes "Server Key"))
+                               server-signature (hmac-sha256 server-key auth-message)
+                               result (byte-array (concat proof server-signature))]
+                           (swap! limits-state update :scram-proofs inc)
+                           (write-bytes! instance (aget args 7) (aget args 8) result))
+                         (finally
+                           (.clearPassword spec)
+                           (java.util.Arrays/fill password (char 0)))))))
+                 (catch Exception _ -1))))))
+
+(defn- random-bytes-host-fn
+  "`(out-ptr out-cap) -> bytes-written|-1`. Fills out-cap random bytes via
+  SecureRandom (CSPRNG). `#{:crypto :write}` — requires grant +
+  `:allow-write-imports?` (contract limit-errors) and is metered against
+  `:max-random-bytes` (default 0 = deny). Caps single fill at 4096 bytes
+  (same ceiling as actor-host.js)."
+  [caps limits-state]
+  (host-fn "random_bytes" [ValType/I32 ValType/I32] ValType/I32
+           (fn [instance args]
+             (ensure-granted! caps :random-bytes)
+             (let [out-ptr (aget args 0)
+                   out-cap (int (aget args 1))]
+               (cond
+                 (or (<= out-cap 0) (> out-cap 4096)) -1
+                 (not (try-add-bytes! :random-bytes :max-random-bytes
+                                      caps limits-state out-cap))
+                 -1
+                 :else
+                 (let [bs (byte-array out-cap)]
+                   (.nextBytes (SecureRandom.) bs)
+                   (write-bytes! instance out-ptr out-cap bs)))))))
+
+(defn in-memory-store
+  "A trivial `{:read-fn :append-fn}` log store backing `log-read`/
+  `log-write`, an atom of concatenated bytes -- the default for tests/
+  standalone use. A production tender injects its own (file, R2,
+  whatever backs its actual log)."
+  []
+  (let [state (atom (byte-array 0))]
+    {:read-fn (fn [] @state)
+     :append-fn (fn [bs] (swap! state #(byte-array (concat % bs))))}))
+
+(def fuel-scopes
+  "What one `:fuel` budget is a budget FOR (koto-h1).
+
+     :call      the budget window restarts at every `session-call-*` /
+                `session-dispatch-trigger` on the session. This is what
+                `spec/kototama-vm-v1.edn` says a budget is -- an input of
+                ONE transition, named per `:message` as `:fuel-limit` --
+                and what the EVM tender already does by construction (a
+                fresh machine with the full gas per `run-report`). The host
+                decides how many calls a session gets; the guest cannot
+                call itself, so per-call fuel bounds the guest's CPU per
+                host decision, which is the axis a budget is meant to bound.
+     :instance  one budget for the Instance's whole life. Every call
+                draws down the same counter and the session dies of fuel
+                at whichever later call crosses the cap -- legible only
+                because the denial now reports the scope and the call
+                number. This is the only scope a bare `instantiate`d
+                Instance can have (no session, no window boundary), and
+                it stays selectable for a caller who wants a lifetime cap."
+  #{:call :instance})
+
+(def default-fuel-scope
+  "A session's budget is per call unless the caller says otherwise. Measured
+   on the tree before this default existed (kotoba-compiled-fact.wasm, `main`
+   = 59 instructions): three calls on one session reported :fuel-used 59,
+   118, 177 -- a lifetime cap nobody had chosen."
+  :call)
+
+(defn fuel-listener*
+  "Returns `[listener counter-atom]` so a session can report how many
+   Wasm instructions were executed (maturity R1 observability).
+
+   OPTS `:scope` (a `fuel-scopes` member, default :instance -- a listener
+   with no session to restart it IS a lifetime counter) and `:calls` (the
+   session's call-count atom, when a session is counting) go into the
+   `:fuel-exhausted` denial as `:kototama.tender/fuel-scope` and
+   `:kototama.tender/calls`, so a reader can tell 'died at call 7 of a
+   lifetime cap' from 'one call overran its own budget'."
+  ([limit] (fuel-listener* limit {}))
+  ([limit {:keys [scope calls] :or {scope :instance}}]
+   (let [n (atom 0)
+         listener (reify ExecutionListener
+                    (onExecution [_ _instruction _stack]
+                      (when (> (swap! n inc) limit)
+                        ;; P4 of adr-2609242100: this counter is the Wasm
+                        ;; HOST's instruction meter, not the language's fuel
+                        ;; (fuel counts function entries on every Kotoba
+                        ;; target), so its exhaustion has its own name. The
+                        ;; `fuel-*` detail keys stay beside the new ones for
+                        ;; readers written before the rename.
+                        (deny! :host-meter/instructions-exhausted @n
+                               (cond-> {:kototama.tender/host-meter-limit limit
+                                        :kototama.tender/host-meter-used @n
+                                        :kototama.tender/host-meter-scope scope
+                                        :kototama.tender/fuel-limit limit
+                                        :kototama.tender/fuel-used @n
+                                        :kototama.tender/fuel-scope scope}
+                                 calls (assoc :kototama.tender/calls @calls))))))]
+     [listener n])))
+
+(defn- validate-fuel!
+  "FUEL must be a positive integer and SCOPE a `fuel-scopes` member -- refused
+   before any host admission or Wasm parsing. The EVM tender refuses `:gas`
+   the same way under the same reason (`:invalid-budget`); before this check a
+   `:fuel -1` reached Chicory and surfaced as `:fuel-exhausted` at the first
+   instruction -- an exhaustion of a budget that never existed."
+  [fuel scope]
+  (when-not (and (integer? fuel) (pos? fuel))
+    (deny! :invalid-budget fuel {:kototama.tender/fuel fuel}))
+  (when-not (contains? fuel-scopes scope)
+    (deny! :invalid-fuel-scope scope
+           {:kototama.tender/fuel-scope scope
+            :kototama.tender/known-scopes fuel-scopes})))
+
+(defn fuel-listener
+  "Same `ExecutionListener` per-instruction counting hook
+  `kotoba.wasm-exec/fuel-listener` uses (verified against Chicory
+  1.4.0's own dispatch loop there) -- traps a runaway/looping guest
+  instead of hanging the tender process.
+
+   Returns only the listener (backward compatible). Prefer
+   `fuel-listener*` when the caller needs the counter atom for a
+   post-run report (`open-session` / `run-report`)."
+  [limit]
+  (first (fuel-listener* limit)))
+
+(def default-instruction-meter-limit
+  "Default Wasm-INSTRUCTION meter per call (per `instantiate`d guest), absent
+  an explicit `:host-meter/instructions` (legacy spelling `:fuel`) in `opts`.
+  Generous for legitimate small guests, still trips a genuinely unbounded
+  loop in a fraction of a second.
+
+  A HOST meter of this Wasm host, not the language's fuel (P4 of superproject
+  adr-2609242100): Kotoba's fuel counts function entries on every target and
+  is the profile budget `:budget/fuel`; this counts Chicory instructions and
+  its exhaustion is `:host-meter/instructions-exhausted`. kotoba-lang
+  lang/limits.edn :profile/wasm :host-meter names this var."
+  5000000)
+
+(def ^{:deprecated "adr-2609242100 P4: use default-instruction-meter-limit"}
+  default-fuel-limit
+  "Deprecated name of `default-instruction-meter-limit` (it was never fuel)."
+  default-instruction-meter-limit)
+
+(def host-meter-scopes
+  "`fuel-scopes` under the host meter's own name (P4 of adr-2609242100)."
+  fuel-scopes)
+
+(defn- host-meter-options
+  "OPTS with the host meter's canonical keys -- `:host-meter/instructions`
+  and `:host-meter/scope` -- folded onto the legacy `:fuel` / `:fuel-scope`
+  every existing caller passes, which remain accepted. Naming the same budget
+  twice with two values is refused, not resolved silently."
+  [opts]
+  (doseq [[canonical legacy] [[:host-meter/instructions :fuel]
+                              [:host-meter/scope :fuel-scope]]]
+    (when (and (contains? opts canonical) (contains? opts legacy)
+               (not= (get opts canonical) (get opts legacy)))
+      (deny! :invalid-budget (get opts canonical)
+             {:kototama.tender/host-meter canonical
+              :kototama.tender/legacy legacy
+              :kototama.tender/legacy-value (get opts legacy)})))
+  (cond-> opts
+    (contains? opts :host-meter/instructions)
+    (assoc :fuel (:host-meter/instructions opts))
+    (contains? opts :host-meter/scope)
+    (assoc :fuel-scope (:host-meter/scope opts))))
+
+(defn artifact-sha256 [^bytes wasm-bytes]
+  (apply str
+         (map #(format "%02x" (bit-and (int %) 0xff))
+              (.digest (MessageDigest/getInstance "SHA-256") wasm-bytes))))
+
+(defn- production-artifact-admission!
+  [wasm-bytes profile
+   {:keys [signer-registry signed-manifest manifest-now-ms
+           verify-manifest-fn]}]
+  (if (not= :production profile)
+    {:required? false :authorized? true}
+    (do
+      (when-not (and signer-registry (map? signed-manifest)
+                     (integer? manifest-now-ms) (ifn? verify-manifest-fn))
+        (deny! :signed-manifest-required profile
+               {:kototama.tender/missing
+                (cond-> []
+                  (nil? signer-registry) (conj :signer-registry)
+                  (not (map? signed-manifest)) (conj :signed-manifest)
+                  (not (integer? manifest-now-ms)) (conj :manifest-now-ms)
+                  (not (ifn? verify-manifest-fn)) (conj :verify-manifest-fn))}))
+      (let [actual (artifact-sha256 wasm-bytes)
+            declared (:manifest/artifact-sha256 signed-manifest)]
+        (when-not (= actual declared)
+          (deny! :artifact-digest-mismatch declared
+                 {:declared declared :actual actual}))
+        (assoc (signer/authorize-manifest!
+                signer-registry signed-manifest manifest-now-ms
+                verify-manifest-fn)
+               :required? true :artifact-sha256 actual)))))
+
+(defn- memory-limits-for
+  "Chicory `MemoryLimits` capping how far the guest's `memory.grow` can
+  reach, to `min(caps-limit, module's-own-declared-max)` -- the module's
+  OWN declared INITIAL page count is read and never overridden (a guest
+  that needs N pages to even start must still get them; only the ceiling
+  on growth is capped). `nil` when MODULE declares no memory section at
+  all (a memory-less guest, e.g. one only calling `clock-monotonic`, has
+  nothing to limit). Same approach `aiueos.execute/memory-limits-for`
+  establishes,
+  via Chicory's STABLE (not :unsafe/:experimental, unlike the fuel
+  listener above) `Instance.Builder/withMemoryLimits` API."
+  [module caps-limit]
+  (let [section (.memorySection module)]
+    (when (.isPresent section)
+      (let [own-limits (.limits (.getMemory (.get section) 0))]
+        (MemoryLimits. (.initialPages own-limits) (min caps-limit (.maximumPages own-limits)))))))
+
+(declare open-session*)
+
+(defn open-session
+  "`open-session*` with the host meter's canonical option keys
+  (`:host-meter/instructions`, `:host-meter/scope`) accepted beside the
+  legacy `:fuel` / `:fuel-scope` (P4 of adr-2609242100). See `open-session*`."
+  ([wasm-bytes requested-imports host-caps]
+   (open-session* wasm-bytes requested-imports host-caps {}))
+  ([wasm-bytes requested-imports host-caps opts]
+   (open-session* wasm-bytes requested-imports host-caps (host-meter-options opts))))
+
+(defn- open-session*
+  "Parse WASM-BYTES and build a Chicory session (Instance + observability).
+
+   Returns:
+     {:instance      Chicory Instance
+      :limits-state  atom of RuntimeLimits counters (http-posts, llm-infers, …)
+      :fuel-used     atom of instruction count in the CURRENT budget window
+                     (the whole life under :fuel-scope :instance)
+      :fuel-limit    long
+      :fuel-scope    :call | :instance (`fuel-scopes`; default `default-fuel-scope`)
+      :fuel-calls    atom of `session-call-*` / `session-dispatch-trigger`
+                     invocations so far
+      :fuel-total    atom of instructions charged in CLOSED windows; see
+                     `fuel-report` for the lifetime total
+      :caps          normalized HostCaps
+      :requested     vector of granted import ids wired into the Instance
+      :validation    contract/validate-import-surface result}
+
+   Fail-closed pre-flight via `contract/validate-import-surface`. Each
+   HostFunction re-checks grants at call time. Memory growth capped to
+   HostCaps `:max-memory-pages`. Maturity R1 (ADR-2607101200).
+
+   opts: :store, :llm-client, :kagi-client, :kagi-decisions, :fuel,
+   :fuel-scope, and :provider-host-functions.
+   The latter is an explicit map of import id → Chicory HostFunction for
+   inject-path ABIs (transport-provider etc.); missing bindings for
+   requested inject imports fail closed before instantiation.
+   `:kagi-client` is `{:authorized-sign-fn (fn [decisions ref msg] bytes|nil)}`;
+   without it (and non-empty `:kagi-decisions`) kagi-sign returns -1."
+  ([wasm-bytes requested-imports host-caps]
+   (open-session* wasm-bytes requested-imports host-caps {}))
+  ([wasm-bytes requested-imports host-caps
+    {:keys [store llm-client kagi-client kagi-decisions fuel fuel-scope
+            require-kotoba-compatibility? profile capability-leases
+            execution-identity execution-identity-cid lease-now-ms
+            http-policy request-purpose credential-provider
+            provider-host-functions scram-credentials]
+     :as opts
+     :or {store (in-memory-store) llm-client (default-llm-client)
+          kagi-client {} kagi-decisions [] fuel default-instruction-meter-limit
+          fuel-scope default-fuel-scope}}]
+   (validate-fuel! fuel fuel-scope)
+   (let [configured (cond-> #{}
+                      (contains? opts :store) (conj :store)
+                      (contains? opts :llm-client) (conj :llm-client)
+                      (contains? opts :kagi-client) (conj :kagi-client)
+                      (contains? opts :http-policy) (conj :http-policy)
+                      (contains? opts :request-purpose) (conj :request-purpose)
+                      (contains? opts :credential-provider)
+                      (conj :credential-provider))
+         host-admission (browser/admit-host!
+                         :jvm requested-imports
+                         {:profile (or profile :development)
+                          :configured configured})
+         network-context
+         (when (and (= :production profile)
+                    (some #{:http-post}
+                          (contract/requested-import-ids requested-imports)))
+           (network/make-context http-policy request-purpose
+                                 credential-provider))
+         artifact-admission (production-artifact-admission!
+                             wasm-bytes (or profile :development) opts)
+         artifact-compatibility (compatibility/validate! wasm-bytes require-kotoba-compatibility?)
+         normalized-caps (contract/host-caps host-caps)
+         now-ms (long (if (ifn? lease-now-ms) (lease-now-ms)
+                          (or lease-now-ms (System/currentTimeMillis))))
+         leases (validate-capability-leases! (contract/requested-import-ids requested-imports)
+                                             capability-leases execution-identity
+                                             execution-identity-cid now-ms)
+         authority-state (atom {:active (:grants normalized-caps)
+                                :revoked #{}
+                                :dropped #{}
+                                :consumed #{}
+                                :expired #{}
+                                :remaining (into {} (map (fn [[id lease]] [id (:uses lease)]) leases))
+                                :uses {}})
+         caps (assoc normalized-caps :authority-state authority-state :capability-leases leases
+                    :lease-now-ms (or lease-now-ms #(System/currentTimeMillis)))
+         validation (contract/validate-import-surface requested-imports caps)]
+     (when-not (:ok? validation)
+       (deny! :import-surface-rejected requested-imports
+              {:kototama.tender/rejected requested-imports
+               :kototama.tender/errors (:errors validation)}))
+     (let [limits-state (new-limits-state)
+           fn-by-id {:gen-keypair #(gen-keypair-host-fn caps limits-state)
+                     :sign #(sign-host-fn caps limits-state)
+                     :verify #(verify-host-fn caps limits-state)
+                     :sha256-hex #(sha256-hex-host-fn caps limits-state)
+                     :http-post #(http-post-host-fn caps limits-state
+                                                    network-context)
+                     :llm-infer #(llm-infer-host-fn caps limits-state llm-client)
+                     :log-read #(log-read-host-fn caps limits-state store)
+                     :log-write #(log-write-host-fn caps limits-state store)
+                     :clock-monotonic #(clock-monotonic-host-fn caps limits-state)
+                     :random-bytes #(random-bytes-host-fn caps limits-state)
+                     :scram-sha256 #(scram-sha256-host-fn caps limits-state scram-credentials)
+                     :kagi-sign #(kagi-sign-host-fn caps limits-state
+                                                    kagi-client kagi-decisions)
+                     :http-fetch #(http-fetch-host-fn caps limits-state)
+                     :cbor-encode #(cbor-encode-host-fn caps limits-state)
+                     :json-encode #(json-encode-host-fn caps limits-state)
+                     :json-extract-field #(json-extract-field-host-fn caps limits-state)
+                     :http-post-headers #(http-post-headers-host-fn caps limits-state)}
+           ;; Inject path: transport-provider (and component linker bridges)
+           ;; supply ready HostFunction values keyed by import id.
+           fn-by-id (merge fn-by-id
+                           (into {}
+                                 (map (fn [[id host-fn]]
+                                        [id (constantly host-fn)]))
+                                 provider-host-functions))
+           missing-providers (vec (remove fn-by-id (:requested validation)))
+           _ (when (seq missing-providers)
+               (deny! :provider-unavailable missing-providers
+                      {:kototama.tender/errors
+                       [{:error :runtime/provider-unavailable
+                         :imports missing-providers}]}))
+           host-fns (into (mapv (fn [id] ((get fn-by-id id))) (:requested validation))
+                          [(cap-call-host-fn caps limits-state)])
+           imports (-> (ImportValues/builder)
+                      (.addFunction (into-array ImportFunction host-fns))
+                      .build)
+           module (Parser/parse ^bytes wasm-bytes)
+           mem-limits (memory-limits-for module (:max-memory-pages (:limits caps)))
+           fuel-calls (atom 0)
+           ;; A bare Instance (`instantiate`) discards the session, so
+           ;; nothing counts its calls; its denial must not claim a count.
+           [listener fuel-used] (fuel-listener* fuel {:scope fuel-scope
+                                                      :calls (when-not (::instance-only opts)
+                                                               fuel-calls)})
+           builder (-> (Instance/builder module)
+                      (.withImportValues imports)
+                      (.withUnsafeExecutionListener listener))
+           instance (.build (if mem-limits (.withMemoryLimits builder mem-limits) builder))]
+       {:instance instance
+        :limits-state limits-state
+        ;; The host meter under its own name (P4); the `fuel-*` keys below
+        ;; are the same atoms/values, kept for readers written before it.
+        :host-meter/instructions-used fuel-used
+        :host-meter/instructions-limit fuel
+        :host-meter/scope fuel-scope
+        :fuel-used fuel-used
+        :fuel-limit fuel
+        :fuel-scope fuel-scope
+        :fuel-calls fuel-calls
+        :fuel-total (atom 0)
+        :caps caps
+        :authority-state authority-state
+        :requested (:requested validation)
+        :host-admission host-admission
+        :artifact-admission artifact-admission
+        :compatibility artifact-compatibility
+        :validation validation}))))
+
+(defn authority-snapshot
+  "Immutable snapshot of a session's active/revoked/dropped grants and use
+   counters."
+  [session]
+  (if-let [state (:authority-state session)]
+    @state
+    (deny! :missing-authority-state (select-keys session [:requested]))))
+
+(defn- deactivate-import!
+  [session import-id disposition reason]
+  (let [id (contract/import-id import-id)
+        state (:authority-state session)]
+    (when-not (and id state)
+      (deny! :invalid-deactivation import-id
+             {:kototama.tender/import import-id
+              :kototama.tender/has-authority-state? (some? state)}))
+    (swap! state
+           (fn [current]
+             (-> current
+                 (update :active disj id)
+                 (update disposition conj id)
+                 (assoc-in [:reasons id] reason))))
+    (authority-snapshot session)))
+
+(defn revoke-import!
+  "Revoke one import for an existing session. Every subsequent host call sees
+   the change without re-instantiation."
+  ([session import-id] (revoke-import! session import-id :operator-revocation))
+  ([session import-id reason]
+   (effect/guard!
+    {:evaluate (constantly {:allowed? true})
+     :request {:import-id import-id :reason reason}
+     :approved? :allowed?
+     :action :component-import/revoke
+     :resource (contract/import-id import-id)
+     :digest nil
+     :effect
+     (fn [_]
+       (deactivate-import! session import-id :revoked reason))})))
+
+(defn drop-import!
+  "Voluntarily and irreversibly drop one import from a session."
+  ([session import-id] (drop-import! session import-id :session-drop))
+  ([session import-id reason]
+   (deactivate-import! session import-id :dropped reason)))
+
+(defn instantiate
+  "Backward-compatible Instance-only entry. Prefer `open-session` /
+   `run-report` for maturity R1 observability.
+
+   An Instance has no session to restart its budget window, so its fuel is
+   `:fuel-scope :instance` by construction -- one budget for the Instance's
+   life, however many times the caller invokes an export on it. That is what
+   this entry sets; a caller asking it for `:fuel-scope :call` is asking for a
+   promise it cannot keep and is refused (`:invalid-fuel-scope`) rather than
+   handed a lifetime cap labelled per-call."
+  ([wasm-bytes requested-imports host-caps]
+   (instantiate wasm-bytes requested-imports host-caps {}))
+  ([wasm-bytes requested-imports host-caps opts]
+   (let [opts (host-meter-options opts)
+         scope (get opts :fuel-scope :instance)]
+     (when-not (= :instance scope)
+       (deny! :invalid-fuel-scope scope
+              {:kototama.tender/fuel-scope scope
+               :kototama.tender/known-scopes #{:instance}
+               :kototama.tender/entry :instantiate}))
+     (:instance (open-session wasm-bytes requested-imports host-caps
+                              (assoc opts :fuel-scope :instance
+                                     ::instance-only true))))))
+
+(defn call-export
+  "Invoke an already-built Instance's 0-arity EXPORT-NAME and return its
+  single i32/i64 result as a long. Throws (Chicory's own exception) if
+  INSTANCE has no such export -- see `has-export?` to check first."
+  [instance export-name]
+  (aget ^longs (.apply (.export instance export-name) (long-array 0)) 0))
+
+(defn call-main
+  "`(call-export instance \"main\")` -- kept as the historical name every
+  existing caller/test uses; `main` is still the one export every guest
+  is required to have."
+  [instance]
+  (call-export instance "main"))
+
+(defn has-export?
+  "True when INSTANCE exports a function named EXPORT-NAME. For a caller
+  that wants to dispatch an OPTIONAL export (not every guest implements
+  every trigger -- see `dispatch-trigger`) without relying on Chicory's
+  exception type as control flow."
+  [instance export-name]
+  (try (some? (.export instance export-name))
+       (catch Exception _ false)))
+
+(def trigger->export
+  "ADR-2607082400: the export-name mapping kotoba-server's own
+  `net_actor.rs::trigger_name` uses for its four `ComponentTrigger`
+  kinds (Run/Http/Tick/Kse) -- kept as data here so a caller dispatching
+  by trigger keyword doesn't hand-roll the string shape. NOTE this is
+  the kotoba-server WIRE VOCABULARY, not a claim that kototama can host
+  kotoba-server's own guests: those are WASM Components (`kotoba-clj`
+  compiler, WIT canonical ABI) and Chicory -- kototama's only engine --
+  rejects that binary format outright (verified: `Parser/parse` throws
+  `MalformedException` on a real compiled mesh-guest .wasm, version
+  header `[13,0,1,0]` vs the core-module `[1,0,0,0]` it expects). This
+  map exists so a FUTURE `.kotoba`-language guest with more than one
+  export can be dispatched by the same trigger vocabulary, not to
+  imply today's mesh guests are already hostable here."
+  {:run "run" :http "on-http" :tick "on-tick" :kse "on-kse"})
+
+(defn- trigger-export!
+  "The export name for TRIGGER-KIND, or the `:unknown-trigger-kind` denial
+  (a caller bug, not a guest shape question)."
+  [trigger-kind]
+  (or (get trigger->export trigger-kind)
+      (deny! :unknown-trigger-kind trigger-kind
+             {:kototama.tender/trigger-kind trigger-kind
+              :kototama.tender/known-kinds (set (keys trigger->export))})))
+
+(defn dispatch-trigger
+  "Invoke the export for TRIGGER-KIND (one of `(keys trigger->export)`)
+  if INSTANCE has it. Returns `{:dispatched? true :result <long>}`, or
+  `{:dispatched? false}` when the guest doesn't implement that trigger
+  -- not an error, the same non-event kotoba-server's own route table
+  represents when a component isn't bound to a given trigger kind.
+  Throws for an unrecognised TRIGGER-KIND (a caller bug, not a guest
+  shape question). Instance-level: no budget window is opened (see
+  `session-dispatch-trigger` for the budgeted form)."
+  [instance trigger-kind]
+  (let [export-name (trigger-export! trigger-kind)]
+    (if (has-export? instance export-name)
+      {:dispatched? true :result (call-export instance export-name)}
+      {:dispatched? false})))
+
+(defn- begin-call!
+  "Count one invocation on SESSION and, under `:fuel-scope :call`, close the
+   current budget window (its spend rolls into `:fuel-total`) and open a
+   fresh one. Under `:instance` only the count moves."
+  [{:keys [fuel-scope fuel-calls fuel-used fuel-total]}]
+  (swap! fuel-calls inc)
+  (when (= :call fuel-scope)
+    (swap! fuel-total + @fuel-used)
+    (reset! fuel-used 0)))
+
+(defn session-call-export
+  "Invoke EXPORT-NAME on an `open-session` map as ONE budgeted call: the
+   session's call count moves and, under `:fuel-scope :call`, the fuel window
+   restarts before the export runs. Returns the i32/i64 result."
+  [session export-name]
+  (begin-call! session)
+  (call-export (:instance session) export-name))
+
+(defn session-call-main
+  "Invoke `main` on an `open-session` map as one budgeted call; returns the
+   i32/i64 result."
+  [session]
+  (session-call-export session "main"))
+
+(defn session-dispatch-trigger
+  "`dispatch-trigger` on an `open-session` map, as one budgeted call when the
+   guest implements the trigger. A `{:dispatched? false}` non-event is not a
+   call: it moves neither the count nor the window."
+  [session trigger-kind]
+  (let [export-name (trigger-export! trigger-kind)]
+    (if (has-export? (:instance session) export-name)
+      {:dispatched? true :result (session-call-export session export-name)}
+      {:dispatched? false})))
+
+(defn fuel-report
+  "The session's budget arithmetic, as values:
+
+     {:fuel-scope :call | :instance
+      :fuel-limit n        the per-window (or lifetime) cap
+      :fuel-used  n        instructions in the current window
+      :fuel-total n        instructions over the session's whole life
+      :fuel-calls n        budgeted invocations so far}
+
+   Under :call, `:fuel-total` = the sum of every window; under :instance the
+   one window IS the life, so `:fuel-total` = `:fuel-used`."
+  [{:keys [fuel-scope fuel-limit fuel-used fuel-total fuel-calls]}]
+  {:fuel-scope fuel-scope
+   :fuel-limit fuel-limit
+   :fuel-used @fuel-used
+   :fuel-total (+ @fuel-total @fuel-used)
+   :fuel-calls @fuel-calls})
+
+(defn run-main
+  "`instantiate` + `call-main` in one call. See `instantiate` for the
+  requested-imports/host-caps/opts contract."
+  ([wasm-bytes requested-imports host-caps]
+   (call-main (instantiate wasm-bytes requested-imports host-caps)))
+  ([wasm-bytes requested-imports host-caps opts]
+   (call-main (instantiate wasm-bytes requested-imports host-caps opts))))
+
+(def default-run-deadline-ms 30000)
+(def default-run-permits
+  "Process-wide admission bound for concurrently executing guest calls."
+  (Semaphore. 64 true))
+
+(defn run-main-bounded
+  "Run a guest behind wall-clock, cancellation, and concurrency boundaries.
+
+   `:deadline-ms` must be positive. `:run-permits` may inject a shared fair
+   Semaphore; production callers should share one across their tender pool.
+   Admission is non-blocking, so saturation fails closed instead of creating
+   an unbounded queue. A deadline cancels/interupts the worker Future; Wasm
+   instruction fuel remains the hard backstop for CPU-only guests."
+  ([wasm-bytes requested-imports host-caps]
+   (run-main-bounded wasm-bytes requested-imports host-caps {}))
+  ([wasm-bytes requested-imports host-caps
+    {:keys [deadline-ms run-permits]
+     :or {deadline-ms default-run-deadline-ms
+          run-permits default-run-permits}
+     :as opts}]
+   (when-not (and (integer? deadline-ms) (pos? deadline-ms))
+     (deny! :invalid-deadline deadline-ms
+            {:kototama.tender/deadline-ms deadline-ms}))
+   (when-not (.tryAcquire ^Semaphore run-permits)
+     (deny! :concurrency-exhausted (.availablePermits ^Semaphore run-permits)))
+   (let [executor (Executors/newSingleThreadExecutor)
+         task (.submit executor
+                       ^java.util.concurrent.Callable
+                       (fn [] (run-main wasm-bytes requested-imports host-caps
+                                        (dissoc opts :deadline-ms :run-permits))))]
+     (try
+       (.get task (long deadline-ms) TimeUnit/MILLISECONDS)
+       (catch TimeoutException e
+         (.cancel task true)
+         (deny! :deadline-exceeded deadline-ms
+                {:kototama.tender/deadline-ms deadline-ms}
+                e))
+       (finally
+         (.shutdownNow executor)
+         (.release ^Semaphore run-permits))))))
+
+(defn run-report
+  "`open-session` + `call-main` with a structured post-run report.
+
+   Returns {:ok? true :result long :fuel-used n :fuel-limit n
+            :fuel-scope k :fuel-calls 1
+            :limits {...} :requested [...] :caps HostCaps}
+   or {:ok? false :error ex-data-or-message ...} on denial/fuel/trap."
+  ([wasm-bytes requested-imports host-caps]
+   (run-report wasm-bytes requested-imports host-caps {}))
+  ([wasm-bytes requested-imports host-caps opts]
+   (try
+     (let [session (open-session wasm-bytes requested-imports host-caps opts)
+           result (session-call-main session)]
+       {:ok? true
+        :result result
+        :host-meter/instructions-used @(:fuel-used session)
+        :host-meter/instructions-limit (:fuel-limit session)
+        :host-meter/scope (:fuel-scope session)
+        :fuel-used @(:fuel-used session)
+        :fuel-limit (:fuel-limit session)
+        :fuel-scope (:fuel-scope session)
+        :fuel-calls @(:fuel-calls session)
+        :limits @(:limits-state session)
+        :requested (:requested session)
+        :caps (:caps session)})
+     (catch Exception e
+       {:ok? false
+        :error (or (ex-data e) {:message (.getMessage e)})
+        :message (.getMessage e)}))))
+
+(defn run-report-bounded
+  "Production-oriented run-report with mandatory wall deadline, cancellation,
+   and shared concurrency admission. Operational denials use run-report's
+   structured error shape."
+  ([wasm-bytes requested-imports host-caps]
+   (run-report-bounded wasm-bytes requested-imports host-caps {}))
+  ([wasm-bytes requested-imports host-caps
+    {:keys [deadline-ms run-permits]
+     :or {deadline-ms default-run-deadline-ms
+          run-permits default-run-permits}
+     :as opts}]
+   (cond
+     (not (and (integer? deadline-ms) (pos? deadline-ms)))
+     (let [d (denial/denial :jvm :invalid-deadline deadline-ms
+                            {:kototama.tender/deadline-ms deadline-ms})]
+       {:ok? false :error d
+        :message (denial/message :jvm :invalid-deadline deadline-ms d)})
+
+     (not (.tryAcquire ^Semaphore run-permits))
+     (let [d (denial/denial :jvm :concurrency-exhausted
+                            (.availablePermits ^Semaphore run-permits))]
+       {:ok? false :error d
+        :message (denial/message :jvm :concurrency-exhausted nil d)})
+
+     :else
+     (let [executor (Executors/newSingleThreadExecutor)
+           task (.submit executor
+                         ^java.util.concurrent.Callable
+                         (fn [] (run-report
+                                 wasm-bytes requested-imports host-caps
+                                 (dissoc opts :deadline-ms :run-permits))))]
+       (try
+         (.get task (long deadline-ms) TimeUnit/MILLISECONDS)
+         (catch TimeoutException _
+           (.cancel task true)
+           (let [d (denial/denial :jvm :deadline-exceeded deadline-ms
+                                  {:kototama.tender/deadline-ms deadline-ms})]
+             {:ok? false :error d
+              :message (denial/message :jvm :deadline-exceeded deadline-ms d)}))
+         (catch Exception e
+           {:ok? false
+            :error (or (some-> e .getCause ex-data)
+                       (ex-data e)
+                       {:message (.getMessage e)})
+            :message (.getMessage e)})
+         (finally
+           (.shutdownNow executor)
+           (.release ^Semaphore run-permits)))))))
+
+(defn inspect-module
+  "Parse WASM-BYTES (no Instantiation) and report structural surface:
+
+     {:magic-ok? bool
+      :byte-count n
+      :export-names [\"main\" …]
+      :import-names [\"gen_keypair\" …]   ; field names under module \"kotoba\"
+      :import-modules [\"kotoba\" …]
+      :has-memory? bool
+      :has-main? bool}
+
+   Pure observation — does not run guest code or check HostCaps. Used by
+   CLI doctor / maturity gates before a run."
+  [^bytes wasm-bytes]
+  (let [module (Parser/parse wasm-bytes)
+        ;; Chicory 1.4: exportSection/importSection are concrete sections
+        ;; (not Optional); memorySection is Optional.
+        export-names (try
+                       (let [es (.exportSection module)
+                             n (.exportCount es)]
+                         (mapv #(.name (.getExport es %)) (range n)))
+                       (catch Exception _ []))
+        imports (try
+                  (let [isec (.importSection module)
+                        n (.importCount isec)]
+                    (mapv (fn [i]
+                            (let [imp (.getImport isec i)]
+                              {:module (.module imp)
+                               :name (.name imp)}))
+                          (range n)))
+                  (catch Exception _ []))
+        has-memory? (try
+                      (let [ms (.memorySection module)]
+                        (if (instance? java.util.Optional ms)
+                          (.isPresent ^java.util.Optional ms)
+                          (some? ms)))
+                      (catch Exception _ false))]
+    {:magic-ok? (and (>= (alength wasm-bytes) 4)
+                     (= (bit-and (aget wasm-bytes 0) 0xff) 0x00)
+                     (= (bit-and (aget wasm-bytes 1) 0xff) 0x61)
+                     (= (bit-and (aget wasm-bytes 2) 0xff) 0x73)
+                     (= (bit-and (aget wasm-bytes 3) 0xff) 0x6d))
+     :byte-count (alength wasm-bytes)
+     :export-names export-names
+     :import-names (mapv :name imports)
+     :import-modules (vec (distinct (map :module imports)))
+     :imports imports
+     :has-memory? has-memory?
+     :has-main? (boolean (some #{"main"} export-names))}))
+
+(defn read-memory-string
+  "Read a UTF-8 string of LEN bytes at PTR out of INSTANCE's memory -- for
+  a caller inspecting a result `main` wrote into a buffer it provided."
+  [instance ptr len]
+  (kbytes/utf8-string ^bytes (read-bytes! instance ptr len)))

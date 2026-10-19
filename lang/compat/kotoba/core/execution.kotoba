@@ -1,0 +1,196 @@
+(ns kotoba.core.execution
+  "Target-independent bounded execution descriptors. Pure data; no target or host imports."
+  {:kotoba/export [stream-contract valid-stream-limits? ability-keys valid-ability? plan-keys policy-decision-keys approval-keys cid? valid-plan? valid-policy-decision? valid-approval? execution-identity-keys valid-execution-identity? capability-lease-keys valid-capability-lease?]})
+
+(def stream-contract
+  {:format :kotoba.stream/bytes-v1
+   :task :poll-cancel
+   :stream :pull-cancel
+   :required-limits #{:deadline-ms :max-items :max-bytes}
+   :zero-copy? false
+   :ambient-executor? false})
+
+(defn valid-stream-limits?
+  [limits]
+  (and (map? limits)
+       (= #{:deadline-ms :max-items :max-bytes} (set (keys limits)))
+       (every? #(pos-int? (get limits %))
+               [:deadline-ms :max-items :max-bytes])))
+
+(def ability-keys
+  #{:target :operation :max-bytes :max-items :deadline-ms :audit-id})
+
+(defn valid-ability?
+  "Validate an exact, bounded semantic ability descriptor. :target names a
+  resource, not a compiler target. This is data validation; a host must enforce the
+  resulting limits at every host boundary."
+  [ability]
+  (and (map? ability)
+       (= ability-keys (set (keys ability)))
+       (string? (:target ability)) (seq (:target ability))
+       (keyword? (:operation ability))
+       (string? (:audit-id ability)) (seq (:audit-id ability))
+       (every? #(pos-int? (get ability %))
+               [:max-bytes :max-items :deadline-ms])))
+
+(def plan-keys
+  #{:format :plan-cid :code-closure-cid :artifact-cid :compiler-contract
+    :requested-effects :requested-resources :input-cid :budget})
+
+(def policy-decision-keys
+  #{:format :decision-cid :plan-cid :policy-cid :db-basis :result :reasons
+    :issued-at :expires-at})
+
+(def approval-keys
+  #{:format :approval-cid :plan-cid :policy-cid :db-basis :resources
+    :input-cid :approver-cid :issued-at :expires-at})
+
+(def ^:private base32-value
+  "RFC 4648 base32, lowercase, unpadded — the `b` multibase alphabet. A map
+  rather than `.indexOf` so the decode stays interop-free and portable."
+  (into {} (map-indexed (fn [i c] [c i]) "abcdefghijklmnopqrstuvwxyz234567")))
+
+(defn- base32-decode
+  "Returns a vector of byte values, or nil if any character is outside the
+  alphabet."
+  [s]
+  (loop [cs (seq s) acc 0 bits 0 out []]
+    (if-let [c (first cs)]
+      (if-let [v (base32-value c)]
+        (let [acc (bit-or (bit-shift-left acc 5) v)
+              bits (+ bits 5)]
+          (if (>= bits 8)
+            (let [bits' (- bits 8)]
+              (recur (rest cs)
+                     (bit-and acc (dec (bit-shift-left 1 bits')))
+                     bits'
+                     (conj out (bit-and 0xff (bit-shift-right acc bits')))))
+            (recur (rest cs) acc bits out)))
+        nil)
+      out)))
+
+(defn- read-varint
+  "Unsigned LEB128 at `offset`. Returns [value next-offset], or nil if the
+  bytes run out before the continuation bit clears."
+  [bs offset]
+  (loop [offset offset value 0 shift 0]
+    (when (< offset (count bs))
+      (let [b (bit-and (nth bs offset) 0xff)]
+        (if (< b 0x80)
+          [(bit-or value (bit-shift-left b shift)) (inc offset)]
+          (when (< shift 56)
+            (recur (inc offset)
+                   (bit-or value (bit-shift-left (bit-and b 0x7f) shift))
+                   (+ shift 7))))))))
+
+(defn cid?
+  "True only for a fully decodable CIDv1 with a well-formed multihash.
+
+  Deliberately structural and not semantic: it proves the string is a content
+  identifier, not that the content exists or matches. Same shape as
+  `kototama.component-platform`'s check, so the portable contract and the
+  admission boundary agree."
+  [value]
+  (boolean
+   (and (string? value)
+        (< 1 (count value))
+        (= \b (first value))
+        (when-let [bs (base32-decode (subs value 1))]
+          (when-let [[version off1] (read-varint bs 0)]
+            (when-let [[codec off2] (read-varint bs off1)]
+              (when-let [[hash-fn off3] (read-varint bs off2)]
+                (when-let [[hash-len off4] (read-varint bs off3)]
+                  (and (= 1 version)
+                       (pos? codec)
+                       (pos? hash-fn)
+                       (pos? hash-len)
+                       (= hash-len (- (count bs) off4)))))))))))
+
+(defn- cid-vector? [value]
+  (and (vector? value) (every? cid? value) (= (count value) (count (distinct value)))))
+
+(defn valid-plan?
+  "Validate the portable, bounded plan descriptor. Policy evaluation is a
+  host concern; this contract only prevents shape drift before that boundary."
+  [plan]
+  (and (map? plan)
+       (= plan-keys (set (keys plan)))
+       (= :kotoba.plan/v1 (:format plan))
+       (every? cid? ((juxt :plan-cid :code-closure-cid :artifact-cid
+                            :compiler-contract :input-cid) plan))
+       (set? (:requested-effects plan))
+       (set? (:requested-resources plan))
+       (map? (:budget plan))))
+
+(defn valid-policy-decision?
+  "Validate a deterministic, basis-bound policy decision. A `:permit` is not
+  authority by itself: the host must still issue and enforce scoped leases."
+  [decision]
+  (and (map? decision)
+       (= policy-decision-keys (set (keys decision)))
+       (= :kotoba.policy-decision/v1 (:format decision))
+       (every? cid? ((juxt :decision-cid :plan-cid :policy-cid :db-basis) decision))
+       (contains? #{:permit :deny} (:result decision))
+       (vector? (:reasons decision))
+       (string? (:issued-at decision))
+       (string? (:expires-at decision))))
+
+(defn valid-approval?
+  "Validate an immutable human/organizational approval witness. An approval is
+  authority only for the exact plan, policy, basis, input and resource set it
+  names; a host must additionally verify its CID, signer and expiry."
+  [approval]
+  (and (map? approval)
+       (= approval-keys (set (keys approval)))
+       (= :kotoba.approval/v1 (:format approval))
+       (every? cid? ((juxt :approval-cid :plan-cid :policy-cid :db-basis
+                            :input-cid :approver-cid) approval))
+       (set? (:resources approval))
+       (seq (:resources approval))
+       (string? (:issued-at approval))
+       (string? (:expires-at approval))))
+
+;; v2 replaces physical Component/WIT fields with an opaque, content-addressed
+;; target binding. The selected target owner validates that binding and checks
+;; its artifact/profile/interface identities before admission. A shape check
+;; proves neither authority, block content, nor target conformance.
+(def execution-identity-keys
+  #{:format :plan-cid :code-closure-cid :artifact-cid :compiler-contract
+    :profile-binding-cid :package-lock-cid :policy-cid :policy-decision-cid
+    :db-basis :grant-cids :approval-cids :runtime-identity :input-cid
+    :outcome-cid :host-receipt-cids})
+
+(defn valid-execution-identity?
+  "Closed target-neutral v2 identity. Rejects v1 and physical target fields.
+  The binding CID is mandatory; no unspecified target or ambient fallback."
+  [identity]
+  (and (map? identity)
+       (= execution-identity-keys (set (keys identity)))
+       (= :kotoba.execution-identity/v2 (:format identity))
+       (every? cid? ((juxt :code-closure-cid :artifact-cid :compiler-contract
+                           :profile-binding-cid :package-lock-cid :policy-cid
+                           :policy-decision-cid :db-basis :runtime-identity
+                           :input-cid :outcome-cid) identity))
+       (or (cid? (:plan-cid identity)) (nil? (:plan-cid identity)))
+       (every? cid-vector? ((juxt :grant-cids :approval-cids :host-receipt-cids) identity))))
+
+(def capability-lease-keys
+  #{:format :capability-cid :execution-identity-cid :artifact-cid
+    :profile-binding-cid :resource-cid :purpose :expires-at :uses :transfer
+    :delegation-depth})
+
+(defn valid-capability-lease?
+  "Non-bearer v2 audit descriptor bound to an artifact and target binding.
+  Hosts verify identity/binding/CIDs, expiry, revocation and actual authority."
+  [lease]
+  (and (map? lease)
+       (= capability-lease-keys (set (keys lease)))
+       (= :kotoba.capability-lease/v2 (:format lease))
+       (every? cid? ((juxt :capability-cid :execution-identity-cid :artifact-cid
+                           :profile-binding-cid :resource-cid) lease))
+       (keyword? (:purpose lease))
+       (string? (:expires-at lease))
+       (pos-int? (:uses lease))
+       (contains? #{:non-transferable :same-artifact} (:transfer lease))
+       (nat-int? (:delegation-depth lease))))
+

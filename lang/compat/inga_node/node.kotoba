@@ -1,0 +1,554 @@
+(ns inga-node.node
+  "One witness, one process, one socket to every peer.
+
+  `inga` decides; this executes. Nothing here casts a vote, orders a block or
+  chooses a leader — `inga.replica` does all of that as a pure fold, and this
+  file is the part with a clock, a socket and a disk.
+
+  ## What a process gives that a Durable Object was being asked for
+
+  | DO | here |
+  |---|---|
+  | one writer per witness | **the process is one writer.** No lease, no fencing epoch |
+  | an address | a port |
+  | a bounded snapshot | a file (`inga-node.store`) |
+
+  A process serializes its own events only. The deployment must prevent
+  two processes using one witness key and must retain its durable vote state
+  without rollback. This node does not fence cloned processes or lost disks.
+
+  ## The tick is ours now
+
+  The Worker deployment could only be driven by a Cloudflare cron, whose
+  floor is one minute, and the pacemaker's view budget has to outlast
+  whatever drives it — so that deployment could not have a view shorter than
+  two minutes, and took ~91 seconds to commit a write. Here the interval is a
+  `setInterval` we choose — and the view budget is derived from THAT
+  rather than from a vendor's cron floor. See `:params` below for what the
+  ratio has to be and what it cost to find out."
+  (:require [kotoba.lang.text :as str]
+            ["ws" :as ws]
+            ["node:http" :as http]
+            [inga.replica :as r]
+            [inga.consensus :as c]
+            [inga.current-ref-read :as current-ref-read]
+            [inga.prefix :as prefix]
+            [inga.sync :as sync]
+            [inga.wire :as wire]
+            [inga.net.ws :as nws]
+            [inga.net.server :as srv]
+            [inga-node.cors :as cors]
+            [inga-node.seams :as seams]
+            [inga-node.store :as store]))
+
+(defn- now [] (.getTime (js/Date.)))
+
+(defn- json-res [res status obj]
+  (.writeHead res status #js {"content-type" "application/json"})
+  (.end res (js/JSON.stringify (clj->js obj))))
+
+(defn- query-nat [value]
+  (when (and (string? value) (re-matches #"(0|[1-9][0-9]*)" value))
+    (let [n (js/Number value)]
+      (when (js/Number.isSafeInteger n) n))))
+
+(defn- valid-current-ref-request?
+  [ref challenge]
+  (and (string? ref) (<= 1 (count ref) 1024)
+       (not (str/includes? ref "\n"))
+       (not (str/includes? ref "\r"))
+       (not (str/includes? ref "\u0000"))
+       (string? challenge) (<= 16 (count challenge) 256)
+       (boolean (re-matches #"[A-Za-z0-9_-]+" challenge))))
+
+(defn- current-ref-query
+  [parameters]
+  (let [refs (.getAll parameters "ref")
+        challenges (.getAll parameters "challenge")
+        keys (js/Array.from (.keys parameters))]
+    (when (and (= 1 (.-length refs))
+               (= 1 (.-length challenges))
+               (= 2 (.-length keys)))
+      (let [ref (aget refs 0)
+            challenge (aget challenges 0)]
+        (when (valid-current-ref-request? ref challenge)
+          {:ref ref :challenge challenge})))))
+
+(defn current-ref-response
+  "Sign this witness's current committed ref head for one client challenge.
+
+  A present head is returned only when its membership proof sidecar is also
+  present. The response signature proves the witness observed these exact
+  ref/sequence/CID fields at `observed-at`; clients still verify the
+  commitment and finality evidence separately and collect a trusted quorum."
+  [data-dir {:keys [chain-id witness ref challenge observed-at sign-fn]}]
+  (when (and (valid-current-ref-request? ref challenge)
+             (string? chain-id) (seq chain-id)
+             (string? witness) (seq witness)
+             (js/Number.isSafeInteger observed-at)
+             (not (neg? observed-at))
+             (fn? sign-fn))
+    (let [head (store/head-of data-dir ref)
+          proof (when head (store/proof-text data-dir ref (get head "seq")))]
+      (when (or (nil? head) (and (string? proof) (seq proof)
+                                 (= ref (get head "ref"))))
+        (when-let [signed (current-ref-read/signed-read
+                           {:chain-id chain-id :witness witness :ref ref
+                            :head-seq (get head "seq") :head-cid (get head "cid")
+                            :challenge challenge :observed-at observed-at}
+                           sign-fn)]
+          (assoc signed :head head :commitment-proof proof))))))
+
+(defn- edn-res [res value]
+  (let [body (pr-str value)]
+    (if (<= (.-length (.encode (js/TextEncoder.) body)) (* 8 1024 1024))
+      (do (.writeHead res 200 #js {"content-type" "application/edn; charset=utf-8"
+                                   "cache-control" "no-store"})
+          (.end res body))
+      (json-res res 503 {:ok false :error "evidence page exceeds byte limit"}))))
+
+(defn committed-lock-conflict
+  "Return evidence when a lock contradicts an available committed block.
+
+  A bounded snapshot may omit older blocks, so absence is not called a
+  conflict. A block at the lock's height with a different hash is conclusive:
+  this witness must not sign or serve a healthy consensus state from it."
+  [s]
+  (let [lock (get-in s [:pm :locked-qc])
+        h (:inga.qc/height lock)
+        committed-height (r/committed-height s)
+        block (when (and (integer? h) (<= h committed-height))
+                (some #(when (= h (:inga.block/height %)) %)
+                      (concat (:committed s) (:chain s))))]
+    (when (and block (not= (:inga.qc/block-hash lock)
+                            ((:hash-fn s) block)))
+      {:height h
+       :committed-hash ((:hash-fn s) block)
+       :locked-hash (:inga.qc/block-hash lock)})))
+
+(defn- require-consistent-lock! [s]
+  (when-let [conflict (committed-lock-conflict s)]
+    (throw (ex-info "inga-node: lock conflicts with committed block" conflict))))
+
+(defn archive-sync-response
+  "Answer a bounded sync request from finalized local custody. A restarted
+  witness retains a short in-memory tail; peers farther behind must be able to
+  fetch the earlier finalized branch from disk, including a hash-targeted fork.
+  Return nil when this archive cannot answer, so the replica may answer from
+  its live tail. Corrupt stored bytes throw and poison this witness."
+  [data-dir state {:keys [type from to target-hash]}]
+  (when (= :sync-request type)
+    (let [committed (r/committed-height state)
+          cap (:max-batch sync/default-params)
+          end (if target-hash to (min (or to -1) committed (+ (or from 0) (dec cap))))]
+      (when (and (nat-int? from) (nat-int? to) (<= from end))
+        (when-let [blocks (store/finalized-range data-dir from end committed
+                                                 (:hash-fn state) cap)]
+          (when (and (seq blocks)
+                     (or (nil? target-hash)
+                         (= target-hash ((:hash-fn state) (peek blocks)))))
+            (cond-> {:type :sync-response :blocks blocks}
+              target-hash (assoc :target-hash target-hash))))))))
+
+(defn start!
+  "Run one witness. `cfg`:
+
+    :witness    \"w1\"
+    :witnesses  [\"w1\" \"w2\" ...]
+    :peers      {\"w2\" \"ws://host:port\" ...}   (this witness excluded)
+    :pubkeys    {\"w1\" \"<hex>\" ...}
+    :seed-hex   this witness's private seed
+    :chain-id   string
+    :port       int
+    :bind       optional local interface address (for example a tailnet IP)
+    :tick-ms    int
+    :data-dir   string
+    :archive-finalized?  retain every finalized block from a fresh genesis
+    :archive-http?       expose opt-in bounded archive evidence endpoints
+    :writer-admit?       optional predicate (inga.writer/admit) a committed
+                         record must pass to become a head; absent = all
+    :cors-origins        optional `inga-node.cors/parse-origins` value: which
+                         browser origins may read replies; absent = none
+
+  Returns `{:stop! fn :state atom :advance! fn}`. `advance!` is the same
+  durable transition path used by ticks and inbound messages."
+  [{:keys [witness witnesses peers pubkeys seed-hex chain-id port bind tick-ms view-ms data-dir prefix-service archive-finalized? archive-http? writer-admit? cors-origins]}]
+  (let [opts {:witness witness
+              :witnesses witnesses
+              :quorum (c/quorum-size (count witnesses))
+              :chain-id chain-id
+              ;; The view budget has to cover a whole ROUND, not a tick.
+              ;;
+              ;; Two ticks was the first guess and it is wrong: a round is
+              ;; propose, vote, certify, and under churn it is that again
+              ;; after a view led by a witness that is gone. Measured here —
+              ;; seven processes, budget = 2 x tick — the chain ran fine
+              ;; until one witness was killed and then froze at height 43
+              ;; while views kept turning over, which is the same starvation
+              ;; signature the Worker deployment had, one layer up.
+              ;;
+              ;; The default is eight ticks, which is the ratio `inga`'s own
+              ;; harness runs at (120ms ticks against a 1000ms budget) and
+              ;; the only configuration anybody has watched survive a
+              ;; Byzantine validator for a hundred blocks.
+              :params {:base-timeout (or view-ms (* 8 tick-ms)) :max-doublings 6}
+              :hash-fn seams/hash-fn
+              :sign-fn (seams/sign-fn seed-hex)
+              :verify-fn (seams/verify-fn pubkeys)}
+        snap (store/read-snapshot data-dir)
+        _ (when archive-finalized?
+            (store/verify-finalized-archive! data-dir snap (:hash-fn opts)))
+        _ (when (and snap
+                     (or (not= (wire/wire-id witness) (:witness snap))
+                         (not (integer? (:voted-view snap)))
+                         (not (integer? (:voted-below snap)))))
+            (throw (ex-info "inga-node: snapshot lacks this witness's durable vote state" {})))
+        state (atom (if snap (r/resume opts snap) (r/replica opts)))
+        _ (require-consistent-lock! @state)
+        durable-snapshot (atom snap)
+        snapshot-writes (atom 0)
+        failed? (atom false)
+        registry (atom {})
+        out-node (atom nil)
+        counts (atom {:sent 0 :recv 0})]
+    (letfn [(persist! [s before]
+              ;; The sink lives HERE, next to the only place `:committed` can
+              ;; grow, rather than at each caller. A decision centralised in
+              ;; one function but invoked from three call sites is a plane
+              ;; that is on in two of them.
+              (let [fresh (vec (drop before (:committed s)))]
+                (when (seq fresh)
+                  (when archive-finalized?
+                    (store/append-finalized! data-dir fresh (:qcs s) (:hash-fn s)))
+                  ;; The certificates and the hash come from the SAME state
+                  ;; snapshot the blocks did. Reading them separately would
+                  ;; let a tick land in between and pair a block with a
+                  ;; certificate for a different one.
+                  ;; Revisit the bounded committed tail. A record may become
+                  ;; durable one transition before its QC is locally visible;
+                  ;; the next commit then fills the proof without an
+                  ;; unbounded scan of historical blocks.
+                  (store/sink-blocks! data-dir
+                                      (take-last r/resume-tail (:committed s))
+                                      (:qcs s) (:hash-fn s)
+                                      (or writer-admit? (constantly true))))
+                ;; The transport sends many votes and repeated sync requests
+                ;; that change only in-memory working sets. The old path
+                ;; fsynced the same bounded snapshot for every one of them:
+                ;; xavier received 38k messages and wrote about 1 GB while
+                ;; the HTTP event loop intermittently stopped answering.
+                ;; A vote, lock, QC, commit, pending record, or pacemaker
+                ;; change is in this snapshot and still reaches disk BEFORE
+                ;; ship! can release any output.
+                (let [next-snapshot (r/snapshot s)]
+                  (when (not= @durable-snapshot next-snapshot)
+                    (store/write-snapshot! data-dir next-snapshot)
+                    (reset! durable-snapshot next-snapshot)
+                    (swap! snapshot-writes inc)))))
+
+            (ship! [outbox]
+              ;; BROADCAST, ignoring `:to`, because that is what `inga`'s own
+              ;; harness does and matching the only configuration anyone has
+              ;; watched run is worth more than an optimisation.
+              ;;
+              ;; It is NOT a fix for the departure stall below. Honouring
+              ;; `:to` was the third of three guesses at that, and switching
+              ;; to broadcast changed nothing — measured, same freeze at the
+              ;; same place. The reason it stays is the first sentence, not
+              ;; the second.
+              ;;
+              ;; Both halves of the mesh, because a peer we dialled and a
+              ;; peer that dialled us are different sockets and reaching one
+              ;; set is reaching half the network.
+              (doseq [{:keys [msg]} outbox]
+                (swap! counts update :sent inc)
+                (when-let [n @out-node] ((:broadcast! n) msg))
+                (doseq [[_ s] @registry]
+                  (when (:send! s) ((:send! s) msg)))))
+
+            (advance! [f]
+              (when @failed?
+                (throw (ex-info "inga-node: safety or persistence failed; restart required" {})))
+              (let [before (count (:committed @state))
+                    [s' out] (f @state)]
+                ;; No vote leaves before its safety state is durable.
+                ;; A failure poisons this running instance: the rename may
+                ;; have succeeded before directory fsync failed.
+                (try
+                  (require-consistent-lock! s')
+                  (persist! s' before)
+                  (catch :default e
+                    (reset! failed? true)
+                    (throw e)))
+                (reset! state s')
+                (ship! out)))
+
+            (feed! [msg reply!]
+              (swap! counts update :recv inc)
+              (if (and archive-finalized? (= :sync-request (:type msg)))
+                (let [answer (try (archive-sync-response data-dir @state msg)
+                                  (catch :default e
+                                    (reset! failed? true)
+                                    (throw e)))]
+                  (if answer
+                    (do (swap! counts update :sent inc)
+                        (reply! answer))
+                    (advance! #(r/on-message % msg (now)))))
+                (advance! #(r/on-message % msg (now)))))
+
+            (tick! []
+              (when-let [n @out-node] ((:tick! n)))
+              (let [s @state]
+                (when (and (empty? (:committed s)) (zero? (r/height s)))
+                  (advance! #(r/start % (now)))))
+              (advance! #(r/on-tick % (now))))]
+
+      (let [server (http/createServer
+                    (fn [req res]
+                      (let [url (js/URL. (.-url req) "http://localhost")
+                            p (.-pathname url)
+                            hdrs (.-headers req)
+                            preflight? (and cors-origins (= "OPTIONS" (.-method req)))]
+                        ;; setHeader, not writeHead: every branch below ends in a
+                        ;; writeHead, which merges these in, so no route can
+                        ;; forget them — including the 503 a failed node answers.
+                        (doseq [[k v] (cors/headers cors-origins (aget hdrs "origin")
+                                                    (when preflight?
+                                                      {:private-network? (= "true" (aget hdrs "access-control-request-private-network"))}))]
+                          (.setHeader res k v))
+                        (cond
+                          preflight?
+                          (do (.writeHead res 204) (.end res))
+
+                          @failed?
+                          (json-res res 503 {:ok false :error "safety or persistence failed; restart required"})
+
+                          (= p "/health")
+                          (let [s @state]
+                            (json-res res 200
+                                      {:ok true :service "inga-node" :witness witness
+                                       :chain-id chain-id
+                                       ;; Named, not implied: what the fault model IS
+                                       ;; depends on where the keys live, and here each
+                                       ;; witness generated its own on its own machine.
+                                       :fault-model "byzantine-capable (one key per host)"
+                                       :height (r/height s)
+                                       :committed-height (r/committed-height s)
+                                       :pending (count (:pending s))
+                                       :view (:view (:pm s))
+                                       :blocks-known (count (:by-hash s))
+                                       :equivocations (count (:equivocations s))
+                                       ;; Enough to tell WHICH step of a round
+                                       ;; is missing. Without these a stall is
+                                       ;; just "height did not move", which is
+                                       ;; the same picture for four different
+                                       ;; causes.
+                                       :vote-groups (count (:votes s))
+                                       :new-view-groups (count (:new-views s))
+                                       :qcs (count (:qcs s))
+                                       :leader-of-view (nth witnesses
+                                                            (mod (:view (:pm s)) (count witnesses)))
+                                       :tip-height (:inga.block/height (r/tip s))
+                                       :peers-out (when-let [n @out-node] (count ((:live n))))
+                                       :peers-in (srv/peer-count registry)
+                                       :records (store/count-records data-dir)
+                                       :snapshot-writes @snapshot-writes
+                                       :counts @counts}))
+
+                          (= p "/finalized-prefix")
+                          (if-not prefix-service
+                            (json-res res 503 {:ok false :error "prefix archive not configured"})
+                            (-> (js/Promise.resolve nil)
+                                (.then (fn [_] (prefix-service {:method (.-method req)
+                                                              :checkpoint (.get (.-searchParams url) "checkpoint")})))
+                                (.then (fn [{:keys [status headers body]}]
+                                         (.writeHead res status (clj->js headers))
+                                         (.end res body)))
+                                (.catch (fn [_] (json-res res 503 {:ok false :error "prefix archive unavailable"})))))
+
+                          (= p "/local-finalized-range")
+                          (if-not (and archive-finalized? archive-http?
+                                       (= "GET" (.-method req)))
+                            (json-res res 404 {:ok false :error "not found"})
+                            (let [from (query-nat (.get (.-searchParams url) "from"))
+                                  limit (query-nat (.get (.-searchParams url) "limit"))]
+                              (if-not (and from limit (<= 1 limit 128))
+                                (json-res res 400 {:ok false :error "invalid bounded range"})
+                                (try
+                                  (let [s @state
+                                        committed (r/committed-height s)
+                                        to (+ from (dec limit))]
+                                    (if (and (<= to 9007199254740991)
+                                             (<= to committed))
+                                      (if-let [blocks (store/finalized-range
+                                                       data-dir from to committed
+                                                       (:hash-fn s) 128)]
+                                        (edn-res res {:chain-id chain-id :from from :to to
+                                                      :blocks blocks})
+                                        (json-res res 416 {:ok false :error "range unavailable"}))
+                                      (json-res res 416 {:ok false :error "range unavailable"})))
+                                  (catch :default _
+                                    (json-res res 503 {:ok false :error "archive range unavailable"}))))))
+
+                          (= p "/local-finalized-checkpoint")
+                          (if-not (and archive-finalized? archive-http?
+                                       (= "GET" (.-method req)))
+                            (json-res res 404 {:ok false :error "not found"})
+                            (try
+                              (edn-res res (assoc (store/finalized-checkpoint data-dir @state)
+                                                  :chain-id chain-id))
+                              (catch :default _
+                                (json-res res 503 {:ok false :error "certified checkpoint unavailable"}))))
+
+                          (= p "/local-finalized-prefix")
+                          (if-not (and archive-finalized? archive-http?
+                                       (= "GET" (.-method req)))
+                            (json-res res 404 {:ok false :error "not found"})
+                            (try
+                              (let [s @state
+                                    proof (store/finalized-prefix data-dir s 8192)
+                                    context {:genesis (first (:blocks proof))
+                                             :chain-id chain-id
+                                             :witnesses witnesses
+                                             :quorum (:quorum s)
+                                             :hash-fn (:hash-fn s)
+                                             :verify-fn (:verify-fn s)
+                                             :max-blocks 8192}
+                                    checked (prefix/verify proof context)
+                                    body (pr-str {:proof proof
+                                                  :finalized-height (:height checked)
+                                                  :chain-id chain-id})]
+                                (if (and (= :finalized (:status checked))
+                                         (<= (.-length (.encode (js/TextEncoder.) body))
+                                             (* 8 1024 1024)))
+                                  (do (.writeHead res 200 #js {"content-type" "application/edn; charset=utf-8"
+                                                               "cache-control" "no-store"})
+                                      (.end res body))
+                                  (json-res res 503 {:ok false :error "complete prefix unavailable"})))
+                              (catch :default _
+                                (json-res res 503 {:ok false :error "complete prefix unavailable"}))))
+
+                          (= p "/current-ref")
+                          (do
+                            (.setHeader res "cache-control" "no-store, max-age=0")
+                            (if-not (= "GET" (.-method req))
+                              (json-res res 405 {:ok false :error "GET required"})
+                              (if-let [{:keys [ref challenge]}
+                                       (current-ref-query (.-searchParams url))]
+                                (try
+                                  (if-let [response (current-ref-response
+                                                     data-dir
+                                                     {:chain-id chain-id :witness witness
+                                                      :ref ref :challenge challenge
+                                                      :observed-at (now)
+                                                      :sign-fn (:sign-fn opts)})]
+                                    (json-res res 200 response)
+                                    (json-res res 503 {:ok false :error "current ref proof unavailable"}))
+                                  (catch :default _
+                                    (json-res res 503 {:ok false :error "current ref proof unavailable"})))
+                                (json-res res 400 {:ok false :error "exactly one ref and challenge required"}))))
+
+                          (= p "/committed")
+                          (let [ref (.get (.-searchParams url) "ref")
+                                head (when ref (store/head-of data-dir ref))]
+                            (json-res res 200
+                                      (cond-> {:ok true :records (store/count-records data-dir)
+                                               :source "filesystem"}
+                                        ref (assoc :head head)
+                                        ;; The proof travels WITH the head, so
+                                        ;; a reader never has to ask a second
+                                        ;; time and never has to decide
+                                        ;; whether the two answers describe
+                                        ;; the same moment.
+                                        ;; The EDN text, not a re-encoded
+                                        ;; value: a proof's qualified keywords
+                                        ;; and sets do not survive JSON, which
+                                        ;; is why it is stored as EDN in the
+                                        ;; first place.
+                                        head (assoc :proof
+                                                    (store/proof-text
+                                                     data-dir ref (get head "seq"))))))
+
+                          (and (= p "/submit") (= "POST" (.-method req)))
+                          (let [chunks (atom "")]
+                            (.on req "data" (fn [c] (swap! chunks str c)))
+                            (.on req "end"
+                                 (fn []
+                                   (let [rec (try (aget (js/JSON.parse @chunks) "record")
+                                                  (catch :default _ nil))
+                                         m (when rec (js->clj rec))]
+                                     (if-not (and (map? m) (get m "ref") (get m "cid"))
+                                       (json-res res 400 {:ok false :error "record required"})
+                                       (try
+                                         (advance! (fn [s] [(r/submit s (js/JSON.stringify (clj->js m))) []]))
+                                         (json-res res 200 {:ok true :submitted true})
+                                         (catch :default _
+                                           (json-res res 503 {:ok false :error "safety or persistence failed; restart required"}))))))))
+
+                          :else (json-res res 404 {:ok false :error "not found"})))))
+            wss (ws/WebSocketServer. #js {:server server})
+            n (atom 0)]
+
+        (.on wss "connection"
+             (fn [sock]
+               (let [peer (str "in-" (swap! n inc))
+                     handle-ref (atom nil)
+                     attached (srv/attach! registry peer sock
+                                         {:add-listener (fn [s ev f] (.on s ev f))
+                                          :on-message (fn [_ m]
+                                                        (feed! m (fn [answer]
+                                                                   (when-let [send! (:send! @handle-ref)]
+                                                                     (send! answer)))))})]
+                 (reset! handle-ref attached)
+                 (swap! registry update peer merge attached))))
+        (if bind
+          (.listen server port bind)
+          (.listen server port))
+
+        (reset! out-node
+                (nws/make-node {;; The `ws` package, not the platform global.
+                                ;;
+                                ;; Node 26 and Node 22 disagree about what a
+                                ;; failed `new WebSocket(...)` does: on 22 the
+                                ;; error escaped `onerror` and killed the
+                                ;; process. Measured on the fleet — three
+                                ;; nodes on 26 formed a chain while the one on
+                                ;; 22 died at startup with an undici stack.
+                                ;; The server side of this file already uses
+                                ;; `ws`; using it on the client side too makes
+                                ;; the runtime version stop being a variable.
+                                ;;
+                                ;; Outbound sockets leave from `bind` when it
+                                ;; is set. An unbound connect lets the kernel
+                                ;; pick the source port from the whole
+                                ;; ephemeral range, and on a host whose other
+                                ;; services churn connections that range runs
+                                ;; out: dan (2026-10-06) held 55k TIME_WAIT
+                                ;; sockets, every unbound connect to a peer
+                                ;; failed EADDRNOTAVAIL, and its witness sat at
+                                ;; peers-out 0 while the same connect bound to
+                                ;; the tailnet address succeeded. The witness
+                                ;; already listens only on `bind`; dialing from
+                                ;; it too keeps both directions on one identity.
+                                :ctor (let [WS (or (.-WebSocket ws) ws)]
+                                        (if bind
+                                          (fn [url] (WS. url #js {:localAddress bind}))
+                                          WS))
+                                :peers (vec (keys peers))
+                                :url-of (fn [p] (get peers (wire/wire-id p)))
+                                :on-message (fn [peer m]
+                                              (feed! m (fn [answer]
+                                                         ((:send! @out-node) peer answer))))}))
+        ((:tick! @out-node))
+
+        (let [iv (js/setInterval tick! tick-ms)]
+          (js/console.log (str "inga-node " witness " listening on " (or bind "*") ":" port
+                               " peers=" (str/join "," (keys peers))
+                               " tick=" tick-ms "ms data=" data-dir))
+          {:state state
+           :advance! advance!
+           :stop! (fn []
+                    (js/clearInterval iv)
+                    (when-let [nd @out-node] ((:close-all! nd)))
+                    (.close wss)
+                    (.close server))})))))

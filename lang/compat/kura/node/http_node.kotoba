@@ -1,0 +1,152 @@
+(ns kura.node.http-node
+  "An `IAsyncShardStore` that talks to a remote kura node over HTTP.
+
+  **This was the missing half of the node protocol.** `script/run_node.cljk`
+  has served the shard-store contract over HTTP since self-hosted nodes became
+  possible, and nothing could consume it: `fs`, `r2` and `s3-async` were the
+  only backends, so a coordinator could read a node's `/descriptor` and run its
+  `/self-check` but could not place a single shard on it. Self-hosted nodes were
+  countable and unusable.
+
+  **What this tests that `/self-check` cannot.** A node's self-check runs the
+  contract against its own disk, in-process, bypassing HTTP entirely — so a node
+  can report 19/19 while its HTTP surface mis-encodes a range, loses a byte in a
+  round trip, or returns 200 for an absent shard. Running the SAME suite through
+  this store exercises the wire, and the wire is what a coordinator depends on.
+  A backend is not verified by the machine that hosts it.
+
+  `IHttp` is injected, exactly as in `kura.node.s3`: request shaping stays a
+  pure function of its inputs, and a test does not need a node running."
+  (:require [kotoba.lang.text :as str]
+            [kura.node.async :as async]
+            [kura.node.s3 :as s3]
+            [kura.node.store :as store]))
+
+(defn- shard-url [base shard-id]
+  ;; Each segment encoded independently — a shard id is `<object>/<stripe>/<n>`
+  ;; and the slashes are structure, not data.
+  (str base "/shard/" (str/join "/" (map js/encodeURIComponent (str/split shard-id #"/")))))
+
+(defn- ok? [{:keys [status]}] (and status (<= 200 status 299)))
+
+(defn- absent?
+  "404 means absent. Distinguished from every other failure, because a store
+  that reports a transport error as `nil` tells the repair scheduler a shard is
+  gone when the truth is that the network is down — and it will then spend
+  bandwidth rebuilding data that never left."
+  [{:keys [status]}]
+  (= 404 status))
+
+(defn- json-body [{:keys [body]}]
+  (try (js->clj (js/JSON.parse (.decode (js/TextDecoder.) body)) :keywordize-keys true)
+       (catch :default _ nil)))
+
+(defn- fail! [op shard-id {:keys [status]}]
+  (throw (js/Error. (str op " failed for " shard-id ": HTTP " status))))
+
+(defrecord HttpNodeStore [http base desc extra-headers]
+  async/IAsyncShardStore
+  (-put-shard!> [_ shard-id bytes]
+    (if-not (store/valid-shard-id? shard-id)
+      (js/Promise.reject (js/Error. (str "bad shard id: " shard-id)))
+      (-> (s3/-request http {:method :put
+                             :url (shard-url base shard-id)
+                             :headers (merge {"content-type" "application/octet-stream"} extra-headers)
+                             :body bytes})
+          (.then (fn [r]
+                   (if (ok? r)
+                     ;; Trust the length we sent, not the one echoed back: a
+                     ;; node that miscounts should fail the round-trip check,
+                     ;; not quietly agree with itself.
+                     {:shard-id shard-id :bytes-written (.-length ^js bytes)}
+                     (fail! "put" shard-id r)))))))
+
+  (-get-shard> [_ shard-id]
+    (-> (s3/-request http {:method :get :url (shard-url base shard-id)
+                           :headers extra-headers :body (js/Uint8Array. 0)})
+        (.then (fn [r] (cond (ok? r) (:body r)
+                             (absent? r) nil
+                             :else (fail! "get" shard-id r))))))
+
+  (-get-range> [_ shard-id offset length]
+    (-> (s3/-request http {:method :get
+                           :url (str (shard-url base shard-id)
+                                     "?range=" offset "," length)
+                           :headers extra-headers :body (js/Uint8Array. 0)})
+        (.then (fn [r] (cond (ok? r) (:body r)
+                             (absent? r) nil
+                             :else (fail! "range" shard-id r))))))
+
+  (-delete-shard!> [_ shard-id]
+    (-> (s3/-request http {:method :delete :url (shard-url base shard-id)
+                           :headers extra-headers :body (js/Uint8Array. 0)})
+        (.then (fn [r] (cond (ok? r) (boolean (:removed (json-body r)))
+                             (absent? r) false
+                             :else (fail! "delete" shard-id r))))))
+
+  (-list-shards> [_ prefix]
+    (-> (s3/-request http {:method :get
+                           :url (str base "/shards?prefix="
+                                     (js/encodeURIComponent (or prefix "")))
+                           :headers extra-headers :body (js/Uint8Array. 0)})
+        (.then (fn [r]
+                 (if (ok? r)
+                   (vec (sort (:shards (json-body r))))
+                   (fail! "list" prefix r))))))
+
+  (-shard-size> [_ shard-id]
+    ;; HEAD, so this honours the `:size-without-read` capability the node
+    ;; declares. Reading the body and measuring it would satisfy the contract
+    ;; and defeat the point — an audit asks for size across every shard it
+    ;; holds, and doing that by download is the I/O the design exists to avoid.
+    (-> (s3/-request http {:method :head :url (shard-url base shard-id)
+                           :headers extra-headers :body (js/Uint8Array. 0)})
+        (.then (fn [r]
+                 (cond (absent? r) nil
+                       (ok? r) (let [n (get-in r [:headers "content-length"])]
+                                 (when n (js/parseInt n 10)))
+                       :else (fail! "size" shard-id r))))))
+
+  store/INodeIdentity
+  (-descriptor [_] desc))
+
+(defn open
+  "A store over the node at `base` (e.g. `http://100.82.98.110:8410`).
+
+  `:descriptor` is the node's own, normally fetched from `/descriptor` — see
+  `descriptor>`. It is passed in rather than fetched here so that constructing
+  a store does no I/O, which is what lets placement build one per backend
+  without a round trip each.
+
+  `:headers` is merged into every request. A node on a tailnet needs none: the
+  perimeter is the authentication. A node served by a Worker has no perimeter
+  and requires a bearer token, and the same client has to reach both — so auth
+  belongs here as a per-store detail rather than in six method bodies."
+  [{:keys [http base descriptor headers]}]
+  (assert http "an IHttp is required")
+  (assert (and (string? base) (seq base)) "a base URL is required")
+  (assert (map? descriptor) ":descriptor is required — fetch it with descriptor>")
+  (->HttpNodeStore http (str/replace base #"/+$" "") descriptor (or headers {})))
+
+(defn descriptor>
+  "Fetch and VALIDATE a remote node's descriptor.
+
+  Validated through `store/descriptor` rather than trusted as received, because
+  a descriptor is a claim about failure domain and availability that the audit
+  then does arithmetic on. A node that omits `:availability`, or invents a
+  profile, must be refused here — otherwise the first place a malformed claim
+  shows up is a durability number."
+  ([http base] (descriptor> http base {}))
+  ([http base headers]
+   (-> (s3/-request http {:method :get :url (str base "/descriptor")
+                          :headers headers :body (js/Uint8Array. 0)})
+      (.then (fn [r]
+               (if-not (ok? r)
+                 (throw (js/Error. (str "descriptor fetch failed: HTTP " (:status r))))
+                 (let [d (json-body r)]
+                   (store/descriptor
+                    {:node-id (:node-id d)
+                     :failure-domain (into {} (map (fn [[k v]] [k (str v)])) (:failure-domain d))
+                     :independence (keyword (:independence d))
+                     :availability (keyword (:availability d))
+                     :capabilities (set (map keyword (:capabilities d)))}))))))))

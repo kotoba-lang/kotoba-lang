@@ -1,0 +1,235 @@
+(ns kototama.linear-journal
+  "Durable at-most-once capability consumption journal — a parent-linked
+  chain of content-addressed entries.
+
+  The at-most-once property is unchanged and is still the point: one claim is
+  fsynced before the provider runs, so a crash may consume authority without
+  producing a result, but recovery can never replay it.
+
+  What is new is that an entry has an **identity**. Each appended line is
+  addressed by the raw CIDv1 of its own bytes, and carries `:prev`, the CID
+  of the line before it. Root ADR-2608160200 asks for receipts that are
+  values rather than lines, for two reasons a plain append log cannot serve:
+
+  - a transaction elsewhere can then **cite** the consumption that authorised
+    it, by CID, instead of by \"trust the file\";
+  - truncation and edits stop being invisible. Appending is the only edit an
+    append log detects; a chain detects a middle entry being changed, and
+    `verify-chain` says where.
+
+  **Content addressing is not idempotence.** The CID does not stop a second
+  execution — the file lock, the fsync and the count do. Nothing about the
+  linear guarantee moved into the hash.
+
+  The CID is `raw` (0x55) over the exact bytes of the line, so any tool can
+  verify it (`ipfs add --raw-leaves` agrees) without this file teaching it a
+  schema. dag-cbor would additionally let generic tooling read the fields,
+  and is the follow-up when a consumer needs that; it would pull a CBOR
+  dependency into a repo that keeps `kototama.contract` and `lib/*`
+  zero-dep, which is not worth paying before there is a reader.
+
+  **Entries written before this** carry no `:prev`. They are reported as an
+  unchained prefix rather than as corruption: a journal that predates the
+  chain is not a broken chain, and calling it one would make the check
+  useless on every journal that already exists."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.edn :as edn]
+            [multiformats.core :as mf])
+  (:import [java.io File RandomAccessFile]
+           [java.util.concurrent ConcurrentHashMap]
+           [java.util.concurrent.locks ReentrantLock]
+           [java.util.function Function]))
+
+(defrecord Journal [^File file ^ReentrantLock lock])
+(defonce ^:private path-locks (ConcurrentHashMap.))
+
+(defn open! [path]
+  (let [file (File. ^String path)]
+    (when-let [parent (.getParentFile file)] (.mkdirs parent))
+    (when-not (.exists file) (.createNewFile file))
+    (->Journal file
+               (.computeIfAbsent
+                path-locks (.getCanonicalPath file)
+                (reify Function
+                  (apply [_ _] (ReentrantLock.)))))))
+
+(defn canonical-line
+  "The exact string appended for `entry`, without its newline.
+
+  Keys are sorted so the bytes depend on the entry's content and not on the
+  order a map happened to be built in — a CID over a non-canonical encoding
+  addresses the writer's mood as much as the fact."
+  [entry]
+  (pr-str (into (sorted-map) entry)))
+
+(defn entry-cid
+  "Raw CIDv1 of an entry's canonical bytes."
+  [entry]
+  (mf/cidv1-raw (kbytes/utf8-bytes ^String (canonical-line entry))))
+
+(defn entries [^Journal journal]
+  (with-open [reader (java.io.BufferedReader. (java.io.FileReader. (:file journal)))]
+    (->> (line-seq reader) (remove empty?) (mapv edn/read-string))))
+
+(defn consumed [journal lease-id import]
+  (count (filter #(and (= :consume (:op %))
+                       (= lease-id (:lease-id %))
+                       (= import (:import %)))
+                 (entries journal))))
+
+(defn claim!
+  "Fsync one claim before provider execution. A crash may consume authority
+  without a result, but recovery can never replay it."
+  [^Journal journal lease-id import max-items]
+  (let [lock (:lock journal)]
+    (.lock lock)
+    (try
+      (with-open [raf (RandomAccessFile. (:file journal) "rw")
+                  file-lock (.lock (.getChannel raf))]
+        (let [bytes (byte-array (.length raf))
+              _ (.seek raf 0)
+              _ (.readFully raf bytes)
+              recovered (->> (.split (kbytes/utf8-string bytes) "\n")
+                             (remove empty?)
+                             (map edn/read-string))
+              used (count (filter #(and (= :consume (:op %))
+                                        (= lease-id (:lease-id %))
+                                        (= import (:import %)))
+                                  recovered))]
+          (if (>= used max-items)
+            false
+            (let [;; The chain head comes from the same parse the count came
+                  ;; from: one read, one truth. Reading it separately would
+                  ;; leave a window where the count and the link disagree.
+                  prev (some-> (last recovered) entry-cid)
+                  entry (cond-> {:op :consume :lease-id lease-id
+                                 :import import :ordinal (inc used)}
+                          prev (assoc :prev prev))]
+              (.seek raf (.length raf))
+              (.write raf (kbytes/utf8-bytes (str (canonical-line entry) "\n")))
+              (.sync (.getFD raf))
+              true))))
+      (finally (.unlock lock)))))
+
+(defn verify-chain
+  "Walk the journal and check that every `:prev` is the CID of the line
+  before it.
+
+  Returns
+
+      {:ok? bool :count n :unchained n :broken-at i :expected cid :found cid}
+
+  `:unchained` counts leading entries written before the chain existed; they
+  are not a failure. `:broken-at` is the index of the first entry whose
+  `:prev` does not match, which is what a truncated or edited middle looks
+  like."
+  [^Journal journal]
+  (let [es (entries journal)]
+    (loop [i 0 prev nil unchained 0]
+      (if (>= i (count es))
+        {:ok? true :count (count es) :unchained unchained}
+        (let [e (nth es i)
+              declared (:prev e)]
+          (cond
+            ;; pre-chain entry: no claim to check, and none to make
+            (and (nil? declared) (zero? i))
+            (recur (inc i) (entry-cid e) (inc unchained))
+
+            (and (nil? declared) (= unchained i))
+            (recur (inc i) (entry-cid e) (inc unchained))
+
+            (= declared prev)
+            (recur (inc i) (entry-cid e) unchained)
+
+            :else
+            {:ok? false :count (count es) :unchained unchained
+             :broken-at i :expected prev :found declared}))))))
+
+;; ── outcomes ────────────────────────────────────────────────────────────────
+;;
+;; A claim is written BEFORE the provider runs -- that is what makes the
+;; guarantee at-most-once rather than exactly-once -- so at claim time there
+;; is no outcome to record. The outcome is a second entry, written after, and
+;; `capability-semantics.edn` says what it must carry:
+;; `:receipt/cap`, `:receipt/at`, `:receipt/call`, `:receipt/outcome`.
+;;
+;; That file also declares `:attempt-always-receipted true`. A rule nothing
+;; can check is a wish, so `unreceipted` answers which consumptions have no
+;; outcome recorded -- and a crash between the claim and the receipt is
+;; exactly what it should report, not a case to paper over.
+
+(def required-receipt-keys
+  "From `kotoba-lang`'s `lang/capability-semantics.edn`."
+  #{:receipt/cap :receipt/at :receipt/call :receipt/outcome})
+
+(defn- append-entry!
+  "Append one chained, fsynced entry under the file lock. The chain head is
+   read in the same critical section that writes, so two writers cannot
+   produce two entries claiming the same parent."
+  [^Journal journal entry-fn]
+  (let [lock (:lock journal)]
+    (.lock lock)
+    (try
+      (with-open [raf (RandomAccessFile. (:file journal) "rw")
+                  file-lock (.lock (.getChannel raf))]
+        (let [bytes (byte-array (.length raf))
+              _ (.seek raf 0)
+              _ (.readFully raf bytes)
+              recovered (->> (.split (kbytes/utf8-string bytes) "\n")
+                             (remove empty?)
+                             (map edn/read-string))
+              prev (some-> (last recovered) entry-cid)]
+          (when-let [entry (entry-fn (vec recovered))]
+            (let [entry (cond-> entry prev (assoc :prev prev))]
+              (.seek raf (.length raf))
+              (.write raf (kbytes/utf8-bytes (str (canonical-line entry) "\n")))
+              (.sync (.getFD raf))
+              (entry-cid entry)))))
+      (finally (.unlock lock)))))
+
+(defn- claims [entries lease-id import]
+  (filterv #(and (= :consume (:op %))
+                 (= lease-id (:lease-id %))
+                 (= import (:import %)))
+           entries))
+
+(defn receipt!
+  "Record the outcome of a consumption. Returns the receipt's CID, or nil if
+   there is no claim to attach it to.
+
+   `receipt` must carry every key in `required-receipt-keys`. A receipt for a
+   consumption that never happened is refused: it would be a record of
+   authority nobody spent."
+  [^Journal journal lease-id import ordinal receipt]
+  (let [missing (remove #(contains? receipt %) required-receipt-keys)]
+    (when (seq missing)
+      (throw (ex-info "linear-journal: incomplete receipt"
+                      {:type :linear-journal/incomplete-receipt
+                       :missing (set missing)}))))
+  (append-entry!
+   journal
+   (fn [entries]
+     (when (some #(= ordinal (:ordinal %)) (claims entries lease-id import))
+       (merge {:op :receipt :lease-id lease-id :import import :ordinal ordinal}
+              (select-keys receipt (into required-receipt-keys [:receipt/value])))))))
+
+(defn receipts
+  "Every recorded outcome for `lease-id`/`import`."
+  [^Journal journal lease-id import]
+  (filterv #(and (= :receipt (:op %))
+                 (= lease-id (:lease-id %))
+                 (= import (:import %)))
+           (entries journal)))
+
+(defn unreceipted
+  "Consumptions with no outcome recorded — the checkable form of
+   `capability-semantics.edn`'s `:attempt-always-receipted`.
+
+   A crash between the claim and the provider returning shows up here, which
+   is the point: the authority was spent and nothing knows what came of it."
+  [^Journal journal]
+  (let [es (entries journal)
+        receipted (set (map (juxt :lease-id :import :ordinal)
+                            (filter #(= :receipt (:op %)) es)))]
+    (filterv #(and (= :consume (:op %))
+                   (not (receipted ((juxt :lease-id :import :ordinal) %))))
+             es)))

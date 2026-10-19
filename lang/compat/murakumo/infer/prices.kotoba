@@ -1,0 +1,235 @@
+(ns murakumo.infer.prices
+  "掲示価格レジストリ（`resources/murakumo/prices.edn`）の読み出しと参照。
+
+  ── なぜこの ns が要るのか ──
+
+  `murakumo.infer.credits/job-cost` は『model map の `:credit/per-*` を引き、
+  無ければ例外』という正しい規律を持っていたが、**その map を供給する側が
+  存在しなかった**。結果、実際に効いていた価格は次の 2 つだけだった:
+
+  - text : kotoba oracle の `default-per-token` = `:i64 1` → $0.01/token
+           = $10,000/Mtok = 実勢の 20,000 倍。**誰も選んでいない** ——
+           `:i64` の正の最小値が 1 で、それがそのまま価格になっていた
+  - image: `murakumo.infer.media/cmd-generate` の即値 `:credit/per-image 100`
+           = $1.00/枚 = fal 原価 $0.03 の 33 倍
+
+  video / audio / 3D は価格が無く、`job-cost` は仕様どおり例外を投げていた。
+  つまり **売れる状態にあったのは、桁が違う 2 つの価格だけ**だった。
+
+  この ns は EDN を読むだけで、価格の判断は持たない（判断は ADR-2608026200 /
+  ADR-2608026500、値は prices.edn）。`spec.cljc` が `murakumo.edn` を読むのと
+  同じ分担。
+
+  ── staleness ──
+
+  原価は他社の公開価格に依存するので必ず古くなる。`:verified-at` が
+  `:staleness-days` を超えたレジストリで見積もりを出すのは『間違った数字を
+  自信をもって返す』ことなので、`price-for` は例外を投げる（ADR-2608026000）。
+  掲示価格そのものは固定でよいが、それが今も黒字かは原価の鮮度に依存する。"
+  
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [murakumo.infer.credits :as credits]
+            ))
+
+(def resource-path "murakumo/prices.edn")
+
+(defn load-registry
+  "prices.edn を読む。引数で解析済み map を渡せる（テスト用）。
+
+  cljs では Cloudflare Worker にファイルシステムが無いので、`prices-embed` が
+  **コンパイル時に同じ EDN を読んで**リテラルへ展開したものを返す。写しではなく
+  同一ファイルなので、JVM と Worker で価格がずれることは構造的に起きない。"
+  ([] (load-registry nil))
+  ([parsed]
+   (or parsed
+       )))
+
+(defn- days-between
+  "ISO date 文字列 2 つの日数差（`from` → `to`）。時刻は持たない。"
+  [from to]
+  (letfn [(->days [s]
+            (let [[y m d] (map #( %)
+                               (str/split s #"-"))
+                  ;; civil-days（Howard Hinnant のアルゴリズム）。うるう年を正しく扱う。
+                  y' (if (<= m 2) (dec y) y)
+                  era (quot (if (>= y' 0) y' (- y' 399)) 400)
+                  yoe (- y' (* era 400))
+                  doy (+ (quot (+ (* 153 (+ m (if (> m 2) -3 9))) 2) 5) (dec d))
+                  doe (+ (* yoe 365) (quot yoe 4) (- (quot yoe 100)) doy)]
+              (+ (* era 146097) doe -719468)))]
+    (- (->days to) (->days from))))
+
+(defn stale?
+  "レジストリが `today`（ISO 文字列）時点で陳腐化しているか。"
+  [registry today]
+  (let [limit (:staleness-days registry)
+        at    (:verified-at registry)]
+    (boolean (and limit at (> (days-between at today) limit)))))
+
+(defn assert-fresh!
+  "陳腐化していたら例外。silent に古い原価で見積もらない。"
+  [registry today]
+  (when (stale? registry today)
+    (throw (ex-info "price registry is stale — re-verify provider costs before quoting"
+                    {:verified-at (:verified-at registry)
+                     :staleness-days (:staleness-days registry)
+                     :today today})))
+  registry)
+
+(defn price-for
+  "modality（:text/:video/:image/:model3d/:voice/:music）と model id →
+  `job-cost` に渡せる model map。
+
+  未登録なら例外 —— `job-cost` が価格キー欠落で例外を投げるのと同じ規律を、
+  レジストリ参照の段でも守る。**沈黙は『無料』にも『最小整数』にもなりうる**
+  ので、どちらも起こさない。"
+  ([registry modality model-id] (price-for registry modality model-id nil))
+  ([registry modality model-id today]
+   (when today (assert-fresh! registry today))
+   (let [by-modality (get registry modality)]
+     (when-not by-modality
+       (throw (ex-info "unknown modality in price registry"
+                       {:modality modality :available (set (keys registry))})))
+     (or (get by-modality model-id)
+         (throw (ex-info "model has no published price — refusing to quote"
+                         {:modality modality :model model-id
+                          :available (set (keys by-modality))}))))))
+
+(def ^:private modalities
+  "レジストリの中で『model id → 価格 map』を持つキー。`:peg` や `:verified-at`
+  のようなメタデータキーと区別するために列挙する —— `(remove keyword? ...)` の
+  ような構造推論だと、将来メタデータを足したときに黙って modality 扱いされる。"
+  [:text :video :image :model3d :voice :music])
+
+(defn find-model
+  "model id だけからレジストリ内の 1 件を引く（modality を呼び出し側に要求しない）。
+
+  → `{:modality kw :model-id s :price map}`
+
+  課金経路が持っているのは model id だけで、それがどの modality かは
+  レジストリしか知らない。**曖昧なら例外** —— 同じ id が 2 つの modality に
+  あるとき、片方を黙って選ぶと『動画のつもりが画像価格で課金される』が
+  無言で起きる。"
+  [registry model-id]
+  (let [hits (for [m modalities
+                   :let [entry (get-in registry [m model-id])]
+                   :when entry]
+               {:modality m :model-id model-id :price entry})]
+    (case (count hits)
+      1 (first hits)
+      0 (throw (ex-info "model has no published price — refusing to quote"
+                        {:model model-id
+                         :available (into (sorted-set)
+                                          (mapcat #(keys (get registry % {})) modalities))}))
+      (throw (ex-info "model id is ambiguous across modalities — refusing to guess"
+                      {:model model-id :modalities (mapv :modality hits)})))))
+
+(defn quote-credits
+  "model id + 課金単位 → credits。**沈黙で 0 にならない**唯一の見積もり経路。
+
+  `units` は `credits/job-cost` と同じ形（`{:mtokens-in 0.3 :mtokens-out 1.2}`、
+  `{:video-seconds 5}`、`{:images 4}` など）。
+
+  ── ここが fail-closed でなければならない理由 ──
+
+  本番の `/infer/spend` は 2026-08-02 まで、この関数の代わりに
+
+      per-token (double (or (:credit/per-token model) 1))
+      cost      (* per-token (double (or (:tokens body) 0)))
+
+  をインラインで持っていた。3 つの穴が同時に開いていた:
+
+  1. 価格が無い model は **1 credit/token**（= $10,000/Mtok）で課金された
+  2. `:tokens` 以外の単位が存在しないので、動画も画像も **0 credits**
+  3. `credits/job-cost` を通らないので、job-cost が守っていた
+     『価格キー欠落は例外』という規律の外にいた
+
+  `:credit/job-minimum` を持つ model は、算出額がそれを下回ったら最低額に
+  切り上げる（ADR-2608036900）。
+
+  戻り値は double。`assert-fresh!` は呼び出し側の責任（`today` を渡せる
+  `price-for` と違い、ここは課金のホットパスなので日付を毎回要求しない）。"
+  [registry model-id units]
+  (let [{:keys [price]} (find-model registry model-id)]
+    (when (empty? units)
+      (throw (ex-info "refusing to quote a job with no billing units"
+                      {:model model-id})))
+    (let [computed (credits/job-cost price units)
+          ;; `:credit/job-minimum` はレジストリに 2026-08-02 から書かれていたが、
+          ;; **どこからも読まれていなかった**（ace-step / stable-audio-open の
+          ;; 5cr）。単価が微小な modality はジョブ最低額が無いと、1 回の生成が
+          ;; 0.6cr のような、決済手数料にも届かない金額で通ってしまう ——
+          ;; 宣言はあるのに発火しない機構、というこの repo が繰り返し見つける
+          ;; 失敗そのものだった。ここで適用する。
+          minimum  (:credit/job-minimum price)]
+      (if (and (number? minimum) (< computed minimum))
+        (double minimum)
+        computed))))
+
+(defn peg-credits-per-usd [registry]
+  (get-in registry [:peg :credits-per-usd]))
+
+(defn usd->credits [registry usd]
+  (* (double usd) (peg-credits-per-usd registry)))
+
+(defn credits->usd [registry credits]
+  (/ (double credits) (peg-credits-per-usd registry)))
+
+(defn contribution-rate
+  "掲示価格に対する寄与率 = 1 − 原価/(掲示 × (1 − 収入側費用))。
+  収入側 4.4% = Stripe 2.9% + Tax 0.5% + チャージバック引当 1.0%
+  （ADR-2608026200 §4）。ADR-2608026200 §5-5 の floor は 0.30。"
+  ([registry price-credits cost-usd] (contribution-rate registry price-credits cost-usd 0.044))
+  ([registry price-credits cost-usd rev-side]
+   (let [price-usd (credits->usd registry price-credits)]
+     (if (pos? price-usd)
+       (- 1.0 (/ (double cost-usd) (* price-usd (- 1.0 rev-side))))
+       0.0))))
+
+(def cost-keys
+  "原価を宣言しているキー。**新しい課金次元を足したらここにも足すこと** ——
+  ここに無い次元は `below-floor` から見えず、寄与率の検査を素通りする。"
+  [:cost/usd-per-second :cost/usd-per-minute :cost/usd-per-image
+   :cost/usd-per-asset :cost/usd-per-ktext :cost/usd-per-mtoken-out])
+
+(def price-keys
+  "掲示価格を宣言しているキー。同上。"
+  [:credit/per-video-second :credit/per-audio-second :credit/per-audio-minute
+   :credit/per-image :credit/per-asset :credit/per-ktext :credit/per-mtoken-out])
+
+(defn uncosted
+  "**価格はあるのに原価が宣言されていない** entry を全部返す。
+
+  `below-floor` は cost と price が両方そろった entry だけを見るので、原価の
+  無い entry は『floor 割れではない』のではなく『検査されていない』。両者は
+  同じ結果（空リスト）に見えるので、区別できる関数を別に置く ——
+  沈黙が合格に見える構造を作らない、というのがこのレジストリ全体の規律。
+  → [{:modality m :model id :price c}]"
+  [registry]
+  (for [[modality models] registry
+        :when (map? models)
+        [model-id m] models
+        :when (map? m)
+        :let [price (some m price-keys)]
+        :when (and price (pos? price) (nil? (some m cost-keys)))]
+    {:modality modality :model model-id :price price}))
+
+(defn below-floor
+  "floor（既定 0.30）を割る登録価格を全部返す。捏造ではなく機械検査で
+  『赤字にならない』を保証するための関数（ADR-2608026200 §5-5 不変条件 1）。
+  → [{:modality m :model id :price c :cost usd :contribution r}]"
+  ([registry] (below-floor registry 0.30))
+  ([registry floor]
+   (let [cost-keys  cost-keys
+         price-keys price-keys]
+     (for [[modality models] registry
+           :when (map? models)
+           [model-id m] models
+           :when (map? m)
+           :let [cost (some m cost-keys)
+                 price (some m price-keys)]
+           :when (and cost price (pos? price))
+           :let [r (contribution-rate registry price cost)]
+           :when (< r floor)]
+       {:modality modality :model model-id :price price :cost cost :contribution r}))))

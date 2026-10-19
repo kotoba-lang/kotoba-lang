@@ -1,0 +1,80 @@
+(ns murakumo.infer.orchestrate
+  "The autonomous control loop: read fleet capacity + request demand from
+  murakumo's own public data, compute a demand-aware placement (rebalance.cljc),
+  and publish the decision back as murakumo data. One tick = one closed loop:
+
+    GET  /infer/fleet   → capacity (anonymized snapshot)
+    GET  /infer/runs    → demand (recent request mix)
+    rebalance/target    → placement plan + moves
+    POST /infer/placement (record the decision — the fleet's desired state)
+
+  kbb -M:entrypoints:
+    kbb -M:murakumo infer orchestrate            one tick, print + publish
+    kbb -M:murakumo infer orchestrate --watch=N  loop every N seconds
+
+  This is I/O (HTTP) so it lives in a .clj (not the portable .cljc core). The
+  decision itself is pure murakumo.infer.rebalance — this only wires it to live
+  data. Applying moves to nodes (restarting engines) is a separate, gated step;
+  here we compute + publish the desired placement, which the reconcile path
+  (murakumo.core reconcile) can then converge nodes toward."
+  (:require [murakumo.config :as config]
+            [murakumo.infer.rebalance :as rb]
+            [kotoba.lang.http.host.babashka :as http]
+            [json.compat :as json]))
+
+(defn- cloud-url
+  "Config URL (MURAKUMO_CLOUD). Injectable via config/cloud-url for tests."
+  []
+  (config/cloud-url))
+
+(defn- GET [path]
+  (-> (http/get (str (cloud-url) path) {:headers {"accept" "application/json"} :timeout 12000})
+      :body (json/parse-string true)))
+
+(defn- POST [path body]
+  (http/post (str (cloud-url) path)
+             {:headers {"content-type" "application/json"} :timeout 12000
+              :body (json/generate-string body)}))
+
+(defn tick
+  "One control-loop tick. Reads live capacity + demand, computes the placement,
+   and (unless :dry-run) publishes it. Returns the decision map."
+  [{:keys [dry-run current] :or {current {}}}]
+  (let [snapshot (GET "/infer/fleet")
+        runs     (GET "/infer/runs")
+        cap      (rb/capacity snapshot)
+        demand   (rb/demand-from-runs runs)
+        {:keys [target moves changed? reason]} (rb/rebalance current cap demand)
+        decision {:placement/head (:head target)
+                  :placement/pools (:pools target)
+                  :placement/pool-seats (:pool-seats target)
+                  :placement/pipeline (:pipeline target)
+                  :placement/demand demand
+                  :placement/online (:online target)
+                  :placement/moves moves
+                  :placement/changed changed?
+                  :placement/reason reason}]
+    (when-not dry-run (POST "/infer/placement" decision))
+    decision))
+
+(defn -main [& args]
+  (let [watch (some->> args (some #(re-matches #"--watch=(\d+)" %)) second Long/parseLong)
+        dry?  (some #{"--dry-run"} args)]
+    (letfn [(once [current]
+              (let [d (tick {:dry-run dry? :current current})]
+                (println (format "[orchestrate] online=%d demand=%s seats=%s %s%s"
+                                  (:placement/online d)
+                                  (:placement/demand d)
+                                  (:placement/pool-seats d)
+                                  (:placement/reason d)
+                                  (if dry? " (dry-run)" " → /infer/placement")))
+                (when (:placement/changed d)
+                  (doseq [m (:placement/moves d)]
+                    (println (format "  move %s: %s → %s" (:id m) (:from m) (:to m)))))
+                {:pools (:placement/pools d) :demand (:placement/demand d)}))]
+      (if watch
+        (loop [cur {}]
+          (let [nxt (try (once cur) (catch Exception e (println "[orchestrate] error:" (.getMessage e)) cur))]
+            (Thread/sleep (* 1000 watch))
+            (recur nxt)))
+        (once {})))))
