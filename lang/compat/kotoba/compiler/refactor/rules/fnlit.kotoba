@@ -1,0 +1,237 @@
+;; Rule (g): an anonymous-function literal becomes the `fn` form the reader expands it to.
+;;
+;;   #(run! % context)        ->  (fn [x] (run! x context))
+;;   #(f %1 %2)               ->  (fn [x1 x2] (f x1 x2))
+;;   #(apply f %2 %&)         ->  (fn [_x1 x2 & xs] (apply f x2 xs))
+;;   #(timed-body)            ->  (fn [] (timed-body))
+;;
+;; The Clojure reader turns #(BODY) into (fn* [p1 .. pN & rest] (BODY)) with N the highest %N used (% is %1), so the
+;; output is the same function on the host.  The seed and the Kotoba reader do not read `#(` (E1005); this is the wall
+;; of the product entries nbb.cli / nbb.aarch64-cli.  Parameter names never collide with a symbol of the body, so no
+;; outer local is shadowed.  Continuation lines move right by the width the opener grew, so the layout stays aligned;
+;; lines inside a string literal are left as they are.  A literal under ' or ` is data (the reader's gensym'd
+;; parameters are part of it) and is reported, not rewritten.
+(ns kotoba.compiler.refactor.rules.fnlit
+  {:kotoba/export [find-all arg-index rewrite-text]}
+  (:require [kotoba.compiler.refactor.cst :as cst]
+                         [kotoba.compiler.refactor.edit :as edit]
+                         [kotoba.compiler.refactor.finding :as fd])
+  (:schemas {:fnlit/names [:record :fnlit/names [[:params [:list :string]] [:pos [:list :string]] [:rest :string]]]
+                        :fnlit/scan [:record :fnlit/scan [[:args [:list [:ref :cst/node]]] [:idx :vector-i64] [:used [:list :string]]
+                                                          [:rs :vector-i64] [:re :vector-i64] [:nmax :i64] [:rest :bool]]]}))
+
+;; ---------------------------------------------------------------------------
+;; Kotoba reading: the forms of the guest twin kotoba-lang lang/compat/kotoba/compiler/refactor/rules/fnlit.kotoba
+;; (claude/refactor-twins-parity 1c7260f), moved verbatim, each in a #?(:kotoba ...) form; the last one carries the
+;; host reading (the whole host program, unchanged) as its :default arm.  The twin's header follows.
+;; kotoba.compiler.refactor.rules.fnlit -- the GUEST-ROUTE twin of amu's
+;; `src/kotoba/compiler/refactor/rules/fnlit.cljk`, rule (g): an anonymous-function literal becomes the `fn` form the
+;; Clojure reader expands it to.
+;;
+;;   #(run! % context)        ->  (fn [x] (run! x context))
+;;   #(f %1 %2)               ->  (fn [x1 x2] (f x1 x2))
+;;   #(apply f %2 %&)         ->  (fn [_x1 x2 & xs] (apply f x2 xs))
+;;   #(timed-body)            ->  (fn [] (timed-body))
+;;
+;; The same computation as the host over the cst twin's nodes: parameter names avoid every symbol of the body (base,
+;; base__1, ...), continuation lines move right by the opener's growth except lines inside a string/regex literal and
+;; blank lines, a literal under ' or ` is :human (its reason names the outermost such prefix), a literal holding
+;; another #( ) is :human, every other one is :auto with :force-apply and :kind :with-args / :thunk. The host's
+;; `cst/walk` answers :skip at a #( ), so a #( ) below another is never a finding of its own: here a visit with a
+;; #( ) ancestor is passed over.
+;;   (find-all src nodes) -> [:list :finding/f]   in the host's order
+;;   (arg-index t)        -> :i64                 the host's arg-index: N for % / %N, -1 for %&, 0 for nil
+;;   (rewrite-text src n) -> :string              the (fn [..] (BODY)) text of the #( ) node n
+;;
+;; OFFSETS are UTF-8 bytes (the cst twin's); every edit here is relative to the literal and the inserted text is
+;; ASCII, so the rewrite is the host's text.
+
+
+(defn- cat [a :string b :string] :string (string-concat a b))
+(defn- kid [n [:ref :cst/node] i :i64] [:ref :cst/node] (typed-list-nth [:list [:ref :cst/node]] (cst/node-kids n) i))
+(defn- nodes-nth [xs [:list [:ref :cst/node]] i :i64] [:ref :cst/node] (typed-list-nth [:list [:ref :cst/node]] xs i))
+(defn- strs-nth [xs [:list :string] i :i64] :string (typed-list-nth [:list :string] xs i))
+
+(defn- digit? [p :i64] :bool (and (>= p 48) (<= p 57)))
+
+;; % and %1 -> 1, %N -> N, %& -> -1; 0 for any other symbol text
+(defn arg-index [t :string] :i64
+  (let [n (string-byte-length t)]
+    (cond
+      (string=? t "%") 1
+      (string=? t "%&") -1
+      (and (> n 1) (= (string-code-point-at t 0) 37) (not (= (string-code-point-at t 1) 48))
+           (loop [k 1] (cond (>= k n) true (digit? (string-code-point-at t k)) (recur (+ k 1)) :else false)))
+      (loop [k 1 acc 0] (if (>= k n) acc (recur (+ k 1) (+ (* 10 acc) (- (string-code-point-at t k) 48)))))
+      :else 0)))
+
+;; every node below n, pre-order
+(defn- descend [n [:ref :cst/node] acc [:list [:ref :cst/node]]] [:list [:ref :cst/node]]
+  (let [ks (cst/node-kids n) m (vector-count ks)]
+    (loop [i 0 a acc]
+      (if (>= i m)
+        a
+        (let [k (nodes-nth ks i)]
+          (recur (+ i 1) (descend k (typed-list-conj [:list [:ref :cst/node]] a k))))))))
+
+(defn- descendants [n [:ref :cst/node]] [:list [:ref :cst/node]]
+  (descend n (typed-list-new [:list [:ref :cst/node]])))
+
+(defn- member? [xs [:list :string] s :string] :bool
+  (let [m (vector-count xs)]
+    (loop [k 0] (cond (>= k m) false (string=? (strs-nth xs k) s) true :else (recur (+ k 1))))))
+
+;; base, or base__1, base__2 ... : the first that is not a symbol of the body
+(defn- fresh [base :string used [:list :string]] :string
+  (if (not (member? used base))
+    base
+    (loop [k 1]
+      (let [c (cat base (cat "__" (string-from-i64 k)))]
+        (if (member? used c) (recur (+ k 1)) c)))))
+
+(defn- referenced? [nums :vector-i64 i :i64] :bool
+  (let [m (vector-count nums)]
+    (loop [k 0] (cond (>= k m) false (= (vector-at nums k) i) true :else (recur (+ k 1))))))
+
+(defn- param-names [n :i64 rest :bool nums :vector-i64 used [:list :string]] [:ref :fnlit/names]
+  (let [one (and (= n 1) (not rest))
+        pos (loop [i 1 acc (typed-list-new [:list :string])]
+              (if (> i n)
+                acc
+                (let [base (if one "x" (cat "x" (string-from-i64 i)))]
+                  (recur (+ i 1)
+                         (typed-list-conj [:list :string] acc
+                                          (fresh (if (referenced? nums i) base (cat "_" base)) used))))))
+        rest-name (if rest (fresh "xs" used) "")
+        params (if rest
+                 (typed-list-conj [:list :string] (typed-list-conj [:list :string] pos "&") rest-name)
+                 pos)]
+    (record-new [:ref :fnlit/names] params pos rest-name)))
+
+(defn- by-index [nm [:ref :fnlit/names] i :i64] :string
+  (if (< i 0)
+    (record-get [:ref :fnlit/names] nm :rest)
+    (strs-nth (record-get [:ref :fnlit/names] nm :pos) (- i 1))))
+
+(defn- join-space [xs [:list :string]] :string
+  (let [m (vector-count xs)]
+    (loop [k 0 acc ""] (if (>= k m) acc (recur (+ k 1) (if (= k 0) (strs-nth xs k) (cat acc (cat " " (strs-nth xs k)))))))))
+
+(defn- spaces [k :i64] :string
+  (loop [i 0 acc ""] (if (>= i k) acc (recur (+ i 1) (cat acc " ")))))
+
+;; insertions of `delta` spaces after every newline in [s, e) that is not inside a string literal and does not end a
+;; blank line; the ranges are the :str / :regex descendants' [s, e)
+(defn- reindent-edits [src :string s :i64 e :i64 rs :vector-i64 re :vector-i64 delta :i64 base :i64]
+  [:list [:ref :edit/e]]
+  (let [pad (spaces delta)
+        size (string-byte-length src)
+        nr (vector-count rs)]
+    (loop [i s out (edit/edits-new)]
+      (let [j (string-find-byte src 10 i)]
+        (if (or (< j 0) (>= j e))
+          out
+          (let [nxt (+ j 1)
+                in-str (loop [k 0] (cond (>= k nr) false
+                                         (and (> j (vector-at rs k)) (< j (vector-at re k))) true
+                                         :else (recur (+ k 1))))
+                blank (or (>= nxt e)
+                          (and (< nxt size)
+                               (or (= (string-code-point-at src nxt) 10) (= (string-code-point-at src nxt) 13))))]
+            (recur nxt (if (or in-str blank) out (edit/edits-conj out (edit/insert-at (- nxt base) pad "fnlit" 0))))))))))
+
+(defn rewrite-text [src :string n [:ref :cst/node]] :string
+  (let [ds (descendants n)
+        dn (vector-count ds)
+        ;; the argument symbols, their indices, the other symbols' texts, the string ranges
+        scan (loop [k 0 args (typed-list-new [:list [:ref :cst/node]]) idx (vector-alloc 0) used (typed-list-new [:list :string])
+                    rs (vector-alloc 0) re (vector-alloc 0) nmax 0 rest false]
+               (if (>= k dn)
+                 (record-new [:ref :fnlit/scan] args idx used rs re nmax rest)
+                 (let [d (nodes-nth ds k)
+                       t (cst/node-type d)
+                       rs2 (if (or (= t :str) (= t :regex)) (vector-conj rs (cst/node-s d)) rs)
+                       re2 (if (or (= t :str) (= t :regex)) (vector-conj re (cst/node-e d)) re)]
+                   (if (cst/sym? d)
+                     (let [ai (arg-index (cst/node-text d))]
+                       (if (= ai 0)
+                         (recur (+ k 1) args idx (typed-list-conj [:list :string] used (cst/node-text d)) rs2 re2 nmax rest)
+                         (recur (+ k 1) (typed-list-conj [:list [:ref :cst/node]] args d) (vector-conj idx ai) used rs2 re2
+                                (if (> ai nmax) ai nmax) (or rest (< ai 0)))))
+                     (recur (+ k 1) args idx used rs2 re2 nmax rest)))))
+        sc scan
+        args (record-get [:ref :fnlit/scan] sc :args)
+        idx (record-get [:ref :fnlit/scan] sc :idx)
+        nm (param-names (record-get [:ref :fnlit/scan] sc :nmax) (record-get [:ref :fnlit/scan] sc :rest) idx
+                        (record-get [:ref :fnlit/scan] sc :used))
+        opener (cat "(fn [" (cat (join-space (record-get [:ref :fnlit/names] nm :params)) "] ("))
+        b (+ (cst/node-s n) 2)
+        e (- (cst/node-e n) 1)
+        na (vector-count args)
+        renames (loop [k 0 acc (edit/edits-new)]
+                  (if (>= k na)
+                    acc
+                    (let [d (nodes-nth args k)]
+                      (recur (+ k 1) (edit/edits-conj acc (edit/make-edit (- (cst/node-s d) b) (- (cst/node-e d) b)
+                                                                          (by-index nm (vector-at idx k)) "fnlit" 0))))))
+        inserts (reindent-edits src b e (record-get [:ref :fnlit/scan] sc :rs) (record-get [:ref :fnlit/scan] sc :re)
+                                (- (string-byte-length opener) 2) b)
+        all (let [m (edit/edits-count inserts)]
+              (loop [k 0 acc renames] (if (>= k m) acc (recur (+ k 1) (edit/edits-conj acc (edit/edits-nth inserts k))))))]
+    (cat opener (cat (edit/apply-edits (string-substring src b e) all) "))"))))
+
+;; the outermost ' or ` prefix among the ancestors of visit V ("" when none)
+(defn- quote-above [vs [:list [:ref :cst/visit]] v [:ref :cst/visit]] :string
+  (loop [p (cst/visit-parent v) found ""]
+    (if (< p 0)
+      found
+      (let [pv (typed-list-nth [:list [:ref :cst/visit]] vs p)
+            pn (cst/visit-node pv)
+            q (and (= :prefix (cst/node-type pn))
+                   (or (string=? "'" (cst/node-prefix pn)) (string=? "`" (cst/node-prefix pn))))]
+        (recur (cst/visit-parent pv) (if q (cst/node-prefix pn) found))))))
+
+(defn- fnlit-above? [vs [:list [:ref :cst/visit]] v [:ref :cst/visit]] :bool
+  (loop [p (cst/visit-parent v)]
+    (if (< p 0)
+      false
+      (let [pv (typed-list-nth [:list [:ref :cst/visit]] vs p)]
+        (if (= :fnlit (cst/node-type (cst/visit-node pv))) true (recur (cst/visit-parent pv)))))))
+
+(defn- has-type? [ds [:list [:ref :cst/node]] t :keyword] :bool
+  (let [m (vector-count ds)]
+    (loop [k 0] (cond (>= k m) false (= t (cst/node-type (nodes-nth ds k))) true :else (recur (+ k 1))))))
+
+(defn- has-arg? [ds [:list [:ref :cst/node]]] :bool
+  (let [m (vector-count ds)]
+    (loop [k 0] (cond (>= k m) false
+                      (and (cst/sym? (nodes-nth ds k)) (not (= 0 (arg-index (cst/node-text (nodes-nth ds k)))))) true
+                      :else (recur (+ k 1))))))
+
+(defn find-all [src :string nodes [:list [:ref :cst/node]]] [:list [:ref :finding/f]]
+  (let [vs (cst/walk-visits nodes)
+        nv (vector-count vs)
+        starts (edit/line-starts src)]
+    (loop [i 0 out (fd/fs-new)]
+      (if (>= i nv)
+        out
+        (let [v (typed-list-nth [:list [:ref :cst/visit]] vs i)
+              n (cst/visit-node v)]
+          (if (or (not (= :fnlit (cst/node-type n))) (fnlit-above? vs v))
+            (recur (+ i 1) out)
+            (let [s (cst/node-s n) e (cst/node-e n)
+                  region (cst/visit-region v)
+                  line (edit/offset->line starts s)
+                  ctx (cst/call-head-text n)
+                  q (quote-above vs v)
+                  ds (descendants n)
+                  f (cond
+                      (> (string-byte-length q) 0)
+                      (fd/human "fnlit" s e region line ctx (cat "#( ) under " (cat q " is data, not a function")) "" false)
+                      (has-type? ds :fnlit)
+                      (fd/human "fnlit" s e region line ctx "nested #( ) (the reader refuses it)" "" false)
+                      :else
+                      (fd/with-force
+                        (fd/auto "fnlit" s e region line ctx (if (has-arg? ds) "with-args" "thunk") true
+                                 (edit/edits-conj (edit/edits-new) (edit/replace-node n (rewrite-text src n) "fnlit")))))]
+              (recur (+ i 1) (fd/fs-conj out f)))))))))

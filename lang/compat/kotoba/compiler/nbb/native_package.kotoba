@@ -1,0 +1,198 @@
+(ns kotoba.compiler.nbb.native-package
+  "Artifact packaging for the JDK-free native driver.
+
+  `kotoba.compiler.nbb.cli` sealed a `:kotoba.kexe/v1` artifact and wrote it
+  out as EDN, full stop. The JVM CLI does one more thing for the aiueos target
+  profiles: it hands that same sealed artifact to an ELF64 or PE32+ packager
+  and writes THOSE bytes to `--output`. Nothing about that step needs a JVM --
+  `kotoba.native.elf64` and `kotoba.compiler.packaging.pe32plus` are portable
+  `.cljc` that load unchanged under nbb -- it simply had no caller on this
+  route. That absence is the whole reason `os/aiueos` built every one of its
+  67 kernel objects through `clojure`.
+
+  Kept out of `cli.cljs` deliberately: that namespace is shared with the Wasm
+  driver, which must not pay to load two native packagers it will never call.
+  The ISA entrypoint supplies `package` the same way it supplies
+  `emit-program`."
+  {:kotoba/export [package]}
+  (:require [kotoba.compiler.limits :as limits]
+            [kotoba.compiler.linux-static-handlers :as static-handlers]
+            [kotoba.compiler.nbb.cli-support :as support]
+            [kotoba.compiler.packaging.pe32plus :as pe32plus]
+            [kotoba.kir.target :as target-profile]
+            [kotoba.native.elf64 :as elf64]
+            [kotoba.native.linux-static :as linux-static]
+            [kotoba.verifier.linux-static :as linux-static-verifier]))
+
+;; superproject adr-2609251400 C2. The static ELF's prelude reads its budgets,
+;; admitted slots, trap names and exit codes from the native profile of
+;; kotoba-lang lang/limits.edn -- this compiler's `kotoba.compiler.limits/table`
+;; -- so the packager is handed that profile rather than restating any of it.
+(defn- num [n] (js/Number n))
+
+(defn- spawn-grant
+  "The :process/spawn grant of a compile policy: top-level `:spawn`, or the
+  older `:linux-static :spawn` spelling. Both at once is refused."
+  [policy]
+  (let [top (:spawn policy)
+        old (get-in policy [:linux-static :spawn])]
+    (when (and (some? top) (some? old))
+      (throw (ex-info "the :process/spawn grant is spelled twice: use the top-level :spawn, not also :linux-static :spawn"
+                      {:reason :policy/spawn-grant-spelled-twice})))
+    (if (some? top) top old)))
+
+(defn- static-options
+  "superproject adr-2609251400 C3. What a program with capability effects is
+  packaged with, all of it sealed into the image:
+
+    :handlers  the decision code its handlers call -- amu's own
+               tools/kexe_loader_decisions.kotoba (the kexe loader's) and
+               tools/linux_static_handlers.kotoba, compiled by this compiler
+               for the image's ISA and held here as sealed artifacts
+               (scripts/gen-linux-static-handlers.cljk writes them; --check
+               recompiles and compares).
+    :grant     the policy's `:linux-static :grant` (wire ids) when it names
+               one, which may only narrow the program's effects; otherwise
+               the effects themselves, each already admitted by `:allow`.
+    :fs-scope  the policy's `:linux-static :fs-scope`, the one directory
+               :fs/app-data and :fs/browse resolve under.
+    :spawn     the policy's top-level `:spawn` ({:programs [..]
+               :path-lookup bool :env [..]}): what :process/spawn may run,
+               whether a bare name is looked up among those programs, and
+               which variables the child receives (C3, second half). The
+               grant is target-neutral (kotoba-lang lang/capability-catalog.edn
+               :process/spawn :grant; the kexe loader and the kbb js host take
+               the same shape), so it is not spelled under `:linux-static`
+               any more; that older spelling is still read, and a policy that
+               spells it both ways is refused rather than one silently
+               winning.
+
+  The grant is authority (adr-2609242100: a capability is the authority to
+  use a handler), so it comes from the compile policy and nowhere else: the
+  image reads no argument or variable that could widen it."
+  [artifact policy]
+  (let [isa (get-in linux-static/targets [(:target artifact) :isa])
+        texts (get static-handlers/artifact-texts isa)
+        {:keys [grant fs-scope]} (:linux-static policy)
+        spawn (spawn-grant policy)]
+    (cond-> {:handlers {:decisions (support/read-artifact-text! (:decisions texts))
+                        :handlers (support/read-artifact-text! (:handlers texts))}}
+      (some? grant) (assoc :grant (set (map num grant)))
+      (some? fs-scope) (assoc :fs-scope fs-scope)
+      (some? spawn) (assoc :spawn spawn))))
+
+(defn- package-linux-static [artifact policy]
+  (let [profile (:profile/native limits/table)
+        options (static-options artifact policy)
+        image (linux-static/package artifact profile options)]
+    ;; The image is verified before it is written: the code bytes re-derived
+    ;; from the program (as for every kexe), the handler decision code
+    ;; re-derived from ITS programs, the prelude re-derived from the artifact,
+    ;; the profile and the sealed grant, and the ELF held to no interpreter /
+    ;; no dynamic section / no W+X by a parser that is not the packager's.
+    (linux-static-verifier/verify-image! artifact (:bytes image) profile options)
+    image))
+
+(def ^:private kits
+  "Exactly the `cond->` arms of `kotoba.compiler.core/compile-source*`. A target
+  absent here has no packaged form, which is not an error: it means `--output`
+  receives the artifact EDN, same as on the JVM."
+  {:x86_64-aiueos-kernel-v1  {:object elf64/package-kernel-object
+                              :image  elf64/package-kernel}
+   :aarch64-aiueos-kernel-v1 {:image  elf64/package-kernel-aarch64}
+   :x86_64-aiueos-user-v1    {:image  elf64/package-user}
+   :x86_64-aiueos-uefi-v1    {:image  pe32plus/package-efi}
+   :x86_64-linux-static-kotoba-v1  {:image package-linux-static}
+   :aarch64-linux-static-kotoba-v1 {:image package-linux-static}})
+
+(def ^:private divergent-twins
+  "`kotoba.native.elf64` is a TWIN: a `.clj` the JVM loads and a `.cljc` this
+  route loads (kotoba-native ADR-0036), and the ADR keeps them apart on purpose
+  -- the live-boot GDT/TSS shim lives only in the JVM file, which also lays the
+  kernel RW context at a different offset.
+
+  Measured 2026-08-31 on one source: the x86-64 kernel IMAGE is 65,904 bytes
+  here and 110,872 through the JVM. The object, the CPL3 user image, the UEFI
+  application and the AArch64 kernel image are byte-identical across both
+  routes; this one is not, and it is not a bug to fix here -- the divergence is
+  the ADR's decision.
+
+  So it is refused rather than served. Producing a materially different kernel
+  image under a flag whose whole value is that it refuses instead of falling
+  back would be the exact failure this route was added to remove: a quiet wrong
+  answer where the caller asked for an equivalent one."
+  {[:x86_64-aiueos-kernel-v1 :image]
+   (str "the portable elf64 twin does not carry the live-boot GDT/TSS shim, so "
+        "this route's x86-64 kernel image is not the JVM's (65,904 vs 110,872 "
+        "bytes measured 2026-08-31). kotoba-native ADR-0036 keeps the two files "
+        "apart deliberately. Build the kernel image through the JVM entry point; "
+        "the kernel OBJECT, the CPL3 user image, the UEFI application and the "
+        "AArch64 kernel image are byte-identical on this route.")})
+
+(defn- refusal-is-not-a-defect
+  "Run a packager, giving its deliberate refusals a `:phase` so the CLI can
+  tell them apart from a crash.
+
+  `kotoba.native.elf64` refuses a source claiming an `aiueos-*` export with no
+  admitted symbol, and the PE32+ packager refuses a malformed image; both raise
+  `ex-info` carrying data but no `:phase`. `cli-support/exit-code` reads
+  `:phase`, so every one of those arrived as `:internal`, exit 70, and the
+  refusal's own sentence was replaced by the words `internal compiler error`.
+  Measured 2026-09-02 on b1fdaad2, single-file and project route alike: a
+  module exporting `aiueos-not-a-symbol` was told the compiler had broken.
+
+  Only an error CARRYING `ex-data` is re-tagged: raising `ex-info` is how a
+  packager says it decided to refuse. A `TypeError` out of a packager IS a
+  compiler defect and has to keep saying so -- re-tagging everything would
+  turn every internal packaging bug into `your source is wrong`, which is the
+  same mistake pointed the other way."
+  [target artifact-kind thunk]
+  (try
+    (thunk)
+    (catch :default error
+      (if-let [data (ex-data error)]
+        (if (:phase data)
+          (throw error)
+          (throw (ex-info (ex-message error)
+                          (assoc data :phase :artifact-target
+                                      :target target
+                                      :artifact artifact-kind))))
+        (throw error)))))
+
+(defn package
+  "Select and run the packager exactly as `kotoba.compiler.cli`'s `:kexe/v1`
+  branch does, and return a Buffer, or nil when the artifact EDN is what
+  `--output` should hold.
+
+  The defaulting rule is copied rather than simplified: with no `--artifact`,
+  an object is preferred when one exists, and an image is used only for a
+  `:process` profile. That is why `--target x86_64-aiueos-kernel-v1` alone
+  yields a `.o` (what `bisect-object-migration.sh` hashes) while the UEFI
+  image requires `--artifact image` (what `build-kotoba-native-kernel.sh`
+  passes)."
+  [target artifact artifact-kind policy]
+  (let [kit (get kits target)
+        packager (case artifact-kind
+                   "image" (:image kit)
+                   "object" (:object kit)
+                   (or (:object kit)
+                       ;; A static-linkage profile's only form is its image:
+                       ;; without it `--output` would hold artifact EDN under
+                       ;; a name the caller means to execute.
+                       (when (or (= :process (:execution (target-profile/profile target)))
+                                 (= :static (:linkage (target-profile/profile target))))
+                         (:image kit))))
+        selected-kind (cond (= packager (:image kit)) :image
+                            (= packager (:object kit)) :object)]
+    (when-let [reason (get divergent-twins [target selected-kind])]
+      (throw (ex-info (str "no JVM-free implementation: " reason)
+                      {:phase :artifact-target :target target
+                       :artifact selected-kind
+                       :reason :packager-twin-divergence})))
+    (when packager
+      (let [packaged (refusal-is-not-a-defect
+                      target selected-kind
+                      #(if (= packager package-linux-static)
+                         (packager artifact policy)
+                         (packager artifact)))]
+        (js/Buffer.from (clj->js (mapv #(bit-and (int %) 0xff) (:bytes packaged))))))))

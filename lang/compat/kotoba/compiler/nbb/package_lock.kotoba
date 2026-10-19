@@ -1,0 +1,574 @@
+(ns kotoba.compiler.nbb.package-lock
+  "Resolve a Kotoba package lock (`kotoba.lock.edn`,
+  `:kotoba.lock/version 1`) into source roots the project linker can read,
+  without a JVM and without the network.
+
+  WHAT THIS IS FOR. `ADR-kotoba-package-cid-lock` (accepted 2026-06-30)
+  specified the lock, `kotoba.lang.package-contract` validates it, and the
+  conformance corpus exercises it -- but its own maturity list has recorded
+  M5, \"`kotoba-lang/registry` or `kotoba-cli` consumes the same suite\", as
+  outstanding since the day it was written. Nothing read a lock. A package
+  could be published, signed and pinned, and no compiler would look at it, so
+  the only way to depend on Kotoba code was to hand `--source-path` a
+  directory and hope. This namespace is that missing consumer.
+
+  THE DIVISION OF LABOUR, because two locks now exist and they are not
+  competing:
+
+    kotoba.lock.edn      WHO and WHAT MAY IT DO -- package name and version,
+    (this file)          repo identity, the commit it came from, the signer
+                         DIDs, and the capability grant. Authority.
+
+    kotoba.modules.edn   WHICH BYTES -- every module in the closed graph by
+    (module_lock.cljs)   CID, read from a content-addressed block directory.
+                         Integrity.
+
+  They compose in that order: a package lock resolves to source roots, the
+  linker walks them, and `module-lock` pins the result. Neither subsumes the
+  other. A module lock says nothing about who signed the code; a package lock
+  says nothing about the bytes of an individual module.
+
+  NO NETWORK, ON PURPOSE. This does not fetch. Dependency trees are read from
+  `--packages <dir>`, the way locked module bytes are read from `--blocks`.
+  Fetching is the authoring side's job, and keeping it there is what lets a
+  build be reproduced on a machine with no credentials and no route out.
+
+  WHAT IS STRICTER HERE THAN IN THE CONTRACT. `:dep/definition-cids` is
+  optional in `kotoba.lang.package-contract` -- deliberately, because
+  effectful code stays component-addressed until its capability interface is
+  in the typed KIR. It is REQUIRED here. The reason is that without it this
+  namespace has nothing to check the materialised tree against: the lock's
+  `:dep/tree-cid` pins a codebase head this route never computes, and
+  `:dep/repo-rid` is a commitment to a URL, not a locator. Admitting a
+  directory because it sits at the right path, under a name the lock
+  mentions, would be a lock in name only -- the same failure `module_lock`
+  refuses when it declines to fall back to a path search. A dep without
+  definition CIDs is refused with the command that produces them."
+  {:kotoba/export [dependency-root lock-schema manifest-file-name normalize-numbers package-dir-name report resolve-lock tree-bytes tree-serialization trust-context verify-definitions]}
+  (:require [kotoba.compiler.decimal-text :as decimal-text]
+            [kotoba.compiler.host-integer :as host-integer]
+            [kotoba.compiler.posix-path :as posix-path]
+            [kotoba.compiler.process-wire :as process-wire]
+            [kotoba.compiler.text-bytes :as text-bytes]
+            ;; Abilities (superproject adr-2609242330 S5): fs/app-data,
+            ;; fs/browse, hash/sha256 and process/spawn.
+            
+            
+            
+            ;; Kotoba: the same abilities, the directory helpers, the Form record
+            ;; (a lock and a manifest are EDN of unknown shape) and the pure
+            ;; digest of file bytes.
+            [kotoba.compiler.nbb.host.fs :as fs]
+                         [kotoba.compiler.nbb.host.process :as process]
+                         [kotoba.compiler.nbb.fs-tree :as fs-tree]
+                         [kotoba.form :as form]
+                         [kotoba.bytes :as kbytes]
+                         [multiformats.core :as mf]
+            [kotoba.lang.coll :as coll]
+            [kotoba.lang.text :as str]
+            [kotoba.lang.package-contract :as contract]
+            [kotoba.compiler.nbb.cli-support :as support])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                                  [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]}))
+
+;; ── the Kotoba reading of this file ─────────────────────────────────────────
+;; `#?(:kotoba A :default B)`: the Kotoba reader takes A, the JVM and
+;; ClojureScript readers take B, so every host body below is what it was. A lock
+;; and a manifest are the recursive `:form/r` record of kotoba.form (EDN of
+;; unknown shape); a host `nil` is `(form/nil-form)`; a host constant that is
+;; exported is a zero-argument function; `reject!` is a `throw` of an `ex-info`
+;; whose data is a flat map of strings (the host's data map is not a document:
+;; it holds nested values). Where the Kotoba reading differs from the host's,
+;; the function says so:
+;;   * a lock or manifest that is not readable EDN aborts with the bounded
+;;     reader's own error, where the host catches it and refuses with
+;;     "... does not read as EDN" (a capability call cannot be wrapped);
+;;   * `git` that cannot be started aborts where the host takes it as "no git
+;;     metadata" (same reason);
+;;   * a refusal's data carries the dependency and the figures it can state as
+;;     strings, not the host's nested maps;
+;;   * every function that can refuse is called only from a tail position or a
+;;     `let` binding (the abort ability's rule), and a loop that can refuse is a
+;;     recursion.
+;; The set operations (`sort`, `distinct`, `set-difference`) are restated over
+;; Form lists in byte order, the order the host's `sort` gives these strings and
+;; keywords.
+
+(defn- kf [k :keyword] [:ref :form/r] (form/keyword-form k))
+
+;; A function of ANOTHER module that can abort aborts here too (ADR 0363): its
+;; value is used as is.
+
+(defn- gk [m [:ref :form/r] k :keyword] [:ref :form/r]
+  (if (form/is-map? m) (form/form-get m (form/keyword-form k)) (form/nil-form)))
+
+;; the string at K of M, "" when it is not a string
+(defn- gs [m [:ref :form/r] k :keyword] :string
+  (let [v (gk m k)] (if (form/is-string? v) (form/string-value v) "")))
+
+(defn- truthy? [x [:ref :form/r]] :bool
+  (not (or (form/is-nil? x) (and (form/is-bool? x) (not (form/bool-value x))))))
+
+(defn- map2 [k1 :keyword v1 [:ref :form/r] k2 :keyword v2 [:ref :form/r]] [:ref :form/r]
+  (form/form-map (typed-list-new [:list [:ref :form/r]] (kf k1) v1 (kf k2) v2)))
+
+(defn- map3 [k1 :keyword v1 [:ref :form/r] k2 :keyword v2 [:ref :form/r] k3 :keyword v3 [:ref :form/r]] [:ref :form/r]
+  (form/form-map (typed-list-new [:list [:ref :form/r]] (kf k1) v1 (kf k2) v2 (kf k3) v3)))
+
+;; the message of a contract error value
+(defn- message-of [e [:ref :form/r]] :string (gs e :message))
+
+;; ---- sorted, deduplicated Form lists (the host's `(vec (sort (set xs)))`) ------
+
+;; -1, 0, 1: strings by byte order; keywords by namespace, then name; strings
+;; before keywords; anything else equal.
+(defn- kind-rank [x [:ref :form/r]] :i64
+  (cond (form/is-string? x) 0 (form/is-keyword? x) 1 :else 2))
+
+(defn- keyword-parts [k [:ref :form/r]] :string
+  (let [s (document-edn-print (document-keyword (form/keyword-value k)))]
+    (string-substring s 1 (string-byte-length s))))
+
+(defn- compare-keywords [a :string b :string] :i64
+  (let [ia (string-find-byte a 47 0)
+        ib (string-find-byte b 47 0)]
+    (cond
+      (and (< ia 0) (< ib 0)) (string-compare a b)
+      (< ia 0) -1
+      (< ib 0) 1
+      :else (let [c (string-compare (string-substring a 0 ia) (string-substring b 0 ib))]
+              (if (= c 0)
+                (string-compare (string-substring a (+ ia 1) (string-byte-length a))
+                                (string-substring b (+ ib 1) (string-byte-length b)))
+                c)))))
+
+(defn- form-compare [a [:ref :form/r] b [:ref :form/r]] :i64
+  (let [ra (kind-rank a) rb (kind-rank b)]
+    (cond
+      (< ra rb) -1
+      (> ra rb) 1
+      (= ra 0) (string-compare (form/string-value a) (form/string-value b))
+      (= ra 1) (compare-keywords (keyword-parts a) (keyword-parts b))
+      :else 0)))
+
+;; XS with X inserted before the first item that sorts after it, unless an equal item is there
+(defn- insert-sorted [xs [:list [:ref :form/r]] x [:ref :form/r]] [:list [:ref :form/r]]
+  (let [n (vector-count xs)]
+    (loop [i 0]
+      (cond
+        (>= i n) (form/append-form xs x)
+        (= 0 (form-compare (typed-list-nth [:list [:ref :form/r]] xs i) x)) xs
+        (> (form-compare (typed-list-nth [:list [:ref :form/r]] xs i) x) 0)
+        (form/append-many (form/append-form (take-forms xs i) x) (drop-forms xs i))
+        :else (recur (+ i 1))))))
+
+(defn- take-forms [xs [:list [:ref :form/r]] n :i64] [:list [:ref :form/r]]
+  (loop [i 0 acc (form/no-forms)]
+    (if (>= i n) acc (recur (+ i 1) (form/append-form acc (typed-list-nth [:list [:ref :form/r]] xs i))))))
+
+(defn- drop-forms [xs [:list [:ref :form/r]] n :i64] [:list [:ref :form/r]]
+  (let [len (vector-count xs)]
+    (loop [i n acc (form/no-forms)]
+      (if (>= i len) acc (recur (+ i 1) (form/append-form acc (typed-list-nth [:list [:ref :form/r]] xs i)))))))
+
+;; the items of the Form list / vector / set XS, sorted and each once
+(defn- sorted-items [xs [:ref :form/r]] [:list [:ref :form/r]]
+  (let [n (form/count-of xs)]
+    (loop [i 0 acc (form/no-forms)]
+      (if (>= i n)
+        acc
+        (recur (+ i 1) (insert-sorted acc (form/nth-of xs i)))))))
+
+(defn- has-item? [xs [:list [:ref :form/r]] x [:ref :form/r]] :bool
+  (let [n (vector-count xs)]
+    (loop [i 0]
+      (if (>= i n)
+        false
+        (if (form/eq (typed-list-nth [:list [:ref :form/r]] xs i) x) true (recur (+ i 1)))))))
+
+;; the sorted items of A that B does not hold
+(defn- sorted-difference [a [:ref :form/r] b [:ref :form/r]] [:list [:ref :form/r]]
+  (let [items (sorted-items a)
+        n (vector-count items)]
+    (loop [i 0 acc (form/no-forms)]
+      (if (>= i n)
+        acc
+        (let [x (typed-list-nth [:list [:ref :form/r]] items i)]
+          (recur (+ i 1) (if (has-item? (form/kids-of b) x) acc (form/append-form acc x))))))))
+
+
+(defn lock-schema [] :keyword :kotoba.lock/version)
+
+nil
+
+(defn normalize-numbers
+  "The bounded reader's integers are i64 already on this route: there is no
+  BigInt to narrow, so the value is the answer."
+  [value [:ref :form/r]] [:ref :form/r]
+  value)
+;; ── the package directory ────────────────────────────────────────────────────
+
+(defn package-dir-name
+  "One path segment for a package name (`/` becomes `+`)."
+  [package-name :string] :string
+  (str/replace package-name "/" "+"))
+(defn dependency-root
+  "Where `<packages>/` holds this dependency's tree, addressed by commit."
+  [packages-dir :string dep [:ref :form/r]] :string
+  (posix-path/join (posix-path/join packages-dir (package-dir-name (gs dep :dep/name)))
+                   (gs dep :dep/commit)))
+(defn- directory? [p :string] :bool (fs-tree/directory? p))
+
+(defn- exists? [p :string] :bool (fs-tree/exists? p))
+;; ── provenance: is this checkout at the commit the lock names ────────────────
+
+(defn- git-head-sha
+  "The commit a materialised dependency is actually at, or none when it is not a
+  git checkout at all. process/spawn: git's stderr is this process's own."
+  [dir :string] [:option :string]
+  (let [request (process-wire/request "git" (typed-list-new [:list :string] "-C" dir "rev-parse" "HEAD"))
+        answer (process/spawn request)
+        code (process-wire/answer-exit answer)]
+    (if (= 0 code)
+      (option-some-of [:option :string] (str/trim (process-wire/answer-out answer)))
+      (option-none-of [:option :string]))))
+
+(defn- commit-verdict
+  "Three outcomes, and the third is not the second (see the host body)."
+  [dir :string dep [:ref :form/r]] [:ref :form/r]
+  (let [found (git-head-sha dir)]
+    (if (option-some?-of [:option :string] found)
+      (let [head (option-value-of [:option :string] found "")]
+        (if (string=? head (gs dep :dep/commit))
+          (form/form-map (typed-list-new [:list [:ref :form/r]]
+                                         (kf :check) (kf :git-commit) (kf :outcome) (kf :verified)
+                                         (kf :head) (form/string-form head)))
+          (throw (ex-info "dependency checkout is not at the commit the lock pins"
+                          {:phase :package-lock :dependency (gs dep :dep/name)
+                           :pinned (gs dep :dep/commit) :actual head :root dir}))))
+      (form/form-map (typed-list-new [:list [:ref :form/r]]
+                                     (kf :check) (kf :git-commit) (kf :outcome) (kf :unverified)
+                                     (kf :reason) (form/string-form "no git metadata in the materialised tree"))))))
+;; ── development-only shapes the lock must not carry ─────────────────────────
+
+(defn- local-root-key [i :i64] :keyword
+  (cond (= i 0) :package/local-root
+        (= i 1) :dep/local-root
+        (= i 2) :dep/local-path
+        (= i 3) :dep/path
+        :else :dep/root))
+
+(defn- local-root-found [dep [:ref :form/r] i :i64] :i64
+  (cond (> i 4) -1
+        (form/form-has? dep (kf (local-root-key i))) i
+        :else (local-root-found dep (+ i 1))))
+
+(defn- local-path-error
+  "A lock reaching a compiler is past the development-only stage: a local-path
+  dependency is refused. Answers 0 when there is none."
+  [dep [:ref :form/r]] :i64
+  (let [at (if (form/is-map? dep) (local-root-found dep 0) -1)]
+    (if (>= at 0)
+      (throw (ex-info "local-path dependency not allowed in a consumed lock"
+                      {:phase :package-lock :dependency (gs dep :dep/name)
+                       :field (local-root-key at)}))
+      0)))
+(defn tree-serialization [] :keyword :kotoba.package-tree/v1)
+
+(defn manifest-file-name [] :string "package-manifest.edn")
+
+(defn- ignored-tree-entry? [name :string] :bool
+  (or (string=? name ".git") (string=? name "node_modules") (string=? name ".DS_Store")
+      (string=? name (manifest-file-name))))
+
+(defn- tree-names [root :string prefix :string acc [:set :string]] [:set :string]
+  (let [dir (if (str/blank? prefix) root (posix-path/join root prefix))]
+    (tree-members root prefix dir (fs-tree/entries dir) 0 acc)))
+
+(defn- tree-members [root :string prefix :string dir :string names [:list :string] i :i64 acc [:set :string]] [:set :string]
+  (if (>= i (vector-count names))
+    acc
+    (let [name (typed-list-nth [:list :string] names i)
+          rel (if (str/blank? prefix) name (str prefix "/" name))
+          kind (option-value-of [:option :i64] (fs-tree/kind (str dir "/" name)) -1)
+          next (cond
+                 (ignored-tree-entry? name) acc
+                 (= 1 kind) (tree-names root rel acc)
+                 (= 0 kind) (conj acc rel)
+                 :else acc)]
+      (tree-members root prefix dir names (+ i 1) next))))
+(defn- file-digest-hex [path :string] :string
+  (kbytes/hex (mf/sha256 (vector-i64-from-bytes (fs/app-data-bytes path)))))
+
+(defn- tree-lines [root :string files [:set :string] i :i64 acc [:list :string]] [:list :string]
+  (if (>= i (count files))
+    acc
+    (let [rel (typed-set-nth [:set :string] files i)
+          digest (file-digest-hex (posix-path/join root rel))]
+      (tree-lines root files (+ i 1) (conj acc (str rel "\t" digest))))))
+
+(defn tree-bytes
+  "The bytes `:tree-cid` is the CIDv1-raw of, for a package tree on disk: a
+  sorted listing of `<relative path>\t<sha256 hex>`, one per line, UTF-8, as
+  the vector of its bytes (`tree-serialization` versions the rule)."
+  [root :string] :vector-i64
+  (let [files (tree-names root "" (typed-set-new [:set :string]))
+        lines (tree-lines root files 0 (typed-list-new [:list :string]))]
+    (if (= 0 (vector-count lines))
+      (throw (ex-info "package tree is empty" {:phase :package-lock :root root}))
+      (kbytes/utf8-encode (str/join "\n" lines)))))
+(defn- read-manifest
+  [root :string dep [:ref :form/r]] [:ref :form/r]
+  (let [path (posix-path/join root (manifest-file-name))]
+    (if (not (exists? path))
+      (throw (ex-info "dependency tree carries no package manifest"
+                      {:phase :package-lock :dependency (gs dep :dep/name) :expected path}))
+      (let [manifest (support/read-edn-file! path)]
+        (normalize-numbers manifest)))))
+(defn- signature-dids [manifest [:ref :form/r]] [:ref :form/r]
+  (let [sigs (gk manifest :kotoba.package/signatures)
+        n (form/count-of sigs)]
+    (form/form-vec
+     (loop [i 0 acc (form/no-forms)]
+       (if (>= i n)
+         acc
+         (let [d (gk (form/nth-of sigs i) :did)]
+           (recur (+ i 1) (if (form/is-nil? d) acc (form/append-form acc d)))))))))
+
+(defn- manifest-verdicts-rest [manifest [:ref :form/r] dep [:ref :form/r]] [:ref :form/r]
+  (let [dname (gs dep :dep/name)]
+    (if (not (form/eq (gk manifest :kotoba.package/name) (gk dep :dep/name)))
+      (throw (ex-info "package manifest is for a different package"
+                      {:phase :package-lock :dependency dname :manifest-name (gs manifest :kotoba.package/name)}))
+      (if (not (form/eq (gk manifest :kotoba.package/version) (gk dep :dep/version)))
+        (throw (ex-info "package manifest is for a different version"
+                        {:phase :package-lock :dependency dname :locked (gs dep :dep/version)
+                         :manifest-version (gs manifest :kotoba.package/version)}))
+        (let [declared-cid (gk (gk manifest :kotoba.package/source) :manifest-cid)]
+          (if (not (form/eq declared-cid (gk dep :dep/manifest-cid)))
+            (throw (ex-info "manifest cid in the lock is not this manifest's cid"
+                            {:phase :package-lock :dependency dname :locked (gs dep :dep/manifest-cid)}))
+            (let [signed-by (signature-dids manifest)
+                  absent (sorted-difference (gk dep :dep/signers) signed-by)]
+              (if (> (vector-count absent) 0)
+                (throw (ex-info "the lock names signers who did not sign this manifest"
+                                {:phase :package-lock :dependency dname}))
+                (let [over (sorted-difference (gk dep :dep/capabilities)
+                                              (gk manifest :kotoba.package/capabilities))]
+                  (if (> (vector-count over) 0)
+                    (throw (ex-info "lock grants capabilities the package does not declare"
+                                    {:phase :package-lock :dependency dname}))
+                    (form/form-vec
+                     (typed-list-new [:list [:ref :form/r]]
+                                     (map3 :check (kf :manifest-signature) :outcome (kf :verified)
+                                           :signers (form/form-vec (sorted-items signed-by)))
+                                     (map3 :check (kf :manifest-integrity) :outcome (kf :verified)
+                                           :manifest-cid (gk dep :dep/manifest-cid))))))))))))))
+
+(defn- manifest-verdicts
+  "Bind the lock entry to the manifest the signers actually signed (shape and a
+  real Ed25519 signature, the cid the content hashes to, identity, signers and
+  capabilities)."
+  [manifest [:ref :form/r] dep [:ref :form/r]] [:ref :form/r]
+  (let [dname (gs dep :dep/name)
+        e1 (contract/package-manifest-error manifest)]
+    (if (not (form/is-nil? e1))
+      (throw (ex-info (str "package manifest rejected: " (message-of e1))
+                      {:phase :package-lock :dependency dname}))
+      (let [e2 (contract/manifest-integrity-error manifest)]
+        (if (not (form/is-nil? e2))
+          (throw (ex-info (str "package manifest rejected: " (message-of e2))
+                          {:phase :package-lock :dependency dname}))
+          (manifest-verdicts-rest manifest dep))))))
+;; ── the source roots a dependency contributes ───────────────────────────────
+
+(defn- dependency-source-roots
+  "`<root>/src` when it exists, else `<root>`."
+  [root :string] [:ref :form/r]
+  (let [src (posix-path/join root "src")]
+    (if (directory? src)
+      (form/form-vec (form/one-form (form/string-form src)))
+      (form/form-vec (form/one-form (form/string-form root))))))
+;; ── the trust context the contract validates against ────────────────────────
+
+(defn- honoured-trust-key? [k [:ref :form/r]] :bool
+  (or (form/eq k (kf :declared-capabilities)) (form/eq k (kf :revoked-signers))
+      (form/eq k (kf :expired-signers)) (form/eq k (kf :compromised-signers))))
+
+(defn- first-unknown-key [trust [:ref :form/r] i :i64] [:ref :form/r]
+  (let [ks (form/kids-of trust)]
+    (cond (>= i (vector-count ks)) (form/nil-form)
+          (honoured-trust-key? (typed-list-nth [:list [:ref :form/r]] ks i)) (first-unknown-key trust (+ i 2))
+          :else (typed-list-nth [:list [:ref :form/r]] ks i))))
+
+(defn- vec-of [trust [:ref :form/r] k :keyword] [:ref :form/r]
+  (let [v (gk trust k)]
+    (form/form-vec (if (form/is-nil? v) (form/no-forms) (form/kids-of v)))))
+
+(defn trust-context
+  "What the caller grants and whom it no longer trusts, as
+  `kotoba.lang.package-contract/lockfile-error` wants it. A key this route does
+  not act on is REFUSED, not ignored; absent `:declared-capabilities` this route
+  grants nothing. (A nil trust is the nil Form.)"
+  [trust [:ref :form/r]] [:ref :form/r]
+  (cond
+    (and (form/is-map? trust) (form/form-has? trust (kf :key-register)))
+    (throw (ex-info "this route does not honour :key-register in a trust file" {:phase :package-lock}))
+    (and (form/is-map? trust) (form/form-has? trust (kf :keys)))
+    (throw (ex-info "this route does not honour :keys in a trust file" {:phase :package-lock}))
+    (and (form/is-map? trust) (not (form/is-nil? (first-unknown-key trust 0))))
+    (throw (ex-info "unrecognised keys in the trust file" {:phase :package-lock}))
+    :else
+    (form/form-map (typed-list-new [:list [:ref :form/r]]
+                                   (kf :declared-capabilities) (vec-of trust :declared-capabilities)
+                                   (kf :revoked-signers) (vec-of trust :revoked-signers)
+                                   (kf :expired-signers) (vec-of trust :expired-signers)
+                                   (kf :compromised-signers) (vec-of trust :compromised-signers)))))
+(defn- tree-verdict
+  "The materialised tree hashes to the `:dep/tree-cid` the lock pins."
+  [root :string dep [:ref :form/r]] [:ref :form/r]
+  (let [bytes (tree-bytes root)
+        e (contract/tree-cid-error (gk dep :dep/tree-cid) (option-some-of [:option :vector-i64] bytes))]
+    (if (not (form/is-nil? e))
+      (throw (ex-info (str "package tree rejected: " (message-of e))
+                      {:phase :package-lock :dependency (gs dep :dep/name) :root root}))
+      (form/form-map (typed-list-new [:list [:ref :form/r]]
+                                     (kf :check) (kf :tree-cid) (kf :outcome) (kf :verified)
+                                     (kf :serialization) (kf (tree-serialization))
+                                     (kf :tree-cid) (gk dep :dep/tree-cid))))))
+;; ── resolution ──────────────────────────────────────────────────────────────
+
+(defn- validate-lock [lock [:ref :form/r] trust [:ref :form/r]] :i64
+  (let [version (gk lock :kotoba.lock/version)]
+    (if (not (form/eq version (form/int-form 1)))
+      (throw (ex-info "package lock version 1 required" {:phase :package-lock}))
+      (let [tc (trust-context trust)
+            error (contract/lockfile-error lock tc (form/form-map (form/no-forms)))]
+        (if (not (form/is-nil? error))
+          (throw (ex-info (message-of error) {:phase :package-lock :contract true}))
+          0)))))
+
+(defn- definition-cids [dep [:ref :form/r]] [:ref :form/r]
+  (let [cids (gk dep :dep/definition-cids)]
+    (if (and (form/is-vec? cids) (> (form/count-of cids) 0))
+      (form/form-set (sorted-items cids))
+      (throw (ex-info "dependency does not pin its definitions, so the materialised tree cannot be checked against the lock"
+                      {:phase :package-lock :dependency (gs dep :dep/name) :field :dep/definition-cids})))))
+
+(defn- resolve-dep [dep [:ref :form/r] lock-path :string packages-dir :string] [:ref :form/r]
+  (let [_ (local-path-error dep)
+        root (dependency-root packages-dir dep)]
+    (if (not (directory? root))
+      (throw (ex-info "dependency tree is not materialised"
+                      {:phase :package-lock :dependency (gs dep :dep/name) :commit (gs dep :dep/commit)
+                       :expected root}))
+      (let [cids (definition-cids dep)
+            roots (dependency-source-roots root)
+            commit-check (commit-verdict root dep)
+            tree-check (tree-verdict root dep)
+            manifest (read-manifest root dep)
+            manifest-checks (manifest-verdicts manifest dep)]
+        (form/form-map
+         (typed-list-new [:list [:ref :form/r]]
+                         (kf :name) (gk dep :dep/name)
+                         (kf :version) (gk dep :dep/version)
+                         (kf :commit) (gk dep :dep/commit)
+                         (kf :signers) (gk dep :dep/signers)
+                         (kf :capabilities) (gk dep :dep/capabilities)
+                         (kf :definition-cids) cids
+                         (kf :root) (form/string-form root)
+                         (kf :source-paths) roots
+                         (kf :checks) (form/form-vec
+                                       (form/append-many
+                                        (typed-list-new [:list [:ref :form/r]] commit-check tree-check)
+                                        (form/kids-of manifest-checks)))))))))
+
+(defn- resolve-deps [deps [:ref :form/r] i :i64 lock-path :string packages-dir :string acc [:list [:ref :form/r]]]
+  [:list [:ref :form/r]]
+  (if (>= i (form/count-of deps))
+    acc
+    (let [r (resolve-dep (form/nth-of deps i) lock-path packages-dir)]
+      (resolve-deps deps (+ i 1) lock-path packages-dir (form/append-form acc r)))))
+
+(defn- all-source-paths [resolved [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count resolved))
+    acc
+    (all-source-paths resolved (+ i 1)
+                      (form/append-many acc (form/kids-of (gk (typed-list-nth [:list [:ref :form/r]] resolved i) :source-paths))))))
+
+(defn resolve-lock
+  "LOCK-PATH and PACKAGES-DIR to `{:lock :packages :dependencies :source-paths}`.
+  Every dependency is refused rather than skipped."
+  [lock-path :string packages-dir :string trust [:ref :form/r]] [:ref :form/r]
+  (cond
+    (not (exists? lock-path)) (throw (ex-info "package lock not found" {:phase :package-lock :path lock-path}))
+    (not (directory? packages-dir)) (throw (ex-info "--packages must name an existing directory" {:phase :package-lock :path packages-dir}))
+    :else
+    (let [raw (support/read-edn-file! lock-path)
+          lock (normalize-numbers raw)
+          _ (validate-lock lock trust)
+          resolved (resolve-deps (gk lock :deps) 0 lock-path packages-dir (form/no-forms))]
+      (form/form-map
+       (typed-list-new [:list [:ref :form/r]]
+                       (kf :lock) (form/string-form lock-path)
+                       (kf :packages) (form/string-form packages-dir)
+                       (kf :dependencies) (form/form-vec resolved)
+                       (kf :source-paths) (form/form-vec (all-source-paths resolved 0 (form/no-forms))))))))
+;; ── the check that binds the tree to the lock ───────────────────────────────
+
+(defn- missing-for [dep [:ref :form/r] have [:ref :form/r]] [:list [:ref :form/r]]
+  (sorted-difference (gk dep :definition-cids) have))
+
+(defn- first-missing [dependencies [:ref :form/r] i :i64 have [:ref :form/r]] :i64
+  (cond (>= i (form/count-of dependencies)) -1
+        (> (vector-count (missing-for (form/nth-of dependencies i) have)) 0) i
+        :else (first-missing dependencies (+ i 1) have)))
+
+(defn- pinned-count [dependencies [:ref :form/r] i :i64 acc :i64] :i64
+  (if (>= i (form/count-of dependencies))
+    acc
+    (pinned-count dependencies (+ i 1) (+ acc (form/count-of (gk (form/nth-of dependencies i) :definition-cids))))))
+
+(defn verify-definitions
+  "Every definition CID the lock pins must be present in the CIDs the compiler
+  computed for the linked project (superset, not equality). DEPENDENCIES is the
+  `:dependencies` of `resolve-lock`; COMPUTED a Form list of CID strings."
+  [dependencies [:ref :form/r] computed [:ref :form/r]] [:ref :form/r]
+  (let [have (form/form-vec (sorted-items computed))
+        bad (first-missing dependencies 0 have)]
+    (if (>= bad 0)
+      (throw (ex-info "definitions the package lock pins are not in the built graph"
+                      {:phase :package-lock
+                       :dependency (gs (form/nth-of dependencies bad) :name)}))
+      (let [pinned (pinned-count dependencies 0 0)
+            computed-count (form/count-of have)]
+        (form/form-map (typed-list-new [:list [:ref :form/r]]
+                                       (kf :check) (kf :definition-cids) (kf :outcome) (kf :verified)
+                                       (kf :pinned) (form/int-form pinned)
+                                       (kf :computed) (form/int-form computed-count)))))))
+(defn- report-entry [d [:ref :form/r]] [:ref :form/r]
+  (form/form-map (typed-list-new [:list [:ref :form/r]]
+                                 (kf :name) (gk d :name) (kf :version) (gk d :version)
+                                 (kf :commit) (gk d :commit) (kf :signers) (gk d :signers)
+                                 (kf :capabilities) (gk d :capabilities)
+                                 (kf :definitions) (form/int-form (form/count-of (gk d :definition-cids)))
+                                 (kf :checks) (gk d :checks))))
+
+(defn- report-entries [ds [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (form/count-of ds))
+    acc
+    (report-entries ds (+ i 1) (form/append-form acc (report-entry (form/nth-of ds i))))))
+
+(defn report
+  "What was checked, per dependency, in the command's own answer."
+  [resolved [:ref :form/r] definition-check [:ref :form/r]] [:ref :form/r]
+  (let [deps (gk resolved :dependencies)
+        n (form/count-of deps)]
+    (form/form-map
+     (typed-list-new [:list [:ref :form/r]]
+                     (kf :kotoba.package-lock/version) (form/int-form 1)
+                     (kf :lock) (gk resolved :lock)
+                     (kf :packages) (gk resolved :packages)
+                     (kf :dependencies) (form/form-vec (report-entries deps 0 (form/no-forms)))
+                     (kf :definition-check) definition-check
+                     (kf :scanned) (form/string-form (str "SCANNED\t" (string-from-i64 n) " dependencies"))))))

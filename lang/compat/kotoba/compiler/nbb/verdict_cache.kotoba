@@ -1,0 +1,560 @@
+(ns kotoba.compiler.nbb.verdict-cache
+  "Persistent, content-addressed cache of STATIC VERDICTS about definitions
+  (adr-2609242100 P5, first half).
+
+  ## What it holds, and what it does not
+
+  A verdict is `{:admitted true}` or `{:refused {:message m :data d}}` -- the
+  answer a validator gave, never a value it computed and never a trust
+  decision. The one validator wired to it today is compile-time
+  `kotoba.verifier/verify-artifact!` in the nbb native driver (see
+  `kotoba.compiler.nbb.cli`), because that is the only static verdict on the
+  compile path that costs anything: measured 2026-09-24 on
+  examples/recursive-tree.kotoba and examples/approval-queue-app.kotoba,
+  native-verify was 1.0-3.0 s per compile, while front-end admission
+  (`effect-row/check`) was 0-20 ms and native admission
+  (`only-native-word-typed-features?`) 4-22 ms.
+
+  Execution-time checks are NOT static verdicts and never pass through here:
+  `amu run` / `amu verify` / `extract-native` verify signatures and artifact
+  integrity on every invocation.
+
+  ## The key
+
+  Every input the verdict depended on, each as a named field:
+
+    :kind          which validator (`:kotoba.verdict/native-verify`)
+    :definitions   `definition-identity/cache-material` -- the ordered
+                   definition CIDs and export names. A definition CID covers
+                   its dependency closure (callees are sealed as
+                   `[:kotoba.definition/ref <cid>]`, cycles as scc-v1 groups),
+                   so a changed callee changes every caller's CID.
+    :subject       the validator's own input, canonically hashed (for
+                   native-verify: the whole sealed artifact map, whose seal is
+                   one of its fields)
+    :toolchain     `toolchain-digest`: the classpath the process actually
+                   loaded -- gitlibs entries by their pinned sha path, every
+                   other entry (amu's own src/ and resources/) by the bytes
+                   of every file under it -- plus the Node version and
+                   `compatibility/compiler-version`
+    :target        the target profile keyword
+    :capabilities  canonical sha256 of the capability policy in force
+    :limits        sha256 of the `kotoba/lang/limits.edn` bytes on the
+                   classpath (kotoba-lang `lang/limits.edn`, vendored)
+
+  The toolchain digest is read from disk the first time a process needs it,
+  not when the code was loaded; a long-lived `amu worker` whose checkout is
+  edited between its start and its first native compile keys on the edited
+  bytes. Restart workers after editing the compiler.
+
+  A module without a complete definition identity is NOT cached
+  (`:unkeyed`), for the reason `definition-identity/cache-material` gives: a
+  partial identity is not an identity.
+
+  ## Storage and integrity
+
+  One file per key, `<dir>/<key>.edn`, holding the record
+  `{:format :kotoba.verdict-cache/v1 :key k :key-material m :verdict v
+  :digest d}`, where `d` is the canonical sha256 of `[format k m v]`. On read
+  the record's `:key` must equal the requested key, the key recomputed from
+  `:key-material` must equal it too, and the digest must match. Any failure
+  -- unreadable, malformed, key mismatch, digest mismatch -- deletes the
+  entry, prints one `kotoba.verdict-cache: rejected` line on stderr, and
+  recomputes. A rejected entry is never trusted.
+
+  The digest detects corruption and mismatch, not forgery: anyone who can
+  write the directory can write a self-consistent record. Forgery is kept out
+  the way `bin/amu` keeps its classpath cache: the directory must be owned by
+  this uid and not group/world writable, files are opened without following
+  symlinks and must be owned by this uid, and writes are 0600 temp + rename.
+  A directory that fails those checks disables the cache (`:disabled`).
+
+  ## Configuration
+
+    KOTOBA_VERDICT_CACHE=off           disable
+    KOTOBA_VERDICT_CACHE_DIR           default <os.tmpdir>/amu-verdict-cache-<uid>
+                                       (an empty value is unset)
+    KOTOBA_VERDICT_CACHE_ENTRIES       default 4096, at most 65536
+    KOTOBA_VERDICT_CACHE_BYTES         default 16 MiB, at most 1 GiB
+
+  parallel to the worker's `KOTOBA_WORKER_CACHE_*` bounds.
+
+  ## Host effects
+
+  Every one is an ability call (superproject adr-2609242330 S5): env/read,
+  hash/sha256, entropy/draw (the temporary name), io/write-error (the
+  warning) and fs/app-data / fs/browse for the store. The security rules
+  above are THIS module's decisions, spelled in wire-35 requests the handler
+  answers one host call each:
+
+    owner-only directory   NOFOLLOW (a directory, mode & 0o022 = 0) and
+                           OWNER (owner uid = this process's euid); a missing
+                           directory is created 0700 as MKTEMP in its parent,
+                           then RENAMEd to its name, so it never exists with a
+                           wider mode
+    symlink / foreign      NOFOLLOW (a symlink is unreadable; anything but a
+                           regular file, a foreign owner or a group/world
+                           writable mode is :foreign-entry), then RANGE of
+                           exactly that size, which does not follow a symlink
+    0600 temp + rename     WRITE (empty, O_NOFOLLOW), CHMOD 600, WRITE the
+                           record, RENAME -- no byte exists under another mode
+
+  OWNER is a proposed form of wire 35 (kotoba-lang capability catalog); no
+  native host answers it yet. Windows keeps its stated non-claims: no owner
+  or mode check and a followed final component, as before."
+  {:kotoba/export [key-for key-material limits-digest lookup-verdict open-store record-digest
+                              store-verdict! toolchain-digest]}
+  (:require [kotoba.artifact.core :as artifact]
+            
+            
+            
+            
+            
+            
+            ;; Abilities (superproject adr-2609242330 S5); `sys` holds the
+            ;; host facts no ability carries.
+            
+            
+            
+            
+            
+            
+            [kotoba.compiler.posix-path :as posix-path]
+                         [kotoba.compiler.decimal-text :as decimal-text]
+                         [kotoba.compiler.nbb.compile-cache :as digest]
+                         [kotoba.kir.compatibility :as compatibility]))
+
+;; Kotoba reading: THE SAME STORE, WITHOUT THE CLOSURE. The identity (key,
+;; record digest, key material, toolchain and limits digests) and the store
+;; protocol (owner-only directory, no-follow reads, 0600 temporary + rename,
+;; record/key/digest verification, a rejected entry deleted) are all here, in
+;; wire-35 requests. What a Kotoba module cannot carry is `resolve!`'s
+;; compute closure and its two pieces of process state, so the caller splits
+;; it: `lookup-verdict` (a trusted verdict or null), then compute, then
+;; `store-verdict!`. Left to the host reading, named: entry/byte eviction
+;; (`evict!`), the one-line `rejected` warning on stderr, and the toolchain
+;; digest of the process's own `--classpath` argv (a Kotoba module is handed
+;; the entries). A raise cannot be caught on the Kotoba route, so a
+;; malformed or foreign entry is a miss (and is deleted), never an abort.
+(defn key-for [material :document] :string
+     (artifact/sha256 material))
+
+(defn record-digest [key :string material :document verdict :document] :string
+     (artifact/sha256 (document-vector (document-keyword :kotoba.verdict-cache/v1)
+                                       (document-string key) material verdict)))
+
+
+;; ---------------------------------------------------------------------------
+;; Kotoba: key material, toolchain and limits identity, the store
+
+(defn- field [m :document k :keyword] :document
+     (option-value-of [:option :document] (document-get m k) (document-null)))
+
+(defn- slot [fields :document k :keyword] :document
+     (document-vector (document-keyword k) (field fields k)))
+
+(defn key-material
+     "The ordered vector the key is the hash of: every field present, named, in
+     a fixed order; an absent field is part of the material as null."
+     [kind :keyword fields :document] :document
+     (document-vector (document-keyword :kotoba.verdict-key/v1)
+                      (document-keyword kind)
+                      (document-vector (slot fields :definitions) (slot fields :subject)
+                                       (slot fields :toolchain) (slot fields :target)
+                                       (slot fields :capabilities) (slot fields :limits))))
+
+(defn- nul [] :string (string-from-utf8 (bytes-from-vector-i64 (vector-i64 0))))
+
+(defn- file-digest [file :string] :string
+     (digest/sha256-bytes (fs/app-data-bytes file)))
+
+(defn- numbers [answer :string] :vector-i64
+     (if (= 0 (string-byte-length answer))
+       (vector-i64)
+       (decimal-text/fields answer)))
+
+;; `.../.gitlibs/libs/<group>/<artifact>/<40-hex sha>/...` names the commit,
+;; which is the identity deps-lock.edn pins. Either separator, as the host's
+;; regex [/\\]\.gitlibs[/\\]libs[/\\].+[/\\][0-9a-f]{40}([/\\]|$).
+(defn- sep? [b :i64] :bool (or (= b 47) (= b 92)))
+
+(defn- bytes-match? [bs :bytes at :i64 needle :bytes] :bool
+     (if (> (+ at (bytes-count needle)) (bytes-count bs))
+       false
+       (loop [j 0]
+         (if (>= j (bytes-count needle))
+           true
+           (if (= (bytes-at bs (+ at j)) (bytes-at needle j)) (recur (+ j 1)) false)))))
+
+(defn- hex40-from? [bs :bytes at :i64] :bool
+     (if (> (+ at 40) (bytes-count bs))
+       false
+       (loop [j 0]
+         (if (>= j 40)
+           true
+           (let [c (bytes-at bs (+ at j))]
+             (if (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 102)))
+               (recur (+ j 1))
+               false))))))
+
+;; A separator at P, 40 hex after it, then a separator or the end.
+(defn- sha-segment-at? [bs :bytes p :i64] :bool
+     (if (sep? (bytes-at bs p))
+       (if (hex40-from? bs (+ p 1))
+         (if (= (+ p 41) (bytes-count bs))
+           true
+           (sep? (bytes-at bs (+ p 41))))
+         false)
+       false))
+
+(defn- sha-segment-from? [bs :bytes p :i64] :bool
+     (if (>= p (bytes-count bs))
+       false
+       (if (sha-segment-at? bs p) true (sha-segment-from? bs (+ p 1)))))
+
+;; Offset one past "<sep>.gitlibs<sep>libs<sep>", or -1.
+(defn- libs-prefix-end [bs :bytes at :i64] :i64
+     (if (>= at (bytes-count bs))
+       -1
+       (if (sep? (bytes-at bs at))
+         (if (bytes-match? bs (+ at 1) (string-to-utf8 ".gitlibs"))
+           (if (sep? (bytes-at bs (+ at 9)))
+             (if (bytes-match? bs (+ at 10) (string-to-utf8 "libs"))
+               (if (sep? (bytes-at bs (+ at 14)))
+                 (+ at 15)
+                 (libs-prefix-end bs (+ at 1)))
+               (libs-prefix-end bs (+ at 1)))
+             (libs-prefix-end bs (+ at 1)))
+           (libs-prefix-end bs (+ at 1)))
+         (libs-prefix-end bs (+ at 1)))))
+
+(defn- pinned-gitlib? [entry :string] :bool
+     (let [bs (string-to-utf8 entry)
+           after (libs-prefix-end bs 0)]
+       ;; `.+` takes at least one character before the sha segment.
+       (if (< after 0) false (sha-segment-from? bs (+ after 1)))))
+
+;; fs/browse answers NAME<TAB>D rows; a named wrapper types its result.
+(defn- listing-of [d :string] :string (fs/browse d))
+
+;; fs/browse rows are NAME<TAB>D joined by single newlines. The sha256 of
+;; every regular file under D, depth first, in the handler's bytewise name
+;; order, as "file\0<rel>\0<sha256>\0" text.
+(defn- tree-text [d :string rel :string listing :string start :i64] :string
+     (if (>= start (string-byte-length listing))
+       ""
+       (let [nl (string-find-byte listing 10 start)
+             end (if (< nl 0) (string-byte-length listing) nl)
+             row (string-substring listing start end)
+             tab (string-find-byte row 9 0)
+             name (if (< tab 0) row (string-substring row 0 tab))
+             p (string-concat d (string-concat "/" name))
+             r (if (= 0 (string-byte-length rel)) name (string-concat rel (string-concat "/" name)))
+             kind (numbers (fs/app-data (string-concat p "NOFOLLOW_SEP")))
+             here (if (< (vector-count kind) 4)
+                    (throw (ex-info "toolchain tree contains a non-regular file" {:path p}))
+                    (if (= 1 (vector-at kind 3))
+                      (tree-text p r (listing-of p) 0)
+                      (if (= 0 (vector-at kind 3))
+                        (string-concat "file" (string-concat (nul) (string-concat r (string-concat (nul) (string-concat (file-digest p) (nul))))))
+                        ;; A symlink inside a hashed tree is refused rather
+                        ;; than followed or skipped: either would let the
+                        ;; digest say less than what was loaded.
+                        (throw (ex-info "toolchain tree contains a non-regular file" {:path p})))))]
+         (string-concat here (tree-text d rel listing (+ end 1))))))
+
+(defn- resolve-path [p :string cwd :string] :string
+     (let [joined (posix-path/normalize
+                   (if (= 47 (string-code-point-at p 0)) p (posix-path/join cwd p)))]
+       (if (and (< 1 (string-byte-length joined)) (= 47 (string-code-point-at joined (- (string-byte-length joined) 1))))
+         (string-substring joined 0 (- (string-byte-length joined) 1))
+         joined)))
+
+(defn- entry-text [entry :string cwd :string] :string
+     (let [absolute (resolve-path entry cwd)
+           st (numbers (fs/app-data (string-concat absolute "STAT_SEP")))
+           head (string-concat "entry" (string-concat (nul) (string-concat absolute (nul))))]
+       (string-concat
+        head
+        (if (pinned-gitlib? absolute)
+          (string-concat "pinned" (nul))
+          (if (< (vector-count st) 4)
+            (string-concat "absent" (nul))
+            (if (= 0 (vector-at st 3))
+              (string-concat "sha256" (string-concat (nul) (string-concat (file-digest absolute) (nul))))
+              (tree-text absolute "" (listing-of absolute) 0)))))))
+
+(defn- entries-text [entries :document cwd :string i :i64] :string
+     (if (>= i (document-count entries))
+       ""
+       (string-concat
+        (entry-text (option-value-of [:option :string]
+                                     (document-string-value
+                                      (option-value-of [:option :document] (document-vector-at entries i) (document-null)))
+                                     "")
+                    cwd)
+        (entries-text entries cwd (+ i 1)))))
+
+(defn toolchain-digest
+     "The toolchain identity over ENTRIES (a vector of classpath entry strings;
+     relative ones against CWD): gitlibs entries by their pinned sha path,
+     every other entry by the bytes of every file under it, plus the compiler
+     version. The text and its hash are the host's, with the runtime named
+     \"kotoba\" as the host's non-Node reading does. A non-regular file in a
+     hashed tree aborts, as the host's `:unavailable` does."
+     [entries :document cwd :string] :string
+     (digest/sha256
+      (string-concat
+       (string-concat "kotoba.verdict-toolchain/v2" (string-concat (nul) (string-concat "kotoba" (nul))))
+       (string-concat (string-concat (document-edn-print (document-string (compatibility/compiler-version))) (nul))
+                      (entries-text entries cwd 0)))))
+
+(defn- limits-from [entries :document i :i64] [:option :string]
+     (if (>= i (document-count entries))
+       (option-none-of [:option :string])
+       (let [entry (option-value-of [:option :string]
+                                    (document-string-value
+                                     (option-value-of [:option :document] (document-vector-at entries i) (document-null)))
+                                    "")
+             file (posix-path/join entry "kotoba/lang/limits.edn")]
+         (if (= "1" (fs/app-data (string-concat file "EXISTS_SEP")))
+           (option-some-of [:option :string] (file-digest file))
+           (limits-from entries (+ i 1))))))
+
+(defn limits-digest
+     "sha256 of the first `kotoba/lang/limits.edn` found on ENTRIES; none when
+     there is none."
+     [entries :document] [:option :string]
+     (limits-from entries 0))
+
+;; -- the store ------------------------------------------------------------
+
+(defn- writable-by-others? [mode :i64] :bool
+     ;; mode & 0o022 <> 0: bit 1 (world write) or bit 4 (group write).
+     (or (= 1 (rem (quot mode 2) 2)) (= 1 (rem (quot mode 16) 2))))
+
+(defn- secure-dir? [dir :string] :bool
+     (let [st (numbers (fs/app-data (string-concat dir "NOFOLLOW_SEP")))
+           who (numbers (fs/app-data (string-concat dir "OWNER_SEP")))]
+       (if (< (vector-count st) 4)
+         false
+         (if (< (vector-count who) 2)
+           false
+           (if (= 1 (vector-at st 3))
+             (if (writable-by-others? (vector-at st 0))
+               false
+               (= (vector-at who 0) (vector-at who 1)))
+             false)))))
+
+(defn- absent? [p :string] :bool
+     (< (vector-count (numbers (fs/app-data (string-concat p "STAT_SEP")))) 4))
+
+;; DIR (and any missing parent) as a 0700 directory: MKTEMP in the parent --
+;; created 0700 by the host -- then RENAME to DIR, so DIR never exists with a
+;; wider mode. A DIR another run created meanwhile is used.
+(defn- make-private-directory! [dir :string] :i64
+     (let [parent (posix-path/dirname dir)
+           made (if (and (not= parent dir) (absent? parent)) (make-private-directory! parent) 0)
+           staged (fs/app-data (string-concat parent (string-concat "MKTEMP_SEP" ".amu-verdict-cache-")))]
+       (if (= 0 (string-byte-length staged))
+         (throw (ex-info "verdict cache directory could not be created" {:dir dir}))
+         (if (= "1" (fs/app-data (string-concat staged (string-concat "RENAME_SEP" dir))))
+           1
+           (do (fs/app-data (string-concat staged "RMDIR_SEP"))
+               (if (absent? dir)
+                 (throw (ex-info "verdict cache directory could not be created" {:dir dir}))
+                 1))))))
+
+(defn- tmpdir-from [names :document i :i64] :string
+     (if (>= i (document-count names))
+       "/tmp"
+       (let [v (env/read (option-value-of [:option :string]
+                                          (document-string-value
+                                           (option-value-of [:option :document] (document-vector-at names i) (document-null)))
+                                          ""))]
+         (if (> (string-byte-length v) 0) v (tmpdir-from names (+ i 1))))))
+
+(defn- default-dir [] :string
+     (let [t (tmpdir-from (document-edn-read "[\"TMPDIR\" \"TMP\" \"TEMP\"]") 0)
+           trimmed (if (and (< 1 (string-byte-length t)) (= 47 (string-code-point-at t (- (string-byte-length t) 1))))
+                     (string-substring t 0 (- (string-byte-length t) 1))
+                     t)
+           me (numbers (fs/app-data "/OWNER_SEP"))]
+       (posix-path/join trimmed
+                        (string-concat "amu-verdict-cache-"
+                                       (string-from-i64 (if (< (vector-count me) 2) 0 (vector-at me 1)))))))
+
+(defn open-store
+     "The verdict-cache directory to use, or \"\" when the cache is disabled
+     (KOTOBA_VERDICT_CACHE=off, or a directory that is not ours / is
+     group- or world-writable, as the host's `:insecure-directory`).
+     KOTOBA_VERDICT_CACHE_DIR names it, else DIR when given, else the host's
+     default <tmpdir>/amu-verdict-cache-<euid>; creating the default is part
+     of opening it."
+     [dir :string] :string
+     (if (= "off" (env/read "KOTOBA_VERDICT_CACHE"))
+       ""
+       (let [configured (env/read "KOTOBA_VERDICT_CACHE_DIR")
+             chosen (if (> (string-byte-length dir) 0)
+                      dir
+                      (if (> (string-byte-length configured) 0) configured (default-dir)))]
+         (if (absent? chosen)
+           (if (= 1 (make-private-directory! chosen))
+             (if (secure-dir? chosen) chosen "")
+             "")
+           (if (secure-dir? chosen) chosen "")))))
+
+(defn- entry-path [dir :string key :string] :string
+     (posix-path/join dir (string-concat key ".edn")))
+
+;; :absent, :unreadable (a symlink), :foreign (not a regular file of ours, or
+;; group/world writable), or :ok.
+(defn- entry-state [file :string] :keyword
+     (let [st (numbers (fs/app-data (string-concat file "NOFOLLOW_SEP")))]
+       (if (< (vector-count st) 4)
+         :absent
+         (if (= 2 (vector-at st 3))
+           :unreadable
+           (let [who (numbers (fs/app-data (string-concat file "OWNER_SEP")))]
+             (if (and (= 0 (vector-at st 3))
+                      (>= (vector-count who) 2)
+                      (= (vector-at who 0) (vector-at who 1))
+                      (not (writable-by-others? (vector-at st 0))))
+               :ok
+               :foreign))))))
+
+(defn- admitted-verdict? [verdict :document] :bool
+     (document-equal? verdict (document-edn-read "{:admitted true}")))
+
+(defn- refused-verdict? [verdict :document] :bool
+     (and (= :map (document-kind verdict))
+          (= 1 (document-count verdict))
+          (document-contains verdict (document-keyword :refused))
+          (= :map (document-kind (field verdict :refused)))
+          (document-contains (field verdict :refused) (document-keyword :message))
+          (= :string (document-kind (field (field verdict :refused) :message)))))
+
+;; The record, checked as the host does: closed keys, format, key == requested
+;; key == key recomputed from the material, digest, verdict shape.
+(defn- record-ok? [record :document key :string] :bool
+     (and (= :map (document-kind record))
+          (= 5 (document-count record))
+          (document-contains record (document-keyword :format))
+          (document-contains record (document-keyword :key))
+          (document-contains record (document-keyword :key-material))
+          (document-contains record (document-keyword :verdict))
+          (document-contains record (document-keyword :digest))
+          (document-equal? (field record :format) (document-keyword :kotoba.verdict-cache/v1))
+          (document-equal? (field record :key) (document-string key))
+          (document-equal? (document-string (key-for (field record :key-material))) (document-string key))
+          (document-equal? (field record :digest)
+                           (document-string (record-digest key (field record :key-material) (field record :verdict))))
+          (or (admitted-verdict? (field record :verdict))
+              (refused-verdict? (field record :verdict)))))
+
+(defn- pop-expected [v :vector-i64] :vector-i64
+     (let [n (vector-count v)]
+       (loop [i 0 out (vector-i64)]
+         (if (>= i (- n 1)) out (recur (+ i 1) (vector-conj out (vector-at v i)))))))
+
+;; The language's EDN reader traps on a malformed text, and a raise cannot be
+;; caught here, so a record is first checked to be one bracket-balanced form
+;; with terminated strings, no reader dispatch (`#`), no comment and no
+;; character literal outside a string (a record the host writes has none).
+;; `kotoba.lang.edn/read-document` is not used: it keeps every token in a
+;; document vector, which the language bounds at 32 items, and a record has
+;; far more tokens than that. An odd-length map or a duplicate key is the one
+;; malformed shape this does not see; only a writer with this uid could
+;; produce it, since the directory and the entry are owner-only.
+(defn- only-space-from? [bs :bytes i :i64] :bool
+     (if (>= i (bytes-count bs))
+       true
+       (let [c (bytes-at bs i)]
+         (if (or (= c 32) (= c 10) (= c 13) (= c 9))
+           (only-space-from? bs (+ i 1))
+           false))))
+
+(defn- balanced-from? [bs :bytes i :i64 stack :vector-i64 in-string :bool escaped :bool] :bool
+     (if (>= i (bytes-count bs))
+       (if in-string false (= 0 (vector-count stack)))
+       (let [c (bytes-at bs i)]
+         (if in-string
+           (if escaped
+             (balanced-from? bs (+ i 1) stack true false)
+             (if (= c 92)
+               (balanced-from? bs (+ i 1) stack true true)
+               (if (= c 34)
+                 (balanced-from? bs (+ i 1) stack false false)
+                 (balanced-from? bs (+ i 1) stack true false))))
+           (if (= c 34)
+             (balanced-from? bs (+ i 1) stack true false)
+             (if (or (= c 35) (= c 59) (= c 92))
+               false
+               (if (or (= c 40) (= c 91) (= c 123))
+                 (balanced-from? bs (+ i 1)
+                                 (vector-conj stack (if (= c 40) 41 (if (= c 91) 93 125))) false false)
+                 (if (or (= c 41) (= c 93) (= c 125))
+                   (if (= 0 (vector-count stack))
+                     false
+                     (if (= c (vector-at stack (- (vector-count stack) 1)))
+                       (if (= 1 (vector-count stack))
+                         (only-space-from? bs (+ i 1))
+                         (balanced-from? bs (+ i 1) (pop-expected stack) false false))
+                       false))
+                   (balanced-from? bs (+ i 1) stack false false)))))))))
+
+(defn- one-map-form? [text :string] :bool
+     (and (> (string-byte-length text) 1)
+          (= 123 (string-code-point-at text 0))
+          (balanced-from? (string-to-utf8 text) 0 (vector-i64) false false)))
+
+(defn- checked-verdict [text :string key :string] :document
+     (if (one-map-form? text)
+       (let [record (document-edn-read text)]
+         (if (record-ok? record key) (field record :verdict) (document-null)))
+       (document-null)))
+
+(defn lookup-verdict
+     "The trusted verdict stored under KEY in DIR (`{:admitted true}` or
+     `{:refused ...}`), or null: a miss. An entry that is a symlink, foreign,
+     malformed, or whose key/digest do not verify is deleted and is a miss."
+     [dir :string key :string] :document
+     (if (= 0 (string-byte-length dir))
+       (document-null)
+       (let [file (entry-path dir key)
+             state (entry-state file)]
+         (if (= state :absent)
+           (document-null)
+           (if (= state :ok)
+             (let [size (vector-at (numbers (fs/app-data (string-concat file "NOFOLLOW_SEP"))) 1)
+                   verdict (checked-verdict (fs/app-data (string-concat file (string-concat "RANGE_SEP0:" (string-from-i64 size)))) key)]
+               (if (= :null (document-kind verdict))
+                 (do (fs/app-data (string-concat file "UNLINK_SEP")) (document-null))
+                 verdict))
+             (do (fs/app-data (string-concat file "UNLINK_SEP")) (document-null)))))))
+
+(defn store-verdict!
+     "Write the record for KEY: an empty 0600 temporary (O_NOFOLLOW), CHMOD,
+     the record, RENAME -- no byte exists under another mode. Answers 1 when
+     stored, 0 when not (the cache is an optimization: a failed write loses
+     the entry, never the verdict). The temporary is always removed."
+     [dir :string key :string material :document verdict :document] :i64
+     (if (= 0 (string-byte-length dir))
+       0
+       (let [file (entry-path dir key)
+             empty (document-edn-read "{}")
+             record (assoc (assoc (assoc (assoc (assoc empty :format (document-keyword :kotoba.verdict-cache/v1))
+                                                :key (document-string key))
+                                         :key-material material)
+                                  :verdict verdict)
+                           :digest (document-string (record-digest key material verdict)))
+             content (string-concat (document-edn-print record) "\n")
+             temporary (string-concat file (string-concat "." (string-concat (entropy/draw "16") ".tmp")))
+             created (fs/app-data (string-concat temporary "WRITE_SEP"))
+             chmod (fs/app-data (string-concat temporary (string-concat "CHMOD_SEP" "600")))
+             written (if (= "1" chmod) (fs/app-data (string-concat temporary (string-concat "WRITE_SEP" content))) "")
+             moved (if (= "1" chmod) (fs/app-data (string-concat temporary (string-concat "RENAME_SEP" file))) "0")
+             removed (fs/app-data (string-concat temporary "UNLINK_SEP"))]
+         (if (= "1" moved) 1 0))))
+
+nil

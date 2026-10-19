@@ -1,0 +1,354 @@
+(ns kotoba.compiler.release
+  "Release attestation: an SPDX 2.3 SBOM that is a pure function of the
+  artifact bytes, and an Ed25519 statement over {artifact, sbom, target}.
+
+  Portable since 2026-09-11 (ADR 0347): the file walk that was
+  `java.nio.file` + `MessageDigest` has a `:cljs` branch on `node:fs` and
+  `node:crypto` with the same refusals (regular file, no symlink, byte
+  limit, SPDX-safe name). The statement, the signature and the verdicts are
+  host-independent. Integers read back on the Node host are bigint, so the
+  validity bounds and the recorded sizes are admitted through
+  `verifier/guest-integer?` and compared through a normalizing equality."
+  {:kotoba/export [attest file-identity sbom-bytes verify!]}
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.coll :as coll]
+            [kotoba.verifier :as verifier]
+            [kotoba.verifier.signing :as signing]
+            [kotoba.kir.target :as target]
+            [kotoba.form :as form]
+                         [kotoba.verifier.seal :as seal]
+                         [sha2.core :as sha2]
+            )
+  
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                                  [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]}))
+
+nil
+nil
+nil
+nil
+nil
+
+
+
+
+
+nil
+
+nil
+
+nil
+nil
+nil
+nil
+nil
+nil
+nil
+
+;; ---------------------------------------------------------------------------
+;; THE KOTOBA READING. Same checks, same order, over Forms; a file is read
+;; through the app-data scope, which answers a regular file inside the granted
+;; root and traps on anything else (no symlink, directory or missing file gets
+;; through), so `regular-path`'s refusals are that trap. A host `throw`
+;; (ex-info) is a TRAP (`assert`): an export cannot abort with a value a
+;; caller sees. The target profile is the `:document` of kotoba.kir.target,
+;; read into a Form for the statement; SHA-256 of a file is the pure
+;; org-nist-sha2. `now` and the validity bounds are i64.
+
+(defn- max-file-bytes [] :i64 1073741824)
+
+(defn- trap-form [] [:ref :form/r]
+     (let [refused (assert (= 1 0))] (form/nil-form)))
+
+(defn- trap-bytes [] :bytes
+     (let [refused (assert (= 1 0))] (bytes-empty)))
+
+(defn- fget [m [:ref :form/r] k :keyword] [:ref :form/r]
+     (form/form-get m (form/keyword-form k)))
+
+(defn- has? [m [:ref :form/r] k :keyword] :bool
+     (form/form-has? m (form/keyword-form k)))
+
+(defn- put [m [:ref :form/r] k :keyword v [:ref :form/r]] [:ref :form/r]
+     (form/assoc-form m (form/keyword-form k) v))
+
+(defn- empty-map [] [:ref :form/r] (form/form-map (form/no-forms)))
+
+(defn- member-from [xs [:list [:ref :form/r]] x [:ref :form/r] i :i64] :bool
+     (if (>= i (vector-count xs))
+       false
+       (if (form/eq (typed-list-nth [:list [:ref :form/r]] xs i) x)
+         true
+         (member-from xs x (+ i 1)))))
+
+(defn- member? [s [:ref :form/r] x [:ref :form/r]] :bool
+     (member-from (form/kids-of s) x 0))
+
+(defn- lower-hex? [c :i64] :bool
+     (if (>= c 48) (if (<= c 57) true (if (>= c 97) (<= c 102) false)) false))
+
+(defn- hex64-from [s :string i :i64] :bool
+     (if (>= i 64)
+       true
+       (if (lower-hex? (string-code-point-at s i)) (hex64-from s (+ i 1)) false)))
+
+(defn- sha256? [f [:ref :form/r]] :bool
+     (if (form/is-string? f)
+       (if (= 64 (string-byte-length (form/string-value f)))
+         (hex64-from (form/string-value f) 0)
+         false)
+       false))
+
+;; the bytes of a regular file under the byte limit
+(defn- file-bytes [path :string] :bytes
+     (if (= 0 (string-byte-length path))
+       (trap-bytes)
+       (let [data (fs/app-data-bytes path)]
+         (if (> (bytes-count data) (max-file-bytes)) (trap-bytes) data))))
+
+;; the text after the last "/" of a path
+(defn- base-from [path :string i :i64] :string
+     (if (< i 0)
+       path
+       (if (= 47 (string-code-point-at path i))
+         (string-substring path (+ i 1) (string-byte-length path))
+         (base-from path (- i 1)))))
+
+(defn- basename [path :string] :string
+     (base-from path (- (string-byte-length path) 1)))
+
+;; a code point of the name below 32 or in 127..159 is not SPDX-safe; the walk
+;; advances by the UTF-8 width of each code point
+(defn- name-safe-from? [name :string i :i64 n :i64] :bool
+     (if (>= i n)
+       true
+       (let [c (string-code-point-at name i)]
+         (if (< c 32)
+           false
+           (if (>= c 127)
+             (if (<= c 159)
+               false
+               (name-safe-from? name (+ i (if (< c 2048) 2 (if (< c 65536) 3 4))) n))
+             (name-safe-from? name (+ i 1) n))))))
+
+(defn- spdx-safe? [name :string] :bool
+     (if (> (string-length name) 255)
+       false
+       (name-safe-from? name 0 (string-byte-length name))))
+
+(defn- sha256-hex [data :bytes] :string
+     (kbytes/hex (sha2/sha256 (vector-i64-from-bytes data))))
+
+;; {:name :sha256 :size} of a regular file; a name that is not SPDX-safe traps
+(defn file-identity [path :string] [:ref :form/r]
+     (let [data (file-bytes path)
+           name (basename path)]
+       (if (spdx-safe? name)
+         (put (put (put (empty-map) :name (form/string-form name))
+                   :sha256 (form/string-form (sha256-hex data)))
+              :size (form/int-form (bytes-count data)))
+         (trap-form))))
+
+(defn- sbom-text-of [name :string sha256 :string size :i64] :string
+     (let [file-id (string-concat "SPDXRef-File-" (string-substring sha256 0 16))]
+       (string-concat
+        "SPDXVersion: SPDX-2.3\nDataLicense: CC0-1.0\nSPDXID: SPDXRef-DOCUMENT\nDocumentName: kotoba-release-"
+        (string-concat (string-substring sha256 0 16)
+        (string-concat "\nDocumentNamespace: https://kotoba-lang.org/spdx/"
+        (string-concat sha256
+        (string-concat "\nCreator: Tool: kotoba-compiler\nCreated: 1970-01-01T00:00:00Z\n\nFileName: ./"
+        (string-concat name
+        (string-concat "\nSPDXID: "
+        (string-concat file-id
+        (string-concat "\nFileChecksum: SHA256: "
+        (string-concat sha256
+        (string-concat "\nFileSize: "
+        (string-concat (string-from-i64 size)
+        (string-concat "\nLicenseConcluded: NOASSERTION\nCopyrightText: NOASSERTION\n\nRelationship: SPDXRef-DOCUMENT DESCRIBES "
+        (string-concat file-id "\n"))))))))))))))))
+
+(defn- sbom-text [artifact-path :string] :string
+     (let [identity (file-identity artifact-path)]
+       (sbom-text-of (form/string-value (fget identity :name))
+                     (form/string-value (fget identity :sha256))
+                     (form/int-value (fget identity :size)))))
+
+(defn sbom-bytes [artifact-path :string] :bytes
+     (string-to-utf8 (sbom-text artifact-path)))
+
+;; constant-time equality of two byte strings: every byte is read
+(defn- bytes-diff-from [a :bytes b :bytes i :i64 diff :i64] :i64
+     (if (>= i (bytes-count a))
+       diff
+       (bytes-diff-from a b (+ i 1) (bit-or diff (bit-xor (bytes-at a i) (bytes-at b i))))))
+
+(defn- bytes-equal? [a :bytes b :bytes] :bool
+     (if (= (bytes-count a) (bytes-count b))
+       (= 0 (bytes-diff-from a b 0 0))
+       false))
+
+(defn- canonical-sbom? [artifact-path :string sbom-path :string] :bool
+     (let [actual (file-bytes sbom-path)]
+       (if (> (bytes-count actual) 1048576)
+         false
+         (bytes-equal? (sbom-bytes artifact-path) actual))))
+
+(defn- profile-of [target-name :keyword] :document
+     (target/profile target-name))
+
+(defn- known-target? [target-name :keyword] :bool
+     (= :map (document-kind (profile-of target-name))))
+
+(defn attest [artifact-path :string sbom-path :string target-name :keyword
+                 signing-key [:ref :form/r] not-before :i64 expires :i64]
+     [:ref :form/r]
+     (if (known-target? target-name)
+       (if (< not-before expires)
+         (if (signing/valid-key? signing-key)
+           (if (canonical-sbom? artifact-path sbom-path)
+             (let [statement (put (put (put (put (put (put (put (put (put (put (empty-map)
+                               :format (form/keyword-form :kotoba.release-statement/v1))
+                               :subject (file-identity artifact-path))
+                               :sbom (file-identity sbom-path))
+                               :target (form/keyword-form target-name))
+                               :target-profile (form/from-document (profile-of target-name)))
+                               :builder (form/keyword-form :kotoba-compiler/v1))
+                               :signer (fget signing-key :signer))
+                               :public-key (fget signing-key :public-key))
+                               :not-before (form/int-form not-before))
+                               :expires (form/int-form expires))]
+               (put (put (put (empty-map) :format (form/keyword-form :kotoba.release-attestation/v1))
+                         :statement statement)
+                    :signature (form/string-form (signing/sign-value signing-key statement))))
+             (trap-form))
+           (trap-form))
+         (trap-form))
+       (trap-form)))
+
+;; {:name :sha256 :size} with a valid digest and a size in 0..max
+(defn- identity-shape? [f [:ref :form/r]] :bool
+     (if (form/is-map? f)
+       (if (= 6 (form/count-of f))
+         (if (has? f :name)
+           (if (has? f :sha256)
+             (if (has? f :size)
+               (if (sha256? (fget f :sha256))
+                 (if (verifier/guest-integer? (fget f :size))
+                   (if (>= (form/int-value (fget f :size)) 0)
+                     (<= (form/int-value (fget f :size)) (max-file-bytes))
+                     false)
+                   false)
+                 false)
+               false)
+             false)
+           false)
+         false)
+       false))
+
+(defn- statement-shape? [st [:ref :form/r]] :bool
+     (if (form/is-map? st)
+       (if (= 20 (form/count-of st))
+         (if (has? st :format)
+           (if (has? st :subject)
+             (if (has? st :sbom)
+               (if (has? st :target)
+                 (if (has? st :target-profile)
+                   (if (has? st :builder)
+                     (if (has? st :signer)
+                       (if (has? st :public-key)
+                         (if (has? st :not-before) (has? st :expires) false)
+                         false)
+                       false)
+                     false)
+                   false)
+                 false)
+               false)
+             false)
+           false)
+         false)
+       false))
+
+(defn- target-matches? [st [:ref :form/r]] :bool
+     (if (form/is-keyword? (fget st :target))
+       (if (known-target? (form/keyword-value (fget st :target)))
+         (form/eq (fget st :target-profile)
+                  (form/from-document (profile-of (form/keyword-value (fget st :target)))))
+         false)
+       false))
+
+(defn- interval? [st [:ref :form/r]] :bool
+     (if (verifier/guest-integer? (fget st :not-before))
+       (if (verifier/guest-integer? (fget st :expires))
+         (< (form/int-value (fget st :not-before)) (form/int-value (fget st :expires)))
+         false)
+       false))
+
+(defn- schema-ok? [envelope [:ref :form/r]] :bool
+     (if (form/is-map? envelope)
+       (if (= 6 (form/count-of envelope))
+         (if (has? envelope :format)
+           (if (has? envelope :statement)
+             (if (has? envelope :signature)
+               (let [st (fget envelope :statement)]
+                 (if (form/eq (fget envelope :format) (form/keyword-form :kotoba.release-attestation/v1))
+                   (if (statement-shape? st)
+                     (if (form/eq (fget st :format) (form/keyword-form :kotoba.release-statement/v1))
+                       (if (form/eq (fget st :builder) (form/keyword-form :kotoba-compiler/v1))
+                         (if (target-matches? st)
+                           (if (identity-shape? (fget st :subject))
+                             (if (identity-shape? (fget st :sbom))
+                               (if (form/is-string? (fget st :public-key))
+                                 (if (form/eq (fget st :signer)
+                                              (form/string-form (signing/signer-id (form/string-value (fget st :public-key)))))
+                                   (if (interval? st)
+                                     (form/is-string? (fget envelope :signature))
+                                     false)
+                                   false)
+                                 false)
+                               false)
+                             false)
+                           false)
+                         false)
+                       false)
+                     false)
+                   false))
+               false)
+             false)
+           false)
+         false)
+       false))
+
+(defn- standing-ok? [trust [:ref :form/r] st [:ref :form/r] now :i64] :bool
+     (let [signer (fget st :signer)]
+       (if (member? (fget trust :trusted-signers) signer)
+         (if (member? (fget trust :revoked-signers) signer)
+           false
+           (if (member? (fget trust :revoked-artifacts) (fget (fget st :subject) :sha256))
+             false
+             (if (< now (form/int-value (fget st :not-before)))
+               false
+               (< now (form/int-value (fget st :expires))))))
+         false)))
+
+(defn verify! [envelope [:ref :form/r] artifact-path :string sbom-path :string
+                  trust [:ref :form/r] now :i64]
+     [:ref :form/r]
+     (let [checked (signing/validate-trust! trust)]
+       (if (schema-ok? envelope)
+         (let [st (fget envelope :statement)]
+           (if (signing/verify-value (form/string-value (fget st :public-key)) st
+                                     (form/string-value (fget envelope :signature)))
+             (if (standing-ok? trust st now)
+               (if (form/eq (fget st :subject) (file-identity artifact-path))
+                 (if (form/eq (fget st :sbom) (file-identity sbom-path))
+                   (if (canonical-sbom? artifact-path sbom-path)
+                     (put (put (put (put (put (empty-map) :verified? (form/bool-form true))
+                                         :target (fget st :target))
+                                    :subject (fget st :subject))
+                               :sbom (fget st :sbom))
+                          :signer (fget st :signer))
+                     (trap-form))
+                   (trap-form))
+                 (trap-form))
+               (trap-form))
+             (trap-form)))
+         (trap-form))))

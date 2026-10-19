@@ -1,0 +1,143 @@
+(ns kotoba.compiler.refactor-cli
+  "`amu refactor` -- AST-based refactoring, the default way to change the compiler's own sources.
+
+    amu refactor list-rules
+    amu refactor plan <rules> <path>...  [--no-diff] [--patch-out FILE] [rule options]
+    amu refactor apply <rules> <path>... [--check] [--out FILE] [rule options]
+    amu refactor graph <path> [--summary] [--out FILE]
+    amu refactor partition <path> [--modules N] [--driver FORM] [--names FILE] [--out FILE]
+    amu refactor split <path> --partition FILE --out DIR [--ns NAME]
+    amu refactor verify --runner FILE --classpath CP [--classpath-file FILE]
+                        [--base-first DIR] [--candidate-first DIR] [--nbb PATH] [--stack-size N]
+    amu refactor to-kotoba <path>... [--out FILE] [--check] [--data-name NAME] [--ns NAME]
+
+  <rules> is `a,b,d,e,f`, a rule name, or `all` (= a,b,d,e,f). A <path> is a source file or a directory searched for
+  .cljk / .cljc / .clj / .cljs files; `to-kotoba` also takes `.edn` data files (exactly one top-level value). Rule
+  options: --target dual|host-env (rule c), --include-ported, --lower-accessor,
+  --regions shared,default,kotoba, --observable-from DIR[,DIR], --max-passes N.
+
+  Every answer is one EDN map with `:format :kotoba.refactor/v1`, printed to stdout. `plan` and `--check` never write.
+  `apply` writes through a temporary file and a rename, only after the rewritten text has been re-parsed. A refusal is
+  the usual `:kotoba.cli-error/v1` report on stderr whose `:diagnostic :code` is one of:
+
+    :refactor/usage                  bad flags or arguments               (exit 64)
+    :refactor/unknown-rule           a rule id/name the library lacks     (64)
+    :refactor/target-required        rule c without --target              (64)
+    :refactor/unreadable             a file could not be read             (65)
+    :refactor/parse-error            a source is not readable Clojure     (65)
+    :refactor/no-paths               the paths hold no source file        (65)
+    :refactor/output-unparsable      a rewrite produced unreadable text   (65)  nothing was written
+    :refactor/no-driver              partition found no pass driver       (65)
+    :refactor/partition-incomplete   the partition omits defining forms   (65)
+    :refactor/roundtrip-failed       a split lost or duplicated a form    (65)  nothing was written
+    :refactor/write-failed           a file could not be written          (74)
+
+  Exit 1 (not a refusal) means the answer is `:ok false`: `apply --check` or `to-kotoba --check` found pending
+  changes, or `verify` found differing per-test outcomes. `to-kotoba` is the mechanical .cljk/.edn -> .kotoba
+  conversion: reader conditionals resolve to their :kotoba arm (else :default, else nothing) and every other byte is
+  copied verbatim; an .edn file becomes a data module (`--data-name`, default `data`).
+
+  One implementation, no JVM and no Python: the command is a function from arguments and an I/O record to a value
+  (`run`), the Node entrypoint is `kotoba.compiler.nbb.refactor-cli`. The host route's alone, as `amu test` is."
+  {:kotoba/export [run]}
+  (:require [kotoba.compiler.refactor.rules :as rules]))
+
+;; ---- the :kotoba reading of `run` (selfhost S6.1) -------------------------------------------------------------------
+;;
+;; The guest route answers; it never throws (an unhandled abort at the export boundary is refused
+;; "unhandled abort at export boundary; catch it with try: run", measured), so every refusal is a
+;; :kotoba.cli-error/v1 report string like the host entry prints. `list-rules` is real over the rules
+;; twin; the I/O subcommands name their own absence instead of pretending (S6.1: the I/O record is the
+;; remaining host surface).
+
+(defn- g-edn-str [s :string] :string
+     ;; S as an EDN string literal: a byte walk (string-substring counts UTF-8 bytes; a mid-character
+     ;; continuation byte is never 34 or 92, so slicing here is byte-preserving), escaping " and \.
+     (let [n (string-byte-length s)]
+       (loop [i 0 acc "\""]
+         (if (>= i n)
+           (string-concat acc "\"")
+           (let [c (string-code-point-at s i)]
+             (recur (+ i 1)
+                    (cond
+                      (= c 34) (string-concat acc "\\\"")
+                      (= c 92) (string-concat acc "\\\\")
+                      :else (string-concat acc (string-substring s i (+ i 1))))))))))
+
+(defn- g-kw [s :string] :string (string-concat ":" s))
+
+(defn- g-rule [r [:ref :rules/entry]] :string
+     (let [s1 (string-concat "{:id " (g-kw (rules/entry-id r)))
+           s2 (string-concat s1 (string-concat " :name " (g-kw (rules/entry-name r))))
+           s3 (string-concat s2 (string-concat " :summary " (g-edn-str (rules/entry-summary r))))
+           base (string-concat s3 (string-concat " :host-effect " (g-edn-str (rules/entry-host-effect r))))]
+       (string-concat base (if (rules/entry-needs-target? r) " :needs-target true}" "}"))))
+
+(defn- g-joined [xs [:list :string] sep :string] :string
+     (let [n (vector-count xs)]
+       (loop [i 0 acc ""]
+         (if (>= i n)
+           acc
+           (recur (+ i 1)
+                  (if (= i 0)
+                    (typed-list-nth [:list :string] xs i)
+                    (string-concat acc (string-concat sep (typed-list-nth [:list :string] xs i)))))))))
+
+(defn- g-list-rules [] :string
+     ;; one library build for the whole answer: rebuilding it per entry deepened the
+     ;; interpreter recursion past the host stack (measured :host/stack-exhausted)
+     (let [lib (rules/library)
+           n (rules/entries-count lib)]
+       (loop [i 0 acc "["]
+         (if (>= i n)
+           (string-concat acc "]")
+           (recur (+ i 1)
+                  (string-concat acc (if (= i 0)
+                                       (g-rule (rules/entries-nth lib i))
+                                       (string-concat " " (g-rule (rules/entries-nth lib i))))))))))
+
+(defn- g-standard-order [] :string
+     (string-concat "[" (string-concat (g-joined (rules/standard-order) ":") "]"))) ;; placeholder, fixed below
+(defn- g-kw-list [xs [:list :string]] :string
+     (let [n (vector-count xs)]
+       (loop [i 0 acc "["]
+         (if (>= i n)
+           (string-concat acc "]")
+           (recur (+ i 1)
+                  (string-concat acc (if (= i 0)
+                                       (g-kw (typed-list-nth [:list :string] xs i))
+                                       (string-concat " " (g-kw (typed-list-nth [:list :string] xs i))))))))))
+
+(defn- g-list-rules-answer [] :string
+     ;; sequential bindings, not nested concats: the KIR interpreter recurses per
+     ;; nested expression and the chain exhausted the host stack at its default size
+     ;; (measured :host/stack-exhausted; fine at --stack-size=2048)
+     (let [a1 (string-concat "{:format :kotoba.refactor/v1 :command :list-rules :ok true :standard-order "
+                             (g-kw-list (rules/standard-order)))
+           a2 (string-concat a1 " :rules ")
+           a3 (string-concat a2 (g-list-rules))]
+       (string-concat a3 " :commands [:list-rules :plan :apply :graph :partition :split :verify :to-kotoba]}")))
+
+(defn- g-refusal [code :string message :string] :string
+     (let [r1 (string-concat "{:format :kotoba.cli-error/v1 :ok false :error :usage :diagnostic {:format :kotoba.diagnostic/v1 :code "
+                             (g-kw code))
+           r2 (string-concat r1 " :severity :error :message ")]
+       (string-concat r2 (string-concat (g-edn-str message) "}}"))))
+
+(defn- g-on-route [sub :string] :bool
+     (or (string=? sub "plan") (string=? sub "apply") (string=? sub "graph") (string=? sub "partition")
+         (string=? sub "split") (string=? sub "verify") (string=? sub "to-kotoba")))
+
+(defn run [args [:list :string]] :string
+     (let [sub (if (> (vector-count args) 0) (typed-list-nth [:list :string] args 0) "")]
+       (cond
+         (string=? sub "list-rules") (g-list-rules-answer)
+         (= (string-byte-length sub) 0)
+         (g-refusal "refactor/usage" "usage: amu refactor <list-rules|plan|apply|graph|partition|split|verify|to-kotoba> ...")
+         (g-on-route sub)
+         (g-refusal "refactor/not-on-kotoba-route"
+                    (string-concat "refactor " (string-concat sub " is not on the Kotoba route yet (selfhost S6.1); use the nbb bootstrap route")))
+         :else
+         (g-refusal "refactor/usage" (string-concat "unknown refactor command " (string-concat sub "; one of list-rules plan apply graph partition split verify to-kotoba"))))))
+
+nil

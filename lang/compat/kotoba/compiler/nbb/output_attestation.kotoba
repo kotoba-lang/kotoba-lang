@@ -1,0 +1,398 @@
+(ns kotoba.compiler.nbb.output-attestation
+  "Ed25519 publisher authentication for one admitted output set.
+
+  The signature binds the committed marker, sealed provenance, primary
+  artifact identity, and target.  It intentionally does not replace the
+  independent output admission that callers must run first."
+  {:kotoba/export [format parse-epoch! sign signer-id statement-format verify!]}
+  (:require [kotoba.artifact.core :as artifact]
+            [kotoba.kir.cljs-i64 :as i64]
+            [kotoba.compiler.host-integer :as host-integer]
+            [kotoba.compiler.decimal-text :as decimal-text]
+                         [kotoba.bytes :as kbytes]
+                         [ed25519.sign :as ed]
+            ))
+
+;; Kotoba: an exported constant is a function returning it.
+(defn format [] :keyword :kotoba.output-attestation/v1)
+(defn statement-format [] :keyword :kotoba.output-attestation-statement/v1)
+
+;; Kotoba: the signature time a caller types on the command line. Reading is
+;; `decimal-text` (an optional `-` and 1..18 digits -- a 19-digit time, more
+;; than year 31 billion, is refused here where the host accepts it up to the
+;; i64 maximum), and the range check is the host's: a non-negative i64. A
+;; Kotoba raise takes a keyword-keyed literal, so the two refusals are spelled
+;; out; their phase, reason and message are the host's.
+(defn parse-epoch! [value :string] :i64
+     (if (decimal-text/decimal? value)
+       (let [epoch (decimal-text/parse value)]
+         (if (>= epoch 0)
+           epoch
+           (throw (ex-info "output-set signature time must be a non-negative i64"
+                           {:phase :usage :reason :invalid-time}))))
+       (throw (ex-info "output-set signature time must be a non-negative i64"
+                       {:phase :usage :reason :invalid-time}))))
+
+;; Kotoba: the Ed25519 half. Signing and verifying are the pure RFC 8032
+;; implementation (`ed25519.sign`, the same one kotoba.verifier.signing's
+;; Kotoba twin uses) over the canonical bytes `artifact/canonical-bytes`
+;; gives (byte-identical to the hosts'); the key envelopes are the same DER
+;; (X.509 SubjectPublicKeyInfo and PKCS#8, base64'd), built and parsed by
+;; hand as 12 or 16 fixed prefix bytes over the 32 raw bytes. Ed25519 is
+;; deterministic, so `sign` produces the host's signature byte for byte.
+;; Values are documents. A raise is an abort here: the refusal's :phase and
+;; :reason are the host's, spelled as keyword values of the ex-info data.
+(defn- reject! [phase :keyword reason :keyword message :string] :document
+     (throw (ex-info message {:phase phase :reason reason})))
+
+(defn- field [m :document k :keyword] :document
+     (option-value-of [:option :document] (document-get m k) (document-null)))
+
+(defn- has? [m :document k :keyword] :bool
+     (document-contains m (document-keyword k)))
+
+(defn- keyword-is? [d :document k :keyword] :bool
+     (document-equal? d (document-keyword k)))
+
+(defn- text-of [d :document] :string
+     (option-value-of [:option :string] (document-string-value d) ""))
+
+(defn- hex-byte? [b :i64] :bool
+     (or (and (>= b 48) (<= b 57)) (and (>= b 97) (<= b 102))))
+
+(defn- hex64-from? [bs :bytes i :i64] :bool
+     (if (>= i 64)
+       true
+       (if (hex-byte? (bytes-at bs i)) (hex64-from? bs (+ i 1)) false)))
+
+;; (digest? d): a string of exactly 64 lowercase hex characters.
+(defn- digest? [d :document] :bool
+     (if (= :string (document-kind d))
+       (let [bs (string-to-utf8 (text-of d))]
+         (if (= 64 (bytes-count bs)) (hex64-from? bs 0) false))
+       false))
+
+(defn- string? [d :document] :bool (= :string (document-kind d)))
+
+;; ---- bytes and the DER envelopes ------------------------------------------
+
+(defn- unhex-bytes [s :string] :vector-i64
+     (option-value-of [:option :vector-i64] (kbytes/unhex s) (vector-i64)))
+
+(defn- spki-prefix [] :vector-i64 (unhex-bytes "302a300506032b6570032100"))
+(defn- pkcs8-prefix [] :vector-i64 (unhex-bytes "302e020100300506032b657004220420"))
+
+(defn- slice-from [v :vector-i64 from :i64 to :i64 out :vector-i64] :vector-i64
+     (if (>= from to)
+       out
+       (slice-from v (+ from 1) to (vector-conj out (vector-at v from)))))
+
+(defn- prefix-from? [v :vector-i64 p :vector-i64 i :i64] :bool
+     (if (>= i (vector-count p))
+       true
+       (if (= (vector-at v i) (vector-at p i)) (prefix-from? v p (+ i 1)) false)))
+
+;; [A-Za-z0-9+/]+ then at most two '=', from I.
+(defn- alphabet-byte? [b :i64] :bool
+     (or (and (>= b 65) (<= b 90)) (and (>= b 97) (<= b 122)) (and (>= b 48) (<= b 57)) (= b 43) (= b 47)))
+
+(defn- base64-body-end [bs :bytes i :i64] :i64
+     (if (>= i (bytes-count bs))
+       i
+       (if (alphabet-byte? (bytes-at bs i)) (base64-body-end bs (+ i 1)) i)))
+
+(defn- base64-shape? [text :string] :bool
+     (let [bs (string-to-utf8 text)
+           n (bytes-count bs)
+           body (base64-body-end bs 0)
+           pad (- n body)]
+       (and (> n 0)
+            (= 0 (rem n 4))
+            (> body 0)
+            (<= pad 2)
+            (loop [i body]
+              (if (>= i n) true (if (= 61 (bytes-at bs i)) (recur (+ i 1)) false))))))
+
+;; The decoded bytes of a CANONICAL base64 text (re-encoding it gives the text
+;; back), or none: the host's strict-base64.
+(defn- strict-base64 [text :string] [:option :vector-i64]
+     (if (base64-shape? text)
+       (match-option (kbytes/base64-decode text) [:option :vector-i64]
+         (none (option-none-of [:option :vector-i64]))
+         (some v (if (= text (kbytes/base64-encode v))
+                   (option-some-of [:option :vector-i64] v)
+                   (option-none-of [:option :vector-i64]))))
+       (option-none-of [:option :vector-i64])))
+
+;; the 32 raw bytes under a fixed DER PREFIX, or none
+(defn- der-raw [encoded :string prefix :vector-i64] [:option :vector-i64]
+     (match-option (strict-base64 encoded) [:option :vector-i64]
+       (none (option-none-of [:option :vector-i64]))
+       (some v (if (= (vector-count v) (+ (vector-count prefix) 32))
+                 (if (prefix-from? v prefix 0)
+                   (option-some-of [:option :vector-i64] (slice-from v (vector-count prefix) (vector-count v) (vector-i64)))
+                   (option-none-of [:option :vector-i64]))
+                 (option-none-of [:option :vector-i64])))))
+
+(defn- doc-bytes-from [d :document i :i64 out :vector-i64] :vector-i64
+     (if (>= i (document-count d))
+       out
+       (doc-bytes-from d (+ i 1)
+                       (vector-conj out (option-value-of [:option :i64]
+                                                         (document-i64-value
+                                                          (option-value-of [:option :document] (document-vector-at d i) (document-null)))
+                                                         0)))))
+
+(defn- public-of-seed [seed :vector-i64] :vector-i64
+     (doc-bytes-from (field (ed/secret-key seed) :public) 0 (vector-i64)))
+
+
+;; ---- signer identity and keys ---------------------------------------------
+
+(defn signer-id [encoded-public-key :string] :string
+     (artifact/sha256 (assoc (assoc (document-map) :algorithm (document-keyword :ed25519))
+                             :public-key (document-string encoded-public-key))))
+
+(defn- decode-public [encoded :string] [:option :vector-i64]
+     (der-raw encoded (spki-prefix)))
+
+(defn- decode-private [encoded :string] [:option :vector-i64]
+     (der-raw encoded (pkcs8-prefix)))
+
+(defn- keypair-matches? [encoded-public :string encoded-private :string] :bool
+     (match-option (decode-public encoded-public) [:option :vector-i64]
+       (none false)
+       (some pub (match-option (decode-private encoded-private) [:option :vector-i64]
+                   (none false)
+                   (some seed (kbytes/constant-time-eq pub (public-of-seed seed)))))))
+
+(defn- signing-key-ok? [key :document] :bool
+     (and (= :map (document-kind key))
+          (= 5 (document-count key))
+          (has? key :format) (has? key :algorithm) (has? key :signer)
+          (has? key :public-key) (has? key :private-key)
+          (keyword-is? (field key :format) :kotoba.signing-key/v1)
+          (keyword-is? (field key :algorithm) :ed25519)
+          (string? (field key :public-key))
+          (string? (field key :private-key))
+          (document-equal? (field key :signer)
+                           (document-string (signer-id (text-of (field key :public-key)))))
+          (keypair-matches? (text-of (field key :public-key)) (text-of (field key :private-key)))))
+
+(defn- signing-key! [key :document] :document
+     (if (signing-key-ok? key)
+       key
+       (reject! :signature :invalid-key "output-set signing key is invalid")))
+
+;; ---- trust ----------------------------------------------------------------
+
+;; A set's members as a vector, through its EDN text: `#{a b}` -> `[a b]`.
+(defn- set-members [s :document] :document
+     (let [t (document-edn-print s)]
+       (document-edn-read (string-concat "[" (string-concat (string-substring t 2 (- (string-byte-length t) 1)) "]")))))
+
+(defn- all-digests-from? [items :document i :i64] :bool
+     (if (>= i (document-count items))
+       true
+       (if (digest? (option-value-of [:option :document] (document-vector-at items i) (document-null)))
+         (all-digests-from? items (+ i 1))
+         false)))
+
+(defn- digest-set? [s :document] :bool
+     (and (= :set (document-kind s))
+          (all-digests-from? (set-members s) 0)))
+
+(defn- optional-digest-set? [trust :document k :keyword] :bool
+     (if (has? trust k) (digest-set? (field trust k)) true))
+
+;; Allowed keys: the four required plus the two optional (6 at most), and
+;; every required one present.
+(defn- trust-keys-ok? [trust :document i :i64] :bool
+     (if (>= i (document-count trust))
+       true
+       (let [k (option-value-of [:option :document]
+                                (document-vector-at
+                                 (option-value-of [:option :document] (document-map-entry-at trust i) (document-null))
+                                 0)
+                                (document-null))]
+         (if (or (keyword-is? k :format) (keyword-is? k :trusted-signers) (keyword-is? k :revoked-signers)
+                 (keyword-is? k :revoked-artifacts) (keyword-is? k :trusted-runtime-sha256)
+                 (keyword-is? k :revoked-runtime-sha256))
+           (trust-keys-ok? trust (+ i 1))
+           false))))
+
+(defn- trust-ok? [trust :document] :bool
+     (and (= :map (document-kind trust))
+          (keyword-is? (field trust :format) :kotoba.trust/v1)
+          (trust-keys-ok? trust 0)
+          (has? trust :trusted-signers) (has? trust :revoked-signers) (has? trust :revoked-artifacts)
+          (digest-set? (field trust :trusted-signers))
+          (digest-set? (field trust :revoked-signers))
+          (digest-set? (field trust :revoked-artifacts))
+          (optional-digest-set? trust :trusted-runtime-sha256)
+          (optional-digest-set? trust :revoked-runtime-sha256)))
+
+(defn- trust! [trust :document] :document
+     (if (trust-ok? trust)
+       trust
+       (reject! :trust :malformed-trust "output-set trust policy is malformed")))
+
+;; ---- epochs and identities ------------------------------------------------
+
+(defn- reject-i64! [phase :keyword reason :keyword message :string] :i64
+     (throw (ex-info message {:phase phase :reason reason})))
+
+(defn- epoch! [d :document reason :keyword] :i64
+     (let [n (option-value-of [:option :i64] (document-i64-value d) -1)]
+       (if (>= n 0)
+         n
+         (reject-i64! :signature reason "output-set signature time is invalid"))))
+
+(defn- identities! [marker :document provenance :document] :document
+     (let [artifact-sha (field (field (field provenance :outputs) :primary) :sha256)]
+       (if (and (digest? (field marker :sha256))
+                (digest? (field provenance :sha256))
+                (digest? artifact-sha)
+                (= :keyword (document-kind (field provenance :target))))
+         (assoc (assoc (assoc (assoc (document-map)
+                                     :output-set-sha256 (field marker :sha256))
+                              :provenance-sha256 (field provenance :sha256))
+                       :artifact-sha256 artifact-sha)
+                :target (field provenance :target))
+         (reject! :signature :invalid-output-identity "output-set identity cannot be attested"))))
+
+(defn- statement-of [marker :document provenance :document key :document not-before :i64 expires :i64] :document
+     (let [ids (identities! marker provenance)]
+       (assoc (assoc (assoc (assoc (assoc (assoc (assoc (assoc (assoc (document-map)
+                                                                      :format (document-keyword :kotoba.output-attestation-statement/v1))
+                                                               :output-set-sha256 (field ids :output-set-sha256))
+                                                        :provenance-sha256 (field ids :provenance-sha256))
+                                                 :artifact-sha256 (field ids :artifact-sha256))
+                                          :target (field ids :target))
+                                   :signer (field key :signer))
+                            :public-key (field key :public-key))
+                     :not-before (document-i64 not-before))
+              :expires (document-i64 expires))))
+
+(defn sign
+     "The envelope for MARKER and PROVENANCE signed by KEY (a signing-key map)
+     over [NOT-BEFORE, EXPIRES): `{:format .. :statement .. :signature <base64>}`.
+     The signature is the host's, byte for byte."
+     [marker :document provenance :document key :document not-before :i64 expires :i64] :document
+     (let [checked (signing-key! key)]
+       (if (< not-before 0)
+         (reject! :signature :invalid-validity "output-set signature time is invalid")
+         (if (< expires 0)
+           (reject! :signature :invalid-validity "output-set signature time is invalid")
+           (if (< not-before expires)
+             ;; `signing-key!` has decoded the private key already (it is the
+             ;; key-pair consistency check), so the seed is present.
+             (let [statement (statement-of marker provenance checked not-before expires)
+                   seed (option-value-of [:option :vector-i64]
+                                         (decode-private (text-of (field checked :private-key)))
+                                         (vector-i64))]
+               (assoc (assoc (assoc (document-map)
+                                    :format (document-keyword :kotoba.output-attestation/v1))
+                             :statement statement)
+                      :signature
+                      (document-string
+                       (kbytes/base64-encode
+                        (ed/sign (ed/secret-key seed)
+                                 (vector-i64-from-bytes (artifact/canonical-bytes statement)))))))
+             (reject! :signature :invalid-validity
+                      "output-set signature validity interval is invalid"))))))
+
+;; ---- verification ---------------------------------------------------------
+
+(defn- signature-raw [encoded :string] [:option :vector-i64]
+     (match-option (strict-base64 encoded) [:option :vector-i64]
+       (none (option-none-of [:option :vector-i64]))
+       (some v (if (= 64 (vector-count v))
+                 (option-some-of [:option :vector-i64] v)
+                 (option-none-of [:option :vector-i64])))))
+
+(defn- envelope-ok? [envelope :document statement :document] :bool
+     (and (= :map (document-kind envelope))
+          (= 3 (document-count envelope))
+          (has? envelope :format) (has? envelope :statement) (has? envelope :signature)
+          (keyword-is? (field envelope :format) :kotoba.output-attestation/v1)
+          (= :map (document-kind statement))
+          (= 9 (document-count statement))
+          (has? statement :format) (has? statement :output-set-sha256) (has? statement :provenance-sha256)
+          (has? statement :artifact-sha256) (has? statement :target) (has? statement :signer)
+          (has? statement :public-key) (has? statement :not-before) (has? statement :expires)
+          (keyword-is? (field statement :format) :kotoba.output-attestation-statement/v1)
+          (digest? (field statement :output-set-sha256))
+          (digest? (field statement :provenance-sha256))
+          (digest? (field statement :artifact-sha256))
+          (= :keyword (document-kind (field statement :target)))
+          (string? (field statement :signer))
+          (string? (field statement :public-key))
+          (document-equal? (field statement :signer)
+                           (document-string (signer-id (text-of (field statement :public-key)))))
+          (match-option (signature-raw (text-of (field envelope :signature))) [:option :vector-i64]
+            (none false)
+            (some sig true))))
+
+(defn- signature-valid? [statement :document signature :string] :bool
+     (match-option (decode-public (text-of (field statement :public-key))) [:option :vector-i64]
+       (none false)
+       (some pub (match-option (signature-raw signature) [:option :vector-i64]
+                   (none false)
+                   (some sig (ed/verify pub (vector-i64-from-bytes (artifact/canonical-bytes statement)) sig))))))
+
+(defn- in-set? [s :document member :document] :bool
+     (document-set-contains? s member))
+
+(defn- identity-matches? [statement :document ids :document] :bool
+     (and (document-equal? (field statement :output-set-sha256) (field ids :output-set-sha256))
+          (document-equal? (field statement :provenance-sha256) (field ids :provenance-sha256))
+          (document-equal? (field statement :artifact-sha256) (field ids :artifact-sha256))
+          (document-equal? (field statement :target) (field ids :target))))
+
+(defn- checked-at [statement :document envelope :document trust :document ids :document
+                      not-before :i64 expires :i64 now :i64] :document
+     (if (not (< not-before expires))
+       (reject! :signature :invalid-validity "output-set signature validity interval is invalid")
+       (if (not (signature-valid? statement (text-of (field envelope :signature))))
+         (reject! :signature :invalid-signature "output-set Ed25519 signature is invalid")
+         (if (not (in-set? (field trust :trusted-signers) (field statement :signer)))
+           (reject! :trust :untrusted-signer "output-set signer is not trusted")
+           (if (in-set? (field trust :revoked-signers) (field statement :signer))
+             (reject! :trust :revoked-signer "output-set signer is revoked")
+             (if (or (in-set? (field trust :revoked-artifacts) (field ids :output-set-sha256))
+                     (in-set? (field trust :revoked-artifacts) (field ids :provenance-sha256))
+                     (in-set? (field trust :revoked-artifacts) (field ids :artifact-sha256)))
+               (reject! :trust :revoked-output "output-set identity is revoked")
+               (if (< now not-before)
+                 (reject! :trust :not-yet-valid "output-set signature is not yet valid")
+                 (if (>= now expires)
+                   (reject! :trust :expired "output-set signature is expired")
+                   (if (not (identity-matches? statement ids))
+                     (reject! :signature :identity-mismatch
+                              "output-set attestation does not name the admitted output")
+                     (assoc (assoc (assoc (assoc (document-map)
+                                                 :publisher-authenticated (document-bool true))
+                                          :publisher (field statement :signer))
+                                   :publisher-attestation (document-keyword :kotoba.output-attestation/v1))
+                            :publisher-validity
+                            (assoc (assoc (document-map) :not-before (document-i64 not-before))
+                                   :expires (document-i64 expires))))))))))))
+
+(defn verify!
+     "Authenticate the publisher of the admitted output: the host's checks in
+     the host's order, each refusal with the host's :phase and :reason. NOW is
+     the verification time (a non-negative i64)."
+     [envelope :document trust :document marker :document provenance :document now :i64] :document
+     (let [statement (field envelope :statement)
+           ids (identities! marker provenance)]
+       (if (< now 0)
+         (reject! :signature :invalid-now "output-set signature time is invalid")
+         (if (not (envelope-ok? envelope statement))
+           (reject! :signature :malformed-attestation "output-set attestation schema is invalid")
+           (let [not-before (epoch! (field statement :not-before) :invalid-validity)
+                 expires (epoch! (field statement :expires) :invalid-validity)
+                 checked-trust (trust! trust)]
+             (checked-at statement envelope checked-trust ids not-before expires now))))))
+
+nil

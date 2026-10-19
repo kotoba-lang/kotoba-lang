@@ -1,0 +1,375 @@
+(ns kotoba.compiler.wall-cache
+  "Content-addressed keys and affected-only planning for the selfhost wall
+  scan (scripts/selfhost-wall/scan-cached.sh). PURE: text in, text out. No
+  file, no process, no clock, no nbb host call beyond `sha256` -- the shell
+  driver owns every effect (reading sources, hashing file bytes, the cache
+  directory); this module owns every decision.
+
+  ## What a verdict depends on (the key)
+
+  `amu check <file>` on the project route answers from three things: the
+  file's bytes, the bytes of every module it transitively requires, and the
+  checker (classpath identity plus the checker's own version). So
+
+    key(f) = sha256 of the text
+      kotoba.wall-key/v1
+      H <classpath-id> <checker-version>
+      S <path of f> <sha of f>
+      D <path> <sha>          one line per module in the require closure of f
+                              other than f itself, in node-id order
+
+  where node ids are assigned by the caller in sorted path order (so the
+  order is canonical). A change to any module in the closure changes the
+  key; a change to anything outside it does not. Cycles are harmless: the
+  closure is a reachability set, not a recursion.
+
+  ## Affected mode
+
+  The reverse-dependency closure of a set of changed paths is the set of
+  files whose key MUST change. It is derived from the same graph by an
+  independent fixpoint, so `scan-cached.sh --verify-affected` can check
+  the two derivations against each other: affected set == key-miss set.
+
+  ## Wire format
+
+  Input (one record per line, fields separated by TAB):
+    H  <classpath-id>  <checker-version>
+    N  <path>  <sha>  <dep ids, space separated>     id = order among N lines
+    X  <path>                                        a changed path
+    R  <key>  <verdict>  <digest>                    a stored record to check
+    S  <key>  <verdict>                              a verdict to be stored
+    G  <name>  <module paths, `;` separated>  <case-set CID>   a golden host output
+  Output:
+    K  <path>  <key>        one per N line, same order
+    A  <path>               one per affected path (X plus its dependents)
+    V  <key>  ok|bad        one per R line: the digest matches the record
+    D  <key>  <digest>      one per S line: the digest to store
+    Q  <name>  <key>        one per G line: the key of that golden output
+
+  ## The record (same conventions as nbb/verdict_cache.cljk)
+
+  One file per key, holding the format, the key, the verdict and a digest
+  of all three: digest = sha256 of `kotoba.wall-cache/v1`, key and verdict,
+  one per line. A stored record is trusted only when its digest, recomputed
+  here, equals the stored one; a mismatch is a miss. (Corruption and
+  mismatch, not forgery: the driver keeps the directory owner-only.)
+
+  Dual runtime: the same algorithm under nbb/JVM (`:default`) and the Kotoba
+  route; only the leaves differ. The nbb reading is BOOTSTRAP scaffolding for
+  running the module today; the product reading is the :kotoba one."
+  {:kotoba/export [plan record-digest]}
+  (:require [kotoba.compiler.decimal-text :as decimal-text]
+            [kotoba.compiler.nbb.compile-cache :as digest]))
+
+;; ---- leaves: the only host-specific lines ----
+
+(defn- len [s :string] :i64
+  (string-byte-length s))
+
+(defn- find-byte
+  "The offset of the first byte B at or after FROM in S, or -1."
+  [s :string b :i64 from :i64] :i64
+  (string-find-byte s b from))
+
+(defn- cut [s :string start :i64 end :i64] :string
+  (string-substring s start end))
+
+(defn- cat2 [a :string b :string] :string
+  (string-concat a b))
+
+(defn- same? [a :string b :string] :bool
+  (= 0 (string-compare a b)))
+
+(defn- vpush [v :vector-i64 x :i64] :vector-i64
+  (vector-conj v x))
+
+(defn- vget [v :vector-i64 i :i64] :i64
+  (vector-at v i))
+
+(defn- vset [v :vector-i64 i :i64 x :i64] :vector-i64
+  (vector-assoc v i x))
+
+(defn- vcount [v :vector-i64] :i64
+  (vector-count v))
+
+(defn- vdrop-last [v :vector-i64] :vector-i64
+  (vector-take v (- (vector-count v) 1)))
+
+(defn- vempty [] :vector-i64
+  (vector-i64))
+
+(defn- zeros
+  "A vector of N zeros."
+  [n :i64] :vector-i64
+  (loop [i 0 acc (vempty)]
+    (if (>= i n) acc (recur (inc i) (vpush acc 0)))))
+
+;; ---- lines and fields ----
+
+(defn- line-end
+  "The offset of the newline ending the line that starts at P (the text
+  length when the last line has none)."
+  [s :string p :i64] :i64
+  (let [e (find-byte s 10 p)]
+    (if (< e 0) (len s) e)))
+
+(defn- field
+  "Field K (0-based, TAB separated) of the line [P, E) of S; \"\" when absent."
+  [s :string p :i64 e :i64 k :i64] :string
+  (loop [i 0 start p]
+    (let [t (find-byte s 9 start)
+          stop (if (or (< t 0) (> t e)) e t)]
+      (if (= i k)
+        (if (> start e) "" (cut s start stop))
+        (if (>= stop e)
+          ""
+          (recur (inc i) (inc stop)))))))
+
+(defn- tag-is?
+  "True when the line at P begins with TAG then a TAB or its end."
+  [s :string p :i64 e :i64 tag :string] :bool
+  (same? (field s p e 0) tag))
+
+;; ---- the graph ----
+
+(defn- node-count
+  [s :string] :i64
+  (loop [p 0 n 0]
+    (if (>= p (len s))
+      n
+      (let [e (line-end s p)]
+        (recur (inc e) (if (tag-is? s p e "N") (inc n) n))))))
+
+(defn- node-lines
+  "Start offset of every N line, in order."
+  [s :string] :vector-i64
+  (loop [p 0 acc (vempty)]
+    (if (>= p (len s))
+      acc
+      (let [e (line-end s p)]
+        (recur (inc e) (if (tag-is? s p e "N") (vpush acc p) acc))))))
+
+(defn- node-field
+  [s :string starts :vector-i64 k :i64 i :i64] :string
+  (let [p (vget starts k)]
+    (field s p (line-end s p) i)))
+
+(defn- adjacency-offsets
+  "CSR row offsets (n+1 entries) of the dependency lists."
+  [s :string starts :vector-i64] :vector-i64
+  (let [n (vcount starts)]
+    (loop [k 0 total 0 acc (vpush (vempty) 0)]
+      (if (>= k n)
+        acc
+        (let [deps (decimal-text/fields (node-field s starts k 3))
+              t2 (+ total (vcount deps))]
+          (recur (inc k) t2 (vpush acc t2)))))))
+
+(defn- adjacency-targets
+  [s :string starts :vector-i64] :vector-i64
+  (let [n (vcount starts)]
+    (loop [k 0 acc (vempty)]
+      (if (>= k n)
+        acc
+        (let [deps (decimal-text/fields (node-field s starts k 3))]
+          (recur (inc k)
+                 (loop [j 0 a acc]
+                   (if (>= j (vcount deps)) a (recur (inc j) (vpush a (vget deps j)))))))))))
+
+(defn- push-successors
+  [stack :vector-i64 eoff :vector-i64 eto :vector-i64 u :i64] :vector-i64
+  (loop [j (vget eoff u) acc stack]
+    (if (>= j (vget eoff (inc u)))
+      acc
+      (recur (inc j) (vpush acc (vget eto j))))))
+
+(defn- closure
+  "Reachability flags (1/0 per node) from K, K included."
+  [n :i64 eoff :vector-i64 eto :vector-i64 k :i64] :vector-i64
+  (loop [stack (vpush (vempty) k) seen (zeros n)]
+    (if (= 0 (vcount stack))
+      seen
+      (let [u (vget stack (- (vcount stack) 1))
+            rest-stack (vdrop-last stack)]
+        (if (= 1 (vget seen u))
+          (recur rest-stack seen)
+          (recur (push-successors rest-stack eoff eto u) (vset seen u 1)))))))
+
+;; ---- keys ----
+
+(defn- line-of
+  [tag :string s :string starts :vector-i64 i :i64] :string
+  (cat2 tag
+        (cat2 "\t"
+              (cat2 (node-field s starts i 1)
+                    (cat2 "\t" (cat2 (node-field s starts i 2) "\n"))))))
+
+(defn- key-material
+  [header :string s :string starts :vector-i64 seen :vector-i64 k :i64] :string
+  (let [n (vcount starts)]
+    (loop [i 0 acc (cat2 "kotoba.wall-key/v1\n" (cat2 header (line-of "S" s starts k)))]
+      (if (>= i n)
+        acc
+        (recur (inc i)
+               (if (and (= 1 (vget seen i)) (not (= i k)))
+                 (cat2 acc (line-of "D" s starts i))
+                 acc))))))
+
+(defn- header-line
+  [s :string] :string
+  (loop [p 0]
+    (if (>= p (len s))
+      "H\t\t\n"
+      (let [e (line-end s p)]
+        (if (tag-is? s p e "H")
+          (cat2 (cut s p e) "\n")
+          (recur (inc e)))))))
+
+(defn- node-key
+  "The key of node K (see the ns doc)."
+  [header :string s :string starts :vector-i64 eoff :vector-i64 eto :vector-i64 k :i64] :string
+  (digest/sha256 (key-material header s starts (closure (vcount starts) eoff eto k) k)))
+
+(defn- keys-text
+  [s :string starts :vector-i64 eoff :vector-i64 eto :vector-i64] :string
+  (let [n (vcount starts)
+        header (header-line s)]
+    (loop [k 0 acc ""]
+      (if (>= k n)
+        acc
+        (recur (inc k)
+               (cat2 acc (cat2 "K\t" (cat2 (node-field s starts k 1) (cat2 "\t" (cat2 (node-key header s starts eoff eto k) "\n"))))))))))
+
+;; ---- affected ----
+
+(defn- node-index
+  "Index of the node whose path is PATH, or -1."
+  [s :string starts :vector-i64 path :string] :i64
+  (let [n (vcount starts)]
+    (loop [k 0]
+      (if (>= k n)
+        -1
+        (if (same? (node-field s starts k 1) path) k (recur (inc k)))))))
+
+(defn- changed-flags
+  [s :string starts :vector-i64] :vector-i64
+  (loop [p 0 flags (zeros (vcount starts))]
+    (if (>= p (len s))
+      flags
+      (let [e (line-end s p)]
+        (if (tag-is? s p e "X")
+          (let [k (node-index s starts (field s p e 1))]
+            (recur (inc e) (if (< k 0) flags (vset flags k 1))))
+          (recur (inc e) flags))))))
+
+(defn- depends-on-flagged?
+  [eoff :vector-i64 eto :vector-i64 flags :vector-i64 v :i64] :bool
+  (loop [j (vget eoff v)]
+    (if (>= j (vget eoff (inc v)))
+      false
+      (if (= 1 (vget flags (vget eto j))) true (recur (inc j))))))
+
+(defn- spread
+  "One pass: every node with a flagged dependency becomes flagged."
+  [n :i64 eoff :vector-i64 eto :vector-i64 flags :vector-i64] :vector-i64
+  (loop [v 0 acc flags]
+    (if (>= v n)
+      acc
+      (recur (inc v)
+             (if (and (= 0 (vget acc v)) (depends-on-flagged? eoff eto acc v))
+               (vset acc v 1)
+               acc)))))
+
+(defn- total [v :vector-i64] :i64
+  (loop [i 0 t 0]
+    (if (>= i (vcount v)) t (recur (inc i) (+ t (vget v i))))))
+
+(defn- affected-flags
+  "Fixpoint of `spread` from the changed set: the reverse-dependency closure."
+  [n :i64 eoff :vector-i64 eto :vector-i64 flags :vector-i64] :vector-i64
+  (let [next (spread n eoff eto flags)]
+    (if (= (total next) (total flags))
+      flags
+      (affected-flags n eoff eto next))))
+
+(defn- affected-text
+  [s :string starts :vector-i64 flags :vector-i64] :string
+  (loop [k 0 acc ""]
+    (if (>= k (vcount starts))
+      acc
+      (recur (inc k)
+             (if (= 1 (vget flags k))
+               (cat2 acc (cat2 "A\t" (cat2 (node-field s starts k 1) "\n")))
+               acc)))))
+
+;; ---- golden host outputs (differential caching) ----
+
+(defn- module-keys
+  "The keys of the nodes named by MODULES (paths separated by `;`), one per
+  line, in that order; a path that is not a node contributes `-`."
+  [header :string s :string starts :vector-i64 eoff :vector-i64 eto :vector-i64 modules :string] :string
+  (loop [from 0 acc ""]
+    (if (> from (len modules))
+      acc
+      (let [semi (find-byte modules 59 from)
+            stop (if (< semi 0) (len modules) semi)
+            k (node-index s starts (cut modules from stop))]
+        (recur (inc stop)
+               (cat2 acc (cat2 (if (< k 0) "-" (node-key header s starts eoff eto k)) "\n")))))))
+
+(defn- golden-text
+  "Q lines for the G lines. A golden host output is determined by the
+  function (its module keys, which cover the require closure and the
+  checker) and the case set (the caller's CID of the case inputs):
+    key = sha256 of kotoba.wall-golden/v1, name, module keys, case-set CID."
+  [s :string starts :vector-i64 eoff :vector-i64 eto :vector-i64] :string
+  (let [header (header-line s)]
+    (loop [p 0 acc ""]
+      (if (>= p (len s))
+        acc
+        (let [e (line-end s p)]
+          (recur (inc e)
+                 (if (tag-is? s p e "G")
+                   (let [name (field s p e 1)
+                         mkeys (module-keys header s starts eoff eto (field s p e 2))
+                         material (cat2 "kotoba.wall-golden/v1\n"
+                                        (cat2 name (cat2 "\n" (cat2 mkeys (cat2 (field s p e 3) "\n")))))]
+                     (cat2 acc (cat2 "Q\t" (cat2 name (cat2 "\t" (cat2 (digest/sha256 material) "\n"))))))
+                   acc)))))))
+
+;; ---- records ----
+
+(defn record-digest
+  "The digest a stored record carries (see the ns doc)."
+  [key :string verdict :string] :string
+  (digest/sha256 (cat2 "kotoba.wall-cache/v1\n" (cat2 key (cat2 "\n" (cat2 verdict "\n"))))))
+
+(defn- records-text
+  "V lines for the R lines and D lines for the S lines, in input order."
+  [s :string] :string
+  (loop [p 0 acc ""]
+    (if (>= p (len s))
+      acc
+      (let [e (line-end s p)
+            key (field s p e 1)
+            verdict (field s p e 2)]
+        (recur (inc e)
+               (if (tag-is? s p e "R")
+                 (cat2 acc (cat2 "V\t" (cat2 key (cat2 "\t" (if (same? (field s p e 3) (record-digest key verdict)) "ok\n" "bad\n")))))
+                 (if (tag-is? s p e "S")
+                   (cat2 acc (cat2 "D\t" (cat2 key (cat2 "\t" (cat2 (record-digest key verdict) "\n")))))
+                   acc)))))))
+
+;; ---- entry ----
+
+(defn plan
+  "INPUT (see the ns doc) -> the K lines, the A lines, then the V and D lines."
+  [input :string] :string
+  (let [starts (node-lines input)
+        n (vcount starts)
+        eoff (adjacency-offsets input starts)
+        eto (adjacency-targets input starts)]
+    (cat2 (keys-text input starts eoff eto)
+          (cat2 (affected-text input starts (affected-flags n eoff eto (changed-flags input starts)))
+                (cat2 (golden-text input starts eoff eto)
+                      (records-text input))))))
