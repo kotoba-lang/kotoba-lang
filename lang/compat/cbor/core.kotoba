@@ -1,0 +1,489 @@
+;; cbor.core — definite-length CBOR (RFC 8949) encode/decode.
+;;
+;; Across a kotoba/IPLD codebase CBOR keeps getting hand-rolled — the CACAO leash
+;; issuer, the apqc/kabuto/isco coordinators each open-code the major-type headers.
+;; This is that once, with two encoders:
+;;
+;;   (encode x)          — canonical/deterministic: map keys sorted dag-cbor style
+;;                         (shorter key first, then bytewise) → stable bytes for IPLD
+;;   (encode-ordered ps) — a map from an ORDERED [k v] seq, keys emitted as given
+;;                         (CAIP-122 CACAO and other insertion-order-sensitive wire
+;;                         formats need this — canonical sorting would corrupt them)
+;;
+;;   (decode bytes)      — → Clojure data (maps as {}, arrays as [], text as String,
+;;                         byte strings as bytes, ints as Long/number, bool/nil)
+;;
+;; Supported major types: 0 uint · 1 negint · 2 byte-string · 3 text · 4 array ·
+;; 5 map · 6 tag (as an explicit `Tagged` wrapper — see below) · 7
+;; (false/true/null/finite float64). No indefinite lengths. Floats are always
+;; emitted as IEEE-754 binary64: DAG-CBOR has one canonical float width and
+;; excludes NaN and infinities from the IPLD Data Model.
+;;
+;;   (tagged 42 bytes)   — encodes as major type 6, tag `n`, then the wrapped
+;;                         value; decodes back to a `Tagged`. Plain data never
+;;                         silently becomes a tag and a tag never silently
+;;                         becomes plain data — the wrapper is always explicit,
+;;                         so canonical bytes stay unambiguous. IPLD's CID link
+;;                         (tag 42) is layered on top by `kotoba-lang/ipld`;
+;;                         this namespace stays codec-generic.
+;;
+;; PORTABLE and PURE (adr-2609242330 S1, 2026-09-24): the encoder builds a
+;; vector of ints and the decoder threads a position; only the leaves listed
+;; under "the byte plumbing" below differ per host. `encode`/`decode`'s public
+;; contract (bytes in, bytes/Clojure-data out) is unchanged: byte-array on
+;; :clj, Uint8Array on :cljs.
+;;
+;; THE TYPED ENCODER (adr-2609242330 S1c, 2026-09-25, owner decision): one
+;; function per CBOR major type, resolved statically -- no dispatch on the
+;; run-time type of a value. Kotoba has no value whose type is only known at
+;; run time except `:document`, and the owner decided NOT to widen the
+;; document with bytes or record nodes; so `encode` / `encode-ordered` /
+;; `decode` (which dispatch on, or build, values of any type) and the
+;; `Tagged` / `OrderedMap` records exist on the HOSTS only, and the Kotoba
+;; module is the typed API below. Every typed function is also a host
+;; function with the same answer, and the host `encode` is built from them:
+;; each branch of its dispatch calls the typed writer for that type, so the
+;; golden corpus pins the typed functions' bytes too.
+;;
+;;   a FRAGMENT is the encoding of one CBOR item: a vector of ints 0..255
+;;   (Kotoba `:vector-i64`). Fragments compose; `fragment-bytes` turns one
+;;   into the host's byte container (Kotoba: the vector itself).
+;;
+;;   (encode-null) (encode-bool b) (encode-uint n) (encode-nint n)
+;;   (encode-int n) (encode-f64 x) (encode-text s) (encode-bytes b)
+;;   (encode-tag n fragment)
+;;   (array-items) (array-item items fragment) (encode-array items)
+;;   (map-entries) (map-entry entries key-string fragment)
+;;   (encode-map entries)          -- canonical DAG-CBOR key order
+;;   (encode-map-ordered entries)  -- entries in the order they were added
+;;   (fragment-bytes fragment)
+;;
+;; An element's type is declared by the function its caller encodes it with
+;; (a heterogeneous array is items encoded by different functions; a record
+;; is a map whose entries are). `items` / `entries` are accumulators, also
+;; vectors of ints: items = [count fragment-bytes...]; entries =
+;; [key-length key-utf8... fragment-length key-fragment+value-fragment...]*.
+;; Their layout is this namespace's business -- build them with the
+;; functions above.
+(ns cbor.core
+  {:kotoba/export [encode-null encode-bool encode-uint encode-nint encode-int
+                                encode-f64 encode-text encode-bytes encode-tag
+                                array-items array-item encode-array
+                                map-entries map-entry encode-map encode-map-ordered
+                                fragment-bytes]}
+  )
+
+;; ── host-only: the two records ───────────────────────────────────────────────
+;; (Kotoba reads the `:kotoba` clause: a placeholder `def`, since only
+;; ns/def/defn/defn- may stand at its top level.)
+(def ^:private host-records "OrderedMap and Tagged are host values; Kotoba uses encode-map-ordered and encode-tag")
+
+;; ── the byte plumbing (adr-2609242330 S1) ────────────────────────────────────
+;; The encoder and decoder are PURE: the output is a vector of ints 0..255
+;; built by `push`/`into`, the input is read by position, and the cursor is
+;; a value threaded through the reads (`[value pos]`), not a mutable object.
+;; What is left per host is a handful of LEAVES, each with a Kotoba body
+;; (the `:default` or `:kotoba` clause the Kotoba reader takes) -- never a
+;; copy of the :cljs host code, which the compiler refused by name
+;; (adr-2609242330 §2):
+;;
+;;   leaf               :clj / :cljs (speed)           Kotoba
+;;   push               conj                            vector-conj
+;;   str->bytes         getBytes / TextEncoder          string-code-point-at walk
+;;   float64-bytes      ByteBuffer / DataView           f64-to-bits + u64-shift-right
+;;   bytes->float64     ByteBuffer / DataView           i64-shift-left + f64-from-bits
+;;   finite-number?     isFinite                        exponent bits of f64-to-bits
+;;   in-count/in-byte/  alength / aget / .slice         count / nth / vector-take+drop
+;;   in-slice
+;;   write-input-bytes  by index / one chunk             push loop
+;;   write-text         (str->bytes) / one chunk        str->bytes + into
+;;   out->bytes         byte-array / Uint8Array         the vector itself
+;;   bytes->str         String. / TextDecoder (fatal)   string-from-utf8
+;;   bytes-like?        bytes? / Uint8Array|Int8Array   (host only: dynamic)
+;;   byte-items         a vector or a host container    the vector itself
+;;
+;; The host branches must answer exactly what the Kotoba body answers: the
+;; golden corpus (test/cbor/golden.edn, written by the pre-S1 host encoder)
+;; pins the bytes, and scripts/verify-pure-leaves.cljk evaluates each Kotoba
+;; body on nbb against its host twin.
+;;
+;; A parameter list `[#?@(:kotoba [out :vector-i64 n] :default [out n])]`
+;; gives Kotoba the type (an unannotated Kotoba parameter is `:i64`) and the
+;; hosts the same `[out n]` as before; `#?@(:kotoba [:vector-i64])` after it
+;; is the Kotoba result type and splices to nothing on the hosts.
+;;
+;; bytes->str: `(string-from-utf8 b)` is the language's string constructor.
+;; It takes `:bytes`, so the vector of ints is converted with
+;; `bytes-from-vector-i64` (which refuses an item outside [0,255] rather than
+;; masking it). Canonical UTF-8 only: invalid text is REFUSED with a named
+;; trap (utf8/overlong, utf8/surrogate, ...), never replaced with U+FFFD --
+;; so the host branches decode fatally too and throw "cbor: invalid UTF-8
+;; text".
+
+(defn- push
+  "OUT with X appended."
+  [out :vector-i64 x] :vector-i64
+  (vector-conj out x))
+
+(defn- append-all
+  "OUT with every item of V appended. One function per `into`: Kotoba lowers
+  `into` to a loop, and a function whose body holds two of them (or one
+  inside another loop) is refused with `expected i64, got vector-i64` --
+  the frontend limit kotoba.bytes met too."
+  [out :vector-i64 v :vector-i64] :vector-i64
+  (into out v))
+
+(defn- out->bytes
+  "The encoder's output as the host's byte container. On :cljs an element
+  of V is either one byte or a whole Uint8Array/Int8Array chunk appended by
+  `write-input-bytes` / `write-text` (copied here once, with `.set`, which
+  converts an Int8Array's -1 to 255 as the old masking push did)."
+  [v :vector-i64] :vector-i64
+  v)
+
+(defn- in-count [data :vector-i64] :i64
+  (count data))
+
+(defn- in-byte
+  "The unsigned byte at POS (an Int8Array / JVM byte[] is signed)."
+  [data :vector-i64 pos] :i64
+  (bit-and (nth data pos) 0xff))
+
+(defn- in-slice
+  "Bytes [FROM, TO) of DATA as a fresh container of DATA's own kind."
+  [data :vector-i64 from to] :vector-i64
+  (vector-take (vector-drop data from) (- to from)))
+
+(defn- utf8-code-point
+  "OUT with the UTF-8 encoding of code point CP appended (CP is a scalar
+  value: never a surrogate half)."
+  [out :vector-i64 cp] :vector-i64
+  (cond
+    (< cp 0x80) (push out cp)
+    (< cp 0x800) (push (push out (+ 0xC0 (quot cp 64))) (+ 0x80 (bit-and cp 0x3F)))
+    (< cp 0x10000) (push (push (push out (+ 0xE0 (quot cp 4096)))
+                               (+ 0x80 (bit-and (quot cp 64) 0x3F)))
+                         (+ 0x80 (bit-and cp 0x3F)))
+    :else (push (push (push (push out (+ 0xF0 (quot cp 262144)))
+                            (+ 0x80 (bit-and (quot cp 4096) 0x3F)))
+                      (+ 0x80 (bit-and (quot cp 64) 0x3F)))
+                (+ 0x80 (bit-and cp 0x3F)))))
+
+(defn- utf8-width
+  "Bytes of the UTF-8 sequence that starts with a code point CP."
+  [cp]
+  (cond (< cp 0x80) 1 (< cp 0x800) 2 (< cp 0x10000) 3 :else 4))
+
+(defn- str->bytes
+  "The UTF-8 bytes of S as a vector of ints. On the hosts a lone surrogate
+  becomes U+FFFD (TextEncoder; the JDK's getBytes writes `?` instead -- the
+  one pre-existing host divergence, unchanged here). A Kotoba string is
+  UTF-8 already and cannot hold a lone surrogate."
+  [s :string] :vector-i64
+  (let [n (string-byte-length s)]
+                (loop [i 0 out []]
+                  (if (< i n)
+                    (let [cp (string-code-point-at s i)]
+                      (recur (+ i (utf8-width cp)) (utf8-code-point out cp)))
+                    out))))
+
+(defn- bytes->str [b :vector-i64] :string
+  (string-from-utf8 (bytes-from-vector-i64 b)))
+
+(defn- finite-number?
+  "Is X a finite number? Kotoba's X is an `:f64` (a typed program cannot
+  hand this anything else); the hosts also answer false for a non-number."
+  [x :f64] :bool
+  (not= 2047 (bit-and (u64-shift-right (f64-to-bits x) 52) 2047)))
+
+(defn- float64-bytes
+  "The 8 big-endian bytes of the binary64 X, as a vector of ints."
+  [x :f64] :vector-i64
+  (let [bits (f64-to-bits x)]
+                (loop [s 56 out []]
+                  (if (< s 0)
+                    out
+                    (recur (- s 8) (push out (bit-and (u64-shift-right bits s) 255)))))))
+
+(defn- bytes->float64
+  "The binary64 whose big-endian bytes are the 8-byte container B."
+  [b :vector-i64] :f64
+  (f64-from-bits
+               (loop [i 0 acc 0]
+                 (if (< i 8)
+                   (recur (inc i) (bit-or (i64-shift-left acc 8) (in-byte b i)))
+                   acc))))
+
+;; `byte-at` extracts the byte at bit-position `s` (a multiple of 8) from a
+;; non-negative `n`. On the hosts: division by a power of two, then the low 8
+;; bits. JS bitwise operators coerce to Int32 first, so a shift of an n above
+;; 2^32 would truncate it before shifting; `quot` by 2^s does not (a double
+;; divides by a power of two exactly), and `bit-and 255` after it only needs
+;; the low bits, which ToInt32 keeps. In Kotoba n is an i64 and the logical
+;; shift is the same answer for n >= 0 (the only n `write-head` hands it).
+(def ^:private byte-weights
+  {0 1 8 256 16 65536 24 16777216 32 4294967296 40 1099511627776
+   48 281474976710656 56 72057594037927936})
+
+(defn- byte-at [n s]
+  (bit-and (u64-shift-right n s) 255))
+
+;; ── the typed writers ────────────────────────────────────────────────────────
+;; Each appends one item (or one head) to OUT and returns it. The public
+;; `encode-*` functions are these applied to `[]`; the host `encode` below
+;; calls them from its dispatch.
+
+(defn- write-head [out :vector-i64 major n] :vector-i64
+  (let [mt (* major 32)]
+    (cond
+      ;; bit-or / bit-and 0xff, not +: a caller-supplied tag number that is
+      ;; negative or fractional lands here, and the pre-S1 byte sink masked
+      ;; every byte it was handed -- the bytes stay what they were.
+      (< n 24)          (push out (bit-and (bit-or mt n) 0xff))
+      (< n 0x100)       (push (push out (+ mt 24)) (bit-and n 0xff))
+      (< n 0x10000)     (push (push (push out (+ mt 25)) (byte-at n 8)) (byte-at n 0))
+      (< n 0x100000000) (push (push (push (push (push out (+ mt 26)) (byte-at n 24)) (byte-at n 16))
+                                    (byte-at n 8))
+                              (byte-at n 0))
+      :else             (push (push (push (push (push (push (push (push (push out (+ mt 27))
+                                                                            (byte-at n 56))
+                                                                      (byte-at n 48))
+                                                                (byte-at n 40))
+                                                          (byte-at n 32))
+                                                    (byte-at n 24))
+                                              (byte-at n 16))
+                                        (byte-at n 8))
+                              (byte-at n 0)))))
+
+(defn- write-null [out :vector-i64] :vector-i64
+  (push out 0xf6))
+
+(defn- write-bool [out :vector-i64 b :bool] :vector-i64
+  (push out (if b 0xf5 0xf4)))
+
+(defn- write-int
+  "Major type 0 for N >= 0, major type 1 (-1 - N) below zero."
+  [out :vector-i64 n] :vector-i64
+  (if (neg? n) (write-head out 1 (- -1 n)) (write-head out 0 n)))
+
+(defn- write-f64
+  "The binary64 X (major type 7, info 27). A non-finite X is refused: on the
+  hosts by the ex-info every caller already sees, in Kotoba by a trap (an
+  aborting function cannot be exported, and DAG-CBOR has no non-finite
+  float to write)."
+  [out :vector-i64 x :f64] :vector-i64
+  (do (assert (finite-number? x))
+                 (append-all (push out 0xfb) (float64-bytes x))))
+
+(defn- write-text [out :vector-i64 s :string] :vector-i64
+  (let [b (str->bytes s)]
+                (append-all (write-head out 3 (count b)) b)))
+
+(defn- byte-items
+  "The bytes of B as a vector of ints. Kotoba's byte vector already is one;
+  the hosts also take their own byte container (byte[] / Uint8Array /
+  Int8Array), the value `decode` hands back for a byte string."
+  [b :vector-i64] :vector-i64
+  b)
+
+(defn- write-byte-string
+  "Major type 2 over a vector of ints B."
+  [out :vector-i64 b :vector-i64] :vector-i64
+  (append-all (write-head out 2 (count b)) b))
+
+;; ── accumulators: array items and map entries ───────────────────────────────
+
+(defn- vec-slice
+  "Items [FROM, TO) of the vector V."
+  [v :vector-i64 from to] :vector-i64
+  (vector-take (vector-drop v from) (- to from)))
+
+(defn- vec-set [v :vector-i64 i x] :vector-i64
+  (vector-assoc v i x))
+
+(defn- add-entry
+  "ENTRIES with one entry appended: SORT-KEY (the bytes the canonical order
+  compares) and FRAGMENT (the encoded key followed by the encoded value).
+  An element of FRAGMENT is copied, never read, so a host chunk (see
+  `out->bytes`) may stand in it."
+  [entries :vector-i64 sort-key :vector-i64 fragment :vector-i64] :vector-i64
+  (append-all (push (append-all (push entries (count sort-key)) sort-key) (count fragment)) fragment))
+
+(defn- entry-fragment-start
+  "Index of the first fragment item of the entry at offset O."
+  [entries :vector-i64 o] :i64
+  (+ o 2 (nth entries o)))
+
+(defn- entry-end [entries :vector-i64 o] :i64
+  (let [f (entry-fragment-start entries o)]
+    (+ f (nth entries (- f 1)))))
+
+(defn- entry-offsets
+  "The offset of every entry, in the order they were added."
+  [entries :vector-i64] :vector-i64
+  (let [n (count entries)]
+    (loop [o 0 out []]
+      (if (< o n) (recur (entry-end entries o) (push out o)) out))))
+
+(defn- key-less?
+  "dag-cbor key order over the sort keys of the entries at offsets A and B:
+  shorter first, then bytewise."
+  [entries :vector-i64 a b] :bool
+  (let [la (nth entries a) lb (nth entries b)]
+    (if (not= la lb)
+      (< la lb)
+      (loop [i 1]
+        (cond (> i la) false
+              (not= (nth entries (+ a i)) (nth entries (+ b i)))
+              (< (nth entries (+ a i)) (nth entries (+ b i)))
+              :else (recur (+ i 1)))))))
+
+(defn- merge-runs
+  "OUT with the runs SRC[lo,mid) and SRC[mid,hi) (each already in key order)
+  merged onto its end. Ties take the left run first: the sort is stable, as
+  the host `sort-by` it replaces was."
+  [entries :vector-i64 src :vector-i64 lo mid hi out :vector-i64] :vector-i64
+  (loop [i lo j mid out out]
+    (cond
+      (and (< i mid) (< j hi))
+      (if (key-less? entries (nth src j) (nth src i))
+        (recur i (+ j 1) (push out (nth src j)))
+        (recur (+ i 1) j (push out (nth src i))))
+      (< i mid) (recur (+ i 1) j (push out (nth src i)))
+      (< j hi) (recur i (+ j 1) (push out (nth src j)))
+      :else out)))
+
+(defn- merge-pass
+  "One bottom-up merge sort pass over SRC with runs of WIDTH."
+  [entries :vector-i64 src :vector-i64 width] :vector-i64
+  (let [n (count src)]
+    (loop [lo 0 out []]
+      (if (< lo n)
+        (let [mid (min n (+ lo width))
+              hi (min n (+ lo width width))]
+          (recur hi (merge-runs entries src lo mid hi out)))
+        out))))
+
+(defn- sorted-offsets
+  "The entry offsets in dag-cbor key order (stable)."
+  [entries :vector-i64] :vector-i64
+  (let [offsets (entry-offsets entries)
+        n (count offsets)]
+    ;; the hosts use their own stable sort over the same strict order (the
+    ;; answer is the same permutation; nbb interprets the merge 2x slower)
+    (loop [width 1 src offsets]
+                  (if (< width n) (recur (* 2 width) (merge-pass entries src width)) src))))
+
+(defn- write-entries
+  "OUT with a map head for the entries at OFFSETS and their fragments, in
+  that order."
+  [out :vector-i64 entries :vector-i64 offsets :vector-i64] :vector-i64
+  (let [n (count offsets)]
+    (loop [k 0 out (write-head out 5 n)]
+      (if (< k n)
+        (let [o (nth offsets k)]
+          (recur (+ k 1) (append-all out (vec-slice entries (entry-fragment-start entries o) (entry-end entries o)))))
+        out))))
+
+;; ── the typed encoder (public) ───────────────────────────────────────────────
+
+(defn encode-null
+  "CBOR null (major type 7, simple 22)."
+  [] :vector-i64
+  (write-null []))
+
+(defn encode-bool
+  "CBOR true / false."
+  [b :bool] :vector-i64
+  (write-bool [] b))
+
+(defn encode-uint
+  "An unsigned integer N >= 0 (major type 0)."
+  [n] :vector-i64
+  (write-head [] 0 n))
+
+(defn encode-nint
+  "A negative integer N < 0 (major type 1, argument -1 - N)."
+  [n] :vector-i64
+  (write-head [] 1 (- -1 n)))
+
+(defn encode-int
+  "An integer of either sign: `encode-uint` for N >= 0, else `encode-nint`."
+  [n] :vector-i64
+  (write-int [] n))
+
+(defn encode-f64
+  "A finite binary64 X (always 8 bytes: DAG-CBOR's one float width). Every X
+  is written as a float, even an integral one -- the typed encoder never
+  guesses; the dynamic host `encode` writes an integral JS number as an int."
+  [x :f64] :vector-i64
+  (write-f64 [] x))
+
+(defn encode-text
+  "A UTF-8 text string (major type 3)."
+  [s :string] :vector-i64
+  (let [b (str->bytes s)]
+    (append-all (write-head [] 3 (count b)) b)))
+
+(defn encode-bytes
+  "A byte string (major type 2) from a vector of ints 0..255 (on the hosts
+  also from the host byte container)."
+  [b :vector-i64] :vector-i64
+  (write-byte-string [] (byte-items b)))
+
+(defn encode-tag
+  "Tag N (major type 6) around the already-encoded item FRAGMENT."
+  [n fragment :vector-i64] :vector-i64
+  (append-all (write-head [] 6 n) fragment))
+
+(defn array-items
+  "An empty array accumulator."
+  [] :vector-i64
+  [0])
+
+(defn array-item
+  "ITEMS with the encoded item FRAGMENT appended."
+  [items :vector-i64 fragment :vector-i64] :vector-i64
+  (append-all (vec-set items 0 (+ 1 (nth items 0))) fragment))
+
+(defn encode-array
+  "An array (major type 4) of the items in ITEMS, in the order added."
+  [items :vector-i64] :vector-i64
+  (append-all (write-head [] 4 (nth items 0)) (vec-slice items 1 (count items))))
+
+(defn map-entries
+  "An empty map accumulator."
+  [] :vector-i64
+  [])
+
+(defn map-entry
+  "ENTRIES with the entry KEY (a string: DAG-CBOR's only key type) -> the
+  encoded value FRAGMENT appended."
+  [entries :vector-i64 key :string fragment :vector-i64]
+  :vector-i64
+  (add-entry entries (str->bytes key) (append-all (encode-text key) fragment)))
+
+(defn encode-map
+  "A map (major type 5) of ENTRIES in canonical DAG-CBOR key order: shorter
+  UTF-8 key first, then bytewise; entries with equal keys keep the order
+  they were added in."
+  [entries :vector-i64] :vector-i64
+  (write-entries [] entries (sorted-offsets entries)))
+
+(defn encode-map-ordered
+  "A map (major type 5) of ENTRIES in the order they were added (CAIP-122
+  CACAO and other order-sensitive formats)."
+  [entries :vector-i64] :vector-i64
+  (write-entries [] entries (entry-offsets entries)))
+
+(defn fragment-bytes
+  "FRAGMENT as the host's byte container (byte-array on :clj, Uint8Array on
+  :cljs); in Kotoba the vector of ints itself."
+  [fragment :vector-i64] :vector-i64
+  (out->bytes fragment))
+
+;; ── host-only: the dynamic encoder and the decoder ───────────────────────────
+;; `encode` dispatches on the run-time type of its argument and `decode`
+;; builds values of any type; neither has a Kotoba reading (see the typed
+;; encoder above). Each branch of `encode-into` is a typed writer.
+(def ^:private host-dynamic-codec "encode / encode-ordered / decode are host functions; Kotoba uses the typed encoder")
