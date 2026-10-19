@@ -198,7 +198,11 @@ gates it hits are mechanical — an `:export` clause, a folded constant, dropped
 - **The 137 files are one day's classpath**, at the pins recorded in
   `lang/selfhost-distance.edn`. Not a stable denominator.
 
-## The trust half of the native flow is not JVM-free
+## The trust half of the native flow
+
+*(Superseded below: measured again 2026-10-19, the trust commands are
+JVM-free now. The 2026-09-08 table is kept as the record of what was true
+then.)*
 
 Measured 2026-09-08 by putting refusing stubs for `java`, `javac`, `clojure`
 and `clj` first on `PATH` with `JAVA_HOME=/nonexistent`, and running each step
@@ -225,46 +229,109 @@ invoking `kexe_loader` by hand with the symbol's offset — which is how the
 the runtime measurement entirely**. That is a demonstration, not a way to run
 software.
 
+### Re-measured 2026-10-19 (`amu c4064497`): the trust commands are JVM-free
+
+Re-run 2026-10-19 with the same method — refusing stubs for `java`, `javac`,
+`clojure` and `clj` first on `PATH`, `JAVA_HOME=/nonexistent` — but against a
+clean worktree of `origin/main` (`c4064497`) rather than a development
+checkout:
+
+| step | JVM-free |
+|---|---|
+| `amu compile … --jvm-free --target aarch64-macos` | **yes** |
+| `amu keygen` | **yes** |
+| `amu public-key` / `amu trust-key` | **yes** |
+| `amu sign` | **yes** |
+| `amu verify-signed --trust` | **yes** (`:verified? true`) |
+| `amu measure-runtime` (builds the `kotoba-loader` Mach-O) | **yes** |
+| `amu run <signed.kexe> --trust --policy --input --executor-key --runtime --loader` | **yes** — `:status :ok`, `:result 42` |
+| `amu verify-receipt` | **yes** (`:verified? true`) |
+
+The gap this section was written to name is closed: the whole trust chain —
+produce, sign, verify, measure the runtime, execute under a policy and an
+input, mint a receipt, verify the receipt — runs with no JVM on `PATH`. The
+execute step is real: `amu run` drove the signed `aiueos-probe.kotoba` artifact
+under the measured runtime (`:kotoba.native-runtime/v6`) with `{:allow #{}}`
+and `{:args []}`, answered `:result 42`, and wrote a receipt
+(`receipt-sha256 2126b78d…`).
+
+Two usage details the old table could not have known. `verify-receipt` rejects
+the receipt until the *executor* key's signer is in the trust set's
+`:trusted-signers` — `executor receipt attestation rejected`, the artifact
+signer alone is not enough — and it needs an explicit `--now`. And the command
+that accepts a signed envelope is `verify-signed`; `amu verify <signed.kexe>`
+answers `native artifact schema rejected`.
+
+What remains open is the parity question raised below: this run proves one
+host's route is JVM-free, not that the two host implementations agree. A key
+generated on one host verifying on the other, in both directions, is the rung
+still to climb.
+
 ### There are two signing surfaces, and one of them is already portable
 
 `bin/amu` routes `sign-output-set` and `verify-output-set` to nbb, and
 `src/kotoba/compiler/nbb/output_attestation.cljs` signs with `node:crypto`
-Ed25519 — no JVM anywhere. The kexe flow instead goes through
-`kotoba-verifier/src/kotoba/verifier/signing.clj`, 171 lines of
-`java.security` `KeyFactory`/`Signature` and `java.util.Base64`, which is
-`.clj` and therefore JVM-only.
+Ed25519 — no JVM anywhere. The kexe flow goes through
+`kotoba-verifier/src/kotoba/verifier/signing.cljk`, 220 lines that carry both
+hosts: `java.security` `KeyFactory`/`Signature` and `java.util.Base64` under
+`:clj`, `node:crypto` under `:cljs`. (When the table above was measured it was
+`signing.clj`, 171 lines of `java.security` only.) `bin/amu` routes the whole
+`trustCommands` set — `keygen`, `public-key`, `inspect`, `trust-key`,
+`trust-runtime`, `sign`, `verify-signed`, `verify`, `receipt`, … — through
+the nbb route, and `run` / `measure-runtime` ride the same route plus the
+executor's alias closure.
 
-Same algorithm, same purpose, two implementations, one portable. That is the
-shape `lang/definition-patch.edn` already names for the hasher
-(`:parallel-hasher {:status :second-implementation-to-be-migrated}`), and it
-is worth naming here for the signer too.
+Same algorithm, same purpose, two implementations, both now portable. That is
+the shape `lang/definition-patch.edn` already names for the hasher
+(`:parallel-hasher {:status :second-implementation-to-be-migrated}`), and the
+signer is the worked example of it.
 
 ### The next rung, and what would make it real
 
-Port `kotoba.verifier.signing` to `.cljc` — `java.security` under `:clj`,
-`node:crypto` under `:cljs` — and add the four kexe trust commands to
-`bin/amu`'s nbb-eligible list.
+The port this section asked for is done: `kotoba.verifier.signing` is
+dual-host and the kexe trust commands are on the nbb-eligible route. What
+remains is the check that would make it evidence.
 
-The check that would make it landable is a **cross-host parity test**, not a
-green suite: a key generated on one host verifies on the other, in both
-directions, and a signature made on one host is accepted by the other. Signing
-code that has only ever been run one way is signing code whose portability
-nobody has measured — and this document's own ladder exists because the
-JVM-free claim had never been run against a `PATH` with no `java` on it.
+It is a **cross-host parity test**, not a green suite: a key generated on one
+host verifies on the other, in both directions, and a signature made on one
+host is accepted by the other. Signing code that has only ever been run one
+way is signing code whose portability nobody has measured — and this
+document's own ladder exists because the JVM-free claim had never been run
+against a `PATH` with no `java` on it. The 2026-10-19 run above closes the
+`PATH` question on one host; the cross-host question is still open.
 
 ## The order the hosts can leave in
 
-Knowing that the trust half needs a JVM is not a work order. A namespace
+Knowing which namespaces are host-bound is not a work order. A namespace
 cannot be ported before the namespaces it requires are, so "what first" is a
 topological sort over the require graph, restricted to the host-bound nodes.
 `scripts/measure-host-port-order.cljk` computes it; `lang/host-port-order.edn`
 is the result.
 
+*(Was not regenerable; matcher and predicate repaired 2026-10-19.)* The
+script matched source files with `\.clj[cs]?$`, which the 2026-09-11 `.cljk`
+rename (ADR-2609111500) left matching nothing: `kotoba-verifier/src` holds 4
+`.cljk` files and amu `src` holds 96, none of them `.clj`/`.cljc`/`.cljs`, so
+a re-run answered `reachable: 3, blockers: 0, waves: 0` with `:escapes {}` —
+an empty sweep, not a clean bill of health. It now reads `.cljk`, fails
+closed (`REFUSED: ... an empty graph is not a measurement`) when nothing
+matches, and defines `:clj-only` by what survives the rename: no `.cljs` twin
+and no `:cljs` branch in any `#?(...)`/`#?@(...)` form (deliberately loose,
+like the script's `requires`). On the two-tree scope (kotoba-verifier/src +
+amu/src at `c4064497`) that re-run reads: reachable 101, JVM-removal
+blockers 17 in 4 waves, Kotoba-only 48 in 9 waves — and
+`kotoba.verifier.signing` drops out of the JVM blockers
+(`[:java-interop :js-interop :node-require]`, no `:clj-only`), which is the
+fact the wave tables below predate. The waves below are still the pre-rename
+snapshot; regenerating them over the full classpath (gitlibs pins included)
+is the remaining step.
+
 **Two hosts leave, not one.** `node:crypto` is not a smaller problem than
 `java.security` — it is the same problem with a different owner, and
 Kotoba-only means neither. Four escape kinds are read off the source:
-`:clj-only` (a `.clj` with no `.cljc`/`.cljs` twin), `:java-interop`,
-`:node-require`, `:js-interop`.
+`:clj-only` (no `.cljs` twin and no `:cljs` branch in a reader conditional,
+so it loads on no other host), `:java-interop`, `:node-require`,
+`:js-interop`.
 
 ⚠ **The first version of this section asked one question where there are
 two, and got the answer wrong.** It counted any host escape as a JVM blocker,
@@ -275,55 +342,48 @@ branch, which is what portable code looks like. Two predicates, two orders:
 
 | question | blocker | reachable | blockers | waves |
 |---|---|---:|---:|---|
-| **stop depending on the JVM** | `:clj-only` — a `.clj` with no `.cljc`/`.cljs` twin, so it runs on no other host | 100 | **18** | **6, no cycle** |
-| **be Kotoba only** | any host escape, including a `:cljs` branch naming `js/` | 100 | **52** | 8 + a cycle of 9 |
+| **stop depending on the JVM** | `:clj-only` — no `.cljs` twin and no `:cljs` reader-conditional branch | 125 | **34** | **4, no cycle** |
+| **be Kotoba only** | any host escape, including a `:cljs` branch naming `js/` | 125 | **86** | 6 + a cycle of 10 |
+
+Re-measured 2026-10-19 over 60 source trees — `kotoba-verifier/src`, amu
+`src` at `c4064497`, and the 58 `:pins` gitlibs checkouts named in
+`lang/selfhost-distance.edn` — 125 reachable namespaces, up from 100 at the
+pre-rename measurement the first table recorded.
 
 ### To stop depending on the JVM
 
-```
-wave 0  compiler.atomic-output, bounded-edn, coverage, ipld-adl-source,
-        project-files, component.admission, verifier.signing, wasm.tools
-wave 1  compiler.cache, coverage-evidence, module-lock, receipt, release,
-        component.core
-wave 2  component.artifact
-wave 3  compiler.core
-wave 4  compiler.test-profile
-wave 5  compiler.cli
-```
-
-**`kotoba.verifier.signing` is in wave 0.** Everything it requires is already
-`.cljc`; the only thing binding it to the JVM is that it is a `.clj` file.
-The trust gap measured above is therefore not blocked behind four waves of
-other work, which is what the conflated ordering implied — it can be started
-now.
+34 namespaces in 4 waves (0–3), no cycle. `lang/host-port-order.edn` carries
+the full wave list. `kotoba.verifier.signing` is **not** among them any more:
+the port to `.cljk` with a `:cljs` branch moved it out of `:clj-only` (its
+escapes now read `[:java-interop :js-interop :node-require]`). In the
+pre-rename snapshot it sat in wave 0, and "it can be started now" was the
+right read then — that rung is climbed, and the trust-chain measurement
+above is what came of it.
 
 ### To be Kotoba only
 
 From the same three roots — `kotoba.verifier.signing`,
-`kotoba.compiler.cli`, `kotoba.compiler.nbb.output-attestation`: **52
-host-bound namespaces, 8 waves and one cycle.**
-
-| wave | namespaces |
-|---:|---|
-| 0 | `cbor.core`, `json.core`, `compiler.atomic-output`, `bounded-edn`, `coverage`, `ipld-adl-source`, `kotoba-reader`, `project-files`, `component.admission`, `component.wit`, `gmir`, `hir`, `kir.cljs-i64`, `kir.descriptor`, `native.interrupt-abi`, `script`, `wasm.tools` |
-| 1 | `artifact.core`, `capability-names`, `kir.value`, `mir`, `wasm.typed` |
-| 2 | `backend.evm`, `nbb.output-attestation`, `kir.decimal`, `kir.xml`, `native.elf64`, `native.machine-ir`, `wasm.core` |
-| 3 | `component.core`, `kir`, `native.aarch64`, `native.x86-64` |
-| 4 | `compiler.frontend`, `reference-runtime`, `component.artifact`, `verifier` |
-| 5 | `backend.cljs`, `ios-aot`, `verifier.signing` |
-| 6 | `coverage-evidence`, `receipt`, `release` |
-| **cycle** | `cli`, `core`, `cache`, `definition-identity`, `module-lock`, `provenance`, `test-profile`, `kir.definition-identity`, `multiformats.core` |
+`kotoba.compiler.cli`, `kotoba.compiler.nbb.output-attestation`: **86
+host-bound namespaces, 6 waves and one cycle of 10.** Full wave lists are in
+`lang/host-port-order.edn`; the shape to know is that waves 0–2 are the face
+that can be started (leaves and near-leaves: the cbor/json/multiformats
+shims, the mechanism layer, `component.wit`, `verifier.signing`), and the
+names after that wait on what they require.
 
 Two things to read from it.
 
 **Wave 0 is the only face that can be started.** Everything after it waits on
 what it requires. It is what can begin, not what is easy.
 
-**The tail is a cycle, and nine namespaces sit in it.** `cli`, `core`,
-`cache`, `definition-identity`, `module-lock`, `provenance`, `test-profile`,
-`kir.definition-identity` and `multiformats.core` require each other, so no
-one of them comes out alone. Whether to break the cycle or move all nine at
-once is a design decision; it is not an ordering question, and the sort
+**The tail is a cycle, and ten namespaces sit in it:** `ipld.core`,
+`ipld.dag-json`, `kotoba.compiler.backend.kototama`, `cli`, `core`,
+`manifest-native`, `module-lock`, `test-cli`, `test-profile` and
+`multiformats.core` require each other, so no one of them comes out alone.
+(Compared to the pre-rename snapshot's nine: `backend.kototama`,
+`manifest-native`, `test-cli`, `ipld.core` and `ipld.dag-json` joined; `cache`,
+`definition-identity`, `provenance` and `kir.definition-identity` left.)
+Whether to break the cycle or move all ten
+at once is a design decision; it is not an ordering question, and the sort
 cannot answer it.
 
 `kotoba.artifact.core` carries `:java-interop`, `:node-require` **and**
