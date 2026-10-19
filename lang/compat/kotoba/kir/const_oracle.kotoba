@@ -1,0 +1,298 @@
+;; Kotoba-side constant oracle for the scalar KIR expression subset.
+;; The host interpreter's lower step preserves analyzed function bodies; this
+;; entry evaluates those bodies directly after the frontend has closed HIR.
+(ns kotoba.kir.const-oracle
+  (:export [execute-expression]))
+
+(defn- field [value :document key :keyword] :document
+  (option-value-of [:option :document]
+                   (document-get value (document-keyword key))
+                   (document-null)))
+
+(defn- vector-item [value :document index :i64] :document
+  (option-value-of [:option :document] (document-vector-at value index) (document-null)))
+
+(defn- list-item [value :document index :i64] :document
+  (vector-item value index))
+
+(defn- result [status :keyword value :document fuel :i64 message :string] :document
+  (document-vector-conj
+   (document-vector-conj
+    (document-vector-conj
+     (document-vector-conj (document-vector) (document-keyword status)) value)
+    (document-i64 fuel))
+   (document-string message)))
+
+(defn- oracle-result-ok? [value :document] :bool
+  (document-equal? (vector-item value 0) (document-keyword :ok)))
+
+(defn- oracle-result-value [value :document] :document
+  (vector-item value 1))
+
+(defn- oracle-result-fuel [value :document] :i64
+  (option-value-of [:option :i64] (document-i64-value (vector-item value 2)) 0))
+
+(defn- oracle-result-message [value :document] :string
+  (option-value-of [:option :string] (document-string-value (vector-item value 3)) ""))
+
+(defn- success [value :document fuel :i64] :document
+  (result :ok value fuel ""))
+
+(defn- refusal [status :keyword message :string fuel :i64] :document
+  (result status (document-null) fuel message))
+
+(defn- kind? [value :document kind :keyword] :bool
+  (= (document-kind value) kind))
+
+(defn- truthy? [value :document] :bool
+  (and (not (kind? value :null))
+       (not (and (kind? value :bool)
+                 (not (option-value-of [:option :bool]
+                                      (document-bool-value value) false))))
+       (not (and (kind? value :i64)
+                 (= 0 (option-value-of [:option :i64]
+                                       (document-i64-value value) 0))))))
+
+(defn- symbol-is? [value :document name :string] :bool
+  (document-equal? value (document-edn-read name)))
+
+(defn- eval-expr [expression :document env :document fuel :i64 depth :i64] :document
+  (if (<= fuel 0)
+    (refusal :fuel "constant oracle fuel exhausted" 0)
+    (if (> depth 256)
+      (refusal :depth "constant oracle expression depth exceeded" fuel)
+      (let [remaining (- fuel 1)
+            kind (document-kind expression)]
+        (cond
+          (or (= kind :null) (= kind :bool) (= kind :i64)
+              (= kind :string) (= kind :keyword))
+          (success expression remaining)
+
+          (= kind :symbol)
+          (if (document-contains env expression)
+            (success (option-value-of [:option :document]
+                                      (document-get env expression)
+                                      (document-null)) remaining)
+            (refusal :unbound "constant oracle found an unbound symbol" remaining))
+
+          (= kind :map)
+          (if (document-equal? (field expression :kind)
+                               (document-keyword :kotoba.form/seq))
+            (eval-call (field expression :items) env remaining depth)
+            (refusal :unported "constant oracle does not admit this collection expression yet" remaining))
+
+          :else
+          (refusal :unported "constant oracle does not yet admit this expression kind" remaining))))))
+
+(defn- eval-sequence [forms :document start :i64 env :document fuel :i64 depth :i64]
+  :document
+  (loop [index start remaining fuel value (document-null)]
+    (if (>= index (document-count forms))
+      (success value remaining)
+      (let [checked (eval-expr (list-item forms index) env remaining (+ depth 1))]
+        (if (not (oracle-result-ok? checked))
+          checked
+          (recur (+ index 1) (oracle-result-fuel checked) (oracle-result-value checked)))))))
+
+(defn- eval-bindings [bindings :document index :i64 env :document fuel :i64 depth :i64]
+  :document
+  (if (>= index (document-count bindings))
+    (success env fuel)
+    (let [name (vector-item bindings index)
+          expression (vector-item bindings (+ index 1))]
+      (if (not (kind? name :symbol))
+        (refusal :unported "constant oracle let binding must be a symbol" fuel)
+        (let [checked (eval-expr expression env fuel (+ depth 1))]
+          (if (not (oracle-result-ok? checked))
+            checked
+            (eval-bindings bindings (+ index 2)
+                           (document-assoc env name (oracle-result-value checked))
+                           (oracle-result-fuel checked) depth)))))))
+
+(defn- int-value [value :document] :i64
+  (option-value-of [:option :i64] (document-i64-value value) 0))
+
+(defn- eval-arguments [call :document env :document index :i64 fuel :i64 depth :i64]
+  :document
+  (loop [i index remaining fuel values (document-vector)]
+    (if (>= i (document-count call))
+      (success values remaining)
+      (let [checked (eval-expr (list-item call i) env remaining (+ depth 1))]
+        (if (not (oracle-result-ok? checked))
+          checked
+          (recur (+ i 1) (oracle-result-fuel checked)
+                 (document-vector-conj values (oracle-result-value checked))))))))
+
+(defn- fold-int-args [arguments :document index :i64 accumulator :i64 operation :document fuel :i64] :document
+  (loop [i index value accumulator]
+    (if (>= i (document-count arguments))
+      (success (document-i64 value) fuel)
+      (let [argument (vector-item arguments i)]
+        (if (not (kind? argument :i64))
+          (refusal :trap "integer operator received a non-integer" fuel)
+          (let [next (int-value argument)]
+            (recur (+ i 1)
+                   (cond
+                     (or (symbol-is? operation "+") (symbol-is? operation "i64+")) (+ value next)
+                     (or (symbol-is? operation "*") (symbol-is? operation "i64*")) (* value next)
+                     (or (symbol-is? operation "-") (symbol-is? operation "i64-")) (- value next)
+                     (symbol-is? operation "min") (if (< value next) value next)
+                     (symbol-is? operation "max") (if (> value next) value next)
+                     :else value))))))))
+
+(defn- compare-int-args [arguments :document index :i64 previous :i64 operation :document fuel :i64] :document
+  (if (>= index (document-count arguments))
+    (success (document-bool true) fuel)
+    (let [current-form (vector-item arguments index)]
+      (if (not (kind? current-form :i64))
+        (refusal :trap "integer comparison received a non-integer" fuel)
+        (let [current (int-value current-form)
+              matches (cond
+                        (symbol-is? operation "<") (< previous current)
+                        (symbol-is? operation ">") (> previous current)
+                        (symbol-is? operation "<=") (<= previous current)
+                        :else (>= previous current))]
+          (if matches
+            (compare-int-args arguments (+ index 1) current operation fuel)
+            (success (document-bool false) fuel)))))))
+
+(defn- apply-builtin [operation :document arguments :document fuel :i64] :document
+  (let [count (document-count arguments)
+        first-form (vector-item arguments 0)
+        first-value (int-value first-form)]
+    (cond
+      (or (symbol-is? operation "+") (symbol-is? operation "i64+"))
+      (fold-int-args arguments 0 0 operation fuel)
+
+      (or (symbol-is? operation "*") (symbol-is? operation "i64*"))
+      (fold-int-args arguments 0 1 operation fuel)
+
+      (or (symbol-is? operation "-") (symbol-is? operation "i64-"))
+      (cond
+        (= count 0) (refusal :trap "subtraction expects an operand" fuel)
+        (= count 1)
+        (if (kind? first-form :i64)
+          (success (document-i64 (- 0 first-value)) fuel)
+          (refusal :trap "subtraction received a non-integer" fuel))
+        (kind? first-form :i64)
+        (fold-int-args arguments 1 first-value operation fuel)
+        :else (refusal :trap "subtraction received a non-integer" fuel))
+
+      (or (symbol-is? operation "min") (symbol-is? operation "max"))
+      (cond
+        (= count 0) (refusal :trap "min/max expects an operand" fuel)
+        (kind? first-form :i64)
+        (fold-int-args arguments 1 first-value operation fuel)
+        :else (refusal :trap "min/max received a non-integer" fuel))
+
+      (or (symbol-is? operation "quot") (symbol-is? operation "mod")
+          (symbol-is? operation "rem"))
+      (if (not (= count 2))
+        (refusal :trap "integer division expects two operands" fuel)
+        (let [left-form (vector-item arguments 0)
+              right-form (vector-item arguments 1)]
+          (if (not (and (kind? left-form :i64) (kind? right-form :i64)))
+            (refusal :trap "integer division received a non-integer" fuel)
+            (let [left (int-value left-form)
+                  right (int-value right-form)]
+              (if (= right 0)
+                (refusal :trap "integer division by zero" fuel)
+                (success (document-i64
+                          (if (symbol-is? operation "quot") (quot left right)
+                              (if (symbol-is? operation "mod")
+                                (let [remainder (- left (* (quot left right) right))]
+                                  (if (= remainder 0) 0
+                                      (if (= (< left 0) (< right 0)) remainder (+ remainder right))))
+                                (- left (* (quot left right) right))))) fuel))))))
+
+      (or (symbol-is? operation "<") (symbol-is? operation ">")
+          (symbol-is? operation "<=") (symbol-is? operation ">="))
+      (if (< count 2)
+        (refusal :trap "comparison expects at least two operands" fuel)
+        (if (not (kind? first-form :i64))
+          (refusal :trap "integer comparison received a non-integer" fuel)
+          (compare-int-args arguments 1 first-value operation fuel)))
+
+      (symbol-is? operation "=")
+      (loop [index 1 previous first-form]
+        (if (>= index count)
+          (success (document-bool true) fuel)
+          (let [current (vector-item arguments index)]
+            (if (document-equal? previous current)
+              (recur (+ index 1) current)
+              (success (document-bool false) fuel)))))
+
+      (or (symbol-is? operation "inc") (symbol-is? operation "dec")
+          (symbol-is? operation "i64"))
+      (if (not (= count 1))
+        (refusal :trap "integer conversion expects one operand" fuel)
+        (if (not (kind? first-form :i64))
+          (refusal :trap "integer conversion received a non-integer" fuel)
+          (success (document-i64
+                    (if (symbol-is? operation "inc") (+ first-value 1)
+                        (if (symbol-is? operation "dec") (- first-value 1) first-value))) fuel)))
+
+      (or (symbol-is? operation "zero?") (symbol-is? operation "pos?")
+          (symbol-is? operation "neg?"))
+      (if (not (= count 1))
+        (refusal :trap "integer predicate expects one operand" fuel)
+        (if (not (kind? first-form :i64))
+          (refusal :trap "integer predicate received a non-integer" fuel)
+          (success (document-bool
+                    (if (symbol-is? operation "zero?") (= first-value 0)
+                        (if (symbol-is? operation "pos?") (> first-value 0) (< first-value 0)))) fuel)))
+
+      :else (refusal :unported "constant oracle operation is not ported yet" fuel))))
+
+(defn- eval-call [call :document env :document fuel :i64 depth :i64] :document
+  (let [count (document-count call)
+        operation (list-item call 0)]
+    (cond
+      (symbol-is? operation "quote")
+      (if (= count 2)
+        (success (list-item call 1) fuel)
+        (refusal :trap "quote expects one operand" fuel))
+
+      (symbol-is? operation "if")
+      (if (or (= count 3) (= count 4))
+        (let [condition (eval-expr (list-item call 1) env fuel (+ depth 1))]
+          (if (not (oracle-result-ok? condition))
+            condition
+            (eval-expr (if (truthy? (oracle-result-value condition))
+                         (list-item call 2)
+                         (if (= count 4) (list-item call 3) (document-null)))
+                       env (oracle-result-fuel condition) (+ depth 1))))
+        (refusal :trap "if expects a test and one or two branches" fuel))
+
+      (symbol-is? operation "do")
+      (eval-sequence call 1 env fuel depth)
+
+      (symbol-is? operation "let")
+      (let [binding-form (list-item call 1)
+            binding-kind (field binding-form :kind)
+            bindings (field binding-form :items)]
+        (if (and (>= count 3)
+                 (document-equal? binding-kind (document-keyword :kotoba.form/vector))
+                 (kind? bindings :vector)
+                 (= 0 (bit-and (document-count bindings) 1)))
+          (let [evaluated-bindings (eval-bindings bindings 0 env fuel depth)]
+            (if (not (oracle-result-ok? evaluated-bindings))
+              evaluated-bindings
+              (eval-sequence call 2 (oracle-result-value evaluated-bindings)
+                             (oracle-result-fuel evaluated-bindings) depth)))
+          (refusal :trap "let expects an even vector of bindings and a body" fuel)))
+
+      :else
+      (let [arguments (eval-arguments call env 1 fuel depth)]
+        (if (not (oracle-result-ok? arguments))
+          arguments
+          (apply-builtin operation (oracle-result-value arguments) (oracle-result-fuel arguments)))))))
+
+(defn execute-expression [expression :string fuel :i64] :string
+  "Evaluate one scalar expression encoded by the Kotoba Form bridge. Form
+  sequences use a :kotoba.form/seq map with an :items vector so they remain
+  distinct from literal vectors. EDN is the narrow cross-module wire because
+  :document is an internal evaluator value, not a native module ABI type. The
+  result is [:ok value fuel message]."
+  (document-edn-print
+   (eval-expr (document-edn-read expression) (document-map) fuel 0)))
