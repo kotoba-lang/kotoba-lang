@@ -1,0 +1,250 @@
+(ns kotoba.compiler.nbb.io
+  "Minimal Node-`fs`-based file I/O for the nbb-native compile/check path
+  (`bin/amu`'s Wasm and ordinary-native fast paths). This is a primary compiler
+  boundary, so publication follows the same durable shape as the JVM path:
+  an OS-created private temporary location, exclusive/no-follow file creation,
+  complete write, file `fsync`, close, then same-filesystem atomic rename.
+  Hardened EDN parsing remains in `kotoba.compiler.nbb.cli-support`; Windows
+  owner-only ACL provisioning remains a JVM-only requirement because this path
+  emits no private keys.
+
+  Every filesystem operation is an fs/app-data (wire 35) request, one per
+  step (superproject adr-2609242330 S5): STAT / NOFOLLOW for the checks,
+  READ and RANGE for the reads, MKTEMP for the private staging directory,
+  WRITE + CHMOD + WRITE for a 0600-before-any-byte member, FSYNC, RENAME,
+  and FSYNC of the directory. The order and the refusals are this module's;
+  the handler makes one host call per request. The binary reads and writes
+  use the proposed `:bytes` payload of the same wire (`fs/app-data-bytes`),
+  which Kotoba's typed-cap-call cannot name yet."
+  {:kotoba/export [bytes-entry read-artifact-text-file read-bounded-bytes-file read-text-file text-entry write-bytes! write-set! write-text!]}
+  (:require [kotoba.compiler.decimal-text :as decimal-text]
+            [kotoba.compiler.posix-path :as posix-path]
+            [kotoba.compiler.text-bytes :as text-bytes]
+            [kotoba.lang.text :as text]
+            ;; Abilities (superproject adr-2609242330 S5): under Kotoba
+            ;; `fs/app-data` is catalog wire 35 and its handler comes from the
+            ;; target profile; under nbb the alias names the mechanism layer.
+            ;; `sys` holds host facts no ability carries (Windows).
+            
+            ))
+
+;; Kotoba: one output-set member, typed (a `.kotoba` module has no open map
+;; with optional keys and no untyped bytes-or-text). KIND 0 carries DATA, 1
+;; carries TEXT; MODE 0 means the default private mode.
+(defrecord OutputEntry [path :string kind :i64 data :bytes text :string mode :i64])
+
+;; Matches `kotoba.compiler.bounded-edn/max-source-bytes` exactly (the
+;; stricter of its two limits -- `.kotoba` source and `--policy` EDN both
+;; go through this same function, so both get the tighter cap). Checked
+;; against the RAW byte count before UTF-8 decoding, same order the JVM
+;; path's `read-bytes` uses -- confirmed live: without this, a >1MiB
+;; `.kotoba` source silently reached `sema/analyze`'s own (differently
+;; worded) size check instead of failing here with the exact message
+;; `scripts/conformance.cljk` asserts on.
+(def ^:private max-bytes (* 1024 1024))
+
+;; An ARTIFACT (.kexe) is EDN whose `:code` is a byte vector printed as text --
+;; ~4 characters per machine byte -- so it outgrows a source file long before
+;; the verifier's code ceiling does. Matches `bounded-edn/max-edn-bytes`, the
+;; JVM twin's bound for the same kind. Measured 2026-09-19: a 12-layer Nex
+;; decode guest (kotoba-lang/inference verify/native/gpu) compiled to a
+;; 1,087,282-byte kexe that `extract-native` then refused with the 1 MiB
+;; source bound -- "input exceeds byte limit", which was true of the wrong
+;; limit.
+(def max-artifact-bytes (* 8 1024 1024))
+
+(def ^:private windows?
+  ;; Windows has no directory handle to fsync; that platform's rename
+  ;; durability is an explicit non-claim (below). Under Kotoba the handler
+  ;; profile answers directory FSYNC itself.
+  false)
+
+(defn- fields [answer :string] :vector-i64
+     (if (= 0 (string-byte-length answer))
+       (vector-i64)
+       (decimal-text/fields answer)))
+
+(defn- read-text-file-bounded [p :string limit :i64] :string
+     (if (= 0 (string-byte-length p))
+       (throw (ex-info "input path is required" {:phase :decode}))
+       (if (not (= "1" (fs/app-data (str p "EXISTS_SEP"))))
+         (throw (ex-info "input could not be read" {:phase :decode :path p}))
+       (let [stat (fields (fs/app-data (str p "STAT_SEP")))]
+         (if (or (< (vector-count stat) 4) (= 1 (vector-at stat 3)))
+           (throw (ex-info "input could not be read" {:phase :decode :path p}))
+         (if (> (vector-at stat 1) limit)
+           (throw (ex-info "input exceeds byte limit" {:phase :decode :path p :limit limit}))
+           (let [content (fs/app-data-bytes p)]
+             ;; The file may have grown between STAT and READ.
+             (if (> (text-bytes/bytes-length content) limit)
+               (throw (ex-info "input exceeds byte limit" {:phase :decode :path p :limit limit}))
+               (if (text-bytes/utf8-valid? content)
+                 (text-bytes/utf8-text content)
+                 (throw (ex-info "input is not valid UTF-8" {:phase :decode :path p})))))))))))
+
+(defn read-text-file [p] (read-text-file-bounded p max-bytes))
+(defn read-artifact-text-file [p] (read-text-file-bounded p max-artifact-bytes))
+
+(defn- member-error [message :string p :string] :document
+     (ex-info message {:phase :verify :path p}))
+
+(defn read-bounded-bytes-file [p :string maximum :i64] :bytes
+     (if (= 0 (string-byte-length p))
+       (throw (ex-info "input path is required" {:phase :verify}))
+       (let [stat (fields (fs/app-data (str p "NOFOLLOW_SEP")))]
+         (cond
+           (< (vector-count stat) 4) (throw (member-error "output-set member could not be read" p))
+           (= 2 (vector-at stat 3)) (throw (member-error "output-set member must not be a symbolic link" p))
+           (not= 0 (vector-at stat 3)) (throw (member-error "output-set member is not a regular file" p))
+           (> (vector-at stat 1) maximum)
+           (throw (ex-info "output-set member exceeds byte limit"
+                           {:phase :verify :path p :limit maximum}))
+           :else
+           ;; Do not READ the whole file: it may grow after the stat and turn a
+           ;; nominally bounded verifier into an unbounded allocation. RANGE
+           ;; reads exactly the observed size (no-follow, a regular file
+           ;; only); a size that moved while it was read is a member that
+           ;; changed. A window the file no longer holds traps in the handler.
+           (let [size (vector-at stat 1)
+                 bytes (fs/app-data-bytes (str p "RANGE_SEP0:" size))
+                 after (fields (fs/app-data (str p "NOFOLLOW_SEP")))]
+             (if (or (< (vector-count after) 2) (not= size (vector-at after 1)))
+               (throw (member-error "output-set member changed while being read" p))
+               bytes))))))
+
+(defn- octal
+  "N (a permission mode) as octal digits."
+  [n]
+  (loop [n n digits ""]
+    (if (< n 8)
+      (str n digits)
+      (recur (quot n 8) (str (mod n 8) digits)))))
+
+(defn- open-output! [temporary :string mode :i64] :i64
+     ;; Created EMPTY, mode set, and only then written to (see the :default
+     ;; branch's note): the file never exists with bytes and the wrong mode.
+     (do (fs/app-data (str temporary "WRITE_SEP"))
+         (if (= "1" (fs/app-data (str temporary "CHMOD_SEP" (octal (if (= 0 mode) 384 mode)))))
+           0
+           (throw (ex-info "output member mode could not be set" {:phase :output})))))
+
+(defn- fsync! [p :string] :i64
+     (if (= "1" (fs/app-data (str p "FSYNC_SEP")))
+       0
+       (throw (ex-info "fsync failed" {:phase :output}))))
+
+(defn- fsync-directory! [dir :string] :i64
+     (if windows? 0 (fsync! dir)))
+
+(defn- spelled
+  ;; On Windows the host's separator is also `\`; the pure path functions
+  ;; read only `/`, which Windows accepts too.
+  [p]
+  (if windows? (text/replace p "\\" "/") p))
+
+(defn- target! [output-path :string] :string
+     (if (= 0 (string-byte-length output-path))
+       (throw (ex-info "output path is required" {:phase :output}))
+       (let [target (posix-path/normalize (spelled output-path))
+             stat (fields (fs/app-data (str (posix-path/dirname target) "STAT_SEP")))]
+         (if (and (> (vector-count stat) 3) (= 1 (vector-at stat 3)))
+           target
+           (throw (ex-info "output parent must be a directory"
+                           {:phase :output :path output-path}))))))
+
+(defn- discard-staging! [temporary-dir :string total :i64] :i64
+     (do (loop [index 0]
+           (if (< index total)
+             (do (fs/app-data (str temporary-dir "/" index ".tmp" "UNLINK_SEP"))
+                 (recur (inc index)))
+             0))
+         (fs/app-data (str temporary-dir "RMDIR_SEP"))
+         0))
+
+(defn- stage! [temporary-dir :string index :i64 entry [:record :kotoba.compiler.nbb.io/OutputEntry [[:path :string] [:kind :i64] [:data :bytes] [:text :string] [:mode :i64]]]] :i64
+     (let [temporary (str temporary-dir "/" index ".tmp")]
+       (do (open-output! temporary (:mode entry))
+           (if (= 0 (:kind entry))
+             (do (fs/app-data-bytes (str temporary "WRITE_SEP") (:data entry)) "")
+             (fs/app-data (str temporary "WRITE_SEP" (:text entry))))
+           (fsync! temporary))))
+
+(defn- stage-from! [temporary-dir :string entries [:list [:record :kotoba.compiler.nbb.io/OutputEntry [[:path :string] [:kind :i64] [:data :bytes] [:text :string] [:mode :i64]]]] index :i64] :i64
+     ;; Recursion, not `loop`: an abort before `recur` on the same path would
+     ;; take the recur out of tail position.
+     (if (< index (count entries))
+       (do (stage! temporary-dir index (nth entries index))
+           (stage-from! temporary-dir entries (inc index)))
+       0))
+
+(defn- rename-from! [temporary-dir :string dir :string entries [:list [:record :kotoba.compiler.nbb.io/OutputEntry [[:path :string] [:kind :i64] [:data :bytes] [:text :string] [:mode :i64]]]] index :i64] :i64
+     (if (< index (count entries))
+       ;; Destination symlinks are replaced, never followed. The commit marker
+       ;; is the last entry and therefore the last rename, and each namespace
+       ;; transition is persisted before the next member.
+       (do (if (= "1" (fs/app-data (str temporary-dir "/" index ".tmp" "RENAME_SEP"
+                                        (target! (:path (nth entries index))))))
+             0
+             (throw (ex-info "rename failed" {:phase :output :path (:path (nth entries index))})))
+           (fsync-directory! dir)
+           (rename-from! temporary-dir dir entries (inc index)))
+       0))
+
+(defn- shares-dir? [dir :string entries [:list [:record :kotoba.compiler.nbb.io/OutputEntry [[:path :string] [:kind :i64] [:data :bytes] [:text :string] [:mode :i64]]]] index :i64] :bool
+     (if (>= index (count entries))
+       true
+       (if (= dir (posix-path/dirname (target! (:path (nth entries index)))))
+         (shares-dir? dir entries (inc index))
+         false)))
+
+(defn- duplicate-from? [entries [:list [:record :kotoba.compiler.nbb.io/OutputEntry [[:path :string] [:kind :i64] [:data :bytes] [:text :string] [:mode :i64]]]] index :i64 other :i64] :bool
+     (if (>= index (count entries))
+       false
+       (if (>= other (count entries))
+         (duplicate-from? entries (inc index) (+ index 2))
+         (if (= (target! (:path (nth entries index))) (target! (:path (nth entries other))))
+           true
+           (duplicate-from? entries index (inc other))))))
+
+   ;; aborts below are this module's own refusals, and a failure after the
+   ;; staging directory exists discards it before the abort continues.
+   
+(defn write-set! [entries [:list [:record :kotoba.compiler.nbb.io/OutputEntry [[:path :string] [:kind :i64] [:data :bytes] [:text :string] [:mode :i64]]]]] :i64
+     (if (= 0 (count entries))
+       (throw (ex-info "output set is required" {:phase :output}))
+       (let [dir (posix-path/dirname (target! (:path (nth entries 0))))]
+         (if (not (shares-dir? dir entries 0))
+           (throw (ex-info "output set must share one parent directory" {:phase :output}))
+           (if (duplicate-from? entries 0 1)
+             (throw (ex-info "output set contains duplicate paths" {:phase :output}))
+             (let [temporary-dir (fs/app-data (str dir "MKTEMP_SEP" ".kotoba-output-"))]
+               (if (= "" temporary-dir)
+                 (throw (ex-info "output staging directory could not be created"
+                                 {:phase :output :path (:path (nth entries 0))}))
+                 (let [published (try
+                                   (do (stage-from! temporary-dir entries 0)
+                                       (rename-from! temporary-dir dir entries 0)
+                                       (count entries))
+                                   (catch :default error
+                                     (do (discard-staging! temporary-dir (count entries))
+                                         (throw (ex-info "atomic output set failed"
+                                                         {:phase :output} error)))))]
+                   (do (discard-staging! temporary-dir (count entries))
+                       published)))))))))
+
+(defn bytes-entry [path :string data :bytes mode :i64] [:record :kotoba.compiler.nbb.io/OutputEntry [[:path :string] [:kind :i64] [:data :bytes] [:text :string] [:mode :i64]]]
+     (->OutputEntry path 0 data "" mode))
+
+(defn text-entry [path :string text :string] [:record :kotoba.compiler.nbb.io/OutputEntry [[:path :string] [:kind :i64] [:data :bytes] [:text :string] [:mode :i64]]]
+     (->OutputEntry path 1 (bytes-empty) text 0))
+
+(defn- write-atomic! [entry [:record :kotoba.compiler.nbb.io/OutputEntry [[:path :string] [:kind :i64] [:data :bytes] [:text :string] [:mode :i64]]]] :i64
+     (write-set! [entry]))
+
+(defn write-bytes! [output-path :string data :bytes mode :i64] :i64
+     (write-atomic! (bytes-entry output-path data mode)))
+
+;; Same fsync-before-rename boundary as `write-bytes!`, for the native compile
+;; path's `.kexe`/`.provenance.edn` output.
+(defn write-text! [output-path :string text :string] :i64
+     (write-atomic! (text-entry output-path text)))

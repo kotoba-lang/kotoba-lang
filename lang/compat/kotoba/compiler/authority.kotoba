@@ -1,0 +1,302 @@
+(ns kotoba.compiler.authority
+  "Dynamic authority admission for typed capability calls. Identity proof and
+  delegation verification stay at the host boundary; this module validates
+  their sealed result and intersects it with local runtime policy."
+  {:kotoba/export [context-format decision-format grant-format intersect! max-authority-entries policy-format principal-format validate-decision! validate-scope!]}
+  (:require [kotoba.lang.text :as str]))
+
+(def ^:private code-context-format :kotoba.authority-context/v1)
+(def ^:private code-principal-format :kotoba.principal/v1)
+(def ^:private code-grant-format :kotoba.authority-grant/v1)
+(def ^:private code-policy-format :kotoba.authority-policy/v1)
+(def ^:private code-decision-format :kotoba.authority-decision/v1)
+(def ^:private code-max-authority-entries 256)
+
+;; The exports name functions on Kotoba; the host keeps the values.
+(defn context-format [] :keyword code-context-format)
+(defn principal-format [] :keyword code-principal-format)
+(defn grant-format [] :keyword code-grant-format)
+(defn policy-format [] :keyword code-policy-format)
+(defn decision-format [] :keyword code-decision-format)
+(defn max-authority-entries [] :i64 code-max-authority-entries)
+
+(def ^:private context-fields
+       #{:format :principal :grant :local-policy :audience :now})
+(def ^:private principal-fields #{:format :id :proof-sha256})
+(def ^:private grant-fields
+       #{:format :id :subject :audience :not-before :expires :capabilities
+         :evidence-sha256})
+(def ^:private policy-fields
+       #{:format :id :audience :principals :capabilities})
+(def ^:private scope-fields #{:capability :action :resource})
+(def ^:private decision-fields
+       #{:format :principal :audience :capability :action :resource :grant-id
+         :policy-id :grant-evidence-sha256 :principal-proof-sha256})
+
+(defn- fail-with! [message :string data :document] :document
+     (throw (ex-info message (assoc data :phase (document-keyword :authority)))))
+(defn- fail-bare! [message :string] :document
+     (fail-with! message (document-map)))
+(defn- fail-scope! [message :string scope :document] :document
+     (fail-with! message (assoc (document-map) :scope scope)))
+(defn- fail-capability! [message :string capability :document] :document
+     (fail-with! message (assoc (document-map) :capability capability)))
+(defn- fail! [message data]
+     (throw (ex-info message (assoc data :phase :authority))))
+
+(defn- has-all? [value :document tag :keyword] :bool
+    (cond
+      (= tag :scope)
+      (and (= 3 (count value))
+           (contains? value :capability) (contains? value :action)
+           (contains? value :resource))
+      (= tag :principal)
+      (and (= 3 (count value))
+           (contains? value :format) (contains? value :id)
+           (contains? value :proof-sha256))
+      (= tag :grant)
+      (and (= 8 (count value))
+           (contains? value :format) (contains? value :id)
+           (contains? value :subject) (contains? value :audience)
+           (contains? value :not-before) (contains? value :expires)
+           (contains? value :capabilities) (contains? value :evidence-sha256))
+      (= tag :policy)
+      (and (= 5 (count value))
+           (contains? value :format) (contains? value :id)
+           (contains? value :audience) (contains? value :principals)
+           (contains? value :capabilities))
+      (= tag :context)
+      (and (= 6 (count value))
+           (contains? value :format) (contains? value :principal)
+           (contains? value :grant) (contains? value :local-policy)
+           (contains? value :audience) (contains? value :now))
+      :else
+      (and (= 10 (count value))
+           (contains? value :format) (contains? value :principal)
+           (contains? value :audience) (contains? value :capability)
+           (contains? value :action) (contains? value :resource)
+           (contains? value :grant-id) (contains? value :policy-id)
+           (contains? value :grant-evidence-sha256)
+           (contains? value :principal-proof-sha256))))
+
+(defn- exact-map? [value :document fields :keyword] :bool
+    (and (map? value) (has-all? value fields)))
+
+;; Character classes are spelled as scans over one-character substrings, not
+;; host regex literals: a `#"..."` is host data and the Kotoba project route
+;; refuses it (kotoba.error/host-regex-literal). Each predicate accepts exactly
+;; the language of the regex it replaced (named beside it).
+
+(defn- all-in? [value :string start :i64 alphabet :string] :bool
+     (loop [i start]
+       (cond (= i (string-byte-length value)) true
+             (str/includes? alphabet (string-substring value i (inc i))) (recur (inc i))
+             :else false)))
+
+;; was (re-find #"[\u0000-\u001f\u007f]" value): a code unit below U+0020
+;; compares below " ", and DEL is named.
+(defn- control-free? [value :string] :bool
+     (loop [b 0]
+       (cond (= b 32) (< (string-find-byte value 127 0) 0)
+             (< (string-find-byte value b 0) 0) (recur (inc b))
+             :else false)))
+
+(defn- bounded-text? [value :string limit :i64] :bool
+     (and (not (str/blank? value))
+          (<= (string-length value) limit)
+          (control-free? value)))
+
+(defn- bounded-string? [value :document limit :i64] :bool
+     (match-option (document-string-value value) [:option :string]
+       (none false)
+       (some text (bounded-text? text limit))))
+
+;; was (re-matches #"[0-9a-f]{64}" value)
+(defn- sha256? [value :document] :bool
+     (match-option (document-string-value value) [:option :string]
+       (none false)
+       (some text (and (= 64 (string-byte-length text))
+                       (all-in? text 0 "0123456789abcdef")))))
+
+;; was (re-matches #"[a-z][a-z0-9+.-]*:.+" value). `.` is any code unit but a
+;; line terminator; bounded-string? has already refused \n and \r, and
+;; U+2028 / U+2029 are refused here by name. (U+0085 was a terminator for
+;; java.util.regex and not for JavaScript; it is now accepted on both.)
+(defn- principal-text? [value :string] :bool
+     (and (bounded-text? value 512)
+          (let [colon (string-find-byte value 58 0)]
+            (and (<= 1 colon)
+                 (< (inc colon) (string-byte-length value))
+                 (str/includes? "abcdefghijklmnopqrstuvwxyz" (string-substring value 0 1))
+                 (all-in? (string-substring value 0 colon) 1 "abcdefghijklmnopqrstuvwxyz0123456789+.-")
+                 (not (str/includes? value " "))
+                 (not (str/includes? value " "))))))
+(defn- principal-id? [value :document] :bool
+     (match-option (document-string-value value) [:option :string]
+       (none false)
+       (some text (principal-text? text))))
+
+(defn- capability-id? [value :document] :bool
+     (match-option (document-i64-value value) [:option :i64]
+       (none false)
+       (some n (and (<= 0 n) (<= n 255)))))
+
+(defn- qualified-action? [value :document] :bool
+     (match-option (document-keyword-value value) [:option :keyword]
+       (none false)
+       (some k (str/includes? (document-edn-print (document-keyword k)) "/"))))
+
+(defn- keyword-is? [value :document expected :keyword] :bool
+     (match-option (document-keyword-value value) [:option :keyword]
+       (none false)
+       (some k (= k expected))))
+
+(defn- doc-get [value :document key :keyword] :document
+     (match-option (get value key) [:option :document]
+       (none (document-null))
+       (some found found)))
+
+(defn- scope-ok? [scope :document] :bool
+     (and (exact-map? scope :scope)
+          (capability-id? (doc-get scope :capability))
+          (qualified-action? (doc-get scope :action))
+          (bounded-string? (doc-get scope :resource) 2048)))
+
+(defn validate-scope!
+  [scope :document]
+  :document
+  (when-not (scope-ok? scope)
+    (fail-scope! "authority capability scope rejected" scope))
+  scope)
+
+(defn- decision-ok? [decision :document] :bool
+     (and (exact-map? decision :decision)
+          (keyword-is? (doc-get decision :format) code-decision-format)
+          (principal-id? (doc-get decision :principal))
+          (bounded-string? (doc-get decision :audience) 512)
+          (capability-id? (doc-get decision :capability))
+          (qualified-action? (doc-get decision :action))
+          (bounded-string? (doc-get decision :resource) 2048)
+          (bounded-string? (doc-get decision :grant-id) 512)
+          (bounded-string? (doc-get decision :policy-id) 512)
+          (sha256? (doc-get decision :grant-evidence-sha256))
+          (sha256? (doc-get decision :principal-proof-sha256))))
+
+(defn validate-decision!
+  [decision :document]
+  :document
+  (when-not (decision-ok? decision)
+    (fail-bare! "authority decision rejected"))
+  decision)
+
+(defn- principal-ok? [principal :document] :bool
+     (and (exact-map? principal :principal)
+          (keyword-is? (doc-get principal :format) code-principal-format)
+          (principal-id? (doc-get principal :id))
+          (sha256? (doc-get principal :proof-sha256))))
+
+(defn- scope-acc [acc :i64 scope :document] :i64
+     (if (and (= acc 1) (scope-ok? scope)) 1 0))
+
+(defn- scope-set? [value :document] :bool
+     (and (or (set? value) (vector? value))
+          (<= (count value) code-max-authority-entries)
+          (= 1 (reduce scope-acc 1 value))))
+
+(defn- i64-of [value :document] :i64
+     (match-option (document-i64-value value) [:option :i64]
+       (none 0)
+       (some n n)))
+
+(defn- principal-acc [acc :i64 value :document] :i64
+     (if (and (= acc 1) (principal-id? value)) 1 0))
+
+(defn- principal-set? [value :document] :bool
+     (and (or (set? value) (vector? value))
+          (<= (count value) code-max-authority-entries)
+          (= 1 (reduce principal-acc 1 value))))
+
+(defn- context-head-ok? [context :document] :bool
+     (and (exact-map? context :context)
+          (keyword-is? (doc-get context :format) code-context-format)
+          (bounded-string? (doc-get context :audience) 512)
+          (integer? (doc-get context :now))))
+
+(defn- grant-ok? [grant :document principal :document audience :document
+                     now :i64] :bool
+     (and (exact-map? grant :grant)
+          (keyword-is? (doc-get grant :format) code-grant-format)
+          (bounded-string? (doc-get grant :id) 512)
+          (document-equal? (doc-get grant :subject) (doc-get principal :id))
+          (document-equal? (doc-get grant :audience) audience)
+          (integer? (doc-get grant :not-before))
+          (integer? (doc-get grant :expires))
+          (<= (i64-of (doc-get grant :not-before)) now)
+          (< now (i64-of (doc-get grant :expires)))
+          (scope-set? (doc-get grant :capabilities))
+          (sha256? (doc-get grant :evidence-sha256))))
+
+(defn- policy-ok? [policy :document principal :document audience :document]
+     :bool
+     (and (exact-map? policy :policy)
+          (keyword-is? (doc-get policy :format) code-policy-format)
+          (bounded-string? (doc-get policy :id) 512)
+          (document-equal? (doc-get policy :audience) audience)
+          (principal-set? (doc-get policy :principals))
+          (contains? (doc-get policy :principals) (doc-get principal :id))
+          (scope-set? (doc-get policy :capabilities))))
+
+(defn- validate-context! [context :document] :document
+     (when-not (context-head-ok? context)
+       (fail-bare! "authority context rejected"))
+     (when-not (principal-ok? (doc-get context :principal))
+       (fail-bare! "verified principal rejected"))
+     (when-not (grant-ok? (doc-get context :grant)
+                          (doc-get context :principal)
+                          (doc-get context :audience)
+                          (i64-of (doc-get context :now)))
+       (fail-bare! "delegated authority grant rejected"))
+     (when-not (policy-ok? (doc-get context :local-policy)
+                           (doc-get context :principal)
+                           (doc-get context :audience))
+       (fail-bare! "local authority policy rejected"))
+     context)
+
+(defn- decision-of [context :document scope :document] :document
+     (let [principal (doc-get context :principal)
+           grant (doc-get context :grant)
+           policy (doc-get context :local-policy)]
+       (-> (document-map)
+           (assoc :format (document-keyword code-decision-format))
+           (assoc :principal (doc-get principal :id))
+           (assoc :audience (doc-get context :audience))
+           (assoc :capability (doc-get scope :capability))
+           (assoc :action (doc-get scope :action))
+           (assoc :resource (doc-get scope :resource))
+           (assoc :grant-id (doc-get grant :id))
+           (assoc :policy-id (doc-get policy :id))
+           (assoc :grant-evidence-sha256 (doc-get grant :evidence-sha256))
+           (assoc :principal-proof-sha256 (doc-get principal :proof-sha256)))))
+
+(defn- statically-allowed? [static-allow [:set :i64] capability :i64] :bool
+     (contains? static-allow capability))
+
+(defn- scope-in? [scopes :document scope :document] :bool
+     (contains? scopes scope))
+
+(defn intersect!
+  "Returns a sealed decision only when the exact dynamic scope is admitted by
+  the checked program, delegated grant and local policy."
+  [context :document static-allow [:set :i64] scope :document]
+  :document
+  (let [checked-context (validate-context! context)
+           checked-scope (validate-scope! scope)
+           capability (doc-get scope :capability)]
+       (when-not (statically-allowed? static-allow (i64-of capability))
+         (fail-capability! "capability is outside the checked program authority"
+                           capability))
+       (when-not (scope-in? (doc-get (doc-get context :grant) :capabilities) scope)
+         (fail-scope! "capability is outside delegated authority" scope))
+       (when-not (scope-in? (doc-get (doc-get context :local-policy) :capabilities) scope)
+         (fail-scope! "capability is outside local authority policy" scope))
+       (validate-decision! (decision-of context scope))))

@@ -1,0 +1,222 @@
+(ns kotoba.compiler.bounded-edn
+  "Bounded reading of EDN and source text, on both compiler hosts.
+
+  This was `.clj` until 2026-09-11, and it was the first leaf in the
+  reverse-topological order of what still forces `bin/amu` onto the JVM
+  (`docs/jvm-route-topology.edn`): every JVM-only command reads its input
+  through here, and nothing here is about the JVM -- it is a byte ceiling, a
+  UTF-8 decode that refuses malformed input, a preflight over the text, and
+  a walk over the value. The bounds are the contract; the host is not.
+
+  On `:clj` the implementation is the one that was here, byte for byte
+  inside the reader conditionals. On `:cljs` the bytes come through
+  `kotoba.compiler.nbb.io`'s bounded, no-follow, growth-detecting read, and
+  the EDN is read with `kotoba.compiler.kotoba-reader` -- the reader the rest
+  of this compiler uses on that host, which returns a bigint for every integer
+  token. That is deliberate and it is the same choice
+  `kotoba.compiler.nbb.cli-support/read-artifact-file!` records: `cljs.reader`
+  returns a Number, and a Number cannot hold an i64 (the first SHA-512 round
+  constant came back off by 774 through it). The two hosts therefore hand
+  back different representations of the same integer, and every consumer
+  that compares one has to say so with `kotoba.verifier/guest-integer?`
+  rather than `integer?` -- `kotoba.verifier.signing` learned that on
+  2026-09-11 (kotoba-verifier f1efb423)."
+  {:kotoba/export [max-edn-bytes max-source-bytes read-edn-text read-edn-text-limits read-file read-reader-text-limits read-text-file]}
+  (:refer-clojure :exclude [read-string])
+  (:require [kotoba.compiler.kotoba-reader :as kr]
+                         [kotoba.compiler.decimal-text :as decimal-text]
+                         [kotoba.compiler.text-bytes :as text-bytes])
+  ;; Kotoba: an EDN value is the recursive `:form/r` record of kotoba.form
+  ;; (the same schema, so the same type), and the reader's answer is the
+  ;; twin's `:kotoba.reader/out`. Nothing here needs kotoba.form's functions.
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                                  [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
+                        :kotoba.reader/out [:record :kotoba.reader/out
+                                            [[:forms [:list [:ref :form/r]]]
+                                             [:err :string]
+                                             [:at :i64]]]})
+  )
+
+;; Kotoba: an exported constant is a function returning it, and the bounds are
+;; constants of the module, so all six are functions here.
+(defn max-edn-bytes [] :i64 8388608)
+(defn max-source-bytes [] :i64 1048576)
+(defn- max-depth [] :i64 128)
+(defn- max-token-chars [] :i64 4096)
+(defn- max-nodes [] :i64 200000)
+(defn- max-string-chars [] :i64 1048576)
+
+;; Kotoba: the refusal carries its phase only. The data map of the host
+;; (kind, limit, path) is an open map merged at run time; a Kotoba raise takes
+;; a keyword-keyed literal.
+(defn- reject! [message :string] :string
+     (throw (ex-info message {:phase :decode})))
+
+;; A Kotoba raise has the type its position needs, and an `if` needs equal
+;; branch types, so a refusal is spelled once per result type it stands in.
+(defn- reject-bytes! [message :string] :bytes
+     (throw (ex-info message {:phase :decode})))
+(defn- reject-form! [message :string] [:ref :form/r]
+     (throw (ex-info message {:phase :decode})))
+;; The reader's own refusals keep the phase the host reader gives them.
+(defn- reject-read! [message :string] [:ref :form/r]
+     (throw (ex-info message {:phase :read})))
+
+(defn- read-bytes [path :string limit :i64 kind :keyword] :bytes
+     (if (= 0 (string-byte-length path))
+       (reject-bytes! "input path is required")
+       (if (not (= "1" (fs/app-data (str path "EXISTS_SEP"))))
+         (reject-bytes! "input could not be read")
+         (let [stat (fs/app-data (str path "STAT_SEP"))
+               fields (if (= 0 (string-byte-length stat)) (vector-i64) (decimal-text/fields stat))]
+           (if (or (< (vector-count fields) 4) (not (= 0 (vector-at fields 3))))
+             (reject-bytes! "input must be a regular file")
+             (let [data (fs/app-data-bytes path)]
+               (if (> (bytes-count data) limit)
+                 (reject-bytes! "input exceeds byte limit")
+                 data)))))))
+
+(defn- decode-utf8 [bytes :bytes kind :keyword] :string
+     (if (text-bytes/utf8-valid? bytes)
+       (string-from-utf8 bytes)
+       (throw (ex-info "input is not valid UTF-8" {:phase :decode}))))
+
+(defn read-bytes-file
+  "The raw bytes of a regular file under LIMIT -- a `byte[]` on the JVM, a
+  `Buffer` on Node, `:bytes` on Kotoba -- with this namespace's refusals (path
+  required, regular file, byte limit). For inputs that are bytes and not text: a
+  kernel object handed to `package-aiueos-boot`."
+  [path :string limit :i64]
+  :bytes
+  (read-bytes path limit :bytes))
+
+;; Kotoba has one arity per name: the bounded form is `read-text-file-limit`.
+(defn read-text-file-limit [path :string limit :i64] :string
+     (decode-utf8 (read-bytes path limit :source) :source))
+
+(defn read-text-file [path :string] :string
+     (read-text-file-limit path (max-source-bytes)))
+
+(defn- whitespace? [b :i64] :bool
+     (or (= b 32) (and (>= b 9) (<= b 13)) (and (>= b 28) (<= b 31))))
+
+(defn- preflight-code [text :string depth-limit :i64] :i64
+     (let [raw (string-to-utf8 text)
+           n (bytes-count raw)]
+       (loop [index 0 depth 0 token 0 in-string 0 escaped 0 in-comment 0]
+         (if (>= index n)
+           0
+           (let [ch (bytes-at raw index)]
+             (cond
+               (= in-comment 1)
+               (recur (+ index 1) depth 0 0 0 (if (= ch 10) 0 1))
+
+               (and (= in-string 1) (= escaped 1))
+               (recur (+ index 1) depth 0 1 0 0)
+
+               (and (= in-string 1) (= ch 92))
+               (recur (+ index 1) depth 0 1 1 0)
+
+               (= ch 10)
+               (recur (+ index 1) depth 0 in-string 0 0)
+
+               (and (= in-string 0) (= ch 59))
+               (recur (+ index 1) depth 0 0 0 1)
+
+               (= ch 34)
+               (recur (+ index 1) depth 0 (if (= in-string 1) 0 1) 0 0)
+
+               (= in-string 1)
+               (recur (+ index 1) depth 0 1 0 0)
+
+               (and (= ch 35)
+                    (or (= (+ index 1) n)
+                        (not (= (bytes-at raw (+ index 1)) 123))))
+               1
+
+               (or (= ch 40) (= ch 91) (= ch 123))
+               (if (> (+ depth 1) depth-limit)
+                 2
+                 (recur (+ index 1) (+ depth 1) 0 0 0 0))
+
+               (or (= ch 41) (= ch 93) (= ch 125))
+               (recur (+ index 1) (if (> depth 0) (- depth 1) 0) 0 0 0 0)
+
+               (or (whitespace? ch) (= ch 44))
+               (recur (+ index 1) depth 0 0 0 0)
+
+               :else
+               (if (> (+ token 1) (max-token-chars))
+                 3
+                 (recur (+ index 1) depth (+ token 1) 0 0 0))))))))
+
+nil
+
+(defn- shape-walk [x [:ref :form/r] depth :i64 nodes :i64 depth-limit :i64 node-limit :i64] :i64
+     (if (> depth depth-limit)
+       -1
+       (let [nodes (+ nodes 1)]
+         (if (> nodes node-limit)
+           -2
+           (if (and (= 3 (record-get [:ref :form/r] x :tag))
+                    (> (string-byte-length (record-get [:ref :form/r] x :s)) (max-string-chars)))
+             -3
+             (shape-walk-kids (record-get [:ref :form/r] x :kids) 0 (+ depth 1) nodes depth-limit node-limit))))))
+
+(defn- shape-walk-kids [kids [:list [:ref :form/r]] i :i64 depth :i64 nodes :i64 depth-limit :i64 node-limit :i64] :i64
+     (if (>= i (vector-count kids))
+       nodes
+       (let [r (shape-walk (typed-list-nth [:list [:ref :form/r]] kids i) depth nodes depth-limit node-limit)]
+         (if (< r 0)
+           r
+           (shape-walk-kids kids (+ i 1) depth r depth-limit node-limit)))))
+
+nil
+
+(defn- read-one! [text :string depth-limit :i64] [:ref :form/r]
+     (let [out (kr/read-forms-bounded text depth-limit (max-token-chars))
+           err (record-get [:ref :kotoba.reader/out] out :err)
+           forms (record-get [:ref :kotoba.reader/out] out :forms)
+           n (vector-count forms)]
+       (if (> (string-byte-length err) 0)
+         (reject-read! err)
+         (if (= n 0)
+           (reject-form! "EDN input is empty")
+           (if (> n 1)
+             (reject-form! "EDN input contains trailing forms")
+             (typed-list-nth [:list [:ref :form/r]] forms 0))))))
+
+(defn read-reader-text-limits [text :string node-limit :i64 depth-limit :i64] [:ref :form/r]
+     (let [value (read-one! text depth-limit)
+           walked (shape-walk value 0 0 depth-limit node-limit)]
+       (if (= walked -1)
+         (reject-form! "EDN value nesting exceeds limit")
+         (if (= walked -2)
+           (reject-form! "EDN value contains too many nodes")
+           (if (= walked -3)
+             (reject-form! "EDN string exceeds limit")
+             value)))))
+
+(defn read-edn-text [text :string] [:ref :form/r]
+     (read-edn-text-limits text (max-nodes) (max-depth)))
+
+(defn read-edn-text-limits [text :string node-limit :i64 depth-limit :i64] [:ref :form/r]
+     (let [code (preflight-code text depth-limit)]
+       (if (= code 1)
+         (reject-form! "EDN dispatch forms are forbidden")
+         (if (= code 2)
+           (reject-form! "EDN nesting exceeds limit")
+           (if (= code 3)
+             (reject-form! "EDN token exceeds limit")
+             (let [value (read-one! text depth-limit)
+                   walked (shape-walk value 0 0 depth-limit node-limit)]
+               (if (= walked -1)
+                 (reject-form! "EDN value nesting exceeds limit")
+                 (if (= walked -2)
+                   (reject-form! "EDN value contains too many nodes")
+                   (if (= walked -3)
+                     (reject-form! "EDN string exceeds limit")
+                     value)))))))))
+
+(defn read-file [path :string] [:ref :form/r]
+     (read-edn-text (decode-utf8 (read-bytes path (max-edn-bytes) :edn) :edn)))

@@ -1,0 +1,594 @@
+(ns kotoba.compiler.nbb.package-authoring
+  "Produce what `kotoba.compiler.nbb.package-lock` consumes: a signed package
+  manifest, and a `kotoba.lock.edn` resolved from a dependency declaration.
+
+  WHERE tools.deps FITS, AND WHY IT IS ONLY HERE. Choosing between conflicting
+  transitive git pins is a solved problem with an implementation
+  (`tools.deps`), and a second resolver written in nbb would be free to
+  disagree with the first. So this reuses it -- and confines it to authoring
+  time, exactly as `scripts/lock-classpath.cljk` confines it for Amu's own
+  classpath. The split is the whole point:
+
+    authoring   `amu package-lock`  resolves a closure, may use a JDK,
+                                    writes CID pins into kotoba.lock.edn
+    build       `amu compile        reads the lock. No resolver, no network,
+                 --package-lock`    no JDK, no path search.
+
+  A commit id is a content address, so once the answer is recorded it can be
+  reproduced without re-deriving it. `--jvm-free` therefore REFUSES
+  `package-lock` rather than quietly resolving some other way: the honest
+  answer to \"resolve this closure without a JDK\" is that this command does
+  not, and a fallback that produced a different closure under the same flag
+  would be worse than a refusal.
+
+  `package-manifest` needs none of that and runs on nbb alone."
+  {:kotoba/export [build-manifest fetch-package! package-fetch! package-lock! package-manifest! repo-rid write-edn!]}
+  (:require [kotoba.lang.text :as str]
+            [kotoba.compiler.nbb.fs-tree :as fs-tree]
+            [kotoba.compiler.posix-path :as posix-path]
+            [kotoba.compiler.process-wire :as process-wire]
+            [kotoba.compiler.text-bytes :as text-bytes]
+            ;; The pure codec: a 64-byte signature costs ~1 ms interpreted.
+            [kotoba.bytes :as pure-bytes]
+            ;; process/spawn (catalog wire 20; superproject adr-2609242330 S5).
+            
+            [ed25519.core :as ed25519]
+            [kotoba.lang.package-contract :as contract]
+            [multiformats.core :as mf]
+            [kotoba.compiler.nbb.cli-support :as support]
+            [kotoba.compiler.nbb.io :as io]
+            [kotoba.compiler.nbb.package-lock :as package-lock]
+            ;; Kotoba: process/spawn and the Form record (a manifest, a lock and a
+            ;; dependency declaration are EDN of unknown shape).
+            [kotoba.compiler.nbb.host.process :as process]
+                         [kotoba.form :as form])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                                  [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]}))
+
+;; ── the Kotoba reading of this file ─────────────────────────────────────────
+;; `#?(:kotoba A :default B)`: the Kotoba reader takes A, the JVM and
+;; ClojureScript readers take B, so every host body below is what it was. A
+;; manifest, a lock and a dependency declaration are the recursive `:form/r`
+;; record of kotoba.form; a command takes the argument list and answers the TEXT
+;; the host route prints (`pr-str` of its map, here `edn-text`: maps print as
+;; `{k v, k v}` without the `#:ns{}` abbreviation, as `write-edn!` requires).
+;; Differences from the host, each forced by the language:
+;;   * a refusal's data is a flat map of strings, not the host's nested map;
+;;   * `git` that cannot be started aborts where the host reads it as exit -1
+;;     (a capability call cannot be wrapped), and a failed `git clone` / `git
+;;     checkout` removes the half-made directory and then refuses -- the host's
+;;     `try/finally`, spelled out, since neither step can raise anything else;
+;;   * `package-lock!` takes `describe` as a closure
+;;     `[:fn [[:string] [:list :string]]]`;
+;;   * `build-manifest` takes its seed as a Form bytes leaf in the spec map;
+;;   * a function that can refuse is called only from a tail position or a `let`
+;;     binding (the abort ability's rule) and a loop that can refuse is a
+;;     recursion.
+
+(defn- kf [k :keyword] [:ref :form/r] (form/keyword-form k))
+
+;; A function of ANOTHER module that can abort is seen here as returning its
+;; lowered interface `[:result T E]` (abort slice 2 propagates inside one module,
+;; not across a module boundary): these unwrap it and abort again with the same
+;; error, the pattern cli_support's `read-edn-file!` uses for `bounded-edn`.
+(defn- unwrap-form [r [:result [:ref :form/r] :document]] [:ref :form/r]
+  (if (result-ok?-of [:result [:ref :form/r] :document] r)
+    (result-value-of [:result [:ref :form/r] :document] r (form/nil-form))
+    (throw (result-error-of [:result [:ref :form/r] :document] r (document-null)))))
+
+(defn- unwrap-string [r [:result :string :document]] :string
+  (if (result-ok?-of [:result :string :document] r)
+    (result-value-of [:result :string :document] r "")
+    (throw (result-error-of [:result :string :document] r (document-null)))))
+
+(defn- unwrap-i64 [r [:result :i64 :document]] :i64
+  (if (result-ok?-of [:result :i64 :document] r)
+    (result-value-of [:result :i64 :document] r 0)
+    (throw (result-error-of [:result :i64 :document] r (document-null)))))
+
+(defn- unwrap-bool [r [:result :bool :document]] :bool
+  (if (result-ok?-of [:result :bool :document] r)
+    (result-value-of [:result :bool :document] r false)
+    (throw (result-error-of [:result :bool :document] r (document-null)))))
+
+(defn- unwrap-vector [r [:result :vector-i64 :document]] :vector-i64
+  (if (result-ok?-of [:result :vector-i64 :document] r)
+    (result-value-of [:result :vector-i64 :document] r (vector-i64))
+    (throw (result-error-of [:result :vector-i64 :document] r (document-null)))))
+
+(defn- usage-error [message :string] :string (unwrap-string (support/usage-error! message)))
+
+(defn- gk [m [:ref :form/r] k :keyword] [:ref :form/r]
+  (if (form/is-map? m) (form/form-get m (form/keyword-form k)) (form/nil-form)))
+
+(defn- gs [m [:ref :form/r] k :keyword] :string
+  (let [v (gk m k)] (if (form/is-string? v) (form/string-value v) "")))
+
+(defn- truthy? [x [:ref :form/r]] :bool
+  (not (or (form/is-nil? x) (and (form/is-bool? x) (not (form/bool-value x))))))
+
+(defn- message-of [e [:ref :form/r]] :string (gs e :message))
+
+;; ---- EDN text of a Form (pr-str with *print-namespace-maps* false) ---------------
+
+(defn- edn-seq [kids [:list [:ref :form/r]] i :i64 acc :string] :string
+  (if (>= i (vector-count kids))
+    acc
+    (let [piece (edn-text (typed-list-nth [:list [:ref :form/r]] kids i))]
+      (edn-seq kids (+ i 1) (str acc (if (= i 0) "" " ") piece)))))
+
+(defn- edn-map [kids [:list [:ref :form/r]] i :i64 acc :string] :string
+  (if (>= (+ i 1) (vector-count kids))
+    acc
+    (let [k (edn-text (typed-list-nth [:list [:ref :form/r]] kids i))
+          v (edn-text (typed-list-nth [:list [:ref :form/r]] kids (+ i 1)))]
+      (edn-map kids (+ i 2) (str acc (if (= i 0) "" ", ") k " " v)))))
+
+(defn- edn-text [f [:ref :form/r]] :string
+  (let [t (form/tag-of f)]
+    (cond
+      (= t 0) "nil"
+      (= t 1) (if (form/is-true? f) "true" "false")
+      (= t 2) (let [n (form/int-value f)] (string-from-i64 n))
+      (= t 3) (document-edn-print (document-string (form/string-value f)))
+      (= t 4) (document-edn-print (document-keyword (form/keyword-value f)))
+      (= t 5) (form/symbol-value f)
+      (= t 6) (let [body (edn-seq (form/kids-of f) 0 "")] (str "(" body ")"))
+      (= t 7) (let [body (edn-seq (form/kids-of f) 0 "")] (str "[" body "]"))
+      (= t 8) (let [body (edn-seq (form/kids-of f) 0 "")] (str "#{" body "}"))
+      (= t 9) (let [body (edn-map (form/kids-of f) 0 "")] (str "{" body "}"))
+      :else (throw (ex-info "this value has no EDN text here (a float or bytes leaf)" {:phase :package-authoring})))))
+
+
+(defn write-edn!
+  "Write EDN the way this CLI's own reader will accept it back (no #:ns{} maps)."
+  [path :string value [:ref :form/r]] :i64
+  (let [text (edn-text value)]
+    (unwrap-i64 (io/write-text! path text))))
+nil
+
+(defn repo-rid
+  "A repository's identity CID: CIDv1-raw over its canonical URL bytes."
+  [url :string] :string
+  (mf/cidv1-raw (pure-bytes/utf8-encode url)))
+(defn- read-key!
+  "An Ed25519 signing key as `amu keygen` writes it, read through the bounded
+  reader: the seed's 32 bytes."
+  [path :string] :vector-i64
+  (let [key (unwrap-form (support/read-edn-file! path))
+        a (gk key :seed-hex)
+        seed (if (truthy? a) a (gk key :kotoba.key/seed-hex))]
+    (if (not (form/is-string? seed))
+      (throw (ex-info "signing key has no :seed-hex" {:phase :package-authoring :path path}))
+      (let [bytes (ed25519/unhex (form/string-value seed))]
+        (if (option-some?-of [:option :vector-i64] bytes)
+          (option-value-of [:option :vector-i64] bytes (vector-i64))
+          (throw (ex-info "signing key :seed-hex is not hexadecimal" {:phase :package-authoring :path path})))))))
+(defn- manifest-base [spec [:ref :form/r] repo-rid-text :string tree-cid :string] [:ref :form/r]
+  (let [kind (let [k (gk spec :kind)] (if (truthy? k) k (kf :library)))]
+    (form/form-map
+     (typed-list-new [:list [:ref :form/r]]
+                     (kf :kotoba.package/name) (gk spec :name)
+                     (kf :kotoba.package/version) (gk spec :version)
+                     (kf :kotoba.package/kind) kind
+                     (kf :kotoba.package/repo-rid) (form/string-form repo-rid-text)
+                     (kf :kotoba.package/source)
+                     (form/form-map (typed-list-new [:list [:ref :form/r]]
+                                                    (kf :git-commit) (gk spec :commit)
+                                                    (kf :tree-cid) (form/string-form tree-cid)))
+                     (kf :kotoba.package/capabilities) (gk spec :capabilities)
+                     (kf :kotoba.package/dependencies) (form/form-vec (form/no-forms))))))
+
+(defn- signed-manifest [base [:ref :form/r] cid :string did :string sig-text :string] [:ref :form/r]
+  (let [source (form/assoc-form (gk base :kotoba.package/source) (kf :manifest-cid) (form/string-form cid))
+        sig (form/form-map (typed-list-new [:list [:ref :form/r]]
+                                           (kf :did) (form/string-form did)
+                                           (kf :alg) (kf :ed25519)
+                                           (kf :sig) (form/string-form sig-text)))]
+    (form/assoc-form (form/assoc-form base (kf :kotoba.package/source) source)
+                     (kf :kotoba.package/signatures)
+                     (form/form-vec (form/one-form sig)))))
+
+(defn- checked-manifest [manifest [:ref :form/r]] [:ref :form/r]
+  (let [e1 (contract/package-manifest-error manifest)]
+    (if (not (form/is-nil? e1))
+      (throw (ex-info (str "generated manifest fails its own shape check: " (message-of e1))
+                      {:phase :package-authoring}))
+      (let [e2 (contract/manifest-integrity-error manifest)]
+        (if (not (form/is-nil? e2))
+          (throw (ex-info (str "generated manifest fails its own integrity check: " (message-of e2))
+                          {:phase :package-authoring}))
+          manifest)))))
+
+(defn build-manifest
+  "A self-consistent, signed manifest for the package tree at :root of SPEC (a
+  Form map with :root :name :version :kind :url :capabilities :commit and :seed,
+  the 32 seed bytes as a bytes leaf). The cid is taken over the content WITHOUT
+  the self-cid and WITHOUT signatures, written in, then signed; both contract
+  checks run before the manifest is answered."
+  [spec [:ref :form/r]] [:ref :form/r]
+  (let [seed (vector-i64-from-bytes (form/bytes-of (gk spec :seed)))
+        tree (unwrap-vector (package-lock/tree-bytes (gs spec :root)))
+        base (manifest-base spec (repo-rid (gs spec :url)) (mf/cidv1-raw tree))
+        cid (contract/compute-manifest-cid base)
+        pub (ed25519/pubkey-from-seed seed)]
+    (if (not (option-some?-of [:option :vector-i64] pub))
+      (throw (ex-info "signing seed is not 32 bytes" {:phase :package-authoring}))
+      (let [did (ed25519/did-key-from-pub (option-value-of [:option :vector-i64] pub (vector-i64)))
+            signed (ed25519/sign seed (pure-bytes/utf8-encode cid))]
+        (if (not (option-some?-of [:option :vector-i64] signed))
+          (throw (ex-info "signing seed is not 32 bytes" {:phase :package-authoring}))
+          (let [sig-text (pure-bytes/base64-encode (option-value-of [:option :vector-i64] signed (vector-i64)))
+                manifest (signed-manifest base cid did sig-text)]
+            (checked-manifest manifest)))))))
+(defn- git!
+  "Run git with ARGS through process/spawn: {:exit n :out stdout}. git's stderr
+  is this process's own (the wire captures stdout only)."
+  [args [:list :string]] [:ref :form/r]
+  (let [request (unwrap-string (process-wire/request "git" args))
+        answer (process/spawn request)
+        code (unwrap-i64 (process-wire/answer-exit answer))
+        out (unwrap-string (process-wire/answer-out answer))]
+    (form/form-map (typed-list-new [:list [:ref :form/r]]
+                                   (kf :exit) (form/int-form code) (kf :out) (form/string-form out)))))
+
+(defn- git-ok? [r [:ref :form/r]] :bool
+  (= 0 (form/int-value (gk r :exit))))
+
+(defn- git-head
+  "`git -C DIR rev-parse HEAD` trimmed, or none when it does not succeed."
+  [dir :string] [:option :string]
+  (let [r (git! (typed-list-new [:list :string] "-C" dir "rev-parse" "HEAD"))]
+    (if (git-ok? r)
+      (option-some-of [:option :string] (str/trim (gs r :out)))
+      (option-none-of [:option :string]))))
+(defn- required [args [:list :string] flag :string] :string
+  (let [o (support/option args flag)]
+    (if (option-some?-of [:option :string] o)
+      (option-value-of [:option :string] o "")
+      (usage-error (str flag " is required")))))
+
+(defn- commit-of [args [:list :string] root :string] :string
+  (let [o (support/option args "--commit")]
+    (if (option-some?-of [:option :string] o)
+      (option-value-of [:option :string] o "")
+      (let [h (git-head root)]
+        (if (option-some?-of [:option :string] h)
+          (option-value-of [:option :string] h "")
+          (usage-error
+           (str "--commit is required: " root " is not a git checkout, "
+                "so the commit a manifest pins cannot be read from it")))))))
+
+(defn- flag-keyword [text :string] [:ref :form/r]
+  (if (str/starts-with? text ":")
+    (form/keyword-form (keyword-from-string (string-substring text 1 (string-byte-length text))))
+    (form/keyword-form (keyword-from-string text))))
+
+(defn- capability-forms [texts [:list :string] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count texts))
+    acc
+    (capability-forms texts (+ i 1) (form/append-form acc (flag-keyword (typed-list-nth [:list :string] texts i))))))
+
+(defn- signature-dids [manifest [:ref :form/r]] [:ref :form/r]
+  (let [sigs (gk manifest :kotoba.package/signatures)
+        n (form/count-of sigs)]
+    (form/form-vec
+     (loop [i 0 acc (form/no-forms)]
+       (if (>= i n)
+         acc
+         (recur (+ i 1) (form/append-form acc (gk (form/nth-of sigs i) :did))))))))
+
+(defn package-manifest!
+  "amu package-manifest <root> --name <n> --version <v> --url <git url>
+                        --key key.edn [--kind :library] [--output <file>]
+  Answers the text the host route prints."
+  [args [:list :string]] :string
+  (if (< (vector-count args) 2)
+    (usage-error "package-manifest <package root> is required")
+    (let [root (typed-list-nth [:list :string] args 1)
+          commit (commit-of args root)
+          name (required args "--name")
+          version (required args "--version")
+          kopt (support/option args "--kind")
+          kind (if (option-some?-of [:option :string] kopt)
+                 (flag-keyword (option-value-of [:option :string] kopt ""))
+                 (form/nil-form))
+          url (required args "--url")
+          caps (capability-forms (support/options args "--capability") 0 (form/no-forms))
+          key-path (required args "--key")
+          seed (read-key! key-path)
+          manifest (build-manifest
+                    (form/form-map
+                     (typed-list-new [:list [:ref :form/r]]
+                                     (kf :root) (form/string-form root)
+                                     (kf :name) (form/string-form name)
+                                     (kf :version) (form/string-form version)
+                                     (kf :kind) kind
+                                     (kf :url) (form/string-form url)
+                                     (kf :capabilities) (form/form-vec caps)
+                                     (kf :commit) (form/string-form commit)
+                                     (kf :seed) (form/bytes-form (bytes-from-vector-i64 seed)))))
+          oopt (support/option args "--output")
+          output (if (option-some?-of [:option :string] oopt)
+                   (option-value-of [:option :string] oopt "")
+                   (posix-path/join root (package-lock/manifest-file-name)))
+          written (write-edn! output manifest)
+          source (gk manifest :kotoba.package/source)]
+      (edn-text
+       (form/form-map
+        (typed-list-new [:list [:ref :form/r]]
+                        (kf :ok) (form/bool-form true)
+                        (kf :format) (kf :kotoba.package-manifest/v1)
+                        (kf :output) (form/string-form output)
+                        (kf :package) (gk manifest :kotoba.package/name)
+                        (kf :version) (gk manifest :kotoba.package/version)
+                        (kf :manifest-cid) (gk source :manifest-cid)
+                        (kf :tree-cid) (gk source :tree-cid)
+                        (kf :signers) (signature-dids manifest)))))))
+(defn- git-run [args [:list :string]] [:ref :form/r] (git! args))
+
+(defn- outcome-map [name :string commit :string dest :string outcome :keyword] [:ref :form/r]
+  (form/form-map (typed-list-new [:list [:ref :form/r]]
+                                 (kf :name) (form/string-form name) (kf :commit) (form/string-form commit)
+                                 (kf :root) (form/string-form dest) (kf :outcome) (kf outcome))))
+
+(defn- clone-and-checkout [name :string url :string commit :string dest :string] [:ref :form/r]
+  (let [clone (git-run (typed-list-new [:list :string] "clone" "--quiet" "--no-checkout" url dest))]
+    (if (not (git-ok? clone))
+      (let [removed (fs-tree/remove-tree! dest)]
+        (throw (ex-info "git clone failed" {:phase :package-authoring :dependency name :url url})))
+      (let [checkout (git-run (typed-list-new [:list :string] "-C" dest "checkout" "--quiet" commit))]
+        (if (not (git-ok? checkout))
+          (let [removed (fs-tree/remove-tree! dest)]
+            (throw (ex-info "the pinned commit is not in the fetched repository"
+                            {:phase :package-authoring :dependency name :commit commit})))
+          (outcome-map name commit dest :fetched))))))
+
+(defn fetch-package!
+  "Materialise one declared package (a Form map with :name :url :commit) at its
+  pinned commit under `<packages>/<name>/<commit>`. Full history; content
+  addressed and idempotent."
+  [packages-dir :string spec [:ref :form/r]] [:ref :form/r]
+  (let [name (gs spec :name)
+        commit (gs spec :commit)
+        url (gk spec :url)
+        dest (package-lock/dependency-root
+              packages-dir
+              (form/form-map (typed-list-new [:list [:ref :form/r]]
+                                             (kf :dep/name) (form/string-form name)
+                                             (kf :dep/commit) (form/string-form commit))))]
+    (if (fs-tree/exists? dest)
+      (let [head (git-run (typed-list-new [:list :string] "-C" dest "rev-parse" "HEAD"))]
+        (cond
+          (not (git-ok? head))
+          (form/assoc-form (outcome-map name commit dest :present-unverified)
+                           (kf :note) (form/string-form "already present, but not a git checkout -- HEAD not checked"))
+          (string=? commit (str/trim (gs head :out)))
+          (outcome-map name commit dest :already-present)
+          :else
+          (throw (ex-info "a different commit is already materialised at this path"
+                          {:phase :package-authoring :dependency name :expected commit
+                           :actual (str/trim (gs head :out)) :root dest}))))
+      (if (not (form/is-string? url))
+        (throw (ex-info "package declares no :git/url, so it cannot be fetched"
+                        {:phase :package-authoring :dependency name}))
+        (let [made (unwrap-bool (fs-tree/make-directories! (posix-path/dirname dest)))]
+          (clone-and-checkout name (form/string-value url) commit dest))))))
+(defn- opt-required [args [:list :string] flag :string usage :string] :string
+  (let [o (support/option args flag)]
+    (if (option-some?-of [:option :string] o)
+      (option-value-of [:option :string] o "")
+      (usage-error usage))))
+
+(defn- package-names [m [:ref :form/r] i :i64 acc [:set :string]] [:set :string]
+  (let [ks (form/kids-of m)]
+    (if (>= i (vector-count ks))
+      acc
+      (let [k (typed-list-nth [:list [:ref :form/r]] ks i)]
+        (package-names m (+ i 2) (if (form/is-string? k) (conj acc (form/string-value k)) acc))))))
+
+(defn- fetch-spec [name :string spec [:ref :form/r]] [:ref :form/r]
+  (let [sha (gk spec :git/sha)]
+    (if (not (truthy? sha))
+      (throw (ex-info "package declares no :git/sha" {:phase :package-authoring :dependency name}))
+      (form/form-map (typed-list-new [:list [:ref :form/r]]
+                                     (kf :name) (form/string-form name)
+                                     (kf :url) (gk spec :git/url)
+                                     (kf :commit) sha)))))
+
+(defn- fetch-all [packages :string pm [:ref :form/r] names [:set :string] i :i64 acc [:list [:ref :form/r]]]
+  [:list [:ref :form/r]]
+  (if (>= i (count names))
+    acc
+    (let [name (typed-set-nth [:set :string] names i)
+          spec (fetch-spec name (form/form-get pm (form/string-form name)))
+          result (fetch-package! packages spec)]
+      (fetch-all packages pm names (+ i 1) (form/append-form acc result)))))
+
+(defn- count-outcome [results [:list [:ref :form/r]] outcome [:ref :form/r] i :i64 acc :i64] :i64
+  (if (>= i (vector-count results))
+    acc
+    (count-outcome results outcome (+ i 1)
+                   (if (form/eq (gk (typed-list-nth [:list [:ref :form/r]] results i) :outcome) outcome) (+ acc 1) acc))))
+
+(defn- without-notes [results [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count results))
+    acc
+    (without-notes results (+ i 1)
+                   (form/append-form acc (form/dissoc-form (typed-list-nth [:list [:ref :form/r]] results i) (kf :note))))))
+
+(defn package-fetch!
+  "amu package-fetch --deps kotoba.deps.edn --packages <dir>. Populates the
+  directory `--package-lock` reads from; the only command here that touches the
+  network. Answers the text the host route prints."
+  [args [:list :string]] :string
+  (let [deps-path (opt-required args "--deps" "--deps <kotoba.deps.edn> is required")
+        packages (opt-required args "--packages" "--packages <dir> is required")
+        declaration (unwrap-form (support/read-edn-file! deps-path))
+        pm (gk declaration :packages)]
+    (cond
+      (not (form/is-map? pm))
+      (throw (ex-info "dependency declaration has no :packages map" {:phase :package-authoring :path deps-path}))
+      (= 0 (form/count-of pm))
+      (throw (ex-info "dependency declaration pins nothing" {:phase :package-authoring :path deps-path}))
+      :else
+      (let [made (unwrap-bool (fs-tree/make-directories! packages))
+            names (package-names pm 0 (typed-set-new [:set :string]))
+            results (fetch-all packages pm names 0 (form/no-forms))
+            declared (vector-count results)
+            fetched (count-outcome results (kf :fetched) 0 0)
+            present (count-outcome results (kf :already-present) 0 0)
+            unverified (count-outcome results (kf :present-unverified) 0 0)]
+        (edn-text
+         (form/form-map
+          (typed-list-new [:list [:ref :form/r]]
+                          (kf :ok) (form/bool-form true)
+                          (kf :format) (kf :kotoba.package-fetch/v1)
+                          (kf :packages) (form/string-form packages)
+                          (kf :fetched) (form/form-vec (without-notes results 0 (form/no-forms)))
+                          (kf :scanned) (form/string-form
+                                         (str "SCANNED\t" (string-from-i64 declared) " declared\tfetched=" (string-from-i64 fetched)
+                                              "\tpresent=" (string-from-i64 present) "\tunverified=" (string-from-i64 unverified))))))))))
+;; ── the lock ────────────────────────────────────────────────────────────────
+
+(defn- describe-all [describe [:fn [[:string] [:list :string]]] root :string entries [:ref :form/r] i :i64 acc [:set :string]]
+  [:set :string]
+  (if (>= i (form/count-of entries))
+    acc
+    (let [path (posix-path/join root (form/string-value (form/nth-of entries i)))
+          cids (describe path)]
+      (describe-all describe root entries (+ i 1) (add-all acc cids 0)))))
+
+(defn- add-all [acc [:set :string] xs [:list :string] i :i64] [:set :string]
+  (if (>= i (vector-count xs))
+    acc
+    (add-all (conj acc (typed-list-nth [:list :string] xs i)) xs (+ i 1))))
+
+(defn- string-forms-of [xs [:set :string] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (count xs))
+    acc
+    (string-forms-of xs (+ i 1) (form/append-form acc (form/string-form (typed-set-nth [:set :string] xs i))))))
+
+(defn- dep-entry
+  [describe [:fn [[:string] [:list :string]]] packages-dir :string name :string version :string commit :string
+   url [:ref :form/r] entries [:ref :form/r]] [:ref :form/r]
+  (let [root (package-lock/dependency-root
+              packages-dir
+              (form/form-map (typed-list-new [:list [:ref :form/r]]
+                                             (kf :dep/name) (form/string-form name)
+                                             (kf :dep/commit) (form/string-form commit))))]
+    (if (not (fs-tree/exists? root))
+      (throw (ex-info "dependency is not materialised" {:phase :package-authoring :dependency name :expected root}))
+      (let [manifest-path (posix-path/join root (package-lock/manifest-file-name))]
+        (if (not (fs-tree/exists? manifest-path))
+          (throw (ex-info "dependency carries no package manifest"
+                          {:phase :package-authoring :dependency name :expected manifest-path}))
+          (let [manifest (unwrap-form (support/read-edn-file! manifest-path))
+                cids (describe-all describe root entries 0 (typed-set-new [:set :string]))]
+            (if (= 0 (count cids))
+              (throw (ex-info "dependency exports no definitions to pin" {:phase :package-authoring :dependency name}))
+              (let [kind (let [k (gk manifest :kotoba.package/kind)] (if (truthy? k) k (kf :library)))
+                    source (gk manifest :kotoba.package/source)
+                    sigs (gk manifest :kotoba.package/signatures)
+                    git-ref (let [r (gk url :ref)] (if (truthy? r) r (form/string-form "refs/heads/main")))]
+                (form/form-map
+                 (typed-list-new [:list [:ref :form/r]]
+                                 (kf :dep/name) (form/string-form name)
+                                 (kf :dep/version) (form/string-form version)
+                                 (kf :dep/kind) kind
+                                 (kf :dep/repo-rid) (gk manifest :kotoba.package/repo-rid)
+                                 (kf :dep/ref) git-ref
+                                 (kf :dep/commit) (form/string-form commit)
+                                 (kf :dep/tree-cid) (gk source :tree-cid)
+                                 (kf :dep/manifest-cid) (gk source :manifest-cid)
+                                 (kf :dep/signers) (signature-dids manifest)
+                                 (kf :dep/capabilities) (let [c (gk manifest :kotoba.package/capabilities)]
+                                                          (form/form-vec (if (form/is-nil? c) (form/no-forms) (form/kids-of c))))
+                                 (kf :dep/definition-cids) (form/form-vec (string-forms-of cids 0 (form/no-forms)))))))))))))
+
+(defn- lock-deps [describe [:fn [[:string] [:list :string]]] packages :string pm [:ref :form/r] names [:set :string]
+                  i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (count names))
+    acc
+    (let [name (typed-set-nth [:set :string] names i)
+          spec (form/form-get pm (form/string-form name))
+          version (gk spec :version)
+          sha (gk spec :git/sha)
+          entries (gk spec :entries)]
+      (if (not (truthy? version))
+        (throw (ex-info "package declares no :version" {:phase :package-authoring :dependency name}))
+        (if (not (truthy? sha))
+          (throw (ex-info "package declares no :git/sha" {:phase :package-authoring :dependency name}))
+          (if (= 0 (form/count-of entries))
+            (throw (ex-info "package declares no :entries" {:phase :package-authoring :dependency name}))
+            (let [entry (dep-entry describe packages name (form/string-value version) (form/string-value sha)
+                                   (gk spec :git/url) entries)]
+              (lock-deps describe packages pm names (+ i 1) (form/append-form acc entry)))))))))
+
+(defn- declared-capabilities [deps [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count deps))
+    acc
+    (declared-capabilities deps (+ i 1) (distinct-append acc (form/kids-of (gk (typed-list-nth [:list [:ref :form/r]] deps i) :dep/capabilities)) 0))))
+
+(defn- distinct-append [acc [:list [:ref :form/r]] xs [:list [:ref :form/r]] i :i64] [:list [:ref :form/r]]
+  (if (>= i (vector-count xs))
+    acc
+    (let [x (typed-list-nth [:list [:ref :form/r]] xs i)]
+      (distinct-append (if (has-form? acc x 0) acc (form/append-form acc x)) xs (+ i 1)))))
+
+(defn- has-form? [xs [:list [:ref :form/r]] x [:ref :form/r] i :i64] :bool
+  (cond (>= i (vector-count xs)) false
+        (form/eq (typed-list-nth [:list [:ref :form/r]] xs i) x) true
+        :else (has-form? xs x (+ i 1))))
+
+(defn- lock-summary [deps [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count deps))
+    acc
+    (let [d (typed-list-nth [:list [:ref :form/r]] deps i)]
+      (lock-summary deps (+ i 1)
+                    (form/append-form acc
+                                      (form/form-map (typed-list-new [:list [:ref :form/r]]
+                                                                     (kf :name) (gk d :dep/name)
+                                                                     (kf :version) (gk d :dep/version)
+                                                                     (kf :commit) (gk d :dep/commit)
+                                                                     (kf :definitions) (form/int-form (form/count-of (gk d :dep/definition-cids))))))))))
+
+(defn package-lock!
+  "amu package-lock --deps kotoba.deps.edn --packages <dir> --output kotoba.lock.edn
+  DESCRIBE answers the definition CIDs of one entry module path. Every field
+  written into the lock is read from the dependency's own signed manifest or
+  computed from its tree. Answers the text the host route prints."
+  [describe [:fn [[:string] [:list :string]]] args [:list :string]] :string
+  (let [deps-path (opt-required args "--deps" "--deps <kotoba.deps.edn> is required")
+        packages (opt-required args "--packages" "--packages <dir> is required")
+        oopt (support/option args "--output")
+        output (if (option-some?-of [:option :string] oopt) (option-value-of [:option :string] oopt "") "kotoba.lock.edn")
+        declaration (unwrap-form (support/read-edn-file! deps-path))
+        pm (gk declaration :packages)]
+    (cond
+      (not (form/is-map? pm))
+      (throw (ex-info "dependency declaration has no :packages map" {:phase :package-authoring :path deps-path}))
+      (= 0 (form/count-of pm))
+      (throw (ex-info "dependency declaration pins nothing" {:phase :package-authoring :path deps-path}))
+      :else
+      (let [names (package-names pm 0 (typed-set-new [:set :string]))
+            deps (lock-deps describe packages pm names 0 (form/no-forms))
+            lock (form/form-map (typed-list-new [:list [:ref :form/r]]
+                                                (kf :kotoba.lock/version) (form/int-form 1)
+                                                (kf :deps) (form/form-vec deps)))
+            declared (declared-capabilities deps 0 (form/no-forms))
+            tc (unwrap-form (package-lock/trust-context
+                             (form/form-map (form/two-forms (kf :declared-capabilities) (form/form-vec declared)))))
+            e (contract/lockfile-error lock tc (form/form-map (form/no-forms)))]
+        (if (not (form/is-nil? e))
+          (throw (ex-info (str "generated lock fails the contract: " (message-of e)) {:phase :package-authoring}))
+          (let [written (write-edn! output lock)
+                n (vector-count deps)]
+            (edn-text
+             (form/form-map
+              (typed-list-new [:list [:ref :form/r]]
+                              (kf :ok) (form/bool-form true)
+                              (kf :format) (kf :kotoba.package-lock/v1)
+                              (kf :output) (form/string-form output)
+                              (kf :dependencies) (form/form-vec (lock-summary deps 0 (form/no-forms)))
+                              (kf :scanned) (form/string-form (str "SCANNED\t" (string-from-i64 n) " dependencies")))))))))))

@@ -1,0 +1,299 @@
+(ns kotoba.compiler.fuel-estimate
+  "T7.3: crude compile-time fuel estimate (function-entry charge model, T7.2).
+
+  Best-effort only — not a sound WCET analysis.
+
+  lang-h10 (aiueos ledger reflect-01 / rank-02): one shape of recursion IS
+  estimable from the source and is expanded here -- the bounded countdown
+  poll. A self-recursive function whose single self-call passes `(- p 1)`
+  or `(+ p 1)` for a parameter `p` that a guarding `if` compares against an
+  integer literal, called elsewhere with an integer literal for `p`, costs
+  `entries x (1 + non-self call sites)` at that call site, where `entries`
+  is the number of function entries the countdown makes before the guard
+  fires. Every other recursion keeps the old answer and is reported as
+  `:unbounded`. The aiueos kernel waits with exactly this idiom
+  (`(rx-ring-wait-command win head 8000)` under a sealed 2^20 per-boot
+  budget), and until this slice its cadence constant had to be set by
+  watching `ud2` deaths on hardware."
+  {:kotoba/export [-main estimate-hir estimate-source]}
+  (:require [kotoba.sema :as sema]
+            [kotoba.lang.text :as str]
+            ))
+
+;; `System/exit` is JVM-only and `*err*` does not exist in ClojureScript. Both
+;; appear solely in `-main` below -- the estimator itself is pure -- so the
+;; namespace only needed a portable way to leave and to write a usage line.
+;; Node's exitCode is the peer of System/exit: setting it lets the process end
+;; normally with that status, which is also what a caller of `-main` in an
+;; embedded context wants rather than a hard exit.
+;; clojure.core/some, spelled as the loop it is. In Kotoba `some` is the
+;; option constructor and a two-argument `(some pred coll)` is refused as a
+;; name collision (kotoba-sema frontend); this is the same definition as
+;; clojure.core/some -- the first logical-true (pred x), in order, stopping
+;; there -- so the host answer is unchanged on nbb and the JVM.
+(defn- first-truthy [pred coll]
+  (loop [s (seq coll)]
+    (when s
+      (or (pred (first s)) (recur (next s))))))
+
+(defn- exit! [code]
+  )
+
+;; Reading the file named on the command line. `slurp` is not portable -- nbb
+;; does not provide it -- and this is a CLI entry point reading its own
+;; argument, which is host work by definition, so a reader conditional is the
+;; right shape here rather than the `fs`/IFilesystem seam that library code
+;; should take.
+(defn- read-source [path]
+  )
+
+(defn- warn! [line]
+  )
+
+(defn- walk-forms [form f]
+  (f form)
+  (cond
+    (seq? form) (doseq [x form] (walk-forms x f))
+    (vector? form) (doseq [x form] (walk-forms x f))
+    (map? form) (doseq [x (vals form)] (walk-forms x f))))
+
+(defn- call-sites
+  "Count list heads that look like function calls to simple symbols (not special)."
+  [body specials]
+  (let [n (atom 0)]
+    (walk-forms body
+                (fn [form]
+                  (when (and (seq? form)
+                             (simple-symbol? (first form))
+                             (not (contains? specials (first form))))
+                    (swap! n inc))))
+    @n))
+
+(def ^:private specials
+  '#{if if-not when when-not let do and or quote
+     string-concat string-length string-byte-length string-from-i64
+     string=? string-substring string-contains? string-split-count
+     string-fold-case string-upper string-code-point-at
+     string-join inc dec reduce map filter record-new record-get
+     + - * / quot rem mod < > <= >= = not not=
+     pair pair-first pair-second first second rest empty? cons list
+     cap-call typed-cap-call})
+
+;; ---------------------------------------------------------------------------
+;; Bounded countdown recursion (lang-h10)
+;;
+;; The recognizer is deliberately narrow. What it accepts:
+;;
+;;   (defn f [.. p ..] (.. (if (OP p LIT) A B) ..))      OP in = < <= > >=
+;;   exactly one self-call in the body, passing (- p 1) or (+ p 1) at p's
+;;   position, lexically inside A or B; the guard `if` is the one whose test
+;;   compares p to LIT (either operand order).
+;;
+;; and, at a call site in ANOTHER function, an integer literal at p's
+;; position. The number of entries is found by walking p from the literal by
+;; the step until the guard sends the call down the branch that does not
+;; recurse; a walk that does not terminate within |literal - bound| + 2 steps
+;; is not a countdown toward that bound and is left unexpanded. Anything the
+;; recognizer does not accept keeps today's answer -- reported, not guessed.
+;; `let`-shadowing of `p` and arithmetic on the other arguments are not
+;; inspected: this is the T7.3 crude model, one unit per function entry.
+
+(defn- forms-in [tree] (tree-seq coll? seq tree))
+
+(defn- int-literal
+  "An integer literal as a host number, else nil. Under nbb the frontend reads
+  i64 literals as BigInt, for which `integer?` is false and `(= 1 x)` fails;
+  the JVM reads them as Long. Measured 2026-09-07: without this the same
+  fixture answered 16007 on the JVM and 6 under nbb. Countdown literals are
+  small (poll windows), so the Number conversion is exact here."
+  [x]
+  (cond (integer? x) x
+        
+        :else nil))
+
+(defn- self-call-sites [body fname]
+  (filterv #(and (seq? %) (= fname (first %))) (forms-in body)))
+
+(defn- contains-form? [tree form]
+  (boolean (first-truthy #(identical? % form) (forms-in tree))))
+
+(defn- countdown-step
+  "`(- p 1)` -> [p -1], `(+ p 1)` -> [p 1] for a parameter symbol p."
+  [arg param-set]
+  (when (and (seq? arg) (= 3 (count arg))
+             (contains? param-set (second arg)) (= 1 (int-literal (nth arg 2))))
+    (case (first arg)
+      - [(second arg) -1]
+      + [(second arg) 1]
+      nil)))
+
+(def ^:private comparators '#{= < <= > >=})
+(def ^:private flipped '{= = < > <= >= > < >= <=})
+
+(defn- literal-comparison
+  "[op lit] when `test` is (op p LIT) or (op LIT p), normalized to p first."
+  [test p]
+  (when (and (seq? test) (= 3 (count test)) (contains? comparators (first test)))
+    (let [[op a b] test]
+      (cond (and (= a p) (int-literal b)) [op (int-literal b)]
+            (and (int-literal a) (= b p)) [(flipped op) (int-literal a)]))))
+
+(defn- compare-i64 [op a b]
+  (case op = (= a b) < (< a b) <= (<= a b) > (> a b) >= (>= a b)))
+
+(defn- guard-for
+  "The first `if` whose test compares `param` to a literal and whose then/else
+  branch contains `call`. :terminates-when says which truth value of the test
+  takes the branch WITHOUT the self-call."
+  [body param call]
+  (first
+   (keep (fn [form]
+           (when (and (seq? form) (= 'if (first form)) (<= 3 (count form) 4))
+             (let [[_ test then else] form]
+               (when-let [[op lit] (literal-comparison test param)]
+                 (cond (contains-form? else call)
+                       {:op op :bound lit :terminates-when :test-true :guard test}
+                       (contains-form? then call)
+                       {:op op :bound lit :terminates-when :test-false :guard test})))))
+         (forms-in body))))
+
+(defn- classify-recursion
+  "nil when `function` never calls itself; {:kind :unbounded} when it does in
+  any shape but the countdown; otherwise the countdown description."
+  [{:keys [name params body]}]
+  (let [calls (self-call-sites body name)]
+    (when (seq calls)
+      (or (when (= 1 (count calls))
+            (let [call (first calls)
+                  args (vec (rest call))
+                  params (vec params)
+                  param-set (set params)]
+              (when (= (count args) (count params))
+                (let [steps (keep-indexed
+                             (fn [i a]
+                               (when-let [[p step] (countdown-step a param-set)]
+                                 (when (= p (nth params i))
+                                   {:index i :param p :step step})))
+                             args)]
+                  (when (= 1 (count steps))
+                    (let [{:keys [index param step]} (first steps)]
+                      (when-let [guard (guard-for body param call)]
+                        (merge {:kind :bounded-countdown
+                                :param param :index index :step step}
+                               guard
+                               {:per-iteration (+ 1 (- (call-sites body specials)
+                                                       (count calls)))}))))))))
+          {:kind :unbounded}))))
+
+(defn- countdown-entries
+  "Function entries made by a countdown starting at `start`, or nil when the
+  walk does not reach the guard within |start - bound| + 2 steps."
+  [{:keys [op bound step terminates-when]} start]
+  (let [d (- start bound)
+        limit (+ (if (neg? d) (- d) d) 2)
+        terminates? (fn [p]
+                      (let [t (compare-i64 op p bound)]
+                        (if (= terminates-when :test-true) t (not t))))]
+    (loop [p start k 1]
+      (cond (terminates? p) k
+            (> k limit) nil
+            :else (recur (+ p step) (inc k))))))
+
+(defn- bounded-calls
+  "Every call site, in a function other than the callee, that passes an
+  integer literal at the countdown parameter of a :bounded-countdown callee."
+  [fn-list recursion]
+  (vec
+   (for [caller fn-list
+         :let [body (or (:body caller) (:form caller))]
+         :when body
+         form (forms-in body)
+         :when (and (seq? form) (symbol? (first form)))
+         :let [callee (first form)
+               info (get recursion callee)]
+         :when (and info (= :bounded-countdown (:kind info))
+                    (not= callee (:name caller)))
+         :let [arg (int-literal (nth (rest form) (:index info) nil))]
+         :when arg
+         :let [entries (countdown-entries info arg)]
+         :when entries]
+     {:callee callee :caller (:name caller) :param (:param info)
+      :argument arg :bound (:bound info) :iterations entries
+      :per-iteration (:per-iteration info)
+      :units (* entries (:per-iteration info))})))
+
+(defn estimate-hir
+  "Estimate from analyzed HIR map (sema/analyze result)."
+  [hir]
+  (let [fns (or (:functions hir) (:defs hir) [])
+        ;; frontend analyze returns :functions as map or list depending on path
+        fn-list (cond
+                  (map? fns) (vals fns)
+                  (sequential? fns) fns
+                  :else [])
+        entries (count fn-list)
+        ;; Prefer :body on each function
+        total-calls
+        (reduce + 0
+                (map (fn [function]
+                       (let [body (or (:body function) (:form function))]
+                         (if body (call-sites body specials) 0)))
+                     fn-list))
+        ;; Conservative: entry of main + one unit per static call site (each call
+        ;; charges on callee entry). Self-recursion not unrolled ...
+        crude (+ (max 1 entries) total-calls)
+        ;; ... except the bounded countdown (lang-h10): a literal call site of
+        ;; such a function was counted as 1 above; it costs `:units`.
+        recursion (into {}
+                        (keep (fn [f]
+                                (when-let [r (classify-recursion
+                                              (assoc f :body (or (:body f) (:form f))))]
+                                  [(:name f) r])))
+                        fn-list)
+        expanded (bounded-calls fn-list recursion)
+        crude (reduce + crude (map #(dec (:units %)) expanded))
+        default-budget 512]
+    {:format :kotoba.fuel-estimate/v1
+     :wbs "T7.3"
+     :model "1 unit per function entry (T7.2); static call-sites counted once; bounded countdown self-recursion expanded at literal call sites (lang-h10)"
+     :function-count entries
+     :static-call-sites total-calls
+     :recursion recursion
+     :bounded-calls expanded
+     :crude-units crude
+     :default-budget default-budget
+     :within-default-budget? (<= crude default-budget)
+     :note "Expands only bounded countdown recursion called with a literal; other recursion and loops are reported, not expanded -- adversarial depth still needs runtime fuel."}))
+
+(defn estimate-source
+  "Analyze source and return crude fuel estimate."
+  ([source] (estimate-source source nil))
+  ([source opts]
+   (let [hir (sema/analyze source opts)]
+     (assoc (estimate-hir hir)
+            :exports (:exports hir)
+            :language-profile (:language-profile hir)))))
+
+(defn -main
+  "CLI: kbb -M -m kotoba.compiler.fuel-estimate <file.kotoba>
+        kbb -M -m kotoba.compiler.fuel-estimate --expr '(defn main [] (+ 1 2))'"
+  [& args]
+  (let [[mode a] (if (= "--expr" (first args))
+                   [:expr (second args)]
+                   [:file (first args)])]
+    (when-not a
+      (warn! "usage: fuel-estimate <file.kotoba> | --expr <source>")
+      (exit! 2))
+    (let [src (if (= mode :expr) a (read-source a))
+          report (estimate-source src)]
+      (prn report)
+      ;; NOTE: both branches are 0, so this CLI cannot report an over-budget
+      ;; estimate through its exit status. That is how it was written in its
+      ;; first and only commit (b6b00ee), not a regression, and `(if pred 0 0)`
+      ;; is not how one spells "always zero" -- it reads as an unfinished
+      ;; `(if pred 0 1)`. Left exactly as it was: changing a CLI's exit
+      ;; contract is a decision for whoever wants the estimate to gate
+      ;; something, and this ns's own docstring calls the model "best-effort
+      ;; only -- not a sound WCET analysis", which is a reason someone might
+      ;; deliberately never fail on it.
+      (exit! (if (:within-default-budget? report) 0 0)))))

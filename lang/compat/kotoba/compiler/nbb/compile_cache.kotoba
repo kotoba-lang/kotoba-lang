@@ -1,0 +1,224 @@
+(ns kotoba.compiler.nbb.compile-cache
+  "Bounded in-memory content-addressed cache for one target-locked worker.
+
+  Only fully admitted/emitted (and for native, independently verified)
+  artifacts are inserted. Values never cross worker processes."
+  {:kotoba/export [key-for key-for-kind lookup lookup-stage put! put-stage! remove! sha256 sha256-bytes stage-key-for stats store-dir]}
+  (:require [kotoba.compiler.json-text :as json-text]
+            [kotoba.compiler.text-bytes :as text-bytes]
+            [kotoba.bytes :as kbytes]
+                         [sha2.core :as sha2]
+                         [kotoba.compiler.decimal-text :as decimal-text]
+                         [kotoba.compiler.nbb.io :as nbb-io]
+            ;; Abilities (superproject adr-2609242330 S5): under Kotoba
+            ;; `env/read` and `hash/sha256` are catalog operations whose
+            ;; handler comes from the target profile; under nbb the aliases
+            ;; name the mechanism-layer handlers.
+            
+            ))
+
+;; Kotoba reading: A CONTENT-ADDRESSED STORE ON DISK. A cache is mutable
+;; per-process state (volatiles) and Kotoba modules carry none, so the Kotoba
+;; cache is not a map in memory but a directory: one `<key>.bin` per entry
+;; plus `<key>.sha256`, the digest of the bytes, written AFTER the bytes (the
+;; digest file is the commit marker). The identity is byte-identical to the
+;; host reading (`key-for` hashes the same JSON text, so a Kotoba-built key
+;; names the artifact a host-built key does).
+;;
+;; The store is OPT-IN and fail-closed: its directory is named by
+;; KOTOBA_COMPILE_CACHE_DIR, and an unset variable, a directory that is not
+;; ours (owner) or is group/world writable, a missing or short entry, or a
+;; digest mismatch is a MISS, never a hit. No entry is served that was not
+;; read back with the digest it was written with. Writes go through
+;; `nbb.io/write-bytes!` (0600 temporary + fsync + rename), so a reader sees
+;; the whole entry or none. Bounds (LRU, entries, bytes) and the in-memory
+;; stage cache with its closures remain host-only.
+nil
+
+(defn sha256-bytes
+     "SHA-256 of a byte buffer as 64 lowercase hex characters (the pure
+     library; byte-identical to the host's node:crypto reading)."
+     [data :bytes] :string
+     (kbytes/hex (sha2/sha256 (vector-i64-from-bytes data))))
+
+(defn sha256
+  "SHA-256 of VALUE (text, hashed as UTF-8, or bytes) as 64 lowercase hex
+  characters: the hash/sha256 ability (catalog wire 3). Under Kotoba the
+  ability hashes a string."
+  [value :string]
+  :string
+  (hash/sha256 value))
+
+(defn key-for-kind
+     "The artifact key: exactly the host's six-argument `key-for` over the same
+     JSON text. EMIT-METADATA is the caller's `pr-str` of the metadata map.
+     HAS-KIND false is the host's nil `artifact-kind`."
+     [target :string source :string policy-present :bool policy-text :string
+      emit-metadata :string linked :bool artifact-kind :string has-kind :bool] :string
+     (sha256
+      (json-text/encode-array
+       (document-vector (document-string "kotoba.compile-cache/v4")
+                        (document-string target)
+                        (document-string source)
+                        (document-bool policy-present)
+                        (document-string policy-text)
+                        (document-string emit-metadata)
+                        (document-bool linked)
+                        (if has-kind (document-string artifact-kind) (document-null))))))
+
+(defn key-for
+     "The host's one-to-five-argument `key-for` (no artifact kind)."
+     [target :string source :string policy-present :bool policy-text :string
+      emit-metadata :string linked :bool] :string
+     (key-for-kind target source policy-present policy-text emit-metadata linked "" false))
+
+(defn stage-key-for [stage :string material :string] :string
+     (sha256
+      (json-text/encode-array
+       (document-vector (document-string "kotoba.stage-cache/v1")
+                        (document-string stage)
+                        (document-string material)))))
+
+nil
+
+;; ---------------------------------------------------------------------------
+;; Kotoba: the on-disk store (see the reading above)
+
+(defrecord Found [hit :bool data :bytes])
+
+(defn store-dir
+     "The store directory (KOTOBA_COMPILE_CACHE_DIR), or \"\" when the store is
+     off. An empty value is unset, as on the host."
+     [] :string
+     (env/read "KOTOBA_COMPILE_CACHE_DIR"))
+
+(defn- numbers [answer :string] :vector-i64
+     (if (= 0 (string-byte-length answer))
+       (vector-i64)
+       (decimal-text/fields answer)))
+
+(defn- usable-dir?
+     "DIR is a directory (not followed), owned by this process's euid, and not
+     group/world writable: the verdict cache's rule. Anything else disables
+     the store."
+     [dir :string] :bool
+     (if (= 0 (string-byte-length dir))
+       false
+       (let [st (numbers (fs/app-data (str dir "NOFOLLOW_SEP")))
+             who (numbers (fs/app-data (str dir "OWNER_SEP")))]
+         (if (< (vector-count st) 4)
+           false
+           (if (< (vector-count who) 2)
+             false
+             (if (= 1 (vector-at st 3))
+               ;; mode & 0o022 = 0: bits 1 (world write) and 4 (group write).
+               (if (= 0 (rem (quot (vector-at st 0) 2) 2))
+                 (if (= 0 (rem (quot (vector-at st 0) 16) 2))
+                   (= (vector-at who 0) (vector-at who 1))
+                   false)
+                 false)
+               false))))))
+
+(defn- data-path [dir :string key :string] :string (str dir "/" key ".bin"))
+
+(defn- digest-path [dir :string key :string] :string (str dir "/" key ".sha256"))
+
+(defn- key-name? [key :string] :bool
+     ;; A key is the 64 lowercase hex characters `key-for` answers; anything
+     ;; else (a path separator, a dot) is never joined into a path.
+     (if (= 64 (string-byte-length key))
+       (loop [i 0]
+         (if (>= i 64)
+           true
+           (let [c (string-code-point-at key i)]
+             (if (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 102)))
+               (recur (+ i 1))
+               false))))
+       false))
+
+(defn lookup
+     "The entry for KEY in DIR, or a miss. A hit is returned only when the
+     bytes read back hash to the digest written with them; every other
+     condition (store off, foreign directory, bad key, absent or unreadable
+     entry, digest mismatch) is a miss."
+     [dir :string key :string maximum :i64]
+     [:record :kotoba.compiler.nbb.compile-cache/Found [[:hit :bool] [:data :bytes]]]
+     (if (key-name? key)
+       (if (usable-dir? dir)
+         (if (= "1" (fs/app-data (str (digest-path dir key) "EXISTS_SEP")))
+           (if (= "1" (fs/app-data (str (data-path dir key) "EXISTS_SEP")))
+             (let [st (numbers (fs/app-data (str (data-path dir key) "NOFOLLOW_SEP")))]
+               ;; A regular file (kind 0) within the bound; RANGE reads exactly
+               ;; the observed size without following a symlink.
+               (if (< (vector-count st) 4)
+                 (->Found false (bytes-empty))
+                 (if (= 0 (vector-at st 3))
+                   (if (> (vector-at st 1) maximum)
+                     (->Found false (bytes-empty))
+                     (let [data (fs/app-data-bytes (str (data-path dir key) "RANGE_SEP0:" (vector-at st 1)))
+                           want (fs/app-data (digest-path dir key))]
+                       (if (= want (sha256-bytes data))
+                         (->Found true data)
+                         (->Found false (bytes-empty)))))
+                   (->Found false (bytes-empty)))))
+             (->Found false (bytes-empty)))
+           (->Found false (bytes-empty)))
+         (->Found false (bytes-empty)))
+       (->Found false (bytes-empty))))
+
+(defn put!
+     "Store DATA under KEY: the bytes first, then the digest that commits
+     them. Answers 1 when stored, 0 when the store is off (never an error:
+     the cache is an optimization, the artifact is already built)."
+     [dir :string key :string data :bytes] :i64
+     (if (key-name? key)
+       (if (usable-dir? dir)
+         (do (nbb-io/write-bytes! (data-path dir key) data 384)
+             (nbb-io/write-text! (digest-path dir key) (sha256-bytes data))
+             1)
+         0)
+       0))
+
+(defn remove!
+     "Drop KEY: the digest first, so a half-removed entry is a miss."
+     [dir :string key :string] :i64
+     (if (key-name? key)
+       (if (usable-dir? dir)
+         (do (fs/app-data (str (digest-path dir key) "UNLINK_SEP"))
+             (fs/app-data (str (data-path dir key) "UNLINK_SEP"))
+             1)
+         0)
+       0))
+
+(defn- count-lines
+     ;; fs/browse joins its NAME<TAB>D rows with a single newline and no
+     ;; trailing one: an empty answer is no rows, otherwise newlines + 1.
+     [listing :string] :i64
+     (loop [i 0 n (if (= 0 (string-byte-length listing)) 0 1)]
+       (if (>= i (string-byte-length listing))
+         n
+         (recur (+ i 1)
+                (if (= 10 (string-code-point-at listing i)) (+ n 1) n)))))
+
+(defn stats
+     "The number of files (`.bin` and `.sha256` each count) in DIR: the raw
+     listing line count; 0 when the store is off."
+     [dir :string] :i64
+     (if (usable-dir? dir)
+       (count-lines (fs/browse dir))
+       0))
+
+;; The stage cache's disk analogues. The host's stages hold Clojure values and
+;; a compute closure (`resolve-stage!`); a Kotoba module has neither, so a
+;; stage is the SERIALIZED text the host would `pr-str` for its integrity
+;; digest, stored as UTF-8 bytes through the same committed-entry protocol.
+;; The caller computes on a miss and calls `put-stage!`; \"\" is a miss (a
+;; serialized stage is never empty).
+(defn put-stage! [dir :string key :string serialized :string] :i64
+     (put! dir key (string-to-utf8 serialized)))
+
+(defn lookup-stage [dir :string key :string maximum :i64] :string
+     (let [found (lookup dir key maximum)]
+       (if (:hit found)
+         (string-from-utf8 (:data found))
+         "")))

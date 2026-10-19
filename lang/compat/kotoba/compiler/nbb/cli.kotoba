@@ -1,0 +1,204 @@
+(ns kotoba.compiler.nbb.cli
+  "Shared ordinary-native CLI implementation. ISA-specific executable
+  entrypoints inject exactly one emitter, so compiling AArch64 never loads
+  x86-64 code and vice versa."
+  {:kotoba/export [run!]}
+  (:require [kotoba.compiler.capability-names :as cap-names]
+                         [kotoba.compiler.nbb.cli-support :as support]
+                         [kotoba.compiler.nbb.io :as nbb-io]
+                         [kotoba.compiler.nbb.output-set :as output-set]
+                         [kotoba.compiler.native-artifact :as na]
+                         [kotoba.compiler.nbb.project-source :as project-source]
+                         [kotoba.compiler.project :as project]
+                         [kotoba.compiler.project-files :as project-files]
+                         [kotoba.form :as form]
+                         [kotoba.sema :as sema]
+            ;; The env/read ability (catalog wire 33, superproject
+            ;; adr-2609242330 S5); under nbb the alias names the
+            ;; mechanism-layer handler.
+            
+            ;; ADR 0365: the opt-in `--backend seed` (bootstrap-labelled spawn
+            ;; route); no Kotoba reading, see the helpers before compile-native!.
+            )
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                                 [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
+                        :fe/err [:record :fe/err [[:msg :string] [:code :string] [:form [:ref :form/r]] [:phase :string] [:data [:ref :form/r]]]]
+                        :ana/ir [:record :ana/ir [[:ok :bool] [:val [:ref :form/r]] [:err [:ref :fe/err]]]]}))
+
+;; ---------------------------------------------------------------------------
+;; Kotoba reading: `run!` over the command line, answering the text the host route prints (`pr-str` of the
+;; answer + newline), the `compile` command only. aarch64-cli's Kotoba `main` calls it and owns the refusal
+;; report and exit status (cli-support `error-phase` / `exit-code` / `refusal-text`).
+;;
+;; COVERED: `compile <source> --target aarch64-macos [--output f] [--policy p] [--fuel n] [--source-path r ...]`,
+;; exactly `compile-uncached!`'s steps: policy (wire ids), build metadata, the frontend (with the policy's
+;; `:language-profile`, and `:admit-linked-synthetics?` for a linked graph), then
+;; `kotoba.compiler.native-artifact/compile-native` (native admission / entryless / UEFI gates, admission, fuel
+;; policy, `kir/lower`, `native-program`, kotoba.native.aarch64, the sealed artifact, definitions, the verifier step)
+;; and its provenance record; then the `.kexe`, `.provenance.edn` and `.publication.edn` (output-set marker over the
+;; bytes written) in one `write-set!`, and the host's answer map.
+;;
+;; REFUSED BY NAME (each a usage refusal, exit 64, unless noted): a command other than `compile` (`extract-native`
+;; included); a target other than aarch64-macos (an unknown name and an x86-64 name with the host's own messages;
+;; the other aarch64 targets, packaged and not, as not on this route); `--artifact` (packaging; an unknown kind with
+;; the host's `:artifact-target` refusal, exit 70); `--backend` (ADR 0365's seed route is nbb-host only);
+;; `--module-lock` / `--package-lock`. Worker mode is refused by aarch64-cli's `main`. No compile / stage / verdict
+;; cache exists on this route.
+;;
+;; NAMED DIFFERENCES from the host answer and outputs (measured: docs/selfhost-compile-twin-spike-20261008.md):
+;;   - `:verdict-cache` is `{:native-verify :disabled}`: the verdict is computed on every compile, what the host
+;;     answers with KOTOBA_VERDICT_CACHE=off (`:miss` / `:hit` when its store is on);
+;;   - the `.kexe` / `.provenance.edn` texts are printed in entry order (the host prints a large map in hash order),
+;;     so they are equal as data, not as bytes, and the `.publication.edn` marker, which hashes those bytes, carries
+;;     this route's sha256 / size / marker digest (the same names, roles and format);
+;;   - refusal messages: the native admission gate's (`kotoba.compiler.native-admission`, no feature locator), a
+;;     linked graph's refusals (not attributed to module and line), and the report is reduced (see cli-support);
+;;   - the frontend's refusal phase is the frontend error's own `:phase` (`subset`, `read`, ...);
+;;   - native-artifact's own named differences (kexe-fs-forms not called, metered compiles at another budget, ...).
+(defn- cl-kw [k :keyword] [:ref :form/r] (form/keyword-form k))
+
+(defn- cl-get [m [:ref :form/r] k :keyword] [:ref :form/r] (form/form-get m (cl-kw k)))
+
+(defn- cl-put [m [:ref :form/r] k :keyword v [:ref :form/r]] [:ref :form/r] (form/assoc-form m (cl-kw k) v))
+
+(defn- cl-empty [] [:ref :form/r] (form/form-map (form/no-forms)))
+
+(defn- cl-arg [args [:list :string] i :i64] :string
+     (if (< i (vector-count args)) (typed-list-nth [:list :string] args i) ""))
+
+(defn- cl-flag? [args [:list :string] flag :string] :bool
+     (loop [i 0]
+       (if (>= i (vector-count args))
+         false
+         (if (string=? flag (typed-list-nth [:list :string] args i)) true (recur (+ i 1))))))
+
+;; the host `targets` table: the keyword of a name, :none for a name it does not carry
+(defn- cl-target [name :string] :keyword
+     (cond
+       (string=? name "x86_64") :x86_64-kotoba-v1
+       (string=? name "x86_64-linux") :x86_64-linux-kotoba-v1
+       (string=? name "x86_64-macos") :x86_64-macos-kotoba-v1
+       (string=? name "x86_64-windows") :x86_64-windows-kotoba-v1
+       (string=? name "aarch64") :aarch64-kotoba-v1
+       (string=? name "aarch64-linux") :aarch64-linux-kotoba-v1
+       (string=? name "x86_64-linux-static") :x86_64-linux-static-kotoba-v1
+       (string=? name "aarch64-linux-static") :aarch64-linux-static-kotoba-v1
+       (string=? name "aarch64-macos") :aarch64-macos-kotoba-v1
+       (string=? name "aarch64-windows") :aarch64-windows-kotoba-v1
+       (string=? name "aarch64-android") :aarch64-android-kotoba-v1
+       (string=? name "aarch64-ios") :aarch64-ios-kotoba-v1
+       (string=? name "x86_64-aiueos-kernel-v1") :x86_64-aiueos-kernel-v1
+       (string=? name "x86_64-aiueos-user-v1") :x86_64-aiueos-user-v1
+       (string=? name "x86_64-aiueos-uefi-v1") :x86_64-aiueos-uefi-v1
+       (string=? name "aarch64-aiueos-kernel-v1") :aarch64-aiueos-kernel-v1
+       :else :none))
+
+(defn- cl-x86? [target :keyword] :bool
+     (or (= target :x86_64-kotoba-v1) (= target :x86_64-linux-kotoba-v1) (= target :x86_64-macos-kotoba-v1)
+         (= target :x86_64-windows-kotoba-v1) (= target :x86_64-linux-static-kotoba-v1)
+         (= target :x86_64-aiueos-kernel-v1) (= target :x86_64-aiueos-user-v1) (= target :x86_64-aiueos-uefi-v1)))
+
+(defn- cl-usage-kw [message :string] :keyword (throw (ex-info message {:phase :usage})))
+
+;; `run!`'s target checks in the host's order, then this route's one target
+(defn- cl-target! [args [:list :string]] :keyword
+     (let [name (option-value-of [:option :string] (support/option args "--target") "")
+           target (cl-target name)]
+       (cond
+         (= target :none)
+         (cl-usage-kw (string-concat "error: nbb native path does not cover target " name))
+         (cl-x86? target)
+         (cl-usage-kw (string-concat "error: target " (string-concat name " does not match loaded native ISA")))
+         (not (= target :aarch64-macos-kotoba-v1))
+         (cl-usage-kw (string-concat "error: target " (string-concat name " is not on the Kotoba route (the nbb.cli compile twin covers aarch64-macos only)")))
+         :else target)))
+
+;; the flags of host modes this route does not have, refused by name rather than ignored
+(defn- cl-unsupported! [args [:list :string]] :string
+     (let [kind (support/option args "--artifact")]
+       (cond
+         (option-some?-of [:option :string] kind)
+         (let [k (option-value-of [:option :string] kind "")]
+           (if (or (string=? k "object") (string=? k "image"))
+             (support/usage-error! (string-concat "error: --artifact " (string-concat k " (native packaging) is not available on the Kotoba route")))
+             (throw (ex-info "unknown native artifact kind" {:phase :artifact-target}))))
+         (cl-flag? args "--backend")
+         (support/usage-error! "error: --backend is not available on the Kotoba route (ADR 0365: the seed backend is served only on the nbb host)")
+         (cl-flag? args "--module-lock")
+         (support/usage-error! "--module-lock is not available on the Kotoba route")
+         (cl-flag? args "--package-lock")
+         (support/usage-error! "--package-lock is not available on the Kotoba route")
+         :else "")))
+
+;; `project-source/resolve-source!` without the locks: one file, or the closed graph of the `--source-path` roots
+;; linked by the twins (kotoba-lang lang/compat/kotoba/compiler/project{,_files}.kotoba), as check-driver's Kotoba
+;; reading does it; `{:source :linked?}`. A refusal of the loader or the linker is `:project-link`.
+(defn- cl-refuse [e [:ref :fe/err]] [:ref :form/r]
+     (throw (ex-info (record-get [:ref :fe/err] e :msg) {:phase :project-link})))
+
+(defn- cl-link [input :string roots [:list :string]] [:ref :form/r]
+     (try (let [g (project-files/load-closed-graph input roots)
+                l (try (project/link-source (cl-get g :sources) (cl-get g :root))
+                       (catch [:ref :fe/err] e (throw (project/with-module-file e (cl-get g :paths)))))]
+            (cl-put (cl-put (cl-empty) :source (cl-get l :source)) :linked? (form/bool-form true)))
+          (catch [:ref :fe/err] e (cl-refuse e))))
+
+(defn- cl-resolve [args [:list :string]] [:ref :form/r]
+     (let [roots (project-source/source-roots args)]
+       (if (> (vector-count roots) 0)
+         (cl-link (support/source! (cl-arg args 1)) roots)
+         (cl-put (cl-put (cl-empty) :source (form/string-form (project-source/resolve-single-source! args)))
+                 :linked? (form/bool-form false)))))
+
+;; the frontend (`resolve-hir!` without a stage cache); a refusal keeps the frontend error's phase
+(defn- cl-analyze [source :string policy [:ref :form/r] linked :bool] [:ref :form/r]
+     (let [profile (cl-get policy :language-profile)
+           o1 (if (form/is-nil? profile) (cl-empty) (cl-put (cl-empty) :language-profile profile))
+           opts (if linked (cl-put o1 :admit-linked-synthetics? (form/bool-form true)) o1)
+           r (sema/analyze source opts)]
+       (if (record-get [:ref :ana/ir] r :ok)
+         (record-get [:ref :ana/ir] r :val)
+         (let [e (record-get [:ref :ana/ir] r :err)
+               phase (record-get [:ref :fe/err] e :phase)]
+           (throw (ex-info (record-get [:ref :fe/err] e :msg)
+                           {:phase (if (string=? phase "") :subset (keyword-from-string phase))}))))))
+
+;; `compile-uncached!` + `write-native!` + run!'s answer, for one resolved source
+(defn- cl-compile [args [:list :string]] :string
+     (let [target (cl-target! args)
+           refused (cl-unsupported! args)
+           resolved (cl-resolve args)
+           linked (form/bool-value (cl-get resolved :linked?))
+           source (form/string-value (cl-get resolved :source))
+           input (cl-arg args 1)
+           output (option-value-of [:option :string] (support/option args "--output") (string-concat input ".kexe"))
+           policy (cap-names/wire-policy (support/read-policy args))
+           metadata (support/emit-metadata args)
+           hir (cl-analyze source policy linked)
+           result (na/compile-native source hir target policy metadata)
+           artifact-text (project/pr-text (cl-get result :artifact))
+           provenance-text (project/pr-text (na/provenance source policy metadata result))
+           provenance-output (string-concat output ".provenance.edn")
+           publication-output (string-concat output ".publication.edn")
+           publication-text (output-set/serialize output (string-to-utf8 artifact-text) provenance-text)
+           written (nbb-io/write-set! [(nbb-io/text-entry output artifact-text)
+                                       (nbb-io/text-entry provenance-output provenance-text)
+                                       (nbb-io/text-entry publication-output publication-text)])
+           a0 (cl-put (cl-put (cl-put (cl-empty) :ok (form/bool-form true)) :target (cl-kw target))
+                      :output (form/string-form output))
+           a1 (cl-put (cl-put a0 :provenance-output (form/string-form provenance-output))
+                      :publication-output (form/string-form publication-output))
+           a2 (cl-put (cl-put a1 :oracle (cl-get result :oracle)) :fuel-metering (cl-get result :fuel-metering))
+           a3 (cl-put a2 :verdict-cache (cl-put (cl-empty) :native-verify (cl-kw :disabled)))
+           answer (cl-put a3 :kotoba.compile/inputs (cl-kw (if linked :unpinned-source-path :single-file)))]
+       (string-concat (project/pr-text answer) "\n")))
+
+;; ---------------------------------------------------------------------------
+;; `run!`: the Kotoba reading (above: its helpers) and the host reading (the whole host program, unchanged)
+(defn run! [args [:list :string]] :string
+     (let [command (cl-arg args 0)]
+       (cond
+         (string=? command "compile") (cl-compile args)
+         (string=? command "extract-native")
+         (support/usage-error! "error: extract-native is not available on the Kotoba route (the nbb.cli twin answers compile only)")
+         :else (support/usage-error! (string-concat "error: nbb native path does not cover command " command)))))

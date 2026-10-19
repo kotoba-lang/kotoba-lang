@@ -1,0 +1,867 @@
+(ns kotoba.compiler.packaging.pe32plus
+  {:kotoba/export [align le package-efi package-embedded-kernel]}
+  (:require [kotoba.artifact.core :as artifact]
+            [kotoba.native.image-scratch :as image-scratch]
+            [kotoba.object.pe32plus :as pe]))
+
+(def ^:private firmware-target :x86_64-aiueos-uefi-v1)
+(def ^:private file-alignment 0x200)
+(def ^:private section-alignment 0x1000)
+(def ^:private image-base 0x400000)
+(def ^:private text-rva 0x1000)
+;; boot: `data-rva 0x2000` and `reloc-rva 0x3000` used to be constants here,
+;; and `image-size` was the constant 0x4000 at the call. That froze `.text` at
+;; ONE PAGE. A Kotoba UEFI application whose code exceeded 4096 bytes was
+;; packaged without complaint and had its `.data` mapped over the tail of its
+;; own code -- silent corruption at load time, not a refusal at build time,
+;; because `kotoba.object.pe32plus/encode-image` validated raw file offsets
+;; and had no opinion about RVAs at all (fixed there the same day, ADR-0002).
+;; `package-embedded-kernel` below never had the defect: it computed its
+;; addresses from the real text size, which is what this now does too.
+(def ^:private text-offset 0x200)
+;; boot: 96, not 80. The two-arity EFI entry contract parks the ImageHandle at
+;; context+0x50 and the SystemTable at +0x58, so the last addressed byte is 95.
+;; The zero-arity contract gets the same 96 bytes rather than a second layout:
+;; its extra 16 bytes are zero, which is strictly better than what it had --
+;; `kernel-boot-info` reads [r9+0x50], which under an 80-byte virtual size was
+;; a read one byte PAST the section.
+(def ^:private context-size 96)
+;; boot-scratch: the writable area this packager reserves for the guest, past
+;; the context (kotoba-gmir ADR-0013, kotoba-native ADR-0068).
+;;
+;; It is DECLARED, not implied. `.data`'s virtual size is `context-size +
+;; scratch-size`, the raw bytes are emitted rather than left to the loader's
+;; zero-fill, and the numbers come from `kotoba.native.image-scratch` -- the
+;; namespace the ENCODER reads to build `lea r10,[r9+0x60]`. One var, two
+;; readers, the discipline `kotoba.native.interrupt-abi` established.
+;;
+;; UNCONDITIONAL. Every UEFI image gets the reservation whether or not its
+;; program names the region. Sizing it by what the program uses would make the
+;; operation lie in exactly the case that matters -- a module that gains a
+;; `(kernel-scratch-region)` after the packager decided it needed none -- and
+;; 16 KiB of zeros is a cheap price for the operation always being true.
+(def ^:private scratch-offset 0x60)
+(def ^:private scratch-size 16384)
+(def ^:private data-size (+ context-size scratch-size))
+
+;; The offset the encoder assumes has to BE the end of the context. If the
+;; context ever grows past it the scratch would overlap the context's last
+;; slots, silently: the emitted `lea` does not know how big the context is.
+(when-not (= scratch-offset context-size)
+  (throw (ex-info "the scratch region must begin where the context ends"
+                  {:context-size context-size :scratch-offset scratch-offset})))
+
+(defn le [n width] (pe/little-endian n width))
+(defn align [n alignment] (pe/align-up n alignment))
+
+;; 2^(8*width) for the widths this packager emits. Written as literals rather
+;; than `(bit-shift-left 1 (* 8 width))`, which is NOT portable: JavaScript
+;; shift counts are taken mod 32, so on ClojureScript `(bit-shift-left 1 32)`
+;; is 1, not 2^32. Measured 2026-08-20 under nbb -- `limit` came out 1, so
+;; `maximum` was 0 and every nonzero field was rejected as "out of range",
+;; including a relocation displacement of 4085. Both bounds below are powers of
+;; two, exact as a JVM long and as a JS double alike.
+;; Kotoba has no 2^64 literal (an i64 tops out at 2^63 - 1) and this packager
+;; only ever emits 1, 2 and 4 byte signed fields, so the Kotoba table omits 8.
+(def ^:private signed-limit
+  {1 256 2 65536 4 4294967296})
+
+(defn- signed-le [n width]
+  (let [limit (or (signed-limit width)
+                  (throw (ex-info "unsupported signed little-endian width"
+                                  {:width width})))
+        minimum (- (quot limit 2))
+        maximum (dec (quot limit 2))]
+    (when-not (<= minimum n maximum)
+      (throw (ex-info "signed little-endian field is out of range"
+                      {:value n :width width})))
+    (le (if (neg? n) (+ limit n) n) width)))
+
+(def ^:private zero-arity-shim-size 21)
+;; boot: sub rsp,0x28 / lea r9 / two stores / two argument moves / call /
+;; add rsp,0x28 / ret. Fixed, like the zero-arity one, so the context RVA can
+;; be computed before the shim that references it is built.
+(def ^:private two-arity-shim-size 35)
+
+(defn- entry-shim
+  "The Microsoft x64 -> Kotoba adapter at the image entry point.
+
+  UEFI enters an EFI application with `(EFI_HANDLE ImageHandle,
+  EFI_SYSTEM_TABLE *SystemTable)` in RCX and RDX. The zero-arity shim
+  DISCARDED both, which is why a Kotoba program compiled for this target could
+  not reach the console, boot services or the memory map, and why aiueos's
+  BOOTX64.EFI is still C.
+
+  The two-arity shim parks them in the hidden context at +0x50 and +0x58 --
+  where `kernel-boot-info` and `kernel-system-table` read them -- AND passes
+  them positionally in RDI and RSI, which is where the internal Kotoba ABI
+  takes its first two parameters. Both, deliberately: the entry reads them as
+  parameters, and anything it calls reads them out of the context without
+  having to thread them through every signature.
+
+  Neither shim is a claim that the internal lowering is Microsoft x64. It is
+  not; this is the adapter that makes that irrelevant."
+  [arity source-rva context-rva]
+  (case arity
+    0 (let [after-lea (+ text-rva 11)
+            after-call (+ text-rva 16)]
+        (vec (concat [0x48 0x83 0xec 0x28
+                      0x4c 0x8d 0x0d]
+                     (signed-le (- context-rva after-lea) 4)
+                     [0xe8] (signed-le (- source-rva after-call) 4)
+                     [0x48 0x83 0xc4 0x28 0xc3])))
+    2 (let [after-lea (+ text-rva 11)
+            after-call (+ text-rva 30)]
+        (vec (concat [0x48 0x83 0xec 0x28]        ; sub rsp,0x28
+                     [0x4c 0x8d 0x0d]             ; lea r9,[rip+ctx]
+                     (signed-le (- context-rva after-lea) 4)
+                     [0x49 0x89 0x49 0x50]        ; mov [r9+0x50],rcx
+                     [0x49 0x89 0x51 0x58]        ; mov [r9+0x58],rdx
+                     [0x48 0x89 0xcf]             ; mov rdi,rcx
+                     [0x48 0x89 0xd6]             ; mov rsi,rdx
+                     [0xe8] (signed-le (- source-rva after-call) 4)
+                     [0x48 0x83 0xc4 0x28]        ; add rsp,0x28
+                     [0xc3])))
+    (throw (ex-info "UEFI boundary has no shim for this entry arity"
+                    {:arity arity}))))
+
+(def ^:private entry-contracts
+  {0 {:contract :microsoft-x64-zero-arity-efi-status-v1 :size zero-arity-shim-size}
+   2 {:contract :microsoft-x64-two-arity-efi-status-v2 :size two-arity-shim-size}})
+
+;; boot: the two-arity entry is a named EXPORT rather than `main`, and the
+;; name is the one the target profile already declares (`:entry :efi_main`).
+;;
+;; It is not a style choice. `kotoba.compiler.frontend` rejects any `main` that
+;; takes arguments -- "main must take zero arguments" -- for every target,
+;; because `main` is the guest entry every OTHER backend calls with no
+;; arguments. Relaxing that globally to admit one target's firmware ABI would
+;; be a language change made by a packager, which is the wrong direction; the
+;; profile already had a name for this boundary, so this uses it.
+;;
+;; A module with no `efi-main` still packages through its `main`, on the
+;; zero-arity contract, exactly as before.
+;; fuel64: the budget this image starts life with, and the reason it is read
+;; from the artifact rather than written as a constant.
+;;
+;; It WAS the constant 512, and had been since this packager existed. Every
+;; UEFI image ran on 512 no matter what `--fuel` said -- the flag is parsed,
+;; validated, sealed into `:limits :fuel` and `:fuel-abi :initial`, and then
+;; the one place that decides what the machine actually gets ignored it.
+;;
+;; Measured 2026-09-03: `--fuel 512` and `--fuel 1048576` produce
+;; BYTE-IDENTICAL images (sha256 fc742834811b3118...), a 2048x difference that
+;; changes nothing. `--fuel 250000000` was refused, so the flag was reaching
+;; the verifier; it simply never reached the image. Found by the LOADER stream
+;; from the other end, where `sha256-region` costs 1,772 fuel per 64-byte
+;; block, so ONE SHA-256 BLOCK could not fit in 512 and the loader's
+;; `integrity` module had never returned. Four in-guest boots bisected it
+;; before the cause was known -- scratch write/read-back, a 64-byte
+;; `kernel-subregion` of a `bytes-literal`, `store32`/`load32` and `sha-init`
+;; all pass, and only `sha-block` fails.
+;;
+;; This is the same class as the imm32 replenish ceiling one layer down
+;; (kotoba-native ADR 0078): a budget that cannot be raised past 2^31, and a
+;; budget that is silently ignored, are both "the number the machine runs on is
+;; not the number anybody wrote".
+;;
+;; The two checks are `kotoba.native.elf64/artifact-fuel`'s, restated rather
+;; than shared because this repository owns the PE32+ route and that one owns
+;; ELF: the budget must be a positive integer, and `:limits :fuel` must AGREE
+;; with `:fuel-abi :initial`. The agreement check is what makes this a seam
+;; rather than a second opinion -- the verifier re-derives `:fuel-abi` from
+;; `:limits`, so a packager that read one of the two could ship an image whose
+;; running budget contradicts its own receipt.
+(defn- artifact-fuel [artifact]
+  (let [fuel (get-in artifact [:limits :fuel])
+        abi-fuel (get-in artifact [:fuel-abi :initial])]
+    (when-not (and (integer? fuel) (pos? fuel) (= fuel abi-fuel))
+      (throw (ex-info "PE32+ EFI packaging requires one valid sealed fuel bound"
+                      {:reason :efi-fuel-bound-invalid
+                       :fuel fuel :fuel-abi-initial abi-fuel})))
+    fuel))
+
+(def ^:private efi-entry-name 'efi-main)
+
+(defn package-efi
+  "Package a sealed aiueos firmware artifact as an import-free PE32+ EFI image.
+
+  Two entry contracts. A zero-arity Kotoba entry returning an EFI_STATUS-sized
+  integer is v1 and still works; a two-arity entry -- `(defn main
+  [image-handle system-table] ...)` -- is v2, and is the one a program that
+  intends to talk to the firmware wants. The contract is chosen BY THE ENTRY'S
+  ARITY rather than by a flag, so there is nothing to keep in step.
+
+  Section placement is derived from the real code and context sizes. It used
+  to be three frozen RVAs and a frozen SizeOfImage, which put a 4096-byte
+  ceiling on `.text` that nothing checked: past it, `.data` was mapped over
+  the tail of the code and the image was still a byte-valid PE."
+  [artifact]
+  (when-not (artifact/valid-seal? artifact)
+    (throw (ex-info "PE32+ EFI packaging requires a sealed artifact" {})))
+  (when-not (= firmware-target (:target artifact))
+    (throw (ex-info "PE32+ EFI packaging requires the aiueos UEFI target"
+                    {:target (:target artifact)})))
+  (when-not (and (= :none (get-in artifact [:target-profile :runtime]))
+                 (false? (get-in artifact [:target-profile :ambient-syscalls])))
+    (throw (ex-info "PE32+ EFI packaging requires a freestanding profile"
+                    {:target-profile (:target-profile artifact)})))
+  (let [exports (:exports artifact)
+        source-entry (if (contains? exports efi-entry-name)
+                       efi-entry-name
+                       (get-in artifact [:program :entry]))
+        export (get exports source-entry)]
+    (when-not export
+      (throw (ex-info "Kotoba firmware entry is not exported" {:entry source-entry})))
+    (when-not (contains? entry-contracts (:arity export))
+      (throw (ex-info "UEFI boundary requires a zero-arity entry or a two-arity `efi-main`"
+                      {:entry source-entry :arity (:arity export)
+                       :admitted (sort (keys entry-contracts))})))
+    (let [{:keys [contract] shim-size :size} (get entry-contracts (:arity export))
+          source-rva (+ text-rva shim-size (:offset export))
+          text-size (+ shim-size (count (:code artifact)))
+          ;; boot: derived, not frozen. A section's mapped span is its virtual
+          ;; size rounded up to the section alignment, which is the
+          ;; granularity the loader assigns pages at -- the same rule
+          ;; `encode-image` now enforces, computed here rather than assumed.
+          data-rva (align (+ text-rva text-size) section-alignment)
+          reloc-rva (align (+ data-rva data-size) section-alignment)
+          image-size (align (+ reloc-rva 12) section-alignment)
+          shim (entry-shim (:arity export) source-rva data-rva)
+          text (into shim (:code artifact))
+          context (into (vec (repeat 8 0))
+                        (concat (le (artifact-fuel artifact) 8)
+                                (repeat (- data-size 16) 0)))
+          text-raw-size (align (count text) file-alignment)
+          data-offset (+ text-offset text-raw-size)
+          data-raw-size (align data-size file-alignment)
+          reloc-offset (+ data-offset data-raw-size)
+          ;; A legal relocation directory containing two IMAGE_REL_BASED_ABSOLUTE
+          ;; padding entries. All image references are relative, so no fixups exist.
+          reloc (vec (concat (le 0 4) (le 12 4) (le 0 2) (le 0 2)))
+          reloc-raw-size (align (count reloc) file-alignment)
+          bytes (pe/encode-image
+                 {:machine :x86-64 :entry-rva text-rva :text-rva text-rva
+                  :image-base image-base :section-alignment section-alignment
+                  :file-alignment file-alignment :headers-size text-offset
+                  :image-size image-size :subsystem :efi-application
+                  :data-directories {5 {:rva reloc-rva :size (count reloc)}}
+                  :sections [{:name ".text" :virtual-size (count text)
+                              :rva text-rva :raw-size text-raw-size
+                              :raw-offset text-offset :characteristics 0x60000020
+                              :bytes text}
+                             {:name ".data" :virtual-size data-size
+                              :rva data-rva :raw-size data-raw-size
+                              :raw-offset data-offset :characteristics 0xc0000040
+                              :bytes context}
+                             {:name ".reloc" :virtual-size (count reloc)
+                              :rva reloc-rva :raw-size reloc-raw-size
+                              :raw-offset reloc-offset :characteristics 0x42000040
+                              :bytes reloc}]})]
+      (when-not (= text-size (count text))
+        (throw (ex-info "UEFI entry shim size disagrees with its declaration"
+                        {:declared shim-size :emitted (- (count text)
+                                                         (count (:code artifact)))})))
+      {:format :pe32+/v1
+       :target firmware-target
+       :entry :efi_main
+       :source-entry source-entry
+       :entry-rva text-rva
+       :entry-contract contract
+       :entry-arity (:arity export)
+       :context-size context-size
+       :scratch {:offset scratch-offset :bytes scratch-size
+                 :rva (+ data-rva scratch-offset)}
+       :section-layout {:text {:rva text-rva :virtual-size (count text)}
+                        :data {:rva data-rva :virtual-size data-size}
+                        :reloc {:rva reloc-rva :virtual-size (count reloc)}
+                        :image-size image-size}
+       :sections [:text :data :reloc]
+       :imports []
+       :relocations {:format :pe-base-relocation/v1 :fixups 0 :position-independent true}
+       :bytes bytes})))
+
+;; 2^(8*i) for i in 0..7, for the same reason the bounds above are literals:
+;; `(bit-shift-left 1 32)` is 1 on ClojureScript. Each is a power of two, exact
+;; as a JVM long and as a JS double alike.
+(def ^:private byte-scale
+  [1 256 65536 16777216 4294967296 1099511627776 281474976710656 72057594037927936])
+
+(defn- rip [label] {:rel32 label})
+(defn- label [name] {:label name})
+
+(defn- read-le
+  "WIDTH little-endian bytes at OFFSET, as one number.
+
+  This used to accumulate with `(bit-shift-left byte (* 8 index))`, which is
+  the very hazard the comment above this file's bounds was written about, at a
+  width the comment's author was not looking at: the six ELF fields read here
+  with width 8 need shifts of 32, 40, 48 and 56, and cljs takes shift counts
+  mod 32. Bytes 4 through 7 of every 64-bit field were folded into the LOW
+  bits.
+
+  It was inert for legal input -- the PT_LOAD contract caps paddr at
+  0x40000000 and memsz at 0x100000, so those four bytes are zero in every
+  kernel this packager is supposed to see. It was NOT inert for input the
+  contract exists to refuse. Measured 2026-08-25 with
+  `kotoba.compiler.packaging.elf-fixture`, whose first segment sits at
+  0x0001000000100000: the JVM read 281474977759232 and rejected the kernel;
+  nbb read 1114112, passed every bound check, and emitted a boot image.
+  The admission check failed open on the second runtime."
+  [bytes offset width]
+  (reduce (fn [value index]
+            (+ value (* (nth bytes (+ offset index)) (nth byte-scale index))))
+          0 (range width)))
+;; The Kotoba reading of utf16z: UTF-8 text is walked by code point (the index is
+;; a byte offset), each code point becomes one little-endian UTF-16 unit or a
+;; surrogate pair, then a zero unit terminates. Same bytes as the host branch.
+(defn- utf16-width [cp]
+     (if (< cp 128) 1 (if (< cp 2048) 2 (if (< cp 65536) 3 4))))
+(defn- utf16-units [value i n acc]
+     (if (>= i n)
+       acc
+       (let [cp (string-code-point-at value i)]
+         (utf16-units value (+ i (utf16-width cp)) n
+                      (if (< cp 65536) (+ acc 1) (+ acc 2))))))
+(defn- utf16-put [out k unit]
+     (let [low (vector-assoc! out k (rem unit 256))]
+       (vector-assoc! low (+ k 1) (quot unit 256))))
+(defn- utf16-fill [value n units]
+     (loop [i 0 k 0 out (vector-alloc (* 2 (+ units 1)))]
+       (if (>= i n)
+         (vector-drop (utf16-put out k 0) 0)
+         (let [cp (string-code-point-at value i)
+               next-i (+ i (utf16-width cp))]
+           (if (< cp 65536)
+             (recur next-i (+ k 2) (utf16-put out k cp))
+             (let [v (- cp 65536)]
+               (recur next-i (+ k 4)
+                      (utf16-put (utf16-put out k (+ 55296 (quot v 1024)))
+                                 (+ k 2) (+ 56320 (rem v 1024))))))))))
+(defn- utf16z [value]
+  (let [n (string-byte-length value)]
+       (utf16-fill value n (utf16-units value 0 n 0))))
+(defn- read-i32 [bytes offset]
+  (let [value (read-le bytes offset 4)]
+    (if (>= value 2147483648)
+      (- value 4294967296)
+      value)))
+(defn- uefi-output-string-tokens [message-label return-label]
+  (concat
+   ;; EFI_SYSTEM_TABLE.ConOut is at +0x40 and SIMPLE_TEXT_OUTPUT.OutputString
+   ;; is at +0x08. Keep each checkpoint optional when firmware exposes no
+   ;; console, so the headless boot path remains valid.
+   [0x49 0x8b 0x4d 0x40 0x48 0x85 0xc9 0x0f 0x84] [(rip return-label)]
+   [0x48 0x8d 0x15] [(rip message-label)]
+   [0x48 0x8b 0x41 0x08 0xff 0xd0]
+   [(label return-label)]))
+(defn- store-status-nibble [source shift digit-label store-label target-label]
+  (concat
+   [0x44 0x89 0xf8]
+   (when (pos? shift) [0xc1 0xe8 shift])
+   [0x83 0xe0 0x0f 0x83 0xf8 0x0a 0x0f 0x8c] [(rip digit-label)]
+   [0x83 0xc0 0x37 0xe9] [(rip store-label)]
+   [(label digit-label)] [0x83 0xc0 0x30]
+   [(label store-label)] [0x66 0x89 0x05] [(rip target-label)]
+   ;; Retain the explicit source register in this helper's contract. Both
+   ;; callers currently convert r15d, which holds the kernel return status.
+   (when (not (= source :r15d)) [0xcc])))
+(def ^:private tender-continue
+  "What the guest returns to mean \"that was one step; call me again\".
+
+  250 rather than 0 or 1 because this value is also what the panel renders as
+  STATUS: the two hex digits are the low byte of the same register, so a
+  sentinel that collides with an ordinary return would make a running node and
+  a finished one print the same thing. The guest's existing returns are small
+  and 223 (`DF`, a reset that did not happen); 250 is `FA` and is free."
+  250)
+
+(defn- tender-snapshot-tokens [context-address]
+  "Read the budget the ELF sealed, once, before the guest has run.
+
+  The loader does not carry a fuel number and cannot be told one. The
+  compiler already wrote the budget into the guest's own context word at
+  `[r9+8]`, and `elf64/artifact-fuel` checked there that `:limits :fuel` and
+  `:fuel-abi :initial` agree, so that word IS the receipt. Copying it at
+  runtime rather than baking an immediate removes two failure modes at once:
+  the loader cannot disagree with the artifact, and there is no `imm32` to
+  overflow -- ADR-0195's hazard was a budget at or above 2^31 being written as
+  a negative quadword by `mov qword [r9+8], imm32`, and ADR-0203 has since
+  raised `ir/max-fuel` to 2^53-1. A mechanism whose ceiling is the width of
+  one field is a knob; this one has no ceiling to state.
+
+  movabs r9, context ; mov rax, [r9+8] ; mov [rip+:tender-fuel], rax"
+  (concat [0x49 0xb9] (le context-address 8)
+          [0x49 0x8b 0x41 0x08]
+          [0x48 0x89 0x05] [(rip :tender-fuel)]))
+
+(defn- tender-replenish-tokens []
+  ;; mov rax, [rip+:tender-fuel] ; mov [r9+8], rax -- r9 is re-materialised by
+  ;; the caller each iteration, so this pairs with that and nothing else.
+  (concat [0x48 0x8b 0x05] [(rip :tender-fuel)]
+          [0x49 0x89 0x41 0x08]))
+
+(defn- k16-preflight-tokens [returnable-entry context-address]
+  (concat
+   ;; Read 02:00.0 through PCI mechanism #1. Only the explicit K16 diagnostic
+   ;; profile calls the kernel while Boot Services and ConOut are still live.
+   [0x66 0xba 0xf8 0x0c 0xb8 0x00 0x00 0x02 0x80 0xef
+    0x66 0xba 0xfc 0x0c 0xed 0x3d 0xec 0x10 0x25 0x81
+    0x0f 0x85] [(rip :exit-boot)]
+   (uefi-output-string-tokens :rtl-message :rtl-message-return)
+   ;; ── the tender loop (ADR-0204, ADR-0205) ─────────────────────────────
+   ;; The normal ELF entry deliberately halts after main returns. Preflight
+   ;; instead calls the compiler's returnable main wrapper and establishes the
+   ;; two context values normally installed by that ELF entry shim -- and, from
+   ;; 2026-09-08, RE-ENTERS it for as long as the guest says it has more steps.
+   ;;
+   ;; This is the object wrapper's `replenish; call` lifted to the image. It is
+   ;; here rather than in the guest for the reason ADR-0204 gives: the kernel
+   ;; could write its own fuel word from Kotoba and it would work, and a
+   ;; handler inside the computation is not a handler. The budget belongs to
+   ;; whoever calls, and on this route that is this instruction stream.
+   ;;
+   ;; Everything is re-materialised each iteration rather than kept in a
+   ;; register: rdi and r9 are caller-saved across the SysV call and the guest
+   ;; is free to clobber both. `lea` of a fixed RVA and `movabs` of a constant
+   ;; cost four instructions and remove a class of question.
+   (tender-snapshot-tokens context-address)
+   [(label :tender-step)]
+   [0x48 0x8d 0x3d] [(rip :boot-info)]
+   [0x49 0xb9] (le context-address 8)
+   [0x49 0x89 0x79 0x50]
+   (tender-replenish-tokens)
+   [0x48 0xb8] (le returnable-entry 8) [0xff 0xd0 0x49 0x89 0xc7]
+   ;; cmp r15, tender-continue ; je tender-step
+   [0x49 0x81 0xff] (le tender-continue 4)
+   [0x0f 0x84] [(rip :tender-step)]
+   (store-status-nibble :r15d 4 :status-high-digit :status-high-store
+                        :status-high)
+   (store-status-nibble :r15d 0 :status-low-digit :status-low-store
+                        :status-low)
+   [0x49 0x8b 0x4d 0x40 0x48 0x85 0xc9 0x0f 0x84]
+   [(rip :preflight-hold)]
+   [0x48 0x8d 0x15] [(rip :status-message)]
+   [0x48 0x8b 0x41 0x08 0xff 0xd0]
+   [(label :preflight-hold)]
+   ;; Keep the physical diagnostic visible. Returning EFI_LOAD_ERROR made the
+   ;; K16 immediately retry PXE and erase STATUS before it could be recorded.
+   [0xfa 0xf4 0xeb 0xfd]))
+(def ^:private kernel-scratch-pages 14)
+
+
+
+(defn- code-size [tokens]
+  (reduce (fn [size token]
+            (+ size (cond
+                      (and (map? token) (:label token)) 0
+                      (and (map? token) (:rel32 token)) 4
+                      :else 1)))
+          0 tokens))
+
+(defn- finalize-loader [tokens external-labels]
+  (let [labels (loop [remaining tokens position text-rva out external-labels]
+                 (if-let [token (first remaining)]
+                   (cond
+                     (and (map? token) (:label token))
+                     (recur (next remaining) position
+                            (assoc out (:label token) position))
+
+                     (and (map? token) (:rel32 token))
+                     (recur (next remaining) (+ position 4) out)
+
+                     :else
+                     (recur (next remaining) (inc position) out))
+                   out))]
+    (loop [remaining tokens position text-rva out []]
+      (if-let [token (first remaining)]
+        (cond
+          (and (map? token) (:label token))
+          (recur (next remaining) position out)
+
+          (and (map? token) (:rel32 token))
+          (let [target (get labels (:rel32 token))]
+            (when-not target (throw (ex-info "unknown UEFI loader label" {:label (:rel32 token)})))
+            (recur (next remaining) (+ position 4)
+                   (into out (signed-le (- target (+ position 4)) 4))))
+
+          :else (recur (next remaining) (inc position) (conj out token)))
+        (vec out)))))
+
+(defn- allocate-segment [address-label pages source-label size]
+  (concat
+   [0xb9 2 0 0 0 0xba 2 0 0 0 0x41 0xb8] (le pages 4)
+   [0x4c 0x8d 0x0d] [(rip address-label)]
+   [0x41 0xff 0x56 0x28 0x48 0x85 0xc0 0x0f 0x85] [(rip :fail)]
+   [0x48 0x8b 0x0d] [(rip address-label)]
+   [0x48 0x8d 0x15] [(rip source-label)]
+   [0x41 0xb8] (le size 4)
+   [0x41 0xff 0x96 0x60 0x01 0x00 0x00]))
+
+(defn package-embedded-kernel
+  "Generate a position-independent PE32+ UEFI transition loader around a
+  compiler-produced aiueos kernel ELF. No C object, CRT, import, or linker is
+  involved. The current hard-flip contract admits exactly two bounded PT_LOAD
+  segments and transfers control after ExitBootServices.
+
+  ⚠ NOT PORTABLE, measured 2026-08-31. This function emits different bytes
+  under ClojureScript than under the JVM. Given one identical kernel it
+  produced 129,024 bytes on both, differing in exactly two, inside an
+  eight-byte run the JVM writes as `AIUEBOOT` and cljs as a NUL followed by
+  `HUEBOOT`; read as one little-endian word the two differ by 321. Both routes reported
+  the same kernel sha256, so both had read the same input.
+
+  `package-efi` in this same namespace IS byte-identical across the two, so
+  this is one function, not the file. That is also why `bin/amu`'s JDK-free
+  route serves `--target x86_64-aiueos-uefi-v1` and refuses
+  `package-aiueos-boot`: the boot command was implemented on that route,
+  measured, and reverted rather than shipped.
+
+  No test guards this, and one cannot be written here. Clojure and nbb each
+  load their own runtime; a comparison has to build the same input under BOTH
+  and diff the bytes, which is what aiueos's
+  `os/aiueos/scripts/verify-jvm-free-object-parity.cljs` does for kernel
+  objects. Whoever narrows this down should do the same for the boot image.
+
+  This file has ZERO reader conditionals. That was taken as evidence it was
+  portable; it is evidence that nobody wrote one. Suspect the arithmetic --
+  cljs bitwise operators truncate to int32, and the values here (entry points,
+  paddrs, segment sizes) are 64-bit. See aiueos ADR-0130."
+  ([kernel] (package-embedded-kernel kernel [] {:k16-preflight? false :k16-note ""}))
+  ([kernel payload] (package-embedded-kernel kernel payload {:k16-preflight? false :k16-note ""}))
+  ([kernel payload options [:record :pe32plus/options [[:k16-preflight? :bool] [:k16-note :string]]]]
+  (let [kernel (vec kernel)
+        payload (vec payload)
+        k16-preflight? (true? (:k16-preflight? options))
+        k16-note (or (:k16-note options) "")]
+    ;; These two are refusals of the CALLER's input, so they carry a phase:
+    ;; without one the CLI reports "internal compiler error" (exit 70) for a
+    ;; kernel OBJECT handed to a packager that wants an ET_EXEC image --
+    ;; measured on the first `package-aiueos-boot` the Node route ever ran.
+    (when (> (count payload) 16384)
+      (throw (ex-info "embedded RT payload exceeds 16 KiB"
+                      {:phase :verify :bytes (count payload)})))
+    (when-not (and (>= (count kernel) 64)
+                   (= [0x7f 0x45 0x4c 0x46] (subvec kernel 0 4))
+                   (= 2 (read-le kernel 16 2)) (= 0x3e (read-le kernel 18 2)))
+      (throw (ex-info "embedded kernel must be x86-64 ET_EXEC" {:phase :verify})))
+    (let [entry (read-le kernel 24 8)
+          phoff (read-le kernel 32 8)
+          phentsize (read-le kernel 54 2)
+          phnum (read-le kernel 56 2)
+          segments (mapv (fn [index]
+                           (let [offset (+ phoff (* index phentsize))]
+                             {:type (read-le kernel offset 4)
+                              :flags (read-le kernel (+ offset 4) 4)
+                              :offset (read-le kernel (+ offset 8) 8)
+                              :paddr (read-le kernel (+ offset 24) 8)
+                              :filesz (read-le kernel (+ offset 32) 8)
+                              :memsz (read-le kernel (+ offset 40) 8)}))
+                         (range phnum))]
+      (let [first-segment (first segments) second-segment (second segments)
+            entry-segment (first (filter #(and (= 5 (:flags %))
+                                               (<= (:paddr %) entry)
+                                               (< entry (+ (:paddr %) (:memsz %))))
+                                         segments))
+            non-overlap (or (<= (+ (:paddr first-segment) (:memsz first-segment))
+                                (:paddr second-segment))
+                            (<= (+ (:paddr second-segment) (:memsz second-segment))
+                                (:paddr first-segment)))]
+      (when-not (and (= 2 phnum) (= 56 phentsize)
+                     (every? #(and (= 1 (:type %)) (pos? (:filesz %))
+                                   (= (:filesz %) (:memsz %))
+                                   (<= 0x100000 (:paddr %))
+                                   (<= (:memsz %) 0x100000)
+                                   (<= (:paddr %) (- 0x40000000 (:memsz %)))
+                                   (zero? (mod (:paddr %) 4096))
+                                   (<= (+ (:offset %) (:filesz %)) (count kernel))) segments)
+                     (= [5 6] (mapv #(:flags %) segments)) entry-segment non-overlap)
+        (throw (ex-info "embedded kernel PT_LOAD contract rejected" {:segments segments})))
+      (let [entry-file-offset (+ (:offset entry-segment)
+                                 (- entry (:paddr entry-segment)))
+            entry-shim? (and (<= (+ entry-file-offset 73) (count kernel))
+                             (= [0x48 0x89 0x3d]
+                                (subvec kernel (+ entry-file-offset 54)
+                                        (+ entry-file-offset 57)))
+                             (= [0x4c 0x8d 0x0d]
+                                (subvec kernel (+ entry-file-offset 61)
+                                        (+ entry-file-offset 64)))
+                             (= 0xe8 (nth kernel (+ entry-file-offset 68))))
+            context-address (when entry-shim?
+                              (+ entry 68
+                                 (read-i32 kernel (+ entry-file-offset 64))))
+            returnable-entry (when entry-shim?
+                               (+ entry 73
+                                  (read-i32 kernel (+ entry-file-offset 69))))
+            _ (when (and k16-preflight? (not entry-shim?))
+                (throw (ex-info "K16 preflight requires the returnable AIUEOS kernel entry shim"
+                                {:entry entry :entry-file-offset entry-file-offset})))
+            data-addresses [0 8]
+            rx-limit (align (+ (:paddr first-segment) (:memsz first-segment)) 4096)
+            rw-start (:paddr second-segment)
+            rw-end (+ rw-start (:memsz second-segment))
+            payload? (seq payload)
+            ;; The budget the tender will restore, read from the ELF where the
+            ;; compiler sealed it. The loader does not choose it and does not
+            ;; emit it; this is here so the receipt can NAME it and a verifier
+            ;; can compare it against `:limits :fuel`. Reading the same word
+            ;; the running loop reads is the point -- a second opinion derived
+            ;; some other way could disagree with the image and be believed.
+            sealed-fuel (when (and k16-preflight?
+                                   (<= (:paddr second-segment) context-address)
+                                   (<= (+ (- context-address
+                                             (:paddr second-segment)) 16)
+                                       (:filesz second-segment)))
+                          (read-le kernel (+ (:offset second-segment)
+                                             (- context-address
+                                                (:paddr second-segment))
+                                             8)
+                                   8))
+            _ (when (and k16-preflight? (not (and (integer? sealed-fuel)
+                                                  (pos? sealed-fuel))))
+                (throw (ex-info "K16 tender found no sealed fuel word in the kernel context"
+                                {:reason :k16-tender-sealed-fuel-unreadable
+                                 :context-address context-address
+                                 :sealed-fuel sealed-fuel})))
+            ;; Two loader-private segment destinations precede boot-info.
+            ;; Boot-info v4 is 96 bytes without a payload: the original
+            ;; firmware-map and W^X fields followed by a loader-owned scratch
+            ;; address/page count. An optional payload pointer/length follows.
+            variables-size (if payload? 128 112)
+            memory-map-offset (align variables-size 16)
+            memory-map-capacity 16384
+            embedded-offset (align (+ memory-map-offset memory-map-capacity) 16)
+            payload-offset embedded-offset
+            kernel-offset (align (+ payload-offset (count payload)) 16)
+            status-prefix "AIUEOS K16 PREFLIGHT STATUS "
+            enter-message (if k16-preflight?
+                            (utf16z "AIUEOS K16 PREFLIGHT ENTER\r\n") [])
+            rtl-message (if k16-preflight?
+                          (utf16z "AIUEOS K16 PREFLIGHT RTL8125\r\n") [])
+            status-message (if k16-preflight?
+                             (utf16z (str status-prefix "00\r\n")) [])
+            ;; The panel could not tell a running kernel from a stale one.
+            ;; ENTER and RTL8125 are printed by every preflight image ever
+            ;; built, and STATUS only appears after `main` returns -- which a
+            ;; resident kernel never does. So three different situations --
+            ;; this artifact is running, an older artifact is running, the
+            ;; machine is wedged -- all showed the same two lines.
+            ;;
+            ;; The embedded kernel's SHA-256 is the whole identity: the fuel
+            ;; budget, every source module and the compiler are sealed into
+            ;; that ELF, so any of them changing changes this string. It is
+            ;; also reproducible, which a wall-clock timestamp is not -- and
+            ;; this packager is byte-compared against a second packaging on
+            ;; every build. A caller who wants a version or a date supplies it
+            ;; through `:k16-note`, where determinism is its own problem.
+            kernel-digest (artifact/sha256 kernel)
+            build-message (if k16-preflight?
+                            (utf16z (str "AIUEOS K16 BUILD "
+                                         (subs kernel-digest 0 16)
+                                         (when (seq (str k16-note))
+                                           (str " " k16-note))
+                                         "\r\n"))
+                            [])
+            enter-message-offset (align (+ kernel-offset (count kernel)) 16)
+            rtl-message-offset (align (+ enter-message-offset
+                                         (count enter-message)) 16)
+            status-message-offset (align (+ rtl-message-offset
+                                            (count rtl-message)) 16)
+            build-message-offset (align (+ status-message-offset
+                                           (count status-message)) 16)
+            ;; One loader-private quadword, after everything the image
+            ;; already had: where the tender puts the budget it read out of
+            ;; the guest before the first call. Deliberately at the TAIL --
+            ;; boot-info, the memory map and every message keep the offsets
+            ;; they had, so a preflight image with the tender differs from one
+            ;; without it only in `.text` and in these 16 bytes. The guest is
+            ;; never shown the thing that refills it.
+            tender-slot-offset (align (+ build-message-offset
+                                         (count build-message)) 16)
+            ;; Build once with provisional external RVAs; instruction length is
+            ;; independent of displacement values.
+            segment-tokens (mapcat (fn [index segment]
+                                     (allocate-segment (keyword (str "address" index))
+                                      (quot (+ (:memsz segment) 4095) 4096)
+                                      (keyword (str "segment" index)) (:filesz segment)))
+                                   (range) segments)
+            tokens (vec (concat
+                    [0x41 0x54 0x41 0x55 0x41 0x56 0x41 0x57
+                     0x48 0x83 0xec 0x28 0x49 0x89 0xcc 0x49 0x89 0xd5
+                     0x4c 0x8b 0x72 0x60]
+                    (when k16-preflight?
+                      (concat
+                       (uefi-output-string-tokens :enter-message
+                                                  :enter-message-return)
+                       ;; Before anything can hang: say which artifact this is.
+                       (uefi-output-string-tokens :build-message
+                                                  :build-message-return)))
+                    segment-tokens
+                    ;; AllocateAnyPages/EfiLoaderData. The returned physical
+                    ;; address is explicit boot authority, so no fixed low-RAM
+                    ;; hole or conventional-memory scan is required on K16.
+                    [0xb9 0 0 0 0 0xba 2 0 0 0 0x41 0xb8]
+                    (le kernel-scratch-pages 4)
+                    [0x4c 0x8d 0x0d] [(rip :scratch-address)]
+                    [0x41 0xff 0x56 0x28 0x48 0x85 0xc0 0x0f 0x85]
+                    [(rip :fail)]
+                    (when payload?
+                      (concat [0x48 0x8d 0x05] [(rip :payload)]
+                              [0x48 0x89 0x05] [(rip :payload-pointer)]
+                              [0xb8] (le (count payload) 4)
+                              [0x48 0x89 0x05] [(rip :payload-length)]))
+                    ;; The bounded memory map is part of the loader image's RW
+                    ;; section, immediately after boot-info. This makes the
+                    ;; handoff one compiler-owned region: the kernel derives
+                    ;; boot+64 instead of trusting a pointer read from firmware
+                    ;; data as a new memory authority. GetMemoryMap fails closed
+                    ;; when 16 KiB is insufficient.
+                    [0x48 0x8d 0x05] [(rip :memory-map)]
+                    [0x48 0x89 0x05] [(rip :map-pointer)]
+                    [(label :get-map)]
+                    [0xb8 0x00 0x40 0x00 0x00]
+                    [0x48 0x89 0x05] [(rip :map-size)]
+                    [0x48 0x8d 0x0d] [(rip :map-size)]
+                    [0x48 0x8b 0x15] [(rip :map-pointer)]
+                    [0x4c 0x8d 0x05] [(rip :map-key)]
+                    [0x4c 0x8d 0x0d] [(rip :descriptor-size)]
+                    [0x48 0x8d 0x05] [(rip :descriptor-version)]
+                    [0x48 0x89 0x44 0x24 0x20 0x41 0xff 0x56 0x38
+                     0x48 0x85 0xc0 0x0f 0x85] [(rip :fail)]
+                    (when k16-preflight?
+                      (k16-preflight-tokens returnable-entry context-address))
+                    [(label :exit-boot)]
+                    [0x4c 0x89 0xe1 0x48 0x8b 0x15] [(rip :map-key)]
+                    [0x41 0xff 0x96 0xe8 0x00 0x00 0x00 0x48 0x85 0xc0
+                     0x0f 0x85] [(rip :get-map)]
+                    [0x48 0x8d 0x3d] [(rip :boot-info)]
+                    [0x48 0xb8] (le entry 8) [0xff 0xd0]
+                    [(label :fail)]
+                    [0x66 0xba 0xe9 0x00 0xb0 0x46 0xee
+                     0x66 0xba 0xf4 0x00 0xb8 0x7f 0x00 0x00 0x00 0xef
+                     0xfa 0xf4 0xeb 0xfc]))
+            text-size (code-size tokens)
+            data-address (align (+ text-rva text-size) section-alignment)
+            data (vec (concat (mapcat #(le (:paddr %) 8) segments)
+                              (le 0x544f4f4245554941 8)
+                              (le 4 8)
+                              ;; map pointer/size/key/descriptor fields are
+                              ;; populated by the loader before handoff.
+                              (repeat 40 0)
+                              (le rx-limit 8)
+                              (le rw-start 8)
+                              (le rw-end 8)
+                              (repeat 8 0)
+                              (le kernel-scratch-pages 8)
+                              (when payload? (repeat 16 0))
+                              (repeat (- memory-map-offset variables-size) 0)
+                              (repeat memory-map-capacity 0)
+                              (repeat (- embedded-offset
+                                         (+ memory-map-offset memory-map-capacity)) 0)
+                              payload
+                              (repeat (- kernel-offset
+                                         (+ payload-offset (count payload))) 0)
+                              kernel
+                              (when k16-preflight?
+                                (concat
+                                 (repeat (- enter-message-offset
+                                            (+ kernel-offset (count kernel))) 0)
+                                 enter-message
+                                 (repeat (- rtl-message-offset
+                                            (+ enter-message-offset
+                                               (count enter-message))) 0)
+                                 rtl-message
+                                 (repeat (- status-message-offset
+                                            (+ rtl-message-offset
+                                               (count rtl-message))) 0)
+                                 status-message
+                                 (repeat (- build-message-offset
+                                            (+ status-message-offset
+                                               (count status-message))) 0)
+                                 build-message
+                                 (repeat (- tender-slot-offset
+                                            (+ build-message-offset
+                                               (count build-message))) 0)
+                                 (repeat 16 0)))))
+            data-raw-size (align (count data) file-alignment)
+            reloc-address (align (+ data-address (count data)) section-alignment)
+            labels (merge {:address0 (+ data-address (nth data-addresses 0))
+                           :address1 (+ data-address (nth data-addresses 1))
+                           :boot-info (+ data-address 16)
+                           :map-pointer (+ data-address 32)
+                           :map-size (+ data-address 40)
+                           :descriptor-size (+ data-address 48)
+                           :descriptor-version (+ data-address 56)
+                           :map-key (+ data-address 64)
+                           :rx-limit (+ data-address 72)
+                           :rw-start (+ data-address 80)
+                           :rw-end (+ data-address 88)
+                           :scratch-address (+ data-address 96)
+                           :memory-map (+ data-address memory-map-offset)
+                           :payload-pointer (+ data-address 112)
+                           :payload-length (+ data-address 120)
+                           :payload (+ data-address payload-offset)}
+                          (when k16-preflight?
+                            {:tender-fuel (+ data-address tender-slot-offset)
+                             :enter-message (+ data-address enter-message-offset)
+                             :build-message (+ data-address build-message-offset)
+                             :rtl-message (+ data-address rtl-message-offset)
+                             :status-message (+ data-address status-message-offset)
+                             :status-high (+ data-address status-message-offset
+                                             (* 2 (count status-prefix)))
+                             :status-low (+ data-address status-message-offset
+                                            (* 2 (inc (count status-prefix))))})
+                          (into {} (map-indexed
+                                    (fn [index segment]
+                                      [(keyword (str "segment" index))
+                                       (+ data-address kernel-offset (:offset segment))])
+                                    segments)))
+            text (finalize-loader tokens labels)
+            text-raw-size (align (count text) file-alignment)
+            data-offset (+ text-offset text-raw-size)
+            reloc-offset (+ data-offset data-raw-size)
+            reloc (vec (concat (le 0 4) (le 12 4) (le 0 2) (le 0 2)))
+            reloc-raw-size (align (count reloc) file-alignment)
+            image-size (align (+ reloc-address (count reloc)) section-alignment)
+            bytes (pe/encode-image
+                   {:machine :x86-64 :entry-rva text-rva :text-rva text-rva
+                    :image-base image-base :section-alignment section-alignment
+                    :file-alignment file-alignment :headers-size text-offset
+                    :image-size image-size :subsystem :efi-application
+                    :data-directories {5 {:rva reloc-address :size (count reloc)}}
+                    :sections [{:name ".text" :virtual-size (count text)
+                                :rva text-rva :raw-size text-raw-size
+                                :raw-offset text-offset :characteristics 0x60000020
+                                :bytes text}
+                               {:name ".data" :virtual-size (count data)
+                                :rva data-address :raw-size data-raw-size
+                                :raw-offset data-offset :characteristics 0xc0000040
+                                :bytes data}
+                               {:name ".reloc" :virtual-size (count reloc)
+                                :rva reloc-address :raw-size reloc-raw-size
+                                :raw-offset reloc-offset :characteristics 0x42000040
+                                :bytes reloc}]})]
+        {:format :pe32+-embedded-kernel/v3 :target firmware-target
+         :entry :efi_main :entry-rva text-rva :sections [:text :data :reloc]
+         :boot-info-layout (cond->
+                            {:bytes (+ (- memory-map-offset 16)
+                                       memory-map-capacity (count payload))
+                             :memory-map-offset (- memory-map-offset 16)
+                             :memory-map-capacity memory-map-capacity
+                             :rx-limit-offset 56
+                             :rw-start-offset 64
+                             :rw-end-offset 72
+                             :kernel-scratch-address-offset 80
+                             :kernel-scratch-pages-offset 88
+                             :kernel-scratch-pages kernel-scratch-pages}
+                             payload?
+                             (assoc :payload-offset (- payload-offset 16)
+                                    :payload-bytes (count payload)))
+         :imports [] :embedded-kernel-sha256 (artifact/sha256 kernel)
+         :embedded-payload-sha256 (when payload? (artifact/sha256 payload))
+         :k16-preflight? k16-preflight?
+         :k16-preflight-returnable-entry (when k16-preflight? returnable-entry)
+         :k16-preflight-context-address (when k16-preflight? context-address)
+         :k16-tender-continue (when k16-preflight? tender-continue)
+         :k16-tender-sealed-fuel sealed-fuel
+         :bytes bytes}))))))
