@@ -198,7 +198,11 @@ gates it hits are mechanical — an `:export` clause, a folded constant, dropped
 - **The 137 files are one day's classpath**, at the pins recorded in
   `lang/selfhost-distance.edn`. Not a stable denominator.
 
-## The trust half of the native flow is not JVM-free
+## The trust half of the native flow
+
+*(Superseded below: measured again 2026-10-19, the trust commands are
+JVM-free now. The 2026-09-08 table is kept as the record of what was true
+then.)*
 
 Measured 2026-09-08 by putting refusing stubs for `java`, `javac`, `clojure`
 and `clj` first on `PATH` with `JAVA_HOME=/nonexistent`, and running each step
@@ -225,36 +229,72 @@ invoking `kexe_loader` by hand with the symbol's offset — which is how the
 the runtime measurement entirely**. That is a demonstration, not a way to run
 software.
 
+### Re-measured 2026-10-19 (`amu c4064497`): the trust commands are JVM-free
+
+Re-run 2026-10-19 with the same method — refusing stubs for `java`, `javac`,
+`clojure` and `clj` first on `PATH`, `JAVA_HOME=/nonexistent` — but against a
+clean worktree of `origin/main` (`c4064497`) rather than a development
+checkout:
+
+| step | JVM-free |
+|---|---|
+| `amu compile … --jvm-free --target aarch64-macos` | **yes** |
+| `amu keygen` | **yes** |
+| `amu public-key` / `amu trust-key` | **yes** |
+| `amu sign` | **yes** |
+| `amu verify-signed --trust` | **yes** (`:verified? true`) |
+| `amu measure-runtime` (builds the `kotoba-loader` Mach-O) | **yes** |
+| `amu run` / `amu receipt` | stops at usage — `missing --policy`, not a JVM refusal |
+
+The gap this section was written to name is closed: a native artifact can be
+produced, signed, verified, and its runtime measured, with no JVM on `PATH`.
+What is not measured here: `run` and `receipt` need a capability policy file
+(`--policy`), and whether the full execute path answers once one is supplied
+is untested by this run.
+
+Two things the 2026-09-08 table got wrong in detail. The command that accepts
+a signed envelope is `verify-signed`; `amu verify <signed.kexe>` answers
+`native artifact schema rejected`. And the parity question raised below — a
+key generated on one host verifying on the other, in both directions — is
+still unanswered: this run proves one host's route is JVM-free, not that the
+two host implementations agree.
+
 ### There are two signing surfaces, and one of them is already portable
 
 `bin/amu` routes `sign-output-set` and `verify-output-set` to nbb, and
 `src/kotoba/compiler/nbb/output_attestation.cljs` signs with `node:crypto`
-Ed25519 — no JVM anywhere. The kexe flow instead goes through
-`kotoba-verifier/src/kotoba/verifier/signing.clj`, 171 lines of
-`java.security` `KeyFactory`/`Signature` and `java.util.Base64`, which is
-`.clj` and therefore JVM-only.
+Ed25519 — no JVM anywhere. The kexe flow goes through
+`kotoba-verifier/src/kotoba/verifier/signing.cljk`, 220 lines that carry both
+hosts: `java.security` `KeyFactory`/`Signature` and `java.util.Base64` under
+`:clj`, `node:crypto` under `:cljs`. (When the table above was measured it was
+`signing.clj`, 171 lines of `java.security` only.) `bin/amu` routes the whole
+`trustCommands` set — `keygen`, `public-key`, `inspect`, `trust-key`,
+`trust-runtime`, `sign`, `verify-signed`, `verify`, `receipt`, … — through
+the nbb route, and `run` / `measure-runtime` ride the same route plus the
+executor's alias closure.
 
-Same algorithm, same purpose, two implementations, one portable. That is the
-shape `lang/definition-patch.edn` already names for the hasher
-(`:parallel-hasher {:status :second-implementation-to-be-migrated}`), and it
-is worth naming here for the signer too.
+Same algorithm, same purpose, two implementations, both now portable. That is
+the shape `lang/definition-patch.edn` already names for the hasher
+(`:parallel-hasher {:status :second-implementation-to-be-migrated}`), and the
+signer is the worked example of it.
 
 ### The next rung, and what would make it real
 
-Port `kotoba.verifier.signing` to `.cljc` — `java.security` under `:clj`,
-`node:crypto` under `:cljs` — and add the four kexe trust commands to
-`bin/amu`'s nbb-eligible list.
+The port this section asked for is done: `kotoba.verifier.signing` is
+dual-host and the kexe trust commands are on the nbb-eligible route. What
+remains is the check that would make it evidence.
 
-The check that would make it landable is a **cross-host parity test**, not a
-green suite: a key generated on one host verifies on the other, in both
-directions, and a signature made on one host is accepted by the other. Signing
-code that has only ever been run one way is signing code whose portability
-nobody has measured — and this document's own ladder exists because the
-JVM-free claim had never been run against a `PATH` with no `java` on it.
+It is a **cross-host parity test**, not a green suite: a key generated on one
+host verifies on the other, in both directions, and a signature made on one
+host is accepted by the other. Signing code that has only ever been run one
+way is signing code whose portability nobody has measured — and this
+document's own ladder exists because the JVM-free claim had never been run
+against a `PATH` with no `java` on it. The 2026-10-19 run above closes the
+`PATH` question on one host; the cross-host question is still open.
 
 ## The order the hosts can leave in
 
-Knowing that the trust half needs a JVM is not a work order. A namespace
+Knowing which namespaces are host-bound is not a work order. A namespace
 cannot be ported before the namespaces it requires are, so "what first" is a
 topological sort over the require graph, restricted to the host-bound nodes.
 `scripts/measure-host-port-order.cljk` computes it; `lang/host-port-order.edn`
