@@ -119,13 +119,13 @@ owner's current profile, artifact and receipt when making a completion claim.
 
 The [integrated Lisp machine design](kotoba-lisp-machine-design.ja.md) adds
 whole-machine proposals (image, interactive environment, distributed machine)
-and the kotoba marshal boundary contract, drawing on Holochain, EVM and the
-awai L1 charter as references. Those are proposals, not evidence, and they do
-not close the list above.
+and a judgment-free boundary-encoding contract, drawing on Holochain, EVM and
+the awai L1 charter as references. Those are proposals, not evidence, and they
+do not close the list above.
 
 ## Refactor and presentation entry points
 
 - [Whole-stack refactor procedure](stack-refactor-procedure.md)
 - [Japanese presentation narrative and diagrams](presentations/kotoba-lisp-machine.ja.md)
-- [Integrated Lisp machine design and kotoba marshal (proposal)](kotoba-lisp-machine-design.ja.md)
+- [Integrated Lisp machine design (proposal)](kotoba-lisp-machine-design.ja.md)
 - [Documentation authority routing](authority-map.edn)

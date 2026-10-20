@@ -1,4 +1,4 @@
-# Kotoba Lisp machine 統合設計 — Holochain / EVM / awai を参照した分散 Lisp machine と kotoba marshal
+# Kotoba Lisp machine 統合設計 — Holochain / EVM / awai を参照した分散 Lisp machine
 
 Status: **提案（:proposed）** · 2026-10-21。責務と構造の設計提案であり、実装移行・
 qualification・広告可能な完成のいずれも意味しない。証拠のない箇所には「未実装」または
@@ -10,9 +10,9 @@ qualification・広告可能な完成のいずれも意味しない。証拠の�
 分散の既定構成は [stack-architecture-target-neutral.ja.md](stack-architecture-target-neutral.ja.md)、
 agent-centric な面は root の ADR-2610082200、順序 domain は inga（ADR-2608038000）、
 chain は awai L1 charter（ADR-2610092330）。**この文書はそれらを書き換えず、
-「Lisp machine としての全体」と「kotoba marshal」だけを足す。**
+「Lisp machine としての全体」と「境界の形」だけを足す。**
 
-機械可読の草案: [kotoba-marshal.draft.edn](kotoba-marshal.draft.edn)（:status :proposed）。
+機械可読の草案: [kotoba-lisp-machine-boundary.draft.edn](kotoba-lisp-machine-boundary.draft.edn)（:status :proposed）。
 
 ## 0. 何を足すのか
 
@@ -22,7 +22,7 @@ chain は awai L1 charter（ADR-2610092330）。**この文書はそれらを書
 qualification。
 
 この文書はそのうち**設計が無い 3 つ**（image・対話環境・分散 Lisp machine）に設計を置き、
-同時に今まで seam ごとに散らばっていた境界符号化を **kotoba marshal** 1 つの契約に束ねる。
+同時に今まで seam ごとに散らばっていた境界符号化を **境界の形（boundary encoding）** 1 つの契約に束ねる。
 これは構成の設計であって、上記 6 つの証拠を 1 つも作らない。
 
 ## 1. 用語の固定
@@ -37,7 +37,7 @@ qualification。
 | 世界 world | IPLD の state root（CID） | kototama `:state :world-root` |
 | 記録 receipt | 実行の署名付き記録 | kototama `:receipt` |
 | **image** | 世界 × コード環境 × 開いた lease の組 | **この文書 §5.1（提案）** |
-| **marshal** | 判断を持たない境界符号化 | **この文書 §4（提案）** |
+| **境界の形 boundary** | 判断を持たない境界符号化 | **この文書 §4（提案）** |
 | 機 conductor / 紋 DNA / cell / 糸 ito / 布 nuno / membrane / kotoba app | agent-centric な面の部品 | root ADR-2610082200 |
 | 順序 domain / inga / awai L1 | 順序と finality が要る書書き込みの裁定 | ADR-2608038000 / ADR-2610092330 |
 | 層 T0–T6 / L0–L5 / 通信 8 面 | 責務・データ・通信の凡例 | root `manifest/kotoba-stack-legend.edn`（この文書は番号を足さない） |
@@ -96,9 +96,9 @@ target-neutral 文書が Wasm / WIT に対して立てた線と同じである�
 flowchart TB
   subgraph local["1 cell = 1 machine（ローカル面）"]
     Code["code（DefCID）"] -->|check / project-link / compile| AMU["amu"]
-    AMU -->|artifact| M1["marshal: host ↔ guest"]
+    AMU -->|artifact| M1["境界: host ↔ guest"]
     M1 --> Host["host / 機"]
-    Host -->|marshal: value ↔ wire| VM["kototama 遷移（fuel）"]
+    Host -->|境界: value ↔ wire| VM["kototama 遷移（fuel）"]
     VM -->|receipt| World["world root（IPLD CID）"]
     VM -.->|decision request| Grant["grant / authority"]
     Grant -.->|decision| Host
@@ -113,15 +113,15 @@ flowchart TB
 ```
 
 - 値・コード・状態・記録はすべて content-addressed。実行は fuel 付き遷移、
-  境界はすべて marshal を通る（§4）。
+  境界はすべて §4 の境界の形を通る。
 - 合意の既定は validation。順序が要る書込みだけが ordered domain に入る（§6.1）。
 - hosted 実行に AiueOS は必須ではない（stack-architecture.md の既存の線）。
 
-## 4. kotoba marshal
+## 4. 境界の形（boundary encoding）
 
 ### 4.1 定義
 
-**marshal は判断を持たない境界符号化である。** pack / unpack / 長さ / 順序だけを扱い、
+**境界の形は判断を持たない符号化である。** 以下この契約を「境界の形」と呼ぶ。pack / unpack / 長さ / 順序だけを扱い、
 検査（valid か）も決定（許可されるか）も実行（走るか）もしない。
 
 この原則は aiueos に既に実装されている規約の一般化である:
@@ -135,7 +135,7 @@ flowchart TB
 
 ### 4.2 5 つの境界（domain）
 
-| domain | 通る物 | 現行の記述場所 | marshal の形 | 判断は誰か |
+| domain | 通る物 | 現行の記述場所 | 境界の形 | 判断は誰か |
 |---|---|---|---|---|
 | kernel ↔ object | flat record | aiueos ADR-0219、`.kotoba` ヘッダ comment | base + length、offset read | Kotoba object / grant |
 | host ↔ guest | typed import / export | amu Canonical ABI（0065/0068/0070/0076）、abi.component profile | lift / lower の layout | host admission / authority |
@@ -145,7 +145,7 @@ flowchart TB
 
 ### 4.3 不変条件（:proposed）
 
-1. **judgment-free。** marshal は述語・policy・capability 判定を含まない。含んだ時点で
+1. **judgment-free。** 境界の形は述語・policy・capability 判定を含まない。含んだ時点で
    それは rule Form か grant の仕事に移す。aiueos の「C marshals, Kotoba judges」を
    全 domain に広げたものである。
 2. **既知 shape のみ。** 未知の tag / shape / profile は fail closed で拒否して記録する
@@ -154,23 +154,23 @@ flowchart TB
 3. **canonical bytes → CID の順。** 書き込みは canonical bytes を作ってから CID を付ける
    （kototama `:state :write :canonical-bytes-before-cid`）。読み込みは CID 検証後に
    decode（`:read :verify-cid-before-decode`）。
-4. **versioned、wire key は保持。** marshal spec 自体を content-addressed にし、
+4. **versioned、wire key は保持。** 境界の形の spec 自体を content-addressed にし、
    versioned migration まで既存の wire key / CID 規則を変えない（target-neutral の規則）。
-5. **秘密を marshal に載せない。** raw bearer・秘密鍵・ambient host handle は禁止
+5. **秘密を境界符号化に載せない。** raw bearer・秘密鍵・ambient host handle は禁止
    （kototama `:receipt :forbidden`）。discovery や receipt に secret / provider handle を
    載せない。private content は client-held key で暗号化する。
 6. **host object 不透過、host 呼び出しは仕事量。** `:host-object false` を維持し、
-   marshal が host を呼ぶ回数は fuel / 仕事量に数える（amu `lang-cosientist.md` の
+   境界の形が host を呼ぶ回数は fuel / 仕事量に数える（amu `lang-cosientist.md` の
    `:string` marshal 計測がその見方）。
 
-### 4.4 なぜ marshal が「全体を整える」骨格か
+### 4.4 なぜ境界の形が「全体を整える」骨格か
 
 いま 5 つの seam に 5 つの別物がある（4.2 の表の「現行の記述場所」列）。Lisp machine として
 image・cell・chain をまたぐには、値・コード・状態・記録が同じ規則で通る必要がある。
-marshal を 1 契約にまとめると:
+境界の形を 1 契約にまとめると:
 
 1. kernel object・guest・cell・node が同じ値の形を話す（§3 の図の M1 と value ↔ wire が同じ契約）。
-2. image の保存と復元が「同じ marshal で世界を CID に落とす」ことになる（§5.1）。
+2. image の保存と復元が「同じ境界の形で世界を CID に落とす」ことになる（§5.1）。
 3. 分散が「同じ code を別の machine で検証して実行すること」に落ち着く（§6.2）。
 
 ### 4.5 正本の置き場（:proposed、owner 決定待ち）
@@ -183,7 +183,7 @@ marshal を 1 契約にまとめると:
 | 中立の descriptor（shape の定義） | `kotoba-core-contracts`（`kotoba.core.execution` の隣） |
 | target profile ごとの layout | `abi`（Component profile は既存の Canonical ABI と連続） |
 | wire codec（bytes の正規化） | `kotoba-protocol` |
-| kernel profile の実装 | aiueos の packer（現行 flat record を kernel marshal 実装と位置づける） |
+| kernel profile の実装 | aiueos の packer（現行 flat record を kernel 境界の実装と位置づける） |
 | host / guest の実装 | amu の lower / lift |
 
 ## 5. Lisp machine の核 — image・対話・live（設計案）
@@ -199,7 +199,7 @@ image = { world root (IPLD CID)
         × open leases / receipts の連鎖 }
 ```
 
-- **保存** = 3 つを marshal して 1 つの CID に落とす。**復元** = CID から解決し、
+- **保存** = 3 つを境界符号化して 1 つの CID に落とす。**復元** = CID から解決し、
   未解決の依存があれば unresolved として拒否する（ADR-2610082200 の
   valid / invalid / unresolved の姿勢）。
 - 継続は値である（kototama `:explicit-continuations`）。image に含まれるのは
@@ -266,7 +266,7 @@ image = { world root (IPLD CID)
 結果（action・receipt）を content-addressed で交換する系」である。共有されるのは
 code・contract・action・receipt であって、live な heap ではない。
 
-これにより §4.3 の marshal だけで分散が閉じる: cell 間で渡るのは marshal 済みの message と
+これにより §4.3 の境界の形だけで分散が閉じる: cell 間で渡るのは境界符号化済みの message と
 receipt だけである。どこでも「同じ値の形」で通る。
 
 ### 6.3 awai L1 の使い所
@@ -284,7 +284,7 @@ receipt だけである。どこでも「同じ値の形」で通る。
 
 - 決定は grant / authority、強制は機 / host / AiueOS。cell 間呼び出し・remote call も
   capability chain 経由で、membrane は cell の genesis で検査する（ADR-2610082200）。
-- marshal は権限を運ばない（§4.3-5）。署名は行為の真正性の材料であり、その行為が許可されるかは
+- 境界の形は権限を運ばない（§4.3-5）。署名は行為の真正性の材料であり、その行為が許可されるかは
   別に判定する（target-neutral の規則）。
 
 ## 7. 非主張
@@ -302,7 +302,7 @@ qualify は target × host × operation × consistency ごとに、実際に走�
 
 ## 8. 次に決めること（owner 判断）
 
-1. marshal 契約の正本 repo（§4.5 の置き案の確定）と、marshal spec の versioning domain。
+1. 境界の形の正本 repo（§4.5 の置き案の確定）と、その spec の versioning domain。
 2. image 定義（§5.1）の ADR 化と、conformance vectors（save / restore / 未解決依存の拒否）。
 3. 対話環境（§5.2）の contract 分割（REPL / editor plane / receipt debugger）。
 4. live redefinition（§5.3）の束縛操作と receipt の shape。
@@ -320,6 +320,6 @@ qualify は target × host × operation × consistency ごとに、実際に走�
 | 分散の既定構成 | [stack-architecture-target-neutral.ja.md](stack-architecture-target-neutral.ja.md) | 参照のみ |
 | agent-centric な面 | root ADR-2610082200 | 参照のみ |
 | 順序 domain / chain | inga（ADR-2608038000）、awai L1 charter（ADR-2610092330） | 参照のみ |
-| marshal 契約 | （未定。§4.5 の置き案） | 草案を [kotoba-marshal.draft.edn](kotoba-marshal.draft.edn) に置く |
+| 境界の形の契約 | （未定。§4.5 の置き案） | 草案を [kotoba-lisp-machine-boundary.draft.edn](kotoba-lisp-machine-boundary.draft.edn) に置く |
 | image / 対話 / live | （未定） | §5 の提案。ADR 化は各 repo の規則に従う |
 | 層の凡例 | root `manifest/kotoba-stack-legend.edn` | 番号を足さない |
