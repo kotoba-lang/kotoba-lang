@@ -4,6 +4,10 @@ Status: **提案（:proposed）** · 2026-10-21。責務と構造の設計提案
 qualification・広告可能な完成のいずれも意味しない。証拠のない箇所には「未実装」または
 「:proposed」と書く。**文書の変更だけを実装移行と数えない。**
 
+名前は owner 確定（2026-10-21）: **Kotoba Lisp machine**。描写的な名を採用し、metaphor 名
+（kumiori / orimono 等の候補）は使わない。「kotoba marshal」という名は誤入力であり、
+この設計の名でも契約の名でもない。
+
 正本関係は [authority-map.edn](authority-map.edn) に従う。責務の凡例は
 [stack-architecture.md](stack-architecture.md)、VM の正本は
 [kototama-vm-v1.edn](https://github.com/kotoba-lang/kototama/blob/main/spec/kototama-vm-v1.edn)、
