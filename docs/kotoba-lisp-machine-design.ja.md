@@ -177,7 +177,7 @@ image・cell・chain をまたぐには、値・コード・状態・記録が�
 2. image の保存と復元が「同じ境界の形で世界を CID に落とす」ことになる（§5.1）。
 3. 分散が「同じ code を別の machine で検証して実行すること」に落ち着く（§6.2）。
 
-### 4.5 正本の置き場（:proposed、owner 決定待ち）
+### 4.5 正本の置き場（決定: [ADR-kotoba-lisp-machine-contract-decisions.md](adr/ADR-kotoba-lisp-machine-contract-decisions.md) D1）
 
 **新規 repo は作らない。** target-neutral の方針（独立 consumer と release 境界の確認まで
 新規 repo / 一括改名をしない）に従う。置き案:
@@ -304,15 +304,21 @@ receipt だけである。どこでも「同じ値の形」で通る。
 qualify は target × host × operation × consistency ごとに、実際に走った artifact と
 拒否した経路と receipt で行う。
 
-## 8. 次に決めること（owner 判断）
+## 8. 決定の記録（2026-10-21、owner 判断）
 
-1. 境界の形の正本 repo（§4.5 の置き案の確定）と、その spec の versioning domain。
-2. image 定義（§5.1）の ADR 化と、conformance vectors（save / restore / 未解決依存の拒否）。
-3. 対話環境（§5.2）の contract 分割（REPL / editor plane / receipt debugger）。
-4. live redefinition（§5.3）の束縛操作と receipt の shape。
-5. cell 間呼び出し・remote call の正式 owner / API（target-neutral の「残る判断」のうち
-   hata / mon / ito / nuno に掛かるもの）。
-6. awai S1 ゲートの計測順序（この文書の範囲外。awai-l1-charter の担当）。
+正本は [ADR-kotoba-lisp-machine-contract-decisions.md](adr/ADR-kotoba-lisp-machine-contract-decisions.md)。
+
+1. 境界の形の正本 repo と versioning domain → **決定**（ADR D1）。配置は §4.5 の確定。
+   owner repo への移管は各 repo の手順に従う未了の作業。
+2. image 定義（§5.1）の ADR 化と conformance vectors → **決定・草案添付**（ADR D2、
+   vectors は [kotoba-lisp-machine-image-vectors.draft.edn](kotoba-lisp-machine-image-vectors.draft.edn)）。
+3. 対話環境（§5.2）の contract 分割 → **決定**（ADR D3: REPL / editor plane / receipt debugger
+   の 3 契約。統合環境はこの 3 つの集まり、単一 repo への再編なし）。
+4. live redefinition（§5.3）の束縛操作と receipt の shape → **決定**（ADR D4: rebind 操作。
+   紋は不変、running な継続は古い DefCID のまま）。
+5. cell 間呼び出し・remote call の正式 owner / API → **決定**（ADR D5: 機（kotoba-lang/hata）。
+   mon / ito / nuno の owner は残る）。
+6. awai S1 ゲートの計測順序 → **引き渡し**（ADR D6: awai-l1-charter の担当。順序案の記録のみ）。
 
 ## 9. 正本ルーティング
 
@@ -324,6 +330,6 @@ qualify は target × host × operation × consistency ごとに、実際に走�
 | 分散の既定構成 | [stack-architecture-target-neutral.ja.md](stack-architecture-target-neutral.ja.md) | 参照のみ |
 | agent-centric な面 | root ADR-2610082200 | 参照のみ |
 | 順序 domain / chain | inga（ADR-2608038000）、awai L1 charter（ADR-2610092330） | 参照のみ |
-| 境界の形の契約 | （未定。§4.5 の置き案） | 草案を [kotoba-lisp-machine-boundary.draft.edn](kotoba-lisp-machine-boundary.draft.edn) に置く |
-| image / 対話 / live | （未定） | §5 の提案。ADR 化は各 repo の規則に従う |
+| 境界の形の契約 | [ADR-kotoba-lisp-machine-contract-decisions.md](adr/ADR-kotoba-lisp-machine-contract-decisions.md) D1（配置確定、移管は未了） | 草案を [kotoba-lisp-machine-boundary.draft.edn](kotoba-lisp-machine-boundary.draft.edn) に置く |
+| image / 対話 / live | 同 ADR D2–D4 | §5 が本文、vectors は [kotoba-lisp-machine-image-vectors.draft.edn](kotoba-lisp-machine-image-vectors.draft.edn) |
 | 層の凡例 | root `manifest/kotoba-stack-legend.edn` | 番号を足さない |

@@ -236,7 +236,9 @@ neutral入口のsource closureはrequire 0であり、core-contracts repo全体�
 
 中立descriptor ownerとv2の閉じたschemaは確定・実装済み。今後決める点は、profile bindingのcodec/hash domainの認定、native/Script profileの共通化範囲、
 VM conformanceのtarget別対象、consensus domainのmembership/finality/recovery、
-hata/mon/ito/nunoの正式なowner/API。これらを設計図だけで決定済みにはしない。
+mon/ito/nunoの正式なowner/API。hataのcell間呼び出し・remote call APIのownerは
+機（kotoba-lang/hata）に確定した（ADR-kotoba-lisp-machine-contract-decisions.md D5、2026-10-21）。
+これらを設計図だけで決定済みにはしない。
 
 参照：
 [core-contracts](https://github.com/kotoba-lang/kotoba-core-contracts/blob/main/spec/execution-contract.edn)、
