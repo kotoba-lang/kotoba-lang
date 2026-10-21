@@ -51,3 +51,8 @@ and signed-package options are refused on this route. Checked Kotoba and the
 signed `library inspect/publish` and `package add/run` workflows retain their
 existing contracts. Signed subtree publication/admission remains a separate
 release gate.
+
+SCI consumers may depend on the same immutable language revision with
+`:deps/root "lib/library-import"`. This portable profile uses the exact
+authoritative resolver source and its text dependency, without adding the
+full authority's compiler/JVM graph to a script host.
