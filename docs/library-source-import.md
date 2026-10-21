@@ -40,6 +40,10 @@ source APIs remain available too. Duplicate aliases of one ID select one copy.
 
 SCI reads the CLJS branch of `.cljk`/`.cljc` sources and invokes the declared
 namespace's `main` function, or `--function`, with repeated EDN `--arg` values.
+Lisp entry names such as `+`, `-`, `/`, `valid?`, `value'` and Unicode names
+are accepted; quote shell-sensitive names when passing them to the CLI. Prior
+qualified selector spellings remain compatible. Naming is defined by the
+[Kotoba naming Spec](lang/naming.md), and changes no execution authority.
 `--source-path`/`-S` adds explicit project roots. Bundled source roots take
 precedence, and an import path escaping the installed source tree is refused.
 
