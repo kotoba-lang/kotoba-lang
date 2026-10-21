@@ -100,7 +100,7 @@ target-neutral 文書が Wasm / WIT に対して立てた線と同じである�
 flowchart TB
   subgraph local["1 cell = 1 machine（ローカル面）"]
     Code["code（DefCID）"] -->|check / project-link / compile| AMU["amu"]
-    AMU -->|artifact| M1["境界: host ↔ guest"]
+    AMU -->|artifact| M1["選択した ABI / context の境界（native 内部は直接リンク）"]
     M1 --> Host["host / 機"]
     Host -->|境界: value ↔ wire| VM["kototama 遷移（fuel）"]
     VM -->|receipt| World["world root（IPLD CID）"]
@@ -138,6 +138,12 @@ flowchart TB
 - kototama: 値は `:tagged-dag-cbor-vector` に正規化され、`:host-object false`。
 
 ### 4.2 5 つの境界（domain）
+
+Native 内部は [実行領域の ADR](adr/ADR-native-execution-domains.md) に従う。
+同じ値表現・実行 context・権限領域・資源 budget の閉じた呼出しでは通常の型付き呼出しを使う。
+名前空間や役割が異なるだけでは符号化しない。下表の host ↔ guest は実際に ABI / context
+を越える profile の境界であり、native の全関数呼出しに課すものではない。
+admission、provider の権限強制、資源制限、cell・wire・永続化の境界は残す。
 
 | domain | 通る物 | 現行の記述場所 | 境界の形 | 判断は誰か |
 |---|---|---|---|---|

@@ -46,6 +46,11 @@ separate axes; a diagram must say which one it shows.
 
 ## Execution and artifact flow
 
+Native implementations use ordinary typed calls within a closed execution
+domain. Guest/host adapters belong to actual target/context crossings;
+authority and resource enforcement remain distinct responsibilities. See
+[native execution domains](adr/ADR-native-execution-domains.md).
+
 Solid labelled arrows describe operations or artifact consumption. Dashed
 arrows describe optional deployment composition, not source imports.
 
