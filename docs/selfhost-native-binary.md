@@ -1,4 +1,21 @@
-# `kotoba` as a native binary, without GraalVM
+# `kotoba` as an Amu selfhost-built native binary
+
+## Current contract — 2026-10-22
+
+Canonical source is `.kotoba`; compiler, CLI, build orchestration, packaging
+and execution use Amu selfhost-produced native artifacts. Remove
+CLJK/CLJC/CLJS, NBB, KBB, Clojure, Java/JVM, GraalVM, Node and C
+compiler/loader/runtime dependencies. Retaining CLJK syntax sugar and pinning
+a C loader are superseded conditions. `--jvm-free` alone does not qualify a
+selfhost route. Missing native functionality is blocked, without a hosted
+fallback. See [the current decision](adr/ADR-kotoba-amu-selfhost-only.md) and
+the machine contract in `lang/q9-migration.edn`.
+
+## Historical measurements and earlier contracts
+
+The commands, goals and implementation statements below record their dated
+observations. They are not current execution instructions or acceptance
+exceptions, and do not prove the native build closure required above.
 
 The released `kotoba` is a native executable. It is not a native executable
 that Kotoba produced.

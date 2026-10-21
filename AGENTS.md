@@ -9,10 +9,11 @@ catalog is separate from signed CID language package admission; runtime tools
 and west pins retain their owning repository's authority. See
 `docs/adr/ADR-kotoba-extension-registry-reference.md`.
 
-## Q9 source migration is whole-component and JVM-free
+## Q9 uses whole-component Kotoba / Amu selfhost only
 
-The machine authority is `lang/q9-migration.edn`; the accepted decision is
-`docs/adr/ADR-q9-whole-component-build-migration.md`.
+The machine authority is `lang/q9-migration.edn`; the current owner decision
+(2026-10-22) is `docs/adr/ADR-kotoba-amu-selfhost-only.md`. It supersedes the
+hosted runtime permissions in the earlier whole-component Q9 contract.
 
 - Migrate a complete namespace/deployable component: every public export and
   its transitive Kotoba source closure. A predicate, decision core or
@@ -20,21 +21,25 @@ The machine authority is `lang/q9-migration.edn`; the accepted decision is
 - Keep native mechanisms behind explicit capability/provider imports. Do not
   shrink the component to avoid a missing language or backend feature; mark
   that migration blocked.
-- Every target must pass the verified native Kotoba CLI (`kotoba check`,
-  `kotoba compile`, and package-level `kotoba rad build`) and Amu
-  `check`/`compile` with `--jvm-free`.
-- Q9 build, test, parity and soak gates must not require a JDK, Java process or
-  Clojure CLI. Deny/trace `java`, `javac`, `clojure` and `clj`; unsupported
-  routes and lock failures fail closed instead of falling back to the JVM.
-- Run portable retained `.cljc` oracles through nbb/CLJS, native or Wasm, or
-  use content-addressed golden vectors. JVM observations are diagnostic only.
-- Existing JVM/Clojure compiler and test paths are compatibility surfaces;
-  they cannot satisfy or weaken Q9 acceptance.
+- Final source is canonical `.kotoba`. CLJK syntax sugar, CLJC/CLJS source
+  and host adapters are migration inputs to port and retire.
+- Every target uses the qualified Amu selfhost-built Kotoba and Amu CLI for
+  source checks, project builds, packaging and execution. `--jvm-free` alone
+  does not qualify the compiler or exclude Node/NBB/C.
+- Build, test, parity and soak closures must not depend on NBB, KBB,
+  Clojure, Java/JVM, GraalVM, Node, a C compiler/loader/runtime, or wrappers
+  invoking them. Record actual process traces and compiler generations.
+- Port oracle behavior to Kotoba/native or selfhost-produced Wasm, retaining
+  content-addressed golden vectors and historical observations as evidence.
+  Do not retain a hosted oracle as a required comparison route.
+- Unsupported routes, missing native policy tooling and lock failures stay
+  blocked. Do not replace missing component behavior with a smaller slice or
+  silently fall back. CDCI has only the Amu selfhost and Kotoba native gates;
+  both and their controller use loaderless `x86_64-linux-static` ELF.
 
 
-## Claude 向け追記（旧 CLAUDE.md より統合）
+## Shared agent rule
 
-In particular, Q9 migration is a complete-component move,
-not decision-core extraction, and its build/acceptance path is JVM-free:
-verified native `kotoba` plus Amu `--jvm-free`. Never use an installed JDK or
-`clojure` fallback to make a migration pass; block the migration instead.
+All agents follow this contract. Old inventories, receipts and ADRs record
+past state; they do not prove current native qualification or grant permission
+for a production cutover or stopping existing services. Preserve unrelated WIP.
