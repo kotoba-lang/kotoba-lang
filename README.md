@@ -491,6 +491,7 @@ authoritative in machine-readable contracts and qualification evidence.
 - [Safety claims and residual risks](lang/safety-claims.edn)
 - [Capability semantics](lang/capability-semantics.edn)
 - [Component role model](lang/component-role-model.edn)
+- [Bundled dotted-ID source imports](docs/library-source-import.md)
 - [Library publication authority](lang/library-publication.edn)
 - [Public library catalog](https://kotoba-lang.org/libraries/)
 - [Kotoba extension registry: skills and MCP](https://github.com/kotoba-lang/kotoba-registry)
