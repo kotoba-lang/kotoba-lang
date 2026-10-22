@@ -64,8 +64,26 @@ The full existing app-data confinement contract remains mandatory: narrowed
 scope, no symlink traversal, proved descriptor ownership, and absence without
 existence leakage outside scope. Framing does not relax or establish those
 properties. Provider/authority/resource failures cannot become successful
-empty responses. The native candidate's generic non-EXISTS path-failure trap
-still needs reconciliation with the outside-scope absence rule.
+empty responses. The native candidate now distinguishes C1 scope denial from
+invalid state and applies owning decision op 48 before target filesystem
+access. Both rename operands are checked before opening either parent.
+
+An out-of-scope path answers `0` for boolean forms 3/7/8/9/10/11/12 and empty
+text for data forms 0/1/2/4/5/6/13/14/15. Unknown forms and genuine request,
+provider or resource failures remain terminal. Every FS2 absence answer still
+carries the acknowledgement and uses real result budgets. This describes all
+sixteen forms; it does not qualify actual confinement or no-leak behavior.
+The complete path span, including a rename destination, rejects NUL before
+normalization; ordinary valid path bytes and content tails are preserved.
+The exact matching Amu-produced sealed handler artifact must include op 48;
+an older artifact's unknown-op answer refuses rather than falling back.
+
+Native also carries the admitted root length to the updated C1 op 8 so scope
+`/` includes its descendants. The public decision arity stays unchanged;
+exact matching C1 and handler artifacts are both required. Shared opens and
+parent opens request BENEATH/NO_MAGICLINKS/NO_SYMLINKS, enforcing the declared
+all-component no-symlink rule in the mechanism. Final-link metadata does not
+traverse the link. Actual kernel/descriptor/race behavior is still unqualified.
 
 All frame/copy/answer bytes and result cells consume real checked budgets.
 Actual source spans, path/root grants, complete C1/decision artifacts, native
