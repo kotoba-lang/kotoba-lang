@@ -85,6 +85,15 @@ parent opens request BENEATH/NO_MAGICLINKS/NO_SYMLINKS, enforcing the declared
 all-component no-symlink rule in the mechanism. Final-link metadata does not
 traverse the link. Actual kernel/descriptor/race behavior is still unqualified.
 
+The native path API performs lexical normalization before scope admission
+and lookup. No-follow applies to that resulting path; raw POSIX traversal of
+discarded components is not an added port requirement. Absent/false scope
+uses a filesystem anchor at `/` while preserving inherited spawn cwd.
+Direct children of `/` use the root parent; attempts to mutate the granted
+root through its external parent answer negatively without opening it.
+Exact matching handler source must also include these op 15/19 rules; public
+decision arities/IDs, capability data and profile authority remain unchanged.
+
 All frame/copy/answer bytes and result cells consume real checked budgets.
 Actual source spans, path/root grants, complete C1/decision artifacts, native
 syscalls and result UTF-8/handle checks remain required. Operations are not
