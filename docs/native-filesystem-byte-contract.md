@@ -2,7 +2,9 @@
 
 This refines the existing proposed `:fs/app-data :answer-kinds :bytes`
 metadata. Status remains `:proposed`. No capability wire, effect, grant,
-confinement rule, form ID or existing string/string contract changes.
+confinement rule, existing form ID or string/string contract changes.
+Proposed kind 11 adds a named FS2-only stage-member extension (form 16/Q);
+the original sixteen forms remain. No hosted token or kind-1 route is added.
 Historical provider sources/measurements do not qualify the native proposal.
 
 | Contract | Request | Result | Discriminator | Forms |
@@ -10,6 +12,7 @@ Historical provider sources/measurements do not qualify the native proposal.
 | `bytes-v1` | `:bytes` | `:bytes` | 8 | write 1, append 2 |
 | `string-bytes-v1` | `:string` | `:bytes` | 9 | read 0, range 4 |
 | `string-byte-chunks-v1` | `:string` | `[:list :bytes]` | 10 | read 0, range 4 |
+| `byte-chunks-v1` | `[:list :bytes]` | `[:list :bytes]` | 11 | write 1, append 2, stage-member 16 |
 
 Both ABI metadata words carry the same whole-contract discriminator. Kind 9
 does not mean bytes/string. The compiler-port draft's numeric names are
@@ -18,7 +21,7 @@ are admitted; GMIR main still stops at kind 7.
 
 ## Framing and boundaries
 
-Both contracts use the existing wire 35 / provider 5 / handler 7. Requests
+These contracts use the existing wire 35 / provider 5 / handler 7. Requests
 require FS2: five marker bytes 0,70,83,50,0, then one form byte, nonempty
 UTF8 path, NUL and a tail. Read has no tail. Range uses offset:length text.
 Write/append tail bytes are arbitrary, including NUL and malformed UTF8.
@@ -51,14 +54,33 @@ out-of-domain string or silently shorten the source.
 
 ## Qualification still open
 
+Contract 11 validates the full outer list, all inner byte windows/words and
+aggregate size before pool allocation. It concatenates one bounded raw
+request span under real run budgets, then the original complete WRITE/APPEND
+keeps one opened descriptor for the entire content. Only the path is UTF8
+checked. No per-chunk reopen/truncation or aggregate value-size reduction is
+introduced. Paired source now includes all seven IO names and ordered output
+publication; caller/type adaptation and native terminal-trap cleanup remain
+explicitly unqualified.
+
+Stage-member tail is 1..6 octal mode digits, NUL, then arbitrary full payload.
+After complete request validation and scope admission it exclusively creates
+an empty no-follow 0600 file, applies permission bits with fchmod before any
+data, writes all bytes, fsyncs and checks close through ONE descriptor. Thus
+mode 0000/0400 does not require reopening a now inaccessible file. Success
+is acknowledged payload "1" only after all steps; denied scope answers "0".
+It is proposed only under kind 11; all other contracts reject form 16 before
+path access. Existing WRITE/APPEND echo semantics are unchanged. Detailed
+native stage-failure diagnostics and terminal cleanup remain unqualified.
+
 Contract 10 returns the full response as ordered bounded byte chunks while
 ONE read/range operation retains ONE opened descriptor. It does not reopen
 the path per chunk, which could mix same-size files across a rename. The
 aggregate uses actual run budgets; every element retains existing value
 bounds. FS2 acknowledgement may span chunks and is still mandatory. Paired
 Amu source now prepares a logical byte/text buffer and complete bounded input
-unit for the original 1 MiB/8 MiB domain. Its parent outputs, caller/parser/
-hash integration and all native qualification remain open.
+unit for the original 1 MiB/8 MiB domain. Parent output source is now present;
+caller/parser/hash integration and all native qualification remain open.
 
 Complete canonical GMIR/signature/type/value lowering and both ISA encoding,
 the Amu codec and full callers, native positive/refusal/authority/resource/
