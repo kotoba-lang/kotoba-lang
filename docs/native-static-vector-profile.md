@@ -1,5 +1,9 @@
 # Native static vector profile proposal
 
+Update: [complete bytes primitive profile](native-static-bytes-profile.md)
+adds four slots, existing per-value limits and canonical named refusals.
+The initial sixteen-slot candidate below remains source provenance.
+
 Tracking: JUN-241 / JUN-200 / JUN-201 / JUN-202, Kotoba Labs. Source proposal
 only; no native profile activation or runtime qualification is established.
 
