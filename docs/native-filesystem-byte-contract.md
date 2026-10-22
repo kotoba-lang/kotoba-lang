@@ -9,6 +9,7 @@ Historical provider sources/measurements do not qualify the native proposal.
 | --- | --- | --- | --- | --- |
 | `bytes-v1` | `:bytes` | `:bytes` | 8 | write 1, append 2 |
 | `string-bytes-v1` | `:string` | `:bytes` | 9 | read 0, range 4 |
+| `string-byte-chunks-v1` | `:string` | `[:list :bytes]` | 10 | read 0, range 4 |
 
 Both ABI metadata words carry the same whole-contract discriminator. Kind 9
 does not mean bytes/string. The compiler-port draft's numeric names are
@@ -49,6 +50,15 @@ text values: decoding several chunks is not permission to concatenate an
 out-of-domain string or silently shorten the source.
 
 ## Qualification still open
+
+Contract 10 returns the full response as ordered bounded byte chunks while
+ONE read/range operation retains ONE opened descriptor. It does not reopen
+the path per chunk, which could mix same-size files across a rename. The
+aggregate uses actual run budgets; every element retains existing value
+bounds. FS2 acknowledgement may span chunks and is still mandatory. Paired
+Amu source now prepares a logical byte/text buffer and complete bounded input
+unit for the original 1 MiB/8 MiB domain. Its parent outputs, caller/parser/
+hash integration and all native qualification remain open.
 
 Complete canonical GMIR/signature/type/value lowering and both ISA encoding,
 the Amu codec and full callers, native positive/refusal/authority/resource/
