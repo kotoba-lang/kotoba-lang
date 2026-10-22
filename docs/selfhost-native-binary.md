@@ -11,6 +11,11 @@ selfhost route. Missing native functionality is blocked, without a hosted
 fallback. See [the current decision](adr/ADR-kotoba-amu-selfhost-only.md) and
 the machine contract in `lang/q9-migration.edn`.
 
+The former hosted source-scan, differential and red-probe drivers are retired
+from `scripts/`. Their exact source text and full corpus are historical data;
+see [the retirement record](native-selfhost-harness-retirement.md). Native
+compiler/runner availability and full execution qualification remain open.
+
 ## Historical measurements and earlier contracts
 
 The commands, goals and implementation statements below record their dated
@@ -101,9 +106,11 @@ KIR, interface, effect row, dependencies by CID — in that plane?*
 
 ## The measurement in `lang/selfhost-distance.edn`, and what it is not
 
-`scripts/measure-selfhost-distance.cljk` walks the 137 `.cljc` files on the
-compiler's own classpath (85,106 lines) and runs the two gates that the
-**authored-input** surface has:
+The historical `measure-selfhost-distance.cljk` scanned the 137 `.cljc` files
+on the compiler's then-current classpath (85,106 lines) and ran the two gates
+that the **authored-input** surface had. Its retired source is preserved as
+text under `docs/evidence/retired-selfhost-host-drivers-20261022/`; these old
+counts are not a current source graph or a native acceptance result:
 
 | gate | passes |
 |---|---:|
