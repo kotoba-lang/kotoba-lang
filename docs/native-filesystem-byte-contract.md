@@ -3,7 +3,8 @@
 This refines the existing proposed `:fs/app-data :answer-kinds :bytes`
 metadata. Status remains `:proposed`. No capability wire, effect, grant,
 confinement rule, existing form ID or string/string contract changes.
-Proposed kind 11 adds a named FS2-only stage-member extension (form 16/Q);
+Proposed kind 11 adds FS2-only stage-member (16/Q), begin-output-set (17/R)
+and discard-output-set (18/S) extensions;
 the original sixteen forms remain. No hosted token or kind-1 route is added.
 Historical provider sources/measurements do not qualify the native proposal.
 
@@ -12,7 +13,7 @@ Historical provider sources/measurements do not qualify the native proposal.
 | `bytes-v1` | `:bytes` | `:bytes` | 8 | write 1, append 2 |
 | `string-bytes-v1` | `:string` | `:bytes` | 9 | read 0, range 4 |
 | `string-byte-chunks-v1` | `:string` | `[:list :bytes]` | 10 | read 0, range 4 |
-| `byte-chunks-v1` | `[:list :bytes]` | `[:list :bytes]` | 11 | write 1, append 2, stage-member 16 |
+| `byte-chunks-v1` | `[:list :bytes]` | `[:list :bytes]` | 11 | write 1, append 2, stage-member 16, begin 17, discard 18 |
 
 Both ABI metadata words carry the same whole-contract discriminator. Kind 9
 does not mean bytes/string. The compiler-port draft's numeric names are
@@ -72,6 +73,23 @@ is acknowledged payload "1" only after all steps; denied scope answers "0".
 It is proposed only under kind 11; all other contracts reject form 16 before
 path access. Existing WRITE/APPEND echo semantics are unchanged. Detailed
 native stage-failure diagnostics and terminal cleanup remain unqualified.
+
+Begin/discard have empty tails. Begin uses the original private-directory
+creation policy with a fixed .kotoba-output- prefix; it returns an
+acknowledged absolute staging path or an acknowledged empty absence/failure.
+Discard matches the exact owned staging path and returns acknowledged "1"
+only on complete removal, "0" on incomplete removal. Only kind 11 admits
+these forms. No kind-1/legacy-token extension or new capability authority is
+introduced.
+
+Paired native source now retains parent/directory/current-member FDs,
+journals successful mkdir/member-open before sealed outcome conversion,
+and composes cleanup into normal/fatal/signal exits. The original fatal
+diagnostic/exit is retained; incomplete cleanup is separately reported and
+makes an otherwise successful exit nonzero. These are source facts only.
+Name replacement races, mkdir/open journaling windows, signal interruption,
+close failures and process death remain unqualified; an uncaptured created
+directory can remain. This is not an all-crash removal guarantee.
 
 Contract 10 returns the full response as ordered bounded byte chunks while
 ONE read/range operation retains ONE opened descriptor. It does not reopen
