@@ -51,22 +51,26 @@ precompiled example rather than an arbitrary in-browser compiler.
 The displayed Kotoba source is tokenized at build time by
 `kotoba-lang/grammar`'s portable `kotoba.grammar.highlight/tokenize` API; the
 site does not maintain a tokenizer, keyword list, or forbidden-form list.
-Stable TextMate-compatible scopes are adapted to presentation classes, and the
-generator fails if concatenating the highlighted tokens does not reproduce the
-exact `.kotoba` source. The generated TextMate artifact remains digest-checked
-as the editor scope contract. The deployed page needs no client-side syntax
-highlighter or third-party runtime dependency.
-`site/dependencies.edn` records the grammar revision, artifact digest, scope,
-other build-time repositories, and the intentionally small browser runtime
-dependency surface. The generator verifies the grammar digest and scope before
-rendering and publishes the manifest at `/dependencies.edn`.
+Stable TextMate-compatible scopes are mapped through the shared
+`themes/kotoba-awai.json` Awai manifest into presentation classes. The site
+uses its light and dark token colors with the existing theme toggle, and keeps
+the forbidden-form red signal. The generator fails if concatenating the
+highlighted tokens does not reproduce the exact `.kotoba` source. Both the
+generated TextMate grammar and Awai color manifest are digest-checked at build
+time. The deployed page needs no client-side syntax highlighter or third-party
+runtime dependency.
+`site/dependencies.edn` records the grammar and theme revisions, artifact
+digests, scope, other build-time repositories, and the intentionally small
+browser runtime dependency surface. The generator verifies the grammar digest,
+scope, and theme digest before rendering and publishes the manifest at
+`/dependencies.edn`.
 ## Dark mode
 
-Both themes come from one knob: `jp-go-dds.page` is called with `:dark? true`,
-which inserts `jp-go-dds.dark`'s inversion layer and writes `color-scheme` and
-`theme-color` for both modes. Application CSS defines no palette — every mark,
-including the charts, reads a `--hig-*` token — so the whole page follows the
-mirrored DADS ramps without a second set of colours.
+The site theme control drives both light and dark modes. `jp-go-dds.page` inserts
+the design system's surface inversion and writes `color-scheme` and `theme-color`
+for both modes. Application chrome and charts read `--hig-*` tokens; Kotoba
+syntax colors are the deliberate exception and come from the shared Awai
+manifest, with light and dark values selected by the same theme control.
 
 Two things had to be fixed for it, and both were invisible in light mode:
 
