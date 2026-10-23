@@ -684,6 +684,44 @@ kbb --backend sci --classpath site/src site/test/locales_test.cljk
 kbb --backend sci --classpath site/src site/test/public_locales_test.cljk
 ```
 
+## Computability and safety design note
+
+`site/computability-article.edn` contains English and Japanese article source.
+Its intended routes are `/blog/computability-and-safety-20261023/` and
+`/ja/blog/computability-and-safety-20261023/`. The article is not registered in
+the current legacy generator or blog index. The detailed
+documentation is `docs/lang/computability-and-safety.md` and its `.ja.md`
+companion. The note separates usability, conservative effect analysis,
+operation authorization, target budgets and content identity. It records
+zero-charge loop re-entry and the native kexe profile's default unmetered fuel.
+
+Publication status for this addition: source recorded; generation, article
+registration and live publication remain pending. The legacy `site:build` path above uses
+KBB/SCI and Node, which the 22 October selfhost-only decision in `AGENTS.md`
+and `docs/adr/ADR-kotoba-amu-selfhost-only.md` no longer admits as an acceptance
+fallback. A qualified native/selfhost site generation and locale-validation
+route remains a release blocker. When that route is qualified, register the
+two articles, their index entries and reciprocal links, offer only the authored
+English/Japanese locales, and verify canonical/hreflang links and rendered pages.
+Do not edit `site/dist` by hand or label source inspection as a successful site
+build. This documentation change does not modify or activate the old generator.
+
+## Physical model and IPLD design note
+
+`site/physical-model-article.edn` contains the English and Japanese companion
+article. Its intended routes are `/blog/physical-model-and-ipld-20261023/` and
+`/ja/blog/physical-model-and-ipld-20261023/`. The two article sources include
+reciprocal links to those future routes; neither new route nor index entry is
+registered in the current generator. Detailed documentation and a Mermaid representation diagram
+live in `docs/lang/physical-model-and-ipld.md` and its `.ja.md` companion.
+
+The note distinguishes design emphasis from measured optimization, IPLD
+nodes from blocks, compiler ASTs from canonical identities, and ValueCID from
+Handle and Capability. It discusses block granularity, pure-result cache
+conditions, packed numeric buffers and end-to-end cost metrics. Source prepared
+does not mean published: the native/selfhost generation and locale-validation
+blocker described above applies to this article too.
+
 ## CSF assessment article
 
 `site/security-article.edn` holds the dated public article; `docs/security/csf2-threat-model.md` carries the English source-backed model, control boundaries and selected CSF mapping. The article is generated at `/blog/csf2-attack-graphs/` and all 16 translated equivalents, linked from each localized blog. New source strings use the shared root `scripts/model-eval/bench.cljs translate` policy with explicit public input. Translation receipts and provenance remain separate from native-language quality certification.

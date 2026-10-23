@@ -44,7 +44,10 @@ persistent pair-chain representations with linear bounded operations.
   resolution remain forbidden.
 - Hidden exception paths are excluded from safe components; fallible work uses
   explicit option/result values.
-- Execution is fuel-bounded. See the [fuel model](../lang/fuel-model.md).
+- Resource budgets and interruption depend on the target profile. Call fuel
+  alone does not bound zero-charge loop re-entry, and POSIX native kexe fuel
+  metering is off by default. See the [fuel model](../lang/fuel-model.md) and
+  [computability and safety](../lang/computability-and-safety.md).
 - Diagnostics are phase-tagged. The bounded stable registry is in the
   [generated diagnostic-code reference](../generated/diagnostics.md); compiler
   and host-specific codes outside it must not be presented as covered.

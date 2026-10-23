@@ -11,9 +11,12 @@ It describes what engines **actually do today**, not a wish list.
 
 ## 1. What fuel is
 
-Fuel is a **finite, non-replenishable call budget** attached to a program run.
-It prevents unbounded recursion / loops from hanging a host. Fuel is
-**interpreter / module bookkeeping** — never a guest `.kotoba` value.
+When metering is enabled, fuel is a **finite, non-replenishable call budget**
+attached to a program run. It bounds charged calls; zero-charge loop re-entry,
+provider time and unmetered profiles require separate host controls. Fuel is
+**interpreter / module bookkeeping** — never a guest `.kotoba` value. See
+[computability and safety](computability-and-safety.md) for the distinction
+between resource interruption and proving successful termination.
 
 | Property | Value |
 |---|---|
@@ -55,7 +58,8 @@ Evidence comments in tree:
 | Mutual recursion / multi-export helpers | 1 per call edge |
 | Deep expression tree, no calls | 1 |
 
-So `fact 5` costs a handful of units; a non-tail `forever` loop exhausts 512 and traps.
+So `fact 5` costs a handful of units; an indefinitely recursive, charged
+`forever` call exhausts an enabled fuel budget, unless another limit answers first.
 Demo: `compiler/examples/fuel.kotoba`.
 
 ---
@@ -100,9 +104,12 @@ their own bound; recursion still burns module fuel per call.
 | Pure-product oracles (murakumo-style, shallow call graph) | Succeed with large margin |
 | Bounded loops (`dotimes` small *N*) | OK if desugared call depth ≤ budget |
 | Deep recursion without true tail | May exhaust fuel or stack (T7.1 improves tail) |
-| Intentional non-termination | Always traps (fuel or host kill) |
+| Non-termination through charged calls | Exhausts enabled fuel unless another limit answers first |
+| Zero-charge loop re-entry | Call fuel alone does not interrupt it; the host needs an independent bound |
 
-**Fail closed:** never “run forever with warning.” Exhaustion is a trap, not a soft log.
+**Fail closed:** an enforced budget's exhaustion is a trap, not a soft log.
+This table is not a universal termination guarantee: native defaults differ,
+and a host must actually enforce the independent interruption it requires.
 
 ---
 
@@ -138,8 +145,9 @@ not be reintroduced on one backend only.
 ## loop / recur (T7.1 / T7.4)
 
 `loop`/`recur` desugar to a **named helper** (`__kotoba_loop_N`) that self-calls.
-Each iteration is a **function entry** and charges **1 fuel unit** (same as any
-call). Dual-backend pilot kits prove KIR + wasm agreement.
+The first helper entry charges **1 fuel unit** when call metering is enabled.
+The landed self-tail optimization below makes repeated entry zero-charge in
+the recorded KIR/Wasm paths. Dual-backend pilot kits cover that scoped agreement.
 
 **T7.4 + T7.1 (landed):** `:loop-deep-kit` runs **10_000** iterations with case
 `:fuel 16` (compiler#428). KIR trampolines + **zero-charges** self-tail re-entry

@@ -11,6 +11,12 @@ fuel, errors, capabilities, multi-backend meaning (R1 / T1.1).
 **Option/result (T4.3):** [`option-result-guide.md`](./option-result-guide.md).  
 **String kit (T4.2):** [`string-kit.md`](./string-kit.md).
 **Collections costs (T4.5):** [`collections-costs.md`](./collections-costs.md).
+**Computability and safety:** [`computability-and-safety.md`](./computability-and-safety.md)
+([日本語](./computability-and-safety.ja.md)) — the Turing tarpit, Rice's theorem,
+effect analysis, authority enforcement, and target-specific termination limits.
+**Physical model and IPLD:** [`physical-model-and-ipld.md`](./physical-model-and-ipld.md)
+([日本語](./physical-model-and-ipld.ja.md)) — data movement, persistence, reuse,
+verification, and logical identity versus execution layout.
 **Content-addressed incidence:** [`incidence.md`](./incidence.md) — immutable
 role relations, organization projection, and DID/VC/UCAN/ZCAP adapter boundary.
 
