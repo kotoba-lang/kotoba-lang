@@ -14,6 +14,9 @@ fuel, errors, capabilities, multi-backend meaning (R1 / T1.1).
 **Computability and safety:** [`computability-and-safety.md`](./computability-and-safety.md)
 ([日本語](./computability-and-safety.ja.md)) — the Turing tarpit, Rice's theorem,
 effect analysis, authority enforcement, and target-specific termination limits.
+**Physical model and IPLD:** [`physical-model-and-ipld.md`](./physical-model-and-ipld.md)
+([日本語](./physical-model-and-ipld.ja.md)) — data movement, persistence, reuse,
+verification, and logical identity versus execution layout.
 **Content-addressed incidence:** [`incidence.md`](./incidence.md) — immutable
 role relations, organization projection, and DID/VC/UCAN/ZCAP adapter boundary.
 

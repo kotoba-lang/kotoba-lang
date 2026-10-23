@@ -124,6 +124,10 @@ scope; they do not decide whether arbitrary programs compute the same function.
 Different definitions can compute the same function. An identified or signed
 definition can also contain a logic error.
 
+For the physical costs this design addresses, and the distinction between
+IPLD identity, compiler forms and execution layout, see
+[physical model and IPLD](physical-model-and-ipld.md).
+
 ## Evidence and maintenance
 
 This is a source-reading assessment, not a new runtime test or production
