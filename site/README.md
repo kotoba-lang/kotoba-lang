@@ -684,6 +684,25 @@ kbb --backend sci --classpath site/src site/test/locales_test.cljk
 kbb --backend sci --classpath site/src site/test/public_locales_test.cljk
 ```
 
+## Computability and safety design note
+
+`site/computability-article.edn` contains English and Japanese article source
+for `/blog/computability-and-safety-20261023/` and
+`/ja/blog/computability-and-safety-20261023/`. The generator adds it to the
+blog index and offers only those two languages on the article. The detailed
+documentation is `docs/lang/computability-and-safety.md` and its `.ja.md`
+companion. The note separates usability, conservative effect analysis,
+operation authorization, target budgets and content identity. It records
+zero-charge loop re-entry and the native kexe profile's default unmetered fuel.
+
+Publication status for this addition: source prepared; generated pages and
+live publication are unverified. The legacy `site:build` path above uses
+KBB/SCI and Node, which the 22 October selfhost-only decision in `AGENTS.md`
+and `docs/adr/ADR-kotoba-amu-selfhost-only.md` no longer admits as an acceptance
+fallback. A qualified native/selfhost site generation and locale-validation
+route remains a release blocker. Do not edit `site/dist` by hand or label
+source inspection as a successful site build.
+
 ## CSF assessment article
 
 `site/security-article.edn` holds the dated public article; `docs/security/csf2-threat-model.md` carries the English source-backed model, control boundaries and selected CSF mapping. The article is generated at `/blog/csf2-attack-graphs/` and all 16 translated equivalents, linked from each localized blog. New source strings use the shared root `scripts/model-eval/bench.cljs translate` policy with explicit public input. Translation receipts and provenance remain separate from native-language quality certification.

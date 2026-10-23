@@ -7,6 +7,11 @@ Kotoba uses one bounded relational vocabulary across the compiler and runtime,
 but it does not collapse their trust boundaries. The same predicate shape can
 carry facts from several origins; the origin determines what the fact proves.
 
+For the scope of these checks, Rice's theorem, and the distinction between
+authority enforcement and semantic correctness, see
+[computability and safety](computability-and-safety.md)
+([日本語](computability-and-safety.ja.md)).
+
 ```text
 source
   -> Amu infers effects and emits a content-bound logic manifest
