@@ -79,8 +79,13 @@ single-repository reorganization is decided here.
 
 ### D4. Live redefinition is rebind, not mutation
 
-The 紋 (rule Form / logic Form) of a running cell is immutable, as a Holochain
-DNA is. The live operation is a versioned rebinding:
+The 紋 of a running Cell is immutable: rule Form DefCIDs, entry schemas,
+properties, network seed and membrane define its identity. Logic Form is
+outside the 紋 CID (root ADR-2610082200 §2 and abi `spec/mon-v1.edn`). This
+2026-10-23 terminology correction preserves that existing contract: a change
+to 紋 requires an explicit network/Cell migration; a logic-only update need not
+change the network, but still requires interface/admission and update receipts.
+The live operation is a versioned rebinding:
 
 ```
 rebind(env-slot, old DefCID, new DefCID) -> receipt

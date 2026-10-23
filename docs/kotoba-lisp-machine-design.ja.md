@@ -57,6 +57,7 @@ target-neutral 文書が Wasm / WIT に対して立てた線と同じである�
 | Holochain | Kotoba での対応 | 状態 |
 |---|---|---|
 | integrity zome / coordinator zome の分離 | rule Form / logic Form | ADR-2610082200 §4 |
+| DNA / Cell | 紋 mon（網の定義）/ Cell（mon CID × agent 公開鍵） | abi `spec/mon-v1.edn` / hata.cell |
 | source chain（自分の action は自分でしか書けない） | 糸（cell ごとの署名付き action の連鎖） | ADR-2610082200 §5 |
 | validation が合意である（global order を作らない） | 合意の既定 | ADR-2610082200 §6 |
 | DHT を DNA で keyspace 分割 | 布（紋 CID で区切った Kademlia keyspace） | ADR-2610082200 §5 |
@@ -92,7 +93,9 @@ target-neutral 文書が Wasm / WIT に対して立てた線と同じである�
 
 ## 3. マシンの全体像
 
-**1 machine = 1 cell（= 紋 CID × agent 鍵）。** ネットワークは「1 つの巨大な共有 heap」では
+**1 machine = 1 Cell（= 紋 CID × agent 公開鍵の identity）。** 紋（mon）は DNA にあたる定義であり、
+Cell という実行 instance ではない。node / process / container は配置であり Cell identity と分ける。
+ネットワークは「1 つの巨大な共有 heap」では
 なく、同じ code（DefCID）と contract を各自が検証して実行する machine の集まりである。
 層の対応は root の凡例が正本。ここでは 2 つの面だけを描く。
 
@@ -236,8 +239,11 @@ image = { world root (IPLD CID)
 
 ### 5.3 live redefinition
 
-- 働いている cell の **紋（rule Form / logic Form）は不変**。Holochain の DNA と同じで、
-  upgrade は migration か新しい cell である。
+- 働いている Cell の **紋（rule Form・entry schema・properties・network-seed・membrane）は不変**。
+  logic Form は紋 CID に入らない（root ADR-2610082200 §2、abi `spec/mon-v1.edn`）。
+  紋の変更は新しい網 / Cell への明示 migration。logic の更新は同じ網のままでも可能だが、
+  interface pin・admission・下記の rebind receipt の gate を通す。Holochain の integrity と
+  coordinator の区別を参照し、logic-only 更新を新しい DNA と同一視しない。
 - live なのは **code environment の束縛**だけ。redefinition は in-place 変更ではなく
   「新しい DefCID を同じ環境スロットに束縛し直す」操作で、それ自体が receipt 付きの
   action になる。running な継続は古い DefCID のまま終わり、新しい束縛は次の呼び出しから効く。
@@ -327,6 +333,14 @@ qualify は target × host × operation × consistency ごとに、実際に走�
 6. awai S1 ゲートの計測順序 → **引き渡し**（ADR D6: awai-l1-charter の担当。順序案の記録のみ）。
 
 ## 9. 正本ルーティング
+
+Awai Network 全体への接続（owner 指示 2026-10-23）は
+[network-awai-apex ADR 0011](https://github.com/network-awai/network-awai-apex/blob/main/docs/adr/0011-awai-network-as-a-kotoba-lisp-machine-network.md)
+と[下が土台の積層図・Holochain 対応](https://github.com/network-awai/network-awai-apex/blob/main/docs/awai-integration-plan-2026-10-23.md)
+を参照する。全体構造は本 machine / cell 契約を利用するが、ABI や VM の意味論を所有しない。
+AWAI-22 が mon / hata / ito / nuno の native 接続、AWAI-30 が境界・image・rebind・call の実装を追跡する。
+Holochain の [DNA 定義](https://developer.holochain.org/build/dnas/) と
+[Cell の定義](https://developer.holochain.org/resources/glossary/) は構造の参照であり wire 互換の証拠ではない。
 
 | 主題 | 正本 | この文書の扱い |
 |---|---|---|
