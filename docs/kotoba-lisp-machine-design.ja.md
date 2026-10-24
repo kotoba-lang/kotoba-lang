@@ -80,6 +80,34 @@ target-neutral 文書が Wasm / WIT に対して立てた線と同じである�
 借りない: 全体 state trie を言語意味にすること、account model、
 「fuel = gas = 課金 credit」の同一視（kototama の compatibility 節が禁止）。
 
+### 2.2.1 Holochain の構造・IPLD 保存・EVM profile の接続
+
+2026-10-24 owner 採用の root
+[ADR-2610241600](https://github.com/com-junkawasaki/root/blob/main/90-docs/adr/2610241600-holochain-structure-ipld-and-evm-compatibility.kotoba)
+と product 側の
+[ADR0014](https://github.com/network-awai/network-awai-apex/blob/main/docs/adr/0014-holochain-structure-ipld-and-evm-compatibility.md)
+で統合境界を固定する。既存の言語意味、wire/CID、profile の所有者は変えない。
+
+- **構造**: mon の不変な rule/schema/参加条件、mon CID の外の logic Form、
+  Cell、hata、ito/nuno を Holochain 型の骨格にする。Holochain wire/API の互換宣言ではない。
+- **保存**: Yataverse は CID bytes の保存・取得・配信、Kura は保持・修復、kotobase は
+  commit graph/query projection/検証済み head。元の app action と派生 index を区別し、
+  graph 自身は宣言した署名 commit chain に従う。CID 一致を validation/finality と同一視しない。
+- **IPLD**: 既存の canonical encoding と link/CID を維持する。CAR round-trip は元 bytes/CID、
+  root と依存 closure を検証する。Ethereum 由来の bytes/hash は原形を保ち、対応する
+  IPLD link / DAG-ETH で参照する。DAG-CBOR への再符号化で Ethereum state root を名乗らない。
+- **EVM**: `evm/v1` の message / semantic / bytecode / state を個別に認定する。
+  chain spec、hardfork、gas schedule、precompile set、implementation revision を pin し、
+  公式 vectors と differential execution を使う。ABI/RPC/codegen だけを bytecode 実行互換と数えない。
+- **共有 state**: 残高・nonce・contract storage は Inga 等の順序・確定規則を持つ EVM domain で
+  更新する。Cell と権限付き message/receipt で接続し、replay/重複配送/timeout/reorg を扱う。
+  Cell ごとの独立した EVM state の同期だけで共有残高にせず、通常の Cell に全世界の順序を課さない。
+
+現行 awai charter D5 の `eth_getProof` 非提供は維持する。Ethereum の state/proof level は
+別の gate で、必要なら charter と proof 検証を一緒に再検討する。今回の設計採用は実装・
+profile 適合・本番移行の証拠ではない。実装受入は AWAI-22/30、JUN-23/296/300、
+EVM の AWAI-81 / KOTOBA-73 の順序 domain gate、KOTOBA-12/15 に接続する。
+
 ### 2.3 awai から借りるもの
 
 | awai | Kotoba での対応 | 状態 |
