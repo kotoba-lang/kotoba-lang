@@ -28,12 +28,12 @@ lock.write_text('KSL1\nentry ' + str(entry) + '\nroot ' + str(amu / 'src') + '\n
 env = dict(PATH='/nonexistent', KEXE_ALLOW='35,37,38,39', KEXE_STACK_BYTES='8388608',
            KEXE_CAP_RESOURCES_35=':'.join(map(str, [out, repo, amu])))
 calls = []
-def run(name, argv):
+def run(name, argv, expected=0):
     result = subprocess.run(list(map(str, argv)), cwd=out, env=env, capture_output=True, timeout=900)
     (out / (name + '.stdout')).write_bytes(result.stdout)
     (out / (name + '.stderr')).write_bytes(result.stderr)
     calls.append(dict(name=name, exit=result.returncode))
-    assert result.returncode == 0 and not result.stderr, (name, result.returncode, result.stdout, result.stderr)
+    assert result.returncode == expected and not result.stderr, (name, result.returncode, result.stdout, result.stderr)
 
 run('compile', [compiler, 'compile', entry, '--source-path', amu / 'src', '--source-lock', lock,
                 '--source-lock-sha256', pin(lock)['sha256'], '--target', 'aarch64-macos', '--output', out / 'reader.kseed'])
@@ -43,6 +43,16 @@ run('pack', [compiler, 'compile', amu / 'seed/x86_64-kx64-runner.kotoba', '--tar
 env['KEXE_CAP_RESOURCES_35'] = str(repo / 'lang')
 run('surface', [out / 'reader.elf', repo / 'lang/surface-status.edn', 'surface'])
 run('cli', [out / 'reader.elf', repo / 'lang/cli.edn', 'cli'])
+env['KEXE_CAP_RESOURCES_35'] = str(out)
+original = (repo / 'lang/cli.edn').read_text()
+for name, text, expected in [
+    ('changed-flag', original.replace('"--principal"', '"--obsolete-principal"', 1), 15),
+    ('duplicate-command', original.replace(':id :id', ':id :run', 1), 10),
+    ('hosted-runtime', original.replace(':values [:kotoba] :default :kotoba', ':values [:kotoba :sci] :default :kotoba', 1), 16),
+]:
+    candidate = out / (name + '.edn')
+    candidate.write_text(text)
+    run('refuse-' + name, [out / 'reader.elf', candidate, 'cli'], expected)
 receipt = dict(status='PASS_NATIVE_CLI_CONTRACT_ALL12_AND_FLAGS', compiler=pin(compiler), sourceLock=pin(lock),
                sources={('contract:' + str(path.relative_to(repo)) if path.is_relative_to(repo) else
                          'amu:' + str(path.relative_to(amu))): pin(path) for path in files},
