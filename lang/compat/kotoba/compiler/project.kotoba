@@ -1,15 +1,9 @@
 (ns kotoba.compiler.project
-  
-  {:kotoba/export [attribute-error attribute-linked-error instantiate-forms instantiation-key key-binding key-namespace link-source linked-position max-definition-closure-count max-linked-source-bytes max-project-dependency-edges max-project-depth max-project-exports max-project-expression-nodes max-project-functions max-project-literals max-project-modules max-project-source-bytes max-project-string-literal-bytes max-template-parameters module-info module-namespaces source-position with-module-file]}
-    
+  {:kotoba/export [attribute-error attribute-linked-error instantiate-forms linked-function-module instantiation-key key-binding key-namespace link-source linked-position max-definition-closure-count max-linked-source-bytes max-project-dependency-edges max-project-depth max-project-exports max-project-expression-nodes max-project-functions max-project-literals max-project-modules max-project-source-bytes max-project-string-literal-bytes max-template-parameters module-info module-namespaces source-position with-module-file]}
   (:require [kotoba.lang.text :as str]
             [kotoba.sema :as sema]
             [kotoba.kir.value :as value]
-            #?@(:cljs [[kotoba.lang.coll :as coll]
-                       [kotoba.kir.cljs-i64 :as i64]]) [kotoba.set.union :as ui :with {elem :i64}]
-;;                      [kotoba.set.union :as us :with {elem :symbol}] [clojure.set :as set] [[kotoba.lang.coll :as coll]
-                       [kotoba.kir.cljs-i64 :as i64]])
-)
+            ))
 
 ;; clojure.core/some, spelled as the loop it is. In Kotoba `some` is the
 ;; option constructor and a two-argument `(some pred coll)` is refused as a
@@ -67,7 +61,8 @@
 ;;   (ns kotoba.set.union (:params [elem]) (:export [union]))
 ;;   (defn union [s1 [:set elem] s2 [:set elem]] [:set elem] ...)
 ;;
-;;   (ns root  ...)
+;;   (ns root (:require [kotoba.set.union :as ui :with {elem :i64}]
+;;                      [kotoba.set.union :as us :with {elem :symbol}]) ...)
 ;;
 ;; Where a parameter symbol is a TYPE and where it is a NAME is decided the
 ;; way the frontend itself decides it (`parameter-type-item?`): a type is a
@@ -101,7 +96,7 @@
 ;;
 ;; Why this exists: DUAL-RUNTIME source. The compiler's own modules keep
 ;; loading on nbb / Clojure while they are being admitted here, and their
-;; `` cannot carry `:with` -- measured
+;; `(:require [clojure.set :as set])` cannot carry `:with` -- measured
 ;; 2026-09-11, ClojureScript 1.12.42 refuses the spec outright ("Only :as,
 ;; :refer and :rename options supported in :require / :require-macros"),
 ;; and Clojure 1.12.5 / nbb accept it only because they ignore libspec
@@ -764,21 +759,19 @@
                   (list (clause-params clause) (clause-result clause) (body-of clause)))
                 clauses))))
 
-(defn- stub-body [stub-name {:keys [params result callable-result-contract] :as clause}]
+(defn- stub-body [stub {:keys [params callable-result-contract]}]
   (if callable-result-contract
     ;; The stub exists only for isolated type/effect analysis and is
     ;; removed before linking. Its explicit result contract supplies
     ;; the closure refinement without inventing a lambda ID/helper that
     ;; could be mistaken for executable project code.
     0
-    (try (stub-value result)
-         (catch  _
-           ;; A result type with no closed value -- a `[:ref :x/y]` record
-           ;; returned across a module boundary is the case measured -- is
-           ;; still a well-typed result. The stub is never executed or linked,
-           ;; only analysed, and a call to itself has exactly the declared
-           ;; result type, so it types as that result without inventing a value.
-           (list* stub-name params)))))
+    ;; A signature-only import must not manufacture a default value of its
+    ;; result type. Recursive records may have no finite default, and an
+    ;; internal typed call is not a foreign-value ABI. This self-call checks
+    ;; exactly the declared signature and is removed with the stub before
+    ;; emission; no recursive trampoline survives in the executable graph.
+    (list* stub params)))
 
 (defn- aborting-clause?
   "True when the analysed export ABORTS: the frontend lowers a function that
@@ -925,6 +918,10 @@
                     ;; one import resolved. The frontend's refusal is the one
                     ;; that names the thing.
                     (when (= "kotoba.reader" (namespace op)) op)
+                    ;; The call is named in the sentence: the CLI prints only
+                    ;; the message, and a module with forty qualified calls
+                    ;; gave its reader no way to find the one refused
+                    ;; (measured 2026-10-09 on kotoba-lang/text).
                     (reject! (str "qualified call is not an admitted exported import: " op) {:call op}))
                 op)]
       (list* op' (map #(rewrite-import-calls % imported) args)))
@@ -951,6 +948,47 @@
 
 (defn- closure-apply-name? [name]
   (= '__kotoba_closure_apply name))
+
+;; A `loop` desugars to a `__kotoba_loop_N` helper, and that NAME is the whole
+;; contract by which a recur stays a loop: the KIR interpreter
+;; (`kotoba.kir/loop-helper-name?`) re-enters a self-tail call to such a helper
+;; in place -- no frame, no fuel (T7.1) -- and the cljs backend keys off the
+;; same prefix. Renamed to `kotoba_module__M__K` like any other local, a linked
+;; helper was an ordinary function calling itself, so every iteration took a
+;; call frame and any loop over ~30 items trapped `:budget/frames` under the
+;; default budget of 32 -- in the linked unit only; a single-file run of the
+;; same module never renames. So a linked helper keeps the shape.
+;;
+;; N must not collide with a helper the second analysis of the linked text
+;; mints from its own `*loop-counter*` (which starts again at 1). That counter
+;; ticks at most once per desugared form, so it stays under the frontend's
+;; `max-lowered-nodes` (100000), below this base; the per-module stride is the
+;; one `:lambda-id-base` uses, so two modules' helpers never share a number.
+(def ^:private linked-loop-helper-base 1000000)
+
+(defn- loop-helper-name? [name]
+  (and (symbol? name)
+       (nil? (namespace name))
+       (boolean (re-matches #"__kotoba_loop_\d+" (str name)))))
+
+(defn- linked-local-name [module-index function-index name]
+  (if (loop-helper-name? name)
+    (symbol (str "__kotoba_loop_" (+ linked-loop-helper-base
+                                     (* module-index sema/max-functions)
+                                     function-index)))
+    (symbol (str "kotoba_module__" module-index "__" function-index))))
+
+(defn linked-function-module
+  "The module index a linked local NAME (a string or symbol) came from, or nil
+  for a name the linker did not mint (an export wrapper, a dispatcher)."
+  [name]
+  (let [name (str name)]
+    (if-let [[_ m] (re-matches #"kotoba_module__(\d+)__\d+" name)]
+      (parse-long m)
+      (when-let [[_ n] (re-matches #"__kotoba_loop_(\d+)" name)]
+        (let [n (parse-long n)]
+          (when (>= n linked-loop-helper-base)
+            (quot (- n linked-loop-helper-base) sema/max-functions)))))))
 
 ;; `source-text` emits the linked module graph as text the reader has to read
 ;; back, so anything it prints unreadably breaks linking rather than merely
@@ -987,8 +1025,11 @@
     (str (str/join "\n" (map #(pr-str ) forms))
          "\n")))
 
+;; `symbol?` first: on nbb an integer leaf can be a js BigInt, and looking one
+;; up in a set hashes it, which throws (`Cannot create property 'closure_uid_…'
+;; on bigint`). Measured 2026-09-30: a let binding's `1` crashed the link.
 (defn- definition-symbols [form names]
-  (into #{} (filter names) (tree-seq coll? seq form)))
+  (into #{} (filter #(and (symbol? %) (contains? names %))) (tree-seq coll? seq form)))
 
 (defn- admit-definition-closures!
   "Bound each definition by the transitive definition graph it can call.
@@ -1449,7 +1490,7 @@
 (defn- check-referred-exports!
   "Every referred name must be an export of the module it is referred from."
   [info dependencies]
-  (doseq [{dep-name :namespace with :with refer :refer} 
+  (doseq [{dep-name :namespace with :with refer :refer} (:requires info)
           :when (seq refer)]
     (let [interface (:interface (get dependencies (instantiation-key dep-name with)))]
       (doseq [n refer
@@ -1505,7 +1546,7 @@
                           (map (fn [[export clauses]]
                                  [(symbol (str alias) (str export)) clauses])
                                (:interface dependency))))
-                      ))
+                      (:requires info)))
         stub-pairs (map-indexed (fn [index [qualified clauses]]
                                   [qualified (symbol (str "kotoba_import__" index)) clauses])
                                 (sort-by (comp str key) available))
@@ -1525,11 +1566,11 @@
         _ (check-referred-exports! info dependencies)
         rewritten (mapv #(rewrite-import-calls % import->stub)
                         (rewrite-referred-symbols (with-derived-export (without-requires forms) info)
-                                                  (referred-alias-table )))
+                                                  (referred-alias-table (:requires info))))
         dependency-schemas (into {}
                                  (map (fn [{dep-name :namespace with :with}]
                                         (:schemas (get dependencies (instantiation-key dep-name with)))))
-                                 )
+                                 (:requires info))
         augmented (into (with-dependency-schemas rewritten dependency-schemas)
                         (mapcat (fn [[_ stub clauses]] (stub-form stub clauses)) stub-pairs))
         ;; Lambda IDs are artifact data. Give every source module a disjoint
@@ -1563,18 +1604,10 @@
                                    :arity (arity-of function)}))
                        [(:name function) target])))
               stub-functions)
-        ;; A synthesized loop helper keeps the `__kotoba_loop_<digits>` shape
-        ;; (made unique across modules): the KIR interpreter trampolines a
-        ;; self-tail call only for a helper of that name, and a helper renamed
-        ;; `kotoba_module__M__F` nested one host frame per iteration, so a loop
-        ;; of a few hundred turns exhausted the host stack on the project route.
-        local-names (into {} (map-indexed (fn [function-index {:keys [name loop-helper?]}]
-                                            [name (if loop-helper?
-                                                    (symbol (str "__kotoba_loop_"
-                                                                 (+ (* module-index 1000000) function-index)))
-                                                    (symbol (str "kotoba_module__"
-                                                                 module-index "__"
-                                                                 function-index)))])
+        local-names (into {} (map-indexed (fn [function-index {:keys [name]}]
+                                            [name (linked-local-name module-index
+                                                                     function-index
+                                                                     name)])
                                           locals))
         global-dispatcher-names
         (into {}
@@ -1635,7 +1668,7 @@
                        [export (mapv #(interface-of % (get local-names (:name %)))
                                      clauses)])))
               (:exports info))]
-    {:namespace (:namespace info) :requires 
+    {:namespace (:namespace info) :requires (:requires info)
      :schemas (:schemas info)
      :functions functions :interface interface}))
 
@@ -1688,9 +1721,23 @@
                 (assoc :name '__kotoba_closure_apply)
                 (dissoc :project-closure-apply?))))))
 
+(defn- direct-exports
+  "Coalesce a single-clause root export with its implementation. This is
+  link-time name binding, not an ABI or authority crossing. Keep wrappers for
+  multi-arity exports and names that could capture an existing local."
+  [functions exports]
+  (let [used (set (mapcat #(tree-seq coll? seq
+                                   [(:name %) (:params %) (:body %)]) functions))]
+    (into {} (keep (fn [[export clauses]]
+                     (when (and (= 1 (count clauses)) (not (contains? used export)))
+                       [(:linked-name (first clauses)) export]))) exports)))
+
 (defn link-source
-  "Link a closed namespace->source map into one bounded source unit."
-  [sources root]
+  "Link a closed namespace->source map into one bounded source unit.
+  Native callers select :direct-exports? to avoid a forwarding call at the
+  root. Module imports already resolve to direct typed calls in this unit."
+  ([sources root] (link-source sources root {}))
+  ([sources root {:keys [direct-exports?]}]
   (when-not (and (map? sources) (pos? (count sources))
                  (<= (count sources) max-project-modules))
     (reject! "project source map is empty or exceeds module limit"
@@ -1807,7 +1854,7 @@
                 (when-not (contains? @linked key)
                   (vswap! visiting conj name)
                   (let [{:keys [forms info]} (instantiate name binding)]
-                    (doseq [{dependency :namespace with :with} ]
+                    (doseq [{dependency :namespace with :with} (:requires info)]
                       (when (> (vswap! edge-count inc) max-project-dependency-edges)
                         (reject! "project dependency edges exceed limit"
                                  {:edges @edge-count}))
@@ -1823,7 +1870,7 @@
       (visit root 1))
     (let [root-module (get @linked root)
           module-functions (vec (mapcat #(get-in @linked [% :functions]) @order))
-          functions (into module-functions (project-dispatchers module-functions))
+          linked-functions (into module-functions (project-dispatchers module-functions))
           ;; Clauses, not export names. `max-project-exports` bounds the
           ;; exported FUNCTION surface, and a multi-arity export is several
           ;; functions -- the artifact carries `twice$arity$1` and
@@ -1835,10 +1882,20 @@
                                         (reduce + (map count (vals (get-in @linked [module :interface])))))
                                       @order))
           exports (sort-by (comp str key) (:interface root-module))
-          wrappers (mapv wrapper-form exports)
+          direct (when direct-exports? (direct-exports linked-functions exports))
+          functions (if (seq direct)
+                      (mapv (fn [function]
+                              (-> function
+                                  (update :name #(get direct % %))
+                                  (update :body rewrite-calls direct)))
+                            linked-functions)
+                      linked-functions)
+          direct-names (set (vals direct))
+          wrapped-exports (remove #(contains? direct-names (first %)) exports)
+          wrappers (mapv wrapper-form wrapped-exports)
           ;; Same reason: one multi-arity wrapper form is several functions
           ;; against `max-project-functions`.
-          wrapper-function-count (reduce + (map (comp count val) exports))
+          wrapper-function-count (reduce + (map (comp count val) wrapped-exports))
           function-count (+ (count functions) wrapper-function-count)
           ;; The linked namespace deliberately carries NO `:capabilities`
           ;; clause even when its modules declared one. That clause is a
@@ -1874,7 +1931,7 @@
           (into
            (mapv (fn [{:keys [name params param-types result body
                               callable-param-contracts callable-result-contract]}]
-                   (list 'defn- name
+                   (list (if (contains? direct-names name) 'defn 'defn-) name
                          (typed-params params param-types callable-param-contracts)
                          (or callable-result-contract result)
                          body))
@@ -1924,7 +1981,7 @@
       {:source
        linked-source
        :root root :module-order @order :modules (set @order)
-       :source-map source-map})))
+       :source-map source-map}))))
 
 (defn source-position
   "Translate a line in the linked source back to the module that wrote it.
