@@ -33,11 +33,27 @@ automatic `object.field` evaluation or an executable publish/subscribe form.
 ## Dotted IDs and exact aliases
 
 An ID has at least two nonempty dot-separated segments, each matching
-`[a-z][A-Za-z0-9]*`. Project library and event profiles MUST start with
-`kotoba.`. This is project authority, not DNS ownership or an ATProto NSID.
-The dot separates named levels; it is never a substitute for every hyphen in
-a repository name. Inside a multiword ID segment, use lower camel case, such
-as `documentChange`. Existing spelling and case MUST be preserved.
+`[a-z][A-Za-z0-9]*`. Event profiles MUST start with `kotoba.`. This is project
+authority, not DNS ownership or an ATProto NSID.
+
+A specification that Kotoba defines itself gets an ID that starts with `kotoba.`.
+A library that implements an external specification uses the reverse domain of that
+specification's publisher, then the specification: `org.ietf.cbor` (IETF, `ietf.org`),
+`gov.nist.sha3` (NIST, `nist.gov`).
+The catalog declares each root it uses in
+`:namespace-authorities`, a vector of `{:prefix P :authority A :dns-authority? false}`,
+where `A` is `:kotoba-project` (only for `kotoba`) or `:external-reverse-domain`. An ID
+under an external root has at least three segments. `:dns-authority?` MUST be `false`,
+prefixes MUST be unique, and `kotoba` MUST stay declared. A catalog without
+`:namespace-authorities` has the single root `kotoba`, so existing catalogs are unchanged.
+
+The validator is syntax only and never looks anything up, so it cannot check that the
+domain segment is the publisher's real domain; that is a review obligation and must come
+from the specification itself, never from a repository name. A declared root grants no
+authority and does not rename a namespace. Segment rules are unchanged: a hyphen is
+refused, so write `org.nist.mlKem`, not `org.nist.ml-kem`; publisher domains with hyphens
+(for example `wi-fi.org`) have no canonical spelling yet and need a decision before
+they can be used.
 
 Hyphens, underscores, spaces, slashes and reader/operator punctuation MUST NOT
 occur in canonical ID segments. Empty segments, leading/trailing dots and
